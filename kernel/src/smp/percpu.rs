@@ -49,7 +49,7 @@ fn alloc_arena<T>(n: usize) -> *mut T {
     let pages = (bytes + 0xFFF) / 0x1000;
     let phys = crate::memory::allocator::alloc_contiguous(pages.max(1))
         .expect("percpu: frame allocator could not back a per-core arena");
-    let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
+    let hhdm = crate::arch::imp::page_tables::get_hhdm_offset();
     (hhdm + phys) as *mut T
 }
 

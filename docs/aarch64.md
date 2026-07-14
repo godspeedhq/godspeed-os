@@ -95,6 +95,17 @@ is stub-or-defer. That is the real size of "supporting the architecture."
 
 ## 2. Phase 0 - seal the boundary on x86 FIRST (before any ARM)
 
+> **Status (2026-07-14, `feat/aarch64-prep`): the seam + bucket-A sweep are DONE.** `arch/mod.rs` now
+> exposes `imp` (a `#[cfg(target_arch)]` alias of the current arch module), and all **126** arch-neutral
+> references were swept `arch::x86_64::` -> `arch::imp::`. Because `imp` is a literal alias of `x86_64`
+> on this target, the sweep is compiler-guaranteed behavior-identical; verified anyway with **identity
+> 24/0**. Adding `arch/aarch64/` that exposes the same surface is now a drop-in for those 126 sites.
+> **Still open** (deferred as they are not pure alias-renames and want careful verification): the
+> bucket-B relocation (§1.1) and isolating the 23 inline-asm ops in `smp/`+`memory/` behind `imp`
+> primitives (`read/write_page_table_base`, `invalidate_tlb_page`, `save/restore_irq`). Order below was
+> reversed on purpose: seam+sweep first because it is provably safe unattended; bucket B (code motion)
+> waits for a calm QEMU / a live operator.
+
 Do the de-x86-ification as a refactor on the x86 side, verified by the identity suite (24/24 = zero
 behavior change), *before* writing AArch64. Then adding `arch/aarch64/` is "implement the same surface"
 instead of "also patch 126 call sites while debugging on hardware you can't see." It is 100 % on the

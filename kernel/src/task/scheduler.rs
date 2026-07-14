@@ -12,7 +12,7 @@
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
-use crate::arch::x86_64::context_switch::{switch_context, TaskContext};
+use crate::arch::imp::context_switch::{switch_context, TaskContext};
 use crate::capability::cap::{CapError, Capability};
 use crate::capability::rights::Rights;
 use crate::capability::table::CapTable;
@@ -168,7 +168,7 @@ pub fn monotonic_ticks() -> u64 {
 /// Convert a `recv_timeout` duration in TSC cycles to a count of BSP ticks (≥1), for arming a
 /// timed wake on the core-independent clock. Falls back to 1 tick if the quantum isn't calibrated.
 pub fn cycles_to_ticks(cycles: u64) -> u64 {
-    let q = crate::arch::x86_64::boot::tsc_ticks_per_quantum();
+    let q = crate::arch::imp::boot::tsc_ticks_per_quantum();
     if q == 0 { 1 } else { (cycles / q).max(1) }
 }
 
@@ -392,7 +392,7 @@ pub fn init_arenas(n: usize) {
 /// Must only be called after `init_local_apic` on this core.
 pub fn current_core_id() -> usize {
     // SAFETY: APIC is mapped before the scheduler ever runs on any core.
-    let lapic_id = unsafe { crate::arch::x86_64::boot::get_lapic_id() };
+    let lapic_id = unsafe { crate::arch::imp::boot::get_lapic_id() };
     crate::smp::core::lapic_to_core_id(lapic_id) as usize
 }
 
@@ -507,7 +507,7 @@ pub unsafe fn commit_task(
     unsafe {
         TASK_CTX[slot].write(ctx);
         TASK_NAME[slot]             = name;
-        TASK_SPAWN_DT[slot].store(crate::arch::x86_64::rtc::read_datetime(), Ordering::Relaxed);
+        TASK_SPAWN_DT[slot].store(crate::arch::imp::rtc::read_datetime(), Ordering::Relaxed);
         TASK_IS_USER[slot]          = is_user;
         TASK_KERNEL_STACK_TOP[slot].store(kernel_stack_top, Ordering::Relaxed);
         TASK_ENDPOINT[slot].store(ep_to_u64(endpoint_id), Ordering::Relaxed);
@@ -544,7 +544,7 @@ pub fn enqueue(
                 TASK_CAP[i].write(caps);
                 TASK_STATE[i].store(TaskState::Ready as u8, Ordering::Relaxed);
                 TASK_NAME[i]             = name;
-                TASK_SPAWN_DT[i].store(crate::arch::x86_64::rtc::read_datetime(), Ordering::Relaxed);
+                TASK_SPAWN_DT[i].store(crate::arch::imp::rtc::read_datetime(), Ordering::Relaxed);
                 TASK_VALID[i].store(true, Ordering::Release);
                 TASK_CORE[i]             = core_id;
                 TASK_IS_USER[i]          = is_user;
@@ -842,10 +842,10 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
                 // (a service is never older than the system). 0 if never stamped (empty slot).
                 let spawn = TASK_SPAWN_DT[slot].load(Ordering::Relaxed);
                 if spawn == 0 { 0 } else {
-                    let now  = crate::arch::x86_64::rtc::now_epoch_monotonic();
-                    let svc  = (now - crate::arch::x86_64::rtc::epoch_secs(spawn)).max(0);
-                    let boot = crate::arch::x86_64::rtc::boot_datetime();
-                    let sys  = if boot == 0 { svc } else { (now - crate::arch::x86_64::rtc::epoch_secs(boot)).max(0) };
+                    let now  = crate::arch::imp::rtc::now_epoch_monotonic();
+                    let svc  = (now - crate::arch::imp::rtc::epoch_secs(spawn)).max(0);
+                    let boot = crate::arch::imp::rtc::boot_datetime();
+                    let sys  = if boot == 0 { svc } else { (now - crate::arch::imp::rtc::epoch_secs(boot)).max(0) };
                     svc.min(sys) as u64
                 }
             },
@@ -921,15 +921,15 @@ unsafe fn prepare_ring3_switch(core_id: usize, slot: usize) {
     // SAFETY: syscall_slot(core_id) points at this core's arena slot (or the BSP bootstrap pre-arena);
     // single writer (this core), per the per-core single-owner invariant.
     unsafe {
-        (*crate::arch::x86_64::syscall_entry::syscall_slot(core_id)).kernel_rsp = syscall_rsp;
+        (*crate::arch::imp::syscall_entry::syscall_slot(core_id)).kernel_rsp = syscall_rsp;
         // Restore per-task user RSP so SYSRETQ loads the correct stack pointer for
         // this task, not the value left by the last task that ran on this core.
-        (*crate::arch::x86_64::syscall_entry::syscall_slot(core_id)).user_rsp =
+        (*crate::arch::imp::syscall_entry::syscall_slot(core_id)).user_rsp =
             TASK_USER_RSP[slot];
     }
     // TSS.rsp0 stays at K0T so hardware interrupts (timer ISR) still enter at the top.
     // SAFETY: set_tss_rsp0 writes only to TSS_PER_CORE[core_id].rsp0.
-    unsafe { crate::arch::x86_64::boot::set_tss_rsp0(core_id, ksp) };
+    unsafe { crate::arch::imp::boot::set_tss_rsp0(core_id, ksp) };
 }
 
 /// Enter the scheduler loop on the calling core. Never returns.
@@ -951,11 +951,11 @@ pub fn run(core_id: u32) -> ! {
     // from init_local_apic to here so that any timer ISR firing after this point
     // will find a valid CORE_SCHED_CTX[cid].cr3 and can safely call pick_next
     // → switch_context without loading a garbage page table.
-    if crate::arch::x86_64::boot::TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
+    if crate::arch::imp::boot::TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
         // SAFETY: ring-0; TSC-Deadline was confirmed in init_local_apic
         // (TSC_DEADLINE_MODE=true implies CPUID check passed and
         // TSC_TICKS_PER_QUANTUM > 0); cr3 seeded above.
-        unsafe { crate::arch::x86_64::boot::rearm_tsc_deadline() };
+        unsafe { crate::arch::imp::boot::rearm_tsc_deadline() };
     }
 
     loop {
@@ -1044,7 +1044,7 @@ pub fn run(core_id: u32) -> ! {
                 // ticks and IPIs.  The compiler_fence above forces a fresh reload
                 // of TASK_STATE on every iteration so wakeups from other cores
                 // are always visible.
-                crate::arch::x86_64::wait_for_interrupt();
+                crate::arch::imp::wait_for_interrupt();
             }
         }
     }
@@ -1063,14 +1063,14 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
     drain_pending_kstack(cid);
     // SAFETY: IF=0 throughout (interrupt gate clears IF on entry).
     unsafe {
-        crate::arch::x86_64::boot::apic_send_eoi();
+        crate::arch::imp::boot::apic_send_eoi();
 
         // TSC-Deadline mode is one-shot: re-arm immediately after EOI.
         // In periodic mode this is a no-op (TSC_DEADLINE_MODE stays false).
         // SAFETY: IF=0; ring-0; TSC_DEADLINE_MODE=true implies TSC-Deadline
         // was verified at init_local_apic time and TSC_TICKS_PER_QUANTUM > 0.
-        if crate::arch::x86_64::boot::TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
-            crate::arch::x86_64::boot::rearm_tsc_deadline();
+        if crate::arch::imp::boot::TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
+            crate::arch::imp::boot::rearm_tsc_deadline();
         }
 
         // Poll the COM2 control channel and COM1 UART RX on every core-0 timer
@@ -1078,7 +1078,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // has ready tasks.  COM1 polling replaces IRQ 4 (fully masked by PIC).
         if cid == 0 {
             crate::control::process_pending();
-            crate::arch::x86_64::uart_rx_poll();
+            crate::arch::imp::uart_rx_poll();
             // Advance the BSP tick clock + wake any task whose recv_timeout deadline elapsed
             // (§12 timed-wait). BSP-driven because the BSP ticks reliably while APs idle; the
             // wake is tick-clocked so it's valid cross-core. See scan_timed_wakes.
@@ -1100,9 +1100,9 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // minimum fail loud. Armed only once the TSC quantum is calibrated (real hardware, TSC-Deadline
         // mode); QEMU's periodic tick has no calibrated rate (0), so it is skipped - and a normal
         // shootdown/critical-section is milliseconds, so the ~3 s deadline cannot false-fire.
-        let now = crate::arch::x86_64::read_cycle_counter();
+        let now = crate::arch::imp::read_cycle_counter();
         CORE_LAST_TICK_TSC.get(cid).0.store(now, Ordering::Relaxed);
-        let tpq = crate::arch::x86_64::boot::tsc_ticks_per_quantum();
+        let tpq = crate::arch::imp::boot::tsc_ticks_per_quantum();
         let ncores = crate::smp::core::ready_count() as usize;
         if tpq > 0 {
             let deadline = tpq.saturating_mul(300); // ~3 s (300 * 10 ms quanta) with no forward progress
@@ -1165,7 +1165,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             // Capture prev's user RSP now (other tasks run before prev is rescheduled, overwriting it).
             if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
                 TASK_USER_RSP[prev] =
-                    (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
+                    (*crate::arch::imp::syscall_entry::syscall_slot(cid)).user_rsp;
             }
             let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
                 // prev self-killed - discard into CORE_DEAD_CTX (never resumed).
@@ -1237,7 +1237,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             // rescheduled, overwriting PER_CORE_SYSCALL.user_rsp, so capture it now.
             if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
                 TASK_USER_RSP[prev] =
-                    (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
+                    (*crate::arch::imp::syscall_entry::syscall_slot(cid)).user_rsp;
             }
             let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
                 // prev self-killed (e.g. the supervisor itself) - discard into CORE_DEAD_CTX.
@@ -1302,7 +1302,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // SYSCALL entry for `prev`, not the value prepare_ring3_switch writes for `next`.
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
             TASK_USER_RSP[prev] =
-                (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
+                (*crate::arch::imp::syscall_entry::syscall_slot(cid)).user_rsp;
         }
 
         // On abort we do not enter `next`; only prepare the ring-3 switch when we
@@ -1340,7 +1340,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
 /// Advisory yield: mark the current task Ready and reschedule.
 /// Also called from the IPI handler for cross-core WAKE_RECEIVER (§9.4).
 pub fn yield_current() {
-    crate::arch::x86_64::disable_interrupts();
+    crate::arch::imp::disable_interrupts();
 
     let cid = current_core_id();
 
@@ -1353,7 +1353,7 @@ pub fn yield_current() {
         // A yield IS forward progress - stamp the liveness heartbeat too, so the cross-core watchdog
         // (timer_tick_from_irq) never mistakes a heavily-yielding core (one making progress via syscalls
         // rather than timer preemption) for a stalled one.
-        CORE_LAST_TICK_TSC.get(cid).0.store(crate::arch::x86_64::read_cycle_counter(), Ordering::Relaxed);
+        CORE_LAST_TICK_TSC.get(cid).0.store(crate::arch::imp::read_cycle_counter(), Ordering::Relaxed);
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
             CORE_ACTIVE_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
             // Credit the running task this quantum - the per-task CPU% source for `observe`
@@ -1424,7 +1424,7 @@ pub fn yield_current() {
         if cid == 0 && prev < MAX_TASKS && crate::task::supervisor_respawn_pending() {
             if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
                 TASK_USER_RSP[prev] =
-                    (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
+                    (*crate::arch::imp::syscall_entry::syscall_slot(cid)).user_rsp;
             }
             let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
                 CORE_DEAD_CTX.as_mut_ptr(cid)   // prev self-killed - discard (never resumed)
@@ -1457,7 +1457,7 @@ pub fn yield_current() {
         // entry, not the value prepare_ring3_switch is about to write for `next`.
         if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
             TASK_USER_RSP[prev] =
-                (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
+                (*crate::arch::imp::syscall_entry::syscall_slot(cid)).user_rsp;
         }
 
         if TASK_IS_USER[next] {
@@ -1704,7 +1704,7 @@ pub fn kill_task_by_slot(slot: usize) {
         // cannot leave the system muted forever, and wake any shell parked in a muted blocking read.
         // Unconditional (before the endpoint cleanup) since the owner need not have an endpoint; the
         // if-owner guard is a cheap no-op for the common case of a non-owner death.
-        crate::arch::x86_64::release_console_foreground_if_owner(slot as u32);
+        crate::arch::imp::release_console_foreground_if_owner(slot as u32);
 
         // Kill the task's endpoint if it has one.
         if let Some(ep_id) = task_ep {
@@ -1776,7 +1776,7 @@ pub fn kill_task_by_slot(slot: usize) {
                 // Mask the source: effective for a level/INTx line (the ehci); a no-op for edge/MSI (the
                 // xhci), whose stray MSI is already harmless once the route is None (deliver finds no
                 // endpoint) and stops at the respawned driver's HCRST.
-                crate::arch::x86_64::ioapic::mask_vector(dead_irq);
+                crate::arch::imp::ioapic::mask_vector(dead_irq);
             }
 
             // Reclaim the endpoint id itself for reuse (§14.2). Its routing entry is Dead and its
@@ -1853,7 +1853,7 @@ pub fn kill_task_by_slot(slot: usize) {
             || task_name == "nic-driver"
         {
             use core::sync::atomic::Ordering::Relaxed;
-            use crate::arch::x86_64::pci;
+            use crate::arch::imp::pci;
             let bdf = match task_name {
                 "xhci"       => pci::XHCI_BDF.load(Relaxed),
                 "ehci"       => pci::EHCI_BDF.load(Relaxed),
@@ -1865,7 +1865,7 @@ pub fn kill_task_by_slot(slot: usize) {
             // cleanly (no-op if the device wasn't confined). Confined USB drivers (xhci/ehci) only; AHCI
             // + nic-driver run in IOMMU passthrough, so there is no DTE to revert.
             if task_name == "xhci" || task_name == "ehci" {
-                crate::arch::x86_64::iommu::release_device(bdf);
+                crate::arch::imp::iommu::release_device(bdf);
             }
         }
 
@@ -1958,7 +1958,7 @@ pub fn kill_task_by_slot(slot: usize) {
                 // slot (spin-wait above); no core will load this cr3 hereafter.
                 // reclaim_user_frames frees every user frame INLINE except the PML4 root, and
                 // returns the count (no fixed buffer - it no longer leaks large allocations).
-                let freed = crate::arch::x86_64::page_tables::reclaim_user_frames(cr3);
+                let freed = crate::arch::imp::page_tables::reclaim_user_frames(cr3);
                 if is_self_kill {
                     // Defer the PML4 frame: our CR3 still points to it, and freeing it now lets
                     // another core zero it (PageTable::new) while we hold that CR3, causing a
@@ -2096,7 +2096,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         // load this task's RSP, not the value another task wrote to PER_CORE_SYSCALL.
         if TASK_IS_USER[slot] {
             TASK_USER_RSP[slot] =
-                (*crate::arch::x86_64::syscall_entry::syscall_slot(cid)).user_rsp;
+                (*crate::arch::imp::syscall_entry::syscall_slot(cid)).user_rsp;
         }
 
         match pick_next(cid) {

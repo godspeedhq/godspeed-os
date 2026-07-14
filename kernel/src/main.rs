@@ -177,7 +177,7 @@ static mut BSP_BOOT_STACK: [u8; 512 * 1024] = [0u8; 512 * 1024];
 // not by Rust's type system. The function cannot be `unsafe fn` because Limine
 // requires a specific extern "C" signature.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> ! {
+pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
     // Switch from Limine's tiny boot stack to our own 512 KiB stack before
     // any locals are allocated.  boot_info_ptr is in RDI (a register) so it
     // survives the RSP change.
@@ -198,12 +198,12 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // SAFETY: bootloader guarantees boot_info_ptr is valid and aligned.
     let boot_info = unsafe { &*boot_info_ptr };
 
-    arch::x86_64::init(boot_info);
+    arch::imp::init(boot_info);
 
     // Record the boot wall-clock time (RTC is raw port I/O - available immediately). `uptime`
     // reads it via InspectKernel query 12 and reports now − boot. Captured here, as early as
     // possible, so uptime measures from true boot rather than first query.
-    arch::x86_64::rtc::capture_boot_time();
+    arch::imp::rtc::capture_boot_time();
 
     memory::init(boot_info);
 
@@ -216,7 +216,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     task::scheduler::init_arenas(smp::percpu::num_cores());
     // Per-AP GDT/TSS arenas (the BSP already runs on its static bootstrap). Sized to the same N; the
     // APs load these in ap_init, which runs after this point.
-    arch::x86_64::boot::init_gdt_arenas(smp::percpu::num_cores());
+    arch::imp::boot::init_gdt_arenas(smp::percpu::num_cores());
 
     // Hardening: unmap a guard page below each kernel-stack slot so an overflow
     // faults loudly instead of corrupting the neighbouring stack. Done here - BSP
@@ -227,10 +227,10 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
 
     // Stage 1 of the USB stack: locate the xHCI controller (§12). Records its
     // MMIO base + IRQ for a future userspace driver's hw_mmio/hw_interrupt caps.
-    arch::x86_64::pci::init();
+    arch::imp::pci::init();
 
     // EHCI INTx routing needs the IOAPIC mapped; map it now (CPU MMIO, AP-independent).
-    arch::x86_64::ioapic::init();
+    arch::imp::ioapic::init();
 
     // EHCI interrupt path (§12): program it HERE - before the firmware USB handoff + IOMMU
     // below - which is where it worked in the E2 build; deferring it past the handoff stopped
@@ -238,8 +238,8 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // pre-smp::init - only the xHCI's core-1 MSI needs the APs up, so that one stays deferred).
     // The EHCI driver is pinned to the BSP (task/mod.rs) to match. Interrupters stay off until
     // each userspace driver enables them, so nothing fires yet.
-    if !arch::x86_64::pci::program_ehci_msi() {
-        arch::x86_64::pci::route_ehci_intx();
+    if !arch::imp::pci::program_ehci_msi() {
+        arch::imp::pci::route_ehci_intx();
     }
 
     // Take a USB controller from the firmware (BIOS→OS handoff) before the IOMMU
@@ -254,22 +254,22 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
     // - the configuration in which both keyboards work. Flip the switch to
     // re-enable the xHCI confinement flagship (hands off + confines xHCI only).
     if task::CONFINE_USB_DRIVERS {
-        arch::x86_64::pci::xhci_bios_handoff();
+        arch::imp::pci::xhci_bios_handoff();
     }
     // Report whether the EHCI controller supports a PCI Function-Level Reset - the
     // candidate for scrubbing its stale firmware-era internal state (which HCRESET
     // doesn't clear) so it can run firmware-independent. Detection only.
-    arch::x86_64::pci::ehci_flr_probe();
+    arch::imp::pci::ehci_flr_probe();
 
     // H1 Phase 0: probe ACPI for an AMD-Vi IOMMU (IVRS). Detection only - reports
     // whether this machine can confine DMA-capable drivers to their granted
     // arena (the prerequisite for dropping xhci/ehci from the TCB).
-    arch::x86_64::iommu::detect(boot_info.rsdp_addr, boot_info.hhdm_offset);
+    arch::imp::iommu::detect(boot_info.rsdp_addr, boot_info.hhdm_offset);
     // H1 Phase 1a: if an IOMMU was found, map its MMIO and read capabilities.
-    arch::x86_64::iommu::bringup(boot_info.hhdm_offset);
+    arch::imp::iommu::bringup(boot_info.hhdm_offset);
 
-    arch::x86_64::init_timer();
-    arch::x86_64::com2_init();
+    arch::imp::init_timer();
+    arch::imp::com2_init();
     // COM1 RX is polled from the core-0 timer ISR (uart_rx_poll every 10 ms).
     // IRQ-driven reception was abandoned because the kernel masks all PIC IRQs
     // globally (APIC-only kernel). uart_rx_enable() must NOT be called: on real
@@ -308,13 +308,13 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
         // runtime. audit_wx then confirms the HHDM reads NX=1.
         // Safe fn - boot-ordering contract (must follow smp::init), not UB; the
         // CR3/PTE unsafe lives in the arch layer.
-        arch::x86_64::page_tables::harden_hhdm_nx();
-        arch::x86_64::boot::audit_wx();
+        arch::imp::page_tables::harden_hhdm_nx();
+        arch::imp::boot::audit_wx();
 
         kprintln!("kernel: {} cores ready", smp::core::ready_count());
         kprintln!(
             "idle: cores may halt = {} (cool when idle if true)",
-            arch::x86_64::interrupts::idle_can_halt()
+            arch::imp::interrupts::idle_can_halt()
         );
 
         // Interrupt-driven USB (§12): program the xHCI's MSI now that the APs are up, so it
@@ -322,7 +322,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
         // out of its idle `hlt`, no cross-core wake. (The EHCI was programmed earlier, before
         // the firmware handoff, routed to the BSP; see above.) The interrupter stays OFF until
         // the userspace driver enables it, so nothing fires yet.
-        arch::x86_64::pci::program_xhci_msi();
+        arch::imp::pci::program_xhci_msi();
 
         task::scheduler::run(0)
     }
@@ -330,7 +330,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::x86_64::BootInfo) -> !
 
 #[no_mangle]
 pub extern "C" fn ap_main(core_id: u32) -> ! {
-    arch::x86_64::ap_init(core_id);
+    arch::imp::ap_init(core_id);
     smp::core::mark_ready(core_id);
     task::scheduler::run(core_id)
 }
@@ -338,5 +338,5 @@ pub extern "C" fn ap_main(core_id: u32) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     kprintln!("KERNEL PANIC: {}", info);
-    arch::x86_64::halt_all_cores();
+    arch::imp::halt_all_cores();
 }

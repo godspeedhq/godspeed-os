@@ -53,7 +53,7 @@ pub fn unregister(irq: u8) {
 pub unsafe fn deliver(irq: u8) {
     // One-shot diagnostic: confirm the IDT actually receives the EHCI vector and on which core
     // (the EHCI's legacy INTx delivery has been the hard part on the T630). Logged once.
-    if irq == crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR
+    if irq == crate::arch::imp::interrupts::EHCI_MSI_VECTOR
         && !EHCI_DELIVER_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed)
     {
         crate::kprintln!(
@@ -65,7 +65,7 @@ pub unsafe fn deliver(irq: u8) {
     // it does not re-fire while the userspace driver handles it (the line stays asserted until
     // the driver clears the device's interrupt status). The driver unmasks via the IrqUnmask
     // syscall after acking. No-op for edge/MSI vectors (the xHCI), which need no masking.
-    crate::arch::x86_64::ioapic::mask_vector(irq);
+    crate::arch::imp::ioapic::mask_vector(irq);
 
     let endpoint = IRQ_TABLE.lock()[irq as usize];
     if let Some(ep) = endpoint {
@@ -88,5 +88,5 @@ pub unsafe fn deliver(irq: u8) {
     }
     // EOI must fire unconditionally - even on discard and even on full queue.
     // If the APIC is not re-armed here, the IRQ line stays masked and the system hangs.
-    crate::arch::x86_64::interrupts::send_eoi();
+    crate::arch::imp::interrupts::send_eoi();
 }

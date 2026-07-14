@@ -10,11 +10,11 @@ pub mod frame;
 pub mod ownership;
 pub mod page;
 
-use crate::arch::x86_64::BootInfo;
+use crate::arch::imp::BootInfo;
 
 pub fn init(boot_info: &BootInfo) {
     // SAFETY: called once by BSP before any PageTable is created.
-    unsafe { crate::arch::x86_64::page_tables::set_hhdm_offset(boot_info.hhdm_offset) };
+    unsafe { crate::arch::imp::page_tables::set_hhdm_offset(boot_info.hhdm_offset) };
     crate::kprintln!(
         "memory: kernel phys [{:#x}, {:#x}) hhdm={:#x}",
         boot_info.kernel_phys_start, boot_info.kernel_phys_end,

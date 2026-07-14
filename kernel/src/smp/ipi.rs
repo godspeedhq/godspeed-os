@@ -105,7 +105,7 @@ fn word_bit(c: usize) -> (usize, u64) {
 #[inline]
 fn this_core() -> usize {
     // SAFETY: the APIC is mapped before any IPI path runs.
-    let lapic = unsafe { crate::arch::x86_64::boot::get_lapic_id() };
+    let lapic = unsafe { crate::arch::imp::boot::get_lapic_id() };
     crate::smp::core::lapic_to_core_id(lapic) as usize
 }
 
@@ -165,7 +165,7 @@ fn service_pending(me: usize) {
 /// `core_id` must refer to a ready core; the local APIC must be mapped.
 pub unsafe fn send_ipi(core_id: u32, vector: u8) {
     let lapic_id  = crate::smp::core::core_lapic_id(core_id);
-    let apic_base = unsafe { crate::arch::x86_64::boot::get_apic_virt_base() };
+    let apic_base = unsafe { crate::arch::imp::boot::get_apic_virt_base() };
 
     // xAPIC ICR write protocol: write high word (destination) first, then
     // low word (vector + delivery mode), which triggers delivery.
@@ -193,7 +193,7 @@ pub unsafe fn send_ipi(core_id: u32, vector: u8) {
 /// # Safety
 /// The APIC must be mapped; the caller holds IF=0 (or has saved/disabled it).
 unsafe fn broadcast_shootdown_ipi() {
-    let apic_base = unsafe { crate::arch::x86_64::boot::get_apic_virt_base() };
+    let apic_base = unsafe { crate::arch::imp::boot::get_apic_virt_base() };
     // SAFETY: APIC mapped; IF=0.
     unsafe {
         write_apic_reg(apic_base + APIC_ICR_HIGH, 0);
@@ -305,7 +305,7 @@ pub unsafe fn ipi_handler(vector: u8) {
     }
     // Send EOI to allow the next interrupt to be delivered.
     // SAFETY: called from interrupt context; APIC is mapped.
-    unsafe { crate::arch::x86_64::boot::apic_send_eoi() }
+    unsafe { crate::arch::imp::boot::apic_send_eoi() }
 }
 
 /// Broadcast a full TLB flush to all other cores and flush locally (§10.5).

@@ -69,7 +69,7 @@ struct LogSink<'a> {
 impl LogSink<'_> {
     fn flush(&mut self) {
         if self.n > 0 {
-            crate::arch::x86_64::serial_write_bytes_lockfree(&self.stage[..self.n]);
+            crate::arch::imp::serial_write_bytes_lockfree(&self.stage[..self.n]);
             self.n = 0;
         }
     }

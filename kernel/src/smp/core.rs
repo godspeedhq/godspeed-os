@@ -6,7 +6,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::arch::x86_64::BootInfo;
+use crate::arch::imp::BootInfo;
 use crate::smp::percpu::{num_cores, PerCore};
 
 static READY_COUNT: AtomicU32 = AtomicU32::new(0);

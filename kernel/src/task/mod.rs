@@ -9,8 +9,8 @@ pub use task::{Task, TaskId};
 
 use crate::smp::SpinLock;
 
-use crate::arch::x86_64::context_switch::TaskContext;
-use crate::arch::x86_64::page_tables::{
+use crate::arch::imp::context_switch::TaskContext;
+use crate::arch::imp::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
 use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE};
@@ -71,11 +71,11 @@ pub fn install_kstack_guards() {
     let base = kstack_pool_base();
     debug_assert!(base & (PAGE_SIZE as u64 - 1) == 0, "kstack pool not page-aligned");
     // Page-table work lives in the arch layer (§18.1) - no `unsafe` here.
-    crate::arch::x86_64::page_tables::unmap_4k_strided(
+    crate::arch::imp::page_tables::unmap_4k_strided(
         base, KSTACK_STRIDE as u64, TASK_KSTACK_MAX);
     // Verify: slot 0's guard is now unmapped, its usable second page still mapped.
-    let g = crate::arch::x86_64::page_tables::entry_for_va(base).is_none();
-    let u = crate::arch::x86_64::page_tables::entry_for_va(base + PAGE_SIZE as u64).is_some();
+    let g = crate::arch::imp::page_tables::entry_for_va(base).is_none();
+    let u = crate::arch::imp::page_tables::entry_for_va(base + PAGE_SIZE as u64).is_some();
     crate::kprintln!(
         "kstack: {} guard pages installed (64 KiB usable/slot); guard_unmapped={} usable_mapped={}",
         TASK_KSTACK_MAX, g, u);
@@ -333,7 +333,7 @@ enum HwClass { None, Ahci, Nic, Xhci, Ehci }
 impl HwClass {
     /// Did the PCI scan find this class of controller?
     fn found(self) -> bool {
-        use crate::arch::x86_64::pci;
+        use crate::arch::imp::pci;
         use core::sync::atomic::Ordering::Relaxed;
         match self {
             HwClass::Xhci => pci::XHCI_FOUND.load(Relaxed),
@@ -346,7 +346,7 @@ impl HwClass {
     /// The controller's first MMIO BAR base, or 0 if absent (or, for a NIC, not a model we can drive -
     /// an Intel e1000 or a Realtek RTL8168; on any other NIC the driver gets no mapping and idles).
     fn mmio_bar(self) -> u64 {
-        use crate::arch::x86_64::pci;
+        use crate::arch::imp::pci;
         use core::sync::atomic::Ordering::Relaxed;
         if !self.found() { return 0; }
         match self {
@@ -377,7 +377,7 @@ impl HwClass {
     fn iommu_confine(self) -> bool { self == HwClass::Xhci }
     /// The device's PCI BDF (bus/device/function) for the bus-master + D0 enable, or 0xFFFF if none.
     fn bdf(self) -> u32 {
-        use crate::arch::x86_64::pci;
+        use crate::arch::imp::pci;
         use core::sync::atomic::Ordering::Relaxed;
         match self {
             HwClass::Xhci => pci::XHCI_BDF.load(Relaxed),
@@ -3692,9 +3692,9 @@ fn spawn_service_with_config(
                 // docs/iommu.md.
                 {
                     use core::sync::atomic::Ordering::Relaxed;
-                    use crate::arch::x86_64::pci;
+                    use crate::arch::imp::pci;
                     if CONFINE_USB_DRIVERS && hw.iommu_confine() {
-                        crate::arch::x86_64::iommu::confine_device(
+                        crate::arch::imp::iommu::confine_device(
                             pci::XHCI_BDF.load(Relaxed), phys, len);
                     } else {
                         // `block-driver` (AHCI) stays in IOMMU passthrough, like ehci:
@@ -3741,7 +3741,7 @@ fn spawn_service_with_config(
             data.magic              = SERVICE_CTX_MAGIC;
             // Readback: confirm write was not silently dropped (should always pass).
             if data.magic != SERVICE_CTX_MAGIC {
-                crate::arch::x86_64::serial_write_bytes_lockfree(b"CTX-MAGIC-MISMATCH\n");
+                crate::arch::imp::serial_write_bytes_lockfree(b"CTX-MAGIC-MISMATCH\n");
             }
             data.log_write_slot     = 0;
             data.recv_slot          = recv_slot_u32;

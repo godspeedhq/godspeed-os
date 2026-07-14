@@ -7,8 +7,8 @@
 //!   - A saved context for context switching.
 //!   - A fixed core assignment (never migrates - §9.1).
 
-use crate::arch::x86_64::context_switch::TaskContext;
-use crate::arch::x86_64::page_tables::PageTable;
+use crate::arch::imp::context_switch::TaskContext;
+use crate::arch::imp::page_tables::PageTable;
 use crate::capability::table::CapTable;
 use crate::memory::ownership::TaskMemoryOwner;
 use crate::task::state::TaskState;

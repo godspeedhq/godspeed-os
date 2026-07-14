@@ -47,7 +47,7 @@ pub fn process_pending() {
     // H1 diagnostic: surface any IOMMU translation faults (device DMA blocked
     // outside its confined arena). Cheap when quiet (a head/tail compare); prints
     // the faulting device + address when a confined driver oversteps its arena.
-    crate::arch::x86_64::iommu::drain_event_log();
+    crate::arch::imp::iommu::drain_event_log();
 
     let mut state = match LINE.try_lock() {
         Some(g) => g,
@@ -57,7 +57,7 @@ pub fn process_pending() {
     let mut budget = 256u32;
     while budget > 0 {
         budget -= 1;
-        let b = match crate::arch::x86_64::com2_try_read_byte() {
+        let b = match crate::arch::imp::com2_try_read_byte() {
             Some(b) => b,
             None    => break,
         };
@@ -116,7 +116,7 @@ fn execute_command(cmd: &str) {
                 None    => { crate::kprintln!("control: FIRE_IRQ missing irq"); return; }
             };
             crate::kprintln!("control: FIRE_IRQ {}", irq);
-            crate::arch::x86_64::interrupts::fire_test_irq(irq);
+            crate::arch::imp::interrupts::fire_test_irq(irq);
         }
         Some(other) => crate::kprintln!("control: unknown command '{}'", other),
         None => {}

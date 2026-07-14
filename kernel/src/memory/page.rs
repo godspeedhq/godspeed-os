@@ -5,7 +5,7 @@
 //! address space. The kernel never dereferences a user virtual address
 //! directly; it uses `Page` as a typed index into page tables only.
 
-use crate::arch::x86_64::page_tables::VirtAddr;
+use crate::arch::imp::page_tables::VirtAddr;
 
 pub const PAGE_SIZE: usize = 4096;
 

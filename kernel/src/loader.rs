@@ -10,7 +10,7 @@
 //!   - PT_LOAD program headers (all others are skipped)
 //!   - PF_X / PF_W / PF_R flags → PageFlags
 
-use crate::arch::x86_64::page_tables::{
+use crate::arch::imp::page_tables::{
     get_hhdm_offset, MapError, PageFlags, PageTable, VirtAddr, PAGE_SIZE,
 };
 use crate::memory::allocator::alloc_frame;
@@ -354,7 +354,7 @@ pub fn run_elf_fuzz() -> ! {
     }
 
     crate::kprintln!("fuzz: F3 pass ({}/{})", n, n);
-    crate::arch::x86_64::halt_all_cores()
+    crate::arch::imp::halt_all_cores()
 }
 
 /// Brutal ELF loader fuzz - Milestone 17 BF3.
@@ -424,5 +424,5 @@ pub fn run_elf_fuzz_brutal() -> ! {
     }
 
     crate::kprintln!("fuzz: BF3 pass ({}/{})", n, n);
-    crate::arch::x86_64::halt_all_cores()
+    crate::arch::imp::halt_all_cores()
 }

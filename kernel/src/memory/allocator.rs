@@ -11,7 +11,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::arch::x86_64::{BootInfo, MemoryKind};
+use crate::arch::imp::{BootInfo, MemoryKind};
 use crate::memory::frame::{Frame, PhysAddr, FRAME_SIZE};
 
 // ---------------------------------------------------------------------------
@@ -25,7 +25,7 @@ static mut GUARD_END:   u64 = 0;
 fn guard_bugcheck(phys: u64) {
     // Write directly to COM1 - no lock, no allocator, no stack growth.
     #[inline(always)]
-    fn putb(b: u8) { crate::arch::x86_64::serial_write_byte(b); }
+    fn putb(b: u8) { crate::arch::imp::serial_write_byte(b); }
     fn puts(s: &[u8]) { for &b in s { putb(b); } }
     fn puthex(v: u64) {
         puts(b"0x");
@@ -585,7 +585,7 @@ pub fn phys_in_ram(phys: u64) -> bool {
 /// Must be called after `allocator::init` (bitmap populated) and after
 /// `set_hhdm_offset` (physical↔virtual translation live).
 pub fn protect_kernel_page_table_frames() {
-    let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
+    let hhdm = crate::arch::imp::page_tables::get_hhdm_offset();
     if hhdm == 0 {
         return; // HHDM not initialised - cannot walk tables safely.
     }

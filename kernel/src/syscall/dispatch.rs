@@ -7,8 +7,8 @@
 //! Syscall numbers are fixed; adding a syscall requires a new number and a
 //! capability that authorises it.
 
-use crate::arch::x86_64::{read_user_bytes, validate_user_ptr, write_user_bytes, read_cycle_counter};
-use crate::arch::x86_64::page_tables::{map_in_active_tables, PageFlags};
+use crate::arch::imp::{read_user_bytes, validate_user_ptr, write_user_bytes, read_cycle_counter};
+use crate::arch::imp::page_tables::{map_in_active_tables, PageFlags};
 use crate::capability::cap::CapError;
 use crate::capability::rights::Rights;
 use crate::ipc::endpoint::EndpointId;
@@ -218,8 +218,8 @@ fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     // Console foreground gate: while a TUI app (e.g. `chaos`, syscall 40) owns the screen, a
     // backgrounded task's output goes to serial only - it must not smear the app's framebuffer. The
     // owner (or unclaimed = the normal case) writes to both.
-    let to_fb = crate::arch::x86_64::console_foreground_allows(scheduler::current_task_slot() as u32);
-    crate::arch::x86_64::console_write_bytes_gated(bytes, to_fb);
+    let to_fb = crate::arch::imp::console_foreground_allows(scheduler::current_task_slot() as u32);
+    crate::arch::imp::console_write_bytes_gated(bytes, to_fb);
     0
 }
 
@@ -452,7 +452,7 @@ fn handle_irq_unmask(irq: u64) -> i64 {
     if my_ep.is_none() || crate::interrupt::route::registered_endpoint(irq) != my_ep {
         return cap_err_to_i64(CapError::CapNotHeld);
     }
-    crate::arch::x86_64::ioapic::unmask_vector(irq);
+    crate::arch::imp::ioapic::unmask_vector(irq);
     0
 }
 
@@ -1290,37 +1290,37 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // Console (fbcon) geometry packed as (rows << 16) | cols. The console
         // service needs this to lay out its terminal (pin the input line to the
         // bottom row). 0 if the framebuffer never initialised.
-        9 => crate::arch::x86_64::fb::dims_packed() as i64,
+        9 => crate::arch::imp::fb::dims_packed() as i64,
         // Input-ready flag - set by the xHCI driver when it finishes setup (the
         // last boot step). The shell watches it to auto-clear the boot screen.
-        10 => crate::arch::x86_64::input_ready() as i64,
+        10 => crate::arch::imp::input_ready() as i64,
         // Wall-clock date/time from the hardware RTC, packed (see rtc.rs). Ungated
         // - the time of day is task-neutral hardware info, like the TSC (query 3).
-        11 => crate::arch::x86_64::rtc::read_datetime() as i64,
+        11 => crate::arch::imp::rtc::read_datetime() as i64,
         // Wall-clock datetime captured at boot (same packed layout as query 11). Pairs with
         // query 11 for `uptime` = now − boot, a portable wall-clock delta (a tick counter's rate
         // varies with the APIC timer mode). Task-neutral hardware info like the RTC, so ungated.
-        12 => crate::arch::x86_64::rtc::boot_datetime() as i64,
+        12 => crate::arch::imp::rtc::boot_datetime() as i64,
         // Is the CALLING task the console foreground owner (may its console reads return bytes)? 1 if
         // foreground or unclaimed (normal), 0 if a foreground app (e.g. `chaos`, syscall 40) owns it.
         // Caller-specific, so ungated (like query 0). The muted shell polls this to stay quiet + redraw
         // its prompt only when it regains the keyboard.
-        13 => crate::arch::x86_64::console_foreground_allows(scheduler::current_task_slot() as u32) as i64,
+        13 => crate::arch::imp::console_foreground_allows(scheduler::current_task_slot() as u32) as i64,
         // NIC vendor | device<<16 from the PCI scan (0 if no NIC). Task-neutral hardware info, ungated:
         // nic-driver reads it to know which chip it drives (e1000 vs RTL8168). Networking Phase 4.
-        14 => crate::arch::x86_64::pci::NIC_VENDOR_DEVICE.load(core::sync::atomic::Ordering::Relaxed) as i64,
+        14 => crate::arch::imp::pci::NIC_VENDOR_DEVICE.load(core::sync::atomic::Ordering::Relaxed) as i64,
         // NIC MMIO base (the register-space BAR the PCI scan chose), 0 if none. Ungated hardware fact;
         // a diagnostic for the driver (which BAR did the memory-BAR scan pick). Networking Phase 4.
-        15 => crate::arch::x86_64::pci::NIC_MMIO_BASE.load(core::sync::atomic::Ordering::Relaxed) as i64,
+        15 => crate::arch::imp::pci::NIC_MMIO_BASE.load(core::sync::atomic::Ordering::Relaxed) as i64,
         // TSC ticks per 10 ms quantum, from the boot-time CPUID calibration (boot.rs). Ungated,
         // task-neutral timing (like the raw TSC, query 3): userspace turns a TSC delta into milliseconds
         // as `delta * 10 / this`. `ping` uses it for round-trip time. 0 if the TSC was not calibrated.
-        16 => crate::arch::x86_64::boot::tsc_ticks_per_quantum() as i64,
+        16 => crate::arch::imp::boot::tsc_ticks_per_quantum() as i64,
         // Deglitched monotonic "now" in epoch seconds (rtc.rs now_epoch_monotonic): the wall clock with
         // backward / huge-forward CMOS misreads dropped. For time-DELTA deadlines
         // (request_with_reply_deadline) and pacing, where a raw RTC glitch (the "4383d" misread) would
         // expire a deadline instantly. Ungated task-neutral timing, like the raw RTC (query 11).
-        17 => crate::arch::x86_64::rtc::now_epoch_monotonic(),
+        17 => crate::arch::imp::rtc::now_epoch_monotonic(),
         // Hardware-driver presence from the PCI scan, packed: bit0 = xHCI, bit1 = EHCI, bit2 = a NIC
         // this build can actually drive (found AND an e1000 or RTL8168). Ungated task-neutral hardware
         // fact (like the NIC identity, query 14). The supervisor reads it to skip spawning a driver
@@ -1328,7 +1328,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // driver does not busy-hold a whole core.
         18 => {
             use core::sync::atomic::Ordering::Relaxed;
-            use crate::arch::x86_64::pci;
+            use crate::arch::imp::pci;
             let x = pci::XHCI_FOUND.load(Relaxed) as i64;
             let e = pci::EHCI_FOUND.load(Relaxed) as i64;
             // Only a NIC nic-driver can actually drive counts - an unsupported NIC leaves it idling
@@ -1476,19 +1476,19 @@ fn handle_console_read(cap_slot: u64) -> i64 {
     // Store our slot as waiter before entering the block loop to avoid a
     // lost-wakeup race with the IRQ handler.
     let my_slot = scheduler::current_task_slot();
-    crate::arch::x86_64::CONSOLE_READ_WAITER.store(my_slot as u32, Ordering::Release);
+    crate::arch::imp::CONSOLE_READ_WAITER.store(my_slot as u32, Ordering::Release);
 
     loop {
         // Only consume a byte while we own (or share) the console foreground. While a foreground app
         // (e.g. `chaos`, syscall 40) owns it, stay blocked so ITS keystrokes (its `q`) reach it, not us.
         // This closes the race where the shell's loop gate passed is-foreground, then it blocked here
         // just as the app claimed. We are woken by the RX IRQ (a byte) OR by release/owner-death.
-        if crate::arch::x86_64::console_foreground_allows(my_slot as u32) {
+        if crate::arch::imp::console_foreground_allows(my_slot as u32) {
             // Drain the UART FIFO ourselves (a starved timer ISR under chaos max-carnage would otherwise
             // leave the serial byte stranded in the FIFO). See uart_rx_drain_now.
-            crate::arch::x86_64::uart_rx_drain_now();
-            if let Some(b) = crate::arch::x86_64::uart_rx_pop() {
-                crate::arch::x86_64::CONSOLE_READ_WAITER.store(u32::MAX, Ordering::Release);
+            crate::arch::imp::uart_rx_drain_now();
+            if let Some(b) = crate::arch::imp::uart_rx_pop() {
+                crate::arch::imp::CONSOLE_READ_WAITER.store(u32::MAX, Ordering::Release);
                 return b as i64;
             }
         }
@@ -1496,7 +1496,7 @@ fn handle_console_read(cap_slot: u64) -> i64 {
         // Block until the IRQ handler (a byte) or release/owner-death (foreground changed) wakes us.
         let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
         if err != 0 {
-            crate::arch::x86_64::CONSOLE_READ_WAITER.store(u32::MAX, Ordering::Release);
+            crate::arch::imp::CONSOLE_READ_WAITER.store(u32::MAX, Ordering::Release);
             return err;
         }
         // Woken by uart_rx_irq_handler; loop to pop the byte.
@@ -1529,14 +1529,14 @@ fn handle_try_console_read(cap_slot: u64) -> i64 {
     // service running its TUI), a poll from any OTHER task reads empty - so a resurrected shell
     // cannot swallow the foreground app's `q`. Unclaimed (the normal state) allows everyone, so
     // ordinary shell input is unchanged.
-    if !crate::arch::x86_64::console_foreground_allows(scheduler::current_task_slot() as u32) {
+    if !crate::arch::imp::console_foreground_allows(scheduler::current_task_slot() as u32) {
         return NO_CONSOLE_BYTE;
     }
     // Drain the UART FIFO ourselves before popping: `chaos max-carnage` starves the timer-ISR poll
     // (the normal FIFO->ring drain), so without this the serial `q`-to-abort sits stranded in the FIFO
     // and the storm cannot be stopped. This makes the chaos runner's q-poll independent of the ISR.
-    crate::arch::x86_64::uart_rx_drain_now();
-    match crate::arch::x86_64::uart_rx_pop() {
+    crate::arch::imp::uart_rx_drain_now();
+    match crate::arch::imp::uart_rx_pop() {
         Some(b) => b as i64,
         None    => NO_CONSOLE_BYTE,
     }
@@ -1563,9 +1563,9 @@ fn handle_console_foreground(cap_slot: u64, op: u64) -> i64 {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
     if op == 0 {
-        crate::arch::x86_64::release_console_foreground();
+        crate::arch::imp::release_console_foreground();
     } else {
-        crate::arch::x86_64::claim_console_foreground(scheduler::current_task_slot() as u32);
+        crate::arch::imp::claim_console_foreground(scheduler::current_task_slot() as u32);
     }
     0
 }
@@ -1588,7 +1588,7 @@ fn handle_console_echo(cap_slot: u64, on: u64) -> i64 {
     if cap.resource_id != CONSOLE_READ_RESOURCE {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
-    crate::arch::x86_64::set_console_echo(on != 0);
+    crate::arch::imp::set_console_echo(on != 0);
     0
 }
 
@@ -1610,7 +1610,7 @@ fn handle_console_boot_complete(cap_slot: u64) -> i64 {
     if cap.resource_id != CONSOLE_READ_RESOURCE {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
-    crate::arch::x86_64::console_boot_complete();
+    crate::arch::imp::console_boot_complete();
     0
 }
 
@@ -1633,7 +1633,7 @@ fn handle_signal_input_ready(cap_slot: u64) -> i64 {
     if cap.resource_id != CONSOLE_PUSH_RESOURCE {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
-    crate::arch::x86_64::set_input_ready();
+    crate::arch::imp::set_input_ready();
     0
 }
 
@@ -1695,7 +1695,7 @@ fn handle_console_push(cap_slot: u64, byte: u64) -> i64 {
     if cap.resource_id != CONSOLE_PUSH_RESOURCE {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
-    crate::arch::x86_64::console_push_byte(byte as u8);
+    crate::arch::imp::console_push_byte(byte as u8);
     0
 }
 
@@ -1716,7 +1716,7 @@ fn handle_reboot() -> i64 {
         return cap_err_to_i64(CapError::CapNotHeld);
     }
     crate::kprintln!("reboot: hardware reset");
-    crate::arch::x86_64::hardware_reset();
+    crate::arch::imp::hardware_reset();
 }
 
 fn ipc_err_to_i64(e: IpcError) -> i64 {
