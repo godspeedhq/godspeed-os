@@ -278,6 +278,29 @@ pub fn disable_interrupts() {
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) }
 }
 
+/// Disable interrupts on the local core and return whether they were previously enabled - the portable
+/// IRQ-save half of a critical section (the arch seam: x86 reads RFLAGS.IF; RISC-V would read+clear
+/// sstatus.SIE, AArch64 DAIF.I). The returned bool is an opaque "were they on" token for `local_irq_restore`.
+#[inline(always)]
+pub fn local_irq_save() -> bool {
+    let rflags: u64;
+    // SAFETY: reading RFLAGS + CLI are local-core operations with no memory effects.
+    unsafe {
+        core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(nostack));
+        core::arch::asm!("cli", options(nomem, nostack));
+    }
+    (rflags & (1 << 9)) != 0
+}
+
+/// Restore interrupts to the state a matching `local_irq_save` captured: re-enable iff they were on.
+/// Nests correctly - an inner save observes IF=0, so only the outermost restore re-enables.
+#[inline(always)]
+pub fn local_irq_restore(was_enabled: bool) {
+    if was_enabled {
+        enable_interrupts();
+    }
+}
+
 /// Enable interrupts and return immediately (pure busy-spin, no C-state hint).
 ///
 /// Used in the idle loop. On Goldmont+ (Apollo Lake / Gemini Lake), both `hlt`

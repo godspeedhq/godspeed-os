@@ -188,11 +188,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
     unsafe {
         let top = (core::ptr::addr_of_mut!(BSP_BOOT_STACK) as *mut u8).add(512 * 1024);
         let top_aligned = (top as usize & !15) as u64;
-        core::arch::asm!(
-            "mov rsp, {0}",
-            in(reg) top_aligned,
-            options(nostack),
-        );
+        arch::imp::switch_to_boot_stack(top_aligned);
     }
 
     // SAFETY: bootloader guarantees boot_info_ptr is valid and aligned.

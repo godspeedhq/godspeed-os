@@ -942,8 +942,7 @@ pub fn run(core_id: u32) -> ! {
     // triple-fault on the next instruction fetch.
     // SAFETY: run() is called once per core before any task switch; CORE_SCHED_CTX[cid] exclusively accessible.
     unsafe {
-        let cr3: u64;
-        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
+        let cr3 = crate::arch::imp::read_page_table_base();
         (*CORE_SCHED_CTX.as_mut_ptr(cid)).cr3 = cr3;
     }
 
@@ -989,7 +988,7 @@ pub fn run(core_id: u32) -> ! {
             Some(next) => {
                 // SAFETY: IF disabled around the switch to prevent preemption.
                 unsafe {
-                    core::arch::asm!("cli", options(nostack, nomem));
+                    crate::arch::imp::disable_interrupts();
                     // V3 (kernel-audit-2): claim `next` with a CAS, not an
                     // unconditional store, so a cross-core kill that stored Dead
                     // between pick_next and here is not overwritten (mirrors the
@@ -1029,7 +1028,7 @@ pub fn run(core_id: u32) -> ! {
                     // Shared tail (switched, or aborted): leave CORE_CURRENT off
                     // `next` so a racing kill's spin-wait proceeds, then re-loop.
                     CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);
-                    core::arch::asm!("sti", options(nostack, nomem));
+                    crate::arch::imp::enable_interrupts();
                 }
             }
             None => {
@@ -1405,7 +1404,7 @@ pub fn yield_current() {
                             )
                             .ok();
                     }
-                    core::arch::asm!("sti", options(nostack, nomem));
+                    crate::arch::imp::enable_interrupts();
                 }
                 return;
             }
@@ -1446,7 +1445,7 @@ pub fn yield_current() {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             );
-            core::arch::asm!("sti", options(nostack, nomem));
+            crate::arch::imp::enable_interrupts();
             return;
         }
 
@@ -1485,7 +1484,7 @@ pub fn yield_current() {
             TASK_CTX[next].assume_init_ref() as *const TaskContext;
 
         switch_context(current_ctx, next_ctx);
-        core::arch::asm!("sti", options(nostack, nomem));
+        crate::arch::imp::enable_interrupts();
     }
 }
 
@@ -2063,7 +2062,7 @@ pub fn park_current() -> i64 {
 pub fn block_and_reschedule(state: TaskState) -> i64 {
     // SAFETY: IF=0 (caller ensures this; double-cli is a no-op).
     unsafe {
-        core::arch::asm!("cli", options(nostack, nomem));
+        crate::arch::imp::disable_interrupts();
 
         let cid  = current_core_id();
         let slot = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
@@ -2086,7 +2085,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
             Ordering::Acquire,
         ).is_err() {
             // CAS failed: wake_by_slot already set state to Ready (lost-wakeup prevention).
-            core::arch::asm!("sti", options(nostack, nomem));
+            crate::arch::imp::enable_interrupts();
             return TASK_WAKEUP_ERR[slot];
         }
 
@@ -2116,7 +2115,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
             }
         }
 
-        core::arch::asm!("sti", options(nostack, nomem));
+        crate::arch::imp::enable_interrupts();
         TASK_WAKEUP_ERR[slot]
     }
 }

@@ -43,6 +43,9 @@ jobs:
       - name: Contract reconcile check (contract vs kernel service_config)
         run: python3 scripts/contract_check.py
 
+      - name: Arch-boundary check (no arch-specific code in neutral layers)
+        run: python3 scripts/arch_boundary_check.py
+
       - name: Unit tests (kernel pure-logic)
         run: python3 scripts/test_report.py
 

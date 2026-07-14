@@ -278,8 +278,23 @@ pub fn ap_init(core_id: u32) {
     }
 }
 
-pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt};
+pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, local_irq_save, local_irq_restore};
+pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
 pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
+
+/// Switch the local core to a new stack top (boot only). Used once at kernel entry to move off the
+/// bootloader's tiny stack onto the kernel's own before any locals are allocated. `#[inline(always)]`
+/// is REQUIRED: it must inline into the caller so there is no function epilogue trying to `ret` off the
+/// just-switched stack. The arch seam for the stack pointer: x86 RSP; RISC-V/AArch64 `sp`.
+///
+/// # Safety
+/// `top` must point at (one past) a valid, sufficiently large, aligned stack region that stays live for
+/// the caller's remaining execution, and no live local may reside on the old stack across the switch.
+#[inline(always)]
+pub unsafe fn switch_to_boot_stack(top: u64) {
+    // SAFETY: caller guarantees `top` is a valid aligned stack top; nothing live is on the old stack.
+    unsafe { core::arch::asm!("mov rsp, {0}", in(reg) top, options(nostack)); }
+}
 
 /// Halt this core. Disables interrupts and loops on hlt.
 /// Milestone 6: broadcast NMI IPI to other cores before halting.

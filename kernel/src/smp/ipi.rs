@@ -113,15 +113,12 @@ fn this_core() -> usize {
 #[inline]
 fn invalidate(addr: u64) {
     if addr == !0u64 {
-        // SAFETY: reloading CR3 with the same value is always valid in ring 0.
-        unsafe {
-            let cr3: u64;
-            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem));
-            core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, nomem));
-        }
+        // SAFETY: reloading the page-table base with the same value is always valid in ring 0.
+        let base = crate::arch::imp::read_page_table_base();
+        unsafe { crate::arch::imp::write_page_table_base(base); }
     } else {
-        // SAFETY: invlpg is always valid in ring 0; `addr` is a virtual address.
-        unsafe { core::arch::asm!("invlpg [{a}]", a = in(reg) addr, options(nostack)); }
+        // SAFETY: single-page local TLB invalidation; `addr` is a virtual address.
+        unsafe { crate::arch::imp::invalidate_tlb_page(addr); }
     }
 }
 
@@ -321,12 +318,7 @@ pub unsafe fn ipi_handler(vector: u8) {
 /// The local APIC must be initialised.
 pub unsafe fn broadcast_full_tlb_flush() {
     // Save the interrupt flag and disable interrupts for the shootdown protocol.
-    // SAFETY: pushfq/cli are always valid in ring 0.
-    let rflags: u64;
-    unsafe {
-        core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(nostack));
-        core::arch::asm!("cli", options(nostack, nomem));
-    }
+    let was_enabled = crate::arch::imp::local_irq_save();
 
     // Flush locally (CR3 reload invalidates all non-global TLB entries on this core).
     invalidate(!0u64);
@@ -337,10 +329,7 @@ pub unsafe fn broadcast_full_tlb_flush() {
     unsafe { request_and_wait(!0u64); }
 
     // Restore the caller's interrupt flag.
-    // SAFETY: push/popfq restores exactly the flags in effect on entry.
-    unsafe {
-        core::arch::asm!("push {}; popfq", in(reg) rflags, options(nostack));
-    }
+    crate::arch::imp::local_irq_restore(was_enabled);
 }
 
 fn handle_tlb_shootdown() {

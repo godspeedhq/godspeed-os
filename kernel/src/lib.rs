@@ -54,8 +54,19 @@ pub mod ipc {
     pub mod names_model;
 }
 
+// Host/lib stub for the arch seam. The pure-logic lib has no hardware, so SpinLock's interrupt masking
+// (smp/spinlock.rs, routed through `crate::arch::imp`) is a no-op here; the real per-arch impl lives in
+// the bin's arch/ (aarch64 Phase 0 / docs/aarch64.md). Mirrors the `kprintln` host-stub pattern above -
+// the lib provides just enough of the seam for the shared pure-logic modules to compile off-hardware.
+pub mod arch {
+    pub mod imp {
+        #[inline(always)] pub fn local_irq_save() -> bool { false }
+        #[inline(always)] pub fn local_irq_restore(_was_enabled: bool) {}
+    }
+}
+
 // SpinLock is used by capability/table.rs (GLOBAL_RESOURCES).
-// spinlock.rs uses only core primitives so it compiles fine in std test mode.
+// spinlock.rs routes its irq masking through the arch seam (real in the bin, no-op stub above in the lib).
 pub mod smp {
     pub mod spinlock;
     pub use spinlock::SpinLock;

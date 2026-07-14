@@ -255,6 +255,37 @@ const PAGE_SIZE_BIT: u64 = 1 << 7;
 /// page tables, or `None` if `virt` is unmapped. Walks PML4→PDPT→PD→PT and stops
 /// early at a large-page entry. Read-only - it does not modify any table. Used to
 /// audit mapping permissions (the NX / W^X check in `boot::audit_wx`).
+/// Read the page-table base register - the physical address of the active root table, low bits included
+/// (caller masks). The arch seam for the MMU base: x86 CR3; RISC-V satp.PPN, AArch64 TTBR0_EL1.
+#[inline(always)]
+pub fn read_page_table_base() -> u64 {
+    let v: u64;
+    // SAFETY: reading CR3 is a local-core register read with no memory effects.
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) v, options(nostack, nomem)); }
+    v
+}
+
+/// Write the page-table base register, switching the active address space (an x86 CR3 reload also flushes
+/// non-global TLB entries on this core). The arch seam: RISC-V satp write + sfence, AArch64 TTBR0_EL1.
+///
+/// # Safety
+/// `base` must be a valid root-table physical address for this core's intended address space.
+#[inline(always)]
+pub unsafe fn write_page_table_base(base: u64) {
+    // SAFETY: caller guarantees `base` is a valid root-table physical address.
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) base, options(nostack, nomem)); }
+}
+
+/// Invalidate a single TLB entry for `addr` on the local core (x86 invlpg; RISC-V sfence.vma, AArch64 TLBI).
+///
+/// # Safety
+/// Local-core TLB maintenance for a mapping the caller is changing.
+#[inline(always)]
+pub unsafe fn invalidate_tlb_page(addr: u64) {
+    // SAFETY: local-core TLB invalidation, no memory effects beyond the TLB.
+    unsafe { core::arch::asm!("invlpg [{a}]", a = in(reg) addr, options(nostack)); }
+}
+
 pub fn entry_for_va(virt: u64) -> Option<u64> {
     let cr3: u64;
     // SAFETY: reading CR3 is always valid in ring 0.

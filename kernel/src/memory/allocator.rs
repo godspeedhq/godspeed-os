@@ -591,9 +591,7 @@ pub fn protect_kernel_page_table_frames() {
     }
 
     // SAFETY: CR3 is always valid after Limine hands control to the kernel.
-    let cr3: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)) };
-    let pml4_phys = cr3 & !0xFFF_u64;
+    let pml4_phys = crate::arch::imp::read_page_table_base() & !0xFFF_u64;
 
     alloc_lock();
     // SAFETY: lock held; BITMAP and ALLOCATOR.free_frames may be mutated.

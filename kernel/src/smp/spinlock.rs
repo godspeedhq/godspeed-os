@@ -8,6 +8,15 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
+// Local-core interrupt masking for the irq-safe lock (`lock_irq` / `without_interrupts`), routed through
+// the arch seam (`arch::imp`) so the arch-specific asm lives ONLY in arch/ (aarch64 Phase 0). The
+// pure-logic host/lib build provides a no-op `arch::imp` stub (lib.rs), so SpinLock stays
+// host-unit-testable exactly as lib.rs promises - no hardware asm in this neutral file.
+#[inline(always)]
+fn irq_save() -> bool { crate::arch::imp::local_irq_save() }
+#[inline(always)]
+fn irq_restore(was_enabled: bool) { crate::arch::imp::local_irq_restore(was_enabled) }
+
 /// Watchdog bound for a `lock()`/`lock_irq()` spin. A kernel critical section is short (microseconds);
 /// even heavy cross-core contention drains in well under this. Spinning past ~10^9 iterations (a few
 /// seconds at GHz) means the holder is NEVER releasing - a preempted/un-reschedulable holder, or an
@@ -89,12 +98,7 @@ impl<T> SpinLock<T> {
     pub fn lock_irq(&self) -> SpinLockGuard<'_, T> {
         // SAFETY: reading RFLAGS + cli are local-core, no memory effects; the prior IF (bit 9) is
         // captured and restored exactly on drop. Disable BEFORE spinning so the hold is never preempted.
-        let was_enabled = unsafe {
-            let rflags: u64;
-            core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(nostack));
-            core::arch::asm!("cli", options(nomem, nostack));
-            (rflags & (1 << 9)) != 0
-        };
+        let was_enabled = irq_save();
         let mut spins: u64 = 0;
         while self.locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -136,17 +140,9 @@ pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
     // SAFETY: reading RFLAGS and toggling IF are local-core operations with no memory effects; the
     // prior IF (bit 9) is captured and restored exactly. `pushfq; pop` is balanced (nostack matches
     // the existing convention in smp/ipi.rs; the kernel target has no red zone).
-    let was_enabled = unsafe {
-        let rflags: u64;
-        core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(nostack));
-        core::arch::asm!("cli", options(nomem, nostack));
-        (rflags & (1 << 9)) != 0
-    };
+    let was_enabled = irq_save();
     let r = f();
-    if was_enabled {
-        // SAFETY: restore the prior (enabled) interrupt state we masked above.
-        unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
-    }
+    irq_restore(was_enabled);
     r
 }
 
@@ -168,9 +164,6 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
-        if self.irq_restore {
-            // SAFETY: restore the prior (enabled) interrupt state that lock_irq masked.
-            unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
-        }
+        irq_restore(self.irq_restore);
     }
 }

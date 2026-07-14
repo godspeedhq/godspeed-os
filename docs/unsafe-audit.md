@@ -67,6 +67,29 @@ id > 255 is excluded LOUDLY (§26.7) until the APIC layer gains x2APIC. Validate
 
 ---
 
+## 2026-07-14 - aarch64 Phase 0: isolate arch asm behind `arch::imp` primitives
+
+The arch-boundary seal (docs/aarch64.md) moved every inline-asm operation out of the arch-NEUTRAL layers
+and behind `arch::imp` primitives, so `unsafe` asm consolidated INTO the permitted arch layer and OUT of
+the neutral files. New primitives (each one `// SAFETY:`-commented): `page_tables::{read_page_table_base,
+write_page_table_base, invalidate_tlb_page}`, `interrupts::{local_irq_save, local_irq_restore}`,
+`mod::switch_to_boot_stack`.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/page_tables.rs` | 41 → 46 (+5) | CR3 read/write + `invlpg` primitives (the MMU-base + TLB seam). |
+| `arch/x86_64/mod.rs` | 33 → 35 (+2) | `switch_to_boot_stack` (the boot stack-pointer seam; `#[inline(always)]`). |
+| `arch/x86_64/interrupts.rs` | 21 → 22 (+1) | `local_irq_save` (the irq-save half; `local_irq_restore` calls `enable_interrupts`). |
+| `memory/allocator.rs` | 44 → 43 (-1) | CR3-read asm replaced by `arch::imp::read_page_table_base`. |
+| `smp/ipi.rs` | 25 → 23 (-2) | CR3 reload + `invlpg` + rflags save/restore replaced by `arch::imp` primitives. |
+| `smp/spinlock.rs` | 9 → 5 (-4) | irq-save/restore asm replaced by `arch::imp::local_irq_save/restore` (no-op stub in the host lib). |
+
+Net: neutral-layer asm now ZERO (enforced by `scripts/arch_boundary_check.py`, CI-wired); the arch
+layer is the sole home of `unsafe` asm, as §18.1 intends. `task/scheduler.rs` + `main.rs` asm was
+removed too but their `unsafe` blocks (other ops) stayed, so their counts are unchanged. Identity 24/0.
+
+---
+
 ## 2026-07-13 - kernel-audit-3 fix: spurious-interrupt stub (K3)
 
 | File | Change | Why |
@@ -218,24 +241,24 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/boot.rs | 92 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 5 | permitted |
-| arch/x86_64/interrupts.rs | 21 | permitted |
+| arch/x86_64/interrupts.rs | 22 | permitted |
 | arch/x86_64/ioapic.rs | 8 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
-| arch/x86_64/mod.rs | 33 | permitted |
-| arch/x86_64/page_tables.rs | 41 | permitted |
+| arch/x86_64/mod.rs | 35 | permitted |
+| arch/x86_64/page_tables.rs | 46 | permitted |
 | arch/x86_64/pci.rs | 19 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 15 | permitted |
 | capability/table.rs | 7 | permitted |
-| memory/allocator.rs | 44 | permitted |
+| memory/allocator.rs | 43 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
-| smp/ipi.rs | 25 | permitted |
+| smp/ipi.rs | 23 | permitted |
 | smp/mod.rs | 1 | permitted |
 | smp/percpu.rs | 8 | permitted |
 | smp/placement.rs | 1 | permitted |
-| smp/spinlock.rs | 9 | permitted |
+| smp/spinlock.rs | 5 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
 | loader.rs | 4 | grandfathered |
 | main.rs | 2 | grandfathered |
