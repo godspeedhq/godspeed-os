@@ -111,10 +111,24 @@ is stub-or-defer. That is the real size of "supporting the architecture."
 >   by construction - implement `arch/<new>/` to the `imp` surface, touch zero neutral files, and CI
 >   guarantees no neutral file smuggled in arch-specific code.
 >
-> **Still open** (a hygiene simplification, not a boundary hole): the bucket-B relocation (§1.1) of the
-> misfiled arch-*neutral* console/UART state machines out of `arch/x86_64/mod.rs` into a neutral module.
-> That shrinks the arch *implementation* file; it does not affect boundedness (it's neutral code either
-> way). Deferred as pure code-motion best done with a live operator.
+> - **IPI-send extraction (2026-07-14):** `smp/ipi.rs` was the last file in a *permitted* layer still
+>   holding APIC MMIO (the ICR programming for a targeted `send_ipi` + the shootdown broadcast). Moved to
+>   `arch/x86_64/boot.rs` as `send_ipi_to_lapic(lapic_id, vector)` + `broadcast_ipi_all_but_self(vector)`;
+>   `smp/ipi.rs` now resolves core->LAPIC and holds only the neutral shootdown *protocol* (per-core ack
+>   masks, request/wait), calling the arch seam for the actual send. **`smp/ipi.rs` is now APIC-MMIO-free
+>   - arch owns ALL hardware MMIO.** Identity 24/0 (9A cross-core IPC + the shootdown exercise the moved
+>   paths). So the boundedness claim is now clean: a port reimplements `arch/`, full stop.
+> - **Dash guard (2026-07-14):** `scripts/dash_check.py` (CI-wired) enforces CLAUDE.md §21 (ASCII hyphen
+>   only, no em/en dash) mechanically instead of by hand-grepping each diff.
+>
+> **Remaining soft-spots (documented, not blocking):**
+> - The IPI *vector numbers* (`WAKE_RECEIVER=0xF0`, `TLB_SHOOTDOWN=0xF1`, `SCHEDULER_TICK=0xF2` in
+>   `smp/ipi::vectors`) are x86 IDT vectors passed through to `arch::imp`. A GIC port maps the IPI *kind*
+>   to an SGI id (0-15), so those three numbers want to become abstract kinds that arch resolves - a
+>   small change best finalized alongside the GIC impl (rule of three), not now.
+> - **Bucket-B relocation** (§1.1): the misfiled arch-*neutral* console/UART state machines in
+>   `arch/x86_64/mod.rs` -> a neutral module. Shrinks the arch *implementation* file; does not affect
+>   boundedness (neutral either way). Pure code-motion, deferred for a live operator.
 
 Do the de-x86-ification as a refactor on the x86 side, verified by the identity suite (24/24 = zero
 behavior change), *before* writing AArch64. Then adding `arch/aarch64/` is "implement the same surface"

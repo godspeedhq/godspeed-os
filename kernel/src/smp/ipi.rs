@@ -16,9 +16,6 @@ pub mod vectors {
     pub const SCHEDULER_TICK: u8 = 0xF2;
 }
 
-// xAPIC ICR register offsets (relative to APIC base).
-const APIC_ICR_HIGH: u64 = 0x310;
-const APIC_ICR_LOW:  u64 = 0x300;
 
 // Per-core TLB shootdown state - one independent request slot per INITIATING core, so concurrent
 // shootdowns never share a counter or address. The single-global `TLB_ACK` / `TLB_SHOOTDOWN_ADDR`
@@ -161,28 +158,11 @@ fn service_pending(me: usize) {
 /// # Safety
 /// `core_id` must refer to a ready core; the local APIC must be mapped.
 pub unsafe fn send_ipi(core_id: u32, vector: u8) {
-    let lapic_id  = crate::smp::core::core_lapic_id(core_id);
-    let apic_base = unsafe { crate::arch::imp::boot::get_apic_virt_base() };
-
-    // xAPIC ICR write protocol: write high word (destination) first, then
-    // low word (vector + delivery mode), which triggers delivery.
-    // Fixed delivery, edge-triggered, assert (bit 14), no shorthand.
-    // SAFETY: apic_base is a valid MMIO address set during init_local_apic.
-    unsafe {
-        write_apic_reg(apic_base + APIC_ICR_HIGH, (lapic_id & 0xFF) << 24);
-        // Per Intel SDM §10.6.1: poll the Delivery Status bit (bit 12 of
-        // ICR_LOW) before writing a new IPI.  Writing while DELIVS=1 silently
-        // drops the interrupt on some xAPIC implementations (observed on
-        // Goldmont+ under concurrent IPI load).  Cap at 10 000 iterations to
-        // avoid an infinite spin if the APIC is wedged.
-        let mut tries = 0u32;
-        while (read_apic_reg(apic_base + APIC_ICR_LOW) >> 12) & 1 != 0 {
-            core::hint::spin_loop();
-            tries += 1;
-            if tries >= 10_000 { break; }
-        }
-        write_apic_reg(apic_base + APIC_ICR_LOW, (vector as u32) | (1 << 14));
-    }
+    // Resolve the core -> LAPIC mapping (smp owns it) and hand the raw send to the arch seam (arch owns
+    // the APIC MMIO). The protocol logic below stays here; only the register programming lives in arch.
+    let lapic_id = crate::smp::core::core_lapic_id(core_id);
+    // SAFETY: local APIC mapped after init_local_apic; lapic_id is a ready core's id.
+    unsafe { crate::arch::imp::boot::send_ipi_to_lapic(lapic_id, vector); }
 }
 
 /// Broadcast a `TLB_SHOOTDOWN` IPI to all OTHER cores (all-excluding-self shorthand).
@@ -190,24 +170,9 @@ pub unsafe fn send_ipi(core_id: u32, vector: u8) {
 /// # Safety
 /// The APIC must be mapped; the caller holds IF=0 (or has saved/disabled it).
 unsafe fn broadcast_shootdown_ipi() {
-    let apic_base = unsafe { crate::arch::imp::boot::get_apic_virt_base() };
-    // SAFETY: APIC mapped; IF=0.
-    unsafe {
-        write_apic_reg(apic_base + APIC_ICR_HIGH, 0);
-        // Poll DELIVS (bit 12) before the broadcast (SDM §10.6.1) - writing while DELIVS=1 silently
-        // drops the IPI on some xAPICs. Bounded so a wedged APIC can't spin forever.
-        let mut tries = 0u32;
-        while (read_apic_reg(apic_base + APIC_ICR_LOW) >> 12) & 1 != 0 {
-            core::hint::spin_loop();
-            tries += 1;
-            if tries >= 10_000 { break; }
-        }
-        // ICR shorthand 0b11 (all-excluding-self, bits 19:18), fixed delivery, edge, assert (bit 14).
-        write_apic_reg(
-            apic_base + APIC_ICR_LOW,
-            (vectors::TLB_SHOOTDOWN as u32) | (1 << 14) | (0b11 << 18),
-        );
-    }
+    // smp owns WHICH vector (the TLB_SHOOTDOWN kind); arch owns the APIC broadcast MMIO.
+    // SAFETY: APIC mapped; caller holds IF=0.
+    unsafe { crate::arch::imp::boot::broadcast_ipi_all_but_self(vectors::TLB_SHOOTDOWN); }
 }
 
 /// Publish this core's shootdown request for `addr` (`!0` = full CR3 flush), broadcast it, and wait
@@ -338,14 +303,3 @@ fn handle_tlb_shootdown() {
     service_pending(this_core());
 }
 
-#[inline]
-unsafe fn read_apic_reg(addr: u64) -> u32 {
-    // SAFETY: addr is a valid MMIO register inside the mapped APIC page.
-    unsafe { (addr as *const u32).read_volatile() }
-}
-
-#[inline]
-unsafe fn write_apic_reg(addr: u64, val: u32) {
-    // SAFETY: addr is a valid MMIO register inside the mapped APIC page.
-    unsafe { (addr as *mut u32).write_volatile(val) }
-}

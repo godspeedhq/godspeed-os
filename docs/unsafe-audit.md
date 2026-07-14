@@ -84,6 +84,8 @@ write_page_table_base, invalidate_tlb_page}`, `interrupts::{local_irq_save, loca
 | `smp/ipi.rs` | 25 → 23 (-2) | CR3 reload + `invlpg` + rflags save/restore replaced by `arch::imp` primitives. |
 | `smp/spinlock.rs` | 9 → 5 (-4) | irq-save/restore asm replaced by `arch::imp::local_irq_save/restore` (no-op stub in the host lib). |
 
+Follow-on same day - **IPI-send extraction**: `smp/ipi.rs` held the last APIC MMIO in a permitted-but-not-arch layer (the ICR programming for `send_ipi` + the shootdown broadcast). Moved to `arch/x86_64/boot.rs` as `send_ipi_to_lapic(lapic_id, vector)` + `broadcast_ipi_all_but_self(vector)` (+ `apic_wait_icr_idle`); `smp/ipi.rs` now resolves core->LAPIC and holds the neutral shootdown PROTOCOL only, calling the arch seam for the send. `smp/ipi.rs` 23 -> 17 (-6, incl. the removed `read/write_apic_reg` helpers + ICR consts); `arch/x86_64/boot.rs` 92 -> 98 (+6). `smp/ipi.rs` is now APIC-MMIO-free; arch owns ALL hardware MMIO. Identity 24/0 (9A cross-core IPC + shootdown exercise the moved paths).
+
 Net: neutral-layer asm now ZERO (enforced by `scripts/arch_boundary_check.py`, CI-wired); the arch
 layer is the sole home of `unsafe` asm, as §18.1 intends. `task/scheduler.rs` + `main.rs` asm was
 removed too but their `unsafe` blocks (other ops) stayed, so their counts are unchanged. Identity 24/0.
@@ -238,7 +240,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
 | arch/x86_64/ap_boot.rs | 2 | permitted |
-| arch/x86_64/boot.rs | 92 | permitted |
+| arch/x86_64/boot.rs | 98 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 5 | permitted |
 | arch/x86_64/interrupts.rs | 22 | permitted |
@@ -254,7 +256,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
-| smp/ipi.rs | 23 | permitted |
+| smp/ipi.rs | 17 | permitted |
 | smp/mod.rs | 1 | permitted |
 | smp/percpu.rs | 8 | permitted |
 | smp/placement.rs | 1 | permitted |

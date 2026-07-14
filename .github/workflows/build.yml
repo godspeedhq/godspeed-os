@@ -46,6 +46,9 @@ jobs:
       - name: Arch-boundary check (no arch-specific code in neutral layers)
         run: python3 scripts/arch_boundary_check.py
 
+      - name: Dash check (house convention: ASCII hyphen only, CLAUDE.md §21)
+        run: python3 scripts/dash_check.py
+
       - name: Unit tests (kernel pure-logic)
         run: python3 scripts/test_report.py
 

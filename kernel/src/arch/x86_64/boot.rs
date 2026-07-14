@@ -707,6 +707,59 @@ pub unsafe fn get_lapic_id() -> u32 {
     }
 }
 
+// ICR (Interrupt Command Register) offsets - the local APIC's cross-core IPI-send registers.
+const APIC_ICR_LOW:  u64 = 0x300;
+const APIC_ICR_HIGH: u64 = 0x310;
+
+/// Poll the ICR Delivery-Status bit (ICR_LOW bit 12) until clear, bounded. Writing a new IPI while
+/// DELIVS=1 silently drops it on some xAPICs (observed on Goldmont+ under concurrent IPI load); the
+/// cap keeps a wedged APIC from spinning forever (SDM 10.6.1).
+///
+/// # Safety
+/// APIC must be mapped (after `init_local_apic`).
+#[inline]
+unsafe fn apic_wait_icr_idle() {
+    let mut tries = 0u32;
+    // SAFETY: APIC_VIRT_BASE valid; volatile MMIO read of ICR_LOW.
+    while unsafe { ((APIC_VIRT_BASE + APIC_ICR_LOW) as *const u32).read_volatile() >> 12 } & 1 != 0 {
+        core::hint::spin_loop();
+        tries += 1;
+        if tries >= 10_000 { break; }
+    }
+}
+
+/// Send a fixed-delivery IPI to the core with local-APIC id `lapic_id`, raising `vector` on it. The arch
+/// seam for a TARGETED cross-core IPI (AArch64 maps this to a GIC SGI, RISC-V to a CLINT MSIP write).
+///
+/// # Safety
+/// The local APIC must be mapped (after `init_local_apic`); `lapic_id` must be a valid target core.
+#[inline]
+pub unsafe fn send_ipi_to_lapic(lapic_id: u32, vector: u8) {
+    // xAPIC ICR write protocol: high word (destination) first, then low word (vector + assert, bit 14),
+    // which triggers delivery. SAFETY: APIC mapped; DELIVS polled before the write per SDM 10.6.1.
+    unsafe {
+        write_apic(APIC_VIRT_BASE, APIC_ICR_HIGH, (lapic_id & 0xFF) << 24);
+        apic_wait_icr_idle();
+        write_apic(APIC_VIRT_BASE, APIC_ICR_LOW, (vector as u32) | (1 << 14));
+    }
+}
+
+/// Broadcast `vector` as an IPI to all cores EXCEPT this one (xAPIC all-excluding-self shorthand). The
+/// arch seam for a BROADCAST IPI (AArch64: GIC SGI with the broadcast target-list filter).
+///
+/// # Safety
+/// The APIC must be mapped; the caller holds IF=0 (or has saved/disabled it).
+#[inline]
+pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {
+    // SAFETY: APIC mapped; IF=0. Shorthand 0b11 (all-excluding-self, ICR_LOW bits 19:18), fixed
+    // delivery, edge, assert (bit 14); DELIVS polled first (SDM 10.6.1).
+    unsafe {
+        write_apic(APIC_VIRT_BASE, APIC_ICR_HIGH, 0);
+        apic_wait_icr_idle();
+        write_apic(APIC_VIRT_BASE, APIC_ICR_LOW, (vector as u32) | (1 << 14) | (0b11 << 18));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers.
 // ---------------------------------------------------------------------------
