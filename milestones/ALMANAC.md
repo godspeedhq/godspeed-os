@@ -45,7 +45,8 @@
 - [2026-07-09 - The day recovery became a fixed point](#2026-07-09---the-day-recovery-became-a-fixed-point)
 - [2026-07-10 - The day the kernel met a second architecture, and fit the machine it found](#2026-07-10---the-day-the-kernel-met-a-second-architecture-and-fit-the-machine-it-found)
 - [2026-07-11 to 2026-07-13 - The days the whole system stood for audit](#2026-07-11-to-2026-07-13---the-days-the-whole-system-stood-for-audit)
-- [2026-07-14 - The day one kernel booted three instruction sets](#2026-07-14---the-day-one-kernel-booted-three-instruction-sets)
+- [2026-07-14 - The day the boundary became something a machine enforced](#2026-07-14---the-day-the-boundary-became-something-a-machine-enforced)
+- [2026-07-14 - The day one kernel booted three instruction sets in QEMU virt](#2026-07-14---the-day-one-kernel-booted-three-instruction-sets-in-qemu-virt)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -650,45 +651,71 @@ someone thinks to check.
 
 ---
 
-## 2026-07-14 - The day one kernel booted three instruction sets
+## 2026-07-14 - The day the boundary became something a machine enforced
 
-Straight off the audit, the arch boundary was sealed and made mechanical: one seam
-(`crate::arch::imp`), every inline-asm operation moved behind it, and a CI guard
-(`arch_boundary_check.py`) that fails the build if any neutral file so much as names an
-architecture. Then the boundary was put to the only test that cannot be argued with. The
-arch-neutral kernel - the capability table, IPC, scheduler, syscall dispatch, memory, task,
-loader, every service's logic - was compiled and booted on **three genuinely different
-instruction sets**, writing only `arch/<isa>/`: x86-64 (the full OS, all the way to the
-`gsh>` shell), AArch64 (QEMU `virt`, a line on the PL011 UART), and RISC-V (QEMU `virt`,
-OpenSBI into S-mode, a line on the 16550). Not one arch-neutral file changed between them.
-Three QEMU consoles, one codebase.
+Straight off the audit, the arch boundary stopped being a habit and became a law. The survey
+came first - because you cannot seal what you have not measured: 126 places where a
+neutral file reached for the x86 layer by name, 23 lines of inline assembly living outside
+`arch/`, and - the number that mattered - *zero* of either in the capability table or IPC.
+Then the sealing: one seam, `crate::arch::imp`, that names "the implementation for whatever
+architecture this is"; all 126 references routed through it; every inline-asm operation
+(read the page-table base, invalidate a TLB entry, mask interrupts, send an IPI) moved out of
+the neutral layers and behind an `arch::imp` primitive, so that not one arch-neutral file
+holds a single instruction of assembly. And last, the part that makes it stick:
+`arch_boundary_check.py`, a CI guard that **fails the build** if any file outside `arch/` so
+much as writes `asm!` or names a specific architecture.
 
-**What I came to understand:** a boundary is a *claim* until a second implementation is
-dropped in behind it without touching what it bounds - and it becomes a *law* on the third.
-The demarcation was never something to prove on a whiteboard; it was something to observe on
-a wire, exactly like the boot on day one. And the tell was in *how* the three went: AArch64
-took real debugging - the CPU traps FP/SIMD at EL1 by default and Rust emits NEON for a
-byte-copy, so the first port faulted before its first Rust statement (found by reading the
-exception ESR off `qemu -d int`), and the SP had to be forced 16-aligned. That was me
-learning the architecture's quirks. **RISC-V went first try, no debugging.** By the third
-ISA the playbook was solid and the neutral kernel simply came along for the ride - which is
-precisely what "bounded" is supposed to *feel* like: the second implementation teaches you
-the arch's personality, the third is a formality. The deepest thing, though, is that this
-day and the audit days were the same act seen from two sides. The audit proved the *inside*
-was honest - nothing above the kernel could wedge it. The port proved the *edge* was real -
-nothing inside the kernel had smuggled the machine into the model. A boundary is only as
-trustworthy as the code it bounds is clean, and the code was clean because it had already
-been walked end to end. The small kernel that was cheap to audit was, for the same reason,
-cheap to carry to a new machine.
+**What I came to understand:** a boundary that lives only in a contributor's head, or even in
+a well-written doc, will rot - because nothing stops the next well-meaning change from
+crossing it. The whole difference between a *convention* and a *law* is whether a machine
+refuses to let you break it. The seam made the boundary **nameable** (`arch::imp`, one place);
+the guard made it **unbreakable** (CI, every push). This is §26 - *the architecture survives
+only if the discipline survives* - turned from an aspiration into a mechanism. And the survey
+taught its own lesson: the belief "the boundary is clean" was worth nothing until it was a
+number, and the number that carried the whole bet was the *zero* in `capability/` and `ipc/`.
 
-**What it produced:** `docs/multi-arch.md` (the three-ISA record) and the executable form of
-§26 - *the architecture survives only if the discipline survives*. The boundary is now held
-not by intention but by four CI guards **and** three live consoles: to add a fourth ISA you
-implement `arch/<new>/` to the `imp` surface, add one `#[cfg(target_arch)]` arm, and the
-compiler plus CI prove that no neutral file had to move. It closed the founding thesis into a
-demonstrated fact: a capability microkernel kept *small enough to fully audit* has an arch
-boundary *clean enough that a new architecture is a bounded drop-in* - claim to proof, in the
-span of a single day that only looked sudden because a hundred careful days came before it.
+**What it produced:** the `arch::imp` seam and the arch-boundary guard - the fourth of the
+kernel's mechanical disciplines (alongside the unsafe audit, the contract reconcile, and the
+dash convention). A boundary you can no longer cross by accident, only by deleting the guard
+on purpose. It set the stage for the only test that could prove the boundary was real.
+
+## 2026-07-14 - The day one kernel booted three instruction sets in QEMU virt
+
+With the boundary sealed and enforced, it was put to the one test that cannot be argued with.
+The arch-neutral kernel - the capability table, IPC, scheduler, syscall dispatch, memory,
+task, loader, every service's logic - was compiled and booted on **three genuinely different
+instruction sets**, writing only `arch/<isa>/`. x86-64 ran the full OS, all the way to the
+`gsh>` shell. AArch64 booted under QEMU's `virt` virtual machine (`qemu-system-aarch64 -M
+virt`) and put a line on the PL011 UART. RISC-V booted under the same `virt` machine
+(`qemu-system-riscv64 -M virt`), handed off by OpenSBI into S-mode, and put a line on the
+16550. Not one arch-neutral file changed between them. Three QEMU-`virt` consoles, one
+codebase.
+
+**What I came to understand:** a boundary is a *claim* until a second implementation drops in
+behind it without touching what it bounds - and it becomes a *law* on the third. The
+demarcation was never something to prove on a whiteboard; it was something to observe on a
+wire, exactly like the boot on day one. And the tell was in *how* the three went. AArch64 took
+real debugging: the CPU traps FP/SIMD at EL1 by default and Rust emits NEON for a byte-copy,
+so the first port faulted before its first Rust statement (found by reading the exception ESR
+off `qemu -d int`), and the stack pointer had to be forced 16-aligned. That was me learning
+the architecture's personality. **RISC-V went first try, no debugging** - `riscv64imac` is
+soft-float, so there was nothing to trap, and by the third ISA the playbook was solid enough
+that the neutral kernel simply came along for the ride. That asymmetry *is* what "bounded"
+feels like: the second implementation teaches you the arch's quirks, the third is a formality.
+The deepest thing is that this day and the audit days were the same act seen from two sides -
+the audit proved the *inside* was honest (nothing above the kernel could wedge it), and the
+port proved the *edge* was real (nothing inside had smuggled the machine into the model). A
+boundary is only as trustworthy as the code it bounds is clean; the code was clean because it
+had already been walked end to end. The small kernel that was cheap to audit was, for the same
+reason, cheap to carry to a new machine.
+
+**What it produced:** `docs/multi-arch.md`, and the founding thesis closed into a demonstrated
+fact. The boundary is now held not by intention but by four CI guards **and** three live
+QEMU-`virt` consoles: to add a fourth ISA you implement `arch/<new>/` to the `imp` surface,
+add one `#[cfg(target_arch)]` arm, and the compiler plus CI prove that no neutral file had to
+move. A capability microkernel kept *small enough to fully audit* has an arch boundary *clean
+enough that a new architecture is a bounded drop-in* - claim to proof, in the span of a day
+that only looked sudden because a hundred careful days came before it.
 
 ---
 
