@@ -45,6 +45,7 @@
 - [2026-07-09 - The day recovery became a fixed point](#2026-07-09---the-day-recovery-became-a-fixed-point)
 - [2026-07-10 - The day the kernel met a second architecture, and fit the machine it found](#2026-07-10---the-day-the-kernel-met-a-second-architecture-and-fit-the-machine-it-found)
 - [2026-07-11 to 2026-07-13 - The days the whole system stood for audit](#2026-07-11-to-2026-07-13---the-days-the-whole-system-stood-for-audit)
+- [2026-07-14 - The day one kernel booted three instruction sets](#2026-07-14---the-day-one-kernel-booted-three-instruction-sets)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -646,6 +647,48 @@ an audit is that *nothing above the kernel may panic or wedge it*: a service's w
 cost that service its life and no more. The findings became the next increment of work; the discipline
 became a habit. A model you can re-verify in an afternoon is a model that stays honest between the days
 someone thinks to check.
+
+---
+
+## 2026-07-14 - The day one kernel booted three instruction sets
+
+Straight off the audit, the arch boundary was sealed and made mechanical: one seam
+(`crate::arch::imp`), every inline-asm operation moved behind it, and a CI guard
+(`arch_boundary_check.py`) that fails the build if any neutral file so much as names an
+architecture. Then the boundary was put to the only test that cannot be argued with. The
+arch-neutral kernel - the capability table, IPC, scheduler, syscall dispatch, memory, task,
+loader, every service's logic - was compiled and booted on **three genuinely different
+instruction sets**, writing only `arch/<isa>/`: x86-64 (the full OS, all the way to the
+`gsh>` shell), AArch64 (QEMU `virt`, a line on the PL011 UART), and RISC-V (QEMU `virt`,
+OpenSBI into S-mode, a line on the 16550). Not one arch-neutral file changed between them.
+Three QEMU consoles, one codebase.
+
+**What I came to understand:** a boundary is a *claim* until a second implementation is
+dropped in behind it without touching what it bounds - and it becomes a *law* on the third.
+The demarcation was never something to prove on a whiteboard; it was something to observe on
+a wire, exactly like the boot on day one. And the tell was in *how* the three went: AArch64
+took real debugging - the CPU traps FP/SIMD at EL1 by default and Rust emits NEON for a
+byte-copy, so the first port faulted before its first Rust statement (found by reading the
+exception ESR off `qemu -d int`), and the SP had to be forced 16-aligned. That was me
+learning the architecture's quirks. **RISC-V went first try, no debugging.** By the third
+ISA the playbook was solid and the neutral kernel simply came along for the ride - which is
+precisely what "bounded" is supposed to *feel* like: the second implementation teaches you
+the arch's personality, the third is a formality. The deepest thing, though, is that this
+day and the audit days were the same act seen from two sides. The audit proved the *inside*
+was honest - nothing above the kernel could wedge it. The port proved the *edge* was real -
+nothing inside the kernel had smuggled the machine into the model. A boundary is only as
+trustworthy as the code it bounds is clean, and the code was clean because it had already
+been walked end to end. The small kernel that was cheap to audit was, for the same reason,
+cheap to carry to a new machine.
+
+**What it produced:** `docs/multi-arch.md` (the three-ISA record) and the executable form of
+§26 - *the architecture survives only if the discipline survives*. The boundary is now held
+not by intention but by four CI guards **and** three live consoles: to add a fourth ISA you
+implement `arch/<new>/` to the `imp` surface, add one `#[cfg(target_arch)]` arm, and the
+compiler plus CI prove that no neutral file had to move. It closed the founding thesis into a
+demonstrated fact: a capability microkernel kept *small enough to fully audit* has an arch
+boundary *clean enough that a new architecture is a bounded drop-in* - claim to proof, in the
+span of a single day that only looked sudden because a hundred careful days came before it.
 
 ---
 
