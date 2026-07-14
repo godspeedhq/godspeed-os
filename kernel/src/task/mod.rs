@@ -180,10 +180,10 @@ pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
 /// reservation bounded - one arena per driver, reused, rather than one allocated per spawn. So a stray
 /// device DMA (if the kill-path bus-master quiesce ever fails) always lands in DMA-reserved memory,
 /// never a PTE or kernel struct. 0 = not yet allocated. (xhci/ehci/block-driver; a future NIC = 4th.)
-pub static XHCI_DMA_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static EHCI_DMA_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static AHCI_DMA_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static NIC_DMA_PHYS:  core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static XHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+pub static EHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+pub static AHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+pub static NIC_DMA_PHYS:  portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 /// Pages of contiguous DMA memory for the **xHCI** driver. The first 32 pages
 /// hold the control structures (command/event rings, DCBAA, ERST) and the six
 /// per-device 4-page slices, plus the scratchpad buffer array at page 31; the
@@ -363,7 +363,7 @@ impl HwClass {
     /// Arena size: xHCI needs room for its 256-buffer scratchpad; every other driver gets 64 KiB.
     fn dma_pages(self) -> u64 { if self == HwClass::Xhci { XHCI_DMA_PAGES } else { EHCI_DMA_PAGES } }
     /// The permanent per-class DMA phys reservation, reused across respawns (§12 DMA permanent-reserve).
-    fn dma_phys_slot(self) -> &'static core::sync::atomic::AtomicU64 {
+    fn dma_phys_slot(self) -> &'static portable_atomic::AtomicU64 {
         match self {
             HwClass::Xhci => &XHCI_DMA_PHYS,
             HwClass::Ehci => &EHCI_DMA_PHYS,
@@ -3837,8 +3837,8 @@ pub fn spawn_supervisor() {
 // ---------------------------------------------------------------------------
 static SUPERVISOR_RESPAWN_PENDING: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-static SUPERVISOR_RESPAWN_COUNT: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static SUPERVISOR_RESPAWN_COUNT: portable_atomic::AtomicU64 =
+    portable_atomic::AtomicU64::new(0);
 /// True while a supervisor respawn is in flight (from just before PENDING is claimed in
 /// `poll_supervisor_respawn` until `spawn_supervisor` returns). The timer ISR uses it to ROUND-ROBIN
 /// the spawn with ready tasks (see `scheduler::timer_tick_from_irq`): when a task is running it

@@ -227,7 +227,8 @@ pub mod rtc {
 
 // ---------------------------------------------------------------------------
 pub mod pci {
-    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64};
+    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
+    use portable_atomic::AtomicU64;
     pub static XHCI_FOUND: AtomicBool = AtomicBool::new(false);
     pub static XHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
     pub static XHCI_BDF: AtomicU32 = AtomicU32::new(0xFFFF);

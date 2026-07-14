@@ -1,58 +1,30 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! LoongArch64 (la64) arch layer - STUB scaffold that BOOTS in QEMU `virt`. The FOURTH ISA.
+//! ARM (armv7, 32-bit) arch layer - STUB scaffold for the 32-bit word-size PROOF (compile-only).
 //!
-//! Same `arch::imp` surface as x86_64/aarch64/riscv64; the neutral kernel compiles for loongarch64 with
-//! only this file written. Bodies are stubs; real bodies (LoongArch page tables/DMW, CSR trap vector,
-//! extended IRQ controller, stable timer) come later.
+//! Same `arch::imp` surface; proves the neutral kernel compiles for 32-bit ARM. ARMv7 HAS 64-bit
+//! atomics (LDREXD/STREXD), so `portable_atomic::AtomicU64` is native here (no shim) - unlike RV32.
 
 #![allow(unused_variables, dead_code)]
 
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
-// ============================ Boot bring-up (QEMU `virt`) ============================
-// QEMU loongarch `virt` UART is an NS16550 at 0x1fe0_01e0 (the LoongArch legacy UART address). At reset
-// the CPU is in DA mode (direct address: VA==PA, paging off), so a direct write reaches the register.
-const UART_THR: *mut u8 = 0x1fe001e0 as *mut u8;
+const UART_THR: *mut u8 = 0x0900_0000 as *mut u8;  // placeholder (varies by ARM machine); compile-only
 
-/// ELF entry - QEMU `-kernel` jumps here. Set the stack, zero BSS, call Rust. softfloat target, so no
-/// FP-enable step. LoongArch register ABI: $sp=r3, $t0-$t1=r12-r13, $zero=r0.
 #[unsafe(naked)]
 #[no_mangle]
 #[link_section = ".text.boot"]
 pub unsafe extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
-        "la.pcrel $sp, __stack_top",         // boot stack
-        "la.pcrel $t0, __bss_start",         // zero [__bss_start, __bss_end)
-        "la.pcrel $t1, __bss_end",
+        "ldr sp, =__stack_top",
+        "bl {main}",
         "1:",
-        "bgeu $t0, $t1, 2f",
-        "st.d $zero, $t0, 0",
-        "addi.d $t0, $t0, 8",
         "b 1b",
-        "2:",
-        "bl {main}",                         // -> loong_boot_main (never returns)
-        "3:",
-        "idle 0",
-        "b 3b",
-        main = sym loong_boot_main,
+        main = sym arm_boot_main,
     )
 }
 
-/// Rust side of boot. Milestone: write to the 16550 UART and halt.
-extern "C" fn loong_boot_main() -> ! {
-    for &b in b"
-GodspeedOS loongarch64: _start reached, 16550 UART alive - the demarcation BOOTS on a FOURTH arch.
-" {
-        // SAFETY: UART_THR is QEMU loongarch virt NS16550 transmit register.
-        unsafe { UART_THR.write_volatile(b); }
-    }
-    for &b in b"loongarch64: neutral kernel linked; arch/loongarch64 stubs pending real bodies. halting.
-" {
-        unsafe { UART_THR.write_volatile(b); }
-    }
-    loop {
-        unsafe { core::arch::asm!("idle 0"); }
-    }
+extern "C" fn arm_boot_main() -> ! {
+    loop { unsafe { core::arch::asm!("wfe"); } }
 }
 
 // ---- Boot info (shape shared with x86; a real port fills it from the DTB / UEFI) ----
@@ -101,7 +73,7 @@ pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("aarch64::switch_t
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 
-// ---- Serial / console (NS16550 on QEMU loongarch virt @ 0x1fe0_01e0; stubbed) ----
+// ---- Serial / console (board UART; stubbed - 32-bit proof is compile-only) ----
 pub fn serial_write_byte(b: u8) { unsafe { UART_THR.write_volatile(b); } }
 pub fn serial_write_bytes_lockfree(s: &[u8]) { for &b in s { unsafe { UART_THR.write_volatile(b); } } }
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {}

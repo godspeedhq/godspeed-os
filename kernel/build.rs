@@ -45,7 +45,9 @@ fn main() {
     let is_riscv64 = target == "riscv64imac-unknown-none-elf";
     let is_loongarch64 = target == "loongarch64-unknown-none-softfloat";
     let is_s390x = target == "s390x-unknown-none-softfloat";
-    let use_placeholder = is_aarch64 || is_riscv64 || is_loongarch64 || is_s390x;
+    let is_riscv32 = target == "riscv32imac-unknown-none-elf";
+    let is_arm = target == "armv7a-none-eabi";
+    let use_placeholder = is_aarch64 || is_riscv64 || is_loongarch64 || is_s390x || is_riscv32 || is_arm;
     let placeholder = workspace.join("kernel").join("svc-placeholder.bin");
 
     // (env-var suffix, binary name in target dir)

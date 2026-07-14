@@ -13,7 +13,8 @@ pub mod routing;
 pub use endpoint::{Endpoint, EndpointId};
 pub use message::{IpcError, Message};
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{Ordering};
+use portable_atomic::AtomicU64;
 use crate::smp::SpinLock;
 
 /// Endpoint IDs below 100 are reserved for kernel tests.

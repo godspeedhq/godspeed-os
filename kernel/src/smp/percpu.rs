@@ -169,8 +169,8 @@ impl<T: 'static> PerCoreMut<T> {
 /// count* - the TLB-shootdown ack bitmask is `num_cores * ceil(num_cores/64)` words, which no fixed
 /// `PerCore<[_; K]>` can size dynamically. A bounded arena (§26.6.1): one boot carve, never freed.
 /// Panics (loud halt, §26.7) if the allocator cannot back it.
-pub fn alloc_atomic_u64_slice(n: usize, init: u64) -> &'static [core::sync::atomic::AtomicU64] {
-    use core::sync::atomic::AtomicU64;
+pub fn alloc_atomic_u64_slice(n: usize, init: u64) -> &'static [portable_atomic::AtomicU64] {
+    use portable_atomic::AtomicU64;
     let base = alloc_arena::<AtomicU64>(n.max(1));
     // SAFETY: `base` covers `n` freshly-allocated, page-aligned slots (alloc_arena rounds up); each is
     // written exactly once here before any reader can reach the slice, so no concurrent access and no

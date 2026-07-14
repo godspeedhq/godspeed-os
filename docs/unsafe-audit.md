@@ -239,6 +239,12 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
+| arch/aarch64/mod.rs | 23 | permitted |
+| arch/arm/mod.rs | 21 | permitted |
+| arch/loongarch64/mod.rs | 23 | permitted |
+| arch/riscv32/mod.rs | 23 | permitted |
+| arch/riscv64/mod.rs | 23 | permitted |
+| arch/s390x/mod.rs | 18 | permitted |
 | arch/x86_64/ap_boot.rs | 2 | permitted |
 | arch/x86_64/boot.rs | 98 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
@@ -885,3 +891,18 @@ checked at their call sites; ring3 switch is called only from the scheduler
 with interrupts disabled; cap init runs before the task is visible to other
 cores; deferred PML4 free runs only after CR3 switch.
 `// SAFETY:` comments present in source for all blocks.
+
+## 2026-07-15 - multi-arch stubs: aarch64 / arm / loongarch64 / riscv32 / riscv64 / s390x
+
+Six per-arch scaffolds under `arch/<isa>/mod.rs`, added while proving the demarcation
+(docs/multi-arch.md). Each is the arch layer (a permitted §18.1 layer, exactly like
+`arch/x86_64/`) for a non-x86 target: the `_start` naked entry, a minimal boot bring-up,
+and a UART poke. All `unsafe` in them is the same class as x86's arch layer - inline
+`asm!` for the boot sequence and raw MMIO writes to a fixed UART register - and each block
+carries a `// SAFETY:` comment. They exist only to compile (all six) and boot (four:
+aarch64/riscv64/loongarch64 to a UART print, x86 to the full shell) the arch-neutral kernel;
+no neutral file gained any `unsafe`. `arch/arm/mod.rs` and `arch/riscv32/mod.rs` are the
+32-bit word-size proof (docs/multi-arch.md, "Word size"); `arm` needs no atomics shim
+(ARMv7 LDREXD), `riscv32` uses `portable-atomic` (RV32A has no 64-bit atomic). Counts are
+the current stub sizes; they may grow as a real port fills the arch surface, each increase
+carrying its own `// SAFETY:` and an audit bump.

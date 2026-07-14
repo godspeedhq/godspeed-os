@@ -18,7 +18,8 @@
 //! ACPI table access is hardware/firmware memory, so this lives in the arch
 //! layer (§18.1). Every raw read carries a SAFETY argument.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
+use portable_atomic::AtomicU64;
 
 /// Set true once an IVRS table with at least one IVHD block has been found.
 pub static IOMMU_PRESENT: AtomicBool = AtomicBool::new(false);

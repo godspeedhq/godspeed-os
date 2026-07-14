@@ -33,3 +33,13 @@ pub use loongarch64 as imp;
 pub mod s390x;
 #[cfg(target_arch = "s390x")]
 pub use s390x as imp;
+
+#[cfg(target_arch = "riscv32")]
+pub mod riscv32;
+#[cfg(target_arch = "riscv32")]
+pub use riscv32 as imp;
+
+#[cfg(target_arch = "arm")]
+pub mod arm;
+#[cfg(target_arch = "arm")]
+pub use arm as imp;

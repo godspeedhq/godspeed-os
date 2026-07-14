@@ -16,6 +16,10 @@ path = "src/lib.rs"
 
 [dependencies]
 bitflags = { version = "2", default-features = false }
+# portable-atomic: AtomicU64 on every target - native (zero-cost) where the ISA has 64-bit atomics
+# (x86/x86_64, ARMv7 LDREXD, all 64-bit ISAs), and a lock-based shim on 32-bit RISC-V (RV32A has only
+# 32-bit atomics). This is the ONE thing the kernel needed for 32-bit word-size portability.
+portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
 # Antialiased Noto Sans Mono raster glyphs for the framebuffer console (fb.rs).
 # no_std, pure const data (no alloc, no float). Only the Regular weight, one size,
 # and Basic-Latin are compiled in to keep the rodata small. Box-drawing glyphs are

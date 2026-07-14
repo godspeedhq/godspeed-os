@@ -9,7 +9,8 @@
 //! This is the "single global RwLock" approach approved for v1. The lock is
 //! never held across a `block_and_reschedule` call.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{Ordering};
+use portable_atomic::AtomicU64;
 
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;

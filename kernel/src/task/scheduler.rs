@@ -10,7 +10,8 @@
 //! IPI when the target task lives on a different core.
 
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use portable_atomic::AtomicU64;
 
 use crate::arch::imp::context_switch::{switch_context, TaskContext};
 use crate::capability::cap::{CapError, Capability};

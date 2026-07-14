@@ -1,57 +1,59 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! LoongArch64 (la64) arch layer - STUB scaffold that BOOTS in QEMU `virt`. The FOURTH ISA.
+//! RISC-V (rv32) arch layer - STUB scaffold that BOOTS in QEMU `virt` (docs/aarch64.md pattern).
 //!
-//! Same `arch::imp` surface as x86_64/aarch64/riscv64; the neutral kernel compiles for loongarch64 with
-//! only this file written. Bodies are stubs; real bodies (LoongArch page tables/DMW, CSR trap vector,
-//! extended IRQ controller, stable timer) come later.
+//! The 32-bit testitecture. Exposes the SAME `arch::imp` surface as arch/x86_64/ and arch/aarch64/, so
+//! the arch-NEUTRAL kernel compiles for riscv32 with only this file written - the boundary, generalised
+//! to a third ISA. Bodies are stubs; real bodies (Sv39 MMU, S-mode trap vec, PLIC/CLINT, SBI) come later.
 
 #![allow(unused_variables, dead_code)]
 
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
-// ============================ Boot bring-up (QEMU `virt`) ============================
-// QEMU loongarch `virt` UART is an NS16550 at 0x1fe0_01e0 (the LoongArch legacy UART address). At reset
-// the CPU is in DA mode (direct address: VA==PA, paging off), so a direct write reaches the register.
-const UART_THR: *mut u8 = 0x1fe001e0 as *mut u8;
+// ============================ Boot bring-up (QEMU `virt`, M-mode) ============================
+// QEMU riscv `virt` UART is an NS16550 at 0x1000_0000; writing the transmit-hold register (offset 0) sends
+// a byte (QEMU accepts it directly, like early x86 COM1 output).
+const UART_THR: *mut u8 = 0x1000_0000 as *mut u8;
 
-/// ELF entry - QEMU `-kernel` jumps here. Set the stack, zero BSS, call Rust. softfloat target, so no
-/// FP-enable step. LoongArch register ABI: $sp=r3, $t0-$t1=r12-r13, $zero=r0.
+/// ELF entry - OpenSBI (QEMU default firmware) jumps here in S-mode at 0x8020_0000 (a0=hartid, a1=dtb).
+/// Only the boot hart arrives (OpenSBI parks the rest via HSM). Set the stack, zero BSS, call Rust. No
+/// FP-enable needed: riscv32imac is integer-only (soft-float), so no FP traps (unlike aarch64 CPACR).
 #[unsafe(naked)]
 #[no_mangle]
 #[link_section = ".text.boot"]
 pub unsafe extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
-        "la.pcrel $sp, __stack_top",         // boot stack
-        "la.pcrel $t0, __bss_start",         // zero [__bss_start, __bss_end)
-        "la.pcrel $t1, __bss_end",
+        "la   sp, __stack_top",
+        "la   t0, __bss_start",
+        "la   t1, __bss_end",
         "1:",
-        "bgeu $t0, $t1, 2f",
-        "st.d $zero, $t0, 0",
-        "addi.d $t0, $t0, 8",
-        "b 1b",
+        "bgeu t0, t1, 2f",
+        "sd   zero, 0(t0)",
+        "addi t0, t0, 8",
+        "j    1b",
         "2:",
-        "bl {main}",                         // -> loong_boot_main (never returns)
+        "call {main}",
         "3:",
-        "idle 0",
-        "b 3b",
-        main = sym loong_boot_main,
+        "wfi",
+        "j    3b",
+        main = sym riscv_boot_main,
     )
 }
 
-/// Rust side of boot. Milestone: write to the 16550 UART and halt.
-extern "C" fn loong_boot_main() -> ! {
+/// Rust side of boot. Milestone: write to the 16550 UART and halt. Later: Sv39 MMU, S-mode trap vector
+/// (stvec) for ecall/faults/IRQ, PLIC/CLINT, SBI HSM for SMP - toward the neutral `kernel_main`.
+extern "C" fn riscv_boot_main() -> ! {
     for &b in b"
-GodspeedOS loongarch64: _start reached, 16550 UART alive - the demarcation BOOTS on a FOURTH arch.
+GodspeedOS riscv32: _start reached S-mode, 16550 UART alive - the demarcation BOOTS on a 32-bit test.
 " {
-        // SAFETY: UART_THR is QEMU loongarch virt NS16550 transmit register.
+        // SAFETY: UART_THR is QEMU virt NS16550 transmit register.
         unsafe { UART_THR.write_volatile(b); }
     }
-    for &b in b"loongarch64: neutral kernel linked; arch/loongarch64 stubs pending real bodies. halting.
+    for &b in b"riscv32: neutral kernel linked; arch/riscv32 stubs pending real bodies. halting.
 " {
         unsafe { UART_THR.write_volatile(b); }
     }
     loop {
-        unsafe { core::arch::asm!("idle 0"); }
+        unsafe { core::arch::asm!("wfi"); }
     }
 }
 
@@ -101,7 +103,7 @@ pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("aarch64::switch_t
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 
-// ---- Serial / console (NS16550 on QEMU loongarch virt @ 0x1fe0_01e0; stubbed) ----
+// ---- Serial / console (NS16550 on QEMU virt @ 0x1000_0000; stubbed) ----
 pub fn serial_write_byte(b: u8) { unsafe { UART_THR.write_volatile(b); } }
 pub fn serial_write_bytes_lockfree(s: &[u8]) { for &b in s { unsafe { UART_THR.write_volatile(b); } } }
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {}

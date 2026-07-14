@@ -39,3 +39,11 @@ rustflags = [
 rustflags = [
     "-C", "relocation-model=static",
 ]
+
+# riscv32 - a WORD-SIZE test (32-bit), not a clean bank. Reveals the kernel's 64-bit assumptions.
+[target.riscv32imac-unknown-none-elf]
+rustflags = ["-C", "relocation-model=static"]
+
+# ARM 32-bit (word-size proof, compile-only).
+[target.armv7a-none-eabi]
+rustflags = ["-C", "relocation-model=static"]

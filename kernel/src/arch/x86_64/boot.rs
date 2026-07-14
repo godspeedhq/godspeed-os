@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! BSP/AP hardware initialisation - §11.1, §11.2.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
+use portable_atomic::AtomicU64;
 
 use super::BootInfo;
 use crate::smp::percpu::PerCoreMut;

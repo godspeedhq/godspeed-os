@@ -10,7 +10,8 @@
 //!
 //! Port I/O is hardware access, so this lives in the arch layer (§18.1).
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use portable_atomic::AtomicU64;
 use crate::smp::SpinLock;
 
 const CONFIG_ADDRESS: u16 = 0xCF8;

@@ -6,7 +6,8 @@
 //!   2. TLB shootdown after a page is unmapped (§10.5).
 //!   3. Cross-core scheduler preemption (timer overflow).
 
-use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use portable_atomic::AtomicU64;
 use crate::smp::percpu::{PerCore, num_cores};
 
 /// Vector numbers for each IPI purpose.

@@ -12,7 +12,8 @@
 //! PCs incl. the T630/QEMU) and a single IOAPIC; a multi-IOAPIC machine would parse the ACPI
 //! MADT for the base + GSI ranges. Uncached MMIO mapping mirrors the IOMMU/MSI-X pattern.
 
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
+use portable_atomic::AtomicU64;
 
 /// Architectural default IOAPIC physical base (all standard PCs).
 const IOAPIC_PHYS_DEFAULT: u64 = 0xFEC0_0000;

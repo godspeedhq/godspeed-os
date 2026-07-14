@@ -8,7 +8,8 @@
 //! device). Userspace reads it via `InspectKernel` query 11, ungated, because
 //! the time of day is task-neutral hardware info (like the TSC clock).
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{Ordering};
+use portable_atomic::AtomicU64;
 
 const CMOS_INDEX: u16 = 0x70;
 const CMOS_DATA: u16 = 0x71;
