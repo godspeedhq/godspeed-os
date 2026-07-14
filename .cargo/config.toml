@@ -25,3 +25,10 @@ rustflags = [
 rustflags = [
     "-C", "relocation-model=static",
 ]
+
+# LoongArch64 variant (QEMU `virt`) - the FOURTH arch. softfloat = no FP-enable step.
+# Build: cargo build -p kernel --target loongarch64-unknown-none-softfloat
+[target.loongarch64-unknown-none-softfloat]
+rustflags = [
+    "-C", "relocation-model=static",
+]

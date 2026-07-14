@@ -1,8 +1,8 @@
 # Multi-Architecture Proof
 
 > **The demarcation, demonstrated.** GodspeedOS is one arch-neutral codebase behind a single seam
-> (`arch::imp`). On 2026-07-14 that neutral kernel was compiled and booted on **three genuinely
-> different instruction set architectures** - x86-64 (CISC), AArch64 (ARM), and RISC-V - by writing
+> (`arch::imp`). On 2026-07-14 that neutral kernel was compiled and booted on **four genuinely
+> different instruction set architectures** - x86-64 (CISC), AArch64 (ARM), RISC-V, and LoongArch - by writing
 > only `arch/<isa>/`. Not one arch-neutral file changed between them. This is the executable proof of
 > the "a new architecture is bounded to the arch layer" claim (docs/aarch64.md, `CLAUDE.md` §26).
 
@@ -13,6 +13,7 @@
 | **x86-64** | `x86_64-unknown-none` | q35 / bare metal (UEFI) | Limine | 16550 COM1 | **Full OS** - 4 cores, supervisor, `gsh>` shell, storage, networking | Hardware (HP T630) + QEMU; identity 24/0; 80k-round chaos soak |
 | **AArch64** | `aarch64-unknown-none` | `-M virt -cpu cortex-a53` | direct `-kernel` (EL1) | PL011 @ `0x0900_0000` | **Boots + prints** to UART; neutral kernel linked | `qemu-system-aarch64` |
 | **RISC-V** | `riscv64imac-unknown-none-elf` | `-M virt` | OpenSBI → S-mode @ `0x8020_0000` | NS16550 @ `0x1000_0000` | **Boots + prints** to UART; neutral kernel linked | `qemu-system-riscv64` |
+| **LoongArch64** | `loongarch64-unknown-none-softfloat` | `-M virt` | direct `-kernel` (DA mode) @ `0x20_0000` | NS16550 @ `0x1fe0_01e0` | **Boots + prints** to UART; neutral kernel linked | `qemu-system-loongarch64` |
 
 The boot lines actually observed:
 
@@ -20,6 +21,7 @@ The boot lines actually observed:
 x86_64 :  kernel: 4 cores ready  /  supervisor: ready  /  shell: ready (type 'help')
 aarch64:  GodspeedOS aarch64: _start reached EL1, PL011 UART alive - the demarcation BOOTS.
 riscv64:  GodspeedOS riscv64: _start reached S-mode, 16550 UART alive - the demarcation BOOTS on a THIRD arch.
+loong64:  GodspeedOS loongarch64: _start reached, 16550 UART alive - the demarcation BOOTS on a FOURTH arch.
 ```
 
 ## What is (and isn't) proven

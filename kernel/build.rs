@@ -26,6 +26,11 @@ fn main() {
     if target == "riscv64imac-unknown-none-elf" {
         println!("cargo:rustc-link-arg=-T{}", kernel_ld_riscv64.display());
     }
+    let kernel_ld_loongarch64 = workspace.join("kernel").join("kernel-loongarch64.ld");
+    println!("cargo:rerun-if-changed={}", kernel_ld_loongarch64.display());
+    if target == "loongarch64-unknown-none-softfloat" {
+        println!("cargo:rustc-link-arg=-T{}", kernel_ld_loongarch64.display());
+    }
     let profile   = std::env::var("PROFILE").unwrap(); // "debug" or "release"
 
     let target_dir = workspace
@@ -38,7 +43,8 @@ fn main() {
     // x86 embeds the real service binaries. When aarch64 services are built, point this at their dir.
     let is_aarch64 = target == "aarch64-unknown-none";
     let is_riscv64 = target == "riscv64imac-unknown-none-elf";
-    let use_placeholder = is_aarch64 || is_riscv64;
+    let is_loongarch64 = target == "loongarch64-unknown-none-softfloat";
+    let use_placeholder = is_aarch64 || is_riscv64 || is_loongarch64;
     let placeholder = workspace.join("kernel").join("svc-placeholder.bin");
 
     // (env-var suffix, binary name in target dir)
