@@ -43,6 +43,56 @@ The **23 asm sites reduce to ~5 operations**, each with a clean AArch64 analog:
 | `push; popfq` | restore IRQ flags | `msr DAIF, {}` |
 | (context switch reg save) | callee-saved + PC/SP/page-base | x19-x30, SP, `SPSR`/`ELR`, `TTBR0` |
 
+## 1.1 The HAL contract (measured surface, categorized)
+
+Extracting the *distinct* symbols behind those 126 references (`grep -hoE "arch::x86_64::[\w:]+"`)
+gives ~90 names - but they fall into three very different buckets, and the split matters for scoping:
+
+**(A) True arch primitives - reimplement per arch.** The irreducible hardware surface:
+
+- **MMU:** `page_tables::{PageTable, VirtAddr, entry_for_va, unmap_4k_strided, reclaim_user_frames,
+  get/set_hhdm_offset, harden_hhdm_nx}` -> VMSAv8-64 tables, `TTBR0/1`, broadcast `TLBI`.
+- **Context switch:** `context_switch::TaskContext` -> x19-x30/SP/`ELR`/`SPSR`/`TTBR0`.
+- **Syscall + user-copy:** `syscall_entry::{syscall_slot, USER_END, user_copy_active,
+  clear_user_copy_active, init_percore_syscall_arena, init_percore_arenas}` -> `SVC` + `VBAR_EL1`,
+  EL0/EL1 fault discrimination (the C1/C2/V1 twin).
+- **Boot lifecycle:** `init, ap_init, ap_count, ap_boot::start_all_aps, halt_all_cores,
+  hardware_reset, boot::{init_gdt_arenas, set_tss_rsp0, audit_wx}, BootInfo` -> PSCI/spin-table,
+  `PSCI SYSTEM_RESET`, EL1 setup.
+- **CPU + timer:** `read_cycle_counter, _rdtsc, __cpuid(_count), init_timer,
+  boot::{tsc_ticks_per_quantum, TSC_DEADLINE_MODE, rearm_tsc_deadline, get_lapic_id,
+  get_apic_virt_base}` -> `CNTPCT`/`CNTFRQ`, `MIDR`/ID regs, generic-timer compare.
+- **IRQ flags + controller:** `disable_interrupts, wait_for_interrupt, interrupts::{send_eoi,
+  idle_can_halt, fire_test_irq}, ioapic::{init, mask/unmask_vector, set_redir, set_level_route,
+  set/bsp_lapic_id}` -> `DAIF`, GIC-400 distributor/CPU-interface, SGIs.
+- **Serial byte in/out:** `serial_write_byte, serial_write_bytes_lockfree, com2_init,
+  com2_try_read_byte, uart_rx_drain_fifo` -> PL011 MMIO. (Only the raw byte in/out is arch; see B.)
+
+**(B) Misfiled arch-neutral logic - RELOCATE, do not reimplement.** These live in
+`arch/x86_64/mod.rs` but are pure state machines with no x86 dependency beyond calling a (A) primitive:
+`console_foreground_allows, claim/release_console_foreground(_if_owner), CONSOLE_READ_WAITER,
+set_console_echo, console_boot_complete, console_write_bytes_gated, console_push_byte,
+input_ready/set_input_ready`, and the `uart_rx_{pop, poll, drain_now}` ring buffer. Moving these to a
+neutral `kernel/src/console.rs` (calling arch only for the actual byte) **shrinks the arch contract by
+~15 symbols** and is a safe, compile-verifiable refactor that pays off on *every* future arch. A
+genuine simplification the survey surfaced (§26.13).
+
+**(C) Optional / board subsystems - stub or board-specific, not blocking the core:**
+
+- `iommu::{detect, bringup, confine_device, release_device, drain_event_log}` -> **no usable SMMU on
+  the Pi**, so these become no-ops and DMA drivers are trusted-on-machine (§6.4 already machine-dependent).
+- `pci::{init, xhci_bios_handoff, program_xhci/ehci_msi, route_ehci_intx, ehci_flr_probe, *_BDF,
+  NIC_*}` -> Pi 4 has a BCM2711 PCIe controller (for the VL805); a Pi 3 has none. Board-gated.
+- `rtc::{read_datetime, now_epoch_monotonic, epoch_secs, boot_datetime, capture_boot_time}` ->
+  **the Pi has no battery-backed RTC.** These degrade to "no wall clock" (date/uptime lose their RTC
+  source; uptime can move to the generic timer, wall-clock date needs NTP or a DS3231 add-on later).
+  A real, board-level gap to design for - not a blocker for the identity suite.
+- `fb::dims_packed` -> Limine framebuffer vs the Pi VideoCore mailbox framebuffer.
+
+**Scoping takeaway:** the true per-arch reimplementation (bucket A) is ~40 symbols in the well-known
+categories above; ~15 (bucket B) are a one-time neutral relocation that helps every arch; and bucket C
+is stub-or-defer. That is the real size of "supporting the architecture."
+
 ## 2. Phase 0 - seal the boundary on x86 FIRST (before any ARM)
 
 Do the de-x86-ification as a refactor on the x86 side, verified by the identity suite (24/24 = zero
@@ -60,10 +110,18 @@ existing x86 target, needs no Pi, and does not touch `main`.
   it. Cleaner long-term boundary, more upfront design, easier to enforce "no arch leak" (the trait *is*
   the contract). A reasonable later refinement once two arches exist to generalize from.
 
-Either way the surface to formalize is what `arch/x86_64/mod.rs` already exports today: `init`,
-`ap_init`, `init_timer`, `halt_all_cores`, `hardware_reset`, the serial/console/UART family, IPI send,
-page-table ops (via `page_tables`), user-copy (`read/write_user_bytes`, `validate_user_ptr`),
-`read_cycle_counter`, and the CR3/TLB/IRQ-flag primitives currently inlined in `smp/` and `memory/`.
+Either way the surface to formalize is the bucket-A list in §1.1.
+
+**Safe execution order (each step compile- and identity-verifiable on x86, no big-bang):**
+
+1. **Relocate bucket B** (§1.1) - move the console/foreground/echo/input-ready/UART-ring state machines
+   out of `arch/x86_64/mod.rs` into a neutral `kernel/src/console.rs`, calling arch only for the raw
+   byte. Shrinks the contract ~15 symbols; pure code motion, zero behavior change.
+2. **Introduce the seam** - `arch/mod.rs` selects the arch impl (cfg-alias) or defines the `Arch` trait.
+3. **Sweep the remaining bucket-A references** through the seam, in reviewable chunks (per subsystem:
+   scheduler, syscall, smp, memory, loader), with an identity run between chunks - not one 126-site
+   commit. The 23 inlined asm ops in `smp/`+`memory/` become calls to arch primitives in this step.
+4. **Verify:** identity 24/24 (no behavior change) is the gate for each chunk.
 
 ## 3. The AArch64 arch layer (`arch/aarch64/`, what Phase 1+ implements)
 
