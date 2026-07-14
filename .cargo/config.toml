@@ -18,3 +18,10 @@ rustflags = [
 #
 # Build the host tool with:
 #   cargo build -p osdev
+
+# RISC-V variant (QEMU `virt`, S-mode via OpenSBI) - the THIRD arch, proving the boundary generalises.
+# riscv64imac = integer-only (soft-float), so no FP-enable step. Build: cargo build -p kernel --target riscv64imac-unknown-none-elf
+[target.riscv64imac-unknown-none-elf]
+rustflags = [
+    "-C", "relocation-model=static",
+]

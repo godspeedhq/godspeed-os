@@ -21,6 +21,11 @@ fn main() {
     if target == "aarch64-unknown-none" {
         println!("cargo:rustc-link-arg=-T{}", kernel_ld_aarch64.display());
     }
+    let kernel_ld_riscv64 = workspace.join("kernel").join("kernel-riscv64.ld");
+    println!("cargo:rerun-if-changed={}", kernel_ld_riscv64.display());
+    if target == "riscv64imac-unknown-none-elf" {
+        println!("cargo:rustc-link-arg=-T{}", kernel_ld_riscv64.display());
+    }
     let profile   = std::env::var("PROFILE").unwrap(); // "debug" or "release"
 
     let target_dir = workspace
@@ -32,6 +37,8 @@ fn main() {
     // an empty placeholder - the arch-neutral kernel must still COMPILE for aarch64 (the boundary test).
     // x86 embeds the real service binaries. When aarch64 services are built, point this at their dir.
     let is_aarch64 = target == "aarch64-unknown-none";
+    let is_riscv64 = target == "riscv64imac-unknown-none-elf";
+    let use_placeholder = is_aarch64 || is_riscv64;
     let placeholder = workspace.join("kernel").join("svc-placeholder.bin");
 
     // (env-var suffix, binary name in target dir)
@@ -62,7 +69,7 @@ fn main() {
     ];
 
     for (env_name, bin_name) in services {
-        let elf = if is_aarch64 { placeholder.clone() } else { target_dir.join(bin_name) };
+        let elf = if use_placeholder { placeholder.clone() } else { target_dir.join(bin_name) };
         println!("cargo:rustc-env=SVC_{}_ELF={}", env_name, elf.display());
         // Rerun if the service binary changes (osdev build rebuilds services first).
         println!("cargo:rerun-if-changed={}", elf.display());
