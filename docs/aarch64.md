@@ -106,10 +106,15 @@ is stub-or-defer. That is the real size of "supporting the architecture."
 >   `enable/disable_interrupts`. The `unsafe` asm consolidated into the permitted arch layer
 >   (docs/unsafe-audit.md); the host lib gets a no-op `arch::imp` stub (lib.rs). Identity 24/0.
 > - **Enforcement:** `scripts/arch_boundary_check.py` (CI-wired, alongside `unsafe_check`/`contract_check`)
->   FAILS on any `asm!`/`naked_asm!` or any named-arch reference (`arch::x86_64::` etc.) outside
->   `kernel/src/arch/`. So the demarcation cannot silently rot: a future RISC-V/AArch64 port is BOUNDED
->   by construction - implement `arch/<new>/` to the `imp` surface, touch zero neutral files, and CI
->   guarantees no neutral file smuggled in arch-specific code.
+>   FAILS on any `asm!`/`naked_asm!`, any named-arch reference (`arch::x86_64::` etc.), OR any
+>   `core::arch::<arch>::` intrinsic (e.g. `__cpuid`) outside `kernel/src/arch/`. So the demarcation
+>   cannot silently rot: a future RISC-V/AArch64 port is BOUNDED by construction - implement
+>   `arch/<new>/` to the `imp` surface, touch zero neutral files, and CI guarantees no neutral file
+>   smuggled in arch-specific code (asm, named-arch module, or intrinsic).
+> - **Clear failure for a not-yet-built arch:** `kernel/src/arch/aarch64/mod.rs` is a `#[cfg]`-gated
+>   stub with a `compile_error!` that names the plan and the surface to fill. A `--target
+>   aarch64-unknown-none` build fails with that message instead of a cryptic "file not found for module
+>   aarch64"; it is inert on the x86 build (byte-identical binary).
 >
 > - **IPI-send extraction (2026-07-14):** `smp/ipi.rs` was the last file in a *permitted* layer still
 >   holding APIC MMIO (the ICR programming for a targeted `send_ipi` + the shootdown broadcast). Moved to

@@ -27,8 +27,11 @@ REPO_ROOT = Path(__file__).parent.parent
 KERNEL_SRC = REPO_ROOT / "kernel" / "src"
 ARCH_DIR = KERNEL_SRC / "arch"
 
-# Any named arch module. Neutral code must use `arch::imp::` instead. Extend as arches are added.
-NAMED_ARCH = re.compile(r"\barch::(x86_64|aarch64|riscv64|riscv32|arm)::")
+# Any named arch module - via the crate's own `arch::` tree OR `core::arch::<arch>::` intrinsics.
+# Neutral code must use `arch::imp::` instead. Extend the arch list as arches are added.
+_ARCHES = r"x86_64|x86|aarch64|arm|riscv64|riscv32"
+NAMED_ARCH = re.compile(rf"\barch::({_ARCHES})::")
+CORE_ARCH_INTRINSIC = re.compile(rf"\bcore::arch::({_ARCHES})::")  # e.g. core::arch::x86_64::__cpuid
 INLINE_ASM = re.compile(r"\b(?:core::arch::)?(?:naked_)?asm!")
 
 
@@ -55,6 +58,10 @@ def main() -> int:
             if m:
                 violations.append(f"  {rel}:{i}: names `arch::{m.group(1)}::` directly - use "
                                   f"`arch::imp::` (the seam) so a new arch stays a drop-in")
+            ci = CORE_ARCH_INTRINSIC.search(line)
+            if ci:
+                violations.append(f"  {rel}:{i}: uses `core::arch::{ci.group(1)}::` intrinsics in a "
+                                  f"neutral file - wrap it in an `arch::imp` primitive in kernel/src/arch/")
 
     if violations:
         print("Arch-boundary check - FAILURES (arch-specific code leaked into a neutral kernel layer):")
