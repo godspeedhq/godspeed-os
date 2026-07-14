@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
-EM, EN = "—", "–"
+EM, EN = chr(0x2014), chr(0x2013)  # em-dash / en-dash; via chr() so this file has no literal dash
 # Text file suffixes worth scanning. Binary assets (images, fonts, os.img) are skipped.
 TEXT_SUFFIXES = {".rs", ".md", ".toml", ".py", ".yml", ".yaml", ".sh", ".json", ".html", ".css",
                  ".js", ".txt", ".gsh", ".c", ".h", ".s", ".ld", ".cfg", ".conf"}
