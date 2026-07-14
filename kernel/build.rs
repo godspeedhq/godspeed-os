@@ -16,6 +16,11 @@ fn main() {
     if target == "x86_64-unknown-none" {
         println!("cargo:rustc-link-arg=-T{}", kernel_ld.display());
     }
+    let kernel_ld_aarch64 = workspace.join("kernel").join("kernel-aarch64.ld");
+    println!("cargo:rerun-if-changed={}", kernel_ld_aarch64.display());
+    if target == "aarch64-unknown-none" {
+        println!("cargo:rustc-link-arg=-T{}", kernel_ld_aarch64.display());
+    }
     let profile   = std::env::var("PROFILE").unwrap(); // "debug" or "release"
 
     let target_dir = workspace

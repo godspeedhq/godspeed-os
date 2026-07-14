@@ -11,6 +11,63 @@
 
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
+// ============================ Boot bring-up (QEMU `virt`) ============================
+// The PL011 UART data register on QEMU's `virt` machine. Writing a byte transmits it; no init needed
+// for basic output under QEMU. (A real port polls the flag register at +0x18 for TXFF.)
+const PL011_DR: *mut u8 = 0x0900_0000 as *mut u8;
+
+/// ELF entry point - `qemu-system-aarch64 -M virt -kernel` jumps here (EL1/EL2). Park the secondary
+/// cores (WFE loop), set the boot stack, zero BSS, then call the Rust boot. `.text.boot` so the linker
+/// script places it first at the load address. First milestone: prove the toolchain + boot + UART.
+#[unsafe(naked)]
+#[no_mangle]
+#[link_section = ".text.boot"]
+pub unsafe extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "mov  x0, #(3 << 20)",               // CPACR_EL1.FPEN = 0b11: DON'T trap FP/SIMD at EL1.
+        "msr  cpacr_el1, x0",                //   (Rust emits NEON for memcpy/byte-copy; default EL1
+        "isb",                               //    traps it -> ESR 0x07 undefined-instruction fault.)
+        "mrs  x1, mpidr_el1",                // only the primary core boots
+        "and  x1, x1, #0xff",
+        "cbnz x1, 2f",
+        "adrp x1, __stack_top",              // sp = __stack_top
+        "add  x1, x1, :lo12:__stack_top",
+        "and  x1, x1, #0xfffffffffffffff0",   // SP must be 16-byte aligned (EL1 SP-align check)
+        "mov  sp, x1",
+        "adrp x1, __bss_start",              // zero [__bss_start, __bss_end)
+        "add  x1, x1, :lo12:__bss_start",
+        "adrp x2, __bss_end",
+        "add  x2, x2, :lo12:__bss_end",
+        "1:",
+        "cmp  x1, x2",
+        "b.hs 3f",
+        "str  xzr, [x1], #8",
+        "b    1b",
+        "3:",
+        "bl   {main}",                       // -> aarch64_boot_main (never returns)
+        "2:",
+        "wfe",
+        "b    2b",
+        main = sym aarch64_boot_main,
+    )
+}
+
+/// Rust side of boot. Milestone 1: write a line to the PL011 and halt. Later this grows into the real
+/// init (MMU, EL1 exceptions, GIC, generic timer, PSCI) and finally calls the neutral `kernel_main`.
+extern "C" fn aarch64_boot_main() -> ! {
+    for &b in b"\r\nGodspeedOS aarch64: _start reached EL1, PL011 UART alive - the demarcation BOOTS.\r\n" {
+        // SAFETY: PL011_DR is QEMU virt's UART data register; a byte write transmits it.
+        unsafe { PL011_DR.write_volatile(b); }
+    }
+    for &b in b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.\r\n" {
+        unsafe { PL011_DR.write_volatile(b); }
+    }
+    loop {
+        // SAFETY: WFI is always valid; wait for an interrupt that never comes (halt).
+        unsafe { core::arch::asm!("wfi"); }
+    }
+}
+
 // ---- Boot info (shape shared with x86; a real port fills it from the DTB / UEFI) ----
 #[repr(C)]
 pub struct BootInfo {
@@ -58,8 +115,8 @@ pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 
 // ---- Serial / console (PL011 on QEMU virt @ 0x0900_0000; stubbed) ----
-pub fn serial_write_byte(b: u8) {}
-pub fn serial_write_bytes_lockfree(s: &[u8]) {}
+pub fn serial_write_byte(b: u8) { unsafe { PL011_DR.write_volatile(b); } }
+pub fn serial_write_bytes_lockfree(s: &[u8]) { for &b in s { unsafe { PL011_DR.write_volatile(b); } } }
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {}
 pub fn set_console_echo(on: bool) {}
 pub fn claim_console_foreground(task_slot: u32) {}
