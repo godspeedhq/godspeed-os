@@ -3,6 +3,14 @@ rustflags = [
     "-C", "relocation-model=static",
 ]
 
+# AArch64 variant (QEMU `virt`) - the arch-boundary demarcation test (docs/aarch64.md). The neutral
+# kernel must compile for this target with ONLY arch/aarch64/ written; any error outside arch/aarch64/
+# is a boundary leak. Build: cargo build -p kernel --target aarch64-unknown-none
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=static",
+]
+
 # Build the kernel and services with:
 #   cargo build -p kernel --target x86_64-unknown-none
 #   cargo build -p godspeed-sdk --target x86_64-unknown-none

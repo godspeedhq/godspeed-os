@@ -23,6 +23,12 @@ fn main() {
         .join("x86_64-unknown-none")
         .join(&profile);
 
+    // AArch64 demarcation build (docs/aarch64.md): real aarch64 service ELFs don't exist yet, so embed
+    // an empty placeholder - the arch-neutral kernel must still COMPILE for aarch64 (the boundary test).
+    // x86 embeds the real service binaries. When aarch64 services are built, point this at their dir.
+    let is_aarch64 = target == "aarch64-unknown-none";
+    let placeholder = workspace.join("kernel").join("svc-placeholder.bin");
+
     // (env-var suffix, binary name in target dir)
     let services: &[(&str, &str)] = &[
         ("SUPERVISOR", "supervisor"),
@@ -51,7 +57,7 @@ fn main() {
     ];
 
     for (env_name, bin_name) in services {
-        let elf = target_dir.join(bin_name);
+        let elf = if is_aarch64 { placeholder.clone() } else { target_dir.join(bin_name) };
         println!("cargo:rustc-env=SVC_{}_ELF={}", env_name, elf.display());
         // Rerun if the service binary changes (osdev build rebuilds services first).
         println!("cargo:rerun-if-changed={}", elf.display());
