@@ -18,6 +18,24 @@ GodspeedOS is governed by a written constitution, and contributions are held to 
   start a service; the others teach IPC, capabilities, composition, persistence, and drivers.
 - **[`GLOSSARY.md`](GLOSSARY.md)** - the abbreviations (TLB, DMA, IOMMU, AHCI, and the rest).
 
+## Where do I start?
+
+Most contributions fall into a handful of shapes. Find yours and begin at the file named - each is a
+short, local doc that points onward. Every directory carries its own `CLAUDE.md` explaining what lives
+there and why, so when in doubt, open the one nearest the code you are editing.
+
+| I want to ... | Start here |
+|---------------|-----------|
+| Understand the philosophy before touching anything | [`COMMANDMENTS.md`](COMMANDMENTS.md), then skim [`CLAUDE.md`](CLAUDE.md) |
+| Write a new userspace service | Copy [`examples/00-hello/`](examples/00-hello/); read its `CLAUDE.md` and [`sdk/rust/CLAUDE.md`](sdk/rust/CLAUDE.md) |
+| Learn one pattern (IPC, caps, composition, persistence, drivers) | The matching `examples/*/CLAUDE.md` (index: [`examples/README.md`](examples/README.md)) |
+| Add or change a syscall | `kernel/src/syscall/CLAUDE.md`, then `syscall/mod.rs` |
+| Add a new CPU architecture | [`kernel/src/arch/CLAUDE.md`](kernel/src/arch/CLAUDE.md) (the seam + the five-place checklist) |
+| Change capability or generation logic | `kernel/src/capability/CLAUDE.md` |
+| Touch IPC or routing | `kernel/src/ipc/CLAUDE.md` (and bring a benchmark - the fast path may not change without one) |
+| Add or change a test | `tests/CLAUDE.md`, then the category under `tests/qemu/` |
+| Know the full law and the instant-reject list | [`CLAUDE.md`](CLAUDE.md) (the constitution; section 21 is the reject list) |
+
 ## Building and testing
 
 See the [README](README.md) "Getting started". It is the same `cargo run -p osdev -- ...` flow on

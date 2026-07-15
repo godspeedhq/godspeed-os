@@ -60,6 +60,8 @@ It exists to:
 
 When this document and the code disagree, the document wins and the code is wrong. When this document and reality disagree, the document is amended and the change is recorded.
 
+**How to read this document.** Each section's present-tense body is the current, canonical law - read it as settled fact. The inline **Amendment YYYY-MM-DD** blocks record *how* a rule reached its present form and why; they are ratified history, not open proposals or drafts. Where an amendment and the body it sits under read differently, the most recent amendment is the canonical state and the body is being brought up to match. You never need the git history to know the current law: it is the section body, as amended. Sections whose state changed the most over time (notably §6, the TCB) open with a short "current canonical state" box so the settled answer is available before the history that produced it.
+
 The appendices at the end of this document collect forward-looking design notes. Appendix A documents a v1 commitment (the bootloader choice). Appendices B, C, and D are explicitly non-normative - they record design intent and discussion, not commitments. Their content does not amend the constitution.
 
 This constitution has a human-readable distillation: `COMMANDMENTS.md`, the **Ten Commandments of Godspeed**. Each commandment is grounded in the invariants and sections it enforces here. Where a commandment and this document disagree, this document is the law and the commandment is amended to match (it is the distillation, not the source).
@@ -262,6 +264,17 @@ os/
 ---
 
 ## 6. Trusted Computing Base
+
+> **Current canonical state (as amended below).** The non-restartable set is **`{kernel}` alone** - the
+> kernel is the only component that cannot be restarted; everything else recovers from death rather than
+> forcing a reboot. Present-tense status of every former TCB member:
+> - **supervisor** - trusted but **restartable**: the kernel respawns it on death (unconditionally, forever) and it reconciles with the still-running services (§6.2).
+> - **init** - **removed** entirely; the kernel spawns the supervisor directly (Path C / Phase 5).
+> - **registry** - left the TCB, then the *service* was **retired**; naming is now a minimal kernel directory (naming Phase 4 / Path C).
+> - **block-driver, fs** - **restartable** storage services, made safe by `fs`'s crash-consistent recovery (Phase D); their death is a supervisor restart, not a reboot.
+> - **DMA drivers (`xhci`/`ehci`)** - in the TCB **only on a machine with no IOMMU**; where an IOMMU confines them they are least-privilege and drop out (§6.4).
+>
+> The dated amendments in §6.1-§6.3 record how this floor was reached and why. They are ratified history, not proposals; this box is the settled result they add up to.
 
 ### 6.1 TCB Members
 

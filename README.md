@@ -35,6 +35,14 @@ The kernel is strictly bounded: memory isolation, scheduling, IPC routing, capab
 
 ---
 
+## Portability
+
+One arch-neutral kernel sits behind a single seam, `arch::imp`; everything CPU-specific lives in `arch/<isa>/`. **x86-64 is the full runnable OS** - the `os.img` you flash, with 4 cores, the shell, storage, and networking. The *same* neutral kernel is proven to compile and boot on other instruction sets: **AArch64, RISC-V, and LoongArch** boot and print to their UART, and **s390x** compiles clean (big-endian). Both **64-bit and 32-bit** word sizes are proven - 32-bit ARM and RISC-V compile clean. Adding an ISA is bounded to `arch/<isa>/` and enforced by CI; it does not touch a single arch-neutral file.
+
+See **[docs/multi-arch.md](docs/multi-arch.md)** for the proof, and **[kernel/src/arch/CLAUDE.md](kernel/src/arch/CLAUDE.md)** for how to add one.
+
+---
+
 ## How it works
 
 **Capabilities** - every privileged action requires an explicit, unforgeable token. A capability carries a resource ID, a rights set, and a generation number. Stale capabilities return `EndpointDead`. Forged ones return `CapNotHeld`. There is no ambient authority.
