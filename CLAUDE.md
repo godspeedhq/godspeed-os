@@ -1241,6 +1241,8 @@ A PR is rejected without further review if it:
 
 Reviewers ask: does this respect the constitution, leave the kernel small, present a convincing unsafe argument, include a test, make the system more or less understandable?
 
+A grounded catalog of these violations - each paired with the correct pattern and the section it breaks - is [`docs/anti-patterns.md`](docs/anti-patterns.md), the field guide to constitutional violations. Scan the categories your change touches before opening a PR.
+
 ---
 
 ## 22. Identity Test Suite

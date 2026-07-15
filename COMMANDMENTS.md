@@ -9,6 +9,10 @@ grounded in the invariants and sections it enforces. Where a Commandment and the
 code is wrong (`CLAUDE.md` §1). Where a Commandment and the constitution disagree, the constitution
 is the law and this document is amended to match.
 
+For a catalog of concrete violations of these Commandments - each paired with the correct pattern and
+grounded in the section it breaks - see [`docs/anti-patterns.md`](./docs/anti-patterns.md), the field
+guide to constitutional violations.
+
 ---
 
 ## Respect Godspeed

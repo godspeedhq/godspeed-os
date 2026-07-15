@@ -35,6 +35,7 @@ there and why, so when in doubt, open the one nearest the code you are editing.
 | Touch IPC or routing | `kernel/src/ipc/CLAUDE.md` (and bring a benchmark - the fast path may not change without one) |
 | Add or change a test | `tests/CLAUDE.md`, then the category under `tests/qemu/` |
 | Know the full law and the instant-reject list | [`CLAUDE.md`](CLAUDE.md) (the constitution; section 21 is the reject list) |
+| Check my change against the anti-patterns before I open a PR | [`docs/anti-patterns.md`](docs/anti-patterns.md) - the field guide to constitutional violations, each paired with the correct pattern |
 
 ## Building and testing
 
