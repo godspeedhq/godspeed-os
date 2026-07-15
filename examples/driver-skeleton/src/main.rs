@@ -72,8 +72,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 /// Reset the device, verify identity, install the DMA ring, enable interrupts.
 /// Returns false if the device never reports ready.
 fn bring_up(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> bool {
-    // Identity check: confirm we are talking to the device we expect.
-    if mmio.read32(REG_ID) != EXPECTED_ID {
+    // Identity check: confirm we are talking to the device we expect. Log the raw id
+    // with `log_fmt` - the SDK's bounded formatted logger (a fixed 256-byte stack buffer,
+    // no heap, §26.6.1). Use it for any register/hex value; never hand-roll digit-by-digit
+    // number formatting to "avoid the heap" - `format_args!` does not allocate.
+    let id = mmio.read32(REG_ID);
+    ctx.log_fmt(format_args!("driver-skeleton: device id {:#010x}", id));
+    if id != EXPECTED_ID {
         ctx.log("driver-skeleton: unexpected device id");
         return false;
     }

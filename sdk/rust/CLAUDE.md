@@ -41,12 +41,30 @@ let msg = my_endpoint.recv()?;
 // reacquires the peer by name, and retries. This is the primitive fs's block_rpc rides on.
 let reply = ctx.request_with_reply("fs", &request_msg);   // Option<Message>
 
-// Logging
+// Logging - plain, and formatted. `log_fmt` takes `format_args!` and renders through a
+// bounded 256-byte stack buffer (no heap): use it instead of hand-building a string.
 ctx.log("ping: starting");
+ctx.log_fmt(format_args!("ping: sent {} of {} messages", sent, total));
 
 // Spawn (supervisor-only; requires service_control cap)
 ctx.spawn_on("pong", 1)?;
 ```
+
+### The `ServiceContext` method menu
+
+The methods a service actually reaches for, grouped by purpose. This is the working subset; the full
+surface is in `sdk/rust/src/service_context.rs`. **Reach for the SDK method that already exists before
+hand-rolling** - the commonest mistake is rebuilding something the SDK provides (e.g. formatting a
+number by hand instead of using `log_fmt`).
+
+| Purpose | Methods |
+|---------|---------|
+| **Log** | `log(&str)`; **`log_fmt(format_args!(...))`** - formatted output, bounded (256-byte stack buffer, no heap) |
+| **Capabilities** | `capability(name) -> Result<CapHandle>`; `derive_cap(h) -> Option<CapHandle>`; `remove_cap(h)`; `query_cap_rights(h)`; `self_grant_handle() -> Option<CapHandle>` |
+| **IPC** | `recv()`; `try_recv() -> Option`; `recv_timeout(cycles)`; `send(peer, &msg)`; `try_send(peer, &msg)`; `send_by_handle(h, &msg)`; `request_with_reply(peer, &msg) -> Option<Message>` (sync, waits on truth); `reacquire_by_name(peer) -> bool` |
+| **Delegated resource caps (§7.10)** | `resource_mint(rights) -> Option<(id, cap)>`; `resource_invoke(cap, right, reply, &msg)`; `resource_revoke(id) -> bool`; `last_recv_badge() -> Option<(id, right)>`; `take_pending_cap() -> Option<CapHandle>`; `send_with_cap_by_handle(peer_h, cap, &msg)`; `acquire_send_cap(peer) -> Option<CapHandle>` |
+| **Hardware (drivers, §12)** | `mmio() -> Option<Mmio>`; `dma_region() -> Option<Dma>`; `irq_unmask(vector)` |
+| **CPU / lifecycle** | `yield_cpu()`; `park() -> !`; `spawn_on(name, core)` (TCB-only) |
 
 ## Records and pipe-friendly services (`record.rs`)
 

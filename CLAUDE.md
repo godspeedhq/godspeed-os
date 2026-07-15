@@ -2616,6 +2616,13 @@ When a working set feels too big for the stack, the move is **not** to reach for
   arena), reset between uses;
 - **iterate with an explicit bounded stack** instead of call-stack recursion (`tree`'s walk).
 
+**`format_args!` is already bounded - it does not allocate.** The no-heap rule forbids a *growable*
+buffer, not lazy formatting. Building output with `format_args!` - and logging it with the SDK's
+`log_fmt`, which renders through a fixed 256-byte stack buffer - IS the bounded discipline, not a
+violation of it. Do **not** hand-roll digit-by-digit number formatting to "avoid the heap" that
+`format_args!` never touches; reach for `log_fmt` (or `write!` into a fixed-size array) instead. Over-
+applying this section - refusing the sanctioned bounded tool and reinventing it - is itself the mistake.
+
 A hard ceiling reached *loudly* is therefore a **feature**, not a missing heap: it says "rethink
 the working set." (The `selfcheck | write` stack overflow was exactly this lesson - the fix was to
 forbid the unbounded nesting, not to add a heap.)
