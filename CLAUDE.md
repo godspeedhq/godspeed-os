@@ -656,6 +656,22 @@ On every send, the kernel:
 
 Queue depth is not configurable per endpoint in v1. Per-endpoint depth is a v2 concern.
 
+> **Transferring a capability - the three checks.** Embedding a cap in a message *moves* authority.
+> The kernel enforces the rules below but cannot warn you at compile time, so an author (and a
+> reviewer) must verify all three every time a cap is sent:
+> 1. **Grantable?** The cap being sent must hold the `GRANT` right, or the transfer is rejected with
+>    `CapNotGrantable` (§7.7). A copy made by `derive_cap` carries only the rights of its source, so a
+>    send-only cap yields a send-only copy that *cannot* be transferred. Do not assume a transfer
+>    succeeded; a send that embeds an un-grantable cap fails, and the receiver gets nothing (§7.4, §7.6).
+> 2. **Moved, not kept.** A successful transfer *removes* the cap from the sender's table (§7.6):
+>    authority moves, it does not duplicate. Reusing that handle afterward is a use of a cap you no
+>    longer hold. And if the transfer *failed*, the cap stayed - reclaim it (so a table slot does not
+>    leak, §26.6). Either way, the outcome of the send decides what you may do next: never ignore it.
+> 3. **Narrowed to need.** Grant the *least* rights the receiver needs (§7.3). In particular, do not
+>    pass `GRANT` onward unless the receiver is meant to re-delegate - a cap handed out *with* `GRANT`
+>    lets its holder transfer it again. Rights only narrow on transfer; widening is impossible, so the
+>    floor you set is the floor forever.
+
 ### 8.6 Failure Semantics
 
 | Event                                       | Effect                       |
