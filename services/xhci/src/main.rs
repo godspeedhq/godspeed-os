@@ -321,7 +321,7 @@ fn run_command(
     dma.write32(cmd_trb_off + 4, d1);
     dma.write32(cmd_trb_off + 8, d2);
     dma.write32(cmd_trb_off + 12, d3);
-    mmio.write32(dboff, 0); // command doorbell
+    mmio.write32(dboff, 0); // command doorbell: DB Target must be 0 (the command ring), NOT a DCI like the slot doorbells (dboff + slot*4, target = endpoint DCI) elsewhere in this file
 
     for _ in 0..8 {
         match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 10_000_000) {
