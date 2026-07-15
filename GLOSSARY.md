@@ -149,3 +149,20 @@ minimal `name -> EndpointId` map (`ipc::names`) plus a gated "mint a SEND cap by
 call (`AcquireSendCap`). It is the bounded recovery anchor that **replaced the retired
 `registry` service** (Path C / Phase 4): the supervisor wires services from a `name -> cap`
 map, and clients reacquire a service by name through this directory after a restart.
+
+## Amendment shorthand
+
+`CLAUDE.md` and the docs refer to past amendments by short codes. This decodes the common ones; each is
+defined in full at its cited section.
+
+| Code | Meaning | Where |
+|------|---------|-------|
+| **H1** | IOMMU DMA-confinement: an IOMMU (AMD-Vi) confines a DMA-capable driver to its granted arena, making it least-privilege and restartable, so it drops out of the TCB where an IOMMU exists. | §6.4, `docs/iommu.md` |
+| **H11** | The `registry` left the TCB - it became a real userspace name service (holding only delegated caps), later retired entirely (see Path C / naming Phase 4). | §6.1 |
+| **P2** | File-as-capability: **delegated resource capabilities** - a service owns a resource's *meaning* while the kernel mints, validates, routes, and revokes its cap. | §7.10 |
+| **Phase C** | `fs` gained crash-consistent recovery: every metadata mutation commits through a redo-journal, replayed on mount to a consistent state. | §15, `docs/persistence.md` §6.8 |
+| **Phase D** | `block-driver` + `fs` became restartable and left the TCB (made safe by Phase C's recovery); their death is a supervisor restart, not a reboot. | §6.1 |
+| **Path C** | Naming moved out of the kernel: the supervisor wires services from a `name -> cap` map; the kernel keeps only a minimal gated recovery directory. Reduced the unkillable set to `{kernel}`. | §3.7, `docs/naming-design.md` |
+| **naming Phase 4** | The `registry` *service* was retired into the kernel's `name -> EndpointId` directory. | Path C |
+| **naming Phase 5** | `init` was removed; the kernel spawns the supervisor directly. | Path C |
+| **naming Phase 6** | The `supervisor` was made restartable - the kernel respawns it, unconditionally, forever. | §6.2, Path C |

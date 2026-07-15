@@ -126,3 +126,36 @@ you can name is a rule you catch) and the seed bank for future review probes.
 - `docs/userspace-audit.md` - the services audit (wait on truth incl. failure; reacquire and retry).
 - `docs/anti-patterns.md` - the field guide this audit maintains.
 - `COMMANDMENTS.md`, `CLAUDE.md` - the law the docs must convey clearly.
+
+---
+
+## Audit 2 - 2026-07-15 (fix-validation + new-cluster probe)
+
+Method: cold least-capable-model probes - two grokability cold-reads (comprehension questions targeting
+Audit-1's fix areas) + one seeded cold-review on an **untested cluster** (memory/allocation,
+temporal/boot-order, unbounded) in a `prefetch` candidate PR. Purpose: confirm Audit-1's fixes are
+legible to a cold model, and probe a cluster Audit 1's reviews did not cover. Run as part of the
+2026-07-15 full-trilogy audit (`audit-report/2026-07-15.md`).
+
+**Result: 0 HIGH, 0 MED, 1 LOW. Audit-1's fixes are confirmed legible, and the field guide works.**
+
+- **Fixes validated legible (cold weak model, unprompted).** Both grokability reads independently
+  answered the Audit-1 fix-area questions correctly, citing the source: `log_fmt` (D1), the §8.5 GRANT
+  three-checks (D3), the §14.3 stale-handle rule (D2 - one read quoted it verbatim), where
+  `anti-patterns.md` lives, and the `#[no_mangle]` gotcha (D6). Grokability held at **median 7/10,
+  comprehension maxed, coherence 9/10** - the north-star passes (correctness maxed; the 7/10 is the
+  deliberate read-the-constitution tax).
+- **The field guide works.** The seeded `prefetch` review caught the planted cluster (alloc-`unwrap` ->
+  §10.4; boot-order assumption -> VIII/§14.3; unbounded loop -> §26.6.1) **and cited `anti-patterns.md`
+  by category name** to justify findings - direct evidence the field guide is usable as a reviewer
+  checklist. No new doc gap (the two partial catches were model-thoroughness; the rules were legible).
+
+| ID | Sev | Finding | Status |
+|----|-----|---------|--------|
+| **DA1** | LOW | The amendment shorthand (H1, H11, P2, Phase C/D, Path C, naming Phase 4/5/6) is used pervasively across `CLAUDE.md`/docs with no decoder; both grokability reads (and the prior session) flagged it as the top remaining friction. | **fixed** - "Amendment shorthand" glossary added to `GLOSSARY.md`. |
+| (cross) | LOW | `memory/CLAUDE.md` + `task/CLAUDE.md` describe dead code (`TaskMemoryOwner`/`ownership::reclaim_all`, `smp::placement`) as the live mechanism (shared with kernel-audit M1/M2). | **doc fixed** (banners repoint at the live code); the dead-code deletion is staged. |
+
+Recorded as NOT doc gaps: the `prefetch` review's two partial catches (silent-swallow, report-ready)
+were model-thoroughness, not missing rules - the reviewer caught the cluster and cited the guide. The
+recurring "constitution is a reference, not a tutorial" friction remains a **feature**, not a defect
+(the north-star sets 7/10 as sufficient).

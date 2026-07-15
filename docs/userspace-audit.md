@@ -450,3 +450,33 @@ and needs a real multi-subnet network to validate.
 | **shell pipes/net/observe** | net_dns/ping Err blast-safe; observe ctx.sleep safe; find size bounds-safe; pipe dispatch loud on type mismatch. Defects: U4/U7/U8 |
 | **net-stack/nic-driver/supervisor** | M3 fixed, M5 closed (death arms); every recv is an own-endpoint server loop, every reply non-blocking; dns/ping Err always replies. Defects: U3/M4/U9-U12 |
 | **library/contracts/fs/SDK** | T1 intact; fs/block-driver VIII+III clean; library scripts convention-compliant (argcount-first, help/version, raw-facts); unsafe clean. Defects: U13/U14/U15/L8 |
+
+---
+
+## Audit 3 - 2026-07-15 (full userspace sweep)
+
+Method: 5 parallel auditors by coupling (block-driver+fs, nic-driver+net-stack, supervisor+logger,
+xhci+ehci, shell+chaos+observe+probe+mem-pressure), each reading its crates in full and triaging against
+VIII/IX/VII/III/IV/VI/X. Every prior Audit 1/2 fix re-verified **present in current source**.
+
+**Result: 0 HIGH, 5 MED, 3 LOW (+1 carried). All prior fixes intact; no hang, corruption, shared-state,
+or ambient-authority violation on any path.** The MEDs are resource-lifecycle gaps (a cap/slot/frame not
+revoked or reclaimed on some teardown path) and one recovery-backstop gap - each concrete and
+ordinary-use-reachable, none a wedge. The two USB MEDs live in the newer hub-walk code Audit 1 predated;
+the root-port path stays clean.
+
+| ID | Sev | Service | What | Status |
+|----|-----|---------|------|--------|
+| **F1** | MED | fs | `OP_RESET`/`OP_FLASH` (`fs/src/main.rs:724,751`) drop the mounted volume without revoking outstanding file caps (unlike delete/rename, which call `revoke_open_by_path`) - the kernel delegated-resource slot for each open file leaks until fs restarts; repeated reset/flash-with-files-open eventually fails `resource_mint` loudly. No corruption/escape. | open, staged - revoke-all `open_files` before `*vol = None` / re-`format`. |
+| **N1** | MED | net-stack | Sockets are never closed/revoked (`net-stack/src/main.rs:730-753`; shell `sock` at `:5058,5120`) - the 8-slot table leaks one slot per `open` (no CLOSE op, contra `docs/networking.md` §6 "Close = revoke"); the 9th open fails and the error misattributes exhaustion to "no NIC" (same class as fixed L1). | open, staged - badge-driven CLOSE -> `resource_revoke` + slot clear; shell `cmd_sock` calls it before `remove_cap`; distinct "table full" message. |
+| **S1** | MED | supervisor | Logger's fresh-boot spawn (`supervisor/src/main.rs:308-319`) uses plain `ctx.spawn`, so `name_map.get("logger")` is `None`; `reconcile`/`converge` then treat logger as "never spawned" and silently `continue`, disabling its dropped-notification recovery backstop (a `chaos max-carnage logger` that drops the death-notice leaves logger dead with no log - §26.4/Inv 12). Direct death-notify path unaffected. | open, staged - `ensure_mapped(&ctx, &mut name_map, "logger", 0xFFFF)` on fresh boot. |
+| **XH-1** | MED | xhci | HC-wedge detection (`hc_wedged`/poison/`continue 'reenum`) was not ported to the hub/downstream command path (`address_downstream`, `configure_as_hub`); a downstream Address-Device wedge can re-trigger the all-core freeze the root-port fix prevents. Newer, not-yet-hardware-tested hub code. | open, staged - thread `hc_wedged` through the hub commands; check `configure_as_hub`'s return. |
+| **XH-2** | MED | xhci | Hub-walk Address-Device failure (`:1171-1177`) leaves the enabled xHC slot never `disable_slot`'d (the root-port path does). Bounded (HCRST per pass) but wastes slots on a flaky hub port within a pass. | open, staged - `disable_slot` in the failure branch, guarded by the not-wedged check once XH-1 lands. |
+| **XH-3/4/5** | LOW | xhci | (3) `spin()` discards success/failure, so reset logs assert unverified facts (ehci's `wait()` returns `bool` + WARNs); (4) poll drain never re-arms MSI-X (`irq_unmask`); (5) dead-BAR detection is diagnostic-only, falls through to enumerate. | staged (observability hygiene). |
+| **M4** | MED | net-stack | (carried, deferred) `!have_mac` auto-config gate (`:706-713`) never re-reconciles a cached IP/gateway on a different-subnet re-DHCP. On record since Audit 1; needs a real multi-subnet network to validate. | deferred (unchanged). |
+
+Re-verified intact: shell/chaos/observe/probe/mem-pressure CLEAN (zero bare `recv` on a dependency in
+the 9,938-line shell; `reacquire_by_name` on every fs/net path; `SERVICE_CONTROL`-gated kill;
+unsafe-free); block-driver+fs VIII-airtight + III-clean (`block_rpc` single funnel, bounded mount
+retries); all prior M1/M2/M3/M5/M6/M8/U3/U9-U12/T1 fixes present. Zero `unsafe` in any service (§18.2);
+no shared mutable statics anywhere in scope.

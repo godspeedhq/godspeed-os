@@ -384,3 +384,31 @@ that needs a privileged cap (supervisor spawn, probe kill/introspect for the sel
 the negative pins (A11/A12/A13, verified in QEMU) hold. On-silicon sign-off: the audited kernel boots,
 self-checks, and runs clean on the AMD GX-420GI. (The host-driven 24-case suite - Tests 1B/6/10/12/13/15,
 which need the control channel - remains the QEMU gate, 24/0 on this branch.)
+
+---
+
+## Audit 4 - 2026-07-15 (full-kernel sweep + arch-demarcation focus)
+
+Method: 5 parallel subsystem auditors (syscall+ipc+interrupt, capability, task+scheduler, memory+smp,
+arch+boundary-seam), each reading its files in full and triaging A/B/C, with this branch's arch-boundary
+demarcation (`arch::imp` seam, `portable_atomic`) as a focused target. Every prior finding (C1/C2/C3,
+K1/K3, V3) re-verified **present in current source**, not just claimed.
+
+**Result: the arch demarcation is sound - zero boundary leaks (verified four ways), a mechanical
+extraction with no logic change. One new (C) resource-leak finding (T1) + four (A/B) dead-code/hygiene
+items. No new panic/wedge/inconsistent-state violation; no regression of any prior fix.**
+
+| ID | Sev | Class | What | Status |
+|----|-----|-------|------|--------|
+| **T1** | MED-HIGH | (C) | `task/mod.rs` `spawn_service_with_config` leaks the page-table + ELF + user-stack + ctx frames on any `Err` after `loader::load()` - `cleanup_partial_spawn` unwinds only the endpoint/routing/name/slot half and never reclaims `page_table` (no `Drop` on `PageTable`/`Frame`). Trigger: kstack-pool exhaustion under a concurrent spawn burst (`chaos max-carnage`); `poll_supervisor_respawn` retries on transient `Err`, so a respawn failing partway leaks more frames each attempt - a ratchet that can defeat the "reclaim every respawn" property (mod.rs:3830). Breaches §26.6 / Commandment IX; NOT the strict north-star (no panic/wedge). | open, staged - give `cleanup_partial_spawn` the `page_table` and reclaim via `reclaim_user_frames` + free the never-loaded PML4. |
+| **M1** | LOW | (A) | `memory/ownership.rs` (`TaskMemoryOwner`,`FrameSet`) + `memory/page.rs` (`Page`) + `task/task.rs`'s `Task` are **dead code** (zero callers), yet `memory/CLAUDE.md` + `task/CLAUDE.md` describe them as the live limit/reclaim path - III doc-vs-dead-code drift. Live: `scheduler.rs` `TASK_ALLOC_BYTES`/`current_task_claim_alloc`; `arch/x86_64/page_tables.rs::reclaim_user_frames`. | **doc fixed** (banners repoint at live code); dead-code deletion staged. |
+| **M2** | LOW | (A) | `smp/placement.rs` (`resolve`,`round_robin_next`,`static mut RR_COUNTER`) is dead - a known-unsound `static mut` stub - yet `task/CLAUDE.md` cites it as the live spawn placement. Live: `task/mod.rs::resolve_spawn_core` (atomic). | **doc fixed** (banner); dead-code deletion staged. |
+| **K-a** | LOW | (A) | `capability/cap.rs` `Capability::validate` + `narrow_for_grant` are dead (re-implemented inline in `CapTable::get`) - a mild III duplicate-logic smell. | staged (collapse onto one impl if `capability/` is next touched). |
+| **K-b** | LOW | (B) | `capability/table.rs` `CapTable::get`'s diagnostic `kprintln!` runs while a `GLOBAL_RESOURCES` lock guard is live - latency hygiene, not a deadlock. | staged. |
+
+Re-verified present-and-correct (no regression): boundary integrity (0 leaks - `arch_boundary_check.py`
+plus independent greps for named-arch / `target_arch`-cfg / `asm!` / `AtomicU64`); C1/C2 (ring-3 fault
+kill vs halt), K1 (bounded THRE poll), K3 (spurious-vector `iretq` stub); V3 (scheduler UAF Dekker
+handshake); C3 (non-panic supervisor respawn). The demarcation is a mechanical `arch::x86_64::` ->
+`arch::imp::` + `core::sync::atomic::AtomicU64` -> `portable_atomic::AtomicU64` substitution, verified via
+diff to have zero logic change.

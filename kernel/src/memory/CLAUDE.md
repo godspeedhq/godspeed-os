@@ -19,6 +19,14 @@ Physical memory management (§10). Unsafe boundary: raw physical addresses appea
 - **TLB shootdown before frame free.** `ownership.rs`'s `reclaim_all` does NOT issue the shootdown - its caller (the task death path in `task/mod.rs`) calls `smp::ipi::broadcast_tlb_shootdown` first, then `reclaim_all`, then `allocator::free_frame` for each returned frame.
 - **PML4 frame deferred in self-kill.** The PML4 frame is skipped during `reclaim_all` in the self-kill path (dying task's CR3 still active) and stored in `CORE_PENDING_PML4[core]`. It is freed at the next `drain_pending_kstack` call when a different CR3 is loaded. This prevents a CR3 use-after-free kernel page fault.
 
+> **Doc-drift correction (documentation-audit Audit 2, 2026-07-15; kernel-audit M1).** The
+> `TaskMemoryOwner` / `ownership.rs` / `reclaim_all` names used in this file are **dead code** (zero live
+> callers) pending removal. The **live** paths are: limit enforcement = `task/scheduler.rs`'s
+> `TASK_ALLOC_BYTES` + `current_task_claim_alloc` (returns `None` = `AllocDenied`); kill-path frame
+> reclaim = `arch/x86_64/page_tables.rs::reclaim_user_frames`. The *behaviour* described below
+> (shootdown-before-free, deferred self-kill PML4 via `CORE_PENDING_PML4`) is correct - only the function
+> names are stale. Editing `ownership.rs` will have no effect.
+
 ## Limit enforcement flow
 
 1. Supervisor sets `limit_bytes` from the contract at spawn time.

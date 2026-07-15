@@ -11,6 +11,13 @@ Task management and per-core scheduler (§9, §14).
 | `state.rs`      | `TaskState` enum: Ready, Running, BlockedOnRecv, BlockedOnSend, Dead |
 | `scheduler.rs`  | `run()` (never returns), `timer_tick()`, `wake(task_id)`, `block_on_send(endpoint)` |
 
+> **Doc-drift correction (documentation-audit Audit 2, 2026-07-15; kernel-audit M1/M2).** Two mechanisms
+> named below are **dead code** (zero live callers), pending removal: the spawn-flow's
+> `smp::placement::resolve` is dead - the live core placement is `task/mod.rs::resolve_spawn_core` (atomic
+> round-robin); the kill-flow's `memory::ownership::reclaim_all` is dead - the live kill-path reclaim is
+> `arch/x86_64/page_tables.rs::reclaim_user_frames`. The described behaviour is right; the function names
+> are stale.
+
 ## Static placement invariant (§9.1)
 
 A task's `core_id` is set at spawn and never changes. Mid-execution migration is forbidden. The invariant is enforced by `invariants::assertions::assert_no_mid_execution_migration`, called from the scheduler before every context switch.
