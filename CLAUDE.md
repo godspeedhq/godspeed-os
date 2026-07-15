@@ -1043,6 +1043,8 @@ Every syscall checks the calling task's capability table, populated *from* the c
 
 Cascading failure is **the client's responsibility**. There is no implicit recovery. If A depends on B and B restarts, A's next syscall returns `CapRevoked` or `EndpointDead`, and A must retry, degrade, or fail.
 
+**Reacquiring the endpoint is necessary but not sufficient.** A fresh cap to B's new instance does not refresh anything A obtained from B's *previous* incarnation. Every secondary thing A still holds that was derived from the dead instance - a socket or connection id, a resource or open-file cap, a generation number, or a cached copy of B's state - is stale: the new B never issued it and does not know it. A must discard or re-establish each of these against the new instance. In particular, A must not keep serving a cached view of B's state as authoritative once B has restarted: that view is a derived copy of B's truth (§26.4, Commandment III), and that truth was just replaced. Reacquire the endpoint, *and* re-derive everything that hung off the old one.
+
 ### 14.4 Supervisor API
 
 ```rust

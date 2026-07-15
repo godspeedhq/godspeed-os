@@ -178,6 +178,11 @@ hang. Only a truth that includes failure makes "wait on truth" complete.
 Failure is not exceptional. It is expected. Every service should recover cleanly without assuming a
 perfect world. A client whose dependency restarts must reacquire and retry, not crash.
 
+And reacquiring is not just the endpoint. Anything the dependency's *previous* incarnation handed you -
+a connection or socket id, a handle, a cached value, a generation - is stale once it restarts, and must
+be re-established with the new instance or discarded. A fresh connection does not refresh what the dead
+one gave you; a cached view of a restarted peer's state is no longer the truth.
+
 **If recovery cannot be tested, it does not exist.**
 
 > *Grounded in:* §14 (service lifecycle, restart, and cap rebinding), §14.3 (cascading failure is the
