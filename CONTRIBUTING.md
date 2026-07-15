@@ -83,6 +83,29 @@ operational problem - never added speculatively because another system has them 
 default answer to "should we add this?" is to simplify, reduce scope, and preserve the invariants. A
 smaller coherent system is preferred over a larger impressive one.
 
+## Adding an architecture
+
+GodspeedOS is one arch-neutral codebase behind a single seam, `crate::arch::imp`. A new instruction
+set architecture is **bounded to `kernel/src/arch/<isa>/`** - you write that directory and, apart from
+two `#[cfg(target_arch)]` lines and the build plumbing, nothing else in the kernel changes. Five ISA
+families (x86-64, AArch64, RISC-V, LoongArch, s390x) and both word sizes have been proven this way;
+the proof is `docs/multi-arch.md`.
+
+If you are porting, **read [`kernel/src/arch/CLAUDE.md`](kernel/src/arch/CLAUDE.md)** - it is the map:
+the seam, the surface a port must expose, the exact five-place checklist, and the per-arch bring-up
+gotchas found by actually booting. Two rules matter most, and both are load-bearing:
+
+- **No inline `asm!` and no named-arch reference (`arch::x86_64::`, `core::arch::<isa>::`) outside
+  `arch/`.** This is enforced by `scripts/arch_boundary_check.py` in CI - a violation means a neutral
+  file made an arch-specific assumption, and the fix is to add an `arch::imp` primitive, never to
+  special-case an arch at the call site.
+- **Never use `core::sync::atomic::AtomicU64` directly - import `portable_atomic::AtomicU64`.** That
+  one dependency is the entire cost of 32-bit support (32-bit RISC-V has no 64-bit atomic); reaching
+  for the `core` type is the one easy way to silently break word-size portability.
+
+`cargo check -p kernel --target <triple>` is the boundary test: any error *outside* `arch/<isa>/` is a
+leak; errors *inside* it are just your stub naming the surface you still owe.
+
 ## Credit and attribution
 
 Contributors are credited through **git history** - every commit carries its author, permanently and
