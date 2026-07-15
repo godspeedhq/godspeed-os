@@ -107,8 +107,16 @@ exempt. If the Supervisor itself must survive its own death - and it must, for t
 The only unkillable component is the kernel. Everything above it is identity, not location, and
 identity survives restart.
 
+Being unexceptional cuts both ways. Just as no service is too important to restart, none is too
+important to admit when it could not recover. When a service tries to recover from a failure - a
+retry, a reacquire, a fallback - and that recovery *itself* fails, the failure is still a failure:
+surface it. A recovery whose own failure is discarded becomes a silent success, and the service then
+proceeds on a state it never actually reached - the very hidden failure this system forbids. Recover
+if you can; when you cannot, say so plainly.
+
 > *Grounded in:* §6.2-§6.3 (the supervisor is restartable; the unkillable set is `{kernel}` alone),
-> Invariant 6 (services must be restartable), Invariant 11 (identity is stable; location is not).
+> Invariant 6 (services must be restartable), Invariant 11 (identity is stable; location is not),
+> §26.7 (loud failure over hidden recovery), Invariant 12 (failures are loud, never silent).
 
 ---
 

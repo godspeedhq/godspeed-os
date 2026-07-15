@@ -2648,6 +2648,8 @@ A restart is preferable to hidden mutation.
 
 A visible timeout is preferable to indefinite waiting.
 
+A reported failed recovery is preferable to a hidden one.
+
 The developer must never be forced to guess whether:
 - an operation succeeded;
 - a message was delivered;
@@ -2655,6 +2657,14 @@ The developer must never be forced to guess whether:
 - or the system silently degraded behavior.
 
 The kernel boundary must remain semantically honest.
+
+**A recovery that itself fails is still a failure.** Retrying, reacquiring, or falling back is the
+right response to a failure - but when the recovery step *also* fails, that outcome must remain as
+visible as the original failure. Proceeding as though a failed recovery had succeeded - discarding its
+result and continuing - converts a loud failure into a silent one and hides exactly the state an
+operator needs to see. Every failure path, including a retry that ultimately fails, is reported, never
+swallowed. This holds in any language: an ignored error return is the same silent fallback as a
+suppressed exception.
 
 ---
 
