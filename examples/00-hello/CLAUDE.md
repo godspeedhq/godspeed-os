@@ -23,6 +23,13 @@ The four files every service has, and nothing more:
 way in (no raw syscalls, no ambient globals). If it is not reachable through `ctx`, and not granted by
 the contract, the service cannot do it.
 
+> **Gotcha - keep `#[no_mangle]` directly on `service_main`.** `build.rs` wires the ELF entry by name
+> (`--entry=service_main`), so the entry resolves to a symbol *literally* named `service_main`. Rust
+> mangles names by default; `#[no_mangle]` must sit *directly* on `service_main` to preserve it. Miss it
+> (or let other code separate the attribute from the function) and the entry address becomes `0` - the
+> service page-faults at `rip=0` the instant it spawns, prints nothing, and dies in under a second. If a
+> service you spawn never logs its first line, check this first.
+
 ## Why it is built this way (the Commandments)
 
 - **Commandment I (do not expand the kernel; use a service).** `hello` is a service, not a kernel

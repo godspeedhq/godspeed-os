@@ -1,27 +1,41 @@
 # tests/qemu/identity/
 
-The identity test suite (§22). **22/22 tests passing - no regressions allowed.**
+The identity test suite (§22, Tests 1-15). **`osdev test identity` runs 24 cases (Tests 1-11 and 15, each with an A/B case, plus IR1A/IR1B) - all passing, no regressions allowed.** Tests 12-14 run as their own bare-metal subcommands (see below).
 
 If any test in this directory fails, the system is no longer the system the spec describes.
 
 ## Tests
 
-| File                           | Spec test  | Constitutional invariant  | Timeout      |
-|--------------------------------|------------|---------------------------|--------------|
-| `test_01_bootstrap.rs`         | §22 Test 1 | TCB integrity             | 30s / 120s   |
-| `test_02_cap_enforcement.rs`   | §22 Test 2 | No ambient authority      | 30s          |
-| `test_03_ipc_same_core.rs`     | §22 Test 3 | Authority is explicit     | 30s          |
-| `test_04_endpoint_death.rs`    | §22 Test 4 | Restartability            | 30s / 60s    |
-| `test_05_cap_transfer.rs`      | §22 Test 5 | Authority is explicit     | 30s          |
-| `test_06_supervisor_restart.rs`| §22 Test 6 | Restartability            | 60s / 60s    |
-| `test_07_memory_limits.rs`     | §22 Test 7 | Isolation                 | 30s / 60s    |
-| `test_08_preemption.rs`        | §22 Test 8 | No service monopoly       | 120s / 120s  |
-| `test_09_cross_core_ipc.rs`    | §22 Test 9 | Identity over location    | 60s          |
-| `test_10_restart_core_change.rs`| §22 Test 10| Identity over location   | 60s / 60s    |
-| IR1A (inline in validator)     | §12.2 §12.3 | Interrupt delivery      | 60s          |
-| IR1B (inline in validator)     | §12.2       | Discard on no-driver    | 60s          |
+There are **no `test_NN_*.rs` files in this directory** - it is a spec/guide directory. The identity
+cases are **data-driven `TestSpec` entries in `osdev/src/validator.rs`** (each names its own
+`spec_ref`, e.g. `§22 Test 4A`), and `osdev test identity` runs all 24 together.
 
-Timeout column: positive test / negative test. Single value = both cases share the timeout.
+| Case(s) in `osdev/src/validator.rs` | Spec test  | Constitutional invariant  | Timeout      |
+|-------------------------------------|------------|---------------------------|--------------|
+| `1A` / `1B`                         | §22 Test 1 | TCB integrity             | 30s / 120s   |
+| `2A` / `2B`                         | §22 Test 2 | No ambient authority      | 30s          |
+| `3A` / `3B`                         | §22 Test 3 | Authority is explicit     | 30s          |
+| `4A` / `4B`                         | §22 Test 4 | Restartability            | 30s / 60s    |
+| `5A` / `5B`                         | §22 Test 5 | Authority is explicit     | 30s          |
+| `6A` / `6B`                         | §22 Test 6 | Restartability            | 60s / 60s    |
+| `7A` / `7B`                         | §22 Test 7 | Isolation                 | 30s / 60s    |
+| `8A` / `8B`                         | §22 Test 8 | No service monopoly       | 120s / 120s  |
+| `9A` / `9B`                         | §22 Test 9 | Identity over location    | 60s          |
+| `10A` / `10B`                       | §22 Test 10| Identity over location    | 60s / 60s    |
+| `11`                                | §22 Test 11| Naming out of kernel; restartability | 60s |
+| `15`                                | §22 Test 15| Unkillable set = {kernel} | 60s          |
+| `IR1A` / `IR1B`                     | §12.2 §12.3| Interrupt delivery / discard-on-no-driver | 60s |
+
+Timeout column: positive case / negative case. Single value = both cases share the timeout.
+
+**Tests 12, 13, and 14 are heavier bare-metal scenarios run as their own subcommands** (not part of
+`osdev test identity`):
+
+| Subcommand              | Spec test   | Pins                                            | Implemented in |
+|-------------------------|-------------|-------------------------------------------------|----------------|
+| `osdev test iommu`      | §22 Test 12 | Confined driver cannot DMA outside its arena (H1, §6.4) | `osdev/src/main.rs` |
+| `osdev test fs-restart` | §22 Test 13 | `fs` survives its own restart (Phase D)         | `osdev/src/main.rs`, `osdev/src/shell_test.rs` |
+| `osdev test file-cap`   | §22 Test 14 | A file is a capability (P2, §7.10)               | `osdev/src/main.rs`, `osdev/src/shell_test.rs` |
 
 ## How tests work (§22.3)
 

@@ -27,7 +27,7 @@ there and why, so when in doubt, open the one nearest the code you are editing.
 | I want to ... | Start here |
 |---------------|-----------|
 | Understand the philosophy before touching anything | [`COMMANDMENTS.md`](COMMANDMENTS.md), then skim [`CLAUDE.md`](CLAUDE.md) |
-| Write a new userspace service | Copy [`examples/00-hello/`](examples/00-hello/); read its `CLAUDE.md` and [`sdk/rust/CLAUDE.md`](sdk/rust/CLAUDE.md) |
+| Write a new userspace service | [`GETTING_STARTED.md`](GETTING_STARTED.md) - the 5-minute quickstart (copy [`examples/00-hello/`](examples/00-hello/), read its `CLAUDE.md` + [`sdk/rust/CLAUDE.md`](sdk/rust/CLAUDE.md)) |
 | Learn one pattern (IPC, caps, composition, persistence, drivers) | The matching `examples/*/CLAUDE.md` (index: [`examples/README.md`](examples/README.md)) |
 | Add or change a syscall | `kernel/src/syscall/CLAUDE.md`, then `syscall/mod.rs` |
 | Add a new CPU architecture | [`kernel/src/arch/CLAUDE.md`](kernel/src/arch/CLAUDE.md) (the seam + the five-place checklist) |

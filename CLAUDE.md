@@ -1445,6 +1445,16 @@ Bar: the system either continues correctly with degraded capacity, or panics lou
            └── 500 ms isolation pause (OS reclaims QEMU pages)
 ```
 
+**Where these tests actually live (spec -> implementation).** The pseudocode in this section pins each
+test; the executable form lives in `osdev/`, not as `.rs` files under `tests/qemu/`. The identity cases
+(Tests 1-11 and 15, each A/B, plus the interrupt-routing IR1A/IR1B) are data-driven `TestSpec` entries
+in `osdev/src/validator.rs`, run together by `osdev test identity` - **24 cases**. Tests 12, 13, and 14
+are heavier bare-metal scenarios with their own subcommands - `osdev test iommu` (Test 12),
+`osdev test fs-restart` (Test 13), `osdev test file-cap` (Test 14) - in `osdev/src/main.rs` and
+`osdev/src/shell_test.rs`. The per-directory guide `tests/qemu/identity/CLAUDE.md` maps every spec Test
+to its entry, and the other categories (Property, Fuzz, Stress, Perf, Adversarial, Chaos, and their
+brutal variants) are `TestSpec` tables in the same `validator.rs`.
+
 ### 22.4 Sequencing Note
 
 "Tests before code" is aspirational. You cannot run any test until the kernel boots and IPC works. Honest sequence: write test specs (this section); build minimum kernel + harness; see tests fail for the right reasons; implement until they pass.
@@ -2115,7 +2125,7 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 - **Trusted root** - `supervisor` (sole; `init` was removed in Path C / Phase 5 - the kernel spawns the supervisor directly). It is **trusted but restartable** (Path C / Phase 6, §6.2): the kernel respawns it on death - unconditionally, forever - so its failure is recovered, not a reboot. The **only unkillable component is the kernel itself**. (`block-driver` + `fs` are restartable storage services.)
 - **Name directory** - the kernel's minimal `name → EndpointId` map (`ipc::names`) + a gated "mint a SEND cap by name" (`AcquireSendCap`). The bounded recovery anchor that **replaced the registry service** (naming Phase 4 / Path C, §3.7): the supervisor wires services from a `name → cap` map and clients reacquire names through the directory. *(The retired `registry` userspace name service is `docs/registry.md` - historical.)*
 - **Service** - Userspace component with a contract, capability table, and isolated address space.
-- **Contract** - `service.toml` declaring resource, capability, and placement requirements.
+- **Contract** - a service's `contracts/<name>.toml` (e.g. `examples/ping/contracts/ping.toml`) declaring resource, capability, and placement requirements.
 - **Supervisor** - User-space service holding restart authority over other services.
 - **`osdev`** - Host-side CLI for building, publishing, and controlling the OS in QEMU.
 

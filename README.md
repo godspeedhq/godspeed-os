@@ -6,6 +6,8 @@ A capability-based microkernel OS written in Rust. Every privileged action requi
 
 📖 **[Documentation](https://godspeedhq.github.io/godspeed-os/)** · **[SDK API reference](https://godspeedhq.github.io/godspeed-os/api/godspeed_sdk/)** · **[Releases](https://github.com/godspeedhq/godspeed-os/releases)**
 
+> **New here?** [**GETTING_STARTED.md**](GETTING_STARTED.md) takes you from zero to your first running service in a few minutes.
+
 ---
 
 ## Architecture
@@ -101,6 +103,8 @@ Latest pass (2026-05-31, boot-verified on AMD T630; `milestones/testing/static-a
 ---
 
 ## Getting started
+
+**Want to write a service?** See [**GETTING_STARTED.md**](GETTING_STARTED.md) - a 5-minute, copy-`examples/00-hello` walkthrough. The rest of this section is about building and booting the OS itself.
 
 **Requirements:** Rust nightly (pinned in `rust-toolchain.toml`), QEMU on your PATH, an x86_64 host, and the Limine bootloader binaries (one-time setup below). The same commands work on Linux, macOS, and Windows - `osdev` handles the platform differences, and there is no Makefile to keep in sync.
 

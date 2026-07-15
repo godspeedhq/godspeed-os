@@ -6,7 +6,7 @@ All QEMU-based tests. Tests in this tree boot the OS in QEMU; they are integrati
 
 | Directory     | Purpose                                        | Status          |
 |---------------|------------------------------------------------|-----------------|
-| `identity/`   | Constitutional identity tests (§22) - 20/20 ✅ | Complete        |
+| `identity/`   | Constitutional identity tests (§22) - 24/24 ✅ | Complete        |
 | `harness/`    | Shared QEMU launcher, serial reader, runner    | -               |
 | `perf/`       | Performance benchmarks (B1-B10, BP1-BP10)      | ✅ 10/10 + 10/10 brutal |
 | `property/`   | Property tests (P1-P10, §22)                   | Active          |

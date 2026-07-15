@@ -14,7 +14,7 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `osdev logs <service>`      | Tail service log output |
 | `osdev status <service>`    | Show service state + assigned core |
 | `osdev caps <service>`      | Show held capabilities |
-| `osdev test identity`       | Run §22 identity test suite (20 tests) |
+| `osdev test identity`       | Run §22 identity test suite (24 cases: Tests 1-11 + 15, A/B, + IR1A/B) |
 | `osdev test property`       | Run property tests (P1-P10) |
 | `osdev test fuzz`           | Run fuzz tests (F1-F8) |
 | `osdev test stress`         | Run stress tests (S1-S10) |

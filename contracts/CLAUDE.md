@@ -6,7 +6,7 @@ Service contracts and JSON Schema (§13.5). Every service declares what it needs
 
 | File                          | Purpose |
 |-------------------------------|---------|
-| `schema/service.schema.json`  | JSON Schema (draft 2020-12) for all `service.toml` contract files |
+| `schema/service.schema.json`  | JSON Schema (draft 2020-12) for all `contracts/<name>.toml` contract files |
 | `*.toml`                      | One contract per service |
 
 ## Contract format (§13.1)

@@ -89,7 +89,7 @@ before inclusion.
 | TCG | Tiny Code Generator | QEMU's pure-software (non-KVM) JIT; cross-core wake timing differs under TCG, so some tests poll rather than block-wait. |
 | TLB | Translation Lookaside Buffer | On unmap (service death, memory reclaim) the kernel issues a TLB shootdown via IPI to every core and resumes only after all acknowledge (section 10.5). |
 | TOCTOU | Time-Of-Check-To-Time-Of-Use | The send-during-restart race; caught atomically by the generation check inside the send syscall (section 8.7, adversarial test A5). |
-| TOML | Tom's Obvious Minimal Language | The format of a service contract (`service.toml`), validated structurally against the JSON Schema. |
+| TOML | Tom's Obvious Minimal Language | The format of a service contract (`contracts/<name>.toml`), validated structurally against the JSON Schema. |
 | TSC | Time-Stamp Counter | The CPU cycle counter (`read_tsc`) used for the performance benchmarks; note `CORE_TOTAL_TICKS` counts scheduler quanta, not time. |
 | UART | Universal Asynchronous Receiver/Transmitter | The serial-port hardware carrying the shell (COM1, 115200 8N1). |
 | UB | Undefined Behavior | What unsound `unsafe` would produce; the spec's rule is "undefined behavior in spec becomes bugs in system" (section 25). |
