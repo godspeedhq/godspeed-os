@@ -839,7 +839,13 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
     };
 
     let resource_id = crate::capability::cap::ResourceId::from(ep_id);
-    let rights = if include_grant != 0 {
+    // SEC-6: the GRANT right is only for the operator/test instruments (ACQUIRE_ANY holders) that
+    // legitimately re-delegate reached caps - chaos flooding, pipe-sink wiring, the cap-transfer
+    // tests (P3). A declared-peer acquirer is an ordinary service reacquiring its OWN peer for
+    // recovery (§14.2); it only sends to it, never re-delegates it, so it gets SEND-only regardless
+    // of `include_grant`. This stops a service self-minting a re-delegatable cap to a declared peer
+    // (narrow to need, §8.5) - GRANT now follows the instrument permission, not the caller's request.
+    let rights = if include_grant != 0 && broad {
         crate::capability::Rights::SEND | crate::capability::Rights::GRANT
     } else {
         crate::capability::Rights::SEND
