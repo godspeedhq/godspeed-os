@@ -1207,7 +1207,7 @@ Bugs are classified as one of: `kernel`, `arch`, `memory`, `ipc`, `capability`, 
 
 Bug reports include: logs (kernel ring buffer + service), contract(s), QEMU repro steps including `-smp N` value, expected behavior, actual behavior, suspected classification.
 
-Kernel panics write to serial console **and** a reserved memory page that survives reboot. On next boot, the kernel logs the stored panic reason (init, which used to, is removed - Phase 5). Panics on any core halt the system.
+Kernel panics print the reason (`KERNEL PANIC: {info}`) to the serial console and the kernel log ring buffer. Panics on any core halt the system: the panic path broadcasts an NMI so **every** core halts, not only the panicking one (§6.2). A reserved-page mechanism to persist the panic reason across reboot was once described here but was **never implemented** (and `init`, which would have re-read it, is removed - Phase 5); the panic reason lives on the serial console only.
 
 ---
 

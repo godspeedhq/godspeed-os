@@ -381,8 +381,9 @@ standing on the rug that didn't know how to land.
 - **Unplanned rug pull (kernel panic):** identical to a planned one - the apps recover
   the same way, from their *last* persisted checkpoint. The only difference is there was
   no chance for an optional graceful wind-down (§11.6), so an app loses whatever it had
-  not yet checkpointed. The crash page (§19) preserves the panic reason across the
-  reboot. Hence the app-author's discipline: persist often.
+  not yet checkpointed. The panic reason is on the serial console (a reboot-surviving
+  crash page is described in §19 but is not yet implemented). Hence the app-author's
+  discipline: persist often.
 - **A/B is what makes the rug pull safe to attempt** (§8): a broken new Prime is a
   reboot you can *undo* (rollback to the old slot), not a brick. Without A/B, a bad
   kernel update bricks; with it, it's reversible.
