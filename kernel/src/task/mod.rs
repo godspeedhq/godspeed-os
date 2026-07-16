@@ -3789,19 +3789,24 @@ fn spawn_service_with_config(
         TaskContext::new_user(kstack_top, entry_va, USER_STACK_TOP, cr3)
     };
 
-    // 9. Finalise the reserved task slot (ctx + metadata → Ready).
-    // SAFETY: task_slot reserved above; CapTable initialised; IF=0.
-    unsafe {
-        scheduler::commit_task(task_slot, name, ctx, true, kstack_top as u64, own_endpoint);
-    }
-
-    // 10. Initialise the memory budget for this task (§10.3). Seed it with the base footprint -
-    // the mapped binary (code+data+BSS), the 256 KiB user stack, and the ctx page - so MEM_USED
-    // reflects real occupancy, not just dynamic alloc_mem (which most no-heap services never call).
+    // 9. Initialise the memory budget for this task (§10.3) BEFORE committing the slot Ready (SEC-19).
+    // commit_task publishes Ready last, making the task schedulable - possibly on a DIFFERENT core;
+    // seeded after, that core could run the task and read the PREVIOUS occupant's TASK_LIMIT_BYTES /
+    // TASK_ALLOC_BYTES in the window before this line ran (a transient wrong quota). Seed it first,
+    // with the base footprint - the mapped binary (code+data+BSS), the 256 KiB user stack, and the
+    // ctx page - so MEM_USED reflects real occupancy, not just dynamic alloc_mem (which most no-heap
+    // services never call). Mirrors commit_task's own "every field set before Ready is published" rule.
     let base_bytes = elf_mapped_bytes
         + USER_STACK_PAGES * PAGE_SIZE as u64
         + PAGE_SIZE as u64; // ctx page
     scheduler::set_task_memory_budget(task_slot, memory_limit, base_bytes);
+
+    // 10. Finalise the reserved task slot (ctx + metadata -> Ready). The budget above is already in
+    // place, so a task scheduled the instant Ready publishes sees its own quota, never a stale one.
+    // SAFETY: task_slot reserved above; CapTable initialised; IF=0.
+    unsafe {
+        scheduler::commit_task(task_slot, name, ctx, true, kstack_top as u64, own_endpoint);
+    }
 
     crate::kprintln!("task: '{}' spawned OK on core {} (slot {})", name, core_id, task_slot);
     Ok(own_endpoint)

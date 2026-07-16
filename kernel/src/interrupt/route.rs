@@ -25,7 +25,19 @@ static EHCI_DELIVER_LOGGED: core::sync::atomic::AtomicBool =
 /// Register a driver endpoint to receive interrupts for `irq`.
 /// Called at spawn time when the kernel processes a `hw_interrupt` capability.
 pub fn register(irq: u8, endpoint: EndpointId) {
-    IRQ_TABLE.lock()[irq as usize] = Some(endpoint);
+    let mut table = IRQ_TABLE.lock();
+    // SEC-16: never SILENTLY steal an IRQ line. On a clean driver restart the death path calls
+    // `unregister` first, so the slot is None here; a Some for a DIFFERENT endpoint means either a
+    // second driver claiming an already-owned line or a missed unregister - surface it loudly
+    // (invariant 12) rather than a silent overwrite. The new registration still wins (a respawn's
+    // fresh endpoint must take over its line); today it is unreachable (distinct per-device vectors).
+    if let Some(existing) = table[irq as usize] {
+        if existing != endpoint {
+            crate::kprintln!(
+                "interrupt: IRQ {} already routed - overwriting (second claim or a missed unregister?)", irq);
+        }
+    }
+    table[irq as usize] = Some(endpoint);
 }
 
 /// The driver endpoint registered for `irq`, if any. Used to gate the `IrqUnmask` syscall:
