@@ -268,6 +268,21 @@ fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 /// Blocks until a message is dequeued from the endpoint, then copies the
 /// payload into the caller-supplied buffer.  Returns the number of bytes
 /// written on success, or a negative error code.
+/// SEC-7: narrow an embedded cap for its RECEIVER before installing it. A DELEGATED-resource cap
+/// (a file/socket, §7.10) is installed WITHOUT GRANT - the owning service (e.g. fs) mints it with
+/// GRANT only so it can transfer it (§8.5 rule 1: an embedded cap must be grantable), but the
+/// recipient only USES it (invokes); it must not re-delegate it - the owner controls delegation by
+/// minting fresh caps. Endpoint caps are returned unchanged: re-delegating an endpoint (e.g. the
+/// shell wiring a pipe stage, or a reply cap) is a legitimate part of the IPC model, so GRANT is
+/// preserved for those. This is the default "narrow to need" §8.5 wants, enforced at the boundary.
+fn narrow_embedded_for_receiver(cap: crate::capability::cap::Capability) -> crate::capability::cap::Capability {
+    if crate::capability::delegated::is_delegated(cap.resource_id) {
+        cap.without_grant()
+    } else {
+        cap
+    }
+}
+
 fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::RECV) {
         Ok(c)  => c,
@@ -300,7 +315,7 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
                 let n_caps = msg.cap_count.min(msg.caps.len());
                 for i in 0..n_caps {
                     if let Some(embedded_cap) = msg.caps[i] {
-                        if let Ok(new_slot) = scheduler::current_task_insert_cap(embedded_cap) {
+                        if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
                             scheduler::push_pending_recv_cap(new_slot as u32);
                         }
                     }
@@ -353,7 +368,7 @@ fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
             let n_caps = msg.cap_count.min(msg.caps.len());
             for i in 0..n_caps {
                 if let Some(embedded_cap) = msg.caps[i] {
-                    if let Ok(new_slot) = scheduler::current_task_insert_cap(embedded_cap) {
+                    if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
                         scheduler::push_pending_recv_cap(new_slot as u32);
                     }
                 }
@@ -413,7 +428,7 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
                 let n_caps = msg.cap_count.min(msg.caps.len());
                 for i in 0..n_caps {
                     if let Some(embedded_cap) = msg.caps[i] {
-                        if let Ok(new_slot) = scheduler::current_task_insert_cap(embedded_cap) {
+                        if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
                             scheduler::push_pending_recv_cap(new_slot as u32);
                         }
                     }
@@ -1049,7 +1064,7 @@ fn handle_call(packed: u64, buf_ptr: u64, req_len: u64) -> i64 {
                 let n_caps = reply.cap_count.min(reply.caps.len());
                 for i in 0..n_caps {
                     if let Some(embedded_cap) = reply.caps[i] {
-                        if let Ok(new_slot) = scheduler::current_task_insert_cap(embedded_cap) {
+                        if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
                             scheduler::push_pending_recv_cap(new_slot as u32);
                         }
                     }
