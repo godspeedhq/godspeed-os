@@ -480,3 +480,50 @@ the 9,938-line shell; `reacquire_by_name` on every fs/net path; `SERVICE_CONTROL
 unsafe-free); block-driver+fs VIII-airtight + III-clean (`block_rpc` single funnel, bounded mount
 retries); all prior M1/M2/M3/M5/M6/M8/U3/U9-U12/T1 fixes present. Zero `unsafe` in any service (§18.2);
 no shared mutable statics anywhere in scope.
+
+## Long-soak observation - 2026-07-16 (LS1, open + uncaptured)
+
+Not a code-read finding - a **reproducible field observation** from a sustained hardware `chaos
+max-carnage` soak on the T630. Recorded here (rather than lost as chat) because its recovery signature
+puts it squarely in this audit's resource-lifecycle family (F1 / N1). It is **not yet root-caused**: the
+failure moment has never been captured (every log so far ended on a healthy round).
+
+| ID | Sev | Service (suspected) | What | Status |
+|----|-----|---------------------|------|--------|
+| **LS1** | MED (suspected) | fs / shell (delegated-slot or cap-table family) | After a sustained `chaos max-carnage` soak **past ~300K rounds**, `ls` (shell -> fs) stops returning and does **not** self-heal even after chaos is stopped; only **killing all services** restores it. | open, **uncaptured** - needs an introspection snapshot at the stuck moment before reset. |
+
+**The bracket (where it lives).** Two hardware datapoints on the same demarcated x86_64 image
+(`feat/aarch64-prep` @ `4d48d92`, now merged to `main`):
+- **~205,260 rounds -> healthy.** `ls` works; shell `selfcheck` reports **0 failed** (full fs / shell /
+  records / pipes suite green). No persistent corruption at this point.
+- **> ~300K rounds -> degraded** (seen **once**, the run immediately before the 205K stop): `ls` stuck
+  until a full service reset.
+
+So the degradation threshold is **above ~205K and at/below ~300K rounds** - a genuinely slow
+accumulation, consistent with one resource leaked per some-thousands of restart/reacquire cycles.
+
+**Why it is a live-service resource leak, not orphaned frames.** The recovery signature is decisive:
+*killing all services* clears it. That reclaims resources **held by live services**, so the leaked
+thing is a per-service resource freed on task death - a **cap-table slot** or a **delegated-resource
+slot** (§7.10) - **not** the orphaned page-table frames of kernel-audit **T1** (those are already
+detached from any task; killing services would not reclaim them). This is the same class as the staged
+**F1** (fs delegated-slot leak on `OP_RESET`/`OP_FLASH`) and **N1** (net-stack socket-slot leak): a slot
+leaked per teardown that accumulates under churn until `resource_mint` / a cap-table alloc fails and the
+shell's fs path can no longer complete an `ls`. **Landing the staged F1/N1 revocation fixes is the first
+thing to try** - LS1 may be a downstream symptom of the same missing-revoke discipline under sustained
+load.
+
+**Capture plan (do this the next time it reproduces, BEFORE `kill` recovers it).** The single most
+valuable action is one introspection snapshot at the stuck `gsh>`:
+1. At the stuck prompt, run `observe` (or the kernel-introspection command) and record **free frames**,
+   **live endpoint count**, and **per-service cap-table / delegated-slot occupancy**. A slot count
+   pinned at its ceiling for fs (or shell) names the culprit outright.
+2. Then try **`kill fs` alone** (does `ls` return? -> localizes to fs) versus **`kill shell` alone**,
+   instead of jumping straight to killing everything. Whichever single kill restores `ls` is the leaking
+   service.
+3. Grep the captured serial for the loud failure the leak should eventually raise (`resource_mint`
+   failure, cap-table full) - if it is *absent* at the stuck moment, the exhaustion is silent and that
+   is itself a §26.7 / Inv-12 gap to fix alongside the leak.
+
+Until captured, LS1 stays here as an open long-soak finding: real, reproducible, bracketed, and pointed
+at a suspect - but not yet pinned to a line.
