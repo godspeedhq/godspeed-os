@@ -13,7 +13,7 @@ use crate::capability::cap::CapError;
 use crate::capability::rights::Rights;
 use crate::ipc::endpoint::EndpointId;
 use crate::ipc::message::{IpcError, Message, MAX_MESSAGE_SIZE};
-use crate::memory::allocator::alloc_frame;
+use crate::memory::allocator::{alloc_frame, zero_frame};
 use crate::task::scheduler;
 use crate::task::state::TaskState;
 
@@ -1249,6 +1249,11 @@ fn handle_alloc_mem(size: u64) -> i64 {
             None    => return -1, // physical memory exhausted; budget already updated
         };
         let phys = frame.phys_addr().0;
+        // SEC-21: zero the frame before it becomes user-readable. `alloc_frame` may return a frame
+        // still holding a dead task's contents (the allocator zeroes neither on alloc nor on free),
+        // and AllocMem needs no capability, so an un-zeroed page would leak stale cross-task memory.
+        // `zero_frame` keeps the `unsafe` in the permitted memory/ layer (§18.5); this stays safe.
+        zero_frame(phys);
         // SAFETY: va is in the task heap range (0x1_0000_0000+); phys is from the
         // allocator; the task's page table is the active CR3 during this syscall.
         if unsafe { map_in_active_tables(va, phys, flags) }.is_err() {

@@ -13,6 +13,16 @@ comment.
 
 ---
 
+## 2026-07-16 - SEC-21 security fix (feat/hardening)
+
+| File | Change | Why |
+|------|--------|-----|
+| `memory/allocator.rs` | 43 → 44 (+1) | **SEC-21:** new safe `zero_frame(phys)` helper (one `unsafe` `write_bytes` block via the HHDM alias) so the AllocMem syscall can zero a frame before it becomes user-readable, closing a cross-task info leak (`alloc_frame` returns un-zeroed frames). Permitted `memory/` layer with a SAFETY comment; keeping the `unsafe` here lets the caller (`syscall/dispatch.rs`, a grandfathered file) stay `unsafe`-free per §18.5. |
+
+SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this inventory: the SDK's
+permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
+bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
+
 ## 2026-07-16 - SEC-1 / SEC-18 security fixes (feat/hardening)
 
 Two HIGH findings from the security audit (`docs/security-audit.md`), both fixed with `// SAFETY:`-
@@ -271,7 +281,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 15 | permitted |
 | capability/table.rs | 7 | permitted |
-| memory/allocator.rs | 43 | permitted |
+| memory/allocator.rs | 44 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
