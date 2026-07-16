@@ -12,6 +12,11 @@
 /// [`crate::ServiceContext::dma_region`]). The CPU accesses it through `base`
 /// (a normal cacheable mapping - x86 DMA is cache-coherent); the device through
 /// `phys`. Both views cover the same `len` bytes one-to-one.
+///
+/// SEC-28 (SMP-port contract, `kernel/src/arch/CLAUDE.md`): this cacheable, no-maintenance mapping
+/// assumes x86 DMA coherence. On a non-coherent arch (AArch64) a port must add cache maintenance here
+/// (clean before a device read of a CPU-written buffer; invalidate before a CPU read of a device-written
+/// one) or map the arena non-cacheable - else the CPU and the device can see stale copies.
 #[derive(Clone, Copy)]
 pub struct Dma {
     base: *mut u8,

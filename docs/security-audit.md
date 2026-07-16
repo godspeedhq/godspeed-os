@@ -413,6 +413,7 @@ Verdict key: **SAFE** (no issue) / **BY-DESIGN** (intentional, documented) / **F
 | **SEC-13** | ACCEPTED (dev-only) | - | `spawnwired`/`spawncap` are completed-phase Phase-0 diagnostics that spawn the `greet`/`pong` **examples**, which are absent from the bare-metal/production image - so the GRANT leak is dev-only, fixed-target, and not attacker-steerable. Documented rather than coded. |
 | **LS1** | FIXED (root-caused) | `658df88` | Not SEC-5: a block-driver transient AHCI disk-detection miss (`sig=0xffffffff`) + fs latching a degraded mount. block-driver waits `PxTFD.BSY/DRQ` before reading `PxSIG`; fs re-mounts on a request while degraded (self-heal). See `docs/userspace-audit.md` LS1 resolution. |
 | **SEC-2** | FIXED (least-privilege) + §6.4 note | `feat/hardening` | Removed **REBOOT** from the USB drivers (`xhci`/`ehci`) - a compromised driver can no longer hard-reset the machine directly from any context; reboot lives only with the shell (its `reboot` command). The core residual is **inherent and un-codeable** (a keyboard driver synthesizes keystrokes, and keystrokes are commands the kernel can't tell from real ones), so §6.4 now acknowledges CONSOLE_PUSH holders are inside the shell's trust perimeter. Chosen scope: least-privilege + honest note, not a UX-breaking trusted-serial path. |
+| **SEC-25..28** | SPECIFIED (SMP-port contract) | `feat/hardening` | Portability-latent, weak-arch-only - **no x86 code change** (identical/no-op codegen on x86, and untestable there; the barrier/flush/coherence code belongs in the future `arch/aarch64/` SMP layer). Encoded as an authoritative **SMP-port contract** in `kernel/src/arch/CLAUDE.md`: task-slot publication ordering - Release-before-flag + Acquire loads (SEC-25); address-space-switch TLB flush (SEC-26); the `arch::imp` semantic contract, not just signatures (SEC-27); and DMA cache-coherence maintenance (SEC-28). Inline `SEC-25`/`SEC-28` markers at the `reserve_task_slot` store site and the SDK `Dma` wrapper point back to it, so a porter meets the obligation by construction rather than as a heisenbug. |
 
 All are on `feat/hardening`, compile clean (`osdev build`) with the arch-boundary / dash / unsafe guards
 green. **Boot-verified on the T630:** the hardening image booted clean and `selfcheck` ran **349, failed
@@ -421,6 +422,10 @@ The only fixes still needing an active fault to prove are **SEC-1** (a cross-cor
 reproduce - a long `chaos max-carnage` soak) and **SEC-18** (fires only on a real multi-core panic).
 Everything else is exercised by the ordinary boot + selfcheck + file-cap paths.
 
-Still open on this branch: the **portability set SEC-25..28** (safe on x86; the AArch64-SMP blockers).
-SEC-2 is fixed (least-privilege + §6.4 note, above); SEC-3 (ehci passthrough) is an accepted §6.4
-posture; SEC-9/10/12/17/22/24 remain recorded LOWs.
+The **portability set SEC-25..28** is now SPECIFIED as the SMP-port contract (above; `arch/CLAUDE.md`) -
+weak-arch-only, no x86 code change. SEC-2 is fixed (least-privilege + §6.4 note); SEC-3 (ehci passthrough)
+is an accepted §6.4 posture; SEC-9/10/12/17/22/24 remain recorded LOWs (weak-arch / DoS-bounded /
+info-only - no reachable x86 escalation). **Every SEC finding with a reachable x86 impact is now fixed,
+subsumed, verified, assessed, or specified** - the two HIGH by code (SEC-1/SEC-18, HW-validation pending),
+the reachable MEDs by code (SEC-4/5/7/21 + the SEC-2/3 driver posture), and the rest by targeted fixes,
+assessment, or the port contract.

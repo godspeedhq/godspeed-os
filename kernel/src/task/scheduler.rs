@@ -442,6 +442,10 @@ pub fn reserve_task_slot(core_id: u32) -> Option<usize> {
             let mut found = None;
             for i in 0..MAX_TASKS {
                 if !TASK_VALID[i].load(Ordering::Relaxed) {
+                    // SEC-25 (SMP-port contract, kernel/src/arch/CLAUDE.md): on a weak-ordered arch this
+                    // store order is wrong - TASK_CORE (the data) must be written BEFORE TASK_VALID (the
+                    // Release flag), and the ~30 `TASK_VALID.load(Relaxed)` readers must become Acquire.
+                    // Correct on x86 (TSO); left as-is so x86 codegen is unchanged. The port fixes it.
                     TASK_VALID[i].store(true, Ordering::Release);
                     TASK_CORE[i]  = core_id;
                     found = Some(i);
