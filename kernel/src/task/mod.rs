@@ -237,6 +237,7 @@ struct ServiceContextData {
     probe_mode:         u32,
     console_read_slot:  u32, // u32::MAX = not present; slot index if service has console_read cap
     xhci_mmio_va:       u64, // 0 = not mapped; else VA of the driver's controller BAR - xHCI or EHCI (§12)
+    xhci_mmio_len:      u64, // length of the mapped MMIO register window in bytes (SEC-4)
     xhci_dma_va:        u64, // 0 = none; else VA of the driver's DMA arena (§12)
     xhci_dma_phys:      u64, // physical base of the DMA arena (programmed into the device)
     xhci_dma_len:       u64, // length of the DMA arena in bytes
@@ -3631,6 +3632,9 @@ fn spawn_service_with_config(
             0
         }
     };
+    // The mapped MMIO window is a uniform XHCI_MMIO_PAGES for every driver class; passing its byte
+    // length to the service lets the SDK's `Mmio` wrapper bounds-check accesses (SEC-4). 0 = no BAR.
+    let xhci_mmio_len: u64 = if xhci_mmio_va != 0 { XHCI_MMIO_PAGES * PAGE_SIZE as u64 } else { 0 };
 
     // 6b. Allocate + map a physically-contiguous DMA arena for the xHCI driver
     // (§12). The controller DMAs into this memory (rings/contexts), so the driver
@@ -3753,6 +3757,7 @@ fn spawn_service_with_config(
             data.console_push_slot  = console_push_slot_u32;
             data.self_grant_slot    = self_grant_slot_u32;
             data.xhci_mmio_va       = xhci_mmio_va;
+            data.xhci_mmio_len      = xhci_mmio_len;
             data.xhci_dma_va        = xhci_dma_va;
             data.xhci_dma_phys      = xhci_dma_phys;
             data.xhci_dma_len       = xhci_dma_len;
