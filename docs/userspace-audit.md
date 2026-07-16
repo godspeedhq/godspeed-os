@@ -490,7 +490,7 @@ failure moment has never been captured (every log so far ended on a healthy roun
 
 | ID | Sev | Service (suspected) | What | Status |
 |----|-----|---------------------|------|--------|
-| **LS1** | MED (suspected) | fs / shell (delegated-slot or cap-table family) | After a sustained `chaos max-carnage` soak **past ~300K rounds**, `ls` (shell -> fs) stops returning and does **not** self-heal even after chaos is stopped; only **killing all services** restores it. | open, **uncaptured** - needs an introspection snapshot at the stuck moment before reset. |
+| **LS1** | MED | **block-driver + fs** (NOT the slot-leak / SEC-5 hypothesis) | After a sustained `chaos max-carnage` soak, `ls` (shell -> fs) returns "storage unavailable" and does **not** self-heal even after chaos stops; only **killing all services** (or `kill fs`) restores it. | **ROOT-CAUSED + FIXED @ `658df88`** (2026-07-16, T630 capture) - see resolution below. |
 
 **The bracket (where it lives).** Two hardware datapoints on the same demarcated x86_64 image
 (`feat/aarch64-prep` @ `4d48d92`, now merged to `main`):
@@ -527,3 +527,23 @@ valuable action is one introspection snapshot at the stuck `gsh>`:
 
 Until captured, LS1 stays here as an open long-soak finding: real, reproducible, bracketed, and pointed
 at a suspect - but not yet pinned to a line.
+
+### LS1 RESOLUTION - 2026-07-16 (root-caused on the T630, fixed @ `658df88`)
+
+Captured live on the T630 (soak @ 57196 rounds) with `observe now` + targeted single-service kills. The
+earlier slot-leak / **SEC-5** hypothesis above was **wrong** - fs never mounted, so no files were ever
+opened. The real mechanism is two parts:
+
+1. **block-driver (transient trigger).** After ~27,827 restart-storm respawns, one AHCI init read the
+   port signature the instant `DET` went up, before the device's initial D2H FIS latched it ->
+   `sig=0xffffffff` -> "no SATA disk" -> served I/O errors. Transient: a later fresh init (a manual
+   `kill block-driver`) read `sig=0x00000101` and IDENTIFYd the Samsung SSD fine.
+2. **fs (the "no self-heal" persistence - the real LS1).** fs mounted degraded once against that I/O
+   error and **latched** "storage unavailable" forever - it never re-mounted, even after block-driver
+   recovered the disk. `kill block-driver` alone did NOT fix `ls` (fs stayed latched); `kill fs` did
+   (its fresh mount succeeded). That is exactly the "kill-all-services fixes it" signature.
+
+**No memory leak** was involved (`observe` showed RAM 0% across 127k+ restarts each). **Fix (`658df88`):**
+fs re-attempts the mount on a request while degraded (self-heal, no manual kill needed); block-driver
+waits for `PxTFD.BSY/DRQ` to clear before reading `PxSIG` (robust detection). **SEC-5** (subtree revoke)
+remains a real, separate fix - it is **not** the LS1 fix.
