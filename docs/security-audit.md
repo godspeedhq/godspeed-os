@@ -388,3 +388,17 @@ Verdict key: **SAFE** (no issue) / **BY-DESIGN** (intentional, documented) / **F
 - **Exhaustion**: per-task cap tables (A6 self-contained), ABA-safe id reuse, checked/saturating accounting, typed alloc-fail (no partial-state-as-valid).
 - **Disclosure**: spawn (ELF/BSS/stack/PT), IPC message buffers, and introspection out-buffers are all zeroed; errors carry no kernel pointers; introspection + name-acquire are capability-gated.
 - **Weak-arch-safe already**: `portable_atomic` word-size portability, the SPSC console ring (own-index Relaxed / cross-index Acquire-Release), lock-guarded cap/routing/`CALL_AWAIT_EP` ordering, per-core arena publication.
+
+---
+
+## Fix log
+
+| Finding | Status | Commit | Notes |
+|---------|--------|--------|-------|
+| **SEC-1** | FIXED (compile-verified; HW-pending) | `d08d7d4` | Ported the `timer_tick_from_irq` Dekker handshake (CAS `Ready->Running` + publish `CORE_CURRENT` SeqCst + fence + re-read + abort-to-scheduler) into `yield_current` and `block_and_reschedule` - the two switch-in sites that lacked it. |
+| **SEC-18** | FIXED (compile-verified; HW-pending) | `dc9d580` | `halt_all_cores` broadcasts an NMI to every other core (new `boot::broadcast_nmi_all_but_self`, NMI delivery mode so it reaches a core spinning IF=0), and `idt[2]` is repointed to the unconditional `exception_halt`. A panic now stops the machine (§6.2 / §19). |
+
+Both are on `feat/hardening`, compile clean (`osdev build`) with the arch-boundary / dash / unsafe
+guards green. Neither is **boot-verified** yet, by design of the bugs: SEC-1 is a cross-core interleaving
+TCG cannot reproduce, and SEC-18 fires only on a real multi-core panic. Both are validated on **hardware**
+(a `chaos max-carnage` soak for SEC-1; an induced panic for SEC-18), not under the flaky dev-host QEMU.
