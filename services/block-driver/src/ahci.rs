@@ -577,6 +577,16 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
         if !wait_port_ready(ctx, hba, base) {
             continue;
         }
+        // After DET==3 the device posts its initial D2H Register FIS, which clears PxTFD.BSY/DRQ and
+        // latches the signature into PxSIG. Reading PxSIG the instant DET goes up can catch it BEFORE
+        // that FIS lands: observed under a heavy restart-storm as a physically-present disk reading
+        // sig=0xffffffff, mis-declared "no SATA disk" (fs then degraded until a manual restart, LS1).
+        // Wait (bounded) for the task file to go ready, THEN read the signature. A healthy port has
+        // BSY already clear so this returns on the first read (zero added latency); an empty port never
+        // reaches here (wait_port_ready fails DET first), so no empty-port waste.
+        for _ in 0..2_000_000u32 {
+            if hba.read32(base + PX_TFD) & (TFD_BSY | TFD_DRQ) == 0 { break; }
+        }
         let sig = hba.read32(base + PX_SIG);
         ctx.log_fmt(format_args!(
             "block-driver: AHCI port {}: device present (DET=3) sig={:#010x}{}",

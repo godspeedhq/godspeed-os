@@ -400,6 +400,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("fs: serving file API");
     loop {
         let msg = ctx.recv();
+        // LS1 self-heal: if we came up DEGRADED on a storage I/O error, re-attempt the mount when a
+        // request arrives, before serving it. block-driver's AHCI disk detection can transiently miss
+        // under a heavy restart-storm (a present disk reads sig=0xffffffff and is declared "no disk")
+        // and recover on a later init; without this, fs latched "storage unavailable" forever - even
+        // after the disk was back - until a manual `kill fs`. Request-driven, no hidden timer (§26.4);
+        // one successful re-mount exits the degraded state and serves this very request normally.
+        // `mount` fails fast on a still-down disk (`read_superblock` returns an error, no spin), so a
+        // per-request attempt is cheap. Only the I/O-error degraded state re-mounts; a genuinely blank
+        // disk (storage_unreadable == false) stays "no filesystem" until `drives flash`.
+        if fs.is_none() && storage_unreadable {
+            let _ = ctx.reacquire_by_name("block-driver");
+            if let Ok(f) = Fs::mount(&ctx) {
+                ctx.log_fmt(format_args!(
+                    "fs: storage recovered - re-mounted GSFS0008 ({} blocks, {} free)",
+                    f.total_blocks, f.free_blocks
+                ));
+                capacity = f.total_blocks;
+                storage_unreadable = false;
+                fs = Some(f);
+            }
+        }
         // A delegated-resource badge (§7.10) is set ONLY by the kernel after it validated a real
         // file cap - so its presence means "this is a trusted file-cap invocation", impossible to
         // forge over the ordinary fs send-cap. No badge → a name-addressed request.
