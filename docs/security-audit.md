@@ -400,11 +400,26 @@ Verdict key: **SAFE** (no issue) / **BY-DESIGN** (intentional, documented) / **F
 | **SEC-21** | FIXED (compile-verified; HW-pending) | `b110191` | New safe `memory::allocator::zero_frame` zeroes each AllocMem frame via the HHDM before it is mapped, closing the cross-task stale-memory leak. `unsafe` kept in the permitted `memory/` layer so the grandfathered `dispatch.rs` stays `unsafe`-free (§18.5). |
 | **SEC-4** | FIXED (compile-verified; HW-pending) | `cc9288d` | `check(off,size)` (checked-add) bounds-assert on every `Dma` and `Mmio` accessor; `Mmio` gained a `len`, threaded from the kernel through the mirrored `#[repr(C)]` context ABI. An out-of-bounds access now loudly panics the one driver instead of silently corrupting memory. |
 | **SEC-5** | FIXED (compile-verified; HW-pending) | `5b2893f` | New `revoke_open_subtree` (prefix-match with a `/` boundary guard) revokes descendant file caps on `delete_tree` / dir rename / move. Closes the slot leak and the recreate-path aliasing escalation; single-file `delete` keeps the exact-match revoke. **NOT the LS1 fix** - the T630 capture showed LS1 is a block-driver transient-disk-detection miss + fs mount not self-healing (fixed separately @ `658df88`, `docs/userspace-audit.md` LS1 resolution); the SEC-5 slot leak was a wrong hypothesis for LS1, though a real bug in its own right. |
+| **SEC-6** | FIXED (build-verified) | `df7e4e6` | `AcquireSendCap` mints the GRANT right only for `ACQUIRE_ANY` holders (the operator/test instruments that legitimately re-delegate); a declared-peer acquirer gets SEND-only. GRANT follows the instrument permission, not the caller's `arg2`. |
+| **SEC-7** | FIXED (**`file-cap` 10/0**) | `2dc6dde` | The kernel strips GRANT from an embedded **delegated**-resource cap at every install site, so a client's file/socket cap is READ/WRITE-only and cannot be re-delegated (the owner controls delegation by minting). Endpoint caps unchanged. New `Rights::without` / `Capability::without_grant` / `narrow_embedded_for_receiver`. |
+| **SEC-8** | RESOLVED (subsumed by SEC-7) | `2dc6dde` | With no GRANT a file cap cannot be shared -> a resource has exactly one holder -> `FOP_CLOSE` can no longer revoke a *different* holder's cap. The cross-holder revoke is unreachable, so no separate change is needed. |
+| **SEC-11** | FIXED (build-verified) | `f7e64d0` | `debug_assert` in `bump_generation` that no stable gate resource (ids 1-9) is ever revoked/killed - pins the invariant that keeps `holds_resource` gen-safe. |
+| **SEC-14** | VERIFIED (no change) | - | `loader.rs:178` already rejects `p_offset + p_filesz > bytes.len()` with `checked_add`. |
+| **SEC-15** | FIXED (build-verified) | `de685b5` | `fire_test_irq` uses `local_irq_save/restore` (preserves the caller's IF; no ISR-stack re-entrancy). |
+| **SEC-16** | FIXED (build-verified) | `de685b5` | `route::register` logs loudly on an IRQ-route collision instead of a silent overwrite (invariant 12). |
+| **SEC-19** | FIXED (build-verified) | `de685b5` | Task memory budget seeded **before** `commit_task` publishes `Ready` - no stale-quota window on the scheduling core. |
+| **SEC-20** | FIXED (doc) | `f7e64d0` | Crash-page doc-drift corrected in `CLAUDE.md` §19, `kernel/CLAUDE.md`, `docs/prime.md` (no crash page exists; the panic reason is serial-only; the panic now NMI-halts all cores). |
+| **SEC-23** | ASSESSED (keep) | - | The cap-mismatch log is operator-only serial/ring-buffer diagnostic detail, not an authority leak (an id+generation can't forge a cap); §26.7 favours keeping loud diagnostics. No change. |
+| **SEC-13** | ACCEPTED (dev-only) | - | `spawnwired`/`spawncap` are completed-phase Phase-0 diagnostics that spawn the `greet`/`pong` **examples**, which are absent from the bare-metal/production image - so the GRANT leak is dev-only, fixed-target, and not attacker-steerable. Documented rather than coded. |
+| **LS1** | FIXED (root-caused) | `658df88` | Not SEC-5: a block-driver transient AHCI disk-detection miss (`sig=0xffffffff`) + fs latching a degraded mount. block-driver waits `PxTFD.BSY/DRQ` before reading `PxSIG`; fs re-mounts on a request while degraded (self-heal). See `docs/userspace-audit.md` LS1 resolution. |
 
-All are on `feat/hardening`, compile clean (`osdev build`) with the arch-boundary / dash / unsafe
-guards green. **SEC-1 and SEC-18 are not boot-verified** yet, by design of the bugs: SEC-1 is a
-cross-core interleaving TCG cannot reproduce, and SEC-18 fires only on a real multi-core panic - both
-validated on **hardware** (a `chaos max-carnage` soak for SEC-1; an induced panic for SEC-18), not
-under the flaky dev-host QEMU. SEC-21 / SEC-4 / SEC-5 are ordinary-path changes whose live behaviour a
-hardware `selfcheck` + soak exercises directly (SEC-5's subtree revoke is also what a long soak needs to
-confirm LS1 is gone).
+All are on `feat/hardening`, compile clean (`osdev build`) with the arch-boundary / dash / unsafe guards
+green. **Boot-verified on the T630:** the hardening image booted clean and `selfcheck` ran **349, failed
+0** (SMP + IOMMU + AHCI detection + fs mount + all file ops), and **`osdev test file-cap` is 10/0** (SEC-7).
+The only fixes still needing an active fault to prove are **SEC-1** (a cross-core interleaving TCG cannot
+reproduce - a long `chaos max-carnage` soak) and **SEC-18** (fires only on a real multi-core panic).
+Everything else is exercised by the ordinary boot + selfcheck + file-cap paths.
+
+Still open on this branch: **SEC-2** (CONSOLE_PUSH trust boundary - in progress) and the **portability
+set SEC-25..28** (safe on x86; the AArch64-SMP blockers). SEC-3 (ehci passthrough) is an accepted §6.4
+posture; SEC-9/10/12/17/22/24 remain recorded LOWs.
