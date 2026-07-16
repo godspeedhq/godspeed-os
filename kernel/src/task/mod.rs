@@ -419,7 +419,7 @@ struct Privileges {
     console_push:    bool, // CONSOLE_PUSH: inject keystrokes into the input ring (USB keyboard drivers)
     introspect:      bool, // INTROSPECT: read another task's / system-wide kernel state (§3.1)
     service_control: bool, // SERVICE_CONTROL: kill/restart other services (§14.4)
-    reboot:          bool, // REBOOT: hardware-reset the machine (shell `reboot`, USB Ctrl+Alt+Del)
+    reboot:          bool, // REBOOT: hardware-reset the machine (shell `reboot` only - SEC-2)
     acquire_any:     bool, // ACQUIRE_ANY: reach ARBITRARY services by name via AcquireSendCap (§3.1)
 }
 
@@ -437,8 +437,10 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // shell (interactive broker), supervisor (restart authority), chaos (the point of max-carnage),
         // and every probe (they kill victims to exercise kill/revocation).
         service_control: is_probe || matches!(name, "shell" | "supervisor" | "chaos"),
-        // shell `reboot` + the USB drivers' Ctrl+Alt+Del secure-attention reboot are the only rebooters.
-        reboot: matches!(name, "shell" | "xhci" | "ehci"),
+        // SEC-2: REBOOT lives ONLY with the shell (its `reboot` command); the USB drivers no longer
+        // hold it. A keyboard driver can synthesize any keystroke (the console's inherent trust, §6.4),
+        // but it must not ALSO be able to hard-reset the machine directly from any context.
+        reboot: matches!(name, "shell"),
         // Operator/test instruments that legitimately reach arbitrary services by name: shell (chaos
         // flooding, pipe sinks), supervisor (reconcile-by-name), probes. `adv-a13` is the §22 Test A13
         // NEGATIVE pin - deliberately excluded so it holds no ACQUIRE_ANY (proves AcquireSendCap denies
@@ -2508,7 +2510,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // A12: reboot gated - Reboot/18 denied without the REBOOT cap (§3.1).
-        // Name matches no reboot grant (only shell/xhci/ehci get it), so adv-a12 holds none.
+        // Name matches no reboot grant (only the shell gets it now - SEC-2), so adv-a12 holds none.
         "adv-a12" => Some(("adv-a12", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: false,

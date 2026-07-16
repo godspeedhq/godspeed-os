@@ -417,6 +417,19 @@ Operationally these drivers were already restartable (their death reclaims their
 resources and the supervisor respawns them); this amendment makes the *trust* claim
 official, not the runtime behaviour.
 
+> **Amendment 2026-07-16 (SEC-2): a confined USB driver's least-privilege claim is bounded by the
+> console it drives.** A USB *keyboard* driver is, by function, the machine's input path: it delivers
+> keystrokes to the shell via `CONSOLE_PUSH`, and keystrokes *are* commands. The kernel cannot
+> distinguish a faithfully-decoded key-press from a synthesized one, so no code check can let a real
+> keyboard type a privileged command while stopping a compromised driver from injecting the same bytes
+> (both reach the shell through the same input ring). **`CONSOLE_PUSH` holders are therefore inside the
+> shell's trust perimeter** - IOMMU confinement bounds the driver's *DMA*, not its console-injection
+> authority. What the code *can* do is deny the driver any authority it does not need for that role:
+> SEC-2 removed **`REBOOT`** from the USB drivers, so a compromised driver can no longer hard-reset the
+> machine directly from any context - reboot lives only with the shell (its `reboot` command;
+> Ctrl+Alt+Del is now decoded as ordinary keystrokes). The residual (a keyboard can type) is inherent
+> to being a keyboard, and is recorded here rather than papered over. `docs/security-audit.md` SEC-2.
+
 ---
 
 ## 7. Capability System
