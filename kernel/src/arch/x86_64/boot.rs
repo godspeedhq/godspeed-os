@@ -761,6 +761,25 @@ pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {
     }
 }
 
+/// Broadcast an NMI to all cores EXCEPT this one. Unlike `broadcast_ipi_all_but_self` (a maskable
+/// fixed-delivery vector), an NMI reaches a core even when it is running with interrupts disabled -
+/// e.g. spinning on a lock. The panic path (`halt_all_cores`, SEC-18) uses this so a panic on one core
+/// actually stops the machine (§6.2, §19); `idt[2]` routes the NMI to `exception_halt`.
+///
+/// # Safety
+/// The APIC must be mapped; the caller holds IF=0 (or has saved/disabled it).
+#[inline]
+pub unsafe fn broadcast_nmi_all_but_self() {
+    // NMI delivery mode (ICR_LOW bits 10:8 = 0b100), all-excluding-self shorthand (bits 19:18 = 0b11),
+    // edge, assert (bit 14). The vector field is ignored for NMI delivery. SAFETY: APIC mapped; IF=0;
+    // DELIVS polled before the write per SDM 10.6.1.
+    unsafe {
+        write_apic(APIC_VIRT_BASE, APIC_ICR_HIGH, 0);
+        apic_wait_icr_idle();
+        write_apic(APIC_VIRT_BASE, APIC_ICR_LOW, (0b100 << 8) | (1 << 14) | (0b11 << 18));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers.
 // ---------------------------------------------------------------------------
@@ -1208,6 +1227,12 @@ pub(super) unsafe fn init_idt() {
             if v == 6 || v == 13 || v == 14 { continue; } // dedicated handlers below
             idt[v] = IdtEntry::new(if EC_VECTORS.contains(&v) { exc_ec } else { exc_noec });
         }
+        // IDT[2] = NMI: the panic path (SEC-18) broadcasts an NMI to every other core so a panic on one
+        // core actually stops the machine (§6.2, §19) - NMI reaches a core even spinning IF=0 on a lock.
+        // Route it to the UNCONDITIONAL `exception_halt`, NOT the CPL-discriminating `exc_noec` the loop
+        // just set: the receiving core must HALT regardless of ring, never kill-a-task-and-continue. No
+        // other NMI source exists in the kernel, so any NMI means "stop".
+        idt[2]    = IdtEntry::new(halt);
         // IDT[6] = #UD handler: used as the syscall entry on AMD GX-420GI where
         // both SYSCALL and int $0x80 silently stall from ring-3.  DPL=0 is
         // correct - CPU exceptions bypass the DPL check, so ud2 from ring-3
