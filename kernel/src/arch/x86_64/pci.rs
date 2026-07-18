@@ -667,21 +667,21 @@ pub fn program_xhci_msi() -> bool {
     }
     let bdf = XHCI_BDF.load(Ordering::Relaxed);
     let vector = crate::arch::x86_64::interrupts::XHCI_MSI_VECTOR;
-    let dest = usb_irq_dest_lapic();
+    let dest = usb_irq_dest_lapic(crate::task::XHCI_CORE);
     // Prefer plain MSI; fall back to MSI-X (what qemu-xhci and most real xHCIs expose).
     program_msi(bdf, vector, dest) || program_msix(bdf, vector, dest)
 }
 
-/// LAPIC id to deliver USB-controller interrupts to: the core the USB drivers are pinned to
-/// (core 1, per the xhci/ehci contracts' `preferred_core`). Delivering the IRQ to the driver's
-/// OWN core means a device event (a keypress) wakes that core directly out of its idle `hlt`
-/// and the wake stays core-local - no cross-core IPI or BSP scan, which an idle AP on this
-/// hardware (ARAT `hlt` idle) does not service promptly (§12). Falls back to the BSP if there
-/// is no core 1 (single-core), where the driver runs on the BSP anyway.
-fn usb_irq_dest_lapic() -> u8 {
-    const USB_DRIVER_CORE: u32 = 1;
-    if crate::smp::core::is_ready(USB_DRIVER_CORE) {
-        crate::smp::core::core_lapic_id(USB_DRIVER_CORE) as u8
+/// LAPIC id to deliver a USB controller's interrupt to: the core `driver_core` the owning driver is
+/// pinned to (`task::XHCI_CORE` / `task::EHCI_CORE`, the single source of truth). Delivering the IRQ to
+/// the driver's OWN core means a device event (a keypress) wakes that core directly out of its idle
+/// `hlt` and the wake stays core-local - no cross-core IPI or BSP scan, which an idle AP on this
+/// hardware (ARAT `hlt` idle) does not service promptly (§12). Falls back to the BSP if that core is not
+/// ready (single-core), where the driver runs on the BSP anyway. Previously hardcoded core 1, which had
+/// drifted away from the drivers' actual cores (2/3) - the co-location is now real (docs/power.md).
+fn usb_irq_dest_lapic(driver_core: u32) -> u8 {
+    if crate::smp::core::is_ready(driver_core) {
+        crate::smp::core::core_lapic_id(driver_core) as u8
     } else {
         crate::arch::x86_64::ioapic::bsp_lapic_id()
     }
@@ -698,7 +698,7 @@ pub fn program_ehci_msi() -> bool {
     }
     let bdf = EHCI_BDF.load(Ordering::Relaxed);
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
-    let dest = usb_irq_dest_lapic();
+    let dest = usb_irq_dest_lapic(crate::task::EHCI_CORE);
     let ok = program_msi(bdf, vector, dest) || program_msix(bdf, vector, dest);
     if !ok {
         crate::kprintln!(

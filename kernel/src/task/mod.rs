@@ -390,6 +390,16 @@ impl HwClass {
     }
 }
 
+/// The core each USB host-controller driver is pinned to - the SINGLE SOURCE OF TRUTH for USB driver
+/// placement. Both the `ServiceConfig.preferred_core` below AND the kernel's MSI/INTx destination
+/// routing (`arch::x86_64::pci`) read these, so a controller interrupt is always delivered to the core
+/// the driver actually runs on (§12). Co-location is required for interrupt-driven USB (docs/power.md):
+/// a keypress MSI must wake the driver's OWN core out of its idle `hlt` locally, because a cross-core
+/// wake to a halted AP is not serviced promptly on this hardware. Both sit on cores 2/3 (off core 1)
+/// because busy-polling two controllers on one core saturated it; when they block, that can relax.
+pub const XHCI_CORE: u32 = 2;
+pub const EHCI_CORE: u32 = 3;
+
 /// The hardware class + resource-mint authority a service is granted, keyed by name. This is the ONE
 /// place the kernel declares which driver drives which discovered device and which service may mint
 /// delegated resource caps (§7.10) - the spawn path reads it, never a scattered `name ==` check (audit
@@ -599,7 +609,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // (input garbled then died on the T630). Spreading the two busy-pollers onto the idle cores
             // (xhci=2, ehci=3) leaves core 1 for the request-driven services. Falls back to round-robin
             // if core 2 is not ready.
-            preferred_core:    2,
+            preferred_core:    XHCI_CORE,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             // Route the xHCI MSI (interrupts::XHCI_MSI_VECTOR = 0x28) to this driver's recv
@@ -620,7 +630,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    3,   // core 3: the other busy-poller, off the saturated core 1 (see xhci)
+            preferred_core:    EHCI_CORE,   // core 3: the other busy-poller, off the saturated core 1 (see xhci)
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             // Route the EHCI INTx (interrupts::EHCI_MSI_VECTOR = 0x29, IOAPIC-routed) to this
