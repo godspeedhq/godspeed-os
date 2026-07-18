@@ -119,7 +119,9 @@ The tension is real and is why this is a later, careful step, not a free flip:
   only to a core whose run queue is empty and that is parked.
 
 Reconciling "let idle cores sleep through the tick" with "still notice a core that stopped ticking
-because it wedged" is the design knot to solve before this lands.
+because it wedged" is the design knot. **§14 is the worked design that solves it** - and the key move
+is that GodspeedOS should **slow** the idle tick rather than stop it, which sidesteps the watchdog
+tension entirely and keeps a lost-wake safety net.
 
 ## 8. Further out: efficiency-core placement (arch-gated)
 
@@ -274,3 +276,101 @@ mask computation, periodic-tree linking - and every existing helper (`control`, 
 when the fan/heat justifies it, or leave EHCI on busy-poll and move to Phase 2. This section is the
 ready-to-implement design for whenever it is chosen. No speculative driver code was written, to keep
 the T630 keyboard's known-good path intact.
+
+## 14. Phase 2 design: slow the idle tick (tickless idle, done the GodspeedOS way)
+
+This is the build-ready design for §7. The investigation of the scheduler/timer/watchdog machinery
+(`kernel/src/task/scheduler.rs`, `arch/x86_64/boot.rs`, `arch/x86_64/interrupts.rs`) settled the shape.
+
+### 14.1 The mechanism today
+
+- **Per-core, self-re-arming timer.** Each core (BSP and every AP) arms its own LAPIC timer at
+  `init_local_apic`. On real HW it is TSC-Deadline one-shot: the timer ISR re-arms it every tick,
+  right after EOI. ~100 Hz (~10 ms quantum, PIT-calibrated). QEMU uses periodic mode (hardware
+  auto-reload; the watchdog is disabled there).
+- **Idle cores still tick.** When a core's run queue is empty it calls `wait_for_interrupt()` -
+  `sti; hlt` where `IDLE_CAN_HALT` is true, else `sti`-only spin. But **the timer keeps firing every
+  quantum regardless**, so an idle core wakes 100x/s to run an ISR that finds nothing and re-arms
+  itself. That is the waste.
+- **The liveness watchdog (the tension).** Each core stamps its own TSC into `CORE_LAST_TICK_TSC[cid]`
+  in the timer ISR. Every core, every tick, checks every *other* core and **panics the whole machine**
+  if one has made no progress for `tpq * 300` (~3 s). The stamp is per-core-self; the **check is
+  cross-core**. So a core that simply stops ticking does not self-exempt - it is policed by all the
+  others and gets the machine panicked after ~3 s. Nothing today distinguishes "idle on purpose" from
+  "wedged"; the tick *is* the only liveness signal.
+- **The BSP-only monotonic clock (the second hard constraint).** `MONOTONIC_TICKS` is advanced in
+  exactly one place - `scan_timed_wakes`, driven only from the **BSP's** timer ISR (`cid == 0`). It is
+  the single core-independent clock (AMD cores need not share a TSC), and every timed wake rides it:
+  `recv_timeout`, the xHCI hot-plug watchdog, keyboard auto-repeat, `block_rpc` deadlines. The BSP
+  also drives COM2 control (`process_pending`) and COM1 input (`uart_rx_poll`) from its tick. So if
+  the **BSP** ever stops ticking, all timed wakes and console input die system-wide.
+
+### 14.2 The design: slow the idle tick on halt-capable APs
+
+The elegant move is **not** to stop the idle tick (which forces a watchdog exemption and loses the
+lost-wake safety net) but to **slow** it:
+
+- **Idle AP** (run queue empty, `cid != 0`, `IDLE_CAN_HALT`): re-arm the timer at a long
+  `IDLE_QUANTUM` (~1 s) instead of the ~10 ms quantum, then `hlt`. The core now wakes ~1x/s instead
+  of ~100x/s - or immediately on real work.
+- **Busy AP** (>=1 runnable task): the normal ~10 ms quantum, unchanged (preemption needs it). The
+  transition idle->busy must re-arm the quantum promptly when a task is picked, or a newly-runnable
+  busy task would go un-preempted for up to ~1 s. A per-core "idle-tick mode" flag (set when arming
+  long, cleared + re-armed to quantum when `pick_next` returns a task) is the mechanism.
+- **BSP (`cid == 0`): always the ~10 ms quantum.** It is the heartbeat - the monotonic clock, timed
+  wakes, and COM2/COM1 polling all ride it. One always-ticking core is the cost of not re-homing that
+  clock (Phase 2b, §14.4). This is why the win is on the APs.
+
+**Why this sidesteps the watchdog entirely (the payoff):** a slow-ticking idle core *still stamps*
+`CORE_LAST_TICK_TSC` every ~1 s. Since `IDLE_QUANTUM` (~1 s) is comfortably under the watchdog
+threshold (`tpq * 300` ~ 3 s), every policing core still sees it as alive. **No watchdog change is
+needed** - the stamp and check stay exactly as they are. (Design constraint: `IDLE_QUANTUM` MUST stay
+below the watchdog threshold, or the watchdog would false-panic an idle core. Couple them, e.g.
+`IDLE_QUANTUM = threshold / 3`, so they can never drift into a false panic.)
+
+**Why the lost-wake safety net survives:** today the 100 Hz timer is not only preemption - it is also
+a 10 ms re-poll of the run queue that *recovers a lost cross-core wake* (a dropped `WAKE_RECEIVER`
+IPI). A slow idle tick keeps that recovery, just at ~1 s granularity: a parked core that missed its
+wake IPI re-checks its run queue within ~1 s and picks up the work. A *fully* tickless core would lose
+this entirely (a lost wake = parked forever, invisible). Slowing rather than stopping keeps the
+GodspeedOS "bounded and recoverable" property (§26.6, §26.7) for a negligible power difference between
+1 Hz and 0 Hz.
+
+**Waking on real work is unchanged:** a `WAKE_RECEIVER` IPI (cross-core send / `wake_by_slot`) or a
+device IRQ wakes a `hlt`-ed core immediately, regardless of the timer. The slow tick is only the
+fallback; real work still wakes the core instantly.
+
+### 14.3 Gating and scope
+
+- **Only where `IDLE_CAN_HALT` is true.** The win is real only when the core actually `hlt`s between
+  ticks (then fewer ticks = deeper/longer sleep = less power). On Goldmont+ (the Wyse 5070), C-states
+  are BIOS-locked and `IDLE_CAN_HALT` is false, so idle cores `sti`-spin and never sleep - slowing the
+  timer saves nothing there (their idle spin is a separate, firmware-gated problem, and note `observe`
+  hides it: an idle core reads 0% *task-share* while physically spinning). So Phase 2a helps the T630
+  and typical laptops with working C-states/ARAT, not the Wyse.
+- **Only the APs** (`cid != 0`). The BSP stays 100 Hz (§14.2).
+- **Expected win:** on a 4-core T630, three APs drop from ~100 Hz to ~1 Hz idle wakeups (sleeping ~1 s
+  at a time instead of 10 ms); one core (BSP) keeps the heartbeat. This is the deep-sleep enabler a
+  laptop needs. It does NOT rescue a core EHCI busy-polls at 100% - only interrupt-driving or gating
+  EHCI does that (§13).
+
+### 14.4 Phase 2b (future, harder): a fully-tickless BSP
+
+To let core 0 also sleep deep, its tick-borne duties must move off the scheduler tick onto an
+always-on timer decoupled from it: `scan_timed_wakes` + `MONOTONIC_TICKS` (re-armed as a one-shot to
+the *next* pending deadline rather than a fixed 100 Hz), and COM2/COM1 polling (interrupt-driven UART
+RX instead of polled). That is a larger change and is deferred; Phase 2a (AP slow-tick) captures most
+of the win first.
+
+### 14.5 Validation
+
+- **QEMU proves correctness, not power.** Under load: preemption still fair (two busy tasks on one AP
+  still round-robin at 10 ms), timed wakes still fire (recv_timeout, auto-repeat, hot-plug), a
+  cross-core wake still schedules promptly, and no false liveness panic over a multi-minute idle soak.
+- **Hardware (T630, `IDLE_CAN_HALT` true) proves power.** `observe` will *not* show it - an idle core
+  already reads 0% task-share. Need a wakeup counter (ticks/sec per core) or a real thermal/power
+  read. A minute of idle should show the APs at ~1 tick/s and the BSP at ~100.
+- **Risk:** this touches the scheduler timer core; the known-good baseline is "always 100 Hz". A bug
+  is a missed preemption (a busy task starves) or a stalled timed wake - serious, so build it behind
+  care and iterate on hardware, exactly like the driver work. The watchdog-coupling constraint
+  (§14.2) is the one invariant that must not be violated.
