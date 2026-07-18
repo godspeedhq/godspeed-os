@@ -396,7 +396,7 @@ Verdict key: **SAFE** (no issue) / **BY-DESIGN** (intentional, documented) / **F
 | Finding | Status | Commit | Notes |
 |---------|--------|--------|-------|
 | **SEC-1** | FIXED (compile-verified; HW-pending) | `d08d7d4` | Ported the `timer_tick_from_irq` Dekker handshake (CAS `Ready->Running` + publish `CORE_CURRENT` SeqCst + fence + re-read + abort-to-scheduler) into `yield_current` and `block_and_reschedule` - the two switch-in sites that lacked it. |
-| **SEC-18** | FIXED (compile-verified; HW-pending) | `dc9d580` | `halt_all_cores` broadcasts an NMI to every other core (new `boot::broadcast_nmi_all_but_self`, NMI delivery mode so it reaches a core spinning IF=0), and `idt[2]` is repointed to the unconditional `exception_halt`. A panic now stops the machine (§6.2 / §19). |
+| **SEC-18** | FIXED (**HW-verified on the T630**, 2026-07-18) | `dc9d580` | `halt_all_cores` broadcasts an NMI to every other core (new `boot::broadcast_nmi_all_but_self`, NMI delivery mode so it reaches a core spinning IF=0), and `idt[2]` is repointed to the unconditional `exception_halt`. A panic now stops the machine (§6.2 / §19). **Verified end-to-end** (QEMU int-trace + T630 serial) via a keystroke-induced kernel panic - see "SEC-18 hardware verification" below. |
 | **SEC-21** | FIXED (compile-verified; HW-pending) | `b110191` | New safe `memory::allocator::zero_frame` zeroes each AllocMem frame via the HHDM before it is mapped, closing the cross-task stale-memory leak. `unsafe` kept in the permitted `memory/` layer so the grandfathered `dispatch.rs` stays `unsafe`-free (§18.5). |
 | **SEC-4** | FIXED (compile-verified; HW-pending) | `cc9288d` | `check(off,size)` (checked-add) bounds-assert on every `Dma` and `Mmio` accessor; `Mmio` gained a `len`, threaded from the kernel through the mirrored `#[repr(C)]` context ABI. An out-of-bounds access now loudly panics the one driver instead of silently corrupting memory. |
 | **SEC-5** | FIXED (compile-verified; HW-pending) | `5b2893f` | New `revoke_open_subtree` (prefix-match with a `/` boundary guard) revokes descendant file caps on `delete_tree` / dir rename / move. Closes the slot leak and the recreate-path aliasing escalation; single-file `delete` keeps the exact-match revoke. **NOT the LS1 fix** - the T630 capture showed LS1 is a block-driver transient-disk-detection miss + fs mount not self-healing (fixed separately @ `658df88`, `docs/userspace-audit.md` LS1 resolution); the SEC-5 slot leak was a wrong hypothesis for LS1, though a real bug in its own right. |
@@ -418,14 +418,51 @@ Verdict key: **SAFE** (no issue) / **BY-DESIGN** (intentional, documented) / **F
 All are on `feat/hardening`, compile clean (`osdev build`) with the arch-boundary / dash / unsafe guards
 green. **Boot-verified on the T630:** the hardening image booted clean and `selfcheck` ran **349, failed
 0** (SMP + IOMMU + AHCI detection + fs mount + all file ops), and **`osdev test file-cap` is 10/0** (SEC-7).
-The only fixes still needing an active fault to prove are **SEC-1** (a cross-core interleaving TCG cannot
-reproduce - a long `chaos max-carnage` soak) and **SEC-18** (fires only on a real multi-core panic).
-Everything else is exercised by the ordinary boot + selfcheck + file-cap paths.
+**SEC-18 is now HW-verified on the T630** (2026-07-18; keystroke-induced panic - see "SEC-18 hardware
+verification" below). The only fix still needing an active fault to prove is **SEC-1** (a cross-core
+interleaving TCG cannot reproduce - a long `chaos max-carnage` soak, clean past ~400k rounds as of
+2026-07-18). Everything else is exercised by the ordinary boot + selfcheck + file-cap paths.
 
 The **portability set SEC-25..28** is now SPECIFIED as the SMP-port contract (above; `arch/CLAUDE.md`) -
 weak-arch-only, no x86 code change. SEC-2 is fixed (least-privilege + §6.4 note); SEC-3 (ehci passthrough)
 is an accepted §6.4 posture; SEC-9/10/12/17/22/24 remain recorded LOWs (weak-arch / DoS-bounded /
 info-only - no reachable x86 escalation). **Every SEC finding with a reachable x86 impact is now fixed,
-subsumed, verified, assessed, or specified** - the two HIGH by code (SEC-1/SEC-18, HW-validation pending),
+subsumed, verified, assessed, or specified** - the two HIGH by code (SEC-1 - soak-pending; **SEC-18 - HW-verified 2026-07-18**),
 the reachable MEDs by code (SEC-4/5/7/21 + the SEC-2/3 driver posture), and the rest by targeted fixes,
 assessment, or the port contract.
+
+---
+
+## SEC-18 hardware verification (2026-07-18)
+
+SEC-18 fires only on a real multi-core kernel panic, so it is reachable neither by the ordinary boot nor
+by soak depth - it needs an *induced* panic. A temporary, uncommitted "faulty" image induced one
+deterministically; the mechanism was verified identically in QEMU and on the T630. (The trigger lives
+only in the faulty image; `feat/hardening` HEAD is clean.)
+
+**Trigger - why a keystroke, not a timer.** A first attempt fused the panic to a core-0 timer-tick
+count. That proved the wrong tool on the T630, which boots `idle_can_halt = true` (AMD, cool-when-idle)
+and, in the bare-metal image (no ping/pong), goes fully idle after boot - so core-0 ticks accrue far too
+slowly to time a fuse (the arming banner, printed on the 2nd core-0 tick, took ~1.7 s to appear; a
+1500-tick fuse never fired). The trigger was changed to a **keystroke-induced** panic: a `panic!` in the
+`ConsolePush` syscall handler (`dispatch.rs`), which is reached only on a real key press from the USB
+keyboard driver. A keypress deterministically wakes a core and runs kernel code regardless of idle state,
+so it fires the instant a key is pressed.
+
+**Result - identical in QEMU and on hardware.** On a key press the kernel panics on the core running the
+keyboard driver; `halt_all_cores` broadcasts the NMI; every *other* core takes `v=02` (NMI) into
+`exception_halt` and stops.
+- **QEMU** (`-d int`, USB keyboard + monitor `sendkey`): the CPU trace's final three events are all
+  `v=02` into `exception_halt` (`IP=0xffffffff8010e823`), one per non-panicking core, after which the
+  trace goes silent. Single boot, zero service lines after the panic.
+- **T630 serial** (2026-07-18 10:23:28.451): `KERNEL PANIC ... keystroke-induced kernel panic` at
+  `dispatch.rs`, followed by `EXCEPTION ... RIP=0x...8010e823` breadcrumbs *garbled together at the
+  character level* - the interleaving is itself the proof that multiple cores' panic handlers hit the one
+  serial port simultaneously. The log then dead-ends: single boot (no reboot), zero service lines after
+  the panic (no `gsh>`, no heartbeat) - the whole machine went dark on one keypress.
+
+**Strongest form of the guarantee.** On the T630 the keyboard is on `ehci`, which runs on **core 3** (a
+non-BSP core), so the panic *originated on core 3* and the NMI still halted cores 0/1/2 (including the
+BSP). The property proven is "a panic *anywhere* halts *everywhere*", not merely "a BSP panic halts the
+APs". Before SEC-18, `halt_all_cores` stopped only the calling core and the survivors kept scheduling
+past a dead kernel (§6.2 / §19 violated); this is that law holding on real silicon.
