@@ -202,9 +202,13 @@ two controllers are different problems:
    busy-poll only while a key is held (auto-repeat); a slow watchdog wake keeps hot-plug detection
    alive. Judge by `observe` (100% -> ~0% at rest) and **hardware typing feel** - QEMU timing lies,
    so the T630/Wyse are the sole judges. The Wyse (xHCI only, no EHCI) gets the full win here.
-2. **Phase 1b - EHCI (only if the periodic-schedule path re-verifies on hardware).** Otherwise EHCI
-   stays busy-poll and is documented as such; the T630 keyboard (on EHCI via a hub) then keeps a hot
-   core until a better mechanism is found. Do not re-break the "flawless state" for a CPU number.
+2. **Phase 1b - EHCI: DEFERRED (needs a from-scratch periodic-schedule engine; see §13).** The
+   investigation found the keyboard sits on EHCI's ASYNC schedule and the PERIODIC schedule is
+   entirely absent, so a blocked driver cannot wake - hardware-confirmed on the T630. Interrupt-driven
+   EHCI requires building periodic split-interrupt scheduling from scratch (§13): a medium-to-large
+   lift that benefits ONLY the T630 (legacy USB 2.0; modern laptops are xHCI-only, so it does not
+   serve the laptop-battery goal). EHCI stays busy-poll (the known-good state). Do not re-break the
+   flawless state for a CPU number on a non-laptop.
 3. **Phase 2 - tickless-ish idle.** Stop ticking a parked, empty-run-queue core, reconciled with
    the liveness watchdog and preemption (§7). The next system-level lever.
 4. **Future (arch-gated) - efficiency-core placement.** On a big.LITTLE ARM target, route light
@@ -215,3 +219,58 @@ two controllers are different problems:
 > feel or hot-plug robustness for a CPU percentage (§26.12 - correctness before performance). The
 > failure mode to respect is a dead or laggy keyboard, which is exactly what reverted the last
 > attempt.
+
+## 13. EHCI investigation: interrupt-driven needs the periodic schedule (verdict)
+
+A deep read of `services/ehci/src/main.rs` settled whether interrupt-driven EHCI is viable. Verdict:
+**not without building a from-scratch periodic-schedule engine.**
+
+**What the code does today.** The keyboard's interrupt-IN queue head is linked into the **async**
+schedule (`ASYNCLISTADDR` + `USBCMD.ASE`), with the head-of-reclamation-list bit set and the QH's
+S-mask / C-mask fields (dword 2 bits 0-15) **zero** - the structural signature of an async QH. The
+**periodic** schedule is entirely absent: `PERIODICLISTBASE` is never programmed (it stays 0, matching
+the boot log), there is no frame-list array in the DMA arena, and there is no `USBCMD.PSE` path. The
+driver keeps the endpoint alive by re-arming a fresh ACTIVE qTD every time one completes (`arm_int`).
+
+**Why blocking fails (confirmed, not just claimed).** An async interrupt endpoint only advances while
+the driver re-arms it. Block the driver and it stops re-arming, the QH goes idle, no qTD retires, no
+`USBSTS.USBINT`, no `deliver()`. The driver's own note ("INTx never reached the kernel once the driver
+blocked, proven across many T630 flashes") is exactly consistent with this. A **periodic** interrupt
+endpoint is different: the controller walks the periodic frame list every microframe autonomously, so
+a completion raises `USBINT` regardless of driver activity - which is what lets a blocked driver wake.
+
+**What interrupt-driven EHCI would require (from scratch).**
+1. Allocate a periodic frame list (1024 dwords, 4 KiB-aligned) in the DMA arena.
+2. Program `PERIODICLISTBASE`, enable `USBCMD.PSE`, wait `USBSTS.PSS`.
+3. Build the interrupt QH with a non-zero **S-mask** (start-split microframe) and, because the T630
+   keyboard is a low-speed device behind a high-speed hub's Transaction Translator, a **C-mask**
+   (complete-split microframes) - a periodic split-interrupt transfer.
+4. Link the QH into the periodic tree at the polling interval, instead of the async reclamation ring.
+5. Keep IOC on the qTD (already done) so periodic completions raise `USBINT` autonomously; then the
+   driver can genuinely block on `EHCI_INT_VECTOR` (0x29).
+
+This is a **medium-to-large** change - a second schedule engine, new DMA regions, split-interrupt S/C
+mask computation, periodic-tree linking - and every existing helper (`control`, `arm_int`,
+`poll_devices`) assumes the async model. The simpler "async + short watchdog + block" alternative is a
+**hardware-proven dead-end on the T630** (INTx goes cold), so it is not an option here.
+
+**ROI and recommendation - why this is DEFERRED, not built now.**
+- **It benefits only the T630.** EHCI is legacy USB 2.0. The Wyse 5070 is xHCI-only (its EHCI driver
+  just idles). Modern laptops are xHCI-only too - EHCI was phased out of new silicon years ago. So
+  interrupt-driven EHCI does **not** serve the stated laptop-battery goal; the xHCI work (Phase 1a,
+  done) is the part that does, and it already covers any current laptop.
+- **The T630 is a desktop thin-client, not battery-powered.** The only real payoff there is fan/heat
+  from the one hot core - worth something, but not the headline.
+- **It cannot be validated without the T630.** QEMU's split-TT periodic emulation may not faithfully
+  reproduce the T630's rate-matching hub, so this must be built iteratively against real hardware,
+  behind a feature flag (default = busy-poll, the known-good state), with the operator testing typing
+  feel and hot-plug each step. Writing it blind risks the T630's *only* keyboard path.
+- **The higher-ROI next lever is Phase 2 (tickless idle, §7).** It reclaims idle-tick wakeups on
+  **every** core and machine - including whatever core EHCI busy-polls on - so it helps the T630's
+  power/heat picture too, without the risk of rebuilding the T630's keyboard stack. It is the better
+  next investment for the laptop goal.
+
+**Decision left to the operator:** pursue the periodic-schedule engine (feature-flagged, T630-iterative)
+when the fan/heat justifies it, or leave EHCI on busy-poll and move to Phase 2. This section is the
+ready-to-implement design for whenever it is chosen. No speculative driver code was written, to keep
+the T630 keyboard's known-good path intact.
