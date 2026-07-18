@@ -102,6 +102,53 @@ entire cost of 32-bit support (`docs/multi-arch.md`, "Word size").
 - **Boot handoff differs per platform**: x86 via Limine (higher-half), AArch64 / LoongArch via QEMU
   `-kernel`, RISC-V via OpenSBI into S-mode. Your linker script's load address follows from this.
 
+## The SMP-port contract: memory ordering, TLB, DMA coherence (SEC-25..28)
+
+x86-64 has a strong memory model (TSO) and cache-coherent DMA, so the neutral kernel relies on
+guarantees x86 gives for free but a weaker arch (AArch64, RISC-V) does **not**. On x86 the relevant code
+is correct and generates identical-or-no-op instructions; on a weak-ordered SMP port each becomes a real
+race unless the port meets the obligation below. These are the security audit's **SEC-25..28**
+(`docs/security-audit.md`) - **port blockers**, gathered here so a porter meets them by construction
+instead of rediscovering them as heisenbugs. (They do not affect x86, so they are not "fixed" in code on
+`feat/hardening`; they are specified here for whoever brings up SMP on a weak arch.)
+
+**1. Task-slot publication ordering (SEC-25).** The scheduler publishes a slot with a flag store and
+reads it with a flag load, then touches plain data fields (`TASK_CTX`, `TASK_IS_USER`,
+`TASK_KERNEL_STACK_TOP`, ...). For the data to be visible whenever the flag is, the *writer* stores the
+data **before** the flag with **Release**, and every *reader* loads the flag with **Acquire** before
+touching the data. Two concrete port fixes:
+- `reserve_task_slot` currently stores `TASK_VALID[i] = true` (Release) *before* `TASK_CORE[i]` - reorder
+  so `TASK_CORE` (the data) is written first and `TASK_VALID` is the Release that publishes it.
+- The ~30 `TASK_VALID.load(Relaxed)` reader sites (and field reads gated on them) become **Acquire**. On
+  x86 an Acquire load is a plain `mov` (identical codegen); on AArch64/RISC-V it emits the barrier that
+  establishes happens-before. `commit_task` already publishes fields then `TASK_STATE = Ready` (Release);
+  the SEC-1 switch-in path is already `SeqCst`.
+
+  Without this, a weak-arch reader can observe `VALID`/`Ready == true` with a **stale `TASK_CTX`/CR3/
+  kstack** - the same use-after-free class as SEC-1.
+
+**2. An address-space switch must flush the TLB (SEC-26 / SEC-27).** The neutral kill path *elides* the
+cross-core TLB shootdown for a pinned task ("a CR3 reload flushes non-global TLB entries"). That is an
+**x86 semantic**. On AArch64 a `TTBR0_EL1`+ASID switch does not implicitly flush; RISC-V `satp` needs an
+explicit `sfence.vma`. So the `arch::imp` context-switch / `write_page_table_base` primitive on a weak
+arch MUST either (a) flush the outgoing address space's non-global entries on the switch, or (b) the
+neutral kill path must issue the cross-core shootdown it currently elides. `invalidate_tlb_page` is
+local-core on x86 but broadcasts on ARM (`TLBI VAE1`) - a correctness-neutral but worth-knowing
+difference.
+
+**Every `arch::imp` primitive owes a documented SEMANTIC, not just a signature (SEC-27).** When you add
+`arch/<isa>/`, treat each primitive's memory-ordering, TLB, and broadcast behaviour as part of the
+contract: `write_page_table_base` flushes the old ASID's non-global TLB; `invalidate_tlb_page` covers the
+VA on the required cores; the atomics keep the ordering item 1 assumes. Matching the x86 *signature* is
+necessary but not sufficient - the seam pins names, and this section pins the semantics behind them.
+
+**3. DMA cache coherence (SEC-28).** The SDK's `Dma` wrapper (`sdk/rust/src/dma.rs`) maps the arena
+cacheable and does **no** cache maintenance, because "x86 DMA is cache-coherent". AArch64 (and most
+non-x86) DMA is **not** coherent - CPU and device can see stale copies. A port reusing a driver there
+MUST add cache maintenance (clean before a device read of a CPU-written buffer; invalidate before a CPU
+read of a device-written buffer), either by mapping the arena non-cacheable or via a `dma_sync`-style
+hook the accessors call. This is separate from the SMMU/H1 posture `docs/aarch64.md` already flags.
+
 ## See also
 
 - `docs/multi-arch.md` - the proof: what compiles, what boots, and the word-size matrix.

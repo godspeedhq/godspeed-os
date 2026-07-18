@@ -442,6 +442,10 @@ pub fn reserve_task_slot(core_id: u32) -> Option<usize> {
             let mut found = None;
             for i in 0..MAX_TASKS {
                 if !TASK_VALID[i].load(Ordering::Relaxed) {
+                    // SEC-25 (SMP-port contract, kernel/src/arch/CLAUDE.md): on a weak-ordered arch this
+                    // store order is wrong - TASK_CORE (the data) must be written BEFORE TASK_VALID (the
+                    // Release flag), and the ~30 `TASK_VALID.load(Relaxed)` readers must become Acquire.
+                    // Correct on x86 (TSO); left as-is so x86 codegen is unchanged. The port fixes it.
                     TASK_VALID[i].store(true, Ordering::Release);
                     TASK_CORE[i]  = core_id;
                     found = Some(i);
@@ -1450,8 +1454,37 @@ pub fn yield_current() {
             return;
         }
 
-        TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
-        CORE_CURRENT.get(cid).store(next, Ordering::Relaxed);
+        // SEC-1: claim `next` with the Dekker handshake (CAS Ready->Running, publish
+        // CORE_CURRENT SeqCst, fence, re-read STATE) - identical to timer_tick_from_irq.
+        // If a cross-core kill won the pick->publish race it may have already freed
+        // `next`'s page tables, so `abort_to_sched` re-routes prev to the scheduler
+        // context rather than let switch_context load a freed CR3. yield/block were the
+        // two switch-in sites missing the handshake that run()/timer_tick already carry.
+        let mut abort_to_sched = TASK_STATE[next]
+            .compare_exchange(
+                TaskState::Ready as u8,
+                TaskState::Running as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err();
+        if !abort_to_sched {
+            CORE_CURRENT.get(cid).store(next, Ordering::SeqCst);
+            core::sync::atomic::fence(Ordering::SeqCst);
+            abort_to_sched =
+                TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
+        }
+        if abort_to_sched {
+            // Leave CORE_CURRENT off `next` so the racing kill's spin-wait proceeds.
+            CORE_CURRENT.get(cid).store(IDLE, Ordering::SeqCst);
+            if prev >= MAX_TASKS {
+                // Core was idle - nothing to switch out; return to it.
+                crate::arch::imp::enable_interrupts();
+                return;
+            }
+            // else fall through and switch `prev` (set Ready by the CAS above) to the
+            // scheduler context via the shared switch below.
+        }
 
         // Save BEFORE prepare_ring3_switch so we capture the value from SYSCALL
         // entry, not the value prepare_ring3_switch is about to write for `next`.
@@ -1460,7 +1493,9 @@ pub fn yield_current() {
                 (*crate::arch::imp::syscall_entry::syscall_slot(cid)).user_rsp;
         }
 
-        if TASK_IS_USER[next] {
+        // On abort we do not enter `next`; only prepare the ring-3 switch when actually
+        // switching to it.
+        if !abort_to_sched && TASK_IS_USER[next] {
             prepare_ring3_switch(cid, next);
         }
 
@@ -1481,8 +1516,13 @@ pub fn yield_current() {
         } else {
             TASK_CTX[prev].assume_init_mut() as *mut TaskContext
         };
-        let next_ctx: *const TaskContext =
-            TASK_CTX[next].assume_init_ref() as *const TaskContext;
+        // Normal: switch into `next`. Abort (kill won the race): switch `prev` to the
+        // scheduler context instead, never loading `next`'s possibly-freed page table.
+        let next_ctx: *const TaskContext = if abort_to_sched {
+            CORE_SCHED_CTX.as_ptr(cid)
+        } else {
+            TASK_CTX[next].assume_init_ref() as *const TaskContext
+        };
 
         switch_context(current_ctx, next_ctx);
         crate::arch::imp::enable_interrupts();
@@ -2101,13 +2141,37 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
 
         match pick_next(cid) {
             Some(next) => {
-                TASK_STATE[next].store(TaskState::Running as u8, Ordering::Relaxed);
-                CORE_CURRENT.get(cid).store(next, Ordering::Relaxed);
-                if TASK_IS_USER[next] {
-                    prepare_ring3_switch(cid, next);
+                // SEC-1: Dekker handshake claiming `next` (mirror timer_tick_from_irq)
+                // so a cross-core kill that already freed next's page tables makes us
+                // switch `slot` to the scheduler context instead of loading a freed CR3.
+                let mut abort_to_sched = TASK_STATE[next]
+                    .compare_exchange(
+                        TaskState::Ready as u8,
+                        TaskState::Running as u8,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_err();
+                if !abort_to_sched {
+                    CORE_CURRENT.get(cid).store(next, Ordering::SeqCst);
+                    core::sync::atomic::fence(Ordering::SeqCst);
+                    abort_to_sched =
+                        TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
                 }
-                let next_ctx = TASK_CTX[next].assume_init_ref() as *const TaskContext;
-                switch_context(current_ctx, next_ctx);
+                if abort_to_sched {
+                    // Kill won the race: release its spin-wait (CORE_CURRENT off `next`)
+                    // and switch the now-Blocked `slot` to the scheduler context, exactly
+                    // as the None branch does - `slot` resumes here when later woken.
+                    CORE_CURRENT.get(cid).store(IDLE, Ordering::SeqCst);
+                    let sched = CORE_SCHED_CTX.as_mut_ptr(cid);
+                    switch_context(current_ctx, sched);
+                } else {
+                    if TASK_IS_USER[next] {
+                        prepare_ring3_switch(cid, next);
+                    }
+                    let next_ctx = TASK_CTX[next].assume_init_ref() as *const TaskContext;
+                    switch_context(current_ctx, next_ctx);
+                }
             }
             None => {
                 CORE_CURRENT.get(cid).store(IDLE, Ordering::Relaxed);

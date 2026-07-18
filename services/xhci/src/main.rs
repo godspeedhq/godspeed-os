@@ -1598,13 +1598,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 // mouse consumer exists, wire it into these callbacks instead of logging.
                                 mouse[d].feed(&rep, |_mask, _down| {}, |_dx, _dy| {});
                             } else {
-                                // Ctrl+Alt+Del = secure-attention reboot, from any context. Checked
-                                // only for keyboard reports (a mouse button byte can alias the
-                                // modifier bits). reboot() does not return.
-                                if godspeed_sdk::hid::is_ctrl_alt_del(&rep) {
-                                    ctx.log("xhci: Ctrl+Alt+Del - rebooting");
-                                    ctx.reboot();
-                                }
+                                // SEC-2: this driver no longer holds REBOOT and does not reboot
+                                // directly. A compromised USB driver must not be able to hard-reset
+                                // the machine from any context; reboot authority lives only with the
+                                // shell (its `reboot` command). Ctrl+Alt+Del is decoded as ordinary
+                                // keystrokes below, like any other key.
                                 godspeed_sdk::hid::decode_keyboard(
                                     &rep, &mut kb_last[d], &mut kb_rep[d], &mut kb_caps[d], ctx.read_tsc(),
                                     |ch| ctx.console_push(ch),

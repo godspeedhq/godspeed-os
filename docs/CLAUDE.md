@@ -22,7 +22,8 @@ Narrative documentation. These files explain design decisions in prose; they do 
 | `unsafe-audit.md`   | Complete inventory of every `unsafe` block in the kernel (§18.4) |
 | `kernel-audit.md`   | **Living audit** of the ring-0 kernel against the invariants; north-star: nothing above the kernel may panic or wedge it |
 | `userspace-audit.md`| **Living audit** of the userspace services against the Commandments; north-star: identity over location, wait on truth incl. failure, reacquire + retry |
-| `documentation-audit.md` | **Living audit** of the *documentation* for clarity and intent - the least-capable model should not have to guess. Third of the audit trilogy; maintains `anti-patterns.md` |
+| `documentation-audit.md` | **Living audit** of the *documentation* for clarity and intent - the least-capable model should not have to guess. Third of the audit family; maintains `anti-patterns.md` |
+| `security-audit.md` | **Living audit** of *authority* against escalation; north-star: no principal gains authority beyond its grant. Fourth of the audit family; the TCB-principal threat model (the "root" analog is reaching a deputy). Framed against the AI-vuln pattern (ksmbd/Big-Sleep style) |
 | `anti-patterns.md`  | Field Guide to Constitutional Violations: 21 categories, each violation paired with the correct pattern and the Commandment/section it breaks |
 | `introspection-capability.md` | Design note: gating `InspectKernel`/`TaskStat` behind the `INTROSPECT` cap (§3.1) - closes the ambient-introspection exception |
 | `networking.md`     | **Networking (v2 design, not built):** network stack as a userspace service - a socket IS a capability (the same delegated-resource-cap mechanism as file-as-capability, §7.10/P2), so the kernel gains nothing (§4.4); IOMMU-confined NIC driver (e1000 for QEMU/Intel, T630 chipset TBD via a Phase-0 PCI print); ARP/IPv4/ICMP/UDP phased plan with TCP far-future; no ambient network (§3.1, Appendix D.4), §23.4 |

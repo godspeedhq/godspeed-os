@@ -371,11 +371,15 @@ pub fn send_eoi() {
 /// hardware interrupt is pending.
 #[inline]
 pub fn fire_test_irq(irq: u8) {
-    disable_interrupts();
-    // SAFETY: interrupts are disabled above (IF=0), satisfying deliver's calling
-    // convention. EOI to the APIC is safe outside a real IRQ - the write is
-    // idempotent and the APIC ignores spurious EOIs.
+    // SEC-15: preserve the caller's IF. FIRE_IRQ is reachable from control::process_pending running
+    // inside the Core-0 timer ISR at IF=0; an unconditional enable_interrupts() there would set IF=1
+    // mid-ISR and open re-entrancy on the ISR stack. local_irq_save/restore keep the caller's state
+    // (re-enabling only if they were on), so the idle-loop caller is unaffected and the ISR caller
+    // is not force-enabled.
+    let was = local_irq_save();
+    // SAFETY: local_irq_save left IF=0, satisfying deliver's calling convention. EOI to the APIC is
+    // safe outside a real IRQ - the write is idempotent and the APIC ignores spurious EOIs.
     unsafe { crate::interrupt::route::deliver(irq); }
-    enable_interrupts();
+    local_irq_restore(was);
 }
 

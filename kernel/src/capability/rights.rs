@@ -28,6 +28,11 @@ impl Rights {
         Rights(self.0 & mask.0)
     }
 
+    /// Remove `mask`'s bits from `self` - only ever clears bits, never widens (SEC-7).
+    pub fn without(self, mask: Rights) -> Rights {
+        Rights(self.0 & !mask.0)
+    }
+
     pub fn union(self, other: Rights) -> Rights {
         Rights(self.0 | other.0)
     }

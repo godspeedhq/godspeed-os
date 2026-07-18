@@ -13,7 +13,7 @@ use crate::capability::cap::CapError;
 use crate::capability::rights::Rights;
 use crate::ipc::endpoint::EndpointId;
 use crate::ipc::message::{IpcError, Message, MAX_MESSAGE_SIZE};
-use crate::memory::allocator::alloc_frame;
+use crate::memory::allocator::{alloc_frame, zero_frame};
 use crate::task::scheduler;
 use crate::task::state::TaskState;
 
@@ -268,6 +268,21 @@ fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 /// Blocks until a message is dequeued from the endpoint, then copies the
 /// payload into the caller-supplied buffer.  Returns the number of bytes
 /// written on success, or a negative error code.
+/// SEC-7: narrow an embedded cap for its RECEIVER before installing it. A DELEGATED-resource cap
+/// (a file/socket, §7.10) is installed WITHOUT GRANT - the owning service (e.g. fs) mints it with
+/// GRANT only so it can transfer it (§8.5 rule 1: an embedded cap must be grantable), but the
+/// recipient only USES it (invokes); it must not re-delegate it - the owner controls delegation by
+/// minting fresh caps. Endpoint caps are returned unchanged: re-delegating an endpoint (e.g. the
+/// shell wiring a pipe stage, or a reply cap) is a legitimate part of the IPC model, so GRANT is
+/// preserved for those. This is the default "narrow to need" §8.5 wants, enforced at the boundary.
+fn narrow_embedded_for_receiver(cap: crate::capability::cap::Capability) -> crate::capability::cap::Capability {
+    if crate::capability::delegated::is_delegated(cap.resource_id) {
+        cap.without_grant()
+    } else {
+        cap
+    }
+}
+
 fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::RECV) {
         Ok(c)  => c,
@@ -300,7 +315,7 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
                 let n_caps = msg.cap_count.min(msg.caps.len());
                 for i in 0..n_caps {
                     if let Some(embedded_cap) = msg.caps[i] {
-                        if let Ok(new_slot) = scheduler::current_task_insert_cap(embedded_cap) {
+                        if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
                             scheduler::push_pending_recv_cap(new_slot as u32);
                         }
                     }
@@ -353,7 +368,7 @@ fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
             let n_caps = msg.cap_count.min(msg.caps.len());
             for i in 0..n_caps {
                 if let Some(embedded_cap) = msg.caps[i] {
-                    if let Ok(new_slot) = scheduler::current_task_insert_cap(embedded_cap) {
+                    if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
                         scheduler::push_pending_recv_cap(new_slot as u32);
                     }
                 }
@@ -413,7 +428,7 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
                 let n_caps = msg.cap_count.min(msg.caps.len());
                 for i in 0..n_caps {
                     if let Some(embedded_cap) = msg.caps[i] {
-                        if let Ok(new_slot) = scheduler::current_task_insert_cap(embedded_cap) {
+                        if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
                             scheduler::push_pending_recv_cap(new_slot as u32);
                         }
                     }
@@ -839,7 +854,13 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
     };
 
     let resource_id = crate::capability::cap::ResourceId::from(ep_id);
-    let rights = if include_grant != 0 {
+    // SEC-6: the GRANT right is only for the operator/test instruments (ACQUIRE_ANY holders) that
+    // legitimately re-delegate reached caps - chaos flooding, pipe-sink wiring, the cap-transfer
+    // tests (P3). A declared-peer acquirer is an ordinary service reacquiring its OWN peer for
+    // recovery (§14.2); it only sends to it, never re-delegates it, so it gets SEND-only regardless
+    // of `include_grant`. This stops a service self-minting a re-delegatable cap to a declared peer
+    // (narrow to need, §8.5) - GRANT now follows the instrument permission, not the caller's request.
+    let rights = if include_grant != 0 && broad {
         crate::capability::Rights::SEND | crate::capability::Rights::GRANT
     } else {
         crate::capability::Rights::SEND
@@ -1043,7 +1064,7 @@ fn handle_call(packed: u64, buf_ptr: u64, req_len: u64) -> i64 {
                 let n_caps = reply.cap_count.min(reply.caps.len());
                 for i in 0..n_caps {
                     if let Some(embedded_cap) = reply.caps[i] {
-                        if let Ok(new_slot) = scheduler::current_task_insert_cap(embedded_cap) {
+                        if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
                             scheduler::push_pending_recv_cap(new_slot as u32);
                         }
                     }
@@ -1249,6 +1270,11 @@ fn handle_alloc_mem(size: u64) -> i64 {
             None    => return -1, // physical memory exhausted; budget already updated
         };
         let phys = frame.phys_addr().0;
+        // SEC-21: zero the frame before it becomes user-readable. `alloc_frame` may return a frame
+        // still holding a dead task's contents (the allocator zeroes neither on alloc nor on free),
+        // and AllocMem needs no capability, so an un-zeroed page would leak stale cross-task memory.
+        // `zero_frame` keeps the `unsafe` in the permitted memory/ layer (§18.5); this stays safe.
+        zero_frame(phys);
         // SAFETY: va is in the task heap range (0x1_0000_0000+); phys is from the
         // allocator; the task's page table is the active CR3 during this syscall.
         if unsafe { map_in_active_tables(va, phys, flags) }.is_err() {

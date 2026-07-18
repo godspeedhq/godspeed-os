@@ -52,6 +52,19 @@ impl Capability {
             generation: self.generation,
         }
     }
+
+    /// A copy of this cap with the GRANT right stripped (SEC-7). Never widens. Used when installing an
+    /// embedded DELEGATED-resource cap (a file/socket, §7.10) into a receiver: the owning service
+    /// mints it with GRANT only so it can transfer it (§8.5 rule 1 - an embedded cap must be
+    /// grantable), but the recipient only *uses* it (invokes); it must not re-delegate it - the owner
+    /// controls delegation by minting fresh caps.
+    pub fn without_grant(&self) -> Self {
+        Capability {
+            resource_id: self.resource_id,
+            rights: self.rights.without(Rights::GRANT),
+            generation: self.generation,
+        }
+    }
 }
 
 #[cfg(test)]

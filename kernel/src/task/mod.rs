@@ -237,6 +237,7 @@ struct ServiceContextData {
     probe_mode:         u32,
     console_read_slot:  u32, // u32::MAX = not present; slot index if service has console_read cap
     xhci_mmio_va:       u64, // 0 = not mapped; else VA of the driver's controller BAR - xHCI or EHCI (§12)
+    xhci_mmio_len:      u64, // length of the mapped MMIO register window in bytes (SEC-4)
     xhci_dma_va:        u64, // 0 = none; else VA of the driver's DMA arena (§12)
     xhci_dma_phys:      u64, // physical base of the DMA arena (programmed into the device)
     xhci_dma_len:       u64, // length of the DMA arena in bytes
@@ -418,7 +419,7 @@ struct Privileges {
     console_push:    bool, // CONSOLE_PUSH: inject keystrokes into the input ring (USB keyboard drivers)
     introspect:      bool, // INTROSPECT: read another task's / system-wide kernel state (§3.1)
     service_control: bool, // SERVICE_CONTROL: kill/restart other services (§14.4)
-    reboot:          bool, // REBOOT: hardware-reset the machine (shell `reboot`, USB Ctrl+Alt+Del)
+    reboot:          bool, // REBOOT: hardware-reset the machine (shell `reboot` only - SEC-2)
     acquire_any:     bool, // ACQUIRE_ANY: reach ARBITRARY services by name via AcquireSendCap (§3.1)
 }
 
@@ -436,8 +437,10 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // shell (interactive broker), supervisor (restart authority), chaos (the point of max-carnage),
         // and every probe (they kill victims to exercise kill/revocation).
         service_control: is_probe || matches!(name, "shell" | "supervisor" | "chaos"),
-        // shell `reboot` + the USB drivers' Ctrl+Alt+Del secure-attention reboot are the only rebooters.
-        reboot: matches!(name, "shell" | "xhci" | "ehci"),
+        // SEC-2: REBOOT lives ONLY with the shell (its `reboot` command); the USB drivers no longer
+        // hold it. A keyboard driver can synthesize any keystroke (the console's inherent trust, §6.4),
+        // but it must not ALSO be able to hard-reset the machine directly from any context.
+        reboot: matches!(name, "shell"),
         // Operator/test instruments that legitimately reach arbitrary services by name: shell (chaos
         // flooding, pipe sinks), supervisor (reconcile-by-name), probes. `adv-a13` is the §22 Test A13
         // NEGATIVE pin - deliberately excluded so it holds no ACQUIRE_ANY (proves AcquireSendCap denies
@@ -2507,7 +2510,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // A12: reboot gated - Reboot/18 denied without the REBOOT cap (§3.1).
-        // Name matches no reboot grant (only shell/xhci/ehci get it), so adv-a12 holds none.
+        // Name matches no reboot grant (only the shell gets it now - SEC-2), so adv-a12 holds none.
         "adv-a12" => Some(("adv-a12", ServiceConfig {
             elf:               PROBE_ELF,
             has_recv_endpoint: false,
@@ -3631,6 +3634,9 @@ fn spawn_service_with_config(
             0
         }
     };
+    // The mapped MMIO window is a uniform XHCI_MMIO_PAGES for every driver class; passing its byte
+    // length to the service lets the SDK's `Mmio` wrapper bounds-check accesses (SEC-4). 0 = no BAR.
+    let xhci_mmio_len: u64 = if xhci_mmio_va != 0 { XHCI_MMIO_PAGES * PAGE_SIZE as u64 } else { 0 };
 
     // 6b. Allocate + map a physically-contiguous DMA arena for the xHCI driver
     // (§12). The controller DMAs into this memory (rings/contexts), so the driver
@@ -3753,6 +3759,7 @@ fn spawn_service_with_config(
             data.console_push_slot  = console_push_slot_u32;
             data.self_grant_slot    = self_grant_slot_u32;
             data.xhci_mmio_va       = xhci_mmio_va;
+            data.xhci_mmio_len      = xhci_mmio_len;
             data.xhci_dma_va        = xhci_dma_va;
             data.xhci_dma_phys      = xhci_dma_phys;
             data.xhci_dma_len       = xhci_dma_len;
@@ -3784,19 +3791,24 @@ fn spawn_service_with_config(
         TaskContext::new_user(kstack_top, entry_va, USER_STACK_TOP, cr3)
     };
 
-    // 9. Finalise the reserved task slot (ctx + metadata → Ready).
-    // SAFETY: task_slot reserved above; CapTable initialised; IF=0.
-    unsafe {
-        scheduler::commit_task(task_slot, name, ctx, true, kstack_top as u64, own_endpoint);
-    }
-
-    // 10. Initialise the memory budget for this task (§10.3). Seed it with the base footprint -
-    // the mapped binary (code+data+BSS), the 256 KiB user stack, and the ctx page - so MEM_USED
-    // reflects real occupancy, not just dynamic alloc_mem (which most no-heap services never call).
+    // 9. Initialise the memory budget for this task (§10.3) BEFORE committing the slot Ready (SEC-19).
+    // commit_task publishes Ready last, making the task schedulable - possibly on a DIFFERENT core;
+    // seeded after, that core could run the task and read the PREVIOUS occupant's TASK_LIMIT_BYTES /
+    // TASK_ALLOC_BYTES in the window before this line ran (a transient wrong quota). Seed it first,
+    // with the base footprint - the mapped binary (code+data+BSS), the 256 KiB user stack, and the
+    // ctx page - so MEM_USED reflects real occupancy, not just dynamic alloc_mem (which most no-heap
+    // services never call). Mirrors commit_task's own "every field set before Ready is published" rule.
     let base_bytes = elf_mapped_bytes
         + USER_STACK_PAGES * PAGE_SIZE as u64
         + PAGE_SIZE as u64; // ctx page
     scheduler::set_task_memory_budget(task_slot, memory_limit, base_bytes);
+
+    // 10. Finalise the reserved task slot (ctx + metadata -> Ready). The budget above is already in
+    // place, so a task scheduled the instant Ready publishes sees its own quota, never a stale one.
+    // SAFETY: task_slot reserved above; CapTable initialised; IF=0.
+    unsafe {
+        scheduler::commit_task(task_slot, name, ctx, true, kstack_top as u64, own_endpoint);
+    }
 
     crate::kprintln!("task: '{}' spawned OK on core {} (slot {})", name, core_id, task_slot);
     Ok(own_endpoint)

@@ -400,6 +400,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("fs: serving file API");
     loop {
         let msg = ctx.recv();
+        // LS1 self-heal: if we came up DEGRADED on a storage I/O error, re-attempt the mount when a
+        // request arrives, before serving it. block-driver's AHCI disk detection can transiently miss
+        // under a heavy restart-storm (a present disk reads sig=0xffffffff and is declared "no disk")
+        // and recover on a later init; without this, fs latched "storage unavailable" forever - even
+        // after the disk was back - until a manual `kill fs`. Request-driven, no hidden timer (§26.4);
+        // one successful re-mount exits the degraded state and serves this very request normally.
+        // `mount` fails fast on a still-down disk (`read_superblock` returns an error, no spin), so a
+        // per-request attempt is cheap. Only the I/O-error degraded state re-mounts; a genuinely blank
+        // disk (storage_unreadable == false) stays "no filesystem" until `drives flash`.
+        if fs.is_none() && storage_unreadable {
+            let _ = ctx.reacquire_by_name("block-driver");
+            if let Ok(f) = Fs::mount(&ctx) {
+                ctx.log_fmt(format_args!(
+                    "fs: storage recovered - re-mounted GSFS0008 ({} blocks, {} free)",
+                    f.total_blocks, f.free_blocks
+                ));
+                capacity = f.total_blocks;
+                storage_unreadable = false;
+                fs = Some(f);
+            }
+        }
         // A delegated-resource badge (§7.10) is set ONLY by the kernel after it validated a real
         // file cap - so its presence means "this is a trusted file-cap invocation", impossible to
         // forge over the ordinary fs send-cap. No badge → a name-addressed request.
@@ -1995,7 +2016,8 @@ impl Fs {
                     // The old path no longer names this file - revoke any open caps to it, so a
                     // held cap can never silently rebind to a different file later created at the
                     // old path (confused-deputy avoidance; §7.10). Same discipline as delete.
-                    self.revoke_open_by_path(ctx, path);
+                    // Subtree revoke: if `path` is a directory, its descendants' paths change too (SEC-5).
+                    self.revoke_open_subtree(ctx, path);
                     return Ok(());
                 }
             }
@@ -2060,6 +2082,33 @@ impl Fs {
         }
     }
 
+    /// True if `candidate` is `dir` itself, or a path strictly beneath the directory `dir` (i.e.
+    /// `dir` followed by a `/`). The `/` guard stops `/dir` from matching a sibling like `/directory`
+    /// on a raw byte prefix.
+    fn path_in_subtree(candidate: &[u8], dir: &[u8]) -> bool {
+        candidate == dir
+            || (candidate.len() > dir.len()
+                && candidate.starts_with(dir)
+                && candidate[dir.len()] == b'/')
+    }
+
+    /// Revoke every open file cap for `path` OR any file beneath the directory `path` - called on
+    /// `delete_tree` and directory rename/move (SEC-5). `revoke_open_by_path` matches only the exact
+    /// path, so removing a directory left caps to its DESCENDANTS valid: the open-file slot leaked
+    /// (eventually exhausting the table -> Open DoS), and a stale descendant cap could re-resolve to a
+    /// DIFFERENT file later created at the same path (authority beyond grant). Revoking the whole
+    /// subtree closes both, so the revocable property (§7.5 / §22 Test 14) holds for a subtree, not
+    /// just a single file.
+    fn revoke_open_subtree(&mut self, ctx: &ServiceContext, path: &[u8]) {
+        for i in 0..MAX_OPEN {
+            let o = self.open_files[i];
+            if o.rid != 0 && Self::path_in_subtree(&o.path[..o.plen as usize], path) {
+                let _ = ctx.resource_revoke(o.rid);
+                self.open_files[i].rid = 0;
+            }
+        }
+    }
+
     fn delete(&mut self, ctx: &ServiceContext, path: &[u8]) -> Result<(), &'static str> {
         let e = self.walk(ctx, path).ok_or("not found")?;
         if e.loc.is_none() { return Err("cannot delete root"); }
@@ -2087,7 +2136,7 @@ impl Fs {
         self.begin_txn();
         let r = self.dir_remove(ctx, &parent, name);
         self.end_txn(ctx, r)?;
-        self.revoke_open_by_path(ctx, path); // invalidate any open file caps to the deleted entry
+        self.revoke_open_subtree(ctx, path); // revoke caps to the deleted entry AND its descendants (SEC-5)
         // Reclaim the unreachable subtree in bounded transactions. A crash here only leaks
         // blocks (nothing references them) - never corruption.
         self.free_subtree(ctx, e.itype, e.first_block, e.block_count, 0)
@@ -2316,7 +2365,8 @@ impl Fs {
         self.dir_remove(ctx, &sparent, sname)?;
         // `src` no longer names this file - revoke any open caps to it (confused-deputy
         // avoidance, §7.10). The same-directory case above goes through `rename`, which does this.
-        self.revoke_open_by_path(ctx, src);
+        // Subtree revoke: if `src` is a directory, its descendants moved too (SEC-5).
+        self.revoke_open_subtree(ctx, src);
         Ok(())
     }
 }

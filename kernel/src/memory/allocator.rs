@@ -497,6 +497,27 @@ pub fn alloc_frame() -> Option<Frame> {
     })
 }
 
+/// Zero a freshly-allocated physical frame through its HHDM alias. `alloc_frame` returns a frame
+/// straight off the free bitmap without zeroing, and `free_frame` does not zero either, so any path
+/// that hands a raw frame to userspace must zero it first or it leaks the previous owner's contents.
+/// The spawn ELF/stack/page-table paths already zero; this is the shared helper for the AllocMem
+/// syscall, which needs no capability and so must never expose stale cross-task memory (SEC-21).
+/// Keeping the `unsafe` here in the permitted `memory/` layer lets the syscall caller stay
+/// `unsafe`-free (§18.5).
+#[inline]
+pub fn zero_frame(phys: u64) {
+    // SAFETY: `phys` is a frame from this allocator; the HHDM aliases all physical RAM at a fixed
+    // kernel offset (set up in memory::init, before any syscall runs), so `hhdm + phys` is a valid
+    // writable kernel VA covering exactly one FRAME_SIZE-byte frame.
+    unsafe {
+        core::ptr::write_bytes(
+            (crate::arch::imp::page_tables::get_hhdm_offset() + phys) as *mut u8,
+            0,
+            FRAME_SIZE as usize,
+        );
+    }
+}
+
 /// Allocate `n` physically-contiguous, page-aligned frames; return the physical
 /// address of the first, or `None` if no run that long is free. For driver DMA
 /// arenas (§12) where the device DMAs into contiguous memory. The frames are not

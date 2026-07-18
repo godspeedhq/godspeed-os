@@ -177,6 +177,7 @@ struct ServiceContextData {
     probe_mode:         u32,
     console_read_slot:  u32, // u32::MAX = not present
     xhci_mmio_va:       u64, // 0 = not mapped; else VA of the mapped xHCI BAR
+    xhci_mmio_len:      u64, // length of the mapped MMIO register window in bytes (SEC-4)
     xhci_dma_va:        u64, // 0 = none; else VA of the driver's DMA arena
     xhci_dma_phys:      u64, // physical base of the DMA arena
     xhci_dma_len:       u64, // length of the DMA arena in bytes
@@ -1312,7 +1313,7 @@ impl ServiceContext {
         if va == 0 {
             None
         } else {
-            Some(crate::mmio::Mmio::new(va as *mut u8))
+            Some(crate::mmio::Mmio::new(va as *mut u8, Self::ctx().xhci_mmio_len as usize))
         }
     }
 
@@ -1325,7 +1326,7 @@ impl ServiceContext {
         if va == 0 {
             None
         } else {
-            Some(crate::mmio::Mmio::new(va as *mut u8))
+            Some(crate::mmio::Mmio::new(va as *mut u8, Self::ctx().xhci_mmio_len as usize))
         }
     }
 
@@ -1338,7 +1339,7 @@ impl ServiceContext {
         if va == 0 {
             None
         } else {
-            Some(crate::mmio::Mmio::new(va as *mut u8))
+            Some(crate::mmio::Mmio::new(va as *mut u8, Self::ctx().xhci_mmio_len as usize))
         }
     }
 

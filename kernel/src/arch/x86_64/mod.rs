@@ -296,9 +296,17 @@ pub unsafe fn switch_to_boot_stack(top: u64) {
     unsafe { core::arch::asm!("mov rsp, {0}", in(reg) top, options(nostack)); }
 }
 
-/// Halt this core. Disables interrupts and loops on hlt.
-/// Milestone 6: broadcast NMI IPI to other cores before halting.
+/// Halt EVERY core, permanently. The panic path calls this, so a panic on one core must stop the whole
+/// machine, not just the caller (§6.2, §19): otherwise the survivors keep running on the shared state
+/// whose corruption triggered the panic, and a lock the panicking core held live-wedges them.
+///
+/// SEC-18: broadcast an NMI to the other cores first (it reaches them even while spinning IF=0 on a
+/// lock; `idt[2]` routes it to `exception_halt`, which halts the receiving core), then halt this one.
 pub fn halt_all_cores() -> ! {
+    // SAFETY: panic path - stop all execution permanently. The APIC is mapped by boot; a bare ICR write
+    // is sound. If we panicked before the APIC came up the broadcast is a best-effort no-op and this
+    // core still halts below.
+    unsafe { boot::broadcast_nmi_all_but_self() };
     // SAFETY: panic path - we want to stop all execution permanently.
     unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
     loop {

@@ -13,6 +13,29 @@ comment.
 
 ---
 
+## 2026-07-16 - SEC-21 security fix (feat/hardening)
+
+| File | Change | Why |
+|------|--------|-----|
+| `memory/allocator.rs` | 43 → 44 (+1) | **SEC-21:** new safe `zero_frame(phys)` helper (one `unsafe` `write_bytes` block via the HHDM alias) so the AllocMem syscall can zero a frame before it becomes user-readable, closing a cross-task info leak (`alloc_frame` returns un-zeroed frames). Permitted `memory/` layer with a SAFETY comment; keeping the `unsafe` here lets the caller (`syscall/dispatch.rs`, a grandfathered file) stay `unsafe`-free per §18.5. |
+
+SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this inventory: the SDK's
+permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
+bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
+
+## 2026-07-16 - SEC-1 / SEC-18 security fixes (feat/hardening)
+
+Two HIGH findings from the security audit (`docs/security-audit.md`), both fixed with `// SAFETY:`-
+commented blocks in the permitted `arch/` layer (no §18.5 amendment needed):
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/boot.rs` | 98 → 100 (+2) | **SEC-18:** new `broadcast_nmi_all_but_self` (a `pub unsafe fn` + one `unsafe` ICR-write block) so the panic path stops every core, not just the caller. Models the sibling `broadcast_ipi_all_but_self`; NMI delivery mode (ICR bits 10:8 = 0b100) reaches a core even while it spins IF=0 on a lock. `idt[2]` is also repointed to `exception_halt` (a same-file IDT re-wire, no new `unsafe`). |
+| `arch/x86_64/mod.rs` | 35 → 36 (+1) | **SEC-18:** `halt_all_cores` now calls `boot::broadcast_nmi_all_but_self()` before its `cli`+`hlt`, so a panic on one core halts the whole machine (§6.2 / §19). The +1 is that `unsafe { boot::... }` call block. |
+
+**SEC-1** (the freed-CR3 UAF fix in `task/scheduler.rs`) adds **0** here: its Dekker-handshake edits to
+`yield_current` / `block_and_reschedule` live inside those functions' pre-existing `unsafe` blocks.
+
 ## 2026-07-12 - userspace audit M8: probe made `unsafe`-free; `unsafe_check.py` now scans `services/`
 
 `probe` (the §22 adversarial/fuzz/chaos test harness) held raw-SYSCALL `asm!` plus deliberate ring-3
@@ -246,19 +269,19 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/riscv64/mod.rs | 23 | permitted |
 | arch/s390x/mod.rs | 18 | permitted |
 | arch/x86_64/ap_boot.rs | 2 | permitted |
-| arch/x86_64/boot.rs | 98 | permitted |
+| arch/x86_64/boot.rs | 100 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 5 | permitted |
 | arch/x86_64/interrupts.rs | 22 | permitted |
 | arch/x86_64/ioapic.rs | 8 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
-| arch/x86_64/mod.rs | 35 | permitted |
+| arch/x86_64/mod.rs | 36 | permitted |
 | arch/x86_64/page_tables.rs | 46 | permitted |
 | arch/x86_64/pci.rs | 19 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 15 | permitted |
 | capability/table.rs | 7 | permitted |
-| memory/allocator.rs | 43 | permitted |
+| memory/allocator.rs | 44 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
