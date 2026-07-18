@@ -4394,7 +4394,7 @@ fn cmd_about(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
 /// fact (conventions rule 7 - a raw fact). Pipeable like `about` (`version | write /ver.txt`). The SHA
 /// is stamped at build time by `build.rs`; a build with no git reports `unknown`.
 fn cmd_version_os(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
-    out.line_fmt(ctx, format_args!("GodspeedOS {} ({})", UTIL_VERSION, env!("GODSPEED_GIT_SHA")));
+    out.line_fmt(ctx, format_args!("GodspeedOS {} ({})", env!("CARGO_PKG_VERSION"), env!("GODSPEED_GIT_SHA")));
     Ok(())
 }
 

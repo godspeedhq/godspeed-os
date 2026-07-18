@@ -1,6 +1,6 @@
 [package]
 name = "shell"
-version = "0.1.0"
+version.workspace = true   # inherits the OS version so the `version` command shows it (single source)
 edition = "2021"
 
 [[bin]]

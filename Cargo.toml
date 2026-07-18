@@ -33,6 +33,12 @@ members = [
     "services/ehci",
 ]
 
+# Single source of truth for the OS version (the release version). Member crates
+# that make up a release (kernel, osdev, sdk, and the shell that displays it) inherit
+# this with `version.workspace = true`, so a release bump is a one-line change here.
+[workspace.package]
+version = "0.6.0"
+
 # kernel and all services/examples build for the bare-metal target;
 # osdev builds for the host. Use `cargo build -p osdev` for the host tool,
 # and `cargo build -p kernel --target x86_64-unknown-none` for the kernel.
