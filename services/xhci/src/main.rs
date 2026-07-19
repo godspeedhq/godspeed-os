@@ -1557,14 +1557,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 need_queue[d] = false;
             }
 
-            // BUSY-POLL (§12). The CPU-reduction experiment (block on recv_timeout to idle the
-            // core, interrupt/timer to wake) introduced subtle quirks on this hardware - input
-            // lag, sluggish auto-repeat, hot-plug wedges - so we scaled it back to the model that
-            // worked flawlessly: yield each pass and re-scan. The MSI-X interrupt is still
-            // enabled and drained below (belt-and-suspenders), it just doesn't gate the loop.
-            // The core runs hot; reclaiming that idle cleanly is deferred (revisit later).
-            ctx.yield_cpu();
-            // Drain any queued interrupt-event IPCs (kept so an enabled MSI-X can't pile up).
+            // INTERRUPT-DRIVEN (§12, docs/power.md). Block until the controller's next MSI-X (a
+            // device event, e.g. a keypress) or a deadline, instead of busy-yielding, so the core
+            // can `hlt` between events and drops to ~0% CPU at rest. The wake is now LOCAL: the
+            // xHCI MSI is co-located to this driver's OWN core (task::XHCI_CORE + pci.rs), so a
+            // keypress wakes this core directly out of idle rather than paging a halted AP across
+            // cores - the destination/placement drift that made the earlier attempt lag
+            // (docs/power.md §11). A held key emits no new USB reports, so while one is armed we
+            // wake briskly (~20 ms) to synthesise typematic auto-repeat below; when idle we sleep
+            // ~250 ms as the hot-plug watchdog. Never pass 0 (recv_timeout(0) blocks FOREVER).
+            let any_held = (0..ndev).any(|d| !devs[d].is_mouse && kb_rep[d].armed());
+            let base = rep_ticks.max(1);
+            let deadline = if any_held { base.saturating_mul(2) } else { base.saturating_mul(25) };
+            let _ = ctx.recv_timeout(deadline);
+            // Drain any further queued interrupt-event IPCs (an MSI-X mid-processing must not pile up).
             while ctx.try_recv().is_some() {}
             // Ack the interrupter (clear IP, keep IE) BEFORE draining the ring, so an event
             // arriving mid-drain re-sets IP and re-arms a fresh MSI-X (no missed events).
