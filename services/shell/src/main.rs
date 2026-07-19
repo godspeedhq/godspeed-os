@@ -1223,7 +1223,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "about"   => cmd_about(ctx, out),
         "version" => cmd_version_os(ctx, out),
         "mem"     => cmd_mem(ctx, out),
-        "cores"   => cmd_cores(ctx, out),
+        "cores"   => cmd_cores(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "net"     => cmd_net(ctx, s["net".len()..].trim(), out),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
@@ -3813,8 +3813,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "mem" => help_block(ctx, "mem", "physical memory usage", &[
             ("mem", "used / total / free physical memory", "mem"),
         ], true),
-        "cores" => help_block(ctx, "cores", "CPU core count", &[
+        "cores" => help_block(ctx, "cores", "CPU core count + timer-tick rate", &[
             ("cores", "how many CPU cores are up", "cores"),
+            ("cores ticks", "each core's timer ticks/s (5s RTC-paced sample)", "cores ticks"),
         ], true),
         "date" => help_block(ctx, "date", "date + time from the hardware clock", &[
             ("date", "full timestamp (weekday date time)", "date"),
@@ -4483,8 +4484,56 @@ fn cmd_reboot(ctx: &ServiceContext) -> ! {
     ctx.reboot()
 }
 
-fn cmd_cores(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
-    out.line_fmt(ctx, format_args!("cores: {}", ctx.inspect_core_count()));
+/// `cores` - how many cores are up. `cores ticks` - each core's timer-tick RATE.
+///
+/// The rate form is how the Phase 2a idle-tick slowdown (`docs/power.md` §14) is *measured* rather
+/// than assumed: an idle AP re-arms its timer at a long interval, so it should read far lower than
+/// the BSP, which deliberately keeps the normal period as the timed-wake/console heartbeat. A core
+/// running a busy-poll driver (e.g. `ehci`) never idles, so it reads at the full rate - which makes
+/// this a direct, side-by-side read of what still costs power.
+///
+/// Paced by the RTC (`epoch_secs_monotonic`), never the TSC: this hardware's TSC-Hz calibration is
+/// unreliable, so a cycle-based interval would report a confidently wrong rate. It `sleep`s between
+/// polls rather than spinning, so the measurement does not perturb what it is measuring.
+fn cmd_cores(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+    let n = ctx.inspect_core_count();
+    if arg != "ticks" {
+        out.line_fmt(ctx, format_args!("cores: {}", n));
+        return Ok(());
+    }
+
+    const MAXC: usize = 16;
+    const SAMPLE_SECS: i64 = 5;
+    let ncores = (n as usize).min(MAXC);
+    let mut before = [0u64; MAXC];
+    for c in 0..ncores {
+        before[c] = ctx.inspect_core_total_ticks(c as u32);
+    }
+    let t0 = ctx.epoch_secs_monotonic();
+    out.line_fmt(ctx, format_args!("sampling {}s (RTC-paced)...", SAMPLE_SECS));
+    while ctx.epoch_secs_monotonic() - t0 < SAMPLE_SECS {
+        ctx.sleep(1); // granularity is one scheduler quantum; parks instead of spinning
+    }
+    let elapsed = (ctx.epoch_secs_monotonic() - t0).max(1) as u64;
+
+    // Show the raw sampled count alongside the rate: a slowed idle core can tick below 1/s, which
+    // integer division would flatten to a bare "0" and hide the very signal being measured.
+    out.line(ctx, "core  ticks/s   sampled");
+    for c in 0..ncores {
+        let delta = ctx
+            .inspect_core_total_ticks(c as u32)
+            .saturating_sub(before[c]);
+        out.line_fmt(
+            ctx,
+            format_args!(
+                "  C{}   {:>5}   {:>5}{}",
+                c,
+                delta / elapsed,
+                delta,
+                if c == 0 { "   (BSP - keeps the normal period)" } else { "" }
+            ),
+        );
+    }
     Ok(())
 }
 
@@ -6273,7 +6322,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "version"      => { let _ = cmd_version_os(ctx, out); }
         "whatis"       => { let _ = cmd_whatis(ctx, arg, out); }
         "mem"          => { let _ = cmd_mem(ctx, out); }
-        "cores"        => { let _ = cmd_cores(ctx, out); }
+        "cores"        => { let _ = cmd_cores(ctx, "", out); }
         "date"         => { let _ = cmd_date(ctx, arg, out); }
         "net"          => { let _ = cmd_net(ctx, arg, out); }
         "ping"         => { let _ = cmd_ping(ctx, arg, out); }
