@@ -166,3 +166,86 @@ defined in full at its cited section.
 | **naming Phase 4** | The `registry` *service* was retired into the kernel's `name -> EndpointId` directory. | Path C |
 | **naming Phase 5** | `init` was removed; the kernel spawns the supervisor directly. | Path C |
 | **naming Phase 6** | The `supervisor` was made restartable - the kernel respawns it, unconditionally, forever. | §6.2, Path C |
+
+## Hardware and Systems Abbreviations
+
+The short forms that appear throughout the kernel, the drivers, and the design docs. Each is listed
+because the repository genuinely uses it (verified by grep), and defined by how GodspeedOS uses it -
+not by its most general industry meaning. Architectural **terms** remain the province of `CLAUDE.md`
+section 24; these are the abbreviations you meet while reading the code.
+
+### CPU, interrupts, and time
+
+- **APIC** - Advanced Programmable Interrupt Controller. The interrupt hardware the kernel drives for
+  timers and inter-core signalling.
+- **LAPIC** - the **local** APIC, one per core. Owns that core's timer and receives its interrupts.
+- **IOAPIC** - the I/O APIC: routes device interrupt lines (legacy INTx) to a core's vector.
+- **LVT** - Local Vector Table. The LAPIC registers that say which vector a local source (e.g. the
+  timer) raises, and whether it is masked.
+- **ISR** - Interrupt Service Routine: the handler that runs when a vector fires.
+- **IRQ** - Interrupt ReQuest: a device's interrupt line or its assigned vector.
+- **IPI** - Inter-Processor Interrupt: one core interrupting another (used for wakeups and TLB
+  shootdown). See also `CLAUDE.md` section 24.
+- **NMI** - Non-Maskable Interrupt: reaches a core even with interrupts disabled, which is why the
+  panic path uses it to halt every core (SEC-18).
+- **MSI / MSI-X** - Message Signalled Interrupts: a device raises an interrupt by writing a message
+  rather than asserting a pin, so it can be targeted at a chosen core.
+- **TSC** - Time Stamp Counter: the CPU's cycle counter. **TSC-Deadline** is a one-shot timer mode
+  armed by writing a deadline; the kernel re-arms it every tick.
+- **PIT** - Programmable Interval Timer (i8254). Legacy but portable, so it is the ground truth the
+  kernel calibrates the TSC and the LAPIC timer against.
+- **ARAT** - Always Running APIC Timer: a CPU flag meaning the LAPIC timer keeps ticking through deep
+  C-states. Without it, halting an idle core can drop its wakeup.
+- **C-state** - a CPU idle power state. Deeper states save more power but can power-gate the APIC.
+- **RTC / CMOS** - the battery-backed real-time clock; the wall-clock source (`date`, uptime, and any
+  pacing that must not trust the TSC).
+- **SMP** - Symmetric MultiProcessing: multiple cores running the same kernel.
+
+### Memory and addressing
+
+- **MMIO** - Memory-Mapped I/O: device registers accessed as memory rather than I/O ports.
+- **DMA** - Direct Memory Access: a device reading or writing RAM itself. Unconfined DMA is
+  kernel-equivalent power, which is why section 6.4 treats it so carefully.
+- **IOMMU** - I/O Memory Management Unit: translates and confines device DMA, so a driver's device
+  reaches only its granted arena (H1).
+- **TLB** - Translation Lookaside Buffer: the CPU's cache of page-table translations; a stale entry
+  must be shot down across cores.
+- **CR3** - the x86 register holding the current address space's page-table root.
+- **PML4** - the top-level x86-64 page table.
+- **HHDM** - Higher-Half Direct Map: all physical memory mapped at a known high virtual base, so the
+  kernel can reach any frame without a temporary mapping.
+
+### Buses, devices, and storage
+
+- **PCI** - the device bus the kernel enumerates. **BDF** = Bus/Device/Function, a device's address
+  on it.
+- **AHCI** - the SATA controller interface the block driver drives. **SATA** is the disk interface
+  itself.
+- **USB** - Universal Serial Bus. **xHCI** is the USB 3 host controller, **EHCI** the USB 2 one.
+- **HID** - Human Interface Device: the USB class for keyboards and mice.
+- **qTD / QH** - EHCI queue Transfer Descriptor and Queue Head: the DMA structures describing a USB
+  transfer and the endpoint queue it belongs to.
+- **NIC** - Network Interface Controller.
+- **UART** - the serial port hardware behind the console (COM1) and the test control channel (COM2).
+
+### Boot, formats, and files
+
+- **UEFI / BIOS** - the two firmware styles a machine may boot with. **ESP** = EFI System Partition,
+  the FAT32 partition holding the bootloader.
+- **GPT / MBR** - GUID Partition Table and Master Boot Record: the two partition-table formats.
+- **ELF** - Executable and Linkable Format: the binary format of the kernel and every service.
+- **GSFS** - the GodspeedOS filesystem (`GSFS0008`).
+- **CRC** - Cyclic Redundancy Check: the checksum guarding superblocks, directories, and data blocks.
+
+### Networking
+
+- **TCP / UDP** - the transport protocols. **ICMP** carries ping. **ARP** resolves an IP to a MAC.
+  **DHCP** leases an address; **DNS** resolves names.
+
+### Tooling
+
+- **QEMU** - the emulator used for development. **TCG** is its software (no-virtualisation) engine;
+  **KVM** is hardware-accelerated virtualisation.
+- **SDK** - `sdk/rust`, the crate every service links against.
+- **POSIX** - the Unix interface standard GodspeedOS deliberately does **not** implement (section 2.2,
+  Appendix B.3).

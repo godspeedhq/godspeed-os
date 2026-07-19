@@ -1,0 +1,20 @@
+/* Glossary acronym links (see website/glossary-abbr.py).
+   The first occurrence of a glossary acronym on a page is wrapped as
+   <a class="gs-abbr"><abbr title="...">, so it is hoverable for the meaning and
+   clickable for the full entry. Styled to hint "there is more here" without
+   shouting: it keeps the body text colour, and only a dotted underline plus a
+   help cursor mark it, so dense prose does not turn into a wall of blue links. */
+.gs-abbr,
+.gs-abbr:visited {
+    color: inherit;
+    text-decoration: none;
+}
+.gs-abbr abbr[title] {
+    text-decoration: underline dotted;
+    text-underline-offset: 0.15em;
+    cursor: help;
+    border-bottom: none; /* some UAs add their own; keep one underline, not two */
+}
+.gs-abbr:hover abbr[title] {
+    text-decoration-style: solid;
+}

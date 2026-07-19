@@ -21,6 +21,8 @@ git-repository-url = "https://github.com/godspeedhq/godspeed-os"
 # absolute references resolve against that base. If a custom domain at root is added
 # later, change this to "/".
 site-url = "/godspeed-os/"
+# Styling for the glossary acronym links injected by glossary-abbr.py.
+additional-css = ["gs-abbr.css"]
 # edit-url is deliberately omitted: the included pages are {{#include}} stubs, so an
 # "edit this page" link would point at the stub, not the real source. The repo link
 # (git-repository-url, above) is enough.
@@ -35,3 +37,11 @@ level = 1
 [preprocessor.godspeed-links]
 command = "python link-fixup.py"
 after = ["links"]
+
+# Link each glossary acronym (IOMMU, xHCI, TSC, ...) to its entry and give it a hover
+# tooltip, so a reader meeting one mid-sentence does not have to leave the page. Terms come
+# from GLOSSARY.md itself, so the vocabulary lives in one place and cannot drift. Runs after
+# the link pass, on already-expanded {{#include}} content. See website/glossary-abbr.py.
+[preprocessor.godspeed-abbr]
+command = "python glossary-abbr.py"
+after = ["links", "godspeed-links"]
