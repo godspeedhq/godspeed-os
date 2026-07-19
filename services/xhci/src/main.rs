@@ -1603,12 +1603,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 // movement (looks like a freeze under a scrolling framebuffer). When a real
                                 // mouse consumer exists, wire it into these callbacks instead of logging.
                                 mouse[d].feed(&rep, |_mask, _down| {}, |_dx, _dy| {});
+                            } else if godspeed_sdk::hid::is_ctrl_alt_del(&rep) {
+                                // SEC-2 follow-up: this driver holds no REBOOT and never resets the
+                                // machine itself. It only SIGNALS the chord on the console stream;
+                                // the shell - which legitimately holds REBOOT - decides. That keeps
+                                // what SEC-2 won (no direct reboot syscall from a driver, in any
+                                // context) while restoring the UX, and grants the driver nothing
+                                // new: a CONSOLE_PUSH holder can already type `reboot` (§6.4).
+                                ctx.console_push(godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL);
                             } else {
-                                // SEC-2: this driver no longer holds REBOOT and does not reboot
-                                // directly. A compromised USB driver must not be able to hard-reset
-                                // the machine from any context; reboot authority lives only with the
-                                // shell (its `reboot` command). Ctrl+Alt+Del is decoded as ordinary
-                                // keystrokes below, like any other key.
                                 godspeed_sdk::hid::decode_keyboard(
                                     &rep, &mut kb_last[d], &mut kb_rep[d], &mut kb_caps[d], ctx.read_tsc(),
                                     |ch| ctx.console_push(ch),

@@ -270,6 +270,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let b = ctx.console_read();
 
         match b {
+            // Ctrl+Alt+Del (the SEC-2 follow-up). The USB driver cannot reboot - SEC-2 took REBOOT
+            // away from it - so it only SIGNALS the chord on the console stream. The decision is
+            // made HERE because the shell is the principal that legitimately holds REBOOT. This
+            // restores the chord's UX without handing the driver back a direct reset from any
+            // context, which is what SEC-2 actually removed. The signal byte is outside ASCII, so
+            // no typed key produces it, and the chord is a deliberate three-key combination.
+            godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL => {
+                ctx.console_write("\r\n");
+                cmd_reboot(&ctx);
+            }
             b'\r' | b'\n' => {
                 // We own echo now, so move to a fresh line ourselves (the kernel used
                 // to echo the Enter as "\r\n").

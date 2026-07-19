@@ -239,6 +239,20 @@ pub const KEY_CAPS_LOCK: u8 = 0x39;
 /// true, issues the reboot syscall. Because reboot does not return, no edge-tracking is needed
 /// (the first detection reboots). Apply this ONLY to keyboard reports: a mouse boot report's
 /// button byte (byte 0) can alias the Ctrl/Alt modifier bits, so it must never be tested here.
+/// Console-stream signal for the Ctrl+Alt+Del secure-attention chord (the SEC-2 follow-up).
+///
+/// SEC-2 removed `REBOOT` from the USB drivers, so a driver can no longer hard-reset the machine
+/// directly from any context. To keep the chord working, the driver does not reboot - it *signals*
+/// the chord on the console stream, and the **shell**, which legitimately holds `REBOOT`, decides.
+/// That preserves what SEC-2 actually won (no direct reboot syscall from a driver) while restoring
+/// the UX, and it grants the driver nothing new: a `CONSOLE_PUSH` holder can already type `reboot`,
+/// the residual §6.4 documents.
+///
+/// `0x80` is outside ASCII, so [`hid_to_ascii`] never emits it and it cannot collide with a typed
+/// key. Both the drivers (producer) and the shell (consumer) read it from here, so the two cannot
+/// drift apart.
+pub const CTRL_ALT_DEL_SIGNAL: u8 = 0x80;
+
 pub fn is_ctrl_alt_del(report: &[u8; 8]) -> bool {
     if report[1] != 0 { return false; }                  // reserved byte ≠ 0 → invalid/stale report
     let mods = report[0];
