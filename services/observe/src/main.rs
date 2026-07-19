@@ -184,7 +184,14 @@ fn print_state(
     ctx.console_line_fmt(live, format_args!("{}TASK scheduler slot | NAME service name | CORE cpu core | STATE task state", p));
     ctx.console_line_fmt(live, format_args!("{}MEM_USED/LIMIT/% memory in use (binary+stack+alloc) / limit / % of limit", p));
     ctx.console_line_fmt(live, format_args!("{}RESTARTS deaths recovered (not clean re-runs) | QUEUE/LIMIT inbound depth / max", p));
-    ctx.console_line_fmt(live, format_args!("{}CPU% core share since last snapshot | UPTIME since the service last (re)started", p));
+    // CPU%'s WINDOW differs by mode, so the legend must say which one you are reading. A one-shot
+    // (`observe now`, and the parting snapshot after `q`) starts with zero baselines, so every
+    // delta is measured against boot - a lifetime average, not "right now". The live view carries
+    // its baselines across frames, so there it genuinely is the last interval. Printing one fixed
+    // label for both made the snapshot claim a window it does not measure (§26.7 - the reader must
+    // never have to guess), which is what makes a long-idle service read as ~99% on the way out.
+    let window = if ctx.probe_mode() == MODE_NOW { "since boot" } else { "since last snapshot" };
+    ctx.console_line_fmt(live, format_args!("{}CPU% core share {} | UPTIME since the service last (re)started", p, window));
 
     // --- System summary ---
     ctx.console_line_fmt(live, format_args!("{}------------------------- system state ({} live) -------------------------", p, live_count));

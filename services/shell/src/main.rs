@@ -5,6 +5,12 @@
 use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError, ReqOutcome};
 use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, AggErr, REC_MAX_ROWS, REC_ARENA};
 
+/// Per-iteration sleep for the muted loop (a foreground app owns the console), in TSC cycles
+/// (~30 ms at 2 GHz; QEMU's 1-tick fallback makes it ~one quantum). Matches the `observe` q-poll
+/// cadence - long enough that the core halts between checks, short enough that regaining the
+/// keyboard reprints the prompt with no perceptible delay.
+const MUTED_POLL_SLEEP_CYCLES: u64 = 60_000_000;
+
 const MAX_LINE: usize = 128;
 const MAX_ARGS: usize = 4;
 
@@ -256,12 +262,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut muted = false;
 
     loop {
-        // Muted: a foreground app owns the console. Yield + skip - don't draw, don't blocking-read. The
+        // Muted: a foreground app owns the console. Sleep + skip - don't draw, don't blocking-read. The
         // Phase-1 kernel gate only covers the non-blocking poll, so THIS loop gate is what keeps the
-        // main (blocking) read path from stealing the foreground app's `q`. v1 busy-yields while muted;
-        // park + wake-on-release is a later optimization.
+        // main (blocking) read path from stealing the foreground app's `q`. We SLEEP rather than
+        // busy-yield: the trigger is `chaos` (max-carnage / kill-storm), which holds the console for the
+        // WHOLE run, so a yield-loop pegged this core for minutes at a stretch. Worse, `yield_cpu`
+        // increments CORE_TOTAL_TICKS, so the spin inflated the very denominator every CPU% is divided
+        // by - the observer distorting what it observes. Park + wake-on-release is still the endgame;
+        // this is the cheap 99% of it. Regain latency stays one sleep, imperceptible at the prompt.
         if !ctx.is_console_foreground() {
-            ctx.yield_cpu();
+            ctx.sleep(MUTED_POLL_SLEEP_CYCLES);
             muted = true;
             continue;
         }
