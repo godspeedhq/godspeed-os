@@ -97,6 +97,18 @@ const HUB_POLL_CYCLES: u64 = 1_000_000_000;
 /// hub. A device replugged BEHIND a hub changes no root PORTSC, so the root-port wait would miss it;
 /// re-walking every ~1.5 s catches a back-port (re)connect. Only runs while NO HID is bound.
 const HUB_RESCAN_CYCLES: u64 = 3_000_000_000;
+
+/// Idle-wait pacing for the paths that have NO device to service (`idle`, `wait_for_port`, the hub
+/// re-walk). These used `yield_cpu`, which does not sleep - it pegs the core at ~100% forever, which
+/// is exactly what showed up as ~85k scheduler quanta/s on the T630 (its keyboard is on ehci, so
+/// xhci sits here permanently). `sleep` PARKS the task instead: the core can halt, and with the
+/// Phase 2a idle-tick slowdown it can also stretch its timer.
+///
+/// This deliberately keeps the SELF-DRIVEN poll these loops were built around - we still `try_recv`
+/// on our own schedule and need no cross-core wake, so the flood-storm drain property the previous
+/// comments relied on is preserved (a deeply-blocked `recv` on an AP was the unreliable part, and we
+/// still never do that). Granularity is one scheduler quantum, so this value only sets a floor.
+const IDLE_WAIT_CYCLES: u64 = 10_000_000;
 const DEV_BASE: usize = 0x7000;
 const DEV_STRIDE: usize = 0x4000; // 4 pages: device ctx, EP0 ring, int ring, report
 fn device_ctx_off(i: usize) -> usize { DEV_BASE + i * DEV_STRIDE }
@@ -224,7 +236,7 @@ fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
         // flood-storm (or any stray send) fills our 16-deep queue and it sits at 16/16 FOREVER, exactly
         // the logger stub bug in another guise. try_recv is non-blocking, so the port poll is unaffected.
         while ctx.try_recv().is_some() {}
-        ctx.yield_cpu();
+        ctx.sleep(IDLE_WAIT_CYCLES);
     }
 }
 
@@ -255,7 +267,7 @@ fn idle(ctx: &ServiceContext) -> ! {
     // on an AP is unreliable under QEMU TCG (the drain flaked in the flood-storm pin); the self-driven poll
     // drains every quantum with no wake needed (mirrors wait_for_port above + ehci idle_draining). Pinned by
     // the shell-test `chaos flood-storm xhci` step (xhci has no controller in QEMU, so it sits in this path).
-    loop { while ctx.try_recv().is_some() {} ctx.yield_cpu(); }
+    loop { while ctx.try_recv().is_some() {} ctx.sleep(IDLE_WAIT_CYCLES); }
 }
 
 /// Poll the event ring for the next event TRB. Returns (trb_type, completion,
@@ -1434,7 +1446,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                     if new_root { break; } // a front/root-port device appeared - re-walk now
                     if ctx.read_tsc().wrapping_sub(t0) >= HUB_RESCAN_CYCLES { break; } // periodic re-walk
-                    ctx.yield_cpu();
+                    ctx.sleep(IDLE_WAIT_CYCLES);
                 }
                 announce = true; // whatever we bind on the re-walk is a real plug event
                 continue 'reenum;
@@ -1603,12 +1615,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 // movement (looks like a freeze under a scrolling framebuffer). When a real
                                 // mouse consumer exists, wire it into these callbacks instead of logging.
                                 mouse[d].feed(&rep, |_mask, _down| {}, |_dx, _dy| {});
+                            } else if godspeed_sdk::hid::is_ctrl_alt_del(&rep) {
+                                // SEC-2 follow-up: this driver holds no REBOOT and never resets the
+                                // machine itself. It only SIGNALS the chord on the console stream;
+                                // the shell - which legitimately holds REBOOT - decides. That keeps
+                                // what SEC-2 won (no direct reboot syscall from a driver, in any
+                                // context) while restoring the UX, and grants the driver nothing
+                                // new: a CONSOLE_PUSH holder can already type `reboot` (§6.4).
+                                ctx.console_push(godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL);
                             } else {
-                                // SEC-2: this driver no longer holds REBOOT and does not reboot
-                                // directly. A compromised USB driver must not be able to hard-reset
-                                // the machine from any context; reboot authority lives only with the
-                                // shell (its `reboot` command). Ctrl+Alt+Del is decoded as ordinary
-                                // keystrokes below, like any other key.
                                 godspeed_sdk::hid::decode_keyboard(
                                     &rep, &mut kb_last[d], &mut kb_rep[d], &mut kb_caps[d], ctx.read_tsc(),
                                     |ch| ctx.console_push(ch),

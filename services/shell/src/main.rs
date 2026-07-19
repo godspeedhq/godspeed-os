@@ -5,6 +5,12 @@
 use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError, ReqOutcome};
 use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, AggErr, REC_MAX_ROWS, REC_ARENA};
 
+/// Per-iteration sleep for the muted loop (a foreground app owns the console), in TSC cycles
+/// (~30 ms at 2 GHz; QEMU's 1-tick fallback makes it ~one quantum). Matches the `observe` q-poll
+/// cadence - long enough that the core halts between checks, short enough that regaining the
+/// keyboard reprints the prompt with no perceptible delay.
+const MUTED_POLL_SLEEP_CYCLES: u64 = 60_000_000;
+
 const MAX_LINE: usize = 128;
 const MAX_ARGS: usize = 4;
 
@@ -256,12 +262,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut muted = false;
 
     loop {
-        // Muted: a foreground app owns the console. Yield + skip - don't draw, don't blocking-read. The
+        // Muted: a foreground app owns the console. Sleep + skip - don't draw, don't blocking-read. The
         // Phase-1 kernel gate only covers the non-blocking poll, so THIS loop gate is what keeps the
-        // main (blocking) read path from stealing the foreground app's `q`. v1 busy-yields while muted;
-        // park + wake-on-release is a later optimization.
+        // main (blocking) read path from stealing the foreground app's `q`. We SLEEP rather than
+        // busy-yield: the trigger is `chaos` (max-carnage / kill-storm), which holds the console for the
+        // WHOLE run, so a yield-loop pegged this core for minutes at a stretch. Worse, `yield_cpu`
+        // increments CORE_TOTAL_TICKS, so the spin inflated the very denominator every CPU% is divided
+        // by - the observer distorting what it observes. Park + wake-on-release is still the endgame;
+        // this is the cheap 99% of it. Regain latency stays one sleep, imperceptible at the prompt.
         if !ctx.is_console_foreground() {
-            ctx.yield_cpu();
+            ctx.sleep(MUTED_POLL_SLEEP_CYCLES);
             muted = true;
             continue;
         }
@@ -270,6 +280,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let b = ctx.console_read();
 
         match b {
+            // Ctrl+Alt+Del (the SEC-2 follow-up). The USB driver cannot reboot - SEC-2 took REBOOT
+            // away from it - so it only SIGNALS the chord on the console stream. The decision is
+            // made HERE because the shell is the principal that legitimately holds REBOOT. This
+            // restores the chord's UX without handing the driver back a direct reset from any
+            // context, which is what SEC-2 actually removed. The signal byte is outside ASCII, so
+            // no typed key produces it, and the chord is a deliberate three-key combination.
+            godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL => {
+                ctx.console_write("\r\n");
+                cmd_reboot(&ctx);
+            }
             b'\r' | b'\n' => {
                 // We own echo now, so move to a fresh line ourselves (the kernel used
                 // to echo the Enter as "\r\n").
@@ -1213,7 +1233,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "about"   => cmd_about(ctx, out),
         "version" => cmd_version_os(ctx, out),
         "mem"     => cmd_mem(ctx, out),
-        "cores"   => cmd_cores(ctx, out),
+        "cores"   => cmd_cores(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "net"     => cmd_net(ctx, s["net".len()..].trim(), out),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
@@ -3803,8 +3823,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "mem" => help_block(ctx, "mem", "physical memory usage", &[
             ("mem", "used / total / free physical memory", "mem"),
         ], true),
-        "cores" => help_block(ctx, "cores", "CPU core count", &[
+        "cores" => help_block(ctx, "cores", "CPU core count + timer-tick rate", &[
             ("cores", "how many CPU cores are up", "cores"),
+            ("cores ticks", "each core's timer ticks/s (5s RTC-paced sample)", "cores ticks"),
         ], true),
         "date" => help_block(ctx, "date", "date + time from the hardware clock", &[
             ("date", "full timestamp (weekday date time)", "date"),
@@ -4473,8 +4494,61 @@ fn cmd_reboot(ctx: &ServiceContext) -> ! {
     ctx.reboot()
 }
 
-fn cmd_cores(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
-    out.line_fmt(ctx, format_args!("cores: {}", ctx.inspect_core_count()));
+/// `cores` - how many cores are up. `cores ticks` - each core's SCHEDULER-QUANTUM rate.
+///
+/// The counter (`CORE_TOTAL_TICKS`) advances on a timer tick **and** on every `yield`, so for an
+/// idle core it reads as the timer rate, while a busy-polling service reads as its loop rate. That
+/// conflation is a feature here: it is exactly what exposed xhci pegging a core at ~85k/s on the
+/// T630 while the truly idle cores sat at 0.
+///
+/// The rate form is how the Phase 2a idle-tick slowdown (`docs/power.md` §14) is *measured* rather
+/// than assumed: an idle AP re-arms its timer at a long interval, so it should read far lower than
+/// the BSP, which deliberately keeps the normal period as the timed-wake/console heartbeat. A core
+/// running a busy-poll driver (e.g. `ehci`) never idles, so it reads at the full rate - which makes
+/// this a direct, side-by-side read of what still costs power.
+///
+/// Paced by the RTC (`epoch_secs_monotonic`), never the TSC: this hardware's TSC-Hz calibration is
+/// unreliable, so a cycle-based interval would report a confidently wrong rate. It `sleep`s between
+/// polls rather than spinning, so the measurement does not perturb what it is measuring.
+fn cmd_cores(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+    let n = ctx.inspect_core_count();
+    if arg != "ticks" {
+        out.line_fmt(ctx, format_args!("cores: {}", n));
+        return Ok(());
+    }
+
+    const MAXC: usize = 16;
+    const SAMPLE_SECS: i64 = 5;
+    let ncores = (n as usize).min(MAXC);
+    let mut before = [0u64; MAXC];
+    for c in 0..ncores {
+        before[c] = ctx.inspect_core_total_ticks(c as u32);
+    }
+    let t0 = ctx.epoch_secs_monotonic();
+    out.line_fmt(ctx, format_args!("sampling {}s (RTC-paced)...", SAMPLE_SECS));
+    while ctx.epoch_secs_monotonic() - t0 < SAMPLE_SECS {
+        ctx.sleep(1); // granularity is one scheduler quantum; parks instead of spinning
+    }
+    let elapsed = (ctx.epoch_secs_monotonic() - t0).max(1) as u64;
+
+    // Show the raw sampled count alongside the rate: a slowed idle core can tick below 1/s, which
+    // integer division would flatten to a bare "0" and hide the very signal being measured.
+    out.line(ctx, "core  quanta/s  sampled   (quantum = timer tick OR yield)");
+    for c in 0..ncores {
+        let delta = ctx
+            .inspect_core_total_ticks(c as u32)
+            .saturating_sub(before[c]);
+        out.line_fmt(
+            ctx,
+            format_args!(
+                "  C{}   {:>5}   {:>5}{}",
+                c,
+                delta / elapsed,
+                delta,
+                if c == 0 { "   (BSP - keeps the normal period)" } else { "" }
+            ),
+        );
+    }
     Ok(())
 }
 
@@ -6263,7 +6337,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "version"      => { let _ = cmd_version_os(ctx, out); }
         "whatis"       => { let _ = cmd_whatis(ctx, arg, out); }
         "mem"          => { let _ = cmd_mem(ctx, out); }
-        "cores"        => { let _ = cmd_cores(ctx, out); }
+        "cores"        => { let _ = cmd_cores(ctx, "", out); }
         "date"         => { let _ = cmd_date(ctx, arg, out); }
         "net"          => { let _ = cmd_net(ctx, arg, out); }
         "ping"         => { let _ = cmd_ping(ctx, arg, out); }

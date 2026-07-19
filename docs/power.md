@@ -1,8 +1,23 @@
 # Power and Idle Efficiency
 
-> **Status:** Design note, active on `feat/power-efficiency`. Non-normative until any part
-> lands as an amendment. Records the strategy for reducing CPU/power draw without hurting
-> latency or robustness. Companion to the implementation work on this branch.
+> **Status:** SHIPPED in v0.7.0 (Phases 1a, 1b, 2a). Non-normative - it records strategy and
+> measurement, not law. Reducing CPU/power draw without hurting latency or robustness.
+>
+> **Result (hardware, 2026-07-19).** Every busy-spinning service is gone. On the T630 the idle
+> reading went from two cores pegged at 100% to `C0 82 / C1 0 / C2 82 / C3 84` quanta/s, and on
+> the Wyse `xhci` fell from 100% to ~0%. Validation: identity 24/24; `chaos max-carnage` 882
+> deaths on the T630 and 66 on the Wyse, all recovered, zero panics / page faults / liveness
+> wedges; `selfcheck` 349 pass / 0 fail on both machines, before *and* after the storm. Crucially
+> the slow-idle path **re-engages after the storm** (C1 back to 0), so the tick slowdown is not a
+> one-shot boot-time state.
+>
+> **What is deliberately NOT done:** the BSP still ticks at the normal rate (it owns
+> `MONOTONIC_TICKS`, `scan_timed_wakes`, and polled UART RX) - see §14.4, Phase 2b. `observe`'s
+> live repaint is transmit-bound at 115200 baud, measured at ~87 us of THRE spin per byte and
+> confirmed linear (halving the frame rate halved its CPU, 28% -> 14%); the fix is frame-diffing
+> plus interrupt-driven UART TX, and it belongs with Phase 2b. On firmware-locked Goldmont+ parts
+> (`idle: cores may halt = false`) the slowdown is correctly inert - those cores spin regardless,
+> so slowing their tick would cost wake latency and save nothing.
 
 ## 1. The problem
 
@@ -206,7 +221,20 @@ two controllers are different problems:
    busy-poll only while a key is held (auto-repeat); a slow watchdog wake keeps hot-plug detection
    alive. Judge by `observe` (100% -> ~0% at rest) and **hardware typing feel** - QEMU timing lies,
    so the T630/Wyse are the sole judges. The Wyse (xHCI only, no EHCI) gets the full win here.
-2. **Phase 1b - EHCI: DEFERRED (needs a from-scratch periodic-schedule engine; see §13).** The
+2. **Phase 1b - EHCI: DONE, but NOT the way this section predicted (2026-07-19).** The verdict
+   below stands on its own terms and is left intact because the reasoning is still correct: making
+   EHCI genuinely *interrupt-driven* does need a from-scratch periodic-schedule engine, and that
+   remains unbuilt. What the verdict missed is that the **power** goal never required it. Needing
+   to POLL is not the same as needing to SPIN. Replacing `yield_cpu()` with `ctx.sleep()` at the
+   three idle sites dropped `ehci` from 216,810 to 84 quanta/s (~2,600x) with continuous key-repeat
+   intact - a handful of lines, no new engine. The earlier "cool-c1" sleep-poll attempt failed only
+   because `sleep`'s floor was an uncalibrated ~1 s quantum on this machine; once the APIC/TSC PIT
+   calibration landed, the cheap fix simply worked. Lesson worth keeping: when an expensive
+   mechanism is deferred, re-check whether the *goal* still needs it. The periodic engine is still
+   the answer for EHCI *latency*; it was never the answer for EHCI *power*.
+
+   The original (still-accurate) analysis of why interrupt-driven EHCI is hard:
+   **DEFERRED (needs a from-scratch periodic-schedule engine; see §13).** The
    investigation found the keyboard sits on EHCI's ASYNC schedule and the PERIODIC schedule is
    entirely absent, so a blocked driver cannot wake - hardware-confirmed on the T630. Interrupt-driven
    EHCI requires building periodic split-interrupt scheduling from scratch (§13): a medium-to-large

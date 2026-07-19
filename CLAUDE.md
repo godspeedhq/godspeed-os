@@ -426,9 +426,19 @@ official, not the runtime behaviour.
 > shell's trust perimeter** - IOMMU confinement bounds the driver's *DMA*, not its console-injection
 > authority. What the code *can* do is deny the driver any authority it does not need for that role:
 > SEC-2 removed **`REBOOT`** from the USB drivers, so a compromised driver can no longer hard-reset the
-> machine directly from any context - reboot lives only with the shell (its `reboot` command;
-> Ctrl+Alt+Del is now decoded as ordinary keystrokes). The residual (a keyboard can type) is inherent
-> to being a keyboard, and is recorded here rather than papered over. `docs/security-audit.md` SEC-2.
+> machine directly from any context - reboot lives only with the shell (its `reboot` command). The
+> residual (a keyboard can type) is inherent to being a keyboard, and is recorded here rather than
+> papered over. `docs/security-audit.md` SEC-2.
+>
+> **Amendment 2026-07-19 (SEC-2 follow-up): Ctrl+Alt+Del is restored, routed through the shell.** The
+> chord initially became ordinary keystrokes, which removed a familiar affordance. It now works again
+> without giving the driver back anything: the USB driver only **signals** the chord on the console
+> stream (`hid::CTRL_ALT_DEL_SIGNAL`, a byte outside ASCII that no typed key produces) and the
+> **shell** - the principal that legitimately holds `REBOOT` - makes the decision. What SEC-2 actually
+> won is intact: a driver still cannot issue the reboot syscall, in any context, even when no shell is
+> listening. And it grants the driver no new authority, because a `CONSOLE_PUSH` holder could already
+> type `reboot` - the residual named just above. Scope: the chord is handled at the shell prompt; while
+> a full-screen app owns the console the shell is not reading, so quit it first.
 
 ---
 

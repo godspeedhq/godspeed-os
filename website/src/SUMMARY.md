@@ -19,6 +19,7 @@
 - [Persistence and the filesystem](design/persistence.md)
 - [AHCI block driver](design/ahci.md)
 - [IOMMU and DMA confinement](design/iommu.md)
+- [Power and idle efficiency](design/power.md)
 - [Naming out of the kernel](design/naming.md)
 - [Typed pipes](design/pipes.md)
 - [Records](design/records.md)

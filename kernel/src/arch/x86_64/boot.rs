@@ -167,6 +167,7 @@ const APIC_EOI:          u64 = 0x0B0;
 const APIC_SPURIOUS:     u64 = 0x0F0;
 const APIC_LVT_TIMER:    u64 = 0x320;
 const APIC_TIMER_INIT:   u64 = 0x380;
+const APIC_TIMER_CURRENT: u64 = 0x390;
 const APIC_TIMER_DIVIDE: u64 = 0x3E0;
 
 // TSC-Deadline timer MSR (IA32_TSC_DEADLINE).  Writing a 64-bit TSC value
@@ -181,6 +182,18 @@ pub static TSC_DEADLINE_MODE: AtomicBool = AtomicBool::new(false);
 
 /// TSC ticks per 10 ms quantum.  Set once during BSP boot; read by every core.
 static TSC_TICKS_PER_QUANTUM: AtomicU64 = AtomicU64::new(0);
+
+/// Calibrated LAPIC periodic-timer initial count for one ~10 ms quantum, or 0 if calibration was
+/// unavailable (then `PERIODIC_TIMER_COUNT` is used). Measured once on the BSP against the PIT; APs
+/// read the stored value.
+///
+/// This exists because the periodic period is `init_count * divisor / f_apic`, and `f_apic` is
+/// machine-dependent, so no single hardcoded count can be right everywhere. The previous fixed
+/// 6_250_000 yields ~100 ms on QEMU (1 GHz APIC clock) but ~1 s on the T630 (~100 MHz) - 100x the
+/// intended 10 ms quantum. That coarse quantum is what made `sleep` bottom out near a second,
+/// preemption land ~1 s apart, and every timed wake (`recv_timeout`, hot-plug, auto-repeat) equally
+/// coarse on that machine.
+static PERIODIC_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Diagnostic exception flags - set as the very first action inside each
@@ -349,13 +362,25 @@ pub unsafe fn init_local_apic() {
     // with the quantum uncalibrated (0) and cycles_to_ticks uses its 1-tick fallback exactly as before -
     // deliberately NOT calibrated on QEMU: its tick clock runs ~10 Hz, so an accurate quantum would make
     // recv_timeout deadlines ~10x too long. The wrong value only ever existed in the TSC-Deadline path.
-    let tsc_ticks = if tsc_deadline_supported {
+    // NOW CALIBRATED ON EVERY MACHINE, not only in TSC-Deadline mode. The paragraph above described
+    // why it used to be skipped in periodic mode: the quantum there was an uncalibrated ~100 ms
+    // (QEMU) / ~1 s (T630) while this value describes 10 ms, so an "accurate" figure made every
+    // cycles_to_ticks conversion wrong. The periodic timer is now PIT-calibrated to a true ~10 ms
+    // (see PERIODIC_TIMER_TICKS), so the two finally agree and calibrating always is the correct
+    // thing rather than a hazard.
+    //
+    // This also repairs what silently depended on it. `KeyRepeat::new_calibrated` derives its
+    // ~600 ms initial delay and ~50 ms typematic interval from `tsc_ticks_per_10ms()`; returning 0
+    // collapsed both to zero, so a held key repeated on EVERY wake - which read as choppy while the
+    // quantum was ~1 s, and would have become a ~100/s character spam once the quantum was fixed.
+    let tsc_ticks = {
         let existing = TSC_TICKS_PER_QUANTUM.load(Ordering::Relaxed);
         // SAFETY: ring-0; interrupts are disabled during early per-core init.
         if existing > 0 { existing } else { unsafe { calibrate_tsc_ticks_per_10ms(lapic_id) } }
-    } else {
-        0
     };
+    if tsc_ticks > 0 {
+        TSC_TICKS_PER_QUANTUM.store(tsc_ticks, Ordering::Relaxed);
+    }
 
     if tsc_deadline_supported && tsc_ticks > 0 {
         // TSC-Deadline mode: LVT bits[18:17] = 10b (mode 2), vector 0x20. No DIVIDE/INIT in this mode.
@@ -368,16 +393,32 @@ pub unsafe fn init_local_apic() {
         TSC_DEADLINE_MODE.store(true, Ordering::Relaxed);
         crate::kprintln!("apic: core {} TSC-Deadline timer ({} ticks/quantum)", lapic_id, tsc_ticks);
     } else {
-        // Periodic mode: fires every ~10 ms regardless of C-states. QEMU's normal path (no TSC-Deadline).
+        // Periodic mode, CALIBRATED against the PIT (the BSP measures once; APs reuse the stored
+        // value, exactly like the TSC path). The period is init_count * divisor / f_apic and f_apic
+        // is machine-dependent, so the previous hardcoded count could not be right everywhere: it
+        // gave ~100 ms on QEMU (1 GHz APIC clock) but ~1 s on the T630 (~100 MHz) - 100x the intended
+        // 10 ms quantum, which is what made `sleep` bottom out near a second, preemption land ~1 s
+        // apart, and every timed wake equally coarse there. Falls back to the fixed count if the
+        // measurement is unavailable or implausible, so a dead PIT degrades rather than misprograms.
+        let measured = {
+            let existing = PERIODIC_TIMER_TICKS.load(Ordering::Relaxed);
+            if existing > 0 { existing } else { pit_calibrate_apic_ticks_per_10ms(apic_virt) }
+        };
+        let init = if measured > 0 {
+            PERIODIC_TIMER_TICKS.store(measured, Ordering::Relaxed);
+            measured as u32
+        } else {
+            PERIODIC_TIMER_COUNT
+        };
         write_apic(apic_virt, APIC_LVT_TIMER, (1 << 17) | 0x20);
         write_apic(apic_virt, APIC_TIMER_DIVIDE, 0x03);
-        // ~100 ms at 1 GHz APIC bus / 16 divider (QEMU); ~50 ms on AMD GX-420GI (Jaguar). 10x from
-        // 625_000 broke the timer-ISR cascade on AMD where verbose diagnostics (~18 ms) exceeded the
-        // prior 5 ms period.
-        write_apic(apic_virt, APIC_TIMER_INIT, 6_250_000);
-        if tsc_deadline_supported {
-            crate::kprintln!("apic: core {} periodic timer (TSC calibration unavailable)", lapic_id);
-        }
+        write_apic(apic_virt, APIC_TIMER_INIT, init);
+        crate::kprintln!(
+            "apic: core {} periodic timer, init={} ({})",
+            lapic_id,
+            init,
+            if measured > 0 { "PIT-calibrated ~10ms" } else { "uncalibrated fallback" }
+        );
     }
 
     // Apply the package C-state limit (keeps the APIC powered on Intel), and THEN decide whether idle
@@ -509,6 +550,66 @@ unsafe fn calibrate_tsc_ticks_per_10ms(lapic_id: u32) -> u64 {
 /// # Safety
 /// Ring-0 only. Interrupts disabled. Uses PIT channel 2 (data 0x42, command 0x43) and control port 0x61;
 /// channel 0 (the legacy tick) is untouched. Saves and restores 0x61.
+/// Measure the LAPIC timer against the PIT and return the periodic initial count for one ~10 ms
+/// quantum, or 0 if the measurement is unavailable or implausible (the caller then keeps the
+/// `PERIODIC_TIMER_COUNT` fallback).
+///
+/// The period is `init_count * divisor / f_apic`, and `f_apic` is machine-dependent, so a hardcoded
+/// count cannot be right everywhere - see `PERIODIC_TIMER_TICKS`. The PIT is the portable ground
+/// truth here exactly as it is for the TSC.
+///
+/// The timer LVT is **masked** for the measurement so calibration cannot deliver an interrupt, and
+/// one-shot mode is used so the counter cannot wrap: 0xFFFF_FFFF ticks is far more than a 50 ms
+/// window costs even at a 2 GHz APIC clock (~6.25M ticks after the /16 divider).
+///
+/// # Safety
+/// Ring-0 only; the local APIC must be mapped at `apic_virt`. Touches PIT ports 0x42/0x43/0x61 and
+/// the APIC timer registers, and leaves the timer masked and stopped - the caller reprograms
+/// LVT/DIVIDE/INIT afterwards.
+unsafe fn pit_calibrate_apic_ticks_per_10ms(apic_virt: u64) -> u64 {
+    const PIT_HZ: u64 = 1_193_182;
+    const CAL_MS: u64 = 50;
+    let count: u16 = ((PIT_HZ * CAL_MS) / 1000) as u16;
+
+    // Mask the timer (LVT bit 16) so no interrupt fires mid-calibration; divide by 16 to match the
+    // divider the periodic mode actually runs with, so the measured rate is directly usable.
+    write_apic(apic_virt, APIC_LVT_TIMER, (1 << 16) | 0x20);
+    write_apic(apic_virt, APIC_TIMER_DIVIDE, 0x03);
+
+    let saved_61 = inb(0x61);
+    outb(0x61, (saved_61 & 0xFC) | 0x01);
+    outb(0x43, 0b1011_0000);
+    outb(0x42, (count & 0xFF) as u8);
+    // Start the APIC countdown immediately before the PIT's high byte starts its countdown, so the
+    // two windows line up as closely as the port writes allow.
+    write_apic(apic_virt, APIC_TIMER_INIT, 0xFFFF_FFFF);
+    outb(0x42, (count >> 8) as u8);
+
+    let t0 = core::arch::x86_64::_rdtsc();
+    loop {
+        if inb(0x61) & 0x20 != 0 { break; }
+        // Same stuck-PIT guard as the TSC calibration: never hang boot on dead hardware.
+        if core::arch::x86_64::_rdtsc().wrapping_sub(t0) > 100_000_000_000 {
+            outb(0x61, saved_61);
+            return 0;
+        }
+    }
+    let current = read_apic(apic_virt, APIC_TIMER_CURRENT) as u64;
+    outb(0x61, saved_61);
+
+    let elapsed = 0xFFFF_FFFFu64.saturating_sub(current);
+    let per_10ms = elapsed / (CAL_MS / 10);   // 50 ms window -> one 10 ms quantum
+
+    // Plausibility gate. A real APIC clock is roughly 25 MHz .. 2 GHz, so a 10 ms quantum lands
+    // around 15k .. 1.25M ticks after the /16 divider. Reject anything outside a generous band
+    // rather than program a wild period: a count that is far too SMALL would make the timer fire
+    // faster than the ISR can complete, which is the cascade this file's periodic comment records.
+    if per_10ms < 10_000 || per_10ms > 4_000_000 {
+        return 0;
+    }
+    per_10ms
+}
+
 unsafe fn pit_calibrate_tsc_ticks_per_10ms() -> u64 {
     const PIT_HZ: u64 = 1_193_182;      // i8254 input clock
     const CAL_MS: u64 = 50;             // 50 ms window = 59_659 counts, well under the 16-bit max
@@ -584,6 +685,96 @@ pub unsafe fn rearm_tsc_deadline() {
     let ticks = TSC_TICKS_PER_QUANTUM.load(Ordering::Relaxed);
     // SAFETY: delegated to arm_tsc_deadline_now - same preconditions.
     unsafe { arm_tsc_deadline_now(ticks) };
+}
+
+/// Quantum multiplier for an IDLE core's timer in **TSC-Deadline** mode (Phase 2a,
+/// `docs/power.md` §14). MUST stay well under the liveness watchdog threshold (300 quanta, ~3 s) -
+/// the slow tick is what keeps stamping `CORE_LAST_TICK_TSC`, so an idle core still reads as alive
+/// and the watchdog needs no change.
+pub const IDLE_QUANTUM_MULT: u64 = 100;
+
+/// LAPIC periodic-timer initial count: the normal preemption period. ~50 ms on the AMD GX-420GI
+/// (T630), ~100 ms at 1 GHz APIC bus / 16 divider (QEMU). The APIC bus frequency is not calibrated,
+/// so the absolute period is machine-dependent - only the ratio below is under our control.
+const PERIODIC_TIMER_COUNT: u32 = 6_250_000;
+
+/// Multiplier for an IDLE core's **periodic** timer. Deliberately smaller than `IDLE_QUANTUM_MULT`
+/// because the periodic period is already far longer than a 10 ms quantum (~50 ms on the T630), so
+/// 20x lands the idle tick near ~1 s there (~2 s on QEMU) instead of an unhelpfully long ~5 s. The
+/// liveness watchdog is inactive in periodic mode (it is gated on a calibrated
+/// `TSC_TICKS_PER_QUANTUM`), so the binding constraint here is lost-wake recovery latency rather
+/// than the wedge threshold.
+const IDLE_PERIODIC_MULT: u32 = 20;
+
+/// The periodic-timer initial count actually in use: the PIT-calibrated ~10 ms quantum, or the
+/// fixed fallback if calibration was unavailable. Everything that reprograms the periodic timer
+/// reads this, so the idle/restore path can never disagree with what boot programmed.
+/// Initial count for a SLOWED (idle) periodic timer.
+///
+/// When the timer is PIT-calibrated the base really is ~10 ms, so 100 quanta lands the idle tick at
+/// ~1 s - the same target the TSC-Deadline path uses, and the value `docs/power.md` §14 designed
+/// for. Before calibration existed this used a small multiplier only because the base period was
+/// unknown and could already be ~1 s on some machines; that guard is kept for the uncalibrated
+/// fallback, where stretching by 100x could otherwise mean a minutes-long idle tick.
+fn idle_timer_count() -> u32 {
+    let calibrated = PERIODIC_TIMER_TICKS.load(Ordering::Relaxed);
+    if calibrated > 0 {
+        (calibrated as u32).saturating_mul(IDLE_QUANTUM_MULT as u32)
+    } else {
+        PERIODIC_TIMER_COUNT.saturating_mul(IDLE_PERIODIC_MULT)
+    }
+}
+
+fn periodic_timer_count() -> u32 {
+    let t = PERIODIC_TIMER_TICKS.load(Ordering::Relaxed);
+    if t > 0 { t as u32 } else { PERIODIC_TIMER_COUNT }
+}
+
+/// Re-arm this core's timer for the long IDLE interval (~1 s) instead of the normal preemption
+/// period (Phase 2a). Handles **both** timer modes:
+///  - **TSC-Deadline** (one-shot, software re-armed each tick): arm the next deadline
+///    `IDLE_QUANTUM_MULT` quanta out.
+///  - **Periodic** (hardware auto-reload): reprogram the LAPIC initial count, which restarts the
+///    countdown with the longer period; the hardware then keeps reloading it until restored.
+///
+/// Only ever called for a core that can `hlt` (enforced by the scheduler's idle path). That gate
+/// matters in periodic mode: a core that spins instead of halting would rewrite the initial count
+/// on every loop iteration, restarting the countdown forever so the timer never fires.
+///
+/// Safe per §18.5: writing a timer register is not memory-unsafe, and the only precondition is
+/// ordering (call from the steady-state scheduler loop) - a documented contract, not an unsafe one.
+pub fn rearm_idle_timer() {
+    if TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
+        let ticks = TSC_TICKS_PER_QUANTUM
+            .load(Ordering::Relaxed)
+            .saturating_mul(IDLE_QUANTUM_MULT);
+        // SAFETY: ring-0; TSC_DEADLINE_MODE=true implies the CPUID check passed and
+        // TSC_TICKS_PER_QUANTUM was set (both together in init_local_apic).
+        unsafe { arm_tsc_deadline_now(ticks) };
+    } else {
+        // SAFETY: ring-0; APIC_VIRT_BASE is valid after init_local_apic (the same pattern
+        // apic_send_eoi uses), and this writes THIS core's own LAPIC - no cross-core race.
+        unsafe {
+            write_apic(
+                APIC_VIRT_BASE,
+                APIC_TIMER_INIT,
+                idle_timer_count(),
+            )
+        };
+    }
+}
+
+/// Restore this core's timer to the normal preemption period after an idle wake (Phase 2a), so a
+/// task scheduled off that wake is preemptible on schedule rather than running until the idle
+/// deadline. Mirrors `rearm_idle_timer` across both timer modes.
+pub fn rearm_quantum_timer() {
+    if TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
+        // SAFETY: as `rearm_idle_timer` - ring-0, TSC-Deadline confirmed active.
+        unsafe { rearm_tsc_deadline() };
+    } else {
+        // SAFETY: as `rearm_idle_timer` - ring-0, this core's own LAPIC initial count.
+        unsafe { write_apic(APIC_VIRT_BASE, APIC_TIMER_INIT, periodic_timer_count()) };
+    }
 }
 
 /// TSC cycles per scheduler quantum (the timer period), or 0 before the local APIC timer is
@@ -908,6 +1099,16 @@ unsafe fn mask_pic() {
 }
 
 #[inline]
+/// Read a local-APIC register.
+///
+/// # Safety
+/// Ring-0 only; `base + reg` must be the mapped APIC MMIO address.
+#[inline]
+unsafe fn read_apic(base: u64, reg: u64) -> u32 {
+    // SAFETY: base + reg is the APIC MMIO address; volatile read is required.
+    unsafe { ((base + reg) as *const u32).read_volatile() }
+}
+
 unsafe fn write_apic(base: u64, reg: u64, val: u32) {
     // SAFETY: base + reg is the APIC MMIO address; volatile write is required.
     unsafe { ((base + reg) as *mut u32).write_volatile(val) };
