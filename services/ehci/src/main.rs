@@ -36,7 +36,7 @@ fn idle_draining(ctx: &ServiceContext) -> ! {
     // Drain by POLLING (try_recv), not a blocking recv: a cross-core flood that must WAKE a deeply-blocked
     // recv on an AP is unreliable under QEMU TCG (the drain flaked in the flood-storm pin); the self-driven
     // poll drains every quantum with no wake needed. Busy-yield is fine for this rare no-controller path.
-    loop { while ctx.try_recv().is_some() {} ctx.yield_cpu(); }
+    loop { while ctx.try_recv().is_some() {} ctx.sleep(POLL_SLEEP_CYCLES); }
 }
 
 #[no_mangle]
@@ -623,7 +623,7 @@ fn wait_for_connection(
         // Drain our IPC endpoint while we idle here with no HID attached (the active path drains in
         // poll_devices). Without it a flood-storm clogs our 16-deep queue permanently - see xhci.
         while ctx.try_recv().is_some() {}
-        ctx.yield_cpu();
+        ctx.sleep(POLL_SLEEP_CYCLES); // no HID attached: park, do not spin
     }
 }
 
@@ -842,7 +842,23 @@ fn poll_devices(
             }
             ctx.irq_unmask(EHCI_INT_VECTOR);
         }
-        ctx.yield_cpu();
+        // PACED POLL (was a bare `yield_cpu`). Everything above still holds: this controller's INTx
+        // will not drive a block-and-wake loop, so the driver must keep its own self-driven re-arm
+        // of the async schedule. But needing to POLL never meant needing to SPIN. `yield_cpu` does
+        // not sleep - it pegs the core at ~100%, and this core measured ~216k scheduler quanta/s,
+        // by far the hottest thing left in the system. `sleep` parks the task so the core can halt.
+        //
+        // Why this is safe NOW when the earlier sleep-poll attempt was not: `sleep` granularity is
+        // one scheduler quantum, and that quantum used to be an uncalibrated ~1 s on this machine,
+        // so the shortest possible sleep was a whole second - precisely the lag that got that
+        // attempt reverted. The APIC timer is now PIT-calibrated to a true ~10 ms, and ~10 ms is
+        // also the keyboard's bInterval, so the controller has at most one fresh report to hand us
+        // per pass: we are pacing to the hardware's own rate, not outrunning it.
+        //
+        // Residual to watch: a boot-protocol report is a state SNAPSHOT, so a press+release
+        // completed entirely inside one interval could be missed. Human presses last far longer
+        // than 10 ms, but fast typing is the thing to check on hardware.
+        ctx.sleep(POLL_SLEEP_CYCLES);
     }
 }
 
@@ -891,6 +907,12 @@ const OP_CONFIGFLAG: usize = 0x40;
 const INT_USB:        u32 = 1 << 0; // USB Interrupt (a transfer with IOC completed)
 const INT_PCD:        u32 = 1 << 2; // Port Change Detect (hot-plug)
 const STS_INT_BITS:   u32 = 0x3F;   // the six W1C interrupt-status bits (0..5)
+/// Pacing for every wait in this driver. `sleep` PARKS the task, so the core can halt between
+/// passes; `yield_cpu` (what these sites used) does not sleep at all - it spins the core at ~100%.
+/// Granularity is one scheduler quantum, so any non-zero value means "one quantum": ~10 ms now that
+/// the APIC timer is PIT-calibrated, which is also the keyboard's own bInterval.
+const POLL_SLEEP_CYCLES: u64 = 1;
+
 const EHCI_INT_VECTOR: u8 = 0x29;   // matches kernel interrupts::EHCI_MSI_VECTOR
 
 // Typematic auto-repeat is CALIBRATED per-machine from the TSC rate at keyboard-poll setup
