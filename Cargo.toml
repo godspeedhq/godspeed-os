@@ -37,7 +37,7 @@ members = [
 # that make up a release (kernel, osdev, sdk, and the shell that displays it) inherit
 # this with `version.workspace = true`, so a release bump is a one-line change here.
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 
 # kernel and all services/examples build for the bare-metal target;
 # osdev builds for the host. Use `cargo build -p osdev` for the host tool,
