@@ -198,7 +198,9 @@ two controllers are different problems:
 
 ## 12. Phasing (revised for the prior art)
 
-1. **Phase 1a - xHCI interrupt-driven, with IRQ-core co-location (this branch first).** The new
+1. **Phase 1a - xHCI interrupt-driven, with IRQ-core co-location. DONE + HW-VERIFIED (Wyse 5070,
+   2026-07-19: `observe` shows xhci `BlockRecv` at ~0% CPU, was 100%; its core idle; keyboard fully
+   responsive; zero panics).** The new
    angle the last attempt missed: route the xHCI MSI to, and pin the driver on, the same core, so
    the wake is local (no IPI). Block on `recv_timeout` when idle; keep a short deadline / brief
    busy-poll only while a key is held (auto-repeat); a slow watchdog wake keeps hot-plug detection
