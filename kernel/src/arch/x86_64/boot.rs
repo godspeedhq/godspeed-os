@@ -586,6 +586,35 @@ pub unsafe fn rearm_tsc_deadline() {
     unsafe { arm_tsc_deadline_now(ticks) };
 }
 
+/// Quantum multiplier for an IDLE core's timer (Phase 2a, `docs/power.md` §14). MUST stay well
+/// under the liveness watchdog threshold (300 quanta, ~3 s) - the slow tick is what keeps stamping
+/// `CORE_LAST_TICK_TSC`, so an idle core still reads as alive and the watchdog needs no change.
+pub const IDLE_QUANTUM_MULT: u64 = 100;
+
+/// Re-arm this core's timer for the long IDLE interval (~1 s) instead of the ~10 ms quantum
+/// (Phase 2a). No-op in periodic mode. Safe per §18.5 (ordering contract, not an unsafe one).
+pub fn rearm_idle_timer() {
+    if !TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
+        return;
+    }
+    let ticks = TSC_TICKS_PER_QUANTUM
+        .load(Ordering::Relaxed)
+        .saturating_mul(IDLE_QUANTUM_MULT);
+    // SAFETY: ring-0; TSC_DEADLINE_MODE=true implies the CPUID check passed and
+    // TSC_TICKS_PER_QUANTUM was set (both together in init_local_apic).
+    unsafe { arm_tsc_deadline_now(ticks) };
+}
+
+/// Restore this core's timer to the normal preemption quantum (~10 ms) after an idle wake
+/// (Phase 2a), so a task scheduled off that wake is preemptible on schedule.
+pub fn rearm_quantum_timer() {
+    if !TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
+        return;
+    }
+    // SAFETY: as `rearm_idle_timer` - ring-0, TSC-Deadline confirmed active.
+    unsafe { rearm_tsc_deadline() };
+}
+
 /// TSC cycles per scheduler quantum (the timer period), or 0 before the local APIC timer is
 /// calibrated. Used to convert a cycle-based `recv_timeout` into a count of timer ticks for the
 /// core-independent timed-wake clock (§12) - a TSC deadline can't be compared across cores

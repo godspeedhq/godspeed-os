@@ -1041,6 +1041,25 @@ pub fn run(core_id: u32) -> ! {
                 if cid == 0 {
                     crate::control::process_pending();
                 }
+                // Phase 2a - SLOW THE IDLE TICK (docs/power.md §14). With no ready tasks this core
+                // has nothing to preempt, yet its timer still fires ~100x/s purely to re-arm
+                // itself. Re-arm at ~1 s instead, so it wakes ~1x/s and sleeps deep in between.
+                //
+                // Why slowing (not stopping) is the right shape:
+                //  - The watchdog needs NO change. The slow tick still stamps CORE_LAST_TICK_TSC,
+                //    and ~1 s is far under the cross-core wedge threshold (~3 s), so an idle core
+                //    still reads as alive while a genuinely wedged core (no ticks at all) is still
+                //    caught. Stopping the tick would make those two indistinguishable.
+                //  - It stays a lost-wake safety net: a missed WAKE_RECEIVER IPI is recovered on
+                //    the next ~1 s re-poll of the run queue, instead of parking the core forever.
+                //
+                // Excluded: the BSP (it drives MONOTONIC_TICKS, scan_timed_wakes and the COM2/COM1
+                // polling, which must stay ~100 Hz), and any core that cannot halt (a Goldmont+
+                // sti-spin core gains nothing from a slower timer, so its behaviour is untouched).
+                let slow_idle = cid != 0 && crate::arch::imp::interrupts::idle_can_halt();
+                if slow_idle {
+                    crate::arch::imp::boot::rearm_idle_timer();
+                }
                 // No ready tasks; re-enable interrupts and loop.
                 // `wait_for_interrupt` issues only `sti` - no PAUSE, no HLT.
                 // On Goldmont+, both are "low-power hints" that allow firmware
@@ -1049,6 +1068,14 @@ pub fn run(core_id: u32) -> ! {
                 // of TASK_STATE on every iteration so wakeups from other cores
                 // are always visible.
                 crate::arch::imp::wait_for_interrupt();
+                // Woke - by the slow idle timer, a WAKE_RECEIVER IPI, or a device IRQ. Restore the
+                // normal preemption quantum so a task picked on the next iteration is preemptible
+                // on schedule instead of running until the ~1 s idle deadline. (A timer wake has
+                // already re-armed the quantum inside the ISR; this covers the IPI/IRQ wake, and
+                // is harmlessly idempotent.)
+                if slow_idle {
+                    crate::arch::imp::boot::rearm_quantum_timer();
+                }
             }
         }
     }

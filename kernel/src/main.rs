@@ -163,6 +163,25 @@ fn test_ipc_routing() {
     kprintln!("ipc-test: all routing tests passed");
 }
 
+/// Report the Phase 2a idle-tick configuration (`docs/power.md` §14), so the running machine states
+/// which case it is instead of leaving it a hidden assumption (§26.7).
+///
+/// `#[inline(never)]` is load-bearing, not style. `kernel_main`'s stack frame is allocated **upfront**
+/// and is already near the 512 KiB `BSP_BOOT_STACK` ceiling (the pre-scheduler tests pass 4 KiB
+/// `Message`s by value - see the stack comment below). Inlining this log's format temporaries into
+/// that frame pushed a later, deeper call (PCI enumeration) off the end of the stack and into a guard
+/// page, producing a page-fault loop at boot (a flood of the pf-handler's raw 'P'). Keeping the log in
+/// its own small frame costs nothing and keeps `kernel_main` off the ceiling.
+#[inline(never)]
+fn log_idle_tick_config() {
+    kprintln!(
+        "idle-tick: APs slow to {}x quantum when idle = {} (tickless Phase 2a; BSP stays 100 Hz)",
+        arch::imp::boot::IDLE_QUANTUM_MULT,
+        arch::imp::interrupts::idle_can_halt()
+            && arch::imp::boot::TSC_DEADLINE_MODE.load(core::sync::atomic::Ordering::Relaxed)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Kernel entry point.
 // ---------------------------------------------------------------------------
@@ -312,6 +331,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
             "idle: cores may halt = {} (cool when idle if true)",
             arch::imp::interrupts::idle_can_halt()
         );
+        log_idle_tick_config();
 
         // Interrupt-driven USB (§12): program the xHCI's MSI now that the APs are up, so it
         // targets the xHCI driver's core (core 1) - a keypress then wakes that core straight
