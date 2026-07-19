@@ -374,7 +374,7 @@ pub unsafe fn init_local_apic() {
         // ~100 ms at 1 GHz APIC bus / 16 divider (QEMU); ~50 ms on AMD GX-420GI (Jaguar). 10x from
         // 625_000 broke the timer-ISR cascade on AMD where verbose diagnostics (~18 ms) exceeded the
         // prior 5 ms period.
-        write_apic(apic_virt, APIC_TIMER_INIT, 6_250_000);
+        write_apic(apic_virt, APIC_TIMER_INIT, PERIODIC_TIMER_COUNT);
         if tsc_deadline_supported {
             crate::kprintln!("apic: core {} periodic timer (TSC calibration unavailable)", lapic_id);
         }
@@ -586,33 +586,70 @@ pub unsafe fn rearm_tsc_deadline() {
     unsafe { arm_tsc_deadline_now(ticks) };
 }
 
-/// Quantum multiplier for an IDLE core's timer (Phase 2a, `docs/power.md` §14). MUST stay well
-/// under the liveness watchdog threshold (300 quanta, ~3 s) - the slow tick is what keeps stamping
-/// `CORE_LAST_TICK_TSC`, so an idle core still reads as alive and the watchdog needs no change.
+/// Quantum multiplier for an IDLE core's timer in **TSC-Deadline** mode (Phase 2a,
+/// `docs/power.md` §14). MUST stay well under the liveness watchdog threshold (300 quanta, ~3 s) -
+/// the slow tick is what keeps stamping `CORE_LAST_TICK_TSC`, so an idle core still reads as alive
+/// and the watchdog needs no change.
 pub const IDLE_QUANTUM_MULT: u64 = 100;
 
-/// Re-arm this core's timer for the long IDLE interval (~1 s) instead of the ~10 ms quantum
-/// (Phase 2a). No-op in periodic mode. Safe per §18.5 (ordering contract, not an unsafe one).
+/// LAPIC periodic-timer initial count: the normal preemption period. ~50 ms on the AMD GX-420GI
+/// (T630), ~100 ms at 1 GHz APIC bus / 16 divider (QEMU). The APIC bus frequency is not calibrated,
+/// so the absolute period is machine-dependent - only the ratio below is under our control.
+const PERIODIC_TIMER_COUNT: u32 = 6_250_000;
+
+/// Multiplier for an IDLE core's **periodic** timer. Deliberately smaller than `IDLE_QUANTUM_MULT`
+/// because the periodic period is already far longer than a 10 ms quantum (~50 ms on the T630), so
+/// 20x lands the idle tick near ~1 s there (~2 s on QEMU) instead of an unhelpfully long ~5 s. The
+/// liveness watchdog is inactive in periodic mode (it is gated on a calibrated
+/// `TSC_TICKS_PER_QUANTUM`), so the binding constraint here is lost-wake recovery latency rather
+/// than the wedge threshold.
+const IDLE_PERIODIC_MULT: u32 = 20;
+
+/// Re-arm this core's timer for the long IDLE interval (~1 s) instead of the normal preemption
+/// period (Phase 2a). Handles **both** timer modes:
+///  - **TSC-Deadline** (one-shot, software re-armed each tick): arm the next deadline
+///    `IDLE_QUANTUM_MULT` quanta out.
+///  - **Periodic** (hardware auto-reload): reprogram the LAPIC initial count, which restarts the
+///    countdown with the longer period; the hardware then keeps reloading it until restored.
+///
+/// Only ever called for a core that can `hlt` (enforced by the scheduler's idle path). That gate
+/// matters in periodic mode: a core that spins instead of halting would rewrite the initial count
+/// on every loop iteration, restarting the countdown forever so the timer never fires.
+///
+/// Safe per §18.5: writing a timer register is not memory-unsafe, and the only precondition is
+/// ordering (call from the steady-state scheduler loop) - a documented contract, not an unsafe one.
 pub fn rearm_idle_timer() {
-    if !TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
-        return;
+    if TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
+        let ticks = TSC_TICKS_PER_QUANTUM
+            .load(Ordering::Relaxed)
+            .saturating_mul(IDLE_QUANTUM_MULT);
+        // SAFETY: ring-0; TSC_DEADLINE_MODE=true implies the CPUID check passed and
+        // TSC_TICKS_PER_QUANTUM was set (both together in init_local_apic).
+        unsafe { arm_tsc_deadline_now(ticks) };
+    } else {
+        // SAFETY: ring-0; APIC_VIRT_BASE is valid after init_local_apic (the same pattern
+        // apic_send_eoi uses), and this writes THIS core's own LAPIC - no cross-core race.
+        unsafe {
+            write_apic(
+                APIC_VIRT_BASE,
+                APIC_TIMER_INIT,
+                PERIODIC_TIMER_COUNT.saturating_mul(IDLE_PERIODIC_MULT),
+            )
+        };
     }
-    let ticks = TSC_TICKS_PER_QUANTUM
-        .load(Ordering::Relaxed)
-        .saturating_mul(IDLE_QUANTUM_MULT);
-    // SAFETY: ring-0; TSC_DEADLINE_MODE=true implies the CPUID check passed and
-    // TSC_TICKS_PER_QUANTUM was set (both together in init_local_apic).
-    unsafe { arm_tsc_deadline_now(ticks) };
 }
 
-/// Restore this core's timer to the normal preemption quantum (~10 ms) after an idle wake
-/// (Phase 2a), so a task scheduled off that wake is preemptible on schedule.
+/// Restore this core's timer to the normal preemption period after an idle wake (Phase 2a), so a
+/// task scheduled off that wake is preemptible on schedule rather than running until the idle
+/// deadline. Mirrors `rearm_idle_timer` across both timer modes.
 pub fn rearm_quantum_timer() {
-    if !TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
-        return;
+    if TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
+        // SAFETY: as `rearm_idle_timer` - ring-0, TSC-Deadline confirmed active.
+        unsafe { rearm_tsc_deadline() };
+    } else {
+        // SAFETY: as `rearm_idle_timer` - ring-0, this core's own LAPIC initial count.
+        unsafe { write_apic(APIC_VIRT_BASE, APIC_TIMER_INIT, PERIODIC_TIMER_COUNT) };
     }
-    // SAFETY: as `rearm_idle_timer` - ring-0, TSC-Deadline confirmed active.
-    unsafe { rearm_tsc_deadline() };
 }
 
 /// TSC cycles per scheduler quantum (the timer period), or 0 before the local APIC timer is

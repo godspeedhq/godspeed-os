@@ -30,7 +30,7 @@ commented blocks in the permitted `arch/` layer (no §18.5 amendment needed):
 
 | File | Change | Why |
 |------|--------|-----|
-| `arch/x86_64/boot.rs` | 100 -> 102 (+2) | **Phase 2a (tickless idle, `docs/power.md` §14):** two safe wrappers, `rearm_idle_timer` (arm the TSC-Deadline at `IDLE_QUANTUM_MULT` quanta, ~1 s, so an idle AP wakes ~100x less often) and `rearm_quantum_timer` (restore the ~10 ms preemption quantum on an idle wake). Each wraps one `arm_tsc_deadline_now` / `rearm_tsc_deadline` call in a SAFETY-commented block, guarded by `TSC_DEADLINE_MODE`. Deliberately **safe `fn`s in the arch layer** so the neutral `scheduler.rs` calls them without `unsafe` - §18.5's rule that new `unsafe` lives in a permitted layer rather than growing a grandfathered file (scheduler.rs stays at its floor of 37). |
+| `arch/x86_64/boot.rs` | 100 -> 104 (+4) | **Phase 2a (tickless idle, `docs/power.md` §14):** two safe wrappers, `rearm_idle_timer` (arm the TSC-Deadline at `IDLE_QUANTUM_MULT` quanta, ~1 s, so an idle AP wakes ~100x less often) and `rearm_quantum_timer` (restore the ~10 ms preemption quantum on an idle wake). Each wraps one `arm_tsc_deadline_now` / `rearm_tsc_deadline` call in a SAFETY-commented block, guarded by `TSC_DEADLINE_MODE`. Deliberately **safe `fn`s in the arch layer** so the neutral `scheduler.rs` calls them without `unsafe` - §18.5's rule that new `unsafe` lives in a permitted layer rather than growing a grandfathered file (scheduler.rs stays at its floor of 37). Each helper handles BOTH timer modes, so each has two SAFETY-commented blocks: the TSC-Deadline arm, and a LAPIC `APIC_TIMER_INIT` write for the periodic path (the T630 runs periodic, where the hardware auto-reloads and the initial count is the only way to slow the tick). |
 | `arch/x86_64/boot.rs` | 98 → 100 (+2) | **SEC-18:** new `broadcast_nmi_all_but_self` (a `pub unsafe fn` + one `unsafe` ICR-write block) so the panic path stops every core, not just the caller. Models the sibling `broadcast_ipi_all_but_self`; NMI delivery mode (ICR bits 10:8 = 0b100) reaches a core even while it spins IF=0 on a lock. `idt[2]` is also repointed to `exception_halt` (a same-file IDT re-wire, no new `unsafe`). |
 | `arch/x86_64/mod.rs` | 35 → 36 (+1) | **SEC-18:** `halt_all_cores` now calls `boot::broadcast_nmi_all_but_self()` before its `cli`+`hlt`, so a panic on one core halts the whole machine (§6.2 / §19). The +1 is that `unsafe { boot::... }` call block. |
 
@@ -270,7 +270,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/riscv64/mod.rs | 23 | permitted |
 | arch/s390x/mod.rs | 18 | permitted |
 | arch/x86_64/ap_boot.rs | 2 | permitted |
-| arch/x86_64/boot.rs | 102 | permitted |
+| arch/x86_64/boot.rs | 104 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 5 | permitted |
 | arch/x86_64/interrupts.rs | 22 | permitted |

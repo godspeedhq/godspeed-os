@@ -175,10 +175,13 @@ fn test_ipc_routing() {
 #[inline(never)]
 fn log_idle_tick_config() {
     kprintln!(
-        "idle-tick: APs slow to {}x quantum when idle = {} (tickless Phase 2a; BSP stays 100 Hz)",
-        arch::imp::boot::IDLE_QUANTUM_MULT,
-        arch::imp::interrupts::idle_can_halt()
-            && arch::imp::boot::TSC_DEADLINE_MODE.load(core::sync::atomic::Ordering::Relaxed)
+        "idle-tick: APs slow their idle timer = {} ({} mode; BSP keeps the normal period)",
+        arch::imp::interrupts::idle_can_halt(),
+        if arch::imp::boot::TSC_DEADLINE_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+            "tsc-deadline"
+        } else {
+            "periodic"
+        }
     );
 }
 
