@@ -4484,7 +4484,12 @@ fn cmd_reboot(ctx: &ServiceContext) -> ! {
     ctx.reboot()
 }
 
-/// `cores` - how many cores are up. `cores ticks` - each core's timer-tick RATE.
+/// `cores` - how many cores are up. `cores ticks` - each core's SCHEDULER-QUANTUM rate.
+///
+/// The counter (`CORE_TOTAL_TICKS`) advances on a timer tick **and** on every `yield`, so for an
+/// idle core it reads as the timer rate, while a busy-polling service reads as its loop rate. That
+/// conflation is a feature here: it is exactly what exposed xhci pegging a core at ~85k/s on the
+/// T630 while the truly idle cores sat at 0.
 ///
 /// The rate form is how the Phase 2a idle-tick slowdown (`docs/power.md` §14) is *measured* rather
 /// than assumed: an idle AP re-arms its timer at a long interval, so it should read far lower than
@@ -4518,7 +4523,7 @@ fn cmd_cores(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), Shell
 
     // Show the raw sampled count alongside the rate: a slowed idle core can tick below 1/s, which
     // integer division would flatten to a bare "0" and hide the very signal being measured.
-    out.line(ctx, "core  ticks/s   sampled");
+    out.line(ctx, "core  quanta/s  sampled   (quantum = timer tick OR yield)");
     for c in 0..ncores {
         let delta = ctx
             .inspect_core_total_ticks(c as u32)
