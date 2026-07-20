@@ -23,6 +23,22 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-20 - ARMv7 MMU (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mmu.rs` | 0 -> 4 (new file) | **ARMv7 short-descriptor translation, 1 MiB sections.** Four SAFETY-commented blocks: filling the L1 table (`static mut`, boot-only, secondaries parked and MMU off so nothing is walking it); the enable sequence (TLB/BP/I-cache invalidate, DACR=client, TTBCR=0, TTBR0, then SCTLR.M, with the DSB/ISB pairs the ARM ARM requires); enabling caches afterwards; and `translate()`, which runs the CPU's own table walker via ATS1CPR and reads PAR. `translate` is deliberately safe to call on an address expected to be UNMAPPED - a failed walk sets PAR.F rather than raising an exception, which is what lets the selftest prove the table bounds anything. |
+
+The MMU is the gate on task isolation, and it comes *after* the vectors on purpose: a bad mapping is a
+translation fault, and without a vector table that fault is a silent hang rather than a printed
+`translation fault (section) - NOT MAPPED`.
+
+**The selftest checks a negative, not just a positive** (same reasoning as the x86 IOMMU selftest,
+§22 Test 12): confirming that mapped addresses translate only shows the table is non-empty, so it also
+confirms that an address outside every mapped range does **not** translate. The three checks are
+mutually validating - a broken `translate()` that always failed would break checks 1-2, and a blanket
+identity map would break check 3.
+
 ## 2026-07-20 - ARMv7 exception vectors (feat/pi2-arm32)
 
 The 32-bit ARM port gains its vector table. All additions are in the permitted `arch/` layer with
@@ -283,6 +299,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 |---|---|---|
 | arch/aarch64/mod.rs | 23 | permitted |
 | arch/arm/exceptions.rs | 21 | permitted |
+| arch/arm/mmu.rs | 4 | permitted |
 | arch/arm/mod.rs | 21 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |

@@ -45,7 +45,7 @@ fn kind_name(k: u32) -> &'static [u8] {
 
 /// Print `0x` + 8 hex digits. Fixed 8-byte stack buffer, no allocation (§26.6.1) - this runs on a
 /// fault path where nothing about the machine's state can be assumed.
-fn write_hex32(v: u32) {
+pub(super) fn write_hex32(v: u32) {
     let mut buf = [0u8; 8];
     for i in 0..8 {
         let nib = ((v >> ((7 - i) * 4)) & 0xF) as u8;
