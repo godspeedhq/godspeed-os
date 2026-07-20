@@ -6,8 +6,9 @@ reaches the hardware only through this directory.
 
 If you are porting GodspeedOS to a new architecture, this file is your map. The claim it backs is the
 one proven in `docs/multi-arch.md`: **a new architecture is bounded to `arch/<isa>/` - you write that
-directory and nothing else in the kernel changes.** Five ISA families (x86-64, AArch64, RISC-V,
-LoongArch, s390x) and both word sizes (64-bit and 32-bit) have been proven this way.
+directory and nothing else in the kernel changes.** Six ISA families (x86-64, AArch64, ARMv7,
+RISC-V, LoongArch, s390x) and both word sizes (64-bit and 32-bit) have been proven this way - and
+**arm32 boots on real hardware** (Raspberry Pi 2 Model B, 2026-07-20), not only under emulation.
 
 ## The seam: `arch::imp`
 
@@ -95,6 +96,13 @@ entire cost of 32-bit support (`docs/multi-arch.md`, "Word size").
 - **AArch64** traps FP/SIMD at EL1 by default, and Rust emits NEON for `memcpy`/byte-copy, so `_start`
   must enable `CPACR_EL1.FPEN` before *any* Rust runs (found via `qemu -d int` -> ESR `0x07`). SP must
   be 16-byte aligned.
+- **ARMv7 (32-bit)** is a SEPARATE port from AArch64 - modes + CP15 rather than exception levels +
+  system registers, sharing no code. The Pi firmware enters it in **HYP mode** (Cortex-A7 has the virt
+  extensions) whenever a device tree is loaded, so `_start` must `eret` down to SVC; `.arch_extension
+  virt` is required or the assembler rejects `spsr_hyp`/`elr_hyp`/`eret`. QEMU's `raspi2b` hands over
+  in SVC, so emulation never exercises that branch. Do not assume firmware initialised the PL011
+  (QEMU's is disabled and silently eats output), but do NOT reprogram IBRD/FBRD - the reference clock
+  differs between firmware and emulation.
 - **RISC-V / LoongArch** use soft-float targets (`riscv64imac`, `-softfloat`), sidestepping the
   FP-enable step, and booted first try.
 - **s390x** is **big-endian** - it compiles clean (the endian-neutrality proof) but boot is pending
