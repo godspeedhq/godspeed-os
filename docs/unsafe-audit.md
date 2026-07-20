@@ -27,7 +27,7 @@ bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free serv
 
 | File | Change | Why |
 |------|--------|-----|
-| `arch/arm/timer.rs` | 0 -> 3 (new file) | **ARM generic timer + BCM2835 System Timer.** Three SAFETY-commented blocks, all side-effect-free reads: `CNTFRQ` (the firmware-programmed frequency), `CNTPCT` via `mrrc` into a register pair (the 64-bit counter, with an ISB so the read is not reordered), and a volatile read of the System Timer's counter-low register in the Device-mapped peripheral range. |
+| `arch/arm/timer.rs` | 0 -> 4 (new file) | **ARM generic timer + BCM2835 System Timer.** Four SAFETY-commented blocks, all side-effect-free reads: `CNTFRQ` (the firmware-programmed frequency), `CNTPCT` via `mrrc` into a register pair (the 64-bit counter, with an ISB so the read is not reordered), a volatile read of the System Timer's counter-low register, and `local_reg` reading the BCM2836 core-local block (timer control + prescaler). The last two are in ranges `mmu.rs` maps as Device memory. |
 
 **ARM needs no timer calibration** - `CNTFRQ` reports the frequency architecturally, so the whole
 x86 PIT-calibration apparatus (and the ~1 second-quantum bug it existed to fix on the T630) has no
@@ -41,6 +41,17 @@ wrong - surfacing much later as mysterious timing bugs. The Pi carries a second,
 other over 100 ms and compares the result with what `CNTFRQ` claims. That turns "the register says
 19.2 MHz" into "two independent clocks agree on how long a second is". A zero `CNTFRQ` is reported
 loudly and degrades to the System Timer rather than computing nonsense (invariant 12).
+
+**The cross-check immediately paid for itself: on the Raspberry Pi 2, `CNTFRQ` is wrong by 19.2x.**
+Hardware reports `CNTFRQ = 19200000` while the counter measurably advances at 1 MHz. The BCM2836
+feeds the generic timer through a core timer prescaler (`0x4000_0008`) at `source * prescaler / 2^31`;
+firmware programs `0x06AAAAAB`, which divides the 19.2 MHz crystal to **exactly** 1 MHz, and then
+never updates `CNTFRQ` - so the register still advertises the undivided crystal. Trusting it would
+have made every delay and every scheduler quantum wrong by 19.2x, with the symptom appearing far from
+the cause. **QEMU cannot reproduce this**: it does not model the prescaler (both registers read 0) and
+its `CNTFRQ` is truthful, so only hardware could have caught it. `timer_hz()` therefore returns the
+**measured** rate, never `CNTFRQ`, and the selftest distinguishes a deviation *explained* by the
+prescaler (a known board quirk, reported and continued) from an unexplained one (a real failure).
 
 ## 2026-07-20 - ARMv7 MMU (feat/pi2-arm32)
 
@@ -319,7 +330,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mod.rs | 23 | permitted |
 | arch/arm/exceptions.rs | 21 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
-| arch/arm/timer.rs | 3 | permitted |
+| arch/arm/timer.rs | 4 | permitted |
 | arch/arm/mod.rs | 21 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
