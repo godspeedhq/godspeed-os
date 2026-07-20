@@ -41,6 +41,11 @@ proptest = "1"
 panic = "abort"
 
 [features]
+# Deliberately take a data abort during arm32 boot, to PROVE the exception vectors
+# fire (a fault path never observed firing is not evidence). The ARM twin of the x86
+# adversarial fault tests (§22 A14/A15/C2). Never enabled in a normal boot.
+arm-fault-test = []
+
 # Build the kernel with a deliberately invalid SUPERVISOR ELF to trigger the TCB
 # failure path when the kernel spawns the supervisor directly (§6.2, §22 Test 1B).
 # Only used by `osdev test identity`.

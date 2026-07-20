@@ -8,6 +8,8 @@
 
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
+pub mod exceptions;
+
 // ============================ Boot bring-up (Raspberry Pi 2 Model B) ============================
 // BCM2836 peripheral base is 0x3F00_0000 (the BCM2835/Pi 1 was 0x2000_0000; the BCM2711/Pi 4 is
 // 0xFE00_0000 - this constant is the single thing that moves between Broadcom generations).
@@ -130,7 +132,7 @@ pub unsafe extern "C" fn _start() -> ! {
 /// The firmware has already configured the UART (115200 8N1 - the same line Linux uses), so no
 /// baud/line setup is needed for this milestone. We poll TXFF rather than writing blind, or a burst
 /// longer than the 16-byte FIFO would silently drop characters.
-fn pl011_write_byte(b: u8) {
+pub(super) fn pl011_write_byte(b: u8) {
     // SAFETY: PL011_FR/PL011_DR are the BCM2836 UART0 flag and data registers, identity-mapped with
     // the MMU off. Volatile MMIO: poll until the TX FIFO has room, then write one byte to transmit.
     unsafe {
@@ -139,7 +141,7 @@ fn pl011_write_byte(b: u8) {
     }
 }
 
-fn pl011_write(s: &[u8]) {
+pub(super) fn pl011_write(s: &[u8]) {
     for &b in s {
         pl011_write_byte(b);
     }
@@ -153,7 +155,10 @@ extern "C" fn arm_boot_main() -> ! {
     pl011_init();
     pl011_write(b"\r\nGodspeedOS arm32: _start reached SVC, PL011 alive - 32-bit ARM BOOTS.\r\n");
     pl011_write(b"arm32: Raspberry Pi 2 Model B (BCM2836, Cortex-A7), peripherals @ 0x3F000000.\r\n");
-    pl011_write(b"arm32: neutral kernel linked; MMU/vectors/IRQ controller pending. halting.\r\n");
+    exceptions::install();
+    #[cfg(feature = "arm-fault-test")]
+    exceptions::trigger_test_fault();
+    pl011_write(b"arm32: neutral kernel linked; MMU/timer/IRQ controller pending. halting.\r\n");
     loop {
         // SAFETY: WFI is always valid; wait for an interrupt that never comes (halt).
         unsafe { core::arch::asm!("wfi"); }
@@ -190,9 +195,9 @@ pub enum MemoryKind {
 
 // ---- Lifecycle ----
 pub fn ap_count() -> usize { 0 }
-pub fn init(boot_info: &BootInfo) { unimplemented!("aarch64::init") }
-pub fn init_timer() { unimplemented!("aarch64::init_timer") }
-pub fn ap_init(core_id: u32) { unimplemented!("aarch64::ap_init") }
+pub fn init(boot_info: &BootInfo) { unimplemented!("arm::init") }
+pub fn init_timer() { unimplemented!("arm::init_timer") }
+pub fn ap_init(core_id: u32) { unimplemented!("arm::ap_init") }
 
 pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, local_irq_save, local_irq_restore};
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
@@ -201,7 +206,7 @@ pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, 
 /// Switch to a new stack top - `sp` on AArch64. `#[inline(always)]` for the same reason as x86.
 /// # Safety: caller guarantees `top` is a valid aligned stack top; nothing live is on the old stack.
 #[inline(always)]
-pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("aarch64::switch_to_boot_stack") }
+pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("arm::switch_to_boot_stack") }
 
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }

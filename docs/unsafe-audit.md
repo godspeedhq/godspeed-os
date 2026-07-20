@@ -23,6 +23,23 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-20 - ARMv7 exception vectors (feat/pi2-arm32)
+
+The 32-bit ARM port gains its vector table. All additions are in the permitted `arch/` layer with
+`// SAFETY:` comments, so no §18.5 amendment is needed and no grandfathered floor moves.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/exceptions.rs` | 0 -> 21 (new file) | **ARMv7 exception vectors.** Until this existed, ANY fault on ARMv7 was a silent lockup - no vector table means the CPU jumps to whatever sits at address 0 and wanders off, which is exactly the silent failure invariant 12 forbids. The count is dominated by the eight one-instruction vector entries plus their `naked` stubs (each loads the exception kind, the LR-adjusted faulting PC, and DFSR/DFAR or IFSR/IFAR, then branches to a common reporter). `install()` holds one block that programs VBAR and primes the ABT/UND/IRQ/FIQ banked stacks; `trigger_test_fault()` holds one deliberately-unsound read behind the `arm-fault-test` feature, which is the ARM twin of the x86 A14/A15/C2 adversarial fault tests - a fault path never observed firing is not evidence that it works. |
+
+**ARMv7 trap worth recording: FIQ mode banks r8-r12.** The first version of `install()` stashed the
+caller's CPSR in `r12`, walked through FIQ mode to set its banked stack, then restored CPSR from
+`r12` - but inside FIQ that register name refers to a different physical register holding garbage, so
+the restore loaded a nonsense mode and reset the CPU. The symptom was oblique (the boot banner
+printing twice, and VBAR reading back as `0x00000000` instead of the table address). The fix carries
+nothing across a mode switch: VBAR is programmed first while still in SVC, and the walk ends by
+naming SVC explicitly rather than restoring a saved value.
+
 ## 2026-07-16 - SEC-1 / SEC-18 security fixes (feat/hardening)
 
 Two HIGH findings from the security audit (`docs/security-audit.md`), both fixed with `// SAFETY:`-
@@ -265,6 +282,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
 | arch/aarch64/mod.rs | 23 | permitted |
+| arch/arm/exceptions.rs | 21 | permitted |
 | arch/arm/mod.rs | 21 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
