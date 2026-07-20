@@ -26,6 +26,11 @@ fn main() {
     if target == "riscv64imac-unknown-none-elf" {
         println!("cargo:rustc-link-arg=-T{}", kernel_ld_riscv64.display());
     }
+    let kernel_ld_arm = workspace.join("kernel").join("kernel-arm.ld");
+    println!("cargo:rerun-if-changed={}", kernel_ld_arm.display());
+    if target == "armv7a-none-eabi" {
+        println!("cargo:rustc-link-arg=-T{}", kernel_ld_arm.display());
+    }
     let kernel_ld_loongarch64 = workspace.join("kernel").join("kernel-loongarch64.ld");
     println!("cargo:rerun-if-changed={}", kernel_ld_loongarch64.display());
     if target == "loongarch64-unknown-none-softfloat" {

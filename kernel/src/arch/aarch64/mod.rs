@@ -140,6 +140,12 @@ pub mod boot {
     use super::*;
     pub static TSC_DEADLINE_MODE: AtomicBool = AtomicBool::new(false);
     pub fn init_gdt_arenas(n: usize) {}
+    /// Idle-tick pacing (v0.7.0 power work, x86 Phase 2a). Neutral `scheduler.rs` calls these around
+    /// its idle `wait_for_interrupt`: slow the timer while a core sleeps, restore the quantum on wake.
+    /// A no-op here is CORRECT for a stub - the tick simply never slows - and a real port implements
+    /// them on its own timer (generic timer on ARM, CLINT/mtimecmp on RISC-V).
+    pub fn rearm_idle_timer() {}
+    pub fn rearm_quantum_timer() {}
     pub fn audit_wx() {}
     pub fn tsc_ticks_per_quantum() -> u64 { 0 }
     pub unsafe fn rearm_tsc_deadline() {}

@@ -8,23 +8,156 @@
 
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
-const UART_THR: *mut u8 = 0x0900_0000 as *mut u8;  // placeholder (varies by ARM machine); compile-only
+// ============================ Boot bring-up (Raspberry Pi 2 Model B) ============================
+// BCM2836 peripheral base is 0x3F00_0000 (the BCM2835/Pi 1 was 0x2000_0000; the BCM2711/Pi 4 is
+// 0xFE00_0000 - this constant is the single thing that moves between Broadcom generations).
+//
+// PL011 UART0 sits at +0x201000. On the Pi 2 it is wired to the GPIO header (pins 8/10) and is the
+// default console; unlike the Pi 3/4 there is no Bluetooth to steal it, so no dtoverlay is needed.
+// Confirmed on the board: Linux boots here with `console=ttyAMA0,115200`.
+const PERIPHERAL_BASE: usize = 0x3F00_0000;
+const PL011_BASE:      usize = PERIPHERAL_BASE + 0x20_1000;
+const PL011_DR:        *mut u32 = PL011_BASE as *mut u32;              // +0x00 data
+const PL011_FR:        *const u32 = (PL011_BASE + 0x18) as *const u32; // +0x18 flags
+const PL011_LCRH:      *mut u32 = (PL011_BASE + 0x2C) as *mut u32;     // +0x2C line control
+const PL011_CR:        *mut u32 = (PL011_BASE + 0x30) as *mut u32;     // +0x30 control
+const PL011_FR_TXFF:   u32 = 1 << 5;                                   // transmit FIFO full
+const PL011_FR_BUSY:   u32 = 1 << 3;                                   // transmitting
+const PL011_LCRH_8N1:  u32 = (3 << 5) | (1 << 4);                      // WLEN=8 bits, FIFOs on
+const PL011_CR_ON:     u32 = (1 << 0) | (1 << 8) | (1 << 9);           // UARTEN | TXE | RXE
 
+/// Bring the PL011 up for output, **preserving whatever baud divisors are already programmed**.
+///
+/// Do not assume the firmware did this. On real hardware it has (Linux runs a console here at
+/// 115200), but under `qemu-system-arm -M raspi2b -kernel` there is no firmware at all: the UART
+/// comes up disabled, every write to DR is silently swallowed, and FR.TXFF reads 0 so the poll below
+/// never even blocks. Output just vanishes - which is exactly the failure seen the first time this
+/// booted. Explicit init makes the same image work in both worlds.
+///
+/// IBRD/FBRD are deliberately NOT touched. The Pi's UART reference clock depends on firmware
+/// (`init_uart_clock`, commonly 48 MHz) and differs under emulation, so recomputing divisors here
+/// would risk a wrong baud on one of the two targets. QEMU ignores baud for a chardev, and hardware
+/// firmware has already set it correctly for 115200 - so keeping the existing divisors is right on
+/// both. Sequence per the PL011 spec: disable, drain, set the line format, re-enable.
+fn pl011_init() {
+    // SAFETY: BCM2836 UART0 registers, identity-mapped with the MMU off. Volatile MMIO writes in the
+    // order the PL011 spec requires; no memory is aliased and no other core is running yet.
+    unsafe {
+        PL011_CR.write_volatile(0);
+        while PL011_FR.read_volatile() & PL011_FR_BUSY != 0 {}
+        PL011_LCRH.write_volatile(PL011_LCRH_8N1);
+        PL011_CR.write_volatile(PL011_CR_ON);
+    }
+}
+
+/// Image entry - the firmware loads `kernel7.img` flat at 0x8000 and branches to byte 0, so this
+/// must be physically first (`.text.boot`, KEEPed by the linker script).
+///
+/// Four things have to happen before any Rust runs, and three of them are ARMv7 traps that do not
+/// exist on AArch64:
+///
+/// 1. **Drop out of HYP mode.** Cortex-A7 has the virtualization extensions and the Pi firmware
+///    enters an ARMv7 kernel in HYP (mode 0x1A) so a hypervisor *could* install itself. Ordinary
+///    kernel code expects SVC. We check CPSR and `eret` down to SVC only if we are actually in HYP,
+///    so the same image works whichever mode the firmware hands us. This is the ARMv7 counterpart of
+///    the AArch64 CPACR_EL1.FPEN trap: skip it and the failure is baffling and far from the cause.
+/// 2. **Park the secondary cores.** All four A7s start executing here. Read MPIDR and send anything
+///    that is not core 0 to a WFE loop. (Later SMP work takes them off the firmware mailboxes at
+///    0x4000_008C + 0x10*core instead.)
+/// 3. **Enable VFP/NEON.** Both are trapped at reset via CPACR cp10/cp11 and FPEXC.EN. The target is
+///    soft-float so this *should* be unnecessary, but LLVM may still emit NEON for bulk copies - the
+///    exact bug that cost a debugging session on AArch64. Enabling it costs four instructions.
+/// 4. **Stack, then zeroed BSS**, before calling into Rust.
 #[unsafe(naked)]
 #[no_mangle]
 #[link_section = ".text.boot"]
 pub unsafe extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
-        "ldr sp, =__stack_top",
-        "bl {main}",
-        "1:",
-        "b 1b",
+        // ---- 1. If we booted in HYP (mode 0x1A), eret down to SVC. Otherwise fall through. ----
+        // `armv7a-none-eabi` does not enable the virtualization extensions, so the assembler rejects
+        // spsr_hyp/elr_hyp/eret without this. The Cortex-A7 HAS them; only the default target
+        // description is conservative.
+        ".arch_extension virt",
+        "mrs  r0, cpsr",
+        "and  r1, r0, #0x1f",
+        "cmp  r1, #0x1a",
+        "bne  2f",
+        "bic  r0, r0, #0x1f",
+        "orr  r0, r0, #0xd3",            // SVC (0x13) + I/F masked (0xC0)
+        "msr  spsr_hyp, r0",
+        "adr  r1, 2f",
+        "msr  elr_hyp, r1",
+        "eret",
+        "2:",
+        "cpsid if",                      // interrupts off until the IDT-equivalent exists
+
+        // ---- 2. Only core 0 continues; the other three A7s park. ----
+        "mrc  p15, 0, r1, c0, c0, 5",    // MPIDR
+        "and  r1, r1, #3",
+        "cmp  r1, #0",
+        "bne  4f",
+
+        // ---- 3. Full access to CP10/CP11 (VFP/NEON), then FPEXC.EN. ----
+        "mrc  p15, 0, r0, c1, c0, 2",    // CPACR
+        "orr  r0, r0, #(0xf << 20)",
+        "mcr  p15, 0, r0, c1, c0, 2",
+        "isb",
+        ".fpu vfpv3-d16",
+        "mov  r0, #0x40000000",          // FPEXC.EN
+        "vmsr fpexc, r0",
+
+        // ---- 4. Stack, then zero [__bss_start, __bss_end). ----
+        "ldr  sp, =__stack_top",
+        "ldr  r1, =__bss_start",
+        "ldr  r2, =__bss_end",
+        "mov  r3, #0",
+        "3:",
+        "cmp  r1, r2",
+        "bhs  5f",
+        "str  r3, [r1], #4",
+        "b    3b",
+        "5:",
+        "bl   {main}",                   // -> arm_boot_main (never returns)
+        "4:",
+        "wfe",
+        "b    4b",
         main = sym arm_boot_main,
     )
 }
 
+/// Write one byte to the PL011, waiting for room in the transmit FIFO.
+///
+/// The firmware has already configured the UART (115200 8N1 - the same line Linux uses), so no
+/// baud/line setup is needed for this milestone. We poll TXFF rather than writing blind, or a burst
+/// longer than the 16-byte FIFO would silently drop characters.
+fn pl011_write_byte(b: u8) {
+    // SAFETY: PL011_FR/PL011_DR are the BCM2836 UART0 flag and data registers, identity-mapped with
+    // the MMU off. Volatile MMIO: poll until the TX FIFO has room, then write one byte to transmit.
+    unsafe {
+        while PL011_FR.read_volatile() & PL011_FR_TXFF != 0 {}
+        PL011_DR.write_volatile(b as u32);
+    }
+}
+
+fn pl011_write(s: &[u8]) {
+    for &b in s {
+        pl011_write_byte(b);
+    }
+}
+
+/// Rust side of boot. Milestone 1: prove the toolchain, the load address, the HYP drop, and the UART
+/// on real 32-bit silicon, then halt. The neutral kernel is already linked in; what is still missing
+/// before `kernel_main` can run is the ARMv7 MMU (short/long descriptors via CP15), the vector table
+/// (VBAR), and the BCM2836 interrupt controller - none of which is shared with AArch64.
 extern "C" fn arm_boot_main() -> ! {
-    loop { unsafe { core::arch::asm!("wfe"); } }
+    pl011_init();
+    pl011_write(b"\r\nGodspeedOS arm32: _start reached SVC, PL011 alive - 32-bit ARM BOOTS.\r\n");
+    pl011_write(b"arm32: Raspberry Pi 2 Model B (BCM2836, Cortex-A7), peripherals @ 0x3F000000.\r\n");
+    pl011_write(b"arm32: neutral kernel linked; MMU/vectors/IRQ controller pending. halting.\r\n");
+    loop {
+        // SAFETY: WFI is always valid; wait for an interrupt that never comes (halt).
+        unsafe { core::arch::asm!("wfi"); }
+    }
 }
 
 // ---- Boot info (shape shared with x86; a real port fills it from the DTB / UEFI) ----
@@ -74,8 +207,8 @@ pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 
 // ---- Serial / console (board UART; stubbed - 32-bit proof is compile-only) ----
-pub fn serial_write_byte(b: u8) { unsafe { UART_THR.write_volatile(b); } }
-pub fn serial_write_bytes_lockfree(s: &[u8]) { for &b in s { unsafe { UART_THR.write_volatile(b); } } }
+pub fn serial_write_byte(b: u8) { pl011_write_byte(b); }
+pub fn serial_write_bytes_lockfree(s: &[u8]) { pl011_write(s); }
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {}
 pub fn set_console_echo(on: bool) {}
 pub fn claim_console_foreground(task_slot: u32) {}
@@ -99,6 +232,12 @@ pub mod boot {
     use super::*;
     pub static TSC_DEADLINE_MODE: AtomicBool = AtomicBool::new(false);
     pub fn init_gdt_arenas(n: usize) {}
+    /// Idle-tick pacing (v0.7.0 power work, x86 Phase 2a). Neutral `scheduler.rs` calls these around
+    /// its idle `wait_for_interrupt`: slow the timer while a core sleeps, restore the quantum on wake.
+    /// A no-op here is CORRECT for a stub - the tick simply never slows - and a real port implements
+    /// them on its own timer (generic timer on ARM, CLINT/mtimecmp on RISC-V).
+    pub fn rearm_idle_timer() {}
+    pub fn rearm_quantum_timer() {}
     pub fn audit_wx() {}
     pub fn tsc_ticks_per_quantum() -> u64 { 0 }
     pub unsafe fn rearm_tsc_deadline() {}
