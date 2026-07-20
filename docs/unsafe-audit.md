@@ -23,6 +23,25 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-20 - ARMv7 generic timer (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/timer.rs` | 0 -> 3 (new file) | **ARM generic timer + BCM2835 System Timer.** Three SAFETY-commented blocks, all side-effect-free reads: `CNTFRQ` (the firmware-programmed frequency), `CNTPCT` via `mrrc` into a register pair (the 64-bit counter, with an ISB so the read is not reordered), and a volatile read of the System Timer's counter-low register in the Device-mapped peripheral range. |
+
+**ARM needs no timer calibration** - `CNTFRQ` reports the frequency architecturally, so the whole
+x86 PIT-calibration apparatus (and the ~1 second-quantum bug it existed to fix on the T630) has no
+counterpart here.
+
+**But `CNTFRQ` is still cross-checked, because it is firmware-programmed rather than
+hardware-discovered.** It is an ordinary read/write register that firmware is *supposed* to set;
+firmware that forgets leaves it 0 or wrong, and every duration derived from it is then silently
+wrong - surfacing much later as mysterious timing bugs. The Pi carries a second, independent clock
+(the BCM2835 System Timer, fixed at 1 MHz by hardware), so the selftest measures one against the
+other over 100 ms and compares the result with what `CNTFRQ` claims. That turns "the register says
+19.2 MHz" into "two independent clocks agree on how long a second is". A zero `CNTFRQ` is reported
+loudly and degrades to the System Timer rather than computing nonsense (invariant 12).
+
 ## 2026-07-20 - ARMv7 MMU (feat/pi2-arm32)
 
 | File | Change | Why |
@@ -300,6 +319,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mod.rs | 23 | permitted |
 | arch/arm/exceptions.rs | 21 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
+| arch/arm/timer.rs | 3 | permitted |
 | arch/arm/mod.rs | 21 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |

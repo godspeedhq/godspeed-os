@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
 pub mod exceptions;
 pub mod mmu;
+pub mod timer;
 
 // ============================ Boot bring-up (Raspberry Pi 2 Model B) ============================
 // BCM2836 peripheral base is 0x3F00_0000 (the BCM2835/Pi 1 was 0x2000_0000; the BCM2711/Pi 4 is
@@ -158,9 +159,10 @@ extern "C" fn arm_boot_main() -> ! {
     pl011_write(b"arm32: Raspberry Pi 2 Model B (BCM2836, Cortex-A7), peripherals @ 0x3F000000.\r\n");
     exceptions::install();
     mmu::enable();
+    timer::init();
     #[cfg(feature = "arm-fault-test")]
     exceptions::trigger_test_fault();
-    pl011_write(b"arm32: neutral kernel linked; timer + IRQ controller + context switch pending. halting.\r\n");
+    pl011_write(b"arm32: neutral kernel linked; IRQ controller + context switch pending. halting.\r\n");
     loop {
         // SAFETY: WFI is always valid; wait for an interrupt that never comes (halt).
         unsafe { core::arch::asm!("wfi"); }
@@ -312,7 +314,8 @@ pub mod syscall_entry {
     pub fn validate_user_ptr(ptr: u64, len: usize) -> bool { false }
     pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> { None }
     pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool { false }
-    pub fn read_cycle_counter() -> u64 { 0 }                 // CNTPCT_EL0
+    /// CNTPCT - the ARM generic timer's physical counter, the arm32 analogue of RDTSC.
+    pub fn read_cycle_counter() -> u64 { super::timer::cntpct() }
 }
 
 // ---------------------------------------------------------------------------
