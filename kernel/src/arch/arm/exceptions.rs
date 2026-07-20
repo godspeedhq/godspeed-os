@@ -206,13 +206,26 @@ unsafe extern "C" fn stub_reserved() -> ! {
     )
 }
 
+/// IRQ is the one exception that **returns**. Every other stub above reports and halts; this one has
+/// to hand control back to whatever was interrupted, so it is a real handler rather than a reporter.
+///
+/// - `sub lr, lr, #4` first: on IRQ entry ARMv7 leaves LR one instruction past the return point.
+/// - Stack `r0-r3, r12` (caller-saved under AAPCS, so the Rust handler may clobber them) and `lr`.
+///   `r4-r11` need no saving - Rust preserves callee-saved registers itself. Six registers is 24
+///   bytes, a multiple of 8, so the stack stays 8-byte aligned for the call.
+/// - `ldm sp!, {..., pc}^` is the exception return: the trailing `^` with `pc` in the list restores
+///   `CPSR` from `SPSR` in the same instruction, atomically resuming the interrupted mode.
+///
+/// This runs on the IRQ mode's own banked stack, primed by `install()`.
 #[unsafe(naked)]
 #[no_mangle]
-unsafe extern "C" fn stub_irq() -> ! {
+unsafe extern "C" fn stub_irq() {
     core::arch::naked_asm!(
-        "sub lr, lr, #4",
-        "mov r0, #6", "mov r1, lr", "mov r2, #0", "mov r3, #0",
-        "b {rep}", rep = sym arm_exception_report,
+        "sub  lr, lr, #4",
+        "stmfd sp!, {{r0-r3, r12, lr}}",
+        "bl   {dispatch}",
+        "ldmfd sp!, {{r0-r3, r12, pc}}^",
+        dispatch = sym crate::arch::arm::irq::arm_irq_dispatch,
     )
 }
 

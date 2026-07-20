@@ -119,6 +119,9 @@ pub fn delay_us(us: u32) {
     }
 }
 
+/// Public shim so sibling arch modules can print decimals without duplicating the formatter.
+pub(super) fn write_dec_pub(v: u32) { write_dec(v) }
+
 /// Print a u32 in decimal. Fixed 10-byte stack buffer, no allocation (§26.6.1).
 fn write_dec(mut v: u32) {
     if v == 0 {

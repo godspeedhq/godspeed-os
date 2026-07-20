@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 pub mod exceptions;
 pub mod mmu;
 pub mod timer;
+pub mod irq;
 
 // ============================ Boot bring-up (Raspberry Pi 2 Model B) ============================
 // BCM2836 peripheral base is 0x3F00_0000 (the BCM2835/Pi 1 was 0x2000_0000; the BCM2711/Pi 4 is
@@ -160,6 +161,10 @@ extern "C" fn arm_boot_main() -> ! {
     exceptions::install();
     mmu::enable();
     timer::init();
+    const TICK_HZ: u32 = 100; // 10 ms quantum, matching CLAUDE.md section 9.1
+    if irq::start_tick(TICK_HZ) {
+        irq::selftest(TICK_HZ);
+    }
     #[cfg(feature = "arm-fault-test")]
     exceptions::trigger_test_fault();
     pl011_write(b"arm32: neutral kernel linked; IRQ controller + context switch pending. halting.\r\n");

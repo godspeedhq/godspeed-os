@@ -23,6 +23,27 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-20 - BCM2836 interrupt controller / timer tick (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/irq.rs` | 0 -> 8 (new file) | **Routing the timer IRQ so the counter becomes a tick** - the prerequisite for preemption. Eight SAFETY-commented blocks: volatile read/write of the Device-mapped BCM2836 core-local block (routing + pending), `CNTP_TVAL` and `CNTP_CTL` writes to arm the timer, `CNTP_CTL` and `CPSR` reads for diagnostics, and `cpsie i` / `cpsid i` to unmask and mask IRQs. |
+| `arch/arm/exceptions.rs` | 21 (unchanged) | The IRQ stub changed shape without changing its count: it now saves `r0-r3, r12, lr`, calls the dispatcher and **returns** via `ldm sp!, {r0-r3, r12, pc}^` (the trailing `^` restores CPSR from SPSR atomically). It is the only exception in the port that returns rather than halting. |
+
+**The tick selftest caught a real routing bug, and the diagnostics located it precisely.** The first
+version counted **zero** interrupts. The follow-up print made the cause unambiguous: `CNTP_CTL` read
+`0x5` (ENABLE set, IMASK clear, **ISTATUS set** - the timer was firing), `CPSR` showed SVC mode with
+IRQs unmasked, yet the core-local pending register read `0x0`. Timer firing + interrupts enabled +
+nothing pending means the timer was raising a source nobody was listening to.
+
+**Cause: `CNTP_*` addresses the secure OR the non-secure physical timer depending on the CPU's
+security state, and those are two different interrupt sources** - `CNTPSIRQ` (bit 0) and `CNTPNSIRQ`
+(bit 1). The Pi firmware enters an ARMv7 kernel in HYP (non-secure), so hardware raises bit 1; QEMU's
+`raspi2b` stub passes through the secure monitor into *secure* SVC and raises bit 0. Routing only the
+non-secure bit therefore worked on neither in the same image. The fix routes and accepts **both**,
+exactly as `_start` accepts either HYP or SVC entry: one image, either security state, no assumption
+left to be wrong about.
+
 ## 2026-07-20 - ARMv7 generic timer (feat/pi2-arm32)
 
 | File | Change | Why |
@@ -329,6 +350,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 |---|---|---|
 | arch/aarch64/mod.rs | 23 | permitted |
 | arch/arm/exceptions.rs | 21 | permitted |
+| arch/arm/irq.rs | 8 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
 | arch/arm/mod.rs | 21 | permitted |
