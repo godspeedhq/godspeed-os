@@ -23,6 +23,29 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-20 - Device tree parsing: learn the memory map (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/dtb.rs` | 0 -> 6 (new file) | **Flattened Device Tree parsing.** Six SAFETY-commented blocks, all bounds-checked reads of the firmware-supplied blob: big-endian u32 reads, node-name comparison, and reading `DTB_PTR` itself. Every offset is checked against the blob's own declared `totalsize` before being walked - a corrupt header pointing outside the blob is exactly how a parser wanders into unmapped memory. |
+| `arch/arm/mod.rs` | +1 asm site (no new unsafe block) | `_start` now stashes `r2` (the DTB pointer) into `r10` before the mode check clobbers `r0-r2`, and publishes it into `DTB_PTR` **after** the BSS zero - which would otherwise wipe it. |
+
+**Why this stops being optional here.** Every layer so far tolerated a hardcoded `RAM_END`, copied
+from what the firmware told Linux, with a comment admitting that was not how a real port should learn
+it. That is fine while nothing depends on it, and stops being fine the moment the neutral kernel's
+frame allocator does: a wrong constant hands out frames backed by memory that does not exist. The
+firmware already knows the answer and passes it in `r2`.
+
+**FDT is big-endian on a little-endian CPU**, so every u32 needs swapping - the most common way to get
+nonsense from this format, hence a single `be32` rather than byte-swapping at each site. The parser is
+deliberately minimal: find `/memory`, read `reg`, stop. It does not pretend to general
+`#address-cells` handling it has not implemented.
+
+A missing or unparsable blob falls back to the old constant but **announces it** (invariant 12),
+because a silently wrong memory size becomes allocator corruption much later, far from its cause.
+Note QEMU cannot exercise the real path here: `-device loader` sets the PC without emulating the
+firmware's r0/r1/r2 handoff, so `DTB_PTR` is 0 there and only hardware tests the parse.
+
 ## 2026-07-20 - ARMv7 PREEMPTIVE switch (feat/pi2-arm32)
 
 | File | Change | Why |
@@ -403,6 +426,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mod.rs | 23 | permitted |
 | arch/arm/exceptions.rs | 21 | permitted |
 | arch/arm/context.rs | 6 | permitted |
+| arch/arm/dtb.rs | 6 | permitted |
 | arch/arm/irq.rs | 8 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
 | arch/arm/timer.rs | 4 | permitted |

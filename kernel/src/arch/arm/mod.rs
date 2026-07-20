@@ -8,7 +8,15 @@
 
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
+/// Physical address of the flattened device tree, as handed to us in r2 by the firmware.
+///
+/// Captured in `_start` (into r10 before the mode check clobbers r0-r2) and published here only
+/// *after* the BSS zero, which would otherwise wipe it. Zero means the firmware passed nothing.
+#[no_mangle]
+pub static mut DTB_PTR: u32 = 0;
+
 pub mod exceptions;
+pub mod dtb;
 pub mod mmu;
 pub mod timer;
 pub mod irq;
@@ -84,6 +92,11 @@ pub unsafe extern "C" fn _start() -> ! {
         // spsr_hyp/elr_hyp/eret without this. The Cortex-A7 HAS them; only the default target
         // description is conservative.
         ".arch_extension virt",
+        // The firmware hands us r0 = 0, r1 = machine type, r2 = **DTB address**, and that pointer is
+        // the only way to learn the machine's real memory map. Stash it in r10 before anything else:
+        // the mode check below clobbers r0/r1 immediately, and the BSS-zero loop would take r2. r10 is
+        // callee-saved and untouched by everything between here and the store into DTB_PTR.
+        "mov  r10, r2",
         "mrs  r0, cpsr",
         "and  r1, r0, #0x1f",
         "cmp  r1, #0x1a",
@@ -123,11 +136,14 @@ pub unsafe extern "C" fn _start() -> ! {
         "str  r3, [r1], #4",
         "b    3b",
         "5:",
+        "ldr  r0, ={dtb}",               // publish the DTB pointer AFTER the BSS zero, or it would
+        "str  r10, [r0]",                //   be wiped along with everything else in BSS
         "bl   {main}",                   // -> arm_boot_main (never returns)
         "4:",
         "wfe",
         "b    4b",
         main = sym arm_boot_main,
+        dtb = sym DTB_PTR,
     )
 }
 
@@ -160,6 +176,8 @@ extern "C" fn arm_boot_main() -> ! {
     pl011_write(b"\r\nGodspeedOS arm32: _start reached SVC, PL011 alive - 32-bit ARM BOOTS.\r\n");
     pl011_write(b"arm32: Raspberry Pi 2 Model B (BCM2836, Cortex-A7), peripherals @ 0x3F000000.\r\n");
     exceptions::install();
+    let ram_end = dtb::report_memory(mmu::FALLBACK_RAM_END);
+    mmu::set_ram_end(ram_end);
     mmu::enable();
     timer::init();
     const TICK_HZ: u32 = 100; // 10 ms quantum, matching CLAUDE.md section 9.1

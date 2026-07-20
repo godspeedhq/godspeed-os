@@ -16,6 +16,8 @@
 //! the stack and the vector table stay valid across the instant the MMU turns on. A higher-half
 //! kernel split comes with the task work, not now.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use super::pl011_write;
 use super::exceptions::write_hex32;
 
@@ -28,14 +30,24 @@ struct L1Table([u32; 4096]);
 
 static mut L1: L1Table = L1Table([0; 4096]);
 
-/// Usable RAM on this board, as reported by the firmware to Linux (`mem 0x0-0x3b3fffff` = 948 MiB).
+/// Usable RAM end, learned from the firmware's device tree at boot (`dtb.rs`).
 ///
-/// Hardcoded for the milestone and **not** how a real port should learn this: the firmware passes a
-/// device tree (r2 at entry) and the VideoCore mailbox answers a memory query. Both are later work;
-/// a wrong constant here maps RAM that does not exist, which now faults loudly rather than silently
-/// corrupting. The GPU's carve-out sits above this (`vc_mem.mem_base=0x3ec00000`) and is deliberately
-/// left unmapped - we do not own it.
-const RAM_END: u32 = 0x3B40_0000;
+/// This used to be a hardcoded constant copied from what the firmware told Linux, with a comment
+/// admitting that was not how a real port should learn it. It now IS learned - the DTB is the
+/// firmware's own description of the machine - and the constant below survives only as a fallback for
+/// a board that hands us no usable blob. That case is announced loudly rather than assumed, because a
+/// wrong RAM size becomes frame-allocator corruption later, far from its cause.
+///
+/// The GPU's carve-out sits above this (`vc_mem.mem_base=0x3ec00000`) and is deliberately left
+/// unmapped - we do not own it.
+pub const FALLBACK_RAM_END: u32 = 0x3B40_0000;
+
+static RAM_END: AtomicU32 = AtomicU32::new(FALLBACK_RAM_END);
+
+/// Record the usable RAM end before `enable()` builds the tables from it.
+pub fn set_ram_end(end: u32) {
+    RAM_END.store(end, Ordering::Relaxed);
+}
 
 /// BCM2836 peripherals (16 MiB) and the core-local block (timers, mailboxes, IPIs - what SMP and the
 /// timer will need next). Both are Device memory, never Normal: speculative or reordered accesses to
@@ -86,8 +98,9 @@ fn build_tables() {
     let l1 = unsafe { &mut *core::ptr::addr_of_mut!(L1) };
 
     // RAM: Normal memory, executable (the kernel's own text lives down here).
+    let ram_end = RAM_END.load(Ordering::Relaxed);
     let mut pa = 0u32;
-    while pa < RAM_END {
+    while pa < ram_end {
         l1.0[(pa / SECTION_SIZE) as usize] = section(pa, false, true);
         pa += SECTION_SIZE;
     }
