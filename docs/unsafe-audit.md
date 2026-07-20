@@ -23,6 +23,27 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-20 - ARMv7 kernel context switch (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/context.rs` | 0 -> 4 (new file) | **Cooperative kernel-mode context switch.** The switch itself is a three-instruction naked fn (`stmia`/`ldmia`/`bx lr`); the remaining blocks are the ping-pong selftest driving it. Only ten registers are saved and that is not a shortcut: AAPCS makes `r0-r3`/`r12` caller-saved, so the compiler has already spilled anything live at the call site, leaving the switch responsible for `r4-r11`, `sp`, `lr` - the same division as the x86 side. |
+
+`Context`'s field order is **load-bearing**: `stmia`/`ldmia` transfer in increasing register number
+regardless of how the list is written, so the struct must read `r4..r11`, `sp`, `lr` under `repr(C)`.
+Reordering the fields would silently restore registers into the wrong slots.
+
+A fresh context is started by *fabricating* its `lr` as the entry point, so the ordinary restore path
+starts it - no special case in the switch. The selftest checks the round trip rather than mere
+arrival: the counter is incremented by the *other* context and read back, which only works if state
+survives in both directions (a half-working switch that transfers control but corrupts registers is
+the dangerous case).
+
+**This is cooperative - called, not forced.** A preemptive switch from the timer IRQ must save the
+*full* register file, because an interrupt can land between any two instructions with anything live.
+That is the next increment. No address-space switch either: all contexts share the identity mapping,
+and per-task `TTBR0` writes bring the SEC-26/27 TLB obligations with them.
+
 ## 2026-07-20 - BCM2836 interrupt controller / timer tick (feat/pi2-arm32)
 
 | File | Change | Why |
@@ -350,6 +371,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 |---|---|---|
 | arch/aarch64/mod.rs | 23 | permitted |
 | arch/arm/exceptions.rs | 21 | permitted |
+| arch/arm/context.rs | 4 | permitted |
 | arch/arm/irq.rs | 8 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
 | arch/arm/timer.rs | 4 | permitted |

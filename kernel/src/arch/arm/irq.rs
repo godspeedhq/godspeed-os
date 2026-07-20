@@ -216,11 +216,20 @@ pub fn selftest(hz: u32) {
         return;
     }
 
-    // 10% tolerance: the window is measured by a busy-wait that the interrupts themselves preempt,
-    // so a couple of ticks of slop at either end is expected and meaningless. An order-of-magnitude
-    // error - the interesting failure - is far outside this.
+    // 25% tolerance, and deliberately loose. Two reasons, both about what this test is FOR.
+    //
+    // First, the window is measured by a busy-wait that the interrupts themselves preempt, so a few
+    // ticks of slop at either end are expected. Second - and this is what set the number - QEMU's TCG
+    // timing wanders: the same image measured 45 and then 43 across rebuilds, while real hardware
+    // returns exactly 50 every time. A 10% bar failed on emulation jitter alone, and a test that
+    // cries wolf gets ignored, which is worse than not having it.
+    //
+    // The failures worth catching are gross, not subtle: a tick that never fires (handled above) or
+    // one off by a factor - like a period computed from CNTFRQ, which would land near 2 instead of 50.
+    // Both are far outside 25%. This is a smoke test for "the tick runs at roughly the rate asked
+    // for", not a precision measurement, and it should not pretend otherwise.
     let diff = if fired > expected { fired - expected } else { expected - fired };
-    if diff * 10 <= expected {
+    if diff * 4 <= expected {
         pl011_write(b"arm32: tick selftest PASS (timer IRQ fires at the requested rate)\r\n");
     } else {
         pl011_write(b"arm32: tick selftest FAIL - the IRQ fires, but at the wrong rate.\r\n");

@@ -12,6 +12,7 @@ pub mod exceptions;
 pub mod mmu;
 pub mod timer;
 pub mod irq;
+pub mod context;
 
 // ============================ Boot bring-up (Raspberry Pi 2 Model B) ============================
 // BCM2836 peripheral base is 0x3F00_0000 (the BCM2835/Pi 1 was 0x2000_0000; the BCM2711/Pi 4 is
@@ -165,9 +166,11 @@ extern "C" fn arm_boot_main() -> ! {
     if irq::start_tick(TICK_HZ) {
         irq::selftest(TICK_HZ);
     }
+    context::selftest();
     #[cfg(feature = "arm-fault-test")]
     exceptions::trigger_test_fault();
-    pl011_write(b"arm32: neutral kernel linked; IRQ controller + context switch pending. halting.\r\n");
+    pl011_write(b"arm32: machine layer up (MMU, vectors, tick, context switch). Neutral kernel linked;
+       preemptive switch + tasks pending. halting.\r\n");
     loop {
         // SAFETY: WFI is always valid; wait for an interrupt that never comes (halt).
         unsafe { core::arch::asm!("wfi"); }
