@@ -167,10 +167,11 @@ extern "C" fn arm_boot_main() -> ! {
         irq::selftest(TICK_HZ);
     }
     context::selftest();
+    context::preempt_selftest();
     #[cfg(feature = "arm-fault-test")]
     exceptions::trigger_test_fault();
-    pl011_write(b"arm32: machine layer up (MMU, vectors, tick, context switch). Neutral kernel linked;
-       preemptive switch + tasks pending. halting.\r\n");
+    pl011_write(b"arm32: machine layer COMPLETE - MMU, vectors, tick, cooperative + preemptive switch.\r\n");
+    pl011_write(b"       Neutral kernel linked; scheduler integration + user mode pending. halting.\r\n");
     loop {
         // SAFETY: WFI is always valid; wait for an interrupt that never comes (halt).
         unsafe { core::arch::asm!("wfi"); }

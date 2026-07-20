@@ -23,6 +23,37 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-20 - ARMv7 PREEMPTIVE switch (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/context.rs` | 4 -> 6 (+2) | **Preemptive switching.** Two further SAFETY-commented blocks: fabricating a trap frame on a fresh task's stack, and the WFI halt for a task that returns from its entry function. |
+| `arch/arm/exceptions.rs` | 21 (unchanged) | `stub_irq` grew from a five-register handler into a full trap-frame entry: `srsdb` + `cps` + `push {r0-r12, lr}`, dispatch, `mov sp, r0`, `pop`, `rfeia sp!`. No new `unsafe` - the naked stub was already one block. |
+
+**Cooperative and preemptive switching are genuinely different problems**, and the difference is
+AAPCS. A cooperative switch happens inside a function call, so the compiler has already spilled the
+caller-saved half and ten registers suffice. A preemptive switch is *forced* between two arbitrary
+instructions with anything live, so the **entire** register file plus the resume PC and `SPSR` must be
+captured.
+
+**The ARMv7 obstacle is register banking**: on IRQ entry the CPU is in IRQ mode, where the interrupted
+mode's `sp` and `lr` are banked away and unreachable. `srsdb sp!, #0x13` reaches across that by
+pushing `LR_irq`/`SPSR_irq` onto the *SVC* stack; `cps #0x13` then stands on the interrupted task's
+own stack to save the rest. The frame therefore lives on **the task's own stack**, which is what makes
+a switch cheap - the state is already parked where it belongs, so switching tasks is switching `sp`
+and nothing else. The dispatcher returns the frame to resume; returning a *different* pointer is the
+entire mechanism of preemption. `rfeia sp!` restores PC and CPSR atomically.
+
+`TrapFrame`'s field order mirrors the push order and is as load-bearing as `Context`'s; a mismatch
+would resume tasks with scrambled registers, looking like random corruption far from the cause. A
+fresh task is started by fabricating its frame rather than special-casing "never run" in the switch -
+the same trick as `Context::prepare`, one layer down. `SPSR` is set with **IRQs enabled**: a task
+started with them masked would run to completion and never yield, silently killing preemption with no
+error anywhere.
+
+The selftest runs three tasks that never cooperate and checks **all three** were scheduled - a switch
+that always picked one task, or worked once then wedged, would still show *a* task running.
+
 ## 2026-07-20 - ARMv7 kernel context switch (feat/pi2-arm32)
 
 | File | Change | Why |
@@ -371,7 +402,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 |---|---|---|
 | arch/aarch64/mod.rs | 23 | permitted |
 | arch/arm/exceptions.rs | 21 | permitted |
-| arch/arm/context.rs | 4 | permitted |
+| arch/arm/context.rs | 6 | permitted |
 | arch/arm/irq.rs | 8 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
 | arch/arm/timer.rs | 4 | permitted |

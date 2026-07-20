@@ -206,25 +206,44 @@ unsafe extern "C" fn stub_reserved() -> ! {
     )
 }
 
-/// IRQ is the one exception that **returns**. Every other stub above reports and halts; this one has
-/// to hand control back to whatever was interrupted, so it is a real handler rather than a reporter.
+/// IRQ is the one exception that **returns** - and now the one that can return somewhere *else*.
 ///
-/// - `sub lr, lr, #4` first: on IRQ entry ARMv7 leaves LR one instruction past the return point.
-/// - Stack `r0-r3, r12` (caller-saved under AAPCS, so the Rust handler may clobber them) and `lr`.
-///   `r4-r11` need no saving - Rust preserves callee-saved registers itself. Six registers is 24
-///   bytes, a multiple of 8, so the stack stays 8-byte aligned for the call.
-/// - `ldm sp!, {..., pc}^` is the exception return: the trailing `^` with `pc` in the list restores
-///   `CPSR` from `SPSR` in the same instruction, atomically resuming the interrupted mode.
+/// A cooperative switch (`context.rs`) gets to assume a function-call boundary, so AAPCS lets it save
+/// ten registers. Preemption has no such luxury: the interrupt lands between two arbitrary
+/// instructions with anything live, so the **entire** register file plus the return PC and `SPSR`
+/// must be captured. That whole set is the *trap frame*, and it is built on the interrupted task's
+/// own stack - which is what makes switching tasks a matter of switching `sp`.
 ///
-/// This runs on the IRQ mode's own banked stack, primed by `install()`.
+/// The ARMv7 problem this dance solves: on IRQ entry the CPU is in IRQ mode, where the interrupted
+/// mode's `sp` and `lr` are **banked away and unreachable**. Saving them means getting back into the
+/// interrupted mode first, which is what `srsdb` + `cps` achieve between them:
+///
+/// - `sub lr, lr, #4` - on IRQ entry ARMv7 leaves LR one instruction past the resume point.
+/// - `srsdb sp!, #0x13` - Store Return State: pushes `LR_irq` (the resume PC) and `SPSR_irq` onto the
+///   **SVC** mode's stack, reaching across the mode banking rather than fighting it.
+/// - `cps #0x13` - now switch to SVC, standing on the interrupted task's own stack.
+/// - `push {{r0-r12, lr}}` - the rest of the frame. `lr` here is `LR_svc`, the task's own link
+///   register, no longer the IRQ one.
+/// - The dispatcher receives the frame pointer and **returns the frame to resume**. Returning a
+///   different pointer is the entire mechanism of preemption: `mov sp, r0` adopts another task's
+///   stack, and everything below restores *that* task instead.
+/// - `rfeia sp!` - Return From Exception: reloads PC and CPSR from the frame in one instruction,
+///   atomically resuming the target task in its own mode with its own interrupt state.
+///
+/// The frame is 16 words (64 bytes), a multiple of 8, so AAPCS stack alignment survives the call.
 #[unsafe(naked)]
 #[no_mangle]
 unsafe extern "C" fn stub_irq() {
     core::arch::naked_asm!(
-        "sub  lr, lr, #4",
-        "stmfd sp!, {{r0-r3, r12, lr}}",
-        "bl   {dispatch}",
-        "ldmfd sp!, {{r0-r3, r12, pc}}^",
+        "sub   lr, lr, #4",
+        "srsdb sp!, #0x13",             // push resume PC + SPSR onto the SVC stack
+        "cps   #0x13",                  // switch to SVC: the interrupted task's stack
+        "push  {{r0-r12, lr}}",         // rest of the frame
+        "mov   r0, sp",                 // r0 = &TrapFrame
+        "bl    {dispatch}",             // -> returns the frame to resume (maybe a different task)
+        "mov   sp, r0",                 // adopt it: THIS is the task switch
+        "pop   {{r0-r12, lr}}",
+        "rfeia sp!",                    // restore PC + CPSR together
         dispatch = sym crate::arch::arm::irq::arm_irq_dispatch,
     )
 }

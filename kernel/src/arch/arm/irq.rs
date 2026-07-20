@@ -137,7 +137,7 @@ pub fn disable_interrupts() {
 /// counted but not acted on, because silently *clearing* an interrupt we do not understand would turn
 /// a diagnosable fault into an invisible one.
 #[no_mangle]
-pub(super) extern "C" fn arm_irq_dispatch() {
+pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
     let source = local_read(CORE_IRQ_SOURCE);
 
     if source & IRQ_PHYS_TIMER != 0 {
@@ -150,6 +150,10 @@ pub(super) extern "C" fn arm_irq_dispatch() {
     // Other sources (mailboxes, GPU funnel) are not enabled yet, so nothing else should arrive. If
     // something does, leaving it asserted is the loud outcome: it will re-enter and be obvious,
     // rather than being quietly discarded.
+
+    // Hand the frame to the scheduler. It returns the frame to RESUME - the same one to continue
+    // uninterrupted, or another task's to preempt. `stub_irq` adopts whatever comes back.
+    super::context::schedule(frame_sp)
 }
 
 /// Route the generic timer to this core's IRQ line and start ticking at `hz`.

@@ -11,10 +11,12 @@
 //! caller-saved set at the call site. So the switch is responsible only for the callee-saved half -
 //! exactly as the x86 side saves its callee-saved registers and CR3 and no more.
 //!
-//! **This is a cooperative switch: it is called, not forced.** Preemptive switching - swapping
-//! contexts from inside the timer IRQ - needs the *full* register file saved, because an interrupt
-//! can land between any two instructions with anything live. That is the next increment, and it
-//! builds on this rather than replacing it.
+//! **Both halves live here.** The cooperative switch above is *called*, so AAPCS lets it save ten
+//! registers. The preemptive switch below is *forced* from the timer IRQ, where an interrupt can land
+//! between any two instructions with anything live - so it saves the entire register file plus the
+//! resume PC and `SPSR` as a **trap frame on the interrupted task's own stack**. That placement is
+//! what makes a task switch cheap: the state is already parked where it belongs, so switching tasks
+//! is switching `sp`, and the scheduler need only return a different frame pointer.
 //!
 //! No address-space switch here either. Every context shares the one identity mapping from `mmu.rs`;
 //! per-task page tables (a `TTBR0` write plus the TLB maintenance the SEC-26/27 port contract
@@ -145,5 +147,146 @@ pub fn selftest() {
         pl011_write(b"arm32: context selftest PASS (two kernel contexts switch and resume)\r\n");
     } else {
         pl011_write(b"arm32: context selftest FAIL - the switch did not round-trip cleanly\r\n");
+    }
+}
+
+// ============================ Preemptive switching ============================
+
+/// The full interrupted state, as `stub_irq` lays it out on the task's own stack.
+///
+/// **Field order mirrors the push order exactly** and is as load-bearing as `Context`'s: `push
+/// {r0-r12, lr}` stores in increasing register number from the lowest address, and the `srsdb` above
+/// it leaves the resume PC then `SPSR` at the top. Get this wrong and tasks resume with scrambled
+/// registers - which would look like random corruption far from the cause.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TrapFrame {
+    pub r: [u32; 13], // r0-r12
+    pub lr: u32,      // LR_svc - the interrupted task's own link register
+    pub pc: u32,      // resume address (LR_irq, already adjusted by -4)
+    pub spsr: u32,    // the interrupted CPSR: mode + interrupt masks
+}
+
+/// CPSR for a fresh kernel task: SVC mode, IRQs **enabled** (so it can itself be preempted), FIQ
+/// masked. A task started with IRQs disabled would run to completion and never yield - preemption
+/// silently dead, with no error anywhere.
+const SPSR_SVC_IRQ_ON: u32 = 0x13 | 0x40;
+
+const MAX_TASKS: usize = 3;
+const TASK_STACK_SIZE: usize = 4096;
+
+#[repr(align(8))]
+struct TaskStacks([[u8; TASK_STACK_SIZE]; MAX_TASKS]);
+static mut TASK_STACKS: TaskStacks = TaskStacks([[0; TASK_STACK_SIZE]; MAX_TASKS]);
+
+/// Per-task saved frame pointer. A task is "saved" precisely when its `sp` is recorded here; the rest
+/// of its state is already sitting on its own stack, which is the elegance of the trap-frame approach
+/// - there is no separate register-save area to manage.
+static TASK_SP: [AtomicU32; MAX_TASKS] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
+/// How many times each task has been scheduled - the selftest's evidence that round-robin actually
+/// rotates rather than favouring one task.
+static TASK_RUNS: [AtomicU32; MAX_TASKS] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
+static CURRENT: AtomicU32 = AtomicU32::new(0);
+static PREEMPT_ON: AtomicU32 = AtomicU32::new(0);
+
+/// Build a trap frame on a fresh task's stack so the ordinary `pop` + `rfeia` path starts it.
+///
+/// The same trick as `Context::prepare`, one layer down: rather than special-casing "has never run"
+/// inside the switch, fabricate the state the switch expects to find.
+fn prepare_task(index: usize, entry: extern "C" fn() -> !) {
+    // SAFETY: Boot-time, single-threaded, before preemption is armed. Each task's stack is a distinct
+    // static slice; we write one frame at its top and record the pointer. `addr_of_mut!` avoids
+    // taking a reference to a `static mut`.
+    unsafe {
+        let base = core::ptr::addr_of_mut!(TASK_STACKS.0[index]) as usize;
+        let top = (base + TASK_STACK_SIZE) & !7;
+        let frame_addr = top - core::mem::size_of::<TrapFrame>();
+        let frame = frame_addr as *mut TrapFrame;
+        (*frame) = TrapFrame {
+            r: [0; 13],
+            lr: task_returned as usize as u32,
+            pc: entry as usize as u32,
+            spsr: SPSR_SVC_IRQ_ON,
+        };
+        TASK_SP[index].store(frame_addr as u32, Ordering::Relaxed);
+    }
+}
+
+/// A kernel task ran off the end of its entry function. Nothing can recover it - there is no task
+/// table to reap into yet - so stop loudly rather than branching somewhere undefined.
+extern "C" fn task_returned() -> ! {
+    pl011_write(b"arm32: a kernel task returned from its entry function - halting\r\n");
+    loop {
+        // SAFETY: WFI is always architecturally valid.
+        unsafe { core::arch::asm!("wfi") }
+    }
+}
+
+/// Round-robin, called from the timer IRQ with the outgoing task's frame.
+///
+/// Saves the current task's `sp`, picks the next, returns *its* `sp`. `stub_irq` adopts whatever
+/// comes back, so returning a different frame is precisely what makes the switch happen.
+pub(super) fn schedule(frame_sp: u32) -> u32 {
+    if PREEMPT_ON.load(Ordering::Relaxed) == 0 {
+        return frame_sp; // not armed: resume exactly what we interrupted
+    }
+
+    let cur = CURRENT.load(Ordering::Relaxed) as usize;
+    TASK_SP[cur].store(frame_sp, Ordering::Relaxed);
+
+    let next = (cur + 1) % MAX_TASKS;
+    CURRENT.store(next as u32, Ordering::Relaxed);
+    TASK_RUNS[next].fetch_add(1, Ordering::Relaxed);
+
+    TASK_SP[next].load(Ordering::Relaxed)
+}
+
+// Demo task bodies. Each spins forever; the TIMER takes control away, which is the whole point -
+// none of them cooperates, yields, or is aware the others exist.
+extern "C" fn task_a() -> ! { loop { core::hint::spin_loop(); } }
+extern "C" fn task_b() -> ! { loop { core::hint::spin_loop(); } }
+extern "C" fn task_c() -> ! { loop { core::hint::spin_loop(); } }
+
+/// Prove preemption: start three non-cooperating tasks and check the timer rotates between them.
+///
+/// The bar is "all three ran", not "something ran". A switch that always picked the same task, or
+/// that worked once and then wedged, would still show a task running - checking that EVERY task was
+/// scheduled is what requires a working rotation.
+pub fn preempt_selftest() {
+    prepare_task(0, task_a);
+    prepare_task(1, task_b);
+    prepare_task(2, task_c);
+
+    // Slot 0 is notionally current, so the first preemption saves THIS boot context into it and moves
+    // on; boot's own state is what slot 0 carries from then on.
+    CURRENT.store(0, Ordering::Relaxed);
+    PREEMPT_ON.store(1, Ordering::Relaxed);
+
+    // Let the tick rotate for a while. This delay is itself preempted - which is the point.
+    super::timer::delay_us(300_000);
+
+    PREEMPT_ON.store(0, Ordering::Relaxed);
+
+    let runs = [
+        TASK_RUNS[0].load(Ordering::Relaxed),
+        TASK_RUNS[1].load(Ordering::Relaxed),
+        TASK_RUNS[2].load(Ordering::Relaxed),
+    ];
+
+    pl011_write(b"arm32: preempt selftest - task runs: ");
+    let mut first = true;
+    for r in runs.iter() {
+        if !first { pl011_write(b" / "); }
+        first = false;
+        write_dec_pub(*r);
+    }
+    pl011_write(b"\r\n");
+
+    if runs.iter().all(|&r| r > 0) {
+        pl011_write(b"arm32: preempt selftest PASS (timer rotates between tasks that never yield)\r\n");
+    } else {
+        pl011_write(b"arm32: preempt selftest FAIL - not every task was scheduled\r\n");
     }
 }
