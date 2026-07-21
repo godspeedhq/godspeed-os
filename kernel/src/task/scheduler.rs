@@ -367,9 +367,8 @@ static CORE_SCHED_CTX: PerCoreMut<TaskContext> = PerCoreMut::new();
 /// (`main`, right after `smp::percpu_init` sets the width) - before any core enters `run()`. The
 /// contexts start zeroed (`run()` seeds CR3); the pending-kstack lists start empty.
 pub fn init_arenas(n: usize) {
-    const ZERO_CTX: TaskContext = TaskContext {
-        rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rip: 0, rsp: 0, cr3: 0,
-    };
+    // Zeroed via the arch primitive so no register name leaks into neutral code (arch/CLAUDE.md).
+    const ZERO_CTX: TaskContext = TaskContext::ZERO;
     CORE_PENDING_KSTACK.init_with(n, |_| [0u64; PENDING_KSTACK_CAP]);
     CORE_DEAD_CTX.init_with(n, |_| ZERO_CTX);
     CORE_SCHED_CTX.init_with(n, |_| ZERO_CTX);

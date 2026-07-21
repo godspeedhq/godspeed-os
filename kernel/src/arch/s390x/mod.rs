@@ -212,6 +212,9 @@ pub mod context_switch {
         pub rip: u64, pub rsp: u64, pub cr3: u64,
     }
     impl TaskContext {
+        /// All-zero context. Neutral code builds zero contexts via this, naming no register.
+        pub const ZERO: Self = Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rip: 0, rsp: 0, cr3: 0 };
+
         pub unsafe fn new_kernel(entry: unsafe extern "C" fn() -> !, stack_top: *mut u8, cr3: u64) -> Self {
             Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rip: entry as u64, rsp: stack_top as u64, cr3 }
         }

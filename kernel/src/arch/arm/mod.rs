@@ -21,6 +21,7 @@ pub mod mmu;
 pub mod timer;
 pub mod irq;
 pub mod context;
+pub mod context_switch;
 
 // ============================ Boot bring-up (Raspberry Pi 2 Model B) ============================
 // BCM2836 peripheral base is 0x3F00_0000 (the BCM2835/Pi 1 was 0x2000_0000; the BCM2711/Pi 4 is
@@ -186,6 +187,7 @@ extern "C" fn arm_boot_main() -> ! {
     }
     context::selftest();
     context::preempt_selftest();
+    context_switch::selftest();
     #[cfg(feature = "arm-fault-test")]
     exceptions::trigger_test_fault();
     pl011_write(b"arm32: machine layer COMPLETE - MMU, vectors, tick, cooperative + preemptive switch.\r\n");
@@ -360,24 +362,8 @@ pub mod interrupts {
 }
 
 // ---------------------------------------------------------------------------
-pub mod context_switch {
-    // AArch64: callee-saved x19-x28, fp/lr, sp + the page-table base. Field names kept x86-ish for the
-    // stub compile; a real port renames them (and `cr3` in the neutral scheduler is a leak to address).
-    #[repr(C)]
-    pub struct TaskContext {
-        pub rbx: u64, pub rbp: u64, pub r12: u64, pub r13: u64, pub r14: u64, pub r15: u64,
-        pub rip: u64, pub rsp: u64, pub cr3: u64,
-    }
-    impl TaskContext {
-        pub unsafe fn new_kernel(entry: unsafe extern "C" fn() -> !, stack_top: *mut u8, cr3: u64) -> Self {
-            Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rip: entry as u64, rsp: stack_top as u64, cr3 }
-        }
-        pub unsafe fn new_user(kernel_stack_top: *mut u8, user_entry: u64, user_stack_top: u64, cr3: u64) -> Self {
-            Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rip: user_entry, rsp: kernel_stack_top as u64, cr3 }
-        }
-    }
-    pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const TaskContext) {}
-}
+// The neutral context-switch surface is now a REAL implementation (`context_switch.rs`), not a stub:
+// TaskContext + new_kernel/new_user + switch_context that the arch-neutral scheduler drives directly.
 
 // ---------------------------------------------------------------------------
 pub mod rtc {

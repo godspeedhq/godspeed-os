@@ -23,6 +23,28 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-21 - Neutral context-switch surface, real (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/context_switch.rs` | 0 -> 14 (new file) | **The real `arch::imp::context_switch` surface** the neutral scheduler imports: `TaskContext`, `new_kernel`/`new_user`, and the naked `switch_context`, plus a selftest driving a kernel task through that exact neutral API. The `unsafe` is the two naked asm fns (switch + first-entry trampoline), the constructors, `user_mode_unimplemented`, and the selftest's static/ptr manipulation. Replaces the compile-only stub that was inline in `mod.rs`. |
+| `arch/x86_64/context_switch.rs` + 5 arch stubs | +1 line each (`TaskContext::ZERO`) | A neutral leak fixed by an arch primitive, not a special case (`arch/CLAUDE.md`). The scheduler built a zero context with a literal `TaskContext { rbx: 0, ... }`, naming x86 registers in neutral code - which does not compile once ARM's `TaskContext` is ARM-shaped. Each arch now exposes `const ZERO: Self`; the scheduler uses `TaskContext::ZERO`, naming no register. |
+
+**Kernel-only integration, honestly scoped.** The neutral scheduler spawns **only** ring-3 tasks
+(`new_user`, from ELF binaries) - it has no path that calls `new_kernel` - so `scheduler::run()`
+end-to-end genuinely needs userspace, which ARM does not have (0-byte service placeholder). What *is*
+provable kernel-only is the scheduler's core primitive: `TaskContext::new_kernel` + `switch_context`
+driving an ARM kernel task, which the selftest exercises through the neutral types.
+
+**The switch mirrors x86 semantics exactly, and a bug proved it.** Like x86, the ARM switch saves
+callee-saved + `sp` + `lr` but **not** `cr3` (it only *loads* TTBR0). The first selftest faulted in a
+loop with TTBR0=0 - because `SCHED_CTX.cr3` stayed zero from its `ZERO` init, and switching back
+loaded it. That is the *exact* gotcha x86 documents at `scheduler.rs` ("seed the scheduler context's
+CR3 ... switch_context never saves CR3, only loads it"); reproducing it confirms the semantics match.
+The fix seeds `SCHED_CTX.cr3` with the live TTBR0, as the neutral `run()` does. `new_user` builds a
+context that halts loudly if entered - ring-3 needs an SPSR return, per-task page tables, and SVC
+syscalls, none of which exist yet, so a premature user spawn fails visibly rather than running undefined.
+
 ## 2026-07-20 - Device tree parsing: learn the memory map (feat/pi2-arm32)
 
 | File | Change | Why |
@@ -426,6 +448,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mod.rs | 23 | permitted |
 | arch/arm/exceptions.rs | 21 | permitted |
 | arch/arm/context.rs | 6 | permitted |
+| arch/arm/context_switch.rs | 14 | permitted |
 | arch/arm/dtb.rs | 6 | permitted |
 | arch/arm/irq.rs | 8 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
