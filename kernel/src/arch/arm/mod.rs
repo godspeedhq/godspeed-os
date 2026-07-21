@@ -22,6 +22,7 @@ pub mod timer;
 pub mod irq;
 pub mod context;
 pub mod context_switch;
+pub mod page_tables;
 
 // ============================ Boot bring-up (Raspberry Pi 2 Model B) ============================
 // BCM2836 peripheral base is 0x3F00_0000 (the BCM2835/Pi 1 was 0x2000_0000; the BCM2711/Pi 4 is
@@ -188,6 +189,7 @@ extern "C" fn arm_boot_main() -> ! {
     context::selftest();
     context::preempt_selftest();
     context_switch::selftest();
+    page_tables::selftest();
     #[cfg(feature = "arm-fault-test")]
     exceptions::trigger_test_fault();
     pl011_write(b"arm32: machine layer COMPLETE - MMU, vectors, tick, cooperative + preemptive switch.\r\n");
@@ -287,49 +289,8 @@ pub mod boot {
 }
 
 // ---------------------------------------------------------------------------
-pub mod page_tables {
-    use crate::memory::frame::{Frame, PhysAddr};
-
-    pub const PAGE_SIZE: usize = 4096;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-    pub struct VirtAddr(pub u64);
-
-    bitflags::bitflags! {
-        #[derive(Clone, Copy, PartialEq, Eq)]
-        pub struct PageFlags: u64 {
-            const PRESENT  = 1 << 0;
-            const WRITABLE = 1 << 1;
-            const USER     = 1 << 2;
-            const PWT      = 1 << 3;
-            const PCD      = 1 << 4;
-            const NO_EXEC  = 1 << 63;
-        }
-    }
-
-    #[derive(Debug)]
-    pub enum MapError { FrameAllocFailed, AlreadyMapped, NotMapped }
-
-    pub struct PageTable { root: u64 }
-    impl PageTable {
-        pub fn new() -> Result<Self, MapError> { unimplemented!() }
-        pub fn map(&mut self, virt: VirtAddr, phys: PhysAddr, flags: PageFlags) -> Result<(), MapError> { unimplemented!() }
-        pub fn unmap(&mut self, virt: VirtAddr) -> Result<Frame, MapError> { unimplemented!() }
-        pub fn cr3_value(&self) -> u64 { self.root }
-        pub fn into_cr3(self) -> u64 { self.root }
-    }
-
-    pub fn get_hhdm_offset() -> u64 { 0 }
-    pub unsafe fn set_hhdm_offset(offset: u64) {}
-    pub fn read_page_table_base() -> u64 { 0 }               // TTBR0_EL1
-    pub unsafe fn write_page_table_base(base: u64) {}
-    pub unsafe fn invalidate_tlb_page(addr: u64) {}          // TLBI VAE1
-    pub unsafe fn map_in_active_tables(virt: u64, phys: u64, flags: u64) -> Result<(), MapError> { unimplemented!() }
-    pub fn entry_for_va(virt: u64) -> Option<u64> { None }
-    pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {}
-    pub fn harden_hhdm_nx() {}
-    pub unsafe fn reclaim_user_frames(cr3: u64) -> usize { 0 }
-}
+// page_tables is now a real module (page_tables.rs): two-level 4 KiB tables, TTBR0/TLB
+// primitives, and the neutral PageTable API - not the compile-only stub that was here.
 
 // ---------------------------------------------------------------------------
 pub mod syscall_entry {

@@ -23,6 +23,29 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-21 - ARMv7 two-level page tables (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/page_tables.rs` | 0 -> 17 (new file) | **Real two-level 4 KiB page tables**, replacing the compile-only stub inline in `mod.rs`. `mmu.rs` gave 1 MiB sections; this gives an L2 table under an L1 entry, so individual pages carry their own permissions. The `unsafe` is: the TTBR0/TLB primitives (`invalidate_tlb_page` = TLBIMVA, `read`/`write_page_table_base`), the descriptor writes into the live and fresh L1/L2 tables, the static-arena table allocators, and the `ATS1CPR`/`ATS1CPW` translation probes the selftest uses. |
+
+**The read-only proof needs no fault.** `ATS1CPW` runs a privileged-*write* address translation and
+reports the result in `PAR.F` - so a read-only page returns "denied" for a write while `ATS1CPR`
+(read) still returns its address. The selftest maps one page RW and one RO into the live tables and
+checks: both translate for read, RW is writable, **RO is not**. The negative is the load-bearing one
+(same discipline as the MMU and IOMMU selftests): "RW translates" only shows the L2 was built; "RO
+refuses a write" shows the AP/APX permission bits are actually enforced. That is real per-page
+protection, the thing 1 MiB sections could not give.
+
+**The frame source is a bounded static arena, deliberately.** x86's `PageTable::new` pulls table
+frames from the neutral `alloc_frame`, which needs `memory::init` + a real memory map - and that pulls
+in Limine-shaped assumptions (`protect_kernel_page_table_frames`) that are a separate integration
+step. So table memory is a fixed static arena here (§26.6.1), with the `alloc_frame` swap called out as
+the one remaining seam. The *algorithm* - build an L2, point an L1 entry at it, encode the page with
+its permissions - is the real one the neutral path will drive unchanged. `map_in_active_tables` fills a
+currently-unmapped L1 slot (a VA in the gap between RAM end and the peripherals) rather than converting
+a live section, so running code is never momentarily unmapped.
+
 ## 2026-07-21 - Neutral context-switch surface, real (feat/pi2-arm32)
 
 | File | Change | Why |
@@ -452,6 +475,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/dtb.rs | 6 | permitted |
 | arch/arm/irq.rs | 8 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
+| arch/arm/page_tables.rs | 17 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
 | arch/arm/mod.rs | 21 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
