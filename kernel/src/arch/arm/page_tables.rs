@@ -92,17 +92,20 @@ fn l1_table_ptr(l2_pa: u32) -> u32 {
 // ---- Static table arena (the seam to the neutral frame allocator) ----
 
 /// L2 tables: 1 KiB each, 1 KiB aligned. A bump allocator hands them out. The count is a fixed,
-/// visible bound (§26.6.1); it is generous for the kernel-only path (each covers 1 MiB of 4 KiB
-/// pages) and the whole arena is replaced by `alloc_frame` once `memory::init` is wired on ARM.
-const L2_TABLES: usize = 16;
+/// visible bound (§26.6.1); each covers 1 MiB of 4 KiB pages, and a service uses ~3-4 (its code, ctx,
+/// stack, plus the kernel-identity fill). Sized for the boot loader selftest plus several concurrent
+/// services (IPC pair, supervisor, shell); the whole arena is replaced by `alloc_frame` once
+/// `memory::init` owns page-table frames on ARM.
+const L2_TABLES: usize = 64;
 #[repr(align(1024))]
 struct L2Arena([[u32; 256]; L2_TABLES]);
 static mut L2_ARENA: L2Arena = L2Arena([[0; 256]; L2_TABLES]);
 static L2_NEXT: AtomicUsize = AtomicUsize::new(0);
 
-/// Fresh L1 tables (16 KiB each, 16 KiB aligned) for `PageTable::new`. Two suffice with no real user
-/// tasks yet; this too becomes `alloc_frame` when the neutral allocator is wired.
-const L1_TABLES: usize = 2;
+/// Fresh L1 tables (16 KiB each, 16 KiB aligned) for `PageTable::new`. One per address space: the boot
+/// loader selftest takes one, and each live service takes one. Sized (with headroom) for the running
+/// service set; becomes `alloc_frame` when the neutral allocator owns these frames.
+const L1_TABLES: usize = 8;
 #[repr(align(16384))]
 struct L1Arena([[u32; 4096]; L1_TABLES]);
 static mut L1_ARENA: L1Arena = L1Arena([[0; 4096]; L1_TABLES]);

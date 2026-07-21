@@ -23,6 +23,22 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-21 - Two USER services at once: the banked-register trap frame (feat/pi2-arm32, increment 3a)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/exceptions.rs` | unchanged count | `stub_irq` now stacks the interrupted task's USER-banked `SP_usr`/`LR_usr` (`stmdb r0, {sp, lr}^` on save, `ldmia r0, {sp, lr}^` on restore) - the prerequisite for **more than one** user task. With one, nothing else touched the USER bank across a round trip; with two, task B's ring-3 execution would clobber task A's user stack unless it is saved per task. The extra instructions live in the existing naked block, so no new `unsafe`. Frame grew 16 -> 18 words. |
+| `arch/arm/context.rs` | unchanged count | `TrapFrame` gains `usr_sp`/`usr_lr` (matching the 18-word layout) and `prepare_task` zeroes them for kernel tasks (their USER bank is unused). Struct/field change only, no new `unsafe`. |
+| `arch/arm/page_tables.rs` | unchanged count | L1 arena 2 -> 8, L2 arena 16 -> 64: the boot loader selftest takes one L1 and each live service takes one, so two only left room for a single service. Sized (bounded static, §26.6.1) for the running service set - IPC pair, supervisor, shell. Constants only, no `unsafe`. |
+| `arch/arm/sched_ipc.rs` | 0 -> 6 (new file) | Loads **two** logger instances as scheduled USER tasks (each its own address space) plus two kernel spinners, and runs them under `scheduler::run`. The isolation test for the banked frame; grows into real send/recv (increment 3b). The `unsafe` is the static-stack setup and the `new_user`/`new_kernel`/`commit_task` calls. Gated behind `arm-sched-ipc`. |
+
+**What this proves.** Two independent USER services run concurrently in ring 3 under the scheduler and
+both reach PL0 and issue their cap-validated syscall (`logger: ready` twice) with no corruption and no
+fault. Were the banked frame wrong, the second user task's ring-3 execution would clobber the first's
+`SP_usr` and one would fault - so "both ready, no fault, system live" is the proof the per-task
+`SP_usr`/`LR_usr` save/restore is correct. This is the trap-frame foundation IPC stands on. Verified in
+QEMU (`raspi2b`); the default image is unregressed (`preempt selftest PASS 9/9/9`).
+
 ## 2026-07-21 - A USER service runs through the scheduler, preemptively (feat/pi2-arm32)
 
 | File | Change | Why |
@@ -610,6 +626,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/page_tables.rs | 23 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |
+| arch/arm/sched_ipc.rs | 6 | permitted |
 | arch/arm/spawn.rs | 8 | permitted |
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |

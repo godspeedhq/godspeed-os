@@ -242,15 +242,23 @@ unsafe extern "C" fn stub_reserved() -> ! {
 /// - `srsdb sp!, #0x13` - Store Return State: pushes `LR_irq` (the resume PC) and `SPSR_irq` onto the
 ///   **SVC** mode's stack, reaching across the mode banking rather than fighting it.
 /// - `cps #0x13` - now switch to SVC, standing on the interrupted task's own stack.
-/// - `push {{r0-r12, lr}}` - the rest of the frame. `lr` here is `LR_svc`, the task's own link
-///   register, no longer the IRQ one.
+/// - `push {{r0-r12, lr}}` - the rest of the SVC-visible frame. `lr` here is `LR_svc`, the task's own
+///   link register, no longer the IRQ one.
+/// - **`stmdb r0, {{sp, lr}}^` - save the interrupted task's USER-banked `SP_usr`/`LR_usr`.** This is
+///   what makes preempting a *user* task correct once more than one exists: user mode banks its own
+///   `sp`/`lr`, and if task B runs in ring 3 between task A's preemption and resume it clobbers those
+///   banked registers. Without stacking them per-task, A would resume on B's user stack. The `^`
+///   suffix is the only way SVC mode can reach the USER bank; it forbids base-register writeback and
+///   `sp` in the list, so a scratch base (`r0`) carries the address and `sp` is adjusted separately.
+///   (For a *kernel* task these are the unused System-bank `r13`/`r14`: saved and restored harmlessly.)
 /// - The dispatcher receives the frame pointer and **returns the frame to resume**. Returning a
 ///   different pointer is the entire mechanism of preemption: `mov sp, r0` adopts another task's
 ///   stack, and everything below restores *that* task instead.
 /// - `rfeia sp!` - Return From Exception: reloads PC and CPSR from the frame in one instruction,
 ///   atomically resuming the target task in its own mode with its own interrupt state.
 ///
-/// The frame is 16 words (64 bytes), a multiple of 8, so AAPCS stack alignment survives the call.
+/// The frame is 18 words (72 bytes), a multiple of 8, so AAPCS stack alignment survives the call. Its
+/// layout is mirrored by `context::TrapFrame` (`usr_sp, usr_lr, r0..r12, lr_svc, pc, spsr`).
 #[unsafe(naked)]
 #[no_mangle]
 unsafe extern "C" fn stub_irq() {
@@ -258,11 +266,18 @@ unsafe extern "C" fn stub_irq() {
         "sub   lr, lr, #4",
         "srsdb sp!, #0x13",             // push resume PC + SPSR onto the SVC stack
         "cps   #0x13",                  // switch to SVC: the interrupted task's stack
-        "push  {{r0-r12, lr}}",         // rest of the frame
+        "push  {{r0-r12, lr}}",         // r0-r12 + LR_svc
+        "mov   r0, sp",                 // r0 -> the r0 slot (top of the pushed regs)
+        "stmdb r0, {{sp, lr}}^",        // save USER-banked SP_usr/LR_usr just below (no writeback)
+        "sub   sp, sp, #8",             // sp -> usr_sp slot: the frame now includes them
         "mov   r0, sp",                 // r0 = &TrapFrame
         "bl    {dispatch}",             // -> returns the frame to resume (maybe a different task)
         "mov   sp, r0",                 // adopt it: THIS is the task switch
-        "pop   {{r0-r12, lr}}",
+        "mov   r0, sp",                 // r0 = &TrapFrame (base for the ^ load; must not be sp)
+        "add   sp, sp, #8",             // advance SVC sp past usr_sp/usr_lr
+        "ldmia r0, {{sp, lr}}^",        // restore USER-banked SP_usr/LR_usr from the frame
+        "nop",                          // banked-register hazard spacer (one instr before touching sp)
+        "pop   {{r0-r12, lr}}",         // restore r0-r12 + LR_svc
         "rfeia sp!",                    // restore PC + CPSR together
         dispatch = sym crate::arch::arm::irq::arm_irq_dispatch,
     )

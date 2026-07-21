@@ -154,13 +154,16 @@ pub fn selftest() {
 
 /// The full interrupted state, as `stub_irq` lays it out on the task's own stack.
 ///
-/// **Field order mirrors the push order exactly** and is as load-bearing as `Context`'s: `push
-/// {r0-r12, lr}` stores in increasing register number from the lowest address, and the `srsdb` above
-/// it leaves the resume PC then `SPSR` at the top. Get this wrong and tasks resume with scrambled
-/// registers - which would look like random corruption far from the cause.
+/// **Field order mirrors the push order exactly** and is as load-bearing as `Context`'s: the two
+/// USER-banked words (`SP_usr`/`LR_usr`, saved via `stmdb {sp, lr}^`) sit lowest, then `push {r0-r12,
+/// lr}` stores in increasing register number, and the `srsdb` above leaves the resume PC then `SPSR`
+/// at the top. Get this wrong and tasks resume with scrambled registers - random corruption far from
+/// the cause. 18 words / 72 bytes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TrapFrame {
+    pub usr_sp: u32,  // SP_usr - the interrupted task's USER-banked stack pointer
+    pub usr_lr: u32,  // LR_usr - the interrupted task's USER-banked link register
     pub r: [u32; 13], // r0-r12
     pub lr: u32,      // LR_svc - the interrupted task's own link register
     pub pc: u32,      // resume address (LR_irq, already adjusted by -4)
@@ -205,6 +208,10 @@ fn prepare_task(index: usize, entry: extern "C" fn() -> !) {
         let frame_addr = top - core::mem::size_of::<TrapFrame>();
         let frame = frame_addr as *mut TrapFrame;
         (*frame) = TrapFrame {
+            // Kernel task: the USER-banked sp/lr are unused (it runs in SVC), so zero them. They are
+            // restored into the System/USER bank on entry and never read, which is harmless.
+            usr_sp: 0,
+            usr_lr: 0,
             r: [0; 13],
             lr: task_returned as usize as u32,
             pc: entry as usize as u32,

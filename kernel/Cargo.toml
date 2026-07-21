@@ -51,6 +51,9 @@ arm-sched-demo = []
 # Run a real USER service (the logger) THROUGH the neutral scheduler on ARM, preemptively, alongside
 # spinning kernel tasks (arch/arm/sched_user.rs). Proves per-task address spaces + user-mode preemption.
 arm-sched-user = []
+# Run TWO USER services under the scheduler at once (arch/arm/sched_ipc.rs). Proves the banked-register
+# trap frame (SP_usr/LR_usr per task) and is the base the real IPC send/recv proof grows on.
+arm-sched-ipc = []
 
 # Deliberately take a data abort during arm32 boot, to PROVE the exception vectors
 # fire (a fault path never observed firing is not evidence). The ARM twin of the x86
