@@ -351,6 +351,52 @@ pub unsafe fn fill_kernel_identity(pt_root: u32) {
     clean_dcache(pt_root, 16384);
 }
 
+/// Clean + invalidate the entire L1 data cache by set/way (`DCCISW`).
+///
+/// Table walks are non-cacheable (`mmu.rs`: TTBR0 carries no cacheability attributes), so a page
+/// table's descriptors must reach the point of coherency before the walker reads them under a new
+/// TTBR0. `fill_kernel_identity` and the loader write those descriptors while the D-cache is on, so a
+/// service's whole page table is flushed **once** with this before it is ever scheduled; thereafter
+/// `switch_context` only re-points TTBR0 and flushes the TLB, needing no further cache maintenance
+/// (the descriptors do not change after spawn). This is also why the first direct spawn cleaned here
+/// before switching TTBR0 - the same one-shot, hoisted to spawn time for the scheduled path.
+///
+/// # Safety
+/// A pure cache-maintenance sweep with no memory effects; reads CCSIDR to size the cache.
+pub(super) unsafe fn clean_invalidate_dcache_all() {
+    // SAFETY: set/way D-cache clean+invalidate is a PL1 maintenance operation with no memory effects
+    // beyond making the D-cache coherent with memory. Sizes the cache from CCSIDR/CSSELR.
+    unsafe {
+        core::arch::asm!(
+            "mov  {t0}, #0",
+            "mcr  p15, 2, {t0}, c0, c0, 0", // CSSELR = L1 data cache
+            "isb",
+            "mrc  p15, 1, {t0}, c0, c0, 0", // CCSIDR
+            "and  {t1}, {t0}, #7",          // line size (log2 words - 2)
+            "add  {t1}, {t1}, #4",          // + word/byte shift
+            "ubfx {t2}, {t0}, #3, #10",     // associativity - 1 (ways)
+            "ubfx {t3}, {t0}, #13, #15",    // num sets - 1
+            "clz  {t4}, {t2}",              // way position shift
+            "2:",                           // set loop ({t3} = current set)
+            "mov  {t5}, {t2}",              // ways
+            "3:",                           // way loop ({t5} = current way)
+            "lsl  {t6}, {t5}, {t4}",        // way << A
+            "lsl  {t0}, {t3}, {t1}",        // set << L (t0 reused as scratch)
+            "orr  {t6}, {t6}, {t0}",        // set/way value
+            "mcr  p15, 0, {t6}, c7, c14, 2",// DCCISW - clean+invalidate by set/way
+            "subs {t5}, {t5}, #1",
+            "bge  3b",
+            "subs {t3}, {t3}, #1",
+            "bge  2b",
+            "dsb",
+            "isb",
+            t0 = out(reg) _, t1 = out(reg) _, t2 = out(reg) _, t3 = out(reg) _,
+            t4 = out(reg) _, t5 = out(reg) _, t6 = out(reg) _,
+            options(nostack),
+        );
+    }
+}
+
 // ---- The remaining neutral surface (honest stubs / no-ops for the kernel-only path) ----
 
 /// ARM runs identity-mapped (VA == PA), so hhdm=0 is the correct value, not "unset".

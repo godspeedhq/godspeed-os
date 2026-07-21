@@ -48,6 +48,9 @@ panic = "abort"
 arm-spawn-logger = []
 # Run the neutral scheduler over 3 cooperative kernel tasks on ARM (arch/arm/sched_demo.rs).
 arm-sched-demo = []
+# Run a real USER service (the logger) THROUGH the neutral scheduler on ARM, preemptively, alongside
+# spinning kernel tasks (arch/arm/sched_user.rs). Proves per-task address spaces + user-mode preemption.
+arm-sched-user = []
 
 # Deliberately take a data abort during arm32 boot, to PROVE the exception vectors
 # fire (a fault path never observed firing is not evidence). The ARM twin of the x86

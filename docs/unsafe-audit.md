@@ -23,6 +23,26 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-21 - A USER service runs through the scheduler, preemptively (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/context_switch.rs` | 14 -> 13 (-1) | `new_user` is now **real**: it builds a context whose first `switch_context` drops to PL0 via a new `user_entry_trampoline` (installs the user stack, fabricates a USR-mode SPSR with IRQs on, `movs pc`). The loud `user_mode_unimplemented` stub it replaced is deleted - net one fewer `unsafe`. `switch_context` also gained a `TLBIALL` on the TTBR0-change branch (SEC-26/27: an ARM address-space switch does not implicitly flush), inside the existing naked block (no new `unsafe`). |
+| `arch/arm/page_tables.rs` | 21 -> 23 (+2) | `clean_invalidate_dcache_all` (set/way `DCCISW`) moved here from `spawn.rs` as the shared home for cache maintenance: it makes a service's page-table descriptors visible to the non-cacheable walker once at spawn, so `switch_context` needs no per-switch cache work. The `unsafe fn` + its asm block are the +2. |
+| `arch/arm/sched_user.rs` | 0 -> 6 (new file) | Loads the logger as a scheduled **USER** task (its own TTBR0), commits it plus two spinning kernel tasks to the neutral `scheduler::run(0)`, cleans the D-cache once, and arms `NEUTRAL_SCHED`. The `unsafe` is the static-stack setup and the `new_user`/`new_kernel`/`commit_task` calls. Gated behind `arm-sched-user`. |
+| `arch/arm/spawn.rs` | unchanged count | Refactored to expose `neutral_bootstrap` + `load_logger_into_slot` (shared with `sched_user`) and to call `page_tables::clean_invalidate_dcache_all` rather than a private copy. No net `unsafe` change. |
+
+**What this proves.** A real GodspeedOS service (`logger`) runs *through* the neutral scheduler on ARM,
+not entered directly: loaded into its own address space, committed to a task slot, and preempted in
+ring 3 by the timer (its trap frame lands on its own kernel stack), while spinning kernel tasks are
+round-robined around it. `logger: ready` is its cap-validated syscall, issued from PL0 under its own
+TTBR0 - so the per-task page table, the `switch_context` TTBR0-swap + `TLBIALL`, and the one-shot
+descriptor D-cache clean all hold end to end. Verified in QEMU (`raspi2b`): `logger: ready` once,
+kernel tasks advancing past tick 3, no fault. **Single** user task by design: a second one needs
+`stub_irq` to also stack the banked `SP_usr`/`LR_usr` (the next increment); with one, nothing else
+touches the USER bank across the round trip. The default image is unregressed (`preempt selftest PASS
+9/9/9`, `neutral surface PASS`).
+
 ## 2026-07-21 - Timer preemption via the neutral scheduler (feat/pi2-arm32)
 
 | File | Change | Why |
@@ -582,13 +602,14 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mod.rs | 23 | permitted |
 | arch/arm/exceptions.rs | 21 | permitted |
 | arch/arm/context.rs | 6 | permitted |
-| arch/arm/context_switch.rs | 14 | permitted |
+| arch/arm/context_switch.rs | 13 | permitted |
 | arch/arm/dtb.rs | 6 | permitted |
 | arch/arm/irq.rs | 9 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
-| arch/arm/page_tables.rs | 21 | permitted |
+| arch/arm/page_tables.rs | 23 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
+| arch/arm/sched_user.rs | 6 | permitted |
 | arch/arm/spawn.rs | 8 | permitted |
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
@@ -621,7 +642,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | smp/placement.rs | 1 | permitted |
 | smp/spinlock.rs | 5 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
-| loader.rs | 4 | grandfathered |
+| loader.rs | 2 | grandfathered |
 | main.rs | 2 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
 | task/mod.rs | 7 | grandfathered |

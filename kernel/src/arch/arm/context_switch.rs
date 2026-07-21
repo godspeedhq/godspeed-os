@@ -78,25 +78,54 @@ impl TaskContext {
         }
     }
 
-    /// Build a context that would enter **user mode** (PL0). Present so the neutral scheduler's
-    /// ring-3 spawn path compiles; **not** reachable on the kernel-only path.
+    /// Build a context that enters **user mode** (PL0) on its first `switch_context`.
     ///
-    /// User mode on ARMv7 needs an `rfe`/`movs pc` return through a fabricated `SPSR` with the USR
-    /// mode bits, per-task page tables, and the SVC syscall entry - none of which exist yet. Rather
-    /// than fake it, this builds a context that halts loudly if it is ever actually entered, so a
-    /// premature ring-3 spawn fails visibly instead of running undefined.
+    /// The same priming trick as `new_kernel`, one privilege level lower. The switch restores `lr` and
+    /// `bx`es to it, so `lr` is a trampoline; `r4`/`r5` carry the PL0 entry and the user stack the
+    /// trampoline installs before dropping to ring 3 (mirroring `usermode::enter_pl0`). `sp` is the
+    /// task's own **kernel** (SVC) stack - the stack a later timer IRQ builds its trap frame on, which
+    /// is what makes the running user task preemptible.
     ///
     /// # Safety
-    /// Same contract as `new_kernel`; the arguments are accepted for signature parity.
+    /// `kernel_stack_top` must point to writable memory owned by this task. `user_entry` must be mapped
+    /// USER-executable and `user_stack_top` USER-writable in the address space `cr3` (TTBR0) selects,
+    /// which the switch installs on entry.
     pub unsafe fn new_user(
         kernel_stack_top: *mut u8,
-        _user_entry: u64,
-        _user_stack_top: u64,
+        user_entry: u64,
+        user_stack_top: u64,
         cr3: u64,
     ) -> Self {
-        // SAFETY: the caller guarantees a valid kernel stack; we only start the task at a loud stop.
-        unsafe { Self::new_kernel(user_mode_unimplemented, kernel_stack_top, cr3) }
+        TaskContext {
+            r4: user_entry as u32,       // parked: the PL0 entry the trampoline drops to
+            r5: user_stack_top as u32,   // parked: the user stack the trampoline installs
+            r6: 0, r7: 0, r8: 0, r9: 0, r10: 0, r11: 0,
+            sp: (kernel_stack_top as usize & !7) as u32,
+            lr: user_entry_trampoline as usize as u32,
+            cr3,
+        }
     }
+}
+
+/// First-entry trampoline for a **user** task: the `bx lr` target the switch lands on, one privilege
+/// level below `first_entry_trampoline`.
+///
+/// The scheduler switched in with IRQs masked. `switch_context` restored `r4` = the PL0 entry, `r5` =
+/// the user stack, and `sp` = this task's kernel stack (where a future preemption's trap frame goes).
+/// This installs the user stack in the USR bank and fabricates an exception return to ring 3 with IRQs
+/// **enabled** (SPSR = USR), so the task is preemptible the instant it starts - the ARM analogue of
+/// `usermode::enter_pl0`, reached through the scheduler rather than directly.
+#[unsafe(naked)]
+unsafe extern "C" fn user_entry_trampoline() -> ! {
+    core::arch::naked_asm!(
+        "cps  #0x1f",   // system mode shares the USR banked SP
+        "mov  sp, r5",  // install the user stack
+        "cps  #0x13",   // back to SVC (its sp = this task's kernel stack, untouched)
+        "mov  r3, #0x10", // SPSR = USR mode, IRQs enabled (F left masked) - preemptible in ring 3
+        "msr  spsr_cxsf, r3",
+        "mov  lr, r4",  // LR = the service entry
+        "movs pc, lr",  // drop to PL0, restoring CPSR (IRQs on) from SPSR
+    )
 }
 
 /// First-entry trampoline: the `bx lr` target for a never-run task.
@@ -112,26 +141,26 @@ unsafe extern "C" fn first_entry_trampoline() -> ! {
     )
 }
 
-/// A task built by `new_user` was actually entered on the kernel-only path. There is no user mode
-/// yet, so stop loudly rather than execute undefined.
-unsafe extern "C" fn user_mode_unimplemented() -> ! {
-    pl011_write(b"arm32: new_user context entered, but user mode is not implemented - halting\r\n");
-    loop {
-        // SAFETY: WFI is always valid.
-        unsafe { core::arch::asm!("wfi") }
-    }
-}
-
 /// Save the outgoing task's callee-saved state into `*current`, restore `*next`, and resume `next`.
 ///
 /// The ARM twin of x86's return-based switch. `ldmia` restores `r4-r11`, `sp`, `lr`; `bx lr` resumes
 /// wherever `next` left off (its saved `lr`), or the trampoline for a fresh task. TTBR0 is switched
-/// only when it changes - identical to x86's CR3 compare - which for kernel tasks sharing the
-/// identity map means it is never touched, and the SEC-26/27 TLB obligation never arises here.
+/// only when it changes - identical to x86's CR3 compare - so a switch between two kernel tasks
+/// sharing the identity map never touches it.
+///
+/// **When TTBR0 *does* change (a user task enters or leaves), the whole TLB is flushed (`TLBIALL`).**
+/// This is the SEC-26/27 obligation the `arch/CLAUDE.md` port contract names: unlike x86, an ARMv7
+/// TTBR0 switch does **not** implicitly flush non-global entries, so without this a stale mapping from
+/// the outgoing address space could be honoured under the incoming one. `TLBIALL` over-flushes (it
+/// drops global kernel entries too, which merely re-walk) but is unconditionally correct;
+/// per-ASID precision (`TLBIASID`) is a later optimisation, not a correctness need. The descriptors
+/// themselves are made visible to the (non-cacheable) walker by a one-shot D-cache clean at spawn
+/// (`page_tables::clean_invalidate_dcache_all`), so no per-switch cache maintenance is needed here.
 ///
 /// # Safety
 /// Both pointers must be valid, distinct, aligned `TaskContext`s. `next` must hold state saved by a
-/// previous call here or built by a constructor above; its `sp` must point at a live stack.
+/// previous call here or built by a constructor above; its `sp` must point at a live stack. `next.cr3`
+/// must be a valid TTBR0 whose page table's descriptors are already clean to the point of coherency.
 #[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const TaskContext) {
@@ -146,6 +175,8 @@ pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const 
         "cmp   r2, r3",
         "beq   1f",
         "mcr   p15, 0, r2, c2, c0, 0", // switch address space
+        "mov   r3, #0",
+        "mcr   p15, 0, r3, c8, c7, 0", // TLBIALL - ARM TTBR0 switch needs explicit TLB flush (SEC-26/27)
         "dsb",
         "isb",
         "1:",
