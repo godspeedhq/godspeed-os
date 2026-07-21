@@ -142,6 +142,19 @@ pub fn disable_interrupts() {
 /// by the port when it hands control to `scheduler::run`.
 pub static NEUTRAL_SCHED: AtomicBool = AtomicBool::new(false);
 
+/// Per-slot "this is a USER (ring-3) task" flags, maintained arch-locally so the timer can implement
+/// **atomic syscalls** (below) without reaching into the neutral scheduler's `static mut TASK_IS_USER`
+/// (which would grow `task/`'s grandfathered unsafe floor). The ARM spawn/commit paths mark each user
+/// task's slot via `mark_task_user`; kernel tasks (the demos) are left `false` and stay preemptible.
+const ARM_MAX_TASKS: usize = 256;
+static ARM_TASK_IS_USER: [AtomicBool; ARM_MAX_TASKS] =
+    [const { AtomicBool::new(false) }; ARM_MAX_TASKS];
+
+/// Mark scheduler `slot` as a USER task (so the timer won't preempt it mid-syscall). Idempotent.
+pub fn mark_task_user(slot: usize) {
+    if slot < ARM_MAX_TASKS { ARM_TASK_IS_USER[slot].store(true, Ordering::Relaxed); }
+}
+
 #[no_mangle]
 pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
     let source = local_read(CORE_IRQ_SOURCE);
@@ -155,17 +168,33 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
         TICKS.fetch_add(1, Ordering::Relaxed);
 
         if NEUTRAL_SCHED.load(Ordering::Relaxed) {
-            // The real preemption path: the neutral scheduler tick preempts the running task via
-            // `switch_context` INTERNALLY - it swaps `sp` to the resumed task's kernel stack itself. So
-            // we return `frame_sp` unchanged: after the switch (and after this task is later resumed,
-            // `switch_context` unwinding back into this call), `frame_sp` again names THIS task's frame,
-            // and `stub_irq`'s `mov sp, r0` is a no-op. The SAME stub serves both paths (below): the demo
-            // scheduler returns a DIFFERENT frame to adopt; the neutral one swaps in place and returns
-            // the same one. Runs with IRQs masked (IRQ-mode entry set CPSR.I), as the neutral tick
-            // assumes.
-            // SAFETY: `timer_tick_from_irq` is the neutral preemption entry; on ARM it is reached only
-            // from this masked IRQ handler running on the interrupted task's kernel (SVC) stack.
-            unsafe { crate::task::scheduler::timer_tick_from_irq(0, 0, 0); }
+            // **Atomic syscalls: do not preempt a USER task that is in a syscall (SVC mode).** Unlike
+            // x86, preempting ARM kernel/SVC code mid-syscall corrupts - SPSR_svc and the SVC-banked sp
+            // are single shared registers, so switching to another task (which runs its own syscall)
+            // clobbers state the interrupted syscall must restore at its `movs pc` return, producing a
+            // wild-PC fault (proven: slowing the tick to run syscalls to completion eliminates it). A
+            // blocking syscall yields *voluntarily* via `block_and_reschedule`, so this cannot let a
+            // task monopolise the core; a non-blocking syscall is short; and the task is preempted the
+            // instant it is back in USER mode. Only a USER task in SVC is a syscall: a *kernel* task
+            // (the demos) runs in SVC as its normal body and MUST stay preemptible, so the check is
+            // gated on this slot being a user task, not on SVC mode alone.
+            //
+            // The interrupted CPSR is the trap frame's `spsr`, the last of its 18 words:
+            // [usr_sp, usr_lr, r0..r12, lr_svc, pc, spsr] -> spsr at frame_sp + 68.
+            // SAFETY: `frame_sp` is the trap frame `stub_irq` built on the interrupted task's stack.
+            let interrupted_spsr = unsafe { ((frame_sp + 68) as *const u32).read_volatile() };
+            let in_svc = (interrupted_spsr & 0x1f) != 0x10; // not USR mode -> SVC (kernel/syscall)
+            let slot = crate::task::scheduler::current_task_slot();
+            let user_task = slot < ARM_MAX_TASKS && ARM_TASK_IS_USER[slot].load(Ordering::Relaxed);
+            if !(in_svc && user_task) {
+                // Preempt: the neutral tick swaps `sp` to the resumed task's kernel stack INTERNALLY,
+                // so we return `frame_sp` unchanged and `stub_irq`'s `mov sp, r0` is a no-op. The SAME
+                // stub serves both paths (below): the demo scheduler returns a DIFFERENT frame to adopt;
+                // the neutral one swaps in place. Runs with IRQs masked (IRQ-mode entry set CPSR.I).
+                // SAFETY: `timer_tick_from_irq` is the neutral preemption entry; on ARM it is reached
+                // only from this masked IRQ handler running on the interrupted task's kernel stack.
+                unsafe { crate::task::scheduler::timer_tick_from_irq(0, 0, 0); }
+            }
             return frame_sp;
         }
     }

@@ -20,31 +20,33 @@
 //! actually enqueues messages and wakes `pong` (`handle_try_send` -> `enqueue Ok(Some) -> wake_by_slot`).
 //! Two distinct problems remain, one fixed and one open:
 //!
-//! **(1) FIXED - mid-syscall register corruption -> wild-PC fault.** Symptom: after a few syscalls a
-//! task jumped to a data page (DATA ABORT / UNDEFINED INSTRUCTION with a PC inside a kernel stack).
-//! Bisected: `ping` ALONE loops clean forever; `ping`+`pong` corrupts; and **slowing the timer to 2 Hz
-//! eliminates the fault entirely** - so it is *timer preemption of a task mid-syscall*. Root cause found:
-//! the neutral scheduler re-enables IRQs inside a yield/block dispatch (`enable_interrupts` after
-//! `switch_context`), so `stub_svc`'s exit runs with IRQs on, and its `movs pc, lr` restores the caller's
-//! CPSR from **`SPSR_svc` - a single shared banked register**. A timer taken in that window lets another
-//! task's syscall clobber `SPSR_svc`, corrupting the return. Fixed by re-masking IRQs at the syscall exit
-//! (`stub_svc`: `cpsid i` before the SPSR-restore -> `movs pc`), which dramatically reduced but did not
-//! fully close it - the remaining corruption is the raw mid-syscall preemption itself. A proper "atomic
-//! syscall" fix (skip timer preemption while a USER task is in SVC/syscall) needs to distinguish a user
-//! task in a syscall from a *kernel* task legitimately running in SVC - i.e. `is_user` gating in
-//! `arm_irq_dispatch` (a bare SVC-mode check wrongly freezes the kernel-task demos). That is the next step.
+//! **(1) FIXED - mid-syscall timer-preemption fault.** Symptom: after a few syscalls a task jumped to a
+//! data page (DATA ABORT / UNDEFINED INSTRUCTION, PC inside a kernel stack). Bisected: `ping` ALONE
+//! loops clean forever; `ping`+`pong` corrupts; **slowing the timer to 2 Hz eliminates it** - so it is
+//! *timer preemption of a task mid-syscall*, which on ARM corrupts (SPSR_svc + the SVC-banked sp are
+//! single shared registers). Two fixes landed: (a) `stub_svc` re-masks IRQs (`cpsid i`) across its
+//! `SPSR_svc`-restore -> `movs pc` exit window (the neutral scheduler re-enables IRQs mid-dispatch, so
+//! that window otherwise ran interruptible); (b) **atomic syscalls** - `arm_irq_dispatch` skips timer
+//! preemption when the interrupted mode is SVC *and* the current slot is a USER task
+//! (`irq::ARM_TASK_IS_USER`, set via `mark_task_user`). Gated on `is_user` so a *kernel* task (which
+//! runs in SVC as its body) stays preemptible - verified: `sched_demo`/`sched_user` still rotate, and
+//! the fault is gone (no EXCEPTION across a 30 s run). Also added `clrex` to `switch_context` (a
+//! voluntary switch does not implicitly CLREX like an exception entry, so a cross-task exclusive-monitor
+//! leak could wedge a SpinLock).
 //!
-//! **(2) OPEN - scheduling hang after the SPSR fix.** With the fault suppressed, the system instead
-//! *hangs* right after both services start: `pong` blocks on `recv`, `ping` sends + `yield`s to `pong`
-//! (a switch trace showed `Y 1->0 nlr=block_and_reschedule`, so `pong`'s saved context is now correct -
-//! not the timer context it was before), but `pong`'s block never returns and no `pong: received`
-//! appears. So a `yield`-driven switch into a just-woken task blocked in `recv` does not resume its
-//! `block_and_reschedule` cleanly. This is the current front line.
-//!
-//! Ruled out along the way: `find_send_slot`/ctx wiring (correct), the send path (enqueues+wakes), and
-//! the USER-banked `SP_usr`/`LR_usr` (saving them in both `stub_svc` and `switch_context` left the fault
-//! unchanged; both attempts reverted). `kprintln` works on ARM (it is how `handle_log` emits), but it is
-//! slow enough on the PL011 to perturb timing, so traces must be minimal.
+//! **(2) OPEN - residual corruption/hang on the syscall-context switch.** Even with the fault gone, the
+//! IPC still does not complete: after both services start, the system hangs. Tracing showed `pong`'s
+//! `block_and_reschedule` DOES resume after `ping` wakes+yields to it (`B resume slot=0`), but its local
+//! `slot` - asserted `< MAX_TASKS` at function entry - reads back as a **garbage value** (e.g.
+//! 22870304) at the function tail, i.e. `pong`'s stack/registers are corrupted *across the voluntary
+//! `switch_context`* (yield/block from a syscall context) - a path #1/#2/#3a never hit (they switch only
+//! from the timer IRQ). Non-deterministic between runs. This is the front line: the AAPCS callee-saved
+//! contract, or the saved `TaskContext`/kernel stack, is not surviving a cross-task switch reached from
+//! deep inside a syscall. Ruled out: ctx/`find_send_slot` wiring (correct), the send path (enqueues +
+//! wakes - traced), the wake (`wake_by_slot` completes), USER-banked SP_usr/LR_usr (reverted), and the
+//! SpinLock/D-cache (kprintln, which takes a lock, works under the service TTBR0 right at the hang).
+//! `kprintln` works on ARM but is PL011-slow, so it perturbs timing - keep traces minimal, and symbolize
+//! fault/return addresses with `rust-nm -n <kernel-elf>`.
 
 use core::sync::atomic::Ordering;
 
@@ -107,6 +109,8 @@ unsafe fn commit_user(svc: &super::spawn::RawService, name: &'static str, kstack
         let ctx = TaskContext::new_user(kstack_top, svc.entry as u64, USER_STACK_TOP as u64, svc.pt_root as u64);
         crate::task::scheduler::commit_task(svc.slot, name, ctx, false, kstack_top as u64, endpoint);
     }
+    // Mark it a USER task so the timer runs its syscalls atomically (no mid-syscall preemption).
+    super::irq::mark_task_user(svc.slot);
 }
 
 /// Bring up the neutral subsystems, wire a `ping` -> `pong` endpoint, commit both as scheduled USER

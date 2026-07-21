@@ -23,6 +23,20 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-21 - Atomic syscalls + CLREX on ARM (feat/pi2-arm32, increment 3b hunt cont'd)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/irq.rs` | 9 -> 10 (+1) | `arm_irq_dispatch` reads the interrupted CPSR from the trap frame (`frame_sp + 68`) to implement **atomic syscalls**: skip timer preemption when a USER task is in SVC (a syscall), since preempting ARM kernel code mid-syscall corrupts (SPSR_svc + SVC-banked sp are shared). Gated on `ARM_TASK_IS_USER[slot]` (set by `mark_task_user`) so a *kernel* task running in SVC stays preemptible. The +1 unsafe is the frame read. |
+| `arch/arm/context_switch.rs` | unchanged count | Added `clrex` at the top of `switch_context`: a voluntary switch does not implicitly CLREX like an exception entry, so a task switched out mid-`ldrex`/`strex` could leak the exclusive monitor and wedge a SpinLock. Inside the existing naked block, no new `unsafe`. |
+| `arch/arm/mod.rs` | unchanged count | Doc-only: `syscall_slot` stays null (ARM tracks user tasks arch-locally, so the neutral `prepare_ring3_switch` never runs and never derefs it). |
+
+**Status: the mid-syscall preemption FAULT is fixed (verified: no EXCEPTION over 30 s, `sched_demo`/
+`sched_user` still rotate/preempt); the IPC still hangs on a residual corruption across the voluntary
+syscall-context `switch_context`** (`block_and_reschedule`'s `slot` local, asserted `< MAX_TASKS` at
+entry, reads back garbage at the tail). Full diagnosis in `sched_ipc.rs`. The SPSR-window fix (`stub_svc`
+`cpsid i`) from the prior commit stays.
+
 ## 2026-07-21 - Cross-service IPC wiring (feat/pi2-arm32, increment 3b - WIP, blocked on a diagnosed bug)
 
 | File | Change | Why |
@@ -643,7 +657,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
 | arch/arm/dtb.rs | 6 | permitted |
-| arch/arm/irq.rs | 9 | permitted |
+| arch/arm/irq.rs | 10 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
 | arch/arm/page_tables.rs | 23 | permitted |

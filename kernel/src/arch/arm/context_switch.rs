@@ -165,6 +165,14 @@ unsafe extern "C" fn first_entry_trampoline() -> ! {
 #[no_mangle]
 pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const TaskContext) {
     core::arch::naked_asm!(
+        // Clear the local exclusive monitor. This is a VOLUNTARY switch (a function call), not an
+        // exception, so unlike an IRQ/SVC entry it does NOT implicitly CLREX. Without this, a task
+        // switched out between an `ldrex` and its `strex` (e.g. one that blocked while spinning for a
+        // SpinLock) leaves the monitor open; the incoming task's `strex` can then spuriously succeed or
+        // fail against the outgoing task's tag, corrupting or livelocking the lock. The SpinLock uses
+        // ldrex/strex, so a cross-task monitor leak wedges it - the IPC recv-path hang. Architecturally
+        // mandated on any context switch that isn't an exception return.
+        "clrex",
         // Save outgoing callee-saved + sp + lr into *current (r0).
         "stmia r0, {{r4-r11}}",
         "str   sp, [r0, #0x20]",

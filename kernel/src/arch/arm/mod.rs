@@ -363,6 +363,10 @@ pub mod syscall_entry {
     /// at `0x400000` and their stack tops at `USER_STACK_TOP` (`0x8000_0000`), all under this.
     pub const USER_END: u64 = 0x8000_0000;
 
+    // ARM keeps `is_user=false` in the neutral scheduler and tracks ring-3 tasks arch-locally
+    // (`irq::ARM_TASK_IS_USER`), so the neutral `prepare_ring3_switch`/user-RSP path never runs and this
+    // pointer is never dereferenced - null is correct. (ARM has no SYSCALL/SYSRET fast path: user sp/lr
+    // live in banked registers and syscall entry/exit is `svc`/`movs pc`.)
     pub fn syscall_slot(_core_id: usize) -> *mut PerCoreSyscallData { core::ptr::null_mut() }
     pub fn init_percore_syscall_arena(_n: usize) {}
     pub fn init_percore_arenas(_n: usize) {}

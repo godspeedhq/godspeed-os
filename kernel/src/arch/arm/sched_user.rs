@@ -82,6 +82,8 @@ pub fn run(ram_end: u32, reserve_end: u32) -> ! {
                     svc.slot, "logger", ctx, false, kstack_top as u64, None,
                 );
             }
+            // Mark it a USER task so the timer runs its syscalls atomically (no mid-syscall preemption).
+            super::irq::mark_task_user(svc.slot);
             pl011_write(b"sched-user: logger committed as a scheduled USER task.\r\n");
         }
         None => {
