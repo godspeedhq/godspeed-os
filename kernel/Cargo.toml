@@ -46,6 +46,8 @@ panic = "abort"
 # work under the service's dual-mapped address space, so the boot would block. Gated so the default
 # image boots clean while the spawn is exercised + iterated on with this feature.
 arm-spawn-logger = []
+# Run the neutral scheduler over 3 cooperative kernel tasks on ARM (arch/arm/sched_demo.rs).
+arm-sched-demo = []
 
 # Deliberately take a data abort during arm32 boot, to PROVE the exception vectors
 # fire (a fault path never observed firing is not evidence). The ARM twin of the x86

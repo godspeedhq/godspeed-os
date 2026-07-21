@@ -23,6 +23,19 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-21 - Neutral scheduler runs tasks on ARM (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/sched_demo.rs` | 0 -> 6 (new file) | Commits three kernel tasks and enters the neutral `scheduler::run(0)`; it round-robins them (A->B->C->A...) via `pick_next` + `switch_context` + `yield_current`. Proves the neutral scheduler - the foundation the supervisor and every service stand on - runs on ARM. The `unsafe` is the static-stack setup, the `new_kernel`/`commit_task` calls, and the BootInfo construction for the neutral bootstrap. Gated behind `arm-sched-demo`. |
+
+**Cooperative first, deliberately.** The tasks `yield` (a scheduling point), so this exercises the
+scheduler's task table + `switch_context` without the timer-preemption rework - running the timer IRQ
+on per-task kernel stacks so it can `switch_context` a *non-yielding* task - that real services need.
+That is the next increment; this proves the layer beneath it. No per-task page tables (all tasks share
+the kernel identity map), so a switch never changes TTBR0 and the D-cache dance from the service spawn
+does not arise.
+
 ## 2026-07-21 - Minimal service spawn (feat/pi2-arm32)
 
 Increment 6 groundwork: enough to load a real service, set up its task + capability, and run it at
@@ -555,6 +568,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
 | arch/arm/page_tables.rs | 21 | permitted |
+| arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/spawn.rs | 8 | permitted |
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
