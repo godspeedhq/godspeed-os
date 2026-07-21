@@ -269,6 +269,9 @@ pub enum SpawnError {
     /// A live task with this name already exists. Refused to avoid duplicate
     /// instances - in particular a second trusted-root service (§6.2).
     AlreadyRunning,
+    /// An explicitly-requested core (contract `placement.core` / `spawn_on`) is not ready (§9.2). The
+    /// spawn is rejected rather than rerouted; the caller (e.g. the supervisor) may retry elsewhere.
+    PlacementInvalid,
 }
 
 impl From<crate::loader::LoadError> for SpawnError {
@@ -3172,21 +3175,28 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
 /// Resolve which core a spawn lands on: explicit override, else the contract's
 /// preferred core (falling back to round-robin if it isn't ready), else
 /// round-robin across ready cores.
-fn resolve_spawn_core(core_override: Option<u32>, preferred_core: u32) -> u32 {
+fn resolve_spawn_core(core_override: Option<u32>, preferred_core: u32) -> Result<u32, SpawnError> {
     use core::sync::atomic::{AtomicU32, Ordering};
     static RR: AtomicU32 = AtomicU32::new(0);
     match core_override {
-        Some(n) => n,
+        // An explicitly-requested core (contract `placement.core`, or the supervisor's `spawn_on`) is
+        // STRICT (§9.2): if it is not ready, REJECT with PlacementInvalid rather than silently placing
+        // the service on a core no scheduler runs (which would strand it). On a multi-core machine the
+        // requested core is ready, so this always passes and nothing changes; on a single-core machine
+        // (the Pi 2, APs parked) it is what makes the supervisor's `spawn_on(x, 1)` fall back to core 0
+        // instead of stranding `x` on the parked core.
+        Some(n) if crate::smp::core::is_ready(n) => Ok(n),
+        Some(_) => Err(SpawnError::PlacementInvalid),
         None if preferred_core == u32::MAX => {
             let count = crate::smp::core::ready_count() as u32;
-            if count == 0 { 0 } else { RR.fetch_add(1, Ordering::Relaxed) % count }
+            Ok(if count == 0 { 0 } else { RR.fetch_add(1, Ordering::Relaxed) % count })
         }
         None => {
             if crate::smp::core::is_ready(preferred_core) {
-                preferred_core
+                Ok(preferred_core)
             } else {
                 let count = crate::smp::core::ready_count() as u32;
-                RR.fetch_add(1, Ordering::Relaxed) % count.max(1)
+                Ok(RR.fetch_add(1, Ordering::Relaxed) % count.max(1))
             }
         }
     }
@@ -3205,7 +3215,7 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
     -> Result<(), SpawnError>
 {
     let (static_name, cfg) = service_config(producer).ok_or(SpawnError::NotFound)?;
-    let core_id = resolve_spawn_core(core_override, cfg.preferred_core);
+    let core_id = resolve_spawn_core(core_override, cfg.preferred_core)?;
     // The delegated pipe peer goes FIRST so the producer/filter reaches it via
     // `send_peer_at(0)` (its "downstream"); the contract's own peers follow, so a filter that
     // must register its name to receive a stage's input (e.g. `upper`) still can. Bounded by
@@ -3242,7 +3252,7 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<O
         return Err(SpawnError::AlreadyRunning);
     }
 
-    let core_id = resolve_spawn_core(core_override, cfg.preferred_core);
+    let core_id = resolve_spawn_core(core_override, cfg.preferred_core)?;
 
     let result = spawn_service_with_config(static_name, cfg.elf, core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
@@ -3266,7 +3276,7 @@ pub fn spawn_service_by_name_with_installs(
         crate::kprintln!("task: spawn '{}' rejected: already running", static_name);
         return Err(SpawnError::AlreadyRunning);
     }
-    let core_id = resolve_spawn_core(core_override, cfg.preferred_core);
+    let core_id = resolve_spawn_core(core_override, cfg.preferred_core)?;
     let result = spawn_service_with_config(static_name, cfg.elf, core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
                               cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,

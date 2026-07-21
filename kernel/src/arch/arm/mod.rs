@@ -32,6 +32,7 @@ pub mod sched_demo;
 pub mod sched_user;
 pub mod sched_ipc;
 pub mod sched_spawn;
+pub mod sched_supervisor;
 
 // ============================ Boot bring-up (Raspberry Pi 2 Model B) ============================
 // BCM2836 peripheral base is 0x3F00_0000 (the BCM2835/Pi 1 was 0x2000_0000; the BCM2711/Pi 4 is
@@ -228,6 +229,8 @@ extern "C" fn arm_boot_main() -> ! {
     sched_ipc::run(ram_end, reserve_end);
     #[cfg(feature = "arm-sched-spawn")]
     sched_spawn::run(ram_end, reserve_end);
+    #[cfg(feature = "arm-supervisor")]
+    sched_supervisor::run(ram_end, reserve_end);
     #[cfg(feature = "arm-spawn-logger")]
     spawn::boot_service(ram_end, reserve_end);
     let _ = (ram_end, reserve_end);

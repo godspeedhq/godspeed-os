@@ -60,6 +60,11 @@ pub(super) fn neutral_bootstrap(ram_end: u32, reserve_end: u32) {
     crate::smp::percpu_init(&boot_info);
     crate::task::scheduler::init_arenas(crate::smp::percpu::num_cores());
     crate::capability::init();
+    // Mark core 0 ready (the only core the Pi 2 runs; the other three A7s are parked in `_start`). This
+    // makes `is_ready(0)` true so placement on core 0 succeeds, while `is_ready(N>0)` stays false
+    // (num_cores == 1) - so the supervisor's `spawn_on(x, 1)` is rejected (§9.2) and falls back to
+    // core 0 rather than stranding the service on a parked core.
+    crate::smp::core::mark_ready(0);
 }
 
 /// The service-context virtual address (`SERVICE_CTX_VA`) mapped into `pt`, backed by a fresh frame.
