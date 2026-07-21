@@ -15,7 +15,7 @@
 |------|-------------|--------------|--------------|---------|--------|----------|
 | **x86-64** | `x86_64-unknown-none` | q35 / bare metal (UEFI) | Limine | 16550 COM1 | **Full OS** - 4 cores, supervisor, `gsh>` shell, storage, networking | Hardware (HP T630) + QEMU; identity 24/0; 80k-round chaos soak |
 | **AArch64** | `aarch64-unknown-none` | `-M virt -cpu cortex-a53` | direct `-kernel` (EL1) | PL011 @ `0x0900_0000` | **Boots + prints** to UART; neutral kernel linked | `qemu-system-aarch64` |
-| **ARM (32-bit)** | `armv7a-none-eabi` | `-M raspi2b` + bare metal | firmware loads `kernel7.img` @ `0x8000` (HYP) | PL011 @ `0x3F20_1000` | **RUNS USERSPACE ON HARDWARE** - a real service (`logger`) loaded from ELF runs at PL0 and logs via a cap-checked syscall (`logger: ready`); full machine layer + syscalls + user mode below it | **Raspberry Pi 2 Model B v1.1** (2026-07-21) + QEMU |
+| **ARM (32-bit)** | `armv7a-none-eabi` | `-M raspi2b` + bare metal | firmware loads `kernel7.img` @ `0x8000` (HYP) | PL011 @ `0x3F20_1000` | **RUNS MULTI-SERVICE IPC ON HARDWARE** - two isolated ring-3 services (`ping`/`pong`) exchange capability-mediated messages through a kernel endpoint under preemptive scheduling (`pong: received "N"`, 6192 clean on the Pi 2, 0 faults); built up from `logger: ready` through timer preemption, per-task address spaces, the banked trap frame, atomic syscalls, and 64 KiB kstacks. Full machine layer + syscalls + user mode + scheduler + IPC | **Raspberry Pi 2 Model B v1.1** (2026-07-21) + QEMU |
 | **RISC-V** | `riscv64imac-unknown-none-elf` | `-M virt` | OpenSBI → S-mode @ `0x8020_0000` | NS16550 @ `0x1000_0000` | **Boots + prints** to UART; neutral kernel linked | `qemu-system-riscv64` |
 | **LoongArch64** | `loongarch64-unknown-none-softfloat` | `-M virt` | direct `-kernel` (DA mode) @ `0x20_0000` | NS16550 @ `0x1fe0_01e0` | **Boots + prints** to UART; neutral kernel linked | `qemu-system-loongarch64` |
 | **s390x** (IBM Z) | `s390x-unknown-none-softfloat` (tier-3, `-Zbuild-std`) | `s390-ccw-virtio` | IPL | SCLP console | **Compiles - BIG-ENDIAN**; boot pending the SCLP console (a protocol, not a register) | `qemu-system-s390x` |
@@ -74,7 +74,7 @@ every ISA that has one (x86/x86-64, ARMv7, all 64-bit arches) and a small lock-b
 
 | Arch | Rust target | Word | 64-bit atomics? | Status |
 |------|-------------|------|-----------------|--------|
-| **ARM (32-bit)** | `armv7a-none-eabi` | 32 | Native (LDREXD) | **RUNS USERSPACE ON HARDWARE** (`logger: ready`) - Raspberry Pi 2 Model B v1.1 (BCM2836, Cortex-A7), 2026-07-21. See below. |
+| **ARM (32-bit)** | `armv7a-none-eabi` | 32 | Native (LDREXD) | **RUNS MULTI-SERVICE IPC ON HARDWARE** (`ping`->`pong`, 6192 messages, 0 faults) - Raspberry Pi 2 Model B v1.1 (BCM2836, Cortex-A7), 2026-07-21. See below. |
 | **RISC-V (32-bit)** | `riscv32imac-unknown-none-elf` | 32 | No (RV32A) → `portable-atomic` shim | **Compiles - 0 errors** (shim proves the shim path) |
 | **x86 (32-bit)** | (no upstream `i686-none`) | 32 | Native (CMPXCHG8B) | **Provable, tooling-gated:** the code is word-size-clean (proven by the two above) and has native 64-bit atomics, but rustc ships no bare-metal `i686-none` target; it needs a custom target-spec JSON (a known, small artifact), which hit stable-toolchain friction here. Not a code gap. |
 
