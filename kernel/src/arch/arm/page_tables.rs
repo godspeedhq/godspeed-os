@@ -304,6 +304,53 @@ impl PageTable {
     }
 }
 
+/// Copy the live kernel identity map into a service page table, so the kernel is reachable (as
+/// privileged memory) while running under that table - which it must be, or the service's very first
+/// `svc` would fault with the vectors/kernel unmapped.
+///
+/// Copies each active L1 entry into the service L1 **only where the service L1 is empty**, so the
+/// service's own USER pages (its code, stack, and context, at their own L1 slots) are never
+/// overwritten. The kernel sections are PL1-only, so a PL0 service still cannot touch them - it is
+/// present-but-privileged, exactly the split a user/kernel address space needs.
+///
+/// # Safety
+/// `pt_root` must be a service L1 (16 KiB aligned) built by `PageTable::new`, not yet in use.
+pub unsafe fn fill_kernel_identity(pt_root: u32) {
+    let active = (read_page_table_base() as u32) & 0xFFFF_C000;
+    // SAFETY: both L1s are identity-mapped RAM. For each 1 MiB slot:
+    //  - service slot empty  -> copy the kernel's section wholesale (fast, the common case).
+    //  - service slot is a TABLE over a kernel SECTION -> the service mapped a *page* in this 1 MiB
+    //    (its ctx at 0x3ff000), so the kernel's own data elsewhere in the SAME 1 MiB (the per-core
+    //    arenas the allocator handed out just above the reserve) would be left unmapped. Fill the
+    //    service L2's empty entries with kernel identity PAGES so that data stays reachable. This is
+    //    the fault the first version hit (0x370004): kernel data sharing the ctx's 1 MiB.
+    unsafe {
+        let src = active as *const u32;
+        let dst = pt_root as *mut u32;
+        for i in 0..4096 {
+            let s = src.add(i).read_volatile();
+            let d = dst.add(i).read_volatile();
+            if d == 0 {
+                dst.add(i).write_volatile(s);            // whole-section copy
+            } else if d & 0b11 == L1_TYPE_TABLE && s & 0b11 == 0b10 {
+                // Kernel section under a service table: fill the L2's holes with kernel pages.
+                let l2 = (d & 0xFFFF_FC00) as *mut u32;
+                let sect_base = s & 0xFFF0_0000;         // the 1 MiB physical base
+                for j in 0..256 {
+                    if l2.add(j).read_volatile() == 0 {
+                        let page_pa = sect_base | (j as u32) << 12;
+                        // Kernel RW, PL0 none (PRESENT|WRITABLE) - present but privileged.
+                        l2.add(j).write_volatile(l2_small_page(page_pa, PageFlags::PRESENT | PageFlags::WRITABLE));
+                    }
+                }
+                clean_dcache(l2 as u32, 1024);
+            }
+        }
+    }
+    // The whole L1 must reach the PoC before the (non-cacheable) walker reads it under the new TTBR0.
+    clean_dcache(pt_root, 16384);
+}
+
 // ---- The remaining neutral surface (honest stubs / no-ops for the kernel-only path) ----
 
 /// ARM runs identity-mapped (VA == PA), so hhdm=0 is the correct value, not "unset".

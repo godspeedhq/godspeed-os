@@ -172,6 +172,12 @@ unsafe extern "C" fn stub_undef() -> ! {
 #[no_mangle]
 unsafe extern "C" fn stub_svc() {
     core::arch::naked_asm!(
+        // Mask IRQs for the duration of the syscall. ARM's `svc` does NOT auto-mask (unlike x86's
+        // syscall entry disabling IF), but the neutral handlers ASSUME interrupts are off - notably the
+        // spinlocks: an IRQ taken mid-`ldrex`/`strex` does an implicit CLREX, so with interrupts left
+        // enabled a lock livelocks (the exact timing-dependent hang the first service spawn hit). The
+        // return via `movs pc, lr` restores the caller's CPSR from SPSR, re-enabling IRQs in USR.
+        "cpsid i",
         "push {{r4-r12, lr}}",          // save callee-saved + the SVC return address (LR_svc)
         "mrs  r4, spsr",                // the caller's CPSR (SPSR_svc): carries the caller's mode
         "ldr  r5, ={spsr_save}",        // publish it so a syscall can see the caller's privilege level

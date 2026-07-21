@@ -567,6 +567,18 @@ pub fn enqueue(
 
 /// Validate and return a copy of the capability at `slot` in the current
 /// task's table.
+/// Set which task slot is "current" on a core. Used by a minimal/direct-entry bring-up (e.g. the ARM
+/// port's first service run) that enters a task without going through `scheduler::run`'s pick loop, so
+/// that `current_task_lookup_cap` and the user-copy path resolve to the right task. Arch-neutral.
+///
+/// # Contract (not `unsafe` - the store itself is a safe atomic write, no UB is possible)
+/// `slot` should be a reserved, valid task slot (or `IDLE`), and the core should not be concurrently
+/// running the scheduler pick loop for a different task; violating this mis-attributes syscalls, not
+/// memory-unsafe.
+pub fn set_current_task(core_id: u32, slot: usize) {
+    CORE_CURRENT.get(core_id as usize).store(slot, Ordering::SeqCst);
+}
+
 pub fn current_task_lookup_cap(slot: usize, right: Rights) -> Result<Capability, CapError> {
     let cid  = current_core_id();
     // SAFETY: IF=0 in syscall context; CORE_CURRENT is stable for this core.

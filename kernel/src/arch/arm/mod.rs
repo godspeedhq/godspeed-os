@@ -27,6 +27,7 @@ pub mod meminit;
 pub mod syscall;
 pub mod usermode;
 pub mod loadtest;
+pub mod spawn;
 
 // ============================ Boot bring-up (Raspberry Pi 2 Model B) ============================
 // BCM2836 peripheral base is 0x3F00_0000 (the BCM2835/Pi 1 was 0x2000_0000; the BCM2711/Pi 4 is
@@ -182,6 +183,23 @@ extern "C" fn arm_boot_main() -> ! {
     pl011_write(b"\r\nGodspeedOS arm32: _start reached SVC, PL011 alive - 32-bit ARM BOOTS.\r\n");
     pl011_write(b"arm32: Raspberry Pi 2 Model B (BCM2836, Cortex-A7), peripherals @ 0x3F000000.\r\n");
     exceptions::install();
+    // Set ACTLR.SMP (bit 6) BEFORE enabling caches/MMU. On Cortex-A7, exclusive access (LDREX/STREX -
+    // the basis of every spinlock) to cacheable, shareable memory needs the SMP bit; without it, an
+    // exclusive store can fail perpetually and a spinlock deadlocks. Firmware often sets it, but not
+    // always (nor under QEMU), so set it explicitly. Harmless if already set or if the write is ignored
+    // in non-secure state.
+    // SAFETY: ACTLR is a PL1 control register; ORing in SMP before caches are on is the documented
+    // Cortex-A7 bring-up order. No memory effects.
+    unsafe {
+        core::arch::asm!(
+            "mrc p15, 0, {t}, c1, c0, 1",   // read ACTLR
+            "orr {t}, {t}, #(1 << 6)",      // SMP = 1 (coherency + exclusives for shareable memory)
+            "mcr p15, 0, {t}, c1, c0, 1",   // write ACTLR
+            "isb",
+            t = out(reg) _,
+            options(nomem, nostack),
+        );
+    }
     let ram_end = dtb::report_memory(mmu::FALLBACK_RAM_END);
     mmu::set_ram_end(ram_end);
     mmu::enable();
@@ -193,11 +211,14 @@ extern "C" fn arm_boot_main() -> ! {
     context::selftest();
     context::preempt_selftest();
     context_switch::selftest();
-    meminit::init(ram_end);
+    let reserve_end = meminit::init(ram_end);
     meminit::selftest();
     syscall::selftest();
     usermode::selftest();
     loadtest::selftest();
+    #[cfg(feature = "arm-spawn-logger")]
+    spawn::boot_service(ram_end, reserve_end);
+    let _ = (ram_end, reserve_end);
     page_tables::selftest();
     #[cfg(feature = "arm-fault-test")]
     exceptions::trigger_test_fault();
@@ -370,14 +391,50 @@ pub mod syscall_entry {
 pub mod interrupts {
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
     pub const EHCI_MSI_VECTOR: u8 = 0x29;
-    pub fn enable_interrupts() {}                            // msr daifclr
-    pub fn disable_interrupts() {}                           // msr daifset
-    pub fn local_irq_save() -> bool { false }                // mrs DAIF
-    pub fn local_irq_restore(was_enabled: bool) {}
-    pub fn wait_for_interrupt() {}                           // wfi
-    pub fn idle_can_halt() -> bool { false }
-    pub fn send_eoi() {}                                     // GIC EOIR
-    pub fn fire_test_irq(irq: u8) {}
+
+    /// Unmask IRQs (`cpsie i`). Real, not a stub: the neutral `SpinLock` masks interrupts while held
+    /// (via `local_irq_save`/`restore`), and a no-op here lets the timer ISR fire mid-lock and
+    /// deadlock against the interrupted holder - exactly the hang the first service spawn hit.
+    pub fn enable_interrupts() {
+        // SAFETY: clearing CPSR.I is always valid; the vector table and handlers are installed.
+        unsafe { core::arch::asm!("cpsie i", options(nomem, nostack)) }
+    }
+
+    /// Mask IRQs (`cpsid i`).
+    pub fn disable_interrupts() {
+        // SAFETY: setting CPSR.I is always architecturally valid.
+        unsafe { core::arch::asm!("cpsid i", options(nomem, nostack)) }
+    }
+
+    /// Save the current IRQ-enable state and mask. Returns true if IRQs *were* enabled (so the paired
+    /// `restore` knows whether to re-enable), the ARM analogue of x86 saving RFLAGS.IF.
+    pub fn local_irq_save() -> bool {
+        let cpsr: u32;
+        // SAFETY: reading CPSR is side-effect-free; masking IRQs is always valid.
+        unsafe {
+            core::arch::asm!("mrs {c}, cpsr", c = out(reg) cpsr, options(nomem, nostack));
+            core::arch::asm!("cpsid i", options(nomem, nostack));
+        }
+        cpsr & 0x80 == 0 // I bit (7) clear == IRQs were enabled
+    }
+
+    /// Re-enable IRQs only if they were enabled when `local_irq_save` ran (nests correctly).
+    pub fn local_irq_restore(was_enabled: bool) {
+        if was_enabled {
+            // SAFETY: clearing CPSR.I; only done when the saved state had IRQs enabled.
+            unsafe { core::arch::asm!("cpsie i", options(nomem, nostack)) }
+        }
+    }
+
+    /// Wait for an interrupt (`wfi`) - the idle primitive.
+    pub fn wait_for_interrupt() {
+        // SAFETY: WFI is always valid; the timer IRQ (or any) wakes the core.
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) }
+    }
+
+    pub fn idle_can_halt() -> bool { true } // ARM WFI wakes on the generic-timer IRQ; halting is safe
+    pub fn send_eoi() {}                    // BCM2836 timer has no separate EOI (TVAL re-arm clears it)
+    pub fn fire_test_irq(_irq: u8) {}
 }
 
 // ---------------------------------------------------------------------------

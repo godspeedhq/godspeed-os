@@ -23,6 +23,29 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-21 - Minimal service spawn (feat/pi2-arm32)
+
+Increment 6 groundwork: enough to load a real service, set up its task + capability, and run it at
+PL0 issuing syscalls. All in the permitted `arch/` layer with SAFETY comments; no grandfathered floor
+moves (the one neutral helper, `set_current_task`, is a **safe** fn - the atomic store is not UB - so
+`scheduler.rs` stays at its floor).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/spawn.rs` | 0 -> 7 (new file) | The minimal spawn: build a BootInfo, run the neutral `memory`/`percpu`/`capability` init, load the logger ELF, map its user stack + service-context page, reserve a task slot with a `LOG_WRITE` cap, clone the kernel into the service address space, switch TTBR0, and drop to PL0. |
+| `arch/arm/page_tables.rs` | 19 -> 21 | `fill_kernel_identity`: clone the live kernel identity map into a service page table (whole-section where the service slot is empty; page-fill the L2 where the service tabled-over a kernel section, so kernel data sharing the ctx/code 1 MiB stays reachable). |
+| `arch/arm/mod.rs` | 21 -> 22 | The `interrupts` module's `disable`/`enable`/`local_irq_save`/`restore`/`wfi` are now REAL (`cpsid`/`cpsie`/`wfi`), the ARM `read`/`write_user_bytes`/`validate_user_ptr` are real, `switch_to_boot_stack` sets SP, and ACTLR.SMP is set at boot. |
+
+**MILESTONE REACHED: `logger: ready`.** A real GodspeedOS service, loaded from an ELF, runs
+unprivileged (PL0) on 32-bit ARM under its own address space, and logs through a capability-checked
+`svc` into the neutral dispatcher. `clean_invalidate_dcache_all` (a set/way `DCCISW` sweep, +1
+unsafe) before the TTBR0 switch was the final fix: the kernel maps its memory as 1 MiB **sections**
+but the service maps the shared 1 MiB as 4 KiB **pages**, and stale D-cache lines from the section
+view made the cap-table spinlock's `LDREX`/`STREX` fail under the page view. Cleaning the D-cache
+makes every line coherent before the walker and exclusive monitor see the new mappings, and the lock
+acquires. Gated behind `arm-spawn-logger` so the default image still boots to the selftest halt; the
+feature build runs the service to `ready`.
+
 ## 2026-07-21 - ARMv7 user mode / PL0 (feat/pi2-arm32)
 
 | File | Change | Why |
@@ -531,11 +554,12 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/irq.rs | 8 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
-| arch/arm/page_tables.rs | 19 | permitted |
+| arch/arm/page_tables.rs | 21 | permitted |
+| arch/arm/spawn.rs | 8 | permitted |
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 21 | permitted |
+| arch/arm/mod.rs | 22 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
 | arch/riscv64/mod.rs | 23 | permitted |

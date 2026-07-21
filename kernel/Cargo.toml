@@ -41,6 +41,12 @@ proptest = "1"
 panic = "abort"
 
 [features]
+# Run the minimal ARM logger spawn at boot (arch/arm/spawn.rs). Off by default: the spawn currently
+# reaches PL0 and issues real syscalls, but the kernel's cap-table spinlock (LDREX/STREX) does not yet
+# work under the service's dual-mapped address space, so the boot would block. Gated so the default
+# image boots clean while the spawn is exercised + iterated on with this feature.
+arm-spawn-logger = []
+
 # Deliberately take a data abort during arm32 boot, to PROVE the exception vectors
 # fire (a fault path never observed firing is not evidence). The ARM twin of the x86
 # adversarial fault tests (§22 A14/A15/C2). Never enabled in a normal boot.

@@ -138,10 +138,11 @@ pub unsafe extern "C" fn syscall_handler(
 fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::WRITE) {
         Ok(c) => c,
-        Err(e) => return cap_err_to_i64(e),
+        Err(_e) => { crate::arch::imp::serial_write_bytes_lockfree(b"[hl:CAPERR]\r\n"); return cap_err_to_i64(_e); }
     };
 
     if cap.resource_id != crate::capability::LOG_WRITE_RESOURCE {
+        crate::arch::imp::serial_write_bytes_lockfree(b"[hl:WRONGSCOPE]\r\n");
         return cap_err_to_i64(CapError::CapWrongScope);
     }
     // §3.1 (no ambient authority): control reaches the privileged log write only
@@ -153,11 +154,11 @@ fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 
     let bytes = match read_user_bytes(msg_ptr, len) {
         Some(b) => b,
-        None    => return -1,
+        None    => { crate::arch::imp::serial_write_bytes_lockfree(b"[hl:READERR]\r\n"); return -1; }
     };
     match core::str::from_utf8(bytes) {
         Ok(s) => { crate::kprintln!("{}", s); 0 }
-        Err(_) => -1,
+        Err(_) => { crate::arch::imp::serial_write_bytes_lockfree(b"[hl:UTF8ERR]\r\n"); -1 }
     }
 }
 
