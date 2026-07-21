@@ -10,43 +10,32 @@
 //!      cap, and `ping.send_peers["pong"]` -> its SEND cap.
 //!   4. Commit both as scheduled USER tasks and run.
 //!
-//! The intent: `ping` `ctx.try_send("pong", ...)` and `pong` `ctx.recv()` + logs `pong: received
-//! "..."` - a capability-mediated message from one ring-3 service to another, copied sender ->
-//! receiver by the kernel (§8.5), under preemption. No zero-copy, no shared memory.
+//! `ping` `ctx.try_send("pong", ...)` and `pong` `ctx.recv()` + logs `pong: received "..."` - a
+//! capability-mediated message from one ring-3 service to another, copied sender -> receiver by the
+//! kernel (§8.5), under preemption. No zero-copy, no shared memory. **WORKING** (QEMU `raspi2b`):
+//! `ping: sent 20 messages`, `pong: received "1"`, `"2"`, `"3"`, ... thousands, no fault. Gated behind
+//! `arm-sched-ipc`.
 //!
-//! **KNOWN BUG (increment 3b, under investigation - gated behind `arm-sched-ipc`, off by default).**
-//! The wiring is verified correct: a ctx dump confirmed `send_peer_count=1, slot=1, name="pong"`, both
-//! services reach PL0 and log (`ping: starting`, `pong: ready on core 0`), and tracing confirmed `ping`
-//! actually enqueues messages and wakes `pong` (`handle_try_send` -> `enqueue Ok(Some) -> wake_by_slot`).
-//! Two distinct problems remain, one fixed and one open:
-//!
-//! **(1) FIXED - mid-syscall timer-preemption fault.** Symptom: after a few syscalls a task jumped to a
-//! data page (DATA ABORT / UNDEFINED INSTRUCTION, PC inside a kernel stack). Bisected: `ping` ALONE
-//! loops clean forever; `ping`+`pong` corrupts; **slowing the timer to 2 Hz eliminates it** - so it is
-//! *timer preemption of a task mid-syscall*, which on ARM corrupts (SPSR_svc + the SVC-banked sp are
-//! single shared registers). Two fixes landed: (a) `stub_svc` re-masks IRQs (`cpsid i`) across its
-//! `SPSR_svc`-restore -> `movs pc` exit window (the neutral scheduler re-enables IRQs mid-dispatch, so
-//! that window otherwise ran interruptible); (b) **atomic syscalls** - `arm_irq_dispatch` skips timer
-//! preemption when the interrupted mode is SVC *and* the current slot is a USER task
-//! (`irq::ARM_TASK_IS_USER`, set via `mark_task_user`). Gated on `is_user` so a *kernel* task (which
-//! runs in SVC as its body) stays preemptible - verified: `sched_demo`/`sched_user` still rotate, and
-//! the fault is gone (no EXCEPTION across a 30 s run). Also added `clrex` to `switch_context` (a
-//! voluntary switch does not implicitly CLREX like an exception entry, so a cross-task exclusive-monitor
-//! leak could wedge a SpinLock).
-//!
-//! **(2) OPEN - residual corruption/hang on the syscall-context switch.** Even with the fault gone, the
-//! IPC still does not complete: after both services start, the system hangs. Tracing showed `pong`'s
-//! `block_and_reschedule` DOES resume after `ping` wakes+yields to it (`B resume slot=0`), but its local
-//! `slot` - asserted `< MAX_TASKS` at function entry - reads back as a **garbage value** (e.g.
-//! 22870304) at the function tail, i.e. `pong`'s stack/registers are corrupted *across the voluntary
-//! `switch_context`* (yield/block from a syscall context) - a path #1/#2/#3a never hit (they switch only
-//! from the timer IRQ). Non-deterministic between runs. This is the front line: the AAPCS callee-saved
-//! contract, or the saved `TaskContext`/kernel stack, is not surviving a cross-task switch reached from
-//! deep inside a syscall. Ruled out: ctx/`find_send_slot` wiring (correct), the send path (enqueues +
-//! wakes - traced), the wake (`wake_by_slot` completes), USER-banked SP_usr/LR_usr (reverted), and the
-//! SpinLock/D-cache (kprintln, which takes a lock, works under the service TTBR0 right at the hang).
-//! `kprintln` works on ARM but is PL011-slow, so it perturbs timing - keep traces minimal, and symbolize
-//! fault/return addresses with `rust-nm -n <kernel-elf>`.
+//! **The four ARM-specific bugs this path uncovered, and their fixes (increment 3b):**
+//! 1. **SPSR_svc syscall-exit race** - `stub_svc` restores the caller's CPSR from `SPSR_svc` (a single
+//!    shared banked register) via `movs pc`; the neutral scheduler re-enables IRQs mid-dispatch, so
+//!    that exit ran interruptible and a timer could let another task's syscall clobber it. Fix:
+//!    `cpsid i` before the restore->`movs pc` window (`exceptions::stub_svc`).
+//! 2. **Mid-syscall timer preemption** - preempting ARM kernel/SVC code mid-syscall corrupts (SPSR_svc
+//!    + the SVC-banked sp are shared; proven by the 2 Hz slow-timer test eliminating the fault). Fix:
+//!    **atomic syscalls** - `arm_irq_dispatch` skips timer preemption when a USER task is in SVC,
+//!    gated on the arch-local `irq::ARM_TASK_IS_USER` (`mark_task_user`) so a *kernel* task (which runs
+//!    in SVC as its body) stays preemptible.
+//! 3. **No CLREX on a voluntary switch** - `switch_context` is a call, not an exception, so it does not
+//!    implicitly clear the exclusive monitor; a task switched out mid-`ldrex`/`strex` could wedge a
+//!    SpinLock. Fix: `clrex` at the top of `switch_context`.
+//! 4. **Kernel stack overflow (the residual)** - the ARM kstacks were 8 KiB, but the neutral scheduler
+//!    is written against **64 KiB** (a syscall puts a 4 KiB `Message` on the stack, and
+//!    `block_and_reschedule`/`timer_tick_from_irq`/`switch_context` are deep in a debug build). 8 KiB
+//!    overflowed into the ADJACENT task's stack in this same static array, so a neighbour's
+//!    `block_and_reschedule` local (`slot`, asserted `< MAX_TASKS` at entry) read back a stray pointer
+//!    at the tail. Fix: 64 KiB `KSTACK`, matching what the neutral code assumes. This was the last one:
+//!    with it, the IPC completes cleanly.
 
 use core::sync::atomic::Ordering;
 
@@ -59,7 +48,13 @@ use super::spawn::{USER_STACK_TOP, SERVICE_CTX_MAGIC};
 static PING_ELF: &[u8] = include_bytes!(env!("SVC_PING_ELF"));
 static PONG_ELF: &[u8] = include_bytes!(env!("SVC_PONG_ELF"));
 
-const KSTACK: usize = 8192;
+// 64 KiB, matching the size the NEUTRAL scheduler assumes for a kernel stack (x86 uses 64 KiB, and
+// `prepare_ring3_switch` reasons about "the 64 KiB kstack"). A syscall can put a 4 KiB `Message` on
+// the stack, and the neutral `block_and_reschedule`/`timer_tick_from_irq`/`switch_context` chain is
+// deep in a debug build - 8 KiB overflowed into the ADJACENT task's stack in this same static array,
+// which was the residual IPC corruption (a neighbour task's `block_and_reschedule` local read back a
+// stray pointer). The size must match what the neutral code was written against, not a guess.
+const KSTACK: usize = 64 * 1024;
 
 /// One kernel stack per USER task (for its trap frames): ping + pong.
 #[repr(align(8))]

@@ -27,7 +27,7 @@ use super::pl011_write;
 use super::spawn::USER_STACK_TOP;
 
 const NUM_KERNEL: usize = 2;
-const KSTACK: usize = 8192;
+const KSTACK: usize = 64 * 1024; // 64 KiB: the neutral scheduler assumes this (see sched_ipc); 8 KiB overflows into the adjacent task stack
 
 /// One kernel stack per spinning kernel task, plus one for the user task's trap frames.
 #[repr(align(8))]

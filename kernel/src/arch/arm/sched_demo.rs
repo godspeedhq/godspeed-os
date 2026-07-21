@@ -22,7 +22,7 @@ use crate::arch::imp::{BootInfo, MemoryKind, MemoryRegion};
 use super::pl011_write;
 
 const NUM: usize = 3;
-const KSTACK: usize = 8192;
+const KSTACK: usize = 64 * 1024; // 64 KiB: the neutral scheduler assumes this (see sched_ipc); 8 KiB overflows into the adjacent task stack
 
 #[repr(align(8))]
 struct Stacks([[u8; KSTACK]; NUM]);
