@@ -183,9 +183,18 @@ unsafe extern "C" fn stub_svc() {
         "ldr  r5, ={spsr_save}",        // publish it so a syscall can see the caller's privilege level
         "str  r4, [r5]",                //   (used to prove PL0 in the user-mode selftest)
         "bl   {dispatch}",              // arm_svc_dispatch(r0..r3) -> i64 in r0:r1
-        "msr  spsr_cxsf, r4",           // restore SPSR for the exception return
+        // Re-mask IRQs for the exit. The neutral scheduler re-enables interrupts inside a
+        // yield/block dispatch (enable_interrupts after switch_context), so on return IRQs are ON.
+        // But SPSR_svc is a SINGLE shared banked register, and the exit's `movs pc, lr` restores the
+        // caller's CPSR from it - so a timer taken between `msr spsr` and `movs pc` would let another
+        // task's syscall clobber SPSR_svc, and the caller would resume with a corrupt CPSR (the wild-PC
+        // fault the ARM IPC path hit). Masking here makes the SPSR-restore -> movs-pc window
+        // uninterruptible; `movs pc` then re-enables IRQs from the restored USER CPSR. (x86 has no
+        // analogue: SYSRET restores RIP/RFLAGS atomically from registers, nothing banked or shared.)
+        "cpsid i",
+        "msr  spsr_cxsf, r4",           // restore SPSR for the exception return (now uninterruptible)
         "pop  {{r4-r12, lr}}",          // restore callee-saved + LR_svc; r0:r1 (result) untouched
-        "movs pc, lr",                  // return to caller, restoring CPSR from SPSR
+        "movs pc, lr",                  // return to caller, restoring CPSR (IRQs on for USR) from SPSR
         dispatch = sym crate::arch::arm::syscall::arm_svc_dispatch,
         spsr_save = sym crate::arch::arm::usermode::USER_SPSR_SAVE,
     )

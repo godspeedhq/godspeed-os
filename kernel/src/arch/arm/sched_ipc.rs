@@ -15,22 +15,36 @@
 //! receiver by the kernel (§8.5), under preemption. No zero-copy, no shared memory.
 //!
 //! **KNOWN BUG (increment 3b, under investigation - gated behind `arm-sched-ipc`, off by default).**
-//! The wiring is verified correct (a ctx dump confirmed `send_peer_count=1, slot=1, name="pong"`; both
-//! services reach PL0 and log `ping: starting` / `pong: ready on core 0`). But once `ping` issues
-//! syscalls in a loop alongside a *second* running user task, a task's register state is corrupted and
-//! it jumps to a wild PC. Bisected precisely:
-//!   - `pong`'s blocking `recv` alone is fine (a diag kernel task kept ticking while pong blocked).
-//!   - `ping` ALONE (self-scheduling, no second user task) runs its `try_send`/`yield` loop forever,
-//!     clean.
-//!   - `ping` + `pong` together corrupts after a few syscalls (garbage syscall numbers, then a DATA
-//!     ABORT to `0xfffffeae` from a PC in a data page).
-//! So the fault is in a **real cross-task `switch_context` reached from a *syscall* context** (yield/
-//! block) - a path #1/#2/#3a never exercised (they switch only via the timer IRQ; #3a's two user tasks
-//! never yield/block, they busy-loop on a non-blocking `recv`). The USER-banked `SP_usr`/`LR_usr` were
-//! the first suspect and were ruled out (saving/restoring them in `stub_svc` and in `switch_context`
-//! both left the corruption unchanged). Next leads: the AAPCS callee-saved contract across a
-//! syscall-context switch between two *different* user address spaces (TTBR0 change), or the SVC-stack
-//! nesting when the timer preempts a task mid-syscall.
+//! The wiring is verified correct: a ctx dump confirmed `send_peer_count=1, slot=1, name="pong"`, both
+//! services reach PL0 and log (`ping: starting`, `pong: ready on core 0`), and tracing confirmed `ping`
+//! actually enqueues messages and wakes `pong` (`handle_try_send` -> `enqueue Ok(Some) -> wake_by_slot`).
+//! Two distinct problems remain, one fixed and one open:
+//!
+//! **(1) FIXED - mid-syscall register corruption -> wild-PC fault.** Symptom: after a few syscalls a
+//! task jumped to a data page (DATA ABORT / UNDEFINED INSTRUCTION with a PC inside a kernel stack).
+//! Bisected: `ping` ALONE loops clean forever; `ping`+`pong` corrupts; and **slowing the timer to 2 Hz
+//! eliminates the fault entirely** - so it is *timer preemption of a task mid-syscall*. Root cause found:
+//! the neutral scheduler re-enables IRQs inside a yield/block dispatch (`enable_interrupts` after
+//! `switch_context`), so `stub_svc`'s exit runs with IRQs on, and its `movs pc, lr` restores the caller's
+//! CPSR from **`SPSR_svc` - a single shared banked register**. A timer taken in that window lets another
+//! task's syscall clobber `SPSR_svc`, corrupting the return. Fixed by re-masking IRQs at the syscall exit
+//! (`stub_svc`: `cpsid i` before the SPSR-restore -> `movs pc`), which dramatically reduced but did not
+//! fully close it - the remaining corruption is the raw mid-syscall preemption itself. A proper "atomic
+//! syscall" fix (skip timer preemption while a USER task is in SVC/syscall) needs to distinguish a user
+//! task in a syscall from a *kernel* task legitimately running in SVC - i.e. `is_user` gating in
+//! `arm_irq_dispatch` (a bare SVC-mode check wrongly freezes the kernel-task demos). That is the next step.
+//!
+//! **(2) OPEN - scheduling hang after the SPSR fix.** With the fault suppressed, the system instead
+//! *hangs* right after both services start: `pong` blocks on `recv`, `ping` sends + `yield`s to `pong`
+//! (a switch trace showed `Y 1->0 nlr=block_and_reschedule`, so `pong`'s saved context is now correct -
+//! not the timer context it was before), but `pong`'s block never returns and no `pong: received`
+//! appears. So a `yield`-driven switch into a just-woken task blocked in `recv` does not resume its
+//! `block_and_reschedule` cleanly. This is the current front line.
+//!
+//! Ruled out along the way: `find_send_slot`/ctx wiring (correct), the send path (enqueues+wakes), and
+//! the USER-banked `SP_usr`/`LR_usr` (saving them in both `stub_svc` and `switch_context` left the fault
+//! unchanged; both attempts reverted). `kprintln` works on ARM (it is how `handle_log` emits), but it is
+//! slow enough on the PL011 to perturb timing, so traces must be minimal.
 
 use core::sync::atomic::Ordering;
 
