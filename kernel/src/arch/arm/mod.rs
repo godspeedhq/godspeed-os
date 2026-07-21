@@ -238,19 +238,36 @@ pub enum MemoryKind {
 }
 
 // ---- Lifecycle ----
-pub fn ap_count() -> usize { 0 }
-pub fn init(boot_info: &BootInfo) { unimplemented!("arm::init") }
-pub fn init_timer() { unimplemented!("arm::init_timer") }
-pub fn ap_init(core_id: u32) { unimplemented!("arm::ap_init") }
+//
+// On ARM the machine is brought up in `arm_boot_main` (MMU, vectors, timer, tick, allocator) *before*
+// any neutral code runs, rather than by the neutral `kernel_main` calling `arch::imp::init` partway
+// through. So these are honest no-ops: the work they name is already done, not skipped. They exist to
+// complete the `arch::imp` surface (the boundary the whole port rests on).
+pub fn ap_count() -> usize { 0 } // single-core for now; the 3 other A7s are parked in `_start`
+
+/// Machine init - already performed in `arm_boot_main` before neutral code runs. No-op.
+pub fn init(_boot_info: &BootInfo) {}
+
+/// Timer init - the generic timer + BCM2836 tick are already up (`timer::init` / `irq::start_tick`).
+pub fn init_timer() {}
+
+/// AP init - the secondary A7s are parked in `_start`; SMP bring-up (firmware mailboxes) is later
+/// work. Never reached while `ap_count() == 0`.
+pub fn ap_init(_core_id: u32) {}
 
 pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, local_irq_save, local_irq_restore};
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
 pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
 
-/// Switch to a new stack top - `sp` on AArch64. `#[inline(always)]` for the same reason as x86.
-/// # Safety: caller guarantees `top` is a valid aligned stack top; nothing live is on the old stack.
+/// Switch to a new stack top - `sp` on ARM. `#[inline(always)]` for the same reason as x86: the
+/// caller's frame must not outlive the switch.
+/// # Safety: caller guarantees `top` is a valid 8-byte-aligned stack top; nothing live is on the old
+/// stack.
 #[inline(always)]
-pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("arm::switch_to_boot_stack") }
+pub unsafe fn switch_to_boot_stack(top: u64) {
+    // SAFETY: sets SP to the caller-provided stack top. `nostack` because nothing is pushed/popped.
+    unsafe { core::arch::asm!("mov sp, {t}", t = in(reg) top as u32, options(nomem, nostack)) }
+}
 
 /// The ELF `e_machine` and `EI_CLASS` this arch's service binaries carry (ARM, ELFCLASS32).
 /// The neutral loader checks a candidate ELF against these, so it can parse a 32-bit ARM
@@ -312,13 +329,39 @@ pub mod syscall_entry {
     #[repr(C)]
     pub struct PerCoreSyscallData { pub user_rsp: u64, pub kernel_rsp: u64 }
 
-    pub const USER_END: u64 = 0x0000_8000_0000_0000;
-    pub fn syscall_slot(core_id: usize) -> *mut PerCoreSyscallData { core::ptr::null_mut() }
-    pub fn init_percore_syscall_arena(n: usize) {}
-    pub fn init_percore_arenas(n: usize) {}
-    pub fn validate_user_ptr(ptr: u64, len: usize) -> bool { false }
-    pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> { None }
-    pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool { false }
+    /// Top of the ARM user address space. 32-bit, so the ceiling is well below 4 GiB: services load
+    /// at `0x400000` and their stack tops at `USER_STACK_TOP` (`0x8000_0000`), all under this.
+    pub const USER_END: u64 = 0x8000_0000;
+
+    pub fn syscall_slot(_core_id: usize) -> *mut PerCoreSyscallData { core::ptr::null_mut() }
+    pub fn init_percore_syscall_arena(_n: usize) {}
+    pub fn init_percore_arenas(_n: usize) {}
+
+    /// A user pointer is valid if the whole range lies below `USER_END`. A service runs under its own
+    /// page table (kernel cloned in as privileged, service pages USER), and the kernel handles its
+    /// `svc` in SVC mode under that same table - so a user VA is directly readable once range-checked.
+    /// A genuinely unmapped user address still faults into the abort handler rather than reading junk.
+    pub fn validate_user_ptr(ptr: u64, len: usize) -> bool {
+        let end = match ptr.checked_add(len as u64) { Some(e) => e, None => return false };
+        end <= USER_END
+    }
+
+    /// Borrow `len` bytes at user VA `ptr` as a slice, after range-checking. Returns `None` if the
+    /// range escapes user space.
+    pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
+        if !validate_user_ptr(ptr, len) { return None; }
+        // SAFETY: the range is within user space and mapped in the current (service) page table; the
+        // kernel shares that table while handling the syscall, so `ptr` is directly addressable.
+        Some(unsafe { core::slice::from_raw_parts(ptr as usize as *const u8, len) })
+    }
+
+    /// Write `src` to user VA `dst`, after range-checking. Returns false if the range escapes user space.
+    pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool {
+        if !validate_user_ptr(dst, src.len()) { return false; }
+        // SAFETY: range-checked user VA, mapped writable in the current page table (see read_user_bytes).
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst as usize as *mut u8, src.len()); }
+        true
+    }
     /// CNTPCT - the ARM generic timer's physical counter, the arm32 analogue of RDTSC.
     pub fn read_cycle_counter() -> u64 { super::timer::cntpct() }
 }
