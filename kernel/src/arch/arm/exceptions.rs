@@ -161,13 +161,24 @@ unsafe extern "C" fn stub_undef() -> ! {
     )
 }
 
+/// SVC is a *syscall*, not a fault: it marshals `(r0-r3) = (number, args)` into the neutral
+/// dispatcher and returns, rather than reporting and halting like the fault vectors.
+///
+/// `LR_svc`/`SPSR_svc` are saved FIRST (the kernel already runs in SVC, so the next `bl` would
+/// clobber the return address otherwise), then `arm_svc_dispatch` is called with `r0-r3` already in
+/// place, and `movs pc, lr` returns to the caller restoring its CPSR from the saved SPSR. `r0:r1`
+/// carry the `i64` result out untouched by the restore (only `r4-r12`/`lr` are popped).
 #[unsafe(naked)]
 #[no_mangle]
-unsafe extern "C" fn stub_svc() -> ! {
+unsafe extern "C" fn stub_svc() {
     core::arch::naked_asm!(
-        "sub lr, lr, #4",
-        "mov r0, #2", "mov r1, lr", "mov r2, #0", "mov r3, #0",
-        "b {rep}", rep = sym arm_exception_report,
+        "push {{r4-r12, lr}}",          // save callee-saved + the SVC return address (LR_svc)
+        "mrs  r4, spsr",                // save the caller's CPSR (SPSR_svc) across the call
+        "bl   {dispatch}",              // arm_svc_dispatch(r0..r3) -> i64 in r0:r1
+        "msr  spsr_cxsf, r4",           // restore SPSR for the exception return
+        "pop  {{r4-r12, lr}}",          // restore callee-saved + LR_svc; r0:r1 (result) untouched
+        "movs pc, lr",                  // return to caller, restoring CPSR from SPSR
+        dispatch = sym crate::arch::arm::syscall::arm_svc_dispatch,
     )
 }
 

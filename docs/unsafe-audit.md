@@ -23,6 +23,29 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-21 - ARMv7 SVC syscall entry (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/syscall.rs` | 0 -> 5 (new file) | **The SVC syscall entry** - `svc #0` traps into the neutral `syscall_handler`. The `unsafe` is `arm_svc_dispatch` (forwards to the `unsafe` neutral handler) and the `issue_svc`/selftest asm. |
+| `arch/arm/exceptions.rs` | 21 (unchanged) | The SVC vector went from report-and-halt to a real entry: save `LR_svc`/`SPSR_svc`, call the dispatcher, `movs pc, lr` to return restoring CPSR. No new `unsafe` block - the naked stub was already one. |
+
+**Two ARM-specific things had to be right, and one was a bug.** (1) SVC targets SVC mode and the
+kernel already runs in SVC, so `LR_svc`/`SPSR_svc` are saved *first thing* like a nested exception, or
+the next `bl` clobbers the return address; done that way the entry works from a USR caller (real
+tasks) and an SVC caller (the selftest) alike. (2) **The 32-bit ABI bug:** `syscall_handler` takes
+`u64` parameters, and on 32-bit ARM each `u64` is a *register pair* (number in r0:r1, arg0 in r2:r3,
+rest on the stack). Passing the four `r0-r3` values to a `u64`-parameter function read the arguments
+shifted - it showed up as a wrong echo (7400 vs 7345). `arm_svc_dispatch` takes `u32`s (one register
+each, matching r0-r3) and widens to `u64` for the neutral call; every syscall argument on this arch
+(pointer, handle, length) fits in 32 bits, so the widening is loss-free. That widening is the seam the
+SDK port will use.
+
+**No user tasks yet (increment 3)**, and the real handlers touch per-task state, so the selftest
+proves the *entry mechanism* through a test dispatch (a mix of all four args, so a correct result
+proves each survived the mode switch) and leaves `syscall_handler` wired for when tasks arrive. A
+second trap confirms the path is re-entrant.
+
 ## 2026-07-21 - Neutral frame allocator live on ARM (feat/pi2-arm32)
 
 | File | Change | Why |
@@ -490,6 +513,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
 | arch/arm/page_tables.rs | 19 | permitted |
+| arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
 | arch/arm/mod.rs | 21 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |

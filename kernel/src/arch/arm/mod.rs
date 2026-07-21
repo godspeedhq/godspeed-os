@@ -24,6 +24,7 @@ pub mod context;
 pub mod context_switch;
 pub mod page_tables;
 pub mod meminit;
+pub mod syscall;
 
 // ============================ Boot bring-up (Raspberry Pi 2 Model B) ============================
 // BCM2836 peripheral base is 0x3F00_0000 (the BCM2835/Pi 1 was 0x2000_0000; the BCM2711/Pi 4 is
@@ -192,6 +193,7 @@ extern "C" fn arm_boot_main() -> ! {
     context_switch::selftest();
     meminit::init(ram_end);
     meminit::selftest();
+    syscall::selftest();
     page_tables::selftest();
     #[cfg(feature = "arm-fault-test")]
     exceptions::trigger_test_fault();
