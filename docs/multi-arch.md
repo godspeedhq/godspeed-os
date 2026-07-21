@@ -15,7 +15,7 @@
 |------|-------------|--------------|--------------|---------|--------|----------|
 | **x86-64** | `x86_64-unknown-none` | q35 / bare metal (UEFI) | Limine | 16550 COM1 | **Full OS** - 4 cores, supervisor, `gsh>` shell, storage, networking | Hardware (HP T630) + QEMU; identity 24/0; 80k-round chaos soak |
 | **AArch64** | `aarch64-unknown-none` | `-M virt -cpu cortex-a53` | direct `-kernel` (EL1) | PL011 @ `0x0900_0000` | **Boots + prints** to UART; neutral kernel linked | `qemu-system-aarch64` |
-| **ARM (32-bit)** | `armv7a-none-eabi` | `-M raspi2b` + bare metal | firmware loads `kernel7.img` @ `0x8000` (HYP) | PL011 @ `0x3F20_1000` | **Full machine layer ON HARDWARE** - MMU (4 KiB pages), timer tick, preemption, page tables; below-userspace complete | **Raspberry Pi 2 Model B v1.1** (2026-07-21) + QEMU |
+| **ARM (32-bit)** | `armv7a-none-eabi` | `-M raspi2b` + bare metal | firmware loads `kernel7.img` @ `0x8000` (HYP) | PL011 @ `0x3F20_1000` | **RUNS USERSPACE ON HARDWARE** - a real service (`logger`) loaded from ELF runs at PL0 and logs via a cap-checked syscall (`logger: ready`); full machine layer + syscalls + user mode below it | **Raspberry Pi 2 Model B v1.1** (2026-07-21) + QEMU |
 | **RISC-V** | `riscv64imac-unknown-none-elf` | `-M virt` | OpenSBI → S-mode @ `0x8020_0000` | NS16550 @ `0x1000_0000` | **Boots + prints** to UART; neutral kernel linked | `qemu-system-riscv64` |
 | **LoongArch64** | `loongarch64-unknown-none-softfloat` | `-M virt` | direct `-kernel` (DA mode) @ `0x20_0000` | NS16550 @ `0x1fe0_01e0` | **Boots + prints** to UART; neutral kernel linked | `qemu-system-loongarch64` |
 | **s390x** (IBM Z) | `s390x-unknown-none-softfloat` (tier-3, `-Zbuild-std`) | `s390-ccw-virtio` | IPL | SCLP console | **Compiles - BIG-ENDIAN**; boot pending the SCLP console (a protocol, not a register) | `qemu-system-s390x` |
@@ -74,7 +74,7 @@ every ISA that has one (x86/x86-64, ARMv7, all 64-bit arches) and a small lock-b
 
 | Arch | Rust target | Word | 64-bit atomics? | Status |
 |------|-------------|------|-----------------|--------|
-| **ARM (32-bit)** | `armv7a-none-eabi` | 32 | Native (LDREXD) | **FULL MACHINE LAYER ON HARDWARE** - Raspberry Pi 2 Model B v1.1 (BCM2836, Cortex-A7), 2026-07-21. See below. |
+| **ARM (32-bit)** | `armv7a-none-eabi` | 32 | Native (LDREXD) | **RUNS USERSPACE ON HARDWARE** (`logger: ready`) - Raspberry Pi 2 Model B v1.1 (BCM2836, Cortex-A7), 2026-07-21. See below. |
 | **RISC-V (32-bit)** | `riscv32imac-unknown-none-elf` | 32 | No (RV32A) → `portable-atomic` shim | **Compiles - 0 errors** (shim proves the shim path) |
 | **x86 (32-bit)** | (no upstream `i686-none`) | 32 | Native (CMPXCHG8B) | **Provable, tooling-gated:** the code is word-size-clean (proven by the two above) and has native 64-bit atomics, but rustc ships no bare-metal `i686-none` target; it needs a custom target-spec JSON (a known, small artifact), which hit stable-toolchain friction here. Not a code gap. |
 
@@ -83,6 +83,41 @@ word-size cases end to end: the neutral kernel is 32-bit-clean. x86-32 is the sa
 native-atomic story as ARM; only the missing upstream target stands in the way, and that is a
 toolchain matter, not a boundary leak. Recorded here so a future 32-bit port starts from "add the
 target spec," not "find out whether the kernel is even word-size-portable."
+
+### arm32 RUNS USERSPACE on hardware: `logger: ready` (2026-07-21)
+
+The finish line. A **real GodspeedOS service** - the `logger` crate, compiled for `armv7a-none-eabi`,
+loaded from its ELF - runs **unprivileged (PL0)** in its own address space on a **Raspberry Pi 2 Model
+B v1.1** and logs through a **capability-checked `svc`** into the neutral kernel:
+
+```
+arm32: ===> below this line is a real GodspeedOS SERVICE running unprivileged <===
+logger: ready
+```
+
+That one line is the whole userspace stack meeting on 32-bit ARM: the neutral frame allocator hands
+out the service's frames, the SVC entry serves its syscall, PL0 + USER page permissions run it
+unprivileged, the SDK+service built for ARM is the code, the neutral ELF loader mapped it, and a
+minimal spawn wired a task with a `LOG_WRITE` capability. `ctx.log("logger: ready")` issues `svc #0`;
+the neutral `handle_log` validates the cap and prints. Nothing in the syscall/IPC/capability/scheduler
+core is ARM-specific - only `arch/arm/` was written.
+
+**The hardest bug, and the one only hardware truly settles.** The service reached PL0 and issued its
+Log syscall, but the kernel hung acquiring the cap-table spinlock (`GLOBAL_RESOURCES`) under the
+service's address space - while `kprintln`'s lock worked. The kernel maps its memory as 1 MiB
+**sections** but the service maps the shared 1 MiB (holding the service-context page) as 4 KiB
+**pages**; stale D-cache lines from the section view made the lock's `LDREX`/`STREX` fail under the
+page view (a coherency, not attribute, mismatch). A set/way `DCCISW` D-cache clean before the TTBR0
+switch - correct across any address-space change - fixes it, and it held on hardware first try.
+Diagnosis used the full toolkit: `-d int` (service runs past the svc), symbol addresses
+(`GLOBAL_RESOURCES` at `0x3f0078`), `ATS1CPR` (the page IS mapped), and lock-vs-lock_irq isolation.
+
+Gated behind the `arm-spawn-logger` build feature (the default image boots to the clean selftest
+halt). This is a **minimal** spawn - one service, one capability, entered directly rather than through
+the full scheduler; IPC endpoints, the registry, the supervisor manifest, and running the *neutral*
+`scheduler::run` are the remaining work toward a full multi-service boot.
+
+Everything below is the machine layer under it, each part verified on the silicon by its own selftest:
 
 ### arm32 runs a COMPLETE kernel machine layer on hardware (2026-07-21)
 
