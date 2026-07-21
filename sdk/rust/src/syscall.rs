@@ -19,6 +19,33 @@
 ///
 /// # Safety
 /// Caller must pass valid arguments for the given syscall number.
+#[cfg(target_arch = "arm")]
+#[inline]
+pub(crate) unsafe fn raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+    // ARMv7 syscall mechanism: `svc #0`, matching the kernel's SVC entry (arch/arm/syscall.rs).
+    // The kernel ABI takes the number and three args in r0-r3 as single 32-bit registers (a u64
+    // parameter would be a register PAIR on 32-bit ARM); every argument on this arch - pointer,
+    // handle, length - fits in 32 bits. The i64 result comes back in r0:r1.
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: `svc #0` traps to the kernel SVC handler, which preserves callee-saved registers and
+    // returns the i64 result in r0:r1. r0-r3 are the ABI inputs (clobbered by the handler); r12 is
+    // caller-saved. No VFP clobber list (soft-float target has none), so the clobbers are listed by hand.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            inout("r0") nr as u32 => lo,
+            inout("r1") a0 as u32 => hi,
+            inout("r2") a1 as u32 => _,
+            inout("r3") a2 as u32 => _,
+            lateout("r12") _,
+            options(nostack),
+        );
+    }
+    ((hi as u64) << 32 | lo as u64) as i64
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) unsafe fn raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     let ret: i64;
