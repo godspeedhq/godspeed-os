@@ -513,6 +513,9 @@ pub unsafe fn commit_task(
         TASK_NAME[slot]             = name;
         TASK_SPAWN_DT[slot].store(crate::arch::imp::rtc::read_datetime(), Ordering::Relaxed);
         TASK_IS_USER[slot]          = is_user;
+        // Arch hook: on ARM a user task's syscalls must run atomically (the timer skips preempting it
+        // in SVC), which needs the slot recorded arch-locally. No-op on x86 (it reads TASK_IS_USER).
+        if is_user { crate::arch::imp::note_user_task(slot); }
         TASK_KERNEL_STACK_TOP[slot].store(kernel_stack_top, Ordering::Relaxed);
         TASK_ENDPOINT[slot].store(ep_to_u64(endpoint_id), Ordering::Relaxed);
         // TASK_STATE must be last: once Ready is visible to other cores, every

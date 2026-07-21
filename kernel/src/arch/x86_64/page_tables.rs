@@ -280,6 +280,14 @@ pub unsafe fn write_page_table_base(base: u64) {
     unsafe { core::arch::asm!("mov cr3, {}", in(reg) base, options(nostack, nomem)); }
 }
 
+/// Finalize a freshly-built service page table (neutral spawn hook). On x86 the kernel is shared into
+/// every address space via the higher-half PML4 entries, so nothing extra is needed - a no-op. (ARM
+/// clones the kernel identity into the table and cleans the D-cache here.)
+///
+/// # Safety
+/// `_cr3` is a service page-table root; this hook does nothing on x86.
+pub unsafe fn finalize_service_address_space(_cr3: u64) {}
+
 /// Invalidate a single TLB entry for `addr` on the local core (x86 invlpg; RISC-V sfence.vma, AArch64 TLBI).
 ///
 /// # Safety

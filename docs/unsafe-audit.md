@@ -23,6 +23,22 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-21 - The NEUTRAL spawn works on ARM (feat/pi2-arm32, increment 4a)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/page_tables.rs` | 23 -> 25 (+2) | `finalize_service_address_space(cr3)` - the arch hook the neutral spawn calls after building a service page table: clones the kernel identity into it + cleans the D-cache (ARM has no shared higher-half kernel). The `unsafe fn` + its block. |
+| `arch/x86_64/page_tables.rs` | 46 -> 47 (+1) | The x86 `finalize_service_address_space` is a `pub unsafe fn` no-op (kernel is shared higher-half); the empty `unsafe fn` is the +1. |
+| `arch/arm/mod.rs` | 22 -> 23 (+1) | `syscall_slot` now returns a real per-core `PerCoreSyscallData` (an `addr_of_mut` unsafe) instead of null: the neutral spawn commits `is_user=true`, and `prepare_ring3_switch` writes through this pointer for every user task. Also added the safe `note_user_task` hook (`irq::mark_task_user`; no unsafe). |
+| `task/mod.rs` | unchanged (7, at the grandfathered floor) | The neutral `spawn_service_with_config` gained ONE line calling `finalize_service_address_space`, and `arm_spawn_logger_neutral` (an ARM-only pub probe). The finalize call was folded into the existing `unsafe { TaskContext::new_user }` block so `task/`'s floor holds (§18.5) - no amendment. `scheduler::commit_task` gained a safe `note_user_task` hook call (no unsafe). |
+
+**The neutral spawn machinery runs unchanged on ARM.** `task::spawn_service_with_config` - the exact path
+the supervisor's spawn syscall uses (ELF load, user-stack + ctx-page map, kstack-pool alloc, cap
+minting, ServiceContext write) - spawns the `logger` on ARM: `task: 'logger' spawned OK on core 0
+(slot 0)` -> `logger: ready`. The two ARM-specific steps are now arch-seam hooks the neutral code calls
+itself (both no-ops on x86, so x86 is byte-for-byte unchanged - verified it still compiles). This is the
+foundation the supervisor stands on. Gated behind `arm-sched-spawn`.
+
 ## 2026-07-21 - Atomic syscalls + CLREX on ARM (feat/pi2-arm32, increment 3b hunt cont'd)
 
 | File | Change | Why |
@@ -660,7 +676,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/irq.rs | 10 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
-| arch/arm/page_tables.rs | 23 | permitted |
+| arch/arm/page_tables.rs | 25 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |
 | arch/arm/sched_ipc.rs | 9 | permitted |
@@ -668,7 +684,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 22 | permitted |
+| arch/arm/mod.rs | 23 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
 | arch/riscv64/mod.rs | 23 | permitted |
@@ -681,7 +697,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/ioapic.rs | 8 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
 | arch/x86_64/mod.rs | 36 | permitted |
-| arch/x86_64/page_tables.rs | 46 | permitted |
+| arch/x86_64/page_tables.rs | 47 | permitted |
 | arch/x86_64/pci.rs | 19 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 15 | permitted |

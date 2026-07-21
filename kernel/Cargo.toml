@@ -54,6 +54,9 @@ arm-sched-user = []
 # Run TWO USER services under the scheduler at once (arch/arm/sched_ipc.rs). Proves the banked-register
 # trap frame (SP_usr/LR_usr per task) and is the base the real IPC send/recv proof grows on.
 arm-sched-ipc = []
+# Spawn a service (logger) through the NEUTRAL spawn path on ARM (arch/arm/sched_spawn.rs). Proves
+# task::spawn_service_with_config - the machinery the supervisor's spawn syscall uses - works on ARM.
+arm-sched-spawn = []
 
 # Deliberately take a data abort during arm32 boot, to PROVE the exception vectors
 # fire (a fault path never observed firing is not evidence). The ARM twin of the x86

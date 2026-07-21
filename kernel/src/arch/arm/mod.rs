@@ -31,6 +31,7 @@ pub mod spawn;
 pub mod sched_demo;
 pub mod sched_user;
 pub mod sched_ipc;
+pub mod sched_spawn;
 
 // ============================ Boot bring-up (Raspberry Pi 2 Model B) ============================
 // BCM2836 peripheral base is 0x3F00_0000 (the BCM2835/Pi 1 was 0x2000_0000; the BCM2711/Pi 4 is
@@ -225,6 +226,8 @@ extern "C" fn arm_boot_main() -> ! {
     sched_user::run(ram_end, reserve_end);
     #[cfg(feature = "arm-sched-ipc")]
     sched_ipc::run(ram_end, reserve_end);
+    #[cfg(feature = "arm-sched-spawn")]
+    sched_spawn::run(ram_end, reserve_end);
     #[cfg(feature = "arm-spawn-logger")]
     spawn::boot_service(ram_end, reserve_end);
     let _ = (ram_end, reserve_end);
@@ -327,6 +330,11 @@ pub fn uart_rx_pop() -> Option<u8> { None }
 pub fn uart_rx_poll() {}
 pub fn uart_rx_drain_now() {}
 
+/// Hook called by the neutral `commit_task` when it commits a **user** task. On ARM this records the
+/// slot as a ring-3 task so the timer runs its syscalls atomically (see `irq::mark_task_user` and the
+/// atomic-syscall check in `irq::arm_irq_dispatch`). A no-op on x86, which tracks ring via `TASK_IS_USER`.
+pub fn note_user_task(slot: usize) { irq::mark_task_user(slot); }
+
 pub static CONSOLE_READ_WAITER: AtomicU32 = AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
@@ -363,11 +371,20 @@ pub mod syscall_entry {
     /// at `0x400000` and their stack tops at `USER_STACK_TOP` (`0x8000_0000`), all under this.
     pub const USER_END: u64 = 0x8000_0000;
 
-    // ARM keeps `is_user=false` in the neutral scheduler and tracks ring-3 tasks arch-locally
-    // (`irq::ARM_TASK_IS_USER`), so the neutral `prepare_ring3_switch`/user-RSP path never runs and this
-    // pointer is never dereferenced - null is correct. (ARM has no SYSCALL/SYSRET fast path: user sp/lr
-    // live in banked registers and syscall entry/exit is `svc`/`movs pc`.)
-    pub fn syscall_slot(_core_id: usize) -> *mut PerCoreSyscallData { core::ptr::null_mut() }
+    // Real backing storage so `syscall_slot` is non-null. ARM has no SYSCALL/SYSRET fast path (user
+    // sp/lr live in banked registers; syscall entry/exit is `svc`/`movs pc`), so `user_rsp`/`kernel_rsp`
+    // are never *read* to drive a return. But the neutral spawn commits services with `is_user=true`,
+    // and the neutral `prepare_ring3_switch` (+ user-RSP capture) then WRITES through this pointer for
+    // every user task - so it must be real memory. The writes land here and are ignored. Sized for the
+    // effectively-single-core port; clamp guards any stray index.
+    const MAX_SLOTS: usize = 8;
+    static mut SYSCALL_SLOTS: [PerCoreSyscallData; MAX_SLOTS] =
+        [const { PerCoreSyscallData { user_rsp: 0, kernel_rsp: 0 } }; MAX_SLOTS];
+
+    pub fn syscall_slot(core_id: usize) -> *mut PerCoreSyscallData {
+        // SAFETY: index clamped into the fixed static array; single writer per core.
+        unsafe { core::ptr::addr_of_mut!(SYSCALL_SLOTS[core_id.min(MAX_SLOTS - 1)]) }
+    }
     pub fn init_percore_syscall_arena(_n: usize) {}
     pub fn init_percore_arenas(_n: usize) {}
 

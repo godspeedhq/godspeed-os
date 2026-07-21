@@ -3795,9 +3795,14 @@ fn spawn_service_with_config(
 
     // 8. Initial ring-3 context.
     let cr3 = page_table.into_cr3();
-    // SAFETY: kstack_top is valid kernel memory; entry_va and USER_STACK_TOP
-    // are valid ring-3 addresses in the new page table.
+    // SAFETY: `finalize_service_address_space` - arch hook: on ARM it clones the kernel identity into
+    // the service page table and cleans the D-cache for the non-cacheable walker (the kernel is not
+    // shared higher-half as on x86), a no-op on x86; runs after ALL of the service's regions (ELF,
+    // stack, ctx) are mapped and `cr3` is the freshly-built, not-yet-active root. `new_user`:
+    // kstack_top is valid kernel memory; entry_va and USER_STACK_TOP are valid ring-3 addresses in the
+    // new page table. (Both in one block so this stays at `task/`'s grandfathered unsafe floor, §18.5.)
     let ctx = unsafe {
+        crate::arch::imp::page_tables::finalize_service_address_space(cr3);
         TaskContext::new_user(kstack_top, entry_va, USER_STACK_TOP, cr3)
     };
 
@@ -3834,6 +3839,23 @@ pub fn spawn_supervisor() {
     match spawn_service_with_config("supervisor", SUPERVISOR_ELF, 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => panic!("supervisor spawn failed: {:?}", e),
+    }
+}
+
+/// ARM bring-up (increment 4a): spawn the logger through the **neutral** `spawn_service_with_config` -
+/// the exact machinery the supervisor's spawn syscall uses - to prove the real spawn path works on ARM
+/// (page tables + kstack pool + cap wiring + ctx page + the ARM `finalize_service_address_space` hook).
+/// The full-OS build spawns via the supervisor instead; this is the direct probe. Requires the neutral
+/// bootstrap (percpu / scheduler arenas / capability) to have run first.
+#[cfg(target_arch = "arm")]
+pub fn arm_spawn_logger_neutral() {
+    static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
+    match spawn_service_with_config(
+        "logger", LOGGER_ELF, 0, /*has_recv_endpoint=*/true, &[], 0, false,
+        8 * 1024 * 1024, &[], false, None,
+    ) {
+        Ok(_)  => crate::kprintln!("arm: logger spawned via the neutral spawn path"),
+        Err(e) => crate::kprintln!("arm: logger neutral spawn FAILED: {:?}", e),
     }
 }
 

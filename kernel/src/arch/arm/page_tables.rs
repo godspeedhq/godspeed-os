@@ -400,6 +400,23 @@ pub(super) unsafe fn clean_invalidate_dcache_all() {
     }
 }
 
+/// Finalize a freshly-built service page table for use as a TTBR0 (called by the neutral spawn after
+/// all of the service's own regions are mapped). On ARM this is two steps x86 does not need: clone the
+/// kernel identity map into the service L1 (so the vectors/kernel/peripherals stay reachable, as
+/// privileged memory, once TTBR0 is switched to this table), and clean the D-cache so the non-cacheable
+/// table walker sees every descriptor. The x86 kernel is shared higher-half, so its hook is a no-op.
+///
+/// # Safety
+/// `cr3` must be the root of a service page table built by `PageTable::new` and not yet in use.
+pub unsafe fn finalize_service_address_space(cr3: u64) {
+    // SAFETY: cr3 is the service L1 root; fill_kernel_identity + the D-cache clean are the exact steps
+    // the direct-spawn path (spawn.rs) does by hand before entering a service.
+    unsafe {
+        fill_kernel_identity(cr3 as u32);
+        clean_invalidate_dcache_all();
+    }
+}
+
 // ---- The remaining neutral surface (honest stubs / no-ops for the kernel-only path) ----
 
 /// ARM runs identity-mapped (VA == PA), so hhdm=0 is the correct value, not "unset".

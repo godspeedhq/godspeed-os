@@ -423,6 +423,11 @@ pub unsafe fn serial_init() {
 ///
 /// # Safety
 /// `serial_init` must have been called before the first call.
+/// Hook called by the neutral `commit_task` when it commits a user task. On x86 the ring is tracked by
+/// the scheduler's `TASK_IS_USER` and the SYSRET machinery, so nothing arch-local is needed here - a
+/// no-op. (ARM uses this to record the slot for its atomic-syscall timer check.)
+pub fn note_user_task(_slot: usize) {}
+
 pub fn serial_write_byte(b: u8) {
     use core::sync::atomic::Ordering;
     // Bounded best-effort lock acquire: a wedged SERIAL_LOCK must never spin a
