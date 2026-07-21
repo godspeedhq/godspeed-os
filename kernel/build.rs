@@ -82,8 +82,25 @@ fn main() {
         ("HOLDER",     "holder"),   // examples/holder: the CLIENT that USEs the granted resource cap
     ];
 
+    // ARM userspace is being brought up incrementally (docs/multi-arch.md): a service is embedded
+    // for real only once it is built for armv7a-none-eabi. Any not yet ported keep the empty
+    // placeholder, so the kernel still links. As each is ported, drop its name in here.
+    let arm_built: &[&str] = &["logger"];
+    let arm_dir = workspace
+        .join("target")
+        .join("armv7a-none-eabi")
+        .join(&profile);
+
     for (env_name, bin_name) in services {
-        let elf = if use_placeholder { placeholder.clone() } else { target_dir.join(bin_name) };
+        let elf = if is_arm {
+            // A ported ARM service if its binary exists; otherwise the placeholder.
+            let arm_bin = arm_dir.join(bin_name);
+            if arm_built.contains(bin_name) && arm_bin.exists() { arm_bin } else { placeholder.clone() }
+        } else if use_placeholder {
+            placeholder.clone()
+        } else {
+            target_dir.join(bin_name)
+        };
         println!("cargo:rustc-env=SVC_{}_ELF={}", env_name, elf.display());
         // Rerun if the service binary changes (osdev build rebuilds services first).
         println!("cargo:rerun-if-changed={}", elf.display());

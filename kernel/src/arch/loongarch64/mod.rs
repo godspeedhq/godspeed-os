@@ -98,6 +98,12 @@ pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, 
 #[inline(always)]
 pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("aarch64::switch_to_boot_stack") }
 
+/// The ELF `e_machine` and `EI_CLASS` this arch's service binaries carry (LoongArch, ELFCLASS64).
+/// The neutral loader checks a candidate ELF against these, so it can parse a 32-bit ARM
+/// service ELF or a 64-bit one without any arch-specific code in the loader itself.
+pub const ELF_MACHINE: u16 = 258;
+pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
+
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 

@@ -26,6 +26,7 @@ pub mod page_tables;
 pub mod meminit;
 pub mod syscall;
 pub mod usermode;
+pub mod loadtest;
 
 // ============================ Boot bring-up (Raspberry Pi 2 Model B) ============================
 // BCM2836 peripheral base is 0x3F00_0000 (the BCM2835/Pi 1 was 0x2000_0000; the BCM2711/Pi 4 is
@@ -196,6 +197,7 @@ extern "C" fn arm_boot_main() -> ! {
     meminit::selftest();
     syscall::selftest();
     usermode::selftest();
+    loadtest::selftest();
     page_tables::selftest();
     #[cfg(feature = "arm-fault-test")]
     exceptions::trigger_test_fault();
@@ -249,6 +251,12 @@ pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, 
 /// # Safety: caller guarantees `top` is a valid aligned stack top; nothing live is on the old stack.
 #[inline(always)]
 pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("arm::switch_to_boot_stack") }
+
+/// The ELF `e_machine` and `EI_CLASS` this arch's service binaries carry (ARM, ELFCLASS32).
+/// The neutral loader checks a candidate ELF against these, so it can parse a 32-bit ARM
+/// service ELF or a 64-bit one without any arch-specific code in the loader itself.
+pub const ELF_MACHINE: u16 = 40;
+pub const ELF_CLASS: u8 = 1; // 1 = ELFCLASS32, 2 = ELFCLASS64
 
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }

@@ -302,6 +302,12 @@ pub unsafe fn switch_to_boot_stack(top: u64) {
 ///
 /// SEC-18: broadcast an NMI to the other cores first (it reaches them even while spinning IF=0 on a
 /// lock; `idt[2]` routes it to `exception_halt`, which halts the receiving core), then halt this one.
+/// The ELF `e_machine` and `EI_CLASS` this arch's service binaries carry (x86-64, ELFCLASS64).
+/// The neutral loader checks a candidate ELF against these, so it can parse a 32-bit ARM
+/// service ELF or a 64-bit one without any arch-specific code in the loader itself.
+pub const ELF_MACHINE: u16 = 62;
+pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
+
 pub fn halt_all_cores() -> ! {
     // SAFETY: panic path - stop all execution permanently. The APIC is mapped by boot; a bare ICR write
     // is sound. If we panicked before the APIC came up the broadcast is a best-effort no-op and this
