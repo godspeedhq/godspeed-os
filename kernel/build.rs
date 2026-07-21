@@ -85,7 +85,7 @@ fn main() {
     // ARM userspace is being brought up incrementally (docs/multi-arch.md): a service is embedded
     // for real only once it is built for armv7a-none-eabi. Any not yet ported keep the empty
     // placeholder, so the kernel still links. As each is ported, drop its name in here.
-    let arm_built: &[&str] = &["logger"];
+    let arm_built: &[&str] = &["logger", "ping", "pong"];
     let arm_dir = workspace
         .join("target")
         .join("armv7a-none-eabi")

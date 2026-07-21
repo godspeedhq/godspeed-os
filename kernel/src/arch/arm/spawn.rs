@@ -15,9 +15,9 @@
 //! syscalls are served - which is what "GodspeedOS runs on ARM" means.
 
 use crate::arch::imp::{BootInfo, MemoryKind, MemoryRegion};
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, Capability};
 use super::pl011_write;
-use super::page_tables::{self, PageFlags, VirtAddr};
+use super::page_tables::{self, PageFlags, PageTable, VirtAddr};
 use crate::memory::frame::PhysAddr;
 
 /// The ARM `logger` ELF, embedded by `build.rs`. Empty placeholder on a not-yet-ported arch.
@@ -25,8 +25,8 @@ static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
 
 // Must match the SDK's ServiceContext layout (sdk/rust/src/service_context.rs) - the kernel writes
 // this page, the service reads it. Only the fields the logger touches on startup need real values.
-const SERVICE_CTX_VA: u32 = 0x003f_f000;
-const SERVICE_CTX_MAGIC: u32 = 0xD0_5D_EA_D5;
+pub(super) const SERVICE_CTX_VA: u32 = 0x003f_f000;
+pub(super) const SERVICE_CTX_MAGIC: u32 = 0xD0_5D_EA_D5;
 pub(super) const USER_STACK_TOP: u32 = 0x8000_0000;
 
 /// A service loaded into a fresh address space with a task slot reserved and its cap installed, ready
@@ -62,35 +62,22 @@ pub(super) fn neutral_bootstrap(ram_end: u32, reserve_end: u32) {
     crate::capability::init();
 }
 
-/// Load the embedded `logger` ELF into a fresh address space: map its user stack + service-context
-/// page, write the SDK `ServiceContext`, reserve a task slot, install a `LOG_WRITE` cap at cap-slot 0,
-/// and clone the kernel identity into the new page table. Returns the entry / page-table root / slot,
-/// or `None` (having logged the reason) on any failure. The kernel's descriptors are made visible to
-/// the walker by the caller's one-shot `clean_invalidate_dcache_all` before the table is used.
-pub(super) fn load_logger_into_slot() -> Option<LoadedService> {
-    if LOGGER_ELF.len() < 64 {
-        pl011_write(b"arm32: spawn SKIP - no ARM logger ELF embedded\r\n");
-        return None;
-    }
-    let loaded = match crate::loader::load(LOGGER_ELF) {
-        Ok(l) => l,
-        Err(_) => { pl011_write(b"arm32: spawn FAIL - loader rejected the service ELF\r\n"); return None; }
-    };
-    let entry = loaded.entry_va as u32;
-    let mut pt = loaded.page_table;
-    let pt_root = pt.cr3_value() as u32;
-
-    // Several stack pages: a service builds a 4 KiB IPC message buffer on its stack (ctx.log/recv),
-    // so one page is not enough (the first run faulted just below a single page). 8 pages = 32 KiB.
+/// The service-context virtual address (`SERVICE_CTX_VA`) mapped into `pt`, backed by a fresh frame.
+/// Also maps 8 user stack pages below `USER_STACK_TOP`. Returns the ctx frame's physical address (so
+/// the caller can write the `ServiceContext` there), or `None` (having logged) on failure.
+///
+/// Several stack pages because a service builds a 4 KiB IPC message buffer on its stack (`ctx.log`/
+/// `recv`/`send`), so one page is not enough (the first run faulted just below a single page).
+fn map_stack_and_ctx(pt: &mut PageTable) -> Option<u32> {
     const STACK_PAGES: u32 = 8;
-    let stack_flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXEC;
+    let uflags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXEC;
     for p in 1..=STACK_PAGES {
         let f = match crate::memory::allocator::alloc_frame() {
             Some(f) => f.phys_addr().0 as u32,
             None => { pl011_write(b"arm32: spawn FAIL - no frame for user stack\r\n"); return None; }
         };
         let va = USER_STACK_TOP - p * 0x1000;
-        if pt.map(VirtAddr(va as u64), PhysAddr(f as u64), stack_flags).is_err() {
+        if pt.map(VirtAddr(va as u64), PhysAddr(f as u64), uflags).is_err() {
             pl011_write(b"arm32: spawn FAIL - could not map user stack\r\n"); return None;
         }
     }
@@ -98,23 +85,37 @@ pub(super) fn load_logger_into_slot() -> Option<LoadedService> {
         Some(f) => f.phys_addr().0 as u32,
         None => { pl011_write(b"arm32: spawn FAIL - no frame for service context\r\n"); return None; }
     };
-    let ctx_flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXEC;
-    if pt.map(VirtAddr(SERVICE_CTX_VA as u64), PhysAddr(ctx_frame as u64), ctx_flags).is_err() {
+    if pt.map(VirtAddr(SERVICE_CTX_VA as u64), PhysAddr(ctx_frame as u64), uflags).is_err() {
         pl011_write(b"arm32: spawn FAIL - could not map service context\r\n");
         return None;
     }
+    Some(ctx_frame)
+}
 
-    // Write the ServiceContext the SDK reads. Identity-mapped, so writable at the frame's phys addr.
-    // SAFETY: `ctx_frame` is a fresh frame we own; writing the SDK's context struct into it.
-    unsafe {
-        let p = ctx_frame as *mut u32;
-        p.add(0).write_volatile(SERVICE_CTX_MAGIC); // magic
-        p.add(1).write_volatile(0);                 // log_write_slot = 0 (the cap we insert below)
-        // Every other slot is "not present" (u32::MAX) or zero; the logger only needs log_write + recv.
-        for i in 2..8 { p.add(i).write_volatile(u32::MAX); }
-        // recv_slot (index 2) MAX is fine - ctx.recv() returns EndpointDead, the logger loops harmlessly.
-    }
+/// A service loaded into a fresh address space with a task slot reserved, its `LOG_WRITE` cap at
+/// cap-slot 0, and each `extra_caps` entry inserted at slots 1.. (in order). The service-context page
+/// is mapped but **left for the caller to fill** (so an IPC service can wire its recv/send slots), and
+/// `fill_kernel_identity` is **not** yet applied - the caller does both, then `clean_invalidate_dcache_all`.
+pub(super) struct RawService {
+    pub entry: u32,
+    pub pt_root: u32,
+    pub ctx_frame: u32,
+    pub slot: usize,
+}
 
+/// Load an arbitrary service ELF into a fresh address space, reserve a task slot, install its
+/// `LOG_WRITE` cap (slot 0) and any `extra_caps` (slots 1..). See [`RawService`] for what the caller
+/// still owes (ctx write, `fill_kernel_identity`). Returns `None` (having logged) on any failure.
+pub(super) fn load_service_raw(elf: &[u8], extra_caps: &[Capability]) -> Option<RawService> {
+    if elf.len() < 64 { pl011_write(b"arm32: spawn SKIP - empty service ELF\r\n"); return None; }
+    let loaded = match crate::loader::load(elf) {
+        Ok(l) => l,
+        Err(_) => { pl011_write(b"arm32: spawn FAIL - loader rejected the service ELF\r\n"); return None; }
+    };
+    let entry = loaded.entry_va as u32;
+    let mut pt = loaded.page_table;
+    let pt_root = pt.cr3_value() as u32;
+    let ctx_frame = map_stack_and_ctx(&mut pt)?;
     let slot = match crate::task::scheduler::reserve_task_slot(0) {
         Some(s) => s,
         None => { pl011_write(b"arm32: spawn FAIL - no free task slot\r\n"); return None; }
@@ -122,16 +123,30 @@ pub(super) fn load_logger_into_slot() -> Option<LoadedService> {
     // SAFETY: slot just reserved; single-threaded boot with interrupts effectively quiescent for setup.
     unsafe {
         let caps = crate::task::scheduler::task_cap_init_empty(slot);
-        // Insert the log-write cap at cap-slot 0 (matching log_write_slot in the ctx page above).
-        let _ = caps.insert(mint_cap(LOG_WRITE_RESOURCE, Rights::WRITE));
+        let _ = caps.insert(mint_cap(LOG_WRITE_RESOURCE, Rights::WRITE)); // slot 0
+        for c in extra_caps { let _ = caps.insert(*c); }                  // slots 1..
     }
+    Some(RawService { entry, pt_root, ctx_frame, slot })
+}
 
-    // Clone the kernel into the service's address space: the empty (non-service) L1 slots get the
-    // kernel identity so the vectors/kernel/peripherals are reachable (privileged) under this table.
+/// Load the embedded `logger` ELF and write its (minimal) `ServiceContext`. Thin wrapper over
+/// `load_service_raw` for the no-endpoint case: the logger needs only `log_write` + a (dead) `recv`.
+pub(super) fn load_logger_into_slot() -> Option<LoadedService> {
+    let raw = load_service_raw(LOGGER_ELF, &[])?;
+    // Write the ServiceContext the SDK reads. Identity-mapped, so writable at the frame's phys addr.
+    // SAFETY: `raw.ctx_frame` is a fresh frame we own; writing the SDK's context struct into it.
+    unsafe {
+        let p = raw.ctx_frame as *mut u32;
+        p.add(0).write_volatile(SERVICE_CTX_MAGIC); // magic
+        p.add(1).write_volatile(0);                 // log_write_slot = 0 (the cap inserted at slot 0)
+        // Every other slot "not present" (u32::MAX); the logger only needs log_write + recv.
+        for i in 2..8 { p.add(i).write_volatile(u32::MAX); }
+        // recv_slot (index 2) MAX is fine - ctx.recv() returns EndpointDead, the logger loops harmlessly.
+    }
+    // Clone the kernel into the service's address space (empty L1 slots get kernel identity, privileged).
     // SAFETY: pt_root is the freshly-built service L1, not yet in use.
-    unsafe { page_tables::fill_kernel_identity(pt_root); }
-
-    Some(LoadedService { entry, pt_root, slot })
+    unsafe { page_tables::fill_kernel_identity(raw.pt_root); }
+    Some(LoadedService { entry: raw.entry, pt_root: raw.pt_root, slot: raw.slot })
 }
 
 /// Bring up the neutral subsystems, then load the logger and enter it **directly** at PL0 (bypassing

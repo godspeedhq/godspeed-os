@@ -23,6 +23,29 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-21 - Cross-service IPC wiring (feat/pi2-arm32, increment 3b - WIP, blocked on a diagnosed bug)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/spawn.rs` | unchanged count | Refactored to expose `load_service_raw(elf, extra_caps)` + `map_stack_and_ctx` (shared with `sched_ipc`): load any service ELF, map its stack/ctx, reserve a slot, install `LOG_WRITE` + caller-supplied endpoint caps, leaving the ctx write + `fill_kernel_identity` to the caller. `load_logger_into_slot` now rides on it. No net `unsafe` change; `load_service_raw`'s block is the cap inserts. |
+| `arch/arm/sched_ipc.rs` | 6 -> 9 (+3) | Rewritten from the 2-logger frame proof to a real `ping`->`pong` IPC attempt: create pong's endpoint (the `spawn_service_with_config` sequence - `alloc_endpoint_id` + register resource/routing/name), mint a RECV cap for pong and a SEND cap for ping, hand-build both `ServiceContext`s (`write_ipc_ctx`), and commit both as scheduled USER tasks. The +3 `unsafe` is `write_ipc_ctx` (raw ctx writes), `commit_user`, and the `halt` WFI. `build.rs` now builds `ping`/`pong` for `armv7a-none-eabi`. Gated behind `arm-sched-ipc`. |
+
+**Status: the wiring is correct, the runtime is blocked on a diagnosed kernel bug.** Verified: the ctx
+is wired correctly (a dump confirmed `send_peer_count=1, peer0.slot=1, name="pong"`), both services reach
+PL0 and log (`ping: starting`, `pong: ready on core 0`). But once `ping` loops issuing syscalls
+alongside a second running user task, a task's registers are corrupted and it jumps to a wild PC (garbage
+syscall numbers, then a DATA ABORT to `0xfffffeae` from a PC in a data page). Bisected: `pong`'s blocking
+`recv` alone is fine; `ping` ALONE (self-scheduling) loops forever clean; `ping`+`pong` together corrupts.
+So the fault is in a **real cross-task `switch_context` reached from a *syscall* context** (yield/block) -
+a path #1/#2/#3a never exercised (they switch only via the timer IRQ; #3a's two user tasks busy-loop on a
+non-blocking `recv`, never yielding). The USER-banked `SP_usr`/`LR_usr` were ruled out (saving them in both
+`stub_svc` and `switch_context` left the corruption unchanged, so those attempts were reverted). Next
+leads: the AAPCS callee-saved contract across a syscall-context switch between two different user address
+spaces (TTBR0 change), or SVC-stack nesting when the timer preempts a task mid-syscall. The 2-logger
+banked-frame proof it replaced is preserved in commit `3e6cb3f`; the banked frame (`stub_irq`) stays, and
+ping+pong both reaching PL0 still exercises it. The committed increments (#1/#2/#3a) are unregressed
+(default `preempt selftest PASS 9/9/9`, sched-user `logger: ready`).
+
 ## 2026-07-21 - Two USER services at once: the banked-register trap frame (feat/pi2-arm32, increment 3a)
 
 | File | Change | Why |
@@ -626,7 +649,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/page_tables.rs | 23 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |
-| arch/arm/sched_ipc.rs | 6 | permitted |
+| arch/arm/sched_ipc.rs | 9 | permitted |
 | arch/arm/spawn.rs | 8 | permitted |
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
