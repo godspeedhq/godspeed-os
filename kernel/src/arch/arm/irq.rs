@@ -20,7 +20,7 @@
 //! model. Nothing here transfers to the AArch64 port - another instance of the two ARM ports sharing
 //! no code.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use super::pl011_write;
 
@@ -136,6 +136,12 @@ pub fn disable_interrupts() {
 /// Kept deliberately small: read the source, handle what we know, re-arm. Anything unrecognised is
 /// counted but not acted on, because silently *clearing* an interrupt we do not understand would turn
 /// a diagnosable fault into an invisible one.
+///
+/// Once the neutral scheduler is running (`scheduler::run`), the timer tick drives IT (preemptive
+/// `switch_context` via `timer_tick_from_irq`) rather than the early `context.rs` demo scheduler. Set
+/// by the port when it hands control to `scheduler::run`.
+pub static NEUTRAL_SCHED: AtomicBool = AtomicBool::new(false);
+
 #[no_mangle]
 pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
     let source = local_read(CORE_IRQ_SOURCE);
@@ -143,16 +149,32 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
     if source & IRQ_PHYS_TIMER != 0 {
         // Re-arm first: writing TVAL both sets the next deadline and deasserts the current interrupt.
         // Doing it before the bookkeeping keeps the period honest - the next interval starts counting
-        // from here, not from whenever the handler happens to finish.
+        // from here, not from whenever the handler happens to finish. (This is the ARM timer's "EOI";
+        // the neutral `apic_send_eoi` is a no-op here.)
         set_tval(RELOAD.load(Ordering::Relaxed));
         TICKS.fetch_add(1, Ordering::Relaxed);
+
+        if NEUTRAL_SCHED.load(Ordering::Relaxed) {
+            // The real preemption path: the neutral scheduler tick preempts the running task via
+            // `switch_context` INTERNALLY - it swaps `sp` to the resumed task's kernel stack itself. So
+            // we return `frame_sp` unchanged: after the switch (and after this task is later resumed,
+            // `switch_context` unwinding back into this call), `frame_sp` again names THIS task's frame,
+            // and `stub_irq`'s `mov sp, r0` is a no-op. The SAME stub serves both paths (below): the demo
+            // scheduler returns a DIFFERENT frame to adopt; the neutral one swaps in place and returns
+            // the same one. Runs with IRQs masked (IRQ-mode entry set CPSR.I), as the neutral tick
+            // assumes.
+            // SAFETY: `timer_tick_from_irq` is the neutral preemption entry; on ARM it is reached only
+            // from this masked IRQ handler running on the interrupted task's kernel (SVC) stack.
+            unsafe { crate::task::scheduler::timer_tick_from_irq(0, 0, 0); }
+            return frame_sp;
+        }
     }
     // Other sources (mailboxes, GPU funnel) are not enabled yet, so nothing else should arrive. If
     // something does, leaving it asserted is the loud outcome: it will re-enter and be obvious,
     // rather than being quietly discarded.
 
-    // Hand the frame to the scheduler. It returns the frame to RESUME - the same one to continue
-    // uninterrupted, or another task's to preempt. `stub_irq` adopts whatever comes back.
+    // Pre-scheduler (boot selftests, incl. preempt_selftest): the `context.rs` demo scheduler. It
+    // returns the frame to RESUME - the same to continue, or another task's to preempt.
     super::context::schedule(frame_sp)
 }
 

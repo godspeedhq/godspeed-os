@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Neutral-scheduler demo - proving `scheduler::run` round-robins real tasks on ARM.
+//! Neutral-scheduler PREEMPTION demo - the timer preempts non-yielding tasks on ARM.
 //!
 //! The `logger: ready` spawn (spawn.rs) entered ONE service directly, bypassing the scheduler. Full
-//! operation needs the neutral `scheduler::run` itself: its task table, `pick_next`, and
-//! `switch_context` driving multiple tasks. This demo commits three kernel tasks that log and
-//! `yield_current`, then hands control to `scheduler::run(0)` - if they interleave forever, the
-//! neutral scheduler runs on ARM, which is the foundation the supervisor and every service stand on.
+//! operation needs the neutral `scheduler::run` itself, and - crucially - **preemption of tasks that
+//! do not cooperate**: a real service blocks on `recv`, it does not `yield`, so only the timer can
+//! take the core away from it. This demo commits three kernel tasks that **spin** (no yield), arms the
+//! neutral preemption path (`irq::NEUTRAL_SCHED`), and enters `scheduler::run(0)`. If all three
+//! counters advance, the timer really did preempt a non-cooperating task and the neutral scheduler
+//! round-robined it.
 //!
-//! Cooperative first, on purpose: the tasks yield (a syscall-driven scheduling point), so this
-//! exercises the scheduler's task management + `switch_context` without the timer-preemption rework
-//! (running the IRQ on per-task kernel stacks) that real, non-yielding services need. That is the
-//! next increment; this proves the layer beneath it.
+//! **How preemption reaches the neutral scheduler on ARM.** The timer IRQ (`exceptions::stub_irq`)
+//! saves the full interrupted frame on the task's kernel (SVC) stack and calls `arm_irq_dispatch`,
+//! which - when `NEUTRAL_SCHED` is set - invokes the neutral `timer_tick_from_irq`. That does the
+//! preemptive `switch_context` INTERNALLY (swapping `sp` to the next task's kernel stack); on return
+//! the same IRQ stub pops the (now-resumed task's) frame and `rfe`s back to it. The proof is visible
+//! in the interleaved output: a task caught **mid-print** by the tick, another running, then the first
+//! resuming its half-written line - preemption between arbitrary instructions, not at yield points.
 
 use crate::arch::imp::context_switch::TaskContext;
 use crate::arch::imp::{BootInfo, MemoryKind, MemoryRegion};
@@ -32,14 +37,16 @@ unsafe extern "C" fn task_c() -> ! { run_task(b'C') }
 fn run_task(id: u8) -> ! {
     let mut n = 0u32;
     loop {
-        let mut line = *b"sched: task X tick ..... (yields)\r\n";
+        let mut line = *b"sched: task X tick ..... (PREEMPTED)\r\n";
         line[12] = id;
         // crude 5-digit counter, no allocation
         let mut v = n; for k in 0..5 { line[22 - k] = b'0' + (v % 10) as u8; v /= 10; }
         pl011_write(&line);
         n += 1;
-        for _ in 0..3_000_000 { core::hint::spin_loop(); } // slow the cadence for readable output
-        crate::task::scheduler::yield_current();           // hand the core back to the scheduler
+        // NO yield: the task spins. The timer preempts it (~10 ms) and the neutral scheduler
+        // round-robins to the next task - the whole point. If all three counters advance, a
+        // non-cooperating task really was preempted.
+        for _ in 0..8_000_000 { core::hint::spin_loop(); }
     }
 }
 
@@ -87,6 +94,10 @@ pub fn run(ram_end: u32, reserve_end: u32) -> ! {
         }
     }
 
-    pl011_write(b"sched-demo: 3 kernel tasks committed; entering scheduler::run(0)...\r\n");
+    // Arm the neutral preemption path: from here the timer tick drives scheduler::run's tasks via
+    // switch_context, not the early context.rs demo scheduler.
+    super::irq::NEUTRAL_SCHED.store(true, core::sync::atomic::Ordering::Relaxed);
+    pl011_write(b"sched-demo: 3 SPINNING kernel tasks committed; the TIMER will preempt them.\r\n");
+    pl011_write(b"sched-demo: entering scheduler::run(0)...\r\n");
     crate::task::scheduler::run(0)
 }

@@ -23,6 +23,26 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-21 - Timer preemption via the neutral scheduler (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/irq.rs` | 8 -> 9 (+1) | `arm_irq_dispatch` now routes the timer tick to the neutral `timer_tick_from_irq` (the preemptive `switch_context` path) once `NEUTRAL_SCHED` is set, instead of the early `context.rs` demo scheduler. The +1 unsafe is the `timer_tick_from_irq` call. |
+| `arch/arm/sched_demo.rs` | unchanged count | The demo tasks now **spin** (no yield) and arm `NEUTRAL_SCHED`, proving the timer preempts a non-cooperating task. |
+
+**The mechanism, and why the same IRQ stub serves both paths.** The stub saves the full interrupted
+frame on the task's kernel (SVC) stack and calls `arm_irq_dispatch`, which returns an `sp` the stub
+adopts (`mov sp, r0`). The early demo scheduler returns a *different* task's frame to adopt. The
+neutral `timer_tick_from_irq` instead does the `switch_context` INTERNALLY - it swaps `sp` to the next
+task's kernel stack itself - so `arm_irq_dispatch` returns `frame_sp` unchanged, and after this task is
+later resumed (`switch_context` unwinding back into the call), `frame_sp` again names THIS task's
+frame, making the `mov sp` a no-op. One stub, two mechanisms.
+
+**Non-yielding tasks are genuinely preempted**, proven by output interleaved mid-print (a tick caught a
+task between arbitrary instructions). The boot `preempt_selftest` still uses the demo path
+(`NEUTRAL_SCHED` defaults false) and still passes 9/9/9, so the default image is unregressed. This is
+the preemption real services need (they block on `recv`, they do not yield).
+
 ## 2026-07-21 - Neutral scheduler runs tasks on ARM (feat/pi2-arm32)
 
 | File | Change | Why |
@@ -564,7 +584,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 14 | permitted |
 | arch/arm/dtb.rs | 6 | permitted |
-| arch/arm/irq.rs | 8 | permitted |
+| arch/arm/irq.rs | 9 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
 | arch/arm/page_tables.rs | 21 | permitted |
