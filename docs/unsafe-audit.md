@@ -475,7 +475,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/dtb.rs | 6 | permitted |
 | arch/arm/irq.rs | 8 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
-| arch/arm/page_tables.rs | 17 | permitted |
+| arch/arm/page_tables.rs | 19 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
 | arch/arm/mod.rs | 21 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |

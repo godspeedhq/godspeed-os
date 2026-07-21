@@ -116,6 +116,8 @@ fn alloc_l2() -> Option<u32> {
     unsafe {
         let t = core::ptr::addr_of_mut!(L2_ARENA.0[i]);
         (*t) = [0; 256];
+        // The zeroed table must reach the PoC before the non-cacheable walker reads any entry.
+        clean_dcache(t as u32, 1024);
         Some(t as u32)
     }
 }
@@ -129,8 +131,34 @@ fn alloc_l1() -> Option<u32> {
     unsafe {
         let t = core::ptr::addr_of_mut!(L1_ARENA.0[i]);
         (*t) = [0; 4096];
+        clean_dcache(t as u32, 16384); // zeroed L1 -> PoC for the non-cacheable walker
         Some(t as u32)
     }
+}
+
+/// Clean `len` bytes from `addr` out of the D-cache to the Point of Coherency (`DCCMVAC`), then
+/// `dsb`.
+///
+/// **This is the fix for a hardware-only bug QEMU cannot show.** `mmu.rs` leaves table walks
+/// *non-cacheable*, so the hardware page-table walker reads descriptors from the PoC - but ordinary
+/// stores land in the write-back D-cache first. A descriptor written and not cleaned is invisible to
+/// the walker: on real silicon the very read translation faults, while QEMU's flat memory model honours
+/// it regardless. This is the same class as SEC-28 (DMA coherence): a second observer (here the walker)
+/// that does not go through the CPU's cache. Cortex-A7 lines are 64 bytes; a 32-byte stride is a safe
+/// lower bound.
+fn clean_dcache(addr: u32, len: u32) {
+    let mut p = addr & !31;
+    let end = addr + len;
+    while p < end {
+        // SAFETY: `DCCMVAC` (`c7, c10, 1`) cleans one cache line by MVA to the PoC - no memory is
+        // modified, only written back. `p` walks the descriptor bytes just written.
+        unsafe {
+            core::arch::asm!("mcr p15, 0, {a}, c7, c10, 1", a = in(reg) p, options(nostack));
+        }
+        p += 32;
+    }
+    // SAFETY: `dsb` orders the cleans before any subsequent table walk observes the memory.
+    unsafe { core::arch::asm!("dsb", options(nostack)) }
 }
 
 // ---- TLB + TTBR0 primitives (the neutral surface) ----
@@ -203,13 +231,16 @@ pub unsafe fn map_in_active_tables(virt: u64, phys: u64, flags: u64) -> Result<(
         } else if existing == 0 {
             let l2 = alloc_l2().ok_or(MapError::FrameAllocFailed)?;
             l1.add(l1_index).write_volatile(l1_table_ptr(l2));
+            clean_dcache(l1.add(l1_index) as u32, 4); // L1 entry -> PoC for the walker
             l2 as *mut u32
         } else {
             return Err(MapError::AlreadyMapped); // a live section - do not clobber
         };
 
         let pf = PageFlags::from_bits_truncate(flags);
-        l2_base.add(l2_index).write_volatile(l2_small_page(pa, pf));
+        let ent = l2_base.add(l2_index);
+        ent.write_volatile(l2_small_page(pa, pf));
+        clean_dcache(ent as u32, 4); // L2 entry -> PoC
     }
 
     invalidate_tlb_page(virt);
@@ -247,14 +278,17 @@ impl PageTable {
             } else if existing == 0 {
                 let l2 = alloc_l2().ok_or(MapError::FrameAllocFailed)?;
                 l1.add(l1_index).write_volatile(l1_table_ptr(l2));
+                clean_dcache(l1.add(l1_index) as u32, 4);
                 l2 as *mut u32
             } else {
                 return Err(MapError::AlreadyMapped);
             };
-            if l2_base.add(l2_index).read_volatile() & 0b11 != 0 {
+            let ent = l2_base.add(l2_index);
+            if ent.read_volatile() & 0b11 != 0 {
                 return Err(MapError::AlreadyMapped);
             }
-            l2_base.add(l2_index).write_volatile(l2_small_page(pa, flags));
+            ent.write_volatile(l2_small_page(pa, flags));
+            clean_dcache(ent as u32, 4);
         }
         Ok(())
     }
@@ -385,7 +419,9 @@ pub fn selftest() {
     // SAFETY: clearing the single L1 slot for the test gap (index 0x3C0); it was invalid before us.
     unsafe {
         let l1 = l1_base as *mut u32;
-        l1.add((TEST_VA_RW >> 20) as usize).write_volatile(0);
+        let slot = l1.add((TEST_VA_RW >> 20) as usize);
+        slot.write_volatile(0);
+        clean_dcache(slot as u32, 4);
         invalidate_tlb_page(TEST_VA_RW as u64);
     }
 }
