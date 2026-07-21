@@ -23,6 +23,25 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-21 - ARMv7 user mode / PL0 (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/usermode.rs` | 0 -> 15 (new file) | **A task runs UNPRIVILEGED for the first time.** Enters USR mode (PL0), runs a stub that cannot touch kernel memory, and has it `svc` back. The `unsafe` is: `enter_user` (the fabricated exception return that drops to PL0), `resume_boot` (restores the kernel context on the magic svc), the user stub, I-cache sync for the copied code, the ATS1CPUR/W unprivileged translation probes, and the frame copy/map in the selftest. |
+| `arch/arm/page_tables.rs` | 19 (unchanged) | `l2_small_page` now encodes PL0 access from the `USER` flag: AP=0b11 (PL0 RW), 0b10 (PL0 RO), 0b01 (PL0 none) - the page's whole two-level security model. No new `unsafe`. |
+| `arch/arm/exceptions.rs` / `syscall.rs` | unchanged counts | The SVC entry publishes the caller's SPSR (so a syscall can see its privilege), and the magic test syscall routes to `on_magic_svc`. |
+
+**Entering USR mode is a fabricated exception return.** No `iret`: set SPSR to USR (IRQs enabled), set
+LR to the entry PC, arrange the USR banked SP (via a brief system-mode switch), and `movs pc, lr` -
+which copies SPSR->CPSR and LR->PC atomically, dropping privilege. The ARM analogue of x86's IRETQ.
+
+**The proof of PL0 is the SPSR at the svc, not that the code ran.** The CPU records the caller's mode
+in SPSR_svc; `SPSR.mode == 0x10 (USR)` is unforgeable evidence the stub executed unprivileged. The
+selftest checks exactly that (observed 0x10), and separately probes the permission model with the
+*unprivileged*-access translation ops (ATS1CPUR/W): user code is user-readable, user stack
+user-writable, and a KERNEL page is NOT user-accessible - isolation, proven non-faulting. Getting back
+out with no scheduler: `enter_user` saves the kernel context first; the magic svc restores it.
+
 ## 2026-07-21 - ARMv7 SVC syscall entry (feat/pi2-arm32)
 
 | File | Change | Why |
@@ -514,6 +533,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 4 | permitted |
 | arch/arm/page_tables.rs | 19 | permitted |
 | arch/arm/syscall.rs | 5 | permitted |
+| arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
 | arch/arm/mod.rs | 21 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |

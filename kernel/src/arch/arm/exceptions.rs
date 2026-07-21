@@ -173,12 +173,15 @@ unsafe extern "C" fn stub_undef() -> ! {
 unsafe extern "C" fn stub_svc() {
     core::arch::naked_asm!(
         "push {{r4-r12, lr}}",          // save callee-saved + the SVC return address (LR_svc)
-        "mrs  r4, spsr",                // save the caller's CPSR (SPSR_svc) across the call
+        "mrs  r4, spsr",                // the caller's CPSR (SPSR_svc): carries the caller's mode
+        "ldr  r5, ={spsr_save}",        // publish it so a syscall can see the caller's privilege level
+        "str  r4, [r5]",                //   (used to prove PL0 in the user-mode selftest)
         "bl   {dispatch}",              // arm_svc_dispatch(r0..r3) -> i64 in r0:r1
         "msr  spsr_cxsf, r4",           // restore SPSR for the exception return
         "pop  {{r4-r12, lr}}",          // restore callee-saved + LR_svc; r0:r1 (result) untouched
         "movs pc, lr",                  // return to caller, restoring CPSR from SPSR
         dispatch = sym crate::arch::arm::syscall::arm_svc_dispatch,
+        spsr_save = sym crate::arch::arm::usermode::USER_SPSR_SAVE,
     )
 }
 

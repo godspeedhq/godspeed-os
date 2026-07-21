@@ -48,6 +48,11 @@ static SVC_TEST_MODE: AtomicBool = AtomicBool::new(false);
 /// control returned.
 #[no_mangle]
 pub(super) extern "C" fn arm_svc_dispatch(number: u32, arg0: u32, arg1: u32, arg2: u32) -> i64 {
+    // The user-mode selftest's magic syscall: record the caller's privilege and resume the kernel
+    // (never returns to this handler). This is how a PL0 task hands control back with no scheduler yet.
+    if number == super::usermode::USER_TEST_SVC {
+        super::usermode::on_magic_svc();
+    }
     if SVC_TEST_MODE.load(Ordering::Relaxed) {
         return (number as i64 * 1000) + (arg0 as i64 * 100) + (arg1 as i64 * 10) + arg2 as i64;
     }

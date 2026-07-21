@@ -69,11 +69,14 @@ fn l2_small_page(pa: u32, flags: PageFlags) -> u32 {
     d |= 1 << 3; // C
     d |= 1 << 2; // B
     d |= 1 << 10; // S (shareable), matching mmu.rs sections
-    if flags.contains(PageFlags::WRITABLE) {
-        d |= 0b01 << 4; // AP=0b01, APX=0 -> PL1 RW
-    } else {
-        d |= 0b01 << 4; // AP=0b01 ...
-        d |= 1 << 9; //    ... + APX=1 -> PL1 RO
+    // AP/APX encode both privilege levels. USER = PL0 gets access; without it PL0 has none (kernel
+    // page). AP=0b11 is PL1 RW / PL0 RW; AP=0b10 is PL1 RW / PL0 RO; AP=0b01 is PL1 RW / PL0 none;
+    // APX=1 turns the PL1 half read-only. That is the whole security model of a page in two bits.
+    match (flags.contains(PageFlags::USER), flags.contains(PageFlags::WRITABLE)) {
+        (true, true)   => d |= 0b11 << 4,             // PL0 RW
+        (true, false)  => d |= 0b10 << 4,             // PL0 RO
+        (false, true)  => d |= 0b01 << 4,             // PL1 RW, PL0 none
+        (false, false) => { d |= 0b01 << 4; d |= 1 << 9; } // PL1 RO, PL0 none
     }
     if flags.contains(PageFlags::NO_EXEC) {
         d |= 1; // XN (bit 0 of a small-page descriptor)
