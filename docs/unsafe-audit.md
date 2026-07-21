@@ -23,6 +23,19 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-21 - Neutral frame allocator live on ARM (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/meminit.rs` | 0 -> 4 (new file) | **Wires the neutral `memory::init` on ARM** - the first shared (non-arch-layer) subsystem running on 32-bit ARM, and the prerequisite for per-task page tables and service spawn. Builds a `BootInfo` from the DTB memory map + linker kernel bounds, reserves the kernel image as a low region, and runs the neutral bitmap allocator. The `unsafe` is the `static mut MEM_REGIONS`/`BootInfo` construction, the `__fiq_stack_top` linker-symbol read, and reconstructing a `Frame` to free in the selftest. |
+| `memory/allocator.rs` + 7 arch `page_tables` | guard relaxed + `PHYS_IS_IDENTITY` const | The allocator panicked on `hhdm == 0` ("HHDM offset not set"). That is true on x86/Limine but WRONG on ARM: the kernel runs identity-mapped, so hhdm=0 is the correct value (`hhdm + phys == phys` already addresses the frame). Fixed the boundary-correct way (`arch/CLAUDE.md`): each arch declares `page_tables::PHYS_IS_IDENTITY` (true on ARM, false elsewhere), and the guard only fires where a zero offset genuinely means "unset". x86 identity 24/24 confirms the shipping arch is unaffected. |
+
+**`memory::init` fit the neutral allocator unchanged** because two ARM facts line up with what it wants:
+`hhdm=0` works (identity map), and `protect_kernel_page_table_frames` - the one Limine-table-specific
+step - already returns early when `hhdm == 0`, a clean no-op rather than a special case. Result on
+hardware-shaped input: `frame allocator ready (946 MiB free)`, and the selftest allocates 8 distinct
+page-aligned frames, checks the free count drops by 8, frees them, and checks it returns to baseline.
+
 ## 2026-07-21 - ARMv7 two-level page tables (feat/pi2-arm32)
 
 | File | Change | Why |
@@ -474,6 +487,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/context_switch.rs | 14 | permitted |
 | arch/arm/dtb.rs | 6 | permitted |
 | arch/arm/irq.rs | 8 | permitted |
+| arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 4 | permitted |
 | arch/arm/page_tables.rs | 19 | permitted |
 | arch/arm/timer.rs | 4 | permitted |

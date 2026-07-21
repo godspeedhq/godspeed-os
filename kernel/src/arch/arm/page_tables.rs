@@ -303,6 +303,9 @@ impl PageTable {
 
 // ---- The remaining neutral surface (honest stubs / no-ops for the kernel-only path) ----
 
+/// ARM runs identity-mapped (VA == PA), so hhdm=0 is the correct value, not "unset".
+pub const PHYS_IS_IDENTITY: bool = true;
+
 pub fn get_hhdm_offset() -> u64 { 0 }
 pub unsafe fn set_hhdm_offset(_offset: u64) {}
 pub fn entry_for_va(_virt: u64) -> Option<u64> { None }

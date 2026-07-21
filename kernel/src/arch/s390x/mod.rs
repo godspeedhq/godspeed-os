@@ -161,6 +161,7 @@ pub mod page_tables {
         pub fn into_cr3(self) -> u64 { self.root }
     }
 
+    pub const PHYS_IS_IDENTITY: bool = false;
     pub fn get_hhdm_offset() -> u64 { 0 }
     pub unsafe fn set_hhdm_offset(offset: u64) {}
     pub fn read_page_table_base() -> u64 { 0 }               // TTBR0_EL1

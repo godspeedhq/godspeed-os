@@ -24,6 +24,10 @@ static mut HHDM_OFFSET: u64 = 0;
 /// Read the HHDM offset set during memory init.
 ///
 /// # Safety
+/// True if physical RAM is directly addressable (VA == PA), so a zero HHDM offset is VALID
+/// rather than "unset". x86 reaches frames through Limine's higher-half direct map, so this is false.
+pub const PHYS_IS_IDENTITY: bool = false;
+
 /// Returns 0 if called before `set_hhdm_offset`.
 #[inline]
 pub fn get_hhdm_offset() -> u64 {
