@@ -179,6 +179,11 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
         set_tval(RELOAD.load(Ordering::Relaxed));
         TICKS.fetch_add(1, Ordering::Relaxed);
 
+        // Hands-off chaos demo: Core 0 counts ticks and, once boot has settled, injects the storm
+        // command into the input ring (no keyboard needed). One-shot, latched inside.
+        #[cfg(feature = "arm-autochaos")]
+        if this_core() == 0 { super::autochaos_tick(); }
+
         if NEUTRAL_SCHED.load(Ordering::Relaxed) {
             // **Atomic syscalls: do not preempt a USER task that is in a syscall (SVC mode).** Unlike
             // x86, preempting ARM kernel/SVC code mid-syscall corrupts - SPSR_svc and the SVC-banked sp

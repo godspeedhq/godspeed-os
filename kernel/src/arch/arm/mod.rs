@@ -600,6 +600,26 @@ pub fn uart_rx_pop() -> Option<u8> {
 /// hinges on the timer tick, which the atomic-syscall path may skip while a user task is mid-syscall).
 pub fn uart_rx_drain_now() { pl011_rx_drain(); }
 
+/// Hands-off chaos demo (`arm-autochaos`). A serial-output-only setup (no keyboard) still can't type a
+/// command, so a few seconds after boot - once the supervisor has spawned everything and the shell is
+/// at a steady prompt - inject `chaos max-carnage all-services 10` plus its `y` confirm into the input
+/// ring. The shell consumes it exactly as if typed (real path, real confirmation), runs the storm, and
+/// prints the report to serial. Called from the Core-0 timer tick; a one-shot latch fires it once.
+#[cfg(feature = "arm-autochaos")]
+pub fn autochaos_tick() {
+    use core::sync::atomic::AtomicU32;
+    static TICKS: AtomicU32 = AtomicU32::new(0);
+    static FIRED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if FIRED.load(Ordering::Relaxed) { return; }
+    // ~100 Hz tick; wait ~6 s so boot (supervisor spawns, shell prompt) has settled.
+    if TICKS.fetch_add(1, Ordering::Relaxed) < 600 { return; }
+    if FIRED.swap(true, Ordering::Relaxed) { return; }
+    for &b in b"chaos max-carnage all-services 10\ry\r" {
+        console_push_byte(b);
+    }
+    pl011_write(b"\r\nautochaos: injected 'chaos max-carnage all-services 10' + confirm (hands-off demo)\r\n");
+}
+
 /// Timer-tick hook: drain the RX FIFO and wake any task blocked in ConsoleRead. Runs from
 /// `timer_tick_from_irq` (core 0).
 pub fn uart_rx_poll() {

@@ -61,6 +61,10 @@ arm-sched-spawn = []
 arm-supervisor = []
 # The interactive shell on ARM: gsh> prompt reading serial input (arch/arm/sched_shell.rs).
 arm-shell = []
+# Hands-off chaos demo: a few seconds after boot the kernel INJECTS `chaos max-carnage all-services 10`
+# (+ confirm) into the input ring, so a serial-output-only setup (no keyboard) still runs + shows the
+# storm. Build with `arm-supervisor,arm-autochaos`.
+arm-autochaos = []
 
 # Deliberately take a data abort during arm32 boot, to PROVE the exception vectors
 # fire (a fault path never observed firing is not evidence). The ARM twin of the x86
