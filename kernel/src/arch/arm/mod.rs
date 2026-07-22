@@ -55,6 +55,36 @@ const PL011_FR_BUSY:   u32 = 1 << 3;                                   // transm
 const PL011_LCRH_8N1:  u32 = (3 << 5) | (1 << 4);                      // WLEN=8 bits, FIFOs on
 const PL011_CR_ON:     u32 = (1 << 0) | (1 << 8) | (1 << 9);           // UARTEN | TXE | RXE
 
+// GPIO controller (BCM2836) sits at +0x200000. UART0 uses GPIO14 (TXD0) + GPIO15 (RXD0), both ALT0.
+const GPIO_BASE:  usize = PERIPHERAL_BASE + 0x20_0000;
+const GPFSEL1:    *mut u32 = (GPIO_BASE + 0x04) as *mut u32; // function select for GPIO10-19
+const GPPUD:      *mut u32 = (GPIO_BASE + 0x94) as *mut u32; // pull up/down enable
+const GPPUDCLK0:  *mut u32 = (GPIO_BASE + 0x98) as *mut u32; // pull up/down clock (GPIO0-31)
+
+/// Route GPIO14/GPIO15 to the UART (ALT0) so BOTH transmit AND receive reach header pins 8/10. The
+/// firmware often muxes only GPIO14 (TX) for console *output*, leaving GPIO15 (RX) as an input - so
+/// output works but typing does nothing. Setting both to ALT0 here makes receive work regardless of how
+/// the firmware left the header. Runs with the MMU off; the GPIO block is identity-mapped MMIO.
+fn gpio_init_uart() {
+    // SAFETY: BCM2836 GPIO registers, identity-mapped MMIO, single-threaded boot. Read-modify-write of
+    // GPFSEL1 touches only GPIO14/15's function bits; the pull sequence is the BCM2835-spec dance.
+    unsafe {
+        let mut sel = GPFSEL1.read_volatile();
+        sel &= !((0b111 << 12) | (0b111 << 15)); // clear GPIO14, GPIO15 function fields
+        sel |= (0b100 << 12) | (0b100 << 15);    // ALT0 = UART0 TXD0 / RXD0
+        GPFSEL1.write_volatile(sel);
+        // Disable pull-up/down on both UART pins (they are externally driven). BCM2835 pull sequence:
+        // write GPPUD, wait, write the pin clock, wait, clear both.
+        let spin = |n: u32| { for _ in 0..n { core::arch::asm!("nop", options(nomem, nostack)); } };
+        GPPUD.write_volatile(0);
+        spin(150);
+        GPPUDCLK0.write_volatile((1 << 14) | (1 << 15));
+        spin(150);
+        GPPUD.write_volatile(0);
+        GPPUDCLK0.write_volatile(0);
+    }
+}
+
 /// Bring the PL011 up for output, **preserving whatever baud divisors are already programmed**.
 ///
 /// Do not assume the firmware did this. On real hardware it has (Linux runs a console here at
@@ -71,6 +101,7 @@ const PL011_CR_ON:     u32 = (1 << 0) | (1 << 8) | (1 << 9);           // UARTEN
 fn pl011_init() {
     // SAFETY: BCM2836 UART0 registers, identity-mapped with the MMU off. Volatile MMIO writes in the
     // order the PL011 spec requires; no memory is aliased and no other core is running yet.
+    gpio_init_uart(); // mux GPIO14/15 to the UART so RECEIVE works, not just transmit
     unsafe {
         PL011_CR.write_volatile(0);
         while PL011_FR.read_volatile() & PL011_FR_BUSY != 0 {}
