@@ -37,19 +37,19 @@ pub struct FbInfo {
 
 /// Send the property buffer to the GPU and wait for its reply. Returns whether the GPU reported success.
 ///
-/// The address handed to the mailbox is the buffer's **uncached VideoCore bus alias** (`| 0xC0000000`),
-/// not its plain ARM physical address. The GPU reaches memory through its own bus; the cached alias can
-/// leave it reading a stale copy of our request (which is why this WORKED under QEMU's lenient model but
-/// FAILED on real silicon). The uncached alias makes the GPU read/write RAM directly, and the D-cache
-/// clean+invalidate on our side keeps our (cached) view of the buffer coherent with it.
+/// **Called with the MMU and caches OFF** (from the boot path before `mmu::enable`), which is what makes
+/// it coherent with the GPU on real silicon: the GPU reaches RAM through its own bus, and with the ARM
+/// caches off there is no L1/L2 copy to go stale - our request and the GPU's reply both live in RAM. (An
+/// earlier caches-on version FAILED on hardware because the reply came back through the A7's L2, which a
+/// set/way L1 clean does not reach, while QEMU's cacheless model hid it.) The address handed to the
+/// mailbox is still the uncached VideoCore bus alias (`| 0xC0000000`).
 fn mbox_call(channel: u32) -> bool {
-    // SAFETY: MBOX is a 16-byte-aligned static touched only on this single-threaded boot path; the
-    // mailbox registers are Device-mapped MMIO.
+    // SAFETY: MBOX is a 16-byte-aligned static touched only on this single-threaded, caches-off boot
+    // path; the mailbox registers are physical MMIO (Strongly-Ordered with the MMU off).
     unsafe {
         let phys = core::ptr::addr_of!(MBOX) as u32;
         let bus  = (phys | 0xC000_0000) & !0xF; // uncached GPU alias, 16-byte aligned
-        super::page_tables::clean_invalidate_dcache_all(); // publish the request to RAM
-        core::arch::asm!("dsb", options(nostack));
+        core::arch::asm!("dsb", options(nostack)); // request is in RAM (caches off) before we signal
         while MBOX_STATUS.read_volatile() & MBOX_FULL != 0 {}
         MBOX_WRITE.write_volatile(bus | (channel & 0xF));
         loop {
@@ -59,15 +59,16 @@ fn mbox_call(channel: u32) -> bool {
                 break;
             }
         }
-        super::page_tables::clean_invalidate_dcache_all(); // re-read the GPU's reply from RAM
-        core::arch::asm!("dsb", "isb", options(nostack));
+        core::arch::asm!("dsb", options(nostack));
         MBOX.data[1] == RESP_SUCCESS
     }
 }
 
-/// Ask the GPU for a 32-bpp framebuffer at `width` x `height`, map it Device so ARM writes reach the
-/// display, and return its descriptor. `None` (logged) if the mailbox call fails or returns nothing.
-pub fn init(width: u32, height: u32) -> Option<FbInfo> {
+/// Ask the GPU for a 32-bpp framebuffer at `width` x `height` and return its descriptor. `None`
+/// (logged) if the mailbox call fails or returns nothing. **Must run with the MMU + caches OFF** (before
+/// `mmu::enable`) so the mailbox exchange is coherent with the GPU; the framebuffer is mapped and drawn
+/// later via `map_and_fill` once translation is on.
+pub fn request(width: u32, height: u32) -> Option<FbInfo> {
     // SAFETY: single-threaded boot; MBOX is filled then read here only.
     unsafe {
         let b = &mut (*core::ptr::addr_of_mut!(MBOX)).data;
@@ -96,7 +97,6 @@ pub fn init(width: u32, height: u32) -> Option<FbInfo> {
         pl011_write(b"arm32: framebuffer allocation returned null (base/pitch 0)\r\n");
         return None;
     }
-    super::mmu::map_framebuffer(base, pitch * h);
     pl011_write(b"arm32: framebuffer at ");
     write_hex32(base);
     pl011_write(b" pitch ");
@@ -114,6 +114,13 @@ pub fn init(width: u32, height: u32) -> Option<FbInfo> {
 /// NOT the x86 `0x00RRGGBB` order. Use this helper everywhere so colours read correctly on the display.
 pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+/// Map the framebuffer Device (so ARM writes reach the display) and fill it with `color`. Called AFTER
+/// `mmu::enable`, once translation is on - the counterpart to the MMU-off `request`.
+pub fn map_and_fill(fb: &FbInfo, color: u32) {
+    super::mmu::map_framebuffer(fb.base, fb.pitch.saturating_mul(fb.height));
+    fill(fb, color);
 }
 
 /// Fill the whole framebuffer with a solid colour. Phase-1 proof the pipeline works.

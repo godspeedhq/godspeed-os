@@ -429,12 +429,15 @@ extern "C" fn arm_boot_main() -> ! {
     }
     let ram_end = dtb::report_memory(mmu::FALLBACK_RAM_END);
     mmu::set_ram_end(ram_end);
+    // Ask the GPU for a framebuffer BEFORE turning the MMU + caches on: the mailbox exchange is only
+    // coherent with the GPU while the ARM caches are off (on real silicon the reply comes back through
+    // the A7's L2, which an L1 clean does not reach). Get the descriptor now; map + fill after `enable`.
+    let fb = video::request(1024, 768);
     mmu::enable();
-    // Ask the GPU for a framebuffer and prove the display pipeline with a solid fill (Phase 1). A colour
-    // on the TV confirms the mailbox, the returned base/pitch, and the device mapping are all correct;
-    // text rendering layers on next. Serial stays the source of truth if there is no display.
-    if let Some(fb) = video::init(1024, 768) {
-        video::fill(&fb, video::rgb(0x18, 0x30, 0xA0)); // a clear blue - unmistakable on a working display
+    // Prove the display pipeline with a solid fill (Phase 1). A colour on the TV confirms the mailbox,
+    // the returned base/pitch, and the device mapping are all correct; text rendering layers on next.
+    if let Some(fb) = fb {
+        video::map_and_fill(&fb, video::rgb(0x18, 0x30, 0xA0)); // clear blue - unmistakable if it works
         pl011_write(b"arm32: framebuffer filled (you should see a BLUE screen on the display)\r\n");
     }
     timer::init();
