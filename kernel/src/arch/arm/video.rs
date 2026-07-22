@@ -36,20 +36,26 @@ pub struct FbInfo {
 }
 
 /// Send the property buffer to the GPU and wait for its reply. Returns whether the GPU reported success.
+///
+/// The address handed to the mailbox is the buffer's **uncached VideoCore bus alias** (`| 0xC0000000`),
+/// not its plain ARM physical address. The GPU reaches memory through its own bus; the cached alias can
+/// leave it reading a stale copy of our request (which is why this WORKED under QEMU's lenient model but
+/// FAILED on real silicon). The uncached alias makes the GPU read/write RAM directly, and the D-cache
+/// clean+invalidate on our side keeps our (cached) view of the buffer coherent with it.
 fn mbox_call(channel: u32) -> bool {
     // SAFETY: MBOX is a 16-byte-aligned static touched only on this single-threaded boot path; the
-    // mailbox registers are Device-mapped MMIO. Cache maintenance brackets the exchange so the GPU sees
-    // our request and we see its reply (the buffer is Normal cacheable RAM, the GPU a second observer).
+    // mailbox registers are Device-mapped MMIO.
     unsafe {
-        let addr = core::ptr::addr_of!(MBOX) as u32;
+        let phys = core::ptr::addr_of!(MBOX) as u32;
+        let bus  = (phys | 0xC000_0000) & !0xF; // uncached GPU alias, 16-byte aligned
         super::page_tables::clean_invalidate_dcache_all(); // publish the request to RAM
         core::arch::asm!("dsb", options(nostack));
         while MBOX_STATUS.read_volatile() & MBOX_FULL != 0 {}
-        MBOX_WRITE.write_volatile((addr & !0xF) | (channel & 0xF));
+        MBOX_WRITE.write_volatile(bus | (channel & 0xF));
         loop {
             while MBOX_STATUS.read_volatile() & MBOX_EMPTY != 0 {}
             let r = MBOX_READ.read_volatile();
-            if (r & 0xF) == channel && (r & !0xF) == (addr & !0xF) {
+            if (r & 0xF) == channel && (r & !0xF) == bus {
                 break;
             }
         }
