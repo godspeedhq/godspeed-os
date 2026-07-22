@@ -685,6 +685,12 @@ pub mod syscall_entry {
     /// `svc` in SVC mode under that same table - so a user VA is directly readable once range-checked.
     /// A genuinely unmapped user address still faults into the abort handler rather than reading junk.
     pub fn validate_user_ptr(ptr: u64, len: usize) -> bool {
+        // Refuse a len past isize::MAX and a null base with a non-empty range: BOTH are hard
+        // preconditions of `slice::from_raw_parts` / `copy_nonoverlapping`, so a service passing a
+        // garbage len (seen under chaos/fuzz) must be REFUSED here, never panic the kernel in
+        // read_user_bytes/write_user_bytes (§22 F1: no kernel panic on user-controllable syscall args).
+        if len > isize::MAX as usize { return false; }
+        if ptr == 0 && len != 0 { return false; }
         let end = match ptr.checked_add(len as u64) { Some(e) => e, None => return false };
         end <= USER_END
     }

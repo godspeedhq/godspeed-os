@@ -23,7 +23,7 @@
 //! allocator swap called out as the remaining seam. The *algorithm* - build an L2, point an L1 entry
 //! at it, encode the page - is the real one, identical to what the neutral path will drive.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::memory::frame::PhysAddr;
 use super::pl011_write;
@@ -106,6 +106,28 @@ struct L2Arena([[u32; 256]; L2_TABLES]);
 static mut L2_ARENA: L2Arena = L2Arena([[0; 256]; L2_TABLES]);
 static L2_USED: [AtomicBool; L2_TABLES] = [const { AtomicBool::new(false) }; L2_TABLES];
 
+/// The L1 root that ALLOCATED each L2 slot (0 = unowned). This is the reclaim discriminator, and it has
+/// to be exact: `fill_kernel_identity` copies the SPAWNER's L1 table pointers into a child that does not
+/// map that megabyte (a smaller binary inherits the spawner's higher binary L2s), so the child's L1
+/// then points at L2s it does NOT own. Freeing those on the child's death would free the spawner's LIVE
+/// pages (a real use-after-free - the double-free the allocator bitmap only *happened* to catch, and the
+/// UNDEF from a live service's code being reused). `reclaim_user_frames` frees an L2 (and its pages)
+/// only when `L2_OWNER == the dying task's root`; an inherited/shared L2 is owned by someone else and
+/// left alone.
+static L2_OWNER: [AtomicU32; L2_TABLES] = [const { AtomicU32::new(0) }; L2_TABLES];
+
+/// First-alias-only latch for the reclaim dedup log (aliasing is expected + handled, so log once).
+static RECLAIM_ALIAS_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Map an L2 physical base to its arena slot index (the arena is a contiguous static array of 1 KiB
+/// tables). `None` for an address outside the arena (e.g. a kernel L2 not from this arena).
+fn l2_slot(pa: u32) -> Option<usize> {
+    let base = core::ptr::addr_of!(L2_ARENA) as u32;
+    if pa < base { return None; }
+    let idx = ((pa - base) / 1024) as usize; // each L2 = 256 * 4 = 1024 bytes
+    if idx < L2_TABLES { Some(idx) } else { None }
+}
+
 /// Fresh L1 tables (16 KiB each, 16 KiB aligned) for `PageTable::new`. One per address space (the boot
 /// loader selftest and each live service). Reclaimable like the L2 arena.
 const L1_TABLES: usize = 16;
@@ -114,11 +136,13 @@ struct L1Arena([[u32; 4096]; L1_TABLES]);
 static mut L1_ARENA: L1Arena = L1Arena([[0; 4096]; L1_TABLES]);
 static L1_USED: [AtomicBool; L1_TABLES] = [const { AtomicBool::new(false) }; L1_TABLES];
 
-/// Hand out a zeroed L2 table; returns its physical (== virtual, identity-mapped) address. Claims the
-/// first free slot (CAS on its `used` flag), so it composes with `free_l2` for reuse across spawns.
-fn alloc_l2() -> Option<u32> {
+/// Hand out a zeroed L2 table for the address space rooted at `owner`; returns its physical
+/// (== virtual, identity-mapped) address. Claims the first free slot (CAS on its `used` flag) and
+/// records `owner` so `reclaim_user_frames` frees it only for its true owner, never an inheritor.
+fn alloc_l2(owner: u32) -> Option<u32> {
     for i in 0..L2_TABLES {
         if L2_USED[i].compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            L2_OWNER[i].store(owner, Ordering::Relaxed);
             // SAFETY: we exclusively claimed slot `i`; no other caller can alias it until `free_l2`.
             // The arena is 1 KiB aligned as the L1 pointer descriptor requires.
             unsafe {
@@ -133,13 +157,12 @@ fn alloc_l2() -> Option<u32> {
     None
 }
 
-/// Return an L2 table to the arena (mapping its physical base back to a slot index). Called from
-/// `reclaim_user_frames` for a dead task's own L2s. Out-of-arena addresses are ignored defensively.
+/// Return an L2 table to the arena (mapping its physical base back to a slot index) and clear its
+/// owner. Called from `reclaim_user_frames` for a dead task's own L2s. Out-of-arena addresses are
+/// ignored defensively.
 fn free_l2(pa: u32) {
-    let base = core::ptr::addr_of!(L2_ARENA) as u32;
-    if pa < base { return; }
-    let idx = ((pa - base) / 1024) as usize; // each L2 = 256 * 4 = 1024 bytes
-    if idx < L2_TABLES {
+    if let Some(idx) = l2_slot(pa) {
+        L2_OWNER[idx].store(0, Ordering::Relaxed);
         L2_USED[idx].store(false, Ordering::Release);
     }
 }
@@ -263,7 +286,9 @@ pub unsafe fn map_in_active_tables(virt: u64, phys: u64, flags: u64) -> Result<(
         let l2_base = if existing & 0b11 == L1_TYPE_TABLE {
             (existing & 0xFFFF_FC00) as *mut u32 // already a table
         } else if existing == 0 {
-            let l2 = alloc_l2().ok_or(MapError::FrameAllocFailed)?;
+            // The live kernel map owns any L2 it splits (l1_base = the active kernel L1), so no service
+            // reclaim ever frees it (a service that inherits it is not its owner).
+            let l2 = alloc_l2(l1_base).ok_or(MapError::FrameAllocFailed)?;
             l1.add(l1_index).write_volatile(l1_table_ptr(l2));
             clean_dcache(l1.add(l1_index) as u32, 4); // L1 entry -> PoC for the walker
             l2 as *mut u32
@@ -310,7 +335,9 @@ impl PageTable {
             let l2_base = if existing & 0b11 == L1_TYPE_TABLE {
                 (existing & 0xFFFF_FC00) as *mut u32
             } else if existing == 0 {
-                let l2 = alloc_l2().ok_or(MapError::FrameAllocFailed)?;
+                // This L2 belongs to THIS address space (self.root); reclaim frees it only for this
+                // root, never for a child that later inherits the pointer via fill_kernel_identity.
+                let l2 = alloc_l2(self.root).ok_or(MapError::FrameAllocFailed)?;
                 l1.add(l1_index).write_volatile(l1_table_ptr(l2));
                 clean_dcache(l1.add(l1_index) as u32, 4);
                 l2 as *mut u32
@@ -477,40 +504,70 @@ pub fn harden_hhdm_nx() {}
 /// Free every user frame a dying task owns, and return its own L2 tables to the arena; return the count
 /// of frames freed. Mirrors x86's `reclaim_user_frames` for the ARM two-level short-descriptor tables.
 ///
-/// The subtlety is the SHARED kernel identity map: `fill_kernel_identity` copies kernel L1 entries
-/// (sections and table pointers) into every service L1, so a naive "free every table under this L1"
-/// would free the kernel's own tables and its shared pages. The clean discriminator:
-/// - an L1 entry is the service's OWN iff it is a TABLE **and differs from the boot kernel L1** at that
-///   index (a matching value is a shared copy; a SECTION is always kernel);
-/// - within such an L2, a page is the service's OWN iff PL0 has access (AP[1:0] >= 0b10) - the USER
-///   pages the loader/`map_stack_and_ctx` `alloc_frame`d. Kernel hole-fill pages (AP == 0b01, PL0 none)
-///   are shared and left alone.
+/// The trap is the SHARED kernel identity map: `fill_kernel_identity` copies kernel sections AND the
+/// SPAWNER's L1 table pointers into every service L1, so a service's L1 points at L2s it does NOT own
+/// (kernel L2s, and a smaller binary inherits the spawner's higher binary L2s). Freeing those would
+/// free the kernel's or a LIVE sibling's pages - a real use-after-free. The exact discriminator is
+/// ownership, recorded at `alloc_l2` time:
+/// - free an L2 (and its pages) only when `L2_OWNER[slot] == this task's root` - never an inherited or
+///   kernel-owned L2;
+/// - within an owned L2, free only PL0-accessible pages (AP[1:0] >= 0b10) - the USER pages the
+///   loader/`map_stack_and_ctx` `alloc_frame`d - and leave the kernel hole-fill pages (AP == 0b01),
+///   which point at kernel RAM and are shared.
 /// Leaves the L1 ROOT for `free_page_table_root` (mirrors x86 leaving the PML4 to the root-free path).
 ///
 /// # Safety
 /// `cr3` is the Dead task's L1 root; no core will load it again, so its tables are ours to walk + free.
 pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
     use crate::memory::frame::{Frame, PhysAddr};
-    let svc_l1 = ((cr3 as u32) & 0xFFFF_C000) as *const u32;
-    let ker_l1 = super::mmu::kernel_l1_base() as *const u32;
+    let root = (cr3 as u32) & 0xFFFF_C000;
+    let svc_l1 = root as *const u32;
     let mut freed = 0usize;
-    // SAFETY: both L1s are identity-mapped (arena L1 + boot L1), readable here; the task is Dead.
+    // A frame must be freed at most ONCE per reclaim: if the same physical page appears in two of this
+    // task's owned L2 entries (an alias), freeing it twice would double-free (an uncaught UAF if it were
+    // reallocated between). Dedup within the call, and log the first alias loudly so the source is
+    // pinned (a service is ~76 frames; 512 is ample headroom, and past it we simply stop deduping).
+    let mut seen: [u32; 512] = [0; 512];
+    let mut nseen = 0usize;
+    // SAFETY: the arena L1 is identity-mapped, readable here; the task is Dead, so its tables are ours.
     unsafe {
         for i in 0..4096usize {
             let svc = svc_l1.add(i).read_volatile();
-            if svc & 0b11 != L1_TYPE_TABLE { continue; }          // 0 (unmapped) or a kernel SECTION
-            if svc == ker_l1.add(i).read_volatile() { continue; } // shared kernel table (copied in)
-            let l2 = (svc & 0xFFFF_FC00) as *const u32;
+            if svc & 0b11 != L1_TYPE_TABLE { continue; }   // 0 (unmapped) or a kernel SECTION
+            let l2_pa = svc & 0xFFFF_FC00;
+            // Only walk+free an L2 THIS root owns. A kernel L2 or one inherited from the spawner is
+            // owned by someone else (or is outside the arena) - its live pages must NOT be freed here.
+            match l2_slot(l2_pa) {
+                Some(s) if L2_OWNER[s].load(Ordering::Relaxed) == root => {}
+                _ => continue,
+            }
+            let l2 = l2_pa as *const u32;
             for j in 0..256usize {
                 let e = l2.add(j).read_volatile();
                 if e & 0b11 == 0 { continue; }                    // invalid entry
                 if (e >> 4) & 0b11 >= 0b10 {                      // PL0 has access => USER page => ours
-                    free_frame(Frame::from_phys(PhysAddr((e & 0xFFFF_F000) as u64)));
+                    let pa = e & 0xFFFF_F000;
+                    let mut dup = false;
+                    for k in 0..nseen { if seen[k] == pa { dup = true; break; } }
+                    if dup {
+                        // A frame mapped at more than one VA in this task: free the physical page ONCE
+                        // (the correct reclaim semantics), skip the duplicate. Log the FIRST such alias
+                        // per boot only (it is expected/handled, not an error - rate-limited so a storm
+                        // does not bury the console, §26.7).
+                        if !RECLAIM_ALIAS_LOGGED.swap(true, Ordering::Relaxed) {
+                            crate::kprintln!(
+                                "reclaim: aliased frame pa={:#010x} at l1={} l2={} - freed once (further aliases silent)",
+                                pa, i, j);
+                        }
+                        continue; // already freed this frame in this reclaim; do NOT free again
+                    }
+                    if nseen < seen.len() { seen[nseen] = pa; nseen += 1; }
+                    free_frame(Frame::from_phys(PhysAddr(pa as u64)));
                     freed += 1;
                 }
                 // AP == 0b01 => kernel hole-fill page (shared) => leave it
             }
-            free_l2(l2 as u32); // return the service's own L2 to the arena
+            free_l2(l2_pa); // return this task's own L2 to the arena
         }
     }
     freed
