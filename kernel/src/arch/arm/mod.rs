@@ -278,6 +278,7 @@ pub fn smp_bringup() {
 
     let entry = ap_entry as *const () as u32; // identity-mapped, so physical == virtual
     for core in 1u32..=3 {
+        crate::kprintln!("smp: releasing core {}...", core);
         // Write ap_entry to this core's mailbox-3 SET register (0x4000008C + 0x10*core), then SEV to
         // wake it from WFE.
         // SAFETY: the core-local block is Device-mapped; a volatile write to a fixed mailbox register,
@@ -286,17 +287,19 @@ pub fn smp_bringup() {
             ((0x4000_008C + 0x10 * core as usize) as *mut u32).write_volatile(entry);
             core::arch::asm!("dsb", "sev", options(nomem, nostack));
         }
-        // Wait (bounded) for this core before releasing the next - a wedged core is then distinct from
-        // a slow one, and the log line for each `smp: core N ready` stays ordered.
+        // Wait (bounded, generous) for this core before releasing the next - a wedged core is then
+        // distinct from a slow one, and each `smp: core N ready` line stays ordered. ~40M spins is
+        // tens of ms, far longer than a healthy AP's MMU+timer bring-up.
         let mut online = false;
-        for _ in 0..4_000_000u32 {
+        for _ in 0..40_000_000u32 {
             if crate::smp::core::is_ready(core) { online = true; break; }
             core::hint::spin_loop();
         }
         if online {
             AP_ONLINE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            crate::kprintln!("smp: core {} up", core);
         } else {
-            pl011_write(b"smp: WARNING - a secondary core did not come up; continuing without it\r\n");
+            crate::kprintln!("smp: WARNING - core {} did NOT come up; continuing without it", core);
         }
     }
     crate::kprintln!("smp: {} cores ready", AP_ONLINE.load(core::sync::atomic::Ordering::Relaxed) + 1);
@@ -316,9 +319,34 @@ pub(super) fn pl011_write_byte(b: u8) {
     }
 }
 
+/// Best-effort cross-core serialization of the one PL011 UART. Under SMP, cores 0/1/2/... all write the
+/// single UART; without this each core's bytes interleave and every log line garbles (seen on the Pi 2:
+/// "smp: core 1 ready" mangled into neighbouring lines). This is NOT the neutral `SpinLock` on purpose:
+/// a `SpinLock` watchdog-panics on a wedge, and the panic path itself writes serial - a recursion trap.
+/// Instead every writer BOUNDED-acquires this flag and writes REGARDLESS: a fault-time / panic dump, or a
+/// write that interrupts a holder on the same core, is never lost or deadlocked (it may rarely interleave).
+static SERIAL_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Cap on the acquire spin (~one full serial line at 115200 baud). A waiter that exceeds it writes
+/// anyway rather than block forever - the only correct choice for a UART also used by the fault handler.
+const SERIAL_ACQUIRE_SPINS: u32 = 20_000_000;
+
 pub(super) fn pl011_write(s: &[u8]) {
+    use core::sync::atomic::Ordering;
+    // Try to claim the UART (bounded), then write, then release only if we claimed it.
+    let mut held = false;
+    let mut spins: u32 = 0;
+    while SERIAL_BUSY.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        spins += 1;
+        if spins >= SERIAL_ACQUIRE_SPINS { break; } // give up waiting; write lock-free (never deadlock)
+        core::hint::spin_loop();
+    }
+    if spins < SERIAL_ACQUIRE_SPINS { held = true; }
     for &b in s {
         pl011_write_byte(b);
+    }
+    if held {
+        SERIAL_BUSY.store(false, Ordering::Release);
     }
 }
 
