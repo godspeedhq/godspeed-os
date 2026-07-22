@@ -46,6 +46,7 @@ const HPRT:     usize = 0x440; // host port control + status (root port)
 // Host channel 0 register block (each channel is 0x20 apart from 0x500). We use only channel 0 - one
 // transfer at a time is plenty for enumerating + polling a single keyboard.
 const HCCHAR0:  usize = 0x500; // channel characteristics (ep, dir, addr, type, enable)
+const HCSPLT0:  usize = 0x504; // channel split control (0 = no split transaction)
 const HCINT0:   usize = 0x508; // channel interrupt status
 const HCINTMSK0:usize = 0x50C; // channel interrupt mask
 const HCTSIZ0:  usize = 0x510; // transfer size (bytes, packet count, PID)
@@ -361,6 +362,11 @@ fn channel_start(dir_in: bool, pid: u32, buf_phys: u32, len: u32) {
     let low_speed = LOW_SPEED.load(Ordering::Relaxed) as u32;
     let pkts = if len == 0 { 1 } else { (len + mps - 1) / mps };
     wr(HCINT0, 0xFFFF_FFFF);                                    // clear stale channel interrupts
+    // No split transaction: the device is directly on the (root) port, not behind a high-speed hub doing
+    // FS/LS split. HCSPLT must be 0 or a stale SplEna makes the core wait to schedule a split it can never
+    // complete - the channel arms (ChEna set) but never transacts (HCINT=0, HCDMA never advances), exactly
+    // the Pi 2 stall. Bare-metal DWC2 stacks write HCSPLT=0 for every non-split transfer.
+    wr(HCSPLT0, 0);
     wr(HCTSIZ0, (len & 0x7_FFFF) | (pkts << 19) | (pid << 29)); // size, packet count, PID
     // The DWC2 DMA engine addresses RAM through the VideoCore *bus* alias, not the ARM physical address
     // (the same 0xC0000000 uncached alias the framebuffer mailbox needed). Hand it the ARM physical and
