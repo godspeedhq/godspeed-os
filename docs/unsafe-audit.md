@@ -23,6 +23,17 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-22 - HDMI framebuffer on the Pi 2, Phase 2: text console (feat/pi2-arm32)
+
+`fbcon.rs` renders the serial stream onto the framebuffer (glyphs via the shared `noto-sans-mono-bitmap`
+font), so the boot log + `gsh>` prompt appear on the TV; `pl011_write` mirrors to it under the same
+SERIAL_BUSY guard. New unsafe is the framebuffer pixel writes + the single FBCON static, permitted
+`arch/`. QEMU screendump: text renders (231 distinct colours in the top-left region = antialiased glyphs).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/fbcon.rs` | new, 3 | `put_pixel` (device-mapped framebuffer store), the FBCON static in `init` + `put_byte` - the glyph renderer + cursor. |
+
 ## 2026-07-22 - HDMI framebuffer on the Pi 2, Phase 1 (feat/pi2-arm32)
 
 Toward x86-parity local console. The ARM has no Limine to hand it a framebuffer, so `video.rs` asks the
@@ -770,6 +781,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 4 | permitted |
+| arch/arm/fbcon.rs | 3 | permitted |
 | arch/arm/page_tables.rs | 27 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |

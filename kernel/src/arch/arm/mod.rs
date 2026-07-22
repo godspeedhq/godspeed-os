@@ -26,6 +26,7 @@ pub mod page_tables;
 pub mod meminit;
 pub mod syscall;
 pub mod video;
+pub mod fbcon;
 pub mod usermode;
 pub mod loadtest;
 pub mod spawn;
@@ -381,6 +382,7 @@ pub(super) fn pl011_write(s: &[u8]) {
     // Write lock-free.
     if !SERIAL_SMP.load(Ordering::Relaxed) {
         for &b in s { pl011_write_byte(b); }
+        fbcon::put_bytes(s); // mirror to the TV once the console is up (no-op before that)
         return;
     }
     // SMP is live: serialize across cores. Try to claim the UART (bounded), write, then release only if
@@ -396,6 +398,7 @@ pub(super) fn pl011_write(s: &[u8]) {
     for &b in s {
         pl011_write_byte(b);
     }
+    fbcon::put_bytes(s); // mirror to the TV under the same guard (serialized across cores)
     if held {
         SERIAL_BUSY.store(false, Ordering::Release);
     }
@@ -434,11 +437,12 @@ extern "C" fn arm_boot_main() -> ! {
     // the A7's L2, which an L1 clean does not reach). Get the descriptor now; map + fill after `enable`.
     let fb = video::request(1024, 768);
     mmu::enable();
-    // Prove the display pipeline with a solid fill (Phase 1). A colour on the TV confirms the mailbox,
-    // the returned base/pitch, and the device mapping are all correct; text rendering layers on next.
+    // Map the framebuffer and bring up the text console over it, so the boot log + shell prompt appear
+    // on the TV (mirrored from serial). Everything logged from here on shows on the display.
     if let Some(fb) = fb {
-        video::map_and_fill(&fb, video::rgb(0x18, 0x30, 0xA0)); // clear blue - unmistakable if it works
-        pl011_write(b"arm32: framebuffer filled (you should see a BLUE screen on the display)\r\n");
+        video::map(&fb);
+        fbcon::init(fb.base, fb.pitch, fb.width, fb.height);
+        pl011_write(b"arm32: framebuffer console up - this line should appear on the TV\r\n");
     }
     timer::init();
     const TICK_HZ: u32 = 100; // 10 ms quantum, matching CLAUDE.md section 9.1
