@@ -26,6 +26,13 @@ pub fn run(ram_end: u32, reserve_end: u32) -> ! {
     // the supervisor ELF is real (arm_built), so it spawns; it then spawns the rest.
     crate::task::spawn_supervisor();
 
+    // On x86 the shell's input-ready signal is raised by `xhci` coming up (a USB keyboard is the input
+    // path). On the Pi 2 the input path is the PL011 RX, which is ALWAYS up, and `xhci` is a placeholder
+    // that fails to spawn - so nothing would ever raise input-ready and the supervisor-spawned shell
+    // would wait for its prompt forever. Raise it here: on ARM, console input is ready the moment the
+    // UART is (arch-appropriate - readiness is not gated on a USB driver that does not exist here).
+    super::set_input_ready();
+
     super::irq::NEUTRAL_SCHED.store(true, Ordering::Relaxed);
     pl011_write(b"sched-supervisor: entering scheduler::run(0) - the supervisor now drives the boot.\r\n");
     crate::task::scheduler::run(0)

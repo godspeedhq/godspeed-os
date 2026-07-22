@@ -85,7 +85,16 @@ fn main() {
     // ARM userspace is being brought up incrementally (docs/multi-arch.md): a service is embedded
     // for real only once it is built for armv7a-none-eabi. Any not yet ported keep the empty
     // placeholder, so the kernel still links. As each is ported, drop its name in here.
-    let arm_built: &[&str] = &["logger", "ping", "pong", "supervisor", "shell"];
+    // Userspace services that use only the arch-neutral SDK + syscalls (no hardware probe) run on ARM
+    // as-is. The hardware drivers (block-driver, fs, nic-driver, net-stack, xhci, ehci) compile but hunt
+    // for x86 hardware (PCI/AHCI/Realtek/xHCI) absent on the Pi 2, so they stay placeholders until real
+    // Pi drivers (SD/EMMC, DWC2, LAN9514) exist. `probe` does not build for ARM (x86-only fault module).
+    let arm_built: &[&str] = &[
+        "logger", "ping", "pong", "supervisor", "shell",
+        "observe", "chaos", "mem-pressure",
+        "counter", "greet", "upper", "roster",
+        "reply-server", "asker", "resource-server", "holder",
+    ];
     let arm_dir = workspace
         .join("target")
         .join("armv7a-none-eabi")

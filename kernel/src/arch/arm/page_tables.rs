@@ -347,6 +347,25 @@ pub unsafe fn fill_kernel_identity(pt_root: u32) {
                     }
                 }
                 clean_dcache(l2 as u32, 1024);
+            } else if d & 0b11 == L1_TYPE_TABLE && s & 0b11 == L1_TYPE_TABLE {
+                // BOTH the child and the source split this 1 MiB into pages: each mapped its own ctx at
+                // 0x3ff000, so both L1 entries are TABLEs. The two branches above assume the SOURCE is a
+                // kernel SECTION; when a *service* spawns another service (the shell spawning
+                // observe-now), the spawner ALSO split this megabyte, so its kernel pages live in its L2
+                // - and neither branch above fires. Left unfixed, the kernel data this 1 MiB holds (an
+                // embedded service ELF at 0x34xxxx - .rodata is ~21 MiB of include_bytes! - and the
+                // per-core arenas) is unmapped in the child, and the child's ELF loader faults reading
+                // the ELF magic (0x34eb68). Fill the child L2's HOLES from the source L2's present
+                // entries; the child's own ctx page is already non-zero, so it is never overwritten.
+                let dl2 = (d & 0xFFFF_FC00) as *mut u32;
+                let sl2 = (s & 0xFFFF_FC00) as *const u32;
+                for j in 0..256 {
+                    if dl2.add(j).read_volatile() == 0 {
+                        let sp = sl2.add(j).read_volatile();
+                        if sp != 0 { dl2.add(j).write_volatile(sp); }
+                    }
+                }
+                clean_dcache(dl2 as u32, 1024);
             }
         }
     }
