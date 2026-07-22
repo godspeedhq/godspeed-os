@@ -243,13 +243,6 @@ pub unsafe extern "C" fn ap_entry() -> ! {
 /// Rust side of a secondary core's bring-up. Runs with the MMU OFF on `core`'s own stack, then brings
 /// this core into the SAME kernel address space and the neutral per-core scheduler. Never returns.
 extern "C" fn ap_boot_main(core_id: u32) -> ! {
-    // Bring-up breadcrumbs (lock-free single-byte MMIO, no LDREX - safe before this core's ACTLR.SMP /
-    // MMU are set, and the other APs come up serially so they do not garble). "[N" on entry, then a
-    // letter after each phase. If a core reaches ap_boot_main but silently dies before mark_ready
-    // (e.g. a fault with VBAR still 0 -> vectors at address 0 -> wander), the last letter it printed
-    // pins the phase. TEMP diagnostic for the core-3 no-show on the Pi 2.
-    ap_crumb(b'[');
-    ap_crumb(b'0' + core_id as u8);
     // Coherency + exclusives for shareable memory (LDREX/STREX, every spinlock) - before caches/MMU.
     // SAFETY: ACTLR is a PL1 control register; SMP before caches is the documented Cortex-A7 order.
     unsafe {
@@ -258,31 +251,18 @@ extern "C" fn ap_boot_main(core_id: u32) -> ! {
             t = out(reg) _, options(nomem, nostack),
         );
     }
-    ap_crumb(b's'); // ACTLR.SMP set
     // Load the SAME L1 core 0 built: this core now sees the whole kernel address space.
     // SAFETY: core 0 finished build_tables and released us; every mapping is identity.
     unsafe { mmu::enable_on_this_core(); }
-    ap_crumb(b'm'); // MMU + caches on
     // Vectors + THIS core's own banked mode stacks (never shared with another core).
     exceptions::install_for_core(core_id);
-    ap_crumb(b'v'); // vectors installed
     // Register our id so the neutral current_core_id() resolves us, then start our own timer tick.
     crate::smp::core::set_core_lapic_id(core_id, core_id);
     irq::start_tick_ap(core_id);
-    ap_crumb(b't'); // timer ticking
-    ap_crumb(b']');
     // Announce ready (logs "smp: core N ready") and enter the neutral per-core scheduler. The run
     // queue is empty until the supervisor places a service on this core, so we idle until then.
     crate::smp::core::mark_ready(core_id);
     crate::task::scheduler::run(core_id)
-}
-
-/// Emit one raw breadcrumb byte to the PL011, bypassing the cross-core serial guard. Lock-free (just an
-/// MMIO poll + store, no LDREX), so it is valid on a core whose ACTLR.SMP / MMU are not yet enabled -
-/// exactly where an AP is during early bring-up. Prefixed with CR so a breadcrumb burst is visible even
-/// mid-line. TEMP diagnostic (core-3 no-show).
-fn ap_crumb(b: u8) {
-    pl011_write_byte(b);
 }
 
 /// Bring the secondary cores online (SMP). Core 0 calls this from a sched path AFTER the machine is up
