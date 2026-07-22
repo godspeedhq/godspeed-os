@@ -24,7 +24,7 @@ GSNPSID=0x4f54294a, device detected + port enabled at full-speed.
 
 | File | Change | Why |
 |------|--------|-----|
-| `arch/arm/dwc2.rs` | new, 3 | `rd`/`wr` (DWC2 Device MMIO 32-bit accessors) + `spin` (`nop` delay) - the register access + bounded settle waits for controller bring-up. |
+| `arch/arm/dwc2.rs` | new, 3 -> 6 | `rd`/`wr` (DWC2 Device MMIO 32-bit accessors) + `spin` (`nop` delay) for bring-up; increment 2 adds `flush_dcache` (DCCIMVAC + `dsb` - the DMA cache-coherency bracket, 2) and `control_xfer`'s access to the `DMA` scratch static (identity-mapped physical buffer, 1). |
 
 ## 2026-07-22 - ARM serial input works: idle + scheduler-context fixes (feat/pi2-arm32)
 
@@ -807,7 +807,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 6 | permitted |
 | arch/arm/fbcon.rs | 4 | permitted |
-| arch/arm/dwc2.rs | 3 | permitted |
+| arch/arm/dwc2.rs | 6 | permitted |
 | arch/arm/page_tables.rs | 27 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |
