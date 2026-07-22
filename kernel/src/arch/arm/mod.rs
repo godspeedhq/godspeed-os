@@ -153,11 +153,153 @@ pub unsafe extern "C" fn _start() -> ! {
         "str  r10, [r0]",                //   be wiped along with everything else in BSS
         "bl   {main}",                   // -> arm_boot_main (never returns)
         "4:",
-        "wfe",
-        "b    4b",
+        "b    arm_ap_park",              // secondary cores: watch the mailbox, jump to ap_entry on release
         main = sym arm_boot_main,
         dtb = sym DTB_PTR,
     )
+}
+
+/// Secondary-core park + release loop, reached from `_start` when MPIDR says we are not core 0.
+///
+/// `r1` holds this core's id (1-3). We watch this core's BCM2836 mailbox-3 read/clear register
+/// (`0x400000CC + 0x10*core`): core 0 writes `ap_entry`'s physical address to the matching set
+/// register (`0x4000008C + 0x10*core`) in `smp_bringup`, we read it, clear it, and jump. This mirrors
+/// the firmware spin-table exactly, so it works whether QEMU/firmware started this core here in
+/// `_start` (we park and are released) or held it in its own spin-table (core 0's write releases it
+/// straight to `ap_entry`, bypassing us). Either way the AP arrives at `ap_entry` with the MMU off.
+core::arch::global_asm!(
+    ".section .text.boot",
+    ".globl arm_ap_park",
+    "arm_ap_park:",
+    "mov  r2, #0x40000000",
+    "orr  r2, r2, #0xCC",            // 0x400000CC = core 0 mailbox-3 read/clear
+    "add  r2, r2, r1, lsl #4",       // + 0x10*core -> this core's mailbox-3
+    "1:",
+    "wfe",
+    "ldr  r3, [r2]",                 // read this core's mailbox
+    "cmp  r3, #0",
+    "beq  1b",                       // nothing yet -> keep waiting
+    "str  r3, [r2]",                 // write the value back = clear the mailbox
+    "bx   r3",                       // jump to ap_entry (physical address; MMU off)
+);
+
+/// Secondary cores that came online (set by `smp_bringup`); `ap_count()` returns this.
+static AP_ONLINE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Per-core kernel stacks for the secondary cores (core 0 uses the linker `__stack_top`). 64 KiB each
+/// (= 1 << 16, so the AP entry asm can shift rather than multiply). Slot `core` is that AP's stack;
+/// slot 0 is unused. BSS.
+const AP_KSTACK_SIZE: usize = 64 * 1024;
+#[repr(C, align(16))]
+struct ApKStacks([u8; AP_KSTACK_SIZE * 4]);
+static mut AP_KSTACK_REGION: ApKStacks = ApKStacks([0; AP_KSTACK_SIZE * 4]);
+
+/// AP entry: reached from `arm_ap_park` (or the firmware spin-table) with the MMU OFF and this core's
+/// id in MPIDR. Drop HYP defensively, enable VFP/NEON, set this core's stack top
+/// (`AP_KSTACK_REGION + (core+1)*64 KiB`), then call `ap_boot_main(core)`. Never returns.
+#[unsafe(naked)]
+#[no_mangle]
+#[link_section = ".text.boot"]
+pub unsafe extern "C" fn ap_entry() -> ! {
+    core::arch::naked_asm!(
+        ".arch_extension virt",
+        // Drop HYP if firmware left us there (idempotent: skip if already SVC/secure).
+        "mrs  r0, cpsr",
+        "and  r1, r0, #0x1f",
+        "cmp  r1, #0x1a",
+        "bne  2f",
+        "bic  r0, r0, #0x1f",
+        "orr  r0, r0, #0xd3",            // SVC + I/F masked
+        "msr  spsr_hyp, r0",
+        "adr  r1, 2f",
+        "msr  elr_hyp, r1",
+        "eret",
+        "2:",
+        "cpsid if",
+        // VFP/NEON on (CPACR cp10/11 then FPEXC.EN) - same reason as core 0's _start.
+        "mrc  p15, 0, r0, c1, c0, 2",
+        "orr  r0, r0, #(0xf << 20)",
+        "mcr  p15, 0, r0, c1, c0, 2",
+        "isb",
+        ".fpu vfpv3-d16",
+        "mov  r0, #0x40000000",
+        "vmsr fpexc, r0",
+        // core id -> r4
+        "mrc  p15, 0, r4, c0, c0, 5",
+        "and  r4, r4, #3",
+        // stack top = AP_KSTACK_REGION + (core+1) * 64 KiB  (64 KiB = 1 << 16)
+        "ldr  r0, ={kstacks}",
+        "add  r5, r4, #1",
+        "lsl  r5, r5, #16",
+        "add  sp, r0, r5",
+        "mov  r0, r4",                   // ap_boot_main(core)
+        "bl   {apmain}",
+        "3:", "wfe", "b 3b",             // ap_boot_main never returns; guard anyway
+        kstacks = sym AP_KSTACK_REGION,
+        apmain  = sym ap_boot_main,
+    )
+}
+
+/// Rust side of a secondary core's bring-up. Runs with the MMU OFF on `core`'s own stack, then brings
+/// this core into the SAME kernel address space and the neutral per-core scheduler. Never returns.
+extern "C" fn ap_boot_main(core_id: u32) -> ! {
+    // Coherency + exclusives for shareable memory (LDREX/STREX, every spinlock) - before caches/MMU.
+    // SAFETY: ACTLR is a PL1 control register; SMP before caches is the documented Cortex-A7 order.
+    unsafe {
+        core::arch::asm!(
+            "mrc p15, 0, {t}, c1, c0, 1", "orr {t}, {t}, #(1 << 6)", "mcr p15, 0, {t}, c1, c0, 1", "isb",
+            t = out(reg) _, options(nomem, nostack),
+        );
+    }
+    // Load the SAME L1 core 0 built: this core now sees the whole kernel address space.
+    // SAFETY: core 0 finished build_tables and released us; every mapping is identity.
+    unsafe { mmu::enable_on_this_core(); }
+    // Vectors + THIS core's own banked mode stacks (never shared with another core).
+    exceptions::install_for_core(core_id);
+    // Register our id so the neutral current_core_id() resolves us, then start our own timer tick.
+    crate::smp::core::set_core_lapic_id(core_id, core_id);
+    irq::start_tick_ap(core_id);
+    // Announce ready (logs "smp: core N ready") and enter the neutral per-core scheduler. The run
+    // queue is empty until the supervisor places a service on this core, so we idle until then.
+    crate::smp::core::mark_ready(core_id);
+    crate::task::scheduler::run(core_id)
+}
+
+/// Bring the secondary cores online (SMP). Core 0 calls this from a sched path AFTER the machine is up
+/// (MMU, per-core scheduler arenas, NEUTRAL_SCHED). Releases cores 1-3 via the BCM2836 mailbox
+/// spin-table and waits (bounded) for each to mark itself ready - as x86's `start_all_aps` waits on
+/// `mark_ready`. A core that never answers is left not-ready (§11.3 "continue with available cores");
+/// placement to it then fails gracefully and services fall back to core 0.
+pub fn smp_bringup() {
+    // Publish everything core 0 wrote (L1 tables, scheduler arenas) before the APs - which start with
+    // caches OFF, reading physical memory directly - can observe it.
+    // SAFETY: a set/way clean+invalidate of core 0's D-cache; valid at PL1, no operands.
+    unsafe { page_tables::clean_invalidate_dcache_all(); }
+
+    let entry = ap_entry as *const () as u32; // identity-mapped, so physical == virtual
+    for core in 1u32..=3 {
+        // Write ap_entry to this core's mailbox-3 SET register (0x4000008C + 0x10*core), then SEV to
+        // wake it from WFE.
+        // SAFETY: the core-local block is Device-mapped; a volatile write to a fixed mailbox register,
+        // followed by the barrier + event that make the write visible and wake the waiter.
+        unsafe {
+            ((0x4000_008C + 0x10 * core as usize) as *mut u32).write_volatile(entry);
+            core::arch::asm!("dsb", "sev", options(nomem, nostack));
+        }
+        // Wait (bounded) for this core before releasing the next - a wedged core is then distinct from
+        // a slow one, and the log line for each `smp: core N ready` stays ordered.
+        let mut online = false;
+        for _ in 0..4_000_000u32 {
+            if crate::smp::core::is_ready(core) { online = true; break; }
+            core::hint::spin_loop();
+        }
+        if online {
+            AP_ONLINE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        } else {
+            pl011_write(b"smp: WARNING - a secondary core did not come up; continuing without it\r\n");
+        }
+    }
+    crate::kprintln!("smp: {} cores ready", AP_ONLINE.load(core::sync::atomic::Ordering::Relaxed) + 1);
 }
 
 /// Write one byte to the PL011, waiting for room in the transmit FIFO.
@@ -282,7 +424,12 @@ pub enum MemoryKind {
 // any neutral code runs, rather than by the neutral `kernel_main` calling `arch::imp::init` partway
 // through. So these are honest no-ops: the work they name is already done, not skipped. They exist to
 // complete the `arch::imp` surface (the boundary the whole port rests on).
-pub fn ap_count() -> usize { 0 } // single-core for now; the 3 other A7s are parked in `_start`
+/// Number of secondary cores to SIZE the per-core arenas for. The BCM2836 always has 4 A7s, so this
+/// is a constant 3 (like x86 sizing to Limine's enumerated count) - `percpu_init` runs this BEFORE
+/// `smp_bringup` releases the cores, so it must be the expected count, not the live one. A core that
+/// fails to come up is simply never `is_ready` (its arena slot goes unused); `AP_ONLINE` tracks how
+/// many actually answered, for the boot log.
+pub fn ap_count() -> usize { 3 }
 
 /// Machine init - already performed in `arm_boot_main` before neutral code runs. No-op.
 pub fn init(_boot_info: &BootInfo) {}
@@ -433,7 +580,16 @@ pub mod boot {
     pub fn tsc_ticks_per_quantum() -> u64 { 0 }
     pub unsafe fn rearm_tsc_deadline() {}
     pub unsafe fn apic_send_eoi() {}
-    pub unsafe fn get_lapic_id() -> u32 { 0 }
+    /// The calling core's id (0-3), read from MPIDR. On ARM the "lapic id" IS the core index, so the
+    /// neutral `lapic_to_core_id` (which matches this against each ready core's registered id) resolves
+    /// it identically. This is what makes `current_core_id()` correct on every core - the linchpin the
+    /// whole per-core scheduler rests on. (Was `0` while the port was single-core.)
+    pub unsafe fn get_lapic_id() -> u32 {
+        let mpidr: u32;
+        // SAFETY: reading MPIDR (c0,c0,5) is a side-effect-free PL1 register read.
+        unsafe { core::arch::asm!("mrc p15, 0, {m}, c0, c0, 5", m = out(reg) mpidr, options(nomem, nostack)); }
+        mpidr & 3
+    }
     pub unsafe fn send_ipi_to_lapic(lapic_id: u32, vector: u8) {}
     pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {}
     pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {}

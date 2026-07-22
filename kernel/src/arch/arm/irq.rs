@@ -65,6 +65,17 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// The calling core's index (0-3), read from MPIDR. The BCM2836 core-local block has one copy of
+/// each interrupt register PER CORE at `+4*core`, so every access below must be indexed by this - a
+/// timer IRQ fires on the core whose down-counter expired and is handled there, and reading core 0's
+/// source register from core 2 would miss it.
+fn this_core() -> usize {
+    let mpidr: u32;
+    // SAFETY: reading MPIDR (c0,c0,5) is a side-effect-free PL1 register read.
+    unsafe { core::arch::asm!("mrc p15, 0, {m}, c0, c0, 5", m = out(reg) mpidr, options(nomem, nostack)); }
+    (mpidr & 3) as usize
+}
+
 fn local_write(addr: usize, v: u32) {
     // SAFETY: The BCM2836 core-local block is mapped Device by `mmu.rs`. Volatile write to a
     // control register at a fixed, in-range offset.
@@ -157,7 +168,8 @@ pub fn mark_task_user(slot: usize) {
 
 #[no_mangle]
 pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
-    let source = local_read(CORE_IRQ_SOURCE);
+    // Per-core source register: the timer fired on THIS core, so read this core's `+0x60 + 4*core`.
+    let source = local_read(CORE_IRQ_SOURCE + 4 * this_core());
 
     if source & IRQ_PHYS_TIMER != 0 {
         // Re-arm first: writing TVAL both sets the next deadline and deasserts the current interrupt.
@@ -202,6 +214,13 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
     // something does, leaving it asserted is the loud outcome: it will re-enter and be obvious,
     // rather than being quietly discarded.
 
+    // The `context.rs` demo scheduler lives on CORE 0 only (the boot selftests ran there before the
+    // neutral scheduler took over). A secondary core (SMP) reaches here only while it idles in
+    // `scheduler::run` before `NEUTRAL_SCHED` is set - it has no demo tasks, so just resume it.
+    if this_core() != 0 {
+        return frame_sp;
+    }
+
     // Pre-scheduler (boot selftests, incl. preempt_selftest): the `context.rs` demo scheduler. It
     // returns the frame to RESUME - the same to continue, or another task's to preempt.
     super::context::schedule(frame_sp)
@@ -223,9 +242,26 @@ pub fn start_tick(hz: u32) -> bool {
     let reload = timer_hz / hz;
     RELOAD.store(reload, Ordering::Relaxed);
 
-    // Core 0 only for now; the other three are still parked in `_start`.
-    local_write(CORE_TIMER_IRQCNTL, IRQ_PHYS_TIMER);
+    // Route the generic timer to THIS core's IRQ line (per-core register at +0x40 + 4*core).
+    local_write(CORE_TIMER_IRQCNTL + 4 * this_core(), IRQ_PHYS_TIMER);
 
+    set_tval(reload);
+    enable_timer();
+    enable_interrupts();
+    true
+}
+
+/// Start the tick on a secondary core (SMP). Core 0 already computed and stored `RELOAD` in
+/// `start_tick`; an AP only needs to route ITS own timer interrupt (per-core `CORE_TIMER_IRQCNTL`),
+/// arm its own banked down-counter, and unmask IRQs on itself. The generic-timer registers
+/// (`CNTP_TVAL`/`CNTP_CTL`) are per-core by construction, so `set_tval`/`enable_timer` act on this
+/// core alone. Returns false if core 0 never established a reload (timer frequency unknown).
+pub fn start_tick_ap(_core: u32) -> bool {
+    let reload = RELOAD.load(Ordering::Relaxed);
+    if reload == 0 {
+        return false;
+    }
+    local_write(CORE_TIMER_IRQCNTL + 4 * this_core(), IRQ_PHYS_TIMER);
     set_tval(reload);
     enable_timer();
     enable_interrupts();

@@ -363,6 +363,56 @@ pub fn install() {
     pl011_write(b"\r\n");
 }
 
+/// Per-core exception mode stacks for the SECONDARY cores (SMP). Core 0 uses the single linker-symbol
+/// stacks (`__irq_stack_top` etc.); an AP must NOT share them - two cores taking a timer IRQ at once
+/// would both push onto the one IRQ stack and corrupt each other. Each AP gets its own 8 KiB per mode.
+const AP_MODE_STACK: usize = 8 * 1024;
+#[repr(C, align(16))]
+struct ApModeStacks {
+    abt: [u8; AP_MODE_STACK],
+    und: [u8; AP_MODE_STACK],
+    irq: [u8; AP_MODE_STACK],
+    fiq: [u8; AP_MODE_STACK],
+}
+static mut AP_MODE_STACKS: [ApModeStacks; 3] = [const {
+    ApModeStacks { abt: [0; AP_MODE_STACK], und: [0; AP_MODE_STACK],
+                   irq: [0; AP_MODE_STACK], fiq: [0; AP_MODE_STACK] }
+}; 3];
+
+/// Install the exception vectors and prime the banked mode stacks on the CALLING core. Core 0 uses
+/// the shared linker stacks (`install`); a secondary core (`core` in 1..=3) uses its own BSS stacks so
+/// concurrent exceptions on different cores never share a mode stack. The vector TABLE is shared (VBAR
+/// points every core at the same `arm_vectors`); only the banked SPs differ per core.
+pub fn install_for_core(core: u32) {
+    if core == 0 {
+        install();
+        return;
+    }
+    // SAFETY: `core` in 1..=3 selects this core's dedicated mode stacks; no other core touches them.
+    let (abt, und, irq, fiq) = unsafe {
+        let m = &raw const AP_MODE_STACKS[(core - 1) as usize];
+        let top = |field: *const [u8; AP_MODE_STACK]| field as u32 + AP_MODE_STACK as u32;
+        (top(&raw const (*m).abt), top(&raw const (*m).und),
+         top(&raw const (*m).irq), top(&raw const (*m).fiq))
+    };
+    // SAFETY: mirrors `install` - VBAR write then per-mode banked-SP loads, ending back in SVC. The
+    // stacks are this core's own, 16-byte aligned, in BSS. No banked register other than each mode's
+    // own SP is touched, and the caller's SVC SP/LR are untouched (we return in SVC by name).
+    unsafe {
+        core::arch::asm!(
+            "mcr  p15, 0, {vec}, c12, c0, 0", // VBAR = shared table
+            "isb",
+            "msr  cpsr_c, #0xD7", "mov sp, {abt}",   // ABT
+            "msr  cpsr_c, #0xDB", "mov sp, {und}",   // UND
+            "msr  cpsr_c, #0xD2", "mov sp, {irq}",   // IRQ
+            "msr  cpsr_c, #0xD1", "mov sp, {fiq}",   // FIQ
+            "msr  cpsr_c, #0xD3",                    // back to SVC by name
+            vec = in(reg) arm_vectors as *const () as u32,
+            abt = in(reg) abt, und = in(reg) und, irq = in(reg) irq, fiq = in(reg) fiq,
+        );
+    }
+}
+
 /// Deliberately take a data abort, to prove the vectors actually fire.
 ///
 /// Gated behind a build feature so it can never run in a normal boot. This is the ARM twin of the

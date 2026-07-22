@@ -164,10 +164,29 @@ fn translate(va: u32) -> Option<u32> {
 /// sides of the switch.
 pub fn enable() {
     build_tables();
+    // SAFETY: core 0, tables just built; enables translation + caches on this core.
+    unsafe { enable_on_this_core(); }
 
+    pl011_write(b"arm32: MMU ON (short descriptors, 1 MiB sections, L1 @ ");
+    write_hex32(core::ptr::addr_of!(L1) as u32);
+    pl011_write(b")\r\n");
+    selftest();
+    pl011_write(b"arm32: caches ON (I + D + branch prediction)\r\n");
+}
+
+/// Enable translation + caches on the CALLING core, using the `L1` table `build_tables` already
+/// populated. Core 0 calls this from `enable` after building the tables; each secondary core (SMP)
+/// calls it from its bring-up path to load the SAME kernel address space. Idempotent per core: it
+/// invalidates this core's TLB/caches, points its TTBR0 at the shared L1, and sets SCTLR.M + caches.
+///
+/// # Safety
+/// The `L1` table must already be built (core 0 ran `build_tables`), and the caller must be at PL1
+/// with interrupts masked. Every mapping in `L1` is identity, so PC/SP/VBAR stay valid across the
+/// SCTLR.M write on any core.
+pub unsafe fn enable_on_this_core() {
     let table = core::ptr::addr_of!(L1) as u32;
 
-    // SAFETY: Boot core only, interrupts masked, secondaries parked. Every `mcr` below is an
+    // SAFETY: Every `mcr` below is an
     // architecturally valid PL1 system-register write, issued in the order the ARM ARM requires for
     // enabling translation. The table is 16 KiB aligned (`repr(align(16384))`) as TTBR0 demands, and
     // every mapping is identity, so the PC/SP/VBAR remain valid across the SCTLR.M write. The
@@ -198,11 +217,6 @@ pub fn enable() {
         );
     }
 
-    pl011_write(b"arm32: MMU ON (short descriptors, 1 MiB sections, L1 @ ");
-    write_hex32(table);
-    pl011_write(b")\r\n");
-    selftest();
-
     // Caches are enabled only after translation is proven, so that if the machine wedges we know
     // which of the two steps did it. Memory attributes above (Normal WB/WA for RAM, Device for MMIO)
     // are what make this safe to do at all - with the MMU off, everything behaves as Strongly-ordered.
@@ -220,7 +234,6 @@ pub fn enable() {
             tmp = out(reg) _,
         );
     }
-    pl011_write(b"arm32: caches ON (I + D + branch prediction)\r\n");
 }
 
 /// Prove translation is live, using the CPU's own table walker.

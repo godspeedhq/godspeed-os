@@ -21,6 +21,11 @@ use super::pl011_write;
 pub fn run(ram_end: u32, reserve_end: u32) -> ! {
     super::spawn::neutral_bootstrap(ram_end, reserve_end);
 
+    // Bring the other three A7s online BEFORE spawning services, so the supervisor's `spawn_on(pong, 1)`
+    // finds core 1 ready and pong actually runs there (real cross-core IPC), instead of falling back to
+    // core 0. The APs come up idle in the neutral scheduler and pick up work once it is placed on them.
+    super::smp_bringup();
+
     pl011_write(b"sched-supervisor: the kernel's ONE direct spawn - the supervisor...\r\n");
     // The kernel's one direct spawn (§11.1). Panics if it fails (TCB, §6.2/§11.3) - but on the Pi 2
     // the supervisor ELF is real (arm_built), so it spawns; it then spawns the rest.
