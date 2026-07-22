@@ -27,6 +27,7 @@ pub mod meminit;
 pub mod syscall;
 pub mod video;
 pub mod fbcon;
+pub mod dwc2;
 pub mod usermode;
 pub mod loadtest;
 pub mod spawn;
@@ -497,6 +498,9 @@ extern "C" fn arm_boot_main() -> ! {
     syscall::selftest();
     usermode::selftest();
     loadtest::selftest();
+    // USB host bring-up (DWC2): detect the controller + the attached device. Increment 1 - no transfers
+    // yet. Runs before the scheduler dispatch (which never returns).
+    dwc2::init();
     #[cfg(feature = "arm-sched-demo")]
     sched_demo::run(ram_end, reserve_end);
     #[cfg(feature = "arm-sched-user")]

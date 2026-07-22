@@ -13,6 +13,31 @@ comment.
 
 ---
 
+## 2026-07-22 - DWC2 USB host bring-up, increment 1 (feat/pi2-arm32)
+
+The Pi 2's USB is a Synopsys DesignWare USB 2.0 OTG (DWC2) core. `dwc2.rs` brings it up in host mode and
+detects the attached device (the first step toward a USB keyboard): read the Synopsys core ID, soft-reset
+the core, force host mode, power + reset the root port, report the connected device's speed. All new
+unsafe is Device-mapped MMIO (the DWC2 register block is inside the already-Device-mapped peripheral
+window) plus a `nop`-spin, both permitted `arch/`. QEMU (`-M raspi2b,usb=on -device usb-kbd`): core
+GSNPSID=0x4f54294a, device detected + port enabled at full-speed.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/dwc2.rs` | new, 3 | `rd`/`wr` (DWC2 Device MMIO 32-bit accessors) + `spin` (`nop` delay) - the register access + bounded settle waits for controller bring-up. |
+
+## 2026-07-22 - ARM serial input works: idle + scheduler-context fixes (feat/pi2-arm32)
+
+The core-0 block-path idle bug (typing did nothing) is fixed. `wait_for_interrupt` was a bare `wfi` that
+never re-enabled IRQs, and the scheduler context was seeded with cr3=0 because the timer preempted the
+bootstrap before `run(0)` seeded it; masking IRQs before arming the neutral scheduler closes that race.
+New unsafe is the `clrex` before the serial-lock acquire (exclusive-monitor hygiene) and the `cpsie i`
+added to the idle `wfi`, both permitted `arch/`.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 36 -> 38 (+2) | `clrex` before the `SERIAL_BUSY` compare-exchange (clear a stale ARMv7 exclusive-monitor that wedged the shell's 2nd console echo); GPIO14/15 -> ALT0 mux in `gpio_init_uart` so serial RECEIVE works, not just transmit. |
+
 ## 2026-07-16 - SEC-21 security fix (feat/hardening)
 
 | File | Change | Why |
@@ -782,6 +807,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 6 | permitted |
 | arch/arm/fbcon.rs | 4 | permitted |
+| arch/arm/dwc2.rs | 3 | permitted |
 | arch/arm/page_tables.rs | 27 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |
@@ -790,7 +816,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 36 | permitted |
+| arch/arm/mod.rs | 38 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
 | arch/riscv64/mod.rs | 23 | permitted |
