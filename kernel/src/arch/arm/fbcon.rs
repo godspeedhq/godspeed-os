@@ -25,13 +25,15 @@ struct Fbcon {
     pitch: usize,
     width: usize,
     height: usize,
+    org_x: usize, // left inset (overscan safe area)
+    org_y: usize, // top inset
     cols: usize,
     rows: usize,
     col: usize,
     row: usize,
 }
 static mut FBCON: Fbcon =
-    Fbcon { base: 0, pitch: 0, width: 0, height: 0, cols: 0, rows: 0, col: 0, row: 0 };
+    Fbcon { base: 0, pitch: 0, width: 0, height: 0, org_x: 0, org_y: 0, cols: 0, rows: 0, col: 0, row: 0 };
 static READY: AtomicBool = AtomicBool::new(false);
 
 /// True once `init` has set up the console; `pl011_write` mirrors to the framebuffer only after this.
@@ -46,8 +48,12 @@ pub fn init(base: u32, pitch: u32, width: u32, height: u32) {
         c.pitch = pitch as usize;
         c.width = width as usize;
         c.height = height as usize;
-        c.cols = c.width / CELL_W;
-        c.rows = c.height / CELL_H;
+        // Inset a ~5% margin so text lands inside the TV's overscan-cropped visible area (an HDMI TV
+        // typically drops the outer edge). The text grid is sized to the safe area, not the full panel.
+        c.org_x = c.width / 20;
+        c.org_y = c.height / 20;
+        c.cols = (c.width - 2 * c.org_x) / CELL_W;
+        c.rows = (c.height - 2 * c.org_y) / CELL_H;
         c.col = 0;
         c.row = 0;
         clear(c);
@@ -83,8 +89,8 @@ fn blend(intensity: u8) -> u32 {
 }
 
 fn draw_glyph(c: &Fbcon, ch: u8, col: usize, row: usize) {
-    let x0 = col * CELL_W;
-    let y0 = row * CELL_H;
+    let x0 = c.org_x + col * CELL_W;
+    let y0 = c.org_y + row * CELL_H;
     match get_raster(ch as char, FONT_WEIGHT, RASTER_HEIGHT) {
         Some(rc) => {
             for (gy, rowpix) in rc.raster().iter().enumerate() {
@@ -110,17 +116,22 @@ fn draw_glyph(c: &Fbcon, ch: u8, col: usize, row: usize) {
 /// rules) and reaches the display. This replaces the old clear-and-home so the screen never blanks -
 /// the flicker seen on the TV under continuous output.
 fn scroll(c: &Fbcon) {
-    let shift = CELL_H * c.pitch;   // bytes in one text row
-    let total = c.height * c.pitch; // bytes in the whole framebuffer
-    // SAFETY: [base, base+total) is the mapped framebuffer; the copy stays inside it (shift < total),
-    // and Normal-NC memory permits an unaligned byte memmove.
+    let row_bytes = c.cols * CELL_W * 4; // one text row, inset width
+    // SAFETY: every source/destination row is inside the mapped framebuffer's text region, and
+    // Normal-NC memory permits the byte memmove; margins stay fixed (only the inset region moves).
     unsafe {
-        let base = c.base as *mut u8;
-        core::ptr::copy(base.add(shift), base, total - shift);
-        // Clear the freed bottom band to BG (aligned u32 stores).
-        let bottom = (c.base + (total - shift)) as *mut u32;
-        for i in 0..(shift / 4) {
-            bottom.add(i).write_volatile(BG);
+        // Shift the text region up by one cell row, row by row (strided - margins untouched).
+        for gy in 0..((c.rows - 1) * CELL_H) {
+            let dst = (c.base + (c.org_y + gy) * c.pitch + c.org_x * 4) as *mut u8;
+            let src = (c.base + (c.org_y + gy + CELL_H) * c.pitch + c.org_x * 4) as *const u8;
+            core::ptr::copy(src, dst, row_bytes);
+        }
+        // Clear the freed bottom text row to BG.
+        for gy in ((c.rows - 1) * CELL_H)..(c.rows * CELL_H) {
+            let row = (c.base + (c.org_y + gy) * c.pitch + c.org_x * 4) as *mut u32;
+            for i in 0..(c.cols * CELL_W) {
+                row.add(i).write_volatile(BG);
+            }
         }
     }
 }

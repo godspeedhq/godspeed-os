@@ -9,6 +9,9 @@
 //! the PL011 RX FIFO, the timer tick (or the blocked read itself) drains it into the input ring and
 //! wakes the shell, which reads the byte, echoes it, and runs the command on Enter.
 //!
+//! It also brings all cores online (`smp_bringup`) so the machine boots to "4 cores ready", the same as
+//! the supervisor path - the APs park idle behind the shell and stay quiet until there is work to run.
+//!
 //! There is no `fs` on the Pi 2 yet, so file/history commands degrade; every other command works. This
 //! is deliberately a direct spawn (not via the supervisor) so the prompt is clean - no ping/pong output
 //! competing with the line editor.
@@ -21,6 +24,11 @@ use super::pl011_write;
 /// Does not return.
 pub fn run(ram_end: u32, reserve_end: u32) -> ! {
     super::spawn::neutral_bootstrap(ram_end, reserve_end);
+
+    // Bring the other cores online (same order as the supervisor path: APs park idle, ready to schedule
+    // once NEUTRAL_SCHED flips). The shell + logger still run on core 0; this just makes "4 cores ready"
+    // true and lets any spawned work spread. The APs are quiet until there is something to run.
+    super::smp_bringup();
 
     pl011_write(b"sched-shell: spawning logger + shell...\r\n");
     crate::task::arm_spawn_logger_neutral();

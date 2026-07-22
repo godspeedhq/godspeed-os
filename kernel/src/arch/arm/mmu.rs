@@ -92,10 +92,13 @@ fn section(pa: u32, device: bool, execute: bool) -> u32 {
 /// allowing fast buffered writes and a byte memmove for scrolling - Device memory forbids the unaligned
 /// accesses a memmove makes and is much slower to read back for a scroll.
 fn section_fb(pa: u32) -> u32 {
+    // NON-shareable: the framebuffer is not shared *kernel* data - only this core writes glyphs and the
+    // GPU scans it through its own bus, so it never needs the SMP coherency fabric. Marking it Shareable
+    // (as an earlier cut did) dragged QEMU TCG into its slow cross-core coherency path for every access,
+    // crawling the whole system under -smp; dropping S keeps it out of that path (and is more accurate).
     (pa & 0xFFF0_0000)
         | 0b10          // section descriptor
         | (0b01 << 10)  // AP = PL1 RW, PL0 none
-        | (1 << 16)     // S = shareable
         | (0b100 << 12) // TEX = Normal, outer + inner non-cacheable
         | (1 << 4)      // XN
 }
