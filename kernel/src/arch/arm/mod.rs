@@ -33,6 +33,7 @@ pub mod sched_user;
 pub mod sched_ipc;
 pub mod sched_spawn;
 pub mod sched_supervisor;
+pub mod sched_shell;
 
 // ============================ Boot bring-up (Raspberry Pi 2 Model B) ============================
 // BCM2836 peripheral base is 0x3F00_0000 (the BCM2835/Pi 1 was 0x2000_0000; the BCM2711/Pi 4 is
@@ -231,6 +232,8 @@ extern "C" fn arm_boot_main() -> ! {
     sched_spawn::run(ram_end, reserve_end);
     #[cfg(feature = "arm-supervisor")]
     sched_supervisor::run(ram_end, reserve_end);
+    #[cfg(feature = "arm-shell")]
+    sched_shell::run(ram_end, reserve_end);
     #[cfg(feature = "arm-spawn-logger")]
     spawn::boot_service(ram_end, reserve_end);
     let _ = (ram_end, reserve_end);
@@ -314,24 +317,99 @@ pub const ELF_CLASS: u8 = 1; // 1 = ELFCLASS32, 2 = ELFCLASS64
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 
-// ---- Serial / console (board UART; stubbed - 32-bit proof is compile-only) ----
+// ---- Serial / console (PL011: output = pl011_write; input = the PL011 RX FIFO drained into a ring) ----
 pub fn serial_write_byte(b: u8) { pl011_write_byte(b); }
 pub fn serial_write_bytes_lockfree(s: &[u8]) { pl011_write(s); }
-pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {}
+/// The shell's console output. No framebuffer on this port, so `to_fb` is ignored - everything goes to
+/// the PL011 (the serial console). Without this the shell's prompt/output would silently vanish.
+pub fn console_write_bytes_gated(s: &[u8], _to_fb: bool) { pl011_write(s); }
 pub fn set_console_echo(on: bool) {}
 pub fn claim_console_foreground(task_slot: u32) {}
 pub fn release_console_foreground() {}
 pub fn release_console_foreground_if_owner(task_slot: u32) {}
 pub fn console_foreground_allows(task_slot: u32) -> bool { true }
 pub fn console_boot_complete() {}
-pub fn console_push_byte(b: u8) {}
-pub fn set_input_ready() {}
-pub fn input_ready() -> bool { false }
+
+// PL011 receive FIFO -> a single-producer/single-consumer input ring. The producer is `pl011_rx_drain`
+// (polled from the timer tick and by a blocked `console_read` itself); the consumer is `uart_rx_pop`
+// (the ConsoleRead syscall). PL011 FR bit 4 = RXFE (RX FIFO empty).
+const PL011_FR_RXFE: u32 = 1 << 4;
+const RX_BUF_SIZE: usize = 256;
+static mut RX_BUF: [u8; RX_BUF_SIZE] = [0; RX_BUF_SIZE];
+static RX_HEAD: AtomicU32 = AtomicU32::new(0);
+static RX_TAIL: AtomicU32 = AtomicU32::new(0);
+static INPUT_READY: AtomicBool = AtomicBool::new(false);
+
+/// Drain every byte currently in the PL011 RX FIFO into the input ring. Single producer (guard IRQs at
+/// the call site if a poll and a syscall could race; on this single-core port they are serialised by
+/// the syscall/IRQ masking already).
+fn pl011_rx_drain() {
+    // SAFETY: reading the PL011 FR/DR (Device-mapped MMIO) and appending to the ring; the ring indices
+    // are atomics and this is the only producer path.
+    unsafe {
+        loop {
+            if PL011_FR.read_volatile() & PL011_FR_RXFE != 0 { break; } // RX FIFO empty
+            let b = (PL011_DR.read_volatile() & 0xFF) as u8;
+            let tail = RX_TAIL.load(Ordering::Relaxed) as usize;
+            let head = RX_HEAD.load(Ordering::Acquire) as usize;
+            let next = (tail + 1) % RX_BUF_SIZE;
+            if next == head { continue; } // ring full: drop this byte, keep draining the FIFO
+            RX_BUF[tail] = b;
+            RX_TAIL.store(next as u32, Ordering::Release);
+        }
+    }
+}
+
+/// Pop one byte from the input ring (the ConsoleRead syscall consumer). `None` if empty.
+pub fn uart_rx_pop() -> Option<u8> {
+    let head = RX_HEAD.load(Ordering::Relaxed) as usize;
+    let tail = RX_TAIL.load(Ordering::Acquire) as usize;
+    if head == tail { return None; }
+    // SAFETY: single consumer; head is in-bounds.
+    let b = unsafe { RX_BUF[head] };
+    RX_HEAD.store(((head + 1) % RX_BUF_SIZE) as u32, Ordering::Release);
+    Some(b)
+}
+
+/// Drain the RX FIFO into the ring right now (called by a blocked `console_read` so input capture never
+/// hinges on the timer tick, which the atomic-syscall path may skip while a user task is mid-syscall).
+pub fn uart_rx_drain_now() { pl011_rx_drain(); }
+
+/// Timer-tick hook: drain the RX FIFO and wake any task blocked in ConsoleRead. Runs from
+/// `timer_tick_from_irq` (core 0).
+pub fn uart_rx_poll() {
+    pl011_rx_drain();
+    if RX_HEAD.load(Ordering::Acquire) != RX_TAIL.load(Ordering::Acquire) {
+        let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
+        if waiter != u32::MAX {
+            crate::task::scheduler::wake_by_slot(waiter as usize, 0);
+        }
+    }
+}
+
+/// Inject a byte into the input ring + wake the reader (kernel-side producer; unused on this port,
+/// which drives input straight from the PL011 RX FIFO, but kept for parity with the x86 keyboard path).
+pub fn console_push_byte(b: u8) {
+    let tail = RX_TAIL.load(Ordering::Relaxed) as usize;
+    let head = RX_HEAD.load(Ordering::Acquire) as usize;
+    let next = (tail + 1) % RX_BUF_SIZE;
+    if next != head {
+        // SAFETY: single producer in practice; tail in-bounds.
+        unsafe { RX_BUF[tail] = b; }
+        RX_TAIL.store(next as u32, Ordering::Release);
+    }
+    let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
+    if waiter != u32::MAX {
+        crate::task::scheduler::wake_by_slot(waiter as usize, 0);
+    }
+}
+
+/// The input path is up (the PL011 RX is always available on this port). The shell waits on this before
+/// presenting its prompt (the deterministic end-of-boot signal).
+pub fn set_input_ready() { INPUT_READY.store(true, Ordering::Release); }
+pub fn input_ready() -> bool { INPUT_READY.load(Ordering::Acquire) }
 pub fn com2_init() {}
 pub fn com2_try_read_byte() -> Option<u8> { None }
-pub fn uart_rx_pop() -> Option<u8> { None }
-pub fn uart_rx_poll() {}
-pub fn uart_rx_drain_now() {}
 
 /// Hook called by the neutral `commit_task` when it commits a **user** task. On ARM this records the
 /// slot as a ring-3 task so the timer runs its syscalls atomically (see `irq::mark_task_user` and the

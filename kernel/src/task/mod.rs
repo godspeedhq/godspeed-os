@@ -3869,6 +3869,23 @@ pub fn arm_spawn_logger_neutral() {
     }
 }
 
+/// ARM bring-up (increment 5): spawn the shell through the neutral spawn path with a CONSOLE_READ cap,
+/// so it reads serial input from the PL011 RX ring. `send_peers=&[]` (not `["fs"]` as on x86) because
+/// there is no `fs` on the Pi 2 yet - file/history commands degrade, but the prompt comes up and every
+/// non-fs command (`help`, `version`, ...) works. The shell's other authorities (spawn/kill/reboot)
+/// come from `service_privileges("shell")` automatically.
+#[cfg(target_arch = "arm")]
+pub fn arm_spawn_shell_neutral() {
+    static SHELL_ELF: &[u8] = include_bytes!(env!("SVC_SHELL_ELF"));
+    match spawn_service_with_config(
+        "shell", SHELL_ELF, 0, /*has_recv_endpoint=*/true, &[], 0, false,
+        8 * 1024 * 1024, &[], /*has_console_read=*/true, None,
+    ) {
+        Ok(_)  => crate::kprintln!("arm: shell spawned (console-read wired)"),
+        Err(e) => crate::kprintln!("arm: shell spawn FAILED: {:?}", e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Supervisor respawn (Path C / Phase 6 - the supervisor is restartable; §6.2).
 //

@@ -23,6 +23,20 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-22 - The interactive shell on ARM (feat/pi2-arm32, increment 5)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 23 -> 26 (+3) | Real console I/O: `console_write_bytes_gated` -> `pl011_write` (output); a PL011-RX -> input-ring path (`pl011_rx_drain`, `uart_rx_pop`, `uart_rx_poll`, `uart_rx_drain_now`, `console_push_byte`, `set_input_ready`/`input_ready`) so the shell reads serial input via ConsoleRead. The +3 unsafe are the three MMIO/ring blocks (`pl011_rx_drain`, `uart_rx_pop`, `console_push_byte`). |
+| `arch/arm/exceptions.rs` | unchanged count | `stub_svc` now saves/restores the caller's USER-banked `SP_usr`/`LR_usr` around the syscall (asm inside the existing naked block, no new `unsafe`). A syscall that blocks (recv/console_read) switches to another USER task, which clobbers the shared USER bank; the shell, woken from `console_read`, resumed on the logger's shallow SP and faulted just above the stack top. Saving on the task's own kernel stack (like `stub_irq`'s trap frame) fixes it. |
+
+**The interactive shell runs on ARM.** `gsh> ` prompt, reads serial input, echoes, and executes
+commands: `help` prints the command list, `version` prints `GodspeedOS 0.7.0`. 0 faults. The
+committed increments are unregressed (IPC 6600+ messages, supervisor bootstrap - both 0 faults - with
+the `stub_svc` USER-bank change). New ARM boot: `arm-shell` (`sched_shell.rs`); the shell is built for
+ARM (`arm_built += shell`). x86 unchanged (all changes in `arch/arm/`; the shell-spawn helper is
+`#[cfg(target_arch = "arm")]`).
+
 ## 2026-07-21 - The NEUTRAL spawn works on ARM (feat/pi2-arm32, increment 4a)
 
 | File | Change | Why |
@@ -684,7 +698,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 23 | permitted |
+| arch/arm/mod.rs | 26 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
 | arch/riscv64/mod.rs | 23 | permitted |

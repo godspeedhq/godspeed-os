@@ -179,6 +179,18 @@ unsafe extern "C" fn stub_svc() {
         // return via `movs pc, lr` restores the caller's CPSR from SPSR, re-enabling IRQs in USR.
         "cpsid i",
         "push {{r4-r12, lr}}",          // save callee-saved + the SVC return address (LR_svc)
+        // Save the caller's USER-banked SP_usr/LR_usr on ITS OWN kernel stack. A syscall that blocks
+        // (recv/console_read/yield) switches to another USER task, which runs in ring 3 and clobbers
+        // the shared USER bank; without this the caller resumes on the WRONG user stack (the shell,
+        // woken from console_read, resumed on the logger's shallow SP and faulted just above the stack
+        // top). Stacking it here (not in switch_context) keeps it per-task, so it survives every switch
+        // inside the syscall and is restored on the way out - the syscall-path twin of stub_irq's
+        // trap-frame USER-bank save. `r6` is callee-saved (pushed above), free to use as a scratch base;
+        // the `^` user-register transfer forbids sp in the list + writeback, so a base register carries
+        // the address and sp is adjusted separately.
+        "sub  sp, sp, #8",              // room for usr_sp, usr_lr below the callee-saved frame
+        "mov  r6, sp",                  // r6 = base
+        "stmia r6, {{sp, lr}}^",        // store USER bank r13/r14 at [sp], [sp+4]
         "mrs  r4, spsr",                // the caller's CPSR (SPSR_svc): carries the caller's mode
         "ldr  r5, ={spsr_save}",        // publish it so a syscall can see the caller's privilege level
         "str  r4, [r5]",                //   (used to prove PL0 in the user-mode selftest)
@@ -193,6 +205,11 @@ unsafe extern "C" fn stub_svc() {
         // analogue: SYSRET restores RIP/RFLAGS atomically from registers, nothing banked or shared.)
         "cpsid i",
         "msr  spsr_cxsf, r4",           // restore SPSR for the exception return (now uninterruptible)
+        // Restore the caller's USER-banked SP_usr/LR_usr (clobbered if the syscall switched tasks).
+        "mov  r6, sp",                  // r6 = base (still points at usr_sp/usr_lr)
+        "ldmia r6, {{sp, lr}}^",        // restore USER bank r13/r14
+        "nop",                          // banked-register hazard spacer
+        "add  sp, sp, #8",              // drop the user-bank words
         "pop  {{r4-r12, lr}}",          // restore callee-saved + LR_svc; r0:r1 (result) untouched
         "movs pc, lr",                  // return to caller, restoring CPSR (IRQs on for USR) from SPSR
         dispatch = sym crate::arch::arm::syscall::arm_svc_dispatch,

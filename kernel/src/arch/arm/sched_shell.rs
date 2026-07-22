@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//! The interactive shell on ARM (increment 5): a `gsh>` prompt reading serial input.
+//!
+//! Everything below the shell is now in place (kernel, MMU, scheduler, syscalls, user mode, the neutral
+//! spawn path, console I/O). This brings up the user's interface: the kernel spawns the `logger` and the
+//! `shell` (through the neutral spawn path, with a CONSOLE_READ cap), tells the shell the input path is
+//! up (`set_input_ready` - the PL011 RX is always available), and enters the scheduler. The shell logs
+//! `shell: ready`, prints `gsh> `, and blocks in `console_read`; a keystroke on the serial line lands in
+//! the PL011 RX FIFO, the timer tick (or the blocked read itself) drains it into the input ring and
+//! wakes the shell, which reads the byte, echoes it, and runs the command on Enter.
+//!
+//! There is no `fs` on the Pi 2 yet, so file/history commands degrade; every other command works. This
+//! is deliberately a direct spawn (not via the supervisor) so the prompt is clean - no ping/pong output
+//! competing with the line editor.
+
+use core::sync::atomic::Ordering;
+
+use super::pl011_write;
+
+/// Bring up the neutral subsystems, spawn logger + shell, signal input-ready, and enter the scheduler.
+/// Does not return.
+pub fn run(ram_end: u32, reserve_end: u32) -> ! {
+    super::spawn::neutral_bootstrap(ram_end, reserve_end);
+
+    pl011_write(b"sched-shell: spawning logger + shell...\r\n");
+    crate::task::arm_spawn_logger_neutral();
+    crate::task::arm_spawn_shell_neutral();
+
+    // The PL011 RX is the input driver, and it is always up - tell the shell so it presents its prompt
+    // (the deterministic end-of-boot signal it waits on).
+    super::set_input_ready();
+
+    super::irq::NEUTRAL_SCHED.store(true, Ordering::Relaxed);
+    pl011_write(b"sched-shell: entering scheduler::run(0) - type at the serial console for 'gsh> '.\r\n");
+    crate::task::scheduler::run(0)
+}

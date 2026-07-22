@@ -59,6 +59,8 @@ arm-sched-ipc = []
 arm-sched-spawn = []
 # The real OS bootstrap: kernel spawns the SUPERVISOR, which spawns the services (arch/arm/sched_supervisor.rs).
 arm-supervisor = []
+# The interactive shell on ARM: gsh> prompt reading serial input (arch/arm/sched_shell.rs).
+arm-shell = []
 
 # Deliberately take a data abort during arm32 boot, to PROVE the exception vectors
 # fire (a fault path never observed firing is not evidence). The ARM twin of the x86
