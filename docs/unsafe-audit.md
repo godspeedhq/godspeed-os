@@ -23,6 +23,18 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-22 - AP bring-up: vectors-first + barrier (feat/pi2-arm32)
+
+On real HW core 3's bring-up intermittently faulted BEFORE it installed its vectors, so with VBAR still 0
+it branched into low memory (an UNDEF at 0x618) and halted the boot. `ap_boot_main` now installs the
+per-core vectors FIRST (before ACTLR.SMP/MMU) so any bring-up fault is REPORTED through the vectors
+instead of wandering, plus a `dsb sy`/`isb` to synchronize with core 0's published boot state (SEC-25/28
+weak-ordering hygiene). +1 unsafe: the barrier block.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 34 -> 35 (+1) | `dsb sy`/`isb` barrier at the top of `ap_boot_main` (weak-ordering sync before an AP relies on core 0's tables/arenas). `install_for_core` moved ahead of the MMU enable so bring-up faults are loud, not wild. |
+
 ## 2026-07-22 - ARM frame reclaim on task death (feat/pi2-arm32)
 
 The ARM kill path reclaimed nothing (`reclaim_user_frames` was a `{ 0 }` stub) and the neutral kill path
@@ -742,7 +754,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 34 | permitted |
+| arch/arm/mod.rs | 35 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
 | arch/riscv64/mod.rs | 23 | permitted |

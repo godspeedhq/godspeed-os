@@ -243,6 +243,17 @@ pub unsafe extern "C" fn ap_entry() -> ! {
 /// Rust side of a secondary core's bring-up. Runs with the MMU OFF on `core`'s own stack, then brings
 /// this core into the SAME kernel address space and the neutral per-core scheduler. Never returns.
 extern "C" fn ap_boot_main(core_id: u32) -> ! {
+    // Vectors FIRST (before the MMU), so a fault ANYWHERE in the rest of this core's bring-up is
+    // REPORTED through the vectors instead of wandering into garbage. On real HW core 3's bring-up
+    // intermittently faulted before vectors were installed and, with VBAR still 0, branched into low
+    // memory (an UNDEF at 0x618) and halted the boot. arm_vectors is a kernel .text symbol at its
+    // identity address, valid with the MMU off or on, so this is safe here. Fail loud, never wild.
+    exceptions::install_for_core(core_id);
+    // Synchronize with core 0's published boot state (page tables, arenas) before relying on it - the
+    // weak-ordering hygiene a released AP owes on the Cortex-A7 (SEC-25/28 class). Core 0 flushed its
+    // D-cache and `dsb`+`sev`'d before release; match it with a barrier on this side.
+    // SAFETY: `dsb`/`isb` are PL1 barriers with no memory effects.
+    unsafe { core::arch::asm!("dsb sy", "isb", options(nomem, nostack)); }
     // Coherency + exclusives for shareable memory (LDREX/STREX, every spinlock) - before caches/MMU.
     // SAFETY: ACTLR is a PL1 control register; SMP before caches is the documented Cortex-A7 order.
     unsafe {
@@ -254,8 +265,6 @@ extern "C" fn ap_boot_main(core_id: u32) -> ! {
     // Load the SAME L1 core 0 built: this core now sees the whole kernel address space.
     // SAFETY: core 0 finished build_tables and released us; every mapping is identity.
     unsafe { mmu::enable_on_this_core(); }
-    // Vectors + THIS core's own banked mode stacks (never shared with another core).
-    exceptions::install_for_core(core_id);
     // Register our id so the neutral current_core_id() resolves us, then start our own timer tick.
     crate::smp::core::set_core_lapic_id(core_id, core_id);
     irq::start_tick_ap(core_id);
