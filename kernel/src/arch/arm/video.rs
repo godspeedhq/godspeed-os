@@ -138,9 +138,9 @@ pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
 }
 
-/// Map the framebuffer Device (so ARM writes reach the display). Called AFTER `mmu::enable`, once
-/// translation is on - the counterpart to the MMU-off `request`. The text console (`fbcon`) draws into
-/// it after this.
+/// Map the framebuffer cacheable (so console rendering is fast; `fbcon` cleans each write to the GPU).
+/// Called AFTER `mmu::enable`, once translation is on - the counterpart to the MMU-off `request`. The
+/// text console (`fbcon`) draws into it after this.
 pub fn map(fb: &FbInfo) {
     super::mmu::map_framebuffer(fb.base, fb.pitch.saturating_mul(fb.height));
 }

@@ -64,8 +64,23 @@ pub fn init(base: u32, pitch: u32, width: u32, height: u32) {
 #[inline]
 fn put_pixel(c: &Fbcon, x: usize, y: usize, color: u32) {
     if x >= c.width || y >= c.height { return; }
-    // SAFETY: (x,y) in bounds; the framebuffer is device-mapped RAM, one aligned u32 store per pixel.
+    // SAFETY: (x,y) in bounds; the framebuffer is cacheable RAM, one aligned u32 store per pixel. The
+    // write lands in the cache; `clean_rect` publishes it to the GPU afterwards.
     unsafe { ((c.base + y * c.pitch + x * 4) as *mut u32).write_volatile(color); }
+}
+
+/// Publish a written pixel rectangle to the Point of Coherency so the GPU (which scans RAM, not the CPU
+/// cache) sees it. The framebuffer is cacheable (see `section_fb`), so every glyph/scroll/clear writes to
+/// the cache and MUST be cleaned by MVA (DCCMVAC) here or the display shows stale pixels. Cleans row by
+/// row because a rectangle is strided in memory (each scanline is `pitch` apart).
+fn clean_rect(c: &Fbcon, x0: usize, y0: usize, w: usize, h: usize) {
+    let y_end = (y0 + h).min(c.height);
+    let bytes = (w.min(c.width.saturating_sub(x0)) * 4) as u32;
+    let mut y = y0;
+    while y < y_end {
+        super::page_tables::clean_dcache((c.base + y * c.pitch + x0 * 4) as u32, bytes);
+        y += 1;
+    }
 }
 
 fn clear(c: &Fbcon) {
@@ -74,6 +89,8 @@ fn clear(c: &Fbcon) {
             put_pixel(c, x, y, BG);
         }
     }
+    // Publish the whole framebuffer to the GPU (one contiguous clean of the full buffer).
+    super::page_tables::clean_dcache(c.base as u32, (c.pitch * c.height) as u32);
 }
 
 /// Blend the foreground over the background by an antialiasing intensity (0 = bg, 255 = fg).
@@ -108,17 +125,19 @@ fn draw_glyph(c: &Fbcon, ch: u8, col: usize, row: usize) {
             }
         }
     }
+    // Publish this glyph cell to the GPU.
+    clean_rect(c, x0, y0, CELL_W, CELL_H);
 }
 
 /// Scroll the framebuffer up by one text row: move the pixel rows below the top cell-row up over it,
-/// then clear the freed bottom band to the background. Reads + writes the framebuffer, which is Normal
-/// non-cacheable (mapped so by `map_framebuffer`), so a byte memmove is valid (no Device alignment
-/// rules) and reaches the display. This replaces the old clear-and-home so the screen never blanks -
-/// the flicker seen on the TV under continuous output.
+/// then clear the freed bottom band to the background. The framebuffer is cacheable (`section_fb`), so
+/// the memmove reads + writes the cache - fast and smooth, not the uncached crawl a non-cacheable buffer
+/// forced. The shifted region is then published to the GPU by one `clean_rect` over the text area. This
+/// replaces the old clear-and-home so the screen never blanks - the flicker seen on the TV under output.
 fn scroll(c: &Fbcon) {
     let row_bytes = c.cols * CELL_W * 4; // one text row, inset width
-    // SAFETY: every source/destination row is inside the mapped framebuffer's text region, and
-    // Normal-NC memory permits the byte memmove; margins stay fixed (only the inset region moves).
+    // SAFETY: every source/destination row is inside the mapped framebuffer's text region (cacheable
+    // RAM), so the byte memmove is valid; margins stay fixed (only the inset region moves).
     unsafe {
         // Shift the text region up by one cell row, row by row (strided - margins untouched).
         for gy in 0..((c.rows - 1) * CELL_H) {
@@ -134,6 +153,8 @@ fn scroll(c: &Fbcon) {
             }
         }
     }
+    // Publish the whole shifted inset text region to the GPU in one pass.
+    clean_rect(c, c.org_x, c.org_y, c.cols * CELL_W, c.rows * CELL_H);
 }
 
 /// Render one byte of the serial stream. Handles CR/LF/backspace; printable ASCII draws a glyph and

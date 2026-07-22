@@ -87,19 +87,21 @@ fn section(pa: u32, device: bool, execute: bool) -> u32 {
     d
 }
 
-/// A 1 MB section for the framebuffer: Normal but NON-cacheable (TEX=0b100, C=0, B=0), PL1 RW, non-exec.
-/// Non-cacheable so the GPU (which scans RAM) sees ARM writes without cache maintenance, while still
-/// allowing fast buffered writes and a byte memmove for scrolling - Device memory forbids the unaligned
-/// accesses a memmove makes and is much slower to read back for a scroll.
+/// A 1 MB section for the framebuffer: Normal write-back CACHEABLE (TEX=0b001, C=1, B=1), PL1 RW,
+/// non-exec, NON-shareable. Cacheable is what makes the console fast: glyph writes and the scroll
+/// memmove hit the cache instead of crawling through uncached RAM, so scrolling is smooth. The GPU scans
+/// RAM through its own bus and does not snoop the CPU cache, so `fbcon` publishes each write to the Point
+/// of Coherency with an explicit `clean_dcache` (DCCMVAC) - the same primitive `map_framebuffer` already
+/// uses for the page tables. Non-shareable keeps it off the SMP coherency fabric (only this core writes
+/// it; the GPU sees it via the clean), which also avoids the QEMU TCG slow-path that a non-cacheable or
+/// shareable mapping dragged the whole system onto under -smp.
 fn section_fb(pa: u32) -> u32 {
-    // NON-shareable: the framebuffer is not shared *kernel* data - only this core writes glyphs and the
-    // GPU scans it through its own bus, so it never needs the SMP coherency fabric. Marking it Shareable
-    // (as an earlier cut did) dragged QEMU TCG into its slow cross-core coherency path for every access,
-    // crawling the whole system under -smp; dropping S keeps it out of that path (and is more accurate).
     (pa & 0xFFF0_0000)
         | 0b10          // section descriptor
         | (0b01 << 10)  // AP = PL1 RW, PL0 none
-        | (0b100 << 12) // TEX = Normal, outer + inner non-cacheable
+        | (0b001 << 12) // TEX = Normal
+        | (1 << 3)      // C = 1  (write-back)
+        | (1 << 2)      // B = 1  (write-back write-allocate with TEX)
         | (1 << 4)      // XN
 }
 
@@ -178,11 +180,12 @@ fn translate(va: u32) -> Option<u32> {
 ///
 /// Identity mapping is what makes this survivable - PC, SP and VBAR all mean the same thing on both
 /// sides of the switch.
-/// Map the GPU framebuffer region `[base, base+size)` as Device memory in the LIVE kernel L1, so ARM
-/// writes to it reach the display. The framebuffer sits in the gap between usable RAM and the
-/// peripherals, which `build_tables` leaves unmapped, so it must be added after the fact. Rounds to the
-/// enclosing 1 MiB sections. Runs after the MMU + caches are on, so the new descriptors are cleaned to
-/// RAM (the walker reads the table non-cacheable) and the TLB is flushed.
+/// Map the GPU framebuffer region `[base, base+size)` as Normal cacheable memory in the LIVE kernel L1
+/// (see `section_fb`), so console rendering is fast; `fbcon` publishes each write to the GPU with an
+/// explicit clean. The framebuffer sits in the gap between usable RAM and the peripherals, which
+/// `build_tables` leaves unmapped, so it must be added after the fact. Rounds to the enclosing 1 MiB
+/// sections. Runs after the MMU + caches are on, so the new descriptors are cleaned to RAM (the walker
+/// reads the table non-cacheable) and the TLB is flushed.
 pub fn map_framebuffer(base: u32, size: u32) {
     // SAFETY: `L1` is the live kernel table; we add previously-empty (unmapped-gap) entries, so no
     // running mapping is disturbed. Single writer on this boot path.
