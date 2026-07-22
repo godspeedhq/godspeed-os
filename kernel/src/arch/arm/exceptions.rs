@@ -156,8 +156,25 @@ unsafe extern "C" fn stub_reset() -> ! {
 unsafe extern "C" fn stub_undef() -> ! {
     core::arch::naked_asm!(
         "sub lr, lr, #4",              // undefined: LR = faulting instr + 4
+        // Fault-survival, same split as the aborts: a USER undefined-instruction (a service branched
+        // into garbage or hit a bad opcode - seen under chaos max-carnage) kills just that task; a
+        // kernel UNDEF is a real bug and reports + halts. UNDEF entry masks IRQs, so `cps #0x13` keeps
+        // them masked on the task's kernel stack.
+        "mrs r0, spsr",
+        "and r0, r0, #0x1f",
+        "cmp r0, #0x10",              // USR mode?
+        "bne 1f",
+        "mov r1, lr",                 // fault pc
+        "cps #0x13",                  // -> SVC mode, the task's kernel stack
+        "mov r0, r1",                 // arg0 = fault pc
+        "mov r1, #0",                 // arg1 = addr: n/a for an instruction fault
+        "bl {kill}",                  // kill_current + reschedule; NEVER returns
+        "b .",
+        "1:",
         "mov r0, #1", "mov r1, lr", "mov r2, #0", "mov r3, #0",
-        "b {rep}", rep = sym arm_exception_report,
+        "b {rep}",
+        kill = sym arm_user_fault_kill,
+        rep = sym arm_exception_report,
     )
 }
 
