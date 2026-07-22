@@ -405,7 +405,7 @@ pub(super) static SERIAL_SMP: core::sync::atomic::AtomicBool = core::sync::atomi
 
 /// Cap on the acquire spin (~one full serial line at 115200 baud). A waiter that exceeds it writes
 /// anyway rather than block forever - the only correct choice for a UART also used by the fault handler.
-const SERIAL_ACQUIRE_SPINS: u32 = 20_000_000;
+const SERIAL_ACQUIRE_SPINS: u32 = 50_000;
 
 pub(super) fn pl011_write(s: &[u8]) {
     use core::sync::atomic::Ordering;
@@ -416,6 +416,13 @@ pub(super) fn pl011_write(s: &[u8]) {
         fbcon::put_bytes(s); // mirror to the TV once the console is up (no-op before that)
         return;
     }
+    // Clear any stale exclusive-monitor reservation before the compare-exchange below. ARMv7 does NOT
+    // guarantee the local monitor is cleared on exception entry/return, so a task that took an
+    // interrupt (or an SVC) mid-`ldrex`/`strex` sequence can leave the monitor "exclusive" to a foreign
+    // address - making EVERY subsequent `strex` here fail spuriously and forever (the shell's second
+    // console echo wedged exactly this way). An explicit `clrex` resets it so the acquire can succeed.
+    // SAFETY: `clrex` clears the local exclusive monitor; no memory effect.
+    unsafe { core::arch::asm!("clrex", options(nomem, nostack)); }
     // SMP is live: serialize across cores. Try to claim the UART (bounded), write, then release only if
     // we claimed it - a fault-time / heavily-contended write is never lost or deadlocked.
     let mut held = false;
