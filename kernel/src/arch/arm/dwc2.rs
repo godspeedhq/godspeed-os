@@ -330,7 +330,11 @@ fn channel_start(dir_in: bool, pid: u32, buf_phys: u32, len: u32) {
     let pkts = if len == 0 { 1 } else { (len + mps - 1) / mps };
     wr(HCINT0, 0xFFFF_FFFF);                                    // clear stale channel interrupts
     wr(HCTSIZ0, (len & 0x7_FFFF) | (pkts << 19) | (pid << 29)); // size, packet count, PID
-    wr(HCDMA0, buf_phys);
+    // The DWC2 DMA engine addresses RAM through the VideoCore *bus* alias, not the ARM physical address
+    // (the same 0xC0000000 uncached alias the framebuffer mailbox needed). Hand it the ARM physical and
+    // it reads the wrong memory - the SETUP packet never goes out and the channel halts with ChHltd only
+    // (no completion, no error), exactly what the Pi 2 reported. OR in the alias so it sees our buffer.
+    wr(HCDMA0, buf_phys | 0xC000_0000);
     wr(HCCHAR0, (mps & 0x7FF)
         | ((dir_in as u32) << 15)
         | (low_speed << 17)
@@ -429,6 +433,9 @@ fn poll_inner() {
         poll_stage(setup_phys, data_phys, data_in, dlen)
     };
     if still_busy { return; }
+    // If the step FAILED (poll_stage set STEP_FAILED), stop here - do NOT run the completion handler or
+    // advance to the next step, which would plough on through a broken enumeration reporting garbage.
+    if SM_STEP.load(Ordering::Relaxed) == STEP_FAILED { return; }
 
     // Step just completed - consume its result and advance.
     match step {
