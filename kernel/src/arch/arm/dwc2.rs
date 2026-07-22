@@ -300,6 +300,7 @@ static SM_RUNNING: AtomicBool = AtomicBool::new(false); // a channel transaction
 static SM_TICKS:   AtomicU32  = AtomicU32::new(0);      // watchdog: ticks the current stage has waited
 static DEV_ADDR:   AtomicU8   = AtomicU8::new(0);       // 0 until SET_ADDRESS assigns 1
 static MPS0:       AtomicU8   = AtomicU8::new(8);       // EP0 max packet size (8 until GET_DESCRIPTOR)
+static SM_RETRY:   AtomicU8   = AtomicU8::new(0);       // NAK/xact-error retries for the current stage
 
 // Enumeration steps. `done` marks enumeration complete; 255 marks a failure. Increment 2 stops after
 // reading the device descriptor (proof the transfers work); increment 3 adds SET_CONFIGURATION +
@@ -362,10 +363,26 @@ fn poll_stage(setup_phys: u32, data_phys: u32, data_in: bool, dlen: usize) -> bo
     }
     SM_RUNNING.store(false, Ordering::Relaxed);
     if i & HCINT_XFERCOMPL == 0 {
-        pl011_write(b"dwc2: control transfer error - USB unavailable\r\n");
+        // The channel halted without completing. A device fresh out of reset routinely NAKs early
+        // control transfers (bit 4) and can hit transaction errors (bit 7); both mean "not ready, try
+        // again", so re-issue the SAME stage a bounded number of times rather than giving up. A STALL
+        // (bit 3) or exhausted retries is a real failure.
+        let nak = i & (1 << 4) != 0;
+        let xacterr = i & (1 << 7) != 0;
+        if (nak || xacterr) && SM_RETRY.fetch_add(1, Ordering::Relaxed) < 200 {
+            return true; // SM_RUNNING is false + stage unchanged, so next poll restarts this transaction
+        }
+        pl011_write(b"dwc2: control transfer error HCINT=");
+        write_hex32(i);
+        pl011_write(b" step=");
+        write_hex32(SM_STEP.load(Ordering::Relaxed) as u32);
+        pl011_write(b" stage=");
+        write_hex32(SM_STAGE.load(Ordering::Relaxed) as u32);
+        pl011_write(b" - USB unavailable\r\n");
         SM_STEP.store(STEP_FAILED, Ordering::Relaxed);
         return false;
     }
+    SM_RETRY.store(0, Ordering::Relaxed);
     match SM_STAGE.load(Ordering::Relaxed) {
         0 => { SM_STAGE.store(if dlen > 0 { 1 } else { 2 }, Ordering::Relaxed); true }
         1 => {
@@ -417,8 +434,13 @@ fn poll_inner() {
     match step {
         STEP_GET_DESC8 => {
             // SAFETY: read the invalidated device-descriptor bytes the DMA delivered.
-            let mps = unsafe { (*core::ptr::addr_of!(DMA)).data[7] };
-            MPS0.store(if mps == 0 { 8 } else { mps }, Ordering::Relaxed);
+            let d = unsafe { (*core::ptr::addr_of!(DMA)).data };
+            // Diagnostic: first 8 descriptor bytes - bLength(0x12) bDescType(0x01) bcdUSB.. bMaxPacketSize0.
+            pl011_write(b"dwc2: desc8=");
+            write_hex32((d[0] as u32) << 24 | (d[1] as u32) << 16 | (d[2] as u32) << 8 | d[3] as u32);
+            write_hex32((d[4] as u32) << 24 | (d[5] as u32) << 16 | (d[6] as u32) << 8 | d[7] as u32);
+            pl011_write(b"\r\n");
+            MPS0.store(if d[7] == 0 { 8 } else { d[7] }, Ordering::Relaxed);
         }
         STEP_SET_ADDR => DEV_ADDR.store(1, Ordering::Relaxed),
         STEP_GET_DESC18 => {
