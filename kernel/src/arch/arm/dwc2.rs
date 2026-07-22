@@ -57,6 +57,9 @@ const PCGCCTL:  usize = 0xE00; // power + clock gating control
 
 // GRSTCTL bits
 const GRSTCTL_CSFTRST: u32 = 1 << 0;  // core soft reset (self-clearing)
+const GRSTCTL_RXFFLSH: u32 = 1 << 4;  // RX FIFO flush (self-clearing)
+const GRSTCTL_TXFFLSH: u32 = 1 << 5;  // TX FIFO flush (self-clearing)
+const GRSTCTL_TXFNUM_ALL: u32 = 0x10 << 6; // TxFNum=0x10 flushes ALL TX FIFOs
 const GRSTCTL_AHBIDLE: u32 = 1 << 31; // AHB master idle
 
 // GAHBCFG bits
@@ -181,6 +184,29 @@ pub fn init() {
     wr(GRXFSIZ, 0x100);
     wr(GNPTXFSIZ, (0x80 << 16) | 0x100);
     wr(HPTXFSIZ, (0x80 << 16) | 0x180);
+    // 5b'. Flush every TX FIFO and the RX FIFO so their internal read/write pointers match the boundaries
+    //      just programmed. The core soft reset set pointers for the DEFAULT layout; resizing the FIFOs
+    //      leaves those pointers stale, and in DMA mode the core DMAs the SETUP packet INTO the NP TX FIFO
+    //      itself - a stale pointer makes that write silently stall, so the channel arms but never
+    //      transacts (HW-diagnosed on the Pi 2: ChEna set, HCINT=0, zero bytes moved). Flush only while the
+    //      AHB master is idle; each flush bit self-clears.
+    let mut waited = 0u32;
+    while rd(GRSTCTL) & GRSTCTL_AHBIDLE == 0 {
+        waited += 1;
+        if waited > 100_000 { pl011_write(b"dwc2: WARN AHB not idle before FIFO flush\r\n"); break; }
+    }
+    wr(GRSTCTL, GRSTCTL_TXFNUM_ALL | GRSTCTL_TXFFLSH);
+    let mut waited = 0u32;
+    while rd(GRSTCTL) & GRSTCTL_TXFFLSH != 0 {
+        waited += 1;
+        if waited > 1_000_000 { pl011_write(b"dwc2: WARN TX FIFO flush did not clear\r\n"); break; }
+    }
+    wr(GRSTCTL, GRSTCTL_RXFFLSH);
+    let mut waited = 0u32;
+    while rd(GRSTCTL) & GRSTCTL_RXFFLSH != 0 {
+        waited += 1;
+        if waited > 1_000_000 { pl011_write(b"dwc2: WARN RX FIFO flush did not clear\r\n"); break; }
+    }
     // 5c. Enable internal buffer DMA + a 16-beat AHB burst, so a transfer is "point HCDMA at a buffer,
     //     start the channel, wait" rather than hand-copying the FIFO. Re-enable the global interrupt bit
     //     too (we still poll, but some cores gate DMA completion on it).
