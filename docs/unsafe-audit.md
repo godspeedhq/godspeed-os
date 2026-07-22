@@ -23,6 +23,22 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-22 - ARM frame reclaim on task death (feat/pi2-arm32)
+
+The ARM kill path reclaimed nothing (`reclaim_user_frames` was a `{ 0 }` stub) and the neutral kill path
+`free_frame`d the page-table root - fine on x86 (root = a general frame) but on ARM the root is an ARENA
+L1 slot, so it corrupted the frame bitmap (the `alloc_frame returned kernel-range frame` panic on the
+first respawn). Real reclaim: `reclaim_user_frames` walks the dying task's L1/L2, `free_frame`s its USER
+pages (AP[1:0] >= 0b10; distinguished from shared kernel hole-fill pages) and returns its own L2s to the
+arena; the arenas gained per-slot `used` flags so freed L1/L2 slots are reused (a `free_frame`-of-root
+would still corrupt, so the root goes back to the arena via `free_page_table_root`). QEMU-proven: 15
+logger kill/restart cycles, 0 panic, 0 leak/exhaustion (`freed 76 frames` each, was `freed 0`).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/page_tables.rs` | 25 -> 27 (+2) | `reclaim_user_frames` (walk L1/L2, free USER pages + L2 slots) and `free_page_table_root` (return the L1 root to the arena) - the two `unsafe fn` bodies that free a dead task's memory. `alloc_l1/l2` gained CAS-on-`used` + `free_l1/l2` (safe: atomic store + `addr_of`). |
+| `arch/x86_64/page_tables.rs` | 47 -> 48 (+1) | `free_page_table_root` = `free_frame` (behaviour-identical to the old inline neutral root free), so the neutral kill path can be arch-neutral for both ISAs. |
+
 ## 2026-07-22 - Fault-survival on ARM: kill the faulting task, keep the kernel alive (feat/pi2-arm32)
 
 The data/prefetch abort handlers went from report-and-halt to the x86 C2/A14/A15 property: a USER-mode
@@ -718,7 +734,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/irq.rs | 11 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 6 | permitted |
-| arch/arm/page_tables.rs | 25 | permitted |
+| arch/arm/page_tables.rs | 27 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |
 | arch/arm/sched_ipc.rs | 9 | permitted |
@@ -739,7 +755,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/ioapic.rs | 8 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
 | arch/x86_64/mod.rs | 36 | permitted |
-| arch/x86_64/page_tables.rs | 47 | permitted |
+| arch/x86_64/page_tables.rs | 48 | permitted |
 | arch/x86_64/pci.rs | 19 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 15 | permitted |

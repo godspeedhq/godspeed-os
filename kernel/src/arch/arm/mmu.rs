@@ -49,6 +49,14 @@ pub fn set_ram_end(end: u32) {
     RAM_END.store(end, Ordering::Relaxed);
 }
 
+/// Physical (== virtual, identity-mapped) base of the boot kernel L1 table. The reclaim path
+/// (`page_tables::reclaim_user_frames`) compares a dying service's L1 entries against this canonical
+/// kernel map: an entry that MATCHES is a shared kernel mapping (copied in by `fill_kernel_identity`)
+/// and must be left alone; an entry that DIFFERS is the service's own and is freed.
+pub fn kernel_l1_base() -> u32 {
+    core::ptr::addr_of!(L1) as u32
+}
+
 /// BCM2836 peripherals (16 MiB) and the core-local block (timers, mailboxes, IPIs - what SMP and the
 /// timer will need next). Both are Device memory, never Normal: speculative or reordered accesses to
 /// MMIO are how drivers get mysterious, and Device + XN forbids executing from them at all.

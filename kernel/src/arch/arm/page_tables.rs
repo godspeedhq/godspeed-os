@@ -23,7 +23,7 @@
 //! allocator swap called out as the remaining seam. The *algorithm* - build an L2, point an L1 entry
 //! at it, encode the page - is the real one, identical to what the neutral path will drive.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::memory::frame::PhysAddr;
 use super::pl011_write;
@@ -96,49 +96,77 @@ fn l1_table_ptr(l2_pa: u32) -> u32 {
 /// stack, plus the kernel-identity fill). Sized for the boot loader selftest plus several concurrent
 /// services (IPC pair, supervisor, shell); the whole arena is replaced by `alloc_frame` once
 /// `memory::init` owns page-table frames on ARM.
-const L2_TABLES: usize = 64;
+/// Reclaimable now: a per-slot `used` flag replaces the old bump counter, so a slot freed on task death
+/// (`free_l2`) is handed out again by the next spawn. Without this a restart storm (`chaos max-carnage`)
+/// would exhaust the arena in a handful of respawns. Headroom is for the concurrent-live set plus the
+/// brief overlap of a dying and its replacement instance, NOT the cumulative spawn count.
+const L2_TABLES: usize = 128;
 #[repr(align(1024))]
 struct L2Arena([[u32; 256]; L2_TABLES]);
 static mut L2_ARENA: L2Arena = L2Arena([[0; 256]; L2_TABLES]);
-static L2_NEXT: AtomicUsize = AtomicUsize::new(0);
+static L2_USED: [AtomicBool; L2_TABLES] = [const { AtomicBool::new(false) }; L2_TABLES];
 
-/// Fresh L1 tables (16 KiB each, 16 KiB aligned) for `PageTable::new`. One per address space: the boot
-/// loader selftest takes one, and each live service takes one. Sized (with headroom) for the running
-/// service set; becomes `alloc_frame` when the neutral allocator owns these frames.
-const L1_TABLES: usize = 8;
+/// Fresh L1 tables (16 KiB each, 16 KiB aligned) for `PageTable::new`. One per address space (the boot
+/// loader selftest and each live service). Reclaimable like the L2 arena.
+const L1_TABLES: usize = 16;
 #[repr(align(16384))]
 struct L1Arena([[u32; 4096]; L1_TABLES]);
 static mut L1_ARENA: L1Arena = L1Arena([[0; 4096]; L1_TABLES]);
-static L1_NEXT: AtomicUsize = AtomicUsize::new(0);
+static L1_USED: [AtomicBool; L1_TABLES] = [const { AtomicBool::new(false) }; L1_TABLES];
 
-/// Hand out a zeroed L2 table; returns its physical (== virtual, identity-mapped) address.
+/// Hand out a zeroed L2 table; returns its physical (== virtual, identity-mapped) address. Claims the
+/// first free slot (CAS on its `used` flag), so it composes with `free_l2` for reuse across spawns.
 fn alloc_l2() -> Option<u32> {
-    let i = L2_NEXT.fetch_add(1, Ordering::Relaxed);
-    if i >= L2_TABLES {
-        return None;
+    for i in 0..L2_TABLES {
+        if L2_USED[i].compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            // SAFETY: we exclusively claimed slot `i`; no other caller can alias it until `free_l2`.
+            // The arena is 1 KiB aligned as the L1 pointer descriptor requires.
+            unsafe {
+                let t = core::ptr::addr_of_mut!(L2_ARENA.0[i]);
+                (*t) = [0; 256];
+                // The zeroed table must reach the PoC before the non-cacheable walker reads any entry.
+                clean_dcache(t as u32, 1024);
+                return Some(t as u32);
+            }
+        }
     }
-    // SAFETY: Boot-time, single-threaded; each index is handed out once by the atomic bump, so no two
-    // callers alias the same table. The arena is 1 KiB aligned as the L1 pointer descriptor requires.
-    unsafe {
-        let t = core::ptr::addr_of_mut!(L2_ARENA.0[i]);
-        (*t) = [0; 256];
-        // The zeroed table must reach the PoC before the non-cacheable walker reads any entry.
-        clean_dcache(t as u32, 1024);
-        Some(t as u32)
+    None
+}
+
+/// Return an L2 table to the arena (mapping its physical base back to a slot index). Called from
+/// `reclaim_user_frames` for a dead task's own L2s. Out-of-arena addresses are ignored defensively.
+fn free_l2(pa: u32) {
+    let base = core::ptr::addr_of!(L2_ARENA) as u32;
+    if pa < base { return; }
+    let idx = ((pa - base) / 1024) as usize; // each L2 = 256 * 4 = 1024 bytes
+    if idx < L2_TABLES {
+        L2_USED[idx].store(false, Ordering::Release);
     }
 }
 
 fn alloc_l1() -> Option<u32> {
-    let i = L1_NEXT.fetch_add(1, Ordering::Relaxed);
-    if i >= L1_TABLES {
-        return None;
+    for i in 0..L1_TABLES {
+        if L1_USED[i].compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            // SAFETY: As `alloc_l2`; 16 KiB aligned as TTBR0 requires.
+            unsafe {
+                let t = core::ptr::addr_of_mut!(L1_ARENA.0[i]);
+                (*t) = [0; 4096];
+                clean_dcache(t as u32, 16384); // zeroed L1 -> PoC for the non-cacheable walker
+                return Some(t as u32);
+            }
+        }
     }
-    // SAFETY: As `alloc_l2`; 16 KiB aligned as TTBR0 requires.
-    unsafe {
-        let t = core::ptr::addr_of_mut!(L1_ARENA.0[i]);
-        (*t) = [0; 4096];
-        clean_dcache(t as u32, 16384); // zeroed L1 -> PoC for the non-cacheable walker
-        Some(t as u32)
+    None
+}
+
+/// Return an L1 table (an address-space root) to the arena. Called by `free_page_table_root` from the
+/// kill path. Out-of-arena addresses are ignored defensively.
+fn free_l1(pa: u32) {
+    let base = core::ptr::addr_of!(L1_ARENA) as u32;
+    if pa < base { return; }
+    let idx = ((pa - base) / 16384) as usize; // each L1 = 4096 * 4 = 16384 bytes
+    if idx < L1_TABLES {
+        L1_USED[idx].store(false, Ordering::Release);
     }
 }
 
@@ -446,7 +474,60 @@ pub unsafe fn set_hhdm_offset(_offset: u64) {}
 pub fn entry_for_va(_virt: u64) -> Option<u64> { None }
 pub fn unmap_4k_strided(_base: u64, _stride: u64, _count: usize) {}
 pub fn harden_hhdm_nx() {}
-pub unsafe fn reclaim_user_frames(_cr3: u64) -> usize { 0 }
+/// Free every user frame a dying task owns, and return its own L2 tables to the arena; return the count
+/// of frames freed. Mirrors x86's `reclaim_user_frames` for the ARM two-level short-descriptor tables.
+///
+/// The subtlety is the SHARED kernel identity map: `fill_kernel_identity` copies kernel L1 entries
+/// (sections and table pointers) into every service L1, so a naive "free every table under this L1"
+/// would free the kernel's own tables and its shared pages. The clean discriminator:
+/// - an L1 entry is the service's OWN iff it is a TABLE **and differs from the boot kernel L1** at that
+///   index (a matching value is a shared copy; a SECTION is always kernel);
+/// - within such an L2, a page is the service's OWN iff PL0 has access (AP[1:0] >= 0b10) - the USER
+///   pages the loader/`map_stack_and_ctx` `alloc_frame`d. Kernel hole-fill pages (AP == 0b01, PL0 none)
+///   are shared and left alone.
+/// Leaves the L1 ROOT for `free_page_table_root` (mirrors x86 leaving the PML4 to the root-free path).
+///
+/// # Safety
+/// `cr3` is the Dead task's L1 root; no core will load it again, so its tables are ours to walk + free.
+pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
+    use crate::memory::frame::{Frame, PhysAddr};
+    let svc_l1 = ((cr3 as u32) & 0xFFFF_C000) as *const u32;
+    let ker_l1 = super::mmu::kernel_l1_base() as *const u32;
+    let mut freed = 0usize;
+    // SAFETY: both L1s are identity-mapped (arena L1 + boot L1), readable here; the task is Dead.
+    unsafe {
+        for i in 0..4096usize {
+            let svc = svc_l1.add(i).read_volatile();
+            if svc & 0b11 != L1_TYPE_TABLE { continue; }          // 0 (unmapped) or a kernel SECTION
+            if svc == ker_l1.add(i).read_volatile() { continue; } // shared kernel table (copied in)
+            let l2 = (svc & 0xFFFF_FC00) as *const u32;
+            for j in 0..256usize {
+                let e = l2.add(j).read_volatile();
+                if e & 0b11 == 0 { continue; }                    // invalid entry
+                if (e >> 4) & 0b11 >= 0b10 {                      // PL0 has access => USER page => ours
+                    free_frame(Frame::from_phys(PhysAddr((e & 0xFFFF_F000) as u64)));
+                    freed += 1;
+                }
+                // AP == 0b01 => kernel hole-fill page (shared) => leave it
+            }
+            free_l2(l2 as u32); // return the service's own L2 to the arena
+        }
+    }
+    freed
+}
+
+/// Free a dying task's page-table ROOT (its L1). On ARM the L1 is an ARENA slot, not a general-allocator
+/// frame, so it goes back to the arena - never to `free_frame`, which would corrupt the frame bitmap
+/// (the `alloc_frame returned kernel-range frame` panic that motivated this whole path). The neutral
+/// kill path calls this instead of `free_frame` for the root (immediate non-self-kill + deferred drain).
+///
+/// # Safety
+/// `root` is a Dead task's L1 root; no core will load this address space again.
+pub unsafe fn free_page_table_root(root: u64) {
+    free_l1((root as u32) & 0xFFFF_C000);
+}
+
+use crate::memory::allocator::free_frame;
 
 // ---- Selftest: build a real 4 KiB mapping and prove translation + permissions ----
 

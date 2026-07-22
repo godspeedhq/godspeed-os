@@ -1717,13 +1717,11 @@ fn drain_pending_kstack(cid: usize) {
     let pml4_phys = CORE_PENDING_PML4.get(cid).load(Ordering::Acquire);
     if pml4_phys != 0 {
         CORE_PENDING_PML4.get(cid).store(0, Ordering::Relaxed);
-        // SAFETY: pml4_phys was the task's own PML4 frame; CR3 has since been
-        // switched away so no core's page-walker will read from it.
+        // SAFETY: pml4_phys was the task's own page-table root; CR3 has since been switched away so no
+        // core's page-walker will read from it. Arch-neutral root free (x86: free_frame; ARM: arena L1
+        // slot) - the deferred (self-kill) twin of the immediate free in the kill path.
         unsafe {
-            let frame = crate::memory::frame::Frame::from_phys(
-                crate::memory::frame::PhysAddr(pml4_phys)
-            );
-            crate::memory::allocator::free_frame(frame);
+            crate::arch::imp::page_tables::free_page_table_root(pml4_phys);
         }
     }
 }
@@ -2048,12 +2046,11 @@ pub fn kill_task_by_slot(slot: usize) {
                         CORE_PENDING_PML4.get(my_core).store(pml4_phys, Ordering::Release);
                     }
                 } else if pml4_phys != 0 {
-                    // Not a self-kill: no core holds this CR3, so free the PML4 root now.
-                    // (Same unsafe context as the old in-loop free_frame above.)
-                    let frame = crate::memory::frame::Frame::from_phys(
-                        crate::memory::frame::PhysAddr(pml4_phys)
-                    );
-                    crate::memory::allocator::free_frame(frame);
+                    // Not a self-kill: no core holds this CR3, so free the page-table root now. Arch-
+                    // neutral: on x86 the root is a general frame (free_frame); on ARM it is an arena L1
+                    // slot returned to the arena. Handing an ARM arena L1 to free_frame corrupted the
+                    // frame bitmap (the `alloc_frame returned kernel-range frame` panic).
+                    crate::arch::imp::page_tables::free_page_table_root(pml4_phys);
                 }
                 freed_frames = freed;
             } else {

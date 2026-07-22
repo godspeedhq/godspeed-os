@@ -288,6 +288,19 @@ pub unsafe fn write_page_table_base(base: u64) {
 /// `_cr3` is a service page-table root; this hook does nothing on x86.
 pub unsafe fn finalize_service_address_space(_cr3: u64) {}
 
+/// Free a dying task's page-table ROOT (its PML4). On x86 the root is an ordinary general-allocator
+/// frame, so this is exactly `free_frame` - the behaviour the neutral kill path had inline before it
+/// was made arch-neutral (ARM's root is an arena slot, freed differently; see `arch/arm/page_tables`).
+///
+/// # Safety
+/// `root` is a Dead task's PML4 physical address; no core will load this CR3 again (the neutral kill
+/// path defers this for the self-kill case via `CORE_PENDING_PML4`).
+pub unsafe fn free_page_table_root(root: u64) {
+    crate::memory::allocator::free_frame(crate::memory::frame::Frame::from_phys(
+        crate::memory::frame::PhysAddr(root),
+    ));
+}
+
 /// Invalidate a single TLB entry for `addr` on the local core (x86 invlpg; RISC-V sfence.vma, AArch64 TLBI).
 ///
 /// # Safety
