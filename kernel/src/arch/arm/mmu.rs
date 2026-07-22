@@ -179,10 +179,14 @@ pub fn map_framebuffer(base: u32, size: u32) {
         pa = pa.wrapping_add(SECTION_SIZE);
         if pa == 0 { break; } // wrapped past 4 GiB
     }
-    // SAFETY: publish the new descriptors to RAM (non-cacheable walks) and flush the TLB so the next
-    // framebuffer access uses them. `dsb`/`isb`/TLBIALL are PL1 barriers with no operand hazards.
+    // Publish the new descriptors to the Point of Coherency (RAM). The walker reads the table
+    // non-cacheable, PAST the A7's L2 cache, so a set/way L1 clean is NOT enough - the fb write faulted
+    // NOT-MAPPED because the new entries sat in L2. `clean_dcache` (DCCMVAC by MVA) reaches the PoC, the
+    // same publish `fill_kernel_identity` uses for its L1/L2 writes.
+    super::page_tables::clean_dcache(core::ptr::addr_of!(L1) as u32, 16384);
+    // SAFETY: flush the TLB so the next framebuffer access uses the new descriptors. `dsb`/`isb`/TLBIALL
+    // are PL1 barriers with no operand hazards.
     unsafe {
-        super::page_tables::clean_invalidate_dcache_all();
         core::arch::asm!(
             "dsb",
             "mcr p15, 0, {z}, c8, c7, 0", // TLBIALL

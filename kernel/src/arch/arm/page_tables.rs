@@ -203,7 +203,7 @@ fn free_l1(pa: u32) {
 /// it regardless. This is the same class as SEC-28 (DMA coherence): a second observer (here the walker)
 /// that does not go through the CPU's cache. Cortex-A7 lines are 64 bytes; a 32-byte stride is a safe
 /// lower bound.
-fn clean_dcache(addr: u32, len: u32) {
+pub(super) fn clean_dcache(addr: u32, len: u32) {
     let mut p = addr & !31;
     let end = addr + len;
     while p < end {
