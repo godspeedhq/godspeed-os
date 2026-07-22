@@ -409,6 +409,9 @@ fn poll_stage(setup_phys: u32, data_phys: u32, data_in: bool, dlen: usize) -> bo
             pl011_write(b" GHWCFG2="); write_hex32(rd(GHWCFG2));
             pl011_write(b" HCFG="); write_hex32(rd(HCFG));
             pl011_write(b" GNPTXSTS="); write_hex32(rd(0x02C));
+            let f1 = rd(0x408); spin(500_000); let f2 = rd(0x408); // HFNUM twice: is the host framing?
+            pl011_write(b" HFNUM1="); write_hex32(f1);
+            pl011_write(b" HFNUM2="); write_hex32(f2);
             pl011_write(b"\r\n");
             SM_STEP.store(STEP_FAILED, Ordering::Relaxed);
         }
