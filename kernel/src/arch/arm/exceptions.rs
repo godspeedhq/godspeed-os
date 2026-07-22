@@ -222,11 +222,27 @@ unsafe extern "C" fn stub_svc() {
 unsafe extern "C" fn stub_pabt() -> ! {
     core::arch::naked_asm!(
         "sub lr, lr, #4",              // prefetch abort: LR = faulting instr + 4
+        // Same fault-survival split as the data abort: a USER prefetch abort (a service branched to an
+        // address it cannot execute) kills just that task; a kernel prefetch abort reports and halts.
+        "mrs r0, spsr",
+        "and r0, r0, #0x1f",
+        "cmp r0, #0x10",              // USR mode?
+        "bne 1f",
+        "mov r1, lr",                 // fault pc
+        "mrc p15, 0, r2, c6, c0, 2",  // IFAR (fault address)
+        "cps #0x13",                  // -> SVC mode, the task's kernel stack
+        "mov r0, r1",
+        "mov r1, r2",
+        "bl {kill}",                  // kill_current + reschedule; NEVER returns
+        "b .",
+        "1:",
         "mov r0, #3",
         "mov r1, lr",
         "mrc p15, 0, r2, c5, c0, 1",   // IFSR
         "mrc p15, 0, r3, c6, c0, 2",   // IFAR
-        "b {rep}", rep = sym arm_exception_report,
+        "b {rep}",
+        kill = sym arm_user_fault_kill,
+        rep = sym arm_exception_report,
     )
 }
 
@@ -235,12 +251,56 @@ unsafe extern "C" fn stub_pabt() -> ! {
 unsafe extern "C" fn stub_dabt() -> ! {
     core::arch::naked_asm!(
         "sub lr, lr, #8",              // data abort: LR = faulting instr + 8
+        // Fault-survival: a USER-mode (PL0) fault is a misbehaving service - kill just that task and
+        // keep the kernel + every other task running (the x86 C2/A14/A15 property). A fault in any
+        // other mode is kernel code touching bad memory - a real kernel bug - so report and halt.
+        "mrs r0, spsr",               // the faulting context's CPSR
+        "and r0, r0, #0x1f",
+        "cmp r0, #0x10",              // 0x10 = USR mode?
+        "bne 1f",
+        // USER fault: capture (pc, addr) in low regs (they survive the mode switch - only sp/lr and the
+        // FIQ high regs are banked), switch to SVC on the faulting task's own kernel stack (IRQs stay
+        // masked from abort entry), and kill + reschedule. Never returns.
+        "mov r1, lr",                 // fault pc
+        "mrc p15, 0, r2, c6, c0, 0",  // DFAR (fault address)
+        "cps #0x13",                  // -> SVC mode, the task's kernel stack
+        "mov r0, r1",                 // arg0 = fault pc
+        "mov r1, r2",                 // arg1 = fault addr
+        "bl {kill}",                  // kill_current + switch to next task; NEVER returns
+        "b .",                        // guard: never reached
+        "1:",
+        // KERNEL fault: report + halt (real kernel bug).
         "mov r0, #4",
         "mov r1, lr",
         "mrc p15, 0, r2, c5, c0, 0",   // DFSR
         "mrc p15, 0, r3, c6, c0, 0",   // DFAR
-        "b {rep}", rep = sym arm_exception_report,
+        "b {rep}",
+        kill = sym arm_user_fault_kill,
+        rep = sym arm_exception_report,
     )
+}
+
+/// A USER-mode task took a data or prefetch abort: it touched memory it does not own. Kill just that
+/// task; the kernel and every other task keep running (§10.4 "a protection violation is unrecoverable -
+/// the service is terminated", and the C2/A14/A15 fault-kills-task-not-kernel property, now on ARM).
+///
+/// Reached from `stub_dabt`/`stub_pabt` already in SVC mode, on the faulting task's own kernel stack,
+/// with IRQs masked (abort entry). Never returns: `kill_current` sets the task Dead and switches to the
+/// next runnable task - `yield_current`'s Dead path saves the abandoned handler context to
+/// `CORE_DEAD_CTX` (not the task slot, so no use-after-free) and never resumes it.
+extern "C" fn arm_user_fault_kill(pc: u32, addr: u32) -> ! {
+    let slot = crate::task::scheduler::current_task_slot();
+    // Loud, never silent (invariant 12): the kill and where it faulted are visible.
+    crate::kprintln!(
+        "arm32: user task (slot {}) faulted at pc {:#010x}, addr {:#010x} - killing it; kernel continues",
+        slot, pc, addr
+    );
+    crate::task::kill_current();
+    // kill_current does not return for a Dead task; if it somehow does, halt rather than resume a corpse.
+    loop {
+        // SAFETY: WFI is always valid; halt rather than return into a dead task's context.
+        unsafe { core::arch::asm!("wfi") }
+    }
 }
 
 #[unsafe(naked)]

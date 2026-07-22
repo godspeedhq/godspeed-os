@@ -23,6 +23,20 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-22 - Fault-survival on ARM: kill the faulting task, keep the kernel alive (feat/pi2-arm32)
+
+The data/prefetch abort handlers went from report-and-halt to the x86 C2/A14/A15 property: a USER-mode
+(PL0) fault kills just that task and reschedules; a kernel fault still reports and halts. `stub_dabt` /
+`stub_pabt` now branch on the faulting mode (SPSR & 0x1f == 0x10) - no new `unsafe` (asm inside the
+existing naked blocks). The +1 is the `wfi` guard loop in the new `arm_user_fault_kill`, which calls the
+neutral `kill_current()` (sets the task Dead, `yield_current` switches to the next task). HW-verifiable;
+QEMU-proven: `spawn greet` (rigged to read address 0) -> "user task faulted ... killing it; kernel
+continues", and the shell + ping/pong keep running, no panic.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/exceptions.rs` | 23 -> 24 (+1) | `arm_user_fault_kill` (reached from the abort stubs in SVC mode on the faulting task's kernel stack) logs the kill loudly and calls `kill_current()`; the +1 is its `wfi` guard loop (kill_current does not return for a Dead task). |
+
 ## 2026-07-22 - SMP: cores 1-3 online on the Pi 2 (feat/pi2-arm32)
 
 Bring the other three Cortex-A7s online. All new `unsafe` is in the permitted `arch/arm/` layer (§18.1),
@@ -697,7 +711,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
 | arch/aarch64/mod.rs | 23 | permitted |
-| arch/arm/exceptions.rs | 23 | permitted |
+| arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
 | arch/arm/dtb.rs | 6 | permitted |
