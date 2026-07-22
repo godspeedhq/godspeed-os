@@ -31,6 +31,7 @@ IPC flowing, 0 faults. (Weak-memory-ordering hardening SEC-25..28 for real HW is
 
 | File | Change | Why |
 |------|--------|-----|
+| `arch/arm/mod.rs` | 33 -> 34 (+1) | Core-3-no-show diagnosis: a periodic re-`sev` in `smp_bringup`'s AP-ready wait (nudges a core that missed the wake event out of WFE). The +1 is the `dsb`/`sev` block. (Also added lock-free bring-up breadcrumbs via the existing `pl011_write_byte` - no new unsafe.) |
 | `arch/arm/mod.rs` | 26 -> 33 (+7) | `get_lapic_id` reads MPIDR (the core id - the linchpin for `current_core_id`); `ap_entry` (naked AP entry: HYP-drop, VFP, per-core stack); `ap_boot_main` (ACTLR.SMP + `mmu::enable_on_this_core` + vectors + timer, one asm block); `smp_bringup` (D-cache clean before release + per-core mailbox-3 SET write + `dsb`/`sev`). The `arm_ap_park` release loop is `global_asm!` (not counted as a Rust `unsafe` block). |
 | `arch/arm/mmu.rs` | 4 -> 6 (+2) | Split `enable` into `build_tables` + `enable_on_this_core` (a `pub unsafe fn`, +1) so each AP loads the SAME L1 into its TTBR0; core 0 calls it too. The register-write blocks are unchanged; the +2 is the new unsafe fn wrapper and core 0's call site. |
 | `arch/arm/exceptions.rs` | 21 -> 23 (+2) | `install_for_core(core)` gives each AP its OWN banked ABT/UND/IRQ/FIQ stacks (BSS `AP_MODE_STACKS`) instead of the shared linker-symbol stacks - two cores taking a timer IRQ at once would otherwise corrupt the one IRQ stack. The +2 are the raw-pointer stack-top computation and the VBAR/banked-SP asm block. |
@@ -711,7 +712,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 33 | permitted |
+| arch/arm/mod.rs | 34 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
 | arch/riscv64/mod.rs | 23 | permitted |
