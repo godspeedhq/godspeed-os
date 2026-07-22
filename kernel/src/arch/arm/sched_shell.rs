@@ -38,6 +38,15 @@ pub fn run(ram_end: u32, reserve_end: u32) -> ! {
     // (the deterministic end-of-boot signal it waits on).
     super::set_input_ready();
 
+    // Mask IRQs before arming the neutral scheduler and entering run(0). CRITICAL: once NEUTRAL_SCHED is
+    // set, the timer ISR preempts whatever core 0 is running - and here that is still THIS bootstrap, not
+    // a task. If the timer fires in the window between the store below and run(0) seeding the scheduler
+    // context, it preempts the bootstrap into `CORE_SCHED_CTX[0]` WITHOUT seeding its `cr3` (switch_context
+    // never saves cr3), leaving cr3=0. The first task that then blocks switches to that context, loads
+    // TTBR0=0, and wedges core 0 - the shell can never be rescheduled, so serial/keyboard input hangs.
+    // With IRQs masked, run(0) reaches its cr3 seeding uninterrupted; the scheduler loop re-enables IRQs
+    // once it switches to the first task.
+    super::irq::disable_interrupts();
     super::irq::NEUTRAL_SCHED.store(true, Ordering::Relaxed);
     pl011_write(b"sched-shell: entering scheduler::run(0) - type at the serial console for 'gsh> '.\r\n");
     crate::task::scheduler::run(0)

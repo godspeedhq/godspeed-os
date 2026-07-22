@@ -38,6 +38,10 @@ pub fn run(ram_end: u32, reserve_end: u32) -> ! {
     // UART is (arch-appropriate - readiness is not gated on a USB driver that does not exist here).
     super::set_input_ready();
 
+    // Mask IRQs before arming the neutral scheduler: the timer must not preempt this bootstrap into the
+    // scheduler context before run(0) seeds its cr3, or that context is left with TTBR0=0 and the first
+    // task to block wedges core 0. Same fix as sched_shell; the scheduler loop re-enables IRQs.
+    super::irq::disable_interrupts();
     super::irq::NEUTRAL_SCHED.store(true, Ordering::Relaxed);
     pl011_write(b"sched-supervisor: entering scheduler::run(0) - the supervisor now drives the boot.\r\n");
     crate::task::scheduler::run(0)
