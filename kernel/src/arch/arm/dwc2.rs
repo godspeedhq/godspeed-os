@@ -85,6 +85,11 @@ const HPRT_PRTSPD_SHIFT: u32 = 17;    // port speed (0=HS, 1=FS, 2=LS)
 const HPRT_PRTSPD_MASK:  u32 = 0b11 << HPRT_PRTSPD_SHIFT;
 /// The W1C change bits - preserve-by-masking-off on any HPRT write that is not clearing them.
 const HPRT_WC_BITS: u32 = HPRT_PRTCONNDET | HPRT_PRTENCHNG | HPRT_PRTOVRCHNG;
+/// Bits to mask OFF before ANY HPRT read-modify-write: the W1C change bits (above) AND PrtEna. PrtEna is
+/// write-1-to-DISABLE, so an RMW that reads the hardware-set PrtEna=1 and writes it back would disable the
+/// very port it just enabled (the SETUP then halts with ChHltd and zero bytes moved - HW-diagnosed on the
+/// Pi 2). No RMW here ever intends to disable the port, so PrtEna is always zeroed on write.
+const HPRT_RMW_CLEAR: u32 = HPRT_WC_BITS | HPRT_PRTENA;
 
 #[inline]
 fn rd(off: usize) -> u32 {
@@ -194,7 +199,7 @@ pub fn init() {
 
     // 6. Power the root port. Preserve the W1C change bits (mask them off so we do not clear pending
     //    connect/enable-change flags), then set PrtPwr.
-    let hprt = rd(HPRT) & !HPRT_WC_BITS;
+    let hprt = rd(HPRT) & !HPRT_RMW_CLEAR;
     if hprt & HPRT_PRTPWR == 0 {
         wr(HPRT, hprt | HPRT_PRTPWR);
     }
@@ -222,10 +227,10 @@ pub fn init() {
 /// answers on address 0). Assert PrtRst, hold ~50 ms, deassert, then wait for the hardware to set
 /// PrtEna. Reports the enabled speed - the handle a control transfer (increment 2) will use.
 fn reset_port() {
-    let base = rd(HPRT) & !HPRT_WC_BITS;
+    let base = rd(HPRT) & !HPRT_RMW_CLEAR;
     wr(HPRT, base | HPRT_PRTRST);
     spin(3_000_000); // ~50 ms of USB reset (generous; bounded)
-    let base = rd(HPRT) & !HPRT_WC_BITS;
+    let base = rd(HPRT) & !HPRT_RMW_CLEAR;
     wr(HPRT, base & !HPRT_PRTRST);
     spin(1_000_000); // recovery time before the port enables
 
@@ -238,8 +243,9 @@ fn reset_port() {
     pl011_write(b"dwc2: root port enabled after reset, ");
     pl011_write(speed_name(hprt).as_bytes());
     pl011_write(b"\r\n");
-    // Clear the connect/enable change flags now that we have acted on them (W1C: write 1s back).
-    wr(HPRT, (rd(HPRT) & !HPRT_WC_BITS) | HPRT_PRTCONNDET | HPRT_PRTENCHNG);
+    // Clear the connect/enable change flags now that we have acted on them (W1C: write 1s back). Mask
+    // PrtEna off (HPRT_RMW_CLEAR) so writing these change bits does not also disable the port.
+    wr(HPRT, (rd(HPRT) & !HPRT_RMW_CLEAR) | HPRT_PRTCONNDET | HPRT_PRTENCHNG);
     // Arm tick-driven enumeration (increment 2). We do NOT enumerate synchronously here: a control
     // transfer must let the controller's transactions run between our polls, which a boot-time busy-spin
     // never allows (QEMU advances the emulated core only on its event loop; hardware completes DMA in
