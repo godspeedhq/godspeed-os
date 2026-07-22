@@ -376,13 +376,14 @@ fn poll_stage(setup_phys: u32, data_phys: u32, data_in: bool, dlen: usize) -> bo
         if (nak || xacterr) && SM_RETRY.fetch_add(1, Ordering::Relaxed) < 200 {
             return true; // SM_RUNNING is false + stage unchanged, so next poll restarts this transaction
         }
-        pl011_write(b"dwc2: control transfer error HCINT=");
-        write_hex32(i);
-        pl011_write(b" step=");
-        write_hex32(SM_STEP.load(Ordering::Relaxed) as u32);
-        pl011_write(b" stage=");
-        write_hex32(SM_STAGE.load(Ordering::Relaxed) as u32);
-        pl011_write(b" - USB unavailable\r\n");
+        pl011_write(b"dwc2: xfer err HCINT="); write_hex32(i);
+        pl011_write(b" HCTSIZ="); write_hex32(rd(HCTSIZ0));
+        pl011_write(b" HCCHAR="); write_hex32(rd(HCCHAR0));
+        pl011_write(b" GINTSTS="); write_hex32(rd(GINTSTS));
+        pl011_write(b" HAINT="); write_hex32(rd(HAINT));
+        pl011_write(b" HPRT="); write_hex32(rd(HPRT));
+        pl011_write(b" step="); write_hex32(SM_STEP.load(Ordering::Relaxed) as u32);
+        pl011_write(b"\r\n");
         SM_STEP.store(STEP_FAILED, Ordering::Relaxed);
         return false;
     }
