@@ -265,6 +265,20 @@ extern "C" fn ap_boot_main(core_id: u32) -> ! {
     // Load the SAME L1 core 0 built: this core now sees the whole kernel address space.
     // SAFETY: core 0 finished build_tables and released us; every mapping is identity.
     unsafe { mmu::enable_on_this_core(); }
+    // Duplicate/mis-identified core guard. On the real Pi 2, releasing core 3 brought up a core whose
+    // MPIDR read back as 0 - it registered as a SECOND core 0, so two cores ran `scheduler::run(0)`,
+    // raced on core 0's state, and one crashed the boot. A core that finds its own id ALREADY ready is
+    // such a confused release: park it safely (it never double-registers or runs a second scheduler),
+    // and the system continues on the cores that came up cleanly. Vectors are installed, so it still
+    // reports a later fault loudly rather than wandering.
+    if crate::smp::core::is_ready(core_id) {
+        crate::kprintln!(
+            "smp: a released core reports id {} which is ALREADY ready - mis-identified, parking it", core_id);
+        loop {
+            // SAFETY: WFI is always valid; park this confused core instead of running it.
+            unsafe { core::arch::asm!("wfi") }
+        }
+    }
     // Register our id so the neutral current_core_id() resolves us, then start our own timer tick.
     crate::smp::core::set_core_lapic_id(core_id, core_id);
     irq::start_tick_ap(core_id);

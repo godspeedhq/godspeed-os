@@ -23,6 +23,17 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-22 - AP bring-up: park a mis-identified core (feat/pi2-arm32)
+
+Real Pi 2: releasing core 3 brought up a core whose MPIDR read back as 0 - it registered as a SECOND
+core 0, two cores ran scheduler::run(0), raced, and one crashed the boot (UNDEF halt). `ap_boot_main`
+now parks any core that finds its own id ALREADY ready (a confused/duplicate release), so the system
+boots reliably on the good cores. +1 unsafe: the `wfi` park loop.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 35 -> 36 (+1) | Park (`wfi`) a released AP whose id is already ready - the mis-identified-core guard. |
+
 ## 2026-07-22 - AP bring-up: vectors-first + barrier (feat/pi2-arm32)
 
 On real HW core 3's bring-up intermittently faulted BEFORE it installed its vectors, so with VBAR still 0
@@ -754,7 +765,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 35 | permitted |
+| arch/arm/mod.rs | 36 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
 | arch/riscv64/mod.rs | 23 | permitted |
