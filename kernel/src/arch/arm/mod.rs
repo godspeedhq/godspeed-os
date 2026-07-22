@@ -25,6 +25,7 @@ pub mod context_switch;
 pub mod page_tables;
 pub mod meminit;
 pub mod syscall;
+pub mod video;
 pub mod usermode;
 pub mod loadtest;
 pub mod spawn;
@@ -429,6 +430,13 @@ extern "C" fn arm_boot_main() -> ! {
     let ram_end = dtb::report_memory(mmu::FALLBACK_RAM_END);
     mmu::set_ram_end(ram_end);
     mmu::enable();
+    // Ask the GPU for a framebuffer and prove the display pipeline with a solid fill (Phase 1). A colour
+    // on the TV confirms the mailbox, the returned base/pitch, and the device mapping are all correct;
+    // text rendering layers on next. Serial stays the source of truth if there is no display.
+    if let Some(fb) = video::init(1024, 768) {
+        video::fill(&fb, video::rgb(0x18, 0x30, 0xA0)); // a clear blue - unmistakable on a working display
+        pl011_write(b"arm32: framebuffer filled (you should see a BLUE screen on the display)\r\n");
+    }
     timer::init();
     const TICK_HZ: u32 = 100; // 10 ms quantum, matching CLAUDE.md section 9.1
     if irq::start_tick(TICK_HZ) {

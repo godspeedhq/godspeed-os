@@ -23,6 +23,18 @@ SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this invento
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
 
+## 2026-07-22 - HDMI framebuffer on the Pi 2, Phase 1 (feat/pi2-arm32)
+
+Toward x86-parity local console. The ARM has no Limine to hand it a framebuffer, so `video.rs` asks the
+VideoCore GPU for one via the mailbox property interface, `mmu::map_framebuffer` maps it Device, and a
+solid fill proves the pipeline (QEMU screendump: a clean 1024x768 blue). New unsafe is the MMIO/mailbox
+and framebuffer writes (video.rs) and the live-L1 mapping + TLB flush (mmu.rs), both permitted `arch/`.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/video.rs` | new, 4 | VideoCore mailbox (Device MMIO), framebuffer writes, MBOX static access - the framebuffer acquisition + fill. |
+| `arch/arm/mmu.rs` | 6 -> 8 (+2) | `map_framebuffer`: write the framebuffer's Device sections into the live L1, then clean the D-cache + TLBIALL so the walker sees them. |
+
 ## 2026-07-22 - AP bring-up: park a mis-identified core (feat/pi2-arm32)
 
 Real Pi 2: releasing core 3 brought up a core whose MPIDR read back as 0 - it registered as a SECOND
@@ -756,7 +768,8 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/dtb.rs | 6 | permitted |
 | arch/arm/irq.rs | 11 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
-| arch/arm/mmu.rs | 6 | permitted |
+| arch/arm/mmu.rs | 8 | permitted |
+| arch/arm/video.rs | 4 | permitted |
 | arch/arm/page_tables.rs | 27 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |

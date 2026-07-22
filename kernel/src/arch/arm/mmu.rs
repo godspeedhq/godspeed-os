@@ -162,6 +162,36 @@ fn translate(va: u32) -> Option<u32> {
 ///
 /// Identity mapping is what makes this survivable - PC, SP and VBAR all mean the same thing on both
 /// sides of the switch.
+/// Map the GPU framebuffer region `[base, base+size)` as Device memory in the LIVE kernel L1, so ARM
+/// writes to it reach the display. The framebuffer sits in the gap between usable RAM and the
+/// peripherals, which `build_tables` leaves unmapped, so it must be added after the fact. Rounds to the
+/// enclosing 1 MiB sections. Runs after the MMU + caches are on, so the new descriptors are cleaned to
+/// RAM (the walker reads the table non-cacheable) and the TLB is flushed.
+pub fn map_framebuffer(base: u32, size: u32) {
+    // SAFETY: `L1` is the live kernel table; we add previously-empty (unmapped-gap) entries, so no
+    // running mapping is disturbed. Single writer on this boot path.
+    let l1 = unsafe { &mut *core::ptr::addr_of_mut!(L1) };
+    let start = base & !(SECTION_SIZE - 1);
+    let end   = base.saturating_add(size).saturating_add(SECTION_SIZE - 1) & !(SECTION_SIZE - 1);
+    let mut pa = start;
+    while pa < end {
+        l1.0[(pa / SECTION_SIZE) as usize] = section(pa, /*device=*/true, /*execute=*/false);
+        pa = pa.wrapping_add(SECTION_SIZE);
+        if pa == 0 { break; } // wrapped past 4 GiB
+    }
+    // SAFETY: publish the new descriptors to RAM (non-cacheable walks) and flush the TLB so the next
+    // framebuffer access uses them. `dsb`/`isb`/TLBIALL are PL1 barriers with no operand hazards.
+    unsafe {
+        super::page_tables::clean_invalidate_dcache_all();
+        core::arch::asm!(
+            "dsb",
+            "mcr p15, 0, {z}, c8, c7, 0", // TLBIALL
+            "dsb", "isb",
+            z = in(reg) 0u32, options(nostack),
+        );
+    }
+}
+
 pub fn enable() {
     build_tables();
     // SAFETY: core 0, tables just built; enables translation + caches on this core.
