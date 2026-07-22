@@ -366,7 +366,14 @@ fn poll_stage(setup_phys: u32, data_phys: u32, data_in: bool, dlen: usize) -> bo
     if i & HCINT_CHHLTD == 0 {
         // Still in flight. Give the controller more ticks; fail loudly if it never completes.
         if SM_TICKS.fetch_add(1, Ordering::Relaxed) > 1000 {
-            pl011_write(b"dwc2: enumeration stalled (channel never halted) - USB unavailable\r\n");
+            pl011_write(b"dwc2: stalled HCINT="); write_hex32(i);
+            pl011_write(b" HCCHAR="); write_hex32(rd(HCCHAR0));
+            pl011_write(b" HCTSIZ="); write_hex32(rd(HCTSIZ0));
+            pl011_write(b" HCDMA="); write_hex32(rd(HCDMA0));
+            pl011_write(b" GAHBCFG="); write_hex32(rd(GAHBCFG));
+            pl011_write(b" GINTSTS="); write_hex32(rd(GINTSTS));
+            pl011_write(b" HPRT="); write_hex32(rd(HPRT));
+            pl011_write(b"\r\n");
             SM_STEP.store(STEP_FAILED, Ordering::Relaxed);
         }
         return true;
