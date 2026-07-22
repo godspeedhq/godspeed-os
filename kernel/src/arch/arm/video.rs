@@ -64,6 +64,28 @@ fn mbox_call(channel: u32) -> bool {
     }
 }
 
+/// Ask the GPU for the display's native (physical) resolution, so the framebuffer can be requested at
+/// exactly that size and fill the screen - no pillarbox bars. `None` (fall back to a default) if the
+/// query fails or returns nothing. Runs with the MMU + caches OFF, like `request`.
+pub fn query_display_size() -> Option<(u32, u32)> {
+    // SAFETY: single-threaded, caches-off boot; MBOX filled then read here only.
+    unsafe {
+        let b = &mut (*core::ptr::addr_of_mut!(MBOX)).data;
+        *b = [0; 36];
+        b[0] = 8 * 4; b[1] = 0;
+        b[2] = 0x0004_0003; b[3] = 8; b[4] = 0; b[5] = 0; b[6] = 0; // get physical (display) W/H
+        b[7] = 0; // end tag
+    }
+    if !mbox_call(CHANNEL_PROP) {
+        return None;
+    }
+    let (w, h) = unsafe { let b = &(*core::ptr::addr_of!(MBOX)).data; (b[5], b[6]) };
+    if w == 0 || h == 0 || w > 4096 || h > 4096 {
+        return None;
+    }
+    Some((w, h))
+}
+
 /// Ask the GPU for a 32-bpp framebuffer at `width` x `height` and return its descriptor. `None`
 /// (logged) if the mailbox call fails or returns nothing. **Must run with the MMU + caches OFF** (before
 /// `mmu::enable`) so the mailbox exchange is coherent with the GPU; the framebuffer is mapped and drawn

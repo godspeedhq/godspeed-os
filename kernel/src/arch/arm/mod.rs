@@ -434,8 +434,10 @@ extern "C" fn arm_boot_main() -> ! {
     mmu::set_ram_end(ram_end);
     // Ask the GPU for a framebuffer BEFORE turning the MMU + caches on: the mailbox exchange is only
     // coherent with the GPU while the ARM caches are off (on real silicon the reply comes back through
-    // the A7's L2, which an L1 clean does not reach). Get the descriptor now; map + fill after `enable`.
-    let fb = video::request(1024, 768);
+    // the A7's L2, which an L1 clean does not reach). Request the display's NATIVE resolution so the
+    // framebuffer fills the screen (no pillarbox bars); fall back to 1280x720 if the query fails.
+    let (fbw, fbh) = video::query_display_size().unwrap_or((1280, 720));
+    let fb = video::request(fbw, fbh);
     mmu::enable();
     // Map the framebuffer and bring up the text console over it, so the boot log + shell prompt appear
     // on the TV (mirrored from serial). Everything logged from here on shows on the display.
