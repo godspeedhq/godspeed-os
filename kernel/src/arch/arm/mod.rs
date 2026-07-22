@@ -271,6 +271,11 @@ extern "C" fn ap_boot_main(core_id: u32) -> ! {
 /// `mark_ready`. A core that never answers is left not-ready (§11.3 "continue with available cores");
 /// placement to it then fails gracefully and services fall back to core 0.
 pub fn smp_bringup() {
+    // From here more than one core writes the UART, and core 0's MMU + caches + ACTLR.SMP are all on
+    // (arm_boot_main ran long ago), so the serial guard's exclusive access is now sound. Enable it
+    // BEFORE releasing any AP, so the very first concurrent write is already serialized.
+    SERIAL_SMP.store(true, core::sync::atomic::Ordering::Release);
+
     // Publish everything core 0 wrote (L1 tables, scheduler arenas) before the APs - which start with
     // caches OFF, reading physical memory directly - can observe it.
     // SAFETY: a set/way clean+invalidate of core 0's D-cache; valid at PL1, no operands.
@@ -327,13 +332,29 @@ pub(super) fn pl011_write_byte(b: u8) {
 /// write that interrupts a holder on the same core, is never lost or deadlocked (it may rarely interleave).
 static SERIAL_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// True once `smp_bringup` is about to run more than one core. The serial guard uses `compare_exchange`
+/// (LDREX/STREX), and on ARMv7 an EXCLUSIVE access before the MMU + caches + ACTLR.SMP are enabled is
+/// architecturally UNPREDICTABLE (it faults/hangs - the same hazard that once wedged the cap-table
+/// spinlock). Every boot message before `smp_bringup` runs on core 0 alone, with the MMU possibly still
+/// off, so those writes MUST stay lock-free. Once this is set (inside `smp_bringup`, well after
+/// `mmu::enable` and ACTLR.SMP), the exclusive is sound and needed. A plain atomic LOAD of this flag is
+/// a bare `LDR` (not LDREX), which is safe pre-MMU.
+pub(super) static SERIAL_SMP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Cap on the acquire spin (~one full serial line at 115200 baud). A waiter that exceeds it writes
 /// anyway rather than block forever - the only correct choice for a UART also used by the fault handler.
 const SERIAL_ACQUIRE_SPINS: u32 = 20_000_000;
 
 pub(super) fn pl011_write(s: &[u8]) {
     use core::sync::atomic::Ordering;
-    // Try to claim the UART (bounded), then write, then release only if we claimed it.
+    // Pre-SMP (or the boot core alone): no contention, and LDREX/STREX are unsafe before the MMU is on.
+    // Write lock-free.
+    if !SERIAL_SMP.load(Ordering::Relaxed) {
+        for &b in s { pl011_write_byte(b); }
+        return;
+    }
+    // SMP is live: serialize across cores. Try to claim the UART (bounded), write, then release only if
+    // we claimed it - a fault-time / heavily-contended write is never lost or deadlocked.
     let mut held = false;
     let mut spins: u32 = 0;
     while SERIAL_BUSY.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
