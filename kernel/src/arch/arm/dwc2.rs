@@ -399,6 +399,10 @@ fn poll_stage(setup_phys: u32, data_phys: u32, data_in: bool, dlen: usize) -> bo
             pl011_write(b" GAHBCFG="); write_hex32(rd(GAHBCFG));
             pl011_write(b" GINTSTS="); write_hex32(rd(GINTSTS));
             pl011_write(b" HPRT="); write_hex32(rd(HPRT));
+            pl011_write(b" GUSBCFG="); write_hex32(rd(GUSBCFG));
+            pl011_write(b" GHWCFG2="); write_hex32(rd(GHWCFG2));
+            pl011_write(b" HCFG="); write_hex32(rd(HCFG));
+            pl011_write(b" GNPTXSTS="); write_hex32(rd(0x02C));
             pl011_write(b"\r\n");
             SM_STEP.store(STEP_FAILED, Ordering::Relaxed);
         }
