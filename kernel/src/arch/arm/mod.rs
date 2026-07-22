@@ -683,6 +683,15 @@ pub fn autochaos_tick() {
 /// `timer_tick_from_irq` (core 0).
 pub fn uart_rx_poll() {
     pl011_rx_drain();
+    // Advance USB enumeration one transaction per tick, on core 0 only (it is the single writer of the
+    // DWC2 channel + DMA buffer). Reached both from the Core-0 tick and from the idle loop; the MPIDR
+    // gate keeps an AP that idles here from racing core 0 on the controller.
+    {
+        let mpidr: u32;
+        // SAFETY: reading MPIDR (`c0, c0, 5`) is a side-effect-free PL1 register read.
+        unsafe { core::arch::asm!("mrc p15, 0, {m}, c0, c0, 5", m = out(reg) mpidr, options(nomem, nostack)); }
+        if mpidr & 3 == 0 { dwc2::poll(); }
+    }
     if RX_HEAD.load(Ordering::Acquire) != RX_TAIL.load(Ordering::Acquire) {
         let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
         if waiter != u32::MAX {

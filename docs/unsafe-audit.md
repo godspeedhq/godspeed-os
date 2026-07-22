@@ -24,7 +24,8 @@ GSNPSID=0x4f54294a, device detected + port enabled at full-speed.
 
 | File | Change | Why |
 |------|--------|-----|
-| `arch/arm/dwc2.rs` | new, 3 -> 6 | `rd`/`wr` (DWC2 Device MMIO 32-bit accessors) + `spin` (`nop` delay) for bring-up; increment 2 adds `flush_dcache` (DCCIMVAC + `dsb` - the DMA cache-coherency bracket, 2) and `control_xfer`'s access to the `DMA` scratch static (identity-mapped physical buffer, 1). |
+| `arch/arm/dwc2.rs` | new, 3 -> 8 | `rd`/`wr` (DWC2 Device MMIO 32-bit accessors) + `spin` (`nop` delay) for bring-up; increment 2 adds `flush_dcache` (DCCIMVAC + `dsb` - the DMA cache-coherency bracket, 2) and, in the tick-driven state machine, `poll_inner` + the two step-completion handlers' access to the `DMA` scratch static (identity-mapped physical buffer, 3). |
+| `arch/arm/mod.rs` | 38 -> 39 (+1) | `uart_rx_poll` reads MPIDR to gate the USB `dwc2::poll()` to core 0 (it is the single writer of the DWC2 channel + DMA). |
 
 ## 2026-07-22 - ARM serial input works: idle + scheduler-context fixes (feat/pi2-arm32)
 
@@ -807,7 +808,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 6 | permitted |
 | arch/arm/fbcon.rs | 4 | permitted |
-| arch/arm/dwc2.rs | 6 | permitted |
+| arch/arm/dwc2.rs | 8 | permitted |
 | arch/arm/page_tables.rs | 27 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |
@@ -816,7 +817,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 38 | permitted |
+| arch/arm/mod.rs | 39 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
 | arch/riscv64/mod.rs | 23 | permitted |

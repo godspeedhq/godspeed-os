@@ -18,6 +18,8 @@
 //! reached only after enumerating that hub (a later increment). Under QEMU (`-M raspi2b,usb=on -device
 //! usb-kbd`) the keyboard attaches to the root port directly, which is what this increment detects.
 
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+
 use super::pl011_write;
 use super::exceptions::write_hex32;
 
@@ -184,6 +186,11 @@ pub fn init() {
     wr(HCINTMSK0, 0x7FF);   // all channel-0 interrupt sources
     wr(HAINTMSK, 0xFFFF);   // all channels
     wr(GINTMSK, (1 << 25) | (1 << 24)); // Hchint (host channel) + Prtint (port)
+    // 5e. Host PHY clock select: for a full/low-speed device the PHY runs at 48 MHz (FSLSPClkSel=1);
+    //     leaving it 0 (30/60 MHz HS clock) makes the SOF/transaction timing wrong for an FS keyboard.
+    wr(HCFG, (rd(HCFG) & !0b11) | 1);
+    // Ack any pending core interrupts (a stuck SOF/port flag can stall the emulated frame machine).
+    wr(GINTSTS, 0xFFFF_FFFF);
 
     // 6. Power the root port. Preserve the W1C change bits (mask them off so we do not clear pending
     //    connect/enable-change flags), then set PrtPwr.
@@ -233,13 +240,24 @@ fn reset_port() {
     pl011_write(b"\r\n");
     // Clear the connect/enable change flags now that we have acted on them (W1C: write 1s back).
     wr(HPRT, (rd(HPRT) & !HPRT_WC_BITS) | HPRT_PRTCONNDET | HPRT_PRTENCHNG);
-    // Increment 2: enumerate the attached device over EP0 (control transfers).
-    let low_speed = (hprt & HPRT_PRTSPD_MASK) >> HPRT_PRTSPD_SHIFT == 2;
-    enumerate(low_speed);
+    // Arm tick-driven enumeration (increment 2). We do NOT enumerate synchronously here: a control
+    // transfer must let the controller's transactions run between our polls, which a boot-time busy-spin
+    // never allows (QEMU advances the emulated core only on its event loop; hardware completes DMA in
+    // silicon but our poll would still hog the CPU). `poll()`, called from the timer tick, drives the
+    // state machine one transaction per tick, so the idle WFI between ticks gives the controller time.
+    LOW_SPEED.store((hprt & HPRT_PRTSPD_MASK) >> HPRT_PRTSPD_SHIFT == 2, Ordering::Relaxed);
+    SM_ACTIVE.store(true, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------
-// Increment 2: control transfers via host channel 0.
+// Increment 2: tick-driven control-transfer state machine.
+//
+// A control transfer is SETUP -> (DATA) -> STATUS, each stage one host-channel transaction. Rather than
+// busy-spin for each transaction to complete (which never yields to the emulated controller's event
+// loop, and would hog the CPU on hardware too), `poll()` - called from the timer tick - advances ONE
+// transaction per invocation: it starts a stage, then on later ticks checks whether the channel halted.
+// The idle WFI between ticks lets the controller run. This is the in-kernel-polled design the module
+// header promises.
 // ---------------------------------------------------------------------------
 
 // HCTSIZ PIDs
@@ -248,20 +266,19 @@ const PID_SETUP: u32 = 3;
 // HCINT bits
 const HCINT_XFERCOMPL: u32 = 1 << 0;
 const HCINT_CHHLTD:    u32 = 1 << 1;
-const HCINT_STALL:     u32 = 1 << 3;
 
 /// DMA scratch buffers. Static, so they live in identity-mapped kernel RAM (VA == PA - the DWC2 DMA
 /// engine takes a physical address, and the kernel identity map makes the static's address usable
-/// directly). Cacheable, so `flush_dcache` cleans+invalidates around every transfer: the A7's DMA is
-/// NOT cache-coherent, so without this the device would read stale bytes (OUT) or the CPU would read a
-/// stale cache line instead of what the device just wrote (IN).
+/// directly). Cacheable, so `flush_dcache` cleans+invalidates around every transfer: the A7's DMA is NOT
+/// cache-coherent, so without this the device would read stale bytes (OUT) or the CPU would read a stale
+/// cache line instead of what the device just wrote (IN).
 #[repr(C, align(64))]
 struct DmaBuf { setup: [u8; 8], data: [u8; 256] }
 static mut DMA: DmaBuf = DmaBuf { setup: [0; 8], data: [0; 256] };
 
 /// Clean+invalidate a cache-line range to the PoC (DCCIMVAC) - the DMA-coherency bracket. Clean pushes
-/// any dirty CPU write out to RAM (so the device sees it); invalidate drops the line (so a later CPU
-/// read re-fetches what the device wrote). Correct for both directions, so used before AND after DMA.
+/// any dirty CPU write out to RAM (so the device sees it); invalidate drops the line (so a later CPU read
+/// re-fetches what the device wrote). Correct for both directions, so used before AND after DMA.
 fn flush_dcache(addr: u32, len: u32) {
     let mut p = addr & !31;
     let end = addr.wrapping_add(len);
@@ -274,106 +291,150 @@ fn flush_dcache(addr: u32, len: u32) {
     unsafe { core::arch::asm!("dsb", options(nostack)); }
 }
 
-/// Run one transaction on channel 0 and wait (bounded) for it to halt. Returns bytes transferred, or
-/// Err on stall/error/timeout. `buf_phys` is a physical address already flushed by the caller.
-fn channel_xfer(dir_in: bool, ep_type: u32, pid: u32, buf_phys: u32, len: u32, mps: u32,
-                dev_addr: u32, low_speed: bool) -> Result<u32, ()> {
+// --- State machine state (core 0 only touches these) ---
+static SM_ACTIVE:  AtomicBool = AtomicBool::new(false); // a device is present + enumeration is armed
+static LOW_SPEED:  AtomicBool = AtomicBool::new(false); // attached device is low-speed
+static SM_STEP:    AtomicU8   = AtomicU8::new(0);       // enumeration step (see step_setup)
+static SM_STAGE:   AtomicU8   = AtomicU8::new(0);       // 0=SETUP, 1=DATA, 2=STATUS
+static SM_RUNNING: AtomicBool = AtomicBool::new(false); // a channel transaction is in flight
+static SM_TICKS:   AtomicU32  = AtomicU32::new(0);      // watchdog: ticks the current stage has waited
+static DEV_ADDR:   AtomicU8   = AtomicU8::new(0);       // 0 until SET_ADDRESS assigns 1
+static MPS0:       AtomicU8   = AtomicU8::new(8);       // EP0 max packet size (8 until GET_DESCRIPTOR)
+
+// Enumeration steps. `done` marks enumeration complete; 255 marks a failure. Increment 2 stops after
+// reading the device descriptor (proof the transfers work); increment 3 adds SET_CONFIGURATION +
+// SET_PROTOCOL, increment 4 the interrupt-endpoint HID poll.
+const STEP_GET_DESC8:  u8 = 0; // GET_DESCRIPTOR(device, 8) -> learn EP0 max packet size
+const STEP_SET_ADDR:   u8 = 1; // SET_ADDRESS(1)
+const STEP_GET_DESC18: u8 = 2; // GET_DESCRIPTOR(device, 18) @ addr 1 -> VID/PID
+const STEP_DONE:       u8 = 3;
+const STEP_FAILED:     u8 = 255;
+
+/// The SETUP packet + data direction + data length for a step. `data_in`/`dlen` describe the DATA stage
+/// (dlen 0 = no DATA stage - the STATUS goes IN).
+fn step_setup(step: u8) -> ([u8; 8], bool, usize) {
+    match step {
+        STEP_GET_DESC8  => ([0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 8, 0x00], true, 8),
+        STEP_SET_ADDR   => ([0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00], false, 0),
+        STEP_GET_DESC18 => ([0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00], true, 18),
+        _               => ([0; 8], false, 0),
+    }
+}
+
+/// Start one channel-0 transaction (non-blocking - just enables the channel; completion is polled).
+fn channel_start(dir_in: bool, pid: u32, buf_phys: u32, len: u32) {
+    let mps = MPS0.load(Ordering::Relaxed) as u32;
+    let dev_addr = DEV_ADDR.load(Ordering::Relaxed) as u32;
+    let low_speed = LOW_SPEED.load(Ordering::Relaxed) as u32;
     let pkts = if len == 0 { 1 } else { (len + mps - 1) / mps };
     wr(HCINT0, 0xFFFF_FFFF);                                    // clear stale channel interrupts
     wr(HCTSIZ0, (len & 0x7_FFFF) | (pkts << 19) | (pid << 29)); // size, packet count, PID
     wr(HCDMA0, buf_phys);
-    let chan = (mps & 0x7FF)
-        | (0 << 11)                        // endpoint 0 (control)
-        | ((dir_in as u32) << 15)          // direction
-        | ((low_speed as u32) << 17)       // low-speed device flag
-        | (ep_type << 18)                  // endpoint type (0 = control)
-        | (1 << 20)                        // multi-count = 1
-        | ((dev_addr & 0x7F) << 22)        // device address
-        | (1 << 31);                       // channel enable
-    wr(HCCHAR0, chan);
-    let mut waited = 0u32;
-    loop {
-        let i = rd(HCINT0);
-        if i & HCINT_CHHLTD != 0 {
-            if i & HCINT_XFERCOMPL != 0 {
-                return Ok(len - (rd(HCTSIZ0) & 0x7_FFFF)); // remaining size -> transferred
-            }
-            return Err(()); // stalled / xact error / babble
+    wr(HCCHAR0, (mps & 0x7FF)
+        | ((dir_in as u32) << 15)
+        | (low_speed << 17)
+        | (1 << 20)                        // multi-count = 1; endpoint 0 + control type are the zero fields
+        | ((dev_addr & 0x7F) << 22)
+        | (1 << 31));                      // channel enable
+}
+
+/// Poll the current stage: start it if idle, else check the channel. Returns true while still busy with
+/// this step, false when the step is complete (or on failure, which sets SM_STEP = STEP_FAILED).
+fn poll_stage(setup_phys: u32, data_phys: u32, data_in: bool, dlen: usize) -> bool {
+    if !SM_RUNNING.load(Ordering::Relaxed) {
+        match SM_STAGE.load(Ordering::Relaxed) {
+            0 => channel_start(false, PID_SETUP, setup_phys, 8),            // SETUP (always 8, OUT)
+            1 => channel_start(data_in, PID_DATA1, data_phys, dlen as u32), // DATA (OUT already flushed)
+            _ => channel_start(!data_in, PID_DATA1, data_phys, 0),          // STATUS (opposite dir, 0 len)
         }
-        waited += 1;
-        if waited > 300_000 {
-            // Bounded so a stuck transfer never wedges boot. Under QEMU the channel enables (ChEna=1)
-            // but never completes here because the emulated controller advances transactions on its
-            // event loop, which a synchronous boot-time busy-spin never yields to - hence the planned
-            // move to tick-driven enumeration (see the module header). On hardware the DMA completes in
-            // silicon and this path succeeds.
-            let _ = (HCINT_STALL, HAINT, HCDMA0);
-            return Err(());
+        SM_RUNNING.store(true, Ordering::Relaxed);
+        SM_TICKS.store(0, Ordering::Relaxed);
+        return true;
+    }
+    let i = rd(HCINT0);
+    if i & HCINT_CHHLTD == 0 {
+        // Still in flight. Give the controller more ticks; fail loudly if it never completes.
+        if SM_TICKS.fetch_add(1, Ordering::Relaxed) > 1000 {
+            pl011_write(b"dwc2: enumeration stalled (channel never halted) - USB unavailable\r\n");
+            SM_STEP.store(STEP_FAILED, Ordering::Relaxed);
         }
+        return true;
+    }
+    SM_RUNNING.store(false, Ordering::Relaxed);
+    if i & HCINT_XFERCOMPL == 0 {
+        pl011_write(b"dwc2: control transfer error - USB unavailable\r\n");
+        SM_STEP.store(STEP_FAILED, Ordering::Relaxed);
+        return false;
+    }
+    match SM_STAGE.load(Ordering::Relaxed) {
+        0 => { SM_STAGE.store(if dlen > 0 { 1 } else { 2 }, Ordering::Relaxed); true }
+        1 => {
+            if data_in { flush_dcache(data_phys, dlen as u32); } // publish device-written bytes to the CPU
+            SM_STAGE.store(2, Ordering::Relaxed);
+            true
+        }
+        _ => { SM_STAGE.store(0, Ordering::Relaxed); false } // STATUS done -> step complete
     }
 }
 
-/// A full control transfer: SETUP stage, optional DATA stage, then the zero-length STATUS stage in the
-/// opposite direction. `data` is filled (IN) or sent (OUT). Address 0 + mps 8 is the pre-SET_ADDRESS
-/// default a device answers on.
-fn control_xfer(setup: &[u8; 8], data: &mut [u8], data_in: bool, mps: u32, dev_addr: u32,
-                low_speed: bool) -> Result<(), ()> {
-    // SAFETY: single-threaded USB bring-up; DMA is touched only here, and only while no channel is
-    // running (each `channel_xfer` completes before the next stage). `addr_of` gives the identity-mapped
-    // physical address the DMA engine uses.
-    unsafe {
+static POLL_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Advance the enumeration by (at most) one transaction. Called from the Core-0 timer tick AND the Core-0
+/// idle loop; a re-entry guard stops the tick (which can preempt the idle mid-poll) from racing the
+/// state machine on the same core.
+pub fn poll() {
+    if POLL_BUSY.swap(true, Ordering::Acquire) { return; }
+    poll_inner();
+    POLL_BUSY.store(false, Ordering::Release);
+}
+
+/// Between calls the core idles (WFI), which is what lets the controller run its transactions.
+fn poll_inner() {
+    if !SM_ACTIVE.load(Ordering::Acquire) { return; }
+    let step = SM_STEP.load(Ordering::Relaxed);
+    if step >= STEP_DONE { return; }
+
+    let (setup, data_in, dlen) = step_setup(step);
+    // SAFETY: DMA is a static touched only here on core 0; `addr_of` yields its identity-mapped physical
+    // address. The SETUP / OUT-DATA buffer is filled + flushed only while no channel is running
+    // (SM_RUNNING gates that), so the DMA engine never reads a half-written buffer.
+    let still_busy = unsafe {
         let d = &mut *core::ptr::addr_of_mut!(DMA);
         let setup_phys = core::ptr::addr_of!(d.setup) as u32;
         let data_phys = core::ptr::addr_of!(d.data) as u32;
-
-        d.setup.copy_from_slice(setup);
-        flush_dcache(setup_phys, 8);
-        channel_xfer(false, 0, PID_SETUP, setup_phys, 8, mps, dev_addr, low_speed)?;
-
-        let dlen = data.len();
-        if dlen > 0 {
-            if data_in {
-                channel_xfer(true, 0, PID_DATA1, data_phys, dlen as u32, mps, dev_addr, low_speed)?;
-                flush_dcache(data_phys, dlen as u32);
-                data.copy_from_slice(&d.data[..dlen]);
-            } else {
-                d.data[..dlen].copy_from_slice(data);
-                flush_dcache(data_phys, dlen as u32);
-                channel_xfer(false, 0, PID_DATA1, data_phys, dlen as u32, mps, dev_addr, low_speed)?;
+        if !SM_RUNNING.load(Ordering::Relaxed) {
+            match SM_STAGE.load(Ordering::Relaxed) {
+                0 => { d.setup.copy_from_slice(&setup); flush_dcache(setup_phys, 8); }
+                1 if !data_in => flush_dcache(data_phys, dlen as u32), // (OUT payload would be filled here)
+                _ => {}
             }
         }
-        // STATUS stage: zero-length, opposite direction (IN transfer -> OUT status, and vice versa).
-        channel_xfer(!data_in, 0, PID_DATA1, data_phys, 0, mps, dev_addr, low_speed)?;
-        Ok(())
-    }
-}
+        poll_stage(setup_phys, data_phys, data_in, dlen)
+    };
+    if still_busy { return; }
 
-/// Increment 2: read the attached device's descriptor over EP0 and report it - proof that control
-/// transfers work end to end. (SET_ADDRESS + configuration + HID setup are increment 3.)
-fn enumerate(low_speed: bool) {
-    // GET_DESCRIPTOR(Device), first 8 bytes, to learn bMaxPacketSize0 (byte 7).
-    let setup8 = [0x80u8, 0x06, 0x00, 0x01, 0x00, 0x00, 8, 0x00];
-    let mut head = [0u8; 8];
-    if control_xfer(&setup8, &mut head, true, 8, 0, low_speed).is_err() {
-        pl011_write(b"dwc2: GET_DESCRIPTOR(device) failed - control transfers not working\r\n");
-        return;
+    // Step just completed - consume its result and advance.
+    match step {
+        STEP_GET_DESC8 => {
+            // SAFETY: read the invalidated device-descriptor bytes the DMA delivered.
+            let mps = unsafe { (*core::ptr::addr_of!(DMA)).data[7] };
+            MPS0.store(if mps == 0 { 8 } else { mps }, Ordering::Relaxed);
+        }
+        STEP_SET_ADDR => DEV_ADDR.store(1, Ordering::Relaxed),
+        STEP_GET_DESC18 => {
+            // SAFETY: read the invalidated 18-byte device descriptor.
+            let d = unsafe { (*core::ptr::addr_of!(DMA)).data };
+            let vid = (d[8] as u32) | ((d[9] as u32) << 8);
+            let pid = (d[10] as u32) | ((d[11] as u32) << 8);
+            pl011_write(b"dwc2: enumerated device VID:PID=");
+            write_hex32((vid << 16) | pid);
+            pl011_write(b" class=");
+            write_hex32(d[4] as u32);
+            pl011_write(b" mps0=");
+            write_hex32(MPS0.load(Ordering::Relaxed) as u32);
+            pl011_write(b" - control transfers work (tick-driven)\r\n");
+        }
+        _ => {}
     }
-    let mps0 = (head[7] as u32).max(8);
-    // Full 18-byte device descriptor (now with the real max packet size).
-    let setup18 = [0x80u8, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00];
-    let mut desc = [0u8; 18];
-    if control_xfer(&setup18, &mut desc, true, mps0, 0, low_speed).is_err() {
-        pl011_write(b"dwc2: GET_DESCRIPTOR(device, full) failed\r\n");
-        return;
-    }
-    let vid = (desc[8] as u32) | ((desc[9] as u32) << 8);
-    let pid = (desc[10] as u32) | ((desc[11] as u32) << 8);
-    pl011_write(b"dwc2: enumerated device VID:PID=");
-    write_hex32((vid << 16) | pid);
-    pl011_write(b" class=");
-    write_hex32(desc[4] as u32);
-    pl011_write(b" mps0=");
-    write_hex32(mps0);
-    pl011_write(b" - control transfers work\r\n");
+    SM_STEP.store(step + 1, Ordering::Relaxed);
 }
-
