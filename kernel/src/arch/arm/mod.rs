@@ -852,10 +852,23 @@ pub mod interrupts {
         }
     }
 
-    /// Wait for an interrupt (`wfi`) - the idle primitive.
+    /// Wait for an interrupt - the idle primitive. **Enables IRQs, then `wfi`**, the ARM twin of x86's
+    /// `sti; hlt`. This is load-bearing: the scheduler reaches here from a task that BLOCKED inside a
+    /// syscall (the shell in `console_read`), and syscall entry masked IRQs (`cpsid i`). A bare `wfi`
+    /// would idle with IRQs still masked, so the timer ISR could never fire - nothing would drain the
+    /// UART RX or reschedule the woken task, and serial input would hang forever (exactly the bug this
+    /// fixes). `cpsie i` unmasks so the timer wakes the core and runs the tick; the woken task's own
+    /// saved CPSR is restored by `switch_context`, so it resumes with the IRQ state it had.
     pub fn wait_for_interrupt() {
-        // SAFETY: WFI is always valid; the timer IRQ (or any) wakes the core.
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) }
+        // Poll serial input from the idle loop and wake a blocked reader. The scheduler reaches here
+        // when the shell has blocked in `console_read` with nothing else to run. The timer tick that
+        // normally drains the UART does NOT fire while the core idles (WFI quiesces it under QEMU, and
+        // even on hardware the tick is the only other drainer), so draining here is what lets a
+        // keystroke actually arrive and reschedule the shell. Then `cpsie i; wfi` (the x86 `sti; hlt`
+        // twin) unmasks IRQs so a timer/IPI can also wake us instead of busy-spinning forever.
+        super::uart_rx_poll();
+        // SAFETY: unmasking IRQs is always valid (vectors + handlers installed); WFI then waits for one.
+        unsafe { core::arch::asm!("cpsie i", "wfi", options(nomem, nostack)) }
     }
 
     pub fn idle_can_halt() -> bool { true } // ARM WFI wakes on the generic-timer IRQ; halting is safe

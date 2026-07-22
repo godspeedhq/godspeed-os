@@ -1585,6 +1585,16 @@ pub fn current_task_is_dead() -> bool {
     TASK_STATE[current_task_slot()].load(Ordering::Acquire) == TaskState::Dead as u8
 }
 
+/// True if the current task on this core is actively **Running** (as opposed to blocked, or the core
+/// idling with `IDLE`). The ARM timer gate uses this: it must skip preemption only for a task genuinely
+/// *executing* a syscall - a task blocked in `recv`/`console_read` has voluntarily yielded, so the tick
+/// must still run (to drain input and reschedule the woken task). `IDLE == MAX_TASKS` is out of range,
+/// so the bounds check also makes an idling core "not running".
+pub fn current_task_is_running() -> bool {
+    let slot = current_task_slot();
+    slot < MAX_TASKS && TASK_STATE[slot].load(Ordering::Relaxed) == TaskState::Running as u8
+}
+
 /// Wake the task at `slot` with the given result code.
 ///
 /// If the task lives on a different core, sends a WAKE_RECEIVER IPI to that

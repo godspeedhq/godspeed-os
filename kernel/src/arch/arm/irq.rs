@@ -203,7 +203,14 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
             let in_svc = (interrupted_spsr & 0x1f) != 0x10; // not USR mode -> SVC (kernel/syscall)
             let slot = crate::task::scheduler::current_task_slot();
             let user_task = slot < ARM_MAX_TASKS && ARM_TASK_IS_USER[slot].load(Ordering::Relaxed);
-            if !(in_svc && user_task) {
+            // Only protect a task that is genuinely *running* a syscall. A task BLOCKED in a syscall
+            // (the shell in `console_read`) has voluntarily yielded and the core is idling in its
+            // context (current still points at it, in SVC) - if we skipped the tick here too, the timer
+            // would NEVER drain the UART RX or reschedule the woken task, so serial input could never
+            // arrive. Gating on "running" lets the tick run while blocked (drain + wake) but still keeps
+            // an actively-executing syscall atomic.
+            let running = crate::task::scheduler::current_task_is_running();
+            if !(in_svc && user_task && running) {
                 // Preempt: the neutral tick swaps `sp` to the resumed task's kernel stack INTERNALLY,
                 // so we return `frame_sp` unchanged and `stub_irq`'s `mov sp, r0` is a no-op. The SAME
                 // stub serves both paths (below): the demo scheduler returns a DIFFERENT frame to adopt;
