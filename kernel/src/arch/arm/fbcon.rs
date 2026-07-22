@@ -15,10 +15,10 @@ const RASTER_HEIGHT: RasterHeight = RasterHeight::Size20;
 const CELL_W: usize = get_raster_width(FONT_WEIGHT, RASTER_HEIGHT);
 const CELL_H: usize = RASTER_HEIGHT.val();
 
-/// Dark background + light foreground. Colours are packed in the framebuffer's channel order (RED in the
-/// low byte - see `video::rgb`), so text reads correctly on the display.
-const BG: u32 = super::video::rgb(0x0C, 0x0C, 0x18); // near-black, faint blue
-const FG: (u32, u32, u32) = (0xE0, 0xE0, 0xE0);      // light grey
+/// Black background + green foreground, matching the x86 console look. Colours are packed in the
+/// framebuffer's channel order (RED in the low byte - see `video::rgb`), so they read correctly.
+const BG: u32 = super::video::rgb(0x00, 0x00, 0x00); // black
+const FG: (u32, u32, u32) = (0x33, 0xFF, 0x66);      // terminal green
 
 struct Fbcon {
     base: usize,
@@ -104,8 +104,29 @@ fn draw_glyph(c: &Fbcon, ch: u8, col: usize, row: usize) {
     }
 }
 
+/// Scroll the framebuffer up by one text row: move the pixel rows below the top cell-row up over it,
+/// then clear the freed bottom band to the background. Reads + writes the framebuffer, which is Normal
+/// non-cacheable (mapped so by `map_framebuffer`), so a byte memmove is valid (no Device alignment
+/// rules) and reaches the display. This replaces the old clear-and-home so the screen never blanks -
+/// the flicker seen on the TV under continuous output.
+fn scroll(c: &Fbcon) {
+    let shift = CELL_H * c.pitch;   // bytes in one text row
+    let total = c.height * c.pitch; // bytes in the whole framebuffer
+    // SAFETY: [base, base+total) is the mapped framebuffer; the copy stays inside it (shift < total),
+    // and Normal-NC memory permits an unaligned byte memmove.
+    unsafe {
+        let base = c.base as *mut u8;
+        core::ptr::copy(base.add(shift), base, total - shift);
+        // Clear the freed bottom band to BG (aligned u32 stores).
+        let bottom = (c.base + (total - shift)) as *mut u32;
+        for i in 0..(shift / 4) {
+            bottom.add(i).write_volatile(BG);
+        }
+    }
+}
+
 /// Render one byte of the serial stream. Handles CR/LF/backspace; printable ASCII draws a glyph and
-/// advances. When the screen fills, clear-and-home (no scroll yet - a follow-up).
+/// advances. When the screen fills, scroll up one row (no blanking).
 pub fn put_byte(b: u8) {
     if !READY.load(Ordering::Relaxed) { return; }
     // SAFETY: FBCON is published; concurrent callers are serialized by pl011_write's SERIAL_BUSY guard
@@ -121,8 +142,8 @@ pub fn put_byte(b: u8) {
         }
         if c.col >= c.cols { c.col = 0; c.row += 1; }
         if c.row >= c.rows {
-            clear(c);
-            c.row = 0;
+            scroll(c);
+            c.row = c.rows - 1;
             c.col = 0;
         }
     }

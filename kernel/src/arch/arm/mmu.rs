@@ -87,6 +87,19 @@ fn section(pa: u32, device: bool, execute: bool) -> u32 {
     d
 }
 
+/// A 1 MB section for the framebuffer: Normal but NON-cacheable (TEX=0b100, C=0, B=0), PL1 RW, non-exec.
+/// Non-cacheable so the GPU (which scans RAM) sees ARM writes without cache maintenance, while still
+/// allowing fast buffered writes and a byte memmove for scrolling - Device memory forbids the unaligned
+/// accesses a memmove makes and is much slower to read back for a scroll.
+fn section_fb(pa: u32) -> u32 {
+    (pa & 0xFFF0_0000)
+        | 0b10          // section descriptor
+        | (0b01 << 10)  // AP = PL1 RW, PL0 none
+        | (1 << 16)     // S = shareable
+        | (0b100 << 12) // TEX = Normal, outer + inner non-cacheable
+        | (1 << 4)      // XN
+}
+
 /// Fill the L1 table: identity-map RAM as Normal, peripherals and the core-local block as Device.
 ///
 /// Everything not written stays 0 (an invalid descriptor), so any access outside these ranges takes a
@@ -175,7 +188,7 @@ pub fn map_framebuffer(base: u32, size: u32) {
     let end   = base.saturating_add(size).saturating_add(SECTION_SIZE - 1) & !(SECTION_SIZE - 1);
     let mut pa = start;
     while pa < end {
-        l1.0[(pa / SECTION_SIZE) as usize] = section(pa, /*device=*/true, /*execute=*/false);
+        l1.0[(pa / SECTION_SIZE) as usize] = section_fb(pa); // Normal non-cacheable, GPU-coherent
         pa = pa.wrapping_add(SECTION_SIZE);
         if pa == 0 { break; } // wrapped past 4 GiB
     }
