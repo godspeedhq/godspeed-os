@@ -28,6 +28,7 @@ pub mod syscall;
 pub mod video;
 pub mod fbcon;
 pub mod dwc2;
+pub mod sdhci;
 pub mod usermode;
 pub mod loadtest;
 pub mod spawn;
@@ -501,6 +502,9 @@ extern "C" fn arm_boot_main() -> ! {
     // USB host bring-up (DWC2): detect the controller + the attached device. Increment 1 - no transfers
     // yet. Runs before the scheduler dispatch (which never returns).
     dwc2::init();
+    // SD/EMMC hardware-validation probe (throwaway): prove the EMMC + card + block read before the real
+    // driver is built as a userspace block-driver backend. Harmless with no SD image attached.
+    sdhci::probe();
     #[cfg(feature = "arm-sched-demo")]
     sched_demo::run(ram_end, reserve_end);
     #[cfg(feature = "arm-sched-user")]
