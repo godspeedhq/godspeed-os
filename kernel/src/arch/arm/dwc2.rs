@@ -586,7 +586,11 @@ fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: 
     // A split transaction that transaction-errors is retried whole (USB 2.0 11.17.5 / 11.20). The hub's
     // transaction translator (TT) legitimately XactErr/NAKs while busy; the host re-issues the start-split.
     let ss_tries = if bounded { 1u32 } else { 24u32 };          // the ISR poll does ONE attempt (NAK = no key, next tick); enumeration is patient
-    for _ss in 0..ss_tries {
+    for attempt in 0..ss_tries {
+        // Place the Start-Split by SWEEPING microframes 0..7 across retries, waiting on the HFNUM counter
+        // TRUTH until the target microframe - so the trace shows whether ANY placement is accepted
+        // (checklist: fixed SSPLIT placements across uframes). Enumeration only; the ISR poll fires at once.
+        if !bounded { wait_for_uframe((attempt % 8) as u32); }
         // STATE 1 - issue the Start-Split (CompleteSplit = 0); capture the microframe it goes out in.
         let hf0 = rd(HFNUM);
         chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt);
@@ -595,7 +599,7 @@ fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: 
         last = ss;
         if ss & (1 << 3) != 0 { break; }                        // STALL - real failure
         if ss & HCINT_XFERCOMPL != 0 { return ss; }             // (rare) already complete
-        if ss & (1 << 5) == 0 { super::timer::delay_us(1_000); continue; } // no ACK -> retry next frame (REAL 1 MHz clock, not a nop-spin - Commandment VIII)
+        if ss & (1 << 5) == 0 { continue; }                     // no ACK -> retry (the microframe sweep above spaces it)
         // STATE 2 - poll the Complete-Split (CompleteSplit = 1) for the low/full-speed result.
         let mut nyet = 0u32;
         loop {
@@ -614,7 +618,6 @@ fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: 
             }
             break;                                              // NAK (4) / XactErr (7): re-issue the start-split
         }
-        super::timer::delay_us(1_000);                          // one frame between whole-split retries (real clock, not nop-spin)
     }
     // Enumeration only, one-shot: dump HFIR + the captured microframe trace (logging INLINE would take far
     // longer than a 125 us microframe and destroy the timing we are measuring, so we captured it silently).
@@ -662,6 +665,16 @@ fn trace_split(phase: u8, hf_issue: u32, hf_halt: u32, hcint: u32) {
 fn write_hfnum(hf: u32) {
     let frnum = hf & 0x3FFF;
     write_hex32(frnum >> 3); pl011_write(b"."); write_hex32(frnum & 0x7);
+}
+
+/// Spin until the host frame counter reaches microframe `target` (0..7) - waiting on the HFNUM scheduling
+/// TRUTH, not a guessed delay (Commandment VIII). Bounded backstop so a stuck counter cannot hang the boot.
+fn wait_for_uframe(target: u32) {
+    let mut guard = 0u32;
+    while (rd(HFNUM) & 0x7) != (target & 0x7) {
+        guard += 1;
+        if guard > 2_000_000 { break; }
+    }
 }
 
 /// A single control-endpoint DMA transaction (ep 0, type control). Thin wrapper so ctrl_xfer reads clean.
