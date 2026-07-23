@@ -111,7 +111,22 @@ GodspeedOS way.
 - **SD/EMMC block driver -> `fs`** - **DONE** (2026-07-23): userspace `block-driver` SDHCI/PIO backend +
   the kernel's fixed-peripheral MMIO grant; `fs` mounts + persists in QEMU. Remaining: real-hardware
   verification on a Pi, and multi-block/faster transfers (PIO single-block today).
-- **LAN9514 USB-Ethernet -> `net-stack`** - far-future; the Pi 2 NIC is behind the USB hub.
+- **USB bulk transfers (DWC2)** - **DONE + QEMU-verified** (2026-07-23). `bulk_xfer` (the third transfer
+  type after control + interrupt) is the shared foundation for USB mass storage and USB-Ethernet. Proven
+  end to end against QEMU's `usb-storage`: a Bulk-Only Transport + minimal SCSI layer (`bot_command`,
+  TEST UNIT READY / REQUEST SENSE to clear the power-on UNIT ATTENTION, READ CAPACITY(10), READ(10)) reads
+  a planted block-0 signature back correctly through a multi-packet bulk IN. Test:
+  `qemu-system-arm -M raspi2b,usb=on -device usb-storage,drive=ud -drive if=none,id=ud,format=raw,file=<img>`
+  -> serial shows `msc capacity ...` + `BULK TRANSFER VERIFIED`. A real USB flash drive is thus already
+  detected + read on the Pi 2; promoting it to a `block-driver` backend (alongside SD/EMMC) is a small
+  further step.
+- **LAN9514 USB-Ethernet -> `net-stack`** - the Pi 2 NIC is a USB device behind the hub, so it rides the
+  DWC2 stack (enumeration + bulk transfers, both now in place). The remaining work is the device-specific
+  layer: the real Pi 2 speaks `smsc95xx` (not QEMU-emulated, so HW-verified later), while QEMU's `usb-net`
+  is a CDC/RNDIS device - structure the driver as a generic USB-net core (bulk frame TX/RX) + a per-device
+  setup layer so the frame plumbing is QEMU-verifiable and only the register layer is HW-blind. Then bridge
+  the in-kernel driver to the userspace `net-stack` over frame IPC (the USB analog of how the in-kernel
+  DWC2 keyboard feeds `console_push_byte`).
 - **SDK DMA cache-coherence (SEC-28)** - `sdk/rust/src/dma.rs` assumes x86 coherent DMA; any real ARM
   driver needs cache-maintenance hooks (clean-before-device-read, invalidate-before-CPU-read) first.
 

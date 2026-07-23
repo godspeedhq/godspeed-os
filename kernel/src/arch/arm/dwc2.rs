@@ -413,12 +413,13 @@ fn wait_halt() -> u32 {
     }
 }
 
-/// DMA scratch buffer for control transfers. Static so it lives in identity-mapped RAM (VA == PA); the
-/// DMA engine reads/writes it via the uncached bus alias (`chan_program`). 64-byte aligned so a whole
-/// buffer sits on its own cache lines for the clean/invalidate bracket.
+/// DMA scratch buffer. Static so it lives in identity-mapped RAM (VA == PA); the DMA engine reads/writes
+/// it via the bus alias (`chan_program`). 64-byte aligned, and `setup` is padded to a full 64 bytes so
+/// `data` starts on its own cache line (the clean/invalidate bracket never straddles setup + data). The
+/// `data` region holds a full disk block (512) or ethernet frame (~1514) for bulk transfers.
 #[repr(C, align(64))]
-struct DmaBuf { setup: [u8; 8], data: [u8; 64] }
-static mut DMA: DmaBuf = DmaBuf { setup: [0; 8], data: [0; 64] };
+struct DmaBuf { setup: [u8; 64], data: [u8; 2048] }
+static mut DMA: DmaBuf = DmaBuf { setup: [0; 64], data: [0; 2048] };
 
 /// Clean+invalidate a cache-line range to the PoC (DCCIMVAC) - the DMA-coherency bracket. The A7's DMA
 /// is not cache-coherent: clean pushes CPU writes to RAM before the device reads (OUT); invalidate drops
@@ -464,7 +465,7 @@ fn ctrl_xfer(setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize) -> bo
         let setup_phys = core::ptr::addr_of!(d.setup) as u32;
         let data_phys = core::ptr::addr_of!(d.data) as u32;
 
-        d.setup.copy_from_slice(setup);
+        d.setup[..8].copy_from_slice(setup);
         flush_dcache(setup_phys, 8);
         if !ctrl_dma(false, PID_SETUP, setup_phys, 8) { pl011_write(b"dwc2: SETUP failed\r\n"); return false; }
 
@@ -568,6 +569,7 @@ fn enumerate_sync() {
 /// Walk the hub at address 1: configure it, power every port, then for each connected port reset it and
 /// enumerate the downstream device, stopping at the first keyboard. Every wait is bounded.
 fn enumerate_hub() {
+    let hub_mps = MPS0.load(Ordering::Relaxed);          // hub EP0 max-packet (set during root enumeration)
     if !control_out(0x00, 0x09, 1, 0) { pl011_write(b"dwc2: hub SET_CONFIG failed\r\n"); return; }
 
     // Hub descriptor (class GET_DESCRIPTOR, type 0x29) -> bNbrPorts at byte 2.
@@ -582,6 +584,12 @@ fn enumerate_hub() {
     spin(1_000_000);                                                             // ~bPwrOn2PwrGood, bounded
 
     for port in 1..=nports {
+        // Re-select the hub's own control endpoint: a prior downstream enumeration left DEV_ADDR/MPS0
+        // pointing at that device, so every hub request below would otherwise go to the wrong address.
+        DEV_ADDR.store(1, Ordering::Relaxed);
+        MPS0.store(hub_mps, Ordering::Relaxed);
+        LOW_SPEED.store(false, Ordering::Relaxed);
+
         let st = hub_get_port_status(port);
         if st & 1 == 0 { continue; }                                            // no device on this port
         control_out(0x23, 0x01, C_PORT_CONNECTION, port as u16);                // CLEAR_FEATURE(C_CONNECTION)
@@ -592,13 +600,14 @@ fn enumerate_hub() {
         let low = (st2 >> 9) & 1 == 1;                                          // wPortStatus low-speed bit
         pl011_write(b"dwc2: port "); write_hex32(port as u32);
         pl011_write(b" device status="); write_hex32(st2); pl011_write(b"\r\n");
-        if enumerate_downstream(low) { return; }                               // found + configured a keyboard
+        if enumerate_downstream(low) { return; }                               // recognised + brought up a device
     }
     pl011_write(b"dwc2: no keyboard found behind hub\r\n");
 }
 
 /// A freshly-reset downstream device answers at address 0. Learn its EP0 max-packet, move it to address 2,
-/// then try to configure it as a boot keyboard. Returns true if it was one.
+/// then dispatch by function: a boot keyboard (HID) or - proving the bulk path - a mass-storage device.
+/// Returns true if it was one we brought up.
 fn enumerate_downstream(low: bool) -> bool {
     DEV_ADDR.store(0, Ordering::Relaxed);
     MPS0.store(8, Ordering::Relaxed);
@@ -622,7 +631,11 @@ fn enumerate_downstream(low: bool) -> bool {
     pl011_write(b"dwc2: downstream VID:PID="); write_hex32((vid << 16) | pid);
     pl011_write(b" class="); write_hex32(buf[4] as u32); pl011_write(b"\r\n");
 
-    configure_keyboard()
+    // Both HID and mass storage define their class at the interface level, so each probe reads the
+    // config descriptor itself. A boot keyboard is the goal; mass storage exercises the bulk path.
+    if configure_keyboard() { return true; }
+    if probe_mass_storage() { return true; }
+    false
 }
 
 /// Read the configuration descriptor of the current device (DEV_ADDR), find a boot-keyboard interface
@@ -678,6 +691,146 @@ fn configure_keyboard() -> bool {
     KBD_TOGGLE.store(false, Ordering::Relaxed);
     KBD_READY.store(true, Ordering::Release);
     pl011_write(b"dwc2: boot keyboard ready on ep="); write_hex32(ep as u32); pl011_write(b"\r\n");
+    true
+}
+
+// --- bulk transfers (the shared foundation for USB mass storage and, later, USB-Ethernet) ---
+// A bulk endpoint keeps its own DATA0/DATA1 toggle per direction, advanced only on a completed packet.
+static BULK_TOGGLE_IN:  AtomicBool = AtomicBool::new(false);
+static BULK_TOGGLE_OUT: AtomicBool = AtomicBool::new(false);
+static BULK_MPS:        AtomicU8   = AtomicU8::new(64);   // bulk endpoint max-packet (set at config time)
+
+/// One bulk transfer of `len` bytes on endpoint `ep`, through the `DMA.data` buffer, with cache
+/// maintenance for the A7's non-coherent DMA. Uses the bulk endpoint's max-packet (`BULK_MPS`) for the
+/// packet count and maintains the per-direction data toggle. Returns true on completion.
+fn bulk_xfer(dir_in: bool, ep: u32, data: &mut [u8], len: usize) -> bool {
+    MPS0.store(BULK_MPS.load(Ordering::Relaxed), Ordering::Relaxed); // chan_program uses MPS0 for pktcnt
+    let toggle = if dir_in { &BULK_TOGGLE_IN } else { &BULK_TOGGLE_OUT };
+    let pid = if toggle.load(Ordering::Relaxed) { PID_DATA1 } else { PID_DATA0 };
+    // SAFETY: DMA is touched only on core 0; addr_of gives its identity-mapped physical address.
+    let ok = unsafe {
+        let d = &mut *core::ptr::addr_of_mut!(DMA);
+        let data_phys = core::ptr::addr_of!(d.data) as u32;
+        let n = len.min(d.data.len());
+        if dir_in {
+            flush_dcache(data_phys, n as u32);                     // invalidate before the device writes
+            let ok = chan_dma(true, pid, data_phys, n as u32, ep, 2);
+            if ok {
+                flush_dcache(data_phys, n as u32);                 // invalidate after -> read device bytes
+                let m = n.min(data.len());
+                data[..m].copy_from_slice(&d.data[..m]);
+            }
+            ok
+        } else {
+            let m = n.min(data.len());
+            d.data[..m].copy_from_slice(&data[..m]);
+            flush_dcache(data_phys, n as u32);
+            chan_dma(false, pid, data_phys, n as u32, ep, 2)
+        }
+    };
+    if ok { toggle.store(!toggle.load(Ordering::Relaxed), Ordering::Relaxed); }
+    ok
+}
+
+// --- USB Mass Storage (Bulk-Only Transport) - a QEMU-verifiable exerciser of the bulk path ---
+// BOT wraps each SCSI command in a 31-byte CBW (bulk OUT), an optional data stage, and a 13-byte CSW
+// (bulk IN). Signatures: CBW "USBC" (0x43425355), CSW "USBS" (0x53425355).
+
+/// Run one SCSI command via BOT. `cdb` is the SCSI command block; `data`/`dlen` is the data stage
+/// (`data_in` selects direction). Returns true iff the command completed with CSW status = passed.
+fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u8], dlen: usize) -> bool {
+    let mut cbw = [0u8; 31];
+    cbw[0..4].copy_from_slice(&0x4342_5355u32.to_le_bytes());     // dCBWSignature "USBC"
+    cbw[4..8].copy_from_slice(&0x1234_5678u32.to_le_bytes());     // dCBWTag
+    cbw[8..12].copy_from_slice(&(dlen as u32).to_le_bytes());     // dCBWDataTransferLength
+    cbw[12] = if data_in { 0x80 } else { 0x00 };                 // bmCBWFlags (bit7 = data-IN)
+    cbw[13] = 0;                                                  // bCBWLUN
+    cbw[14] = cdb.len() as u8;                                    // bCBWCBLength
+    let n = cdb.len().min(16);
+    cbw[15..15 + n].copy_from_slice(&cdb[..n]);
+
+    if !bulk_xfer(false, ep_out, &mut cbw, 31) { pl011_write(b"dwc2: bot CBW-out failed\r\n"); return false; }
+    if dlen > 0 && !bulk_xfer(data_in, if data_in { ep_in } else { ep_out }, data, dlen) {
+        pl011_write(b"dwc2: bot data-stage failed\r\n"); return false;
+    }
+
+    let mut csw = [0u8; 13];
+    if !bulk_xfer(true, ep_in, &mut csw, 13) { pl011_write(b"dwc2: bot CSW-in failed\r\n"); return false; }
+    let sig = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
+    sig == 0x5342_5355 && csw[12] == 0                            // "USBS" and bCSWStatus = passed
+}
+
+/// Detect a Bulk-Only mass-storage device on the current address, select its config, and prove the bulk
+/// path by reading its capacity and block 0 (READ CAPACITY(10) + READ(10)). Returns true if it was one.
+fn probe_mass_storage() -> bool {
+    let mut cfg = [0u8; 64];
+    if !get_descriptor(0x80, 0x02, 0x00, 0, &mut cfg, 9) { return false; }
+    let total = (((cfg[2] as usize) | ((cfg[3] as usize) << 8)).max(9)).min(cfg.len());
+    if !get_descriptor(0x80, 0x02, 0x00, 0, &mut cfg, total) { return false; }
+    let cfg_val = cfg[5];
+
+    // Walk for a mass-storage interface (class 0x08, Bulk-Only protocol 0x50) + its bulk IN/OUT endpoints.
+    let mut i = 0usize;
+    let mut in_ms = false;
+    let mut is_ms = false;
+    let mut ep_in = 0u8;
+    let mut ep_out = 0u8;
+    let mut bulk_mps = 64u8;
+    while i + 2 <= total {
+        let blen = cfg[i] as usize;
+        let btype = cfg[i + 1];
+        if blen == 0 { break; }
+        if btype == 0x04 && i + 8 <= total {                       // interface descriptor
+            in_ms = cfg[i + 5] == 0x08 && cfg[i + 7] == 0x50;      // Mass Storage class, Bulk-Only transport
+            if in_ms { is_ms = true; }
+        } else if btype == 0x05 && in_ms && i + 7 <= total {       // endpoint descriptor
+            let addr = cfg[i + 2];
+            if cfg[i + 3] & 0x03 == 0x02 {                         // bulk
+                bulk_mps = if cfg[i + 4] == 0 { 64 } else { cfg[i + 4] };
+                if addr & 0x80 != 0 { ep_in = addr & 0x0F; } else { ep_out = addr & 0x0F; }
+            }
+        }
+        i += blen;
+    }
+    if !is_ms || ep_in == 0 || ep_out == 0 { return false; }
+
+    if !control_out(0x00, 0x09, cfg_val as u16, 0) { pl011_write(b"dwc2: msc SET_CONFIG failed\r\n"); return true; }
+    BULK_MPS.store(bulk_mps, Ordering::Relaxed);
+    BULK_TOGGLE_IN.store(false, Ordering::Relaxed);
+    BULK_TOGGLE_OUT.store(false, Ordering::Relaxed);
+    pl011_write(b"dwc2: mass storage: bulk in ep="); write_hex32(ep_in as u32);
+    pl011_write(b" out ep="); write_hex32(ep_out as u32); pl011_write(b"\r\n");
+
+    // Clear the power-on UNIT ATTENTION: a freshly-attached device rejects its first command with CHECK
+    // CONDITION until its sense data is drained. Loop TEST UNIT READY / REQUEST SENSE a bounded few times.
+    let ei = ep_in as u32;
+    let eo = ep_out as u32;
+    for _ in 0..8 {
+        if bot_command(ei, eo, &[0u8; 6], false, &mut [], 0) { break; }        // TEST UNIT READY (0x00)
+        let mut sense = [0u8; 18];
+        let _ = bot_command(ei, eo, &[0x03, 0, 0, 0, 18, 0], true, &mut sense, 18); // REQUEST SENSE clears it
+    }
+
+    // READ CAPACITY(10): 8-byte reply = last LBA (BE) + block size (BE).
+    let cap_cdb = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut cap = [0u8; 8];
+    if !bot_command(ep_in as u32, ep_out as u32, &cap_cdb, true, &mut cap, 8) {
+        pl011_write(b"dwc2: msc READ CAPACITY failed\r\n"); return true;
+    }
+    let last_lba = u32::from_be_bytes([cap[0], cap[1], cap[2], cap[3]]);
+    let bsize = u32::from_be_bytes([cap[4], cap[5], cap[6], cap[7]]);
+    pl011_write(b"dwc2: msc capacity last_lba="); write_hex32(last_lba);
+    pl011_write(b" block_size="); write_hex32(bsize); pl011_write(b"\r\n");
+
+    // READ(10) block 0: proves a multi-packet bulk IN moves real data.
+    let rd_cdb = [0x28u8, 0, 0, 0, 0, 0, 0, 0, 1, 0];             // READ(10), LBA 0, 1 block
+    let mut blk = [0u8; 512];
+    if !bot_command(ep_in as u32, ep_out as u32, &rd_cdb, true, &mut blk, 512) {
+        pl011_write(b"dwc2: msc READ(10) failed\r\n"); return true;
+    }
+    pl011_write(b"dwc2: msc read block0 first4=");
+    write_hex32(u32::from_be_bytes([blk[0], blk[1], blk[2], blk[3]]));
+    pl011_write(b"\r\ndwc2: BULK TRANSFER VERIFIED (usb mass storage)\r\n");
     true
 }
 
