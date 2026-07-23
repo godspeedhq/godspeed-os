@@ -70,13 +70,16 @@ pub(super) fn neutral_bootstrap(ram_end: u32, reserve_end: u32) {
 }
 
 /// The service-context virtual address (`SERVICE_CTX_VA`) mapped into `pt`, backed by a fresh frame.
-/// Also maps 8 user stack pages below `USER_STACK_TOP`. Returns the ctx frame's physical address (so
+/// Also maps the user stack pages below `USER_STACK_TOP`. Returns the ctx frame's physical address (so
 /// the caller can write the `ServiceContext` there), or `None` (having logged) on failure.
 ///
-/// Several stack pages because a service builds a 4 KiB IPC message buffer on its stack (`ctx.log`/
-/// `recv`/`send`), so one page is not enough (the first run faulted just below a single page).
+/// 64 pages = 256 KiB, matching x86 (`task::mod::USER_STACK_PAGES`). A service builds 4 KiB IPC message
+/// buffers on its stack (`ctx.log`/`recv`/`send`), and the shell's pipe path (`status | count`) builds
+/// record tables in deep frames - 8 pages (32 KiB) overflowed and faulted the shell on every pipe
+/// (HW/QEMU-diagnosed: PF ~40 KiB below the top). The x86 stack is 256 KiB, so match it: pipes fit and
+/// there is headroom for the page-fault handler running on the user stack.
 fn map_stack_and_ctx(pt: &mut PageTable) -> Option<u32> {
-    const STACK_PAGES: u32 = 8;
+    const STACK_PAGES: u32 = 64;
     let uflags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXEC;
     for p in 1..=STACK_PAGES {
         let f = match crate::memory::allocator::alloc_frame() {

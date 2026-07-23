@@ -66,8 +66,9 @@ def main():
     time.sleep(1.0)
 
     for c in args.cmd:
-        for ch in (c + "\r").encode():
-            p.stdin.write(bytes([ch])); p.stdin.flush(); time.sleep(0.06)
+        # Newline (not CR) is the Enter the shell acts on under QEMU -serial stdio.
+        for ch in (c + "\n").encode():
+            p.stdin.write(bytes([ch])); p.stdin.flush(); time.sleep(0.08)
         time.sleep(3.0)
 
     # let any remaining boot output settle
