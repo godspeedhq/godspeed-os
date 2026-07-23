@@ -336,6 +336,8 @@ fn chan_program(dir_in: bool, pid: u32, len: u32) {
     wr(HCCHAR0, chan);
 }
 
+static DUMPED: AtomicBool = AtomicBool::new(false);
+
 /// True while `HCINT` shows the channel neither completed nor errored. Bounded so a wedged controller
 /// reports rather than hangs the boot.
 fn wait_halt() -> u32 {
@@ -345,7 +347,21 @@ fn wait_halt() -> u32 {
         if ci & HCINT_CHHLTD != 0 { return ci; }
         t += 1;
         if t > 4_000_000 {
-            pl011_write(b"dwc2: halt timeout HCINT="); write_hex32(ci); pl011_write(b"\r\n");
+            if !DUMPED.swap(true, Ordering::Relaxed) {
+                // One-shot: did the core CONSUME the pushed SETUP bytes (NPTxFSpcAvail back to full) or
+                // are they still stuck in the FIFO (core never started the token)?
+                pl011_write(b"dwc2: STALL HCCHAR="); write_hex32(rd(HCCHAR0));
+                pl011_write(b" HCTSIZ="); write_hex32(rd(HCTSIZ0));
+                pl011_write(b" GNPTXSTS="); write_hex32(rd(0x02C));
+                pl011_write(b" GINTSTS="); write_hex32(rd(GINTSTS));
+                pl011_write(b" HPRT="); write_hex32(rd(HPRT));
+                pl011_write(b" HAINT="); write_hex32(rd(HAINT));
+                pl011_write(b" GRSTCTL="); write_hex32(rd(GRSTCTL));
+                let f1 = rd(0x408); spin(300_000); let f2 = rd(0x408);
+                pl011_write(b" HFNUM1="); write_hex32(f1);
+                pl011_write(b" HFNUM2="); write_hex32(f2);
+                pl011_write(b"\r\n");
+            }
             return ci | HCINT_CHHLTD; // treat as halted-without-complete -> failure
         }
     }
@@ -356,7 +372,7 @@ fn wait_halt() -> u32 {
 /// from reset can be briefly not-ready); STALL or exhausted retries is a hard failure. Returns true on
 /// XferCompl.
 fn chan_out(pid: u32, buf: &[u8], len: usize) -> bool {
-    for _attempt in 0..1000 {
+    for _attempt in 0..2 {
         chan_program(false, pid, len as u32);
         let words = (len + 3) / 4;
         for i in 0..words {
@@ -384,7 +400,7 @@ fn chan_out(pid: u32, buf: &[u8], len: usize) -> bool {
 /// as packets arrive (GRXSTSP tells us the byte count), then wait for the halt. Same retry policy as
 /// chan_out. Returns true on XferCompl.
 fn chan_in(pid: u32, buf: &mut [u8], len: usize) -> bool {
-    for _attempt in 0..1000 {
+    for _attempt in 0..2 {
         chan_program(true, pid, len as u32);
         let mut received = 0usize;
         let mut t = 0u32;
