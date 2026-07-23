@@ -28,6 +28,8 @@ ARM_SERVICES = [
     "observe", "chaos", "mem-pressure",
     "counter", "greet", "upper", "roster",
     "reply-server", "asker", "resource-server", "holder",
+    # Persistence on the Pi 2: block-driver (BCM2835 EMMC/SDHCI PIO backend) + arch-neutral fs.
+    "block-driver", "fs",
 ]
 
 

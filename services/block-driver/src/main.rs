@@ -15,7 +15,13 @@
 
 use godspeed_sdk::ServiceContext;
 
+// Backend by architecture: x86 talks AHCI (SATA, MMIO+DMA); ARM (Raspberry Pi 2) talks the BCM2835 EMMC
+// (Arasan SDHCI, PIO). Both satisfy the same block-IPC protocol below and are reached through the
+// kernel-granted MMIO window (`ctx.mmio()`).
+#[cfg(not(target_arch = "arm"))]
 mod ahci;
+#[cfg(target_arch = "arm")]
+mod sdhci;
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
 //   Request : [op:u8, lba:u64 LE, (WriteBlock only: 512 data bytes)]
@@ -34,10 +40,16 @@ const OP_WRITE_ZEROS: u8 = 4;
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
 
+/// Run the arch-appropriate backend against the kernel-granted MMIO window.
+#[cfg(not(target_arch = "arm"))]
+fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { ahci::run(ctx, m) }
+#[cfg(target_arch = "arm")]
+fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { sdhci::run(ctx, m) }
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     match ctx.mmio() {
-        Some(hba) => ahci::run(&ctx, &hba),
+        Some(m) => backend_run(&ctx, &m),
         None => {
             ctx.log("block-driver: no AHCI controller found (no SATA disk?)");
             // DRAIN our IPC endpoint forever, never just yield: a registered service that idles here without

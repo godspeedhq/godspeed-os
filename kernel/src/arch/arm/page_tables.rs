@@ -59,15 +59,22 @@ const L2_TYPE_SMALL: u32 = 0b10; // small page; bit 0 (XN) is ORed in separately
 
 /// Encode an L2 small-page descriptor for `pa` with the given flags.
 ///
-/// Normal, cacheable, write-back memory (TEX=0b001, C=1, B=1) - kernel RAM. AP/APX come from
-/// `WRITABLE`; XN from `NO_EXEC`. `S` (shareable) is set to match the section mappings `mmu.rs` made,
-/// so a page and a section covering the same memory agree on shareability.
+/// Small-page descriptor. Normal cacheable write-back by default (TEX=0b001, C=1, B=1 - kernel/service
+/// RAM); **Device** memory (TEX=0b000, C=0, B=1 - uncached, no reorder/gather) when `PCD` is set, so a
+/// driver service can map a peripheral's MMIO into its own address space (the same `PCD` the x86 encoder
+/// treats as uncached). AP/APX come from `WRITABLE`; XN from `NO_EXEC`. `S` (shareable) matches the
+/// section mappings `mmu.rs` made, so a page and a section covering the same memory agree on shareability.
 fn l2_small_page(pa: u32, flags: PageFlags) -> u32 {
     let mut d = (pa & 0xFFFF_F000) | L2_TYPE_SMALL;
-    // Normal WB/WA: TEX[2:0] at bits [8:6] = 0b001, C bit 3, B bit 2.
-    d |= 0b001 << 6;
-    d |= 1 << 3; // C
-    d |= 1 << 2; // B
+    if flags.contains(PageFlags::PCD) {
+        // Device: TEX=0b000, C=0, B=1 (Shareable Device) - correct for MMIO, never cached or reordered.
+        d |= 1 << 2; // B
+    } else {
+        // Normal WB/WA: TEX[2:0] at bits [8:6] = 0b001, C bit 3, B bit 2.
+        d |= 0b001 << 6;
+        d |= 1 << 3; // C
+        d |= 1 << 2; // B
+    }
     d |= 1 << 10; // S (shareable), matching mmu.rs sections
     // AP/APX encode both privilege levels. USER = PL0 gets access; without it PL0 has none (kernel
     // page). AP=0b11 is PL1 RW / PL0 RW; AP=0b10 is PL1 RW / PL0 RO; AP=0b01 is PL1 RW / PL0 none;

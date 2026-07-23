@@ -3630,7 +3630,9 @@ fn spawn_service_with_config(
     // service holds exactly one controller, and each has its own address space, so
     // the shared VA + ctx field (`xhci_mmio_va`, read by `ctx.xhci_mmio()` /
     // `ctx.ehci_mmio()`) is unambiguous (§12).
-    let xhci_mmio_va = {
+    // The mapped MMIO window's VA + byte length; the length lets the SDK's `Mmio` wrapper bounds-check
+    // accesses (SEC-4). (0, 0) = this service gets no MMIO.
+    let (xhci_mmio_va, xhci_mmio_len) = {
         // The controller BAR for this driver's declared class (audit M7): xHCI/EHCI/AHCI use their
         // register base; a NIC only when it is a model we drive (e1000 / RTL8168) - otherwise 0, so the
         // driver gets no mapping and idles, never touching foreign hardware (Commandment VII).
@@ -3649,14 +3651,17 @@ fn spawn_service_with_config(
                     .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::MapFailed })?;
             }
             crate::kprintln!("spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}", name, bar, XHCI_MMIO_VA);
-            XHCI_MMIO_VA
+            (XHCI_MMIO_VA, XHCI_MMIO_PAGES * PAGE_SIZE as u64)
+        } else if let Some((va, len)) = crate::arch::imp::map_fixed_driver_mmio(&mut page_table, name) {
+            // Non-PCI fixed-physical peripheral MMIO grant (§12.3 for a bus with no PCI scan - the Pi's
+            // peripherals are at fixed addresses). The arch layer maps the window Device+USER and returns
+            // its (VA, len); on x86 this is always None (PCI BARs handle it above).
+            crate::kprintln!("spawn[mmio]: '{}' fixed peripheral -> VA {:#x} ({} B)", name, va, len);
+            (va, len)
         } else {
-            0
+            (0, 0)
         }
     };
-    // The mapped MMIO window is a uniform XHCI_MMIO_PAGES for every driver class; passing its byte
-    // length to the service lets the SDK's `Mmio` wrapper bounds-check accesses (SEC-4). 0 = no BAR.
-    let xhci_mmio_len: u64 = if xhci_mmio_va != 0 { XHCI_MMIO_PAGES * PAGE_SIZE as u64 } else { 0 };
 
     // 6b. Allocate + map a physically-contiguous DMA arena for the xHCI driver
     // (§12). The controller DMAs into this memory (rings/contexts), so the driver

@@ -282,6 +282,11 @@ pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, 
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
 pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
 
+/// Non-PCI fixed-physical peripheral MMIO grant (the ARM Pi path). x86 discovers driver MMIO from the
+/// PCI scan (handled in the spawn path via `HwClass::mmio_bar`), so there is never a fixed-physical
+/// window to grant here - always `None`.
+pub fn map_fixed_driver_mmio(_pt: &mut page_tables::PageTable, _name: &str) -> Option<(u64, u64)> { None }
+
 /// Switch the local core to a new stack top (boot only). Used once at kernel entry to move off the
 /// bootloader's tiny stack onto the kernel's own before any locals are allocated. `#[inline(always)]`
 /// is REQUIRED: it must inline into the caller so there is no function epilogue trying to `ret` off the

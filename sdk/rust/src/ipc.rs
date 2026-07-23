@@ -178,11 +178,17 @@ pub fn call(
     let mut buf = [0u8; MAX_PAYLOAD];
     let req = request.payload_bytes();
     buf[..req.len()].copy_from_slice(req);
-    let packed = ((recv.0 as u64) << 32) | ((reply_grant.0 as u64) << 16) | (target.0 as u64);
+    // Pack three 16-bit cap slots + the length into THREE 32-bit-safe args (not two): arg0 = target |
+    // reply, arg2 = recv | len. The old layout put `recv` in bits 32-47 of arg0, which the ARM 32-bit
+    // syscall ABI truncates away (each arg is one register) - recv_slot became 0 and the Call routed to
+    // the wrong endpoint (userspace-audit A-U1 class). A request length never exceeds one message (4 KiB
+    // < 0xFFFF), so `recv` rides the high half of the length arg. `handle_call` mirrors this.
+    let packed = ((reply_grant.0 as u64) << 16) | (target.0 as u64);
+    let recv_len = ((recv.0 as u64) << 16) | (req.len() as u64 & 0xFFFF);
     // SAFETY: raw_syscall(41) = Call; `buf` is a valid in/out stack buffer in user space (request in,
     // reply written back), `req.len() <= MAX_PAYLOAD`. The kernel validates every cap slot and the
     // buffer pointer before use.
-    let ret = unsafe { raw_syscall(41, packed, buf.as_mut_ptr() as u64, req.len() as u64) };
+    let ret = unsafe { raw_syscall(41, packed, buf.as_mut_ptr() as u64, recv_len) };
     if ret < 0 {
         Err(i64_to_ipc_error(ret))
     } else {

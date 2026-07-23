@@ -94,6 +94,10 @@ fn main() {
         "observe", "chaos", "mem-pressure",
         "counter", "greet", "upper", "roster",
         "reply-server", "asker", "resource-server", "holder",
+        // Persistence on the Pi 2: block-driver's ARM backend is the BCM2835 EMMC (SDHCI, PIO); fs is
+        // arch-neutral and rides on it. The kernel grants block-driver the EMMC MMIO window at spawn
+        // (arch::arm::map_fixed_driver_mmio).
+        "block-driver", "fs",
     ];
     let arm_dir = workspace
         .join("target")

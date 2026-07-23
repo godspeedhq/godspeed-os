@@ -968,10 +968,13 @@ fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 // Syscall: Call (41) - synchronous request + death-aware wait for the reply (§8, §8.6).
 // ---------------------------------------------------------------------------
 
-/// arg0 = (recv_slot << 32) | (reply_grant_slot << 16) | target_endpoint_slot
+/// arg0 = (reply_grant_slot << 16) | target_endpoint_slot
 /// arg1 = buf_ptr (in/out, MAX_MESSAGE_SIZE): the request payload on entry; the reply is written
 ///        back into the same buffer on return.
-/// arg2 = request length (bytes, <= MAX_MESSAGE_SIZE).
+/// arg2 = (recv_slot << 16) | request_length. Three 16-bit slots + the length are packed into two
+///        32-bit-safe args (NOT one 48-bit arg): the ARM 32-bit syscall ABI carries each arg in one
+///        register and would truncate a value above 32 bits, dropping `recv_slot` (userspace-audit
+///        A-U1). A request never exceeds one 4 KiB message (< 0xFFFF), so `recv` rides the high half.
 ///
 /// seL4-style synchronous CALL. Sends the request to the `target` endpoint carrying `reply_grant`
 /// as a one-shot reply cap (the caller's own endpoint, so the peer can reply to it), then blocks on
@@ -985,10 +988,11 @@ fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 ///
 /// Returns the reply length (>= 0), or a negative error: -12 `ReplyDead` (peer died awaiting reply),
 /// -7 `EndpointDead` (peer dead before the request was delivered), or a cap error.
-fn handle_call(packed: u64, buf_ptr: u64, req_len: u64) -> i64 {
+fn handle_call(packed: u64, buf_ptr: u64, recv_len: u64) -> i64 {
     let target_slot = (packed & 0xFFFF) as usize;
     let reply_slot  = ((packed >> 16) & 0xFFFF) as usize;
-    let recv_slot   = ((packed >> 32) & 0xFFFF) as usize;
+    let recv_slot   = ((recv_len >> 16) & 0xFFFF) as usize;
+    let req_len     = recv_len & 0xFFFF;
 
     // 1. Validate the three caps: SEND to the peer, GRANT on the reply cap, RECV on our own endpoint.
     let target_cap = match scheduler::current_task_lookup_cap(target_slot, Rights::SEND) {

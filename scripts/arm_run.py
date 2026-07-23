@@ -30,6 +30,7 @@ def main():
     ap.add_argument("--secs", type=float, default=20.0)
     ap.add_argument("--release", action="store_true")
     ap.add_argument("--usb", action="store_true")
+    ap.add_argument("--sd", default=None, help="path to a raw SD-card image to attach (if=sd)")
     ap.add_argument("--cmd", action="append", default=[])
     ap.add_argument("--tail", type=int, default=3000)
     args = ap.parse_args()
@@ -44,6 +45,9 @@ def main():
     cmd = [QEMU, "-M", machine, "-kernel", krn, "-serial", "stdio", "-display", "none"]
     if args.usb:
         cmd += ["-device", "usb-kbd"]
+    if args.sd:
+        # Attach an SD-card image so the block-driver (BCM2835 EMMC) has a disk to serve to fs.
+        cmd += ["-drive", f"if=sd,format=raw,file={args.sd}"]
 
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, bufsize=0)

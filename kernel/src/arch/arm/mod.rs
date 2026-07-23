@@ -28,7 +28,6 @@ pub mod syscall;
 pub mod video;
 pub mod fbcon;
 pub mod dwc2;
-pub mod sdhci;
 pub mod usermode;
 pub mod loadtest;
 pub mod spawn;
@@ -502,9 +501,6 @@ extern "C" fn arm_boot_main() -> ! {
     // USB host bring-up (DWC2): detect the controller + the attached device. Increment 1 - no transfers
     // yet. Runs before the scheduler dispatch (which never returns).
     dwc2::init();
-    // SD/EMMC hardware-validation probe (throwaway): prove the EMMC + card + block read before the real
-    // driver is built as a userspace block-driver backend. Harmless with no SD image attached.
-    sdhci::probe();
     #[cfg(feature = "arm-sched-demo")]
     sched_demo::run(ram_end, reserve_end);
     #[cfg(feature = "arm-sched-user")]
@@ -574,6 +570,35 @@ pub fn ap_count() -> usize { 3 }
 
 /// Machine init - already performed in `arm_boot_main` before neutral code runs. No-op.
 pub fn init(_boot_info: &BootInfo) {}
+
+/// The VA at which a driver service's fixed-peripheral MMIO window is mapped in ITS address space. ARM
+/// is 32-bit, so the x86 `XHCI_MMIO_VA` (0x1_0000_0000, 4 GiB) is out of range; this sits in the free
+/// gap between a service's binary/heap and its user stack (`USER_STACK_TOP = 0x8000_0000`). The service
+/// reads it back through `ctx.mmio()`.
+pub const DRIVER_MMIO_VA: u32 = 0x6000_0000;
+
+/// Map a fixed-physical peripheral MMIO window into a driver SERVICE's page table and return
+/// `(va, byte_len)`, or `None` if this service needs no fixed MMIO. This is the §12.3 MMIO-cap grant for
+/// ARM's non-PCI peripherals (x86 grants PCI BARs from the scan; the Pi's peripherals are at fixed
+/// physical addresses). Mapped Device (`PCD`, uncached) + `USER` so the userspace driver can reach the
+/// registers through the SDK `Mmio` wrapper - no `unsafe` in the service (§18.2). Called from the
+/// neutral spawn path when a service's PCI BAR is 0 (always, on ARM).
+pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Option<(u64, u64)> {
+    use crate::memory::frame::PhysAddr;
+    use page_tables::{PageFlags, VirtAddr};
+    // `block-driver` on the Pi drives the Arasan EMMC (SD/EMMC) at peripheral + 0x30_0000.
+    let (phys, pages): (u32, u32) = match name {
+        "block-driver" => (PERIPHERAL_BASE as u32 + 0x30_0000, 1),
+        _ => return None,
+    };
+    let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE
+        | PageFlags::NO_EXEC | PageFlags::PCD;
+    for i in 0..pages {
+        let off = i * 0x1000;
+        pt.map(VirtAddr((DRIVER_MMIO_VA + off) as u64), PhysAddr((phys + off) as u64), flags).ok()?;
+    }
+    Some((DRIVER_MMIO_VA as u64, (pages * 0x1000) as u64))
+}
 
 /// Timer init - the generic timer + BCM2836 tick are already up (`timer::init` / `irq::start_tick`).
 pub fn init_timer() {}

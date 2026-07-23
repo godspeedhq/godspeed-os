@@ -13,22 +13,6 @@ comment.
 
 ---
 
-## 2026-07-23 - SD/EMMC (Arasan SDHCI) hardware-validation probe (feat/pi2-arm32)
-
-`arch/arm/sdhci.rs` (new, 3 unsafe: `rd`/`wr` Device-MMIO 32-bit accessors + `spin`). A THROWAWAY
-in-kernel probe that proves the BCM2835 EMMC path before the real driver is built as a userspace
-`block-driver` backend (Option A): it inits the card (CMD0/8/ACMD41/2/3/7) and reads block 0 + 100 by
-PIO, printing the on-disk signature. PIO/polled (no DMA -> SEC-28 n/a; no IRQ). Verified in QEMU
-`raspi2b -drive if=sd`: EMMC at peripheral+0x300000, card enumerates (SDSC), block reads return the
-planted signatures. Will be REMOVED when the userspace SD driver (which has no `unsafe` - it uses the SDK
-`Mmio` wrapper, §18.2) replaces it.
-
-| File | Change | Why |
-|------|--------|-----|
-| `arch/arm/sdhci.rs` | new, 3 | `rd`/`wr` (EMMC Device MMIO) + `spin` (`nop`) - throwaway probe; goes away with the userspace driver. |
-
----
-
 ## 2026-07-23 - DWC2 control transfers via slave/PIO mode (feat/pi2-arm32)
 
 The DWC2's internal DMA master never initiated a transfer on the Pi 2: across a dozen HW tests the channel
@@ -846,7 +830,6 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/video.rs | 6 | permitted |
 | arch/arm/fbcon.rs | 4 | permitted |
 | arch/arm/dwc2.rs | 3 | permitted |
-| arch/arm/sdhci.rs | 3 | permitted |
 | arch/arm/page_tables.rs | 27 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |
