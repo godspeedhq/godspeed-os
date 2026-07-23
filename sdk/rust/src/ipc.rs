@@ -108,6 +108,16 @@ pub fn recv_timeout(endpoint: CapHandle, timeout_cycles: u64) -> Result<Option<M
     let mut payload = [0u8; MAX_PAYLOAD];
     // arg0 packs the buffer length (high) and the cap slot (low) to fit the 3-arg ABI.
     let packed = ((MAX_PAYLOAD as u64) << 16) | (endpoint.0 as u64 & 0xFFFF);
+    // ARM's 32-bit syscall ABI carries each argument in ONE register, and `raw_syscall` truncates a
+    // u64 arg to u32. Every OTHER arg (pointer, handle, length) genuinely fits in 32 bits, but a timeout
+    // in generic-timer ticks does NOT: at the Pi 2's ~62.5 MHz CNTFRQ, u32::MAX ticks is only ~68 s, so
+    // a longer finite timeout would truncate to a tiny value (premature wake) or - if it landed on a
+    // multiple of 2^32 - to 0, which the kernel reads as "block forever": a bounded VIII deadline turning
+    // into an infinite hang. Saturate to u32::MAX so a long finite request becomes the longest
+    // REPRESENTABLE timeout (~68 s), never a tiny one and never 0; keep a genuine 0 (block-forever) as 0.
+    // x86-64 (64-bit registers) passes the full value. (userspace-audit Audit 4, A-U1.)
+    #[cfg(target_arch = "arm")]
+    let timeout_cycles = if timeout_cycles == 0 { 0 } else { timeout_cycles.min(u32::MAX as u64).max(1) };
     // SAFETY: raw_syscall(35) = RecvTimeout; buf is a valid stack slice within user space.
     let ret = unsafe { raw_syscall(35, packed, payload.as_mut_ptr() as u64, timeout_cycles) };
     if ret == RECV_TIMED_OUT {
