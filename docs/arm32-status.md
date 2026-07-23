@@ -188,27 +188,6 @@ GodspeedOS way.
   speed win, but a protocol change to `fs` + the block IPC that risks the working persistence path for
   marginal gain on a shell OS - the block-driver is single-block PIO today, correct just not fast).
 
-## QEMU validation status (2026-07-23)
-
-The arch-neutral OS + every QEMU-emulable peripheral are green in `qemu-system-arm -M raspi2b`; the one
-gap is emulator *speed*, not correctness:
-
-- **`selfcheck` - 108+ asserts, 0 failures.** The whole non-file suite passes: gsh scripting
-  (vars/if/for/fn/defer/imports/aggregators + negative cases), IPC, `chaos kill-storm supervisor` (kill +
-  respawn, recovered), spawn/kill/wait. It does **not** finish all 163 in QEMU - **each file write takes
-  ~11 s on the TCG interpreter** (SDHCI PIO over an emulated SD), so the file-heavy tail is minutes long
-  and the harness window runs out. This is proven to be *slowness, not a defect*: an isolated write works,
-  survives a supervisor kill-storm, and **15/15 back-to-back writes complete** (~11 s each). On real
-  hardware each op is milliseconds - the T630 runs all 163 in seconds - so `selfcheck` on the Pi will
-  finish them.
-- **Kitchen-sink green:** SD (`fs`) + USB networking (DHCP/ICMP) + USB keyboard all coexist and function in
-  one boot - the real-Pi config.
-- **Everything else QEMU-verified:** boot/SMP/services/shell/IPC, persistence (format/mount/write/read/
-  append/reboot-survival), USB keyboard/storage/CDC-ECM networking, multi-device USB, `chaos max-carnage`
-  with networking, and five audit lenses (kernel/userspace/docs/unsafe/security).
-- **Untestable in QEMU:** `smsc95xx` (not emulated) and the register quirks real DWC2 silicon needs - both
-  hardware-day items.
-
 ## See also
 
 - **`kernel/src/arch/arm/CLAUDE.md`** - the implementer's reference: the ARM syscall ABI (and its one
