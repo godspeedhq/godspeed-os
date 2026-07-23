@@ -229,6 +229,27 @@ pub fn init() {
     // Ack any pending core interrupts (a stuck SOF/port flag can stall the emulated frame machine).
     wr(GINTSTS, 0xFFFF_FFFF);
 
+    // 5f. Halt every host channel into a clean, known state. A DWC2 channel can power up in an undefined
+    //     state and will then NEVER dispatch a transfer (it arms - ChEna set - but the token never goes
+    //     out, leaving the pushed bytes stuck in the FIFO), which is exactly the universal stall seen on
+    //     this board in both DMA and PIO mode. u-boot/Linux do this dance before any transfer: for each
+    //     channel, first assert ChDis (clearing ChEna), then set ChEna|ChDis together and wait for the
+    //     hardware to clear ChEna (the channel halts cleanly). NumHstChnl is GHWCFG2[17:14] + 1.
+    let num_ch = ((rd(GHWCFG2) >> 14) & 0xF) + 1;
+    for i in 0..num_ch {
+        let hcchar = 0x500 + (i as usize) * 0x20;
+        wr(hcchar, (rd(hcchar) & !((1 << 31) | (1 << 15))) | (1 << 30)); // ChDis, clear ChEna+EPDir
+    }
+    for i in 0..num_ch {
+        let hcchar = 0x500 + (i as usize) * 0x20;
+        wr(hcchar, (rd(hcchar) & !(1 << 15)) | (1 << 31) | (1 << 30));   // ChEna|ChDis -> clean halt
+        let mut t = 0u32;
+        while rd(hcchar) & (1 << 31) != 0 {                             // wait for ChEna to clear
+            t += 1;
+            if t > 1_000_000 { break; }
+        }
+    }
+
     // 6. Power the root port. Preserve the W1C change bits (mask them off so we do not clear pending
     //    connect/enable-change flags), then set PrtPwr.
     let hprt = rd(HPRT) & !HPRT_RMW_CLEAR;
