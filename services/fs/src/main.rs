@@ -319,7 +319,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // disk (I/O error - data may be intact, do NOT flash) vs a blank/raw disk (flash to format). Set on
     // the I/O-failure break paths below; left false for a genuinely blank disk (the FS_NOFS case).
     let mut storage_unreadable = false;
-    let mut fs: Option<Fs> = {
+    let mut fs: Option<Fs> = if capacity == 0 {
+        // No usable disk: block-driver reported 0 capacity after the bounded probe above (a genuinely
+        // cardless boot - e.g. the Pi 2 before the SD/EMMC driver can read the card). There is nothing
+        // to mount, and the loop below would probe LBA 0 up to MOUNT_MAX_ATTEMPTS times - each a
+        // guaranteed-failing read that logs, a ~1000-line serial flood that drowns the console. "No
+        // disk" is an authoritative truth, not an absence of answer (Commandment VIII): come up
+        // storage-unavailable at once. Marked unreadable so the serve loop stays armed to re-mount if a
+        // disk later appears - and that path re-checks capacity first, so it never re-probes an absent disk.
+        storage_unreadable = true;
+        None
+    } else {
         let mut mounted: Option<Fs> = None;
         let mut io_attempts = 0u32;
         loop {
@@ -411,14 +421,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // disk (storage_unreadable == false) stays "no filesystem" until `drives flash`.
         if fs.is_none() && storage_unreadable {
             let _ = ctx.reacquire_by_name("block-driver");
-            if let Ok(f) = Fs::mount(&ctx) {
-                ctx.log_fmt(format_args!(
-                    "fs: storage recovered - re-mounted GSFS0008 ({} blocks, {} free)",
-                    f.total_blocks, f.free_blocks
-                ));
-                capacity = f.total_blocks;
-                storage_unreadable = false;
-                fs = Some(f);
+            // Never probe an absent disk: capacity 0 -> block_capacity None, so a cardless boot does
+            // not re-flood LBA-0 reads on every request. Only attempt the re-mount once block-driver
+            // reports a real capacity again (a disk is back) - this preserves the LS1 self-heal for a
+            // present-but-transiently-unreadable disk while suppressing the no-disk flood.
+            if block_capacity(&ctx).is_some() {
+                if let Ok(f) = Fs::mount(&ctx) {
+                    ctx.log_fmt(format_args!(
+                        "fs: storage recovered - re-mounted GSFS0008 ({} blocks, {} free)",
+                        f.total_blocks, f.free_blocks
+                    ));
+                    capacity = f.total_blocks;
+                    storage_unreadable = false;
+                    fs = Some(f);
+                }
             }
         }
         // A delegated-resource badge (§7.10) is set ONLY by the kernel after it validated a real
