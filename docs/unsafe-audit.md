@@ -126,6 +126,7 @@ PHY/MDIO, and TX/RX-framing code is all safe. So `dwc2.rs` is **13**.
 | File | Change | Why |
 |------|--------|-----|
 | `arch/arm/dwc2.rs` | 3 -> 13 (+10) | DMA reinstated (`flush_dcache` +2, `DMA`-static in `ctrl_xfer`/`poll`/`bulk_xfer` +3, `PREV_KEYS`-static +1, `NET_MAC`-static write +1), USB-net bridge (`on_core0` MPIDR read +1, `NET_MAC`-static read in `net_info` +1), smsc95xx (`NET_MAC`-static write in `configure_smsc95xx` +1). Slave-mode FIFO code (all safe `rd`/`wr`) removed. |
+| `arch/arm/dwc2.rs` | 13 -> 15 (+2) | Slave/PIO pivot for the real Pi 2 v2.80a core (the internal DMA master never dispatches; `qemu`-gated, DMA kept for QEMU). `pio_out` reads the DMA scratch via a raw ptr to push into the TX FIFO (+1); `pio_in` writes it via a raw ptr while draining the RX FIFO (+1). Both are the identity-mapped scratch, bounded by `len` (SAFETY-commented). Higher layers (`ctrl_xfer`/`bulk_xfer`) unchanged. |
 
 ---
 
@@ -945,7 +946,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 6 | permitted |
 | arch/arm/fbcon.rs | 4 | permitted |
-| arch/arm/dwc2.rs | 13 | permitted |
+| arch/arm/dwc2.rs | 15 | permitted |
 | arch/arm/page_tables.rs | 27 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |

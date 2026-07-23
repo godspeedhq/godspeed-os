@@ -104,6 +104,17 @@ const GUSBCFG_FRCDEVMODE: u32 = 1 << 30; // force device mode
 // GINTSTS bit
 const GINTSTS_CURMODE_HOST: u32 = 1 << 0; // current mode: 1 = host
 
+// Slave/PIO-mode registers (real Pi 2 only: the v2.80a core's AXI DMA master never starts, so we move
+// the channel's bytes to/from the FIFO by hand). Unused in the QEMU/DMA build, hence cfg-gated.
+#[cfg(not(feature = "qemu"))]
+const GNPTXSTS: usize = 0x02C; // non-periodic TX FIFO/queue status (low 16 bits = words free)
+#[cfg(not(feature = "qemu"))]
+const GRXSTSP:  usize = 0x020; // RX status pop (reading it dequeues one RX FIFO packet-status word)
+#[cfg(not(feature = "qemu"))]
+const DFIFO0:   usize = 0x1000; // host channel-0 data FIFO push/pop window (offset from DWC2_BASE)
+#[cfg(not(feature = "qemu"))]
+const GINTSTS_RXFLVL: u32 = 1 << 4; // RX FIFO non-empty (a packet status is waiting in GRXSTSP)
+
 // HPRT bits. NOTE: PrtConnDet/PrtEnChng/PrtOvrCurrChng are write-1-to-clear; a read-modify-write that
 // sets PrtPwr/PrtRst must mask them off first or it clears pending change flags by accident.
 const HPRT_PRTCONNSTS: u32 = 1 << 0;  // device connected
@@ -251,7 +262,15 @@ pub fn init() {
     //     FIFO push/pop. The old `(3 << 1)` (AHB INCR4) with WAIT_AXI_WRITES clear let the AXI DMA master
     //     never retire its first write on real silicon (AHBIdle stuck 1, the channel armed but zero bytes
     //     moved - HW-diagnosed on the Pi 2); QEMU's AHB-style model tolerated either. This matches Circle.
+    #[cfg(feature = "qemu")]
     wr(GAHBCFG, GAHBCFG_DMAEN | GAHBCFG_WAIT_AXI_WRITES | GAHBCFG_GLBLINTRMSK);
+    // Real Pi 2 (v2.80a core): the internal AXI DMA master never starts - AHBIdle stayed 1 across ~15 HW
+    // iterations, even with Circle-exact GAHBCFG/GUSBCFG/HCFG/HFIR all verified stuck. So run SLAVE/PIO
+    // mode: DMAEN cleared, and we push/pop the channel FIFO by hand (pio_out/pio_in). QEMU emulates ONLY
+    // DMA (PIO is an unimplemented TODO there), so the QEMU build above keeps the DMA path. Gated exactly
+    // like DMA_BUS_ALIAS: one source, the transfer mechanism chosen per platform.
+    #[cfg(not(feature = "qemu"))]
+    wr(GAHBCFG, GAHBCFG_GLBLINTRMSK);
     // 5d. Enable the channel + aggregate host-channel interrupts. We poll HCINT, but some DWC2 cores
     //     (and QEMU's model) only advance a channel's transaction when its interrupt is unmasked. These
     //     never reach the CPU (the BCM2836 USB IRQ line is not wired), they just gate the state machine.
@@ -349,6 +368,14 @@ fn reset_port() {
     // busy-poll here is the right shape. The DWC2's internal DMA master never initiated a transfer on this
     // board (AHBIdle stayed 1 across a dozen HW tests), so PIO is the working path.
     LOW_SPEED.store((hprt & HPRT_PRTSPD_MASK) >> HPRT_PRTSPD_SHIFT == 2, Ordering::Relaxed);
+    // (Pi) SETTLE IN HOST MODE BEFORE THE FIRST TRANSFER. u-boot's working DWC2 waits a full second here
+    // (`dwc2_init_common`: `if (gintsts & CURMODE_HOST) mdelay(1000)`); the v2.80a core needs the settle or
+    // the channel arms but the master never dispatches the token (AHBIdle stuck 1, HW-diagnosed across many
+    // sessions in DMA AND intermittently in slave/PIO). Every prior experiment tuned CONFIG - none added
+    // this delay. Bounded spin (~1 s at the ~50 ms = 3e6 ratio the reset delays above use); one-time boot
+    // cost. HW-only: QEMU's v2.94a dispatches without it, so the settle would only slow the TCG boot.
+    #[cfg(not(feature = "qemu"))]
+    spin(60_000_000);
     enumerate_sync();
 }
 
@@ -414,9 +441,12 @@ fn chan_program(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_typ
     wr(HCTSIZ0, (len & 0x7_FFFF) | (pkts << 19) | (pid << 29));  // size, packet count, starting PID
     // The HCDMA address is a *bus* address as the DWC2 master sees memory (see DMA_BUS_ALIAS).
     wr(HCDMA0, buf_phys | DMA_BUS_ALIAS);
-    // Schedule in the NEXT frame: set OddFrm to the parity of (current frame + 1). Circle reads HFNUM and
-    // sets this on every channel start; a fixed value can leave the channel armed but never dispatched.
-    let oddfrm = if (rd(HFNUM) & 1) == 0 { HCCHAR_ODDFRM } else { 0 };
+    // Odd-frame scheduling applies to PERIODIC transfers only (the databook's HCCHAR.OddFrm). Set it just
+    // for an interrupt endpoint (ep_type 3 - the keyboard poll), scheduling the next frame from HFNUM.
+    // Setting it on a NON-periodic control/bulk transfer makes the v2.80a core DEFER the token to a
+    // matching frame and leave the pushed bytes stuck in the TX FIFO (HW-diagnosed on the Pi 2: the SETUP
+    // never transmits, GNPTXSTS shows the words still queued). So control/bulk get OddFrm = 0.
+    let oddfrm = if ep_type == 3 && (rd(HFNUM) & 1) == 0 { HCCHAR_ODDFRM } else { 0 };
     let chan = (mps & 0x7FF)
         | ((ep & 0xF) << 11)               // endpoint number
         | ((dir_in as u32) << 15)
@@ -436,6 +466,8 @@ static DUMPED: AtomicBool = AtomicBool::new(false);
 /// normal interrupt-IN halts (complete or NAK) in far fewer iterations, so this generous cap never affects
 /// the working path - it only bounds the pathological per-tick cost (the keyboard auto-recovers if the
 /// wedge clears). No diagnostic dump; that is the one-shot enumeration path's job (`wait_halt`).
+/// QEMU/DMA build only - the PIO keyboard poll uses `pio_in` with its own tight bound instead.
+#[cfg(feature = "qemu")]
 fn poll_wait_halt() -> u32 {
     let mut t = 0u32;
     loop {
@@ -446,8 +478,35 @@ fn poll_wait_halt() -> u32 {
     }
 }
 
+/// One-shot diagnostic dump of the channel + core-config state on a stalled transfer. Both the DMA path
+/// (`wait_halt`) and the slave path (`slave_wait_halt`) call it on their bounded timeout; `DUMPED` gates
+/// it to the FIRST stall so the log is never flooded.
+fn stall_dump() {
+    if DUMPED.swap(true, Ordering::Relaxed) { return; }
+    // Did the core CONSUME the pushed bytes (NPTxFSpcAvail back to full) or are they stuck in the FIFO?
+    pl011_write(b"dwc2: STALL HCCHAR="); write_hex32(rd(HCCHAR0));
+    pl011_write(b" HCTSIZ="); write_hex32(rd(HCTSIZ0));
+    pl011_write(b" GNPTXSTS="); write_hex32(rd(0x02C));
+    pl011_write(b" GINTSTS="); write_hex32(rd(GINTSTS));
+    pl011_write(b" HPRT="); write_hex32(rd(HPRT));
+    pl011_write(b" HAINT="); write_hex32(rd(HAINT));
+    pl011_write(b" GRSTCTL="); write_hex32(rd(GRSTCTL));
+    let f1 = rd(0x408); spin(300_000); let f2 = rd(0x408);
+    pl011_write(b" HFNUM1="); write_hex32(f1);
+    pl011_write(b" HFNUM2="); write_hex32(f2);
+    // Second line: did our config writes actually stick? (GAHBCFG DMAEN/slave, force-host + PHY in
+    // GUSBCFG, FSLSPClkSel in HCFG, the full-speed HFIR, the interrupt unmask.)
+    pl011_write(b"\r\ndwc2: cfg GAHBCFG="); write_hex32(rd(GAHBCFG));
+    pl011_write(b" GUSBCFG="); write_hex32(rd(GUSBCFG));
+    pl011_write(b" HCFG="); write_hex32(rd(HCFG));
+    pl011_write(b" HFIR="); write_hex32(rd(HFIR));
+    pl011_write(b" GINTMSK="); write_hex32(rd(GINTMSK));
+    pl011_write(b"\r\n");
+}
+
 /// True while `HCINT` shows the channel neither completed nor errored. Bounded so a wedged controller
-/// reports rather than hangs the boot.
+/// reports rather than hangs the boot. QEMU/DMA build only - the slave path uses `slave_wait_halt`.
+#[cfg(feature = "qemu")]
 fn wait_halt() -> u32 {
     let mut t = 0u32;
     loop {
@@ -455,28 +514,7 @@ fn wait_halt() -> u32 {
         if ci & HCINT_CHHLTD != 0 { return ci; }
         t += 1;
         if t > 4_000_000 {
-            if !DUMPED.swap(true, Ordering::Relaxed) {
-                // One-shot: did the core CONSUME the pushed SETUP bytes (NPTxFSpcAvail back to full) or
-                // are they still stuck in the FIFO (core never started the token)?
-                pl011_write(b"dwc2: STALL HCCHAR="); write_hex32(rd(HCCHAR0));
-                pl011_write(b" HCTSIZ="); write_hex32(rd(HCTSIZ0));
-                pl011_write(b" GNPTXSTS="); write_hex32(rd(0x02C));
-                pl011_write(b" GINTSTS="); write_hex32(rd(GINTSTS));
-                pl011_write(b" HPRT="); write_hex32(rd(HPRT));
-                pl011_write(b" HAINT="); write_hex32(rd(HAINT));
-                pl011_write(b" GRSTCTL="); write_hex32(rd(GRSTCTL));
-                let f1 = rd(0x408); spin(300_000); let f2 = rd(0x408);
-                pl011_write(b" HFNUM1="); write_hex32(f1);
-                pl011_write(b" HFNUM2="); write_hex32(f2);
-                // Second line: did our config writes actually stick? (DMAEN in GAHBCFG, force-host + PHY
-                // bits in GUSBCFG, FSLSPClkSel in HCFG, the full-speed HFIR, the interrupt unmask.)
-                pl011_write(b"\r\ndwc2: cfg GAHBCFG="); write_hex32(rd(GAHBCFG));
-                pl011_write(b" GUSBCFG="); write_hex32(rd(GUSBCFG));
-                pl011_write(b" HCFG="); write_hex32(rd(HCFG));
-                pl011_write(b" HFIR="); write_hex32(rd(HFIR));
-                pl011_write(b" GINTMSK="); write_hex32(rd(GINTMSK));
-                pl011_write(b"\r\n");
-            }
+            stall_dump();
             return ci | HCINT_CHHLTD; // treat as halted-without-complete -> failure
         }
     }
@@ -519,6 +557,11 @@ fn flush_dcache(addr: u32, len: u32) {
 /// the data itself. Retries on NAK / transaction-error up to `tries` times; STALL or exhausted retries is
 /// a hard failure. `tries == 1` (no backoff) is the fast path for polling an endpoint that legitimately
 /// NAKs when idle (a bulk IN with no frame queued), so an empty poll returns immediately.
+///
+/// This is the QEMU build (the only mode QEMU emulates). The real-hardware build below is the byte-
+/// identical PIO twin: same signature and retry policy, so every caller (ctrl_xfer/bulk_xfer/poll) and
+/// the DMA scratch buffer are unchanged - only HOW the bytes cross to the device differs.
+#[cfg(feature = "qemu")]
 fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u32, tries: u32) -> bool {
     for attempt in 0..tries {
         chan_program(dir_in, pid, len, buf_phys, ep, ep_type);
@@ -528,6 +571,106 @@ fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u
         if attempt + 1 < tries { spin(5_000); }         // NAK / XactErr - brief backoff, then retry
     }
     false
+}
+
+/// One SLAVE/PIO transaction (real Pi 2): program the channel, then move the bytes between the scratch at
+/// `buf_phys` and the channel FIFO ourselves - OUT pushes into the non-periodic TX FIFO, IN drains the RX
+/// FIFO. Same signature + retry policy as the DMA twin above, so ctrl_xfer/bulk_xfer are unchanged.
+#[cfg(not(feature = "qemu"))]
+fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u32, tries: u32) -> bool {
+    for attempt in 0..tries {
+        chan_program(dir_in, pid, len, buf_phys, ep, ep_type);
+        let ci = if dir_in { pio_in(buf_phys, len, 4_000_000) } else { pio_out(buf_phys, len) };
+        if ci & HCINT_XFERCOMPL != 0 { return true; }
+        if ci & (1 << 3) != 0 { return false; }         // STALL - hard failure
+        if attempt + 1 < tries { spin(5_000); }         // NAK / XactErr - brief backoff, then retry
+    }
+    false
+}
+
+/// Push `len` bytes from the scratch at `buf_phys` into the non-periodic TX FIFO one 32-bit word at a
+/// time (waiting for FIFO space each word), then wait for the channel to halt. SETUP / OUT-DATA / OUT-STATUS.
+#[cfg(not(feature = "qemu"))]
+fn pio_out(buf_phys: u32, len: u32) -> u32 {
+    let p = buf_phys as *const u8;
+    let words = (len + 3) / 4;
+    for i in 0..words {
+        let mut t = 0u32;
+        while (rd(GNPTXSTS) & 0xFFFF) == 0 {            // NPTxFSpcAvail == 0: no TX FIFO space yet
+            t += 1;
+            if t > 1_000_000 { return 0; }              // stuck: no XferCompl bit -> caller treats as failure
+        }
+        let mut w = 0u32;
+        for b in 0..4u32 {
+            let idx = i * 4 + b;
+            // SAFETY: `buf_phys` is the identity-mapped DMA scratch (a valid pointer). `idx < len`, and
+            // `len` never exceeds the scratch region the caller passed, so this reads strictly in-bounds.
+            if idx < len { w |= (unsafe { *p.add(idx as usize) } as u32) << (b * 8); }
+        }
+        wr(DFIFO0, w);
+    }
+    slave_wait_halt()
+}
+
+/// Wait for the channel to halt in SLAVE mode, DRAINING the RX status FIFO as we go. In host mode a
+/// channel's completion ("Channel Halted") status is delivered through the RX status queue (GRXSTSP), so
+/// we MUST pop it or the core stalls with RxFLvl stuck set and HCINT.ChHltd never asserting - HW-diagnosed
+/// on the Pi 2: the SETUP bytes drain from the TX FIFO (transmitted) but the channel then hangs. Discard
+/// any data attached to a status word (an OUT/SETUP completion carries none). Bounded; dumps once on stall.
+#[cfg(not(feature = "qemu"))]
+fn slave_wait_halt() -> u32 {
+    let mut t = 0u32;
+    loop {
+        while rd(GINTSTS) & GINTSTS_RXFLVL != 0 {
+            let status = rd(GRXSTSP);
+            let bcnt = (status >> 4) & 0x7FF;
+            for _ in 0..((bcnt + 3) / 4) { let _ = rd(DFIFO0); } // discard any attached data words
+            t = 0;
+        }
+        let ci = rd(HCINT0);
+        if ci & HCINT_CHHLTD != 0 { return ci; }
+        t += 1;
+        if t > 4_000_000 { stall_dump(); return ci | HCINT_CHHLTD; }
+    }
+}
+
+/// Drain the RX FIFO into the scratch at `buf_phys` as IN packets arrive (GRXSTSP gives each packet's byte
+/// count), interleaved with checking for the channel halt. `max_spin` bounds the wait so a wedged
+/// controller reports rather than hangs (enumeration passes a generous bound; the keyboard ISR poll a
+/// tight one). DATA-IN / STATUS-IN / the interrupt-endpoint report.
+#[cfg(not(feature = "qemu"))]
+fn pio_in(buf_phys: u32, len: u32, max_spin: u32) -> u32 {
+    let p = buf_phys as *mut u8;
+    let mut received = 0u32;
+    let mut t = 0u32;
+    loop {
+        // Drain every queued RX status before checking the halt, so no received data is left in the FIFO.
+        while rd(GINTSTS) & GINTSTS_RXFLVL != 0 {
+            let status = rd(GRXSTSP);
+            let bcnt = (status >> 4) & 0x7FF;
+            let pktsts = (status >> 17) & 0xF;
+            if pktsts == 2 && bcnt > 0 {                // an IN data packet is waiting in the FIFO
+                let pwords = (bcnt + 3) / 4;
+                let mut got = 0u32;
+                for _ in 0..pwords {
+                    let w = rd(DFIFO0);
+                    for b in 0..4u32 {
+                        if got < bcnt {
+                            // SAFETY: `buf_phys` is the identity-mapped DMA scratch; `received < len` and
+                            // `len` never exceeds the scratch region, so this writes strictly in-bounds.
+                            if received < len { unsafe { *p.add(received as usize) = (w >> (b * 8)) as u8; } received += 1; }
+                            got += 1;
+                        }
+                    }
+                }
+            }
+            t = 0;
+        }
+        let ci = rd(HCINT0);
+        if ci & HCINT_CHHLTD != 0 { return ci; }
+        t += 1;
+        if t > max_spin { return ci | HCINT_CHHLTD; }   // bounded -> failure if no XferCompl bit set
+    }
 }
 
 /// A single control-endpoint DMA transaction (ep 0, type control). Thin wrapper so ctrl_xfer reads clean.
@@ -1339,11 +1482,21 @@ pub fn poll() {
     unsafe {
         let d = &mut *core::ptr::addr_of_mut!(DMA);
         let data_phys = core::ptr::addr_of!(d.data) as u32;
-        flush_dcache(data_phys, 8);                               // invalidate before the device writes
-        chan_program(true, pid, 8, data_phys, ep, 3);            // one interrupt IN, up to 8 bytes
-        let ci = poll_wait_halt();                               // tighter bound: this runs in the timer ISR
-        if ci & HCINT_XFERCOMPL == 0 { return; }                 // NAK / no new report
-        flush_dcache(data_phys, 8);                               // invalidate after -> read device bytes
+        // One interrupt IN, up to 8 bytes. Tight bound: this runs in the core-0 timer ISR.
+        #[cfg(feature = "qemu")]
+        {
+            flush_dcache(data_phys, 8);                          // invalidate before the device writes
+            chan_program(true, pid, 8, data_phys, ep, 3);
+            let ci = poll_wait_halt();
+            if ci & HCINT_XFERCOMPL == 0 { return; }             // NAK / no new report
+            flush_dcache(data_phys, 8);                          // invalidate after -> read device bytes
+        }
+        #[cfg(not(feature = "qemu"))]
+        {
+            chan_program(true, pid, 8, data_phys, ep, 3);
+            let ci = pio_in(data_phys, 8, 500_000);             // drain the RX FIFO into d.data (tight ISR bound)
+            if ci & HCINT_XFERCOMPL == 0 { return; }             // NAK / no new report
+        }
         let mut report = [0u8; 8];
         report.copy_from_slice(&d.data[..8]);
         KBD_TOGGLE.store(!toggle, Ordering::Relaxed);            // advance the data toggle on a real packet
