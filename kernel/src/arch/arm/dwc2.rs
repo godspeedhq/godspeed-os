@@ -35,6 +35,7 @@ const GUSBCFG:  usize = 0x00C; // USB config (force host/device mode, PHY select
 const GRSTCTL:  usize = 0x010; // reset control (core soft reset, AHB idle)
 const GINTSTS:  usize = 0x014; // core interrupt status
 const GINTMSK:  usize = 0x018; // core interrupt mask
+const GNPTXSTS: usize = 0x02C; // non-periodic TX FIFO/queue status (low 16 = words free): did the SSPLIT drain?
 const GRXFSIZ:  usize = 0x024; // receive FIFO size
 const GNPTXFSIZ:usize = 0x028; // non-periodic transmit FIFO size
 const GSNPSID:  usize = 0x040; // Synopsys core ID ("OT2" + release, e.g. 0x4F54_294A)
@@ -629,10 +630,12 @@ fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: 
         let n = SPLIT_TRACE_N.load(Ordering::Relaxed).min(SPLIT_TRACE_MAX);
         for i in 0..n {
             // SAFETY: read-only, single-threaded, i < n <= SPLIT_TRACE_MAX (array bound).
-            let (ph, hi, hh, ci) = unsafe { (*core::ptr::addr_of!(SPLIT_TRACE))[i as usize] };
+            let (ph, hi, hh, ci, nptx, gints) = unsafe { (*core::ptr::addr_of!(SPLIT_TRACE))[i as usize] };
             pl011_write(b"  "); pl011_write(&[ph]); pl011_write(b" ");
             write_hfnum(hi); pl011_write(b" -> "); write_hfnum(hh);
-            pl011_write(b" hcint="); write_hex32(ci); pl011_write(b"\r\n");
+            pl011_write(b" hcint="); write_hex32(ci);
+            pl011_write(b" nptx="); write_hex32(nptx);
+            pl011_write(b" gints="); write_hex32(gints); pl011_write(b"\r\n");
         }
     }
     last
@@ -647,15 +650,19 @@ static SPLIT_DUMPED: AtomicBool = AtomicBool::new(false);
 const PH_SSPLIT: u8 = b'S';
 const PH_CSPLIT: u8 = b'C';
 const SPLIT_TRACE_MAX: u32 = 40;
-static mut SPLIT_TRACE: [(u8, u32, u32, u32); 40] = [(0, 0, 0, 0); 40];
+// (phase, HFNUM-issue, HFNUM-halt, HCINT, GNPTXSTS, GINTSTS) per SSPLIT/CSPLIT.
+static mut SPLIT_TRACE: [(u8, u32, u32, u32, u32, u32); 40] = [(0, 0, 0, 0, 0, 0); 40];
 static SPLIT_TRACE_N: AtomicU32 = AtomicU32::new(0);
 
 fn trace_split(phase: u8, hf_issue: u32, hf_halt: u32, hcint: u32) {
     if SPLIT_DUMPED.load(Ordering::Relaxed) { return; }         // stop capturing once the one-shot dump ran
     let n = SPLIT_TRACE_N.load(Ordering::Relaxed);
     if n < SPLIT_TRACE_MAX {
+        // Also snapshot GNPTXSTS (did the SSPLIT's 8 SETUP bytes leave the NP TX FIFO = the core actually
+        // TRANSMITTED the split, vs stuck = a core-internal reject) and GINTSTS (global state), read now at
+        // the halt. This is THE discriminator: on-the-wire XactErr vs internal reject.
         // SAFETY: single-threaded (core-0 only) capture into a fixed array, index n < SPLIT_TRACE_MAX.
-        unsafe { (*core::ptr::addr_of_mut!(SPLIT_TRACE))[n as usize] = (phase, hf_issue, hf_halt, hcint); }
+        unsafe { (*core::ptr::addr_of_mut!(SPLIT_TRACE))[n as usize] = (phase, hf_issue, hf_halt, hcint, rd(GNPTXSTS), rd(GINTSTS)); }
         SPLIT_TRACE_N.store(n + 1, Ordering::Relaxed);
     }
 }
