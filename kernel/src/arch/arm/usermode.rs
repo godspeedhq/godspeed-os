@@ -43,9 +43,14 @@ static mut RESUME: Context = Context::new();
 /// Set to the caller mode (`SPSR & 0x1f`) observed at the magic `svc`. `0x10` means USR - the proof.
 static ENTERED_MODE: AtomicU32 = AtomicU32::new(0);
 
-// Two spare VAs in the unmapped RAM/peripheral gap (see `page_tables.rs`) for the user pages.
-const USER_CODE_VA: u32 = 0x3C10_0000;
-const USER_STACK_VA: u32 = 0x3C10_1000;
+// Two spare VAs for the user pages, chosen ABOVE every identity-mapped region so the L1 slot is always
+// empty (map_in_active_tables refuses to clobber a live section). The mapped regions are RAM (0..RAM_END),
+// the framebuffer (dynamic, in the RAM/peripheral gap - QEMU lands it ~0x3C00_0000, which the old
+// 0x3C10_0000 collided with, failing the selftest under QEMU while passing on HW), peripherals
+// (0x3F00_0000..0x4000_0000), and core-local (0x4000_0000..0x4100_0000). 0x5000_0000 is clear of all of
+// them on both QEMU and real hardware.
+const USER_CODE_VA: u32 = 0x5000_0000;
+const USER_STACK_VA: u32 = 0x5000_1000;
 
 /// The user stub, PL0 code: raise the magic syscall, then spin (the kernel takes over before this
 /// spins for real). `naked` so it is pure position-independent instructions we can copy into a page.
