@@ -412,3 +412,55 @@ kill vs halt), K1 (bounded THRE poll), K3 (spurious-vector `iretq` stub); V3 (sc
 handshake); C3 (non-panic supervisor respawn). The demarcation is a mechanical `arch::x86_64::` ->
 `arch::imp::` + `core::sync::atomic::AtomicU64` -> `portable_atomic::AtomicU64` substitution, verified via
 diff to have zero logic change.
+
+## Audit 5 - 2026-07-23 (feat/pi2-arm32: the ARM32 layer we built)
+
+Method: 4 parallel subsystem auditors over the ~6,000 lines of new/changed kernel code on this branch -
+(1) `dwc2` USB driver + `timer` + `video`; (2) `exceptions` + `syscall` + `irq` (the trap/SVC path);
+(3) `mmu` + `page_tables` + `spawn` + `usermode` + the neutral `loader`; (4) `mod` boot + `context_switch`
++ the neutral `scheduler`/`task`/`dispatch`/`allocator` changes. Each triaged A/B/C; every (C) was
+adversarially re-verified against a concrete trigger (default: not-a-bug) before being recorded here, and
+every fix was build-checked on **both** armv7 and x86 (the neutral files) and boot-checked in QEMU
+`raspi2b` (arm-shell: `usermode PASS`, shell ready, 0 faults).
+
+**Result: 10 confirmed (C) violations - 8 FIXED, 2 STAGED (latent, neutral-loader).** Two were
+userspace-reachable HIGH kernel-wedges (a bad-pointer syscall halted the kernel; a magic syscall number
+diverted control into stale boot state) - both now closed. The genuine ring-3 fault path (USR-mode data/
+prefetch abort, undefined instruction) was already correct (kills only the faulting task). The SEC-25
+weak-memory port obligation is now **met** (the port this branch is). No finding is a kernel panic; the
+loader does not panic/hang on any malformed ELF.
+
+| ID | Sev | Class | What | Status |
+|----|-----|-------|------|--------|
+| **A5-1** | HIGH | (C) | `arch/arm/video.rs` `mbox_call` - 3 unbounded mailbox spins (FULL/EMPTY/response-match) run at boot before the scheduler; an absent/wedged VideoCore hangs the boot forever (invariant 12). | **FIXED** - bounded each (`MBOX_SPIN_CAP`/`MBOX_MATCH_CAP`); on timeout report + return false (callers fall back to serial). |
+| **A5-2** | HIGH | (C) | `arch/arm/mod.rs` `read_user_bytes`/`write_user_bytes` - a range-valid-but-unmapped (or, for a write, read-only) user pointer to ANY copying syscall (`log`, `send`/`call`, `recv`/`console_read`, ...) faults the raw copy in SVC mode; the abort handler classifies that as a kernel bug and HALTS the core. Any service wedges the kernel with one bad-pointer syscall (the ARM analog of x86's `USER_COPY_ACTIVE` gap). | **FIXED** - pre-validate every page via the CP15 unprivileged-translation probe (`translate_user`, non-faulting) under the service's own TTBR0; return a defined error instead. No TOCTOU (a task can't mutate its own page tables mid-syscall, nor run concurrently). |
+| **A5-3** | HIGH | (C) | `arch/arm/syscall.rs` `arm_svc_dispatch` intercepted the magic `USER_TEST_SVC` (0x5555_0001) **unconditionally**; a live service issuing `svc r0=0x55550001` diverts the kernel into a stale boot context on a boot-era `sp` (PL0-reachable wild control flow) instead of `UnknownSyscall`. | **FIXED** - gated behind `SELFTEST_ACTIVE`, armed only for the boot selftest round trip; production returns `UnknownSyscall`. |
+| **A5-4** | MED | (C) | `arch/arm/dwc2.rs` `chan_in` - the inner `RxFLvl` FIFO-drain loop reset the outer 4M timeout on every pop, so a core keeping `RxFLvl` asserted hangs forever (the 4M cap is never reached). Reachable at boot via `enumerate_sync` on a present-but-wedged core. | **FIXED** - independent `RX_DRAIN_CAP` on the inner drain. |
+| **A5-5** | MED | (C) | `arch/arm/timer.rs` `delay_us` - unbounded spin on a System Timer that never advances (dead peripheral); also made the `selftest` "did not advance" FAIL branch unreachable. | **FIXED** - `DELAY_SPIN_CAP` ceiling; returns best-effort on a stuck timer. |
+| **A5-6** | (config) | (C) | `arch/arm/sched_spawn.rs`/`sched_user.rs`/`sched_ipc.rs`/`sched_demo.rs` - the cr3/TTBR0-seed guard (`disable_interrupts` before `NEUTRAL_SCHED`) was on the shipping paths (`sched_shell`/`sched_supervisor`) but MISSING on these demo/increment paths; a timer in the window wedges the core silently (ARM liveness watchdog is off). NOT userspace-reachable (a service can't pick the boot feature). | **FIXED** - added the guard to all four, uniform with the shipping paths. |
+| **A5-7** | MED | (C)-latent | `task/scheduler.rs` (SEC-25) - `reserve_task_slot` stored `TASK_VALID` (Release) *before* `TASK_CORE` (data), and 33 `TASK_VALID` readers were `Relaxed`; on live weak-ordered 4-core ARM a reader can observe `VALID==true` with stale data. The *critical* scheduling path was already saved by the `TASK_STATE` Release/Acquire publish (no UAF today); the residual hazard was best-effort/introspection readers. | **FIXED** - write `TASK_CORE` first then `TASK_VALID` (Release); all 34 readers now Acquire. x86 codegen unchanged (Acquire load == `mov` under TSO); x86+arm both build. The SEC-25 port obligation is met. |
+| **A5-8** | LOW | (C) | `arch/arm/video.rs` `request` - GPU-returned `pitch`/`w`/`h` used unvalidated in the `fill` loop + mapping length (GPU is trusted, but defence-in-depth). | **FIXED** - range-check geometry before use (matches `query_display_size`). |
+| **A5-9** | LOW | (B->fix) | `syscall/dispatch.rs` `handle_log` - debug `[hl:*]` serial breadcrumbs left in a **neutral** file (fired on x86 too); a capless-log spammer floods serial (bounded, non-wedging console noise). | **FIXED** - removed; error returns unchanged. |
+| **A5-10** | MED | (C)-latent | `loader.rs` - `p_vaddr` never range-checked against the kernel/user VA split; a crafted ELF can overlay a USER page onto a kernel/MMIO VA in its own (kernel-shared, no per-syscall TTBR switch) address space. Latent on ARM (only trusted embedded ELFs load; fuzz/probe are x86-only), but the loader is the neutral spawn/fuzz entry. No panic/wedge (indices stay in range). | **STAGED** - add an arch-provided user-VA-window check in the loader (the missing analog of x86 higher-half separation). |
+| **A5-11** | MED | (C)-latent | `loader.rs` - on any `Err` after `PageTable::new()`, the partial page-table (L1/L2 arena slots) + already-allocated frames leak (no `Drop`, no cleanup path); repeated failed spawns permanently exhaust the 16-slot L1 arena. Degrades gracefully (errors, no panic - fuzz F3 still passes) but is an unrecoverable resource ratchet (26.6). Same root as x86 **T1** (Audit 4, staged). | **STAGED** - reclaim the partial address space on the error path (`reclaim_user_frames` + `free_page_table_root` exist), or give `PageTable` a `Drop`; fix x86 T1 + this together. |
+
+**Doc-drift corrected (Findings 3/4, Low):** `arch/CLAUDE.md` claimed `invalidate_tlb_page` broadcasts on
+ARM (it is local `TLBIMVA` - correct for pinned per-task address spaces, but the doc overstated) and did
+not record that `write_page_table_base` does no TLB maintenance (harmless - switching goes through
+`switch_context`, which flushes). Both corrected in the SEC-25/26/27 note; SEC-25 marked DONE.
+
+**Re-verified sound (no violation):** the USR-mode data/prefetch-abort + undefined-instruction handlers
+correctly kill only the faulting task and keep the kernel alive; the `stub_svc` SPSR/banked-register
+window is fully IRQ-masked and the atomic-syscall gate stops a mid-syscall preemption from clobbering
+`SPSR_svc`; `switch_context` save/restore (incl. per-task USER-banked SP/LR on both IRQ and SVC paths,
+`clrex`, TTBR0-compare+`TLBIALL` on change) is correct; `smp_bringup` is bounded (40M-spin/core then
+proceeds; core-3 mis-ID parks in `wfi`); the neutral loader validates every ELF header field before use
+(`checked_add`/`checked_mul`, bounds vs `bytes.len()`) so no malformed ELF panics or hangs; `dwc2`
+`init`/`reset_port`/`wait_halt`/`chan_out` waits are all bounded-and-loud; and there is **no**
+`panic!`/`unwrap`/`expect`/`unreachable!` anywhere in `arch/arm/`.
+
+**Observations (noted, not confirmed-reachable):** a deeply-nested syscall could overflow a task's SVC
+kernel stack and fault in SVC mode -> the A5-2 pre-validation does not cover that (no ARM kernel-stack
+guard page yet; C5-class hardening, reachability unproven). `USER_SPSR_SAVE` is a global `static mut`
+written by every `svc` across cores - benign for a selftest artifact, and dead in production once A5-3
+gated the magic path.

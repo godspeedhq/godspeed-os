@@ -120,29 +120,38 @@ race unless the port meets the obligation below. These are the security audit's 
 instead of rediscovering them as heisenbugs. (They do not affect x86, so they are not "fixed" in code on
 `feat/hardening`; they are specified here for whoever brings up SMP on a weak arch.)
 
-**1. Task-slot publication ordering (SEC-25).** The scheduler publishes a slot with a flag store and
-reads it with a flag load, then touches plain data fields (`TASK_CTX`, `TASK_IS_USER`,
-`TASK_KERNEL_STACK_TOP`, ...). For the data to be visible whenever the flag is, the *writer* stores the
-data **before** the flag with **Release**, and every *reader* loads the flag with **Acquire** before
-touching the data. Two concrete port fixes:
-- `reserve_task_slot` currently stores `TASK_VALID[i] = true` (Release) *before* `TASK_CORE[i]` - reorder
-  so `TASK_CORE` (the data) is written first and `TASK_VALID` is the Release that publishes it.
-- The ~30 `TASK_VALID.load(Relaxed)` reader sites (and field reads gated on them) become **Acquire**. On
-  x86 an Acquire load is a plain `mov` (identical codegen); on AArch64/RISC-V it emits the barrier that
-  establishes happens-before. `commit_task` already publishes fields then `TASK_STATE = Ready` (Release);
-  the SEC-1 switch-in path is already `SeqCst`.
+**1. Task-slot publication ordering (SEC-25) - DONE (ARM port, kernel-audit Audit 5).** The scheduler
+publishes a slot with a flag store and reads it with a flag load, then touches plain data fields
+(`TASK_CTX`, `TASK_IS_USER`, `TASK_KERNEL_STACK_TOP`, ...). For the data to be visible whenever the flag
+is, the *writer* stores the data **before** the flag with **Release**, and every *reader* loads the flag
+with **Acquire** before touching the data. Both are now in the code:
+- `reserve_task_slot` writes `TASK_CORE[i]` first, then `TASK_VALID[i] = true` (**Release**) - the flag
+  publishes the data, not the reverse.
+- All 34 `TASK_VALID[..].load(..)` reader sites are **Acquire**. On x86 an Acquire load / Release store is
+  a plain `mov` (identical codegen); on AArch64/RISC-V/ARMv7 it emits the barrier that establishes
+  happens-before. `commit_task` already publishes fields then `TASK_STATE = Ready` (Release); the SEC-1
+  switch-in path is already `SeqCst`.
 
-  Without this, a weak-arch reader can observe `VALID`/`Ready == true` with a **stale `TASK_CTX`/CR3/
-  kstack** - the same use-after-free class as SEC-1.
+  Without this, a weak-arch reader could observe `VALID`/`Ready == true` with a **stale `TASK_CTX`/CR3/
+  kstack** - the same use-after-free class as SEC-1. A future weak-arch port inherits the fixed ordering;
+  no action needed. (The armv7 audit confirmed the *critical* scheduling path was already saved by the
+  `TASK_STATE` Release/Acquire publish even before this - the residual hazard was best-effort/
+  introspection readers gating a field read on a Relaxed `TASK_VALID`; those are now Acquire too.)
 
 **2. An address-space switch must flush the TLB (SEC-26 / SEC-27).** The neutral kill path *elides* the
 cross-core TLB shootdown for a pinned task ("a CR3 reload flushes non-global TLB entries"). That is an
 **x86 semantic**. On AArch64 a `TTBR0_EL1`+ASID switch does not implicitly flush; RISC-V `satp` needs an
 explicit `sfence.vma`. So the `arch::imp` context-switch / `write_page_table_base` primitive on a weak
 arch MUST either (a) flush the outgoing address space's non-global entries on the switch, or (b) the
-neutral kill path must issue the cross-core shootdown it currently elides. `invalidate_tlb_page` is
-local-core on x86 but broadcasts on ARM (`TLBI VAE1`) - a correctness-neutral but worth-knowing
-difference.
+neutral kill path must issue the cross-core shootdown it currently elides. On the **armv7 port** the
+context switch takes route (a): `switch_context` writes TTBR0 then `TLBIALL`+`dsb`+`isb` on an
+address-space change, satisfying SEC-26 for the pinned single-core model. Note the arm
+`invalidate_tlb_page` is **local** (`TLBIMVA`, `c8,c7,1`), *not* an inner-shareable broadcast - correct
+for per-task pinned address spaces where an unmap runs on the task's own core, but a future *cross-core*
+unmap that assumed a broadcast would under-flush and must upgrade to `TLBIMVAIS` (`c8,c3,1`). The neutral
+`write_page_table_base` on arm does TTBR0+ISB only (no TLB maintenance); switching between private
+address spaces goes exclusively through `switch_context` (which does flush), so no neutral caller relies
+on `write_page_table_base` to flush. (kernel-audit Audit 5, Findings 3/4 - doc corrected to match code.)
 
 **Every `arch::imp` primitive owes a documented SEMANTIC, not just a signature (SEC-27).** When you add
 `arch/<isa>/`, treat each primitive's memory-ordering, TLB, and broadcast behaviour as part of the
