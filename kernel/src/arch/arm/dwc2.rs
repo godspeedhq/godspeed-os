@@ -356,7 +356,18 @@ static MPS0:      AtomicU8   = AtomicU8::new(8);       // EP0 max packet size (8
 static KBD_READY:  AtomicBool = AtomicBool::new(false); // a boot keyboard is configured + pollable
 static KBD_ADDR:   AtomicU8   = AtomicU8::new(0);       // its assigned USB address
 static KBD_EP:     AtomicU8   = AtomicU8::new(0);       // its interrupt IN endpoint number
+static KBD_MPS:    AtomicU8   = AtomicU8::new(8);       // its interrupt endpoint max-packet
+static KBD_LOW:    AtomicBool = AtomicBool::new(false); // whether it is a low-speed device
 static KBD_TOGGLE: AtomicBool = AtomicBool::new(false); // DATA0/DATA1 toggle for the interrupt endpoint
+
+/// Point channel 0 at a specific device before a transaction. With more than one device behind the hub
+/// (a keyboard AND the ethernet), the single host channel is time-shared: each transfer path selects its
+/// device's address / EP0-or-endpoint max-packet / speed into the globals `chan_program` reads.
+fn select_device(addr: u8, mps: u8, low: bool) {
+    DEV_ADDR.store(addr, Ordering::Relaxed);
+    MPS0.store(mps, Ordering::Relaxed);
+    LOW_SPEED.store(low, Ordering::Relaxed);
+}
 
 /// Program + enable channel 0 for one transaction. `ep`/`ep_type` select the endpoint (0/control for the
 /// enumeration path, the keyboard's IN endpoint / interrupt=3 for polling); device address, EP0 max-packet
@@ -585,12 +596,14 @@ fn enumerate_hub() {
     for port in 1..=nports { control_out(0x23, 0x03, PORT_POWER, port as u16); } // SET_FEATURE(PORT_POWER)
     spin(1_000_000);                                                             // ~bPwrOn2PwrGood, bounded
 
+    // Walk EVERY connected port, assigning each device a distinct USB address (2, 3, ...) and configuring
+    // it (keyboard AND ethernet can coexist behind the one hub - the Pi 2's LAN9514 topology). The single
+    // host channel is time-shared: each device's transfer path re-selects it (`select_device`).
+    let mut next_addr = 2u8;
     for port in 1..=nports {
         // Re-select the hub's own control endpoint: a prior downstream enumeration left DEV_ADDR/MPS0
         // pointing at that device, so every hub request below would otherwise go to the wrong address.
-        DEV_ADDR.store(1, Ordering::Relaxed);
-        MPS0.store(hub_mps, Ordering::Relaxed);
-        LOW_SPEED.store(false, Ordering::Relaxed);
+        select_device(1, hub_mps, false);
 
         let st = hub_get_port_status(port);
         if st & 1 == 0 { continue; }                                            // no device on this port
@@ -602,18 +615,27 @@ fn enumerate_hub() {
         let low = (st2 >> 9) & 1 == 1;                                          // wPortStatus low-speed bit
         pl011_write(b"dwc2: port "); write_hex32(port as u32);
         pl011_write(b" device status="); write_hex32(st2); pl011_write(b"\r\n");
-        if enumerate_downstream(low) { return; }                               // recognised + brought up a device
+        enumerate_downstream(low, next_addr);                                   // configure whatever it is
+        next_addr += 1;                                                         // consume the address regardless
+        if next_addr > 120 { break; }                                          // bounded (address space guard)
     }
-    pl011_write(b"dwc2: no keyboard found behind hub\r\n");
+    if !KBD_READY.load(Ordering::Relaxed) && !NET_READY.load(Ordering::Relaxed) {
+        pl011_write(b"dwc2: no keyboard or network device found behind hub\r\n");
+    }
+    // A one-shot mass-storage probe during this walk may have advanced the shared bulk toggle; reset it so
+    // the net device's first ongoing frame op starts from DATA0 (its config already set it, but a later
+    // storage probe on another port could have moved it).
+    if NET_READY.load(Ordering::Relaxed) {
+        BULK_TOGGLE_IN.store(false, Ordering::Relaxed);
+        BULK_TOGGLE_OUT.store(false, Ordering::Relaxed);
+    }
 }
 
-/// A freshly-reset downstream device answers at address 0. Learn its EP0 max-packet, move it to address 2,
-/// then dispatch by function: a boot keyboard (HID) or - proving the bulk path - a mass-storage device.
+/// A freshly-reset downstream device answers at address 0. Learn its EP0 max-packet, move it to `addr`,
+/// then dispatch by function: a boot keyboard (HID), the ethernet (CDC-ECM), or a mass-storage device.
 /// Returns true if it was one we brought up.
-fn enumerate_downstream(low: bool) -> bool {
-    DEV_ADDR.store(0, Ordering::Relaxed);
-    MPS0.store(8, Ordering::Relaxed);
-    LOW_SPEED.store(low, Ordering::Relaxed);
+fn enumerate_downstream(low: bool, addr: u8) -> bool {
+    select_device(0, 8, low);
     let mut buf = [0u8; 64];
 
     if !get_descriptor(0x80, 0x01, 0x00, 0, &mut buf, 8) {
@@ -621,8 +643,8 @@ fn enumerate_downstream(low: bool) -> bool {
     }
     MPS0.store(if buf[7] == 0 { 8 } else { buf[7] }, Ordering::Relaxed);
 
-    if !control_out(0x00, 0x05, 2, 0) { pl011_write(b"dwc2: downstream SET_ADDRESS failed\r\n"); return false; }
-    DEV_ADDR.store(2, Ordering::Relaxed);
+    if !control_out(0x00, 0x05, addr as u16, 0) { pl011_write(b"dwc2: downstream SET_ADDRESS failed\r\n"); return false; }
+    DEV_ADDR.store(addr, Ordering::Relaxed);
     spin(300_000);
 
     if !get_descriptor(0x80, 0x01, 0x00, 0, &mut buf, 18) {
@@ -646,6 +668,8 @@ fn enumerate_downstream(low: bool) -> bool {
 
 // --- CDC-ECM USB-Ethernet: raw ethernet frames over the bulk endpoints, no per-packet framing ---
 static NET_READY:  AtomicBool = AtomicBool::new(false);
+static NET_ADDR:   AtomicU8   = AtomicU8::new(0);   // the net device's assigned USB address
+static NET_LOW:    AtomicBool = AtomicBool::new(false); // whether it is a low-speed device (it is not)
 static NET_EP_IN:  AtomicU8   = AtomicU8::new(0);   // bulk IN endpoint (device -> host frames)
 static NET_EP_OUT: AtomicU8   = AtomicU8::new(0);   // bulk OUT endpoint (host -> device frames)
 static mut NET_MAC: [u8; 6] = [0; 6];               // our station MAC (the future net-stack bridge needs it)
@@ -721,6 +745,8 @@ fn configure_cdc_ecm(nconfigs: u8) -> bool {
         BULK_MPS.store(bulk_mps, Ordering::Relaxed);
         BULK_TOGGLE_IN.store(false, Ordering::Relaxed);
         BULK_TOGGLE_OUT.store(false, Ordering::Relaxed);
+        NET_ADDR.store(DEV_ADDR.load(Ordering::Relaxed), Ordering::Relaxed);
+        NET_LOW.store(LOW_SPEED.load(Ordering::Relaxed), Ordering::Relaxed);
         NET_EP_IN.store(ep_in, Ordering::Relaxed);
         NET_EP_OUT.store(ep_out, Ordering::Relaxed);
         // SAFETY: NET_MAC is written only here, during core-0 enumeration.
@@ -757,6 +783,9 @@ fn on_core0() -> bool {
 /// Transmit one ethernet frame (bulk OUT). Returns true if it was handed to the device.
 pub fn net_frame_tx(frame: &[u8]) -> bool {
     if !NET_READY.load(Ordering::Acquire) || !on_core0() { return false; }
+    // Point the shared channel at the net device (the keyboard poll may have selected itself last).
+    select_device(NET_ADDR.load(Ordering::Relaxed), BULK_MPS.load(Ordering::Relaxed),
+                  NET_LOW.load(Ordering::Relaxed));
     let ep_out = NET_EP_OUT.load(Ordering::Relaxed) as u32;
     let mut buf = [0u8; NET_FRAME_MAX];
     let n = frame.len().min(NET_FRAME_MAX);
@@ -768,6 +797,9 @@ pub fn net_frame_tx(frame: &[u8]) -> bool {
 /// 0 if none is available (the device NAKs an empty bulk IN).
 pub fn net_frame_rx(dst: &mut [u8]) -> usize {
     if !NET_READY.load(Ordering::Acquire) || !on_core0() { return 0; }
+    // Point the shared channel at the net device (the keyboard poll may have selected itself last).
+    select_device(NET_ADDR.load(Ordering::Relaxed), BULK_MPS.load(Ordering::Relaxed),
+                  NET_LOW.load(Ordering::Relaxed));
     let ep_in = NET_EP_IN.load(Ordering::Relaxed) as u32;
     let cap = dst.len().min(NET_FRAME_MAX);
     // A single bulk-IN attempt: a NAK means "no frame queued now" and must return fast (net-stack
@@ -834,7 +866,8 @@ fn configure_keyboard() -> bool {
 
     KBD_ADDR.store(DEV_ADDR.load(Ordering::Relaxed), Ordering::Relaxed);
     KBD_EP.store(ep, Ordering::Relaxed);
-    MPS0.store(ep_mps, Ordering::Relaxed);                         // interrupt-endpoint packet size for the poll
+    KBD_MPS.store(ep_mps, Ordering::Relaxed);                      // interrupt-endpoint packet size for the poll
+    KBD_LOW.store(LOW_SPEED.load(Ordering::Relaxed), Ordering::Relaxed);
     KBD_TOGGLE.store(false, Ordering::Relaxed);
     KBD_READY.store(true, Ordering::Release);
     pl011_write(b"dwc2: boot keyboard ready on ep="); write_hex32(ep as u32); pl011_write(b"\r\n");
@@ -1043,6 +1076,9 @@ fn decode_report(r: &[u8; 8]) {
 /// a completed transfer decode the boot report into console bytes. A NAK (no key change) returns quietly.
 pub fn poll() {
     if !KBD_READY.load(Ordering::Acquire) { return; }
+    // Point the shared channel at the keyboard (the net device may have selected itself last).
+    select_device(KBD_ADDR.load(Ordering::Relaxed), KBD_MPS.load(Ordering::Relaxed),
+                  KBD_LOW.load(Ordering::Relaxed));
     let ep = KBD_EP.load(Ordering::Relaxed) as u32;
     let toggle = KBD_TOGGLE.load(Ordering::Relaxed);
     let pid = if toggle { PID_DATA1 } else { PID_DATA0 };

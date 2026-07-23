@@ -32,6 +32,12 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
   per-arch `nic-driver` backend speaks the frame IPC. Verified in QEMU (`arm_run.py --usbnet`): DHCP, ARP,
   ICMP, DNS, and the shell `net` + `ping` all work over USB. The Pi 2's onboard LAN9514 (`smsc95xx`) is the
   one HW-blind device layer left; everything above it is done.
+- **Multiple USB devices coexist:** `enumerate_downstream` walks *every* hub port, gives each device a
+  distinct address, and configures all of them; the single DWC2 host channel is time-shared by having each
+  transfer path re-select its device (`select_device`: address / max-packet / speed). Verified in QEMU with
+  a keyboard + usb-net + usb-storage attached together: all three enumerate, networking flows (DHCP/ICMP),
+  and the keyboard still types **while** the network is live - the shape the real Pi 2's LAN9514
+  (hub + integrated ethernet, plus external keyboard ports) needs.
 - **Graceful degradation (loud, not silent):** `xhci`/`ehci` (front/back USB host on x86) are not ported,
   so they fail their spawn **loudly** and the system continues to a usable shell - exactly §9.2/§11.3
   ("continue with the services that started"). Without an attached SD image `block-driver` finds no card
