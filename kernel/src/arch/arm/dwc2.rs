@@ -575,28 +575,45 @@ fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u
 /// picks the tight ISR wait (the keyboard poll) over the generous one-shot enumeration wait. HCINT bits used:
 /// XferCompl0, STALL3, NAK4, ACK5, NYET6.
 fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32, bounded: bool) -> u32 {
-    // Start-Split (CompleteSplit = 0): the hub accepts the transaction; it should ACK.
-    chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt);
-    let ci = if bounded { poll_wait_halt() } else { wait_halt() };
-    if ci & (1 << 3) != 0 { return ci; }                        // STALL
-    if ci & HCINT_XFERCOMPL != 0 { return ci; }                 // (rare) already complete
-    if ci & (1 << 5) == 0 { return ci; }                        // no ACK on the start-split -> caller retries
-    // Complete-Split (CompleteSplit = 1): poll the hub for the low/full-speed result.
-    let mut csplit = 0u32;
-    loop {
-        chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt | (1 << 16));
-        let ci = if bounded { poll_wait_halt() } else { wait_halt() };
-        if ci & HCINT_XFERCOMPL != 0 { return ci; }             // the transfer completed
-        if ci & (1 << 3) != 0 { return ci; }                    // STALL
-        if ci & ((1 << 6) | (1 << 4)) != 0 {                    // NYET (6) or NAK (4): hub not ready, retry CSPLIT
-            csplit += 1;
-            if csplit > 400 { return ci; }                      // bounded so a wedged hub cannot hang the boot
-            spin(2_000);
-            continue;
+    let mut last = 0u32;
+    // A split transaction that transaction-errors is retried whole (USB 2.0 11.17.5 / 11.20). The hub's
+    // transaction translator (TT) legitimately XactErr/NAKs while busy; the host re-issues the start-split.
+    let ss_tries = if bounded { 1u32 } else { 24u32 };          // the ISR poll does ONE attempt (NAK = no key, next tick); enumeration is patient
+    for _ss in 0..ss_tries {
+        // Start-Split (CompleteSplit = 0): hand the transaction to the hub's TT; it should ACK.
+        chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt);
+        let ss = if bounded { poll_wait_halt() } else { wait_halt() };
+        last = ss;
+        if ss & (1 << 3) != 0 { return ss; }                    // STALL - real failure
+        if ss & HCINT_XFERCOMPL != 0 { return ss; }             // (rare) already complete
+        if ss & (1 << 5) == 0 { spin(20_000); continue; }       // no ACK (XactErr/NAK) -> retry the whole split
+        // Complete-Split (CompleteSplit = 1): poll the TT for the low/full-speed result.
+        let mut nyet = 0u32;
+        loop {
+            chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt | (1 << 16));
+            let cs = if bounded { poll_wait_halt() } else { wait_halt() };
+            last = cs;
+            if cs & HCINT_XFERCOMPL != 0 { return cs; }         // the transfer completed
+            if cs & (1 << 3) != 0 { return cs; }                // STALL - real failure
+            if cs & (1 << 6) != 0 {                             // NYET: TT not finished, keep polling the CSPLIT
+                nyet += 1;
+                if nyet > 500 { break; }                        // bounded; fall out to a fresh start-split
+                spin(2_000);
+                continue;
+            }
+            break;                                              // NAK (4) / XactErr (7): re-issue the start-split
         }
-        return ci;                                              // XactErr / other -> report to the retry loop
+        spin(20_000);
     }
+    if !bounded && !SPLIT_DUMPED.swap(true, Ordering::Relaxed) { // enumeration only; a poll NAK is normal (no key)
+        pl011_write(b"dwc2: split exhausted last_hcint="); write_hex32(last);
+        pl011_write(b" HCSPLT="); write_hex32(hcsplt);
+        pl011_write(b" HCCHAR="); write_hex32(rd(HCCHAR0)); pl011_write(b"\r\n");
+    }
+    last
 }
+
+static SPLIT_DUMPED: AtomicBool = AtomicBool::new(false);
 
 /// A single control-endpoint DMA transaction (ep 0, type control). Thin wrapper so ctrl_xfer reads clean.
 fn ctrl_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32) -> bool {
