@@ -368,14 +368,11 @@ fn reset_port() {
     // busy-poll here is the right shape. The DWC2's internal DMA master never initiated a transfer on this
     // board (AHBIdle stayed 1 across a dozen HW tests), so PIO is the working path.
     LOW_SPEED.store((hprt & HPRT_PRTSPD_MASK) >> HPRT_PRTSPD_SHIFT == 2, Ordering::Relaxed);
-    // (Pi) SETTLE IN HOST MODE BEFORE THE FIRST TRANSFER. u-boot's working DWC2 waits a full second here
-    // (`dwc2_init_common`: `if (gintsts & CURMODE_HOST) mdelay(1000)`); the v2.80a core needs the settle or
-    // the channel arms but the master never dispatches the token (AHBIdle stuck 1, HW-diagnosed across many
-    // sessions in DMA AND intermittently in slave/PIO). Every prior experiment tuned CONFIG - none added
-    // this delay. Bounded spin (~1 s at the ~50 ms = 3e6 ratio the reset delays above use); one-time boot
-    // cost. HW-only: QEMU's v2.94a dispatches without it, so the settle would only slow the TCG boot.
-    #[cfg(not(feature = "qemu"))]
-    spin(60_000_000);
+    // NOTE: a ~1 s host-mode settle before enumeration (u-boot's `dwc2_init_common` mdelay(1000)) was tried
+    // on HW and REMOVED - even at an accurate full second it did NOT dispatch the SETUP, and it FROZE the
+    // frame counter (HFNUM stopped advancing = SOF gated off during the long idle), so the long idle lets
+    // the port stop framing. The v2.80a "channel arms but the master won't dispatch channel 0" wall stays
+    // unresolved (DMA and PIO alike); see the git log + docs/arm32-status.md. Enumerate now (SOF is running).
     enumerate_sync();
 }
 
