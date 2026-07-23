@@ -13,6 +13,19 @@ comment.
 
 ---
 
+## 2026-07-23 - BCM2835 hardware RNG (feat/pi2-arm32)
+
+Added a hardware entropy source: `hw_random()` reads the BCM2835 SoC RNG (one-time enable + bounded wait
+for a word, then read `RNG_DATA`) in the already-Device-mapped peripheral window. Exposed ungated as
+InspectKernel query 19 (entropy confers no authority, like the raw TSC) with a `random` shell utility as
+its consumer. QEMU-verified (`random 3` returns three distinct u32s). `arch/arm/mod.rs` unsafe 40 -> 41
+(+1, one SAFETY-commented block of RNG MMIO). The other arches stub `hw_random` to `None` (no unsafe; x86
+RDRAND is a trivial follow-up).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 40 -> 41 (+1) | `hw_random` reads the BCM2835 RNG (RNG_CTRL/STATUS/DATA MMIO). |
+
 ## 2026-07-23 - BCM2835 watchdog reset (feat/pi2-arm32)
 
 `hardware_reset()` on ARM was a stub that spun, so the shell `reboot` (and Ctrl+Alt+Del) hung the Pi 2
@@ -928,7 +941,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 40 | permitted |
+| arch/arm/mod.rs | 41 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
 | arch/riscv64/mod.rs | 23 | permitted |

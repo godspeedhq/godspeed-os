@@ -1034,6 +1034,14 @@ impl ServiceContext {
         unsafe { raw_syscall(13, 17, 0, 0) }
     }
 
+    /// A hardware-random u32 from the SoC RNG (the BCM2835 RNG on the Pi 2), or None if this build exposes
+    /// no hardware RNG. Ungated (entropy confers no authority). The `random` shell utility consumes it.
+    pub fn hw_random(&self) -> Option<u32> {
+        // SAFETY: syscall(13) = InspectKernel; query 19 = a hardware-random u32 (-1 if unavailable).
+        let r = unsafe { raw_syscall(13, 19, 0, 0) };
+        if r < 0 { None } else { Some(r as u32) }
+    }
+
     /// Decode the packed RTC `u64` (the layout shared by query 11 / 12) into a `Datetime`.
     fn unpack_datetime(p: u64) -> Datetime {
         Datetime {

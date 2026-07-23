@@ -502,7 +502,7 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
 /// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
-    "wait", "watch", "whatis", "busiest",
+    "wait", "watch", "whatis", "busiest", "random",
 ];
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
@@ -1239,6 +1239,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "uptime"  => cmd_uptime(ctx),
+        "random"  => cmd_random(ctx, if argc >= 2 { args[1] } else { "" }),
         "wait"    => cmd_wait(ctx, if argc >= 2 { args[1] } else { "" }),
         "whatis"  => cmd_whatis(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "status"  => cmd_status(ctx),
@@ -5256,6 +5257,19 @@ fn cmd_uptime(ctx: &ServiceContext) -> Result<(), ShellError> {
     let t = build_uptime_table(ctx);
     let mut o = Out::Console;
     t.to_grid(&mut OutSink { ctx, out: &mut o });
+    Ok(())
+}
+
+/// `random [n]` - one (or n, bounded 1..64) hardware-random u32 from the SoC RNG (the BCM2835 RNG on the
+/// Pi 2), printed as hex + decimal. Reports loudly if the machine exposes no hardware RNG.
+fn cmd_random(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+    let n = arg.trim().parse::<u32>().unwrap_or(1).clamp(1, 64);
+    for _ in 0..n {
+        match ctx.hw_random() {
+            Some(v) => ctx.console_writeln_fmt(format_args!("{:#010x}  {}", v, v)),
+            None => { ctx.console_writeln("random: no hardware RNG on this machine"); break; }
+        }
+    }
     Ok(())
 }
 

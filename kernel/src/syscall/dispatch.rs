@@ -1313,7 +1313,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // boot/RTC reads (10, 11). Every other query discloses another task's or
     // system-wide state and requires the INTROSPECT capability with READ (§3.1;
     // docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18)
+    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -1373,6 +1373,10 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
                 && matches!(pci::NIC_VENDOR_DEVICE.load(Relaxed), 0x100E_8086 | 0x8168_10EC)) as i64;
             x | (e << 1) | (nic << 2)
         }
+        // A hardware-random u32 (the SoC RNG on ARM, RDRAND on x86), or -1 if this build has no hardware
+        // RNG. Ungated: reading entropy confers no authority (like the raw TSC, query 3). The `random`
+        // shell utility consumes it. A u32 is always 0..2^32, so it never collides with the -1 sentinel.
+        19 => match crate::arch::imp::hw_random() { Some(v) => v as i64, None => -1 },
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,

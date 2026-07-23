@@ -109,6 +109,8 @@ pub fn map_fixed_driver_mmio(_pt: &mut page_tables::PageTable, _name: &str) -> O
 
 // USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
 pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
+// No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
+pub fn hw_random() -> Option<u32> { None }
 pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }
 pub fn net_info() -> Option<([u8; 6], bool)> { None }
 pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};

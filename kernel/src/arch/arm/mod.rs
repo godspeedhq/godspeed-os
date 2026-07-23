@@ -654,6 +654,32 @@ pub fn hardware_reset() -> ! {
     loop { core::hint::spin_loop(); }
 }
 
+/// A hardware-random u32 from the BCM2835 SoC RNG, or None if it never produced (absent/wedged - loud, not
+/// a fallback). Ungated (InspectKernel query 19); the `random` shell utility consumes it. Best-effort under
+/// concurrent callers (an unlocked FIFO pop) - fine for a diagnostic, not fed to crypto.
+pub fn hw_random() -> Option<u32> {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    const RNG_CTRL:   usize = PERIPHERAL_BASE + 0x10_4000;
+    const RNG_STATUS: usize = PERIPHERAL_BASE + 0x10_4004;
+    const RNG_DATA:   usize = PERIPHERAL_BASE + 0x10_4008;
+    static INIT: AtomicBool = AtomicBool::new(false);
+    // SAFETY: the BCM2835 RNG registers are in the already-Device-mapped peripheral window; volatile
+    // 32-bit accesses. One-time enable (a warm-up count, then CTRL=1); read once a word is available.
+    unsafe {
+        if !INIT.swap(true, Ordering::Relaxed) {
+            (RNG_STATUS as *mut u32).write_volatile(0x40000);        // warm-up cycles before the first read
+            (RNG_CTRL as *mut u32).write_volatile(1);                // enable
+        }
+        // Status bits [31:24] = words available. Bounded so an absent/wedged RNG reports None, not a hang.
+        let mut n = 0u32;
+        while ((RNG_STATUS as *const u32).read_volatile() >> 24) == 0 {
+            n += 1;
+            if n > 2_000_000 { return None; }
+        }
+        Some((RNG_DATA as *const u32).read_volatile())
+    }
+}
+
 // ---- Serial / console (PL011: output = pl011_write; input = the PL011 RX FIFO drained into a ring) ----
 pub fn serial_write_byte(b: u8) { pl011_write_byte(b); }
 pub fn serial_write_bytes_lockfree(s: &[u8]) { pl011_write(s); }
