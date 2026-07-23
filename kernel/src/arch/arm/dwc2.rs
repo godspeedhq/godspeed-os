@@ -436,17 +436,24 @@ fn chan_program(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_typ
     let dev_addr = DEV_ADDR.load(Ordering::Relaxed) as u32;
     let low_speed = LOW_SPEED.load(Ordering::Relaxed) as u32;
     let pkts = if len == 0 { 1 } else { (len + mps - 1) / mps };
+    // Channel-reuse hygiene: if a prior transaction left the channel ENABLED (a timeout that never truly
+    // halted, or a split phase re-arm), disable it cleanly before reprogramming - never reuse a half-live
+    // channel (fresh-eyes checklist: stale ChEna/ChDis before reuse).
+    if rd(HCCHAR0) & (1 << 31) != 0 {
+        wr(HCCHAR0, (rd(HCCHAR0) & !(1 << 31)) | (1 << 30));    // ChDis: clear ChEna, set ChDis
+        let mut t = 0u32; while rd(HCCHAR0) & (1 << 31) != 0 { t += 1; if t > 100_000 { break; } }
+    }
     wr(HCINT0, 0xFFFF_FFFF);                                     // clear stale channel interrupts
     wr(HCSPLT0, hcsplt);                                         // split descriptor (0 = direct transaction)
     wr(HCTSIZ0, (len & 0x7_FFFF) | (pkts << 19) | (pid << 29));  // size, packet count, starting PID
     // The HCDMA address is a *bus* address as the DWC2 master sees memory (see DMA_BUS_ALIAS).
     wr(HCDMA0, buf_phys | DMA_BUS_ALIAS);
-    // Odd-frame scheduling applies to PERIODIC transfers only (the databook's HCCHAR.OddFrm). Set it just
-    // for an interrupt endpoint (ep_type 3 - the keyboard poll), scheduling the next frame from HFNUM.
-    // Setting it on a NON-periodic control/bulk transfer makes the v2.80a core DEFER the token to a
-    // matching frame and leave the pushed bytes stuck in the TX FIFO (HW-diagnosed on the Pi 2: the SETUP
-    // never transmits, GNPTXSTS shows the words still queued). So control/bulk get OddFrm = 0.
-    let oddfrm = if ep_type == 3 && (rd(HFNUM) & 1) == 0 { HCCHAR_ODDFRM } else { 0 };
+    // Odd-frame scheduling applies to PERIODIC transfers AND SPLIT transactions (a split's SSPLIT/CSPLIT
+    // are microframe-scheduled by the hub's TT - fresh-eyes checklist: derive OddFrm from the target frame
+    // including control splits). Target the NEXT microframe: OddFrm set when the current one is even (so the
+    // token lands in the next, odd, one). A direct non-periodic transfer keeps OddFrm = 0 (setting it there
+    // makes the v2.80a core defer the token and strand the bytes - HW-diagnosed).
+    let oddfrm = if (ep_type == 3 || hcsplt != 0) && (rd(HFNUM) & 1) == 0 { HCCHAR_ODDFRM } else { 0 };
     let chan = (mps & 0x7FF)
         | ((ep & 0xF) << 11)               // endpoint number
         | ((dir_in as u32) << 15)
@@ -580,40 +587,82 @@ fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: 
     // transaction translator (TT) legitimately XactErr/NAKs while busy; the host re-issues the start-split.
     let ss_tries = if bounded { 1u32 } else { 24u32 };          // the ISR poll does ONE attempt (NAK = no key, next tick); enumeration is patient
     for _ss in 0..ss_tries {
-        // Start-Split (CompleteSplit = 0): hand the transaction to the hub's TT; it should ACK.
+        // STATE 1 - issue the Start-Split (CompleteSplit = 0); capture the microframe it goes out in.
+        let hf0 = rd(HFNUM);
         chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt);
         let ss = if bounded { poll_wait_halt() } else { wait_halt() };
+        trace_split(PH_SSPLIT, hf0, rd(HFNUM), ss);
         last = ss;
-        if ss & (1 << 3) != 0 { return ss; }                    // STALL - real failure
+        if ss & (1 << 3) != 0 { break; }                        // STALL - real failure
         if ss & HCINT_XFERCOMPL != 0 { return ss; }             // (rare) already complete
-        if ss & (1 << 5) == 0 { spin(20_000); continue; }       // no ACK (XactErr/NAK) -> retry the whole split
-        // Complete-Split (CompleteSplit = 1): poll the TT for the low/full-speed result.
+        if ss & (1 << 5) == 0 { super::timer::delay_us(1_000); continue; } // no ACK -> retry next frame (REAL 1 MHz clock, not a nop-spin - Commandment VIII)
+        // STATE 2 - poll the Complete-Split (CompleteSplit = 1) for the low/full-speed result.
         let mut nyet = 0u32;
         loop {
+            let hf1 = rd(HFNUM);
             chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt | (1 << 16));
             let cs = if bounded { poll_wait_halt() } else { wait_halt() };
+            trace_split(PH_CSPLIT, hf1, rd(HFNUM), cs);
             last = cs;
             if cs & HCINT_XFERCOMPL != 0 { return cs; }         // the transfer completed
             if cs & (1 << 3) != 0 { return cs; }                // STALL - real failure
             if cs & (1 << 6) != 0 {                             // NYET: TT not finished, keep polling the CSPLIT
                 nyet += 1;
                 if nyet > 500 { break; }                        // bounded; fall out to a fresh start-split
-                spin(2_000);
+                super::timer::delay_us(125);                    // ONE microframe on the real 1 MHz clock (Commandment VIII)
                 continue;
             }
             break;                                              // NAK (4) / XactErr (7): re-issue the start-split
         }
-        spin(20_000);
+        super::timer::delay_us(1_000);                          // one frame between whole-split retries (real clock, not nop-spin)
     }
-    if !bounded && !SPLIT_DUMPED.swap(true, Ordering::Relaxed) { // enumeration only; a poll NAK is normal (no key)
-        pl011_write(b"dwc2: split exhausted last_hcint="); write_hex32(last);
+    // Enumeration only, one-shot: dump HFIR + the captured microframe trace (logging INLINE would take far
+    // longer than a 125 us microframe and destroy the timing we are measuring, so we captured it silently).
+    if !bounded && !SPLIT_DUMPED.swap(true, Ordering::Relaxed) {
+        pl011_write(b"dwc2: split fail last_hcint="); write_hex32(last);
         pl011_write(b" HCSPLT="); write_hex32(hcsplt);
-        pl011_write(b" HCCHAR="); write_hex32(rd(HCCHAR0)); pl011_write(b"\r\n");
+        pl011_write(b" HFIR="); write_hex32(rd(HFIR));
+        pl011_write(b"\r\ndwc2: split trace [phase issue.uf -> halt.uf hcint]:\r\n");
+        let n = SPLIT_TRACE_N.load(Ordering::Relaxed).min(SPLIT_TRACE_MAX);
+        for i in 0..n {
+            // SAFETY: read-only, single-threaded, i < n <= SPLIT_TRACE_MAX (array bound).
+            let (ph, hi, hh, ci) = unsafe { (*core::ptr::addr_of!(SPLIT_TRACE))[i as usize] };
+            pl011_write(b"  "); pl011_write(&[ph]); pl011_write(b" ");
+            write_hfnum(hi); pl011_write(b" -> "); write_hfnum(hh);
+            pl011_write(b" hcint="); write_hex32(ci); pl011_write(b"\r\n");
+        }
     }
     last
 }
 
 static SPLIT_DUMPED: AtomicBool = AtomicBool::new(false);
+
+// --- split microframe trace ------------------------------------------------------------------------
+// Capture (phase, HFNUM-at-issue, HFNUM-at-halt, HCINT) per SSPLIT/CSPLIT into a fixed buffer, dumped
+// ONCE after the first failing enumeration split. Never log inline in the split path: a pl011_write is
+// far slower than a 125 us microframe and would perturb the very scheduling we are measuring.
+const PH_SSPLIT: u8 = b'S';
+const PH_CSPLIT: u8 = b'C';
+const SPLIT_TRACE_MAX: u32 = 40;
+static mut SPLIT_TRACE: [(u8, u32, u32, u32); 40] = [(0, 0, 0, 0); 40];
+static SPLIT_TRACE_N: AtomicU32 = AtomicU32::new(0);
+
+fn trace_split(phase: u8, hf_issue: u32, hf_halt: u32, hcint: u32) {
+    if SPLIT_DUMPED.load(Ordering::Relaxed) { return; }         // stop capturing once the one-shot dump ran
+    let n = SPLIT_TRACE_N.load(Ordering::Relaxed);
+    if n < SPLIT_TRACE_MAX {
+        // SAFETY: single-threaded (core-0 only) capture into a fixed array, index n < SPLIT_TRACE_MAX.
+        unsafe { (*core::ptr::addr_of_mut!(SPLIT_TRACE))[n as usize] = (phase, hf_issue, hf_halt, hcint); }
+        SPLIT_TRACE_N.store(n + 1, Ordering::Relaxed);
+    }
+}
+
+/// Decode + print HFNUM as `frame.uframe`: FrNum is bits [13:0]; the low 3 bits are the microframe (0..7)
+/// in high-speed mode, the rest the frame. This is the scheduling axis a split transaction lives on.
+fn write_hfnum(hf: u32) {
+    let frnum = hf & 0x3FFF;
+    write_hex32(frnum >> 3); pl011_write(b"."); write_hex32(frnum & 0x7);
+}
 
 /// A single control-endpoint DMA transaction (ep 0, type control). Thin wrapper so ctrl_xfer reads clean.
 fn ctrl_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32) -> bool {
@@ -773,9 +822,18 @@ fn enumerate_hub() {
         if st & 1 == 0 { continue; }                                            // no device on this port
         control_out(0x23, 0x01, C_PORT_CONNECTION, port as u16);                // CLEAR_FEATURE(C_CONNECTION)
         control_out(0x23, 0x03, PORT_RESET, port as u16);                       // SET_FEATURE(PORT_RESET)
-        spin(6_000_000);                                                        // reset drive + recovery, bounded
-        let st2 = hub_get_port_status(port);
+        // Wait on the hub's TRUTH that the reset finished - PORT_RESET (wPortStatus bit 4) clears when the
+        // hub has driven the ~10-20 ms reset - not a nop-spin guess (Commandment VIII). Bounded on the REAL
+        // 1 MHz clock so a dead port cannot hang the boot; then the USB-spec reset-recovery on the real clock.
+        let mut st2 = hub_get_port_status(port);
+        let mut waited_ms = 0u32;
+        while st2 & (1 << 4) != 0 && waited_ms < 60 {                            // bit4 = PORT_RESET still asserted
+            super::timer::delay_us(1_000);
+            waited_ms += 1;
+            st2 = hub_get_port_status(port);
+        }
         control_out(0x23, 0x01, C_PORT_RESET, port as u16);                     // CLEAR_FEATURE(C_RESET)
+        super::timer::delay_us(10_000);                                         // reset-recovery (real clock, not spin)
         let low = (st2 >> 9) & 1 == 1;                                          // wPortStatus low-speed bit
         // A device that is NOT high-speed (bit 10 clear) behind this high-speed hub is reachable ONLY via
         // SPLIT transactions through this hub port; a high-speed device (ethernet/wifi) is direct.
