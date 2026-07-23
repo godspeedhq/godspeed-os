@@ -153,12 +153,19 @@ GodspeedOS way.
   bug fell out: `now_epoch_monotonic()` was a `0` stub, so `calibrate_tsc_hz` spun ~100M yields and every
   deadline wait never expired, hanging net-stack before its serve loop - now wired to the generic timer
   (`cntpct()/timer_hz()`).
-- **LAN9514 (`smsc95xx`) for the real Pi 2** - the one HW-blind piece left. The Pi 2's onboard NIC is a
-  **vendor-specific** `smsc95xx` device (class 0xFF, VID 0x0424), *not* CDC-ECM and not QEMU-emulated: it
-  needs its own device-setup + framing layer (register R/W via vendor control requests, a TX command word
-  + RX status word around each frame) as another branch of `enumerate_downstream`, over the same
-  enumeration + `bulk_xfer` + `net_frame_*` bridge that CDC-ECM already proved. Everything above it (the
-  bridge, net-stack, the utilities) is done; only this register layer awaits real-Pi verification.
+- **LAN9514 (`smsc95xx`) for the real Pi 2** - **written, HW-UNVERIFIED** (2026-07-23). The Pi 2's onboard
+  NIC is a **vendor-specific** `smsc95xx` device (class 0xFF, VID 0x0424), *not* CDC-ECM and not
+  QEMU-emulated. `configure_smsc95xx` is a clean reimplementation from the working u-boot/Linux `smsc95xx`
+  reference (per the driver doctrine): chip config via **vendor control requests** (bRequest 0xA0 write /
+  0xA1 read, register offset in wIndex), lite-reset + PHY-reset, MAC from the chip's ADDRH/ADDRL (firmware-
+  programmed) with a locally-administered fallback, MDIO PHY auto-negotiation, MAC TX/RX enable. Each TX
+  frame is prefixed with the **8-byte TX command word** and each RX frame carries a **4-byte RX status
+  word** (`net_frame_tx`/`rx` branch on `NET_KIND`). It slots into `enumerate_downstream` alongside CDC-ECM
+  over the same enumeration + `bulk_xfer` + `net_frame_*` bridge, so the whole stack above it (nic-driver,
+  net-stack, `net`/`ping`) works unchanged once the device comes up. **Every hardware wait is bounded**, so
+  a wrong assumption leaves the NIC unconfigured (net-stack degrades) rather than hanging the boot. QEMU
+  never exercises this branch, so it awaits **real-Pi verification** - the MAC-from-VideoCore-mailbox is a
+  known refinement for that pass.
 - **SDK DMA cache-coherence (SEC-28)** - `sdk/rust/src/dma.rs` assumes x86 coherent DMA; any real ARM
   driver needs cache-maintenance hooks (clean-before-device-read, invalidate-before-CPU-read) first.
 

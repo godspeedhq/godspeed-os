@@ -655,8 +655,12 @@ fn enumerate_downstream(low: bool, addr: u8) -> bool {
     pl011_write(b"dwc2: downstream VID:PID="); write_hex32((vid << 16) | pid);
     pl011_write(b" class="); write_hex32(buf[4] as u32); pl011_write(b"\r\n");
 
-    // A CDC device (class 0x02 at the device level) is a USB-Ethernet gadget. Try CDC-ECM (QEMU's usb-net,
-    // and real CDC-ECM dongles). The Pi 2's own LAN9514 is vendor-specific (smsc95xx) - a later branch.
+    // The Pi 2's onboard LAN9514 is a vendor-specific smsc95xx (class 0xFF, VID 0x0424 SMSC). Bring it up
+    // as the network device (HW-blind - QEMU never takes this branch).
+    if buf[4] == 0xFF && vid == 0x0424 && configure_smsc95xx() { return true; }
+
+    // A CDC device (class 0x02 at the device level) is a USB-Ethernet gadget: QEMU's usb-net, and real
+    // CDC-ECM dongles.
     if buf[4] == 0x02 && configure_cdc_ecm(buf[17]) { return true; }
 
     // Both HID and mass storage define their class at the interface level, so each probe reads the
@@ -673,6 +677,11 @@ static NET_LOW:    AtomicBool = AtomicBool::new(false); // whether it is a low-s
 static NET_EP_IN:  AtomicU8   = AtomicU8::new(0);   // bulk IN endpoint (device -> host frames)
 static NET_EP_OUT: AtomicU8   = AtomicU8::new(0);   // bulk OUT endpoint (host -> device frames)
 static mut NET_MAC: [u8; 6] = [0; 6];               // our station MAC (the future net-stack bridge needs it)
+// How the net device frames ethernet on its bulk endpoints. CDC-ECM carries raw frames; smsc95xx (the real
+// Pi 2 LAN9514) prepends an 8-byte TX command / 4-byte RX status word, so tx/rx branch on this.
+const NET_KIND_CDC:   u8 = 1;
+const NET_KIND_SMSC:  u8 = 2;
+static NET_KIND: AtomicU8 = AtomicU8::new(0);
 
 fn hex_val(c: u8) -> u8 {
     match c { b'0'..=b'9' => c - b'0', b'a'..=b'f' => c - b'a' + 10, b'A'..=b'F' => c - b'A' + 10, _ => 0 }
@@ -749,6 +758,7 @@ fn configure_cdc_ecm(nconfigs: u8) -> bool {
         NET_LOW.store(LOW_SPEED.load(Ordering::Relaxed), Ordering::Relaxed);
         NET_EP_IN.store(ep_in, Ordering::Relaxed);
         NET_EP_OUT.store(ep_out, Ordering::Relaxed);
+        NET_KIND.store(NET_KIND_CDC, Ordering::Relaxed);
         // SAFETY: NET_MAC is written only here, during core-0 enumeration.
         unsafe { (*core::ptr::addr_of_mut!(NET_MAC)).copy_from_slice(&mac); }
         NET_READY.store(true, Ordering::Release);
@@ -763,11 +773,155 @@ fn configure_cdc_ecm(nconfigs: u8) -> bool {
     false
 }
 
-/// Prove the USB-Ethernet frame path end to end: broadcast an ARP request for the QEMU user-net gateway
-/// (10.0.2.2) and poll the bulk IN endpoint for the reply. A frame out + a frame in through a real network
-/// stack is the verification the bulk-storage test is to mass storage.
+// --- smsc95xx (Raspberry Pi 2 LAN9514) USB-Ethernet ------------------------------------------------------
+// The Pi 2's onboard NIC. Vendor-specific (class 0xFF, VID 0x0424 SMSC), NOT CDC-ECM, and NOT emulated by
+// QEMU - so this path is HW-BLIND (written from the working u-boot/Linux `smsc95xx` reference, per the
+// driver doctrine in arch/CLAUDE.md; behaviour is cited, code is a clean reimplementation). It differs from
+// CDC-ECM in two ways: (1) all chip config is register R/W over VENDOR control requests (bRequest 0xA0 write
+// / 0xA1 read, the register offset in wIndex, a 4-byte value in the data stage); (2) each TX frame is
+// prefixed with an 8-byte TX command word and each RX frame with a 4-byte RX status word (handled in
+// net_frame_tx/rx, branched on NET_KIND). Every hardware wait is bounded so a wrong assumption can't hang
+// the boot - it just leaves the device unconfigured and net-stack degrades (invariant 12).
+
+const SMSC_HW_CFG: u16 = 0x14;
+const SMSC_HW_CFG_LRST: u32 = 0x0000_0008;      // Lite reset
+const SMSC_HW_CFG_BIR:  u32 = 0x0000_1000;      // Bulk-IN empty response (0-length packet, not a NAK storm)
+const SMSC_PM_CTRL: u16 = 0x20;
+const SMSC_PM_CTRL_PHY_RST: u32 = 0x0000_0010;
+const SMSC_AFC_CFG:  u16 = 0x2C;
+const SMSC_BURST_CAP: u16 = 0x38;
+const SMSC_BULK_IN_DLY: u16 = 0x6C;
+const SMSC_MAC_CR: u16 = 0x100;
+const SMSC_MAC_CR_TXEN: u32 = 0x0000_0008;
+const SMSC_MAC_CR_RXEN: u32 = 0x0000_0004;
+const SMSC_ADDRH: u16 = 0x104;
+const SMSC_ADDRL: u16 = 0x108;
+const SMSC_TX_CFG: u16 = 0x10;
+const SMSC_TX_CFG_ON: u32 = 0x0000_0004;
+const SMSC_MII_ADDR: u16 = 0x114;
+const SMSC_MII_DATA: u16 = 0x118;
+const SMSC_PHY_ID: u32 = 1;                     // the internal PHY is at MII address 1
+const SMSC_MII_BMCR: u32 = 0;                   // basic mode control register
+const SMSC_MII_ADVERTISE: u32 = 4;
+
+/// Write a 4-byte smsc95xx register via a vendor control OUT (bRequest 0xA0; offset in wIndex).
+fn smsc_write_reg(index: u16, value: u32) -> bool {
+    let setup = [0x40, 0xA0, 0x00, 0x00, index as u8, (index >> 8) as u8, 4, 0x00];
+    let mut data = value.to_le_bytes();
+    ctrl_xfer(&setup, &mut data, false, 4)
+}
+
+/// Read a 4-byte smsc95xx register via a vendor control IN (bRequest 0xA1; offset in wIndex).
+fn smsc_read_reg(index: u16) -> u32 {
+    let setup = [0xC0, 0xA1, 0x00, 0x00, index as u8, (index >> 8) as u8, 4, 0x00];
+    let mut data = [0u8; 4];
+    if !ctrl_xfer(&setup, &mut data, true, 4) { return 0; }
+    u32::from_le_bytes(data)
+}
+
+/// Wait (bounded) for the MII/MDIO engine to go not-busy (MII_ADDR bit 0).
+fn smsc_mii_wait() {
+    let mut n = 0u32;
+    while smsc_read_reg(SMSC_MII_ADDR) & 1 != 0 { n += 1; if n > 100_000 { break; } }
+}
+
+fn smsc_mii_read(reg: u32) -> u16 {
+    smsc_mii_wait();
+    smsc_write_reg(SMSC_MII_ADDR, (SMSC_PHY_ID << 11) | (reg << 6) | 1); // BUSY, read (WRITE bit clear)
+    smsc_mii_wait();
+    (smsc_read_reg(SMSC_MII_DATA) & 0xFFFF) as u16
+}
+
+fn smsc_mii_write(reg: u32, val: u16) {
+    smsc_mii_wait();
+    smsc_write_reg(SMSC_MII_DATA, val as u32);
+    smsc_write_reg(SMSC_MII_ADDR, (SMSC_PHY_ID << 11) | (reg << 6) | 0x02 | 1); // WRITE | BUSY
+    smsc_mii_wait();
+}
+
+/// Bring up the LAN9514: select its config, reset the chip + PHY, program the MAC, enable TX/RX, kick the
+/// PHY into auto-negotiation. HW-blind (see the section header); every wait is bounded.
+fn configure_smsc95xx() -> bool {
+    // Find the bulk endpoints + select the (single) configuration.
+    let mut cfg = [0u8; 64];
+    if !get_descriptor(0x80, 0x02, 0x00, 0, &mut cfg, 9) { return false; }
+    let total = (((cfg[2] as usize) | ((cfg[3] as usize) << 8)).max(9)).min(cfg.len());
+    if !get_descriptor(0x80, 0x02, 0x00, 0, &mut cfg, total) { return false; }
+    let cfg_val = cfg[5];
+    let mut i = 0usize;
+    let mut ep_in = 0u8;
+    let mut ep_out = 0u8;
+    let mut bulk_mps = 64u8;
+    while i + 2 <= total {
+        let blen = cfg[i] as usize;
+        if blen == 0 { break; }
+        if cfg[i + 1] == 0x05 && i + 7 <= total && cfg[i + 3] & 0x03 == 0x02 {   // bulk endpoint
+            bulk_mps = if cfg[i + 4] == 0 { 64 } else { cfg[i + 4] };
+            if cfg[i + 2] & 0x80 != 0 { ep_in = cfg[i + 2] & 0x0F; } else { ep_out = cfg[i + 2] & 0x0F; }
+        }
+        i += blen;
+    }
+    if ep_in == 0 || ep_out == 0 { pl011_write(b"dwc2: smsc no bulk endpoints\r\n"); return false; }
+    if !control_out(0x00, 0x09, cfg_val as u16, 0) { pl011_write(b"dwc2: smsc SET_CONFIG failed\r\n"); return false; }
+
+    // Lite reset the chip, then reset the PHY.
+    smsc_write_reg(SMSC_HW_CFG, smsc_read_reg(SMSC_HW_CFG) | SMSC_HW_CFG_LRST);
+    let mut n = 0u32;
+    while smsc_read_reg(SMSC_HW_CFG) & SMSC_HW_CFG_LRST != 0 { n += 1; if n > 100_000 { break; } }
+    smsc_write_reg(SMSC_PM_CTRL, smsc_read_reg(SMSC_PM_CTRL) | SMSC_PM_CTRL_PHY_RST);
+    n = 0;
+    while smsc_read_reg(SMSC_PM_CTRL) & SMSC_PM_CTRL_PHY_RST != 0 { n += 1; if n > 100_000 { break; } }
+
+    // MAC: read whatever the firmware programmed into the chip; fall back to a locally-administered address.
+    // (On a real Pi the board MAC b8:27:eb:.. comes from the VideoCore mailbox - a HW-verification-time
+    // refinement; reading the chip registers first is correct when the firmware already set them.)
+    let lo = smsc_read_reg(SMSC_ADDRL);
+    let hi = smsc_read_reg(SMSC_ADDRH);
+    let mut mac = [lo as u8, (lo >> 8) as u8, (lo >> 16) as u8, (lo >> 24) as u8, hi as u8, (hi >> 8) as u8];
+    if mac == [0u8; 6] || mac == [0xFFu8; 6] {
+        mac = [0x02, 0x00, 0x00, 0x12, 0x34, 0x56];             // locally-administered (bit 1 of byte 0 set)
+    }
+    smsc_write_reg(SMSC_ADDRL, (mac[0] as u32) | ((mac[1] as u32) << 8) | ((mac[2] as u32) << 16) | ((mac[3] as u32) << 24));
+    smsc_write_reg(SMSC_ADDRH, (mac[4] as u32) | ((mac[5] as u32) << 8));
+
+    smsc_write_reg(SMSC_HW_CFG, SMSC_HW_CFG_BIR);               // empty bulk-IN -> 0-length packet, not a NAK
+    smsc_write_reg(SMSC_BURST_CAP, 0);                          // one frame per transfer (our simple model)
+    smsc_write_reg(SMSC_BULK_IN_DLY, 0x2000);                   // smsc95xx default
+    smsc_write_reg(SMSC_AFC_CFG, 0x00F8_30A1);                  // flow-control thresholds (smsc95xx default)
+
+    // PHY: reset, advertise 10/100, restart auto-negotiation. We do NOT block on link (net-stack retries +
+    // self-configures when the link comes up).
+    smsc_mii_write(SMSC_MII_BMCR, 0x8000);                     // PHY reset
+    n = 0;
+    while smsc_mii_read(SMSC_MII_BMCR) & 0x8000 != 0 { n += 1; if n > 1000 { break; } }
+    smsc_mii_write(SMSC_MII_ADVERTISE, 0x01E1);               // 100/10 full+half, 802.3
+    smsc_mii_write(SMSC_MII_BMCR, 0x1200);                    // ANENABLE | ANRESTART
+
+    // Enable TX + RX.
+    smsc_write_reg(SMSC_MAC_CR, smsc_read_reg(SMSC_MAC_CR) | SMSC_MAC_CR_TXEN | SMSC_MAC_CR_RXEN);
+    smsc_write_reg(SMSC_TX_CFG, SMSC_TX_CFG_ON);
+
+    BULK_MPS.store(bulk_mps, Ordering::Relaxed);
+    BULK_TOGGLE_IN.store(false, Ordering::Relaxed);
+    BULK_TOGGLE_OUT.store(false, Ordering::Relaxed);
+    NET_ADDR.store(DEV_ADDR.load(Ordering::Relaxed), Ordering::Relaxed);
+    NET_LOW.store(false, Ordering::Relaxed);
+    NET_EP_IN.store(ep_in, Ordering::Relaxed);
+    NET_EP_OUT.store(ep_out, Ordering::Relaxed);
+    // SAFETY: NET_MAC is written only during core-0 enumeration.
+    unsafe { (*core::ptr::addr_of_mut!(NET_MAC)).copy_from_slice(&mac); }
+    NET_KIND.store(NET_KIND_SMSC, Ordering::Relaxed);
+    NET_READY.store(true, Ordering::Release);
+    pl011_write(b"dwc2: smsc95xx (LAN9514) up: in ep="); write_hex32(ep_in as u32);
+    pl011_write(b" out ep="); write_hex32(ep_out as u32);
+    pl011_write(b" mac="); write_hex32(u32::from_be_bytes([mac[0], mac[1], mac[2], mac[3]]));
+    write_hex32(((mac[4] as u32) << 8) | mac[5] as u32);
+    pl011_write(b" (HW-UNVERIFIED)\r\n");
+    true
+}
+
 // --- USB-net bridge: the mechanism the userspace ARM `nic-driver` calls (via syscalls) to move ethernet
-// frames to/from the CDC-ECM device. net-stack owns all protocol (ARP/IP/DHCP); this is pure transport. ---
+// frames to/from the net device. net-stack owns all protocol (ARP/IP/DHCP); this is pure transport. ---
 
 const NET_FRAME_MAX: usize = 1600;                  // matches nic-driver's FRAME_MAX
 
@@ -787,10 +941,20 @@ pub fn net_frame_tx(frame: &[u8]) -> bool {
     select_device(NET_ADDR.load(Ordering::Relaxed), BULK_MPS.load(Ordering::Relaxed),
                   NET_LOW.load(Ordering::Relaxed));
     let ep_out = NET_EP_OUT.load(Ordering::Relaxed) as u32;
-    let mut buf = [0u8; NET_FRAME_MAX];
     let n = frame.len().min(NET_FRAME_MAX);
-    buf[..n].copy_from_slice(&frame[..n]);
-    bulk_xfer(false, ep_out, &mut buf, n, 3) >= 0
+    let mut buf = [0u8; NET_FRAME_MAX + 8];                     // room for the smsc95xx 8-byte TX command
+    let total = if NET_KIND.load(Ordering::Relaxed) == NET_KIND_SMSC {
+        // smsc95xx TX command: TX_CMD_A = len | FIRST_SEG(0x2000) | LAST_SEG(0x1000); TX_CMD_B = len.
+        let a = (n as u32) | 0x0000_2000 | 0x0000_1000;
+        buf[0..4].copy_from_slice(&a.to_le_bytes());
+        buf[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+        buf[8..8 + n].copy_from_slice(&frame[..n]);
+        n + 8
+    } else {
+        buf[..n].copy_from_slice(&frame[..n]);                 // CDC-ECM: raw frame
+        n
+    };
+    bulk_xfer(false, ep_out, &mut buf, total, 3) >= 0
 }
 
 /// Receive one ethernet frame (a single bulk IN attempt), copied into `dst`. Returns the frame length, or
@@ -801,11 +965,27 @@ pub fn net_frame_rx(dst: &mut [u8]) -> usize {
     select_device(NET_ADDR.load(Ordering::Relaxed), BULK_MPS.load(Ordering::Relaxed),
                   NET_LOW.load(Ordering::Relaxed));
     let ep_in = NET_EP_IN.load(Ordering::Relaxed) as u32;
-    let cap = dst.len().min(NET_FRAME_MAX);
     // A single bulk-IN attempt: a NAK means "no frame queued now" and must return fast (net-stack
     // re-polls under its own deadline), so no retry/backoff here.
-    let got = bulk_xfer(true, ep_in, dst, cap, 1);
-    if got > 0 { got as usize } else { 0 }
+    if NET_KIND.load(Ordering::Relaxed) == NET_KIND_SMSC {
+        // smsc95xx prefixes each frame with a 4-byte RX status word: bit 15 = error summary, bits[30:16] =
+        // frame length (INCLUDING the 4-byte FCS, which we strip). The frame follows the status word.
+        let mut buf = [0u8; NET_FRAME_MAX + 4];
+        let got = bulk_xfer(true, ep_in, &mut buf, NET_FRAME_MAX + 4, 1);
+        if got < 4 { return 0; }
+        let status = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if status & 0x0000_8000 != 0 { return 0; }             // RX error summary - drop
+        let flen = ((status >> 16) & 0x3FFF) as usize;
+        if flen < 4 || 4 + flen > got as usize { return 0; }
+        let payload = flen - 4;                                 // strip the trailing FCS
+        let m = payload.min(dst.len());
+        dst[..m].copy_from_slice(&buf[4..4 + m]);
+        m
+    } else {
+        let cap = dst.len().min(NET_FRAME_MAX);                 // CDC-ECM: raw frame, no header
+        let got = bulk_xfer(true, ep_in, dst, cap, 1);
+        if got > 0 { got as usize } else { 0 }
+    }
 }
 
 /// The USB-net device's MAC + link state, or None if no net device is up. CDC-ECM's link is up once the
