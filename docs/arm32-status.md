@@ -22,11 +22,16 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
 - **Interactive shell:** a supervisor-spawned `gsh>` prompt over serial. Verified utilities in QEMU:
   `help`, `version` (`GodspeedOS 0.7.0`), `cores` (`4`), `mem`, `status`, `caps`, `roster`, pipes
   (`status | count` -> `3`), and graceful degradation (`ls` -> `ls: storage unavailable`).
-- **Graceful degradation (loud, not silent):** the Pi 2 *has* eMMC and USB, but their **drivers are not
-  ported to ARM yet**, so the hardware services (`block-driver`, `fs`, `xhci`, `ehci`, `nic-driver`,
-  `net-stack`) are placeholders that fail their spawn **loudly** ("kernel will name-wire it" / "returned
-  no endpoint cap") and the system continues to a usable shell - exactly §9.2/§11.3 ("continue with the
-  services that started").
+- **Persistence (SD/EMMC -> fs):** `block-driver` drives the Pi 2's BCM2835 EMMC (Arasan SDHCI) from
+  **userspace** (PIO; the kernel grants it the EMMC MMIO window at spawn, `arch::arm::map_fixed_driver_mmio`),
+  and `fs` mounts on top. Verified in QEMU (`--sd` an image): `drives flash` formats GSFS, files write +
+  read, and **survive a reboot** (re-mount + read-back). This unblocks the file utilities (`ls`, `read`,
+  `write`, `edit`, `drives`, ...). Needs `--release` (see below).
+- **Graceful degradation (loud, not silent):** the USB/NIC drivers are not ported yet, so `xhci`, `ehci`,
+  `nic-driver`, `net-stack` are placeholders that fail their spawn **loudly** ("kernel will name-wire it")
+  and the system continues to a usable shell - exactly §9.2/§11.3 ("continue with the services that
+  started"). Without an attached SD image `block-driver` finds no card and `fs` serves storage-unavailable
+  (loud, not a hang).
 
 ## Build + run
 
@@ -67,10 +72,10 @@ method").
 
 ## Known issues / gotchas
 
-- **Debug pipes overflow the user stack; use `--release`.** A debug (unoptimized) shell pipe frame
-  (e.g. `status | count`'s record builder) is ~600 KiB, exceeding the 256 KiB user stack, so it faults
-  the shell (which recovers via supervisor restart). Release frames fit and pipes run cleanly. The
-  release image is also 27x smaller. Build the usable OS in release.
+- **Debug frames overflow the 256 KiB user stack; use `--release`.** A debug (unoptimized) shell pipe
+  frame (`status | count`'s record builder, ~600 KiB) or `fs`'s mount/journal frame exceeds the 256 KiB
+  user stack and faults the task (it recovers via supervisor restart). Release frames fit; the release
+  image is also 27x smaller. Build the usable OS in release.
 - **No RTC on the Pi 2** (and QEMU raspi2b emulates none), so `date`/`uptime` read zeros. Not a bug -
   the x86 MC146818 CMOS RTC has no Pi equivalent; a real clock needs NTP or an I2C RTC module.
 - **The `usermode` selftest** used VAs in the framebuffer region; it now maps at `0x5000_0000` (above
@@ -85,9 +90,9 @@ GodspeedOS way.
 - **USB keyboard (DWC2)** - *in progress* (kernel-side, `arch/arm/dwc2.rs`). Control transfers via PIO;
   the current blocker's fix (halt-all-channels at init, `FSLSPClkSel` for the HS PHY) is being
   hardware-verified. See git log + memory. QEMU's DWC2 cannot complete transfers, so this needs the Pi.
-- **SD/EMMC block driver -> `fs`** - the Pi 2 has an Arasan SDHCI controller (QEMU emulates it), so this
-  is QEMU-developable. `fs` is arch-neutral and embed-ready; it just needs a working block-driver
-  backend (the current one is AHCI/PCI, x86-only). Unblocks persistence + the file utilities.
+- **SD/EMMC block driver -> `fs`** - **DONE** (2026-07-23): userspace `block-driver` SDHCI/PIO backend +
+  the kernel's fixed-peripheral MMIO grant; `fs` mounts + persists in QEMU. Remaining: real-hardware
+  verification on a Pi, and multi-block/faster transfers (PIO single-block today).
 - **LAN9514 USB-Ethernet -> `net-stack`** - far-future; the Pi 2 NIC is behind the USB hub.
 - **SDK DMA cache-coherence (SEC-28)** - `sdk/rust/src/dma.rs` assumes x86 coherent DMA; any real ARM
   driver needs cache-maintenance hooks (clean-before-device-read, invalidate-before-CPU-read) first.

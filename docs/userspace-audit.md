@@ -579,3 +579,17 @@ arm service runtime obeys the Commandments (loud graceful degradation, restart-o
 256 KiB user stack and fault the shell; it recovers via supervisor restart, and the **release** build's
 optimized frames fit and run pipes cleanly (`docs/arm32-status.md`). This is a build-environment / kernel
 user-stack matter, not a service-code defect - recorded there, not counted here.
+
+### Addendum to Audit 4 (2026-07-23): A-U2 - the `Call` syscall packing (found during SD bring-up)
+
+Building the Pi 2 SD driver surfaced a second instance of the A-U1 class that Audit 4's ABI review did
+not catch (it focused on `recv_timeout`). `sdk/rust/src/ipc.rs` `call` (syscall 41) packed **three**
+16-bit cap slots into one u64 arg - `target` (0-15), `reply` (16-31), `recv` (**32-47**). On x86-64 the
+arg is a full 64-bit register; on ARM the 32-bit ABI truncates each arg to u32, so **`recv_slot` (bits
+32-47) was dropped to 0** and the Call routed to the wrong endpoint. `request_with_reply` therefore never
+completed on ARM - `fs`'s block I/O to `block-driver` got no reply and `fs` degraded to
+storage-unavailable. **FIXED** (`7786a39`): repacked into three 32-bit-safe args (`recv` rides the high
+half of the length arg, which is `< 0xFFFF`); `handle_call` mirrors it. Transparent on x86 (same values),
+correct on ARM. **Lesson (reinforces A-U1):** any syscall that packs a value above 32 bits into one arg
+is broken on the 32-bit ABI; `arch/arm/CLAUDE.md` already warns of this, but the sweep must check *every*
+multi-field-packed syscall arg, not just obviously-wide ones like a timeout.

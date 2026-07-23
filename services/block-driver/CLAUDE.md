@@ -1,7 +1,10 @@
 # services/block-driver/
 
-Userspace **AHCI (SATA)** disk driver (persistence, v2; §6.3, `docs/ahci.md`,
-`docs/persistence.md`). **Restartable, NOT a TCB member** (Phase D amendment, §6.1,
+Userspace disk driver (persistence, v2; §6.3, `docs/ahci.md`, `docs/persistence.md`). **Two backends,
+one block-IPC protocol**, selected by `cfg(target_arch)`: **x86 = AHCI/SATA** (MMIO + DMA, `ahci.rs`);
+**ARM (Raspberry Pi 2) = BCM2835 EMMC / Arasan SDHCI** (`sdhci.rs`, PIO - no DMA/IRQ). Both are reached
+through the kernel-granted MMIO window (`ctx.mmio()`) and serve `fs` identically; `fs` never knows which.
+The rest of this doc describes the AHCI backend. **Restartable, NOT a TCB member** (Phase D amendment, §6.1,
 2026-06-17): it holds no persistent state, so its death is a supervisor restart (re-init the
 controller, re-register), not a reboot - `fs` reacquires it by name and retries (§14.3).
 
