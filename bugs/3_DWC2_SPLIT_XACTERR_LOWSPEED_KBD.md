@@ -16,6 +16,44 @@ the DWC2 split state machine needs **microframe scheduling** that we do not do.
 
 ---
 
+## 1b. UPDATE (measured on HW 2026-07-24): it is NOT microframe scheduling
+
+A non-perturbing trace was added (capture per SSPLIT/CSPLIT, dump after) and the SSPLIT was placed
+into **each of the 8 microframes** by waiting on the `HFNUM` counter truth (`wait_for_uframe`). Result:
+
+- **`HFIR = 0xEA60` (60000), and `HFNUM` advances 8 ticks/ms = a 125 us microframe.** The frame-timing
+  domain is HEALTHY. **HFIR is ruled out.**
+- **Every microframe (0..7), three full sweeps, XactErrs (`hcint=0x82`).** The Start-Split of a control
+  transfer is rejected in EVERY microframe, and fast (issue.uframe == halt.uframe). **Microframe
+  placement is ruled out** - it was the leading hypothesis; the data kills it.
+
+**New shape of the problem:** the SSPLIT (a HIGH-speed host->hub transaction) fails with a fast, placement-
+independent XactErr, even though (a) HCSPLT/HCCHAR/HCTSIZ are correct, (b) direct high-speed control
+transfers to the SAME hub's EP0 succeed (it enumerated), (c) high-speed devices behind the hub enumerate
+directly, (d) the port is reset (on the hub's truth) + enabled + shows the low-speed device connected. So
+the rejection is **below scheduling** - in how the DWC2 v2.80a forms/drives the split itself, or the TT.
+
+**Refocused suspects (research these, not timing):**
+
+1. **`HCCHAR.LSpdDev` + `SplEna` interaction on the v2.80a.** For a low-speed device DIRECTLY on a
+   full-speed bus, `LSpdDev=1` makes the core send a low-speed **PREamble**. For a SPLIT the host->hub leg
+   is HIGH-speed and must NOT be preambled - the hub does the low-speed. If the v2.80a wrongly preambles
+   the SSPLIT when `LSpdDev=1`, the HS hub would not recognize it -> fast XactErr in every microframe (fits
+   the data exactly). **Concrete experiment:** try the split with `LSpdDev=0` (keep `SplEna=1`).
+2. **Manual CSPLIT vs core-auto split (buffer-DMA).** Confirm whether the DWC2 in buffer-DMA does the
+   whole non-periodic split (SSPLIT + CSPLIT) on ONE channel enable, or software must drive both phases.
+   If the core auto-drives it, our XactErr is the FINAL result (the low-speed transaction to the device
+   failed) and the suspect shifts to device readiness, not the SSPLIT.
+3. **v2.80a split erratum.** It is an old core; check Linux dwc2 `params`/quirks and the databook errata
+   for split-transaction issues specific to 2.80a.
+4. **Is the SSPLIT even on the wire?** Add `GNPTXSTS`/`GINTSTS` to the trace - did the core consume the
+   SSPLIT data (bytes left the NP TX FIFO) or reject internally before transmitting?
+
+The instrumentation to do all of this is in place (`split_txn` trace + `wait_for_uframe`); extend the
+capture tuple with `GNPTXSTS` and flip `LSpdDev` behind a temporary constant to sweep the experiments.
+
+---
+
 ## 2. System context (so research targets the right silicon)
 
 | Thing | Value |
