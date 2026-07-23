@@ -170,10 +170,9 @@ zero code: processor modes and CP15 (`MRC`/`MCR`) instead of exception levels an
 (`MRS`/`MSR`), different MMU descriptors, different vector tables, `LDREXD` instead of `LDXR`/`STXR`.
 Budget a 32-bit ARM port as its own work; almost nothing carries over from the 64-bit one.
 
-**ARMv7 is a SEPARATE PORT from AArch64, not a variant of it.** `arch/arm/` and `arch/aarch64/` share
-zero code: processor modes and CP15 (`MRC`/`MCR`) instead of exception levels and system registers
-(`MRS`/`MSR`), different MMU descriptors, different vector tables, `LDREXD` instead of `LDXR`/`STXR`.
-Budget a 32-bit ARM port as its own work; almost nothing carries over from the 64-bit one.
+> **ARM32 lives here:** `docs/arm32-status.md` (what runs, `scripts/arm_build.py` / `scripts/arm_run.py`
+> to build + boot it, known issues) and `kernel/src/arch/arm/CLAUDE.md` (the syscall ABI, boot flow,
+> driver rules, and port hazards for implementers).
 
 **Bring-up notes (each one cost something to find):**
 

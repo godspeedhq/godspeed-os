@@ -349,9 +349,12 @@ tasks) and an SVC caller (the selftest) alike. (2) **The 32-bit ABI bug:** `sysc
 `u64` parameters, and on 32-bit ARM each `u64` is a *register pair* (number in r0:r1, arg0 in r2:r3,
 rest on the stack). Passing the four `r0-r3` values to a `u64`-parameter function read the arguments
 shifted - it showed up as a wrong echo (7400 vs 7345). `arm_svc_dispatch` takes `u32`s (one register
-each, matching r0-r3) and widens to `u64` for the neutral call; every syscall argument on this arch
-(pointer, handle, length) fits in 32 bits, so the widening is loss-free. That widening is the seam the
-SDK port will use.
+each, matching r0-r3) and widens to `u64` for the neutral call; **most** syscall arguments on this arch
+(pointer, handle, cap slot, length) fit in 32 bits, so the widening is loss-free for them. The **one
+exception** is a value that can exceed 32 bits - a `recv_timeout` in generic-timer ticks - which the
+single-register ABI would truncate; its SDK wrapper pre-clamps it on ARM (userspace-audit A-U1). The ABI
+convention + this constraint are now documented for SDK/service authors in `arch/arm/CLAUDE.md`. That
+widening is the seam the SDK port uses.
 
 **No user tasks yet (increment 3)**, and the real handlers touch per-task state, so the selftest
 proves the *entry mechanism* through a test dispatch (a mix of all four args, so a correct result

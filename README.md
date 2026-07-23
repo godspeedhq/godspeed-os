@@ -39,7 +39,7 @@ The kernel is strictly bounded: memory isolation, scheduling, IPC routing, capab
 
 ## Portability
 
-One arch-neutral kernel sits behind a single seam, `arch::imp`; everything CPU-specific lives in `arch/<isa>/`. **x86-64 is the full runnable OS** - the `os.img` you flash, with 4 cores, the shell, storage, and networking. The *same* neutral kernel is proven to compile and boot on other instruction sets: **AArch64, RISC-V, and LoongArch** boot and print to their UART, and **s390x** compiles clean (big-endian). Both **64-bit and 32-bit** word sizes are proven - 32-bit ARM and RISC-V compile clean. Adding an ISA is bounded to `arch/<isa>/` and enforced by CI; it does not touch a single arch-neutral file.
+One arch-neutral kernel sits behind a single seam, `arch::imp`; everything CPU-specific lives in `arch/<isa>/`. **x86-64 is the full runnable OS** - the `os.img` you flash, with 4 cores, the shell, storage, and networking. **32-bit ARM (Raspberry Pi 2) runs the OS too** - the same neutral kernel boots to an interactive `gsh>` shell on real Pi 2 hardware (4-core SMP, supervisor spawning services, `ping`->`pong` capability IPC); build + run it with `scripts/arm_build.py` / `scripts/arm_run.py` (see `docs/arm32-status.md`), the SD/USB drivers still in progress. The neutral kernel is *also* proven to compile and boot on **AArch64, RISC-V, and LoongArch** (they print to their UART), and **s390x** compiles clean (big-endian); 32-bit RISC-V compiles clean. Adding an ISA is bounded to `arch/<isa>/` and enforced by CI; it does not touch a single arch-neutral file.
 
 See **[docs/multi-arch.md](docs/multi-arch.md)** for the proof, and **[kernel/src/arch/CLAUDE.md](kernel/src/arch/CLAUDE.md)** for how to add one.
 

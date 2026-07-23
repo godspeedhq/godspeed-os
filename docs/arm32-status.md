@@ -22,10 +22,11 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
 - **Interactive shell:** a supervisor-spawned `gsh>` prompt over serial. Verified utilities in QEMU:
   `help`, `version` (`GodspeedOS 0.7.0`), `cores` (`4`), `mem`, `status`, `caps`, `roster`, pipes
   (`status | count` -> `3`), and graceful degradation (`ls` -> `ls: storage unavailable`).
-- **Graceful degradation (loud, not silent):** with no block device / NIC, the hardware services
-  (`block-driver`, `fs`, `xhci`, `ehci`, `nic-driver`, `net-stack`) are placeholders that fail their
-  spawn **loudly** ("kernel will name-wire it" / "returned no endpoint cap") and the system continues to
-  a usable shell - exactly §9.2/§11.3 ("continue with the services that started").
+- **Graceful degradation (loud, not silent):** the Pi 2 *has* eMMC and USB, but their **drivers are not
+  ported to ARM yet**, so the hardware services (`block-driver`, `fs`, `xhci`, `ehci`, `nic-driver`,
+  `net-stack`) are placeholders that fail their spawn **loudly** ("kernel will name-wire it" / "returned
+  no endpoint cap") and the system continues to a usable shell - exactly §9.2/§11.3 ("continue with the
+  services that started").
 
 ## Build + run
 
@@ -40,8 +41,29 @@ python scripts/arm_run.py --release --secs 15 --cmd "status | count"   # boot in
 kernel (which embeds them via `kernel/build.rs`'s `arm_built` allowlist), and objcopies to a flat
 `build/kernel7.img`. The supervisor is built with its `bare-metal` feature (the "usable OS, quiet gsh>"
 set: logger + shell, no harness probes; `ping`/`pong` spawnable on demand). Deploy to a Pi by copying
-`build/kernel7.img` to the SD card's FAT32 partition. `osdev` itself is still x86-only; these scripts are
-the ARM equivalent of `osdev build`/`run` until ARM becomes a first-class `osdev` target.
+`build/kernel7.img` to the SD card's FAT32 partition (a file copy, not a flash - `docs/multi-arch.md`);
+serial console is **115200 8N1** on the PL011. Prereqs: the same Rust nightly + `cargo` as x86, plus
+Python 3 and `qemu-system-arm`. `osdev` itself is still x86-only; these scripts are the ARM equivalent of
+`osdev build`/`run` until ARM becomes a first-class `osdev` target.
+
+### Running a new service on the Pi 2
+
+An arch-neutral service (SDK + syscalls only, no x86 hardware probe) runs on ARM unchanged. To get it
+into the ARM image you add it to **two** allowlists that must stay in sync:
+
+1. Write the service as usual (`GETTING_STARTED.md`; the `service_main(ctx)` + contract pattern is
+   arch-neutral).
+2. Add its crate/binary name to **`arm_built`** in `kernel/build.rs` (so the kernel embeds its real ARM
+   ELF instead of the empty placeholder).
+3. Add the same name to **`ARM_SERVICES`** in `scripts/arm_build.py` (so the build cross-compiles it to
+   `armv7a-none-eabi` before the kernel embeds it). The two lists are deliberately identical; keep them
+   so.
+4. Rebuild: `python scripts/arm_build.py --release`. If the supervisor should *spawn* it at boot, that is
+   a supervisor-manifest change (same as x86), not an ARM-specific step.
+
+A **hardware** driver is different - see `kernel/src/arch/arm/CLAUDE.md` (the ARM syscall ABI, the
+in-kernel-driver rule, DMA cache coherence) and `kernel/src/arch/CLAUDE.md` ("Porting a driver: the
+method").
 
 ## Known issues / gotchas
 
@@ -69,3 +91,12 @@ GodspeedOS way.
 - **LAN9514 USB-Ethernet -> `net-stack`** - far-future; the Pi 2 NIC is behind the USB hub.
 - **SDK DMA cache-coherence (SEC-28)** - `sdk/rust/src/dma.rs` assumes x86 coherent DMA; any real ARM
   driver needs cache-maintenance hooks (clean-before-device-read, invalidate-before-CPU-read) first.
+
+## See also
+
+- **`kernel/src/arch/arm/CLAUDE.md`** - the implementer's reference: the ARM syscall ABI (and its one
+  wider-than-u32 constraint), the boot flow, the in-kernel-driver rule, and the SMP/DMA hazards.
+- **`kernel/src/arch/CLAUDE.md`** - the arch boundary + "Porting a driver: the method" (the doctrine).
+- **`docs/multi-arch.md`** - the cross-arch proof and per-arch bring-up notes.
+- **Audits of this branch:** `docs/kernel-audit.md` Audit 5 (the arm32 kernel layer) and
+  `docs/userspace-audit.md` Audit 4 (the arm SDK ABI).
