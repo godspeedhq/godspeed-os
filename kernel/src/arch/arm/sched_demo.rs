@@ -96,6 +96,9 @@ pub fn run(ram_end: u32, reserve_end: u32) -> ! {
 
     // Arm the neutral preemption path: from here the timer tick drives scheduler::run's tasks via
     // switch_context, not the early context.rs demo scheduler.
+    // Mask IRQs before arming the neutral scheduler for consistency with the other paths (kernel-audit
+    // Audit 5 (C)): these demo tasks never block so cr3=0 is never reloaded, but the guard is uniform.
+    super::irq::disable_interrupts();
     super::irq::NEUTRAL_SCHED.store(true, core::sync::atomic::Ordering::Relaxed);
     pl011_write(b"sched-demo: 3 SPINNING kernel tasks committed; the TIMER will preempt them.\r\n");
     pl011_write(b"sched-demo: entering scheduler::run(0)...\r\n");

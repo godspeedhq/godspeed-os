@@ -128,7 +128,7 @@ pub(super) fn on_magic_svc() -> ! {
 /// Unprivileged translation probe (`ATS1CPUR` = user read, or `ATS1CPUW` = user write); `None` if the
 /// access is not permitted at PL0. The PL0 counterpart of the page-table selftest's privileged probes,
 /// and non-faulting for the same reason: the result lands in `PAR.F`, not an exception.
-fn translate_user(va: u32, write: bool) -> Option<u32> {
+pub(super) fn translate_user(va: u32, write: bool) -> Option<u32> {
     let par: u32;
     // SAFETY: ATS1CPUR (`c7, c8, 2`) / ATS1CPUW (`c7, c8, 3`) run an unprivileged-access translation
     // with no memory side effects; a denied access sets PAR.F rather than faulting.

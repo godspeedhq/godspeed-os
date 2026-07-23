@@ -26,6 +26,10 @@ pub fn run(ram_end: u32, reserve_end: u32) -> ! {
 
     // The neutral spawn already ran finalize_service_address_space (kernel-identity + D-cache clean)
     // per service inside spawn_service_with_config, so no extra one-shot clean is needed here.
+    // Mask IRQs before arming the neutral scheduler: the timer must not preempt into the scheduler
+    // context before run(0) seeds its cr3/TTBR0, or the first task to block wedges the core (kernel-audit
+    // Audit 5 (C); matches the shipping sched_shell/sched_supervisor guard).
+    super::irq::disable_interrupts();
     super::irq::NEUTRAL_SCHED.store(true, Ordering::Relaxed);
     pl011_write(b"sched-spawn: entering scheduler::run(0) - watch for 'logger: ready'.\r\n");
     crate::task::scheduler::run(0)

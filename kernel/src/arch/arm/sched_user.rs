@@ -114,6 +114,9 @@ pub fn run(ram_end: u32, reserve_end: u32) -> ! {
     // SAFETY: pure cache maintenance; all page tables are built by this point.
     unsafe { super::page_tables::clean_invalidate_dcache_all(); }
 
+    // Mask IRQs before arming the neutral scheduler (see sched_shell / kernel-audit Audit 5 (C)): the
+    // timer must not preempt into the scheduler context before run(0) seeds its cr3/TTBR0.
+    super::irq::disable_interrupts();
     super::irq::NEUTRAL_SCHED.store(true, Ordering::Relaxed);
     pl011_write(b"sched-user: entering scheduler::run(0) - a USER service now runs under preemption.\r\n");
     crate::task::scheduler::run(0)

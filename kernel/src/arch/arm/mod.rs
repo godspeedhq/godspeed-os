@@ -806,19 +806,48 @@ pub mod syscall_entry {
         end <= USER_END
     }
 
-    /// Borrow `len` bytes at user VA `ptr` as a slice, after range-checking. Returns `None` if the
-    /// range escapes user space.
+    /// True if EVERY page in `[ptr, ptr+len)` is accessible at PL0 for the requested access. Uses the
+    /// CP15 unprivileged-translation probe (`translate_user`, non-faulting: the result lands in PAR.F,
+    /// not an exception) under the service's own TTBR0 - the same table the copy will use.
+    ///
+    /// This is the fix for a userspace-reachable kernel wedge (kernel-audit Audit 5, (C) HIGH): a
+    /// range-valid-but-unmapped (or, for a write, read-only) user pointer passed to any copying syscall
+    /// would otherwise fault the raw copy below in SVC mode, which the abort handler classifies as a
+    /// KERNEL bug and HALTS the core - any service could wedge the kernel with one bad-pointer syscall.
+    /// Probing here rejects it with a defined error instead. Sound without a fault-recovery flag because
+    /// a task cannot modify its own page tables during its own syscall (no such syscall) and is not
+    /// running concurrently on another core, so there is no TOCTOU between probe and copy.
+    fn user_range_accessible(ptr: u64, len: usize, write: bool) -> bool {
+        if len == 0 { return true; }
+        let first = ptr as u32 & !0xFFF;
+        let last  = ((ptr as u32).wrapping_add((len - 1) as u32)) & !0xFFF;
+        let mut page = first;
+        loop {
+            if super::usermode::translate_user(page, write).is_none() { return false; }
+            if page == last { break; }
+            page = page.wrapping_add(0x1000);
+        }
+        true
+    }
+
+    /// Borrow `len` bytes at user VA `ptr` as a slice, after range-checking AND confirming every page is
+    /// user-readable. Returns `None` if the range escapes user space or is not fully mapped.
     pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
         if !validate_user_ptr(ptr, len) { return None; }
-        // SAFETY: the range is within user space and mapped in the current (service) page table; the
-        // kernel shares that table while handling the syscall, so `ptr` is directly addressable.
+        if !user_range_accessible(ptr, len, false) { return None; }
+        // SAFETY: the range is within user space, fully mapped user-readable (probed above), and the
+        // kernel shares the service page table while handling the syscall, so `ptr` is addressable and
+        // the copy cannot fault.
         Some(unsafe { core::slice::from_raw_parts(ptr as usize as *const u8, len) })
     }
 
-    /// Write `src` to user VA `dst`, after range-checking. Returns false if the range escapes user space.
+    /// Write `src` to user VA `dst`, after range-checking AND confirming every page is user-writable.
+    /// Returns false if the range escapes user space or is not fully mapped writable.
     pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool {
         if !validate_user_ptr(dst, src.len()) { return false; }
-        // SAFETY: range-checked user VA, mapped writable in the current page table (see read_user_bytes).
+        if !user_range_accessible(dst, src.len(), true) { return false; }
+        // SAFETY: range-checked user VA, probed mapped-writable at PL0 (see read_user_bytes); the copy
+        // cannot fault the kernel.
         unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst as usize as *mut u8, src.len()); }
         true
     }
