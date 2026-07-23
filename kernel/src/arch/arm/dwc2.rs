@@ -18,7 +18,7 @@
 //! reached only after enumerating that hub (a later increment). Under QEMU (`-M raspi2b,usb=on -device
 //! usb-kbd`) the keyboard attaches to the root port directly, which is what this increment detects.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use super::pl011_write;
 use super::exceptions::write_hex32;
@@ -401,6 +401,13 @@ static KBD_EP:     AtomicU8   = AtomicU8::new(0);       // its interrupt IN endp
 static KBD_MPS:    AtomicU8   = AtomicU8::new(8);       // its interrupt endpoint max-packet
 static KBD_LOW:    AtomicBool = AtomicBool::new(false); // whether it is a low-speed device
 static KBD_TOGGLE: AtomicBool = AtomicBool::new(false); // DATA0/DATA1 toggle for the interrupt endpoint
+static KBD_HUB_PORT: AtomicU8 = AtomicU8::new(0);      // hub port the keyboard is on (for split; 0 = direct)
+
+/// Hub port (1-based) the CURRENTLY-selected device sits on when it is low/full-speed behind the high-speed
+/// LAN9514 hub - such a device is only reachable via SPLIT transactions (the hub does the low-speed transfer;
+/// the host talks to the hub at high speed). 0 = a direct (high-speed or root) device, no split. Set by the
+/// enumeration/poll paths after `select_device`, which clears it. The hub itself is always device address 1.
+static SPLIT_PORT: AtomicU8 = AtomicU8::new(0);
 
 /// Point channel 0 at a specific device before a transaction. With more than one device behind the hub
 /// (a keyboard AND the ethernet), the single host channel is time-shared: each transfer path selects its
@@ -409,18 +416,28 @@ fn select_device(addr: u8, mps: u8, low: bool) {
     DEV_ADDR.store(addr, Ordering::Relaxed);
     MPS0.store(mps, Ordering::Relaxed);
     LOW_SPEED.store(low, Ordering::Relaxed);
+    SPLIT_PORT.store(0, Ordering::Relaxed);                     // direct by default; split set explicitly after
+}
+
+/// Build the HCSPLT value for the currently-selected device: 0 for a direct device, or a Start-Split
+/// descriptor (hub address 1, the device's hub port, XactPos=all, SplitEnable) when `SPLIT_PORT` is set.
+/// The caller ORs in CompleteSplit (bit 16) for the complete-split phase.
+fn hcsplt_for_current() -> u32 {
+    let port = SPLIT_PORT.load(Ordering::Relaxed) as u32;
+    if port == 0 { 0 } else { 1 | (port << 7) | (0b11 << 14) | (1 << 31) } // hubaddr=1, XactPos=all, SplEna
 }
 
 /// Program + enable channel 0 for one transaction. `ep`/`ep_type` select the endpoint (0/control for the
 /// enumeration path, the keyboard's IN endpoint / interrupt=3 for polling); device address, EP0 max-packet
-/// and speed come from the globals the enumeration steps set. The DWC2 DMA master moves the data itself.
-fn chan_program(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: u32) {
+/// and speed come from the globals the enumeration steps set. `hcsplt` is the split-transaction descriptor
+/// (0 for a direct device). The DWC2 DMA master moves the data itself.
+fn chan_program(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32) {
     let mps = MPS0.load(Ordering::Relaxed) as u32;
     let dev_addr = DEV_ADDR.load(Ordering::Relaxed) as u32;
     let low_speed = LOW_SPEED.load(Ordering::Relaxed) as u32;
     let pkts = if len == 0 { 1 } else { (len + mps - 1) / mps };
     wr(HCINT0, 0xFFFF_FFFF);                                     // clear stale channel interrupts
-    wr(HCSPLT0, 0);                                              // no split transaction (full-speed chain)
+    wr(HCSPLT0, hcsplt);                                         // split descriptor (0 = direct transaction)
     wr(HCTSIZ0, (len & 0x7_FFFF) | (pkts << 19) | (pid << 29));  // size, packet count, starting PID
     // The HCDMA address is a *bus* address as the DWC2 master sees memory (see DMA_BUS_ALIAS).
     wr(HCDMA0, buf_phys | DMA_BUS_ALIAS);
@@ -537,14 +554,48 @@ fn flush_dcache(addr: u32, len: u32) {
 /// a hard failure. `tries == 1` (no backoff) is the fast path for polling an endpoint that legitimately
 /// NAKs when idle (a bulk IN with no frame queued), so an empty poll returns immediately.
 fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u32, tries: u32) -> bool {
+    let hcsplt = hcsplt_for_current();
     for attempt in 0..tries {
-        chan_program(dir_in, pid, len, buf_phys, ep, ep_type);
-        let ci = wait_halt();
+        let ci = if hcsplt != 0 {
+            split_txn(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt, false)
+        } else {
+            chan_program(dir_in, pid, len, buf_phys, ep, ep_type, 0);
+            wait_halt()
+        };
         if ci & HCINT_XFERCOMPL != 0 { return true; }
         if ci & (1 << 3) != 0 { return false; }         // STALL - hard failure
         if attempt + 1 < tries { spin(5_000); }         // NAK / XactErr - brief backoff, then retry
     }
     false
+}
+
+/// One SPLIT transaction to a low/full-speed device behind the high-speed LAN9514 hub: a **Start-Split**
+/// (the hub captures the token and runs it at the device's low/full speed), then **Complete-Splits** polled
+/// until the hub returns the result (NYET/NAK = "not ready yet", retry). Returns the final HCINT. `bounded`
+/// picks the tight ISR wait (the keyboard poll) over the generous one-shot enumeration wait. HCINT bits used:
+/// XferCompl0, STALL3, NAK4, ACK5, NYET6.
+fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32, bounded: bool) -> u32 {
+    // Start-Split (CompleteSplit = 0): the hub accepts the transaction; it should ACK.
+    chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt);
+    let ci = if bounded { poll_wait_halt() } else { wait_halt() };
+    if ci & (1 << 3) != 0 { return ci; }                        // STALL
+    if ci & HCINT_XFERCOMPL != 0 { return ci; }                 // (rare) already complete
+    if ci & (1 << 5) == 0 { return ci; }                        // no ACK on the start-split -> caller retries
+    // Complete-Split (CompleteSplit = 1): poll the hub for the low/full-speed result.
+    let mut csplit = 0u32;
+    loop {
+        chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt | (1 << 16));
+        let ci = if bounded { poll_wait_halt() } else { wait_halt() };
+        if ci & HCINT_XFERCOMPL != 0 { return ci; }             // the transfer completed
+        if ci & (1 << 3) != 0 { return ci; }                    // STALL
+        if ci & ((1 << 6) | (1 << 4)) != 0 {                    // NYET (6) or NAK (4): hub not ready, retry CSPLIT
+            csplit += 1;
+            if csplit > 400 { return ci; }                      // bounded so a wedged hub cannot hang the boot
+            spin(2_000);
+            continue;
+        }
+        return ci;                                              // XactErr / other -> report to the retry loop
+    }
 }
 
 /// A single control-endpoint DMA transaction (ep 0, type control). Thin wrapper so ctrl_xfer reads clean.
@@ -709,9 +760,12 @@ fn enumerate_hub() {
         let st2 = hub_get_port_status(port);
         control_out(0x23, 0x01, C_PORT_RESET, port as u16);                     // CLEAR_FEATURE(C_RESET)
         let low = (st2 >> 9) & 1 == 1;                                          // wPortStatus low-speed bit
+        // A device that is NOT high-speed (bit 10 clear) behind this high-speed hub is reachable ONLY via
+        // SPLIT transactions through this hub port; a high-speed device (ethernet/wifi) is direct.
+        let split_port = if (st2 >> 10) & 1 == 0 { port } else { 0 };
         pl011_write(b"dwc2: port "); write_hex32(port as u32);
         pl011_write(b" device status="); write_hex32(st2); pl011_write(b"\r\n");
-        enumerate_downstream(low, next_addr);                                   // configure whatever it is
+        enumerate_downstream(low, next_addr, split_port);                       // configure whatever it is
         next_addr += 1;                                                         // consume the address regardless
         if next_addr > 120 { break; }                                          // bounded (address space guard)
     }
@@ -730,8 +784,12 @@ fn enumerate_hub() {
 /// A freshly-reset downstream device answers at address 0. Learn its EP0 max-packet, move it to `addr`,
 /// then dispatch by function: a boot keyboard (HID), the ethernet (CDC-ECM), or a mass-storage device.
 /// Returns true if it was one we brought up.
-fn enumerate_downstream(low: bool, addr: u8) -> bool {
+fn enumerate_downstream(low: bool, addr: u8, split_port: u8) -> bool {
     select_device(0, 8, low);
+    // A low/full-speed device behind the high-speed hub needs SPLIT for EVERY transfer (select_device
+    // above cleared it); a high-speed device gets split_port = 0 = direct. This persists through the
+    // SET_ADDRESS + descriptor reads + configure_* below (none of which re-select the device).
+    SPLIT_PORT.store(split_port, Ordering::Relaxed);
     let mut buf = [0u8; 64];
 
     if !get_descriptor(0x80, 0x01, 0x00, 0, &mut buf, 8) {
@@ -1144,6 +1202,7 @@ fn configure_keyboard() -> bool {
     KBD_EP.store(ep, Ordering::Relaxed);
     KBD_MPS.store(ep_mps, Ordering::Relaxed);                      // interrupt-endpoint packet size for the poll
     KBD_LOW.store(LOW_SPEED.load(Ordering::Relaxed), Ordering::Relaxed);
+    KBD_HUB_PORT.store(SPLIT_PORT.load(Ordering::Relaxed), Ordering::Relaxed); // remember the split path for poll()
     KBD_TOGGLE.store(false, Ordering::Relaxed);
     KBD_READY.store(true, Ordering::Release);
     pl011_write(b"dwc2: boot keyboard ready on ep="); write_hex32(ep as u32); pl011_write(b"\r\n");
@@ -1355,6 +1414,8 @@ pub fn poll() {
     // Point the shared channel at the keyboard (the net device may have selected itself last).
     select_device(KBD_ADDR.load(Ordering::Relaxed), KBD_MPS.load(Ordering::Relaxed),
                   KBD_LOW.load(Ordering::Relaxed));
+    // A low/full-speed keyboard behind the high-speed hub is reached only via SPLIT (like enumeration).
+    SPLIT_PORT.store(KBD_HUB_PORT.load(Ordering::Relaxed), Ordering::Relaxed);
     let ep = KBD_EP.load(Ordering::Relaxed) as u32;
     let toggle = KBD_TOGGLE.load(Ordering::Relaxed);
     let pid = if toggle { PID_DATA1 } else { PID_DATA0 };
@@ -1364,8 +1425,13 @@ pub fn poll() {
         let data_phys = core::ptr::addr_of!(d.data) as u32;
         // One interrupt IN, up to 8 bytes. Tight bound: this runs in the core-0 timer ISR.
         flush_dcache(data_phys, 8);                          // invalidate before the device writes
-        chan_program(true, pid, 8, data_phys, ep, 3);
-        let ci = poll_wait_halt();
+        let hcsplt = hcsplt_for_current();
+        let ci = if hcsplt != 0 {
+            split_txn(true, pid, 8, data_phys, ep, 3, hcsplt, true) // split IN, tight ISR bound
+        } else {
+            chan_program(true, pid, 8, data_phys, ep, 3, 0);
+            poll_wait_halt()
+        };
         if ci & HCINT_XFERCOMPL == 0 { return; }             // NAK / no new report
         flush_dcache(data_phys, 8);                          // invalidate after -> read device bytes
         let mut report = [0u8; 8];
