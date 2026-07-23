@@ -13,6 +13,36 @@ comment.
 
 ---
 
+## 2026-07-23 - Soundness audit of the DWC2 USB unsafe (feat/pi2-arm32)
+
+The session took `arch/arm/dwc2.rs` from 3 to 13 `unsafe` blocks (the whole USB stack: DMA control/bulk
+transfers, cache maintenance, the keyboard/net/storage device paths) plus 3 SDK ABI wrappers
+(`net_frame_tx`/`rx`/`info`). Audited all of them - a self-review plus an **independent adversarial pass**
+(a second reviewer briefed to find UB, checked against the actual concurrency machinery: `arm_irq_dispatch`,
+`stub_svc`, `NEUTRAL_SCHED` boot ordering, `uart_rx_poll`). **Verdict: no memory-safety bug (UB / OOB /
+data race).** The load-bearing facts, each verified against code not comments:
+
+- **`&mut *addr_of_mut!(DMA)` never overlaps.** The three accessors (`ctrl_xfer`/`bulk_xfer`/`poll`) are all
+  **core-0 only** (MPIDR gate on `poll`'s call site + `on_core0()` on the net syscalls) and **mutually
+  exclusive in time**: `poll` runs from the timer IRQ; the net syscalls run IRQs-masked (SVC `cpsid i`) and
+  **never block**, so the timer cannot fire mid-transfer. During *boot enumeration* `poll` is unreachable -
+  `arm_irq_dispatch` routes the tick to the demo scheduler until `NEUTRAL_SCHED` flips *after* `dwc2::init`
+  (this closes the one real-looking race: the hub walk keeps issuing `ctrl_xfer`s after `KBD_READY`/
+  `NET_READY` are set mid-walk). This invariant is now documented at the `DMA` static.
+- **Device-controlled lengths are all bounded before a copy** (`bulk_xfer` HCTSIZ residual only *shrinks*
+  `recv`; `net_frame_rx` smsc `flen` hard-checked `4 + flen > got`; every descriptor-parse loop guards
+  `i + k <= total`). No transfer exceeds the 2048-byte scratch buffer. No `MPS0 == 0` div-by-zero.
+- **`NET_MAC` / `PREV_KEYS` statics** are boot-single-writer (Release) / core-0-single-accessor; `net_info`
+  reads `NET_MAC` after an Acquire on `NET_READY`. **SDK wrappers** pass a 32-bit pointer + length <= 1600
+  (no ABI truncation) and the kernel range-checks every user pointer.
+
+**Two latent robustness gaps hardened (P1/P2, neither reachable by any current caller or device input):**
+`ctrl_xfer`'s OUT path could panic (`&data[..n]` with `n = dlen.min(2048)`, not `.min(data.len())`) and
+programmed the DMA length unclamped to the scratch buffer. Both now clamp to `min(d.data.len(), data.len())`
+- symmetric with `bulk_xfer` - so a future caller with `dlen > data.len()` can neither panic nor DMA past
+the buffer. No new `unsafe` (edits to an existing block + comments); `dwc2.rs` stays at **13**. One liveness
+(not safety) note recorded: a wedged controller spins the core IRQs-off for the bounded `wait_halt` timeout.
+
 ## 2026-07-23 - DWC2 USB keyboard: DMA mode + hub enumeration + HID poll (feat/pi2-arm32)
 
 The slave/PIO experiment (entry below) got control transfers working on QEMU's DWC2 model *only for the

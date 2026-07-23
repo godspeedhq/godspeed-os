@@ -428,6 +428,16 @@ fn wait_halt() -> u32 {
 /// it via the bus alias (`chan_program`). 64-byte aligned, and `setup` is padded to a full 64 bytes so
 /// `data` starts on its own cache line (the clean/invalidate bracket never straddles setup + data). The
 /// `data` region holds a full disk block (512) or ethernet frame (~1514) for bulk transfers.
+///
+/// SOUNDNESS INVARIANT (the `&mut *addr_of_mut!(DMA)` in `ctrl_xfer`/`bulk_xfer`/`poll` must never
+/// overlap): every DMA access is **core-0 only** and the accessors are **mutually exclusive in time**.
+/// This rests on two properties that any future edit MUST preserve:
+///   1. `poll()` runs only from the core-0 timer tick, and `net_frame_tx/rx` only from a syscall guarded
+///      by `on_core0()` - so no cross-core and no off-core access.
+///   2. `net_frame_tx/rx` (and everything they call) **never block** - no `yield`/`recv`/`enable_interrupts`.
+///      The SVC entry masks IRQs, so a non-blocking syscall keeps them masked start-to-finish; the timer
+///      cannot fire and `poll()` cannot interleave. Adding a blocking call to the net path would re-enable
+///      IRQs mid-transfer and let `poll()` alias this buffer - a data race. Keep the net path synchronous.
 #[repr(C, align(64))]
 struct DmaBuf { setup: [u8; 64], data: [u8; 2048] }
 static mut DMA: DmaBuf = DmaBuf { setup: [0; 64], data: [0; 2048] };
@@ -484,16 +494,21 @@ fn ctrl_xfer(setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize) -> bo
 
         if dlen > 0 {
             if data_in {
-                flush_dcache(data_phys, dlen as u32); // invalidate the line before the device writes it
-                if !ctrl_dma(true, PID_DATA1, data_phys, dlen as u32) { pl011_write(b"dwc2: DATA failed\r\n"); return false; }
-                flush_dcache(data_phys, dlen as u32); // invalidate after -> the CPU reads device-written bytes
-                let n = dlen.min(d.data.len()).min(data.len());
+                // Never let the device DMA past the scratch buffer (clamp the programmed length, not just
+                // the copy-out). All current callers pass dlen <= ~160, but defend the buffer regardless.
+                let want = dlen.min(d.data.len());
+                flush_dcache(data_phys, want as u32); // invalidate the line before the device writes it
+                if !ctrl_dma(true, PID_DATA1, data_phys, want as u32) { pl011_write(b"dwc2: DATA failed\r\n"); return false; }
+                flush_dcache(data_phys, want as u32); // invalidate after -> the CPU reads device-written bytes
+                let n = want.min(data.len());
                 data[..n].copy_from_slice(&d.data[..n]);
             } else {
-                let n = dlen.min(d.data.len());
+                // Send only what fits in BOTH the scratch buffer and the source slice - so a future caller
+                // with dlen > data.len() can neither panic the `&data[..n]` copy nor DMA past the buffer.
+                let n = dlen.min(d.data.len()).min(data.len());
                 d.data[..n].copy_from_slice(&data[..n]);
-                flush_dcache(data_phys, dlen as u32);
-                if !ctrl_dma(false, PID_DATA1, data_phys, dlen as u32) { pl011_write(b"dwc2: DATA failed\r\n"); return false; }
+                flush_dcache(data_phys, n as u32);
+                if !ctrl_dma(false, PID_DATA1, data_phys, n as u32) { pl011_write(b"dwc2: DATA failed\r\n"); return false; }
             }
         }
 
