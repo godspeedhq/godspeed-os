@@ -547,3 +547,35 @@ opened. The real mechanism is two parts:
 fs re-attempts the mount on a request while degraded (self-heal, no manual kill needed); block-driver
 waits for `PxTFD.BSY/DRQ` to clear before reading `PxSIG` (robust detection). **SEC-5** (subtree revoke)
 remains a real, separate fix - it is **not** the LS1 fix.
+
+---
+
+## Audit 4 - 2026-07-23 (feat/pi2-arm32: the ARM32 userspace we touched)
+
+Scope: **only** the userspace changed for the arm32 port. The service crates (supervisor, logger, shell,
+ping/pong, examples) are **arch-neutral and unchanged** on this branch - they cross-compile to armv7 and
+run as-is, so their Commandment compliance is what Audits 1-3 already established. The arm32-specific
+userspace surface is exactly **three files, 62 lines**: the SDK's ARM syscall ABI (`sdk/rust/src/
+syscall.rs`), the SDK's ARM adversarial fault primitives (`sdk/rust/src/adversarial.rs`, the §18.1 audited
+test module), and the user linker script (`services/user.ld`). Method: direct thorough read, cross-checking
+the ABI against the kernel's `arm_svc_dispatch`, AAPCS, and the x86 `raw_syscall`; plus a runtime
+Commandment pass on the arm service stack booted in QEMU `raspi2b`.
+
+**Result: 1 finding (A-U1, MED-latent, FIXED). The syscall ABI is otherwise correct, the adversarial
+primitives correctly express the ARM ring-3 faults and are test-only, the linker change is sound, and the
+arm service runtime obeys the Commandments (loud graceful degradation, restart-on-fault).**
+
+| ID | Sev | Cmd | What | Status |
+|----|-----|-----|------|--------|
+| **A-U1** | MED-latent | III / VIII | `sdk/rust/src/ipc.rs` `recv_timeout` - ARM's 32-bit ABI truncates each `raw_syscall` u64 arg to u32. Pointers/handles/lengths/slots genuinely fit, but `timeout_cycles` (generic-timer ticks) does not: at the Pi 2's ~62.5 MHz CNTFRQ, u32::MAX ticks is ~68 s, so a longer finite timeout truncated to a tiny value (premature wake) or - on a multiple of 2^32 - to **0**, which the kernel reads as **block-forever** = a bounded VIII deadline silently becoming an infinite hang. A silent truncation (III/§26.4) diverging arm from x86. Latent: needs a >68 s `recv_timeout`, which no current arm service issues; non-wedging in the common (premature) case, but the block-forever edge is a real VIII violation. | **FIXED** - `recv_timeout` saturates on ARM to `[1, u32::MAX]` (a genuine 0/block-forever stays 0), so a long finite request becomes the longest REPRESENTABLE timeout (~68 s), never tiny and never accidental-forever; x86 passes the full u64. `raw_syscall` comment corrected to name the one wider-than-u32 arg. |
+
+**Verified sound (no violation):**
+- **ARM syscall ABI (`raw_syscall`)** - register mapping (nr->r0, a0-a2->r1-r3) matches `arm_svc_dispatch(number, arg0, arg1, arg2)` and AAPCS; the i64 result is read from r0:r1 (low:high) with correct sign extension for negative error codes; the clobber list is right (inout r0-r3, lateout r12) and `options(nostack)` **omits** `nomem`, so the compiler treats the `svc` as a memory barrier - user buffers passed by pointer are not reordered/cached across the trap (matches x86). Same call surface as x86.
+- **ARM adversarial primitives** (`fault_noncanonical_read` -> unmapped-high read `0xFFFF_FFF0`; `fault_divide_by_zero` -> `udf #0` undefined instruction) correctly express the arm-equivalent ring-3 CPU faults (ARM has no non-canonical VA form, and integer divide-by-zero does not trap by default), and each is the A14/C1 property the kernel audit confirmed: a USR-mode data-abort / undefined-instruction kills only the faulting task. Test-only (§18.1), `#[cfg(target_arch = "arm")]`, not called by any arm service (`probe` is x86-only).
+- **`services/user.ld`** discards `.ARM.exidx`/`.extab`/`.attributes` (dead unwind tables under panic=abort) so every PT_LOAD stays 4 KiB-page-aligned for the loader - a sound build-correctness fix, no-op on x86.
+- **Runtime Commandment pass (arm-supervisor in QEMU):** every hardware service absent on the Pi 2 (block-driver, fs, xhci, ehci, nic-driver, net-stack) fails its spawn **loudly** ("kernel will name-wire it" / "returned no endpoint cap") and the supervisor continues to a usable shell (§9.2/§11.3, loud not silent); `ls` on the fs-less shell returns `ls: storage unavailable` (loud degradation, not a hang); a PL0 shell fault (e.g. a debug-build pipe frame) kills only the shell and the supervisor **restarts** it (V/IX - identity over location, recovery). These are the existing arch-neutral service behaviours, confirmed intact on arm.
+
+**Observation (not a finding):** debug-build shell pipe frames (~600 KiB, e.g. `status | count`) exceed the
+256 KiB user stack and fault the shell; it recovers via supervisor restart, and the **release** build's
+optimized frames fit and run pipes cleanly (`docs/arm32-status.md`). This is a build-environment / kernel
+user-stack matter, not a service-code defect - recorded there, not counted here.
