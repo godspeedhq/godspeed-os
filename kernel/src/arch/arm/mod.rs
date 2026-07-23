@@ -632,7 +632,27 @@ pub const ELF_MACHINE: u16 = 40;
 pub const ELF_CLASS: u8 = 1; // 1 = ELFCLASS32, 2 = ELFCLASS64
 
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
-pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
+
+/// Reset the machine via the BCM2835 power-management watchdog (the shell `reboot` command + Ctrl+Alt+Del).
+/// Arm a short watchdog timeout and request a FULL reset in `PM_RSTC`; the SoC resets when the watchdog
+/// fires. Every PM write is gated by the `0x5A` password. (The prior stub just spun, so `reboot` hung.)
+pub fn hardware_reset() -> ! {
+    const PM_RSTC: usize = PERIPHERAL_BASE + 0x10_001c;
+    const PM_WDOG: usize = PERIPHERAL_BASE + 0x10_0024;
+    const PM_PASSWORD: u32 = 0x5A00_0000;
+    const PM_RSTC_WRCFG_FULL_RESET: u32 = 0x0000_0020;
+    const PM_RSTC_WRCFG_CLR: u32 = 0xffff_ffcf; // clear the WRCFG field before setting FULL_RESET
+    // SAFETY: PM_WDOG/PM_RSTC are the BCM2835 power-management registers, in the already-Device-mapped
+    // peripheral window; volatile 32-bit writes gated by the 0x5A password - the documented reset poke.
+    unsafe {
+        let rstc = PM_RSTC as *mut u32;
+        (PM_WDOG as *mut u32).write_volatile(PM_PASSWORD | 10); // watchdog fires in ~10 ticks (fast)
+        let cur = rstc.read_volatile();
+        rstc.write_volatile(PM_PASSWORD | (cur & PM_RSTC_WRCFG_CLR) | PM_RSTC_WRCFG_FULL_RESET);
+    }
+    // The watchdog resets the SoC almost immediately; spin until it does (this never returns).
+    loop { core::hint::spin_loop(); }
+}
 
 // ---- Serial / console (PL011: output = pl011_write; input = the PL011 RX FIFO drained into a ring) ----
 pub fn serial_write_byte(b: u8) { pl011_write_byte(b); }

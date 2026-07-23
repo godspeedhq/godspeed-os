@@ -168,12 +168,12 @@ GodspeedOS way.
   known refinement for that pass.
 - **SDK DMA cache-coherence (SEC-28)** - `sdk/rust/src/dma.rs` assumes x86 coherent DMA; any real ARM
   driver needs cache-maintenance hooks (clean-before-device-read, invalidate-before-CPU-read) first.
-- **Watchdog / PM reset (`hardware_reset`) - a real gap.** `arch::imp::hardware_reset` on ARM is a **stub
-  that spins forever** (`arch/arm/mod.rs`), so the shell `reboot` command (and the Ctrl+Alt+Del chord that
-  routes through it) **hangs the Pi 2 instead of resetting it**. The BCM2835 power-management block does a
-  full reset: write `PM_RSTC` (peripheral base + 0x10001c) with the `0x5A` password + full-reset bits and a
-  short `PM_WDOG` (base + 0x100024) timeout, then wait for the watchdog to fire. Small, well-defined, and
-  QEMU's `raspi2b` PM block should exercise it. Until then, recover a wedged Pi by power-cycling.
+- **Watchdog / PM reset (`hardware_reset`) - DONE + QEMU-verified** (2026-07-23). Was a stub that spun, so
+  the shell `reboot` (and the Ctrl+Alt+Del chord that routes through it) hung the Pi 2 instead of resetting
+  it. Now does the BCM2835 power-management watchdog reset (`arch/arm/mod.rs`): write `PM_WDOG` (peripheral
+  base + 0x100024) a short timeout and `PM_RSTC` (base + 0x10001c) a full-reset request, both gated by the
+  `0x5A` password; the SoC resets when the watchdog fires. Verified in QEMU (`reboot` re-runs the kernel
+  from its boot banner - boot markers go 1 -> 2).
 - **Not gaps, nice-to-haves:** USB **mouse** (HID - a trivial extension of the keyboard interrupt-poll
   path, low value for a console OS); **GPIO**; the BCM2835 hardware **RNG** (an entropy source); **I2C/SPI**
   (which would enable an external RTC module for wall-clock time - see the no-RTC note above, or use NTP

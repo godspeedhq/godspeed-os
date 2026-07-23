@@ -13,6 +13,18 @@ comment.
 
 ---
 
+## 2026-07-23 - BCM2835 watchdog reset (feat/pi2-arm32)
+
+`hardware_reset()` on ARM was a stub that spun, so the shell `reboot` (and Ctrl+Alt+Del) hung the Pi 2
+instead of resetting it. Implemented the BCM2835 power-management watchdog reset: one `unsafe` block of
+volatile 32-bit writes to `PM_WDOG`/`PM_RSTC` in the already-Device-mapped peripheral window, gated by the
+`0x5A` password (the documented reset poke). QEMU-verified (a `reboot` re-runs the kernel from its boot
+banner). `arch/arm/mod.rs` unsafe 39 -> 40 (+1), permitted arch layer, SAFETY-commented.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 39 -> 40 (+1) | `hardware_reset` does the BCM2835 PM watchdog reset (PM_WDOG/PM_RSTC MMIO writes). |
+
 ## 2026-07-23 - Soundness audit of the DWC2 USB unsafe (feat/pi2-arm32)
 
 The session took `arch/arm/dwc2.rs` from 3 to 13 `unsafe` blocks (the whole USB stack: DMA control/bulk
@@ -916,7 +928,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 39 | permitted |
+| arch/arm/mod.rs | 40 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
 | arch/riscv64/mod.rs | 23 | permitted |
