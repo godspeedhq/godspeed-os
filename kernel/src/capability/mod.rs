@@ -86,6 +86,12 @@ pub const ACQUIRE_ANY_RESOURCE: ResourceId = ResourceId(9);
 /// so - like a DMA-capable driver (§6.4) - this is real reach; it is granted explicitly, never ambient.
 pub const NET_DEVICE_RESOURCE: ResourceId = ResourceId(10);
 
+/// Authority to drive the SoC GPIO pins (the ARM `Gpio` syscall: set a pin's direction, drive it high/low,
+/// read its level). Real hardware reach - GPIO pins carry the UART console and the SD card, so toggling the
+/// wrong one breaks the machine; granted only to the `shell` (its `gpio` command, the operator interface).
+/// A no-op off ARM. Like REBOOT/NET_DEVICE, it is explicit authority, never ambient.
+pub const GPIO_DEVICE_RESOURCE: ResourceId = ResourceId(11);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever - §7.5).
@@ -99,5 +105,6 @@ pub fn init() {
     table::register_resource(REBOOT_RESOURCE);
     table::register_resource(ACQUIRE_ANY_RESOURCE);
     table::register_resource(NET_DEVICE_RESOURCE);
+    table::register_resource(GPIO_DEVICE_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }

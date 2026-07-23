@@ -174,11 +174,19 @@ GodspeedOS way.
   base + 0x100024) a short timeout and `PM_RSTC` (base + 0x10001c) a full-reset request, both gated by the
   `0x5A` password; the SoC resets when the watchdog fires. Verified in QEMU (`reboot` re-runs the kernel
   from its boot banner - boot markers go 1 -> 2).
-- **Not gaps, nice-to-haves:** USB **mouse** (HID - a trivial extension of the keyboard interrupt-poll
-  path, low value for a console OS); **GPIO**; the BCM2835 hardware **RNG** (an entropy source); **I2C/SPI**
-  (which would enable an external RTC module for wall-clock time - see the no-RTC note above, or use NTP
-  now that networking works); and **DMA-accelerated / multi-block SD** (the block-driver is single-block
-  PIO today - correct, just not fast).
+- **Hardware RNG (BCM2835) - DONE + QEMU-verified** (2026-07-23). An entropy source: `hw_random()` reads
+  the SoC RNG, exposed ungated as InspectKernel query 19 (entropy confers no authority) with a `random [n]`
+  shell command. QEMU's `raspi2b` emulates it (`random 3` -> three distinct u32s). x86 RDRAND is a trivial
+  follow-up (stubbed `None` today).
+- **GPIO (BCM2835) - DONE + QEMU-verified** (2026-07-23). Drive the SoC pins: a **capability-gated** `Gpio`
+  syscall (GPIO carries the UART/SD lines, so only the `shell` holds `GPIO_DEVICE`) with a `gpio
+  <input|output|high|low|read> <pin>` command. QEMU verifies the readback (pin high -> reads 1, low -> 0);
+  on real hardware it drives actual pins (blink an LED, read a button).
+- **Still nice-to-haves (deliberately not built - no consumer yet, §26.2):** USB **mouse** (a console OS
+  has no pointer to consume it); **I2C/SPI** (would enable an external RTC module - but NTP over the
+  now-working network is the better wall-clock path); and **DMA-accelerated / multi-block SD** (a real
+  speed win, but a protocol change to `fs` + the block IPC that risks the working persistence path for
+  marginal gain on a shell OS - the block-driver is single-block PIO today, correct just not fast).
 
 ## QEMU validation status (2026-07-23)
 

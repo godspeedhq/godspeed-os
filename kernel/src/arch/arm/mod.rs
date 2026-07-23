@@ -680,6 +680,39 @@ pub fn hw_random() -> Option<u32> {
     }
 }
 
+/// Drive a BCM2835 GPIO pin (the shell `gpio` command, via the gated `Gpio` syscall). `op` = 0 input /
+/// 1 output / 2 high / 3 low / 4 read; `pin` = 0..53. Returns the level (0/1) for a read, 0 on success,
+/// -1 on a bad pin. GPIO carries the UART/SD lines, so this is gated by GPIO_DEVICE - the operator's call.
+pub fn gpio_op(op: u32, pin: u32) -> i64 {
+    if pin > 53 { return -1; }
+    const GPFSEL0: usize = GPIO_BASE + 0x00; // function select (10 pins/reg, 3 bits each)
+    const GPSET0:  usize = GPIO_BASE + 0x1c; // set output high (1 bit/pin, 2 banks)
+    const GPCLR0:  usize = GPIO_BASE + 0x28; // set output low
+    const GPLEV0:  usize = GPIO_BASE + 0x34; // read pin level
+    let reg = (pin / 10) as usize;
+    let shift = (pin % 10) * 3;
+    let bank = (pin / 32) as usize;
+    let bit = pin % 32;
+    // SAFETY: BCM2835 GPIO registers in the already-Device-mapped peripheral window; volatile 32-bit
+    // accesses. Read-modify-write of the function-select is single-core-serialised at the syscall layer.
+    unsafe {
+        match op {
+            0 | 1 => {
+                let fsel = (GPFSEL0 + reg * 4) as *mut u32;
+                let mut v = fsel.read_volatile();
+                v &= !(0b111 << shift);                 // clear the 3-bit function field
+                if op == 1 { v |= 0b001 << shift; }     // 0b001 = output; 0b000 = input
+                fsel.write_volatile(v);
+                0
+            }
+            2 => { ((GPSET0 + bank * 4) as *mut u32).write_volatile(1 << bit); 0 }
+            3 => { ((GPCLR0 + bank * 4) as *mut u32).write_volatile(1 << bit); 0 }
+            4 => (((GPLEV0 + bank * 4) as *const u32).read_volatile() >> bit & 1) as i64,
+            _ => -1,
+        }
+    }
+}
+
 // ---- Serial / console (PL011: output = pl011_write; input = the PL011 RX FIFO drained into a ring) ----
 pub fn serial_write_byte(b: u8) { pl011_write_byte(b); }
 pub fn serial_write_bytes_lockfree(s: &[u8]) { pl011_write(s); }

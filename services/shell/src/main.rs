@@ -502,7 +502,7 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
 /// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
-    "wait", "watch", "whatis", "busiest", "random",
+    "wait", "watch", "whatis", "busiest", "random", "gpio",
 ];
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
@@ -1240,6 +1240,7 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "sock"    => cmd_sock(ctx, out),
         "uptime"  => cmd_uptime(ctx),
         "random"  => cmd_random(ctx, if argc >= 2 { args[1] } else { "" }),
+        "gpio"    => cmd_gpio(ctx, if argc >= 2 { args[1] } else { "" }, if argc >= 3 { args[2] } else { "" }),
         "wait"    => cmd_wait(ctx, if argc >= 2 { args[1] } else { "" }),
         "whatis"  => cmd_whatis(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "status"  => cmd_status(ctx),
@@ -5269,6 +5270,33 @@ fn cmd_random(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
             Some(v) => ctx.console_writeln_fmt(format_args!("{:#010x}  {}", v, v)),
             None => { ctx.console_writeln("random: no hardware RNG on this machine"); break; }
         }
+    }
+    Ok(())
+}
+
+/// `gpio <input|output|high|low|read> <pin>` - drive a SoC GPIO pin (the Pi 2's BCM2835). WORDS not flags
+/// (utility convention). GPIO pins carry the UART console + SD card, so this is the operator's rope: pin
+/// 0..53, at your own risk. ARM-only; reports loudly elsewhere.
+fn cmd_gpio(ctx: &ServiceContext, verb: &str, pin_s: &str) -> Result<(), ShellError> {
+    let op = match verb {
+        "input" | "in"        => 0u32,
+        "output" | "out"      => 1,
+        "high" | "set" | "on" => 2,
+        "low" | "clear" | "off" => 3,
+        "read" | "get"        => 4,
+        _ => { ctx.console_writeln("usage: gpio <input|output|high|low|read> <pin 0..53>"); return Ok(()); }
+    };
+    let pin = match pin_s.trim().parse::<u32>() {
+        Ok(p) if p <= 53 => p,
+        _ => { ctx.console_writeln("gpio: pin must be 0..53"); return Ok(()); }
+    };
+    let r = ctx.gpio(op, pin);
+    if r < 0 {
+        ctx.console_writeln("gpio: not available on this machine (Pi 2 only)");
+    } else if op == 4 {
+        ctx.console_writeln_fmt(format_args!("gpio {} = {}", pin, r));
+    } else {
+        ctx.console_writeln_fmt(format_args!("gpio {} {}", pin, verb));
     }
     Ok(())
 }

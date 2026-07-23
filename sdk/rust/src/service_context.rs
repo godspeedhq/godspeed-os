@@ -1042,6 +1042,14 @@ impl ServiceContext {
         if r < 0 { None } else { Some(r as u32) }
     }
 
+    /// Drive a SoC GPIO pin (the shell `gpio` command; the Pi 2's BCM2835). `op`: 0 input / 1 output /
+    /// 2 high / 3 low / 4 read. Returns the level (0/1) for a read, 0 on success, -1 on a bad pin /
+    /// unsupported arch. Gated by the GPIO_DEVICE cap (only the shell holds it).
+    pub fn gpio(&self, op: u32, pin: u32) -> i64 {
+        // SAFETY: syscall(45) = Gpio; the kernel validates the GPIO_DEVICE cap and bounds op/pin.
+        unsafe { raw_syscall(45, op as u64, pin as u64, 0) }
+    }
+
     /// Decode the packed RTC `u64` (the layout shared by query 11 / 12) into a `Datetime`.
     fn unpack_datetime(p: u64) -> Datetime {
         Datetime {

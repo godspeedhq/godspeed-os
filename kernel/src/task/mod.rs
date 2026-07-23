@@ -13,7 +13,7 @@ use crate::arch::imp::context_switch::TaskContext;
 use crate::arch::imp::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -435,6 +435,7 @@ struct Privileges {
     reboot:          bool, // REBOOT: hardware-reset the machine (shell `reboot` only - SEC-2)
     acquire_any:     bool, // ACQUIRE_ANY: reach ARBITRARY services by name via AcquireSendCap (§3.1)
     net_device:      bool, // NET_DEVICE: move ethernet frames via the in-kernel USB-net bridge (ARM nic-driver)
+    gpio:            bool, // GPIO_DEVICE: drive the SoC GPIO pins (ARM `gpio` shell command)
 }
 
 fn service_privileges(name: &str, is_probe: bool) -> Privileges {
@@ -464,6 +465,8 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // path. Off ARM the NetFrame* syscalls are inert stubs (the NIC is a userspace PCIe driver), so
         // arch-gate the grant rather than hand out an authority that is dormant-but-latent there (SEC-31).
         net_device: cfg!(target_arch = "arm") && matches!(name, "nic-driver"),
+        // The shell's `gpio` command drives the SoC pins (ARM-only; inert stub off ARM), so arch-gate it.
+        gpio: cfg!(target_arch = "arm") && matches!(name, "shell"),
     }
 }
 
@@ -3560,6 +3563,14 @@ fn spawn_service_with_config(
     if privs.net_device {
         let nd_cap = mint_cap(NET_DEVICE_RESOURCE, Rights::WRITE);
         caps.insert(nd_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+
+    // GPIO_DEVICE: the shell's `gpio` command drives the SoC pins (ARM `Gpio` syscall). Minted here; WHO
+    // holds it is in `service_privileges`.
+    if privs.gpio {
+        let g_cap = mint_cap(GPIO_DEVICE_RESOURCE, Rights::WRITE);
+        caps.insert(g_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 

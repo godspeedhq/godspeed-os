@@ -67,6 +67,7 @@ pub enum SyscallNumber {
     NetFrameTx             = 42,
     NetFrameRx             = 43,
     NetInfo                = 44,
+    Gpio                   = 45,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -95,6 +96,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::NetFrameTx     as u64 => handle_net_frame_tx(arg0, arg1),
         n if n == SyscallNumber::NetFrameRx     as u64 => handle_net_frame_rx(arg0, arg1),
         n if n == SyscallNumber::NetInfo        as u64 => handle_net_info(arg0),
+        n if n == SyscallNumber::Gpio           as u64 => handle_gpio(arg0, arg1),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
             0
@@ -1805,6 +1807,17 @@ fn handle_net_info(ptr: u64) -> i64 {
         }
         None => 0,
     }
+}
+
+/// Gpio (45): drive a SoC GPIO pin. `op` = 0 input / 1 output / 2 set-high / 3 set-low / 4 read; `pin` =
+/// 0..53. Gated by GPIO_DEVICE (validated by holdings - the args fill the ABI). Returns the level (0/1) for
+/// a read, 0 on success, -1 on a bad pin / unsupported arch. On non-ARM `gpio_op` is an inert `-1` stub.
+fn handle_gpio(op: u64, pin: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::GPIO_DEVICE_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    if op > 4 || pin > 53 { return -1; } // BCM2835 has 54 GPIO lines (0..53)
+    crate::arch::imp::gpio_op(op as u32, pin as u32)
 }
 
 fn ipc_err_to_i64(e: IpcError) -> i64 {

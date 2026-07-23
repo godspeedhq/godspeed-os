@@ -13,6 +13,19 @@ comment.
 
 ---
 
+## 2026-07-23 - BCM2835 GPIO (feat/pi2-arm32)
+
+Added `gpio_op(op, pin)` - drive a SoC GPIO pin's direction/level/read (BCM2835 GPFSEL/GPSET/GPCLR/GPLEV in
+the already-Device-mapped peripheral window). Exposed via a new **capability-gated** `Gpio` syscall (45),
+GPIO carries the UART/SD lines so it is granted only to the `shell` (GPIO_DEVICE cap, id 11), with a `gpio`
+shell command (`gpio <input|output|high|low|read> <pin>`). QEMU-verified: drive pin 21 high -> read 1, low
+-> read 0. `arch/arm/mod.rs` unsafe 41 -> 42 (+1, one SAFETY-commented block of GPIO MMIO). Other arches
+stub `gpio_op` to `-1` (no unsafe).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 41 -> 42 (+1) | `gpio_op` drives the BCM2835 GPIO (GPFSEL/GPSET/GPCLR/GPLEV MMIO). |
+
 ## 2026-07-23 - BCM2835 hardware RNG (feat/pi2-arm32)
 
 Added a hardware entropy source: `hw_random()` reads the BCM2835 SoC RNG (one-time enable + bounded wait
@@ -941,7 +954,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 41 | permitted |
+| arch/arm/mod.rs | 42 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
 | arch/riscv64/mod.rs | 23 | permitted |
