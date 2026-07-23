@@ -49,8 +49,12 @@ def main():
     rel = ["--release"] if args.release else []
 
     # 1. Cross-compile every ARM-ported service to armv7 so build.rs can embed them.
+    #    The Pi 2 is a bare-metal target (no QEMU control port), so the supervisor is built with its
+    #    `bare-metal` feature - the designated "usable OS, quiet gsh> prompt" spawn set (logger + shell,
+    #    no 178 harness probes, no ping/pong flood). ping/pong are spawnable on demand from the shell.
     for svc in ARM_SERVICES:
-        run(["cargo", "build", "-p", svc, "--target", TARGET] + rel)
+        feats = ["--features", "bare-metal"] if svc == "supervisor" else []
+        run(["cargo", "build", "-p", svc, "--target", TARGET] + feats + rel)
 
     # 2. Build the kernel (embeds the service ELFs) with the chosen boot path.
     run(["cargo", "build", "-p", "kernel", "--target", TARGET,
