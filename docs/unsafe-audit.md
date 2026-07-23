@@ -13,6 +13,24 @@ comment.
 
 ---
 
+## 2026-07-23 - DWC2 control transfers via slave/PIO mode (feat/pi2-arm32)
+
+The DWC2's internal DMA master never initiated a transfer on the Pi 2: across a dozen HW tests the channel
+armed (ChEna set), the host framed (HFNUM advanced) and every config register read correct, yet
+`GRSTCTL.AHBIdle` stayed 1 and `HCDMA` never advanced. Switched enumeration to **slave / PIO mode** - the
+mode every working bare-metal Pi USB driver uses: DMA disabled (`GAHBCFG.DmaEn=0`), OUT data pushed
+word-by-word into the NP TX FIFO and IN data popped from the RX FIFO after `GRXSTSP`, no bus-mastering.
+This **removed** the DMA scratch static, the `flush_dcache` cache-coherency bracket, and the tick-driven
+state machine, so `dwc2.rs` unsafe **shrank 8 -> 3** (only the `rd`/`wr` Device-MMIO accessors + the `nop`
+`spin` remain; the slave-mode transfer code is all safe `rd`/`wr`). Enumeration is now synchronous (a
+one-time bounded boot cost).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/dwc2.rs` | 8 -> 3 (-5) | Slave/PIO rewrite dropped the DMA path: removed `flush_dcache` (DCCIMVAC + `dsb`, -2) and `poll_inner` + the two step handlers' `DMA`-static access (-3). Remaining: `rd`/`wr`/`spin`. |
+
+---
+
 ## 2026-07-22 - DWC2 USB host bring-up, increment 1 (feat/pi2-arm32)
 
 The Pi 2's USB is a Synopsys DesignWare USB 2.0 OTG (DWC2) core. `dwc2.rs` brings it up in host mode and
@@ -808,7 +826,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 6 | permitted |
 | arch/arm/fbcon.rs | 4 | permitted |
-| arch/arm/dwc2.rs | 8 | permitted |
+| arch/arm/dwc2.rs | 3 | permitted |
 | arch/arm/page_tables.rs | 27 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |

@@ -18,7 +18,7 @@
 //! reached only after enumerating that hub (a later increment). Under QEMU (`-M raspi2b,usb=on -device
 //! usb-kbd`) the keyboard attaches to the root port directly, which is what this increment detects.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use super::pl011_write;
 use super::exceptions::write_hex32;
@@ -208,10 +208,11 @@ pub fn init() {
         waited += 1;
         if waited > 1_000_000 { pl011_write(b"dwc2: WARN RX FIFO flush did not clear\r\n"); break; }
     }
-    // 5c. Enable internal buffer DMA + a 16-beat AHB burst, so a transfer is "point HCDMA at a buffer,
-    //     start the channel, wait" rather than hand-copying the FIFO. Re-enable the global interrupt bit
-    //     too (we still poll, but some cores gate DMA completion on it).
-    wr(GAHBCFG, (rd(GAHBCFG) & !0x1E) | GAHBCFG_DMAEN | (0x7 << 1) | GAHBCFG_GLBLINTRMSK);
+    // 5c. Slave / PIO mode: DMA DISABLED (DmaEn=0). The internal DMA master never initiated a transfer on
+    //     this board (GRSTCTL.AHBIdle stayed 1 across a dozen HW tests despite correct config + framing),
+    //     so we drive the FIFO from the CPU instead - the mode every working bare-metal Pi driver uses.
+    //     Keep only GlblIntrMsk (harmless; we poll GINTSTS/HCINT directly, which update regardless).
+    wr(GAHBCFG, GAHBCFG_GLBLINTRMSK);
     // 5d. Enable the channel + aggregate host-channel interrupts. We poll HCINT, but some DWC2 cores
     //     (and QEMU's model) only advance a channel's transaction when its interrupt is unmasked. These
     //     never reach the CPU (the BCM2836 USB IRQ line is not wired), they just gate the state machine.
@@ -273,13 +274,12 @@ fn reset_port() {
     // Clear the connect/enable change flags now that we have acted on them (W1C: write 1s back). Mask
     // PrtEna off (HPRT_RMW_CLEAR) so writing these change bits does not also disable the port.
     wr(HPRT, (rd(HPRT) & !HPRT_RMW_CLEAR) | HPRT_PRTCONNDET | HPRT_PRTENCHNG);
-    // Arm tick-driven enumeration (increment 2). We do NOT enumerate synchronously here: a control
-    // transfer must let the controller's transactions run between our polls, which a boot-time busy-spin
-    // never allows (QEMU advances the emulated core only on its event loop; hardware completes DMA in
-    // silicon but our poll would still hog the CPU). `poll()`, called from the timer tick, drives the
-    // state machine one transaction per tick, so the idle WFI between ticks gives the controller time.
+    // Enumerate synchronously in slave/PIO mode. Enumeration is a one-time bounded boot cost, and slave
+    // mode needs prompt FIFO servicing (a tick-spaced poll would under/overrun the FIFO), so a bounded
+    // busy-poll here is the right shape. The DWC2's internal DMA master never initiated a transfer on this
+    // board (AHBIdle stayed 1 across a dozen HW tests), so PIO is the working path.
     LOW_SPEED.store((hprt & HPRT_PRTSPD_MASK) >> HPRT_PRTSPD_SHIFT == 2, Ordering::Relaxed);
-    SM_ACTIVE.store(true, Ordering::Release);
+    enumerate_sync();
 }
 
 // ---------------------------------------------------------------------------
@@ -300,233 +300,188 @@ const PID_SETUP: u32 = 3;
 const HCINT_XFERCOMPL: u32 = 1 << 0;
 const HCINT_CHHLTD:    u32 = 1 << 1;
 
-/// DMA scratch buffers. Static, so they live in identity-mapped kernel RAM (VA == PA - the DWC2 DMA
-/// engine takes a physical address, and the kernel identity map makes the static's address usable
-/// directly). Cacheable, so `flush_dcache` cleans+invalidates around every transfer: the A7's DMA is NOT
-/// cache-coherent, so without this the device would read stale bytes (OUT) or the CPU would read a stale
-/// cache line instead of what the device just wrote (IN).
-#[repr(C, align(64))]
-struct DmaBuf { setup: [u8; 8], data: [u8; 256] }
-static mut DMA: DmaBuf = DmaBuf { setup: [0; 8], data: [0; 256] };
+// --- Slave / PIO mode -------------------------------------------------------
+// The DWC2's internal DMA master never initiates a transfer in our environment: across a dozen HW tests
+// the channel arms (ChEna set), the host frames (HFNUM advances), every config register reads correct,
+// yet GRSTCTL.AHBIdle stays 1 and HCDMA never advances. So we drive the FIFO from the CPU instead - the
+// slave/PIO mode every working bare-metal Pi USB driver uses. No bus-mastering, no DMA buffers, no cache
+// maintenance: OUT data is pushed word-by-word into the NP TX FIFO, IN data is popped word-by-word from
+// the RX FIFO after reading GRXSTSP. Enumeration is synchronous (a one-time bounded boot cost); the
+// keyboard interrupt-endpoint poll (increment 4) will reuse chan_in from the timer tick.
 
-/// Clean+invalidate a cache-line range to the PoC (DCCIMVAC) - the DMA-coherency bracket. Clean pushes
-/// any dirty CPU write out to RAM (so the device sees it); invalidate drops the line (so a later CPU read
-/// re-fetches what the device wrote). Correct for both directions, so used before AND after DMA.
-fn flush_dcache(addr: u32, len: u32) {
-    let mut p = addr & !31;
-    let end = addr.wrapping_add(len);
-    while p < end {
-        // SAFETY: DCCIMVAC (`c7, c14, 1`) cleans+invalidates one line by MVA; no memory is modified.
-        unsafe { core::arch::asm!("mcr p15, 0, {a}, c7, c14, 1", a = in(reg) p, options(nostack)); }
-        p = p.wrapping_add(32);
-    }
-    // SAFETY: `dsb` orders the maintenance before the DMA (or the following CPU read) observes memory.
-    unsafe { core::arch::asm!("dsb", options(nostack)); }
-}
+const DFIFO0:  usize = 0x1000; // host channel-0 data FIFO push/pop window (offset from DWC2_BASE)
+const GRXSTSP: usize = 0x020;  // RX status pop (reading it dequeues one RX FIFO status word)
+const GINTSTS_RXFLVL: u32 = 1 << 4; // RX FIFO non-empty (a packet status is waiting in GRXSTSP)
 
-// --- State machine state (core 0 only touches these) ---
-static SM_ACTIVE:  AtomicBool = AtomicBool::new(false); // a device is present + enumeration is armed
-static LOW_SPEED:  AtomicBool = AtomicBool::new(false); // attached device is low-speed
-static SM_STEP:    AtomicU8   = AtomicU8::new(0);       // enumeration step (see step_setup)
-static SM_STAGE:   AtomicU8   = AtomicU8::new(0);       // 0=SETUP, 1=DATA, 2=STATUS
-static SM_RUNNING: AtomicBool = AtomicBool::new(false); // a channel transaction is in flight
-static SM_TICKS:   AtomicU32  = AtomicU32::new(0);      // watchdog: ticks the current stage has waited
-static DEV_ADDR:   AtomicU8   = AtomicU8::new(0);       // 0 until SET_ADDRESS assigns 1
-static MPS0:       AtomicU8   = AtomicU8::new(8);       // EP0 max packet size (8 until GET_DESCRIPTOR)
-static SM_RETRY:   AtomicU8   = AtomicU8::new(0);       // NAK/xact-error retries for the current stage
+static LOW_SPEED: AtomicBool = AtomicBool::new(false); // attached device is low-speed
+static DEV_ADDR:  AtomicU8   = AtomicU8::new(0);       // 0 until SET_ADDRESS assigns 1
+static MPS0:      AtomicU8   = AtomicU8::new(8);       // EP0 max packet size (8 until GET_DESCRIPTOR)
 
-// Enumeration steps. `done` marks enumeration complete; 255 marks a failure. Increment 2 stops after
-// reading the device descriptor (proof the transfers work); increment 3 adds SET_CONFIGURATION +
-// SET_PROTOCOL, increment 4 the interrupt-endpoint HID poll.
-const STEP_GET_DESC8:  u8 = 0; // GET_DESCRIPTOR(device, 8) -> learn EP0 max packet size
-const STEP_SET_ADDR:   u8 = 1; // SET_ADDRESS(1)
-const STEP_GET_DESC18: u8 = 2; // GET_DESCRIPTOR(device, 18) @ addr 1 -> VID/PID
-const STEP_DONE:       u8 = 3;
-const STEP_FAILED:     u8 = 255;
-
-/// The SETUP packet + data direction + data length for a step. `data_in`/`dlen` describe the DATA stage
-/// (dlen 0 = no DATA stage - the STATUS goes IN).
-fn step_setup(step: u8) -> ([u8; 8], bool, usize) {
-    match step {
-        STEP_GET_DESC8  => ([0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 8, 0x00], true, 8),
-        STEP_SET_ADDR   => ([0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00], false, 0),
-        STEP_GET_DESC18 => ([0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00], true, 18),
-        _               => ([0; 8], false, 0),
-    }
-}
-
-/// Start one channel-0 transaction (non-blocking - just enables the channel; completion is polled).
-fn channel_start(dir_in: bool, pid: u32, buf_phys: u32, len: u32) {
+/// Program + enable channel 0 for one transaction. In slave mode the enable just tells the core to run
+/// the token; we then feed/drain the FIFO ourselves.
+fn chan_program(dir_in: bool, pid: u32, len: u32) {
     let mps = MPS0.load(Ordering::Relaxed) as u32;
     let dev_addr = DEV_ADDR.load(Ordering::Relaxed) as u32;
     let low_speed = LOW_SPEED.load(Ordering::Relaxed) as u32;
     let pkts = if len == 0 { 1 } else { (len + mps - 1) / mps };
-    wr(HCINT0, 0xFFFF_FFFF);                                    // clear stale channel interrupts
-    // No split transaction: the device is directly on the (root) port, not behind a high-speed hub doing
-    // FS/LS split. HCSPLT must be 0 or a stale SplEna makes the core wait to schedule a split it can never
-    // complete - the channel arms (ChEna set) but never transacts (HCINT=0, HCDMA never advances), exactly
-    // the Pi 2 stall. Bare-metal DWC2 stacks write HCSPLT=0 for every non-split transfer.
-    wr(HCSPLT0, 0);
-    wr(HCTSIZ0, (len & 0x7_FFFF) | (pkts << 19) | (pid << 29)); // size, packet count, PID
-    // The DWC2 DMA engine addresses RAM through the VideoCore *bus* alias, not the ARM physical address
-    // (the same 0xC0000000 uncached alias the framebuffer mailbox needed). Hand it the ARM physical and
-    // it reads the wrong memory - the SETUP packet never goes out and the channel halts with ChHltd only
-    // (no completion, no error), exactly what the Pi 2 reported. OR in the alias so it sees our buffer.
-    wr(HCDMA0, buf_phys | 0xC000_0000);
-    // Two-step channel enable: write the transfer fields with ChEna=0 first, THEN set ChEna in a separate
-    // write. On this DWC2 core the scheduler triggers on the ChEna rising edge AFTER the fields are latched
-    // - a single combined write (fields + ChEna together) leaves the master idle and the transfer never
-    // starts (HW-diagnosed on the Pi 2: AHBIdle=1, HCDMA never advances). Matches the working bare-metal
-    // Pi examples (HCCHAR |= 1<<31 as the last step).
+    wr(HCINT0, 0xFFFF_FFFF);                                     // clear stale channel interrupts
+    wr(HCSPLT0, 0);                                              // no split transaction (device on root port)
+    wr(HCTSIZ0, (len & 0x7_FFFF) | (pkts << 19) | (pid << 29));  // size, packet count, starting PID
     let chan = (mps & 0x7FF)
         | ((dir_in as u32) << 15)
         | (low_speed << 17)
         | (1 << 20)                        // multi-count = 1; endpoint 0 + control type are the zero fields
-        | ((dev_addr & 0x7F) << 22);
-    wr(HCCHAR0, chan);                      // fields, channel disabled
-    wr(HCCHAR0, chan | (1 << 31));          // rising edge on channel enable -> initiate
+        | ((dev_addr & 0x7F) << 22)
+        | (1 << 31);                       // channel enable
+    wr(HCCHAR0, chan);
 }
 
-/// Poll the current stage: start it if idle, else check the channel. Returns true while still busy with
-/// this step, false when the step is complete (or on failure, which sets SM_STEP = STEP_FAILED).
-fn poll_stage(setup_phys: u32, data_phys: u32, data_in: bool, dlen: usize) -> bool {
-    if !SM_RUNNING.load(Ordering::Relaxed) {
-        match SM_STAGE.load(Ordering::Relaxed) {
-            0 => channel_start(false, PID_SETUP, setup_phys, 8),            // SETUP (always 8, OUT)
-            1 => channel_start(data_in, PID_DATA1, data_phys, dlen as u32), // DATA (OUT already flushed)
-            _ => channel_start(!data_in, PID_DATA1, data_phys, 0),          // STATUS (opposite dir, 0 len)
+/// True while `HCINT` shows the channel neither completed nor errored. Bounded so a wedged controller
+/// reports rather than hangs the boot.
+fn wait_halt() -> u32 {
+    let mut t = 0u32;
+    loop {
+        let ci = rd(HCINT0);
+        if ci & HCINT_CHHLTD != 0 { return ci; }
+        t += 1;
+        if t > 4_000_000 {
+            pl011_write(b"dwc2: halt timeout HCINT="); write_hex32(ci); pl011_write(b"\r\n");
+            return ci | HCINT_CHHLTD; // treat as halted-without-complete -> failure
         }
-        SM_RUNNING.store(true, Ordering::Relaxed);
-        SM_TICKS.store(0, Ordering::Relaxed);
-        return true;
-    }
-    let i = rd(HCINT0);
-    if i & HCINT_CHHLTD == 0 {
-        // Still in flight. Give the controller more ticks; fail loudly if it never completes.
-        if SM_TICKS.fetch_add(1, Ordering::Relaxed) > 1000 {
-            pl011_write(b"dwc2: stalled HCINT="); write_hex32(i);
-            pl011_write(b" HCCHAR="); write_hex32(rd(HCCHAR0));
-            pl011_write(b" HCTSIZ="); write_hex32(rd(HCTSIZ0));
-            pl011_write(b" HCDMA="); write_hex32(rd(HCDMA0));
-            pl011_write(b" GAHBCFG="); write_hex32(rd(GAHBCFG));
-            pl011_write(b" GINTSTS="); write_hex32(rd(GINTSTS));
-            pl011_write(b" HPRT="); write_hex32(rd(HPRT));
-            pl011_write(b" GUSBCFG="); write_hex32(rd(GUSBCFG));
-            pl011_write(b" GHWCFG2="); write_hex32(rd(GHWCFG2));
-            pl011_write(b" HCFG="); write_hex32(rd(HCFG));
-            pl011_write(b" GNPTXSTS="); write_hex32(rd(0x02C));
-            let f1 = rd(0x408); spin(500_000); let f2 = rd(0x408); // HFNUM twice: is the host framing?
-            let hcint2 = rd(HCINT0); // re-read HCINT AFTER the ~59ms spin: did the transaction complete late?
-            pl011_write(b" HFNUM1="); write_hex32(f1);
-            pl011_write(b" HFNUM2="); write_hex32(f2);
-            pl011_write(b" HCINT2="); write_hex32(hcint2);
-            pl011_write(b" GRSTCTL="); write_hex32(rd(GRSTCTL)); // bit31 AHBIdle: master idle vs hung DMA
-            pl011_write(b" HAINT="); write_hex32(rd(HAINT));
-            pl011_write(b"\r\n");
-            SM_STEP.store(STEP_FAILED, Ordering::Relaxed);
-        }
-        return true;
-    }
-    SM_RUNNING.store(false, Ordering::Relaxed);
-    if i & HCINT_XFERCOMPL == 0 {
-        // The channel halted without completing. A device fresh out of reset routinely NAKs early
-        // control transfers (bit 4) and can hit transaction errors (bit 7); both mean "not ready, try
-        // again", so re-issue the SAME stage a bounded number of times rather than giving up. A STALL
-        // (bit 3) or exhausted retries is a real failure.
-        let nak = i & (1 << 4) != 0;
-        let xacterr = i & (1 << 7) != 0;
-        if (nak || xacterr) && SM_RETRY.fetch_add(1, Ordering::Relaxed) < 200 {
-            return true; // SM_RUNNING is false + stage unchanged, so next poll restarts this transaction
-        }
-        pl011_write(b"dwc2: xfer err HCINT="); write_hex32(i);
-        pl011_write(b" HCTSIZ="); write_hex32(rd(HCTSIZ0));
-        pl011_write(b" HCCHAR="); write_hex32(rd(HCCHAR0));
-        pl011_write(b" GINTSTS="); write_hex32(rd(GINTSTS));
-        pl011_write(b" HAINT="); write_hex32(rd(HAINT));
-        pl011_write(b" HPRT="); write_hex32(rd(HPRT));
-        pl011_write(b" step="); write_hex32(SM_STEP.load(Ordering::Relaxed) as u32);
-        pl011_write(b"\r\n");
-        SM_STEP.store(STEP_FAILED, Ordering::Relaxed);
-        return false;
-    }
-    SM_RETRY.store(0, Ordering::Relaxed);
-    match SM_STAGE.load(Ordering::Relaxed) {
-        0 => { SM_STAGE.store(if dlen > 0 { 1 } else { 2 }, Ordering::Relaxed); true }
-        1 => {
-            if data_in { flush_dcache(data_phys, dlen as u32); } // publish device-written bytes to the CPU
-            SM_STAGE.store(2, Ordering::Relaxed);
-            true
-        }
-        _ => { SM_STAGE.store(0, Ordering::Relaxed); false } // STATUS done -> step complete
     }
 }
 
-static POLL_BUSY: AtomicBool = AtomicBool::new(false);
-
-/// Advance the enumeration by (at most) one transaction. Called from the Core-0 timer tick AND the Core-0
-/// idle loop; a re-entry guard stops the tick (which can preempt the idle mid-poll) from racing the
-/// state machine on the same core.
-pub fn poll() {
-    if POLL_BUSY.swap(true, Ordering::Acquire) { return; }
-    poll_inner();
-    POLL_BUSY.store(false, Ordering::Release);
-}
-
-/// Between calls the core idles (WFI), which is what lets the controller run its transactions.
-fn poll_inner() {
-    if !SM_ACTIVE.load(Ordering::Acquire) { return; }
-    let step = SM_STEP.load(Ordering::Relaxed);
-    if step >= STEP_DONE { return; }
-
-    let (setup, data_in, dlen) = step_setup(step);
-    // SAFETY: DMA is a static touched only here on core 0; `addr_of` yields its identity-mapped physical
-    // address. The SETUP / OUT-DATA buffer is filled + flushed only while no channel is running
-    // (SM_RUNNING gates that), so the DMA engine never reads a half-written buffer.
-    let still_busy = unsafe {
-        let d = &mut *core::ptr::addr_of_mut!(DMA);
-        let setup_phys = core::ptr::addr_of!(d.setup) as u32;
-        let data_phys = core::ptr::addr_of!(d.data) as u32;
-        if !SM_RUNNING.load(Ordering::Relaxed) {
-            match SM_STAGE.load(Ordering::Relaxed) {
-                0 => { d.setup.copy_from_slice(&setup); flush_dcache(setup_phys, 8); }
-                1 if !data_in => flush_dcache(data_phys, dlen as u32), // (OUT payload would be filled here)
-                _ => {}
+/// One OUT transaction (SETUP or 0-length STATUS OUT): enable the channel, push `buf[..len]` into the NP
+/// TX FIFO one word at a time, then wait for the halt. Retries on NAK/transaction-error (a device fresh
+/// from reset can be briefly not-ready); STALL or exhausted retries is a hard failure. Returns true on
+/// XferCompl.
+fn chan_out(pid: u32, buf: &[u8], len: usize) -> bool {
+    for _attempt in 0..1000 {
+        chan_program(false, pid, len as u32);
+        let words = (len + 3) / 4;
+        for i in 0..words {
+            let mut t = 0u32;
+            while (rd(0x02C) & 0xFFFF) == 0 {           // GNPTXSTS.NPTxFSpcAvail (words free)
+                t += 1;
+                if t > 1_000_000 { pl011_write(b"dwc2: TX FIFO space timeout\r\n"); return false; }
             }
+            let mut w = 0u32;
+            for b in 0..4 {
+                let idx = i * 4 + b;
+                if idx < len { w |= (buf[idx] as u32) << (b * 8); }
+            }
+            wr(DFIFO0, w);
         }
-        poll_stage(setup_phys, data_phys, data_in, dlen)
-    };
-    if still_busy { return; }
-    // If the step FAILED (poll_stage set STEP_FAILED), stop here - do NOT run the completion handler or
-    // advance to the next step, which would plough on through a broken enumeration reporting garbage.
-    if SM_STEP.load(Ordering::Relaxed) == STEP_FAILED { return; }
-
-    // Step just completed - consume its result and advance.
-    match step {
-        STEP_GET_DESC8 => {
-            // SAFETY: read the invalidated device-descriptor bytes the DMA delivered.
-            let d = unsafe { (*core::ptr::addr_of!(DMA)).data };
-            // Diagnostic: first 8 descriptor bytes - bLength(0x12) bDescType(0x01) bcdUSB.. bMaxPacketSize0.
-            pl011_write(b"dwc2: desc8=");
-            write_hex32((d[0] as u32) << 24 | (d[1] as u32) << 16 | (d[2] as u32) << 8 | d[3] as u32);
-            write_hex32((d[4] as u32) << 24 | (d[5] as u32) << 16 | (d[6] as u32) << 8 | d[7] as u32);
-            pl011_write(b"\r\n");
-            MPS0.store(if d[7] == 0 { 8 } else { d[7] }, Ordering::Relaxed);
-        }
-        STEP_SET_ADDR => DEV_ADDR.store(1, Ordering::Relaxed),
-        STEP_GET_DESC18 => {
-            // SAFETY: read the invalidated 18-byte device descriptor.
-            let d = unsafe { (*core::ptr::addr_of!(DMA)).data };
-            let vid = (d[8] as u32) | ((d[9] as u32) << 8);
-            let pid = (d[10] as u32) | ((d[11] as u32) << 8);
-            pl011_write(b"dwc2: enumerated device VID:PID=");
-            write_hex32((vid << 16) | pid);
-            pl011_write(b" class=");
-            write_hex32(d[4] as u32);
-            pl011_write(b" mps0=");
-            write_hex32(MPS0.load(Ordering::Relaxed) as u32);
-            pl011_write(b" - control transfers work (tick-driven)\r\n");
-        }
-        _ => {}
+        let ci = wait_halt();
+        if ci & HCINT_XFERCOMPL != 0 { return true; }
+        if ci & (1 << 3) != 0 { return false; }         // STALL - hard failure
+        spin(5_000);                                    // NAK / XactErr - brief backoff, then retry
     }
-    SM_STEP.store(step + 1, Ordering::Relaxed);
+    false
 }
+
+/// One IN transaction (DATA IN or 0-length STATUS IN): enable the channel, drain the RX FIFO into `buf`
+/// as packets arrive (GRXSTSP tells us the byte count), then wait for the halt. Same retry policy as
+/// chan_out. Returns true on XferCompl.
+fn chan_in(pid: u32, buf: &mut [u8], len: usize) -> bool {
+    for _attempt in 0..1000 {
+        chan_program(true, pid, len as u32);
+        let mut received = 0usize;
+        let mut t = 0u32;
+        let ci = loop {
+            // Drain every RX status currently queued before checking for the halt, so no received data
+            // is left in the FIFO when the channel completes.
+            while rd(GINTSTS) & GINTSTS_RXFLVL != 0 {
+                let status = rd(GRXSTSP);
+                let bcnt = ((status >> 4) & 0x7FF) as usize;
+                let pktsts = (status >> 17) & 0xF;
+                if pktsts == 2 && bcnt > 0 {            // IN data packet received
+                    let words = (bcnt + 3) / 4;
+                    let mut got = 0usize;
+                    for _ in 0..words {
+                        let w = rd(DFIFO0);
+                        for b in 0..4 {
+                            if got < bcnt {
+                                if received < buf.len() { buf[received] = (w >> (b * 8)) as u8; received += 1; }
+                                got += 1;
+                            }
+                        }
+                    }
+                }
+                t = 0;
+            }
+            let ci = rd(HCINT0);
+            if ci & HCINT_CHHLTD != 0 { break ci; }
+            t += 1;
+            if t > 4_000_000 {
+                pl011_write(b"dwc2: IN timeout HCINT="); write_hex32(rd(HCINT0)); pl011_write(b"\r\n");
+                return false;
+            }
+        };
+        let _ = received;
+        if ci & HCINT_XFERCOMPL != 0 { return true; }
+        if ci & (1 << 3) != 0 { return false; }         // STALL - hard failure
+        spin(5_000);                                    // NAK / XactErr - brief backoff, then retry
+    }
+    false
+}
+
+/// A full control transfer: SETUP -> (DATA) -> STATUS. `data_in`/`dlen` describe the DATA stage; the
+/// STATUS stage runs in the opposite direction with zero length. Returns true if every stage completed.
+fn ctrl_xfer(setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize) -> bool {
+    if !chan_out(PID_SETUP, setup, 8) { pl011_write(b"dwc2: SETUP failed\r\n"); return false; }
+    if dlen > 0 {
+        let ok = if data_in { chan_in(PID_DATA1, data, dlen) } else { chan_out(PID_DATA1, data, dlen) };
+        if !ok { pl011_write(b"dwc2: DATA failed\r\n"); return false; }
+    }
+    // STATUS: opposite direction, zero length, DATA1.
+    let ok = if data_in {
+        chan_out(PID_DATA1, &[], 0)
+    } else {
+        let mut z = [0u8; 1];
+        chan_in(PID_DATA1, &mut z, 0)
+    };
+    if !ok { pl011_write(b"dwc2: STATUS failed\r\n"); return false; }
+    true
+}
+
+/// Enumerate the attached device synchronously: read 8 bytes of the device descriptor to learn EP0's max
+/// packet size, assign address 1, then read the full 18-byte descriptor for VID/PID. Proof that control
+/// transfers work end to end. Called once from `reset_port` at boot.
+fn enumerate_sync() {
+    let mut buf = [0u8; 64];
+
+    // GET_DESCRIPTOR(device, 8) -> bMaxPacketSize0 at byte 7.
+    let setup1 = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 8, 0x00];
+    if !ctrl_xfer(&setup1, &mut buf, true, 8) {
+        pl011_write(b"dwc2: GET_DESC(8) failed - USB unavailable\r\n"); return;
+    }
+    let mps = if buf[7] == 0 { 8 } else { buf[7] };
+    MPS0.store(mps, Ordering::Relaxed);
+    pl011_write(b"dwc2: desc8 mps0="); write_hex32(mps as u32); pl011_write(b"\r\n");
+
+    // SET_ADDRESS(1).
+    let setup2 = [0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
+    if !ctrl_xfer(&setup2, &mut buf, false, 0) {
+        pl011_write(b"dwc2: SET_ADDRESS failed - USB unavailable\r\n"); return;
+    }
+    DEV_ADDR.store(1, Ordering::Relaxed);
+    spin(300_000); // USB spec: 2 ms recovery before the device answers on its new address
+
+    // GET_DESCRIPTOR(device, 18) at address 1 -> VID/PID/class.
+    let setup3 = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00];
+    if !ctrl_xfer(&setup3, &mut buf, true, 18) {
+        pl011_write(b"dwc2: GET_DESC(18) failed - USB unavailable\r\n"); return;
+    }
+    let vid = (buf[8] as u32) | ((buf[9] as u32) << 8);
+    let pid = (buf[10] as u32) | ((buf[11] as u32) << 8);
+    pl011_write(b"dwc2: enumerated device VID:PID=");
+    write_hex32((vid << 16) | pid);
+    pl011_write(b" class="); write_hex32(buf[4] as u32);
+    pl011_write(b" mps0="); write_hex32(mps as u32);
+    pl011_write(b" - control transfers work (slave/PIO)\r\n");
+}
+
+/// Called from the Core-0 idle loop. Enumeration is synchronous (done in `reset_port`); the keyboard
+/// interrupt-endpoint poll will hook in here in increment 4.
+pub fn poll() {}
