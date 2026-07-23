@@ -219,9 +219,13 @@ pub fn init() {
     wr(HCINTMSK0, 0x7FF);   // all channel-0 interrupt sources
     wr(HAINTMSK, 0xFFFF);   // all channels
     wr(GINTMSK, (1 << 25) | (1 << 24)); // Hchint (host channel) + Prtint (port)
-    // 5e. Host PHY clock select: for a full/low-speed device the PHY runs at 48 MHz (FSLSPClkSel=1);
-    //     leaving it 0 (30/60 MHz HS clock) makes the SOF/transaction timing wrong for an FS keyboard.
-    wr(HCFG, (rd(HCFG) & !0b11) | 1);
+    // 5e. Host PHY clock select. CRITICAL for the Pi: with a HS UTMI+ PHY (GUSBCFG.PHYSel=0) driving a
+    //     full/low-speed device, Linux's dwc2_init_fs_ls_pclk_sel() selects the 30/60 MHz HS-derived
+    //     clock (FSLSPClkSel=0), NOT 48 MHz (which is for a dedicated FS serial PHY). With the wrong FS/LS
+    //     clock the frame timer still ticks (SOFs advance) but the core cannot clock the actual FS token,
+    //     so the channel arms and never transmits - the exact universal stall seen on this board in both
+    //     DMA and PIO mode (SETUP bytes left unconsumed in the TX FIFO). Set it to 0 before the port reset.
+    wr(HCFG, rd(HCFG) & !0b11);
     // Ack any pending core interrupts (a stuck SOF/port flag can stall the emulated frame machine).
     wr(GINTSTS, 0xFFFF_FFFF);
 
