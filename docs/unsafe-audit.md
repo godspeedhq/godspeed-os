@@ -37,9 +37,15 @@ the same way `ctrl_xfer`/`poll` do (`addr_of_mut`, core-0 only, cache-bracketed)
 end against `usb-storage` (READ CAPACITY + READ(10) of a planted block-0 signature). The BOT/SCSI layer on
 top of it (`bot_command`, `probe_mass_storage`) is all safe code. So `dwc2.rs` is **9**.
 
+**CDC-ECM USB-Ethernet (+1 -> 10):** the same session added a CDC-ECM driver (`configure_cdc_ecm` +
+`net_verify_arp`) - raw ethernet frames over the bulk endpoints, verified in QEMU by an ARP round-trip
+through `usb-net`. The one added `unsafe` is a single write of the station MAC into the `NET_MAC` static
+(`addr_of_mut`, core-0 enumeration only); the MAC is otherwise passed as a local, and the frame build +
+BOT/SCSI code is all safe. So `dwc2.rs` is **10**.
+
 | File | Change | Why |
 |------|--------|-----|
-| `arch/arm/dwc2.rs` | 3 -> 9 (+6) | DMA reinstated: `flush_dcache` (DCCIMVAC + `dsb`, +2), `DMA`-static access in `ctrl_xfer` + `poll` (+2), `PREV_KEYS`-static in `decode_report` (+1), `DMA`-static access in `bulk_xfer` (+1). Slave-mode FIFO code (all safe `rd`/`wr`) removed. |
+| `arch/arm/dwc2.rs` | 3 -> 10 (+7) | DMA reinstated: `flush_dcache` (DCCIMVAC + `dsb`, +2), `DMA`-static access in `ctrl_xfer` + `poll` (+2), `PREV_KEYS`-static in `decode_report` (+1), `DMA`-static in `bulk_xfer` (+1), `NET_MAC`-static write in `configure_cdc_ecm` (+1). Slave-mode FIFO code (all safe `rd`/`wr`) removed. |
 
 ---
 
@@ -859,7 +865,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 6 | permitted |
 | arch/arm/fbcon.rs | 4 | permitted |
-| arch/arm/dwc2.rs | 9 | permitted |
+| arch/arm/dwc2.rs | 10 | permitted |
 | arch/arm/page_tables.rs | 27 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |

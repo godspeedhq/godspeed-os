@@ -120,13 +120,25 @@ GodspeedOS way.
   -> serial shows `msc capacity ...` + `BULK TRANSFER VERIFIED`. A real USB flash drive is thus already
   detected + read on the Pi 2; promoting it to a `block-driver` backend (alongside SD/EMMC) is a small
   further step.
-- **LAN9514 USB-Ethernet -> `net-stack`** - the Pi 2 NIC is a USB device behind the hub, so it rides the
-  DWC2 stack (enumeration + bulk transfers, both now in place). The remaining work is the device-specific
-  layer: the real Pi 2 speaks `smsc95xx` (not QEMU-emulated, so HW-verified later), while QEMU's `usb-net`
-  is a CDC/RNDIS device - structure the driver as a generic USB-net core (bulk frame TX/RX) + a per-device
-  setup layer so the frame plumbing is QEMU-verifiable and only the register layer is HW-blind. Then bridge
-  the in-kernel driver to the userspace `net-stack` over frame IPC (the USB analog of how the in-kernel
-  DWC2 keyboard feeds `console_push_byte`).
+- **USB-Ethernet frame path (CDC-ECM)** - **DONE + QEMU-verified** (2026-07-23). A CDC-ECM driver
+  (`configure_cdc_ecm`) brings up QEMU's `usb-net` gadget: it finds the ECM config (control class
+  0x02/subclass 0x06 + a data interface with bulk endpoints), selects it, reads the station MAC from the
+  ECM functional descriptor's string, activates the data interface's bulk endpoints (SET_INTERFACE), and
+  enables the packet filter. CDC-ECM carries **raw ethernet frames over bulk, no per-packet header**, so
+  the frame path is exactly `bulk_xfer`. Proven end to end by an **ARP round-trip through QEMU's user-net**:
+  `net_verify_arp` broadcasts an ARP request for the gateway (10.0.2.2) and receives the reply over bulk IN
+  (gateway MAC 52:55:0a:00:02:02) -> `USB-ETHERNET FRAME TX/RX VERIFIED`. Test:
+  `qemu-system-arm -M raspi2b,usb=on -netdev user,id=n0 -device usb-net,netdev=n0`. This is a real driver
+  for CDC-ECM USB dongles, and it validates the whole in-kernel USB frame path.
+- **LAN9514 (`smsc95xx`) + net-stack bridge -> full Pi 2 networking** - the remaining work, in two parts.
+  (1) The real Pi 2 onboard NIC is a **vendor-specific** `smsc95xx` device (class 0xFF, VID 0x0424), *not*
+  CDC-ECM - it needs its own device-setup + framing layer (register reads/writes via vendor control
+  requests, a TX command word + RX status word around each frame). QEMU does not emulate it, so this layer
+  is HW-verified later; but it plugs into the same enumeration + `bulk_xfer` that CDC-ECM already proved.
+  (2) **Bridge** the in-kernel USB-net driver to the userspace `net-stack` over frame IPC (the USB analog
+  of how the in-kernel DWC2 keyboard feeds `console_push_byte`) - the genuinely new plumbing, since on x86
+  the NIC is a userspace PCIe driver. Once bridged, the existing `net-stack` (ARP/IPv4/ICMP/UDP/DHCP) and
+  the `net`/`ping` utilities work over USB. The CDC-ECM path can drive that bridge in QEMU for verification.
 - **SDK DMA cache-coherence (SEC-28)** - `sdk/rust/src/dma.rs` assumes x86 coherent DMA; any real ARM
   driver needs cache-maintenance hooks (clean-before-device-read, invalidate-before-CPU-read) first.
 

@@ -631,11 +631,144 @@ fn enumerate_downstream(low: bool) -> bool {
     pl011_write(b"dwc2: downstream VID:PID="); write_hex32((vid << 16) | pid);
     pl011_write(b" class="); write_hex32(buf[4] as u32); pl011_write(b"\r\n");
 
+    // A CDC device (class 0x02 at the device level) is a USB-Ethernet gadget. Try CDC-ECM (QEMU's usb-net,
+    // and real CDC-ECM dongles). The Pi 2's own LAN9514 is vendor-specific (smsc95xx) - a later branch.
+    if buf[4] == 0x02 && configure_cdc_ecm(buf[17]) { return true; }
+
     // Both HID and mass storage define their class at the interface level, so each probe reads the
     // config descriptor itself. A boot keyboard is the goal; mass storage exercises the bulk path.
     if configure_keyboard() { return true; }
     if probe_mass_storage() { return true; }
     false
+}
+
+// --- CDC-ECM USB-Ethernet: raw ethernet frames over the bulk endpoints, no per-packet framing ---
+static NET_READY:  AtomicBool = AtomicBool::new(false);
+static NET_EP_IN:  AtomicU8   = AtomicU8::new(0);   // bulk IN endpoint (device -> host frames)
+static NET_EP_OUT: AtomicU8   = AtomicU8::new(0);   // bulk OUT endpoint (host -> device frames)
+static mut NET_MAC: [u8; 6] = [0; 6];               // our station MAC (the future net-stack bridge needs it)
+
+fn hex_val(c: u8) -> u8 {
+    match c { b'0'..=b'9' => c - b'0', b'a'..=b'f' => c - b'a' + 10, b'A'..=b'F' => c - b'A' + 10, _ => 0 }
+}
+
+/// Read the ECM iMACAddress string descriptor (12 UTF-16LE hex chars) into a 6-byte MAC.
+fn read_mac_string(idx: u8) -> [u8; 6] {
+    let mut mac = [0u8; 6];
+    if idx == 0 { return mac; }
+    let mut s = [0u8; 40];
+    if !get_descriptor(0x80, 0x03, idx, 0x0409, &mut s, 2) { return mac; }   // langid en-US; length first
+    let len = (s[0] as usize).min(s.len());
+    if len < 26 { return mac; }
+    if !get_descriptor(0x80, 0x03, idx, 0x0409, &mut s, len) { return mac; }
+    for b in 0..6 { mac[b] = (hex_val(s[2 + b * 4]) << 4) | hex_val(s[2 + b * 4 + 2]); }
+    mac
+}
+
+/// Bring up a CDC-ECM USB-Ethernet interface: find the ECM config (control class 0x02/subclass 0x06 + a
+/// data interface with bulk endpoints), select it, read the station MAC, activate the data interface's
+/// bulk endpoints, enable the packet filter, then prove the frame path with an ARP round-trip.
+fn configure_cdc_ecm(nconfigs: u8) -> bool {
+    for ci in 0..nconfigs {
+        let mut cfg = [0u8; 160];
+        if !get_descriptor(0x80, 0x02, ci, 0, &mut cfg, 9) { continue; }
+        let total = (((cfg[2] as usize) | ((cfg[3] as usize) << 8)).max(9)).min(cfg.len());
+        if !get_descriptor(0x80, 0x02, ci, 0, &mut cfg, total) { continue; }
+        let cfg_val = cfg[5];
+
+        let mut i = 0usize;
+        let mut is_ecm = false;
+        let mut ctrl_iface = 0u8;
+        let mut imac = 0u8;
+        let mut cur_iface = 0u8;
+        let mut cur_alt = 0u8;
+        let mut cur_is_data = false;
+        let mut data_iface = 0u8;
+        let mut data_alt = 0u8;
+        let mut ep_in = 0u8;
+        let mut ep_out = 0u8;
+        let mut bulk_mps = 64u8;
+        while i + 2 <= total {
+            let blen = cfg[i] as usize;
+            let bt = cfg[i + 1];
+            if blen == 0 { break; }
+            if bt == 0x04 && i + 8 <= total {                          // interface descriptor
+                cur_iface = cfg[i + 2];
+                cur_alt = cfg[i + 3];
+                cur_is_data = cfg[i + 5] == 0x0A;                      // CDC Data class
+                if cfg[i + 5] == 0x02 && cfg[i + 6] == 0x06 { is_ecm = true; ctrl_iface = cur_iface; }
+            } else if bt == 0x24 && i + 4 <= total && cfg[i + 2] == 0x0F {
+                imac = cfg[i + 3];                                     // ECM functional: iMACAddress index
+            } else if bt == 0x05 && cur_is_data && i + 7 <= total && cfg[i + 3] & 0x03 == 0x02 {
+                bulk_mps = if cfg[i + 4] == 0 { 64 } else { cfg[i + 4] };
+                data_iface = cur_iface;
+                data_alt = cur_alt;                                    // the alt setting that carries the bulk eps
+                if cfg[i + 2] & 0x80 != 0 { ep_in = cfg[i + 2] & 0x0F; } else { ep_out = cfg[i + 2] & 0x0F; }
+            }
+            i += blen;
+        }
+        if !is_ecm || ep_in == 0 || ep_out == 0 { continue; }
+
+        if !control_out(0x00, 0x09, cfg_val as u16, 0) { pl011_write(b"dwc2: ecm SET_CONFIG failed\r\n"); return false; }
+        let mac = read_mac_string(imac);
+        // SET_INTERFACE(data_iface, data_alt): activate the alt setting that exposes the bulk endpoints.
+        control_out(0x01, 0x0B, data_alt as u16, data_iface as u16);
+        // SET_ETHERNET_PACKET_FILTER (CDC class, req 0x43) on the control interface: directed+broadcast+multicast.
+        control_out(0x21, 0x43, 0x000E, ctrl_iface as u16);
+
+        BULK_MPS.store(bulk_mps, Ordering::Relaxed);
+        BULK_TOGGLE_IN.store(false, Ordering::Relaxed);
+        BULK_TOGGLE_OUT.store(false, Ordering::Relaxed);
+        NET_EP_IN.store(ep_in, Ordering::Relaxed);
+        NET_EP_OUT.store(ep_out, Ordering::Relaxed);
+        // SAFETY: NET_MAC is written only here, during core-0 enumeration.
+        unsafe { (*core::ptr::addr_of_mut!(NET_MAC)).copy_from_slice(&mac); }
+        NET_READY.store(true, Ordering::Release);
+
+        pl011_write(b"dwc2: CDC-ECM up: in ep="); write_hex32(ep_in as u32);
+        pl011_write(b" out ep="); write_hex32(ep_out as u32);
+        pl011_write(b" mac="); write_hex32(u32::from_be_bytes([mac[0], mac[1], mac[2], mac[3]]));
+        write_hex32(((mac[4] as u32) << 8) | mac[5] as u32);
+        pl011_write(b"\r\n");
+        net_verify_arp(&mac);
+        return true;
+    }
+    false
+}
+
+/// Prove the USB-Ethernet frame path end to end: broadcast an ARP request for the QEMU user-net gateway
+/// (10.0.2.2) and poll the bulk IN endpoint for the reply. A frame out + a frame in through a real network
+/// stack is the verification the bulk-storage test is to mass storage.
+fn net_verify_arp(mac: &[u8; 6]) {
+    let ep_out = NET_EP_OUT.load(Ordering::Relaxed) as u32;
+    let ep_in = NET_EP_IN.load(Ordering::Relaxed) as u32;
+    let mut frame = [0u8; 64];
+    for b in 0..6 { frame[b] = 0xFF; }                                 // dst = broadcast
+    frame[6..12].copy_from_slice(mac);                                // src = our MAC
+    frame[22..28].copy_from_slice(mac);                               // ARP sender hardware address
+    frame[12] = 0x08; frame[13] = 0x06;                               // ethertype ARP
+    frame[14] = 0x00; frame[15] = 0x01;                               // htype = Ethernet
+    frame[16] = 0x08; frame[17] = 0x00;                               // ptype = IPv4
+    frame[18] = 6; frame[19] = 4;                                     // hlen, plen
+    frame[20] = 0x00; frame[21] = 0x01;                               // oper = request
+    frame[28] = 10; frame[29] = 0; frame[30] = 2; frame[31] = 15;     // sender IP 10.0.2.15
+    frame[38] = 10; frame[39] = 0; frame[40] = 2; frame[41] = 2;      // target IP 10.0.2.2 (gateway)
+
+    if !bulk_xfer(false, ep_out, &mut frame, 42) { pl011_write(b"dwc2: net ARP send failed\r\n"); return; }
+    pl011_write(b"dwc2: net ARP request sent\r\n");
+
+    let mut rx = [0u8; 1536];
+    for _ in 0..40 {
+        if bulk_xfer(true, ep_in, &mut rx, 1536) && rx[12] == 0x08 && rx[13] == 0x06 && rx[21] == 0x02 {
+            pl011_write(b"dwc2: net ARP reply, gateway MAC=");
+            write_hex32(u32::from_be_bytes([rx[22], rx[23], rx[24], rx[25]]));
+            write_hex32(((rx[26] as u32) << 8) | rx[27] as u32);
+            pl011_write(b"\r\ndwc2: USB-ETHERNET FRAME TX/RX VERIFIED (CDC-ECM)\r\n");
+            return;
+        }
+        spin(500_000);
+    }
+    pl011_write(b"dwc2: net no ARP reply\r\n");
 }
 
 /// Read the configuration descriptor of the current device (DEV_ADDR), find a boot-keyboard interface
