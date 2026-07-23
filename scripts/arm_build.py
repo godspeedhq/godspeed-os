@@ -46,9 +46,12 @@ def main():
     ap.add_argument("--feature", default="arm-supervisor",
                     help="kernel boot-path feature (arm-supervisor | arm-shell | ...)")
     ap.add_argument("--release", action="store_true")
+    ap.add_argument("--qemu", action="store_true",
+                    help="target QEMU emulation (identity DWC2 DMA); default is real-Pi hardware")
     args = ap.parse_args()
     profile = "release" if args.release else "debug"
     rel = ["--release"] if args.release else []
+    kfeatures = args.feature + (",qemu" if args.qemu else "")
 
     # 1. Cross-compile every ARM-ported service to armv7 so build.rs can embed them.
     #    The Pi 2 is a bare-metal target (no QEMU control port), so the supervisor is built with its
@@ -60,7 +63,7 @@ def main():
 
     # 2. Build the kernel (embeds the service ELFs) with the chosen boot path.
     run(["cargo", "build", "-p", "kernel", "--target", TARGET,
-         "--features", args.feature] + rel)
+         "--features", kfeatures] + rel)
 
     # 3. Flatten to a raw image the Pi firmware / QEMU loads at 0x8000.
     kelf = os.path.join(ROOT, "target", TARGET, profile, "kernel")
@@ -71,7 +74,7 @@ def main():
     run([objcopy, "-O", "binary", kelf, img])
 
     size = os.path.getsize(img)
-    print(f"\nOK  build/kernel7.img  ({size} bytes, feature={args.feature}, profile={profile})")
+    print(f"\nOK  build/kernel7.img  ({size} bytes, feature={kfeatures}, profile={profile})")
     print("Boot in QEMU:  python scripts/arm_run.py")
     print("Deploy to Pi:  copy build/kernel7.img to the SD card's FAT32 partition")
 

@@ -13,6 +13,30 @@ comment.
 
 ---
 
+## 2026-07-23 - DWC2 USB keyboard: DMA mode + hub enumeration + HID poll (feat/pi2-arm32)
+
+The slave/PIO experiment (entry below) got control transfers working on QEMU's DWC2 model *only for the
+SETUP stage*: QEMU emulates the DWC2 **DMA** engine, not slave/PIO, so DATA-IN never delivered bytes.
+Reverted enumeration to **internal DMA mode** - which is also how u-boot/Linux drive the Pi 2 core - and
+completed the keyboard: point `HCDMA` at the `DMA` scratch static, bracket every transfer with cache
+maintenance (`flush_dcache`, DCCIMVAC + `dsb`, the A7's DMA is not coherent), enumerate the hub the
+keyboard sits behind (the Pi 2's LAN9514 topology, and QEMU's NEC-hub model), select boot protocol, and
+poll the interrupt IN endpoint from the timer tick (`poll` -> `decode_report` -> `console_push_byte`).
+QEMU-verified end to end: keys typed on the emulated `usb-kbd` reach the shell. The DMA buffer address is
+the VideoCore bus alias `0xC000_0000 | phys` on real hardware and identity (`0`) under QEMU, selected by
+the new `qemu` cargo feature (`scripts/arm_build.py --qemu`); the shipped image stays hardware-correct.
+
+So `dwc2.rs` unsafe returns to **3 -> 8**: the DMA path is back (`flush_dcache`'s 2 asm blocks + the
+`DMA`-static access in `ctrl_xfer` and `poll`), plus one `PREV_KEYS`-static access in `decode_report` (the
+edge-trigger previous-report buffer, reached via `addr_of_mut` to avoid a mutable-static reference). All
+in permitted `arch/`; every block carries a SAFETY comment.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/dwc2.rs` | 3 -> 8 (+5) | DMA reinstated: `flush_dcache` (DCCIMVAC + `dsb`, +2), `DMA`-static access in `ctrl_xfer` + `poll` (+2), `PREV_KEYS`-static access in `decode_report` (+1). Slave-mode FIFO code (all safe `rd`/`wr`) removed. |
+
+---
+
 ## 2026-07-23 - DWC2 control transfers via slave/PIO mode (feat/pi2-arm32)
 
 The DWC2's internal DMA master never initiated a transfer on the Pi 2: across a dozen HW tests the channel
@@ -829,7 +853,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 6 | permitted |
 | arch/arm/fbcon.rs | 4 | permitted |
-| arch/arm/dwc2.rs | 3 | permitted |
+| arch/arm/dwc2.rs | 8 | permitted |
 | arch/arm/page_tables.rs | 27 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |

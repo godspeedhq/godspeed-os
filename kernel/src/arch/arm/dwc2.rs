@@ -51,6 +51,17 @@ const HCINT0:   usize = 0x508; // channel interrupt status
 const HCINTMSK0:usize = 0x50C; // channel interrupt mask
 const HCTSIZ0:  usize = 0x510; // transfer size (bytes, packet count, PID)
 const HCDMA0:   usize = 0x514; // channel DMA address (physical buffer)
+// What the DWC2 DMA master OR's into a physical buffer address to reach RAM.
+//   Real Pi 2 (BCM2836): the VideoCore uncached bus alias 0xC000_0000 | phys (Circle's BUS_ADDRESS,
+//     u-boot's `dev->dma`). The peripherals see ARM RAM at 0xC000_0000, not at 0.
+//   QEMU raspi2b: the emulated DWC2 DMA reads/writes the ARM *system* address space directly, so the
+//     alias points at unmapped memory - the device would then DMA a garbage SETUP (which USB still ACKs)
+//     and STALL the DATA stage. Emulation therefore wants 0 (identity).
+// Gated on the `qemu` build feature so the same source serves both; HW build keeps the alias.
+#[cfg(feature = "qemu")]
+const DMA_BUS_ALIAS: u32 = 0x0000_0000;
+#[cfg(not(feature = "qemu"))]
+const DMA_BUS_ALIAS: u32 = 0xC000_0000;
 const HAINT:    usize = 0x414; // host all-channels interrupt
 const HAINTMSK: usize = 0x418; // host all-channels interrupt mask
 // --- Power / clock gating ---
@@ -208,11 +219,13 @@ pub fn init() {
         waited += 1;
         if waited > 1_000_000 { pl011_write(b"dwc2: WARN RX FIFO flush did not clear\r\n"); break; }
     }
-    // 5c. Slave / PIO mode: DMA DISABLED (DmaEn=0). The internal DMA master never initiated a transfer on
-    //     this board (GRSTCTL.AHBIdle stayed 1 across a dozen HW tests despite correct config + framing),
-    //     so we drive the FIFO from the CPU instead - the mode every working bare-metal Pi driver uses.
-    //     Keep only GlblIntrMsk (harmless; we poll GINTSTS/HCINT directly, which update regardless).
-    wr(GAHBCFG, GAHBCFG_GLBLINTRMSK);
+    // 5c. Internal buffer DMA + INCR4 AHB burst (u-boot's value) + the global-int bit. We POLL HCINT for
+    //     completion, but the transfer itself is DMA: the core moves each packet to/from the buffer HCDMA
+    //     points at, so no FIFO push/pop. This is what QEMU's DWC2 model actually emulates (slave/PIO is
+    //     an unimplemented TODO there), and the earlier "DMA master never initiated" symptom was a channel
+    //     left in an undefined state - the halt-all-channels init (5f) is exactly the fix for that, so DMA
+    //     is retried WITH it in place. INCR4 = HBstLen field (bits [4:1]) = 3.
+    wr(GAHBCFG, GAHBCFG_DMAEN | (3 << 1) | GAHBCFG_GLBLINTRMSK);
     // 5d. Enable the channel + aggregate host-channel interrupts. We poll HCINT, but some DWC2 cores
     //     (and QEMU's model) only advance a channel's transaction when its interrupt is unmasked. These
     //     never reach the CPU (the BCM2836 USB IRQ line is not wired), they just gate the state machine.
@@ -319,47 +332,51 @@ fn reset_port() {
 // ---------------------------------------------------------------------------
 
 // HCTSIZ PIDs
+const PID_DATA0: u32 = 0;
 const PID_DATA1: u32 = 2;
 const PID_SETUP: u32 = 3;
 // HCINT bits
 const HCINT_XFERCOMPL: u32 = 1 << 0;
 const HCINT_CHHLTD:    u32 = 1 << 1;
-// Max RX status entries drained in one IN transaction before declaring the core wedged. A real transfer
-// yields a handful (data packets + completion); this is far above that but finite, so a core that keeps
-// RxFLvl asserted forever cannot hang the kernel.
-const RX_DRAIN_CAP: u32 = 100_000;
 
-// --- Slave / PIO mode -------------------------------------------------------
-// The DWC2's internal DMA master never initiates a transfer in our environment: across a dozen HW tests
-// the channel arms (ChEna set), the host frames (HFNUM advances), every config register reads correct,
-// yet GRSTCTL.AHBIdle stays 1 and HCDMA never advances. So we drive the FIFO from the CPU instead - the
-// slave/PIO mode every working bare-metal Pi USB driver uses. No bus-mastering, no DMA buffers, no cache
-// maintenance: OUT data is pushed word-by-word into the NP TX FIFO, IN data is popped word-by-word from
-// the RX FIFO after reading GRXSTSP. Enumeration is synchronous (a one-time bounded boot cost); the
-// keyboard interrupt-endpoint poll (increment 4) will reuse chan_in from the timer tick.
-
-const DFIFO0:  usize = 0x1000; // host channel-0 data FIFO push/pop window (offset from DWC2_BASE)
-const GRXSTSP: usize = 0x020;  // RX status pop (reading it dequeues one RX FIFO status word)
-const GINTSTS_RXFLVL: u32 = 1 << 4; // RX FIFO non-empty (a packet status is waiting in GRXSTSP)
+// --- Internal DMA mode ------------------------------------------------------
+// The DWC2's own bus-mastering DMA moves the data: we point HCDMA at a physically-contiguous buffer
+// (`DMA`), arm the channel, and wait for the halt - no FIFO push/pop from the CPU. QEMU's DWC2 model
+// only implements this DMA path (not slave/PIO), and it is also how u-boot/Linux drive the Pi 2 core.
+// The A7's DMA is not cache-coherent, so every transfer is bracketed with cache maintenance
+// (`flush_dcache`, DCCIMVAC) and the buffer is reached through the VideoCore bus alias on real hardware
+// (`DMA_BUS_ALIAS`). Enumeration is synchronous (a one-time bounded boot cost); the keyboard interrupt
+// endpoint is polled from the timer tick (`poll`).
 
 static LOW_SPEED: AtomicBool = AtomicBool::new(false); // attached device is low-speed
 static DEV_ADDR:  AtomicU8   = AtomicU8::new(0);       // 0 until SET_ADDRESS assigns 1
 static MPS0:      AtomicU8   = AtomicU8::new(8);       // EP0 max packet size (8 until GET_DESCRIPTOR)
 
-/// Program + enable channel 0 for one transaction. In slave mode the enable just tells the core to run
-/// the token; we then feed/drain the FIFO ourselves.
-fn chan_program(dir_in: bool, pid: u32, len: u32) {
+// --- boot-keyboard poll state (set once enumeration finds a keyboard behind the hub) ---
+static KBD_READY:  AtomicBool = AtomicBool::new(false); // a boot keyboard is configured + pollable
+static KBD_ADDR:   AtomicU8   = AtomicU8::new(0);       // its assigned USB address
+static KBD_EP:     AtomicU8   = AtomicU8::new(0);       // its interrupt IN endpoint number
+static KBD_TOGGLE: AtomicBool = AtomicBool::new(false); // DATA0/DATA1 toggle for the interrupt endpoint
+
+/// Program + enable channel 0 for one transaction. `ep`/`ep_type` select the endpoint (0/control for the
+/// enumeration path, the keyboard's IN endpoint / interrupt=3 for polling); device address, EP0 max-packet
+/// and speed come from the globals the enumeration steps set. The DWC2 DMA master moves the data itself.
+fn chan_program(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: u32) {
     let mps = MPS0.load(Ordering::Relaxed) as u32;
     let dev_addr = DEV_ADDR.load(Ordering::Relaxed) as u32;
     let low_speed = LOW_SPEED.load(Ordering::Relaxed) as u32;
     let pkts = if len == 0 { 1 } else { (len + mps - 1) / mps };
     wr(HCINT0, 0xFFFF_FFFF);                                     // clear stale channel interrupts
-    wr(HCSPLT0, 0);                                              // no split transaction (device on root port)
+    wr(HCSPLT0, 0);                                              // no split transaction (full-speed chain)
     wr(HCTSIZ0, (len & 0x7_FFFF) | (pkts << 19) | (pid << 29));  // size, packet count, starting PID
+    // The HCDMA address is a *bus* address as the DWC2 master sees memory (see DMA_BUS_ALIAS).
+    wr(HCDMA0, buf_phys | DMA_BUS_ALIAS);
     let chan = (mps & 0x7FF)
+        | ((ep & 0xF) << 11)               // endpoint number
         | ((dir_in as u32) << 15)
         | (low_speed << 17)
-        | (1 << 20)                        // multi-count = 1; endpoint 0 + control type are the zero fields
+        | ((ep_type & 0x3) << 18)          // 0=control, 2=bulk, 3=interrupt
+        | (1 << 20)                        // multi-count = 1
         | ((dev_addr & 0x7F) << 22)
         | (1 << 31);                       // channel enable
     wr(HCCHAR0, chan);
@@ -396,27 +413,33 @@ fn wait_halt() -> u32 {
     }
 }
 
-/// One OUT transaction (SETUP or 0-length STATUS OUT): enable the channel, push `buf[..len]` into the NP
-/// TX FIFO one word at a time, then wait for the halt. Retries on NAK/transaction-error (a device fresh
-/// from reset can be briefly not-ready); STALL or exhausted retries is a hard failure. Returns true on
-/// XferCompl.
-fn chan_out(pid: u32, buf: &[u8], len: usize) -> bool {
-    for _attempt in 0..2 {
-        chan_program(false, pid, len as u32);
-        let words = (len + 3) / 4;
-        for i in 0..words {
-            let mut t = 0u32;
-            while (rd(0x02C) & 0xFFFF) == 0 {           // GNPTXSTS.NPTxFSpcAvail (words free)
-                t += 1;
-                if t > 1_000_000 { pl011_write(b"dwc2: TX FIFO space timeout\r\n"); return false; }
-            }
-            let mut w = 0u32;
-            for b in 0..4 {
-                let idx = i * 4 + b;
-                if idx < len { w |= (buf[idx] as u32) << (b * 8); }
-            }
-            wr(DFIFO0, w);
-        }
+/// DMA scratch buffer for control transfers. Static so it lives in identity-mapped RAM (VA == PA); the
+/// DMA engine reads/writes it via the uncached bus alias (`chan_program`). 64-byte aligned so a whole
+/// buffer sits on its own cache lines for the clean/invalidate bracket.
+#[repr(C, align(64))]
+struct DmaBuf { setup: [u8; 8], data: [u8; 64] }
+static mut DMA: DmaBuf = DmaBuf { setup: [0; 8], data: [0; 64] };
+
+/// Clean+invalidate a cache-line range to the PoC (DCCIMVAC) - the DMA-coherency bracket. The A7's DMA
+/// is not cache-coherent: clean pushes CPU writes to RAM before the device reads (OUT); invalidate drops
+/// the line so a later CPU read re-fetches what the device wrote (IN). A no-op under QEMU (no caches).
+fn flush_dcache(addr: u32, len: u32) {
+    let mut p = addr & !31;
+    let end = addr.wrapping_add(len);
+    while p < end {
+        // SAFETY: DCCIMVAC (`c7, c14, 1`) cleans+invalidates one line by MVA; no memory is modified.
+        unsafe { core::arch::asm!("mcr p15, 0, {a}, c7, c14, 1", a = in(reg) p, options(nostack)); }
+        p = p.wrapping_add(32);
+    }
+    // SAFETY: `dsb` orders the maintenance before the DMA (or the following CPU read) observes memory.
+    unsafe { core::arch::asm!("dsb", options(nostack)); }
+}
+
+/// One DMA transaction: point HCDMA at `buf_phys`, enable the channel, wait for the halt. The core moves
+/// the data itself. Retries on NAK / transaction-error; STALL or exhausted retries is a hard failure.
+fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u32) -> bool {
+    for _attempt in 0..3 {
+        chan_program(dir_in, pid, len, buf_phys, ep, ep_type);
         let ci = wait_halt();
         if ci & HCINT_XFERCOMPL != 0 { return true; }
         if ci & (1 << 3) != 0 { return false; }         // STALL - hard failure
@@ -425,89 +448,92 @@ fn chan_out(pid: u32, buf: &[u8], len: usize) -> bool {
     false
 }
 
-/// One IN transaction (DATA IN or 0-length STATUS IN): enable the channel, drain the RX FIFO into `buf`
-/// as packets arrive (GRXSTSP tells us the byte count), then wait for the halt. Same retry policy as
-/// chan_out. Returns true on XferCompl.
-fn chan_in(pid: u32, buf: &mut [u8], len: usize) -> bool {
-    for _attempt in 0..2 {
-        chan_program(true, pid, len as u32);
-        let mut received = 0usize;
-        let mut t = 0u32;
-        let mut drained = 0u32;
-        let ci = loop {
-            // Drain every RX status currently queued before checking for the halt, so no received data
-            // is left in the FIFO when the channel completes. This inner loop has its OWN bound: a
-            // wedged core that keeps RxFLvl perpetually asserted would otherwise spin here forever, and
-            // the `t = 0` progress-reset below means the outer 4M timeout would never fire. Any real IN
-            // transfer produces a handful of RX status entries; RX_DRAIN_CAP is far above that but finite.
-            while rd(GINTSTS) & GINTSTS_RXFLVL != 0 {
-                let status = rd(GRXSTSP);
-                let bcnt = ((status >> 4) & 0x7FF) as usize;
-                let pktsts = (status >> 17) & 0xF;
-                if pktsts == 2 && bcnt > 0 {            // IN data packet received
-                    let words = (bcnt + 3) / 4;
-                    let mut got = 0usize;
-                    for _ in 0..words {
-                        let w = rd(DFIFO0);
-                        for b in 0..4 {
-                            if got < bcnt {
-                                if received < buf.len() { buf[received] = (w >> (b * 8)) as u8; received += 1; }
-                                got += 1;
-                            }
-                        }
-                    }
-                }
-                t = 0;
-                drained += 1;
-                if drained > RX_DRAIN_CAP {
-                    pl011_write(b"dwc2: RX FIFO drain runaway - USB unavailable\r\n");
-                    return false;
-                }
-            }
-            let ci = rd(HCINT0);
-            if ci & HCINT_CHHLTD != 0 { break ci; }
-            t += 1;
-            if t > 4_000_000 {
-                pl011_write(b"dwc2: IN timeout HCINT="); write_hex32(rd(HCINT0)); pl011_write(b"\r\n");
-                return false;
-            }
-        };
-        let _ = received;
-        if ci & HCINT_XFERCOMPL != 0 { return true; }
-        if ci & (1 << 3) != 0 { return false; }         // STALL - hard failure
-        spin(5_000);                                    // NAK / XactErr - brief backoff, then retry
-    }
-    false
+/// A single control-endpoint DMA transaction (ep 0, type control). Thin wrapper so ctrl_xfer reads clean.
+fn ctrl_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32) -> bool {
+    chan_dma(dir_in, pid, buf_phys, len, 0, 0)
 }
 
-/// A full control transfer: SETUP -> (DATA) -> STATUS. `data_in`/`dlen` describe the DATA stage; the
-/// STATUS stage runs in the opposite direction with zero length. Returns true if every stage completed.
+/// A full control transfer via DMA: SETUP -> (DATA) -> STATUS, through the `DMA` scratch buffer. `data_in`
+/// / `dlen` describe the DATA stage; the STATUS stage runs in the opposite direction with zero length.
 fn ctrl_xfer(setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize) -> bool {
-    if !chan_out(PID_SETUP, setup, 8) { pl011_write(b"dwc2: SETUP failed\r\n"); return false; }
-    if dlen > 0 {
-        let ok = if data_in { chan_in(PID_DATA1, data, dlen) } else { chan_out(PID_DATA1, data, dlen) };
-        if !ok { pl011_write(b"dwc2: DATA failed\r\n"); return false; }
+    // SAFETY: DMA is a static touched only here on core 0; `addr_of` yields its identity-mapped physical
+    // address. The buffer is filled + cache-flushed while no channel is running, so the DMA engine never
+    // reads a half-written buffer.
+    unsafe {
+        let d = &mut *core::ptr::addr_of_mut!(DMA);
+        let setup_phys = core::ptr::addr_of!(d.setup) as u32;
+        let data_phys = core::ptr::addr_of!(d.data) as u32;
+
+        d.setup.copy_from_slice(setup);
+        flush_dcache(setup_phys, 8);
+        if !ctrl_dma(false, PID_SETUP, setup_phys, 8) { pl011_write(b"dwc2: SETUP failed\r\n"); return false; }
+
+        if dlen > 0 {
+            if data_in {
+                flush_dcache(data_phys, dlen as u32); // invalidate the line before the device writes it
+                if !ctrl_dma(true, PID_DATA1, data_phys, dlen as u32) { pl011_write(b"dwc2: DATA failed\r\n"); return false; }
+                flush_dcache(data_phys, dlen as u32); // invalidate after -> the CPU reads device-written bytes
+                let n = dlen.min(d.data.len()).min(data.len());
+                data[..n].copy_from_slice(&d.data[..n]);
+            } else {
+                let n = dlen.min(d.data.len());
+                d.data[..n].copy_from_slice(&data[..n]);
+                flush_dcache(data_phys, dlen as u32);
+                if !ctrl_dma(false, PID_DATA1, data_phys, dlen as u32) { pl011_write(b"dwc2: DATA failed\r\n"); return false; }
+            }
+        }
+
+        // STATUS: opposite direction, zero length, DATA1 (uses the setup buffer as a dummy DMA target).
+        let ok = if data_in {
+            ctrl_dma(false, PID_DATA1, setup_phys, 0)
+        } else {
+            flush_dcache(data_phys, 4);
+            ctrl_dma(true, PID_DATA1, data_phys, 0)
+        };
+        if !ok { pl011_write(b"dwc2: STATUS failed\r\n"); return false; }
     }
-    // STATUS: opposite direction, zero length, DATA1.
-    let ok = if data_in {
-        chan_out(PID_DATA1, &[], 0)
-    } else {
-        let mut z = [0u8; 1];
-        chan_in(PID_DATA1, &mut z, 0)
-    };
-    if !ok { pl011_write(b"dwc2: STATUS failed\r\n"); return false; }
     true
 }
 
-/// Enumerate the attached device synchronously: read 8 bytes of the device descriptor to learn EP0's max
-/// packet size, assign address 1, then read the full 18-byte descriptor for VID/PID. Proof that control
-/// transfers work end to end. Called once from `reset_port` at boot.
+// --- small control-transfer helpers (built on ctrl_xfer) ---
+
+/// GET_DESCRIPTOR: `dtype`/`dindex` select the descriptor; up to `len` bytes land in `buf`.
+fn get_descriptor(rtype: u8, dtype: u8, dindex: u8, windex: u16, buf: &mut [u8], len: usize) -> bool {
+    let setup = [rtype, 0x06, dindex, dtype, windex as u8, (windex >> 8) as u8, len as u8, (len >> 8) as u8];
+    ctrl_xfer(&setup, buf, true, len)
+}
+
+/// A no-data control OUT (SET_ADDRESS / SET_CONFIGURATION / a class request). `rtype`/`req`/`value`/`index`
+/// are the bmRequestType / bRequest / wValue / wIndex fields.
+fn control_out(rtype: u8, req: u8, value: u16, index: u16) -> bool {
+    let setup = [rtype, req, value as u8, (value >> 8) as u8, index as u8, (index >> 8) as u8, 0, 0];
+    let mut z = [0u8; 1];
+    ctrl_xfer(&setup, &mut z, false, 0)
+}
+
+// USB hub port features (USB 2.0 §11.24.2) and wPortStatus bits.
+const PORT_RESET: u16 = 4;
+const PORT_POWER: u16 = 8;
+const C_PORT_CONNECTION: u16 = 16;
+const C_PORT_RESET: u16 = 20;
+
+/// GET_STATUS of a hub port -> wPortStatus (low 16) | wPortChange (high 16). 0 on failure.
+fn hub_get_port_status(port: u8) -> u32 {
+    let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 4, 0x00];
+    let mut b = [0u8; 4];
+    if !ctrl_xfer(&setup, &mut b, true, 4) { return 0; }
+    (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24)
+}
+
+/// Enumerate the device on the root port synchronously: read 8 bytes of the device descriptor to learn
+/// EP0's max packet size, assign address 1, read the full 18-byte descriptor for VID/PID/class. If the
+/// device is a hub (class 0x09) - the Pi 2's onboard LAN9514 topology, and QEMU's model - walk it to find
+/// a keyboard. Called once from `reset_port` at boot.
 fn enumerate_sync() {
     let mut buf = [0u8; 64];
 
     // GET_DESCRIPTOR(device, 8) -> bMaxPacketSize0 at byte 7.
-    let setup1 = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 8, 0x00];
-    if !ctrl_xfer(&setup1, &mut buf, true, 8) {
+    if !get_descriptor(0x80, 0x01, 0x00, 0, &mut buf, 8) {
         pl011_write(b"dwc2: GET_DESC(8) failed - USB unavailable\r\n"); return;
     }
     let mps = if buf[7] == 0 { 8 } else { buf[7] };
@@ -515,27 +541,219 @@ fn enumerate_sync() {
     pl011_write(b"dwc2: desc8 mps0="); write_hex32(mps as u32); pl011_write(b"\r\n");
 
     // SET_ADDRESS(1).
-    let setup2 = [0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
-    if !ctrl_xfer(&setup2, &mut buf, false, 0) {
+    if !control_out(0x00, 0x05, 1, 0) {
         pl011_write(b"dwc2: SET_ADDRESS failed - USB unavailable\r\n"); return;
     }
     DEV_ADDR.store(1, Ordering::Relaxed);
     spin(300_000); // USB spec: 2 ms recovery before the device answers on its new address
 
     // GET_DESCRIPTOR(device, 18) at address 1 -> VID/PID/class.
-    let setup3 = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00];
-    if !ctrl_xfer(&setup3, &mut buf, true, 18) {
+    if !get_descriptor(0x80, 0x01, 0x00, 0, &mut buf, 18) {
         pl011_write(b"dwc2: GET_DESC(18) failed - USB unavailable\r\n"); return;
     }
     let vid = (buf[8] as u32) | ((buf[9] as u32) << 8);
     let pid = (buf[10] as u32) | ((buf[11] as u32) << 8);
+    let class = buf[4];
     pl011_write(b"dwc2: enumerated device VID:PID=");
     write_hex32((vid << 16) | pid);
-    pl011_write(b" class="); write_hex32(buf[4] as u32);
-    pl011_write(b" mps0="); write_hex32(mps as u32);
-    pl011_write(b" - control transfers work (slave/PIO)\r\n");
+    pl011_write(b" class="); write_hex32(class as u32); pl011_write(b"\r\n");
+
+    if class == 0x09 {
+        enumerate_hub();               // keyboard is behind the hub (LAN9514 on real Pi 2, NEC hub in QEMU)
+    } else if class == 0x00 || class == 0x03 {
+        configure_keyboard();          // keyboard plugged straight into the root port
+    }
 }
 
-/// Called from the Core-0 idle loop. Enumeration is synchronous (done in `reset_port`); the keyboard
-/// interrupt-endpoint poll will hook in here in increment 4.
-pub fn poll() {}
+/// Walk the hub at address 1: configure it, power every port, then for each connected port reset it and
+/// enumerate the downstream device, stopping at the first keyboard. Every wait is bounded.
+fn enumerate_hub() {
+    if !control_out(0x00, 0x09, 1, 0) { pl011_write(b"dwc2: hub SET_CONFIG failed\r\n"); return; }
+
+    // Hub descriptor (class GET_DESCRIPTOR, type 0x29) -> bNbrPorts at byte 2.
+    let mut hd = [0u8; 16];
+    if !get_descriptor(0xA0, 0x29, 0x00, 0, &mut hd, 16) {
+        pl011_write(b"dwc2: hub descriptor failed\r\n"); return;
+    }
+    let nports = hd[2];
+    pl011_write(b"dwc2: hub ports="); write_hex32(nports as u32); pl011_write(b"\r\n");
+
+    for port in 1..=nports { control_out(0x23, 0x03, PORT_POWER, port as u16); } // SET_FEATURE(PORT_POWER)
+    spin(1_000_000);                                                             // ~bPwrOn2PwrGood, bounded
+
+    for port in 1..=nports {
+        let st = hub_get_port_status(port);
+        if st & 1 == 0 { continue; }                                            // no device on this port
+        control_out(0x23, 0x01, C_PORT_CONNECTION, port as u16);                // CLEAR_FEATURE(C_CONNECTION)
+        control_out(0x23, 0x03, PORT_RESET, port as u16);                       // SET_FEATURE(PORT_RESET)
+        spin(6_000_000);                                                        // reset drive + recovery, bounded
+        let st2 = hub_get_port_status(port);
+        control_out(0x23, 0x01, C_PORT_RESET, port as u16);                     // CLEAR_FEATURE(C_RESET)
+        let low = (st2 >> 9) & 1 == 1;                                          // wPortStatus low-speed bit
+        pl011_write(b"dwc2: port "); write_hex32(port as u32);
+        pl011_write(b" device status="); write_hex32(st2); pl011_write(b"\r\n");
+        if enumerate_downstream(low) { return; }                               // found + configured a keyboard
+    }
+    pl011_write(b"dwc2: no keyboard found behind hub\r\n");
+}
+
+/// A freshly-reset downstream device answers at address 0. Learn its EP0 max-packet, move it to address 2,
+/// then try to configure it as a boot keyboard. Returns true if it was one.
+fn enumerate_downstream(low: bool) -> bool {
+    DEV_ADDR.store(0, Ordering::Relaxed);
+    MPS0.store(8, Ordering::Relaxed);
+    LOW_SPEED.store(low, Ordering::Relaxed);
+    let mut buf = [0u8; 64];
+
+    if !get_descriptor(0x80, 0x01, 0x00, 0, &mut buf, 8) {
+        pl011_write(b"dwc2: downstream desc8 failed\r\n"); return false;
+    }
+    MPS0.store(if buf[7] == 0 { 8 } else { buf[7] }, Ordering::Relaxed);
+
+    if !control_out(0x00, 0x05, 2, 0) { pl011_write(b"dwc2: downstream SET_ADDRESS failed\r\n"); return false; }
+    DEV_ADDR.store(2, Ordering::Relaxed);
+    spin(300_000);
+
+    if !get_descriptor(0x80, 0x01, 0x00, 0, &mut buf, 18) {
+        pl011_write(b"dwc2: downstream desc18 failed\r\n"); return false;
+    }
+    let vid = (buf[8] as u32) | ((buf[9] as u32) << 8);
+    let pid = (buf[10] as u32) | ((buf[11] as u32) << 8);
+    pl011_write(b"dwc2: downstream VID:PID="); write_hex32((vid << 16) | pid);
+    pl011_write(b" class="); write_hex32(buf[4] as u32); pl011_write(b"\r\n");
+
+    configure_keyboard()
+}
+
+/// Read the configuration descriptor of the current device (DEV_ADDR), find a boot-keyboard interface
+/// (HID class 0x03, boot subclass, keyboard protocol) and its interrupt IN endpoint, select the config,
+/// put it in boot protocol, and arm the poll. Returns true iff it is a boot keyboard.
+fn configure_keyboard() -> bool {
+    let mut cfg = [0u8; 64];
+    // First 9 bytes for wTotalLength, then the whole thing (capped at our buffer).
+    if !get_descriptor(0x80, 0x02, 0x00, 0, &mut cfg, 9) {
+        pl011_write(b"dwc2: config desc(9) failed\r\n"); return false;
+    }
+    let total = (((cfg[2] as usize) | ((cfg[3] as usize) << 8)).max(9)).min(cfg.len());
+    if !get_descriptor(0x80, 0x02, 0x00, 0, &mut cfg, total) {
+        pl011_write(b"dwc2: config desc(full) failed\r\n"); return false;
+    }
+    let cfg_val = cfg[5];
+
+    // Walk the packed interface/endpoint descriptors for a boot-keyboard interrupt IN endpoint.
+    let mut i = 0usize;
+    let mut iface = 0u8;
+    let mut in_kbd_iface = false;
+    let mut found_kbd = false;
+    let mut ep = 0u8;
+    let mut ep_mps = 8u8;
+    while i + 2 <= total {
+        let blen = cfg[i] as usize;
+        let btype = cfg[i + 1];
+        if blen == 0 { break; }
+        if btype == 0x04 && i + 8 <= total {                       // interface descriptor
+            iface = cfg[i + 2];
+            in_kbd_iface = cfg[i + 5] == 0x03 && cfg[i + 7] == 0x01; // HID class, keyboard protocol
+            if in_kbd_iface { found_kbd = true; }
+        } else if btype == 0x05 && in_kbd_iface && i + 7 <= total { // endpoint descriptor
+            let addr = cfg[i + 2];
+            let attr = cfg[i + 3];
+            if addr & 0x80 != 0 && attr & 0x03 == 0x03 {           // IN + interrupt
+                ep = addr & 0x0F;
+                ep_mps = if cfg[i + 4] == 0 { 8 } else { cfg[i + 4] };
+            }
+        }
+        i += blen;
+    }
+    if !found_kbd || ep == 0 { pl011_write(b"dwc2: no boot-keyboard interface\r\n"); return false; }
+
+    if !control_out(0x00, 0x09, cfg_val as u16, 0) { pl011_write(b"dwc2: kbd SET_CONFIG failed\r\n"); return false; }
+    // SET_PROTOCOL(boot=0) and SET_IDLE(0) are HID class requests; some devices STALL them - not fatal.
+    control_out(0x21, 0x0B, 0, iface as u16);                      // SET_PROTOCOL(boot)
+    control_out(0x21, 0x0A, 0, iface as u16);                      // SET_IDLE(indefinite)
+
+    KBD_ADDR.store(DEV_ADDR.load(Ordering::Relaxed), Ordering::Relaxed);
+    KBD_EP.store(ep, Ordering::Relaxed);
+    MPS0.store(ep_mps, Ordering::Relaxed);                         // interrupt-endpoint packet size for the poll
+    KBD_TOGGLE.store(false, Ordering::Relaxed);
+    KBD_READY.store(true, Ordering::Release);
+    pl011_write(b"dwc2: boot keyboard ready on ep="); write_hex32(ep as u32); pl011_write(b"\r\n");
+    true
+}
+
+static mut PREV_KEYS: [u8; 6] = [0; 6];
+
+/// Map a HID boot-keyboard usage code to an ASCII byte (US layout). Returns None for keys we do not feed
+/// to the console (modifiers, F-keys, ...). `shift` selects the shifted glyph.
+fn hid_to_ascii(k: u8, shift: bool) -> Option<u8> {
+    let c = match k {
+        0x04..=0x1D => {                                           // a-z
+            let base = b'a' + (k - 0x04);
+            if shift { base - 32 } else { base }
+        }
+        0x1E..=0x26 => {                                           // 1-9
+            if shift { b"!@#$%^&*("[(k - 0x1E) as usize] } else { b'1' + (k - 0x1E) }
+        }
+        0x27 => if shift { b')' } else { b'0' },                   // 0
+        0x28 => b'\r',                                             // Enter
+        0x2A => 0x08,                                              // Backspace
+        0x2B => b'\t',                                             // Tab
+        0x2C => b' ',                                              // Space
+        0x2D => if shift { b'_' } else { b'-' },
+        0x2E => if shift { b'+' } else { b'=' },
+        0x2F => if shift { b'{' } else { b'[' },
+        0x30 => if shift { b'}' } else { b']' },
+        0x31 => if shift { b'|' } else { b'\\' },
+        0x33 => if shift { b':' } else { b';' },
+        0x34 => if shift { b'"' } else { b'\'' },
+        0x36 => if shift { b'<' } else { b',' },
+        0x37 => if shift { b'>' } else { b'.' },
+        0x38 => if shift { b'?' } else { b'/' },
+        _ => return None,
+    };
+    Some(c)
+}
+
+/// Decode one 8-byte boot report `[modifiers, reserved, key0..key5]`, pushing a byte for each key that is
+/// newly pressed this report (edge-triggered against the previous report - no auto-repeat).
+fn decode_report(r: &[u8; 8]) {
+    let shift = r[0] & 0x22 != 0;                                  // Left|Right Shift
+    // SAFETY: PREV_KEYS is touched only here, only on core 0 (the single DWC2 poller); addr_of avoids a
+    // reference to the mutable static.
+    unsafe {
+        let prev = &mut *core::ptr::addr_of_mut!(PREV_KEYS);
+        for j in 2..8 {
+            let k = r[j];
+            if k == 0 { continue; }
+            let mut was_down = false;
+            for &p in prev.iter() { if p == k { was_down = true; break; } }
+            if !was_down {
+                if let Some(c) = hid_to_ascii(k, shift) { super::console_push_byte(c); }
+            }
+        }
+        prev.copy_from_slice(&r[2..8]);
+    }
+}
+
+/// Called from the Core-0 timer tick. Once a keyboard is configured, run one interrupt IN transaction; on
+/// a completed transfer decode the boot report into console bytes. A NAK (no key change) returns quietly.
+pub fn poll() {
+    if !KBD_READY.load(Ordering::Acquire) { return; }
+    let ep = KBD_EP.load(Ordering::Relaxed) as u32;
+    let toggle = KBD_TOGGLE.load(Ordering::Relaxed);
+    let pid = if toggle { PID_DATA1 } else { PID_DATA0 };
+    // SAFETY: DMA is touched only on core 0; addr_of gives its identity-mapped physical address.
+    unsafe {
+        let d = &mut *core::ptr::addr_of_mut!(DMA);
+        let data_phys = core::ptr::addr_of!(d.data) as u32;
+        flush_dcache(data_phys, 8);                               // invalidate before the device writes
+        chan_program(true, pid, 8, data_phys, ep, 3);            // one interrupt IN, up to 8 bytes
+        let ci = wait_halt();
+        if ci & HCINT_XFERCOMPL == 0 { return; }                 // NAK / no new report
+        flush_dcache(data_phys, 8);                               // invalidate after -> read device bytes
+        let mut report = [0u8; 8];
+        report.copy_from_slice(&d.data[..8]);
+        KBD_TOGGLE.store(!toggle, Ordering::Relaxed);            // advance the data toggle on a real packet
+        decode_report(&report);
+    }
+}

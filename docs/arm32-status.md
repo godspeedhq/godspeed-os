@@ -37,10 +37,17 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
 
 ```
 python scripts/arm_build.py                       # full stack, debug -> build/kernel7.img
-python scripts/arm_build.py --release              # optimized (773 KiB; USE THIS for a usable shell)
+python scripts/arm_build.py --release              # optimized; USE THIS for a usable shell (and the Pi)
+python scripts/arm_build.py --release --qemu       # QEMU-targeted: identity DWC2 DMA (for USB testing)
 python scripts/arm_build.py --feature arm-shell    # logger+shell only (kernel-spawned, no supervisor)
 python scripts/arm_run.py --release --secs 15 --cmd "status | count"   # boot in QEMU + drive the shell
+python scripts/arm_run.py --release --usb          # boot in QEMU with an emulated usb-kbd (DWC2 path)
 ```
+
+> **`--qemu` vs the default.** The only current difference is the DWC2 USB DMA bus-address translation
+> (`arch/arm/dwc2.rs`): QEMU addresses ARM RAM directly (identity), real BCM2836 silicon sees RAM through
+> the VideoCore alias `0xC000_0000`. The default build is **hardware-correct**; pass `--qemu` only to test
+> USB under emulation. Everything else (shell, SD/fs, ping/pong) is identical between the two.
 
 `arm_build.py` cross-compiles the SDK + every arm-ported service to `armv7a-none-eabi`, builds the
 kernel (which embeds them via `kernel/build.rs`'s `arm_built` allowlist), and objcopies to a flat
@@ -87,9 +94,20 @@ These are genuine new driver development, not recompilation. Each reads a workin
 Linux / bare-metal) for the register sequence and reimplements it as a capability service the
 GodspeedOS way.
 
-- **USB keyboard (DWC2)** - *in progress* (kernel-side, `arch/arm/dwc2.rs`). Control transfers via PIO;
-  the current blocker's fix (halt-all-channels at init, `FSLSPClkSel` for the HS PHY) is being
-  hardware-verified. See git log + memory. QEMU's DWC2 cannot complete transfers, so this needs the Pi.
+- **USB keyboard (DWC2)** - **working in QEMU** (kernel-side, `arch/arm/dwc2.rs`); real-Pi verification
+  pending. The full path runs end to end under `qemu-system-arm -M raspi2b,usb=on -device usb-kbd`: DMA
+  control transfers, enumerate the **hub** the keyboard sits behind (the Pi 2's LAN9514 topology, and
+  QEMU's NEC-hub model), select HID **boot protocol**, and poll the interrupt IN endpoint from the timer
+  tick -> `decode_report` -> `console_push_byte`. Keys typed on the emulated keyboard reach the `gsh>`
+  prompt (verified: injecting `hello` via the QEMU monitor `sendkey` echoes to the shell). Two lessons:
+  (1) QEMU's DWC2 model emulates **only the DMA engine**, not slave/PIO - so the driver uses internal DMA
+  (also how u-boot/Linux drive it), bracketed with cache maintenance for the A7's non-coherent DMA;
+  (2) the HCDMA buffer address is the VideoCore bus alias `0xC000_0000 | phys` on **real hardware** but
+  identity (`0`) under **QEMU**, selected by the `qemu` cargo feature (`scripts/arm_build.py --qemu`) so
+  the shipped image stays hardware-correct. **Build for QEMU test:** `arm_build.py --release --qemu`;
+  **build for the Pi:** `arm_build.py --release` (default = hardware alias). Real-Pi bring-up may still
+  need the hard-won register quirks (halt-all-channels at init, `FSLSPClkSel=0` for the HS PHY) that QEMU
+  does not exercise - see the `dwc2.rs` comments + git log.
 - **SD/EMMC block driver -> `fs`** - **DONE** (2026-07-23): userspace `block-driver` SDHCI/PIO backend +
   the kernel's fixed-peripheral MMIO grant; `fs` mounts + persists in QEMU. Remaining: real-hardware
   verification on a Pi, and multi-block/faster transfers (PIO single-block today).

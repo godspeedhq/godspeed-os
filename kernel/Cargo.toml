@@ -65,6 +65,11 @@ arm-shell = []
 # (+ confirm) into the input ring, so a serial-output-only setup (no keyboard) still runs + shows the
 # storm. Build with `arm-supervisor,arm-autochaos`.
 arm-autochaos = []
+# Target QEMU's raspi2b emulation rather than real Pi 2 hardware. Currently only changes the DWC2 USB
+# DMA bus-address translation: QEMU's emulated DWC2 addresses ARM system RAM directly (identity), while
+# real BCM2836 silicon sees RAM through the VideoCore uncached alias 0xC000_0000 (arch/arm/dwc2.rs).
+# OFF by default so the shipped image is hardware-correct; scripts/arm_run.py passes it for emulation.
+qemu = []
 
 # Deliberately take a data abort during arm32 boot, to PROVE the exception vectors
 # fire (a fault path never observed firing is not evidence). The ARM twin of the x86
