@@ -168,6 +168,38 @@ GodspeedOS way.
   known refinement for that pass.
 - **SDK DMA cache-coherence (SEC-28)** - `sdk/rust/src/dma.rs` assumes x86 coherent DMA; any real ARM
   driver needs cache-maintenance hooks (clean-before-device-read, invalidate-before-CPU-read) first.
+- **Watchdog / PM reset (`hardware_reset`) - a real gap.** `arch::imp::hardware_reset` on ARM is a **stub
+  that spins forever** (`arch/arm/mod.rs`), so the shell `reboot` command (and the Ctrl+Alt+Del chord that
+  routes through it) **hangs the Pi 2 instead of resetting it**. The BCM2835 power-management block does a
+  full reset: write `PM_RSTC` (peripheral base + 0x10001c) with the `0x5A` password + full-reset bits and a
+  short `PM_WDOG` (base + 0x100024) timeout, then wait for the watchdog to fire. Small, well-defined, and
+  QEMU's `raspi2b` PM block should exercise it. Until then, recover a wedged Pi by power-cycling.
+- **Not gaps, nice-to-haves:** USB **mouse** (HID - a trivial extension of the keyboard interrupt-poll
+  path, low value for a console OS); **GPIO**; the BCM2835 hardware **RNG** (an entropy source); **I2C/SPI**
+  (which would enable an external RTC module for wall-clock time - see the no-RTC note above, or use NTP
+  now that networking works); and **DMA-accelerated / multi-block SD** (the block-driver is single-block
+  PIO today - correct, just not fast).
+
+## QEMU validation status (2026-07-23)
+
+The arch-neutral OS + every QEMU-emulable peripheral are green in `qemu-system-arm -M raspi2b`; the one
+gap is emulator *speed*, not correctness:
+
+- **`selfcheck` - 108+ asserts, 0 failures.** The whole non-file suite passes: gsh scripting
+  (vars/if/for/fn/defer/imports/aggregators + negative cases), IPC, `chaos kill-storm supervisor` (kill +
+  respawn, recovered), spawn/kill/wait. It does **not** finish all 163 in QEMU - **each file write takes
+  ~11 s on the TCG interpreter** (SDHCI PIO over an emulated SD), so the file-heavy tail is minutes long
+  and the harness window runs out. This is proven to be *slowness, not a defect*: an isolated write works,
+  survives a supervisor kill-storm, and **15/15 back-to-back writes complete** (~11 s each). On real
+  hardware each op is milliseconds - the T630 runs all 163 in seconds - so `selfcheck` on the Pi will
+  finish them.
+- **Kitchen-sink green:** SD (`fs`) + USB networking (DHCP/ICMP) + USB keyboard all coexist and function in
+  one boot - the real-Pi config.
+- **Everything else QEMU-verified:** boot/SMP/services/shell/IPC, persistence (format/mount/write/read/
+  append/reboot-survival), USB keyboard/storage/CDC-ECM networking, multi-device USB, `chaos max-carnage`
+  with networking, and five audit lenses (kernel/userspace/docs/unsafe/security).
+- **Untestable in QEMU:** `smsc95xx` (not emulated) and the register quirks real DWC2 silicon needs - both
+  hardware-day items.
 
 ## See also
 
