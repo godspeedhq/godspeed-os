@@ -43,6 +43,12 @@ const HPTXFSIZ: usize = 0x100; // host periodic transmit FIFO size
 // --- Host-mode registers ---
 const HCFG:     usize = 0x400; // host config (PHY clock select)
 const HPRT:     usize = 0x440; // host port control + status (root port)
+const HFIR:     usize = 0x404; // host frame interval (Circle writes 48000 for a full-speed host)
+const HFNUM:    usize = 0x408; // host frame number (low 16) + frame remaining (high 16)
+// HCCHAR bit 29: schedule the transaction in an ODD (micro)frame. Circle sets this from the current
+// frame number on every channel start; some DWC2 cores gate a channel's dispatch on the parity match,
+// so a fixed value can leave the channel armed (ChEna set) but never executed - the DMA master idle.
+const HCCHAR_ODDFRM: u32 = 1 << 29;
 // Host channel 0 register block (each channel is 0x20 apart from 0x500). We use only channel 0 - one
 // transfer at a time is plenty for enumerating + polling a single keyboard.
 const HCCHAR0:  usize = 0x500; // channel characteristics (ep, dir, addr, type, enable)
@@ -75,11 +81,23 @@ const GRSTCTL_TXFNUM_ALL: u32 = 0x10 << 6; // TxFNum=0x10 flushes ALL TX FIFOs
 const GRSTCTL_AHBIDLE: u32 = 1 << 31; // AHB master idle
 
 // GAHBCFG bits
-const GAHBCFG_GLBLINTRMSK: u32 = 1 << 0; // global interrupt enable
-const GAHBCFG_DMAEN:       u32 = 1 << 5; // DMA mode enable
+const GAHBCFG_GLBLINTRMSK:     u32 = 1 << 0; // global interrupt enable
+const GAHBCFG_WAIT_AXI_WRITES: u32 = 1 << 4; // (BCM2836 AXI) hold the DMA master until its AXI writes retire
+const GAHBCFG_DMAEN:           u32 = 1 << 5; // DMA mode enable
+// bits [2:1] are the AXI max-burst field. Circle's working Pi 2 init leaves it 0 (widest) and sets
+// WAIT_AXI_WRITES; the old INCR4 (3<<1) is an AHB-core notion QEMU tolerated but real silicon does not.
 
-// GUSBCFG bits
+// GUSBCFG bits. The PHY-interface + OTG bits below are Pi-hardware-critical and QEMU-INVISIBLE: the real
+// BCM2836 UTMI+ PHY will not clock a transaction unless the interface is selected correctly (Circle's
+// working Pi 2 init clears these at core init). QEMU ignores PHY config, so their absence only bites on
+// silicon - the exact "channel arms, ChEna stays set, DMA master never starts" symptom seen on the Pi 2.
+const GUSBCFG_PHYIF:         u32 = 1 << 3;  // UTMI+ data width: 0 = 8-bit (Pi), 1 = 16-bit
+const GUSBCFG_ULPI_UTMI_SEL: u32 = 1 << 4;  // PHY interface: 0 = UTMI+ (Pi), 1 = ULPI
 const GUSBCFG_PHYSEL:     u32 = 1 << 6;  // 1 = full-speed serial PHY, 0 = USB 2.0 HS PHY (UTMI+)
+const GUSBCFG_SRP_CAPABLE:   u32 = 1 << 8;  // OTG SRP - off for a pure host
+const GUSBCFG_HNP_CAPABLE:   u32 = 1 << 9;  // OTG HNP - off for a pure host
+const GUSBCFG_ULPI_EXT_VBUS: u32 = 1 << 20; // drive VBUS externally (ULPI) - off
+const GUSBCFG_TERM_SEL_DL:   u32 = 1 << 22; // TermSel DLine pulsing - off
 const GUSBCFG_FRCHSTMODE: u32 = 1 << 29; // force host mode
 const GUSBCFG_FRCDEVMODE: u32 = 1 << 30; // force device mode
 
@@ -165,6 +183,10 @@ pub fn init() {
         if waited > 100_000 { pl011_write(b"dwc2: WARN AHB not idle before reset\r\n"); break; }
     }
 
+    // 2b. (Pi) Before the reset, clear the ULPI external-VBUS-drive and TermSel-DLine-pulse bits, matching
+    //     Circle's working BCM2836 init. Harmless on the UTMI+ PHY; QEMU ignores them.
+    wr(GUSBCFG, rd(GUSBCFG) & !(GUSBCFG_ULPI_EXT_VBUS | GUSBCFG_TERM_SEL_DL));
+
     // 3. Core soft reset: sets defaults and clears the FIFOs. Self-clears when done.
     wr(GRSTCTL, rd(GRSTCTL) | GRSTCTL_CSFTRST);
     let mut waited = 0u32;
@@ -175,9 +197,13 @@ pub fn init() {
     // Let the PHY settle after reset.
     spin(200_000);
 
-    // 4. Force HOST mode (we are a host, not a device). The core samples this ~25 ms after the write, so
-    //    wait for CurMode=host rather than assuming it took immediately.
+    // 4. Select the PHY interface + force HOST mode (Circle's working Pi 2 sequence). On the real BCM2836
+    //    the UTMI+ 8-bit interface MUST be selected (clear ULPI_UTMI_SEL + PHYIF) and OTG HNP/SRP disabled,
+    //    or the PHY never clocks a transaction (the channel arms, ChEna stays set, and the DMA master never
+    //    starts - AHBIdle stuck 1, HW-diagnosed on the Pi 2). QEMU ignores all of this, so it only matters
+    //    on silicon. The core samples ForceHstMode ~25 ms after the write, so wait for CurMode=host.
     let mut cfg = rd(GUSBCFG);
+    cfg &= !(GUSBCFG_ULPI_UTMI_SEL | GUSBCFG_PHYIF | GUSBCFG_SRP_CAPABLE | GUSBCFG_HNP_CAPABLE);
     cfg &= !GUSBCFG_FRCDEVMODE;
     cfg |= GUSBCFG_FRCHSTMODE;
     wr(GUSBCFG, cfg);
@@ -219,13 +245,13 @@ pub fn init() {
         waited += 1;
         if waited > 1_000_000 { pl011_write(b"dwc2: WARN RX FIFO flush did not clear\r\n"); break; }
     }
-    // 5c. Internal buffer DMA + INCR4 AHB burst (u-boot's value) + the global-int bit. We POLL HCINT for
-    //     completion, but the transfer itself is DMA: the core moves each packet to/from the buffer HCDMA
-    //     points at, so no FIFO push/pop. This is what QEMU's DWC2 model actually emulates (slave/PIO is
-    //     an unimplemented TODO there), and the earlier "DMA master never initiated" symptom was a channel
-    //     left in an undefined state - the halt-all-channels init (5f) is exactly the fix for that, so DMA
-    //     is retried WITH it in place. INCR4 = HBstLen field (bits [4:1]) = 3.
-    wr(GAHBCFG, GAHBCFG_DMAEN | (3 << 1) | GAHBCFG_GLBLINTRMSK);
+    // 5c. Internal buffer DMA on the BCM2836 AXI bus (Circle's working Pi 2 value): set DMAEN +
+    //     WAIT_AXI_WRITES and leave the AXI max-burst field 0 (widest). We POLL HCINT for completion, but
+    //     the transfer itself is DMA: the core moves each packet to/from the buffer HCDMA points at, so no
+    //     FIFO push/pop. The old `(3 << 1)` (AHB INCR4) with WAIT_AXI_WRITES clear let the AXI DMA master
+    //     never retire its first write on real silicon (AHBIdle stuck 1, the channel armed but zero bytes
+    //     moved - HW-diagnosed on the Pi 2); QEMU's AHB-style model tolerated either. This matches Circle.
+    wr(GAHBCFG, GAHBCFG_DMAEN | GAHBCFG_WAIT_AXI_WRITES | GAHBCFG_GLBLINTRMSK);
     // 5d. Enable the channel + aggregate host-channel interrupts. We poll HCINT, but some DWC2 cores
     //     (and QEMU's model) only advance a channel's transaction when its interrupt is unmasked. These
     //     never reach the CPU (the BCM2836 USB IRQ line is not wired), they just gate the state machine.
@@ -309,6 +335,12 @@ fn reset_port() {
     pl011_write(b"dwc2: root port enabled after reset, ");
     pl011_write(speed_name(hprt).as_bytes());
     pl011_write(b"\r\n");
+    // (Pi) A full/low-speed host needs the frame interval set explicitly (Circle: HFIR=48000 for a
+    //  full-speed port). The DWC2 request scheduler times transactions off HFIR; on the Pi the on-board
+    //  hub enumerates full-speed, and leaving HFIR at its power-on default can leave non-periodic
+    //  transfers undispatched (the SETUP channel arms but the DMA master never starts). QEMU ignores it.
+    let spd = (hprt & HPRT_PRTSPD_MASK) >> HPRT_PRTSPD_SHIFT;
+    if spd == 1 || spd == 2 { wr(HFIR, 48000); }
     // Clear the connect/enable change flags now that we have acted on them (W1C: write 1s back). Mask
     // PrtEna off (HPRT_RMW_CLEAR) so writing these change bits does not also disable the port.
     wr(HPRT, (rd(HPRT) & !HPRT_RMW_CLEAR) | HPRT_PRTCONNDET | HPRT_PRTENCHNG);
@@ -382,6 +414,9 @@ fn chan_program(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_typ
     wr(HCTSIZ0, (len & 0x7_FFFF) | (pkts << 19) | (pid << 29));  // size, packet count, starting PID
     // The HCDMA address is a *bus* address as the DWC2 master sees memory (see DMA_BUS_ALIAS).
     wr(HCDMA0, buf_phys | DMA_BUS_ALIAS);
+    // Schedule in the NEXT frame: set OddFrm to the parity of (current frame + 1). Circle reads HFNUM and
+    // sets this on every channel start; a fixed value can leave the channel armed but never dispatched.
+    let oddfrm = if (rd(HFNUM) & 1) == 0 { HCCHAR_ODDFRM } else { 0 };
     let chan = (mps & 0x7FF)
         | ((ep & 0xF) << 11)               // endpoint number
         | ((dir_in as u32) << 15)
@@ -389,6 +424,7 @@ fn chan_program(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_typ
         | ((ep_type & 0x3) << 18)          // 0=control, 2=bulk, 3=interrupt
         | (1 << 20)                        // multi-count = 1
         | ((dev_addr & 0x7F) << 22)
+        | oddfrm                           // odd/even frame parity (Circle sets this per start)
         | (1 << 31);                       // channel enable
     wr(HCCHAR0, chan);
 }
@@ -432,6 +468,13 @@ fn wait_halt() -> u32 {
                 let f1 = rd(0x408); spin(300_000); let f2 = rd(0x408);
                 pl011_write(b" HFNUM1="); write_hex32(f1);
                 pl011_write(b" HFNUM2="); write_hex32(f2);
+                // Second line: did our config writes actually stick? (DMAEN in GAHBCFG, force-host + PHY
+                // bits in GUSBCFG, FSLSPClkSel in HCFG, the full-speed HFIR, the interrupt unmask.)
+                pl011_write(b"\r\ndwc2: cfg GAHBCFG="); write_hex32(rd(GAHBCFG));
+                pl011_write(b" GUSBCFG="); write_hex32(rd(GUSBCFG));
+                pl011_write(b" HCFG="); write_hex32(rd(HCFG));
+                pl011_write(b" HFIR="); write_hex32(rd(HFIR));
+                pl011_write(b" GINTMSK="); write_hex32(rd(GINTMSK));
                 pl011_write(b"\r\n");
             }
             return ci | HCINT_CHHLTD; // treat as halted-without-complete -> failure
