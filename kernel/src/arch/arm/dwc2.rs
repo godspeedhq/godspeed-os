@@ -373,12 +373,18 @@ fn channel_start(dir_in: bool, pid: u32, buf_phys: u32, len: u32) {
     // it reads the wrong memory - the SETUP packet never goes out and the channel halts with ChHltd only
     // (no completion, no error), exactly what the Pi 2 reported. OR in the alias so it sees our buffer.
     wr(HCDMA0, buf_phys | 0xC000_0000);
-    wr(HCCHAR0, (mps & 0x7FF)
+    // Two-step channel enable: write the transfer fields with ChEna=0 first, THEN set ChEna in a separate
+    // write. On this DWC2 core the scheduler triggers on the ChEna rising edge AFTER the fields are latched
+    // - a single combined write (fields + ChEna together) leaves the master idle and the transfer never
+    // starts (HW-diagnosed on the Pi 2: AHBIdle=1, HCDMA never advances). Matches the working bare-metal
+    // Pi examples (HCCHAR |= 1<<31 as the last step).
+    let chan = (mps & 0x7FF)
         | ((dir_in as u32) << 15)
         | (low_speed << 17)
         | (1 << 20)                        // multi-count = 1; endpoint 0 + control type are the zero fields
-        | ((dev_addr & 0x7F) << 22)
-        | (1 << 31));                      // channel enable
+        | ((dev_addr & 0x7F) << 22);
+    wr(HCCHAR0, chan);                      // fields, channel disabled
+    wr(HCCHAR0, chan | (1 << 31));          // rising edge on channel enable -> initiate
 }
 
 /// Poll the current stage: start it if idle, else check the channel. Returns true while still busy with
