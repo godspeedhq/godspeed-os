@@ -109,7 +109,10 @@ fn pl011_init() {
     gpio_init_uart(); // mux GPIO14/15 to the UART so RECEIVE works, not just transmit
     unsafe {
         PL011_CR.write_volatile(0);
-        while PL011_FR.read_volatile() & PL011_FR_BUSY != 0 {}
+        // Bounded: a present-but-wedged UART must not hang the boot on the BUSY bit (invariant 12;
+        // kernel-audit Audit 6 - same class as the x86 THRE-poll K1 fix). Best-effort proceed on timeout.
+        let mut t = 0u32;
+        while PL011_FR.read_volatile() & PL011_FR_BUSY != 0 { t += 1; if t > 1_000_000 { break; } }
         PL011_LCRH.write_volatile(PL011_LCRH_8N1);
         PL011_CR.write_volatile(PL011_CR_ON);
     }
@@ -646,12 +649,18 @@ pub fn hardware_reset() -> ! {
     // peripheral window; volatile 32-bit writes gated by the 0x5A password - the documented reset poke.
     unsafe {
         let rstc = PM_RSTC as *mut u32;
-        (PM_WDOG as *mut u32).write_volatile(PM_PASSWORD | 10); // watchdog fires in ~10 ticks (fast)
-        let cur = rstc.read_volatile();
-        rstc.write_volatile(PM_PASSWORD | (cur & PM_RSTC_WRCFG_CLR) | PM_RSTC_WRCFG_FULL_RESET);
+        let wdog = PM_WDOG as *mut u32;
+        let rstc_val = PM_PASSWORD | (rstc.read_volatile() & PM_RSTC_WRCFG_CLR) | PM_RSTC_WRCFG_FULL_RESET;
+        // The watchdog resets the SoC in ~10 ticks. RE-ISSUE the poke every iteration so a write that did
+        // not take (a briefly-unready PM block) is retried, rather than a bare spin waiting forever on one
+        // failed poke (kernel-audit Audit 6, N1). ARM/BCM2835 has no second reset method; this never
+        // returns (the SoC resets out from under it).
+        loop {
+            wdog.write_volatile(PM_PASSWORD | 10);
+            rstc.write_volatile(rstc_val);
+            core::hint::spin_loop();
+        }
     }
-    // The watchdog resets the SoC almost immediately; spin until it does (this never returns).
-    loop { core::hint::spin_loop(); }
 }
 
 /// A hardware-random u32 from the BCM2835 SoC RNG, or None if it never produced (absent/wedged - loud, not
@@ -1046,7 +1055,10 @@ pub mod rtc {
     /// deadline-based wait never expire, hanging net-stack before its serve loop.
     pub fn now_epoch_monotonic() -> i64 {
         let hz = super::timer::timer_hz() as u64;
-        if hz == 0 { return 0; }
+        // Generic timer dead (CNTFRQ selftest failed): fall back to the 1 MHz System Timer so the clock
+        // still ADVANCES rather than freezing at 0 (which would make a time-bounded wait never fire -
+        // kernel-audit Audit 6, N2). Not reachable on QEMU/real Pi 2 (both set TIMER_HZ).
+        if hz == 0 { return super::timer::systimer_secs(); }
         (super::timer::cntpct() / hz) as i64
     }
 }

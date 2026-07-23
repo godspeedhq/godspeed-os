@@ -12,6 +12,15 @@ limit   = "16MiB"
 # Reach the BAR via ctx.mmio().
 hw_device = "nic"
 log_write = true
+# ARM (Pi 2) NOTE (userspace-audit Audit 5, A5-U1): on ARM there is no PCIe NIC, so `hw_device = "nic"`
+# resolves to nothing; instead the kernel grants this service the NET_DEVICE capability BY NAME (the
+# in-kernel USB-net frame bridge, syscalls 42-44 - `service_privileges` in kernel `task/mod.rs`, arch-gated
+# to ARM). NET_DEVICE is a kernel-only by-name grant (like the SEC-audit U15 privileges) and is
+# deliberately NOT a contract capability - `contract_check.py` does not reconcile it. So on ARM the real
+# authority of this service is: NET_DEVICE (move ethernet frames) + log_write. Stated here so a contract
+# reader is not misled by the x86-shaped `hw_device` line above.
 
 [placement]
 core = 1   # a driver pins to the core its IRQ will route to (interrupt locality, §12.2)
+# ARM (Pi 2): the kernel overrides this to core 0 - the in-kernel DWC2 USB-net device is driven only from
+# core 0, and the NET_DEVICE syscalls guard on that core (userspace-audit Audit 5). This x86 value stands.

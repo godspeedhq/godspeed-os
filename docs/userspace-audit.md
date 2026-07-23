@@ -593,3 +593,34 @@ half of the length arg, which is `< 0xFFFF`); `handle_call` mirrors it. Transpar
 correct on ARM. **Lesson (reinforces A-U1):** any syscall that packs a value above 32 bits into one arg
 is broken on the 32-bit ABI; `arch/arm/CLAUDE.md` already warns of this, but the sweep must check *every*
 multi-field-packed syscall arg, not just obviously-wide ones like a timeout.
+
+## Audit 5 - 2026-07-23 (feat/pi2-arm32: the ARM USB-net backend + new shell hardware commands)
+
+Scope: the userspace ADDED this session beyond Audit 4's three ABI files - the nic-driver ARM backend
+`usb_net_main` (the `cfg(target_arch="arm")` frame-IPC <-> NetFrame* bridge) and the two new shell commands
+`cmd_random` / `cmd_gpio`. Method: direct read cross-checked against the x86 e1000/RTL serve loops (same
+contract), the SDK wrappers, the UNCHANGED net-stack client's reply parsers (to prove the ARM replies are
+contract-compatible and cannot hang it), and the kernel privilege-grant path.
+
+**Result: 0 HIGH, 1 MED-latent, 2 LOW - all FIXED.** The ARM backend's reply-cap discipline is airtight
+(no F1/N1/SEC-5-class slot leak - the cap is taken once and `remove_cap`'d unconditionally after every
+arm), every buffer is a fixed stack array, degradation is loud (serves empty replies, never hangs), and
+every reply is length-guarded on the unchanged net-stack side. The MED is the U15 prediction realized:
+nic-driver ships a contract, so a by-name privilege grant it omits is an M6-class understatement.
+
+| ID | Sev | Cmd | What | Status |
+|----|-----|-----|------|--------|
+| **A5-U1** | MED-latent | IV / VII | The kernel grants nic-driver the **NET_DEVICE** cap BY NAME (`service_privileges`, arch-gated to ARM) - the USB-net frame bridge (syscalls 42-44). But nic-driver SHIPS a contract that declares only `hw_device="nic"` + `log_write`, and on the Pi 2 `hw_device="nic"` resolves to nothing (no PCIe NIC): the contract describes x86 authority the ARM instance doesn't use while omitting the ARM authority it does. A reviewer reading the .toml to answer "what can nic-driver reach on ARM?" gets the wrong answer (M6/M7). Runtime is still explicit-cap (no ambient authority at use), arch-gated, so latent. `contract_check.py` doesn't reconcile it (NET_DEVICE lives in the Privileges table). | **FIXED** (annotate, per the settled U15 doctrine): nic-driver.toml carries an explicit ARM note (real authority = NET_DEVICE + log_write; NET_DEVICE is a sanctioned kernel-only by-name grant, not a contract cap), and `service_privileges` documents NET_DEVICE/GPIO_DEVICE as the sanctioned by-name grants. A latent placement divergence surfaced with it (contract core 1 vs ARM kernel core 0, and `contract_check.py` couldn't parse the arch-conditional `preferred_core`) - the checker now takes the x86 `else` value, and both .tomls note the ARM core-0 override. |
+| **A5-U2** | LOW | XXVI.6 / III | nic-driver `usb_net_main` op-9 batch drain called `net_frame_rx` (which DEQUEUES a frame) and THEN checked `opos + 2 + n > out.len()` - so a frame already pulled off the device but too big for `BATCH_MSG_MAX`(3072) was DROPPED (lost, not held), diverging from the x86 path which checks fit before advancing. Unreachable in practice (net-stack sends op 9 only in `ping`, where wire frames are tiny + retried), but a real lost RX frame. | **FIXED** - checks a max-size frame would fit (`opos + 2 + FRAME_MAX > out.len()`) BEFORE dequeuing; stops cleanly and lets net-stack re-poll, never dropping a consumed frame. |
+| **A5-U3** | LOW | conventions | `cmd_random` did `arg.parse::<u32>().unwrap_or(1)` - a non-numeric count (`random abc`) silently became `1` rather than a loud rejection, inconsistent with its sibling `cmd_gpio` (which rejects a bad verb/pin loudly) and the loud-input-rejection convention. | **FIXED** - a bare `random` = 1, but a given non-numeric count prints `random: count must be a number 1..64` and returns. |
+
+**Verified sound (no violation):** reply-cap discipline airtight (taken once, `remove_cap`'d
+unconditionally after every arm - no path leaks a slot); no hang / no unbounded busy-wait (`rx_one` is a
+fixed `RX_TRIES`=8 bounded best-effort, the batch loop breaks on the first empty poll, `recv()` is the
+service's own-endpoint server recv, no dependency-wait); loud graceful degradation with no device (logs +
+serves empty op-3 replies -> net-stack stays unconfigured, never hangs); fixed stack buffers (no heap);
+the frame IPC contract is net-stack-compatible (every reply length-guarded on the unchanged client side -
+op 3's 8-byte reply, op 4/9 length-prefixed, ops 5-8 ack - so a shorter-than-x86 ARM reply can't hang or
+panic net-stack); `cmd_gpio` fully validated + loud (verb match with loud usage, pin bounded 0..53 with a
+loud reject, loud "not available" on the non-ARM stub), GPIO_DEVICE cap-gated; `cmd_random` bounded
+(`clamp(1,64)`) + loud on `hw_random()==None`.

@@ -99,6 +99,14 @@ fn systimer_lo() -> u32 {
     unsafe { SYSTIMER_CLO.read_volatile() }
 }
 
+/// Seconds since boot from the 1 MHz System Timer (the low 32 bits). The DEGRADED-mode monotonic clock:
+/// used only when the generic timer is dead (`timer_hz() == 0`), where the generic `cntpct()/timer_hz`
+/// path can't produce seconds. It wraps every ~71 min (low-word only), but an advancing clock beats a
+/// frozen 0 for the deadline waits that consume it (kernel-audit Audit 6, N2).
+pub fn systimer_secs() -> i64 {
+    (systimer_lo() as u64 / SYSTIMER_HZ) as i64
+}
+
 /// Read a register in the BCM2836 core-local peripheral block (`0x4000_0000`).
 ///
 /// This block is BCM2836-specific (a Pi 1 has none) and holds the core timer control and prescaler,

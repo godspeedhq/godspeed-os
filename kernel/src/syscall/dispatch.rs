@@ -1786,7 +1786,9 @@ fn handle_net_frame_rx(ptr: u64, max: u64) -> i64 {
     let max = (max as usize).min(NET_FRAME_MAX);
     if max == 0 { return -1; }
     let mut buf = [0u8; NET_FRAME_MAX];
-    let n = crate::arch::imp::net_frame_rx(&mut buf[..max]);
+    // `net_frame_rx` returns bytes written into the `[..max]` slice; clamp defensively so a future buggy
+    // arch impl returning n > max can never index-panic `buf[..n]` (kernel-audit Audit 6, INFO-1).
+    let n = crate::arch::imp::net_frame_rx(&mut buf[..max]).min(max);
     if n == 0 { return 0; }
     if !write_user_bytes(ptr, &buf[..n]) { return -1; }
     n as i64

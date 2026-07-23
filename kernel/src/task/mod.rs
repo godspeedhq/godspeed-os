@@ -461,11 +461,15 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // NEGATIVE pin - deliberately excluded so it holds no ACQUIRE_ANY (proves AcquireSendCap denies
         // a non-holder). Ordinary services get none; their AcquireSendCap is limited to declared peers.
         acquire_any: (is_probe && name != "adv-a13") || matches!(name, "shell" | "supervisor" | "chaos"),
-        // The `nic-driver` bridges ethernet frames to/from the in-kernel USB-net device - an ARM-only
-        // path. Off ARM the NetFrame* syscalls are inert stubs (the NIC is a userspace PCIe driver), so
-        // arch-gate the grant rather than hand out an authority that is dormant-but-latent there (SEC-31).
+        // NET_DEVICE + GPIO_DEVICE are SANCTIONED KERNEL-ONLY BY-NAME GRANTS (the U15 / userspace-audit
+        // A5-U1 doctrine): they are deliberately NOT contract capabilities - the kernel is their single
+        // source of truth, and `contract_check.py` does not reconcile them. Both are arch-gated to ARM
+        // (off ARM the syscalls are inert stubs; SEC-31) so no dormant authority is handed out elsewhere.
+        // nic-driver (which DOES ship a contract) carries an ARM note in nic-driver.toml so a contract
+        // reader is not misled; the shell ships no contract, so the kernel is trivially its only record.
+        //   nic-driver bridges ethernet frames to/from the in-kernel USB-net device (NetFrame*, 42-44).
         net_device: cfg!(target_arch = "arm") && matches!(name, "nic-driver"),
-        // The shell's `gpio` command drives the SoC pins (ARM-only; inert stub off ARM), so arch-gate it.
+        //   the shell's `gpio` command drives the SoC pins (the gated `Gpio` syscall, 45).
         gpio: cfg!(target_arch = "arm") && matches!(name, "shell"),
     }
 }

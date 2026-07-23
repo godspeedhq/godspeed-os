@@ -19,3 +19,5 @@ resource_mint = true
 
 [placement]
 core = 1   # co-located with nic-driver (the two exchange frames constantly)
+# ARM (Pi 2): the kernel overrides this to core 0, co-located with nic-driver there (which must be core 0
+# for the DWC2 USB-net device), avoiding QEMU-TCG cross-core IPC latency. This x86 value stands.

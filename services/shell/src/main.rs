@@ -5264,7 +5264,15 @@ fn cmd_uptime(ctx: &ServiceContext) -> Result<(), ShellError> {
 /// `random [n]` - one (or n, bounded 1..64) hardware-random u32 from the SoC RNG (the BCM2835 RNG on the
 /// Pi 2), printed as hex + decimal. Reports loudly if the machine exposes no hardware RNG.
 fn cmd_random(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
-    let n = arg.trim().parse::<u32>().unwrap_or(1).clamp(1, 64);
+    // Bare `random` = 1; a given count must be a number - reject junk LOUDLY, not silently as 1
+    // (userspace-audit Audit 5, A5-U3; matches cmd_gpio's loud rejection).
+    let a = arg.trim();
+    let n = if a.is_empty() { 1 } else {
+        match a.parse::<u32>() {
+            Ok(v) => v.clamp(1, 64),
+            Err(_) => { ctx.console_writeln("random: count must be a number 1..64"); return Ok(()); }
+        }
+    };
     for _ in 0..n {
         match ctx.hw_random() {
             Some(v) => ctx.console_writeln_fmt(format_args!("{:#010x}  {}", v, v)),

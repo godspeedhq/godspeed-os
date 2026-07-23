@@ -591,10 +591,13 @@ fn usb_net_main(ctx: ServiceContext) -> ! {
             let mut opos = 1usize;
             let mut count = 0u8;
             while count < BATCH_MAX {
+                // Check a MAX-size frame would fit BEFORE dequeuing, so a frame is never pulled off the
+                // device only to be dropped for lack of room (userspace-audit Audit 5, A5-U2). net-stack
+                // re-polls (op 4/9) for whatever we stop short of.
+                if opos + 2 + FRAME_MAX > out.len() { break; }
                 let mut rx = [0u8; FRAME_MAX];
                 let n = ctx.net_frame_rx(&mut rx);
                 if n == 0 { break; }
-                if opos + 2 + n > out.len() { break; }
                 out[opos] = (n & 0xff) as u8;
                 out[opos + 1] = ((n >> 8) & 0xff) as u8;
                 opos += 2;

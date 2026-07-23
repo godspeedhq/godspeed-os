@@ -464,3 +464,37 @@ kernel stack and fault in SVC mode -> the A5-2 pre-validation does not cover tha
 guard page yet; C5-class hardening, reachability unproven). `USER_SPSR_SAVE` is a global `static mut`
 written by every `svc` across cores - benign for a selftest artifact, and dead in production once A5-3
 gated the magic path.
+
+## Audit 6 - 2026-07-23 (feat/pi2-arm32: the USB-net bridge + hardware helpers we added since Audit 5)
+
+Method: 2 parallel auditors over this session's kernel additions AFTER Audit 5 - (1) the neutral
+syscall/cap layer (the `NetFrame*` syscalls 42-44 + `handle_gpio` 45 + InspectKernel query 19 handlers,
+the `NET_DEVICE`/`GPIO_DEVICE` resources, their privilege mints, the SEC-11 gate-safety); (2) the arch/arm
+drivers (`hardware_reset` watchdog, `hw_random` RNG, `gpio_op`, `now_epoch_monotonic`, and the dwc2
+USB-net bridge / multi-device / smsc95xx work). Lens: **robustness / liveness / correctness of untrusted
+syscall input and device-driven loops** - memory-safety (`unsafe-audit.md`) and authority
+(`security-audit.md` Audit 2) were audited separately and are NOT re-covered here.
+
+**Result: 0 CONFIRMED north-star violations.** Every new copying syscall gates the cap FIRST, bounds all
+user args, and routes pointers exclusively through the fault-safe `read_user_bytes`/`write_user_bytes`
+wrappers (inheriting V1/A5-2 fault-safety by construction); every device-driven loop is bounded; the one
+divide (`now_epoch_monotonic`) is guarded. 4 latent/defense-in-depth hardening items, all **FIXED**.
+
+| ID | Sev | Class | What | Status |
+|----|-----|-------|------|--------|
+| **A6-1** | INFO | (defense-in-depth) | `syscall/dispatch.rs` `handle_net_frame_rx` - `buf[..n]` trusts the arch `net_frame_rx` to return `n <= max`; a future buggy arch impl returning `n > max` would index-panic the kernel. Not user-controllable (arch code), so not a live north-star finding. | **FIXED** - `.min(max)` clamp on the returned length; the neutral layer is now robust against a buggy arch impl. |
+| **A6-2** | LOW-latent | (C) | `arch/arm/mod.rs` `hardware_reset` - the BCM2835 watchdog poke is correct, but on an absent/wedged PM block that never resets, control fell through to a bare terminal `loop { spin }` on a SINGLE poke; unlike x86's unconditionally-terminal triple-fault. No trigger (QEMU raspi2b + real Pi 2 both honor the watchdog). | **FIXED** - the terminal loop now RE-ISSUES the watchdog poke every iteration, so a write that did not take is retried (BCM2835 has no second reset method; this still never returns). |
+| **A6-3** | LOW-latent | (C) | `arch/arm/mod.rs` `now_epoch_monotonic` - the divide-by-zero IS guarded (`if hz==0 return`), but it returned a FROZEN `0` when `timer_hz()==0` (dead generic timer), so any purely time-bounded wait computing `deadline = now + ticks` would never advance -> a bounded wait becomes unbounded. No trigger (QEMU + Pi 2 both set TIMER_HZ). | **FIXED** - falls back to the 1 MHz System Timer (`timer::systimer_secs`) so the monotonic clock still advances in the degraded-timer case (wraps ~71 min, still better than frozen). |
+| **A6-4** | LOW | (C) | `arch/arm/mod.rs` `pl011_init` opened with an UNBOUNDED `while FR & BUSY {}` boot wait on the console UART; a present-but-wedged PL011 hangs the boot (invariant 12). Pre-existing machine-layer code (not this session's bridge work), same class as the x86 THRE-poll K1 fix. No trigger (QEMU/firmware leave it idle). | **FIXED** - bounded (1M spin cap, best-effort proceed on timeout). |
+
+**Verified sound (no violation):** all four new handlers gate the cap first + bound args + use the
+audited user-copy wrappers (no raw `from_raw_parts`/`copy_nonoverlapping`); `handle_gpio` bounds BOTH
+`op` and `pin` before the arch call (and `gpio_op` re-checks the pin, `_ => -1` default); query 19 is
+correctly ungated (entropy leaks nothing, x86 returns None immediately, ARM's FIFO wait is 2M-bounded ->
+None); `NET_DEVICE`(10)/`GPIO_DEVICE`(11) registered unconditionally so `mint_cap` cannot expect-panic;
+the SEC-11 `id.0 >= 100` assert correctly covers ids 10/11 (holds-resource gen-safety sound); the spawn
+mints unwind cleanly (`cleanup_partial_spawn` on `CapTableFull`). Arch drivers: the RNG FIFO wait (2M),
+GPIO pin/op guards, `hardware_reset` sequence, and the ENTIRE dwc2 chain (init spins, `wait_halt` 4M /
+`poll_wait_halt` 500k, `enumerate_hub` bounded by `next_addr > 120`, `configure_smsc95xx` + `smsc_mii_wait`
+all capped, `net_frame_tx`/`rx` bounded + the smsc RX length hard-guarded) are individually bounded - no
+unbounded device-driven loop, no boot-wedge on hostile/absent hardware.
