@@ -324,6 +324,10 @@ const PID_SETUP: u32 = 3;
 // HCINT bits
 const HCINT_XFERCOMPL: u32 = 1 << 0;
 const HCINT_CHHLTD:    u32 = 1 << 1;
+// Max RX status entries drained in one IN transaction before declaring the core wedged. A real transfer
+// yields a handful (data packets + completion); this is far above that but finite, so a core that keeps
+// RxFLvl asserted forever cannot hang the kernel.
+const RX_DRAIN_CAP: u32 = 100_000;
 
 // --- Slave / PIO mode -------------------------------------------------------
 // The DWC2's internal DMA master never initiates a transfer in our environment: across a dozen HW tests
@@ -429,9 +433,13 @@ fn chan_in(pid: u32, buf: &mut [u8], len: usize) -> bool {
         chan_program(true, pid, len as u32);
         let mut received = 0usize;
         let mut t = 0u32;
+        let mut drained = 0u32;
         let ci = loop {
             // Drain every RX status currently queued before checking for the halt, so no received data
-            // is left in the FIFO when the channel completes.
+            // is left in the FIFO when the channel completes. This inner loop has its OWN bound: a
+            // wedged core that keeps RxFLvl perpetually asserted would otherwise spin here forever, and
+            // the `t = 0` progress-reset below means the outer 4M timeout would never fire. Any real IN
+            // transfer produces a handful of RX status entries; RX_DRAIN_CAP is far above that but finite.
             while rd(GINTSTS) & GINTSTS_RXFLVL != 0 {
                 let status = rd(GRXSTSP);
                 let bcnt = ((status >> 4) & 0x7FF) as usize;
@@ -450,6 +458,11 @@ fn chan_in(pid: u32, buf: &mut [u8], len: usize) -> bool {
                     }
                 }
                 t = 0;
+                drained += 1;
+                if drained > RX_DRAIN_CAP {
+                    pl011_write(b"dwc2: RX FIFO drain runaway - USB unavailable\r\n");
+                    return false;
+                }
             }
             let ci = rd(HCINT0);
             if ci & HCINT_CHHLTD != 0 { break ci; }

@@ -21,6 +21,11 @@ const MBOX_FULL:  u32 = 0x8000_0000; // status: outgoing mailbox full
 const MBOX_EMPTY: u32 = 0x4000_0000; // status: incoming mailbox empty
 const CHANNEL_PROP: u32 = 8;         // ARM->VC property tags
 const RESP_SUCCESS: u32 = 0x8000_0000;
+// Bounds for the mailbox handshake so an absent/wedged GPU degrades to "no framebuffer" instead of
+// hanging the boot. Generous - a live GPU drains/responds in microseconds; these are only ever reached
+// when the peripheral is dead.
+const MBOX_SPIN_CAP:  u32 = 20_000_000; // per FULL/EMPTY status wait
+const MBOX_MATCH_CAP: u32 = 64;          // responses read before giving up on a channel match
 
 /// The property buffer: 16-byte aligned (the low 4 bits of its address carry the channel number).
 #[repr(C, align(16))]
@@ -50,14 +55,29 @@ fn mbox_call(channel: u32) -> bool {
         let phys = core::ptr::addr_of!(MBOX) as u32;
         let bus  = (phys | 0xC000_0000) & !0xF; // uncached GPU alias, 16-byte aligned
         core::arch::asm!("dsb", options(nostack)); // request is in RAM (caches off) before we signal
-        while MBOX_STATUS.read_volatile() & MBOX_FULL != 0 {}
+        // Every mailbox wait is bounded: an absent/wedged VideoCore that never drains (FULL stuck),
+        // never fills (EMPTY stuck), or never posts our matching response must NOT hang the boot before
+        // the scheduler (invariant 12 / 26.6 - the same discipline dwc2.rs applies). On timeout report
+        // loudly and return false; every caller treats false as "no framebuffer" and falls back to serial.
+        let mut spins = 0u32;
+        while MBOX_STATUS.read_volatile() & MBOX_FULL != 0 {
+            spins += 1;
+            if spins > MBOX_SPIN_CAP { pl011_write(b"video: WARN mailbox FULL stuck - no GPU\r\n"); return false; }
+        }
         MBOX_WRITE.write_volatile(bus | (channel & 0xF));
+        let mut waits = 0u32;
         loop {
-            while MBOX_STATUS.read_volatile() & MBOX_EMPTY != 0 {}
+            let mut spins = 0u32;
+            while MBOX_STATUS.read_volatile() & MBOX_EMPTY != 0 {
+                spins += 1;
+                if spins > MBOX_SPIN_CAP { pl011_write(b"video: WARN mailbox EMPTY stuck - no GPU\r\n"); return false; }
+            }
             let r = MBOX_READ.read_volatile();
             if (r & 0xF) == channel && (r & !0xF) == bus {
                 break;
             }
+            waits += 1;
+            if waits > MBOX_MATCH_CAP { pl011_write(b"video: WARN mailbox response never matched - no GPU\r\n"); return false; }
         }
         core::arch::asm!("dsb", options(nostack));
         MBOX.data[1] == RESP_SUCCESS
@@ -117,6 +137,14 @@ pub fn request(width: u32, height: u32) -> Option<FbInfo> {
     let base = bus_base & 0x3FFF_FFFF; // GPU bus address -> ARM physical
     if base == 0 || pitch == 0 {
         pl011_write(b"arm32: framebuffer allocation returned null (base/pitch 0)\r\n");
+        return None;
+    }
+    // Range-check the GPU-returned geometry before it drives the fill loop (`(pitch/4)*height` stores)
+    // and the mapping length. The GPU is trusted, but an absurd pitch/width/height must not be accepted
+    // blindly (defence in depth; matches the <=4096 cap query_display_size already applies). 8 KiB per
+    // dimension and a 64 KiB pitch bound any real Pi display with headroom.
+    if w == 0 || h == 0 || w > 8192 || h > 8192 || pitch > 0x1_0000 {
+        pl011_write(b"arm32: framebuffer geometry out of range - falling back to serial\r\n");
         return None;
     }
     pl011_write(b"arm32: framebuffer at ");

@@ -110,12 +110,22 @@ fn local_reg(off: usize) -> u32 {
     unsafe { ((0x4000_0000usize + off) as *const u32).read_volatile() }
 }
 
+/// Iteration ceiling for `delay_us` so a stuck System Timer cannot hang the boot. Each loop is one MMIO
+/// read plus a `spin_loop`; 200M reads is far more than any real microsecond delay needs.
+const DELAY_SPIN_CAP: u32 = 200_000_000;
+
 /// Busy-wait for `us` microseconds using the System Timer (the clock whose rate is fixed by
-/// hardware, so this is correct even if `CNTFRQ` is wrong).
+/// hardware, so this is correct even if `CNTFRQ` is wrong). Bounded: a dead System Timer that never
+/// advances must not hang the boot (invariant 12 / 26.6). The iteration cap is far larger than the
+/// reads needed for any real delay, so it is only ever reached when the peripheral is absent/stuck -
+/// in which case we return (best-effort proceed) rather than spin forever.
 pub fn delay_us(us: u32) {
     let start = systimer_lo();
+    let mut spins = 0u32;
     while systimer_lo().wrapping_sub(start) < us {
         core::hint::spin_loop();
+        spins += 1;
+        if spins > DELAY_SPIN_CAP { return; }
     }
 }
 

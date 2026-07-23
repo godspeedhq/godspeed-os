@@ -43,6 +43,14 @@ static mut RESUME: Context = Context::new();
 /// Set to the caller mode (`SPSR & 0x1f`) observed at the magic `svc`. `0x10` means USR - the proof.
 static ENTERED_MODE: AtomicU32 = AtomicU32::new(0);
 
+/// True ONLY while the boot-time PL0 selftest is running. `arm_svc_dispatch` intercepts the magic
+/// `USER_TEST_SVC` (which resumes the boot context) exclusively when this is set. Without this gate a
+/// live service could issue `svc` with `r0 = USER_TEST_SVC` and divert the kernel into stale boot state
+/// (a PL0-reachable wild control-flow jump); once the selftest clears it, that number is an ordinary
+/// unknown syscall and the neutral handler returns `UnknownSyscall`. Kernel-audit Audit 5 (C) HIGH.
+pub(super) static SELFTEST_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 // Two spare VAs for the user pages, chosen ABOVE every identity-mapped region so the L1 slot is always
 // empty (map_in_active_tables refuses to clobber a live section). The mapped regions are RAM (0..RAM_END),
 // the framebuffer (dynamic, in the RAM/peripheral gap - QEMU lands it ~0x3C00_0000, which the old
@@ -201,10 +209,14 @@ pub fn selftest() {
     }
 
     // Now actually run at PL0. enter_user drops to USR at the stub; the stub raises USER_TEST_SVC;
-    // the SVC handler records the caller mode and resumes us here.
+    // the SVC handler records the caller mode and resumes us here. Arm the magic-svc interception ONLY
+    // for the duration of this round trip, and disarm it immediately after, so the magic number is inert
+    // once real services are running (see SELFTEST_ACTIVE).
     // SAFETY: the code/stack pages are mapped USER; enter_user saves the kernel context and returns
     // via the magic svc. Single-threaded; interrupts are enabled in USR so the tick still runs.
+    SELFTEST_ACTIVE.store(true, Ordering::SeqCst);
     unsafe { enter_user(USER_CODE_VA, USER_STACK_VA + 0x1000); }
+    SELFTEST_ACTIVE.store(false, Ordering::SeqCst);
 
     let mode = ENTERED_MODE.load(Ordering::Relaxed);
     pl011_write(b"arm32: usermode - svc taken from CPSR mode ");

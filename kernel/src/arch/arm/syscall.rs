@@ -50,7 +50,13 @@ static SVC_TEST_MODE: AtomicBool = AtomicBool::new(false);
 pub(super) extern "C" fn arm_svc_dispatch(number: u32, arg0: u32, arg1: u32, arg2: u32) -> i64 {
     // The user-mode selftest's magic syscall: record the caller's privilege and resume the kernel
     // (never returns to this handler). This is how a PL0 task hands control back with no scheduler yet.
-    if number == super::usermode::USER_TEST_SVC {
+    // GATED on SELFTEST_ACTIVE: only the boot selftest may trigger the boot-context resume. Once real
+    // services run the flag is clear, so a service issuing `svc` with this number falls through to the
+    // neutral handler and gets `UnknownSyscall` instead of diverting the kernel into stale boot state
+    // (kernel-audit Audit 5 (C) HIGH - PL0-reachable wild control flow).
+    if number == super::usermode::USER_TEST_SVC
+        && super::usermode::SELFTEST_ACTIVE.load(Ordering::Relaxed)
+    {
         super::usermode::on_magic_svc();
     }
     if SVC_TEST_MODE.load(Ordering::Relaxed) {
