@@ -98,6 +98,9 @@ fn main() {
         // arch-neutral and rides on it. The kernel grants block-driver the EMMC MMIO window at spawn
         // (arch::arm::map_fixed_driver_mmio).
         "block-driver", "fs",
+        // Networking on the Pi 2: nic-driver's ARM backend bridges the frame IPC to the in-kernel DWC2
+        // CDC-ECM USB-net device (NET_DEVICE syscalls); net-stack is arch-neutral and rides on it.
+        "nic-driver", "net-stack",
     ];
     let arm_dir = workspace
         .join("target")

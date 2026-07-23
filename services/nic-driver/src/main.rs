@@ -531,12 +531,106 @@ fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
     }
 }
 
+/// ARM USB-net backend: bridge the frame IPC (the request/reply contract net-stack speaks) to the
+/// in-kernel DWC2 CDC-ECM device via the NET_DEVICE syscalls. Pure mechanism, mirroring the e1000/rtl
+/// serve loops - the frame IS the message; net-stack owns all protocol. Pinned to core 0 (its contract),
+/// where the single-channel DWC2 lives. A request payload of exactly 1 byte 3/4/5/6/7/8/9 is an opcode;
+/// any other payload is a raw ethernet frame to transmit.
+#[cfg(target_arch = "arm")]
+fn usb_net_main(ctx: ServiceContext) -> ! {
+    // How many bulk-IN polls to try when a request wants a received frame (net-stack also re-polls via
+    // ops 4/9 under its own deadline, so this is a bounded best-effort, not a spin).
+    const RX_TRIES: usize = 8;
+    const FRAME_MAX: usize = 1600;
+    const BATCH_MAX: u8 = 8;
+    const BATCH_MSG_MAX: usize = 3072;
+
+    let mut info = [0u8; 7];
+    if ctx.net_info(&mut info) {
+        ctx.log_fmt(format_args!(
+            "nic-driver: usb-net up  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  link {}",
+            info[0], info[1], info[2], info[3], info[4], info[5], if info[6] != 0 { "UP" } else { "down" }));
+    } else {
+        ctx.log("nic-driver: no usb-net device - serving empty replies (net degrades, not hangs)");
+    }
+    ctx.log("nic-driver: serving frame interface");
+
+    // Poll the bulk IN endpoint up to RX_TRIES times for one received frame; returns its length (0 = none).
+    let rx_one = |ctx: &ServiceContext, buf: &mut [u8]| -> usize {
+        for _ in 0..RX_TRIES {
+            let n = ctx.net_frame_rx(buf);
+            if n > 0 { return n; }
+            ctx.yield_cpu();                      // give the device / QEMU a moment to queue a frame
+        }
+        0
+    };
+
+    loop {
+        let _req = ctx.recv();
+        let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
+        let p = _req.payload_bytes();
+
+        if p.len() == 1 && p[0] == 3 {
+            // STATUS: [ok, mac(6), link] - net-stack reads MAC at [1..7] and link at [7].
+            let mut out = [0u8; 8];
+            let mut ni = [0u8; 7];
+            if ctx.net_info(&mut ni) {
+                out[0] = 1;
+                out[1..7].copy_from_slice(&ni[0..6]);
+                out[7] = ni[6];
+            }
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out));
+        } else if p.len() == 1 && p[0] == 4 {
+            // RX-only: one frame, no TX.
+            let mut rx = [0u8; FRAME_MAX];
+            let n = rx_one(&ctx, &mut rx);
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rx[..n]));
+        } else if p.len() == 1 && p[0] == 9 {
+            // BATCH RX drain: [count:u8] then per frame [len:u16 LE][bytes].
+            let mut out = [0u8; BATCH_MSG_MAX];
+            let mut opos = 1usize;
+            let mut count = 0u8;
+            while count < BATCH_MAX {
+                let mut rx = [0u8; FRAME_MAX];
+                let n = ctx.net_frame_rx(&mut rx);
+                if n == 0 { break; }
+                if opos + 2 + n > out.len() { break; }
+                out[opos] = (n & 0xff) as u8;
+                out[opos + 1] = ((n >> 8) & 0xff) as u8;
+                opos += 2;
+                out[opos..opos + n].copy_from_slice(&rx[..n]);
+                opos += n;
+                count += 1;
+            }
+            out[0] = count;
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos]));
+        } else if p.len() == 1 && matches!(p[0], 5 | 6 | 7 | 8) {
+            // Diagnostics / chaos force-link: not applicable to usb-net; ack so callers don't hang.
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[1u8]));
+        } else {
+            // TX FRAME (any multi-byte payload) + coupled RX: transmit, then hand back one received frame.
+            ctx.net_frame_tx(p);
+            let mut rx = [0u8; FRAME_MAX];
+            let n = rx_one(&ctx, &mut rx);
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rx[..n]));
+        }
+        ctx.remove_cap(reply_cap);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("nic-driver: starting");
 
+    // ARM (Raspberry Pi 2): there is no PCIe NIC. The NIC is a USB device driven in-kernel (DWC2 CDC-ECM);
+    // this backend bridges the same frame IPC net-stack speaks to the kernel USB-net syscalls. Same
+    // request/reply contract, different transport - exactly the block-driver x86/ARM split.
+    #[cfg(target_arch = "arm")]
+    usb_net_main(ctx);
+
     // Which NIC did the kernel find? nic-driver drives an Intel e1000 (the QEMU dev NIC) or a Realtek
     // RTL8168 (the T630); the kernel maps whichever one's BAR. Dispatch on the PCI identity (Phase 4).
+    #[cfg(not(target_arch = "arm"))]
     if ctx.nic_vendor_device() == 0x8168_10EC {
         realtek_main(ctx); // RTL8168 - a separate path that never returns
     }

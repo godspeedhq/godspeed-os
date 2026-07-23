@@ -106,6 +106,11 @@ pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, 
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
 /// Non-PCI fixed-physical peripheral MMIO grant (ARM Pi path); no fixed windows on this arch stub.
 pub fn map_fixed_driver_mmio(_pt: &mut page_tables::PageTable, _name: &str) -> Option<(u64, u64)> { None }
+
+// USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
+pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
+pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }
+pub fn net_info() -> Option<([u8; 6], bool)> { None }
 pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
 
 /// Switch to a new stack top - `sp` on AArch64. `#[inline(always)]` for the same reason as x86.

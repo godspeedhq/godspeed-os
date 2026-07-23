@@ -79,6 +79,13 @@ pub const REBOOT_RESOURCE: ResourceId = ResourceId(8);
 /// (recovery, §13/§14.2), so an ordinary service holds no ambient send authority (§3.1).
 pub const ACQUIRE_ANY_RESOURCE: ResourceId = ResourceId(9);
 
+/// Authority to move raw ethernet frames to/from the in-kernel USB-net device (the ARM DWC2 CDC-ECM
+/// bridge: `NetFrameTx`/`NetFrameRx`/`NetInfo`, syscalls 42-44). Held only by the ARM `nic-driver`, which
+/// bridges those frames to the frame IPC net-stack speaks. On non-ARM arches the NIC is a userspace PCIe
+/// driver and these syscalls return unsupported, so nothing holds this there. A frame is raw wire bytes,
+/// so - like a DMA-capable driver (§6.4) - this is real reach; it is granted explicitly, never ambient.
+pub const NET_DEVICE_RESOURCE: ResourceId = ResourceId(10);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever - §7.5).
@@ -91,5 +98,6 @@ pub fn init() {
     table::register_resource(RESOURCE_MINT_RESOURCE);
     table::register_resource(REBOOT_RESOURCE);
     table::register_resource(ACQUIRE_ANY_RESOURCE);
+    table::register_resource(NET_DEVICE_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }

@@ -27,11 +27,15 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
   and `fs` mounts on top. Verified in QEMU (`--sd` an image): `drives flash` formats GSFS, files write +
   read, and **survive a reboot** (re-mount + read-back). This unblocks the file utilities (`ls`, `read`,
   `write`, `edit`, `drives`, ...). Needs `--release` (see below).
-- **Graceful degradation (loud, not silent):** the USB/NIC drivers are not ported yet, so `xhci`, `ehci`,
-  `nic-driver`, `net-stack` are placeholders that fail their spawn **loudly** ("kernel will name-wire it")
-  and the system continues to a usable shell - exactly §9.2/§11.3 ("continue with the services that
-  started"). Without an attached SD image `block-driver` finds no card and `fs` serves storage-unavailable
-  (loud, not a hang).
+- **Networking (USB-Ethernet -> net-stack):** a CDC-ECM USB-net device is driven in-kernel (DWC2 bulk
+  frames) and bridged to the **unchanged** userspace `net-stack` via three `NET_DEVICE`-gated syscalls; a
+  per-arch `nic-driver` backend speaks the frame IPC. Verified in QEMU (`arm_run.py --usbnet`): DHCP, ARP,
+  ICMP, DNS, and the shell `net` + `ping` all work over USB. The Pi 2's onboard LAN9514 (`smsc95xx`) is the
+  one HW-blind device layer left; everything above it is done.
+- **Graceful degradation (loud, not silent):** `xhci`/`ehci` (front/back USB host on x86) are not ported,
+  so they fail their spawn **loudly** and the system continues to a usable shell - exactly §9.2/§11.3
+  ("continue with the services that started"). Without an attached SD image `block-driver` finds no card
+  and `fs` serves storage-unavailable (loud, not a hang); without a `--usbnet` device net-stack degrades.
 
 ## Build + run
 
@@ -130,15 +134,25 @@ GodspeedOS way.
   (gateway MAC 52:55:0a:00:02:02) -> `USB-ETHERNET FRAME TX/RX VERIFIED`. Test:
   `qemu-system-arm -M raspi2b,usb=on -netdev user,id=n0 -device usb-net,netdev=n0`. This is a real driver
   for CDC-ECM USB dongles, and it validates the whole in-kernel USB frame path.
-- **LAN9514 (`smsc95xx`) + net-stack bridge -> full Pi 2 networking** - the remaining work, in two parts.
-  (1) The real Pi 2 onboard NIC is a **vendor-specific** `smsc95xx` device (class 0xFF, VID 0x0424), *not*
-  CDC-ECM - it needs its own device-setup + framing layer (register reads/writes via vendor control
-  requests, a TX command word + RX status word around each frame). QEMU does not emulate it, so this layer
-  is HW-verified later; but it plugs into the same enumeration + `bulk_xfer` that CDC-ECM already proved.
-  (2) **Bridge** the in-kernel USB-net driver to the userspace `net-stack` over frame IPC (the USB analog
-  of how the in-kernel DWC2 keyboard feeds `console_push_byte`) - the genuinely new plumbing, since on x86
-  the NIC is a userspace PCIe driver. Once bridged, the existing `net-stack` (ARP/IPv4/ICMP/UDP/DHCP) and
-  the `net`/`ping` utilities work over USB. The CDC-ECM path can drive that bridge in QEMU for verification.
+- **USB-net -> net-stack bridge -> full networking** - **DONE + QEMU-verified** (2026-07-23). The
+  in-kernel USB-net device is bridged to the **unchanged** userspace `net-stack` so the whole networking
+  stack runs over USB. Mechanism: three kernel syscalls (`NetFrameTx`/`NetFrameRx`/`NetInfo`, 42-44, gated
+  by a `NET_DEVICE` cap) move raw ethernet frames to/from the CDC-ECM device (core-0-guarded, the DWC2's
+  core). A per-arch `nic-driver` backend (cfg-split exactly like block-driver's AHCI/SDHCI) bridges those
+  syscalls to the frame IPC net-stack speaks - the frame IS the message, `[3]`=MAC/link, `[4]`=RX,
+  `[9]`=batch. net-stack, nic-driver co-located on core 0; both added to the ARM build lists + spawned by
+  the supervisor. **Verified end to end** with `arm_run.py --usbnet`: net-stack does DHCP (`ip 10.0.2.15`),
+  ARP (`gateway 10.0.2.2 at 52:55:0a:00:02:02`), ICMP (`ping ok`), DNS (`10.0.2.3`), and the interactive
+  shell `net` + `ping 10.0.2.2` (`Reply from 10.0.2.2: bytes=32 ... TTL=255`) all work over USB. A real ARM
+  bug fell out: `now_epoch_monotonic()` was a `0` stub, so `calibrate_tsc_hz` spun ~100M yields and every
+  deadline wait never expired, hanging net-stack before its serve loop - now wired to the generic timer
+  (`cntpct()/timer_hz()`).
+- **LAN9514 (`smsc95xx`) for the real Pi 2** - the one HW-blind piece left. The Pi 2's onboard NIC is a
+  **vendor-specific** `smsc95xx` device (class 0xFF, VID 0x0424), *not* CDC-ECM and not QEMU-emulated: it
+  needs its own device-setup + framing layer (register R/W via vendor control requests, a TX command word
+  + RX status word around each frame) as another branch of `enumerate_downstream`, over the same
+  enumeration + `bulk_xfer` + `net_frame_*` bridge that CDC-ECM already proved. Everything above it (the
+  bridge, net-stack, the utilities) is done; only this register layer awaits real-Pi verification.
 - **SDK DMA cache-coherence (SEC-28)** - `sdk/rust/src/dma.rs` assumes x86 coherent DMA; any real ARM
   driver needs cache-maintenance hooks (clean-before-device-read, invalidate-before-CPU-read) first.
 

@@ -13,7 +13,7 @@ use crate::arch::imp::context_switch::TaskContext;
 use crate::arch::imp::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -434,6 +434,7 @@ struct Privileges {
     service_control: bool, // SERVICE_CONTROL: kill/restart other services (§14.4)
     reboot:          bool, // REBOOT: hardware-reset the machine (shell `reboot` only - SEC-2)
     acquire_any:     bool, // ACQUIRE_ANY: reach ARBITRARY services by name via AcquireSendCap (§3.1)
+    net_device:      bool, // NET_DEVICE: move ethernet frames via the in-kernel USB-net bridge (ARM nic-driver)
 }
 
 fn service_privileges(name: &str, is_probe: bool) -> Privileges {
@@ -459,6 +460,10 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // NEGATIVE pin - deliberately excluded so it holds no ACQUIRE_ANY (proves AcquireSendCap denies
         // a non-holder). Ordinary services get none; their AcquireSendCap is limited to declared peers.
         acquire_any: (is_probe && name != "adv-a13") || matches!(name, "shell" | "supervisor" | "chaos"),
+        // The `nic-driver` bridges ethernet frames to/from the in-kernel USB-net device on ARM. Inert on
+        // other arches (the NetFrame* syscalls stub to unsupported there - the NIC is a userspace PCIe
+        // driver), so holding it is harmless where it is unused.
+        net_device: matches!(name, "nic-driver"),
     }
 }
 
@@ -665,7 +670,9 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true, // will serve the frame interface to net-stack (§12)
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    1,
+            // ARM: the NIC is the in-kernel DWC2 USB device, driven only from core 0 - the ARM backend's
+            // NET_DEVICE syscalls guard on that core. x86: core 1 (co-located with net-stack + fs).
+            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[], // Phase 1 step 2: reset + MAC only; RX IRQ wired later
@@ -680,7 +687,8 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true,               // nic-driver replies frames here (per-request reply cap)
             send_peers:        &["nic-driver"],    // the frame interface; reacquired by name on death
             send_peers_grant:  false,
-            preferred_core:    1,
+            // ARM: co-locate with nic-driver on core 0 (avoids QEMU-TCG cross-core IPC latency). x86: core 1.
+            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[],
@@ -3544,6 +3552,14 @@ fn spawn_service_with_config(
     if privs.acquire_any {
         let aa_cap = mint_cap(ACQUIRE_ANY_RESOURCE, Rights::WRITE);
         caps.insert(aa_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+
+    // NET_DEVICE: the ARM `nic-driver` moves ethernet frames via the in-kernel USB-net bridge
+    // (NetFrame*/NetInfo, syscalls 42-44). WHO holds it is in `service_privileges`; here we only mint it.
+    if privs.net_device {
+        let nd_cap = mint_cap(NET_DEVICE_RESOURCE, Rights::WRITE);
+        caps.insert(nd_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 

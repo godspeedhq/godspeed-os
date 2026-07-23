@@ -43,9 +43,16 @@ through `usb-net`. The one added `unsafe` is a single write of the station MAC i
 (`addr_of_mut`, core-0 enumeration only); the MAC is otherwise passed as a local, and the frame build +
 BOT/SCSI code is all safe. So `dwc2.rs` is **10**.
 
+**USB-net bridge to userspace (+2 -> 12):** the same session added the mechanism the userspace ARM
+`nic-driver` calls (`net_frame_tx`/`net_frame_rx`/`net_info`, syscalls 42-44) to move ethernet frames to
+the in-kernel CDC-ECM device. Two added `unsafe`: `on_core0` reads MPIDR (`mrc`, side-effect-free) to
+guard the single-channel DWC2 against off-core access; `net_info` reads the `NET_MAC` static
+(`addr_of`, read-only). Both in permitted `arch/`. So `dwc2.rs` is **12**. (`net_verify_arp` was
+removed - net-stack now drives networking end to end.)
+
 | File | Change | Why |
 |------|--------|-----|
-| `arch/arm/dwc2.rs` | 3 -> 10 (+7) | DMA reinstated: `flush_dcache` (DCCIMVAC + `dsb`, +2), `DMA`-static access in `ctrl_xfer` + `poll` (+2), `PREV_KEYS`-static in `decode_report` (+1), `DMA`-static in `bulk_xfer` (+1), `NET_MAC`-static write in `configure_cdc_ecm` (+1). Slave-mode FIFO code (all safe `rd`/`wr`) removed. |
+| `arch/arm/dwc2.rs` | 3 -> 12 (+9) | DMA reinstated (`flush_dcache` +2, `DMA`-static in `ctrl_xfer`/`poll`/`bulk_xfer` +3, `PREV_KEYS`-static +1, `NET_MAC`-static write +1), USB-net bridge (`on_core0` MPIDR read +1, `NET_MAC`-static read in `net_info` +1). Slave-mode FIFO code (all safe `rd`/`wr`) removed. |
 
 ---
 
@@ -865,7 +872,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 6 | permitted |
 | arch/arm/fbcon.rs | 4 | permitted |
-| arch/arm/dwc2.rs | 10 | permitted |
+| arch/arm/dwc2.rs | 12 | permitted |
 | arch/arm/page_tables.rs | 27 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |

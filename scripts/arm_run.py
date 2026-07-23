@@ -30,6 +30,7 @@ def main():
     ap.add_argument("--secs", type=float, default=20.0)
     ap.add_argument("--release", action="store_true")
     ap.add_argument("--usb", action="store_true")
+    ap.add_argument("--usbnet", action="store_true", help="attach a CDC-ECM USB-Ethernet device (user-net)")
     ap.add_argument("--sd", default=None, help="path to a raw SD-card image to attach (if=sd)")
     ap.add_argument("--cmd", action="append", default=[])
     ap.add_argument("--tail", type=int, default=3000)
@@ -41,10 +42,13 @@ def main():
         print("no kernel ELF - run scripts/arm_build.py first", file=sys.stderr)
         sys.exit(1)
 
-    machine = "raspi2b,usb=on" if args.usb else "raspi2b"
+    machine = "raspi2b,usb=on" if (args.usb or args.usbnet) else "raspi2b"
     cmd = [QEMU, "-M", machine, "-kernel", krn, "-serial", "stdio", "-display", "none"]
     if args.usb:
         cmd += ["-device", "usb-kbd"]
+    if args.usbnet:
+        # Attach a CDC-ECM USB-Ethernet device on QEMU's user-net so net-stack can DHCP/ARP/ping.
+        cmd += ["-netdev", "user,id=n0", "-device", "usb-net,netdev=n0"]
     if args.sd:
         # Attach an SD-card image so the block-driver (BCM2835 EMMC) has a disk to serve to fs.
         cmd += ["-drive", f"if=sd,format=raw,file={args.sd}"]
@@ -69,11 +73,15 @@ def main():
         time.sleep(0.2)
     time.sleep(1.0)
 
+    # Prime the shell input: QEMU -serial stdio drops the FIRST byte after boot, so send a lone
+    # newline before the real commands (an empty line the shell ignores) to absorb the drop.
+    if args.cmd:
+        p.stdin.write(b"\n"); p.stdin.flush(); time.sleep(0.5)
     for c in args.cmd:
         # Newline (not CR) is the Enter the shell acts on under QEMU -serial stdio.
         for ch in (c + "\n").encode():
             p.stdin.write(bytes([ch])); p.stdin.flush(); time.sleep(0.08)
-        time.sleep(3.0)
+        time.sleep(6.0)
 
     # let any remaining boot output settle
     end = time.time() + max(0.0, args.secs - (time.time() - t))

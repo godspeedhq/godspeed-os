@@ -30,6 +30,8 @@ ARM_SERVICES = [
     "reply-server", "asker", "resource-server", "holder",
     # Persistence on the Pi 2: block-driver (BCM2835 EMMC/SDHCI PIO backend) + arch-neutral fs.
     "block-driver", "fs",
+    # Networking on the Pi 2: nic-driver (USB-net bridge backend) + arch-neutral net-stack.
+    "nic-driver", "net-stack",
 ]
 
 

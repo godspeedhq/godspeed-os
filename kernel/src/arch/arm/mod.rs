@@ -28,6 +28,10 @@ pub mod syscall;
 pub mod video;
 pub mod fbcon;
 pub mod dwc2;
+// USB-net bridge (the mechanism the userspace ARM `nic-driver` calls): move ethernet frames to/from the
+// in-kernel CDC-ECM device. On ARM these are the real DWC2 functions; other arches stub them (net there is
+// a userspace PCIe driver, not this in-kernel USB path).
+pub use dwc2::{net_frame_tx, net_frame_rx, net_info};
 pub mod usermode;
 pub mod loadtest;
 pub mod spawn;
@@ -957,7 +961,15 @@ pub mod rtc {
     pub fn capture_boot_time() {}
     pub fn boot_datetime() -> u64 { 0 }
     pub fn read_datetime() -> u64 { 0 }
-    pub fn now_epoch_monotonic() -> i64 { 0 }
+    /// Monotonic seconds since boot, from the generic timer (the Pi 2 has no wall-clock RTC, so this is
+    /// NOT a real epoch - but it advances, which is all its callers need: bounding deadline waits and
+    /// measuring TSC Hz. A `0` stub here made `calibrate_tsc_hz` spin ~100M yields and every
+    /// deadline-based wait never expire, hanging net-stack before its serve loop.
+    pub fn now_epoch_monotonic() -> i64 {
+        let hz = super::timer::timer_hz() as u64;
+        if hz == 0 { return 0; }
+        (super::timer::cntpct() / hz) as i64
+    }
 }
 
 // ---------------------------------------------------------------------------

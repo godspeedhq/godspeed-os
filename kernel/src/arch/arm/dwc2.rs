@@ -437,21 +437,23 @@ fn flush_dcache(addr: u32, len: u32) {
 }
 
 /// One DMA transaction: point HCDMA at `buf_phys`, enable the channel, wait for the halt. The core moves
-/// the data itself. Retries on NAK / transaction-error; STALL or exhausted retries is a hard failure.
-fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u32) -> bool {
-    for _attempt in 0..3 {
+/// the data itself. Retries on NAK / transaction-error up to `tries` times; STALL or exhausted retries is
+/// a hard failure. `tries == 1` (no backoff) is the fast path for polling an endpoint that legitimately
+/// NAKs when idle (a bulk IN with no frame queued), so an empty poll returns immediately.
+fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u32, tries: u32) -> bool {
+    for attempt in 0..tries {
         chan_program(dir_in, pid, len, buf_phys, ep, ep_type);
         let ci = wait_halt();
         if ci & HCINT_XFERCOMPL != 0 { return true; }
         if ci & (1 << 3) != 0 { return false; }         // STALL - hard failure
-        spin(5_000);                                    // NAK / XactErr - brief backoff, then retry
+        if attempt + 1 < tries { spin(5_000); }         // NAK / XactErr - brief backoff, then retry
     }
     false
 }
 
 /// A single control-endpoint DMA transaction (ep 0, type control). Thin wrapper so ctrl_xfer reads clean.
 fn ctrl_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32) -> bool {
-    chan_dma(dir_in, pid, buf_phys, len, 0, 0)
+    chan_dma(dir_in, pid, buf_phys, len, 0, 0, 3)
 }
 
 /// A full control transfer via DMA: SETUP -> (DATA) -> STATUS, through the `DMA` scratch buffer. `data_in`
@@ -730,7 +732,6 @@ fn configure_cdc_ecm(nconfigs: u8) -> bool {
         pl011_write(b" mac="); write_hex32(u32::from_be_bytes([mac[0], mac[1], mac[2], mac[3]]));
         write_hex32(((mac[4] as u32) << 8) | mac[5] as u32);
         pl011_write(b"\r\n");
-        net_verify_arp(&mac);
         return true;
     }
     false
@@ -739,36 +740,49 @@ fn configure_cdc_ecm(nconfigs: u8) -> bool {
 /// Prove the USB-Ethernet frame path end to end: broadcast an ARP request for the QEMU user-net gateway
 /// (10.0.2.2) and poll the bulk IN endpoint for the reply. A frame out + a frame in through a real network
 /// stack is the verification the bulk-storage test is to mass storage.
-fn net_verify_arp(mac: &[u8; 6]) {
+// --- USB-net bridge: the mechanism the userspace ARM `nic-driver` calls (via syscalls) to move ethernet
+// frames to/from the CDC-ECM device. net-stack owns all protocol (ARP/IP/DHCP); this is pure transport. ---
+
+const NET_FRAME_MAX: usize = 1600;                  // matches nic-driver's FRAME_MAX
+
+/// True on the boot processor. The DWC2 has one host channel + one DMA buffer, driven only from core 0;
+/// the bridge functions guard on this so a misplaced `nic-driver` can never corrupt that shared state.
+fn on_core0() -> bool {
+    let mpidr: u32;
+    // SAFETY: reading MPIDR (`c0, c0, 5`) is a side-effect-free PL1 register read.
+    unsafe { core::arch::asm!("mrc p15, 0, {m}, c0, c0, 5", m = out(reg) mpidr, options(nomem, nostack)); }
+    mpidr & 3 == 0
+}
+
+/// Transmit one ethernet frame (bulk OUT). Returns true if it was handed to the device.
+pub fn net_frame_tx(frame: &[u8]) -> bool {
+    if !NET_READY.load(Ordering::Acquire) || !on_core0() { return false; }
     let ep_out = NET_EP_OUT.load(Ordering::Relaxed) as u32;
+    let mut buf = [0u8; NET_FRAME_MAX];
+    let n = frame.len().min(NET_FRAME_MAX);
+    buf[..n].copy_from_slice(&frame[..n]);
+    bulk_xfer(false, ep_out, &mut buf, n, 3) >= 0
+}
+
+/// Receive one ethernet frame (a single bulk IN attempt), copied into `dst`. Returns the frame length, or
+/// 0 if none is available (the device NAKs an empty bulk IN).
+pub fn net_frame_rx(dst: &mut [u8]) -> usize {
+    if !NET_READY.load(Ordering::Acquire) || !on_core0() { return 0; }
     let ep_in = NET_EP_IN.load(Ordering::Relaxed) as u32;
-    let mut frame = [0u8; 64];
-    for b in 0..6 { frame[b] = 0xFF; }                                 // dst = broadcast
-    frame[6..12].copy_from_slice(mac);                                // src = our MAC
-    frame[22..28].copy_from_slice(mac);                               // ARP sender hardware address
-    frame[12] = 0x08; frame[13] = 0x06;                               // ethertype ARP
-    frame[14] = 0x00; frame[15] = 0x01;                               // htype = Ethernet
-    frame[16] = 0x08; frame[17] = 0x00;                               // ptype = IPv4
-    frame[18] = 6; frame[19] = 4;                                     // hlen, plen
-    frame[20] = 0x00; frame[21] = 0x01;                               // oper = request
-    frame[28] = 10; frame[29] = 0; frame[30] = 2; frame[31] = 15;     // sender IP 10.0.2.15
-    frame[38] = 10; frame[39] = 0; frame[40] = 2; frame[41] = 2;      // target IP 10.0.2.2 (gateway)
+    let cap = dst.len().min(NET_FRAME_MAX);
+    // A single bulk-IN attempt: a NAK means "no frame queued now" and must return fast (net-stack
+    // re-polls under its own deadline), so no retry/backoff here.
+    let got = bulk_xfer(true, ep_in, dst, cap, 1);
+    if got > 0 { got as usize } else { 0 }
+}
 
-    if !bulk_xfer(false, ep_out, &mut frame, 42) { pl011_write(b"dwc2: net ARP send failed\r\n"); return; }
-    pl011_write(b"dwc2: net ARP request sent\r\n");
-
-    let mut rx = [0u8; 1536];
-    for _ in 0..40 {
-        if bulk_xfer(true, ep_in, &mut rx, 1536) && rx[12] == 0x08 && rx[13] == 0x06 && rx[21] == 0x02 {
-            pl011_write(b"dwc2: net ARP reply, gateway MAC=");
-            write_hex32(u32::from_be_bytes([rx[22], rx[23], rx[24], rx[25]]));
-            write_hex32(((rx[26] as u32) << 8) | rx[27] as u32);
-            pl011_write(b"\r\ndwc2: USB-ETHERNET FRAME TX/RX VERIFIED (CDC-ECM)\r\n");
-            return;
-        }
-        spin(500_000);
-    }
-    pl011_write(b"dwc2: net no ARP reply\r\n");
+/// The USB-net device's MAC + link state, or None if no net device is up. CDC-ECM's link is up once the
+/// interface is configured (QEMU slirp is always up); a real driver would read a link-status notification.
+pub fn net_info() -> Option<([u8; 6], bool)> {
+    if !NET_READY.load(Ordering::Acquire) { return None; }
+    // SAFETY: NET_MAC is written once at enumeration; read-only here.
+    let mac = unsafe { *core::ptr::addr_of!(NET_MAC) };
+    Some((mac, true))
 }
 
 /// Read the configuration descriptor of the current device (DEV_ADDR), find a boot-keyboard interface
@@ -833,36 +847,40 @@ static BULK_TOGGLE_IN:  AtomicBool = AtomicBool::new(false);
 static BULK_TOGGLE_OUT: AtomicBool = AtomicBool::new(false);
 static BULK_MPS:        AtomicU8   = AtomicU8::new(64);   // bulk endpoint max-packet (set at config time)
 
-/// One bulk transfer of `len` bytes on endpoint `ep`, through the `DMA.data` buffer, with cache
-/// maintenance for the A7's non-coherent DMA. Uses the bulk endpoint's max-packet (`BULK_MPS`) for the
-/// packet count and maintains the per-direction data toggle. Returns true on completion.
-fn bulk_xfer(dir_in: bool, ep: u32, data: &mut [u8], len: usize) -> bool {
+/// One bulk transfer on endpoint `ep`, through the `DMA.data` buffer, with cache maintenance for the A7's
+/// non-coherent DMA. Uses the bulk endpoint's max-packet (`BULK_MPS`) for the packet count and maintains
+/// the per-direction data toggle. Returns the number of bytes transferred (for IN, the device may send a
+/// short packet, so this can be < `len`), or -1 on failure / no data.
+fn bulk_xfer(dir_in: bool, ep: u32, data: &mut [u8], len: usize, tries: u32) -> i32 {
     MPS0.store(BULK_MPS.load(Ordering::Relaxed), Ordering::Relaxed); // chan_program uses MPS0 for pktcnt
     let toggle = if dir_in { &BULK_TOGGLE_IN } else { &BULK_TOGGLE_OUT };
     let pid = if toggle.load(Ordering::Relaxed) { PID_DATA1 } else { PID_DATA0 };
     // SAFETY: DMA is touched only on core 0; addr_of gives its identity-mapped physical address.
-    let ok = unsafe {
+    let got = unsafe {
         let d = &mut *core::ptr::addr_of_mut!(DMA);
         let data_phys = core::ptr::addr_of!(d.data) as u32;
         let n = len.min(d.data.len());
         if dir_in {
             flush_dcache(data_phys, n as u32);                     // invalidate before the device writes
-            let ok = chan_dma(true, pid, data_phys, n as u32, ep, 2);
-            if ok {
+            if !chan_dma(true, pid, data_phys, n as u32, ep, 2, tries) { -1i32 }
+            else {
                 flush_dcache(data_phys, n as u32);                 // invalidate after -> read device bytes
-                let m = n.min(data.len());
+                // HCTSIZ.xfersize counts DOWN as bytes arrive, so received = requested - remaining.
+                let remaining = (rd(HCTSIZ0) & 0x7_FFFF) as usize;
+                let recv = n.saturating_sub(remaining);
+                let m = recv.min(data.len());
                 data[..m].copy_from_slice(&d.data[..m]);
+                recv as i32
             }
-            ok
         } else {
             let m = n.min(data.len());
             d.data[..m].copy_from_slice(&data[..m]);
             flush_dcache(data_phys, n as u32);
-            chan_dma(false, pid, data_phys, n as u32, ep, 2)
+            if chan_dma(false, pid, data_phys, n as u32, ep, 2, tries) { n as i32 } else { -1i32 }
         }
     };
-    if ok { toggle.store(!toggle.load(Ordering::Relaxed), Ordering::Relaxed); }
-    ok
+    if got >= 0 { toggle.store(!toggle.load(Ordering::Relaxed), Ordering::Relaxed); }
+    got
 }
 
 // --- USB Mass Storage (Bulk-Only Transport) - a QEMU-verifiable exerciser of the bulk path ---
@@ -882,13 +900,13 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     let n = cdb.len().min(16);
     cbw[15..15 + n].copy_from_slice(&cdb[..n]);
 
-    if !bulk_xfer(false, ep_out, &mut cbw, 31) { pl011_write(b"dwc2: bot CBW-out failed\r\n"); return false; }
-    if dlen > 0 && !bulk_xfer(data_in, if data_in { ep_in } else { ep_out }, data, dlen) {
+    if bulk_xfer(false, ep_out, &mut cbw, 31, 3) < 0 { pl011_write(b"dwc2: bot CBW-out failed\r\n"); return false; }
+    if dlen > 0 && bulk_xfer(data_in, if data_in { ep_in } else { ep_out }, data, dlen, 3) < 0 {
         pl011_write(b"dwc2: bot data-stage failed\r\n"); return false;
     }
 
     let mut csw = [0u8; 13];
-    if !bulk_xfer(true, ep_in, &mut csw, 13) { pl011_write(b"dwc2: bot CSW-in failed\r\n"); return false; }
+    if bulk_xfer(true, ep_in, &mut csw, 13, 3) < 0 { pl011_write(b"dwc2: bot CSW-in failed\r\n"); return false; }
     let sig = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
     sig == 0x5342_5355 && csw[12] == 0                            // "USBS" and bCSWStatus = passed
 }

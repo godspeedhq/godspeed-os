@@ -395,6 +395,29 @@ impl ServiceContext {
         let _ = unsafe { raw_syscall(37, cycles, 0, 0) };
     }
 
+    /// Transmit one raw ethernet frame via the in-kernel USB-net device (the ARM DWC2 CDC-ECM bridge).
+    /// Gated by the NET_DEVICE cap (the ARM `nic-driver` holds it). Returns true if it was sent. Both
+    /// args are pointer + length, so they fit the 32-bit ABI without truncation. Inert on non-ARM.
+    pub fn net_frame_tx(&self, frame: &[u8]) -> bool {
+        // SAFETY: syscall(42) = NetFrameTx; the kernel range-checks (ptr, len) before copying.
+        unsafe { raw_syscall(42, frame.as_ptr() as u64, frame.len() as u64, 0) >= 0 }
+    }
+
+    /// Receive one raw ethernet frame into `dst` (a single bulk-IN poll). Returns the frame length, or 0
+    /// if none is available. Gated by the NET_DEVICE cap.
+    pub fn net_frame_rx(&self, dst: &mut [u8]) -> usize {
+        // SAFETY: syscall(43) = NetFrameRx; the kernel range-checks (ptr, len) before writing.
+        let r = unsafe { raw_syscall(43, dst.as_mut_ptr() as u64, dst.len() as u64, 0) };
+        if r > 0 { r as usize } else { 0 }
+    }
+
+    /// Query the USB-net device: writes `[mac(6), link(1)]` (7 bytes) into `out`. Returns true if a net
+    /// device is up. Gated by the NET_DEVICE cap.
+    pub fn net_info(&self, out: &mut [u8; 7]) -> bool {
+        // SAFETY: syscall(44) = NetInfo; the kernel writes exactly 7 range-checked bytes.
+        unsafe { raw_syscall(44, out.as_mut_ptr() as u64, 0, 0) == 1 }
+    }
+
     /// Block until a message arrives; returns the error instead of looping silently.
     pub fn recv_result(&self) -> Result<Message, crate::ipc::IpcError> {
         let data = Self::ctx();

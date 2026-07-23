@@ -64,6 +64,9 @@ pub enum SyscallNumber {
     SpawnWithCaps          = 39,
     ConsoleForeground      = 40,
     Call                   = 41,
+    NetFrameTx             = 42,
+    NetFrameRx             = 43,
+    NetInfo                = 44,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -89,6 +92,9 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Sleep          as u64 => handle_sleep(arg0),
         n if n == SyscallNumber::TrySend        as u64 => handle_try_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Call           as u64 => handle_call(arg0, arg1, arg2),
+        n if n == SyscallNumber::NetFrameTx     as u64 => handle_net_frame_tx(arg0, arg1),
+        n if n == SyscallNumber::NetFrameRx     as u64 => handle_net_frame_rx(arg0, arg1),
+        n if n == SyscallNumber::NetInfo        as u64 => handle_net_info(arg0),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
             0
@@ -1747,6 +1753,54 @@ fn handle_reboot() -> i64 {
     }
     crate::kprintln!("reboot: hardware reset");
     crate::arch::imp::hardware_reset();
+}
+
+/// Largest ethernet frame the USB-net bridge moves (matches nic-driver's FRAME_MAX).
+const NET_FRAME_MAX: usize = 1600;
+
+/// NetFrameTx (42): transmit a raw ethernet frame via the in-kernel USB-net device. `arg0` = frame ptr,
+/// `arg1` = length. Gated by NET_DEVICE (validated by holdings - the args fill the ABI, no slot to pass).
+/// Returns 0 on success, -1 on error. On non-ARM arches `net_frame_tx` is a stub returning false.
+fn handle_net_frame_tx(ptr: u64, len: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::NET_DEVICE_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    let len = len as usize;
+    if len == 0 || len > NET_FRAME_MAX { return -1; }
+    let frame = match read_user_bytes(ptr, len) { Some(b) => b, None => return -1 };
+    if crate::arch::imp::net_frame_tx(frame) { 0 } else { -1 }
+}
+
+/// NetFrameRx (43): receive one raw ethernet frame into the user buffer. `arg0` = dst ptr, `arg1` = max
+/// length. Gated by NET_DEVICE. Returns the frame length (0 if none is available), -1 on error.
+fn handle_net_frame_rx(ptr: u64, max: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::NET_DEVICE_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    let max = (max as usize).min(NET_FRAME_MAX);
+    if max == 0 { return -1; }
+    let mut buf = [0u8; NET_FRAME_MAX];
+    let n = crate::arch::imp::net_frame_rx(&mut buf[..max]);
+    if n == 0 { return 0; }
+    if !write_user_bytes(ptr, &buf[..n]) { return -1; }
+    n as i64
+}
+
+/// NetInfo (44): write `[mac(6), link(1)]` (7 bytes) of the USB-net device to `arg0`. Gated by NET_DEVICE.
+/// Returns 1 if a net device is up, 0 if none, -1 on error.
+fn handle_net_info(ptr: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::NET_DEVICE_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    match crate::arch::imp::net_info() {
+        Some((mac, link)) => {
+            let mut out = [0u8; 7];
+            out[..6].copy_from_slice(&mac);
+            out[6] = if link { 1 } else { 0 };
+            if write_user_bytes(ptr, &out) { 1 } else { -1 }
+        }
+        None => 0,
+    }
 }
 
 fn ipc_err_to_i64(e: IpcError) -> i64 {

@@ -287,6 +287,11 @@ pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, 
 /// window to grant here - always `None`.
 pub fn map_fixed_driver_mmio(_pt: &mut page_tables::PageTable, _name: &str) -> Option<(u64, u64)> { None }
 
+// USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
+pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
+pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }
+pub fn net_info() -> Option<([u8; 6], bool)> { None }
+
 /// Switch the local core to a new stack top (boot only). Used once at kernel entry to move off the
 /// bootloader's tiny stack onto the kernel's own before any locals are allocated. `#[inline(always)]`
 /// is REQUIRED: it must inline into the caller so there is no function epilogue trying to `ret` off the
