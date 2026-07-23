@@ -391,6 +391,39 @@ Verdict key: **SAFE** (no issue) / **BY-DESIGN** (intentional, documented) / **F
 
 ---
 
+## Audit 2 - 2026-07-23 (ARM32 in-kernel USB stack)
+
+**Scope:** the ARM32 USB stack this branch (`feat/pi2-arm32`) added - the in-kernel DWC2 host driver
+(`arch/arm/dwc2.rs`: keyboard + CDC-ECM/smsc95xx networking + mass-storage), the `NetFrame*` syscalls
+(42-44), the `NET_DEVICE` authority, and the ARM `nic-driver` bridge. A memory-safety pass on this exact
+code was done first (see `docs/unsafe-audit.md`, 2026-07-23) and found no UB/OOB/race; this pass audits
+**authority, trust boundaries, untrusted-input robustness (DoS/logic), and confused-deputy** only.
+
+**Result: 1 MED, 3 LOW.** No exploitable escalation. The descriptor/frame parsing is genuinely
+DoS-robust (every walk and hardware wait is bounded and guards the malicious cases); the `NET_DEVICE`
+gate is correctly enforced and gen-safe (the SEC-11 assert covers its id); "TX/RX raw frames" is
+on-the-wire transport, not a reach into another principal; the `nic-driver` bridge leaks no cap and
+over-serves nothing. **The finding is a trust-posture one:** the whole USB stack runs in ring 0 on ARM,
+a real and previously under-documented TCB expansion versus x86's confined-userspace-driver model.
+
+### Ranked ledger
+
+| ID | Sev | Conf | Principal | Finding | Fix direction |
+|----|-----|------|-----------|---------|---------------|
+| **SEC-29** | MED | CONFIRMED (posture) | kernel/arch (TCB) | **The entire ARM USB stack runs in-kernel (ring 0 / TCB) and parses untrusted device input there.** On x86 the USB drivers are confined *userspace* services (IOMMU arena, non-TCB, restartable - §6.4); on ARM `dwc2.rs` is kernel code (enumeration + the core-0 poll, `arch/arm/mod.rs:726`) parsing untrusted descriptors/frames. A logic flaw is a *kernel* compromise, not a bounded-service one. **Worse than §6.4's no-IOMMU x86 case:** the Pi 2 has no IOMMU/SMMU to confine DMA *and* ARM does not yet route device IRQs to userspace, so the driver is ring-0 code regardless. Not code-fixable on this hardware - the honest resolution is to *record* it (§26.3), as §6.4 records the DMA-driver posture. | CLAUDE.md §6.4-analog amendment: on ARM the in-kernel USB drivers are machine/arch-dependent TCB members until device-IRQ-to-userspace routing exists. **Done** (this commit). |
+| **SEC-30** | LOW | CONFIRMED | shell / drivers | **SEC-2's least-privilege win does not translate to ARM.** The in-kernel keyboard driver calls `console_push_byte` directly (`dwc2.rs`, no cap - it is kernel code), so a hostile USB keyboard still injects shell commands (the inherent, un-codeable SEC-2 residual). But SEC-2's actual *win* - "REBOOT lives only with the shell; the USB driver no longer holds it" - is meaningless here: an in-kernel driver implicitly holds *all* kernel authority (it can call `hardware_reset` directly). The ARM keyboard driver is a superset of the x86 CONSOLE_PUSH+REBOOT posture SEC-2 narrowed. | Note in the SEC-2 / §6.4 text that the REBOOT-removal win is x86-only; on the in-kernel-driver ARM port the driver is inside the *kernel* trust perimeter, not merely the shell's. Folded into the SEC-29 amendment. |
+| **SEC-31** | LOW | CONFIRMED (latent) | kernel/task | **`NET_DEVICE` is granted by service name on every arch, and a stale gen-safety comment.** `service_privileges` grants it via `matches!(name,"nic-driver")` and mints it unconditionally, but `net_frame_*` are inert stubs off-ARM - so the held cap authorizes nothing today, yet becomes live the day a non-ARM path wires a real `net_frame_*`. Separately, the SEC-11 comment (`table.rs:186`) says gate ids are "1-9" but `NET_DEVICE` is id 10; the actual assert is `id.0 >= 100`, which **does** correctly cover id 10 (so `holds_resource` gen-safety is sound - only the comment is stale). | Arch-gate the grant (`cfg!(target_arch="arm")`); update the SEC-11 comment to "ids 1-10". **Done** (this commit). |
+| **SEC-32** | LOW | PLAUSIBLE | kernel/arch (DoS) | **`wait_halt`'s up-to-4M-iteration spin runs inside the core-0 timer ISR.** The keyboard `poll()` runs from the timer tick and calls `wait_halt`, which spins up to 4,000,000 iterations if a channel arms but never sets `CHHLTD` (a wedged/hostile controller state; a normal NAK/STALL/complete returns fast). When it occurs it is a per-tick tax degrading core-0 scheduler/console responsiveness (on x86 the equivalent poll is a preemptible userspace driver on its own core). Bounded - never a hang or escalation. | Use a tighter bound for the *polled* (steady-state) path than the enumeration path, and/or a one-shot "controller wedged" latch that stops polling loudly (invariant 12). **Done** (tighter poll bound, this commit). |
+
+### Sound / no finding (verified)
+
+- **Descriptor + frame parsing is DoS-robust.** Every walk is `while i + 2 <= total` with `blen == 0` break and `total` clamped `.min(cfg.len())`; the hub walk is bounded by `next_addr > 120` regardless of a hostile `bNbrPorts`; there is no recursion into a downstream hub; every hardware wait is a bounded counter with a loud break. The smsc95xx RX length is masked + validated (`4 + flen > got` rejects) before any copy. A malformed device slows or aborts a one-time boot enumeration; it cannot hang it.
+- **`NET_DEVICE` gate is enforced + gen-safe.** All three syscalls check `current_task_holds_resource(NET_DEVICE_RESOURCE, WRITE)` first (non-holder -> `CapNotHeld`); lengths are bounded; user memory goes through the validated `read_user_bytes`/`write_user_bytes`. The gate resource is stable gen-0 and provably never revoked.
+- **"TX/RX raw frames" is transport, not escalation.** Bounded to `NET_FRAME_MAX`, mediated by the in-kernel device; frames reach only the physical wire, never local IPC/routing - a `net_frame_tx` cannot reach or spoof another in-system principal. Bounded exactly like a DMA driver's arena.
+- **The `nic-driver` ARM bridge (`usb_net_main`) leaks/over-serves nothing.** Opcodes are bounded to transport/info; the reply cap is taken, used once, and `remove_cap`'d after every reply. A client can only make it move frames or report info.
+
+---
+
 ## Fix log
 
 | Finding | Status | Commit | Notes |

@@ -460,10 +460,10 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // NEGATIVE pin - deliberately excluded so it holds no ACQUIRE_ANY (proves AcquireSendCap denies
         // a non-holder). Ordinary services get none; their AcquireSendCap is limited to declared peers.
         acquire_any: (is_probe && name != "adv-a13") || matches!(name, "shell" | "supervisor" | "chaos"),
-        // The `nic-driver` bridges ethernet frames to/from the in-kernel USB-net device on ARM. Inert on
-        // other arches (the NetFrame* syscalls stub to unsupported there - the NIC is a userspace PCIe
-        // driver), so holding it is harmless where it is unused.
-        net_device: matches!(name, "nic-driver"),
+        // The `nic-driver` bridges ethernet frames to/from the in-kernel USB-net device - an ARM-only
+        // path. Off ARM the NetFrame* syscalls are inert stubs (the NIC is a userspace PCIe driver), so
+        // arch-gate the grant rather than hand out an authority that is dormant-but-latent there (SEC-31).
+        net_device: cfg!(target_arch = "arm") && matches!(name, "nic-driver"),
     }
 }
 

@@ -395,6 +395,21 @@ fn chan_program(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_typ
 
 static DUMPED: AtomicBool = AtomicBool::new(false);
 
+/// A tighter-bounded halt wait for the STEADY-STATE keyboard poll, which runs inside the core-0 timer ISR
+/// (SEC-32): a wedged/hostile controller must not tax the ISR the full enumeration budget every tick. A
+/// normal interrupt-IN halts (complete or NAK) in far fewer iterations, so this generous cap never affects
+/// the working path - it only bounds the pathological per-tick cost (the keyboard auto-recovers if the
+/// wedge clears). No diagnostic dump; that is the one-shot enumeration path's job (`wait_halt`).
+fn poll_wait_halt() -> u32 {
+    let mut t = 0u32;
+    loop {
+        let ci = rd(HCINT0);
+        if ci & HCINT_CHHLTD != 0 { return ci; }
+        t += 1;
+        if t > 500_000 { return ci | HCINT_CHHLTD; }
+    }
+}
+
 /// True while `HCINT` shows the channel neither completed nor errored. Bounded so a wedged controller
 /// reports rather than hangs the boot.
 fn wait_halt() -> u32 {
@@ -1283,7 +1298,7 @@ pub fn poll() {
         let data_phys = core::ptr::addr_of!(d.data) as u32;
         flush_dcache(data_phys, 8);                               // invalidate before the device writes
         chan_program(true, pid, 8, data_phys, ep, 3);            // one interrupt IN, up to 8 bytes
-        let ci = wait_halt();
+        let ci = poll_wait_halt();                               // tighter bound: this runs in the timer ISR
         if ci & HCINT_XFERCOMPL == 0 { return; }                 // NAK / no new report
         flush_dcache(data_phys, 8);                               // invalidate after -> read device bytes
         let mut report = [0u8; 8];

@@ -440,6 +440,25 @@ official, not the runtime behaviour.
 > type `reboot` - the residual named just above. Scope: the chord is handled at the shell prompt; while
 > a full-screen app owns the console the shell is not reading, so quit it first.
 
+> **Amendment 2026-07-23 (SEC-29/SEC-30): on the ARM32 (Raspberry Pi 2) port the USB drivers are
+> in-kernel TCB members - a machine/arch-dependent posture, the ARM analog of the no-IOMMU case above,
+> and larger.** The amendments above concern *userspace* USB drivers (`xhci`/`ehci`) confined - or not -
+> by an IOMMU. The ARM port has no such split yet: the DWC2 USB host driver (keyboard, CDC-ECM/`smsc95xx`
+> networking, mass-storage) runs **in the kernel** (`arch/arm/dwc2.rs`, driven from boot + the core-0
+> timer tick), because ARM does not yet route device IRQs to userspace (`arch/arm/CLAUDE.md`, "Drivers on
+> ARM"). So on ARM the USB stack is **ring-0 code that parses untrusted device-supplied descriptors and
+> frames**, and it is a TCB member by construction. This is **strictly more** than the no-IOMMU x86 case:
+> there the driver is untrusted-but-userspace with only its *DMA* unconfined; here the driver *is* the
+> kernel. It is not fixable on this hardware - the Pi 2 has no IOMMU/SMMU to confine USB DMA regardless,
+> and the userspace-driver split awaits device-IRQ-to-userspace routing - so, per §26.3, it is **recorded**
+> rather than closed. Two consequences follow: (a) the memory-safety of `arch/arm/dwc2.rs` is TCB-critical
+> (audited: `docs/unsafe-audit.md`, `docs/security-audit.md` Audit 2, no UB/OOB/race); (b) **SEC-2's win
+> does not travel to ARM** - "REBOOT lives only with the shell, not the USB driver" is an x86 property; an
+> in-kernel ARM driver implicitly holds all kernel authority (it could call `hardware_reset` directly), so
+> the ARM keyboard driver sits inside the *kernel* trust perimeter, not merely the shell's. The residual
+> that IS shared with x86 is inherent: a keyboard's keystrokes are commands (SEC-2). `docs/security-audit.md`
+> Audit 2 (SEC-29/30) is the full treatment.
+
 ---
 
 ## 7. Capability System
