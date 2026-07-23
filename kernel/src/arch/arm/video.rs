@@ -84,6 +84,28 @@ fn mbox_call(channel: u32) -> bool {
     }
 }
 
+/// Ask the VideoCore to power ON the USB HCD (`SET_POWER_STATE`, device 3, `ON | WAIT`) - Circle does this
+/// before DWC2 init. Register access to the DWC2 is on the always-on APB peripheral bus, but its AXI DMA
+/// **master** lives in a separate power/clock domain the firmware may leave off - which is exactly the
+/// symptom on the Pi 2 (GSNPSID reads, PHY detects a connect, SOFs run, yet the DMA master never
+/// dispatches, AHBIdle stuck 1). Runs with the MMU + caches OFF like the rest of this file, so it must be
+/// called from the early boot path before `mmu::enable`. Returns the GPU's success flag.
+pub fn set_usb_power_on() -> bool {
+    // SAFETY: single-threaded, caches-off boot; MBOX is filled then read here only.
+    unsafe {
+        let m = &mut *core::ptr::addr_of_mut!(MBOX);
+        m.data[0] = 8 * 4;       // total buffer size in bytes
+        m.data[1] = 0;           // request code
+        m.data[2] = 0x0002_8001; // tag: SET_POWER_STATE
+        m.data[3] = 8;           // value buffer size (2 u32s: device id + state)
+        m.data[4] = 0;           // tag request code
+        m.data[5] = 3;           // device id: USB HCD
+        m.data[6] = 0b11;        // state: bit0 ON | bit1 WAIT (block until powered + stable)
+        m.data[7] = 0;           // end tag
+    }
+    mbox_call(8)
+}
+
 /// Ask the GPU for the display's native (physical) resolution, so the framebuffer can be requested at
 /// exactly that size and fill the screen - no pillarbox bars. `None` (fall back to a default) if the
 /// query fails or returns nothing. Runs with the MMU + caches OFF, like `request`.

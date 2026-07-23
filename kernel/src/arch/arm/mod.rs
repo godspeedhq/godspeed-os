@@ -484,6 +484,15 @@ extern "C" fn arm_boot_main() -> ! {
     // framebuffer fills the screen (no pillarbox bars); fall back to 1280x720 if the query fails.
     let (fbw, fbh) = video::query_display_size().unwrap_or((1280, 720));
     let fb = video::request(fbw, fbh);
+    // Power on the USB HCD via the VideoCore mailbox BEFORE the MMU/caches (this exchange, like the
+    // framebuffer one above, needs caches off). Circle does this before DWC2 init: the DWC2's AXI DMA
+    // master is in a separate power/clock domain the firmware may leave off even though register reads
+    // work - the leading suspect for "the master never dispatches" on the Pi 2 (dwc2.rs).
+    if video::set_usb_power_on() {
+        pl011_write(b"arm32: USB HCD powered on via VideoCore mailbox\r\n");
+    } else {
+        pl011_write(b"arm32: WARN USB HCD power-on mailbox failed (firmware may already have it on)\r\n");
+    }
     mmu::enable();
     // Map the framebuffer and bring up the text console over it, so the boot log + shell prompt appear
     // on the TV (mirrored from serial). Everything logged from here on shows on the display.
