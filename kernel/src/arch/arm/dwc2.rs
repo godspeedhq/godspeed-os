@@ -684,7 +684,11 @@ fn enumerate_hub() {
     pl011_write(b"dwc2: hub ports="); write_hex32(nports as u32); pl011_write(b"\r\n");
 
     for port in 1..=nports { control_out(0x23, 0x03, PORT_POWER, port as u16); } // SET_FEATURE(PORT_POWER)
-    spin(1_000_000);                                                             // ~bPwrOn2PwrGood, bounded
+    // Power-on-to-power-good + device-connect settle. bPwrOn2PwrGood (hd[5], in 2 ms units) is how long the
+    // hub says to wait after PORT_POWER before a port reads valid; wait that plus a generous margin so a
+    // just-powered device - or the LAN9514's internal ethernet port - has time to show connected. The old
+    // spin(1M) was ~tens of ms, too short (every port read disconnected). Accurate delay via the 1 MHz timer.
+    super::timer::delay_us((hd[5] as u32).saturating_mul(2000).max(300_000));
 
     // Walk EVERY connected port, assigning each device a distinct USB address (2, 3, ...) and configuring
     // it (keyboard AND ethernet can coexist behind the one hub - the Pi 2's LAN9514 topology). The single
@@ -696,6 +700,8 @@ fn enumerate_hub() {
         select_device(1, hub_mps, false);
 
         let st = hub_get_port_status(port);
+        pl011_write(b"dwc2: hub port "); write_hex32(port as u32);
+        pl011_write(b" status="); write_hex32(st); pl011_write(b"\r\n");
         if st & 1 == 0 { continue; }                                            // no device on this port
         control_out(0x23, 0x01, C_PORT_CONNECTION, port as u16);                // CLEAR_FEATURE(C_CONNECTION)
         control_out(0x23, 0x03, PORT_RESET, port as u16);                       // SET_FEATURE(PORT_RESET)
