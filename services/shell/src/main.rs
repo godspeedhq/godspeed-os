@@ -3807,7 +3807,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("clear", "clear the screen and home the cursor", "clear"),
         ], true),
         "about" => help_block(ctx, "about", "system identity + credits", &[
-            ("about", "name, core count, creator", "about"),
+            ("about", "name, version + arch, core count, creator", "about"),
         ], true),
         "version" => help_block(ctx, "version", "the GodspeedOS version + architecture + build stamp", &[
             ("version", "GodspeedOS <version> <arch> (<git-sha>)", "version"),
@@ -4090,7 +4090,7 @@ static HELP: &[HelpRow] = &[
     Row("assert ok|fails <cmd>", "verify success/failure (also: … | assert contains X)"),
     Gap,
     Sec("System"),
-    Row("about", "identity + credits"),
+    Row("about", "identity: version + arch, cores, credits"),
     Row("version", "GodspeedOS version + architecture + build stamp"),
     Row("cores", "CPU core count"),
     Row("mem", "physical memory usage"),
@@ -4407,6 +4407,10 @@ fn cmd_echo(ctx: &ServiceContext, text: &str, out: &mut Out) -> Result<(), Shell
 fn cmd_about(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     out.line(ctx, "GodspeedOS: a capability-based microkernel");
     out.line(ctx, "  Small enough to understand. Rigorous enough to trust.");
+    // Same facts as `version` (and the same ARCH const), so a single `about` gives the whole identity -
+    // what it is, which build, which machine. `version` stays the RAW fact for piping; this is prose.
+    out.line_fmt(ctx, format_args!("  Version {} {} ({})",
+                                   env!("CARGO_PKG_VERSION"), ARCH, env!("GODSPEED_GIT_SHA")));
     out.line_fmt(ctx, format_args!("  Running on {} core(s).", ctx.inspect_core_count()));
     out.line(ctx, "  Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.");
     Ok(())
