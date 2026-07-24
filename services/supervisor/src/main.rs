@@ -412,6 +412,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]
     ensure_wired(&ctx, &mut name_map, "fs", &["block-driver"]);
 
+    // shell: the interactive prompt. Spawned in bare-metal (the USB image rests here) and full builds;
+    // excluded from test-specific builds. Its `fs` peer is wired from the supervisor's map.
+    // Phase 6: ensure_wired adopts a running shell on a supervisor respawn instead of duplicating it.
+    //
+    // Spawned EARLY - before the network services - and that ordering is deliberate: **the user's prompt
+    // must never wait on hardware bring-up.** It was briefly moved last (so the boot log would finish
+    // before the prompt painted, a cosmetic win); on real hardware, once the Pi's NIC actually came up,
+    // net-stack's DHCP -> ARP -> ICMP dance ran its full ~45 s of budgets with nothing answering, and the
+    // prompt sat behind it. A tidy boot log is not worth a 45-second wait for the shell: the shell comes
+    // up first and net-stack configures itself in the background (it already self-configures on link-up).
+    #[cfg(not(any(feature = "identity-only", feature = "perf-only",
+                  feature = "perf-brutal-only", feature = "stress-only",
+                  feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
+                  feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
+    ensure_wired(&ctx, &mut name_map, "shell", &["fs"]);
+
     // counter (examples/counter): a STATEFUL example that survives its OWN restart by persisting its
     // running count to `fs` and reconstructing it on spawn (§14 restart, §15 persistence). Spawned
     // ONLY in the `counter-test` build (`osdev test counter`) - its per-tick writes to /counter.dat
@@ -500,22 +516,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     spawn_wired(&ctx, &mut name_map, "net-stack", &["nic-driver"]);
-
-    // shell: the interactive prompt. Spawned in bare-metal (the USB image rests here) and full builds;
-    // excluded from test-specific builds. Its `fs` peer is wired from the supervisor's map (fs is
-    // spawned above), and Phase 6 `ensure_wired` adopts a running shell on a supervisor respawn instead
-    // of duplicating it.
-    //
-    // Spawned LAST, after every other service, deliberately: the shell paints the `gsh> ` prompt as soon
-    // as it is ready, and a prompt is the one console write that does NOT end in a newline. Any service
-    // still announcing itself afterwards lands ON the prompt line (`gsh> net-stack: serving ...`).
-    // Starting the shell last gives every other service its head start, so the boot log is finished
-    // before the prompt is painted and the prompt is left alone at the bottom of the screen.
-    #[cfg(not(any(feature = "identity-only", feature = "perf-only",
-                  feature = "perf-brutal-only", feature = "stress-only",
-                  feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
-                  feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    ensure_wired(&ctx, &mut name_map, "shell", &["fs"]);
 
     // Phase 1 (docs/naming-design.md): report the shadow name→cap map. Proves the supervisor now
     // holds an endpoint cap to every real service it spawned - the future name authority. Nothing
