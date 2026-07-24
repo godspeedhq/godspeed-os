@@ -31,9 +31,17 @@ struct Fbcon {
     rows: usize,
     col: usize,
     row: usize,
+    // ANSI escape-sequence state for the console stream: 0 = normal, 1 = saw ESC, 2 = inside CSI.
+    // The shell's line editor emits CSI sequences - notably `ESC[K` (erase to end of line) after each
+    // echoed character. A serial terminal interprets those; fbcon used to drop only the ESC byte and then
+    // draw "[K" as literal glyphs, which is the garble seen on the TV when typing (`h[Ke[Kl[Kp[K`).
+    ansi: u8,
+    csi_param: u32,
 }
-static mut FBCON: Fbcon =
-    Fbcon { base: 0, pitch: 0, width: 0, height: 0, org_x: 0, org_y: 0, cols: 0, rows: 0, col: 0, row: 0 };
+static mut FBCON: Fbcon = Fbcon {
+    base: 0, pitch: 0, width: 0, height: 0, org_x: 0, org_y: 0, cols: 0, rows: 0, col: 0, row: 0,
+    ansi: 0, csi_param: 0,
+};
 static READY: AtomicBool = AtomicBool::new(false);
 
 /// True once `init` has set up the console; `pl011_write` mirrors to the framebuffer only after this.
@@ -56,6 +64,8 @@ pub fn init(base: u32, pitch: u32, width: u32, height: u32) {
         c.rows = (c.height - 2 * c.org_y) / CELL_H;
         c.col = 0;
         c.row = 0;
+        c.ansi = 0;
+        c.csi_param = 0;
         clear(c);
     }
     READY.store(true, Ordering::Release);
@@ -157,14 +167,56 @@ fn scroll(c: &Fbcon) {
     clean_rect(c, c.org_x, c.org_y, c.cols * CELL_W, c.rows * CELL_H);
 }
 
-/// Render one byte of the serial stream. Handles CR/LF/backspace; printable ASCII draws a glyph and
-/// advances. When the screen fills, scroll up one row (no blanking).
+/// `ESC[K` (Erase in Line): blank the current row from the cursor to the end of the text area. The shell's
+/// line editor emits this after each echoed character to wipe any leftover tail.
+fn erase_to_eol(c: &Fbcon) {
+    if c.row >= c.rows || c.col >= c.cols { return; }
+    let x0 = c.org_x + c.col * CELL_W;
+    let y0 = c.org_y + c.row * CELL_H;
+    let w = (c.cols - c.col) * CELL_W;
+    for gy in 0..CELL_H {
+        for gx in 0..w {
+            put_pixel(c, x0 + gx, y0 + gy, BG);
+        }
+    }
+    clean_rect(c, x0, y0, w, CELL_H);
+}
+
+/// Render one byte of the serial stream. Consumes ANSI CSI escape sequences (so they are acted on, not
+/// drawn as literal text); handles CR/LF/backspace; printable ASCII draws a glyph and advances. When the
+/// screen fills, scroll up one row (no blanking).
 pub fn put_byte(b: u8) {
     if !READY.load(Ordering::Relaxed) { return; }
     // SAFETY: FBCON is published; concurrent callers are serialized by pl011_write's SERIAL_BUSY guard
     // (the only caller), so there is a single writer at a time.
     unsafe {
         let c = &mut *core::ptr::addr_of_mut!(FBCON);
+        // --- ANSI escape handling (before any glyph is drawn) ---
+        if c.ansi == 1 {                                   // previous byte was ESC
+            c.ansi = if b == b'[' { 2 } else { 0 };        // only CSI (`ESC[`) is understood
+            c.csi_param = 0;
+            return;
+        }
+        if c.ansi == 2 {                                   // inside a CSI sequence
+            if (0x30..=0x3F).contains(&b) {                // parameter bytes: digits, ';', '?'
+                if b.is_ascii_digit() {
+                    c.csi_param = c.csi_param.saturating_mul(10) + (b - b'0') as u32;
+                }
+                return;
+            }
+            if (0x20..=0x2F).contains(&b) { return; }      // intermediate bytes
+            // 0x40..=0x7E: the final byte ends the sequence.
+            c.ansi = 0;
+            let p = c.csi_param;
+            c.csi_param = 0;
+            match b {
+                b'K' => erase_to_eol(c),                   // EL - what the line editor uses
+                b'J' if p == 2 => { clear(c); c.col = 0; c.row = 0; } // ED(2) - clear screen
+                _ => {}                                    // SGR colours, cursor moves, ... : ignored
+            }
+            return;
+        }
+        if b == 0x1B { c.ansi = 1; c.csi_param = 0; return; } // ESC starts a sequence
         match b {
             b'\n' => { c.col = 0; c.row += 1; }
             b'\r' => { c.col = 0; }
