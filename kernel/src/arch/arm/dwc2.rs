@@ -622,10 +622,6 @@ fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: 
         // STATE 1 - issue the Start-Split (CompleteSplit = 0); capture the microframe it goes out in.
         let hf0 = rd(HFNUM);
         chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt);
-        // VERIFY the split actually stuck on the CHANNEL register (we have only ever trusted the value we
-        // WROTE). If HCSPLT.SplEna (bit 31) is not set here, the "split" is really a plain HS SETUP to
-        // device 0 - transmitted, unanswered, XactErr - which matches our data exactly.
-        if !bounded { unsafe { SS_HCSPLT_RB = rd(HCSPLT0); SS_HCCHAR_RB = rd(HCCHAR0); } }
         let ss = if bounded { poll_wait_halt() } else { wait_halt() };
         trace_split(PH_SSPLIT, hf0, rd(HFNUM), ss);
         last = ss;
@@ -659,9 +655,6 @@ fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: 
         pl011_write(b" HCCHAR="); write_hex32(rd(HCCHAR0));
         pl011_write(b" GINTMSK="); write_hex32(rd(GINTMSK));
         pl011_write(b" HFIR="); write_hex32(rd(HFIR));
-        // Channel state read BACK right after arming the SSPLIT - proves whether SplEna actually stuck.
-        pl011_write(b" HCSPLTrb="); write_hex32(unsafe { SS_HCSPLT_RB });
-        pl011_write(b" HCCHARrb="); write_hex32(unsafe { SS_HCCHAR_RB });
         pl011_write(b"\r\ndwc2: split trace [phase issue.uf -> halt.uf hcint]:\r\n");
         let n = SPLIT_TRACE_N.load(Ordering::Relaxed).min(SPLIT_TRACE_MAX);
         for i in 0..n {
@@ -678,8 +671,6 @@ fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: 
 }
 
 static SPLIT_DUMPED: AtomicBool = AtomicBool::new(false);
-static mut SS_HCSPLT_RB: u32 = 0;  // HCSPLT read back right after arming the start-split (verify SplEna stuck)
-static mut SS_HCCHAR_RB: u32 = 0;  // HCCHAR read back likewise (verify LSpdDev / DevAddr / ChEna)
 
 // --- split microframe trace ------------------------------------------------------------------------
 // Capture (phase, HFNUM-at-issue, HFNUM-at-halt, HCINT) per SSPLIT/CSPLIT into a fixed buffer, dumped
