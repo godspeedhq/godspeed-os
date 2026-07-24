@@ -520,20 +520,34 @@ fn stall_dump() {
     pl011_write(b"\r\n");
 }
 
-/// True while `HCINT` shows the channel neither completed nor errored. Bounded so a wedged controller
-/// reports rather than hangs the boot.
+/// Wait for the channel to halt (complete or error), bounded by REAL TIME so a wedged controller reports
+/// rather than hanging.
+///
+/// **The bound MUST be time, not a spin count, and it MUST be short.** This runs in two contexts that
+/// both hold interrupts off: the boot path, and - critically - the runtime net/bulk path, which the SVC
+/// entry enters with IRQs MASKED (see the DMA soundness invariant below: the net path must not block, so
+/// it keeps IRQs masked start to finish). A spin count of 4,000,000 MMIO reads on the slow peripheral bus
+/// is tens to hundreds of milliseconds with the timer ISR unable to fire - so a single stalled ethernet
+/// frame read froze the whole machine: no keyboard poll (the ISR never ran), no preemption (the shell
+/// took 49 s to reach ready). HW-observed on the Pi 2 once the board-MAC fix brought the NIC up and
+/// net-stack began polling frames in earnest.
+///
+/// A healthy USB transaction halts in microseconds, so `HALT_BUDGET_US` is enormously generous for the
+/// working path while capping the pathological one at a fraction of a scheduler tick.
 fn wait_halt() -> u32 {
-    let mut t = 0u32;
+    let start = super::timer::systimer_us();
     loop {
         let ci = rd(HCINT0);
         if ci & HCINT_CHHLTD != 0 { return ci; }
-        t += 1;
-        if t > 4_000_000 {
+        if super::timer::systimer_us().wrapping_sub(start) > HALT_BUDGET_US {
             stall_dump();
             return ci | HCINT_CHHLTD; // treat as halted-without-complete -> failure
         }
     }
 }
+/// Per-transaction halt budget. 2 ms is ~1000x a healthy transaction and still well under the 10 ms
+/// scheduler tick, so even a fully wedged device cannot starve the timer ISR or the scheduler.
+const HALT_BUDGET_US: u32 = 2000;
 
 /// DMA scratch buffer. Static so it lives in identity-mapped RAM (VA == PA); the DMA engine reads/writes
 /// it via the bus alias (`chan_program`). 64-byte aligned, and `setup` is padded to a full 64 bytes so
