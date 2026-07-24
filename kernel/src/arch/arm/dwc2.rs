@@ -567,13 +567,36 @@ fn flush_dcache(addr: u32, len: u32) {
 /// NAKs when idle (a bulk IN with no frame queued), so an empty poll returns immediately.
 fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u32, tries: u32) -> bool {
     let hcsplt = hcsplt_for_current();
+    if hcsplt != 0 {
+        // SPLIT path, ONE low/full-speed packet per split transaction. The DWC2 does not auto-continue a
+        // multi-packet split in buffer-DMA mode - it halts XferCompl after the FIRST packet - so software
+        // must sequence each mps-sized packet itself, advancing the buffer and toggling the data PID.
+        // HW-proven (Pi 2 / LAN9514): an 18-byte device descriptor read whole came back as 8 correct bytes
+        // + 10 stale, because only packet 1 was ever retrieved. A single-packet transfer (the 8-byte SETUP,
+        // a boot-report IN) is just one iteration; a zero-length STATUS is one iteration with chunk 0.
+        let mps = MPS0.load(Ordering::Relaxed).max(1) as u32;
+        let mut off = 0u32;
+        let mut cur_pid = pid;
+        loop {
+            let chunk = (len - off).min(mps);
+            let mut ok = false;
+            for attempt in 0..tries {
+                let ci = split_txn(dir_in, cur_pid, chunk, buf_phys + off, ep, ep_type, hcsplt, false);
+                if ci & HCINT_XFERCOMPL != 0 { ok = true; break; }
+                if ci & (1 << 3) != 0 { return false; }     // STALL - hard failure
+                if attempt + 1 < tries { spin(5_000); }     // NAK / XactErr - brief backoff, then retry
+            }
+            if !ok { return false; }
+            off += chunk;
+            if off >= len { return true; }                  // whole transfer done (len == 0 completes here)
+            if chunk < mps { return true; }                 // a short packet ends the transfer early
+            cur_pid = if cur_pid == PID_DATA1 { PID_DATA0 } else { PID_DATA1 }; // control/bulk data toggle
+        }
+    }
+    // DIRECT (high-speed) path: the core handles multi-packet framing + the data toggle itself.
     for attempt in 0..tries {
-        let ci = if hcsplt != 0 {
-            split_txn(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt, false)
-        } else {
-            chan_program(dir_in, pid, len, buf_phys, ep, ep_type, 0);
-            wait_halt()
-        };
+        chan_program(dir_in, pid, len, buf_phys, ep, ep_type, 0);
+        let ci = wait_halt();
         if ci & HCINT_XFERCOMPL != 0 { return true; }
         if ci & (1 << 3) != 0 { return false; }         // STALL - hard failure
         if attempt + 1 < tries { spin(5_000); }         // NAK / XactErr - brief backoff, then retry
@@ -928,6 +951,17 @@ fn enumerate_downstream(low: bool, addr: u8, split_port: u8) -> bool {
     let pid = (buf[10] as u32) | ((buf[11] as u32) << 8);
     pl011_write(b"dwc2: downstream VID:PID="); write_hex32((vid << 16) | pid);
     pl011_write(b" class="); write_hex32(buf[4] as u32); pl011_write(b"\r\n");
+    // DIAGNOSTIC: raw 18-byte device descriptor. A low-speed device (mps 8) returns it over 3 IN packets
+    // via split; if bytes 8+ (VID/PID/class detail) are stale or duplicated while bytes 0-7 are right,
+    // the multi-packet split IN is mis-toggling. bLength(00)=0x12, bDescType(01)=0x01 for a real one.
+    pl011_write(b"dwc2: desc18 raw=");
+    for i in 0..18usize {
+        let b = buf[i];
+        let hi = b >> 4; let lo = b & 0xF;
+        pl011_write(&[if hi < 10 { b'0' + hi } else { b'a' + hi - 10 },
+                      if lo < 10 { b'0' + lo } else { b'a' + lo - 10 }, b' ']);
+    }
+    pl011_write(b"\r\n");
 
     // The Pi 2's onboard LAN9514 is a vendor-specific smsc95xx (class 0xFF, VID 0x0424 SMSC). Bring it up
     // as the network device (HW-blind - QEMU never takes this branch).
