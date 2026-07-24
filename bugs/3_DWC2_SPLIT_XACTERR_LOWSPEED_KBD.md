@@ -47,20 +47,49 @@ the rejection is **below scheduling** - in how the DWC2 v2.80a forms/drives the 
 wire, and the LAN9514 hub - which ACKs direct high-speed control transfers to its own EP0 (it enumerated) -
 **never ACKs the SSPLIT, in any microframe.** Not timing, not HFIR, not internal-reject, not preamble.
 
-**What is left (needs a byte-level reference comparison, not another black-box HW boot):**
+**Linux byte-level diff DONE (2026-07-24) - we now MATCH Linux on every dwc2 register, still XactErr.**
 
-1. **Compare our SSPLIT channel programming against Linux dwc2 field-by-field**, especially the exact
-   `HCCHAR`/`HCSPLT` bits and *which address the SSPLIT token carries*. Hypothesis worth checking: does
-   the v2.80a put the **hub address** (`HCSPLT.HubAddr`) or the **device address** (`HCCHAR.DevAddr`) in
-   the SSPLIT token? If it (or our setup) sends the SSPLIT to device 0 instead of hub 1, no one ACKs.
-2. **Manual vs core-auto split in buffer-DMA** (does the core want ONE channel-enable for the whole
-   non-periodic split?), and any **v2.80a split errata** / dwc2 quirk flags.
-3. **Isolation** (checklist): bring up ONLY the keyboard (skip ethernet/wifi config) to rule out any TT
-   state left by the high-speed devices enumerated first.
+Diffed against Linux `dwc2_hc_init` / `dwc2_hc_start_transfer` / `dwc2_hc_init_split` /
+`dwc2_hc_init_xfer`. Every field matches:
 
-Instrumentation is all in place (`split_txn` trace with phase/HFNUM/HCINT/GNPTXSTS/GINTSTS +
-`wait_for_uframe`). The next move is reading Linux's `dwc2_hc_init` / `dwc2_hc_init_split` /
-`dwc2_hc_start_transfer` and diffing the channel setup byte-for-byte.
+- `HCCHAR`: MC=1 (control), **LSpdDev=1** (Linux sets it even for a low-speed split - reverted my earlier
+  clear), DevAddr = the low-speed DEVICE (0, the hub addr rides HCSPLT), EPType=control, MPS=8.
+- `HCSPLT`: SplEna, HubAddr=1, PrtAddr=2, XactPos=ALL(0b11), CompSplit=0.
+- `HCTSIZ`: PID=SETUP(3), PktCnt=1, XferSize=8.
+- **Interrupt masks**: Linux writes HCINTMSK + HAINTMSK + GINTMSK before enabling ANY channel; we had them
+  OFF on HW (the u-boot transcription removed them, but u-boot does no low-speed splits). **RESTORED @
+  8a22056** - HW-confirmed live (GINTSTS bit 25 HChInt now propagates: `gints` 0x04000029 -> 0x06000029)
+  and SAFE (the direct hub/ethernet path still enumerates). **Still XactErr.** Correct, but not the fix.
+
+So: register-identical to Linux, the SSPLIT transmits on the wire, and the LAN9514 will not ACK it.
+**Confirmed NOT:** microframe timing, HFIR, internal reject (GNPTXSTS drains = transmitted), low-speed
+preamble (LSpdDev), interrupt masks. That is an unusual place to be - the dwc2 config is right.
+
+**Remaining leads, prioritized (all need a HW boot to test):**
+
+1. **HUB-LEVEL TT SETUP - top suspect.** The Linux dwc2 diff explicitly notes TT acknowledgment/scheduling
+   "may be in the hub-driver integration, not this file." The dwc2 registers are right; what may be
+   missing is USBCORE-level hub setup we skip:
+   - **Multi-TT hubs need `SET_INTERFACE(alt 1)`** to activate per-port TTs. Log the hub's
+     `bDeviceProtocol` (device-descriptor byte 6): 2 = multi-TT. If multi-TT, issue `SET_INTERFACE(1)` on
+     the hub (device address 1) before the first split. (Verify the LAN9514's TT architecture first - if
+     single-TT, alt 0 already works and this is not it, but it is cheap and safe to try.)
+   - **TT think-time** (hub descriptor `wHubCharacteristics` bits 5-6): a required inter-split delay we do
+     not honor. Unlikely for the FIRST split, but cheap.
+2. **HCSPLT write ORDER.** Linux: HCTSIZ -> HCSPLT -> HCCHAR; ours: HCSPLT -> HCTSIZ -> HCCHAR. Independent
+   registers, low probability, but free to match exactly.
+3. **v2.80a split errata / the actual Linux C** (WebFetch only gives summaries - read the real source for
+   any 2.80a `dwc2` quirk flag or a subtle channel-start step), and the interrupt-driven CSPLIT timing
+   (lower priority - the SSPLIT fails first).
+4. **HW-level analysis** (a USB analyzer, or the Pi's own trace) to see what the LAN9514 actually returns
+   to the SSPLIT on the wire - the only way to distinguish "the v2.80a emits a malformed SSPLIT" from "the
+   hub receives a valid SSPLIT and NAK/ignores it".
+
+**Instrumentation in place** (nothing to rebuild for the next test): `split_txn` trace (phase / HFNUM
+issue.uframe -> halt.uframe / HCINT / GNPTXSTS / GINTSTS) + `wait_for_uframe` microframe placement + the
+failure dump (now HCSPLT / HCCHAR / GINTMSK / HFIR). The current image on the SD card is the
+Linux-register-faithful build; the next code step is lead #1 (hub `bDeviceProtocol` log + conditional
+`SET_INTERFACE(1)`).
 
 ---
 

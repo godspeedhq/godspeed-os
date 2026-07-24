@@ -624,6 +624,8 @@ fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: 
     if !bounded && !SPLIT_DUMPED.swap(true, Ordering::Relaxed) {
         pl011_write(b"dwc2: split fail last_hcint="); write_hex32(last);
         pl011_write(b" HCSPLT="); write_hex32(hcsplt);
+        pl011_write(b" HCCHAR="); write_hex32(rd(HCCHAR0));
+        pl011_write(b" GINTMSK="); write_hex32(rd(GINTMSK));
         pl011_write(b" HFIR="); write_hex32(rd(HFIR));
         pl011_write(b"\r\ndwc2: split trace [phase issue.uf -> halt.uf hcint]:\r\n");
         let n = SPLIT_TRACE_N.load(Ordering::Relaxed).min(SPLIT_TRACE_MAX);
@@ -794,12 +796,14 @@ fn enumerate_sync() {
     let vid = (buf[8] as u32) | ((buf[9] as u32) << 8);
     let pid = (buf[10] as u32) | ((buf[11] as u32) << 8);
     let class = buf[4];
+    let protocol = buf[6];             // hub bDeviceProtocol: 1 = single-TT, 2 = multi-TT
     pl011_write(b"dwc2: enumerated device VID:PID=");
     write_hex32((vid << 16) | pid);
-    pl011_write(b" class="); write_hex32(class as u32); pl011_write(b"\r\n");
+    pl011_write(b" class="); write_hex32(class as u32);
+    pl011_write(b" proto="); write_hex32(protocol as u32); pl011_write(b"\r\n");
 
     if class == 0x09 {
-        enumerate_hub();               // keyboard is behind the hub (LAN9514 on real Pi 2, NEC hub in QEMU)
+        enumerate_hub(protocol);       // keyboard is behind the hub (LAN9514 on real Pi 2, NEC hub in QEMU)
     } else if class == 0x00 || class == 0x03 {
         configure_keyboard();          // keyboard plugged straight into the root port
     }
@@ -807,9 +811,17 @@ fn enumerate_sync() {
 
 /// Walk the hub at address 1: configure it, power every port, then for each connected port reset it and
 /// enumerate the downstream device, stopping at the first keyboard. Every wait is bounded.
-fn enumerate_hub() {
+fn enumerate_hub(protocol: u8) {
     let hub_mps = MPS0.load(Ordering::Relaxed);          // hub EP0 max-packet (set during root enumeration)
     if !control_out(0x00, 0x09, 1, 0) { pl011_write(b"dwc2: hub SET_CONFIG failed\r\n"); return; }
+    // A MULTI-TT hub (bDeviceProtocol 2) needs SET_INTERFACE(alt 1) to activate its per-port transaction
+    // translators before ANY split is accepted - a USBCORE hub-driver step the dwc2 register layer does
+    // not perform (fresh-eyes lead #1 for the low-speed keyboard split XactErr). Harmless on a single-TT
+    // hub (it STALLs alt 1; we log and continue). SET_INTERFACE = bmReqType 0x01, bReq 0x0B, wValue=alt.
+    if protocol == 2 {
+        if control_out(0x01, 0x0B, 1, 0) { pl011_write(b"dwc2: hub is multi-TT: SET_INTERFACE(1) ok\r\n"); }
+        else { pl011_write(b"dwc2: hub is multi-TT: SET_INTERFACE(1) refused\r\n"); }
+    }
 
     // Hub descriptor (class GET_DESCRIPTOR, type 0x29) -> bNbrPorts at byte 2.
     let mut hd = [0u8; 16];
