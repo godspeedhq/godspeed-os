@@ -67,23 +67,28 @@ preamble (LSpdDev), interrupt masks. That is an unusual place to be - the dwc2 c
 
 **Remaining leads, prioritized (all need a HW boot to test):**
 
-1. **HUB-LEVEL TT SETUP - top suspect.** The Linux dwc2 diff explicitly notes TT acknowledgment/scheduling
-   "may be in the hub-driver integration, not this file." The dwc2 registers are right; what may be
-   missing is USBCORE-level hub setup we skip:
-   - **Multi-TT hubs need `SET_INTERFACE(alt 1)`** to activate per-port TTs. Log the hub's
-     `bDeviceProtocol` (device-descriptor byte 6): 2 = multi-TT. If multi-TT, issue `SET_INTERFACE(1)` on
-     the hub (device address 1) before the first split. (Verify the LAN9514's TT architecture first - if
-     single-TT, alt 0 already works and this is not it, but it is cheap and safe to try.)
-   - **TT think-time** (hub descriptor `wHubCharacteristics` bits 5-6): a required inter-split delay we do
-     not honor. Unlikely for the FIRST split, but cheap.
-2. **HCSPLT write ORDER.** Linux: HCTSIZ -> HCSPLT -> HCCHAR; ours: HCSPLT -> HCTSIZ -> HCCHAR. Independent
-   registers, low probability, but free to match exactly.
-3. **v2.80a split errata / the actual Linux C** (WebFetch only gives summaries - read the real source for
-   any 2.80a `dwc2` quirk flag or a subtle channel-start step), and the interrupt-driven CSPLIT timing
-   (lower priority - the SSPLIT fails first).
-4. **HW-level analysis** (a USB analyzer, or the Pi's own trace) to see what the LAN9514 actually returns
-   to the SSPLIT on the wire - the only way to distinguish "the v2.80a emits a malformed SSPLIT" from "the
-   hub receives a valid SSPLIT and NAK/ignores it".
+1. **HUB TT MODE - TESTED, RULED OUT (2026-07-24 07:37).** The LAN9514 IS multi-TT (`proto=0x2`), and
+   `SET_INTERFACE(1)` **succeeds** (`dwc2: hub is multi-TT: SET_INTERFACE(1) ok`). But the split **still**
+   XactErrs. It also failed in single-TT mode (the default, all prior boots). So the split fails in BOTH
+   TT modes -> TT mode / SET_INTERFACE is not the fix. (Kept the SET_INTERFACE(1) - it is the correct
+   thing for a multi-TT hub and matches Linux; just not sufficient.)
+2. **DESCRIPTOR DMA - now the top structural suspect.** We use BUFFER DMA. Hypothesis: the v2.80a's
+   buffer-DMA split path is broken/insufficient and it needs **descriptor DMA** (`HCFG.DescDMA`, a
+   linked-list of `dwc2_dma_desc` per channel) for splits - which Linux may enable on the bcm2835. If so,
+   NO amount of buffer-DMA register tweaking will ACK the SSPLIT. This is a large change (a different DMA
+   model) and unverifiable without HW, but it is the single most plausible thing left: it would explain a
+   config-perfect SSPLIT that transmits yet is never accepted, and why Linux (possibly desc-DMA) works.
+   Verify first whether Linux enables `dma_desc` for the Pi, and whether the core's `hw_params` advertises
+   descriptor-DMA support.
+3. **HCSPLT write ORDER - MATCHED (@ 4494b52), no change.** Now HCTSIZ -> HCSPLT -> HCCHAR like Linux.
+4. **v2.80a split errata / the ACTUAL Linux C** (WebFetch summaries are exhausted; the remaining answer,
+   if it is not desc-DMA, needs the real source read line-by-line for a 2.80a `dwc2` quirk or a subtle
+   channel-start precondition), and **HW-level analysis** - a USB bus analyzer to see whether the LAN9514
+   receives a malformed SSPLIT (core bug) or a valid one it NAK/ignores (still a config/protocol gap).
+
+**Bottom line:** every software-testable register/protocol hypothesis is eliminated. The split is now
+either a **buffer-vs-descriptor DMA** structural issue (top lead #2) or a **v2.80a/LAN9514 quirk** that
+needs bus-level visibility. Not another black-box register tweak.
 
 **Instrumentation in place** (nothing to rebuild for the next test): `split_txn` trace (phase / HFNUM
 issue.uframe -> halt.uframe / HCINT / GNPTXSTS / GINTSTS) + `wait_for_uframe` microframe placement + the
