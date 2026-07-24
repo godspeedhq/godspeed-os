@@ -13,6 +13,29 @@ comment.
 
 ---
 
+## 2026-07-24 - DWC2 split debug + VideoCore USB power-on + board MAC (feat/pi2-arm32)
+
+Two `arch/arm/` files gained `unsafe` this session; all blocks are in the permitted arch layer (§18.1),
+each carries a `// SAFETY:` comment, and each is single-threaded (core-0-only) hardware access.
+
+- **`dwc2.rs` 13 -> 15 (+2):** the split-transaction microframe **trace** added while diagnosing the
+  low-speed-keyboard split XactErr. `trace_split` captures `(phase, HFNUM, HCINT, GNPTXSTS, GINTSTS)` into
+  a fixed `SPLIT_TRACE` array (write), and the one-shot split-fail dump reads it back (read). Both are a
+  bounded fixed array indexed `< SPLIT_TRACE_MAX`, single-writer on core 0. (The HubAddr/PrtAddr fix, the
+  multi-packet split loop, the toggle-parity fix, and the driver-review fixes are all **safe** code -
+  `rd`/`wr`/atomics - and added no `unsafe`.)
+- **`video.rs` 6 -> 11 (+5):** `set_usb_power_on` (the VideoCore `SET_POWER_STATE` mailbox call that
+  powers the DWC2 AXI master - the breakthrough that made USB work on real silicon) is one MBOX-fill
+  block; `read_board_mac` is three (MBOX fill, MBOX response read, and the `BOARD_MAC` static **write** -
+  a plain pre-MMU store, NOT an atomic, because ARMv7 `STREXD` is UNPREDICTABLE before the MMU is on);
+  `board_mac` is one (the `BOARD_MAC` static read). These read the board Ethernet MAC (`GET_BOARD_MAC`,
+  tag 0x00010003) since the Pi 2 has no EEPROM.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/dwc2.rs` | 13 -> 15 (+2) | `SPLIT_TRACE` fixed-array capture (`trace_split` write + split-fail dump read) for the low-speed-keyboard split diagnosis. |
+| `arch/arm/video.rs` | 6 -> 11 (+5) | `set_usb_power_on` (USB-HCD power mailbox, +1); `read_board_mac` (MBOX fill + read + `BOARD_MAC` pre-MMU store, +3); `board_mac` (`BOARD_MAC` read, +1). |
+
 ## 2026-07-23 - BCM2835 GPIO (feat/pi2-arm32)
 
 Added `gpio_op(op, pin)` - drive a SoC GPIO pin's direction/level/read (BCM2835 GPFSEL/GPSET/GPCLR/GPLEV in
@@ -945,9 +968,9 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/irq.rs | 11 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 8 | permitted |
-| arch/arm/video.rs | 6 | permitted |
+| arch/arm/video.rs | 11 | permitted |
 | arch/arm/fbcon.rs | 4 | permitted |
-| arch/arm/dwc2.rs | 13 | permitted |
+| arch/arm/dwc2.rs | 15 | permitted |
 | arch/arm/page_tables.rs | 27 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |
