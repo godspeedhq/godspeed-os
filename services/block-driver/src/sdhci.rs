@@ -40,6 +40,10 @@ const INT_DATA_DONE: u32 = 1 << 1; // transfer complete
 const INT_WRITE_RDY: u32 = 1 << 4;
 const INT_READ_RDY: u32 = 1 << 5;
 const INT_ERR: u32 = 0x017E_8000;
+/// Command Timeout Error (SDHCI Error Interrupt Status bit 0, i.e. bit 16 of the combined register):
+/// the card did not respond to the command at all. Deliberately NOT part of `INT_ERR` above, which
+/// follows the reference driver's mask, so it is tested explicitly where a non-response must be seen.
+const INT_CMD_TIMEOUT: u32 = 0x0001_0000;
 // CONTROL1 bits.
 const C1_CLK_INTLEN: u32 = 1 << 0;
 const C1_CLK_STABLE: u32 = 1 << 1;
@@ -96,7 +100,11 @@ impl<'a> Sd<'a> {
         loop {
             let i = self.rd(INTERRUPT);
             if i & INT_CMD_DONE != 0 { break; }
-            if i & INT_ERR != 0 { self.reset_cmd_dat(); return None; }
+            // A command TIMEOUT (the card did not respond at all) is bit 16, which INT_ERR deliberately
+            // excludes - so without this the commonest real-hardware failure looked like "nothing
+            // happened" and we spun out the full bounded wait with INTERRUPT reading 0. Treat it as the
+            // error it is: reset the line so the next command is not left inhibited, and report.
+            if i & (INT_ERR | INT_CMD_TIMEOUT) != 0 { self.reset_cmd_dat(); return None; }
             t += 1;
             if t > 2_000_000 { return None; }
         }
@@ -117,9 +125,17 @@ impl<'a> Sd<'a> {
         self.wr(INTERRUPT, self.rd(INTERRUPT)); // clear latched error/status bits
     }
 
-    fn acmd(&self, code: u32, arg: u32) -> Option<u32> {
+    /// An application command: CMD55 (APP_CMD) then the ACMD itself. `ctx` is only for reporting WHICH
+    /// of the two failed - "ACMD41 failed" alone cannot distinguish "the card ignored CMD55" (the card is
+    /// not listening at all) from "the card took CMD55 but refused the ACMD" (it is listening but
+    /// rejecting our arguments), and those lead to completely different fixes.
+    fn acmd(&self, code: u32, arg: u32, ctx: &ServiceContext) -> Option<u32> {
         let app = if self.rca != 0 { CMD_APP_CMD | 0x0002_0000 } else { CMD_APP_CMD };
-        self.cmd(app, self.rca)?;
+        if self.cmd(app, self.rca).is_none() {
+            ctx.log_fmt(format_args!("block-driver: CMD55 (APP_CMD, rca={:#010x}) failed - STATUS={:#010x} INT={:#010x}",
+                                     self.rca, self.rd(STATUS), self.rd(INTERRUPT)));
+            return None;
+        }
         self.cmd(code, arg)
     }
 
@@ -223,15 +239,27 @@ impl<'a> Sd<'a> {
                                      self.rd(STATUS), self.rd(INTERRUPT)));
             return false;
         }
-        if self.cmd(CMD_SEND_IF_COND, 0x0000_01AA).is_none() {
-            ctx.log_fmt(format_args!("block-driver: CMD8 (SEND_IF_COND) failed - STATUS={:#010x} INT={:#010x}",
-                                     self.rd(STATUS), self.rd(INTERRUPT)));
-            return false;
-        }
+        // CMD8 also tells us the card ACCEPTED our voltage and echoed the check pattern: the response
+        // must echo 0x1AA. A card that answers but echoes something else is not talking to us properly,
+        // which is worth seeing rather than assuming.
+        let ifcond = match self.cmd(CMD_SEND_IF_COND, 0x0000_01AA) {
+            Some(v) => v,
+            None => {
+                ctx.log_fmt(format_args!("block-driver: CMD8 (SEND_IF_COND) failed - STATUS={:#010x} INT={:#010x}",
+                                         self.rd(STATUS), self.rd(INTERRUPT)));
+                return false;
+            }
+        };
+        ctx.log_fmt(format_args!("block-driver: CMD8 echo={:#010x} (want 0x000001aa)", ifcond));
         let mut ocr = 0u32;
         let mut tries = 0u32;
         loop {
-            ocr = match self.acmd(CMD_SEND_OP_COND, 0x51FF_8000) {
+            // ACMD41 argument: HCS (bit30, we support high-capacity) | XPC (bit28, max performance) |
+            // the 3.2-3.4 V OCR window. Deliberately NOT S18R (bit24): that requests 1.8 V signalling,
+            // and we never perform the CMD11 voltage switch that must follow it - asking for a switch we
+            // cannot complete is a way to leave a real card unresponsive, and it is invisible under
+            // emulation where the negotiation is not modelled.
+            ocr = match self.acmd(CMD_SEND_OP_COND, 0x50FF_8000, ctx) {
                 Some(v) => v,
                 None => {
                     ctx.log_fmt(format_args!("block-driver: ACMD41 failed - STATUS={:#010x} INT={:#010x}",
