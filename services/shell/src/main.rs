@@ -9778,11 +9778,20 @@ fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) -> Result<(), Sh
         ""        => drives_list(ctx),
         "flash"   => {
             // `drives flash [drive] [label] [force]` - the drive selector is optional (one drive).
-            // A trailing `force` overrides fs's refusal to overwrite a foreign/bootable disk. It is a
-            // word the operator has to type; there is no default that destroys a boot medium.
-            let force = argc >= 3 && args[argc - 1] == "force";
-            let eff = if force { argc - 1 } else { argc };
-            let (sel, label) = split_drive_value(args, eff);
+            // `force` overrides fs's refusal to overwrite a foreign/bootable disk. It is a word the
+            // operator has to type; there is no default that destroys a boot medium. Recognised
+            // ANYWHERE after the subcommand, not just last: `drives flash 0 data force` has to work as
+            // well as `drives flash data force`, and requiring a fixed position silently dropped the
+            // override in the selector form - which then refused a disk the operator had just forced.
+            let force = args[2..argc].iter().any(|a| *a == "force");
+            let mut kept = [""; MAX_ARGS];
+            let mut n = 0usize;
+            for a in args[..argc].iter() {
+                if *a == "force" { continue; }
+                kept[n] = a;
+                n += 1;
+            }
+            let (sel, label) = split_drive_value(&kept, n);
             if drive_sel_ok(ctx, sel) { drives_flash(ctx, label, force) } else { Err(ShellError::Unknown) }
         }
         "label"   => {
@@ -9793,8 +9802,9 @@ fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) -> Result<(), Sh
         }
         "reset"   => {
             // `drives reset [drive] [force]` - un-format back to raw (optional selector, no value).
-            let force = argc >= 3 && args[argc - 1] == "force";
-            let sel = if argc >= 3 && !(force && argc == 3) { args[2] } else { "" };
+            // `force` is recognised anywhere after the subcommand, as for `flash`.
+            let force = args[2..argc].iter().any(|a| *a == "force");
+            let sel = if argc >= 3 && args[2] != "force" { args[2] } else { "" };
             if drive_sel_ok(ctx, sel) { drives_reset(ctx, force) } else { Err(ShellError::Unknown) }
         }
         "check"   => {

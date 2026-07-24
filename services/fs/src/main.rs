@@ -767,8 +767,14 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         return;
     }
 
+    // Bit 7 of the op byte is the destructive-override flag (`force`), not part of the opcode - so
+    // dispatch on the opcode with it masked off. Matching the RAW byte meant a forced flash (op | 0x80)
+    // matched no arm at all and fell through to a generic error, so the format never ran and the shell
+    // reported "flash FAILED (no disk, or disk too small)" on a perfectly good 15 GB disk. Every opcode
+    // is <= 30, so bit 7 is free for this.
+    let forced = p[0] & 0x80 != 0;
     // drives API - INFO/FLASH work on a raw disk; LABEL/RESET as below.
-    match p[0] {
+    match p[0] & 0x7F {
         OP_DRIVES_INFO => {
             // [FS_OK, mounted, capacity:u64, used:u64, flags:u8, label_len:u8, label…]
             let mut out = [0u8; 28 + LABEL_MAX];
@@ -794,7 +800,6 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
             // Refuse to overwrite someone else's disk unless the caller explicitly forced it. On a
             // single-storage board (the Pi) this disk is also the boot medium - see `foreign_disk`.
             // The force flag rides in the op byte's high bit so the wire format is unchanged.
-            let forced = p[0] & 0x80 != 0;
             if !forced {
                 if let Some(b0) = block_read(ctx, 0) {
                     if let Some(what) = foreign_disk(&b0) {
@@ -811,7 +816,14 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
             let label = if p.len() >= 2 + ll { &p[2..2 + ll] } else { &[][..] };
             match Fs::format(ctx, capacity, label) {
                 Ok(f) => { *vol = Some(f); send(&[FS_OK]); }
-                Err(_) => send(&[FS_ERR]),
+                Err(why) => {
+                    // `format` names the exact step that failed ("backup superblock write failed",
+                    // "bitmap init failed", ...). Discarding it left the operator with the shell's
+                    // generic "flash FAILED (no disk, or disk too small)" - which on a 15 GB disk is
+                    // actively misleading. Report the reason (§26.7: a failure is never swallowed).
+                    ctx.log_fmt(format_args!("fs: format FAILED - {} (capacity {} sectors)", why, capacity));
+                    send(&[FS_ERR]);
+                }
             }
             return;
         }
@@ -839,7 +851,6 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
             else {
                 // Same protection as OP_FLASH: reset zeroes block 0, which on a foreign disk is the
                 // partition table / boot sector. Refuse unless explicitly forced.
-                let forced = p[0] & 0x80 != 0;
                 if let Some(b0) = if forced { None } else { block_read(ctx, 0) } {
                     if let Some(what) = foreign_disk(&b0) {
                         ctx.log_fmt(format_args!(
