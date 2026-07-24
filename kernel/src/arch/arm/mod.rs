@@ -451,8 +451,14 @@ pub(super) fn pl011_write(s: &[u8]) {
     for &b in s {
         pl011_write_byte(b);
     }
-    fbcon::put_bytes(s); // mirror to the TV under the same guard (serialized across cores)
+    // Mirror to the TV ONLY as the lock HOLDER. fbcon has shared cursor/scroll state (FBCON.col/row) and
+    // assumes a single writer at a time; a contended writer that could NOT claim SERIAL_BUSY (another core
+    // logging, or an ISR preempting the holder mid-render) must not also render, or two writers corrupt
+    // fbcon's position and the TV shows garbled/overlapping text. The contended write's bytes still went to
+    // serial above (the source of truth); only its TV mirror is dropped, which is invisible in practice
+    // because the dominant console writer (the shell) holds the lock for its own output.
     if held {
+        fbcon::put_bytes(s);
         SERIAL_BUSY.store(false, Ordering::Release);
     }
 }
