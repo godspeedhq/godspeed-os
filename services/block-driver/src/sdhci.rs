@@ -63,7 +63,14 @@ const CMD_CARD_SELECT: u32 = 0x0703_0000; // CMD7, 48-bit-busy
 const CMD_SEND_IF_COND: u32 = 0x0802_0000; // CMD8
 const CMD_READ_SINGLE: u32 = 0x1122_0010; // CMD17, 48-bit + data + read
 const CMD_WRITE_SINGLE: u32 = 0x1822_0000; // CMD24, 48-bit + data + write
-const CMD_APP_CMD: u32 = 0x3700_0000; // CMD55
+/// CMD55 (APP_CMD). **RSPNS_TYPE = 2 (48-bit), always** - CMD55 always answers R1. Declaring "no
+/// response" here (RSPNS_TYPE 0, which this was) makes the controller stop driving/sampling CMD while
+/// the card replies anyway, and the resulting **CMD line conflict** is reported on the transaction as
+/// Command Timeout + Command CRC together (INT bits 16|17, the SDHCI spec's signature for a conflict).
+/// That is precisely how ACMD41 failed on real hardware - CMD55 "succeeded" because a no-response
+/// command completes as soon as it is sent, and the conflict it left behind killed the command after it.
+/// QEMU models no line conflict, so it never noticed.
+const CMD_APP_CMD: u32 = 0x3702_0000; // CMD55, R1 (48-bit)
 const CMD_SEND_OP_COND: u32 = 0x2902_0000; // ACMD41
 
 fn spin() {
@@ -119,6 +126,11 @@ impl<'a> Sd<'a> {
             if t > 2_000_000 { self.last_int.set(self.rd(INTERRUPT)); return None; }
         }
         self.wr(INTERRUPT, INT_CMD_DONE);
+        // Ncc: the SD spec requires at least 8 card-clock cycles between the end of one command and the
+        // start of the next. At the 400 kHz identification clock that is 20 us; issuing back-to-back can
+        // catch the card still driving CMD, which the controller reports as a line conflict. A handful of
+        // spins comfortably covers it and costs nothing next to a real transfer.
+        for _ in 0..10 { spin(); }
         Some(self.rd(RESP0))
     }
 
@@ -140,8 +152,10 @@ impl<'a> Sd<'a> {
     /// not listening at all) from "the card took CMD55 but refused the ACMD" (it is listening but
     /// rejecting our arguments), and those lead to completely different fixes.
     fn acmd(&self, code: u32, arg: u32, ctx: &ServiceContext) -> Option<u32> {
-        let app = if self.rca != 0 { CMD_APP_CMD | 0x0002_0000 } else { CMD_APP_CMD };
-        if self.cmd(app, self.rca).is_none() {
+        // The response type is part of CMD_APP_CMD itself and does not depend on the card's state - the
+        // old conditional added the 48-bit response type only when `rca != 0`, i.e. exactly NOT during
+        // identification, which is when ACMD41 runs. CMD55's argument is the RCA (0 while identifying).
+        if self.cmd(CMD_APP_CMD, self.rca).is_none() {
             ctx.log_fmt(format_args!("block-driver: CMD55 (APP_CMD, rca={:#010x}) failed - STATUS={:#010x} INT={:#010x}",
                                      self.rca, self.rd(STATUS), self.last_int.get()));
             return None;
