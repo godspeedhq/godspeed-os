@@ -44,27 +44,12 @@ struct Fbcon {
     cur_col: usize,
     cur_row: usize,
     cursor_on: bool,     // is the underline currently painted at (cur_col, cur_row)?
-    scale: usize,        // glyph magnification (see `cell_scale`) - 1 cell = CELL_W*scale x CELL_H*scale
-}
-
-/// Glyph magnification for this display, using the SAME formula as the x86 console
-/// (`arch/x86_64/fb.rs::cell_scale`) so both render text at the same physical size: one step per
-/// ~600 px of height, capped at 3. A 1080p TV - what the Pi drives - gets 2x; the unscaled 20 px
-/// raster is half-size on a panel that big, which is exactly how the ARM console looked next to x86.
-fn cell_scale(height: usize) -> usize {
-    ((height + 300) / 600).clamp(1, 3)
 }
 static mut FBCON: Fbcon = Fbcon {
     base: 0, pitch: 0, width: 0, height: 0, org_x: 0, org_y: 0, cols: 0, rows: 0, col: 0, row: 0,
     ansi: 0, csi_param: 0, csi_private: false,
-    cursor_visible: true, cur_col: 0, cur_row: 0, cursor_on: false, scale: 1,
+    cursor_visible: true, cur_col: 0, cur_row: 0, cursor_on: false,
 };
-
-/// Scaled cell width / height in pixels (the glyph raster times the display's magnification).
-#[inline]
-fn cw(c: &Fbcon) -> usize { CELL_W * c.scale }
-#[inline]
-fn ch(c: &Fbcon) -> usize { CELL_H * c.scale }
 static READY: AtomicBool = AtomicBool::new(false);
 
 /// True once `init` has set up the console; `pl011_write` mirrors to the framebuffer only after this.
@@ -81,11 +66,10 @@ pub fn init(base: u32, pitch: u32, width: u32, height: u32) {
         c.height = height as usize;
         // Inset a ~5% margin so text lands inside the TV's overscan-cropped visible area (an HDMI TV
         // typically drops the outer edge). The text grid is sized to the safe area, not the full panel.
-        c.scale = cell_scale(c.height);
         c.org_x = c.width / 20;
         c.org_y = c.height / 20;
-        c.cols = (c.width - 2 * c.org_x) / (CELL_W * c.scale);
-        c.rows = (c.height - 2 * c.org_y) / (CELL_H * c.scale);
+        c.cols = (c.width - 2 * c.org_x) / CELL_W;
+        c.rows = (c.height - 2 * c.org_y) / CELL_H;
         c.col = 0;
         c.row = 0;
         c.ansi = 0;
@@ -144,37 +128,28 @@ fn blend(intensity: u8) -> u32 {
     r | (g << 8) | (b << 16)
 }
 
-fn draw_glyph(c: &Fbcon, glyph: u8, col: usize, row: usize) {
-    let s = c.scale;
-    let (cellw, cellh) = (cw(c), ch(c));
-    let x0 = c.org_x + col * cellw;
-    let y0 = c.org_y + row * cellh;
-    match get_raster(glyph as char, FONT_WEIGHT, RASTER_HEIGHT) {
+fn draw_glyph(c: &Fbcon, ch: u8, col: usize, row: usize) {
+    let x0 = c.org_x + col * CELL_W;
+    let y0 = c.org_y + row * CELL_H;
+    match get_raster(ch as char, FONT_WEIGHT, RASTER_HEIGHT) {
         Some(rc) => {
-            // Each raster pixel becomes an s x s block - nearest-neighbour magnification, which keeps the
-            // antialiased edges the font already carries without needing a second raster size.
             for (gy, rowpix) in rc.raster().iter().enumerate() {
                 for (gx, &intensity) in rowpix.iter().enumerate() {
-                    let colour = blend(intensity);
-                    for dy in 0..s {
-                        for dx in 0..s {
-                            put_pixel(c, x0 + gx * s + dx, y0 + gy * s + dy, colour);
-                        }
-                    }
+                    put_pixel(c, x0 + gx, y0 + gy, blend(intensity));
                 }
             }
         }
         None => {
             // Unknown glyph: leave a blank (repaint the cell background, no stale pixels).
-            for gy in 0..cellh {
-                for gx in 0..cellw {
+            for gy in 0..CELL_H {
+                for gx in 0..CELL_W {
                     put_pixel(c, x0 + gx, y0 + gy, BG);
                 }
             }
         }
     }
     // Publish this glyph cell to the GPU.
-    clean_rect(c, x0, y0, cellw, cellh);
+    clean_rect(c, x0, y0, CELL_W, CELL_H);
 }
 
 /// Scroll the framebuffer up by one text row: move the pixel rows below the top cell-row up over it,
@@ -183,27 +158,26 @@ fn draw_glyph(c: &Fbcon, glyph: u8, col: usize, row: usize) {
 /// forced. The shifted region is then published to the GPU by one `clean_rect` over the text area. This
 /// replaces the old clear-and-home so the screen never blanks - the flicker seen on the TV under output.
 fn scroll(c: &Fbcon) {
-    let cellh = ch(c);
-    let row_bytes = c.cols * cw(c) * 4; // one text row, inset width
+    let row_bytes = c.cols * CELL_W * 4; // one text row, inset width
     // SAFETY: every source/destination row is inside the mapped framebuffer's text region (cacheable
     // RAM), so the byte memmove is valid; margins stay fixed (only the inset region moves).
     unsafe {
         // Shift the text region up by one cell row, row by row (strided - margins untouched).
-        for gy in 0..((c.rows - 1) * cellh) {
+        for gy in 0..((c.rows - 1) * CELL_H) {
             let dst = (c.base + (c.org_y + gy) * c.pitch + c.org_x * 4) as *mut u8;
-            let src = (c.base + (c.org_y + gy + cellh) * c.pitch + c.org_x * 4) as *const u8;
+            let src = (c.base + (c.org_y + gy + CELL_H) * c.pitch + c.org_x * 4) as *const u8;
             core::ptr::copy(src, dst, row_bytes);
         }
         // Clear the freed bottom text row to BG.
-        for gy in ((c.rows - 1) * cellh)..(c.rows * cellh) {
+        for gy in ((c.rows - 1) * CELL_H)..(c.rows * CELL_H) {
             let row = (c.base + (c.org_y + gy) * c.pitch + c.org_x * 4) as *mut u32;
-            for i in 0..(c.cols * cw(c)) {
+            for i in 0..(c.cols * CELL_W) {
                 row.add(i).write_volatile(BG);
             }
         }
     }
     // Publish the whole shifted inset text region to the GPU in one pass.
-    clean_rect(c, c.org_x, c.org_y, c.cols * cw(c), c.rows * cellh);
+    clean_rect(c, c.org_x, c.org_y, c.cols * CELL_W, c.rows * CELL_H);
 }
 
 /// Height of the underline cursor, in pixels at the bottom of the cell.
@@ -220,15 +194,15 @@ const CURSOR_H: usize = 2;
 /// artifact is not worth the memory or the code here.
 fn paint_cursor(c: &Fbcon, on: bool) {
     if c.cur_row >= c.rows || c.cur_col >= c.cols { return; }
-    let x0 = c.org_x + c.cur_col * cw(c);
-    let y0 = c.org_y + c.cur_row * ch(c) + ch(c) - CURSOR_H;
+    let x0 = c.org_x + c.cur_col * CELL_W;
+    let y0 = c.org_y + c.cur_row * CELL_H + CELL_H - CURSOR_H;
     let colour = if on { blend(255) } else { BG };
     for gy in 0..CURSOR_H {
-        for gx in 0..cw(c) {
+        for gx in 0..CELL_W {
             put_pixel(c, x0 + gx, y0 + gy, colour);
         }
     }
-    clean_rect(c, x0, y0, cw(c), CURSOR_H);
+    clean_rect(c, x0, y0, CELL_W, CURSOR_H);
 }
 
 /// Lift the cursor if it is currently painted (called before anything moves the write position).
@@ -252,15 +226,15 @@ fn cursor_show(c: &mut Fbcon) {
 /// line editor emits this after each echoed character to wipe any leftover tail.
 fn erase_to_eol(c: &Fbcon) {
     if c.row >= c.rows || c.col >= c.cols { return; }
-    let x0 = c.org_x + c.col * cw(c);
-    let y0 = c.org_y + c.row * ch(c);
-    let w = (c.cols - c.col) * cw(c);
-    for gy in 0..ch(c) {
+    let x0 = c.org_x + c.col * CELL_W;
+    let y0 = c.org_y + c.row * CELL_H;
+    let w = (c.cols - c.col) * CELL_W;
+    for gy in 0..CELL_H {
         for gx in 0..w {
             put_pixel(c, x0 + gx, y0 + gy, BG);
         }
     }
-    clean_rect(c, x0, y0, w, ch(c));
+    clean_rect(c, x0, y0, w, CELL_H);
 }
 
 /// Render one byte into the console state. Consumes ANSI CSI escape sequences (so they are acted on,
