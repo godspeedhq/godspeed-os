@@ -18,7 +18,7 @@
 //! reached only after enumerating that hub (a later increment). Under QEMU (`-M raspi2b,usb=on -device
 //! usb-kbd`) the keyboard attaches to the root port directly, which is what this increment detects.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
 use super::pl011_write;
 use super::exceptions::write_hex32;
@@ -392,7 +392,11 @@ const HCINT_CHHLTD:    u32 = 1 << 1;
 
 static LOW_SPEED: AtomicBool = AtomicBool::new(false); // attached device is low-speed
 static DEV_ADDR:  AtomicU8   = AtomicU8::new(0);       // 0 until SET_ADDRESS assigns 1
-static MPS0:      AtomicU8   = AtomicU8::new(8);       // EP0 max packet size (8 until GET_DESCRIPTOR)
+// Max packet size of the CURRENTLY SELECTED endpoint. **u16, not u8**: a high-speed bulk endpoint is
+// 512 bytes, which a u8 cannot represent at all - and `wMaxPacketSize` is a 16-bit descriptor field
+// whose LOW byte is 0 for exactly that size, so a byte-wide parse silently read 512 as "0" and fell
+// back to 64. That mismatch is invisible for short replies and breaks every full-size transfer.
+static MPS0:      AtomicU16  = AtomicU16::new(8);      // EP0 max packet size (8 until GET_DESCRIPTOR)
 
 // --- boot-keyboard poll state (set once enumeration finds a keyboard behind the hub) ---
 static KBD_READY:  AtomicBool = AtomicBool::new(false); // a boot keyboard is configured + pollable
@@ -412,9 +416,9 @@ static SPLIT_PORT: AtomicU8 = AtomicU8::new(0);
 /// Point channel 0 at a specific device before a transaction. With more than one device behind the hub
 /// (a keyboard AND the ethernet), the single host channel is time-shared: each transfer path selects its
 /// device's address / EP0-or-endpoint max-packet / speed into the globals `chan_program` reads.
-fn select_device(addr: u8, mps: u8, low: bool) {
+fn select_device(addr: u8, mps: u16, low: bool) {
     DEV_ADDR.store(addr, Ordering::Relaxed);
-    MPS0.store(mps, Ordering::Relaxed);
+    MPS0.store(mps as u16, Ordering::Relaxed);
     LOW_SPEED.store(low, Ordering::Relaxed);
     SPLIT_PORT.store(0, Ordering::Relaxed);                     // direct by default; split set explicitly after
 }
@@ -890,7 +894,7 @@ fn enumerate_sync() {
     if !get_descriptor(0x80, 0x01, 0x00, 0, &mut buf, 8) {
         pl011_write(b"dwc2: GET_DESC(8) failed - USB unavailable\r\n"); return;
     }
-    let mps = if buf[7] == 0 { 8 } else { buf[7] };
+    let mps = if buf[7] == 0 { 8u16 } else { buf[7] as u16 };
     MPS0.store(mps, Ordering::Relaxed);
     pl011_write(b"dwc2: desc8 mps0="); write_hex32(mps as u32); pl011_write(b"\r\n");
 
@@ -1013,7 +1017,7 @@ fn enumerate_downstream(low: bool, addr: u8, split_port: u8) -> bool {
     if !get_descriptor(0x80, 0x01, 0x00, 0, &mut buf, 8) {
         pl011_write(b"dwc2: downstream desc8 failed\r\n"); return false;
     }
-    MPS0.store(if buf[7] == 0 { 8 } else { buf[7] }, Ordering::Relaxed);
+    MPS0.store(if buf[7] == 0 { 8 } else { buf[7] as u16 }, Ordering::Relaxed);
 
     if !control_out(0x00, 0x05, addr as u16, 0) { pl011_write(b"dwc2: downstream SET_ADDRESS failed\r\n"); return false; }
     DEV_ADDR.store(addr, Ordering::Relaxed);
@@ -1108,7 +1112,7 @@ fn configure_cdc_ecm(nconfigs: u8) -> bool {
         let mut data_alt = 0u8;
         let mut ep_in = 0u8;
         let mut ep_out = 0u8;
-        let mut bulk_mps = 64u8;
+        let mut bulk_mps = 64u16;
         while i + 2 <= total {
             let blen = cfg[i] as usize;
             let bt = cfg[i + 1];
@@ -1121,7 +1125,8 @@ fn configure_cdc_ecm(nconfigs: u8) -> bool {
             } else if bt == 0x24 && i + 4 <= total && cfg[i + 2] == 0x0F {
                 imac = cfg[i + 3];                                     // ECM functional: iMACAddress index
             } else if bt == 0x05 && cur_is_data && i + 7 <= total && cfg[i + 3] & 0x03 == 0x02 {
-                bulk_mps = if cfg[i + 4] == 0 { 64 } else { cfg[i + 4] };
+                let raw = (cfg[i + 4] as u16) | ((cfg[i + 5] as u16) << 8);
+                bulk_mps = match raw & 0x07FF { 0 => 64, v => v }; // [10:0] = size; [12:11] = HS mult
                 data_iface = cur_iface;
                 data_alt = cur_alt;                                    // the alt setting that carries the bulk eps
                 if cfg[i + 2] & 0x80 != 0 { ep_in = cfg[i + 2] & 0x0F; } else { ep_out = cfg[i + 2] & 0x0F; }
@@ -1239,12 +1244,13 @@ fn configure_smsc95xx() -> bool {
     let mut i = 0usize;
     let mut ep_in = 0u8;
     let mut ep_out = 0u8;
-    let mut bulk_mps = 64u8;
+    let mut bulk_mps = 64u16;
     while i + 2 <= total {
         let blen = cfg[i] as usize;
         if blen == 0 { break; }
         if cfg[i + 1] == 0x05 && i + 7 <= total && cfg[i + 3] & 0x03 == 0x02 {   // bulk endpoint
-            bulk_mps = if cfg[i + 4] == 0 { 64 } else { cfg[i + 4] };
+            let raw = (cfg[i + 4] as u16) | ((cfg[i + 5] as u16) << 8);
+            bulk_mps = match raw & 0x07FF { 0 => 64, v => v }; // [10:0] = size; [12:11] = HS mult
             if cfg[i + 2] & 0x80 != 0 { ep_in = cfg[i + 2] & 0x0F; } else { ep_out = cfg[i + 2] & 0x0F; }
         }
         i += blen;
@@ -1423,7 +1429,7 @@ fn configure_keyboard() -> bool {
     let mut in_kbd_iface = false;
     let mut found_kbd = false;
     let mut ep = 0u8;
-    let mut ep_mps = 8u8;
+    let mut ep_mps = 8u16;
     while i + 2 <= total {
         let blen = cfg[i] as usize;
         let btype = cfg[i + 1];
@@ -1437,7 +1443,8 @@ fn configure_keyboard() -> bool {
             let attr = cfg[i + 3];
             if addr & 0x80 != 0 && attr & 0x03 == 0x03 {           // IN + interrupt
                 ep = addr & 0x0F;
-                ep_mps = if cfg[i + 4] == 0 { 8 } else { cfg[i + 4] };
+                let raw = (cfg[i + 4] as u16) | ((cfg[i + 5] as u16) << 8);
+                ep_mps = match raw & 0x07FF { 0 => 8, v => v };
             }
         }
         i += blen;
@@ -1451,7 +1458,7 @@ fn configure_keyboard() -> bool {
 
     KBD_ADDR.store(DEV_ADDR.load(Ordering::Relaxed), Ordering::Relaxed);
     KBD_EP.store(ep, Ordering::Relaxed);
-    KBD_MPS.store(ep_mps, Ordering::Relaxed);                      // interrupt-endpoint packet size for the poll
+    KBD_MPS.store(ep_mps.min(255) as u8, Ordering::Relaxed);                      // interrupt-endpoint packet size for the poll
     KBD_LOW.store(LOW_SPEED.load(Ordering::Relaxed), Ordering::Relaxed);
     KBD_HUB_PORT.store(SPLIT_PORT.load(Ordering::Relaxed), Ordering::Relaxed); // remember the split path for poll()
     KBD_TOGGLE.store(false, Ordering::Relaxed);
@@ -1468,7 +1475,7 @@ static BULK_TOGGLE_OUT: AtomicBool = AtomicBool::new(false);
 /// (split path) or the HCTSIZ.PID readback (direct path). bulk_xfer stores this into the endpoint toggle so
 /// an even-packet-count transfer does not desync - a blind flip is only correct for odd packet counts.
 static NEXT_BULK_PID_DATA1: AtomicBool = AtomicBool::new(false);
-static BULK_MPS:        AtomicU8   = AtomicU8::new(64);   // bulk endpoint max-packet (set at config time)
+static BULK_MPS:        AtomicU16  = AtomicU16::new(64);  // bulk endpoint max-packet (set at config time)
 
 /// One bulk transfer on endpoint `ep`, through the `DMA.data` buffer, with cache maintenance for the A7's
 /// non-coherent DMA. Uses the bulk endpoint's max-packet (`BULK_MPS`) for the packet count and maintains
@@ -1564,7 +1571,7 @@ fn probe_mass_storage() -> bool {
     let mut is_ms = false;
     let mut ep_in = 0u8;
     let mut ep_out = 0u8;
-    let mut bulk_mps = 64u8;
+    let mut bulk_mps = 64u16;
     while i + 2 <= total {
         let blen = cfg[i] as usize;
         let btype = cfg[i + 1];
@@ -1575,7 +1582,8 @@ fn probe_mass_storage() -> bool {
         } else if btype == 0x05 && in_ms && i + 7 <= total {       // endpoint descriptor
             let addr = cfg[i + 2];
             if cfg[i + 3] & 0x03 == 0x02 {                         // bulk
-                bulk_mps = if cfg[i + 4] == 0 { 64 } else { cfg[i + 4] };
+                let raw = (cfg[i + 4] as u16) | ((cfg[i + 5] as u16) << 8);
+                bulk_mps = match raw & 0x07FF { 0 => 64, v => v }; // [10:0] = size; [12:11] = HS mult
                 if addr & 0x80 != 0 { ep_in = addr & 0x0F; } else { ep_out = addr & 0x0F; }
             }
         }
@@ -1655,7 +1663,7 @@ static MSC_READY:   AtomicBool = AtomicBool::new(false);
 static MSC_ADDR:    AtomicU8   = AtomicU8::new(0);   // the device's USB address
 static MSC_EP_IN:   AtomicU8   = AtomicU8::new(0);   // bulk IN endpoint
 static MSC_EP_OUT:  AtomicU8   = AtomicU8::new(0);   // bulk OUT endpoint
-static MSC_MPS:     AtomicU8   = AtomicU8::new(64);  // bulk max packet size
+static MSC_MPS:     AtomicU16  = AtomicU16::new(64); // bulk max packet size
 static MSC_SECTORS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
 /// Capacity of the attached USB mass-storage device in 512-byte sectors (0 = none attached).
@@ -1716,7 +1724,7 @@ static mut KBD_STATE: KbdState =
 pub fn poll() {
     if !KBD_READY.load(Ordering::Acquire) { return; }
     // Point the shared channel at the keyboard (the net device may have selected itself last).
-    select_device(KBD_ADDR.load(Ordering::Relaxed), KBD_MPS.load(Ordering::Relaxed),
+    select_device(KBD_ADDR.load(Ordering::Relaxed), KBD_MPS.load(Ordering::Relaxed) as u16,
                   KBD_LOW.load(Ordering::Relaxed));
     // A low/full-speed keyboard behind the high-speed hub is reached only via SPLIT (like enumeration).
     SPLIT_PORT.store(KBD_HUB_PORT.load(Ordering::Relaxed), Ordering::Relaxed);
