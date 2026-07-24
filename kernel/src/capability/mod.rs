@@ -92,6 +92,13 @@ pub const NET_DEVICE_RESOURCE: ResourceId = ResourceId(10);
 /// A no-op off ARM. Like REBOOT/NET_DEVICE, it is explicit authority, never ambient.
 pub const GPIO_DEVICE_RESOURCE: ResourceId = ResourceId(11);
 
+/// Authority to read and write blocks on the in-kernel USB mass-storage device (the ARM DWC2 Bulk-Only
+/// bridge: `UsbDiskInfo`/`UsbDiskRead`/`UsbDiskWrite`, syscalls 46-48). Held only by the ARM
+/// `block-driver`, which serves those blocks to `fs` over the same block IPC protocol as any disk. This
+/// is whole-device read/write reach - a holder can rewrite any sector, so it is granted explicitly,
+/// never ambient (the same posture as NET_DEVICE). A no-op off ARM, where disks are userspace drivers.
+pub const USB_DISK_RESOURCE: ResourceId = ResourceId(12);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever - §7.5).
@@ -106,5 +113,6 @@ pub fn init() {
     table::register_resource(ACQUIRE_ANY_RESOURCE);
     table::register_resource(NET_DEVICE_RESOURCE);
     table::register_resource(GPIO_DEVICE_RESOURCE);
+    table::register_resource(USB_DISK_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }

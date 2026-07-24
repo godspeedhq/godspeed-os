@@ -68,6 +68,9 @@ pub enum SyscallNumber {
     NetFrameRx             = 43,
     NetInfo                = 44,
     Gpio                   = 45,
+    UsbDiskInfo            = 46,
+    UsbDiskRead            = 47,
+    UsbDiskWrite           = 48,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -97,6 +100,9 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::NetFrameRx     as u64 => handle_net_frame_rx(arg0, arg1),
         n if n == SyscallNumber::NetInfo        as u64 => handle_net_info(arg0),
         n if n == SyscallNumber::Gpio           as u64 => handle_gpio(arg0, arg1),
+        n if n == SyscallNumber::UsbDiskInfo    as u64 => handle_usb_disk_info(),
+        n if n == SyscallNumber::UsbDiskRead    as u64 => handle_usb_disk_read(arg0, arg1),
+        n if n == SyscallNumber::UsbDiskWrite   as u64 => handle_usb_disk_write(arg0, arg1),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
             0
@@ -1827,6 +1833,41 @@ fn handle_gpio(op: u64, pin: u64) -> i64 {
     }
     if op > 4 || pin > 53 { return -1; } // BCM2835 has 54 GPIO lines (0..53)
     crate::arch::imp::gpio_op(op as u32, pin as u32)
+}
+
+/// One block of the USB mass-storage device. The whole storage stack is 512-byte blocks, and the kernel
+/// only claims a device whose sectors are that size (`dwc2::probe_mass_storage`), so this is fixed.
+const USB_DISK_BLOCK: usize = 512;
+
+/// UsbDiskInfo (46): capacity of the attached USB mass-storage device in 512-byte sectors, 0 if none.
+/// Gated by USB_DISK (validated by holdings - no slot to pass). On non-ARM arches this is always 0.
+fn handle_usb_disk_info() -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    crate::arch::imp::usb_disk_sectors() as i64
+}
+
+/// UsbDiskRead (47): read the 512-byte block at `arg0` (LBA) into the user buffer at `arg1`.
+/// Gated by USB_DISK. Returns 0 on success, -1 on failure (no device, LBA past the end, I/O error).
+fn handle_usb_disk_read(lba: u64, ptr: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    let mut buf = [0u8; USB_DISK_BLOCK];
+    if !crate::arch::imp::usb_disk_read(lba, &mut buf) { return -1; }
+    if !write_user_bytes(ptr, &buf) { return -1; }
+    0
+}
+
+/// UsbDiskWrite (48): write the 512-byte block at the user buffer `arg1` to LBA `arg0`.
+/// Gated by USB_DISK. Returns 0 on success, -1 on failure.
+fn handle_usb_disk_write(lba: u64, ptr: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    let src = match read_user_bytes(ptr, USB_DISK_BLOCK) { Some(b) => b, None => return -1 };
+    if crate::arch::imp::usb_disk_write(lba, src) { 0 } else { -1 }
 }
 
 fn ipc_err_to_i64(e: IpcError) -> i64 {

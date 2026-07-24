@@ -22,6 +22,8 @@ use godspeed_sdk::ServiceContext;
 mod ahci;
 #[cfg(target_arch = "arm")]
 mod sdhci;
+#[cfg(target_arch = "arm")]
+mod usbdisk;
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
 //   Request : [op:u8, lba:u64 LE, (WriteBlock only: 512 data bytes)]
@@ -43,8 +45,22 @@ const STATUS_ERR: u8 = 1;
 /// Run the arch-appropriate backend against the kernel-granted MMIO window.
 #[cfg(not(target_arch = "arm"))]
 fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { ahci::run(ctx, m) }
+/// ARM backend selection: a USB stick if one is attached, otherwise the SD/EMMC card.
+///
+/// USB is PREFERRED deliberately. The Pi boots from its SD card, so that card carries the firmware and
+/// the kernel image and cannot be handed to GSFS without making the board unbootable (`fs` refuses to
+/// format it). A USB stick is the storage that can actually be used: boot from SD, store on USB. When no
+/// stick is present we still bring up the SD backend - it serves capacity/read to whatever is there and
+/// reports honestly when the card is not a GodspeedOS disk.
 #[cfg(target_arch = "arm")]
-fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { sdhci::run(ctx, m) }
+fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! {
+    let sectors = ctx.usb_disk_sectors();
+    if sectors > 0 {
+        usbdisk::run(ctx, sectors)
+    } else {
+        sdhci::run(ctx, m)
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {

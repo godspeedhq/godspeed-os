@@ -1049,6 +1049,9 @@ fn enumerate_downstream(low: bool, addr: u8, split_port: u8) -> bool {
     // Both HID and mass storage define their class at the interface level, so each probe reads the
     // config descriptor itself. A boot keyboard is the goal; mass storage exercises the bulk path.
     if configure_keyboard() { return true; }
+    // Record the hub port BEFORE probing: a stick behind the hub needs split transfers on every later
+    // block I/O, and `SPLIT_PORT` is re-selected per transfer (the channel is shared with the keyboard).
+    MSC_HUB_PORT.store(split_port, Ordering::Relaxed);
     if probe_mass_storage() { return true; }
     false
 }
@@ -1604,8 +1607,79 @@ fn probe_mass_storage() -> bool {
     }
     pl011_write(b"dwc2: msc read block0 first4=");
     write_hex32(u32::from_be_bytes([blk[0], blk[1], blk[2], blk[3]]));
-    pl011_write(b"\r\ndwc2: BULK TRANSFER VERIFIED (usb mass storage)\r\n");
+    pl011_write(b"\r\n");
+
+    // KEEP the device: everything above proved the path works, and the same coordinates are what a block
+    // driver needs to serve real I/O. Only 512-byte-sector media is accepted - the whole storage stack
+    // (GSFS, the block IPC protocol) is 512-byte blocks, and silently serving a 4K-sector device as if it
+    // were 512 would corrupt it. A device with any other sector size is reported and left unclaimed.
+    if bsize != 512 {
+        pl011_write(b"dwc2: msc UNSUPPORTED sector size (only 512 is served)\r\n");
+        return true;
+    }
+    MSC_ADDR.store(DEV_ADDR.load(Ordering::Relaxed), Ordering::Relaxed);
+    MSC_EP_IN.store(ep_in, Ordering::Relaxed);
+    MSC_EP_OUT.store(ep_out, Ordering::Relaxed);
+    MSC_MPS.store(bulk_mps, Ordering::Relaxed);
+    MSC_SECTORS.store(last_lba as u64 + 1, Ordering::Relaxed); // READ CAPACITY reports the LAST LBA
+    MSC_READY.store(true, Ordering::Release);
+    pl011_write(b"dwc2: mass storage READY - ");
+    super::timer::write_dec_pub(((last_lba as u64 + 1) / 2048) as u32);
+    pl011_write(b" MiB, serving block I/O\r\n");
     true
+}
+
+// --- USB mass storage as a block device -------------------------------------------------------------
+// The probe above leaves the device configured and its coordinates recorded here, so the userspace
+// `block-driver` can serve real block I/O from it through the gated syscalls (the same shape as the
+// USB-net bridge: the kernel owns the controller, a userspace driver owns the protocol above it).
+static MSC_READY:   AtomicBool = AtomicBool::new(false);
+static MSC_ADDR:    AtomicU8   = AtomicU8::new(0);   // the device's USB address
+static MSC_EP_IN:   AtomicU8   = AtomicU8::new(0);   // bulk IN endpoint
+static MSC_EP_OUT:  AtomicU8   = AtomicU8::new(0);   // bulk OUT endpoint
+static MSC_MPS:     AtomicU8   = AtomicU8::new(64);  // bulk max packet size
+static MSC_SECTORS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
+/// Capacity of the attached USB mass-storage device in 512-byte sectors (0 = none attached).
+pub fn msc_sectors() -> u64 {
+    if !MSC_READY.load(Ordering::Acquire) { return 0; }
+    MSC_SECTORS.load(Ordering::Relaxed)
+}
+
+/// Point the shared host channel at the mass-storage device. The single DWC2 channel is time-shared by
+/// every device (keyboard, net, storage), so each path re-selects its own before transacting.
+fn msc_select() {
+    select_device(MSC_ADDR.load(Ordering::Relaxed), MSC_MPS.load(Ordering::Relaxed), false);
+    SPLIT_PORT.store(MSC_HUB_PORT.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+static MSC_HUB_PORT: AtomicU8 = AtomicU8::new(0); // hub port for split transfers (0 = direct/high-speed)
+
+/// Read one 512-byte block from the USB mass-storage device into `dst`. Returns false if there is no
+/// device, the LBA is past the end, or the transfer failed. Core-0 only (the single DWC2 poller), and
+/// non-blocking like the net path - see the DMA soundness invariant on `DMA`.
+pub fn msc_read_block(lba: u64, dst: &mut [u8]) -> bool {
+    if !MSC_READY.load(Ordering::Acquire) || !on_core0() || dst.len() < 512 { return false; }
+    if lba >= MSC_SECTORS.load(Ordering::Relaxed) { return false; }
+    msc_select();
+    let l = lba as u32;
+    // READ(10): opcode 0x28, LBA big-endian at [2..6], transfer length big-endian at [7..9].
+    let cdb = [0x28u8, 0, (l >> 24) as u8, (l >> 16) as u8, (l >> 8) as u8, l as u8, 0, 0, 1, 0];
+    bot_command(MSC_EP_IN.load(Ordering::Relaxed) as u32, MSC_EP_OUT.load(Ordering::Relaxed) as u32,
+                &cdb, true, &mut dst[..512], 512)
+}
+
+/// Write one 512-byte block to the USB mass-storage device. Same constraints as `msc_read_block`.
+pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
+    if !MSC_READY.load(Ordering::Acquire) || !on_core0() || src.len() < 512 { return false; }
+    if lba >= MSC_SECTORS.load(Ordering::Relaxed) { return false; }
+    msc_select();
+    let l = lba as u32;
+    // WRITE(10): opcode 0x2A, same big-endian LBA/length layout as READ(10).
+    let cdb = [0x2Au8, 0, (l >> 24) as u8, (l >> 16) as u8, (l >> 8) as u8, l as u8, 0, 0, 1, 0];
+    let mut buf = [0u8; 512];
+    buf.copy_from_slice(&src[..512]);
+    bot_command(MSC_EP_IN.load(Ordering::Relaxed) as u32, MSC_EP_OUT.load(Ordering::Relaxed) as u32,
+                &cdb, false, &mut buf, 512)
 }
 
 /// The keyboard's host-side decode state: the previous report's keycodes (for N-key edge detection),

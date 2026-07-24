@@ -780,6 +780,13 @@ pub fn hardware_reset() -> ! {
 /// controller's registers - it cannot ask the mailbox itself (§12.3).
 pub fn emmc_base_clock_hz() -> u32 { video::emmc_clock_hz() }
 
+/// USB mass-storage block device, served by the in-kernel DWC2 Bulk-Only stack (`dwc2`). Exposed to the
+/// userspace `block-driver` through the USB_DISK-gated syscalls 46-48, the same shape as the USB-net
+/// bridge: the kernel owns the controller and the transport, the driver owns the block protocol above it.
+pub fn usb_disk_sectors() -> u64 { dwc2::msc_sectors() }
+pub fn usb_disk_read(lba: u64, dst: &mut [u8]) -> bool { dwc2::msc_read_block(lba, dst) }
+pub fn usb_disk_write(lba: u64, src: &[u8]) -> bool { dwc2::msc_write_block(lba, src) }
+
 pub fn hw_random() -> Option<u32> {
     use core::sync::atomic::{AtomicBool, Ordering};
     const RNG_CTRL:   usize = PERIPHERAL_BASE + 0x10_4000;

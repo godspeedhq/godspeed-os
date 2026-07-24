@@ -117,6 +117,13 @@ pub fn hw_random() -> Option<u32> { None }
 /// from the VideoCore mailbox at boot.
 pub fn emmc_base_clock_hz() -> u32 { 0 }
 
+/// USB mass-storage block device (the ARM DWC2 Bulk-Only bridge). Only the Pi's ARM port has an
+/// in-kernel USB stack; elsewhere disks are userspace drivers, so there is no device here.
+pub fn usb_disk_sectors() -> u64 { 0 }
+pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
+pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
+
+
 // No GPIO on this arch (the ARM `gpio` shell command is Pi-only).
 pub fn gpio_op(_op: u32, _pin: u32) -> i64 { -1 }
 pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }

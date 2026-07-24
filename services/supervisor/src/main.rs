@@ -407,6 +407,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (QEMU has no -drive there: "no controller"), giving §22 Test 11 a restartable victim to kill.
     // `ensure_*` (Phase 6): spawn on a fresh boot, ADOPT the running instance on a supervisor respawn.
     #[cfg(any(feature = "bare-metal", feature = "blockdev", feature = "identity-only"))]
+    // block-driver: core 0 on ARM, unpinned elsewhere. On ARM it may serve a USB stick through the
+    // in-kernel DWC2 stack, and those syscalls are core-0-only: the single USB host channel and its DMA
+    // buffer are shared with the keyboard poll in core 0's timer ISR, kept mutually exclusive by an ARM
+    // syscall running with interrupts masked. A request from another core would simply be refused.
+    #[cfg(target_arch = "arm")]
+    ensure_mapped(&ctx, &mut name_map, "block-driver", 0);
+    #[cfg(not(target_arch = "arm"))]
     ensure_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
     // fs needs a disk → bare-metal / blockdev only.
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]

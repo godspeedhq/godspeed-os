@@ -13,7 +13,7 @@ use crate::arch::imp::context_switch::TaskContext;
 use crate::arch::imp::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -435,6 +435,7 @@ struct Privileges {
     reboot:          bool, // REBOOT: hardware-reset the machine (shell `reboot` only - SEC-2)
     acquire_any:     bool, // ACQUIRE_ANY: reach ARBITRARY services by name via AcquireSendCap (§3.1)
     net_device:      bool, // NET_DEVICE: move ethernet frames via the in-kernel USB-net bridge (ARM nic-driver)
+    usb_disk:        bool, // USB_DISK: read/write blocks on the in-kernel USB mass-storage device (ARM block-driver)
     gpio:            bool, // GPIO_DEVICE: drive the SoC GPIO pins (ARM `gpio` shell command)
 }
 
@@ -469,6 +470,9 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // reader is not misled; the shell ships no contract, so the kernel is trivially its only record.
         //   nic-driver bridges ethernet frames to/from the in-kernel USB-net device (NetFrame*, 42-44).
         net_device: cfg!(target_arch = "arm") && matches!(name, "nic-driver"),
+        // USB_DISK: on ARM the USB stack is in-kernel, so `block-driver` reaches a USB stick through
+        // syscalls 46-48 rather than MMIO. Whole-device read/write reach, granted to that one service.
+        usb_disk: cfg!(target_arch = "arm") && matches!(name, "block-driver"),
         //   the shell's `gpio` command drives the SoC pins (the gated `Gpio` syscall, 45).
         gpio: cfg!(target_arch = "arm") && matches!(name, "shell"),
     }
@@ -3567,6 +3571,14 @@ fn spawn_service_with_config(
     if privs.net_device {
         let nd_cap = mint_cap(NET_DEVICE_RESOURCE, Rights::WRITE);
         caps.insert(nd_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+
+    // USB_DISK: the ARM `block-driver` reads/writes a USB stick through the in-kernel Bulk-Only stack
+    // (UsbDisk*, syscalls 46-48). Minted here; WHO holds it is in `service_privileges`.
+    if privs.usb_disk {
+        let ud_cap = mint_cap(USB_DISK_RESOURCE, Rights::WRITE);
+        caps.insert(ud_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 

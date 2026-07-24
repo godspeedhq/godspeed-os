@@ -849,6 +849,33 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u32 }
     }
 
+    /// Capacity of the in-kernel USB mass-storage device in 512-byte sectors, 0 if none is attached.
+    /// Requires the `USB_DISK` capability. Syscall 46.
+    pub fn usb_disk_sectors(&self) -> u64 {
+        // SAFETY: syscall(46) = UsbDiskInfo; no arguments, gated by the USB_DISK capability.
+        let ret = unsafe { raw_syscall(46, 0, 0, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
+    /// Read the 512-byte block at `lba` from the USB mass-storage device into `dst`. Returns false if
+    /// there is no device, the LBA is past the end, or the transfer failed. Requires `USB_DISK`.
+    /// Syscall 47.
+    pub fn usb_disk_read(&self, lba: u64, dst: &mut [u8; 512]) -> bool {
+        // SAFETY: syscall(47) = UsbDiskRead; the kernel writes exactly 512 bytes to `dst` on success,
+        // through its checked user-pointer path.
+        let ret = unsafe { raw_syscall(47, lba, dst.as_mut_ptr() as u64, 0) };
+        ret == 0
+    }
+
+    /// Write `src` as the 512-byte block at `lba` on the USB mass-storage device. Requires `USB_DISK`.
+    /// Syscall 48.
+    pub fn usb_disk_write(&self, lba: u64, src: &[u8; 512]) -> bool {
+        // SAFETY: syscall(48) = UsbDiskWrite; the kernel reads exactly 512 bytes from `src` through its
+        // checked user-pointer path.
+        let ret = unsafe { raw_syscall(48, lba, src.as_ptr() as u64, 0) };
+        ret == 0
+    }
+
     /// The SD/EMMC controller's base clock in Hz (0 if the platform does not report one), via
     /// InspectKernel query 20. The block driver needs it to compute its clock divider: on the BCM283x
     /// the controller's own capability register reports the base clock wrongly, and the driver holds

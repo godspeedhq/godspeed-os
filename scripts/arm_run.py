@@ -32,6 +32,9 @@ def main():
     ap.add_argument("--usb", action="store_true")
     ap.add_argument("--usbnet", action="store_true", help="attach a CDC-ECM USB-Ethernet device (user-net)")
     ap.add_argument("--sd", default=None, help="path to a raw SD-card image to attach (if=sd)")
+    ap.add_argument("--usbdisk", default=None,
+                    help="path to a raw image to attach as a USB mass-storage stick (block-driver "
+                         "prefers this over the SD card, matching the Pi: boot from SD, store on USB)")
     ap.add_argument("--cmd", action="append", default=[])
     ap.add_argument("--tail", type=int, default=3000)
     args = ap.parse_args()
@@ -42,13 +45,17 @@ def main():
         print("no kernel ELF - run scripts/arm_build.py first", file=sys.stderr)
         sys.exit(1)
 
-    machine = "raspi2b,usb=on" if (args.usb or args.usbnet) else "raspi2b"
+    machine = "raspi2b,usb=on" if (args.usb or args.usbnet or args.usbdisk) else "raspi2b"
     cmd = [QEMU, "-M", machine, "-kernel", krn, "-serial", "stdio", "-display", "none"]
     if args.usb:
         cmd += ["-device", "usb-kbd"]
     if args.usbnet:
         # Attach a CDC-ECM USB-Ethernet device on QEMU's user-net so net-stack can DHCP/ARP/ping.
         cmd += ["-netdev", "user,id=n0", "-device", "usb-net,netdev=n0"]
+    if args.usbdisk:
+        # A USB mass-storage stick: the storage target on a real Pi (the SD card holds the boot files).
+        cmd += ["-drive", f"if=none,id=usbstick,format=raw,file={args.usbdisk}",
+                "-device", "usb-storage,drive=usbstick"]
     if args.sd:
         # Attach an SD-card image so the block-driver (BCM2835 EMMC) has a disk to serve to fs.
         cmd += ["-drive", f"if=sd,format=raw,file={args.sd}"]
