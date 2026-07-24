@@ -493,7 +493,7 @@ fn poll_wait_halt() -> u32 {
         }
     }
 }
-const POLL_HALT_BUDGET_US: u32 = 1000; // 1 ms per in-ISR halt wait (tick is 10 ms; a healthy halt is < 1 ms)
+const POLL_HALT_BUDGET_US: u32 = 500; // per in-ISR halt wait; tick is 10 ms, a healthy split halts in << 1 ms
 
 /// One-shot diagnostic dump of the channel + core-config state on a stalled transfer (`wait_halt` calls it
 /// on its bounded timeout); `DUMPED` gates it to the FIRST stall so the log is never flooded.
@@ -624,41 +624,43 @@ fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u
 /// picks the tight ISR wait (the keyboard poll) over the generous one-shot enumeration wait. HCINT bits used:
 /// XferCompl0, STALL3, NAK4, ACK5, NYET6.
 fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32, bounded: bool) -> u32 {
+    // The keyboard interrupt IN (bounded = the ISR poll) is a PERIODIC split - frame-scheduled with an
+    // ACK-required start-split (Circle). The enumeration control/bulk splits (not bounded) use the
+    // microframe-sweep loop below, which brute-forces a landing microframe for a non-periodic split.
+    if bounded {
+        return split_txn_periodic(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt);
+    }
     let mut last = 0u32;
     // A split transaction that transaction-errors is retried whole (USB 2.0 11.17.5 / 11.20). The hub's
     // transaction translator (TT) legitimately XactErr/NAKs while busy; the host re-issues the start-split.
-    let ss_tries = if bounded { 1u32 } else { 24u32 };          // the ISR poll does ONE attempt (NAK = no key, next tick); enumeration is patient
+    // Non-periodic (control/bulk) split - the ISR keyboard poll (`bounded`) took the periodic path above.
+    // Brute-force a landing microframe by SWEEPING 0..7 across retries (waiting on the HFNUM truth), since a
+    // non-periodic split has no fixed schedule; the patient `wait_halt` is fine off the ISR (enumeration).
+    let ss_tries = 24u32;
     for attempt in 0..ss_tries {
-        // Place the Start-Split by SWEEPING microframes 0..7 across retries, waiting on the HFNUM counter
-        // TRUTH until the target microframe - so the trace shows whether ANY placement is accepted
-        // (checklist: fixed SSPLIT placements across uframes). Enumeration only; the ISR poll fires at once.
-        if !bounded { wait_for_uframe((attempt % 8) as u32); }
+        wait_for_uframe((attempt % 8) as u32);
         // STATE 1 - issue the Start-Split (CompleteSplit = 0); capture the microframe it goes out in.
         let hf0 = rd(HFNUM);
         chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt);
-        let ss = if bounded { poll_wait_halt() } else { wait_halt() };
+        let ss = wait_halt();
         trace_split(PH_SSPLIT, hf0, rd(HFNUM), ss);
         last = ss;
         if ss & (1 << 3) != 0 { break; }                        // STALL - real failure
         if ss & HCINT_XFERCOMPL != 0 { return ss; }             // (rare) already complete
         if ss & (1 << 5) == 0 { continue; }                     // no ACK -> retry (the microframe sweep above spaces it)
         // STATE 2 - poll the Complete-Split (CompleteSplit = 1) for the low/full-speed result.
-        // In the ISR (bounded) poll, retry the CSPLIT only a couple of times so the whole poll stays well
-        // under one 10 ms scheduler tick - a missed keyboard report is simply re-polled next tick, whereas
-        // a long CSPLIT retry chain in the ISR starves the scheduler. Enumeration (not bounded) is patient.
-        let nyet_cap = if bounded { 2u32 } else { 500u32 };
         let mut nyet = 0u32;
         loop {
             let hf1 = rd(HFNUM);
             chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt | (1 << 16));
-            let cs = if bounded { poll_wait_halt() } else { wait_halt() };
+            let cs = wait_halt();
             trace_split(PH_CSPLIT, hf1, rd(HFNUM), cs);
             last = cs;
             if cs & HCINT_XFERCOMPL != 0 { return cs; }         // the transfer completed
             if cs & (1 << 3) != 0 { return cs; }                // STALL - real failure
             if cs & (1 << 6) != 0 {                             // NYET: TT not finished, keep polling the CSPLIT
                 nyet += 1;
-                if nyet > nyet_cap { break; }                   // bounded; fall out to a fresh start-split
+                if nyet > 500 { break; }                        // bounded; fall out to a fresh start-split
                 super::timer::delay_us(125);                    // ONE microframe on the real 1 MHz clock (Commandment VIII)
                 continue;
             }
@@ -724,11 +726,55 @@ fn write_hfnum(hf: u32) {
 /// Spin until the host frame counter reaches microframe `target` (0..7) - waiting on the HFNUM scheduling
 /// TRUTH, not a guessed delay (Commandment VIII). Bounded backstop so a stuck counter cannot hang the boot.
 fn wait_for_uframe(target: u32) {
-    let mut guard = 0u32;
+    // Bound by REAL time (1 MHz System Timer): reaching a target microframe takes at most one ~1 ms frame,
+    // so 1.5 ms always reaches it while keeping the in-ISR periodic-split poll bounded. (A spin-count bound
+    // is MMIO-latency-dependent and was the cause of the scheduler-starving hang; use real time here too.)
+    let start = super::timer::systimer_us();
     while (rd(HFNUM) & 0x7) != (target & 0x7) {
-        guard += 1;
-        if guard > 2_000_000 { break; }
+        if super::timer::systimer_us().wrapping_sub(start) > 1500 { break; }
     }
+}
+
+/// A PERIODIC (interrupt) IN split, frame-scheduled per Circle's CDWHCIFrameSchedulerPeriodic (proven on
+/// this exact Pi 2 + LAN9514 hardware). The keyboard poll's start-split was being NYET'd because it fired
+/// at an arbitrary microframe; a periodic split MUST be scheduled:
+///   1. START-SPLIT in microframe (current+1)&7, SKIPPING uframe 6 (too few left before the frame boundary
+///      for the complete-split at +2). ODDFRM must match that microframe's parity - `chan_program` derives
+///      it from HFNUM, which now reads the scheduled microframe because we enable the channel only after
+///      `wait_for_uframe` reaches it. The start-split MUST be ACK'd (a NYET/NAK means the TT refused it).
+///   2. COMPLETE-SPLIT at +2 (COMPSPLT set, SplitEnable kept), retrying NYET in the following microframes
+///      (Circle: 3 tries), ODDFRM re-set each time.
+/// ONE attempt per call: the keyboard poll runs every tick, so a NYET/NAK on the start-split simply
+/// reschedules a fresh start-split next tick. Every wait is bounded (time-bounded `wait_for_uframe` +
+/// `poll_wait_halt`), so the whole poll is ~1-3 ms, well under the 10 ms scheduler tick.
+fn split_txn_periodic(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32) -> u32 {
+    let mut ssf = (rd(HFNUM).wrapping_add(1)) & 0x7;  // start-split microframe = current + 1
+    if ssf == 6 { ssf = 7; }                          // skip uframe 6 (Circle WaitForFrame)
+    wait_for_uframe(ssf);
+    let hf0 = rd(HFNUM);
+    chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt);   // CompleteSplit = 0
+    let ss = poll_wait_halt();
+    trace_split(PH_SSPLIT, hf0, rd(HFNUM), ss);
+    if ss & (1 << 3) != 0 { return ss; }                             // STALL
+    if ss & HCINT_XFERCOMPL != 0 { return ss; }                      // (rare) already complete
+    if ss & (1 << 5) == 0 { return ss; }                            // no ACK on the start-split -> reschedule next tick
+    // Complete-split at ssf+2, retry NYET in the following microframes (COMPSPLT set, ODDFRM re-set each).
+    let mut csf = (ssf + 2) & 0x7;
+    let mut last = ss;
+    for _ in 0..3 {
+        wait_for_uframe(csf);
+        let hf1 = rd(HFNUM);
+        chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt | (1 << 16)); // CompleteSplit = 1
+        let cs = poll_wait_halt();
+        trace_split(PH_CSPLIT, hf1, rd(HFNUM), cs);
+        last = cs;
+        if cs & HCINT_XFERCOMPL != 0 { return cs; }                 // data arrived - the report
+        if cs & (1 << 3) != 0 { return cs; }                        // STALL
+        if cs & (1 << 4) != 0 { return cs; }                        // NAK - no data this period (idle keyboard)
+        if cs & (1 << 6) != 0 { csf = (csf + 1) & 0x7; continue; }  // NYET - retry the complete-split next microframe
+        return cs;                                                   // XactErr / other - reschedule next tick
+    }
+    last
 }
 
 /// A single control-endpoint DMA transaction (ep 0, type control). Thin wrapper so ctrl_xfer reads clean.
