@@ -474,9 +474,16 @@ static SERIAL_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 /// a bare `LDR` (not LDREX), which is safe pre-MMU.
 pub(super) static SERIAL_SMP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Cap on the acquire spin (~one full serial line at 115200 baud). A waiter that exceeds it writes
-/// anyway rather than block forever - the only correct choice for a UART also used by the fault handler.
-const SERIAL_ACQUIRE_SPINS: u32 = 50_000;
+/// Cap on the acquire wait, in MICROSECONDS of real time. A waiter that exceeds it writes anyway rather
+/// than block forever - the only correct choice for a UART also used by the fault handler.
+///
+/// This must outlast a full line, or a waiter gives up mid-line and its bytes land INSIDE the holder's
+/// output: `fs: block-driver did not report capacity ... (dhelli read; (typO 'hel ')` is a real capture of
+/// the shell's `(F1=help or type 'help')` interleaved into an fs log line. At 115200 baud a byte is ~87 us,
+/// so a 200-character line takes ~17 ms - and the old 50,000-SPIN cap was nowhere near that, because a
+/// spin count is not a duration (the same trap as the USB waits earlier in this port). 40 ms of real time
+/// covers any line this console writes.
+const SERIAL_ACQUIRE_US: u32 = 40_000;
 
 pub(super) fn pl011_write(s: &[u8]) {
     use core::sync::atomic::Ordering;
@@ -497,13 +504,16 @@ pub(super) fn pl011_write(s: &[u8]) {
     // SMP is live: serialize across cores. Try to claim the UART (bounded), write, then release only if
     // we claimed it - a fault-time / heavily-contended write is never lost or deadlocked.
     let mut held = false;
-    let mut spins: u32 = 0;
-    while SERIAL_BUSY.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        spins += 1;
-        if spins >= SERIAL_ACQUIRE_SPINS { break; } // give up waiting; write lock-free (never deadlock)
+    let start = timer::systimer_us();
+    loop {
+        if SERIAL_BUSY.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            held = true;
+            break;
+        }
+        // Give up waiting and write lock-free rather than block forever (never deadlock).
+        if timer::systimer_us().wrapping_sub(start) > SERIAL_ACQUIRE_US { break; }
         core::hint::spin_loop();
     }
-    if spins < SERIAL_ACQUIRE_SPINS { held = true; }
     for &b in s {
         pl011_write_byte(b);
     }

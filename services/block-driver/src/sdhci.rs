@@ -78,6 +78,9 @@ struct Sd<'a> {
     /// The controller's base clock in Hz, from the platform (InspectKernel query 20). Every card clock
     /// is derived from it; 0 means the platform did not report one and init refuses rather than guessing.
     base_clock: u32,
+    /// The INTERRUPT register captured at the moment a command failed, BEFORE the line reset that clears
+    /// it. Without this a caller logging INTERRUPT after a failure always sees 0.
+    last_int: core::cell::Cell<u32>,
 }
 
 impl<'a> Sd<'a> {
@@ -104,9 +107,16 @@ impl<'a> Sd<'a> {
             // excludes - so without this the commonest real-hardware failure looked like "nothing
             // happened" and we spun out the full bounded wait with INTERRUPT reading 0. Treat it as the
             // error it is: reset the line so the next command is not left inhibited, and report.
-            if i & (INT_ERR | INT_CMD_TIMEOUT) != 0 { self.reset_cmd_dat(); return None; }
+            if i & (INT_ERR | INT_CMD_TIMEOUT) != 0 {
+                // Record WHY before recovering: `reset_cmd_dat` clears INTERRUPT, so a caller that logs
+                // the register afterwards sees 0 and cannot tell a timeout from an error - which is
+                // exactly how a real command timeout showed up as "INT=0x00000000, nothing happened".
+                self.last_int.set(i);
+                self.reset_cmd_dat();
+                return None;
+            }
             t += 1;
-            if t > 2_000_000 { return None; }
+            if t > 2_000_000 { self.last_int.set(self.rd(INTERRUPT)); return None; }
         }
         self.wr(INTERRUPT, INT_CMD_DONE);
         Some(self.rd(RESP0))
@@ -133,7 +143,7 @@ impl<'a> Sd<'a> {
         let app = if self.rca != 0 { CMD_APP_CMD | 0x0002_0000 } else { CMD_APP_CMD };
         if self.cmd(app, self.rca).is_none() {
             ctx.log_fmt(format_args!("block-driver: CMD55 (APP_CMD, rca={:#010x}) failed - STATUS={:#010x} INT={:#010x}",
-                                     self.rca, self.rd(STATUS), self.rd(INTERRUPT)));
+                                     self.rca, self.rd(STATUS), self.last_int.get()));
             return None;
         }
         self.cmd(code, arg)
@@ -262,9 +272,23 @@ impl<'a> Sd<'a> {
             ocr = match self.acmd(CMD_SEND_OP_COND, 0x50FF_8000, ctx) {
                 Some(v) => v,
                 None => {
-                    ctx.log_fmt(format_args!("block-driver: ACMD41 failed - STATUS={:#010x} INT={:#010x}",
-                                             self.rd(STATUS), self.rd(INTERRUPT)));
-                    return false;
+                    // A card that is still powering up can legitimately miss an ACMD41 - the sequence is
+                    // meant to be repeated until it answers ready. Treat a non-response as another
+                    // attempt rather than a fatal error, bounded by the same try budget below.
+                    tries += 1;
+                    if tries > 200 {
+                        ctx.log_fmt(format_args!(
+                            "block-driver: ACMD41 never answered - STATUS={:#010x} INT={:#010x}",
+                            self.rd(STATUS), self.last_int.get()));
+                        return false;
+                    }
+                    if tries == 1 {
+                        ctx.log_fmt(format_args!(
+                            "block-driver: ACMD41 no response (retrying) - STATUS={:#010x} INT={:#010x}",
+                            self.rd(STATUS), self.last_int.get()));
+                    }
+                    for _ in 0..20 { spin(); }
+                    continue;
                 }
             };
             if ocr & 0x8000_0000 != 0 { break; }
@@ -406,7 +430,8 @@ fn serve(sd: &Sd, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapHandle
 
 /// Entry point: initialise the EMMC + serve block I/O to `fs`.
 pub fn run(ctx: &ServiceContext, mmio: &Mmio) -> ! {
-    let mut sd = Sd { m: mmio, rca: 0, sdhc: false, sectors: 0, base_clock: ctx.emmc_base_clock_hz() };
+    let mut sd = Sd { m: mmio, rca: 0, sdhc: false, sectors: 0,
+                      base_clock: ctx.emmc_base_clock_hz(), last_int: core::cell::Cell::new(0) };
     if !sd.init(ctx) {
         ctx.log("block-driver: no usable SD card - serving errors so fs never hangs");
         loop {
