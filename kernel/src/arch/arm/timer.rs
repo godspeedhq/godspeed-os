@@ -107,6 +107,14 @@ pub fn systimer_secs() -> i64 {
     (systimer_lo() as u64 / SYSTIMER_HZ) as i64
 }
 
+/// The 1 MHz System Timer low word = microseconds since boot (wraps every ~71 min). A free-running
+/// counter independent of the ARM generic timer / the scheduler tick, so it is safe to read from a
+/// timer ISR to bound an in-ISR hardware wait by REAL time (rather than a spin count whose duration
+/// depends on the peripheral-bus MMIO latency). Used by the DWC2 keyboard poll's per-tick budget.
+pub fn systimer_us() -> u32 {
+    systimer_lo()
+}
+
 /// Read a register in the BCM2836 core-local peripheral block (`0x4000_0000`).
 ///
 /// This block is BCM2836-specific (a Pi 1 has none) and holds the core timer control and prescaler,

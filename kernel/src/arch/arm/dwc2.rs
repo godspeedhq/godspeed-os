@@ -475,18 +475,25 @@ static DUMPED: AtomicBool = AtomicBool::new(false);
 
 /// A tighter-bounded halt wait for the STEADY-STATE keyboard poll, which runs inside the core-0 timer ISR
 /// (SEC-32): a wedged/hostile controller must not tax the ISR the full enumeration budget every tick. A
-/// normal interrupt-IN halts (complete or NAK) in far fewer iterations, so this generous cap never affects
-/// the working path - it only bounds the pathological per-tick cost (the keyboard auto-recovers if the
-/// wedge clears). No diagnostic dump; that is the one-shot enumeration path's job (`wait_halt`).
+/// normal interrupt-IN halts (complete or NAK) in microseconds, so this budget never affects the working
+/// path; it only bounds the pathological per-tick cost (the keyboard auto-recovers if the wedge clears).
+///
+/// The bound is by REAL TIME (the 1 MHz System Timer), not a spin count: a spin count's duration depends
+/// on the peripheral-bus MMIO latency, and the old 500k-spin cap could reach tens of ms - longer than the
+/// 10 ms scheduler tick - so a keyboard whose split does not halt promptly starved the scheduler and wedged
+/// the boot (HW-observed on a Logitech low-speed keyboard behind the LAN9514 hub). `POLL_HALT_BUDGET_US`
+/// keeps a single wait well under one tick.
 fn poll_wait_halt() -> u32 {
-    let mut t = 0u32;
+    let start = super::timer::systimer_us();
     loop {
         let ci = rd(HCINT0);
         if ci & HCINT_CHHLTD != 0 { return ci; }
-        t += 1;
-        if t > 500_000 { return ci | HCINT_CHHLTD; }
+        if super::timer::systimer_us().wrapping_sub(start) > POLL_HALT_BUDGET_US {
+            return ci | HCINT_CHHLTD; // treat as halted-without-complete -> the poll gives up this tick
+        }
     }
 }
+const POLL_HALT_BUDGET_US: u32 = 1000; // 1 ms per in-ISR halt wait (tick is 10 ms; a healthy halt is < 1 ms)
 
 /// One-shot diagnostic dump of the channel + core-config state on a stalled transfer (`wait_halt` calls it
 /// on its bounded timeout); `DUMPED` gates it to the FIRST stall so the log is never flooded.
@@ -636,6 +643,10 @@ fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: 
         if ss & HCINT_XFERCOMPL != 0 { return ss; }             // (rare) already complete
         if ss & (1 << 5) == 0 { continue; }                     // no ACK -> retry (the microframe sweep above spaces it)
         // STATE 2 - poll the Complete-Split (CompleteSplit = 1) for the low/full-speed result.
+        // In the ISR (bounded) poll, retry the CSPLIT only a couple of times so the whole poll stays well
+        // under one 10 ms scheduler tick - a missed keyboard report is simply re-polled next tick, whereas
+        // a long CSPLIT retry chain in the ISR starves the scheduler. Enumeration (not bounded) is patient.
+        let nyet_cap = if bounded { 2u32 } else { 500u32 };
         let mut nyet = 0u32;
         loop {
             let hf1 = rd(HFNUM);
@@ -647,7 +658,7 @@ fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: 
             if cs & (1 << 3) != 0 { return cs; }                // STALL - real failure
             if cs & (1 << 6) != 0 {                             // NYET: TT not finished, keep polling the CSPLIT
                 nyet += 1;
-                if nyet > 500 { break; }                        // bounded; fall out to a fresh start-split
+                if nyet > nyet_cap { break; }                   // bounded; fall out to a fresh start-split
                 super::timer::delay_us(125);                    // ONE microframe on the real 1 MHz clock (Commandment VIII)
                 continue;
             }
