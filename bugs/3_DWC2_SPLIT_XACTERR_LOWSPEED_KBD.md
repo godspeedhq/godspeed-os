@@ -33,24 +33,34 @@ transfers to the SAME hub's EP0 succeed (it enumerated), (c) high-speed devices 
 directly, (d) the port is reset (on the hub's truth) + enabled + shows the low-speed device connected. So
 the rejection is **below scheduling** - in how the DWC2 v2.80a forms/drives the split itself, or the TT.
 
-**Refocused suspects (research these, not timing):**
+**MORE ruled out by measurement (2026-07-24, later):**
 
-1. **`HCCHAR.LSpdDev` + `SplEna` interaction on the v2.80a.** For a low-speed device DIRECTLY on a
-   full-speed bus, `LSpdDev=1` makes the core send a low-speed **PREamble**. For a SPLIT the host->hub leg
-   is HIGH-speed and must NOT be preambled - the hub does the low-speed. If the v2.80a wrongly preambles
-   the SSPLIT when `LSpdDev=1`, the HS hub would not recognize it -> fast XactErr in every microframe (fits
-   the data exactly). **Concrete experiment:** try the split with `LSpdDev=0` (keep `SplEna=1`).
-2. **Manual CSPLIT vs core-auto split (buffer-DMA).** Confirm whether the DWC2 in buffer-DMA does the
-   whole non-periodic split (SSPLIT + CSPLIT) on ONE channel enable, or software must drive both phases.
-   If the core auto-drives it, our XactErr is the FINAL result (the low-speed transaction to the device
-   failed) and the suspect shifts to device readiness, not the SSPLIT.
-3. **v2.80a split erratum.** It is an old core; check Linux dwc2 `params`/quirks and the databook errata
-   for split-transaction issues specific to 2.80a.
-4. **Is the SSPLIT even on the wire?** Add `GNPTXSTS`/`GINTSTS` to the trace - did the core consume the
-   SSPLIT data (bytes left the NP TX FIFO) or reject internally before transmitting?
+- **On the wire, not internal (GNPTXSTS).** On the failing SSPLIT the NP TX FIFO is empty at halt
+  (`nptx` low16 = `0x80` = 128 = full depth free), so the 8 SETUP bytes DRAINED - the core **transmitted**
+  the split on the bus. `gints=0x04000029` shows no error (just host mode + SOF). So the high-speed hub
+  received the SSPLIT and simply **did not ACK** it (no bit 5; timeout -> XactErr). **This is a bus/TT
+  rejection, not a core-internal reject.**
+- **`LSpdDev` PREamble - RULED OUT.** Cleared `HCCHAR.LSpdDev` for splits (keeping `SplEna`) - **no
+  change**, still `0x82`, still transmitted-but-not-ACK'd. The stray-low-speed-preamble theory is dead.
 
-The instrumentation to do all of this is in place (`split_txn` trace + `wait_for_uframe`); extend the
-capture tuple with `GNPTXSTS` and flip `LSpdDev` behind a temporary constant to sweep the experiments.
+**Razor-sharp state of the problem:** the DWC2 v2.80a **transmits** a config-correct Start-Split on the
+wire, and the LAN9514 hub - which ACKs direct high-speed control transfers to its own EP0 (it enumerated) -
+**never ACKs the SSPLIT, in any microframe.** Not timing, not HFIR, not internal-reject, not preamble.
+
+**What is left (needs a byte-level reference comparison, not another black-box HW boot):**
+
+1. **Compare our SSPLIT channel programming against Linux dwc2 field-by-field**, especially the exact
+   `HCCHAR`/`HCSPLT` bits and *which address the SSPLIT token carries*. Hypothesis worth checking: does
+   the v2.80a put the **hub address** (`HCSPLT.HubAddr`) or the **device address** (`HCCHAR.DevAddr`) in
+   the SSPLIT token? If it (or our setup) sends the SSPLIT to device 0 instead of hub 1, no one ACKs.
+2. **Manual vs core-auto split in buffer-DMA** (does the core want ONE channel-enable for the whole
+   non-periodic split?), and any **v2.80a split errata** / dwc2 quirk flags.
+3. **Isolation** (checklist): bring up ONLY the keyboard (skip ethernet/wifi config) to rule out any TT
+   state left by the high-speed devices enumerated first.
+
+Instrumentation is all in place (`split_txn` trace with phase/HFNUM/HCINT/GNPTXSTS/GINTSTS +
+`wait_for_uframe`). The next move is reading Linux's `dwc2_hc_init` / `dwc2_hc_init_split` /
+`dwc2_hc_start_transfer` and diffing the channel setup byte-for-byte.
 
 ---
 
