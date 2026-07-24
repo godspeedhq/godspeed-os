@@ -45,6 +45,8 @@ const FS_OK: u8 = 0;
 const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
 const FS_UNAVAIL: u8 = 4;   // present-but-unreadable storage: do NOT flash (data may be intact)
+const FS_FOREIGN: u8 = 6; // fs refused a destructive op: the disk holds a foreign partition table or
+                          // boot sector (on a single-disk board, the very disk it boots from)
 const FS_DENIED: u8 = 5; // file-cap op needs a right the cap lacks (non-escalation, §7.3); DISTINCT
                          // from FS_UNAVAIL(4) so a client can tell "denied" from "storage down" (audit L2)
 // File-as-capability (§7.10, P2): Open mints a file cap; the holder invokes it (FOP_*).
@@ -9775,9 +9777,13 @@ fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) -> Result<(), Sh
     match sub {
         ""        => drives_list(ctx),
         "flash"   => {
-            // `drives flash [drive] [label]` - the drive selector is optional (one drive).
-            let (sel, label) = split_drive_value(args, argc);
-            if drive_sel_ok(ctx, sel) { drives_flash(ctx, label) } else { Err(ShellError::Unknown) }
+            // `drives flash [drive] [label] [force]` - the drive selector is optional (one drive).
+            // A trailing `force` overrides fs's refusal to overwrite a foreign/bootable disk. It is a
+            // word the operator has to type; there is no default that destroys a boot medium.
+            let force = argc >= 3 && args[argc - 1] == "force";
+            let eff = if force { argc - 1 } else { argc };
+            let (sel, label) = split_drive_value(args, eff);
+            if drive_sel_ok(ctx, sel) { drives_flash(ctx, label, force) } else { Err(ShellError::Unknown) }
         }
         "label"   => {
             // `drives label [drive] <name>` - selector optional; name required.
@@ -9786,9 +9792,10 @@ fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) -> Result<(), Sh
             else if drive_sel_ok(ctx, sel) { drives_label(ctx, name) } else { Err(ShellError::Unknown) }
         }
         "reset"   => {
-            // `drives reset [drive]` - un-format back to raw (optional selector, no value).
-            let sel = if argc >= 3 { args[2] } else { "" };
-            if drive_sel_ok(ctx, sel) { drives_reset(ctx) } else { Err(ShellError::Unknown) }
+            // `drives reset [drive] [force]` - un-format back to raw (optional selector, no value).
+            let force = argc >= 3 && args[argc - 1] == "force";
+            let sel = if argc >= 3 && !(force && argc == 3) { args[2] } else { "" };
+            if drive_sel_ok(ctx, sel) { drives_reset(ctx, force) } else { Err(ShellError::Unknown) }
         }
         "check"   => {
             // `drives check [drive]` - fsck: verify CRCs + rebuild the bitmap/free count.
@@ -9867,7 +9874,15 @@ fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
 }
 
 /// `drives flash [label]` - format the drive as GSFS after a `[y/N]` confirm. Destructive.
-fn drives_flash(ctx: &ServiceContext, label: &str) -> Result<(), ShellError> {
+/// `drives flash [label] [force]` - format the drive as GSFS.
+///
+/// `force` overrides `fs`'s refusal to overwrite a disk that already carries a foreign partition table
+/// or boot sector. That refusal exists because a machine with a single storage device boots from the
+/// very disk being formatted (the Raspberry Pi's SD card holds the firmware, the kernel image AND would
+/// be the GSFS target), and a confirmation prompt cannot convey that - `drives` shows it as an
+/// unformatted raw disk either way. So the danger is named explicitly and the override is a word the
+/// operator has to type.
+fn drives_flash(ctx: &ServiceContext, label: &str, force: bool) -> Result<(), ShellError> {
     if label.len() > LABEL_MAX {
         ctx.console_writeln_fmt(format_args!("drives: label too long (max {})", LABEL_MAX));
         return Err(ShellError::Unknown);
@@ -9880,13 +9895,22 @@ fn drives_flash(ctx: &ServiceContext, label: &str) -> Result<(), ShellError> {
     let lb = label.as_bytes();
     let ll = lb.len().min(LABEL_MAX);
     let mut req = [0u8; 2 + LABEL_MAX];
-    req[0] = OP_FLASH;
+    // The force flag rides in the op byte's high bit, so the request format is otherwise unchanged.
+    req[0] = if force { OP_FLASH | 0x80 } else { OP_FLASH };
     req[1] = ll as u8;
     req[2..2 + ll].copy_from_slice(&lb[..ll]);
     match ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + ll])) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: formatted as GSFS - mounted, ready to use now (no reboot)");
             Ok(())
+        }
+        Some(r) if r.payload_bytes().first() == Some(&FS_FOREIGN) => {
+            ctx.console_writeln("drives: REFUSED - this disk already holds a partition table or boot sector.");
+            ctx.console_writeln("  It is not blank. If this machine boots from this disk (the Pi boots from");
+            ctx.console_writeln("  its SD card), formatting it destroys the boot partition and the machine");
+            ctx.console_writeln("  will not start until the card is re-imaged from another computer.");
+            ctx.console_writeln("  If you are certain: drives flash <label> force");
+            Err(ShellError::Unknown)
         }
         Some(_) => { ctx.console_writeln("drives: flash FAILED (no disk, or disk too small)"); Err(ShellError::Unknown) }
         None    => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
@@ -9895,16 +9919,24 @@ fn drives_flash(ctx: &ServiceContext, label: &str) -> Result<(), ShellError> {
 
 /// `drives reset` - un-format the drive back to raw (zero the superblock). Destructive;
 /// a quick clean slate for re-testing the raw→flash path. NOT a secure wipe.
-fn drives_reset(ctx: &ServiceContext) -> Result<(), ShellError> {
+fn drives_reset(ctx: &ServiceContext, force: bool) -> Result<(), ShellError> {
     ctx.console_write("This un-formats the drive back to raw (ERASES). Continue? [y/N] ");
     if !read_confirm(ctx) {
         ctx.console_writeln("drives: aborted");
         return Err(ShellError::Unknown);
     }
-    match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_RESET])) {
+    // Reset zeroes block 0, which on a foreign disk is its partition table - same danger as flash.
+    let op = if force { OP_RESET | 0x80 } else { OP_RESET };
+    match ctx.request_with_reply("fs", &Message::from_bytes(&[op])) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: reset to raw - 'drives flash' to use again");
             Ok(())
+        }
+        Some(r) if r.payload_bytes().first() == Some(&FS_FOREIGN) => {
+            ctx.console_writeln("drives: REFUSED - block 0 holds a foreign partition table or boot sector.");
+            ctx.console_writeln("  Zeroing it would destroy that disk's boot record. If you are certain:");
+            ctx.console_writeln("  drives reset force");
+            Err(ShellError::Unknown)
         }
         Some(_) => { ctx.console_writeln("drives: reset FAILED (no disk?)"); Err(ShellError::Unknown) }
         None    => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }

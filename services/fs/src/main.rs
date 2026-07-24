@@ -167,6 +167,37 @@ const FS_DENIED: u8 = 5;     // op requires a right the file cap lacks (non-esca
                              // DISTINCT value from FS_UNAVAIL(4): a file-cap client must tell "storage
                              // unavailable" apart from "permission denied" (they never shared a code
                              // path, but a shared value invited a future confusion; audit L2)
+const FS_FOREIGN: u8 = 6;    // the disk carries someone else's partition table / boot sector. Refused
+                             // rather than formatted - see `foreign_disk`. Distinct from FS_ERR so the
+                             // client can explain WHY and offer the deliberate override.
+
+/// Does block 0 belong to a foreign (non-GSFS) partitioned or bootable disk? Returns a short name for
+/// what was found, so the refusal can say what it is protecting.
+///
+/// **Why this exists.** On the Raspberry Pi there is exactly ONE storage device, and it is the card the
+/// machine boots from: its MBR and FAT boot partition hold the firmware and the kernel image. `fs` sees
+/// the whole raw device, so formatting writes the GSFS superblock over LBA 0 - destroying the partition
+/// table and leaving a board that cannot boot until the card is re-imaged from another machine. (On x86
+/// the OS boots from USB and formats a separate disk, so the question never arose.) A confirmation
+/// prompt is not enough protection: the operator cannot see from `drives` that the raw disk they are
+/// about to format is also their boot medium. So refuse by default and make the override deliberate -
+/// loud failure over silent destruction (§26.7).
+fn foreign_disk(b: &[u8; BLOCK]) -> Option<&'static str> {
+    // An MBR/partition table ends with the 0x55AA boot signature.
+    if b[510] == 0x55 && b[511] == 0xAA {
+        // Distinguish a FAT volume boot record from a partition table - both carry the signature, and
+        // naming the right one makes the refusal actionable.
+        if &b[54..59] == b"FAT12" || &b[54..59] == b"FAT16" || &b[82..87] == b"FAT32" {
+            return Some("a FAT boot volume");
+        }
+        return Some("an MBR partition table");
+    }
+    // A FAT volume without the signature still starts with the x86 jump used by a boot sector.
+    if (b[0] == 0xEB || b[0] == 0xE9) && (&b[54..59] == b"FAT12" || &b[54..59] == b"FAT16" || &b[82..87] == b"FAT32") {
+        return Some("a FAT boot volume");
+    }
+    None
+}
 
 // File-cap operations - the FIRST payload byte of a badged `ResourceInvoke` (§7.10). The kernel
 // has already validated the cap holds the invoked right; fs enforces that the op needs ≤ that right.
@@ -760,6 +791,22 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         }
         OP_FLASH => {
             if capacity == 0 { send(&[FS_ERR]); return; }
+            // Refuse to overwrite someone else's disk unless the caller explicitly forced it. On a
+            // single-storage board (the Pi) this disk is also the boot medium - see `foreign_disk`.
+            // The force flag rides in the op byte's high bit so the wire format is unchanged.
+            let forced = p[0] & 0x80 != 0;
+            if !forced {
+                if let Some(b0) = block_read(ctx, 0) {
+                    if let Some(what) = foreign_disk(&b0) {
+                        ctx.log_fmt(format_args!(
+                            "fs: REFUSED to format - block 0 holds {}. This disk is not blank; on a board \
+                             that boots from it, formatting would make it unbootable. Force to override.",
+                            what));
+                        send(&[FS_FOREIGN]);
+                        return;
+                    }
+                }
+            }
             let ll = if p.len() >= 2 { (p[1] as usize).min(LABEL_MAX) } else { 0 };
             let label = if p.len() >= 2 + ll { &p[2..2 + ll] } else { &[][..] };
             match Fs::format(ctx, capacity, label) {
@@ -790,6 +837,18 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
             // "recover" the just-reset filesystem from the surviving backup.
             if capacity == 0 { send(&[FS_ERR]); }
             else {
+                // Same protection as OP_FLASH: reset zeroes block 0, which on a foreign disk is the
+                // partition table / boot sector. Refuse unless explicitly forced.
+                let forced = p[0] & 0x80 != 0;
+                if let Some(b0) = if forced { None } else { block_read(ctx, 0) } {
+                    if let Some(what) = foreign_disk(&b0) {
+                        ctx.log_fmt(format_args!(
+                            "fs: REFUSED to reset - block 0 holds {} (not a GSFS disk). Force to override.",
+                            what));
+                        send(&[FS_FOREIGN]);
+                        return;
+                    }
+                }
                 let z = [0u8; BLOCK];
                 let ok = block_write(ctx, 0, &z) && block_write(ctx, capacity - 1, &z);
                 if ok { *vol = None; send(&[FS_OK]); } else { send(&[FS_ERR]); }
