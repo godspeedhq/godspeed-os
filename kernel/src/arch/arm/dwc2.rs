@@ -252,18 +252,17 @@ pub fn init() {
     //     completion). Same on QEMU and HW - u-boot drives DMA on the real Pi 2, so DMA is the faithful
     //     transcription's mode. (NOT Circle's WAIT_AXI_WRITES, which was a wrong turn; INCR4 is u-boot's.)
     wr(GAHBCFG, GAHBCFG_DMAEN | (3 << 1) | GAHBCFG_GLBLINTRMSK);
-    // 5d. Host-channel interrupt masks. QEMU's DWC2 model only advances a channel when its interrupt is
-    //     unmasked, so keep the masks there. u-boot (real HW, polled DMA) does NOT set HCINTMSK/HAINTMSK/
-    //     GINTMSK at all - it reads HCINT directly. Every prior Pi 2 session only ever *added* masks (never
-    //     helped); NOT setting them - u-boot's way - is the untried case, and unserviced masked host-channel
-    //     interrupts (no USB IRQ handler is wired on ARM) are a plausible reason the DMA master never
-    //     dispatches. So: masks on QEMU only, none on real hardware (the faithful u-boot transcription).
-    #[cfg(feature = "qemu")]
-    {
-        wr(HCINTMSK0, 0x7FF);   // all channel-0 interrupt sources
-        wr(HAINTMSK, 0xFFFF);   // all channels
-        wr(GINTMSK, (1 << 25) | (1 << 24)); // Hchint (host channel) + Prtint (port)
-    }
+    // 5d. Host-channel interrupt masks. Linux dwc2 sets HCINTMSK + HAINTMSK + GINTMSK before enabling ANY
+    //     channel (byte-level diff, 2026-07-24). The direct DMA path worked here WITHOUT them (u-boot omits
+    //     them) - but u-boot does NOT do low-speed SPLITs, and Linux does. On the v2.80a the core advances
+    //     the split state machine / registers the hub's SSPLIT ACK through the channel-interrupt path, so a
+    //     split run with the masks OFF transmits the SSPLIT but never sees the ACK -> XactErr every
+    //     microframe (exactly our HW data). So set the masks unconditionally, matching Linux. QEMU already
+    //     needed them; this makes HW match. No USB IRQ is wired on ARM - the interrupts pend unserviced,
+    //     which is fine: we poll HCINT; the masks only gate the core's own state-machine advancement.
+    wr(HCINTMSK0, 0x7FF);   // all channel-0 interrupt sources
+    wr(HAINTMSK, 0xFFFF);   // all channels
+    wr(GINTMSK, (1 << 25) | (1 << 24)); // Hchint (host channel) + Prtint (port)
     // 5e. Host PHY clock select. CRITICAL for the Pi: with a HS UTMI+ PHY (GUSBCFG.PHYSel=0) driving a
     //     full/low-speed device, Linux's dwc2_init_fs_ls_pclk_sel() selects the 30/60 MHz HS-derived
     //     clock (FSLSPClkSel=0), NOT 48 MHz (which is for a dedicated FS serial PHY). With the wrong FS/LS
@@ -455,19 +454,13 @@ fn chan_program(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_typ
     // token lands in the next, odd, one). A direct non-periodic transfer keeps OddFrm = 0 (setting it there
     // makes the v2.80a core defer the token and strand the bytes - HW-diagnosed).
     let oddfrm = if (ep_type == 3 || hcsplt != 0) && (rd(HFNUM) & 1) == 0 { HCCHAR_ODDFRM } else { 0 };
-    // On a SPLIT the host->hub leg is HIGH-speed - the hub's TT does the low-speed to the device - so the
-    // channel must NOT carry LSpdDev (which on a full-speed bus makes the core prefix a low-speed PREamble
-    // packet). HW data: the SSPLIT transmits (GNPTXSTS drains) but the hub never ACKs, XactErr in every
-    // microframe - exactly what a bogus PRE-prefixed SSPLIT to a high-speed hub would do. So clear LSpdDev
-    // for splits; a DIRECT low-speed device (none on the Pi 2, all behind the HS hub) keeps it.
-    let ls_bit = if hcsplt != 0 { 0 } else { low_speed };
     let chan = (mps & 0x7FF)
         | ((ep & 0xF) << 11)               // endpoint number
         | ((dir_in as u32) << 15)
-        | (ls_bit << 17)                   // low-speed device (cleared for splits - see above)
+        | (low_speed << 17)                // low-speed device - Linux sets LSpdDev even for a low-speed split
         | ((ep_type & 0x3) << 18)          // 0=control, 2=bulk, 3=interrupt
-        | (1 << 20)                        // multi-count = 1
-        | ((dev_addr & 0x7F) << 22)
+        | (1 << 20)                        // multi-count = 1 (Linux: ec_mc = 1 for control/bulk, incl. split)
+        | ((dev_addr & 0x7F) << 22)        // the low-speed DEVICE address (the hub address rides HCSPLT)
         | oddfrm                           // odd/even frame parity (Circle sets this per start)
         | (1 << 31);                       // channel enable
     wr(HCCHAR0, chan);
