@@ -1534,7 +1534,19 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     if bulk_xfer(true, ep_in, &mut csw, 13, 3) < 0 { pl011_write(b"dwc2: bot CSW-in failed\r\n"); return false; }
     let sig = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
     let tag = u32::from_le_bytes([csw[4], csw[5], csw[6], csw[7]]);
-    sig == 0x5342_5355 && tag == 0x1234_5678 && csw[12] == 0      // "USBS", tag echoed, bCSWStatus = passed
+    let residue = u32::from_le_bytes([csw[8], csw[9], csw[10], csw[11]]);
+    let ok = sig == 0x5342_5355 && tag == 0x1234_5678 && csw[12] == 0; // "USBS", tag echoed, status passed
+    if !ok {
+        // The transfers all succeeded but the device's verdict did not: report WHAT it said. Signature
+        // wrong = we are out of sync with the device's framing; status 1 = the SCSI command itself
+        // failed; a nonzero residue says how many bytes of the data stage it did NOT deliver.
+        pl011_write(b"dwc2: bot CSW bad - sig="); write_hex32(sig);
+        pl011_write(b" tag="); write_hex32(tag);
+        pl011_write(b" residue="); write_hex32(residue);
+        pl011_write(b" status="); write_hex32(csw[12] as u32);
+        pl011_write(b"\r\n");
+    }
+    ok
 }
 
 /// Detect a Bulk-Only mass-storage device on the current address, select its config, and prove the bulk
@@ -1576,7 +1588,13 @@ fn probe_mass_storage() -> bool {
     BULK_TOGGLE_IN.store(false, Ordering::Relaxed);
     BULK_TOGGLE_OUT.store(false, Ordering::Relaxed);
     pl011_write(b"dwc2: mass storage: bulk in ep="); write_hex32(ep_in as u32);
-    pl011_write(b" out ep="); write_hex32(ep_out as u32); pl011_write(b"\r\n");
+    pl011_write(b" out ep="); write_hex32(ep_out as u32);
+    // The bulk max-packet size and whether this device needs SPLIT transfers decide how a 512-byte
+    // block moves: one packet on a high-speed stick (mps 512, direct), or EIGHT split packets on a
+    // full-speed one (mps 64) - and a small command reply can succeed while the block read fails.
+    pl011_write(b" mps="); write_hex32(bulk_mps as u32);
+    pl011_write(b" split_port="); write_hex32(SPLIT_PORT.load(Ordering::Relaxed) as u32);
+    pl011_write(b"\r\n");
 
     // Clear the power-on UNIT ATTENTION: a freshly-attached device rejects its first command with CHECK
     // CONDITION until its sense data is drained. Loop TEST UNIT READY / REQUEST SENSE a bounded few times.
