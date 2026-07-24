@@ -3809,8 +3809,8 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "about" => help_block(ctx, "about", "system identity + credits", &[
             ("about", "name, core count, creator", "about"),
         ], true),
-        "version" => help_block(ctx, "version", "the GodspeedOS version + build stamp", &[
-            ("version", "GodspeedOS <version> (<git-sha>)", "version"),
+        "version" => help_block(ctx, "version", "the GodspeedOS version + architecture + build stamp", &[
+            ("version", "GodspeedOS <version> <arch> (<git-sha>)", "version"),
         ], true),
         "wait" => help_block(ctx, "wait", "do nothing for N seconds (q aborts)", &[
             ("wait <seconds>", "pause for N wall-clock seconds; q/Esc aborts with Err", "wait 2"),
@@ -4091,7 +4091,7 @@ static HELP: &[HelpRow] = &[
     Gap,
     Sec("System"),
     Row("about", "identity + credits"),
-    Row("version", "GodspeedOS version + build stamp"),
+    Row("version", "GodspeedOS version + architecture + build stamp"),
     Row("cores", "CPU core count"),
     Row("mem", "physical memory usage"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
@@ -4412,12 +4412,29 @@ fn cmd_about(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     Ok(())
 }
 
-/// `version` - the GodspeedOS version and build stamp: `GodspeedOS <ver> (<git-sha>)`. Distinct from
-/// `<util> version` (which reports a single utility's version); this is the whole system's version
-/// fact (conventions rule 7 - a raw fact). Pipeable like `about` (`version | write /ver.txt`). The SHA
-/// is stamped at build time by `build.rs`; a build with no git reports `unknown`.
+/// The architecture this build targets, named the way the project names it (`docs/multi-arch.md`)
+/// rather than in Rust's `target_arch` spelling - notably **arm32** for 32-bit ARMv7, which is what the
+/// Raspberry Pi 2 port is called everywhere else in the tree (`docs/arm32-status.md`,
+/// `kernel/src/arch/arm/`). One source tree now builds for several ISAs, so a version string without
+/// the architecture cannot say which machine produced it - the same reason `uname -m` exists.
+const ARCH: &str = if cfg!(target_arch = "x86_64") { "x86_64" }
+    else if cfg!(target_arch = "arm") { "arm32" }
+    else if cfg!(target_arch = "aarch64") { "aarch64" }
+    else if cfg!(target_arch = "riscv64") { "riscv64" }
+    else if cfg!(target_arch = "riscv32") { "riscv32" }
+    else if cfg!(target_arch = "loongarch64") { "loongarch64" }
+    else if cfg!(target_arch = "s390x") { "s390x" }
+    else { "unknown-arch" };
+
+/// `version` - the GodspeedOS version, architecture, and build stamp:
+/// `GodspeedOS <ver> <arch> (<git-sha>)`. Distinct from `<util> version` (which reports a single
+/// utility's version); this is the whole system's version fact (conventions rule 7 - a raw fact).
+/// Pipeable like `about` (`version | write /ver.txt`). The SHA is stamped at build time by `build.rs`;
+/// a build with no git reports `unknown`. The architecture is reported because the same source builds
+/// for several ISAs, so a serial log or bug report must say which one it came from.
 fn cmd_version_os(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
-    out.line_fmt(ctx, format_args!("GodspeedOS {} ({})", env!("CARGO_PKG_VERSION"), env!("GODSPEED_GIT_SHA")));
+    out.line_fmt(ctx, format_args!("GodspeedOS {} {} ({})",
+                                   env!("CARGO_PKG_VERSION"), ARCH, env!("GODSPEED_GIT_SHA")));
     Ok(())
 }
 
