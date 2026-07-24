@@ -106,6 +106,43 @@ pub fn set_usb_power_on() -> bool {
     mbox_call(8)
 }
 
+/// The board MAC read from the VideoCore mailbox at boot, packed little-endian into the low 48 bits with
+/// bit 63 as the valid flag (0 = not read / mailbox gave nothing -> the ethernet driver uses its default).
+/// Written once on the single-threaded caches-off boot path (`read_board_mac`), read-only afterwards.
+static mut BOARD_MAC: u64 = 0;
+const BOARD_MAC_VALID: u64 = 1 << 63;
+
+/// Read the board's Ethernet MAC from the GPU (`GET_BOARD_MAC_ADDRESS`, tag 0x00010003) and stash it for
+/// the LAN9514 driver. The Pi 2 has no EEPROM, so this is the only source of the real `b8:27:eb:..` MAC;
+/// without it the driver falls back to a locally-administered address. **Must run with the MMU + caches
+/// OFF** (before `mmu::enable`), like every mailbox call. A missing/failed reply just leaves the default.
+pub fn read_board_mac() {
+    // SAFETY: single-threaded, caches-off boot; MBOX is filled then read here only.
+    unsafe {
+        let b = &mut (*core::ptr::addr_of_mut!(MBOX)).data;
+        *b = [0; 36];
+        b[0] = 8 * 4; b[1] = 0;                       // total size, request code
+        b[2] = 0x0001_0003; b[3] = 6; b[4] = 0;       // GET_BOARD_MAC_ADDRESS, 6-byte value buffer
+        b[5] = 0; b[6] = 0;                           // response: MAC bytes 0-3, then 4-5
+        b[7] = 0;                                     // end tag
+    }
+    if !mbox_call(CHANNEL_PROP) { return; }
+    // b[5] = m0 m1 m2 m3 (LE), b[6] low 16 = m4 m5.
+    let (w0, w1) = unsafe { let b = &(*core::ptr::addr_of!(MBOX)).data; (b[5], b[6]) };
+    let packed = (w0 as u64) | (((w1 & 0xFFFF) as u64) << 32);
+    if packed == 0 { return; } // GPU returned nothing usable
+    // SAFETY: single-threaded boot, before APs are released or any task runs; no concurrent access.
+    unsafe { core::ptr::addr_of_mut!(BOARD_MAC).write(packed | BOARD_MAC_VALID); }
+}
+
+/// The board MAC read at boot, or `None` if the mailbox gave nothing (driver falls back to its default).
+pub fn board_mac() -> Option<[u8; 6]> {
+    // SAFETY: BOARD_MAC is written once on the single-threaded boot path and only read afterwards.
+    let v = unsafe { core::ptr::addr_of!(BOARD_MAC).read() };
+    if v & BOARD_MAC_VALID == 0 { return None; }
+    Some([v as u8, (v >> 8) as u8, (v >> 16) as u8, (v >> 24) as u8, (v >> 32) as u8, (v >> 40) as u8])
+}
+
 /// Ask the GPU for the display's native (physical) resolution, so the framebuffer can be requested at
 /// exactly that size and fill the screen - no pillarbox bars. `None` (fall back to a default) if the
 /// query fails or returns nothing. Runs with the MMU + caches OFF, like `request`.

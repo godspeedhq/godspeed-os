@@ -1172,15 +1172,18 @@ fn configure_smsc95xx() -> bool {
     n = 0;
     while smsc_read_reg(SMSC_PM_CTRL) & SMSC_PM_CTRL_PHY_RST != 0 { n += 1; if n > 100_000 { break; } }
 
-    // MAC: read whatever the firmware programmed into the chip; fall back to a locally-administered address.
-    // (On a real Pi the board MAC b8:27:eb:.. comes from the VideoCore mailbox - a HW-verification-time
-    // refinement; reading the chip registers first is correct when the firmware already set them.)
-    let lo = smsc_read_reg(SMSC_ADDRL);
-    let hi = smsc_read_reg(SMSC_ADDRH);
-    let mut mac = [lo as u8, (lo >> 8) as u8, (lo >> 16) as u8, (lo >> 24) as u8, hi as u8, (hi >> 8) as u8];
-    if mac == [0u8; 6] || mac == [0xFFu8; 6] {
-        mac = [0x02, 0x00, 0x00, 0x12, 0x34, 0x56];             // locally-administered (bit 1 of byte 0 set)
-    }
+    // MAC: prefer the real board MAC (b8:27:eb:..) read from the VideoCore mailbox at boot; else read
+    // whatever the firmware left in the chip; else fall back to a locally-administered address.
+    let mac = super::video::board_mac().unwrap_or_else(|| {
+        let lo = smsc_read_reg(SMSC_ADDRL);
+        let hi = smsc_read_reg(SMSC_ADDRH);
+        let m = [lo as u8, (lo >> 8) as u8, (lo >> 16) as u8, (lo >> 24) as u8, hi as u8, (hi >> 8) as u8];
+        if m == [0u8; 6] || m == [0xFFu8; 6] {
+            [0x02, 0x00, 0x00, 0x12, 0x34, 0x56]               // locally-administered (bit 1 of byte 0 set)
+        } else {
+            m
+        }
+    });
     smsc_write_reg(SMSC_ADDRL, (mac[0] as u32) | ((mac[1] as u32) << 8) | ((mac[2] as u32) << 16) | ((mac[3] as u32) << 24));
     smsc_write_reg(SMSC_ADDRH, (mac[4] as u32) | ((mac[5] as u32) << 8));
 

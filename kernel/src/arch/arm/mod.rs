@@ -500,6 +500,9 @@ extern "C" fn arm_boot_main() -> ! {
     } else {
         pl011_write(b"arm32: WARN USB HCD power-on mailbox failed (firmware may already have it on)\r\n");
     }
+    // Read the board Ethernet MAC while caches are still off (mailbox coherency); the LAN9514 driver picks
+    // it up during USB enumeration. The Pi 2 has no EEPROM, so this is the only source of the real MAC.
+    video::read_board_mac();
     mmu::enable();
     // Map the framebuffer and bring up the text console over it, so the boot log + shell prompt appear
     // on the TV (mirrored from serial). Everything logged from here on shows on the display.
