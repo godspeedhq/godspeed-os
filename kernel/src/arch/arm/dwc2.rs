@@ -455,10 +455,16 @@ fn chan_program(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_typ
     // token lands in the next, odd, one). A direct non-periodic transfer keeps OddFrm = 0 (setting it there
     // makes the v2.80a core defer the token and strand the bytes - HW-diagnosed).
     let oddfrm = if (ep_type == 3 || hcsplt != 0) && (rd(HFNUM) & 1) == 0 { HCCHAR_ODDFRM } else { 0 };
+    // On a SPLIT the host->hub leg is HIGH-speed - the hub's TT does the low-speed to the device - so the
+    // channel must NOT carry LSpdDev (which on a full-speed bus makes the core prefix a low-speed PREamble
+    // packet). HW data: the SSPLIT transmits (GNPTXSTS drains) but the hub never ACKs, XactErr in every
+    // microframe - exactly what a bogus PRE-prefixed SSPLIT to a high-speed hub would do. So clear LSpdDev
+    // for splits; a DIRECT low-speed device (none on the Pi 2, all behind the HS hub) keeps it.
+    let ls_bit = if hcsplt != 0 { 0 } else { low_speed };
     let chan = (mps & 0x7FF)
         | ((ep & 0xF) << 11)               // endpoint number
         | ((dir_in as u32) << 15)
-        | (low_speed << 17)
+        | (ls_bit << 17)                   // low-speed device (cleared for splits - see above)
         | ((ep_type & 0x3) << 18)          // 0=control, 2=bulk, 3=interrupt
         | (1 << 20)                        // multi-count = 1
         | ((dev_addr & 0x7F) << 22)
