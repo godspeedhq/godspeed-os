@@ -188,7 +188,8 @@ pub fn request(width: u32, height: u32) -> Option<FbInfo> {
         pl011_write(b"arm32: framebuffer mailbox request FAILED\r\n");
         return None;
     }
-    // SAFETY: response fields written by the GPU, now coherent after the invalidate in mbox_call.
+    // SAFETY: response fields written by the GPU; coherent because mbox_call runs caches-off (no stale
+    // line to invalidate) and issues a dsb before reading back.
     let (bus_base, pitch, w, h) = unsafe {
         let b = &(*core::ptr::addr_of!(MBOX)).data;
         (b[28], b[33], b[5], b[6])

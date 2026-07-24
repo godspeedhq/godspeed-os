@@ -82,11 +82,19 @@ pub fn memory_range() -> Option<MemRange> {
 
     let totalsize = be32(dtb + 4) as usize;
     let off_struct = be32(dtb + 8) as usize;
+    let off_strings = be32(dtb + 12) as usize;
+    let size_strings = be32(dtb + 32) as usize;
     let size_struct = be32(dtb + 36) as usize;
 
-    // Bound everything by the blob's own declared size before walking it. A corrupt header pointing
-    // outside the blob is exactly the case where a parser wanders into unmapped memory.
-    if totalsize < 40 || off_struct + size_struct > totalsize {
+    // Bound the struct AND strings blocks by the blob's own declared size before walking it, and do it
+    // OVERFLOW-SAFELY: `usize` is 32-bit on ARMv7 and every field is untrusted firmware input, so a naive
+    // `off + size > totalsize` can wrap and pass (libfdt guards this the same way). A corrupt header that
+    // points a block outside the blob is exactly how a parser wanders into unmapped memory and faults
+    // early boot (invariant 12).
+    if totalsize < 40
+        || off_struct > totalsize || size_struct > totalsize - off_struct
+        || off_strings > totalsize || size_strings > totalsize - off_strings
+    {
         return None;
     }
 
@@ -121,17 +129,23 @@ pub fn memory_range() -> Option<MemRange> {
                 let len = be32(p) as usize;
                 let nameoff = be32(p + 4) as usize;
                 let data = p + 8;
+                // The property data must fit within the struct block (overflow-safe: data <= struct_end,
+                // guaranteed by the p+8 check above), or the blob is malformed.
+                if len > struct_end - data {
+                    return None;
+                }
 
-                // The property name lives in the strings block, indexed by nameoff.
-                let off_strings = be32(dtb + 12) as usize;
-                let name_ptr = dtb + off_strings + nameoff;
-
-                if in_memory_node && name_matches(name_ptr, b"reg") && len >= 8 {
-                    // `reg` is <address size> pairs. The Pi 2 uses one address cell and one size
-                    // cell (32-bit each), which is what a 1 GiB 32-bit board wants; anything else
-                    // would need #address-cells/#size-cells handling this parser deliberately does
-                    // not pretend to have.
-                    return Some(MemRange { base: be32(data), size: be32(data + 4) });
+                // Only dereference the property name if `nameoff` (untrusted) points at a "reg\0"-sized
+                // window fully inside the strings block - libfdt gates every string access the same way.
+                // Overflow-safe (no `nameoff + 4`, which could wrap on 32-bit).
+                if in_memory_node && size_strings >= 4 && nameoff <= size_strings - 4 && len >= 8 {
+                    let name_ptr = dtb + off_strings + nameoff;
+                    // `reg` is <address size> pairs. The Pi 2 uses one address cell and one size cell
+                    // (32-bit each); anything else would need #address-cells/#size-cells handling this
+                    // parser deliberately does not pretend to have.
+                    if name_matches(name_ptr, b"reg") {
+                        return Some(MemRange { base: be32(data), size: be32(data + 4) });
+                    }
                 }
 
                 p = data + ((len + 3) & !3);
