@@ -1588,59 +1588,16 @@ fn probe_mass_storage() -> bool {
     true
 }
 
-static mut PREV_KEYS: [u8; 6] = [0; 6];
-
-/// Map a HID boot-keyboard usage code to an ASCII byte (US layout). Returns None for keys we do not feed
-/// to the console (modifiers, F-keys, ...). `shift` selects the shifted glyph.
-fn hid_to_ascii(k: u8, shift: bool) -> Option<u8> {
-    let c = match k {
-        0x04..=0x1D => {                                           // a-z
-            let base = b'a' + (k - 0x04);
-            if shift { base - 32 } else { base }
-        }
-        0x1E..=0x26 => {                                           // 1-9
-            if shift { b"!@#$%^&*("[(k - 0x1E) as usize] } else { b'1' + (k - 0x1E) }
-        }
-        0x27 => if shift { b')' } else { b'0' },                   // 0
-        0x28 => b'\r',                                             // Enter
-        0x2A => 0x08,                                              // Backspace
-        0x2B => b'\t',                                             // Tab
-        0x2C => b' ',                                              // Space
-        0x2D => if shift { b'_' } else { b'-' },
-        0x2E => if shift { b'+' } else { b'=' },
-        0x2F => if shift { b'{' } else { b'[' },
-        0x30 => if shift { b'}' } else { b']' },
-        0x31 => if shift { b'|' } else { b'\\' },
-        0x33 => if shift { b':' } else { b';' },
-        0x34 => if shift { b'"' } else { b'\'' },
-        0x36 => if shift { b'<' } else { b',' },
-        0x37 => if shift { b'>' } else { b'.' },
-        0x38 => if shift { b'?' } else { b'/' },
-        _ => return None,
-    };
-    Some(c)
+/// The keyboard's host-side decode state: the previous report's keycodes (for N-key edge detection),
+/// the Caps Lock latch (the HID modifier byte never carries it), and the typematic auto-repeat timer.
+/// One keyboard, one owner: touched only by `poll()` on core 0 (the single DWC2 poller).
+struct KbdState {
+    last: [u8; 6],
+    caps: bool,
+    rep: super::hid::KeyRepeat,
 }
-
-/// Decode one 8-byte boot report `[modifiers, reserved, key0..key5]`, pushing a byte for each key that is
-/// newly pressed this report (edge-triggered against the previous report - no auto-repeat).
-fn decode_report(r: &[u8; 8]) {
-    let shift = r[0] & 0x22 != 0;                                  // Left|Right Shift
-    // SAFETY: PREV_KEYS is touched only here, only on core 0 (the single DWC2 poller); addr_of avoids a
-    // reference to the mutable static.
-    unsafe {
-        let prev = &mut *core::ptr::addr_of_mut!(PREV_KEYS);
-        for j in 2..8 {
-            let k = r[j];
-            if k == 0 { continue; }
-            let mut was_down = false;
-            for &p in prev.iter() { if p == k { was_down = true; break; } }
-            if !was_down {
-                if let Some(c) = hid_to_ascii(k, shift) { super::console_push_byte(c); }
-            }
-        }
-        prev.copy_from_slice(&r[2..8]);
-    }
-}
+static mut KBD_STATE: KbdState =
+    KbdState { last: [0; 6], caps: false, rep: super::hid::KeyRepeat::new() };
 
 /// Called from the Core-0 timer tick. Once a keyboard is configured, run one interrupt IN transaction; on
 /// a completed transfer decode the boot report into console bytes. A NAK (no key change) returns quietly.
@@ -1667,11 +1624,27 @@ pub fn poll() {
             chan_program(true, pid, 8, data_phys, ep, 3, 0);
             poll_wait_halt()
         };
-        if ci & HCINT_XFERCOMPL == 0 { return; }             // NAK / no new report
+        // SAFETY: KBD_STATE is touched only here, only on core 0 (the single DWC2 poller); addr_of
+        // avoids taking a reference to the mutable static.
+        let ks = &mut *core::ptr::addr_of_mut!(KBD_STATE);
+        if ci & HCINT_XFERCOMPL == 0 {
+            // NAK / no new report. A HELD key sends NOTHING (a boot keyboard reports only on change),
+            // so typematic auto-repeat MUST be driven from here - the tick where nothing arrived.
+            ks.rep.poll(super::console_push_byte);
+            return;
+        }
         flush_dcache(data_phys, 8);                          // invalidate after -> read device bytes
         let mut report = [0u8; 8];
         report.copy_from_slice(&d.data[..8]);
         KBD_TOGGLE.store(!toggle, Ordering::Relaxed);            // advance the data toggle on a real packet
-        decode_report(&report);
+        // Ctrl+Alt+Del: SIGNAL it on the console stream; the shell (which holds REBOOT) decides (§6.4).
+        if super::hid::is_ctrl_alt_del(&report) {
+            super::console_push_byte(super::hid::CTRL_ALT_DEL_SIGNAL);
+            return;
+        }
+        super::hid::decode_keyboard(&report, &mut ks.last, &mut ks.rep, &mut ks.caps,
+                                    super::console_push_byte);
+        // Also service repeat on a report tick, so a held key keeps repeating while another is tapped.
+        ks.rep.poll(super::console_push_byte);
     }
 }

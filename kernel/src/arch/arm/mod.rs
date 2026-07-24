@@ -28,6 +28,7 @@ pub mod syscall;
 pub mod video;
 pub mod fbcon;
 pub mod dwc2;
+pub mod hid;
 // USB-net bridge (the mechanism the userspace ARM `nic-driver` calls): move ethernet frames to/from the
 // in-kernel CDC-ECM device. On ARM these are the real DWC2 functions; other arches stub them (net there is
 // a userspace PCIe driver, not this in-kernel USB path).

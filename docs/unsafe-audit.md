@@ -13,6 +13,20 @@ comment.
 
 ---
 
+## 2026-07-24 - full ARM keyboard decode: new `arch/arm/hid.rs`, and dwc2 unsafe SHRINKS (feat/pi2-arm32)
+
+Full HID boot-keyboard support for the ARM in-kernel USB driver (numeric keypad, arrows/navigation,
+F-keys, Caps Lock latch, Ctrl+letter, typematic auto-repeat) moved into a new **`arch/arm/hid.rs`
+containing ZERO `unsafe`** - it is pure decode logic (usage code -> bytes), no MMIO and no statics.
+The driver's old `decode_report` + its `PREV_KEYS` `unsafe` block are gone, replaced by a single
+`KBD_STATE` struct accessed inside `poll`'s ALREADY-EXISTING `unsafe` block, so `dwc2.rs`
+**shrinks 15 -> 14**. A new file with no unsafe and a net reduction in the driver.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/hid.rs` | new, 0 | Pure HID decode logic (keymap, CSI sequences, auto-repeat timing). No `unsafe`: no MMIO, no statics - the caller owns the state and passes it in. |
+| `arch/arm/dwc2.rs` | 15 -> 14 (-1) | `decode_report`'s `PREV_KEYS` block removed; the keyboard state (`KBD_STATE`) is now read inside `poll`'s existing `unsafe` block instead of a second one. |
+
 ## 2026-07-24 - DWC2 split debug + VideoCore USB power-on + board MAC (feat/pi2-arm32)
 
 Two `arch/arm/` files gained `unsafe` this session; all blocks are in the permitted arch layer (§18.1),
@@ -970,7 +984,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 11 | permitted |
 | arch/arm/fbcon.rs | 4 | permitted |
-| arch/arm/dwc2.rs | 15 | permitted |
+| arch/arm/dwc2.rs | 14 | permitted |
 | arch/arm/page_tables.rs | 27 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |
