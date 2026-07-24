@@ -449,7 +449,7 @@ fn chan_program(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_typ
         let mut t = 0u32; while rd(HCCHAR0) & (1 << 31) != 0 { t += 1; if t > 100_000 { break; } }
     }
     wr(HCINT0, 0xFFFF_FFFF);                                     // clear stale channel interrupts
-    wr(HCTSIZ0, (len & 0x7_FFFF) | (pkts << 19) | (pid << 29));  // size, packet count, starting PID
+    wr(HCTSIZ0, (len & 0x7_FFFF) | ((pkts & 0x3ff) << 19) | (pid << 29));  // size, packet count (10-bit field), starting PID
     // The HCDMA address is a *bus* address as the DWC2 master sees memory (see DMA_BUS_ALIAS).
     wr(HCDMA0, buf_phys | DMA_BUS_ALIAS);
     wr(HCSPLT0, hcsplt);                                         // split descriptor - LAST before HCCHAR (Linux order: HCTSIZ -> HCSPLT -> HCCHAR)
@@ -1093,6 +1093,7 @@ const SMSC_BULK_IN_DLY: u16 = 0x6C;
 const SMSC_MAC_CR: u16 = 0x100;
 const SMSC_MAC_CR_TXEN: u32 = 0x0000_0008;
 const SMSC_MAC_CR_RXEN: u32 = 0x0000_0004;
+const SMSC_MAC_CR_FDPX: u32 = 0x0010_0000;      // full-duplex (Linux MAC_CR_FDPX_)
 const SMSC_ADDRH: u16 = 0x104;
 const SMSC_ADDRL: u16 = 0x108;
 const SMSC_TX_CFG: u16 = 0x10;
@@ -1183,7 +1184,8 @@ fn configure_smsc95xx() -> bool {
     smsc_write_reg(SMSC_ADDRL, (mac[0] as u32) | ((mac[1] as u32) << 8) | ((mac[2] as u32) << 16) | ((mac[3] as u32) << 24));
     smsc_write_reg(SMSC_ADDRH, (mac[4] as u32) | ((mac[5] as u32) << 8));
 
-    smsc_write_reg(SMSC_HW_CFG, SMSC_HW_CFG_BIR);               // empty bulk-IN -> 0-length packet, not a NAK
+    // Read-modify-write (Linux does): a bare write would clear HW_CFG's non-zero power-on default bits.
+    smsc_write_reg(SMSC_HW_CFG, smsc_read_reg(SMSC_HW_CFG) | SMSC_HW_CFG_BIR); // empty bulk-IN -> 0-length packet, not a NAK
     smsc_write_reg(SMSC_BURST_CAP, 0);                          // one frame per transfer (our simple model)
     smsc_write_reg(SMSC_BULK_IN_DLY, 0x2000);                   // smsc95xx default
     smsc_write_reg(SMSC_AFC_CFG, 0x00F8_30A1);                  // flow-control thresholds (smsc95xx default)
@@ -1197,7 +1199,9 @@ fn configure_smsc95xx() -> bool {
     smsc_mii_write(SMSC_MII_BMCR, 0x1200);                    // ANENABLE | ANRESTART
 
     // Enable TX + RX.
-    smsc_write_reg(SMSC_MAC_CR, smsc_read_reg(SMSC_MAC_CR) | SMSC_MAC_CR_TXEN | SMSC_MAC_CR_RXEN);
+    // FDPX: the Pi's internal PHY negotiates full duplex; without setting it the MAC runs half-duplex on
+    // a full-duplex link (late collisions / drops). We do not watch link status, so set it as the default.
+    smsc_write_reg(SMSC_MAC_CR, smsc_read_reg(SMSC_MAC_CR) | SMSC_MAC_CR_TXEN | SMSC_MAC_CR_RXEN | SMSC_MAC_CR_FDPX);
     smsc_write_reg(SMSC_TX_CFG, SMSC_TX_CFG_ON);
 
     BULK_MPS.store(bulk_mps, Ordering::Relaxed);

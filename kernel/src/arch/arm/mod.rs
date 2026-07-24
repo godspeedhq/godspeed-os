@@ -389,7 +389,14 @@ pub(super) fn pl011_write_byte(b: u8) {
     // SAFETY: PL011_FR/PL011_DR are the BCM2836 UART0 flag and data registers, identity-mapped with
     // the MMU off. Volatile MMIO: poll until the TX FIFO has room, then write one byte to transmit.
     unsafe {
-        while PL011_FR.read_volatile() & PL011_FR_TXFF != 0 {}
+        // Bounded: a wedged/absent UART with a permanently-full TX FIFO must never hang the console
+        // output path (invariant 12 / §26.6). Matches the bounded BUSY poll in `pl011_init` (Audit 6);
+        // this one was missed. On a healthy UART the FIFO drains far faster than the cap.
+        let mut t: u32 = 0;
+        while PL011_FR.read_volatile() & PL011_FR_TXFF != 0 {
+            t += 1;
+            if t > 1_000_000 { break; } // drop the byte rather than hang forever
+        }
         PL011_DR.write_volatile(b as u32);
     }
 }

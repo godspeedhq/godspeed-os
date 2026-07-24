@@ -46,6 +46,8 @@ const C1_CLK_STABLE: u32 = 1 << 1;
 const C1_CLK_EN: u32 = 1 << 2;
 const C1_TOUNIT_MAX: u32 = 0x000E_0000;
 const C1_SRST_HC: u32 = 1 << 24;
+const C1_SRST_CMD: u32 = 1 << 25; // SOFTWARE_RESET.RESET_CMD (byte 0x2F)
+const C1_SRST_DATA: u32 = 1 << 26; // SOFTWARE_RESET.RESET_DATA
 
 // CMDTM command encodings: index<<24 | RSPNS_TYPE<<16 | flags. RSPNS 1=136-bit, 2=48-bit, 3=48-bit-busy.
 // CMD_ISDATA=1<<21, TM_DAT_DIR read=1<<4.
@@ -91,12 +93,25 @@ impl<'a> Sd<'a> {
         loop {
             let i = self.rd(INTERRUPT);
             if i & INT_CMD_DONE != 0 { break; }
-            if i & INT_ERR != 0 { return None; }
+            if i & INT_ERR != 0 { self.reset_cmd_dat(); return None; }
             t += 1;
             if t > 2_000_000 { return None; }
         }
         self.wr(INTERRUPT, INT_CMD_DONE);
         Some(self.rd(RESP0))
+    }
+
+    /// After a command/data error the CMD and DAT lines stay inhibited (SDHCI 3.10) - every later command
+    /// would then spin to its bounded timeout. Reset both lines (bounded) and clear the latched error bits
+    /// so I/O is not wedged by one transient glitch. Called on every error return below.
+    fn reset_cmd_dat(&self) {
+        self.wr(CONTROL1, self.rd(CONTROL1) | C1_SRST_CMD | C1_SRST_DATA);
+        let mut t = 0u32;
+        while self.rd(CONTROL1) & (C1_SRST_CMD | C1_SRST_DATA) != 0 {
+            t += 1;
+            if t > 1_000_000 { break; }
+        }
+        self.wr(INTERRUPT, self.rd(INTERRUPT)); // clear latched error/status bits
     }
 
     fn acmd(&self, code: u32, arg: u32) -> Option<u32> {
@@ -198,7 +213,7 @@ impl<'a> Sd<'a> {
         loop {
             let i = self.rd(INTERRUPT);
             if i & INT_READ_RDY != 0 { break; }
-            if i & INT_ERR != 0 { return false; }
+            if i & INT_ERR != 0 { self.reset_cmd_dat(); return false; }
             t += 1;
             if t > 2_000_000 { return false; }
         }
@@ -225,7 +240,7 @@ impl<'a> Sd<'a> {
         loop {
             let i = self.rd(INTERRUPT);
             if i & INT_WRITE_RDY != 0 { break; }
-            if i & INT_ERR != 0 { return false; }
+            if i & INT_ERR != 0 { self.reset_cmd_dat(); return false; }
             t += 1;
             if t > 2_000_000 { return false; }
         }
@@ -242,7 +257,7 @@ impl<'a> Sd<'a> {
         loop {
             let i = self.rd(INTERRUPT);
             if i & INT_DATA_DONE != 0 { break; }
-            if i & INT_ERR != 0 { return false; }
+            if i & INT_ERR != 0 { self.reset_cmd_dat(); return false; }
             t += 1;
             if t > 2_000_000 { return false; }
         }
