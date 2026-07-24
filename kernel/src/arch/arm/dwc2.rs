@@ -329,7 +329,7 @@ fn reset_port() {
     spin(3_000_000); // ~50 ms of USB reset (generous; bounded)
     let base = rd(HPRT) & !HPRT_RMW_CLEAR;
     wr(HPRT, base & !HPRT_PRTRST);
-    spin(1_000_000); // recovery time before the port enables
+    super::timer::delay_us(10_000); // TRSTRCY: 10 ms reset recovery on the real 1 MHz clock (not the freq-dependent spin)
 
     let mut waited = 0u32;
     while rd(HPRT) & HPRT_PRTENA == 0 {
@@ -588,8 +588,11 @@ fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u
             }
             if !ok { return false; }
             off += chunk;
-            if off >= len { return true; }                  // whole transfer done (len == 0 completes here)
-            if chunk < mps { return true; }                 // a short packet ends the transfer early
+            if off >= len || chunk < mps {                  // whole transfer done (len==0 here), or a short packet ended it
+                // Next data PID = flip of the last packet's PID; bulk_xfer reads this to keep the toggle in sync.
+                NEXT_BULK_PID_DATA1.store(cur_pid == PID_DATA0, Ordering::Relaxed);
+                return true;
+            }
             cur_pid = if cur_pid == PID_DATA1 { PID_DATA0 } else { PID_DATA1 }; // control/bulk data toggle
         }
     }
@@ -597,7 +600,11 @@ fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u
     for attempt in 0..tries {
         chan_program(dir_in, pid, len, buf_phys, ep, ep_type, 0);
         let ci = wait_halt();
-        if ci & HCINT_XFERCOMPL != 0 { return true; }
+        if ci & HCINT_XFERCOMPL != 0 {
+            // The core advances HCTSIZ.PID [30:29] to the next data PID (parity- and ZLP-correct); bulk_xfer reads it.
+            NEXT_BULK_PID_DATA1.store((rd(HCTSIZ0) >> 29) & 0x3 == PID_DATA1, Ordering::Relaxed);
+            return true;
+        }
         if ci & (1 << 3) != 0 { return false; }         // STALL - hard failure
         if attempt + 1 < tries { spin(5_000); }         // NAK / XactErr - brief backoff, then retry
     }
@@ -815,7 +822,7 @@ fn enumerate_sync() {
         pl011_write(b"dwc2: SET_ADDRESS failed - USB unavailable\r\n"); return;
     }
     DEV_ADDR.store(1, Ordering::Relaxed);
-    spin(300_000); // USB spec: 2 ms recovery before the device answers on its new address
+    super::timer::delay_us(2000); // TDSETADDR: 2 ms SET_ADDRESS recovery on the real 1 MHz clock
 
     // GET_DESCRIPTOR(device, 18) at address 1 -> VID/PID/class.
     if !get_descriptor(0x80, 0x01, 0x00, 0, &mut buf, 18) {
@@ -933,7 +940,7 @@ fn enumerate_downstream(low: bool, addr: u8, split_port: u8) -> bool {
 
     if !control_out(0x00, 0x05, addr as u16, 0) { pl011_write(b"dwc2: downstream SET_ADDRESS failed\r\n"); return false; }
     DEV_ADDR.store(addr, Ordering::Relaxed);
-    spin(300_000);
+    super::timer::delay_us(2000); // TDSETADDR: 2 ms SET_ADDRESS recovery on the real 1 MHz clock
 
     if !get_descriptor(0x80, 0x01, 0x00, 0, &mut buf, 18) {
         pl011_write(b"dwc2: downstream desc18 failed\r\n"); return false;
@@ -1047,7 +1054,8 @@ fn configure_cdc_ecm(nconfigs: u8) -> bool {
         let mac = read_mac_string(imac);
         // SET_INTERFACE(data_iface, data_alt): activate the alt setting that exposes the bulk endpoints.
         control_out(0x01, 0x0B, data_alt as u16, data_iface as u16);
-        // SET_ETHERNET_PACKET_FILTER (CDC class, req 0x43) on the control interface: directed+broadcast+multicast.
+        // SET_ETHERNET_PACKET_FILTER (CDC class, req 0x43) on the control interface. 0x0E =
+        // DIRECTED(0x04) | BROADCAST(0x08) | ALL_MULTICAST(0x02) - a superset of Linux's DIRECTED|BROADCAST.
         control_out(0x21, 0x43, 0x000E, ctrl_iface as u16);
 
         BULK_MPS.store(bulk_mps, Ordering::Relaxed);
@@ -1260,7 +1268,18 @@ pub fn net_frame_tx(frame: &[u8]) -> bool {
         buf[..n].copy_from_slice(&frame[..n]);                 // CDC-ECM: raw frame
         n
     };
-    bulk_xfer(false, ep_out, &mut buf, total, 3) >= 0
+    if bulk_xfer(false, ep_out, &mut buf, total, 3) < 0 { return false; }
+    // CDC-ECM delimits a datagram with a short packet; a frame that is an exact multiple of the bulk max
+    // packet size needs a trailing zero-length packet, or the device won't see the frame boundary. (smsc95xx
+    // carries an explicit length in its TX command, so it needs no ZLP.)
+    if NET_KIND.load(Ordering::Relaxed) != NET_KIND_SMSC {
+        let mps = BULK_MPS.load(Ordering::Relaxed) as usize;
+        if total != 0 && mps != 0 && total % mps == 0 {
+            let mut zlp = [0u8; 1];
+            let _ = bulk_xfer(false, ep_out, &mut zlp, 0, 3);
+        }
+    }
+    true
 }
 
 /// Receive one ethernet frame (a single bulk IN attempt), copied into `dst`. Returns the frame length, or
@@ -1365,6 +1384,10 @@ fn configure_keyboard() -> bool {
 // A bulk endpoint keeps its own DATA0/DATA1 toggle per direction, advanced only on a completed packet.
 static BULK_TOGGLE_IN:  AtomicBool = AtomicBool::new(false);
 static BULK_TOGGLE_OUT: AtomicBool = AtomicBool::new(false);
+/// The next data PID (true = DATA1) after the most recent chan_dma, computed from the ACTUAL packet count
+/// (split path) or the HCTSIZ.PID readback (direct path). bulk_xfer stores this into the endpoint toggle so
+/// an even-packet-count transfer does not desync - a blind flip is only correct for odd packet counts.
+static NEXT_BULK_PID_DATA1: AtomicBool = AtomicBool::new(false);
 static BULK_MPS:        AtomicU8   = AtomicU8::new(64);   // bulk endpoint max-packet (set at config time)
 
 /// One bulk transfer on endpoint `ep`, through the `DMA.data` buffer, with cache maintenance for the A7's
@@ -1399,7 +1422,9 @@ fn bulk_xfer(dir_in: bool, ep: u32, data: &mut [u8], len: usize, tries: u32) -> 
             if chan_dma(false, pid, data_phys, n as u32, ep, 2, tries) { n as i32 } else { -1i32 }
         }
     };
-    if got >= 0 { toggle.store(!toggle.load(Ordering::Relaxed), Ordering::Relaxed); }
+    // Advance the endpoint data toggle to the parity-correct next PID that chan_dma computed (from the actual
+    // packet count / HCTSIZ.PID) - NOT a blind flip, which desyncs on an even-packet-count multi-packet transfer.
+    if got >= 0 { toggle.store(NEXT_BULK_PID_DATA1.load(Ordering::Relaxed), Ordering::Relaxed); }
     got
 }
 
@@ -1428,7 +1453,8 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     let mut csw = [0u8; 13];
     if bulk_xfer(true, ep_in, &mut csw, 13, 3) < 0 { pl011_write(b"dwc2: bot CSW-in failed\r\n"); return false; }
     let sig = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
-    sig == 0x5342_5355 && csw[12] == 0                            // "USBS" and bCSWStatus = passed
+    let tag = u32::from_le_bytes([csw[4], csw[5], csw[6], csw[7]]);
+    sig == 0x5342_5355 && tag == 0x1234_5678 && csw[12] == 0      // "USBS", tag echoed, bCSWStatus = passed
 }
 
 /// Detect a Bulk-Only mass-storage device on the current address, select its config, and prove the bulk
