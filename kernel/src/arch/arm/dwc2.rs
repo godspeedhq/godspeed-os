@@ -444,10 +444,10 @@ fn chan_program(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_typ
         let mut t = 0u32; while rd(HCCHAR0) & (1 << 31) != 0 { t += 1; if t > 100_000 { break; } }
     }
     wr(HCINT0, 0xFFFF_FFFF);                                     // clear stale channel interrupts
-    wr(HCSPLT0, hcsplt);                                         // split descriptor (0 = direct transaction)
     wr(HCTSIZ0, (len & 0x7_FFFF) | (pkts << 19) | (pid << 29));  // size, packet count, starting PID
     // The HCDMA address is a *bus* address as the DWC2 master sees memory (see DMA_BUS_ALIAS).
     wr(HCDMA0, buf_phys | DMA_BUS_ALIAS);
+    wr(HCSPLT0, hcsplt);                                         // split descriptor - LAST before HCCHAR (Linux order: HCTSIZ -> HCSPLT -> HCCHAR)
     // Odd-frame scheduling applies to PERIODIC transfers AND SPLIT transactions (a split's SSPLIT/CSPLIT
     // are microframe-scheduled by the hub's TT - fresh-eyes checklist: derive OddFrm from the target frame
     // including control splits). Target the NEXT microframe: OddFrm set when the current one is even (so the
