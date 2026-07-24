@@ -71,6 +71,9 @@ struct Sd<'a> {
     rca: u32,
     sdhc: bool,
     sectors: u64,
+    /// The controller's base clock in Hz, from the platform (InspectKernel query 20). Every card clock
+    /// is derived from it; 0 means the platform did not report one and init refuses rather than guessing.
+    base_clock: u32,
 }
 
 impl<'a> Sd<'a> {
@@ -120,18 +123,47 @@ impl<'a> Sd<'a> {
         self.cmd(code, arg)
     }
 
-    fn set_clock(&self, divider: u32) -> bool {
+    /// The SDHCI clock divider for a target card clock, from the controller's real base clock.
+    ///
+    /// The card clock is `base / (2 * divisor)`, and the divisor is split across CONTROL1 as the
+    /// SDHCI-3.0 10-bit field: low 8 bits at [15:8], high 2 bits at [7:6]. Deriving it from the ACTUAL
+    /// base clock is the whole point - a hardcoded divider only yields the intended clock on the board
+    /// it was measured on, and running the identification clock too fast means no card ever answers
+    /// (the failure this driver had on real hardware while passing under emulation).
+    fn divider_for(&self, target_hz: u32) -> u32 {
+        let base = self.base_clock;
+        if base == 0 || target_hz == 0 { return 0; }
+        let mut divisor = (base + (2 * target_hz) - 1) / (2 * target_hz); // ceil: never faster than asked
+        if divisor > 0x3FF { divisor = 0x3FF; }
+        divisor
+    }
+
+    /// Program the card clock. `divisor` is the value from `divider_for`.
+    fn set_clock(&self, divisor: u32, ctx: &ServiceContext) -> bool {
         self.wr(CONTROL1, self.rd(CONTROL1) & !C1_CLK_EN);
         for _ in 0..5 { spin(); }
-        let c1 = (self.rd(CONTROL1) & !0x0000_FFE0) | C1_CLK_INTLEN | ((divider & 0xFF) << 8) | C1_TOUNIT_MAX;
+        let c1 = (self.rd(CONTROL1) & !0x0000_FFE0)
+            | C1_CLK_INTLEN
+            | ((divisor & 0xFF) << 8)          // divider low 8 bits  [15:8]
+            | (((divisor >> 8) & 0x3) << 6)    // divider high 2 bits [7:6] (SDHCI 3.0 10-bit mode)
+            | C1_TOUNIT_MAX;
         self.wr(CONTROL1, c1);
+        // The Arasan loses successive writes to the same register that fall within two card-clock cycles
+        // of each other (a clock-domain-crossing erratum Linux's sdhci-iproc spaces out explicitly). At
+        // the 400 kHz identification clock two cycles is ~5 us, so space the CONTROL1 writes generously.
+        for _ in 0..40 { spin(); }
         let mut t = 0u32;
         while self.rd(CONTROL1) & C1_CLK_STABLE == 0 {
             t += 1;
-            if t > 1_000_000 { return false; }
+            if t > 1_000_000 {
+                ctx.log_fmt(format_args!(
+                    "block-driver: EMMC clock never stable (divisor={}, CONTROL1={:#010x})",
+                    divisor, self.rd(CONTROL1)));
+                return false;
+            }
         }
         self.wr(CONTROL1, self.rd(CONTROL1) | C1_CLK_EN);
-        for _ in 0..5 { spin(); }
+        for _ in 0..40 { spin(); }
         true
     }
 
@@ -168,28 +200,61 @@ impl<'a> Sd<'a> {
             t += 1;
             if t > 1_000_000 { ctx.log("block-driver: EMMC SRST_HC never cleared"); return false; }
         }
-        if !self.set_clock(0x68) { return false; }
+        // Every card clock derives from the controller's REAL base clock, which only the platform knows
+        // (the Arasan's capability register reports it wrongly on this SoC). Refuse rather than guess: a
+        // divider computed from a wrong base runs the identification clock at the wrong speed, and no
+        // card answers - which is a silent failure on hardware and no failure at all under emulation.
+        if self.base_clock == 0 {
+            ctx.log("block-driver: EMMC base clock unknown (platform reported 0) - cannot set the card clock");
+            return false;
+        }
+        let id_div = self.divider_for(400_000); // 400 kHz identification clock (SD spec)
+        ctx.log_fmt(format_args!("block-driver: EMMC base clock {} Hz, identification divisor {}",
+                                 self.base_clock, id_div));
+        // Each step reports WHICH one failed. A bare `return false` told us only "no usable SD card",
+        // which on real hardware is the difference between "the controller is not wired to the card" and
+        // "the card refused a command" - a whole debugging session apart (invariant 12: loud failure).
+        if !self.set_clock(id_div, ctx) { return false; }
         self.wr(INT_EN, 0xFFFF_FFFF);
         self.wr(INT_MASK, 0xFFFF_FFFF);
 
-        if self.cmd(CMD_GO_IDLE, 0).is_none() { return false; }
-        if self.cmd(CMD_SEND_IF_COND, 0x0000_01AA).is_none() { return false; }
+        if self.cmd(CMD_GO_IDLE, 0).is_none() {
+            ctx.log_fmt(format_args!("block-driver: CMD0 (GO_IDLE) failed - STATUS={:#010x} INT={:#010x}",
+                                     self.rd(STATUS), self.rd(INTERRUPT)));
+            return false;
+        }
+        if self.cmd(CMD_SEND_IF_COND, 0x0000_01AA).is_none() {
+            ctx.log_fmt(format_args!("block-driver: CMD8 (SEND_IF_COND) failed - STATUS={:#010x} INT={:#010x}",
+                                     self.rd(STATUS), self.rd(INTERRUPT)));
+            return false;
+        }
         let mut ocr = 0u32;
         let mut tries = 0u32;
         loop {
-            ocr = match self.acmd(CMD_SEND_OP_COND, 0x51FF_8000) { Some(v) => v, None => return false };
+            ocr = match self.acmd(CMD_SEND_OP_COND, 0x51FF_8000) {
+                Some(v) => v,
+                None => {
+                    ctx.log_fmt(format_args!("block-driver: ACMD41 failed - STATUS={:#010x} INT={:#010x}",
+                                             self.rd(STATUS), self.rd(INTERRUPT)));
+                    return false;
+                }
+            };
             if ocr & 0x8000_0000 != 0 { break; }
             tries += 1;
-            if tries > 200 { ctx.log("block-driver: ACMD41 never ready"); return false; }
+            if tries > 200 { ctx.log_fmt(format_args!("block-driver: ACMD41 never ready (OCR={:#010x})", ocr)); return false; }
             for _ in 0..20 { spin(); }
         }
         self.sdhc = ocr & 0x4000_0000 != 0;
-        if self.cmd(CMD_ALL_SEND_CID, 0).is_none() { return false; }
-        self.rca = match self.cmd(CMD_SEND_REL_ADDR, 0) { Some(v) => v & 0xFFFF_0000, None => return false };
+        if self.cmd(CMD_ALL_SEND_CID, 0).is_none() { ctx.log("block-driver: CMD2 (ALL_SEND_CID) failed"); return false; }
+        self.rca = match self.cmd(CMD_SEND_REL_ADDR, 0) {
+            Some(v) => v & 0xFFFF_0000,
+            None => { ctx.log("block-driver: CMD3 (SEND_REL_ADDR) failed"); return false; }
+        };
         // CSD (capacity) while the card is in stand-by, addressed by RCA.
-        if self.cmd(CMD_SEND_CSD, self.rca).is_none() { return false; }
+        if self.cmd(CMD_SEND_CSD, self.rca).is_none() { ctx.log("block-driver: CMD9 (SEND_CSD) failed"); return false; }
         self.sectors = self.read_capacity();
-        let _ = self.set_clock(0x04);
+        // Identification done - step up to the normal-speed clock (25 MHz, SD spec) for data transfer.
+        let _ = self.set_clock(self.divider_for(25_000_000), ctx);
         if self.cmd(CMD_CARD_SELECT, self.rca).is_none() { return false; }
         ctx.log_fmt(format_args!(
             "block-driver: SD card ready ({}, {} sectors = {} MiB)",
@@ -313,7 +378,7 @@ fn serve(sd: &Sd, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapHandle
 
 /// Entry point: initialise the EMMC + serve block I/O to `fs`.
 pub fn run(ctx: &ServiceContext, mmio: &Mmio) -> ! {
-    let mut sd = Sd { m: mmio, rca: 0, sdhc: false, sectors: 0 };
+    let mut sd = Sd { m: mmio, rca: 0, sdhc: false, sectors: 0, base_clock: ctx.emmc_base_clock_hz() };
     if !sd.init(ctx) {
         ctx.log("block-driver: no usable SD card - serving errors so fs never hangs");
         loop {

@@ -143,6 +143,62 @@ pub fn board_mac() -> Option<[u8; 6]> {
     Some([v as u8, (v >> 8) as u8, (v >> 16) as u8, (v >> 24) as u8, (v >> 32) as u8, (v >> 40) as u8])
 }
 
+/// Ask the VideoCore to power ON the SD card (`SET_POWER_STATE`, device 0, `ON | WAIT`). Circle and
+/// rpi-boot both do this before touching the EMMC controller. Like the USB HCD (device 3), the Arasan
+/// EMMC's register interface answers even when the card's power domain is off, so skipping this yields
+/// exactly the observed symptom: registers read fine, no command ever completes. QEMU stubs the tag, so
+/// a missing power-on is invisible under emulation and fatal on hardware. Returns the GPU's success flag.
+/// **Must run with the MMU + caches OFF** (before `mmu::enable`), like every mailbox call.
+pub fn set_sd_power_on() -> bool {
+    // SAFETY: single-threaded, caches-off boot; MBOX is filled then read here only.
+    unsafe {
+        let b = &mut (*core::ptr::addr_of_mut!(MBOX)).data;
+        *b = [0; 36];
+        b[0] = 8 * 4; b[1] = 0;
+        b[2] = 0x0002_8001; b[3] = 8; b[4] = 0;   // SET_POWER_STATE
+        b[5] = 0;                                  // device id 0 = SD card
+        b[6] = 0b11;                               // ON | WAIT (block until powered + stable)
+        b[7] = 0;
+    }
+    if !mbox_call(CHANNEL_PROP) { return false; }
+    // Response state: bit0 = on, bit1 = "device does not exist".
+    let state = unsafe { (*core::ptr::addr_of!(MBOX)).data[6] };
+    state & 1 != 0 && state & 2 == 0
+}
+
+/// The EMMC base clock in Hz, read from the GPU at boot (`GET_CLOCK_RATE`, clock id 1 = EMMC).
+/// 0 = not read / the GPU gave nothing.
+static mut EMMC_CLOCK_HZ: u32 = 0;
+
+/// Ask the GPU for the EMMC controller's base clock. The SD driver MUST derive its clock divider from
+/// this: the Arasan's CAPS base-clock field is garbage on the BCM283x (Linux marks it `missing_caps`),
+/// and a hardcoded guess silently produces the wrong card clock - a driver that assumes ~41.7 MHz (the
+/// Pi 3 value) runs its "400 kHz" identification clock several times too fast on a Pi 2, so no card ever
+/// answers CMD0/CMD8 while QEMU, which ignores clocks entirely, passes. **Caches-off boot path only.**
+pub fn read_emmc_clock() {
+    // SAFETY: single-threaded, caches-off boot; MBOX is filled then read here only.
+    unsafe {
+        let b = &mut (*core::ptr::addr_of_mut!(MBOX)).data;
+        *b = [0; 36];
+        b[0] = 8 * 4; b[1] = 0;
+        b[2] = 0x0003_0002; b[3] = 8; b[4] = 4;   // GET_CLOCK_RATE
+        b[5] = 1;                                  // clock id 1 = EMMC
+        b[6] = 0;                                  // response: rate in Hz
+        b[7] = 0;
+    }
+    if !mbox_call(CHANNEL_PROP) { return; }
+    let hz = unsafe { (*core::ptr::addr_of!(MBOX)).data[6] };
+    // SAFETY: single-threaded boot, before APs are released or any task runs.
+    unsafe { core::ptr::addr_of_mut!(EMMC_CLOCK_HZ).write(hz); }
+}
+
+/// The EMMC base clock in Hz (0 if the GPU never reported one - the driver then refuses rather than
+/// guessing a divider, because a wrong guess is a silent failure).
+pub fn emmc_clock_hz() -> u32 {
+    // SAFETY: written once on the single-threaded boot path, read-only afterwards.
+    unsafe { core::ptr::addr_of!(EMMC_CLOCK_HZ).read() }
+}
+
 /// Ask the GPU for the display's native (physical) resolution, so the framebuffer can be requested at
 /// exactly that size and fill the screen - no pillarbox bars. `None` (fall back to a default) if the
 /// query fails or returns nothing. Runs with the MMU + caches OFF, like `request`.

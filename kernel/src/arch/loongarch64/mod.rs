@@ -98,6 +98,12 @@ pub fn map_fixed_driver_mmio(_pt: &mut page_tables::PageTable, _name: &str) -> O
 pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
 // No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
 pub fn hw_random() -> Option<u32> { None }
+
+/// The SD/EMMC controller's base clock in Hz, or 0 where the platform does not report one
+/// (the block driver then refuses to guess a divider). Only the Pi's ARM port learns this,
+/// from the VideoCore mailbox at boot.
+pub fn emmc_base_clock_hz() -> u32 { 0 }
+
 // No GPIO on this arch (the ARM `gpio` shell command is Pi-only).
 pub fn gpio_op(_op: u32, _pin: u32) -> i64 { -1 }
 pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }

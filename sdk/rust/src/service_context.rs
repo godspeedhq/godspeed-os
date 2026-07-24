@@ -849,6 +849,19 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u32 }
     }
 
+    /// The SD/EMMC controller's base clock in Hz (0 if the platform does not report one), via
+    /// InspectKernel query 20. The block driver needs it to compute its clock divider: on the BCM283x
+    /// the controller's own capability register reports the base clock wrongly, and the driver holds
+    /// only its controller's registers, so it cannot ask the platform firmware itself. A driver that
+    /// gets 0 should report that rather than guess - a wrong divider runs the card's identification
+    /// clock at the wrong speed, which fails on hardware and not under emulation. Ungated - task-neutral
+    /// hardware info, like the console geometry and the RTC.
+    pub fn emmc_base_clock_hz(&self) -> u32 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=20 = EMMC base clock (Hz).
+        let ret = unsafe { raw_syscall(13, 20, 0, 0) };
+        if ret < 0 { 0 } else { ret as u32 }
+    }
+
     /// The discovered NIC's PCI identity as `vendor | device<<16` (0 if no NIC), via InspectKernel
     /// query 14. A NIC driver reads it to know which chip it is driving (e.g. Intel e1000 =
     /// 0x100E_8086 vs Realtek RTL8168 = 0x8168_10EC). Ungated - task-neutral hardware info.

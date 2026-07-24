@@ -66,6 +66,61 @@ const GPIO_BASE:  usize = PERIPHERAL_BASE + 0x20_0000;
 const GPFSEL1:    *mut u32 = (GPIO_BASE + 0x04) as *mut u32; // function select for GPIO10-19
 const GPPUD:      *mut u32 = (GPIO_BASE + 0x94) as *mut u32; // pull up/down enable
 const GPPUDCLK0:  *mut u32 = (GPIO_BASE + 0x98) as *mut u32; // pull up/down clock (GPIO0-31)
+const GPFSEL4:    *mut u32 = (GPIO_BASE + 0x10) as *mut u32; // function select for GPIO40-49
+const GPFSEL5:    *mut u32 = (GPIO_BASE + 0x14) as *mut u32; // function select for GPIO50-53
+const GPPUDCLK1:  *mut u32 = (GPIO_BASE + 0x9C) as *mut u32; // pull up/down clock (GPIO32-53)
+
+/// Route the SD-card pins (GPIO 48-53) to the **Arasan EMMC** controller and report what the firmware
+/// had them set to.
+///
+/// The BCM283x wires the card slot to EITHER controller, selected by the pins' alternate function:
+/// **ALT0 (fsel 4) = the Broadcom `sdhost` block**, **ALT3 (fsel 7) = the Arasan EMMC** (which is the
+/// controller `block-driver` drives, and the one bare-metal projects use - a Pi 2 has no SDIO WiFi to
+/// need the other). If the firmware left them on sdhost, the Arasan is electrically disconnected from
+/// the card: its registers answer perfectly while no command ever completes.
+///
+/// The read-back is logged BEFORE the write, because it is the one fact that distinguishes "the card was
+/// muxed away from us" from "the card is ours and something else is wrong" - worth a line of boot log
+/// forever. This is board-level pin muxing, so it belongs here and not in the driver, which is granted
+/// only its own controller's registers (§12.3).
+fn sd_route_to_emmc() {
+    // SAFETY: GPFSEL4/5 and the pull registers are the BCM2835 GPIO block, inside the Device-mapped
+    // peripheral window; volatile reads/writes of ordinary MMIO on the single-threaded boot path.
+    unsafe {
+        let (f4, f5) = (GPFSEL4.read_volatile(), GPFSEL5.read_volatile());
+        // Pins 48,49 are fields 8,9 of GPFSEL4; pins 50-53 are fields 0..3 of GPFSEL5.
+        let mut fsel = [0u32; 6];
+        fsel[0] = (f4 >> 24) & 7; // 48
+        fsel[1] = (f4 >> 27) & 7; // 49
+        for i in 0..4 { fsel[2 + i] = (f5 >> (i * 3)) & 7; } // 50..53
+        pl011_write(b"arm32: SD pins 48-53 fsel=");
+        for v in fsel.iter() { pl011_write(&[b'0' + (*v as u8 & 7)]); }
+        pl011_write(if fsel.iter().all(|v| *v == 7) {
+            b" (ALT3 = Arasan EMMC, already ours)\r\n" as &[u8]
+        } else if fsel.iter().all(|v| *v == 4) {
+            b" (ALT0 = sdhost - the card was muxed AWAY from the EMMC; routing it back)\r\n"
+        } else {
+            b" (mixed/unexpected - routing to ALT3 = Arasan EMMC)\r\n"
+        });
+
+        // ALT3 (7) for 48,49 in GPFSEL4 and 50-53 in GPFSEL5.
+        let mut r4 = GPFSEL4.read_volatile();
+        r4 = (r4 & !((7 << 24) | (7 << 27))) | (7 << 24) | (7 << 27);
+        GPFSEL4.write_volatile(r4);
+        let mut r5 = GPFSEL5.read_volatile();
+        for i in 0..4 { r5 = (r5 & !(7 << (i * 3))) | (7 << (i * 3)); }
+        GPFSEL5.write_volatile(r5);
+
+        // Pull-ups on CLK/CMD (48,49) and DAT0-3 (50-53). GPPUDCLK1 bit N = GPIO 32+N, so 48-53 are
+        // bits 16-21. The BCM2835 pull sequence is: set GPPUD, wait, strobe the clock, wait, clear both.
+        GPPUD.write_volatile(2); // 2 = pull-up
+        for _ in 0..150 { core::arch::asm!("nop", options(nomem, nostack)); }
+        GPPUDCLK1.write_volatile((1 << 16) | (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21));
+        for _ in 0..150 { core::arch::asm!("nop", options(nomem, nostack)); }
+        GPPUD.write_volatile(0);
+        GPPUDCLK1.write_volatile(0);
+    }
+}
 
 /// Route GPIO14/GPIO15 to the UART (ALT0) so BOTH transmit AND receive reach header pins 8/10. The
 /// firmware often muxes only GPIO14 (TX) for console *output*, leaving GPIO15 (RX) as an input - so
@@ -510,6 +565,19 @@ extern "C" fn arm_boot_main() -> ! {
     // Read the board Ethernet MAC while caches are still off (mailbox coherency); the LAN9514 driver picks
     // it up during USB enumeration. The Pi 2 has no EEPROM, so this is the only source of the real MAC.
     video::read_board_mac();
+    // SD card, same caches-off window: power the card's domain (the EMMC registers answer even when it is
+    // off - the same trap as the USB HCD) and learn the EMMC base clock from the GPU. The base clock MUST
+    // come from here: the Arasan's CAPS field is garbage on this SoC, and a guessed divider runs the
+    // identification clock at the wrong speed, which no card answers.
+    if video::set_sd_power_on() {
+        pl011_write(b"arm32: SD card powered on via VideoCore mailbox\r\n");
+    } else {
+        pl011_write(b"arm32: WARN SD power-on mailbox failed (firmware may already have it on)\r\n");
+    }
+    video::read_emmc_clock();
+    pl011_write(b"arm32: EMMC base clock = ");
+    timer::write_dec_pub(video::emmc_clock_hz());
+    pl011_write(b" Hz\r\n");
     mmu::enable();
     // Map the framebuffer and bring up the text console over it, so the boot log + shell prompt appear
     // on the TV (mirrored from serial). Everything logged from here on shows on the display.
@@ -518,6 +586,10 @@ extern "C" fn arm_boot_main() -> ! {
         fbcon::init(fb.base, fb.pitch, fb.width, fb.height);
         pl011_write(b"arm32: framebuffer console up - this line should appear on the TV\r\n");
     }
+    // Route the SD-card pins to the Arasan EMMC (and report what the firmware left them as). After
+    // `mmu::enable` because it touches the Device-mapped peripheral window, unlike the mailbox calls
+    // above which must run caches-off.
+    sd_route_to_emmc();
     timer::init();
     const TICK_HZ: u32 = 100; // 10 ms quantum, matching CLAUDE.md section 9.1
     if irq::start_tick(TICK_HZ) {
@@ -692,6 +764,12 @@ pub fn hardware_reset() -> ! {
 /// A hardware-random u32 from the BCM2835 SoC RNG, or None if it never produced (absent/wedged - loud, not
 /// a fallback). Ungated (InspectKernel query 19); the `random` shell utility consumes it. Best-effort under
 /// concurrent callers (an unlocked FIFO pop) - fine for a diagnostic, not fed to crypto.
+/// The SD/EMMC controller's base clock in Hz, read from the VideoCore mailbox at boot (0 = the GPU
+/// never reported one). Exposed to `block-driver` through InspectKernel query 20 because the Arasan's
+/// own capability register reports this wrongly on the BCM283x, and the driver is granted only its
+/// controller's registers - it cannot ask the mailbox itself (§12.3).
+pub fn emmc_base_clock_hz() -> u32 { video::emmc_clock_hz() }
+
 pub fn hw_random() -> Option<u32> {
     use core::sync::atomic::{AtomicBool, Ordering};
     const RNG_CTRL:   usize = PERIPHERAL_BASE + 0x10_4000;

@@ -1315,7 +1315,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // boot/RTC reads (10, 11). Every other query discloses another task's or
     // system-wide state and requires the INTROSPECT capability with READ (§3.1;
     // docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19)
+    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -1379,6 +1379,13 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // RNG. Ungated: reading entropy confers no authority (like the raw TSC, query 3). The `random`
         // shell utility consumes it. A u32 is always 0..2^32, so it never collides with the -1 sentinel.
         19 => match crate::arch::imp::hw_random() { Some(v) => v as i64, None => -1 },
+        // 20 = the SD/EMMC controller's base clock in Hz, learned from the platform at boot. Task-neutral
+        // hardware info like the console geometry (9) and the RTC (10/11), so ungated. The block driver
+        // needs it to compute its clock divider: the controller's own capability register reports this
+        // wrongly on the BCM283x, and a guessed divider runs the card's identification clock at the wrong
+        // speed - which fails silently on hardware and not at all under emulation. 0 = unknown, and the
+        // driver then reports rather than guessing.
+        20 => crate::arch::imp::emmc_base_clock_hz() as i64,
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,

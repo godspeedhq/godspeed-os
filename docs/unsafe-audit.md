@@ -13,6 +13,31 @@ comment.
 
 ---
 
+## 2026-07-24 - SD card bring-up on real hardware: mailbox power + base clock + pin routing (feat/pi2-arm32)
+
+The Pi 2's SD card init failed on hardware while passing under emulation. Three board-level steps the
+Arasan EMMC needs, none of which the driver can do itself (it is granted only its controller's 4 KiB
+register window - §12.3), so they live in the kernel's boot path like the USB power-on before them:
+
+- **`video::set_sd_power_on`** - mailbox `SET_POWER_STATE` device 0 (SD card). The EMMC's registers
+  answer even when the card's power domain is off, so skipping it gives exactly the observed symptom:
+  registers read fine, no command completes. QEMU stubs the tag, so it is invisible there.
+- **`video::read_emmc_clock` / `emmc_clock_hz`** - mailbox `GET_CLOCK_RATE` clock id 1. The base clock
+  MUST come from the platform: the Arasan's capability register reports it wrongly on this SoC (Linux
+  marks it `missing_caps`), and a guessed divider runs the card's identification clock at the wrong
+  speed, which no card answers.
+- **`sd_route_to_emmc`** (mod.rs) - route GPIO 48-53 to ALT3 (the Arasan) with the BCM2835 pull-up
+  sequence, and log what the firmware had them set to first (ALT0 = the other `sdhost` controller,
+  which would leave the Arasan electrically disconnected from the card).
+
+All in the permitted `arch/` layer, each block SAFETY-commented, all single-threaded boot-path MMIO or
+the caches-off mailbox buffer.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/video.rs` | 11 -> 17 (+6) | `set_sd_power_on` (MBOX fill + response read, +2), `read_emmc_clock` (MBOX fill + response read + `EMMC_CLOCK_HZ` store, +3), `emmc_clock_hz` (static read, +1). |
+| `arch/arm/mod.rs` | 42 -> 43 (+1) | `sd_route_to_emmc` - GPFSEL4/5 read-back + ALT3 write and the GPPUD/GPPUDCLK1 pull sequence for GPIO 48-53. |
+
 ## 2026-07-24 - underline cursor on the ARM framebuffer console (feat/pi2-arm32)
 
 The TV console had no visible cursor (x86 draws an underline; ARM did not). `fbcon` now paints a 2 px
@@ -996,7 +1021,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/irq.rs | 11 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 8 | permitted |
-| arch/arm/video.rs | 11 | permitted |
+| arch/arm/video.rs | 17 | permitted |
 | arch/arm/fbcon.rs | 5 | permitted |
 | arch/arm/dwc2.rs | 14 | permitted |
 | arch/arm/page_tables.rs | 27 | permitted |
@@ -1007,7 +1032,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 42 | permitted |
+| arch/arm/mod.rs | 43 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
 | arch/riscv64/mod.rs | 23 | permitted |
