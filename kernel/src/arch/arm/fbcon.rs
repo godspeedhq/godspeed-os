@@ -37,10 +37,18 @@ struct Fbcon {
     // draw "[K" as literal glyphs, which is the garble seen on the TV when typing (`h[Ke[Kl[Kp[K`).
     ansi: u8,
     csi_param: u32,
+    csi_private: bool,   // the CSI carried a `?` (a private sequence, e.g. `ESC[?25l` hide cursor)
+    // The underline cursor: where it was last painted, so it can be lifted before the write position
+    // moves. Full-screen apps (edit, observe) turn it off with `ESC[?25l` and back on with `ESC[?25h`.
+    cursor_visible: bool,
+    cur_col: usize,
+    cur_row: usize,
+    cursor_on: bool,     // is the underline currently painted at (cur_col, cur_row)?
 }
 static mut FBCON: Fbcon = Fbcon {
     base: 0, pitch: 0, width: 0, height: 0, org_x: 0, org_y: 0, cols: 0, rows: 0, col: 0, row: 0,
-    ansi: 0, csi_param: 0,
+    ansi: 0, csi_param: 0, csi_private: false,
+    cursor_visible: true, cur_col: 0, cur_row: 0, cursor_on: false,
 };
 static READY: AtomicBool = AtomicBool::new(false);
 
@@ -66,6 +74,11 @@ pub fn init(base: u32, pitch: u32, width: u32, height: u32) {
         c.row = 0;
         c.ansi = 0;
         c.csi_param = 0;
+        c.csi_private = false;
+        c.cursor_visible = true;
+        c.cur_col = 0;
+        c.cur_row = 0;
+        c.cursor_on = false;
         clear(c);
     }
     READY.store(true, Ordering::Release);
@@ -167,6 +180,48 @@ fn scroll(c: &Fbcon) {
     clean_rect(c, c.org_x, c.org_y, c.cols * CELL_W, c.rows * CELL_H);
 }
 
+/// Height of the underline cursor, in pixels at the bottom of the cell.
+const CURSOR_H: usize = 2;
+
+/// Paint or lift the underline cursor at `(cur_col, cur_row)`. `on = true` paints it in the foreground
+/// colour; `on = false` lifts it by repainting that strip in the background colour.
+///
+/// Unlike x86's console this keeps no shadow grid of the screen's characters, so lifting the cursor
+/// repaints the strip rather than redrawing the glyph underneath. That is exact for the normal case -
+/// during typing the cursor always sits one cell PAST the last character, on a blank cell - and at worst
+/// clips the bottom 2 px of a descender (g, y, p) when the cursor is moved back over text with Left/Home.
+/// The shell redraws the line on edits, so even that is transient. Keeping a full grid to avoid a 2 px
+/// artifact is not worth the memory or the code here.
+fn paint_cursor(c: &Fbcon, on: bool) {
+    if c.cur_row >= c.rows || c.cur_col >= c.cols { return; }
+    let x0 = c.org_x + c.cur_col * CELL_W;
+    let y0 = c.org_y + c.cur_row * CELL_H + CELL_H - CURSOR_H;
+    let colour = if on { blend(255) } else { BG };
+    for gy in 0..CURSOR_H {
+        for gx in 0..CELL_W {
+            put_pixel(c, x0 + gx, y0 + gy, colour);
+        }
+    }
+    clean_rect(c, x0, y0, CELL_W, CURSOR_H);
+}
+
+/// Lift the cursor if it is currently painted (called before anything moves the write position).
+fn cursor_lift(c: &mut Fbcon) {
+    if c.cursor_on {
+        paint_cursor(c, false);
+        c.cursor_on = false;
+    }
+}
+
+/// Paint the cursor at the current write position, if the cursor is enabled.
+fn cursor_show(c: &mut Fbcon) {
+    if !c.cursor_visible { return; }
+    c.cur_col = c.col;
+    c.cur_row = c.row;
+    paint_cursor(c, true);
+    c.cursor_on = true;
+}
+
 /// `ESC[K` (Erase in Line): blank the current row from the cursor to the end of the text area. The shell's
 /// line editor emits this after each echoed character to wipe any leftover tail.
 fn erase_to_eol(c: &Fbcon) {
@@ -182,59 +237,86 @@ fn erase_to_eol(c: &Fbcon) {
     clean_rect(c, x0, y0, w, CELL_H);
 }
 
-/// Render one byte of the serial stream. Consumes ANSI CSI escape sequences (so they are acted on, not
-/// drawn as literal text); handles CR/LF/backspace; printable ASCII draws a glyph and advances. When the
-/// screen fills, scroll up one row (no blanking).
+/// Render one byte into the console state. Consumes ANSI CSI escape sequences (so they are acted on,
+/// not drawn as literal text); handles CR/LF/backspace; printable ASCII draws a glyph and advances.
+/// When the screen fills, scroll up one row (no blanking).
+///
+/// The CURSOR is not touched here - the callers below lift it before a run and repaint it after, so a
+/// bulk write moves it once instead of once per byte.
+fn put_byte_inner(c: &mut Fbcon, b: u8) {
+    // --- ANSI escape handling (before any glyph is drawn) ---
+    if c.ansi == 1 {                                   // previous byte was ESC
+        c.ansi = if b == b'[' { 2 } else { 0 };        // only CSI (`ESC[`) is understood
+        c.csi_param = 0;
+        c.csi_private = false;
+        return;
+    }
+    if c.ansi == 2 {                                   // inside a CSI sequence
+        if (0x30..=0x3F).contains(&b) {                // parameter bytes: digits, ';', '?'
+            if b == b'?' { c.csi_private = true; }     // `ESC[?...` - a private sequence
+            if b.is_ascii_digit() {
+                c.csi_param = c.csi_param.saturating_mul(10) + (b - b'0') as u32;
+            }
+            return;
+        }
+        if (0x20..=0x2F).contains(&b) { return; }      // intermediate bytes
+        // 0x40..=0x7E: the final byte ends the sequence.
+        c.ansi = 0;
+        let p = c.csi_param;
+        let private = c.csi_private;
+        c.csi_param = 0;
+        c.csi_private = false;
+        match b {
+            b'K' => erase_to_eol(c),                   // EL - what the line editor uses
+            b'J' if p == 2 => { clear(c); c.col = 0; c.row = 0; } // ED(2) - clear screen
+            // `ESC[?25l` / `ESC[?25h` - hide / show the cursor. Full-screen apps (edit, observe) hide it
+            // for the session so their bulk redraws do not smear an underline across the screen.
+            b'l' if private && p == 25 => c.cursor_visible = false,
+            b'h' if private && p == 25 => c.cursor_visible = true,
+            _ => {}                                    // SGR colours, cursor moves, ... : ignored
+        }
+        return;
+    }
+    if b == 0x1B { c.ansi = 1; c.csi_param = 0; c.csi_private = false; return; } // ESC starts a sequence
+    match b {
+        b'\n' => { c.col = 0; c.row += 1; }
+        b'\r' => { c.col = 0; }
+        0x08 => { if c.col > 0 { c.col -= 1; draw_glyph(c, b' ', c.col, c.row); } }
+        0x20..=0x7E => { draw_glyph(c, b, c.col, c.row); c.col += 1; }
+        _ => {} // control byte: ignore (serial keeps the full stream)
+    }
+    if c.col >= c.cols { c.col = 0; c.row += 1; }
+    if c.row >= c.rows {
+        scroll(c);
+        c.row = c.rows - 1;
+        c.col = 0;
+    }
+}
+
+/// Render one byte, then leave the underline cursor at the new write position.
 pub fn put_byte(b: u8) {
     if !READY.load(Ordering::Relaxed) { return; }
     // SAFETY: FBCON is published; concurrent callers are serialized by pl011_write's SERIAL_BUSY guard
     // (the only caller), so there is a single writer at a time.
     unsafe {
         let c = &mut *core::ptr::addr_of_mut!(FBCON);
-        // --- ANSI escape handling (before any glyph is drawn) ---
-        if c.ansi == 1 {                                   // previous byte was ESC
-            c.ansi = if b == b'[' { 2 } else { 0 };        // only CSI (`ESC[`) is understood
-            c.csi_param = 0;
-            return;
-        }
-        if c.ansi == 2 {                                   // inside a CSI sequence
-            if (0x30..=0x3F).contains(&b) {                // parameter bytes: digits, ';', '?'
-                if b.is_ascii_digit() {
-                    c.csi_param = c.csi_param.saturating_mul(10) + (b - b'0') as u32;
-                }
-                return;
-            }
-            if (0x20..=0x2F).contains(&b) { return; }      // intermediate bytes
-            // 0x40..=0x7E: the final byte ends the sequence.
-            c.ansi = 0;
-            let p = c.csi_param;
-            c.csi_param = 0;
-            match b {
-                b'K' => erase_to_eol(c),                   // EL - what the line editor uses
-                b'J' if p == 2 => { clear(c); c.col = 0; c.row = 0; } // ED(2) - clear screen
-                _ => {}                                    // SGR colours, cursor moves, ... : ignored
-            }
-            return;
-        }
-        if b == 0x1B { c.ansi = 1; c.csi_param = 0; return; } // ESC starts a sequence
-        match b {
-            b'\n' => { c.col = 0; c.row += 1; }
-            b'\r' => { c.col = 0; }
-            0x08 => { if c.col > 0 { c.col -= 1; draw_glyph(c, b' ', c.col, c.row); } }
-            0x20..=0x7E => { draw_glyph(c, b, c.col, c.row); c.col += 1; }
-            _ => {} // control byte: ignore (serial keeps the full stream)
-        }
-        if c.col >= c.cols { c.col = 0; c.row += 1; }
-        if c.row >= c.rows {
-            scroll(c);
-            c.row = c.rows - 1;
-            c.col = 0;
-        }
+        cursor_lift(c);
+        put_byte_inner(c, b);
+        cursor_show(c);
     }
 }
 
+/// Render a run of bytes, moving the underline cursor ONCE for the whole run rather than once per byte.
+/// Lifting and repainting per byte would double the pixel traffic of bulk output (a `help` listing, a
+/// scroll) for no visible benefit - the intermediate positions are never seen. Lifting BEFORE the run
+/// also keeps the underline from being scrolled up the screen as a stray mark.
 pub fn put_bytes(s: &[u8]) {
-    for &b in s {
-        put_byte(b);
+    if !READY.load(Ordering::Relaxed) { return; }
+    // SAFETY: as `put_byte` - single writer, serialized by the SERIAL_BUSY guard in pl011_write.
+    unsafe {
+        let c = &mut *core::ptr::addr_of_mut!(FBCON);
+        cursor_lift(c);
+        for &b in s { put_byte_inner(c, b); }
+        cursor_show(c);
     }
 }

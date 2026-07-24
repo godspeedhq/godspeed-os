@@ -13,6 +13,20 @@ comment.
 
 ---
 
+## 2026-07-24 - underline cursor on the ARM framebuffer console (feat/pi2-arm32)
+
+The TV console had no visible cursor (x86 draws an underline; ARM did not). `fbcon` now paints a 2 px
+underline at the write position, lifts it before the position moves, and honours `ESC[?25l`/`ESC[?25h`
+so full-screen apps can hide it. The cursor is moved ONCE per write run rather than once per byte, so
+bulk output (a `help` listing, a scroll) does not pay for it - which is why `put_bytes` gained its own
+`unsafe` block instead of looping over the public `put_byte`: one borrow of the `FBCON` static for the
+whole run. `arch/arm/fbcon.rs` unsafe 4 -> 5 (+1), permitted arch layer, SAFETY-commented, same
+single-writer justification as the existing blocks (serialized by `pl011_write`'s SERIAL_BUSY guard).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/fbcon.rs` | 4 -> 5 (+1) | `put_bytes` borrows the `FBCON` static once for a whole run (lift cursor, render every byte, repaint cursor) instead of re-borrowing per byte via `put_byte`. |
+
 ## 2026-07-24 - full ARM keyboard decode: new `arch/arm/hid.rs`, and dwc2 unsafe SHRINKS (feat/pi2-arm32)
 
 Full HID boot-keyboard support for the ARM in-kernel USB driver (numeric keypad, arrows/navigation,
@@ -983,7 +997,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 11 | permitted |
-| arch/arm/fbcon.rs | 4 | permitted |
+| arch/arm/fbcon.rs | 5 | permitted |
 | arch/arm/dwc2.rs | 14 | permitted |
 | arch/arm/page_tables.rs | 27 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
