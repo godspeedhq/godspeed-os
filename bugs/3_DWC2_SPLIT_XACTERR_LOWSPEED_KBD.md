@@ -1,8 +1,38 @@
 # DWC2 split-transaction XactErr: low-speed keyboard behind the LAN9514 hub
 
-**Status:** open. USB DMA + high-speed enumeration WORK on the real Pi 2; the low-speed
-keyboard behind the hub does not. Branch `feat/pi2-arm32`. Driver: `kernel/src/arch/arm/dwc2.rs`
-(in-kernel, polled, internal buffer-DMA).
+**Status: RESOLVED (2026-07-24), QEMU-validated; hardware boot pending (user away).** The XactErr
+was TWO bugs stacked, both in how we drove HCSPLT / the split DATA stage - not microframe
+scheduling (that lead, section 1b onward, was correctly ruled out by the data; the real cause was
+below it). Branch `feat/pi2-arm32`. Driver: `kernel/src/arch/arm/dwc2.rs`.
+
+## 0. Resolution (read this first)
+
+Found by reading Circle's register header (`include/circle/usb/dwhci.h`) - the ratified doctrine of
+grokking a *working* reference - instead of trusting a remembered bit layout.
+
+1. **HCSPLT HubAddr / PrtAddr were SWAPPED** (commit `aa83788`). The DWC2 databook / Circle layout is
+   `PrtAddr[6:0]` = the hub PORT, `HubAddr[13:7]` = the hub's DEVICE address. Our `hcsplt_for_current`
+   built `1 | (port << 7)` - hub address in the port field and vice-versa. So every Start-Split was
+   addressed to hub-address = *port number*, which is not a hub, so nothing ACK'd it: transmitted,
+   unanswered, XactErr in **every** microframe regardless of TT mode or timing - exactly the observed
+   signature. **Why QEMU never caught it:** QEMU's keyboard sits on hub PORT 1, where PrtAddr and
+   HubAddr are *both* 1 and the swap is invisible; a device on port >= 2 (the real keyboard on port 2)
+   is the first place the two fields differ.
+
+2. **Multi-packet control-IN over split retrieved only the FIRST packet** (commit `d9071ef`). Once (1)
+   let low-speed devices start enumerating, the 18-byte device descriptor came back as 8 correct bytes
+   + 10 **stale** (leftover LAN9514 interface-descriptor data in the shared DMA buffer). HW dump of two
+   *different* devices on ports 2 and 4 showed **identical** tails and `bNumConfigurations = 0x00`
+   (impossible) - proof the tail was not real data. Root cause: the DWC2 does **not** auto-continue a
+   multi-packet transfer over a SPLIT in buffer-DMA mode (it halts XferCompl after the first low/full-
+   speed packet); the direct high-speed path is fine because the core frames + toggles multi-packet
+   itself (which is why ethernet/wifi enumerated all along). Fix: `chan_dma` sequences the split
+   transfer one `mps`-sized packet per `split_txn`, advancing the buffer and toggling DATA1/DATA0
+   itself (matches u-boot / Circle per-packet split handling).
+
+QEMU after both fixes: the low-speed keyboard enumerates with the full correct descriptor
+(`... 27 06 01 00 00 00 01 04 0b 01`, VID 0627 PID 0001, `bNumConfigurations=01`) and reaches
+`boot keyboard ready`. Everything below is the (correct, still-useful) investigation that led here.
 
 ---
 
