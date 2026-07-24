@@ -670,6 +670,12 @@ fn link_is_up(ctx: &ServiceContext) -> bool {
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("net-stack: starting");
+    // Announce the API BEFORE the configuration dance. The dance can take seconds (DHCP and ARP each
+    // wait out their budget when there is no link), and logging after it meant this line landed on the
+    // console AFTER the shell had already printed its prompt - leaving `gsh> net-stack: ...` on one
+    // line at boot. Announcing first is also the more honest order: this reports that the service came
+    // up, and the dance below reports its own result (offer/no offer) as it happens.
+    ctx.log("net-stack: serving the client API (status/dns/socket)");
 
     // Configure the stack (DHCP -> ARP -> ICMP). These are `mut` because `net renew` (op 8) re-runs the
     // dance in place - a link that comes up after boot recovers without a reboot.
@@ -683,7 +689,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut sockets = [Socket { rid: 0, port: 0 }; MAX_SOCKETS];
     let mut ping_seq: u16 = 0;                    // unique ICMP seq per ping - see ping() (RTT accuracy)
     let tsc_hz = calibrate_tsc_hz(&ctx);          // RTC-calibrated TSC Hz for RTT (kernel calib is 0 on T630)
-    ctx.log("net-stack: serving the client API (status/dns/socket)");
     loop {
         let req = ctx.recv();                   // block for a client request
         // A nonzero badge = a SOCKET-CAPABILITY invocation the kernel validated (§7.10). A plain
