@@ -493,7 +493,13 @@ fn poll_wait_halt() -> u32 {
         }
     }
 }
-const POLL_HALT_BUDGET_US: u32 = 500; // per in-ISR halt wait; tick is 10 ms, a healthy split halts in << 1 ms
+/// Per in-ISR halt wait. Generous enough not to ABANDON a transfer that is about to complete: if this
+/// expires just as the device's data lands, the controller has already ACKed it - the device considers
+/// the report delivered and will not resend - so we would silently LOSE that report. Losing a key-RELEASE
+/// report is what left a key armed and auto-repeating until the next keypress (`appearddddddddd` on real
+/// hardware). Worst case per poll is one start-split plus three complete-splits = ~4 ms, still under half
+/// the 10 ms scheduler tick, so the ISR still cannot starve the scheduler.
+const POLL_HALT_BUDGET_US: u32 = 1000;
 
 /// One-shot diagnostic dump of the channel + core-config state on a stalled transfer (`wait_halt` calls it
 /// on its bounded timeout); `DUMPED` gates it to the FIRST stall so the log is never flooded.

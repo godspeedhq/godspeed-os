@@ -140,10 +140,13 @@ pub struct KeyRepeat {
     next_at: u32,  // systimer microsecond value at which the next repeat is due
 }
 
-/// Delay before the first repeat: a deliberate hold, not a normal keypress.
-const REPEAT_INITIAL_US: u32 = 400_000; // 400 ms
-/// Delay between repeats once repeating (~25 characters/second).
-const REPEAT_INTERVAL_US: u32 = 40_000; // 40 ms
+/// Delay before the first repeat. Must require a CLEARLY DELIBERATE hold: at 400 ms ordinary typing
+/// tripped it on real hardware (`appeardddddddddddd`, `multiplere`), because a brief pause mid-word is
+/// easily that long. 600 ms is the value x86 settled on for the same complaint - fast enough to feel
+/// responsive when you mean it, slow enough that normal typing never triggers it.
+const REPEAT_INITIAL_US: u32 = 600_000; // 600 ms
+/// Delay between repeats once repeating (~20 characters/second).
+const REPEAT_INTERVAL_US: u32 = 50_000; // 50 ms
 
 /// Wrap-safe "has `now` reached `when`?" - the 1 MHz counter's low word wraps every ~71 minutes, so
 /// compare the signed difference rather than the raw values.
