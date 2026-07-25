@@ -166,7 +166,9 @@ impl KeyRepeat {
         self.next_at = now.wrapping_add(REPEAT_INITIAL_US);
     }
 
-    fn disarm(&mut self) {
+    /// Stop repeating. Called on release, and by the driver when it can no longer see the keyboard
+    /// (an unreachable poll leaves our view of which keys are down stale - better silent than spewing).
+    pub fn disarm(&mut self) {
         self.key = 0;
     }
 

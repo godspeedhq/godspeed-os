@@ -281,7 +281,12 @@ fn put_byte_inner(c: &mut Fbcon, b: u8) {
     match b {
         b'\n' => { c.col = 0; c.row += 1; }
         b'\r' => { c.col = 0; }
-        0x08 => { if c.col > 0 { c.col -= 1; draw_glyph(c, b' ', c.col, c.row); } }
+        // Backspace is a NON-DESTRUCTIVE cursor-left move, exactly as on a terminal. Drawing a space
+        // here (as this did) erases the character the cursor lands on - so moving LEFT along a line
+        // deleted the text instead of just moving through it, and the line editor's redraw, which
+        // repositions with a run of backspaces after reprinting the tail, wiped what it had just drawn.
+        // A caller that wants to erase sends the classic backspace-space-backspace itself.
+        0x08 => { if c.col > 0 { c.col -= 1; } }
         0x20..=0x7E => { draw_glyph(c, b, c.col, c.row); c.col += 1; }
         _ => {} // control byte: ignore (serial keeps the full stream)
     }

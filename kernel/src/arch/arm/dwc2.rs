@@ -379,6 +379,7 @@ const PID_DATA1: u32 = 2;
 const PID_SETUP: u32 = 3;
 // HCINT bits
 const HCINT_XFERCOMPL: u32 = 1 << 0;
+const HCINT_NAK: u32 = 1 << 4;   // the device positively answered "nothing new"
 const HCINT_CHHLTD:    u32 = 1 << 1;
 
 // --- Internal DMA mode ------------------------------------------------------
@@ -1715,9 +1716,13 @@ struct KbdState {
     last: [u8; 6],
     caps: bool,
     rep: super::hid::KeyRepeat,
+    /// Consecutive polls that did not reach the keyboard (timeout / transaction error, as opposed to a
+    /// clean NAK). While this is nonzero our view of which keys are down is stale, so auto-repeat is
+    /// held back; past a few in a row it is disarmed outright.
+    unhealthy: u8,
 }
 static mut KBD_STATE: KbdState =
-    KbdState { last: [0; 6], caps: false, rep: super::hid::KeyRepeat::new() };
+    KbdState { last: [0; 6], caps: false, rep: super::hid::KeyRepeat::new(), unhealthy: 0 };
 
 /// Called from the Core-0 timer tick. Once a keyboard is configured, run one interrupt IN transaction; on
 /// a completed transfer decode the boot report into console bytes. A NAK (no key change) returns quietly.
@@ -1748,11 +1753,26 @@ pub fn poll() {
         // avoids taking a reference to the mutable static.
         let ks = &mut *core::ptr::addr_of_mut!(KBD_STATE);
         if ci & HCINT_XFERCOMPL == 0 {
-            // NAK / no new report. A HELD key sends NOTHING (a boot keyboard reports only on change),
-            // so typematic auto-repeat MUST be driven from here - the tick where nothing arrived.
-            ks.rep.poll(super::console_push_byte);
+            // No new report. A HELD key sends NOTHING (a boot keyboard reports only on change), so
+            // typematic auto-repeat MUST be driven from here - the tick where nothing arrived.
+            //
+            // But ONLY on a clean NAK, which is the device positively saying "nothing has changed".
+            // A timeout or transaction error means we did not reach the keyboard at all, so we do not
+            // know whether the key is still down - and if the report we missed was the key's RELEASE,
+            // repeating would spew characters the user never typed until the next keypress. That is
+            // exactly what appeared once a USB stick joined the bus: block I/O shares this single host
+            // channel, keyboard polls started failing, and held keys ran on. Several unreachable polls
+            // in a row mean we have lost track of the keyboard entirely - disarm rather than guess.
+            if ci & HCINT_NAK != 0 {
+                ks.unhealthy = 0;
+                ks.rep.poll(super::console_push_byte);
+            } else {
+                ks.unhealthy = ks.unhealthy.saturating_add(1);
+                if ks.unhealthy > 3 { ks.rep.disarm(); }
+            }
             return;
         }
+        ks.unhealthy = 0;
         flush_dcache(data_phys, 8);                          // invalidate after -> read device bytes
         let mut report = [0u8; 8];
         report.copy_from_slice(&d.data[..8]);
