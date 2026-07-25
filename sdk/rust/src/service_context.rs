@@ -1248,7 +1248,20 @@ impl ServiceContext {
     /// `reply` (a SEND|GRANT cap) so the owner can reply. `Ok(())` on delivery. Syscall 31.
     pub fn resource_invoke(&self, file: CapHandle, right: u8, reply: CapHandle, msg: &Message)
         -> Result<(), IpcError> {
-        let packed = ((right as u64) << 32) | ((reply.0 as u64) << 16) | (file.0 as u64);
+        // Packed into ONE 32-BIT word: file[0..12] | reply[12..24] | right[24..32].
+        //
+        // A syscall argument is a single register, and on a 32-bit target (arm32's r1/r2/r3) that
+        // register is 32 bits - so anything placed above bit 31 is silently truncated on the way in.
+        // The original layout put `right` at bit 32, which arrived as 0 on ARM: the kernel then had
+        // no right to validate, `fs` received a badge of 0, and every real operation failed `op <=
+        // right` while a read-only cap invoked declaring WRITE sailed past the kernel check that was
+        // supposed to stop it. Three symptoms, one truncated field.
+        //
+        // 12 bits per slot is 4095 against a MAX_CAPS_PER_TASK of 64 - room to grow by 60x - and
+        // `right` is a u8, so the whole thing lands in 24 bits with 8 to spare. This is the A-U1
+        // rule from arch/arm/CLAUDE.md: on a 32-bit ABI, a syscall argument that does not fit in one
+        // register must be narrowed at the wrapper, never assumed to survive.
+        let packed = ((right as u64) << 24) | ((reply.0 as u64) << 12) | (file.0 as u64);
         let payload = msg.payload_bytes();
         // SAFETY: syscall(31) = ResourceInvoke; packed + payload are user values the kernel
         // validates (cap slots, rights, generation, and the message bounds) before acting.

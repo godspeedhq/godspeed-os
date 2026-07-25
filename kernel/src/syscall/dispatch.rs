@@ -1149,7 +1149,9 @@ fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
 // Syscall: ResourceInvoke (31) - use a delegated (file) cap (§7.10, P2).
 // ---------------------------------------------------------------------------
 
-/// arg0 = (right_bits << 32) | (reply_grant_slot << 16) | file_cap_slot
+/// arg0 = (right_bits << 24) | (reply_grant_slot << 12) | file_cap_slot - ONE 32-bit word, because a
+/// syscall argument is one register and that register is 32 bits on a 32-bit target (see the SDK's
+/// `resource_invoke`: a field above bit 31 is truncated away on arm32).
 /// arg1 = msg_ptr (user VA), arg2 = msg_len.
 ///
 /// The "use = send" of a delegated resource cap. Validates the file cap carries `right_bits`
@@ -1161,9 +1163,9 @@ fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
 /// trusts the client, and the kernel never learns the operation.
 fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     use crate::capability::delegated;
-    let file_slot  = (packed & 0xFFFF) as usize;
-    let reply_slot = ((packed >> 16) & 0xFFFF) as usize;
-    let right_bits = ((packed >> 32) & 0xFF) as u8;
+    let file_slot  = (packed & 0xFFF) as usize;
+    let reply_slot = ((packed >> 12) & 0xFFF) as usize;
+    let right_bits = ((packed >> 24) & 0xFF) as u8;
     let required   = Rights(right_bits);
 
     // 1. Validate the file cap holds the requested right (generation + rights, global table).
