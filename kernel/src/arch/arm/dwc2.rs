@@ -1520,6 +1520,31 @@ fn bulk_xfer(dir_in: bool, ep: u32, data: &mut [u8], len: usize, tries: u32) -> 
 // BOT wraps each SCSI command in a 31-byte CBW (bulk OUT), an optional data stage, and a 13-byte CSW
 // (bulk IN). Signatures: CBW "USBC" (0x43425355), CSW "USBS" (0x53425355).
 
+/// Attempts per bulk transfer inside a BOT command. A real stick NAKs while its flash is busy - an
+/// erase or an internal remap can outlast a single attempt - so give it several rather than declaring
+/// the device broken on the first one. Each attempt is separately time-bounded, so this lengthens the
+/// patience without lengthening any single interrupts-off window.
+const BOT_TRIES: u32 = 10;
+
+/// Recover the Bulk-Only endpoints after a failed command.
+///
+/// **Why a failure must not merely be reported.** A BOT command is three transfers (CBW, data, CSW). If
+/// one fails the device is left mid-command: its endpoint may be HALTED and our data toggle no longer
+/// matches its. Every later command then fails too - which is exactly what hardware showed, one bad
+/// transfer turning into `drives check`, `drives scrub` and `fcap` all failing in a row. Clearing the
+/// halt on both endpoints and resetting the toggles puts the pair back in a known state, so a transient
+/// glitch costs one command instead of every command after it.
+///
+/// USB 2.0 CLEAR_FEATURE(ENDPOINT_HALT): bmRequestType 0x02 (host-to-device, endpoint recipient),
+/// bRequest 0x01, wValue 0, wIndex = the endpoint address with bit 7 set for an IN endpoint. Clearing
+/// the halt also resets the DEVICE's toggle to DATA0, which is why ours is reset to match.
+fn bot_recover(ep_in: u32, ep_out: u32) {
+    let _ = control_out(0x02, 0x01, 0x0000, (ep_in | 0x80) as u16); // bulk IN
+    let _ = control_out(0x02, 0x01, 0x0000, ep_out as u16);         // bulk OUT
+    BULK_TOGGLE_IN.store(false, Ordering::Relaxed);
+    BULK_TOGGLE_OUT.store(false, Ordering::Relaxed);
+}
+
 /// Run one SCSI command via BOT. `cdb` is the SCSI command block; `data`/`dlen` is the data stage
 /// (`data_in` selects direction). Returns true iff the command completed with CSW status = passed.
 fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u8], dlen: usize) -> bool {
@@ -1533,13 +1558,23 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     let n = cdb.len().min(16);
     cbw[15..15 + n].copy_from_slice(&cdb[..n]);
 
-    if bulk_xfer(false, ep_out, &mut cbw, 31, 3) < 0 { pl011_write(b"dwc2: bot CBW-out failed\r\n"); return false; }
-    if dlen > 0 && bulk_xfer(data_in, if data_in { ep_in } else { ep_out }, data, dlen, 3) < 0 {
-        pl011_write(b"dwc2: bot data-stage failed\r\n"); return false;
+    if bulk_xfer(false, ep_out, &mut cbw, 31, BOT_TRIES) < 0 {
+        pl011_write(b"dwc2: bot CBW-out failed\r\n");
+        bot_recover(ep_in, ep_out);
+        return false;
+    }
+    if dlen > 0 && bulk_xfer(data_in, if data_in { ep_in } else { ep_out }, data, dlen, BOT_TRIES) < 0 {
+        pl011_write(b"dwc2: bot data-stage failed\r\n");
+        bot_recover(ep_in, ep_out);
+        return false;
     }
 
     let mut csw = [0u8; 13];
-    if bulk_xfer(true, ep_in, &mut csw, 13, 3) < 0 { pl011_write(b"dwc2: bot CSW-in failed\r\n"); return false; }
+    if bulk_xfer(true, ep_in, &mut csw, 13, BOT_TRIES) < 0 {
+        pl011_write(b"dwc2: bot CSW-in failed\r\n");
+        bot_recover(ep_in, ep_out);
+        return false;
+    }
     let sig = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
     let tag = u32::from_le_bytes([csw[4], csw[5], csw[6], csw[7]]);
     let residue = u32::from_le_bytes([csw[8], csw[9], csw[10], csw[11]]);
@@ -1553,6 +1588,10 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
         pl011_write(b" residue="); write_hex32(residue);
         pl011_write(b" status="); write_hex32(csw[12] as u32);
         pl011_write(b"\r\n");
+        // A bad signature means we are out of sync with the device's framing, and a phase error means
+        // it wants a reset - both need the endpoints put back to a known state, not just a report.
+        // (A plain status=1 is the device refusing THIS command, which recovery also makes safe.)
+        bot_recover(ep_in, ep_out);
     }
     ok
 }
