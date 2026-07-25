@@ -318,10 +318,18 @@ mod tests {
             prop_assert!(t.get_record(ResourceId(id)).is_none());
         }
 
+        // Generators for the BUMP properties start at 100, not 0. Ids below 100 are the STABLE gate
+        // resources (SEC-11, `bump_generation` above): they are never revoked, and `holds_resource`
+        // validates them without a generation check, which is sound only while that holds. Sweeping
+        // from 0 fabricated a reserved id and then asserted that the forbidden bump succeeded - so
+        // these three failed permanently, on a correct kernel, for a reason that was about the test.
+        // Three always-red tests train everyone to read `94 passed - 3 failed` as green, which is how
+        // a real regression walks in unnoticed (§22.4: a test failing for the wrong reason is a
+        // failure of the test, not the kernel).
         /// bump_generation is strictly monotonic per resource (§7.5 P2).
         #[test]
         fn bump_generation_is_strictly_monotonic(
-            id    in 0u64..(DIRECT_CAP as u64),
+            id    in 100u64..(DIRECT_CAP as u64),
             bumps in 1usize..=8,
         ) {
             let mut t = Box::new(GlobalResourceTable::new());
@@ -337,7 +345,7 @@ mod tests {
 
         /// After bump_generation with Dead liveness, get_record returns Dead.
         #[test]
-        fn bump_to_dead_sets_liveness_dead(id in 0u64..(DIRECT_CAP as u64)) {
+        fn bump_to_dead_sets_liveness_dead(id in 100u64..(DIRECT_CAP as u64)) {
             let mut t = Box::new(GlobalResourceTable::new());
             t.register(ResourceId(id));
             t.bump_generation(ResourceId(id), Liveness::Dead);
@@ -346,7 +354,7 @@ mod tests {
 
         /// After bump_generation with Revoked liveness, get_record returns Revoked.
         #[test]
-        fn bump_to_revoked_sets_liveness_revoked(id in 0u64..(DIRECT_CAP as u64)) {
+        fn bump_to_revoked_sets_liveness_revoked(id in 100u64..(DIRECT_CAP as u64)) {
             let mut t = Box::new(GlobalResourceTable::new());
             t.register(ResourceId(id));
             t.bump_generation(ResourceId(id), Liveness::Revoked);
