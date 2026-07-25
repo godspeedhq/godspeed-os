@@ -1724,6 +1724,38 @@ static MSC_EP_OUT:  AtomicU8   = AtomicU8::new(0);   // bulk OUT endpoint
 static MSC_MPS:     AtomicU16  = AtomicU16::new(64); // bulk max packet size
 static MSC_SECTORS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
+/// When storage last used the shared host channel (1 MHz System Timer microseconds).
+///
+/// The DWC2 has ONE host channel, time-shared by the keyboard poll and block I/O. Individual commands
+/// do not interleave - a Bulk-Only command runs inside one syscall with interrupts masked - but `fs`
+/// issues hundreds of them, and the keyboard poll runs in the timer ISR BETWEEN them. The keyboard is a
+/// low-speed device behind the hub, so its poll is a SPLIT transaction through the hub's transaction
+/// translator, and the poll ABANDONS it when its in-ISR budget expires (which is normal and frequent -
+/// an idle keyboard NAKs). That leaves the hub's TT holding a transaction the host walked away from,
+/// and the next storage command then fails on its very first transfer.
+///
+/// Measured on hardware, and the reason this is here rather than a theory: with a keyboard attached
+/// `selfcheck` reported 83 failures and 235 USB error lines; with it unplugged, 1 failure and ZERO USB
+/// errors, same build and same disk.
+static MSC_LAST_USE_US: AtomicU32 = AtomicU32::new(0);
+
+/// How long after storage touches the channel the keyboard poll stays off it. Long enough to cover the
+/// gap between the back-to-back block commands `fs` issues, short enough that typing resumes the moment
+/// I/O quiesces. Keystrokes are not lost meanwhile - the device queues its reports and we read them on
+/// the next poll.
+const MSC_CHANNEL_GUARD_US: u32 = 2000;
+
+/// Record that storage just used the channel (see `MSC_LAST_USE_US`).
+fn msc_mark_channel_use() {
+    MSC_LAST_USE_US.store(super::timer::systimer_us(), Ordering::Relaxed);
+}
+
+/// Is storage using the shared channel right now? The keyboard poll checks this and stands off.
+fn msc_channel_busy() -> bool {
+    if !MSC_READY.load(Ordering::Acquire) { return false; }
+    super::timer::systimer_us().wrapping_sub(MSC_LAST_USE_US.load(Ordering::Relaxed)) < MSC_CHANNEL_GUARD_US
+}
+
 /// Capacity of the attached USB mass-storage device in 512-byte sectors (0 = none attached).
 pub fn msc_sectors() -> u64 {
     if !MSC_READY.load(Ordering::Acquire) { return 0; }
@@ -1748,8 +1780,10 @@ pub fn msc_read_block(lba: u64, dst: &mut [u8]) -> bool {
     let l = lba as u32;
     // READ(10): opcode 0x28, LBA big-endian at [2..6], transfer length big-endian at [7..9].
     let cdb = [0x28u8, 0, (l >> 24) as u8, (l >> 16) as u8, (l >> 8) as u8, l as u8, 0, 0, 1, 0];
-    bot_command(MSC_EP_IN.load(Ordering::Relaxed) as u32, MSC_EP_OUT.load(Ordering::Relaxed) as u32,
-                &cdb, true, &mut dst[..512], 512)
+    let ok = bot_command(MSC_EP_IN.load(Ordering::Relaxed) as u32, MSC_EP_OUT.load(Ordering::Relaxed) as u32,
+                         &cdb, true, &mut dst[..512], 512);
+    msc_mark_channel_use();
+    ok
 }
 
 /// Write one 512-byte block to the USB mass-storage device. Same constraints as `msc_read_block`.
@@ -1762,8 +1796,10 @@ pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
     let cdb = [0x2Au8, 0, (l >> 24) as u8, (l >> 16) as u8, (l >> 8) as u8, l as u8, 0, 0, 1, 0];
     let mut buf = [0u8; 512];
     buf.copy_from_slice(&src[..512]);
-    bot_command(MSC_EP_IN.load(Ordering::Relaxed) as u32, MSC_EP_OUT.load(Ordering::Relaxed) as u32,
-                &cdb, false, &mut buf, 512)
+    let ok = bot_command(MSC_EP_IN.load(Ordering::Relaxed) as u32, MSC_EP_OUT.load(Ordering::Relaxed) as u32,
+                         &cdb, false, &mut buf, 512);
+    msc_mark_channel_use();
+    ok
 }
 
 /// The keyboard's host-side decode state: the previous report's keycodes (for N-key edge detection),
@@ -1785,6 +1821,12 @@ static mut KBD_STATE: KbdState =
 /// a completed transfer decode the boot report into console bytes. A NAK (no key change) returns quietly.
 pub fn poll() {
     if !KBD_READY.load(Ordering::Acquire) { return; }
+    // Stand off the shared host channel while storage is using it (see `MSC_LAST_USE_US`). Polling an
+    // idle keyboard means starting a SPLIT through the hub's transaction translator and abandoning it
+    // when the in-ISR budget expires - harmless on its own, but it leaves the TT holding a transaction
+    // and the next block command fails on its first transfer. A skipped poll costs nothing: the device
+    // queues its reports, so the keystroke arrives on the next one.
+    if msc_channel_busy() { return; }
     // Point the shared channel at the keyboard (the net device may have selected itself last).
     select_device(KBD_ADDR.load(Ordering::Relaxed), KBD_MPS.load(Ordering::Relaxed) as u16,
                   KBD_LOW.load(Ordering::Relaxed));
