@@ -119,6 +119,7 @@ const OP_READ_BLOCK: u8 = 1;
 const OP_WRITE_BLOCK: u8 = 2;
 const OP_CAPACITY: u8 = 3;
 const OP_WRITE_ZEROS: u8 = 4; // [op, lba:u64, count:u64] - zero a run of blocks (fast format)
+const OP_FLUSH: u8 = 5;       // [op] - make prior writes durable on the medium (see `block_flush`)
 const BLK_OK: u8 = 0;
 
 // fs file API (client <-> fs). `[op, path_len, path, (WriteFile: data | Rename/Move: tail)]`.
@@ -259,6 +260,10 @@ struct Fs {
     // all the SAME block). Owned state on the struct, not a static - a service holds no global
     // mutable state (§3.9). `u64::MAX` = nothing reported yet.
     last_bad_dir_lba: core::cell::Cell<u64>,
+    // Set once the backend has refused a durability request, so the warning is reported one time per
+    // mount instead of on every commit. A device that does not implement SYNCHRONIZE CACHE must not
+    // brick the filesystem - we cannot make it durable, but we can refuse to pretend otherwise.
+    flush_warned: core::cell::Cell<bool>,
     // Crash-consistency journal (Phase C). While `txn_active`, structural writes (directory,
     // bitmap, superblock) are STAGED here - with read-your-writes - instead of going to disk,
     // then committed atomically through the on-disk journal region (`commit_txn`). Data-block
@@ -1203,6 +1208,7 @@ impl Fs {
             feat_incompat,
             read_only,
             last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
+            flush_warned: core::cell::Cell::new(false),
             txn_active: false,
             txn_n: 0,
             txn_overflow: false,
@@ -1264,7 +1270,7 @@ impl Fs {
                     ctx.log_fmt(format_args!(
                         "fs: ROOT directory block (lba {}) failed its CRC - the file tree is unreadable. \
                          No redundancy exists for it, so this is not repairable: reformat with \
-                         `drives flash <n> data force`.", lba));
+                         `drives flash <n> data force`, and let the format finish before resetting.", lba));
                 } else {
                     ctx.log_fmt(format_args!(
                         "fs: directory block CRC mismatch at lba {} - refusing (that directory's entries \
@@ -1281,6 +1287,21 @@ impl Fs {
         let c = crc32(&blk[..DIR_REC_REGION]);
         blk[DIR_CRC_OFF..DIR_CRC_OFF + 4].copy_from_slice(&c.to_le_bytes());
         self.tb_write(ctx, lba, blk)
+    }
+
+    /// Request durability, and report ONCE per mount if the backend cannot provide it.
+    ///
+    /// Deliberately not fatal. A drive that does not implement SYNCHRONIZE CACHE cannot be made to
+    /// honour a barrier, and refusing to commit would brick the filesystem on that hardware for a
+    /// guarantee it was never going to give. Before this existed there was no flush at all, so
+    /// continuing is exactly the old behaviour - the difference is that it is now VISIBLE. What is
+    /// not acceptable is the third option: proceeding while implying the ordering held (§26.7).
+    fn durable_or_warn(&self, ctx: &ServiceContext) {
+        if block_flush(ctx) { return; }
+        if !self.flush_warned.get() {
+            self.flush_warned.set(true);
+            ctx.log("fs: WARNING - the drive refuses cache flushes, so journal write ordering is NOT enforced on this medium. Metadata is still CRC-checked, but a power loss may leave it torn.");
+        }
     }
 
     fn begin_txn(&mut self) {
@@ -1318,9 +1339,18 @@ impl Fs {
         for i in 0..n {
             commit[8 + i * 8..16 + i * 8].copy_from_slice(&self.txn_lba[i].to_le_bytes());
         }
+        // BARRIER 1: the staged blocks must be on the medium before the record that authorises
+        // replaying them. Otherwise a crash can leave a valid commit record pointing at journal
+        // slots the device never wrote, and recovery faithfully copies garbage to their home LBAs -
+        // the journal actively causing the corruption it exists to prevent.
+        self.durable_or_warn(ctx);
         let crc = crc32(&commit[..8 + n * 8]);
         commit[COMMIT_CRC_OFF..COMMIT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
         if !block_write(ctx, self.journal_start, &commit) { return Err("journal commit write failed"); }
+        // BARRIER 2: and the commit record must be on the medium before any home block is
+        // overwritten - that ordering IS the atomicity. A device free to reorder these two can land
+        // a half-finished checkpoint with no commit record to replay it from.
+        self.durable_or_warn(ctx);
         // Test-only: simulate a power loss right here - commit record durable, home not yet
         // updated. The next mount must replay this transaction. (Never set in production.)
         if self.crash_after_commit {
@@ -1335,6 +1365,11 @@ impl Fs {
                 return Err("checkpoint write failed (will replay on next mount)");
             }
         }
+        // BARRIER 3: the home blocks must be durable before the journal is invalidated, or a crash
+        // could drop both the checkpoint and the record needed to redo it. Failing here is safe -
+        // the journal still holds the committed transaction and the next mount replays it - so this
+        // reports rather than returning, and the invalidation below is skipped.
+        self.durable_or_warn(ctx);
         // 4. Invalidate the journal. The checkpoint above already landed every block home, so a
         // failure here is safe (the next mount re-replays this committed transaction idempotently) -
         // but log it loudly rather than silently re-replaying on every future mount (§26.7).
@@ -1470,6 +1505,13 @@ impl Fs {
         // Clear the journal commit block so a re-flash of a previously-used disk can't replay a
         // stale transaction (a fresh host image is already zeroed here).
         if !block_write(ctx, journal_start, &[0u8; BLOCK]) { return Err("journal init failed"); }
+        // Everything above is only ACKNOWLEDGED until the medium confirms it. Without this the root
+        // directory - written last, and so still in the device's buffer - was lost to a power-cycle
+        // moments later, leaving a disk whose superblock said "formatted" and whose file tree was
+        // unreadable. A format that cannot be made durable is a failed format, and says so.
+        if !block_flush(ctx) {
+            ctx.log("fs: WARNING - the drive refused a cache flush; this format is written but NOT confirmed on the medium. If power is cut before the drive settles, it may come back unreadable.");
+        }
 
         Fs::mount(ctx)
     }
@@ -2600,6 +2642,25 @@ fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     req[9..17].copy_from_slice(&count.to_le_bytes());
     match block_rpc(ctx, &req) {
+        Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
+        None => false,
+    }
+}
+
+/// Ask the block backend to make every previously acknowledged write durable on the medium.
+///
+/// A completed write is not a durable one. A USB stick acknowledges a WRITE(10) as soon as the bytes
+/// are in its own volatile buffer, so a reset before it programs flash loses them - which is exactly
+/// how a freshly formatted disk came back with an unreadable root directory: `format` writes the root
+/// last, so it was still in the device's buffer when the machine restarted, while the superblock
+/// (written first) had long since landed. Losing the tail of a write sequence is also precisely what a
+/// redo journal cannot survive, since it rests on the commit record reaching the disk BEFORE the blocks
+/// it authorises.
+///
+/// So durability is requested explicitly, at the points that promise it, and the answer is checked -
+/// `false` means the data is NOT known to be on the medium and the caller must say so (§26.5, §26.7).
+fn block_flush(ctx: &ServiceContext) -> bool {
+    match block_rpc(ctx, &[OP_FLUSH]) {
         Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
         None => false,
     }

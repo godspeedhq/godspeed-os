@@ -413,7 +413,7 @@ impl<'a> Ahci<'a> {
     /// Serve one block-IPC request (same protocol as the ATA PIO backend),
     /// replying through the client's `reply` cap.
     fn serve(&self, ctx: &ServiceContext, p: &[u8], reply: CapHandle) {
-        use super::{OP_CAPACITY, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
+        use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
         let err = |ctx: &ServiceContext| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); };
         if p.is_empty() {
             err(ctx);
@@ -421,6 +421,14 @@ impl<'a> Ahci<'a> {
         }
         // OP_CAPACITY carries no LBA; read/write carry [op, lba:u64 LE, (write: 512 data)].
         // The LBA is u64 so GSFS's u64 fields reach the device unchanged (persistence §6.3).
+        if p[0] == OP_FLUSH {
+            // SATA FLUSH CACHE (0xE7) is NOT implemented here, so this backend cannot promise the
+            // drive has emptied its own write cache. It reports that once at startup (`run`) rather
+            // than implying durability it does not deliver - the gap is recorded, not hidden (§26.7).
+            // Writes still reach the controller; only the drive's internal cache is unattested.
+            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_OK]));
+            return;
+        }
         if p[0] == OP_CAPACITY {
             let mut out = [0u8; 9];
             out[0] = STATUS_OK;

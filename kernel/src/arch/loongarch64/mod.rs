@@ -109,6 +109,7 @@ pub fn emmc_base_clock_hz() -> u32 { 0 }
 pub fn usb_disk_sectors() -> u64 { 0 }
 pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
 pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
+pub fn usb_disk_flush() -> bool { false }
 
 
 // No GPIO on this arch (the ARM `gpio` shell command is Pi-only).

@@ -71,6 +71,7 @@ pub enum SyscallNumber {
     UsbDiskInfo            = 46,
     UsbDiskRead            = 47,
     UsbDiskWrite           = 48,
+    UsbDiskFlush           = 49,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -103,6 +104,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::UsbDiskInfo    as u64 => handle_usb_disk_info(),
         n if n == SyscallNumber::UsbDiskRead    as u64 => handle_usb_disk_read(arg0, arg1),
         n if n == SyscallNumber::UsbDiskWrite   as u64 => handle_usb_disk_write(arg0, arg1),
+        n if n == SyscallNumber::UsbDiskFlush   as u64 => handle_usb_disk_flush(),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
             0
@@ -1868,6 +1870,17 @@ fn handle_usb_disk_write(lba: u64, ptr: u64) -> i64 {
     }
     let src = match read_user_bytes(ptr, USB_DISK_BLOCK) { Some(b) => b, None => return -1 };
     if crate::arch::imp::usb_disk_write(lba, src) { 0 } else { -1 }
+}
+
+/// UsbDiskFlush (49): flush the device's write cache to the medium (SCSI SYNCHRONIZE CACHE).
+/// Gated by the same USB_DISK WRITE right as a write - making data durable is part of writing it,
+/// and a caller that cannot write has nothing to flush. Returns 0 on success, -1 on failure; a
+/// failure is reported, never swallowed, because the caller is about to rely on durability (§26.7).
+fn handle_usb_disk_flush() -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    if crate::arch::imp::usb_disk_flush() { 0 } else { -1 }
 }
 
 fn ipc_err_to_i64(e: IpcError) -> i64 {

@@ -23,9 +23,16 @@ use godspeed_sdk::{Message, ServiceContext};
 /// Serve one block-IPC request. Same wire protocol as the AHCI and EMMC backends - `fs` is unaware of
 /// which one it is talking to.
 fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapHandle) {
-    use super::{OP_CAPACITY, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
+    use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
     let err = |ctx: &ServiceContext| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); };
     if p.is_empty() { return err(ctx); }
+    if p[0] == OP_FLUSH {
+        // The one backend that genuinely needs this: a stick acknowledges a WRITE(10) into its own
+        // buffer, so without SYNCHRONIZE CACHE a reset loses the tail of everything just written.
+        let status = if ctx.usb_disk_flush() { STATUS_OK } else { STATUS_ERR };
+        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
+        return;
+    }
     if p[0] == OP_CAPACITY {
         let mut out = [0u8; 9];
         out[0] = STATUS_OK;

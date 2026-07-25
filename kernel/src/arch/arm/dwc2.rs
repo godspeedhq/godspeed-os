@@ -1812,6 +1812,35 @@ pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
     ok
 }
 
+/// Flush the device's internal write cache to the medium (SCSI SYNCHRONIZE CACHE (10), opcode 0x35).
+///
+/// A USB mass-storage device completes a WRITE(10) as soon as it has the data in its own buffer - the
+/// bytes need not be on flash yet. Every write this driver issues was therefore only *acknowledged*,
+/// not *durable*, and a reset or power cut before the device flushed lost it. That is not theoretical:
+/// it destroyed the root directory block of a freshly formatted disk twice, because `format` writes the
+/// root last, so it was still the most likely thing sitting in the device's buffer when the Pi was
+/// power-cycled seconds later. The superblock, written first, always survived - which is exactly the
+/// signature of a lost tail of writes rather than a bad block.
+///
+/// It also decides whether the crash-consistency journal means anything on this medium. A redo journal
+/// rests on the commit record reaching the disk BEFORE the blocks it authorises; a device free to hold
+/// and reorder both in a volatile cache voids "replayed or discarded, never torn". Durability has to be
+/// asked for explicitly, so callers ask - `fs` at the points where it promises it (§26.5).
+///
+/// No data phase. Bounded like every other transfer; a device that refuses it reports `false` rather
+/// than silently pretending the data is safe (invariant 12).
+pub fn msc_sync_cache() -> bool {
+    if !MSC_READY.load(Ordering::Acquire) || !on_core0() { return false; }
+    msc_select();
+    // SYNCHRONIZE CACHE (10): opcode 0x35; LBA 0 + length 0 means "the whole medium".
+    let cdb = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut none = [0u8; 0];
+    let ok = bot_command(MSC_EP_IN.load(Ordering::Relaxed) as u32, MSC_EP_OUT.load(Ordering::Relaxed) as u32,
+                         &cdb, false, &mut none, 0);
+    msc_mark_channel_use();
+    ok
+}
+
 /// The keyboard's host-side decode state: the previous report's keycodes (for N-key edge detection),
 /// the Caps Lock latch (the HID modifier byte never carries it), and the typematic auto-repeat timer.
 /// One keyboard, one owner: touched only by `poll()` on core 0 (the single DWC2 poller).

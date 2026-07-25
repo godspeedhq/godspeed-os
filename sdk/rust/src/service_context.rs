@@ -876,6 +876,18 @@ impl ServiceContext {
         ret == 0
     }
 
+    /// Make previously written blocks durable on the USB mass-storage device (SCSI SYNCHRONIZE CACHE).
+    /// Requires `USB_DISK` WRITE. Syscall 49.
+    ///
+    /// A write is only ACKNOWLEDGED when `usb_disk_write` returns - the device may still be holding the
+    /// bytes in a volatile buffer. Anything that promises durability (a format, a journal commit) has to
+    /// ask for it, and check the answer: `false` means the data is NOT known to be on the medium.
+    pub fn usb_disk_flush(&self) -> bool {
+        // SAFETY: syscall(49) = UsbDiskFlush; takes no arguments and touches no user memory.
+        let ret = unsafe { raw_syscall(49, 0, 0, 0) };
+        ret == 0
+    }
+
     /// The SD/EMMC controller's base clock in Hz (0 if the platform does not report one), via
     /// InspectKernel query 20. The block driver needs it to compute its clock divider: on the BCM283x
     /// the controller's own capability register reports the base clock wrongly, and the driver holds

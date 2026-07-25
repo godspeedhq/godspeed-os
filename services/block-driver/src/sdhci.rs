@@ -399,9 +399,17 @@ impl<'a> Sd<'a> {
 
 /// Decode one block-IPC request and reply. Mirrors the AHCI backend's `serve` (same wire protocol).
 fn serve(sd: &Sd, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapHandle) {
-    use super::{OP_CAPACITY, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
+    use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
     let err = |ctx: &ServiceContext| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); };
     if p.is_empty() { return err(ctx); }
+    if p[0] == OP_FLUSH {
+        // An SD/EMMC single-block write is already durable when it completes: the card holds DAT0 low
+        // while it programs the flash, and this driver waits for that busy period to end before
+        // reporting success. There is no separate volatile cache to flush in this access mode, so the
+        // guarantee the caller wants is one the write path already provides.
+        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_OK]));
+        return;
+    }
     if p[0] == OP_CAPACITY {
         let mut out = [0u8; 9];
         out[0] = STATUS_OK;

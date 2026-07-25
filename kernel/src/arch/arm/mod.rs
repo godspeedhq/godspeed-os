@@ -786,6 +786,8 @@ pub fn emmc_base_clock_hz() -> u32 { video::emmc_clock_hz() }
 pub fn usb_disk_sectors() -> u64 { dwc2::msc_sectors() }
 pub fn usb_disk_read(lba: u64, dst: &mut [u8]) -> bool { dwc2::msc_read_block(lba, dst) }
 pub fn usb_disk_write(lba: u64, src: &[u8]) -> bool { dwc2::msc_write_block(lba, src) }
+/// Make prior writes durable (SCSI SYNCHRONIZE CACHE) - see `dwc2::msc_sync_cache`.
+pub fn usb_disk_flush() -> bool { dwc2::msc_sync_cache() }
 
 pub fn hw_random() -> Option<u32> {
     use core::sync::atomic::{AtomicBool, Ordering};
