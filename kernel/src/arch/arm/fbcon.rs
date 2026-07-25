@@ -286,7 +286,20 @@ fn put_byte_inner(c: &mut Fbcon, b: u8) {
         // deleted the text instead of just moving through it, and the line editor's redraw, which
         // repositions with a run of backspaces after reprinting the tail, wiped what it had just drawn.
         // A caller that wants to erase sends the classic backspace-space-backspace itself.
-        0x08 => { if c.col > 0 { c.col -= 1; } }
+        //
+        // At column 0 it steps back to the END OF THE PREVIOUS ROW, because a line longer than the
+        // screen has WRAPPED onto that row and is still one logical line. Stopping at column 0 (as
+        // this did) made editing break at exactly the screen width - the line editor repositions with
+        // a RUN of backspaces, and once that run hit the wrap point it could go no further, so every
+        // redraw after it landed in the wrong place. That is the "typing boundary".
+        0x08 => {
+            if c.col > 0 {
+                c.col -= 1;
+            } else if c.row > 0 {
+                c.row -= 1;
+                c.col = c.cols.saturating_sub(1);
+            }
+        }
         0x20..=0x7E => { draw_glyph(c, b, c.col, c.row); c.col += 1; }
         _ => {} // control byte: ignore (serial keeps the full stream)
     }

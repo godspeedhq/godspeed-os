@@ -990,7 +990,15 @@ impl Line {
 
     /// Insert a printable byte at the cursor.
     fn insert(&mut self, ctx: &ServiceContext, b: u8) {
-        if self.len >= MAX_LINE { return; }
+        if self.len >= MAX_LINE {
+            // The line is full. Say so instead of swallowing the keystroke: a limit that drops input
+            // with no sign of it reads as a broken keyboard ("there seems to be a typing boundary"),
+            // and a ceiling reached LOUDLY is the point of having a fixed one at all (§26.6/§26.7).
+            // BEL is what a terminal expects here - serial rings it, the framebuffer console ignores
+            // it - so the line being edited is never disturbed.
+            ctx.console_write("\x07");
+            return;
+        }
         let mut i = self.len;
         while i > self.cur { self.buf[i] = self.buf[i - 1]; i -= 1; }
         self.buf[self.cur] = b;
