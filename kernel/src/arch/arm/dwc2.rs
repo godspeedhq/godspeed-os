@@ -1796,20 +1796,65 @@ pub fn msc_read_block(lba: u64, dst: &mut [u8]) -> bool {
     ok
 }
 
+/// Set once the device has rejected a WRITE(10) carrying FUA, after which writes go out plain.
+/// See `msc_write_block` - this is the fallback that keeps a device writable when it will not take
+/// the bit, rather than leaving the filesystem unable to write at all.
+static MSC_NO_FUA: AtomicBool = AtomicBool::new(false);
+/// One-shot latch so the FUA-accepted line is stated once, not per write.
+static MSC_FUA_LOGGED: AtomicBool = AtomicBool::new(false);
+
 /// Write one 512-byte block to the USB mass-storage device. Same constraints as `msc_read_block`.
+///
+/// Issued with **FUA** (Force Unit Access) where the device accepts it, which asks the drive to put
+/// this block on the medium before reporting completion instead of parking it in a volatile buffer.
+/// That matters because this stick refuses SYNCHRONIZE CACHE, leaving no barrier at all: a redo
+/// journal is nothing but ordering (staged blocks durable before the commit record, that record
+/// durable before any home block moves), and without one the device may land the journal's
+/// invalidation before the checkpoint - losing the data AND the means to replay it. Observed as a
+/// root directory that failed its CRC after every power cycle. FUA per write restores the ordering
+/// from below: if each write is durable when acknowledged, the sequence is durable in order.
+///
+/// **Acceptance is not proof.** Some devices take the bit and ignore it, and nothing on the host can
+/// tell. So this claims only what it knows - the device did not reject it - and the real evidence is
+/// a power cycle with the tree still readable afterwards.
 pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
     if !MSC_READY.load(Ordering::Acquire) || !on_core0() || src.len() < 512 { return false; }
     if lba >= MSC_SECTORS.load(Ordering::Relaxed) { return false; }
     msc_select();
     let l = lba as u32;
-    // WRITE(10): opcode 0x2A, same big-endian LBA/length layout as READ(10).
-    let cdb = [0x2Au8, 0, (l >> 24) as u8, (l >> 16) as u8, (l >> 8) as u8, l as u8, 0, 0, 1, 0];
     let mut buf = [0u8; 512];
+    let fua = !MSC_NO_FUA.load(Ordering::Relaxed);
+    // WRITE(10): opcode 0x2A, same big-endian LBA/length layout as READ(10). Byte 1 bit 3 = FUA.
+    let cdb = |fua: bool| [0x2Au8, if fua { 0x08 } else { 0 },
+                           (l >> 24) as u8, (l >> 16) as u8, (l >> 8) as u8, l as u8, 0, 0, 1, 0];
     buf.copy_from_slice(&src[..512]);
-    let ok = bot_command(MSC_EP_IN.load(Ordering::Relaxed) as u32, MSC_EP_OUT.load(Ordering::Relaxed) as u32,
-                         &cdb, false, &mut buf, 512);
+    let ep_in = MSC_EP_IN.load(Ordering::Relaxed) as u32;
+    let ep_out = MSC_EP_OUT.load(Ordering::Relaxed) as u32;
+    let mut ok = bot_command(ep_in, ep_out, &cdb(fua), false, &mut buf, 512);
+    if ok && fua && !MSC_FUA_LOGGED.swap(true, Ordering::Relaxed) {
+        // State the regime once, positively. Inferring it from the ABSENCE of a rejection message
+        // makes a log reader guess, and the whole point of this experiment is to know which of the
+        // two durability regimes the machine is actually running in.
+        pl011_write(b"dwc2: device accepted FUA writes - each write reported durable on completion\r\n");
+    }
+    if !ok && fua {
+        // The write failed while carrying FUA. It may be the bit the device objected to, or it may be
+        // an unrelated transport error - we cannot tell from a CSW status alone, so assume the former
+        // ONCE and retry plain. Getting this wrong costs durability on a device that would have taken
+        // the bit; getting the alternative wrong costs the ability to write at all, which is worse.
+        MSC_NO_FUA.store(true, Ordering::Relaxed);
+        pl011_write(b"dwc2: device rejected a FUA write - falling back to plain writes (not durable on ack)\r\n");
+        buf.copy_from_slice(&src[..512]);
+        ok = bot_command(ep_in, ep_out, &cdb(false), false, &mut buf, 512);
+    }
     msc_mark_channel_use();
     ok
+}
+
+/// Are writes going out with FUA (so each is durable when acknowledged)? Used by `msc_sync_cache` to
+/// answer a durability request truthfully without a bus round-trip.
+pub fn msc_writes_are_fua() -> bool {
+    MSC_READY.load(Ordering::Acquire) && !MSC_NO_FUA.load(Ordering::Relaxed)
 }
 
 /// Flush the device's internal write cache to the medium (SCSI SYNCHRONIZE CACHE (10), opcode 0x35).
@@ -1837,6 +1882,11 @@ pub fn msc_sync_cache() -> bool {
     // single selfcheck. Latching the refusal keeps the bus for work that can succeed. The caller still
     // gets `false` and still reports the lost guarantee once (§26.7) - we stop retrying, not telling.
     if MSC_NO_FLUSH.load(Ordering::Relaxed) { return false; }
+    // If every write went out with FUA it was already on the medium when it completed, so "make prior
+    // writes durable" is satisfied before it is asked and costs no round-trip. This is why the caller
+    // stops warning once FUA is in use: the guarantee is being met by a different mechanism, not
+    // quietly dropped. (Bounded by what the device honours - see `msc_write_block`.)
+    if msc_writes_are_fua() { return true; }
     msc_select();
     // SYNCHRONIZE CACHE (10): opcode 0x35; LBA 0 + length 0 means "the whole medium".
     let cdb = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
