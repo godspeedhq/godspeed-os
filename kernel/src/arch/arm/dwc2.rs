@@ -1831,6 +1831,12 @@ pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
 /// than silently pretending the data is safe (invariant 12).
 pub fn msc_sync_cache() -> bool {
     if !MSC_READY.load(Ordering::Acquire) || !on_core0() { return false; }
+    // Ask a device at most once. This stick answers SYNCHRONIZE CACHE with CHECK CONDITION - it does
+    // not implement the command - and a device that refuses once will refuse forever, so continuing to
+    // send it bought nothing and cost a full bulk round-trip per journal barrier: 166 of them in a
+    // single selfcheck. Latching the refusal keeps the bus for work that can succeed. The caller still
+    // gets `false` and still reports the lost guarantee once (§26.7) - we stop retrying, not telling.
+    if MSC_NO_FLUSH.load(Ordering::Relaxed) { return false; }
     msc_select();
     // SYNCHRONIZE CACHE (10): opcode 0x35; LBA 0 + length 0 means "the whole medium".
     let cdb = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -1838,8 +1844,17 @@ pub fn msc_sync_cache() -> bool {
     let ok = bot_command(MSC_EP_IN.load(Ordering::Relaxed) as u32, MSC_EP_OUT.load(Ordering::Relaxed) as u32,
                          &cdb, false, &mut none, 0);
     msc_mark_channel_use();
+    if !ok {
+        MSC_NO_FLUSH.store(true, Ordering::Relaxed);
+        pl011_write(b"dwc2: device does not support SYNCHRONIZE CACHE - writes cannot be confirmed durable\r\n");
+    }
     ok
 }
+
+/// Set once the device has refused SYNCHRONIZE CACHE, so it is never asked again (see `msc_sync_cache`).
+/// Cleared nowhere: a fresh device re-enumerates through `msc_select`, and re-probing costs a round-trip
+/// per barrier for an answer that does not change.
+static MSC_NO_FLUSH: AtomicBool = AtomicBool::new(false);
 
 /// The keyboard's host-side decode state: the previous report's keycodes (for N-key edge detection),
 /// the Caps Lock latch (the HID modifier byte never carries it), and the typematic auto-repeat timer.
