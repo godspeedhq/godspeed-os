@@ -21,7 +21,13 @@ const MUTED_POLL_SLEEP_CYCLES: u64 = 60_000_000;
 /// this doubling costs about 4 KiB of the shell's stack, not 4 KiB per line. Reaching it is now
 /// audible (BEL in `insert`) rather than silent, so the ceiling is honest either way.
 const MAX_LINE: usize = 256;
-const MAX_ARGS: usize = 4;
+/// Tokens the command tokenizer keeps. Anything past this is SILENTLY DROPPED, so the ceiling has to
+/// sit above every real command shape - at 4 it did not: `drives flash 0 data force` is five tokens, so
+/// the `force` an operator explicitly typed never reached the parser and the disk was refused as though
+/// it had been omitted. (The same limit had already forced a hand-rolled re-parse elsewhere in this
+/// file for a six-token command - a standing sign the ceiling was too low.) Eight covers every command
+/// the utilities define, for a few dozen bytes of stack per argument array.
+const MAX_ARGS: usize = 8;
 
 // fs API (shell <-> fs). MUST match `services/fs`.
 //   File ops:   [op, path_len:u8, path[path_len], (WriteFile: data)]
@@ -9932,11 +9938,10 @@ fn drives_flash(ctx: &ServiceContext, label: &str, force: bool) -> Result<(), Sh
             Ok(())
         }
         Some(r) if r.payload_bytes().first() == Some(&FS_FOREIGN) => {
-            ctx.console_writeln("drives: REFUSED - this disk already holds a partition table or boot sector.");
-            ctx.console_writeln("  It is not blank. If this machine boots from this disk (the Pi boots from");
-            ctx.console_writeln("  its SD card), formatting it destroys the boot partition and the machine");
-            ctx.console_writeln("  will not start until the card is re-imaged from another computer.");
-            ctx.console_writeln("  If you are certain: drives flash <label> force");
+            ctx.console_writeln("drives: REFUSED - block 0 holds a partition table or boot sector, so this");
+            ctx.console_writeln("  disk is not blank. Formatting replaces whatever is on it, and if a machine");
+            ctx.console_writeln("  boots from this disk it will stop booting until it is re-imaged.");
+            ctx.console_writeln("  To format it anyway: drives flash [drive] <label> force");
             Err(ShellError::Unknown)
         }
         Some(_) => { ctx.console_writeln("drives: flash FAILED (no disk, or disk too small)"); Err(ShellError::Unknown) }
