@@ -182,9 +182,29 @@ pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const 
         "mrc   p15, 0, r3, c2, c0, 0", // current TTBR0
         "cmp   r2, r3",
         "beq   1f",
-        "mcr   p15, 0, r2, c2, c0, 0", // switch address space
+        // Address-space switch, in the order the ARM ARM requires (B3.10.1 "TLB maintenance
+        // requirements" / A3.8.3). The barriers are NOT decoration:
+        //   dsb  - every prior memory access, INCLUDING the page-table writes the spawning core made
+        //          for this address space, must be complete and visible before translation can use them.
+        //   isb  - the TTBR0 write must be IN EFFECT before the TLB operation and before any
+        //          instruction is fetched or translated under the new tables. Without it the TLBIALL
+        //          could execute in the context of the OUTGOING address space, leaving stale entries
+        //          alive across the switch.
+        //   dsb+isb after the TLBIALL - the flush must complete, and the pipeline must refetch, before
+        //          the incoming task's first instruction is translated.
+        //
+        // This was previously TTBR0-write, TLBIALL, dsb, isb - no barrier before the switch and none
+        // between the switch and the flush. On hardware that let stale mappings survive a switch, and
+        // because EVERY service is linked at the same address (0x400000) the incoming task then ran
+        // against the OUTGOING task's memory: it executed, but its stack and data resolved to another
+        // address space, producing wild pointers and faults at unrelated addresses. It showed up only
+        // on cores other than the one that built the tables, which is precisely the window these
+        // barriers close. (QEMU's TCG does not model the ordering, so it never reproduced it.)
+        "dsb",
+        "mcr   p15, 0, r2, c2, c0, 0", // switch address space (TTBR0)
+        "isb",
         "mov   r3, #0",
-        "mcr   p15, 0, r3, c8, c7, 0", // TLBIALL - ARM TTBR0 switch needs explicit TLB flush (SEC-26/27)
+        "mcr   p15, 0, r3, c8, c7, 0", // TLBIALL - an ARM TTBR0 switch does not implicitly flush
         "dsb",
         "isb",
         "1:",
