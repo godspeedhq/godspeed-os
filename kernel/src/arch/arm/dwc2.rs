@@ -1796,6 +1796,25 @@ pub fn msc_read_block(lba: u64, dst: &mut [u8]) -> bool {
     ok
 }
 
+/// Whether to ask for FUA at all. **Off**, and the reason is measured, not assumed.
+///
+/// The drive honours the bit - that was never in doubt after it accepted it and kept working for 31
+/// seconds. The problem is what honouring it COSTS: a write that waits for the medium leaves the drive
+/// busy afterwards, and it NAKs the next command while it finishes programming. A NAK is normal USB
+/// flow control meaning "busy, ask again", but this driver gives a command only `BOT_TRIES` x
+/// `HALT_BUDGET_US` = 20 ms before calling it an error, and a flash program outlasts that. The result
+/// was 17 `bot CBW-out failed` and 18 failed tests, against 1 with the bit off.
+///
+/// Those budgets are not arbitrary either: a block write runs in a syscall with IRQs masked, so the
+/// time it spends waiting is time the timer tick does not run. Buying FUA by simply waiting longer
+/// trades data durability for scheduler responsiveness, which is a real trade and not one to make
+/// silently. The honest resolution is to treat NAK as "busy, retry" rather than an error and to wait
+/// for it WITHOUT holding the core - which is an async block path, not a constant.
+///
+/// Left in place, one edit from being re-enabled, so the next attempt starts from what was learned
+/// rather than rediscovering it.
+const USE_FUA: bool = false;
+
 /// Set once the device has rejected a WRITE(10) carrying FUA, after which writes go out plain.
 /// See `msc_write_block` - this is the fallback that keeps a device writable when it will not take
 /// the bit, rather than leaving the filesystem unable to write at all.
@@ -1823,7 +1842,7 @@ pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
     msc_select();
     let l = lba as u32;
     let mut buf = [0u8; 512];
-    let fua = !MSC_NO_FUA.load(Ordering::Relaxed);
+    let fua = USE_FUA && !MSC_NO_FUA.load(Ordering::Relaxed);
     // WRITE(10): opcode 0x2A, same big-endian LBA/length layout as READ(10). Byte 1 bit 3 = FUA.
     let cdb = |fua: bool| [0x2Au8, if fua { 0x08 } else { 0 },
                            (l >> 24) as u8, (l >> 16) as u8, (l >> 8) as u8, l as u8, 0, 0, 1, 0];
@@ -1854,7 +1873,7 @@ pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
 /// Are writes going out with FUA (so each is durable when acknowledged)? Used by `msc_sync_cache` to
 /// answer a durability request truthfully without a bus round-trip.
 pub fn msc_writes_are_fua() -> bool {
-    MSC_READY.load(Ordering::Acquire) && !MSC_NO_FUA.load(Ordering::Relaxed)
+    USE_FUA && MSC_READY.load(Ordering::Acquire) && !MSC_NO_FUA.load(Ordering::Relaxed)
 }
 
 /// Flush the device's internal write cache to the medium (SCSI SYNCHRONIZE CACHE (10), opcode 0x35).
