@@ -1544,7 +1544,7 @@ const BOT_TRIES: u32 = 10;
 /// USB 2.0 CLEAR_FEATURE(ENDPOINT_HALT): bmRequestType 0x02 (host-to-device, endpoint recipient),
 /// bRequest 0x01, wValue 0, wIndex = the endpoint address with bit 7 set for an IN endpoint. Clearing
 /// the halt also resets the DEVICE's toggle to DATA0, which is why ours is reset to match.
-fn bot_recover(ep_in: u32, ep_out: u32) {
+fn bot_recover(ep_in: u32, ep_out: u32) -> bool {
     // Re-select the device with its CONTROL packet size. `msc_select` leaves MPS0 set to the BULK
     // endpoint's size (512 on a high-speed stick), and a control transfer framed with that instead of
     // EP0's 64 is malformed - the clear-halt then fails and disturbs the device further, turning a
@@ -1552,11 +1552,25 @@ fn bot_recover(ep_in: u32, ep_out: u32) {
     // to 70.) Restore the bulk selection afterwards so the caller's next transfer is framed correctly.
     select_device(MSC_ADDR.load(Ordering::Relaxed), MSC_EP0_MPS.load(Ordering::Relaxed), false);
     SPLIT_PORT.store(MSC_HUB_PORT.load(Ordering::Relaxed), Ordering::Relaxed);
-    let _ = control_out(0x02, 0x01, 0x0000, (ep_in | 0x80) as u16); // bulk IN
-    let _ = control_out(0x02, 0x01, 0x0000, ep_out as u16);         // bulk OUT
+    // Step 1 of the Bulk-Only Transport reset recovery, which was missing: the class-specific
+    // **Bulk-Only Mass Storage Reset** (bmRequestType 0x21, bRequest 0xFF, wIndex = interface). The
+    // spec orders it FIRST, before the clear-halts, because it is the step that resynchronises the
+    // device's own CBW/CSW state machine - clear-halt only unsticks the pipes. Without it a device
+    // that lost framing stayed lost: we would clear both halts, it would still be waiting for the
+    // rest of a transfer we had abandoned, and every following command failed. Interface 0 (this
+    // driver binds the first mass-storage interface; `probe_mass_storage` does not look past it).
+    let reset_ok = control_out(0x21, 0xFF, 0x0000, 0);
+    let in_ok  = control_out(0x02, 0x01, 0x0000, (ep_in | 0x80) as u16); // CLEAR_FEATURE(ENDPOINT_HALT)
+    let out_ok = control_out(0x02, 0x01, 0x0000, ep_out as u16);
     BULK_TOGGLE_IN.store(false, Ordering::Relaxed);
     BULK_TOGGLE_OUT.store(false, Ordering::Relaxed);
     msc_select();
+    // A recovery that itself failed is still a failure, and saying so is the whole point (§26.7).
+    // These results used to be discarded with `let _ =`, so a recovery that achieved nothing looked
+    // exactly like one that worked - and the caller went on to fail forever with no idea why.
+    let ok = reset_ok && in_ok && out_ok;
+    if !ok { pl011_write(b"dwc2: bot RESET RECOVERY FAILED - device is not answering on EP0\r\n"); }
+    ok
 }
 /// The mass-storage device's endpoint-0 max packet size (see `bot_recover`).
 static MSC_EP0_MPS: AtomicU16 = AtomicU16::new(64);
@@ -1576,19 +1590,19 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
 
     if bulk_xfer(false, ep_out, &mut cbw, 31, BOT_TRIES) < 0 {
         pl011_write(b"dwc2: bot CBW-out failed\r\n");
-        bot_recover(ep_in, ep_out);
+        let _ = bot_recover(ep_in, ep_out);
         return false;
     }
     if dlen > 0 && bulk_xfer(data_in, if data_in { ep_in } else { ep_out }, data, dlen, BOT_TRIES) < 0 {
         pl011_write(b"dwc2: bot data-stage failed\r\n");
-        bot_recover(ep_in, ep_out);
+        let _ = bot_recover(ep_in, ep_out);
         return false;
     }
 
     let mut csw = [0u8; 13];
     if bulk_xfer(true, ep_in, &mut csw, 13, BOT_TRIES) < 0 {
         pl011_write(b"dwc2: bot CSW-in failed\r\n");
-        bot_recover(ep_in, ep_out);
+        let _ = bot_recover(ep_in, ep_out);
         return false;
     }
     let sig = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
