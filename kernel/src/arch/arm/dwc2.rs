@@ -1539,11 +1539,21 @@ const BOT_TRIES: u32 = 10;
 /// bRequest 0x01, wValue 0, wIndex = the endpoint address with bit 7 set for an IN endpoint. Clearing
 /// the halt also resets the DEVICE's toggle to DATA0, which is why ours is reset to match.
 fn bot_recover(ep_in: u32, ep_out: u32) {
+    // Re-select the device with its CONTROL packet size. `msc_select` leaves MPS0 set to the BULK
+    // endpoint's size (512 on a high-speed stick), and a control transfer framed with that instead of
+    // EP0's 64 is malformed - the clear-halt then fails and disturbs the device further, turning a
+    // recovery into a second fault. (Measured: doing this wrong took a selfcheck run from 16 failures
+    // to 70.) Restore the bulk selection afterwards so the caller's next transfer is framed correctly.
+    select_device(MSC_ADDR.load(Ordering::Relaxed), MSC_EP0_MPS.load(Ordering::Relaxed), false);
+    SPLIT_PORT.store(MSC_HUB_PORT.load(Ordering::Relaxed), Ordering::Relaxed);
     let _ = control_out(0x02, 0x01, 0x0000, (ep_in | 0x80) as u16); // bulk IN
     let _ = control_out(0x02, 0x01, 0x0000, ep_out as u16);         // bulk OUT
     BULK_TOGGLE_IN.store(false, Ordering::Relaxed);
     BULK_TOGGLE_OUT.store(false, Ordering::Relaxed);
+    msc_select();
 }
+/// The mass-storage device's endpoint-0 max packet size (see `bot_recover`).
+static MSC_EP0_MPS: AtomicU16 = AtomicU16::new(64);
 
 /// Run one SCSI command via BOT. `cdb` is the SCSI command block; `data`/`dlen` is the data stage
 /// (`data_in` selects direction). Returns true iff the command completed with CSW status = passed.
@@ -1588,10 +1598,14 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
         pl011_write(b" residue="); write_hex32(residue);
         pl011_write(b" status="); write_hex32(csw[12] as u32);
         pl011_write(b"\r\n");
-        // A bad signature means we are out of sync with the device's framing, and a phase error means
-        // it wants a reset - both need the endpoints put back to a known state, not just a report.
-        // (A plain status=1 is the device refusing THIS command, which recovery also makes safe.)
-        bot_recover(ep_in, ep_out);
+        // Recover ONLY from a transport-level problem: a wrong signature or tag means we are out of
+        // sync with the device's framing, and status 2 is a phase error, which explicitly asks for a
+        // reset. Status 1 is the device cleanly REFUSING this command (a power-on UNIT ATTENTION, a
+        // bad LBA) - the endpoints are fine, so clearing halts there is pointless control traffic that
+        // only risks upsetting a healthy device.
+        if sig != 0x5342_5355 || tag != 0x1234_5678 || csw[12] >= 2 {
+            bot_recover(ep_in, ep_out);
+        }
     }
     ok
 }
@@ -1599,6 +1613,10 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
 /// Detect a Bulk-Only mass-storage device on the current address, select its config, and prove the bulk
 /// path by reading its capacity and block 0 (READ CAPACITY(10) + READ(10)). Returns true if it was one.
 fn probe_mass_storage() -> bool {
+    // The device's CONTROL (endpoint 0) max-packet, as selected right now by enumeration. It must be
+    // captured before the bulk size replaces it: a later control transfer to this device (the endpoint
+    // recovery below) has to be framed with EP0's packet size, not the bulk endpoint's.
+    MSC_EP0_MPS.store(MPS0.load(Ordering::Relaxed), Ordering::Relaxed);
     let mut cfg = [0u8; 64];
     if !get_descriptor(0x80, 0x02, 0x00, 0, &mut cfg, 9) { return false; }
     let total = (((cfg[2] as usize) | ((cfg[3] as usize) << 8)).max(9)).min(cfg.len());
