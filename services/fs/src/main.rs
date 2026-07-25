@@ -264,6 +264,8 @@ struct Fs {
     // mount instead of on every commit. A device that does not implement SYNCHRONIZE CACHE must not
     // brick the filesystem - we cannot make it durable, but we can refuse to pretend otherwise.
     flush_warned: core::cell::Cell<bool>,
+    // Same, for the checkpoint barrier: on a drive with no flush every commit trips it.
+    checkpoint_warned: core::cell::Cell<bool>,
     // Crash-consistency journal (Phase C). While `txn_active`, structural writes (directory,
     // bitmap, superblock) are STAGED here - with read-your-writes - instead of going to disk,
     // then committed atomically through the on-disk journal region (`commit_txn`). Data-block
@@ -1209,6 +1211,7 @@ impl Fs {
             read_only,
             last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
             flush_warned: core::cell::Cell::new(false),
+            checkpoint_warned: core::cell::Cell::new(false),
             txn_active: false,
             txn_n: 0,
             txn_overflow: false,
@@ -1377,7 +1380,14 @@ impl Fs {
         // redo record: precisely the corruption this barrier exists to prevent, performed by the
         // barrier itself.
         if !self.durable_or_warn(ctx) {
-            ctx.log("fs: checkpoint not confirmed durable - journal left INTACT, replays next mount (data safe)");
+            // Report ONCE per mount. On a drive that cannot flush at all this is true of every
+            // transaction, and 50 identical lines in one selfcheck is the CRC-spam mistake again -
+            // loud without being useful. `durable_or_warn` has already said, once, that ordering is
+            // unenforced on this medium; this line adds only which step noticed.
+            if !self.checkpoint_warned.get() {
+                self.checkpoint_warned.set(true);
+                ctx.log("fs: checkpoint not confirmed durable - journal left INTACT, replays next mount (data safe)");
+            }
             return Ok(());
         }
         // 4. Invalidate the journal. The checkpoint above already landed every block home, so a

@@ -1575,6 +1575,54 @@ fn bot_recover(ep_in: u32, ep_out: u32) -> bool {
 /// The mass-storage device's endpoint-0 max packet size (see `bot_recover`).
 static MSC_EP0_MPS: AtomicU16 = AtomicU16::new(64);
 
+
+/// How many times a vanished device may be revived per boot, and whether a revival is already running.
+static MSC_REVIVE_TRIES: AtomicU32 = AtomicU32::new(0);
+static MSC_REVIVING: AtomicBool = AtomicBool::new(false);
+const MSC_REVIVE_MAX: u32 = 3;
+
+/// Recover from a failed BOT command, escalating to a full re-enumeration if the device has GONE.
+///
+/// `bot_recover` clears the endpoint halts, which fixes a device that is confused. It cannot fix one
+/// that is absent - and the two are distinguishable: a halted bulk endpoint still answers control
+/// transfers, so a `bot_recover` that fails on EP0 means the device itself stopped responding. That
+/// happened on real hardware after ~27 s of sustained I/O, and because nothing escalated, the FIRST
+/// such failure killed storage until reboot: every later command failed against a device that was no
+/// longer there.
+///
+/// The USB-level answer to a device that has gone is a port reset and a fresh enumeration, which is
+/// exactly what boot does. The machinery already existed and was simply never reached after boot.
+fn recover_or_revive(ep_in: u32, ep_out: u32) {
+    if bot_recover(ep_in, ep_out) { return; }
+    if MSC_REVIVING.swap(true, Ordering::Relaxed) { return; } // re-entered from the probe below
+    let tries = MSC_REVIVE_TRIES.load(Ordering::Relaxed);
+    if tries >= MSC_REVIVE_MAX {
+        MSC_REVIVING.store(false, Ordering::Relaxed);
+        return;                                  // bounded: stop trying, stay loudly unavailable
+    }
+    MSC_REVIVE_TRIES.store(tries + 1, Ordering::Relaxed);
+    pl011_write(b"dwc2: device stopped answering EP0 - port reset + re-enumerate, attempt ");
+    super::timer::write_dec_pub(tries + 1);
+    pl011_write(b" of 3
+
+");
+    // Stop serving while the bus is rebuilt: `probe_mass_storage` sets MSC_READY again on success, so
+    // a failed revival leaves storage cleanly "no device" rather than looping on a corpse.
+    MSC_READY.store(false, Ordering::Release);
+    reset_port();
+    enumerate_sync();
+    MSC_REVIVING.store(false, Ordering::Relaxed);
+    if MSC_READY.load(Ordering::Acquire) {
+        pl011_write(b"dwc2: device came back - storage restored
+
+");
+    } else {
+        pl011_write(b"dwc2: device did not come back - storage unavailable (loud, not silent)
+
+");
+    }
+}
+
 /// Run one SCSI command via BOT. `cdb` is the SCSI command block; `data`/`dlen` is the data stage
 /// (`data_in` selects direction). Returns true iff the command completed with CSW status = passed.
 fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u8], dlen: usize) -> bool {
@@ -1590,7 +1638,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
 
     if bulk_xfer(false, ep_out, &mut cbw, 31, BOT_TRIES) < 0 {
         pl011_write(b"dwc2: bot CBW-out failed\r\n");
-        let _ = bot_recover(ep_in, ep_out);
+        recover_or_revive(ep_in, ep_out);
         return false;
     }
     // Keep what the data stage actually moved, so the CSW check below can compare the device's own
@@ -1609,7 +1657,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     let mut csw = [0u8; 13];
     if bulk_xfer(true, ep_in, &mut csw, 13, BOT_TRIES) < 0 {
         pl011_write(b"dwc2: bot CSW-in failed\r\n");
-        let _ = bot_recover(ep_in, ep_out);
+        recover_or_revive(ep_in, ep_out);
         return false;
     }
     let sig = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
