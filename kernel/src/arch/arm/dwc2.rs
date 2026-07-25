@@ -1739,11 +1739,15 @@ static MSC_SECTORS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new
 /// errors, same build and same disk.
 static MSC_LAST_USE_US: AtomicU32 = AtomicU32::new(0);
 
-/// How long after storage touches the channel the keyboard poll stays off it. Long enough to cover the
-/// gap between the back-to-back block commands `fs` issues, short enough that typing resumes the moment
-/// I/O quiesces. Keystrokes are not lost meanwhile - the device queues its reports and we read them on
-/// the next poll.
-const MSC_CHANNEL_GUARD_US: u32 = 2000;
+/// How long after storage touches the channel the keyboard poll stays off it.
+///
+/// It has to cover the gap BETWEEN block commands, not merely the commands themselves: `fs` verifies a
+/// CRC and walks its tree between reads, and at 2 ms the keyboard slipped into those gaps. The evidence
+/// was precise - 27 USB errors left, failing exactly the READ-HEAVY commands (`drives check`, `drives
+/// scrub`, `fcap`) while every light one passed. One scheduler tick covers the gaps and costs nothing
+/// noticeable: the standoff applies only after storage has actually run, so typing at an idle prompt is
+/// unaffected, and a skipped poll loses no keystroke because the device queues its reports.
+const MSC_CHANNEL_GUARD_US: u32 = 10_000;
 
 /// Record that storage just used the channel (see `MSC_LAST_USE_US`).
 fn msc_mark_channel_use() {
