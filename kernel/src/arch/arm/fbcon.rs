@@ -365,7 +365,6 @@ fn put_byte_inner(c: &mut Fbcon, b: u8) {
         c.ansi = 0;
         let p = c.csi_params[0];
         let p1 = c.csi_params[1];
-        let had_param = c.csi_n > 0 || p != 0;
         let private = c.csi_private;
         c.csi_params = [0; 4]; c.csi_n = 0;
         c.csi_private = false;
@@ -398,7 +397,8 @@ fn put_byte_inner(c: &mut Fbcon, b: u8) {
             b'D' => c.col = c.col.saturating_sub(n1),                              // CUB
             // SGR. Only the two the full-screen apps actually emit: reverse video for a highlighted
             // row, and reset. A bare `ESC[m` is a reset too.
-            b'm' => match p { 7 => c.reverse = true, 0 if !had_param || p == 0 => c.reverse = false, _ => {} },
+            // SGR: only the two the full-screen apps emit. A bare `ESC[m` parses as p = 0 = reset.
+            b'm' => match p { 7 => c.reverse = true, 0 => c.reverse = false, _ => {} },
             // `ESC[?25l` / `ESC[?25h` - hide / show the cursor. Full-screen apps (edit, observe) hide it
             // for the session so their bulk redraws do not smear an underline across the screen.
             b'l' if private && p == 25 => c.cursor_visible = false,
