@@ -285,11 +285,19 @@ unsafe extern "C" fn stub_dabt() -> ! {
         // alignment or external abort - and those have completely different fixes. Without it a fault
         // whose address looks impossible (a load from a known-good page reporting address 0) leaves
         // nothing to reason from.
-        "mrc p15, 0, r3, c5, c0, 0",  // DFSR (fault status)
+        "mrc p15, 0, r12, c5, c0, 0", // DFSR (fault status)
+        // ...and the faulting task's USER stack pointer. A fault whose address sits just ABOVE the
+        // mapped stack top says the task is running on a stack pointer it should never have had, and
+        // no amount of pc/addr/status distinguishes "bad pointer in correct code" from "correct code
+        // on a corrupt SP". System mode (0x1f) shares the USR bank, so this reads the very SP the
+        // faulting PL0 code was using.
+        "cps #0x1f",                  // system mode - shares the USR banked SP
+        "mov r3, sp",                 // SP_usr at the moment of the fault
         "cps #0x13",                  // -> SVC mode, the task's kernel stack
         "mov r0, r1",                 // arg0 = fault pc
         "mov r1, r2",                 // arg1 = fault addr
-        "mov r2, r3",                 // arg2 = fault status
+        "mov r2, r12",                // arg2 = fault status
+                                      // arg3 = r3 = SP_usr (already in place)
         "bl {kill}",                  // kill_current + switch to next task; NEVER returns
         "b .",                        // guard: never reached
         "1:",
@@ -312,7 +320,7 @@ unsafe extern "C" fn stub_dabt() -> ! {
 /// with IRQs masked (abort entry). Never returns: `kill_current` sets the task Dead and switches to the
 /// next runnable task - `yield_current`'s Dead path saves the abandoned handler context to
 /// `CORE_DEAD_CTX` (not the task slot, so no use-after-free) and never resumes it.
-extern "C" fn arm_user_fault_kill(pc: u32, addr: u32, dfsr: u32) -> ! {
+extern "C" fn arm_user_fault_kill(pc: u32, addr: u32, dfsr: u32, sp_usr: u32) -> ! {
     let slot = crate::task::scheduler::current_task_slot();
     // Loud, never silent (invariant 12): the kill, WHERE it faulted, and WHY. The DFSR status field is
     // the "why" - ARMv7 short-descriptor encoding packs it as bits [3:0] plus bit 10, so 0b00101 /
@@ -321,8 +329,8 @@ extern "C" fn arm_user_fault_kill(pc: u32, addr: u32, dfsr: u32) -> ! {
     // without the status left a fault whose address looked impossible with nothing to reason from.
     let status = (dfsr & 0xF) | ((dfsr >> 10) & 1) << 4;
     crate::kprintln!(
-        "arm32: user task (slot {}) faulted at pc {:#010x}, addr {:#010x} - DFSR {:#010x} (status {:#07b}, {}) - killing it; kernel continues",
-        slot, pc, addr, dfsr, status,
+        "arm32: user task (slot {}) faulted at pc {:#010x}, addr {:#010x}, SP_usr {:#010x} - DFSR {:#010x} (status {:#07b}, {}) - killing it; kernel continues",
+        slot, pc, addr, sp_usr, dfsr, status,
         match status {
             0b00101 | 0b00111 => "translation - nothing mapped there",
             0b01101 | 0b01111 => "permission - mapped, but not accessible at this level",
