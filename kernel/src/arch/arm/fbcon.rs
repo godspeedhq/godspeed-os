@@ -36,7 +36,20 @@ struct Fbcon {
     // echoed character. A serial terminal interprets those; fbcon used to drop only the ESC byte and then
     // draw "[K" as literal glyphs, which is the garble seen on the TV when typing (`h[Ke[Kl[Kp[K`).
     ansi: u8,
-    csi_param: u32,
+    // A CSI carries a LIST of parameters (`ESC[row;colH`), not one. This was a single u32, which made
+    // absolute cursor positioning impossible to express - so `ESC[H` was silently dropped and every
+    // full-screen app (chaos max-carnage, observe, edit) streamed its repaint down the screen instead
+    // of painting over it. Four is enough for everything we emit; extra parameters are counted but
+    // discarded rather than overflowing.
+    csi_params: [u32; 4],
+    csi_n: usize,
+    // SGR reverse video (`ESC[7m` / `ESC[0m`), used by the full-screen apps to highlight a row.
+    reverse: bool,
+    // UTF-8 decode state, matching `arch/x86_64/fb.rs`. Without it a multi-byte sequence was drawn
+    // as its raw bytes, so every box-drawing character in the UI (`tree`, the table borders, the
+    // full-screen frames) came out as two or three pieces of mojibake.
+    utf8_cp: u32,
+    utf8_remaining: u8,
     csi_private: bool,   // the CSI carried a `?` (a private sequence, e.g. `ESC[?25l` hide cursor)
     // The underline cursor: where it was last painted, so it can be lifted before the write position
     // moves. Full-screen apps (edit, observe) turn it off with `ESC[?25l` and back on with `ESC[?25h`.
@@ -47,7 +60,8 @@ struct Fbcon {
 }
 static mut FBCON: Fbcon = Fbcon {
     base: 0, pitch: 0, width: 0, height: 0, org_x: 0, org_y: 0, cols: 0, rows: 0, col: 0, row: 0,
-    ansi: 0, csi_param: 0, csi_private: false,
+    ansi: 0, csi_params: [0; 4], csi_n: 0, csi_private: false, reverse: false,
+    utf8_cp: 0, utf8_remaining: 0,
     cursor_visible: true, cur_col: 0, cur_row: 0, cursor_on: false,
 };
 static READY: AtomicBool = AtomicBool::new(false);
@@ -73,7 +87,7 @@ pub fn init(base: u32, pitch: u32, width: u32, height: u32) {
         c.col = 0;
         c.row = 0;
         c.ansi = 0;
-        c.csi_param = 0;
+        c.csi_params = [0; 4]; c.csi_n = 0;
         c.csi_private = false;
         c.cursor_visible = true;
         c.cur_col = 0;
@@ -117,6 +131,13 @@ fn clear(c: &Fbcon) {
 }
 
 /// Blend the foreground over the background by an antialiasing intensity (0 = bg, 255 = fg).
+/// Under SGR reverse video (`ESC[7m`) the ramp is inverted, so the cell fills with foreground and the
+/// glyph is punched out of it - which is what the full-screen apps use to mark a selected row.
+#[inline]
+fn blend_rev(intensity: u8, reverse: bool) -> u32 {
+    blend(if reverse { 255 - intensity } else { intensity })
+}
+
 #[inline]
 fn blend(intensity: u8) -> u32 {
     let i = intensity as u32;
@@ -131,11 +152,14 @@ fn blend(intensity: u8) -> u32 {
 fn draw_glyph(c: &Fbcon, ch: u8, col: usize, row: usize) {
     let x0 = c.org_x + col * CELL_W;
     let y0 = c.org_y + row * CELL_H;
+    let rev = c.reverse;
+    // Box-drawing cells are drawn with strokes, not from the font (see `draw_box_glyph`).
+    if box_arms(ch) != (false, false, false, false) { draw_box_glyph(c, ch, x0, y0); return; }
     match get_raster(ch as char, FONT_WEIGHT, RASTER_HEIGHT) {
         Some(rc) => {
             for (gy, rowpix) in rc.raster().iter().enumerate() {
                 for (gx, &intensity) in rowpix.iter().enumerate() {
-                    put_pixel(c, x0 + gx, y0 + gy, blend(intensity));
+                    put_pixel(c, x0 + gx, y0 + gy, blend_rev(intensity, rev));
                 }
             }
         }
@@ -224,6 +248,81 @@ fn cursor_show(c: &mut Fbcon) {
 
 /// `ESC[K` (Erase in Line): blank the current row from the cursor to the end of the text area. The shell's
 /// line editor emits this after each echoed character to wipe any leftover tail.
+
+/// Map a decoded Unicode codepoint to the internal **cell byte** the renderer draws. ASCII passes
+/// through (rendered from the font); the light box-drawing block (`U+2500..U+253C`) maps to reserved
+/// high bytes rendered PROCEDURALLY by `draw_box_glyph`, so the frames join seamlessly regardless of
+/// what the font happens to contain; anything else becomes `?` - visible, never silently dropped
+/// (§3.12). Byte-for-byte the same mapping as `arch/x86_64/fb.rs`, so the two consoles agree.
+fn cell_for_codepoint(cp: u32) -> u8 {
+    if cp < 0x80 { return cp as u8; }
+    match cp {
+        0x2500 => 0xC4, 0x2502 => 0xB3, 0x250C => 0xDA, 0x2510 => 0xBF,
+        0x2514 => 0xC0, 0x2518 => 0xD9, 0x251C => 0xC3, 0x2524 => 0xB4,
+        0x252C => 0xC2, 0x2534 => 0xC1, 0x253C => 0xC5,
+        _ => b'?',
+    }
+}
+
+/// Which of the four arms a box-drawing cell byte has: `(up, down, left, right)`.
+fn box_arms(ch: u8) -> (bool, bool, bool, bool) {
+    match ch {
+        0xC4 => (false, false, true, true),  0xB3 => (true, true, false, false),
+        0xDA => (false, true, false, true),  0xBF => (false, true, true, false),
+        0xC0 => (true, false, false, true),  0xD9 => (true, false, true, false),
+        0xC3 => (true, true, false, true),   0xB4 => (true, true, true, false),
+        0xC2 => (false, true, true, true),   0xC1 => (true, false, true, true),
+        0xC5 => (true, true, true, true),
+        _ => (false, false, false, false),
+    }
+}
+
+/// Draw a box-drawing cell with strokes out from the cell centre, so neighbouring cells JOIN with no
+/// gap - which a font glyph cannot guarantee at an arbitrary cell size.
+fn draw_box_glyph(c: &Fbcon, ch: u8, x0: usize, y0: usize) {
+    let (up, down, left, right) = box_arms(ch);
+    let th = (CELL_W / 5).max(2);                  // stroke thickness
+    let vx = CELL_W.saturating_sub(th) / 2;        // left edge of the vertical band
+    let hy = CELL_H.saturating_sub(th) / 2;        // top edge of the horizontal band
+    let ink = if c.reverse { BG } else { blend(255) };
+    let bg  = if c.reverse { blend(255) } else { BG };
+    for y in 0..CELL_H { for x in 0..CELL_W { put_pixel(c, x0 + x, y0 + y, bg); } }
+    let mut fill = |xs: usize, xe: usize, ys: usize, ye: usize| {
+        for y in ys..ye.min(CELL_H) { for x in xs..xe.min(CELL_W) { put_pixel(c, x0 + x, y0 + y, ink); } }
+    };
+    if up    { fill(vx, vx + th, 0, hy + th); }
+    if down  { fill(vx, vx + th, hy, CELL_H); }
+    if left  { fill(0, vx + th, hy, hy + th); }
+    if right { fill(vx, CELL_W, hy, hy + th); }
+    clean_rect(c, x0, y0, CELL_W, CELL_H);
+}
+
+/// EL(2) - erase the whole current line (x86 parity; the default EL(0) is `erase_to_eol`).
+fn erase_line_full(c: &Fbcon) {
+    if c.row >= c.rows { return; }
+    let y0 = c.org_y + c.row * CELL_H;
+    let w = c.cols * CELL_W;
+    for gy in 0..CELL_H { for gx in 0..w { put_pixel(c, c.org_x + gx, y0 + gy, BG); } }
+    clean_rect(c, c.org_x, y0, w, CELL_H);
+}
+
+/// ED(0) - erase from the cursor to the end of the screen: the rest of the current line, then every
+/// row below it. A full-screen repaint uses this to wipe the tail of a taller previous frame, so
+/// without it the old frame showed through beneath the new one.
+fn erase_to_end_of_screen(c: &Fbcon) {
+    erase_to_eol(c);
+    if c.row + 1 >= c.rows { return; }
+    let y0 = c.org_y + (c.row + 1) * CELL_H;
+    let h = (c.rows - c.row - 1) * CELL_H;
+    let w = c.cols * CELL_W;
+    for gy in 0..h {
+        for gx in 0..w {
+            put_pixel(c, c.org_x + gx, y0 + gy, BG);
+        }
+    }
+    clean_rect(c, c.org_x, y0, w, h);
+}
+
 fn erase_to_eol(c: &Fbcon) {
     if c.row >= c.rows || c.col >= c.cols { return; }
     let x0 = c.org_x + c.col * CELL_W;
@@ -247,37 +346,95 @@ fn put_byte_inner(c: &mut Fbcon, b: u8) {
     // --- ANSI escape handling (before any glyph is drawn) ---
     if c.ansi == 1 {                                   // previous byte was ESC
         c.ansi = if b == b'[' { 2 } else { 0 };        // only CSI (`ESC[`) is understood
-        c.csi_param = 0;
+        c.csi_params = [0; 4]; c.csi_n = 0;
         c.csi_private = false;
         return;
     }
     if c.ansi == 2 {                                   // inside a CSI sequence
         if (0x30..=0x3F).contains(&b) {                // parameter bytes: digits, ';', '?'
             if b == b'?' { c.csi_private = true; }     // `ESC[?...` - a private sequence
+            if b == b';' { c.csi_n = (c.csi_n + 1).min(3); } // next parameter
             if b.is_ascii_digit() {
-                c.csi_param = c.csi_param.saturating_mul(10) + (b - b'0') as u32;
+                let i = c.csi_n.min(3);
+                c.csi_params[i] = c.csi_params[i].saturating_mul(10) + (b - b'0') as u32;
             }
             return;
         }
         if (0x20..=0x2F).contains(&b) { return; }      // intermediate bytes
         // 0x40..=0x7E: the final byte ends the sequence.
         c.ansi = 0;
-        let p = c.csi_param;
+        let p = c.csi_params[0];
+        let p1 = c.csi_params[1];
+        let had_param = c.csi_n > 0 || p != 0;
         let private = c.csi_private;
-        c.csi_param = 0;
+        c.csi_params = [0; 4]; c.csi_n = 0;
         c.csi_private = false;
+        // A CSI parameter defaults to 1 when omitted, EXCEPT for ED/EL where it defaults to 0.
+        let n1 = if p == 0 { 1 } else { p } as usize;
         match b {
-            b'K' => erase_to_eol(c),                   // EL - what the line editor uses
-            b'J' if p == 2 => { clear(c); c.col = 0; c.row = 0; } // ED(2) - clear screen
+            // EL. 2 = the whole line; 0 (default) = cursor to end of line, which is what the line
+            // editor emits after each echoed character.
+            b'K' if p == 2 => erase_line_full(c),
+            b'K' => erase_to_eol(c),
+            // ED. `ESC[2J` clears everything; `ESC[J` / `ESC[0J` clears from the cursor to the end of
+            // the screen, which is what a full-screen repaint uses to wipe the tail of a shorter frame.
+            // Only the p == 2 form was handled, so `ESC[J` fell through to the catch-all and left the
+            // previous frame's leftovers on screen underneath the new one.
+            b'J' if p == 2 => { clear(c); c.col = 0; c.row = 0; }
+            b'J' if p == 0 => erase_to_end_of_screen(c),
+            // CUP - absolute cursor position, 1-based on the wire, clamped to the screen. THE missing
+            // one: a full-screen app paints by seeking to a row/column and writing, so without this its
+            // output simply streamed at the current position and scrolled the shell instead of
+            // overlaying it. `f` (HVP) is the same operation under a different final byte.
+            b'H' | b'f' => {
+                let r = if p == 0 { 1 } else { p } as usize;
+                let cl = if p1 == 0 { 1 } else { p1 } as usize;
+                c.row = (r - 1).min(c.rows.saturating_sub(1));
+                c.col = (cl - 1).min(c.cols.saturating_sub(1));
+            }
+            b'A' => c.row = c.row.saturating_sub(n1),                              // CUU
+            b'B' => c.row = (c.row + n1).min(c.rows.saturating_sub(1)),            // CUD
+            b'C' => c.col = (c.col + n1).min(c.cols.saturating_sub(1)),            // CUF
+            b'D' => c.col = c.col.saturating_sub(n1),                              // CUB
+            // SGR. Only the two the full-screen apps actually emit: reverse video for a highlighted
+            // row, and reset. A bare `ESC[m` is a reset too.
+            b'm' => match p { 7 => c.reverse = true, 0 if !had_param || p == 0 => c.reverse = false, _ => {} },
             // `ESC[?25l` / `ESC[?25h` - hide / show the cursor. Full-screen apps (edit, observe) hide it
             // for the session so their bulk redraws do not smear an underline across the screen.
             b'l' if private && p == 25 => c.cursor_visible = false,
             b'h' if private && p == 25 => c.cursor_visible = true,
-            _ => {}                                    // SGR colours, cursor moves, ... : ignored
+            _ => {}                                    // colours, scroll regions, ... : ignored
         }
         return;
     }
-    if b == 0x1B { c.ansi = 1; c.csi_param = 0; c.csi_private = false; return; } // ESC starts a sequence
+    if b == 0x1B { c.ansi = 1; c.csi_params = [0; 4]; c.csi_n = 0; c.csi_private = false; return; } // ESC starts a sequence
+
+    // --- UTF-8 decode (so the console renders the box-drawing UI, not garbled bytes) ---
+    if c.utf8_remaining > 0 {
+        if b & 0xC0 == 0x80 {                                   // continuation byte
+            c.utf8_cp = (c.utf8_cp << 6) | (b & 0x3F) as u32;
+            c.utf8_remaining -= 1;
+            if c.utf8_remaining == 0 {
+                let cell = cell_for_codepoint(c.utf8_cp);
+                draw_glyph(c, cell, c.col, c.row);
+                c.col += 1;
+                if c.col >= c.cols { c.col = 0; c.row += 1; }
+                if c.row >= c.rows { scroll(c); c.row = c.rows - 1; c.col = 0; }
+            }
+            return;
+        }
+        c.utf8_remaining = 0;                                   // malformed - reprocess this byte
+    }
+    if b >= 0x80 {
+        if b & 0xE0 == 0xC0 { c.utf8_cp = (b & 0x1F) as u32; c.utf8_remaining = 1; return; }
+        if b & 0xF0 == 0xE0 { c.utf8_cp = (b & 0x0F) as u32; c.utf8_remaining = 2; return; }
+        if b & 0xF8 == 0xF0 { c.utf8_cp = (b & 0x07) as u32; c.utf8_remaining = 3; return; }
+        draw_glyph(c, b'?', c.col, c.row); c.col += 1;          // stray lead: visible, never dropped
+        if c.col >= c.cols { c.col = 0; c.row += 1; }
+        if c.row >= c.rows { scroll(c); c.row = c.rows - 1; c.col = 0; }
+        return;
+    }
+
     match b {
         b'\n' => { c.col = 0; c.row += 1; }
         b'\r' => { c.col = 0; }
