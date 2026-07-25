@@ -523,7 +523,13 @@ commit just leaves harmless garbage in free space.
 means a committed-but-unfinished transaction → replay its blocks to their home LBAs
 (idempotent) and invalidate. An absent/torn commit (no magic, or a CRC mismatch) → do
 nothing. So a crash *before* the commit record is discarded (home untouched); a crash *after*
-it is completed. There is no third outcome.
+it is completed. There is no third outcome **on a backend that attests durability** (see the note below).
+
+**Backends that cannot be ordered (2026-07-25).** What follows is true of `ahci` and SD/EMMC, and is
+BACKEND-specific rather than architectural. The ARM USB mass-storage backend issues no per-write flush
+and the device refuses `SYNCHRONIZE CACHE`, so the journal-data -> commit -> checkpoint ordering is NOT
+enforced there; `commit_txn` now asks explicitly (three barriers) and `fs` warns once per mount when the
+answer is no. `CLAUDE.md` §6.1 (amendment 2026-07-25) carries the constitutional form.
 
 **Why ordered durability is free.** `block-driver` flushes every sector write to the medium
 before replying (`FLUSH EXT`), and `fs` serializes requests, so the journal-data → commit →

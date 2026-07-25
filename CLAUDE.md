@@ -311,6 +311,29 @@ os/
 > of invariant 11 and the §6.3 goal reached. §22 Test 13 pins it (`fs` survives its own
 > restart). The remaining non-restartable set is now just `init` + `supervisor` + kernel.
 
+> **Amendment 2026-07-25 (ARM/USB): the Phase D recovery guarantee is BACKEND-CONDITIONAL, and the
+> backend reports which case it is in.** Phase D (above) dropped `block-driver` and `fs` from the TCB
+> *on the strength of* crash-consistent recovery. Bringing up USB mass storage on the ARM32 port showed
+> that guarantee is not a property of `fs` alone: a redo journal is **pure ordering** - staged blocks
+> durable before the commit record that authorises replaying them, that record durable before any home
+> block moves - and ordering can only be enforced by a device that attests durability. Two cases, and
+> the difference is a printed fact rather than a hidden assumption (exactly the §6.4 posture):
+> - **A backend that attests durability** keeps the guarantee intact. `ahci` issues `FLUSH CACHE EXT`
+>   after every write; SD/EMMC completes a write only after the card releases its busy line. Ordering
+>   holds, `fs` recovers to a consistent state on mount, and the Phase D TCB claim stands unchanged.
+> - **A backend that cannot** does not. The Pi 2's USB stick refuses `SYNCHRONIZE CACHE` outright, and
+>   FUA - which the drive does honour - costs more time per write than the driver's command budget can
+>   give it (`USE_FUA`, `arch/arm/dwc2.rs`). With no barrier available, a power cut can lose the tail of
+>   a write sequence, and `fs` says so **once per mount** rather than implying a guarantee it cannot
+>   deliver. Metadata is still CRC-verified, so the failure is DETECTED loudly on read; what is lost is
+>   automatic *recovery*, not the ability to notice.
+>
+> So the honest form of the Phase D claim is: **`fs` is restartable everywhere; it is crash-recoverable
+> on a backend that can be ordered.** Where it cannot be, `fs` remains restartable (its death is still a
+> supervisor restart, never a reboot - §6.2 is untouched) and a *power loss* may require a reformat.
+> Recorded rather than closed, per §26.3: the fix is a block path that can wait out a busy device
+> without holding the core, which is real work and not a constant.
+
 > **Amendment 2026-06-09 (H11): `registry` is no longer a TCB member.** It became a
 > real userspace name service (register/lookup over IPC, holding only delegated caps
 > and deriving copies - `docs/registry.md`). It owns no kernel-critical state, so its
@@ -1128,7 +1151,7 @@ Kill is for misbehaving services and for restart. It is not a graceful shutdown 
 
 State belongs to services, not the kernel. Services that need to survive restart must persist externally and reconstruct on startup.
 
-The filesystem service is the externalization mechanism for everyone else and cannot persist *to itself*. Resolution: the block driver holds a direct hardware capability and stores fs metadata. `fs` gives itself **transactional metadata recovery** - every mutation commits through a crash-consistent redo-journal and `fs` recovers to a consistent state on mount (`docs/persistence.md` §6.8). With that, `block-driver` and `fs` are **restartable** and no longer in the TCB (§6.1 Phase D amendment, 2026-06-17); their death is a supervisor restart, not a reboot.
+The filesystem service is the externalization mechanism for everyone else and cannot persist *to itself*. Resolution: the block driver holds a direct hardware capability and stores fs metadata. `fs` gives itself **transactional metadata recovery** - every mutation commits through a crash-consistent redo-journal and `fs` recovers to a consistent state on mount (`docs/persistence.md` §6.8). With that, `block-driver` and `fs` are **restartable** and no longer in the TCB (§6.1 Phase D amendment, 2026-06-17); their death is a supervisor restart, not a reboot. **The recovery guarantee is backend-conditional - see the 2026-07-25 amendment in §6.1.**
 
 Stateless services (logger in v1) restart trivially. Example application services (ping, pong) are also stateless and restart trivially - but they are demonstration services in `examples/`, not permanent architectural components.
 

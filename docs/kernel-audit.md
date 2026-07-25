@@ -498,3 +498,58 @@ GPIO pin/op guards, `hardware_reset` sequence, and the ENTIRE dwc2 chain (init s
 `poll_wait_halt` 500k, `enumerate_hub` bounded by `next_addr > 120`, `configure_smsc95xx` + `smsc_mii_wait`
 all capped, `net_frame_tx`/`rx` bounded + the smsc RX length hard-guarded) are individually bounded - no
 unbounded device-driven loop, no boot-wedge on hostile/absent hardware.
+
+---
+
+## Audit 7 (2026-07-25, `feat/pi2-arm32` @ `74ee6ff`) - the USB mass-storage + durability work
+
+**Scope:** the unaudited range `6929e28..HEAD` (73 commits, ~1,840 kernel lines across 18 files): the
+DWC2 mass-storage/BOT path, the channel interlock, the cache-flush/FUA durability work, syscall 49
+(`UsbDiskFlush`), the `resource_invoke` ABI repack, and the ARM console/HID/page-table changes.
+
+**North star, restated:** nothing above the kernel may panic or wedge it, and the kernel must never
+hand a service data it did not receive. This audit found one breach of the second half.
+
+**Verdict:** authority and memory-safety are sound. Findings concentrate in liveness, one
+data-integrity gap, and one restart break. **1 HIGH, 4 MED, 2 LOW, 2 INFO; 6 FIXED, 2 RECORDED.**
+
+| ID | Sev | Class | What | Status |
+|----|-----|-------|------|--------|
+| **K7-1** | **HIGH** | (L) liveness | Aggregate IRQ-masked time. Each LEAF wait is bounded (`HALT_BUDGET_US` 2 ms, `POLL_HALT_BUDGET_US` 1 ms, `wait_for_uframe` 1.5 ms), but the retry loops MULTIPLY and nothing bounds the product: `chunks x BOT_TRIES x ss_tries x [uframe + halt + NYET retries]`. A block-I/O syscall runs with IRQs masked, so the timer tick, preemption and the keyboard poll all stop for the duration, and ARM has no liveness watchdog to convert it into a loud panic. The worst case needs a FULL-SPEED stick (`split_port != 0`); the high-speed direct path used on the Pi 2 today costs ~96 ms per FAILING `bot_command`. The comment at `dwc2.rs:559` claims "even a fully wedged device cannot starve the timer ISR" - true of one `wait_halt`, not of one syscall. | **RECORDED** - the fix is a single whole-command deadline captured in `bot_command` and threaded through `chan_dma`/`split_txn`, bounding the product rather than each leaf. Deliberately not attempted blind at the end of an audit: this is exactly the class where an untested "fix" has already cost this port a regression (selfcheck 16 -> 70), and the path the hardware actually takes is the bounded one. Tracked together with the async block path that K7-2 and the durability gap also want. |
+| **K7-2** | MED | (L) liveness | Time-only bounds regress the dead-peripheral guarantee. `poll_wait_halt`, `wait_halt`, `wait_for_uframe` and `pl011_write` were converted in this range from hardware-independent spin counts to `systimer_us() - start > BUDGET`. If the 1 MHz System Timer never advances, that condition is never true and the loop is unbounded. `timer::delay_us` keeps a `DELAY_SPIN_CAP` backstop for exactly this reason; these did not inherit it. Worst on `pl011_write`, which sits on the fault/abort path - a dead timer plus a held `SERIAL_BUSY` deadlocks the panic reporter itself. Same class as Audit 6's A6-3. | **RECORDED** with K7-1 (same fix shape: keep the time bound as primary, add an iteration ceiling as backstop). No trigger: QEMU and the Pi 2 both advance the System Timer. |
+| **K7-3** | MED | (C) correctness | **A short data phase with a GOOD verdict was accepted as a successful transfer.** `bot_command` decoded the CSW's `dResidue` and used it ONLY in the failure log; `ok` tested signature, tag and status but never the byte count. A device may legally return 100 bytes of a 512-byte read with status "passed" and residue 412 (BOT case 5/6, and the ordinary degraded behaviour of a flaky stick) - `bulk_xfer` copies 100 bytes, `bot_command` returns true, and `fs` receives 412 bytes of stale zeros PRESENTED AS DATA. Silent corruption arriving through the device's verdict rather than the DMA buffer, which is the one failure `dwc2.rs` states this driver must never produce. | **FIXED** - the data stage's moved byte count is kept and the CSW check now requires `residue == 0 && moved == dlen`; a short transfer is a failed transfer and recovers as a framing fault. |
+| **K7-4** | MED | (C) restart | `block-driver`'s ARM core-0 pin was BOOT-ONLY. The supervisor forced core 0 at boot, but the kernel `ServiceConfig.preferred_core` said `1` unconditionally and the restart path passes no override - so any respawn landed it on core 1, where every `msc_*` entry point refuses on `!on_core0()`. Storage would die permanently on the first `chaos kill-storm block-driver`, and §22 Test 11 kills a restartable service deliberately. Invariant 6 broken on ARM by one value disagreeing with itself across two code paths. | **FIXED** - `preferred_core: if cfg!(target_arch = "arm") { 0 } else { 1 }` (the idiom `nic-driver` already used), supervisor override removed. Placement now lives in ONE place, consulted by boot and restart alike. Verified: block-driver spawns on core 0 with no override. |
+| **K7-5** | MED | (P) portability | `s390x` lacks all five storage `arch::imp` primitives (`emmc_base_clock_hz`, `usb_disk_sectors/read/write/flush`), which neutral `dispatch.rs` calls unconditionally - so the neutral kernel does not compile there. **Pre-existing** (verified at `6929e28`: zero of them present), widened by one in this range. Invisible because CI builds x86_64 only and `arch_boundary_check.py` tests for named-arch references, not surface completeness - so `docs/multi-arch.md`'s "s390x compiles" endian-neutrality claim was stale. | **FIXED** - five stubs added. The structural gap (nothing checks seam completeness) is noted for a future guard. |
+| **K7-6** | LOW | (C) | `clean_invalidate_dcache_range` (`page_tables.rs`) uses `saturating_add` for `end` then `p += 32`; at the top of the address space `p` overflows to 0 (release builds have overflow checks off) and the loop never ends. The sibling `flush_dcache` uses wrapping arithmetic and exits naturally. No trigger (Pi 2 frames are all below `0x40000000`), but it is the NEW code that hangs. | **FIXED** - `while p < end && p >= addr` wrap guard. |
+| **K7-7** | LOW | (D) doc drift | Three doc-vs-code drifts introduced in this range: (a) new functions were inserted between `hw_random`'s doc block and its item, so the block documented `emmc_base_clock_hz` and `hw_random` had none; (b) `msc_write_block`'s doc asserted FUA behaviour in the present tense while `USE_FUA = false` makes that branch unreachable; (c) `MSC_NO_FLUSH`'s "cleared nowhere" comment justified itself with "a fresh device re-enumerates through `msc_select`", which is false - `msc_select` only re-points the channel and clears nothing. | **FIXED** - (a) doc reattached to its own item; (b) reworded to state FUA is off and why the rationale is deliberately kept; (c) the latches are now genuinely cleared on enumeration and the comment says so. |
+| **K7-8** | INFO | (P) | `usb_disk_read/write` take a `u64 lba` that the arm32 single-register ABI truncates to 32 bits with no wrapper clamp - the A-U1 class this same range fixed for `resource_invoke`. Safe today only by coincidence: `READ CAPACITY(10)` caps `MSC_SECTORS` at 2^32 and the bounds check precedes the `as u32`. Worth an explicit note before any `READ(16)` / >2 TiB support. | Recorded. |
+| **K7-9** | INFO | (A) | `USB_DISK` is minted `Rights::WRITE` only, and all four handlers - including the read and the capacity query - demand `WRITE`. A read-only block consumer cannot be expressed; the §7.4 READ/WRITE distinction is collapsed for this resource. | Recorded (no current consumer needs it). |
+
+**Verified sound (no violation):** cap-before-action holds for all four `UsbDisk` handlers and for
+`handle_resource_invoke` (validated before any hardware touch or user-memory access; `USB_DISK_RESOURCE`
+is registered unconditionally so `mint_cap` cannot expect-panic; the mints unwind via
+`cleanup_partial_spawn`). The `resource_invoke` repack is exact on both sides (`right<<24 | reply<<12 |
+file` against masks `0xFFF`, `0xFFF>>12`, `0xFF>>24`), totals 32 bits so nothing truncates on arm32, and
+`MAX_CAPS_PER_TASK` (64) cannot alias into `right` (4095 per field); a hostile `packed` yields only an
+out-of-range slot, which `CapTable::get` turns into `CapNotHeld`. No other syscall argument is packed
+above bit 31. Unsafe is clean (830 lines, no unaccounted additions); every new `asm!` is in `arch/` with
+a SAFETY comment, including `stub_dabt`'s `cps #0x1f` SP_usr capture (`r0-r3`/`r12` are unbanked and the
+I bit is untouched). Both descriptor walkers clamp to the 64-byte buffer, break on `blen == 0`, and
+range-check before every field read; the 16-bit MPS parse is correct; `ctrl_xfer` clamps the programmed
+DMA length on both directions; `bulk_xfer`'s OUT path sends `min(n, data.len())` so leftovers can never
+be transmitted. The `switch_context` `dsb`/`isb` bracketing and `publish_user_pages_to_other_cores` are
+a correct weak-memory fix (set/way is core-local, MVA is broadcast - the SEC-26/27 class), with a
+bounded L1/L2 walk over kernel-built tables only. `hid.rs` is pure logic with provably in-range
+indexing; `fbcon`'s CSI state machine is total and cannot escape the escape state.
+`arch_boundary_check.py` passes.
+
+**Cross-arch:** x86_64 was NOT broken by this range - services, kernel and `osdev` all build clean,
+20/20 contracts validate, and no third party encodes syscall 31's argument (the only encoder is the SDK,
+the only decoder the kernel). Confirmed against a clean worktree of the base commit.
+
+**Also fixed during this audit (a test defect, not a kernel one):** three `capability::table` proptests
+had been permanently red, sweeping `id in 0..DIRECT_CAP` and thereby fabricating STABLE gate resource
+ids (< 100) whose `bump_generation` the kernel correctly refuses (SEC-11). The kernel was right every
+time; the generators now start at 100. `97 passed, 0 failed`. Three always-red tests train a reader to
+see `3 failed` as the normal state, which is how a real regression walks in unnoticed (§22.4: a test
+failing for the wrong reason is a failure of the test, not the kernel).

@@ -624,3 +624,50 @@ op 3's 8-byte reply, op 4/9 length-prefixed, ops 5-8 ack - so a shorter-than-x86
 panic net-stack); `cmd_gpio` fully validated + loud (verb match with loud usage, pin bounded 0..53 with a
 loud reject, loud "not available" on the non-ARM stub), GPIO_DEVICE cap-gated; `cmd_random` bounded
 (`clamp(1,64)`) + loud on `hw_random()==None`.
+
+---
+
+## Audit 6 (2026-07-25, `feat/pi2-arm32` @ `74ee6ff`) - the USB block backend + durability work
+
+**Scope:** the unaudited range `6929e28..HEAD` across `services/` and `sdk/`: `fs`'s flush barriers and
+CRC reporting, the new `usbdisk` block backend and `OP_FLUSH` op, the SDHCI backend, the shell's
+tokenizer/line changes, the supervisor's placement call, and the SDK's `resource_invoke` repack plus
+`usb_disk_flush` wrapper.
+
+**North star, restated:** a service may only reach what it was granted, must fail loudly, and must
+never imply a guarantee it does not deliver. The last clause is where this audit landed.
+
+**Verdict: 1 HIGH, 4 MED, 6 LOW, 1 INFO.** Mechanical checks all pass. The real defects cluster in two
+places: **placement not surviving a restart** (the HIGH), and **comments promising §26.7 behaviour the
+code did not implement** - three separate cases, one of which loses a committed transaction.
+
+| ID | Sev | Class | What | Status |
+|----|-----|-------|------|--------|
+| **U6-1** | **HIGH** | (R) restart | `block-driver`'s ARM core-0 pin was applied at boot (`supervisor/main.rs` `ensure_mapped(..., 0)`) but NOT on restart: `respawn_managed` passes `0xFFFF` (no override), so the kernel fell back to `ServiceConfig.preferred_core: 1`. Every `msc_*` entry point refuses on `!on_core0()`, so a respawned block-driver replies `STATUS_ERR` to every block op forever, `fs` degrades to storage-unavailable, and its self-heal re-mount hits the same wall. Storage dead until reboot - block-driver no longer restartable on ARM (invariant 6), and `chaos max-carnage` kills it by design. | **FIXED** - placement moved into the kernel `ServiceConfig`, arch-conditional (`if cfg!(target_arch = "arm") { 0 } else { 1 }`), exactly as `nic-driver` already did; the supervisor's literal is gone. One source of truth, consulted by boot and restart alike. Verified on QEMU: spawns on core 0 with no override. Same finding as kernel Audit 7 K7-4, reached independently. |
+| **U6-2** | MED | (C) §26.7 | **BARRIER 3 did not do what its own comment said.** The comment promised "the invalidation below is skipped" when the pre-invalidation flush fails; the early return was lost when the barrier moved to `durable_or_warn` (which returned `()`), so `block_write(journal_start, zeros)` ran unconditionally. On a drive that refuses SYNCHRONIZE CACHE the home writes are acknowledged but still in the volatile buffer, fs erases the commit record, power is cut - and the transaction is lost with no redo record. Precisely the corruption BARRIER 3 documents itself as preventing, performed by the barrier itself. | **FIXED** - `durable_or_warn` returns its verdict, BARRIER 3 genuinely returns without invalidating and logs that the journal was left intact; the two advisory call sites now say `let _ =` with a reason rather than discarding by omission. |
+| **U6-3** | MED | (C) §26.7 | The AHCI `OP_FLUSH` comment was factually wrong about its own file. It claimed "SATA FLUSH CACHE (0xE7) is NOT implemented here" and that the gap "reports once at startup (`run`)" - but `write_block` and `write_zeros` have always issued `ATA_FLUSH_EXT` (0xEA) after every write, and `run` logs nothing of the kind. So the BEHAVIOUR was honest (that backend attests durability per-write, stronger than on demand) while the COMMENT was not, and the reply was an asserted `STATUS_OK` for a command never sent rather than an earned one. A maintainer trusting the comment would conclude x86 journal ordering is unenforced, which is false. | **FIXED** - `OP_FLUSH` now issues `ATA_FLUSH_EXT` and reports what the drive said; the comment states the truth. |
+| **U6-4** | MED | (C) | `fs`'s `match p[0] & 0x7F` masks the force bit off EVERY opcode, not just the two that use it. `forced` is consulted only by `OP_FLASH` and `OP_RESET`; for the other ~23 arms a garbled op byte `0x9B` silently executes op `0x1B` instead of returning `FS_ERR`, and a client can set a destructive-override bit on an op that has no override with no error. | **RECORDED** - the fix is to reject `p[0] & 0x80 != 0` unless the masked op is `OP_FLASH`/`OP_RESET`. Not applied in this pass: it changes the fs wire contract and belongs with a shell-side change and a test, not bundled into an audit commit. |
+| **U6-5** | MED | (C) Commandment III | `storage_unreadable` is overloaded to mean both "keep retrying the mount" and "the disk is present but unreadable". On `capacity == 0` (block-driver's authoritative "no disk") the new branch sets it purely to keep the re-mount loop armed, but that same flag selects the client-facing code, so a cardless Pi reports "storage unavailable ... data may be intact, do NOT flash" when there is no disk at all - blurring the distinction audit L2 created. | **RECORDED** - split `retry_mount` from `storage_unreadable`. Not a behavioural regression (the old bounded-attempt path ended in the same state), but the new code makes the conflation deliberate. |
+| **U6-6** | LOW | (C) §26.7 | `format` warns log-only and one-shot when durability is unattested, while the operator at the prompt gets an unqualified "drives: formatted as GSFS - mounted, ready to use now". Success and failure travel on different channels, so on a console/log split the caveat never reaches the person who acted. Same shape for `durable_or_warn`: once-per-mount means an operator attaching later cannot discover that ordering is unenforced. | **RECORDED** - the caveat should ride back in the reply (a distinct byte, or a `drives` flag bit exposing "durability unattested"). |
+| **U6-7** | LOW | (C) | `MAX_ARGS` was raised 4 -> 8, but tokens past the ceiling are still dropped SILENTLY - the exact bug being fixed (a dropped 5th word silently disarming `force`) recurs identically at 9 words. The same commit made `MAX_LINE` loud (BEL) but not this. Doc drift: a comment still reads "the shell's MAX_ARGS=4 tokenizer". | **RECORDED**. |
+| **U6-8** | LOW | (C) §26.6 | The `MAX_LINE` doubling costs more stack than its comment claims ("about 4 KiB"): `History.lines` 2 -> 4 KiB permanent, `History::load` frame ~4.2 -> ~8.3 KiB, `save` 2 -> 4 KiB, i.e. ~+8 KiB against a 64 KiB user stack already known tight on the `pipe_run` path. Both merge frames are correctly `#[inline(never)]`. | **RECORDED** - correct the comments and re-measure headroom on the deep pipe path. |
+| **U6-9** | LOW | (C) §26.7 | The `foreign_disk` guard is bypassed when block 0 cannot be READ: `if let Some(b0) = block_read(ctx, 0)` falls through to the format on `None`, so a transient read failure downgrades "could not verify" to "verified blank" - the one case the guard exists for. | **RECORDED** - refuse and say the disk could not be verified. |
+| **U6-10** | LOW | (C) §26.7 | `sdhci`: `let _ = self.set_clock(self.divider_for(25_000_000), ctx);` discards a failed 25 MHz step-up and `init` still returns true, so the driver announces "SD card ready" for a card whose clock was never confirmed. `reset_cmd_dat` also breaks out of its bounded wait with no log. | **RECORDED**. |
+| **U6-11** | LOW | (C) §14.3 | The block-driver backend choice is made once at startup and `fs` never re-validates it after a restart. If the stick is absent when block-driver respawns, it silently serves the SD card under the same name while `fs` keeps geometry derived from the previous instance - the hazard `foreign_disk` exists to prevent, arriving through a different door. | **RECORDED** - `fs` should re-validate the superblock or a capacity fingerprint after a block-driver reacquire, not only on `E_IO`. |
+| **U6-12** | INFO | (B) | `OP_WRITE_ZEROS` iterates a client-supplied `u64` with no clamp in both `usbdisk` and `sdhci`. The USB one is bounded implicitly (the kernel's `lba >= MSC_SECTORS` check fails the write and breaks the loop); `sdhci::write_block` has no range check, so that loop is genuinely unbounded. | **RECORDED** - clamp `count` to `sectors - lba` in both. |
+
+**Verified sound (no violation):** no global mutable state - `last_bad_dir_lba` and `flush_warned` are
+`Cell` fields on `Fs`, re-initialised by `Fs::mount`, and `format` ends in `Fs::mount`, so a reformat
+gets a fresh latch (the stale-after-reformat case was checked explicitly and does not occur); no service
+gained `unsafe` (`unsafe_check.py`: 52 files, 830 lines, no unaccounted additions), and all new `unsafe`
+is the SDK's §18.1-audited syscall wrappers, each SAFETY-commented. Bounded and heap-free throughout:
+every new buffer is a fixed array, no `alloc`/`Box`/`Vec`, every new device loop carries an explicit
+spin bound. Reply-cap discipline is exactly-once on every path of `usbdisk::serve`, `sdhci::serve` and
+`ahci::serve` (empty payload, short payload, unknown op and `OP_FLUSH` all covered), and `fs::block_flush`
+rides `block_rpc` -> `request_with_reply`, so a dead block-driver wakes it with `ReplyDead` rather than
+hanging a commit. `contract_check.py` passes.
+
+**Contract note (beyond what the checker can see):** `block-driver.toml` declares only `hw_device =
+"ahci"` + `log_write`, while the ARM build grants it **`USB_DISK`** (whole-device read/write reach) by
+kernel name-match. This is the same class as Audit 5's **A5-U1** (`NET_DEVICE`), which was closed there
+by an ARM note in the contract; the new privilege repeats it unannotated and should get the same note.
