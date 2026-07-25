@@ -47,10 +47,12 @@
 - [2026-07-11 to 2026-07-13 - The days the whole system stood for audit](#2026-07-11-to-2026-07-13---the-days-the-whole-system-stood-for-audit)
 - [2026-07-14 - The day the boundary became something a machine enforced](#2026-07-14---the-day-the-boundary-became-something-a-machine-enforced)
 - [2026-07-14 - The day one kernel booted three instruction sets in QEMU virt](#2026-07-14---the-day-one-kernel-booted-three-instruction-sets-in-qemu-virt)
+- [2026-07-25 - The day the second architecture stopped being a demonstration](#2026-07-25---the-day-the-second-architecture-stopped-being-a-demonstration)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
   - [2026-06-28 - The day my own test lied to me](#2026-06-28---the-day-my-own-test-lied-to-me)
+  - [2026-07-25 - The day I tuned against a number the disk was writing](#2026-07-25---the-day-i-tuned-against-a-number-the-disk-was-writing)
 - [The Named Bugs - the teachers](#the-named-bugs---the-teachers)
 
 ---
@@ -719,6 +721,54 @@ that only looked sudden because a hundred careful days came before it.
 
 ---
 
+## 2026-07-25 - The day the second architecture stopped being a demonstration
+
+On a Raspberry Pi 2, on real silicon, the shell printed `run: ran 349, failed 0`.
+
+The arm32 port had booted before. It had reached userspace, driven a keyboard through a hub, mounted
+a disk, spoken DHCP over USB ethernet. What was different on this day is that the *whole* self-check
+ran and every case passed: the language tour, the pipes, the records, the filesystem, and - the one
+that mattered most - `fcap`, the file-as-capability proof (§22 Test 14). A file opened as a real
+kernel capability, written and read *through* the cap, non-escalation enforced at both the kernel and
+the fs layer, a forged handle rejected, the cap revoked on close and on rename. The §7 north star,
+true on a second architecture and not by assertion.
+
+Four bugs stood in the way, and the striking thing is that **not one of them was visible under
+emulation**:
+
+1. A single DWC2 channel shared by the keyboard poll and storage, where a keyboard split abandoned
+   mid-flight corrupted the next block transfer.
+2. `resource_invoke` packing its `right` field at bit 32 of a syscall argument, where arm32's
+   register is 32 bits wide, so the right arrived as zero.
+3. The Bulk-Only Transport reset recovery missing its first step - the Mass Storage Reset that
+   resynchronises the *device's* state machine, without which clear-halt unsticks the pipes and
+   leaves the device still waiting for a transfer we had abandoned.
+4. A failed recovery that reported nothing, because its result was discarded with `let _ =`.
+
+**What I came to understand:** these were not logic bugs, they were bugs about the machine being
+*real*. An emulator gives you a device that is patient, coherent, infinitely fast, and stateless
+between commands. Every one of the four was the consequence of a device that is none of those - a
+channel that is genuinely contended, a register that is genuinely 32 bits, a controller that
+genuinely holds state you must resynchronise, and a recovery that can genuinely fail. QEMU had said
+yes to all four for months. It was not lying; it was answering a different question.
+
+And the third and fourth are the same bug wearing different clothes. The reset step was missing, and
+the code that would have told me it was missing threw its answer away. §26.7 already said a failed
+recovery must stay visible. What I had not appreciated is *why that matters so much*: a silent failed
+recovery does not merely hide a defect, it **misdirects the investigation**. Because the verdict was
+discarded, the log could not distinguish a device that was confused from a device that was gone - so
+I concluded the hardware had failed, and asked the operator to go test their USB stick. They pushed
+back: the stick was fine. They were right. The defect was mine, and the reason I could not see it was
+a return value nobody read. An error you discard does not just cost you the error. It costs you the
+next several hours, spent looking at the wrong component.
+
+**What it produced:** `bot_recover` now performs the full spec sequence and returns its verdict, and
+says out loud when it could not recover - which turns "storage is broken" into the answerable question
+"is this device confused, or gone?". The rule earned a sharper form: **an unread error return is not a
+missing log line, it is a wrong suspect.**
+
+---
+
 ## The Days I Was Wrong
 
 The entries above are mostly victories - the days understanding clicked into place. But the days
@@ -776,6 +826,29 @@ confidence. Fix the verdict before you trust the result.
 which immediately exposed three real clogs the old test had been hiding. Trust a system only as far
 as you trust the test that watched it.
 
+### 2026-07-25 - The day I tuned against a number the disk was writing
+
+Hunting the arm32 storage failures, I steered by the self-check's failure count: 83, then 7, then 61,
+then 7 again. I moved a constant, read the count, and drew a conclusion each time. One of those
+conclusions condemned a change that had in fact worked.
+
+The count was partly measuring the *disk*. A corrupt root directory block fails nearly every file
+test no matter what the build does, and that block persisted across reboots. So a run could report 61
+failures while the subsystem I had just changed had never been healthier - 4 USB-layer errors, down
+from 27. I read the catastrophe and reverted the fix that caused it.
+
+**What I came to understand:** before trusting a metric, ask what *else* can move it. A number that
+sums several independent causes cannot attribute any of them. The honest instrument had been sitting
+in the same log the whole time - the USB-layer error count, which nothing on disk can influence, and
+which told a clean monotone story from the first run to the last: 235, then 27, then 5. I had two
+instruments and spent several hardware round-trips reading the noisy one, because it was the one the
+test suite printed at the end in bold.
+
+**What it produced:** the discipline of judging a subsystem by a metric only that subsystem can move,
+and of treating persistent state as a variable in every experiment that touches it. Also the habit of
+saying so plainly when a previous conclusion was drawn from a contaminated number, rather than quietly
+letting the corrected result stand as though the reasoning had been sound.
+
 ---
 
 ## The Named Bugs - the teachers
@@ -784,6 +857,18 @@ Some bugs are worth naming, because a name turns a failure into shorthand. Years
 will say *"do not repeat the Registry Illusion,"* and everyone in the room will know exactly what
 that means. These are not listed because they were bugs. They are here because they were teachers.
 
+- **The Truncated Right** (2026-07-25) - `resource_invoke` packed its `right` field at bit 32 of a
+  syscall argument. On 32-bit ARM that register is 32 bits wide, so the field arrived as zero: the
+  kernel validated a right of nothing, `fs` received a badge of nothing, and a READ-only file
+  capability invoked declaring WRITE walked straight past the check meant to stop it. *Taught:*
+  authority can be lost to arithmetic. A capability check cannot fail safely if the right never
+  arrives to be checked - and a value assembled by shifting hides its width from the reader, which is
+  why the 32-bit ABI rule exists and why this still slipped past it.
+- **The Silent Clear-Halt** (2026-07-25) - the USB reset recovery discarded the result of its control
+  transfers with `let _ =`, so a recovery that achieved nothing looked exactly like one that worked.
+  One failed command then wedged storage forever with no explanation. *Taught:* a discarded error does
+  not merely hide a failure, it points the investigation at the wrong component - here, at the
+  operator's hardware, which was innocent. (§26.7, the sharpest lesson it has taught.)
 - **The Registry Illusion** (2026-06-21) - an entire service existed to *store* a name-to-cap mapping
   that turned out to be almost entirely derivable: the supervisor already held the caps, the kernel
   needed only a tiny recovery anchor. *Taught:* most of what looks like irreducible truth is a derived
