@@ -1593,10 +1593,17 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
         let _ = bot_recover(ep_in, ep_out);
         return false;
     }
-    if dlen > 0 && bulk_xfer(data_in, if data_in { ep_in } else { ep_out }, data, dlen, BOT_TRIES) < 0 {
-        pl011_write(b"dwc2: bot data-stage failed\r\n");
-        let _ = bot_recover(ep_in, ep_out);
-        return false;
+    // Keep what the data stage actually moved, so the CSW check below can compare the device's own
+    // residue against it rather than trusting a "passed" verdict on a transfer that fell short.
+    let mut moved = 0usize;
+    if dlen > 0 {
+        let n = bulk_xfer(data_in, if data_in { ep_in } else { ep_out }, data, dlen, BOT_TRIES);
+        if n < 0 {
+            pl011_write(b"dwc2: bot data-stage failed\r\n");
+            let _ = bot_recover(ep_in, ep_out);
+            return false;
+        }
+        moved = n as usize;
     }
 
     let mut csw = [0u8; 13];
@@ -1608,7 +1615,18 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     let sig = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
     let tag = u32::from_le_bytes([csw[4], csw[5], csw[6], csw[7]]);
     let residue = u32::from_le_bytes([csw[8], csw[9], csw[10], csw[11]]);
-    let ok = sig == 0x5342_5355 && tag == 0x1234_5678 && csw[12] == 0; // "USBS", tag echoed, status passed
+    // "USBS", tag echoed, status passed - AND the device moved every byte it was asked to.
+    //
+    // `dResidue` is how many bytes of the data stage the device did NOT deliver, and it used to be
+    // decoded for the error message only, never checked. A device is entitled to return a SHORT data
+    // phase with status 0 (BOT case 5/6, and the ordinary degraded behaviour of a flaky stick): 100
+    // bytes of a 512-byte read, residue 412, verdict "passed". That was accepted as a good block, and
+    // `fs` received 412 bytes of stale zeros PRESENTED AS DATA - silent corruption arriving through
+    // the device's verdict instead of the DMA buffer, which is the one thing this driver must never
+    // do. A short transfer is now a failed transfer, and a residue mismatch means we are out of step
+    // with the device's framing, so it recovers like any other transport fault.
+    let short = residue != 0 || moved != dlen;
+    let ok = sig == 0x5342_5355 && tag == 0x1234_5678 && csw[12] == 0 && !short;
     if !ok {
         // The transfers all succeeded but the device's verdict did not: report WHAT it said. Signature
         // wrong = we are out of sync with the device's framing; status 1 = the SCSI command itself
@@ -1726,6 +1744,15 @@ fn probe_mass_storage() -> bool {
     MSC_EP_OUT.store(ep_out, Ordering::Relaxed);
     MSC_MPS.store(bulk_mps, Ordering::Relaxed);
     MSC_SECTORS.store(last_lba as u64 + 1, Ordering::Relaxed); // READ CAPACITY reports the LAST LBA
+    // Forget what the PREVIOUS device answered. `MSC_NO_FLUSH` and `MSC_NO_FUA` cache one specific
+    // device's "no", and this is the point a different device arrives - so they are facts about a
+    // thing that is no longer attached. Left set, a stick that refuses SYNCHRONIZE CACHE would hand
+    // its refusal to whatever replaced it, silently denying a capable device the durability it does
+    // offer, with the one-shot warning already spent so nothing would ever say so. A derived view
+    // must not outlive the source it was derived from (Commandment III).
+    MSC_NO_FLUSH.store(false, Ordering::Relaxed);
+    MSC_NO_FUA.store(false, Ordering::Relaxed);
+    MSC_FUA_LOGGED.store(false, Ordering::Relaxed);
     MSC_READY.store(true, Ordering::Release);
     pl011_write(b"dwc2: mass storage READY - ");
     super::timer::write_dec_pub(((last_lba as u64 + 1) / 2048) as u32);
@@ -1838,6 +1865,11 @@ static MSC_FUA_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Write one 512-byte block to the USB mass-storage device. Same constraints as `msc_read_block`.
 ///
+/// **FUA is currently OFF** (`USE_FUA`, above, records the measurement that turned it off), so the
+/// FUA branch and its fallback below are inert. What follows describes what the bit is FOR, and is
+/// written in the present tense deliberately - it is the standing rationale for re-enabling, not a
+/// description of today's behaviour.
+///
 /// Issued with **FUA** (Force Unit Access) where the device accepts it, which asks the drive to put
 /// this block on the medium before reporting completion instead of parking it in a volatile buffer.
 /// That matters because this stick refuses SYNCHRONIZE CACHE, leaving no barrier at all: a redo
@@ -1935,8 +1967,10 @@ pub fn msc_sync_cache() -> bool {
 }
 
 /// Set once the device has refused SYNCHRONIZE CACHE, so it is never asked again (see `msc_sync_cache`).
-/// Cleared nowhere: a fresh device re-enumerates through `msc_select`, and re-probing costs a round-trip
-/// per barrier for an answer that does not change.
+/// **Cleared on enumeration** (`probe_mass_storage`), because it is a fact about ONE device: a later
+/// stick may well honour the command. An earlier version of this comment justified never clearing it
+/// with "a fresh device re-enumerates through `msc_select`" - which was simply wrong, `msc_select` only
+/// re-points the channel and clears nothing.
 static MSC_NO_FLUSH: AtomicBool = AtomicBool::new(false);
 
 /// The keyboard's host-side decode state: the previous report's keycodes (for N-key edge detection),

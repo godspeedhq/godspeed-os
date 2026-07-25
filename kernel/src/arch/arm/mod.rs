@@ -771,9 +771,6 @@ pub fn hardware_reset() -> ! {
     }
 }
 
-/// A hardware-random u32 from the BCM2835 SoC RNG, or None if it never produced (absent/wedged - loud, not
-/// a fallback). Ungated (InspectKernel query 19); the `random` shell utility consumes it. Best-effort under
-/// concurrent callers (an unlocked FIFO pop) - fine for a diagnostic, not fed to crypto.
 /// The SD/EMMC controller's base clock in Hz, read from the VideoCore mailbox at boot (0 = the GPU
 /// never reported one). Exposed to `block-driver` through InspectKernel query 20 because the Arasan's
 /// own capability register reports this wrongly on the BCM283x, and the driver is granted only its
@@ -789,6 +786,9 @@ pub fn usb_disk_write(lba: u64, src: &[u8]) -> bool { dwc2::msc_write_block(lba,
 /// Make prior writes durable (SCSI SYNCHRONIZE CACHE) - see `dwc2::msc_sync_cache`.
 pub fn usb_disk_flush() -> bool { dwc2::msc_sync_cache() }
 
+/// A hardware-random u32 from the BCM2835 SoC RNG, or None if it never produced (absent/wedged - loud, not
+/// a fallback). Ungated (InspectKernel query 19); the `random` shell utility consumes it. Best-effort under
+/// concurrent callers (an unlocked FIFO pop) - fine for a diagnostic, not fed to crypto.
 pub fn hw_random() -> Option<u32> {
     use core::sync::atomic::{AtomicBool, Ordering};
     const RNG_CTRL:   usize = PERIPHERAL_BASE + 0x10_4000;

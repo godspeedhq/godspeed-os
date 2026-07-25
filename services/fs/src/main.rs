@@ -1296,12 +1296,13 @@ impl Fs {
     /// guarantee it was never going to give. Before this existed there was no flush at all, so
     /// continuing is exactly the old behaviour - the difference is that it is now VISIBLE. What is
     /// not acceptable is the third option: proceeding while implying the ordering held (§26.7).
-    fn durable_or_warn(&self, ctx: &ServiceContext) {
-        if block_flush(ctx) { return; }
+    fn durable_or_warn(&self, ctx: &ServiceContext) -> bool {
+        if block_flush(ctx) { return true; }
         if !self.flush_warned.get() {
             self.flush_warned.set(true);
             ctx.log("fs: WARNING - the drive refuses cache flushes, so journal write ordering is NOT enforced on this medium. Metadata is still CRC-checked, but a power loss may leave it torn.");
         }
+        false
     }
 
     fn begin_txn(&mut self) {
@@ -1343,14 +1344,14 @@ impl Fs {
         // replaying them. Otherwise a crash can leave a valid commit record pointing at journal
         // slots the device never wrote, and recovery faithfully copies garbage to their home LBAs -
         // the journal actively causing the corruption it exists to prevent.
-        self.durable_or_warn(ctx);
+        let _ = self.durable_or_warn(ctx); // advisory: the one-shot warning IS the report (see BARRIER 3)
         let crc = crc32(&commit[..8 + n * 8]);
         commit[COMMIT_CRC_OFF..COMMIT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
         if !block_write(ctx, self.journal_start, &commit) { return Err("journal commit write failed"); }
         // BARRIER 2: and the commit record must be on the medium before any home block is
         // overwritten - that ordering IS the atomicity. A device free to reorder these two can land
         // a half-finished checkpoint with no commit record to replay it from.
-        self.durable_or_warn(ctx);
+        let _ = self.durable_or_warn(ctx); // advisory: see BARRIER 3
         // Test-only: simulate a power loss right here - commit record durable, home not yet
         // updated. The next mount must replay this transaction. (Never set in production.)
         if self.crash_after_commit {
@@ -1366,10 +1367,19 @@ impl Fs {
             }
         }
         // BARRIER 3: the home blocks must be durable before the journal is invalidated, or a crash
-        // could drop both the checkpoint and the record needed to redo it. Failing here is safe -
-        // the journal still holds the committed transaction and the next mount replays it - so this
-        // reports rather than returning, and the invalidation below is skipped.
-        self.durable_or_warn(ctx);
+        // could drop both the checkpoint AND the record needed to redo it. Failing here is safe so
+        // long as we actually keep the journal: it still holds the committed transaction and the next
+        // mount replays it. So this returns without invalidating.
+        //
+        // It previously said exactly that and did NOT do it - the early return was lost when this
+        // switched to `durable_or_warn`, so the commit record was erased even when the home writes
+        // were unconfirmed. On a drive that refuses flushes that loses the whole transaction with no
+        // redo record: precisely the corruption this barrier exists to prevent, performed by the
+        // barrier itself.
+        if !self.durable_or_warn(ctx) {
+            ctx.log("fs: checkpoint not confirmed durable - journal left INTACT, replays next mount (data safe)");
+            return Ok(());
+        }
         // 4. Invalidate the journal. The checkpoint above already landed every block home, so a
         // failure here is safe (the next mount re-replays this committed transaction idempotently) -
         // but log it loudly rather than silently re-replaying on every future mount (§26.7).
@@ -1508,7 +1518,11 @@ impl Fs {
         // Everything above is only ACKNOWLEDGED until the medium confirms it. Without this the root
         // directory - written last, and so still in the device's buffer - was lost to a power-cycle
         // moments later, leaving a disk whose superblock said "formatted" and whose file tree was
-        // unreadable. A format that cannot be made durable is a failed format, and says so.
+        // unreadable. A drive that cannot flush cannot be made to, so this warns and completes
+        // rather than failing the format - refusing would brick such a drive for a guarantee it was
+        // never going to give. (An earlier comment here read "a format that cannot be made durable
+        // is a failed format, and says so"; that described a version of the code that no longer
+        // exists, and a comment asserting a behaviour the code does not have is worse than none.)
         if !block_flush(ctx) {
             ctx.log("fs: WARNING - the drive refused a cache flush; this format is written but NOT confirmed on the medium. If power is cut before the drive settles, it may come back unreadable.");
         }

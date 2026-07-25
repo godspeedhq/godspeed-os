@@ -666,7 +666,15 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true, // serves block read/write requests from fs (§4)
             send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
             send_peers_grant:  false,
-            preferred_core:    1,
+            // ARM pins this to core 0, and it is NOT a preference there - it is a requirement. The
+            // USB mass-storage syscalls run against the in-kernel DWC2 stack, whose single host
+            // channel and DMA buffer are shared with the keyboard poll in core 0's timer ISR; every
+            // `msc_*` entry point refuses outright when `!on_core0()`. Placement lives HERE, in the
+            // one place both boot and RESTART consult. It used to be an unconditional 1 with the
+            // supervisor overriding it to 0 at boot only, so a restarted block-driver came back on
+            // core 1 and every block operation failed forever - storage dead until reboot, and
+            // restartability (invariant 6) broken on ARM by a value that disagreed with itself.
+            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[],

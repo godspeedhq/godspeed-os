@@ -411,9 +411,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // in-kernel DWC2 stack, and those syscalls are core-0-only: the single USB host channel and its DMA
     // buffer are shared with the keyboard poll in core 0's timer ISR, kept mutually exclusive by an ARM
     // syscall running with interrupts masked. A request from another core would simply be refused.
-    #[cfg(target_arch = "arm")]
-    ensure_mapped(&ctx, &mut name_map, "block-driver", 0);
-    #[cfg(not(target_arch = "arm"))]
+    // No override: the kernel's `ServiceConfig.preferred_core` decides, and it is arch-conditional
+    // (0 on ARM for the reason above). Overriding here pinned only the BOOT spawn - the restart path
+    // passes no override, so a respawned block-driver silently landed on a different core than the
+    // one it requires. One source of placement, consulted by both paths.
     ensure_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
     // fs needs a disk → bare-metal / blockdev only.
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]

@@ -305,3 +305,14 @@ pub mod ioapic {
 pub mod ap_boot {
     pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 { 0 }
 }
+
+// Storage primitives the neutral kernel calls unconditionally (`syscall/dispatch.rs`). s390x has no
+// USB or SD/EMMC backend, so each reports "no device" rather than being absent - a missing primitive
+// does not fail this arch loudly, it simply stops the neutral kernel compiling for it, which is how
+// the gap went unnoticed (CI builds x86_64 only, and the arch-boundary check tests for named-arch
+// references, not surface completeness).
+pub fn emmc_base_clock_hz() -> u32 { 0 }
+pub fn usb_disk_sectors() -> u64 { 0 }
+pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
+pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
+pub fn usb_disk_flush() -> bool { false }
