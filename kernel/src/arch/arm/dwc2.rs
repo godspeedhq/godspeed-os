@@ -1504,10 +1504,16 @@ fn bulk_xfer(dir_in: bool, ep: u32, data: &mut [u8], len: usize, tries: u32) -> 
                 recv as i32
             }
         } else {
+            // Send exactly what we filled. `n` is the caller's requested length clamped to the buffer,
+            // but the caller's own slice may be shorter still - and transmitting `n` after filling only
+            // `m` would push (n - m) bytes of the PREVIOUS transfer's leftovers to the device. On a disk
+            // that is silent corruption written to the medium, which is the one failure this driver must
+            // never produce. No current caller passes a short slice (a block write is 512/512), so this
+            // costs nothing today and removes the trap for the next one.
             let m = n.min(data.len());
             d.data[..m].copy_from_slice(&data[..m]);
-            flush_dcache(data_phys, n as u32);
-            if chan_dma(false, pid, data_phys, n as u32, ep, 2, tries) { n as i32 } else { -1i32 }
+            flush_dcache(data_phys, m as u32);
+            if chan_dma(false, pid, data_phys, m as u32, ep, 2, tries) { m as i32 } else { -1i32 }
         }
     };
     // Advance the endpoint data toggle to the parity-correct next PID that chan_dma computed (from the actual

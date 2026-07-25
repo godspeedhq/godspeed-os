@@ -252,6 +252,13 @@ struct Fs {
     feat_ro_compat: u32,
     feat_incompat: u32,
     read_only: bool,
+    // Last directory block reported as CRC-failed, so one bad block is reported ONCE per mount
+    // instead of once per read. A corrupt root produced 84 identical lines in a single selfcheck,
+    // which is the letter of invariant 12 without its purpose: the failure was loud but said
+    // nothing about what to do, and the repetition buried the one fact that mattered (they were
+    // all the SAME block). Owned state on the struct, not a static - a service holds no global
+    // mutable state (§3.9). `u64::MAX` = nothing reported yet.
+    last_bad_dir_lba: core::cell::Cell<u64>,
     // Crash-consistency journal (Phase C). While `txn_active`, structural writes (directory,
     // bitmap, superblock) are STAGED here - with read-your-writes - instead of going to disk,
     // then committed atomically through the on-disk journal region (`commit_txn`). Data-block
@@ -1195,6 +1202,7 @@ impl Fs {
             feat_ro_compat,
             feat_incompat,
             read_only,
+            last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
             txn_active: false,
             txn_n: 0,
             txn_overflow: false,
@@ -1246,7 +1254,23 @@ impl Fs {
     fn td_read(&self, ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
         let blk = self.tb_read(ctx, lba)?;
         if u32_at(&blk, DIR_CRC_OFF) != crc32(&blk[..DIR_REC_REGION]) {
-            ctx.log_fmt(format_args!("fs: directory block CRC mismatch at lba {} - refusing", lba));
+            // Report a given bad block once per mount, and say what it COSTS and what to do. Without
+            // redundancy a directory block cannot be repaired (fs/CLAUDE.md, Phase K): scrub detects
+            // bit-rot, it cannot undo it. The root block is the worst case - every path resolves
+            // through it, so losing it takes the whole tree with it and the only remedy is a reformat.
+            if self.last_bad_dir_lba.get() != lba {
+                self.last_bad_dir_lba.set(lba);
+                if lba == self.root_first_block {
+                    ctx.log_fmt(format_args!(
+                        "fs: ROOT directory block (lba {}) failed its CRC - the file tree is unreadable. \
+                         No redundancy exists for it, so this is not repairable: reformat with \
+                         `drives flash <n> data force`.", lba));
+                } else {
+                    ctx.log_fmt(format_args!(
+                        "fs: directory block CRC mismatch at lba {} - refusing (that directory's entries \
+                         are lost; `drives check` reports the extent, reformat clears it)", lba));
+                }
+            }
             return None;
         }
         Some(blk)
