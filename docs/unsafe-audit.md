@@ -1024,7 +1024,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/video.rs | 17 | permitted |
 | arch/arm/fbcon.rs | 5 | permitted |
 | arch/arm/dwc2.rs | 14 | permitted |
-| arch/arm/page_tables.rs | 27 | permitted |
+| arch/arm/page_tables.rs | 31 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |
 | arch/arm/sched_ipc.rs | 9 | permitted |

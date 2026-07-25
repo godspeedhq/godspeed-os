@@ -495,7 +495,73 @@ pub unsafe fn finalize_service_address_space(cr3: u64) {
     unsafe {
         fill_kernel_identity(cr3 as u32);
         clean_invalidate_dcache_all();
+        publish_user_pages_to_other_cores(cr3 as u32);
     }
+}
+
+/// Make this freshly-loaded address space visible to a core OTHER than the one that built it.
+///
+/// **The set/way sweep above is not enough, and that is an ARM trap worth stating plainly.** Set/way
+/// maintenance (`DCCISW`) is **local to the core that executes it** - it is never broadcast, even with
+/// `ACTLR.SMP` set. Only **MVA-based** operations are broadcast to the inner-shareable domain. So at
+/// spawn: the loader's writes (the service's text, rodata and data) sit in the SPAWNING core's D-cache,
+/// the set/way sweep pushes them out to RAM - and another core that still holds STALE lines for those
+/// same physical frames, recycled from a task that died earlier, never hears about it. It then runs the
+/// service against its own stale cache.
+///
+/// The service still *executes* (its text is mostly refetched) but every pointer it loads from its own
+/// data is garbage, which is exactly the observed signature: a correct `SP_usr`, faults at wild
+/// addresses (`0xfffffffc`, `0x400`, just past the stack top) and only ever on a core other than the
+/// spawner. QEMU cannot show it - TCG has no per-core caches.
+///
+/// So walk the new address space and clean+invalidate each USER page **by MVA** (`DCCIMVAC`), which is
+/// broadcast, then invalidate the instruction cache and branch predictor across the domain
+/// (`ICIALLUIS`/`BPIALLIS`) since the text was freshly written too. Pages are identity-mapped on this
+/// port, so the physical address is the address to maintain.
+unsafe fn publish_user_pages_to_other_cores(root: u32) {
+    let svc_l1 = (root & 0xFFFF_C000) as *const u32;
+    // SAFETY: `root` is a complete service L1 built by `PageTable::new`; every table/page address read
+    // from it is identity-mapped RAM. Cache maintenance has no memory effects beyond coherency.
+    unsafe {
+        for i in 0..4096usize {
+            let e1 = svc_l1.add(i).read_volatile();
+            if e1 & 0b11 != L1_TYPE_TABLE { continue; } // unmapped, or a shared kernel SECTION
+            let l2 = (e1 & 0xFFFF_FC00) as *const u32;
+            for j in 0..256usize {
+                let e2 = l2.add(j).read_volatile();
+                if e2 & 0b11 == 0 { continue; }             // invalid
+                if (e2 >> 4) & 0b11 < 0b10 { continue; }    // not PL0-accessible => not this service's
+                clean_invalidate_dcache_range(e2 & 0xFFFF_F000, 0x1000);
+            }
+        }
+        core::arch::asm!(
+            "dsb",
+            "mcr p15, 0, {z}, c7, c1, 0",  // ICIALLUIS - I-cache invalidate all, inner shareable
+            "mcr p15, 0, {z}, c7, c1, 6",  // BPIALLIS  - branch predictor invalidate, inner shareable
+            "dsb",
+            "isb",
+            z = in(reg) 0u32,
+            options(nostack),
+        );
+    }
+}
+
+/// Clean **and invalidate** a range by MVA (`DCCIMVAC`). Unlike `clean_dcache` (which only cleans) this
+/// also evicts the line, and unlike the set/way sweep it is **broadcast to the inner-shareable domain**,
+/// so other cores drop any stale copy of the same physical memory.
+fn clean_invalidate_dcache_range(addr: u32, len: u32) {
+    let mut p = addr & !31;
+    let end = addr.saturating_add(len);
+    while p < end {
+        // SAFETY: `DCCIMVAC` (`c7, c14, 1`) cleans+invalidates one line by MVA to the PoC. No memory is
+        // modified; identity-mapped physical addresses are valid MVAs on this port.
+        unsafe {
+            core::arch::asm!("mcr p15, 0, {a}, c7, c14, 1", a = in(reg) p, options(nostack));
+        }
+        p += 32;
+    }
+    // SAFETY: order the maintenance before the new address space is entered on any core.
+    unsafe { core::arch::asm!("dsb", options(nostack)) }
 }
 
 // ---- The remaining neutral surface (honest stubs / no-ops for the kernel-only path) ----
