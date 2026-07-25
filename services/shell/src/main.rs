@@ -11,7 +11,16 @@ use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, Agg
 /// keyboard reprints the prompt with no perceptible delay.
 const MUTED_POLL_SLEEP_CYCLES: u64 = 60_000_000;
 
-const MAX_LINE: usize = 128;
+/// Longest command line the editor accepts.
+///
+/// A FIXED ceiling is deliberate - the shell has no heap, so the line, the history and the history
+/// merge are all fixed arrays (§26.6). But it must be generous enough that a real command never meets
+/// it: at 128 an ordinary long path plus arguments, or a four-stage pipe, ran out of room mid-typing,
+/// which reads as a broken keyboard. 256 is past anything the utilities actually need while staying
+/// cheap - the constant multiplies by HIST_MAX (16) in `History` AND in the session-merge buffer, so
+/// this doubling costs about 4 KiB of the shell's stack, not 4 KiB per line. Reaching it is now
+/// audible (BEL in `insert`) rather than silent, so the ceiling is honest either way.
+const MAX_LINE: usize = 256;
 const MAX_ARGS: usize = 4;
 
 // fs API (shell <-> fs). MUST match `services/fs`.
