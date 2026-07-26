@@ -6,7 +6,11 @@
 # Covers every shell utility's main functions + negative cases, EXCEPT:
 #   - observe : it is a live full-screen view (only `observe now` is a snapshot; tested).
 #   - drives  : flashing/relabel/reset touch disks and prompt y/N - not scriptable.
-# Re-runnable: everything is created under /sc and deleted at the end.
+# Re-runnable: everything is created under /sc, removed at the START of the run, and deleted again at
+# the end. Cleaning only at the end is not re-runnable - it assumes the previous run REACHED its end.
+# A run that was aborted, wedged, or killed leaves /sc populated, and the next run then fails setup
+# assertions that only hold on a clean tree ("assert fails mkdir /sc", "assert fails read /sc/b.txt"),
+# reporting phantom failures that look like product bugs. Observed three times before it was fixed.
 #
 # Rules this suite obeys (so it self-grades correctly):
 #   - `assert ok|fails|fails-with <cmd>` is the RESULT form - only for NON-piped commands
@@ -281,6 +285,9 @@ assert fails restart nosuchservice
 # ===== files: create / read / overwrite / append / empty / quoted =====
 echo ''
 echo '===== files: create / read / overwrite / append / empty / quoted ====='
+# Start from a known-empty tree, whatever the previous run did or did not finish. `delete` on an
+# absent path fails harmlessly; the suite grades on the assertions below, not on this line.
+delete /sc recursive
 mkdir /sc
 assert ok ls /sc
 assert fails mkdir /sc
