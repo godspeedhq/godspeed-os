@@ -1706,6 +1706,41 @@ const MSC_REVIVE_MAX: u32 = 3;
 static MSC_FAIL_STREAK: AtomicU32 = AtomicU32::new(0);
 const MSC_FAIL_STREAK_MAX: u32 = 4;
 
+/// Consecutive BUSY hand-backs with no successful command in between, and how many of them mean the
+/// endpoint is STUCK rather than occupied.
+///
+/// Busy was made exempt from recovery because recovering on every busy issued a Mass Storage Reset for
+/// ordinary flow control - 564 of them in one selfcheck. That was right, and then it was applied too
+/// absolutely: recovery went from "always" to "never", which removed the only thing that clears a
+/// desynchronised endpoint. Hardware then showed exactly that state - `write lba 2 gave up after 6000
+/// busy retries`, a solid **30 seconds** of NAK on a single write, after which `fs` degraded the mount.
+/// No device is occupied for 30 seconds; a device that never once pauses is not busy, it is stuck (the
+/// classic cause being a CSW we never collected, which the device waits on before accepting any new CBW).
+///
+/// The two are told apart by DURATION, which is the only thing that distinguishes them: a run of busies
+/// unbroken by a single success. Linux draws the same line - `usb-storage` lets a command NAK freely and
+/// then, when it exceeds the command timeout, runs the very same BOT reset recovery.
+///
+/// 200 consecutive hand-backs is about a second. Recovery then fires once per further 200, so a device
+/// stuck for the full 30-second budget gets ~30 reset attempts rather than 6000 (bounded, §26.6), and a
+/// device that is merely slow gets none at all - one success resets the run.
+static MSC_BUSY_RUN: AtomicU32 = AtomicU32::new(0);
+const MSC_BUSY_RUN_MAX: u32 = 200;
+
+/// Record a BUSY hand-back, and repair the endpoint if they stop looking like flow control.
+///
+/// Deliberately does NOT touch `MSC_FAIL_STREAK` and never escalates to a port reset: busy is positive
+/// evidence the device is present and answering, so the response is to resynchronise the transport, not
+/// to declare the device gone and re-enumerate it.
+fn note_busy(ep_in: u32, ep_out: u32) {
+    let run = MSC_BUSY_RUN.fetch_add(1, Ordering::Relaxed) + 1;
+    if run % MSC_BUSY_RUN_MAX != 0 { return; }
+    pl011_write(b"dwc2: device busy with no pause for ");
+    super::timer::write_dec_pub(run);
+    pl011_write(b" commands - treating the endpoint as stuck, BOT reset recovery\r\n");
+    let _ = bot_recover(ep_in, ep_out);
+}
+
 /// Recover from a failed BOT command, escalating to a full re-enumeration if the device has GONE.
 ///
 /// `bot_recover` clears the endpoint halts, which fixes a device that is confused. It cannot fix one
@@ -1841,7 +1876,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
         // Recovering here meant every busy hand-back issued a Mass Storage Reset plus two clear-halts
         // and bumped the failure streak: 564 of them in one selfcheck, which is what produced 58
         // escalations and 3 port resets of a stick that was never broken. Recovery is for faults.
-        if !msc_last_was_busy() { recover_or_revive(ep_in, ep_out); }
+        if msc_last_was_busy() { note_busy(ep_in, ep_out); } else { recover_or_revive(ep_in, ep_out); }
         return false;
     }
     // Keep what the data stage actually moved, so the CSW check below can compare the device's own
@@ -1858,7 +1893,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
                 pl011_write(b"dwc2: bot data-stage failed - "); pl011_write(last_fail_str().as_bytes());
                 pl011_write(b"\r\n");
             }
-            if !msc_last_was_busy() { let _ = bot_recover(ep_in, ep_out); } // busy needs no repair
+            if msc_last_was_busy() { note_busy(ep_in, ep_out); } else { let _ = bot_recover(ep_in, ep_out); }
             return false;
         }
         moved = n as usize;
@@ -1878,7 +1913,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
         // Recovering here meant every busy hand-back issued a Mass Storage Reset plus two clear-halts
         // and bumped the failure streak: 564 of them in one selfcheck, which is what produced 58
         // escalations and 3 port resets of a stick that was never broken. Recovery is for faults.
-        if !msc_last_was_busy() { recover_or_revive(ep_in, ep_out); }
+        if msc_last_was_busy() { note_busy(ep_in, ep_out); } else { recover_or_revive(ep_in, ep_out); }
         return false;
     }
     let sig = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
@@ -1897,7 +1932,9 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     let short = residue != 0 || moved != dlen;
     let ok = sig == 0x5342_5355 && tag == 0x1234_5678 && csw[12] == 0 && !short;
     // A command that actually worked is the ONLY thing that clears the failure streak.
-    if ok { MSC_FAIL_STREAK.store(0, Ordering::Relaxed); }
+    // A command that worked is also the only evidence that the device is pausing between requests,
+    // so it is what makes a later run of busies mean "stuck" rather than "still the same slow write".
+    if ok { MSC_FAIL_STREAK.store(0, Ordering::Relaxed); MSC_BUSY_RUN.store(0, Ordering::Relaxed); }
     if !ok {
         // The transfers all succeeded but the device's verdict did not: report WHAT it said. Signature
         // wrong = we are out of sync with the device's framing; status 1 = the SCSI command itself
