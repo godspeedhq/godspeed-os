@@ -485,6 +485,21 @@ pub fn put_byte(b: u8) {
 /// Lifting and repainting per byte would double the pixel traffic of bulk output (a `help` listing, a
 /// scroll) for no visible benefit - the intermediate positions are never seen. Lifting BEFORE the run
 /// also keeps the underline from being scrolled up the screen as a stray mark.
+/// Clear the screen and home the cursor - the end-of-boot dismissal (`console_boot_complete`).
+pub fn clear_and_home() {
+    // SAFETY: single console owner (core 0 holds SERIAL_BUSY when this is called), same access
+    // discipline as `put_bytes`.
+    unsafe {
+        let c = &mut *core::ptr::addr_of_mut!(FBCON);
+        if c.base == 0 { return; }
+        clear(c);
+        c.col = 0;
+        c.row = 0;
+        c.cur_col = 0;
+        c.cur_row = 0;
+    }
+}
+
 pub fn put_bytes(s: &[u8]) {
     if !READY.load(Ordering::Relaxed) { return; }
     // SAFETY: as `put_byte` - single writer, serialized by the SERIAL_BUSY guard in pl011_write.

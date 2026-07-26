@@ -861,7 +861,11 @@ pub fn gpio_op(op: u32, pin: u32) -> i64 {
 
 // ---- Serial / console (PL011: output = pl011_write; input = the PL011 RX FIFO drained into a ring) ----
 pub fn serial_write_byte(b: u8) { pl011_write_byte(b); }
-pub fn serial_write_bytes_lockfree(s: &[u8]) { pl011_write(s); }
+pub fn serial_write_bytes_lockfree(s: &[u8]) {
+    // Kernel log output. Mirrored to the TV only while booting: afterwards the display belongs to the
+    // shell, and a log line landing mid-prompt is what made the prompt look absent.
+    if BOOT_LOG_TO_FB.load(Ordering::Acquire) { pl011_write(s); } else { pl011_write_no_fb(s); }
+}
 /// The shell's console output. `to_fb` is the CONSOLE FOREGROUND gate: false means a full-screen app
 /// owns the display, so this text belongs on the serial console only and must NOT reach the TV.
 ///
@@ -961,7 +965,27 @@ fn wake_console_waiter() {
     }
 }
 
-pub fn console_boot_complete() {}
+/// Whether KERNEL LOG output is still mirrored to the TV. True during boot so the init sequence is
+/// visible on the display; the shell flips it false the moment boot completes.
+static BOOT_LOG_TO_FB: AtomicBool = AtomicBool::new(true);
+static BOOT_DISMISSED: AtomicBool = AtomicBool::new(false);
+
+/// Boot is over: clear the boot screen and stop mirroring LOG output to it.
+///
+/// This was an empty stub, and the visible consequence was the prompt never appearing until a key was
+/// pressed. The shell prints `gsh> ` and then a late service log - `fs: journal recovered 5 block(s)`
+/// arriving after the shell is up - lands on the same line, leaving the cursor after the log text with
+/// no prompt at the start of a fresh line. Pressing Enter simply redrew it.
+///
+/// x86 has always done this (`BOOT_LOG_TO_FB` + `fb::clear_and_home`), and the shell's own comment
+/// states the contract it expects: "dismiss the boot screen on the TV (clear + stop mirroring logs to
+/// it) and present a clean prompt. Serial keeps the full stream." ARM simply never implemented its
+/// half. Serial is unchanged - it still receives everything, which is what a captured log needs.
+pub fn console_boot_complete() {
+    if BOOT_DISMISSED.swap(true, Ordering::AcqRel) { return; }
+    BOOT_LOG_TO_FB.store(false, Ordering::Release);
+    fbcon::clear_and_home();
+}
 
 // PL011 receive FIFO -> a single-producer/single-consumer input ring. The producer is `pl011_rx_drain`
 // (polled from the timer tick and by a blocked `console_read` itself); the consumer is `uart_rx_pop`
