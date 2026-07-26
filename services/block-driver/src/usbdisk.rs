@@ -35,7 +35,23 @@ use godspeed_sdk::{Message, ServiceContext};
 ///
 /// Bounded (§26.6) by attempts, and each attempt waits on TRUTH - the transfer completing - rather
 /// than on a clock (Commandment VIII).
-const BUSY_RETRIES: u32 = 200;
+/// How many times to re-ask a busy device before calling it a failure.
+///
+/// 6000 attempts at a 5 ms core-hold each is roughly **30 seconds**, which is deliberately the same
+/// order as the USB mass-storage command timeout Linux uses. The previous 200 was about one second,
+/// and hardware said plainly that this was too short: 36 blocks in a single run reported
+/// `gave up after 200 busy retries - the device stayed busy, it did not fail`, and `fs` then degraded
+/// a mount over a device that was alive and simply working. A stick doing internal garbage collection
+/// or a block remap can hold off for seconds; one second is not a storage timeout, it is a guess.
+///
+/// This does not risk hanging on a DEAD device: a device that has gone answers with transaction errors
+/// or stops answering EP0 entirely, and both are detected separately and immediately (`XACT_ERR_MAX`,
+/// and the revival path). "Busy" is positive evidence the device is present and responding - waiting
+/// for it is waiting on truth, and the bound here only stops that wait being unbounded (§26.6).
+///
+/// Cost when it does happen: this task yields between attempts, so the wait costs nothing but its own
+/// latency - interrupts stay on, the timer runs, every other service runs.
+const BUSY_RETRIES: u32 = 6_000;
 fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMut() -> i64) -> bool {
     for n in 0..BUSY_RETRIES {
         match op() {
