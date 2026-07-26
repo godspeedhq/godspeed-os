@@ -1610,15 +1610,13 @@ fn recover_or_revive(ep_in: u32, ep_out: u32) {
     //
     // So a run of failures escalates on its own. The streak is cleared by any successful command
     // (`bot_command`), which is the only evidence that actually settles it.
-    // Take the re-entrancy guard FIRST. `bot_recover` is not side-effect free: it re-points the global
-    // bus selection at the storage device (`select_device(MSC_ADDR, ..)`, `SPLIT_PORT`, `msc_select`).
-    // Running it while a revival is in flight - which happens, because the revival's own probe issues
-    // BOT commands that can fail - rewrites `DEV_ADDR`/`MPS0`/`SPLIT_PORT` to the PREVIOUS
-    // incarnation's values in the middle of enumeration, so the rest of the enumeration is framed with
-    // the bulk max-packet size against an address that no longer exists. That is exactly the control-
-    // framing defect that took a selfcheck from 16 failures to 70; the escalation path had re-opened a
-    // route to it.
-    if MSC_REVIVING.load(Ordering::Relaxed) { return; }
+    // `bot_recover` runs even during a revival, and that is deliberate. It re-points the bus using the
+    // MSC_* coordinates - which `probe_mass_storage` now publishes BEFORE issuing any command, so they
+    // describe the device actually present. Suppressing recovery here instead (the first attempt at
+    // this) starved the probe of the endpoint recovery it DEPENDS on: its very first command is
+    // expected to fail on the power-on UNIT ATTENTION, and without a clear-halt every revival
+    // enumerated the stick perfectly and then failed every command after it - 0 revivals out of 3,
+    // against 2 of 3 before. Fixing the stale coordinates removes the reason to suppress it.
     let streak = MSC_FAIL_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
     let recovered = bot_recover(ep_in, ep_out);
     if recovered && streak < MSC_FAIL_STREAK_MAX { return; }
@@ -1832,6 +1830,20 @@ fn probe_mass_storage() -> bool {
     pl011_write(b" split_port="); write_hex32(SPLIT_PORT.load(Ordering::Relaxed) as u32);
     pl011_write(b"\r\n");
 
+    // Publish this device's coordinates NOW, before a single command is issued against it.
+    //
+    // They used to be stored only after the probe fully succeeded, so throughout the probe
+    // `MSC_ADDR`/`MSC_EP_*`/`MSC_MPS` still described the PREVIOUS device. `bot_recover` re-points the
+    // bus using exactly those, so recovering a probe-time failure aimed at a device that no longer
+    // existed - which is why recovery had to be suppressed during a revival. Suppressing it then
+    // starved the probe of the recovery it DEPENDS on (its first command is expected to fail on the
+    // UNIT ATTENTION below), and every revival enumerated the stick perfectly and then failed every
+    // command after it. Setting them here fixes the cause, so recovery is safe to leave enabled.
+    MSC_ADDR.store(DEV_ADDR.load(Ordering::Relaxed), Ordering::Relaxed);
+    MSC_EP_IN.store(ep_in, Ordering::Relaxed);
+    MSC_EP_OUT.store(ep_out, Ordering::Relaxed);
+    MSC_MPS.store(bulk_mps, Ordering::Relaxed);
+
     // Clear the power-on UNIT ATTENTION: a freshly-attached device rejects its first command with CHECK
     // CONDITION until its sense data is drained. Loop TEST UNIT READY / REQUEST SENSE a bounded few times.
     //
@@ -1878,10 +1890,7 @@ fn probe_mass_storage() -> bool {
         pl011_write(b"dwc2: msc UNSUPPORTED sector size (only 512 is served)\r\n");
         return true;
     }
-    MSC_ADDR.store(DEV_ADDR.load(Ordering::Relaxed), Ordering::Relaxed);
-    MSC_EP_IN.store(ep_in, Ordering::Relaxed);
-    MSC_EP_OUT.store(ep_out, Ordering::Relaxed);
-    MSC_MPS.store(bulk_mps, Ordering::Relaxed);
+    // (coordinates were published above, before the first command)
     MSC_SECTORS.store(last_lba as u64 + 1, Ordering::Relaxed); // READ CAPACITY reports the LAST LBA
     // Forget what the PREVIOUS device answered. `MSC_NO_FLUSH` and `MSC_NO_FUA` cache one specific
     // device's "no", and this is the point a different device arrives - so they are facts about a
