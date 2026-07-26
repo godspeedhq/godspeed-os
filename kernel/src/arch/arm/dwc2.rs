@@ -1829,8 +1829,19 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     cbw[15..15 + n].copy_from_slice(&cdb[..n]);
 
     if bulk_xfer(CH_BULK, false, ep_out, &mut cbw, 31) < 0 {
-        pl011_write(b"dwc2: bot CBW-out failed - "); pl011_write(last_fail_str().as_bytes()); pl011_write(b"\r\n");
-        recover_or_revive(ep_in, ep_out);
+        // A BUSY hand-back is not a failure - the caller re-asks and it usually succeeds. Logging
+        // it printed 564 lines in ONE selfcheck for entirely normal flow control, which is the
+        // same "report a characteristic as a fault" mistake already fixed once this session:
+        // loud is a budget, and spending it on the expected case is how a real line gets ignored.
+        if !msc_last_was_busy() {
+            pl011_write(b"dwc2: bot CBW-out failed - "); pl011_write(last_fail_str().as_bytes());
+            pl011_write(b"\r\n");
+        }
+        // A BUSY device needs no recovery - it is working, just occupied, and the caller re-asks.
+        // Recovering here meant every busy hand-back issued a Mass Storage Reset plus two clear-halts
+        // and bumped the failure streak: 564 of them in one selfcheck, which is what produced 58
+        // escalations and 3 port resets of a stick that was never broken. Recovery is for faults.
+        if !msc_last_was_busy() { recover_or_revive(ep_in, ep_out); }
         return false;
     }
     // Keep what the data stage actually moved, so the CSW check below can compare the device's own
@@ -1839,8 +1850,15 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     if dlen > 0 {
         let n = bulk_xfer(CH_BULK, data_in, if data_in { ep_in } else { ep_out }, data, dlen);
         if n < 0 {
-            pl011_write(b"dwc2: bot data-stage failed - "); pl011_write(last_fail_str().as_bytes()); pl011_write(b"\r\n");
-            let _ = bot_recover(ep_in, ep_out);
+            // A BUSY hand-back is not a failure - the caller re-asks and it usually succeeds. Logging
+            // it printed 564 lines in ONE selfcheck for entirely normal flow control, which is the
+            // same "report a characteristic as a fault" mistake already fixed once this session:
+            // loud is a budget, and spending it on the expected case is how a real line gets ignored.
+            if !msc_last_was_busy() {
+                pl011_write(b"dwc2: bot data-stage failed - "); pl011_write(last_fail_str().as_bytes());
+                pl011_write(b"\r\n");
+            }
+            if !msc_last_was_busy() { let _ = bot_recover(ep_in, ep_out); } // busy needs no repair
             return false;
         }
         moved = n as usize;
@@ -1848,8 +1866,19 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
 
     let mut csw = [0u8; 13];
     if bulk_xfer(CH_BULK, true, ep_in, &mut csw, 13) < 0 {
-        pl011_write(b"dwc2: bot CSW-in failed - "); pl011_write(last_fail_str().as_bytes()); pl011_write(b"\r\n");
-        recover_or_revive(ep_in, ep_out);
+        // A BUSY hand-back is not a failure - the caller re-asks and it usually succeeds. Logging
+        // it printed 564 lines in ONE selfcheck for entirely normal flow control, which is the
+        // same "report a characteristic as a fault" mistake already fixed once this session:
+        // loud is a budget, and spending it on the expected case is how a real line gets ignored.
+        if !msc_last_was_busy() {
+            pl011_write(b"dwc2: bot CSW-in failed - "); pl011_write(last_fail_str().as_bytes());
+            pl011_write(b"\r\n");
+        }
+        // A BUSY device needs no recovery - it is working, just occupied, and the caller re-asks.
+        // Recovering here meant every busy hand-back issued a Mass Storage Reset plus two clear-halts
+        // and bumped the failure streak: 564 of them in one selfcheck, which is what produced 58
+        // escalations and 3 port resets of a stick that was never broken. Recovery is for faults.
+        if !msc_last_was_busy() { recover_or_revive(ep_in, ep_out); }
         return false;
     }
     let sig = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
