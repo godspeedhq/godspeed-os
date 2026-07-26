@@ -867,7 +867,15 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) { pl011_write(s); }
 /// whatever full-screen app was running, which is why `chaos max-carnage` never held the screen: the
 /// carnage it creates is precisely a flood of service log traffic, all of it un-gated.
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
-    if to_fb { pl011_write(s); } else { pl011_write_no_fb(s); }
+    // Output from the foreground owner RENEWS its claim: drawing is the evidence that it is still
+    // doing the job it took the console for. `to_fb` is true exactly when the writer is the owner (or
+    // the console is unclaimed), which is the same predicate the gate uses.
+    if to_fb {
+        CONSOLE_FG_RENEWED_US.store(timer::systimer_us(), Ordering::Relaxed);
+        pl011_write(s);
+    } else {
+        pl011_write_no_fb(s);
+    }
 }
 pub fn set_console_echo(on: bool) {}
 
@@ -879,8 +887,47 @@ pub fn set_console_echo(on: bool) {}
 // for it. Same semantics as `arch/x86_64/mod.rs`.
 static CONSOLE_FOREGROUND: AtomicU32 = AtomicU32::new(u32::MAX);
 
+/// How long a console claim survives without the owner producing output. A full-screen app renews by
+/// DRAWING - which is what such an app does, every frame - so a working one never notices this. One
+/// that has stopped drawing has stopped being a full-screen app, whatever its task state says.
+/// Generous enough to cover the slowest legitimate gap observed (a `chaos` round on this board runs
+/// ~17 s between repaints).
+const CONSOLE_FG_LEASE_US: u32 = 45_000_000;
+static CONSOLE_FG_RENEWED_US: AtomicU32 = AtomicU32::new(0);
+
+/// Claim exclusive console input, for a BOUNDED term.
+///
+/// The claim used to be perpetual, which made it the one authority here that a task could hold forever
+/// after it had stopped using it: the shell stayed muted, the screen kept the dead app's last frame,
+/// and on this board serial goes through the same gate - so a live, healthy machine had no usable
+/// console and the only way back was the power switch.
+///
+/// The first attempt at a fix was a magic key the kernel watched for. Wrong twice over. It imported a
+/// habit from other systems, which this one owes nothing to (§2.2, Appendix B.3) - and worse, it put
+/// POLICY IN THE KERNEL (§26.10), deciding what a keystroke MEANS. That is exactly what the SEC-2
+/// amendment took out of the USB driver, leaving the driver to signal and the principal holding the
+/// authority to decide. It was also undiscoverable, and the chord chosen did not even decode on this
+/// port's USB keyboard, so it worked only from serial - not where an operator at the TV is sitting.
+///
+/// Bounding the authority needs no keystroke and no interpretation. The kernel enforces a limit, which
+/// is mechanism; nothing guesses what the operator wants, and there is no chord to discover, document,
+/// or find out does not work on the keyboard in front of you. §26.6 lists bounded authority as a
+/// requirement; a perpetual claim was simply an unbounded one that had not bitten yet.
 pub fn claim_console_foreground(task_slot: u32) {
+    CONSOLE_FG_RENEWED_US.store(timer::systimer_us(), Ordering::Relaxed);
     CONSOLE_FOREGROUND.store(task_slot, Ordering::Release);
+}
+
+/// Has the current claim lapsed? Released and reported once, at the moment it happens (invariant 12).
+fn console_fg_lapsed() -> bool {
+    if CONSOLE_FOREGROUND.load(Ordering::Acquire) == u32::MAX { return false; }
+    let since = timer::systimer_us().wrapping_sub(CONSOLE_FG_RENEWED_US.load(Ordering::Relaxed));
+    if since < CONSOLE_FG_LEASE_US { return false; }
+    CONSOLE_FOREGROUND.store(u32::MAX, Ordering::Release);
+    wake_console_waiter();
+    pl011_write_no_fb(b"console: the foreground app stopped drawing - its claim lapsed, console returned
+");
+    true
 }
 pub fn release_console_foreground() {
     CONSOLE_FOREGROUND.store(u32::MAX, Ordering::Release);
@@ -898,7 +945,8 @@ pub fn release_console_foreground_if_owner(task_slot: u32) {
 /// unclaimed or this task holds it.
 pub fn console_foreground_allows(task_slot: u32) -> bool {
     let owner = CONSOLE_FOREGROUND.load(Ordering::Acquire);
-    owner == u32::MAX || owner == task_slot
+    if owner == u32::MAX || owner == task_slot { return true; }
+    console_fg_lapsed() // a claim nobody is renewing does not keep the console
 }
 /// Wake a task parked in a muted blocking console read, so releasing the foreground resumes it at once
 /// instead of leaving it asleep until the next keystroke - which is why the prompt did not come back
@@ -925,37 +973,6 @@ static INPUT_READY: AtomicBool = AtomicBool::new(false);
 /// Drain every byte currently in the PL011 RX FIFO into the input ring. Single producer (guard IRQs at
 /// the call site if a poll and a syscall could race; on this single-core port they are serialised by
 /// the syscall/IRQ masking already).
-/// The console ESCAPE HATCH byte: **Ctrl+\** (0x1C, the traditional "break out").
-///
-/// A full-screen app claims the console foreground so its keystrokes reach IT and not a resurrected
-/// shell. That is correct, and it is also a single point of failure: if the claimant stops making
-/// progress, nothing releases the claim, the shell stays muted, and the machine - which is still
-/// perfectly alive, kernel and all - has no usable console. On this board serial input goes through
-/// the SAME gate, so there was no way back short of a power cycle.
-///
-/// This byte is therefore handled where input ENTERS the ring, before any gate: it releases the
-/// foreground unconditionally and is not delivered to anyone. It cannot be checked on the read side,
-/// because a muted reader would have to POP a byte to inspect it and would then be stealing the
-/// owner's input (the `q` that quits chaos).
-///
-/// Unconditional by design: an escape hatch that can be refused by the thing you are escaping from is
-/// not an escape hatch. It grants no authority - releasing the foreground only ever RESTORES the
-/// default state in which any CONSOLE_READ holder may read.
-pub const CONSOLE_ESCAPE_BYTE: u8 = 0x1C;
-
-/// Handle `CONSOLE_ESCAPE_BYTE` at the producer. Returns true if the byte was consumed as an escape
-/// and must NOT be enqueued.
-fn console_escape_intercept(b: u8) -> bool {
-    if b != CONSOLE_ESCAPE_BYTE { return false; }
-    if CONSOLE_FOREGROUND.load(Ordering::Acquire) != u32::MAX {
-        release_console_foreground();
-        pl011_write_no_fb(b"
-console: foreground released by Ctrl-backslash - the prompt is yours again
-");
-    }
-    true
-}
-
 fn pl011_rx_drain() {
     // SAFETY: reading the PL011 FR/DR (Device-mapped MMIO) and appending to the ring; the ring indices
     // are atomics and this is the only producer path.
@@ -963,7 +980,6 @@ fn pl011_rx_drain() {
         loop {
             if PL011_FR.read_volatile() & PL011_FR_RXFE != 0 { break; } // RX FIFO empty
             let b = (PL011_DR.read_volatile() & 0xFF) as u8;
-            if console_escape_intercept(b) { continue; }
             let tail = RX_TAIL.load(Ordering::Relaxed) as usize;
             let head = RX_HEAD.load(Ordering::Acquire) as usize;
             let next = (tail + 1) % RX_BUF_SIZE;
@@ -1033,7 +1049,6 @@ pub fn uart_rx_poll() {
 /// Inject a byte into the input ring + wake the reader (kernel-side producer; unused on this port,
 /// which drives input straight from the PL011 RX FIFO, but kept for parity with the x86 keyboard path).
 pub fn console_push_byte(b: u8) {
-    if console_escape_intercept(b) { return; }
     let tail = RX_TAIL.load(Ordering::Relaxed) as usize;
     let head = RX_HEAD.load(Ordering::Acquire) as usize;
     let next = (tail + 1) % RX_BUF_SIZE;
