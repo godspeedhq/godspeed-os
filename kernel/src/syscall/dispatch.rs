@@ -1852,8 +1852,20 @@ fn handle_usb_disk_info() -> i64 {
     crate::arch::imp::usb_disk_sectors() as i64
 }
 
+/// A USB-disk syscall's "the device NAKed, re-ask" answer.
+///
+/// Deliberately OUTSIDE the capability-error range (-2..-7, `cap_err_to_i64`). BUSY was first given
+/// `-2`, which is `CapNotHeld` - so a task calling these syscalls WITHOUT the `USB_DISK` capability got
+/// the same answer as one whose device was merely occupied. `block-driver` believes the second reading
+/// and re-asks 6000 times before reporting "the device stayed busy, it did not fail", which is a false
+/// diagnosis of an authority failure, and `fs` then degrades storage on the strength of it (Invariant
+/// 12: a failure must name its own cause). Reachable whenever a respawned driver comes back without its
+/// cap wired - exactly the case a kill-storm produces.
+const USB_DISK_BUSY: i64 = -20;
+
 /// UsbDiskRead (47): read the 512-byte block at `arg0` (LBA) into the user buffer at `arg1`.
-/// Gated by USB_DISK. Returns 0 on success, -1 on failure (no device, LBA past the end, I/O error).
+/// Gated by USB_DISK. Returns 0 on success, `USB_DISK_BUSY` if the device NAKed (re-ask), -1 on a real
+/// failure (no device, LBA past the end, I/O error).
 fn handle_usb_disk_read(lba: u64, ptr: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
         return cap_err_to_i64(CapError::CapNotHeld);
@@ -1862,21 +1874,21 @@ fn handle_usb_disk_read(lba: u64, ptr: u64) -> i64 {
     // -2 = BUSY (the device NAKed; nothing is wrong, re-ask). Distinct from -1 = failed, because the
     // two need opposite responses and collapsing them is what turned a busy stick into a "broken" one.
     if !crate::arch::imp::usb_disk_read(lba, &mut buf) {
-        return if crate::arch::imp::usb_disk_busy() { -2 } else { -1 };
+        return if crate::arch::imp::usb_disk_busy() { USB_DISK_BUSY } else { -1 };
     }
     if !write_user_bytes(ptr, &buf) { return -1; }
     0
 }
 
 /// UsbDiskWrite (48): write the 512-byte block at the user buffer `arg1` to LBA `arg0`.
-/// Gated by USB_DISK. Returns 0 on success, -1 on failure.
+/// Gated by USB_DISK. Returns 0 on success, `USB_DISK_BUSY` if the device NAKed, -1 on a real failure.
 fn handle_usb_disk_write(lba: u64, ptr: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
         return cap_err_to_i64(CapError::CapNotHeld);
     }
     let src = match read_user_bytes(ptr, USB_DISK_BLOCK) { Some(b) => b, None => return -1 };
     if crate::arch::imp::usb_disk_write(lba, src) { 0 }
-    else if crate::arch::imp::usb_disk_busy() { -2 }   // BUSY: re-ask, do not treat as a failure
+    else if crate::arch::imp::usb_disk_busy() { USB_DISK_BUSY }   // re-ask, do not treat as a failure
     else { -1 }
 }
 

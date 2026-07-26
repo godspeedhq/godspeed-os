@@ -23,7 +23,7 @@
 //! hold the core waiting and then answers `-2` (busy) rather than `-1` (failed), and the waiting happens
 //! HERE, between yields, where interrupts are on and every other task still runs.
 
-use godspeed_sdk::{Message, ServiceContext};
+use godspeed_sdk::{Message, ServiceContext, USB_DISK_BUSY};
 
 /// Re-ask while the device says BUSY, yielding in between.
 ///
@@ -56,7 +56,10 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
     for n in 0..BUSY_RETRIES {
         match op() {
             0 => return true,
-            -2 => { ctx.yield_cpu(); }   // busy: hand the CPU on, then ask again - expected, silent
+            // Named, not a literal: BUSY must stay outside the capability-error range, or a driver
+            // missing its USB_DISK cap lands here and gets retried 6000 times before being reported
+            // as a device that "stayed busy" - an authority failure wearing an I/O failure's name.
+            USB_DISK_BUSY => { ctx.yield_cpu(); }   // hand the CPU on, ask again - expected, silent
             _ => return false,           // a real error; the kernel has already named it
         }
         let _ = n;

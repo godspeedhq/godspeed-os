@@ -26,9 +26,13 @@ pub(crate) unsafe fn raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     // The kernel ABI takes the number and three args in r0-r3 as single 32-bit registers (a u64
     // parameter would be a register PAIR on 32-bit ARM), so each arg is TRUNCATED to u32 here. Every
     // arg the current syscalls pass - pointer, handle, length, cap slot - fits in 32 bits. The ONE
-    // exception is a timeout in generic-timer ticks (RecvTimeout), which can exceed u32; its wrapper
-    // (`recv_timeout`) pre-clamps it on ARM so nothing lossy reaches this truncation (userspace-audit
-    // A-U1). The i64 result comes back in r0:r1.
+    // exceptions are values that can exceed 32 bits, and each is handled in ITS OWN WRAPPER before it
+    // reaches this truncation (userspace-audit A-U1): `recv_timeout` clamps a generic-timer tick count,
+    // and the USB-disk wrappers reject an LBA above u32::MAX rather than let it alias onto a real block
+    // (`lba_fits_syscall_abi`). This comment previously claimed the timeout was the ONE exception, which
+    // was false the moment a u64 LBA started coming through here - so before adding any syscall, check
+    // whether an argument can exceed 32 bits and clamp it above, and amend this list when it can.
+    // The i64 result comes back in r0:r1.
     let lo: u32;
     let hi: u32;
     // SAFETY: `svc #0` traps to the kernel SVC handler, which preserves callee-saved registers and

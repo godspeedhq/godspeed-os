@@ -1913,7 +1913,13 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
                 pl011_write(b"dwc2: bot data-stage failed - "); pl011_write(last_fail_str().as_bytes());
                 pl011_write(b"\r\n");
             }
-            if msc_last_was_busy() { note_busy(ep_in, ep_out); } else { let _ = bot_recover(ep_in, ep_out); }
+            // Escalates like its CBW-out and CSW-in siblings, and must. This site used to run a bare
+            // `bot_recover` and DISCARD its verdict, so a data-stage failure never bumped the failure
+            // streak and could therefore never reach `revive_if_needed` - the entire revival machinery
+            // was unreachable from the likeliest place for a block transfer to die (the 512-byte data
+            // phase, eight split chunks wide on this board). A stick that dies mid-READ(10) would retry
+            // into this branch forever, storage staying dead while the log said nothing.
+            if msc_last_was_busy() { note_busy(ep_in, ep_out); } else { recover_or_revive(ep_in, ep_out); }
             return false;
         }
         moved = n as usize;

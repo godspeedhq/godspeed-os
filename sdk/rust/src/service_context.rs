@@ -318,6 +318,33 @@ pub struct ServiceContext {
     _private: (),
 }
 
+/// The USB-disk syscalls' "device NAKed, re-ask" status.
+///
+/// Outside the capability-error range (-2..-7) ON PURPOSE, and this must stay in step with the kernel's
+/// `USB_DISK_BUSY` (`kernel/src/syscall/dispatch.rs`). It was originally `-2`, which is `CapNotHeld`, so
+/// a driver missing its `USB_DISK` capability was indistinguishable from a busy device and got retried
+/// thousands of times before being reported as a device that "stayed busy" - a cap failure wearing an
+/// I/O failure's name.
+pub const USB_DISK_BUSY: i64 = -20;
+
+/// Can this LBA survive the syscall ABI intact?
+///
+/// The ARM ABI gives each syscall argument exactly ONE 32-bit register (`arch/arm/CLAUDE.md`, hazard
+/// A-U1), so a wider value is silently narrowed on the way in. That matters here more than anywhere:
+/// the kernel guards `lba >= MSC_SECTORS` and then builds a READ(10)/WRITE(10) CDB, but it guards the
+/// value it RECEIVED. An LBA of 0x1_0000_0000 arrives as 0, passes the range check, and overwrites the
+/// GSFS superblock while the device, `block-driver` and `fs` all report success - a range check
+/// defeated one level above itself, and silent corruption of exactly the block the check exists to
+/// protect. On x86 the same request is rejected loudly, so the two ports would disagree about what is
+/// a valid write.
+///
+/// Rejecting it in the wrapper is the fix the ABI hazard prescribes (clamp before the syscall, or split
+/// into a register pair). Nothing legitimate is refused: capacity comes from SCSI READ CAPACITY(10),
+/// whose last-LBA field is 32 bits wide, so an LBA above `u32::MAX` is a caller bug - and it is
+/// reported as a failure rather than aliased onto a real block (Invariant 12, failures are loud).
+#[inline]
+fn lba_fits_syscall_abi(lba: u64) -> bool { lba <= u32::MAX as u64 }
+
 impl ServiceContext {
     #[inline]
     fn ctx() -> &'static ServiceContextData {
@@ -863,6 +890,7 @@ impl ServiceContext {
     pub fn usb_disk_read(&self, lba: u64, dst: &mut [u8; 512]) -> bool {
         // SAFETY: syscall(47) = UsbDiskRead; the kernel writes exactly 512 bytes to `dst` on success,
         // through its checked user-pointer path.
+        if !lba_fits_syscall_abi(lba) { return false; }
         let ret = unsafe { raw_syscall(47, lba, dst.as_mut_ptr() as u64, 0) };
         ret == 0
     }
@@ -872,22 +900,25 @@ impl ServiceContext {
     pub fn usb_disk_write(&self, lba: u64, src: &[u8; 512]) -> bool {
         // SAFETY: syscall(48) = UsbDiskWrite; the kernel reads exactly 512 bytes from `src` through its
         // checked user-pointer path.
+        if !lba_fits_syscall_abi(lba) { return false; }
         let ret = unsafe { raw_syscall(48, lba, src.as_ptr() as u64, 0) };
         ret == 0
     }
 
-    /// Read a block, returning the raw status so BUSY is distinguishable from FAILED: `0` ok, `-2` the
-    /// device is busy (NAK - re-ask, nothing is wrong), anything else a real error. The `bool` variants
+    /// Read a block, returning the raw status so BUSY is distinguishable from FAILED: `0` ok, the
+    /// device is busy (`USB_DISK_BUSY` - re-ask, nothing is wrong), anything else a real error. The `bool` variants
     /// above collapse those two, which is exactly the conflation that made a busy stick look broken.
     pub fn usb_disk_read_status(&self, lba: u64, dst: &mut [u8; 512]) -> i64 {
         // SAFETY: syscall(47) = UsbDiskRead; the kernel writes exactly 512 bytes through its checked
         // user-pointer path.
+        if !lba_fits_syscall_abi(lba) { return -1; }
         unsafe { raw_syscall(47, lba, dst.as_mut_ptr() as u64, 0) }
     }
 
     /// Write a block, returning the raw status (see `usb_disk_read_status`).
     pub fn usb_disk_write_status(&self, lba: u64, src: &[u8; 512]) -> i64 {
         // SAFETY: syscall(48) = UsbDiskWrite; the kernel reads exactly 512 bytes from `src`.
+        if !lba_fits_syscall_abi(lba) { return -1; }
         unsafe { raw_syscall(48, lba, src.as_ptr() as u64, 0) }
     }
 
