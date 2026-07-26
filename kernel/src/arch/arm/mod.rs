@@ -485,6 +485,17 @@ pub(super) static SERIAL_SMP: core::sync::atomic::AtomicBool = core::sync::atomi
 /// covers any line this console writes.
 const SERIAL_ACQUIRE_US: u32 = 40_000;
 
+/// Write to the serial console WITHOUT mirroring to the TV. Used when a full-screen app owns the
+/// display (`console_write_bytes_gated(.., false)`): the bytes still reach serial, which is the source
+/// of truth and where a captured log comes from, but they do not paint over the app's screen.
+///
+/// Deliberately lock-free with respect to `SERIAL_BUSY`: it takes no lock and renders nothing, so it
+/// cannot corrupt fbcon's shared cursor state - the hazard the lock exists to prevent. Interleaving on
+/// the serial line itself is the same risk any contended writer already has.
+pub(super) fn pl011_write_no_fb(s: &[u8]) {
+    for &b in s { pl011_write_byte(b); }
+}
+
 pub(super) fn pl011_write(s: &[u8]) {
     use core::sync::atomic::Ordering;
     // Pre-SMP (or the boot core alone): no contention, and LDREX/STREX are unsafe before the MMU is on.
@@ -848,14 +859,57 @@ pub fn gpio_op(op: u32, pin: u32) -> i64 {
 // ---- Serial / console (PL011: output = pl011_write; input = the PL011 RX FIFO drained into a ring) ----
 pub fn serial_write_byte(b: u8) { pl011_write_byte(b); }
 pub fn serial_write_bytes_lockfree(s: &[u8]) { pl011_write(s); }
-/// The shell's console output. No framebuffer on this port, so `to_fb` is ignored - everything goes to
-/// the PL011 (the serial console). Without this the shell's prompt/output would silently vanish.
-pub fn console_write_bytes_gated(s: &[u8], _to_fb: bool) { pl011_write(s); }
+/// The shell's console output. `to_fb` is the CONSOLE FOREGROUND gate: false means a full-screen app
+/// owns the display, so this text belongs on the serial console only and must NOT reach the TV.
+///
+/// It used to be ignored, with the comment "no framebuffer on this port" - true when it was written,
+/// false since fbcon landed. So every log line from a dying or restarting service painted itself over
+/// whatever full-screen app was running, which is why `chaos max-carnage` never held the screen: the
+/// carnage it creates is precisely a flood of service log traffic, all of it un-gated.
+pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
+    if to_fb { pl011_write(s); } else { pl011_write_no_fb(s); }
+}
 pub fn set_console_echo(on: bool) {}
-pub fn claim_console_foreground(task_slot: u32) {}
-pub fn release_console_foreground() {}
-pub fn release_console_foreground_if_owner(task_slot: u32) {}
-pub fn console_foreground_allows(task_slot: u32) -> bool { true }
+
+// Console FOREGROUND. `u32::MAX` = unclaimed (anyone may read, everything reaches the TV); otherwise
+// the task slot of the full-screen app that owns the console. These were empty stubs with
+// `console_foreground_allows` hardwired to `true`, which had two consequences on the TV: log output
+// was never gated (above), and - because the same predicate gates console READS - the shell kept
+// consuming input while a full-screen app was running, so `q` never reached the app that was waiting
+// for it. Same semantics as `arch/x86_64/mod.rs`.
+static CONSOLE_FOREGROUND: AtomicU32 = AtomicU32::new(u32::MAX);
+
+pub fn claim_console_foreground(task_slot: u32) {
+    CONSOLE_FOREGROUND.store(task_slot, Ordering::Release);
+}
+pub fn release_console_foreground() {
+    CONSOLE_FOREGROUND.store(u32::MAX, Ordering::Release);
+    wake_console_waiter();
+}
+pub fn release_console_foreground_if_owner(task_slot: u32) {
+    if CONSOLE_FOREGROUND
+        .compare_exchange(task_slot, u32::MAX, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        wake_console_waiter();
+    }
+}
+/// May `task_slot` read console input, and does its output reach the TV? True when the foreground is
+/// unclaimed or this task holds it.
+pub fn console_foreground_allows(task_slot: u32) -> bool {
+    let owner = CONSOLE_FOREGROUND.load(Ordering::Acquire);
+    owner == u32::MAX || owner == task_slot
+}
+/// Wake a task parked in a muted blocking console read, so releasing the foreground resumes it at once
+/// instead of leaving it asleep until the next keystroke - which is why the prompt did not come back
+/// on its own when a full-screen app exited.
+fn wake_console_waiter() {
+    let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
+    if waiter != u32::MAX {
+        crate::task::scheduler::wake_by_slot(waiter as usize, 0);
+    }
+}
+
 pub fn console_boot_complete() {}
 
 // PL011 receive FIFO -> a single-producer/single-consumer input ring. The producer is `pl011_rx_drain`
@@ -973,7 +1027,11 @@ pub fn com2_try_read_byte() -> Option<u8> { None }
 /// atomic-syscall check in `irq::arm_irq_dispatch`). A no-op on x86, which tracks ring via `TASK_IS_USER`.
 pub fn note_user_task(slot: usize) { irq::mark_task_user(slot); }
 
-pub static CONSOLE_READ_WAITER: AtomicU32 = AtomicU32::new(0);
+/// Task slot parked in a blocking console read, or `u32::MAX` for "nobody". The neutral code both
+/// clears it with `u32::MAX` and tests it with `!= u32::MAX`, so that is the sentinel - this was
+/// initialised to 0, which reads as "task slot 0 is waiting" and would spuriously wake the supervisor
+/// before any reader had ever registered. x86 has always used `u32::MAX`; this is now the same.
+pub static CONSOLE_READ_WAITER: AtomicU32 = AtomicU32::new(u32::MAX);
 
 // ---------------------------------------------------------------------------
 pub mod boot {
