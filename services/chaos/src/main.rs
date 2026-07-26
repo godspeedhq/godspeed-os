@@ -138,6 +138,17 @@ fn flood(ctx: &ServiceContext, name: &str, cache: &mut Option<CapHandle>) -> Opt
     Some((sent, sat, died))
 }
 
+/// Acknowledge `q` the instant it is read, before unwinding the run.
+///
+/// The abort itself always worked, but it was SILENT: a round is seconds long on slow hardware (a
+/// service respawn on the Pi 2 drags in USB storage re-init), so the operator pressed q, saw nothing
+/// change for ten-plus seconds, and reasonably concluded the key was being ignored. The report that
+/// eventually appeared looked like the run finishing early rather than the abort landing. One line at
+/// the moment of the keypress is the difference between "it works" and "it appears not to".
+fn ack_quit(ctx: &ServiceContext) {
+    ctx.console_write("\r\n  aborting at the next safe point...\r\n");
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The shell launcher sends the round count (always > 0 - the shell requires an explicit count) right
@@ -235,7 +246,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // `q` aborts (round boundary; also polled between each kill/flood in the sweep below, so one q
         // press aborts within a sub-step rather than lagging a whole round). The kernel buffers the
         // keypress across input-driver churn, so it is caught here.
-        if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { break; } }
+        if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { ack_quit(&ctx); break; } }
         if round >= rounds { break; } // the bounded run is complete (rounds is always > 0 - the shell requires it)
 
         round += 1;
@@ -299,7 +310,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // Poll q between each kill/flood: a round can take seconds (services respawn), so checking
             // only at the round top made one q press lag a whole round. Now one press aborts within a
             // sub-step. (`break 'carnage` exits the round loop; the kernel buffers the key across churn.)
-            if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { break 'carnage; } }
+            if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { ack_quit(&ctx); break 'carnage; } }
             let nl = cand[c].1;
             let mut nbuf = [0u8; 24]; nbuf[..nl].copy_from_slice(&cand[c].0[..nl]);
             let name = str_of(&nbuf[..nl]);

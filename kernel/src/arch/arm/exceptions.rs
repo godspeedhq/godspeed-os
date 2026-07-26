@@ -245,11 +245,24 @@ unsafe extern "C" fn stub_pabt() -> ! {
         "and r0, r0, #0x1f",
         "cmp r0, #0x10",              // USR mode?
         "bne 1f",
+        // Capture the SAME four things the data-abort path does. This used to set only r0/r1, leaving
+        // `arm_user_fault_kill`'s status and SP_usr arguments holding whatever was in r2/r3 - so a
+        // prefetch abort printed its own fault ADDRESS in the status field (r2 still held IFAR) and a
+        // garbage stack pointer. `DFSR 0x00403000 (status 0b00000)` was that: not a fault status at
+        // all, just the pc again, with an impossible status code to prove it.
+        //
+        // The status register for a PREFETCH abort is IFSR (c5,c0,1), not DFSR - different register,
+        // same meaning - and the kernel-mode branch below already read it correctly.
         "mov r1, lr",                 // fault pc
         "mrc p15, 0, r2, c6, c0, 2",  // IFAR (fault address)
+        "mrc p15, 0, r12, c5, c0, 1", // IFSR (fault status)
+        "cps #0x1f",                  // system mode - shares the USR banked SP
+        "mov r3, sp",                 // SP_usr at the moment of the fault
         "cps #0x13",                  // -> SVC mode, the task's kernel stack
-        "mov r0, r1",
-        "mov r1, r2",
+        "mov r0, r1",                 // arg0 = fault pc
+        "mov r1, r2",                 // arg1 = fault addr
+        "mov r2, r12",                // arg2 = fault status (IFSR)
+                                      // arg3 = r3 = SP_usr (already in place)
         "bl {kill}",                  // kill_current + reschedule; NEVER returns
         "b .",
         "1:",
@@ -329,7 +342,7 @@ extern "C" fn arm_user_fault_kill(pc: u32, addr: u32, dfsr: u32, sp_usr: u32) ->
     // without the status left a fault whose address looked impossible with nothing to reason from.
     let status = (dfsr & 0xF) | ((dfsr >> 10) & 1) << 4;
     crate::kprintln!(
-        "arm32: user task (slot {}) faulted at pc {:#010x}, addr {:#010x}, SP_usr {:#010x} - DFSR {:#010x} (status {:#07b}, {}) - killing it; kernel continues",
+        "arm32: user task (slot {}) faulted at pc {:#010x}, addr {:#010x}, SP_usr {:#010x} - FSR {:#010x} (status {:#07b}, {}) - killing it; kernel continues",
         slot, pc, addr, sp_usr, dfsr, status,
         match status {
             0b00101 | 0b00111 => "translation - nothing mapped there",
