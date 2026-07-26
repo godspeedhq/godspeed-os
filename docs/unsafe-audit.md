@@ -52,6 +52,18 @@ single-writer justification as the existing blocks (serialized by `pl011_write`'
 |------|--------|-----|
 | `arch/arm/fbcon.rs` | 4 -> 5 (+1) | `put_bytes` borrows the `FBCON` static once for a whole run (lift cursor, render every byte, repaint cursor) instead of re-borrowing per byte via `put_byte`. |
 
+### `console_boot_complete` on ARM (2026-07-26)
+
+The shell calls `console_boot_complete()` to dismiss the boot screen and stop mirroring kernel log
+output to the TV, so the prompt is not overwritten by a late service log (`fs: journal recovered ...`
+landing on the `gsh> ` line - the reason the prompt appeared only after pressing Enter). x86 has always
+implemented it; ARM's was an empty stub. Implementing it needs one borrow of the `FBCON` static to
+clear the screen and home the cursor.
+
+| File | unsafe | Why |
+|------|--------|-----|
+| `arch/arm/fbcon.rs` | 5 -> 6 (+1) | `clear_and_home` borrows the `FBCON` static once to clear the framebuffer and reset cursor/write position. Same single-owner discipline as `put_bytes`: core 0 holds `SERIAL_BUSY` when the console writes, and the function returns immediately when no framebuffer was mapped (`base == 0`). Permitted arch layer (§18.1), SAFETY-commented. |
+
 ## 2026-07-24 - full ARM keyboard decode: new `arch/arm/hid.rs`, and dwc2 unsafe SHRINKS (feat/pi2-arm32)
 
 Full HID boot-keyboard support for the ARM in-kernel USB driver (numeric keypad, arrows/navigation,
@@ -1022,7 +1034,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
-| arch/arm/fbcon.rs | 5 | permitted |
+| arch/arm/fbcon.rs | 6 | permitted |
 | arch/arm/dwc2.rs | 14 | permitted |
 | arch/arm/page_tables.rs | 31 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
