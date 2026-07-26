@@ -1630,8 +1630,28 @@ fn recover_or_revive(ep_in: u32, ep_out: u32) {
     pl011_write(b" of 3\r\n");
     // Stop serving only WHILE the bus is rebuilt, so nothing issues commands mid-reset.
     MSC_READY.store(false, Ordering::Release);
+    // Put OUR side of the bus back to the default state before resetting the port, because that is the
+    // state the DEVICES come back in. A port reset returns every device to address 0, EP0 max-packet 8,
+    // and no split routing - while `DEV_ADDR`, `MPS0` and `SPLIT_PORT` still described the mass-storage
+    // device that just died (address N, mps 512). Enumeration then addressed a device that no longer
+    // existed and failed at its very first transfer:
+    //
+    //     dwc2: root port enabled after reset, high-speed (480 Mbps)   <- the reset worked
+    //     dwc2: SETUP failed
+    //     dwc2: GET_DESC(8) failed - USB unavailable                   <- talking to the wrong address
+    //
+    // At boot these statics are already at exactly these values, which is why enumeration only ever
+    // worked the first time. Nothing reset them afterwards because nothing had ever re-enumerated.
+    DEV_ADDR.store(0, Ordering::Relaxed);
+    MPS0.store(8, Ordering::Relaxed);
+    SPLIT_PORT.store(0, Ordering::Relaxed);
+    KBD_READY.store(false, Ordering::Relaxed);
+    NET_READY.store(false, Ordering::Relaxed);
+    select_device(0, 8, false);
+    // `reset_port` ENUMERATES as its last step. Calling `enumerate_sync` after it ran the whole thing
+    // a second time against a bus that had just been addressed - the doubled "GET_DESC(8) failed" pair
+    // in the log is that second pass, failing for a different reason than the first.
     reset_port();
-    enumerate_sync();
     MSC_REVIVING.store(false, Ordering::Relaxed);
     if MSC_READY.load(Ordering::Acquire) {
         pl011_write(b"dwc2: device came back - storage restored\r\n");
