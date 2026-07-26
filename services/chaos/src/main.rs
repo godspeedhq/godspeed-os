@@ -34,6 +34,14 @@ const POLL_EVERY: u32 = 64;         // yields between clock polls in the handoff
 const MAX_CAND: usize = 32;         // bounded snapshot of live killable tasks per round
 const MAX_SVC: usize = 16;          // distinct services in the aggregate tally (~6-8 real)
 const SHELL_SETTLE_YIELDS: u32 = 4000; // let a freshly-respawned shell settle before we hand back
+// Iteration backstops for the two loops whose only escape was a WALL-CLOCK deadline. The Pi 2 has no
+// RTC, so `datetime().epoch_secs()` is frozen at 0 there and `now - t0 >= N` is never true - the bound
+// reads as bounded and is not. Both loops still wait on TRUTH (a message arrived; a live shell exists),
+// which is Commandment VIII; these only cap how long the ESCAPE can take when that truth never comes.
+// A yield count advances on any hardware, which is the whole point (the same reason `timer::delay_us`
+// keeps a spin cap next to its time bound).
+const HANDOFF_MAX_YIELDS: u32 = 200_000;  // the post-run wait for a live shell to hand the console to
+const ARGWAIT_MAX_YIELDS: u32 = 50_000;   // the startup wait for the shell's argument message
 const PACE_YIELDS: u32 = 3000;      // a beat between rounds so the panel/log stay readable + `q` lands
 const MEMP_CHUNK: usize = 64 * 1024; // one mem-pressure round allocs this (held; chaos's limit bounds it)
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]; // matches the `date` utility
@@ -160,6 +168,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut tlen = 0usize;
     {
         let t0 = ctx.datetime().epoch_secs();
+        let mut aw = 0u32;
         loop {
             if let Some(msg) = ctx.try_recv() {
                 let b = msg.payload_bytes();
@@ -168,6 +177,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 break;
             }
             if ctx.datetime().epoch_secs() - t0 >= 2 { break; }
+            aw += 1;
+            if aw >= ARGWAIT_MAX_YIELDS { break; }   // RTC-free hardware: the clock above never moves
             ctx.yield_cpu();
         }
     }
@@ -455,6 +466,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     while slot_of(&ctx, "shell").is_none() {
         ctx.yield_cpu(); k += 1;
         if k % POLL_EVERY == 0 && ctx.datetime().epoch_secs() - t0 >= RECOVER_SECS { break; }
+        // THE hang. Without this, a run that ends with no live shell spins here forever on any board
+        // without an RTC - and because the release below never runs, the console stays claimed by a
+        // task that will never finish: no prompt, no overlay, nothing. The foreground made that
+        // failure visible; it did not create it (before, the gate was hardwired open, so a stuck
+        // owner cost nothing). A missed handoff must degrade to "release anyway", never to a wedge.
+        if k >= HANDOFF_MAX_YIELDS {
+            ctx.console_writeln("chaos: no live shell after the run - releasing the console anyway");
+            break;
+        }
     }
     // Cosmetic hand-off pacing, NOT a completion wait (Commandment VIII): the live-shell TRUTH is
     // already established by the bounded slot_of loop above. This fixed pad only smooths the console
