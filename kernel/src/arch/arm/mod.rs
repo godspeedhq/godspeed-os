@@ -925,6 +925,37 @@ static INPUT_READY: AtomicBool = AtomicBool::new(false);
 /// Drain every byte currently in the PL011 RX FIFO into the input ring. Single producer (guard IRQs at
 /// the call site if a poll and a syscall could race; on this single-core port they are serialised by
 /// the syscall/IRQ masking already).
+/// The console ESCAPE HATCH byte: **Ctrl+\** (0x1C, the traditional "break out").
+///
+/// A full-screen app claims the console foreground so its keystrokes reach IT and not a resurrected
+/// shell. That is correct, and it is also a single point of failure: if the claimant stops making
+/// progress, nothing releases the claim, the shell stays muted, and the machine - which is still
+/// perfectly alive, kernel and all - has no usable console. On this board serial input goes through
+/// the SAME gate, so there was no way back short of a power cycle.
+///
+/// This byte is therefore handled where input ENTERS the ring, before any gate: it releases the
+/// foreground unconditionally and is not delivered to anyone. It cannot be checked on the read side,
+/// because a muted reader would have to POP a byte to inspect it and would then be stealing the
+/// owner's input (the `q` that quits chaos).
+///
+/// Unconditional by design: an escape hatch that can be refused by the thing you are escaping from is
+/// not an escape hatch. It grants no authority - releasing the foreground only ever RESTORES the
+/// default state in which any CONSOLE_READ holder may read.
+pub const CONSOLE_ESCAPE_BYTE: u8 = 0x1C;
+
+/// Handle `CONSOLE_ESCAPE_BYTE` at the producer. Returns true if the byte was consumed as an escape
+/// and must NOT be enqueued.
+fn console_escape_intercept(b: u8) -> bool {
+    if b != CONSOLE_ESCAPE_BYTE { return false; }
+    if CONSOLE_FOREGROUND.load(Ordering::Acquire) != u32::MAX {
+        release_console_foreground();
+        pl011_write_no_fb(b"
+console: foreground released by Ctrl-backslash - the prompt is yours again
+");
+    }
+    true
+}
+
 fn pl011_rx_drain() {
     // SAFETY: reading the PL011 FR/DR (Device-mapped MMIO) and appending to the ring; the ring indices
     // are atomics and this is the only producer path.
@@ -932,6 +963,7 @@ fn pl011_rx_drain() {
         loop {
             if PL011_FR.read_volatile() & PL011_FR_RXFE != 0 { break; } // RX FIFO empty
             let b = (PL011_DR.read_volatile() & 0xFF) as u8;
+            if console_escape_intercept(b) { continue; }
             let tail = RX_TAIL.load(Ordering::Relaxed) as usize;
             let head = RX_HEAD.load(Ordering::Acquire) as usize;
             let next = (tail + 1) % RX_BUF_SIZE;
@@ -1001,6 +1033,7 @@ pub fn uart_rx_poll() {
 /// Inject a byte into the input ring + wake the reader (kernel-side producer; unused on this port,
 /// which drives input straight from the PL011 RX FIFO, but kept for parity with the x86 keyboard path).
 pub fn console_push_byte(b: u8) {
+    if console_escape_intercept(b) { return; }
     let tail = RX_TAIL.load(Ordering::Relaxed) as usize;
     let head = RX_HEAD.load(Ordering::Acquire) as usize;
     let next = (tail + 1) % RX_BUF_SIZE;

@@ -1610,6 +1610,15 @@ fn recover_or_revive(ep_in: u32, ep_out: u32) {
     //
     // So a run of failures escalates on its own. The streak is cleared by any successful command
     // (`bot_command`), which is the only evidence that actually settles it.
+    // Take the re-entrancy guard FIRST. `bot_recover` is not side-effect free: it re-points the global
+    // bus selection at the storage device (`select_device(MSC_ADDR, ..)`, `SPLIT_PORT`, `msc_select`).
+    // Running it while a revival is in flight - which happens, because the revival's own probe issues
+    // BOT commands that can fail - rewrites `DEV_ADDR`/`MPS0`/`SPLIT_PORT` to the PREVIOUS
+    // incarnation's values in the middle of enumeration, so the rest of the enumeration is framed with
+    // the bulk max-packet size against an address that no longer exists. That is exactly the control-
+    // framing defect that took a selfcheck from 16 failures to 70; the escalation path had re-opened a
+    // route to it.
+    if MSC_REVIVING.load(Ordering::Relaxed) { return; }
     let streak = MSC_FAIL_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
     let recovered = bot_recover(ep_in, ep_out);
     if recovered && streak < MSC_FAIL_STREAK_MAX { return; }
@@ -1676,6 +1685,15 @@ reset clears the device cache and this device accepts no flush)\r\n");
     // storage until reboot. That is not a close call - and it is the second time on this branch that a
     // recovery path did more damage than the fault it was written for.
     MSC_READY.store(true, Ordering::Release);
+    // Restore the OTHER devices' flags too. Clearing them before the port reset is right - the reset
+    // genuinely drops the keyboard and the NIC - but leaving them false when enumeration fails is the
+    // same defect as the `MSC_READY` one fixed a commit ago, applied to the two flags that were not
+    // audited then. `usb_poll` returns early on `!KBD_READY`, and `reset_port` has exactly two callers
+    // (boot, and here), so nothing would ever set them again: a STORAGE fault would take the keyboard
+    // and the network down permanently, on a board where the keyboard IS the console. Storage retries
+    // can reach this path again; a dead keyboard flag cannot reach anything.
+    KBD_READY.store(true, Ordering::Relaxed);
+    NET_READY.store(true, Ordering::Relaxed);
     pl011_write(b"dwc2: device did not come back - still retrying commands (revival attempt ");
     super::timer::write_dec_pub(tries + 1);
     pl011_write(b" of 3 spent)\r\n");
@@ -1871,6 +1889,13 @@ fn probe_mass_storage() -> bool {
     // its refusal to whatever replaced it, silently denying a capable device the durability it does
     // offer, with the one-shot warning already spent so nothing would ever say so. A derived view
     // must not outlive the source it was derived from (Commandment III).
+    // A device that enumerated is evidence of health, so replenish BOTH counters. The revive budget
+    // exists to stop a FUTILE loop; spending it on attempts that each produced a working device turns
+    // it into a lifetime cap. This device dies roughly every 27 s of sustained I/O, so three successful
+    // revivals - about a minute and a half - would otherwise exhaust it and leave storage dead for the
+    // rest of the boot despite every recovery having worked. The streak counter already followed this
+    // rule ("only a command that worked clears it"); the budget did not.
+    MSC_REVIVE_TRIES.store(0, Ordering::Relaxed);
     MSC_FAIL_STREAK.store(0, Ordering::Relaxed);
     MSC_NO_FLUSH.store(false, Ordering::Relaxed);
     MSC_NO_FUA.store(false, Ordering::Relaxed);

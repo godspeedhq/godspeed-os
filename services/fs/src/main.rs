@@ -264,8 +264,6 @@ struct Fs {
     // mount instead of on every commit. A device that does not implement SYNCHRONIZE CACHE must not
     // brick the filesystem - we cannot make it durable, but we can refuse to pretend otherwise.
     flush_warned: core::cell::Cell<bool>,
-    // Same, for the checkpoint barrier: on a drive with no flush every commit trips it.
-    checkpoint_warned: core::cell::Cell<bool>,
     // Set the moment a block operation reports a device I/O error. The driver can REVIVE a dead USB
     // device by resetting its port - which restores availability but discards whatever the device had
     // buffered, because a port reset clears its volatile cache and this device accepts no flush. So an
@@ -397,7 +395,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // ask, which on a fresh prompt is the shell recording its history - so an
                     // operator's first `ls` answered with two lines about journal ordering before it
                     // answered with the directory. The fact is about the medium, not the command.
-                    if !f.durable_or_warn(&ctx) { f.checkpoint_warned.set(true); }
+                    let _ = f.durable_or_warn(&ctx);
                     mounted = Some(f);
                     break;
                 }
@@ -1252,7 +1250,6 @@ impl Fs {
             read_only,
             last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
             flush_warned: core::cell::Cell::new(false),
-            checkpoint_warned: core::cell::Cell::new(false),
             io_error_seen: core::cell::Cell::new(false),
             txn_active: false,
             txn_n: 0,
@@ -1371,6 +1368,12 @@ impl Fs {
     /// a checksummed commit record (the atomic point), then checkpoint them to their home LBAs,
     /// then invalidate the journal. On overflow or any failure the transaction is dropped; if it
     /// failed before the commit record landed, home is untouched (the fs is unchanged).
+    /// Record a block-I/O failure on the JOURNAL path, which uses `block_read`/`block_write` directly
+    /// rather than the `tb_*` funnels and therefore bypassed `io_error_seen` entirely - leaving the one
+    /// failure that most needs a re-mount (a device dying mid-checkpoint, whose transaction is now
+    /// half-applied and awaiting replay) as the one that never triggered one.
+    fn note_io_error(&self) { self.io_error_seen.set(true); }
+
     fn commit_txn(&mut self, ctx: &ServiceContext) -> Result<(), &'static str> {
         if self.txn_overflow { self.abort_txn(); return Err("transaction too large to commit atomically"); }
         let n = self.txn_n;
@@ -1380,6 +1383,7 @@ impl Fs {
         // 1. Stage the data blocks in the journal (journal_start+1 ..).
         for i in 0..n {
             if !block_write(ctx, self.journal_start + 1 + i as u64, &self.txn_blk[i]) {
+                self.note_io_error();
                 return Err("journal data write failed");
             }
         }
@@ -1413,7 +1417,7 @@ impl Fs {
         commit[8 + n * 8..12 + n * 8].copy_from_slice(&data_crc.to_le_bytes());
         let crc = crc32(&commit[..12 + n * 8]);
         commit[COMMIT_CRC_OFF..COMMIT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
-        if !block_write(ctx, self.journal_start, &commit) { return Err("journal commit write failed"); }
+        if !block_write(ctx, self.journal_start, &commit) { self.note_io_error(); return Err("journal commit write failed"); }
         // BARRIER 2: and the commit record must be on the medium before any home block is
         // overwritten - that ordering IS the atomicity. A device free to reorder these two can land
         // a half-finished checkpoint with no commit record to replay it from.
@@ -1429,6 +1433,7 @@ impl Fs {
             if !block_write(ctx, self.txn_lba[i], &self.txn_blk[i]) {
                 // Commit is durable: the next mount will replay this transaction. Report, but
                 // the data is safe - no corruption, only a deferred checkpoint.
+                self.note_io_error();
                 return Err("checkpoint write failed (will replay on next mount)");
             }
         }
@@ -1503,18 +1508,42 @@ impl Fs {
             }
         }
         if crc32(&per[..n * 4]) != u32_at(&commit, 8 + n * 8) {
-            ctx.log("fs: journal payload does NOT match its commit record - the device did not durably write what the record authorises. DISCARDING the transaction rather than copying unverified blocks over live metadata (home is untouched; this is the crash-before-commit outcome).");
-            if !block_write(ctx, journal_start, &[0u8; BLOCK]) {
-                ctx.log("fs: could not invalidate the bad journal - it will be re-examined and re-discarded next mount");
-            }
+            // Do NOT destroy the record on a single mismatch, and do NOT claim home is untouched.
+            //
+            // Two things were wrong here. First the asymmetry: a REPORTED read failure left the journal
+            // intact to retry next mount, while a SILENT bad read - the less trustworthy signal, and the
+            // likelier one on a just-revived device - zeroed the record immediately and discarded a
+            // committed transaction for good. One transient sector was enough. Second the claim: the
+            // message asserted "home is untouched, this is the crash-before-commit outcome", which the
+            // code cannot know. `commit_txn` writes the commit record BEFORE the checkpoint loop, so a
+            // failure part-way through the checkpoint leaves the record durable and home PARTIALLY
+            // applied. Discarding there converts a repairable torn state into a permanent one - while
+            // announcing that it was safe. §26.7: a recovery that fails must stay as visible as the
+            // fault, not narrate a success it did not achieve.
+            //
+            // So: leave the journal alone, say what is actually known, and degrade. `drives check`
+            // rebuilds the bitmap from the tree and is the tool for exactly this.
+            ctx.log("fs: journal payload does NOT match its commit record - the device did not durably write what the record authorises. Leaving the journal INTACT and applying NOTHING. Home blocks may be PARTIALLY applied (the commit record is written before the checkpoint), so the tree is not known consistent: run `drives check`. This will be re-verified on the next mount.");
             return;
         }
-        // Pass 2: the payload is verified, so now apply it.
+        // Pass 2: apply - re-verifying EACH block against the checksum pass 1 computed for it.
+        //
+        // Without this the payload check covers bytes that are then thrown away: pass 1 verifies one
+        // read, pass 2 writes home a DIFFERENT read of the same LBA. A device that returns a stale or
+        // partial sector without reporting an error - precisely what a just-revived USB device does -
+        // slips past the check for the one block that gets written over live metadata. The guarantee
+        // has to cover the bytes actually applied, not a previous sight of them.
         let mut replayed_ok = true;
         for i in 0..n {
             let lba = u64_at(&commit, 8 + i * 8);
             match block_read(ctx, journal_start + 1 + i as u64) {
-                Some(blk) => if !block_write(ctx, lba, &blk) { replayed_ok = false; },
+                Some(blk) => {
+                    if crc32(&blk).to_le_bytes() != per[i * 4..i * 4 + 4] {
+                        ctx.log("fs: journal block changed between verify and apply - aborting the replay with the journal INTACT (it will be re-verified next mount); home is not written from unchecked bytes");
+                        return;
+                    }
+                    if !block_write(ctx, lba, &blk) { replayed_ok = false; }
+                }
                 None => replayed_ok = false,
             }
         }

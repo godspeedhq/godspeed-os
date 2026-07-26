@@ -122,7 +122,7 @@ pub fn uart_rx_pop() -> Option<u8> { None }
 pub fn uart_rx_poll() {}
 pub fn uart_rx_drain_now() {}
 
-pub static CONSOLE_READ_WAITER: AtomicU32 = AtomicU32::new(0);
+pub static CONSOLE_READ_WAITER: AtomicU32 = AtomicU32::new(u32::MAX);
 
 // ---------------------------------------------------------------------------
 pub mod boot {
