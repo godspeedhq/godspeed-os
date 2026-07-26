@@ -250,7 +250,26 @@ static TASK_SPAWN_DT: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX
 /// Base virtual address for task-requested dynamic allocations (AllocMem syscall).
 /// Placed well above the ELF load region (~2 MiB), user stack (≤ 0x8000_0000),
 /// and ServiceContextData page (0x3ff000) to avoid collisions.
+/// Where a task's `alloc_mem` region begins. Must sit ABOVE the loaded image and BELOW the user
+/// stack, in a range the kernel maps nothing into (the arch identity map is copied into every service
+/// address space, and `map_in_active_tables` refuses to overwrite a live section).
+///
+/// **This is word-size dependent, and getting that wrong cost real corruption.** The value was a flat
+/// `0x1_0000_0000` - 4 GiB, comfortably above everything on a 64-bit target. On a 32-bit address space
+/// that address DOES NOT EXIST: the mapping path takes `virt as u32`, so 2^32 truncated to **0** and
+/// every allocation mapped from VA 0 upward. A task with a 32 MiB limit therefore walked straight
+/// through its own image at 0x0040_0000 and mapped a NO_EXEC data page over its own TEXT - after which
+/// the next instruction fetch took a permission fault at its own entry. Observed nine times in one
+/// carnage run, byte-identical, as `mem-pressure` faulting at pc 0x0040002c; also behind `supervisor`
+/// faulting into its rodata at 0x0040_3000 and `fs` faulting at 0x0000_1000.
+///
+/// Same class as the arm32 `resource_invoke` truncation: a 64-bit constant that a 32-bit port silently
+/// narrows. On 32-bit the region sits at 1.25 GiB - clear of the 1 GiB RAM identity map and the
+/// peripheral window below it, and clear of `USER_STACK_TOP` (0x8000_0000) above.
+#[cfg(target_pointer_width = "64")]
 pub const TASK_HEAP_VA_START: u64 = 0x1_0000_0000; // 4 GiB
+#[cfg(target_pointer_width = "32")]
+pub const TASK_HEAP_VA_START: u64 = 0x5000_0000;   // 1.25 GiB
 
 /// Bytes dynamically allocated so far by each task (via AllocMem).
 static mut TASK_ALLOC_BYTES:   [u64; MAX_TASKS] = [0u64; MAX_TASKS];
