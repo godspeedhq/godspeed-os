@@ -1583,6 +1583,10 @@ static BOT_PROBE: AtomicBool = AtomicBool::new(false);
 static MSC_REVIVE_TRIES: AtomicU32 = AtomicU32::new(0);
 static MSC_REVIVING: AtomicBool = AtomicBool::new(false);
 const MSC_REVIVE_MAX: u32 = 3;
+/// Consecutive failed BOT commands. Cleared by any success - see `recover_or_revive` for why a
+/// clear-halt that reports OK is not enough on its own to call the device healthy.
+static MSC_FAIL_STREAK: AtomicU32 = AtomicU32::new(0);
+const MSC_FAIL_STREAK_MAX: u32 = 4;
 
 /// Recover from a failed BOT command, escalating to a full re-enumeration if the device has GONE.
 ///
@@ -1596,7 +1600,24 @@ const MSC_REVIVE_MAX: u32 = 3;
 /// The USB-level answer to a device that has gone is a port reset and a fresh enumeration, which is
 /// exactly what boot does. The machinery already existed and was simply never reached after boot.
 fn recover_or_revive(ep_in: u32, ep_out: u32) {
-    if bot_recover(ep_in, ep_out) { return; }
+    // Escalate on EITHER signal, because "recovery succeeded" is not the same as "the device works".
+    //
+    // Observed: 15 consecutive command failures during `drives check` with `bot_recover` returning
+    // TRUE every single time and no revival ever attempted. EP0 answered, the halts cleared, the reset
+    // was accepted - and the very next CBW failed again, all the way down. Gating escalation purely on
+    // the recovery's own verdict trusts the wrong thing: what matters is whether COMMANDS start
+    // working again, not whether the repair reported OK.
+    //
+    // So a run of failures escalates on its own. The streak is cleared by any successful command
+    // (`bot_command`), which is the only evidence that actually settles it.
+    let streak = MSC_FAIL_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+    let recovered = bot_recover(ep_in, ep_out);
+    if recovered && streak < MSC_FAIL_STREAK_MAX { return; }
+    if !recovered {
+        // EP0 is not answering: the device is gone rather than confused (see `bot_recover`).
+    } else {
+        pl011_write(b"dwc2: recovery keeps succeeding but commands keep failing - escalating\r\n");
+    }
     if MSC_REVIVING.swap(true, Ordering::Relaxed) { return; } // re-entered from the probe below
     let tries = MSC_REVIVE_TRIES.load(Ordering::Relaxed);
     if tries >= MSC_REVIVE_MAX {
@@ -1678,6 +1699,8 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     // with the device's framing, so it recovers like any other transport fault.
     let short = residue != 0 || moved != dlen;
     let ok = sig == 0x5342_5355 && tag == 0x1234_5678 && csw[12] == 0 && !short;
+    // A command that actually worked is the ONLY thing that clears the failure streak.
+    if ok { MSC_FAIL_STREAK.store(0, Ordering::Relaxed); }
     if !ok {
         // The transfers all succeeded but the device's verdict did not: report WHAT it said. Signature
         // wrong = we are out of sync with the device's framing; status 1 = the SCSI command itself
@@ -1814,6 +1837,7 @@ fn probe_mass_storage() -> bool {
     // its refusal to whatever replaced it, silently denying a capable device the durability it does
     // offer, with the one-shot warning already spent so nothing would ever say so. A derived view
     // must not outlive the source it was derived from (Commandment III).
+    MSC_FAIL_STREAK.store(0, Ordering::Relaxed);
     MSC_NO_FLUSH.store(false, Ordering::Relaxed);
     MSC_NO_FUA.store(false, Ordering::Relaxed);
     MSC_FUA_LOGGED.store(false, Ordering::Relaxed);
