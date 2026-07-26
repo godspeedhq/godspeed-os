@@ -1729,16 +1729,27 @@ const MSC_BUSY_RUN_MAX: u32 = 200;
 
 /// Record a BUSY hand-back, and repair the endpoint if they stop looking like flow control.
 ///
-/// Deliberately does NOT touch `MSC_FAIL_STREAK` and never escalates to a port reset: busy is positive
-/// evidence the device is present and answering, so the response is to resynchronise the transport, not
-/// to declare the device gone and re-enumerate it.
+/// The repair is chosen by what the device ANSWERS, not by assuming what busy means. The first attempt
+/// here asserted that "busy is positive evidence the device is present and answering, so resynchronise
+/// the transport rather than declaring it gone" - and hardware disproved that sentence directly: the
+/// endpoint kept NAKing while `bot_recover` reported `device is not answering on EP0`, fourteen times in
+/// a row, storage never returning. A halted bulk endpoint still answers control transfers, so an EP0
+/// that does not answer means the device itself has stopped responding - it is absent, not confused, and
+/// no amount of endpoint recovery reaches it. That is precisely the signal `recover_or_revive` escalates
+/// on (port reset + fresh enumeration, bounded to `MSC_REVIVE_MAX`), and withholding it here left the one
+/// layer that could have recovered this unreachable from the busy path.
+///
+/// So: try the cheap repair, and let its verdict pick the next one. Escalation stays bounded and stays
+/// in one place - this decides only *whether* the device looks gone, never what to do about it.
 fn note_busy(ep_in: u32, ep_out: u32) {
     let run = MSC_BUSY_RUN.fetch_add(1, Ordering::Relaxed) + 1;
     if run % MSC_BUSY_RUN_MAX != 0 { return; }
     pl011_write(b"dwc2: device busy with no pause for ");
     super::timer::write_dec_pub(run);
     pl011_write(b" commands - treating the endpoint as stuck, BOT reset recovery\r\n");
-    let _ = bot_recover(ep_in, ep_out);
+    // EP0 answered: the device is present and merely out of step, and the clear-halt is the whole fix.
+    // EP0 did not: it is gone, and only a port reset + re-enumeration brings it back.
+    if !bot_recover(ep_in, ep_out) { revive_if_needed(false, false, ep_in, ep_out); }
 }
 
 /// Recover from a failed BOT command, escalating to a full re-enumeration if the device has GONE.
@@ -1772,7 +1783,16 @@ fn recover_or_revive(ep_in: u32, ep_out: u32) {
     // against 2 of 3 before. Fixing the stale coordinates removes the reason to suppress it.
     let streak = MSC_FAIL_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
     let recovered = bot_recover(ep_in, ep_out);
-    if recovered && streak < MSC_FAIL_STREAK_MAX { return; }
+    revive_if_needed(recovered, streak >= MSC_FAIL_STREAK_MAX, ep_in, ep_out);
+}
+
+/// Escalate to a port reset + re-enumeration, given a repair verdict somebody else already obtained.
+///
+/// Split out so a caller that has ALREADY run `bot_recover` can act on its answer without running it a
+/// second time (`note_busy` does exactly this). The escalation policy stays here, in one place - callers
+/// supply evidence, never a decision.
+fn revive_if_needed(recovered: bool, streak_exhausted: bool, ep_in: u32, ep_out: u32) {
+    if recovered && !streak_exhausted { return; }
     if !recovered {
         // EP0 is not answering: the device is gone rather than confused (see `bot_recover`).
     } else {
