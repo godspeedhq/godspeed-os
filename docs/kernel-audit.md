@@ -553,3 +553,100 @@ ids (< 100) whose `bump_generation` the kernel correctly refuses (SEC-11). The k
 time; the generators now start at 100. `97 passed, 0 failed`. Three always-red tests train a reader to
 see `3 failed` as the normal state, which is how a real regression walks in unnoticed (§22.4: a test
 failing for the wrong reason is a failure of the test, not the kernel).
+
+---
+
+## Audit 8 (2026-07-26, `feat/pi2-arm32` @ `f723e7a`) - the USB recovery layers, console foreground, and 32-bit VA work
+
+Scope: `74ee6ff..HEAD`, 34 commits / ~1300 lines, none previously audited. Four independent auditors
+(dwc2 transport; the rest of the arm layer + neutral `syscall/`+`task/`; guards + doc drift; plus the
+userspace pass recorded as userspace Audit 7). Every finding below was traced to code before being
+recorded; findings that could not be given a concrete failure scenario were discarded.
+
+**Mechanical guards: all PASS** (`unsafe_check`, `arch_boundary_check`, `contract_check`, `dash_check`,
+unit tests 97/0, `osdev validate` 20/20). x86 identity **24/0** after the fixes. `PYTHONIOENCODING=utf-8`
+set, verdicts taken from exit codes, not from the absence of the word FAILURE (the trap from Audit 7).
+
+**Unsafe inventory: TRUE.** Per-file counts independently recounted and matched (`dwc2.rs` 14,
+`arm/mod.rs` 43, `fbcon.rs` 6, `exceptions.rs` 24, `page_tables.rs` 31); grandfathered floors held
+(`scheduler.rs` 34/37, `dispatch.rs` 1/2). Every block carries a `// SAFETY:` comment.
+
+### FIXED in this audit (all HIGH, all introduced by the work being audited)
+
+| ID | Finding |
+|----|---------|
+| **A8-1** | **A u64 LBA truncated to 32 bits on the ARM syscall ABI - silent corruption.** The kernel's `lba >= MSC_SECTORS` guard runs on the value it *received*, so `0x1_0000_0000` arrived as 0, passed, and overwrote the superblock with every layer reporting success. Rejected in the SDK wrapper per hazard A-U1. |
+| **A8-2** | **`-2` meant both "device busy" and `CapNotHeld`.** A driver missing its `USB_DISK` cap was retried 6000 times and then reported as a device that "stayed busy" - an authority failure wearing an I/O failure's name, with `fs` degrading storage on it. BUSY moved to `-20`, outside the cap range, named on both sides. |
+| **A8-3** | **The data-stage failure could never escalate.** It ran a bare `bot_recover` and discarded the verdict, so it never bumped the failure streak and never reached `revive_if_needed` - the revival machinery was unreachable from the likeliest place for a block transfer to die. Now matches its two siblings. |
+
+### OPEN - recorded, not yet fixed (ranked; all CONFIRMED unless noted)
+
+**Boundedness of the recovery path (the theme).** `revive_if_needed` gave `reset_port` a second caller,
+and that one is reached from a syscall, which runs with **IRQs masked on core 0**. Waits written when
+they were boot-only are now runtime core-holds:
+
+- **A8-4 (HIGH).** A revival runs the whole boot enumeration inline: `>1 s` of masked-IRQ core hold
+  (port-enable poll 2M MMIO reads; `bPwrOn2PwrGood` up to 510 ms and **device-supplied**; 60 ms per hub
+  port). Repeats every 4 failed commands. §26.6 and `arm/CLAUDE.md`'s "every hardware wait bounded".
+  Fix: drive the revival from the core-0 tick as a bounded state machine, not inline.
+- **A8-5 (HIGH).** `smsc_mii_wait` is bounded by **100,000 USB control transfers**, not by time - roughly
+  100 s, and there are six such call sites. Boot-only before; on the runtime path now.
+- **A8-6 (HIGH).** `CORE_HOLD_US` (5 ms) is checked *after* `split_txn` returns, and `split_txn` has no
+  internal deadline: worst case ~25 s, realistic NYET storm ~2.2 s. This is the path a full-speed stick
+  behind the Pi's hub actually uses. `split_txn_periodic` already does this correctly via `poll_wait_halt`.
+- **A8-7 (MED).** `CORE_HOLD_US` is taken per *chunk*, not per transfer: a 512-byte stage is 8 chunks, so
+  one BOT command holds the core ~50 ms even when nothing is wrong.
+
+**Recovery that reports success it did not achieve:**
+
+- **A8-8 (HIGH).** A *successful* revival can leave the keyboard and NIC dead permanently: `KBD_READY`/
+  `NET_READY` are cleared before the port reset and restored only on the **failure** path. A stick that
+  re-enumerates while the keyboard's descriptor read fails once returns early with the console's only
+  input device switched off until reboot. Commandment V / §26.7.
+- **A8-9 (MED).** A failed revival re-asserts `KBD_READY`/`NET_READY` without clearing `KBD_ADDR`/`KBD_EP`,
+  but enumeration restarts address assignment at 2 - so the keyboard poll can end up issuing an
+  interrupt-IN on the **mass-storage device's bulk endpoint** and pushing block payload into the console
+  input ring as keystrokes.
+- **A8-10 (MED).** `revive_if_needed` can re-enter enumeration *from inside* enumeration (`MSC_REVIVING`
+  guards a nested revival, correctly - nothing guards a nested walk), leaving the outer walk with a stale
+  `next_addr` and re-resetting ports the inner walk already enumerated. Same class as `8e48bed`.
+- **A8-11 (LOW).** The CSW-bad path still discards `bot_recover`'s verdict (the twin of A8-3).
+
+**Short transfers presented as complete data** (both pre-existing, both the class `bot_command`'s residue
+check fixed for the bulk path in this range):
+
+- **A8-12 (MED).** `ctrl_xfer` never checks how many bytes the DATA stage delivered, so any descriptor can
+  be parsed from the previous transfer's leftovers in the shared DMA buffer.
+- **A8-13 (MED).** `poll()` copies 8 bytes of an interrupt-IN without checking the residue; a short HID
+  packet yields stale disk bytes decoded as keycodes.
+
+**Console foreground (the mechanism added this range):**
+
+- **A8-14 (MED).** `fbcon::clear_and_home` takes no lock and its SAFETY comment asserts a precondition
+  ("core 0 holds SERIAL_BUSY") that its only caller does not satisfy - two live `&mut` to the same
+  `static mut` across cores. x86's equivalent takes `FB.lock()`. §18.3: a SAFETY comment must be true.
+- **A8-15 (MED).** The lease-lapse path uses an unconditional `store`, not a CAS, so it can clobber a
+  claim established between the read and the store - destroying a fresh owner's claim. Every other
+  mutator on that static uses compare-exchange.
+- **A8-16 (MED).** ARM has a 45 s lease; x86's same `arch::imp` primitive is perpetual. SEC-27 requires a
+  primitive to owe a documented *semantic*, not just a signature. The owner is never told its claim
+  lapsed, so it cannot re-establish (§26.7, Commandment IX). Note the 45 s bound now sits under a 30 s
+  storage timeout raised in the same range - two such waits exceed it.
+- **A8-17 (LOW).** fbcon terminal state (`reverse`, CSI parser) is not reset on release/death, so a task
+  killed mid-`ESC[7m` leaves the TV inverted until reboot.
+- **A8-18 (LOW).** The lapse notice goes to serial only - the same defect that disqualified the magic-key
+  alternative it replaced ("not where an operator at the TV is sitting"). Also emits a bare `\n`.
+- **A8-19 (LOW).** `InspectKernel` query 13 is ungated yet can now release a foreground claim and wake
+  another task: a read that writes (§26.4).
+
+**Other:**
+
+- **A8-20 (MED, PLAUSIBLE).** The user-fault handler calls `task_stat`, which takes the routing-table
+  spinlock and does three RTC reads, to fetch one `&'static str` - inside an abort handler with IRQs
+  masked. Under lock contention a single task's fault can escalate to a kernel-wide wedge, inverting
+  §10.4. Fix: a lock-free `task_name(slot)`.
+- **A8-21 (LOW).** `systimer_us()` is 32-bit (wraps ~71.6 min) and `CONSOLE_FG_RENEWED_US` is `Relaxed`
+  on a weak-ordered A7 - should be Release/Acquire per SEC-25.
+- **A8-22 (LOW).** Two stale comments this range's own changes falsified: `dispatch.rs:1301` SAFETY says
+  "task heap range (0x1_0000_0000+)", false on 32-bit since the split; and `map_in_active_tables(virt: u64)`
+  silently narrows to `u32` with no assert - the primitive behind the bug `f886d6b` worked around.

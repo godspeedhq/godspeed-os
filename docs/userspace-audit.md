@@ -671,3 +671,97 @@ hanging a commit. `contract_check.py` passes.
 "ahci"` + `log_write`, while the ARM build grants it **`USB_DISK`** (whole-device read/write reach) by
 kernel name-match. This is the same class as Audit 5's **A5-U1** (`NET_DEVICE`), which was closed there
 by an ARM note in the contract; the new privilege repeats it unannotated and should get the same note.
+
+---
+
+## Audit 7 (2026-07-26, `feat/pi2-arm32` @ `f723e7a`) - the fs journal payload verification, USB block backend, chaos, and the SDK LBA path
+
+Scope: `74ee6ff..HEAD` (34 commits, none previously audited) across `services/fs`, `services/block-driver`,
+`services/chaos`, `sdk/rust/src/service_context.rs`, `scripts/selfcheck.gsh`. Two auditors. Every finding
+traced before recording; anything without a concrete failure scenario was discarded.
+
+**Clean across the board:** no `unsafe` in any service (§18.2), no heap / `alloc` / `Vec` / `Box`
+(§26.6.1), no global mutable state (§3.9 - all new per-mount state is `Cell` on the owned `Fs`), no
+hand-rolled number formatting, no em/en dashes (§21), no mutual blocking sends (§8.9).
+
+**The journal commit-record layout was traced byte-for-byte on both the write and the recovery path and
+they AGREE - no off-by-one.** `n <= TXN_CAP(56)` is enforced at stage time so the write path can never
+exceed the recovery guard; a torn commit record is a torn sector and fails the header CRC; the payload
+CRC is verified **before any home block is overwritten**. The design is right. The findings below are
+about what happens after it says no.
+
+### FIXED in this audit
+
+| ID | Finding |
+|----|---------|
+| **U7-1 (HIGH)** | The four USB-disk SDK wrappers passed a **u64 LBA through a 32-bit syscall register**, silently truncating it. See kernel Audit 8 / A8-1 - fixed in the wrapper per hazard A-U1, with the false "the ONE exception" comment in `syscall.rs` corrected. |
+| **U7-2 (HIGH)** | `block-driver` matched the literal `-2` for BUSY, which is also `CapNotHeld`. See A8-2 - now matches the named `USB_DISK_BUSY`. |
+
+### OPEN - recorded, not yet fixed
+
+**`fs`, after the journal says no** (the recovery-of-the-recovery gap):
+
+- **U7-3 (HIGH).** A failed journal recovery is **silently erased by the next write**. `recover`'s return
+  value is discarded, so on a payload mismatch `fs` mounts read/write, logs "will be re-verified on the
+  next mount", and the first `commit_txn` overwrites the very record and staged blocks it retained. The
+  promised re-verification never happens; the next mount looks clean over a half-applied tree. §26.7 /
+  Commandment V - a failed recovery becoming a silent success one transaction later. Fix: return a status
+  and mount **read-only** (the `read_only` field already exists and already gates every mutating op)
+  until `drives check` clears it.
+- **U7-4 (HIGH).** `recover` returns **silently** when it cannot read the commit record - asymmetric with
+  the staged-block read failure added in the same commit, which does log. This is the likelier failure on
+  the very device the work targets. `recover` is a static `fn` with no `&self`, so it also cannot set
+  `io_error_seen`: the new re-mount machinery is blind to exactly this failure.
+- **U7-5 (MED).** The io-error re-mount **abandons open file caps without revoking them**. The kernel-side
+  delegated resources stay alive, so a client's still-valid file cap is answered `FS_NOTFOUND` - a lie
+  ("your file is gone" vs "I dropped your handle") - and the 2048-entry band leaks across re-mounts until
+  every `Open` fails. §14.3 applied to geometry but not to handles.
+- **U7-6 (MED).** The re-mount degrade path conflates "unreadable device" with "no filesystem": the boot
+  mount distinguishes `E_IO` from every other error, the re-mount arm sets `storage_unreadable` for all.
+  A superblock CRC failure therefore reports "data may be intact; awaiting storage recovery" about a
+  filesystem whose only remedy is a reformat - and the shell deliberately withholds the `drives flash`
+  advice for that code.
+- **U7-7 (MED).** `capacity` is the one cached fact the io-error re-mount does **not** refresh (the
+  sibling recovery path does). Swap in a smaller stick during an outage and `drives flash` formats past
+  the end of the device. Commandment III / §14.3 - the same justification the commit gives for dropping
+  cached geometry, unapplied to the cached geometry living outside `Fs`.
+- **U7-8 (LOW).** The `io_error_seen` funnel is incomplete: journal invalidation, `drives reset`, and
+  `block_write_zeros` in format/check bypass `note_io_error`, so a device error there does not arm the
+  re-mount built for it.
+
+**`block-driver`:**
+
+- **U7-9 (MED).** `BUSY_RETRIES` is bounded per block, but `OP_WRITE_ZEROS` multiplies it by a
+  caller-supplied `count` bounded nowhere. `drives flash` zeroes ~16k bitmap blocks in **one** request; at
+  30 s worst case per block a busy stick puts the serve loop inside a single request for hours, with `fs`
+  blocked in `block_rpc` and the shell hung with no output and no abort. §26.6 - the bound must be on the
+  operation, not just one block.
+- **U7-10 (LOW).** The contract's `[placement] core = 1` is false on ARM (the kernel forces core 0, which
+  the driver's own header requires). §13.2/§9.2 say a named core is enforced intent; document it in the
+  existing ARM NOTE.
+
+**`chaos` (the frozen-clock class - the range fixed its effect on the loops, not on everything else):**
+
+- **U7-11 (MED).** With no RTC the PRNG seeds to a **constant**, so `chaos max-carnage random N` picks the
+  identical victims in the identical order on every run, every boot - while the panel and docs claim a
+  fresh random storm. A thousand runs explore one kill ordering. Fix: seed from `ctx.hw_random()` (already
+  wired) or `epoch_secs_monotonic()`.
+- **U7-12 (MED, PLAUSIBLE).** The handoff escape is bounded but its bound costs minutes (200k iterations x
+  a 256-syscall scan), so in practice it is close to the wedge it replaced. One-word fix:
+  `epoch_secs_monotonic()` instead of `datetime().epoch_secs()` - it **does** advance on ARM, which also
+  fixes U7-13 and the `ARGWAIT` loop.
+- **U7-13 (LOW).** Panel elapsed/ETA/"started" render as plausible numbers on a dead clock (`elapsed 0s`
+  for a 40-minute run) rather than announcing themselves.
+- **U7-14 (LOW).** The end-of-run `mem-pressure` reap is silent when it gives up, unlike the startup reap
+  200 lines above which logs its count.
+
+**`selfcheck.gsh`: re-runnability verified correct.** All script-created state is cleaned at both ends;
+`write` truncates so leftovers cannot change behaviour; `Vars` is per-run so re-declaration cannot fail;
+the `delete` sits inside the tallied block (loud) while the existence probe sits in the untallied
+condition (correct). One residue: `cd` mutates the session CWD, so a run aborted mid-script leaves it
+inside `/sc`, which the next run deletes. Inert today (every earlier statement uses absolute paths), one
+relative path away from a phantom failure - consider `cd /` beside the cleanup.
+
+- **U7-15 (LOW).** `if ls /sc` prints `ls: not a directory: /sc` on every clean run (conditions run with
+  console output), so the transcript still carries two lines that read like failures - the tally is
+  correct, the appearance is not.
