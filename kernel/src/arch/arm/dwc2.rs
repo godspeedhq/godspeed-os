@@ -444,6 +444,26 @@ const XACT_ERR_MAX: u32 = 3;
 /// on this stick and still a fraction of a `chaos` round.
 const NAK_BUDGET_US: u32 = 250_000;
 
+/// Why the last `chan_dma` gave up. A transfer can fail for reasons that need OPPOSITE responses - a
+/// device rejecting us (STALL), a genuinely broken link (XACTERR), or one that stayed busy longer than
+/// we can afford to wait (NAK timeout) - and `bot CBW-out failed` said none of them. Guessing between
+/// them is what produced three wrong diagnoses of the user-task faults before the fault reporter was
+/// taught to name things. Same fix, same reason.
+static LAST_FAIL: AtomicU32 = AtomicU32::new(0);
+const FAIL_STALL: u32 = 1;
+const FAIL_XACT:  u32 = 2;
+const FAIL_NAK_TIMEOUT: u32 = 3;
+
+/// One word for why the last transfer failed (see `LAST_FAIL`).
+fn last_fail_str() -> &'static str {
+    match LAST_FAIL.load(Ordering::Relaxed) {
+        FAIL_STALL => "STALL (endpoint halted - device refused)",
+        FAIL_XACT  => "3x XACTERR (real transaction errors - link/CRC/timeout)",
+        FAIL_NAK_TIMEOUT => "NAK timeout (device stayed busy past 250 ms - NOT an error, we gave up)",
+        _ => "unknown",
+    }
+}
+
 // --- Internal DMA mode ------------------------------------------------------
 // The DWC2's own bus-mastering DMA moves the data: we point HCDMA at a physically-contiguous buffer
 // (`DMA`), arm the channel, and wait for the halt - no FIFO push/pop from the CPU. QEMU's DWC2 model
@@ -679,14 +699,16 @@ fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, e
             loop {
                 let ci = split_txn(ch, dir_in, cur_pid, chunk, buf_phys + off, ep, ep_type, hcsplt, false);
                 if ci & HCINT_XFERCOMPL != 0 { ok = true; break; }
-                if ci & HCINT_STALL != 0 { return false; }              // endpoint halted: hard failure
+                if ci & HCINT_STALL != 0 { LAST_FAIL.store(FAIL_STALL, Ordering::Relaxed); return false; }
                 // A NAK or NYET is FLOW CONTROL, not an error: the device (or the hub's TT) is telling
                 // us to ask again. It must not spend the error budget - that is the whole point.
                 if ci & (HCINT_XACTERR) != 0 {
                     xact_errs += 1;
-                    if xact_errs >= XACT_ERR_MAX { return false; }
+                    if xact_errs >= XACT_ERR_MAX { LAST_FAIL.store(FAIL_XACT, Ordering::Relaxed); return false; }
                 }
-                if super::timer::systimer_us().wrapping_sub(started) > NAK_BUDGET_US { return false; }
+                if super::timer::systimer_us().wrapping_sub(started) > NAK_BUDGET_US {
+                    LAST_FAIL.store(FAIL_NAK_TIMEOUT, Ordering::Relaxed); return false;
+                }
                 spin(5_000);
             }
             if !ok { return false; }
@@ -710,14 +732,16 @@ fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, e
             NEXT_BULK_PID_DATA1.store((rd(hctsiz_at(ch)) >> 29) & 0x3 == PID_DATA1, Ordering::Relaxed);
             return true;
         }
-        if ci & HCINT_STALL != 0 { return false; }       // endpoint halted: hard failure
+        if ci & HCINT_STALL != 0 { LAST_FAIL.store(FAIL_STALL, Ordering::Relaxed); return false; }
         // NAK/NYET = "busy, ask again" and costs nothing. Only a real TRANSACTION error counts, and
         // three of them fail the transfer - the same threshold Linux applies in `dwc2_release_channel`.
         if ci & HCINT_XACTERR != 0 {
             xact_errs += 1;
-            if xact_errs >= XACT_ERR_MAX { return false; }
+            if xact_errs >= XACT_ERR_MAX { LAST_FAIL.store(FAIL_XACT, Ordering::Relaxed); return false; }
         }
-        if super::timer::systimer_us().wrapping_sub(started) > NAK_BUDGET_US { return false; }
+        if super::timer::systimer_us().wrapping_sub(started) > NAK_BUDGET_US {
+            LAST_FAIL.store(FAIL_NAK_TIMEOUT, Ordering::Relaxed); return false;
+        }
         spin(5_000);
     }
 }
@@ -1798,7 +1822,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     cbw[15..15 + n].copy_from_slice(&cdb[..n]);
 
     if bulk_xfer(CH_BULK, false, ep_out, &mut cbw, 31) < 0 {
-        pl011_write(b"dwc2: bot CBW-out failed\r\n");
+        pl011_write(b"dwc2: bot CBW-out failed - "); pl011_write(last_fail_str().as_bytes()); pl011_write(b"\r\n");
         recover_or_revive(ep_in, ep_out);
         return false;
     }
@@ -1808,7 +1832,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     if dlen > 0 {
         let n = bulk_xfer(CH_BULK, data_in, if data_in { ep_in } else { ep_out }, data, dlen);
         if n < 0 {
-            pl011_write(b"dwc2: bot data-stage failed\r\n");
+            pl011_write(b"dwc2: bot data-stage failed - "); pl011_write(last_fail_str().as_bytes()); pl011_write(b"\r\n");
             let _ = bot_recover(ep_in, ep_out);
             return false;
         }
@@ -1817,7 +1841,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
 
     let mut csw = [0u8; 13];
     if bulk_xfer(CH_BULK, true, ep_in, &mut csw, 13) < 0 {
-        pl011_write(b"dwc2: bot CSW-in failed\r\n");
+        pl011_write(b"dwc2: bot CSW-in failed - "); pl011_write(last_fail_str().as_bytes()); pl011_write(b"\r\n");
         recover_or_revive(ep_in, ep_out);
         return false;
     }
