@@ -1654,7 +1654,13 @@ fn recover_or_revive(ep_in: u32, ep_out: u32) {
     reset_port();
     MSC_REVIVING.store(false, Ordering::Relaxed);
     if MSC_READY.load(Ordering::Acquire) {
-        pl011_write(b"dwc2: device came back - storage restored\r\n");
+        // Say what the revival COST, not just that it worked. A port reset clears the device's
+        // volatile write cache, and this device accepts no SYNCHRONIZE CACHE - so any write it had
+        // acknowledged but not yet committed is gone. Availability is bought with durability here, and
+        // that is a real trade rather than a free recovery: observed as a file written moments before
+        // a revival reading back EMPTY afterwards, which looks like corruption until you know why.
+        pl011_write(b"dwc2: device came back - storage restored (writes it had BUFFERED are LOST: a port \
+reset clears the device cache and this device accepts no flush)\r\n");
         return;
     }
     // The revival did not take. RESTORE the serving flag anyway - do NOT leave storage switched off.
