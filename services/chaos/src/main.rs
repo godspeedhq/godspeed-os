@@ -422,7 +422,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // flooding the serial log and outrunning the eye. Yield a modest beat, still polling `q` (from the
         // SERIAL console - the keyboard is a chaos target) so an abort lands promptly.
         for _ in 0..PACE_YIELDS {
-            if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { break 'carnage; } }
+            if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { ack_quit(&ctx); break 'carnage; } }
             ctx.yield_cpu();
         }
     }
