@@ -499,7 +499,8 @@ pub unsafe fn finalize_service_address_space(cr3: u64) {
     }
 }
 
-/// Make this freshly-loaded address space visible to a core OTHER than the one that built it.
+/// Make this freshly-loaded address space visible to the table walker and to every other core:
+/// the mapped PAGES, every L2 table, and the L1 root - all cleaned to the PoC by MVA.
 ///
 /// **The set/way sweep above is not enough, and that is an ARM trap worth stating plainly.** Set/way
 /// maintenance (`DCCISW`) is **local to the core that executes it** - it is never broadcast, even with
@@ -533,7 +534,28 @@ unsafe fn publish_user_pages_to_other_cores(root: u32) {
                 if (e2 >> 4) & 0b11 < 0b10 { continue; }    // not PL0-accessible => not this service's
                 clean_invalidate_dcache_range(e2 & 0xFFFF_F000, 0x1000);
             }
+            // ...and the L2 TABLE ITSELF (1 KiB). See below - the descriptors matter as much as the
+            // pages they describe, and this loop was publishing only the pages.
+            clean_invalidate_dcache_range(e1 & 0xFFFF_FC00, 0x400);
         }
+        // The L1 TABLE (16 KiB). THIS is the one that was missing, and it is the whole bug:
+        //
+        // The table walker is configured NON-CACHEABLE (TTBR0 carries no cacheability attributes), so
+        // it reads descriptors from the point of coherency - not through the D-cache the kernel wrote
+        // them with. Publishing them was left entirely to `clean_invalidate_dcache_all`, a SET/WAY
+        // sweep, and this file already states why that is not enough: set/way is local to the core that
+        // runs it and is never broadcast. On a Cortex-A7 it also cleans L1 into L2 rather than to the
+        // PoC. So a table could be complete and correct in memory-as-the-CPU-sees-it while the walker
+        // still read the previous contents of those frames.
+        //
+        // The symptom is a fault that looks impossible: `mem-pressure` took a PERMISSION fault at
+        // 0x0040002c, an address squarely inside its own valid R-X segment. Not a wrong mapping - a
+        // stale read of a right one. It showed up under a respawn storm because that is when tables are
+        // built and torn down fastest, and when freed frames are recycled into new tables soonest.
+        //
+        // MVA maintenance is the correct instrument: it reaches the PoC and is broadcast to the inner
+        // shareable domain, which is exactly what a non-cacheable walker on any core requires.
+        clean_invalidate_dcache_range(root & 0xFFFF_C000, 0x4000);
         core::arch::asm!(
             "dsb",
             "mcr p15, 0, {z}, c7, c1, 0",  // ICIALLUIS - I-cache invalidate all, inner shareable
