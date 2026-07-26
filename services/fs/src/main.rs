@@ -266,6 +266,14 @@ struct Fs {
     flush_warned: core::cell::Cell<bool>,
     // Same, for the checkpoint barrier: on a drive with no flush every commit trips it.
     checkpoint_warned: core::cell::Cell<bool>,
+    // Set the moment a block operation reports a device I/O error. The driver can REVIVE a dead USB
+    // device by resetting its port - which restores availability but discards whatever the device had
+    // buffered, because a port reset clears its volatile cache and this device accepts no flush. So an
+    // I/O error is not only "that request failed": it marks the point after which this mount's cached
+    // geometry and free count may describe a disk that no longer matches. The serve loop re-mounts on
+    // the next request rather than trusting them (§14.3 - reacquiring is necessary but not sufficient;
+    // everything derived from the previous incarnation must be re-established too).
+    io_error_seen: core::cell::Cell<bool>,
     // Crash-consistency journal (Phase C). While `txn_active`, structural writes (directory,
     // bitmap, superblock) are STAGED here - with read-your-writes - instead of going to disk,
     // then committed atomically through the on-disk journal region (`commit_txn`). Data-block
@@ -470,6 +478,33 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // `mount` fails fast on a still-down disk (`read_superblock` returns an error, no spin), so a
         // per-request attempt is cheap. Only the I/O-error degraded state re-mounts; a genuinely blank
         // disk (storage_unreadable == false) stays "no filesystem" until `drives flash`.
+        // A mount that is UP but has seen an I/O error is re-established before the next request.
+        //
+        // The self-heal below covers the mount that never came up. This covers the other half, which
+        // the USB revival created: the driver can bring a dead device back by resetting its port, so
+        // I/O starts working again and `fs` stays `Some(..)` - while the reset has discarded whatever
+        // the device had buffered. The cached superblock geometry and free count then describe a disk
+        // that may no longer match, and nothing would ever re-read them. Observed as a file written
+        // moments before a revival reading back EMPTY afterwards.
+        //
+        // §14.3 states the rule this implements: reacquiring is necessary but NOT sufficient - every
+        // derived thing obtained from the previous incarnation must be re-established too. A dropped
+        // mount is exactly that. Cheap: the flag is only ever set by a real device I/O error, so the
+        // common path costs one `Cell` read per request.
+        if let Some(f) = fs.as_ref() {
+            if f.io_error_seen.get() {
+                ctx.log("fs: device I/O error seen - re-mounting before serving (a revival may have discarded buffered writes; cached geometry is not trusted across it)");
+                match Fs::mount(&ctx) {
+                    Ok(nf) => { fs = Some(nf); }
+                    Err(e) => {
+                        // Loud, and DEGRADE rather than serve from state we have just declared stale.
+                        ctx.log_fmt(format_args!("fs: re-mount after I/O error FAILED ({}) - degrading", e));
+                        fs = None;
+                        storage_unreadable = true;
+                    }
+                }
+            }
+        }
         if fs.is_none() && storage_unreadable {
             let _ = ctx.reacquire_by_name("block-driver");
             // Never probe an absent disk: capacity 0 -> block_capacity None, so a cardless boot does
@@ -1218,6 +1253,7 @@ impl Fs {
             last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
             flush_warned: core::cell::Cell::new(false),
             checkpoint_warned: core::cell::Cell::new(false),
+            io_error_seen: core::cell::Cell::new(false),
             txn_active: false,
             txn_n: 0,
             txn_overflow: false,
@@ -1245,7 +1281,10 @@ impl Fs {
                 if self.txn_lba[i] == lba { return Some(self.txn_blk[i]); }
             }
         }
-        block_read(ctx, lba)
+        match block_read(ctx, lba) {
+            Some(b) => Some(b),
+            None => { self.io_error_seen.set(true); None }
+        }
     }
 
     /// Write a block: stage it in the active transaction (de-duplicating by `lba`), else write
@@ -1261,7 +1300,9 @@ impl Fs {
             self.txn_n += 1;
             true
         } else {
-            block_write(ctx, lba, data)
+            let ok = block_write(ctx, lba, data);
+            if !ok { self.io_error_seen.set(true); }
+            ok
         }
     }
 
