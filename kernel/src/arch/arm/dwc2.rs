@@ -420,6 +420,29 @@ const PID_SETUP: u32 = 3;
 const HCINT_XFERCOMPL: u32 = 1 << 0;
 const HCINT_NAK: u32 = 1 << 4;   // the device positively answered "nothing new"
 const HCINT_CHHLTD:    u32 = 1 << 1;
+const HCINT_STALL:     u32 = 1 << 3;   // the endpoint is halted - a HARD failure, never retried
+const HCINT_NYET:      u32 = 1 << 6;   // split: the TT has not finished yet - retry the CSPLIT
+const HCINT_XACTERR:   u32 = 1 << 7;   // a real transaction error (CRC, timeout, bit-stuff, toggle)
+
+/// How many genuine TRANSACTION errors a transfer tolerates before it fails. Matches Linux, which
+/// fails a QTD at `error_count >= 3` in `dwc2_release_channel`.
+const XACT_ERR_MAX: u32 = 3;
+
+/// The wall-clock ceiling on retrying a transfer that is only ever being NAKed.
+///
+/// A NAK is not an error - it is the device saying "busy, ask again", and Linux never lets one count
+/// toward failure (`dwc2_hc_nak_intr` explicitly resets `qtd->error_count = 0`; only XACTERR
+/// increments it). We were treating both alike, spending one `tries` budget on either, so a stick that
+/// NAKed while its flash was busy - exactly what a stick does under sustained I/O - had its perfectly
+/// healthy command declared failed, which then escalated into a reset and a re-enumeration of a device
+/// that was never broken.
+///
+/// Linux can retry a NAK indefinitely because it is interrupt-driven and simply re-queues. We are
+/// synchronous with IRQs masked, so unbounded retry would starve the timer (kernel-audit K7-1). The
+/// bound therefore becomes TIME rather than a count: keep answering the device's "ask again" for as
+/// long as we can afford to, then give up loudly. 250 ms is far longer than any flash-busy period seen
+/// on this stick and still a fraction of a `chaos` round.
+const NAK_BUDGET_US: u32 = 250_000;
 
 // --- Internal DMA mode ------------------------------------------------------
 // The DWC2's own bus-mastering DMA moves the data: we point HCDMA at a physically-contiguous buffer
@@ -636,7 +659,7 @@ fn flush_dcache(addr: u32, len: u32) {
 /// the data itself. Retries on NAK / transaction-error up to `tries` times; STALL or exhausted retries is
 /// a hard failure. `tries == 1` (no backoff) is the fast path for polling an endpoint that legitimately
 /// NAKs when idle (a bulk IN with no frame queued), so an empty poll returns immediately.
-fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u32, tries: u32) -> bool {
+fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u32) -> bool {
     let hcsplt = hcsplt_for_current();
     if hcsplt != 0 {
         // SPLIT path, ONE low/full-speed packet per split transaction. The DWC2 does not auto-continue a
@@ -651,11 +674,20 @@ fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, e
         loop {
             let chunk = (len - off).min(mps);
             let mut ok = false;
-            for attempt in 0..tries {
+            let mut xact_errs = 0u32;
+            let started = super::timer::systimer_us();
+            loop {
                 let ci = split_txn(ch, dir_in, cur_pid, chunk, buf_phys + off, ep, ep_type, hcsplt, false);
                 if ci & HCINT_XFERCOMPL != 0 { ok = true; break; }
-                if ci & (1 << 3) != 0 { return false; }     // STALL - hard failure
-                if attempt + 1 < tries { spin(5_000); }     // NAK / XactErr - brief backoff, then retry
+                if ci & HCINT_STALL != 0 { return false; }              // endpoint halted: hard failure
+                // A NAK or NYET is FLOW CONTROL, not an error: the device (or the hub's TT) is telling
+                // us to ask again. It must not spend the error budget - that is the whole point.
+                if ci & (HCINT_XACTERR) != 0 {
+                    xact_errs += 1;
+                    if xact_errs >= XACT_ERR_MAX { return false; }
+                }
+                if super::timer::systimer_us().wrapping_sub(started) > NAK_BUDGET_US { return false; }
+                spin(5_000);
             }
             if !ok { return false; }
             off += chunk;
@@ -668,7 +700,9 @@ fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, e
         }
     }
     // DIRECT (high-speed) path: the core handles multi-packet framing + the data toggle itself.
-    for attempt in 0..tries {
+    let mut xact_errs = 0u32;
+    let started = super::timer::systimer_us();
+    loop {
         chan_program(ch, dir_in, pid, len, buf_phys, ep, ep_type, 0);
         let ci = wait_halt(ch);
         if ci & HCINT_XFERCOMPL != 0 {
@@ -676,10 +710,16 @@ fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, e
             NEXT_BULK_PID_DATA1.store((rd(hctsiz_at(ch)) >> 29) & 0x3 == PID_DATA1, Ordering::Relaxed);
             return true;
         }
-        if ci & (1 << 3) != 0 { return false; }         // STALL - hard failure
-        if attempt + 1 < tries { spin(5_000); }         // NAK / XactErr - brief backoff, then retry
+        if ci & HCINT_STALL != 0 { return false; }       // endpoint halted: hard failure
+        // NAK/NYET = "busy, ask again" and costs nothing. Only a real TRANSACTION error counts, and
+        // three of them fail the transfer - the same threshold Linux applies in `dwc2_release_channel`.
+        if ci & HCINT_XACTERR != 0 {
+            xact_errs += 1;
+            if xact_errs >= XACT_ERR_MAX { return false; }
+        }
+        if super::timer::systimer_us().wrapping_sub(started) > NAK_BUDGET_US { return false; }
+        spin(5_000);
     }
-    false
 }
 
 /// One SPLIT transaction to a low/full-speed device behind the high-speed LAN9514 hub: a **Start-Split**
@@ -843,7 +883,7 @@ fn split_txn_periodic(ch: u32, dir_in: bool, pid: u32, len: u32, buf_phys: u32, 
 
 /// A single control-endpoint DMA transaction (ep 0, type control). Thin wrapper so ctrl_xfer reads clean.
 fn ctrl_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32) -> bool {
-    chan_dma(ch, dir_in, pid, buf_phys, len, 0, 0, 3)
+    chan_dma(ch, dir_in, pid, buf_phys, len, 0, 0)
 }
 
 /// A full control transfer via DMA: SETUP -> (DATA) -> STATUS, through the `DMA` scratch buffer. `data_in`
@@ -1399,7 +1439,7 @@ pub fn net_frame_tx(frame: &[u8]) -> bool {
         buf[..n].copy_from_slice(&frame[..n]);                 // CDC-ECM: raw frame
         n
     };
-    if bulk_xfer(CH_NET, false, ep_out, &mut buf, total, 3) < 0 { return false; }
+    if bulk_xfer(CH_NET, false, ep_out, &mut buf, total) < 0 { return false; }
     // CDC-ECM delimits a datagram with a short packet; a frame that is an exact multiple of the bulk max
     // packet size needs a trailing zero-length packet, or the device won't see the frame boundary. (smsc95xx
     // carries an explicit length in its TX command, so it needs no ZLP.)
@@ -1407,7 +1447,7 @@ pub fn net_frame_tx(frame: &[u8]) -> bool {
         let mps = BULK_MPS.load(Ordering::Relaxed) as usize;
         if total != 0 && mps != 0 && total % mps == 0 {
             let mut zlp = [0u8; 1];
-            let _ = bulk_xfer(CH_NET, false, ep_out, &mut zlp, 0, 3);
+            let _ = bulk_xfer(CH_NET, false, ep_out, &mut zlp, 0);
         }
     }
     true
@@ -1427,7 +1467,7 @@ pub fn net_frame_rx(dst: &mut [u8]) -> usize {
         // smsc95xx prefixes each frame with a 4-byte RX status word: bit 15 = error summary, bits[30:16] =
         // frame length (INCLUDING the 4-byte FCS, which we strip). The frame follows the status word.
         let mut buf = [0u8; NET_FRAME_MAX + 4];
-        let got = bulk_xfer(CH_NET, true, ep_in, &mut buf, NET_FRAME_MAX + 4, 1);
+        let got = bulk_xfer(CH_NET, true, ep_in, &mut buf, NET_FRAME_MAX + 4);
         if got < 4 { return 0; }
         let status = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if status & 0x0000_8000 != 0 { return 0; }             // RX error summary - drop
@@ -1439,7 +1479,7 @@ pub fn net_frame_rx(dst: &mut [u8]) -> usize {
         m
     } else {
         let cap = dst.len().min(NET_FRAME_MAX);                 // CDC-ECM: raw frame, no header
-        let got = bulk_xfer(CH_NET, true, ep_in, dst, cap, 1);
+        let got = bulk_xfer(CH_NET, true, ep_in, dst, cap);
         if got > 0 { got as usize } else { 0 }
     }
 }
@@ -1526,7 +1566,7 @@ static BULK_MPS:        AtomicU16  = AtomicU16::new(64);  // bulk endpoint max-p
 /// non-coherent DMA. Uses the bulk endpoint's max-packet (`BULK_MPS`) for the packet count and maintains
 /// the per-direction data toggle. Returns the number of bytes transferred (for IN, the device may send a
 /// short packet, so this can be < `len`), or -1 on failure / no data.
-fn bulk_xfer(ch: u32, dir_in: bool, ep: u32, data: &mut [u8], len: usize, tries: u32) -> i32 {
+fn bulk_xfer(ch: u32, dir_in: bool, ep: u32, data: &mut [u8], len: usize) -> i32 {
     MPS0.store(BULK_MPS.load(Ordering::Relaxed), Ordering::Relaxed); // chan_program uses MPS0 for pktcnt
     let toggle = if dir_in { &BULK_TOGGLE_IN } else { &BULK_TOGGLE_OUT };
     let pid = if toggle.load(Ordering::Relaxed) { PID_DATA1 } else { PID_DATA0 };
@@ -1537,7 +1577,7 @@ fn bulk_xfer(ch: u32, dir_in: bool, ep: u32, data: &mut [u8], len: usize, tries:
         let n = len.min(d.data.len());
         if dir_in {
             flush_dcache(data_phys, n as u32);                     // invalidate before the device writes
-            if !chan_dma(ch, true, pid, data_phys, n as u32, ep, 2, tries) { -1i32 }
+            if !chan_dma(ch, true, pid, data_phys, n as u32, ep, 2) { -1i32 }
             else {
                 flush_dcache(data_phys, n as u32);                 // invalidate after -> read device bytes
                 // HCTSIZ.xfersize counts DOWN as bytes arrive, so received = requested - remaining.
@@ -1557,7 +1597,7 @@ fn bulk_xfer(ch: u32, dir_in: bool, ep: u32, data: &mut [u8], len: usize, tries:
             let m = n.min(data.len());
             d.data[..m].copy_from_slice(&data[..m]);
             flush_dcache(data_phys, m as u32);
-            if chan_dma(ch, false, pid, data_phys, m as u32, ep, 2, tries) { m as i32 } else { -1i32 }
+            if chan_dma(ch, false, pid, data_phys, m as u32, ep, 2) { m as i32 } else { -1i32 }
         }
     };
     // Advance the endpoint data toggle to the parity-correct next PID that chan_dma computed (from the actual
@@ -1573,8 +1613,11 @@ fn bulk_xfer(ch: u32, dir_in: bool, ep: u32, data: &mut [u8], len: usize, tries:
 /// Attempts per bulk transfer inside a BOT command. A real stick NAKs while its flash is busy - an
 /// erase or an internal remap can outlast a single attempt - so give it several rather than declaring
 /// the device broken on the first one. Each attempt is separately time-bounded, so this lengthens the
-/// patience without lengthening any single interrupts-off window.
-const BOT_TRIES: u32 = 10;
+/// Retry policy now lives in `chan_dma`, expressed the way the protocol actually distinguishes cases:
+/// three genuine TRANSACTION errors fail a transfer (`XACT_ERR_MAX`, matching Linux), while a NAK -
+/// the device saying "busy, ask again" while its flash is occupied - never counts and is bounded only
+/// by wall-clock (`NAK_BUDGET_US`). A single attempt count could not express that difference, which is
+/// why a busy stick used to be declared broken.
 
 /// Recover the Bulk-Only endpoints after a failed command.
 ///
@@ -1754,7 +1797,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     let n = cdb.len().min(16);
     cbw[15..15 + n].copy_from_slice(&cdb[..n]);
 
-    if bulk_xfer(CH_BULK, false, ep_out, &mut cbw, 31, BOT_TRIES) < 0 {
+    if bulk_xfer(CH_BULK, false, ep_out, &mut cbw, 31) < 0 {
         pl011_write(b"dwc2: bot CBW-out failed\r\n");
         recover_or_revive(ep_in, ep_out);
         return false;
@@ -1763,7 +1806,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     // residue against it rather than trusting a "passed" verdict on a transfer that fell short.
     let mut moved = 0usize;
     if dlen > 0 {
-        let n = bulk_xfer(CH_BULK, data_in, if data_in { ep_in } else { ep_out }, data, dlen, BOT_TRIES);
+        let n = bulk_xfer(CH_BULK, data_in, if data_in { ep_in } else { ep_out }, data, dlen);
         if n < 0 {
             pl011_write(b"dwc2: bot data-stage failed\r\n");
             let _ = bot_recover(ep_in, ep_out);
@@ -1773,7 +1816,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     }
 
     let mut csw = [0u8; 13];
-    if bulk_xfer(CH_BULK, true, ep_in, &mut csw, 13, BOT_TRIES) < 0 {
+    if bulk_xfer(CH_BULK, true, ep_in, &mut csw, 13) < 0 {
         pl011_write(b"dwc2: bot CSW-in failed\r\n");
         recover_or_revive(ep_in, ep_out);
         return false;
