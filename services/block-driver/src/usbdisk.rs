@@ -36,14 +36,24 @@ use godspeed_sdk::{Message, ServiceContext};
 /// Bounded (§26.6) by attempts, and each attempt waits on TRUTH - the transfer completing - rather
 /// than on a clock (Commandment VIII).
 const BUSY_RETRIES: u32 = 200;
-fn with_busy_retry(ctx: &ServiceContext, mut op: impl FnMut() -> i64) -> bool {
-    for _ in 0..BUSY_RETRIES {
+fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMut() -> i64) -> bool {
+    for n in 0..BUSY_RETRIES {
         match op() {
             0 => return true,
-            -2 => { ctx.yield_cpu(); }   // busy: hand the CPU on, then ask again
-            _ => return false,           // a real error
+            -2 => { ctx.yield_cpu(); }   // busy: hand the CPU on, then ask again - expected, silent
+            _ => return false,           // a real error; the kernel has already named it
         }
+        let _ = n;
     }
+    // RUNNING OUT is a real failure and must say so. Individual busy hand-backs are silent because
+    // they are the expected case, but that silence was applied to this path too - so a genuine
+    // give-up surfaced as `fs: block write failed ... (device I/O error)` with nothing anywhere
+    // explaining why, which is precisely the unexplained failure §26.7 exists to prevent. The count
+    // is the useful fact: it says the device was ALIVE and asking us to wait, for this long, and we
+    // stopped - which is a different problem from a device that is broken, and has a different fix.
+    ctx.log_fmt(format_args!(
+        "block-driver: {} lba {} gave up after {} busy retries - the device stayed busy, it did not fail",
+        what, lba, BUSY_RETRIES));
     false
 }
 
@@ -72,7 +82,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
     match p[0] {
         OP_READ_BLOCK => {
             let mut buf = [0u8; 512];
-            if with_busy_retry(ctx, || ctx.usb_disk_read_status(lba, &mut buf)) {
+            if with_busy_retry(ctx, "read", lba, || ctx.usb_disk_read_status(lba, &mut buf)) {
                 let mut out = [0u8; 513];
                 out[0] = STATUS_OK;
                 out[1..].copy_from_slice(&buf);
@@ -83,7 +93,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
             if p.len() < 521 { return err(ctx); }
             let mut buf = [0u8; 512];
             buf.copy_from_slice(&p[9..521]);
-            let status = if with_busy_retry(ctx, || ctx.usb_disk_write_status(lba, &buf)) { STATUS_OK } else { STATUS_ERR };
+            let status = if with_busy_retry(ctx, "write", lba, || ctx.usb_disk_write_status(lba, &buf)) { STATUS_OK } else { STATUS_ERR };
             let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
         }
         OP_WRITE_ZEROS => {
@@ -92,7 +102,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
             let zero = [0u8; 512];
             let mut ok = true;
             for i in 0..count {
-                if !with_busy_retry(ctx, || ctx.usb_disk_write_status(lba + i, &zero)) { ok = false; break; }
+                if !with_busy_retry(ctx, "write-zeros", lba + i, || ctx.usb_disk_write_status(lba + i, &zero)) { ok = false; break; }
             }
             let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[if ok { STATUS_OK } else { STATUS_ERR }]));
         }
