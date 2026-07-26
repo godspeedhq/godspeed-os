@@ -165,15 +165,21 @@ unsafe extern "C" fn stub_undef() -> ! {
         "cmp r0, #0x10",              // USR mode?
         "bne 1f",
         "mov r1, lr",                 // fault pc
+        // Supply ALL FOUR arguments. This set only r0/r1, leaving the status and SP_usr parameters
+        // holding whatever happened to be in r2/r3 - the same defect `stub_pabt` carried, printing
+        // invented numbers for a fault that has no status register in the first place.
+        "cps #0x1f",                  // system mode - shares the USR banked SP
+        "mov r3, sp",                 // arg3 = SP_usr at the moment of the fault
         "cps #0x13",                  // -> SVC mode, the task's kernel stack
         "mov r0, r1",                 // arg0 = fault pc
         "mov r1, #0",                 // arg1 = addr: n/a for an instruction fault
+        "mov r2, #0",                 // arg2 = status: n/a - no FSR applies to an UNDEF
         "bl {kill}",                  // kill_current + reschedule; NEVER returns
         "b .",
         "1:",
         "mov r0, #1", "mov r1, lr", "mov r2, #0", "mov r3, #0",
         "b {rep}",
-        kill = sym arm_user_fault_kill,
+        kill = sym arm_user_fault_kill_undef,
         rep = sym arm_exception_report,
     )
 }
@@ -271,7 +277,7 @@ unsafe extern "C" fn stub_pabt() -> ! {
         "mrc p15, 0, r2, c5, c0, 1",   // IFSR
         "mrc p15, 0, r3, c6, c0, 2",   // IFAR
         "b {rep}",
-        kill = sym arm_user_fault_kill,
+        kill = sym arm_user_fault_kill_pabt,
         rep = sym arm_exception_report,
     )
 }
@@ -333,8 +339,35 @@ unsafe extern "C" fn stub_dabt() -> ! {
 /// with IRQs masked (abort entry). Never returns: `kill_current` sets the task Dead and switches to the
 /// next runnable task - `yield_current`'s Dead path saves the abandoned handler context to
 /// `CORE_DEAD_CTX` (not the task slot, so no use-after-free) and never resumes it.
-extern "C" fn arm_user_fault_kill(pc: u32, addr: u32, dfsr: u32, sp_usr: u32) -> ! {
+/// Data-abort entry (`stub_dabt`): the status came from DFSR, the address from DFAR.
+extern "C" fn arm_user_fault_kill(pc: u32, addr: u32, fsr: u32, sp_usr: u32) -> ! {
+    user_fault_kill(pc, addr, fsr, sp_usr, "data")
+}
+
+/// Prefetch-abort entry (`stub_pabt`): the status came from IFSR, the address from IFAR. A separate
+/// symbol rather than a fifth argument, because the stubs are naked asm and a 5th arg goes on the
+/// stack - two thin entry points are cheaper to read and impossible to get wrong.
+extern "C" fn arm_user_fault_kill_pabt(pc: u32, addr: u32, fsr: u32, sp_usr: u32) -> ! {
+    user_fault_kill(pc, addr, fsr, sp_usr, "prefetch")
+}
+
+/// Undefined-instruction entry (`stub_undef`): a service executed a bad opcode. There is no fault
+/// address and no fault status register for this exception, so both are reported as not applicable
+/// rather than as zeros that decode into a real-looking status.
+extern "C" fn arm_user_fault_kill_undef(pc: u32, _addr: u32, _fsr: u32, sp_usr: u32) -> ! {
+    user_fault_kill(pc, 0, 0, sp_usr, "undefined-instruction")
+}
+
+fn user_fault_kill(pc: u32, addr: u32, dfsr: u32, sp_usr: u32, kind: &str) -> ! {
     let slot = crate::task::scheduler::current_task_slot();
+    // NAME the task, do not just number it. Slots are RECYCLED: during a chaos run a service is killed
+    // and respawned into whatever slot is free, so "slot 1" means one binary at boot and a different
+    // one ten seconds later. Reporting only the slot made every fault ambiguous - and worse than
+    // ambiguous, actively misleading, because the natural move is to look up the slot in the boot log
+    // and disassemble THAT binary. Doing exactly that sent an entire diagnosis after the wrong ELF: a
+    // pc and an SP_usr that "contradicted" each other were simply from a program nobody had looked at.
+    // The name is the stable identity (invariant 11); the slot is where it happens to be living.
+    let name = crate::task::scheduler::task_stat(slot).name;
     // Loud, never silent (invariant 12): the kill, WHERE it faulted, and WHY. The DFSR status field is
     // the "why" - ARMv7 short-descriptor encoding packs it as bits [3:0] plus bit 10, so 0b00101 /
     // 0b00111 are section/page TRANSLATION faults (nothing mapped there) while 0b01101 / 0b01111 are
@@ -342,9 +375,12 @@ extern "C" fn arm_user_fault_kill(pc: u32, addr: u32, dfsr: u32, sp_usr: u32) ->
     // without the status left a fault whose address looked impossible with nothing to reason from.
     let status = (dfsr & 0xF) | ((dfsr >> 10) & 1) << 4;
     crate::kprintln!(
-        "arm32: user task (slot {}) faulted at pc {:#010x}, addr {:#010x}, SP_usr {:#010x} - FSR {:#010x} (status {:#07b}, {}) - killing it; kernel continues",
-        slot, pc, addr, sp_usr, dfsr, status,
+        "arm32: user task '{}' (slot {}) took a {} abort at pc {:#010x}, addr {:#010x}, SP_usr {:#010x} - FSR {:#010x} (status {:#07b}, {}) - killing it; kernel continues",
+        name, slot, kind, pc, addr, sp_usr, dfsr, status,
         match status {
+            // An UNDEF has no FSR at all; saying so beats decoding a zero into a plausible-looking
+            // fault class. `addr` is likewise reported as 0 = not applicable, not as an address.
+            _ if kind == "undefined-instruction" => "no fault status applies - bad opcode at pc",
             0b00101 | 0b00111 => "translation - nothing mapped there",
             0b01101 | 0b01111 => "permission - mapped, but not accessible at this level",
             0b00011 | 0b00110 => "access flag",
