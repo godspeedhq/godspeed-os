@@ -1391,11 +1391,27 @@ impl Fs {
             commit[8 + i * 8..16 + i * 8].copy_from_slice(&self.txn_lba[i].to_le_bytes());
         }
         // BARRIER 1: the staged blocks must be on the medium before the record that authorises
-        // replaying them. Otherwise a crash can leave a valid commit record pointing at journal
-        // slots the device never wrote, and recovery faithfully copies garbage to their home LBAs -
-        // the journal actively causing the corruption it exists to prevent.
+        // replaying them.
         let _ = self.durable_or_warn(ctx); // advisory: the one-shot warning IS the report (see BARRIER 3)
-        let crc = crc32(&commit[..8 + n * 8]);
+        // ...and a CHECKSUM OF THE PAYLOAD, so replay can tell whether they actually got there.
+        //
+        // The barrier alone was never enough, and this filesystem has been destroyed repeatedly to
+        // prove it. On a medium that will not honour a flush, the ordering the barrier asks for cannot
+        // be enforced - so a commit record can survive while the staged blocks it authorises do not.
+        // The record described WHICH blocks to copy and WHERE, and nothing at all about what they
+        // should contain, so `recover` copied whatever those journal slots happened to hold over live
+        // metadata. That is how a root directory ends up failing its CRC after a clean-looking mount:
+        // not bit-rot, not a bad write - the journal faithfully applying garbage it could not check.
+        //
+        // A redo record that cannot verify its own payload is not a redo record. `data_crc` is a CRC
+        // over the per-block CRCs of everything staged; it sits immediately after the LBA table and is
+        // covered by the header CRC, so the two cannot disagree. Recovery recomputes it from the
+        // journal and refuses to apply a transaction that does not match (see `recover`).
+        let mut per = [0u8; TXN_CAP * 4];
+        for i in 0..n { per[i * 4..i * 4 + 4].copy_from_slice(&crc32(&self.txn_blk[i]).to_le_bytes()); }
+        let data_crc = crc32(&per[..n * 4]);
+        commit[8 + n * 8..12 + n * 8].copy_from_slice(&data_crc.to_le_bytes());
+        let crc = crc32(&commit[..12 + n * 8]);
         commit[COMMIT_CRC_OFF..COMMIT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
         if !block_write(ctx, self.journal_start, &commit) { return Err("journal commit write failed"); }
         // BARRIER 2: and the commit record must be on the medium before any home block is
@@ -1464,8 +1480,36 @@ impl Fs {
         let commit = match block_read(ctx, journal_start) { Some(b) => b, None => return };
         if u32_at(&commit, 0) != JOURNAL_MAGIC { return; }
         let n = u32_at(&commit, 4) as usize;
-        if n == 0 || n > TXN_CAP || 8 + n * 8 > COMMIT_CRC_OFF { return; }
-        if crc32(&commit[..8 + n * 8]) != u32_at(&commit, COMMIT_CRC_OFF) { return; }
+        if n == 0 || n > TXN_CAP || 12 + n * 8 > COMMIT_CRC_OFF { return; }
+        if crc32(&commit[..12 + n * 8]) != u32_at(&commit, COMMIT_CRC_OFF) { return; }
+        // VERIFY THE PAYLOAD BEFORE APPLYING ANY OF IT. Read every staged block first and check it
+        // against the checksum the commit recorded. A transaction whose blocks do not match is one the
+        // device never durably wrote - replaying it would copy garbage over live metadata, which is
+        // strictly worse than not replaying at all. Discard it whole: that is the documented "crash
+        // before the commit landed" outcome, home untouched, and it is a state the filesystem is
+        // designed to be in. Loudly, never silently (invariant 12).
+        // TWO PASSES, not one buffered pass. Holding all TXN_CAP staged blocks to verify-then-write
+        // would put 28 KiB on the stack, on top of the 28 KiB the `Fs` staging array already occupies -
+        // the heap reflex in stack form (§26.6.1). Reading each block twice costs a bounded number of
+        // extra reads, once per mount, and keeps the frame to a 224-byte checksum table.
+        let mut per = [0u8; TXN_CAP * 4];
+        for i in 0..n {
+            match block_read(ctx, journal_start + 1 + i as u64) {
+                Some(blk) => per[i * 4..i * 4 + 4].copy_from_slice(&crc32(&blk).to_le_bytes()),
+                None => {
+                    ctx.log("fs: journal replay could not READ its own staged blocks - left intact, retries next mount");
+                    return;
+                }
+            }
+        }
+        if crc32(&per[..n * 4]) != u32_at(&commit, 8 + n * 8) {
+            ctx.log("fs: journal payload does NOT match its commit record - the device did not durably write what the record authorises. DISCARDING the transaction rather than copying unverified blocks over live metadata (home is untouched; this is the crash-before-commit outcome).");
+            if !block_write(ctx, journal_start, &[0u8; BLOCK]) {
+                ctx.log("fs: could not invalidate the bad journal - it will be re-examined and re-discarded next mount");
+            }
+            return;
+        }
+        // Pass 2: the payload is verified, so now apply it.
         let mut replayed_ok = true;
         for i in 0..n {
             let lba = u64_at(&commit, 8 + i * 8);
