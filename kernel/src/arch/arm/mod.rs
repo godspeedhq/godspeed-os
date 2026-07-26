@@ -796,6 +796,9 @@ pub fn usb_disk_read(lba: u64, dst: &mut [u8]) -> bool { dwc2::msc_read_block(lb
 pub fn usb_disk_write(lba: u64, src: &[u8]) -> bool { dwc2::msc_write_block(lba, src) }
 /// Make prior writes durable (SCSI SYNCHRONIZE CACHE) - see `dwc2::msc_sync_cache`.
 pub fn usb_disk_flush() -> bool { dwc2::msc_sync_cache() }
+/// Did the last USB-disk transfer fail only because the device was BUSY (NAK)? Then it is not a
+/// failure at all - the caller should re-ask, with interrupts enabled in between.
+pub fn usb_disk_busy() -> bool { dwc2::msc_last_was_busy() }
 
 /// A hardware-random u32 from the BCM2835 SoC RNG, or None if it never produced (absent/wedged - loud, not
 /// a fallback). Ungated (InspectKernel query 19); the `random` shell utility consumes it. Best-effort under

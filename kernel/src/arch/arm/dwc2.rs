@@ -428,21 +428,24 @@ const HCINT_XACTERR:   u32 = 1 << 7;   // a real transaction error (CRC, timeout
 /// fails a QTD at `error_count >= 3` in `dwc2_release_channel`.
 const XACT_ERR_MAX: u32 = 3;
 
-/// The wall-clock ceiling on retrying a transfer that is only ever being NAKed.
+/// How long a single transfer attempt may HOLD THE CORE while the device says "busy, ask again".
 ///
-/// A NAK is not an error - it is the device saying "busy, ask again", and Linux never lets one count
-/// toward failure (`dwc2_hc_nak_intr` explicitly resets `qtd->error_count = 0`; only XACTERR
-/// increments it). We were treating both alike, spending one `tries` budget on either, so a stick that
-/// NAKed while its flash was busy - exactly what a stick does under sustained I/O - had its perfectly
-/// healthy command declared failed, which then escalated into a reset and a re-enumeration of a device
-/// that was never broken.
+/// This is not a failure deadline, and the difference matters. Linux never gives up on a NAK: it is
+/// interrupt-driven, so the channel halts, the QTD is re-queued, and the transfer resumes whenever the
+/// device is ready - there is no wall clock anywhere in that path. Commandment VIII says the same
+/// thing from the other direction: wait on TRUTH (the transfer completed), never on time.
 ///
-/// Linux can retry a NAK indefinitely because it is interrupt-driven and simply re-queues. We are
-/// synchronous with IRQs masked, so unbounded retry would starve the timer (kernel-audit K7-1). The
-/// bound therefore becomes TIME rather than a count: keep answering the device's "ask again" for as
-/// long as we can afford to, then give up loudly. 250 ms is far longer than any flash-busy period seen
-/// on this stick and still a fraction of a `chaos` round.
-const NAK_BUDGET_US: u32 = 250_000;
+/// The previous 250 ms value was a clock standing in for that truth, and the measurement says so
+/// plainly: 42 of 42 transfer failures across nine runs were this timeout expiring. Zero XACTERR, zero
+/// STALL. The device was never failing - it was busy, and we walked away from work that was going to
+/// succeed, then escalated into resetting a healthy device.
+///
+/// We cannot simply wait longer: a block transfer runs in a syscall with IRQs masked, so waiting is
+/// paid for by the timer tick not running (kernel-audit K7-1). So the attempt is bounded by how long
+/// we may hold the CORE, and a device still busy at that point yields `busy` rather than `failed` -
+/// the caller re-asks with interrupts enabled in between, which is where the real waiting belongs and
+/// costs nothing. Bounded (§26.6) and truth-based (VIII), instead of trading one against the other.
+const CORE_HOLD_US: u32 = 5_000;
 
 /// Why the last `chan_dma` gave up. A transfer can fail for reasons that need OPPOSITE responses - a
 /// device rejecting us (STALL), a genuinely broken link (XACTERR), or one that stayed busy longer than
@@ -454,12 +457,16 @@ const FAIL_STALL: u32 = 1;
 const FAIL_XACT:  u32 = 2;
 const FAIL_NAK_TIMEOUT: u32 = 3;
 
+/// Was the last transfer merely BUSY (the device asked us to come back) rather than failed? The
+/// caller re-asks; nothing is wrong.
+pub fn msc_last_was_busy() -> bool { LAST_FAIL.load(Ordering::Relaxed) == FAIL_NAK_TIMEOUT }
+
 /// One word for why the last transfer failed (see `LAST_FAIL`).
 fn last_fail_str() -> &'static str {
     match LAST_FAIL.load(Ordering::Relaxed) {
         FAIL_STALL => "STALL (endpoint halted - device refused)",
         FAIL_XACT  => "3x XACTERR (real transaction errors - link/CRC/timeout)",
-        FAIL_NAK_TIMEOUT => "NAK timeout (device stayed busy past 250 ms - NOT an error, we gave up)",
+        FAIL_NAK_TIMEOUT => "device busy (NAK) - handing the core back, the caller re-asks",
         _ => "unknown",
     }
 }
@@ -706,7 +713,7 @@ fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, e
                     xact_errs += 1;
                     if xact_errs >= XACT_ERR_MAX { LAST_FAIL.store(FAIL_XACT, Ordering::Relaxed); return false; }
                 }
-                if super::timer::systimer_us().wrapping_sub(started) > NAK_BUDGET_US {
+                if super::timer::systimer_us().wrapping_sub(started) > CORE_HOLD_US {
                     LAST_FAIL.store(FAIL_NAK_TIMEOUT, Ordering::Relaxed); return false;
                 }
                 spin(5_000);
@@ -739,7 +746,7 @@ fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, e
             xact_errs += 1;
             if xact_errs >= XACT_ERR_MAX { LAST_FAIL.store(FAIL_XACT, Ordering::Relaxed); return false; }
         }
-        if super::timer::systimer_us().wrapping_sub(started) > NAK_BUDGET_US {
+        if super::timer::systimer_us().wrapping_sub(started) > CORE_HOLD_US {
             LAST_FAIL.store(FAIL_NAK_TIMEOUT, Ordering::Relaxed); return false;
         }
         spin(5_000);
@@ -1640,7 +1647,7 @@ fn bulk_xfer(ch: u32, dir_in: bool, ep: u32, data: &mut [u8], len: usize) -> i32
 /// Retry policy now lives in `chan_dma`, expressed the way the protocol actually distinguishes cases:
 /// three genuine TRANSACTION errors fail a transfer (`XACT_ERR_MAX`, matching Linux), while a NAK -
 /// the device saying "busy, ask again" while its flash is occupied - never counts and is bounded only
-/// by wall-clock (`NAK_BUDGET_US`). A single attempt count could not express that difference, which is
+/// by wall-clock (`CORE_HOLD_US`). A single attempt count could not express that difference, which is
 /// why a busy stick used to be declared broken.
 
 /// Recover the Bulk-Only endpoints after a failed command.

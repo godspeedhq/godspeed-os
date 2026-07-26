@@ -12,13 +12,40 @@
 //! ethernet frames to `net-stack`. The block protocol above them - the same one `fs` speaks to the AHCI
 //! and EMMC backends - is this driver's own, so `fs` cannot tell which disk it is talking to.
 //!
-//! **Core affinity.** The kernel serves these syscalls only from core 0: the single DWC2 host channel and
-//! its DMA buffer are shared with the keyboard poll, which runs in core 0's timer ISR, and they are kept
-//! mutually exclusive by the fact that an ARM syscall runs with interrupts masked (the soundness
-//! invariant on `dwc2::DMA`). A request from another core would be refused, so the supervisor spawns this
-//! driver on core 0 when it serves a USB disk.
+//! **Core affinity.** The kernel serves these syscalls only from core 0, because the DWC2 DMA buffer is
+//! shared with the keyboard poll that runs in core 0's timer ISR, kept mutually exclusive by an ARM
+//! syscall running with interrupts masked (the soundness invariant on `dwc2::DMA`). A request from
+//! another core is refused, so the supervisor spawns this driver on core 0. Storage and the keyboard no
+//! longer share a HOST CHANNEL - each stream has its own (`CH_BULK`/`CH_KBD`) - so what is shared is the
+//! one DMA scratch buffer, not the channel state.
+//!
+//! **Busy is not failure.** A stick NAKs while its flash is occupied. The kernel bounds how long it will
+//! hold the core waiting and then answers `-2` (busy) rather than `-1` (failed), and the waiting happens
+//! HERE, between yields, where interrupts are on and every other task still runs.
 
 use godspeed_sdk::{Message, ServiceContext};
+
+/// Re-ask while the device says BUSY, yielding in between.
+///
+/// A NAK is the device asking us to come back, not a failure - and the kernel now says so with `-2`
+/// instead of folding it into `-1`. The waiting belongs HERE rather than in the syscall: between
+/// attempts this task simply yields, so interrupts are enabled, the timer tick runs, the keyboard is
+/// polled and every other service runs. Inside the syscall the same wait costs a stalled core, which
+/// is why it was bounded to 5 ms there and why a device that stayed busy longer got declared broken.
+///
+/// Bounded (§26.6) by attempts, and each attempt waits on TRUTH - the transfer completing - rather
+/// than on a clock (Commandment VIII).
+const BUSY_RETRIES: u32 = 200;
+fn with_busy_retry(ctx: &ServiceContext, mut op: impl FnMut() -> i64) -> bool {
+    for _ in 0..BUSY_RETRIES {
+        match op() {
+            0 => return true,
+            -2 => { ctx.yield_cpu(); }   // busy: hand the CPU on, then ask again
+            _ => return false,           // a real error
+        }
+    }
+    false
+}
 
 /// Serve one block-IPC request. Same wire protocol as the AHCI and EMMC backends - `fs` is unaware of
 /// which one it is talking to.
@@ -45,7 +72,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
     match p[0] {
         OP_READ_BLOCK => {
             let mut buf = [0u8; 512];
-            if ctx.usb_disk_read(lba, &mut buf) {
+            if with_busy_retry(ctx, || ctx.usb_disk_read_status(lba, &mut buf)) {
                 let mut out = [0u8; 513];
                 out[0] = STATUS_OK;
                 out[1..].copy_from_slice(&buf);
@@ -56,7 +83,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
             if p.len() < 521 { return err(ctx); }
             let mut buf = [0u8; 512];
             buf.copy_from_slice(&p[9..521]);
-            let status = if ctx.usb_disk_write(lba, &buf) { STATUS_OK } else { STATUS_ERR };
+            let status = if with_busy_retry(ctx, || ctx.usb_disk_write_status(lba, &buf)) { STATUS_OK } else { STATUS_ERR };
             let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
         }
         OP_WRITE_ZEROS => {
@@ -65,7 +92,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
             let zero = [0u8; 512];
             let mut ok = true;
             for i in 0..count {
-                if !ctx.usb_disk_write(lba + i, &zero) { ok = false; break; }
+                if !with_busy_retry(ctx, || ctx.usb_disk_write_status(lba + i, &zero)) { ok = false; break; }
             }
             let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[if ok { STATUS_OK } else { STATUS_ERR }]));
         }

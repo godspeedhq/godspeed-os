@@ -1859,7 +1859,11 @@ fn handle_usb_disk_read(lba: u64, ptr: u64) -> i64 {
         return cap_err_to_i64(CapError::CapNotHeld);
     }
     let mut buf = [0u8; USB_DISK_BLOCK];
-    if !crate::arch::imp::usb_disk_read(lba, &mut buf) { return -1; }
+    // -2 = BUSY (the device NAKed; nothing is wrong, re-ask). Distinct from -1 = failed, because the
+    // two need opposite responses and collapsing them is what turned a busy stick into a "broken" one.
+    if !crate::arch::imp::usb_disk_read(lba, &mut buf) {
+        return if crate::arch::imp::usb_disk_busy() { -2 } else { -1 };
+    }
     if !write_user_bytes(ptr, &buf) { return -1; }
     0
 }
@@ -1871,7 +1875,9 @@ fn handle_usb_disk_write(lba: u64, ptr: u64) -> i64 {
         return cap_err_to_i64(CapError::CapNotHeld);
     }
     let src = match read_user_bytes(ptr, USB_DISK_BLOCK) { Some(b) => b, None => return -1 };
-    if crate::arch::imp::usb_disk_write(lba, src) { 0 } else { -1 }
+    if crate::arch::imp::usb_disk_write(lba, src) { 0 }
+    else if crate::arch::imp::usb_disk_busy() { -2 }   // BUSY: re-ask, do not treat as a failure
+    else { -1 }
 }
 
 /// UsbDiskFlush (49): flush the device's write cache to the medium (SCSI SYNCHRONIZE CACHE).

@@ -876,6 +876,21 @@ impl ServiceContext {
         ret == 0
     }
 
+    /// Read a block, returning the raw status so BUSY is distinguishable from FAILED: `0` ok, `-2` the
+    /// device is busy (NAK - re-ask, nothing is wrong), anything else a real error. The `bool` variants
+    /// above collapse those two, which is exactly the conflation that made a busy stick look broken.
+    pub fn usb_disk_read_status(&self, lba: u64, dst: &mut [u8; 512]) -> i64 {
+        // SAFETY: syscall(47) = UsbDiskRead; the kernel writes exactly 512 bytes through its checked
+        // user-pointer path.
+        unsafe { raw_syscall(47, lba, dst.as_mut_ptr() as u64, 0) }
+    }
+
+    /// Write a block, returning the raw status (see `usb_disk_read_status`).
+    pub fn usb_disk_write_status(&self, lba: u64, src: &[u8; 512]) -> i64 {
+        // SAFETY: syscall(48) = UsbDiskWrite; the kernel reads exactly 512 bytes from `src`.
+        unsafe { raw_syscall(48, lba, src.as_ptr() as u64, 0) }
+    }
+
     /// Make previously written blocks durable on the USB mass-storage device (SCSI SYNCHRONIZE CACHE).
     /// Requires `USB_DISK` WRITE. Syscall 49.
     ///

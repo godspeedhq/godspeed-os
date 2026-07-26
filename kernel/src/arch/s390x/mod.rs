@@ -316,3 +316,4 @@ pub fn usb_disk_sectors() -> u64 { 0 }
 pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
 pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
 pub fn usb_disk_flush() -> bool { false }
+pub fn usb_disk_busy() -> bool { false }
