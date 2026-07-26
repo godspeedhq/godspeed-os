@@ -69,6 +69,43 @@ const HCDMA0:   usize = 0x514; // channel DMA address (physical buffer)
 const DMA_BUS_ALIAS: u32 = 0x0000_0000;
 #[cfg(not(feature = "qemu"))]
 const DMA_BUS_ALIAS: u32 = 0xC000_0000;
+/// Per-channel register base: the DWC2 lays its host channels out at 0x500 + ch*0x20, and this board
+/// reports **8** of them (GHWCFG2[17:14]+1, read at init - where we already halt every one).
+///
+/// We used to program every transfer through channel 0. Keyboard polls, mass-storage bulk and ethernet
+/// frames shared one set of registers, which is why an interrupt-split abandoned mid-flight by the ISR
+/// budget corrupted the next block transfer: not because they ran at the same time (they cannot - the
+/// poll runs in the timer ISR, block I/O in an IRQ-masked syscall) but because the abandoned transfer
+/// LEFT ITS STATE on the channel the next user inherited.
+///
+/// Linux allocates a channel per active transfer from a free list (`free_hc_list`,
+/// `dwc2_assign_and_init_hc`). It needs a pool because it juggles arbitrary concurrent URBs; we have
+/// three statically-known streams, so a pool would be speculative generality (§26.2). One channel per
+/// stream buys the isolation the pool exists to provide, without the bookkeeping.
+#[inline] fn hcchar_at(ch: u32)   -> usize { 0x500 + (ch as usize) * 0x20 }
+#[inline] fn hcsplt_at(ch: u32)   -> usize { 0x504 + (ch as usize) * 0x20 }
+#[inline] fn hcint_at(ch: u32)    -> usize { 0x508 + (ch as usize) * 0x20 }
+#[inline] fn hcintmsk_at(ch: u32) -> usize { 0x50C + (ch as usize) * 0x20 }
+#[inline] fn hctsiz_at(ch: u32)   -> usize { 0x510 + (ch as usize) * 0x20 }
+#[inline] fn hcdma_at(ch: u32)    -> usize { 0x514 + (ch as usize) * 0x20 }
+
+/// Bulk + control + enumeration. Boot or syscall context, IRQs masked.
+const CH_BULK: u32 = 0;
+/// The keyboard's periodic poll. Runs in the core-0 timer ISR and is the ONE transfer deliberately
+/// abandoned when its budget expires - so it must not share a channel with anything.
+const CH_KBD:  u32 = 1;
+/// USB-ethernet frames.
+const CH_NET:  u32 = 2;
+
+/// Return a channel to a clean state, as `dwc2_hc_cleanup` does: mask its interrupts and clear every
+/// latched status bit. An abandoned transfer leaves both set, and the next user of that channel would
+/// otherwise read a previous transfer's completion as its own.
+#[allow(dead_code)]
+fn chan_release(ch: u32) {
+    wr(hcintmsk_at(ch), 0);
+    wr(hcint_at(ch), 0xFFFF_FFFF);
+}
+
 const HAINT:    usize = 0x414; // host all-channels interrupt
 const HAINTMSK: usize = 0x418; // host all-channels interrupt mask
 // --- Power / clock gating ---
@@ -260,7 +297,9 @@ pub fn init() {
     //     microframe (exactly our HW data). So set the masks unconditionally, matching Linux. QEMU already
     //     needed them; this makes HW match. No USB IRQ is wired on ARM - the interrupts pend unserviced,
     //     which is fine: we poll HCINT; the masks only gate the core's own state-machine advancement.
-    wr(HCINTMSK0, 0x7FF);   // all channel-0 interrupt sources
+    // Unmask the interrupt sources on every channel we use. This armed channel 0 only, from when
+    // channel 0 was the only one.
+    for c in [CH_BULK, CH_KBD, CH_NET] { wr(hcintmsk_at(c), 0x7FF); }
     wr(HAINTMSK, 0xFFFF);   // all channels
     wr(GINTMSK, (1 << 25) | (1 << 24)); // Hchint (host channel) + Prtint (port)
     // 5e. Host PHY clock select. CRITICAL for the Pi: with a HS UTMI+ PHY (GUSBCFG.PHYSel=0) driving a
@@ -441,7 +480,7 @@ fn hcsplt_for_current() -> u32 {
 /// enumeration path, the keyboard's IN endpoint / interrupt=3 for polling); device address, EP0 max-packet
 /// and speed come from the globals the enumeration steps set. `hcsplt` is the split-transaction descriptor
 /// (0 for a direct device). The DWC2 DMA master moves the data itself.
-fn chan_program(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32) {
+fn chan_program(ch: u32, dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32) {
     let mps = MPS0.load(Ordering::Relaxed) as u32;
     let dev_addr = DEV_ADDR.load(Ordering::Relaxed) as u32;
     let low_speed = LOW_SPEED.load(Ordering::Relaxed) as u32;
@@ -449,15 +488,15 @@ fn chan_program(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_typ
     // Channel-reuse hygiene: if a prior transaction left the channel ENABLED (a timeout that never truly
     // halted, or a split phase re-arm), disable it cleanly before reprogramming - never reuse a half-live
     // channel (fresh-eyes checklist: stale ChEna/ChDis before reuse).
-    if rd(HCCHAR0) & (1 << 31) != 0 {
-        wr(HCCHAR0, (rd(HCCHAR0) & !(1 << 31)) | (1 << 30));    // ChDis: clear ChEna, set ChDis
-        let mut t = 0u32; while rd(HCCHAR0) & (1 << 31) != 0 { t += 1; if t > 100_000 { break; } }
+    if rd(hcchar_at(ch)) & (1 << 31) != 0 {
+        wr(hcchar_at(ch), (rd(hcchar_at(ch)) & !(1 << 31)) | (1 << 30));    // ChDis: clear ChEna, set ChDis
+        let mut t = 0u32; while rd(hcchar_at(ch)) & (1 << 31) != 0 { t += 1; if t > 100_000 { break; } }
     }
-    wr(HCINT0, 0xFFFF_FFFF);                                     // clear stale channel interrupts
-    wr(HCTSIZ0, (len & 0x7_FFFF) | ((pkts & 0x3ff) << 19) | (pid << 29));  // size, packet count (10-bit field), starting PID
+    wr(hcint_at(ch), 0xFFFF_FFFF);                                     // clear stale channel interrupts
+    wr(hctsiz_at(ch), (len & 0x7_FFFF) | ((pkts & 0x3ff) << 19) | (pid << 29));  // size, packet count (10-bit field), starting PID
     // The HCDMA address is a *bus* address as the DWC2 master sees memory (see DMA_BUS_ALIAS).
-    wr(HCDMA0, buf_phys | DMA_BUS_ALIAS);
-    wr(HCSPLT0, hcsplt);                                         // split descriptor - LAST before HCCHAR (Linux order: HCTSIZ -> HCSPLT -> HCCHAR)
+    wr(hcdma_at(ch), buf_phys | DMA_BUS_ALIAS);
+    wr(hcsplt_at(ch), hcsplt);                                         // split descriptor - LAST before HCCHAR (Linux order: HCTSIZ -> HCSPLT -> HCCHAR)
     // Odd-frame scheduling applies to PERIODIC transfers AND SPLIT transactions (a split's SSPLIT/CSPLIT
     // are microframe-scheduled by the hub's TT - fresh-eyes checklist: derive OddFrm from the target frame
     // including control splits). Target the NEXT microframe: OddFrm set when the current one is even (so the
@@ -473,7 +512,7 @@ fn chan_program(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_typ
         | ((dev_addr & 0x7F) << 22)        // the low-speed DEVICE address (the hub address rides HCSPLT)
         | oddfrm                           // odd/even frame parity (Circle sets this per start)
         | (1 << 31);                       // channel enable
-    wr(HCCHAR0, chan);
+    wr(hcchar_at(ch), chan);
 }
 
 static DUMPED: AtomicBool = AtomicBool::new(false);
@@ -488,10 +527,10 @@ static DUMPED: AtomicBool = AtomicBool::new(false);
 /// 10 ms scheduler tick - so a keyboard whose split does not halt promptly starved the scheduler and wedged
 /// the boot (HW-observed on a Logitech low-speed keyboard behind the LAN9514 hub). `POLL_HALT_BUDGET_US`
 /// keeps a single wait well under one tick.
-fn poll_wait_halt() -> u32 {
+fn poll_wait_halt(ch: u32) -> u32 {
     let start = super::timer::systimer_us();
     loop {
-        let ci = rd(HCINT0);
+        let ci = rd(hcint_at(ch));
         if ci & HCINT_CHHLTD != 0 { return ci; }
         if super::timer::systimer_us().wrapping_sub(start) > POLL_HALT_BUDGET_US {
             return ci | HCINT_CHHLTD; // treat as halted-without-complete -> the poll gives up this tick
@@ -508,11 +547,11 @@ const POLL_HALT_BUDGET_US: u32 = 1000;
 
 /// One-shot diagnostic dump of the channel + core-config state on a stalled transfer (`wait_halt` calls it
 /// on its bounded timeout); `DUMPED` gates it to the FIRST stall so the log is never flooded.
-fn stall_dump() {
+fn stall_dump(ch: u32) {
     if DUMPED.swap(true, Ordering::Relaxed) { return; }
     // Did the core CONSUME the pushed bytes (NPTxFSpcAvail back to full) or are they stuck in the FIFO?
-    pl011_write(b"dwc2: STALL HCCHAR="); write_hex32(rd(HCCHAR0));
-    pl011_write(b" HCTSIZ="); write_hex32(rd(HCTSIZ0));
+    pl011_write(b"dwc2: STALL HCCHAR="); write_hex32(rd(hcchar_at(ch)));
+    pl011_write(b" HCTSIZ="); write_hex32(rd(hctsiz_at(ch)));
     pl011_write(b" GNPTXSTS="); write_hex32(rd(0x02C));
     pl011_write(b" GINTSTS="); write_hex32(rd(GINTSTS));
     pl011_write(b" HPRT="); write_hex32(rd(HPRT));
@@ -545,13 +584,13 @@ fn stall_dump() {
 ///
 /// A healthy USB transaction halts in microseconds, so `HALT_BUDGET_US` is enormously generous for the
 /// working path while capping the pathological one at a fraction of a scheduler tick.
-fn wait_halt() -> u32 {
+fn wait_halt(ch: u32) -> u32 {
     let start = super::timer::systimer_us();
     loop {
-        let ci = rd(HCINT0);
+        let ci = rd(hcint_at(ch));
         if ci & HCINT_CHHLTD != 0 { return ci; }
         if super::timer::systimer_us().wrapping_sub(start) > HALT_BUDGET_US {
-            stall_dump();
+            stall_dump(ch);
             return ci | HCINT_CHHLTD; // treat as halted-without-complete -> failure
         }
     }
@@ -597,7 +636,7 @@ fn flush_dcache(addr: u32, len: u32) {
 /// the data itself. Retries on NAK / transaction-error up to `tries` times; STALL or exhausted retries is
 /// a hard failure. `tries == 1` (no backoff) is the fast path for polling an endpoint that legitimately
 /// NAKs when idle (a bulk IN with no frame queued), so an empty poll returns immediately.
-fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u32, tries: u32) -> bool {
+fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u32, tries: u32) -> bool {
     let hcsplt = hcsplt_for_current();
     if hcsplt != 0 {
         // SPLIT path, ONE low/full-speed packet per split transaction. The DWC2 does not auto-continue a
@@ -613,7 +652,7 @@ fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u
             let chunk = (len - off).min(mps);
             let mut ok = false;
             for attempt in 0..tries {
-                let ci = split_txn(dir_in, cur_pid, chunk, buf_phys + off, ep, ep_type, hcsplt, false);
+                let ci = split_txn(ch, dir_in, cur_pid, chunk, buf_phys + off, ep, ep_type, hcsplt, false);
                 if ci & HCINT_XFERCOMPL != 0 { ok = true; break; }
                 if ci & (1 << 3) != 0 { return false; }     // STALL - hard failure
                 if attempt + 1 < tries { spin(5_000); }     // NAK / XactErr - brief backoff, then retry
@@ -630,11 +669,11 @@ fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u
     }
     // DIRECT (high-speed) path: the core handles multi-packet framing + the data toggle itself.
     for attempt in 0..tries {
-        chan_program(dir_in, pid, len, buf_phys, ep, ep_type, 0);
-        let ci = wait_halt();
+        chan_program(ch, dir_in, pid, len, buf_phys, ep, ep_type, 0);
+        let ci = wait_halt(ch);
         if ci & HCINT_XFERCOMPL != 0 {
             // The core advances HCTSIZ.PID [30:29] to the next data PID (parity- and ZLP-correct); bulk_xfer reads it.
-            NEXT_BULK_PID_DATA1.store((rd(HCTSIZ0) >> 29) & 0x3 == PID_DATA1, Ordering::Relaxed);
+            NEXT_BULK_PID_DATA1.store((rd(hctsiz_at(ch)) >> 29) & 0x3 == PID_DATA1, Ordering::Relaxed);
             return true;
         }
         if ci & (1 << 3) != 0 { return false; }         // STALL - hard failure
@@ -648,12 +687,12 @@ fn chan_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u
 /// until the hub returns the result (NYET/NAK = "not ready yet", retry). Returns the final HCINT. `bounded`
 /// picks the tight ISR wait (the keyboard poll) over the generous one-shot enumeration wait. HCINT bits used:
 /// XferCompl0, STALL3, NAK4, ACK5, NYET6.
-fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32, bounded: bool) -> u32 {
+fn split_txn(ch: u32, dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32, bounded: bool) -> u32 {
     // The keyboard interrupt IN (bounded = the ISR poll) is a PERIODIC split - frame-scheduled with an
     // ACK-required start-split (Circle). The enumeration control/bulk splits (not bounded) use the
     // microframe-sweep loop below, which brute-forces a landing microframe for a non-periodic split.
     if bounded {
-        return split_txn_periodic(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt);
+        return split_txn_periodic(ch, dir_in, pid, len, buf_phys, ep, ep_type, hcsplt);
     }
     let mut last = 0u32;
     // A split transaction that transaction-errors is retried whole (USB 2.0 11.17.5 / 11.20). The hub's
@@ -666,8 +705,8 @@ fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: 
         wait_for_uframe((attempt % 8) as u32);
         // STATE 1 - issue the Start-Split (CompleteSplit = 0); capture the microframe it goes out in.
         let hf0 = rd(HFNUM);
-        chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt);
-        let ss = wait_halt();
+        chan_program(ch, dir_in, pid, len, buf_phys, ep, ep_type, hcsplt);
+        let ss = wait_halt(ch);
         trace_split(PH_SSPLIT, hf0, rd(HFNUM), ss);
         last = ss;
         if ss & (1 << 3) != 0 { break; }                        // STALL - real failure
@@ -677,8 +716,8 @@ fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: 
         let mut nyet = 0u32;
         loop {
             let hf1 = rd(HFNUM);
-            chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt | (1 << 16));
-            let cs = wait_halt();
+            chan_program(ch, dir_in, pid, len, buf_phys, ep, ep_type, hcsplt | (1 << 16));
+            let cs = wait_halt(ch);
             trace_split(PH_CSPLIT, hf1, rd(HFNUM), cs);
             last = cs;
             if cs & HCINT_XFERCOMPL != 0 { return cs; }         // the transfer completed
@@ -697,7 +736,7 @@ fn split_txn(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: 
     if !bounded && !SPLIT_DUMPED.swap(true, Ordering::Relaxed) {
         pl011_write(b"dwc2: split fail last_hcint="); write_hex32(last);
         pl011_write(b" HCSPLT="); write_hex32(hcsplt);
-        pl011_write(b" HCCHAR="); write_hex32(rd(HCCHAR0));
+        pl011_write(b" HCCHAR="); write_hex32(rd(hcchar_at(ch)));
         pl011_write(b" GINTMSK="); write_hex32(rd(GINTMSK));
         pl011_write(b" HFIR="); write_hex32(rd(HFIR));
         pl011_write(b"\r\ndwc2: split trace [phase issue.uf -> halt.uf hcint]:\r\n");
@@ -772,13 +811,13 @@ fn wait_for_uframe(target: u32) {
 /// ONE attempt per call: the keyboard poll runs every tick, so a NYET/NAK on the start-split simply
 /// reschedules a fresh start-split next tick. Every wait is bounded (time-bounded `wait_for_uframe` +
 /// `poll_wait_halt`), so the whole poll is ~1-3 ms, well under the 10 ms scheduler tick.
-fn split_txn_periodic(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32) -> u32 {
+fn split_txn_periodic(ch: u32, dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32) -> u32 {
     let mut ssf = (rd(HFNUM).wrapping_add(1)) & 0x7;  // start-split microframe = current + 1
     if ssf == 6 { ssf = 7; }                          // skip uframe 6 (Circle WaitForFrame)
     wait_for_uframe(ssf);
     let hf0 = rd(HFNUM);
-    chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt);   // CompleteSplit = 0
-    let ss = poll_wait_halt();
+    chan_program(ch, dir_in, pid, len, buf_phys, ep, ep_type, hcsplt);   // CompleteSplit = 0
+    let ss = poll_wait_halt(ch);
     trace_split(PH_SSPLIT, hf0, rd(HFNUM), ss);
     if ss & (1 << 3) != 0 { return ss; }                             // STALL
     if ss & HCINT_XFERCOMPL != 0 { return ss; }                      // (rare) already complete
@@ -789,8 +828,8 @@ fn split_txn_periodic(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, 
     for _ in 0..3 {
         wait_for_uframe(csf);
         let hf1 = rd(HFNUM);
-        chan_program(dir_in, pid, len, buf_phys, ep, ep_type, hcsplt | (1 << 16)); // CompleteSplit = 1
-        let cs = poll_wait_halt();
+        chan_program(ch, dir_in, pid, len, buf_phys, ep, ep_type, hcsplt | (1 << 16)); // CompleteSplit = 1
+        let cs = poll_wait_halt(ch);
         trace_split(PH_CSPLIT, hf1, rd(HFNUM), cs);
         last = cs;
         if cs & HCINT_XFERCOMPL != 0 { return cs; }                 // data arrived - the report
@@ -803,13 +842,17 @@ fn split_txn_periodic(dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, 
 }
 
 /// A single control-endpoint DMA transaction (ep 0, type control). Thin wrapper so ctrl_xfer reads clean.
-fn ctrl_dma(dir_in: bool, pid: u32, buf_phys: u32, len: u32) -> bool {
-    chan_dma(dir_in, pid, buf_phys, len, 0, 0, 3)
+fn ctrl_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32) -> bool {
+    chan_dma(ch, dir_in, pid, buf_phys, len, 0, 0, 3)
 }
 
 /// A full control transfer via DMA: SETUP -> (DATA) -> STATUS, through the `DMA` scratch buffer. `data_in`
 /// / `dlen` describe the DATA stage; the STATUS stage runs in the opposite direction with zero length.
 fn ctrl_xfer(setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize) -> bool {
+    // Control traffic (enumeration, SET_ADDRESS, clear-halt) belongs to the bulk stream: it runs in
+    // boot or syscall context, never from the timer ISR, so it shares CH_BULK with storage rather than
+    // competing with the keyboard's periodic poll.
+    let ch = CH_BULK;
     // SAFETY: DMA is a static touched only here on core 0; `addr_of` yields its identity-mapped physical
     // address. The buffer is filled + cache-flushed while no channel is running, so the DMA engine never
     // reads a half-written buffer.
@@ -820,7 +863,7 @@ fn ctrl_xfer(setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize) -> bo
 
         d.setup[..8].copy_from_slice(setup);
         flush_dcache(setup_phys, 8);
-        if !ctrl_dma(false, PID_SETUP, setup_phys, 8) { pl011_write(b"dwc2: SETUP failed\r\n"); return false; }
+        if !ctrl_dma(ch, false, PID_SETUP, setup_phys, 8) { pl011_write(b"dwc2: SETUP failed\r\n"); return false; }
 
         if dlen > 0 {
             if data_in {
@@ -828,7 +871,7 @@ fn ctrl_xfer(setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize) -> bo
                 // the copy-out). All current callers pass dlen <= ~160, but defend the buffer regardless.
                 let want = dlen.min(d.data.len());
                 flush_dcache(data_phys, want as u32); // invalidate the line before the device writes it
-                if !ctrl_dma(true, PID_DATA1, data_phys, want as u32) { pl011_write(b"dwc2: DATA failed\r\n"); return false; }
+                if !ctrl_dma(ch, true, PID_DATA1, data_phys, want as u32) { pl011_write(b"dwc2: DATA failed\r\n"); return false; }
                 flush_dcache(data_phys, want as u32); // invalidate after -> the CPU reads device-written bytes
                 let n = want.min(data.len());
                 data[..n].copy_from_slice(&d.data[..n]);
@@ -838,16 +881,16 @@ fn ctrl_xfer(setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize) -> bo
                 let n = dlen.min(d.data.len()).min(data.len());
                 d.data[..n].copy_from_slice(&data[..n]);
                 flush_dcache(data_phys, n as u32);
-                if !ctrl_dma(false, PID_DATA1, data_phys, n as u32) { pl011_write(b"dwc2: DATA failed\r\n"); return false; }
+                if !ctrl_dma(ch, false, PID_DATA1, data_phys, n as u32) { pl011_write(b"dwc2: DATA failed\r\n"); return false; }
             }
         }
 
         // STATUS: opposite direction, zero length, DATA1 (uses the setup buffer as a dummy DMA target).
         let ok = if data_in {
-            ctrl_dma(false, PID_DATA1, setup_phys, 0)
+            ctrl_dma(ch, false, PID_DATA1, setup_phys, 0)
         } else {
             flush_dcache(data_phys, 4);
-            ctrl_dma(true, PID_DATA1, data_phys, 0)
+            ctrl_dma(ch, true, PID_DATA1, data_phys, 0)
         };
         if !ok { pl011_write(b"dwc2: STATUS failed\r\n"); return false; }
     }
@@ -929,6 +972,7 @@ fn enumerate_sync() {
 /// Walk the hub at address 1: configure it, power every port, then for each connected port reset it and
 /// enumerate the downstream device, stopping at the first keyboard. Every wait is bounded.
 fn enumerate_hub(protocol: u8) {
+    let ch = CH_BULK;
     let hub_mps = MPS0.load(Ordering::Relaxed);          // hub EP0 max-packet (set during root enumeration)
     if !control_out(0x00, 0x09, 1, 0) { pl011_write(b"dwc2: hub SET_CONFIG failed\r\n"); return; }
     // A MULTI-TT hub (bDeviceProtocol 2) needs SET_INTERFACE(alt 1) to activate its per-port transaction
@@ -1355,7 +1399,7 @@ pub fn net_frame_tx(frame: &[u8]) -> bool {
         buf[..n].copy_from_slice(&frame[..n]);                 // CDC-ECM: raw frame
         n
     };
-    if bulk_xfer(false, ep_out, &mut buf, total, 3) < 0 { return false; }
+    if bulk_xfer(CH_NET, false, ep_out, &mut buf, total, 3) < 0 { return false; }
     // CDC-ECM delimits a datagram with a short packet; a frame that is an exact multiple of the bulk max
     // packet size needs a trailing zero-length packet, or the device won't see the frame boundary. (smsc95xx
     // carries an explicit length in its TX command, so it needs no ZLP.)
@@ -1363,7 +1407,7 @@ pub fn net_frame_tx(frame: &[u8]) -> bool {
         let mps = BULK_MPS.load(Ordering::Relaxed) as usize;
         if total != 0 && mps != 0 && total % mps == 0 {
             let mut zlp = [0u8; 1];
-            let _ = bulk_xfer(false, ep_out, &mut zlp, 0, 3);
+            let _ = bulk_xfer(CH_NET, false, ep_out, &mut zlp, 0, 3);
         }
     }
     true
@@ -1383,7 +1427,7 @@ pub fn net_frame_rx(dst: &mut [u8]) -> usize {
         // smsc95xx prefixes each frame with a 4-byte RX status word: bit 15 = error summary, bits[30:16] =
         // frame length (INCLUDING the 4-byte FCS, which we strip). The frame follows the status word.
         let mut buf = [0u8; NET_FRAME_MAX + 4];
-        let got = bulk_xfer(true, ep_in, &mut buf, NET_FRAME_MAX + 4, 1);
+        let got = bulk_xfer(CH_NET, true, ep_in, &mut buf, NET_FRAME_MAX + 4, 1);
         if got < 4 { return 0; }
         let status = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if status & 0x0000_8000 != 0 { return 0; }             // RX error summary - drop
@@ -1395,7 +1439,7 @@ pub fn net_frame_rx(dst: &mut [u8]) -> usize {
         m
     } else {
         let cap = dst.len().min(NET_FRAME_MAX);                 // CDC-ECM: raw frame, no header
-        let got = bulk_xfer(true, ep_in, dst, cap, 1);
+        let got = bulk_xfer(CH_NET, true, ep_in, dst, cap, 1);
         if got > 0 { got as usize } else { 0 }
     }
 }
@@ -1482,7 +1526,7 @@ static BULK_MPS:        AtomicU16  = AtomicU16::new(64);  // bulk endpoint max-p
 /// non-coherent DMA. Uses the bulk endpoint's max-packet (`BULK_MPS`) for the packet count and maintains
 /// the per-direction data toggle. Returns the number of bytes transferred (for IN, the device may send a
 /// short packet, so this can be < `len`), or -1 on failure / no data.
-fn bulk_xfer(dir_in: bool, ep: u32, data: &mut [u8], len: usize, tries: u32) -> i32 {
+fn bulk_xfer(ch: u32, dir_in: bool, ep: u32, data: &mut [u8], len: usize, tries: u32) -> i32 {
     MPS0.store(BULK_MPS.load(Ordering::Relaxed), Ordering::Relaxed); // chan_program uses MPS0 for pktcnt
     let toggle = if dir_in { &BULK_TOGGLE_IN } else { &BULK_TOGGLE_OUT };
     let pid = if toggle.load(Ordering::Relaxed) { PID_DATA1 } else { PID_DATA0 };
@@ -1493,11 +1537,11 @@ fn bulk_xfer(dir_in: bool, ep: u32, data: &mut [u8], len: usize, tries: u32) -> 
         let n = len.min(d.data.len());
         if dir_in {
             flush_dcache(data_phys, n as u32);                     // invalidate before the device writes
-            if !chan_dma(true, pid, data_phys, n as u32, ep, 2, tries) { -1i32 }
+            if !chan_dma(ch, true, pid, data_phys, n as u32, ep, 2, tries) { -1i32 }
             else {
                 flush_dcache(data_phys, n as u32);                 // invalidate after -> read device bytes
                 // HCTSIZ.xfersize counts DOWN as bytes arrive, so received = requested - remaining.
-                let remaining = (rd(HCTSIZ0) & 0x7_FFFF) as usize;
+                let remaining = (rd(hctsiz_at(ch)) & 0x7_FFFF) as usize;
                 let recv = n.saturating_sub(remaining);
                 let m = recv.min(data.len());
                 data[..m].copy_from_slice(&d.data[..m]);
@@ -1513,7 +1557,7 @@ fn bulk_xfer(dir_in: bool, ep: u32, data: &mut [u8], len: usize, tries: u32) -> 
             let m = n.min(data.len());
             d.data[..m].copy_from_slice(&data[..m]);
             flush_dcache(data_phys, m as u32);
-            if chan_dma(false, pid, data_phys, m as u32, ep, 2, tries) { m as i32 } else { -1i32 }
+            if chan_dma(ch, false, pid, data_phys, m as u32, ep, 2, tries) { m as i32 } else { -1i32 }
         }
     };
     // Advance the endpoint data toggle to the parity-correct next PID that chan_dma computed (from the actual
@@ -1710,7 +1754,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     let n = cdb.len().min(16);
     cbw[15..15 + n].copy_from_slice(&cdb[..n]);
 
-    if bulk_xfer(false, ep_out, &mut cbw, 31, BOT_TRIES) < 0 {
+    if bulk_xfer(CH_BULK, false, ep_out, &mut cbw, 31, BOT_TRIES) < 0 {
         pl011_write(b"dwc2: bot CBW-out failed\r\n");
         recover_or_revive(ep_in, ep_out);
         return false;
@@ -1719,7 +1763,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     // residue against it rather than trusting a "passed" verdict on a transfer that fell short.
     let mut moved = 0usize;
     if dlen > 0 {
-        let n = bulk_xfer(data_in, if data_in { ep_in } else { ep_out }, data, dlen, BOT_TRIES);
+        let n = bulk_xfer(CH_BULK, data_in, if data_in { ep_in } else { ep_out }, data, dlen, BOT_TRIES);
         if n < 0 {
             pl011_write(b"dwc2: bot data-stage failed\r\n");
             let _ = bot_recover(ep_in, ep_out);
@@ -1729,7 +1773,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     }
 
     let mut csw = [0u8; 13];
-    if bulk_xfer(true, ep_in, &mut csw, 13, BOT_TRIES) < 0 {
+    if bulk_xfer(CH_BULK, true, ep_in, &mut csw, 13, BOT_TRIES) < 0 {
         pl011_write(b"dwc2: bot CSW-in failed\r\n");
         recover_or_revive(ep_in, ep_out);
         return false;
@@ -1931,41 +1975,16 @@ static MSC_EP_OUT:  AtomicU8   = AtomicU8::new(0);   // bulk OUT endpoint
 static MSC_MPS:     AtomicU16  = AtomicU16::new(64); // bulk max packet size
 static MSC_SECTORS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
-/// When storage last used the shared host channel (1 MHz System Timer microseconds).
-///
-/// The DWC2 has ONE host channel, time-shared by the keyboard poll and block I/O. Individual commands
-/// do not interleave - a Bulk-Only command runs inside one syscall with interrupts masked - but `fs`
-/// issues hundreds of them, and the keyboard poll runs in the timer ISR BETWEEN them. The keyboard is a
-/// low-speed device behind the hub, so its poll is a SPLIT transaction through the hub's transaction
-/// translator, and the poll ABANDONS it when its in-ISR budget expires (which is normal and frequent -
-/// an idle keyboard NAKs). That leaves the hub's TT holding a transaction the host walked away from,
-/// and the next storage command then fails on its very first transfer.
-///
-/// Measured on hardware, and the reason this is here rather than a theory: with a keyboard attached
-/// `selfcheck` reported 83 failures and 235 USB error lines; with it unplugged, 1 failure and ZERO USB
-/// errors, same build and same disk.
-static MSC_LAST_USE_US: AtomicU32 = AtomicU32::new(0);
+/// Storage and the keyboard no longer share a host channel, so the time-based standoff that used to
+/// live here is gone. It existed because both drove channel 0: a keyboard split abandoned when its
+/// in-ISR budget expired left that channel dirty, and the next block command failed on its very first
+/// transfer. Measured at the time - keyboard attached: 83 selfcheck failures, 235 USB error lines;
+/// unplugged: 1 failure, zero errors, same build and same disk. The remedy was to keep the keyboard
+/// OFF the channel for 10 ms after every storage command: a timer standing in for isolation the
+/// hardware already provides. This controller has 8 host channels and we were using one. CH_BULK and
+/// CH_KBD are separate now, so an abandoned poll damages only its own channel and nothing takes turns.
 
-/// How long after storage touches the channel the keyboard poll stays off it.
-///
-/// It has to cover the gap BETWEEN block commands, not merely the commands themselves: `fs` verifies a
-/// CRC and walks its tree between reads, and at 2 ms the keyboard slipped into those gaps. The evidence
-/// was precise - 27 USB errors left, failing exactly the READ-HEAVY commands (`drives check`, `drives
-/// scrub`, `fcap`) while every light one passed. One scheduler tick covers the gaps and costs nothing
-/// noticeable: the standoff applies only after storage has actually run, so typing at an idle prompt is
-/// unaffected, and a skipped poll loses no keystroke because the device queues its reports.
-const MSC_CHANNEL_GUARD_US: u32 = 10_000;
 
-/// Record that storage just used the channel (see `MSC_LAST_USE_US`).
-fn msc_mark_channel_use() {
-    MSC_LAST_USE_US.store(super::timer::systimer_us(), Ordering::Relaxed);
-}
-
-/// Is storage using the shared channel right now? The keyboard poll checks this and stands off.
-fn msc_channel_busy() -> bool {
-    if !MSC_READY.load(Ordering::Acquire) { return false; }
-    super::timer::systimer_us().wrapping_sub(MSC_LAST_USE_US.load(Ordering::Relaxed)) < MSC_CHANNEL_GUARD_US
-}
 
 /// Capacity of the attached USB mass-storage device in 512-byte sectors (0 = none attached).
 pub fn msc_sectors() -> u64 {
@@ -1993,7 +2012,6 @@ pub fn msc_read_block(lba: u64, dst: &mut [u8]) -> bool {
     let cdb = [0x28u8, 0, (l >> 24) as u8, (l >> 16) as u8, (l >> 8) as u8, l as u8, 0, 0, 1, 0];
     let ok = bot_command(MSC_EP_IN.load(Ordering::Relaxed) as u32, MSC_EP_OUT.load(Ordering::Relaxed) as u32,
                          &cdb, true, &mut dst[..512], 512);
-    msc_mark_channel_use();
     ok
 }
 
@@ -2072,7 +2090,6 @@ pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
         buf.copy_from_slice(&src[..512]);
         ok = bot_command(ep_in, ep_out, &cdb(false), false, &mut buf, 512);
     }
-    msc_mark_channel_use();
     ok
 }
 
@@ -2120,7 +2137,6 @@ pub fn msc_sync_cache() -> bool {
     let ok = bot_command(MSC_EP_IN.load(Ordering::Relaxed) as u32, MSC_EP_OUT.load(Ordering::Relaxed) as u32,
                          &cdb, false, &mut none, 0);
     BOT_PROBE.store(false, Ordering::Relaxed);
-    msc_mark_channel_use();
     if !ok {
         MSC_NO_FLUSH.store(true, Ordering::Relaxed);
         pl011_write(b"dwc2: device does not support SYNCHRONIZE CACHE - writes cannot be confirmed durable\r\n");
@@ -2153,13 +2169,16 @@ static mut KBD_STATE: KbdState =
 /// Called from the Core-0 timer tick. Once a keyboard is configured, run one interrupt IN transaction; on
 /// a completed transfer decode the boot report into console bytes. A NAK (no key change) returns quietly.
 pub fn poll() {
+    // The keyboard's periodic poll gets its OWN channel. It is the one transfer deliberately abandoned
+    // when its in-ISR budget expires, and on a shared channel that abandonment was inherited by
+    // whatever ran next.
+    let ch = CH_KBD;
     if !KBD_READY.load(Ordering::Acquire) { return; }
     // Stand off the shared host channel while storage is using it (see `MSC_LAST_USE_US`). Polling an
     // idle keyboard means starting a SPLIT through the hub's transaction translator and abandoning it
     // when the in-ISR budget expires - harmless on its own, but it leaves the TT holding a transaction
     // and the next block command fails on its first transfer. A skipped poll costs nothing: the device
     // queues its reports, so the keystroke arrives on the next one.
-    if msc_channel_busy() { return; }
     // Point the shared channel at the keyboard (the net device may have selected itself last).
     select_device(KBD_ADDR.load(Ordering::Relaxed), KBD_MPS.load(Ordering::Relaxed) as u16,
                   KBD_LOW.load(Ordering::Relaxed));
@@ -2176,10 +2195,10 @@ pub fn poll() {
         flush_dcache(data_phys, 8);                          // invalidate before the device writes
         let hcsplt = hcsplt_for_current();
         let ci = if hcsplt != 0 {
-            split_txn(true, pid, 8, data_phys, ep, 3, hcsplt, true) // split IN, tight ISR bound
+            split_txn(ch, true, pid, 8, data_phys, ep, 3, hcsplt, true) // split IN, tight ISR bound
         } else {
-            chan_program(true, pid, 8, data_phys, ep, 3, 0);
-            poll_wait_halt()
+            chan_program(ch, true, pid, 8, data_phys, ep, 3, 0);
+            poll_wait_halt(ch)
         };
         // SAFETY: KBD_STATE is touched only here, only on core 0 (the single DWC2 poller); addr_of
         // avoids taking a reference to the mutable static.
