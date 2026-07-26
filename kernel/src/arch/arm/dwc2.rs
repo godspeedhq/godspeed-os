@@ -1576,6 +1576,9 @@ fn bot_recover(ep_in: u32, ep_out: u32) -> bool {
 static MSC_EP0_MPS: AtomicU16 = AtomicU16::new(64);
 
 
+/// Set while a command we are ALLOWED to be refused is in flight (see the CSW-bad branch).
+static BOT_PROBE: AtomicBool = AtomicBool::new(false);
+
 /// How many times a vanished device may be revived per boot, and whether a revival is already running.
 static MSC_REVIVE_TRIES: AtomicU32 = AtomicU32::new(0);
 static MSC_REVIVING: AtomicBool = AtomicBool::new(false);
@@ -1679,6 +1682,11 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
         // The transfers all succeeded but the device's verdict did not: report WHAT it said. Signature
         // wrong = we are out of sync with the device's framing; status 1 = the SCSI command itself
         // failed; a nonzero residue says how many bytes of the data stage it did NOT deliver.
+        // A PROBE is a command we are allowed to be told "no" to - today, SYNCHRONIZE CACHE on a
+        // device that does not implement it. That is a fact about the device, not an anomaly, and
+        // dumping six registers for it put a wall of hex in front of the operator's first `ls`. The
+        // conclusion is still reported (once, by the caller); only the post-mortem is suppressed.
+        if !BOT_PROBE.load(Ordering::Relaxed) {
         pl011_write(b"dwc2: bot CSW bad - sig="); write_hex32(sig);
         pl011_write(b" tag="); write_hex32(tag);
         pl011_write(b" residue="); write_hex32(residue);
@@ -1689,6 +1697,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
         // reset. Status 1 is the device cleanly REFUSING this command (a power-on UNIT ATTENTION, a
         // bad LBA) - the endpoints are fine, so clearing halts there is pointless control traffic that
         // only risks upsetting a healthy device.
+        }
         if sig != 0x5342_5355 || tag != 0x1234_5678 || csw[12] >= 2 {
             bot_recover(ep_in, ep_out);
         }
@@ -1750,6 +1759,12 @@ fn probe_mass_storage() -> bool {
 
     // Clear the power-on UNIT ATTENTION: a freshly-attached device rejects its first command with CHECK
     // CONDITION until its sense data is drained. Loop TEST UNIT READY / REQUEST SENSE a bounded few times.
+    //
+    // Marked a PROBE, because being refused here is the expected path, not a fault. Without that this
+    // printed a six-register CSW post-mortem on every single boot - a normal protocol handshake dressed
+    // up as an anomaly. Noise like that is not free: it teaches a reader that a `CSW bad` line is
+    // background, which is exactly the wrong lesson the day one means something.
+    BOT_PROBE.store(true, Ordering::Relaxed);
     let ei = ep_in as u32;
     let eo = ep_out as u32;
     for _ in 0..8 {
@@ -1761,6 +1776,7 @@ fn probe_mass_storage() -> bool {
     // READ CAPACITY(10): 8-byte reply = last LBA (BE) + block size (BE).
     let cap_cdb = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let mut cap = [0u8; 8];
+    BOT_PROBE.store(false, Ordering::Relaxed);
     if !bot_command(ep_in as u32, ep_out as u32, &cap_cdb, true, &mut cap, 8) {
         pl011_write(b"dwc2: msc READ CAPACITY failed\r\n"); return true;
     }
@@ -1802,6 +1818,10 @@ fn probe_mass_storage() -> bool {
     MSC_NO_FUA.store(false, Ordering::Relaxed);
     MSC_FUA_LOGGED.store(false, Ordering::Relaxed);
     MSC_READY.store(true, Ordering::Release);
+    // Settle durability HERE, at bring-up, rather than on whichever command happens to be the first
+    // metadata write. It is a property of the device, so it belongs in the boot log next to its
+    // capacity - not interleaved with an operator's `ls`, which is exactly where it was landing.
+    let _ = msc_sync_cache();
     pl011_write(b"dwc2: mass storage READY - ");
     super::timer::write_dec_pub(((last_lba as u64 + 1) / 2048) as u32);
     pl011_write(b" MiB, serving block I/O\r\n");
@@ -2004,8 +2024,10 @@ pub fn msc_sync_cache() -> bool {
     // SYNCHRONIZE CACHE (10): opcode 0x35; LBA 0 + length 0 means "the whole medium".
     let cdb = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let mut none = [0u8; 0];
+    BOT_PROBE.store(true, Ordering::Relaxed);
     let ok = bot_command(MSC_EP_IN.load(Ordering::Relaxed) as u32, MSC_EP_OUT.load(Ordering::Relaxed) as u32,
                          &cdb, false, &mut none, 0);
+    BOT_PROBE.store(false, Ordering::Relaxed);
     msc_mark_channel_use();
     if !ok {
         MSC_NO_FLUSH.store(true, Ordering::Relaxed);

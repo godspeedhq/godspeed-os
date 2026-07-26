@@ -384,6 +384,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         "fs: mounted GSFS0008 ({} blocks, bitmap {}..{}, root@{}, {} free)",
                         f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
                     ));
+                    // Establish durability AT MOUNT, so the warning (if any) sits in the boot log
+                    // beside the mount line. It was previously emitted by the first transaction to
+                    // ask, which on a fresh prompt is the shell recording its history - so an
+                    // operator's first `ls` answered with two lines about journal ordering before it
+                    // answered with the directory. The fact is about the medium, not the command.
+                    if !f.durable_or_warn(&ctx) { f.checkpoint_warned.set(true); }
                     mounted = Some(f);
                     break;
                 }
@@ -1303,7 +1309,7 @@ impl Fs {
         if block_flush(ctx) { return true; }
         if !self.flush_warned.get() {
             self.flush_warned.set(true);
-            ctx.log("fs: WARNING - the drive refuses cache flushes, so journal write ordering is NOT enforced on this medium. Metadata is still CRC-checked, but a power loss may leave it torn.");
+            ctx.log("fs: durability NOT attested by this drive - it accepts no cache flush, so journal write ordering is unenforced and a power loss may leave metadata torn. Metadata stays CRC-checked, so damage is detected on read; what is missing is automatic repair. See CLAUDE.md 6.1 (2026-07-25).");
         }
         false
     }
@@ -1380,14 +1386,10 @@ impl Fs {
         // redo record: precisely the corruption this barrier exists to prevent, performed by the
         // barrier itself.
         if !self.durable_or_warn(ctx) {
-            // Report ONCE per mount. On a drive that cannot flush at all this is true of every
-            // transaction, and 50 identical lines in one selfcheck is the CRC-spam mistake again -
-            // loud without being useful. `durable_or_warn` has already said, once, that ordering is
-            // unenforced on this medium; this line adds only which step noticed.
-            if !self.checkpoint_warned.get() {
-                self.checkpoint_warned.set(true);
-                ctx.log("fs: checkpoint not confirmed durable - journal left INTACT, replays next mount (data safe)");
-            }
+            // Silent BY DESIGN. Mount has already stated, once, that this medium attests no
+            // durability; repeating it per transaction added no fact, only volume - and on a drive
+            // that never flushes it fired on every commit (50 lines in one run). Keeping the journal
+            // is the right BEHAVIOUR here and it still happens; it just no longer narrates itself.
             return Ok(());
         }
         // 4. Invalidate the journal. The checkpoint above already landed every block home, so a
