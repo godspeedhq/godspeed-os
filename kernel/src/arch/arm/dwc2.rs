@@ -1627,24 +1627,32 @@ fn recover_or_revive(ep_in: u32, ep_out: u32) {
     MSC_REVIVE_TRIES.store(tries + 1, Ordering::Relaxed);
     pl011_write(b"dwc2: device stopped answering EP0 - port reset + re-enumerate, attempt ");
     super::timer::write_dec_pub(tries + 1);
-    pl011_write(b" of 3
-
-");
-    // Stop serving while the bus is rebuilt: `probe_mass_storage` sets MSC_READY again on success, so
-    // a failed revival leaves storage cleanly "no device" rather than looping on a corpse.
+    pl011_write(b" of 3\r\n");
+    // Stop serving only WHILE the bus is rebuilt, so nothing issues commands mid-reset.
     MSC_READY.store(false, Ordering::Release);
     reset_port();
     enumerate_sync();
     MSC_REVIVING.store(false, Ordering::Relaxed);
     if MSC_READY.load(Ordering::Acquire) {
-        pl011_write(b"dwc2: device came back - storage restored
-
-");
-    } else {
-        pl011_write(b"dwc2: device did not come back - storage unavailable (loud, not silent)
-
-");
+        pl011_write(b"dwc2: device came back - storage restored\r\n");
+        return;
     }
+    // The revival did not take. RESTORE the serving flag anyway - do NOT leave storage switched off.
+    //
+    // Clearing it permanently was meant to stop the driver "looping on a corpse". What it actually did
+    // was end the boot: every `msc_*` entry point returns early on `!MSC_READY`, so no command ever
+    // reaches `bot_command`, so `recover_or_revive` is never called again - which makes the 3-attempt
+    // budget unreachable and the FIRST failed attempt final. Measured: one failed revival, then 126
+    // lost block operations and 84 test failures, where the previous retry-forever behaviour had
+    // recovered on its own more than once.
+    //
+    // Retrying a dead device costs bounded, loud failures. Refusing to retry costs the machine's
+    // storage until reboot. That is not a close call - and it is the second time on this branch that a
+    // recovery path did more damage than the fault it was written for.
+    MSC_READY.store(true, Ordering::Release);
+    pl011_write(b"dwc2: device did not come back - still retrying commands (revival attempt ");
+    super::timer::write_dec_pub(tries + 1);
+    pl011_write(b" of 3 spent)\r\n");
 }
 
 /// Run one SCSI command via BOT. `cdb` is the SCSI command block; `data`/`dlen` is the data stage
