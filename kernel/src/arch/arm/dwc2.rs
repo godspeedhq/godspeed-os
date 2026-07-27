@@ -2289,14 +2289,36 @@ pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
         pl011_write(b"dwc2: device accepted FUA writes - each write reported durable on completion\r\n");
     }
     if !ok && fua {
-        // The write failed while carrying FUA. It may be the bit the device objected to, or it may be
-        // an unrelated transport error - we cannot tell from a CSW status alone, so assume the former
-        // ONCE and retry plain. Getting this wrong costs durability on a device that would have taken
-        // the bit; getting the alternative wrong costs the ability to write at all, which is worse.
-        MSC_NO_FUA.store(true, Ordering::Relaxed);
-        pl011_write(b"dwc2: device rejected a FUA write - falling back to plain writes (not durable on ack)\r\n");
-        buf.copy_from_slice(&src[..512]);
-        ok = bot_command(ep_in, ep_out, &cdb(false), false, &mut buf, 512);
+        // A failed FUA write is NOT evidence the device rejects the bit - and assuming it was cost the
+        // machine its durability. The first version latched `MSC_NO_FUA` on ANY failure here, with a
+        // comment admitting "we cannot tell from a CSW status alone"; hardware then showed the latch
+        // flipping at the exact onset of a busy-stuck episode (`busy with no pause for 200` on the very
+        // next log line). The device had never objected to FUA - a transport wobble was misread as a
+        // rejection, durability silently downgraded to plain writes, and the NEXT revival's port reset
+        // lost the buffered root record: the precise corruption FUA had just been enabled to prevent.
+        // The same shape as every regression this branch has recorded: a capability withheld on an
+        // assumption instead of a verdict.
+        //
+        // We CAN tell - by asking. Two verdicts, each from evidence:
+        // - BUSY: flow control, nothing to diagnose. Return busy; the caller re-asks, FUA stays on.
+        // - Otherwise, REQUEST SENSE: the device's own stated reason for the CHECK CONDITION. Sense
+        //   key 5 (ILLEGAL REQUEST) is "I do not take that CDB" - THAT is a FUA rejection, and only
+        //   that latches the plain-write fallback (loudly: the machine changes durability regime).
+        //   Any other sense key is an ordinary I/O problem on a FUA-capable device: report the
+        //   failure, let the normal retry/recovery machinery act, and keep FUA armed. This is the
+        //   discrimination Linux's usb-storage makes (auto-sense, then a decision keyed on what the
+        //   device SAID), reimplemented for this driver.
+        if msc_last_was_busy() { return false; }
+        let mut sense = [0u8; 18];
+        let sensed = bot_command(ep_in, ep_out, &[0x03, 0, 0, 0, 18, 0], true, &mut sense, 18);
+        if sensed && (sense[2] & 0x0F) == 0x05 {
+            MSC_NO_FUA.store(true, Ordering::Relaxed);
+            pl011_write(b"dwc2: device rejected FUA (ILLEGAL REQUEST) - falling back to plain writes (not durable on ack)\r\n");
+            buf.copy_from_slice(&src[..512]);
+            ok = bot_command(ep_in, ep_out, &cdb(false), false, &mut buf, 512);
+        }
+        // Sense unavailable or a non-ILLEGAL key: a real I/O failure, already reported by bot_command's
+        // own paths. FUA stays on; the retry that follows recovery re-asks with the bit set.
     }
     ok
 }
