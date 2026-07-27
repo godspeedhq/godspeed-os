@@ -66,6 +66,34 @@ impl MessageQueue {
         self.len
     }
 
+    /// Dequeue the oldest message whose `sender_ep` matches, leaving every other message queued in
+    /// FIFO order. `None` if no queued message matches.
+    ///
+    /// This is the primitive behind reply correlation in `Call` (§8.2): the caller's own endpoint
+    /// receives BOTH unrelated client requests and the awaited reply, and taking the plain queue head
+    /// handed a blocked `Call` whichever arrived first - observed on hardware as `fs` receiving a
+    /// shell request as its block-driver read "reply", then every later reply off-by-one (the
+    /// "MALFORMED reply / protocol desync" line), including the undetectable case where a stale
+    /// 513-byte read-reply was accepted as a different block's data. Bounded: one pass over at most
+    /// `QUEUE_DEPTH` (16) slots; the compaction shift preserves arrival order for the untouched rest.
+    pub fn dequeue_matching(&mut self, sender_ep: u64) -> Option<Message> {
+        for i in 0..self.len {
+            let idx = (self.head + i) % QUEUE_DEPTH;
+            let matches = self.slots[idx].as_ref().is_some_and(|m| m.sender_ep == sender_ep);
+            if !matches { continue; }
+            let msg = self.slots[idx].take();
+            // Close the gap: shift every later message back one slot, keeping FIFO order.
+            for j in i..self.len - 1 {
+                let from = (self.head + j + 1) % QUEUE_DEPTH;
+                let to   = (self.head + j) % QUEUE_DEPTH;
+                self.slots[to] = self.slots[from].take();
+            }
+            self.len -= 1;
+            return msg;
+        }
+        None
+    }
+
     /// Drain all messages without delivering them (called on endpoint death - §8.6).
     pub fn drain(&mut self) {
         while self.dequeue().is_some() {}

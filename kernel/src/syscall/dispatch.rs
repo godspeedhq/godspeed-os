@@ -550,7 +550,14 @@ fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
         Some(b) => b,
         None    => return Err(-1),
     };
-    Message::new(bytes).map_err(|e| ipc_err_to_i64(e))
+    let mut msg = Message::new(bytes).map_err(|e| ipc_err_to_i64(e))?;
+    // Stamp the sender's primary endpoint (kernel-set, unforgeable by userspace - the payload cannot
+    // influence it). Every user send path funnels through here, so a blocked `Call` can correlate its
+    // reply by WHO sent it (`call_dequeue`), instead of trusting queue arrival order - which handed a
+    // caller whatever message reached its queue first and desynced fs's reply stream on hardware.
+    // A task with no endpoint stamps 0, which matches no target.
+    msg.sender_ep = scheduler::current_task_endpoint().map(|e| e.0).unwrap_or(0);
+    Ok(msg)
 }
 
 // ---------------------------------------------------------------------------
