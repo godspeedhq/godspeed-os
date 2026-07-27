@@ -381,7 +381,14 @@ impl PageTable {
 /// # Safety
 /// `pt_root` must be a service L1 (16 KiB aligned) built by `PageTable::new`, not yet in use.
 pub unsafe fn fill_kernel_identity(pt_root: u32) {
-    let active = (read_page_table_base() as u32) & 0xFFFF_C000;
+    // Copy from the kernel's OWN boot L1, never from the active root. The active root is the
+    // spawner's (or, on a kernel-driven respawn, possibly a DEAD task's): copying it gave the child
+    // the spawner's PL0 user entries - which the child's reclaim later freed out from under the LIVE
+    // spawner (the supervisor-corruption death loop) - and could inherit dangling L2 pointers from a
+    // reclaimed space. The kernel L1 holds only kernel sections + kernel-owned L2s, and cannot die.
+    // (See `mmu::kernel_l1_root`.) It also restores invariant 2: a child no longer sees one byte of
+    // its spawner's memory.
+    let active = super::mmu::kernel_l1_root() & 0xFFFF_C000;
     // SAFETY: both L1s are identity-mapped RAM. For each 1 MiB slot:
     //  - service slot empty  -> copy the kernel's section wholesale (fast, the common case).
     //  - service slot is a TABLE over a kernel SECTION -> the service mapped a *page* in this 1 MiB
@@ -424,7 +431,12 @@ pub unsafe fn fill_kernel_identity(pt_root: u32) {
                 for j in 0..256 {
                     if dl2.add(j).read_volatile() == 0 {
                         let sp = sl2.add(j).read_volatile();
-                        if sp != 0 { dl2.add(j).write_volatile(sp); }
+                        // Copy only PRIVILEGED entries (AP[1:0] == 0b01). With the kernel L1 as the
+                        // source this is a no-op filter (kernel pages are all privileged) - it exists
+                        // so no PL0 entry can EVER be copied into this child-owned L2, because the
+                        // child's reclaim frees PL0 entries in owned L2s as its own. A copied user
+                        // page here is a frame the child would free out from under its real owner.
+                        if sp != 0 && (sp >> 4) & 0b11 == 0b01 { dl2.add(j).write_volatile(sp); }
                     }
                 }
                 clean_dcache(dl2 as u32, 1024);

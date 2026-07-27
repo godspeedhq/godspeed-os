@@ -30,6 +30,21 @@ struct L1Table([u32; 4096]);
 
 static mut L1: L1Table = L1Table([0; 4096]);
 
+/// The kernel's own boot L1 - the canonical CLEAN source for a new service's kernel-identity copy.
+///
+/// `fill_kernel_identity` used to copy from the ACTIVE root (`read_page_table_base`), i.e. from
+/// whatever address space happened to be loaded when the spawn ran - usually the SPAWNER's. That
+/// inherited two things a child must never have: the spawner's PL0 (user) page entries, which the
+/// child's later `reclaim_user_frames` would treat as its own and FREE OUT FROM UNDER THE LIVE
+/// SPAWNER (the supervisor-corruption death loop - a dead nic-driver's reclaim freed the running
+/// supervisor's binary frames, and the next spawn wrote a fresh ELF over them); and, when the active
+/// root belonged to a task ALREADY DEAD (the kernel respawning the supervisor from a death
+/// notification), pointers to freed L2 tables - a child born with dangling translations that faults
+/// on first touch. This L1 has neither: kernel sections and kernel-owned L2s only, and it cannot die.
+pub fn kernel_l1_root() -> u32 {
+    core::ptr::addr_of!(L1) as u32
+}
+
 /// Usable RAM end, learned from the firmware's device tree at boot (`dtb.rs`).
 ///
 /// This used to be a hardcoded constant copied from what the firmware told Linux, with a comment
