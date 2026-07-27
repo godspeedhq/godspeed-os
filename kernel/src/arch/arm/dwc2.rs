@@ -1702,16 +1702,28 @@ fn bot_recover(ep_in: u32, ep_out: u32) -> bool {
     // rest of a transfer we had abandoned, and every following command failed. Interface 0 (this
     // driver binds the first mass-storage interface; `probe_mass_storage` does not look past it).
     let reset_ok = control_out(0x21, 0xFF, 0x0000, 0);
+    let reset_fail = last_fail_str();       // capture before the next transfer overwrites it
     let in_ok  = control_out(0x02, 0x01, 0x0000, (ep_in | 0x80) as u16); // CLEAR_FEATURE(ENDPOINT_HALT)
+    let in_fail = last_fail_str();
     let out_ok = control_out(0x02, 0x01, 0x0000, ep_out as u16);
+    let out_fail = last_fail_str();
     BULK_TOGGLE_IN.store(false, Ordering::Relaxed);
     BULK_TOGGLE_OUT.store(false, Ordering::Relaxed);
     msc_select();
     // A recovery that itself failed is still a failure, and saying so is the whole point (§26.7).
     // These results used to be discarded with `let _ =`, so a recovery that achieved nothing looked
-    // exactly like one that worked - and the caller went on to fail forever with no idea why.
+    // exactly like one that worked - and the caller went on to fail forever with no idea why. Name
+    // WHICH of the three control transfers failed and WHY (NAK-timeout = the device is busy and this
+    // is retryable; XACT/STALL = a transport wedge), because "not answering on EP0" is three different
+    // failures and they need different fixes - the whole point of the drop-off investigation.
     let ok = reset_ok && in_ok && out_ok;
-    if !ok { pl011_write(b"dwc2: bot RESET RECOVERY FAILED - device is not answering on EP0\r\n"); }
+    if !ok {
+        pl011_write(b"dwc2: bot RESET RECOVERY FAILED on EP0 - MSReset ");
+        pl011_write(if reset_ok { b"ok" } else { reset_fail.as_bytes() });
+        pl011_write(b", clr-IN "); pl011_write(if in_ok { b"ok" } else { in_fail.as_bytes() });
+        pl011_write(b", clr-OUT "); pl011_write(if out_ok { b"ok" } else { out_fail.as_bytes() });
+        pl011_write(b"\r\n");
+    }
     ok
 }
 /// The mass-storage device's endpoint-0 max packet size (see `bot_recover`).
