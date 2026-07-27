@@ -850,7 +850,15 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
             return;
         }
         OP_FLASH => {
-            if capacity == 0 { send(&[FS_ERR]); return; }
+            ctx.log_fmt(format_args!("fs: flash requested (capacity {} sectors, forced {})", capacity, forced));
+            if capacity == 0 {
+                // Named, not silent: this was one of two OP_FLASH paths that replied FS_ERR without a
+                // word, so "drives: flash FAILED (no disk, or disk too small)" was the only thing an
+                // operator saw - on hardware that was actively misleading (§26.7).
+                ctx.log("fs: flash REFUSED - block-driver reports 0 capacity (no disk, or the driver is mid-revival). Retry once storage settles.");
+                send(&[FS_ERR]);
+                return;
+            }
             // Refuse to overwrite someone else's disk unless the caller explicitly forced it. On a
             // single-storage board (the Pi) this disk is also the boot medium - see `foreign_disk`.
             // The force flag rides in the op byte's high bit so the wire format is unchanged.
@@ -1710,7 +1718,45 @@ impl Fs {
             ctx.log("fs: WARNING - the drive refused a cache flush; this format is written but NOT confirmed on the medium. If power is cut before the drive settles, it may come back unreadable.");
         }
 
-        Fs::mount(ctx)
+        // Return the filesystem BUILT FROM WHAT WE JUST WROTE, never by reading it back. `format` used
+        // to end with `Fs::mount(ctx)`, which re-reads the superblock and root - and on the ARM USB
+        // stick that readback lands in the post-write stale-read window this driver is fighting: the
+        // device serves the OLD block content for seconds after a write. So a format whose every write
+        // SUCCEEDED was condemned by a flaky READ, and `drives flash force` failed on a disk it had just
+        // correctly formatted - with no diagnosis, because the failure was a mount error swallowed into
+        // a generic reply. There is nothing to re-read: every field here is a value we computed and
+        // wrote microseconds ago, so constructing the Fs directly is both correct and immune to the
+        // read glitch. (Same principle as td_read's re-read: a completed write must not be judged by a
+        // single flaky read of the medium.)
+        let mut lbl = [0u8; LABEL_MAX];
+        lbl[..ll].copy_from_slice(&label[..ll]);
+        Ok(Fs {
+            total_blocks,
+            bitmap_start,
+            data_start,
+            journal_start,
+            journal_blocks,
+            root_first_block,
+            root_block_count,
+            free_blocks,
+            flags: 0,
+            label: lbl,
+            label_len: ll as u8,
+            feat_compat: FEAT_COMPAT_BACKUP_SB,
+            feat_ro_compat: 0,
+            feat_incompat: 0,
+            read_only: false,
+            last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
+            flush_warned: core::cell::Cell::new(false),
+            io_error_seen: core::cell::Cell::new(false),
+            txn_active: false,
+            txn_n: 0,
+            txn_overflow: false,
+            txn_lba: [0; TXN_CAP],
+            txn_blk: [[0u8; BLOCK]; TXN_CAP],
+            crash_after_commit: false,
+            open_files: [OpenFile { rid: 0, plen: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
+        })
     }
 
     fn relabel(&mut self, ctx: &ServiceContext, label: &[u8]) -> Result<(), &'static str> {
