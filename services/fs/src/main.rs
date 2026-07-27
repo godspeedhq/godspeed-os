@@ -1305,8 +1305,29 @@ impl Fs {
     }
 
     /// Directory-block read with CRC verify, honoring staged writes.
+    ///
+    /// **A CRC mismatch is re-read ONCE before it is believed.** On the Pi's USB backend the first
+    /// tree read after a device revival was observed returning garbage that the transport accepted as
+    /// a complete transfer - the root block "failed its CRC", the operator was told the tree was
+    /// unreadable and to reformat, and the very next read of the same block was clean (an `ls` through
+    /// the root PASSED seconds later). The medium was fine; the READ lied once. Declaring permanent
+    /// corruption - whose stated remedy is `drives flash`, i.e. destroying the tree - on a single
+    /// read's evidence turns a transient into data loss by prescription. One bounded re-read separates
+    /// the two: a transient heals (loudly, so every occurrence stays countable evidence of the
+    /// underlying read-path bug); real bit-rot fails twice and is reported exactly as before. The
+    /// staged-write path is exempt (memory, not a device read).
     fn td_read(&self, ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
-        let blk = self.tb_read(ctx, lba)?;
+        let mut blk = self.tb_read(ctx, lba)?;
+        if u32_at(&blk, DIR_CRC_OFF) != crc32(&blk[..DIR_REC_REGION]) {
+            if let Some(again) = self.tb_read(ctx, lba) {
+                if u32_at(&again, DIR_CRC_OFF) == crc32(&again[..DIR_REC_REGION]) {
+                    ctx.log_fmt(format_args!(
+                        "fs: CRC mismatch on directory block lba {} healed on re-read - a transient bad READ, not bit-rot (the transport served garbage as a complete transfer once)", lba));
+                    return Some(again);
+                }
+                blk = again;
+            }
+        }
         if u32_at(&blk, DIR_CRC_OFF) != crc32(&blk[..DIR_REC_REGION]) {
             // Report a given bad block once per mount, and say what it COSTS and what to do. Without
             // redundancy a directory block cannot be repaired (fs/CLAUDE.md, Phase K): scrub detects
