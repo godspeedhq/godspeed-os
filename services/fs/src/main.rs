@@ -1328,6 +1328,16 @@ impl Fs {
             // what it is doing; three attempts is bounded (§26.6) and each heal is logged with its
             // attempt number so the window's width stays measurable. Genuine bit-rot fails all four
             // reads and is reported exactly as before.
+            // Name WHAT the garbage is, once, before retrying - the diagnosis hangs on it. The bad
+            // reads always follow the first write after a device revival, and the three candidate
+            // mechanisms leave different fingerprints in the returned block: the just-written
+            // journal/staged block means OUR shared DMA buffer was served back unrefreshed; all-zeros
+            // means the data stage moved nothing and the buffer was cleared; some OTHER block's valid
+            // content means the DEVICE itself is serving stale data while it settles.
+            ctx.log_fmt(format_args!(
+                "fs: CRC mismatch on directory block lba {} - first bytes {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}, stored crc {:08x}, computed {:08x}",
+                lba, blk[0], blk[1], blk[2], blk[3], blk[4], blk[5], blk[6], blk[7],
+                u32_at(&blk, DIR_CRC_OFF), crc32(&blk[..DIR_REC_REGION])));
             for attempt in 1..=3u32 {
                 for _ in 0..32 { ctx.yield_cpu(); }
                 let Some(again) = self.tb_read(ctx, lba) else { break };
