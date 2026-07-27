@@ -36,6 +36,7 @@ def main():
                     help="path to a raw image to attach as a USB mass-storage stick (block-driver "
                          "prefers this over the SD card, matching the Pi: boot from SD, store on USB)")
     ap.add_argument("--cmd", action="append", default=[])
+    ap.add_argument("--chardelay", type=float, default=0.08, help="seconds between injected characters (raise if the shell drops/garbles input under TCG load)")
     ap.add_argument("--tail", type=int, default=3000)
     args = ap.parse_args()
 
@@ -87,7 +88,7 @@ def main():
     for c in args.cmd:
         # Newline (not CR) is the Enter the shell acts on under QEMU -serial stdio.
         for ch in (c + "\n").encode():
-            p.stdin.write(bytes([ch])); p.stdin.flush(); time.sleep(0.08)
+            p.stdin.write(bytes([ch])); p.stdin.flush(); time.sleep(args.chardelay)
         time.sleep(6.0)
 
     # let any remaining boot output settle

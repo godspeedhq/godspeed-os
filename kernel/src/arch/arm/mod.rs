@@ -997,12 +997,28 @@ static RX_HEAD: AtomicU32 = AtomicU32::new(0);
 static RX_TAIL: AtomicU32 = AtomicU32::new(0);
 static INPUT_READY: AtomicBool = AtomicBool::new(false);
 
-/// Drain every byte currently in the PL011 RX FIFO into the input ring. Single producer (guard IRQs at
-/// the call site if a poll and a syscall could race; on this single-core port they are serialised by
-/// the syscall/IRQ masking already).
+/// Drain every byte currently in the PL011 RX FIFO into the input ring.
+///
+/// **Must be a single producer IN FACT, and it was not.** The old comment said "single producer" and
+/// trusted "the single-core port" to serialise callers - but the port is SMP now, and this is reached
+/// from the core-0 timer tick, from the AP IDLE loops (`uart_rx_poll` - its MPIDR gate protected only
+/// `dwc2::poll`, not the drain), and from a blocked `console_read`. Two racing drains DUPLICATE input:
+/// both read FR as non-empty for the same byte, the first DR read empties the FIFO, and the second DR
+/// read - the PL011 data register on an empty FIFO returns the stale last byte - pushes the SAME byte
+/// again. Observed as `kkkill` / `chaos maxchaos max-carnage...` - typed commands garbled whenever
+/// output was streaming (the idle cores drain most eagerly exactly then), on QEMU and on the Pi alike.
+///
+/// So: core 0 only (the same discipline as `dwc2::poll`), and the FR-check/DR-read/ring-append runs
+/// with IRQs masked so the core-0 tick cannot interleave with a syscall-path drain between the FR
+/// check and the DR read - the same-core variant of the identical stale-DR duplication.
 fn pl011_rx_drain() {
-    // SAFETY: reading the PL011 FR/DR (Device-mapped MMIO) and appending to the ring; the ring indices
-    // are atomics and this is the only producer path.
+    let mpidr: u32;
+    // SAFETY: reading MPIDR (`c0, c0, 5`) is a side-effect-free PL1 register read.
+    unsafe { core::arch::asm!("mrc p15, 0, {m}, c0, c0, 5", m = out(reg) mpidr, options(nomem, nostack)); }
+    if mpidr & 3 != 0 { return; }
+    let saved = interrupts::local_irq_save();
+    // SAFETY: reading the PL011 FR/DR (Device-mapped MMIO) and appending to the ring; core-0-only and
+    // IRQ-masked (above), so this is the only producer executing.
     unsafe {
         loop {
             if PL011_FR.read_volatile() & PL011_FR_RXFE != 0 { break; } // RX FIFO empty
@@ -1015,6 +1031,7 @@ fn pl011_rx_drain() {
             RX_TAIL.store(next as u32, Ordering::Release);
         }
     }
+    interrupts::local_irq_restore(saved);
 }
 
 /// Pop one byte from the input ring (the ConsoleRead syscall consumer). `None` if empty.
