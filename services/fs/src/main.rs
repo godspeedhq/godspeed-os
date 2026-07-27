@@ -1339,16 +1339,20 @@ impl Fs {
                 lba, blk[0], blk[1], blk[2], blk[3], blk[4], blk[5], blk[6], blk[7],
                 u32_at(&blk, DIR_CRC_OFF), crc32(&blk[..DIR_REC_REGION])));
             for attempt in 1..=3u32 {
-                for _ in 0..32 { ctx.yield_cpu(); }
-                // Read a DIFFERENT block before re-asking. The fingerprint showed the device answering
-                // a read of this block with the content of a recently WRITTEN block ("ls\ndrive",
-                // "echo aaa" - shell history and test files, served as the root record), and it kept
-                // giving the IDENTICAL wrong answer to identical retries - a stick whose firmware
-                // aliases reads through its write cache for a window after a post-revival write.
-                // Interposing a read of another LBA (the superblock: always present, never the block
-                // under retry) displaces that cached answer so the retry is not the same question the
-                // firmware keeps short-circuiting. Its result is discarded; only the displacement
-                // matters. Genuine bit-rot still fails every attempt and stays fatal.
+                // Wait REAL time between attempts, because yield-counted waits were three orders of
+                // magnitude too short. Every hardware log agrees on the window's scale: the stale
+                // answers persist across back-to-back retries (32 yields ~ a millisecond - defeated)
+                // and across an interposed read of a different block (defeated too - the firmware's
+                // stale window is not a one-entry cache), yet reads issued SECONDS later are clean.
+                // So each attempt waits for the monotonic clock to ADVANCE (~1 s), double-bounded by
+                // a yield cap so a dead clock cannot spin this loop forever (§26.6, Commandment VIII:
+                // wait on the truth - time actually passing - not on a loop count that only measures
+                // scheduler load). Worst case ~3 s, spent only on this failure path, against the
+                // alternative of declaring a healthy tree dead and prescribing a reformat.
+                let t0 = ctx.epoch_secs_monotonic();
+                let mut spins = 0u32;
+                while ctx.epoch_secs_monotonic() <= t0 && spins < 200_000 { ctx.yield_cpu(); spins += 1; }
+                // Still displace the firmware's cached answer before re-asking (result discarded).
                 if lba != 0 { let _ = block_read(ctx, 0); }
                 let Some(again) = self.tb_read(ctx, lba) else { break };
                 if u32_at(&again, DIR_CRC_OFF) == crc32(&again[..DIR_REC_REGION]) {
