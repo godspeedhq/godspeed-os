@@ -26,6 +26,46 @@ use super::pl011_write;
 
 const LOCAL_BASE: usize = 0x4000_0000;
 
+/// The BCM2835 **legacy** peripheral interrupt controller (`peripheral + 0xB200`). It is the only path
+/// by which a peripheral IRQ - the USB/DWC2 controller among them - reaches a core, funnelled through
+/// the BCM2836 core-local block's "GPU" source (bit 8). Left dormant until the USB stack went
+/// interrupt-driven; the timer needs only the core-local block above.
+const PERIPH_BASE: usize = 0x3F00_0000;
+const IC_PENDING_1:     usize = PERIPH_BASE + 0xB204; // IRQ pending, lines 0-31
+const IC_ENABLE_IRQS_1: usize = PERIPH_BASE + 0xB210; // enable IRQ lines 0-31 (write 1 to enable)
+/// The DWC2 OTG controller is peripheral IRQ line 9 on the BCM283x.
+const USB_IRQ_LINE: u32 = 9;
+/// BCM2836 core-local: route the GPU IRQ (the OR of all legacy peripheral IRQs) and FIQ to a core.
+/// Bits 0-1 = the core that receives the GPU IRQ; bits 2-3 = the core that receives the GPU FIQ.
+const GPU_INT_ROUTING: usize = LOCAL_BASE + 0x0C;
+/// `CORE_IRQ_SOURCE` bit 8: a GPU (legacy-controller peripheral) interrupt is pending on this core.
+const CORE_IRQ_GPU: u32 = 1 << 8;
+
+/// Route the DWC2 USB interrupt to core 0 and enable it in the legacy controller.
+///
+/// Two hops, because the Pi 2 has two interrupt controllers (see the module header): the legacy
+/// controller must be told to raise line 9 at all, and the core-local block must be told which core the
+/// resulting GPU funnel lands on. Core 0 is the single DWC2 poller/owner, so both point there. The USB
+/// interrupt is level-triggered - it stays asserted until its underlying condition is cleared (an HPRT
+/// change bit, or a channel's HCINT) - so the handler MUST clear what it services or the line re-fires
+/// forever. That is why channel interrupts are gated at HAINTMSK to only the channels the ISR actually
+/// drives (`dwc2::init`): a polled channel left with a pending HCINT would storm this line.
+pub fn route_usb_irq_to_core0() {
+    // GPU IRQ -> core 0 (leave FIQ routing at core 0 too; we do not use USB FIQ).
+    local_write(GPU_INT_ROUTING, 0);
+    // Enable peripheral line 9 (USB) in the legacy controller's bank-1 enable register.
+    // SAFETY: the legacy IC is in the Device-mapped peripheral window; a volatile write that sets one
+    // enable bit. Writing 1s enables; 0s are ignored (the register is not read-modify-write).
+    unsafe { (IC_ENABLE_IRQS_1 as *mut u32).write_volatile(1 << USB_IRQ_LINE); }
+}
+
+/// True if the legacy controller currently shows the USB line pending (used by the dispatcher to
+/// confirm the GPU funnel is USB and not some other peripheral before handing it to the USB stack).
+fn usb_irq_pending() -> bool {
+    // SAFETY: volatile read of the Device-mapped legacy IRQ-pending register.
+    (unsafe { (IC_PENDING_1 as *const u32).read_volatile() }) & (1 << USB_IRQ_LINE) != 0
+}
+
 /// Per-core timer interrupt control. One register per core at `+0x40 + 4*core`.
 ///
 /// Bits 0-3 route the four generic timers to IRQ, bits 4-7 route the same to FIQ:
@@ -171,6 +211,17 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
     // Per-core source register: the timer fired on THIS core, so read this core's `+0x60 + 4*core`.
     let source = local_read(CORE_IRQ_SOURCE + 4 * this_core());
 
+    // A GPU-funnel interrupt (bit 8) is a legacy-controller peripheral IRQ. The USB stack is the only
+    // peripheral IRQ we enable, and it is routed to core 0, so service it here and fall through to the
+    // timer check (both can be pending at once). Confirm the line is USB before acting, so an
+    // unexpected peripheral IRQ is left asserted and obvious rather than silently swallowed.
+    let handled_gpu = if this_core() == 0 && source & CORE_IRQ_GPU != 0 && usb_irq_pending() {
+        super::dwc2::on_usb_irq();
+        true
+    } else {
+        false
+    };
+
     if source & IRQ_PHYS_TIMER != 0 {
         // Re-arm first: writing TVAL both sets the next deadline and deasserts the current interrupt.
         // Doing it before the bookkeeping keeps the period honest - the next interval starts counting
@@ -222,9 +273,16 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
             return frame_sp;
         }
     }
-    // Other sources (mailboxes, GPU funnel) are not enabled yet, so nothing else should arrive. If
-    // something does, leaving it asserted is the loud outcome: it will re-enter and be obvious,
-    // rather than being quietly discarded.
+    // A GPU/USB interrupt that fired without a coincident timer tick still needs the scheduler-safe
+    // return once the neutral scheduler owns the core (same contract as the timer branch: the tick
+    // handler swaps stacks internally, so we hand back the frame unchanged).
+    if handled_gpu && NEUTRAL_SCHED.load(Ordering::Relaxed) {
+        return frame_sp;
+    }
+
+    // Other sources (mailboxes) are not enabled, so nothing else should arrive. If something does,
+    // leaving it asserted is the loud outcome: it will re-enter and be obvious, rather than being
+    // quietly discarded.
 
     // The `context.rs` demo scheduler lives on CORE 0 only (the boot selftests ran there before the
     // neutral scheduler took over). A secondary core (SMP) reaches here only while it idles in

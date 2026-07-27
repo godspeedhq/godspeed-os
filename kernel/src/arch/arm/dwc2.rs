@@ -324,8 +324,22 @@ pub fn init() {
     // Unmask the interrupt sources on every channel we use. This armed channel 0 only, from when
     // channel 0 was the only one.
     for c in [CH_BULK, CH_KBD, CH_NET] { wr(hcintmsk_at(c), 0x7FF); }
-    wr(HAINTMSK, 0xFFFF);   // all channels
-    wr(GINTMSK, (1 << 25) | (1 << 24)); // Hchint (host channel) + Prtint (port)
+    // HAINTMSK gates which channels' interrupts reach the top-level Hchint (and thus the CPU, now that
+    // the USB IRQ is routed). It does NOT gate a channel's own state-machine advancement - that is
+    // HCINTMSK, set to 0x7FF per channel above, and left on for every channel so splits still advance.
+    // Stage 0 of the interrupt-driven conversion drives NO channel from the ISR yet (the transfers are
+    // still polled), so no channel may assert Hchint or the level-triggered line would storm between
+    // poll cycles. Gate them all off here; each stage that moves a channel to interrupt service unmasks
+    // exactly that channel's bit. Port interrupts (Prtint) are not gated by HAINTMSK and are the ISR's
+    // only live source for now - enough to prove the route end to end.
+    wr(HAINTMSK, 0x0000);
+    // Hchint (25) + Prtint (24), plus a TEMPORARY stage-0 delivery probe: SOF (bit 3), which the core
+    // raises every microframe while the port is enabled. A port change is a one-shot event already
+    // consumed by the boot reset, so it cannot prove the route; a SOF fires continuously, so the very
+    // first one delivered proves the whole legacy-controller -> GPU-funnel -> core path works (and, on
+    // QEMU, whether its model raises USB interrupts at all). `on_usb_irq` disables SOF the instant it
+    // sees one, so it proves delivery without storming. Removed once a channel drives the ISR for real.
+    wr(GINTMSK, (1 << 25) | (1 << 24) | (1 << 3));
     // 5e. Host PHY clock select. CRITICAL for the Pi: with a HS UTMI+ PHY (GUSBCFG.PHYSel=0) driving a
     //     full/low-speed device, Linux's dwc2_init_fs_ls_pclk_sel() selects the 30/60 MHz HS-derived
     //     clock (FSLSPClkSel=0), NOT 48 MHz (which is for a dedicated FS serial PHY). With the wrong FS/LS
@@ -380,6 +394,54 @@ pub fn init() {
     }
     if hprt & HPRT_PRTOVRCURR != 0 {
         pl011_write(b"dwc2: WARN port overcurrent\r\n");
+    }
+
+    // Stage 0 of the interrupt-driven conversion: route the USB IRQ to core 0 now that the controller
+    // is up and every channel is gated off Hchint (HAINTMSK=0). From here the port interrupt reaches
+    // the CPU; the transfer path is unchanged (still polled). This proves the whole route - legacy
+    // controller -> GPU funnel -> core IRQ -> dispatcher -> on_usb_irq - end to end, which is the
+    // go/no-go for the rest of the conversion (and, under QEMU, whether its DWC2 model delivers it).
+    super::irq::route_usb_irq_to_core0();
+    pl011_write(b"dwc2: USB interrupt routed to core 0 (port events now interrupt-driven)\r\n");
+}
+
+/// Count of USB interrupts serviced, for the boot proof and later diagnostics.
+static USB_IRQ_COUNT: AtomicU32 = AtomicU32::new(0);
+static USB_IRQ_PROVEN: AtomicBool = AtomicBool::new(false);
+pub fn usb_irq_count() -> u32 { USB_IRQ_COUNT.load(Ordering::Relaxed) }
+
+/// The USB interrupt service routine, reached from `arm_irq_dispatch` (core 0) when the GPU funnel
+/// shows the USB line pending. Runs with IRQs masked (IRQ-mode entry).
+///
+/// Stage 0 handles ONLY the port interrupt (Prtint): a connect/enable/overcurrent change. Channel
+/// interrupts are gated off at HAINTMSK, so Hchint cannot reach here yet - the transfers are still
+/// polled. The one job is to clear the condition so the level-triggered line deasserts; a port change
+/// is acknowledged by writing 1 to the set W1C change bits in HPRT (which also clears the derived,
+/// read-only GINTSTS.Prtint). PrtEna is masked off the write so acknowledging a change cannot disable
+/// the port (the W1C trap the rest of this driver already guards).
+pub fn on_usb_irq() {
+    let n = USB_IRQ_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let g = rd(GINTSTS);
+    if g & (1 << 3) != 0 {           // SOF: the stage-0 delivery probe (see init)
+        // Disable SOF immediately so it does not storm, clear it (W1C), and announce ONCE that the
+        // interrupt route works end to end. This whole branch is temporary scaffolding.
+        wr(GINTMSK, rd(GINTMSK) & !(1 << 3));
+        wr(GINTSTS, 1 << 3);
+        if !USB_IRQ_PROVEN.swap(true, Ordering::Relaxed) {
+            pl011_write(b"dwc2: USB IRQ DELIVERY CONFIRMED (SOF) - the interrupt route works end to end\r\n");
+        }
+    }
+    if g & (1 << 24) != 0 {          // Prtint: a port change is latched in HPRT's W1C bits
+        let hprt = rd(HPRT);
+        let changes = hprt & HPRT_WC_BITS;
+        // Write the change bits back (set = clear), keeping PrtPwr, dropping PrtEna so we cannot
+        // disable the port by acknowledging.
+        wr(HPRT, (hprt & !(HPRT_PRTENA | HPRT_WC_BITS)) | changes);
+        if n <= 4 {
+            pl011_write(b"dwc2: USB IRQ #"); super::timer::write_dec_pub(n);
+            pl011_write(b" port change HPRT="); write_hex32(hprt);
+            pl011_write(b"\r\n");
+        }
     }
 }
 
