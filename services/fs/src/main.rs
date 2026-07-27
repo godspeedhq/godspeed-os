@@ -1319,10 +1319,21 @@ impl Fs {
     fn td_read(&self, ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
         let mut blk = self.tb_read(ctx, lba)?;
         if u32_at(&blk, DIR_CRC_OFF) != crc32(&blk[..DIR_REC_REGION]) {
-            if let Some(again) = self.tb_read(ctx, lba) {
+            // Three re-reads with a breather between, because one immediate re-read was defeated on
+            // hardware: `drives scrub` verified the whole tree (0 bad), and seconds later - right
+            // after a device revival's first write - the root read failed its CRC TWICE back-to-back,
+            // then read clean for the rest of the run. The glitch is a WINDOW (a stick serving stale
+            // data while it settles after a revival), not a single bad transfer, so an instant
+            // re-read lands inside the same window. Yielding between attempts lets the device finish
+            // what it is doing; three attempts is bounded (§26.6) and each heal is logged with its
+            // attempt number so the window's width stays measurable. Genuine bit-rot fails all four
+            // reads and is reported exactly as before.
+            for attempt in 1..=3u32 {
+                for _ in 0..32 { ctx.yield_cpu(); }
+                let Some(again) = self.tb_read(ctx, lba) else { break };
                 if u32_at(&again, DIR_CRC_OFF) == crc32(&again[..DIR_REC_REGION]) {
                     ctx.log_fmt(format_args!(
-                        "fs: CRC mismatch on directory block lba {} healed on re-read - a transient bad READ, not bit-rot (the transport served garbage as a complete transfer once)", lba));
+                        "fs: CRC mismatch on directory block lba {} healed on re-read {} - a transient bad READ, not bit-rot (the transport served garbage as a complete transfer)", lba, attempt));
                     return Some(again);
                 }
                 blk = again;
