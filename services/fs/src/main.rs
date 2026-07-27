@@ -1340,6 +1340,16 @@ impl Fs {
                 u32_at(&blk, DIR_CRC_OFF), crc32(&blk[..DIR_REC_REGION])));
             for attempt in 1..=3u32 {
                 for _ in 0..32 { ctx.yield_cpu(); }
+                // Read a DIFFERENT block before re-asking. The fingerprint showed the device answering
+                // a read of this block with the content of a recently WRITTEN block ("ls\ndrive",
+                // "echo aaa" - shell history and test files, served as the root record), and it kept
+                // giving the IDENTICAL wrong answer to identical retries - a stick whose firmware
+                // aliases reads through its write cache for a window after a post-revival write.
+                // Interposing a read of another LBA (the superblock: always present, never the block
+                // under retry) displaces that cached answer so the retry is not the same question the
+                // firmware keeps short-circuiting. Its result is discarded; only the displacement
+                // matters. Genuine bit-rot still fails every attempt and stays fatal.
+                if lba != 0 { let _ = block_read(ctx, 0); }
                 let Some(again) = self.tb_read(ctx, lba) else { break };
                 if u32_at(&again, DIR_CRC_OFF) == crc32(&again[..DIR_REC_REGION]) {
                     ctx.log_fmt(format_args!(
