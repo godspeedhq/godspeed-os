@@ -48,6 +48,7 @@
 - [2026-07-14 - The day the boundary became something a machine enforced](#2026-07-14---the-day-the-boundary-became-something-a-machine-enforced)
 - [2026-07-14 - The day one kernel booted three instruction sets in QEMU virt](#2026-07-14---the-day-one-kernel-booted-three-instruction-sets-in-qemu-virt)
 - [2026-07-25 - The day the second architecture stopped being a demonstration](#2026-07-25---the-day-the-second-architecture-stopped-being-a-demonstration)
+- [2026-07-27 - The day a stick swap ended the hunt, and the recovery earned its keep](#2026-07-27---the-day-a-stick-swap-ended-the-hunt-and-the-recovery-earned-its-keep)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -769,7 +770,82 @@ missing log line, it is a wrong suspect.**
 
 ---
 
+## 2026-07-27 - The day a stick swap ended the hunt, and the recovery earned its keep
+
+The self-check printed `run: ran 349, failed 0`. Then it printed it again, and again - eight times in
+a row, on a Raspberry Pi 2, on real silicon. Consistent zero: the bar that had sat just out of reach
+for a week of hardware round-trips.
+
+What reached it was not a line of code. It was pulling out the USB stick and pushing in a different
+one.
+
+For days the storage had failed the same way: under sustained I/O - a `drives check` reading the whole
+tree - the stick would stop answering, roughly once per run, and cost the handful of tests in flight
+at that instant. Every layer above it was made to survive that: a stuck-endpoint reset, an escalation
+to port-reset and re-enumeration, a filesystem that re-mounts on an I/O error, a journal that replays
+an interrupted write. And along the way real defects fell out that had nothing to do with any stick -
+a synchronous `Call` that took the wrong message off its own queue because it matched replies by
+arrival order instead of by sender (latent on x86 too); a `format` that condemned its own successful
+writes by reading them back through a device that served stale data; the FIFOs sized for a keyboard
+while a 512-byte bulk packet needed the whole of one. Each was found, each was fixed, and still a
+revival cost a run.
+
+The operator proposed the one experiment I had been talking around: change the stick. Eight clean runs
+later, the answer was unambiguous. The old stick's own controller had been failing under load - not
+leaving the bus, just wedging its own firmware while staying plugged in. A dodgy part.
+
+**What I came to understand:** faults stack, and fixing a real one does not exonerate the layer beneath
+it. The 2026-07-25 entry above is the same investigation, two days earlier, and its conclusion was
+*true* - the silent clear-halt was a genuine defect, and "the stick is fine" was the right correction
+at the time, because the software bug was masking everything under it. But "the software bug was real"
+and "the stick was fine" are not the same statement, and I had quietly treated them as one. Peel a real
+fault and you do not reach innocence; you reach the next fault. Only a controlled experiment - one
+variable changed, everything else held - can isolate the last one, and no amount of reading an ambiguous
+log substitutes for it.
+
+And the elaborate recovery was not wasted on a problem that turned out to be hardware - it was the whole
+point. The proof is in the same log: the *old*, failing stick dropped off twice and still produced two
+`349, failed 0` runs, because the recovery caught it and carried on. Resilience surviving a genuinely
+failing device, gracefully, is exactly what resilience is for. The reply-correlation fix and the others
+would have been worth making on any stick; the recovery earned its keep on the bad one.
+
+**What it produced:** the discipline of the one-variable swap before the multi-day rewrite - because the
+next thing I had been about to build was a full interrupt-driven restructure of the USB stack, days of
+work, to fix what a $3 part swap settled in an afternoon. That the restructure is still worth doing
+(for reasons that were never this bug) is a separate decision, now made in the clear rather than under
+the pressure of a failure I had misattributed.
+
+---
+
 ## The Days I Was Wrong
+
+### 2026-07-27 - The day I almost rewrote the world to fix a dodgy part
+
+The drop-off left a fingerprint, and I read it wrong. At every capture the port register said the same
+thing: `HPRT` bit 0 set, device connected, port enabled. I took that as proof the fault was mine - the
+device is right there, so my polled, interrupts-masked transfer path must be wedging the channel. I
+built the case, and I proposed the fix that followed from it: convert the whole USB stack to
+interrupt-driven, the way Linux does. A week of work, and I was ready to start.
+
+The signal was ambiguous and I did not hold it as ambiguous. "Present but not answering" is *equally*
+the signature of a stick whose own controller has wedged - it stays electrically connected while its
+firmware stops responding. The port register cannot tell those two apart; it reports the wire, not the
+silicon at the far end of it. I resolved the ambiguity in the direction I already believed, which is
+the whole mechanism of being confidently wrong.
+
+The operator resolved it the honest way, by changing one variable. Eight clean runs on a new stick.
+
+**What I came to understand:** an instrument that cannot distinguish two hypotheses must not be read as
+favouring either, however much one of them fits the story I am telling. And when a cheap experiment can
+separate them - swap the part, change the one variable - it is worth more than another round of
+inference, and far more than committing days of work to the reading I preferred. I nearly rebuilt the
+entire transfer path to fix a fault that lived in a flash chip.
+
+**What it produced:** reach for the one-variable swap before the multi-day rewrite; treat an ambiguous
+instrument as ambiguous; and notice when a proposed fix is large in proportion to how certain I actually
+am of the cause. The interrupt-driven rewrite may still happen - but as an improvement chosen freely,
+not as a cure for a disease I had misdiagnosed.
+
 
 The entries above are mostly victories - the days understanding clicked into place. But the days
 worth keeping most are the ones where the architecture had to beat the author. A constitution that
