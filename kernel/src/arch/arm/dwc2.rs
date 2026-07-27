@@ -40,6 +40,7 @@ const GRXFSIZ:  usize = 0x024; // receive FIFO size
 const GNPTXFSIZ:usize = 0x028; // non-periodic transmit FIFO size
 const GSNPSID:  usize = 0x040; // Synopsys core ID ("OT2" + release, e.g. 0x4F54_294A)
 const GHWCFG2:  usize = 0x048; // hardware config 2 (architecture, HS PHY type)
+const GHWCFG3:  usize = 0x04C; // hardware config 3 (bits 31:16 = total DFIFO depth in 32-bit words)
 const HPTXFSIZ: usize = 0x100; // host periodic transmit FIFO size
 // --- Host-mode registers ---
 const HCFG:     usize = 0x400; // host config (PHY clock select)
@@ -254,12 +255,35 @@ pub fn init() {
     // 5a. (u-boot host_init) Clear GOTGCTL.HstSetHNPEn - a pure host must not have host-set-HNP enabled.
     wr(GOTGCTL, rd(GOTGCTL) & !GOTGCTL_HSTSETHNPEN);
 
-    // 5b. Size the FIFOs (values are 32-bit words): RX (256), non-periodic TX (128 @ 256), periodic TX
-    //     (128 @ 384). Modest but ample for a single keyboard's tiny transfers. GNPTXFSIZ/HPTXFSIZ pack
-    //     (depth << 16) | start_address.
-    wr(GRXFSIZ, 0x100);
-    wr(GNPTXFSIZ, (0x80 << 16) | 0x100);
-    wr(HPTXFSIZ, (0x80 << 16) | 0x180);
+    // 5b. Size the FIFOs (values are 32-bit words) to the Linux BCM2835 host-mode layout, which is the
+    //     authoritative Pi value (`params_bcm2835` in `drivers/usb/dwc2/params.c`): RX 774, non-periodic
+    //     TX 256, periodic TX 512. GNPTXFSIZ/HPTXFSIZ pack (depth << 16) | start_address, laid end to end
+    //     (RX @0, NPTX @774, PTX @1030). Total 1542 words, well under this core's DFIFO depth.
+    //
+    //     The previous values - RX 256, NPTX 128, PTX 128, "ample for a single keyboard's tiny transfers"
+    //     - were sized before this driver grew a mass-storage backend. A high-speed bulk packet is 512
+    //     bytes = 128 words, so the whole non-periodic TX FIFO held exactly ONE packet and the RX FIFO
+    //     had almost no headroom for the DMA engine's drain latency. Under SUSTAINED bulk I/O (a `drives
+    //     check` reading the whole tree) that starves: the RX FIFO cannot buffer the next packet while
+    //     the DMA drains the last, the host channel wedges, and the device appears to "stop answering
+    //     EP0" - the ~once-per-run drop-off the recovery machinery has been catching. A keyboard never
+    //     hit it because its reports are 8 bytes. Right-sizing removes the starvation at the source.
+    //
+    //     Read the core's total DFIFO depth (GHWCFG3[31:16]) and refuse to program a layout that would
+    //     not fit, loudly (invariant 12) - a silently-truncated FIFO boundary is the exact stale-pointer
+    //     class the flush below exists to prevent.
+    const RX_WORDS:   u32 = 774;
+    const NPTX_WORDS: u32 = 256;
+    const PTX_WORDS:  u32 = 512;
+    let dfifo_depth = rd(GHWCFG3) >> 16;
+    pl011_write(b"dwc2: DFIFO depth "); write_hex32(dfifo_depth);
+    pl011_write(b" words; sizing RX/NPTX/PTX 774/256/512 (Linux bcm2835)\r\n");
+    if dfifo_depth != 0 && dfifo_depth < RX_WORDS + NPTX_WORDS + PTX_WORDS {
+        pl011_write(b"dwc2: WARN DFIFO too small for the bcm2835 layout - USB may be unstable under load\r\n");
+    }
+    wr(GRXFSIZ, RX_WORDS);
+    wr(GNPTXFSIZ, (NPTX_WORDS << 16) | RX_WORDS);
+    wr(HPTXFSIZ, (PTX_WORDS << 16) | (RX_WORDS + NPTX_WORDS));
     // 5b'. Flush every TX FIFO and the RX FIFO so their internal read/write pointers match the boundaries
     //      just programmed. The core soft reset set pointers for the DEFAULT layout; resizing the FIFOs
     //      leaves those pointers stale, and in DMA mode the core DMAs the SETUP packet INTO the NP TX FIFO
@@ -1805,6 +1829,16 @@ fn revive_if_needed(recovered: bool, streak_exhausted: bool, ep_in: u32, ep_out:
         return;                                  // bounded: stop trying, stay loudly unavailable
     }
     MSC_REVIVE_TRIES.store(tries + 1, Ordering::Relaxed);
+    // Capture the controller state at the drop-off, so a hardware log says WHICH failure this is rather
+    // than only that recovery ran. HPRT.PrtConnSts (bit 0) is the deciding bit: SET = the device is
+    // still electrically present and it is the host CHANNEL that wedged (the FIFO-starvation case the
+    // resize targets); CLEAR = the device really left the bus (an electrical/power event no software
+    // fix reaches). GINTSTS shows any pending global condition; the bulk channel's HCINT shows how the
+    // last transfer ended.
+    pl011_write(b"dwc2: drop-off state: HPRT="); write_hex32(rd(HPRT));
+    pl011_write(b" GINTSTS="); write_hex32(rd(GINTSTS));
+    pl011_write(b" HCINT[bulk]="); write_hex32(rd(hcint_at(CH_BULK)));
+    pl011_write(b" (HPRT bit0 set = device present, channel wedged; clear = device left the bus)\r\n");
     pl011_write(b"dwc2: device stopped answering EP0 - port reset + re-enumerate, attempt ");
     super::timer::write_dec_pub(tries + 1);
     pl011_write(b" of 3\r\n");
