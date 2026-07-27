@@ -60,7 +60,17 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
             // missing its USB_DISK cap lands here and gets retried 6000 times before being reported
             // as a device that "stayed busy" - an authority failure wearing an I/O failure's name.
             USB_DISK_BUSY => { ctx.yield_cpu(); }   // hand the CPU on, ask again - expected, silent
-            _ => return false,           // a real error; the kernel has already named it
+            // The CODE is the diagnosis, so it is printed rather than folded into a bare failure. A
+            // hardware run showed `fs` reporting I/O errors while the kernel's transport log said
+            // nothing - the failure was a silent refusal, and this reply was the one place that saw
+            // which one (-1 = kernel-internal refusal or transport failure, -2 = capability not held,
+            // which is an authority bug, not a device problem). "The kernel has already named it"
+            // was only true of transport failures.
+            code => {
+                ctx.log_fmt(format_args!(
+                    "block-driver: {} lba {} refused by kernel, status {}", what, lba, code));
+                return false;
+            }
         }
         let _ = n;
     }

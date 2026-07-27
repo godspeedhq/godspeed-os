@@ -121,6 +121,7 @@ const OP_CAPACITY: u8 = 3;
 const OP_WRITE_ZEROS: u8 = 4; // [op, lba:u64, count:u64] - zero a run of blocks (fast format)
 const OP_FLUSH: u8 = 5;       // [op] - make prior writes durable on the medium (see `block_flush`)
 const BLK_OK: u8 = 0;
+const BLK_ERR: u8 = 1;        // the driver's STATUS_ERR - it answered, and said the operation failed
 
 // fs file API (client <-> fs). `[op, path_len, path, (WriteFile: data | Rename/Move: tail)]`.
 const OP_WRITE_FILE: u8 = 10;
@@ -2768,8 +2769,19 @@ fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
         let mut out = [0u8; BLOCK];
         out.copy_from_slice(&p[1..1 + BLOCK]);
         Some(out)
-    } else {
+    } else if p.first() == Some(&BLK_ERR) && p.len() == 1 {
+        // The driver answered and said no: a genuine device-side failure, already named on its side.
         ctx.log_fmt(format_args!("fs: block read failed at lba {} (device I/O error)", lba));
+        None
+    } else {
+        // The reply is not a read reply at all - a mis-correlated or truncated message (the Bug-2
+        // class `block_capacity` already validates against). Printing this as "device I/O error"
+        // sent a hardware debugging session at the device when the device had said nothing; the two
+        // need opposite responses (a device error is retried/degraded, a protocol desync must be
+        // seen and reported as itself).
+        ctx.log_fmt(format_args!(
+            "fs: block read at lba {} got a MALFORMED reply ({} bytes, first {}) - protocol desync, not a device error",
+            lba, p.len(), p.first().copied().unwrap_or(0xFF)));
         None
     }
 }

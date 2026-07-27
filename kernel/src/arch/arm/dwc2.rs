@@ -2166,12 +2166,42 @@ fn msc_select() {
 }
 static MSC_HUB_PORT: AtomicU8 = AtomicU8::new(0); // hub port for split transfers (0 = direct/high-speed)
 
+/// Name a refusal that used to be silent.
+///
+/// The block entry points below refuse a request for four different reasons (not ready, wrong core,
+/// short buffer, LBA past the end) through one indistinguishable `false` - and a hardware run produced
+/// exactly that signature: `fs` reporting I/O errors at specific LBAs while dwc2, which logs every
+/// TRANSPORT failure, said nothing at all, because the failure was a refusal that never reached the
+/// transport. Ruling out each silent gate took a log-deduction session that one printed word would have
+/// avoided. A refusal is a defined answer, but an unnameable failure is still a silent one
+/// (Invariant 12) - so each gate now says which it was. Rate-limited per reason (first, then every
+/// 64th) so a client that retries in a loop cannot flood the console.
+fn msc_refuse(reason: &str, counter: &AtomicU32, lba: u64) -> bool {
+    let n = counter.fetch_add(1, Ordering::Relaxed);
+    if n % 64 == 0 {
+        pl011_write(b"dwc2: block request refused - ");
+        pl011_write(reason.as_bytes());
+        pl011_write(b" (lba ");
+        super::timer::write_dec_pub(lba as u32);
+        pl011_write(b", occurrence ");
+        super::timer::write_dec_pub(n + 1);
+        pl011_write(b")
+");
+    }
+    false
+}
+static MSC_REFUSE_NOT_READY: AtomicU32 = AtomicU32::new(0);
+static MSC_REFUSE_WRONG_CORE: AtomicU32 = AtomicU32::new(0);
+static MSC_REFUSE_RANGE: AtomicU32 = AtomicU32::new(0);
+
 /// Read one 512-byte block from the USB mass-storage device into `dst`. Returns false if there is no
 /// device, the LBA is past the end, or the transfer failed. Core-0 only (the single DWC2 poller), and
 /// non-blocking like the net path - see the DMA soundness invariant on `DMA`.
 pub fn msc_read_block(lba: u64, dst: &mut [u8]) -> bool {
-    if !MSC_READY.load(Ordering::Acquire) || !on_core0() || dst.len() < 512 { return false; }
-    if lba >= MSC_SECTORS.load(Ordering::Relaxed) { return false; }
+    if !MSC_READY.load(Ordering::Acquire) { return msc_refuse("not ready (mid-revival?)", &MSC_REFUSE_NOT_READY, lba); }
+    if !on_core0() { return msc_refuse("wrong core", &MSC_REFUSE_WRONG_CORE, lba); }
+    if dst.len() < 512 { return false; }
+    if lba >= MSC_SECTORS.load(Ordering::Relaxed) { return msc_refuse("LBA past capacity", &MSC_REFUSE_RANGE, lba); }
     msc_select();
     let l = lba as u32;
     // READ(10): opcode 0x28, LBA big-endian at [2..6], transfer length big-endian at [7..9].
@@ -2227,8 +2257,10 @@ static MSC_FUA_LOGGED: AtomicBool = AtomicBool::new(false);
 /// tell. So this claims only what it knows - the device did not reject it - and the real evidence is
 /// a power cycle with the tree still readable afterwards.
 pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
-    if !MSC_READY.load(Ordering::Acquire) || !on_core0() || src.len() < 512 { return false; }
-    if lba >= MSC_SECTORS.load(Ordering::Relaxed) { return false; }
+    if !MSC_READY.load(Ordering::Acquire) { return msc_refuse("not ready (mid-revival?)", &MSC_REFUSE_NOT_READY, lba); }
+    if !on_core0() { return msc_refuse("wrong core", &MSC_REFUSE_WRONG_CORE, lba); }
+    if src.len() < 512 { return false; }
+    if lba >= MSC_SECTORS.load(Ordering::Relaxed) { return msc_refuse("LBA past capacity", &MSC_REFUSE_RANGE, lba); }
     msc_select();
     let l = lba as u32;
     let mut buf = [0u8; 512];
