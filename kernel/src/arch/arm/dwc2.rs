@@ -2226,9 +2226,19 @@ pub fn msc_read_block(lba: u64, dst: &mut [u8]) -> bool {
 /// silently. The honest resolution is to treat NAK as "busy, retry" rather than an error and to wait
 /// for it WITHOUT holding the core - which is an async block path, not a constant.
 ///
-/// Left in place, one edit from being re-enabled, so the next attempt starts from what was learned
-/// rather than rediscovering it.
-const USE_FUA: bool = false;
+/// **ON again (2026-07-27), because that prerequisite was BUILT.** A NAKed command now comes back as
+/// BUSY (`USB_DISK_BUSY`, distinct from failure), the kernel holds the core only `CORE_HOLD_US` per
+/// attempt, and `block-driver` re-asks from userspace, yielding between attempts - the wait costs
+/// latency, not the tick. So the measured cost that turned FUA off (a post-write NAK burning the 20 ms
+/// command budget into an error) no longer exists; a drive programming flash is simply busy for a
+/// while, which is now a first-class answer. What re-enabling BUYS was demonstrated the same day this
+/// flag flipped: a 20-round carnage storm forced two port resets, each printing "writes it had
+/// BUFFERED are LOST: a port reset clears the device cache", and the second lost the ROOT record -
+/// tree unreadable, reformat required. This device refuses SYNCHRONIZE CACHE (`MSC_NO_FLUSH`), so FUA
+/// is its ONLY durability mechanism: with it, every acknowledged write is on the medium before the
+/// ack, and a revival's port reset has nothing buffered to lose. `MSC_NO_FUA` still guards the device
+/// that rejects the bit - such a device falls back to plain writes, loudly, once.
+const USE_FUA: bool = true;
 
 /// Set once the device has rejected a WRITE(10) carrying FUA, after which writes go out plain.
 /// See `msc_write_block` - this is the fallback that keeps a device writable when it will not take
