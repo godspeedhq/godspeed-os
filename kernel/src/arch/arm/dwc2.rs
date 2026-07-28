@@ -804,6 +804,18 @@ static mut DMA: DmaBuf = DmaBuf { setup: [0; 64], data: [0; 2048] };
 struct KbdDma { report: [u8; 64] }
 static mut KBD_DMA: KbdDma = KbdDma { report: [0; 64] };
 
+/// Storage's OWN DMA buffer (CH_BULK), separate from the shared `DMA` that networking (CH_NET) and
+/// enumeration (control) use. `bulk_xfer` used one buffer for both storage and net; their safety rested
+/// on never overlapping in time. Driving storage from an **interrupt** (stage 2) breaks that: a storage
+/// transfer parks with IRQs enabled, so the nic-driver task can run a net transfer through the shared
+/// buffer while storage's DMA is mid-flight. A dedicated buffer removes that aliasing. 512 bytes holds
+/// the largest storage transfer (one block); CBW/CSW/SENSE/CAPACITY are all smaller. `align(64)` so its
+/// cache-maintenance bracket (SEC-28) touches no neighbour. Today (1b) storage is still spin-polled and
+/// still never overlaps `DMA`; separating the buffer is the prerequisite the async path needs.
+#[repr(C, align(64))]
+struct MscDma { data: [u8; 512] }
+static mut MSC_DMA: MscDma = MscDma { data: [0; 512] };
+
 /// Clean+invalidate a cache-line range to the PoC (DCCIMVAC) - the DMA-coherency bracket. The A7's DMA
 /// is not cache-coherent: clean pushes CPU writes to RAM before the device reads (OUT); invalidate drops
 /// the line so a later CPU read re-fetches what the device wrote (IN). A no-op under QEMU (no caches).
@@ -1740,11 +1752,18 @@ fn bulk_xfer(ch: u32, dir_in: bool, ep: u32, data: &mut [u8], len: usize) -> i32
     MPS0.store(BULK_MPS.load(Ordering::Relaxed), Ordering::Relaxed); // chan_program uses MPS0 for pktcnt
     let toggle = if dir_in { &BULK_TOGGLE_IN } else { &BULK_TOGGLE_OUT };
     let pid = if toggle.load(Ordering::Relaxed) { PID_DATA1 } else { PID_DATA0 };
-    // SAFETY: DMA is touched only on core 0; addr_of gives its identity-mapped physical address.
+    // SAFETY: the DMA buffers are touched only on core 0; addr_of gives their identity-mapped physical
+    // address. Storage (CH_BULK) uses its OWN buffer (`MSC_DMA`) so a parked async storage transfer never
+    // aliases a concurrent net transfer through the shared `DMA`; everything else uses `DMA`.
     let got = unsafe {
-        let d = &mut *core::ptr::addr_of_mut!(DMA);
-        let data_phys = core::ptr::addr_of!(d.data) as u32;
-        let n = len.min(d.data.len());
+        let (bufp, cap): (*mut u8, usize) = if ch == CH_BULK {
+            (core::ptr::addr_of_mut!((*core::ptr::addr_of_mut!(MSC_DMA)).data) as *mut u8, 512)
+        } else {
+            (core::ptr::addr_of_mut!((*core::ptr::addr_of_mut!(DMA)).data) as *mut u8, 2048)
+        };
+        let buf: &mut [u8] = core::slice::from_raw_parts_mut(bufp, cap);
+        let data_phys = buf.as_ptr() as u32;
+        let n = len.min(buf.len());
         if dir_in {
             flush_dcache(data_phys, n as u32);                     // invalidate before the device writes
             if !chan_dma(ch, true, pid, data_phys, n as u32, ep, 2) { -1i32 }
@@ -1754,7 +1773,7 @@ fn bulk_xfer(ch: u32, dir_in: bool, ep: u32, data: &mut [u8], len: usize) -> i32
                 let remaining = (rd(hctsiz_at(ch)) & 0x7_FFFF) as usize;
                 let recv = n.saturating_sub(remaining);
                 let m = recv.min(data.len());
-                data[..m].copy_from_slice(&d.data[..m]);
+                data[..m].copy_from_slice(&buf[..m]);
                 recv as i32
             }
         } else {
@@ -1765,7 +1784,7 @@ fn bulk_xfer(ch: u32, dir_in: bool, ep: u32, data: &mut [u8], len: usize) -> i32
             // never produce. No current caller passes a short slice (a block write is 512/512), so this
             // costs nothing today and removes the trap for the next one.
             let m = n.min(data.len());
-            d.data[..m].copy_from_slice(&data[..m]);
+            buf[..m].copy_from_slice(&data[..m]);
             flush_dcache(data_phys, m as u32);
             if chan_dma(ch, false, pid, data_phys, m as u32, ep, 2) { m as i32 } else { -1i32 }
         }
