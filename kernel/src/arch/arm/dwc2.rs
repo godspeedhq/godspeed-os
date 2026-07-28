@@ -574,6 +574,11 @@ static LAST_FAIL: AtomicU32 = AtomicU32::new(0);
 const FAIL_STALL: u32 = 1;
 const FAIL_XACT:  u32 = 2;
 const FAIL_NAK_TIMEOUT: u32 = 3;
+/// Raw HCINT of the most recent transfer failure - so a hard-to-diagnose case (e.g. the LAN9514
+/// SET_CONFIG status XactErr) can be read at the exact bit level: XferCompl0 CHHLTD1 STALL3 NAK4 ACK5
+/// NYET6 XACTERR7 BBLERR8 FRMOVRUN9 DATATGLERR10. `last_hcint()` surfaces it.
+static LAST_HCINT: AtomicU32 = AtomicU32::new(0);
+pub fn last_hcint() -> u32 { LAST_HCINT.load(Ordering::Relaxed) }
 
 /// Was the last transfer merely BUSY (the device asked us to come back) rather than failed? The
 /// caller re-asks; nothing is wrong.
@@ -890,15 +895,15 @@ fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, e
             NEXT_BULK_PID_DATA1.store((rd(hctsiz_at(ch)) >> 29) & 0x3 == PID_DATA1, Ordering::Relaxed);
             return true;
         }
-        if ci & HCINT_STALL != 0 { LAST_FAIL.store(FAIL_STALL, Ordering::Relaxed); return false; }
+        if ci & HCINT_STALL != 0 { LAST_HCINT.store(ci, Ordering::Relaxed); LAST_FAIL.store(FAIL_STALL, Ordering::Relaxed); return false; }
         // NAK/NYET = "busy, ask again" and costs nothing. Only a real TRANSACTION error counts, and
         // three of them fail the transfer - the same threshold Linux applies in `dwc2_release_channel`.
         if ci & HCINT_XACTERR != 0 {
             xact_errs += 1;
-            if xact_errs >= XACT_ERR_MAX { LAST_FAIL.store(FAIL_XACT, Ordering::Relaxed); return false; }
+            if xact_errs >= XACT_ERR_MAX { LAST_HCINT.store(ci, Ordering::Relaxed); LAST_FAIL.store(FAIL_XACT, Ordering::Relaxed); return false; }
         }
         if super::timer::systimer_us().wrapping_sub(started) > nak_budget_us() {
-            LAST_FAIL.store(FAIL_NAK_TIMEOUT, Ordering::Relaxed); return false;
+            LAST_HCINT.store(ci, Ordering::Relaxed); LAST_FAIL.store(FAIL_NAK_TIMEOUT, Ordering::Relaxed); return false;
         }
         super::uart_rx_drain_now();   // keep serial input alive during a long IRQs-masked wait
         spin(5_000);
@@ -1659,6 +1664,11 @@ fn smsc_mii_write(reg: u32, val: u16) {
 /// Bring up the LAN9514: select its config, reset the chip + PHY, program the MAC, enable TX/RX, kick the
 /// PHY into auto-negotiation. HW-blind (see the section header); every wait is bounded.
 fn configure_smsc95xx() -> bool {
+    // Wait on the device's TRUTH, not a 5 ms clock: the LAN9514 NAKs the SET_CONFIGURATION status stage
+    // (and later register writes) while it reconfigures internally, longer than the default CORE_HOLD
+    // budget - so the status transfer timed out and enumeration gave up ("STATUS failed"). Storage hit
+    // the identical class of bug. Raised for this whole (boot-time, one-shot) bring-up; auto-restored.
+    let _budget = NakBudget::raised(IO_BUDGET_US);
     // Find the bulk endpoints + select the (single) configuration.
     let mut cfg = [0u8; 64];
     if !get_descriptor(0x80, 0x02, 0x00, 0, &mut cfg, 9) { return false; }
@@ -1680,7 +1690,27 @@ fn configure_smsc95xx() -> bool {
         i += blen;
     }
     if ep_in == 0 || ep_out == 0 { pl011_write(b"dwc2: smsc no bulk endpoints\r\n"); return false; }
-    if !control_out(0x00, 0x09, cfg_val as u16, 0) { pl011_write(b"dwc2: smsc SET_CONFIG failed\r\n"); return false; }
+    // The LAN9514 XactErrs the SET_CONFIGURATION status stage on the first tries: it ACCEPTS the request
+    // (the SETUP is ACKed) then errors the zero-length status-IN for tens of ms while it brings up its
+    // internal ethernet state. SET_ADDRESS (the same no-data control-OUT) succeeded moments earlier, so
+    // the device CAN do this transfer - it just needs to settle after accepting the config. Retry the
+    // whole request with a settle delay; usbcore likewise retries control transfers. HW-blind, tuned by
+    // observation. The first failure's reason + raw HCINT is logged so the exact error bits are visible.
+    let mut set_ok = false;
+    for attempt in 0..8u32 {
+        if control_out(0x00, 0x09, cfg_val as u16, 0) { set_ok = true; break; }
+        if attempt == 0 {
+            pl011_write(b"dwc2: smsc SET_CONFIG try failed ("); pl011_write(last_fail_str().as_bytes());
+            pl011_write(b", HCINT="); write_hex32(last_hcint()); pl011_write(b") - settling 50ms + retrying\r\n");
+        }
+        super::timer::delay_us(50_000);   // 50 ms settle, then re-issue the whole SET_CONFIGURATION
+    }
+    if !set_ok {
+        pl011_write(b"dwc2: smsc SET_CONFIG failed after retries - "); pl011_write(last_fail_str().as_bytes());
+        pl011_write(b" HCINT="); write_hex32(last_hcint()); pl011_write(b"\r\n");
+        return false;
+    }
+    pl011_write(b"dwc2: smsc SET_CONFIG ok\r\n");
 
     // Lite reset the chip, then reset the PHY.
     smsc_write_reg(SMSC_HW_CFG, smsc_read_reg(SMSC_HW_CFG) | SMSC_HW_CFG_LRST);
