@@ -778,8 +778,10 @@ const HALT_BUDGET_US: u32 = 2000;
 /// `data` starts on its own cache line (the clean/invalidate bracket never straddles setup + data). The
 /// `data` region holds a full disk block (512) or ethernet frame (~1514) for bulk transfers.
 ///
-/// SOUNDNESS INVARIANT (the `&mut *addr_of_mut!(DMA)` in `ctrl_xfer`/`bulk_xfer`/`poll` must never
-/// overlap): every DMA access is **core-0 only** and the accessors are **mutually exclusive in time**.
+/// SOUNDNESS INVARIANT (the `&mut *addr_of_mut!(DMA)` in `ctrl_xfer`/`bulk_xfer` must never overlap):
+/// every DMA access is **core-0 only** and the accessors are **mutually exclusive in time**. The
+/// keyboard `poll()` uses its OWN buffer (`KBD_DMA`), so it no longer aliases `DMA` at all - the
+/// prerequisite for driving it from an interrupt (where it *would* overlap a `DMA` transfer in time).
 /// This rests on two properties that any future edit MUST preserve:
 ///   1. `poll()` runs only from the core-0 timer tick, and `net_frame_tx/rx` only from a syscall guarded
 ///      by `on_core0()` - so no cross-core and no off-core access.
@@ -790,6 +792,17 @@ const HALT_BUDGET_US: u32 = 2000;
 #[repr(C, align(64))]
 struct DmaBuf { setup: [u8; 64], data: [u8; 2048] }
 static mut DMA: DmaBuf = DmaBuf { setup: [0; 64], data: [0; 2048] };
+
+/// The keyboard poll's OWN DMA buffer, separate from `DMA` above. An 8-byte boot report, but a full
+/// 64-byte cache line, `align(64)`: once the keyboard completes via **interrupt** (Stage 1c) its ISR can
+/// touch this buffer while a storage/net transfer is mid-flight in `DMA` - so the two must not share a
+/// cache line, or one transfer's `flush_dcache` clobbers the other's. A dedicated aligned line makes the
+/// keyboard's cache maintenance (invalidate before the device writes, invalidate after, over exactly
+/// these 8 bytes) touch nothing else. Today (Stage 1a) the keyboard is still polled from the tick and
+/// still never overlaps `DMA` in time; separating the buffer is the prerequisite the interrupt path needs.
+#[repr(C, align(64))]
+struct KbdDma { report: [u8; 64] }
+static mut KBD_DMA: KbdDma = KbdDma { report: [0; 64] };
 
 /// Clean+invalidate a cache-line range to the PoC (DCCIMVAC) - the DMA-coherency bracket. The A7's DMA
 /// is not cache-coherent: clean pushes CPU writes to RAM before the device reads (OUT); invalidate drops
@@ -2604,10 +2617,11 @@ pub fn poll() {
     let ep = KBD_EP.load(Ordering::Relaxed) as u32;
     let toggle = KBD_TOGGLE.load(Ordering::Relaxed);
     let pid = if toggle { PID_DATA1 } else { PID_DATA0 };
-    // SAFETY: DMA is touched only on core 0; addr_of gives its identity-mapped physical address.
+    // SAFETY: KBD_DMA is touched only on core 0; addr_of gives its identity-mapped physical address.
+    // The keyboard has its OWN buffer (not the shared `DMA`) so its transfer never aliases storage/net.
     unsafe {
-        let d = &mut *core::ptr::addr_of_mut!(DMA);
-        let data_phys = core::ptr::addr_of!(d.data) as u32;
+        let kd = &mut *core::ptr::addr_of_mut!(KBD_DMA);
+        let data_phys = core::ptr::addr_of!(kd.report) as u32;
         // One interrupt IN, up to 8 bytes. Tight bound: this runs in the core-0 timer ISR.
         flush_dcache(data_phys, 8);                          // invalidate before the device writes
         let hcsplt = hcsplt_for_current();
@@ -2643,7 +2657,7 @@ pub fn poll() {
         ks.unhealthy = 0;
         flush_dcache(data_phys, 8);                          // invalidate after -> read device bytes
         let mut report = [0u8; 8];
-        report.copy_from_slice(&d.data[..8]);
+        report.copy_from_slice(&kd.report[..8]);
         KBD_TOGGLE.store(!toggle, Ordering::Relaxed);            // advance the data toggle on a real packet
         // Ctrl+Alt+Del: SIGNAL it on the console stream; the shell (which holds REBOOT) decides (§6.4).
         if super::hid::is_ctrl_alt_del(&report) {
