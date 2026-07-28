@@ -1179,6 +1179,19 @@ impl Fs {
         let primary = block_read(ctx, 0);
         if let Some(ref b) = primary {
             if Self::sb_valid(b) { return Ok(*b); }
+            // A FOREIGN disk - a partition table or FAT boot record at block 0 - is NOT a corrupt GSFS
+            // primary, and must NOT trigger the backup fallback. The disk was deliberately partitioned
+            // by another OS (e.g. `diskpart`), and any GSFS backup still sitting at the last block is a
+            // STALE remnant of a former format that a partition-level format does not reach. Recovering
+            // from it resurrects a dead filesystem - and then "heals" the primary by writing that stale
+            // superblock OVER the user's partition table, silently un-formatting the disk they just
+            // formatted (observed: a freshly diskpart'd stick kept coming back as the old GSFS with an
+            // unreadable root). Block 0 is the truth about what the disk currently IS; honour it.
+            if let Some(what) = foreign_disk(b) {
+                ctx.log_fmt(format_args!(
+                    "fs: block 0 holds {} - a foreign disk, not GodspeedOS; NOT recovering from any stale backup (run 'drives flash <n> data force' to format)", what));
+                return Err("disk holds a foreign partition table, not a GodspeedOS filesystem");
+            }
         }
         // Primary missing/corrupt - try the backup at capacity-1. `block_capacity` already rejects a
         // mis-read/absurd value (returns None -> 0 here), so `cap` is a sane sector count or 0; the
