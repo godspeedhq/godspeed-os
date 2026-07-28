@@ -333,13 +333,11 @@ pub fn init() {
     // exactly that channel's bit. Port interrupts (Prtint) are not gated by HAINTMSK and are the ISR's
     // only live source for now - enough to prove the route end to end.
     wr(HAINTMSK, 0x0000);
-    // Hchint (25) + Prtint (24), plus a TEMPORARY stage-0 delivery probe: SOF (bit 3), which the core
-    // raises every microframe while the port is enabled. A port change is a one-shot event already
-    // consumed by the boot reset, so it cannot prove the route; a SOF fires continuously, so the very
-    // first one delivered proves the whole legacy-controller -> GPU-funnel -> core path works (and, on
-    // QEMU, whether its model raises USB interrupts at all). `on_usb_irq` disables SOF the instant it
-    // sees one, so it proves delivery without storming. Removed once a channel drives the ISR for real.
-    wr(GINTMSK, (1 << 25) | (1 << 24) | (1 << 3));
+    // Hchint (25) + Prtint (24). Hchint delivers the host-channel HALT interrupts that drive the async
+    // storage path - gated per-channel through HAINTMSK, so only an interrupt-driven channel (CH_BULK)
+    // reaches the ISR; Prtint delivers port-change events. (The stage-0 SOF delivery probe that once also
+    // sat here was removed now that `async_bulk_isr` drives the ISR for real - it was always temporary.)
+    wr(GINTMSK, (1 << 25) | (1 << 24));
     // 5e. Host PHY clock select. CRITICAL for the Pi: with a HS UTMI+ PHY (GUSBCFG.PHYSel=0) driving a
     //     full/low-speed device, Linux's dwc2_init_fs_ls_pclk_sel() selects the 30/60 MHz HS-derived
     //     clock (FSLSPClkSel=0), NOT 48 MHz (which is for a dedicated FS serial PHY). With the wrong FS/LS
@@ -407,7 +405,6 @@ pub fn init() {
 
 /// Count of USB interrupts serviced, for the boot proof and later diagnostics.
 static USB_IRQ_COUNT: AtomicU32 = AtomicU32::new(0);
-static USB_IRQ_PROVEN: AtomicBool = AtomicBool::new(false);
 pub fn usb_irq_count() -> u32 { USB_IRQ_COUNT.load(Ordering::Relaxed) }
 
 /// The USB interrupt service routine, reached from `arm_irq_dispatch` (core 0) when the GPU funnel
@@ -422,15 +419,6 @@ pub fn usb_irq_count() -> u32 { USB_IRQ_COUNT.load(Ordering::Relaxed) }
 pub fn on_usb_irq() {
     let n = USB_IRQ_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     let g = rd(GINTSTS);
-    if g & (1 << 3) != 0 {           // SOF: the stage-0 delivery probe (see init)
-        // Disable SOF immediately so it does not storm, clear it (W1C), and announce ONCE that the
-        // interrupt route works end to end. This whole branch is temporary scaffolding.
-        wr(GINTMSK, rd(GINTMSK) & !(1 << 3));
-        wr(GINTSTS, 1 << 3);
-        if !USB_IRQ_PROVEN.swap(true, Ordering::Relaxed) {
-            pl011_write(b"dwc2: USB IRQ DELIVERY CONFIRMED (SOF) - the interrupt route works end to end\r\n");
-        }
-    }
     if g & (1 << 24) != 0 {          // Prtint: a port change is latched in HPRT's W1C bits
         let hprt = rd(HPRT);
         let changes = hprt & HPRT_WC_BITS;
@@ -2764,7 +2752,7 @@ pub fn msc_sync_cache() -> bool {
     let mut none = [0u8; 0];
     BOT_PROBE.store(true, Ordering::Relaxed);
     let ok = bot_command(MSC_EP_IN.load(Ordering::Relaxed) as u32, MSC_EP_OUT.load(Ordering::Relaxed) as u32,
-                         &cdb, false, &mut none, 0, false);
+                         &cdb, false, &mut none, 0, true); // async (stage 3): storage fully off the poll
     BOT_PROBE.store(false, Ordering::Relaxed);
     if !ok {
         MSC_NO_FLUSH.store(true, Ordering::Relaxed);
