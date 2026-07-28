@@ -2680,7 +2680,7 @@ pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
     buf.copy_from_slice(&src[..512]);
     let ep_in = MSC_EP_IN.load(Ordering::Relaxed) as u32;
     let ep_out = MSC_EP_OUT.load(Ordering::Relaxed) as u32;
-    let mut ok = bot_command(ep_in, ep_out, &cdb(fua), false, &mut buf, 512, false);
+    let mut ok = bot_command(ep_in, ep_out, &cdb(fua), false, &mut buf, 512, true); // async write (stage 2b)
     if ok && fua && !MSC_FUA_LOGGED.swap(true, Ordering::Relaxed) {
         // State the regime once, positively. Inferring it from the ABSENCE of a rejection message
         // makes a log reader guess, and the whole point of this experiment is to know which of the
@@ -2709,12 +2709,12 @@ pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
         //   device SAID), reimplemented for this driver.
         if msc_last_was_busy() { return false; }
         let mut sense = [0u8; 18];
-        let sensed = bot_command(ep_in, ep_out, &[0x03, 0, 0, 0, 18, 0], true, &mut sense, 18, false);
+        let sensed = bot_command(ep_in, ep_out, &[0x03, 0, 0, 0, 18, 0], true, &mut sense, 18, true);
         if sensed && (sense[2] & 0x0F) == 0x05 {
             MSC_NO_FUA.store(true, Ordering::Relaxed);
             pl011_write(b"dwc2: device rejected FUA (ILLEGAL REQUEST) - falling back to plain writes (not durable on ack)\r\n");
             buf.copy_from_slice(&src[..512]);
-            ok = bot_command(ep_in, ep_out, &cdb(false), false, &mut buf, 512, false);
+            ok = bot_command(ep_in, ep_out, &cdb(false), false, &mut buf, 512, true); // async write retry (2b)
         }
         // Sense unavailable or a non-ILLEGAL key: a real I/O failure, already reported by bot_command's
         // own paths. FUA stays on; the retry that follows recovery re-asks with the bit set.
