@@ -1029,7 +1029,15 @@ impl ServiceContext {
     /// (saturates at 0). The `uptime` shell command renders this. Wall-clock based, so it is
     /// correct regardless of the APIC timer mode (unlike a raw tick counter).
     pub fn uptime_secs(&self) -> i64 {
-        (self.datetime().epoch_secs() - self.boot_datetime().epoch_secs()).max(0)
+        // "now" is the DEGLITCHED MONOTONIC clock (query 17), not the raw RTC datetime (which is frozen
+        // at 0 on a board with no RTC, e.g. the Pi 2 - the reason the old `datetime - boot` read 0 there).
+        let now = self.epoch_secs_monotonic();
+        let boot_epoch = self.boot_datetime().epoch_secs();
+        // A board with no RTC reports a zero/garbage boot datetime whose epoch is far before 2001 (a
+        // packed all-zeros datetime unpacks to ~year 0 = ~-6.2e10 s - subtracting THAT would ADD ~1970
+        // years). There the monotonic clock is already seconds-since-boot (its CNTPCT baseline, ARM), so
+        // it IS the uptime. With a real RTC, uptime is the elapsed wall-clock since boot.
+        if boot_epoch < 1_000_000_000 { now.max(0) } else { (now - boot_epoch).max(0) }
     }
 
     /// Timer ticks the given core spent running a user task (not idle) since boot.

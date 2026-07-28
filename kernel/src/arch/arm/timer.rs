@@ -34,6 +34,7 @@
 //! the BCM2836 interrupt controller to route the timer IRQ, which is the next step.
 
 use core::sync::atomic::{AtomicU32, Ordering};
+use portable_atomic::AtomicU64;
 
 use super::pl011_write;
 use super::exceptions::write_hex32;
@@ -44,6 +45,12 @@ use super::exceptions::write_hex32;
 /// Everything that converts counter ticks to time must use this, so a board whose firmware
 /// misreports its own timer cannot silently skew every duration in the kernel.
 static TIMER_HZ: AtomicU32 = AtomicU32::new(0);
+
+/// CNTPCT captured at boot (`timer::init`), so `now_epoch_monotonic` is elapsed-since-boot regardless of
+/// the counter's power-on value: QEMU seeds CNTPCT at a large value (which made system uptime read as
+/// ~1970 years), while real HW starts it near 0. Subtracting this baseline makes both correct.
+static BOOT_CNTPCT: AtomicU64 = AtomicU64::new(0);
+pub fn boot_cntpct() -> u64 { BOOT_CNTPCT.load(Ordering::Relaxed) }
 
 /// The calibrated counter frequency in Hz - the value to divide `cntpct()` deltas by.
 ///
@@ -170,6 +177,8 @@ fn write_dec(mut v: u32) {
 
 /// Report the timer configuration and prove the two clocks agree.
 pub fn init() {
+    // Baseline the monotonic clock at boot (before the 100 ms selftest), so uptime counts from ~here.
+    BOOT_CNTPCT.store(cntpct(), Ordering::Relaxed);
     let freq = cntfrq();
 
     pl011_write(b"arm32: generic timer CNTFRQ = ");

@@ -21,10 +21,6 @@ const MODE_LIVE:    u32 = 0; // `observe`      - refresh forever (full-build str
 const MODE_NOW:     u32 = 1; // `observe now`  - one static frame, then park
 const MODE_LIVE_FG: u32 = 2; // `observe` live - full-screen foreground view
 
-/// Repaint cadence for the live view, in TSC cycles (~0.5 s at 2 GHz on the
-/// T630). `q` is polled every loop iteration regardless, so quit stays snappy.
-const FRAME_CYCLES: u64 = 1_000_000_000;
-
 /// Per-iteration sleep for the live loop, in TSC cycles (~30 ms at 2 GHz). The loop SLEEPS this
 /// long between `q`-polls/repaints instead of busy-`yield`ing, so the core halts in between and
 /// `observe` itself does not peg its core (which would make every task on that core read as
@@ -88,20 +84,25 @@ fn run_live(
     ctx.console_echo(false);
     ctx.console_write("\x1b[?25l\x1b[2J");
 
-    let mut last = ctx.read_tsc();
     // Home + paint the first frame immediately.
     ctx.console_write("\x1b[H");
     print_state(ctx, prev_core_active, prev_core_total, prev_task_ticks, true);
 
-    // Paint forever; the SHELL owns `q` while we run (it polls the console and KILLS us when
-    // pressed, then restores the screen). We do NOT read input ourselves - one reader avoids a
-    // race over the keyboard - and we SLEEP between frames so we never peg our core (a busy
-    // refresh loop would make every task on this core read as ~100% in our own display, the
-    // bug this fixes). Never returns; the shell reaps us.
+    // Pace repaints by the monotonic WALL CLOCK (~1 s), not a raw TSC-cycle delta. The cycle approach
+    // assumed read_tsc() ran at ~2 GHz; on ARM read_tsc() is the generic timer (1 MHz on the Pi 2), so
+    // the ~0.5 s FRAME_CYCLES was really ~1000 s and the view never refreshed (it read as frozen). And
+    // even on x86 the cycle rate is a fragile assumption (the T630's TSC calibration is separately off).
+    // epoch_secs_monotonic is the same reliable clock on every arch - RTC-deglitched on x86,
+    // cntpct/timer_hz on ARM - so the refresh cadence no longer depends on knowing the cycle rate.
+    let mut last = ctx.epoch_secs_monotonic();
+    // Paint forever; the SHELL owns `q` while we run (it polls the console and KILLS us when pressed,
+    // then restores the screen). We do NOT read input ourselves - one reader avoids a race over the
+    // keyboard - and we SLEEP between polls so we never peg our core (a busy refresh loop would make
+    // every task on this core read as ~100% in our own display, the bug this fixes). Never returns.
     loop {
-        ctx.sleep(POLL_SLEEP_CYCLES);
-        let now = ctx.read_tsc();
-        if now.wrapping_sub(last) >= FRAME_CYCLES {
+        ctx.sleep(POLL_SLEEP_CYCLES);   // short yield so we never peg our core between clock checks
+        let now = ctx.epoch_secs_monotonic();
+        if now != last {                // a monotonic second elapsed -> repaint
             last = now;
             ctx.console_write("\x1b[H");
             print_state(ctx, prev_core_active, prev_core_total, prev_task_ticks, true);

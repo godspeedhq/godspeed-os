@@ -1332,7 +1332,9 @@ pub mod rtc {
         // still ADVANCES rather than freezing at 0 (which would make a time-bounded wait never fire -
         // kernel-audit Audit 6, N2). Not reachable on QEMU/real Pi 2 (both set TIMER_HZ).
         if hz == 0 { return super::timer::systimer_secs(); }
-        (super::timer::cntpct() / hz) as i64
+        // Elapsed since the boot baseline, so this is seconds-since-boot on every board - not the raw
+        // counter, which QEMU seeds at a large value (real HW starts near 0). See timer::BOOT_CNTPCT.
+        (super::timer::cntpct().saturating_sub(super::timer::boot_cntpct()) / hz) as i64
     }
 }
 

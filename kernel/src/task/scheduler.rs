@@ -234,13 +234,14 @@ static mut TASK_PENDING_RECV_CAP_COUNT: [usize; MAX_TASKS] = [0; MAX_TASKS];
 // by the LastRecvBadge syscall. Packed `(badge_right << 32) | badge_id`; 0 = no badge.
 static TASK_LAST_BADGE: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
 
-/// RTC wall-clock datetime (packed, `rtc::read_datetime` format) captured at each task's spawn. Per-service
-/// uptime = `now_epoch_monotonic() - epoch_secs(this)` (surfaced by `task_stat`). The RTC gives PORTABLE
-/// real seconds; the monotonic BSP tick counter does NOT - its rate is the timer-IRQ rate, ~100 Hz only in
-/// TSC-deadline mode; on periodic-APIC HW (the T630, QEMU) it is ~10-20 Hz and not even known to the kernel,
-/// so ticks->seconds would be platform-dependent. The "now" read is DEGLITCHED (`now_epoch_monotonic`) so a
-/// transient CMOS misread landing on an in-range year can no longer inflate uptime to thousands of days (the
-/// "4987d" bug). A restart is a fresh spawn, so uptime resets - "since the last (re)start".
+/// `now_epoch_monotonic()` seconds captured at each task's spawn. Per-service uptime = `now_epoch_monotonic()
+/// - this` (surfaced by `task_stat`), both on the one deglitched monotonic timeline. It was a packed RTC
+/// datetime, which needed an `epoch_secs()` conversion and - fatally - read 0 on a board with no RTC (the
+/// Pi 2), zeroing every task's uptime there. now_epoch_monotonic is cntpct/timer_hz on ARM (real seconds
+/// since boot) and the deglitched RTC epoch on x86, so the delta is portable real seconds without a raw
+/// tick-counter (whose rate is platform-dependent and not always known to the kernel). The "now" read is
+/// DEGLITCHED so a transient CMOS misread can no longer inflate uptime to thousands of days (the "4987d"
+/// bug). A restart is a fresh spawn, so uptime resets - "since the last (re)start".
 static TASK_SPAWN_DT: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
 
 // ---------------------------------------------------------------------------
@@ -532,7 +533,7 @@ pub unsafe fn commit_task(
     unsafe {
         TASK_CTX[slot].write(ctx);
         TASK_NAME[slot]             = name;
-        TASK_SPAWN_DT[slot].store(crate::arch::imp::rtc::read_datetime(), Ordering::Relaxed);
+        TASK_SPAWN_DT[slot].store(crate::arch::imp::rtc::now_epoch_monotonic().max(0) as u64, Ordering::Relaxed);
         TASK_IS_USER[slot]          = is_user;
         // Arch hook: on ARM a user task's syscalls must run atomically (the timer skips preempting it
         // in SVC), which needs the slot recorded arch-locally. No-op on x86 (it reads TASK_IS_USER).
@@ -572,7 +573,7 @@ pub fn enqueue(
                 TASK_CAP[i].write(caps);
                 TASK_STATE[i].store(TaskState::Ready as u8, Ordering::Relaxed);
                 TASK_NAME[i]             = name;
-                TASK_SPAWN_DT[i].store(crate::arch::imp::rtc::read_datetime(), Ordering::Relaxed);
+                TASK_SPAWN_DT[i].store(crate::arch::imp::rtc::now_epoch_monotonic().max(0) as u64, Ordering::Relaxed);
                 TASK_VALID[i].store(true, Ordering::Release);
                 TASK_CORE[i]             = core_id;
                 TASK_IS_USER[i]          = is_user;
@@ -875,18 +876,16 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
             queue_depth,
             run_ticks:   TASK_RUN_TICKS[slot].load(Ordering::Relaxed),
             uptime_secs: {
-                // RTC epoch delta from the spawn stamp to a DEGLITCHED now. now_epoch_monotonic rejects a
-                // backwards step or an implausible (>1 day) forward jump, so a transient CMOS misread of
-                // "now" can no longer inflate this to thousands of days (the "4987d" bug). Two further
-                // clamps: .max(0) floors a backwards delta, and the result is capped at the system uptime
-                // (a service is never older than the system). 0 if never stamped (empty slot).
+                // Seconds since spawn, both timestamps on the SAME deglitched MONOTONIC clock
+                // (now_epoch_monotonic). The stamp used to be a packed RTC datetime, which forced an
+                // epoch_secs() conversion and read 0 on a board with no RTC (the Pi 2) - so every task's
+                // uptime was 0 there. now_epoch_monotonic is cntpct/timer_hz on ARM (seconds since boot)
+                // and the deglitched RTC epoch on x86, so `now - spawn` is correct on both. saturating_sub
+                // floors a backwards read; the monotonic timeline caps it at the system uptime intrinsically
+                // (a task can't spawn before boot). 0 if never stamped (empty slot / spawned at second 0).
                 let spawn = TASK_SPAWN_DT[slot].load(Ordering::Relaxed);
                 if spawn == 0 { 0 } else {
-                    let now  = crate::arch::imp::rtc::now_epoch_monotonic();
-                    let svc  = (now - crate::arch::imp::rtc::epoch_secs(spawn)).max(0);
-                    let boot = crate::arch::imp::rtc::boot_datetime();
-                    let sys  = if boot == 0 { svc } else { (now - crate::arch::imp::rtc::epoch_secs(boot)).max(0) };
-                    svc.min(sys) as u64
+                    (crate::arch::imp::rtc::now_epoch_monotonic().max(0) as u64).saturating_sub(spawn)
                 }
             },
         }
