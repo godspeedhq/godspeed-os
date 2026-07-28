@@ -443,6 +443,12 @@ pub fn on_usb_irq() {
             pl011_write(b"\r\n");
         }
     }
+    if g & (1 << 25) != 0 {          // Hchint: a host channel halted (only gated channels reach here)
+        let haint = rd(HAINT);
+        // CH_BULK is the only interrupt-driven channel today (async storage, stage 2); the keyboard and
+        // net channels stay polled and are not gated into HAINTMSK, so they never reach this path.
+        if haint & (1 << CH_BULK) != 0 { async_bulk_isr(); }
+    }
 }
 
 /// Drive a USB reset on the root port (required to move an attached device from Powered to Default so it
@@ -835,7 +841,7 @@ fn flush_dcache(addr: u32, len: u32) {
 /// the data itself. Retries on NAK / transaction-error up to `tries` times; STALL or exhausted retries is
 /// a hard failure. `tries == 1` (no backoff) is the fast path for polling an endpoint that legitimately
 /// NAKs when idle (a bulk IN with no frame queued), so an empty poll returns immediately.
-fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u32) -> bool {
+fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, ep_type: u32, can_block: bool) -> bool {
     let hcsplt = hcsplt_for_current();
     if hcsplt != 0 {
         // SPLIT path, ONE low/full-speed packet per split transaction. The DWC2 does not auto-continue a
@@ -878,6 +884,13 @@ fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, e
             cur_pid = if cur_pid == PID_DATA1 { PID_DATA0 } else { PID_DATA1 }; // control/bulk data toggle
         }
     }
+    // INTERRUPT-DRIVEN direct path (async block I/O, stage 2): arm the channel, park the calling task,
+    // and let the channel-halt ISR re-arm on NAK / wake on completion - so the core is free (the keyboard
+    // tick, other tasks) instead of spinning IRQs-masked. Only the runtime storage path passes
+    // can_block=true; boot enumeration (no task to park) and, until stage 2b, writes keep the spin path.
+    if can_block {
+        return chan_dma_async(ch, dir_in, pid, len, buf_phys, ep, ep_type);
+    }
     // DIRECT (high-speed) path: the core handles multi-packet framing + the data toggle itself.
     let mut xact_errs = 0u32;
     let started = super::timer::systimer_us();
@@ -901,6 +914,162 @@ fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, e
         }
         super::uart_rx_drain_now();   // keep serial input alive during a long IRQs-masked wait
         spin(5_000);
+    }
+}
+
+// --- Interrupt-driven storage: async block I/O on CH_BULK (stage 2) --------------------------------
+// The block-driver is single-threaded, so at most ONE storage transfer is ever in flight - a single
+// waiter holds its parked task and the registers to replay on a NAK re-arm. Written IRQ-masked at arm
+// (the storage syscall) and read/updated only by the USB channel-halt ISR and the tick watchdog, which
+// are also IRQ-masked on core 0 - so it is core-0 exclusive in fact, like KBD_STATE/DMA.
+struct AsyncBulk {
+    active: bool,
+    slot: u32,                 // parked task's scheduler slot (u32::MAX = none)
+    // Captured channel registers, REPLAYED verbatim to re-arm on a NAK. Replaying (not re-calling
+    // chan_program) is what makes the re-arm immune to the concurrent keyboard poll, which changes the
+    // shared MPS0/DEV_ADDR/LOW_SPEED that chan_program would otherwise read.
+    hcchar: u32, hctsiz: u32, hcdma: u32, hcsplt: u32,
+    started_us: u32,           // NAK-budget origin
+    budget_us: u32,            // the budget captured at arm (same value the spin path uses)
+    xact_errs: u32,
+}
+static mut ASYNC_BULK: AsyncBulk = AsyncBulk {
+    active: false, slot: u32::MAX, hcchar: 0, hctsiz: 0, hcdma: 0, hcsplt: 0,
+    started_us: 0, budget_us: 0, xact_errs: 0,
+};
+// Wake result carried through park_current(): a real HCINT (its bits are all in the low 8) for a halt the
+// ISR saw, or this sentinel when the budget expired with no terminal halt. Negative so it can never be
+// mistaken for an HCINT value.
+const ASYNC_TIMEOUT: i64 = -0x0100_0000;
+// The tick watchdog fires this far PAST the budget, so the ISR's own budget check (which runs the instant
+// a NAK halts the channel) handles the normal slow-stick timeout; the watchdog only catches a device that
+// never halts at all - no channel interrupt ever arrives - which the ISR cannot see.
+const ASYNC_WATCHDOG_MARGIN_US: u32 = 200_000;
+
+/// Arm a direct (high-speed) transfer on CH_BULK and PARK the calling task until the channel-halt ISR
+/// wakes it. Returns the same verdicts the spin path returns (true on XferCompl; false on STALL /
+/// repeated XactErr / NAK-budget timeout), so callers are unchanged. Preconditions: IRQs masked (syscall
+/// context), hcsplt == 0 (direct - storage is high-speed). Reached only with can_block = true.
+fn chan_dma_async(ch: u32, dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u32, ep_type: u32) -> bool {
+    let slot = crate::task::scheduler::current_task_slot();
+    // No task to park (boot/idle context, or a mis-set flag): fall back to one bounded synchronous
+    // attempt so the degradation is correct-but-slow, never a hang.
+    if slot >= crate::task::scheduler::MAX_TASKS {
+        chan_program(ch, dir_in, pid, len, buf_phys, ep, ep_type, 0);
+        let ci = wait_halt(ch);
+        if ci & HCINT_XFERCOMPL != 0 {
+            NEXT_BULK_PID_DATA1.store((rd(hctsiz_at(ch)) >> 29) & 0x3 == PID_DATA1, Ordering::Relaxed);
+            return true;
+        }
+        LAST_FAIL.store(if ci & HCINT_STALL != 0 { FAIL_STALL } else { FAIL_XACT }, Ordering::Relaxed);
+        return false;
+    }
+    // Gate CH_BULK's halt to the CPU: only CHHLTD (a terminal halt) reaches HAINT, and only CH_BULK
+    // reaches Hchint. Toggled per transfer so the SPIN path (boot enumeration, writes) is never exposed
+    // to the ISR clearing HCINT under its poll.
+    wr(hcintmsk_at(CH_BULK), HCINT_CHHLTD);
+    wr(HAINTMSK, rd(HAINTMSK) | (1 << CH_BULK));
+    chan_program(ch, dir_in, pid, len, buf_phys, ep, ep_type, 0);
+    // SAFETY: core-0 exclusive, IRQ-masked; the ISR/watchdog cannot run until park_current() switches
+    // away (which enables IRQs on the next task), so the arm + capture completes before any reader.
+    let result = unsafe {
+        let x = &mut *core::ptr::addr_of_mut!(ASYNC_BULK);
+        x.hcchar = rd(hcchar_at(ch));
+        x.hctsiz = rd(hctsiz_at(ch));
+        x.hcdma  = rd(hcdma_at(ch));
+        x.hcsplt = rd(hcsplt_at(ch));
+        x.started_us = super::timer::systimer_us();
+        x.budget_us  = nak_budget_us();
+        x.xact_errs  = 0;
+        x.slot   = slot as u32;
+        x.active = true;
+        // Park: CAS Running->Blocked, switch away, and return the value wake_by_slot delivered on resume.
+        crate::task::scheduler::park_current()
+    };
+    // Resumed (IRQ-masked). Ungate CH_BULK so the next spin-path transfer is not disturbed by the ISR.
+    wr(HAINTMSK, rd(HAINTMSK) & !(1 << CH_BULK));
+    if result == ASYNC_TIMEOUT {
+        LAST_FAIL.store(FAIL_NAK_TIMEOUT, Ordering::Relaxed);
+        return false;
+    }
+    let ci = result as u32;
+    if ci & HCINT_XFERCOMPL != 0 {
+        NEXT_BULK_PID_DATA1.store((rd(hctsiz_at(ch)) >> 29) & 0x3 == PID_DATA1, Ordering::Relaxed);
+        return true;
+    }
+    LAST_FAIL.store(if ci & HCINT_STALL != 0 { FAIL_STALL } else { FAIL_XACT }, Ordering::Relaxed);
+    false
+}
+
+/// Re-arm CH_BULK by REPLAYING the captured registers - immune to the concurrent keyboard poll, which
+/// changes the shared MPS0/DEV_ADDR/LOW_SPEED that a fresh chan_program would read.
+fn async_bulk_rearm(x: &AsyncBulk) {
+    let ch = CH_BULK;
+    wr(hcint_at(ch), 0xFFFF_FFFF);            // clear the halt we just handled
+    wr(hctsiz_at(ch), x.hctsiz);
+    wr(hcdma_at(ch), x.hcdma);
+    wr(hcsplt_at(ch), x.hcsplt);
+    wr(hcchar_at(ch), x.hcchar | (1 << 31));  // re-enable the channel
+}
+
+/// Deliver a wake to the parked storage task and disarm the waiter.
+fn async_bulk_wake(x: &mut AsyncBulk, result: i64) {
+    let slot = x.slot;
+    x.active = false;
+    x.slot = u32::MAX;
+    if slot != u32::MAX {
+        crate::task::scheduler::wake_by_slot(slot as usize, result);
+    }
+}
+
+/// CH_BULK channel-halt handler, called from `on_usb_irq` when Hchint names CH_BULK. This IS the body of
+/// the spin loop, triggered by the halt interrupt instead of by polling: XferCompl -> wake ok; STALL /
+/// repeated XactErr -> wake fail; NAK/NYET -> re-arm unless the budget is spent (then wake timeout).
+fn async_bulk_isr() {
+    let hcint = rd(hcint_at(CH_BULK));
+    wr(hcint_at(CH_BULK), hcint);             // W1C: deassert this channel's HAINT/Hchint
+    // SAFETY: core-0 exclusive, IRQ-masked (interrupt context).
+    unsafe {
+        let x = &mut *core::ptr::addr_of_mut!(ASYNC_BULK);
+        if !x.active { return; }              // no parked transfer (should not happen while CH_BULK gated)
+        if hcint & HCINT_XFERCOMPL != 0 {
+            async_bulk_wake(x, hcint as i64);
+        } else if hcint & HCINT_STALL != 0 {
+            async_bulk_wake(x, hcint as i64);
+        } else if hcint & HCINT_XACTERR != 0 {
+            x.xact_errs += 1;
+            if x.xact_errs >= XACT_ERR_MAX { async_bulk_wake(x, hcint as i64); }
+            else { async_bulk_rearm(x); }
+        } else {
+            // NAK / NYET / halted-without-data: flow control - retry until the budget is spent.
+            if super::timer::systimer_us().wrapping_sub(x.started_us) > x.budget_us {
+                async_bulk_wake(x, ASYNC_TIMEOUT);
+            } else {
+                async_bulk_rearm(x);
+            }
+        }
+    }
+}
+
+/// Tick watchdog (core-0 timer): force-wake a parked storage transfer whose device NEVER halted, so no
+/// channel interrupt ever arrived for the ISR to time out. Replaces `wait_halt`'s internal timeout for
+/// the async path - a wedged device stays bounded rather than parking the task forever.
+pub fn async_bulk_watchdog() {
+    // SAFETY: core-0 exclusive, IRQ-masked (timer ISR).
+    unsafe {
+        let x = &mut *core::ptr::addr_of_mut!(ASYNC_BULK);
+        if x.active
+            && super::timer::systimer_us().wrapping_sub(x.started_us)
+                > x.budget_us.saturating_add(ASYNC_WATCHDOG_MARGIN_US)
+        {
+            // Disable the stuck channel so the next transfer starts clean, ungate it, then wake timeout.
+            let ch = CH_BULK;
+            if rd(hcchar_at(ch)) & (1 << 31) != 0 {
+                wr(hcchar_at(ch), (rd(hcchar_at(ch)) & !(1 << 31)) | (1 << 30)); // ChDis
+            }
+            wr(HAINTMSK, rd(HAINTMSK) & !(1 << CH_BULK));
+            async_bulk_wake(x, ASYNC_TIMEOUT);
+        }
     }
 }
 
@@ -1065,7 +1234,7 @@ fn split_txn_periodic(ch: u32, dir_in: bool, pid: u32, len: u32, buf_phys: u32, 
 
 /// A single control-endpoint DMA transaction (ep 0, type control). Thin wrapper so ctrl_xfer reads clean.
 fn ctrl_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32) -> bool {
-    chan_dma(ch, dir_in, pid, buf_phys, len, 0, 0)
+    chan_dma(ch, dir_in, pid, buf_phys, len, 0, 0, false)   // control/enum: boot context, never parks
 }
 
 /// A full control transfer via DMA: SETUP -> (DATA) -> STATUS, through the `DMA` scratch buffer. `data_in`
@@ -1621,7 +1790,7 @@ pub fn net_frame_tx(frame: &[u8]) -> bool {
         buf[..n].copy_from_slice(&frame[..n]);                 // CDC-ECM: raw frame
         n
     };
-    if bulk_xfer(CH_NET, false, ep_out, &mut buf, total) < 0 { return false; }
+    if bulk_xfer(CH_NET, false, ep_out, &mut buf, total, false) < 0 { return false; }
     // CDC-ECM delimits a datagram with a short packet; a frame that is an exact multiple of the bulk max
     // packet size needs a trailing zero-length packet, or the device won't see the frame boundary. (smsc95xx
     // carries an explicit length in its TX command, so it needs no ZLP.)
@@ -1629,7 +1798,7 @@ pub fn net_frame_tx(frame: &[u8]) -> bool {
         let mps = BULK_MPS.load(Ordering::Relaxed) as usize;
         if total != 0 && mps != 0 && total % mps == 0 {
             let mut zlp = [0u8; 1];
-            let _ = bulk_xfer(CH_NET, false, ep_out, &mut zlp, 0);
+            let _ = bulk_xfer(CH_NET, false, ep_out, &mut zlp, 0, false);
         }
     }
     true
@@ -1649,7 +1818,7 @@ pub fn net_frame_rx(dst: &mut [u8]) -> usize {
         // smsc95xx prefixes each frame with a 4-byte RX status word: bit 15 = error summary, bits[30:16] =
         // frame length (INCLUDING the 4-byte FCS, which we strip). The frame follows the status word.
         let mut buf = [0u8; NET_FRAME_MAX + 4];
-        let got = bulk_xfer(CH_NET, true, ep_in, &mut buf, NET_FRAME_MAX + 4);
+        let got = bulk_xfer(CH_NET, true, ep_in, &mut buf, NET_FRAME_MAX + 4, false);
         if got < 4 { return 0; }
         let status = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if status & 0x0000_8000 != 0 { return 0; }             // RX error summary - drop
@@ -1661,7 +1830,7 @@ pub fn net_frame_rx(dst: &mut [u8]) -> usize {
         m
     } else {
         let cap = dst.len().min(NET_FRAME_MAX);                 // CDC-ECM: raw frame, no header
-        let got = bulk_xfer(CH_NET, true, ep_in, dst, cap);
+        let got = bulk_xfer(CH_NET, true, ep_in, dst, cap, false);
         if got > 0 { got as usize } else { 0 }
     }
 }
@@ -1748,8 +1917,19 @@ static BULK_MPS:        AtomicU16  = AtomicU16::new(64);  // bulk endpoint max-p
 /// non-coherent DMA. Uses the bulk endpoint's max-packet (`BULK_MPS`) for the packet count and maintains
 /// the per-direction data toggle. Returns the number of bytes transferred (for IN, the device may send a
 /// short packet, so this can be < `len`), or -1 on failure / no data.
-fn bulk_xfer(ch: u32, dir_in: bool, ep: u32, data: &mut [u8], len: usize) -> i32 {
+fn bulk_xfer(ch: u32, dir_in: bool, ep: u32, data: &mut [u8], len: usize, can_block: bool) -> i32 {
     MPS0.store(BULK_MPS.load(Ordering::Relaxed), Ordering::Relaxed); // chan_program uses MPS0 for pktcnt
+    if ch == CH_BULK && can_block {
+        // ASYNC storage parks between the three BOT transfers (CBW/data/CSW), and the keyboard tick runs
+        // in that gap - re-pointing the SHARED device selection (DEV_ADDR/LOW_SPEED/SPLIT_PORT) at the
+        // keyboard. Re-establish storage's selection before this transfer, here in the IRQs-masked window
+        // (before chan_dma reads SPLIT_PORT and chan_program reads DEV_ADDR/LOW_SPEED), so it is atomic
+        // against the keyboard tick - which needs IRQs to run. MPS0 is already BULK_MPS above; the ISR
+        // re-arm is immune via register replay, so this covers only the FRESH chan_program of each transfer.
+        DEV_ADDR.store(MSC_ADDR.load(Ordering::Relaxed), Ordering::Relaxed);
+        LOW_SPEED.store(false, Ordering::Relaxed);
+        SPLIT_PORT.store(MSC_HUB_PORT.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
     let toggle = if dir_in { &BULK_TOGGLE_IN } else { &BULK_TOGGLE_OUT };
     let pid = if toggle.load(Ordering::Relaxed) { PID_DATA1 } else { PID_DATA0 };
     // SAFETY: the DMA buffers are touched only on core 0; addr_of gives their identity-mapped physical
@@ -1766,7 +1946,7 @@ fn bulk_xfer(ch: u32, dir_in: bool, ep: u32, data: &mut [u8], len: usize) -> i32
         let n = len.min(buf.len());
         if dir_in {
             flush_dcache(data_phys, n as u32);                     // invalidate before the device writes
-            if !chan_dma(ch, true, pid, data_phys, n as u32, ep, 2) { -1i32 }
+            if !chan_dma(ch, true, pid, data_phys, n as u32, ep, 2, can_block) { -1i32 }
             else {
                 flush_dcache(data_phys, n as u32);                 // invalidate after -> read device bytes
                 // HCTSIZ.xfersize counts DOWN as bytes arrive, so received = requested - remaining.
@@ -1786,7 +1966,7 @@ fn bulk_xfer(ch: u32, dir_in: bool, ep: u32, data: &mut [u8], len: usize) -> i32
             let m = n.min(data.len());
             buf[..m].copy_from_slice(&data[..m]);
             flush_dcache(data_phys, m as u32);
-            if chan_dma(ch, false, pid, data_phys, m as u32, ep, 2) { m as i32 } else { -1i32 }
+            if chan_dma(ch, false, pid, data_phys, m as u32, ep, 2, can_block) { m as i32 } else { -1i32 }
         }
     };
     // Advance the endpoint data toggle to the parity-correct next PID that chan_dma computed (from the actual
@@ -2052,7 +2232,7 @@ reset clears the device cache and this device accepts no flush)\r\n");
 
 /// Run one SCSI command via BOT. `cdb` is the SCSI command block; `data`/`dlen` is the data stage
 /// (`data_in` selects direction). Returns true iff the command completed with CSW status = passed.
-fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u8], dlen: usize) -> bool {
+fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u8], dlen: usize, can_block: bool) -> bool {
     let mut cbw = [0u8; 31];
     cbw[0..4].copy_from_slice(&0x4342_5355u32.to_le_bytes());     // dCBWSignature "USBC"
     cbw[4..8].copy_from_slice(&0x1234_5678u32.to_le_bytes());     // dCBWTag
@@ -2063,7 +2243,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     let n = cdb.len().min(16);
     cbw[15..15 + n].copy_from_slice(&cdb[..n]);
 
-    if bulk_xfer(CH_BULK, false, ep_out, &mut cbw, 31) < 0 {
+    if bulk_xfer(CH_BULK, false, ep_out, &mut cbw, 31, can_block) < 0 {
         // A BUSY hand-back is not a failure - the caller re-asks and it usually succeeds. Logging
         // it printed 564 lines in ONE selfcheck for entirely normal flow control, which is the
         // same "report a characteristic as a fault" mistake already fixed once this session:
@@ -2083,7 +2263,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     // residue against it rather than trusting a "passed" verdict on a transfer that fell short.
     let mut moved = 0usize;
     if dlen > 0 {
-        let n = bulk_xfer(CH_BULK, data_in, if data_in { ep_in } else { ep_out }, data, dlen);
+        let n = bulk_xfer(CH_BULK, data_in, if data_in { ep_in } else { ep_out }, data, dlen, can_block);
         if n < 0 {
             // A BUSY hand-back is not a failure - the caller re-asks and it usually succeeds. Logging
             // it printed 564 lines in ONE selfcheck for entirely normal flow control, which is the
@@ -2106,7 +2286,7 @@ fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u
     }
 
     let mut csw = [0u8; 13];
-    if bulk_xfer(CH_BULK, true, ep_in, &mut csw, 13) < 0 {
+    if bulk_xfer(CH_BULK, true, ep_in, &mut csw, 13, can_block) < 0 {
         // A BUSY hand-back is not a failure - the caller re-asks and it usually succeeds. Logging
         // it printed 564 lines in ONE selfcheck for entirely normal flow control, which is the
         // same "report a characteristic as a fault" mistake already fixed once this session:
@@ -2245,16 +2425,16 @@ fn probe_mass_storage() -> bool {
     let ei = ep_in as u32;
     let eo = ep_out as u32;
     for _ in 0..8 {
-        if bot_command(ei, eo, &[0u8; 6], false, &mut [], 0) { break; }        // TEST UNIT READY (0x00)
+        if bot_command(ei, eo, &[0u8; 6], false, &mut [], 0, false) { break; } // TEST UNIT READY (0x00)
         let mut sense = [0u8; 18];
-        let _ = bot_command(ei, eo, &[0x03, 0, 0, 0, 18, 0], true, &mut sense, 18); // REQUEST SENSE clears it
+        let _ = bot_command(ei, eo, &[0x03, 0, 0, 0, 18, 0], true, &mut sense, 18, false); // REQUEST SENSE clears it
     }
 
     // READ CAPACITY(10): 8-byte reply = last LBA (BE) + block size (BE).
     let cap_cdb = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let mut cap = [0u8; 8];
     BOT_PROBE.store(false, Ordering::Relaxed);
-    if !bot_command(ep_in as u32, ep_out as u32, &cap_cdb, true, &mut cap, 8) {
+    if !bot_command(ep_in as u32, ep_out as u32, &cap_cdb, true, &mut cap, 8, false) {
         pl011_write(b"dwc2: msc READ CAPACITY failed\r\n"); return true;
     }
     let last_lba = u32::from_be_bytes([cap[0], cap[1], cap[2], cap[3]]);
@@ -2289,7 +2469,7 @@ fn probe_mass_storage() -> bool {
     // truly silent, then restored. A device that is working ends the wait early by delivering; the
     // backstop only catches one that never will.
     IO_NAK_BUDGET_US.store(1_500_000, Ordering::Relaxed);
-    let read_ok = bot_command(ep_in as u32, ep_out as u32, &rd_cdb, true, &mut blk, 512);
+    let read_ok = bot_command(ep_in as u32, ep_out as u32, &rd_cdb, true, &mut blk, 512, false);
     let last_cause = last_fail_str();
     IO_NAK_BUDGET_US.store(0, Ordering::Relaxed);
     if !read_ok {
@@ -2422,7 +2602,7 @@ pub fn msc_read_block(lba: u64, dst: &mut [u8]) -> bool {
     // READ(10): opcode 0x28, LBA big-endian at [2..6], transfer length big-endian at [7..9].
     let cdb = [0x28u8, 0, (l >> 24) as u8, (l >> 16) as u8, (l >> 8) as u8, l as u8, 0, 0, 1, 0];
     let ok = bot_command(MSC_EP_IN.load(Ordering::Relaxed) as u32, MSC_EP_OUT.load(Ordering::Relaxed) as u32,
-                         &cdb, true, &mut dst[..512], 512);
+                         &cdb, true, &mut dst[..512], 512, true);  // async read (stage 2a): park, ISR wakes
     ok
 }
 
@@ -2500,7 +2680,7 @@ pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
     buf.copy_from_slice(&src[..512]);
     let ep_in = MSC_EP_IN.load(Ordering::Relaxed) as u32;
     let ep_out = MSC_EP_OUT.load(Ordering::Relaxed) as u32;
-    let mut ok = bot_command(ep_in, ep_out, &cdb(fua), false, &mut buf, 512);
+    let mut ok = bot_command(ep_in, ep_out, &cdb(fua), false, &mut buf, 512, false);
     if ok && fua && !MSC_FUA_LOGGED.swap(true, Ordering::Relaxed) {
         // State the regime once, positively. Inferring it from the ABSENCE of a rejection message
         // makes a log reader guess, and the whole point of this experiment is to know which of the
@@ -2529,12 +2709,12 @@ pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
         //   device SAID), reimplemented for this driver.
         if msc_last_was_busy() { return false; }
         let mut sense = [0u8; 18];
-        let sensed = bot_command(ep_in, ep_out, &[0x03, 0, 0, 0, 18, 0], true, &mut sense, 18);
+        let sensed = bot_command(ep_in, ep_out, &[0x03, 0, 0, 0, 18, 0], true, &mut sense, 18, false);
         if sensed && (sense[2] & 0x0F) == 0x05 {
             MSC_NO_FUA.store(true, Ordering::Relaxed);
             pl011_write(b"dwc2: device rejected FUA (ILLEGAL REQUEST) - falling back to plain writes (not durable on ack)\r\n");
             buf.copy_from_slice(&src[..512]);
-            ok = bot_command(ep_in, ep_out, &cdb(false), false, &mut buf, 512);
+            ok = bot_command(ep_in, ep_out, &cdb(false), false, &mut buf, 512, false);
         }
         // Sense unavailable or a non-ILLEGAL key: a real I/O failure, already reported by bot_command's
         // own paths. FUA stays on; the retry that follows recovery re-asks with the bit set.
@@ -2584,7 +2764,7 @@ pub fn msc_sync_cache() -> bool {
     let mut none = [0u8; 0];
     BOT_PROBE.store(true, Ordering::Relaxed);
     let ok = bot_command(MSC_EP_IN.load(Ordering::Relaxed) as u32, MSC_EP_OUT.load(Ordering::Relaxed) as u32,
-                         &cdb, false, &mut none, 0);
+                         &cdb, false, &mut none, 0, false);
     BOT_PROBE.store(false, Ordering::Relaxed);
     if !ok {
         MSC_NO_FLUSH.store(true, Ordering::Relaxed);

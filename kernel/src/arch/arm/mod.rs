@@ -1080,7 +1080,7 @@ pub fn uart_rx_poll() {
         let mpidr: u32;
         // SAFETY: reading MPIDR (`c0, c0, 5`) is a side-effect-free PL1 register read.
         unsafe { core::arch::asm!("mrc p15, 0, {m}, c0, c0, 5", m = out(reg) mpidr, options(nomem, nostack)); }
-        if mpidr & 3 == 0 { dwc2::poll(); }
+        if mpidr & 3 == 0 { dwc2::async_bulk_watchdog(); dwc2::poll(); }
     }
     if RX_HEAD.load(Ordering::Acquire) != RX_TAIL.load(Ordering::Acquire) {
         let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
