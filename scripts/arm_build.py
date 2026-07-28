@@ -75,10 +75,18 @@ def main():
     objcopy = shutil.which("rust-objcopy") or "rust-objcopy"
     run([objcopy, "-O", "binary", kelf, img])
 
+    # Stage the canonical Pi 2 boot config next to the kernel, so deploying is copying TWO files
+    # (kernel7.img + config.txt) from build/ - the config the boot depends on is versioned in the repo
+    # (boot/pi2/config.txt), never re-typed onto a card by hand (docs/pi2-deploy.md).
+    cfg_src = os.path.join(ROOT, "boot", "pi2", "config.txt")
+    if os.path.exists(cfg_src):
+        shutil.copyfile(cfg_src, os.path.join(out_dir, "config.txt"))
+
     size = os.path.getsize(img)
     print(f"\nOK  build/kernel7.img  ({size} bytes, feature={kfeatures}, profile={profile})")
     print("Boot in QEMU:  python scripts/arm_run.py")
-    print("Deploy to Pi:  copy build/kernel7.img to the SD card's FAT32 partition")
+    print("Deploy to Pi:  copy build/kernel7.img + build/config.txt to the SD card's FAT boot partition")
+    print("               (full procedure incl. the storage USB stick: docs/pi2-deploy.md)")
 
 
 if __name__ == "__main__":

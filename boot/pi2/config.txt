@@ -1,0 +1,19 @@
+# GodspeedOS - Raspberry Pi 2 (BCM2836, ARMv7) boot config.
+#
+# Canonical copy. `scripts/arm_build.py` copies this next to the built kernel as
+# build/config.txt; deploy by copying it and build/kernel7.img to the FAT boot
+# partition of a card that already carries the Pi firmware (bootcode.bin /
+# start.elf / fixup.dat - written by the Raspberry Pi Imager, or restored from a
+# backup). See docs/pi2-deploy.md for the full procedure.
+
+# Load OUR flat kernel image by name. The Pi 2 firmware loads kernel7.img at 0x8000
+# and branches to its first byte, which is exactly what kernel/kernel-arm.ld expects.
+kernel=kernel7.img
+
+# Force a 32-bit boot. Our port is ARMv7 (Cortex-A7); this guards against a 64-bit
+# Raspberry Pi OS image whose default config would otherwise try to load a kernel8.
+arm_64bit=0
+
+# Keep the PL011 UART enabled and its clock stable, so the 115200 8N1 serial console
+# has the right baud. Without this the UART clocking can drift and serial is garbled.
+enable_uart=1

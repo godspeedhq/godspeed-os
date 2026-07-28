@@ -63,8 +63,10 @@ python scripts/arm_run.py --release --usb          # boot in QEMU with an emulat
 kernel (which embeds them via `kernel/build.rs`'s `arm_built` allowlist), and objcopies to a flat
 `build/kernel7.img`. The supervisor is built with its `bare-metal` feature (the "usable OS, quiet gsh>"
 set: logger + shell, no harness probes; `ping`/`pong` spawnable on demand). Deploy to a Pi by copying
-`build/kernel7.img` to the SD card's FAT32 partition (a file copy, not a flash - `docs/multi-arch.md`);
-serial console is **115200 8N1** on the PL011. Prereqs: the same Rust nightly + `cargo` as x86, plus
+`build/kernel7.img` **and `build/config.txt`** to the SD card's FAT boot partition (a file copy, not a
+flash - `docs/multi-arch.md`); the **full procedure** (preparing the boot card *and* the storage USB
+stick, with the disk-identification safety and the durability caveat) is **`docs/pi2-deploy.md`**.
+Serial console is **115200 8N1** on the PL011. Prereqs: the same Rust nightly + `cargo` as x86, plus
 Python 3 and `qemu-system-arm`. `osdev` itself is still x86-only; these scripts are the ARM equivalent of
 `osdev build`/`run` until ARM becomes a first-class `osdev` target.
 
