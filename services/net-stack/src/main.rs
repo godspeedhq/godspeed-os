@@ -60,6 +60,10 @@ const DANCE_SECS:  i64 = 2;
 /// the cable is unplugged (the nic-driver goes slow on RDU-recovery) `ping` gives up in ~1 s per query and
 /// shows "no link" fast, instead of each query stalling at the 2 s DANCE budget. The boot DANCE keeps 2 s.
 const LINK_SECS:   i64 = 1;
+/// A ping reply may be delivered a ping or two behind the request that produced it (residual RX
+/// delivery lag), so a reply matches the current seq OR one within this small BACKWARD window - the set
+/// of still-outstanding echoes. Small enough that a stale reply from a dead link still cannot match.
+const SEQ_MATCH_WINDOW: u16 = 4;
 // A few tries per step: on a LIVE network the first frame back can be a background broadcast, so a step
 // retries past stray frames (each retry is fast - a frame is already waiting) to find its real reply.
 const DANCE_TRIES: u32 = 6;
@@ -101,6 +105,29 @@ fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
 /// OFFER. This proves the UDP transport (the layer the socket capability sits on) over the frame
 /// interface. Returns the offered IP, or None (no NIC / nothing answered). A real net-stack would use
 /// this to LEARN its own IP instead of hardcoding it; here it demonstrates the round-trip.
+/// Drain RX-ring batches ([9]) and call `on_frame` for each frame until it returns true (matched) or the
+/// deadline elapses. On a busy LAN the reply arrives amid a FLOOD of broadcast, so every path that waits
+/// for a specific reply must SCAN every frame, not take the one coupled frame back - the shared receive.
+fn drain_scan(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8]) -> bool) {
+    let t0 = ctx.epoch_secs_monotonic();
+    loop {
+        if let Some(b) = nic_req(ctx, &Message::from_bytes(&[9u8]), LINK_SECS) {
+            let p = b.payload_bytes();
+            let n = if p.is_empty() { 0 } else { p[0] as usize };
+            let mut pos = 1usize;
+            for _ in 0..n {
+                if pos + 2 > p.len() { break; }
+                let fl = u16::from_le_bytes([p[pos], p[pos + 1]]) as usize;
+                pos += 2;
+                if pos + fl > p.len() { break; }
+                if on_frame(&p[pos..pos + fl]) { return; }
+                pos += fl;
+            }
+        }
+        if ctx.epoch_secs_monotonic() - t0 >= secs { return; }
+    }
+}
+
 fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
     // Ethernet(14) + IPv4(20) + UDP(8) + DHCP/BOOTP(244) = 286 bytes.
     let mut frame = [0u8; 286];
@@ -134,49 +161,43 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u
 
     let req = Message::from_bytes(&frame);
     for _ in 0..DANCE_TRIES {
-        match ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS) {
-            Some(reply) => {
-                let f = reply.payload_bytes();
-                // A DHCP reply: IPv4 (0x0800, IHL 5), UDP (proto 17), BOOTP op = 2 (BOOTREPLY). yiaddr
-                // (our offered IP) sits at BOOTP offset 16 = frame offset 58.
-                if f.len() >= 62 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
-                    && f[23] == 17 && f[42] == 2 {
-                    let ip = [f[58], f[59], f[60], f[61]];
-                    // Learn the GATEWAY from the offer's options (magic cookie at frame offset 278 ->
-                    // options at 282), option 3 = router. This is what makes it work on a REAL network
-                    // (the gateway is 192.168.x.1, not QEMU's 10.0.2.2). Fall back to <subnet>.1.
-                    let mut gw = [ip[0], ip[1], ip[2], 1];
-                    let mut dns = [0u8; 4];
-                    let mut have_dns = false;
-                    let mut o = 282usize;
-                    while o + 1 < f.len() {
-                        let opt = f[o];
-                        if opt == 255 { break; }          // options end
-                        if opt == 0 { o += 1; continue; } // pad
-                        let len = f[o + 1] as usize;
-                        if opt == 3 && len >= 4 && o + 6 <= f.len() {           // router = gateway
-                            gw = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]];
-                        }
-                        if opt == 6 && len >= 4 && o + 6 <= f.len() {           // domain name server
-                            dns = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]];
-                            have_dns = true;
-                        }
-                        o += 2 + len;
-                    }
-                    if !have_dns { dns = gw; }            // no DNS option: the gateway usually forwards DNS
-                    ctx.log_fmt(format_args!(
-                        "net-stack: DHCP - offered {}.{}.{}.{}, gw {}.{}.{}.{}, dns {}.{}.{}.{}",
-                        ip[0], ip[1], ip[2], ip[3], gw[0], gw[1], gw[2], gw[3], dns[0], dns[1], dns[2], dns[3]));
-                    return Some((ip, gw, dns));
+        // Send the DISCOVER, then DRAIN + SCAN the RX ring for the OFFER: on a busy LAN the offer arrives
+        // amid a flood of broadcast, so we scan every frame within the budget, not just the coupled one.
+        let _ = nic_req(ctx, &req, LINK_SECS);
+        let mut found: Option<([u8; 4], [u8; 4], [u8; 4])> = None;
+        drain_scan(ctx, DANCE_SECS, |f| {
+            // A DHCP reply: IPv4 (0x0800, IHL 5), UDP (proto 17), BOOTP op = 2 (BOOTREPLY). yiaddr (our
+            // offered IP) sits at BOOTP offset 16 = frame offset 58.
+            if f.len() >= 62 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45 && f[23] == 17 && f[42] == 2 {
+                let ip = [f[58], f[59], f[60], f[61]];
+                // Learn the GATEWAY from the offer's options (magic cookie at frame offset 278 -> options
+                // at 282), option 3 = router. This is what makes it work on a REAL network (the gateway is
+                // 192.168.x.1, not QEMU's 10.0.2.2). Fall back to <subnet>.1.
+                let mut gw = [ip[0], ip[1], ip[2], 1];
+                let mut dns = [0u8; 4];
+                let mut have_dns = false;
+                let mut o = 282usize;
+                while o + 1 < f.len() {
+                    let opt = f[o];
+                    if opt == 255 { break; }          // options end
+                    if opt == 0 { o += 1; continue; } // pad
+                    let len = f[o + 1] as usize;
+                    if opt == 3 && len >= 4 && o + 6 <= f.len() { gw = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]]; }
+                    if opt == 6 && len >= 4 && o + 6 <= f.len() { dns = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]]; have_dns = true; }
+                    o += 2 + len;
                 }
-                // A frame came back but not our offer (a background broadcast on a live network) - retry
-                // within the budget rather than giving up on the first stray frame.
-            }
-            None => {
-                // No reply within the deadline: nic-driver still spawning, or not answering frames.
-                ctx.reacquire_by_name("nic-driver");
-            }
+                if !have_dns { dns = gw; }            // no DNS option: the gateway usually forwards DNS
+                found = Some((ip, gw, dns));
+                true
+            } else { false }
+        });
+        if let Some((ip, gw, dns)) = found {
+            ctx.log_fmt(format_args!(
+                "net-stack: DHCP - offered {}.{}.{}.{}, gw {}.{}.{}.{}, dns {}.{}.{}.{}",
+                ip[0], ip[1], ip[2], ip[3], gw[0], gw[1], gw[2], gw[3], dns[0], dns[1], dns[2], dns[3]));
+            return Some((ip, gw, dns));
         }
+        ctx.reacquire_by_name("nic-driver");
     }
     ctx.log("net-stack: DHCP - no offer within the budget - degrading to the fallback IP");
     None
@@ -408,26 +429,29 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target
     arp[22..28].copy_from_slice(our_mac);
     arp[28..32].copy_from_slice(our_ip);
     arp[38..42].copy_from_slice(target);             // target ip = who we ask for
-    let req     = Message::from_bytes(&arp);
-    let rx_only = Message::from_bytes(&[4u8]);
+    let req = Message::from_bytes(&arp);
     let mut arp_out = [0u8; 42];
-    let mut reply = nic_req(ctx, &req, DANCE_SECS);
-    for _ in 0..DNS_RX_TRIES {
-        let (mac, answer_arp) = {
-            let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => &[] };
+    // RETRY like DHCP: re-send the request each attempt (a busy LAN, or a burst the device split across
+    // bulk-INs, can lose one reply), then DRAIN + SCAN the ring for OUR reply, answering any gateway that
+    // ARPs for US along the way so it can reach us.
+    for _ in 0..DANCE_TRIES {
+        let _ = nic_req(ctx, &req, LINK_SECS);
+        let mut result: Option<[u8; 6]> = None;
+        drain_scan(ctx, DANCE_SECS, |f| {
             // An ARP REPLY (oper 2) whose SENDER IP is the target we asked for (not some other host's).
-            let hit = f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 && f[20] == 0x00 && f[21] == 0x02
-                && f[28] == target[0] && f[29] == target[1] && f[30] == target[2] && f[31] == target[3];
-            let mac = if hit { let mut m = [0u8; 6]; m.copy_from_slice(&f[22..28]); Some(m) } else { None };
-            let a = mac.is_none() && build_arp_reply(f, our_ip, our_mac, &mut arp_out);
-            (mac, a)
-        };
-        if let Some(m) = mac { return Some(m); }
-        reply = if answer_arp {
-            ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), DANCE_SECS)
-        } else {
-            ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS)
-        };
+            if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 && f[20] == 0x00 && f[21] == 0x02
+                && f[28] == target[0] && f[29] == target[1] && f[30] == target[2] && f[31] == target[3] {
+                let mut m = [0u8; 6]; m.copy_from_slice(&f[22..28]);
+                result = Some(m);
+                true
+            } else {
+                if build_arp_reply(f, our_ip, our_mac, &mut arp_out) {
+                    let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
+                }
+                false
+            }
+        });
+        if let Some(m) = result { return Some(m); }
     }
     None
 }
@@ -451,7 +475,11 @@ fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
     n = 0;
     while ctx.epoch_secs_monotonic() == s1 { ctx.yield_cpu(); n += 1; if n > SPIN_MAX { return 0; } }
     let hz = ctx.read_tsc().wrapping_sub(t0);
-    if (100_000_000..=10_000_000_000).contains(&hz) { hz } else { 0 }   // 100 MHz .. 10 GHz is sane
+    // 0.5 MHz .. 10 GHz spans an ARM generic timer (the Pi 2's cntpct advances ~1 MHz) through a fast
+    // x86 TSC (GHz). The old 100 MHz floor was written for x86 TSCs and REJECTED the slow ARM timer,
+    // returning 0 -> tsc_hz 0 -> the ping poll window (tsc_hz/3) collapsed to ~0 cycles, so ping only
+    // ever caught a reply landing inside the single initial drain (the ~50% "random" loss; RTT read 0).
+    if (500_000..=10_000_000_000).contains(&hz) { hz } else { 0 }
 }
 
 /// Send one ICMP echo of `payload_len` data bytes to `dest_ip` and wait for the reply. Returns
@@ -498,7 +526,16 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
         f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
             && f[23] == 1 && f[34] == 0
             && f[26] == dest_ip[0] && f[27] == dest_ip[1] && f[28] == dest_ip[2] && f[29] == dest_ip[3]
-            && f[40] == (seq >> 8) as u8 && f[41] == seq as u8
+            && {
+                // Match the CURRENT seq OR a very recent one. At 1 ping/s with a small delivery lag,
+                // a reply is delivered a ping or two behind the one that requested it, so there are
+                // always a few OUTSTANDING requests - a reply should match any of them (this is how
+                // ping tracks outstanding echoes), not only the newest. Exact-seq matching reported
+                // loss on a link that works. A stale reply from long ago still cannot match (window is
+                // small and backward-only), so a genuine dead link still shows loss.
+                let s = ((f[40] as u16) << 8) | (f[41] as u16);
+                seq.wrapping_sub(s) <= SEQ_MATCH_WINDOW
+            }
     };
     // us = cycles * 1e6 / tsc_hz (RTC-calibrated; the kernel's CPUID/PIT calib yields 0 on the AMD T630).
     // Finer than ms so a sub-ms LAN RTT is distinguishable from a WAN one; capped at 65 ms (u16).
@@ -520,30 +557,38 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
         None => *timeouts += 1,
     }
 
-    // 2. On a busy LAN the reply can be a frame or two BEHIND a stray broadcast. Drain a BATCH of frames
-    //    in ONE bounded round-trip ([9]) and scan it for our reply - NOT N slow re-queries (each polling
-    //    the full RX budget when the ring was momentarily empty; that pushed net-stack past the shell's
-    //    deadline). The batch is [count:u8] then [len:u16 LE, bytes] per frame; nic-driver stays pure
-    //    mechanism (raw frames), the ICMP match lives here (Commandment X).
-    if let Some(b) = nic_req(ctx, &Message::from_bytes(&[9u8]), LINK_SECS) {
-        let p = b.payload_bytes();
-        let n = if p.is_empty() { 0 } else { p[0] as usize };
-        let mut pos = 1usize;
-        for _ in 0..n {
-            if pos + 2 > p.len() { break; }
-            let fl = u16::from_le_bytes([p[pos], p[pos + 1]]) as usize;
-            pos += 2;
-            if pos + fl > p.len() { break; }
-            let f = &p[pos..pos + fl];
-            pos += fl;
-            *frames += 1;
-            if is_echo(f) { return Some((rtt_us(), f[22])); }
-            if build_arp_reply(f, our_ip, our_mac, &mut arp_out) {
-                let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
+    // 2. Poll for OUR reply until it arrives or a ~330 ms window closes, draining a BATCH of frames
+    //    ([9]) each round and scanning it. The reply for a WAN host arrives tens of ms AFTER the echo -
+    //    AFTER a single drain - so the old ONE-drain code raced the reply and lost, then discarded the
+    //    late reply on the next seq (frames were being RETRIEVED, the ping still timed out). The window
+    //    is bounded by read_tsc (tsc_hz-calibrated), a real sub-second wait, so a fast reply returns at
+    //    once and a lost one gives up quickly - not the 1 s-granular epoch clock. Batch = [count:u8]
+    //    then [len:u16 LE, bytes] per frame; nic-driver stays pure mechanism, the ICMP match lives here.
+    let deadline_cycles = if tsc_hz > 0 { tsc_hz / 3 } else { 0 };   // ~330 ms
+    loop {
+        if let Some(b) = nic_req(ctx, &Message::from_bytes(&[9u8]), LINK_SECS) {
+            let p = b.payload_bytes();
+            let n = if p.is_empty() { 0 } else { p[0] as usize };
+            let mut pos = 1usize;
+            for _ in 0..n {
+                if pos + 2 > p.len() { break; }
+                let fl = u16::from_le_bytes([p[pos], p[pos + 1]]) as usize;
+                pos += 2;
+                if pos + fl > p.len() { break; }
+                let f = &p[pos..pos + fl];
+                pos += fl;
+                *frames += 1;
+                if is_echo(f) { return Some((rtt_us(), f[22])); }
+                if build_arp_reply(f, our_ip, our_mac, &mut arp_out) {
+                    let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
+                }
             }
         }
+        // Give up once the reply window closes (or immediately if the clock is uncalibrated - one drain).
+        if deadline_cycles == 0 || ctx.read_tsc().wrapping_sub(t1) >= deadline_cycles {
+            return None;
+        }
     }
-    None
 }
 
 /// What one run of the boot dance (DHCP -> ARP -> ICMP) learns: our IP, the gateway's MAC, whether ARP

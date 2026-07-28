@@ -1616,6 +1616,9 @@ const SMSC_MAC_CR: u16 = 0x100;
 const SMSC_MAC_CR_TXEN: u32 = 0x0000_0008;
 const SMSC_MAC_CR_RXEN: u32 = 0x0000_0004;
 const SMSC_MAC_CR_FDPX: u32 = 0x0010_0000;      // full-duplex (Linux MAC_CR_FDPX_)
+const SMSC_MAC_CR_PRMS:   u32 = 0x0004_0000;    // promiscuous (receive ALL)
+const SMSC_MAC_CR_MCPAS:  u32 = 0x0008_0000;    // pass ALL multicast
+const SMSC_MAC_CR_HPFILT: u32 = 0x0000_2000;    // hash-perfect multicast filter
 const SMSC_ADDRH: u16 = 0x104;
 const SMSC_ADDRL: u16 = 0x108;
 const SMSC_TX_CFG: u16 = 0x10;
@@ -1625,6 +1628,15 @@ const SMSC_MII_DATA: u16 = 0x118;
 const SMSC_PHY_ID: u32 = 1;                     // the internal PHY is at MII address 1
 const SMSC_MII_BMCR: u32 = 0;                   // basic mode control register
 const SMSC_MII_ADVERTISE: u32 = 4;
+const SMSC_MII_BMSR: u32 = 1;                   // basic mode STATUS register (bit 2 = link up)
+// Multi-frame (turbo) RX: the smsc95xx aggregates MANY ethernet frames into ONE bulk-IN burst, each
+// prefixed with a 4-byte RX status word and DWORD-aligned (Linux smsc95xx_rx_fixup + smsc95xx_reset).
+const SMSC_HW_CFG_MEF: u32 = 0x0000_0020;       // Multiple Ethernet Frames per burst
+const SMSC_HW_CFG_BCE: u32 = 0x0000_0002;       // Burst Cap Enable
+const SMSC_HW_CFG_RXDOFF: u32 = 0x0000_0600;    // RX data offset [10:9]; cleared -> frame right after status
+const SMSC_RX_STS_ES: u32 = 0x0000_8000;        // RX status: error summary
+const NET_RX_BURST_PKTS:  u32   = 8;            // burst = 8 HS packets = 4096 bytes
+const NET_RX_BURST_BYTES: usize = (NET_RX_BURST_PKTS as usize) * 512;
 
 /// Write a 4-byte smsc95xx register via a vendor control OUT (bRequest 0xA0; offset in wIndex).
 fn smsc_write_reg(index: u16, value: u32) -> bool {
@@ -1735,10 +1747,16 @@ fn configure_smsc95xx() -> bool {
     smsc_write_reg(SMSC_ADDRL, (mac[0] as u32) | ((mac[1] as u32) << 8) | ((mac[2] as u32) << 16) | ((mac[3] as u32) << 24));
     smsc_write_reg(SMSC_ADDRH, (mac[4] as u32) | ((mac[5] as u32) << 8));
 
-    // Read-modify-write (Linux does): a bare write would clear HW_CFG's non-zero power-on default bits.
-    smsc_write_reg(SMSC_HW_CFG, smsc_read_reg(SMSC_HW_CFG) | SMSC_HW_CFG_BIR); // empty bulk-IN -> 0-length packet, not a NAK
-    smsc_write_reg(SMSC_BURST_CAP, 0);                          // one frame per transfer (our simple model)
-    smsc_write_reg(SMSC_BULK_IN_DLY, 0x2000);                   // smsc95xx default
+    // Multi-frame (turbo) RX (Linux smsc95xx_reset). The chip aggregates MANY ethernet frames into ONE
+    // bulk-IN burst - each with a 4-byte RX status word, DWORD-aligned - instead of one frame per transfer.
+    // Single-frame was far too slow for a busy LAN: frames backed up and replies were delivered late.
+    // Read-modify-write HW_CFG (a bare write clears its power-on defaults): keep BIR (empty bulk-IN ->
+    // 0-length packet, not a NAK), add MEF + BCE, clear RXDOFF so the frame sits right after the status.
+    let hw = (smsc_read_reg(SMSC_HW_CFG) | SMSC_HW_CFG_BIR | SMSC_HW_CFG_MEF | SMSC_HW_CFG_BCE)
+             & !SMSC_HW_CFG_RXDOFF;
+    smsc_write_reg(SMSC_HW_CFG, hw);
+    smsc_write_reg(SMSC_BURST_CAP, NET_RX_BURST_PKTS);         // burst size in 512-byte HS packets
+    smsc_write_reg(SMSC_BULK_IN_DLY, 0x2000);                   // smsc95xx default aggregation window
     smsc_write_reg(SMSC_AFC_CFG, 0x00F8_30A1);                  // flow-control thresholds (smsc95xx default)
 
     // PHY: reset, advertise 10/100, restart auto-negotiation. We do NOT block on link (net-stack retries +
@@ -1752,7 +1770,12 @@ fn configure_smsc95xx() -> bool {
     // Enable TX + RX.
     // FDPX: the Pi's internal PHY negotiates full duplex; without setting it the MAC runs half-duplex on
     // a full-duplex link (late collisions / drops). We do not watch link status, so set it as the default.
-    smsc_write_reg(SMSC_MAC_CR, smsc_read_reg(SMSC_MAC_CR) | SMSC_MAC_CR_TXEN | SMSC_MAC_CR_RXEN | SMSC_MAC_CR_FDPX);
+    // Receive filter: our-unicast (perfect filter = ADDRH/ADDRL) + broadcast ONLY. CLEAR promiscuous,
+    // all-multicast, and hash-filter so the heavy multicast/other flood (mDNS/SSDP/IPv6-ND) is dropped at
+    // the CHIP instead of drowning our replies in the ring - the reset value left some of these set.
+    let mac_cr = (smsc_read_reg(SMSC_MAC_CR) & !(SMSC_MAC_CR_PRMS | SMSC_MAC_CR_MCPAS | SMSC_MAC_CR_HPFILT))
+                 | SMSC_MAC_CR_TXEN | SMSC_MAC_CR_RXEN | SMSC_MAC_CR_FDPX;
+    smsc_write_reg(SMSC_MAC_CR, mac_cr);
     smsc_write_reg(SMSC_TX_CFG, SMSC_TX_CFG_ON);
 
     BULK_MPS.store(bulk_mps, Ordering::Relaxed);
@@ -1822,34 +1845,165 @@ pub fn net_frame_tx(frame: &[u8]) -> bool {
     true
 }
 
-/// Receive one ethernet frame (a single bulk IN attempt), copied into `dst`. Returns the frame length, or
-/// 0 if none is available (the device NAKs an empty bulk IN).
-pub fn net_frame_rx(dst: &mut [u8]) -> usize {
-    if !NET_READY.load(Ordering::Acquire) || !on_core0() { return 0; }
-    // Point the shared channel at the net device (the keyboard poll may have selected itself last).
+// --- RX ring + continuous multi-frame (turbo) drain -----------------------------------------------
+// The smsc95xx aggregates MANY ethernet frames into ONE bulk-IN BURST (turbo mode, HW_CFG MEF|BCE), each
+// frame prefixed with a 4-byte RX status word and DWORD-aligned (Linux `smsc95xx_rx_fixup`). The core-0
+// timer tick reads bursts CONTINUOUSLY into NET_RX_RING (like the keyboard is polled), parsing EVERY
+// frame; `net_frame_rx` (the syscall) serves the ring. This keeps the device buffer drained on a busy
+// LAN so a reply is not buried behind ambient broadcast. Drop-OLDEST on overflow keeps the newest frames.
+// Single producer (`net_rx_drain_tick`, the tick) + single consumer (`net_frame_rx`, the syscall), both
+// core-0 AND IRQ-masked -> mutually exclusive, no lock.
+/// RX bulk-IN NAK budget (us). 1 us gave up on a device NAKing while it assembled a just-arrived frame,
+/// so a reply present but not yet in the bulk FIFO was missed; a few hundred us waits that out while an
+/// empty device (immediate NAK, budget exceeded) still returns promptly so the tick stays short. Note:
+/// the deeper RX loss is poll-COVERAGE (this tick polls ~3% of each 10 ms window), which interrupt-driven
+/// RX will address; the budget only tunes each poll.
+const NET_RX_NAK_US: u32 = 300;
+
+const NET_RX_RING_FRAMES:     usize = 32;
+const NET_RX_BURSTS_PER_TICK: u32   = 4;   // bounded bulk-INs per tick; stops early when the device is empty
+struct NetRxRing {
+    frames: [[u8; NET_FRAME_MAX]; NET_RX_RING_FRAMES],
+    lens:   [u16; NET_RX_RING_FRAMES],
+    head:   usize,
+    tail:   usize,
+    count:  usize,
+}
+static mut NET_RX_RING: NetRxRing = NetRxRing {
+    frames: [[0u8; NET_FRAME_MAX]; NET_RX_RING_FRAMES], lens: [0u16; NET_RX_RING_FRAMES],
+    head: 0, tail: 0, count: 0,
+};
+
+/// The burst RX DMA buffer, sized for one aggregated bulk-IN (NET_RX_BURST_BYTES). Separate from the
+/// shared `DMA` (only 2 KiB) - a burst holds several frames. align(64) for the SEC-28 cache bracket.
+#[repr(C, align(64))]
+struct NetRxDma { data: [u8; NET_RX_BURST_BYTES] }
+static mut NET_RX_DMA: NetRxDma = NetRxDma { data: [0u8; NET_RX_BURST_BYTES] };
+
+/// Enqueue one ethernet frame into the ring, dropping the oldest if full (keep the newest).
+/// SAFETY: core-0 + IRQ-masked; the single producer of NET_RX_RING.
+unsafe fn net_rx_ring_push(frame: &[u8]) {
+    let r = &mut *core::ptr::addr_of_mut!(NET_RX_RING);
+    let n = frame.len().min(NET_FRAME_MAX);
+    if r.count == NET_RX_RING_FRAMES {
+        r.head = (r.head + 1) % NET_RX_RING_FRAMES;
+        r.count -= 1;
+    }
+    r.frames[r.tail][..n].copy_from_slice(&frame[..n]);
+    r.lens[r.tail] = n as u16;
+    r.tail = (r.tail + 1) % NET_RX_RING_FRAMES;
+    r.count += 1;
+}
+
+/// One bulk-IN into NET_RX_DMA. Returns the byte count of the aggregated burst (0 if the device is empty).
+/// Single-shot (1 us NAK budget): an empty device returns at once so the tick stays short.
+fn net_rx_read_burst() -> usize {
     select_device(NET_ADDR.load(Ordering::Relaxed), BULK_MPS.load(Ordering::Relaxed),
                   NET_LOW.load(Ordering::Relaxed));
     let ep_in = NET_EP_IN.load(Ordering::Relaxed) as u32;
-    // A single bulk-IN attempt: a NAK means "no frame queued now" and must return fast (net-stack
-    // re-polls under its own deadline), so no retry/backoff here.
-    if NET_KIND.load(Ordering::Relaxed) == NET_KIND_SMSC {
-        // smsc95xx prefixes each frame with a 4-byte RX status word: bit 15 = error summary, bits[30:16] =
-        // frame length (INCLUDING the 4-byte FCS, which we strip). The frame follows the status word.
-        let mut buf = [0u8; NET_FRAME_MAX + 4];
-        let got = bulk_xfer(CH_NET, true, ep_in, &mut buf, NET_FRAME_MAX + 4, false);
-        if got < 4 { return 0; }
-        let status = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        if status & 0x0000_8000 != 0 { return 0; }             // RX error summary - drop
-        let flen = ((status >> 16) & 0x3FFF) as usize;
-        if flen < 4 || 4 + flen > got as usize { return 0; }
-        let payload = flen - 4;                                 // strip the trailing FCS
-        let m = payload.min(dst.len());
-        dst[..m].copy_from_slice(&buf[4..4 + m]);
+    let _rxb = NakBudget::raised(NET_RX_NAK_US);
+    let pid = if BULK_TOGGLE_IN.load(Ordering::Relaxed) { PID_DATA1 } else { PID_DATA0 };
+    // SAFETY: core-0 only; NET_RX_DMA is identity-mapped; addr_of gives its physical address.
+    unsafe {
+        let d = &mut *core::ptr::addr_of_mut!(NET_RX_DMA);
+        let phys = core::ptr::addr_of!(d.data) as u32;
+        flush_dcache(phys, NET_RX_BURST_BYTES as u32);                       // invalidate before device writes
+        if !chan_dma(CH_NET, true, pid, phys, NET_RX_BURST_BYTES as u32, ep_in, 2, false) { return 0; }
+        flush_dcache(phys, NET_RX_BURST_BYTES as u32);                       // invalidate after -> CPU reads
+        let remaining = (rd(hctsiz_at(CH_NET)) & 0x7_FFFF) as usize;
+        BULK_TOGGLE_IN.store(NEXT_BULK_PID_DATA1.load(Ordering::Relaxed), Ordering::Relaxed);
+        NET_RX_BURST_BYTES.saturating_sub(remaining)
+    }
+}
+
+/// Core-0 timer-tick hook: read a bounded number of bursts and enqueue EVERY frame into the ring, so the
+/// device buffer never backs up regardless of ping activity. smsc95xx: parse the multi-frame burst
+/// ([4-byte status][frame incl FCS][DWORD pad], repeated); CDC-ECM: the whole transfer is one raw frame.
+/// A frame the smsc95xx split across a bulk-IN boundary: its start is saved here, and the next burst's
+/// leading bytes complete it. The turbo device fills a burst up to BURST_CAP and can end a bulk-IN
+/// mid-frame; Linux usbnet reassembles the same way (tracking the expected length across URBs). Core-0
+/// exclusive - touched only by net_rx_drain_tick under the IRQ mask.
+struct NetRxPartial { buf: [u8; NET_FRAME_MAX], len: usize, expect: usize } // expect 0 = none pending
+static mut NET_RX_PARTIAL: NetRxPartial = NetRxPartial { buf: [0u8; NET_FRAME_MAX], len: 0, expect: 0 };
+
+/// Push a complete ethernet frame (FCS already stripped) into the RX ring.
+/// SAFETY: core-0 + IRQ-masked (the ring's single producer).
+unsafe fn net_rx_deliver(frame: &[u8]) {
+    net_rx_ring_push(frame);
+}
+
+pub fn net_rx_drain_tick() {
+    if !NET_READY.load(Ordering::Acquire) || !on_core0() { return; }
+    let smsc = NET_KIND.load(Ordering::Relaxed) == NET_KIND_SMSC;
+    for _ in 0..NET_RX_BURSTS_PER_TICK {
+        let got = net_rx_read_burst();
+        if got == 0 { break; }                                  // device empty - done for this tick
+        // SAFETY: core-0 + IRQ-masked; NET_RX_DMA (written by net_rx_read_burst above) and NET_RX_PARTIAL
+        // are touched only here.
+        unsafe {
+            let d = &*core::ptr::addr_of!(NET_RX_DMA);
+            let buf = &d.data[..got.min(NET_RX_BURST_BYTES)];
+            if !smsc {
+                if !buf.is_empty() { net_rx_deliver(buf); }     // CDC-ECM: one raw frame per transfer
+                continue;
+            }
+            let part = &mut *core::ptr::addr_of_mut!(NET_RX_PARTIAL);
+            let mut pos = 0usize;
+            // A frame the previous burst split: this burst starts with its continuation (no status word).
+            if part.expect > 0 {
+                let need = part.expect - part.len;
+                let take = buf.len().min(need);
+                if part.len + take <= part.buf.len() {
+                    part.buf[part.len..part.len + take].copy_from_slice(&buf[..take]);
+                }
+                part.len += take;
+                pos = take;
+                if part.len >= part.expect {
+                    let flen = part.expect;
+                    if (4..=part.buf.len()).contains(&flen) { net_rx_deliver(&part.buf[..flen - 4]); }
+                    part.expect = 0; part.len = 0;
+                    pos += (4 - (flen % 4)) % 4;                 // skip the DWORD padding after the frame
+                } else {
+                    continue;                                    // whole burst was continuation - wait for more
+                }
+            }
+            // Parse whole frames: [4-byte RX status][frame incl FCS][DWORD pad], repeated.
+            while pos + 4 <= buf.len() {
+                let status = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
+                pos += 4;
+                let flen = ((status >> 16) & 0x3FFF) as usize;   // frame length INCLUDING the 4-byte FCS
+                if flen < 4 || flen > part.buf.len() { break; }  // invalid length - give up on this burst
+                if pos + flen > buf.len() {
+                    // Frame split across the burst boundary: SAVE its start; the next burst completes it.
+                    let avail = buf.len() - pos;
+                    part.buf[..avail].copy_from_slice(&buf[pos..buf.len()]);
+                    part.len = avail;
+                    part.expect = flen;
+                    break;
+                }
+                if status & SMSC_RX_STS_ES == 0 { net_rx_deliver(&buf[pos..pos + flen - 4]); } // strip FCS
+                // else: the device flagged this frame errored (RX_STS_ES) - drop it silently.
+                pos += flen + ((4 - (flen % 4)) % 4);            // DWORD-align to the next status word
+            }
+        }
+    }
+}
+
+/// Receive one ethernet frame from the RX ring, into `dst`. Returns its length, or 0 if the ring is
+/// empty. No device access - the tick drain fills the ring; this only dequeues (fast).
+pub fn net_frame_rx(dst: &mut [u8]) -> usize {
+    if !on_core0() { return 0; }
+    // SAFETY: core-0 + IRQ-masked (syscall); the single consumer of NET_RX_RING, mutually exclusive
+    // with the tick producer (the tick cannot fire during this IRQ-masked syscall).
+    unsafe {
+        let r = &mut *core::ptr::addr_of_mut!(NET_RX_RING);
+        if r.count == 0 { return 0; }
+        let len = r.lens[r.head] as usize;
+        let m = len.min(dst.len());
+        dst[..m].copy_from_slice(&r.frames[r.head][..m]);
+        r.head = (r.head + 1) % NET_RX_RING_FRAMES;
+        r.count -= 1;
         m
-    } else {
-        let cap = dst.len().min(NET_FRAME_MAX);                 // CDC-ECM: raw frame, no header
-        let got = bulk_xfer(CH_NET, true, ep_in, dst, cap, false);
-        if got > 0 { got as usize } else { 0 }
     }
 }
 
