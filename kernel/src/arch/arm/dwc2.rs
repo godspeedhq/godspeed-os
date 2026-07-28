@@ -471,6 +471,44 @@ const XACT_ERR_MAX: u32 = 3;
 /// costs nothing. Bounded (§26.6) and truth-based (VIII), instead of trading one against the other.
 const CORE_HOLD_US: u32 = 5_000;
 
+/// A temporarily-raised NAK budget for the boot/probe path, in microseconds; 0 = use `CORE_HOLD_US`.
+///
+/// The steady-state budget is deliberately tiny (5 ms) because a normal transfer runs in a syscall with
+/// interrupts masked, and the userspace caller re-asks a busy device with interrupts ON in between (the
+/// real waiting belongs there). But the PROBE read runs at boot, before any userspace exists to re-ask,
+/// and one SanDisk needs far longer than 5 ms to produce its first block: it NAKs the data phase, we
+/// abandon it after 5 ms, and re-issuing the command only wedges it (it is still busy with the read we
+/// walked away from - even a Mass Storage Reset then NAKs). The cure is the opposite of retrying: give a
+/// SINGLE read one long, uninterrupted poll so the device can finish and hand the data over on the same
+/// transfer. This raises the budget only around that one probe read, then restores it.
+static IO_NAK_BUDGET_US: AtomicU32 = AtomicU32::new(0);
+#[inline]
+fn nak_budget_us() -> u32 {
+    let p = IO_NAK_BUDGET_US.load(Ordering::Relaxed);
+    if p > 0 { p } else { CORE_HOLD_US }
+}
+
+/// A block read/write's patient NAK backstop, in microseconds. A real transfer ends the wait early by
+/// completing (`XferCompl`) or failing (STALL/XactErr) - this only bounds how long a device that keeps
+/// NAKing (busy, still working) is waited on before we call it stuck (§26.6). Larger than the tiny
+/// steady-state `CORE_HOLD_US` because the alternative - abandon after 5 ms and let userspace re-issue
+/// the whole command - WEDGES a slow stick: it is still busy with the transfer we walked away from, so
+/// the re-issued command NAKs too, forever. A slow SanDisk needs its READ(10)/WRITE(10) waited on, not
+/// re-issued; this lets ONE command finish. It is IRQs-masked core-hold, so it is a backstop, not a
+/// target - a healthy device is in and out in well under a millisecond.
+const IO_BUDGET_US: u32 = 500_000;
+
+/// RAII: raise the NAK backstop for a block I/O command, and restore it on ANY exit path (Drop). Using
+/// a guard rather than manual store/restore means an early return cannot leave the backstop raised for
+/// the next, unrelated transfer.
+struct NakBudget;
+impl NakBudget {
+    fn raised(us: u32) -> Self { IO_NAK_BUDGET_US.store(us, Ordering::Relaxed); NakBudget }
+}
+impl Drop for NakBudget {
+    fn drop(&mut self) { IO_NAK_BUDGET_US.store(0, Ordering::Relaxed); }
+}
+
 /// Why the last `chan_dma` gave up. A transfer can fail for reasons that need OPPOSITE responses - a
 /// device rejecting us (STALL), a genuinely broken link (XACTERR), or one that stayed busy longer than
 /// we can afford to wait (NAK timeout) - and `bot CBW-out failed` said none of them. Guessing between
@@ -737,9 +775,10 @@ fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, e
                     xact_errs += 1;
                     if xact_errs >= XACT_ERR_MAX { LAST_FAIL.store(FAIL_XACT, Ordering::Relaxed); return false; }
                 }
-                if super::timer::systimer_us().wrapping_sub(started) > CORE_HOLD_US {
+                if super::timer::systimer_us().wrapping_sub(started) > nak_budget_us() {
                     LAST_FAIL.store(FAIL_NAK_TIMEOUT, Ordering::Relaxed); return false;
                 }
+                super::uart_rx_drain_now();   // keep serial input alive during a long IRQs-masked wait
                 spin(5_000);
             }
             if !ok { return false; }
@@ -770,9 +809,10 @@ fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, e
             xact_errs += 1;
             if xact_errs >= XACT_ERR_MAX { LAST_FAIL.store(FAIL_XACT, Ordering::Relaxed); return false; }
         }
-        if super::timer::systimer_us().wrapping_sub(started) > CORE_HOLD_US {
+        if super::timer::systimer_us().wrapping_sub(started) > nak_budget_us() {
             LAST_FAIL.store(FAIL_NAK_TIMEOUT, Ordering::Relaxed); return false;
         }
+        super::uart_rx_drain_now();   // keep serial input alive during a long IRQs-masked wait
         spin(5_000);
     }
 }
@@ -2128,12 +2168,44 @@ fn probe_mass_storage() -> bool {
     pl011_write(b"dwc2: msc capacity last_lba="); write_hex32(last_lba);
     pl011_write(b" block_size="); write_hex32(bsize); pl011_write(b"\r\n");
 
-    // READ(10) block 0: proves a multi-packet bulk IN moves real data.
+    // READ(10) block 0: proves a bulk IN moves real data - and the read a 16 GB SanDisk WEDGES on. It
+    // answers READ CAPACITY (an 8-byte IN) fine, then NAKs the 512-byte data IN forever, and then NAKs
+    // even a REQUEST SENSE. That last part is the tell: the device is STUCK MID-TRANSPORT, not merely
+    // slow - a bare REQUEST SENSE will not clear it. A device left mid-command is resynchronised by a
+    // BOT reset (Bulk-Only Mass Storage Reset + clear-halt), which `bot_recover` does, and - the reason
+    // it is the right tool here - it also RESETS THE BULK DATA TOGGLES, the prime suspect for why a
+    // 512-byte read wedges while an 8-byte one does not (a toggle that is correct for the small reply
+    // and wrong for the block). So each failed attempt runs a full recovery, then retries. Bounded
+    // (§26.6, 8 attempts). On final failure it reports the channel state so the cause is unambiguous:
+    // HCINT (NAK/XactErr/XferCompl) and HCTSIZ.remaining - `remaining == 512` means no data ever moved
+    // (the device never sent), `< 512` means a partial/toggle transfer.
     let rd_cdb = [0x28u8, 0, 0, 0, 0, 0, 0, 0, 1, 0];             // READ(10), LBA 0, 1 block
     let mut blk = [0u8; 512];
-    if !bot_command(ep_in as u32, ep_out as u32, &rd_cdb, true, &mut blk, 512) {
-        pl011_write(b"dwc2: msc READ(10) failed\r\n"); return true;
+    BOT_PROBE.store(true, Ordering::Relaxed);
+    // ONE read, and wait on the TRUTH (Commandment VIII): the device delivering block 0. A NAK is not a
+    // failure - it is the device saying "alive, still fetching, ask again" - so `chan_dma` keeps
+    // re-polling the SAME data phase through every NAK and returns the instant it sees XferCompl (data
+    // arrived) or a real error (STALL/XactErr = the device refusing or the link breaking). Those are the
+    // truths that end the wait; nothing here counts a clock down to a verdict.
+    //
+    // Do NOT abandon-and-retry: this SanDisk NAKs while it fetches the first block, and walking away
+    // after the tiny steady-state budget only leaves it busy with a read we no longer collect (after
+    // which it NAKs even a reset). So the ONLY thing raised here is the BACKSTOP that stops the wait
+    // being unbounded (§26.6) - lifted to 1.5 s just for this one probe read, for a device that goes
+    // truly silent, then restored. A device that is working ends the wait early by delivering; the
+    // backstop only catches one that never will.
+    IO_NAK_BUDGET_US.store(1_500_000, Ordering::Relaxed);
+    let read_ok = bot_command(ep_in as u32, ep_out as u32, &rd_cdb, true, &mut blk, 512);
+    let last_cause = last_fail_str();
+    IO_NAK_BUDGET_US.store(0, Ordering::Relaxed);
+    if !read_ok {
+        BOT_PROBE.store(false, Ordering::Relaxed);
+        pl011_write(b"dwc2: msc READ(10) - device never delivered block 0 (backstop reached); transport: ");
+        pl011_write(last_cause.as_bytes());
+        pl011_write(b"\r\n");
+        return true;
     }
+    BOT_PROBE.store(false, Ordering::Relaxed);
     pl011_write(b"dwc2: msc read block0 first4=");
     write_hex32(u32::from_be_bytes([blk[0], blk[1], blk[2], blk[3]]));
     pl011_write(b"\r\n");
@@ -2249,6 +2321,9 @@ pub fn msc_read_block(lba: u64, dst: &mut [u8]) -> bool {
     if dst.len() < 512 { return false; }
     if lba >= MSC_SECTORS.load(Ordering::Relaxed) { return msc_refuse("LBA past capacity", &MSC_REFUSE_RANGE, lba); }
     msc_select();
+    // Wait on the truth (the transfer completing), not a 5 ms clock: a slow stick NAKs while it fetches,
+    // and abandoning + re-issuing wedges it (see IO_BUDGET_US). Auto-restored on return.
+    let _budget = NakBudget::raised(IO_BUDGET_US);
     let l = lba as u32;
     // READ(10): opcode 0x28, LBA big-endian at [2..6], transfer length big-endian at [7..9].
     let cdb = [0x28u8, 0, (l >> 24) as u8, (l >> 16) as u8, (l >> 8) as u8, l as u8, 0, 0, 1, 0];
@@ -2318,6 +2393,10 @@ pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
     if src.len() < 512 { return false; }
     if lba >= MSC_SECTORS.load(Ordering::Relaxed) { return msc_refuse("LBA past capacity", &MSC_REFUSE_RANGE, lba); }
     msc_select();
+    // Same patience as the read: let ONE write finish (the device NAKs its CSW while programming flash,
+    // more so under FUA) rather than abandoning it after 5 ms and re-issuing, which wedges a slow stick
+    // and used to trip the false "endpoint stuck" reset that failed the format. Auto-restored on return.
+    let _budget = NakBudget::raised(IO_BUDGET_US);
     let l = lba as u32;
     let mut buf = [0u8; 512];
     let fua = USE_FUA && !MSC_NO_FUA.load(Ordering::Relaxed);
