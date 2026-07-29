@@ -72,6 +72,7 @@ pub enum SyscallNumber {
     UsbDiskRead            = 47,
     UsbDiskWrite           = 48,
     UsbDiskFlush           = 49,
+    SetClock               = 50,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -105,6 +106,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::UsbDiskRead    as u64 => handle_usb_disk_read(arg0, arg1),
         n if n == SyscallNumber::UsbDiskWrite   as u64 => handle_usb_disk_write(arg0, arg1),
         n if n == SyscallNumber::UsbDiskFlush   as u64 => handle_usb_disk_flush(),
+        n if n == SyscallNumber::SetClock       as u64 => handle_set_clock(arg0),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
             0
@@ -1783,6 +1785,18 @@ fn handle_reboot() -> i64 {
     }
     crate::kprintln!("reboot: hardware reset");
     crate::arch::imp::hardware_reset();
+}
+
+/// SetClock (50): set the wall clock to `epoch` Unix seconds (SNTP-fed). Gated by SET_CLOCK (validated by
+/// holdings - `arg0` spends the one argument register on the epoch, leaving no slot to pass). `epoch` is a
+/// u32 of seconds (single register - so it survives the 32-bit ARM ABI, valid past year 2106), widened
+/// here. A no-op on arches with a real hardware RTC (x86). Returns 0, or CapNotHeld without the cap.
+fn handle_set_clock(epoch: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::SET_CLOCK_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    crate::arch::imp::rtc::set_wall_clock((epoch & 0xFFFF_FFFF) as i64);
+    0
 }
 
 /// Largest ethernet frame the USB-net bridge moves (matches nic-driver's FRAME_MAX).

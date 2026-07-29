@@ -292,6 +292,7 @@ pub mod rtc {
     pub fn capture_boot_time() {}
     pub fn boot_datetime() -> u64 { 0 }
     pub fn read_datetime() -> u64 { 0 }
+    pub fn set_wall_clock(_epoch: i64) {} // no RTC on this stub; SNTP wall clock unused (arm is the live RTC-less port)
     pub fn now_epoch_monotonic() -> i64 { 0 }
 }
 

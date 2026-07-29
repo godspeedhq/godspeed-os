@@ -1140,6 +1140,16 @@ impl ServiceContext {
         unsafe { raw_syscall(13, 17, 0, 0) }
     }
 
+    /// Set the wall clock to `epoch_secs` (Unix seconds) from a network time source (SNTP). Requires the
+    /// SET_CLOCK capability (held only by `net-stack`); a non-holder gets `false`. A no-op on arches with a
+    /// hardware RTC (x86) - there the CMOS clock is the authority. `epoch_secs` is a `u32` (a single ABI
+    /// register, so it survives the 32-bit ARM syscall ABI and is valid past year 2106). Returns true on
+    /// success. After this, `datetime()` reports the real time on the RTC-less ARM port.
+    pub fn set_wall_clock(&self, epoch_secs: u32) -> bool {
+        // SAFETY: syscall(50) = SetClock; the kernel validates the SET_CLOCK cap by holdings.
+        unsafe { raw_syscall(50, epoch_secs as u64, 0, 0) >= 0 }
+    }
+
     /// A hardware-random u32 from the SoC RNG (the BCM2835 RNG on the Pi 2), or None if this build exposes
     /// no hardware RNG. Ungated (entropy confers no authority). The `random` shell utility consumes it.
     pub fn hw_random(&self) -> Option<u32> {

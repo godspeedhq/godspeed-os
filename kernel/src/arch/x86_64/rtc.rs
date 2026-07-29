@@ -112,6 +112,11 @@ pub fn read_datetime() -> u64 {
     dt
 }
 
+/// Set the wall clock from the network (SNTP). A NO-OP on x86: the hardware CMOS RTC is the authority here,
+/// so `read_datetime` already reports real time and there is nothing to set. Exists so the arch-neutral
+/// `SetClock` syscall compiles on every arch; the RTC-less ARM port is the one that actually uses it.
+pub fn set_wall_clock(_epoch: i64) {}
+
 /// A DEGLITCHED "now" in epoch seconds: monotonic + forward-jump-bounded, for time-DELTA uses (per-service
 /// uptime). `read_datetime` already rejects an implausible YEAR and a mid-update read, but a CMOS misread
 /// landing on an in-range year (e.g. 2039) still slips through and, because uptime = now - stamp, surfaces

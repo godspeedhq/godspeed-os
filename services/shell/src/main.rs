@@ -531,7 +531,7 @@ const NO_PATH_CMDS: &[&str] = &[
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("busiest", &["mem", "restarts", "queue"]),
-    ("date",    &["epoch"]),
+    ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage", "link-flap"]),
@@ -3854,9 +3854,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("cores", "how many CPU cores are up", "cores"),
             ("cores ticks", "each core's timer ticks/s (5s RTC-paced sample)", "cores ticks"),
         ], true),
-        "date" => help_block(ctx, "date", "date + time from the hardware clock", &[
+        "date" => help_block(ctx, "date", "date + time (from the hardware clock, or the network on the RTC-less Pi)", &[
             ("date", "full timestamp (weekday date time)", "date"),
             ("date epoch", "seconds since 1970-01-01", "date epoch"),
+            ("date sync", "fetch the time from the internet (SNTP) and set the clock", "date sync"),
         ], true),
         "net" => help_block(ctx, "net", "network status, DNS, and ARP host discovery", &[
             ("net", "IP, gateway (+MAC), and whether the gateway pings", "net"),
@@ -4607,6 +4608,22 @@ fn cmd_cores(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), Shell
 /// `unix`: this is not POSIX, so the vocabulary doesn't borrow its name.
 fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    // `date sync` - fetch the time from the network (SNTP) via net-stack and set the wall clock. The Pi 2
+    // has no battery-backed RTC, so `date` reads zeros until this runs (also done automatically at boot).
+    if arg == "sync" {
+        out.line_fmt(ctx, format_args!("Syncing the clock from the network (SNTP)..."));
+        let msg = Message::from_bytes(&[10u8]);
+        let outcome = match ctx.request_with_reply_abortable("net-stack", &msg, 8) {
+            ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => ctx.request_with_reply_abortable("net-stack", &msg, 8),
+            other => other,
+        };
+        let ok = matches!(&outcome, ReqOutcome::Reply(r) if r.payload_bytes().first() == Some(&1));
+        if !ok {
+            out.line_fmt(ctx, format_args!("date sync: no time from the network (is the cable in?)"));
+            return Ok(());
+        }
+        // fall through to display the freshly-set time
+    }
     let dt = ctx.datetime();
     if arg == "epoch" {
         out.line_fmt(ctx, format_args!("{}", dt.epoch_secs()));

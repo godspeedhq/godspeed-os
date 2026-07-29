@@ -382,6 +382,82 @@ fn udp_roundtrip(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_m
     None
 }
 
+/// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
+const NTP_UNIX_OFFSET: u32 = 2_208_988_800;
+/// A fixed anycast NTP server (time.cloudflare.com) used if DNS cannot resolve a pool name - so a DNS
+/// hiccup never blocks the clock. Anycast: routed to the nearest instance, reliable from anywhere.
+const NTP_FALLBACK_IP: [u8; 4] = [162, 159, 200, 123];
+/// A plausible "now" floor (2020-01-01 00:00:00 UTC) - reject a garbage/stale SNTP packet whose time is
+/// implausibly early rather than set the clock to it.
+const SNTP_MIN_PLAUSIBLE: u32 = 1_577_836_800;
+
+/// SNTP: fetch the current time from an NTP server and set the wall clock. The RTC-less Pi 2 has no other
+/// time source, so `date` reads zero until this runs (auto on boot after the DHCP dance, and on `date
+/// sync`). Resolve pool.ntp.org (fall back to a fixed anycast NTP IP if DNS is down), send a mode-3 client
+/// request to UDP 123, parse the 32-bit transmit timestamp (seconds since 1900), convert to Unix, and set
+/// the clock via the SET_CLOCK cap. Returns the Unix epoch on success. Bounded (udp_roundtrip's
+/// deadline+retry, Commandment VIII: waits on the reply, never hangs); a silent server returns None.
+fn sntp_sync(ctx: &ServiceContext, st: &NetState) -> Option<u32> {
+    if !st.have_mac { return None; }                     // no gateway MAC - nothing to send through
+    // Resolve an NTP server by name; fall back to the fixed anycast IP so a DNS hiccup does not block us.
+    let (mut gf, mut fr, mut ud, mut to) = (false, 0u16, 0u16, 0u16);
+    let ntp_ip = dns_resolve(ctx, b"pool.ntp.org", &st.gw_mac, &st.our_ip, &st.our_mac, &st.dns_server,
+                             &mut gf, &mut fr, &mut ud, &mut to).unwrap_or(NTP_FALLBACK_IP);
+    ctx.log_fmt(format_args!("net-stack: SNTP - querying {}.{}.{}.{}:123",
+        ntp_ip[0], ntp_ip[1], ntp_ip[2], ntp_ip[3]));
+    // Build the request frame ONCE: eth(14) + IPv4(20) + UDP(8) + SNTP(48) = 90 bytes. src port 40123.
+    const SRC_PORT: u16 = 40_123;
+    let mut frame = [0u8; 90];
+    frame[0..6].copy_from_slice(&st.gw_mac);
+    frame[6..12].copy_from_slice(&st.our_mac);
+    frame[12] = 0x08; frame[13] = 0x00;                  // IPv4
+    frame[14] = 0x45;
+    let total: u16 = 20 + 8 + 48;
+    frame[16] = (total >> 8) as u8; frame[17] = total as u8;
+    frame[22] = 64; frame[23] = 17;                      // TTL, UDP
+    frame[26..30].copy_from_slice(&st.our_ip);
+    frame[30..34].copy_from_slice(&ntp_ip);
+    let ip_ck = checksum(&frame[14..34]);
+    frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
+    frame[34] = (SRC_PORT >> 8) as u8; frame[35] = SRC_PORT as u8;
+    frame[36] = 0; frame[37] = 123;                      // dest port 123
+    frame[38] = 0; frame[39] = 8 + 48;                   // UDP length
+    frame[42] = 0x1B;                                    // SNTP: LI 0, VN 3, Mode 3 (client); rest zero
+    let req = Message::from_bytes(&frame);
+
+    // Send the request, then DRAIN + SCAN the RX ring for the reply until it arrives or the deadline - the
+    // same pattern DHCP/ARP use, so a WAN reply that lands tens of ms after the send (after a single-frame
+    // rx would have raced it) is caught. Retry a few times past stray frames.
+    let mut unix: Option<u32> = None;
+    let mut arp_out = [0u8; 42];
+    for _ in 0..DANCE_TRIES {
+        let _ = nic_req(ctx, &req, LINK_SECS);
+        drain_scan(ctx, DANCE_SECS, |f| {
+            // A UDP reply FROM ntp_ip:123 TO our SRC_PORT. Transmit timestamp (seconds since 1900) at SNTP
+            // offset 40 = frame offset 82.
+            if f.len() >= 86 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17
+                && f[26..30] == ntp_ip[..] && f[34] == 0 && f[35] == 123
+                && f[36] == (SRC_PORT >> 8) as u8 && f[37] == SRC_PORT as u8
+            {
+                let ntp_secs = u32::from_be_bytes([f[82], f[83], f[84], f[85]]);
+                if ntp_secs > NTP_UNIX_OFFSET {
+                    let u = ntp_secs - NTP_UNIX_OFFSET;
+                    if u >= SNTP_MIN_PLAUSIBLE { unix = Some(u); return true; }
+                }
+            }
+            // Answer an ARP for us in the meantime so the gateway can keep addressing our unicast replies.
+            if build_arp_reply(f, &st.our_ip, &st.our_mac, &mut arp_out) {
+                let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
+            }
+            false
+        });
+        if unix.is_some() { break; }
+    }
+    let u = unix?;
+    ctx.set_wall_clock(u);                               // gated by the SET_CLOCK cap
+    Some(u)
+}
+
 /// Send an ICMP echo request to `dest_ip` (via the gateway's MAC) and return true if the matching echo
 /// REPLY comes back. Used to probe the gateway (LAN) and a public IP (internet reachability through NAT).
 /// If `f` is an inbound ARP REQUEST for `our_ip`, build the matching ARP REPLY into `out` and return
@@ -699,7 +775,17 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
     status[8..14].copy_from_slice(&gw_mac);
     status[14] = (have_mac as u8) | ((ping_ok as u8) << 1);
     status[15..19].copy_from_slice(&dns_server);
-    NetState { our_ip, our_mac, gw_mac, have_mac, dns_server, status }
+    let state = NetState { our_ip, our_mac, gw_mac, have_mac, dns_server, status };
+
+    // ---- Set the wall clock from the network (SNTP): the RTC-less Pi 2 has no other time source, so
+    // `date` reads zero until this runs. Best-effort - a failure just leaves the clock unset (a re-sync is
+    // available on demand via `date sync`). A no-op on x86, where the hardware RTC is the authority.
+    if let Some(unix) = sntp_sync(ctx, &state) {
+        ctx.log_fmt(format_args!("net-stack: SNTP - wall clock set (epoch {})", unix));
+    } else if have_mac {
+        ctx.log("net-stack: SNTP - no time reply within the budget - clock stays unset");
+    }
+    state
 }
 
 /// Read the NIC link state from nic-driver's `[3]` status. RTL8168: byte 7 = link up. On the QEMU e1000
@@ -754,7 +840,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // few-second post-cable auto-negotiation eventually catches. Once configured the gateway MAC
         // persists, so a later unplug/replug just resumes (the ICMP flows again) without re-dancing.
         if badge.is_none() && !have_mac
-            && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6))
+            && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&10))
             && link_is_up(&ctx)
         {
             ctx.log("net-stack: link up while unconfigured - auto-configuring");
@@ -874,6 +960,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             dns_server = d.dns_server;
             status = d.status;
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&status));
+        } else if pl.first() == Some(&10) {
+            // SYNC (op 10): re-fetch the time from the network (SNTP) and set the wall clock - the shell
+            // `date sync`. Reply: [1, epoch(4 LE)] on success, [0] on failure (no NIC / server silent).
+            let st = NetState { our_ip, our_mac, gw_mac, have_mac, dns_server, status };
+            match sntp_sync(&ctx, &st) {
+                Some(unix) => {
+                    let mut r = [0u8; 5];
+                    r[0] = 1;
+                    r[1..5].copy_from_slice(&unix.to_le_bytes());
+                    ctx.log_fmt(format_args!("net-stack: SNTP - wall clock set (epoch {})", unix));
+                    let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&r));
+                }
+                None => { let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0])); }
+            }
         } else {
             // Status request (default): reply the CURRENT state, not just the frozen record. Read the link
             // and, if it is down (cable out), clear the "gateway resolved / ping OK" flags so `net` reflects

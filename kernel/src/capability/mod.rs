@@ -99,6 +99,13 @@ pub const GPIO_DEVICE_RESOURCE: ResourceId = ResourceId(11);
 /// never ambient (the same posture as NET_DEVICE). A no-op off ARM, where disks are userspace drivers.
 pub const USB_DISK_RESOURCE: ResourceId = ResourceId(12);
 
+/// Authority to set the wall clock via `SetClock` (the SNTP-fed time-of-day). The RTC-less ARM port has
+/// no hardware clock, so `date` reads zero until a network time source sets it; setting it changes every
+/// task's view of the time of day, so it is a privileged action (§3.1), not ambient. Granted only to
+/// `net-stack`, which runs the SNTP round-trip. A no-op on arches with a real RTC (x86). Validated by
+/// holdings (like `reboot`/8), since `SetClock` spends its one argument register on the epoch.
+pub const SET_CLOCK_RESOURCE: ResourceId = ResourceId(13);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever - §7.5).
@@ -114,5 +121,6 @@ pub fn init() {
     table::register_resource(NET_DEVICE_RESOURCE);
     table::register_resource(GPIO_DEVICE_RESOURCE);
     table::register_resource(USB_DISK_RESOURCE);
+    table::register_resource(SET_CLOCK_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }

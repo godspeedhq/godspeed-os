@@ -1318,10 +1318,26 @@ pub mod interrupts {
 
 // ---------------------------------------------------------------------------
 pub mod rtc {
+    use core::sync::atomic::{AtomicI64, Ordering};
     pub use crate::clock::epoch_secs;
+    /// The wall clock the Pi 2 lacks: set from the network (SNTP) via `set_wall_clock`. 0 = not yet set.
+    /// Stored as the epoch at boot (monotonic == 0), so `read_datetime` = base + seconds-since-boot.
+    static WALL_EPOCH_BASE: AtomicI64 = AtomicI64::new(0);
     pub fn capture_boot_time() {}
     pub fn boot_datetime() -> u64 { 0 }
-    pub fn read_datetime() -> u64 { 0 }
+    /// The packed wall-clock datetime (query 11). 0 until the wall clock is set from the network (there is
+    /// no hardware RTC), then the real time = the SNTP base + monotonic seconds since boot.
+    pub fn read_datetime() -> u64 {
+        let base = WALL_EPOCH_BASE.load(Ordering::Relaxed);
+        if base == 0 { return 0; }                                // no wall clock yet - `date` shows zeros
+        crate::clock::packed_from_epoch(base + now_epoch_monotonic())
+    }
+    /// Set the wall clock: `epoch` is the real Unix time NOW (from SNTP). Store base = epoch - monotonic so
+    /// every later `read_datetime` reconstructs the current time from the monotonic counter. The SetClock
+    /// syscall calls this; it is cap-gated (SET_CLOCK), never ambient.
+    pub fn set_wall_clock(epoch: i64) {
+        WALL_EPOCH_BASE.store(epoch - now_epoch_monotonic(), Ordering::Relaxed);
+    }
     /// Monotonic seconds since boot, from the generic timer (the Pi 2 has no wall-clock RTC, so this is
     /// NOT a real epoch - but it advances, which is all its callers need: bounding deadline waits and
     /// measuring TSC Hz. A `0` stub here made `calibrate_tsc_hz` spin ~100M yields and every

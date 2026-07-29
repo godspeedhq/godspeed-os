@@ -13,7 +13,7 @@ use crate::arch::imp::context_switch::TaskContext;
 use crate::arch::imp::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -437,6 +437,7 @@ struct Privileges {
     net_device:      bool, // NET_DEVICE: move ethernet frames via the in-kernel USB-net bridge (ARM nic-driver)
     usb_disk:        bool, // USB_DISK: read/write blocks on the in-kernel USB mass-storage device (ARM block-driver)
     gpio:            bool, // GPIO_DEVICE: drive the SoC GPIO pins (ARM `gpio` shell command)
+    set_clock:       bool, // SET_CLOCK: set the wall clock from SNTP (RTC-less ARM; net-stack)
 }
 
 fn service_privileges(name: &str, is_probe: bool) -> Privileges {
@@ -475,6 +476,10 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         usb_disk: cfg!(target_arch = "arm") && matches!(name, "block-driver"),
         //   the shell's `gpio` command drives the SoC pins (the gated `Gpio` syscall, 45).
         gpio: cfg!(target_arch = "arm") && matches!(name, "shell"),
+        //   SET_CLOCK: net-stack sets the wall clock from SNTP (the RTC-less ARM port has no other time
+        //   source). A kernel-only by-name grant like NET_DEVICE (not a contract cap). ARM-gated - x86
+        //   has a hardware RTC, so `SetClock` is an inert no-op there and nothing needs it.
+        set_clock: cfg!(target_arch = "arm") && matches!(name, "net-stack"),
     }
 }
 
@@ -3595,6 +3600,14 @@ fn spawn_service_with_config(
     if privs.gpio {
         let g_cap = mint_cap(GPIO_DEVICE_RESOURCE, Rights::WRITE);
         caps.insert(g_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+
+    // SET_CLOCK: net-stack sets the wall clock from SNTP (`SetClock` syscall) on the RTC-less ARM port.
+    // Minted here; WHO holds it is in `service_privileges`. Inert (no-op syscall) off ARM.
+    if privs.set_clock {
+        let sc_cap = mint_cap(SET_CLOCK_RESOURCE, Rights::WRITE);
+        caps.insert(sc_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 

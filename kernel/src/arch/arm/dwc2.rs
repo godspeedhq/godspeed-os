@@ -1660,24 +1660,46 @@ fn smsc_read_reg(index: u16) -> u32 {
     u32::from_le_bytes(data)
 }
 
-/// Wait (bounded) for the MII/MDIO engine to go not-busy (MII_ADDR bit 0).
-fn smsc_mii_wait() {
+/// Bound for ONE MII/MDIO engine wait. Every hardware wait in this driver is bounded (invariant 12), and
+/// this one especially: each poll is a full CONTROL TRANSFER on the shared bulk channel, and the runtime
+/// link poll runs from a syscall with IRQs masked - so an engine that never clears BUSY must not hold the
+/// core. A healthy MDIO answers in microseconds, so a working part never reaches this budget. (The old
+/// bound was a 100,000-ITERATION count, i.e. up to 100k control transfers - acceptable only because it
+/// ran once at enumeration; it is not acceptable per-second at runtime.)
+const SMSC_MII_WAIT_US: u32 = 20_000;
+const SMSC_MII_WAIT_POLLS: u32 = 64;
+
+/// Wait (bounded) for the MII/MDIO engine to go not-busy (MII_ADDR bit 0). False if it never did.
+fn smsc_mii_wait() -> bool {
+    let start = super::timer::systimer_us();
     let mut n = 0u32;
-    while smsc_read_reg(SMSC_MII_ADDR) & 1 != 0 { n += 1; if n > 100_000 { break; } }
+    while smsc_read_reg(SMSC_MII_ADDR) & 1 != 0 {
+        n += 1;
+        if n > SMSC_MII_WAIT_POLLS || super::timer::systimer_us().wrapping_sub(start) > SMSC_MII_WAIT_US {
+            return false;
+        }
+    }
+    true
 }
 
-fn smsc_mii_read(reg: u32) -> u16 {
-    smsc_mii_wait();
+/// A CHECKED MII read: `None` if the MDIO engine never went ready, so a caller that must not fabricate an
+/// answer (the runtime link poll) can keep its cached one instead of reporting a made-up register value.
+fn smsc_mii_read_checked(reg: u32) -> Option<u16> {
+    if !smsc_mii_wait() { return None; }
     smsc_write_reg(SMSC_MII_ADDR, (SMSC_PHY_ID << 11) | (reg << 6) | 1); // BUSY, read (WRITE bit clear)
-    smsc_mii_wait();
-    (smsc_read_reg(SMSC_MII_DATA) & 0xFFFF) as u16
+    if !smsc_mii_wait() { return None; }
+    Some((smsc_read_reg(SMSC_MII_DATA) & 0xFFFF) as u16)
 }
+
+/// The enumeration-path MII read: 0 if the engine timed out (the callers treat 0 as "not busy / done", so
+/// a dead MDIO ends their loops instead of spinning).
+fn smsc_mii_read(reg: u32) -> u16 { smsc_mii_read_checked(reg).unwrap_or(0) }
 
 fn smsc_mii_write(reg: u32, val: u16) {
-    smsc_mii_wait();
+    let _ = smsc_mii_wait();
     smsc_write_reg(SMSC_MII_DATA, val as u32);
     smsc_write_reg(SMSC_MII_ADDR, (SMSC_PHY_ID << 11) | (reg << 6) | 0x02 | 1); // WRITE | BUSY
-    smsc_mii_wait();
+    let _ = smsc_mii_wait();
 }
 
 /// Bring up the LAN9514: select its config, reset the chip + PHY, program the MAC, enable TX/RX, kick the
@@ -2062,13 +2084,56 @@ pub fn net_frame_rx(dst: &mut [u8]) -> usize {
     unsafe { net_rx_ring_pop(dst) }
 }
 
-/// The USB-net device's MAC + link state, or None if no net device is up. CDC-ECM's link is up once the
-/// interface is configured (QEMU slirp is always up); a real driver would read a link-status notification.
+/// Cached PHY link state + when it was last read (System Timer us; 0 = never). The MII read costs several
+/// control transfers on the shared bulk channel, and `link_is_up` can be asked per request, so the answer
+/// is refreshed at most every NET_LINK_POLL_US and served from here in between.
+static NET_LINK_UP:      AtomicBool = AtomicBool::new(true);
+static NET_LINK_LAST_US: AtomicU32  = AtomicU32::new(0);
+/// How often the PHY is actually re-read. A cable pull shows up within this long - fast enough to feel
+/// immediate at the prompt, slow enough that the control transfers cost nothing measurable.
+const NET_LINK_POLL_US: u32 = 1_000_000;
+
+/// Is the ethernet cable in? Reads the LAN9514's internal PHY over MII (BMSR bit 2), rate-limited and
+/// cached. Returns the cached value - never a stale-forever guess - when the read must be skipped.
+///
+/// Three things make this safe to call from the `NetInfo` syscall:
+/// - **core 0 + syscall context**, which is exactly what `ctrl_xfer` requires (it runs on the shared
+///   CH_BULK stream and must never be driven from the timer ISR).
+/// - **Never while a storage transfer is parked**: an async block I/O OWNS CH_BULK, and a control transfer
+///   there would destroy it. A disk read outranks a link poll, so we keep the cached value instead.
+/// - **BMSR's Link Status latches low**: a dropped link stays reported as down until the register is read.
+///   Reading twice and taking the second gives the CURRENT state (Linux's `mii_link_ok` reads it the same
+///   way), so a brief glitch does not stick and a replug is seen on the next poll rather than never.
+fn net_link_up() -> bool {
+    // CDC-ECM (QEMU) exposes no PHY to read: its link is up once the interface is configured.
+    if NET_KIND.load(Ordering::Relaxed) != NET_KIND_SMSC { return true; }
+    let cached = NET_LINK_UP.load(Ordering::Relaxed);
+    if !on_core0() { return cached; }
+    let now = super::timer::systimer_us();
+    let last = NET_LINK_LAST_US.load(Ordering::Relaxed);
+    if last != 0 && now.wrapping_sub(last) < NET_LINK_POLL_US { return cached; }
+    // SAFETY: core-0 + IRQ-masked (syscall); ASYNC_BULK is core-0 exclusive.
+    if unsafe { (*core::ptr::addr_of!(ASYNC_BULK)).active } { return cached; }
+    NET_LINK_LAST_US.store(now.max(1), Ordering::Relaxed);   // max(1) keeps 0 meaning "never read"
+    // Point the shared channel at the net device (the keyboard poll may have selected itself last).
+    select_device(NET_ADDR.load(Ordering::Relaxed), BULK_MPS.load(Ordering::Relaxed),
+                  NET_LOW.load(Ordering::Relaxed));
+    let _ = smsc_mii_read_checked(SMSC_MII_BMSR);            // clear the latched-low bit
+    match smsc_mii_read_checked(SMSC_MII_BMSR) {             // BMSR bit 2 = Link Status (current)
+        Some(bmsr) => { let up = bmsr & 0x0004 != 0; NET_LINK_UP.store(up, Ordering::Relaxed); up }
+        // The MDIO engine did not answer - report the last KNOWN state rather than inventing one.
+        None => cached,
+    }
+}
+
+/// The USB-net device's MAC + link state, or None if no net device is up. The link is the LAN9514's real
+/// PHY state (see `net_link_up`), so unplugging the cable is reported; CDC-ECM (QEMU) has no PHY and is
+/// up once configured.
 pub fn net_info() -> Option<([u8; 6], bool)> {
     if !NET_READY.load(Ordering::Acquire) { return None; }
     // SAFETY: NET_MAC is written once at enumeration; read-only here.
     let mac = unsafe { *core::ptr::addr_of!(NET_MAC) };
-    Some((mac, true))
+    Some((mac, net_link_up()))
 }
 
 /// Read the configuration descriptor of the current device (DEV_ADDR), find a boot-keyboard interface
