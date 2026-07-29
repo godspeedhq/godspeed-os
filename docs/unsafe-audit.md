@@ -24,7 +24,9 @@ The RX path's blocks are the bulk of it: a single-producer/single-consumer ring 
 `net_rx_ring_pop`), the cross-burst reassembly buffer (`net_rx_parse`, `net_rx_partial_reset`), arming and
 re-arming the background bulk-IN (`net_rx_async_arm`, `net_rx_async_start`, `net_rx_isr`), and the
 consumer syscall (`net_frame_rx`), plus `net_rx_ring_full` - the backpressure test that stops the ISR
-re-arming into a full ring (receiving frames only to drop them is work done for nothing).
+re-arming into a full ring (receiving frames only to drop them is work done for nothing), and
+`hotplug_poll` - the hub-port watcher (present but deliberately NOT wired to a caller; see the note at the
+idle hook in `arch/arm/mod.rs` for why enumeration cannot run there yet).
 Producer and consumer are mutually exclusive without a lock because
 both run on core 0 with IRQs masked - the syscall path cannot park, and ARM IRQ entry masks IRQs - which
 is the argument each SAFETY comment carries.
@@ -36,7 +38,7 @@ inventory matches source again rather than carrying a known-stale baseline forwa
 
 | File | Change | Why |
 |------|--------|-----|
-| `arch/arm/dwc2.rs` | 14 -> 32 (+18) | Interrupt-driven net RX (ring push/pop, burst parse + reassembly, partial reset, background arm/re-arm, the halt ISR, the consumer syscall), the net-up arm sites, and the PHY link poll's read of `ASYNC_BULK.active` (the guard that keeps a link poll from destroying a parked storage transfer). |
+| `arch/arm/dwc2.rs` | 14 -> 33 (+19) | Interrupt-driven net RX (ring push/pop, burst parse + reassembly, partial reset, background arm/re-arm, the halt ISR, the consumer syscall), the net-up arm sites, and the PHY link poll's read of `ASYNC_BULK.active` (the guard that keeps a link poll from destroying a parked storage transfer). |
 | `arch/arm/irq.rs` | 11 -> 13 (+2) | **Pre-existing drift, re-baselined:** blocks added by earlier branch work (USB IRQ routing/ack), not by the networking commits. |
 | `arch/arm/mod.rs` | 43 -> 44 (+1) | **Pre-existing drift, re-baselined:** one block from earlier branch work. |
 
@@ -1062,7 +1064,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
 | arch/arm/fbcon.rs | 6 | permitted |
-| arch/arm/dwc2.rs | 32 | permitted |
+| arch/arm/dwc2.rs | 33 | permitted |
 | arch/arm/page_tables.rs | 31 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |

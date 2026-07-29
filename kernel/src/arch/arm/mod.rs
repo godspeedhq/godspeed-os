@@ -1303,6 +1303,22 @@ pub mod interrupts {
         // keystroke actually arrive and reschedule the shell. Then `cpsie i; wfi` (the x86 `sti; hlt`
         // twin) unmasks IRQs so a timer/IPI can also wake us instead of busy-spinning forever.
         super::uart_rx_poll();
+        // USB hot-plug is NOT wired in here, and the reason is worth stating where the call would go.
+        //
+        // `dwc2::hotplug_poll` exists and works, but this idle path is not the atomic context it looks
+        // like: the scheduler re-enables interrupts after every switch-back (see the `enable_interrupts`
+        // at the end of `pick_next`'s Some arm, and the comment there stating idle runs with interrupts
+        // ENABLED). So code here is interruptible AND preemptible, while a USB control transfer needs the
+        // shared device selection (DEV_ADDR/MPS0/LOW_SPEED/SPLIT_PORT) to hold still - and the timer's
+        // keyboard poll, the USB IRQ's net RX re-arm, and a preempting storage command all rewrite it.
+        // A SET_ADDRESS landing in one of those windows re-addresses a LIVE device.
+        //
+        // Masking here instead would swap that for a worse fault: the arrival path is multi-second (a
+        // 60 ms reset wait built from ~21 ms status reads, split transfers up to ~1.5 s, a storage probe
+        // in seconds), and a hold that long stops core 0's tick stamp advancing until another core's
+        // liveness watchdog panics the machine. Bounded-and-masked are both required, which means
+        // enumeration must become a state machine of short steps - real work, deliberately not rushed
+        // (§26.3: recorded rather than half-built). Until then a replugged device needs a reboot.
         // SAFETY: unmasking IRQs is always valid (vectors + handlers installed); WFI then waits for one.
         unsafe { core::arch::asm!("cpsie i", "wfi", options(nomem, nostack)) }
     }

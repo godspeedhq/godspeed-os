@@ -1302,6 +1302,13 @@ fn ctrl_xfer(setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize) -> bo
                 // Never let the device DMA past the scratch buffer (clamp the programmed length, not just
                 // the copy-out). All current callers pass dlen <= ~160, but defend the buffer regardless.
                 let want = dlen.min(d.data.len());
+                // ZERO the scratch first. A control IN completes successfully on a SHORT packet, and this
+                // buffer is shared by every control transfer - so a device returning fewer bytes than asked
+                // left the PREVIOUS transfer's tail in place and the caller read it as this reply's data.
+                // Harmless while callers only logged the result; not harmless once a reply DECIDES
+                // something (a hub port-status short read would fabricate a connect or a disconnect).
+                // A short reply now reads as zeros, which every caller already treats as "no/failed".
+                d.data[..want].fill(0);
                 flush_dcache(data_phys, want as u32); // invalidate the line before the device writes it
                 if !ctrl_dma(ch, true, PID_DATA1, data_phys, want as u32) { pl011_write(b"dwc2: DATA failed\r\n"); return false; }
                 flush_dcache(data_phys, want as u32); // invalidate after -> the CPU reads device-written bytes
@@ -1350,6 +1357,29 @@ const PORT_RESET: u16 = 4;
 const PORT_POWER: u16 = 8;
 const C_PORT_CONNECTION: u16 = 16;
 const C_PORT_RESET: u16 = 20;
+
+// --- Hot-plug: notice a device appearing or vanishing on a hub port, after boot -------------------
+// The root port holds the LAN9514 hub for the whole session, so plugging a keyboard in or out never
+// changes the ROOT port - it changes a HUB port, which only a hub request can report. Boot enumeration
+// walked those ports once; this watches them afterwards so a replugged keyboard works again without a
+// reboot (on x86 the userspace xhci/ehci drivers do this from a port-change interrupt; the ARM driver is
+// in-kernel and had no equivalent, so a keyboard unplugged once stayed dead until the machine was
+// power-cycled - and power-cycling this board is what corrupted a filesystem earlier in this branch).
+//
+// It runs from the IDLE hook, NOT the timer tick: a port query is a control transfer costing milliseconds,
+// and `ctrl_xfer` belongs to task/boot context precisely so the tick stays far under its 10 ms budget.
+// Idle is the honest place - nothing is waiting, and one port per visit keeps each visit short.
+static HUB_EP0_MPS:   AtomicU16 = AtomicU16::new(64); // the hub's own EP0 max-packet (for its control requests)
+static HUB_NPORTS:    AtomicU8  = AtomicU8::new(0);   // ports the hub reports (0 = no hub, hot-plug inactive)
+static HUB_CONNECTED: AtomicU32 = AtomicU32::new(0);  // bit N-1 = a device was present on port N last time we looked
+static HOTPLUG_LAST_US: AtomicU32 = AtomicU32::new(0);
+static HOTPLUG_PORT:    AtomicU8  = AtomicU8::new(1); // round-robin cursor: one port per idle visit
+/// How often a single hub port is queried. A person cannot plug a cable faster than this, and it keeps the
+/// steady-state cost of hot-plug support to one control transfer per second on an otherwise idle core.
+const HOTPLUG_INTERVAL_US: u32 = 1_000_000;
+
+/// The USB address a device on `port` gets - stable, so a replugged device returns to the same address.
+fn hub_port_addr(port: u8) -> u8 { 1 + port }
 
 /// GET_STATUS of a hub port -> wPortStatus (low 16) | wPortChange (high 16). 0 on failure.
 fn hub_get_port_status(port: u8) -> u32 {
@@ -1434,7 +1464,6 @@ fn enumerate_hub(protocol: u8) {
     // Walk EVERY connected port, assigning each device a distinct USB address (2, 3, ...) and configuring
     // it (keyboard AND ethernet can coexist behind the one hub - the Pi 2's LAN9514 topology). The single
     // host channel is time-shared: each device's transfer path re-selects it (`select_device`).
-    let mut next_addr = 2u8;
     for port in 1..=nports {
         // Re-select the hub's own control endpoint: a prior downstream enumeration left DEV_ADDR/MPS0
         // pointing at that device, so every hub request below would otherwise go to the wrong address.
@@ -1444,29 +1473,23 @@ fn enumerate_hub(protocol: u8) {
         pl011_write(b"dwc2: hub port "); write_hex32(port as u32);
         pl011_write(b" status="); write_hex32(st); pl011_write(b"\r\n");
         if st & 1 == 0 { continue; }                                            // no device on this port
-        control_out(0x23, 0x01, C_PORT_CONNECTION, port as u16);                // CLEAR_FEATURE(C_CONNECTION)
-        control_out(0x23, 0x03, PORT_RESET, port as u16);                       // SET_FEATURE(PORT_RESET)
-        // Wait on the hub's TRUTH that the reset finished - PORT_RESET (wPortStatus bit 4) clears when the
-        // hub has driven the ~10-20 ms reset - not a nop-spin guess (Commandment VIII). Bounded on the REAL
-        // 1 MHz clock so a dead port cannot hang the boot; then the USB-spec reset-recovery on the real clock.
-        let mut st2 = hub_get_port_status(port);
-        let mut waited_ms = 0u32;
-        while st2 & (1 << 4) != 0 && waited_ms < 60 {                            // bit4 = PORT_RESET still asserted
-            super::timer::delay_us(1_000);
-            waited_ms += 1;
-            st2 = hub_get_port_status(port);
+        // Address DERIVED FROM THE PORT, not handed out sequentially. A port's device then keeps the same
+        // address across an unplug/replug, so hot-plug needs no allocator and cannot exhaust the address
+        // space by cycling a cable (a sequential counter leaked one address per replug). Unique by
+        // construction: a hub port hosts at most one device.
+        bring_up_hub_port(port, hub_port_addr(port));
+    }
+    // Remember the hub's geometry + which ports held a device, so the idle hot-plug watcher can notice a
+    // later change. Without this the boot walk was the ONLY time these ports were ever looked at.
+    HUB_EP0_MPS.store(hub_mps, Ordering::Relaxed);
+    HUB_NPORTS.store(nports, Ordering::Relaxed);
+    {
+        let mut mask = 0u32;
+        for port in 1..=nports.min(31) {
+            select_device(1, hub_mps, false);
+            if hub_get_port_status(port) & 1 != 0 { mask |= 1 << (port - 1); }
         }
-        control_out(0x23, 0x01, C_PORT_RESET, port as u16);                     // CLEAR_FEATURE(C_RESET)
-        super::timer::delay_us(10_000);                                         // reset-recovery (real clock, not spin)
-        let low = (st2 >> 9) & 1 == 1;                                          // wPortStatus low-speed bit
-        // A device that is NOT high-speed (bit 10 clear) behind this high-speed hub is reachable ONLY via
-        // SPLIT transactions through this hub port; a high-speed device (ethernet/wifi) is direct.
-        let split_port = if (st2 >> 10) & 1 == 0 { port } else { 0 };
-        pl011_write(b"dwc2: port "); write_hex32(port as u32);
-        pl011_write(b" device status="); write_hex32(st2); pl011_write(b"\r\n");
-        enumerate_downstream(low, next_addr, split_port);                       // configure whatever it is
-        next_addr += 1;                                                         // consume the address regardless
-        if next_addr > 120 { break; }                                          // bounded (address space guard)
+        HUB_CONNECTED.store(mask, Ordering::Relaxed);
     }
     if !KBD_READY.load(Ordering::Relaxed) && !NET_READY.load(Ordering::Relaxed) {
         pl011_write(b"dwc2: no keyboard or network device found behind hub\r\n");
@@ -1478,6 +1501,126 @@ fn enumerate_hub(protocol: u8) {
         BULK_TOGGLE_IN.store(false, Ordering::Relaxed);
         BULK_TOGGLE_OUT.store(false, Ordering::Relaxed);
     }
+}
+
+/// Reset one hub port and bring up whatever is on it at USB address `addr`. Shared by the boot walk and by
+/// the hot-plug watcher, so a device plugged in later goes through exactly the same sequence that worked at
+/// boot - no second, subtly-different path to drift out of step (Commandment III applied to code).
+/// Assumes the hub's own control endpoint is already selected. Returns what `enumerate_downstream` decided.
+fn bring_up_hub_port(port: u8, addr: u8) -> bool {
+    control_out(0x23, 0x01, C_PORT_CONNECTION, port as u16);                // CLEAR_FEATURE(C_CONNECTION)
+    control_out(0x23, 0x03, PORT_RESET, port as u16);                       // SET_FEATURE(PORT_RESET)
+    // Wait on the hub's TRUTH that the reset finished - PORT_RESET (wPortStatus bit 4) clears when the hub
+    // has driven the ~10-20 ms reset - not a nop-spin guess (Commandment VIII). Bounded on the REAL 1 MHz
+    // clock so a dead port cannot hang; then the USB-spec reset-recovery on the real clock.
+    let mut st2 = hub_get_port_status(port);
+    let mut waited_ms = 0u32;
+    while st2 & (1 << 4) != 0 && waited_ms < 60 {                           // bit4 = PORT_RESET still asserted
+        super::timer::delay_us(1_000);
+        waited_ms += 1;
+        st2 = hub_get_port_status(port);
+    }
+    control_out(0x23, 0x01, C_PORT_RESET, port as u16);                     // CLEAR_FEATURE(C_RESET)
+    super::timer::delay_us(10_000);                                         // reset-recovery (real clock)
+    let low = (st2 >> 9) & 1 == 1;                                          // wPortStatus low-speed bit
+    // A device that is NOT high-speed (bit 10 clear) behind this high-speed hub is reachable ONLY via SPLIT
+    // transactions through this hub port; a high-speed device (ethernet/wifi) is direct.
+    let split_port = if (st2 >> 10) & 1 == 0 { port } else { 0 };
+    pl011_write(b"dwc2: port "); write_hex32(port as u32);
+    pl011_write(b" device status="); write_hex32(st2); pl011_write(b"\r\n");
+    enumerate_downstream(low, addr, split_port)
+}
+
+/// Watch the hub's ports for a device arriving or leaving, one port per call. Called from the scheduler's
+/// IDLE hook - task context, so the control transfers this needs are legal here and cost the tick nothing.
+///
+/// Three things keep it cheap and safe:
+/// - **Rate-limited** to one port query per `HOTPLUG_INTERVAL_US`; a human cannot plug a cable faster.
+/// - **Yields to storage** via `BulkClaim::try_acquire`: control traffic shares CH_BULK with block I/O, so
+///   a disk command in flight wins and we simply look again next second.
+/// - **One port per visit**, so a visit is a single control transfer rather than a full sweep.
+///
+/// On arrival it runs the same `bring_up_hub_port` the boot walk uses. On departure it forgets the device
+/// so the keyboard poll stops talking to an address that is no longer there.
+pub fn hotplug_poll() {
+    let nports = HUB_NPORTS.load(Ordering::Relaxed);
+    if nports == 0 || !on_core0() { return; }                       // no hub enumerated: nothing to watch
+    let now = super::timer::systimer_us();
+    let last = HOTPLUG_LAST_US.load(Ordering::Relaxed);
+    if last != 0 && now.wrapping_sub(last) < HOTPLUG_INTERVAL_US { return; }
+    // A parked storage transfer owns the channel; so does a BOT command in progress. Either way, later.
+    // SAFETY: core-0; ASYNC_BULK is core-0 exclusive.
+    if unsafe { (*core::ptr::addr_of!(ASYNC_BULK)).active } { return; }
+    let _claim = match BulkClaim::try_acquire() { Some(c) => c, None => return };
+    HOTPLUG_LAST_US.store(now.max(1), Ordering::Relaxed);
+
+    // Round-robin one port, so every port is visited within nports intervals.
+    let port = {
+        let p = HOTPLUG_PORT.load(Ordering::Relaxed).max(1);
+        let next = if p >= nports { 1 } else { p + 1 };
+        HOTPLUG_PORT.store(next, Ordering::Relaxed);
+        p.min(nports)
+    };
+    if port > 31 { return; }                                        // the presence mask is 32 bits
+
+    // Save the shared device selection and put it back afterwards: the keyboard poll and the storage path
+    // both read DEV_ADDR/MPS0/LOW_SPEED/SPLIT_PORT, and leaving them pointing at the hub would misdirect
+    // whichever runs next (the same trap `net_link_up` had to fix).
+    let (prev_addr, prev_mps, prev_low, prev_split) = (
+        DEV_ADDR.load(Ordering::Relaxed), MPS0.load(Ordering::Relaxed),
+        LOW_SPEED.load(Ordering::Relaxed), SPLIT_PORT.load(Ordering::Relaxed));
+    select_device(1, HUB_EP0_MPS.load(Ordering::Relaxed), false);   // the hub's own control endpoint
+
+    let st = hub_get_port_status(port);
+    // A status of ZERO means the REQUEST failed, not that the port is empty: a genuinely empty port still
+    // reports its power bit (boot logs an idle port as 0x0100). Treating a failed query as "device gone"
+    // would stand the keyboard down on any transient transport wobble - inventing a disconnect from an
+    // absence of information, which is the mistake this branch has already paid for twice.
+    if st == 0 {
+        DEV_ADDR.store(prev_addr, Ordering::Relaxed);
+        MPS0.store(prev_mps, Ordering::Relaxed);
+        LOW_SPEED.store(prev_low, Ordering::Relaxed);
+        SPLIT_PORT.store(prev_split, Ordering::Relaxed);
+        return;
+    }
+    let bit = 1u32 << (port - 1);
+    let was = HUB_CONNECTED.load(Ordering::Relaxed) & bit != 0;
+    let now_conn = st & 1 != 0;
+
+    if now_conn && !was {
+        let addr = hub_port_addr(port);
+        pl011_write(b"dwc2: hot-plug - device connected on hub port "); super::timer::write_dec_pub(port as u32);
+        pl011_write(b", enumerating at address "); super::timer::write_dec_pub(addr as u32);
+        pl011_write(b"\r\n");
+        // Record the port as occupied only if bringing it up SUCCEEDED, and say so when it did not.
+        // Setting the bit first and discarding the verdict LATCHED the failure: the port still reads
+        // connected, so neither branch fires again and the device is never retried - dead until the user
+        // physically re-plugs, with nothing said (§26.7, Commandment V). Third instance of this class in
+        // one session; the SDK's #[must_use] gate does not reach an in-kernel bool.
+        if bring_up_hub_port(port, addr) {
+            HUB_CONNECTED.fetch_or(bit, Ordering::Relaxed);
+        } else {
+            pl011_write(b"dwc2: hot-plug - enumeration FAILED on hub port ");
+            super::timer::write_dec_pub(port as u32);
+            pl011_write(b" - left unclaimed so the next scan retries\r\n");
+        }
+    } else if !now_conn && was {
+        HUB_CONNECTED.fetch_and(!bit, Ordering::Relaxed);
+        pl011_write(b"dwc2: hot-plug - device REMOVED from hub port "); super::timer::write_dec_pub(port as u32);
+        pl011_write(b"\r\n");
+        // Forget a device that has gone, or its poll keeps addressing hardware that is not there. Only the
+        // keyboard is polled continuously, so it is the one that must be stood down; storage and the net
+        // device already fail loudly through their own paths and recover by re-enumeration.
+        if KBD_READY.load(Ordering::Relaxed) && KBD_HUB_PORT.load(Ordering::Relaxed) == port {
+            KBD_READY.store(false, Ordering::Relaxed);
+            pl011_write(b"dwc2: keyboard was on that port - input stops until it is plugged back in\r\n");
+        }
+    }
+
+    DEV_ADDR.store(prev_addr, Ordering::Relaxed);
+    MPS0.store(prev_mps, Ordering::Relaxed);
+    LOW_SPEED.store(prev_low, Ordering::Relaxed);
+    SPLIT_PORT.store(prev_split, Ordering::Relaxed);
 }
 
 /// A freshly-reset downstream device answers at address 0. Learn its EP0 max-packet, move it to `addr`,
