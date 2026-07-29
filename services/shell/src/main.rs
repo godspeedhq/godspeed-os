@@ -239,10 +239,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // can't slip between the message and its newline on the serial console.
     ctx.console_write("shell: ready (type 'help')\n");
 
-    // Seed the kernel's clock FLOOR from the last time this machine is known to have run. On a board with
-    // no RTC that is the only thing standing between us and accepting a clock value from before the last
-    // boot. It is a bound, never a reading - nothing is displayed as "now" because of it.
-    clock_floor_seed(&ctx);
+    // The clock FLOOR is deliberately NOT read here any more. Doing fs I/O during startup was a mistake:
+    // fs is at its slowest right then (mounting, replaying its journal), so the read timed out, and an
+    // abandoned fs request poisons the reply channel for the whole session - a reply carries no request
+    // id, so the NEXT command consumes it and every command after that is one answer behind. That is what
+    // made `drives` report a healthy 15 GB disk as absent, and later made `drives flash` announce a
+    // failure for a format that was still running. The floor is read where it is USED instead: `date sync`
+    // seeds it before validating a fetched time (see cmd_date), which is a user-initiated moment when fs
+    // has long settled and a slow answer is visible rather than silent.
 
     wait_for_input_ready(&ctx);
 
@@ -4725,6 +4729,11 @@ fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     // `date sync` - fetch the time from the network (SNTP) via net-stack and set the wall clock. The Pi 2
     // has no battery-backed RTC, so `date` reads zeros until this runs (also done automatically at boot).
     if arg == "sync" {
+        // Seed the floor HERE, where it is used: it exists to let the kernel refuse a fetched time from
+        // before we last ran, so the moment we are about to fetch one is exactly when it must be known.
+        // Reading it at boot instead put fs I/O on the startup path at fs's slowest moment - see the note
+        // in service_main for what that cost.
+        clock_floor_seed(ctx);
         out.line_fmt(ctx, format_args!("Syncing the clock from the network (SNTP)... (q aborts)"));
         let msg = Message::from_bytes(&[10u8]);
         // The budget must cover net-stack's WORST case, not a guess: op 10 can run SNTP_TRIES rounds of a
