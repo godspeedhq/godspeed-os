@@ -685,6 +685,15 @@ impl ServiceContext {
             if let Some(r) = self.try_recv() { return DeadlineOutcome::Reply(r); }
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 self.remove_cap(reply_cap);   // reply never consumed - reclaim its slot
+                // CALLER BEWARE: the request was already SENT, so the peer will reply into our endpoint
+                // whether we are listening or not. Reclaiming the reply CAP does not remove that message
+                // from the queue - the NEXT `try_recv` on this endpoint may return the ABANDONED reply
+                // instead of the answer it expects. That has bitten for real: a timed-out fs read left a
+                // 1-byte `[FS_NOTFOUND]` behind, and the next command consumed it and reported a healthy
+                // mounted disk as absent. `request_with_reply_abortable` avoids this with a DRAIN at its
+                // own top; this variant cannot drain blindly, because a service that also SERVES on this
+                // endpoint (net-stack) would discard live client requests. So a caller that can time out
+                // must reclaim the late reply itself - see the shell's `reclaim_late_fs_reply`.
                 return DeadlineOutcome::Timeout;
             }
             self.yield_cpu();

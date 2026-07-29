@@ -7930,10 +7930,42 @@ fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8], ma
     if let Some(r) = ctx.request_with_reply_deadline("fs", &msg, max_secs) {
         return Some(r);
     }
+    // TIMED OUT. The request was already SENT, so `fs` will reply into our endpoint whether we are still
+    // listening or not - and an unclaimed reply is not harmless: it sits in the queue and the NEXT fs
+    // request reads IT instead of its own answer. That is not hypothetical. A 2 s read of a non-existent
+    // `/clock.last` at boot (fs still mounting) timed out, and its late 1-byte `[FS_NOTFOUND]` was then
+    // consumed by `drives`, which reported "no disk found" on a healthy, mounted 15 GB disk. The bound was
+    // right; abandoning the reply without reclaiming it was the bug.
+    //
+    // So spend a SHORT grace collecting the late reply purely to discard it. The abortable request path
+    // solves the same problem with a drain at its own top; this path had no equivalent.
+    reclaim_late_fs_reply(ctx);
     if ctx.reacquire_by_name("fs") {
-        return ctx.request_with_reply_deadline("fs", &msg, max_secs);
+        if let Some(r) = ctx.request_with_reply_deadline("fs", &msg, max_secs) { return Some(r); }
+        reclaim_late_fs_reply(ctx);
     }
     None
+}
+
+/// Consume-and-discard a reply that arrives after its requester gave up, so it cannot be mistaken for the
+/// next request's answer. Bounded twice over: a wall-clock grace and a yield count, because the whole
+/// point is that the peer may never answer at all.
+///
+/// Residual, stated rather than hidden: if the reply arrives after even this grace it still orphans. The
+/// complete fix is a request tag the reply must carry, which the fs protocol does not have; this closes
+/// the window that actually bit (a peer answering a little late) without inventing a protocol change here.
+fn reclaim_late_fs_reply(ctx: &ServiceContext) {
+    const GRACE_SECS: i64 = 2;
+    const MAX_YIELDS: u32 = 200_000;
+    let t0 = ctx.epoch_secs_monotonic();
+    let mut n = 0u32;
+    loop {
+        if ctx.try_recv().is_some() { return; }                 // caught the orphan - discarded
+        if ctx.epoch_secs_monotonic() - t0 >= GRACE_SECS { return; }
+        n += 1;
+        if n > MAX_YIELDS { return; }
+        ctx.yield_cpu();
+    }
 }
 
 /// `fs_request` for INTERACTIVE commands (`ls`, `cd`, `read`, `find`, ...): q-abortable, and after a
