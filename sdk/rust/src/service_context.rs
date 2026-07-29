@@ -30,6 +30,19 @@ pub enum DeadlineOutcome {
     Timeout,
 }
 
+/// Where a wall-clock reading came from. Reported alongside the time so a displayed timestamp says what
+/// it is standing on: a local hardware clock, a network correction, or nothing (§26.4 - a fallback chain
+/// is mechanism while its choice is visible, and magic when it is not).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ClockSource {
+    /// No clock: no hardware RTC and nothing has set the time. `date` says so rather than inventing one.
+    Unset,
+    /// A local hardware real-time clock reading a plausible date.
+    Rtc,
+    /// Set from the network (SNTP) this boot.
+    Ntp,
+}
+
 /// Wall-clock date/time read from the hardware RTC, fully decoded (binary,
 /// 24-hour). See [`ServiceContext::datetime`].
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,6 +56,30 @@ pub struct Datetime {
 }
 
 impl Datetime {
+    /// Decode Unix epoch seconds into calendar fields (Howard Hinnant's `civil_from_days`) - the inverse
+    /// of [`Datetime::epoch_secs`]. Used to render a stored epoch, such as the clock floor, as a date.
+    pub fn from_epoch_secs(epoch: i64) -> Datetime {
+        let days = epoch.div_euclid(86_400);
+        let rem = epoch.rem_euclid(86_400);
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        Datetime {
+            year:  (y + (m <= 2) as i64) as u16,
+            month: m as u8,
+            day:   d as u8,
+            hour:   (rem / 3_600) as u8,
+            minute: ((rem % 3_600) / 60) as u8,
+            second: (rem % 60) as u8,
+        }
+    }
+
     /// Days since the epoch (1970-01-01), proleptic Gregorian and leap-year aware
     /// (Howard Hinnant's `days_from_civil`). The basis for both `weekday` and
     /// `epoch_secs`.
@@ -1146,8 +1183,44 @@ impl ServiceContext {
     /// register, so it survives the 32-bit ARM syscall ABI and is valid past year 2106). Returns true on
     /// success. After this, `datetime()` reports the real time on the RTC-less ARM port.
     pub fn set_wall_clock(&self, epoch_secs: u32) -> bool {
-        // SAFETY: syscall(50) = SetClock; the kernel validates the SET_CLOCK cap by holdings.
+        // SAFETY: syscall(50) = SetClock, kind 0 = set the clock; the kernel validates SET_CLOCK by holdings.
         unsafe { raw_syscall(50, epoch_secs as u64, 0, 0) >= 0 }
+    }
+
+    /// Raise the persisted clock FLOOR - a "the machine was demonstrably running at least this late" bound,
+    /// seeded from disk at startup. It is never displayed as the time (a bound is true; an estimate of the
+    /// current time from an old bound is a fabrication). Its job is to REFUSE a clock value that cannot be
+    /// right: a dead RTC reading 2000, or a stale/hostile network reply from before we last ran. The floor
+    /// only moves forward. Requires SET_CLOCK; returns false if refused or implausible.
+    pub fn set_clock_floor(&self, epoch_secs: u32) -> bool {
+        // SAFETY: syscall(50) = SetClock, kind 1 = raise the floor; cap-validated by the kernel.
+        unsafe { raw_syscall(50, epoch_secs as u64, 1, 0) >= 0 }
+    }
+
+    /// Where the current wall-clock reading came from: `ClockSource::Ntp` if the network set it this boot,
+    /// `Rtc` if a hardware clock reads a plausible date, `Unset` if the machine has no idea what time it is.
+    pub fn clock_source(&self) -> ClockSource {
+        // SAFETY: syscall(13) = InspectKernel; query 21 = packed clock provenance.
+        let p = unsafe { raw_syscall(13, 21, 0, 0) };
+        match p & 0xFF {
+            2 => ClockSource::Ntp,
+            1 => ClockSource::Rtc,
+            _ => ClockSource::Unset,
+        }
+    }
+
+    /// Seconds since the network last set the clock, or `None` if it never did this boot.
+    pub fn clock_synced_secs_ago(&self) -> Option<i64> {
+        // SAFETY: syscall(13) = InspectKernel; query 21 = packed clock provenance (age in bits 8..).
+        let p = unsafe { raw_syscall(13, 21, 0, 0) };
+        if p & 0xFF == 2 { Some(p >> 8) } else { None }
+    }
+
+    /// The persisted clock floor in epoch seconds, or `None` if none is known. A LOWER BOUND, not a time.
+    pub fn clock_floor(&self) -> Option<i64> {
+        // SAFETY: syscall(13) = InspectKernel; query 22 = the clock floor.
+        let f = unsafe { raw_syscall(13, 22, 0, 0) };
+        if f > 0 { Some(f) } else { None }
     }
 
     /// A hardware-random u32 from the SoC RNG (the BCM2835 RNG on the Pi 2), or None if this build exposes

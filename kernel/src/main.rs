@@ -16,6 +16,7 @@ mod memory;
 mod smp;
 mod syscall;
 mod task;
+mod wallclock;
 
 use core::panic::PanicInfo;
 

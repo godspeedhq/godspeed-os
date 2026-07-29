@@ -477,9 +477,11 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         //   the shell's `gpio` command drives the SoC pins (the gated `Gpio` syscall, 45).
         gpio: cfg!(target_arch = "arm") && matches!(name, "shell"),
         //   SET_CLOCK: net-stack sets the wall clock from SNTP (the RTC-less ARM port has no other time
-        //   source). A kernel-only by-name grant like NET_DEVICE (not a contract cap). ARM-gated - x86
-        //   has a hardware RTC, so `SetClock` is an inert no-op there and nothing needs it.
-        set_clock: cfg!(target_arch = "arm") && matches!(name, "net-stack"),
+        //   source), and the SHELL raises the persisted clock FLOOR from the last-known time it reads off
+        //   the disk at startup - the bound that lets the kernel refuse a clock value from before the
+        //   machine last ran. A kernel-only by-name grant like NET_DEVICE (not a contract cap). ARM-gated:
+        //   x86 has a hardware RTC, so nothing there needs to set the time.
+        set_clock: cfg!(target_arch = "arm") && matches!(name, "net-stack" | "shell"),
     }
 }
 

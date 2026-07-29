@@ -106,7 +106,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::UsbDiskRead    as u64 => handle_usb_disk_read(arg0, arg1),
         n if n == SyscallNumber::UsbDiskWrite   as u64 => handle_usb_disk_write(arg0, arg1),
         n if n == SyscallNumber::UsbDiskFlush   as u64 => handle_usb_disk_flush(),
-        n if n == SyscallNumber::SetClock       as u64 => handle_set_clock(arg0),
+        n if n == SyscallNumber::SetClock       as u64 => handle_set_clock(arg0, arg1),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
             0
@@ -1334,7 +1334,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // boot/RTC reads (10, 11). Every other query discloses another task's or
     // system-wide state and requires the INTROSPECT capability with READ (§3.1;
     // docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20)
+    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -1405,6 +1405,17 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // speed - which fails silently on hardware and not at all under emulation. 0 = unknown, and the
         // driver then reports rather than guessing.
         20 => crate::arch::imp::emmc_base_clock_hz() as i64,
+        // Clock PROVENANCE, packed: bits 0-7 = source (0 unset / 1 rtc / 2 ntp), bits 8.. = seconds since
+        // the network last set it (0 if never). Ungated task-neutral timing info like the RTC (11) itself.
+        // `date` reports this so a displayed time says where it came from - a fallback chain is only
+        // mechanism, not magic, while its choice is visible (§26.4/§26.9).
+        21 => {
+            let ago = crate::wallclock::synced_secs_ago().max(0);
+            (crate::wallclock::source() as i64) | (ago << 8)
+        }
+        // The persisted clock FLOOR in epoch seconds (0 = none known). A "we ran at least this late" bound,
+        // never a reading - `date` shows it only when the time is unknown, explicitly labelled.
+        22 => crate::wallclock::floor(),
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,
@@ -1791,19 +1802,18 @@ fn handle_reboot() -> i64 {
 /// holdings - `arg0` spends the one argument register on the epoch, leaving no slot to pass). `epoch` is a
 /// u32 of seconds (single register - so it survives the 32-bit ARM ABI, valid past year 2106), widened
 /// here. A no-op on arches with a real hardware RTC (x86). Returns 0, or CapNotHeld without the cap.
-fn handle_set_clock(epoch: u64) -> i64 {
+fn handle_set_clock(epoch: u64, kind: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::SET_CLOCK_RESOURCE, Rights::WRITE) {
         return cap_err_to_i64(CapError::CapNotHeld);
     }
-    let new = (epoch & 0xFFFF_FFFF) as i64;
-    // Announce it. This changes EVERY task's view of the time of day, including backwards, and every other
-    // actuator syscall announces itself (`reboot: hardware reset`). Without this line an operator chasing a
-    // clock that stepped has no record that it did, or by how much (§26.7, §26.4 - what changed must be
-    // answerable). Cheap: it happens once per sync, not per read.
-    let old = crate::clock::epoch_secs(crate::arch::imp::rtc::read_datetime());
-    crate::kprintln!("clock: wall clock set to epoch {} (was {})", new, old);
-    crate::arch::imp::rtc::set_wall_clock(new);
-    0
+    let v = (epoch & 0xFFFF_FFFF) as i64;
+    // `kind` 1 = raise the persisted FLOOR (a "we ran at least this late" bound, seeded from disk), 0 = set
+    // the wall clock itself. Both are the same authority - the floor decides which clock values are
+    // acceptable - so they share the cap and the syscall rather than growing a second gate.
+    let ok = if kind == 1 { crate::wallclock::set_floor(v) } else { crate::wallclock::set_wall_clock(v) };
+    // Both paths announce themselves inside `clock` (set, or the reason for a refusal): a change to every
+    // task's view of the time of day must be answerable afterwards (§26.4, §26.7).
+    if ok { 0 } else { -1 }
 }
 
 /// Largest ethernet frame the USB-net bridge moves (matches nic-driver's FRAME_MAX).

@@ -40,6 +40,11 @@ pub fn epoch_secs(packed: u64) -> i64 {
     days * 86_400 + hour * 3_600 + min * 60 + sec
 }
 
+/// A plausible-epoch window shared by every clock consumer: 2020-01-01 .. 2100-01-01. Pure constants, so
+/// they live beside the pure date math; the stateful clock lives in the kernel-only `wallclock` module.
+pub const CLOCK_MIN_PLAUSIBLE: i64 = 1_577_836_800;
+pub const CLOCK_MAX_PLAUSIBLE: i64 = 4_102_444_800;
+
 /// The inverse of `epoch_secs`: Unix epoch seconds -> a `read_datetime`-packed value (same LSB-first
 /// layout: sec[6] min[6] hour[5] day[5] month[4] year[12]). Howard Hinnant's civil_from_days, so it is
 /// leap-year correct and round-trips `epoch_secs` exactly. Used by a settable wall clock (the RTC-less
