@@ -1381,6 +1381,48 @@ const HOTPLUG_INTERVAL_US: u32 = 1_000_000;
 /// The USB address a device on `port` gets - stable, so a replugged device returns to the same address.
 fn hub_port_addr(port: u8) -> u8 { 1 + port }
 
+/// EXCLUSIVE USB access, for an operation too long to make atomic by masking interrupts.
+///
+/// Enumeration is a sequence of control transfers that takes ~100 ms, and it needs the shared device
+/// selection (DEV_ADDR/MPS0/LOW_SPEED/SPLIT_PORT) to hold still throughout. The obvious way to get that -
+/// mask interrupts - is wrong at this length: core 0 would stop stamping its tick and another core's
+/// liveness watchdog would panic the machine. Masking buys atomicity by starving everything, and the
+/// operation is far too long to pay that price.
+///
+/// So the exclusion is a PROTOCOL the other users of the bus observe, not a suppression of the core. While
+/// this is held, interrupts stay ENABLED and the tick keeps running; what changes is that every other path
+/// which would touch the shared selection stands aside for the duration:
+///  - the keyboard poll skips its tick (a keystroke may be missed while a device is being enumerated),
+///  - the net RX ISR does not re-arm and the tick drain stays out (frames drop; the ring already has
+///    backpressure for exactly this),
+///  - net TX reports a failed transmit (visible, and its caller retries),
+///  - the PHY link poll returns its cached answer,
+///  - block I/O answers BUSY - the device's existing "occupied, re-ask" verdict, which `block-driver`
+///    already handles by yielding and re-asking, so storage is DELAYED and never failed.
+///
+/// This is §26.5 in practice: an explicit, visible agreement between the paths that share one channel,
+/// instead of an implicit assumption that nothing else runs.
+static USB_EXCLUSIVE: AtomicBool = AtomicBool::new(false);
+
+/// True while a long USB operation owns the bus. Every shared-selection path checks this and stands aside.
+#[inline]
+fn usb_exclusive_active() -> bool { USB_EXCLUSIVE.load(Ordering::Relaxed) }
+
+/// RAII claim on exclusive USB access. `None` if somebody already holds it (there is only ever one such
+/// operation). Released on every exit path, so an early return cannot wedge the bus in exclusive mode.
+struct UsbExclusive;
+impl UsbExclusive {
+    fn try_acquire() -> Option<UsbExclusive> {
+        match USB_EXCLUSIVE.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_)  => Some(UsbExclusive),
+            Err(_) => None,
+        }
+    }
+}
+impl Drop for UsbExclusive {
+    fn drop(&mut self) { USB_EXCLUSIVE.store(false, Ordering::Relaxed); }
+}
+
 /// GET_STATUS of a hub port -> wPortStatus (low 16) | wPortChange (high 16). 0 on failure.
 fn hub_get_port_status(port: u8) -> u32 {
     let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 4, 0x00];
@@ -1464,6 +1506,7 @@ fn enumerate_hub(protocol: u8) {
     // Walk EVERY connected port, assigning each device a distinct USB address (2, 3, ...) and configuring
     // it (keyboard AND ethernet can coexist behind the one hub - the Pi 2's LAN9514 topology). The single
     // host channel is time-shared: each device's transfer path re-selects it (`select_device`).
+    let mut boot_mask = 0u32;
     for port in 1..=nports {
         // Re-select the hub's own control endpoint: a prior downstream enumeration left DEV_ADDR/MPS0
         // pointing at that device, so every hub request below would otherwise go to the wrong address.
@@ -1472,6 +1515,11 @@ fn enumerate_hub(protocol: u8) {
         let st = hub_get_port_status(port);
         pl011_write(b"dwc2: hub port "); write_hex32(port as u32);
         pl011_write(b" status="); write_hex32(st); pl011_write(b"\r\n");
+        // Record occupancy from the status THIS loop already read - one truth, read once. Building the mask
+        // in a second pass cost a control transfer per port and, if one of those failed, would record a
+        // POPULATED port as empty; the watcher would then "discover" an already-configured device and drive
+        // PORT_RESET + SET_ADDRESS across a live one (Commandment III).
+        if st & 1 != 0 && port <= 31 { boot_mask |= 1 << (port - 1); }
         if st & 1 == 0 { continue; }                                            // no device on this port
         // Address DERIVED FROM THE PORT, not handed out sequentially. A port's device then keeps the same
         // address across an unplug/replug, so hot-plug needs no allocator and cannot exhaust the address
@@ -1482,15 +1530,15 @@ fn enumerate_hub(protocol: u8) {
     // Remember the hub's geometry + which ports held a device, so the idle hot-plug watcher can notice a
     // later change. Without this the boot walk was the ONLY time these ports were ever looked at.
     HUB_EP0_MPS.store(hub_mps, Ordering::Relaxed);
-    HUB_NPORTS.store(nports, Ordering::Relaxed);
-    {
-        let mut mask = 0u32;
-        for port in 1..=nports.min(31) {
-            select_device(1, hub_mps, false);
-            if hub_get_port_status(port) & 1 != 0 { mask |= 1 << (port - 1); }
-        }
-        HUB_CONNECTED.store(mask, Ordering::Relaxed);
+    // Clamp to the presence mask's width, and SAY so rather than silently never watching a high port.
+    if nports > 31 {
+        pl011_write(b"dwc2: hub reports more than 31 ports - watching the first 31 only\r\n");
     }
+    HUB_NPORTS.store(nports.min(31), Ordering::Relaxed);
+    HUB_CONNECTED.store(boot_mask, Ordering::Relaxed);
+    // Stamp the rate limiter so the FIRST watcher visit waits a full interval. Left at zero it fires
+    // immediately, and any port whose boot status read had failed would then look like a fresh arrival.
+    HOTPLUG_LAST_US.store(super::timer::systimer_us().max(1), Ordering::Relaxed);
     if !KBD_READY.load(Ordering::Relaxed) && !NET_READY.load(Ordering::Relaxed) {
         pl011_write(b"dwc2: no keyboard or network device found behind hub\r\n");
     }
@@ -1528,7 +1576,18 @@ fn bring_up_hub_port(port: u8, addr: u8) -> bool {
     let split_port = if (st2 >> 10) & 1 == 0 { port } else { 0 };
     pl011_write(b"dwc2: port "); write_hex32(port as u32);
     pl011_write(b" device status="); write_hex32(st2); pl011_write(b"\r\n");
-    enumerate_downstream(low, addr, split_port)
+    let brought_up = enumerate_downstream(low, addr, split_port);
+    // Repair the SHARED bulk state before returning. A mass-storage probe during enumeration stores its own
+    // BULK_MPS and resets both data toggles - and `net_frame_tx`/`net_rx_async_arm` frame their transfers
+    // from that same BULK_MPS, so leaving a stick's size in place silently malforms every later net
+    // transfer. The boot walk did this repair at the end of ITS walk; doing it here means the hot-plug path
+    // gets it too, which was the whole point of sharing this function (Commandment III - one path, not two).
+    if NET_READY.load(Ordering::Acquire) {
+        BULK_MPS.store(NET_BULK_MPS.load(Ordering::Relaxed), Ordering::Relaxed);
+        BULK_TOGGLE_IN.store(false, Ordering::Relaxed);
+        BULK_TOGGLE_OUT.store(false, Ordering::Relaxed);
+    }
+    brought_up
 }
 
 /// Watch the hub's ports for a device arriving or leaving, one port per call. Called from the scheduler's
@@ -1552,6 +1611,10 @@ pub fn hotplug_poll() {
     // SAFETY: core-0; ASYNC_BULK is core-0 exclusive.
     if unsafe { (*core::ptr::addr_of!(ASYNC_BULK)).active } { return; }
     let _claim = match BulkClaim::try_acquire() { Some(c) => c, None => return };
+    // Own the bus for this whole visit. Interrupts stay ENABLED - a ~100 ms enumeration must not suppress
+    // the tick, which is exactly what would stop core 0's liveness stamp and let another core panic the
+    // machine. Exclusion comes from every other shared-selection path observing this flag (`UsbExclusive`).
+    let _excl = match UsbExclusive::try_acquire() { Some(e) => e, None => return };
     HOTPLUG_LAST_US.store(now.max(1), Ordering::Relaxed);
 
     // Round-robin one port, so every port is visited within nports intervals.
@@ -1690,6 +1753,11 @@ static NET_LOW:    AtomicBool = AtomicBool::new(false); // whether it is a low-s
 /// 64 is MALFORMED. `bot_recover` documents what that costs when it is got wrong on the storage side
 /// (measured: a selfcheck run went from 16 failures to 70) - the same trap, one endpoint over.
 static NET_EP0_MPS: AtomicU16 = AtomicU16::new(64);
+/// The net device's BULK max-packet. `BULK_MPS` is SHARED with storage, and a mass-storage probe stores its
+/// own value there - so after any enumeration the net stream needs its size put back. Both devices happen to
+/// be high-speed with 512-byte bulk endpoints today, which is the only reason the boot walk's toggle-only
+/// repair has been sufficient; recording this makes the repair correct rather than lucky.
+static NET_BULK_MPS: AtomicU16 = AtomicU16::new(512);
 static NET_EP_IN:  AtomicU8   = AtomicU8::new(0);   // bulk IN endpoint (device -> host frames)
 static NET_EP_OUT: AtomicU8   = AtomicU8::new(0);   // bulk OUT endpoint (host -> device frames)
 static mut NET_MAC: [u8; 6] = [0; 6];               // our station MAC (the future net-stack bridge needs it)
@@ -2030,6 +2098,7 @@ fn configure_smsc95xx() -> bool {
     // Capture EP0's max packet size BEFORE BULK_MPS overwrites the shared MPS0 view: the runtime MDIO
     // link poll issues CONTROL transfers and must frame them with this, not with the bulk size.
     NET_EP0_MPS.store(MPS0.load(Ordering::Relaxed), Ordering::Relaxed);
+    NET_BULK_MPS.store(bulk_mps, Ordering::Relaxed);
     BULK_MPS.store(bulk_mps, Ordering::Relaxed);
     BULK_TOGGLE_IN.store(false, Ordering::Relaxed);
     BULK_TOGGLE_OUT.store(false, Ordering::Relaxed);
@@ -2068,6 +2137,9 @@ fn on_core0() -> bool {
 /// Transmit one ethernet frame (bulk OUT). Returns true if it was handed to the device.
 pub fn net_frame_tx(frame: &[u8]) -> bool {
     if !NET_READY.load(Ordering::Acquire) || !on_core0() { return false; }
+    // A long USB operation owns the shared selection; sending now would misdirect it. Report the failed
+    // transmit (the caller sees it and retries) rather than corrupting somebody else's transfer.
+    if usb_exclusive_active() { return false; }
     // Point the shared channel at the net device (the keyboard poll may have selected itself last).
     select_device(NET_ADDR.load(Ordering::Relaxed), BULK_MPS.load(Ordering::Relaxed),
                   NET_LOW.load(Ordering::Relaxed));
@@ -2319,6 +2391,13 @@ fn net_rx_isr() {
     // SAFETY: core-0 exclusive, IRQ-masked.
     unsafe {
         if !NET_RX_ARMED.load(Ordering::Relaxed) { return; }        // net down / disarmed - do not re-arm
+        // A long USB operation owns the shared selection. Re-arming would reprogram the channel under it,
+        // so stop listening; the tick watchdog brings RX back once the operation releases the bus.
+        if usb_exclusive_active() {
+            NET_RX_ARMED.store(false, Ordering::Relaxed);
+            wr(HAINTMSK, rd(HAINTMSK) & !(1 << CH_NET_RX));
+            return;
+        }
         if hcint & HCINT_XFERCOMPL != 0 {
             let remaining = (rd(hctsiz_at(CH_NET_RX)) & 0x7_FFFF) as usize;
             let got = NET_RX_BURST_BYTES.saturating_sub(remaining);
@@ -2368,6 +2447,7 @@ fn net_rx_isr() {
 /// Re-arm it if it went idle - a dropped-IRQ backstop, not the normal path (invariant 12).
 pub fn net_rx_drain_tick() {
     if !on_core0() || !NET_READY.load(Ordering::Acquire) { return; }
+    if usb_exclusive_active() { return; }        // the bus is owned by a long operation - do not re-arm
     // SAFETY: core-0 + IRQ-masked (timer ISR).
     unsafe {
         if !NET_RX_ARMED.load(Ordering::Relaxed) {
@@ -2437,6 +2517,7 @@ fn net_link_up() -> bool {
     if last != 0 && now.wrapping_sub(last) < NET_LINK_POLL_US { return cached; }
     // SAFETY: core-0 + IRQ-masked (syscall); ASYNC_BULK is core-0 exclusive.
     if unsafe { (*core::ptr::addr_of!(ASYNC_BULK)).active } { return cached; }
+    if usb_exclusive_active() { return cached; }   // the bus is owned by a long operation - answer from cache
     // Claim CH_BULK for the duration of the MDIO reads, or step aside. Storage owns this channel for a
     // whole BOT command (three transfers with task-switching gaps between them), and a poll that lands in
     // one of those gaps reprograms the channel under a device waiting for its data phase. A missed poll
@@ -3248,6 +3329,14 @@ static MSC_REFUSE_RANGE: AtomicU32 = AtomicU32::new(0);
 /// device, the LBA is past the end, or the transfer failed. Core-0 only (the single DWC2 poller), and
 /// non-blocking like the net path - see the DMA soundness invariant on `DMA`.
 pub fn msc_read_block(lba: u64, dst: &mut [u8]) -> bool {
+    // A long USB operation owns the shared selection (a hot-plugged device is being enumerated). Answer
+    // with the device's own BUSY verdict, NOT a failure: `block-driver` already treats BUSY as "occupied,
+    // re-ask" and yields between attempts, so storage is DELAYED by ~100 ms and never fails. Failing here
+    // instead would surface as a device I/O error to `fs` for a disk that is perfectly healthy.
+    if usb_exclusive_active() {
+        LAST_FAIL.store(FAIL_NAK_TIMEOUT, Ordering::Relaxed);
+        return false;
+    }
     if !MSC_READY.load(Ordering::Acquire) { return msc_refuse("not ready (mid-revival?)", &MSC_REFUSE_NOT_READY, lba); }
     if !on_core0() { return msc_refuse("wrong core", &MSC_REFUSE_WRONG_CORE, lba); }
     if dst.len() < 512 { return false; }
@@ -3323,6 +3412,14 @@ static MSC_FUA_LOGGED: AtomicBool = AtomicBool::new(false);
 /// tell. So this claims only what it knows - the device did not reject it - and the real evidence is
 /// a power cycle with the tree still readable afterwards.
 pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
+    // A long USB operation owns the shared selection (a hot-plugged device is being enumerated). Answer
+    // with the device's own BUSY verdict, NOT a failure: `block-driver` already treats BUSY as "occupied,
+    // re-ask" and yields between attempts, so storage is DELAYED by ~100 ms and never fails. Failing here
+    // instead would surface as a device I/O error to `fs` for a disk that is perfectly healthy.
+    if usb_exclusive_active() {
+        LAST_FAIL.store(FAIL_NAK_TIMEOUT, Ordering::Relaxed);
+        return false;
+    }
     if !MSC_READY.load(Ordering::Acquire) { return msc_refuse("not ready (mid-revival?)", &MSC_REFUSE_NOT_READY, lba); }
     if !on_core0() { return msc_refuse("wrong core", &MSC_REFUSE_WRONG_CORE, lba); }
     if src.len() < 512 { return false; }
@@ -3407,6 +3504,14 @@ pub fn msc_writes_are_fua() -> bool {
 /// No data phase. Bounded like every other transfer; a device that refuses it reports `false` rather
 /// than silently pretending the data is safe (invariant 12).
 pub fn msc_sync_cache() -> bool {
+    // A long USB operation owns the shared selection (a hot-plugged device is being enumerated). Answer
+    // with the device's own BUSY verdict, NOT a failure: `block-driver` already treats BUSY as "occupied,
+    // re-ask" and yields between attempts, so storage is DELAYED by ~100 ms and never fails. Failing here
+    // instead would surface as a device I/O error to `fs` for a disk that is perfectly healthy.
+    if usb_exclusive_active() {
+        LAST_FAIL.store(FAIL_NAK_TIMEOUT, Ordering::Relaxed);
+        return false;
+    }
     if !MSC_READY.load(Ordering::Acquire) || !on_core0() { return false; }
     // Ask a device at most once. This stick answers SYNCHRONIZE CACHE with CHECK CONDITION - it does
     // not implement the command - and a device that refuses once will refuse forever, so continuing to
@@ -3459,6 +3564,9 @@ static mut KBD_STATE: KbdState =
 /// Called from the Core-0 timer tick. Once a keyboard is configured, run one interrupt IN transaction; on
 /// a completed transfer decode the boot report into console bytes. A NAK (no key change) returns quietly.
 pub fn poll() {
+    // Stand aside while a long USB operation owns the bus (enumeration of a hot-plugged device). A missed
+    // keystroke for ~100 ms is the price of not corrupting the transfer that is bringing up the keyboard.
+    if usb_exclusive_active() { return; }
     // The keyboard's periodic poll gets its OWN channel. It is the one transfer deliberately abandoned
     // when its in-ISR budget expires, and on a shared channel that abandonment was inherited by
     // whatever ran next.
