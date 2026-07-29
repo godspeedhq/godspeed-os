@@ -30,8 +30,12 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
 - **Networking (USB-Ethernet -> net-stack):** a CDC-ECM USB-net device is driven in-kernel (DWC2 bulk
   frames) and bridged to the **unchanged** userspace `net-stack` via three `NET_DEVICE`-gated syscalls; a
   per-arch `nic-driver` backend speaks the frame IPC. Verified in QEMU (`arm_run.py --usbnet`): DHCP, ARP,
-  ICMP, DNS, and the shell `net` + `ping` all work over USB. The Pi 2's onboard LAN9514 (`smsc95xx`) is the
-  one HW-blind device layer left; everything above it is done.
+  ICMP, DNS, and the shell `net` + `ping` all work over USB. The Pi 2's onboard **LAN9514 (`smsc95xx`) is
+  now driven on real hardware too**: DHCP, ARP and internet ping all work, with RX **interrupt-driven** (a
+  bulk-IN is kept armed and its halt-ISR parses each burst and re-arms; the DWC2 core auto-retries NAKs in
+  hardware, so an idle device costs no interrupts). The poll it replaced listened only ~3% of each 10 ms
+  tick and the device's small RX FIFO dropped the rest - that was ~85% ping loss, now ~4% (ordinary
+  internet loss). Link state is read from the PHY (MII BMSR), so an unplugged cable reports as unplugged.
 - **Multiple USB devices coexist:** `enumerate_downstream` walks *every* hub port, gives each device a
   distinct address, and configures all of them; the single DWC2 host channel is time-shared by having each
   transfer path re-select its device (`select_device`: address / max-packet / speed). Verified in QEMU with
@@ -95,8 +99,13 @@ method").
   frame (`status | count`'s record builder, ~600 KiB) or `fs`'s mount/journal frame exceeds the 256 KiB
   user stack and faults the task (it recovers via supervisor restart). Release frames fit; the release
   image is also 27x smaller. Build the usable OS in release.
-- **No RTC on the Pi 2** (and QEMU raspi2b emulates none), so `date`/`uptime` read zeros. Not a bug -
-  the x86 MC146818 CMOS RTC has no Pi equivalent; a real clock needs NTP or an I2C RTC module.
+- **No RTC on the Pi 2** (and QEMU raspi2b emulates none) - the x86 MC146818 CMOS RTC has no Pi
+  equivalent. Both consequences are now **fixed rather than accepted**: `uptime` reads the monotonic
+  generic timer (not a wall-clock delta from a frozen stamp), and the wall clock is set from the network
+  by **SNTP** - net-stack syncs once after the boot DHCP dance and on demand via `date sync` (the gated
+  `SetClock` syscall 50 / `SET_CLOCK` capability, granted by name to net-stack on ARM only; x86's CMOS
+  clock remains the authority there and the syscall is refused). With no cable, `date` reads zeros and
+  says so rather than inventing a time.
 - **The `usermode` selftest** used VAs in the framebuffer region; it now maps at `0x5000_0000` (above
   every identity-mapped region) so it PASSes under QEMU and HW alike.
 

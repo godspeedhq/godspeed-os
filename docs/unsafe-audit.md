@@ -13,6 +13,31 @@ comment.
 
 ---
 
+## 2026-07-29 - LAN9514 networking: interrupt-driven RX, PHY link state, SNTP (feat/arm-usb-interrupt)
+
+The Pi 2's onboard LAN9514 brought up on real hardware, then reworked from a polled RX to an
+**interrupt-driven** one (ping loss 85% -> 4%), plus a real PHY link read and the SNTP wall clock. All in
+the permitted `arch/` layer; every block SAFETY-commented, all of it core-0 + IRQ-masked driver state
+(the RX ring, the reassembly buffer, the DMA burst buffer) or MMIO through the existing `rd`/`wr` helpers.
+
+The RX path's blocks are the bulk of it: a single-producer/single-consumer ring (`net_rx_ring_push`,
+`net_rx_ring_pop`), the cross-burst reassembly buffer (`net_rx_parse`, `net_rx_partial_reset`), arming and
+re-arming the background bulk-IN (`net_rx_async_arm`, `net_rx_async_start`, `net_rx_isr`), and the
+consumer syscall (`net_frame_rx`). Producer and consumer are mutually exclusive without a lock because
+both run on core 0 with IRQs masked - the syscall path cannot park, and ARM IRQ entry masks IRQs - which
+is the argument each SAFETY comment carries.
+
+This entry also **re-baselines two files whose drift predates this work**: `irq.rs` and `mod.rs` are
+untouched by these commits (verified: identical counts at the branch point) and had accumulated
+undocumented blocks from the earlier USB/SD bring-up on this branch. They are recorded here so the
+inventory matches source again rather than carrying a known-stale baseline forward.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/dwc2.rs` | 14 -> 31 (+17) | Interrupt-driven net RX (ring push/pop, burst parse + reassembly, partial reset, background arm/re-arm, the halt ISR, the consumer syscall), the net-up arm sites, and the PHY link poll's read of `ASYNC_BULK.active` (the guard that keeps a link poll from destroying a parked storage transfer). |
+| `arch/arm/irq.rs` | 11 -> 13 (+2) | **Pre-existing drift, re-baselined:** blocks added by earlier branch work (USB IRQ routing/ack), not by the networking commits. |
+| `arch/arm/mod.rs` | 43 -> 44 (+1) | **Pre-existing drift, re-baselined:** one block from earlier branch work. |
+
 ## 2026-07-24 - SD card bring-up on real hardware: mailbox power + base clock + pin routing (feat/pi2-arm32)
 
 The Pi 2's SD card init failed on hardware while passing under emulation. Three board-level steps the
@@ -1030,12 +1055,12 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
 | arch/arm/dtb.rs | 6 | permitted |
-| arch/arm/irq.rs | 11 | permitted |
+| arch/arm/irq.rs | 13 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
 | arch/arm/fbcon.rs | 6 | permitted |
-| arch/arm/dwc2.rs | 14 | permitted |
+| arch/arm/dwc2.rs | 31 | permitted |
 | arch/arm/page_tables.rs | 31 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |
@@ -1044,7 +1069,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 43 | permitted |
+| arch/arm/mod.rs | 44 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
 | arch/riscv64/mod.rs | 23 | permitted |
