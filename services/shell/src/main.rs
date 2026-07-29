@@ -5696,7 +5696,14 @@ fn build_drives_table(ctx: &ServiceContext) -> Option<Table> {
     };
     let p = reply.payload_bytes();
     if p.first() != Some(&FS_OK) || p.len() < 28 {
-        ctx.console_writeln("drives: no disk found");
+        // Name what actually came back. "no disk found" was a GUESS at the cause dressed as a fact: the
+        // reply may be a status code (FS_NOFS / FS_UNAVAIL / FS_ERR) that means something quite different
+        // from an absent disk, and a short reply means the protocol went wrong, not that storage is gone.
+        // Reporting the raw shape is the difference between diagnosing this in one boot and guessing at it
+        // for several (§26.7 - say what failed, not what you suppose it means).
+        ctx.console_writeln_fmt(format_args!(
+            "drives: unexpected reply from fs - status {} len {} (want status {}, len >= 28)",
+            p.first().copied().unwrap_or(255), p.len(), FS_OK));
         return None;
     }
     let mounted = p[1] != 0;
@@ -10072,7 +10079,10 @@ fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
     };
     let p = reply.payload_bytes();
     if p.first() != Some(&FS_OK) || p.len() < 28 {
-        ctx.console_writeln("drives: no disk found");
+        // See build_drives_table: report the reply's actual shape rather than asserting a cause.
+        ctx.console_writeln_fmt(format_args!(
+            "drives: unexpected reply from fs - status {} len {} (want status {}, len >= 28)",
+            p.first().copied().unwrap_or(255), p.len(), FS_OK));
         return Err(ShellError::Unknown);
     }
     let mounted = p[1] != 0;

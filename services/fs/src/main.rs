@@ -831,6 +831,12 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
     match p[0] & 0x7F {
         OP_DRIVES_INFO => {
             // [FS_OK, mounted, capacity:u64, used:u64, flags:u8, label_len:u8, label…]
+            // Report what this answer is made of. `drives` reporting "no disk" while the boot log shows a
+            // mounted 15 GB volume is a contradiction between two of our own statements, and neither side
+            // said enough to tell which was wrong. This is the producing side (§26.4 - where the answer
+            // came from must be answerable).
+            ctx.log_fmt(format_args!("fs: drives-info - capacity {} sectors, mounted {}",
+                                     capacity, vol.is_some()));
             let mut out = [0u8; 28 + LABEL_MAX];
             out[0] = FS_OK;
             out[2..10].copy_from_slice(&capacity.to_le_bytes());
