@@ -3141,10 +3141,13 @@ static MSC_FUA_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Write one 512-byte block to the USB mass-storage device. Same constraints as `msc_read_block`.
 ///
-/// **FUA is currently OFF** (`USE_FUA`, above, records the measurement that turned it off), so the
-/// FUA branch and its fallback below are inert. What follows describes what the bit is FOR, and is
-/// written in the present tense deliberately - it is the standing rationale for re-enabling, not a
-/// description of today's behaviour.
+/// **FUA is ON** (`USE_FUA`, above, records why it was turned back on: the async BUSY path made a
+/// post-write NAK cost latency instead of the command budget, and a carnage storm had already lost the
+/// root record to a port reset clearing the device's buffer). The branch below is live, and what follows
+/// describes TODAY's behaviour. (This paragraph read "FUA is currently OFF ... inert" until 2026-07-29,
+/// left over from when the flag was false - it described the opposite of the shipped code, which is the
+/// same drift just fixed one constant over on `HW_CFG_BIR`. The cost is real and accepted: a durable
+/// write per block is why a whole-disk pass on this stick takes minutes.)
 ///
 /// Issued with **FUA** (Force Unit Access) where the device accepts it, which asks the drive to put
 /// this block on the medium before reporting completion instead of parking it in a volatile buffer.
