@@ -5690,6 +5690,7 @@ fn cap_rights_str(r: u8, buf: &mut [u8]) -> usize {
 /// unit - a bare number cell can't).
 #[inline(never)]
 fn build_drives_table(ctx: &ServiceContext) -> Option<Table> {
+    drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
     let reply = match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_DRIVES_INFO])) {
         Some(r) => r,
         None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); return None; }
@@ -7890,6 +7891,7 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
     let dn = data.len().min(req.len() - 2 - pl);
     req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
     let msg = Message::from_bytes(&req[..2 + pl + dn]);
+    drain_stale_fs_replies(ctx);          // an earlier abandoned reply must not be read as ours
     if let Some(r) = ctx.request_with_reply("fs", &msg) {
         return Some(r);
     }
@@ -7897,6 +7899,7 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
     // §14.3). Reacquire a fresh `fs` cap by name and retry once; if `fs` hasn't
     // finished re-registering yet, this returns None and the next command retries.
     if ctx.reacquire_by_name("fs") {
+        drain_stale_fs_replies(ctx);
         return ctx.request_with_reply("fs", &msg);
     }
     None
@@ -7927,6 +7930,7 @@ fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8], ma
     let dn = data.len().min(req.len() - 2 - pl);
     req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
     let msg = Message::from_bytes(&req[..2 + pl + dn]);
+    drain_stale_fs_replies(ctx);          // an earlier abandoned reply must not be read as ours
     if let Some(r) = ctx.request_with_reply_deadline("fs", &msg, max_secs) {
         return Some(r);
     }
@@ -7939,32 +7943,35 @@ fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8], ma
     //
     // So spend a SHORT grace collecting the late reply purely to discard it. The abortable request path
     // solves the same problem with a drain at its own top; this path had no equivalent.
-    reclaim_late_fs_reply(ctx);
+    // Timed out. Do NOT try to reclaim the late reply here - that is the race described in
+    // `drain_stale_fs_replies`. The next request drains it instead, which is decisive.
     if ctx.reacquire_by_name("fs") {
+        drain_stale_fs_replies(ctx);
         if let Some(r) = ctx.request_with_reply_deadline("fs", &msg, max_secs) { return Some(r); }
-        reclaim_late_fs_reply(ctx);
     }
     None
 }
 
-/// Consume-and-discard a reply that arrives after its requester gave up, so it cannot be mistaken for the
-/// next request's answer. Bounded twice over: a wall-clock grace and a yield count, because the whole
-/// point is that the peer may never answer at all.
+/// Discard anything already queued on our endpoint BEFORE sending an fs request.
 ///
-/// Residual, stated rather than hidden: if the reply arrives after even this grace it still orphans. The
-/// complete fix is a request tag the reply must carry, which the fs protocol does not have; this closes
-/// the window that actually bit (a peer answering a little late) without inventing a protocol change here.
-fn reclaim_late_fs_reply(ctx: &ServiceContext) {
-    const GRACE_SECS: i64 = 2;
-    const MAX_YIELDS: u32 = 200_000;
-    let t0 = ctx.epoch_secs_monotonic();
-    let mut n = 0u32;
-    loop {
-        if ctx.try_recv().is_some() { return; }                 // caught the orphan - discarded
-        if ctx.epoch_secs_monotonic() - t0 >= GRACE_SECS { return; }
-        n += 1;
-        if n > MAX_YIELDS { return; }
-        ctx.yield_cpu();
+/// This is the only reliable cure for a desynchronised reply channel, and it belongs at the START of a
+/// request rather than at the end of a failed one. An fs reply carries no request identity, so a reply
+/// abandoned by an earlier caller - one that timed out, or that the user aborted with `q` - is
+/// indistinguishable from ours once it is sitting in the queue. Trying to reclaim it AFTER the fact is a
+/// race that cannot be won: if the late reply has not arrived yet, we move on and the NEXT command eats
+/// it. Draining first is decisive, because at the instant we are about to send, every queued message is
+/// by definition somebody else's leftover.
+///
+/// Safe here because the shell is a pure CLIENT of fs on this endpoint - it does not serve requests on it.
+/// That is exactly why `request_with_reply_abortable` already drains at its own top; interactive commands
+/// have been relying on it. The bounded and unbounded paths had no equivalent, which is how a single
+/// abandoned reply at boot turned into `drives` reporting a healthy disk as absent, and then into the
+/// shell announcing "flash FAILED" for a format that was still running.
+///
+/// Bounded: at most a handful of discards, so a peer stuck emitting messages cannot spin us here.
+fn drain_stale_fs_replies(ctx: &ServiceContext) {
+    for _ in 0..8 {
+        if ctx.try_recv().is_none() { return; }
     }
 }
 
@@ -8007,6 +8014,7 @@ fn fs_op_q(ctx: &ServiceContext, op: u8) -> ReqOutcome {
     const HINT_SECS: i64 = 2;    // print "(q to quit)" only once the wait lingers
     const MAX_SECS:  i64 = 3600; // effectively unbounded: q is the real exit, not a deadline
     let msg = Message::from_bytes(&[op]);
+    drain_stale_fs_replies(ctx);
     match ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)")) {
         ReqOutcome::Timeout if ctx.reacquire_by_name("fs") =>
             ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)")),
@@ -10125,6 +10133,7 @@ fn drive_sel_ok(ctx: &ServiceContext, sel: &str) -> bool {
 
 /// `drives` - list the attached drive (single-drive in step 3; index 0).
 fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
+    drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
     let reply = match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_DRIVES_INFO])) {
         Some(r) => r,
         None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); return Err(ShellError::Unknown); }
@@ -10182,6 +10191,11 @@ fn drives_flash(ctx: &ServiceContext, label: &str, force: bool) -> Result<(), Sh
     req[0] = if force { OP_FLASH | 0x80 } else { OP_FLASH };
     req[1] = ll as u8;
     req[2..2 + ll].copy_from_slice(&lb[..ll]);
+    // Start from a clean channel. Without this, a reply abandoned by an earlier command is read as this
+    // format's result - and because a 15 GB format takes MINUTES, the answer arrives instantly and says
+    // "flash FAILED" while fs is still formatting. Observed exactly that on hardware: fs logged
+    // `flash requested`, never logged a failure, and the shell had already declared one.
+    drain_stale_fs_replies(ctx);
     match ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + ll])) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: formatted as GSFS - mounted, ready to use now (no reboot)");
@@ -10209,6 +10223,7 @@ fn drives_reset(ctx: &ServiceContext, force: bool) -> Result<(), ShellError> {
     }
     // Reset zeroes block 0, which on a foreign disk is its partition table - same danger as flash.
     let op = if force { OP_RESET | 0x80 } else { OP_RESET };
+    drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
     match ctx.request_with_reply("fs", &Message::from_bytes(&[op])) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: reset to raw - 'drives flash' to use again");
@@ -10313,6 +10328,7 @@ fn drives_label(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     req[0] = OP_LABEL;
     req[1] = ll as u8;
     req[2..2 + ll].copy_from_slice(nb);
+    drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
     match ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + ll])) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln_fmt(format_args!("drives: labelled '{}'", name));
