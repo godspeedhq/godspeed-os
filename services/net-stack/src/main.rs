@@ -197,7 +197,7 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u
                 ip[0], ip[1], ip[2], ip[3], gw[0], gw[1], gw[2], gw[3], dns[0], dns[1], dns[2], dns[3]));
             return Some((ip, gw, dns));
         }
-        ctx.reacquire_by_name("nic-driver");
+        let _ = ctx.reacquire_by_name("nic-driver");   // best-effort: we retry either way
     }
     ctx.log("net-stack: DHCP - no offer within the budget - degrading to the fallback IP");
     None
@@ -367,7 +367,7 @@ fn udp_roundtrip(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_m
     for _ in 0..DANCE_TRIES {
         let reply = match ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS) {
             Some(r) => r,
-            None => { ctx.reacquire_by_name("nic-driver"); continue; }
+            None => { let _ = ctx.reacquire_by_name("nic-driver"); continue; }
         };
         let f = reply.payload_bytes();
         if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17
@@ -802,7 +802,7 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
                     break;
                 }
             }
-            None => { ctx.reacquire_by_name("nic-driver"); }
+            None => { let _ = ctx.reacquire_by_name("nic-driver"); }
         }
     }
     if !have_mac {

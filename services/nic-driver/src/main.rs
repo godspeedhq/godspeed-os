@@ -544,6 +544,9 @@ fn usb_net_main(ctx: ServiceContext) -> ! {
     const FRAME_MAX: usize = 1600;
     const BATCH_MAX: u8 = 8;
     const BATCH_MSG_MAX: usize = 3072;
+    // Failed transmits, so the report is rate-limited rather than per-frame. Serve-loop-local (this
+    // service's own state, threaded through the loop) - not a file-scope static.
+    let mut tx_fail: u32 = 0;
 
     let mut info = [0u8; 7];
     if ctx.net_info(&mut info) {
@@ -612,7 +615,16 @@ fn usb_net_main(ctx: ServiceContext) -> ! {
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[1u8]));
         } else {
             // TX FRAME (any multi-byte payload) + coupled RX: transmit, then hand back one received frame.
-            ctx.net_frame_tx(p);
+            // A failed transmit used to be dropped on the floor: the reply still came back normally, so
+            // net-stack waited out its whole deadline for an answer to a frame that never left the host -
+            // a send that did not happen, reported as one that did (§26.7). Rate-limited so a persistently
+            // broken device cannot flood the console.
+            if !ctx.net_frame_tx(p) {
+                tx_fail = tx_fail.saturating_add(1);
+                if tx_fail == 1 || tx_fail % 64 == 0 {
+                    ctx.log_fmt(format_args!("nic-driver: usb-net TX FAILED x{} (frame not sent)", tx_fail));
+                }
+            }
             let mut rx = [0u8; FRAME_MAX];
             let n = rx_one(&ctx, &mut rx);
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rx[..n]));

@@ -483,6 +483,7 @@ impl ServiceContext {
     /// Transmit one raw ethernet frame via the in-kernel USB-net device (the ARM DWC2 CDC-ECM bridge).
     /// Gated by the NET_DEVICE cap (the ARM `nic-driver` holds it). Returns true if it was sent. Both
     /// args are pointer + length, so they fit the 32-bit ABI without truncation. Inert on non-ARM.
+    #[must_use = "the frame is NOT on the wire if this is false"]
     pub fn net_frame_tx(&self, frame: &[u8]) -> bool {
         // SAFETY: syscall(42) = NetFrameTx; the kernel range-checks (ptr, len) before copying.
         unsafe { raw_syscall(42, frame.as_ptr() as u64, frame.len() as u64, 0) >= 0 }
@@ -810,6 +811,7 @@ impl ServiceContext {
     /// directory**, not a service. The directory is populated synchronously at each service's spawn,
     /// so there is no round-trip and no bootstrap chicken-and-egg (the directory lives in the kernel,
     /// always reachable). `reacquire_cap` also updates the send-cap cache.
+    #[must_use = "the peer is NOT reacquired if this is false"]
     pub fn reacquire_by_name(&self, peer: &str) -> bool {
         self.reacquire_cap(peer).is_ok()
     }
@@ -945,6 +947,7 @@ impl ServiceContext {
     /// Read the 512-byte block at `lba` from the USB mass-storage device into `dst`. Returns false if
     /// there is no device, the LBA is past the end, or the transfer failed. Requires `USB_DISK`.
     /// Syscall 47.
+    #[must_use = "the destination buffer is NOT valid data if this is false"]
     pub fn usb_disk_read(&self, lba: u64, dst: &mut [u8; 512]) -> bool {
         // SAFETY: syscall(47) = UsbDiskRead; the kernel writes exactly 512 bytes to `dst` on success,
         // through its checked user-pointer path.
@@ -955,6 +958,7 @@ impl ServiceContext {
 
     /// Write `src` as the 512-byte block at `lba` on the USB mass-storage device. Requires `USB_DISK`.
     /// Syscall 48.
+    #[must_use = "the block did NOT reach the medium if this is false"]
     pub fn usb_disk_write(&self, lba: u64, src: &[u8; 512]) -> bool {
         // SAFETY: syscall(48) = UsbDiskWrite; the kernel reads exactly 512 bytes from `src` through its
         // checked user-pointer path.
@@ -986,6 +990,7 @@ impl ServiceContext {
     /// A write is only ACKNOWLEDGED when `usb_disk_write` returns - the device may still be holding the
     /// bytes in a volatile buffer. Anything that promises durability (a format, a journal commit) has to
     /// ask for it, and check the answer: `false` means the data is NOT known to be on the medium.
+    #[must_use = "prior writes are NOT durable if this is false"]
     pub fn usb_disk_flush(&self) -> bool {
         // SAFETY: syscall(49) = UsbDiskFlush; takes no arguments and touches no user memory.
         let ret = unsafe { raw_syscall(49, 0, 0, 0) };
@@ -1203,6 +1208,7 @@ impl ServiceContext {
     /// hardware RTC (x86) - there the CMOS clock is the authority. `epoch_secs` is a `u32` (a single ABI
     /// register, so it survives the 32-bit ARM syscall ABI and is valid past year 2106). Returns true on
     /// success. After this, `datetime()` reports the real time on the RTC-less ARM port.
+    #[must_use = "the kernel can refuse this - the clock is unchanged if false"]
     pub fn set_wall_clock(&self, epoch_secs: u32) -> bool {
         // SAFETY: syscall(50) = SetClock, kind 0 = set the clock; the kernel validates SET_CLOCK by holdings.
         unsafe { raw_syscall(50, epoch_secs as u64, 0, 0) >= 0 }
@@ -1213,6 +1219,7 @@ impl ServiceContext {
     /// current time from an old bound is a fabrication). Its job is to REFUSE a clock value that cannot be
     /// right: a dead RTC reading 2000, or a stale/hostile network reply from before we last ran. The floor
     /// only moves forward. Requires SET_CLOCK; returns false if refused or implausible.
+    #[must_use = "the kernel can refuse this - the floor is unchanged if false"]
     pub fn set_clock_floor(&self, epoch_secs: u32) -> bool {
         // SAFETY: syscall(50) = SetClock, kind 1 = raise the floor; cap-validated by the kernel.
         unsafe { raw_syscall(50, epoch_secs as u64, 1, 0) >= 0 }
@@ -1448,6 +1455,7 @@ impl ServiceContext {
     /// Revoke a delegated resource this service owns (§7.10): bumps its generation so every
     /// outstanding cap to it goes stale (clients see `CapRevoked`/`EndpointDead` on next use).
     /// Owner-gated by the kernel (ownership is the check). `true` on success. Syscall 32.
+    #[must_use = "the capability is STILL VALID if this is false"]
     pub fn resource_revoke(&self, resource_id: u64) -> bool {
         // SAFETY: syscall(32) = ResourceRevoke; the kernel checks this task owns the resource.
         unsafe { raw_syscall(32, resource_id, 0, 0) == 0 }

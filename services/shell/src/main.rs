@@ -4676,25 +4676,36 @@ fn clock_floor_persist(ctx: &ServiceContext, epoch: u32, quiet: bool) -> bool {
     }
 }
 
+/// Read a whole small file into `dst`, returning the byte count, or `None` if it is absent / unreadable /
+/// `fs` is not serving. **The ONE place that parses an OP_READ_FILE reply.**
+///
+/// `fs` answers `[FS_OK, len:u32 LE, data..]`. Every caller that hand-parses that shape gets three
+/// chances to be wrong, and one of them already was: checking the status byte against `1` fails on every
+/// SUCCESS (FS_OK is 0; 1 is FS_ERR), and skipping only one byte splices the length prefix into the data.
+/// That bug made a feature silently inert on every boot. Parsing it once, here, removes the failure mode
+/// for the next caller instead of leaving it lying around (§26.4 - one visible mechanism, not N copies).
+fn fs_read_file(ctx: &ServiceContext, path: &[u8], dst: &mut [u8], max_secs: i64) -> Option<usize> {
+    let r = fs_request_bounded(ctx, OP_READ_FILE, path, &[], max_secs)?;
+    let p = r.payload_bytes();
+    if p.first() != Some(&FS_OK) || p.len() < 5 { return None; }   // FS_NOTFOUND / FS_ERR / no filesystem
+    let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+    let end = (5 + n).min(p.len());
+    let m = (end - 5).min(dst.len());
+    dst[..m].copy_from_slice(&p[5..5 + m]);
+    Some(m)
+}
+
 /// Seed the kernel's clock floor from the last-known time on disk, at startup. The floor is a BOUND, never
 /// a reading: it is not shown as the time and no "estimate" is derived from it (a machine powered off for
 /// six months would otherwise display a six-month-old timestamp indistinguishable from a measured one).
 /// Its whole job is to let the kernel REFUSE a clock value from before we last ran.
-///
-/// `fs` answers OP_READ_FILE with `[FS_OK, len:u32 LE, data..]` - the shape every other reader in this
-/// file honours. (Reading it as `[ok=1, data..]` makes the check fail on every SUCCESS, because FS_OK is 0
-/// and 1 is FS_ERR, and then splices the length bytes into the text: the floor would never once be seeded,
-/// and nothing would say so.)
 fn clock_floor_seed(ctx: &ServiceContext) {
-    let r = match fs_request_bounded(ctx, OP_READ_FILE, CLOCK_FLOOR_PATH, &[], CLOCK_FS_SECS) {
-        Some(r) => r,
-        None => return,                      // no fs / not serving yet - no floor this boot, and that is fine
+    let mut buf = [0u8; 24];
+    let n = match fs_read_file(ctx, CLOCK_FLOOR_PATH, &mut buf, CLOCK_FS_SECS) {
+        Some(n) if n > 0 => n,
+        _ => return,                   // no record yet / no fs - no floor this boot, which is the honest state
     };
-    let p = r.payload_bytes();
-    if p.first() != Some(&FS_OK) || p.len() < 5 { return; }   // FS_NOTFOUND on a fresh disk lands here
-    let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
-    let end = (5 + n).min(p.len());
-    if let Ok(s) = core::str::from_utf8(&p[5..end]) {
+    if let Ok(s) = core::str::from_utf8(&buf[..n]) {
         if let Some(v) = parse_u32(s.trim()) {
             if !ctx.set_clock_floor(v) {
                 ctx.console_writeln("shell: the kernel refused the recorded clock floor - ignoring it");
@@ -5227,7 +5238,7 @@ fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> 
         // Only tell the user about q if the reply DIDN'T come in the first second (a stall) - so a fast
         // query stays clean, but a wedged one advertises how to escape it.
         if i == 0 { ctx.console_writeln("net: waiting for a reply - press q to abort"); }
-        ctx.reacquire_by_name(peer);
+        let _ = ctx.reacquire_by_name(peer);   // best-effort: the caller retries regardless
     }
     NetQ::Timeout
 }
