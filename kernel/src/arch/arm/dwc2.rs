@@ -2024,6 +2024,13 @@ unsafe fn net_rx_ring_push(frame: &[u8]) {
     r.count += 1;
 }
 
+/// Is the RX ring full? The backpressure test in the halt-ISR: a full ring means the consumer is behind,
+/// so continuing to receive only produces frames that will be dropped.
+/// SAFETY: core-0 + IRQ-masked.
+unsafe fn net_rx_ring_full() -> bool {
+    (*core::ptr::addr_of!(NET_RX_RING)).count >= NET_RX_RING_FRAMES
+}
+
 /// Dequeue one frame from the ring into `dst`. Returns its length, or 0 if empty.
 /// SAFETY: core-0 + IRQ-masked; the single consumer of NET_RX_RING.
 unsafe fn net_rx_ring_pop(dst: &mut [u8]) -> usize {
@@ -2178,6 +2185,17 @@ fn net_rx_isr() {
             flush_dcache(phys, NET_RX_BURST_BYTES as u32);          // invalidate after -> CPU reads device bytes
             net_rx_parse(&d.data[..got.min(NET_RX_BURST_BYTES)]);
             NET_RX_ERRS.store(0, Ordering::Relaxed);                // progress - the error run is broken
+            // BACKPRESSURE. If the ring is full the consumer is behind, so re-arming immediately just
+            // burns interrupts and DMA to parse frames we are about to drop - 256 dropped in one burst on
+            // a busy LAN, all of it work done for data nobody read. Stop listening instead and let the
+            // tick re-arm at 100 Hz, which gives the consumer room and bounds the cost to roughly what the
+            // old poll model spent. Doing work whose result is discarded is not throughput, it is heat.
+            if net_rx_ring_full() {
+                NET_RX_ARMED.store(false, Ordering::Relaxed);
+                wr(HAINTMSK, rd(HAINTMSK) & !(1 << CH_NET_RX));
+                chan_disable(CH_NET_RX);
+                return;
+            }
             net_rx_async_arm(NET_RX_ARM_PID.load(Ordering::Relaxed));
             return;
         }
