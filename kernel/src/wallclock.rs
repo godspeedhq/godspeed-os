@@ -49,13 +49,34 @@ pub fn synced_secs_ago() -> i64 {
 
 pub fn floor() -> i64 { CLOCK_FLOOR.load(Ordering::Relaxed) }
 
-/// Raise the persisted floor. Monotonic by construction - a floor only ever moves FORWARD, so a stale disk
-/// value cannot lower a better bound, and a caller cannot un-bound a clock it already bounded.
+/// How far past a KNOWN wall clock a floor may be pushed. A floor is "we were running at least this late",
+/// so it can never legitimately be ahead of the current time by more than clock skew. Without this bound a
+/// floor holder could set it to 2099 and permanently refuse every later clock set - a one-way brick, since
+/// the floor never lowers (§26.6: a subsystem must have a recovery story, not just a limit).
+const FLOOR_AHEAD_MAX: i64 = 86_400;
+
+/// Raise the persisted floor. Monotonic - the floor only ever moves FORWARD, so a stale disk value cannot
+/// lower a better bound. `fetch_max` rather than load-then-store: both `net-stack` and the `shell` can hold
+/// this authority on an SMP board, and a read-modify-write pair would let a slower core's smaller value
+/// land last and move the floor BACKWARDS, contradicting the invariant this function exists to keep.
 pub fn set_floor(epoch: i64) -> bool {
     if !(CLOCK_MIN_PLAUSIBLE..=CLOCK_MAX_PLAUSIBLE).contains(&epoch) { return false; }
-    let cur = CLOCK_FLOOR.load(Ordering::Relaxed);
-    if epoch <= cur { return true; }                       // already at least this late - nothing to do
-    CLOCK_FLOOR.store(epoch, Ordering::Relaxed);
+    // If we know what time it is, refuse a floor implausibly far ahead of it.
+    let now = epoch_secs(crate::arch::imp::rtc::read_datetime());
+    if (CLOCK_MIN_PLAUSIBLE..=CLOCK_MAX_PLAUSIBLE).contains(&now) && epoch > now + FLOOR_AHEAD_MAX {
+        crate::kprintln!("clock: REFUSED floor {} - more than a day ahead of the clock ({})", epoch, now);
+        return false;
+    }
+    CLOCK_FLOOR.fetch_max(epoch, Ordering::Relaxed);
+    true
+}
+
+/// Clear the floor. The escape hatch for a floor that was recorded wrongly (a bad disk value, a clock that
+/// was set far into the future before being corrected): without it the only recovery is deleting the
+/// on-disk record AND rebooting. Requires the stronger clock-setting right, not the floor-raising one.
+pub fn clear_floor() -> bool {
+    let old = CLOCK_FLOOR.swap(0, Ordering::Relaxed);
+    crate::kprintln!("clock: floor cleared (was {})", old);
     true
 }
 
@@ -75,7 +96,13 @@ pub fn set_wall_clock(epoch: i64) -> bool {
         return false;
     }
     let old = epoch_secs(crate::arch::imp::rtc::read_datetime());
-    crate::arch::imp::rtc::set_wall_clock(epoch);
+    // The arch reports whether it actually adopted the value. On a board whose hardware RTC is the
+    // authority the hook is a no-op, and recording "ntp" there would make `date` attribute a CMOS reading
+    // to the network - a provenance lie in the very mechanism built to prevent provenance lies.
+    if !crate::arch::imp::rtc::set_wall_clock(epoch) {
+        crate::kprintln!("clock: epoch {} not adopted - this board's hardware clock is the authority", epoch);
+        return false;
+    }
     WALL_FROM_NETWORK.store(1, Ordering::Relaxed);
     WALL_SET_AT_MONO.store(crate::arch::imp::rtc::now_epoch_monotonic(), Ordering::Relaxed);
     set_floor(epoch);          // we are demonstrably running now, at this time

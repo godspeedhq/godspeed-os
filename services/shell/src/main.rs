@@ -4547,6 +4547,13 @@ fn cmd_mem(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
 }
 
 fn cmd_reboot(ctx: &ServiceContext) -> ! {
+    // Record the clock floor on the way down. This is what carries a BOOT-time network sync across the
+    // power cycle: net-stack sets the clock but holds no filesystem authority, and the shell does - so a
+    // deliberate reboot is the natural explicit moment to write it. Quiet + bounded: the machine is about
+    // to reset, so a missing filesystem must not delay or clutter the shutdown.
+    if let Some(f) = ctx.clock_floor() {
+        if (0..=u32::MAX as i64).contains(&f) { clock_floor_persist(ctx, f as u32, true); }
+    }
     ctx.console_writeln("rebooting...");
     ctx.reboot()
 }
@@ -4609,30 +4616,13 @@ fn cmd_cores(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), Shell
     Ok(())
 }
 
-/// Wall-clock date+time from the hardware RTC. Default renders a full timestamp
-/// with weekday, e.g. `Sat 2026-06-06 22:05:09`. `date epoch` prints seconds since
-/// 1970-01-01 instead. Deliberately just these two forms - no clock-setting, format
-/// strings, or timezones (§26.2: minimal surface). The subcommand is `epoch`, not
-/// `unix`: this is not POSIX, so the vocabulary doesn't borrow its name.
 /// Where the last-known-good time is recorded. Deliberately a plain visible file, not a hidden one: it is
 /// a fact about this machine an operator may want to read or delete (§26.4 - keep the mechanism visible).
 const CLOCK_FLOOR_PATH: &[u8] = b"/clock.last";
-
-/// What we last wrote to `CLOCK_FLOOR_PATH`, so the file is rewritten only when the floor actually moves
-/// forward rather than on every `date`. Shell-owned state (this service is the only reader and writer),
-/// which is what §3.9 permits - it forbids state with no owner, not state a service keeps about itself.
-static CLOCK_FLOOR_WRITTEN: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
-
-/// Record the CURRENT clock as the floor if it has advanced past what is on disk. Called from `date`,
-/// which is what closes the gap left by the BOOT sync: net-stack sets the clock at boot but holds no fs
-/// authority, so the shell - which does - is the one that can make that time survive a power cycle.
-/// Bounded: at most one small write per meaningful advance, never one per invocation.
-fn clock_floor_refresh(ctx: &ServiceContext) {
-    let floor = match ctx.clock_floor() { Some(f) => f, None => return };
-    if floor <= CLOCK_FLOOR_WRITTEN.load(core::sync::atomic::Ordering::Relaxed) { return; }
-    if floor > u32::MAX as i64 { return; }
-    clock_floor_persist(ctx, floor as u32);
-}
+/// Budget for the floor's disk I/O. The floor is best-effort by design, so a slow or still-mounting `fs`
+/// must cost a shrug, never a wedge: an UNBOUNDED request here would hang the boot prompt before the
+/// first `gsh>` (the exact hazard the history loader documents) and hang `date` with no q escape.
+const CLOCK_FS_SECS: i64 = 2;
 
 /// Render a duration the way a person reads one ("4m", "2h", "3d") for the clock's freshness note.
 struct HumanSecs(i64);
@@ -4659,15 +4649,30 @@ impl core::fmt::Write for EpochBuf {
     }
 }
 
-/// Record "the machine was running at this time" to disk, and raise the kernel's floor to match. Called
-/// after a successful sync. Best-effort: with no disk there is simply no floor next boot, which degrades
-/// to "we know nothing" - the honest state - rather than to a guess.
-fn clock_floor_persist(ctx: &ServiceContext, epoch: u32) {
-    ctx.set_clock_floor(epoch);
+/// Record "the machine was running at this time" to disk, and raise the kernel's floor to match. Called at
+/// EXPLICIT moments (a successful `date sync`, and just before `reboot`) - never as a side effect of
+/// displaying the time. `quiet` suppresses the console note for the reboot path, where the machine is
+/// about to reset and a failure to record a floor is not worth a line in the operator's face.
+///
+/// Every verdict here is checked. The kernel can refuse the floor (implausible, or no cap at all - on x86
+/// the shell is never granted it), and `fs` answers a write with a status byte that can say FS_ERR or
+/// "no filesystem". Treating "a reply arrived" as "it worked" is how a refused privileged operation gets
+/// reported to the operator as done (§26.7, invariant 12).
+fn clock_floor_persist(ctx: &ServiceContext, epoch: u32, quiet: bool) -> bool {
+    if !ctx.set_clock_floor(epoch) {
+        if !quiet { ctx.console_writeln("date: the kernel refused the clock floor - not recorded"); }
+        return false;
+    }
     let mut b = EpochBuf { buf: [0u8; 24], len: 0 };
     let _ = core::fmt::write(&mut b, format_args!("{}", epoch));
-    if fs_request(ctx, 10 /* OP_WRITE_FILE */, CLOCK_FLOOR_PATH, &b.buf[..b.len]).is_some() {
-        CLOCK_FLOOR_WRITTEN.store(epoch as i64, core::sync::atomic::Ordering::Relaxed);
+    match fs_request_bounded(ctx, OP_WRITE_FILE, CLOCK_FLOOR_PATH, &b.buf[..b.len], CLOCK_FS_SECS) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => true,
+        _ => {
+            // No disk, no filesystem, or a write that failed: the floor simply will not survive this power
+            // cycle. That is the honest degraded state (next boot knows nothing), not a silent success.
+            if !quiet { ctx.console_writeln("date: could not record the clock floor (no filesystem?)"); }
+            false
+        }
     }
 }
 
@@ -4675,19 +4680,35 @@ fn clock_floor_persist(ctx: &ServiceContext, epoch: u32) {
 /// a reading: it is not shown as the time and no "estimate" is derived from it (a machine powered off for
 /// six months would otherwise display a six-month-old timestamp indistinguishable from a measured one).
 /// Its whole job is to let the kernel REFUSE a clock value from before we last ran.
+///
+/// `fs` answers OP_READ_FILE with `[FS_OK, len:u32 LE, data..]` - the shape every other reader in this
+/// file honours. (Reading it as `[ok=1, data..]` makes the check fail on every SUCCESS, because FS_OK is 0
+/// and 1 is FS_ERR, and then splices the length bytes into the text: the floor would never once be seeded,
+/// and nothing would say so.)
 fn clock_floor_seed(ctx: &ServiceContext) {
-    let r = match fs_request(ctx, 11 /* OP_READ_FILE */, CLOCK_FLOOR_PATH, &[]) { Some(r) => r, None => return };
+    let r = match fs_request_bounded(ctx, OP_READ_FILE, CLOCK_FLOOR_PATH, &[], CLOCK_FS_SECS) {
+        Some(r) => r,
+        None => return,                      // no fs / not serving yet - no floor this boot, and that is fine
+    };
     let p = r.payload_bytes();
-    // fs replies [ok, data...]; anything shorter than a digit means no record yet (a fresh disk).
-    if p.first() != Some(&1) || p.len() < 2 { return; }
-    if let Some(s) = core::str::from_utf8(&p[1..]).ok() {
+    if p.first() != Some(&FS_OK) || p.len() < 5 { return; }   // FS_NOTFOUND on a fresh disk lands here
+    let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+    let end = (5 + n).min(p.len());
+    if let Ok(s) = core::str::from_utf8(&p[5..end]) {
         if let Some(v) = parse_u32(s.trim()) {
-            ctx.set_clock_floor(v);
-            CLOCK_FLOOR_WRITTEN.store(v as i64, core::sync::atomic::Ordering::Relaxed);
+            if !ctx.set_clock_floor(v) {
+                ctx.console_writeln("shell: the kernel refused the recorded clock floor - ignoring it");
+            }
         }
     }
 }
 
+/// Wall-clock date+time. Default renders a full timestamp with weekday AND where the time came from,
+/// e.g. `Sat 2026-06-06 22:05:09  (ntp, synced 4m ago)`; `date epoch` prints seconds since 1970-01-01 as a
+/// bare pipeable number; `date sync` fetches the time over the network. Deliberately these three forms -
+/// no format strings or timezones (§26.2: minimal surface). The subcommand is `epoch`, not `unix`: this is
+/// not POSIX, so the vocabulary doesn't borrow its name. Displaying the time NEVER writes to disk - the
+/// floor is recorded at explicit moments only (`date sync`, and before `reboot`).
 fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     // `date sync` - fetch the time from the network (SNTP) via net-stack and set the wall clock. The Pi 2
@@ -4727,7 +4748,7 @@ fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
         };
         // Record the new time as the floor: we are demonstrably running now, so nothing earlier can be
         // right later. Survives the power cycle that the (absent) RTC would otherwise have covered.
-        clock_floor_persist(ctx, epoch);
+        clock_floor_persist(ctx, epoch, false);
         // fall through to display the freshly-set time
     }
     let dt = ctx.datetime();
@@ -4755,9 +4776,6 @@ fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
         }
         return Ok(());
     }
-    // The clock is known, so this moment is a floor we can stand behind next boot. Writes only when it
-    // has actually advanced past the recorded one (see clock_floor_refresh).
-    clock_floor_refresh(ctx);
     let wd = WEEKDAYS[(dt.weekday() as usize) % 7];
     // The time AND where it came from: a fallback chain is mechanism only while its choice is visible.
     match ctx.clock_synced_secs_ago() {

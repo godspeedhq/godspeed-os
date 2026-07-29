@@ -1803,16 +1803,24 @@ fn handle_reboot() -> i64 {
 /// u32 of seconds (single register - so it survives the 32-bit ARM ABI, valid past year 2106), widened
 /// here. A no-op on arches with a real hardware RTC (x86). Returns 0, or CapNotHeld without the cap.
 fn handle_set_clock(epoch: u64, kind: u64) -> i64 {
-    if !scheduler::current_task_holds_resource(crate::capability::SET_CLOCK_RESOURCE, Rights::WRITE) {
+    // `kind` 1 = raise the persisted FLOOR ("we ran at least this late"); 0 = set the wall clock; 2 = clear
+    // the floor. These are NOT the same authority, so they do not share a right: raising a floor only
+    // CONSTRAINS which clock values are acceptable, while setting the clock (or clearing the bound that
+    // guards it) changes every task's view of the time of day. Rights narrow (§7.4), so the floor-raiser
+    // holds READ and the clock-setter holds WRITE - which lets the shell record a floor off disk without
+    // also being able to step the clock.
+    let need = if kind == 1 { Rights::READ } else { Rights::WRITE };
+    if !scheduler::current_task_holds_resource(crate::capability::SET_CLOCK_RESOURCE, need) {
         return cap_err_to_i64(CapError::CapNotHeld);
     }
     let v = (epoch & 0xFFFF_FFFF) as i64;
-    // `kind` 1 = raise the persisted FLOOR (a "we ran at least this late" bound, seeded from disk), 0 = set
-    // the wall clock itself. Both are the same authority - the floor decides which clock values are
-    // acceptable - so they share the cap and the syscall rather than growing a second gate.
-    let ok = if kind == 1 { crate::wallclock::set_floor(v) } else { crate::wallclock::set_wall_clock(v) };
-    // Both paths announce themselves inside `clock` (set, or the reason for a refusal): a change to every
-    // task's view of the time of day must be answerable afterwards (§26.4, §26.7).
+    let ok = match kind {
+        1 => crate::wallclock::set_floor(v),
+        2 => crate::wallclock::clear_floor(),
+        _ => crate::wallclock::set_wall_clock(v),
+    };
+    // Every path announces itself inside `wallclock` (what changed, or the reason for a refusal): a change
+    // to every task's view of the time of day must be answerable afterwards (§26.4, §26.7).
     if ok { 0 } else { -1 }
 }
 

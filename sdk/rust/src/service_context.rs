@@ -183,6 +183,27 @@ mod datetime_tests {
         assert_eq!(dt(2000, 1, 1, 0, 0, 0).weekday(), 6);
         assert_eq!(dt(2026, 6, 6, 0, 0, 0).weekday(), 6);
     }
+
+    #[test]
+    fn from_epoch_secs_round_trips_over_the_sweep() {
+        // The INVERSE (civil_from_days) must undo epoch_secs exactly, over the same multi-century sweep -
+        // the drift guard its forward twin already has. Without this, the only thing pinning the decode
+        // used to render a stored epoch (the clock floor) would be that it looked right once.
+        for y in 1971..=2100i64 {
+            for mo in 1..=12i64 {
+                let last = days_in_month(y, mo);
+                for &d in &[1i64, 15, 28, last] {
+                    for &(h, mi, s) in &[(0i64, 0i64, 0i64), (23, 59, 59), (12, 30, 15)] {
+                        let a = dt(y as u16, mo as u8, d as u8, h as u8, mi as u8, s as u8);
+                        assert!(Datetime::from_epoch_secs(a.epoch_secs()) == a,
+                            "from_epoch_secs round-trip mismatch at {}-{:02}-{:02} {:02}:{:02}:{:02}",
+                            y, mo, d, h, mi, s);
+                    }
+                }
+            }
+        }
+        assert!(Datetime::from_epoch_secs(0) == dt(1970, 1, 1, 0, 0, 0));
+    }
 }
 
 // ---------------------------------------------------------------------------

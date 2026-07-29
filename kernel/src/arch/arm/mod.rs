@@ -1335,8 +1335,9 @@ pub mod rtc {
     /// Set the wall clock: `epoch` is the real Unix time NOW (from SNTP). Store base = epoch - monotonic so
     /// every later `read_datetime` reconstructs the current time from the monotonic counter. The SetClock
     /// syscall calls this; it is cap-gated (SET_CLOCK), never ambient.
-    pub fn set_wall_clock(epoch: i64) {
+    pub fn set_wall_clock(epoch: i64) -> bool {
         WALL_EPOCH_BASE.store(epoch - now_epoch_monotonic(), Ordering::Relaxed);
+        true                      // this board has no RTC, so a network time IS the authority here
     }
     /// Monotonic seconds since boot, from the generic timer (the Pi 2 has no wall-clock RTC, so this is
     /// NOT a real epoch - but it advances, which is all its callers need: bounding deadline waits and

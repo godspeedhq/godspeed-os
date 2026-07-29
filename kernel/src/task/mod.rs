@@ -437,7 +437,8 @@ struct Privileges {
     net_device:      bool, // NET_DEVICE: move ethernet frames via the in-kernel USB-net bridge (ARM nic-driver)
     usb_disk:        bool, // USB_DISK: read/write blocks on the in-kernel USB mass-storage device (ARM block-driver)
     gpio:            bool, // GPIO_DEVICE: drive the SoC GPIO pins (ARM `gpio` shell command)
-    set_clock:       bool, // SET_CLOCK: set the wall clock from SNTP (RTC-less ARM; net-stack)
+    set_clock:       bool, // SET_CLOCK (WRITE): set the wall clock from SNTP (RTC-less ARM; net-stack)
+    set_clock_floor: bool, // SET_CLOCK (READ): raise the persisted clock floor only (the shell)
 }
 
 fn service_privileges(name: &str, is_probe: bool) -> Privileges {
@@ -476,12 +477,14 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         usb_disk: cfg!(target_arch = "arm") && matches!(name, "block-driver"),
         //   the shell's `gpio` command drives the SoC pins (the gated `Gpio` syscall, 45).
         gpio: cfg!(target_arch = "arm") && matches!(name, "shell"),
-        //   SET_CLOCK: net-stack sets the wall clock from SNTP (the RTC-less ARM port has no other time
-        //   source), and the SHELL raises the persisted clock FLOOR from the last-known time it reads off
-        //   the disk at startup - the bound that lets the kernel refuse a clock value from before the
-        //   machine last ran. A kernel-only by-name grant like NET_DEVICE (not a contract cap). ARM-gated:
-        //   x86 has a hardware RTC, so nothing there needs to set the time.
-        set_clock: cfg!(target_arch = "arm") && matches!(name, "net-stack" | "shell"),
+        //   SET_CLOCK, in two strengths (rights narrow, §7.4). WRITE = set the wall clock itself, held only
+        //   by net-stack, which runs the SNTP exchange (the RTC-less ARM port has no other time source).
+        //   READ = raise the persisted clock FLOOR only, held by the shell, which reads the last-known time
+        //   off the disk at startup and records it before a reboot. The shell needs the bound, not the
+        //   clock, so it does not get the power to step every task's time of day. A kernel-only by-name
+        //   grant like NET_DEVICE (not a contract cap). ARM-gated: x86's CMOS RTC is the authority there.
+        set_clock:       cfg!(target_arch = "arm") && matches!(name, "net-stack"),
+        set_clock_floor: cfg!(target_arch = "arm") && matches!(name, "shell"),
     }
 }
 
@@ -3610,6 +3613,12 @@ fn spawn_service_with_config(
     if privs.set_clock {
         let sc_cap = mint_cap(SET_CLOCK_RESOURCE, Rights::WRITE);
         caps.insert(sc_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+    // The floor-only strength: READ raises the bound, it cannot set the clock (§7.4 - rights narrow).
+    if privs.set_clock_floor {
+        let cf_cap = mint_cap(SET_CLOCK_RESOURCE, Rights::READ);
+        caps.insert(cf_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
