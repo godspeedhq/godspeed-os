@@ -4778,7 +4778,7 @@ fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
                 out.line_fmt(ctx, format_args!(
                     "unset - no clock on this machine; `date sync` fetches it over the network"));
                 out.line_fmt(ctx, format_args!(
-                    "        (last known {:04}-{:02}-{:02} {:02}:{:02}:{:02} from {} - a floor, not a reading)",
+                    "        (last known {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC from {} - a floor, not a reading)",
                     fd.year, fd.month, fd.day, fd.hour, fd.minute, fd.second,
                     core::str::from_utf8(CLOCK_FLOOR_PATH).unwrap_or("disk")));
             }
@@ -4788,13 +4788,20 @@ fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
         return Ok(());
     }
     let wd = WEEKDAYS[(dt.weekday() as usize) % 7];
-    // The time AND where it came from: a fallback chain is mechanism only while its choice is visible.
+    // The time, WHICH SCALE it is on, and where it came from.
+    //
+    // The scale is only stated when it is actually known. NTP serves UTC by definition, so a
+    // network-set clock is labelled `UTC` - without it the reading is ambiguous and a reader in any
+    // other zone silently reads it as local and concludes the clock is wrong by their offset. A
+    // hardware RTC carries NO such guarantee (firmware may keep it in local time or in UTC, and
+    // nothing here can tell which), so it gets no scale label rather than a guessed one - the same
+    // rule as the rest of this command: say what is known, never invent the rest.
     match ctx.clock_synced_secs_ago() {
         Some(ago) => out.line_fmt(ctx, format_args!(
-            "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  (ntp, synced {} ago)",
+            "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC  (ntp, synced {} ago)",
             wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, HumanSecs(ago))),
         None => out.line_fmt(ctx, format_args!(
-            "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  (rtc)",
+            "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  (rtc, scale unknown)",
             wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)),
     }
     Ok(())
