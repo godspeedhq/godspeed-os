@@ -7962,6 +7962,26 @@ fn fs_request_q(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> ReqOu
     }
 }
 
+/// Send a BARE single-opcode request (no path, no data) to `fs`, q-abortable with a hint - for the
+/// whole-disk operations (`drives check`, `drives scrub`) that legitimately run for minutes.
+///
+/// These used a plain `request_with_reply`, which parks the shell in the syscall for the WHOLE operation:
+/// it cannot poll the console, so `q` is never seen and the only way out is cutting the power - which is
+/// exactly what happened on the Pi 2, whose FUA-per-write stick makes a full-tree fsck genuinely slow.
+/// Conventions rule 9 (a blocking command stays q-abortable) is not optional for the longest commands in
+/// the system; those are the ones that need it most. Sends exactly `[op]`, matching what fs expects here
+/// (`fs_request_q` would append a path-length byte).
+fn fs_op_q(ctx: &ServiceContext, op: u8) -> ReqOutcome {
+    const HINT_SECS: i64 = 2;    // print "(q to quit)" only once the wait lingers
+    const MAX_SECS:  i64 = 3600; // effectively unbounded: q is the real exit, not a deadline
+    let msg = Message::from_bytes(&[op]);
+    match ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)")) {
+        ReqOutcome::Timeout if ctx.reacquire_by_name("fs") =>
+            ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)")),
+        other => other,
+    }
+}
+
 /// Stat a path: `Some((size, is_dir))` if it exists, `None` otherwise. Used by the streaming
 /// read/copy paths to learn a file's size before chunking through it.
 fn fs_stat(ctx: &ServiceContext, path: &[u8]) -> Option<(u64, bool)> {
@@ -10178,8 +10198,14 @@ fn drives_reset(ctx: &ServiceContext, force: bool) -> Result<(), ShellError> {
 /// reports (does not delete) files/dirs whose blocks fail their CRC. No confirmation needed -
 /// it never erases data. Reply: [FS_OK, files:u32, dirs:u32, bad:u32, used:u64, free:u64].
 fn drives_check(ctx: &ServiceContext) -> Result<(), ShellError> {
-    match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_CHECK])) {
-        Some(r) => {
+    // q-abortable: a whole-disk pass can run for minutes on a slow stick, and a shell parked in an
+    // unbounded request cannot see the keystroke that asks it to stop (conventions rule 9).
+    match fs_op_q(ctx, OP_CHECK) {
+        ReqOutcome::Aborted => {
+            ctx.console_writeln("drives: aborted (the filesystem finishes its pass in the background)");
+            Err(ShellError::Unknown)
+        }
+        ReqOutcome::Reply(r) => {
             let p = r.payload_bytes();
             if no_fs(ctx, p) { return Err(ShellError::Unknown); }
             if p.first() == Some(&FS_OK) && p.len() >= 29 {
@@ -10201,7 +10227,7 @@ fn drives_check(ctx: &ServiceContext) -> Result<(), ShellError> {
                 ctx.console_writeln("check: FAILED"); Err(ShellError::Unknown)
             }
         }
-        None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
+        _ => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
     }
 }
 
@@ -10210,8 +10236,14 @@ fn drives_check(ctx: &ServiceContext) -> Result<(), ShellError> {
 /// on a schedule to catch latent bit-rot early; without redundancy it detects but cannot repair.
 /// Reply: [FS_OK, files:u32, dirs:u32, bad:u32, scanned:u64].
 fn drives_scrub(ctx: &ServiceContext) -> Result<(), ShellError> {
-    match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_SCRUB])) {
-        Some(r) => {
+    // q-abortable: a whole-disk pass can run for minutes on a slow stick, and a shell parked in an
+    // unbounded request cannot see the keystroke that asks it to stop (conventions rule 9).
+    match fs_op_q(ctx, OP_SCRUB) {
+        ReqOutcome::Aborted => {
+            ctx.console_writeln("drives: aborted (the filesystem finishes its pass in the background)");
+            Err(ShellError::Unknown)
+        }
+        ReqOutcome::Reply(r) => {
             let p = r.payload_bytes();
             if no_fs(ctx, p) { return Err(ShellError::Unknown); }
             if p.first() == Some(&FS_OK) && p.len() >= 21 {
@@ -10233,7 +10265,7 @@ fn drives_scrub(ctx: &ServiceContext) -> Result<(), ShellError> {
                 ctx.console_writeln("scrub: FAILED"); Err(ShellError::Unknown)
             }
         }
-        None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
+        _ => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
     }
 }
 
