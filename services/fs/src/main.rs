@@ -1829,7 +1829,16 @@ impl Fs {
             while within < BITS_PER_BMBLOCK {
                 let idx = base + within;
                 if idx >= self.total_blocks { break; }
-                let used = (blk[(within / 8) as usize] >> (within % 8)) & 1 != 0;
+                // The ROOT's own blocks are NEVER allocatable, whatever the bitmap says. The bitmap is a
+                // derived view (Check rebuilds it from the tree); the root is the tree's anchor, and
+                // losing it takes everything with it - the one corruption whose only remedy is a
+                // reformat. Observed on hardware: a power cut mid-fsck left the bitmap inconsistent, the
+                // next write was handed LBA 7699 (the root) and clobbered it with its own data, so every
+                // directory read then failed its CRC. This keeps a corrupt bitmap costing some data
+                // blocks instead of the whole filesystem (§26.7 - a recoverable fault must not escalate).
+                let is_root = idx >= self.root_first_block
+                    && idx < self.root_first_block.saturating_add(self.root_block_count);
+                let used = is_root || (blk[(within / 8) as usize] >> (within % 8)) & 1 != 0;
                 if used {
                     run_start = None;
                     run_len = 0;
@@ -1930,7 +1939,16 @@ impl Fs {
             while within < BITS_PER_BMBLOCK {
                 let idx = base + within;
                 if idx >= self.total_blocks { break; }
-                let used = (blk[(within / 8) as usize] >> (within % 8)) & 1 != 0;
+                // The ROOT's own blocks are NEVER allocatable, whatever the bitmap says. The bitmap is a
+                // derived view (Check rebuilds it from the tree); the root is the tree's anchor, and
+                // losing it takes everything with it - the one corruption whose only remedy is a
+                // reformat. Observed on hardware: a power cut mid-fsck left the bitmap inconsistent, the
+                // next write was handed LBA 7699 (the root) and clobbered it with its own data, so every
+                // directory read then failed its CRC. This keeps a corrupt bitmap costing some data
+                // blocks instead of the whole filesystem (§26.7 - a recoverable fault must not escalate).
+                let is_root = idx >= self.root_first_block
+                    && idx < self.root_first_block.saturating_add(self.root_block_count);
+                let used = is_root || (blk[(within / 8) as usize] >> (within % 8)) & 1 != 0;
                 if used {
                     if start.is_some() { return Some((start.unwrap(), len)); }
                 } else {
