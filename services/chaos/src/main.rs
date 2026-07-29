@@ -167,7 +167,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut tbuf = [0u8; 128];   // target string; may be a comma-separated list, so sized for a bounded list
     let mut tlen = 0usize;
     {
-        let t0 = ctx.datetime().epoch_secs();
+        let t0 = ctx.epoch_secs_monotonic();
         let mut aw = 0u32;
         loop {
             if let Some(msg) = ctx.try_recv() {
@@ -176,7 +176,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if b.len() > 4 { let n = (b.len() - 4).min(128); tbuf[..n].copy_from_slice(&b[4..4 + n]); tlen = n; }
                 break;
             }
-            if ctx.datetime().epoch_secs() - t0 >= 2 { break; }
+            if ctx.epoch_secs_monotonic() - t0 >= 2 { break; }
             aw += 1;
             if aw >= ARGWAIT_MAX_YIELDS { break; }   // RTC-free hardware: the clock above never moves
             ctx.yield_cpu();
@@ -235,6 +235,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // for elapsed + the linear ETA (a pure extrapolation of elapsed over round progress, no outside truth).
     let start_dt = ctx.datetime();
     let start_epoch = start_dt.epoch_secs();
+    // ELAPSED is measured on the MONOTONIC clock, not this wall-clock stamp: the wall clock is settable
+    // (SNTP sets it on the RTC-less Pi), so a sync landing mid-run would make `now - start` jump by the
+    // whole correction and report an absurd elapsed/ETA. The datetime above is kept for the "started ..."
+    // readout, which is exactly what a wall clock IS for.
+    let start_mono = ctx.epoch_secs_monotonic();
     // Seed the random-storm PRNG from the RTC start time (varies per run); advanced each round so the
     // subset differs round-to-round. Only read in the `target_random` branch.
     let mut rng = Rng::new((start_epoch as u64)
@@ -387,7 +392,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let _ = write!(f, "  round {} / {} ({}%)\x1b[K\r\n", round, rounds, pct);
         // Wall-clock status line: when it began, how long it has run, and a linear ETA (no outside truth -
         // a pure extrapolation of elapsed over round progress). until-q has no total, so remains is n/a.
-        let elapsed = (ctx.datetime().epoch_secs() - start_epoch).max(0) as u64;
+        let elapsed = (ctx.epoch_secs_monotonic() - start_mono).max(0) as u64;
         let _ = write!(f, "  started {} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  |  elapsed ",
             WEEKDAYS[(start_dt.weekday() as usize) % 7], start_dt.year, start_dt.month, start_dt.day,
             start_dt.hour, start_dt.minute, start_dt.second);
@@ -461,11 +466,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (bounded) for a live shell to hand the keyboard back to, THEN release the foreground so that shell
     // resumes reading, THEN self-terminate so a finished run leaves no chaos task behind. Releasing
     // before a live shell exists would leave a window with no keyboard owner.
-    let t0 = ctx.datetime().epoch_secs();
+    let t0 = ctx.epoch_secs_monotonic();
     let mut k = 0u32;
     while slot_of(&ctx, "shell").is_none() {
         ctx.yield_cpu(); k += 1;
-        if k % POLL_EVERY == 0 && ctx.datetime().epoch_secs() - t0 >= RECOVER_SECS { break; }
+        if k % POLL_EVERY == 0 && ctx.epoch_secs_monotonic() - t0 >= RECOVER_SECS { break; }
         // THE hang. Without this, a run that ends with no live shell spins here forever on any board
         // without an RTC - and because the release below never runs, the console stays claimed by a
         // task that will never finish: no prompt, no overlay, nothing. The foreground made that

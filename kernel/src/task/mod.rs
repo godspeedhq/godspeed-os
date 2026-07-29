@@ -463,7 +463,7 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // NEGATIVE pin - deliberately excluded so it holds no ACQUIRE_ANY (proves AcquireSendCap denies
         // a non-holder). Ordinary services get none; their AcquireSendCap is limited to declared peers.
         acquire_any: (is_probe && name != "adv-a13") || matches!(name, "shell" | "supervisor" | "chaos"),
-        // NET_DEVICE + GPIO_DEVICE are SANCTIONED KERNEL-ONLY BY-NAME GRANTS (the U15 / userspace-audit
+        // NET_DEVICE, GPIO_DEVICE, USB_DISK and SET_CLOCK are SANCTIONED KERNEL-ONLY BY-NAME GRANTS (the U15 / userspace-audit
         // A5-U1 doctrine): they are deliberately NOT contract capabilities - the kernel is their single
         // source of truth, and `contract_check.py` does not reconcile them. Both are arch-gated to ARM
         // (off ARM the syscalls are inert stubs; SEC-31) so no dormant authority is handed out elsewhere.

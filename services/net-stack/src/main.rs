@@ -387,9 +387,14 @@ const NTP_UNIX_OFFSET: u32 = 2_208_988_800;
 /// A fixed anycast NTP server (time.cloudflare.com) used if DNS cannot resolve a pool name - so a DNS
 /// hiccup never blocks the clock. Anycast: routed to the nearest instance, reliable from anywhere.
 const NTP_FALLBACK_IP: [u8; 4] = [162, 159, 200, 123];
-/// A plausible "now" floor (2020-01-01 00:00:00 UTC) - reject a garbage/stale SNTP packet whose time is
-/// implausibly early rather than set the clock to it.
+/// A plausible "now" window - reject a garbage/stale/hostile SNTP timestamp outside it rather than adopt
+/// it as this machine's time. Floor = 2020-01-01, ceiling = 2100-01-01 (both fit a u32 epoch).
 const SNTP_MIN_PLAUSIBLE: u32 = 1_577_836_800;
+const SNTP_MAX_PLAUSIBLE: u32 = 4_102_444_800;
+/// Tries for the SNTP exchange. Deliberately FEWER than DANCE_TRIES: each try costs a DANCE_SECS drain, and
+/// this runs inside net-stack's single-threaded serve loop, so a silent NTP server must not hold every
+/// other client op (net/ping/dns) behind it for the full 6-try budget.
+const SNTP_TRIES: u32 = 3;
 
 /// SNTP: fetch the current time from an NTP server and set the wall clock. The RTC-less Pi 2 has no other
 /// time source, so `date` reads zero until this runs (auto on boot after the DHCP dance, and on `date
@@ -397,16 +402,46 @@ const SNTP_MIN_PLAUSIBLE: u32 = 1_577_836_800;
 /// request to UDP 123, parse the 32-bit transmit timestamp (seconds since 1900), convert to Unix, and set
 /// the clock via the SET_CLOCK cap. Returns the Unix epoch on success. Bounded (udp_roundtrip's
 /// deadline+retry, Commandment VIII: waits on the reply, never hangs); a silent server returns None.
+/// The wall clock's current epoch if it already reads a plausible time, else `None`. Two uses: reporting
+/// the value after a dance that just synced (without paying for a second exchange), and deciding whether
+/// the BOOT sync is needed at all. This is a TRUTH test, not an arch test - a machine whose clock already
+/// knows the date (an x86 with a CMOS RTC) needs no network time; the RTC-less Pi 2 reads 0 and does.
+fn clock_epoch_if_set(ctx: &ServiceContext) -> Option<u32> {
+    let e = ctx.datetime().epoch_secs();
+    if e >= SNTP_MIN_PLAUSIBLE as i64 && e <= SNTP_MAX_PLAUSIBLE as i64 { Some(e as u32) } else { None }
+}
+
 fn sntp_sync(ctx: &ServiceContext, st: &NetState) -> Option<u32> {
     if !st.have_mac { return None; }                     // no gateway MAC - nothing to send through
-    // Resolve an NTP server by name; fall back to the fixed anycast IP so a DNS hiccup does not block us.
+    // Resolve an NTP server by name; fall back to the fixed anycast IP if DNS is down - but say so. A
+    // recovery that hides the failure it recovered from is a silent fallback (§26.7): without this line an
+    // operator cannot tell a resolved pool address from a broken resolver.
     let (mut gf, mut fr, mut ud, mut to) = (false, 0u16, 0u16, 0u16);
-    let ntp_ip = dns_resolve(ctx, b"pool.ntp.org", &st.gw_mac, &st.our_ip, &st.our_mac, &st.dns_server,
-                             &mut gf, &mut fr, &mut ud, &mut to).unwrap_or(NTP_FALLBACK_IP);
+    let ntp_ip = match dns_resolve(ctx, b"pool.ntp.org", &st.gw_mac, &st.our_ip, &st.our_mac,
+                                   &st.dns_server, &mut gf, &mut fr, &mut ud, &mut to) {
+        Some(ip) => ip,
+        None => {
+            ctx.log("net-stack: SNTP - DNS could not resolve pool.ntp.org - using the fixed anycast NTP IP");
+            NTP_FALLBACK_IP
+        }
+    };
+    // A NONCE binds the reply to THIS request (RFC 4330 §5): the client puts it in the TRANSMIT timestamp
+    // (SNTP bytes 40..48 = frame 82..90) and the server echoes it back in the ORIGINATE timestamp (SNTP
+    // bytes 24..32 = frame 66..74). Without it every match field is a compile-time constant, so ANY host
+    // could spray one UDP packet and set this machine's wall clock - the capability system would have
+    // granted net-stack the right to set the clock, and net-stack would have handed the VALUE to a
+    // stranger (a confused deputy: §3.1/§26.9, authority reached by a principal that holds none).
+    let nonce: [u8; 8] = {
+        let hi = ctx.hw_random().unwrap_or((ctx.read_tsc() >> 13) as u32);
+        let lo = ctx.hw_random().unwrap_or(ctx.read_tsc() as u32);
+        let (h, l) = (hi.to_be_bytes(), lo.to_be_bytes());
+        [h[0], h[1], h[2], h[3], l[0], l[1], l[2], l[3]]
+    };
+    // The source port is derived from the nonce too, so it is not a constant an off-path spoofer can assume.
+    let src_port: u16 = 40_000 + (u16::from_be_bytes([nonce[0], nonce[1]]) % 20_000);
     ctx.log_fmt(format_args!("net-stack: SNTP - querying {}.{}.{}.{}:123",
         ntp_ip[0], ntp_ip[1], ntp_ip[2], ntp_ip[3]));
-    // Build the request frame ONCE: eth(14) + IPv4(20) + UDP(8) + SNTP(48) = 90 bytes. src port 40123.
-    const SRC_PORT: u16 = 40_123;
+    // Build the request frame ONCE: eth(14) + IPv4(20) + UDP(8) + SNTP(48) = 90 bytes.
     let mut frame = [0u8; 90];
     frame[0..6].copy_from_slice(&st.gw_mac);
     frame[6..12].copy_from_slice(&st.our_mac);
@@ -419,30 +454,38 @@ fn sntp_sync(ctx: &ServiceContext, st: &NetState) -> Option<u32> {
     frame[30..34].copy_from_slice(&ntp_ip);
     let ip_ck = checksum(&frame[14..34]);
     frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
-    frame[34] = (SRC_PORT >> 8) as u8; frame[35] = SRC_PORT as u8;
+    frame[34] = (src_port >> 8) as u8; frame[35] = src_port as u8;
     frame[36] = 0; frame[37] = 123;                      // dest port 123
     frame[38] = 0; frame[39] = 8 + 48;                   // UDP length
-    frame[42] = 0x1B;                                    // SNTP: LI 0, VN 3, Mode 3 (client); rest zero
+    frame[42] = 0x1B;                                    // SNTP: LI 0, VN 3, Mode 3 (client)
+    frame[82..90].copy_from_slice(&nonce);               // transmit timestamp = our nonce
     let req = Message::from_bytes(&frame);
 
     // Send the request, then DRAIN + SCAN the RX ring for the reply until it arrives or the deadline - the
-    // same pattern DHCP/ARP use, so a WAN reply that lands tens of ms after the send (after a single-frame
-    // rx would have raced it) is caught. Retry a few times past stray frames.
+    // same pattern DHCP/ARP use, so a WAN reply that lands tens of ms after the send (which a single-frame
+    // rx would have raced and lost) is caught. Retry past stray frames.
     let mut unix: Option<u32> = None;
     let mut arp_out = [0u8; 42];
-    for _ in 0..DANCE_TRIES {
+    for _ in 0..SNTP_TRIES {
         let _ = nic_req(ctx, &req, LINK_SECS);
         drain_scan(ctx, DANCE_SECS, |f| {
-            // A UDP reply FROM ntp_ip:123 TO our SRC_PORT. Transmit timestamp (seconds since 1900) at SNTP
-            // offset 40 = frame offset 82.
-            if f.len() >= 86 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17
+            // A UDP reply FROM ntp_ip:123 TO our source port, ECHOING our nonce. `f[14] == 0x45` pins a
+            // 20-byte IP header, without which every offset below (ports at 34/36, SNTP at 42+) would be
+            // read from the wrong place on a packet carrying IP options.
+            if f.len() >= 90 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45 && f[23] == 17
                 && f[26..30] == ntp_ip[..] && f[34] == 0 && f[35] == 123
-                && f[36] == (SRC_PORT >> 8) as u8 && f[37] == SRC_PORT as u8
+                && f[36] == (src_port >> 8) as u8 && f[37] == src_port as u8
+                && f[66..74] == nonce[..]                        // originate == our nonce: this is OUR reply
+                && f[42] & 0x07 == 4                             // mode 4 = server
+                && f[42] >> 6 != 3                               // LI 3 = unsynchronized clock
+                && f[43] >= 1 && f[43] <= 15                     // stratum (0 = kiss-of-death, no time)
             {
                 let ntp_secs = u32::from_be_bytes([f[82], f[83], f[84], f[85]]);
                 if ntp_secs > NTP_UNIX_OFFSET {
                     let u = ntp_secs - NTP_UNIX_OFFSET;
-                    if u >= SNTP_MIN_PLAUSIBLE { unix = Some(u); return true; }
+                    // Bounded BOTH ways: a garbage or hostile timestamp outside a plausible window is
+                    // refused rather than becoming this machine's idea of now.
+                    if (SNTP_MIN_PLAUSIBLE..=SNTP_MAX_PLAUSIBLE).contains(&u) { unix = Some(u); return true; }
                 }
             }
             // Answer an ARP for us in the meantime so the gateway can keep addressing our unicast replies.
@@ -454,7 +497,13 @@ fn sntp_sync(ctx: &ServiceContext, st: &NetState) -> Option<u32> {
         if unix.is_some() { break; }
     }
     let u = unix?;
-    ctx.set_wall_clock(u);                               // gated by the SET_CLOCK cap
+    // The kernel can REFUSE this (no SET_CLOCK cap - e.g. on x86, where the CMOS RTC is the authority and
+    // nothing is granted the cap). Reporting "wall clock set" after a refusal would be a privileged
+    // operation the kernel denied, announced to the operator as done (§26.7, invariant 12).
+    if !ctx.set_wall_clock(u) {
+        ctx.log("net-stack: SNTP - clock set REFUSED by the kernel (no SET_CLOCK cap) - clock unchanged");
+        return None;
+    }
     Some(u)
 }
 
@@ -551,11 +600,15 @@ fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
     n = 0;
     while ctx.epoch_secs_monotonic() == s1 { ctx.yield_cpu(); n += 1; if n > SPIN_MAX { return 0; } }
     let hz = ctx.read_tsc().wrapping_sub(t0);
-    // 0.5 MHz .. 10 GHz spans an ARM generic timer (the Pi 2's cntpct advances ~1 MHz) through a fast
-    // x86 TSC (GHz). The old 100 MHz floor was written for x86 TSCs and REJECTED the slow ARM timer,
-    // returning 0 -> tsc_hz 0 -> the ping poll window (tsc_hz/3) collapsed to ~0 cycles, so ping only
-    // ever caught a reply landing inside the single initial drain (the ~50% "random" loss; RTT read 0).
-    if (500_000..=10_000_000_000).contains(&hz) { hz } else { 0 }
+    // The floor is PER-ARCH, not one range widened to cover both. The ARM generic timer advances ~1 MHz
+    // (the old 100 MHz floor rejected it, returning 0 -> the ping poll window `tsc_hz/3` collapsed to ~0
+    // cycles and ping only caught a reply inside the initial drain - the ~50% "random" loss, RTT 0). But
+    // simply lowering the floor everywhere would strip x86 of its protection: `deglitch_epoch` accepts a
+    // forward jump of up to a day, so a CMOS misread that cuts the measurement window short yields a few
+    // MHz on a GHz TSC - which the old floor rejected and a 0.5 MHz floor would accept, poisoning every
+    // RTT and deadline for the life of the process. Each arch keeps the floor that fits its clock.
+    let floor: u64 = if cfg!(target_arch = "arm") { 500_000 } else { 100_000_000 };
+    if (floor..=10_000_000_000).contains(&hz) { hz } else { 0 }
 }
 
 /// Send one ICMP echo of `payload_len` data bytes to `dest_ip` and wait for the reply. Returns
@@ -779,8 +832,12 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
 
     // ---- Set the wall clock from the network (SNTP): the RTC-less Pi 2 has no other time source, so
     // `date` reads zero until this runs. Best-effort - a failure just leaves the clock unset (a re-sync is
-    // available on demand via `date sync`). A no-op on x86, where the hardware RTC is the authority.
-    if let Some(unix) = sntp_sync(ctx, &state) {
+    // available on demand via `date sync`). SKIPPED when the clock already reads a plausible date: on a
+    // machine with a working RTC (x86) the kernel refuses SetClock anyway, and paying a multi-second
+    // network exchange at every boot and every `net renew` for a syscall guaranteed to be denied is waste.
+    if clock_epoch_if_set(ctx).is_some() {
+        // nothing to do - the hardware clock is the authority here
+    } else if let Some(unix) = sntp_sync(ctx, &state) {
         ctx.log_fmt(format_args!("net-stack: SNTP - wall clock set (epoch {})", unix));
     } else if have_mac {
         ctx.log("net-stack: SNTP - no time reply within the budget - clock stays unset");
@@ -839,6 +896,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Gated on !have_mac so a configured stack pays nothing, and retried per request so the PHY's
         // few-second post-cable auto-negotiation eventually catches. Once configured the gateway MAC
         // persists, so a later unplug/replug just resumes (the ICMP flows again) without re-dancing.
+        let mut synced_by_dance = false;
         if badge.is_none() && !have_mac
             && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&10))
             && link_is_up(&ctx)
@@ -846,6 +904,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             ctx.log("net-stack: link up while unconfigured - auto-configuring");
             let d = run_dance(&ctx);
             our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; have_mac = d.have_mac; dns_server = d.dns_server; status = d.status;
+            synced_by_dance = true;   // run_dance ends in its own SNTP sync - op 10 must not repeat it
         }
         if let Some((rid, right)) = badge {
             // Socket-cap invocation - SOP_SEND: transmit a UDP datagram through this socket. Payload =
@@ -963,8 +1022,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         } else if pl.first() == Some(&10) {
             // SYNC (op 10): re-fetch the time from the network (SNTP) and set the wall clock - the shell
             // `date sync`. Reply: [1, epoch(4 LE)] on success, [0] on failure (no NIC / server silent).
+            // If the auto-configure above just ran the dance (which ends in its own sync), do NOT sync
+            // again: that would put two full SNTP exchanges inside one request while every other client op
+            // waits behind this single-threaded serve loop.
             let st = NetState { our_ip, our_mac, gw_mac, have_mac, dns_server, status };
-            match sntp_sync(&ctx, &st) {
+            match if synced_by_dance { clock_epoch_if_set(&ctx) } else { sntp_sync(&ctx, &st) } {
                 Some(unix) => {
                     let mut r = [0u8; 5];
                     r[0] = 1;

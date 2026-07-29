@@ -1795,7 +1795,14 @@ fn handle_set_clock(epoch: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::SET_CLOCK_RESOURCE, Rights::WRITE) {
         return cap_err_to_i64(CapError::CapNotHeld);
     }
-    crate::arch::imp::rtc::set_wall_clock((epoch & 0xFFFF_FFFF) as i64);
+    let new = (epoch & 0xFFFF_FFFF) as i64;
+    // Announce it. This changes EVERY task's view of the time of day, including backwards, and every other
+    // actuator syscall announces itself (`reboot: hardware reset`). Without this line an operator chasing a
+    // clock that stepped has no record that it did, or by how much (§26.7, §26.4 - what changed must be
+    // answerable). Cheap: it happens once per sync, not per read.
+    let old = crate::clock::epoch_secs(crate::arch::imp::rtc::read_datetime());
+    crate::kprintln!("clock: wall clock set to epoch {} (was {})", new, old);
+    crate::arch::imp::rtc::set_wall_clock(new);
     0
 }
 

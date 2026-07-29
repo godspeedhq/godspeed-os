@@ -694,6 +694,16 @@ fn chan_program(ch: u32, dir_in: bool, pid: u32, len: u32, buf_phys: u32, ep: u3
     wr(hcchar_at(ch), chan);
 }
 
+/// Cleanly disable a host channel (ChDis if still enabled) and clear its latched interrupts, so a channel
+/// left armed does not keep raising halts at us after we have stopped listening to it.
+fn chan_disable(ch: u32) {
+    if rd(hcchar_at(ch)) & (1 << 31) != 0 {
+        wr(hcchar_at(ch), (rd(hcchar_at(ch)) & !(1 << 31)) | (1 << 30));   // clear ChEna, set ChDis
+        let mut t = 0u32; while rd(hcchar_at(ch)) & (1 << 31) != 0 { t += 1; if t > 100_000 { break; } }
+    }
+    wr(hcint_at(ch), 0xFFFF_FFFF);
+}
+
 static DUMPED: AtomicBool = AtomicBool::new(false);
 
 /// A tighter-bounded halt wait for the STEADY-STATE keyboard poll, which runs inside the core-0 timer ISR
@@ -1499,6 +1509,12 @@ fn enumerate_downstream(low: bool, addr: u8, split_port: u8) -> bool {
 static NET_READY:  AtomicBool = AtomicBool::new(false);
 static NET_ADDR:   AtomicU8   = AtomicU8::new(0);   // the net device's assigned USB address
 static NET_LOW:    AtomicBool = AtomicBool::new(false); // whether it is a low-speed device (it is not)
+/// The net device's EP0 (control) max packet size, captured at enumeration. A CONTROL transfer must be
+/// framed with THIS, never with `BULK_MPS`: `chan_program` uses `MPS0` for both the HCCHAR max-packet field
+/// and the HCTSIZ packet count, so a control transfer framed with the bulk endpoint's 512 instead of EP0's
+/// 64 is MALFORMED. `bot_recover` documents what that costs when it is got wrong on the storage side
+/// (measured: a selfcheck run went from 16 failures to 70) - the same trap, one endpoint over.
+static NET_EP0_MPS: AtomicU16 = AtomicU16::new(64);
 static NET_EP_IN:  AtomicU8   = AtomicU8::new(0);   // bulk IN endpoint (device -> host frames)
 static NET_EP_OUT: AtomicU8   = AtomicU8::new(0);   // bulk OUT endpoint (host -> device frames)
 static mut NET_MAC: [u8; 6] = [0; 6];               // our station MAC (the future net-stack bridge needs it)
@@ -1589,6 +1605,7 @@ fn configure_cdc_ecm(nconfigs: u8) -> bool {
         // SAFETY: NET_MAC is written only here, during core-0 enumeration.
         unsafe { (*core::ptr::addr_of_mut!(NET_MAC)).copy_from_slice(&mac); }
         NET_READY.store(true, Ordering::Release);
+        // SAFETY: core-0 enumeration path - the caller of the RX arm contract (single-armer, core 0).
         unsafe { net_rx_async_start(); }                      // arm the background bulk-IN (interrupt-driven RX)
 
         pl011_write(b"dwc2: CDC-ECM up: in ep="); write_hex32(ep_in as u32);
@@ -1613,7 +1630,12 @@ fn configure_cdc_ecm(nconfigs: u8) -> bool {
 
 const SMSC_HW_CFG: u16 = 0x14;
 const SMSC_HW_CFG_LRST: u32 = 0x0000_0008;      // Lite reset
-const SMSC_HW_CFG_BIR:  u32 = 0x0000_1000;      // Bulk-IN empty response (0-length packet, not a NAK storm)
+/// HW_CFG.BIR = Bulk-IN "no data" response: **NAK** the IN when the RX FIFO is empty (clearing it makes the
+/// device answer with a zero-length packet instead). The interrupt-driven RX design DEPENDS on the NAK: a
+/// NAK is retried by the DWC2 core in hardware and raises no interrupt, so an idle device is silent and the
+/// armed IN just waits. Clear this bit and every idle poll completes instantly with 0 bytes, turning the
+/// background IN into a permanent max-rate completion storm on core 0. Do not "fix" it away.
+const SMSC_HW_CFG_BIR:  u32 = 0x0000_1000;
 const SMSC_PM_CTRL: u16 = 0x20;
 const SMSC_PM_CTRL_PHY_RST: u32 = 0x0000_0010;
 const SMSC_AFC_CFG:  u16 = 0x2C;
@@ -1652,13 +1674,18 @@ fn smsc_write_reg(index: u16, value: u32) -> bool {
     ctrl_xfer(&setup, &mut data, false, 4)
 }
 
-/// Read a 4-byte smsc95xx register via a vendor control IN (bRequest 0xA1; offset in wIndex).
-fn smsc_read_reg(index: u16) -> u32 {
+/// Read a 4-byte smsc95xx register via a vendor control IN (bRequest 0xA1; offset in wIndex). `None` if
+/// the control transfer itself failed - distinct from a register that genuinely reads 0. Fabricating a 0
+/// there is what let a dead USB link masquerade as a real "PHY says link down" reading.
+fn smsc_read_reg_checked(index: u16) -> Option<u32> {
     let setup = [0xC0, 0xA1, 0x00, 0x00, index as u8, (index >> 8) as u8, 4, 0x00];
     let mut data = [0u8; 4];
-    if !ctrl_xfer(&setup, &mut data, true, 4) { return 0; }
-    u32::from_le_bytes(data)
+    if !ctrl_xfer(&setup, &mut data, true, 4) { return None; }
+    Some(u32::from_le_bytes(data))
 }
+
+/// The enumeration-path register read: 0 if the transfer failed (boot code treats 0 as "not ready").
+fn smsc_read_reg(index: u16) -> u32 { smsc_read_reg_checked(index).unwrap_or(0) }
 
 /// Bound for ONE MII/MDIO engine wait. Every hardware wait in this driver is bounded (invariant 12), and
 /// this one especially: each poll is a full CONTROL TRANSFER on the shared bulk channel, and the runtime
@@ -1669,37 +1696,54 @@ fn smsc_read_reg(index: u16) -> u32 {
 const SMSC_MII_WAIT_US: u32 = 20_000;
 const SMSC_MII_WAIT_POLLS: u32 = 64;
 
-/// Wait (bounded) for the MII/MDIO engine to go not-busy (MII_ADDR bit 0). False if it never did.
-fn smsc_mii_wait() -> bool {
-    let start = super::timer::systimer_us();
-    let mut n = 0u32;
-    while smsc_read_reg(SMSC_MII_ADDR) & 1 != 0 {
-        n += 1;
-        if n > SMSC_MII_WAIT_POLLS || super::timer::systimer_us().wrapping_sub(start) > SMSC_MII_WAIT_US {
-            return false;
-        }
-    }
-    true
+/// A WHOLE-OPERATION deadline shared by every step of an MDIO exchange. Bounding each `smsc_mii_wait`
+/// separately is not enough: the runtime link poll performs four of them plus four control transfers, so
+/// per-step budgets multiply into a core hold many times the 10 ms quantum. One deadline threaded through
+/// the whole exchange keeps the total under it.
+struct MiiBudget { start: u32, budget_us: u32 }
+impl MiiBudget {
+    fn new(budget_us: u32) -> Self { MiiBudget { start: super::timer::systimer_us(), budget_us } }
+    /// The enumeration path is not latency-critical and predates the budget; it gets the per-step bound.
+    fn boot() -> Self { MiiBudget { start: super::timer::systimer_us(), budget_us: SMSC_MII_WAIT_US } }
+    fn spent(&self) -> bool { super::timer::systimer_us().wrapping_sub(self.start) > self.budget_us }
 }
 
-/// A CHECKED MII read: `None` if the MDIO engine never went ready, so a caller that must not fabricate an
-/// answer (the runtime link poll) can keep its cached one instead of reporting a made-up register value.
-fn smsc_mii_read_checked(reg: u32) -> Option<u16> {
-    if !smsc_mii_wait() { return None; }
-    smsc_write_reg(SMSC_MII_ADDR, (SMSC_PHY_ID << 11) | (reg << 6) | 1); // BUSY, read (WRITE bit clear)
-    if !smsc_mii_wait() { return None; }
-    Some((smsc_read_reg(SMSC_MII_DATA) & 0xFFFF) as u16)
+/// Wait (bounded) for the MII/MDIO engine to go not-busy (MII_ADDR bit 0). False if it never did, if the
+/// shared deadline is spent, or if the register read itself failed.
+fn smsc_mii_wait(d: &MiiBudget) -> bool {
+    let mut n = 0u32;
+    loop {
+        match smsc_read_reg_checked(SMSC_MII_ADDR) {
+            Some(v) if v & 1 == 0 => return true,             // engine idle
+            Some(_) => {}                                     // still busy
+            None => return false,                             // the control transfer failed - do not guess
+        }
+        n += 1;
+        if n > SMSC_MII_WAIT_POLLS || d.spent() { return false; }
+    }
+}
+
+/// A CHECKED MII read: `None` if any step failed, so a caller that must not fabricate an answer (the
+/// runtime link poll) keeps its cached one instead of reporting a made-up register value.
+fn smsc_mii_read_checked(reg: u32, d: &MiiBudget) -> Option<u16> {
+    if !smsc_mii_wait(d) { return None; }
+    // The command WRITE can fail too; treating an un-issued command as issued would return whatever
+    // MII_DATA happened to hold as if it were the register we asked for.
+    if !smsc_write_reg(SMSC_MII_ADDR, (SMSC_PHY_ID << 11) | (reg << 6) | 1) { return None; } // BUSY, read
+    if !smsc_mii_wait(d) { return None; }
+    smsc_read_reg_checked(SMSC_MII_DATA).map(|v| (v & 0xFFFF) as u16)
 }
 
 /// The enumeration-path MII read: 0 if the engine timed out (the callers treat 0 as "not busy / done", so
 /// a dead MDIO ends their loops instead of spinning).
-fn smsc_mii_read(reg: u32) -> u16 { smsc_mii_read_checked(reg).unwrap_or(0) }
+fn smsc_mii_read(reg: u32) -> u16 { smsc_mii_read_checked(reg, &MiiBudget::boot()).unwrap_or(0) }
 
 fn smsc_mii_write(reg: u32, val: u16) {
-    let _ = smsc_mii_wait();
+    let d = MiiBudget::boot();
+    let _ = smsc_mii_wait(&d);
     smsc_write_reg(SMSC_MII_DATA, val as u32);
     smsc_write_reg(SMSC_MII_ADDR, (SMSC_PHY_ID << 11) | (reg << 6) | 0x02 | 1); // WRITE | BUSY
-    let _ = smsc_mii_wait();
+    let _ = smsc_mii_wait(&d);
 }
 
 /// Bring up the LAN9514: select its config, reset the chip + PHY, program the MAC, enable TX/RX, kick the
@@ -1779,8 +1823,9 @@ fn configure_smsc95xx() -> bool {
     // Multi-frame (turbo) RX (Linux smsc95xx_reset). The chip aggregates MANY ethernet frames into ONE
     // bulk-IN burst - each with a 4-byte RX status word, DWORD-aligned - instead of one frame per transfer.
     // Single-frame was far too slow for a busy LAN: frames backed up and replies were delivered late.
-    // Read-modify-write HW_CFG (a bare write clears its power-on defaults): keep BIR (empty bulk-IN ->
-    // 0-length packet, not a NAK), add MEF + BCE, clear RXDOFF so the frame sits right after the status.
+    // Read-modify-write HW_CFG (a bare write clears its power-on defaults): keep BIR (an empty bulk-IN is
+    // NAKed, which the DWC2 core retries in hardware WITHOUT interrupting us - the interrupt-driven RX
+    // depends on it; see SMSC_HW_CFG_BIR), add MEF + BCE, clear RXDOFF so the frame sits after the status.
     let hw = (smsc_read_reg(SMSC_HW_CFG) | SMSC_HW_CFG_BIR | SMSC_HW_CFG_MEF | SMSC_HW_CFG_BCE)
              & !SMSC_HW_CFG_RXDOFF;
     smsc_write_reg(SMSC_HW_CFG, hw);
@@ -1807,6 +1852,9 @@ fn configure_smsc95xx() -> bool {
     smsc_write_reg(SMSC_MAC_CR, mac_cr);
     smsc_write_reg(SMSC_TX_CFG, SMSC_TX_CFG_ON);
 
+    // Capture EP0's max packet size BEFORE BULK_MPS overwrites the shared MPS0 view: the runtime MDIO
+    // link poll issues CONTROL transfers and must frame them with this, not with the bulk size.
+    NET_EP0_MPS.store(MPS0.load(Ordering::Relaxed), Ordering::Relaxed);
     BULK_MPS.store(bulk_mps, Ordering::Relaxed);
     BULK_TOGGLE_IN.store(false, Ordering::Relaxed);
     BULK_TOGGLE_OUT.store(false, Ordering::Relaxed);
@@ -1893,6 +1941,17 @@ pub fn net_frame_tx(frame: &[u8]) -> bool {
 // on ring overflow keeps the newest frames.
 static NET_RX_ARMED:   AtomicBool = AtomicBool::new(false); // the background IN is armed (net is up)
 static NET_RX_ARM_PID: AtomicU32  = AtomicU32::new(0);      // the RX endpoint's own data toggle (advanced per completed burst)
+/// Consecutive ERROR halts on the background IN. A completion clears it. When it reaches the cap the IN is
+/// disarmed and reported ONCE, then re-armed at tick cadence - never re-armed instantly from the ISR.
+/// Without this, a device that errors immediately (yanked, wedged, or reset out from under us by
+/// `revive_if_needed`) drives IRQ -> re-arm -> IRQ at tens of kHz and livelocks core 0, which is where
+/// every ARM task runs - and silently, since nothing on the path logs (§26.6 bounded failure, invariant 12).
+static NET_RX_ERRS: AtomicU32 = AtomicU32::new(0);
+const NET_RX_ERR_MAX: u32 = 8;
+/// Frames dropped because the ring was full, and bursts abandoned on a bad device-supplied length. Silent
+/// loss is invisible loss; these make it answerable (§26.7).
+static NET_RX_DROPPED: AtomicU32 = AtomicU32::new(0);
+static NET_RX_BADLEN:  AtomicU32 = AtomicU32::new(0);
 
 const NET_RX_RING_FRAMES: usize = 32;
 struct NetRxRing {
@@ -1921,6 +1980,11 @@ unsafe fn net_rx_ring_push(frame: &[u8]) {
     if r.count == NET_RX_RING_FRAMES {
         r.head = (r.head + 1) % NET_RX_RING_FRAMES;
         r.count -= 1;
+        let d = NET_RX_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if d == 1 || d % 256 == 0 {                             // loud, but rate-limited (§26.7)
+            pl011_write(b"dwc2: net RX ring full - dropped "); super::timer::write_dec_pub(d);
+            pl011_write(b" frame(s) (consumer too slow)\r\n");
+        }
     }
     r.frames[r.tail][..n].copy_from_slice(&frame[..n]);
     r.lens[r.tail] = n as u16;
@@ -1938,7 +2002,16 @@ unsafe fn net_rx_ring_pop(dst: &mut [u8]) -> usize {
     dst[..m].copy_from_slice(&r.frames[r.head][..m]);
     r.head = (r.head + 1) % NET_RX_RING_FRAMES;
     r.count -= 1;
-    m
+    // Report the frame's TRUE length, not the copied length: a caller with a short buffer must be able to
+    // see that it received a truncated frame. Returning `m` presents corruption as a complete small frame.
+    if len > m {
+        let d = NET_RX_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if d == 1 || d % 256 == 0 {
+            pl011_write(b"dwc2: net RX frame truncated (buffer too small) x"); super::timer::write_dec_pub(d);
+            pl011_write(b"\r\n");
+        }
+    }
+    len
 }
 
 
@@ -1967,6 +2040,16 @@ unsafe fn net_rx_async_arm(pid: u32) {
 /// exclusive - touched only by net_rx_drain_tick under the IRQ mask.
 struct NetRxPartial { buf: [u8; NET_FRAME_MAX], len: usize, expect: usize } // expect 0 = none pending
 static mut NET_RX_PARTIAL: NetRxPartial = NetRxPartial { buf: [0u8; NET_FRAME_MAX], len: 0, expect: 0 };
+
+/// Abandon any half-assembled frame. Called whenever the transfer that was carrying it died (an error halt
+/// or a port reset): its continuation is never coming, and treating the NEXT burst's leading bytes as that
+/// continuation splices unrelated data into a frame and hands the stack fabricated packets.
+/// SAFETY: core-0 + IRQ-masked (the sole writer of NET_RX_PARTIAL).
+unsafe fn net_rx_partial_reset() {
+    let part = &mut *core::ptr::addr_of_mut!(NET_RX_PARTIAL);
+    part.len = 0;
+    part.expect = 0;
+}
 
 /// Push a complete ethernet frame (FCS already stripped) into the RX ring.
 /// SAFETY: core-0 + IRQ-masked (the ring's single producer).
@@ -2009,7 +2092,13 @@ unsafe fn net_rx_parse(buf: &[u8]) {
         let status = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
         pos += 4;
         let flen = ((status >> 16) & 0x3FFF) as usize;              // frame length INCLUDING the 4-byte FCS
-        if flen < 4 || flen > part.buf.len() { break; }             // invalid length - give up on this burst
+        // Floor is a full ethernet header + FCS, not just 4: a device-supplied `flen == 4` would push a
+        // ZERO-length ring entry, and 0 is `net_frame_rx`'s "ring empty" sentinel - so one malformed length
+        // would stall the consumer's drain loop and strand every frame behind it.
+        if flen < 4 + 14 || flen > part.buf.len() {
+            NET_RX_BADLEN.fetch_add(1, Ordering::Relaxed);
+            break;                                                  // invalid length - give up on this burst
+        }
         if pos + flen > buf.len() {
             // Frame split across the burst boundary: SAVE its start; the next burst completes it.
             let avail = buf.len() - pos;
@@ -2047,7 +2136,7 @@ fn net_rx_isr() {
     wr(hcint_at(CH_NET_RX), hcint);                                 // W1C: deassert this channel's HAINT/Hchint
     // SAFETY: core-0 exclusive, IRQ-masked.
     unsafe {
-        if !NET_RX_ARMED.load(Ordering::Relaxed) { return; }        // net down - do not re-arm
+        if !NET_RX_ARMED.load(Ordering::Relaxed) { return; }        // net down / disarmed - do not re-arm
         if hcint & HCINT_XFERCOMPL != 0 {
             let remaining = (rd(hctsiz_at(CH_NET_RX)) & 0x7_FFFF) as usize;
             let got = NET_RX_BURST_BYTES.saturating_sub(remaining);
@@ -2056,8 +2145,27 @@ fn net_rx_isr() {
             let phys = core::ptr::addr_of!(d.data) as u32;
             flush_dcache(phys, NET_RX_BURST_BYTES as u32);          // invalidate after -> CPU reads device bytes
             net_rx_parse(&d.data[..got.min(NET_RX_BURST_BYTES)]);
+            NET_RX_ERRS.store(0, Ordering::Relaxed);                // progress - the error run is broken
+            net_rx_async_arm(NET_RX_ARM_PID.load(Ordering::Relaxed));
+            return;
         }
-        // Completion (parsed above) or an error halt: re-arm to keep a bulk-IN always outstanding.
+        // An ERROR halt (XactErr/STALL/babble, or a halt with no data). A reassembly in progress belongs to
+        // the transfer that just died: carrying it into the next burst would splice a status word onto a
+        // frame head and hand the stack a fabricated frame (Commandment IX - discard state derived from a
+        // dead incarnation).
+        net_rx_partial_reset();
+        let errs = NET_RX_ERRS.fetch_add(1, Ordering::Relaxed) + 1;
+        if errs >= NET_RX_ERR_MAX {
+            // Bounded failure: stop the instant re-arm loop, say so ONCE, and leave recovery to the tick
+            // watchdog, which re-arms at 100 Hz instead of at interrupt rate.
+            NET_RX_ARMED.store(false, Ordering::Relaxed);
+            wr(HAINTMSK, rd(HAINTMSK) & !(1 << CH_NET_RX));
+            chan_disable(CH_NET_RX);
+            pl011_write(b"dwc2: net RX disarmed after "); super::timer::write_dec_pub(errs);
+            pl011_write(b" consecutive errors (hcint="); write_hex32(hcint);
+            pl011_write(b") - the tick will retry\r\n");
+            return;
+        }
         net_rx_async_arm(NET_RX_ARM_PID.load(Ordering::Relaxed));
     }
 }
@@ -2066,9 +2174,18 @@ fn net_rx_isr() {
 /// channel-halt interrupt were ever missed the channel would sit idle (ChEna clear) and RX would stall.
 /// Re-arm it if it went idle - a dropped-IRQ backstop, not the normal path (invariant 12).
 pub fn net_rx_drain_tick() {
-    if !on_core0() || !NET_RX_ARMED.load(Ordering::Relaxed) { return; }
+    if !on_core0() || !NET_READY.load(Ordering::Acquire) { return; }
     // SAFETY: core-0 + IRQ-masked (timer ISR).
     unsafe {
+        if !NET_RX_ARMED.load(Ordering::Relaxed) {
+            // RX was disarmed after an error run. Retry at TICK cadence (100 Hz) - bounded-rate recovery,
+            // never the interrupt-rate re-arm that livelocked the core. A device that is still broken just
+            // disarms again after NET_RX_ERR_MAX, so the cost stays bounded either way.
+            NET_RX_ERRS.store(0, Ordering::Relaxed);
+            net_rx_partial_reset();
+            net_rx_async_start();
+            return;
+        }
         if rd(hcchar_at(CH_NET_RX)) & (1 << 31) == 0 {              // ChEna clear - the IN is not outstanding
             net_rx_isr();                                          // harvest any pending completion + re-arm
         }
@@ -2087,20 +2204,30 @@ pub fn net_frame_rx(dst: &mut [u8]) -> usize {
 /// Cached PHY link state + when it was last read (System Timer us; 0 = never). The MII read costs several
 /// control transfers on the shared bulk channel, and `link_is_up` can be asked per request, so the answer
 /// is refreshed at most every NET_LINK_POLL_US and served from here in between.
-static NET_LINK_UP:      AtomicBool = AtomicBool::new(true);
+/// Starts FALSE, not true: until the PHY has actually been read there is no derived view to serve, and a
+/// value that was never derived from the source is an invented fact, not a cache of one (§26.4).
+static NET_LINK_UP:      AtomicBool = AtomicBool::new(false);
 static NET_LINK_LAST_US: AtomicU32  = AtomicU32::new(0);
 /// How often the PHY is actually re-read. A cable pull shows up within this long - fast enough to feel
 /// immediate at the prompt, slow enough that the control transfers cost nothing measurable.
 const NET_LINK_POLL_US: u32 = 1_000_000;
+/// Whole-poll core-hold budget. This runs IRQ-MASKED in a syscall, so it must stay well under the 10 ms
+/// scheduler quantum or it starves the timer ISR, the keyboard poll and the storage watchdog - the same
+/// rule `HALT_BUDGET_US`/`POLL_HALT_BUDGET_US` are set by. Missing a poll costs nothing (the rate limiter
+/// just tries again a second later), so giving up early is always the right trade here.
+const NET_LINK_BUDGET_US: u32 = 2_000;
 
 /// Is the ethernet cable in? Reads the LAN9514's internal PHY over MII (BMSR bit 2), rate-limited and
 /// cached. Returns the cached value - never a stale-forever guess - when the read must be skipped.
 ///
-/// Three things make this safe to call from the `NetInfo` syscall:
+/// Four things make this safe to call from the `NetInfo` syscall:
 /// - **core 0 + syscall context**, which is exactly what `ctrl_xfer` requires (it runs on the shared
 ///   CH_BULK stream and must never be driven from the timer ISR).
 /// - **Never while a storage transfer is parked**: an async block I/O OWNS CH_BULK, and a control transfer
 ///   there would destroy it. A disk read outranks a link poll, so we keep the cached value instead.
+/// - **EP0 framing + selection restore**: the MDIO reads are CONTROL transfers, so they are framed with
+///   `NET_EP0_MPS` (not the bulk 512 - see that static), and the previous device selection is put back on
+///   the way out so the next user of the shared channel is not left pointing at us.
 /// - **BMSR's Link Status latches low**: a dropped link stays reported as down until the register is read.
 ///   Reading twice and taking the second gives the CURRENT state (Linux's `mii_link_ok` reads it the same
 ///   way), so a brief glitch does not stick and a replug is seen on the next poll rather than never.
@@ -2115,15 +2242,25 @@ fn net_link_up() -> bool {
     // SAFETY: core-0 + IRQ-masked (syscall); ASYNC_BULK is core-0 exclusive.
     if unsafe { (*core::ptr::addr_of!(ASYNC_BULK)).active } { return cached; }
     NET_LINK_LAST_US.store(now.max(1), Ordering::Relaxed);   // max(1) keeps 0 meaning "never read"
-    // Point the shared channel at the net device (the keyboard poll may have selected itself last).
-    select_device(NET_ADDR.load(Ordering::Relaxed), BULK_MPS.load(Ordering::Relaxed),
+    // Save the shared selection so this poll cannot leave the channel pointing at the net device.
+    let (prev_addr, prev_mps, prev_low, prev_split) = (
+        DEV_ADDR.load(Ordering::Relaxed), MPS0.load(Ordering::Relaxed),
+        LOW_SPEED.load(Ordering::Relaxed), SPLIT_PORT.load(Ordering::Relaxed));
+    // Point the shared channel at the net device's CONTROL endpoint (EP0 max-packet, not the bulk size).
+    select_device(NET_ADDR.load(Ordering::Relaxed), NET_EP0_MPS.load(Ordering::Relaxed),
                   NET_LOW.load(Ordering::Relaxed));
-    let _ = smsc_mii_read_checked(SMSC_MII_BMSR);            // clear the latched-low bit
-    match smsc_mii_read_checked(SMSC_MII_BMSR) {             // BMSR bit 2 = Link Status (current)
+    let deadline = MiiBudget::new(NET_LINK_BUDGET_US);
+    let _ = smsc_mii_read_checked(SMSC_MII_BMSR, &deadline);  // clear the latched-low bit
+    let out = match smsc_mii_read_checked(SMSC_MII_BMSR, &deadline) { // BMSR bit 2 = Link Status (current)
         Some(bmsr) => { let up = bmsr & 0x0004 != 0; NET_LINK_UP.store(up, Ordering::Relaxed); up }
         // The MDIO engine did not answer - report the last KNOWN state rather than inventing one.
         None => cached,
-    }
+    };
+    DEV_ADDR.store(prev_addr, Ordering::Relaxed);
+    MPS0.store(prev_mps, Ordering::Relaxed);
+    LOW_SPEED.store(prev_low, Ordering::Relaxed);
+    SPLIT_PORT.store(prev_split, Ordering::Relaxed);
+    out
 }
 
 /// The USB-net device's MAC + link state, or None if no net device is up. The link is the LAN9514's real
@@ -2479,6 +2616,15 @@ fn revive_if_needed(recovered: bool, streak_exhausted: bool, ep_in: u32, ep_out:
     SPLIT_PORT.store(0, Ordering::Relaxed);
     KBD_READY.store(false, Ordering::Relaxed);
     NET_READY.store(false, Ordering::Relaxed);
+    // The port reset takes every device back to address 0, so the background RX IN is now armed against a
+    // device that no longer answers on that address: disarm it and drop any half-assembled frame, or the
+    // ISR spins error-re-arm against a stale target and the reassembly splices across the reset.
+    NET_RX_ARMED.store(false, Ordering::Relaxed);
+    NET_RX_ERRS.store(0, Ordering::Relaxed);
+    wr(HAINTMSK, rd(HAINTMSK) & !(1 << CH_NET_RX));
+    chan_disable(CH_NET_RX);
+    // SAFETY: core-0 + IRQ-masked (syscall/boot context, the sole writer of NET_RX_PARTIAL).
+    unsafe { net_rx_partial_reset(); }
     select_device(0, 8, false);
     // `reset_port` ENUMERATES as its last step. Calling `enumerate_sync` after it ran the whole thing
     // a second time against a bus that had just been addressed - the doubled "GET_DESC(8) failed" pair

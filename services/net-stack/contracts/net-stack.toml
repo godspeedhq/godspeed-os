@@ -16,6 +16,14 @@ ipc_receive = ["net-stack"]
 # net-stack mints a delegated SOCKET capability per open socket (§7.10, the same mechanism fs uses for
 # files). resource_mint is that authority; the kernel grants it from this declaration (service_hw, T1 B).
 resource_mint = true
+# ARM (Pi 2) NOTE (userspace-audit U15 / A5-U1 doctrine): the Pi 2 has no battery-backed RTC, so the wall
+# clock has no hardware source and `date` reads zero until something sets it. net-stack runs the SNTP
+# exchange, so on ARM the kernel additionally grants this service the SET_CLOCK capability BY NAME
+# (`SetClock`, syscall 50 - `service_privileges` in kernel `task/mod.rs`, arch-gated to ARM; x86's CMOS RTC
+# is the authority there, so nothing holds it and the syscall is refused). SET_CLOCK is a kernel-only
+# by-name grant and is deliberately NOT a contract capability - `contract_check.py` does not reconcile it.
+# So on ARM the real authority of this service is the four capabilities above PLUS SET_CLOCK (set the
+# machine's time of day). Stated here so a contract reader is not misled about what net-stack can reach.
 
 [placement]
 core = 1   # co-located with nic-driver (the two exchange frames constantly)

@@ -183,10 +183,10 @@ impl GlobalResourceTable {
     }
 
     fn bump_generation(&mut self, id: ResourceId, liveness: Liveness) {
-        // SEC-11: no STABLE gate resource (ids 1-11: LOG_WRITE..ACQUIRE_ANY, NET_DEVICE, GPIO_DEVICE,
-        // ever revoked or killed. `holds_resource` (the by-holdings gate for Kill/Reboot/ResourceMint/
-        // Introspect/NetFrame*) validates those WITHOUT a generation check, which is sound only while they
-        // stay un-revocable. Revocable ids are always >= 100 (endpoints) or in the delegated band. This
+        // SEC-11: no STABLE gate resource (ids 1-13: LOG_WRITE..ACQUIRE_ANY, NET_DEVICE, GPIO_DEVICE,
+        // USB_DISK, SET_CLOCK) is ever revoked or killed. `holds_resource` (the by-holdings gate for
+        // Kill/Reboot/ResourceMint/Introspect/NetFrame*/UsbDisk*/SetClock) validates those WITHOUT a
+        // generation check, which is sound only while they stay un-revocable. Revocable ids are always >= 100 (endpoints) or in the delegated band. This
         // pins the invariant, so a future change that makes a gated resource revocable fails loudly
         // in test/debug rather than silently letting a revoked holder keep passing the gate.
         debug_assert!(id.0 >= 100,

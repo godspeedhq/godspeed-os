@@ -4038,6 +4038,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ("date", "epoch") => help_block(ctx, "date epoch", "seconds since 1970-01-01", &[
             ("date epoch", "print epoch seconds (not POSIX 'unix')", "date epoch"),
         ], false),
+        ("date", "sync") => help_block(ctx, "date sync", "set the clock from the internet (SNTP)", &[
+            ("date sync", "fetch the time over the network and set the wall clock, then print it (q aborts)", "date sync"),
+        ], false),
         ("net", "dns") => help_block(ctx, "net dns", "resolve a hostname to an IPv4 address", &[
             ("net dns <host>", "DNS A-record lookup via net-stack (slirp resolver)", "net dns example.com"),
         ], false),
@@ -4611,12 +4614,24 @@ fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     // `date sync` - fetch the time from the network (SNTP) via net-stack and set the wall clock. The Pi 2
     // has no battery-backed RTC, so `date` reads zeros until this runs (also done automatically at boot).
     if arg == "sync" {
-        out.line_fmt(ctx, format_args!("Syncing the clock from the network (SNTP)..."));
+        out.line_fmt(ctx, format_args!("Syncing the clock from the network (SNTP)... (q aborts)"));
         let msg = Message::from_bytes(&[10u8]);
-        let outcome = match ctx.request_with_reply_abortable("net-stack", &msg, 8) {
-            ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") => ctx.request_with_reply_abortable("net-stack", &msg, 8),
+        // The budget must cover net-stack's WORST case, not a guess: op 10 can run SNTP_TRIES rounds of a
+        // DANCE_SECS drain (plus a DNS attempt) before it can honestly answer "no time". Timing out early
+        // and RE-SENDING would queue a second full sync behind the first, and net-stack's serve loop is
+        // single-threaded - so every other client op (net/ping/dns) would block behind our own retry.
+        // `net renew`, the sibling that also triggers the boot dance, uses 30 s for exactly this reason.
+        const SYNC_SECS: i64 = 30;
+        let outcome = match ctx.request_with_reply_abortable("net-stack", &msg, SYNC_SECS) {
+            ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") =>
+                ctx.request_with_reply_abortable("net-stack", &msg, SYNC_SECS),
             other => other,
         };
+        // An abort is the USER's decision, not a network failure - blaming the cable for it is a lie.
+        if let ReqOutcome::Aborted = outcome {
+            out.line_fmt(ctx, format_args!("date sync: aborted"));
+            return Ok(());
+        }
         let ok = matches!(&outcome, ReqOutcome::Reply(r) if r.payload_bytes().first() == Some(&1));
         if !ok {
             out.line_fmt(ctx, format_args!("date sync: no time from the network (is the cable in?)"));
@@ -6710,10 +6725,10 @@ fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
     // Path C (Phase 4): the sink resolves via the kernel name-directory (SEND|GRANT, so the cap can
     // be delegated to the producer); it is populated synchronously at the sink's spawn, so this
     // normally succeeds on the first iteration - the bounded wait is just a guard.
-    let t0 = ctx.datetime().epoch_secs();
+    let t0 = ctx.epoch_secs_monotonic();
     loop {
         if let Some(h) = ctx.acquire_send_grant_cap(sink) { return Some(h); }
-        if ctx.datetime().epoch_secs() - t0 >= FILTER_WAIT_SECS { return None; }
+        if ctx.epoch_secs_monotonic() - t0 >= FILTER_WAIT_SECS { return None; }
         ctx.yield_cpu();
     }
 }
@@ -6882,11 +6897,11 @@ const CHAOS_SAVE_TOTAL_SECS: i64 = 30;
 /// reacquiring a fresh `fs` cap each round (it may have just respawned). Bounded: `save_report` is
 /// itself wall-clock-bounded, so this never hangs; it gives up gracefully when fs won't stabilise.
 fn chaos_save_retry(ctx: &ServiceContext, ppath: &[u8], data: &[u8]) -> bool {
-    let t0 = ctx.datetime().epoch_secs();
+    let t0 = ctx.epoch_secs_monotonic();
     loop {
         let _ = ctx.reacquire_by_name("fs");
         if save_report(ctx, ppath, data) { return true; }
-        if ctx.datetime().epoch_secs() - t0 >= CHAOS_SAVE_TOTAL_SECS { return false; }
+        if ctx.epoch_secs_monotonic() - t0 >= CHAOS_SAVE_TOTAL_SECS { return false; }
         for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
     }
 }
@@ -6894,12 +6909,12 @@ fn chaos_save_retry(ctx: &ServiceContext, ppath: &[u8], data: &[u8]) -> bool {
 /// Wait (real wall-clock bounded, RTC) for `name` to be ALIVE (present in the task table). Used
 /// before a kill so a round isn't wasted killing a task that is still mid-respawn. Yields cooperatively.
 fn chaos_wait_alive(ctx: &ServiceContext, name: &str) {
-    let t0 = ctx.datetime().epoch_secs();
+    let t0 = ctx.epoch_secs_monotonic();
     let mut k = 0u32;
     while slot_of(ctx, name).is_none() {
         ctx.yield_cpu();
         k += 1;
-        if k % CHAOS_POLL_EVERY == 0 && ctx.datetime().epoch_secs() - t0 >= CHAOS_RECOVER_SECS { break; }
+        if k % CHAOS_POLL_EVERY == 0 && ctx.epoch_secs_monotonic() - t0 >= CHAOS_RECOVER_SECS { break; }
     }
 }
 
@@ -6907,14 +6922,14 @@ fn chaos_wait_alive(ctx: &ServiceContext, name: &str) {
 /// for `name` to reach a generation different from `og` - proof a fresh instance came up (§7.5). Yields
 /// cooperatively so the recoverer (sharing core 0) runs. Returns true on recovery, false on timeout.
 fn chaos_wait_recovery(ctx: &ServiceContext, name: &str, og: u32) -> bool {
-    let t0 = ctx.datetime().epoch_secs();
+    let t0 = ctx.epoch_secs_monotonic();
     let mut k = 0u32;
     loop {
         ctx.yield_cpu();
         k += 1;
         if k % CHAOS_POLL_EVERY == 0 {
             if let Some(g) = gen_of(ctx, name) { if g != og { return true; } }
-            if ctx.datetime().epoch_secs() - t0 >= CHAOS_RECOVER_SECS { return false; }
+            if ctx.epoch_secs_monotonic() - t0 >= CHAOS_RECOVER_SECS { return false; }
         }
     }
 }
@@ -7007,8 +7022,8 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
 /// Yield for up to `secs` of RTC wall-clock, returning true the instant q/Q/ESC is pressed (abort).
 /// Bounded + portable (RTC, not the T630-broken TSC).
 fn hold_or_abort(ctx: &ServiceContext, secs: i64) -> bool {
-    let t0 = ctx.datetime().epoch_secs();
-    while ctx.datetime().epoch_secs() - t0 < secs {
+    let t0 = ctx.epoch_secs_monotonic();
+    while ctx.epoch_secs_monotonic() - t0 < secs {
         while let Some(b) = ctx.try_console_read() {
             if b == b'q' || b == b'Q' || b == 0x1b { return true; }
         }
@@ -7142,10 +7157,10 @@ fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), S
     // done" glitch). Once chaos owns the foreground the shell's loop goes muted and reliably reprints the
     // prompt on regain. Bounded (chaos waits up to 2 s for this count first), so a chaos that never claims
     // still returns and the shell carries on.
-    let t0 = ctx.datetime().epoch_secs();
+    let t0 = ctx.epoch_secs_monotonic();
     while ctx.is_console_foreground() {
         ctx.yield_cpu();
-        if ctx.datetime().epoch_secs() - t0 >= 3 { break; }
+        if ctx.epoch_secs_monotonic() - t0 >= 3 { break; }
     }
     Ok(())
 }
@@ -7421,28 +7436,28 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
         // 1. Spawn the hog; it allocs to its limit on a round-robin core.
         let _ = ctx.spawn("mem-pressure");
         // 2. Wait for the allocation to land - free frames drop. RTC-bounded; breaks early on success.
-        let t0 = ctx.datetime().epoch_secs();
+        let t0 = ctx.epoch_secs_monotonic();
         let mut low = baseline;
         loop {
             ctx.yield_cpu();
             let f = ctx.inspect_kernel_free_frames();
             if f < low { low = f; }
             if baseline.saturating_sub(low) >= MEM_DROP_MIN { break; }
-            if ctx.datetime().epoch_secs() - t0 >= MEM_WAIT_SECS { break; }
+            if ctx.epoch_secs_monotonic() - t0 >= MEM_WAIT_SECS { break; }
         }
         let dropped = baseline.saturating_sub(low);
         grabbed[r] = dropped.min(u32::MAX as u64) as u32;
         // 3. Kill the hog - the only way v1 reclaims its memory (§10.5).
         let _ = ctx.kill("mem-pressure");
         // 4. Wait for reclaim - free frames return toward baseline. RTC-bounded.
-        let t1 = ctx.datetime().epoch_secs();
+        let t1 = ctx.epoch_secs_monotonic();
         let mut hi = low;
         loop {
             ctx.yield_cpu();
             let f = ctx.inspect_kernel_free_frames();
             if f > hi { hi = f; }
             if hi + MEM_SLACK >= baseline { break; }
-            if ctx.datetime().epoch_secs() - t1 >= MEM_WAIT_SECS { break; }
+            if ctx.epoch_secs_monotonic() - t1 >= MEM_WAIT_SECS { break; }
         }
         let leak = baseline as i64 - hi as i64;
         leaked[r] = leak;
@@ -7539,11 +7554,11 @@ fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         spawned += 1;
         // Wait on TRUTH - the hog's allocation landing (free frames drop by its request) - not a fixed
         // pad. RTC-bounded so a hog that cannot alloc near the ceiling times out instead of hanging us.
-        let t = ctx.datetime().epoch_secs();
+        let t = ctx.epoch_secs_monotonic();
         loop {
             ctx.yield_cpu();
             if before.saturating_sub(ctx.inspect_kernel_free_frames()) >= SPAWN_DROP_MIN { break; }
-            if ctx.datetime().epoch_secs() - t >= SPAWN_SETTLE_SECS { break; }
+            if ctx.epoch_secs_monotonic() - t >= SPAWN_SETTLE_SECS { break; }
         }
     }
 
@@ -7558,23 +7573,23 @@ fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         let _ = ctx.kill("mem-pressure");
         killed += 1;
         // Wait on TRUTH - the hog COUNT dropping (this kill was reaped to Dead) - not a fixed pad. Bounded.
-        let t = ctx.datetime().epoch_secs();
+        let t = ctx.epoch_secs_monotonic();
         loop {
             ctx.yield_cpu();
             if count_named(ctx, "mem-pressure") < remaining { break; }
-            if ctx.datetime().epoch_secs() - t >= KILL_SETTLE_SECS { break; }
+            if ctx.epoch_secs_monotonic() - t >= KILL_SETTLE_SECS { break; }
         }
     }
 
     // 3. Wait for reclaim - free frames return to ~baseline (deferred kstacks drain on timer ticks).
-    let t0 = ctx.datetime().epoch_secs();
+    let t0 = ctx.epoch_secs_monotonic();
     let mut hi = low;
     loop {
         ctx.yield_cpu();
         let f = ctx.inspect_kernel_free_frames();
         if f > hi { hi = f; }
         if hi + RECLAIM_SLACK >= baseline { break; }
-        if ctx.datetime().epoch_secs() - t0 >= RECLAIM_SECS { break; }
+        if ctx.epoch_secs_monotonic() - t0 >= RECLAIM_SECS { break; }
     }
     let recovered  = hi;
     let live_after = count_live(ctx);
