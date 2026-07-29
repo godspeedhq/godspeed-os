@@ -560,6 +560,38 @@ fn nak_budget_us() -> u32 {
 /// target - a healthy device is in and out in well under a millisecond.
 const IO_BUDGET_US: u32 = 500_000;
 
+/// Is CH_BULK claimed for a multi-transfer command right now? Storage's BOT commands and the PHY link
+/// poll both drive this one channel; storage's ownership spans three transfers with task-switching gaps
+/// in between, so "is a transfer parked" (`ASYNC_BULK.active`) is too narrow a test for "is the channel
+/// in use". Core-0 exclusive like the rest of this driver's state.
+/// A DEPTH, not a flag: a failing BOT command calls `recover_or_revive`, which issues BOT commands of its
+/// own, so claims nest. With a bool the inner guard's Drop would release the OUTER claim and leave the
+/// rest of the recovery unprotected - the subtle half-released state that is worth one extra counter.
+static BULK_CLAIM_DEPTH: AtomicU32 = AtomicU32::new(0);
+
+/// RAII claim on CH_BULK. `acquire` always succeeds - storage is the channel's owner and must never be
+/// denied its own bus, and it nests. `try_acquire` succeeds only when the channel is completely free,
+/// which is how the link poll steps aside instead of reprogramming the channel under a command in
+/// flight. Released on every exit path, including the early returns a failed transfer takes.
+struct BulkClaim;
+impl BulkClaim {
+    fn acquire() -> BulkClaim { BULK_CLAIM_DEPTH.fetch_add(1, Ordering::Relaxed); BulkClaim }
+    fn try_acquire() -> Option<BulkClaim> {
+        match BULK_CLAIM_DEPTH.compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_)  => Some(BulkClaim),
+            Err(_) => None,
+        }
+    }
+}
+impl Drop for BulkClaim {
+    fn drop(&mut self) {
+        // saturating: a spurious extra Drop must not wrap the depth to u32::MAX and wedge the channel
+        // claimed forever.
+        let _ = BULK_CLAIM_DEPTH.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+                                              |d| Some(d.saturating_sub(1)));
+    }
+}
+
 /// RAII: raise the NAK backstop for a block I/O command, and restore it on ANY exit path (Drop). Using
 /// a guard rather than manual store/restore means an early return cannot leave the backstop raised for
 /// the next, unrelated transfer.
@@ -2208,6 +2240,9 @@ pub fn net_frame_rx(dst: &mut [u8]) -> usize {
 /// value that was never derived from the source is an invented fact, not a cache of one (§26.4).
 static NET_LINK_UP:      AtomicBool = AtomicBool::new(false);
 static NET_LINK_LAST_US: AtomicU32  = AtomicU32::new(0);
+/// How many link polls stepped aside for storage - reported once, as evidence that the exclusion is
+/// load-bearing rather than decorative.
+static NET_LINK_DEFERRED: AtomicU32 = AtomicU32::new(0);
 /// How often the PHY is actually re-read. A cable pull shows up within this long - fast enough to feel
 /// immediate at the prompt, slow enough that the control transfers cost nothing measurable.
 const NET_LINK_POLL_US: u32 = 1_000_000;
@@ -2241,6 +2276,22 @@ fn net_link_up() -> bool {
     if last != 0 && now.wrapping_sub(last) < NET_LINK_POLL_US { return cached; }
     // SAFETY: core-0 + IRQ-masked (syscall); ASYNC_BULK is core-0 exclusive.
     if unsafe { (*core::ptr::addr_of!(ASYNC_BULK)).active } { return cached; }
+    // Claim CH_BULK for the duration of the MDIO reads, or step aside. Storage owns this channel for a
+    // whole BOT command (three transfers with task-switching gaps between them), and a poll that lands in
+    // one of those gaps reprograms the channel under a device waiting for its data phase. A missed poll
+    // costs nothing - the rate limiter simply tries again a second later - so yielding is always right.
+    let _bulk = match BulkClaim::try_acquire() {
+        Some(c) => c,
+        None => {
+            // Say it ONCE: whether a link poll ever actually collides with storage is the difference
+            // between this exclusion being load-bearing and being theatre, and a silent guard cannot
+            // tell us which. One line, first occurrence only.
+            if NET_LINK_DEFERRED.fetch_add(1, Ordering::Relaxed) == 0 {
+                pl011_write(b"dwc2: link poll deferred - storage owns the bulk channel (expected, harmless)\r\n");
+            }
+            return cached;
+        }
+    };
     NET_LINK_LAST_US.store(now.max(1), Ordering::Relaxed);   // max(1) keeps 0 meaning "never read"
     // Save the shared selection so this poll cannot leave the channel pointing at the net device.
     let (prev_addr, prev_mps, prev_low, prev_split) = (
@@ -2671,6 +2722,14 @@ reset clears the device cache and this device accepts no flush)\r\n");
 /// Run one SCSI command via BOT. `cdb` is the SCSI command block; `data`/`dlen` is the data stage
 /// (`data_in` selects direction). Returns true iff the command completed with CSW status = passed.
 fn bot_command(ep_in: u32, ep_out: u32, cdb: &[u8], data_in: bool, data: &mut [u8], dlen: usize, can_block: bool) -> bool {
+    // Claim CH_BULK for the WHOLE command. A BOT command is three transfers (CBW, data, CSW) and the
+    // async path PARKS between them - so for most of a disk read the task is switched away, IRQs are on,
+    // and another service's syscall can run. The PHY link poll uses control transfers on this same
+    // channel, and its `ASYNC_BULK.active` check only covers the instants a transfer is actually parked,
+    // not the gaps between the three. Claiming here makes the exclusion cover the command, which is the
+    // real unit of ownership: a link poll that lands mid-command reprograms the channel under a device
+    // that is waiting for its data phase.
+    let _bulk = BulkClaim::acquire();
     let mut cbw = [0u8; 31];
     cbw[0..4].copy_from_slice(&0x4342_5355u32.to_le_bytes());     // dCBWSignature "USBC"
     cbw[4..8].copy_from_slice(&0x1234_5678u32.to_le_bytes());     // dCBWTag
