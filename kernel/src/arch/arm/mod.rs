@@ -1340,6 +1340,14 @@ pub mod interrupts {
         // shared-selection path stands aside for the duration (storage answers BUSY and re-asks, which it
         // already knows how to do). Interrupts stay on, the tick keeps running, and nothing races.
         super::dwc2::hotplug_poll();
+        // Watch the ethernet cable for the same reason, on the same terms. The PHY read was already
+        // written and already correct - but nothing CALLED it unless a service asked (`net`, `ping`), so
+        // unplugging the cable on an idle machine was silent while unplugging the keyboard was not.
+        // Polling it here makes the cable report itself live, like every other plug. It is a separate call
+        // rather than folded into `hotplug_poll` because it must run OUTSIDE that function's exclusive
+        // section: it takes the same bulk claim, and nesting would make it stand aside from itself. Both
+        // are individually rate-limited to ~1 s and both yield to storage, so idle stays cheap.
+        super::dwc2::link_poll();
         // SAFETY: unmasking IRQs is always valid (vectors + handlers installed); WFI then waits for one.
         unsafe { core::arch::asm!("cpsie i", "wfi", options(nomem, nostack)) }
     }

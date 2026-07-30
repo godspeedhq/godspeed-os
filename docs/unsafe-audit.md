@@ -38,7 +38,7 @@ inventory matches source again rather than carrying a known-stale baseline forwa
 
 | File | Change | Why |
 |------|--------|-----|
-| `arch/arm/dwc2.rs` | 14 -> 33 (+19) | Interrupt-driven net RX (ring push/pop, burst parse + reassembly, partial reset, background arm/re-arm, the halt ISR, the consumer syscall), the net-up arm sites, and the PHY link poll's read of `ASYNC_BULK.active` (the guard that keeps a link poll from destroying a parked storage transfer). |
+| `arch/arm/dwc2.rs` | 14 -> 34 (+20) | Interrupt-driven net RX (ring push/pop, burst parse + reassembly, partial reset, background arm/re-arm, the halt ISR, the consumer syscall), the net-up arm sites, and the PHY link poll's read of `ASYNC_BULK.active` (the guard that keeps a link poll from destroying a parked storage transfer). The +1 over the earlier 33 is the SAME guard read in `link_poll`, the idle-context twin of that poll (a cable change now reports itself without being asked). |
 | `arch/arm/irq.rs` | 11 -> 13 (+2) | **Pre-existing drift, re-baselined:** blocks added by earlier branch work (USB IRQ routing/ack), not by the networking commits. |
 | `arch/arm/mod.rs` | 43 -> 44 (+1) | **Pre-existing drift, re-baselined:** one block from earlier branch work. |
 
@@ -1064,7 +1064,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
 | arch/arm/fbcon.rs | 6 | permitted |
-| arch/arm/dwc2.rs | 33 | permitted |
+| arch/arm/dwc2.rs | 34 | permitted |
 | arch/arm/page_tables.rs | 31 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_user.rs | 6 | permitted |

@@ -1377,6 +1377,13 @@ static HOTPLUG_PORT:    AtomicU8  = AtomicU8::new(1); // round-robin cursor: one
 /// How often a single hub port is queried. A person cannot plug a cable faster than this, and it keeps the
 /// steady-state cost of hot-plug support to one control transfer per second on an otherwise idle core.
 const HOTPLUG_INTERVAL_US: u32 = 1_000_000;
+/// Per-port count of enumeration attempts that got no answer, indexed by port number (0 unused). Bounds the
+/// retry so a device that never answers cannot enumerate-and-complain once a second for the machine's life.
+/// Cleared when the port empties, so an unplug/replug always restores a full set of attempts.
+static HOTPLUG_TRIES: [AtomicU8; 32] = [const { AtomicU8::new(0) }; 32];
+/// Attempts before a silent device is written off. A device woken by its own port reset typically answers on
+/// the second try; by the third, waiting longer is not what is wrong.
+const HOTPLUG_MAX_TRIES: u8 = 3;
 
 /// The USB address a device on `port` gets - stable, so a replugged device returns to the same address.
 fn hub_port_addr(port: u8) -> u8 { 1 + port }
@@ -1525,7 +1532,11 @@ fn enumerate_hub(protocol: u8) {
         // address across an unplug/replug, so hot-plug needs no allocator and cannot exhaust the address
         // space by cycling a cable (a sequential counter leaked one address per replug). Unique by
         // construction: a hub port hosts at most one device.
-        bring_up_hub_port(port, hub_port_addr(port));
+        // The verdict is not needed here: `boot_mask` above already records the port as occupied from the
+        // status this loop read, so an unsupported or failed boot device is settled either way (the retry
+        // question only arises for a device that arrives LATER - see `hotplug_poll`). Both losing cases
+        // print for themselves, so nothing goes unsaid by dropping it.
+        let _ = bring_up_hub_port(port, hub_port_addr(port));
     }
     // Remember the hub's geometry + which ports held a device, so the idle hot-plug watcher can notice a
     // later change. Without this the boot walk was the ONLY time these ports were ever looked at.
@@ -1555,7 +1566,7 @@ fn enumerate_hub(protocol: u8) {
 /// the hot-plug watcher, so a device plugged in later goes through exactly the same sequence that worked at
 /// boot - no second, subtly-different path to drift out of step (Commandment III applied to code).
 /// Assumes the hub's own control endpoint is already selected. Returns what `enumerate_downstream` decided.
-fn bring_up_hub_port(port: u8, addr: u8) -> bool {
+fn bring_up_hub_port(port: u8, addr: u8) -> PortBringUp {
     control_out(0x23, 0x01, C_PORT_CONNECTION, port as u16);                // CLEAR_FEATURE(C_CONNECTION)
     control_out(0x23, 0x03, PORT_RESET, port as u16);                       // SET_FEATURE(PORT_RESET)
     // Wait on the hub's TRUTH that the reset finished - PORT_RESET (wPortStatus bit 4) clears when the hub
@@ -1665,18 +1676,38 @@ pub fn hotplug_poll() {
         // connected, so neither branch fires again and the device is never retried - dead until the user
         // physically re-plugs, with nothing said (§26.7, Commandment V). Third instance of this class in
         // one session; the SDK's #[must_use] gate does not reach an in-kernel bool.
-        if bring_up_hub_port(port, addr) {
-            HUB_CONNECTED.fetch_or(bit, Ordering::Relaxed);
-            announced = true;
-        } else {
-            pl011_write(b"dwc2: hot-plug - enumeration FAILED on hub port ");
-            super::timer::write_dec_pub(port as u32);
-            pl011_write(b" - left unclaimed so the next scan retries\r\n");
-            announced = true;
+        announced = true;
+        match bring_up_hub_port(port, addr) {
+            // Driven, or answered-but-undriveable: either way the port is SETTLED. Recording it as
+            // occupied is what stops the watcher re-entering this branch every second - a full port reset
+            // plus enumeration, with the bus held exclusively, once a second forever, for a device that
+            // will never be claimed. Unplugging it clears the bit, so a replug still gets a fresh look.
+            PortBringUp::Claimed | PortBringUp::Unsupported => {
+                HUB_CONNECTED.fetch_or(bit, Ordering::Relaxed);
+            }
+            // It did not answer. Retry - but a BOUNDED number of times (§26.6). Leaving the port unclaimed
+            // unconditionally meant an unbounded retry: a device that never answers gets a port reset, a
+            // full enumeration and two lines of output every second for as long as the machine runs. Try a
+            // few times (a device woken by its own reset usually answers on the second), then settle and
+            // say so. The count clears on removal, so a replug always buys a fresh set of attempts.
+            PortBringUp::Failed => {
+                let tries = HOTPLUG_TRIES[port as usize].fetch_add(1, Ordering::Relaxed) + 1;
+                pl011_write(b"dwc2: hot-plug - the device on hub port ");
+                super::timer::write_dec_pub(port as u32);
+                if tries < HOTPLUG_MAX_TRIES {
+                    pl011_write(b" did not answer (attempt ");
+                    super::timer::write_dec_pub(tries as u32);
+                    pl011_write(b") - trying again next second\r\n");
+                } else {
+                    HUB_CONNECTED.fetch_or(bit, Ordering::Relaxed);   // settle: stop the retry loop
+                    pl011_write(b" never answered - giving up on it; unplug and plug it back in to retry\r\n");
+                }
+            }
         }
     } else if !now_conn && was {
         announced = true;
         HUB_CONNECTED.fetch_and(!bit, Ordering::Relaxed);
+        HOTPLUG_TRIES[port as usize].store(0, Ordering::Relaxed);   // a replug gets a fresh set of attempts
         pl011_write(b"dwc2: hot-plug - device REMOVED from hub port "); super::timer::write_dec_pub(port as u32);
         pl011_write(b"\r\n");
         // Forget a device that has gone, or its poll keeps addressing hardware that is not there. Only the
@@ -1713,10 +1744,25 @@ pub fn hotplug_poll() {
     SPLIT_PORT.store(prev_split, Ordering::Relaxed);
 }
 
+/// What came of trying to bring a port's device up. Three outcomes, not two: "we have no driver for this"
+/// and "this device did not answer" look identical to a `bool`, but they demand OPPOSITE responses. A
+/// device that did not answer should be retried; a device that answered perfectly well and simply is not
+/// one we drive must NOT be - retrying it means a port reset and a full enumeration every second, forever,
+/// with the bus held exclusively each time. A wifi dongle in a port would have quietly done that.
+#[must_use]
+#[derive(PartialEq, Clone, Copy)]
+enum PortBringUp {
+    /// A driver claimed it (keyboard, network, storage).
+    Claimed,
+    /// It enumerated fine and told us what it is - we just have no driver for that. Settled, not retried.
+    Unsupported,
+    /// It did not answer. A transport failure, so looking again later is the right move.
+    Failed,
+}
+
 /// A freshly-reset downstream device answers at address 0. Learn its EP0 max-packet, move it to `addr`,
 /// then dispatch by function: a boot keyboard (HID), the ethernet (CDC-ECM), or a mass-storage device.
-/// Returns true if it was one we brought up.
-fn enumerate_downstream(low: bool, addr: u8, split_port: u8) -> bool {
+fn enumerate_downstream(low: bool, addr: u8, split_port: u8) -> PortBringUp {
     select_device(0, 8, low);
     // A low/full-speed device behind the high-speed hub needs SPLIT for EVERY transfer (select_device
     // above cleared it); a high-speed device gets split_port = 0 = direct. This persists through the
@@ -1725,16 +1771,18 @@ fn enumerate_downstream(low: bool, addr: u8, split_port: u8) -> bool {
     let mut buf = [0u8; 64];
 
     if !get_descriptor(0x80, 0x01, 0x00, 0, &mut buf, 8) {
-        pl011_write(b"dwc2: downstream desc8 failed\r\n"); return false;
+        pl011_write(b"dwc2: downstream desc8 failed\r\n"); return PortBringUp::Failed;
     }
     MPS0.store(if buf[7] == 0 { 8 } else { buf[7] as u16 }, Ordering::Relaxed);
 
-    if !control_out(0x00, 0x05, addr as u16, 0) { pl011_write(b"dwc2: downstream SET_ADDRESS failed\r\n"); return false; }
+    if !control_out(0x00, 0x05, addr as u16, 0) {
+        pl011_write(b"dwc2: downstream SET_ADDRESS failed\r\n"); return PortBringUp::Failed;
+    }
     DEV_ADDR.store(addr, Ordering::Relaxed);
     super::timer::delay_us(2000); // TDSETADDR: 2 ms SET_ADDRESS recovery on the real 1 MHz clock
 
     if !get_descriptor(0x80, 0x01, 0x00, 0, &mut buf, 18) {
-        pl011_write(b"dwc2: downstream desc18 failed\r\n"); return false;
+        pl011_write(b"dwc2: downstream desc18 failed\r\n"); return PortBringUp::Failed;
     }
     let vid = (buf[8] as u32) | ((buf[9] as u32) << 8);
     let pid = (buf[10] as u32) | ((buf[11] as u32) << 8);
@@ -1754,20 +1802,28 @@ fn enumerate_downstream(low: bool, addr: u8, split_port: u8) -> bool {
 
     // The Pi 2's onboard LAN9514 is a vendor-specific smsc95xx (class 0xFF, VID 0x0424 SMSC). Bring it up
     // as the network device (HW-blind - QEMU never takes this branch).
-    if buf[4] == 0xFF && vid == 0x0424 && configure_smsc95xx() { return true; }
+    if buf[4] == 0xFF && vid == 0x0424 && configure_smsc95xx() { return PortBringUp::Claimed; }
 
     // A CDC device (class 0x02 at the device level) is a USB-Ethernet gadget: QEMU's usb-net, and real
     // CDC-ECM dongles.
-    if buf[4] == 0x02 && configure_cdc_ecm(buf[17]) { return true; }
+    if buf[4] == 0x02 && configure_cdc_ecm(buf[17]) { return PortBringUp::Claimed; }
 
     // Both HID and mass storage define their class at the interface level, so each probe reads the
     // config descriptor itself. A boot keyboard is the goal; mass storage exercises the bulk path.
-    if configure_keyboard() { return true; }
+    if configure_keyboard() { return PortBringUp::Claimed; }
     // Record the hub port BEFORE probing: a stick behind the hub needs split transfers on every later
     // block I/O, and `SPLIT_PORT` is re-selected per transfer (the channel is shared with the keyboard).
     MSC_HUB_PORT.store(split_port, Ordering::Relaxed);
-    if probe_mass_storage() { return true; }
-    false
+    if probe_mass_storage() { return PortBringUp::Claimed; }
+
+    // It answered every question we asked and is simply not a device this port knows how to drive - a
+    // wifi dongle, a webcam, a printer. Name it (VID:PID identifies exactly which), say plainly that
+    // nothing will happen, and settle: the caller records the port as occupied so this is said once
+    // rather than re-enumerated every second. Honest and finite beats hopeful and repeating (§26.7).
+    pl011_write(b"dwc2: no driver for the device on this port (VID:PID=");
+    write_hex32((vid << 16) | pid);
+    pl011_write(b") - it is powered and idle; nothing else will use it\r\n");
+    PortBringUp::Unsupported
 }
 
 // --- CDC-ECM USB-Ethernet: raw ethernet frames over the bulk endpoints, no per-packet framing ---
@@ -2228,6 +2284,9 @@ static NET_RX_DROPPED: AtomicU32 = AtomicU32::new(0);
 /// Frames handed to a caller whose buffer could not hold them. A DEFECT counter, deliberately separate
 /// from the ring-full one so ordinary backpressure on a busy link cannot drown it out.
 static NET_RX_TRUNCATED: AtomicU32 = AtomicU32::new(0);
+/// How many backpressure drops before it is worth a single line. Ordinary bursts on a busy LAN run to
+/// tens; a reader that is genuinely not keeping up runs to thousands. Set so the healthy case is silent.
+const NET_RX_DROP_NOTEWORTHY: u32 = 4096;
 static NET_RX_BADLEN:  AtomicU32 = AtomicU32::new(0);
 
 const NET_RX_RING_FRAMES: usize = 32;
@@ -2263,9 +2322,15 @@ unsafe fn net_rx_ring_push(frame: &[u8]) {
         // reporting normal flow control as a fault: the storage BUSY hand-back "printed 564 lines in ONE
         // selfcheck ... loud is a budget, and spending it on the expected case is how a real line gets
         // ignored". One line establishes the fact; the counter keeps the magnitude for anyone who asks.
-        if NET_RX_DROPPED.fetch_add(1, Ordering::Relaxed) == 0 {
-            pl011_write(b"dwc2: net RX ring full - dropping the oldest frame (normal backpressure on a \
-                          busy link; counted from here, not repeated)\r\n");
+        // SILENT below a threshold, then said exactly once. Dropping the oldest frame when the reader is
+        // behind is not a fault - it is the backpressure this driver applies on purpose, and on any busy
+        // link it happens constantly. Announcing it taught the operator to ignore driver output, which is
+        // the real cost (§26.7: loud is a budget). But losing thousands of frames IS worth knowing, so the
+        // count still speaks - once - when it crosses a level no healthy link reaches.
+        let d = NET_RX_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if d == NET_RX_DROP_NOTEWORTHY {
+            pl011_write(b"dwc2: net RX has now dropped "); super::timer::write_dec_pub(d);
+            pl011_write(b" frames to backpressure - the reader is persistently behind (said once)\r\n");
         }
     }
     r.frames[r.tail][..n].copy_from_slice(&frame[..n]);
@@ -2515,6 +2580,9 @@ pub fn net_frame_rx(dst: &mut [u8]) -> usize {
 /// Starts FALSE, not true: until the PHY has actually been read there is no derived view to serve, and a
 /// value that was never derived from the source is an invented fact, not a cache of one (§26.4).
 static NET_LINK_UP:      AtomicBool = AtomicBool::new(false);
+/// Has the PHY ever been read successfully? Distinguishes "we know the link is down" from the initial
+/// "we have not looked yet", so the first reading is not announced as if the cable had just changed.
+static NET_LINK_KNOWN:   AtomicBool = AtomicBool::new(false);
 static NET_LINK_LAST_US: AtomicU32  = AtomicU32::new(0);
 /// How many link polls stepped aside for storage - reported once, as evidence that the exclusion is
 /// load-bearing rather than decorative.
@@ -2528,8 +2596,59 @@ const NET_LINK_POLL_US: u32 = 1_000_000;
 /// just tries again a second later), so giving up early is always the right trade here.
 const NET_LINK_BUDGET_US: u32 = 2_000;
 
+/// Poll the ethernet PHY from the scheduler's IDLE hook, so a cable change is noticed and announced even
+/// when nothing asks. The verdict is discarded: the announcement is the point, and the value is cached for
+/// whoever asks next.
+///
+/// This is a SEPARATE entry point from `net_link_up`, not a call to it, because the two contexts differ in
+/// the one way that matters. `net_link_up` runs from a syscall - IRQ-masked - so nothing can preempt it and
+/// rewrite the shared device selection its control transfers depend on. The idle hook is **preemptible**
+/// (the scheduler re-enables interrupts after every switch-back), so the timer tick's keyboard poll could
+/// land in the middle of an MDIO read and repoint the channel. Exclusion here therefore has to be the same
+/// PROTOCOL the hot-plug watcher uses - take `UsbExclusive` and let every other shared-selection path stand
+/// aside - rather than the implicit exclusion of a masked context. Calling `net_link_up` from here would
+/// have been the third repeat of the bug the first hot-plug design was rejected for.
+pub fn link_poll() {
+    if !NET_READY.load(Ordering::Acquire) { return; }
+    if NET_KIND.load(Ordering::Relaxed) != NET_KIND_SMSC { return; }   // no PHY to read (CDC-ECM/QEMU)
+    if !on_core0() { return; }
+    let now = super::timer::systimer_us();
+    let last = NET_LINK_LAST_US.load(Ordering::Relaxed);
+    if last != 0 && now.wrapping_sub(last) < NET_LINK_POLL_US { return; }
+    // SAFETY: core-0; ASYNC_BULK is core-0 exclusive. A parked storage transfer owns the channel.
+    if unsafe { (*core::ptr::addr_of!(ASYNC_BULK)).active } { return; }
+    let _bulk = match BulkClaim::try_acquire() { Some(c) => c, None => return };
+    let _excl = match UsbExclusive::try_acquire() { Some(e) => e, None => return };
+    let _ = net_link_read(now);
+}
+
+/// Record the freshly-read PHY link state, and ANNOUNCE it when it changed.
+///
+/// The ethernet cable was the one plug in the machine whose coming and going was invisible: the state was
+/// read correctly and then only ever answered a question (`net`, `ping`). Pulling the cable said nothing;
+/// putting it back said nothing. The keyboard and the USB stick both report themselves, and there is no
+/// principled reason the cable should not - so it does, in the same words, at the same moment.
+///
+/// Changes only. The FIRST determination is deliberately silent: it is the state the machine booted into,
+/// not an event, and boot already reports the network device. That is also what the hot-plug watcher does
+/// (its boot mask is seeded silently and only later changes are announced), so the two behave alike.
+fn note_link_state(up: bool) {
+    let known = NET_LINK_KNOWN.swap(true, Ordering::Relaxed);
+    let was = NET_LINK_UP.swap(up, Ordering::Relaxed);
+    if !known || was == up { return; }
+    if up {
+        pl011_write(b"dwc2: ethernet cable connected - link up\r\n");
+    } else {
+        pl011_write(b"dwc2: ethernet cable UNPLUGGED - no link until it is plugged back in\r\n");
+    }
+    // Same courtesy the hot-plug watcher pays: the line above scrolled `gsh>` away and the shell, blocked
+    // in `console_read`, has no reason to redraw it. One newline gets the prompt back.
+    super::console_push_byte(b'\n');
+}
+
 /// Is the ethernet cable in? Reads the LAN9514's internal PHY over MII (BMSR bit 2), rate-limited and
 /// cached. Returns the cached value - never a stale-forever guess - when the read must be skipped.
+/// (The IDLE-context twin of this entry point is `link_poll`, above.)
 ///
 /// Four things make this safe to call from the `NetInfo` syscall:
 /// - **core 0 + syscall context**, which is exactly what `ctrl_xfer` requires (it runs on the shared
@@ -2569,6 +2688,17 @@ fn net_link_up() -> bool {
             return cached;
         }
     };
+    net_link_read(now)
+}
+
+/// The MDIO read itself. Split out so the syscall path and the idle path can each establish exclusion the
+/// way their own context requires (see `link_poll`) and then share ONE copy of the transfer sequence -
+/// rather than growing a second, subtly-different one to drift out of step (Commandment III).
+///
+/// **Precondition:** the caller holds the bulk claim AND has established exclusion against the shared
+/// device selection - by masked context (syscall) or by `UsbExclusive` (idle).
+fn net_link_read(now: u32) -> bool {
+    let cached = NET_LINK_UP.load(Ordering::Relaxed);
     NET_LINK_LAST_US.store(now.max(1), Ordering::Relaxed);   // max(1) keeps 0 meaning "never read"
     // Save the shared selection so this poll cannot leave the channel pointing at the net device.
     let (prev_addr, prev_mps, prev_low, prev_split) = (
@@ -2580,7 +2710,7 @@ fn net_link_up() -> bool {
     let deadline = MiiBudget::new(NET_LINK_BUDGET_US);
     let _ = smsc_mii_read_checked(SMSC_MII_BMSR, &deadline);  // clear the latched-low bit
     let out = match smsc_mii_read_checked(SMSC_MII_BMSR, &deadline) { // BMSR bit 2 = Link Status (current)
-        Some(bmsr) => { let up = bmsr & 0x0004 != 0; NET_LINK_UP.store(up, Ordering::Relaxed); up }
+        Some(bmsr) => { let up = bmsr & 0x0004 != 0; note_link_state(up); up }
         // The MDIO engine did not answer - report the last KNOWN state rather than inventing one.
         None => cached,
     };
