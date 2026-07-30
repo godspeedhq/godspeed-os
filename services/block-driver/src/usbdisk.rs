@@ -70,17 +70,27 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
     // A bounded wait that cannot say it is waiting is a silent one (§26.7). Two lines - one when it
     // becomes slow, one when it resolves - turn "the Pi has hung" into "the stick is busy, it is
     // working on it". No behaviour changes; only the silence does.
-    let t0 = ctx.epoch_secs_monotonic();
+    // The clock is a SYSCALL, and this is the hottest loop in the storage path - so it is read lazily
+    // and sparsely. The first version read it unconditionally at entry, which put an extra syscall on
+    // EVERY block read and write (the overwhelming majority of which complete on the first attempt and
+    // never wait at all), and then once per busy iteration - thousands per slow request. Chaos pauses
+    // went from 2.3% of rounds to 20%: instrumentation added to explain a delay became a cause of it.
+    //
+    // So: no clock at all unless a request actually goes BUSY, and then only every `CLOCK_SAMPLE_EVERY`
+    // attempts. Sampling coarsely costs at most that many attempts of lateness on a 2 s threshold, which
+    // is nothing, and takes the cost from thousands of syscalls to ~90 across a full 6000-attempt budget.
+    const CLOCK_SAMPLE_EVERY: u32 = 64;
+    let mut t0: Option<i64> = None;
     let mut announced = false;
     for n in 0..BUSY_RETRIES {
         match op() {
             0 => {
-                // Only speak on the way out if we spoke on the way in - a normal request stays silent,
-                // and a slow one is closed out rather than left hanging with no resolution.
-                if announced {
+                // Only speak on the way out if we spoke on the way in - a normal request stays silent
+                // (and pays nothing), and a slow one is closed out rather than left unresolved.
+                if let (true, Some(start)) = (announced, t0) {
                     ctx.log_fmt(format_args!(
                         "block-driver: {} lba {} completed after {}s - the device was busy, not broken",
-                        what, lba, ctx.epoch_secs_monotonic() - t0));
+                        what, lba, ctx.epoch_secs_monotonic() - start));
                 }
                 return true;
             }
@@ -89,12 +99,21 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
             // as a device that "stayed busy" - an authority failure wearing an I/O failure's name.
             USB_DISK_BUSY => {
                 // Expected and silent - until it has gone on long enough that silence is itself
-                // misleading. Said ONCE per request, not per attempt.
-                if !announced && ctx.epoch_secs_monotonic() - t0 >= SLOW_ANNOUNCE_SECS {
-                    announced = true;
-                    ctx.log_fmt(format_args!(
-                        "block-driver: {} lba {} - device busy for {}s and still working; waiting (this is not a hang)",
-                        what, lba, SLOW_ANNOUNCE_SECS));
+                // misleading. Said ONCE per request, not per attempt, and costing a clock read only
+                // every CLOCK_SAMPLE_EVERY attempts (see above - this loop cannot afford a syscall).
+                if !announced && n % CLOCK_SAMPLE_EVERY == 0 {
+                    let now = ctx.epoch_secs_monotonic();
+                    match t0 {
+                        // First time we have actually had to wait: start the clock here, not at entry.
+                        None => t0 = Some(now),
+                        Some(start) if now - start >= SLOW_ANNOUNCE_SECS => {
+                            announced = true;
+                            ctx.log_fmt(format_args!(
+                                "block-driver: {} lba {} - device busy for {}s and still working; waiting (this is not a hang)",
+                                what, lba, now - start));
+                        }
+                        _ => {}
+                    }
                 }
                 ctx.yield_cpu();   // hand the CPU on, ask again
             }
