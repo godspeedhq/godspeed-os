@@ -822,6 +822,28 @@ pub fn usb_disk_write(lba: u64, src: &[u8]) -> bool { dwc2::msc_write_block(lba,
 pub fn usb_disk_flush() -> bool { dwc2::msc_sync_cache() }
 /// Did the last USB-disk transfer fail only because the device was BUSY (NAK)? Then it is not a
 /// failure at all - the caller should re-ask, with interrupts enabled in between.
+/// Counter ticks a core may make NO forward progress before the liveness watchdog panics. Same units as
+/// [`boot::read_cycle_counter`] (both are `CNTPCT`), which is the whole reason this lives in the arch.
+///
+/// Derived, not picked: `timer::timer_hz()` is the **measured** counter rate, cross-checked against the
+/// Pi's independent 1 MHz system timer - deliberately NOT `CNTFRQ`, which overstates it by 19.2x on this
+/// board (see `timer.rs`). Taking `CNTFRQ` on faith would have made this deadline 19.2x too short and
+/// turned a safety net into a source of spurious panics. It reads `0` until calibration completes, and
+/// `0` disables the check, so the watchdog cannot arm on a rate we have not verified.
+///
+/// **10 s, not x86's ~3 s**, and the asymmetry is architectural rather than arbitrary: on ARM the USB
+/// stack runs IN-KERNEL from syscall and idle context (`arch/arm/CLAUDE.md`), so a legitimate
+/// interrupt-masked stretch here is a device wait - port reset, enumeration retries - measured in
+/// hundreds of milliseconds, where x86's longest kernel critical section is a TLB shootdown measured in
+/// microseconds. 10 s leaves ~20x headroom over the worst legitimate case while still catching decisively
+/// the 20-30 s wedges a chaos run produced. A watchdog that panics a healthy machine is worse than none,
+/// so the margin is deliberately generous; it can tighten once the ARM worst case is measured rather
+/// than reasoned about.
+pub fn liveness_deadline_cycles() -> u64 {
+    const LIVENESS_SECS: u64 = 10;
+    (timer::timer_hz() as u64).saturating_mul(LIVENESS_SECS)
+}
+
 pub fn usb_disk_busy() -> bool { dwc2::msc_last_was_busy() }
 /// Is there no USB disk attached at all? Answered from PRESENT state (`MSC_READY`), not from the last
 /// transfer's outcome - which is exactly why it is a separate question. See `USB_DISK_ABSENT` in the

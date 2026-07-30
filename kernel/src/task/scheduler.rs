@@ -305,6 +305,8 @@ static CORE_TOTAL_TICKS: PerCore<CachePaddedU64> = PerCore::new();
 /// The kernel is the last-resort recovery anchor (§6.3); if IT stalls silently nothing recovers it, so
 /// it must at minimum fail LOUD. `0` = that core has not ticked yet (still booting) - not a stall.
 static CORE_LAST_TICK_TSC: PerCore<CachePaddedU64> = PerCore::new();
+/// Has the liveness watchdog announced itself? Only so the arming line is printed once, not per tick.
+static LIVENESS_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Sticky round-robin scan pointer per core (§9.1, §9.3).
 ///
@@ -1167,10 +1169,25 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // shootdown/critical-section is milliseconds, so the ~3 s deadline cannot false-fire.
         let now = crate::arch::imp::read_cycle_counter();
         CORE_LAST_TICK_TSC.get(cid).0.store(now, Ordering::Relaxed);
-        let tpq = crate::arch::imp::boot::tsc_ticks_per_quantum();
+        // The deadline comes from the ARCH, in the same units as `read_cycle_counter`, because the two
+        // must agree and only the arch knows both. It used to be derived here from
+        // `tsc_ticks_per_quantum() * 300`, which silently disabled the whole watchdog on any arch whose
+        // quantum figure is a stub - and arm32's is `0`. So the Pi 2 ran with NO liveness defence at all:
+        // a chaos run wedged the machine for 20-30 s at a time and then permanently, and the machine that
+        // is supposed to fail LOUD (invariant 12) went silent instead, which is what made it
+        // undiagnosable. `0` still means "this arch cannot say" and still disables the check - but that
+        // is now a deliberate per-arch answer rather than a side effect of an unrelated constant.
+        let deadline = crate::arch::imp::liveness_deadline_cycles();
         let ncores = crate::smp::core::ready_count() as usize;
-        if tpq > 0 {
-            let deadline = tpq.saturating_mul(300); // ~3 s (300 * 10 ms quanta) with no forward progress
+        // SAY whether the watchdog is on, once, the first time it arms. A safety net that is silently
+        // absent is worse than one that is absent loudly: arm32 ran without this check for the whole
+        // port and nothing ever said so, which is exactly how a wedge came to be undiagnosable. One line
+        // at boot makes "is the machine currently defended, and by what margin?" answerable from the log
+        // rather than from reading the source (§26.4).
+        if deadline > 0 && !LIVENESS_ARMED.swap(true, Ordering::Relaxed) {
+            crate::kprintln!("kernel: liveness watchdog ARMED - a core dark for {} counter ticks panics", deadline);
+        }
+        if deadline > 0 {
             for other in 0..ncores {
                 if other == cid { continue; }
                 let last = CORE_LAST_TICK_TSC.get(other).0.load(Ordering::Relaxed);
@@ -1179,10 +1196,14 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                 let dark = now.saturating_sub(last);
                 if last != 0 && dark > deadline {
                     let stuck_task = CORE_CURRENT.get(other).load(Ordering::Relaxed);
+                    // Report the overrun as a MULTIPLE of the deadline rather than in quanta: the
+                    // quantum figure is precisely what is unavailable on some arches, and a panic message
+                    // must not depend on the thing whose absence disabled this check in the first place.
                     panic!(
-                        "LIVENESS WEDGE: core {} made NO progress for {} TSC (~{} quanta, >3s); last \
-                         running task slot {}; detected by core {}. No forward progress = loud stop.",
-                        other, dark, dark / tpq, stuck_task, cid
+                        "LIVENESS WEDGE: core {} made NO progress for {} counter ticks ({}x the {} \
+                         allowed); last running task slot {}; detected by core {}. No forward progress \
+                         = loud stop.",
+                        other, dark, dark / deadline, deadline, stuck_task, cid
                     );
                 }
             }

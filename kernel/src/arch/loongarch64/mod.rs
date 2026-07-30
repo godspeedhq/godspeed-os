@@ -110,6 +110,11 @@ pub fn usb_disk_sectors() -> u64 { 0 }
 pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
 pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
 pub fn usb_disk_flush() -> bool { false }
+/// Counter ticks a core may make NO forward progress before the liveness watchdog panics. `0` = this
+/// arch cannot say (no calibrated counter rate yet), so the check stays off - see the x86 and arm
+/// implementations for what a real answer looks like.
+pub fn liveness_deadline_cycles() -> u64 { 0 }
+
 pub fn usb_disk_busy() -> bool { false }
 /// Is there no USB disk attached at all? Distinct from busy - see `USB_DISK_ABSENT` in the syscall
 /// dispatch. This arch has no USB-disk backend, so a request never reaches one and the question is

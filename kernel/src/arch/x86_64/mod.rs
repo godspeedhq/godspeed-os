@@ -303,6 +303,16 @@ pub fn usb_disk_sectors() -> u64 { 0 }
 pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
 pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
 pub fn usb_disk_flush() -> bool { false }
+/// Counter ticks (in `read_cycle_counter` units) a core may make NO forward progress before the
+/// liveness watchdog declares it wedged and panics. `0` = this arch cannot say, so the check is off.
+///
+/// x86: unchanged from when this lived in the scheduler - 300 quanta of ~10 ms is ~3 s, and it is `0`
+/// until the TSC quantum is calibrated (QEMU's periodic tick never calibrates, so it stays off there).
+/// A normal shootdown or critical section is milliseconds, so ~3 s cannot false-fire.
+pub fn liveness_deadline_cycles() -> u64 {
+    boot::tsc_ticks_per_quantum().saturating_mul(300)
+}
+
 pub fn usb_disk_busy() -> bool { false }
 /// Is there no USB disk attached at all? Distinct from busy - see `USB_DISK_ABSENT` in the syscall
 /// dispatch. This arch has no USB-disk backend, so a request never reaches one and the question is
