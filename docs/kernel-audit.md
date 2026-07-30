@@ -3,6 +3,28 @@
 > **Living document.** Records every audit of the ring-0 kernel against the constitution's
 > invariants. Re-run and append with each audit. First audit: 2026-07-11.
 
+
+## Audit 7 - the ARM USB hot-plug + storage-failure chain (2026-07-30, `feat/arm-usb-interrupt`)
+
+**Scope:** every change from `fba9081`..`d8de0f2` - the hot-plug watcher rewrite (level -> latch),
+the absent-vs-busy status split, the block-refusal noise budget, and the ARM `usb_disk_absent`
+primitive. Audited against the Ten Commandments.
+
+**Verdict: 1 HIGH, 1 LOW, both fixed; 1 accepted deviation recorded.**
+
+| ID | Sev | Commandment | Finding |
+|----|-----|-------------|---------|
+| A7-1 | HIGH | V, §26.6 | `hotplug_check_port` discarded the verdict of `control_out(CLEAR_FEATURE, C_PORT_CONNECTION)`. A latch that fails to clear stays set, so **every** later visit believes the port just changed: an occupied port would be stood down and fully re-enumerated **once a second, forever**. Exactly the unbounded retry the `PortBringUp::Failed` bound prevents, re-entered through the new latch path - and the **fourth** discarded-verdict defect in this driver. FIXED: the clear is checked; on failure the event is not consumed (an event we cannot acknowledge is one we cannot safely act on), reported once, and re-read next visit. |
+| A7-2 | LOW | I, §26.6 | `HOTPLUG_TRIES[port as usize]` is indexed without a bound inside `hotplug_check_port`. Both current callers clamp to `1..=31` and the array is 32 wide, so it is unreachable today - but a future caller would panic the kernel from a driver path. Recorded, not fixed (guarding at the callers is where the clamp belongs). |
+| A7-3 | note | VII | Cap-before-action holds on the new status code: `handle_usb_disk_read`/`_write` validate `USB_DISK_RESOURCE` **before** consulting `usb_disk_absent()`. No new authority; `USB_DISK_ABSENT` is a return value, not a gate. |
+| A7-4 | note | III | `MSC_ABSENCE_EXPLAINED` is not a second truth about device presence: it records *whether the absence was announced*, is set only by the removal that prints the cause, and is cleared at both `MSC_READY.store(true)` sites. It reduces to that one event and never overrides `MSC_READY`. |
+| A7-5 | note | X | The hot-plug sweep and the latch read are driver mechanism, not new kernel responsibility - no policy moved inward (Commandment I holds). |
+
+**Accepted deviation:** `usb_disk_absent()` returns `true` on the six non-ARM arches, so on x86 a
+failed USB-disk syscall now answers `USB_DISK_ABSENT` (-21) rather than -1. No x86 code uses that
+path (x86 storage is AHCI), and -21 is the more accurate answer, so this is a widening of truth
+rather than a regression.
+
 ## North-star invariant
 
 **Nothing above the kernel may panic or wedge the kernel.** For any userspace action - any syscall

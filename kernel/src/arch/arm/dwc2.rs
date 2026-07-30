@@ -1395,6 +1395,8 @@ static HOTPLUG_TRIES: [AtomicU8; 32] = [const { AtomicU8::new(0) }; 32];
 /// Attempts before a silent device is written off. A device woken by its own port reset typically answers on
 /// the second try; by the third, waiting longer is not what is wrong.
 const HOTPLUG_MAX_TRIES: u8 = 3;
+/// Has the port change-latch clear failed? Only so the report is said once rather than every visit.
+static LATCH_CLEAR_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// How long a gap between visits means the watcher fell behind and should CATCH UP with a full sweep
 /// rather than the next port in rotation (see `hotplug_poll`). The watcher aims for one visit per second,
@@ -1743,9 +1745,26 @@ fn hotplug_check_port(port: u8) -> bool {
     // design that needed to sample often enough to catch an edge was never going to hold.
     let event = st & (1 << 16) != 0;
     if event {
-        // Clear it now that we have read it, or every later visit re-reports the same stale event. The
-        // arrival path clears it again inside `bring_up_hub_port`; clearing twice is harmless.
-        control_out(0x23, 0x01, C_PORT_CONNECTION, port as u16);
+        // Clear it now that we have read it, or every later visit re-reports the same stale event - and
+        // CHECK that the clear worked before acting on the event.
+        //
+        // Discarding this verdict is the fourth instance of that class in this driver, and here it is not
+        // benign: a latch that stays set makes every later visit believe the port just changed, so an
+        // occupied port would be stood down and fully re-enumerated once a second, forever. That is
+        // exactly the unbounded retry the `PortBringUp::Failed` bound exists to prevent, re-entered
+        // through a different door (Commandment V / §26.6).
+        //
+        // If the clear fails we do NOT act: an event we cannot acknowledge is one we cannot safely
+        // consume. The port status read is bounded and the next visit tries again; if the transport is
+        // genuinely broken, `st == 0` above already catches it. Said once, not per visit.
+        if !control_out(0x23, 0x01, C_PORT_CONNECTION, port as u16) {
+            if !LATCH_CLEAR_FAILED.swap(true, Ordering::Relaxed) {
+                pl011_write(b"dwc2: hub port change-latch clear FAILED - not acting on the event; \
+                              will re-read it next visit (said once)\r\n");
+            }
+            return false;
+        }
+        LATCH_CLEAR_FAILED.store(false, Ordering::Relaxed);   // it works again: a later failure is news
         // A latched event on a port that is STILL occupied is the case levels cannot see: unplugged and
         // replugged, or swapped for a different device, since we last looked. What we believed about it
         // is no longer trustworthy, so forget the old device and let the arrival branch below enumerate

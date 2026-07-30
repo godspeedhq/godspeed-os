@@ -904,6 +904,17 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
               tag: u8, reply: CapHandle, out: &mut [u8], out_len: &mut usize) {
     let mut send = |bytes: &[u8]| {
         let n = bytes.len().min(out.len());
+        // TRUNCATION MUST NOT BE SILENT. The clamp is a bounds guard, not a policy: every reply this
+        // service builds fits (the largest is a streaming read, 5 + MAX_FILE_BYTES = 3561, against 4095
+        // available after the tag), so cutting one short means an arm grew past the buffer and the caller
+        // is about to parse a header describing bytes that are not there. Answering a wrong length as if
+        // it were right is the silent corruption §26.7 forbids - say it, and still send what we have so
+        // the caller is not left hanging as well as wrong.
+        if n < bytes.len() {
+            ctx.log_fmt(format_args!(
+                "fs: REPLY TRUNCATED - {} bytes of {} (buffer is {}); the caller will parse a short reply",
+                n, bytes.len(), out.len()));
+        }
         out[..n].copy_from_slice(&bytes[..n]);
         *out_len = n;
     };

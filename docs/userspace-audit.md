@@ -5,6 +5,25 @@
 > append with each audit. The kernel has its own living record in `docs/kernel-audit.md`; this file
 > is its userspace counterpart. First audit: 2026-07-12.
 
+
+## Audit 6 - fs reply correlation, the buffered reply, and the blocking waits (2026-07-30, `feat/arm-usb-interrupt`)
+
+**Scope:** `services/fs` (correlation tag, buffered reply + in-place retry, failure logging),
+`services/shell` (tag helpers, all five fs senders), `sdk/rust/service_context.rs` (the four wait
+helpers now block), `services/block-driver/usbdisk.rs` (absent vs busy), `examples/counter`.
+
+**Verdict: 1 MEDIUM fixed, 1 MEDIUM accepted with rationale, 2 LOW recorded.**
+
+| ID | Sev | Commandment | Finding |
+|----|-----|-------------|---------|
+| A6-1 | MED | V, §26.7 | fs's buffered `send` clamped with `bytes.len().min(out.len())` and set the length to the clamp - a **silent truncation**. Unreachable today (largest reply is `5 + MAX_FILE_BYTES` = 3561 against 4095 available after the tag), but if an arm ever grew past the buffer the caller would parse a header describing bytes that are not there: silent corruption, not a short read. FIXED: truncation is reported loudly and the short reply still sent, so the caller is wrong-but-not-hanging rather than wrong-and-silent. |
+| A6-2 | MED | VI, Invariant 9 | `next_fs_tag()` uses a function-scope `static AtomicU8`. Before this change the shell had **zero** mutable globals (`HELP` is immutable), and nic-driver's `tx_fail` was deliberately threaded through its serve loop rather than made a file-scope static (userspace-audit A5). **ACCEPTED, recorded:** threading a counter through `fs_request`/`fs_request_q`/`fs_request_bounded`/`fs_op_q`/`fs_raw` reaches dozens of call sites, and correctness does not depend on the counter's *value* - only on successive requests differing, which any monotonic source satisfies. It is owned by exactly one path, is a count rather than a resource (§6.2's distinction), and is never read by another service. Revisit if the shell ever needs a second one. |
+| A6-3 | LOW | III | `drain_stale_fs_replies` is now redundant: the tag supersedes arrival-order hygiene. Two mechanisms for one job. Kept as belt-and-braces for the first hardware runs; retire once the tag has soaked. |
+| A6-4 | LOW | VIII | `fs_take_tagged` waits via `recv_abortable_deadline`, which is q-abortable - so a stray `q` during a non-interactive path (the history write-through) could abort the wait. Bounded and harmless (the caller treats it as no reply and retries), but the abortability is inherited rather than chosen. |
+| A6-5 | note | VIII | The four wait helpers now BLOCK with a short timeout. Correctness still comes from truth (the reply), not time: the timeout only paces the console poll, and the deadline is a bound, not a decision. **But** they now depend on `scheduler::cycles_to_ticks` flooring at 1 tick - if that floor were ever removed the loops would hot-spin with no yield at all. Documented at both ends. |
+| A6-6 | note | IX | The in-place retry re-establishes derived state (a fresh mount) before retrying, and is limited to read-only opcodes so a partially-applied mutation is never re-applied. A retry after `reacquire_by_name` takes a FRESH tag - reusing it would accept the dead instance's late reply as the new one's answer. |
+| A6-7 | note | IV | No contract changed. The tag is a wire-format field between two services that already talk; no new capability, no new named peer. |
+
 ## North-star for services
 
 A service is **identity, not location** (Commandment V): it must be **prepared to fail and to
