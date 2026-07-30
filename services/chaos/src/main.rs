@@ -33,7 +33,8 @@ const RECOVER_SECS: i64 = 8;        // wall-clock bound (RTC, portable) for the 
 const POLL_EVERY: u32 = 64;         // yields between clock polls in the handoff wait
 const MAX_CAND: usize = 32;         // bounded snapshot of live killable tasks per round
 const MAX_SVC: usize = 16;          // distinct services in the aggregate tally (~6-8 real)
-const SHELL_SETTLE_YIELDS: u32 = 4000; // let a freshly-respawned shell settle before we hand back
+const SETTLE_SECS: i64 = 1;            // the console hand-back beat (clock-bounded, see PACE_SECS)
+const SHELL_SETTLE_YIELDS: u32 = 200_000; // hard cap on that beat if the clock never advances
 // Iteration backstops for the two loops whose only escape was a WALL-CLOCK deadline. The Pi 2 has no
 // RTC, so `datetime().epoch_secs()` is frozen at 0 there and `now - t0 >= N` is never true - the bound
 // reads as bounded and is not. Both loops still wait on TRUTH (a message arrived; a live shell exists),
@@ -42,7 +43,20 @@ const SHELL_SETTLE_YIELDS: u32 = 4000; // let a freshly-respawned shell settle b
 // keeps a spin cap next to its time bound).
 const HANDOFF_MAX_YIELDS: u32 = 200_000;  // the post-run wait for a live shell to hand the console to
 const ARGWAIT_MAX_YIELDS: u32 = 50_000;   // the startup wait for the shell's argument message
-const PACE_YIELDS: u32 = 3000;      // a beat between rounds so the panel/log stay readable + `q` lands
+/// The between-rounds beat, in SECONDS - because a yield COUNT is not a duration.
+///
+/// This was `3000` yields, tuned where a yield is cheap. A yield costs a full scheduler quantum whenever
+/// the yielding task is the only runnable one - which is exactly the state chaos creates, with every
+/// service killed and mid-restart - so on the Pi 2 (100 Hz) those 3000 yields are 30.03 SECONDS, and
+/// only on the rounds where everything else happens to be blocked. That is why the pauses looked random,
+/// why they clustered on exactly 30.0 s, and why the operator repeatedly took a healthy machine for a
+/// wedged one and reached for the power switch.
+///
+/// The harness was measuring itself in units whose cost it does not control (Commandment VIII: a proxy
+/// is not the truth). The beat is now bounded by the CLOCK, so it is the same beat on every arch, with
+/// `PACE_YIELDS` kept only as the hard cap that stops a stuck clock spinning forever (§26.6).
+const PACE_SECS: i64 = 1;
+const PACE_YIELDS: u32 = 200_000;   // hard cap on the beat if the clock never advances
 const MEMP_CHUNK: usize = 64 * 1024; // one mem-pressure round allocs this (held; chaos's limit bounds it)
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]; // matches the `date` utility
 
@@ -437,9 +451,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Pace the round. With the recovery wait gone the loop would otherwise spin in milliseconds,
         // flooding the serial log and outrunning the eye. Yield a modest beat, still polling `q` (from the
         // SERIAL console - the keyboard is a chaos target) so an abort lands promptly.
-        for _ in 0..PACE_YIELDS {
+        // Bounded by the clock, capped by the yield count - the same shape as the handoff wait above.
+        // The clock read is a syscall, so it is sampled every POLL_EVERY yields rather than every one.
+        let pace_t0 = ctx.epoch_secs_monotonic();
+        for k in 0..PACE_YIELDS {
             if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { ack_quit(&ctx); break 'carnage; } }
             ctx.yield_cpu();
+            if k % POLL_EVERY == 0 && ctx.epoch_secs_monotonic() - pace_t0 >= PACE_SECS { break; }
         }
     }
 
@@ -485,7 +503,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // already established by the bounded slot_of loop above. This fixed pad only smooths the console
     // hand-back so our "done" line and the shell's redrawn prompt do not interleave; skipping it risks
     // at worst a momentary cosmetic glitch, never incorrectness. Deliberately time-based, not a truth-wait.
-    for _ in 0..SHELL_SETTLE_YIELDS { ctx.yield_cpu(); }
+    // Clock-bounded for the same reason as the round beat: 4000 yields is a blink where a yield is cheap
+    // and ~40 s on the Pi 2, where a lone runnable task pays a full quantum per yield. Cosmetic pacing
+    // should cost a moment on every machine, not most of a minute on one.
+    let settle_t0 = ctx.epoch_secs_monotonic();
+    for k in 0..SHELL_SETTLE_YIELDS {
+        ctx.yield_cpu();
+        if k % POLL_EVERY == 0 && ctx.epoch_secs_monotonic() - settle_t0 >= SETTLE_SECS { break; }
+    }
     // Print our last line FIRST, then release. The muted shell only draws its prompt once it regains the
     // foreground, so releasing BEFORE this printed "done" made the shell's `gsh>` land before the text
     // (the "switches screen, press Enter to see the prompt" glitch). done -> release -> the shell draws a
