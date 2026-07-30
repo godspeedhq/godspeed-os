@@ -58,20 +58,41 @@ const TICK_CYCLES: u64 = 2_000_000_000; // ~1 s at ~2 GHz
 fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 64];
-    req[0] = op;
-    req[1] = pl as u8;
-    req[2..2 + pl].copy_from_slice(&path[..pl]);
-    let dn = data.len().min(req.len() - 2 - pl);
-    req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
-    let msg = Message::from_bytes(&req[..2 + pl + dn]);
+    // Byte 0 is the CORRELATION TAG fs echoes in its reply, so an answer to an earlier request cannot be
+    // mistaken for this one's. This example only ever has one request outstanding, so a fixed tag would
+    // do - but it would silently accept a stale reply from a PREVIOUS request, which is the exact bug
+    // this exists to close, so it varies like every other client's.
+    req[0] = next_fs_tag();
+    req[1] = op;
+    req[2] = pl as u8;
+    req[3..3 + pl].copy_from_slice(&path[..pl]);
+    let dn = data.len().min(req.len() - 3 - pl);
+    req[3 + pl..3 + pl + dn].copy_from_slice(&data[..dn]);
+    let msg = Message::from_bytes(&req[..3 + pl + dn]);
 
-    if let Some(r) = ctx.request_with_reply("fs", &msg) {
+    // Strip the echoed tag so callers parse the reply exactly as before. A reply that does not carry
+    // OUR tag answers someone else's question - treat it as no answer rather than parse it (the failure
+    // being closed here is precisely a client reading the wrong reply and believing it).
+    let tag = req[0];
+    let strip = |r: Message| -> Option<Message> {
+        let p = r.payload_bytes();
+        if p.first() == Some(&tag) { Some(Message::from_bytes(&p[1..])) } else { None }
+    };
+    if let Some(r) = ctx.request_with_reply("fs", &msg).and_then(strip) {
         return Some(r);
     }
     if ctx.reacquire_by_name("fs") {
-        return ctx.request_with_reply("fs", &msg);
+        return ctx.request_with_reply("fs", &msg).and_then(strip);
     }
     None
+}
+
+/// Vary the correlation tag per request; never 0, so an untagged sender is recognisable.
+fn next_fs_tag() -> u8 {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static FS_TAG: AtomicU8 = AtomicU8::new(0);
+    let t = FS_TAG.fetch_add(1, Ordering::Relaxed);
+    if t == 0 { FS_TAG.fetch_add(1, Ordering::Relaxed); 1 } else { t }
 }
 
 /// LOAD-ON-SPAWN: read the persisted count from `fs` and reconstruct it.

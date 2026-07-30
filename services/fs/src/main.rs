@@ -842,10 +842,18 @@ fn op_is_read_only(op: u8) -> bool {
 /// all - the first attempt's failure reply must not already be on the wire. Every arm of `serve_once`
 /// replies exactly once and returns (there are no loops around `send`), so buffering is faithful.
 fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8], reply: CapHandle) {
+    // Split the CORRELATION TAG off the front. A name-addressed request carries one byte the client
+    // chose, and its reply carries the same byte back, so the client can tell an answer to ITS question
+    // from an answer to an earlier one. Everything after it is the request exactly as every opcode arm
+    // already expects - the tag is handled here and nowhere else, which is why adding it did not touch a
+    // single arm. (Badged file-cap invocations take the other path and are untagged; they are their own
+    // request/reply cycle.)
+    let (tag, p) = match p.split_first() { Some((t, b)) => (*t, b), None => (0u8, &[][..]) };
     let mut out = [0u8; SERVE_REPLY_MAX];
+    out[0] = tag;
     let mut len = 0usize;
     if let Some(f) = vol.as_ref() { f.io_error_seen.set(false); }
-    serve_once(ctx, vol, capacity, unreadable, p, reply, &mut out, &mut len);
+    serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
 
     let errored = vol.as_ref().map_or(false, |f| f.io_error_seen.get());
     if errored && len != REPLY_SENT_DIRECTLY && p.first().map_or(false, |&op| op_is_read_only(op)) {
@@ -854,7 +862,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
             Ok(nf) => {
                 *vol = Some(nf);
                 len = 0;
-                serve_once(ctx, vol, capacity, unreadable, p, reply, &mut out, &mut len);
+                serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
             }
             // The retry is best-effort: a re-mount that fails leaves the FIRST attempt's reply in the
             // buffer, so the caller still gets the honest error rather than silence. Said out loud,
@@ -870,7 +878,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         // instrumentation: it is that the layer which PRODUCED the answer states what it produced.
         //
         // Only on failure, so a healthy request stays silent.
-        if len == 0 || out[0] == FS_ERR {
+        if len == 0 || out[1] == FS_ERR {
             ctx.log_fmt(format_args!(
                 "fs: request op {} answered {} ({} byte reply){}",
                 p.first().copied().unwrap_or(0) & 0x7F,
@@ -880,8 +888,9 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         }
         // An empty reply is not a valid answer in this protocol: the caller reads a short reply as a
         // malformed one and reports something misleading. Never send one - say ERR properly.
-        if len == 0 { out[0] = FS_ERR; len = 1; }
-        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out[..len]));
+        if len == 0 { out[1] = FS_ERR; len = 1; }
+        // +1 for the tag at out[0]
+        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out[..1 + len]));
     }
 }
 
@@ -892,7 +901,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
 /// through the kernel (§8.5). That arm sends for itself and sets `out_len` to [`REPLY_SENT_DIRECTLY`]
 /// so the caller does not then send a second, empty reply on top of it.
 fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8],
-              reply: CapHandle, out: &mut [u8], out_len: &mut usize) {
+              tag: u8, reply: CapHandle, out: &mut [u8], out_len: &mut usize) {
     let mut send = |bytes: &[u8]| {
         let n = bytes.len().min(out.len());
         out[..n].copy_from_slice(&bytes[..n]);
@@ -1179,7 +1188,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             // that cap (§7.10). `open_file` sends its own reply (it must embed the cap), so we
             // only send FS_ERR if it failed before replying.
             let want = if tail.is_empty() { 0 } else { tail[0] & (RIGHT_READ | RIGHT_WRITE) };
-            if fs.open_file(ctx, path, want, reply).is_err() { send(&[FS_ERR]); }
+            if fs.open_file(ctx, path, want, tag, reply).is_err() { send(&[FS_ERR]); }
             else { *out_len = REPLY_SENT_DIRECTLY; }   // the cap went with it; do not reply twice
         }
         _ => send(&[FS_ERR]),
@@ -2549,7 +2558,7 @@ impl Fs {
     /// The client operates the file by invoking that cap (the kernel badges the request with the
     /// resource id + right; `serve_filecap` resolves it back here). Minted with `GRANT` so fs can
     /// transfer a copy; fs drops its own copy afterward (it serves via the badge, not the cap).
-    fn open_file(&mut self, ctx: &ServiceContext, path: &[u8], want: u8, reply: CapHandle)
+    fn open_file(&mut self, ctx: &ServiceContext, path: &[u8], want: u8, tag: u8, reply: CapHandle)
         -> Result<(), &'static str> {
         let e = self.walk(ctx, path).ok_or("not found")?;
         if !is_file(e.itype) { return Err("not a file"); }
@@ -2561,7 +2570,10 @@ impl Fs {
         self.open_files[slot] = of;
         // Hand a derived copy to the client; drop fs's original either way.
         let granted = match ctx.derive_cap(cap) {
-            Some(c) => ctx.send_with_cap_by_handle(reply, c, &Message::from_bytes(&[FS_OK])).is_ok(),
+            // Carries the correlation tag like every other reply - this one is built here rather than
+            // in `serve`'s buffer because it must embed the file CAPABILITY, and authority does not fit
+            // in a byte buffer. Same wire shape, different construction site.
+            Some(c) => ctx.send_with_cap_by_handle(reply, c, &Message::from_bytes(&[tag, FS_OK])).is_ok(),
             None    => false,
         };
         ctx.remove_cap(cap);

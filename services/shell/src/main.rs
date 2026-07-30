@@ -5701,7 +5701,7 @@ fn cap_rights_str(r: u8, buf: &mut [u8]) -> usize {
 #[inline(never)]
 fn build_drives_table(ctx: &ServiceContext) -> Option<Table> {
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
-    let reply = match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_DRIVES_INFO])) {
+    let reply = match fs_raw(ctx, &[OP_DRIVES_INFO], 3600) {
         Some(r) => r,
         None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); return None; }
     };
@@ -7892,17 +7892,97 @@ fn resolve_or_err<'a>(ctx: &ServiceContext, cwd: &Cwd, input: &str, out: &'a mut
 }
 
 /// Send an fs file-API request `[op, path_len, path, data]` and return the reply.
+/// The next correlation tag for an fs request.
+///
+/// Replies were matched to requests by ARRIVAL ORDER alone, which holds only while nothing is ever
+/// overtaken. After a USB stick replug the device is slow, a `.gsh_history` write is still in flight when
+/// the next command's request goes out, and the replies come back one behind - so `ls` read the write's
+/// one-byte `[FS_OK]`, saw a reply too short to be a listing, and reported a storage error about a
+/// filesystem that was perfectly fine. The channel then stayed one behind indefinitely, which is why the
+/// SECOND `ls` always worked and why every storage-layer fix left the symptom untouched.
+///
+/// A tag makes the match structural instead of circumstantial: the client stamps each request, fs echoes
+/// it, and an answer to a different question is recognisable as one. Cycles 1..=255 and never uses 0, so
+/// a zero byte can only be an untagged sender - a mismatch that fails loudly rather than aliasing a real
+/// tag. Wrapping is harmless: correlation only needs to distinguish requests that can be in flight at the
+/// same time, and there are at most a handful.
+fn next_fs_tag() -> u8 {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static FS_TAG: AtomicU8 = AtomicU8::new(0);
+    let t = FS_TAG.fetch_add(1, Ordering::Relaxed);
+    if t == 0 { FS_TAG.fetch_add(1, Ordering::Relaxed); 1 } else { t }
+}
+
+/// How many overtaken replies to discard before giving up. A desync is at most a few requests deep (the
+/// shell has one command in flight plus a history write), so this is a bound on a bug, not a workload -
+/// hitting it means something is wrong in a way that waiting longer will not fix (§26.6).
+const FS_STALE_MAX: u32 = 16;
+
+/// Take the reply that answers OUR request, discarding any that answer an earlier one.
+///
+/// Discarding is safe precisely because the sender has moved on: a reply whose tag we are no longer
+/// waiting for belongs to a request whose caller has already returned. Keeping it would only let it be
+/// mistaken for a later answer, which is the failure this exists to end.
+fn fs_take_tagged(ctx: &ServiceContext, tag: u8, first: ReqOutcome, max_secs: i64) -> ReqOutcome {
+    let mut outcome = first;
+    for _ in 0..FS_STALE_MAX {
+        match outcome {
+            ReqOutcome::Reply(r) => {
+                let p = r.payload_bytes();
+                if p.first() == Some(&tag) { return ReqOutcome::Reply(Message::from_bytes(&p[1..])); }
+                // Say it - a discarded reply is proof the correlation is load-bearing, and a silent
+                // guard cannot tell us whether it ever fires (§26.4).
+                ctx.log_fmt(format_args!(
+                    "shell: discarded an fs reply for tag {} while awaiting {} (an earlier request was overtaken)",
+                    p.first().copied().unwrap_or(0), tag));
+                // Wait again WITHOUT re-sending: the request is already with fs, and sending it twice
+                // would ask for the work twice.
+                outcome = ctx.recv_abortable_deadline(max_secs);
+            }
+            other => return other,
+        }
+    }
+    ReqOutcome::Timeout
+}
+
+/// Send an already-formed fs request body (one that does not fit the `[op, plen, path, data]` shape -
+/// a bare opcode, or `drives label`), TAGGED, and return the reply body with the tag stripped.
+///
+/// These sites used to build and send their own `Message` and so would have shipped an untagged request,
+/// which fs would read as `tag = <opcode>` and dispatch on the byte after it - a silent misparse. Routing
+/// them through one helper is what makes "every name-addressed request carries a tag" true rather than
+/// mostly true (Commandment III: one path, not two).
+fn fs_raw(ctx: &ServiceContext, body: &[u8], max_secs: i64) -> Option<Message> {
+    let tag = next_fs_tag();
+    let mut req = [0u8; 4096];
+    req[0] = tag;
+    let n = body.len().min(req.len() - 1);
+    req[1..1 + n].copy_from_slice(&body[..n]);
+    let msg = Message::from_bytes(&req[..1 + n]);
+    drain_stale_fs_replies(ctx);
+    let first = ctx.request_with_reply("fs", &msg).map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
+    match fs_take_tagged(ctx, tag, first, max_secs) {
+        ReqOutcome::Reply(r) => Some(r),
+        _ => None,
+    }
+}
+
 fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
-    req[0] = op;
-    req[1] = pl as u8;
-    req[2..2 + pl].copy_from_slice(&path[..pl]);
-    let dn = data.len().min(req.len() - 2 - pl);
-    req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
-    let msg = Message::from_bytes(&req[..2 + pl + dn]);
+    let tag = next_fs_tag();
+    req[0] = tag;
+    req[1] = op;
+    req[2] = pl as u8;
+    req[3..3 + pl].copy_from_slice(&path[..pl]);
+    let dn = data.len().min(req.len() - 3 - pl);
+    req[3 + pl..3 + pl + dn].copy_from_slice(&data[..dn]);
+    let msg = Message::from_bytes(&req[..3 + pl + dn]);
     drain_stale_fs_replies(ctx);          // an earlier abandoned reply must not be read as ours
-    if let Some(r) = ctx.request_with_reply("fs", &msg) {
+    // 3600 s here is the same "effectively unbounded, q is the real exit" budget the interactive path
+    // uses: it bounds only the wait for a REPLACEMENT reply after discarding an overtaken one.
+    if let ReqOutcome::Reply(r) = fs_take_tagged(
+        ctx, tag, ctx.request_with_reply("fs", &msg).map_or(ReqOutcome::Timeout, ReqOutcome::Reply), 3600) {
         return Some(r);
     }
     // No reply usually means `fs` restarted and our cached cap is now EndpointDead (Phase D,
@@ -7910,7 +7990,16 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
     // finished re-registering yet, this returns None and the next command retries.
     if ctx.reacquire_by_name("fs") {
         drain_stale_fs_replies(ctx);
-        return ctx.request_with_reply("fs", &msg);
+        // The retry is a NEW request and needs its own tag - reusing the first one would accept the
+        // dead instance's late reply as this one's answer, which is the whole class of bug being closed.
+        let tag2 = next_fs_tag();
+        let mut req2 = req;
+        req2[0] = tag2;
+        let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
+        if let ReqOutcome::Reply(r) = fs_take_tagged(
+            ctx, tag2, ctx.request_with_reply("fs", &msg2).map_or(ReqOutcome::Timeout, ReqOutcome::Reply), 3600) {
+            return Some(r);
+        }
     }
     None
 }
@@ -7934,14 +8023,17 @@ const HIST_LOAD_SECS: i64 = 2;
 fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8], max_secs: i64) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
-    req[0] = op;
-    req[1] = pl as u8;
-    req[2..2 + pl].copy_from_slice(&path[..pl]);
-    let dn = data.len().min(req.len() - 2 - pl);
-    req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
-    let msg = Message::from_bytes(&req[..2 + pl + dn]);
+    let tag = next_fs_tag();
+    req[0] = tag;
+    req[1] = op;
+    req[2] = pl as u8;
+    req[3..3 + pl].copy_from_slice(&path[..pl]);
+    let dn = data.len().min(req.len() - 3 - pl);
+    req[3 + pl..3 + pl + dn].copy_from_slice(&data[..dn]);
+    let msg = Message::from_bytes(&req[..3 + pl + dn]);
     drain_stale_fs_replies(ctx);          // an earlier abandoned reply must not be read as ours
-    if let Some(r) = ctx.request_with_reply_deadline("fs", &msg, max_secs) {
+    let first = ctx.request_with_reply_deadline("fs", &msg, max_secs).map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
+    if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag, first, max_secs) {
         return Some(r);
     }
     // TIMED OUT. The request was already SENT, so `fs` will reply into our endpoint whether we are still
@@ -7957,7 +8049,12 @@ fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8], ma
     // `drain_stale_fs_replies`. The next request drains it instead, which is decisive.
     if ctx.reacquire_by_name("fs") {
         drain_stale_fs_replies(ctx);
-        if let Some(r) = ctx.request_with_reply_deadline("fs", &msg, max_secs) { return Some(r); }
+        let tag2 = next_fs_tag();
+        let mut req2 = req;
+        req2[0] = tag2;
+        let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
+        let again = ctx.request_with_reply_deadline("fs", &msg2, max_secs).map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
+        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag2, again, max_secs) { return Some(r); }
     }
     None
 }
@@ -7997,16 +8094,26 @@ fn fs_request_q(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> ReqOu
     const MAX_SECS:  i64 = 3600; // effectively unbounded - fs replies fast now; q is the real exit
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
-    req[0] = op;
-    req[1] = pl as u8;
-    req[2..2 + pl].copy_from_slice(&path[..pl]);
-    let dn = data.len().min(req.len() - 2 - pl);
-    req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
-    let msg = Message::from_bytes(&req[..2 + pl + dn]);
-    match ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)")) {
+    let tag = next_fs_tag();
+    req[0] = tag;
+    req[1] = op;
+    req[2] = pl as u8;
+    req[3..3 + pl].copy_from_slice(&path[..pl]);
+    let dn = data.len().min(req.len() - 3 - pl);
+    req[3 + pl..3 + pl + dn].copy_from_slice(&data[..dn]);
+    let msg = Message::from_bytes(&req[..3 + pl + dn]);
+    let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+    match fs_take_tagged(ctx, tag, first, MAX_SECS) {
         // Send failed (stale cap after an fs restart): reacquire by name and retry once, still hinted.
-        ReqOutcome::Timeout if ctx.reacquire_by_name("fs") =>
-            ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)")),
+        // A fresh tag for the fresh request - see `fs_request`.
+        ReqOutcome::Timeout if ctx.reacquire_by_name("fs") => {
+            let tag2 = next_fs_tag();
+            let mut req2 = req;
+            req2[0] = tag2;
+            let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
+            let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+            fs_take_tagged(ctx, tag2, again, MAX_SECS)
+        }
         other => other,
     }
 }
@@ -8023,11 +8130,17 @@ fn fs_request_q(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> ReqOu
 fn fs_op_q(ctx: &ServiceContext, op: u8) -> ReqOutcome {
     const HINT_SECS: i64 = 2;    // print "(q to quit)" only once the wait lingers
     const MAX_SECS:  i64 = 3600; // effectively unbounded: q is the real exit, not a deadline
-    let msg = Message::from_bytes(&[op]);
+    let tag = next_fs_tag();
+    let msg = Message::from_bytes(&[tag, op]);
     drain_stale_fs_replies(ctx);
-    match ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)")) {
-        ReqOutcome::Timeout if ctx.reacquire_by_name("fs") =>
-            ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)")),
+    let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+    match fs_take_tagged(ctx, tag, first, MAX_SECS) {
+        ReqOutcome::Timeout if ctx.reacquire_by_name("fs") => {
+            let tag2 = next_fs_tag();
+            let msg2 = Message::from_bytes(&[tag2, op]);
+            let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+            fs_take_tagged(ctx, tag2, again, MAX_SECS)
+        }
         other => other,
     }
 }
@@ -10153,7 +10266,7 @@ fn drive_sel_ok(ctx: &ServiceContext, sel: &str) -> bool {
 /// `drives` - list the attached drive (single-drive in step 3; index 0).
 fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
-    let reply = match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_DRIVES_INFO])) {
+    let reply = match fs_raw(ctx, &[OP_DRIVES_INFO], 3600) {
         Some(r) => r,
         None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); return Err(ShellError::Unknown); }
     };
@@ -10215,7 +10328,7 @@ fn drives_flash(ctx: &ServiceContext, label: &str, force: bool) -> Result<(), Sh
     // "flash FAILED" while fs is still formatting. Observed exactly that on hardware: fs logged
     // `flash requested`, never logged a failure, and the shell had already declared one.
     drain_stale_fs_replies(ctx);
-    match ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + ll])) {
+    match fs_raw(ctx, &req[..2 + ll], 3600) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: formatted as GSFS - mounted, ready to use now (no reboot)");
             Ok(())
@@ -10243,7 +10356,7 @@ fn drives_reset(ctx: &ServiceContext, force: bool) -> Result<(), ShellError> {
     // Reset zeroes block 0, which on a foreign disk is its partition table - same danger as flash.
     let op = if force { OP_RESET | 0x80 } else { OP_RESET };
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
-    match ctx.request_with_reply("fs", &Message::from_bytes(&[op])) {
+    match fs_raw(ctx, &[op], 3600) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: reset to raw - 'drives flash' to use again");
             Ok(())
@@ -10348,7 +10461,7 @@ fn drives_label(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     req[1] = ll as u8;
     req[2..2 + ll].copy_from_slice(nb);
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
-    match ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + ll])) {
+    match fs_raw(ctx, &req[..2 + ll], 3600) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln_fmt(format_args!("drives: labelled '{}'", name));
             Ok(())
