@@ -656,7 +656,13 @@ static KBD_EP:     AtomicU8   = AtomicU8::new(0);       // its interrupt IN endp
 static KBD_MPS:    AtomicU8   = AtomicU8::new(8);       // its interrupt endpoint max-packet
 static KBD_LOW:    AtomicBool = AtomicBool::new(false); // whether it is a low-speed device
 static KBD_TOGGLE: AtomicBool = AtomicBool::new(false); // DATA0/DATA1 toggle for the interrupt endpoint
-static KBD_HUB_PORT: AtomicU8 = AtomicU8::new(0);      // hub port the keyboard is on (for split; 0 = direct)
+static KBD_HUB_PORT: AtomicU8 = AtomicU8::new(0);      // SPLIT ROUTING for the keyboard (0 = direct/high-speed)
+/// Which hub port the keyboard is physically IN. Distinct from `KBD_HUB_PORT` above, which is a split
+/// routing value and is 0 for a high-speed device. Only this one answers "did MY device just leave?".
+static KBD_PORT:     AtomicU8 = AtomicU8::new(0);
+/// Which hub port the storage device is physically IN - see `KBD_PORT`. The stick is high-speed, so its
+/// routing value is 0 and using that as a location silently disabled the unplug notice entirely.
+static MSC_PORT:     AtomicU8 = AtomicU8::new(0);
 
 /// Hub port (1-based) the CURRENTLY-selected device sits on when it is low/full-speed behind the high-speed
 /// LAN9514 hub - such a device is only reachable via SPLIT transactions (the hub does the low-speed transfer;
@@ -1587,7 +1593,7 @@ fn bring_up_hub_port(port: u8, addr: u8) -> PortBringUp {
     let split_port = if (st2 >> 10) & 1 == 0 { port } else { 0 };
     pl011_write(b"dwc2: port "); write_hex32(port as u32);
     pl011_write(b" device status="); write_hex32(st2); pl011_write(b"\r\n");
-    let brought_up = enumerate_downstream(low, addr, split_port);
+    let brought_up = enumerate_downstream(low, addr, split_port, port);
     // Repair the SHARED bulk state before returning. A mass-storage probe during enumeration stores its own
     // BULK_MPS and resets both data toggles - and `net_frame_tx`/`net_rx_async_arm` frame their transfers
     // from that same BULK_MPS, so leaving a stick's size in place silently malforms every later net
@@ -1713,7 +1719,13 @@ pub fn hotplug_poll() {
         // Forget a device that has gone, or its poll keeps addressing hardware that is not there. Only the
         // keyboard is polled continuously, so it is the one that must be stood down; storage and the net
         // device already fail loudly through their own paths and recover by re-enumeration.
-        if KBD_READY.load(Ordering::Relaxed) && KBD_HUB_PORT.load(Ordering::Relaxed) == port {
+        // Match on the device's LOCATION (`KBD_PORT`/`MSC_PORT`), never on its split ROUTING value
+        // (`KBD_HUB_PORT`/`MSC_HUB_PORT`). Those are 0 for a high-speed device, and 0 is not a hub port,
+        // so this comparison could never be true for one - the USB stick is high-speed, so unplugging it
+        // stood NOTHING down: `MSC_READY` stayed true and block I/O kept addressing hardware that was no
+        // longer there, which is why the first `ls` after a replug failed and the second worked. The two
+        // values happened to be equal for the LOW-speed keyboard, which is why only that half looked fine.
+        if KBD_READY.load(Ordering::Relaxed) && KBD_PORT.load(Ordering::Relaxed) == port {
             KBD_READY.store(false, Ordering::Relaxed);
             pl011_write(b"dwc2: keyboard was on that port - input stops until it is plugged back in\r\n");
         }
@@ -1722,7 +1734,7 @@ pub fn hotplug_poll() {
         // from the kernel, a "refused by kernel" from block-driver and a "block read failed" from fs, over
         // and over, while nothing said the words "the stick was unplugged". Say the cause once; the layers
         // above are then reporting something already explained (§26.7 - loud is a budget).
-        if MSC_READY.load(Ordering::Acquire) && MSC_HUB_PORT.load(Ordering::Relaxed) == port {
+        if MSC_READY.load(Ordering::Acquire) && MSC_PORT.load(Ordering::Relaxed) == port {
             MSC_READY.store(false, Ordering::Release);
             pl011_write(b"dwc2: USB storage was on that port - block I/O fails until it is plugged back in\r\n");
         }
@@ -1762,7 +1774,12 @@ enum PortBringUp {
 
 /// A freshly-reset downstream device answers at address 0. Learn its EP0 max-packet, move it to `addr`,
 /// then dispatch by function: a boot keyboard (HID), the ethernet (CDC-ECM), or a mass-storage device.
-fn enumerate_downstream(low: bool, addr: u8, split_port: u8) -> PortBringUp {
+///
+/// `split_port` and `port` are DIFFERENT things and the difference matters. `split_port` is transfer
+/// ROUTING - the hub port a low/full-speed device must be reached through, and **0 for a high-speed
+/// device**, which needs no split. `port` is the device's LOCATION - which hub port it is physically in,
+/// always non-zero. Only `port` can answer "was the device that just vanished mine?".
+fn enumerate_downstream(low: bool, addr: u8, split_port: u8, port: u8) -> PortBringUp {
     select_device(0, 8, low);
     // A low/full-speed device behind the high-speed hub needs SPLIT for EVERY transfer (select_device
     // above cleared it); a high-speed device gets split_port = 0 = direct. This persists through the
@@ -1810,11 +1827,11 @@ fn enumerate_downstream(low: bool, addr: u8, split_port: u8) -> PortBringUp {
 
     // Both HID and mass storage define their class at the interface level, so each probe reads the
     // config descriptor itself. A boot keyboard is the goal; mass storage exercises the bulk path.
-    if configure_keyboard() { return PortBringUp::Claimed; }
+    if configure_keyboard() { KBD_PORT.store(port, Ordering::Relaxed); return PortBringUp::Claimed; }
     // Record the hub port BEFORE probing: a stick behind the hub needs split transfers on every later
     // block I/O, and `SPLIT_PORT` is re-selected per transfer (the channel is shared with the keyboard).
     MSC_HUB_PORT.store(split_port, Ordering::Relaxed);
-    if probe_mass_storage() { return PortBringUp::Claimed; }
+    if probe_mass_storage() { MSC_PORT.store(port, Ordering::Relaxed); return PortBringUp::Claimed; }
 
     // It answered every question we asked and is simply not a device this port knows how to drive - a
     // wifi dongle, a webcam, a printer. Name it (VID:PID identifies exactly which), say plainly that
