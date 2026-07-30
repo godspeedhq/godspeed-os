@@ -1719,8 +1719,47 @@ fn hotplug_check_port(port: u8) -> bool {
     // absence of information, which is the mistake this branch has already paid for twice.
     if st == 0 { return false; }
     let bit = 1u32 << (port - 1);
-    let was = HUB_CONNECTED.load(Ordering::Relaxed) & bit != 0;
+    let mut was = HUB_CONNECTED.load(Ordering::Relaxed) & bit != 0;
     let now_conn = st & 1 != 0;
+    // ASK THE HUB WHAT HAPPENED, do not infer it from what the port looks like NOW.
+    //
+    // wPortChange bit 0 (C_PORT_CONNECTION) is a LATCH: the hub sets it when a device connects or
+    // disconnects and holds it until we clear it. Comparing the present connect LEVEL against what we
+    // remembered can only see a change that is still visible at the moment we happen to look - so an
+    // unplug and replug between two samples, or one device swapped for another in the same socket, reads
+    // as "no change" and the new device is never enumerated. That is exactly what left a keyboard dead
+    // after being replugged during a `ping`: the port looked occupied before and occupied after, so
+    // nothing fired, and only a SECOND physical unplug - one we happened to catch mid-gap - revived it.
+    //
+    // The latch has no such blind spot, and it is what the hardware provides the bit for. It also means
+    // correctness no longer depends on polling FAST: an event that happened while the machine was busy is
+    // still waiting to be read whenever we next get the bus. Which matters here, because the network,
+    // the storage and the keyboard all share this one bus - so the poll must yield to traffic, and a
+    // design that needed to sample often enough to catch an edge was never going to hold.
+    let event = st & (1 << 16) != 0;
+    if event {
+        // Clear it now that we have read it, or every later visit re-reports the same stale event. The
+        // arrival path clears it again inside `bring_up_hub_port`; clearing twice is harmless.
+        control_out(0x23, 0x01, C_PORT_CONNECTION, port as u16);
+        // A latched event on a port that is STILL occupied is the case levels cannot see: unplugged and
+        // replugged, or swapped for a different device, since we last looked. What we believed about it
+        // is no longer trustworthy, so forget the old device and let the arrival branch below enumerate
+        // whatever is there now. Clearing `was` ONLY in this case matters: on a port that is now EMPTY,
+        // `was` is what tells the removal branch there is something to stand down.
+        if was && now_conn {
+            stand_down_port(port);
+            was = false;
+            // Keep the RECORD in step with `was`, or the two disagree and the disagreement is silent. If
+            // the re-enumeration below fails, the record still saying "occupied" would make every later
+            // visit take the no-change early exit and the device would never be retried - the same latched
+            // failure the three-way `PortBringUp` verdict exists to prevent, re-entered through the back
+            // door. Fresh attempts too: this is a new device as far as we are concerned.
+            HUB_CONNECTED.fetch_and(!bit, Ordering::Relaxed);
+            HOTPLUG_TRIES[port as usize].store(0, Ordering::Relaxed);
+        }
+    } else if now_conn == was {
+        return false;                                           // no latch, no level change: nothing to do
+    }
     // Did this visit print anything? Any hot-plug line scrolls the shell's prompt off the screen, and the
     // shell - blocked in `console_read` - has no reason to redraw it. Tracking it here rather than only on
     // a keyboard arrival is what makes the behaviour CONSISTENT: pulling the USB stick left the operator
@@ -1771,30 +1810,38 @@ fn hotplug_check_port(port: u8) -> bool {
         HOTPLUG_TRIES[port as usize].store(0, Ordering::Relaxed);   // a replug gets a fresh set of attempts
         pl011_write(b"dwc2: hot-plug - device REMOVED from hub port "); super::timer::write_dec_pub(port as u32);
         pl011_write(b"\r\n");
-        // Forget a device that has gone, or its poll keeps addressing hardware that is not there. Only the
-        // keyboard is polled continuously, so it is the one that must be stood down; storage and the net
-        // device already fail loudly through their own paths and recover by re-enumeration.
-        // Match on the device's LOCATION (`KBD_PORT`/`MSC_PORT`), never on its split ROUTING value
-        // (`KBD_HUB_PORT`/`MSC_HUB_PORT`). Those are 0 for a high-speed device, and 0 is not a hub port,
-        // so this comparison could never be true for one - the USB stick is high-speed, so unplugging it
-        // stood NOTHING down: `MSC_READY` stayed true and block I/O kept addressing hardware that was no
-        // longer there, which is why the first `ls` after a replug failed and the second worked. The two
-        // values happened to be equal for the LOW-speed keyboard, which is why only that half looked fine.
-        if KBD_READY.load(Ordering::Relaxed) && KBD_PORT.load(Ordering::Relaxed) == port {
-            KBD_READY.store(false, Ordering::Relaxed);
-            pl011_write(b"dwc2: keyboard was on that port - input stops until it is plugged back in\r\n");
-        }
-        // Same courtesy for the storage stick, and for the same reason. Without this the operator got no
-        // statement of the CAUSE at all - just the consequence, repeated: every retry produced a refusal
-        // from the kernel, a "refused by kernel" from block-driver and a "block read failed" from fs, over
-        // and over, while nothing said the words "the stick was unplugged". Say the cause once; the layers
-        // above are then reporting something already explained (§26.7 - loud is a budget).
-        if MSC_READY.load(Ordering::Acquire) && MSC_PORT.load(Ordering::Relaxed) == port {
-            MSC_READY.store(false, Ordering::Release);
-            pl011_write(b"dwc2: USB storage was on that port - block I/O fails until it is plugged back in\r\n");
-        }
+        stand_down_port(port);
     }
     announced
+}
+
+/// Forget whatever we believed was on `port`, so nothing keeps addressing hardware that is not there any
+/// more. Called when a port empties, and when the hub's latch says the device was replaced while we were
+/// not looking - in that second case the port still reads occupied, but by something else.
+///
+/// Only the keyboard is polled continuously, so it is the one that must be stood down; storage and the net
+/// device already fail loudly through their own paths and recover by re-enumeration.
+///
+/// Match on the device's LOCATION (`KBD_PORT`/`MSC_PORT`), never on its split ROUTING value
+/// (`KBD_HUB_PORT`/`MSC_HUB_PORT`). Those are 0 for a high-speed device, and 0 is not a hub port, so this
+/// comparison could never be true for one - the USB stick is high-speed, so unplugging it stood NOTHING
+/// down: `MSC_READY` stayed true and block I/O kept addressing hardware that was no longer there, which is
+/// why the first `ls` after a replug failed and the second worked. The two values happened to be equal for
+/// the LOW-speed keyboard, which is why only that half ever looked fine.
+fn stand_down_port(port: u8) {
+    if KBD_READY.load(Ordering::Relaxed) && KBD_PORT.load(Ordering::Relaxed) == port {
+        KBD_READY.store(false, Ordering::Relaxed);
+        pl011_write(b"dwc2: keyboard was on that port - input stops until it is plugged back in\r\n");
+    }
+    // Same courtesy for the storage stick, and for the same reason. Without this the operator got no
+    // statement of the CAUSE at all - just the consequence, repeated: every retry produced a refusal
+    // from the kernel, a "refused by kernel" from block-driver and a "block read failed" from fs, over
+    // and over, while nothing said the words "the stick was unplugged". Say the cause once; the layers
+    // above are then reporting something already explained (§26.7 - loud is a budget).
+    if MSC_READY.load(Ordering::Acquire) && MSC_PORT.load(Ordering::Relaxed) == port {
+        MSC_READY.store(false, Ordering::Release);
+        pl011_write(b"dwc2: USB storage was on that port - block I/O fails until it is plugged back in\r\n");
+    }
 }
 
 /// What came of trying to bring a port's device up. Three outcomes, not two: "we have no driver for this"
