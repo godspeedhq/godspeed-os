@@ -863,6 +863,24 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         }
     }
     if len != REPLY_SENT_DIRECTLY {
+        // A FAILING reply must be able to say why. `ls` came back as "storage error" after a stick
+        // replug with nothing anywhere explaining it - no block-read failure, no re-mount, no I/O error
+        // at all - which left the operator (and me) guessing from the outside for several rounds. That is
+        // precisely the unexplained failure §26.7 exists to prevent, and the fix is not another sweep of
+        // instrumentation: it is that the layer which PRODUCED the answer states what it produced.
+        //
+        // Only on failure, so a healthy request stays silent.
+        if len == 0 || out[0] == FS_ERR {
+            ctx.log_fmt(format_args!(
+                "fs: request op {} answered {} ({} byte reply){}",
+                p.first().copied().unwrap_or(0) & 0x7F,
+                if len == 0 { "NOTHING" } else { "FS_ERR" },
+                len,
+                if errored { " - after a device I/O error" } else { " - no device I/O error was seen" }));
+        }
+        // An empty reply is not a valid answer in this protocol: the caller reads a short reply as a
+        // malformed one and reports something misleading. Never send one - say ERR properly.
+        if len == 0 { out[0] = FS_ERR; len = 1; }
         let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out[..len]));
     }
 }
