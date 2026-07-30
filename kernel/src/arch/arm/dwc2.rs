@@ -1687,6 +1687,15 @@ pub fn hotplug_poll() {
             KBD_READY.store(false, Ordering::Relaxed);
             pl011_write(b"dwc2: keyboard was on that port - input stops until it is plugged back in\r\n");
         }
+        // Same courtesy for the storage stick, and for the same reason. Without this the operator got no
+        // statement of the CAUSE at all - just the consequence, repeated: every retry produced a refusal
+        // from the kernel, a "refused by kernel" from block-driver and a "block read failed" from fs, over
+        // and over, while nothing said the words "the stick was unplugged". Say the cause once; the layers
+        // above are then reporting something already explained (§26.7 - loud is a budget).
+        if MSC_READY.load(Ordering::Acquire) && MSC_HUB_PORT.load(Ordering::Relaxed) == port {
+            MSC_READY.store(false, Ordering::Release);
+            pl011_write(b"dwc2: USB storage was on that port - block I/O fails until it is plugged back in\r\n");
+        }
     }
 
     DEV_ADDR.store(prev_addr, Ordering::Relaxed);
@@ -2207,6 +2216,9 @@ const NET_RX_ERR_MAX: u32 = 8;
 /// Frames dropped because the ring was full, and bursts abandoned on a bad device-supplied length. Silent
 /// loss is invisible loss; these make it answerable (§26.7).
 static NET_RX_DROPPED: AtomicU32 = AtomicU32::new(0);
+/// Frames handed to a caller whose buffer could not hold them. A DEFECT counter, deliberately separate
+/// from the ring-full one so ordinary backpressure on a busy link cannot drown it out.
+static NET_RX_TRUNCATED: AtomicU32 = AtomicU32::new(0);
 static NET_RX_BADLEN:  AtomicU32 = AtomicU32::new(0);
 
 const NET_RX_RING_FRAMES: usize = 32;
@@ -2236,10 +2248,15 @@ unsafe fn net_rx_ring_push(frame: &[u8]) {
     if r.count == NET_RX_RING_FRAMES {
         r.head = (r.head + 1) % NET_RX_RING_FRAMES;
         r.count -= 1;
-        let d = NET_RX_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
-        if d == 1 || d % 256 == 0 {                             // loud, but rate-limited (§26.7)
-            pl011_write(b"dwc2: net RX ring full - dropped "); super::timer::write_dec_pub(d);
-            pl011_write(b" frame(s) (consumer too slow)\r\n");
+        // Counted always; SAID ONCE. A full ring is not a fault - it is the backpressure this driver now
+        // applies deliberately (the ISR stops re-arming and the tick brings RX back), and on a busy LAN it
+        // is simply what a link busier than its reader looks like. This file already learned the cost of
+        // reporting normal flow control as a fault: the storage BUSY hand-back "printed 564 lines in ONE
+        // selfcheck ... loud is a budget, and spending it on the expected case is how a real line gets
+        // ignored". One line establishes the fact; the counter keeps the magnitude for anyone who asks.
+        if NET_RX_DROPPED.fetch_add(1, Ordering::Relaxed) == 0 {
+            pl011_write(b"dwc2: net RX ring full - dropping the oldest frame (normal backpressure on a \
+                          busy link; counted from here, not repeated)\r\n");
         }
     }
     r.frames[r.tail][..n].copy_from_slice(&frame[..n]);
