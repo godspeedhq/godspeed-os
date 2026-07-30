@@ -760,27 +760,51 @@ pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 /// fires. Every PM write is gated by the `0x5A` password. (The prior stub just spun, so `reboot` hung.)
 pub fn hardware_reset() -> ! {
     const PM_RSTC: usize = PERIPHERAL_BASE + 0x10_001c;
+    const PM_RSTS: usize = PERIPHERAL_BASE + 0x10_0020;
     const PM_WDOG: usize = PERIPHERAL_BASE + 0x10_0024;
     const PM_PASSWORD: u32 = 0x5A00_0000;
     const PM_RSTC_WRCFG_FULL_RESET: u32 = 0x0000_0020;
     const PM_RSTC_WRCFG_CLR: u32 = 0xffff_ffcf; // clear the WRCFG field before setting FULL_RESET
-    // SAFETY: PM_WDOG/PM_RSTC are the BCM2835 power-management registers, in the already-Device-mapped
-    // peripheral window; volatile 32-bit writes gated by the 0x5A password - the documented reset poke.
+    // The BOOT PARTITION the firmware reads out of PM_RSTS after the watchdog fires, encoded across the
+    // scattered bits of `0xfffffaaa`. Clearing them selects partition 0 - the normal boot. This step was
+    // MISSING, and its absence matches the symptom exactly: the SoC did reset, the firmware then read a
+    // partition it could not boot, and the board sat dark until it was power-cycled by hand - which reads
+    // as "reboot does nothing". Every bare-metal Pi reset does this; Linux gets away without it only
+    // because its own power-off path is what would have set the field.
+    const PM_RSTS_PARTITION: u32 = 0xffff_faaa;
+    // SAFETY: PM_RSTS/PM_WDOG/PM_RSTC are the BCM2835 power-management registers, in the already
+    // Device-mapped peripheral window; volatile 32-bit writes gated by the 0x5A password - the documented
+    // reset poke.
     unsafe {
         let rstc = PM_RSTC as *mut u32;
+        let rsts = PM_RSTS as *mut u32;
         let wdog = PM_WDOG as *mut u32;
+        // Boot partition 0 on the way back up.
+        let rsts_val = PM_PASSWORD | (rsts.read_volatile() & !PM_RSTS_PARTITION);
+        rsts.write_volatile(rsts_val);
         let rstc_val = PM_PASSWORD | (rstc.read_volatile() & PM_RSTC_WRCFG_CLR) | PM_RSTC_WRCFG_FULL_RESET;
         // The watchdog resets the SoC in ~10 ticks. RE-ISSUE the poke every iteration so a write that did
         // not take (a briefly-unready PM block) is retried, rather than a bare spin waiting forever on one
-        // failed poke (kernel-audit Audit 6, N1). ARM/BCM2835 has no second reset method; this never
-        // returns (the SoC resets out from under it).
+        // failed poke (kernel-audit Audit 6, N1).
+        //
+        // BOUNDED, because "this never returns" is an assumption about hardware and assumptions are what
+        // invariant 12 exists for. If the SoC has not reset after a generous window, the reset did NOT
+        // work, and the operator staring at `rebooting...` deserves to be told that rather than left to
+        // guess whether to wait or pull the plug. Then keep poking - a late reset is still a reset.
+        let mut n: u32 = 0;
         loop {
             wdog.write_volatile(PM_PASSWORD | 10);
             rstc.write_volatile(rstc_val);
+            n = n.saturating_add(1);
+            if n == 2_000_000 {
+                serial_write_bytes_lockfree(b"\r\nreset: the SoC did NOT reset - the watchdog poke had no effect.\r\n");
+                serial_write_bytes_lockfree(b"reset: power-cycle the board. (still poking in case it takes late)\r\n");
+            }
             core::hint::spin_loop();
         }
     }
 }
+
 
 /// The SD/EMMC controller's base clock in Hz, read from the VideoCore mailbox at boot (0 = the GPU
 /// never reported one). Exposed to `block-driver` through InspectKernel query 20 because the Arasan's
