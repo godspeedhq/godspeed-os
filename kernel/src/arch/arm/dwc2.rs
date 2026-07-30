@@ -1662,6 +1662,15 @@ pub fn hotplug_poll() {
         // one session; the SDK's #[must_use] gate does not reach an in-kernel bool.
         if bring_up_hub_port(port, addr) {
             HUB_CONNECTED.fetch_or(bit, Ordering::Relaxed);
+            // A keyboard came back: give the user a PROMPT. The shell is blocked in `console_read` and has
+            // no reason to redraw, so after the hot-plug lines scroll past there is nothing on screen but
+            // kernel output - the keyboard works, and looks like it does not, which is its own kind of
+            // silent failure (invariant 12 is about what the OPERATOR can see). Pushing one newline makes
+            // the shell complete an empty line and print a fresh `gsh>`, which is exactly the "I am ready"
+            // signal a person is looking for. Harmless: an empty command runs nothing.
+            if KBD_READY.load(Ordering::Relaxed) && KBD_HUB_PORT.load(Ordering::Relaxed) == port {
+                super::console_push_byte(b'\n');
+            }
         } else {
             pl011_write(b"dwc2: hot-plug - enumeration FAILED on hub port ");
             super::timer::write_dec_pub(port as u32);
