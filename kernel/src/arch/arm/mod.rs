@@ -823,6 +823,10 @@ pub fn usb_disk_flush() -> bool { dwc2::msc_sync_cache() }
 /// Did the last USB-disk transfer fail only because the device was BUSY (NAK)? Then it is not a
 /// failure at all - the caller should re-ask, with interrupts enabled in between.
 pub fn usb_disk_busy() -> bool { dwc2::msc_last_was_busy() }
+/// Is there no USB disk attached at all? Answered from PRESENT state (`MSC_READY`), not from the last
+/// transfer's outcome - which is exactly why it is a separate question. See `USB_DISK_ABSENT` in the
+/// syscall dispatch for what conflating the two cost.
+pub fn usb_disk_absent() -> bool { !dwc2::msc_ready() }
 
 /// A hardware-random u32 from the BCM2835 SoC RNG, or None if it never produced (absent/wedged - loud, not
 /// a fallback). Ungated (InspectKernel query 19); the `random` shell utility consumes it. Best-effort under

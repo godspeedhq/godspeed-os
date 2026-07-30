@@ -304,6 +304,10 @@ pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
 pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
 pub fn usb_disk_flush() -> bool { false }
 pub fn usb_disk_busy() -> bool { false }
+/// Is there no USB disk attached at all? Distinct from busy - see `USB_DISK_ABSENT` in the syscall
+/// dispatch. This arch has no USB-disk backend, so a request never reaches one and the question is
+/// moot; the read/write primitives already answer false.
+pub fn usb_disk_absent() -> bool { true }
 
 
 // No GPIO on this arch (the ARM `gpio` shell command is Pi-only).

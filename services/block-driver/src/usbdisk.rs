@@ -23,7 +23,7 @@
 //! hold the core waiting and then answers `-2` (busy) rather than `-1` (failed), and the waiting happens
 //! HERE, between yields, where interrupts are on and every other task still runs.
 
-use godspeed_sdk::{Message, ServiceContext, USB_DISK_BUSY};
+use godspeed_sdk::{Message, ServiceContext, USB_DISK_BUSY, USB_DISK_ABSENT};
 
 /// Re-ask while the device says BUSY, yielding in between.
 ///
@@ -60,6 +60,21 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
             // missing its USB_DISK cap lands here and gets retried 6000 times before being reported
             // as a device that "stayed busy" - an authority failure wearing an I/O failure's name.
             USB_DISK_BUSY => { ctx.yield_cpu(); }   // hand the CPU on, ask again - expected, silent
+            // NOTHING THERE. Not the same as busy, and the difference is the whole point of the code:
+            // waiting is only ever right when the device is present and asking for time. Against an
+            // empty socket the retry budget bought nothing and cost everything - ~30 s per block, every
+            // block of every request, while the kernel logged the refusal and the operator watched a
+            // shell that looked hung. One `ls` with the stick out produced over 20,000 refusals.
+            //
+            // Only a hot-plug can change this answer, and that is not something a loop can wait for, so
+            // fail immediately and let the caller decide. `fs` already knows how to come back: it
+            // re-mounts on a later request once the device returns.
+            USB_DISK_ABSENT => {
+                ctx.log_fmt(format_args!(
+                    "block-driver: {} lba {} - no USB disk attached (unplugged?); not retrying until one is",
+                    what, lba));
+                return false;
+            }
             // The CODE is the diagnosis, so it is printed rather than folded into a bare failure. A
             // hardware run showed `fs` reporting I/O errors while the kernel's transport log said
             // nothing - the failure was a silent refusal, and this reply was the one place that saw

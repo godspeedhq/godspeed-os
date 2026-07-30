@@ -622,6 +622,11 @@ pub fn last_hcint() -> u32 { LAST_HCINT.load(Ordering::Relaxed) }
 /// caller re-asks; nothing is wrong.
 pub fn msc_last_was_busy() -> bool { LAST_FAIL.load(Ordering::Relaxed) == FAIL_NAK_TIMEOUT }
 
+/// Is a mass-storage device currently up? The PRESENT-tense fact, as opposed to `msc_last_was_busy`'s
+/// record of the last transfer. A caller deciding whether to retry needs this one: re-asking a device
+/// that is not there cannot succeed until it is plugged back in.
+pub fn msc_ready() -> bool { MSC_READY.load(Ordering::Acquire) }
+
 /// One word for why the last transfer failed (see `LAST_FAIL`).
 fn last_fail_str() -> &'static str {
     match LAST_FAIL.load(Ordering::Relaxed) {

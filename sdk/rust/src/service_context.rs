@@ -400,6 +400,13 @@ pub struct ServiceContext {
 /// I/O failure's name.
 pub const USB_DISK_BUSY: i64 = -20;
 
+/// No USB disk is attached - the opposite instruction to [`USB_DISK_BUSY`], and it must stay in step with
+/// the kernel's `USB_DISK_ABSENT`. BUSY means "come back, I am working"; ABSENT means "there is nothing
+/// here, and asking again cannot change that - only a hot-plug can". A caller that retries on this waits
+/// out its entire budget against an empty socket and then reports the device as busy, which is a false
+/// statement about hardware sitting on the operator's desk.
+pub const USB_DISK_ABSENT: i64 = -21;
+
 /// Can this LBA survive the syscall ABI intact?
 ///
 /// The ARM ABI gives each syscall argument exactly ONE 32-bit register (`arch/arm/CLAUDE.md`, hazard

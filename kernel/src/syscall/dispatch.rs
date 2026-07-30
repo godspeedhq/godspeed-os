@@ -1909,6 +1909,22 @@ fn handle_usb_disk_info() -> i64 {
 /// cap wired - exactly the case a kill-storm produces.
 const USB_DISK_BUSY: i64 = -20;
 
+/// No device is attached at all - as opposed to one that is present and asking us to wait.
+///
+/// These are opposite instructions to the caller and were being answered with the same word. BUSY means
+/// "come back, I am working"; ABSENT means "there is nothing here, and re-asking cannot change that -
+/// only a hot-plug can". Conflated, `block-driver` did the right thing with the wrong fact: it waited out
+/// its full 6000-attempt, ~30-second budget against a socket the operator had emptied, for every block of
+/// every request, and then reported "the device stayed busy, it did not fail" - a statement that was not
+/// true of a stick sitting on the desk.
+///
+/// The conflation was structural, not a missing branch. `usb_disk_busy()` reads `LAST_FAIL`, which
+/// records the last TRANSFER's outcome - and a refusal short-circuits before any transfer, so it left
+/// whatever the previous one wrote. A stick pulled mid-command leaves a NAK there, so "absent" inherited
+/// "busy" from the transfer that was in flight when it was pulled. The state was stale rather than wrong,
+/// which is why it read as plausible (§26.4 - a derived value must reduce to a current truth).
+const USB_DISK_ABSENT: i64 = -21;
+
 /// UsbDiskRead (47): read the 512-byte block at `arg0` (LBA) into the user buffer at `arg1`.
 /// Gated by USB_DISK. Returns 0 on success, `USB_DISK_BUSY` if the device NAKed (re-ask), -1 on a real
 /// failure (no device, LBA past the end, I/O error).
@@ -1920,6 +1936,9 @@ fn handle_usb_disk_read(lba: u64, ptr: u64) -> i64 {
     // -2 = BUSY (the device NAKed; nothing is wrong, re-ask). Distinct from -1 = failed, because the
     // two need opposite responses and collapsing them is what turned a busy stick into a "broken" one.
     if !crate::arch::imp::usb_disk_read(lba, &mut buf) {
+        // ABSENT first: it is the stronger fact. `usb_disk_busy` reads the last TRANSFER's outcome, which
+        // a refusal never updates, so asking it about a device that is not there answers from stale state.
+        if crate::arch::imp::usb_disk_absent() { return USB_DISK_ABSENT; }
         return if crate::arch::imp::usb_disk_busy() { USB_DISK_BUSY } else { -1 };
     }
     if !write_user_bytes(ptr, &buf) { return -1; }
@@ -1934,6 +1953,7 @@ fn handle_usb_disk_write(lba: u64, ptr: u64) -> i64 {
     }
     let src = match read_user_bytes(ptr, USB_DISK_BLOCK) { Some(b) => b, None => return -1 };
     if crate::arch::imp::usb_disk_write(lba, src) { 0 }
+    else if crate::arch::imp::usb_disk_absent() { USB_DISK_ABSENT }  // nothing there; re-asking cannot help
     else if crate::arch::imp::usb_disk_busy() { USB_DISK_BUSY }   // re-ask, do not treat as a failure
     else { -1 }
 }
