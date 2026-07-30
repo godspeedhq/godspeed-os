@@ -1687,35 +1687,75 @@ pub fn hotplug_poll() {
     }
     HOTPLUG_LAST_US.store(now.max(1), Ordering::Relaxed);
 
-    // Round-robin one port, so every port is visited within nports intervals.
-    let port = {
-        let p = HOTPLUG_PORT.load(Ordering::Relaxed).max(1);
-        let next = if p >= nports { 1 } else { p + 1 };
-        HOTPLUG_PORT.store(next, Ordering::Relaxed);
-        p.min(nports)
-    };
-    if port > 31 { return; }                                        // the presence mask is 32 bits
-
     // Save the shared device selection and put it back afterwards: the keyboard poll and the storage path
     // both read DEV_ADDR/MPS0/LOW_SPEED/SPLIT_PORT, and leaving them pointing at the hub would misdirect
     // whichever runs next (the same trap `net_link_up` had to fix).
     let (prev_addr, prev_mps, prev_low, prev_split) = (
         DEV_ADDR.load(Ordering::Relaxed), MPS0.load(Ordering::Relaxed),
         LOW_SPEED.load(Ordering::Relaxed), SPLIT_PORT.load(Ordering::Relaxed));
-    select_device(1, HUB_EP0_MPS.load(Ordering::Relaxed), false);   // the hub's own control endpoint
 
+    // CATCH UP after a starved stretch: sweep EVERY port, not just the next one in the rotation.
+    //
+    // One port per second is the right steady-state cadence, but it is the wrong way to come back from a
+    // gap. A device replugged while the machine was busy is only noticed when the rotation reaches its
+    // port - up to `nports` further seconds of idle - and any command in that window stops the rotation
+    // again. That is how a keyboard replugged during a `ping` stayed dead: the first idle moment after
+    // the ping visited one port (not the keyboard's), the operator typed `ls`, and the machine was busy
+    // for another two minutes. Nothing was broken; the recovery was just slower than the next command.
+    //
+    // So the first visit after a gap looks at all of them. It is bounded - `nports` (<= 31, five here)
+    // control transfers, plus enumeration for any port that actually changed - and it happens only
+    // after a gap, so the steady state is untouched.
+    let sweep_all = last != 0 && now.wrapping_sub(last) > HP_STARVED_US;
+    let mut announced = false;
+    if sweep_all {
+        for port in 1..=nports.min(31) {
+            // Re-select the hub's own control endpoint before EVERY port: a previous port's enumeration
+            // left the selection pointing at the device it brought up, so the next hub request would go
+            // to the wrong address. The boot walk does exactly this for the same reason.
+            select_device(1, HUB_EP0_MPS.load(Ordering::Relaxed), false);
+            announced |= hotplug_check_port(port);
+        }
+    } else {
+        // Round-robin one port, so every port is visited within nports intervals.
+        let port = {
+            let p = HOTPLUG_PORT.load(Ordering::Relaxed).max(1);
+            let next = if p >= nports { 1 } else { p + 1 };
+            HOTPLUG_PORT.store(next, Ordering::Relaxed);
+            p.min(nports)
+        };
+        if port <= 31 {                                             // the presence mask is 32 bits
+            select_device(1, HUB_EP0_MPS.load(Ordering::Relaxed), false);
+            announced = hotplug_check_port(port);
+        }
+    }
+
+    // Give the operator a PROMPT back. Every branch above prints, which scrolls `gsh>` away, and the shell
+    // is blocked in `console_read` with no reason to redraw - so a working machine presents as a dead one
+    // (invariant 12 is about what the OPERATOR can see). One newline makes the shell finish an empty line
+    // and print a fresh prompt; an empty command runs nothing. Applies to REMOVAL too, including the
+    // keyboard's: the shell genuinely is ready, and the line above already says which input device is not.
+    // This grants no authority that was not already present - a keyboard driver can synthesize keystrokes
+    // by definition (the SEC-2 residual, CLAUDE.md §6.4), which is exactly why it may synthesize the one
+    // that says "you may type now".
+    if announced { super::console_push_byte(b'\n'); }
+
+    DEV_ADDR.store(prev_addr, Ordering::Relaxed);
+    MPS0.store(prev_mps, Ordering::Relaxed);
+    LOW_SPEED.store(prev_low, Ordering::Relaxed);
+    SPLIT_PORT.store(prev_split, Ordering::Relaxed);
+}
+
+/// Look at ONE hub port and act on any change since last time. Returns whether it printed anything (the
+/// caller then repaints the shell prompt). Assumes the hub's own control endpoint is already selected and
+/// that the caller restores the shared device selection afterwards.
+fn hotplug_check_port(port: u8) -> bool {
     let st = hub_get_port_status(port);
     // A status of ZERO means the REQUEST failed, not that the port is empty: a genuinely empty port still
     // reports its power bit (boot logs an idle port as 0x0100). Treating a failed query as "device gone"
     // would stand the keyboard down on any transient transport wobble - inventing a disconnect from an
     // absence of information, which is the mistake this branch has already paid for twice.
-    if st == 0 {
-        DEV_ADDR.store(prev_addr, Ordering::Relaxed);
-        MPS0.store(prev_mps, Ordering::Relaxed);
-        LOW_SPEED.store(prev_low, Ordering::Relaxed);
-        SPLIT_PORT.store(prev_split, Ordering::Relaxed);
-        return;
-    }
+    if st == 0 { return false; }
     let bit = 1u32 << (port - 1);
     let was = HUB_CONNECTED.load(Ordering::Relaxed) & bit != 0;
     let now_conn = st & 1 != 0;
@@ -1792,21 +1832,7 @@ pub fn hotplug_poll() {
             pl011_write(b"dwc2: USB storage was on that port - block I/O fails until it is plugged back in\r\n");
         }
     }
-
-    // Give the operator a PROMPT back. Every branch above prints, which scrolls `gsh>` away, and the shell
-    // is blocked in `console_read` with no reason to redraw - so a working machine presents as a dead one
-    // (invariant 12 is about what the OPERATOR can see). One newline makes the shell finish an empty line
-    // and print a fresh prompt; an empty command runs nothing. Applies to REMOVAL too, including the
-    // keyboard's: the shell genuinely is ready, and the line above already says which input device is not.
-    // This grants no authority that was not already present - a keyboard driver can synthesize keystrokes
-    // by definition (the SEC-2 residual, CLAUDE.md §6.4), which is exactly why it may synthesize the one
-    // that says "you may type now".
-    if announced { super::console_push_byte(b'\n'); }
-
-    DEV_ADDR.store(prev_addr, Ordering::Relaxed);
-    MPS0.store(prev_mps, Ordering::Relaxed);
-    LOW_SPEED.store(prev_low, Ordering::Relaxed);
-    SPLIT_PORT.store(prev_split, Ordering::Relaxed);
+    announced
 }
 
 /// What came of trying to bring a port's device up. Three outcomes, not two: "we have no driver for this"
