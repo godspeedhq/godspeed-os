@@ -125,6 +125,9 @@ static L2_OWNER: [AtomicU32; L2_TABLES] = [const { AtomicU32::new(0) }; L2_TABLE
 
 /// First-alias-only latch for the reclaim dedup log (aliasing is expected + handled, so log once).
 static RECLAIM_ALIAS_LOGGED: AtomicBool = AtomicBool::new(false);
+/// Has a device-MMIO skip been reported? Said once: it is the CORRECT outcome for every driver death, so
+/// it is a fact worth stating rather than an event worth repeating (§26.7 - loud is a budget).
+static RECLAIM_DEVICE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Map an L2 physical base to its arena slot index (the arena is a contiguous static array of 1 KiB
 /// tables). `None` for an address outside the arena (e.g. a kernel L2 not from this arena).
@@ -656,6 +659,33 @@ pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
                 let e = l2.add(j).read_volatile();
                 if e & 0b11 == 0 { continue; }                    // invalid entry
                 if (e >> 4) & 0b11 >= 0b10 {                      // PL0 has access => USER page => ours
+                    // ...but PL0 access does NOT mean "allocator RAM". A driver service maps its
+                    // peripheral's registers into its own address space (§12), and that mapping is a
+                    // user page too - so this walk was handing a device MMIO frame to `free_frame` on
+                    // every driver death. On the Pi 2 that is physical 0x3F300000 (the EMMC block inside
+                    // the 0x3F000000 peripheral window), and a chaos run produced it 141 times.
+                    //
+                    // It is contained today only by a bounds check DOWNSTREAM: the frame index lands
+                    // above usable RAM, so the allocator rejects it as a phantom and logs a no-op. That
+                    // is luck about where this SoC puts its peripherals. A device whose registers sit
+                    // BELOW the top of RAM would pass the bounds check, enter the free pool, and be
+                    // handed to a service as ordinary memory - which is a driver's registers becoming
+                    // someone's heap, and then a double-free on the next kill.
+                    //
+                    // The mapping already says what it is, so ask it rather than infer from the address:
+                    // Device memory is encoded TEX=0b000 + C=0 by `l2_small_page`, normal service RAM as
+                    // TEX=0b001 + C=1. x86's reclaim has skipped its equivalent (PCD|PWT) since the
+                    // chaos double-free was found there; this is the same rule, which the ARM port
+                    // simply never carried over.
+                    let is_device = (e >> 6) & 0b111 == 0 && e & (1 << 3) == 0;
+                    if is_device {
+                        if !RECLAIM_DEVICE_LOGGED.swap(true, Ordering::Relaxed) {
+                            crate::kprintln!(
+                                "reclaim: skipped device MMIO pa={:#010x} (not allocator RAM; further skips silent)",
+                                e & 0xFFFF_F000);
+                        }
+                        continue;
+                    }
                     let pa = e & 0xFFFF_F000;
                     let mut dup = false;
                     for k in 0..nseen { if seen[k] == pa { dup = true; break; } }
