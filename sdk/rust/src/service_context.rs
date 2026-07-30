@@ -371,6 +371,21 @@ fn cache_send_slot(name: &str, new_slot: u32) {
     }
 }
 
+/// How long each wait helper BLOCKS on its endpoint before surfacing to re-check the console and the
+/// deadline, in TSC cycles (~30 ms at 2 GHz; a platform whose cycle conversion is a stub degrades this to
+/// one scheduler quantum, which is the same order and equally fine).
+///
+/// The number is not the point - blocking at all is. These loops used `try_recv` + `yield_cpu`, which
+/// leaves the task permanently RUNNABLE: the core never reaches the scheduler's idle path, so it burns
+/// 100% on a task that is doing nothing, and any work the kernel does from that idle path does not happen
+/// while a command waits. On ARM that work is the USB hot-plug watch, so plugging or unplugging a device
+/// during a `ping` went unnoticed until the ping ended.
+///
+/// The interval is a trade between how promptly `q` is noticed and how often the core wakes. Tens of
+/// milliseconds sits under human perception in one direction and well above scheduler overhead in the
+/// other, which is why the `observe` and muted loops already settled on the same figure.
+const ABORTABLE_POLL_CYCLES: u64 = 60_000_000;
+
 /// Passed by the kernel to `service_main`. Non-Copy; one per service instance.
 pub struct ServiceContext {
     _private: (),
@@ -682,7 +697,8 @@ impl ServiceContext {
         // T630) would otherwise make `now - t0` read huge and expire the deadline instantly.
         let t0 = self.epoch_secs_monotonic();
         loop {
-            if let Some(r) = self.try_recv() { return DeadlineOutcome::Reply(r); }
+            // Block, do not spin - see `request_with_reply_abortable` for why this matters beyond power.
+            if let Some(r) = self.recv_timeout(ABORTABLE_POLL_CYCLES) { return DeadlineOutcome::Reply(r); }
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 self.remove_cap(reply_cap);   // reply never consumed - reclaim its slot
                 // CALLER BEWARE: the request was already SENT, so the peer will reply into our endpoint
@@ -727,18 +743,30 @@ impl ServiceContext {
         }
         let t0 = self.epoch_secs_monotonic();
         loop {
-            if let Some(r) = self.try_recv() { self.remove_cap(reply_cap); return ReqOutcome::Reply(r); }
+            // BLOCK for the reply, with a short timeout - do not spin. `try_recv` + `yield_cpu` kept this
+            // task permanently RUNNABLE, so a core running a waiting command never reached the scheduler's
+            // idle path at all. On ARM that path is where USB hot-plug is watched, so plugging or
+            // unplugging anything during a `ping` was noticed only once the ping ended: the events queued
+            // up and all arrived at the prompt. It also pegged the core at 100% for a task that is, in
+            // truth, doing nothing (the same busy-wait the `observe` and muted loops were already fixed
+            // for - see MUTED_POLL_SLEEP_CYCLES). Blocking parks the task, the core halts, idle work runs.
+            if let Some(r) = self.recv_timeout(ABORTABLE_POLL_CYCLES) {
+                self.remove_cap(reply_cap);
+                return ReqOutcome::Reply(r);
+            }
             while let Some(b) = self.try_console_read() {
                 // q/Q/ESC aborts IMMEDIATELY - never wait for the in-flight reply (that wait was the
                 // "it pauses instead of quitting" complaint). The peer's late reply lands in our endpoint
                 // and the drain atop the NEXT abortable request clears it, so it pollutes nothing.
+                // "Immediately" still holds: the abort does not wait on the peer. What the block adds is
+                // up to one poll interval before the keypress is LOOKED at - tens of milliseconds, under
+                // the threshold at which a person can tell, and the same trade the observe loop makes.
                 if b == b'q' || b == b'Q' || b == 0x1b { self.remove_cap(reply_cap); return ReqOutcome::Aborted; }
             }
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 self.remove_cap(reply_cap);
                 return ReqOutcome::Timeout;
             }
-            self.yield_cpu();
         }
     }
 
@@ -769,7 +797,13 @@ impl ServiceContext {
         let t0 = self.epoch_secs_monotonic();
         let mut on_linger = Some(on_linger);   // FnOnce, fired at most once when the wait lingers
         loop {
-            if let Some(r) = self.try_recv() { self.remove_cap(reply_cap); return ReqOutcome::Reply(r); }
+            // Block, do not spin - see `request_with_reply_abortable`. This is the variant `net`/`ping`
+            // actually use (the "press q to abort" hint), so it is the one that kept core 0 permanently
+            // busy during a continuous ping and starved the idle-path USB hot-plug watch.
+            if let Some(r) = self.recv_timeout(ABORTABLE_POLL_CYCLES) {
+                self.remove_cap(reply_cap);
+                return ReqOutcome::Reply(r);
+            }
             while let Some(b) = self.try_console_read() {
                 if b == b'q' || b == b'Q' || b == 0x1b { self.remove_cap(reply_cap); return ReqOutcome::Aborted; }
             }
@@ -801,14 +835,14 @@ impl ServiceContext {
     pub fn recv_abortable_deadline(&self, max_secs: i64) -> ReqOutcome {
         let t0 = self.epoch_secs_monotonic();
         loop {
-            if let Some(r) = self.try_recv() { return ReqOutcome::Reply(r); }
+            // Block, do not spin - see `request_with_reply_abortable`.
+            if let Some(r) = self.recv_timeout(ABORTABLE_POLL_CYCLES) { return ReqOutcome::Reply(r); }
             while let Some(b) = self.try_console_read() {
                 if b == b'q' || b == b'Q' || b == 0x1b { return ReqOutcome::Aborted; }
             }
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 return ReqOutcome::Timeout;
             }
-            self.yield_cpu();
         }
     }
 
