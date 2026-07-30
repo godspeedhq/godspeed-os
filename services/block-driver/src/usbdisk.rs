@@ -52,14 +52,52 @@ use godspeed_sdk::{Message, ServiceContext, USB_DISK_BUSY, USB_DISK_ABSENT};
 /// Cost when it does happen: this task yields between attempts, so the wait costs nothing but its own
 /// latency - interrupts stay on, the timer runs, every other service runs.
 const BUSY_RETRIES: u32 = 6_000;
+/// Seconds a single request may be re-asked before the operator is told it is still going.
+///
+/// A healthy request is sub-millisecond, so crossing this means the device really is holding us off.
+/// Short enough to land well before anyone starts wondering, long enough that ordinary slow writes on
+/// this stick stay silent.
+const SLOW_ANNOUNCE_SECS: i64 = 2;
+
 fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMut() -> i64) -> bool {
+    // WAITING MUST BE VISIBLE. Every layer here is behaving correctly when a stick goes slow - the
+    // driver waits out one command rather than re-issuing it (which wedges this device), and the retry
+    // budget bounds that at ~30 s. But it says NOTHING while it happens, and the whole machine has
+    // nothing else to report either, so a correct 30-second wait is indistinguishable from a dead board.
+    // That cost three chaos runs: the operator reached for the power switch, twice cut a healthy machine
+    // mid-recovery, and the third time only waited because the second had taught them to.
+    //
+    // A bounded wait that cannot say it is waiting is a silent one (§26.7). Two lines - one when it
+    // becomes slow, one when it resolves - turn "the Pi has hung" into "the stick is busy, it is
+    // working on it". No behaviour changes; only the silence does.
+    let t0 = ctx.epoch_secs_monotonic();
+    let mut announced = false;
     for n in 0..BUSY_RETRIES {
         match op() {
-            0 => return true,
+            0 => {
+                // Only speak on the way out if we spoke on the way in - a normal request stays silent,
+                // and a slow one is closed out rather than left hanging with no resolution.
+                if announced {
+                    ctx.log_fmt(format_args!(
+                        "block-driver: {} lba {} completed after {}s - the device was busy, not broken",
+                        what, lba, ctx.epoch_secs_monotonic() - t0));
+                }
+                return true;
+            }
             // Named, not a literal: BUSY must stay outside the capability-error range, or a driver
             // missing its USB_DISK cap lands here and gets retried 6000 times before being reported
             // as a device that "stayed busy" - an authority failure wearing an I/O failure's name.
-            USB_DISK_BUSY => { ctx.yield_cpu(); }   // hand the CPU on, ask again - expected, silent
+            USB_DISK_BUSY => {
+                // Expected and silent - until it has gone on long enough that silence is itself
+                // misleading. Said ONCE per request, not per attempt.
+                if !announced && ctx.epoch_secs_monotonic() - t0 >= SLOW_ANNOUNCE_SECS {
+                    announced = true;
+                    ctx.log_fmt(format_args!(
+                        "block-driver: {} lba {} - device busy for {}s and still working; waiting (this is not a hang)",
+                        what, lba, SLOW_ANNOUNCE_SECS));
+                }
+                ctx.yield_cpu();   // hand the CPU on, ask again
+            }
             // NOTHING THERE. Not the same as busy, and the difference is the whole point of the code:
             // waiting is only ever right when the device is present and asking for time. Against an
             // empty socket the retry budget bought nothing and cost everything - ~30 s per block, every

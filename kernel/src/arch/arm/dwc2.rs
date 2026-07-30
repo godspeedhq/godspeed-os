@@ -556,8 +556,14 @@ fn nak_budget_us() -> u32 {
 /// steady-state `CORE_HOLD_US` because the alternative - abandon after 5 ms and let userspace re-issue
 /// the whole command - WEDGES a slow stick: it is still busy with the transfer we walked away from, so
 /// the re-issued command NAKs too, forever. A slow SanDisk needs its READ(10)/WRITE(10) waited on, not
-/// re-issued; this lets ONE command finish. It is IRQs-masked core-hold, so it is a backstop, not a
-/// target - a healthy device is in and out in well under a millisecond.
+/// re-issued; this lets ONE command finish. A backstop, not a target - a healthy device is in and out in
+/// well under a millisecond.
+///
+/// On the ASYNC path (all runtime block I/O) this is the PARK timeout, not a core-hold: the task is
+/// blocked and the core runs everything else meanwhile. It is only an IRQs-masked hold on the spin
+/// fallback, which runtime storage no longer takes. Together with `BUSY_RETRIES` upstream it sets the
+/// ~30 s ceiling a chaos pause hits - the system waiting correctly on a slow stick, which is why
+/// `with_busy_retry` now SAYS it is waiting rather than leaving the machine looking dead.
 const IO_BUDGET_US: u32 = 500_000;
 
 /// Is CH_BULK claimed for a multi-transfer command right now? Storage's BOT commands and the PHY link
@@ -939,7 +945,13 @@ fn chan_dma(ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, ep: u32, e
     // INTERRUPT-DRIVEN direct path (async block I/O, stage 2): arm the channel, park the calling task,
     // and let the channel-halt ISR re-arm on NAK / wake on completion - so the core is free (the keyboard
     // tick, other tasks) instead of spinning IRQs-masked. Only the runtime storage path passes
-    // can_block=true; boot enumeration (no task to park) and, until stage 2b, writes keep the spin path.
+    // can_block=true; boot enumeration keeps the spin path because there is no task to park.
+    //
+    // Reads AND writes both park (stage 2b landed - see `msc_write_block`, which passes `true`). This
+    // said "until stage 2b, writes keep the spin path" long after that stopped being true, and the drift
+    // cost a real detour: a 30 s pause under chaos was diagnosed from this comment as writes spinning
+    // with the core held, when the core was never held at all. A stale comment about a FINISHED stage is
+    // worse than none - it reads as current and is believed (§26.4).
     if can_block {
         return chan_dma_async(ch, dir_in, pid, len, buf_phys, ep, ep_type);
     }
