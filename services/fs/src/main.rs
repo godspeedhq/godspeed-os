@@ -113,6 +113,13 @@ const ITYPE_FILE_FRAG: u8 = 3; // fragmented file: first_block → extent block,
 // of these via WRITE_NEW/WRITE_AT/READ_AT). 7×508 + a few header bytes ≤ MAX_PAYLOAD (4096).
 // The shell's IO_CHUNK must equal this.
 const MAX_FILE_BYTES: usize = 7 * DATA_PAYLOAD; // 3556 - streaming chunk size (7 data blocks)
+/// Upper bound on a buffered reply (see `serve`). One IPC message is 4 KiB (CLAUDE.md §8.5), and the
+/// largest reply is a streaming read: a 5-byte header plus `MAX_FILE_BYTES`. Sized to the message limit
+/// so buffering can never truncate an answer that a direct send would have carried.
+const SERVE_REPLY_MAX: usize = 4096;
+/// `out_len` sentinel meaning "this arm already sent its own reply, do not send another" - used by the
+/// one arm (`OP_OPEN`) whose reply carries a capability and therefore cannot be buffered as bytes.
+const REPLY_SENT_DIRECTLY: usize = usize::MAX;
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/block-driver`.
 const OP_READ_BLOCK: u8 = 1;
@@ -811,8 +818,68 @@ fn data_journal_test(ctx: &ServiceContext, fs: &mut Fs) {
 }
 
 /// Dispatch one request and reply through the client's `reply` cap.
+/// Is this opcode safe to run TWICE? Only a request that changes nothing may be retried after a device
+/// I/O error: a retried read returns the same answer, a retried write could apply the same change twice.
+/// The failing operation is the one worth rescuing (it is what the operator just typed), but not at the
+/// price of guessing about a mutation whose first attempt may have partly landed. A write that fails
+/// still reports the failure and the caller decides - which is the honest split (§26.7).
+fn op_is_read_only(op: u8) -> bool {
+    matches!(op & 0x7F,
+        OP_READ_FILE | OP_STAT_FILE | OP_LIST_DIR | OP_READ_AT | OP_DRIVES_INFO | OP_SCRUB)
+}
+
+/// Serve one request, retrying ONCE through a fresh mount if the attempt hit a device I/O error.
+///
+/// `fs` already re-mounts when it has seen an I/O error - but it did so at the TOP of the serve loop,
+/// which means the request that DISCOVERS the error is always the one that fails, and only the next one
+/// benefits. That is exactly the "I have to run `ls` twice" the operator hit after replugging the USB
+/// stick: the first `ls` finds the stale mount, dies, and repairs it for the second. §26.7 says a
+/// recovery that leaves the triggering operation failed is only half a recovery, so the repair now
+/// happens INSIDE the request: attempt, and if the device errored and a re-mount succeeds, attempt again
+/// before replying. The caller sees one answer, and for a read-only op that answer is the right one.
+///
+/// The reply is BUFFERED rather than sent from inside, which is what makes a second attempt possible at
+/// all - the first attempt's failure reply must not already be on the wire. Every arm of `serve_once`
+/// replies exactly once and returns (there are no loops around `send`), so buffering is faithful.
 fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8], reply: CapHandle) {
-    let send = |bytes: &[u8]| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(bytes)); };
+    let mut out = [0u8; SERVE_REPLY_MAX];
+    let mut len = 0usize;
+    if let Some(f) = vol.as_ref() { f.io_error_seen.set(false); }
+    serve_once(ctx, vol, capacity, unreadable, p, reply, &mut out, &mut len);
+
+    let errored = vol.as_ref().map_or(false, |f| f.io_error_seen.get());
+    if errored && len != REPLY_SENT_DIRECTLY && p.first().map_or(false, |&op| op_is_read_only(op)) {
+        ctx.log("fs: device I/O error while serving - re-mounting and retrying this request once");
+        match Fs::mount(ctx) {
+            Ok(nf) => {
+                *vol = Some(nf);
+                len = 0;
+                serve_once(ctx, vol, capacity, unreadable, p, reply, &mut out, &mut len);
+            }
+            // The retry is best-effort: a re-mount that fails leaves the FIRST attempt's reply in the
+            // buffer, so the caller still gets the honest error rather than silence. Said out loud,
+            // because a failed recovery is itself a failure and must not look like a plain miss.
+            Err(e) => ctx.log_fmt(format_args!("fs: re-mount for retry FAILED ({}) - replying with the original error", e)),
+        }
+    }
+    if len != REPLY_SENT_DIRECTLY {
+        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out[..len]));
+    }
+}
+
+/// One attempt at a request. Writes its reply into `out`/`out_len` instead of sending it - see `serve`.
+///
+/// `reply` is still passed through for the ONE arm that cannot be buffered: `OP_OPEN` embeds a freshly
+/// minted file capability in its reply, and a capability transfer is not bytes - it moves authority
+/// through the kernel (§8.5). That arm sends for itself and sets `out_len` to [`REPLY_SENT_DIRECTLY`]
+/// so the caller does not then send a second, empty reply on top of it.
+fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8],
+              reply: CapHandle, out: &mut [u8], out_len: &mut usize) {
+    let mut send = |bytes: &[u8]| {
+        let n = bytes.len().min(out.len());
+        out[..n].copy_from_slice(&bytes[..n]);
+        *out_len = n;
+    };
     // When degraded (no mounted volume), which "no filesystem" code to return: FS_UNAVAIL if the disk
     // is present but unreadable (do NOT flash - data may be intact), else FS_NOFS (blank - flash to format).
     let nofs: u8 = if unreadable { FS_UNAVAIL } else { FS_NOFS };
@@ -1095,6 +1162,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
             // only send FS_ERR if it failed before replying.
             let want = if tail.is_empty() { 0 } else { tail[0] & (RIGHT_READ | RIGHT_WRITE) };
             if fs.open_file(ctx, path, want, reply).is_err() { send(&[FS_ERR]); }
+            else { *out_len = REPLY_SENT_DIRECTLY; }   // the cap went with it; do not reply twice
         }
         _ => send(&[FS_ERR]),
     }

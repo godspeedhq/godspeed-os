@@ -57,6 +57,7 @@ const OP_READ_AT: u8 = 26;   // [op, plen, path, offset:u64, len:u32] -> [FS_OK,
 // stay block-aligned (no read-modify-write).
 const IO_CHUNK: usize = 7 * 508; // 3556
 const FS_OK: u8 = 0;
+const FS_ERR: u8 = 1;       // fs could not complete the operation (typically a device I/O error)
 const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
 const FS_UNAVAIL: u8 = 4;   // present-but-unreadable storage: do NOT flash (data may be intact)
@@ -8139,9 +8140,18 @@ fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_NOTFOUND) || p.len() < 2 {
+    if p.first() == Some(&FS_NOTFOUND) {
         ctx.console_writeln_fmt(format_args!("ls: not a directory: {}", str_of(path)));
         return Err(ShellError::FileNotFound);
+    }
+    // A short or error reply is NOT "not a directory". Lumping the two together is how a storage I/O
+    // error - the stick pulled and replugged - came out as a claim about the path, sending the operator
+    // to look at `/` when the problem was the device. Name what actually happened (§26.7).
+    if p.first() == Some(&FS_ERR) || p.len() < 2 {
+        ctx.console_writeln_fmt(format_args!(
+            "ls: could not read {} - storage error (the device may still be settling after a replug; try again)",
+            str_of(path)));
+        return Err(ShellError::Unknown);
     }
     let count = p[1] as usize;
     out.line_fmt(ctx, format_args!("{}  ({} entries)", str_of(path), count));
