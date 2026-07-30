@@ -1841,6 +1841,11 @@ fn stand_down_port(port: u8) {
     if MSC_READY.load(Ordering::Acquire) && MSC_PORT.load(Ordering::Relaxed) == port {
         MSC_READY.store(false, Ordering::Release);
         pl011_write(b"dwc2: USB storage was on that port - block I/O fails until it is plugged back in\r\n");
+        // The cause is now on the operator's screen, so the refusals that follow do not each need to
+        // repeat it - see `msc_refuse_not_ready`. The counter restarts so its occurrence numbers describe
+        // THIS outage rather than every outage since boot.
+        MSC_ABSENCE_EXPLAINED.store(true, Ordering::Relaxed);
+        MSC_REFUSE_NOT_READY.store(0, Ordering::Relaxed);
     }
 }
 
@@ -3217,6 +3222,9 @@ reset clears the device cache and this device accepts no flush)\r\n");
     // storage until reboot. That is not a close call - and it is the second time on this branch that a
     // recovery path did more damage than the fault it was written for.
     MSC_READY.store(true, Ordering::Release);
+    // A live device again: a later refusal would be a NEW, unexplained fact, so let it speak (see
+    // `msc_refuse_not_ready`).
+    MSC_ABSENCE_EXPLAINED.store(false, Ordering::Relaxed);
     // Restore the OTHER devices' flags too. Clearing them before the port reset is right - the reset
     // genuinely drops the keyboard and the NIC - but leaving them false when enumeration fails is the
     // same defect as the `MSC_READY` one fixed a commit ago, applied to the two flags that were not
@@ -3521,6 +3529,9 @@ fn probe_mass_storage() -> bool {
     MSC_NO_FUA.store(false, Ordering::Relaxed);
     MSC_FUA_LOGGED.store(false, Ordering::Relaxed);
     MSC_READY.store(true, Ordering::Release);
+    // A live device again: a later refusal would be a NEW, unexplained fact, so let it speak (see
+    // `msc_refuse_not_ready`).
+    MSC_ABSENCE_EXPLAINED.store(false, Ordering::Relaxed);
     // Settle durability HERE, at bring-up, rather than on whichever command happens to be the first
     // metadata write. It is a property of the device, so it belongs in the boot log next to its
     // capacity - not interleaved with an operator's `ls`, which is exactly where it was landing.
@@ -3592,6 +3603,30 @@ fn msc_refuse(reason: &str, counter: &AtomicU32, lba: u64) -> bool {
     false
 }
 static MSC_REFUSE_NOT_READY: AtomicU32 = AtomicU32::new(0);
+/// Has the operator already been TOLD why storage is unavailable? Set when a hot-plug removal announces
+/// "the stick was unplugged", cleared when a device is brought back up.
+static MSC_ABSENCE_EXPLAINED: AtomicBool = AtomicBool::new(false);
+
+/// Refuse a block request because no device is ready - saying so only when the reason is not already
+/// known.
+///
+/// `msc_refuse` exists because a silent refusal once cost a whole debugging session, and that reasoning
+/// still holds for an UNEXPLAINED refusal. But once a removal has announced "USB storage was on that port
+/// - block I/O fails until it is plugged back in", every following refusal is the consequence of a cause
+/// the operator has already read. Repeating it is not extra information, it is the same information
+/// thousands of times: one `ls` against an absent stick produced over 20,000 refusals and 300+ console
+/// lines, burying everything else in the log - the loudest thing on the machine saying the least.
+///
+/// So: while the absence is explained, count silently. While it is NOT explained - a mid-revival wobble,
+/// a device that vanished without a removal event - speak exactly as before, because that is the case
+/// the message was written for (§26.7: loud is a budget, spend it where it buys something).
+fn msc_refuse_not_ready(lba: u64) -> bool {
+    if MSC_ABSENCE_EXPLAINED.load(Ordering::Relaxed) {
+        MSC_REFUSE_NOT_READY.fetch_add(1, Ordering::Relaxed);   // still counted, just not narrated
+        return false;
+    }
+    msc_refuse("not ready (mid-revival?)", &MSC_REFUSE_NOT_READY, lba)
+}
 static MSC_REFUSE_WRONG_CORE: AtomicU32 = AtomicU32::new(0);
 static MSC_REFUSE_RANGE: AtomicU32 = AtomicU32::new(0);
 
@@ -3607,7 +3642,7 @@ pub fn msc_read_block(lba: u64, dst: &mut [u8]) -> bool {
         LAST_FAIL.store(FAIL_NAK_TIMEOUT, Ordering::Relaxed);
         return false;
     }
-    if !MSC_READY.load(Ordering::Acquire) { return msc_refuse("not ready (mid-revival?)", &MSC_REFUSE_NOT_READY, lba); }
+    if !MSC_READY.load(Ordering::Acquire) { return msc_refuse_not_ready(lba); }
     if !on_core0() { return msc_refuse("wrong core", &MSC_REFUSE_WRONG_CORE, lba); }
     if dst.len() < 512 { return false; }
     if lba >= MSC_SECTORS.load(Ordering::Relaxed) { return msc_refuse("LBA past capacity", &MSC_REFUSE_RANGE, lba); }
@@ -3690,7 +3725,7 @@ pub fn msc_write_block(lba: u64, src: &[u8]) -> bool {
         LAST_FAIL.store(FAIL_NAK_TIMEOUT, Ordering::Relaxed);
         return false;
     }
-    if !MSC_READY.load(Ordering::Acquire) { return msc_refuse("not ready (mid-revival?)", &MSC_REFUSE_NOT_READY, lba); }
+    if !MSC_READY.load(Ordering::Acquire) { return msc_refuse_not_ready(lba); }
     if !on_core0() { return msc_refuse("wrong core", &MSC_REFUSE_WRONG_CORE, lba); }
     if src.len() < 512 { return false; }
     if lba >= MSC_SECTORS.load(Ordering::Relaxed) { return msc_refuse("LBA past capacity", &MSC_REFUSE_RANGE, lba); }
