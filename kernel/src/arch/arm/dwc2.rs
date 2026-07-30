@@ -1391,23 +1391,17 @@ static HOTPLUG_TRIES: [AtomicU8; 32] = [const { AtomicU8::new(0) }; 32];
 /// the second try; by the third, waiting longer is not what is wrong.
 const HOTPLUG_MAX_TRIES: u8 = 3;
 
-// --- Why a hot-plug visit did not happen -------------------------------------------------------------
-// A plug or unplug during a busy command (a continuous `ping`) was not reported until the command ended.
-// Two explanations fit that equally well and demand opposite fixes: either the scheduler's IDLE hook -
-// the only thing that calls `hotplug_poll` - never ran because a core never idled, or it ran plenty and
-// the poll BAILED every time on a guard. Nothing in the output could tell them apart, so the counters
-// below make the difference a printed fact instead of a guess (§26.4: where an answer came from must be
-// answerable). They cost an increment on paths that already do far more work.
-//
-// Reported ONLY when a visit finds it has been starved (see `HP_STARVED_US`), so a healthy machine never
-// mentions them - the tally is worth a line exactly when the thing it explains has gone wrong.
-static HP_CALLS:      AtomicU32 = AtomicU32::new(0);   // idle hook reached us at all
-static HP_NOT_CORE0:  AtomicU32 = AtomicU32::new(0);   // ...but on a core that may not drive the bus
-static HP_BUSY_ASYNC: AtomicU32 = AtomicU32::new(0);   // a parked storage transfer owns the channel
-static HP_BUSY_BULK:  AtomicU32 = AtomicU32::new(0);   // the shared bulk claim was taken
-static HP_BUSY_EXCL:  AtomicU32 = AtomicU32::new(0);   // another exclusive USB operation was running
-/// How long a gap between successful visits counts as STARVED and is worth explaining. The watcher aims
-/// for one visit per second, so a few seconds means something really did stop it.
+/// How long a gap between visits means the watcher fell behind and should CATCH UP with a full sweep
+/// rather than the next port in rotation (see `hotplug_poll`). The watcher aims for one visit per second,
+/// so a few seconds means a command genuinely held the machine.
+///
+/// A temporary diagnostic here once counted WHY a visit had not happened (idle-hook entries, per-guard
+/// bail tallies) and printed them on a starved visit. It answered its question on the first boot that
+/// carried it - the idle hook ran ~300 times a second but 8757 of 8791 entries were on cores 1-3, which
+/// may not drive the bus, and no claim was ever stuck: core 0 simply does not idle while a command runs.
+/// With the answer known it was pure noise, and it fired on an ordinary BOOT (a ~6.7 s busy stretch),
+/// which is precisely how driver output teaches an operator to stop reading it. Removed rather than kept
+/// "in case" (§26.2); the finding lives in the git history and in the sweep below, which is its fix.
 const HP_STARVED_US: u32 = 3_000_000;
 
 /// The USB address a device on `port` gets - stable, so a replugged device returns to the same address.
@@ -1639,52 +1633,20 @@ fn bring_up_hub_port(port: u8, addr: u8) -> PortBringUp {
 /// so the keyboard poll stops talking to an address that is no longer there.
 pub fn hotplug_poll() {
     let nports = HUB_NPORTS.load(Ordering::Relaxed);
-    if nports == 0 { return; }                                      // no hub enumerated: nothing to watch
-    HP_CALLS.fetch_add(1, Ordering::Relaxed);
-    if !on_core0() { HP_NOT_CORE0.fetch_add(1, Ordering::Relaxed); return; }
+    // No hub enumerated: nothing to watch. And only core 0 may drive the bus - the idle hook runs on
+    // every core, and the other three reach here constantly while core 0 is busy with a command.
+    if nports == 0 || !on_core0() { return; }
     let now = super::timer::systimer_us();
     let last = HOTPLUG_LAST_US.load(Ordering::Relaxed);
     if last != 0 && now.wrapping_sub(last) < HOTPLUG_INTERVAL_US { return; }
     // A parked storage transfer owns the channel; so does a BOT command in progress. Either way, later.
     // SAFETY: core-0; ASYNC_BULK is core-0 exclusive.
-    if unsafe { (*core::ptr::addr_of!(ASYNC_BULK)).active } {
-        HP_BUSY_ASYNC.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    let _claim = match BulkClaim::try_acquire() {
-        Some(c) => c,
-        None => { HP_BUSY_BULK.fetch_add(1, Ordering::Relaxed); return; }
-    };
+    if unsafe { (*core::ptr::addr_of!(ASYNC_BULK)).active } { return; }
+    let _claim = match BulkClaim::try_acquire() { Some(c) => c, None => return };
     // Own the bus for this whole visit. Interrupts stay ENABLED - a ~100 ms enumeration must not suppress
     // the tick, which is exactly what would stop core 0's liveness stamp and let another core panic the
     // machine. Exclusion comes from every other shared-selection path observing this flag (`UsbExclusive`).
-    let _excl = match UsbExclusive::try_acquire() {
-        Some(e) => e,
-        None => { HP_BUSY_EXCL.fetch_add(1, Ordering::Relaxed); return; }
-    };
-    // We are past every guard, so this IS a visit. If it has been far too long since the last one, say
-    // what happened in between - the tally distinguishes "the idle hook never ran" (calls barely moved)
-    // from "it ran and something held the bus" (a busy counter moved). Silent on a healthy machine.
-    if last != 0 && now.wrapping_sub(last) > HP_STARVED_US {
-        let (calls, ncore, ba, bb, be) = (
-            HP_CALLS.swap(0, Ordering::Relaxed), HP_NOT_CORE0.swap(0, Ordering::Relaxed),
-            HP_BUSY_ASYNC.swap(0, Ordering::Relaxed), HP_BUSY_BULK.swap(0, Ordering::Relaxed),
-            HP_BUSY_EXCL.swap(0, Ordering::Relaxed));
-        pl011_write(b"dwc2: hot-plug watch was starved for ");
-        super::timer::write_dec_pub(now.wrapping_sub(last) / 1000);
-        pl011_write(b" ms - idle-hook calls "); super::timer::write_dec_pub(calls);
-        pl011_write(b" (off-core "); super::timer::write_dec_pub(ncore);
-        pl011_write(b", storage-parked "); super::timer::write_dec_pub(ba);
-        pl011_write(b", bulk-busy "); super::timer::write_dec_pub(bb);
-        pl011_write(b", excl-busy "); super::timer::write_dec_pub(be);
-        pl011_write(b")\r\n");
-    } else {
-        HP_CALLS.store(0, Ordering::Relaxed);       // healthy visit: start the next window clean
-        HP_NOT_CORE0.store(0, Ordering::Relaxed);
-        HP_BUSY_ASYNC.store(0, Ordering::Relaxed);
-        HP_BUSY_BULK.store(0, Ordering::Relaxed);
-        HP_BUSY_EXCL.store(0, Ordering::Relaxed);
-    }
+    let _excl = match UsbExclusive::try_acquire() { Some(e) => e, None => return };
     HOTPLUG_LAST_US.store(now.max(1), Ordering::Relaxed);
 
     // Save the shared device selection and put it back afterwards: the keyboard poll and the storage path
