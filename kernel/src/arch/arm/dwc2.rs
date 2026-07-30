@@ -1649,6 +1649,11 @@ pub fn hotplug_poll() {
     let bit = 1u32 << (port - 1);
     let was = HUB_CONNECTED.load(Ordering::Relaxed) & bit != 0;
     let now_conn = st & 1 != 0;
+    // Did this visit print anything? Any hot-plug line scrolls the shell's prompt off the screen, and the
+    // shell - blocked in `console_read` - has no reason to redraw it. Tracking it here rather than only on
+    // a keyboard arrival is what makes the behaviour CONSISTENT: pulling the USB stick left the operator
+    // staring at kernel output with no prompt, and plugging it back did not bring one back either.
+    let mut announced = false;
 
     if now_conn && !was {
         let addr = hub_port_addr(port);
@@ -1662,21 +1667,15 @@ pub fn hotplug_poll() {
         // one session; the SDK's #[must_use] gate does not reach an in-kernel bool.
         if bring_up_hub_port(port, addr) {
             HUB_CONNECTED.fetch_or(bit, Ordering::Relaxed);
-            // A keyboard came back: give the user a PROMPT. The shell is blocked in `console_read` and has
-            // no reason to redraw, so after the hot-plug lines scroll past there is nothing on screen but
-            // kernel output - the keyboard works, and looks like it does not, which is its own kind of
-            // silent failure (invariant 12 is about what the OPERATOR can see). Pushing one newline makes
-            // the shell complete an empty line and print a fresh `gsh>`, which is exactly the "I am ready"
-            // signal a person is looking for. Harmless: an empty command runs nothing.
-            if KBD_READY.load(Ordering::Relaxed) && KBD_HUB_PORT.load(Ordering::Relaxed) == port {
-                super::console_push_byte(b'\n');
-            }
+            announced = true;
         } else {
             pl011_write(b"dwc2: hot-plug - enumeration FAILED on hub port ");
             super::timer::write_dec_pub(port as u32);
             pl011_write(b" - left unclaimed so the next scan retries\r\n");
+            announced = true;
         }
     } else if !now_conn && was {
+        announced = true;
         HUB_CONNECTED.fetch_and(!bit, Ordering::Relaxed);
         pl011_write(b"dwc2: hot-plug - device REMOVED from hub port "); super::timer::write_dec_pub(port as u32);
         pl011_write(b"\r\n");
@@ -1697,6 +1696,16 @@ pub fn hotplug_poll() {
             pl011_write(b"dwc2: USB storage was on that port - block I/O fails until it is plugged back in\r\n");
         }
     }
+
+    // Give the operator a PROMPT back. Every branch above prints, which scrolls `gsh>` away, and the shell
+    // is blocked in `console_read` with no reason to redraw - so a working machine presents as a dead one
+    // (invariant 12 is about what the OPERATOR can see). One newline makes the shell finish an empty line
+    // and print a fresh prompt; an empty command runs nothing. Applies to REMOVAL too, including the
+    // keyboard's: the shell genuinely is ready, and the line above already says which input device is not.
+    // This grants no authority that was not already present - a keyboard driver can synthesize keystrokes
+    // by definition (the SEC-2 residual, CLAUDE.md §6.4), which is exactly why it may synthesize the one
+    // that says "you may type now".
+    if announced { super::console_push_byte(b'\n'); }
 
     DEV_ADDR.store(prev_addr, Ordering::Relaxed);
     MPS0.store(prev_mps, Ordering::Relaxed);
