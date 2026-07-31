@@ -246,3 +246,34 @@ the cause was never identified. Recording it so the next attempt does not repeat
    200_000_000` is "~100 ms at ~2 GHz" in **`read_tsc` cycles**, and `read_tsc` on the Pi is the ~1 MHz
    generic timer - so a bare-ESC wait is **~200 SECONDS** here. Same class of bug (an x86-calibrated
    cycle count), independent of the quantum.
+
+## HARDWARE GOTCHA: a GPIO HAT can kill serial INPUT while output still works
+
+**Symptom.** The Pi keeps printing to the serial console perfectly - boot log, service logs, command
+output, everything - but typing into it does nothing. The USB keyboard still works, so the shell is
+plainly alive and reading input from somewhere.
+
+**Cause.** A HAT sits on the GPIO header, which is where the serial console lives (GPIO14 = TX,
+GPIO15 = RX). Output only needs the Pi to drive GPIO14, and nothing contends for that. Input needs the
+USB-TTL adapter to drive GPIO15 - and if the HAT is holding that pin, the adapter cannot win. Hence the
+asymmetry: **TX fine, RX dead.** (A HAT with an ID EEPROM on pins 27/28 can also make the firmware load
+an overlay that reconfigures the UART before our kernel ever runs.)
+
+**How to recognise it, and why it is worth writing down.** On 2026-07-31 this cost most of a day. It
+looks *exactly* like a software regression: serial typing worked in the morning, then stopped, and every
+kernel built afterwards "broke" it. Three separate commits were blamed and one good change (the
+`tsc_ticks_per_quantum` fix) was reverted on that false evidence before the hardware was suspected.
+
+**The tests that settle it, cheapest first:**
+1. **Flash a kernel that provably worked earlier** - ideally the exact released binary, checksum-verified.
+   If the same bytes now fail, nothing in the tree is responsible. *This is the test to run second, not
+   eighth: when every build after a baseline fails, re-test the baseline.*
+2. **Try the same adapter and terminal on another machine.** Serial input works there -> the shared kit
+   is fine and the fault is Pi-side.
+3. **Remove the HAT**, wire the adapter straight to GPIO14/15/GND, boot, type.
+4. **Loopback the adapter** (its own TX shorted to its own RX, off the Pi). Characters echo -> the
+   adapter and terminal are healthy, so it is the wire or the pin.
+
+**Meanwhile the port is still testable.** Serial OUTPUT keeps working, so logs still reach the host -
+drive the shell from the USB keyboard and read results over serial as normal. v0.8.1 was validated
+entirely this way (`selfcheck` 349/0, 100 chaos rounds).
