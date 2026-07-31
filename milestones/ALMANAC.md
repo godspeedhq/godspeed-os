@@ -49,6 +49,7 @@
 - [2026-07-14 - The day one kernel booted three instruction sets in QEMU virt](#2026-07-14---the-day-one-kernel-booted-three-instruction-sets-in-qemu-virt)
 - [2026-07-25 - The day the second architecture stopped being a demonstration](#2026-07-25---the-day-the-second-architecture-stopped-being-a-demonstration)
 - [2026-07-27 - The day a stick swap ended the hunt, and the recovery earned its keep](#2026-07-27---the-day-a-stick-swap-ended-the-hunt-and-the-recovery-earned-its-keep)
+- [2026-07-31 - The day I learned what my instruments could not see](#2026-07-31---the-day-i-learned-what-my-instruments-could-not-see)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -926,6 +927,32 @@ saying so plainly when a previous conclusion was drawn from a contaminated numbe
 letting the corrected result stand as though the reasoning had been sound.
 
 ---
+
+## 2026-07-31 - The day I learned what my instruments could not see
+
+The Pi 2 learned to notice what you unplug - keyboard, storage, an unknown dongle, the ethernet
+cable - and the fix that mattered was not more polling but asking the hub's change-latch what had
+*happened* instead of inferring it from what the port looked like now. A level tells you the present;
+a latch tells you the event. Everything else that week followed from instruments, and from their
+blind spots.
+
+Four times the evidence was in hand and read wrong. A 30-second freeze, blamed on storage through
+five commits, was the chaos harness pacing itself with a fixed yield count - and a yield costs a full
+quantum when nothing else is runnable, which is exactly the state chaos creates. The tell had been in
+the first log: a ceiling at *exactly* 30.0 s, never exceeded, is a count, not a stall. A guard that
+had logged 141 silent "phantom frame" refusals looked like a guard working; it was a guard reporting
+that the kill path was freeing a driver's MMIO as RAM. A stale comment describing finished work as
+pending, and a note calling a three-week-old fix a todo, each bought a confident wrong answer. And 57
+green tests said nothing about the case I had changed, because every one of them was cross-core and
+the broken path was same-core.
+
+**What I came to understand:** every instrument has a shape, and a failure outside that shape is
+invisible to it - so a green result means "nothing in what this could see", never "nothing". Ask what
+an instrument is structurally incapable of noticing before trusting it, and treat a silent guard, an
+exact repeated number, and a note that says "todo" as claims to verify rather than facts. The
+corollary is kinder than it sounds: the BSP had been able to halt onto a dead timer for the life of
+the port, and only became visible when a change stopped userspace spinning long enough for the core
+to idle. The bug was never created. Something merely stopped hiding it.
 
 ## The Named Bugs - the teachers
 
