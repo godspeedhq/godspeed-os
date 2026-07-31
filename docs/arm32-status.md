@@ -207,3 +207,42 @@ GodspeedOS way.
 - **`docs/multi-arch.md`** - the cross-arch proof and per-arch bring-up notes.
 - **Audits of this branch:** `docs/kernel-audit.md` Audit 5 (the arm32 kernel layer) and
   `docs/userspace-audit.md` Audit 4 (the arm SDK ABI).
+
+## OPEN: the ARM quantum stub cannot be fixed naively (2026-07-31)
+
+`arch/arm/mod.rs::tsc_ticks_per_quantum()` returns `0`, and `scheduler::cycles_to_ticks` reads `0` as
+"fall back to exactly 1 tick" - so **every `sleep` and `recv_timeout` on this port collapses to one
+quantum (~10 ms) regardless of what the caller asked for**. A duration the caller chose, silently
+replaced. That is a real defect and it is still open.
+
+**An attempt to fix it (branch `fix/arm-tsc-quantum`, not merged) killed serial input on the Pi**, and
+the cause was never identified. Recording it so the next attempt does not repeat the search:
+
+- The attempt returned `timer_hz()/100` (the MEASURED rate, never `CNTFRQ` - which overstates by 19.2x
+  here), and added an SDK `sleep_ms(ms)`/`duration_cycles(ms)` so that four x86-calibrated constants
+  did not become absurd (shell muted-poll + observe q-poll + `observe` repaint: ~30 ms -> ~60 s;
+  `examples/counter`: ~1 s -> ~33 min). **Fixing the stub alone IS a regression** - that part is
+  certain and any future attempt needs the same companion change.
+- **Symptom:** serial input completely dead on hardware; the USB keyboard unaffected. Bisected across
+  three hardware boots: known-good `main` works; the full change fails; and a probe with the kernel
+  quantum reverted to `0` but `sleep_ms` + the ms constants retained **also fails** - from a cold boot,
+  so it is not state- or core-placement-dependent.
+- **What that leaves is not explanatory.** With the stub at `0`, `sleep_ms(30)` computes to `sleep(1)`
+  = 1 tick, identical to the `sleep(60_000_000)` it replaced (which also floored to 1 tick). The SDK
+  diff is purely additive; `observe`/`counter` are not in the input path. 70 lines that cannot account
+  for the symptom.
+- **QEMU cannot reproduce it** - driving the shell over serial with `arm_run.py --cmd "help"` works on
+  the failing build. Hardware-only.
+
+**Leads for the next attempt**, in the order worth trying:
+1. The only new *behaviour* in the shell's hot loop is that `sleep_ms` issues an extra syscall -
+   **InspectKernel query 16** - before each sleep. Query 16 is NOT in the ungated set (`docs`/
+   `syscall/CLAUDE.md`: ungated are 0,3,9,10,11,12,13), so it is gated on INTROSPECT. Check what that
+   syscall does on ARM from the shell's context before assuming it is harmless; caching the value once
+   at startup instead of per-sleep would sidestep it entirely and is the cheapest thing to try.
+2. The shell is known to run near its 64 KiB user-stack ceiling (`project_shell_stack_pipe`); two extra
+   frames in `service_main`'s loop are not obviously safe on this port.
+3. Unrelated but found while tracing, and worth fixing on its own: `shell`'s `ESC_WAIT_CYCLES =
+   200_000_000` is "~100 ms at ~2 GHz" in **`read_tsc` cycles**, and `read_tsc` on the Pi is the ~1 MHz
+   generic timer - so a bare-ESC wait is **~200 SECONDS** here. Same class of bug (an x86-calibrated
+   cycle count), independent of the quantum.
