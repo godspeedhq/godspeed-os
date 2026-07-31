@@ -26,7 +26,7 @@ const MODE_LIVE_FG: u32 = 2; // `observe` live - full-screen foreground view
 /// `observe` itself does not peg its core (which would make every task on that core read as
 /// ~100% busy - the very thing observe reports). `q` latency stays ≤ this; granularity is one
 /// quantum (~10 ms).
-const POLL_SLEEP_CYCLES: u64 = 60_000_000;
+const POLL_SLEEP_MS: u64 = 30;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
@@ -100,7 +100,7 @@ fn run_live(
     // keyboard - and we SLEEP between polls so we never peg our core (a busy refresh loop would make
     // every task on this core read as ~100% in our own display, the bug this fixes). Never returns.
     loop {
-        ctx.sleep(POLL_SLEEP_CYCLES);   // short yield so we never peg our core between clock checks
+        ctx.sleep_ms(POLL_SLEEP_MS);   // short yield so we never peg our core between clock checks
         let now = ctx.epoch_secs_monotonic();
         if now != last {                // a monotonic second elapsed -> repaint
             last = now;
