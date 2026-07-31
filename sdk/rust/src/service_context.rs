@@ -371,31 +371,29 @@ fn cache_send_slot(name: &str, new_slot: u32) {
     }
 }
 
-/// How long each wait helper BLOCKS on its endpoint before surfacing to re-check the console and the
-/// deadline: **exactly one scheduler quantum**, on every machine.
+/// These wait helpers POLL (`try_recv` + `yield_cpu`); they do not block. That is deliberate, and it is
+/// a REVERSAL - they were made to block earlier on this branch, and the change was wrong twice over.
 ///
-/// This is deliberately not a cycle count. `recv_timeout` converts cycles to ticks with
-/// `cycles / tsc_ticks_per_quantum`, so the wait a cycle count buys is only as trustworthy as the TSC
-/// calibration - and this kernel has already been bitten there once: the AMD T630's CPUID-derived
-/// figure was ~1000x too small until it was PIT-calibrated instead (`77a0e38`, 2026-07-07), which had
-/// stretched `ctx.sleep` and ping RTT by the same factor. That is FIXED - the PIT is ground truth now
-/// and an implausible candidate is rejected - so this constant is not compensating for a live bug.
+/// Why it was tried: a blocked task lets the core reach the scheduler's idle path, which saves power and
+/// (on ARM) lets idle-hook work run while a command waits. Both are real benefits.
 ///
-/// It is avoiding a dependency that has no reason to exist. A poll interval wants to be "one scheduler
-/// quantum"; expressing it in cycles makes it "one quantum, provided the frequency is right", and the
-/// second clause is not something this code owns or can check. Any value below one quantum's worth of
-/// cycles floors to exactly 1 tick (`cycles_to_ticks` ends in `.max(1)`), so `1` means one quantum on a
-/// good TSC, a bad one, and a platform whose quantum figure is a `0` stub alike.
+/// Why it is reverted:
+/// 1. **It broke x86 networking.** net-stack and nic-driver both sit on core 1, and every exchange
+///    between them goes through `request_with_reply_deadline`. With blocking waits, net-stack degraded
+///    to "no NIC MAC yet (driver absent/not ready)" and DHCP/ARP never completed; restoring the poll
+///    made DHCP, ARP and a sustained 14 ms ping work immediately. Proven by an A/B on real hardware -
+///    identical build, this one difference.
+/// 2. **It bought nothing that survived.** It was introduced to make USB hot-plug get noticed during a
+///    `ping`. That symptom turned out to be the chaos harness pacing itself with a fixed yield count
+///    (3000 yields x a full quantum = 30 s on the Pi), not these helpers. The hot-plug fixes that
+///    actually worked were the hub change-latch and the catch-up sweep, neither of which needs this.
 ///
-/// A quantum (~10 ms) is also the right interval on its own merits: far below the threshold at which a
-/// person notices `q` not landing, and far above scheduler overhead.
+/// It also exposed a genuine kernel bug on the way through - the BSP halting onto a consumed one-shot
+/// TSC deadline - which is FIXED and stays fixed independently of this revert.
 ///
-/// Blocking at all is the point. These loops used `try_recv` + `yield_cpu`, which leaves the task
-/// permanently RUNNABLE: the core never reaches the scheduler's idle path, so it burns 100% on a task
-/// that is doing nothing, and any work the kernel does from that idle path does not happen while a
-/// command waits. On ARM that work is the USB hot-plug watch, so plugging or unplugging a device during
-/// a `ping` went unnoticed until the ping ended.
-const ABORTABLE_POLL_CYCLES: u64 = 1;
+/// The lesson worth keeping: same-core request/reply through a blocking waiter is not exercised by the
+/// test suite (identity and fs-restart are all cross-core), so a change here cannot be validated by
+/// those suites. If blocking is attempted again, it needs a same-core request/reply test first.
 
 /// Passed by the kernel to `service_main`. Non-Copy; one per service instance.
 pub struct ServiceContext {
@@ -716,7 +714,8 @@ impl ServiceContext {
         let t0 = self.epoch_secs_monotonic();
         loop {
             // Block, do not spin - see `request_with_reply_abortable` for why this matters beyond power.
-            if let Some(r) = self.recv_timeout(ABORTABLE_POLL_CYCLES) { return DeadlineOutcome::Reply(r); }
+            if let Some(r) = self.try_recv() { return DeadlineOutcome::Reply(r); }
+            self.yield_cpu();   // Poll, do not block
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 self.remove_cap(reply_cap);   // reply never consumed - reclaim its slot
                 // CALLER BEWARE: the request was already SENT, so the peer will reply into our endpoint
@@ -768,7 +767,7 @@ impl ServiceContext {
             // up and all arrived at the prompt. It also pegged the core at 100% for a task that is, in
             // truth, doing nothing (the same busy-wait the `observe` and muted loops were already fixed
             // for - see MUTED_POLL_SLEEP_CYCLES). Blocking parks the task, the core halts, idle work runs.
-            if let Some(r) = self.recv_timeout(ABORTABLE_POLL_CYCLES) {
+            if let Some(r) = self.try_recv() {
                 self.remove_cap(reply_cap);
                 return ReqOutcome::Reply(r);
             }
@@ -781,6 +780,7 @@ impl ServiceContext {
                 // the threshold at which a person can tell, and the same trade the observe loop makes.
                 if b == b'q' || b == b'Q' || b == 0x1b { self.remove_cap(reply_cap); return ReqOutcome::Aborted; }
             }
+            self.yield_cpu();   // Poll, do not block
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 self.remove_cap(reply_cap);
                 return ReqOutcome::Timeout;
@@ -818,7 +818,7 @@ impl ServiceContext {
             // Block, do not spin - see `request_with_reply_abortable`. This is the variant `net`/`ping`
             // actually use (the "press q to abort" hint), so it is the one that kept core 0 permanently
             // busy during a continuous ping and starved the idle-path USB hot-plug watch.
-            if let Some(r) = self.recv_timeout(ABORTABLE_POLL_CYCLES) {
+            if let Some(r) = self.try_recv() {
                 self.remove_cap(reply_cap);
                 return ReqOutcome::Reply(r);
             }
@@ -829,6 +829,7 @@ impl ServiceContext {
             if elapsed >= hint_after_secs {
                 if let Some(f) = on_linger.take() { f(); }
             }
+            self.yield_cpu();   // Poll, do not block
             if elapsed >= max_secs {
                 self.remove_cap(reply_cap);
                 return ReqOutcome::Timeout;
@@ -854,10 +855,11 @@ impl ServiceContext {
         let t0 = self.epoch_secs_monotonic();
         loop {
             // Block, do not spin - see `request_with_reply_abortable`.
-            if let Some(r) = self.recv_timeout(ABORTABLE_POLL_CYCLES) { return ReqOutcome::Reply(r); }
+            if let Some(r) = self.try_recv() { return ReqOutcome::Reply(r); }
             while let Some(b) = self.try_console_read() {
                 if b == b'q' || b == b'Q' || b == 0x1b { return ReqOutcome::Aborted; }
             }
+            self.yield_cpu();   // Poll, do not block
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 return ReqOutcome::Timeout;
             }
