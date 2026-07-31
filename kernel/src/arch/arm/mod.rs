@@ -1214,7 +1214,26 @@ pub mod boot {
     pub fn rearm_idle_timer() {}
     pub fn rearm_quantum_timer() {}
     pub fn audit_wx() {}
-    pub fn tsc_ticks_per_quantum() -> u64 { 0 }
+    /// Counter ticks per 10 ms scheduler quantum, in `read_cycle_counter` (CNTPCT) units.
+    ///
+    /// Was a `0` stub, and `0` is not merely "unknown" - `scheduler::cycles_to_ticks` reads it as a
+    /// signal to fall back to exactly 1 tick, so EVERY `sleep` and `recv_timeout` on this port collapsed
+    /// to one quantum regardless of what was asked for. A duration the caller chose, silently replaced.
+    ///
+    /// Derived from the MEASURED counter rate (`timer_hz`, cross-checked against the Pi's independent
+    /// 1 MHz system timer), never `CNTFRQ` - which overstates it by 19.2x on this board and would make
+    /// every timeout 19.2x too short. Reads 0 until calibration completes, which keeps the old
+    /// one-quantum fallback for exactly that window rather than inventing a rate.
+    ///
+    /// **Fixing this was never safe on its own.** A cycle count is not a portable duration: userspace
+    /// constants were written as x86 cycles at ~2 GHz, so `60_000_000` meaning "~30 ms" becomes ~60
+    /// SECONDS here at ~1 MHz. Three paced loops held exactly that value; they now go through the SDK's
+    /// `sleep_ms`, which converts via the kernel's own calibration. That is why the two changes land
+    /// together - the stub was load-bearing for code that assumed it stayed broken.
+    pub fn tsc_ticks_per_quantum() -> u64 {
+        // TICK_HZ = 100 (10 ms quantum), so ticks-per-quantum = timer_hz / 100.
+        (super::timer::timer_hz() as u64) / 100
+    }
     pub unsafe fn rearm_tsc_deadline() {}
     pub unsafe fn apic_send_eoi() {}
     /// The calling core's id (0-3), read from MPIDR. On ARM the "lapic id" IS the core index, so the

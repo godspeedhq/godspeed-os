@@ -40,9 +40,14 @@ const COUNTER_PATH: &[u8] = b"/counter.dat";
 
 /// Approximate pacing between ticks. Sleeping conserves CPU; it does NOT determine
 /// correctness (Commandment VIII - we never rely on timing for the count itself,
-/// only to avoid spinning). Cycle granularity is one scheduler quantum (~10 ms);
-/// the exact value is not portable across hosts and does not need to be.
-const TICK_CYCLES: u64 = 2_000_000_000; // ~1 s at ~2 GHz
+/// only to avoid spinning). Granularity is one scheduler quantum (~10 ms).
+///
+/// Expressed in MILLISECONDS, not cycles. It used to be `2_000_000_000` ("~1 s at ~2 GHz") with a note
+/// that the exact value "is not portable across hosts and does not need to be" - true only while ARM's
+/// quantum was a stub that collapsed every sleep to one tick. With that fixed, the same literal asks a
+/// ~1 MHz counter for ~33 MINUTES. An example must teach the portable form: `sleep_ms` converts through
+/// the kernel's own calibration and is right on every machine.
+const TICK_MS: u64 = 1_000; // ~1 s, on any host
 
 // ── fs round-trips, modelled on the shell's `fs_request` ────────────────────────
 
@@ -190,6 +195,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
 
         // Pace the loop. `sleep` lets the core halt instead of busy-yielding.
-        ctx.sleep(TICK_CYCLES);
+        ctx.sleep_ms(TICK_MS);
     }
 }

@@ -1247,6 +1247,36 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u64 }
     }
 
+    /// Sleep for approximately `ms` milliseconds - the PORTABLE way to pace a loop.
+    ///
+    /// Prefer this over `sleep(cycles)` for anything expressing a DURATION. A "cycle" is not a portable
+    /// unit: on x86 it is a ~2 GHz CPU cycle, on the Pi 2 it is a tick of a ~1 MHz timer, so the same
+    /// literal means two wildly different lengths of time. Services were written with x86 in mind -
+    /// `60_000_000` meaning "~30 ms at 2 GHz" - and on ARM that same constant asks for ~60 SECONDS once
+    /// the quantum is calibrated. Three loops (the shell's muted poll and observe q-poll, and `observe`'s
+    /// repaint pace) were exactly that, and each would have become a minute-long stall.
+    ///
+    /// Converts through the kernel's own calibration, so it is right on any machine. Floors at one
+    /// scheduler quantum: the underlying `sleep(0)` returns immediately, which would turn a paced loop
+    /// into a busy spin - the opposite of what every caller wants.
+    pub fn sleep_ms(&self, ms: u64) {
+        self.sleep(self.duration_cycles(ms));
+    }
+
+    /// Cycles for approximately `ms` milliseconds, for the two syscalls that take a cycle count
+    /// (`sleep`, `recv_timeout`). See [`Self::sleep_ms`] for why a raw cycle literal is not portable.
+    ///
+    /// Never returns 0. That matters beyond pacing: `recv_timeout(0)` means **block forever**, so a
+    /// zero here would convert a bounded wait into an unbounded one - a hang produced by a unit
+    /// conversion. An uncalibrated machine (query 16 reads 0) also lands on the floor, which is exactly
+    /// the one-quantum behaviour those platforms had before any of this existed.
+    pub fn duration_cycles(&self, ms: u64) -> u64 {
+        let per_10ms = self.tsc_ticks_per_10ms();
+        if per_10ms == 0 { return 1; }              // uncalibrated: floor to one quantum
+        let c = per_10ms.saturating_mul(ms) / 10;
+        if c == 0 { 1 } else { c }
+    }
+
     /// Read the hardware real-time clock (wall-clock date/time) via the kernel.
     ///
     /// Ambient - the time of day is task-neutral hardware info, like the TSC.

@@ -9,7 +9,7 @@ use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, Agg
 /// (~30 ms at 2 GHz; QEMU's 1-tick fallback makes it ~one quantum). Matches the `observe` q-poll
 /// cadence - long enough that the core halts between checks, short enough that regaining the
 /// keyboard reprints the prompt with no perceptible delay.
-const MUTED_POLL_SLEEP_CYCLES: u64 = 60_000_000;
+const MUTED_POLL_MS: u64 = 30;
 
 /// Longest command line the editor accepts.
 ///
@@ -298,7 +298,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // by - the observer distorting what it observes. Park + wake-on-release is still the endgame;
         // this is the cheap 99% of it. Regain latency stays one sleep, imperceptible at the prompt.
         if !ctx.is_console_foreground() {
-            ctx.sleep(MUTED_POLL_SLEEP_CYCLES);
+            ctx.sleep_ms(MUTED_POLL_MS);
             muted = true;
             continue;
         }
@@ -6300,7 +6300,7 @@ fn observe_shell_core(ctx: &ServiceContext) -> u32 {
 /// Per-poll sleep for the live view's `q` loop, in TSC cycles (~30 ms at 2 GHz; QEMU's 1-tick
 /// fallback makes it ~one quantum). The same idea as the painter's POLL_SLEEP_CYCLES: sleep, do
 /// not spin, so the observer never becomes the load it is displaying.
-const OBSERVE_QPOLL_SLEEP_CYCLES: u64 = 60_000_000;
+const OBSERVE_QPOLL_MS: u64 = 30;
 
 fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
     let _ = ctx.kill("observe-live"); // clear any stale instance
@@ -6333,7 +6333,7 @@ fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
             // its own observer: the shell's core sat at ~99-100% for as long as you watched - the
             // very artifact the painter's own sleep exists to avoid. ~30 ms per poll keeps `q`
             // latency imperceptible while the core halts between polls.
-            ctx.sleep(OBSERVE_QPOLL_SLEEP_CYCLES);
+            ctx.sleep_ms(OBSERVE_QPOLL_MS);
             let mut quit = false;
             while let Some(b) = ctx.try_console_read() {
                 if b == b'q' || b == b'Q' { quit = true; }
