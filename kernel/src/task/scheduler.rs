@@ -1095,6 +1095,17 @@ pub fn run(core_id: u32) -> ! {
                 let slow_idle = cid != 0 && crate::arch::imp::interrupts::idle_can_halt();
                 if slow_idle {
                     crate::arch::imp::boot::rearm_idle_timer();
+                } else if crate::arch::imp::interrupts::idle_can_halt() {
+                    // The BSP is excluded from the SLOW idle tick above (it must keep driving
+                    // MONOTONIC_TICKS, scan_timed_wakes and the COM polling at full rate) - but it is
+                    // still about to HALT. On a one-shot timer that means halting on a deadline that is
+                    // already in flight, and if that deadline was consumed the core never wakes.
+                    //
+                    // NEVER HALT WITHOUT A FRESHLY ARMED WAKE. This was invisible while services
+                    // spin-yielded, because the BSP never actually reached idle; once they started
+                    // blocking, the AMD T630 panicked ~5 s after boot with core 0 dark for 3 s - the
+                    // liveness watchdog correctly catching exactly the lost-wake it was written for.
+                    crate::arch::imp::boot::rearm_quantum_timer();
                 }
                 // No ready tasks; re-enable interrupts and loop.
                 // `wait_for_interrupt` issues only `sti` - no PAUSE, no HLT.

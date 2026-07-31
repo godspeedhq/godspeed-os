@@ -764,9 +764,20 @@ pub fn rearm_idle_timer() {
     }
 }
 
-/// Restore this core's timer to the normal preemption period after an idle wake (Phase 2a), so a
-/// task scheduled off that wake is preemptible on schedule rather than running until the idle
-/// deadline. Mirrors `rearm_idle_timer` across both timer modes.
+/// Restore this core's timer to the normal preemption period. Mirrors `rearm_idle_timer` across both
+/// timer modes.
+///
+/// Two callers, and the second is the one that matters:
+/// - **After an idle wake** (Phase 2a), so a task scheduled off that wake is preemptible on schedule
+///   rather than running until the idle deadline.
+/// - **BEFORE the BSP halts.** In TSC-Deadline mode the timer is ONE-SHOT, re-armed by software each
+///   tick, so a halting core depends on a deadline already in flight. The BSP is excluded from
+///   `rearm_idle_timer` (it must keep driving MONOTONIC_TICKS, scan_timed_wakes and the COM polling at
+///   full rate) and was then allowed to `hlt` anyway - halting on whatever deadline state it happened
+///   to hold. That is the "lost / never-re-armed TSC-Deadline" the liveness watchdog exists to catch,
+///   and on the AMD T630 it caught it: core 0 dark for 3 s, panic ~5 s after boot. It stayed invisible
+///   while services spin-yielded, because the BSP never actually reached idle. The rule the idle path
+///   was missing is **never halt without a freshly armed wake**.
 pub fn rearm_quantum_timer() {
     if TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
         // SAFETY: as `rearm_idle_timer` - ring-0, TSC-Deadline confirmed active.
