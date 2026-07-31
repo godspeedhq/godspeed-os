@@ -4,6 +4,25 @@
 > invariants. Re-run and append with each audit. First audit: 2026-07-11.
 
 
+
+## Audit 8 - the liveness watchdog, the MMIO reclaim, and the idle contract (2026-07-31, `feat/arm-usb-interrupt`)
+
+**Scope:** `d8de0f2..HEAD` - the per-arch `liveness_deadline_cycles`, the arm32 device-MMIO reclaim
+skip, the BSP idle-halt fix, and the scheduler idle path. Audited against the Ten Commandments.
+
+**Verdict: 0 new violations. 2 real defects were FOUND and FIXED by this work (both pre-existing).**
+
+| ID | Sev | Commandment | Finding |
+|----|-----|-------------|---------|
+| A8-1 | HIGH (pre-existing, FIXED) | V, IX, Invariant 12 | The BSP was excluded from `rearm_idle_timer` (it must keep driving MONOTONIC_TICKS/scan_timed_wakes/COM at 100 Hz) and then allowed to `hlt` regardless. In TSC-Deadline mode the timer is ONE-SHOT, so it halted onto a deadline already in flight; consumed, the core never woke. `LIVENESS WEDGE: core 0 ... slot 224` (224 = IDLE) ~5 s after boot on the T630. Latent for the life of the port - userspace spin-yielded, so the BSP never reached idle. FIXED @ 2b898c5: **never halt without a freshly armed wake**. |
+| A8-2 | HIGH (pre-existing, FIXED) | I, III | `reclaim_user_frames` (arm32) freed every PL0 leaf as "ours", including a driver's device MMIO mapping - 141 occurrences per 100 chaos rounds at phys 0x3F300000 (the Pi's EMMC window). Contained only by a DOWNSTREAM bounds check that happens to reject it on this SoC; a device mapped below top-of-RAM would have entered the free pool and been handed to a service as heap. FIXED @ 0ce48f6 by skipping on the PTE's own memory type. x86 already had the equivalent rule (PCD|PWT); the ARM port never carried it over. |
+| A8-3 | note | I, X | `liveness_deadline_cycles` moves the watchdog's deadline BEHIND the arch seam. This is complexity in the right place (§26.10): only the arch knows both its counter and its rate, and the previous neutral derivation silently disabled the whole check on any arch whose quantum figure is a stub. No new kernel responsibility - the same check, correctly parameterised. |
+| A8-4 | note | VI, Invariant 9 | Three new statics (`LATCH_CLEAR_FAILED`, `RECLAIM_DEVICE_LOGGED`, `LIVENESS_ARMED`). All are single-owner say-once flags in the layer that owns the event; none is read across a boundary or carries state another component reasons about. |
+| A8-5 | note | VIII | The new scheduler call site arms a timer before halting - that is arming a WAKE, not waiting on a clock for correctness. Correctness still comes from the wake itself. |
+| A8-6 | note | cross-arch | The new `rearm_quantum_timer` / `idle_can_halt` call sites resolve on all 7 arches (verified); arch_boundary_check passes, so the neutral scheduler still reaches hardware only through `arch::imp`. |
+
+**Standing:** unsafe_check (854 lines, no unaccounted additions), arch_boundary_check, identity 24/24.
+
 ## Audit 7 - the ARM USB hot-plug + storage-failure chain (2026-07-30, `feat/arm-usb-interrupt`)
 
 **Scope:** every change from `fba9081`..`d8de0f2` - the hot-plug watcher rewrite (level -> latch),

@@ -6,6 +6,26 @@
 > is its userspace counterpart. First audit: 2026-07-12.
 
 
+
+## Audit 7 - the wait helpers, the block-driver visibility, and the chaos harness (2026-07-31, `feat/arm-usb-interrupt`)
+
+**Scope:** `d8de0f2..HEAD` - the SDK wait-helper reversal, block-driver's slow-request reporting,
+the chaos pacing fix, and fs's truncation report. Audited against the Ten Commandments.
+
+**Verdict: 0 outstanding violations. 3 defects found and fixed DURING the period, 2 of them mine.**
+
+| ID | Sev | Commandment | Finding |
+|----|-----|-------------|---------|
+| A7-1 | HIGH (mine, REVERTED) | II, IX | Making the four SDK wait helpers BLOCK broke x86 networking: `net-stack` and `nic-driver` both sit on core 1, so every exchange is **same-core request/reply**, and net-stack degraded to "no NIC MAC yet". Proven by a hardware A/B (identical build, one difference). Reverted @ e72596d. **The suite could not see it:** identity, file-cap, fs-restart and reply-dead are ALL cross-core - 57 green tests covering none of the changed case. Recorded in the code: a future attempt needs a same-core request/reply test FIRST. |
+| A7-2 | MED (mine, FIXED) | VIII, X | The slow-request notice read `epoch_secs_monotonic()` - a SYSCALL - unconditionally at the top of `with_busy_retry`, so every block read/write paid one, plus one per busy iteration. Chaos pauses went 2.3% -> 20% of rounds: instrumentation added to explain a delay became a cause of one. FIXED @ 88418a8 - lazy (only once actually BUSY) and sampled (every 64th attempt). **Measure the cost of your instrumentation.** |
+| A7-3 | HIGH (pre-existing, FIXED) | VIII | `PACE_YIELDS = 3000` paced chaos rounds by COUNTING YIELDS. A yield costs a full quantum when the yielding task is the only runnable one - exactly the state chaos creates - so on the Pi that beat was 30.03 s, and only on rounds where nothing else was runnable. A count is not a duration and its cost is arch-dependent: the harness was measuring itself in units it does not control. FIXED @ de46f55 (clock-bounded, yield count kept as the §26.6 cap). Same bug in `SHELL_SETTLE_YIELDS`. |
+| A7-4 | note | V, §26.7 | block-driver now SAYS it is waiting (once per request, at 2 s, plus a resolution line). A correct 30 s wait that says nothing is indistinguishable from a dead board - it cost three chaos runs and two power-cuts of a healthy machine. A normal sub-millisecond request stays silent and pays nothing. |
+| A7-5 | note | V | fs reports a truncated reply rather than silently sending a short one, and an empty reply is now impossible (it goes out as FS_ERR). Both close silent-corruption paths rather than adding behaviour. |
+| A7-6 | note | III | The correlation tag (Audit 6) held under a 1M-round soak and repeated selfchecks; `shell: discarded an fs reply for tag N` fired on hardware exactly when an overtake occurred, confirming the mechanism is load-bearing rather than decorative. |
+
+**Standing:** contract_check unchanged (no contract touched); selfcheck 349/0 on both arches; ARM 1M-round
+soak in progress (55K+ clean at last inspection).
+
 ## Audit 6 - fs reply correlation, the buffered reply, and the blocking waits (2026-07-30, `feat/arm-usb-interrupt`)
 
 **Scope:** `services/fs` (correlation tag, buffered reply + in-place retry, failure logging),

@@ -7,6 +7,29 @@
 > `docs/kernel-audit.md`, userspace has `docs/userspace-audit.md`, and the docs themselves have this.
 > First audit: 2026-07-15.
 
+
+## Audit 3 - stale documentation that actively caused wrong diagnoses (2026-07-31, `feat/arm-usb-interrupt`)
+
+**North-star restated:** the least-capable reader, cold, should not have to GUESS. This audit found the
+sharper failure mode: documentation that is not merely absent but **confidently wrong**, which is worse -
+it is believed, and it redirects effort. Three instances, all of which cost real time in one session.
+
+| ID | Sev | Finding |
+|----|-----|---------|
+| DA3-1 | HIGH (FIXED) | `arch/x86_64/CLAUDE.md` described `wait_for_interrupt()` as "`sti` only - no C-state hint". The code has TWO branches and **halts** whenever `IDLE_CAN_HALT` (AMD, or ARAT in periodic mode). A reader trusting that table concludes the kernel never halts at idle - and so never looks for a halt-related lost wake, which is precisely the BSP panic diagnosed the same day. FIXED: the entry states both branches, and a new **"The idle contract: never halt without a freshly armed wake"** section explains the one-shot TSC-Deadline hazard, which core arms what, and why the BSP differs. |
+| DA3-2 | HIGH (FIXED, in-code) | `chan_dma` carried "until stage 2b, writes keep the spin path" long after stage 2b landed - `msc_write_block` passes `can_block=true`. Reading it as current produced a whole wrong diagnosis (a 30 s pause blamed on writes spinning with the core held, when the core was never held). A stale comment about a FINISHED stage is worse than none: it reads as present tense. Corrected @ ee457b3, along with `IO_BUDGET_US` still calling itself an IRQs-masked core-hold when on the async path it is a park timeout. |
+| DA3-3 | HIGH (FIXED, in memory) | An engineering note claimed the T630 TSC PIT-calibration was still "todo" **three weeks after it landed** (77a0e38, 2026-07-07, in main). Believing it produced a confident, wrong root-cause for an x86 failure ("TSC 1000x off -> 30 s waits"); the panic's own numbers disproved it (5988751200/300 = 19,962,504 cycles per 10 ms = ~2 GHz, correct). Corrected, with the lesson attached: **check the code before trusting a note that says "todo"**. |
+
+**The pattern worth naming.** All three are the same shape: a statement that was TRUE when written and
+was never revisited when the code moved past it. None would be caught by a grokability review (each
+reads clearly and plausibly) and none by CI. The only defence is that **a change which finishes a
+staged piece of work must sweep the notes that described it as pending** - the doc equivalent of
+Commandment III's "one truth". Cheap to state; this session paid for it three times.
+
+**Also fixed this session (doc-drift found while auditing code):** the retired hot-plug starvation
+diagnostic left no stale claims behind (its removal is recorded in the constant it left in place), and
+`docs/unsafe-audit.md` tracked every `unsafe` delta (dwc2 33 -> 34) with no unaccounted additions.
+
 ## North-star
 
 **The documentation must be clear enough that the least-capable AI model, working cold, does not have
