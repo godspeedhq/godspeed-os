@@ -1074,6 +1074,15 @@ static INPUT_READY: AtomicBool = AtomicBool::new(false);
 /// DR read - the same-core variant of the identical stale-DR duplication.
 static RX_DRAIN_CLAIMED: AtomicBool = AtomicBool::new(false);
 fn pl011_rx_drain() {
+    // Clear any stale exclusive-monitor reservation before the compare-exchange, for exactly the reason
+    // `pl011_write` does: ARMv7 does NOT guarantee the local monitor is cleared on exception entry or
+    // return, so a task interrupted mid-`ldrex`/`strex` can leave it reserved to a foreign address -
+    // after which EVERY `strex` here fails, forever. A CAS that can never succeed makes this drain
+    // return immediately every time, which is serial input silently dead. Omitting it is what broke
+    // serial on the first cut of this change; QEMU's TCG does not model the monitor strictly enough to
+    // show it, so it looked fine in emulation and failed on the Pi.
+    // SAFETY: `clrex` clears the local exclusive monitor; no memory effect.
+    unsafe { core::arch::asm!("clrex", options(nomem, nostack)); }
     // Claim, or stand aside. Acquire/Release pair the ring writes with the next claimant's view.
     if RX_DRAIN_CLAIMED
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
