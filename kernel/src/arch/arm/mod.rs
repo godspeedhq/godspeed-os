@@ -1058,14 +1058,29 @@ static INPUT_READY: AtomicBool = AtomicBool::new(false);
 /// again. Observed as `kkkill` / `chaos maxchaos max-carnage...` - typed commands garbled whenever
 /// output was streaming (the idle cores drain most eagerly exactly then), on QEMU and on the Pi alike.
 ///
-/// So: core 0 only (the same discipline as `dwc2::poll`), and the FR-check/DR-read/ring-append runs
-/// with IRQs masked so the core-0 tick cannot interleave with a syscall-path drain between the FR
-/// check and the DR read - the same-core variant of the identical stale-DR duplication.
+/// So the drain must have EXACTLY ONE producer at a time. It used to get that by refusing to run
+/// anywhere but core 0 - which is single-producer, but far more than single-producer, and the excess
+/// cost real function: `uart_rx_drain_now` exists precisely so a blocked `console_read` can collect its
+/// own input without waiting for the timer tick, and that self-drain was a silent no-op whenever the
+/// shell was not on core 0. Services are round-robin placed and re-placed on restart, so a shell that
+/// respawned onto core 1-3 lost its own input path and depended entirely on core 0 idling. The USB
+/// keyboard was unaffected (it pushes through `console_push_byte`), so the signature was the odd one of
+/// a live keyboard beside a dead serial line.
+///
+/// Exclusion is now by PROTOCOL rather than by core, the same discipline `UsbExclusive` uses next door:
+/// a CAS claims the drain, any core may win it, and a loser returns immediately instead of waiting -
+/// correct because the winner is draining that very FIFO right now, so the bytes reach the ring either
+/// way. IRQs stay masked inside so this core's own tick cannot interleave between the FR check and the
+/// DR read - the same-core variant of the identical stale-DR duplication.
+static RX_DRAIN_CLAIMED: AtomicBool = AtomicBool::new(false);
 fn pl011_rx_drain() {
-    let mpidr: u32;
-    // SAFETY: reading MPIDR (`c0, c0, 5`) is a side-effect-free PL1 register read.
-    unsafe { core::arch::asm!("mrc p15, 0, {m}, c0, c0, 5", m = out(reg) mpidr, options(nomem, nostack)); }
-    if mpidr & 3 != 0 { return; }
+    // Claim, or stand aside. Acquire/Release pair the ring writes with the next claimant's view.
+    if RX_DRAIN_CLAIMED
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
     let saved = interrupts::local_irq_save();
     // SAFETY: reading the PL011 FR/DR (Device-mapped MMIO) and appending to the ring; core-0-only and
     // IRQ-masked (above), so this is the only producer executing.
@@ -1082,6 +1097,9 @@ fn pl011_rx_drain() {
         }
     }
     interrupts::local_irq_restore(saved);
+    // Released on every path: the critical section above is bounded (it ends when the FIFO reads empty),
+    // masked, and cannot block, so there is no path that leaves the claim held.
+    RX_DRAIN_CLAIMED.store(false, Ordering::Release);
 }
 
 /// Pop one byte from the input ring (the ConsoleRead syscall consumer). `None` if empty.
