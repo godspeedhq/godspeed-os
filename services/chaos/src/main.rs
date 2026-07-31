@@ -33,8 +33,30 @@ const RECOVER_SECS: i64 = 8;        // wall-clock bound (RTC, portable) for the 
 const POLL_EVERY: u32 = 64;         // yields between clock polls in the handoff wait
 const MAX_CAND: usize = 32;         // bounded snapshot of live killable tasks per round
 const MAX_SVC: usize = 16;          // distinct services in the aggregate tally (~6-8 real)
-const SHELL_SETTLE_YIELDS: u32 = 4000; // let a freshly-respawned shell settle before we hand back
-const PACE_YIELDS: u32 = 3000;      // a beat between rounds so the panel/log stay readable + `q` lands
+const SETTLE_SECS: i64 = 1;            // the console hand-back beat (clock-bounded, see PACE_SECS)
+const SHELL_SETTLE_YIELDS: u32 = 200_000; // hard cap on that beat if the clock never advances
+// Iteration backstops for the two loops whose only escape was a WALL-CLOCK deadline. The Pi 2 has no
+// RTC, so `datetime().epoch_secs()` is frozen at 0 there and `now - t0 >= N` is never true - the bound
+// reads as bounded and is not. Both loops still wait on TRUTH (a message arrived; a live shell exists),
+// which is Commandment VIII; these only cap how long the ESCAPE can take when that truth never comes.
+// A yield count advances on any hardware, which is the whole point (the same reason `timer::delay_us`
+// keeps a spin cap next to its time bound).
+const HANDOFF_MAX_YIELDS: u32 = 200_000;  // the post-run wait for a live shell to hand the console to
+const ARGWAIT_MAX_YIELDS: u32 = 50_000;   // the startup wait for the shell's argument message
+/// The between-rounds beat, in SECONDS - because a yield COUNT is not a duration.
+///
+/// This was `3000` yields, tuned where a yield is cheap. A yield costs a full scheduler quantum whenever
+/// the yielding task is the only runnable one - which is exactly the state chaos creates, with every
+/// service killed and mid-restart - so on the Pi 2 (100 Hz) those 3000 yields are 30.03 SECONDS, and
+/// only on the rounds where everything else happens to be blocked. That is why the pauses looked random,
+/// why they clustered on exactly 30.0 s, and why the operator repeatedly took a healthy machine for a
+/// wedged one and reached for the power switch.
+///
+/// The harness was measuring itself in units whose cost it does not control (Commandment VIII: a proxy
+/// is not the truth). The beat is now bounded by the CLOCK, so it is the same beat on every arch, with
+/// `PACE_YIELDS` kept only as the hard cap that stops a stuck clock spinning forever (§26.6).
+const PACE_SECS: i64 = 1;
+const PACE_YIELDS: u32 = 200_000;   // hard cap on the beat if the clock never advances
 const MEMP_CHUNK: usize = 64 * 1024; // one mem-pressure round allocs this (held; chaos's limit bounds it)
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]; // matches the `date` utility
 
@@ -138,6 +160,17 @@ fn flood(ctx: &ServiceContext, name: &str, cache: &mut Option<CapHandle>) -> Opt
     Some((sent, sat, died))
 }
 
+/// Acknowledge `q` the instant it is read, before unwinding the run.
+///
+/// The abort itself always worked, but it was SILENT: a round is seconds long on slow hardware (a
+/// service respawn on the Pi 2 drags in USB storage re-init), so the operator pressed q, saw nothing
+/// change for ten-plus seconds, and reasonably concluded the key was being ignored. The report that
+/// eventually appeared looked like the run finishing early rather than the abort landing. One line at
+/// the moment of the keypress is the difference between "it works" and "it appears not to".
+fn ack_quit(ctx: &ServiceContext) {
+    ctx.console_write("\r\n  aborting at the next safe point...\r\n");
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The shell launcher sends the round count (always > 0 - the shell requires an explicit count) right
@@ -148,7 +181,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut tbuf = [0u8; 128];   // target string; may be a comma-separated list, so sized for a bounded list
     let mut tlen = 0usize;
     {
-        let t0 = ctx.datetime().epoch_secs();
+        let t0 = ctx.epoch_secs_monotonic();
+        let mut aw = 0u32;
         loop {
             if let Some(msg) = ctx.try_recv() {
                 let b = msg.payload_bytes();
@@ -156,7 +190,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if b.len() > 4 { let n = (b.len() - 4).min(128); tbuf[..n].copy_from_slice(&b[4..4 + n]); tlen = n; }
                 break;
             }
-            if ctx.datetime().epoch_secs() - t0 >= 2 { break; }
+            if ctx.epoch_secs_monotonic() - t0 >= 2 { break; }
+            aw += 1;
+            if aw >= ARGWAIT_MAX_YIELDS { break; }   // RTC-free hardware: the clock above never moves
             ctx.yield_cpu();
         }
     }
@@ -213,6 +249,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // for elapsed + the linear ETA (a pure extrapolation of elapsed over round progress, no outside truth).
     let start_dt = ctx.datetime();
     let start_epoch = start_dt.epoch_secs();
+    // ELAPSED is measured on the MONOTONIC clock, not this wall-clock stamp: the wall clock is settable
+    // (SNTP sets it on the RTC-less Pi), so a sync landing mid-run would make `now - start` jump by the
+    // whole correction and report an absurd elapsed/ETA. The datetime above is kept for the "started ..."
+    // readout, which is exactly what a wall clock IS for.
+    let start_mono = ctx.epoch_secs_monotonic();
     // Seed the random-storm PRNG from the RTC start time (varies per run); advanced each round so the
     // subset differs round-to-round. Only read in the `target_random` branch.
     let mut rng = Rng::new((start_epoch as u64)
@@ -235,7 +276,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // `q` aborts (round boundary; also polled between each kill/flood in the sweep below, so one q
         // press aborts within a sub-step rather than lagging a whole round). The kernel buffers the
         // keypress across input-driver churn, so it is caught here.
-        if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { break; } }
+        if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { ack_quit(&ctx); break; } }
         if round >= rounds { break; } // the bounded run is complete (rounds is always > 0 - the shell requires it)
 
         round += 1;
@@ -299,7 +340,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // Poll q between each kill/flood: a round can take seconds (services respawn), so checking
             // only at the round top made one q press lag a whole round. Now one press aborts within a
             // sub-step. (`break 'carnage` exits the round loop; the kernel buffers the key across churn.)
-            if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { break 'carnage; } }
+            if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { ack_quit(&ctx); break 'carnage; } }
             let nl = cand[c].1;
             let mut nbuf = [0u8; 24]; nbuf[..nl].copy_from_slice(&cand[c].0[..nl]);
             let name = str_of(&nbuf[..nl]);
@@ -365,7 +406,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let _ = write!(f, "  round {} / {} ({}%)\x1b[K\r\n", round, rounds, pct);
         // Wall-clock status line: when it began, how long it has run, and a linear ETA (no outside truth -
         // a pure extrapolation of elapsed over round progress). until-q has no total, so remains is n/a.
-        let elapsed = (ctx.datetime().epoch_secs() - start_epoch).max(0) as u64;
+        let elapsed = (ctx.epoch_secs_monotonic() - start_mono).max(0) as u64;
         let _ = write!(f, "  started {} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  |  elapsed ",
             WEEKDAYS[(start_dt.weekday() as usize) % 7], start_dt.year, start_dt.month, start_dt.day,
             start_dt.hour, start_dt.minute, start_dt.second);
@@ -410,9 +451,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Pace the round. With the recovery wait gone the loop would otherwise spin in milliseconds,
         // flooding the serial log and outrunning the eye. Yield a modest beat, still polling `q` (from the
         // SERIAL console - the keyboard is a chaos target) so an abort lands promptly.
-        for _ in 0..PACE_YIELDS {
-            if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { break 'carnage; } }
+        // Bounded by the clock, capped by the yield count - the same shape as the handoff wait above.
+        // The clock read is a syscall, so it is sampled every POLL_EVERY yields rather than every one.
+        let pace_t0 = ctx.epoch_secs_monotonic();
+        for k in 0..PACE_YIELDS {
+            if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { ack_quit(&ctx); break 'carnage; } }
             ctx.yield_cpu();
+            if k % POLL_EVERY == 0 && ctx.epoch_secs_monotonic() - pace_t0 >= PACE_SECS { break; }
         }
     }
 
@@ -439,17 +484,33 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (bounded) for a live shell to hand the keyboard back to, THEN release the foreground so that shell
     // resumes reading, THEN self-terminate so a finished run leaves no chaos task behind. Releasing
     // before a live shell exists would leave a window with no keyboard owner.
-    let t0 = ctx.datetime().epoch_secs();
+    let t0 = ctx.epoch_secs_monotonic();
     let mut k = 0u32;
     while slot_of(&ctx, "shell").is_none() {
         ctx.yield_cpu(); k += 1;
-        if k % POLL_EVERY == 0 && ctx.datetime().epoch_secs() - t0 >= RECOVER_SECS { break; }
+        if k % POLL_EVERY == 0 && ctx.epoch_secs_monotonic() - t0 >= RECOVER_SECS { break; }
+        // THE hang. Without this, a run that ends with no live shell spins here forever on any board
+        // without an RTC - and because the release below never runs, the console stays claimed by a
+        // task that will never finish: no prompt, no overlay, nothing. The foreground made that
+        // failure visible; it did not create it (before, the gate was hardwired open, so a stuck
+        // owner cost nothing). A missed handoff must degrade to "release anyway", never to a wedge.
+        if k >= HANDOFF_MAX_YIELDS {
+            ctx.console_writeln("chaos: no live shell after the run - releasing the console anyway");
+            break;
+        }
     }
     // Cosmetic hand-off pacing, NOT a completion wait (Commandment VIII): the live-shell TRUTH is
     // already established by the bounded slot_of loop above. This fixed pad only smooths the console
     // hand-back so our "done" line and the shell's redrawn prompt do not interleave; skipping it risks
     // at worst a momentary cosmetic glitch, never incorrectness. Deliberately time-based, not a truth-wait.
-    for _ in 0..SHELL_SETTLE_YIELDS { ctx.yield_cpu(); }
+    // Clock-bounded for the same reason as the round beat: 4000 yields is a blink where a yield is cheap
+    // and ~40 s on the Pi 2, where a lone runnable task pays a full quantum per yield. Cosmetic pacing
+    // should cost a moment on every machine, not most of a minute on one.
+    let settle_t0 = ctx.epoch_secs_monotonic();
+    for k in 0..SHELL_SETTLE_YIELDS {
+        ctx.yield_cpu();
+        if k % POLL_EVERY == 0 && ctx.epoch_secs_monotonic() - settle_t0 >= SETTLE_SECS { break; }
+    }
     // Print our last line FIRST, then release. The muted shell only draws its prompt once it regains the
     // foreground, so releasing BEFORE this printed "done" made the shell's `gsh>` land before the text
     // (the "switches screen, press Enter to see the prompt" glitch). done -> release -> the shell draws a

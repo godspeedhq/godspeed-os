@@ -13,7 +13,7 @@ use crate::arch::imp::context_switch::TaskContext;
 use crate::arch::imp::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -269,6 +269,9 @@ pub enum SpawnError {
     /// A live task with this name already exists. Refused to avoid duplicate
     /// instances - in particular a second trusted-root service (§6.2).
     AlreadyRunning,
+    /// An explicitly-requested core (contract `placement.core` / `spawn_on`) is not ready (§9.2). The
+    /// spawn is rejected rather than rerouted; the caller (e.g. the supervisor) may retry elsewhere.
+    PlacementInvalid,
 }
 
 impl From<crate::loader::LoadError> for SpawnError {
@@ -431,6 +434,11 @@ struct Privileges {
     service_control: bool, // SERVICE_CONTROL: kill/restart other services (§14.4)
     reboot:          bool, // REBOOT: hardware-reset the machine (shell `reboot` only - SEC-2)
     acquire_any:     bool, // ACQUIRE_ANY: reach ARBITRARY services by name via AcquireSendCap (§3.1)
+    net_device:      bool, // NET_DEVICE: move ethernet frames via the in-kernel USB-net bridge (ARM nic-driver)
+    usb_disk:        bool, // USB_DISK: read/write blocks on the in-kernel USB mass-storage device (ARM block-driver)
+    gpio:            bool, // GPIO_DEVICE: drive the SoC GPIO pins (ARM `gpio` shell command)
+    set_clock:       bool, // SET_CLOCK (WRITE): set the wall clock from SNTP (RTC-less ARM; net-stack)
+    set_clock_floor: bool, // SET_CLOCK (READ): raise the persisted clock floor only (the shell)
 }
 
 fn service_privileges(name: &str, is_probe: bool) -> Privileges {
@@ -456,6 +464,27 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // NEGATIVE pin - deliberately excluded so it holds no ACQUIRE_ANY (proves AcquireSendCap denies
         // a non-holder). Ordinary services get none; their AcquireSendCap is limited to declared peers.
         acquire_any: (is_probe && name != "adv-a13") || matches!(name, "shell" | "supervisor" | "chaos"),
+        // NET_DEVICE, GPIO_DEVICE, USB_DISK and SET_CLOCK are SANCTIONED KERNEL-ONLY BY-NAME GRANTS (the U15 / userspace-audit
+        // A5-U1 doctrine): they are deliberately NOT contract capabilities - the kernel is their single
+        // source of truth, and `contract_check.py` does not reconcile them. Both are arch-gated to ARM
+        // (off ARM the syscalls are inert stubs; SEC-31) so no dormant authority is handed out elsewhere.
+        // nic-driver (which DOES ship a contract) carries an ARM note in nic-driver.toml so a contract
+        // reader is not misled; the shell ships no contract, so the kernel is trivially its only record.
+        //   nic-driver bridges ethernet frames to/from the in-kernel USB-net device (NetFrame*, 42-44).
+        net_device: cfg!(target_arch = "arm") && matches!(name, "nic-driver"),
+        // USB_DISK: on ARM the USB stack is in-kernel, so `block-driver` reaches a USB stick through
+        // syscalls 46-48 rather than MMIO. Whole-device read/write reach, granted to that one service.
+        usb_disk: cfg!(target_arch = "arm") && matches!(name, "block-driver"),
+        //   the shell's `gpio` command drives the SoC pins (the gated `Gpio` syscall, 45).
+        gpio: cfg!(target_arch = "arm") && matches!(name, "shell"),
+        //   SET_CLOCK, in two strengths (rights narrow, §7.4). WRITE = set the wall clock itself, held only
+        //   by net-stack, which runs the SNTP exchange (the RTC-less ARM port has no other time source).
+        //   READ = raise the persisted clock FLOOR only, held by the shell, which reads the last-known time
+        //   off the disk at startup and records it before a reboot. The shell needs the bound, not the
+        //   clock, so it does not get the power to step every task's time of day. A kernel-only by-name
+        //   grant like NET_DEVICE (not a contract cap). ARM-gated: x86's CMOS RTC is the authority there.
+        set_clock:       cfg!(target_arch = "arm") && matches!(name, "net-stack"),
+        set_clock_floor: cfg!(target_arch = "arm") && matches!(name, "shell"),
     }
 }
 
@@ -647,7 +676,15 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true, // serves block read/write requests from fs (§4)
             send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
             send_peers_grant:  false,
-            preferred_core:    1,
+            // ARM pins this to core 0, and it is NOT a preference there - it is a requirement. The
+            // USB mass-storage syscalls run against the in-kernel DWC2 stack, whose single host
+            // channel and DMA buffer are shared with the keyboard poll in core 0's timer ISR; every
+            // `msc_*` entry point refuses outright when `!on_core0()`. Placement lives HERE, in the
+            // one place both boot and RESTART consult. It used to be an unconditional 1 with the
+            // supervisor overriding it to 0 at boot only, so a restarted block-driver came back on
+            // core 1 and every block operation failed forever - storage dead until reboot, and
+            // restartability (invariant 6) broken on ARM by a value that disagreed with itself.
+            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[],
@@ -662,7 +699,9 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true, // will serve the frame interface to net-stack (§12)
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    1,
+            // ARM: the NIC is the in-kernel DWC2 USB device, driven only from core 0 - the ARM backend's
+            // NET_DEVICE syscalls guard on that core. x86: core 1 (co-located with net-stack + fs).
+            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[], // Phase 1 step 2: reset + MAC only; RX IRQ wired later
@@ -677,7 +716,8 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true,               // nic-driver replies frames here (per-request reply cap)
             send_peers:        &["nic-driver"],    // the frame interface; reacquired by name on death
             send_peers_grant:  false,
-            preferred_core:    1,
+            // ARM: co-locate with nic-driver on core 0 (avoids QEMU-TCG cross-core IPC latency). x86: core 1.
+            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[],
@@ -3172,21 +3212,28 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
 /// Resolve which core a spawn lands on: explicit override, else the contract's
 /// preferred core (falling back to round-robin if it isn't ready), else
 /// round-robin across ready cores.
-fn resolve_spawn_core(core_override: Option<u32>, preferred_core: u32) -> u32 {
+fn resolve_spawn_core(core_override: Option<u32>, preferred_core: u32) -> Result<u32, SpawnError> {
     use core::sync::atomic::{AtomicU32, Ordering};
     static RR: AtomicU32 = AtomicU32::new(0);
     match core_override {
-        Some(n) => n,
+        // An explicitly-requested core (contract `placement.core`, or the supervisor's `spawn_on`) is
+        // STRICT (§9.2): if it is not ready, REJECT with PlacementInvalid rather than silently placing
+        // the service on a core no scheduler runs (which would strand it). On a multi-core machine the
+        // requested core is ready, so this always passes and nothing changes; on a single-core machine
+        // (the Pi 2, APs parked) it is what makes the supervisor's `spawn_on(x, 1)` fall back to core 0
+        // instead of stranding `x` on the parked core.
+        Some(n) if crate::smp::core::is_ready(n) => Ok(n),
+        Some(_) => Err(SpawnError::PlacementInvalid),
         None if preferred_core == u32::MAX => {
             let count = crate::smp::core::ready_count() as u32;
-            if count == 0 { 0 } else { RR.fetch_add(1, Ordering::Relaxed) % count }
+            Ok(if count == 0 { 0 } else { RR.fetch_add(1, Ordering::Relaxed) % count })
         }
         None => {
             if crate::smp::core::is_ready(preferred_core) {
-                preferred_core
+                Ok(preferred_core)
             } else {
                 let count = crate::smp::core::ready_count() as u32;
-                RR.fetch_add(1, Ordering::Relaxed) % count.max(1)
+                Ok(RR.fetch_add(1, Ordering::Relaxed) % count.max(1))
             }
         }
     }
@@ -3205,7 +3252,7 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
     -> Result<(), SpawnError>
 {
     let (static_name, cfg) = service_config(producer).ok_or(SpawnError::NotFound)?;
-    let core_id = resolve_spawn_core(core_override, cfg.preferred_core);
+    let core_id = resolve_spawn_core(core_override, cfg.preferred_core)?;
     // The delegated pipe peer goes FIRST so the producer/filter reaches it via
     // `send_peer_at(0)` (its "downstream"); the contract's own peers follow, so a filter that
     // must register its name to receive a stage's input (e.g. `upper`) still can. Bounded by
@@ -3242,7 +3289,7 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<O
         return Err(SpawnError::AlreadyRunning);
     }
 
-    let core_id = resolve_spawn_core(core_override, cfg.preferred_core);
+    let core_id = resolve_spawn_core(core_override, cfg.preferred_core)?;
 
     let result = spawn_service_with_config(static_name, cfg.elf, core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
@@ -3266,7 +3313,7 @@ pub fn spawn_service_by_name_with_installs(
         crate::kprintln!("task: spawn '{}' rejected: already running", static_name);
         return Err(SpawnError::AlreadyRunning);
     }
-    let core_id = resolve_spawn_core(core_override, cfg.preferred_core);
+    let core_id = resolve_spawn_core(core_override, cfg.preferred_core)?;
     let result = spawn_service_with_config(static_name, cfg.elf, core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
                               cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
@@ -3537,6 +3584,44 @@ fn spawn_service_with_config(
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
+    // NET_DEVICE: the ARM `nic-driver` moves ethernet frames via the in-kernel USB-net bridge
+    // (NetFrame*/NetInfo, syscalls 42-44). WHO holds it is in `service_privileges`; here we only mint it.
+    if privs.net_device {
+        let nd_cap = mint_cap(NET_DEVICE_RESOURCE, Rights::WRITE);
+        caps.insert(nd_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+
+    // USB_DISK: the ARM `block-driver` reads/writes a USB stick through the in-kernel Bulk-Only stack
+    // (UsbDisk*, syscalls 46-48). Minted here; WHO holds it is in `service_privileges`.
+    if privs.usb_disk {
+        let ud_cap = mint_cap(USB_DISK_RESOURCE, Rights::WRITE);
+        caps.insert(ud_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+
+    // GPIO_DEVICE: the shell's `gpio` command drives the SoC pins (ARM `Gpio` syscall). Minted here; WHO
+    // holds it is in `service_privileges`.
+    if privs.gpio {
+        let g_cap = mint_cap(GPIO_DEVICE_RESOURCE, Rights::WRITE);
+        caps.insert(g_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+
+    // SET_CLOCK: net-stack sets the wall clock from SNTP (`SetClock` syscall) on the RTC-less ARM port.
+    // Minted here; WHO holds it is in `service_privileges`. Inert (no-op syscall) off ARM.
+    if privs.set_clock {
+        let sc_cap = mint_cap(SET_CLOCK_RESOURCE, Rights::WRITE);
+        caps.insert(sc_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+    // The floor-only strength: READ raises the bound, it cannot set the clock (§7.4 - rights narrow).
+    if privs.set_clock_floor {
+        let cf_cap = mint_cap(SET_CLOCK_RESOURCE, Rights::READ);
+        caps.insert(cf_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+
     // 5. Send-peer SEND caps (wired at spawn from the name directory).
     let mut peer_data: [(u32, u32, [u8; PEER_NAME_BYTES]); MAX_SEND_PEERS] =
         [(u32::MAX, 0, [0u8; PEER_NAME_BYTES]); MAX_SEND_PEERS];
@@ -3620,7 +3705,9 @@ fn spawn_service_with_config(
     // service holds exactly one controller, and each has its own address space, so
     // the shared VA + ctx field (`xhci_mmio_va`, read by `ctx.xhci_mmio()` /
     // `ctx.ehci_mmio()`) is unambiguous (§12).
-    let xhci_mmio_va = {
+    // The mapped MMIO window's VA + byte length; the length lets the SDK's `Mmio` wrapper bounds-check
+    // accesses (SEC-4). (0, 0) = this service gets no MMIO.
+    let (xhci_mmio_va, xhci_mmio_len) = {
         // The controller BAR for this driver's declared class (audit M7): xHCI/EHCI/AHCI use their
         // register base; a NIC only when it is a model we drive (e1000 / RTL8168) - otherwise 0, so the
         // driver gets no mapping and idles, never touching foreign hardware (Commandment VII).
@@ -3639,14 +3726,17 @@ fn spawn_service_with_config(
                     .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::MapFailed })?;
             }
             crate::kprintln!("spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}", name, bar, XHCI_MMIO_VA);
-            XHCI_MMIO_VA
+            (XHCI_MMIO_VA, XHCI_MMIO_PAGES * PAGE_SIZE as u64)
+        } else if let Some((va, len)) = crate::arch::imp::map_fixed_driver_mmio(&mut page_table, name) {
+            // Non-PCI fixed-physical peripheral MMIO grant (§12.3 for a bus with no PCI scan - the Pi's
+            // peripherals are at fixed addresses). The arch layer maps the window Device+USER and returns
+            // its (VA, len); on x86 this is always None (PCI BARs handle it above).
+            crate::kprintln!("spawn[mmio]: '{}' fixed peripheral -> VA {:#x} ({} B)", name, va, len);
+            (va, len)
         } else {
-            0
+            (0, 0)
         }
     };
-    // The mapped MMIO window is a uniform XHCI_MMIO_PAGES for every driver class; passing its byte
-    // length to the service lets the SDK's `Mmio` wrapper bounds-check accesses (SEC-4). 0 = no BAR.
-    let xhci_mmio_len: u64 = if xhci_mmio_va != 0 { XHCI_MMIO_PAGES * PAGE_SIZE as u64 } else { 0 };
 
     // 6b. Allocate + map a physically-contiguous DMA arena for the xHCI driver
     // (§12). The controller DMAs into this memory (rings/contexts), so the driver
@@ -3795,9 +3885,14 @@ fn spawn_service_with_config(
 
     // 8. Initial ring-3 context.
     let cr3 = page_table.into_cr3();
-    // SAFETY: kstack_top is valid kernel memory; entry_va and USER_STACK_TOP
-    // are valid ring-3 addresses in the new page table.
+    // SAFETY: `finalize_service_address_space` - arch hook: on ARM it clones the kernel identity into
+    // the service page table and cleans the D-cache for the non-cacheable walker (the kernel is not
+    // shared higher-half as on x86), a no-op on x86; runs after ALL of the service's regions (ELF,
+    // stack, ctx) are mapped and `cr3` is the freshly-built, not-yet-active root. `new_user`:
+    // kstack_top is valid kernel memory; entry_va and USER_STACK_TOP are valid ring-3 addresses in the
+    // new page table. (Both in one block so this stays at `task/`'s grandfathered unsafe floor, §18.5.)
     let ctx = unsafe {
+        crate::arch::imp::page_tables::finalize_service_address_space(cr3);
         TaskContext::new_user(kstack_top, entry_va, USER_STACK_TOP, cr3)
     };
 
@@ -3834,6 +3929,40 @@ pub fn spawn_supervisor() {
     match spawn_service_with_config("supervisor", SUPERVISOR_ELF, 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => panic!("supervisor spawn failed: {:?}", e),
+    }
+}
+
+/// ARM bring-up (increment 4a): spawn the logger through the **neutral** `spawn_service_with_config` -
+/// the exact machinery the supervisor's spawn syscall uses - to prove the real spawn path works on ARM
+/// (page tables + kstack pool + cap wiring + ctx page + the ARM `finalize_service_address_space` hook).
+/// The full-OS build spawns via the supervisor instead; this is the direct probe. Requires the neutral
+/// bootstrap (percpu / scheduler arenas / capability) to have run first.
+#[cfg(target_arch = "arm")]
+pub fn arm_spawn_logger_neutral() {
+    static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
+    match spawn_service_with_config(
+        "logger", LOGGER_ELF, 0, /*has_recv_endpoint=*/true, &[], 0, false,
+        8 * 1024 * 1024, &[], false, None,
+    ) {
+        Ok(_)  => crate::kprintln!("arm: logger spawned via the neutral spawn path"),
+        Err(e) => crate::kprintln!("arm: logger neutral spawn FAILED: {:?}", e),
+    }
+}
+
+/// ARM bring-up (increment 5): spawn the shell through the neutral spawn path with a CONSOLE_READ cap,
+/// so it reads serial input from the PL011 RX ring. `send_peers=&[]` (not `["fs"]` as on x86) because
+/// there is no `fs` on the Pi 2 yet - file/history commands degrade, but the prompt comes up and every
+/// non-fs command (`help`, `version`, ...) works. The shell's other authorities (spawn/kill/reboot)
+/// come from `service_privileges("shell")` automatically.
+#[cfg(target_arch = "arm")]
+pub fn arm_spawn_shell_neutral() {
+    static SHELL_ELF: &[u8] = include_bytes!(env!("SVC_SHELL_ELF"));
+    match spawn_service_with_config(
+        "shell", SHELL_ELF, 0, /*has_recv_endpoint=*/true, &[], 0, false,
+        8 * 1024 * 1024, &[], /*has_console_read=*/true, None,
+    ) {
+        Ok(_)  => crate::kprintln!("arm: shell spawned (console-read wired)"),
+        Err(e) => crate::kprintln!("arm: shell spawn FAILED: {:?}", e),
     }
 }
 

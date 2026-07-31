@@ -100,6 +100,14 @@ unsafe extern "C" fn ring3_entry_trampoline() -> ! {
 }
 
 impl TaskContext {
+    /// An all-zero context. The scheduler seeds `cr3` on first use (`run()`), so a zeroed context is
+    /// the correct starting state for the per-core scheduler/dead-context arenas. Exposing this as a
+    /// primitive keeps the arch-specific field names (`rbx`, `rip`, ...) inside the arch layer - the
+    /// neutral scheduler builds its zero contexts through `TaskContext::ZERO`, naming no register.
+    pub const ZERO: Self = Self {
+        rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rip: 0, rsp: 0, cr3: 0,
+    };
+
     /// Build the initial context for a kernel task.
     ///
     /// `entry`     - function the task will start executing.

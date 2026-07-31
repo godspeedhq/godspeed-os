@@ -30,6 +30,19 @@ pub enum DeadlineOutcome {
     Timeout,
 }
 
+/// Where a wall-clock reading came from. Reported alongside the time so a displayed timestamp says what
+/// it is standing on: a local hardware clock, a network correction, or nothing (§26.4 - a fallback chain
+/// is mechanism while its choice is visible, and magic when it is not).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ClockSource {
+    /// No clock: no hardware RTC and nothing has set the time. `date` says so rather than inventing one.
+    Unset,
+    /// A local hardware real-time clock reading a plausible date.
+    Rtc,
+    /// Set from the network (SNTP) this boot.
+    Ntp,
+}
+
 /// Wall-clock date/time read from the hardware RTC, fully decoded (binary,
 /// 24-hour). See [`ServiceContext::datetime`].
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,6 +56,30 @@ pub struct Datetime {
 }
 
 impl Datetime {
+    /// Decode Unix epoch seconds into calendar fields (Howard Hinnant's `civil_from_days`) - the inverse
+    /// of [`Datetime::epoch_secs`]. Used to render a stored epoch, such as the clock floor, as a date.
+    pub fn from_epoch_secs(epoch: i64) -> Datetime {
+        let days = epoch.div_euclid(86_400);
+        let rem = epoch.rem_euclid(86_400);
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        Datetime {
+            year:  (y + (m <= 2) as i64) as u16,
+            month: m as u8,
+            day:   d as u8,
+            hour:   (rem / 3_600) as u8,
+            minute: ((rem % 3_600) / 60) as u8,
+            second: (rem % 60) as u8,
+        }
+    }
+
     /// Days since the epoch (1970-01-01), proleptic Gregorian and leap-year aware
     /// (Howard Hinnant's `days_from_civil`). The basis for both `weekday` and
     /// `epoch_secs`.
@@ -145,6 +182,27 @@ mod datetime_tests {
         assert_eq!(dt(1970, 1, 1, 0, 0, 0).weekday(), 4);
         assert_eq!(dt(2000, 1, 1, 0, 0, 0).weekday(), 6);
         assert_eq!(dt(2026, 6, 6, 0, 0, 0).weekday(), 6);
+    }
+
+    #[test]
+    fn from_epoch_secs_round_trips_over_the_sweep() {
+        // The INVERSE (civil_from_days) must undo epoch_secs exactly, over the same multi-century sweep -
+        // the drift guard its forward twin already has. Without this, the only thing pinning the decode
+        // used to render a stored epoch (the clock floor) would be that it looked right once.
+        for y in 1971..=2100i64 {
+            for mo in 1..=12i64 {
+                let last = days_in_month(y, mo);
+                for &d in &[1i64, 15, 28, last] {
+                    for &(h, mi, s) in &[(0i64, 0i64, 0i64), (23, 59, 59), (12, 30, 15)] {
+                        let a = dt(y as u16, mo as u8, d as u8, h as u8, mi as u8, s as u8);
+                        assert!(Datetime::from_epoch_secs(a.epoch_secs()) == a,
+                            "from_epoch_secs round-trip mismatch at {}-{:02}-{:02} {:02}:{:02}:{:02}",
+                            y, mo, d, h, mi, s);
+                    }
+                }
+            }
+        }
+        assert!(Datetime::from_epoch_secs(0) == dt(1970, 1, 1, 0, 0, 0));
     }
 }
 
@@ -313,10 +371,68 @@ fn cache_send_slot(name: &str, new_slot: u32) {
     }
 }
 
+/// These wait helpers POLL (`try_recv` + `yield_cpu`); they do not block. That is deliberate, and it is
+/// a REVERSAL - they were made to block earlier on this branch, and the change was wrong twice over.
+///
+/// Why it was tried: a blocked task lets the core reach the scheduler's idle path, which saves power and
+/// (on ARM) lets idle-hook work run while a command waits. Both are real benefits.
+///
+/// Why it is reverted:
+/// 1. **It broke x86 networking.** net-stack and nic-driver both sit on core 1, and every exchange
+///    between them goes through `request_with_reply_deadline`. With blocking waits, net-stack degraded
+///    to "no NIC MAC yet (driver absent/not ready)" and DHCP/ARP never completed; restoring the poll
+///    made DHCP, ARP and a sustained 14 ms ping work immediately. Proven by an A/B on real hardware -
+///    identical build, this one difference.
+/// 2. **It bought nothing that survived.** It was introduced to make USB hot-plug get noticed during a
+///    `ping`. That symptom turned out to be the chaos harness pacing itself with a fixed yield count
+///    (3000 yields x a full quantum = 30 s on the Pi), not these helpers. The hot-plug fixes that
+///    actually worked were the hub change-latch and the catch-up sweep, neither of which needs this.
+///
+/// It also exposed a genuine kernel bug on the way through - the BSP halting onto a consumed one-shot
+/// TSC deadline - which is FIXED and stays fixed independently of this revert.
+///
+/// The lesson worth keeping: same-core request/reply through a blocking waiter is not exercised by the
+/// test suite (identity and fs-restart are all cross-core), so a change here cannot be validated by
+/// those suites. If blocking is attempted again, it needs a same-core request/reply test first.
+
 /// Passed by the kernel to `service_main`. Non-Copy; one per service instance.
 pub struct ServiceContext {
     _private: (),
 }
+
+/// The USB-disk syscalls' "device NAKed, re-ask" status.
+///
+/// Outside the capability-error range (-2..-7) ON PURPOSE, and this must stay in step with the kernel's
+/// `USB_DISK_BUSY` (`kernel/src/syscall/dispatch.rs`). It was originally `-2`, which is `CapNotHeld`, so
+/// a driver missing its `USB_DISK` capability was indistinguishable from a busy device and got retried
+/// thousands of times before being reported as a device that "stayed busy" - a cap failure wearing an
+/// I/O failure's name.
+pub const USB_DISK_BUSY: i64 = -20;
+
+/// No USB disk is attached - the opposite instruction to [`USB_DISK_BUSY`], and it must stay in step with
+/// the kernel's `USB_DISK_ABSENT`. BUSY means "come back, I am working"; ABSENT means "there is nothing
+/// here, and asking again cannot change that - only a hot-plug can". A caller that retries on this waits
+/// out its entire budget against an empty socket and then reports the device as busy, which is a false
+/// statement about hardware sitting on the operator's desk.
+pub const USB_DISK_ABSENT: i64 = -21;
+
+/// Can this LBA survive the syscall ABI intact?
+///
+/// The ARM ABI gives each syscall argument exactly ONE 32-bit register (`arch/arm/CLAUDE.md`, hazard
+/// A-U1), so a wider value is silently narrowed on the way in. That matters here more than anywhere:
+/// the kernel guards `lba >= MSC_SECTORS` and then builds a READ(10)/WRITE(10) CDB, but it guards the
+/// value it RECEIVED. An LBA of 0x1_0000_0000 arrives as 0, passes the range check, and overwrites the
+/// GSFS superblock while the device, `block-driver` and `fs` all report success - a range check
+/// defeated one level above itself, and silent corruption of exactly the block the check exists to
+/// protect. On x86 the same request is rejected loudly, so the two ports would disagree about what is
+/// a valid write.
+///
+/// Rejecting it in the wrapper is the fix the ABI hazard prescribes (clamp before the syscall, or split
+/// into a register pair). Nothing legitimate is refused: capacity comes from SCSI READ CAPACITY(10),
+/// whose last-LBA field is 32 bits wide, so an LBA above `u32::MAX` is a caller bug - and it is
+/// reported as a failure rather than aliased onto a real block (Invariant 12, failures are loud).
+#[inline]
+fn lba_fits_syscall_abi(lba: u64) -> bool { lba <= u32::MAX as u64 }
 
 impl ServiceContext {
     #[inline]
@@ -393,6 +509,30 @@ impl ServiceContext {
     pub fn sleep(&self, cycles: u64) {
         // SAFETY: syscall(37) = Sleep; sleeping your own task is unprivileged (like yield).
         let _ = unsafe { raw_syscall(37, cycles, 0, 0) };
+    }
+
+    /// Transmit one raw ethernet frame via the in-kernel USB-net device (the ARM DWC2 CDC-ECM bridge).
+    /// Gated by the NET_DEVICE cap (the ARM `nic-driver` holds it). Returns true if it was sent. Both
+    /// args are pointer + length, so they fit the 32-bit ABI without truncation. Inert on non-ARM.
+    #[must_use = "the frame is NOT on the wire if this is false"]
+    pub fn net_frame_tx(&self, frame: &[u8]) -> bool {
+        // SAFETY: syscall(42) = NetFrameTx; the kernel range-checks (ptr, len) before copying.
+        unsafe { raw_syscall(42, frame.as_ptr() as u64, frame.len() as u64, 0) >= 0 }
+    }
+
+    /// Receive one raw ethernet frame into `dst` (a single bulk-IN poll). Returns the frame length, or 0
+    /// if none is available. Gated by the NET_DEVICE cap.
+    pub fn net_frame_rx(&self, dst: &mut [u8]) -> usize {
+        // SAFETY: syscall(43) = NetFrameRx; the kernel range-checks (ptr, len) before writing.
+        let r = unsafe { raw_syscall(43, dst.as_mut_ptr() as u64, dst.len() as u64, 0) };
+        if r > 0 { r as usize } else { 0 }
+    }
+
+    /// Query the USB-net device: writes `[mac(6), link(1)]` (7 bytes) into `out`. Returns true if a net
+    /// device is up. Gated by the NET_DEVICE cap.
+    pub fn net_info(&self, out: &mut [u8; 7]) -> bool {
+        // SAFETY: syscall(44) = NetInfo; the kernel writes exactly 7 range-checked bytes.
+        unsafe { raw_syscall(44, out.as_mut_ptr() as u64, 0, 0) == 1 }
     }
 
     /// Block until a message arrives; returns the error instead of looping silently.
@@ -573,9 +713,20 @@ impl ServiceContext {
         // T630) would otherwise make `now - t0` read huge and expire the deadline instantly.
         let t0 = self.epoch_secs_monotonic();
         loop {
+            // Block, do not spin - see `request_with_reply_abortable` for why this matters beyond power.
             if let Some(r) = self.try_recv() { return DeadlineOutcome::Reply(r); }
+            self.yield_cpu();   // Poll, do not block
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 self.remove_cap(reply_cap);   // reply never consumed - reclaim its slot
+                // CALLER BEWARE: the request was already SENT, so the peer will reply into our endpoint
+                // whether we are listening or not. Reclaiming the reply CAP does not remove that message
+                // from the queue - the NEXT `try_recv` on this endpoint may return the ABANDONED reply
+                // instead of the answer it expects. That has bitten for real: a timed-out fs read left a
+                // 1-byte `[FS_NOTFOUND]` behind, and the next command consumed it and reported a healthy
+                // mounted disk as absent. `request_with_reply_abortable` avoids this with a DRAIN at its
+                // own top; this variant cannot drain blindly, because a service that also SERVES on this
+                // endpoint (net-stack) would discard live client requests. So a caller that can time out
+                // must reclaim the late reply itself - see the shell's `reclaim_late_fs_reply`.
                 return DeadlineOutcome::Timeout;
             }
             self.yield_cpu();
@@ -609,18 +760,31 @@ impl ServiceContext {
         }
         let t0 = self.epoch_secs_monotonic();
         loop {
-            if let Some(r) = self.try_recv() { self.remove_cap(reply_cap); return ReqOutcome::Reply(r); }
+            // BLOCK for the reply, with a short timeout - do not spin. `try_recv` + `yield_cpu` kept this
+            // task permanently RUNNABLE, so a core running a waiting command never reached the scheduler's
+            // idle path at all. On ARM that path is where USB hot-plug is watched, so plugging or
+            // unplugging anything during a `ping` was noticed only once the ping ended: the events queued
+            // up and all arrived at the prompt. It also pegged the core at 100% for a task that is, in
+            // truth, doing nothing (the same busy-wait the `observe` and muted loops were already fixed
+            // for - see MUTED_POLL_SLEEP_CYCLES). Blocking parks the task, the core halts, idle work runs.
+            if let Some(r) = self.try_recv() {
+                self.remove_cap(reply_cap);
+                return ReqOutcome::Reply(r);
+            }
             while let Some(b) = self.try_console_read() {
                 // q/Q/ESC aborts IMMEDIATELY - never wait for the in-flight reply (that wait was the
                 // "it pauses instead of quitting" complaint). The peer's late reply lands in our endpoint
                 // and the drain atop the NEXT abortable request clears it, so it pollutes nothing.
+                // "Immediately" still holds: the abort does not wait on the peer. What the block adds is
+                // up to one poll interval before the keypress is LOOKED at - tens of milliseconds, under
+                // the threshold at which a person can tell, and the same trade the observe loop makes.
                 if b == b'q' || b == b'Q' || b == 0x1b { self.remove_cap(reply_cap); return ReqOutcome::Aborted; }
             }
+            self.yield_cpu();   // Poll, do not block
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 self.remove_cap(reply_cap);
                 return ReqOutcome::Timeout;
             }
-            self.yield_cpu();
         }
     }
 
@@ -651,7 +815,13 @@ impl ServiceContext {
         let t0 = self.epoch_secs_monotonic();
         let mut on_linger = Some(on_linger);   // FnOnce, fired at most once when the wait lingers
         loop {
-            if let Some(r) = self.try_recv() { self.remove_cap(reply_cap); return ReqOutcome::Reply(r); }
+            // Block, do not spin - see `request_with_reply_abortable`. This is the variant `net`/`ping`
+            // actually use (the "press q to abort" hint), so it is the one that kept core 0 permanently
+            // busy during a continuous ping and starved the idle-path USB hot-plug watch.
+            if let Some(r) = self.try_recv() {
+                self.remove_cap(reply_cap);
+                return ReqOutcome::Reply(r);
+            }
             while let Some(b) = self.try_console_read() {
                 if b == b'q' || b == b'Q' || b == 0x1b { self.remove_cap(reply_cap); return ReqOutcome::Aborted; }
             }
@@ -659,6 +829,7 @@ impl ServiceContext {
             if elapsed >= hint_after_secs {
                 if let Some(f) = on_linger.take() { f(); }
             }
+            self.yield_cpu();   // Poll, do not block
             if elapsed >= max_secs {
                 self.remove_cap(reply_cap);
                 return ReqOutcome::Timeout;
@@ -683,14 +854,15 @@ impl ServiceContext {
     pub fn recv_abortable_deadline(&self, max_secs: i64) -> ReqOutcome {
         let t0 = self.epoch_secs_monotonic();
         loop {
+            // Block, do not spin - see `request_with_reply_abortable`.
             if let Some(r) = self.try_recv() { return ReqOutcome::Reply(r); }
             while let Some(b) = self.try_console_read() {
                 if b == b'q' || b == b'Q' || b == 0x1b { return ReqOutcome::Aborted; }
             }
+            self.yield_cpu();   // Poll, do not block
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 return ReqOutcome::Timeout;
             }
-            self.yield_cpu();
         }
     }
 
@@ -702,6 +874,7 @@ impl ServiceContext {
     /// directory**, not a service. The directory is populated synchronously at each service's spawn,
     /// so there is no round-trip and no bootstrap chicken-and-egg (the directory lives in the kernel,
     /// always reachable). `reacquire_cap` also updates the send-cap cache.
+    #[must_use = "the peer is NOT reacquired if this is false"]
     pub fn reacquire_by_name(&self, peer: &str) -> bool {
         self.reacquire_cap(peer).is_ok()
     }
@@ -826,6 +999,80 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u32 }
     }
 
+    /// Capacity of the in-kernel USB mass-storage device in 512-byte sectors, 0 if none is attached.
+    /// Requires the `USB_DISK` capability. Syscall 46.
+    pub fn usb_disk_sectors(&self) -> u64 {
+        // SAFETY: syscall(46) = UsbDiskInfo; no arguments, gated by the USB_DISK capability.
+        let ret = unsafe { raw_syscall(46, 0, 0, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
+    /// Read the 512-byte block at `lba` from the USB mass-storage device into `dst`. Returns false if
+    /// there is no device, the LBA is past the end, or the transfer failed. Requires `USB_DISK`.
+    /// Syscall 47.
+    #[must_use = "the destination buffer is NOT valid data if this is false"]
+    pub fn usb_disk_read(&self, lba: u64, dst: &mut [u8; 512]) -> bool {
+        // SAFETY: syscall(47) = UsbDiskRead; the kernel writes exactly 512 bytes to `dst` on success,
+        // through its checked user-pointer path.
+        if !lba_fits_syscall_abi(lba) { return false; }
+        let ret = unsafe { raw_syscall(47, lba, dst.as_mut_ptr() as u64, 0) };
+        ret == 0
+    }
+
+    /// Write `src` as the 512-byte block at `lba` on the USB mass-storage device. Requires `USB_DISK`.
+    /// Syscall 48.
+    #[must_use = "the block did NOT reach the medium if this is false"]
+    pub fn usb_disk_write(&self, lba: u64, src: &[u8; 512]) -> bool {
+        // SAFETY: syscall(48) = UsbDiskWrite; the kernel reads exactly 512 bytes from `src` through its
+        // checked user-pointer path.
+        if !lba_fits_syscall_abi(lba) { return false; }
+        let ret = unsafe { raw_syscall(48, lba, src.as_ptr() as u64, 0) };
+        ret == 0
+    }
+
+    /// Read a block, returning the raw status so BUSY is distinguishable from FAILED: `0` ok, the
+    /// device is busy (`USB_DISK_BUSY` - re-ask, nothing is wrong), anything else a real error. The `bool` variants
+    /// above collapse those two, which is exactly the conflation that made a busy stick look broken.
+    pub fn usb_disk_read_status(&self, lba: u64, dst: &mut [u8; 512]) -> i64 {
+        // SAFETY: syscall(47) = UsbDiskRead; the kernel writes exactly 512 bytes through its checked
+        // user-pointer path.
+        if !lba_fits_syscall_abi(lba) { return -1; }
+        unsafe { raw_syscall(47, lba, dst.as_mut_ptr() as u64, 0) }
+    }
+
+    /// Write a block, returning the raw status (see `usb_disk_read_status`).
+    pub fn usb_disk_write_status(&self, lba: u64, src: &[u8; 512]) -> i64 {
+        // SAFETY: syscall(48) = UsbDiskWrite; the kernel reads exactly 512 bytes from `src`.
+        if !lba_fits_syscall_abi(lba) { return -1; }
+        unsafe { raw_syscall(48, lba, src.as_ptr() as u64, 0) }
+    }
+
+    /// Make previously written blocks durable on the USB mass-storage device (SCSI SYNCHRONIZE CACHE).
+    /// Requires `USB_DISK` WRITE. Syscall 49.
+    ///
+    /// A write is only ACKNOWLEDGED when `usb_disk_write` returns - the device may still be holding the
+    /// bytes in a volatile buffer. Anything that promises durability (a format, a journal commit) has to
+    /// ask for it, and check the answer: `false` means the data is NOT known to be on the medium.
+    #[must_use = "prior writes are NOT durable if this is false"]
+    pub fn usb_disk_flush(&self) -> bool {
+        // SAFETY: syscall(49) = UsbDiskFlush; takes no arguments and touches no user memory.
+        let ret = unsafe { raw_syscall(49, 0, 0, 0) };
+        ret == 0
+    }
+
+    /// The SD/EMMC controller's base clock in Hz (0 if the platform does not report one), via
+    /// InspectKernel query 20. The block driver needs it to compute its clock divider: on the BCM283x
+    /// the controller's own capability register reports the base clock wrongly, and the driver holds
+    /// only its controller's registers, so it cannot ask the platform firmware itself. A driver that
+    /// gets 0 should report that rather than guess - a wrong divider runs the card's identification
+    /// clock at the wrong speed, which fails on hardware and not under emulation. Ungated - task-neutral
+    /// hardware info, like the console geometry and the RTC.
+    pub fn emmc_base_clock_hz(&self) -> u32 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=20 = EMMC base clock (Hz).
+        let ret = unsafe { raw_syscall(13, 20, 0, 0) };
+        if ret < 0 { 0 } else { ret as u32 }
+    }
+
     /// The discovered NIC's PCI identity as `vendor | device<<16` (0 if no NIC), via InspectKernel
     /// query 14. A NIC driver reads it to know which chip it is driving (e.g. Intel e1000 =
     /// 0x100E_8086 vs Realtek RTL8168 = 0x8168_10EC). Ungated - task-neutral hardware info.
@@ -908,7 +1155,15 @@ impl ServiceContext {
     /// (saturates at 0). The `uptime` shell command renders this. Wall-clock based, so it is
     /// correct regardless of the APIC timer mode (unlike a raw tick counter).
     pub fn uptime_secs(&self) -> i64 {
-        (self.datetime().epoch_secs() - self.boot_datetime().epoch_secs()).max(0)
+        // "now" is the DEGLITCHED MONOTONIC clock (query 17), not the raw RTC datetime (which is frozen
+        // at 0 on a board with no RTC, e.g. the Pi 2 - the reason the old `datetime - boot` read 0 there).
+        let now = self.epoch_secs_monotonic();
+        let boot_epoch = self.boot_datetime().epoch_secs();
+        // A board with no RTC reports a zero/garbage boot datetime whose epoch is far before 2001 (a
+        // packed all-zeros datetime unpacks to ~year 0 = ~-6.2e10 s - subtracting THAT would ADD ~1970
+        // years). There the monotonic clock is already seconds-since-boot (its CNTPCT baseline, ARM), so
+        // it IS the uptime. With a real RTC, uptime is the elapsed wall-clock since boot.
+        if boot_epoch < 1_000_000_000 { now.max(0) } else { (now - boot_epoch).max(0) }
     }
 
     /// Timer ticks the given core spent running a user task (not idle) since boot.
@@ -1009,6 +1264,70 @@ impl ServiceContext {
     pub fn epoch_secs_monotonic(&self) -> i64 {
         // SAFETY: syscall(13) = InspectKernel; query 17 = deglitched monotonic epoch seconds.
         unsafe { raw_syscall(13, 17, 0, 0) }
+    }
+
+    /// Set the wall clock to `epoch_secs` (Unix seconds) from a network time source (SNTP). Requires the
+    /// SET_CLOCK capability (held only by `net-stack`); a non-holder gets `false`. A no-op on arches with a
+    /// hardware RTC (x86) - there the CMOS clock is the authority. `epoch_secs` is a `u32` (a single ABI
+    /// register, so it survives the 32-bit ARM syscall ABI and is valid past year 2106). Returns true on
+    /// success. After this, `datetime()` reports the real time on the RTC-less ARM port.
+    #[must_use = "the kernel can refuse this - the clock is unchanged if false"]
+    pub fn set_wall_clock(&self, epoch_secs: u32) -> bool {
+        // SAFETY: syscall(50) = SetClock, kind 0 = set the clock; the kernel validates SET_CLOCK by holdings.
+        unsafe { raw_syscall(50, epoch_secs as u64, 0, 0) >= 0 }
+    }
+
+    /// Raise the persisted clock FLOOR - a "the machine was demonstrably running at least this late" bound,
+    /// seeded from disk at startup. It is never displayed as the time (a bound is true; an estimate of the
+    /// current time from an old bound is a fabrication). Its job is to REFUSE a clock value that cannot be
+    /// right: a dead RTC reading 2000, or a stale/hostile network reply from before we last ran. The floor
+    /// only moves forward. Requires SET_CLOCK; returns false if refused or implausible.
+    #[must_use = "the kernel can refuse this - the floor is unchanged if false"]
+    pub fn set_clock_floor(&self, epoch_secs: u32) -> bool {
+        // SAFETY: syscall(50) = SetClock, kind 1 = raise the floor; cap-validated by the kernel.
+        unsafe { raw_syscall(50, epoch_secs as u64, 1, 0) >= 0 }
+    }
+
+    /// Where the current wall-clock reading came from: `ClockSource::Ntp` if the network set it this boot,
+    /// `Rtc` if a hardware clock reads a plausible date, `Unset` if the machine has no idea what time it is.
+    pub fn clock_source(&self) -> ClockSource {
+        // SAFETY: syscall(13) = InspectKernel; query 21 = packed clock provenance.
+        let p = unsafe { raw_syscall(13, 21, 0, 0) };
+        match p & 0xFF {
+            2 => ClockSource::Ntp,
+            1 => ClockSource::Rtc,
+            _ => ClockSource::Unset,
+        }
+    }
+
+    /// Seconds since the network last set the clock, or `None` if it never did this boot.
+    pub fn clock_synced_secs_ago(&self) -> Option<i64> {
+        // SAFETY: syscall(13) = InspectKernel; query 21 = packed clock provenance (age in bits 8..).
+        let p = unsafe { raw_syscall(13, 21, 0, 0) };
+        if p & 0xFF == 2 { Some(p >> 8) } else { None }
+    }
+
+    /// The persisted clock floor in epoch seconds, or `None` if none is known. A LOWER BOUND, not a time.
+    pub fn clock_floor(&self) -> Option<i64> {
+        // SAFETY: syscall(13) = InspectKernel; query 22 = the clock floor.
+        let f = unsafe { raw_syscall(13, 22, 0, 0) };
+        if f > 0 { Some(f) } else { None }
+    }
+
+    /// A hardware-random u32 from the SoC RNG (the BCM2835 RNG on the Pi 2), or None if this build exposes
+    /// no hardware RNG. Ungated (entropy confers no authority). The `random` shell utility consumes it.
+    pub fn hw_random(&self) -> Option<u32> {
+        // SAFETY: syscall(13) = InspectKernel; query 19 = a hardware-random u32 (-1 if unavailable).
+        let r = unsafe { raw_syscall(13, 19, 0, 0) };
+        if r < 0 { None } else { Some(r as u32) }
+    }
+
+    /// Drive a SoC GPIO pin (the shell `gpio` command; the Pi 2's BCM2835). `op`: 0 input / 1 output /
+    /// 2 high / 3 low / 4 read. Returns the level (0/1) for a read, 0 on success, -1 on a bad pin /
+    /// unsupported arch. Gated by the GPIO_DEVICE cap (only the shell holds it).
+    pub fn gpio(&self, op: u32, pin: u32) -> i64 {
+        // SAFETY: syscall(45) = Gpio; the kernel validates the GPIO_DEVICE cap and bounds op/pin.
+        unsafe { raw_syscall(45, op as u64, pin as u64, 0) }
     }
 
     /// Decode the packed RTC `u64` (the layout shared by query 11 / 12) into a `Datetime`.
@@ -1157,7 +1476,20 @@ impl ServiceContext {
     /// `reply` (a SEND|GRANT cap) so the owner can reply. `Ok(())` on delivery. Syscall 31.
     pub fn resource_invoke(&self, file: CapHandle, right: u8, reply: CapHandle, msg: &Message)
         -> Result<(), IpcError> {
-        let packed = ((right as u64) << 32) | ((reply.0 as u64) << 16) | (file.0 as u64);
+        // Packed into ONE 32-BIT word: file[0..12] | reply[12..24] | right[24..32].
+        //
+        // A syscall argument is a single register, and on a 32-bit target (arm32's r1/r2/r3) that
+        // register is 32 bits - so anything placed above bit 31 is silently truncated on the way in.
+        // The original layout put `right` at bit 32, which arrived as 0 on ARM: the kernel then had
+        // no right to validate, `fs` received a badge of 0, and every real operation failed `op <=
+        // right` while a read-only cap invoked declaring WRITE sailed past the kernel check that was
+        // supposed to stop it. Three symptoms, one truncated field.
+        //
+        // 12 bits per slot is 4095 against a MAX_CAPS_PER_TASK of 64 - room to grow by 60x - and
+        // `right` is a u8, so the whole thing lands in 24 bits with 8 to spare. This is the A-U1
+        // rule from arch/arm/CLAUDE.md: on a 32-bit ABI, a syscall argument that does not fit in one
+        // register must be narrowed at the wrapper, never assumed to survive.
+        let packed = ((right as u64) << 24) | ((reply.0 as u64) << 12) | (file.0 as u64);
         let payload = msg.payload_bytes();
         // SAFETY: syscall(31) = ResourceInvoke; packed + payload are user values the kernel
         // validates (cap slots, rights, generation, and the message bounds) before acting.
@@ -1186,6 +1518,7 @@ impl ServiceContext {
     /// Revoke a delegated resource this service owns (§7.10): bumps its generation so every
     /// outstanding cap to it goes stale (clients see `CapRevoked`/`EndpointDead` on next use).
     /// Owner-gated by the kernel (ownership is the check). `true` on success. Syscall 32.
+    #[must_use = "the capability is STILL VALID if this is false"]
     pub fn resource_revoke(&self, resource_id: u64) -> bool {
         // SAFETY: syscall(32) = ResourceRevoke; the kernel checks this task owns the resource.
         unsafe { raw_syscall(32, resource_id, 0, 0) == 0 }

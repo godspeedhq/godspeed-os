@@ -407,19 +407,33 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (QEMU has no -drive there: "no controller"), giving §22 Test 11 a restartable victim to kill.
     // `ensure_*` (Phase 6): spawn on a fresh boot, ADOPT the running instance on a supervisor respawn.
     #[cfg(any(feature = "bare-metal", feature = "blockdev", feature = "identity-only"))]
+    // block-driver: core 0 on ARM, unpinned elsewhere. On ARM it may serve a USB stick through the
+    // in-kernel DWC2 stack, and those syscalls are core-0-only: the single USB host channel and its DMA
+    // buffer are shared with the keyboard poll in core 0's timer ISR, kept mutually exclusive by an ARM
+    // syscall running with interrupts masked. A request from another core would simply be refused.
+    // No override: the kernel's `ServiceConfig.preferred_core` decides, and it is arch-conditional
+    // (0 on ARM for the reason above). Overriding here pinned only the BOOT spawn - the restart path
+    // passes no override, so a respawned block-driver silently landed on a different core than the
+    // one it requires. One source of placement, consulted by both paths.
     ensure_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
     // fs needs a disk → bare-metal / blockdev only.
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]
     ensure_wired(&ctx, &mut name_map, "fs", &["block-driver"]);
 
-    // shell: the interactive prompt. Spawned in bare-metal (the USB image rests
-    // here) and full builds; excluded from test-specific builds.
+    // shell: the interactive prompt. Spawned in bare-metal (the USB image rests here) and full builds;
+    // excluded from test-specific builds. Its `fs` peer is wired from the supervisor's map.
+    // Phase 6: ensure_wired adopts a running shell on a supervisor respawn instead of duplicating it.
+    //
+    // Spawned EARLY - before the network services - and that ordering is deliberate: **the user's prompt
+    // must never wait on hardware bring-up.** It was briefly moved last (so the boot log would finish
+    // before the prompt painted, a cosmetic win); on real hardware, once the Pi's NIC actually came up,
+    // net-stack's DHCP -> ARP -> ICMP dance ran its full ~45 s of budgets with nothing answering, and the
+    // prompt sat behind it. A tidy boot log is not worth a 45-second wait for the shell: the shell comes
+    // up first and net-stack configures itself in the background (it already self-configures on link-up).
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    // shell's `fs` peer is wired from the supervisor's map.
-    // Phase 6: ensure_wired adopts a running shell on a supervisor respawn instead of duplicating it.
     ensure_wired(&ctx, &mut name_map, "shell", &["fs"]);
 
     // counter (examples/counter): a STATEFUL example that survives its OWN restart by persisting its

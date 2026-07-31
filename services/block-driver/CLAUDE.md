@@ -1,9 +1,20 @@
 # services/block-driver/
 
-Userspace **AHCI (SATA)** disk driver (persistence, v2; §6.3, `docs/ahci.md`,
-`docs/persistence.md`). **Restartable, NOT a TCB member** (Phase D amendment, §6.1,
-2026-06-17): it holds no persistent state, so its death is a supervisor restart (re-init the
-controller, re-register), not a reboot - `fs` reacquires it by name and retries (§14.3).
+Userspace disk driver (persistence, v2; §6.3, `docs/ahci.md`, `docs/persistence.md`). **Two backends,
+one block-IPC protocol**, selected by `cfg(target_arch)`: **x86 = AHCI/SATA** (MMIO + DMA, `ahci.rs`);
+**ARM (Raspberry Pi 2) = a USB mass-storage stick** (`usbdisk.rs`, through the in-kernel DWC2 stack).
+They serve `fs` identically; `fs` never knows which. The rest of this doc describes the AHCI backend.
+**Restartable, NOT a TCB member** (Phase D amendment, §6.1, 2026-06-17): it holds no persistent state,
+so its death is a supervisor restart (re-init the controller, re-register), not a reboot - `fs`
+reacquires it by name and retries (§14.3).
+
+> **The SD/EMMC card is NEVER used as storage on the Pi 2.** An SD/EMMC backend exists (`sdhci.rs`) but
+> is **not compiled in** (`main.rs` has no `mod sdhci`). On a single-slot Pi 2 the SD card is the boot
+> medium - firmware + kernel + FAT boot partition - and GSFS's superblock at LBA 0 lands on the card's
+> partition table, so using it as storage **corrupts the card to RAW** (it destroyed two boot cards).
+> With no USB stick, `block-driver` comes up with **no disk** (`fs` storage-unavailable), exactly as x86
+> reports with no SATA disk - it never falls back to the card. `sdhci.rs` is kept only for a future board
+> with a *separate* storage medium. See `backend_run` and `docs/pi2-deploy.md`.
 
 ## Device: AHCI, MMIO + DMA
 

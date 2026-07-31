@@ -183,10 +183,10 @@ impl GlobalResourceTable {
     }
 
     fn bump_generation(&mut self, id: ResourceId, liveness: Liveness) {
-        // SEC-11: no STABLE gate resource (ids 1-9: LOG_WRITE..ACQUIRE_ANY, gen-0-forever) is ever
-        // revoked or killed. `holds_resource` (the by-holdings gate for Kill/Reboot/ResourceMint/
-        // Introspect) validates those WITHOUT a generation check, which is sound only while they stay
-        // un-revocable. Revocable ids are always >= 100 (endpoints) or in the delegated band. This
+        // SEC-11: no STABLE gate resource (ids 1-13: LOG_WRITE..ACQUIRE_ANY, NET_DEVICE, GPIO_DEVICE,
+        // USB_DISK, SET_CLOCK) is ever revoked or killed. `holds_resource` (the by-holdings gate for
+        // Kill/Reboot/ResourceMint/Introspect/NetFrame*/UsbDisk*/SetClock) validates those WITHOUT a
+        // generation check, which is sound only while they stay un-revocable. Revocable ids are always >= 100 (endpoints) or in the delegated band. This
         // pins the invariant, so a future change that makes a gated resource revocable fails loudly
         // in test/debug rather than silently letting a revoked holder keep passing the gate.
         debug_assert!(id.0 >= 100,
@@ -318,10 +318,18 @@ mod tests {
             prop_assert!(t.get_record(ResourceId(id)).is_none());
         }
 
+        // Generators for the BUMP properties start at 100, not 0. Ids below 100 are the STABLE gate
+        // resources (SEC-11, `bump_generation` above): they are never revoked, and `holds_resource`
+        // validates them without a generation check, which is sound only while that holds. Sweeping
+        // from 0 fabricated a reserved id and then asserted that the forbidden bump succeeded - so
+        // these three failed permanently, on a correct kernel, for a reason that was about the test.
+        // Three always-red tests train everyone to read `94 passed - 3 failed` as green, which is how
+        // a real regression walks in unnoticed (§22.4: a test failing for the wrong reason is a
+        // failure of the test, not the kernel).
         /// bump_generation is strictly monotonic per resource (§7.5 P2).
         #[test]
         fn bump_generation_is_strictly_monotonic(
-            id    in 0u64..(DIRECT_CAP as u64),
+            id    in 100u64..(DIRECT_CAP as u64),
             bumps in 1usize..=8,
         ) {
             let mut t = Box::new(GlobalResourceTable::new());
@@ -337,7 +345,7 @@ mod tests {
 
         /// After bump_generation with Dead liveness, get_record returns Dead.
         #[test]
-        fn bump_to_dead_sets_liveness_dead(id in 0u64..(DIRECT_CAP as u64)) {
+        fn bump_to_dead_sets_liveness_dead(id in 100u64..(DIRECT_CAP as u64)) {
             let mut t = Box::new(GlobalResourceTable::new());
             t.register(ResourceId(id));
             t.bump_generation(ResourceId(id), Liveness::Dead);
@@ -346,7 +354,7 @@ mod tests {
 
         /// After bump_generation with Revoked liveness, get_record returns Revoked.
         #[test]
-        fn bump_to_revoked_sets_liveness_revoked(id in 0u64..(DIRECT_CAP as u64)) {
+        fn bump_to_revoked_sets_liveness_revoked(id in 100u64..(DIRECT_CAP as u64)) {
             let mut t = Box::new(GlobalResourceTable::new());
             t.register(ResourceId(id));
             t.bump_generation(ResourceId(id), Liveness::Revoked);

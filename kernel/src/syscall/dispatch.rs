@@ -64,6 +64,15 @@ pub enum SyscallNumber {
     SpawnWithCaps          = 39,
     ConsoleForeground      = 40,
     Call                   = 41,
+    NetFrameTx             = 42,
+    NetFrameRx             = 43,
+    NetInfo                = 44,
+    Gpio                   = 45,
+    UsbDiskInfo            = 46,
+    UsbDiskRead            = 47,
+    UsbDiskWrite           = 48,
+    UsbDiskFlush           = 49,
+    SetClock               = 50,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -89,6 +98,15 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Sleep          as u64 => handle_sleep(arg0),
         n if n == SyscallNumber::TrySend        as u64 => handle_try_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Call           as u64 => handle_call(arg0, arg1, arg2),
+        n if n == SyscallNumber::NetFrameTx     as u64 => handle_net_frame_tx(arg0, arg1),
+        n if n == SyscallNumber::NetFrameRx     as u64 => handle_net_frame_rx(arg0, arg1),
+        n if n == SyscallNumber::NetInfo        as u64 => handle_net_info(arg0),
+        n if n == SyscallNumber::Gpio           as u64 => handle_gpio(arg0, arg1),
+        n if n == SyscallNumber::UsbDiskInfo    as u64 => handle_usb_disk_info(),
+        n if n == SyscallNumber::UsbDiskRead    as u64 => handle_usb_disk_read(arg0, arg1),
+        n if n == SyscallNumber::UsbDiskWrite   as u64 => handle_usb_disk_write(arg0, arg1),
+        n if n == SyscallNumber::UsbDiskFlush   as u64 => handle_usb_disk_flush(),
+        n if n == SyscallNumber::SetClock       as u64 => handle_set_clock(arg0, arg1),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
             0
@@ -534,7 +552,14 @@ fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
         Some(b) => b,
         None    => return Err(-1),
     };
-    Message::new(bytes).map_err(|e| ipc_err_to_i64(e))
+    let mut msg = Message::new(bytes).map_err(|e| ipc_err_to_i64(e))?;
+    // Stamp the sender's primary endpoint (kernel-set, unforgeable by userspace - the payload cannot
+    // influence it). Every user send path funnels through here, so a blocked `Call` can correlate its
+    // reply by WHO sent it (`call_dequeue`), instead of trusting queue arrival order - which handed a
+    // caller whatever message reached its queue first and desynced fs's reply stream on hardware.
+    // A task with no endpoint stamps 0, which matches no target.
+    msg.sender_ep = scheduler::current_task_endpoint().map(|e| e.0).unwrap_or(0);
+    Ok(msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -968,10 +993,13 @@ fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 // Syscall: Call (41) - synchronous request + death-aware wait for the reply (§8, §8.6).
 // ---------------------------------------------------------------------------
 
-/// arg0 = (recv_slot << 32) | (reply_grant_slot << 16) | target_endpoint_slot
+/// arg0 = (reply_grant_slot << 16) | target_endpoint_slot
 /// arg1 = buf_ptr (in/out, MAX_MESSAGE_SIZE): the request payload on entry; the reply is written
 ///        back into the same buffer on return.
-/// arg2 = request length (bytes, <= MAX_MESSAGE_SIZE).
+/// arg2 = (recv_slot << 16) | request_length. Three 16-bit slots + the length are packed into two
+///        32-bit-safe args (NOT one 48-bit arg): the ARM 32-bit syscall ABI carries each arg in one
+///        register and would truncate a value above 32 bits, dropping `recv_slot` (userspace-audit
+///        A-U1). A request never exceeds one 4 KiB message (< 0xFFFF), so `recv` rides the high half.
 ///
 /// seL4-style synchronous CALL. Sends the request to the `target` endpoint carrying `reply_grant`
 /// as a one-shot reply cap (the caller's own endpoint, so the peer can reply to it), then blocks on
@@ -985,10 +1013,11 @@ fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 ///
 /// Returns the reply length (>= 0), or a negative error: -12 `ReplyDead` (peer died awaiting reply),
 /// -7 `EndpointDead` (peer dead before the request was delivered), or a cap error.
-fn handle_call(packed: u64, buf_ptr: u64, req_len: u64) -> i64 {
+fn handle_call(packed: u64, buf_ptr: u64, recv_len: u64) -> i64 {
     let target_slot = (packed & 0xFFFF) as usize;
     let reply_slot  = ((packed >> 16) & 0xFFFF) as usize;
-    let recv_slot   = ((packed >> 32) & 0xFFFF) as usize;
+    let recv_slot   = ((recv_len >> 16) & 0xFFFF) as usize;
+    let req_len     = recv_len & 0xFFFF;
 
     // 1. Validate the three caps: SEND to the peer, GRANT on the reply cap, RECV on our own endpoint.
     let target_cap = match scheduler::current_task_lookup_cap(target_slot, Rights::SEND) {
@@ -1129,7 +1158,9 @@ fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
 // Syscall: ResourceInvoke (31) - use a delegated (file) cap (§7.10, P2).
 // ---------------------------------------------------------------------------
 
-/// arg0 = (right_bits << 32) | (reply_grant_slot << 16) | file_cap_slot
+/// arg0 = (right_bits << 24) | (reply_grant_slot << 12) | file_cap_slot - ONE 32-bit word, because a
+/// syscall argument is one register and that register is 32 bits on a 32-bit target (see the SDK's
+/// `resource_invoke`: a field above bit 31 is truncated away on arm32).
 /// arg1 = msg_ptr (user VA), arg2 = msg_len.
 ///
 /// The "use = send" of a delegated resource cap. Validates the file cap carries `right_bits`
@@ -1141,9 +1172,9 @@ fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
 /// trusts the client, and the kernel never learns the operation.
 fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     use crate::capability::delegated;
-    let file_slot  = (packed & 0xFFFF) as usize;
-    let reply_slot = ((packed >> 16) & 0xFFFF) as usize;
-    let right_bits = ((packed >> 32) & 0xFF) as u8;
+    let file_slot  = (packed & 0xFFF) as usize;
+    let reply_slot = ((packed >> 12) & 0xFFF) as usize;
+    let right_bits = ((packed >> 24) & 0xFF) as u8;
     let required   = Rights(right_bits);
 
     // 1. Validate the file cap holds the requested right (generation + rights, global table).
@@ -1303,7 +1334,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // boot/RTC reads (10, 11). Every other query discloses another task's or
     // system-wide state and requires the INTROSPECT capability with READ (§3.1;
     // docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18)
+    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -1363,6 +1394,28 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
                 && matches!(pci::NIC_VENDOR_DEVICE.load(Relaxed), 0x100E_8086 | 0x8168_10EC)) as i64;
             x | (e << 1) | (nic << 2)
         }
+        // A hardware-random u32 (the SoC RNG on ARM, RDRAND on x86), or -1 if this build has no hardware
+        // RNG. Ungated: reading entropy confers no authority (like the raw TSC, query 3). The `random`
+        // shell utility consumes it. A u32 is always 0..2^32, so it never collides with the -1 sentinel.
+        19 => match crate::arch::imp::hw_random() { Some(v) => v as i64, None => -1 },
+        // 20 = the SD/EMMC controller's base clock in Hz, learned from the platform at boot. Task-neutral
+        // hardware info like the console geometry (9) and the RTC (10/11), so ungated. The block driver
+        // needs it to compute its clock divider: the controller's own capability register reports this
+        // wrongly on the BCM283x, and a guessed divider runs the card's identification clock at the wrong
+        // speed - which fails silently on hardware and not at all under emulation. 0 = unknown, and the
+        // driver then reports rather than guessing.
+        20 => crate::arch::imp::emmc_base_clock_hz() as i64,
+        // Clock PROVENANCE, packed: bits 0-7 = source (0 unset / 1 rtc / 2 ntp), bits 8.. = seconds since
+        // the network last set it (0 if never). Ungated task-neutral timing info like the RTC (11) itself.
+        // `date` reports this so a displayed time says where it came from - a fallback chain is only
+        // mechanism, not magic, while its choice is visible (§26.4/§26.9).
+        21 => {
+            let ago = crate::wallclock::synced_secs_ago().max(0);
+            (crate::wallclock::source() as i64) | (ago << 8)
+        }
+        // The persisted clock FLOOR in epoch seconds (0 = none known). A "we ran at least this late" bound,
+        // never a reading - `date` shows it only when the time is unknown, explicitly labelled.
+        22 => crate::wallclock::floor(),
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,
@@ -1743,6 +1796,177 @@ fn handle_reboot() -> i64 {
     }
     crate::kprintln!("reboot: hardware reset");
     crate::arch::imp::hardware_reset();
+}
+
+/// SetClock (50): set the wall clock to `epoch` Unix seconds (SNTP-fed). Gated by SET_CLOCK (validated by
+/// holdings - `arg0` spends the one argument register on the epoch, leaving no slot to pass). `epoch` is a
+/// u32 of seconds (single register - so it survives the 32-bit ARM ABI, valid past year 2106), widened
+/// here. A no-op on arches with a real hardware RTC (x86). Returns 0, or CapNotHeld without the cap.
+fn handle_set_clock(epoch: u64, kind: u64) -> i64 {
+    // `kind` 1 = raise the persisted FLOOR ("we ran at least this late"); 0 = set the wall clock; 2 = clear
+    // the floor. These are NOT the same authority, so they do not share a right: raising a floor only
+    // CONSTRAINS which clock values are acceptable, while setting the clock (or clearing the bound that
+    // guards it) changes every task's view of the time of day. Rights narrow (§7.4), so the floor-raiser
+    // holds READ and the clock-setter holds WRITE - which lets the shell record a floor off disk without
+    // also being able to step the clock.
+    let need = if kind == 1 { Rights::READ } else { Rights::WRITE };
+    if !scheduler::current_task_holds_resource(crate::capability::SET_CLOCK_RESOURCE, need) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    let v = (epoch & 0xFFFF_FFFF) as i64;
+    let ok = match kind {
+        1 => crate::wallclock::set_floor(v),
+        2 => crate::wallclock::clear_floor(),
+        _ => crate::wallclock::set_wall_clock(v),
+    };
+    // Every path announces itself inside `wallclock` (what changed, or the reason for a refusal): a change
+    // to every task's view of the time of day must be answerable afterwards (§26.4, §26.7).
+    if ok { 0 } else { -1 }
+}
+
+/// Largest ethernet frame the USB-net bridge moves (matches nic-driver's FRAME_MAX).
+const NET_FRAME_MAX: usize = 1600;
+
+/// NetFrameTx (42): transmit a raw ethernet frame via the in-kernel USB-net device. `arg0` = frame ptr,
+/// `arg1` = length. Gated by NET_DEVICE (validated by holdings - the args fill the ABI, no slot to pass).
+/// Returns 0 on success, -1 on error. On non-ARM arches `net_frame_tx` is a stub returning false.
+fn handle_net_frame_tx(ptr: u64, len: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::NET_DEVICE_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    let len = len as usize;
+    if len == 0 || len > NET_FRAME_MAX { return -1; }
+    let frame = match read_user_bytes(ptr, len) { Some(b) => b, None => return -1 };
+    if crate::arch::imp::net_frame_tx(frame) { 0 } else { -1 }
+}
+
+/// NetFrameRx (43): receive one raw ethernet frame into the user buffer. `arg0` = dst ptr, `arg1` = max
+/// length. Gated by NET_DEVICE. Returns the frame length (0 if none is available), -1 on error.
+fn handle_net_frame_rx(ptr: u64, max: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::NET_DEVICE_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    let max = (max as usize).min(NET_FRAME_MAX);
+    if max == 0 { return -1; }
+    let mut buf = [0u8; NET_FRAME_MAX];
+    // `net_frame_rx` returns bytes written into the `[..max]` slice; clamp defensively so a future buggy
+    // arch impl returning n > max can never index-panic `buf[..n]` (kernel-audit Audit 6, INFO-1).
+    let n = crate::arch::imp::net_frame_rx(&mut buf[..max]).min(max);
+    if n == 0 { return 0; }
+    if !write_user_bytes(ptr, &buf[..n]) { return -1; }
+    n as i64
+}
+
+/// NetInfo (44): write `[mac(6), link(1)]` (7 bytes) of the USB-net device to `arg0`. Gated by NET_DEVICE.
+/// Returns 1 if a net device is up, 0 if none, -1 on error.
+fn handle_net_info(ptr: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::NET_DEVICE_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    match crate::arch::imp::net_info() {
+        Some((mac, link)) => {
+            let mut out = [0u8; 7];
+            out[..6].copy_from_slice(&mac);
+            out[6] = if link { 1 } else { 0 };
+            if write_user_bytes(ptr, &out) { 1 } else { -1 }
+        }
+        None => 0,
+    }
+}
+
+/// Gpio (45): drive a SoC GPIO pin. `op` = 0 input / 1 output / 2 set-high / 3 set-low / 4 read; `pin` =
+/// 0..53. Gated by GPIO_DEVICE (validated by holdings - the args fill the ABI). Returns the level (0/1) for
+/// a read, 0 on success, -1 on a bad pin / unsupported arch. On non-ARM `gpio_op` is an inert `-1` stub.
+fn handle_gpio(op: u64, pin: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::GPIO_DEVICE_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    if op > 4 || pin > 53 { return -1; } // BCM2835 has 54 GPIO lines (0..53)
+    crate::arch::imp::gpio_op(op as u32, pin as u32)
+}
+
+/// One block of the USB mass-storage device. The whole storage stack is 512-byte blocks, and the kernel
+/// only claims a device whose sectors are that size (`dwc2::probe_mass_storage`), so this is fixed.
+const USB_DISK_BLOCK: usize = 512;
+
+/// UsbDiskInfo (46): capacity of the attached USB mass-storage device in 512-byte sectors, 0 if none.
+/// Gated by USB_DISK (validated by holdings - no slot to pass). On non-ARM arches this is always 0.
+fn handle_usb_disk_info() -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    crate::arch::imp::usb_disk_sectors() as i64
+}
+
+/// A USB-disk syscall's "the device NAKed, re-ask" answer.
+///
+/// Deliberately OUTSIDE the capability-error range (-2..-7, `cap_err_to_i64`). BUSY was first given
+/// `-2`, which is `CapNotHeld` - so a task calling these syscalls WITHOUT the `USB_DISK` capability got
+/// the same answer as one whose device was merely occupied. `block-driver` believes the second reading
+/// and re-asks 6000 times before reporting "the device stayed busy, it did not fail", which is a false
+/// diagnosis of an authority failure, and `fs` then degrades storage on the strength of it (Invariant
+/// 12: a failure must name its own cause). Reachable whenever a respawned driver comes back without its
+/// cap wired - exactly the case a kill-storm produces.
+const USB_DISK_BUSY: i64 = -20;
+
+/// No device is attached at all - as opposed to one that is present and asking us to wait.
+///
+/// These are opposite instructions to the caller and were being answered with the same word. BUSY means
+/// "come back, I am working"; ABSENT means "there is nothing here, and re-asking cannot change that -
+/// only a hot-plug can". Conflated, `block-driver` did the right thing with the wrong fact: it waited out
+/// its full 6000-attempt, ~30-second budget against a socket the operator had emptied, for every block of
+/// every request, and then reported "the device stayed busy, it did not fail" - a statement that was not
+/// true of a stick sitting on the desk.
+///
+/// The conflation was structural, not a missing branch. `usb_disk_busy()` reads `LAST_FAIL`, which
+/// records the last TRANSFER's outcome - and a refusal short-circuits before any transfer, so it left
+/// whatever the previous one wrote. A stick pulled mid-command leaves a NAK there, so "absent" inherited
+/// "busy" from the transfer that was in flight when it was pulled. The state was stale rather than wrong,
+/// which is why it read as plausible (§26.4 - a derived value must reduce to a current truth).
+const USB_DISK_ABSENT: i64 = -21;
+
+/// UsbDiskRead (47): read the 512-byte block at `arg0` (LBA) into the user buffer at `arg1`.
+/// Gated by USB_DISK. Returns 0 on success, `USB_DISK_BUSY` if the device NAKed (re-ask), -1 on a real
+/// failure (no device, LBA past the end, I/O error).
+fn handle_usb_disk_read(lba: u64, ptr: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    let mut buf = [0u8; USB_DISK_BLOCK];
+    // -2 = BUSY (the device NAKed; nothing is wrong, re-ask). Distinct from -1 = failed, because the
+    // two need opposite responses and collapsing them is what turned a busy stick into a "broken" one.
+    if !crate::arch::imp::usb_disk_read(lba, &mut buf) {
+        // ABSENT first: it is the stronger fact. `usb_disk_busy` reads the last TRANSFER's outcome, which
+        // a refusal never updates, so asking it about a device that is not there answers from stale state.
+        if crate::arch::imp::usb_disk_absent() { return USB_DISK_ABSENT; }
+        return if crate::arch::imp::usb_disk_busy() { USB_DISK_BUSY } else { -1 };
+    }
+    if !write_user_bytes(ptr, &buf) { return -1; }
+    0
+}
+
+/// UsbDiskWrite (48): write the 512-byte block at the user buffer `arg1` to LBA `arg0`.
+/// Gated by USB_DISK. Returns 0 on success, `USB_DISK_BUSY` if the device NAKed, -1 on a real failure.
+fn handle_usb_disk_write(lba: u64, ptr: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    let src = match read_user_bytes(ptr, USB_DISK_BLOCK) { Some(b) => b, None => return -1 };
+    if crate::arch::imp::usb_disk_write(lba, src) { 0 }
+    else if crate::arch::imp::usb_disk_absent() { USB_DISK_ABSENT }  // nothing there; re-asking cannot help
+    else if crate::arch::imp::usb_disk_busy() { USB_DISK_BUSY }   // re-ask, do not treat as a failure
+    else { -1 }
+}
+
+/// UsbDiskFlush (49): flush the device's write cache to the medium (SCSI SYNCHRONIZE CACHE).
+/// Gated by the same USB_DISK WRITE right as a write - making data durable is part of writing it,
+/// and a caller that cannot write has nothing to flush. Returns 0 on success, -1 on failure; a
+/// failure is reported, never swallowed, because the caller is about to rely on durability (§26.7).
+fn handle_usb_disk_flush() -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    if crate::arch::imp::usb_disk_flush() { 0 } else { -1 }
 }
 
 fn ipc_err_to_i64(e: IpcError) -> i64 {

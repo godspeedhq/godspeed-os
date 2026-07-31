@@ -7,6 +7,29 @@
 > `docs/kernel-audit.md`, userspace has `docs/userspace-audit.md`, and the docs themselves have this.
 > First audit: 2026-07-15.
 
+
+## Audit 3 - stale documentation that actively caused wrong diagnoses (2026-07-31, `feat/arm-usb-interrupt`)
+
+**North-star restated:** the least-capable reader, cold, should not have to GUESS. This audit found the
+sharper failure mode: documentation that is not merely absent but **confidently wrong**, which is worse -
+it is believed, and it redirects effort. Three instances, all of which cost real time in one session.
+
+| ID | Sev | Finding |
+|----|-----|---------|
+| DA3-1 | HIGH (FIXED) | `arch/x86_64/CLAUDE.md` described `wait_for_interrupt()` as "`sti` only - no C-state hint". The code has TWO branches and **halts** whenever `IDLE_CAN_HALT` (AMD, or ARAT in periodic mode). A reader trusting that table concludes the kernel never halts at idle - and so never looks for a halt-related lost wake, which is precisely the BSP panic diagnosed the same day. FIXED: the entry states both branches, and a new **"The idle contract: never halt without a freshly armed wake"** section explains the one-shot TSC-Deadline hazard, which core arms what, and why the BSP differs. |
+| DA3-2 | HIGH (FIXED, in-code) | `chan_dma` carried "until stage 2b, writes keep the spin path" long after stage 2b landed - `msc_write_block` passes `can_block=true`. Reading it as current produced a whole wrong diagnosis (a 30 s pause blamed on writes spinning with the core held, when the core was never held). A stale comment about a FINISHED stage is worse than none: it reads as present tense. Corrected @ ee457b3, along with `IO_BUDGET_US` still calling itself an IRQs-masked core-hold when on the async path it is a park timeout. |
+| DA3-3 | HIGH (FIXED, in memory) | An engineering note claimed the T630 TSC PIT-calibration was still "todo" **three weeks after it landed** (77a0e38, 2026-07-07, in main). Believing it produced a confident, wrong root-cause for an x86 failure ("TSC 1000x off -> 30 s waits"); the panic's own numbers disproved it (5988751200/300 = 19,962,504 cycles per 10 ms = ~2 GHz, correct). Corrected, with the lesson attached: **check the code before trusting a note that says "todo"**. |
+
+**The pattern worth naming.** All three are the same shape: a statement that was TRUE when written and
+was never revisited when the code moved past it. None would be caught by a grokability review (each
+reads clearly and plausibly) and none by CI. The only defence is that **a change which finishes a
+staged piece of work must sweep the notes that described it as pending** - the doc equivalent of
+Commandment III's "one truth". Cheap to state; this session paid for it three times.
+
+**Also fixed this session (doc-drift found while auditing code):** the retired hot-plug starvation
+diagnostic left no stale claims behind (its removal is recorded in the constant it left in place), and
+`docs/unsafe-audit.md` tracked every `unsafe` delta (dwc2 33 -> 34) with no unaccounted additions.
+
 ## North-star
 
 **The documentation must be clear enough that the least-capable AI model, working cold, does not have
@@ -159,3 +182,40 @@ Recorded as NOT doc gaps: the `prefetch` review's two partial catches (silent-sw
 were model-thoroughness, not missing rules - the reviewer caught the cluster and cited the guide. The
 recurring "constitution is a reference, not a tutorial" friction remains a **feature**, not a defect
 (the north-star sets 7/10 as sufficient).
+
+---
+
+## Audit 3 - 2026-07-23 (feat/pi2-arm32: the ARM32 docs we touched)
+
+Scope: the documentation for the ARM32 (Raspberry Pi 2) port - what a newcomer/porter/service-author
+meets. Method: three cold **Haiku** (least-capable) probes, each doing a real task from the docs alone and
+flagging every place it had to GUESS - (1) build/run + extend arm32, (2) add a Pi 2 hardware driver, (3) a
+grokability panel on the port's state. Then a structural discoverability pass (is the new doc linked where
+readers look?). Every miss was triaged **doc gap / domain knowledge / model thoroughness**; only doc gaps
+produced edits.
+
+**Cold scores: build/run 6.5/10, add-a-driver 6.0/10, grokability 7.5/10.** The status doc
+(`arm32-status.md`) was strong on *state* but the port lacked an implementer/contributor **home** and had
+stale/missing pointers. **9 doc gaps found, all FIXED.**
+
+| ID | Sev | What | Fix |
+|----|-----|------|-----|
+| **DA1** | HIGH | `docs/unsafe-audit.md` claimed "every syscall argument on this arch fits in 32 bits, so the widening is loss-free" - now WRONG: `recv_timeout`'s `timeout_cycles` exceeds u32 (userspace-audit A-U1). Doc contradicted the corrected code. | Corrected to name the one wider-than-u32 arg + its pre-clamp; pointed at `arch/arm/CLAUDE.md`. |
+| **DA2** | HIGH | `README.md` said "32-bit ARM ... compile clean" - stale/misleading: arm32 boots the full OS to a shell on real Pi 2 hardware. | Rewrote the line: arm32 *runs the OS* (4-core, supervisor, ping/pong IPC), with the build/run commands + a pointer to `arm32-status.md`. |
+| **DA3** | HIGH | The ratified **driver-porting doctrine** ("grok the working driver, reimplement the silicon's wants as a capability service, throw away the OS integration") existed only as a one-line mention + author memory - a contributor could not find "the GodspeedOS way". | Wrote it into `kernel/src/arch/CLAUDE.md` as **"Porting a driver: the method"** (executable-datasheet, reimplement-not-translate, simplest-reference, scope-to-our-chips, license/provenance). |
+| **DA4** | MED | **No `kernel/src/arch/arm/CLAUDE.md`** (x86_64 has one) - the ARM syscall ABI, boot flow, and gotchas had no discoverable home; they were scattered across `unsafe-audit.md`/`multi-arch.md`/`arm32-status.md`. Both cold porters went hunting. | **Created it** - the implementer reference: the `svc #0` register ABI + the wider-than-u32 constraint (A-U1), the boot flow + cr3-seed rule, the in-kernel-driver rule, SEC-25..28 status, gotchas, and pointers. |
+| **DA5** | MED | "How to add an ARM service" was undocumented - a contributor had to reverse-engineer that `ARM_SERVICES` (`arm_build.py`) and `arm_built` (`kernel/build.rs`) must both be edited and kept in sync. | Added a "Running a new service on the Pi 2" section to `arm32-status.md` (the two-allowlist step, explicitly). |
+| **DA6** | MED | `docs/arm32-status.md` was **not listed in `docs/CLAUDE.md`** (the docs index) - a browsing newcomer would not find it. | Added an index entry (state, build/run, add-a-service, gotchas, remaining drivers). |
+| **DA7** | MED | The ARM32 audit findings were not discoverable - `arm32-status.md` did not point to `kernel-audit.md` Audit 5 / `userspace-audit.md` Audit 4, and a cold reader concluded "ARM32 isn't audited". | Added a "See also" with the audit pointers (and `arch/arm/CLAUDE.md` closes it too). |
+| **DA8** | MED | Misleading phrasing in `arm32-status.md`: "with no block device / NIC ..." read as *hardware* absence; the Pi 2 *has* eMMC/USB - the point is *driver* absence. | Reworded to "the Pi 2 *has* eMMC and USB, but their drivers are not ported to ARM yet". |
+| **DA9** | LOW | `docs/multi-arch.md` had a verbatim-duplicated paragraph (the "ARMv7 is a SEPARATE port" note, twice); no pointer from it to `arm32-status.md` / the scripts. | Removed the duplicate; added a pointer box to `arm32-status.md` + `arch/arm/CLAUDE.md`. |
+
+**Triaged as NOT doc gaps:** the physical serial wiring (adapter/pins) is domain knowledge - but the
+baud rate (115200 8N1) was worth stating and is now in `arm32-status.md` + `arch/arm/CLAUDE.md`. The
+grokability probe's "ARM audits not found" was partly model thoroughness (the entries exist, at the
+bottom of long files), addressed by DA7's pointers.
+
+**Result:** the single highest-leverage fix was the missing `kernel/src/arch/arm/CLAUDE.md` (it houses the
+ABI + driver rules + hazards a porter/service-author needs, where they look), and writing the driver
+doctrine into the repo (DA3) so the method is followable, not tribal. Re-probing would clear the two
+below-bar scores: the ABI, add-a-service, and driver method are now stated, discoverable, and legible.

@@ -79,6 +79,33 @@ pub const REBOOT_RESOURCE: ResourceId = ResourceId(8);
 /// (recovery, §13/§14.2), so an ordinary service holds no ambient send authority (§3.1).
 pub const ACQUIRE_ANY_RESOURCE: ResourceId = ResourceId(9);
 
+/// Authority to move raw ethernet frames to/from the in-kernel USB-net device (the ARM DWC2 CDC-ECM
+/// bridge: `NetFrameTx`/`NetFrameRx`/`NetInfo`, syscalls 42-44). Held only by the ARM `nic-driver`, which
+/// bridges those frames to the frame IPC net-stack speaks. On non-ARM arches the NIC is a userspace PCIe
+/// driver and these syscalls return unsupported, so nothing holds this there. A frame is raw wire bytes,
+/// so - like a DMA-capable driver (§6.4) - this is real reach; it is granted explicitly, never ambient.
+pub const NET_DEVICE_RESOURCE: ResourceId = ResourceId(10);
+
+/// Authority to drive the SoC GPIO pins (the ARM `Gpio` syscall: set a pin's direction, drive it high/low,
+/// read its level). Real hardware reach - GPIO pins carry the UART console and the SD card, so toggling the
+/// wrong one breaks the machine; granted only to the `shell` (its `gpio` command, the operator interface).
+/// A no-op off ARM. Like REBOOT/NET_DEVICE, it is explicit authority, never ambient.
+pub const GPIO_DEVICE_RESOURCE: ResourceId = ResourceId(11);
+
+/// Authority to read and write blocks on the in-kernel USB mass-storage device (the ARM DWC2 Bulk-Only
+/// bridge: `UsbDiskInfo`/`UsbDiskRead`/`UsbDiskWrite`, syscalls 46-48). Held only by the ARM
+/// `block-driver`, which serves those blocks to `fs` over the same block IPC protocol as any disk. This
+/// is whole-device read/write reach - a holder can rewrite any sector, so it is granted explicitly,
+/// never ambient (the same posture as NET_DEVICE). A no-op off ARM, where disks are userspace drivers.
+pub const USB_DISK_RESOURCE: ResourceId = ResourceId(12);
+
+/// Authority to set the wall clock via `SetClock` (the SNTP-fed time-of-day). The RTC-less ARM port has
+/// no hardware clock, so `date` reads zero until a network time source sets it; setting it changes every
+/// task's view of the time of day, so it is a privileged action (§3.1), not ambient. Granted only to
+/// `net-stack`, which runs the SNTP round-trip. A no-op on arches with a real RTC (x86). Validated by
+/// holdings (like `reboot`/8), since `SetClock` spends its one argument register on the epoch.
+pub const SET_CLOCK_RESOURCE: ResourceId = ResourceId(13);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever - §7.5).
@@ -91,5 +118,9 @@ pub fn init() {
     table::register_resource(RESOURCE_MINT_RESOURCE);
     table::register_resource(REBOOT_RESOURCE);
     table::register_resource(ACQUIRE_ANY_RESOURCE);
+    table::register_resource(NET_DEVICE_RESOURCE);
+    table::register_resource(GPIO_DEVICE_RESOURCE);
+    table::register_resource(USB_DISK_RESOURCE);
+    table::register_resource(SET_CLOCK_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }

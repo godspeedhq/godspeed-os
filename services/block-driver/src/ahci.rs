@@ -413,7 +413,7 @@ impl<'a> Ahci<'a> {
     /// Serve one block-IPC request (same protocol as the ATA PIO backend),
     /// replying through the client's `reply` cap.
     fn serve(&self, ctx: &ServiceContext, p: &[u8], reply: CapHandle) {
-        use super::{OP_CAPACITY, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
+        use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
         let err = |ctx: &ServiceContext| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); };
         if p.is_empty() {
             err(ctx);
@@ -421,6 +421,22 @@ impl<'a> Ahci<'a> {
         }
         // OP_CAPACITY carries no LBA; read/write carry [op, lba:u64 LE, (write: 512 data)].
         // The LBA is u64 so GSFS's u64 fields reach the device unchanged (persistence §6.3).
+        if p[0] == OP_FLUSH {
+            // Issue the flush and report what the DRIVE said. An earlier version of this branch
+            // replied OK unconditionally, with a comment claiming FLUSH CACHE was "not implemented
+            // here" - which was wrong about this very file: `write_block` and `write_zeros` already
+            // issue ATA_FLUSH_EXT (0xEA) after every write, so this backend attests durability
+            // per-write, which is strictly stronger than on demand. Replying OK for a command never
+            // sent was an ASSERTED guarantee rather than an earned one, and that is the silent
+            // fallback §26.7 forbids - the caller cannot tell a flush that happened from one that
+            // did not. It costs three lines to answer honestly, so it answers honestly.
+            let st = match self.issue_io(ctx, "flush", ATA_FLUSH_EXT, 0, 0, false, 0) {
+                Ok(()) => STATUS_OK,
+                Err(_) => STATUS_ERR,
+            };
+            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[st]));
+            return;
+        }
         if p[0] == OP_CAPACITY {
             let mut out = [0u8; 9];
             out[0] = STATUS_OK;

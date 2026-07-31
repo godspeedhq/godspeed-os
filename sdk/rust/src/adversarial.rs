@@ -39,6 +39,7 @@ pub fn fault_null_read() {
 
 /// Deliberately read a NON-CANONICAL address (bit 47 != bit 63), raising a ring-3 general-protection
 /// fault (#GP(0)) at CPL3 - §22 A14. The kernel must kill this task, not halt (kernel-audit C1).
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn fault_noncanonical_read() {
     // SAFETY: an intentional fault for the A14 regression; the kernel kills this task at the ring-3 #GP.
@@ -46,9 +47,21 @@ pub fn fault_noncanonical_read() {
     unsafe { let _ = core::ptr::read_volatile(0x8000_0000_0000_0000 as *const u8); }
 }
 
+/// ARMv7 has no "non-canonical" address form (that is an x86-64 48-bit-VA concept). The equivalent
+/// ring-3 CPU fault is a read of an **unmapped high address**, which takes a data abort the kernel
+/// must handle by killing the task, not halting - the same A14/C1 property.
+#[cfg(target_arch = "arm")]
+#[inline]
+pub fn fault_noncanonical_read() {
+    // SAFETY: an intentional data-abort for the A14 regression; a conforming kernel kills this task at
+    // the ring-3 abort. `0xFFFF_FFF0` is far above any mapped user or kernel page on this platform.
+    unsafe { let _ = core::ptr::read_volatile(0xFFFF_FFF0 as *const u8); }
+}
+
 /// Deliberately divide by zero, raising a ring-3 divide-error (#DE, vector 0) at CPL3 - §22 A14. Uses
 /// raw asm because Rust inserts a divide guard that would PANIC (unwind) instead of faulting, and the
 /// threat model includes adversarial asm services. The kernel must kill this task, not halt.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn fault_divide_by_zero() {
     // SAFETY: an intentional fault for the A14 regression; the kernel kills this task at the ring-3 #DE.
@@ -62,5 +75,19 @@ pub fn fault_divide_by_zero() {
             out("eax") _, out("edx") _, out("ecx") _,
             options(nostack, nomem),
         );
+    }
+}
+
+/// ARMv7 has no trapping integer divide-by-zero by default (`sdiv`/`udiv` return 0 unless
+/// `SCTLR.DZ` is set), so the equivalent ring-3 CPU fault is an **undefined instruction** (`udf`),
+/// which the kernel's UND vector must handle by killing the task, not halting - the same A14/C1
+/// property this primitive tests on x86.
+#[cfg(target_arch = "arm")]
+#[inline]
+pub fn fault_divide_by_zero() {
+    // SAFETY: an intentional undefined-instruction fault for the A14 regression. `udf #0` raises a
+    // ring-3 undefined-instruction exception; a conforming kernel kills this task and never resumes it.
+    unsafe {
+        core::arch::asm!("udf #0", options(nostack, nomem));
     }
 }

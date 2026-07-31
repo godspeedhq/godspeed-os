@@ -113,13 +113,22 @@ const ITYPE_FILE_FRAG: u8 = 3; // fragmented file: first_block → extent block,
 // of these via WRITE_NEW/WRITE_AT/READ_AT). 7×508 + a few header bytes ≤ MAX_PAYLOAD (4096).
 // The shell's IO_CHUNK must equal this.
 const MAX_FILE_BYTES: usize = 7 * DATA_PAYLOAD; // 3556 - streaming chunk size (7 data blocks)
+/// Upper bound on a buffered reply (see `serve`). One IPC message is 4 KiB (CLAUDE.md §8.5), and the
+/// largest reply is a streaming read: a 5-byte header plus `MAX_FILE_BYTES`. Sized to the message limit
+/// so buffering can never truncate an answer that a direct send would have carried.
+const SERVE_REPLY_MAX: usize = 4096;
+/// `out_len` sentinel meaning "this arm already sent its own reply, do not send another" - used by the
+/// one arm (`OP_OPEN`) whose reply carries a capability and therefore cannot be buffered as bytes.
+const REPLY_SENT_DIRECTLY: usize = usize::MAX;
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/block-driver`.
 const OP_READ_BLOCK: u8 = 1;
 const OP_WRITE_BLOCK: u8 = 2;
 const OP_CAPACITY: u8 = 3;
 const OP_WRITE_ZEROS: u8 = 4; // [op, lba:u64, count:u64] - zero a run of blocks (fast format)
+const OP_FLUSH: u8 = 5;       // [op] - make prior writes durable on the medium (see `block_flush`)
 const BLK_OK: u8 = 0;
+const BLK_ERR: u8 = 1;        // the driver's STATUS_ERR - it answered, and said the operation failed
 
 // fs file API (client <-> fs). `[op, path_len, path, (WriteFile: data | Rename/Move: tail)]`.
 const OP_WRITE_FILE: u8 = 10;
@@ -167,6 +176,37 @@ const FS_DENIED: u8 = 5;     // op requires a right the file cap lacks (non-esca
                              // DISTINCT value from FS_UNAVAIL(4): a file-cap client must tell "storage
                              // unavailable" apart from "permission denied" (they never shared a code
                              // path, but a shared value invited a future confusion; audit L2)
+const FS_FOREIGN: u8 = 6;    // the disk carries someone else's partition table / boot sector. Refused
+                             // rather than formatted - see `foreign_disk`. Distinct from FS_ERR so the
+                             // client can explain WHY and offer the deliberate override.
+
+/// Does block 0 belong to a foreign (non-GSFS) partitioned or bootable disk? Returns a short name for
+/// what was found, so the refusal can say what it is protecting.
+///
+/// **Why this exists.** On the Raspberry Pi there is exactly ONE storage device, and it is the card the
+/// machine boots from: its MBR and FAT boot partition hold the firmware and the kernel image. `fs` sees
+/// the whole raw device, so formatting writes the GSFS superblock over LBA 0 - destroying the partition
+/// table and leaving a board that cannot boot until the card is re-imaged from another machine. (On x86
+/// the OS boots from USB and formats a separate disk, so the question never arose.) A confirmation
+/// prompt is not enough protection: the operator cannot see from `drives` that the raw disk they are
+/// about to format is also their boot medium. So refuse by default and make the override deliberate -
+/// loud failure over silent destruction (§26.7).
+fn foreign_disk(b: &[u8; BLOCK]) -> Option<&'static str> {
+    // An MBR/partition table ends with the 0x55AA boot signature.
+    if b[510] == 0x55 && b[511] == 0xAA {
+        // Distinguish a FAT volume boot record from a partition table - both carry the signature, and
+        // naming the right one makes the refusal actionable.
+        if &b[54..59] == b"FAT12" || &b[54..59] == b"FAT16" || &b[82..87] == b"FAT32" {
+            return Some("a FAT boot volume");
+        }
+        return Some("an MBR partition table");
+    }
+    // A FAT volume without the signature still starts with the x86 jump used by a boot sector.
+    if (b[0] == 0xEB || b[0] == 0xE9) && (&b[54..59] == b"FAT12" || &b[54..59] == b"FAT16" || &b[82..87] == b"FAT32") {
+        return Some("a FAT boot volume");
+    }
+    None
+}
 
 // File-cap operations - the FIRST payload byte of a badged `ResourceInvoke` (§7.10). The kernel
 // has already validated the cap holds the invoked right; fs enforces that the op needs ≤ that right.
@@ -221,6 +261,25 @@ struct Fs {
     feat_ro_compat: u32,
     feat_incompat: u32,
     read_only: bool,
+    // Last directory block reported as CRC-failed, so one bad block is reported ONCE per mount
+    // instead of once per read. A corrupt root produced 84 identical lines in a single selfcheck,
+    // which is the letter of invariant 12 without its purpose: the failure was loud but said
+    // nothing about what to do, and the repetition buried the one fact that mattered (they were
+    // all the SAME block). Owned state on the struct, not a static - a service holds no global
+    // mutable state (§3.9). `u64::MAX` = nothing reported yet.
+    last_bad_dir_lba: core::cell::Cell<u64>,
+    // Set once the backend has refused a durability request, so the warning is reported one time per
+    // mount instead of on every commit. A device that does not implement SYNCHRONIZE CACHE must not
+    // brick the filesystem - we cannot make it durable, but we can refuse to pretend otherwise.
+    flush_warned: core::cell::Cell<bool>,
+    // Set the moment a block operation reports a device I/O error. The driver can REVIVE a dead USB
+    // device by resetting its port - which restores availability but discards whatever the device had
+    // buffered, because a port reset clears its volatile cache and this device accepts no flush. So an
+    // I/O error is not only "that request failed": it marks the point after which this mount's cached
+    // geometry and free count may describe a disk that no longer matches. The serve loop re-mounts on
+    // the next request rather than trusting them (§14.3 - reacquiring is necessary but not sufficient;
+    // everything derived from the previous incarnation must be re-established too).
+    io_error_seen: core::cell::Cell<bool>,
     // Crash-consistency journal (Phase C). While `txn_active`, structural writes (directory,
     // bitmap, superblock) are STAGED here - with read-your-writes - instead of going to disk,
     // then committed atomically through the on-disk journal region (`commit_txn`). Data-block
@@ -319,7 +378,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // disk (I/O error - data may be intact, do NOT flash) vs a blank/raw disk (flash to format). Set on
     // the I/O-failure break paths below; left false for a genuinely blank disk (the FS_NOFS case).
     let mut storage_unreadable = false;
-    let mut fs: Option<Fs> = {
+    let mut fs: Option<Fs> = if capacity == 0 {
+        // No usable disk: block-driver reported 0 capacity after the bounded probe above (a genuinely
+        // cardless boot - e.g. the Pi 2 before the SD/EMMC driver can read the card). There is nothing
+        // to mount, and the loop below would probe LBA 0 up to MOUNT_MAX_ATTEMPTS times - each a
+        // guaranteed-failing read that logs, a ~1000-line serial flood that drowns the console. "No
+        // disk" is an authoritative truth, not an absence of answer (Commandment VIII): come up
+        // storage-unavailable at once. Marked unreadable so the serve loop stays armed to re-mount if a
+        // disk later appears - and that path re-checks capacity first, so it never re-probes an absent disk.
+        storage_unreadable = true;
+        None
+    } else {
         let mut mounted: Option<Fs> = None;
         let mut io_attempts = 0u32;
         loop {
@@ -329,6 +398,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         "fs: mounted GSFS0008 ({} blocks, bitmap {}..{}, root@{}, {} free)",
                         f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
                     ));
+                    // Establish durability AT MOUNT, so the warning (if any) sits in the boot log
+                    // beside the mount line. It was previously emitted by the first transaction to
+                    // ask, which on a fresh prompt is the shell recording its history - so an
+                    // operator's first `ls` answered with two lines about journal ordering before it
+                    // answered with the directory. The fact is about the medium, not the command.
+                    let _ = f.durable_or_warn(&ctx);
                     mounted = Some(f);
                     break;
                 }
@@ -409,16 +484,49 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // `mount` fails fast on a still-down disk (`read_superblock` returns an error, no spin), so a
         // per-request attempt is cheap. Only the I/O-error degraded state re-mounts; a genuinely blank
         // disk (storage_unreadable == false) stays "no filesystem" until `drives flash`.
+        // A mount that is UP but has seen an I/O error is re-established before the next request.
+        //
+        // The self-heal below covers the mount that never came up. This covers the other half, which
+        // the USB revival created: the driver can bring a dead device back by resetting its port, so
+        // I/O starts working again and `fs` stays `Some(..)` - while the reset has discarded whatever
+        // the device had buffered. The cached superblock geometry and free count then describe a disk
+        // that may no longer match, and nothing would ever re-read them. Observed as a file written
+        // moments before a revival reading back EMPTY afterwards.
+        //
+        // §14.3 states the rule this implements: reacquiring is necessary but NOT sufficient - every
+        // derived thing obtained from the previous incarnation must be re-established too. A dropped
+        // mount is exactly that. Cheap: the flag is only ever set by a real device I/O error, so the
+        // common path costs one `Cell` read per request.
+        if let Some(f) = fs.as_ref() {
+            if f.io_error_seen.get() {
+                ctx.log("fs: device I/O error seen - re-mounting before serving (a revival may have discarded buffered writes; cached geometry is not trusted across it)");
+                match Fs::mount(&ctx) {
+                    Ok(nf) => { fs = Some(nf); }
+                    Err(e) => {
+                        // Loud, and DEGRADE rather than serve from state we have just declared stale.
+                        ctx.log_fmt(format_args!("fs: re-mount after I/O error FAILED ({}) - degrading", e));
+                        fs = None;
+                        storage_unreadable = true;
+                    }
+                }
+            }
+        }
         if fs.is_none() && storage_unreadable {
             let _ = ctx.reacquire_by_name("block-driver");
-            if let Ok(f) = Fs::mount(&ctx) {
-                ctx.log_fmt(format_args!(
-                    "fs: storage recovered - re-mounted GSFS0008 ({} blocks, {} free)",
-                    f.total_blocks, f.free_blocks
-                ));
-                capacity = f.total_blocks;
-                storage_unreadable = false;
-                fs = Some(f);
+            // Never probe an absent disk: capacity 0 -> block_capacity None, so a cardless boot does
+            // not re-flood LBA-0 reads on every request. Only attempt the re-mount once block-driver
+            // reports a real capacity again (a disk is back) - this preserves the LS1 self-heal for a
+            // present-but-transiently-unreadable disk while suppressing the no-disk flood.
+            if block_capacity(&ctx).is_some() {
+                if let Ok(f) = Fs::mount(&ctx) {
+                    ctx.log_fmt(format_args!(
+                        "fs: storage recovered - re-mounted GSFS0008 ({} blocks, {} free)",
+                        f.total_blocks, f.free_blocks
+                    ));
+                    capacity = f.total_blocks;
+                    storage_unreadable = false;
+                    fs = Some(f);
+                }
             }
         }
         // A delegated-resource badge (§7.10) is set ONLY by the kernel after it validated a real
@@ -710,8 +818,106 @@ fn data_journal_test(ctx: &ServiceContext, fs: &mut Fs) {
 }
 
 /// Dispatch one request and reply through the client's `reply` cap.
+/// Is this opcode safe to run TWICE? Only a request that changes nothing may be retried after a device
+/// I/O error: a retried read returns the same answer, a retried write could apply the same change twice.
+/// The failing operation is the one worth rescuing (it is what the operator just typed), but not at the
+/// price of guessing about a mutation whose first attempt may have partly landed. A write that fails
+/// still reports the failure and the caller decides - which is the honest split (§26.7).
+fn op_is_read_only(op: u8) -> bool {
+    matches!(op & 0x7F,
+        OP_READ_FILE | OP_STAT_FILE | OP_LIST_DIR | OP_READ_AT | OP_DRIVES_INFO | OP_SCRUB)
+}
+
+/// Serve one request, retrying ONCE through a fresh mount if the attempt hit a device I/O error.
+///
+/// `fs` already re-mounts when it has seen an I/O error - but it did so at the TOP of the serve loop,
+/// which means the request that DISCOVERS the error is always the one that fails, and only the next one
+/// benefits. That is exactly the "I have to run `ls` twice" the operator hit after replugging the USB
+/// stick: the first `ls` finds the stale mount, dies, and repairs it for the second. §26.7 says a
+/// recovery that leaves the triggering operation failed is only half a recovery, so the repair now
+/// happens INSIDE the request: attempt, and if the device errored and a re-mount succeeds, attempt again
+/// before replying. The caller sees one answer, and for a read-only op that answer is the right one.
+///
+/// The reply is BUFFERED rather than sent from inside, which is what makes a second attempt possible at
+/// all - the first attempt's failure reply must not already be on the wire. Every arm of `serve_once`
+/// replies exactly once and returns (there are no loops around `send`), so buffering is faithful.
 fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8], reply: CapHandle) {
-    let send = |bytes: &[u8]| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(bytes)); };
+    // Split the CORRELATION TAG off the front. A name-addressed request carries one byte the client
+    // chose, and its reply carries the same byte back, so the client can tell an answer to ITS question
+    // from an answer to an earlier one. Everything after it is the request exactly as every opcode arm
+    // already expects - the tag is handled here and nowhere else, which is why adding it did not touch a
+    // single arm. (Badged file-cap invocations take the other path and are untagged; they are their own
+    // request/reply cycle.)
+    let (tag, p) = match p.split_first() { Some((t, b)) => (*t, b), None => (0u8, &[][..]) };
+    let mut out = [0u8; SERVE_REPLY_MAX];
+    out[0] = tag;
+    let mut len = 0usize;
+    if let Some(f) = vol.as_ref() { f.io_error_seen.set(false); }
+    serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
+
+    let errored = vol.as_ref().map_or(false, |f| f.io_error_seen.get());
+    if errored && len != REPLY_SENT_DIRECTLY && p.first().map_or(false, |&op| op_is_read_only(op)) {
+        ctx.log("fs: device I/O error while serving - re-mounting and retrying this request once");
+        match Fs::mount(ctx) {
+            Ok(nf) => {
+                *vol = Some(nf);
+                len = 0;
+                serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
+            }
+            // The retry is best-effort: a re-mount that fails leaves the FIRST attempt's reply in the
+            // buffer, so the caller still gets the honest error rather than silence. Said out loud,
+            // because a failed recovery is itself a failure and must not look like a plain miss.
+            Err(e) => ctx.log_fmt(format_args!("fs: re-mount for retry FAILED ({}) - replying with the original error", e)),
+        }
+    }
+    if len != REPLY_SENT_DIRECTLY {
+        // A FAILING reply must be able to say why. `ls` came back as "storage error" after a stick
+        // replug with nothing anywhere explaining it - no block-read failure, no re-mount, no I/O error
+        // at all - which left the operator (and me) guessing from the outside for several rounds. That is
+        // precisely the unexplained failure §26.7 exists to prevent, and the fix is not another sweep of
+        // instrumentation: it is that the layer which PRODUCED the answer states what it produced.
+        //
+        // Only on failure, so a healthy request stays silent.
+        if len == 0 || out[1] == FS_ERR {
+            ctx.log_fmt(format_args!(
+                "fs: request op {} answered {} ({} byte reply){}",
+                p.first().copied().unwrap_or(0) & 0x7F,
+                if len == 0 { "NOTHING" } else { "FS_ERR" },
+                len,
+                if errored { " - after a device I/O error" } else { " - no device I/O error was seen" }));
+        }
+        // An empty reply is not a valid answer in this protocol: the caller reads a short reply as a
+        // malformed one and reports something misleading. Never send one - say ERR properly.
+        if len == 0 { out[1] = FS_ERR; len = 1; }
+        // +1 for the tag at out[0]
+        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out[..1 + len]));
+    }
+}
+
+/// One attempt at a request. Writes its reply into `out`/`out_len` instead of sending it - see `serve`.
+///
+/// `reply` is still passed through for the ONE arm that cannot be buffered: `OP_OPEN` embeds a freshly
+/// minted file capability in its reply, and a capability transfer is not bytes - it moves authority
+/// through the kernel (§8.5). That arm sends for itself and sets `out_len` to [`REPLY_SENT_DIRECTLY`]
+/// so the caller does not then send a second, empty reply on top of it.
+fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8],
+              tag: u8, reply: CapHandle, out: &mut [u8], out_len: &mut usize) {
+    let mut send = |bytes: &[u8]| {
+        let n = bytes.len().min(out.len());
+        // TRUNCATION MUST NOT BE SILENT. The clamp is a bounds guard, not a policy: every reply this
+        // service builds fits (the largest is a streaming read, 5 + MAX_FILE_BYTES = 3561, against 4095
+        // available after the tag), so cutting one short means an arm grew past the buffer and the caller
+        // is about to parse a header describing bytes that are not there. Answering a wrong length as if
+        // it were right is the silent corruption §26.7 forbids - say it, and still send what we have so
+        // the caller is not left hanging as well as wrong.
+        if n < bytes.len() {
+            ctx.log_fmt(format_args!(
+                "fs: REPLY TRUNCATED - {} bytes of {} (buffer is {}); the caller will parse a short reply",
+                n, bytes.len(), out.len()));
+        }
+        out[..n].copy_from_slice(&bytes[..n]);
+        *out_len = n;
+    };
     // When degraded (no mounted volume), which "no filesystem" code to return: FS_UNAVAIL if the disk
     // is present but unreadable (do NOT flash - data may be intact), else FS_NOFS (blank - flash to format).
     let nofs: u8 = if unreadable { FS_UNAVAIL } else { FS_NOFS };
@@ -720,10 +926,22 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         return;
     }
 
+    // Bit 7 of the op byte is the destructive-override flag (`force`), not part of the opcode - so
+    // dispatch on the opcode with it masked off. Matching the RAW byte meant a forced flash (op | 0x80)
+    // matched no arm at all and fell through to a generic error, so the format never ran and the shell
+    // reported "flash FAILED (no disk, or disk too small)" on a perfectly good 15 GB disk. Every opcode
+    // is <= 30, so bit 7 is free for this.
+    let forced = p[0] & 0x80 != 0;
     // drives API - INFO/FLASH work on a raw disk; LABEL/RESET as below.
-    match p[0] {
+    match p[0] & 0x7F {
         OP_DRIVES_INFO => {
             // [FS_OK, mounted, capacity:u64, used:u64, flags:u8, label_len:u8, label…]
+            // Report what this answer is made of. `drives` reporting "no disk" while the boot log shows a
+            // mounted 15 GB volume is a contradiction between two of our own statements, and neither side
+            // said enough to tell which was wrong. This is the producing side (§26.4 - where the answer
+            // came from must be answerable).
+            ctx.log_fmt(format_args!("fs: drives-info - capacity {} sectors, mounted {}",
+                                     capacity, vol.is_some()));
             let mut out = [0u8; 28 + LABEL_MAX];
             out[0] = FS_OK;
             out[2..10].copy_from_slice(&capacity.to_le_bytes());
@@ -743,12 +961,42 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
             return;
         }
         OP_FLASH => {
-            if capacity == 0 { send(&[FS_ERR]); return; }
+            ctx.log_fmt(format_args!("fs: flash requested (capacity {} sectors, forced {})", capacity, forced));
+            if capacity == 0 {
+                // Named, not silent: this was one of two OP_FLASH paths that replied FS_ERR without a
+                // word, so "drives: flash FAILED (no disk, or disk too small)" was the only thing an
+                // operator saw - on hardware that was actively misleading (§26.7).
+                ctx.log("fs: flash REFUSED - block-driver reports 0 capacity (no disk, or the driver is mid-revival). Retry once storage settles.");
+                send(&[FS_ERR]);
+                return;
+            }
+            // Refuse to overwrite someone else's disk unless the caller explicitly forced it. On a
+            // single-storage board (the Pi) this disk is also the boot medium - see `foreign_disk`.
+            // The force flag rides in the op byte's high bit so the wire format is unchanged.
+            if !forced {
+                if let Some(b0) = block_read(ctx, 0) {
+                    if let Some(what) = foreign_disk(&b0) {
+                        ctx.log_fmt(format_args!(
+                            "fs: REFUSED to format - block 0 holds {}. This disk is not blank; on a board \
+                             that boots from it, formatting would make it unbootable. Force to override.",
+                            what));
+                        send(&[FS_FOREIGN]);
+                        return;
+                    }
+                }
+            }
             let ll = if p.len() >= 2 { (p[1] as usize).min(LABEL_MAX) } else { 0 };
             let label = if p.len() >= 2 + ll { &p[2..2 + ll] } else { &[][..] };
             match Fs::format(ctx, capacity, label) {
                 Ok(f) => { *vol = Some(f); send(&[FS_OK]); }
-                Err(_) => send(&[FS_ERR]),
+                Err(why) => {
+                    // `format` names the exact step that failed ("backup superblock write failed",
+                    // "bitmap init failed", ...). Discarding it left the operator with the shell's
+                    // generic "flash FAILED (no disk, or disk too small)" - which on a 15 GB disk is
+                    // actively misleading. Report the reason (§26.7: a failure is never swallowed).
+                    ctx.log_fmt(format_args!("fs: format FAILED - {} (capacity {} sectors)", why, capacity));
+                    send(&[FS_ERR]);
+                }
             }
             return;
         }
@@ -774,6 +1022,17 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
             // "recover" the just-reset filesystem from the surviving backup.
             if capacity == 0 { send(&[FS_ERR]); }
             else {
+                // Same protection as OP_FLASH: reset zeroes block 0, which on a foreign disk is the
+                // partition table / boot sector. Refuse unless explicitly forced.
+                if let Some(b0) = if forced { None } else { block_read(ctx, 0) } {
+                    if let Some(what) = foreign_disk(&b0) {
+                        ctx.log_fmt(format_args!(
+                            "fs: REFUSED to reset - block 0 holds {} (not a GSFS disk). Force to override.",
+                            what));
+                        send(&[FS_FOREIGN]);
+                        return;
+                    }
+                }
                 let z = [0u8; BLOCK];
                 let ok = block_write(ctx, 0, &z) && block_write(ctx, capacity - 1, &z);
                 if ok { *vol = None; send(&[FS_OK]); } else { send(&[FS_ERR]); }
@@ -940,7 +1199,8 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
             // that cap (§7.10). `open_file` sends its own reply (it must embed the cap), so we
             // only send FS_ERR if it failed before replying.
             let want = if tail.is_empty() { 0 } else { tail[0] & (RIGHT_READ | RIGHT_WRITE) };
-            if fs.open_file(ctx, path, want, reply).is_err() { send(&[FS_ERR]); }
+            if fs.open_file(ctx, path, want, tag, reply).is_err() { send(&[FS_ERR]); }
+            else { *out_len = REPLY_SENT_DIRECTLY; }   // the cap went with it; do not reply twice
         }
         _ => send(&[FS_ERR]),
     }
@@ -1031,6 +1291,19 @@ impl Fs {
         let primary = block_read(ctx, 0);
         if let Some(ref b) = primary {
             if Self::sb_valid(b) { return Ok(*b); }
+            // A FOREIGN disk - a partition table or FAT boot record at block 0 - is NOT a corrupt GSFS
+            // primary, and must NOT trigger the backup fallback. The disk was deliberately partitioned
+            // by another OS (e.g. `diskpart`), and any GSFS backup still sitting at the last block is a
+            // STALE remnant of a former format that a partition-level format does not reach. Recovering
+            // from it resurrects a dead filesystem - and then "heals" the primary by writing that stale
+            // superblock OVER the user's partition table, silently un-formatting the disk they just
+            // formatted (observed: a freshly diskpart'd stick kept coming back as the old GSFS with an
+            // unreadable root). Block 0 is the truth about what the disk currently IS; honour it.
+            if let Some(what) = foreign_disk(b) {
+                ctx.log_fmt(format_args!(
+                    "fs: block 0 holds {} - a foreign disk, not GodspeedOS; NOT recovering from any stale backup (run 'drives flash <n> data force' to format)", what));
+                return Err("disk holds a foreign partition table, not a GodspeedOS filesystem");
+            }
         }
         // Primary missing/corrupt - try the backup at capacity-1. `block_capacity` already rejects a
         // mis-read/absurd value (returns None -> 0 here), so `cap` is a sane sector count or 0; the
@@ -1109,6 +1382,9 @@ impl Fs {
             feat_ro_compat,
             feat_incompat,
             read_only,
+            last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
+            flush_warned: core::cell::Cell::new(false),
+            io_error_seen: core::cell::Cell::new(false),
             txn_active: false,
             txn_n: 0,
             txn_overflow: false,
@@ -1136,7 +1412,10 @@ impl Fs {
                 if self.txn_lba[i] == lba { return Some(self.txn_blk[i]); }
             }
         }
-        block_read(ctx, lba)
+        match block_read(ctx, lba) {
+            Some(b) => Some(b),
+            None => { self.io_error_seen.set(true); None }
+        }
     }
 
     /// Write a block: stage it in the active transaction (de-duplicating by `lba`), else write
@@ -1152,15 +1431,89 @@ impl Fs {
             self.txn_n += 1;
             true
         } else {
-            block_write(ctx, lba, data)
+            let ok = block_write(ctx, lba, data);
+            if !ok { self.io_error_seen.set(true); }
+            ok
         }
     }
 
     /// Directory-block read with CRC verify, honoring staged writes.
+    ///
+    /// **A CRC mismatch is re-read ONCE before it is believed.** On the Pi's USB backend the first
+    /// tree read after a device revival was observed returning garbage that the transport accepted as
+    /// a complete transfer - the root block "failed its CRC", the operator was told the tree was
+    /// unreadable and to reformat, and the very next read of the same block was clean (an `ls` through
+    /// the root PASSED seconds later). The medium was fine; the READ lied once. Declaring permanent
+    /// corruption - whose stated remedy is `drives flash`, i.e. destroying the tree - on a single
+    /// read's evidence turns a transient into data loss by prescription. One bounded re-read separates
+    /// the two: a transient heals (loudly, so every occurrence stays countable evidence of the
+    /// underlying read-path bug); real bit-rot fails twice and is reported exactly as before. The
+    /// staged-write path is exempt (memory, not a device read).
     fn td_read(&self, ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
-        let blk = self.tb_read(ctx, lba)?;
+        let mut blk = self.tb_read(ctx, lba)?;
         if u32_at(&blk, DIR_CRC_OFF) != crc32(&blk[..DIR_REC_REGION]) {
-            ctx.log_fmt(format_args!("fs: directory block CRC mismatch at lba {} - refusing", lba));
+            // Three re-reads with a breather between, because one immediate re-read was defeated on
+            // hardware: `drives scrub` verified the whole tree (0 bad), and seconds later - right
+            // after a device revival's first write - the root read failed its CRC TWICE back-to-back,
+            // then read clean for the rest of the run. The glitch is a WINDOW (a stick serving stale
+            // data while it settles after a revival), not a single bad transfer, so an instant
+            // re-read lands inside the same window. Yielding between attempts lets the device finish
+            // what it is doing; three attempts is bounded (§26.6) and each heal is logged with its
+            // attempt number so the window's width stays measurable. Genuine bit-rot fails all four
+            // reads and is reported exactly as before.
+            // Name WHAT the garbage is, once, before retrying - the diagnosis hangs on it. The bad
+            // reads always follow the first write after a device revival, and the three candidate
+            // mechanisms leave different fingerprints in the returned block: the just-written
+            // journal/staged block means OUR shared DMA buffer was served back unrefreshed; all-zeros
+            // means the data stage moved nothing and the buffer was cleared; some OTHER block's valid
+            // content means the DEVICE itself is serving stale data while it settles.
+            ctx.log_fmt(format_args!(
+                "fs: CRC mismatch on directory block lba {} - first bytes {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}, stored crc {:08x}, computed {:08x}",
+                lba, blk[0], blk[1], blk[2], blk[3], blk[4], blk[5], blk[6], blk[7],
+                u32_at(&blk, DIR_CRC_OFF), crc32(&blk[..DIR_REC_REGION])));
+            for attempt in 1..=3u32 {
+                // Wait REAL time between attempts, because yield-counted waits were three orders of
+                // magnitude too short. Every hardware log agrees on the window's scale: the stale
+                // answers persist across back-to-back retries (32 yields ~ a millisecond - defeated)
+                // and across an interposed read of a different block (defeated too - the firmware's
+                // stale window is not a one-entry cache), yet reads issued SECONDS later are clean.
+                // So each attempt waits for the monotonic clock to ADVANCE (~1 s), double-bounded by
+                // a yield cap so a dead clock cannot spin this loop forever (§26.6, Commandment VIII:
+                // wait on the truth - time actually passing - not on a loop count that only measures
+                // scheduler load). Worst case ~3 s, spent only on this failure path, against the
+                // alternative of declaring a healthy tree dead and prescribing a reformat.
+                let t0 = ctx.epoch_secs_monotonic();
+                let mut spins = 0u32;
+                while ctx.epoch_secs_monotonic() <= t0 && spins < 200_000 { ctx.yield_cpu(); spins += 1; }
+                // Still displace the firmware's cached answer before re-asking (result discarded).
+                if lba != 0 { let _ = block_read(ctx, 0); }
+                let Some(again) = self.tb_read(ctx, lba) else { break };
+                if u32_at(&again, DIR_CRC_OFF) == crc32(&again[..DIR_REC_REGION]) {
+                    ctx.log_fmt(format_args!(
+                        "fs: CRC mismatch on directory block lba {} healed on re-read {} - a transient bad READ, not bit-rot (the transport served garbage as a complete transfer)", lba, attempt));
+                    return Some(again);
+                }
+                blk = again;
+            }
+        }
+        if u32_at(&blk, DIR_CRC_OFF) != crc32(&blk[..DIR_REC_REGION]) {
+            // Report a given bad block once per mount, and say what it COSTS and what to do. Without
+            // redundancy a directory block cannot be repaired (fs/CLAUDE.md, Phase K): scrub detects
+            // bit-rot, it cannot undo it. The root block is the worst case - every path resolves
+            // through it, so losing it takes the whole tree with it and the only remedy is a reformat.
+            if self.last_bad_dir_lba.get() != lba {
+                self.last_bad_dir_lba.set(lba);
+                if lba == self.root_first_block {
+                    ctx.log_fmt(format_args!(
+                        "fs: ROOT directory block (lba {}) failed its CRC - the file tree is unreadable. \
+                         No redundancy exists for it, so this is not repairable: reformat with \
+                         `drives flash <n> data force`, and let the format finish before resetting.", lba));
+                } else {
+                    ctx.log_fmt(format_args!(
+                        "fs: directory block CRC mismatch at lba {} - refusing (that directory's entries \
+                         are lost; `drives check` reports the extent, reformat clears it)", lba));
+                }
+            }
             return None;
         }
         Some(blk)
@@ -1171,6 +1524,22 @@ impl Fs {
         let c = crc32(&blk[..DIR_REC_REGION]);
         blk[DIR_CRC_OFF..DIR_CRC_OFF + 4].copy_from_slice(&c.to_le_bytes());
         self.tb_write(ctx, lba, blk)
+    }
+
+    /// Request durability, and report ONCE per mount if the backend cannot provide it.
+    ///
+    /// Deliberately not fatal. A drive that does not implement SYNCHRONIZE CACHE cannot be made to
+    /// honour a barrier, and refusing to commit would brick the filesystem on that hardware for a
+    /// guarantee it was never going to give. Before this existed there was no flush at all, so
+    /// continuing is exactly the old behaviour - the difference is that it is now VISIBLE. What is
+    /// not acceptable is the third option: proceeding while implying the ordering held (§26.7).
+    fn durable_or_warn(&self, ctx: &ServiceContext) -> bool {
+        if block_flush(ctx) { return true; }
+        if !self.flush_warned.get() {
+            self.flush_warned.set(true);
+            ctx.log("fs: durability NOT attested by this drive - it accepts no cache flush, so journal write ordering is unenforced and a power loss may leave metadata torn. Metadata stays CRC-checked, so damage is detected on read; what is missing is automatic repair. See CLAUDE.md 6.1 (2026-07-25).");
+        }
+        false
     }
 
     fn begin_txn(&mut self) {
@@ -1189,6 +1558,12 @@ impl Fs {
     /// a checksummed commit record (the atomic point), then checkpoint them to their home LBAs,
     /// then invalidate the journal. On overflow or any failure the transaction is dropped; if it
     /// failed before the commit record landed, home is untouched (the fs is unchanged).
+    /// Record a block-I/O failure on the JOURNAL path, which uses `block_read`/`block_write` directly
+    /// rather than the `tb_*` funnels and therefore bypassed `io_error_seen` entirely - leaving the one
+    /// failure that most needs a re-mount (a device dying mid-checkpoint, whose transaction is now
+    /// half-applied and awaiting replay) as the one that never triggered one.
+    fn note_io_error(&self) { self.io_error_seen.set(true); }
+
     fn commit_txn(&mut self, ctx: &ServiceContext) -> Result<(), &'static str> {
         if self.txn_overflow { self.abort_txn(); return Err("transaction too large to commit atomically"); }
         let n = self.txn_n;
@@ -1198,6 +1573,7 @@ impl Fs {
         // 1. Stage the data blocks in the journal (journal_start+1 ..).
         for i in 0..n {
             if !block_write(ctx, self.journal_start + 1 + i as u64, &self.txn_blk[i]) {
+                self.note_io_error();
                 return Err("journal data write failed");
             }
         }
@@ -1208,9 +1584,34 @@ impl Fs {
         for i in 0..n {
             commit[8 + i * 8..16 + i * 8].copy_from_slice(&self.txn_lba[i].to_le_bytes());
         }
-        let crc = crc32(&commit[..8 + n * 8]);
+        // BARRIER 1: the staged blocks must be on the medium before the record that authorises
+        // replaying them.
+        let _ = self.durable_or_warn(ctx); // advisory: the one-shot warning IS the report (see BARRIER 3)
+        // ...and a CHECKSUM OF THE PAYLOAD, so replay can tell whether they actually got there.
+        //
+        // The barrier alone was never enough, and this filesystem has been destroyed repeatedly to
+        // prove it. On a medium that will not honour a flush, the ordering the barrier asks for cannot
+        // be enforced - so a commit record can survive while the staged blocks it authorises do not.
+        // The record described WHICH blocks to copy and WHERE, and nothing at all about what they
+        // should contain, so `recover` copied whatever those journal slots happened to hold over live
+        // metadata. That is how a root directory ends up failing its CRC after a clean-looking mount:
+        // not bit-rot, not a bad write - the journal faithfully applying garbage it could not check.
+        //
+        // A redo record that cannot verify its own payload is not a redo record. `data_crc` is a CRC
+        // over the per-block CRCs of everything staged; it sits immediately after the LBA table and is
+        // covered by the header CRC, so the two cannot disagree. Recovery recomputes it from the
+        // journal and refuses to apply a transaction that does not match (see `recover`).
+        let mut per = [0u8; TXN_CAP * 4];
+        for i in 0..n { per[i * 4..i * 4 + 4].copy_from_slice(&crc32(&self.txn_blk[i]).to_le_bytes()); }
+        let data_crc = crc32(&per[..n * 4]);
+        commit[8 + n * 8..12 + n * 8].copy_from_slice(&data_crc.to_le_bytes());
+        let crc = crc32(&commit[..12 + n * 8]);
         commit[COMMIT_CRC_OFF..COMMIT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
-        if !block_write(ctx, self.journal_start, &commit) { return Err("journal commit write failed"); }
+        if !block_write(ctx, self.journal_start, &commit) { self.note_io_error(); return Err("journal commit write failed"); }
+        // BARRIER 2: and the commit record must be on the medium before any home block is
+        // overwritten - that ordering IS the atomicity. A device free to reorder these two can land
+        // a half-finished checkpoint with no commit record to replay it from.
+        let _ = self.durable_or_warn(ctx); // advisory: see BARRIER 3
         // Test-only: simulate a power loss right here - commit record durable, home not yet
         // updated. The next mount must replay this transaction. (Never set in production.)
         if self.crash_after_commit {
@@ -1222,8 +1623,26 @@ impl Fs {
             if !block_write(ctx, self.txn_lba[i], &self.txn_blk[i]) {
                 // Commit is durable: the next mount will replay this transaction. Report, but
                 // the data is safe - no corruption, only a deferred checkpoint.
+                self.note_io_error();
                 return Err("checkpoint write failed (will replay on next mount)");
             }
+        }
+        // BARRIER 3: the home blocks must be durable before the journal is invalidated, or a crash
+        // could drop both the checkpoint AND the record needed to redo it. Failing here is safe so
+        // long as we actually keep the journal: it still holds the committed transaction and the next
+        // mount replays it. So this returns without invalidating.
+        //
+        // It previously said exactly that and did NOT do it - the early return was lost when this
+        // switched to `durable_or_warn`, so the commit record was erased even when the home writes
+        // were unconfirmed. On a drive that refuses flushes that loses the whole transaction with no
+        // redo record: precisely the corruption this barrier exists to prevent, performed by the
+        // barrier itself.
+        if !self.durable_or_warn(ctx) {
+            // Silent BY DESIGN. Mount has already stated, once, that this medium attests no
+            // durability; repeating it per transaction added no fact, only volume - and on a drive
+            // that never flushes it fired on every commit (50 lines in one run). Keeping the journal
+            // is the right BEHAVIOUR here and it still happens; it just no longer narrates itself.
+            return Ok(());
         }
         // 4. Invalidate the journal. The checkpoint above already landed every block home, so a
         // failure here is safe (the next mount re-replays this committed transaction idempotently) -
@@ -1256,13 +1675,65 @@ impl Fs {
         let commit = match block_read(ctx, journal_start) { Some(b) => b, None => return };
         if u32_at(&commit, 0) != JOURNAL_MAGIC { return; }
         let n = u32_at(&commit, 4) as usize;
-        if n == 0 || n > TXN_CAP || 8 + n * 8 > COMMIT_CRC_OFF { return; }
-        if crc32(&commit[..8 + n * 8]) != u32_at(&commit, COMMIT_CRC_OFF) { return; }
+        if n == 0 || n > TXN_CAP || 12 + n * 8 > COMMIT_CRC_OFF { return; }
+        if crc32(&commit[..12 + n * 8]) != u32_at(&commit, COMMIT_CRC_OFF) { return; }
+        // VERIFY THE PAYLOAD BEFORE APPLYING ANY OF IT. Read every staged block first and check it
+        // against the checksum the commit recorded. A transaction whose blocks do not match is one the
+        // device never durably wrote - replaying it would copy garbage over live metadata, which is
+        // strictly worse than not replaying at all. Discard it whole: that is the documented "crash
+        // before the commit landed" outcome, home untouched, and it is a state the filesystem is
+        // designed to be in. Loudly, never silently (invariant 12).
+        // TWO PASSES, not one buffered pass. Holding all TXN_CAP staged blocks to verify-then-write
+        // would put 28 KiB on the stack, on top of the 28 KiB the `Fs` staging array already occupies -
+        // the heap reflex in stack form (§26.6.1). Reading each block twice costs a bounded number of
+        // extra reads, once per mount, and keeps the frame to a 224-byte checksum table.
+        let mut per = [0u8; TXN_CAP * 4];
+        for i in 0..n {
+            match block_read(ctx, journal_start + 1 + i as u64) {
+                Some(blk) => per[i * 4..i * 4 + 4].copy_from_slice(&crc32(&blk).to_le_bytes()),
+                None => {
+                    ctx.log("fs: journal replay could not READ its own staged blocks - left intact, retries next mount");
+                    return;
+                }
+            }
+        }
+        if crc32(&per[..n * 4]) != u32_at(&commit, 8 + n * 8) {
+            // Do NOT destroy the record on a single mismatch, and do NOT claim home is untouched.
+            //
+            // Two things were wrong here. First the asymmetry: a REPORTED read failure left the journal
+            // intact to retry next mount, while a SILENT bad read - the less trustworthy signal, and the
+            // likelier one on a just-revived device - zeroed the record immediately and discarded a
+            // committed transaction for good. One transient sector was enough. Second the claim: the
+            // message asserted "home is untouched, this is the crash-before-commit outcome", which the
+            // code cannot know. `commit_txn` writes the commit record BEFORE the checkpoint loop, so a
+            // failure part-way through the checkpoint leaves the record durable and home PARTIALLY
+            // applied. Discarding there converts a repairable torn state into a permanent one - while
+            // announcing that it was safe. §26.7: a recovery that fails must stay as visible as the
+            // fault, not narrate a success it did not achieve.
+            //
+            // So: leave the journal alone, say what is actually known, and degrade. `drives check`
+            // rebuilds the bitmap from the tree and is the tool for exactly this.
+            ctx.log("fs: journal payload does NOT match its commit record - the device did not durably write what the record authorises. Leaving the journal INTACT and applying NOTHING. Home blocks may be PARTIALLY applied (the commit record is written before the checkpoint), so the tree is not known consistent: run `drives check`. This will be re-verified on the next mount.");
+            return;
+        }
+        // Pass 2: apply - re-verifying EACH block against the checksum pass 1 computed for it.
+        //
+        // Without this the payload check covers bytes that are then thrown away: pass 1 verifies one
+        // read, pass 2 writes home a DIFFERENT read of the same LBA. A device that returns a stale or
+        // partial sector without reporting an error - precisely what a just-revived USB device does -
+        // slips past the check for the one block that gets written over live metadata. The guarantee
+        // has to cover the bytes actually applied, not a previous sight of them.
         let mut replayed_ok = true;
         for i in 0..n {
             let lba = u64_at(&commit, 8 + i * 8);
             match block_read(ctx, journal_start + 1 + i as u64) {
-                Some(blk) => if !block_write(ctx, lba, &blk) { replayed_ok = false; },
+                Some(blk) => {
+                    if crc32(&blk).to_le_bytes() != per[i * 4..i * 4 + 4] {
+                        ctx.log("fs: journal block changed between verify and apply - aborting the replay with the journal INTACT (it will be re-verified next mount); home is not written from unchecked bytes");
+                        return;
+                    }
+                    if !block_write(ctx, lba, &blk) { replayed_ok = false; }
+                }
                 None => replayed_ok = false,
             }
         }
@@ -1360,8 +1831,57 @@ impl Fs {
         // Clear the journal commit block so a re-flash of a previously-used disk can't replay a
         // stale transaction (a fresh host image is already zeroed here).
         if !block_write(ctx, journal_start, &[0u8; BLOCK]) { return Err("journal init failed"); }
+        // Everything above is only ACKNOWLEDGED until the medium confirms it. Without this the root
+        // directory - written last, and so still in the device's buffer - was lost to a power-cycle
+        // moments later, leaving a disk whose superblock said "formatted" and whose file tree was
+        // unreadable. A drive that cannot flush cannot be made to, so this warns and completes
+        // rather than failing the format - refusing would brick such a drive for a guarantee it was
+        // never going to give. (An earlier comment here read "a format that cannot be made durable
+        // is a failed format, and says so"; that described a version of the code that no longer
+        // exists, and a comment asserting a behaviour the code does not have is worse than none.)
+        if !block_flush(ctx) {
+            ctx.log("fs: WARNING - the drive refused a cache flush; this format is written but NOT confirmed on the medium. If power is cut before the drive settles, it may come back unreadable.");
+        }
 
-        Fs::mount(ctx)
+        // Return the filesystem BUILT FROM WHAT WE JUST WROTE, never by reading it back. `format` used
+        // to end with `Fs::mount(ctx)`, which re-reads the superblock and root - and on the ARM USB
+        // stick that readback lands in the post-write stale-read window this driver is fighting: the
+        // device serves the OLD block content for seconds after a write. So a format whose every write
+        // SUCCEEDED was condemned by a flaky READ, and `drives flash force` failed on a disk it had just
+        // correctly formatted - with no diagnosis, because the failure was a mount error swallowed into
+        // a generic reply. There is nothing to re-read: every field here is a value we computed and
+        // wrote microseconds ago, so constructing the Fs directly is both correct and immune to the
+        // read glitch. (Same principle as td_read's re-read: a completed write must not be judged by a
+        // single flaky read of the medium.)
+        let mut lbl = [0u8; LABEL_MAX];
+        lbl[..ll].copy_from_slice(&label[..ll]);
+        Ok(Fs {
+            total_blocks,
+            bitmap_start,
+            data_start,
+            journal_start,
+            journal_blocks,
+            root_first_block,
+            root_block_count,
+            free_blocks,
+            flags: 0,
+            label: lbl,
+            label_len: ll as u8,
+            feat_compat: FEAT_COMPAT_BACKUP_SB,
+            feat_ro_compat: 0,
+            feat_incompat: 0,
+            read_only: false,
+            last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
+            flush_warned: core::cell::Cell::new(false),
+            io_error_seen: core::cell::Cell::new(false),
+            txn_active: false,
+            txn_n: 0,
+            txn_overflow: false,
+            txn_lba: [0; TXN_CAP],
+            txn_blk: [[0u8; BLOCK]; TXN_CAP],
+            crash_after_commit: false,
+            open_files: [OpenFile { rid: 0, plen: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
+        })
     }
 
     fn relabel(&mut self, ctx: &ServiceContext, label: &[u8]) -> Result<(), &'static str> {
@@ -1415,7 +1935,16 @@ impl Fs {
             while within < BITS_PER_BMBLOCK {
                 let idx = base + within;
                 if idx >= self.total_blocks { break; }
-                let used = (blk[(within / 8) as usize] >> (within % 8)) & 1 != 0;
+                // The ROOT's own blocks are NEVER allocatable, whatever the bitmap says. The bitmap is a
+                // derived view (Check rebuilds it from the tree); the root is the tree's anchor, and
+                // losing it takes everything with it - the one corruption whose only remedy is a
+                // reformat. Observed on hardware: a power cut mid-fsck left the bitmap inconsistent, the
+                // next write was handed LBA 7699 (the root) and clobbered it with its own data, so every
+                // directory read then failed its CRC. This keeps a corrupt bitmap costing some data
+                // blocks instead of the whole filesystem (§26.7 - a recoverable fault must not escalate).
+                let is_root = idx >= self.root_first_block
+                    && idx < self.root_first_block.saturating_add(self.root_block_count);
+                let used = is_root || (blk[(within / 8) as usize] >> (within % 8)) & 1 != 0;
                 if used {
                     run_start = None;
                     run_len = 0;
@@ -1516,7 +2045,16 @@ impl Fs {
             while within < BITS_PER_BMBLOCK {
                 let idx = base + within;
                 if idx >= self.total_blocks { break; }
-                let used = (blk[(within / 8) as usize] >> (within % 8)) & 1 != 0;
+                // The ROOT's own blocks are NEVER allocatable, whatever the bitmap says. The bitmap is a
+                // derived view (Check rebuilds it from the tree); the root is the tree's anchor, and
+                // losing it takes everything with it - the one corruption whose only remedy is a
+                // reformat. Observed on hardware: a power cut mid-fsck left the bitmap inconsistent, the
+                // next write was handed LBA 7699 (the root) and clobbered it with its own data, so every
+                // directory read then failed its CRC. This keeps a corrupt bitmap costing some data
+                // blocks instead of the whole filesystem (§26.7 - a recoverable fault must not escalate).
+                let is_root = idx >= self.root_first_block
+                    && idx < self.root_first_block.saturating_add(self.root_block_count);
+                let used = is_root || (blk[(within / 8) as usize] >> (within % 8)) & 1 != 0;
                 if used {
                     if start.is_some() { return Some((start.unwrap(), len)); }
                 } else {
@@ -2031,7 +2569,7 @@ impl Fs {
     /// The client operates the file by invoking that cap (the kernel badges the request with the
     /// resource id + right; `serve_filecap` resolves it back here). Minted with `GRANT` so fs can
     /// transfer a copy; fs drops its own copy afterward (it serves via the badge, not the cap).
-    fn open_file(&mut self, ctx: &ServiceContext, path: &[u8], want: u8, reply: CapHandle)
+    fn open_file(&mut self, ctx: &ServiceContext, path: &[u8], want: u8, tag: u8, reply: CapHandle)
         -> Result<(), &'static str> {
         let e = self.walk(ctx, path).ok_or("not found")?;
         if !is_file(e.itype) { return Err("not a file"); }
@@ -2043,7 +2581,10 @@ impl Fs {
         self.open_files[slot] = of;
         // Hand a derived copy to the client; drop fs's original either way.
         let granted = match ctx.derive_cap(cap) {
-            Some(c) => ctx.send_with_cap_by_handle(reply, c, &Message::from_bytes(&[FS_OK])).is_ok(),
+            // Carries the correlation tag like every other reply - this one is built here rather than
+            // in `serve`'s buffer because it must embed the file CAPABILITY, and authority does not fit
+            // in a byte buffer. Same wire shape, different construction site.
+            Some(c) => ctx.send_with_cap_by_handle(reply, c, &Message::from_bytes(&[tag, FS_OK])).is_ok(),
             None    => false,
         };
         ctx.remove_cap(cap);
@@ -2476,8 +3017,19 @@ fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
         let mut out = [0u8; BLOCK];
         out.copy_from_slice(&p[1..1 + BLOCK]);
         Some(out)
-    } else {
+    } else if p.first() == Some(&BLK_ERR) && p.len() == 1 {
+        // The driver answered and said no: a genuine device-side failure, already named on its side.
         ctx.log_fmt(format_args!("fs: block read failed at lba {} (device I/O error)", lba));
+        None
+    } else {
+        // The reply is not a read reply at all - a mis-correlated or truncated message (the Bug-2
+        // class `block_capacity` already validates against). Printing this as "device I/O error"
+        // sent a hardware debugging session at the device when the device had said nothing; the two
+        // need opposite responses (a device error is retried/degraded, a protocol desync must be
+        // seen and reported as itself).
+        ctx.log_fmt(format_args!(
+            "fs: block read at lba {} got a MALFORMED reply ({} bytes, first {}) - protocol desync, not a device error",
+            lba, p.len(), p.first().copied().unwrap_or(0xFF)));
         None
     }
 }
@@ -2490,6 +3042,25 @@ fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     req[9..17].copy_from_slice(&count.to_le_bytes());
     match block_rpc(ctx, &req) {
+        Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
+        None => false,
+    }
+}
+
+/// Ask the block backend to make every previously acknowledged write durable on the medium.
+///
+/// A completed write is not a durable one. A USB stick acknowledges a WRITE(10) as soon as the bytes
+/// are in its own volatile buffer, so a reset before it programs flash loses them - which is exactly
+/// how a freshly formatted disk came back with an unreadable root directory: `format` writes the root
+/// last, so it was still in the device's buffer when the machine restarted, while the superblock
+/// (written first) had long since landed. Losing the tail of a write sequence is also precisely what a
+/// redo journal cannot survive, since it rests on the commit record reaching the disk BEFORE the blocks
+/// it authorises.
+///
+/// So durability is requested explicitly, at the points that promise it, and the answer is checked -
+/// `false` means the data is NOT known to be on the medium and the caller must say so (§26.5, §26.7).
+fn block_flush(ctx: &ServiceContext) -> bool {
+    match block_rpc(ctx, &[OP_FLUSH]) {
         Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
         None => false,
     }

@@ -3,6 +3,47 @@
 > **Living document.** Records every audit of the ring-0 kernel against the constitution's
 > invariants. Re-run and append with each audit. First audit: 2026-07-11.
 
+
+
+## Audit 8 - the liveness watchdog, the MMIO reclaim, and the idle contract (2026-07-31, `feat/arm-usb-interrupt`)
+
+**Scope:** `d8de0f2..HEAD` - the per-arch `liveness_deadline_cycles`, the arm32 device-MMIO reclaim
+skip, the BSP idle-halt fix, and the scheduler idle path. Audited against the Ten Commandments.
+
+**Verdict: 0 new violations. 2 real defects were FOUND and FIXED by this work (both pre-existing).**
+
+| ID | Sev | Commandment | Finding |
+|----|-----|-------------|---------|
+| A8-1 | HIGH (pre-existing, FIXED) | V, IX, Invariant 12 | The BSP was excluded from `rearm_idle_timer` (it must keep driving MONOTONIC_TICKS/scan_timed_wakes/COM at 100 Hz) and then allowed to `hlt` regardless. In TSC-Deadline mode the timer is ONE-SHOT, so it halted onto a deadline already in flight; consumed, the core never woke. `LIVENESS WEDGE: core 0 ... slot 224` (224 = IDLE) ~5 s after boot on the T630. Latent for the life of the port - userspace spin-yielded, so the BSP never reached idle. FIXED @ 2b898c5: **never halt without a freshly armed wake**. |
+| A8-2 | HIGH (pre-existing, FIXED) | I, III | `reclaim_user_frames` (arm32) freed every PL0 leaf as "ours", including a driver's device MMIO mapping - 141 occurrences per 100 chaos rounds at phys 0x3F300000 (the Pi's EMMC window). Contained only by a DOWNSTREAM bounds check that happens to reject it on this SoC; a device mapped below top-of-RAM would have entered the free pool and been handed to a service as heap. FIXED @ 0ce48f6 by skipping on the PTE's own memory type. x86 already had the equivalent rule (PCD|PWT); the ARM port never carried it over. |
+| A8-3 | note | I, X | `liveness_deadline_cycles` moves the watchdog's deadline BEHIND the arch seam. This is complexity in the right place (§26.10): only the arch knows both its counter and its rate, and the previous neutral derivation silently disabled the whole check on any arch whose quantum figure is a stub. No new kernel responsibility - the same check, correctly parameterised. |
+| A8-4 | note | VI, Invariant 9 | Three new statics (`LATCH_CLEAR_FAILED`, `RECLAIM_DEVICE_LOGGED`, `LIVENESS_ARMED`). All are single-owner say-once flags in the layer that owns the event; none is read across a boundary or carries state another component reasons about. |
+| A8-5 | note | VIII | The new scheduler call site arms a timer before halting - that is arming a WAKE, not waiting on a clock for correctness. Correctness still comes from the wake itself. |
+| A8-6 | note | cross-arch | The new `rearm_quantum_timer` / `idle_can_halt` call sites resolve on all 7 arches (verified); arch_boundary_check passes, so the neutral scheduler still reaches hardware only through `arch::imp`. |
+
+**Standing:** unsafe_check (854 lines, no unaccounted additions), arch_boundary_check, identity 24/24.
+
+## Audit 7 - the ARM USB hot-plug + storage-failure chain (2026-07-30, `feat/arm-usb-interrupt`)
+
+**Scope:** every change from `fba9081`..`d8de0f2` - the hot-plug watcher rewrite (level -> latch),
+the absent-vs-busy status split, the block-refusal noise budget, and the ARM `usb_disk_absent`
+primitive. Audited against the Ten Commandments.
+
+**Verdict: 1 HIGH, 1 LOW, both fixed; 1 accepted deviation recorded.**
+
+| ID | Sev | Commandment | Finding |
+|----|-----|-------------|---------|
+| A7-1 | HIGH | V, §26.6 | `hotplug_check_port` discarded the verdict of `control_out(CLEAR_FEATURE, C_PORT_CONNECTION)`. A latch that fails to clear stays set, so **every** later visit believes the port just changed: an occupied port would be stood down and fully re-enumerated **once a second, forever**. Exactly the unbounded retry the `PortBringUp::Failed` bound prevents, re-entered through the new latch path - and the **fourth** discarded-verdict defect in this driver. FIXED: the clear is checked; on failure the event is not consumed (an event we cannot acknowledge is one we cannot safely act on), reported once, and re-read next visit. |
+| A7-2 | LOW | I, §26.6 | `HOTPLUG_TRIES[port as usize]` is indexed without a bound inside `hotplug_check_port`. Both current callers clamp to `1..=31` and the array is 32 wide, so it is unreachable today - but a future caller would panic the kernel from a driver path. Recorded, not fixed (guarding at the callers is where the clamp belongs). |
+| A7-3 | note | VII | Cap-before-action holds on the new status code: `handle_usb_disk_read`/`_write` validate `USB_DISK_RESOURCE` **before** consulting `usb_disk_absent()`. No new authority; `USB_DISK_ABSENT` is a return value, not a gate. |
+| A7-4 | note | III | `MSC_ABSENCE_EXPLAINED` is not a second truth about device presence: it records *whether the absence was announced*, is set only by the removal that prints the cause, and is cleared at both `MSC_READY.store(true)` sites. It reduces to that one event and never overrides `MSC_READY`. |
+| A7-5 | note | X | The hot-plug sweep and the latch read are driver mechanism, not new kernel responsibility - no policy moved inward (Commandment I holds). |
+
+**Accepted deviation:** `usb_disk_absent()` returns `true` on the six non-ARM arches, so on x86 a
+failed USB-disk syscall now answers `USB_DISK_ABSENT` (-21) rather than -1. No x86 code uses that
+path (x86 storage is AHCI), and -21 is the more accurate answer, so this is a widening of truth
+rather than a regression.
+
 ## North-star invariant
 
 **Nothing above the kernel may panic or wedge the kernel.** For any userspace action - any syscall
@@ -412,3 +453,241 @@ kill vs halt), K1 (bounded THRE poll), K3 (spurious-vector `iretq` stub); V3 (sc
 handshake); C3 (non-panic supervisor respawn). The demarcation is a mechanical `arch::x86_64::` ->
 `arch::imp::` + `core::sync::atomic::AtomicU64` -> `portable_atomic::AtomicU64` substitution, verified via
 diff to have zero logic change.
+
+## Audit 5 - 2026-07-23 (feat/pi2-arm32: the ARM32 layer we built)
+
+Method: 4 parallel subsystem auditors over the ~6,000 lines of new/changed kernel code on this branch -
+(1) `dwc2` USB driver + `timer` + `video`; (2) `exceptions` + `syscall` + `irq` (the trap/SVC path);
+(3) `mmu` + `page_tables` + `spawn` + `usermode` + the neutral `loader`; (4) `mod` boot + `context_switch`
++ the neutral `scheduler`/`task`/`dispatch`/`allocator` changes. Each triaged A/B/C; every (C) was
+adversarially re-verified against a concrete trigger (default: not-a-bug) before being recorded here, and
+every fix was build-checked on **both** armv7 and x86 (the neutral files) and boot-checked in QEMU
+`raspi2b` (arm-shell: `usermode PASS`, shell ready, 0 faults).
+
+**Result: 10 confirmed (C) violations - 8 FIXED, 2 STAGED (latent, neutral-loader).** Two were
+userspace-reachable HIGH kernel-wedges (a bad-pointer syscall halted the kernel; a magic syscall number
+diverted control into stale boot state) - both now closed. The genuine ring-3 fault path (USR-mode data/
+prefetch abort, undefined instruction) was already correct (kills only the faulting task). The SEC-25
+weak-memory port obligation is now **met** (the port this branch is). No finding is a kernel panic; the
+loader does not panic/hang on any malformed ELF.
+
+| ID | Sev | Class | What | Status |
+|----|-----|-------|------|--------|
+| **A5-1** | HIGH | (C) | `arch/arm/video.rs` `mbox_call` - 3 unbounded mailbox spins (FULL/EMPTY/response-match) run at boot before the scheduler; an absent/wedged VideoCore hangs the boot forever (invariant 12). | **FIXED** - bounded each (`MBOX_SPIN_CAP`/`MBOX_MATCH_CAP`); on timeout report + return false (callers fall back to serial). |
+| **A5-2** | HIGH | (C) | `arch/arm/mod.rs` `read_user_bytes`/`write_user_bytes` - a range-valid-but-unmapped (or, for a write, read-only) user pointer to ANY copying syscall (`log`, `send`/`call`, `recv`/`console_read`, ...) faults the raw copy in SVC mode; the abort handler classifies that as a kernel bug and HALTS the core. Any service wedges the kernel with one bad-pointer syscall (the ARM analog of x86's `USER_COPY_ACTIVE` gap). | **FIXED** - pre-validate every page via the CP15 unprivileged-translation probe (`translate_user`, non-faulting) under the service's own TTBR0; return a defined error instead. No TOCTOU (a task can't mutate its own page tables mid-syscall, nor run concurrently). |
+| **A5-3** | HIGH | (C) | `arch/arm/syscall.rs` `arm_svc_dispatch` intercepted the magic `USER_TEST_SVC` (0x5555_0001) **unconditionally**; a live service issuing `svc r0=0x55550001` diverts the kernel into a stale boot context on a boot-era `sp` (PL0-reachable wild control flow) instead of `UnknownSyscall`. | **FIXED** - gated behind `SELFTEST_ACTIVE`, armed only for the boot selftest round trip; production returns `UnknownSyscall`. |
+| **A5-4** | MED | (C) | `arch/arm/dwc2.rs` `chan_in` - the inner `RxFLvl` FIFO-drain loop reset the outer 4M timeout on every pop, so a core keeping `RxFLvl` asserted hangs forever (the 4M cap is never reached). Reachable at boot via `enumerate_sync` on a present-but-wedged core. | **FIXED** - independent `RX_DRAIN_CAP` on the inner drain. |
+| **A5-5** | MED | (C) | `arch/arm/timer.rs` `delay_us` - unbounded spin on a System Timer that never advances (dead peripheral); also made the `selftest` "did not advance" FAIL branch unreachable. | **FIXED** - `DELAY_SPIN_CAP` ceiling; returns best-effort on a stuck timer. |
+| **A5-6** | (config) | (C) | `arch/arm/sched_spawn.rs`/`sched_user.rs`/`sched_ipc.rs`/`sched_demo.rs` - the cr3/TTBR0-seed guard (`disable_interrupts` before `NEUTRAL_SCHED`) was on the shipping paths (`sched_shell`/`sched_supervisor`) but MISSING on these demo/increment paths; a timer in the window wedges the core silently (ARM liveness watchdog is off). NOT userspace-reachable (a service can't pick the boot feature). | **FIXED** - added the guard to all four, uniform with the shipping paths. |
+| **A5-7** | MED | (C)-latent | `task/scheduler.rs` (SEC-25) - `reserve_task_slot` stored `TASK_VALID` (Release) *before* `TASK_CORE` (data), and 33 `TASK_VALID` readers were `Relaxed`; on live weak-ordered 4-core ARM a reader can observe `VALID==true` with stale data. The *critical* scheduling path was already saved by the `TASK_STATE` Release/Acquire publish (no UAF today); the residual hazard was best-effort/introspection readers. | **FIXED** - write `TASK_CORE` first then `TASK_VALID` (Release); all 34 readers now Acquire. x86 codegen unchanged (Acquire load == `mov` under TSO); x86+arm both build. The SEC-25 port obligation is met. |
+| **A5-8** | LOW | (C) | `arch/arm/video.rs` `request` - GPU-returned `pitch`/`w`/`h` used unvalidated in the `fill` loop + mapping length (GPU is trusted, but defence-in-depth). | **FIXED** - range-check geometry before use (matches `query_display_size`). |
+| **A5-9** | LOW | (B->fix) | `syscall/dispatch.rs` `handle_log` - debug `[hl:*]` serial breadcrumbs left in a **neutral** file (fired on x86 too); a capless-log spammer floods serial (bounded, non-wedging console noise). | **FIXED** - removed; error returns unchanged. |
+| **A5-10** | MED | (C)-latent | `loader.rs` - `p_vaddr` never range-checked against the kernel/user VA split; a crafted ELF can overlay a USER page onto a kernel/MMIO VA in its own (kernel-shared, no per-syscall TTBR switch) address space. Latent on ARM (only trusted embedded ELFs load; fuzz/probe are x86-only), but the loader is the neutral spawn/fuzz entry. No panic/wedge (indices stay in range). | **STAGED** - add an arch-provided user-VA-window check in the loader (the missing analog of x86 higher-half separation). |
+| **A5-11** | MED | (C)-latent | `loader.rs` - on any `Err` after `PageTable::new()`, the partial page-table (L1/L2 arena slots) + already-allocated frames leak (no `Drop`, no cleanup path); repeated failed spawns permanently exhaust the 16-slot L1 arena. Degrades gracefully (errors, no panic - fuzz F3 still passes) but is an unrecoverable resource ratchet (26.6). Same root as x86 **T1** (Audit 4, staged). | **STAGED** - reclaim the partial address space on the error path (`reclaim_user_frames` + `free_page_table_root` exist), or give `PageTable` a `Drop`; fix x86 T1 + this together. |
+
+**Doc-drift corrected (Findings 3/4, Low):** `arch/CLAUDE.md` claimed `invalidate_tlb_page` broadcasts on
+ARM (it is local `TLBIMVA` - correct for pinned per-task address spaces, but the doc overstated) and did
+not record that `write_page_table_base` does no TLB maintenance (harmless - switching goes through
+`switch_context`, which flushes). Both corrected in the SEC-25/26/27 note; SEC-25 marked DONE.
+
+**Re-verified sound (no violation):** the USR-mode data/prefetch-abort + undefined-instruction handlers
+correctly kill only the faulting task and keep the kernel alive; the `stub_svc` SPSR/banked-register
+window is fully IRQ-masked and the atomic-syscall gate stops a mid-syscall preemption from clobbering
+`SPSR_svc`; `switch_context` save/restore (incl. per-task USER-banked SP/LR on both IRQ and SVC paths,
+`clrex`, TTBR0-compare+`TLBIALL` on change) is correct; `smp_bringup` is bounded (40M-spin/core then
+proceeds; core-3 mis-ID parks in `wfi`); the neutral loader validates every ELF header field before use
+(`checked_add`/`checked_mul`, bounds vs `bytes.len()`) so no malformed ELF panics or hangs; `dwc2`
+`init`/`reset_port`/`wait_halt`/`chan_out` waits are all bounded-and-loud; and there is **no**
+`panic!`/`unwrap`/`expect`/`unreachable!` anywhere in `arch/arm/`.
+
+**Observations (noted, not confirmed-reachable):** a deeply-nested syscall could overflow a task's SVC
+kernel stack and fault in SVC mode -> the A5-2 pre-validation does not cover that (no ARM kernel-stack
+guard page yet; C5-class hardening, reachability unproven). `USER_SPSR_SAVE` is a global `static mut`
+written by every `svc` across cores - benign for a selftest artifact, and dead in production once A5-3
+gated the magic path.
+
+## Audit 6 - 2026-07-23 (feat/pi2-arm32: the USB-net bridge + hardware helpers we added since Audit 5)
+
+Method: 2 parallel auditors over this session's kernel additions AFTER Audit 5 - (1) the neutral
+syscall/cap layer (the `NetFrame*` syscalls 42-44 + `handle_gpio` 45 + InspectKernel query 19 handlers,
+the `NET_DEVICE`/`GPIO_DEVICE` resources, their privilege mints, the SEC-11 gate-safety); (2) the arch/arm
+drivers (`hardware_reset` watchdog, `hw_random` RNG, `gpio_op`, `now_epoch_monotonic`, and the dwc2
+USB-net bridge / multi-device / smsc95xx work). Lens: **robustness / liveness / correctness of untrusted
+syscall input and device-driven loops** - memory-safety (`unsafe-audit.md`) and authority
+(`security-audit.md` Audit 2) were audited separately and are NOT re-covered here.
+
+**Result: 0 CONFIRMED north-star violations.** Every new copying syscall gates the cap FIRST, bounds all
+user args, and routes pointers exclusively through the fault-safe `read_user_bytes`/`write_user_bytes`
+wrappers (inheriting V1/A5-2 fault-safety by construction); every device-driven loop is bounded; the one
+divide (`now_epoch_monotonic`) is guarded. 4 latent/defense-in-depth hardening items, all **FIXED**.
+
+| ID | Sev | Class | What | Status |
+|----|-----|-------|------|--------|
+| **A6-1** | INFO | (defense-in-depth) | `syscall/dispatch.rs` `handle_net_frame_rx` - `buf[..n]` trusts the arch `net_frame_rx` to return `n <= max`; a future buggy arch impl returning `n > max` would index-panic the kernel. Not user-controllable (arch code), so not a live north-star finding. | **FIXED** - `.min(max)` clamp on the returned length; the neutral layer is now robust against a buggy arch impl. |
+| **A6-2** | LOW-latent | (C) | `arch/arm/mod.rs` `hardware_reset` - the BCM2835 watchdog poke is correct, but on an absent/wedged PM block that never resets, control fell through to a bare terminal `loop { spin }` on a SINGLE poke; unlike x86's unconditionally-terminal triple-fault. No trigger (QEMU raspi2b + real Pi 2 both honor the watchdog). | **FIXED** - the terminal loop now RE-ISSUES the watchdog poke every iteration, so a write that did not take is retried (BCM2835 has no second reset method; this still never returns). |
+| **A6-3** | LOW-latent | (C) | `arch/arm/mod.rs` `now_epoch_monotonic` - the divide-by-zero IS guarded (`if hz==0 return`), but it returned a FROZEN `0` when `timer_hz()==0` (dead generic timer), so any purely time-bounded wait computing `deadline = now + ticks` would never advance -> a bounded wait becomes unbounded. No trigger (QEMU + Pi 2 both set TIMER_HZ). | **FIXED** - falls back to the 1 MHz System Timer (`timer::systimer_secs`) so the monotonic clock still advances in the degraded-timer case (wraps ~71 min, still better than frozen). |
+| **A6-4** | LOW | (C) | `arch/arm/mod.rs` `pl011_init` opened with an UNBOUNDED `while FR & BUSY {}` boot wait on the console UART; a present-but-wedged PL011 hangs the boot (invariant 12). Pre-existing machine-layer code (not this session's bridge work), same class as the x86 THRE-poll K1 fix. No trigger (QEMU/firmware leave it idle). | **FIXED** - bounded (1M spin cap, best-effort proceed on timeout). |
+
+**Verified sound (no violation):** all four new handlers gate the cap first + bound args + use the
+audited user-copy wrappers (no raw `from_raw_parts`/`copy_nonoverlapping`); `handle_gpio` bounds BOTH
+`op` and `pin` before the arch call (and `gpio_op` re-checks the pin, `_ => -1` default); query 19 is
+correctly ungated (entropy leaks nothing, x86 returns None immediately, ARM's FIFO wait is 2M-bounded ->
+None); `NET_DEVICE`(10)/`GPIO_DEVICE`(11) registered unconditionally so `mint_cap` cannot expect-panic;
+the SEC-11 `id.0 >= 100` assert correctly covers ids 10/11 (holds-resource gen-safety sound); the spawn
+mints unwind cleanly (`cleanup_partial_spawn` on `CapTableFull`). Arch drivers: the RNG FIFO wait (2M),
+GPIO pin/op guards, `hardware_reset` sequence, and the ENTIRE dwc2 chain (init spins, `wait_halt` 4M /
+`poll_wait_halt` 500k, `enumerate_hub` bounded by `next_addr > 120`, `configure_smsc95xx` + `smsc_mii_wait`
+all capped, `net_frame_tx`/`rx` bounded + the smsc RX length hard-guarded) are individually bounded - no
+unbounded device-driven loop, no boot-wedge on hostile/absent hardware.
+
+---
+
+## Audit 7 (2026-07-25, `feat/pi2-arm32` @ `74ee6ff`) - the USB mass-storage + durability work
+
+**Scope:** the unaudited range `6929e28..HEAD` (73 commits, ~1,840 kernel lines across 18 files): the
+DWC2 mass-storage/BOT path, the channel interlock, the cache-flush/FUA durability work, syscall 49
+(`UsbDiskFlush`), the `resource_invoke` ABI repack, and the ARM console/HID/page-table changes.
+
+**North star, restated:** nothing above the kernel may panic or wedge it, and the kernel must never
+hand a service data it did not receive. This audit found one breach of the second half.
+
+**Verdict:** authority and memory-safety are sound. Findings concentrate in liveness, one
+data-integrity gap, and one restart break. **1 HIGH, 4 MED, 2 LOW, 2 INFO; 6 FIXED, 2 RECORDED.**
+
+| ID | Sev | Class | What | Status |
+|----|-----|-------|------|--------|
+| **K7-1** | **HIGH** | (L) liveness | Aggregate IRQ-masked time. Each LEAF wait is bounded (`HALT_BUDGET_US` 2 ms, `POLL_HALT_BUDGET_US` 1 ms, `wait_for_uframe` 1.5 ms), but the retry loops MULTIPLY and nothing bounds the product: `chunks x BOT_TRIES x ss_tries x [uframe + halt + NYET retries]`. A block-I/O syscall runs with IRQs masked, so the timer tick, preemption and the keyboard poll all stop for the duration, and ARM has no liveness watchdog to convert it into a loud panic. The worst case needs a FULL-SPEED stick (`split_port != 0`); the high-speed direct path used on the Pi 2 today costs ~96 ms per FAILING `bot_command`. The comment at `dwc2.rs:559` claims "even a fully wedged device cannot starve the timer ISR" - true of one `wait_halt`, not of one syscall. | **RECORDED** - the fix is a single whole-command deadline captured in `bot_command` and threaded through `chan_dma`/`split_txn`, bounding the product rather than each leaf. Deliberately not attempted blind at the end of an audit: this is exactly the class where an untested "fix" has already cost this port a regression (selfcheck 16 -> 70), and the path the hardware actually takes is the bounded one. Tracked together with the async block path that K7-2 and the durability gap also want. |
+| **K7-2** | MED | (L) liveness | Time-only bounds regress the dead-peripheral guarantee. `poll_wait_halt`, `wait_halt`, `wait_for_uframe` and `pl011_write` were converted in this range from hardware-independent spin counts to `systimer_us() - start > BUDGET`. If the 1 MHz System Timer never advances, that condition is never true and the loop is unbounded. `timer::delay_us` keeps a `DELAY_SPIN_CAP` backstop for exactly this reason; these did not inherit it. Worst on `pl011_write`, which sits on the fault/abort path - a dead timer plus a held `SERIAL_BUSY` deadlocks the panic reporter itself. Same class as Audit 6's A6-3. | **RECORDED** with K7-1 (same fix shape: keep the time bound as primary, add an iteration ceiling as backstop). No trigger: QEMU and the Pi 2 both advance the System Timer. |
+| **K7-3** | MED | (C) correctness | **A short data phase with a GOOD verdict was accepted as a successful transfer.** `bot_command` decoded the CSW's `dResidue` and used it ONLY in the failure log; `ok` tested signature, tag and status but never the byte count. A device may legally return 100 bytes of a 512-byte read with status "passed" and residue 412 (BOT case 5/6, and the ordinary degraded behaviour of a flaky stick) - `bulk_xfer` copies 100 bytes, `bot_command` returns true, and `fs` receives 412 bytes of stale zeros PRESENTED AS DATA. Silent corruption arriving through the device's verdict rather than the DMA buffer, which is the one failure `dwc2.rs` states this driver must never produce. | **FIXED** - the data stage's moved byte count is kept and the CSW check now requires `residue == 0 && moved == dlen`; a short transfer is a failed transfer and recovers as a framing fault. |
+| **K7-4** | MED | (C) restart | `block-driver`'s ARM core-0 pin was BOOT-ONLY. The supervisor forced core 0 at boot, but the kernel `ServiceConfig.preferred_core` said `1` unconditionally and the restart path passes no override - so any respawn landed it on core 1, where every `msc_*` entry point refuses on `!on_core0()`. Storage would die permanently on the first `chaos kill-storm block-driver`, and §22 Test 11 kills a restartable service deliberately. Invariant 6 broken on ARM by one value disagreeing with itself across two code paths. | **FIXED** - `preferred_core: if cfg!(target_arch = "arm") { 0 } else { 1 }` (the idiom `nic-driver` already used), supervisor override removed. Placement now lives in ONE place, consulted by boot and restart alike. Verified: block-driver spawns on core 0 with no override. |
+| **K7-5** | MED | (P) portability | `s390x` lacks all five storage `arch::imp` primitives (`emmc_base_clock_hz`, `usb_disk_sectors/read/write/flush`), which neutral `dispatch.rs` calls unconditionally - so the neutral kernel does not compile there. **Pre-existing** (verified at `6929e28`: zero of them present), widened by one in this range. Invisible because CI builds x86_64 only and `arch_boundary_check.py` tests for named-arch references, not surface completeness - so `docs/multi-arch.md`'s "s390x compiles" endian-neutrality claim was stale. | **FIXED** - five stubs added. The structural gap (nothing checks seam completeness) is noted for a future guard. |
+| **K7-6** | LOW | (C) | `clean_invalidate_dcache_range` (`page_tables.rs`) uses `saturating_add` for `end` then `p += 32`; at the top of the address space `p` overflows to 0 (release builds have overflow checks off) and the loop never ends. The sibling `flush_dcache` uses wrapping arithmetic and exits naturally. No trigger (Pi 2 frames are all below `0x40000000`), but it is the NEW code that hangs. | **FIXED** - `while p < end && p >= addr` wrap guard. |
+| **K7-7** | LOW | (D) doc drift | Three doc-vs-code drifts introduced in this range: (a) new functions were inserted between `hw_random`'s doc block and its item, so the block documented `emmc_base_clock_hz` and `hw_random` had none; (b) `msc_write_block`'s doc asserted FUA behaviour in the present tense while `USE_FUA = false` makes that branch unreachable; (c) `MSC_NO_FLUSH`'s "cleared nowhere" comment justified itself with "a fresh device re-enumerates through `msc_select`", which is false - `msc_select` only re-points the channel and clears nothing. | **FIXED** - (a) doc reattached to its own item; (b) reworded to state FUA is off and why the rationale is deliberately kept; (c) the latches are now genuinely cleared on enumeration and the comment says so. |
+| **K7-8** | INFO | (P) | `usb_disk_read/write` take a `u64 lba` that the arm32 single-register ABI truncates to 32 bits with no wrapper clamp - the A-U1 class this same range fixed for `resource_invoke`. Safe today only by coincidence: `READ CAPACITY(10)` caps `MSC_SECTORS` at 2^32 and the bounds check precedes the `as u32`. Worth an explicit note before any `READ(16)` / >2 TiB support. | Recorded. |
+| **K7-9** | INFO | (A) | `USB_DISK` is minted `Rights::WRITE` only, and all four handlers - including the read and the capacity query - demand `WRITE`. A read-only block consumer cannot be expressed; the §7.4 READ/WRITE distinction is collapsed for this resource. | Recorded (no current consumer needs it). |
+
+**Verified sound (no violation):** cap-before-action holds for all four `UsbDisk` handlers and for
+`handle_resource_invoke` (validated before any hardware touch or user-memory access; `USB_DISK_RESOURCE`
+is registered unconditionally so `mint_cap` cannot expect-panic; the mints unwind via
+`cleanup_partial_spawn`). The `resource_invoke` repack is exact on both sides (`right<<24 | reply<<12 |
+file` against masks `0xFFF`, `0xFFF>>12`, `0xFF>>24`), totals 32 bits so nothing truncates on arm32, and
+`MAX_CAPS_PER_TASK` (64) cannot alias into `right` (4095 per field); a hostile `packed` yields only an
+out-of-range slot, which `CapTable::get` turns into `CapNotHeld`. No other syscall argument is packed
+above bit 31. Unsafe is clean (830 lines, no unaccounted additions); every new `asm!` is in `arch/` with
+a SAFETY comment, including `stub_dabt`'s `cps #0x1f` SP_usr capture (`r0-r3`/`r12` are unbanked and the
+I bit is untouched). Both descriptor walkers clamp to the 64-byte buffer, break on `blen == 0`, and
+range-check before every field read; the 16-bit MPS parse is correct; `ctrl_xfer` clamps the programmed
+DMA length on both directions; `bulk_xfer`'s OUT path sends `min(n, data.len())` so leftovers can never
+be transmitted. The `switch_context` `dsb`/`isb` bracketing and `publish_user_pages_to_other_cores` are
+a correct weak-memory fix (set/way is core-local, MVA is broadcast - the SEC-26/27 class), with a
+bounded L1/L2 walk over kernel-built tables only. `hid.rs` is pure logic with provably in-range
+indexing; `fbcon`'s CSI state machine is total and cannot escape the escape state.
+`arch_boundary_check.py` passes.
+
+**Cross-arch:** x86_64 was NOT broken by this range - services, kernel and `osdev` all build clean,
+20/20 contracts validate, and no third party encodes syscall 31's argument (the only encoder is the SDK,
+the only decoder the kernel). Confirmed against a clean worktree of the base commit.
+
+**Also fixed during this audit (a test defect, not a kernel one):** three `capability::table` proptests
+had been permanently red, sweeping `id in 0..DIRECT_CAP` and thereby fabricating STABLE gate resource
+ids (< 100) whose `bump_generation` the kernel correctly refuses (SEC-11). The kernel was right every
+time; the generators now start at 100. `97 passed, 0 failed`. Three always-red tests train a reader to
+see `3 failed` as the normal state, which is how a real regression walks in unnoticed (§22.4: a test
+failing for the wrong reason is a failure of the test, not the kernel).
+
+---
+
+## Audit 8 (2026-07-26, `feat/pi2-arm32` @ `f723e7a`) - the USB recovery layers, console foreground, and 32-bit VA work
+
+Scope: `74ee6ff..HEAD`, 34 commits / ~1300 lines, none previously audited. Four independent auditors
+(dwc2 transport; the rest of the arm layer + neutral `syscall/`+`task/`; guards + doc drift; plus the
+userspace pass recorded as userspace Audit 7). Every finding below was traced to code before being
+recorded; findings that could not be given a concrete failure scenario were discarded.
+
+**Mechanical guards: all PASS** (`unsafe_check`, `arch_boundary_check`, `contract_check`, `dash_check`,
+unit tests 97/0, `osdev validate` 20/20). x86 identity **24/0** after the fixes. `PYTHONIOENCODING=utf-8`
+set, verdicts taken from exit codes, not from the absence of the word FAILURE (the trap from Audit 7).
+
+**Unsafe inventory: TRUE.** Per-file counts independently recounted and matched (`dwc2.rs` 14,
+`arm/mod.rs` 43, `fbcon.rs` 6, `exceptions.rs` 24, `page_tables.rs` 31); grandfathered floors held
+(`scheduler.rs` 34/37, `dispatch.rs` 1/2). Every block carries a `// SAFETY:` comment.
+
+### FIXED in this audit (all HIGH, all introduced by the work being audited)
+
+| ID | Finding |
+|----|---------|
+| **A8-1** | **A u64 LBA truncated to 32 bits on the ARM syscall ABI - silent corruption.** The kernel's `lba >= MSC_SECTORS` guard runs on the value it *received*, so `0x1_0000_0000` arrived as 0, passed, and overwrote the superblock with every layer reporting success. Rejected in the SDK wrapper per hazard A-U1. |
+| **A8-2** | **`-2` meant both "device busy" and `CapNotHeld`.** A driver missing its `USB_DISK` cap was retried 6000 times and then reported as a device that "stayed busy" - an authority failure wearing an I/O failure's name, with `fs` degrading storage on it. BUSY moved to `-20`, outside the cap range, named on both sides. |
+| **A8-3** | **The data-stage failure could never escalate.** It ran a bare `bot_recover` and discarded the verdict, so it never bumped the failure streak and never reached `revive_if_needed` - the revival machinery was unreachable from the likeliest place for a block transfer to die. Now matches its two siblings. |
+
+### OPEN - recorded, not yet fixed (ranked; all CONFIRMED unless noted)
+
+**Boundedness of the recovery path (the theme).** `revive_if_needed` gave `reset_port` a second caller,
+and that one is reached from a syscall, which runs with **IRQs masked on core 0**. Waits written when
+they were boot-only are now runtime core-holds:
+
+- **A8-4 (HIGH).** A revival runs the whole boot enumeration inline: `>1 s` of masked-IRQ core hold
+  (port-enable poll 2M MMIO reads; `bPwrOn2PwrGood` up to 510 ms and **device-supplied**; 60 ms per hub
+  port). Repeats every 4 failed commands. §26.6 and `arm/CLAUDE.md`'s "every hardware wait bounded".
+  Fix: drive the revival from the core-0 tick as a bounded state machine, not inline.
+- **A8-5 (HIGH).** `smsc_mii_wait` is bounded by **100,000 USB control transfers**, not by time - roughly
+  100 s, and there are six such call sites. Boot-only before; on the runtime path now.
+- **A8-6 (HIGH).** `CORE_HOLD_US` (5 ms) is checked *after* `split_txn` returns, and `split_txn` has no
+  internal deadline: worst case ~25 s, realistic NYET storm ~2.2 s. This is the path a full-speed stick
+  behind the Pi's hub actually uses. `split_txn_periodic` already does this correctly via `poll_wait_halt`.
+- **A8-7 (MED).** `CORE_HOLD_US` is taken per *chunk*, not per transfer: a 512-byte stage is 8 chunks, so
+  one BOT command holds the core ~50 ms even when nothing is wrong.
+
+**Recovery that reports success it did not achieve:**
+
+- **A8-8 (HIGH).** A *successful* revival can leave the keyboard and NIC dead permanently: `KBD_READY`/
+  `NET_READY` are cleared before the port reset and restored only on the **failure** path. A stick that
+  re-enumerates while the keyboard's descriptor read fails once returns early with the console's only
+  input device switched off until reboot. Commandment V / §26.7.
+- **A8-9 (MED).** A failed revival re-asserts `KBD_READY`/`NET_READY` without clearing `KBD_ADDR`/`KBD_EP`,
+  but enumeration restarts address assignment at 2 - so the keyboard poll can end up issuing an
+  interrupt-IN on the **mass-storage device's bulk endpoint** and pushing block payload into the console
+  input ring as keystrokes.
+- **A8-10 (MED).** `revive_if_needed` can re-enter enumeration *from inside* enumeration (`MSC_REVIVING`
+  guards a nested revival, correctly - nothing guards a nested walk), leaving the outer walk with a stale
+  `next_addr` and re-resetting ports the inner walk already enumerated. Same class as `8e48bed`.
+- **A8-11 (LOW).** The CSW-bad path still discards `bot_recover`'s verdict (the twin of A8-3).
+
+**Short transfers presented as complete data** (both pre-existing, both the class `bot_command`'s residue
+check fixed for the bulk path in this range):
+
+- **A8-12 (MED).** `ctrl_xfer` never checks how many bytes the DATA stage delivered, so any descriptor can
+  be parsed from the previous transfer's leftovers in the shared DMA buffer.
+- **A8-13 (MED).** `poll()` copies 8 bytes of an interrupt-IN without checking the residue; a short HID
+  packet yields stale disk bytes decoded as keycodes.
+
+**Console foreground (the mechanism added this range):**
+
+- **A8-14 (MED).** `fbcon::clear_and_home` takes no lock and its SAFETY comment asserts a precondition
+  ("core 0 holds SERIAL_BUSY") that its only caller does not satisfy - two live `&mut` to the same
+  `static mut` across cores. x86's equivalent takes `FB.lock()`. §18.3: a SAFETY comment must be true.
+- **A8-15 (MED).** The lease-lapse path uses an unconditional `store`, not a CAS, so it can clobber a
+  claim established between the read and the store - destroying a fresh owner's claim. Every other
+  mutator on that static uses compare-exchange.
+- **A8-16 (MED).** ARM has a 45 s lease; x86's same `arch::imp` primitive is perpetual. SEC-27 requires a
+  primitive to owe a documented *semantic*, not just a signature. The owner is never told its claim
+  lapsed, so it cannot re-establish (§26.7, Commandment IX). Note the 45 s bound now sits under a 30 s
+  storage timeout raised in the same range - two such waits exceed it.
+- **A8-17 (LOW).** fbcon terminal state (`reverse`, CSI parser) is not reset on release/death, so a task
+  killed mid-`ESC[7m` leaves the TV inverted until reboot.
+- **A8-18 (LOW).** The lapse notice goes to serial only - the same defect that disqualified the magic-key
+  alternative it replaced ("not where an operator at the TV is sitting"). Also emits a bare `\n`.
+- **A8-19 (LOW).** `InspectKernel` query 13 is ungated yet can now release a foreground claim and wake
+  another task: a read that writes (§26.4).
+
+**Other:**
+
+- **A8-20 (MED, PLAUSIBLE).** The user-fault handler calls `task_stat`, which takes the routing-table
+  spinlock and does three RTC reads, to fetch one `&'static str` - inside an abort handler with IRQs
+  masked. Under lock contention a single task's fault can escalate to a kernel-wide wedge, inverting
+  §10.4. Fix: a lock-free `task_name(slot)`.
+- **A8-21 (LOW).** `systimer_us()` is 32-bit (wraps ~71.6 min) and `CONSOLE_FG_RENEWED_US` is `Relaxed`
+  on a weak-ordered A7 - should be Release/Acquire per SEC-25.
+- **A8-22 (LOW).** Two stale comments this range's own changes falsified: `dispatch.rs:1301` SAFETY says
+  "task heap range (0x1_0000_0000+)", false on 32-bit since the split; and `map_in_active_tables(virt: u64)`
+  silently narrows to `u32` with no assert - the primitive behind the bug `f886d6b` worked around.

@@ -291,12 +291,45 @@ fn dequeue_locked(
     Ok((msg, sender_slot))
 }
 
+/// Dequeue the oldest queued message on `endpoint` that was SENT BY the task owning `target` - the
+/// only message a blocked `Call` may take as its reply. Everything else (an unrelated client's
+/// request, a kernel notification, a stale reply from a dead incarnation whose endpoint id differs)
+/// stays queued, in order, for the ordinary `recv` loop. Same liveness check and blocked-sender
+/// promotion as `dequeue_locked`; never registers a blocked receiver (the caller does that itself,
+/// under the same lock, in `call_dequeue` step 3).
+fn dequeue_reply_locked(
+    table: &mut [RoutingEntry; MAX_ENDPOINTS],
+    endpoint: EndpointId,
+    cap_gen: Generation,
+    target: EndpointId,
+) -> Result<(Message, Option<usize>), IpcError> {
+    let idx = find_index(table, endpoint).ok_or(IpcError::EndpointDead)?;
+    check_live(&table[idx], cap_gen)?;
+    let msg = match table[idx].queue.dequeue_matching(target.0) {
+        Some(m) => m,
+        None => return Err(IpcError::QueueEmpty),
+    };
+    // A slot was freed: promote a blocked sender's pending message, exactly as dequeue_locked does.
+    let sender_slot = if let Some(slot) = table[idx].blocked_sender.take() {
+        if let Some(pending) = table[idx].pending_send.take() {
+            table[idx].queue.enqueue(pending).ok();
+        }
+        Some(slot)
+    } else {
+        None
+    };
+    Ok((msg, sender_slot))
+}
+
 /// Dequeue a CALL reply, or register the caller as blocked-in-CALL awaiting `target` (§8.6
 /// reply-side death-wake). Like `dequeue` on the caller's own endpoint `recv_ep`, but with the
 /// reply-side liveness guarantee that closes the hang:
 ///
-/// 1. If a reply is already queued on `recv_ep`, return it (`Ok`) - a delivered reply always wins,
-///    even if `target` has since died.
+/// 1. If the REPLY is already queued on `recv_ep`, return it (`Ok`) - a delivered reply always wins,
+///    even if `target` has since died. Only a message stamped as sent by `target`'s owner counts
+///    (`dequeue_reply_locked`): the caller's endpoint also receives unrelated requests, and taking
+///    the bare queue head handed a blocked Call whichever message arrived first - the protocol
+///    desync behind the "MALFORMED reply" line and the false root-block CRC failures.
 /// 2. Else, if `target` (the would-be replier) is already dead, return `Err(ReplyDead)` at once -
 ///    the reply can never come, so the caller must not block.
 /// 3. Else, record the caller as `blocked_receiver` of `recv_ep` AND register the outstanding call
@@ -314,8 +347,8 @@ pub fn call_dequeue(
 ) -> Result<(Message, Option<usize>), IpcError> {
     let mut table = TABLE.lock_irq();
 
-    // 1. Take an already-delivered reply WITHOUT registering as blocked (pass None).
-    match dequeue_locked(&mut *table, recv_ep, recv_gen, None) {
+    // 1. Take an already-delivered REPLY - and only a reply - without registering as blocked.
+    match dequeue_reply_locked(&mut *table, recv_ep, recv_gen, target) {
         Ok(got) => {
             clear_call_await_inner(caller_slot);
             return Ok(got);

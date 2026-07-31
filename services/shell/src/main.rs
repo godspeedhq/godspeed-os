@@ -2,7 +2,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError, ReqOutcome};
+use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError, ReqOutcome, ClockSource, Datetime};
 use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, AggErr, REC_MAX_ROWS, REC_ARENA};
 
 /// Per-iteration sleep for the muted loop (a foreground app owns the console), in TSC cycles
@@ -11,8 +11,23 @@ use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, Agg
 /// keyboard reprints the prompt with no perceptible delay.
 const MUTED_POLL_SLEEP_CYCLES: u64 = 60_000_000;
 
-const MAX_LINE: usize = 128;
-const MAX_ARGS: usize = 4;
+/// Longest command line the editor accepts.
+///
+/// A FIXED ceiling is deliberate - the shell has no heap, so the line, the history and the history
+/// merge are all fixed arrays (§26.6). But it must be generous enough that a real command never meets
+/// it: at 128 an ordinary long path plus arguments, or a four-stage pipe, ran out of room mid-typing,
+/// which reads as a broken keyboard. 256 is past anything the utilities actually need while staying
+/// cheap - the constant multiplies by HIST_MAX (16) in `History` AND in the session-merge buffer, so
+/// this doubling costs about 4 KiB of the shell's stack, not 4 KiB per line. Reaching it is now
+/// audible (BEL in `insert`) rather than silent, so the ceiling is honest either way.
+const MAX_LINE: usize = 256;
+/// Tokens the command tokenizer keeps. Anything past this is SILENTLY DROPPED, so the ceiling has to
+/// sit above every real command shape - at 4 it did not: `drives flash 0 data force` is five tokens, so
+/// the `force` an operator explicitly typed never reached the parser and the disk was refused as though
+/// it had been omitted. (The same limit had already forced a hand-rolled re-parse elsewhere in this
+/// file for a six-token command - a standing sign the ceiling was too low.) Eight covers every command
+/// the utilities define, for a few dozen bytes of stack per argument array.
+const MAX_ARGS: usize = 8;
 
 // fs API (shell <-> fs). MUST match `services/fs`.
 //   File ops:   [op, path_len:u8, path[path_len], (WriteFile: data)]
@@ -42,9 +57,12 @@ const OP_READ_AT: u8 = 26;   // [op, plen, path, offset:u64, len:u32] -> [FS_OK,
 // stay block-aligned (no read-modify-write).
 const IO_CHUNK: usize = 7 * 508; // 3556
 const FS_OK: u8 = 0;
+const FS_ERR: u8 = 1;       // fs could not complete the operation (typically a device I/O error)
 const FS_NOTFOUND: u8 = 2;
 const FS_NOFS: u8 = 3;
 const FS_UNAVAIL: u8 = 4;   // present-but-unreadable storage: do NOT flash (data may be intact)
+const FS_FOREIGN: u8 = 6; // fs refused a destructive op: the disk holds a foreign partition table or
+                          // boot sector (on a single-disk board, the very disk it boots from)
 const FS_DENIED: u8 = 5; // file-cap op needs a right the cap lacks (non-escalation, §7.3); DISTINCT
                          // from FS_UNAVAIL(4) so a client can tell "denied" from "storage down" (audit L2)
 // File-as-capability (§7.10, P2): Open mints a file cap; the holder invokes it (FOP_*).
@@ -221,6 +239,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // One atomic console write (text + newline together) so a concurrent driver boot-log
     // can't slip between the message and its newline on the serial console.
     ctx.console_write("shell: ready (type 'help')\n");
+
+    // The clock FLOOR is deliberately NOT read here any more. Doing fs I/O during startup was a mistake:
+    // fs is at its slowest right then (mounting, replaying its journal), so the read timed out, and an
+    // abandoned fs request poisons the reply channel for the whole session - a reply carries no request
+    // id, so the NEXT command consumes it and every command after that is one answer behind. That is what
+    // made `drives` report a healthy 15 GB disk as absent, and later made `drives flash` announce a
+    // failure for a format that was still running. The floor is read where it is USED instead: `date sync`
+    // seeds it before validating a fetched time (see cmd_date), which is a user-initiated moment when fs
+    // has long settled and a slow answer is visible rather than silent.
 
     wait_for_input_ready(&ctx);
 
@@ -502,7 +529,7 @@ fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
 /// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
-    "wait", "watch", "whatis", "busiest",
+    "wait", "watch", "whatis", "busiest", "random", "gpio",
 ];
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
@@ -514,7 +541,7 @@ const NO_PATH_CMDS: &[&str] = &[
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("busiest", &["mem", "restarts", "queue"]),
-    ("date",    &["epoch"]),
+    ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage", "link-flap"]),
@@ -988,7 +1015,15 @@ impl Line {
 
     /// Insert a printable byte at the cursor.
     fn insert(&mut self, ctx: &ServiceContext, b: u8) {
-        if self.len >= MAX_LINE { return; }
+        if self.len >= MAX_LINE {
+            // The line is full. Say so instead of swallowing the keystroke: a limit that drops input
+            // with no sign of it reads as a broken keyboard ("there seems to be a typing boundary"),
+            // and a ceiling reached LOUDLY is the point of having a fixed one at all (§26.6/§26.7).
+            // BEL is what a terminal expects here - serial rings it, the framebuffer console ignores
+            // it - so the line being edited is never disturbed.
+            ctx.console_write("\x07");
+            return;
+        }
         let mut i = self.len;
         while i > self.cur { self.buf[i] = self.buf[i - 1]; i -= 1; }
         self.buf[self.cur] = b;
@@ -1239,6 +1274,8 @@ fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), Sh
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "uptime"  => cmd_uptime(ctx),
+        "random"  => cmd_random(ctx, if argc >= 2 { args[1] } else { "" }),
+        "gpio"    => cmd_gpio(ctx, if argc >= 2 { args[1] } else { "" }, if argc >= 3 { args[2] } else { "" }),
         "wait"    => cmd_wait(ctx, if argc >= 2 { args[1] } else { "" }),
         "whatis"  => cmd_whatis(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "status"  => cmd_status(ctx),
@@ -3805,10 +3842,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("clear", "clear the screen and home the cursor", "clear"),
         ], true),
         "about" => help_block(ctx, "about", "system identity + credits", &[
-            ("about", "name, core count, creator", "about"),
+            ("about", "name, version + arch, core count, creator", "about"),
         ], true),
-        "version" => help_block(ctx, "version", "the GodspeedOS version + build stamp", &[
-            ("version", "GodspeedOS <version> (<git-sha>)", "version"),
+        "version" => help_block(ctx, "version", "the GodspeedOS version + architecture + build stamp", &[
+            ("version", "GodspeedOS <version> <arch> (<git-sha>)", "version"),
         ], true),
         "wait" => help_block(ctx, "wait", "do nothing for N seconds (q aborts)", &[
             ("wait <seconds>", "pause for N wall-clock seconds; q/Esc aborts with Err", "wait 2"),
@@ -3827,9 +3864,10 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("cores", "how many CPU cores are up", "cores"),
             ("cores ticks", "each core's timer ticks/s (5s RTC-paced sample)", "cores ticks"),
         ], true),
-        "date" => help_block(ctx, "date", "date + time from the hardware clock", &[
+        "date" => help_block(ctx, "date", "date + time (from the hardware clock, or the network on the RTC-less Pi)", &[
             ("date", "full timestamp (weekday date time)", "date"),
             ("date epoch", "seconds since 1970-01-01", "date epoch"),
+            ("date sync", "fetch the time from the internet (SNTP) and set the clock", "date sync"),
         ], true),
         "net" => help_block(ctx, "net", "network status, DNS, and ARP host discovery", &[
             ("net", "IP, gateway (+MAC), and whether the gateway pings", "net"),
@@ -4010,6 +4048,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ("date", "epoch") => help_block(ctx, "date epoch", "seconds since 1970-01-01", &[
             ("date epoch", "print epoch seconds (not POSIX 'unix')", "date epoch"),
         ], false),
+        ("date", "sync") => help_block(ctx, "date sync", "set the clock from the internet (SNTP)", &[
+            ("date sync", "fetch the time over the network and set the wall clock, then print it (q aborts)", "date sync"),
+        ], false),
         ("net", "dns") => help_block(ctx, "net dns", "resolve a hostname to an IPv4 address", &[
             ("net dns <host>", "DNS A-record lookup via net-stack (slirp resolver)", "net dns example.com"),
         ], false),
@@ -4088,8 +4129,8 @@ static HELP: &[HelpRow] = &[
     Row("assert ok|fails <cmd>", "verify success/failure (also: … | assert contains X)"),
     Gap,
     Sec("System"),
-    Row("about", "identity + credits"),
-    Row("version", "GodspeedOS version + build stamp"),
+    Row("about", "identity: version + arch, cores, credits"),
+    Row("version", "GodspeedOS version + architecture + build stamp"),
     Row("cores", "CPU core count"),
     Row("mem", "physical memory usage"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
@@ -4405,17 +4446,38 @@ fn cmd_echo(ctx: &ServiceContext, text: &str, out: &mut Out) -> Result<(), Shell
 fn cmd_about(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     out.line(ctx, "GodspeedOS: a capability-based microkernel");
     out.line(ctx, "  Small enough to understand. Rigorous enough to trust.");
+    // Same facts as `version` (and the same ARCH const), so a single `about` gives the whole identity -
+    // what it is, which build, which machine. `version` stays the RAW fact for piping; this is prose.
+    out.line_fmt(ctx, format_args!("  Version {} {} ({})",
+                                   env!("CARGO_PKG_VERSION"), ARCH, env!("GODSPEED_GIT_SHA")));
     out.line_fmt(ctx, format_args!("  Running on {} core(s).", ctx.inspect_core_count()));
     out.line(ctx, "  Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.");
     Ok(())
 }
 
-/// `version` - the GodspeedOS version and build stamp: `GodspeedOS <ver> (<git-sha>)`. Distinct from
-/// `<util> version` (which reports a single utility's version); this is the whole system's version
-/// fact (conventions rule 7 - a raw fact). Pipeable like `about` (`version | write /ver.txt`). The SHA
-/// is stamped at build time by `build.rs`; a build with no git reports `unknown`.
+/// The architecture this build targets, named the way the project names it (`docs/multi-arch.md`)
+/// rather than in Rust's `target_arch` spelling - notably **arm32** for 32-bit ARMv7, which is what the
+/// Raspberry Pi 2 port is called everywhere else in the tree (`docs/arm32-status.md`,
+/// `kernel/src/arch/arm/`). One source tree now builds for several ISAs, so a version string without
+/// the architecture cannot say which machine produced it - the same reason `uname -m` exists.
+const ARCH: &str = if cfg!(target_arch = "x86_64") { "x86_64" }
+    else if cfg!(target_arch = "arm") { "arm32" }
+    else if cfg!(target_arch = "aarch64") { "aarch64" }
+    else if cfg!(target_arch = "riscv64") { "riscv64" }
+    else if cfg!(target_arch = "riscv32") { "riscv32" }
+    else if cfg!(target_arch = "loongarch64") { "loongarch64" }
+    else if cfg!(target_arch = "s390x") { "s390x" }
+    else { "unknown-arch" };
+
+/// `version` - the GodspeedOS version, architecture, and build stamp:
+/// `GodspeedOS <ver> <arch> (<git-sha>)`. Distinct from `<util> version` (which reports a single
+/// utility's version); this is the whole system's version fact (conventions rule 7 - a raw fact).
+/// Pipeable like `about` (`version | write /ver.txt`). The SHA is stamped at build time by `build.rs`;
+/// a build with no git reports `unknown`. The architecture is reported because the same source builds
+/// for several ISAs, so a serial log or bug report must say which one it came from.
 fn cmd_version_os(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
-    out.line_fmt(ctx, format_args!("GodspeedOS {} ({})", env!("CARGO_PKG_VERSION"), env!("GODSPEED_GIT_SHA")));
+    out.line_fmt(ctx, format_args!("GodspeedOS {} {} ({})",
+                                   env!("CARGO_PKG_VERSION"), ARCH, env!("GODSPEED_GIT_SHA")));
     Ok(())
 }
 
@@ -4490,6 +4552,13 @@ fn cmd_mem(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
 }
 
 fn cmd_reboot(ctx: &ServiceContext) -> ! {
+    // Record the clock floor on the way down. This is what carries a BOOT-time network sync across the
+    // power cycle: net-stack sets the clock but holds no filesystem authority, and the shell does - so a
+    // deliberate reboot is the natural explicit moment to write it. Quiet + bounded: the machine is about
+    // to reset, so a missing filesystem must not delay or clutter the shutdown.
+    if let Some(f) = ctx.clock_floor() {
+        if (0..=u32::MAX as i64).contains(&f) { clock_floor_persist(ctx, f as u32, true); }
+    }
     ctx.console_writeln("rebooting...");
     ctx.reboot()
 }
@@ -4552,21 +4621,198 @@ fn cmd_cores(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), Shell
     Ok(())
 }
 
-/// Wall-clock date+time from the hardware RTC. Default renders a full timestamp
-/// with weekday, e.g. `Sat 2026-06-06 22:05:09`. `date epoch` prints seconds since
-/// 1970-01-01 instead. Deliberately just these two forms - no clock-setting, format
-/// strings, or timezones (§26.2: minimal surface). The subcommand is `epoch`, not
-/// `unix`: this is not POSIX, so the vocabulary doesn't borrow its name.
+/// Where the last-known-good time is recorded. Deliberately a plain visible file, not a hidden one: it is
+/// a fact about this machine an operator may want to read or delete (§26.4 - keep the mechanism visible).
+const CLOCK_FLOOR_PATH: &[u8] = b"/clock.last";
+/// Budget for the floor's disk I/O. The floor is best-effort by design, so a slow or still-mounting `fs`
+/// must cost a shrug, never a wedge: an UNBOUNDED request here would hang the boot prompt before the
+/// first `gsh>` (the exact hazard the history loader documents) and hang `date` with no q escape.
+const CLOCK_FS_SECS: i64 = 2;
+
+/// Render a duration the way a person reads one ("4m", "2h", "3d") for the clock's freshness note.
+struct HumanSecs(i64);
+impl core::fmt::Display for HumanSecs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = self.0.max(0);
+        if s < 60 { write!(f, "{}s", s) }
+        else if s < 3_600 { write!(f, "{}m", s / 60) }
+        else if s < 86_400 { write!(f, "{}h", s / 3_600) }
+        else { write!(f, "{}d", s / 86_400) }
+    }
+}
+
+/// A tiny fixed-size formatting buffer for the floor file (decimal epoch seconds). §26.6.1: use
+/// `format_args!` rather than hand-rolling digits; the bound is the array, not a heap.
+struct EpochBuf { buf: [u8; 24], len: usize }
+impl core::fmt::Write for EpochBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let b = s.as_bytes();
+        let n = b.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&b[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+/// Record "the machine was running at this time" to disk, and raise the kernel's floor to match. Called at
+/// EXPLICIT moments (a successful `date sync`, and just before `reboot`) - never as a side effect of
+/// displaying the time. `quiet` suppresses the console note for the reboot path, where the machine is
+/// about to reset and a failure to record a floor is not worth a line in the operator's face.
+///
+/// Every verdict here is checked. The kernel can refuse the floor (implausible, or no cap at all - on x86
+/// the shell is never granted it), and `fs` answers a write with a status byte that can say FS_ERR or
+/// "no filesystem". Treating "a reply arrived" as "it worked" is how a refused privileged operation gets
+/// reported to the operator as done (§26.7, invariant 12).
+fn clock_floor_persist(ctx: &ServiceContext, epoch: u32, quiet: bool) -> bool {
+    if !ctx.set_clock_floor(epoch) {
+        if !quiet { ctx.console_writeln("date: the kernel refused the clock floor - not recorded"); }
+        return false;
+    }
+    let mut b = EpochBuf { buf: [0u8; 24], len: 0 };
+    let _ = core::fmt::write(&mut b, format_args!("{}", epoch));
+    match fs_request_bounded(ctx, OP_WRITE_FILE, CLOCK_FLOOR_PATH, &b.buf[..b.len], CLOCK_FS_SECS) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => true,
+        _ => {
+            // No disk, no filesystem, or a write that failed: the floor simply will not survive this power
+            // cycle. That is the honest degraded state (next boot knows nothing), not a silent success.
+            if !quiet { ctx.console_writeln("date: could not record the clock floor (no filesystem?)"); }
+            false
+        }
+    }
+}
+
+/// Read a whole small file into `dst`, returning the byte count, or `None` if it is absent / unreadable /
+/// `fs` is not serving. **The ONE place that parses an OP_READ_FILE reply.**
+///
+/// `fs` answers `[FS_OK, len:u32 LE, data..]`. Every caller that hand-parses that shape gets three
+/// chances to be wrong, and one of them already was: checking the status byte against `1` fails on every
+/// SUCCESS (FS_OK is 0; 1 is FS_ERR), and skipping only one byte splices the length prefix into the data.
+/// That bug made a feature silently inert on every boot. Parsing it once, here, removes the failure mode
+/// for the next caller instead of leaving it lying around (§26.4 - one visible mechanism, not N copies).
+fn fs_read_file(ctx: &ServiceContext, path: &[u8], dst: &mut [u8], max_secs: i64) -> Option<usize> {
+    let r = fs_request_bounded(ctx, OP_READ_FILE, path, &[], max_secs)?;
+    let p = r.payload_bytes();
+    if p.first() != Some(&FS_OK) || p.len() < 5 { return None; }   // FS_NOTFOUND / FS_ERR / no filesystem
+    let n = u32::from_le_bytes([p[1], p[2], p[3], p[4]]) as usize;
+    let end = (5 + n).min(p.len());
+    let m = (end - 5).min(dst.len());
+    dst[..m].copy_from_slice(&p[5..5 + m]);
+    Some(m)
+}
+
+/// Seed the kernel's clock floor from the last-known time on disk, at startup. The floor is a BOUND, never
+/// a reading: it is not shown as the time and no "estimate" is derived from it (a machine powered off for
+/// six months would otherwise display a six-month-old timestamp indistinguishable from a measured one).
+/// Its whole job is to let the kernel REFUSE a clock value from before we last ran.
+fn clock_floor_seed(ctx: &ServiceContext) {
+    let mut buf = [0u8; 24];
+    let n = match fs_read_file(ctx, CLOCK_FLOOR_PATH, &mut buf, CLOCK_FS_SECS) {
+        Some(n) if n > 0 => n,
+        _ => return,                   // no record yet / no fs - no floor this boot, which is the honest state
+    };
+    if let Ok(s) = core::str::from_utf8(&buf[..n]) {
+        if let Some(v) = parse_u32(s.trim()) {
+            if !ctx.set_clock_floor(v) {
+                ctx.console_writeln("shell: the kernel refused the recorded clock floor - ignoring it");
+            }
+        }
+    }
+}
+
+/// Wall-clock date+time. Default renders a full timestamp with weekday AND where the time came from,
+/// e.g. `Sat 2026-06-06 22:05:09  (ntp, synced 4m ago)`; `date epoch` prints seconds since 1970-01-01 as a
+/// bare pipeable number; `date sync` fetches the time over the network. Deliberately these three forms -
+/// no format strings or timezones (§26.2: minimal surface). The subcommand is `epoch`, not `unix`: this is
+/// not POSIX, so the vocabulary doesn't borrow its name. Displaying the time NEVER writes to disk - the
+/// floor is recorded at explicit moments only (`date sync`, and before `reboot`).
 fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    // `date sync` - fetch the time from the network (SNTP) via net-stack and set the wall clock. The Pi 2
+    // has no battery-backed RTC, so `date` reads zeros until this runs (also done automatically at boot).
+    if arg == "sync" {
+        // Seed the floor HERE, where it is used: it exists to let the kernel refuse a fetched time from
+        // before we last ran, so the moment we are about to fetch one is exactly when it must be known.
+        // Reading it at boot instead put fs I/O on the startup path at fs's slowest moment - see the note
+        // in service_main for what that cost.
+        clock_floor_seed(ctx);
+        out.line_fmt(ctx, format_args!("Syncing the clock from the network (SNTP)... (q aborts)"));
+        let msg = Message::from_bytes(&[10u8]);
+        // The budget must cover net-stack's WORST case, not a guess: op 10 can run SNTP_TRIES rounds of a
+        // DANCE_SECS drain (plus a DNS attempt) before it can honestly answer "no time". Timing out early
+        // and RE-SENDING would queue a second full sync behind the first, and net-stack's serve loop is
+        // single-threaded - so every other client op (net/ping/dns) would block behind our own retry.
+        // `net renew`, the sibling that also triggers the boot dance, uses 30 s for exactly this reason.
+        const SYNC_SECS: i64 = 30;
+        let outcome = match ctx.request_with_reply_abortable("net-stack", &msg, SYNC_SECS) {
+            ReqOutcome::Timeout if ctx.reacquire_by_name("net-stack") =>
+                ctx.request_with_reply_abortable("net-stack", &msg, SYNC_SECS),
+            other => other,
+        };
+        // An abort is the USER's decision, not a network failure - blaming the cable for it is a lie.
+        if let ReqOutcome::Aborted = outcome {
+            out.line_fmt(ctx, format_args!("date sync: aborted"));
+            return Ok(());
+        }
+        let synced = match &outcome {
+            ReqOutcome::Reply(r) if r.payload_bytes().first() == Some(&1) && r.payload_bytes().len() >= 5 => {
+                let p = r.payload_bytes();
+                Some(u32::from_le_bytes([p[1], p[2], p[3], p[4]]))
+            }
+            _ => None,
+        };
+        let epoch = match synced {
+            Some(e) => e,
+            None => {
+                out.line_fmt(ctx, format_args!("date sync: no time from the network (is the cable in?)"));
+                return Ok(());
+            }
+        };
+        // Record the new time as the floor: we are demonstrably running now, so nothing earlier can be
+        // right later. Survives the power cycle that the (absent) RTC would otherwise have covered.
+        clock_floor_persist(ctx, epoch, false);
+        // fall through to display the freshly-set time
+    }
     let dt = ctx.datetime();
+    let source = ctx.clock_source();
     if arg == "epoch" {
+        // Raw fact, pipeable (conventions rule 7): the number only, no provenance decoration.
         out.line_fmt(ctx, format_args!("{}", dt.epoch_secs()));
-    } else {
-        let wd = WEEKDAYS[(dt.weekday() as usize) % 7];
-        out.line_fmt(ctx, format_args!(
-            "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second));
+        return Ok(());
+    }
+    if source == ClockSource::Unset {
+        // Say we do not know, rather than printing a number we cannot stand behind. If a floor was
+        // recorded, report it AS A FLOOR - "we ran at least this late" is true; "it is now that" is not.
+        match ctx.clock_floor() {
+            Some(f) => {
+                let fd = Datetime::from_epoch_secs(f);
+                out.line_fmt(ctx, format_args!(
+                    "unset - no clock on this machine; `date sync` fetches it over the network"));
+                out.line_fmt(ctx, format_args!(
+                    "        (last known {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC from {} - a floor, not a reading)",
+                    fd.year, fd.month, fd.day, fd.hour, fd.minute, fd.second,
+                    core::str::from_utf8(CLOCK_FLOOR_PATH).unwrap_or("disk")));
+            }
+            None => out.line_fmt(ctx, format_args!(
+                "unset - no clock on this machine; `date sync` fetches it over the network")),
+        }
+        return Ok(());
+    }
+    let wd = WEEKDAYS[(dt.weekday() as usize) % 7];
+    // The time, WHICH SCALE it is on, and where it came from.
+    //
+    // The scale is only stated when it is actually known. NTP serves UTC by definition, so a
+    // network-set clock is labelled `UTC` - without it the reading is ambiguous and a reader in any
+    // other zone silently reads it as local and concludes the clock is wrong by their offset. A
+    // hardware RTC carries NO such guarantee (firmware may keep it in local time or in UTC, and
+    // nothing here can tell which), so it gets no scale label rather than a guessed one - the same
+    // rule as the rest of this command: say what is known, never invent the rest.
+    match ctx.clock_synced_secs_ago() {
+        Some(ago) => out.line_fmt(ctx, format_args!(
+            "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC  (ntp, synced {} ago)",
+            wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, HumanSecs(ago))),
+        None => out.line_fmt(ctx, format_args!(
+            "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  (rtc, scale unknown)",
+            wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)),
     }
     Ok(())
 }
@@ -5009,7 +5255,7 @@ fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> 
         // Only tell the user about q if the reply DIDN'T come in the first second (a stall) - so a fast
         // query stays clean, but a wedged one advertises how to escape it.
         if i == 0 { ctx.console_writeln("net: waiting for a reply - press q to abort"); }
-        ctx.reacquire_by_name(peer);
+        let _ = ctx.reacquire_by_name(peer);   // best-effort: the caller retries regardless
     }
     NetQ::Timeout
 }
@@ -5259,6 +5505,54 @@ fn cmd_uptime(ctx: &ServiceContext) -> Result<(), ShellError> {
     Ok(())
 }
 
+/// `random [n]` - one (or n, bounded 1..64) hardware-random u32 from the SoC RNG (the BCM2835 RNG on the
+/// Pi 2), printed as hex + decimal. Reports loudly if the machine exposes no hardware RNG.
+fn cmd_random(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+    // Bare `random` = 1; a given count must be a number - reject junk LOUDLY, not silently as 1
+    // (userspace-audit Audit 5, A5-U3; matches cmd_gpio's loud rejection).
+    let a = arg.trim();
+    let n = if a.is_empty() { 1 } else {
+        match a.parse::<u32>() {
+            Ok(v) => v.clamp(1, 64),
+            Err(_) => { ctx.console_writeln("random: count must be a number 1..64"); return Ok(()); }
+        }
+    };
+    for _ in 0..n {
+        match ctx.hw_random() {
+            Some(v) => ctx.console_writeln_fmt(format_args!("{:#010x}  {}", v, v)),
+            None => { ctx.console_writeln("random: no hardware RNG on this machine"); break; }
+        }
+    }
+    Ok(())
+}
+
+/// `gpio <input|output|high|low|read> <pin>` - drive a SoC GPIO pin (the Pi 2's BCM2835). WORDS not flags
+/// (utility convention). GPIO pins carry the UART console + SD card, so this is the operator's rope: pin
+/// 0..53, at your own risk. ARM-only; reports loudly elsewhere.
+fn cmd_gpio(ctx: &ServiceContext, verb: &str, pin_s: &str) -> Result<(), ShellError> {
+    let op = match verb {
+        "input" | "in"        => 0u32,
+        "output" | "out"      => 1,
+        "high" | "set" | "on" => 2,
+        "low" | "clear" | "off" => 3,
+        "read" | "get"        => 4,
+        _ => { ctx.console_writeln("usage: gpio <input|output|high|low|read> <pin 0..53>"); return Ok(()); }
+    };
+    let pin = match pin_s.trim().parse::<u32>() {
+        Ok(p) if p <= 53 => p,
+        _ => { ctx.console_writeln("gpio: pin must be 0..53"); return Ok(()); }
+    };
+    let r = ctx.gpio(op, pin);
+    if r < 0 {
+        ctx.console_writeln("gpio: not available on this machine (Pi 2 only)");
+    } else if op == 4 {
+        ctx.console_writeln_fmt(format_args!("gpio {} = {}", pin, r));
+    } else {
+        ctx.console_writeln_fmt(format_args!("gpio {} {}", pin, verb));
+    }
+    Ok(())
+}
+
 /// `observe now` as a record producer: the task roster plus the metric `status` omits - `ticks`,
 /// each task's cumulative `run_ticks` (timer ticks it has spent running since boot). That column
 /// is what distinguishes `observe` (how busy) from `status` (who's alive): `observe now | sort
@@ -5406,13 +5700,21 @@ fn cap_rights_str(r: u8, buf: &mut [u8]) -> usize {
 /// unit - a bare number cell can't).
 #[inline(never)]
 fn build_drives_table(ctx: &ServiceContext) -> Option<Table> {
-    let reply = match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_DRIVES_INFO])) {
+    drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
+    let reply = match fs_raw(ctx, &[OP_DRIVES_INFO], 3600) {
         Some(r) => r,
         None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); return None; }
     };
     let p = reply.payload_bytes();
     if p.first() != Some(&FS_OK) || p.len() < 28 {
-        ctx.console_writeln("drives: no disk found");
+        // Name what actually came back. "no disk found" was a GUESS at the cause dressed as a fact: the
+        // reply may be a status code (FS_NOFS / FS_UNAVAIL / FS_ERR) that means something quite different
+        // from an absent disk, and a short reply means the protocol went wrong, not that storage is gone.
+        // Reporting the raw shape is the difference between diagnosing this in one boot and guessing at it
+        // for several (§26.7 - say what failed, not what you suppose it means).
+        ctx.console_writeln_fmt(format_args!(
+            "drives: unexpected reply from fs - status {} len {} (want status {}, len >= 28)",
+            p.first().copied().unwrap_or(255), p.len(), FS_OK));
         return None;
     }
     let mounted = p[1] != 0;
@@ -6597,10 +6899,10 @@ fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<CapHandle> {
     // Path C (Phase 4): the sink resolves via the kernel name-directory (SEND|GRANT, so the cap can
     // be delegated to the producer); it is populated synchronously at the sink's spawn, so this
     // normally succeeds on the first iteration - the bounded wait is just a guard.
-    let t0 = ctx.datetime().epoch_secs();
+    let t0 = ctx.epoch_secs_monotonic();
     loop {
         if let Some(h) = ctx.acquire_send_grant_cap(sink) { return Some(h); }
-        if ctx.datetime().epoch_secs() - t0 >= FILTER_WAIT_SECS { return None; }
+        if ctx.epoch_secs_monotonic() - t0 >= FILTER_WAIT_SECS { return None; }
         ctx.yield_cpu();
     }
 }
@@ -6769,11 +7071,11 @@ const CHAOS_SAVE_TOTAL_SECS: i64 = 30;
 /// reacquiring a fresh `fs` cap each round (it may have just respawned). Bounded: `save_report` is
 /// itself wall-clock-bounded, so this never hangs; it gives up gracefully when fs won't stabilise.
 fn chaos_save_retry(ctx: &ServiceContext, ppath: &[u8], data: &[u8]) -> bool {
-    let t0 = ctx.datetime().epoch_secs();
+    let t0 = ctx.epoch_secs_monotonic();
     loop {
         let _ = ctx.reacquire_by_name("fs");
         if save_report(ctx, ppath, data) { return true; }
-        if ctx.datetime().epoch_secs() - t0 >= CHAOS_SAVE_TOTAL_SECS { return false; }
+        if ctx.epoch_secs_monotonic() - t0 >= CHAOS_SAVE_TOTAL_SECS { return false; }
         for _ in 0..CHAOS_SETTLE_YIELDS { ctx.yield_cpu(); }
     }
 }
@@ -6781,12 +7083,12 @@ fn chaos_save_retry(ctx: &ServiceContext, ppath: &[u8], data: &[u8]) -> bool {
 /// Wait (real wall-clock bounded, RTC) for `name` to be ALIVE (present in the task table). Used
 /// before a kill so a round isn't wasted killing a task that is still mid-respawn. Yields cooperatively.
 fn chaos_wait_alive(ctx: &ServiceContext, name: &str) {
-    let t0 = ctx.datetime().epoch_secs();
+    let t0 = ctx.epoch_secs_monotonic();
     let mut k = 0u32;
     while slot_of(ctx, name).is_none() {
         ctx.yield_cpu();
         k += 1;
-        if k % CHAOS_POLL_EVERY == 0 && ctx.datetime().epoch_secs() - t0 >= CHAOS_RECOVER_SECS { break; }
+        if k % CHAOS_POLL_EVERY == 0 && ctx.epoch_secs_monotonic() - t0 >= CHAOS_RECOVER_SECS { break; }
     }
 }
 
@@ -6794,14 +7096,14 @@ fn chaos_wait_alive(ctx: &ServiceContext, name: &str) {
 /// for `name` to reach a generation different from `og` - proof a fresh instance came up (§7.5). Yields
 /// cooperatively so the recoverer (sharing core 0) runs. Returns true on recovery, false on timeout.
 fn chaos_wait_recovery(ctx: &ServiceContext, name: &str, og: u32) -> bool {
-    let t0 = ctx.datetime().epoch_secs();
+    let t0 = ctx.epoch_secs_monotonic();
     let mut k = 0u32;
     loop {
         ctx.yield_cpu();
         k += 1;
         if k % CHAOS_POLL_EVERY == 0 {
             if let Some(g) = gen_of(ctx, name) { if g != og { return true; } }
-            if ctx.datetime().epoch_secs() - t0 >= CHAOS_RECOVER_SECS { return false; }
+            if ctx.epoch_secs_monotonic() - t0 >= CHAOS_RECOVER_SECS { return false; }
         }
     }
 }
@@ -6894,8 +7196,8 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
 /// Yield for up to `secs` of RTC wall-clock, returning true the instant q/Q/ESC is pressed (abort).
 /// Bounded + portable (RTC, not the T630-broken TSC).
 fn hold_or_abort(ctx: &ServiceContext, secs: i64) -> bool {
-    let t0 = ctx.datetime().epoch_secs();
-    while ctx.datetime().epoch_secs() - t0 < secs {
+    let t0 = ctx.epoch_secs_monotonic();
+    while ctx.epoch_secs_monotonic() - t0 < secs {
         while let Some(b) = ctx.try_console_read() {
             if b == b'q' || b == b'Q' || b == 0x1b { return true; }
         }
@@ -7029,10 +7331,10 @@ fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), S
     // done" glitch). Once chaos owns the foreground the shell's loop goes muted and reliably reprints the
     // prompt on regain. Bounded (chaos waits up to 2 s for this count first), so a chaos that never claims
     // still returns and the shell carries on.
-    let t0 = ctx.datetime().epoch_secs();
+    let t0 = ctx.epoch_secs_monotonic();
     while ctx.is_console_foreground() {
         ctx.yield_cpu();
-        if ctx.datetime().epoch_secs() - t0 >= 3 { break; }
+        if ctx.epoch_secs_monotonic() - t0 >= 3 { break; }
     }
     Ok(())
 }
@@ -7308,28 +7610,28 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
         // 1. Spawn the hog; it allocs to its limit on a round-robin core.
         let _ = ctx.spawn("mem-pressure");
         // 2. Wait for the allocation to land - free frames drop. RTC-bounded; breaks early on success.
-        let t0 = ctx.datetime().epoch_secs();
+        let t0 = ctx.epoch_secs_monotonic();
         let mut low = baseline;
         loop {
             ctx.yield_cpu();
             let f = ctx.inspect_kernel_free_frames();
             if f < low { low = f; }
             if baseline.saturating_sub(low) >= MEM_DROP_MIN { break; }
-            if ctx.datetime().epoch_secs() - t0 >= MEM_WAIT_SECS { break; }
+            if ctx.epoch_secs_monotonic() - t0 >= MEM_WAIT_SECS { break; }
         }
         let dropped = baseline.saturating_sub(low);
         grabbed[r] = dropped.min(u32::MAX as u64) as u32;
         // 3. Kill the hog - the only way v1 reclaims its memory (§10.5).
         let _ = ctx.kill("mem-pressure");
         // 4. Wait for reclaim - free frames return toward baseline. RTC-bounded.
-        let t1 = ctx.datetime().epoch_secs();
+        let t1 = ctx.epoch_secs_monotonic();
         let mut hi = low;
         loop {
             ctx.yield_cpu();
             let f = ctx.inspect_kernel_free_frames();
             if f > hi { hi = f; }
             if hi + MEM_SLACK >= baseline { break; }
-            if ctx.datetime().epoch_secs() - t1 >= MEM_WAIT_SECS { break; }
+            if ctx.epoch_secs_monotonic() - t1 >= MEM_WAIT_SECS { break; }
         }
         let leak = baseline as i64 - hi as i64;
         leaked[r] = leak;
@@ -7426,11 +7728,11 @@ fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         spawned += 1;
         // Wait on TRUTH - the hog's allocation landing (free frames drop by its request) - not a fixed
         // pad. RTC-bounded so a hog that cannot alloc near the ceiling times out instead of hanging us.
-        let t = ctx.datetime().epoch_secs();
+        let t = ctx.epoch_secs_monotonic();
         loop {
             ctx.yield_cpu();
             if before.saturating_sub(ctx.inspect_kernel_free_frames()) >= SPAWN_DROP_MIN { break; }
-            if ctx.datetime().epoch_secs() - t >= SPAWN_SETTLE_SECS { break; }
+            if ctx.epoch_secs_monotonic() - t >= SPAWN_SETTLE_SECS { break; }
         }
     }
 
@@ -7445,23 +7747,23 @@ fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         let _ = ctx.kill("mem-pressure");
         killed += 1;
         // Wait on TRUTH - the hog COUNT dropping (this kill was reaped to Dead) - not a fixed pad. Bounded.
-        let t = ctx.datetime().epoch_secs();
+        let t = ctx.epoch_secs_monotonic();
         loop {
             ctx.yield_cpu();
             if count_named(ctx, "mem-pressure") < remaining { break; }
-            if ctx.datetime().epoch_secs() - t >= KILL_SETTLE_SECS { break; }
+            if ctx.epoch_secs_monotonic() - t >= KILL_SETTLE_SECS { break; }
         }
     }
 
     // 3. Wait for reclaim - free frames return to ~baseline (deferred kstacks drain on timer ticks).
-    let t0 = ctx.datetime().epoch_secs();
+    let t0 = ctx.epoch_secs_monotonic();
     let mut hi = low;
     loop {
         ctx.yield_cpu();
         let f = ctx.inspect_kernel_free_frames();
         if f > hi { hi = f; }
         if hi + RECLAIM_SLACK >= baseline { break; }
-        if ctx.datetime().epoch_secs() - t0 >= RECLAIM_SECS { break; }
+        if ctx.epoch_secs_monotonic() - t0 >= RECLAIM_SECS { break; }
     }
     let recovered  = hi;
     let live_after = count_live(ctx);
@@ -7590,23 +7892,114 @@ fn resolve_or_err<'a>(ctx: &ServiceContext, cwd: &Cwd, input: &str, out: &'a mut
 }
 
 /// Send an fs file-API request `[op, path_len, path, data]` and return the reply.
+/// The next correlation tag for an fs request.
+///
+/// Replies were matched to requests by ARRIVAL ORDER alone, which holds only while nothing is ever
+/// overtaken. After a USB stick replug the device is slow, a `.gsh_history` write is still in flight when
+/// the next command's request goes out, and the replies come back one behind - so `ls` read the write's
+/// one-byte `[FS_OK]`, saw a reply too short to be a listing, and reported a storage error about a
+/// filesystem that was perfectly fine. The channel then stayed one behind indefinitely, which is why the
+/// SECOND `ls` always worked and why every storage-layer fix left the symptom untouched.
+///
+/// A tag makes the match structural instead of circumstantial: the client stamps each request, fs echoes
+/// it, and an answer to a different question is recognisable as one. Cycles 1..=255 and never uses 0, so
+/// a zero byte can only be an untagged sender - a mismatch that fails loudly rather than aliasing a real
+/// tag. Wrapping is harmless: correlation only needs to distinguish requests that can be in flight at the
+/// same time, and there are at most a handful.
+fn next_fs_tag() -> u8 {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static FS_TAG: AtomicU8 = AtomicU8::new(0);
+    let t = FS_TAG.fetch_add(1, Ordering::Relaxed);
+    if t == 0 { FS_TAG.fetch_add(1, Ordering::Relaxed); 1 } else { t }
+}
+
+/// How many overtaken replies to discard before giving up. A desync is at most a few requests deep (the
+/// shell has one command in flight plus a history write), so this is a bound on a bug, not a workload -
+/// hitting it means something is wrong in a way that waiting longer will not fix (§26.6).
+const FS_STALE_MAX: u32 = 16;
+
+/// Take the reply that answers OUR request, discarding any that answer an earlier one.
+///
+/// Discarding is safe precisely because the sender has moved on: a reply whose tag we are no longer
+/// waiting for belongs to a request whose caller has already returned. Keeping it would only let it be
+/// mistaken for a later answer, which is the failure this exists to end.
+fn fs_take_tagged(ctx: &ServiceContext, tag: u8, first: ReqOutcome, max_secs: i64) -> ReqOutcome {
+    let mut outcome = first;
+    for _ in 0..FS_STALE_MAX {
+        match outcome {
+            ReqOutcome::Reply(r) => {
+                let p = r.payload_bytes();
+                if p.first() == Some(&tag) { return ReqOutcome::Reply(Message::from_bytes(&p[1..])); }
+                // Say it - a discarded reply is proof the correlation is load-bearing, and a silent
+                // guard cannot tell us whether it ever fires (§26.4).
+                ctx.log_fmt(format_args!(
+                    "shell: discarded an fs reply for tag {} while awaiting {} (an earlier request was overtaken)",
+                    p.first().copied().unwrap_or(0), tag));
+                // Wait again WITHOUT re-sending: the request is already with fs, and sending it twice
+                // would ask for the work twice.
+                outcome = ctx.recv_abortable_deadline(max_secs);
+            }
+            other => return other,
+        }
+    }
+    ReqOutcome::Timeout
+}
+
+/// Send an already-formed fs request body (one that does not fit the `[op, plen, path, data]` shape -
+/// a bare opcode, or `drives label`), TAGGED, and return the reply body with the tag stripped.
+///
+/// These sites used to build and send their own `Message` and so would have shipped an untagged request,
+/// which fs would read as `tag = <opcode>` and dispatch on the byte after it - a silent misparse. Routing
+/// them through one helper is what makes "every name-addressed request carries a tag" true rather than
+/// mostly true (Commandment III: one path, not two).
+fn fs_raw(ctx: &ServiceContext, body: &[u8], max_secs: i64) -> Option<Message> {
+    let tag = next_fs_tag();
+    let mut req = [0u8; 4096];
+    req[0] = tag;
+    let n = body.len().min(req.len() - 1);
+    req[1..1 + n].copy_from_slice(&body[..n]);
+    let msg = Message::from_bytes(&req[..1 + n]);
+    drain_stale_fs_replies(ctx);
+    let first = ctx.request_with_reply("fs", &msg).map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
+    match fs_take_tagged(ctx, tag, first, max_secs) {
+        ReqOutcome::Reply(r) => Some(r),
+        _ => None,
+    }
+}
+
 fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
-    req[0] = op;
-    req[1] = pl as u8;
-    req[2..2 + pl].copy_from_slice(&path[..pl]);
-    let dn = data.len().min(req.len() - 2 - pl);
-    req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
-    let msg = Message::from_bytes(&req[..2 + pl + dn]);
-    if let Some(r) = ctx.request_with_reply("fs", &msg) {
+    let tag = next_fs_tag();
+    req[0] = tag;
+    req[1] = op;
+    req[2] = pl as u8;
+    req[3..3 + pl].copy_from_slice(&path[..pl]);
+    let dn = data.len().min(req.len() - 3 - pl);
+    req[3 + pl..3 + pl + dn].copy_from_slice(&data[..dn]);
+    let msg = Message::from_bytes(&req[..3 + pl + dn]);
+    drain_stale_fs_replies(ctx);          // an earlier abandoned reply must not be read as ours
+    // 3600 s here is the same "effectively unbounded, q is the real exit" budget the interactive path
+    // uses: it bounds only the wait for a REPLACEMENT reply after discarding an overtaken one.
+    if let ReqOutcome::Reply(r) = fs_take_tagged(
+        ctx, tag, ctx.request_with_reply("fs", &msg).map_or(ReqOutcome::Timeout, ReqOutcome::Reply), 3600) {
         return Some(r);
     }
     // No reply usually means `fs` restarted and our cached cap is now EndpointDead (Phase D,
     // §14.3). Reacquire a fresh `fs` cap by name and retry once; if `fs` hasn't
     // finished re-registering yet, this returns None and the next command retries.
     if ctx.reacquire_by_name("fs") {
-        return ctx.request_with_reply("fs", &msg);
+        drain_stale_fs_replies(ctx);
+        // The retry is a NEW request and needs its own tag - reusing the first one would accept the
+        // dead instance's late reply as this one's answer, which is the whole class of bug being closed.
+        let tag2 = next_fs_tag();
+        let mut req2 = req;
+        req2[0] = tag2;
+        let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
+        if let ReqOutcome::Reply(r) = fs_take_tagged(
+            ctx, tag2, ctx.request_with_reply("fs", &msg2).map_or(ReqOutcome::Timeout, ReqOutcome::Reply), 3600) {
+            return Some(r);
+        }
     }
     None
 }
@@ -7630,19 +8023,63 @@ const HIST_LOAD_SECS: i64 = 2;
 fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8], max_secs: i64) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
-    req[0] = op;
-    req[1] = pl as u8;
-    req[2..2 + pl].copy_from_slice(&path[..pl]);
-    let dn = data.len().min(req.len() - 2 - pl);
-    req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
-    let msg = Message::from_bytes(&req[..2 + pl + dn]);
-    if let Some(r) = ctx.request_with_reply_deadline("fs", &msg, max_secs) {
+    let tag = next_fs_tag();
+    req[0] = tag;
+    req[1] = op;
+    req[2] = pl as u8;
+    req[3..3 + pl].copy_from_slice(&path[..pl]);
+    let dn = data.len().min(req.len() - 3 - pl);
+    req[3 + pl..3 + pl + dn].copy_from_slice(&data[..dn]);
+    let msg = Message::from_bytes(&req[..3 + pl + dn]);
+    drain_stale_fs_replies(ctx);          // an earlier abandoned reply must not be read as ours
+    let first = ctx.request_with_reply_deadline("fs", &msg, max_secs).map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
+    if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag, first, max_secs) {
         return Some(r);
     }
+    // TIMED OUT. The request was already SENT, so `fs` will reply into our endpoint whether we are still
+    // listening or not - and an unclaimed reply is not harmless: it sits in the queue and the NEXT fs
+    // request reads IT instead of its own answer. That is not hypothetical. A 2 s read of a non-existent
+    // `/clock.last` at boot (fs still mounting) timed out, and its late 1-byte `[FS_NOTFOUND]` was then
+    // consumed by `drives`, which reported "no disk found" on a healthy, mounted 15 GB disk. The bound was
+    // right; abandoning the reply without reclaiming it was the bug.
+    //
+    // So spend a SHORT grace collecting the late reply purely to discard it. The abortable request path
+    // solves the same problem with a drain at its own top; this path had no equivalent.
+    // Timed out. Do NOT try to reclaim the late reply here - that is the race described in
+    // `drain_stale_fs_replies`. The next request drains it instead, which is decisive.
     if ctx.reacquire_by_name("fs") {
-        return ctx.request_with_reply_deadline("fs", &msg, max_secs);
+        drain_stale_fs_replies(ctx);
+        let tag2 = next_fs_tag();
+        let mut req2 = req;
+        req2[0] = tag2;
+        let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
+        let again = ctx.request_with_reply_deadline("fs", &msg2, max_secs).map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
+        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag2, again, max_secs) { return Some(r); }
     }
     None
+}
+
+/// Discard anything already queued on our endpoint BEFORE sending an fs request.
+///
+/// This is the only reliable cure for a desynchronised reply channel, and it belongs at the START of a
+/// request rather than at the end of a failed one. An fs reply carries no request identity, so a reply
+/// abandoned by an earlier caller - one that timed out, or that the user aborted with `q` - is
+/// indistinguishable from ours once it is sitting in the queue. Trying to reclaim it AFTER the fact is a
+/// race that cannot be won: if the late reply has not arrived yet, we move on and the NEXT command eats
+/// it. Draining first is decisive, because at the instant we are about to send, every queued message is
+/// by definition somebody else's leftover.
+///
+/// Safe here because the shell is a pure CLIENT of fs on this endpoint - it does not serve requests on it.
+/// That is exactly why `request_with_reply_abortable` already drains at its own top; interactive commands
+/// have been relying on it. The bounded and unbounded paths had no equivalent, which is how a single
+/// abandoned reply at boot turned into `drives` reporting a healthy disk as absent, and then into the
+/// shell announcing "flash FAILED" for a format that was still running.
+///
+/// Bounded: at most a handful of discards, so a peer stuck emitting messages cannot spin us here.
+fn drain_stale_fs_replies(ctx: &ServiceContext) {
+    for _ in 0..8 {
+        if ctx.try_recv().is_none() { return; }
+    }
 }
 
 /// `fs_request` for INTERACTIVE commands (`ls`, `cd`, `read`, `find`, ...): q-abortable, and after a
@@ -7657,16 +8094,53 @@ fn fs_request_q(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> ReqOu
     const MAX_SECS:  i64 = 3600; // effectively unbounded - fs replies fast now; q is the real exit
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
-    req[0] = op;
-    req[1] = pl as u8;
-    req[2..2 + pl].copy_from_slice(&path[..pl]);
-    let dn = data.len().min(req.len() - 2 - pl);
-    req[2 + pl..2 + pl + dn].copy_from_slice(&data[..dn]);
-    let msg = Message::from_bytes(&req[..2 + pl + dn]);
-    match ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)")) {
+    let tag = next_fs_tag();
+    req[0] = tag;
+    req[1] = op;
+    req[2] = pl as u8;
+    req[3..3 + pl].copy_from_slice(&path[..pl]);
+    let dn = data.len().min(req.len() - 3 - pl);
+    req[3 + pl..3 + pl + dn].copy_from_slice(&data[..dn]);
+    let msg = Message::from_bytes(&req[..3 + pl + dn]);
+    let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+    match fs_take_tagged(ctx, tag, first, MAX_SECS) {
         // Send failed (stale cap after an fs restart): reacquire by name and retry once, still hinted.
-        ReqOutcome::Timeout if ctx.reacquire_by_name("fs") =>
-            ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)")),
+        // A fresh tag for the fresh request - see `fs_request`.
+        ReqOutcome::Timeout if ctx.reacquire_by_name("fs") => {
+            let tag2 = next_fs_tag();
+            let mut req2 = req;
+            req2[0] = tag2;
+            let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
+            let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+            fs_take_tagged(ctx, tag2, again, MAX_SECS)
+        }
+        other => other,
+    }
+}
+
+/// Send a BARE single-opcode request (no path, no data) to `fs`, q-abortable with a hint - for the
+/// whole-disk operations (`drives check`, `drives scrub`) that legitimately run for minutes.
+///
+/// These used a plain `request_with_reply`, which parks the shell in the syscall for the WHOLE operation:
+/// it cannot poll the console, so `q` is never seen and the only way out is cutting the power - which is
+/// exactly what happened on the Pi 2, whose FUA-per-write stick makes a full-tree fsck genuinely slow.
+/// Conventions rule 9 (a blocking command stays q-abortable) is not optional for the longest commands in
+/// the system; those are the ones that need it most. Sends exactly `[op]`, matching what fs expects here
+/// (`fs_request_q` would append a path-length byte).
+fn fs_op_q(ctx: &ServiceContext, op: u8) -> ReqOutcome {
+    const HINT_SECS: i64 = 2;    // print "(q to quit)" only once the wait lingers
+    const MAX_SECS:  i64 = 3600; // effectively unbounded: q is the real exit, not a deadline
+    let tag = next_fs_tag();
+    let msg = Message::from_bytes(&[tag, op]);
+    drain_stale_fs_replies(ctx);
+    let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+    match fs_take_tagged(ctx, tag, first, MAX_SECS) {
+        ReqOutcome::Timeout if ctx.reacquire_by_name("fs") => {
+            let tag2 = next_fs_tag();
+            let msg2 = Message::from_bytes(&[tag2, op]);
+            let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
+            fs_take_tagged(ctx, tag2, again, MAX_SECS)
+        }
         other => other,
     }
 }
@@ -7779,9 +8253,18 @@ fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(
     };
     let p = reply.payload_bytes();
     if no_fs(ctx, p) { return Err(ShellError::Unknown); }
-    if p.first() == Some(&FS_NOTFOUND) || p.len() < 2 {
+    if p.first() == Some(&FS_NOTFOUND) {
         ctx.console_writeln_fmt(format_args!("ls: not a directory: {}", str_of(path)));
         return Err(ShellError::FileNotFound);
+    }
+    // A short or error reply is NOT "not a directory". Lumping the two together is how a storage I/O
+    // error - the stick pulled and replugged - came out as a claim about the path, sending the operator
+    // to look at `/` when the problem was the device. Name what actually happened (§26.7).
+    if p.first() == Some(&FS_ERR) || p.len() < 2 {
+        ctx.console_writeln_fmt(format_args!(
+            "ls: could not read {} - storage error (the device may still be settling after a replug; try again)",
+            str_of(path)));
+        return Err(ShellError::Unknown);
     }
     let count = p[1] as usize;
     out.line_fmt(ctx, format_args!("{}  ({} entries)", str_of(path), count));
@@ -9704,9 +10187,22 @@ fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) -> Result<(), Sh
     match sub {
         ""        => drives_list(ctx),
         "flash"   => {
-            // `drives flash [drive] [label]` - the drive selector is optional (one drive).
-            let (sel, label) = split_drive_value(args, argc);
-            if drive_sel_ok(ctx, sel) { drives_flash(ctx, label) } else { Err(ShellError::Unknown) }
+            // `drives flash [drive] [label] [force]` - the drive selector is optional (one drive).
+            // `force` overrides fs's refusal to overwrite a foreign/bootable disk. It is a word the
+            // operator has to type; there is no default that destroys a boot medium. Recognised
+            // ANYWHERE after the subcommand, not just last: `drives flash 0 data force` has to work as
+            // well as `drives flash data force`, and requiring a fixed position silently dropped the
+            // override in the selector form - which then refused a disk the operator had just forced.
+            let force = args[2..argc].iter().any(|a| *a == "force");
+            let mut kept = [""; MAX_ARGS];
+            let mut n = 0usize;
+            for a in args[..argc].iter() {
+                if *a == "force" { continue; }
+                kept[n] = a;
+                n += 1;
+            }
+            let (sel, label) = split_drive_value(&kept, n);
+            if drive_sel_ok(ctx, sel) { drives_flash(ctx, label, force) } else { Err(ShellError::Unknown) }
         }
         "label"   => {
             // `drives label [drive] <name>` - selector optional; name required.
@@ -9715,9 +10211,11 @@ fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) -> Result<(), Sh
             else if drive_sel_ok(ctx, sel) { drives_label(ctx, name) } else { Err(ShellError::Unknown) }
         }
         "reset"   => {
-            // `drives reset [drive]` - un-format back to raw (optional selector, no value).
-            let sel = if argc >= 3 { args[2] } else { "" };
-            if drive_sel_ok(ctx, sel) { drives_reset(ctx) } else { Err(ShellError::Unknown) }
+            // `drives reset [drive] [force]` - un-format back to raw (optional selector, no value).
+            // `force` is recognised anywhere after the subcommand, as for `flash`.
+            let force = args[2..argc].iter().any(|a| *a == "force");
+            let sel = if argc >= 3 && args[2] != "force" { args[2] } else { "" };
+            if drive_sel_ok(ctx, sel) { drives_reset(ctx, force) } else { Err(ShellError::Unknown) }
         }
         "check"   => {
             // `drives check [drive]` - fsck: verify CRCs + rebuild the bitmap/free count.
@@ -9767,13 +10265,17 @@ fn drive_sel_ok(ctx: &ServiceContext, sel: &str) -> bool {
 
 /// `drives` - list the attached drive (single-drive in step 3; index 0).
 fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
-    let reply = match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_DRIVES_INFO])) {
+    drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
+    let reply = match fs_raw(ctx, &[OP_DRIVES_INFO], 3600) {
         Some(r) => r,
         None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
     if p.first() != Some(&FS_OK) || p.len() < 28 {
-        ctx.console_writeln("drives: no disk found");
+        // See build_drives_table: report the reply's actual shape rather than asserting a cause.
+        ctx.console_writeln_fmt(format_args!(
+            "drives: unexpected reply from fs - status {} len {} (want status {}, len >= 28)",
+            p.first().copied().unwrap_or(255), p.len(), FS_OK));
         return Err(ShellError::Unknown);
     }
     let mounted = p[1] != 0;
@@ -9796,7 +10298,15 @@ fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
 }
 
 /// `drives flash [label]` - format the drive as GSFS after a `[y/N]` confirm. Destructive.
-fn drives_flash(ctx: &ServiceContext, label: &str) -> Result<(), ShellError> {
+/// `drives flash [label] [force]` - format the drive as GSFS.
+///
+/// `force` overrides `fs`'s refusal to overwrite a disk that already carries a foreign partition table
+/// or boot sector. That refusal exists because a machine with a single storage device boots from the
+/// very disk being formatted (the Raspberry Pi's SD card holds the firmware, the kernel image AND would
+/// be the GSFS target), and a confirmation prompt cannot convey that - `drives` shows it as an
+/// unformatted raw disk either way. So the danger is named explicitly and the override is a word the
+/// operator has to type.
+fn drives_flash(ctx: &ServiceContext, label: &str, force: bool) -> Result<(), ShellError> {
     if label.len() > LABEL_MAX {
         ctx.console_writeln_fmt(format_args!("drives: label too long (max {})", LABEL_MAX));
         return Err(ShellError::Unknown);
@@ -9809,13 +10319,26 @@ fn drives_flash(ctx: &ServiceContext, label: &str) -> Result<(), ShellError> {
     let lb = label.as_bytes();
     let ll = lb.len().min(LABEL_MAX);
     let mut req = [0u8; 2 + LABEL_MAX];
-    req[0] = OP_FLASH;
+    // The force flag rides in the op byte's high bit, so the request format is otherwise unchanged.
+    req[0] = if force { OP_FLASH | 0x80 } else { OP_FLASH };
     req[1] = ll as u8;
     req[2..2 + ll].copy_from_slice(&lb[..ll]);
-    match ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + ll])) {
+    // Start from a clean channel. Without this, a reply abandoned by an earlier command is read as this
+    // format's result - and because a 15 GB format takes MINUTES, the answer arrives instantly and says
+    // "flash FAILED" while fs is still formatting. Observed exactly that on hardware: fs logged
+    // `flash requested`, never logged a failure, and the shell had already declared one.
+    drain_stale_fs_replies(ctx);
+    match fs_raw(ctx, &req[..2 + ll], 3600) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: formatted as GSFS - mounted, ready to use now (no reboot)");
             Ok(())
+        }
+        Some(r) if r.payload_bytes().first() == Some(&FS_FOREIGN) => {
+            ctx.console_writeln("drives: REFUSED - block 0 holds a partition table or boot sector, so this");
+            ctx.console_writeln("  disk is not blank. Formatting replaces whatever is on it, and if a machine");
+            ctx.console_writeln("  boots from this disk it will stop booting until it is re-imaged.");
+            ctx.console_writeln("  To format it anyway: drives flash [drive] <label> force");
+            Err(ShellError::Unknown)
         }
         Some(_) => { ctx.console_writeln("drives: flash FAILED (no disk, or disk too small)"); Err(ShellError::Unknown) }
         None    => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
@@ -9824,16 +10347,25 @@ fn drives_flash(ctx: &ServiceContext, label: &str) -> Result<(), ShellError> {
 
 /// `drives reset` - un-format the drive back to raw (zero the superblock). Destructive;
 /// a quick clean slate for re-testing the raw→flash path. NOT a secure wipe.
-fn drives_reset(ctx: &ServiceContext) -> Result<(), ShellError> {
+fn drives_reset(ctx: &ServiceContext, force: bool) -> Result<(), ShellError> {
     ctx.console_write("This un-formats the drive back to raw (ERASES). Continue? [y/N] ");
     if !read_confirm(ctx) {
         ctx.console_writeln("drives: aborted");
         return Err(ShellError::Unknown);
     }
-    match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_RESET])) {
+    // Reset zeroes block 0, which on a foreign disk is its partition table - same danger as flash.
+    let op = if force { OP_RESET | 0x80 } else { OP_RESET };
+    drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
+    match fs_raw(ctx, &[op], 3600) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: reset to raw - 'drives flash' to use again");
             Ok(())
+        }
+        Some(r) if r.payload_bytes().first() == Some(&FS_FOREIGN) => {
+            ctx.console_writeln("drives: REFUSED - block 0 holds a foreign partition table or boot sector.");
+            ctx.console_writeln("  Zeroing it would destroy that disk's boot record. If you are certain:");
+            ctx.console_writeln("  drives reset force");
+            Err(ShellError::Unknown)
         }
         Some(_) => { ctx.console_writeln("drives: reset FAILED (no disk?)"); Err(ShellError::Unknown) }
         None    => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
@@ -9845,8 +10377,14 @@ fn drives_reset(ctx: &ServiceContext) -> Result<(), ShellError> {
 /// reports (does not delete) files/dirs whose blocks fail their CRC. No confirmation needed -
 /// it never erases data. Reply: [FS_OK, files:u32, dirs:u32, bad:u32, used:u64, free:u64].
 fn drives_check(ctx: &ServiceContext) -> Result<(), ShellError> {
-    match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_CHECK])) {
-        Some(r) => {
+    // q-abortable: a whole-disk pass can run for minutes on a slow stick, and a shell parked in an
+    // unbounded request cannot see the keystroke that asks it to stop (conventions rule 9).
+    match fs_op_q(ctx, OP_CHECK) {
+        ReqOutcome::Aborted => {
+            ctx.console_writeln("drives: aborted (the filesystem finishes its pass in the background)");
+            Err(ShellError::Unknown)
+        }
+        ReqOutcome::Reply(r) => {
             let p = r.payload_bytes();
             if no_fs(ctx, p) { return Err(ShellError::Unknown); }
             if p.first() == Some(&FS_OK) && p.len() >= 29 {
@@ -9868,7 +10406,7 @@ fn drives_check(ctx: &ServiceContext) -> Result<(), ShellError> {
                 ctx.console_writeln("check: FAILED"); Err(ShellError::Unknown)
             }
         }
-        None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
+        _ => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
     }
 }
 
@@ -9877,8 +10415,14 @@ fn drives_check(ctx: &ServiceContext) -> Result<(), ShellError> {
 /// on a schedule to catch latent bit-rot early; without redundancy it detects but cannot repair.
 /// Reply: [FS_OK, files:u32, dirs:u32, bad:u32, scanned:u64].
 fn drives_scrub(ctx: &ServiceContext) -> Result<(), ShellError> {
-    match ctx.request_with_reply("fs", &Message::from_bytes(&[OP_SCRUB])) {
-        Some(r) => {
+    // q-abortable: a whole-disk pass can run for minutes on a slow stick, and a shell parked in an
+    // unbounded request cannot see the keystroke that asks it to stop (conventions rule 9).
+    match fs_op_q(ctx, OP_SCRUB) {
+        ReqOutcome::Aborted => {
+            ctx.console_writeln("drives: aborted (the filesystem finishes its pass in the background)");
+            Err(ShellError::Unknown)
+        }
+        ReqOutcome::Reply(r) => {
             let p = r.payload_bytes();
             if no_fs(ctx, p) { return Err(ShellError::Unknown); }
             if p.first() == Some(&FS_OK) && p.len() >= 21 {
@@ -9900,7 +10444,7 @@ fn drives_scrub(ctx: &ServiceContext) -> Result<(), ShellError> {
                 ctx.console_writeln("scrub: FAILED"); Err(ShellError::Unknown)
             }
         }
-        None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
+        _ => { ctx.console_writeln("drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
     }
 }
 
@@ -9916,7 +10460,8 @@ fn drives_label(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     req[0] = OP_LABEL;
     req[1] = ll as u8;
     req[2..2 + ll].copy_from_slice(nb);
-    match ctx.request_with_reply("fs", &Message::from_bytes(&req[..2 + ll])) {
+    drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
+    match fs_raw(ctx, &req[..2 + ll], 3600) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln_fmt(format_args!("drives: labelled '{}'", name));
             Ok(())

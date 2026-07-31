@@ -117,7 +117,12 @@ checkpoints them home, and invalidates the journal. File **data** is written dir
 extent nothing references until the transaction commits). On **mount**, `recover` replays a
 committed-but-unfinished transaction (valid commit magic + CRC) and discards a torn one - so a
 single power loss leaves the filesystem either entirely unchanged or fully applied, never
-half-updated. A transaction stages ≤ `TXN_CAP` (56) blocks (loud failure past that);
+half-updated - **on a backend that attests durability** (`ahci` flushes after every write; SD/EMMC
+completes only after the card releases its busy line). A backend that cannot be ordered - the ARM USB
+stick, which refuses SYNCHRONIZE CACHE - cannot provide that, and `fs` warns once per mount rather
+than implying it (`CLAUDE.md` §6.1, amendment 2026-07-25). Metadata stays CRC-verified either way, so
+a torn write is DETECTED loudly on read; what is lost there is automatic recovery, not the ability to
+notice. A transaction stages ≤ `TXN_CAP` (56) blocks (loud failure past that);
 `delete_tree` commits the unlink atomically then reclaims the subtree in bounded per-extent
 transactions. Proven by `osdev test fs-journal`.
 
@@ -128,6 +133,14 @@ recovered. `WriteAtJ` (op 28) stages the chunk's data blocks in the transaction 
 the chunk commits **atomically** through the journal - replayed or discarded on crash, never torn.
 Opt-in per write (default `WriteAt` stays direct); bounded to one chunk by the 64-block journal (no
 whole-file atomicity - stated honestly, not faked). Proven by `osdev test fs-djournal`.
+
+**Known gap: the ROOT directory block has no redundancy.** The superblock has a backup copy at the last
+LBA and self-heals from it on mount; the root directory block has neither, so losing it takes the whole
+tree with it and the only remedy is a reformat. The asymmetry is deliberate for now, not an oversight: a
+backup root written in the same transaction as the primary is lost by the same power cut that loses the
+primary, so redundancy would buy nothing against the failure actually observed while hiding a durability
+bug behind a second copy that fails identically (§26.2 - pulled into existence by a test that needs it,
+not pushed).
 
 **Scrub (Phase K, §6.14).** Every block self-verifies *on read*; `Scrub` (op 29, `drives scrub`)
 makes that *proactive* - a READ-ONLY walk of the tree verifying every block's CRC, reporting

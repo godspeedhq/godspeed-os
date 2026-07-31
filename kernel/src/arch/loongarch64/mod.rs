@@ -91,12 +91,53 @@ pub fn ap_init(core_id: u32) { unimplemented!("aarch64::ap_init") }
 
 pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, local_irq_save, local_irq_restore};
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
+/// Non-PCI fixed-physical peripheral MMIO grant (ARM Pi path); no fixed windows on this arch stub.
+pub fn map_fixed_driver_mmio(_pt: &mut page_tables::PageTable, _name: &str) -> Option<(u64, u64)> { None }
+
+// USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
+pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
+// No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
+pub fn hw_random() -> Option<u32> { None }
+
+/// The SD/EMMC controller's base clock in Hz, or 0 where the platform does not report one
+/// (the block driver then refuses to guess a divider). Only the Pi's ARM port learns this,
+/// from the VideoCore mailbox at boot.
+pub fn emmc_base_clock_hz() -> u32 { 0 }
+
+/// USB mass-storage block device (the ARM DWC2 Bulk-Only bridge). Only the Pi's ARM port has an
+/// in-kernel USB stack; elsewhere disks are userspace drivers, so there is no device here.
+pub fn usb_disk_sectors() -> u64 { 0 }
+pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
+pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
+pub fn usb_disk_flush() -> bool { false }
+/// Counter ticks a core may make NO forward progress before the liveness watchdog panics. `0` = this
+/// arch cannot say (no calibrated counter rate yet), so the check stays off - see the x86 and arm
+/// implementations for what a real answer looks like.
+pub fn liveness_deadline_cycles() -> u64 { 0 }
+
+pub fn usb_disk_busy() -> bool { false }
+/// Is there no USB disk attached at all? Distinct from busy - see `USB_DISK_ABSENT` in the syscall
+/// dispatch. This arch has no USB-disk backend, so a request never reaches one and the question is
+/// moot; the read/write primitives already answer false.
+pub fn usb_disk_absent() -> bool { true }
+
+
+// No GPIO on this arch (the ARM `gpio` shell command is Pi-only).
+pub fn gpio_op(_op: u32, _pin: u32) -> i64 { -1 }
+pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }
+pub fn net_info() -> Option<([u8; 6], bool)> { None }
 pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
 
 /// Switch to a new stack top - `sp` on AArch64. `#[inline(always)]` for the same reason as x86.
 /// # Safety: caller guarantees `top` is a valid aligned stack top; nothing live is on the old stack.
 #[inline(always)]
 pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("aarch64::switch_to_boot_stack") }
+
+/// The ELF `e_machine` and `EI_CLASS` this arch's service binaries carry (LoongArch, ELFCLASS64).
+/// The neutral loader checks a candidate ELF against these, so it can parse a 32-bit ARM
+/// service ELF or a 64-bit one without any arch-specific code in the loader itself.
+pub const ELF_MACHINE: u16 = 258;
+pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
 
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
@@ -120,13 +161,19 @@ pub fn uart_rx_pop() -> Option<u8> { None }
 pub fn uart_rx_poll() {}
 pub fn uart_rx_drain_now() {}
 
-pub static CONSOLE_READ_WAITER: AtomicU32 = AtomicU32::new(0);
+pub static CONSOLE_READ_WAITER: AtomicU32 = AtomicU32::new(u32::MAX);
 
 // ---------------------------------------------------------------------------
 pub mod boot {
     use super::*;
     pub static TSC_DEADLINE_MODE: AtomicBool = AtomicBool::new(false);
     pub fn init_gdt_arenas(n: usize) {}
+    /// Idle-tick pacing (v0.7.0 power work, x86 Phase 2a). Neutral `scheduler.rs` calls these around
+    /// its idle `wait_for_interrupt`: slow the timer while a core sleeps, restore the quantum on wake.
+    /// A no-op here is CORRECT for a stub - the tick simply never slows - and a real port implements
+    /// them on its own timer (generic timer on ARM, CLINT/mtimecmp on RISC-V).
+    pub fn rearm_idle_timer() {}
+    pub fn rearm_quantum_timer() {}
     pub fn audit_wx() {}
     pub fn tsc_ticks_per_quantum() -> u64 { 0 }
     pub unsafe fn rearm_tsc_deadline() {}
@@ -170,6 +217,7 @@ pub mod page_tables {
         pub fn into_cr3(self) -> u64 { self.root }
     }
 
+    pub const PHYS_IS_IDENTITY: bool = false;
     pub fn get_hhdm_offset() -> u64 { 0 }
     pub unsafe fn set_hhdm_offset(offset: u64) {}
     pub fn read_page_table_base() -> u64 { 0 }               // TTBR0_EL1
@@ -221,6 +269,9 @@ pub mod context_switch {
         pub rip: u64, pub rsp: u64, pub cr3: u64,
     }
     impl TaskContext {
+        /// All-zero context. Neutral code builds zero contexts via this, naming no register.
+        pub const ZERO: Self = Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rip: 0, rsp: 0, cr3: 0 };
+
         pub unsafe fn new_kernel(entry: unsafe extern "C" fn() -> !, stack_top: *mut u8, cr3: u64) -> Self {
             Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rip: entry as u64, rsp: stack_top as u64, cr3 }
         }
@@ -237,6 +288,7 @@ pub mod rtc {
     pub fn capture_boot_time() {}
     pub fn boot_datetime() -> u64 { 0 }
     pub fn read_datetime() -> u64 { 0 }
+    pub fn set_wall_clock(_epoch: i64) -> bool { false } // no RTC on this stub; SNTP wall clock unused (arm is the live RTC-less port)
     pub fn now_epoch_monotonic() -> i64 { 0 }
 }
 

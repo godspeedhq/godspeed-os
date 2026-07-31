@@ -26,6 +26,11 @@ fn main() {
     if target == "riscv64imac-unknown-none-elf" {
         println!("cargo:rustc-link-arg=-T{}", kernel_ld_riscv64.display());
     }
+    let kernel_ld_arm = workspace.join("kernel").join("kernel-arm.ld");
+    println!("cargo:rerun-if-changed={}", kernel_ld_arm.display());
+    if target == "armv7a-none-eabi" {
+        println!("cargo:rustc-link-arg=-T{}", kernel_ld_arm.display());
+    }
     let kernel_ld_loongarch64 = workspace.join("kernel").join("kernel-loongarch64.ld");
     println!("cargo:rerun-if-changed={}", kernel_ld_loongarch64.display());
     if target == "loongarch64-unknown-none-softfloat" {
@@ -77,8 +82,41 @@ fn main() {
         ("HOLDER",     "holder"),   // examples/holder: the CLIENT that USEs the granted resource cap
     ];
 
+    // ARM userspace is being brought up incrementally (docs/multi-arch.md): a service is embedded
+    // for real only once it is built for armv7a-none-eabi. Any not yet ported keep the empty
+    // placeholder, so the kernel still links. As each is ported, drop its name in here.
+    // Userspace services that use only the arch-neutral SDK + syscalls (no hardware probe) run on ARM
+    // as-is. The hardware drivers (block-driver, fs, nic-driver, net-stack, xhci, ehci) compile but hunt
+    // for x86 hardware (PCI/AHCI/Realtek/xHCI) absent on the Pi 2, so they stay placeholders until real
+    // Pi drivers (SD/EMMC, DWC2, LAN9514) exist. `probe` does not build for ARM (x86-only fault module).
+    let arm_built: &[&str] = &[
+        "logger", "ping", "pong", "supervisor", "shell",
+        "observe", "chaos", "mem-pressure",
+        "counter", "greet", "upper", "roster",
+        "reply-server", "asker", "resource-server", "holder",
+        // Persistence on the Pi 2: block-driver's ARM backend is the BCM2835 EMMC (SDHCI, PIO); fs is
+        // arch-neutral and rides on it. The kernel grants block-driver the EMMC MMIO window at spawn
+        // (arch::arm::map_fixed_driver_mmio).
+        "block-driver", "fs",
+        // Networking on the Pi 2: nic-driver's ARM backend bridges the frame IPC to the in-kernel DWC2
+        // CDC-ECM USB-net device (NET_DEVICE syscalls); net-stack is arch-neutral and rides on it.
+        "nic-driver", "net-stack",
+    ];
+    let arm_dir = workspace
+        .join("target")
+        .join("armv7a-none-eabi")
+        .join(&profile);
+
     for (env_name, bin_name) in services {
-        let elf = if use_placeholder { placeholder.clone() } else { target_dir.join(bin_name) };
+        let elf = if is_arm {
+            // A ported ARM service if its binary exists; otherwise the placeholder.
+            let arm_bin = arm_dir.join(bin_name);
+            if arm_built.contains(bin_name) && arm_bin.exists() { arm_bin } else { placeholder.clone() }
+        } else if use_placeholder {
+            placeholder.clone()
+        } else {
+            target_dir.join(bin_name)
+        };
         println!("cargo:rustc-env=SVC_{}_ELF={}", env_name, elf.display());
         // Rerun if the service binary changes (osdev build rebuilds services first).
         println!("cargo:rerun-if-changed={}", elf.display());

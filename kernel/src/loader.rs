@@ -21,68 +21,82 @@ use crate::memory::frame::PhysAddr;
 // ---------------------------------------------------------------------------
 
 const ELF_MAGIC:   [u8; 4] = [0x7f, b'E', b'L', b'F'];
+const ELFCLASS32:  u8  = 1;
 const ELFCLASS64:  u8  = 2;
 const ELFDATA2LSB: u8  = 1;
 const ET_EXEC:     u16 = 2;
-const EM_X86_64:   u16 = 62;
 const PT_LOAD:     u32 = 1;
 // PF_X / PF_W / PF_R and the W^X permission decision live in `crate::elf_flags`
 // (host-testable; see hardening H4a).
 
+// The machine + class THIS build's services carry come from the arch layer, so the loader parses
+// either a 32-bit ARM service ELF or a 64-bit one with no arch-specific code of its own.
+use crate::arch::imp::{ELF_MACHINE, ELF_CLASS};
+
 // ---------------------------------------------------------------------------
-// ELF64 header and program header.
+// Class-agnostic ELF parsing (ELF32 or ELF64).
+//
+// ELF32 and ELF64 share the 16-byte e_ident and the u16 e_type/e_machine, then diverge: the address
+// and offset fields are u32 in ELF32 and u64 in ELF64, which shifts every later field. Rather than two
+// packed structs, small little-endian field readers pull each value from its class-dependent offset -
+// so one code path handles both, checked against the arch's expected class.
 // ---------------------------------------------------------------------------
 
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct Elf64Ehdr {
-    e_ident:     [u8; 16],
-    e_type:      u16,
-    e_machine:   u16,
-    e_version:   u32,
-    e_entry:     u64,
-    e_phoff:     u64,
-    e_shoff:     u64,
-    e_flags:     u32,
-    e_ehsize:    u16,
-    e_phentsize: u16,
-    e_phnum:     u16,
-    e_shentsize: u16,
-    e_shnum:     u16,
-    e_shstrndx:  u16,
+const EI_CLASS: usize = 4;
+const EI_DATA:  usize = 5;
+
+fn ehdr_size(class: u8) -> usize { if class == ELFCLASS64 { 64 } else { 52 } }
+fn phdr_size(class: u8) -> usize { if class == ELFCLASS64 { 56 } else { 32 } }
+
+/// Read a little-endian u16/u32/u64 from `bytes[off..]`. Callers bounds-check `off + width` first.
+fn rd16(b: &[u8], o: usize) -> u16 { u16::from_le_bytes([b[o], b[o + 1]]) }
+fn rd32(b: &[u8], o: usize) -> u32 { u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) }
+fn rd64(b: &[u8], o: usize) -> u64 {
+    u64::from_le_bytes([b[o], b[o+1], b[o+2], b[o+3], b[o+4], b[o+5], b[o+6], b[o+7]])
+}
+/// An address-width field: u32 in ELF32, u64 in ELF64, widened to u64.
+fn rdaddr(b: &[u8], o: usize, class: u8) -> u64 {
+    if class == ELFCLASS64 { rd64(b, o) } else { rd32(b, o) as u64 }
 }
 
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct Elf64Phdr {
-    p_type:   u32,
-    p_flags:  u32,
-    p_offset: u64,
-    p_vaddr:  u64,
-    p_paddr:  u64,
-    p_filesz: u64,
-    p_memsz:  u64,
-    p_align:  u64,
+/// The header fields the loader needs, normalized across classes.
+struct NormEhdr { e_type: u16, e_machine: u16, e_entry: u64, e_phoff: u64, e_phentsize: u16, e_phnum: u16 }
+
+/// Parse the executable header. Caller guarantees `bytes.len() >= ehdr_size(class)`.
+fn read_ehdr(bytes: &[u8], class: u8) -> NormEhdr {
+    // e_type@16, e_machine@18 are the same in both classes; e_entry@24; then the offsets diverge.
+    let (phoff_off, phentsize_off, phnum_off) =
+        if class == ELFCLASS64 { (32, 54, 56) } else { (28, 42, 44) };
+    NormEhdr {
+        e_type:      rd16(bytes, 16),
+        e_machine:   rd16(bytes, 18),
+        e_entry:     rdaddr(bytes, 24, class),
+        e_phoff:     rdaddr(bytes, phoff_off, class),
+        e_phentsize: rd16(bytes, phentsize_off),
+        e_phnum:     rd16(bytes, phnum_off),
+    }
 }
 
-/// Copy `size_of::<Elf64Ehdr>()` bytes from the start of `bytes` into a local
-/// `Elf64Ehdr`.  After this call every field access is a safe copy out of a
-/// local value - no unaligned pointer dereferences at the call site.
-///
-/// Caller must guarantee `bytes.len() >= size_of::<Elf64Ehdr>()`.
-fn read_ehdr(bytes: &[u8]) -> Elf64Ehdr {
-    // SAFETY: length pre-checked by caller; Elf64Ehdr is repr(C, packed) so any
-    // byte sequence is a valid bit-pattern; read_unaligned requires no alignment.
-    unsafe { (bytes.as_ptr() as *const Elf64Ehdr).read_unaligned() }
-}
+/// The program-header fields the loader needs, normalized across classes.
+struct NormPhdr { p_type: u32, p_flags: u32, p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64 }
 
-/// Copy `size_of::<Elf64Phdr>()` bytes from `bytes[off..]` into a local
-/// `Elf64Phdr`.
-///
-/// Caller must guarantee `off + size_of::<Elf64Phdr>() <= bytes.len()`.
-fn read_phdr(bytes: &[u8], off: usize) -> Elf64Phdr {
-    // SAFETY: bounds pre-checked by caller; same reasoning as read_ehdr.
-    unsafe { (bytes.as_ptr().add(off) as *const Elf64Phdr).read_unaligned() }
+/// Parse a program header at `off`. Caller guarantees `off + phdr_size(class) <= bytes.len()`.
+fn read_phdr(bytes: &[u8], off: usize, class: u8) -> NormPhdr {
+    if class == ELFCLASS64 {
+        // ELF64 phdr: p_type@0, p_flags@4, p_offset@8, p_vaddr@16, p_filesz@32, p_memsz@40.
+        NormPhdr {
+            p_type: rd32(bytes, off), p_flags: rd32(bytes, off + 4),
+            p_offset: rd64(bytes, off + 8), p_vaddr: rd64(bytes, off + 16),
+            p_filesz: rd64(bytes, off + 32), p_memsz: rd64(bytes, off + 40),
+        }
+    } else {
+        // ELF32 phdr: p_type@0, p_offset@4, p_vaddr@8, p_filesz@16, p_memsz@20, p_flags@24.
+        NormPhdr {
+            p_type: rd32(bytes, off), p_flags: rd32(bytes, off + 24),
+            p_offset: rd32(bytes, off + 4) as u64, p_vaddr: rd32(bytes, off + 8) as u64,
+            p_filesz: rd32(bytes, off + 16) as u64, p_memsz: rd32(bytes, off + 20) as u64,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -128,19 +142,23 @@ impl From<MapError> for LoadError {
 /// # Safety
 /// Must be called after `memory::init` and `page_tables::set_hhdm_offset`.
 pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
-    if bytes.len() < core::mem::size_of::<Elf64Ehdr>() {
-        return Err(LoadError::TooSmall);
-    }
+    // Need e_ident (magic + class + data) before we know the header size.
+    if bytes.len() < 16 { return Err(LoadError::TooSmall); }
+    if bytes[..4] != ELF_MAGIC        { return Err(LoadError::BadMagic);     }
+    // Class and data must match this build's arch. On x86 a 32-bit ELF still fails here (NotElf64),
+    // preserving the fuzz-test semantics; on ARM a 64-bit ELF fails the same way.
+    if bytes[EI_CLASS] != ELF_CLASS   { return Err(LoadError::NotElf64);     }
+    if bytes[EI_DATA]  != ELFDATA2LSB { return Err(LoadError::NotElf64);     }
 
-    let ehdr = read_ehdr(bytes);
+    let class = ELF_CLASS;
+    if bytes.len() < ehdr_size(class) { return Err(LoadError::TooSmall); }
 
-    if &ehdr.e_ident[..4] != ELF_MAGIC { return Err(LoadError::BadMagic);     }
-    if ehdr.e_ident[4]   != ELFCLASS64 { return Err(LoadError::NotElf64);     }
-    if ehdr.e_ident[5]  != ELFDATA2LSB { return Err(LoadError::NotElf64);     }
-    if ehdr.e_type    != ET_EXEC   { return Err(LoadError::NotExecutable); }
-    if ehdr.e_machine != EM_X86_64 { return Err(LoadError::WrongArch);    }
+    let ehdr = read_ehdr(bytes, class);
 
-    if (ehdr.e_phentsize as usize) < core::mem::size_of::<Elf64Phdr>() {
+    if ehdr.e_type    != ET_EXEC     { return Err(LoadError::NotExecutable); }
+    if ehdr.e_machine != ELF_MACHINE { return Err(LoadError::WrongArch);     }
+
+    if (ehdr.e_phentsize as usize) < phdr_size(class) {
         return Err(LoadError::BadProgramHeader);
     }
 
@@ -156,13 +174,13 @@ pub fn load(bytes: &[u8]) -> Result<LoadedElf, LoadError> {
             .checked_add(i.checked_mul(ph_step).ok_or(LoadError::BadProgramHeader)?)
             .ok_or(LoadError::BadProgramHeader)?;
 
-        if off.checked_add(core::mem::size_of::<Elf64Phdr>())
+        if off.checked_add(phdr_size(class))
                .ok_or(LoadError::BadProgramHeader)? > bytes.len()
         {
             return Err(LoadError::BadProgramHeader);
         }
 
-        let phdr = read_phdr(bytes, off);
+        let phdr = read_phdr(bytes, off, class);
 
         if phdr.p_type != PT_LOAD { continue; }
 

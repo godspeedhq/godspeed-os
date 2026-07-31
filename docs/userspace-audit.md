@@ -5,6 +5,45 @@
 > append with each audit. The kernel has its own living record in `docs/kernel-audit.md`; this file
 > is its userspace counterpart. First audit: 2026-07-12.
 
+
+
+## Audit 7 - the wait helpers, the block-driver visibility, and the chaos harness (2026-07-31, `feat/arm-usb-interrupt`)
+
+**Scope:** `d8de0f2..HEAD` - the SDK wait-helper reversal, block-driver's slow-request reporting,
+the chaos pacing fix, and fs's truncation report. Audited against the Ten Commandments.
+
+**Verdict: 0 outstanding violations. 3 defects found and fixed DURING the period, 2 of them mine.**
+
+| ID | Sev | Commandment | Finding |
+|----|-----|-------------|---------|
+| A7-1 | HIGH (mine, REVERTED) | II, IX | Making the four SDK wait helpers BLOCK broke x86 networking: `net-stack` and `nic-driver` both sit on core 1, so every exchange is **same-core request/reply**, and net-stack degraded to "no NIC MAC yet". Proven by a hardware A/B (identical build, one difference). Reverted @ e72596d. **The suite could not see it:** identity, file-cap, fs-restart and reply-dead are ALL cross-core - 57 green tests covering none of the changed case. Recorded in the code: a future attempt needs a same-core request/reply test FIRST. |
+| A7-2 | MED (mine, FIXED) | VIII, X | The slow-request notice read `epoch_secs_monotonic()` - a SYSCALL - unconditionally at the top of `with_busy_retry`, so every block read/write paid one, plus one per busy iteration. Chaos pauses went 2.3% -> 20% of rounds: instrumentation added to explain a delay became a cause of one. FIXED @ 88418a8 - lazy (only once actually BUSY) and sampled (every 64th attempt). **Measure the cost of your instrumentation.** |
+| A7-3 | HIGH (pre-existing, FIXED) | VIII | `PACE_YIELDS = 3000` paced chaos rounds by COUNTING YIELDS. A yield costs a full quantum when the yielding task is the only runnable one - exactly the state chaos creates - so on the Pi that beat was 30.03 s, and only on rounds where nothing else was runnable. A count is not a duration and its cost is arch-dependent: the harness was measuring itself in units it does not control. FIXED @ de46f55 (clock-bounded, yield count kept as the §26.6 cap). Same bug in `SHELL_SETTLE_YIELDS`. |
+| A7-4 | note | V, §26.7 | block-driver now SAYS it is waiting (once per request, at 2 s, plus a resolution line). A correct 30 s wait that says nothing is indistinguishable from a dead board - it cost three chaos runs and two power-cuts of a healthy machine. A normal sub-millisecond request stays silent and pays nothing. |
+| A7-5 | note | V | fs reports a truncated reply rather than silently sending a short one, and an empty reply is now impossible (it goes out as FS_ERR). Both close silent-corruption paths rather than adding behaviour. |
+| A7-6 | note | III | The correlation tag (Audit 6) held under a 1M-round soak and repeated selfchecks; `shell: discarded an fs reply for tag N` fired on hardware exactly when an overtake occurred, confirming the mechanism is load-bearing rather than decorative. |
+
+**Standing:** contract_check unchanged (no contract touched); selfcheck 349/0 on both arches; ARM 1M-round
+soak in progress (55K+ clean at last inspection).
+
+## Audit 6 - fs reply correlation, the buffered reply, and the blocking waits (2026-07-30, `feat/arm-usb-interrupt`)
+
+**Scope:** `services/fs` (correlation tag, buffered reply + in-place retry, failure logging),
+`services/shell` (tag helpers, all five fs senders), `sdk/rust/service_context.rs` (the four wait
+helpers now block), `services/block-driver/usbdisk.rs` (absent vs busy), `examples/counter`.
+
+**Verdict: 1 MEDIUM fixed, 1 MEDIUM accepted with rationale, 2 LOW recorded.**
+
+| ID | Sev | Commandment | Finding |
+|----|-----|-------------|---------|
+| A6-1 | MED | V, §26.7 | fs's buffered `send` clamped with `bytes.len().min(out.len())` and set the length to the clamp - a **silent truncation**. Unreachable today (largest reply is `5 + MAX_FILE_BYTES` = 3561 against 4095 available after the tag), but if an arm ever grew past the buffer the caller would parse a header describing bytes that are not there: silent corruption, not a short read. FIXED: truncation is reported loudly and the short reply still sent, so the caller is wrong-but-not-hanging rather than wrong-and-silent. |
+| A6-2 | MED | VI, Invariant 9 | `next_fs_tag()` uses a function-scope `static AtomicU8`. Before this change the shell had **zero** mutable globals (`HELP` is immutable), and nic-driver's `tx_fail` was deliberately threaded through its serve loop rather than made a file-scope static (userspace-audit A5). **ACCEPTED, recorded:** threading a counter through `fs_request`/`fs_request_q`/`fs_request_bounded`/`fs_op_q`/`fs_raw` reaches dozens of call sites, and correctness does not depend on the counter's *value* - only on successive requests differing, which any monotonic source satisfies. It is owned by exactly one path, is a count rather than a resource (§6.2's distinction), and is never read by another service. Revisit if the shell ever needs a second one. |
+| A6-3 | LOW | III | `drain_stale_fs_replies` is now redundant: the tag supersedes arrival-order hygiene. Two mechanisms for one job. Kept as belt-and-braces for the first hardware runs; retire once the tag has soaked. |
+| A6-4 | LOW | VIII | `fs_take_tagged` waits via `recv_abortable_deadline`, which is q-abortable - so a stray `q` during a non-interactive path (the history write-through) could abort the wait. Bounded and harmless (the caller treats it as no reply and retries), but the abortability is inherited rather than chosen. |
+| A6-5 | note | VIII | The four wait helpers now BLOCK with a short timeout. Correctness still comes from truth (the reply), not time: the timeout only paces the console poll, and the deadline is a bound, not a decision. **But** they now depend on `scheduler::cycles_to_ticks` flooring at 1 tick - if that floor were ever removed the loops would hot-spin with no yield at all. Documented at both ends. |
+| A6-6 | note | IX | The in-place retry re-establishes derived state (a fresh mount) before retrying, and is limited to read-only opcodes so a partially-applied mutation is never re-applied. A retry after `reacquire_by_name` takes a FRESH tag - reusing it would accept the dead instance's late reply as the new one's answer. |
+| A6-7 | note | IV | No contract changed. The tag is a wire-format field between two services that already talk; no new capability, no new named peer. |
+
 ## North-star for services
 
 A service is **identity, not location** (Commandment V): it must be **prepared to fail and to
@@ -547,3 +586,221 @@ opened. The real mechanism is two parts:
 fs re-attempts the mount on a request while degraded (self-heal, no manual kill needed); block-driver
 waits for `PxTFD.BSY/DRQ` to clear before reading `PxSIG` (robust detection). **SEC-5** (subtree revoke)
 remains a real, separate fix - it is **not** the LS1 fix.
+
+---
+
+## Audit 4 - 2026-07-23 (feat/pi2-arm32: the ARM32 userspace we touched)
+
+Scope: **only** the userspace changed for the arm32 port. The service crates (supervisor, logger, shell,
+ping/pong, examples) are **arch-neutral and unchanged** on this branch - they cross-compile to armv7 and
+run as-is, so their Commandment compliance is what Audits 1-3 already established. The arm32-specific
+userspace surface is exactly **three files, 62 lines**: the SDK's ARM syscall ABI (`sdk/rust/src/
+syscall.rs`), the SDK's ARM adversarial fault primitives (`sdk/rust/src/adversarial.rs`, the §18.1 audited
+test module), and the user linker script (`services/user.ld`). Method: direct thorough read, cross-checking
+the ABI against the kernel's `arm_svc_dispatch`, AAPCS, and the x86 `raw_syscall`; plus a runtime
+Commandment pass on the arm service stack booted in QEMU `raspi2b`.
+
+**Result: 1 finding (A-U1, MED-latent, FIXED). The syscall ABI is otherwise correct, the adversarial
+primitives correctly express the ARM ring-3 faults and are test-only, the linker change is sound, and the
+arm service runtime obeys the Commandments (loud graceful degradation, restart-on-fault).**
+
+| ID | Sev | Cmd | What | Status |
+|----|-----|-----|------|--------|
+| **A-U1** | MED-latent | III / VIII | `sdk/rust/src/ipc.rs` `recv_timeout` - ARM's 32-bit ABI truncates each `raw_syscall` u64 arg to u32. Pointers/handles/lengths/slots genuinely fit, but `timeout_cycles` (generic-timer ticks) does not: at the Pi 2's ~62.5 MHz CNTFRQ, u32::MAX ticks is ~68 s, so a longer finite timeout truncated to a tiny value (premature wake) or - on a multiple of 2^32 - to **0**, which the kernel reads as **block-forever** = a bounded VIII deadline silently becoming an infinite hang. A silent truncation (III/§26.4) diverging arm from x86. Latent: needs a >68 s `recv_timeout`, which no current arm service issues; non-wedging in the common (premature) case, but the block-forever edge is a real VIII violation. | **FIXED** - `recv_timeout` saturates on ARM to `[1, u32::MAX]` (a genuine 0/block-forever stays 0), so a long finite request becomes the longest REPRESENTABLE timeout (~68 s), never tiny and never accidental-forever; x86 passes the full u64. `raw_syscall` comment corrected to name the one wider-than-u32 arg. |
+
+**Verified sound (no violation):**
+- **ARM syscall ABI (`raw_syscall`)** - register mapping (nr->r0, a0-a2->r1-r3) matches `arm_svc_dispatch(number, arg0, arg1, arg2)` and AAPCS; the i64 result is read from r0:r1 (low:high) with correct sign extension for negative error codes; the clobber list is right (inout r0-r3, lateout r12) and `options(nostack)` **omits** `nomem`, so the compiler treats the `svc` as a memory barrier - user buffers passed by pointer are not reordered/cached across the trap (matches x86). Same call surface as x86.
+- **ARM adversarial primitives** (`fault_noncanonical_read` -> unmapped-high read `0xFFFF_FFF0`; `fault_divide_by_zero` -> `udf #0` undefined instruction) correctly express the arm-equivalent ring-3 CPU faults (ARM has no non-canonical VA form, and integer divide-by-zero does not trap by default), and each is the A14/C1 property the kernel audit confirmed: a USR-mode data-abort / undefined-instruction kills only the faulting task. Test-only (§18.1), `#[cfg(target_arch = "arm")]`, not called by any arm service (`probe` is x86-only).
+- **`services/user.ld`** discards `.ARM.exidx`/`.extab`/`.attributes` (dead unwind tables under panic=abort) so every PT_LOAD stays 4 KiB-page-aligned for the loader - a sound build-correctness fix, no-op on x86.
+- **Runtime Commandment pass (arm-supervisor in QEMU):** every hardware service absent on the Pi 2 (block-driver, fs, xhci, ehci, nic-driver, net-stack) fails its spawn **loudly** ("kernel will name-wire it" / "returned no endpoint cap") and the supervisor continues to a usable shell (§9.2/§11.3, loud not silent); `ls` on the fs-less shell returns `ls: storage unavailable` (loud degradation, not a hang); a PL0 shell fault (e.g. a debug-build pipe frame) kills only the shell and the supervisor **restarts** it (V/IX - identity over location, recovery). These are the existing arch-neutral service behaviours, confirmed intact on arm.
+
+**Observation (not a finding):** debug-build shell pipe frames (~600 KiB, e.g. `status | count`) exceed the
+256 KiB user stack and fault the shell; it recovers via supervisor restart, and the **release** build's
+optimized frames fit and run pipes cleanly (`docs/arm32-status.md`). This is a build-environment / kernel
+user-stack matter, not a service-code defect - recorded there, not counted here.
+
+### Addendum to Audit 4 (2026-07-23): A-U2 - the `Call` syscall packing (found during SD bring-up)
+
+Building the Pi 2 SD driver surfaced a second instance of the A-U1 class that Audit 4's ABI review did
+not catch (it focused on `recv_timeout`). `sdk/rust/src/ipc.rs` `call` (syscall 41) packed **three**
+16-bit cap slots into one u64 arg - `target` (0-15), `reply` (16-31), `recv` (**32-47**). On x86-64 the
+arg is a full 64-bit register; on ARM the 32-bit ABI truncates each arg to u32, so **`recv_slot` (bits
+32-47) was dropped to 0** and the Call routed to the wrong endpoint. `request_with_reply` therefore never
+completed on ARM - `fs`'s block I/O to `block-driver` got no reply and `fs` degraded to
+storage-unavailable. **FIXED** (`7786a39`): repacked into three 32-bit-safe args (`recv` rides the high
+half of the length arg, which is `< 0xFFFF`); `handle_call` mirrors it. Transparent on x86 (same values),
+correct on ARM. **Lesson (reinforces A-U1):** any syscall that packs a value above 32 bits into one arg
+is broken on the 32-bit ABI; `arch/arm/CLAUDE.md` already warns of this, but the sweep must check *every*
+multi-field-packed syscall arg, not just obviously-wide ones like a timeout.
+
+## Audit 5 - 2026-07-23 (feat/pi2-arm32: the ARM USB-net backend + new shell hardware commands)
+
+Scope: the userspace ADDED this session beyond Audit 4's three ABI files - the nic-driver ARM backend
+`usb_net_main` (the `cfg(target_arch="arm")` frame-IPC <-> NetFrame* bridge) and the two new shell commands
+`cmd_random` / `cmd_gpio`. Method: direct read cross-checked against the x86 e1000/RTL serve loops (same
+contract), the SDK wrappers, the UNCHANGED net-stack client's reply parsers (to prove the ARM replies are
+contract-compatible and cannot hang it), and the kernel privilege-grant path.
+
+**Result: 0 HIGH, 1 MED-latent, 2 LOW - all FIXED.** The ARM backend's reply-cap discipline is airtight
+(no F1/N1/SEC-5-class slot leak - the cap is taken once and `remove_cap`'d unconditionally after every
+arm), every buffer is a fixed stack array, degradation is loud (serves empty replies, never hangs), and
+every reply is length-guarded on the unchanged net-stack side. The MED is the U15 prediction realized:
+nic-driver ships a contract, so a by-name privilege grant it omits is an M6-class understatement.
+
+| ID | Sev | Cmd | What | Status |
+|----|-----|-----|------|--------|
+| **A5-U1** | MED-latent | IV / VII | The kernel grants nic-driver the **NET_DEVICE** cap BY NAME (`service_privileges`, arch-gated to ARM) - the USB-net frame bridge (syscalls 42-44). But nic-driver SHIPS a contract that declares only `hw_device="nic"` + `log_write`, and on the Pi 2 `hw_device="nic"` resolves to nothing (no PCIe NIC): the contract describes x86 authority the ARM instance doesn't use while omitting the ARM authority it does. A reviewer reading the .toml to answer "what can nic-driver reach on ARM?" gets the wrong answer (M6/M7). Runtime is still explicit-cap (no ambient authority at use), arch-gated, so latent. `contract_check.py` doesn't reconcile it (NET_DEVICE lives in the Privileges table). | **FIXED** (annotate, per the settled U15 doctrine): nic-driver.toml carries an explicit ARM note (real authority = NET_DEVICE + log_write; NET_DEVICE is a sanctioned kernel-only by-name grant, not a contract cap), and `service_privileges` documents NET_DEVICE/GPIO_DEVICE as the sanctioned by-name grants. A latent placement divergence surfaced with it (contract core 1 vs ARM kernel core 0, and `contract_check.py` couldn't parse the arch-conditional `preferred_core`) - the checker now takes the x86 `else` value, and both .tomls note the ARM core-0 override. |
+| **A5-U2** | LOW | XXVI.6 / III | nic-driver `usb_net_main` op-9 batch drain called `net_frame_rx` (which DEQUEUES a frame) and THEN checked `opos + 2 + n > out.len()` - so a frame already pulled off the device but too big for `BATCH_MSG_MAX`(3072) was DROPPED (lost, not held), diverging from the x86 path which checks fit before advancing. Unreachable in practice (net-stack sends op 9 only in `ping`, where wire frames are tiny + retried), but a real lost RX frame. | **FIXED** - checks a max-size frame would fit (`opos + 2 + FRAME_MAX > out.len()`) BEFORE dequeuing; stops cleanly and lets net-stack re-poll, never dropping a consumed frame. |
+| **A5-U3** | LOW | conventions | `cmd_random` did `arg.parse::<u32>().unwrap_or(1)` - a non-numeric count (`random abc`) silently became `1` rather than a loud rejection, inconsistent with its sibling `cmd_gpio` (which rejects a bad verb/pin loudly) and the loud-input-rejection convention. | **FIXED** - a bare `random` = 1, but a given non-numeric count prints `random: count must be a number 1..64` and returns. |
+
+**Verified sound (no violation):** reply-cap discipline airtight (taken once, `remove_cap`'d
+unconditionally after every arm - no path leaks a slot); no hang / no unbounded busy-wait (`rx_one` is a
+fixed `RX_TRIES`=8 bounded best-effort, the batch loop breaks on the first empty poll, `recv()` is the
+service's own-endpoint server recv, no dependency-wait); loud graceful degradation with no device (logs +
+serves empty op-3 replies -> net-stack stays unconfigured, never hangs); fixed stack buffers (no heap);
+the frame IPC contract is net-stack-compatible (every reply length-guarded on the unchanged client side -
+op 3's 8-byte reply, op 4/9 length-prefixed, ops 5-8 ack - so a shorter-than-x86 ARM reply can't hang or
+panic net-stack); `cmd_gpio` fully validated + loud (verb match with loud usage, pin bounded 0..53 with a
+loud reject, loud "not available" on the non-ARM stub), GPIO_DEVICE cap-gated; `cmd_random` bounded
+(`clamp(1,64)`) + loud on `hw_random()==None`.
+
+---
+
+## Audit 6 (2026-07-25, `feat/pi2-arm32` @ `74ee6ff`) - the USB block backend + durability work
+
+**Scope:** the unaudited range `6929e28..HEAD` across `services/` and `sdk/`: `fs`'s flush barriers and
+CRC reporting, the new `usbdisk` block backend and `OP_FLUSH` op, the SDHCI backend, the shell's
+tokenizer/line changes, the supervisor's placement call, and the SDK's `resource_invoke` repack plus
+`usb_disk_flush` wrapper.
+
+**North star, restated:** a service may only reach what it was granted, must fail loudly, and must
+never imply a guarantee it does not deliver. The last clause is where this audit landed.
+
+**Verdict: 1 HIGH, 4 MED, 6 LOW, 1 INFO.** Mechanical checks all pass. The real defects cluster in two
+places: **placement not surviving a restart** (the HIGH), and **comments promising §26.7 behaviour the
+code did not implement** - three separate cases, one of which loses a committed transaction.
+
+| ID | Sev | Class | What | Status |
+|----|-----|-------|------|--------|
+| **U6-1** | **HIGH** | (R) restart | `block-driver`'s ARM core-0 pin was applied at boot (`supervisor/main.rs` `ensure_mapped(..., 0)`) but NOT on restart: `respawn_managed` passes `0xFFFF` (no override), so the kernel fell back to `ServiceConfig.preferred_core: 1`. Every `msc_*` entry point refuses on `!on_core0()`, so a respawned block-driver replies `STATUS_ERR` to every block op forever, `fs` degrades to storage-unavailable, and its self-heal re-mount hits the same wall. Storage dead until reboot - block-driver no longer restartable on ARM (invariant 6), and `chaos max-carnage` kills it by design. | **FIXED** - placement moved into the kernel `ServiceConfig`, arch-conditional (`if cfg!(target_arch = "arm") { 0 } else { 1 }`), exactly as `nic-driver` already did; the supervisor's literal is gone. One source of truth, consulted by boot and restart alike. Verified on QEMU: spawns on core 0 with no override. Same finding as kernel Audit 7 K7-4, reached independently. |
+| **U6-2** | MED | (C) §26.7 | **BARRIER 3 did not do what its own comment said.** The comment promised "the invalidation below is skipped" when the pre-invalidation flush fails; the early return was lost when the barrier moved to `durable_or_warn` (which returned `()`), so `block_write(journal_start, zeros)` ran unconditionally. On a drive that refuses SYNCHRONIZE CACHE the home writes are acknowledged but still in the volatile buffer, fs erases the commit record, power is cut - and the transaction is lost with no redo record. Precisely the corruption BARRIER 3 documents itself as preventing, performed by the barrier itself. | **FIXED** - `durable_or_warn` returns its verdict, BARRIER 3 genuinely returns without invalidating and logs that the journal was left intact; the two advisory call sites now say `let _ =` with a reason rather than discarding by omission. |
+| **U6-3** | MED | (C) §26.7 | The AHCI `OP_FLUSH` comment was factually wrong about its own file. It claimed "SATA FLUSH CACHE (0xE7) is NOT implemented here" and that the gap "reports once at startup (`run`)" - but `write_block` and `write_zeros` have always issued `ATA_FLUSH_EXT` (0xEA) after every write, and `run` logs nothing of the kind. So the BEHAVIOUR was honest (that backend attests durability per-write, stronger than on demand) while the COMMENT was not, and the reply was an asserted `STATUS_OK` for a command never sent rather than an earned one. A maintainer trusting the comment would conclude x86 journal ordering is unenforced, which is false. | **FIXED** - `OP_FLUSH` now issues `ATA_FLUSH_EXT` and reports what the drive said; the comment states the truth. |
+| **U6-4** | MED | (C) | `fs`'s `match p[0] & 0x7F` masks the force bit off EVERY opcode, not just the two that use it. `forced` is consulted only by `OP_FLASH` and `OP_RESET`; for the other ~23 arms a garbled op byte `0x9B` silently executes op `0x1B` instead of returning `FS_ERR`, and a client can set a destructive-override bit on an op that has no override with no error. | **RECORDED** - the fix is to reject `p[0] & 0x80 != 0` unless the masked op is `OP_FLASH`/`OP_RESET`. Not applied in this pass: it changes the fs wire contract and belongs with a shell-side change and a test, not bundled into an audit commit. |
+| **U6-5** | MED | (C) Commandment III | `storage_unreadable` is overloaded to mean both "keep retrying the mount" and "the disk is present but unreadable". On `capacity == 0` (block-driver's authoritative "no disk") the new branch sets it purely to keep the re-mount loop armed, but that same flag selects the client-facing code, so a cardless Pi reports "storage unavailable ... data may be intact, do NOT flash" when there is no disk at all - blurring the distinction audit L2 created. | **RECORDED** - split `retry_mount` from `storage_unreadable`. Not a behavioural regression (the old bounded-attempt path ended in the same state), but the new code makes the conflation deliberate. |
+| **U6-6** | LOW | (C) §26.7 | `format` warns log-only and one-shot when durability is unattested, while the operator at the prompt gets an unqualified "drives: formatted as GSFS - mounted, ready to use now". Success and failure travel on different channels, so on a console/log split the caveat never reaches the person who acted. Same shape for `durable_or_warn`: once-per-mount means an operator attaching later cannot discover that ordering is unenforced. | **RECORDED** - the caveat should ride back in the reply (a distinct byte, or a `drives` flag bit exposing "durability unattested"). |
+| **U6-7** | LOW | (C) | `MAX_ARGS` was raised 4 -> 8, but tokens past the ceiling are still dropped SILENTLY - the exact bug being fixed (a dropped 5th word silently disarming `force`) recurs identically at 9 words. The same commit made `MAX_LINE` loud (BEL) but not this. Doc drift: a comment still reads "the shell's MAX_ARGS=4 tokenizer". | **RECORDED**. |
+| **U6-8** | LOW | (C) §26.6 | The `MAX_LINE` doubling costs more stack than its comment claims ("about 4 KiB"): `History.lines` 2 -> 4 KiB permanent, `History::load` frame ~4.2 -> ~8.3 KiB, `save` 2 -> 4 KiB, i.e. ~+8 KiB against a 64 KiB user stack already known tight on the `pipe_run` path. Both merge frames are correctly `#[inline(never)]`. | **RECORDED** - correct the comments and re-measure headroom on the deep pipe path. |
+| **U6-9** | LOW | (C) §26.7 | The `foreign_disk` guard is bypassed when block 0 cannot be READ: `if let Some(b0) = block_read(ctx, 0)` falls through to the format on `None`, so a transient read failure downgrades "could not verify" to "verified blank" - the one case the guard exists for. | **RECORDED** - refuse and say the disk could not be verified. |
+| **U6-10** | LOW | (C) §26.7 | `sdhci`: `let _ = self.set_clock(self.divider_for(25_000_000), ctx);` discards a failed 25 MHz step-up and `init` still returns true, so the driver announces "SD card ready" for a card whose clock was never confirmed. `reset_cmd_dat` also breaks out of its bounded wait with no log. | **RECORDED**. |
+| **U6-11** | LOW | (C) §14.3 | The block-driver backend choice is made once at startup and `fs` never re-validates it after a restart. If the stick is absent when block-driver respawns, it silently serves the SD card under the same name while `fs` keeps geometry derived from the previous instance - the hazard `foreign_disk` exists to prevent, arriving through a different door. | **RECORDED** - `fs` should re-validate the superblock or a capacity fingerprint after a block-driver reacquire, not only on `E_IO`. |
+| **U6-12** | INFO | (B) | `OP_WRITE_ZEROS` iterates a client-supplied `u64` with no clamp in both `usbdisk` and `sdhci`. The USB one is bounded implicitly (the kernel's `lba >= MSC_SECTORS` check fails the write and breaks the loop); `sdhci::write_block` has no range check, so that loop is genuinely unbounded. | **RECORDED** - clamp `count` to `sectors - lba` in both. |
+
+**Verified sound (no violation):** no global mutable state - `last_bad_dir_lba` and `flush_warned` are
+`Cell` fields on `Fs`, re-initialised by `Fs::mount`, and `format` ends in `Fs::mount`, so a reformat
+gets a fresh latch (the stale-after-reformat case was checked explicitly and does not occur); no service
+gained `unsafe` (`unsafe_check.py`: 52 files, 830 lines, no unaccounted additions), and all new `unsafe`
+is the SDK's §18.1-audited syscall wrappers, each SAFETY-commented. Bounded and heap-free throughout:
+every new buffer is a fixed array, no `alloc`/`Box`/`Vec`, every new device loop carries an explicit
+spin bound. Reply-cap discipline is exactly-once on every path of `usbdisk::serve`, `sdhci::serve` and
+`ahci::serve` (empty payload, short payload, unknown op and `OP_FLUSH` all covered), and `fs::block_flush`
+rides `block_rpc` -> `request_with_reply`, so a dead block-driver wakes it with `ReplyDead` rather than
+hanging a commit. `contract_check.py` passes.
+
+**Contract note (beyond what the checker can see):** `block-driver.toml` declares only `hw_device =
+"ahci"` + `log_write`, while the ARM build grants it **`USB_DISK`** (whole-device read/write reach) by
+kernel name-match. This is the same class as Audit 5's **A5-U1** (`NET_DEVICE`), which was closed there
+by an ARM note in the contract; the new privilege repeats it unannotated and should get the same note.
+
+---
+
+## Audit 7 (2026-07-26, `feat/pi2-arm32` @ `f723e7a`) - the fs journal payload verification, USB block backend, chaos, and the SDK LBA path
+
+Scope: `74ee6ff..HEAD` (34 commits, none previously audited) across `services/fs`, `services/block-driver`,
+`services/chaos`, `sdk/rust/src/service_context.rs`, `scripts/selfcheck.gsh`. Two auditors. Every finding
+traced before recording; anything without a concrete failure scenario was discarded.
+
+**Clean across the board:** no `unsafe` in any service (§18.2), no heap / `alloc` / `Vec` / `Box`
+(§26.6.1), no global mutable state (§3.9 - all new per-mount state is `Cell` on the owned `Fs`), no
+hand-rolled number formatting, no em/en dashes (§21), no mutual blocking sends (§8.9).
+
+**The journal commit-record layout was traced byte-for-byte on both the write and the recovery path and
+they AGREE - no off-by-one.** `n <= TXN_CAP(56)` is enforced at stage time so the write path can never
+exceed the recovery guard; a torn commit record is a torn sector and fails the header CRC; the payload
+CRC is verified **before any home block is overwritten**. The design is right. The findings below are
+about what happens after it says no.
+
+### FIXED in this audit
+
+| ID | Finding |
+|----|---------|
+| **U7-1 (HIGH)** | The four USB-disk SDK wrappers passed a **u64 LBA through a 32-bit syscall register**, silently truncating it. See kernel Audit 8 / A8-1 - fixed in the wrapper per hazard A-U1, with the false "the ONE exception" comment in `syscall.rs` corrected. |
+| **U7-2 (HIGH)** | `block-driver` matched the literal `-2` for BUSY, which is also `CapNotHeld`. See A8-2 - now matches the named `USB_DISK_BUSY`. |
+
+### OPEN - recorded, not yet fixed
+
+**`fs`, after the journal says no** (the recovery-of-the-recovery gap):
+
+- **U7-3 (HIGH).** A failed journal recovery is **silently erased by the next write**. `recover`'s return
+  value is discarded, so on a payload mismatch `fs` mounts read/write, logs "will be re-verified on the
+  next mount", and the first `commit_txn` overwrites the very record and staged blocks it retained. The
+  promised re-verification never happens; the next mount looks clean over a half-applied tree. §26.7 /
+  Commandment V - a failed recovery becoming a silent success one transaction later. Fix: return a status
+  and mount **read-only** (the `read_only` field already exists and already gates every mutating op)
+  until `drives check` clears it.
+- **U7-4 (HIGH).** `recover` returns **silently** when it cannot read the commit record - asymmetric with
+  the staged-block read failure added in the same commit, which does log. This is the likelier failure on
+  the very device the work targets. `recover` is a static `fn` with no `&self`, so it also cannot set
+  `io_error_seen`: the new re-mount machinery is blind to exactly this failure.
+- **U7-5 (MED).** The io-error re-mount **abandons open file caps without revoking them**. The kernel-side
+  delegated resources stay alive, so a client's still-valid file cap is answered `FS_NOTFOUND` - a lie
+  ("your file is gone" vs "I dropped your handle") - and the 2048-entry band leaks across re-mounts until
+  every `Open` fails. §14.3 applied to geometry but not to handles.
+- **U7-6 (MED).** The re-mount degrade path conflates "unreadable device" with "no filesystem": the boot
+  mount distinguishes `E_IO` from every other error, the re-mount arm sets `storage_unreadable` for all.
+  A superblock CRC failure therefore reports "data may be intact; awaiting storage recovery" about a
+  filesystem whose only remedy is a reformat - and the shell deliberately withholds the `drives flash`
+  advice for that code.
+- **U7-7 (MED).** `capacity` is the one cached fact the io-error re-mount does **not** refresh (the
+  sibling recovery path does). Swap in a smaller stick during an outage and `drives flash` formats past
+  the end of the device. Commandment III / §14.3 - the same justification the commit gives for dropping
+  cached geometry, unapplied to the cached geometry living outside `Fs`.
+- **U7-8 (LOW).** The `io_error_seen` funnel is incomplete: journal invalidation, `drives reset`, and
+  `block_write_zeros` in format/check bypass `note_io_error`, so a device error there does not arm the
+  re-mount built for it.
+
+**`block-driver`:**
+
+- **U7-9 (MED).** `BUSY_RETRIES` is bounded per block, but `OP_WRITE_ZEROS` multiplies it by a
+  caller-supplied `count` bounded nowhere. `drives flash` zeroes ~16k bitmap blocks in **one** request; at
+  30 s worst case per block a busy stick puts the serve loop inside a single request for hours, with `fs`
+  blocked in `block_rpc` and the shell hung with no output and no abort. §26.6 - the bound must be on the
+  operation, not just one block.
+- **U7-10 (LOW).** The contract's `[placement] core = 1` is false on ARM (the kernel forces core 0, which
+  the driver's own header requires). §13.2/§9.2 say a named core is enforced intent; document it in the
+  existing ARM NOTE.
+
+**`chaos` (the frozen-clock class - the range fixed its effect on the loops, not on everything else):**
+
+- **U7-11 (MED).** With no RTC the PRNG seeds to a **constant**, so `chaos max-carnage random N` picks the
+  identical victims in the identical order on every run, every boot - while the panel and docs claim a
+  fresh random storm. A thousand runs explore one kill ordering. Fix: seed from `ctx.hw_random()` (already
+  wired) or `epoch_secs_monotonic()`.
+- **U7-12 (MED, PLAUSIBLE).** The handoff escape is bounded but its bound costs minutes (200k iterations x
+  a 256-syscall scan), so in practice it is close to the wedge it replaced. One-word fix:
+  `epoch_secs_monotonic()` instead of `datetime().epoch_secs()` - it **does** advance on ARM, which also
+  fixes U7-13 and the `ARGWAIT` loop.
+- **U7-13 (LOW).** Panel elapsed/ETA/"started" render as plausible numbers on a dead clock (`elapsed 0s`
+  for a 40-minute run) rather than announcing themselves.
+- **U7-14 (LOW).** The end-of-run `mem-pressure` reap is silent when it gives up, unlike the startup reap
+  200 lines above which logs its count.
+
+**`selfcheck.gsh`: re-runnability verified correct.** All script-created state is cleaned at both ends;
+`write` truncates so leftovers cannot change behaviour; `Vars` is per-run so re-declaration cannot fail;
+the `delete` sits inside the tallied block (loud) while the existence probe sits in the untallied
+condition (correct). One residue: `cd` mutates the session CWD, so a run aborted mid-script leaves it
+inside `/sc`, which the next run deletes. Inert today (every earlier statement uses absolute paths), one
+relative path away from a phantom failure - consider `cd /` beside the cleanup.
+
+- **U7-15 (LOW).** `if ls /sc` prints `ls: not a directory: /sc` on every clean run (conditions run with
+  console output), so the transcript still carries two lines that read like failures - the tally is
+  correct, the appearance is not.

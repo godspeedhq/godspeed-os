@@ -28,6 +28,18 @@ pub struct Message {
     /// is the cap right the kernel validated for this invocation (the owner enforces op ≤ right).
     pub badge_id: u64,
     pub badge_right: u8,
+    /// The PRIMARY endpoint id of the task that SENT this message, stamped by the kernel's syscall
+    /// send paths (`0` = kernel-generated or unstamped). This is what lets a blocked `Call` take only
+    /// its actual REPLY from the caller's queue: the reply's sender is the task that owns the endpoint
+    /// the request was sent to, so `call_dequeue` matches `sender_ep == target` and leaves every other
+    /// message (an unrelated client's request, a stale reply from a dead incarnation - whose endpoint
+    /// id differs) queued for the ordinary recv loop. Before this existed, `call` returned whatever
+    /// message reached the queue head first: observed on hardware as `fs` receiving a shell REQUEST as
+    /// block-driver's read "reply" ("MALFORMED reply (3 bytes, first 14) - protocol desync"), and -
+    /// the undetectable case - a stale 513-byte read-reply accepted as a DIFFERENT block's data, which
+    /// is how a healthy root record repeatedly "failed its CRC". Kernel-internal: never crosses to
+    /// userspace (the SDK sees payload + badge only), so no ABI change.
+    pub sender_ep: u64,
 }
 
 impl core::fmt::Debug for Message {
@@ -48,6 +60,7 @@ impl Message {
             cap_count: 0,
             badge_id: 0,
             badge_right: 0,
+            sender_ep: 0,
         };
         msg.payload[..payload.len()].copy_from_slice(payload);
         Ok(msg)
@@ -69,6 +82,7 @@ impl Message {
             cap_count:   0,
             badge_id:    0,
             badge_right: 0,
+            sender_ep:   0,   // kernel-generated: no sending task, never matches a Call's replier
         };
         msg.payload[0] = irq;
         msg

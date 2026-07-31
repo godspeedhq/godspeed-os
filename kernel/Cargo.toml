@@ -41,6 +41,41 @@ proptest = "1"
 panic = "abort"
 
 [features]
+# Run the minimal ARM logger spawn at boot (arch/arm/spawn.rs). Off by default: the spawn currently
+# reaches PL0 and issues real syscalls, but the kernel's cap-table spinlock (LDREX/STREX) does not yet
+# work under the service's dual-mapped address space, so the boot would block. Gated so the default
+# image boots clean while the spawn is exercised + iterated on with this feature.
+arm-spawn-logger = []
+# Run the neutral scheduler over 3 cooperative kernel tasks on ARM (arch/arm/sched_demo.rs).
+arm-sched-demo = []
+# Run a real USER service (the logger) THROUGH the neutral scheduler on ARM, preemptively, alongside
+# spinning kernel tasks (arch/arm/sched_user.rs). Proves per-task address spaces + user-mode preemption.
+arm-sched-user = []
+# Run TWO USER services under the scheduler at once (arch/arm/sched_ipc.rs). Proves the banked-register
+# trap frame (SP_usr/LR_usr per task) and is the base the real IPC send/recv proof grows on.
+arm-sched-ipc = []
+# Spawn a service (logger) through the NEUTRAL spawn path on ARM (arch/arm/sched_spawn.rs). Proves
+# task::spawn_service_with_config - the machinery the supervisor's spawn syscall uses - works on ARM.
+arm-sched-spawn = []
+# The real OS bootstrap: kernel spawns the SUPERVISOR, which spawns the services (arch/arm/sched_supervisor.rs).
+arm-supervisor = []
+# The interactive shell on ARM: gsh> prompt reading serial input (arch/arm/sched_shell.rs).
+arm-shell = []
+# Hands-off chaos demo: a few seconds after boot the kernel INJECTS `chaos max-carnage all-services 10`
+# (+ confirm) into the input ring, so a serial-output-only setup (no keyboard) still runs + shows the
+# storm. Build with `arm-supervisor,arm-autochaos`.
+arm-autochaos = []
+# Target QEMU's raspi2b emulation rather than real Pi 2 hardware. Currently only changes the DWC2 USB
+# DMA bus-address translation: QEMU's emulated DWC2 addresses ARM system RAM directly (identity), while
+# real BCM2836 silicon sees RAM through the VideoCore uncached alias 0xC000_0000 (arch/arm/dwc2.rs).
+# OFF by default so the shipped image is hardware-correct; scripts/arm_run.py passes it for emulation.
+qemu = []
+
+# Deliberately take a data abort during arm32 boot, to PROVE the exception vectors
+# fire (a fault path never observed firing is not evidence). The ARM twin of the x86
+# adversarial fault tests (§22 A14/A15/C2). Never enabled in a normal boot.
+arm-fault-test = []
+
 # Build the kernel with a deliberately invalid SUPERVISOR ELF to trigger the TCB
 # failure path when the kernel spawns the supervisor directly (§6.2, §22 Test 1B).
 # Only used by `osdev test identity`.

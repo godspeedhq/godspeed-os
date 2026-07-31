@@ -6,7 +6,11 @@
 # Covers every shell utility's main functions + negative cases, EXCEPT:
 #   - observe : it is a live full-screen view (only `observe now` is a snapshot; tested).
 #   - drives  : flashing/relabel/reset touch disks and prompt y/N - not scriptable.
-# Re-runnable: everything is created under /sc and deleted at the end.
+# Re-runnable: everything is created under /sc, removed at the START of the run, and deleted again at
+# the end. Cleaning only at the end is not re-runnable - it assumes the previous run REACHED its end.
+# A run that was aborted, wedged, or killed leaves /sc populated, and the next run then fails setup
+# assertions that only hold on a clean tree ("assert fails mkdir /sc", "assert fails read /sc/b.txt"),
+# reporting phantom failures that look like product bugs. Observed three times before it was fixed.
 #
 # Rules this suite obeys (so it self-grades correctly):
 #   - `assert ok|fails|fails-with <cmd>` is the RESULT form - only for NON-piped commands
@@ -27,6 +31,7 @@
 
 echo ''
 echo '#################### gsh LANGUAGE TOUR ####################'
+if ls /tour { delete /tour recursive }    # an aborted run leaves it behind; mkdir would then fail
 mkdir /tour                              # a scratch directory for the tour's files
 
 echo ''
@@ -281,6 +286,14 @@ assert fails restart nosuchservice
 # ===== files: create / read / overwrite / append / empty / quoted =====
 echo ''
 echo '===== files: create / read / overwrite / append / empty / quoted ====='
+# Start from a known-empty tree, whatever the previous run did or did not finish.
+#
+# As an `if` CONDITION, not a bare statement. A bare `delete /sc recursive` fails on a clean tree
+# (there is nothing to delete) and the runner counts every failing statement - so the line added to
+# make the suite re-runnable was itself the one failure in every otherwise-perfect run: 350/1 four
+# times over, caused by the cleanup rather than anything under test. A condition is evaluated for its
+# truth and never tallied, which is exactly the semantics wanted here: delete it IF it is there.
+if ls /sc { delete /sc recursive }
 mkdir /sc
 assert ok ls /sc
 assert fails mkdir /sc

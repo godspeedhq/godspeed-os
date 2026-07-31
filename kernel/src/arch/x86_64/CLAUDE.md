@@ -21,12 +21,30 @@ These functions in `arch::x86_64` expose hardware operations as a safe API. If y
 |------------------------------|---------------|
 | `disable_interrupts()`       | `cli` |
 | `enable_interrupts()`        | `sti` |
-| `wait_for_interrupt()`       | `sti` only - no C-state hint; avoids Goldmont+ APIC power-gate from both `hlt` and `pause` |
+| `wait_for_interrupt()`       | **Two behaviours, chosen at boot by `IDLE_CAN_HALT`:** `sti; hlt` where a halted core is guaranteed to wake (AMD, or ARAT in periodic mode), else `sti` only - no C-state hint, because on Goldmont+ both `hlt` and `pause` let firmware power-gate the LAPIC and drop ticks/IPIs. **A caller must arm a wake before it halts** - see below. |
 | `validate_user_ptr(ptr, len)`| Range check: ptr..ptr+len must be below `USER_END` (0x0000_8000_0000_0000) |
 | `read_user_bytes(ptr, len)`  | Validated `from_raw_parts` into user VA |
 | `write_user_bytes(dst, src)` | Validated `copy_nonoverlapping` to user VA |
 | `read_cycle_counter()`       | `RDTSC` |
 | `com2_init()`                | COM2 UART init (control channel for test harness) |
+
+## The idle contract: never halt without a freshly armed wake
+
+In **TSC-Deadline** mode the LAPIC timer is **one-shot** - software re-arms it on every tick. A core that
+halts is therefore relying on a deadline already in flight, and if that deadline has been consumed the
+core never wakes again. The scheduler's idle path must arm one first:
+
+- an **AP** arms the long idle deadline (`rearm_idle_timer`, ~1 s - deliberately under the liveness
+  watchdog's ~3 s threshold so an idle core still stamps `CORE_LAST_TICK_TSC` and reads as alive);
+- the **BSP** arms the normal quantum (`rearm_quantum_timer`), because it must keep driving
+  `MONOTONIC_TICKS`, `scan_timed_wakes` and the COM polling at ~100 Hz and so cannot slow down.
+
+This was found the hard way (2026-07-31): the BSP was excluded from the idle re-arm and then allowed to
+`hlt` anyway, so on the AMD T630 it halted onto a consumed deadline and the liveness watchdog panicked
+with `core 0 made NO progress ... slot 224` (224 = `IDLE`) ~5 s after boot. It had been latent for the
+life of the port, invisible only because userspace spin-yielded and the BSP never actually reached idle.
+
+**Periodic mode needs none of this** - the hardware auto-reloads, so a halted core keeps being woken.
 
 ## Boot protocol: Limine
 

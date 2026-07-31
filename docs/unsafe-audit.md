@@ -13,6 +13,285 @@ comment.
 
 ---
 
+## 2026-07-29 - LAN9514 networking: interrupt-driven RX, PHY link state, SNTP (feat/arm-usb-interrupt)
+
+The Pi 2's onboard LAN9514 brought up on real hardware, then reworked from a polled RX to an
+**interrupt-driven** one (ping loss 85% -> 4%), plus a real PHY link read and the SNTP wall clock. All in
+the permitted `arch/` layer; every block SAFETY-commented, all of it core-0 + IRQ-masked driver state
+(the RX ring, the reassembly buffer, the DMA burst buffer) or MMIO through the existing `rd`/`wr` helpers.
+
+The RX path's blocks are the bulk of it: a single-producer/single-consumer ring (`net_rx_ring_push`,
+`net_rx_ring_pop`), the cross-burst reassembly buffer (`net_rx_parse`, `net_rx_partial_reset`), arming and
+re-arming the background bulk-IN (`net_rx_async_arm`, `net_rx_async_start`, `net_rx_isr`), and the
+consumer syscall (`net_frame_rx`), plus `net_rx_ring_full` - the backpressure test that stops the ISR
+re-arming into a full ring (receiving frames only to drop them is work done for nothing), and
+`hotplug_poll` - the hub-port watcher (present but deliberately NOT wired to a caller; see the note at the
+idle hook in `arch/arm/mod.rs` for why enumeration cannot run there yet).
+Producer and consumer are mutually exclusive without a lock because
+both run on core 0 with IRQs masked - the syscall path cannot park, and ARM IRQ entry masks IRQs - which
+is the argument each SAFETY comment carries.
+
+This entry also **re-baselines two files whose drift predates this work**: `irq.rs` and `mod.rs` are
+untouched by these commits (verified: identical counts at the branch point) and had accumulated
+undocumented blocks from the earlier USB/SD bring-up on this branch. They are recorded here so the
+inventory matches source again rather than carrying a known-stale baseline forward.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/dwc2.rs` | 14 -> 34 (+20) | Interrupt-driven net RX (ring push/pop, burst parse + reassembly, partial reset, background arm/re-arm, the halt ISR, the consumer syscall), the net-up arm sites, and the PHY link poll's read of `ASYNC_BULK.active` (the guard that keeps a link poll from destroying a parked storage transfer). The +1 over the earlier 33 is the SAME guard read in `link_poll`, the idle-context twin of that poll (a cable change now reports itself without being asked). |
+| `arch/arm/irq.rs` | 11 -> 13 (+2) | **Pre-existing drift, re-baselined:** blocks added by earlier branch work (USB IRQ routing/ack), not by the networking commits. |
+| `arch/arm/mod.rs` | 43 -> 44 (+1) | **Pre-existing drift, re-baselined:** one block from earlier branch work. |
+
+## 2026-07-24 - SD card bring-up on real hardware: mailbox power + base clock + pin routing (feat/pi2-arm32)
+
+The Pi 2's SD card init failed on hardware while passing under emulation. Three board-level steps the
+Arasan EMMC needs, none of which the driver can do itself (it is granted only its controller's 4 KiB
+register window - §12.3), so they live in the kernel's boot path like the USB power-on before them:
+
+- **`video::set_sd_power_on`** - mailbox `SET_POWER_STATE` device 0 (SD card). The EMMC's registers
+  answer even when the card's power domain is off, so skipping it gives exactly the observed symptom:
+  registers read fine, no command completes. QEMU stubs the tag, so it is invisible there.
+- **`video::read_emmc_clock` / `emmc_clock_hz`** - mailbox `GET_CLOCK_RATE` clock id 1. The base clock
+  MUST come from the platform: the Arasan's capability register reports it wrongly on this SoC (Linux
+  marks it `missing_caps`), and a guessed divider runs the card's identification clock at the wrong
+  speed, which no card answers.
+- **`sd_route_to_emmc`** (mod.rs) - route GPIO 48-53 to ALT3 (the Arasan) with the BCM2835 pull-up
+  sequence, and log what the firmware had them set to first (ALT0 = the other `sdhost` controller,
+  which would leave the Arasan electrically disconnected from the card).
+
+All in the permitted `arch/` layer, each block SAFETY-commented, all single-threaded boot-path MMIO or
+the caches-off mailbox buffer.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/video.rs` | 11 -> 17 (+6) | `set_sd_power_on` (MBOX fill + response read, +2), `read_emmc_clock` (MBOX fill + response read + `EMMC_CLOCK_HZ` store, +3), `emmc_clock_hz` (static read, +1). |
+| `arch/arm/mod.rs` | 42 -> 43 (+1) | `sd_route_to_emmc` - GPFSEL4/5 read-back + ALT3 write and the GPPUD/GPPUDCLK1 pull sequence for GPIO 48-53. |
+
+## 2026-07-24 - underline cursor on the ARM framebuffer console (feat/pi2-arm32)
+
+The TV console had no visible cursor (x86 draws an underline; ARM did not). `fbcon` now paints a 2 px
+underline at the write position, lifts it before the position moves, and honours `ESC[?25l`/`ESC[?25h`
+so full-screen apps can hide it. The cursor is moved ONCE per write run rather than once per byte, so
+bulk output (a `help` listing, a scroll) does not pay for it - which is why `put_bytes` gained its own
+`unsafe` block instead of looping over the public `put_byte`: one borrow of the `FBCON` static for the
+whole run. `arch/arm/fbcon.rs` unsafe 4 -> 5 (+1), permitted arch layer, SAFETY-commented, same
+single-writer justification as the existing blocks (serialized by `pl011_write`'s SERIAL_BUSY guard).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/fbcon.rs` | 4 -> 5 (+1) | `put_bytes` borrows the `FBCON` static once for a whole run (lift cursor, render every byte, repaint cursor) instead of re-borrowing per byte via `put_byte`. |
+
+### `console_boot_complete` on ARM (2026-07-26)
+
+The shell calls `console_boot_complete()` to dismiss the boot screen and stop mirroring kernel log
+output to the TV, so the prompt is not overwritten by a late service log (`fs: journal recovered ...`
+landing on the `gsh> ` line - the reason the prompt appeared only after pressing Enter). x86 has always
+implemented it; ARM's was an empty stub. Implementing it needs one borrow of the `FBCON` static to
+clear the screen and home the cursor.
+
+| File | unsafe | Why |
+|------|--------|-----|
+| `arch/arm/fbcon.rs` | 5 -> 6 (+1) | `clear_and_home` borrows the `FBCON` static once to clear the framebuffer and reset cursor/write position. Same single-owner discipline as `put_bytes`: core 0 holds `SERIAL_BUSY` when the console writes, and the function returns immediately when no framebuffer was mapped (`base == 0`). Permitted arch layer (§18.1), SAFETY-commented. |
+
+## 2026-07-24 - full ARM keyboard decode: new `arch/arm/hid.rs`, and dwc2 unsafe SHRINKS (feat/pi2-arm32)
+
+Full HID boot-keyboard support for the ARM in-kernel USB driver (numeric keypad, arrows/navigation,
+F-keys, Caps Lock latch, Ctrl+letter, typematic auto-repeat) moved into a new **`arch/arm/hid.rs`
+containing ZERO `unsafe`** - it is pure decode logic (usage code -> bytes), no MMIO and no statics.
+The driver's old `decode_report` + its `PREV_KEYS` `unsafe` block are gone, replaced by a single
+`KBD_STATE` struct accessed inside `poll`'s ALREADY-EXISTING `unsafe` block, so `dwc2.rs`
+**shrinks 15 -> 14**. A new file with no unsafe and a net reduction in the driver.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/hid.rs` | new, 0 | Pure HID decode logic (keymap, CSI sequences, auto-repeat timing). No `unsafe`: no MMIO, no statics - the caller owns the state and passes it in. |
+| `arch/arm/dwc2.rs` | 15 -> 14 (-1) | `decode_report`'s `PREV_KEYS` block removed; the keyboard state (`KBD_STATE`) is now read inside `poll`'s existing `unsafe` block instead of a second one. |
+
+## 2026-07-24 - DWC2 split debug + VideoCore USB power-on + board MAC (feat/pi2-arm32)
+
+Two `arch/arm/` files gained `unsafe` this session; all blocks are in the permitted arch layer (§18.1),
+each carries a `// SAFETY:` comment, and each is single-threaded (core-0-only) hardware access.
+
+- **`dwc2.rs` 13 -> 15 (+2):** the split-transaction microframe **trace** added while diagnosing the
+  low-speed-keyboard split XactErr. `trace_split` captures `(phase, HFNUM, HCINT, GNPTXSTS, GINTSTS)` into
+  a fixed `SPLIT_TRACE` array (write), and the one-shot split-fail dump reads it back (read). Both are a
+  bounded fixed array indexed `< SPLIT_TRACE_MAX`, single-writer on core 0. (The HubAddr/PrtAddr fix, the
+  multi-packet split loop, the toggle-parity fix, and the driver-review fixes are all **safe** code -
+  `rd`/`wr`/atomics - and added no `unsafe`.)
+- **`video.rs` 6 -> 11 (+5):** `set_usb_power_on` (the VideoCore `SET_POWER_STATE` mailbox call that
+  powers the DWC2 AXI master - the breakthrough that made USB work on real silicon) is one MBOX-fill
+  block; `read_board_mac` is three (MBOX fill, MBOX response read, and the `BOARD_MAC` static **write** -
+  a plain pre-MMU store, NOT an atomic, because ARMv7 `STREXD` is UNPREDICTABLE before the MMU is on);
+  `board_mac` is one (the `BOARD_MAC` static read). These read the board Ethernet MAC (`GET_BOARD_MAC`,
+  tag 0x00010003) since the Pi 2 has no EEPROM.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/dwc2.rs` | 13 -> 15 (+2) | `SPLIT_TRACE` fixed-array capture (`trace_split` write + split-fail dump read) for the low-speed-keyboard split diagnosis. |
+| `arch/arm/video.rs` | 6 -> 11 (+5) | `set_usb_power_on` (USB-HCD power mailbox, +1); `read_board_mac` (MBOX fill + read + `BOARD_MAC` pre-MMU store, +3); `board_mac` (`BOARD_MAC` read, +1). |
+
+## 2026-07-23 - BCM2835 GPIO (feat/pi2-arm32)
+
+Added `gpio_op(op, pin)` - drive a SoC GPIO pin's direction/level/read (BCM2835 GPFSEL/GPSET/GPCLR/GPLEV in
+the already-Device-mapped peripheral window). Exposed via a new **capability-gated** `Gpio` syscall (45),
+GPIO carries the UART/SD lines so it is granted only to the `shell` (GPIO_DEVICE cap, id 11), with a `gpio`
+shell command (`gpio <input|output|high|low|read> <pin>`). QEMU-verified: drive pin 21 high -> read 1, low
+-> read 0. `arch/arm/mod.rs` unsafe 41 -> 42 (+1, one SAFETY-commented block of GPIO MMIO). Other arches
+stub `gpio_op` to `-1` (no unsafe).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 41 -> 42 (+1) | `gpio_op` drives the BCM2835 GPIO (GPFSEL/GPSET/GPCLR/GPLEV MMIO). |
+
+## 2026-07-23 - BCM2835 hardware RNG (feat/pi2-arm32)
+
+Added a hardware entropy source: `hw_random()` reads the BCM2835 SoC RNG (one-time enable + bounded wait
+for a word, then read `RNG_DATA`) in the already-Device-mapped peripheral window. Exposed ungated as
+InspectKernel query 19 (entropy confers no authority, like the raw TSC) with a `random` shell utility as
+its consumer. QEMU-verified (`random 3` returns three distinct u32s). `arch/arm/mod.rs` unsafe 40 -> 41
+(+1, one SAFETY-commented block of RNG MMIO). The other arches stub `hw_random` to `None` (no unsafe; x86
+RDRAND is a trivial follow-up).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 40 -> 41 (+1) | `hw_random` reads the BCM2835 RNG (RNG_CTRL/STATUS/DATA MMIO). |
+
+## 2026-07-23 - BCM2835 watchdog reset (feat/pi2-arm32)
+
+`hardware_reset()` on ARM was a stub that spun, so the shell `reboot` (and Ctrl+Alt+Del) hung the Pi 2
+instead of resetting it. Implemented the BCM2835 power-management watchdog reset: one `unsafe` block of
+volatile 32-bit writes to `PM_WDOG`/`PM_RSTC` in the already-Device-mapped peripheral window, gated by the
+`0x5A` password (the documented reset poke). QEMU-verified (a `reboot` re-runs the kernel from its boot
+banner). `arch/arm/mod.rs` unsafe 39 -> 40 (+1), permitted arch layer, SAFETY-commented.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 39 -> 40 (+1) | `hardware_reset` does the BCM2835 PM watchdog reset (PM_WDOG/PM_RSTC MMIO writes). |
+
+## 2026-07-23 - Soundness audit of the DWC2 USB unsafe (feat/pi2-arm32)
+
+The session took `arch/arm/dwc2.rs` from 3 to 13 `unsafe` blocks (the whole USB stack: DMA control/bulk
+transfers, cache maintenance, the keyboard/net/storage device paths) plus 3 SDK ABI wrappers
+(`net_frame_tx`/`rx`/`info`). Audited all of them - a self-review plus an **independent adversarial pass**
+(a second reviewer briefed to find UB, checked against the actual concurrency machinery: `arm_irq_dispatch`,
+`stub_svc`, `NEUTRAL_SCHED` boot ordering, `uart_rx_poll`). **Verdict: no memory-safety bug (UB / OOB /
+data race).** The load-bearing facts, each verified against code not comments:
+
+- **`&mut *addr_of_mut!(DMA)` never overlaps.** The three accessors (`ctrl_xfer`/`bulk_xfer`/`poll`) are all
+  **core-0 only** (MPIDR gate on `poll`'s call site + `on_core0()` on the net syscalls) and **mutually
+  exclusive in time**: `poll` runs from the timer IRQ; the net syscalls run IRQs-masked (SVC `cpsid i`) and
+  **never block**, so the timer cannot fire mid-transfer. During *boot enumeration* `poll` is unreachable -
+  `arm_irq_dispatch` routes the tick to the demo scheduler until `NEUTRAL_SCHED` flips *after* `dwc2::init`
+  (this closes the one real-looking race: the hub walk keeps issuing `ctrl_xfer`s after `KBD_READY`/
+  `NET_READY` are set mid-walk). This invariant is now documented at the `DMA` static.
+- **Device-controlled lengths are all bounded before a copy** (`bulk_xfer` HCTSIZ residual only *shrinks*
+  `recv`; `net_frame_rx` smsc `flen` hard-checked `4 + flen > got`; every descriptor-parse loop guards
+  `i + k <= total`). No transfer exceeds the 2048-byte scratch buffer. No `MPS0 == 0` div-by-zero.
+- **`NET_MAC` / `PREV_KEYS` statics** are boot-single-writer (Release) / core-0-single-accessor; `net_info`
+  reads `NET_MAC` after an Acquire on `NET_READY`. **SDK wrappers** pass a 32-bit pointer + length <= 1600
+  (no ABI truncation) and the kernel range-checks every user pointer.
+
+**Two latent robustness gaps hardened (P1/P2, neither reachable by any current caller or device input):**
+`ctrl_xfer`'s OUT path could panic (`&data[..n]` with `n = dlen.min(2048)`, not `.min(data.len())`) and
+programmed the DMA length unclamped to the scratch buffer. Both now clamp to `min(d.data.len(), data.len())`
+- symmetric with `bulk_xfer` - so a future caller with `dlen > data.len()` can neither panic nor DMA past
+the buffer. No new `unsafe` (edits to an existing block + comments); `dwc2.rs` stays at **13**. One liveness
+(not safety) note recorded: a wedged controller spins the core IRQs-off for the bounded `wait_halt` timeout.
+
+## 2026-07-23 - DWC2 USB keyboard: DMA mode + hub enumeration + HID poll (feat/pi2-arm32)
+
+The slave/PIO experiment (entry below) got control transfers working on QEMU's DWC2 model *only for the
+SETUP stage*: QEMU emulates the DWC2 **DMA** engine, not slave/PIO, so DATA-IN never delivered bytes.
+Reverted enumeration to **internal DMA mode** - which is also how u-boot/Linux drive the Pi 2 core - and
+completed the keyboard: point `HCDMA` at the `DMA` scratch static, bracket every transfer with cache
+maintenance (`flush_dcache`, DCCIMVAC + `dsb`, the A7's DMA is not coherent), enumerate the hub the
+keyboard sits behind (the Pi 2's LAN9514 topology, and QEMU's NEC-hub model), select boot protocol, and
+poll the interrupt IN endpoint from the timer tick (`poll` -> `decode_report` -> `console_push_byte`).
+QEMU-verified end to end: keys typed on the emulated `usb-kbd` reach the shell. The DMA buffer address is
+the VideoCore bus alias `0xC000_0000 | phys` on real hardware and identity (`0`) under QEMU, selected by
+the new `qemu` cargo feature (`scripts/arm_build.py --qemu`); the shipped image stays hardware-correct.
+
+So `dwc2.rs` unsafe returns to **3 -> 8**: the DMA path is back (`flush_dcache`'s 2 asm blocks + the
+`DMA`-static access in `ctrl_xfer` and `poll`), plus one `PREV_KEYS`-static access in `decode_report` (the
+edge-trigger previous-report buffer, reached via `addr_of_mut` to avoid a mutable-static reference). All
+in permitted `arch/`; every block carries a SAFETY comment.
+
+**Bulk transfers (+1 -> 9):** the same session added `bulk_xfer` (the USB bulk-transfer primitive, the
+shared foundation for USB mass storage and later USB-Ethernet), which accesses the `DMA` scratch static
+the same way `ctrl_xfer`/`poll` do (`addr_of_mut`, core-0 only, cache-bracketed). Verified in QEMU end to
+end against `usb-storage` (READ CAPACITY + READ(10) of a planted block-0 signature). The BOT/SCSI layer on
+top of it (`bot_command`, `probe_mass_storage`) is all safe code. So `dwc2.rs` is **9**.
+
+**CDC-ECM USB-Ethernet (+1 -> 10):** the same session added a CDC-ECM driver (`configure_cdc_ecm` +
+`net_verify_arp`) - raw ethernet frames over the bulk endpoints, verified in QEMU by an ARP round-trip
+through `usb-net`. The one added `unsafe` is a single write of the station MAC into the `NET_MAC` static
+(`addr_of_mut`, core-0 enumeration only); the MAC is otherwise passed as a local, and the frame build +
+BOT/SCSI code is all safe. So `dwc2.rs` is **10**.
+
+**USB-net bridge to userspace (+2 -> 12):** the same session added the mechanism the userspace ARM
+`nic-driver` calls (`net_frame_tx`/`net_frame_rx`/`net_info`, syscalls 42-44) to move ethernet frames to
+the in-kernel CDC-ECM device. Two added `unsafe`: `on_core0` reads MPIDR (`mrc`, side-effect-free) to
+guard the single-channel DWC2 against off-core access; `net_info` reads the `NET_MAC` static
+(`addr_of`, read-only). Both in permitted `arch/`. So `dwc2.rs` is **12**. (`net_verify_arp` was
+removed - net-stack now drives networking end to end.)
+
+**Multi-device USB + smsc95xx (+1 -> 13):** the same session made keyboard/ethernet/storage coexist (per-
+device channel selection, all safe) and added the `smsc95xx` (Pi 2 LAN9514) driver. The one added `unsafe`
+is a second `NET_MAC`-static write (in `configure_smsc95xx`, core-0 enumeration only) - the register R/W,
+PHY/MDIO, and TX/RX-framing code is all safe. So `dwc2.rs` is **13**.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/dwc2.rs` | 3 -> 13 (+10) | DMA reinstated (`flush_dcache` +2, `DMA`-static in `ctrl_xfer`/`poll`/`bulk_xfer` +3, `PREV_KEYS`-static +1, `NET_MAC`-static write +1), USB-net bridge (`on_core0` MPIDR read +1, `NET_MAC`-static read in `net_info` +1), smsc95xx (`NET_MAC`-static write in `configure_smsc95xx` +1). Slave-mode FIFO code (all safe `rd`/`wr`) removed. |
+| `arch/arm/dwc2.rs` | 13 -> 15 (+2) | Slave/PIO pivot for the real Pi 2 v2.80a core (the internal DMA master never dispatches; `qemu`-gated, DMA kept for QEMU). `pio_out` reads the DMA scratch via a raw ptr to push into the TX FIFO (+1); `pio_in` writes it via a raw ptr while draining the RX FIFO (+1). Both are the identity-mapped scratch, bounded by `len` (SAFETY-commented). Higher layers (`ctrl_xfer`/`bulk_xfer`) unchanged. |
+| `arch/arm/dwc2.rs` | 15 -> 13 (-2) | PIO pivot reverted for the full u-boot DMA transcription (back to DMA on both platforms, u-boot's exact config): `pio_out`/`pio_in`/`slave_wait_halt` removed, so the two raw-ptr FIFO blocks are gone. Back to the DMA-scratch access already counted. |
+
+---
+
+## 2026-07-23 - DWC2 control transfers via slave/PIO mode (feat/pi2-arm32)
+
+The DWC2's internal DMA master never initiated a transfer on the Pi 2: across a dozen HW tests the channel
+armed (ChEna set), the host framed (HFNUM advanced) and every config register read correct, yet
+`GRSTCTL.AHBIdle` stayed 1 and `HCDMA` never advanced. Switched enumeration to **slave / PIO mode** - the
+mode every working bare-metal Pi USB driver uses: DMA disabled (`GAHBCFG.DmaEn=0`), OUT data pushed
+word-by-word into the NP TX FIFO and IN data popped from the RX FIFO after `GRXSTSP`, no bus-mastering.
+This **removed** the DMA scratch static, the `flush_dcache` cache-coherency bracket, and the tick-driven
+state machine, so `dwc2.rs` unsafe **shrank 8 -> 3** (only the `rd`/`wr` Device-MMIO accessors + the `nop`
+`spin` remain; the slave-mode transfer code is all safe `rd`/`wr`). Enumeration is now synchronous (a
+one-time bounded boot cost).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/dwc2.rs` | 8 -> 3 (-5) | Slave/PIO rewrite dropped the DMA path: removed `flush_dcache` (DCCIMVAC + `dsb`, -2) and `poll_inner` + the two step handlers' `DMA`-static access (-3). Remaining: `rd`/`wr`/`spin`. |
+
+---
+
+## 2026-07-22 - DWC2 USB host bring-up, increment 1 (feat/pi2-arm32)
+
+The Pi 2's USB is a Synopsys DesignWare USB 2.0 OTG (DWC2) core. `dwc2.rs` brings it up in host mode and
+detects the attached device (the first step toward a USB keyboard): read the Synopsys core ID, soft-reset
+the core, force host mode, power + reset the root port, report the connected device's speed. All new
+unsafe is Device-mapped MMIO (the DWC2 register block is inside the already-Device-mapped peripheral
+window) plus a `nop`-spin, both permitted `arch/`. QEMU (`-M raspi2b,usb=on -device usb-kbd`): core
+GSNPSID=0x4f54294a, device detected + port enabled at full-speed.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/dwc2.rs` | new, 3 -> 8 | `rd`/`wr` (DWC2 Device MMIO 32-bit accessors) + `spin` (`nop` delay) for bring-up; increment 2 adds `flush_dcache` (DCCIMVAC + `dsb` - the DMA cache-coherency bracket, 2) and, in the tick-driven state machine, `poll_inner` + the two step-completion handlers' access to the `DMA` scratch static (identity-mapped physical buffer, 3). |
+| `arch/arm/mod.rs` | 38 -> 39 (+1) | `uart_rx_poll` reads MPIDR to gate the USB `dwc2::poll()` to core 0 (it is the single writer of the DWC2 channel + DMA). |
+
+## 2026-07-22 - ARM serial input works: idle + scheduler-context fixes (feat/pi2-arm32)
+
+The core-0 block-path idle bug (typing did nothing) is fixed. `wait_for_interrupt` was a bare `wfi` that
+never re-enabled IRQs, and the scheduler context was seeded with cr3=0 because the timer preempted the
+bootstrap before `run(0)` seeded it; masking IRQs before arming the neutral scheduler closes that race.
+New unsafe is the `clrex` before the serial-lock acquire (exclusive-monitor hygiene) and the `cpsie i`
+added to the idle `wfi`, both permitted `arch/`.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 36 -> 38 (+2) | `clrex` before the `SERIAL_BUSY` compare-exchange (clear a stale ARMv7 exclusive-monitor that wedged the shell's 2nd console echo); GPIO14/15 -> ALT0 mux in `gpio_init_uart` so serial RECEIVE works, not just transmit. |
+
 ## 2026-07-16 - SEC-21 security fix (feat/hardening)
 
 | File | Change | Why |
@@ -22,6 +301,517 @@ comment.
 SEC-4 (bounds-checking the SDK `Dma`/`Mmio` wrappers) adds **0** to this inventory: the SDK's
 permitted-layer `unsafe` is not tracked here (see the intro), and the change adds only safe `assert!`
 bounds checks, not new `unsafe`. SEC-5 (fs subtree revoke) is `unsafe`-free service code.
+
+## 2026-07-22 - HDMI framebuffer on the Pi 2, Phase 2: text console (feat/pi2-arm32)
+
+`fbcon.rs` renders the serial stream onto the framebuffer (glyphs via the shared `noto-sans-mono-bitmap`
+font), so the boot log + `gsh>` prompt appear on the TV; `pl011_write` mirrors to it under the same
+SERIAL_BUSY guard. New unsafe is the framebuffer pixel writes + the single FBCON static, permitted
+`arch/`. QEMU screendump: text renders (231 distinct colours in the top-left region = antialiased glyphs).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/fbcon.rs` | new, 3 | `put_pixel` (device-mapped framebuffer store), the FBCON static in `init` + `put_byte` - the glyph renderer + cursor. |
+
+## 2026-07-22 - HDMI framebuffer on the Pi 2, Phase 1 (feat/pi2-arm32)
+
+Toward x86-parity local console. The ARM has no Limine to hand it a framebuffer, so `video.rs` asks the
+VideoCore GPU for one via the mailbox property interface, `mmu::map_framebuffer` maps it Device, and a
+solid fill proves the pipeline (QEMU screendump: a clean 1024x768 blue). New unsafe is the MMIO/mailbox
+and framebuffer writes (video.rs) and the live-L1 mapping + TLB flush (mmu.rs), both permitted `arch/`.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/video.rs` | new, 4 | VideoCore mailbox (Device MMIO), framebuffer writes, MBOX static access - the framebuffer acquisition + fill. |
+| `arch/arm/mmu.rs` | 6 -> 8 (+2) | `map_framebuffer`: write the framebuffer's Device sections into the live L1, then clean the D-cache + TLBIALL so the walker sees them. |
+
+## 2026-07-22 - AP bring-up: park a mis-identified core (feat/pi2-arm32)
+
+Real Pi 2: releasing core 3 brought up a core whose MPIDR read back as 0 - it registered as a SECOND
+core 0, two cores ran scheduler::run(0), raced, and one crashed the boot (UNDEF halt). `ap_boot_main`
+now parks any core that finds its own id ALREADY ready (a confused/duplicate release), so the system
+boots reliably on the good cores. +1 unsafe: the `wfi` park loop.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 35 -> 36 (+1) | Park (`wfi`) a released AP whose id is already ready - the mis-identified-core guard. |
+
+## 2026-07-22 - AP bring-up: vectors-first + barrier (feat/pi2-arm32)
+
+On real HW core 3's bring-up intermittently faulted BEFORE it installed its vectors, so with VBAR still 0
+it branched into low memory (an UNDEF at 0x618) and halted the boot. `ap_boot_main` now installs the
+per-core vectors FIRST (before ACTLR.SMP/MMU) so any bring-up fault is REPORTED through the vectors
+instead of wandering, plus a `dsb sy`/`isb` to synchronize with core 0's published boot state (SEC-25/28
+weak-ordering hygiene). +1 unsafe: the barrier block.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 34 -> 35 (+1) | `dsb sy`/`isb` barrier at the top of `ap_boot_main` (weak-ordering sync before an AP relies on core 0's tables/arenas). `install_for_core` moved ahead of the MMU enable so bring-up faults are loud, not wild. |
+
+## 2026-07-22 - ARM frame reclaim on task death (feat/pi2-arm32)
+
+The ARM kill path reclaimed nothing (`reclaim_user_frames` was a `{ 0 }` stub) and the neutral kill path
+`free_frame`d the page-table root - fine on x86 (root = a general frame) but on ARM the root is an ARENA
+L1 slot, so it corrupted the frame bitmap (the `alloc_frame returned kernel-range frame` panic on the
+first respawn). Real reclaim: `reclaim_user_frames` walks the dying task's L1/L2, `free_frame`s its USER
+pages (AP[1:0] >= 0b10; distinguished from shared kernel hole-fill pages) and returns its own L2s to the
+arena; the arenas gained per-slot `used` flags so freed L1/L2 slots are reused (a `free_frame`-of-root
+would still corrupt, so the root goes back to the arena via `free_page_table_root`). QEMU-proven: 15
+logger kill/restart cycles, 0 panic, 0 leak/exhaustion (`freed 76 frames` each, was `freed 0`).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/page_tables.rs` | 25 -> 27 (+2) | `reclaim_user_frames` (walk L1/L2, free USER pages + L2 slots) and `free_page_table_root` (return the L1 root to the arena) - the two `unsafe fn` bodies that free a dead task's memory. `alloc_l1/l2` gained CAS-on-`used` + `free_l1/l2` (safe: atomic store + `addr_of`). |
+| `arch/x86_64/page_tables.rs` | 47 -> 48 (+1) | `free_page_table_root` = `free_frame` (behaviour-identical to the old inline neutral root free), so the neutral kill path can be arch-neutral for both ISAs. |
+
+## 2026-07-22 - Fault-survival on ARM: kill the faulting task, keep the kernel alive (feat/pi2-arm32)
+
+The data/prefetch abort handlers went from report-and-halt to the x86 C2/A14/A15 property: a USER-mode
+(PL0) fault kills just that task and reschedules; a kernel fault still reports and halts. `stub_dabt` /
+`stub_pabt` now branch on the faulting mode (SPSR & 0x1f == 0x10) - no new `unsafe` (asm inside the
+existing naked blocks). The +1 is the `wfi` guard loop in the new `arm_user_fault_kill`, which calls the
+neutral `kill_current()` (sets the task Dead, `yield_current` switches to the next task). HW-verifiable;
+QEMU-proven: `spawn greet` (rigged to read address 0) -> "user task faulted ... killing it; kernel
+continues", and the shell + ping/pong keep running, no panic.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/exceptions.rs` | 23 -> 24 (+1) | `arm_user_fault_kill` (reached from the abort stubs in SVC mode on the faulting task's kernel stack) logs the kill loudly and calls `kill_current()`; the +1 is its `wfi` guard loop (kill_current does not return for a Dead task). |
+
+## 2026-07-22 - SMP: cores 1-3 online on the Pi 2 (feat/pi2-arm32)
+
+Bring the other three Cortex-A7s online. All new `unsafe` is in the permitted `arch/arm/` layer (§18.1),
+each block SAFETY-commented. QEMU-verified: `smp: 4 cores ready`, services placed on cores 0+1, cross-core
+IPC flowing, 0 faults. (Weak-memory-ordering hardening SEC-25..28 for real HW is a documented follow-up.)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 33 -> 34 (+1) | Core-3 lost-wakeup fix: a periodic re-`sev` in `smp_bringup`'s AP-ready wait re-arms the event line for a core that entered WFE just as the first SEV fired (its mailbox is still set, so it proceeds on the nudge). HW-proven: cores 1-2 came up but core 3 hung on release until this landed; now all 4 A7s come up on the Pi 2. The +1 is the `dsb`/`sev` block. (Diagnostic breadcrumbs used to find this were removed once understood.) |
+| `arch/arm/mod.rs` | 26 -> 33 (+7) | `get_lapic_id` reads MPIDR (the core id - the linchpin for `current_core_id`); `ap_entry` (naked AP entry: HYP-drop, VFP, per-core stack); `ap_boot_main` (ACTLR.SMP + `mmu::enable_on_this_core` + vectors + timer, one asm block); `smp_bringup` (D-cache clean before release + per-core mailbox-3 SET write + `dsb`/`sev`). The `arm_ap_park` release loop is `global_asm!` (not counted as a Rust `unsafe` block). |
+| `arch/arm/mmu.rs` | 4 -> 6 (+2) | Split `enable` into `build_tables` + `enable_on_this_core` (a `pub unsafe fn`, +1) so each AP loads the SAME L1 into its TTBR0; core 0 calls it too. The register-write blocks are unchanged; the +2 is the new unsafe fn wrapper and core 0's call site. |
+| `arch/arm/exceptions.rs` | 21 -> 23 (+2) | `install_for_core(core)` gives each AP its OWN banked ABT/UND/IRQ/FIQ stacks (BSS `AP_MODE_STACKS`) instead of the shared linker-symbol stacks - two cores taking a timer IRQ at once would otherwise corrupt the one IRQ stack. The +2 are the raw-pointer stack-top computation and the VBAR/banked-SP asm block. |
+| `arch/arm/irq.rs` | 10 -> 11 (+1) | `this_core()` reads MPIDR so the dispatch reads THIS core's `CORE_IRQ_SOURCE`/`CORE_TIMER_IRQCNTL` (`+4*core`), and `start_tick_ap` routes each AP's own timer. The +1 is the MPIDR read. |
+
+## 2026-07-22 - The interactive shell on ARM (feat/pi2-arm32, increment 5)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 23 -> 26 (+3) | Real console I/O: `console_write_bytes_gated` -> `pl011_write` (output); a PL011-RX -> input-ring path (`pl011_rx_drain`, `uart_rx_pop`, `uart_rx_poll`, `uart_rx_drain_now`, `console_push_byte`, `set_input_ready`/`input_ready`) so the shell reads serial input via ConsoleRead. The +3 unsafe are the three MMIO/ring blocks (`pl011_rx_drain`, `uart_rx_pop`, `console_push_byte`). |
+| `arch/arm/exceptions.rs` | unchanged count | `stub_svc` now saves/restores the caller's USER-banked `SP_usr`/`LR_usr` around the syscall (asm inside the existing naked block, no new `unsafe`). A syscall that blocks (recv/console_read) switches to another USER task, which clobbers the shared USER bank; the shell, woken from `console_read`, resumed on the logger's shallow SP and faulted just above the stack top. Saving on the task's own kernel stack (like `stub_irq`'s trap frame) fixes it. |
+
+**The interactive shell runs on ARM.** `gsh> ` prompt, reads serial input, echoes, and executes
+commands: `help` prints the command list, `version` prints `GodspeedOS 0.7.0`. 0 faults. The
+committed increments are unregressed (IPC 6600+ messages, supervisor bootstrap - both 0 faults - with
+the `stub_svc` USER-bank change). New ARM boot: `arm-shell` (`sched_shell.rs`); the shell is built for
+ARM (`arm_built += shell`). x86 unchanged (all changes in `arch/arm/`; the shell-spawn helper is
+`#[cfg(target_arch = "arm")]`).
+
+## 2026-07-21 - The NEUTRAL spawn works on ARM (feat/pi2-arm32, increment 4a)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/page_tables.rs` | 23 -> 25 (+2) | `finalize_service_address_space(cr3)` - the arch hook the neutral spawn calls after building a service page table: clones the kernel identity into it + cleans the D-cache (ARM has no shared higher-half kernel). The `unsafe fn` + its block. |
+| `arch/x86_64/page_tables.rs` | 46 -> 47 (+1) | The x86 `finalize_service_address_space` is a `pub unsafe fn` no-op (kernel is shared higher-half); the empty `unsafe fn` is the +1. |
+| `arch/arm/mod.rs` | 22 -> 23 (+1) | `syscall_slot` now returns a real per-core `PerCoreSyscallData` (an `addr_of_mut` unsafe) instead of null: the neutral spawn commits `is_user=true`, and `prepare_ring3_switch` writes through this pointer for every user task. Also added the safe `note_user_task` hook (`irq::mark_task_user`; no unsafe). |
+| `task/mod.rs` | unchanged (7, at the grandfathered floor) | The neutral `spawn_service_with_config` gained ONE line calling `finalize_service_address_space`, and `arm_spawn_logger_neutral` (an ARM-only pub probe). The finalize call was folded into the existing `unsafe { TaskContext::new_user }` block so `task/`'s floor holds (§18.5) - no amendment. `scheduler::commit_task` gained a safe `note_user_task` hook call (no unsafe). |
+
+**The neutral spawn machinery runs unchanged on ARM.** `task::spawn_service_with_config` - the exact path
+the supervisor's spawn syscall uses (ELF load, user-stack + ctx-page map, kstack-pool alloc, cap
+minting, ServiceContext write) - spawns the `logger` on ARM: `task: 'logger' spawned OK on core 0
+(slot 0)` -> `logger: ready`. The two ARM-specific steps are now arch-seam hooks the neutral code calls
+itself (both no-ops on x86, so x86 is byte-for-byte unchanged - verified it still compiles). This is the
+foundation the supervisor stands on. Gated behind `arm-sched-spawn`.
+
+## 2026-07-21 - Atomic syscalls + CLREX on ARM (feat/pi2-arm32, increment 3b hunt cont'd)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/irq.rs` | 9 -> 10 (+1) | `arm_irq_dispatch` reads the interrupted CPSR from the trap frame (`frame_sp + 68`) to implement **atomic syscalls**: skip timer preemption when a USER task is in SVC (a syscall), since preempting ARM kernel code mid-syscall corrupts (SPSR_svc + SVC-banked sp are shared). Gated on `ARM_TASK_IS_USER[slot]` (set by `mark_task_user`) so a *kernel* task running in SVC stays preemptible. The +1 unsafe is the frame read. |
+| `arch/arm/context_switch.rs` | unchanged count | Added `clrex` at the top of `switch_context`: a voluntary switch does not implicitly CLREX like an exception entry, so a task switched out mid-`ldrex`/`strex` could leak the exclusive monitor and wedge a SpinLock. Inside the existing naked block, no new `unsafe`. |
+| `arch/arm/mod.rs` | unchanged count | Doc-only: `syscall_slot` stays null (ARM tracks user tasks arch-locally, so the neutral `prepare_ring3_switch` never runs and never derefs it). |
+
+**Status: the mid-syscall preemption FAULT is fixed (verified: no EXCEPTION over 30 s, `sched_demo`/
+`sched_user` still rotate/preempt); the IPC still hangs on a residual corruption across the voluntary
+syscall-context `switch_context`** (`block_and_reschedule`'s `slot` local, asserted `< MAX_TASKS` at
+entry, reads back garbage at the tail). Full diagnosis in `sched_ipc.rs`. The SPSR-window fix (`stub_svc`
+`cpsid i`) from the prior commit stays.
+
+## 2026-07-21 - Cross-service IPC wiring (feat/pi2-arm32, increment 3b - WIP, blocked on a diagnosed bug)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/spawn.rs` | unchanged count | Refactored to expose `load_service_raw(elf, extra_caps)` + `map_stack_and_ctx` (shared with `sched_ipc`): load any service ELF, map its stack/ctx, reserve a slot, install `LOG_WRITE` + caller-supplied endpoint caps, leaving the ctx write + `fill_kernel_identity` to the caller. `load_logger_into_slot` now rides on it. No net `unsafe` change; `load_service_raw`'s block is the cap inserts. |
+| `arch/arm/sched_ipc.rs` | 6 -> 9 (+3) | Rewritten from the 2-logger frame proof to a real `ping`->`pong` IPC attempt: create pong's endpoint (the `spawn_service_with_config` sequence - `alloc_endpoint_id` + register resource/routing/name), mint a RECV cap for pong and a SEND cap for ping, hand-build both `ServiceContext`s (`write_ipc_ctx`), and commit both as scheduled USER tasks. The +3 `unsafe` is `write_ipc_ctx` (raw ctx writes), `commit_user`, and the `halt` WFI. `build.rs` now builds `ping`/`pong` for `armv7a-none-eabi`. Gated behind `arm-sched-ipc`. |
+
+**Status: the wiring is correct, the runtime is blocked on a diagnosed kernel bug.** Verified: the ctx
+is wired correctly (a dump confirmed `send_peer_count=1, peer0.slot=1, name="pong"`), both services reach
+PL0 and log (`ping: starting`, `pong: ready on core 0`). But once `ping` loops issuing syscalls
+alongside a second running user task, a task's registers are corrupted and it jumps to a wild PC (garbage
+syscall numbers, then a DATA ABORT to `0xfffffeae` from a PC in a data page). Bisected: `pong`'s blocking
+`recv` alone is fine; `ping` ALONE (self-scheduling) loops forever clean; `ping`+`pong` together corrupts.
+So the fault is in a **real cross-task `switch_context` reached from a *syscall* context** (yield/block) -
+a path #1/#2/#3a never exercised (they switch only via the timer IRQ; #3a's two user tasks busy-loop on a
+non-blocking `recv`, never yielding). The USER-banked `SP_usr`/`LR_usr` were ruled out (saving them in both
+`stub_svc` and `switch_context` left the corruption unchanged, so those attempts were reverted). Next
+leads: the AAPCS callee-saved contract across a syscall-context switch between two different user address
+spaces (TTBR0 change), or SVC-stack nesting when the timer preempts a task mid-syscall. The 2-logger
+banked-frame proof it replaced is preserved in commit `3e6cb3f`; the banked frame (`stub_irq`) stays, and
+ping+pong both reaching PL0 still exercises it. The committed increments (#1/#2/#3a) are unregressed
+(default `preempt selftest PASS 9/9/9`, sched-user `logger: ready`).
+
+## 2026-07-21 - Two USER services at once: the banked-register trap frame (feat/pi2-arm32, increment 3a)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/exceptions.rs` | unchanged count | `stub_irq` now stacks the interrupted task's USER-banked `SP_usr`/`LR_usr` (`stmdb r0, {sp, lr}^` on save, `ldmia r0, {sp, lr}^` on restore) - the prerequisite for **more than one** user task. With one, nothing else touched the USER bank across a round trip; with two, task B's ring-3 execution would clobber task A's user stack unless it is saved per task. The extra instructions live in the existing naked block, so no new `unsafe`. Frame grew 16 -> 18 words. |
+| `arch/arm/context.rs` | unchanged count | `TrapFrame` gains `usr_sp`/`usr_lr` (matching the 18-word layout) and `prepare_task` zeroes them for kernel tasks (their USER bank is unused). Struct/field change only, no new `unsafe`. |
+| `arch/arm/page_tables.rs` | unchanged count | L1 arena 2 -> 8, L2 arena 16 -> 64: the boot loader selftest takes one L1 and each live service takes one, so two only left room for a single service. Sized (bounded static, §26.6.1) for the running service set - IPC pair, supervisor, shell. Constants only, no `unsafe`. |
+| `arch/arm/sched_ipc.rs` | 0 -> 6 (new file) | Loads **two** logger instances as scheduled USER tasks (each its own address space) plus two kernel spinners, and runs them under `scheduler::run`. The isolation test for the banked frame; grows into real send/recv (increment 3b). The `unsafe` is the static-stack setup and the `new_user`/`new_kernel`/`commit_task` calls. Gated behind `arm-sched-ipc`. |
+
+**What this proves.** Two independent USER services run concurrently in ring 3 under the scheduler and
+both reach PL0 and issue their cap-validated syscall (`logger: ready` twice) with no corruption and no
+fault. Were the banked frame wrong, the second user task's ring-3 execution would clobber the first's
+`SP_usr` and one would fault - so "both ready, no fault, system live" is the proof the per-task
+`SP_usr`/`LR_usr` save/restore is correct. This is the trap-frame foundation IPC stands on. Verified in
+QEMU (`raspi2b`); the default image is unregressed (`preempt selftest PASS 9/9/9`).
+
+## 2026-07-21 - A USER service runs through the scheduler, preemptively (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/context_switch.rs` | 14 -> 13 (-1) | `new_user` is now **real**: it builds a context whose first `switch_context` drops to PL0 via a new `user_entry_trampoline` (installs the user stack, fabricates a USR-mode SPSR with IRQs on, `movs pc`). The loud `user_mode_unimplemented` stub it replaced is deleted - net one fewer `unsafe`. `switch_context` also gained a `TLBIALL` on the TTBR0-change branch (SEC-26/27: an ARM address-space switch does not implicitly flush), inside the existing naked block (no new `unsafe`). |
+| `arch/arm/page_tables.rs` | 21 -> 23 (+2) | `clean_invalidate_dcache_all` (set/way `DCCISW`) moved here from `spawn.rs` as the shared home for cache maintenance: it makes a service's page-table descriptors visible to the non-cacheable walker once at spawn, so `switch_context` needs no per-switch cache work. The `unsafe fn` + its asm block are the +2. |
+| `arch/arm/sched_user.rs` | 0 -> 6 (new file) | Loads the logger as a scheduled **USER** task (its own TTBR0), commits it plus two spinning kernel tasks to the neutral `scheduler::run(0)`, cleans the D-cache once, and arms `NEUTRAL_SCHED`. The `unsafe` is the static-stack setup and the `new_user`/`new_kernel`/`commit_task` calls. Gated behind `arm-sched-user`. |
+| `arch/arm/spawn.rs` | unchanged count | Refactored to expose `neutral_bootstrap` + `load_logger_into_slot` (shared with `sched_user`) and to call `page_tables::clean_invalidate_dcache_all` rather than a private copy. No net `unsafe` change. |
+
+**What this proves.** A real GodspeedOS service (`logger`) runs *through* the neutral scheduler on ARM,
+not entered directly: loaded into its own address space, committed to a task slot, and preempted in
+ring 3 by the timer (its trap frame lands on its own kernel stack), while spinning kernel tasks are
+round-robined around it. `logger: ready` is its cap-validated syscall, issued from PL0 under its own
+TTBR0 - so the per-task page table, the `switch_context` TTBR0-swap + `TLBIALL`, and the one-shot
+descriptor D-cache clean all hold end to end. Verified in QEMU (`raspi2b`): `logger: ready` once,
+kernel tasks advancing past tick 3, no fault. **Single** user task by design: a second one needs
+`stub_irq` to also stack the banked `SP_usr`/`LR_usr` (the next increment); with one, nothing else
+touches the USER bank across the round trip. The default image is unregressed (`preempt selftest PASS
+9/9/9`, `neutral surface PASS`).
+
+## 2026-07-21 - Timer preemption via the neutral scheduler (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/irq.rs` | 8 -> 9 (+1) | `arm_irq_dispatch` now routes the timer tick to the neutral `timer_tick_from_irq` (the preemptive `switch_context` path) once `NEUTRAL_SCHED` is set, instead of the early `context.rs` demo scheduler. The +1 unsafe is the `timer_tick_from_irq` call. |
+| `arch/arm/sched_demo.rs` | unchanged count | The demo tasks now **spin** (no yield) and arm `NEUTRAL_SCHED`, proving the timer preempts a non-cooperating task. |
+
+**The mechanism, and why the same IRQ stub serves both paths.** The stub saves the full interrupted
+frame on the task's kernel (SVC) stack and calls `arm_irq_dispatch`, which returns an `sp` the stub
+adopts (`mov sp, r0`). The early demo scheduler returns a *different* task's frame to adopt. The
+neutral `timer_tick_from_irq` instead does the `switch_context` INTERNALLY - it swaps `sp` to the next
+task's kernel stack itself - so `arm_irq_dispatch` returns `frame_sp` unchanged, and after this task is
+later resumed (`switch_context` unwinding back into the call), `frame_sp` again names THIS task's
+frame, making the `mov sp` a no-op. One stub, two mechanisms.
+
+**Non-yielding tasks are genuinely preempted**, proven by output interleaved mid-print (a tick caught a
+task between arbitrary instructions). The boot `preempt_selftest` still uses the demo path
+(`NEUTRAL_SCHED` defaults false) and still passes 9/9/9, so the default image is unregressed. This is
+the preemption real services need (they block on `recv`, they do not yield).
+
+## 2026-07-21 - Neutral scheduler runs tasks on ARM (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/sched_demo.rs` | 0 -> 6 (new file) | Commits three kernel tasks and enters the neutral `scheduler::run(0)`; it round-robins them (A->B->C->A...) via `pick_next` + `switch_context` + `yield_current`. Proves the neutral scheduler - the foundation the supervisor and every service stand on - runs on ARM. The `unsafe` is the static-stack setup, the `new_kernel`/`commit_task` calls, and the BootInfo construction for the neutral bootstrap. Gated behind `arm-sched-demo`. |
+
+**Cooperative first, deliberately.** The tasks `yield` (a scheduling point), so this exercises the
+scheduler's task table + `switch_context` without the timer-preemption rework - running the timer IRQ
+on per-task kernel stacks so it can `switch_context` a *non-yielding* task - that real services need.
+That is the next increment; this proves the layer beneath it. No per-task page tables (all tasks share
+the kernel identity map), so a switch never changes TTBR0 and the D-cache dance from the service spawn
+does not arise.
+
+## 2026-07-21 - Minimal service spawn (feat/pi2-arm32)
+
+Increment 6 groundwork: enough to load a real service, set up its task + capability, and run it at
+PL0 issuing syscalls. All in the permitted `arch/` layer with SAFETY comments; no grandfathered floor
+moves (the one neutral helper, `set_current_task`, is a **safe** fn - the atomic store is not UB - so
+`scheduler.rs` stays at its floor).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/spawn.rs` | 0 -> 7 (new file) | The minimal spawn: build a BootInfo, run the neutral `memory`/`percpu`/`capability` init, load the logger ELF, map its user stack + service-context page, reserve a task slot with a `LOG_WRITE` cap, clone the kernel into the service address space, switch TTBR0, and drop to PL0. |
+| `arch/arm/page_tables.rs` | 19 -> 21 | `fill_kernel_identity`: clone the live kernel identity map into a service page table (whole-section where the service slot is empty; page-fill the L2 where the service tabled-over a kernel section, so kernel data sharing the ctx/code 1 MiB stays reachable). |
+| `arch/arm/mod.rs` | 21 -> 22 | The `interrupts` module's `disable`/`enable`/`local_irq_save`/`restore`/`wfi` are now REAL (`cpsid`/`cpsie`/`wfi`), the ARM `read`/`write_user_bytes`/`validate_user_ptr` are real, `switch_to_boot_stack` sets SP, and ACTLR.SMP is set at boot. |
+
+**MILESTONE REACHED: `logger: ready`.** A real GodspeedOS service, loaded from an ELF, runs
+unprivileged (PL0) on 32-bit ARM under its own address space, and logs through a capability-checked
+`svc` into the neutral dispatcher. `clean_invalidate_dcache_all` (a set/way `DCCISW` sweep, +1
+unsafe) before the TTBR0 switch was the final fix: the kernel maps its memory as 1 MiB **sections**
+but the service maps the shared 1 MiB as 4 KiB **pages**, and stale D-cache lines from the section
+view made the cap-table spinlock's `LDREX`/`STREX` fail under the page view. Cleaning the D-cache
+makes every line coherent before the walker and exclusive monitor see the new mappings, and the lock
+acquires. Gated behind `arm-spawn-logger` so the default image still boots to the selftest halt; the
+feature build runs the service to `ready`.
+
+## 2026-07-21 - ARMv7 user mode / PL0 (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/usermode.rs` | 0 -> 15 (new file) | **A task runs UNPRIVILEGED for the first time.** Enters USR mode (PL0), runs a stub that cannot touch kernel memory, and has it `svc` back. The `unsafe` is: `enter_user` (the fabricated exception return that drops to PL0), `resume_boot` (restores the kernel context on the magic svc), the user stub, I-cache sync for the copied code, the ATS1CPUR/W unprivileged translation probes, and the frame copy/map in the selftest. |
+| `arch/arm/page_tables.rs` | 19 (unchanged) | `l2_small_page` now encodes PL0 access from the `USER` flag: AP=0b11 (PL0 RW), 0b10 (PL0 RO), 0b01 (PL0 none) - the page's whole two-level security model. No new `unsafe`. |
+| `arch/arm/exceptions.rs` / `syscall.rs` | unchanged counts | The SVC entry publishes the caller's SPSR (so a syscall can see its privilege), and the magic test syscall routes to `on_magic_svc`. |
+
+**Entering USR mode is a fabricated exception return.** No `iret`: set SPSR to USR (IRQs enabled), set
+LR to the entry PC, arrange the USR banked SP (via a brief system-mode switch), and `movs pc, lr` -
+which copies SPSR->CPSR and LR->PC atomically, dropping privilege. The ARM analogue of x86's IRETQ.
+
+**The proof of PL0 is the SPSR at the svc, not that the code ran.** The CPU records the caller's mode
+in SPSR_svc; `SPSR.mode == 0x10 (USR)` is unforgeable evidence the stub executed unprivileged. The
+selftest checks exactly that (observed 0x10), and separately probes the permission model with the
+*unprivileged*-access translation ops (ATS1CPUR/W): user code is user-readable, user stack
+user-writable, and a KERNEL page is NOT user-accessible - isolation, proven non-faulting. Getting back
+out with no scheduler: `enter_user` saves the kernel context first; the magic svc restores it.
+
+## 2026-07-21 - ARMv7 SVC syscall entry (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/syscall.rs` | 0 -> 5 (new file) | **The SVC syscall entry** - `svc #0` traps into the neutral `syscall_handler`. The `unsafe` is `arm_svc_dispatch` (forwards to the `unsafe` neutral handler) and the `issue_svc`/selftest asm. |
+| `arch/arm/exceptions.rs` | 21 (unchanged) | The SVC vector went from report-and-halt to a real entry: save `LR_svc`/`SPSR_svc`, call the dispatcher, `movs pc, lr` to return restoring CPSR. No new `unsafe` block - the naked stub was already one. |
+
+**Two ARM-specific things had to be right, and one was a bug.** (1) SVC targets SVC mode and the
+kernel already runs in SVC, so `LR_svc`/`SPSR_svc` are saved *first thing* like a nested exception, or
+the next `bl` clobbers the return address; done that way the entry works from a USR caller (real
+tasks) and an SVC caller (the selftest) alike. (2) **The 32-bit ABI bug:** `syscall_handler` takes
+`u64` parameters, and on 32-bit ARM each `u64` is a *register pair* (number in r0:r1, arg0 in r2:r3,
+rest on the stack). Passing the four `r0-r3` values to a `u64`-parameter function read the arguments
+shifted - it showed up as a wrong echo (7400 vs 7345). `arm_svc_dispatch` takes `u32`s (one register
+each, matching r0-r3) and widens to `u64` for the neutral call; **most** syscall arguments on this arch
+(pointer, handle, cap slot, length) fit in 32 bits, so the widening is loss-free for them. The **one
+exception** is a value that can exceed 32 bits - a `recv_timeout` in generic-timer ticks - which the
+single-register ABI would truncate; its SDK wrapper pre-clamps it on ARM (userspace-audit A-U1). The ABI
+convention + this constraint are now documented for SDK/service authors in `arch/arm/CLAUDE.md`. That
+widening is the seam the SDK port uses.
+
+**No user tasks yet (increment 3)**, and the real handlers touch per-task state, so the selftest
+proves the *entry mechanism* through a test dispatch (a mix of all four args, so a correct result
+proves each survived the mode switch) and leaves `syscall_handler` wired for when tasks arrive. A
+second trap confirms the path is re-entrant.
+
+## 2026-07-21 - Neutral frame allocator live on ARM (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/meminit.rs` | 0 -> 4 (new file) | **Wires the neutral `memory::init` on ARM** - the first shared (non-arch-layer) subsystem running on 32-bit ARM, and the prerequisite for per-task page tables and service spawn. Builds a `BootInfo` from the DTB memory map + linker kernel bounds, reserves the kernel image as a low region, and runs the neutral bitmap allocator. The `unsafe` is the `static mut MEM_REGIONS`/`BootInfo` construction, the `__fiq_stack_top` linker-symbol read, and reconstructing a `Frame` to free in the selftest. |
+| `memory/allocator.rs` + 7 arch `page_tables` | guard relaxed + `PHYS_IS_IDENTITY` const | The allocator panicked on `hhdm == 0` ("HHDM offset not set"). That is true on x86/Limine but WRONG on ARM: the kernel runs identity-mapped, so hhdm=0 is the correct value (`hhdm + phys == phys` already addresses the frame). Fixed the boundary-correct way (`arch/CLAUDE.md`): each arch declares `page_tables::PHYS_IS_IDENTITY` (true on ARM, false elsewhere), and the guard only fires where a zero offset genuinely means "unset". x86 identity 24/24 confirms the shipping arch is unaffected. |
+
+**`memory::init` fit the neutral allocator unchanged** because two ARM facts line up with what it wants:
+`hhdm=0` works (identity map), and `protect_kernel_page_table_frames` - the one Limine-table-specific
+step - already returns early when `hhdm == 0`, a clean no-op rather than a special case. Result on
+hardware-shaped input: `frame allocator ready (946 MiB free)`, and the selftest allocates 8 distinct
+page-aligned frames, checks the free count drops by 8, frees them, and checks it returns to baseline.
+
+## 2026-07-21 - ARMv7 two-level page tables (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/page_tables.rs` | 0 -> 17 (new file) | **Real two-level 4 KiB page tables**, replacing the compile-only stub inline in `mod.rs`. `mmu.rs` gave 1 MiB sections; this gives an L2 table under an L1 entry, so individual pages carry their own permissions. The `unsafe` is: the TTBR0/TLB primitives (`invalidate_tlb_page` = TLBIMVA, `read`/`write_page_table_base`), the descriptor writes into the live and fresh L1/L2 tables, the static-arena table allocators, and the `ATS1CPR`/`ATS1CPW` translation probes the selftest uses. |
+
+**The read-only proof needs no fault.** `ATS1CPW` runs a privileged-*write* address translation and
+reports the result in `PAR.F` - so a read-only page returns "denied" for a write while `ATS1CPR`
+(read) still returns its address. The selftest maps one page RW and one RO into the live tables and
+checks: both translate for read, RW is writable, **RO is not**. The negative is the load-bearing one
+(same discipline as the MMU and IOMMU selftests): "RW translates" only shows the L2 was built; "RO
+refuses a write" shows the AP/APX permission bits are actually enforced. That is real per-page
+protection, the thing 1 MiB sections could not give.
+
+**The frame source is a bounded static arena, deliberately.** x86's `PageTable::new` pulls table
+frames from the neutral `alloc_frame`, which needs `memory::init` + a real memory map - and that pulls
+in Limine-shaped assumptions (`protect_kernel_page_table_frames`) that are a separate integration
+step. So table memory is a fixed static arena here (§26.6.1), with the `alloc_frame` swap called out as
+the one remaining seam. The *algorithm* - build an L2, point an L1 entry at it, encode the page with
+its permissions - is the real one the neutral path will drive unchanged. `map_in_active_tables` fills a
+currently-unmapped L1 slot (a VA in the gap between RAM end and the peripherals) rather than converting
+a live section, so running code is never momentarily unmapped.
+
+## 2026-07-21 - Neutral context-switch surface, real (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/context_switch.rs` | 0 -> 14 (new file) | **The real `arch::imp::context_switch` surface** the neutral scheduler imports: `TaskContext`, `new_kernel`/`new_user`, and the naked `switch_context`, plus a selftest driving a kernel task through that exact neutral API. The `unsafe` is the two naked asm fns (switch + first-entry trampoline), the constructors, `user_mode_unimplemented`, and the selftest's static/ptr manipulation. Replaces the compile-only stub that was inline in `mod.rs`. |
+| `arch/x86_64/context_switch.rs` + 5 arch stubs | +1 line each (`TaskContext::ZERO`) | A neutral leak fixed by an arch primitive, not a special case (`arch/CLAUDE.md`). The scheduler built a zero context with a literal `TaskContext { rbx: 0, ... }`, naming x86 registers in neutral code - which does not compile once ARM's `TaskContext` is ARM-shaped. Each arch now exposes `const ZERO: Self`; the scheduler uses `TaskContext::ZERO`, naming no register. |
+
+**Kernel-only integration, honestly scoped.** The neutral scheduler spawns **only** ring-3 tasks
+(`new_user`, from ELF binaries) - it has no path that calls `new_kernel` - so `scheduler::run()`
+end-to-end genuinely needs userspace, which ARM does not have (0-byte service placeholder). What *is*
+provable kernel-only is the scheduler's core primitive: `TaskContext::new_kernel` + `switch_context`
+driving an ARM kernel task, which the selftest exercises through the neutral types.
+
+**The switch mirrors x86 semantics exactly, and a bug proved it.** Like x86, the ARM switch saves
+callee-saved + `sp` + `lr` but **not** `cr3` (it only *loads* TTBR0). The first selftest faulted in a
+loop with TTBR0=0 - because `SCHED_CTX.cr3` stayed zero from its `ZERO` init, and switching back
+loaded it. That is the *exact* gotcha x86 documents at `scheduler.rs` ("seed the scheduler context's
+CR3 ... switch_context never saves CR3, only loads it"); reproducing it confirms the semantics match.
+The fix seeds `SCHED_CTX.cr3` with the live TTBR0, as the neutral `run()` does. `new_user` builds a
+context that halts loudly if entered - ring-3 needs an SPSR return, per-task page tables, and SVC
+syscalls, none of which exist yet, so a premature user spawn fails visibly rather than running undefined.
+
+## 2026-07-20 - Device tree parsing: learn the memory map (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/dtb.rs` | 0 -> 6 (new file) | **Flattened Device Tree parsing.** Six SAFETY-commented blocks, all bounds-checked reads of the firmware-supplied blob: big-endian u32 reads, node-name comparison, and reading `DTB_PTR` itself. Every offset is checked against the blob's own declared `totalsize` before being walked - a corrupt header pointing outside the blob is exactly how a parser wanders into unmapped memory. |
+| `arch/arm/mod.rs` | +1 asm site (no new unsafe block) | `_start` now stashes `r2` (the DTB pointer) into `r10` before the mode check clobbers `r0-r2`, and publishes it into `DTB_PTR` **after** the BSS zero - which would otherwise wipe it. |
+
+**Why this stops being optional here.** Every layer so far tolerated a hardcoded `RAM_END`, copied
+from what the firmware told Linux, with a comment admitting that was not how a real port should learn
+it. That is fine while nothing depends on it, and stops being fine the moment the neutral kernel's
+frame allocator does: a wrong constant hands out frames backed by memory that does not exist. The
+firmware already knows the answer and passes it in `r2`.
+
+**FDT is big-endian on a little-endian CPU**, so every u32 needs swapping - the most common way to get
+nonsense from this format, hence a single `be32` rather than byte-swapping at each site. The parser is
+deliberately minimal: find `/memory`, read `reg`, stop. It does not pretend to general
+`#address-cells` handling it has not implemented.
+
+A missing or unparsable blob falls back to the old constant but **announces it** (invariant 12),
+because a silently wrong memory size becomes allocator corruption much later, far from its cause.
+Note QEMU cannot exercise the real path here: `-device loader` sets the PC without emulating the
+firmware's r0/r1/r2 handoff, so `DTB_PTR` is 0 there and only hardware tests the parse.
+
+## 2026-07-20 - ARMv7 PREEMPTIVE switch (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/context.rs` | 4 -> 6 (+2) | **Preemptive switching.** Two further SAFETY-commented blocks: fabricating a trap frame on a fresh task's stack, and the WFI halt for a task that returns from its entry function. |
+| `arch/arm/exceptions.rs` | 21 (unchanged) | `stub_irq` grew from a five-register handler into a full trap-frame entry: `srsdb` + `cps` + `push {r0-r12, lr}`, dispatch, `mov sp, r0`, `pop`, `rfeia sp!`. No new `unsafe` - the naked stub was already one block. |
+
+**Cooperative and preemptive switching are genuinely different problems**, and the difference is
+AAPCS. A cooperative switch happens inside a function call, so the compiler has already spilled the
+caller-saved half and ten registers suffice. A preemptive switch is *forced* between two arbitrary
+instructions with anything live, so the **entire** register file plus the resume PC and `SPSR` must be
+captured.
+
+**The ARMv7 obstacle is register banking**: on IRQ entry the CPU is in IRQ mode, where the interrupted
+mode's `sp` and `lr` are banked away and unreachable. `srsdb sp!, #0x13` reaches across that by
+pushing `LR_irq`/`SPSR_irq` onto the *SVC* stack; `cps #0x13` then stands on the interrupted task's
+own stack to save the rest. The frame therefore lives on **the task's own stack**, which is what makes
+a switch cheap - the state is already parked where it belongs, so switching tasks is switching `sp`
+and nothing else. The dispatcher returns the frame to resume; returning a *different* pointer is the
+entire mechanism of preemption. `rfeia sp!` restores PC and CPSR atomically.
+
+`TrapFrame`'s field order mirrors the push order and is as load-bearing as `Context`'s; a mismatch
+would resume tasks with scrambled registers, looking like random corruption far from the cause. A
+fresh task is started by fabricating its frame rather than special-casing "never run" in the switch -
+the same trick as `Context::prepare`, one layer down. `SPSR` is set with **IRQs enabled**: a task
+started with them masked would run to completion and never yield, silently killing preemption with no
+error anywhere.
+
+The selftest runs three tasks that never cooperate and checks **all three** were scheduled - a switch
+that always picked one task, or worked once then wedged, would still show *a* task running.
+
+## 2026-07-20 - ARMv7 kernel context switch (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/context.rs` | 0 -> 4 (new file) | **Cooperative kernel-mode context switch.** The switch itself is a three-instruction naked fn (`stmia`/`ldmia`/`bx lr`); the remaining blocks are the ping-pong selftest driving it. Only ten registers are saved and that is not a shortcut: AAPCS makes `r0-r3`/`r12` caller-saved, so the compiler has already spilled anything live at the call site, leaving the switch responsible for `r4-r11`, `sp`, `lr` - the same division as the x86 side. |
+
+`Context`'s field order is **load-bearing**: `stmia`/`ldmia` transfer in increasing register number
+regardless of how the list is written, so the struct must read `r4..r11`, `sp`, `lr` under `repr(C)`.
+Reordering the fields would silently restore registers into the wrong slots.
+
+A fresh context is started by *fabricating* its `lr` as the entry point, so the ordinary restore path
+starts it - no special case in the switch. The selftest checks the round trip rather than mere
+arrival: the counter is incremented by the *other* context and read back, which only works if state
+survives in both directions (a half-working switch that transfers control but corrupts registers is
+the dangerous case).
+
+**This is cooperative - called, not forced.** A preemptive switch from the timer IRQ must save the
+*full* register file, because an interrupt can land between any two instructions with anything live.
+That is the next increment. No address-space switch either: all contexts share the identity mapping,
+and per-task `TTBR0` writes bring the SEC-26/27 TLB obligations with them.
+
+## 2026-07-20 - BCM2836 interrupt controller / timer tick (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/irq.rs` | 0 -> 8 (new file) | **Routing the timer IRQ so the counter becomes a tick** - the prerequisite for preemption. Eight SAFETY-commented blocks: volatile read/write of the Device-mapped BCM2836 core-local block (routing + pending), `CNTP_TVAL` and `CNTP_CTL` writes to arm the timer, `CNTP_CTL` and `CPSR` reads for diagnostics, and `cpsie i` / `cpsid i` to unmask and mask IRQs. |
+| `arch/arm/exceptions.rs` | 21 (unchanged) | The IRQ stub changed shape without changing its count: it now saves `r0-r3, r12, lr`, calls the dispatcher and **returns** via `ldm sp!, {r0-r3, r12, pc}^` (the trailing `^` restores CPSR from SPSR atomically). It is the only exception in the port that returns rather than halting. |
+
+**The tick selftest caught a real routing bug, and the diagnostics located it precisely.** The first
+version counted **zero** interrupts. The follow-up print made the cause unambiguous: `CNTP_CTL` read
+`0x5` (ENABLE set, IMASK clear, **ISTATUS set** - the timer was firing), `CPSR` showed SVC mode with
+IRQs unmasked, yet the core-local pending register read `0x0`. Timer firing + interrupts enabled +
+nothing pending means the timer was raising a source nobody was listening to.
+
+**Cause: `CNTP_*` addresses the secure OR the non-secure physical timer depending on the CPU's
+security state, and those are two different interrupt sources** - `CNTPSIRQ` (bit 0) and `CNTPNSIRQ`
+(bit 1). The Pi firmware enters an ARMv7 kernel in HYP (non-secure), so hardware raises bit 1; QEMU's
+`raspi2b` stub passes through the secure monitor into *secure* SVC and raises bit 0. Routing only the
+non-secure bit therefore worked on neither in the same image. The fix routes and accepts **both**,
+exactly as `_start` accepts either HYP or SVC entry: one image, either security state, no assumption
+left to be wrong about.
+
+## 2026-07-20 - ARMv7 generic timer (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/timer.rs` | 0 -> 4 (new file) | **ARM generic timer + BCM2835 System Timer.** Four SAFETY-commented blocks, all side-effect-free reads: `CNTFRQ` (the firmware-programmed frequency), `CNTPCT` via `mrrc` into a register pair (the 64-bit counter, with an ISB so the read is not reordered), a volatile read of the System Timer's counter-low register, and `local_reg` reading the BCM2836 core-local block (timer control + prescaler). The last two are in ranges `mmu.rs` maps as Device memory. |
+
+**ARM needs no timer calibration** - `CNTFRQ` reports the frequency architecturally, so the whole
+x86 PIT-calibration apparatus (and the ~1 second-quantum bug it existed to fix on the T630) has no
+counterpart here.
+
+**But `CNTFRQ` is still cross-checked, because it is firmware-programmed rather than
+hardware-discovered.** It is an ordinary read/write register that firmware is *supposed* to set;
+firmware that forgets leaves it 0 or wrong, and every duration derived from it is then silently
+wrong - surfacing much later as mysterious timing bugs. The Pi carries a second, independent clock
+(the BCM2835 System Timer, fixed at 1 MHz by hardware), so the selftest measures one against the
+other over 100 ms and compares the result with what `CNTFRQ` claims. That turns "the register says
+19.2 MHz" into "two independent clocks agree on how long a second is". A zero `CNTFRQ` is reported
+loudly and degrades to the System Timer rather than computing nonsense (invariant 12).
+
+**The cross-check immediately paid for itself: on the Raspberry Pi 2, `CNTFRQ` is wrong by 19.2x.**
+Hardware reports `CNTFRQ = 19200000` while the counter measurably advances at 1 MHz. The BCM2836
+feeds the generic timer through a core timer prescaler (`0x4000_0008`) at `source * prescaler / 2^31`;
+firmware programs `0x06AAAAAB`, which divides the 19.2 MHz crystal to **exactly** 1 MHz, and then
+never updates `CNTFRQ` - so the register still advertises the undivided crystal. Trusting it would
+have made every delay and every scheduler quantum wrong by 19.2x, with the symptom appearing far from
+the cause. **QEMU cannot reproduce this**: it does not model the prescaler (both registers read 0) and
+its `CNTFRQ` is truthful, so only hardware could have caught it. `timer_hz()` therefore returns the
+**measured** rate, never `CNTFRQ`, and the selftest distinguishes a deviation *explained* by the
+prescaler (a known board quirk, reported and continued) from an unexplained one (a real failure).
+
+## 2026-07-20 - ARMv7 MMU (feat/pi2-arm32)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mmu.rs` | 0 -> 4 (new file) | **ARMv7 short-descriptor translation, 1 MiB sections.** Four SAFETY-commented blocks: filling the L1 table (`static mut`, boot-only, secondaries parked and MMU off so nothing is walking it); the enable sequence (TLB/BP/I-cache invalidate, DACR=client, TTBCR=0, TTBR0, then SCTLR.M, with the DSB/ISB pairs the ARM ARM requires); enabling caches afterwards; and `translate()`, which runs the CPU's own table walker via ATS1CPR and reads PAR. `translate` is deliberately safe to call on an address expected to be UNMAPPED - a failed walk sets PAR.F rather than raising an exception, which is what lets the selftest prove the table bounds anything. |
+
+The MMU is the gate on task isolation, and it comes *after* the vectors on purpose: a bad mapping is a
+translation fault, and without a vector table that fault is a silent hang rather than a printed
+`translation fault (section) - NOT MAPPED`.
+
+**The selftest checks a negative, not just a positive** (same reasoning as the x86 IOMMU selftest,
+§22 Test 12): confirming that mapped addresses translate only shows the table is non-empty, so it also
+confirms that an address outside every mapped range does **not** translate. The three checks are
+mutually validating - a broken `translate()` that always failed would break checks 1-2, and a blanket
+identity map would break check 3.
+
+## 2026-07-20 - ARMv7 exception vectors (feat/pi2-arm32)
+
+The 32-bit ARM port gains its vector table. All additions are in the permitted `arch/` layer with
+`// SAFETY:` comments, so no §18.5 amendment is needed and no grandfathered floor moves.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/exceptions.rs` | 0 -> 21 (new file) | **ARMv7 exception vectors.** Until this existed, ANY fault on ARMv7 was a silent lockup - no vector table means the CPU jumps to whatever sits at address 0 and wanders off, which is exactly the silent failure invariant 12 forbids. The count is dominated by the eight one-instruction vector entries plus their `naked` stubs (each loads the exception kind, the LR-adjusted faulting PC, and DFSR/DFAR or IFSR/IFAR, then branches to a common reporter). `install()` holds one block that programs VBAR and primes the ABT/UND/IRQ/FIQ banked stacks; `trigger_test_fault()` holds one deliberately-unsound read behind the `arm-fault-test` feature, which is the ARM twin of the x86 A14/A15/C2 adversarial fault tests - a fault path never observed firing is not evidence that it works. |
+
+**ARMv7 trap worth recording: FIQ mode banks r8-r12.** The first version of `install()` stashed the
+caller's CPSR in `r12`, walked through FIQ mode to set its banked stack, then restored CPSR from
+`r12` - but inside FIQ that register name refers to a different physical register holding garbage, so
+the restore loaded a nonsense mode and reset the CPU. The symptom was oblique (the boot banner
+printing twice, and VBAR reading back as `0x00000000` instead of the table address). The fix carries
+nothing across a mode switch: VBAR is programmed first while still in SVC, and the walk ends by
+naming SVC explicitly rather than restoring a saved value.
 
 ## 2026-07-16 - SEC-1 / SEC-18 security fixes (feat/hardening)
 
@@ -265,7 +1055,25 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
 | arch/aarch64/mod.rs | 23 | permitted |
-| arch/arm/mod.rs | 21 | permitted |
+| arch/arm/exceptions.rs | 24 | permitted |
+| arch/arm/context.rs | 6 | permitted |
+| arch/arm/context_switch.rs | 13 | permitted |
+| arch/arm/dtb.rs | 6 | permitted |
+| arch/arm/irq.rs | 13 | permitted |
+| arch/arm/meminit.rs | 4 | permitted |
+| arch/arm/mmu.rs | 8 | permitted |
+| arch/arm/video.rs | 17 | permitted |
+| arch/arm/fbcon.rs | 6 | permitted |
+| arch/arm/dwc2.rs | 34 | permitted |
+| arch/arm/page_tables.rs | 31 | permitted |
+| arch/arm/sched_demo.rs | 6 | permitted |
+| arch/arm/sched_user.rs | 6 | permitted |
+| arch/arm/sched_ipc.rs | 9 | permitted |
+| arch/arm/spawn.rs | 8 | permitted |
+| arch/arm/syscall.rs | 5 | permitted |
+| arch/arm/usermode.rs | 15 | permitted |
+| arch/arm/timer.rs | 4 | permitted |
+| arch/arm/mod.rs | 44 | permitted |
 | arch/loongarch64/mod.rs | 23 | permitted |
 | arch/riscv32/mod.rs | 23 | permitted |
 | arch/riscv64/mod.rs | 23 | permitted |
@@ -278,7 +1086,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/ioapic.rs | 8 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
 | arch/x86_64/mod.rs | 36 | permitted |
-| arch/x86_64/page_tables.rs | 46 | permitted |
+| arch/x86_64/page_tables.rs | 48 | permitted |
 | arch/x86_64/pci.rs | 19 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 15 | permitted |
@@ -293,7 +1101,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | smp/placement.rs | 1 | permitted |
 | smp/spinlock.rs | 5 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
-| loader.rs | 4 | grandfathered |
+| loader.rs | 2 | grandfathered |
 | main.rs | 2 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
 | task/mod.rs | 7 | grandfathered |

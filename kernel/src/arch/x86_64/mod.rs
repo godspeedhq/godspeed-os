@@ -282,6 +282,49 @@ pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, 
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
 pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
 
+/// Non-PCI fixed-physical peripheral MMIO grant (the ARM Pi path). x86 discovers driver MMIO from the
+/// PCI scan (handled in the spawn path via `HwClass::mmio_bar`), so there is never a fixed-physical
+/// window to grant here - always `None`.
+pub fn map_fixed_driver_mmio(_pt: &mut page_tables::PageTable, _name: &str) -> Option<(u64, u64)> { None }
+
+// USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
+pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
+// No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
+pub fn hw_random() -> Option<u32> { None }
+
+/// The SD/EMMC controller's base clock in Hz, or 0 where the platform does not report one
+/// (the block driver then refuses to guess a divider). Only the Pi's ARM port learns this,
+/// from the VideoCore mailbox at boot.
+pub fn emmc_base_clock_hz() -> u32 { 0 }
+
+/// USB mass-storage block device (the ARM DWC2 Bulk-Only bridge). Only the Pi's ARM port has an
+/// in-kernel USB stack; elsewhere disks are userspace drivers, so there is no device here.
+pub fn usb_disk_sectors() -> u64 { 0 }
+pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
+pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
+pub fn usb_disk_flush() -> bool { false }
+/// Counter ticks (in `read_cycle_counter` units) a core may make NO forward progress before the
+/// liveness watchdog declares it wedged and panics. `0` = this arch cannot say, so the check is off.
+///
+/// x86: unchanged from when this lived in the scheduler - 300 quanta of ~10 ms is ~3 s, and it is `0`
+/// until the TSC quantum is calibrated (QEMU's periodic tick never calibrates, so it stays off there).
+/// A normal shootdown or critical section is milliseconds, so ~3 s cannot false-fire.
+pub fn liveness_deadline_cycles() -> u64 {
+    boot::tsc_ticks_per_quantum().saturating_mul(300)
+}
+
+pub fn usb_disk_busy() -> bool { false }
+/// Is there no USB disk attached at all? Distinct from busy - see `USB_DISK_ABSENT` in the syscall
+/// dispatch. This arch has no USB-disk backend, so a request never reaches one and the question is
+/// moot; the read/write primitives already answer false.
+pub fn usb_disk_absent() -> bool { true }
+
+
+// No GPIO on this arch (the ARM `gpio` shell command is Pi-only).
+pub fn gpio_op(_op: u32, _pin: u32) -> i64 { -1 }
+pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }
+pub fn net_info() -> Option<([u8; 6], bool)> { None }
+
 /// Switch the local core to a new stack top (boot only). Used once at kernel entry to move off the
 /// bootloader's tiny stack onto the kernel's own before any locals are allocated. `#[inline(always)]`
 /// is REQUIRED: it must inline into the caller so there is no function epilogue trying to `ret` off the
@@ -302,6 +345,12 @@ pub unsafe fn switch_to_boot_stack(top: u64) {
 ///
 /// SEC-18: broadcast an NMI to the other cores first (it reaches them even while spinning IF=0 on a
 /// lock; `idt[2]` routes it to `exception_halt`, which halts the receiving core), then halt this one.
+/// The ELF `e_machine` and `EI_CLASS` this arch's service binaries carry (x86-64, ELFCLASS64).
+/// The neutral loader checks a candidate ELF against these, so it can parse a 32-bit ARM
+/// service ELF or a 64-bit one without any arch-specific code in the loader itself.
+pub const ELF_MACHINE: u16 = 62;
+pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
+
 pub fn halt_all_cores() -> ! {
     // SAFETY: panic path - stop all execution permanently. The APIC is mapped by boot; a bare ICR write
     // is sound. If we panicked before the APIC came up the broadcast is a best-effort no-op and this
@@ -417,6 +466,11 @@ pub unsafe fn serial_init() {
 ///
 /// # Safety
 /// `serial_init` must have been called before the first call.
+/// Hook called by the neutral `commit_task` when it commits a user task. On x86 the ring is tracked by
+/// the scheduler's `TASK_IS_USER` and the SYSRET machinery, so nothing arch-local is needed here - a
+/// no-op. (ARM uses this to record the slot for its atomic-syscall timer check.)
+pub fn note_user_task(_slot: usize) {}
+
 pub fn serial_write_byte(b: u8) {
     use core::sync::atomic::Ordering;
     // Bounded best-effort lock acquire: a wedged SERIAL_LOCK must never spin a

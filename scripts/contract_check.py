@@ -97,9 +97,17 @@ def parse_kernel(name: str, source: str) -> dict | None:
         limit = int(lm.group(1)) * 1024 * 1024
 
     core = None
-    cm = re.search(r'preferred_core:\s*(\d+)', body)
-    if cm:
-        core = int(cm.group(1))
+    # `preferred_core` may be arch-conditional: `if cfg!(target_arch = "arm") { 0 } else { 1 }`. This
+    # check runs on the host (x86) and the .toml states the x86-intended core, so take the `else` (x86)
+    # value; a plain `preferred_core: N` is captured as-is. The ARM core is arch-specific (noted in the
+    # service's .toml where it differs) and not reconciled here.
+    cm_cfg = re.search(r'preferred_core:\s*if cfg!\([^)]*\)\s*\{\s*\d+\s*\}\s*else\s*\{\s*(\d+)\s*\}', body)
+    if cm_cfg:
+        core = int(cm_cfg.group(1))
+    else:
+        cm = re.search(r'preferred_core:\s*(\d+)', body)
+        if cm:
+            core = int(cm.group(1))
 
     send = []
     sm = re.search(r'send_peers:\s*&\[([^\]]*)\]', body)

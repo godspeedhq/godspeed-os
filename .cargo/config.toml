@@ -44,6 +44,12 @@ rustflags = [
 [target.riscv32imac-unknown-none-elf]
 rustflags = ["-C", "relocation-model=static"]
 
-# ARM 32-bit (word-size proof, compile-only).
+# ARM 32-bit (Raspberry Pi 2 port).
+# `max-page-size=0x1000`: the ARM linker defaults to a 64 KiB max page size and packs PT_LOAD
+# segments without 4 KiB page-aligning them, so two segments share a page (e.g. text ending and
+# rodata beginning). The kernel maps at 4 KiB granularity with per-segment permissions, so overlapping
+# segments collide (the loader rejects a double-mapped page). Setting the runtime page size to 4 KiB
+# makes the linker page-align each PT_LOAD, matching what x86 services already get. Benign for the
+# kernel (a flat binary via objcopy), needed for the service ELFs.
 [target.armv7a-none-eabi]
-rustflags = ["-C", "relocation-model=static"]
+rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-z", "-C", "link-arg=max-page-size=0x1000"]

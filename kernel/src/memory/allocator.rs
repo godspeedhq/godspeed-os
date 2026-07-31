@@ -129,7 +129,10 @@ impl BitmapAllocator {
         let kstart = boot_info.kernel_phys_start;
         let kend   = boot_info.kernel_phys_end;
         let hhdm   = boot_info.hhdm_offset;
-        if hhdm == 0 {
+        // hhdm==0 means "unset" on HHDM arches (x86/Limine), but is the CORRECT identity value on
+        // arches where physical RAM is directly addressable (ARM: VA==PA). Only panic where a zero
+        // offset genuinely indicates a caller that forgot to set it.
+        if hhdm == 0 && !crate::arch::imp::page_tables::PHYS_IS_IDENTITY {
             panic!("allocator: HHDM offset not set before init - bitmaps live in the HHDM");
         }
 

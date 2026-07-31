@@ -60,6 +60,10 @@ const DANCE_SECS:  i64 = 2;
 /// the cable is unplugged (the nic-driver goes slow on RDU-recovery) `ping` gives up in ~1 s per query and
 /// shows "no link" fast, instead of each query stalling at the 2 s DANCE budget. The boot DANCE keeps 2 s.
 const LINK_SECS:   i64 = 1;
+/// A ping reply may be delivered a ping or two behind the request that produced it (residual RX
+/// delivery lag), so a reply matches the current seq OR one within this small BACKWARD window - the set
+/// of still-outstanding echoes. Small enough that a stale reply from a dead link still cannot match.
+const SEQ_MATCH_WINDOW: u16 = 4;
 // A few tries per step: on a LIVE network the first frame back can be a background broadcast, so a step
 // retries past stray frames (each retry is fast - a frame is already waiting) to find its real reply.
 const DANCE_TRIES: u32 = 6;
@@ -101,6 +105,29 @@ fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
 /// OFFER. This proves the UDP transport (the layer the socket capability sits on) over the frame
 /// interface. Returns the offered IP, or None (no NIC / nothing answered). A real net-stack would use
 /// this to LEARN its own IP instead of hardcoding it; here it demonstrates the round-trip.
+/// Drain RX-ring batches ([9]) and call `on_frame` for each frame until it returns true (matched) or the
+/// deadline elapses. On a busy LAN the reply arrives amid a FLOOD of broadcast, so every path that waits
+/// for a specific reply must SCAN every frame, not take the one coupled frame back - the shared receive.
+fn drain_scan(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8]) -> bool) {
+    let t0 = ctx.epoch_secs_monotonic();
+    loop {
+        if let Some(b) = nic_req(ctx, &Message::from_bytes(&[9u8]), LINK_SECS) {
+            let p = b.payload_bytes();
+            let n = if p.is_empty() { 0 } else { p[0] as usize };
+            let mut pos = 1usize;
+            for _ in 0..n {
+                if pos + 2 > p.len() { break; }
+                let fl = u16::from_le_bytes([p[pos], p[pos + 1]]) as usize;
+                pos += 2;
+                if pos + fl > p.len() { break; }
+                if on_frame(&p[pos..pos + fl]) { return; }
+                pos += fl;
+            }
+        }
+        if ctx.epoch_secs_monotonic() - t0 >= secs { return; }
+    }
+}
+
 fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
     // Ethernet(14) + IPv4(20) + UDP(8) + DHCP/BOOTP(244) = 286 bytes.
     let mut frame = [0u8; 286];
@@ -134,49 +161,43 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u
 
     let req = Message::from_bytes(&frame);
     for _ in 0..DANCE_TRIES {
-        match ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS) {
-            Some(reply) => {
-                let f = reply.payload_bytes();
-                // A DHCP reply: IPv4 (0x0800, IHL 5), UDP (proto 17), BOOTP op = 2 (BOOTREPLY). yiaddr
-                // (our offered IP) sits at BOOTP offset 16 = frame offset 58.
-                if f.len() >= 62 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
-                    && f[23] == 17 && f[42] == 2 {
-                    let ip = [f[58], f[59], f[60], f[61]];
-                    // Learn the GATEWAY from the offer's options (magic cookie at frame offset 278 ->
-                    // options at 282), option 3 = router. This is what makes it work on a REAL network
-                    // (the gateway is 192.168.x.1, not QEMU's 10.0.2.2). Fall back to <subnet>.1.
-                    let mut gw = [ip[0], ip[1], ip[2], 1];
-                    let mut dns = [0u8; 4];
-                    let mut have_dns = false;
-                    let mut o = 282usize;
-                    while o + 1 < f.len() {
-                        let opt = f[o];
-                        if opt == 255 { break; }          // options end
-                        if opt == 0 { o += 1; continue; } // pad
-                        let len = f[o + 1] as usize;
-                        if opt == 3 && len >= 4 && o + 6 <= f.len() {           // router = gateway
-                            gw = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]];
-                        }
-                        if opt == 6 && len >= 4 && o + 6 <= f.len() {           // domain name server
-                            dns = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]];
-                            have_dns = true;
-                        }
-                        o += 2 + len;
-                    }
-                    if !have_dns { dns = gw; }            // no DNS option: the gateway usually forwards DNS
-                    ctx.log_fmt(format_args!(
-                        "net-stack: DHCP - offered {}.{}.{}.{}, gw {}.{}.{}.{}, dns {}.{}.{}.{}",
-                        ip[0], ip[1], ip[2], ip[3], gw[0], gw[1], gw[2], gw[3], dns[0], dns[1], dns[2], dns[3]));
-                    return Some((ip, gw, dns));
+        // Send the DISCOVER, then DRAIN + SCAN the RX ring for the OFFER: on a busy LAN the offer arrives
+        // amid a flood of broadcast, so we scan every frame within the budget, not just the coupled one.
+        let _ = nic_req(ctx, &req, LINK_SECS);
+        let mut found: Option<([u8; 4], [u8; 4], [u8; 4])> = None;
+        drain_scan(ctx, DANCE_SECS, |f| {
+            // A DHCP reply: IPv4 (0x0800, IHL 5), UDP (proto 17), BOOTP op = 2 (BOOTREPLY). yiaddr (our
+            // offered IP) sits at BOOTP offset 16 = frame offset 58.
+            if f.len() >= 62 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45 && f[23] == 17 && f[42] == 2 {
+                let ip = [f[58], f[59], f[60], f[61]];
+                // Learn the GATEWAY from the offer's options (magic cookie at frame offset 278 -> options
+                // at 282), option 3 = router. This is what makes it work on a REAL network (the gateway is
+                // 192.168.x.1, not QEMU's 10.0.2.2). Fall back to <subnet>.1.
+                let mut gw = [ip[0], ip[1], ip[2], 1];
+                let mut dns = [0u8; 4];
+                let mut have_dns = false;
+                let mut o = 282usize;
+                while o + 1 < f.len() {
+                    let opt = f[o];
+                    if opt == 255 { break; }          // options end
+                    if opt == 0 { o += 1; continue; } // pad
+                    let len = f[o + 1] as usize;
+                    if opt == 3 && len >= 4 && o + 6 <= f.len() { gw = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]]; }
+                    if opt == 6 && len >= 4 && o + 6 <= f.len() { dns = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]]; have_dns = true; }
+                    o += 2 + len;
                 }
-                // A frame came back but not our offer (a background broadcast on a live network) - retry
-                // within the budget rather than giving up on the first stray frame.
-            }
-            None => {
-                // No reply within the deadline: nic-driver still spawning, or not answering frames.
-                ctx.reacquire_by_name("nic-driver");
-            }
+                if !have_dns { dns = gw; }            // no DNS option: the gateway usually forwards DNS
+                found = Some((ip, gw, dns));
+                true
+            } else { false }
+        });
+        if let Some((ip, gw, dns)) = found {
+            ctx.log_fmt(format_args!(
+                "net-stack: DHCP - offered {}.{}.{}.{}, gw {}.{}.{}.{}, dns {}.{}.{}.{}",
+                ip[0], ip[1], ip[2], ip[3], gw[0], gw[1], gw[2], gw[3], dns[0], dns[1], dns[2], dns[3]));
+            return Some((ip, gw, dns));
         }
+        let _ = ctx.reacquire_by_name("nic-driver");   // best-effort: we retry either way
     }
     ctx.log("net-stack: DHCP - no offer within the budget - degrading to the fallback IP");
     None
@@ -346,7 +367,7 @@ fn udp_roundtrip(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_m
     for _ in 0..DANCE_TRIES {
         let reply = match ctx.request_with_reply_deadline("nic-driver", &req, DANCE_SECS) {
             Some(r) => r,
-            None => { ctx.reacquire_by_name("nic-driver"); continue; }
+            None => { let _ = ctx.reacquire_by_name("nic-driver"); continue; }
         };
         let f = reply.payload_bytes();
         if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[23] == 17
@@ -359,6 +380,131 @@ fn udp_roundtrip(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_m
         }
     }
     None
+}
+
+/// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
+const NTP_UNIX_OFFSET: u32 = 2_208_988_800;
+/// A fixed anycast NTP server (time.cloudflare.com) used if DNS cannot resolve a pool name - so a DNS
+/// hiccup never blocks the clock. Anycast: routed to the nearest instance, reliable from anywhere.
+const NTP_FALLBACK_IP: [u8; 4] = [162, 159, 200, 123];
+/// A plausible "now" window - reject a garbage/stale/hostile SNTP timestamp outside it rather than adopt
+/// it as this machine's time. Floor = 2020-01-01, ceiling = 2100-01-01 (both fit a u32 epoch).
+const SNTP_MIN_PLAUSIBLE: u32 = 1_577_836_800;
+const SNTP_MAX_PLAUSIBLE: u32 = 4_102_444_800;
+/// Tries for the SNTP exchange. Deliberately FEWER than DANCE_TRIES: each try costs a DANCE_SECS drain, and
+/// this runs inside net-stack's single-threaded serve loop, so a silent NTP server must not hold every
+/// other client op (net/ping/dns) behind it for the full 6-try budget.
+const SNTP_TRIES: u32 = 3;
+
+/// SNTP: fetch the current time from an NTP server and set the wall clock. The RTC-less Pi 2 has no other
+/// time source, so `date` reads zero until this runs (auto on boot after the DHCP dance, and on `date
+/// sync`). Resolve pool.ntp.org (fall back to a fixed anycast NTP IP if DNS is down), send a mode-3 client
+/// request to UDP 123, parse the 32-bit transmit timestamp (seconds since 1900), convert to Unix, and set
+/// the clock via the SET_CLOCK cap. Returns the Unix epoch on success. Bounded (udp_roundtrip's
+/// deadline+retry, Commandment VIII: waits on the reply, never hangs); a silent server returns None.
+/// The wall clock's current epoch if it already reads a plausible time, else `None`. Two uses: reporting
+/// the value after a dance that just synced (without paying for a second exchange), and deciding whether
+/// the BOOT sync is needed at all. This is a TRUTH test, not an arch test - a machine whose clock already
+/// knows the date (an x86 with a CMOS RTC) needs no network time; the RTC-less Pi 2 reads 0 and does.
+fn clock_epoch_if_set(ctx: &ServiceContext) -> Option<u32> {
+    let e = ctx.datetime().epoch_secs();
+    if e >= SNTP_MIN_PLAUSIBLE as i64 && e <= SNTP_MAX_PLAUSIBLE as i64 { Some(e as u32) } else { None }
+}
+
+fn sntp_sync(ctx: &ServiceContext, st: &NetState) -> Option<u32> {
+    if !st.have_mac { return None; }                     // no gateway MAC - nothing to send through
+    // Resolve an NTP server by name; fall back to the fixed anycast IP if DNS is down - but say so. A
+    // recovery that hides the failure it recovered from is a silent fallback (§26.7): without this line an
+    // operator cannot tell a resolved pool address from a broken resolver.
+    let (mut gf, mut fr, mut ud, mut to) = (false, 0u16, 0u16, 0u16);
+    let ntp_ip = match dns_resolve(ctx, b"pool.ntp.org", &st.gw_mac, &st.our_ip, &st.our_mac,
+                                   &st.dns_server, &mut gf, &mut fr, &mut ud, &mut to) {
+        Some(ip) => ip,
+        None => {
+            ctx.log("net-stack: SNTP - DNS could not resolve pool.ntp.org - using the fixed anycast NTP IP");
+            NTP_FALLBACK_IP
+        }
+    };
+    // A NONCE binds the reply to THIS request (RFC 4330 §5): the client puts it in the TRANSMIT timestamp
+    // (SNTP bytes 40..48 = frame 82..90) and the server echoes it back in the ORIGINATE timestamp (SNTP
+    // bytes 24..32 = frame 66..74). Without it every match field is a compile-time constant, so ANY host
+    // could spray one UDP packet and set this machine's wall clock - the capability system would have
+    // granted net-stack the right to set the clock, and net-stack would have handed the VALUE to a
+    // stranger (a confused deputy: §3.1/§26.9, authority reached by a principal that holds none).
+    let nonce: [u8; 8] = {
+        let hi = ctx.hw_random().unwrap_or((ctx.read_tsc() >> 13) as u32);
+        let lo = ctx.hw_random().unwrap_or(ctx.read_tsc() as u32);
+        let (h, l) = (hi.to_be_bytes(), lo.to_be_bytes());
+        [h[0], h[1], h[2], h[3], l[0], l[1], l[2], l[3]]
+    };
+    // The source port is derived from the nonce too, so it is not a constant an off-path spoofer can assume.
+    let src_port: u16 = 40_000 + (u16::from_be_bytes([nonce[0], nonce[1]]) % 20_000);
+    ctx.log_fmt(format_args!("net-stack: SNTP - querying {}.{}.{}.{}:123",
+        ntp_ip[0], ntp_ip[1], ntp_ip[2], ntp_ip[3]));
+    // Build the request frame ONCE: eth(14) + IPv4(20) + UDP(8) + SNTP(48) = 90 bytes.
+    let mut frame = [0u8; 90];
+    frame[0..6].copy_from_slice(&st.gw_mac);
+    frame[6..12].copy_from_slice(&st.our_mac);
+    frame[12] = 0x08; frame[13] = 0x00;                  // IPv4
+    frame[14] = 0x45;
+    let total: u16 = 20 + 8 + 48;
+    frame[16] = (total >> 8) as u8; frame[17] = total as u8;
+    frame[22] = 64; frame[23] = 17;                      // TTL, UDP
+    frame[26..30].copy_from_slice(&st.our_ip);
+    frame[30..34].copy_from_slice(&ntp_ip);
+    let ip_ck = checksum(&frame[14..34]);
+    frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
+    frame[34] = (src_port >> 8) as u8; frame[35] = src_port as u8;
+    frame[36] = 0; frame[37] = 123;                      // dest port 123
+    frame[38] = 0; frame[39] = 8 + 48;                   // UDP length
+    frame[42] = 0x1B;                                    // SNTP: LI 0, VN 3, Mode 3 (client)
+    frame[82..90].copy_from_slice(&nonce);               // transmit timestamp = our nonce
+    let req = Message::from_bytes(&frame);
+
+    // Send the request, then DRAIN + SCAN the RX ring for the reply until it arrives or the deadline - the
+    // same pattern DHCP/ARP use, so a WAN reply that lands tens of ms after the send (which a single-frame
+    // rx would have raced and lost) is caught. Retry past stray frames.
+    let mut unix: Option<u32> = None;
+    let mut arp_out = [0u8; 42];
+    for _ in 0..SNTP_TRIES {
+        let _ = nic_req(ctx, &req, LINK_SECS);
+        drain_scan(ctx, DANCE_SECS, |f| {
+            // A UDP reply FROM ntp_ip:123 TO our source port, ECHOING our nonce. `f[14] == 0x45` pins a
+            // 20-byte IP header, without which every offset below (ports at 34/36, SNTP at 42+) would be
+            // read from the wrong place on a packet carrying IP options.
+            if f.len() >= 90 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45 && f[23] == 17
+                && f[26..30] == ntp_ip[..] && f[34] == 0 && f[35] == 123
+                && f[36] == (src_port >> 8) as u8 && f[37] == src_port as u8
+                && f[66..74] == nonce[..]                        // originate == our nonce: this is OUR reply
+                && f[42] & 0x07 == 4                             // mode 4 = server
+                && f[42] >> 6 != 3                               // LI 3 = unsynchronized clock
+                && f[43] >= 1 && f[43] <= 15                     // stratum (0 = kiss-of-death, no time)
+            {
+                let ntp_secs = u32::from_be_bytes([f[82], f[83], f[84], f[85]]);
+                if ntp_secs > NTP_UNIX_OFFSET {
+                    let u = ntp_secs - NTP_UNIX_OFFSET;
+                    // Bounded BOTH ways: a garbage or hostile timestamp outside a plausible window is
+                    // refused rather than becoming this machine's idea of now.
+                    if (SNTP_MIN_PLAUSIBLE..=SNTP_MAX_PLAUSIBLE).contains(&u) { unix = Some(u); return true; }
+                }
+            }
+            // Answer an ARP for us in the meantime so the gateway can keep addressing our unicast replies.
+            if build_arp_reply(f, &st.our_ip, &st.our_mac, &mut arp_out) {
+                let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
+            }
+            false
+        });
+        if unix.is_some() { break; }
+    }
+    let u = unix?;
+    // The kernel can REFUSE this (no SET_CLOCK cap - e.g. on x86, where the CMOS RTC is the authority and
+    // nothing is granted the cap). Reporting "wall clock set" after a refusal would be a privileged
+    // operation the kernel denied, announced to the operator as done (§26.7, invariant 12).
+    if !ctx.set_wall_clock(u) {
+        ctx.log("net-stack: SNTP - clock set REFUSED by the kernel (no SET_CLOCK cap) - clock unchanged");
+        return None;
+    }
+    Some(u)
 }
 
 /// Send an ICMP echo request to `dest_ip` (via the gateway's MAC) and return true if the matching echo
@@ -408,26 +554,29 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target
     arp[22..28].copy_from_slice(our_mac);
     arp[28..32].copy_from_slice(our_ip);
     arp[38..42].copy_from_slice(target);             // target ip = who we ask for
-    let req     = Message::from_bytes(&arp);
-    let rx_only = Message::from_bytes(&[4u8]);
+    let req = Message::from_bytes(&arp);
     let mut arp_out = [0u8; 42];
-    let mut reply = nic_req(ctx, &req, DANCE_SECS);
-    for _ in 0..DNS_RX_TRIES {
-        let (mac, answer_arp) = {
-            let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => &[] };
+    // RETRY like DHCP: re-send the request each attempt (a busy LAN, or a burst the device split across
+    // bulk-INs, can lose one reply), then DRAIN + SCAN the ring for OUR reply, answering any gateway that
+    // ARPs for US along the way so it can reach us.
+    for _ in 0..DANCE_TRIES {
+        let _ = nic_req(ctx, &req, LINK_SECS);
+        let mut result: Option<[u8; 6]> = None;
+        drain_scan(ctx, DANCE_SECS, |f| {
             // An ARP REPLY (oper 2) whose SENDER IP is the target we asked for (not some other host's).
-            let hit = f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 && f[20] == 0x00 && f[21] == 0x02
-                && f[28] == target[0] && f[29] == target[1] && f[30] == target[2] && f[31] == target[3];
-            let mac = if hit { let mut m = [0u8; 6]; m.copy_from_slice(&f[22..28]); Some(m) } else { None };
-            let a = mac.is_none() && build_arp_reply(f, our_ip, our_mac, &mut arp_out);
-            (mac, a)
-        };
-        if let Some(m) = mac { return Some(m); }
-        reply = if answer_arp {
-            ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), DANCE_SECS)
-        } else {
-            ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS)
-        };
+            if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 && f[20] == 0x00 && f[21] == 0x02
+                && f[28] == target[0] && f[29] == target[1] && f[30] == target[2] && f[31] == target[3] {
+                let mut m = [0u8; 6]; m.copy_from_slice(&f[22..28]);
+                result = Some(m);
+                true
+            } else {
+                if build_arp_reply(f, our_ip, our_mac, &mut arp_out) {
+                    let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
+                }
+                false
+            }
+        });
+        if let Some(m) = result { return Some(m); }
     }
     None
 }
@@ -451,7 +600,15 @@ fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
     n = 0;
     while ctx.epoch_secs_monotonic() == s1 { ctx.yield_cpu(); n += 1; if n > SPIN_MAX { return 0; } }
     let hz = ctx.read_tsc().wrapping_sub(t0);
-    if (100_000_000..=10_000_000_000).contains(&hz) { hz } else { 0 }   // 100 MHz .. 10 GHz is sane
+    // The floor is PER-ARCH, not one range widened to cover both. The ARM generic timer advances ~1 MHz
+    // (the old 100 MHz floor rejected it, returning 0 -> the ping poll window `tsc_hz/3` collapsed to ~0
+    // cycles and ping only caught a reply inside the initial drain - the ~50% "random" loss, RTT 0). But
+    // simply lowering the floor everywhere would strip x86 of its protection: `deglitch_epoch` accepts a
+    // forward jump of up to a day, so a CMOS misread that cuts the measurement window short yields a few
+    // MHz on a GHz TSC - which the old floor rejected and a 0.5 MHz floor would accept, poisoning every
+    // RTT and deadline for the life of the process. Each arch keeps the floor that fits its clock.
+    let floor: u64 = if cfg!(target_arch = "arm") { 500_000 } else { 100_000_000 };
+    if (floor..=10_000_000_000).contains(&hz) { hz } else { 0 }
 }
 
 /// Send one ICMP echo of `payload_len` data bytes to `dest_ip` and wait for the reply. Returns
@@ -498,7 +655,16 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
         f.len() >= 42 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
             && f[23] == 1 && f[34] == 0
             && f[26] == dest_ip[0] && f[27] == dest_ip[1] && f[28] == dest_ip[2] && f[29] == dest_ip[3]
-            && f[40] == (seq >> 8) as u8 && f[41] == seq as u8
+            && {
+                // Match the CURRENT seq OR a very recent one. At 1 ping/s with a small delivery lag,
+                // a reply is delivered a ping or two behind the one that requested it, so there are
+                // always a few OUTSTANDING requests - a reply should match any of them (this is how
+                // ping tracks outstanding echoes), not only the newest. Exact-seq matching reported
+                // loss on a link that works. A stale reply from long ago still cannot match (window is
+                // small and backward-only), so a genuine dead link still shows loss.
+                let s = ((f[40] as u16) << 8) | (f[41] as u16);
+                seq.wrapping_sub(s) <= SEQ_MATCH_WINDOW
+            }
     };
     // us = cycles * 1e6 / tsc_hz (RTC-calibrated; the kernel's CPUID/PIT calib yields 0 on the AMD T630).
     // Finer than ms so a sub-ms LAN RTT is distinguishable from a WAN one; capped at 65 ms (u16).
@@ -520,30 +686,38 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
         None => *timeouts += 1,
     }
 
-    // 2. On a busy LAN the reply can be a frame or two BEHIND a stray broadcast. Drain a BATCH of frames
-    //    in ONE bounded round-trip ([9]) and scan it for our reply - NOT N slow re-queries (each polling
-    //    the full RX budget when the ring was momentarily empty; that pushed net-stack past the shell's
-    //    deadline). The batch is [count:u8] then [len:u16 LE, bytes] per frame; nic-driver stays pure
-    //    mechanism (raw frames), the ICMP match lives here (Commandment X).
-    if let Some(b) = nic_req(ctx, &Message::from_bytes(&[9u8]), LINK_SECS) {
-        let p = b.payload_bytes();
-        let n = if p.is_empty() { 0 } else { p[0] as usize };
-        let mut pos = 1usize;
-        for _ in 0..n {
-            if pos + 2 > p.len() { break; }
-            let fl = u16::from_le_bytes([p[pos], p[pos + 1]]) as usize;
-            pos += 2;
-            if pos + fl > p.len() { break; }
-            let f = &p[pos..pos + fl];
-            pos += fl;
-            *frames += 1;
-            if is_echo(f) { return Some((rtt_us(), f[22])); }
-            if build_arp_reply(f, our_ip, our_mac, &mut arp_out) {
-                let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
+    // 2. Poll for OUR reply until it arrives or a ~330 ms window closes, draining a BATCH of frames
+    //    ([9]) each round and scanning it. The reply for a WAN host arrives tens of ms AFTER the echo -
+    //    AFTER a single drain - so the old ONE-drain code raced the reply and lost, then discarded the
+    //    late reply on the next seq (frames were being RETRIEVED, the ping still timed out). The window
+    //    is bounded by read_tsc (tsc_hz-calibrated), a real sub-second wait, so a fast reply returns at
+    //    once and a lost one gives up quickly - not the 1 s-granular epoch clock. Batch = [count:u8]
+    //    then [len:u16 LE, bytes] per frame; nic-driver stays pure mechanism, the ICMP match lives here.
+    let deadline_cycles = if tsc_hz > 0 { tsc_hz / 3 } else { 0 };   // ~330 ms
+    loop {
+        if let Some(b) = nic_req(ctx, &Message::from_bytes(&[9u8]), LINK_SECS) {
+            let p = b.payload_bytes();
+            let n = if p.is_empty() { 0 } else { p[0] as usize };
+            let mut pos = 1usize;
+            for _ in 0..n {
+                if pos + 2 > p.len() { break; }
+                let fl = u16::from_le_bytes([p[pos], p[pos + 1]]) as usize;
+                pos += 2;
+                if pos + fl > p.len() { break; }
+                let f = &p[pos..pos + fl];
+                pos += fl;
+                *frames += 1;
+                if is_echo(f) { return Some((rtt_us(), f[22])); }
+                if build_arp_reply(f, our_ip, our_mac, &mut arp_out) {
+                    let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
+                }
             }
         }
+        // Give up once the reply window closes (or immediately if the clock is uncalibrated - one drain).
+        if deadline_cycles == 0 || ctx.read_tsc().wrapping_sub(t1) >= deadline_cycles {
+            return None;
+        }
     }
-    None
 }
 
 /// What one run of the boot dance (DHCP -> ARP -> ICMP) learns: our IP, the gateway's MAC, whether ARP
@@ -628,7 +802,7 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
                     break;
                 }
             }
-            None => { ctx.reacquire_by_name("nic-driver"); }
+            None => { let _ = ctx.reacquire_by_name("nic-driver"); }
         }
     }
     if !have_mac {
@@ -654,7 +828,21 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
     status[8..14].copy_from_slice(&gw_mac);
     status[14] = (have_mac as u8) | ((ping_ok as u8) << 1);
     status[15..19].copy_from_slice(&dns_server);
-    NetState { our_ip, our_mac, gw_mac, have_mac, dns_server, status }
+    let state = NetState { our_ip, our_mac, gw_mac, have_mac, dns_server, status };
+
+    // ---- Set the wall clock from the network (SNTP): the RTC-less Pi 2 has no other time source, so
+    // `date` reads zero until this runs. Best-effort - a failure just leaves the clock unset (a re-sync is
+    // available on demand via `date sync`). SKIPPED when the clock already reads a plausible date: on a
+    // machine with a working RTC (x86) the kernel refuses SetClock anyway, and paying a multi-second
+    // network exchange at every boot and every `net renew` for a syscall guaranteed to be denied is waste.
+    if clock_epoch_if_set(ctx).is_some() {
+        // nothing to do - the hardware clock is the authority here
+    } else if let Some(unix) = sntp_sync(ctx, &state) {
+        ctx.log_fmt(format_args!("net-stack: SNTP - wall clock set (epoch {})", unix));
+    } else if have_mac {
+        ctx.log("net-stack: SNTP - no time reply within the budget - clock stays unset");
+    }
+    state
 }
 
 /// Read the NIC link state from nic-driver's `[3]` status. RTL8168: byte 7 = link up. On the QEMU e1000
@@ -670,6 +858,12 @@ fn link_is_up(ctx: &ServiceContext) -> bool {
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("net-stack: starting");
+    // Announce the API BEFORE the configuration dance. The dance can take seconds (DHCP and ARP each
+    // wait out their budget when there is no link), and logging after it meant this line landed on the
+    // console AFTER the shell had already printed its prompt - leaving `gsh> net-stack: ...` on one
+    // line at boot. Announcing first is also the more honest order: this reports that the service came
+    // up, and the dance below reports its own result (offer/no offer) as it happens.
+    ctx.log("net-stack: serving the client API (status/dns/socket)");
 
     // Configure the stack (DHCP -> ARP -> ICMP). These are `mut` because `net renew` (op 8) re-runs the
     // dance in place - a link that comes up after boot recovers without a reboot.
@@ -683,7 +877,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut sockets = [Socket { rid: 0, port: 0 }; MAX_SOCKETS];
     let mut ping_seq: u16 = 0;                    // unique ICMP seq per ping - see ping() (RTT accuracy)
     let tsc_hz = calibrate_tsc_hz(&ctx);          // RTC-calibrated TSC Hz for RTT (kernel calib is 0 on T630)
-    ctx.log("net-stack: serving the client API (status/dns/socket)");
     loop {
         let req = ctx.recv();                   // block for a client request
         // A nonzero badge = a SOCKET-CAPABILITY invocation the kernel validated (§7.10). A plain
@@ -703,13 +896,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Gated on !have_mac so a configured stack pays nothing, and retried per request so the PHY's
         // few-second post-cable auto-negotiation eventually catches. Once configured the gateway MAC
         // persists, so a later unplug/replug just resumes (the ICMP flows again) without re-dancing.
+        let mut synced_by_dance = false;
         if badge.is_none() && !have_mac
-            && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6))
+            && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&10))
             && link_is_up(&ctx)
         {
             ctx.log("net-stack: link up while unconfigured - auto-configuring");
             let d = run_dance(&ctx);
             our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; have_mac = d.have_mac; dns_server = d.dns_server; status = d.status;
+            synced_by_dance = true;   // run_dance ends in its own SNTP sync - op 10 must not repeat it
         }
         if let Some((rid, right)) = badge {
             // Socket-cap invocation - SOP_SEND: transmit a UDP datagram through this socket. Payload =
@@ -824,6 +1019,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             dns_server = d.dns_server;
             status = d.status;
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&status));
+        } else if pl.first() == Some(&10) {
+            // SYNC (op 10): re-fetch the time from the network (SNTP) and set the wall clock - the shell
+            // `date sync`. Reply: [1, epoch(4 LE)] on success, [0] on failure (no NIC / server silent).
+            // If the auto-configure above just ran the dance (which ends in its own sync), do NOT sync
+            // again: that would put two full SNTP exchanges inside one request while every other client op
+            // waits behind this single-threaded serve loop.
+            let st = NetState { our_ip, our_mac, gw_mac, have_mac, dns_server, status };
+            match if synced_by_dance { clock_epoch_if_set(&ctx) } else { sntp_sync(&ctx, &st) } {
+                Some(unix) => {
+                    let mut r = [0u8; 5];
+                    r[0] = 1;
+                    r[1..5].copy_from_slice(&unix.to_le_bytes());
+                    ctx.log_fmt(format_args!("net-stack: SNTP - wall clock set (epoch {})", unix));
+                    let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&r));
+                }
+                None => { let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0])); }
+            }
         } else {
             // Status request (default): reply the CURRENT state, not just the frozen record. Read the link
             // and, if it is down (cable out), clear the "gateway resolved / ping OK" flags so `net` reflects

@@ -234,13 +234,14 @@ static mut TASK_PENDING_RECV_CAP_COUNT: [usize; MAX_TASKS] = [0; MAX_TASKS];
 // by the LastRecvBadge syscall. Packed `(badge_right << 32) | badge_id`; 0 = no badge.
 static TASK_LAST_BADGE: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
 
-/// RTC wall-clock datetime (packed, `rtc::read_datetime` format) captured at each task's spawn. Per-service
-/// uptime = `now_epoch_monotonic() - epoch_secs(this)` (surfaced by `task_stat`). The RTC gives PORTABLE
-/// real seconds; the monotonic BSP tick counter does NOT - its rate is the timer-IRQ rate, ~100 Hz only in
-/// TSC-deadline mode; on periodic-APIC HW (the T630, QEMU) it is ~10-20 Hz and not even known to the kernel,
-/// so ticks->seconds would be platform-dependent. The "now" read is DEGLITCHED (`now_epoch_monotonic`) so a
-/// transient CMOS misread landing on an in-range year can no longer inflate uptime to thousands of days (the
-/// "4987d" bug). A restart is a fresh spawn, so uptime resets - "since the last (re)start".
+/// `now_epoch_monotonic()` seconds captured at each task's spawn. Per-service uptime = `now_epoch_monotonic()
+/// - this` (surfaced by `task_stat`), both on the one deglitched monotonic timeline. It was a packed RTC
+/// datetime, which needed an `epoch_secs()` conversion and - fatally - read 0 on a board with no RTC (the
+/// Pi 2), zeroing every task's uptime there. now_epoch_monotonic is cntpct/timer_hz on ARM (real seconds
+/// since boot) and the deglitched RTC epoch on x86, so the delta is portable real seconds without a raw
+/// tick-counter (whose rate is platform-dependent and not always known to the kernel). The "now" read is
+/// DEGLITCHED so a transient CMOS misread can no longer inflate uptime to thousands of days (the "4987d"
+/// bug). A restart is a fresh spawn, so uptime resets - "since the last (re)start".
 static TASK_SPAWN_DT: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
 
 // ---------------------------------------------------------------------------
@@ -250,7 +251,26 @@ static TASK_SPAWN_DT: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX
 /// Base virtual address for task-requested dynamic allocations (AllocMem syscall).
 /// Placed well above the ELF load region (~2 MiB), user stack (≤ 0x8000_0000),
 /// and ServiceContextData page (0x3ff000) to avoid collisions.
+/// Where a task's `alloc_mem` region begins. Must sit ABOVE the loaded image and BELOW the user
+/// stack, in a range the kernel maps nothing into (the arch identity map is copied into every service
+/// address space, and `map_in_active_tables` refuses to overwrite a live section).
+///
+/// **This is word-size dependent, and getting that wrong cost real corruption.** The value was a flat
+/// `0x1_0000_0000` - 4 GiB, comfortably above everything on a 64-bit target. On a 32-bit address space
+/// that address DOES NOT EXIST: the mapping path takes `virt as u32`, so 2^32 truncated to **0** and
+/// every allocation mapped from VA 0 upward. A task with a 32 MiB limit therefore walked straight
+/// through its own image at 0x0040_0000 and mapped a NO_EXEC data page over its own TEXT - after which
+/// the next instruction fetch took a permission fault at its own entry. Observed nine times in one
+/// carnage run, byte-identical, as `mem-pressure` faulting at pc 0x0040002c; also behind `supervisor`
+/// faulting into its rodata at 0x0040_3000 and `fs` faulting at 0x0000_1000.
+///
+/// Same class as the arm32 `resource_invoke` truncation: a 64-bit constant that a 32-bit port silently
+/// narrows. On 32-bit the region sits at 1.25 GiB - clear of the 1 GiB RAM identity map and the
+/// peripheral window below it, and clear of `USER_STACK_TOP` (0x8000_0000) above.
+#[cfg(target_pointer_width = "64")]
 pub const TASK_HEAP_VA_START: u64 = 0x1_0000_0000; // 4 GiB
+#[cfg(target_pointer_width = "32")]
+pub const TASK_HEAP_VA_START: u64 = 0x5000_0000;   // 1.25 GiB
 
 /// Bytes dynamically allocated so far by each task (via AllocMem).
 static mut TASK_ALLOC_BYTES:   [u64; MAX_TASKS] = [0u64; MAX_TASKS];
@@ -285,6 +305,8 @@ static CORE_TOTAL_TICKS: PerCore<CachePaddedU64> = PerCore::new();
 /// The kernel is the last-resort recovery anchor (§6.3); if IT stalls silently nothing recovers it, so
 /// it must at minimum fail LOUD. `0` = that core has not ticked yet (still booting) - not a stall.
 static CORE_LAST_TICK_TSC: PerCore<CachePaddedU64> = PerCore::new();
+/// Has the liveness watchdog announced itself? Only so the arming line is printed once, not per tick.
+static LIVENESS_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Sticky round-robin scan pointer per core (§9.1, §9.3).
 ///
@@ -367,9 +389,8 @@ static CORE_SCHED_CTX: PerCoreMut<TaskContext> = PerCoreMut::new();
 /// (`main`, right after `smp::percpu_init` sets the width) - before any core enters `run()`. The
 /// contexts start zeroed (`run()` seeds CR3); the pending-kstack lists start empty.
 pub fn init_arenas(n: usize) {
-    const ZERO_CTX: TaskContext = TaskContext {
-        rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rip: 0, rsp: 0, cr3: 0,
-    };
+    // Zeroed via the arch primitive so no register name leaks into neutral code (arch/CLAUDE.md).
+    const ZERO_CTX: TaskContext = TaskContext::ZERO;
     CORE_PENDING_KSTACK.init_with(n, |_| [0u64; PENDING_KSTACK_CAP]);
     CORE_DEAD_CTX.init_with(n, |_| ZERO_CTX);
     CORE_SCHED_CTX.init_with(n, |_| ZERO_CTX);
@@ -441,13 +462,15 @@ pub fn reserve_task_slot(core_id: u32) -> Option<usize> {
         let result = unsafe {
             let mut found = None;
             for i in 0..MAX_TASKS {
-                if !TASK_VALID[i].load(Ordering::Relaxed) {
-                    // SEC-25 (SMP-port contract, kernel/src/arch/CLAUDE.md): on a weak-ordered arch this
-                    // store order is wrong - TASK_CORE (the data) must be written BEFORE TASK_VALID (the
-                    // Release flag), and the ~30 `TASK_VALID.load(Relaxed)` readers must become Acquire.
-                    // Correct on x86 (TSO); left as-is so x86 codegen is unchanged. The port fixes it.
-                    TASK_VALID[i].store(true, Ordering::Release);
+                if !TASK_VALID[i].load(Ordering::Acquire) {
+                    // SEC-25 (SMP-port contract, kernel/src/arch/CLAUDE.md), fixed by the ARM port: write
+                    // TASK_CORE (the data) BEFORE TASK_VALID (the Release flag that publishes it), and the
+                    // TASK_VALID readers load with Acquire. This establishes happens-before so a weak-
+                    // ordered core (Cortex-A7) that observes VALID==true also sees the data it guards; on
+                    // x86 (TSO) an Acquire load / Release store is identical codegen to Relaxed (a plain
+                    // mov), so this is behaviour-neutral there.
                     TASK_CORE[i]  = core_id;
+                    TASK_VALID[i].store(true, Ordering::Release);
                     found = Some(i);
                     break;
                 }
@@ -512,8 +535,11 @@ pub unsafe fn commit_task(
     unsafe {
         TASK_CTX[slot].write(ctx);
         TASK_NAME[slot]             = name;
-        TASK_SPAWN_DT[slot].store(crate::arch::imp::rtc::read_datetime(), Ordering::Relaxed);
+        TASK_SPAWN_DT[slot].store(crate::arch::imp::rtc::now_epoch_monotonic().max(0) as u64, Ordering::Relaxed);
         TASK_IS_USER[slot]          = is_user;
+        // Arch hook: on ARM a user task's syscalls must run atomically (the timer skips preempting it
+        // in SVC), which needs the slot recorded arch-locally. No-op on x86 (it reads TASK_IS_USER).
+        if is_user { crate::arch::imp::note_user_task(slot); }
         TASK_KERNEL_STACK_TOP[slot].store(kernel_stack_top, Ordering::Relaxed);
         TASK_ENDPOINT[slot].store(ep_to_u64(endpoint_id), Ordering::Relaxed);
         // TASK_STATE must be last: once Ready is visible to other cores, every
@@ -544,12 +570,12 @@ pub fn enqueue(
     // SAFETY: called from BSP before any AP scheduler starts.
     unsafe {
         for i in 0..MAX_TASKS {
-            if !TASK_VALID[i].load(Ordering::Relaxed) {
+            if !TASK_VALID[i].load(Ordering::Acquire) {
                 TASK_CTX[i].write(ctx);
                 TASK_CAP[i].write(caps);
                 TASK_STATE[i].store(TaskState::Ready as u8, Ordering::Relaxed);
                 TASK_NAME[i]             = name;
-                TASK_SPAWN_DT[i].store(crate::arch::imp::rtc::read_datetime(), Ordering::Relaxed);
+                TASK_SPAWN_DT[i].store(crate::arch::imp::rtc::now_epoch_monotonic().max(0) as u64, Ordering::Relaxed);
                 TASK_VALID[i].store(true, Ordering::Release);
                 TASK_CORE[i]             = core_id;
                 TASK_IS_USER[i]          = is_user;
@@ -568,12 +594,24 @@ pub fn enqueue(
 
 /// Validate and return a copy of the capability at `slot` in the current
 /// task's table.
+/// Set which task slot is "current" on a core. Used by a minimal/direct-entry bring-up (e.g. the ARM
+/// port's first service run) that enters a task without going through `scheduler::run`'s pick loop, so
+/// that `current_task_lookup_cap` and the user-copy path resolve to the right task. Arch-neutral.
+///
+/// # Contract (not `unsafe` - the store itself is a safe atomic write, no UB is possible)
+/// `slot` should be a reserved, valid task slot (or `IDLE`), and the core should not be concurrently
+/// running the scheduler pick loop for a different task; violating this mis-attributes syscalls, not
+/// memory-unsafe.
+pub fn set_current_task(core_id: u32, slot: usize) {
+    CORE_CURRENT.get(core_id as usize).store(slot, Ordering::SeqCst);
+}
+
 pub fn current_task_lookup_cap(slot: usize, right: Rights) -> Result<Capability, CapError> {
     let cid  = current_core_id();
     // SAFETY: IF=0 in syscall context; CORE_CURRENT is stable for this core.
     unsafe {
         let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
-        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
+        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Acquire) {
             TASK_CAP[cur].assume_init_ref().get(slot, right)
         } else {
             Err(CapError::CapNotHeld)
@@ -593,7 +631,7 @@ pub fn current_task_holds_resource(
     // SAFETY: IF=0 in syscall context; CORE_CURRENT is stable for this core.
     unsafe {
         let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
-        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
+        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Acquire) {
             TASK_CAP[cur].assume_init_ref().holds_resource(rid, right)
         } else {
             false
@@ -606,7 +644,7 @@ pub fn current_task_holds_resource(
 pub fn current_task_endpoint() -> Option<EndpointId> {
     let cid = current_core_id();
     let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
-    if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
+    if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Acquire) {
         ep_from_u64(TASK_ENDPOINT[cur].load(Ordering::Relaxed))
     } else {
         None
@@ -618,7 +656,7 @@ pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
     let cid = current_core_id();
     unsafe {
         let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
-        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
+        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Acquire) {
             TASK_CAP[cur].assume_init_mut().remove(slot)
         } else {
             None
@@ -633,7 +671,7 @@ pub fn current_task_read_cap_rights(slot: usize) -> Option<Rights> {
     let cid = current_core_id();
     unsafe {
         let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
-        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
+        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Acquire) {
             crate::capability::cap_read_rights(TASK_CAP[cur].assume_init_ref(), slot)
         } else {
             None
@@ -765,7 +803,7 @@ pub fn current_task_claim_alloc(size: u64) -> Option<u64> {
     // SAFETY: IF=0 in syscall context; single core writer.
     unsafe {
         let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
-        if cur >= MAX_TASKS || !TASK_VALID[cur].load(Ordering::Relaxed) { return None; }
+        if cur >= MAX_TASKS || !TASK_VALID[cur].load(Ordering::Acquire) { return None; }
 
         // Overflow guard: (size + 4095) wraps for very large values (e.g. u64::MAX).
         // saturating to u64::MAX guarantees the budget check rejects the request.
@@ -789,7 +827,7 @@ pub fn current_task_alloc_bytes() -> u64 {
     // SAFETY: IF=0 in syscall context; single core reader for this slot.
     unsafe {
         let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
-        if cur >= MAX_TASKS || !TASK_VALID[cur].load(Ordering::Relaxed) { return 0; }
+        if cur >= MAX_TASKS || !TASK_VALID[cur].load(Ordering::Acquire) { return 0; }
         TASK_ALLOC_BYTES[cur]
     }
 }
@@ -827,7 +865,7 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
             None     => 0,
         };
         TaskStatRaw {
-            valid:       TASK_VALID[slot].load(Ordering::Relaxed),
+            valid:       TASK_VALID[slot].load(Ordering::Acquire),
             state:       TASK_STATE[slot].load(Ordering::Acquire),
             core:        TASK_CORE[slot],
             mem_used:    TASK_ALLOC_BYTES[slot],
@@ -840,18 +878,16 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
             queue_depth,
             run_ticks:   TASK_RUN_TICKS[slot].load(Ordering::Relaxed),
             uptime_secs: {
-                // RTC epoch delta from the spawn stamp to a DEGLITCHED now. now_epoch_monotonic rejects a
-                // backwards step or an implausible (>1 day) forward jump, so a transient CMOS misread of
-                // "now" can no longer inflate this to thousands of days (the "4987d" bug). Two further
-                // clamps: .max(0) floors a backwards delta, and the result is capped at the system uptime
-                // (a service is never older than the system). 0 if never stamped (empty slot).
+                // Seconds since spawn, both timestamps on the SAME deglitched MONOTONIC clock
+                // (now_epoch_monotonic). The stamp used to be a packed RTC datetime, which forced an
+                // epoch_secs() conversion and read 0 on a board with no RTC (the Pi 2) - so every task's
+                // uptime was 0 there. now_epoch_monotonic is cntpct/timer_hz on ARM (seconds since boot)
+                // and the deglitched RTC epoch on x86, so `now - spawn` is correct on both. saturating_sub
+                // floors a backwards read; the monotonic timeline caps it at the system uptime intrinsically
+                // (a task can't spawn before boot). 0 if never stamped (empty slot / spawned at second 0).
                 let spawn = TASK_SPAWN_DT[slot].load(Ordering::Relaxed);
                 if spawn == 0 { 0 } else {
-                    let now  = crate::arch::imp::rtc::now_epoch_monotonic();
-                    let svc  = (now - crate::arch::imp::rtc::epoch_secs(spawn)).max(0);
-                    let boot = crate::arch::imp::rtc::boot_datetime();
-                    let sys  = if boot == 0 { svc } else { (now - crate::arch::imp::rtc::epoch_secs(boot)).max(0) };
-                    svc.min(sys) as u64
+                    (crate::arch::imp::rtc::now_epoch_monotonic().max(0) as u64).saturating_sub(spawn)
                 }
             },
         }
@@ -875,7 +911,7 @@ pub fn current_task_insert_cap(cap: Capability) -> Result<usize, CapError> {
     let cid = current_core_id();
     unsafe {
         let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
-        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Relaxed) {
+        if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Acquire) {
             TASK_CAP[cur].assume_init_mut().insert(cap)
         } else {
             Err(CapError::CapNotHeld)
@@ -1059,6 +1095,17 @@ pub fn run(core_id: u32) -> ! {
                 let slow_idle = cid != 0 && crate::arch::imp::interrupts::idle_can_halt();
                 if slow_idle {
                     crate::arch::imp::boot::rearm_idle_timer();
+                } else if crate::arch::imp::interrupts::idle_can_halt() {
+                    // The BSP is excluded from the SLOW idle tick above (it must keep driving
+                    // MONOTONIC_TICKS, scan_timed_wakes and the COM polling at full rate) - but it is
+                    // still about to HALT. On a one-shot timer that means halting on a deadline that is
+                    // already in flight, and if that deadline was consumed the core never wakes.
+                    //
+                    // NEVER HALT WITHOUT A FRESHLY ARMED WAKE. This was invisible while services
+                    // spin-yielded, because the BSP never actually reached idle; once they started
+                    // blocking, the AMD T630 panicked ~5 s after boot with core 0 dark for 3 s - the
+                    // liveness watchdog correctly catching exactly the lost-wake it was written for.
+                    crate::arch::imp::boot::rearm_quantum_timer();
                 }
                 // No ready tasks; re-enable interrupts and loop.
                 // `wait_for_interrupt` issues only `sti` - no PAUSE, no HLT.
@@ -1133,10 +1180,25 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // shootdown/critical-section is milliseconds, so the ~3 s deadline cannot false-fire.
         let now = crate::arch::imp::read_cycle_counter();
         CORE_LAST_TICK_TSC.get(cid).0.store(now, Ordering::Relaxed);
-        let tpq = crate::arch::imp::boot::tsc_ticks_per_quantum();
+        // The deadline comes from the ARCH, in the same units as `read_cycle_counter`, because the two
+        // must agree and only the arch knows both. It used to be derived here from
+        // `tsc_ticks_per_quantum() * 300`, which silently disabled the whole watchdog on any arch whose
+        // quantum figure is a stub - and arm32's is `0`. So the Pi 2 ran with NO liveness defence at all:
+        // a chaos run wedged the machine for 20-30 s at a time and then permanently, and the machine that
+        // is supposed to fail LOUD (invariant 12) went silent instead, which is what made it
+        // undiagnosable. `0` still means "this arch cannot say" and still disables the check - but that
+        // is now a deliberate per-arch answer rather than a side effect of an unrelated constant.
+        let deadline = crate::arch::imp::liveness_deadline_cycles();
         let ncores = crate::smp::core::ready_count() as usize;
-        if tpq > 0 {
-            let deadline = tpq.saturating_mul(300); // ~3 s (300 * 10 ms quanta) with no forward progress
+        // SAY whether the watchdog is on, once, the first time it arms. A safety net that is silently
+        // absent is worse than one that is absent loudly: arm32 ran without this check for the whole
+        // port and nothing ever said so, which is exactly how a wedge came to be undiagnosable. One line
+        // at boot makes "is the machine currently defended, and by what margin?" answerable from the log
+        // rather than from reading the source (§26.4).
+        if deadline > 0 && !LIVENESS_ARMED.swap(true, Ordering::Relaxed) {
+            crate::kprintln!("kernel: liveness watchdog ARMED - a core dark for {} counter ticks panics", deadline);
+        }
+        if deadline > 0 {
             for other in 0..ncores {
                 if other == cid { continue; }
                 let last = CORE_LAST_TICK_TSC.get(other).0.load(Ordering::Relaxed);
@@ -1145,10 +1207,14 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                 let dark = now.saturating_sub(last);
                 if last != 0 && dark > deadline {
                     let stuck_task = CORE_CURRENT.get(other).load(Ordering::Relaxed);
+                    // Report the overrun as a MULTIPLE of the deadline rather than in quanta: the
+                    // quantum figure is precisely what is unavailable on some arches, and a panic message
+                    // must not depend on the thing whose absence disabled this check in the first place.
                     panic!(
-                        "LIVENESS WEDGE: core {} made NO progress for {} TSC (~{} quanta, >3s); last \
-                         running task slot {}; detected by core {}. No forward progress = loud stop.",
-                        other, dark, dark / tpq, stuck_task, cid
+                        "LIVENESS WEDGE: core {} made NO progress for {} counter ticks ({}x the {} \
+                         allowed); last running task slot {}; detected by core {}. No forward progress \
+                         = loud stop.",
+                        other, dark, dark / deadline, deadline, stuck_task, cid
                     );
                 }
             }
@@ -1156,7 +1222,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // (The per-core "hb:" tick heartbeat that lived here was a diagnostic for the Wyse wedge hunt;
         // removed now that the wedge is fixed and the cross-core LIVENESS WATCHDOG above is the permanent
         // progress defense. It printed every ~2 s forever - idle console spam with no remaining purpose.)
-        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
+        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Acquire) {
             CORE_ACTIVE_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
             // Credit the running task this quantum - the per-task CPU% source for `observe`
             // (a task's run_ticks delta as a share of its core's total-tick delta). Idle quanta
@@ -1176,7 +1242,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // load and this transition, the CAS fails and Dead is preserved.
         // An unconditional store(Ready) would silently overwrite Dead, causing
         // kill_task_by_slot's CORE_CURRENT spin-wait to never exit.
-        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
+        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Acquire) {
             let _ = TASK_STATE[prev].compare_exchange(
                 TaskState::Running as u8,
                 TaskState::Ready as u8,
@@ -1194,11 +1260,11 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // acquires - no pin, no deadlock, no strand. Mirrors the pending switch-to-scheduler-context below.
         if cid == 0 && crate::task::supervisor_respawn_in_progress() && prev < MAX_TASKS {
             // Capture prev's user RSP now (other tasks run before prev is rescheduled, overwriting it).
-            if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
+            if TASK_VALID[prev].load(Ordering::Acquire) && TASK_IS_USER[prev] {
                 TASK_USER_RSP[prev] =
                     (*crate::arch::imp::syscall_entry::syscall_slot(cid)).user_rsp;
             }
-            let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
+            let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Acquire) {
                 // prev self-killed - discard into CORE_DEAD_CTX (never resumed).
                 CORE_DEAD_CTX.as_mut_ptr(cid)
             } else {
@@ -1237,7 +1303,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                 } else {
                     // Restore Running only if we changed the state to Ready above.
                     // CAS fails if state is Blocked* or Dead, leaving it untouched.
-                    if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
+                    if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Acquire) {
                         TASK_STATE[prev]
                             .compare_exchange(
                                 TaskState::Ready as u8,
@@ -1266,11 +1332,11 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             }
             // Save prev's user RSP (mirror the normal switch below): other tasks run before prev is
             // rescheduled, overwriting PER_CORE_SYSCALL.user_rsp, so capture it now.
-            if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
+            if TASK_VALID[prev].load(Ordering::Acquire) && TASK_IS_USER[prev] {
                 TASK_USER_RSP[prev] =
                     (*crate::arch::imp::syscall_entry::syscall_slot(cid)).user_rsp;
             }
-            let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
+            let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Acquire) {
                 // prev self-killed (e.g. the supervisor itself) - discard into CORE_DEAD_CTX.
                 CORE_DEAD_CTX.as_mut_ptr(cid)
             } else {
@@ -1331,7 +1397,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
 
         // Save BEFORE prepare_ring3_switch so we capture the value from the last
         // SYSCALL entry for `prev`, not the value prepare_ring3_switch writes for `next`.
-        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
+        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Acquire) && TASK_IS_USER[prev] {
             TASK_USER_RSP[prev] =
                 (*crate::arch::imp::syscall_entry::syscall_slot(cid)).user_rsp;
         }
@@ -1344,7 +1410,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
 
         let current_ctx: *mut TaskContext = if prev >= MAX_TASKS {
             CORE_SCHED_CTX.as_mut_ptr(cid)
-        } else if !TASK_VALID[prev].load(Ordering::Relaxed) {
+        } else if !TASK_VALID[prev].load(Ordering::Acquire) {
             // Slot was immediately released by a self-kill (deferred-kstack
             // approach).  Save into CORE_DEAD_CTX to avoid a write-after-claim
             // race with a concurrent spawn.  CORE_DEAD_CTX is never resumed.
@@ -1385,7 +1451,7 @@ pub fn yield_current() {
         // (timer_tick_from_irq) never mistakes a heavily-yielding core (one making progress via syscalls
         // rather than timer preemption) for a stalled one.
         CORE_LAST_TICK_TSC.get(cid).0.store(crate::arch::imp::read_cycle_counter(), Ordering::Relaxed);
-        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
+        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Acquire) {
             CORE_ACTIVE_TICKS.get(cid).0.fetch_add(1, Ordering::Relaxed);
             // Credit the running task this quantum - the per-task CPU% source for `observe`
             // (a task's run_ticks delta as a share of its core's total-tick delta). Idle quanta
@@ -1394,7 +1460,7 @@ pub fn yield_current() {
         }
 
         // CAS: preserve Dead if a cross-core kill races with this transition.
-        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
+        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Acquire) {
             let _ = TASK_STATE[prev].compare_exchange(
                 TaskState::Running as u8,
                 TaskState::Ready as u8,
@@ -1426,7 +1492,7 @@ pub fn yield_current() {
                 } else {
                     // CAS: don't overwrite Dead if kill raced between is_dead
                     // check and this restore.
-                    if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) {
+                    if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Acquire) {
                         TASK_STATE[prev]
                             .compare_exchange(
                                 TaskState::Ready as u8,
@@ -1453,11 +1519,11 @@ pub fn yield_current() {
         // stay Ready and are re-picked after the run-loop top runs poll. Zero cost when healthy (one
         // relaxed load). Skipped when already in the scheduler context (prev == IDLE).
         if cid == 0 && prev < MAX_TASKS && crate::task::supervisor_respawn_pending() {
-            if TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
+            if TASK_VALID[prev].load(Ordering::Acquire) && TASK_IS_USER[prev] {
                 TASK_USER_RSP[prev] =
                     (*crate::arch::imp::syscall_entry::syscall_slot(cid)).user_rsp;
             }
-            let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Relaxed) {
+            let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Acquire) {
                 CORE_DEAD_CTX.as_mut_ptr(cid)   // prev self-killed - discard (never resumed)
             } else {
                 TASK_CTX[prev].assume_init_mut() as *mut TaskContext
@@ -1515,7 +1581,7 @@ pub fn yield_current() {
 
         // Save BEFORE prepare_ring3_switch so we capture the value from SYSCALL
         // entry, not the value prepare_ring3_switch is about to write for `next`.
-        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Relaxed) && TASK_IS_USER[prev] {
+        if prev < MAX_TASKS && TASK_VALID[prev].load(Ordering::Acquire) && TASK_IS_USER[prev] {
             TASK_USER_RSP[prev] =
                 (*crate::arch::imp::syscall_entry::syscall_slot(cid)).user_rsp;
         }
@@ -1538,7 +1604,7 @@ pub fn yield_current() {
         // CORE_DEAD_CTX is never used as a load source (dead tasks not resumed).
         let current_ctx: *mut TaskContext = if prev >= MAX_TASKS {
             CORE_SCHED_CTX.as_mut_ptr(cid)
-        } else if !TASK_VALID[prev].load(Ordering::Relaxed) {
+        } else if !TASK_VALID[prev].load(Ordering::Acquire) {
             CORE_DEAD_CTX.as_mut_ptr(cid)
         } else {
             TASK_CTX[prev].assume_init_mut() as *mut TaskContext
@@ -1571,6 +1637,16 @@ pub fn current_task_is_dead() -> bool {
     TASK_STATE[current_task_slot()].load(Ordering::Acquire) == TaskState::Dead as u8
 }
 
+/// True if the current task on this core is actively **Running** (as opposed to blocked, or the core
+/// idling with `IDLE`). The ARM timer gate uses this: it must skip preemption only for a task genuinely
+/// *executing* a syscall - a task blocked in `recv`/`console_read` has voluntarily yielded, so the tick
+/// must still run (to drain input and reschedule the woken task). `IDLE == MAX_TASKS` is out of range,
+/// so the bounds check also makes an idling core "not running".
+pub fn current_task_is_running() -> bool {
+    let slot = current_task_slot();
+    slot < MAX_TASKS && TASK_STATE[slot].load(Ordering::Relaxed) == TaskState::Running as u8
+}
+
 /// Wake the task at `slot` with the given result code.
 ///
 /// If the task lives on a different core, sends a WAKE_RECEIVER IPI to that
@@ -1578,7 +1654,7 @@ pub fn current_task_is_dead() -> bool {
 pub fn wake_by_slot(slot: usize, result: i64) {
     // SAFETY: IF=0 from IPC/syscall path.
     unsafe {
-        if slot < MAX_TASKS && TASK_VALID[slot].load(Ordering::Relaxed) {
+        if slot < MAX_TASKS && TASK_VALID[slot].load(Ordering::Acquire) {
             // Do not revive a task that kill_task_by_slot has already marked Dead.
             let first = TASK_STATE[slot].load(Ordering::Acquire);
             if first == TaskState::Dead as u8 { return; }
@@ -1661,7 +1737,7 @@ pub fn find_task_by_name(name: &str) -> Option<usize> {
     // SAFETY: read-only scan; caller holds no locks.
     unsafe {
         for i in 0..MAX_TASKS {
-            if TASK_VALID[i].load(Ordering::Relaxed)
+            if TASK_VALID[i].load(Ordering::Acquire)
                 && TASK_NAME[i] == name
                 && TaskState::from(TASK_STATE[i].load(Ordering::Acquire)) != TaskState::Dead
             {
@@ -1703,13 +1779,11 @@ fn drain_pending_kstack(cid: usize) {
     let pml4_phys = CORE_PENDING_PML4.get(cid).load(Ordering::Acquire);
     if pml4_phys != 0 {
         CORE_PENDING_PML4.get(cid).store(0, Ordering::Relaxed);
-        // SAFETY: pml4_phys was the task's own PML4 frame; CR3 has since been
-        // switched away so no core's page-walker will read from it.
+        // SAFETY: pml4_phys was the task's own page-table root; CR3 has since been switched away so no
+        // core's page-walker will read from it. Arch-neutral root free (x86: free_frame; ARM: arena L1
+        // slot) - the deferred (self-kill) twin of the immediate free in the kill path.
         unsafe {
-            let frame = crate::memory::frame::Frame::from_phys(
-                crate::memory::frame::PhysAddr(pml4_phys)
-            );
-            crate::memory::allocator::free_frame(frame);
+            crate::arch::imp::page_tables::free_page_table_root(pml4_phys);
         }
     }
 }
@@ -1730,7 +1804,7 @@ pub fn kill_task_by_slot(slot: usize) {
     // Lock held; exclusive access to TASK_VALID/TASK_STATE across all cores.
     // All accesses below are atomic loads/stores - no unsafe required.
     let already_dead = {
-        if slot >= MAX_TASKS || !TASK_VALID[slot].load(Ordering::Relaxed) {
+        if slot >= MAX_TASKS || !TASK_VALID[slot].load(Ordering::Acquire) {
             task_slot_unlock();
             return;
         }
@@ -2034,12 +2108,11 @@ pub fn kill_task_by_slot(slot: usize) {
                         CORE_PENDING_PML4.get(my_core).store(pml4_phys, Ordering::Release);
                     }
                 } else if pml4_phys != 0 {
-                    // Not a self-kill: no core holds this CR3, so free the PML4 root now.
-                    // (Same unsafe context as the old in-loop free_frame above.)
-                    let frame = crate::memory::frame::Frame::from_phys(
-                        crate::memory::frame::PhysAddr(pml4_phys)
-                    );
-                    crate::memory::allocator::free_frame(frame);
+                    // Not a self-kill: no core holds this CR3, so free the page-table root now. Arch-
+                    // neutral: on x86 the root is a general frame (free_frame); on ARM it is an arena L1
+                    // slot returned to the arena. Handing an ARM arena L1 to free_frame corrupted the
+                    // frame bitmap (the `alloc_frame returned kernel-range frame` panic).
+                    crate::arch::imp::page_tables::free_page_table_root(pml4_phys);
                 }
                 freed_frames = freed;
             } else {
@@ -2134,7 +2207,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
 
         let cid  = current_core_id();
         let slot = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
-        assert!(slot < MAX_TASKS && TASK_VALID[slot].load(Ordering::Relaxed),
+        assert!(slot < MAX_TASKS && TASK_VALID[slot].load(Ordering::Acquire),
                 "block_and_reschedule: no running task");
 
         // Atomically transition Running → Blocked.
@@ -2263,7 +2336,7 @@ fn pick_next(core_id: usize) -> Option<usize> {
         // SAFETY: hint < MAX_TASKS; TASK_VALID/TASK_STATE are AtomicBool/AtomicU8
         // arrays (no unsafe needed); TASK_CORE is static mut but read-only here
         // after task spawn (immutable once set - see scheduler.rs §9.1 invariant).
-        let v = TASK_VALID[hint].load(Ordering::Relaxed);
+        let v = TASK_VALID[hint].load(Ordering::Acquire);
         let s = TASK_STATE[hint].load(Ordering::Acquire);
         let c = unsafe { TASK_CORE[hint] };
         let ready = v
@@ -2292,7 +2365,7 @@ fn pick_next(core_id: usize) -> Option<usize> {
         // Acquire: sees the Ready write from wake_by_slot's Release store.
         // SAFETY: TASK_STATE and TASK_CORE are static mut arrays; idx < MAX_TASKS.
         let (v2, s2, c2) = unsafe {(
-            TASK_VALID[idx].load(Ordering::Relaxed),
+            TASK_VALID[idx].load(Ordering::Acquire),
             TASK_STATE[idx].load(Ordering::Acquire),
             TASK_CORE[idx],
         )};

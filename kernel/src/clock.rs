@@ -40,6 +40,40 @@ pub fn epoch_secs(packed: u64) -> i64 {
     days * 86_400 + hour * 3_600 + min * 60 + sec
 }
 
+/// A plausible-epoch window shared by every clock consumer: 2020-01-01 .. 2100-01-01. Pure constants, so
+/// they live beside the pure date math; the stateful clock lives in the kernel-only `wallclock` module.
+pub const CLOCK_MIN_PLAUSIBLE: i64 = 1_577_836_800;
+pub const CLOCK_MAX_PLAUSIBLE: i64 = 4_102_444_800;
+
+/// The inverse of `epoch_secs`: Unix epoch seconds -> a `read_datetime`-packed value (same LSB-first
+/// layout: sec[6] min[6] hour[5] day[5] month[4] year[12]). Howard Hinnant's civil_from_days, so it is
+/// leap-year correct and round-trips `epoch_secs` exactly. Used by a settable wall clock (the RTC-less
+/// ARM port sets it from SNTP) so `date` can display a real time. Pure math, host-testable.
+pub fn packed_from_epoch(epoch: i64) -> u64 {
+    let days = epoch.div_euclid(86_400);
+    let rem = epoch.rem_euclid(86_400);
+    let hour = rem / 3_600;
+    let min = (rem % 3_600) / 60;
+    let sec = rem % 60;
+    // civil_from_days (days since 1970-01-01 -> y/m/d).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;                                   // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);            // [0, 365]
+    let mp = (5 * doy + 2) / 153;                                  // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1;                          // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };                 // [1, 12]
+    let year = y + (m <= 2) as i64;
+    (sec as u64 & 0x3F)
+        | ((min as u64 & 0x3F) << 6)
+        | ((hour as u64 & 0x1F) << 12)
+        | ((d as u64 & 0x1F) << 17)
+        | ((m as u64 & 0x0F) << 22)
+        | ((year as u64 & 0xFFF) << 26)
+}
+
 #[cfg(test)]
 mod tests {
     use super::deglitch_epoch;
@@ -140,6 +174,25 @@ mod epoch_tests {
                             epoch_secs(pack(y, mo, d, h, mi, s)),
                             reference_epoch(y, mo, d, h, mi, s),
                             "epoch_secs mismatch at {}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_from_epoch_round_trips_epoch_secs_over_the_sweep() {
+        // The inverse must round-trip the forward map for every date the wall clock can show. Cover the
+        // same multi-century sweep so a leap/century/month bug in civil_from_days cannot hide.
+        use super::packed_from_epoch;
+        for y in 1971..=2100i64 {
+            for mo in 1..=12i64 {
+                let last = days_in_month(y, mo);
+                for &d in &[1i64, 15, 28, last] {
+                    for &(h, mi, s) in &[(0i64, 0i64, 0i64), (23, 59, 59), (12, 30, 15)] {
+                        let e = epoch_secs(pack(y, mo, d, h, mi, s));
+                        assert_eq!(epoch_secs(packed_from_epoch(e)), e,
+                            "round-trip mismatch at {}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s);
                     }
                 }
             }

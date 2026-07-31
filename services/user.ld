@@ -39,10 +39,17 @@ SECTIONS {
 
     _end = .;
 
-    /* Discard unwinding tables - services use panic = "abort". */
+    /* Discard unwinding tables - services use panic = "abort". On ARM, `.ARM.exidx`/`.ARM.extab` are
+     * the unwind tables, and as orphan sections they land right after `.text` at a non-page-aligned
+     * address, forming their own PT_LOAD segment that shares a page with the next one - which the
+     * 4 KiB page-granular loader rejects. Discarding them (dead weight under panic=abort) keeps every
+     * PT_LOAD page-aligned. No-op on x86, which has none of these. */
     /DISCARD/ : {
         *(.eh_frame)
         *(.eh_frame_hdr)
         *(.note.GNU-stack)
+        *(.ARM.exidx*)
+        *(.ARM.extab*)
+        *(.ARM.attributes)
     }
 }

@@ -6,8 +6,9 @@ reaches the hardware only through this directory.
 
 If you are porting GodspeedOS to a new architecture, this file is your map. The claim it backs is the
 one proven in `docs/multi-arch.md`: **a new architecture is bounded to `arch/<isa>/` - you write that
-directory and nothing else in the kernel changes.** Five ISA families (x86-64, AArch64, RISC-V,
-LoongArch, s390x) and both word sizes (64-bit and 32-bit) have been proven this way.
+directory and nothing else in the kernel changes.** Six ISA families (x86-64, AArch64, ARMv7,
+RISC-V, LoongArch, s390x) and both word sizes (64-bit and 32-bit) have been proven this way - and
+**arm32 boots on real hardware** (Raspberry Pi 2 Model B, 2026-07-20), not only under emulation.
 
 ## The seam: `arch::imp`
 
@@ -95,6 +96,13 @@ entire cost of 32-bit support (`docs/multi-arch.md`, "Word size").
 - **AArch64** traps FP/SIMD at EL1 by default, and Rust emits NEON for `memcpy`/byte-copy, so `_start`
   must enable `CPACR_EL1.FPEN` before *any* Rust runs (found via `qemu -d int` -> ESR `0x07`). SP must
   be 16-byte aligned.
+- **ARMv7 (32-bit)** is a SEPARATE port from AArch64 - modes + CP15 rather than exception levels +
+  system registers, sharing no code. The Pi firmware enters it in **HYP mode** (Cortex-A7 has the virt
+  extensions) whenever a device tree is loaded, so `_start` must `eret` down to SVC; `.arch_extension
+  virt` is required or the assembler rejects `spsr_hyp`/`elr_hyp`/`eret`. QEMU's `raspi2b` hands over
+  in SVC, so emulation never exercises that branch. Do not assume firmware initialised the PL011
+  (QEMU's is disabled and silently eats output), but do NOT reprogram IBRD/FBRD - the reference clock
+  differs between firmware and emulation.
 - **RISC-V / LoongArch** use soft-float targets (`riscv64imac`, `-softfloat`), sidestepping the
   FP-enable step, and booted first try.
 - **s390x** is **big-endian** - it compiles clean (the endian-neutrality proof) but boot is pending
@@ -112,29 +120,38 @@ race unless the port meets the obligation below. These are the security audit's 
 instead of rediscovering them as heisenbugs. (They do not affect x86, so they are not "fixed" in code on
 `feat/hardening`; they are specified here for whoever brings up SMP on a weak arch.)
 
-**1. Task-slot publication ordering (SEC-25).** The scheduler publishes a slot with a flag store and
-reads it with a flag load, then touches plain data fields (`TASK_CTX`, `TASK_IS_USER`,
-`TASK_KERNEL_STACK_TOP`, ...). For the data to be visible whenever the flag is, the *writer* stores the
-data **before** the flag with **Release**, and every *reader* loads the flag with **Acquire** before
-touching the data. Two concrete port fixes:
-- `reserve_task_slot` currently stores `TASK_VALID[i] = true` (Release) *before* `TASK_CORE[i]` - reorder
-  so `TASK_CORE` (the data) is written first and `TASK_VALID` is the Release that publishes it.
-- The ~30 `TASK_VALID.load(Relaxed)` reader sites (and field reads gated on them) become **Acquire**. On
-  x86 an Acquire load is a plain `mov` (identical codegen); on AArch64/RISC-V it emits the barrier that
-  establishes happens-before. `commit_task` already publishes fields then `TASK_STATE = Ready` (Release);
-  the SEC-1 switch-in path is already `SeqCst`.
+**1. Task-slot publication ordering (SEC-25) - DONE (ARM port, kernel-audit Audit 5).** The scheduler
+publishes a slot with a flag store and reads it with a flag load, then touches plain data fields
+(`TASK_CTX`, `TASK_IS_USER`, `TASK_KERNEL_STACK_TOP`, ...). For the data to be visible whenever the flag
+is, the *writer* stores the data **before** the flag with **Release**, and every *reader* loads the flag
+with **Acquire** before touching the data. Both are now in the code:
+- `reserve_task_slot` writes `TASK_CORE[i]` first, then `TASK_VALID[i] = true` (**Release**) - the flag
+  publishes the data, not the reverse.
+- All 34 `TASK_VALID[..].load(..)` reader sites are **Acquire**. On x86 an Acquire load / Release store is
+  a plain `mov` (identical codegen); on AArch64/RISC-V/ARMv7 it emits the barrier that establishes
+  happens-before. `commit_task` already publishes fields then `TASK_STATE = Ready` (Release); the SEC-1
+  switch-in path is already `SeqCst`.
 
-  Without this, a weak-arch reader can observe `VALID`/`Ready == true` with a **stale `TASK_CTX`/CR3/
-  kstack** - the same use-after-free class as SEC-1.
+  Without this, a weak-arch reader could observe `VALID`/`Ready == true` with a **stale `TASK_CTX`/CR3/
+  kstack** - the same use-after-free class as SEC-1. A future weak-arch port inherits the fixed ordering;
+  no action needed. (The armv7 audit confirmed the *critical* scheduling path was already saved by the
+  `TASK_STATE` Release/Acquire publish even before this - the residual hazard was best-effort/
+  introspection readers gating a field read on a Relaxed `TASK_VALID`; those are now Acquire too.)
 
 **2. An address-space switch must flush the TLB (SEC-26 / SEC-27).** The neutral kill path *elides* the
 cross-core TLB shootdown for a pinned task ("a CR3 reload flushes non-global TLB entries"). That is an
 **x86 semantic**. On AArch64 a `TTBR0_EL1`+ASID switch does not implicitly flush; RISC-V `satp` needs an
 explicit `sfence.vma`. So the `arch::imp` context-switch / `write_page_table_base` primitive on a weak
 arch MUST either (a) flush the outgoing address space's non-global entries on the switch, or (b) the
-neutral kill path must issue the cross-core shootdown it currently elides. `invalidate_tlb_page` is
-local-core on x86 but broadcasts on ARM (`TLBI VAE1`) - a correctness-neutral but worth-knowing
-difference.
+neutral kill path must issue the cross-core shootdown it currently elides. On the **armv7 port** the
+context switch takes route (a): `switch_context` writes TTBR0 then `TLBIALL`+`dsb`+`isb` on an
+address-space change, satisfying SEC-26 for the pinned single-core model. Note the arm
+`invalidate_tlb_page` is **local** (`TLBIMVA`, `c8,c7,1`), *not* an inner-shareable broadcast - correct
+for per-task pinned address spaces where an unmap runs on the task's own core, but a future *cross-core*
+unmap that assumed a broadcast would under-flush and must upgrade to `TLBIMVAIS` (`c8,c3,1`). The neutral
+`write_page_table_base` on arm does TTBR0+ISB only (no TLB maintenance); switching between private
+address spaces goes exclusively through `switch_context` (which does flush), so no neutral caller relies
+on `write_page_table_base` to flush. (kernel-audit Audit 5, Findings 3/4 - doc corrected to match code.)
 
 **Every `arch::imp` primitive owes a documented SEMANTIC, not just a signature (SEC-27).** When you add
 `arch/<isa>/`, treat each primitive's memory-ordering, TLB, and broadcast behaviour as part of the
@@ -148,6 +165,42 @@ non-x86) DMA is **not** coherent - CPU and device can see stale copies. A port r
 MUST add cache maintenance (clean before a device read of a CPU-written buffer; invalidate before a CPU
 read of a device-written buffer), either by mapping the arena non-cacheable or via a `dma_sync`-style
 hook the accessors call. This is separate from the SMMU/H1 posture `docs/aarch64.md` already flags.
+
+## Porting a driver: the method (the doctrine)
+
+Supporting new hardware does not mean inventing a driver from the datasheet. Read the **working**
+driver - Linux, a BSD, u-boot, or a bare-metal project - and reimplement what the silicon wants as a
+GodspeedOS capability service. The condensed rule:
+
+> **The C driver tells us what the silicon wants; we implement that want as a small capability service,
+> and we throw away everything about how Linux talks to its own kernel. The hardware knowledge is the
+> reusable asset; the OS integration is ours and stays ours.**
+
+What that means in practice:
+
+- **Treat the reference driver as an executable datasheet.** Its register-init sequences, state machines,
+  and - most valuable - its *quirks and magic delays* are the reusable part (a real datasheet omits them).
+  The Pi 2 DWC2 bring-up cost ~13 hardware iterations rediscovering things `dwc2.c`/u-boot already knew
+  (halt all host channels at init; clock the FS PHY at 30/60 MHz not 48); reading the working driver
+  would have collapsed that.
+- **Reimplement, never translate.** A Linux driver is soaked in `struct device`/URB/workqueue/DMA-API/
+  `kmalloc`/threaded-IRQ/sysfs. None of that exists here. Our driver is a **service** (or, until ARM
+  routes device IRQs to userspace, a kernel module polled from the tick - see `arch/arm/CLAUDE.md`):
+  explicit MMIO/IRQ/DMA-arena caps, IPC, bounded arenas (no heap), **every hardware wait bounded**, loud
+  failure + restart. The OS-integration half does not map, so the *understanding* is the only thing that
+  crosses - which is also what keeps it clean.
+- **Prefer the simplest working reference.** u-boot's dwc2 (polled, ~1k lines) taught more than Linux's
+  (interrupt-driven, entangled in usbcore) because it is closer to our model. Use *BSD / u-boot /
+  bare-metal for the sequence; use Linux for completeness and quirk-hunting.
+- **Scope to the specific chips we run**, not "all hardware" - the RTL8168, the AHCI controller, the Pi
+  DWC2 / SD-EMMC / LAN9514. A handful of parts, each one focused driver reading one focused reference.
+- **License + provenance.** The kernel is GPL-2.0 (= Linux, compatible); driver *services* link the
+  Apache-2.0 SDK, so keep them genuine clean reimplementations - cite the *behaviour* in a comment
+  ("Linux `dwc2_init_fs_ls_pclk_sel` selects 30/60 MHz for a HS PHY"), never paste code. A short
+  per-driver note recording the extracted sequence and its reference doubles as our own datasheet.
+
+Grokking cuts the *discovery* cost, not the *iteration* cost: QEMU is not silicon, and the OS plumbing
+(e.g. routing device IRQs to userspace on ARM) plus real-hardware verification are still our work.
 
 ## See also
 

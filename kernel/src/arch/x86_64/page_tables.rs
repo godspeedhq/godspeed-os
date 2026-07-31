@@ -24,6 +24,10 @@ static mut HHDM_OFFSET: u64 = 0;
 /// Read the HHDM offset set during memory init.
 ///
 /// # Safety
+/// True if physical RAM is directly addressable (VA == PA), so a zero HHDM offset is VALID
+/// rather than "unset". x86 reaches frames through Limine's higher-half direct map, so this is false.
+pub const PHYS_IS_IDENTITY: bool = false;
+
 /// Returns 0 if called before `set_hhdm_offset`.
 #[inline]
 pub fn get_hhdm_offset() -> u64 {
@@ -274,6 +278,27 @@ pub fn read_page_table_base() -> u64 {
 pub unsafe fn write_page_table_base(base: u64) {
     // SAFETY: caller guarantees `base` is a valid root-table physical address.
     unsafe { core::arch::asm!("mov cr3, {}", in(reg) base, options(nostack, nomem)); }
+}
+
+/// Finalize a freshly-built service page table (neutral spawn hook). On x86 the kernel is shared into
+/// every address space via the higher-half PML4 entries, so nothing extra is needed - a no-op. (ARM
+/// clones the kernel identity into the table and cleans the D-cache here.)
+///
+/// # Safety
+/// `_cr3` is a service page-table root; this hook does nothing on x86.
+pub unsafe fn finalize_service_address_space(_cr3: u64) {}
+
+/// Free a dying task's page-table ROOT (its PML4). On x86 the root is an ordinary general-allocator
+/// frame, so this is exactly `free_frame` - the behaviour the neutral kill path had inline before it
+/// was made arch-neutral (ARM's root is an arena slot, freed differently; see `arch/arm/page_tables`).
+///
+/// # Safety
+/// `root` is a Dead task's PML4 physical address; no core will load this CR3 again (the neutral kill
+/// path defers this for the self-kill case via `CORE_PENDING_PML4`).
+pub unsafe fn free_page_table_root(root: u64) {
+    crate::memory::allocator::free_frame(crate::memory::frame::Frame::from_phys(
+        crate::memory::frame::PhysAddr(root),
+    ));
 }
 
 /// Invalidate a single TLB entry for `addr` on the local core (x86 invlpg; RISC-V sfence.vma, AArch64 TLBI).
