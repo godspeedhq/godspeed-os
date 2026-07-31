@@ -400,19 +400,28 @@ fn run_help_key(
 /// already queued and `try_console_read` returns it at once; a serial terminal may split
 /// the bytes, so we wait a bounded few monotonic ticks (`ESC_WAIT_TICKS`) before giving
 /// up. `None` ⇒ bare ESC. Returning quickly matters so a held key's repeats stay snappy.
-// ~100 ms at ~2 GHz, in read_tsc cycles. We time the bare-ESC wait off the TSC, not the
-// kernel monotonic tick (query 12), because the tick was found NOT to advance reliably on
-// real hardware (it silently broke typematic auto-repeat on the T630). read_tsc is
-// hardware-proven (§22 perf). A real escape sequence's bytes are already queued (the
-// keyboard pushes them atomically), so this wait only bounds how long a bare Escape - which
-// has nothing following - takes to resolve to "clear the line".
-const ESC_WAIT_CYCLES: u64 = 200_000_000;
+/// How long to wait for a follow-up byte, counted in SCHEDULER QUANTA rather than cycles.
+///
+/// This was `200_000_000` "cycles", meaning ~100 ms at ~2 GHz - true only on x86. `read_tsc` on the
+/// Pi 2 is the generic timer at ~1 MHz, not a 2 GHz CPU clock, so the same literal waited **~200
+/// SECONDS**. Pressing Escape on the Pi hung the line editor for over three minutes. It hid because
+/// only a BARE Escape reaches the wait: a real sequence's bytes are already queued, so arrows and
+/// Home/Delete returned instantly and nothing looked wrong.
+///
+/// Counting quanta needs no notion of the counter's rate, which is the whole point - `sleep(1)` is
+/// exactly one quantum on every architecture (`cycles_to_ticks` floors to 1 tick), so ~10 quanta is
+/// ~100 ms on x86, on ARM, and on any future port, with no constant to recalibrate. It also stays
+/// correct if ARM's quantum figure is later un-stubbed, since `1` still floors to one tick.
+///
+/// Sleeping rather than spinning also parks the task instead of pegging the core, and costs at most
+/// one quantum of latency on a split sequence - a serial terminal's follow-up byte arrives within a
+/// character time (~87 us at 115200), so it is caught on the first check either way.
+const ESC_WAIT_QUANTA: u32 = 10;
 fn read_escape_byte(ctx: &ServiceContext) -> Option<u8> {
     if let Some(b) = ctx.try_console_read() { return Some(b); }
-    let deadline = ctx.read_tsc().wrapping_add(ESC_WAIT_CYCLES);
-    while ctx.read_tsc() < deadline {
+    for _ in 0..ESC_WAIT_QUANTA {
+        ctx.sleep(1); // exactly one scheduler quantum, on every arch
         if let Some(b) = ctx.try_console_read() { return Some(b); }
-        ctx.yield_cpu();
     }
     None
 }
