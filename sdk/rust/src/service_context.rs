@@ -372,19 +372,29 @@ fn cache_send_slot(name: &str, new_slot: u32) {
 }
 
 /// How long each wait helper BLOCKS on its endpoint before surfacing to re-check the console and the
-/// deadline, in TSC cycles (~30 ms at 2 GHz; a platform whose cycle conversion is a stub degrades this to
-/// one scheduler quantum, which is the same order and equally fine).
+/// deadline: **exactly one scheduler quantum**, on every machine.
 ///
-/// The number is not the point - blocking at all is. These loops used `try_recv` + `yield_cpu`, which
-/// leaves the task permanently RUNNABLE: the core never reaches the scheduler's idle path, so it burns
-/// 100% on a task that is doing nothing, and any work the kernel does from that idle path does not happen
-/// while a command waits. On ARM that work is the USB hot-plug watch, so plugging or unplugging a device
-/// during a `ping` went unnoticed until the ping ended.
+/// This is deliberately not a cycle count. `recv_timeout` converts cycles to ticks with
+/// `cycles / tsc_ticks_per_quantum`, so the wait a cycle count buys is only as trustworthy as the TSC
+/// calibration - and it is not universally trustworthy. The T630's is ~1000x too SMALL (AMD, where the
+/// CPUID leaves this kernel reads are Intel-only), which divides 1000x too small and therefore waits
+/// 1000x too LONG: a 30 ms poll became ~30 SECONDS. Every net-stack query to nic-driver then blew its
+/// deadline, which presents as "net-stack is not responding" - a working network stack, wedged by a
+/// constant that assumed a good clock.
 ///
-/// The interval is a trade between how promptly `q` is noticed and how often the core wakes. Tens of
-/// milliseconds sits under human perception in one direction and well above scheduler overhead in the
-/// other, which is why the `observe` and muted loops already settled on the same figure.
-const ABORTABLE_POLL_CYCLES: u64 = 60_000_000;
+/// Any value below one quantum's worth of cycles floors to exactly 1 tick (`cycles_to_ticks` ends in
+/// `.max(1)`), so `1` means "one quantum" on a good TSC, a bad TSC, and a platform whose quantum figure
+/// is a `0` stub alike. The one number that cannot be distorted by a calibration this code does not own.
+///
+/// A quantum (~10 ms) is also the right interval on its own merits: far below the threshold at which a
+/// person notices `q` not landing, and far above scheduler overhead.
+///
+/// Blocking at all is the point. These loops used `try_recv` + `yield_cpu`, which leaves the task
+/// permanently RUNNABLE: the core never reaches the scheduler's idle path, so it burns 100% on a task
+/// that is doing nothing, and any work the kernel does from that idle path does not happen while a
+/// command waits. On ARM that work is the USB hot-plug watch, so plugging or unplugging a device during
+/// a `ping` went unnoticed until the ping ended.
+const ABORTABLE_POLL_CYCLES: u64 = 1;
 
 /// Passed by the kernel to `service_main`. Non-Copy; one per service instance.
 pub struct ServiceContext {
