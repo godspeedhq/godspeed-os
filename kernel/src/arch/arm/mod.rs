@@ -27,6 +27,9 @@ pub mod meminit;
 pub mod syscall;
 pub mod video;
 pub mod fbcon;
+/// The framebuffer-console backend primitives the neutral `crate::fbcon` calls through `arch::imp`.
+/// See `crate::fbcon`'s module header for the contract each one owes.
+pub use fbcon::{fb_commit, FB_READBACK_CHEAP};
 pub mod dwc2;
 pub mod hid;
 // USB-net bridge (the mechanism the userspace ARM `nic-driver` calls): move ethernet frames to/from the
@@ -502,7 +505,7 @@ pub(super) fn pl011_write(s: &[u8]) {
     // Write lock-free.
     if !SERIAL_SMP.load(Ordering::Relaxed) {
         for &b in s { pl011_write_byte(b); }
-        fbcon::put_bytes(s); // mirror to the TV once the console is up (no-op before that)
+        fbcon::mirror(s); // mirror to the TV once the console is up (no-op before that)
         return;
     }
     // Clear any stale exclusive-monitor reservation before the compare-exchange below. ARMv7 does NOT
@@ -535,7 +538,7 @@ pub(super) fn pl011_write(s: &[u8]) {
     // serial above (the source of truth); only its TV mirror is dropped, which is invisible in practice
     // because the dominant console writer (the shell) holds the lock for its own output.
     if held {
-        fbcon::put_bytes(s);
+        fbcon::mirror(s);
         SERIAL_BUSY.store(false, Ordering::Release);
     }
 }
@@ -1509,10 +1512,6 @@ pub mod iommu {
     pub fn drain_event_log() {}
 }
 
-// ---------------------------------------------------------------------------
-pub mod fb {
-    pub fn dims_packed() -> u64 { 0 }
-}
 
 // ---------------------------------------------------------------------------
 pub mod ioapic {

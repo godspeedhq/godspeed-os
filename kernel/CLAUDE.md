@@ -36,6 +36,7 @@ The kernel requires a custom target spec. The binary is a flat ELF loaded by Lim
 | `syscall/`       | §8.2        | 2 grandfathered lines (syscall entry - see audit) |
 | `interrupt/`     | §12         | 1 grandfathered line (IDT delivery - see audit) |
 | `invariants/`    | §22         | No  |
+| `fbcon/`         | §11.4       | No - see below |
 | `log.rs`         | §11.4       | No  |
 | `control.rs`     | §17         | No  |
 
@@ -44,6 +45,22 @@ The kernel requires a custom target spec. The binary is a flat ELF loaded by Lim
 `unsafe` is permitted **only** in `arch/`, `memory/`, `capability/`, `smp/`. Every `unsafe` block must have a `// SAFETY:` comment. The grandfathered lines in `task/`, `syscall/`, and `interrupt/` are documented in `docs/unsafe-audit.md` and frozen - they may decrease but increase only by a recorded §18.5 amendment with rationale. There are no such amendments: hardening that needs `unsafe` (e.g. the H4 W^X / kstack-guard work) puts it in a permitted layer (`arch/`) and uses safe `fn`s for boot-ordering call sites, so the grandfathered floors hold.
 
 A PR adding an unsafe block without a SAFETY comment is rejected without review.
+
+## Framebuffer console (`fbcon/`)
+
+The text console every architecture shares: the ANSI escape parser, the UTF-8 decoder, the character
+grid, glyph rendering and scrolling. It replaced two independent copies (`arch/x86_64/fb.rs` and
+`arch/arm/fbcon.rs`) that had drifted apart, each having fixed terminal bugs the other still had.
+
+`fbcon/` is **not** one of the four unsafe-permitted layers, and it does not need to be. The arch hands
+the console its framebuffer as a `&'static mut [u8]` slice (`FbParams::mem`), so every pixel write here
+is a bounds-checked slice write, the scroll is `slice::copy_within` and the clear is `slice::fill`. The
+one `unsafe` per arch - turning a mapped address into that slice - lives in the arch backend, which is
+the only place that knows the mapping is valid and permanent.
+
+Each arch owes two primitives through `arch::imp`, documented in `fbcon/mod.rs`: `fb_commit` (publish a
+written rectangle - a D-cache clean on ARM, a store fence on x86) and `FB_READBACK_CHEAP` (whether
+reading the framebuffer back is as cheap as writing it, which picks the scroll strategy).
 
 ## Control channel (`control.rs`)
 

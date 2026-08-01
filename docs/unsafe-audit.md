@@ -13,6 +13,38 @@ comment.
 
 ---
 
+## 2026-08-01 - one framebuffer console for every arch: unsafe 11 -> 3 (refactor/fbcon-neutral)
+
+`arch/x86_64/fb.rs` (790 lines) and `arch/arm/fbcon.rs` (512 lines) were two independent
+implementations of the same terminal. They are now one neutral module, `kernel/src/fbcon/`, with a thin
+per-arch backend. **`fbcon/` is NOT a permitted layer (§18.1), and no amendment was sought to make it
+one** - instead the design was changed so the neutral module needs no `unsafe` at all.
+
+The mechanism: the arch hands the console the framebuffer as a **`&'static mut [u8]` slice**
+(`FbParams::mem`) rather than a base address. Every pixel write in `fbcon/` is then a bounds-checked
+slice write; the scroll memmove is `slice::copy_within`; the clear is `slice::fill`. The single
+`unsafe` per arch is `core::slice::from_raw_parts_mut` at init, in the layer that actually knows the
+mapping is valid and permanent.
+
+**This supersedes a claim in the 2026-07-10 entry below**, which said of the fast blit path: *"There is
+no safe route ... a bounds-checked `&mut [u32]` would defeat the purpose (a compare per pixel is the
+very overhead removed)."* That is false, and the assumption behind it was that the check would be
+per-pixel. It is not: slicing the row once (`mem.get_mut(off..end)`) bounds-checks the whole run, and
+`chunks_exact_mut` then iterates it without further checks - the same contiguous store pattern, with
+one compare per row instead of per pixel. Verified behaviour-identical: the rendered framebuffer is
+**byte-for-byte the same PNG** (md5 `2670c31a...`) before and after the change, on the `edit`
+full-screen path that exercises glyphs, reverse video, absolute positioning and erase.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/fb.rs` | 5 -> 2 (-3) | Reduced to the Limine binding + the WC store fence. Remaining: the `sfence` in `fb_commit`, and `from_raw_parts_mut` over Limine's reported `[address, address + pitch*height)` - higher-half, copied into every address space by `PageTable::new`, so 'static; taken once on the BSP before any AP starts, and no other kernel reference to the framebuffer exists, so `&mut` exclusivity holds. |
+| `arch/arm/fbcon.rs` | 6 -> 1 (-5) | Reduced to the pixel format, the D-cache clean in `fb_commit`, and the single-writer mirror gate. Remaining: `from_raw_parts_mut` over the mailbox-reported base, mapped by `video::map` before this runs, taken once on the boot core before the tick or any AP starts. |
+| `fbcon/mod.rs`, `fbcon/render.rs` | 0 | Neutral layer - unsafe-free by construction, which is why no §18.1 amendment is needed. |
+
+Net: 11 lines -> 3, and roughly 300 lines of duplicated logic collapsed to one copy.
+
+---
+
 ## 2026-07-29 - LAN9514 networking: interrupt-driven RX, PHY link state, SNTP (feat/arm-usb-interrupt)
 
 The Pi 2's onboard LAN9514 brought up on real hardware, then reworked from a polled RX to an
@@ -1063,7 +1095,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
-| arch/arm/fbcon.rs | 6 | permitted |
+| arch/arm/fbcon.rs | 1 | permitted |
 | arch/arm/dwc2.rs | 34 | permitted |
 | arch/arm/page_tables.rs | 31 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
@@ -1081,7 +1113,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/ap_boot.rs | 2 | permitted |
 | arch/x86_64/boot.rs | 107 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
-| arch/x86_64/fb.rs | 5 | permitted |
+| arch/x86_64/fb.rs | 2 | permitted |
 | arch/x86_64/interrupts.rs | 22 | permitted |
 | arch/x86_64/ioapic.rs | 8 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
