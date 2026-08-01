@@ -38,13 +38,22 @@ pub(super) const CELL_H: usize = RASTER_HEIGHT.val();
 pub(super) const BOX_FIRST: u8 = 0xB3;
 
 /// Integer font-scale factor for the current framebuffer. The glyph raster is a fixed CELL_W x CELL_H
-/// pixels; on a dense panel (the Dell Wyse 5070's native mode, or a Pi driving a 4K TV) that renders as
-/// a wall of tiny text, so each glyph pixel is upscaled to a `scale x scale` block. Chosen to target
-/// about 30 text rows: 1x on a T630-class panel, 2x around 1080p, 3x on a very high resolution. Larger
-/// cells also mean fewer rows/cols, so a `scroll` (which repaints every cell) touches fewer cells.
+/// pixels; on a genuinely dense panel (the Dell Wyse 5070's native 3840x2160) that renders as a wall of
+/// tiny text, so each glyph pixel is upscaled to a `scale x scale` block.
+///
+/// **Upscaling is a last resort, not a mid-range default, because it coarsens the font.** The Noto
+/// raster is antialiased - each pixel is a 0-255 intensity - and replicating a pixel into an `sc x sc`
+/// block magnifies that gradient into visible chunks. At 1x the text is smooth; at 2x it reads as
+/// grainy. So scale only where 1x would genuinely be unreadable.
+///
+/// A plain `height / 600` puts the first step at 1200 px, which is the honest boundary: below it a
+/// 20 px cell is perfectly legible and should stay pixel-exact. The previous `(height + 300) / 600`
+/// biased the step down to 900 px, which caught a 1824x984 TV (the Pi 2's HDMI mode) and made it 2x -
+/// bigger and grainier than the same panel had always rendered. Both verified x86 machines are
+/// unaffected either way: the T630 (768) stays 1x and the Wyse (2160) stays 3x.
 #[inline]
 pub(super) fn cell_scale(s: &Fb) -> usize {
-    ((s.height + 300) / 600).clamp(1, 3)
+    (s.height / 600).clamp(1, 3)
 }
 
 /// Map a decoded Unicode codepoint to the internal **cell byte** the grid stores. ASCII passes through
@@ -254,6 +263,15 @@ pub(super) fn draw_glyph(s: &mut Fb, ch: u8, col: usize, row: usize) {
     let y0 = s.org_y + row * CELL_H * sc;
     if ch >= BOX_FIRST && box_arms(ch) != (false, false, false, false) {
         draw_box_glyph(s, ch, x0, y0);
+        return;
+    }
+    // A blank cell is just the background: skip the raster lookup and the per-pixel blend and paint it
+    // as one solid rectangle. Spaces dominate real output - padded status bars, indentation, and every
+    // erase - so this is the difference between a full-screen repaint being a rectangle fill and being
+    // thousands of glyph blits. It matters most where the CPU is slowest and the grid largest (a Pi 2
+    // driving a 182x44 TV, where `edit` was visibly crawling before this).
+    if ch == b' ' {
+        clear_cell(s, x0, y0);
         return;
     }
     // Noto raster: `raster()` is `height` rows of `width` intensity bytes; the crate guarantees those

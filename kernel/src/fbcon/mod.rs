@@ -30,6 +30,8 @@
 //! - `arch::imp::FB_READBACK_CHEAP` says whether reading the framebuffer back is as cheap as writing
 //!   it, which selects the scroll strategy - see [`scroll`].
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::smp::spinlock::SpinLock;
 
 mod render;
@@ -102,7 +104,6 @@ pub(crate) struct Fb {
     row: usize,    // cursor row
     fg: u32,       // foreground pixel value (already in the device's channel layout)
     bg: u32,       // background pixel value (always black - see FbParams)
-    ready: bool,   // false until init runs; put_byte no-ops until then
 
     // --- ANSI escape parser ---
     // The shell and the full-screen apps drive the terminal with a small ANSI subset (clear, cursor
@@ -162,7 +163,6 @@ static FB: SpinLock<Fb> = SpinLock::new(Fb {
     row: 0,
     fg: 0,
     bg: 0,
-    ready: false,
     esc: 0,
     csi_priv: false,
     csi_params: [0; 4],
@@ -219,13 +219,16 @@ pub fn init(p: FbParams) {
     s.csi_nparam = 0;
     s.reverse = false;
     s.cursor_visible = true;
-    s.ready = true;
     clear(&mut s);
     commit(&mut s);
     // Report the panel geometry + the chosen font scale. Drop the lock first: `kprintln` renders to this
     // same console, so logging while holding it would re-enter the lock.
     let (w, h, bpp, cols, rows) = (s.width, s.height, s.bpp, s.cols, s.rows);
     drop(s);
+    // Publish LAST: `ready` is what every entry point above tests before it touches the lock, so the
+    // console must be fully built and cleared before any of them may proceed. Release pairs with the
+    // Acquire load in `ready`.
+    READY.store(true, Ordering::Release);
     crate::kprintln!(
         "fb: {}x{} {}bpp, font-scale {}x -> {} cols x {} rows",
         w,
@@ -237,30 +240,42 @@ pub fn init(p: FbParams) {
     );
 }
 
+/// Set once `init` has published the console. **Deliberately a plain flag rather than a field behind
+/// `FB`**, because every public entry point below tests it BEFORE taking the lock - see `ready`.
+static READY: AtomicBool = AtomicBool::new(false);
+
 /// True once `init` has run. An arch that mirrors serial output to the display checks this so it can
 /// call `put_bytes` unconditionally and have it no-op before the console exists.
+///
+/// **This must not take the console lock, and neither must anything reached before `init`.** On ARMv7
+/// the serial path mirrors every byte here, including boot messages emitted *before the MMU is on*, and
+/// `SpinLock::lock` is a `compare_exchange` - LDREX/STREX, which a real Cortex-A7 leaves UNPREDICTABLE
+/// without the MMU (the exclusive monitor needs memory attributes). QEMU emulates it permissively, so
+/// this fails only on silicon: the Pi hangs on the firmware's rainbow splash before a single character
+/// of serial output. A plain load is one `LDRB` and is safe with the MMU off, which is what ARM's
+/// pre-refactor console used. `arch/arm/mod.rs` carries the same warning at `pl011_write`.
 pub fn ready() -> bool {
-    FB.lock().ready
+    READY.load(Ordering::Acquire)
 }
 
 /// Framebuffer text geometry packed as `(rows << 16) | cols`, or 0 if the console has not been
 /// initialised. Exposed to userspace via `InspectKernel` query 9 so the console service can lay out its
 /// terminal.
 pub fn dims_packed() -> u32 {
-    let s = FB.lock();
-    if !s.ready {
+    if !ready() {
         return 0;
     }
+    let s = FB.lock();
     (((s.rows as u32) & 0xFFFF) << 16) | ((s.cols as u32) & 0xFFFF)
 }
 
 /// Clear the framebuffer and move the cursor to the top-left. Used when the shell ends boot-log
 /// mirroring (`console_boot_complete`) to hand over a clean console.
 pub fn clear_and_home() {
-    let mut s = FB.lock();
-    if !s.ready {
+    if !ready() {
         return;
     }
+    let mut s = FB.lock();
     clear(&mut s);
     s.col = 0;
     s.row = 0;
@@ -276,10 +291,10 @@ pub fn clear_and_home() {
 
 /// Write one output byte to the console.
 pub fn put_byte(b: u8) {
-    let mut s = FB.lock();
-    if !s.ready {
+    if !ready() {
         return;
     }
+    let mut s = FB.lock();
     process_byte(&mut s, b);
     commit(&mut s);
 }
@@ -288,10 +303,10 @@ pub fn put_byte(b: u8) {
 /// multi-byte write (the shell's `gsh> ` prompt, say) is atomic with respect to another core's console
 /// output - no byte from another core can interleave mid-string.
 pub fn put_bytes(bytes: &[u8]) {
-    let mut s = FB.lock();
-    if !s.ready {
+    if !ready() {
         return;
     }
+    let mut s = FB.lock();
     for &b in bytes {
         process_byte(&mut s, b);
     }
@@ -609,34 +624,48 @@ fn execute_csi(s: &mut Fb, final_byte: u8) {
 // Erase operations
 // ---------------------------------------------------------------------------
 
+/// Blank a rectangular block of cells as ONE solid fill, and mark them blank in the shadow grid.
+///
+/// Erasing used to draw a space *glyph* per cell - a font raster lookup and a full cell of blended
+/// pixel writes, per blank cell. That is affordable on a fast CPU with an 80x24 grid and is not on a
+/// 900 MHz Cortex-A7 with a 182x44 one: `ESC[K` fires once per row, so a full-screen repaint became
+/// thousands of glyph blits and `edit` visibly crawled on the Pi's TV. A blank cell is by definition
+/// just the background colour (the foreground, under reverse video), so the whole block is one
+/// `fill_rect` writing long contiguous runs - same pixels, a fraction of the work.
+fn blank_block(s: &mut Fb, col: usize, row: usize, cols: usize, rows: usize) {
+    if cols == 0 || rows == 0 {
+        return;
+    }
+    let sc = render::cell_scale(s);
+    let (cw, ch) = (CELL_W * sc, CELL_H * sc);
+    let x0 = s.org_x + col * cw;
+    let y0 = s.org_y + row * ch;
+    let colour = render::paper(s);
+    render::fill_rect(s, x0, y0, cols * cw, rows * ch, colour);
+    for r in row..(row + rows).min(s.rows) {
+        for c in col..(col + cols).min(s.cols) {
+            grid_set(s, c, r, b' ');
+        }
+    }
+}
+
 /// Blank cells from the cursor column to the end of the current row.
 fn erase_line_to_eol(s: &mut Fb) {
     let (row, col, cols) = (s.row, s.col, s.cols);
-    for c in col..cols {
-        render::draw_glyph(s, b' ', c, row);
-        grid_set(s, c, row, b' ');
-    }
+    blank_block(s, col, row, cols.saturating_sub(col), 1);
 }
 
 /// Blank every cell on the current row.
 fn erase_line_full(s: &mut Fb) {
     let (row, cols) = (s.row, s.cols);
-    for c in 0..cols {
-        render::draw_glyph(s, b' ', c, row);
-        grid_set(s, c, row, b' ');
-    }
+    blank_block(s, 0, row, cols, 1);
 }
 
 /// Blank from the cursor to the end of the screen (rest of this row, then every row below it).
 fn erase_to_end_of_screen(s: &mut Fb) {
     erase_line_to_eol(s);
     let (rows, cols, start) = (s.rows, s.cols, s.row + 1);
-    for r in start..rows {
-        for c in 0..cols {
-            render::draw_glyph(s, b' ', c, r);
-            grid_set(s, c, r, b' ');
-        }
-    }
+    blank_block(s, 0, start, cols, rows.saturating_sub(start));
 }
 
 // ---------------------------------------------------------------------------

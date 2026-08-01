@@ -59,8 +59,12 @@ const PL011_DR:        *mut u32 = PL011_BASE as *mut u32;              // +0x00 
 const PL011_FR:        *const u32 = (PL011_BASE + 0x18) as *const u32; // +0x18 flags
 const PL011_LCRH:      *mut u32 = (PL011_BASE + 0x2C) as *mut u32;     // +0x2C line control
 const PL011_CR:        *mut u32 = (PL011_BASE + 0x30) as *mut u32;     // +0x30 control
+const PL011_ECR:       *mut u32 = (PL011_BASE + 0x04) as *mut u32;     // +0x04 error clear
 const PL011_FR_TXFF:   u32 = 1 << 5;                                   // transmit FIFO full
 const PL011_FR_BUSY:   u32 = 1 << 3;                                   // transmitting
+/// Error flags the PL011 returns **in the data register itself**, alongside the byte: framing (8),
+/// parity (9), break (10), overrun (11). A byte arriving with any of these is line noise, not data.
+const PL011_DR_ERR:    u32 = 0xF00;
 const PL011_LCRH_8N1:  u32 = (3 << 5) | (1 << 4);                      // WLEN=8 bits, FIFOs on
 const PL011_CR_ON:     u32 = (1 << 0) | (1 << 8) | (1 << 9);           // UARTEN | TXE | RXE
 
@@ -505,7 +509,12 @@ pub(super) fn pl011_write(s: &[u8]) {
     // Write lock-free.
     if !SERIAL_SMP.load(Ordering::Relaxed) {
         for &b in s { pl011_write_byte(b); }
-        fbcon::mirror(s); // mirror to the TV once the console is up (no-op before that)
+        // Mirror to the TV once the console is up (no-op before that). `mirror` tests a plain
+        // `AtomicBool` BEFORE any exclusive access, which is load-bearing on this path: the first boot
+        // messages run with the MMU off, where LDREX/STREX is UNPREDICTABLE on real silicon (see the
+        // note just above). A `mirror` that locked or CAS'd here hangs the Pi on the firmware's rainbow
+        // splash with no serial output at all - and QEMU, being permissive, does not reproduce it.
+        fbcon::mirror(s);
         return;
     }
     // Clear any stale exclusive-monitor reservation before the compare-exchange below. ARMv7 does NOT
@@ -1076,6 +1085,31 @@ static INPUT_READY: AtomicBool = AtomicBool::new(false);
 /// way. IRQs stay masked inside so this core's own tick cannot interleave between the FR check and the
 /// DR read - the same-core variant of the identical stale-DR duplication.
 static RX_DRAIN_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// RX bytes discarded because the UART flagged them (framing/parity/break/overrun), and whether that
+/// has been reported yet.
+///
+/// Discarding line noise is right, but discarding it **silently** is the failure mode invariant 12
+/// exists to forbid: to an operator, "serial input does not work" and "serial input is being flooded
+/// with break errors and thrown away" look identical, and only one of them tells you to check the
+/// wiring. So the condition is announced once, naming the likely cause. Once, not per byte, because a
+/// held line produces thousands per second and a log storm would be its own denial of service.
+static RX_LINE_ERRORS: AtomicU32 = AtomicU32::new(0);
+static RX_LINE_ERRORS_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Discarded-byte count at which the line is judged genuinely faulty rather than momentarily glitched.
+///
+/// A handful of framing errors is normal - a cable hot-plugged mid-stream, or a terminal attaching at
+/// the wrong baud and resyncing. Sustained hundreds means the line is held.
+///
+/// **Set from measurement, not from a guess.** The first cut used 2,000 and never fired: the Pi 2
+/// session that motivated this discarded roughly 945 bytes over eight minutes (966 spurious repaints
+/// before the fix, 21 after), so the threshold sat above the very condition it was written to catch.
+/// A check that cannot fire in its own worked example is worse than no check - it reads as "the line is
+/// fine". 128 clears connect-time glitches by a wide margin and still trips within seconds of a held
+/// line.
+const RX_LINE_ERROR_REPORT_AT: u32 = 128;
+
 fn pl011_rx_drain() {
     // Clear any stale exclusive-monitor reservation before the compare-exchange, for exactly the reason
     // `pl011_write` does: ARMv7 does NOT guarantee the local monitor is cleared on exception entry or
@@ -1099,7 +1133,24 @@ fn pl011_rx_drain() {
     unsafe {
         loop {
             if PL011_FR.read_volatile() & PL011_FR_RXFE != 0 { break; } // RX FIFO empty
-            let b = (PL011_DR.read_volatile() & 0xFF) as u8;
+            let dr = PL011_DR.read_volatile();
+            // DISCARD a byte the UART flagged as framing/parity/break/overrun. The flags arrive in the
+            // SAME read as the data (bits 11:8), so masking them off - which this used to do - silently
+            // promotes line noise to input.
+            //
+            // This is not a theoretical concern: a GPIO HAT sitting on the UART pins holds GPIO15 (RX)
+            // low, which the PL011 reports as a CONTINUOUS break condition. Each one enqueues a
+            // spurious 0x00, so the input ring fills with nulls forever. That does not merely make
+            // typing dead - it makes every reader spin. A full-screen app blocked in `ConsoleRead`
+            // wakes on each null, discards it as unprintable, and repaints: `edit` on the Pi 2 issued
+            // 966 full-screen repaints while the document changed twice. Dropping the flagged byte
+            // costs nothing when the line is healthy and turns a flood back into silence when it is not.
+            if dr & PL011_DR_ERR != 0 {
+                PL011_ECR.write_volatile(0); // clear the sticky error status (any write clears)
+                RX_LINE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let b = (dr & 0xFF) as u8;
             let tail = RX_TAIL.load(Ordering::Relaxed) as usize;
             let head = RX_HEAD.load(Ordering::Acquire) as usize;
             let next = (tail + 1) % RX_BUF_SIZE;
@@ -1112,6 +1163,22 @@ fn pl011_rx_drain() {
     // Released on every path: the critical section above is bounded (it ends when the FIFO reads empty),
     // masked, and cannot block, so there is no path that leaves the claim held.
     RX_DRAIN_CLAIMED.store(false, Ordering::Release);
+
+    // Announce a persistently bad RX line, ONCE. Deliberately after the claim is released and IRQs are
+    // restored: this logs, and logging goes back out through `pl011_write`.
+    let errs = RX_LINE_ERRORS.load(Ordering::Relaxed);
+    if errs >= RX_LINE_ERROR_REPORT_AT && !RX_LINE_ERRORS_REPORTED.swap(true, Ordering::AcqRel) {
+        // Report the COUNT, not just the condition: it is the difference between "something is wrong
+        // with your serial line" and a number an operator can act on.
+        pl011_write(b"pl011: RX line errors - discarded ");
+        timer::write_dec_pub(errs);
+        pl011_write(
+            b" bytes flagged framing/parity/break/overrun. The receive line is held or noisy, so \
+              serial INPUT is being dropped as noise; serial OUTPUT is unaffected (you are reading \
+              this over it). On a Pi this is usually a GPIO HAT sitting on the UART pins GPIO14/15 - \
+              remove it, or use a USB keyboard.\r\n",
+        );
+    }
 }
 
 /// Pop one byte from the input ring (the ConsoleRead syscall consumer). `None` if empty.

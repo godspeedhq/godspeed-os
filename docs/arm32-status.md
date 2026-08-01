@@ -277,3 +277,34 @@ kernel built afterwards "broke" it. Three separate commits were blamed and one g
 **Meanwhile the port is still testable.** Serial OUTPUT keeps working, so logs still reach the host -
 drive the shell from the USB keyboard and read results over serial as normal. v0.8.1 was validated
 entirely this way (`selfcheck` 349/0, 100 chaos rounds).
+
+### It is not just dead input - it is a FLOOD, and the kernel now says so (2026-08-01)
+
+The account above says input is "dead". That understates it, and the difference matters because the
+*flood* is what you actually feel. A held RX line is not silence: the PL011 reports it as a continuous
+**break condition**, and every one of those enqueues a byte.
+
+The PL011 returns its error flags **in the data register itself** - framing (bit 8), parity (9), break
+(10), overrun (11), in the same read as the data. `pl011_rx_drain` used to do `DR & 0xFF`, masking the
+flags off and promoting every noise event to real input. So the console ring filled with spurious `0x00`
+forever.
+
+That is invisible at a shell prompt (a null is not printable, so nothing appears) but brutal for a
+**full-screen app**, which blocks in `ConsoleRead`, wakes on each null, discards it as unprintable, and
+repaints. Measured on the Pi 2 with `edit` open: **966 full-screen repaints, 963 of them byte-identical,
+while the document changed twice.** After discarding flagged bytes: **21 repaints, none duplicated.**
+
+Two consequences, both now in the code:
+
+- `pl011_rx_drain` **discards** any byte the UART flagged and clears the sticky error. Free on a healthy
+  line.
+- It **reports** the condition once, with the discarded-byte count, naming the likely cause. Silently
+  dropping noise would leave "serial input does not work" looking identical to "serial input is being
+  flooded and thrown away", and only one of those tells you to check the wiring (invariant 12). If you
+  see `pl011: RX line errors - discarded N bytes ...` in the boot log, that is this, and step 3 above is
+  your fix.
+
+A note on the threshold: it was first set at 2,000 discarded bytes and **never fired**, because the
+session that motivated it discarded only ~945. A check that cannot trip in its own worked example is
+worse than no check - it reads as "the line is fine". It is now 128, which clears connect-time glitches
+and trips within seconds of a held line.

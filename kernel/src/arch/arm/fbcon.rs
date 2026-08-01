@@ -37,6 +37,12 @@ pub fn fb_commit(base: usize, pitch: usize, bpp: usize, x: usize, y: usize, w: u
 }
 
 /// True once `init` has set up the console; the serial path mirrors to the framebuffer only after this.
+///
+/// **Lock-free by requirement, not by preference.** `pl011_write` mirrors every serial byte through
+/// here, including boot messages emitted *before `mmu::enable()`*, and with the MMU off a real
+/// Cortex-A7 leaves LDREX/STREX UNPREDICTABLE (the exclusive monitor needs memory attributes). So this
+/// must stay a plain atomic load, and nothing on the pre-`init` path may take the console's spinlock -
+/// which is why `crate::fbcon::ready` is a bare `AtomicBool`, not a field behind the lock.
 pub fn ready() -> bool {
     crate::fbcon::ready()
 }
@@ -92,7 +98,10 @@ static RENDERING: AtomicBool = AtomicBool::new(false);
 /// The dominant console writer (the shell) is never the one that loses a write, because it holds
 /// `SERIAL_BUSY` for its own output.
 pub fn mirror(s: &[u8]) {
-    if !crate::fbcon::ready() {
+    // The `ready` test MUST come first and MUST stay lock-free: it is what keeps every pre-MMU boot
+    // message out of the exclusive-access code below. `swap` is LDREX/STREX, as is the console's
+    // spinlock, and neither is safe before `mmu::enable()` - see `ready`.
+    if !ready() {
         return;
     }
     if RENDERING.swap(true, Ordering::Acquire) {
