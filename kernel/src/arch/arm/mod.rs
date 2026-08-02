@@ -1120,6 +1120,11 @@ static RX_LINE_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 /// Bytes the RX line produced that had nowhere to go, because the input ring was already full.
 static RX_OVERRUN: AtomicU32 = AtomicU32::new(0);
+/// Keystrokes lost the same way, and whether that has been reported. Counted separately from
+/// `RX_OVERRUN` because the two mean opposite things: a dropped noise byte is the system working, a
+/// dropped KEYSTROKE is the user's input vanishing. That must never be silent (§26.7).
+static KBD_DROPPED: AtomicU32 = AtomicU32::new(0);
+static KBD_DROP_REPORTED: AtomicBool = AtomicBool::new(false);
 /// Set once the receiver has been shut off because the line is faulty. Latches until reboot.
 static RX_SHUT_OFF: AtomicBool = AtomicBool::new(false);
 
@@ -1326,6 +1331,20 @@ pub fn console_push_byte(b: u8) {
         // SAFETY: single producer in practice; tail in-bounds.
         unsafe { RX_BUF[tail] = b; }
         RX_TAIL.store(next as u32, Ordering::Release);
+    } else {
+        // The ring is full and a KEYSTROKE is being discarded. This used to happen silently, and it is
+        // how a Pi 2 became unquittable: a faulty UART line filled the shared ring faster than anything
+        // drained it, so every key the user pressed vanished and Ctrl+Q could never arrive. The UART
+        // side now shuts itself off before it gets this far, but the ring is shared and this is the
+        // point where the USER's input is lost - so say it out loud, once, rather than let a keyboard
+        // that appears dead give no account of itself.
+        KBD_DROPPED.fetch_add(1, Ordering::Relaxed);
+        if !KBD_DROP_REPORTED.swap(true, Ordering::AcqRel) {
+            pl011_write(
+                b"console: input ring FULL - keystrokes are being dropped. Something is producing                   input faster than it is consumed; a stuck serial RX line is the usual cause.
+",
+            );
+        }
     }
     let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
     if waiter != u32::MAX {

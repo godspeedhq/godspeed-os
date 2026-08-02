@@ -38,13 +38,23 @@ pub fn fb_commit(base: usize, pitch: usize, bpp: usize, x: usize, y: usize, w: u
 
 /// True once `init` has set up the console; the serial path mirrors to the framebuffer only after this.
 ///
-/// **Lock-free by requirement, not by preference.** `pl011_write` mirrors every serial byte through
-/// here, including boot messages emitted *before `mmu::enable()`*, and with the MMU off a real
-/// Cortex-A7 leaves LDREX/STREX UNPREDICTABLE (the exclusive monitor needs memory attributes). So this
-/// must stay a plain atomic load, and nothing on the pre-`init` path may take the console's spinlock -
-/// which is why `crate::fbcon::ready` is a bare `AtomicBool`, not a field behind the lock.
+/// **This is an ARM-LOCAL flag, deliberately, and must not be replaced by a call into `crate::fbcon`.**
+/// `pl011_write` mirrors every serial byte through here, including boot messages emitted *before*
+/// `mmu::enable()`, and with the MMU off a real Cortex-A7 leaves LDREX/STREX UNPREDICTABLE (the
+/// exclusive monitor needs memory attributes). So the pre-init serial path must touch nothing but a
+/// plain load.
+///
+/// It USED to ask `crate::fbcon::ready()`, which at the time read a field behind the console spinlock -
+/// a compare_exchange, hence LDREX/STREX - and the Pi stopped booting entirely: it hung on the
+/// firmware's rainbow splash before a single character of serial output, while QEMU (permissive about
+/// exclusives) ran the same binary fine. Making the neutral flag lock-free fixed it, but left ARM's boot
+/// depending on an implementation detail of another module, enforced only by comments. Owning the flag
+/// here makes that dependency structural instead: nothing `crate::fbcon` does internally can reach this
+/// path any more.
+static READY: AtomicBool = AtomicBool::new(false);
+
 pub fn ready() -> bool {
-    crate::fbcon::ready()
+    READY.load(Ordering::Acquire)
 }
 
 /// Bring up the console over an already-mapped framebuffer. Called from the boot path right after
@@ -62,6 +72,7 @@ pub fn init(base: u32, pitch: u32, width: u32, height: u32) {
     // exclusivity of `&mut` holds.
     let mem: &'static mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(base as usize as *mut u8, len) };
+    // Publish the ARM-local ready flag only AFTER the neutral console is fully built (see `ready`).
     crate::fbcon::init(crate::fbcon::FbParams {
         mem,
         pitch: pitch as usize,
@@ -72,6 +83,7 @@ pub fn init(base: u32, pitch: u32, width: u32, height: u32) {
         g_shift: G_SHIFT,
         b_shift: B_SHIFT,
     });
+    READY.store(true, Ordering::Release);
 }
 
 /// Clear the screen and home the cursor - the end-of-boot dismissal (`console_boot_complete`).
