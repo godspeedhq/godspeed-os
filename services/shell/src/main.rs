@@ -8756,7 +8756,9 @@ fn edit_goto(ctx: &ServiceContext, row: usize, col: usize) {
 
 /// Draw a full-width reverse-video bar: `text` (already formatted) left-justified, space-padded
 /// to `width`. The caller positions the cursor first. `\x1b[7m`/`\x1b[0m` are reverse-video on a
-/// serial terminal and a no-op on the fbcon (→ plain text), so the bar reads cleanly on both.
+/// serial terminal AND on the framebuffer console - the shared `kernel/src/fbcon` renders SGR 7 by
+/// inverting the glyph blend ramp, so the bar looks the same on the TV as in a terminal. (It used to
+/// be dropped on x86's fbcon and rendered only on ARM's; the two consoles are one module now.)
 fn edit_bar(ctx: &ServiceContext, text: &[u8], width: usize) {
     let mut line = [b' '; EDIT_COLS_MAX];
     let w = width.min(EDIT_COLS_MAX);

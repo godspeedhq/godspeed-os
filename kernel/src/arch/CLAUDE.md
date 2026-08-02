@@ -35,6 +35,13 @@ documented in `arch/x86_64/CLAUDE.md` (`BootInfo`, `init()`, `ap_init()`, `seria
 `halt_all_cores()`, the safe user-pointer and cycle-counter wrappers, and so on). Match those
 signatures when you bring a real port up.
 
+If the platform has a framebuffer you want text on, the arch owes exactly two more things and gets a
+full ANSI terminal for free: `fb_commit` (publish a written rectangle) and `FB_READBACK_CHEAP` (does
+reading the framebuffer back cost what writing it does), plus an init that hands `crate::fbcon` the
+framebuffer as a `&'static mut [u8]`. That slice is deliberate: it keeps the whole console
+`unsafe`-free, so the one `unsafe` stays here in `arch/`, where the mapping's validity is known.
+`arch/x86_64/fb.rs` and `arch/arm/fbcon.rs` are both about 50 lines and are the templates.
+
 For the **first milestone** of a new arch - boot the neutral kernel and print to a UART - the surface
 is far smaller: a `_start`, minimal CPU/stack setup, and a byte-out to the platform's serial device.
 The existing non-x86 stubs (`arch/aarch64/mod.rs`, `arch/riscv64/mod.rs`, `arch/loongarch64/mod.rs`,

@@ -27,6 +27,9 @@ pub mod meminit;
 pub mod syscall;
 pub mod video;
 pub mod fbcon;
+/// The framebuffer-console backend primitives the neutral `crate::fbcon` calls through `arch::imp`.
+/// See `crate::fbcon`'s module header for the contract each one owes.
+pub use fbcon::{fb_commit, FB_READBACK_CHEAP};
 pub mod dwc2;
 pub mod hid;
 // USB-net bridge (the mechanism the userspace ARM `nic-driver` calls): move ethernet frames to/from the
@@ -56,8 +59,12 @@ const PL011_DR:        *mut u32 = PL011_BASE as *mut u32;              // +0x00 
 const PL011_FR:        *const u32 = (PL011_BASE + 0x18) as *const u32; // +0x18 flags
 const PL011_LCRH:      *mut u32 = (PL011_BASE + 0x2C) as *mut u32;     // +0x2C line control
 const PL011_CR:        *mut u32 = (PL011_BASE + 0x30) as *mut u32;     // +0x30 control
+const PL011_ECR:       *mut u32 = (PL011_BASE + 0x04) as *mut u32;     // +0x04 error clear
 const PL011_FR_TXFF:   u32 = 1 << 5;                                   // transmit FIFO full
 const PL011_FR_BUSY:   u32 = 1 << 3;                                   // transmitting
+/// Error flags the PL011 returns **in the data register itself**, alongside the byte: framing (8),
+/// parity (9), break (10), overrun (11). A byte arriving with any of these is line noise, not data.
+const PL011_DR_ERR:    u32 = 0xF00;
 const PL011_LCRH_8N1:  u32 = (3 << 5) | (1 << 4);                      // WLEN=8 bits, FIFOs on
 const PL011_CR_ON:     u32 = (1 << 0) | (1 << 8) | (1 << 9);           // UARTEN | TXE | RXE
 
@@ -134,12 +141,34 @@ fn gpio_init_uart() {
         sel &= !((0b111 << 12) | (0b111 << 15)); // clear GPIO14, GPIO15 function fields
         sel |= (0b100 << 12) | (0b100 << 15);    // ALT0 = UART0 TXD0 / RXD0
         GPFSEL1.write_volatile(sel);
-        // Disable pull-up/down on both UART pins (they are externally driven). BCM2835 pull sequence:
-        // write GPPUD, wait, write the pin clock, wait, clear both.
+        // PULL-UP on GPIO15 (RX). This used to disable the pull on both pins, reasoning that "they are
+        // externally driven" - true of GPIO14 (TX), which WE drive, and false of GPIO15, which is an
+        // INPUT and is only driven when an adapter is actually connected, powered, and transmitting.
+        //
+        // An undriven input floats, and a floating pin beside switching signals picks up noise. Each
+        // glitch looks to the UART like a start bit; the line then reads high for the rest of the frame
+        // and delivers a perfectly well-framed 0xFF - no framing, parity or break error, so nothing
+        // downstream can tell it from a real byte. Measured on a Pi 2 with a GPIO HAT fitted: ~115
+        // spurious 0xFF per second, error-free, which saturated the 256-byte input ring and made every
+        // full-screen app repaint continuously on phantom keystrokes.
+        //
+        // A pull-up gives the pin the UART's own idle level (high) whenever nothing drives it, so an
+        // absent or passive peer reads as silence instead of noise. This is what a UART RX pin should
+        // always have had; the firmware sets it when it configures the UART itself, and we were undoing
+        // that. GPIO14 keeps no pull - we drive it, so a pull would only fight the driver.
+        //
+        // BCM2835 pull sequence: write GPPUD, wait, strobe the pin clock, wait, clear both.
         let spin = |n: u32| { for _ in 0..n { core::arch::asm!("nop", options(nomem, nostack)); } };
-        GPPUD.write_volatile(0);
+        GPPUD.write_volatile(2); // 2 = pull-up
         spin(150);
-        GPPUDCLK0.write_volatile((1 << 14) | (1 << 15));
+        GPPUDCLK0.write_volatile(1 << 15); // RX only
+        spin(150);
+        GPPUD.write_volatile(0);
+        GPPUDCLK0.write_volatile(0);
+        // Then explicitly clear any pull on TX, so the state is set rather than inherited.
+        GPPUD.write_volatile(0); // 0 = no pull
+        spin(150);
+        GPPUDCLK0.write_volatile(1 << 14);
         spin(150);
         GPPUD.write_volatile(0);
         GPPUDCLK0.write_volatile(0);
@@ -502,7 +531,12 @@ pub(super) fn pl011_write(s: &[u8]) {
     // Write lock-free.
     if !SERIAL_SMP.load(Ordering::Relaxed) {
         for &b in s { pl011_write_byte(b); }
-        fbcon::put_bytes(s); // mirror to the TV once the console is up (no-op before that)
+        // Mirror to the TV once the console is up (no-op before that). `mirror` tests a plain
+        // `AtomicBool` BEFORE any exclusive access, which is load-bearing on this path: the first boot
+        // messages run with the MMU off, where LDREX/STREX is UNPREDICTABLE on real silicon (see the
+        // note just above). A `mirror` that locked or CAS'd here hangs the Pi on the firmware's rainbow
+        // splash with no serial output at all - and QEMU, being permissive, does not reproduce it.
+        fbcon::mirror(s);
         return;
     }
     // Clear any stale exclusive-monitor reservation before the compare-exchange below. ARMv7 does NOT
@@ -535,7 +569,7 @@ pub(super) fn pl011_write(s: &[u8]) {
     // serial above (the source of truth); only its TV mirror is dropped, which is invisible in practice
     // because the dominant console writer (the shell) holds the lock for its own output.
     if held {
-        fbcon::put_bytes(s);
+        fbcon::mirror(s);
         SERIAL_BUSY.store(false, Ordering::Release);
     }
 }
@@ -1073,6 +1107,61 @@ static INPUT_READY: AtomicBool = AtomicBool::new(false);
 /// way. IRQs stay masked inside so this core's own tick cannot interleave between the FR check and the
 /// DR read - the same-core variant of the identical stale-DR duplication.
 static RX_DRAIN_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// RX bytes discarded because the UART flagged them (framing/parity/break/overrun), and whether that
+/// has been reported yet.
+///
+/// Discarding line noise is right, but discarding it **silently** is the failure mode invariant 12
+/// exists to forbid: to an operator, "serial input does not work" and "serial input is being flooded
+/// with break errors and thrown away" look identical, and only one of them tells you to check the
+/// wiring. So the condition is announced once, naming the likely cause. Once, not per byte, because a
+/// held line produces thousands per second and a log storm would be its own denial of service.
+static RX_LINE_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+/// Bytes the RX line produced that had nowhere to go, because the input ring was already full.
+static RX_OVERRUN: AtomicU32 = AtomicU32::new(0);
+/// Keystrokes lost the same way, and whether that has been reported. Counted separately from
+/// `RX_OVERRUN` because the two mean opposite things: a dropped noise byte is the system working, a
+/// dropped KEYSTROKE is the user's input vanishing. That must never be silent (§26.7).
+static KBD_DROPPED: AtomicU32 = AtomicU32::new(0);
+static KBD_DROP_REPORTED: AtomicBool = AtomicBool::new(false);
+/// Set once the receiver has been shut off because the line is faulty. Latches until reboot.
+static RX_SHUT_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Microsecond timestamp at which the ring began overflowing without pause; 0 = not overflowing.
+static RX_OVERFLOW_SINCE: AtomicU32 = AtomicU32::new(0);
+
+/// How long the ring must overflow WITHOUT PAUSE before the line is judged faulty.
+///
+/// **A duration, not a count, and that distinction cost three attempts.** Each earlier version picked a
+/// magic number and none of them fired in the very scenario they were written for:
+///
+/// - 2000 discarded *error* bytes: the fault carries no error flags, so the counter never moved.
+/// - 512 *identical consecutive* bytes: occasional 0x00s among the 0xFFs reset the run every time.
+/// - 4096 *dropped* bytes: right quantity, wrong units. At the measured ~141 drops/s that is 29 seconds
+///   of an unusable machine before the self-heal engages - longer than anyone waits before giving up, so
+///   in practice it never engaged either.
+///
+/// The failure's actual signature is not "many drops", it is "the ring has been full CONTINUOUSLY".
+/// A burst (a paste, a fast typist) overflows briefly and then drains, resetting the timer; a faulty
+/// line never lets it drain. Two seconds is far longer than any burst survives and short enough that the
+/// machine heals before a user concludes it is dead.
+const RX_OVERFLOW_FAULT_US: u32 = 2_000_000;
+static RX_LINE_ERRORS_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Discarded-byte count at which the line is judged genuinely faulty rather than momentarily glitched.
+///
+/// A handful of framing errors is normal - a cable hot-plugged mid-stream, or a terminal attaching at
+/// the wrong baud and resyncing. Sustained hundreds means the line is held.
+///
+/// **Set from measurement, not from a guess.** The first cut used 2,000 and never fired: the Pi 2
+/// session that motivated this discarded roughly 945 bytes over eight minutes (966 spurious repaints
+/// before the fix, 21 after), so the threshold sat above the very condition it was written to catch.
+/// A check that cannot fire in its own worked example is worse than no check - it reads as "the line is
+/// fine". 128 clears connect-time glitches by a wide margin and still trips within seconds of a held
+/// line.
+const RX_LINE_ERROR_REPORT_AT: u32 = 128;
+
 fn pl011_rx_drain() {
     // Clear any stale exclusive-monitor reservation before the compare-exchange, for exactly the reason
     // `pl011_write` does: ARMv7 does NOT guarantee the local monitor is cleared on exception entry or
@@ -1081,6 +1170,9 @@ fn pl011_rx_drain() {
     // return immediately every time, which is serial input silently dead. Omitting it is what broke
     // serial on the first cut of this change; QEMU's TCG does not model the monitor strictly enough to
     // show it, so it looked fine in emulation and failed on the Pi.
+    if RX_SHUT_OFF.load(Ordering::Relaxed) {
+        return; // receiver shut off: the line is stuck and we are no longer listening to it
+    }
     // SAFETY: `clrex` clears the local exclusive monitor; no memory effect.
     unsafe { core::arch::asm!("clrex", options(nomem, nostack)); }
     // Claim, or stand aside. Acquire/Release pair the ring writes with the next claimant's view.
@@ -1090,25 +1182,107 @@ fn pl011_rx_drain() {
     {
         return;
     }
+    let mut stuck: Option<(u8, u32)> = None;
+    let mut overflowed = false;
     let saved = interrupts::local_irq_save();
     // SAFETY: reading the PL011 FR/DR (Device-mapped MMIO) and appending to the ring; core-0-only and
     // IRQ-masked (above), so this is the only producer executing.
     unsafe {
         loop {
             if PL011_FR.read_volatile() & PL011_FR_RXFE != 0 { break; } // RX FIFO empty
-            let b = (PL011_DR.read_volatile() & 0xFF) as u8;
+            let dr = PL011_DR.read_volatile();
+            // DISCARD a byte the UART flagged as framing/parity/break/overrun. The flags arrive in the
+            // SAME read as the data (bits 11:8), so masking them off - which this used to do - silently
+            // promotes line noise to input.
+            //
+            // This is not a theoretical concern: a GPIO HAT sitting on the UART pins holds GPIO15 (RX)
+            // low, which the PL011 reports as a CONTINUOUS break condition. Each one enqueues a
+            // spurious 0x00, so the input ring fills with nulls forever. That does not merely make
+            // typing dead - it makes every reader spin. A full-screen app blocked in `ConsoleRead`
+            // wakes on each null, discards it as unprintable, and repaints: `edit` on the Pi 2 issued
+            // 966 full-screen repaints while the document changed twice. Dropping the flagged byte
+            // costs nothing when the line is healthy and turns a flood back into silence when it is not.
+            if dr & PL011_DR_ERR != 0 {
+                PL011_ECR.write_volatile(0); // clear the sticky error status (any write clears)
+                RX_LINE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let b = (dr & 0xFF) as u8;
+            // Stuck-line detection. A faulty RX line does not merely deliver junk - it STARVES the
+            // machine's other input. The ring is shared with the USB keyboard, and a producer that fills
+            // it faster than anything drains it means every keystroke is dropped for want of space. That
+            // is how a Pi 2 with a GPIO HAT became unquittable: `edit` repainted on phantom bytes and
+            // Ctrl+Q never got in, so the only way out was the power switch.
+            //
+            // So once the line is provably not a console, stop listening to it. Serial OUTPUT is
+            // untouched (it is a different pin and this only clears RXE), and the keyboard gets the ring
+            // to itself. Latches until reboot: if the cause is fixed, reboot to re-enable - deliberate,
+            // because silently resuming a line we just declared faulty would be the fallback §26.7
+            // forbids.
+
             let tail = RX_TAIL.load(Ordering::Relaxed) as usize;
             let head = RX_HEAD.load(Ordering::Acquire) as usize;
             let next = (tail + 1) % RX_BUF_SIZE;
-            if next == head { continue; } // ring full: drop this byte, keep draining the FIFO
+            if next == head {
+                // Ring full: drop this byte, but COUNT it. A line that persistently has nowhere to put
+                // its bytes is out-producing every consumer, and the ring it is filling is shared with
+                // the USB keyboard - so the real cost is not the junk, it is that genuine keystrokes are
+                // discarded for want of space. That is how a Pi 2 became unquittable: `edit` repainted on
+                // phantom bytes and Ctrl+Q never got in, leaving the power switch as the only way out.
+                let over = RX_OVERRUN.fetch_add(1, Ordering::Relaxed) + 1;
+                overflowed = true;
+                let now = timer::systimer_us();
+                let since = RX_OVERFLOW_SINCE.load(Ordering::Relaxed);
+                if since == 0 {
+                    RX_OVERFLOW_SINCE.store(now | 1, Ordering::Relaxed); // never store 0 ("not overflowing")
+                } else if now.wrapping_sub(since) > RX_OVERFLOW_FAULT_US
+                    && !RX_SHUT_OFF.swap(true, Ordering::AcqRel)
+                {
+                    let cr = PL011_CR.read_volatile();
+                    PL011_CR.write_volatile(cr & !(1 << 9)); // clear RXE - stop receiving
+                    stuck = Some((b, over));
+                }
+                continue; // keep draining the FIFO either way
+            }
             RX_BUF[tail] = b;
             RX_TAIL.store(next as u32, Ordering::Release);
         }
+    }
+    // A drain that placed every byte means the consumer is keeping up: the overflow was a burst, not a
+    // fault, so restart the clock. Only UNBROKEN overflow counts.
+    if !overflowed {
+        RX_OVERFLOW_SINCE.store(0, Ordering::Relaxed);
     }
     interrupts::local_irq_restore(saved);
     // Released on every path: the critical section above is bounded (it ends when the FIFO reads empty),
     // masked, and cannot block, so there is no path that leaves the claim held.
     RX_DRAIN_CLAIMED.store(false, Ordering::Release);
+
+    // Announce a persistently bad RX line, ONCE. Deliberately after the claim is released and IRQs are
+    // restored: this logs, and logging goes back out through `pl011_write`.
+    if let Some((b, over)) = stuck {
+        pl011_write(b"pl011: RX line FAULTY - ");
+        timer::write_dec_pub(over);
+        pl011_write(b" bytes dropped for lack of ring space (last value ");
+        timer::write_dec_pub(b as u32);
+        pl011_write(
+            b") back to back. This is not a console, and left alone it STARVES the USB keyboard: they               share one input ring, so a line filling it faster than anything drains it means every               keystroke is dropped. Serial RECEIVE is now off (output is unaffected - you are reading               this over it) and the keyboard has the ring to itself. On a Pi this is usually a GPIO HAT               on the UART pins GPIO14/15, or an unconnected/floating RX pin. Reboot to re-enable after               fixing it.
+",
+        );
+    }
+    let errs = RX_LINE_ERRORS.load(Ordering::Relaxed);
+    if errs >= RX_LINE_ERROR_REPORT_AT && !RX_LINE_ERRORS_REPORTED.swap(true, Ordering::AcqRel) {
+        // Report the COUNT, not just the condition: it is the difference between "something is wrong
+        // with your serial line" and a number an operator can act on.
+        pl011_write(b"pl011: RX line errors - discarded ");
+        timer::write_dec_pub(errs);
+        pl011_write(
+            b" bytes flagged framing/parity/break/overrun. The receive line is held or noisy, so \
+              serial INPUT is being dropped as noise; serial OUTPUT is unaffected (you are reading \
+              this over it). On a Pi this is usually a GPIO HAT sitting on the UART pins GPIO14/15 - \
+              remove it, or use a USB keyboard.\r\n",
+        );
+    }
 }
 
 /// Pop one byte from the input ring (the ConsoleRead syscall consumer). `None` if empty.
@@ -1177,6 +1351,20 @@ pub fn console_push_byte(b: u8) {
         // SAFETY: single producer in practice; tail in-bounds.
         unsafe { RX_BUF[tail] = b; }
         RX_TAIL.store(next as u32, Ordering::Release);
+    } else {
+        // The ring is full and a KEYSTROKE is being discarded. This used to happen silently, and it is
+        // how a Pi 2 became unquittable: a faulty UART line filled the shared ring faster than anything
+        // drained it, so every key the user pressed vanished and Ctrl+Q could never arrive. The UART
+        // side now shuts itself off before it gets this far, but the ring is shared and this is the
+        // point where the USER's input is lost - so say it out loud, once, rather than let a keyboard
+        // that appears dead give no account of itself.
+        KBD_DROPPED.fetch_add(1, Ordering::Relaxed);
+        if !KBD_DROP_REPORTED.swap(true, Ordering::AcqRel) {
+            pl011_write(
+                b"console: input ring FULL - keystrokes are being dropped. Something is producing                   input faster than it is consumed; a stuck serial RX line is the usual cause.
+",
+            );
+        }
     }
     let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
     if waiter != u32::MAX {
@@ -1509,10 +1697,6 @@ pub mod iommu {
     pub fn drain_event_log() {}
 }
 
-// ---------------------------------------------------------------------------
-pub mod fb {
-    pub fn dims_packed() -> u64 { 0 }
-}
 
 // ---------------------------------------------------------------------------
 pub mod ioapic {

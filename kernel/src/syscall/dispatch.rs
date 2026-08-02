@@ -1347,7 +1347,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // Console (fbcon) geometry packed as (rows << 16) | cols. The console
         // service needs this to lay out its terminal (pin the input line to the
         // bottom row). 0 if the framebuffer never initialised.
-        9 => crate::arch::imp::fb::dims_packed() as i64,
+        9 => crate::fbcon::dims_packed() as i64,
         // Input-ready flag - set by the xHCI driver when it finishes setup (the
         // last boot step). The shell watches it to auto-clear the boot screen.
         10 => crate::arch::imp::input_ready() as i64,

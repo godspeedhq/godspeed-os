@@ -12,6 +12,7 @@ The unsafe hardware boundary (§18.1). All direct hardware access in the kernel 
 | `interrupts.rs`     | IDT entries, IRQ dispatch stubs, page-fault handler (§12, §10.3) |
 | `context_switch.rs` | Naked function: save/restore callee-saved registers + CR3 (§9) |
 | `page_tables.rs`    | Four-level page table manipulation: map/unmap, CR3 values (§10) |
+| `fb.rs`             | Framebuffer-console **backend** only: binds Limine's descriptor to a slice for the shared `crate::fbcon`, and publishes writes (`fb_commit` = `sfence`, because the mapping is write-combining). The terminal itself is neutral code - see `kernel/CLAUDE.md` |
 
 ## Safe wrappers (call these instead of writing new unsafe blocks)
 

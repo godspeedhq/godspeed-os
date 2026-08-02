@@ -663,9 +663,14 @@ check fixed for the bulk path in this range):
 
 **Console foreground (the mechanism added this range):**
 
-- **A8-14 (MED).** `fbcon::clear_and_home` takes no lock and its SAFETY comment asserts a precondition
-  ("core 0 holds SERIAL_BUSY") that its only caller does not satisfy - two live `&mut` to the same
-  `static mut` across cores. x86's equivalent takes `FB.lock()`. §18.3: a SAFETY comment must be true.
+- **A8-14 (MED). FIXED (2026-08-01, `refactor/fbcon-neutral`).** `fbcon::clear_and_home` took no lock and
+  its SAFETY comment asserted a precondition ("core 0 holds SERIAL_BUSY") that its only caller did not
+  satisfy - two live `&mut` to the same `static mut` across cores. x86's equivalent took `FB.lock()`.
+  §18.3: a SAFETY comment must be true. Fixed by *deleting the divergence*: the two consoles are now one
+  neutral module (`kernel/src/fbcon/`) behind a single `SpinLock`, so ARM's `clear_and_home` takes the
+  same lock x86's always did. The `static mut FBCON` - and with it the untrue SAFETY comment - is gone.
+  ARM additionally keeps a single-writer gate at the mirror (`arch/arm/fbcon.rs`), so the tick ISR
+  logging mid-render skips its mirror rather than re-entering a non-reentrant lock.
 - **A8-15 (MED).** The lease-lapse path uses an unconditional `store`, not a CAS, so it can clobber a
   claim established between the read and the store - destroying a fresh owner's claim. Every other
   mutator on that static uses compare-exchange.
