@@ -278,33 +278,58 @@ kernel built afterwards "broke" it. Three separate commits were blamed and one g
 drive the shell from the USB keyboard and read results over serial as normal. v0.8.1 was validated
 entirely this way (`selfcheck` 349/0, 100 chaos rounds).
 
-### It is not just dead input - it is a FLOOD, and the kernel now says so (2026-08-01)
+### It is not just dead input - it is a FLOOD that STARVES the keyboard (2026-08-02)
 
-The account above says input is "dead". That understates it, and the difference matters because the
-*flood* is what you actually feel. A held RX line is not silence: the PL011 reports it as a continuous
-**break condition**, and every one of those enqueues a byte.
+The account above says input is "dead", and blames the HAT. Both are now known to be wrong, and the
+correction is more useful than the original finding.
 
-The PL011 returns its error flags **in the data register itself** - framing (bit 8), parity (9), break
-(10), overrun (11), in the same read as the data. `pl011_rx_drain` used to do `DR & 0xFF`, masking the
-flags off and promoting every noise event to real input. So the console ring filled with spurious `0x00`
-forever.
+**What is actually happening.** A faulty RX line does not deliver silence. Measured on a Pi 2 with a
+USB-TTL adapter attached: **~148 spurious bytes per second**, almost all `0xFF`, **with valid framing and
+no error flags**. That last part is why every obvious filter misses them - a line held low gives break or
+framing errors, a line held high gives nothing at all, but a line that is floating or weakly driven gives
+a perfectly well-formed `0xFF`, because each glitch reads as a start bit and the line is high for the rest
+of the frame. Nothing above the pin can tell it from a real byte.
 
-That is invisible at a shell prompt (a null is not printable, so nothing appears) but brutal for a
-**full-screen app**, which blocks in `ConsoleRead`, wakes on each null, discards it as unprintable, and
-repaints. Measured on the Pi 2 with `edit` open: **966 full-screen repaints, 963 of them byte-identical,
-while the document changed twice.** After discarding flagged bytes: **21 repaints, none duplicated.**
+**The damage is starvation, not junk.** The PL011 and the USB keyboard share ONE 256-byte input ring. At
+148 bytes/s in and ~7/s out, the ring is permanently full - and `console_push_byte` silently dropped when
+full, so **every keystroke from the USB keyboard was discarded for want of space**. That is what made a
+full-screen app unquittable: `edit` repainted on phantom bytes, Ctrl+Q never got in, and the power switch
+was the only way out. One faulty input source starving the working one is the real bug, and it is ours,
+not the hardware's.
 
-Two consequences, both now in the code:
+**It was probably NOT the HAT.** The decisive test was accidental: *unplugging the serial cable made
+everything work*. If the HAT were driving GPIO15 that would change nothing, since the HAT is fitted either
+way. So the noise arrives through the cable - suspect the RX jumper (adapter TX to pin 10), the ground
+connection, or an adapter that tri-states TX rather than driving it.
 
-- `pl011_rx_drain` **discards** any byte the UART flagged and clears the sticky error. Free on a healthy
-  line.
-- It **reports** the condition once, with the discarded-byte count, naming the likely cause. Silently
-  dropping noise would leave "serial input does not work" looking identical to "serial input is being
-  flooded and thrown away", and only one of those tells you to check the wiring (invariant 12). If you
-  see `pl011: RX line errors - discarded N bytes ...` in the boot log, that is this, and step 3 above is
-  your fix.
+This invalidates the "it is the pi hat" conclusion above. That was reached by eliminating variables (old
+binaries failed; x86 worked with the same adapter), and the reasoning was sound *given the variables under
+consideration* - but the cable was never one of them, so "the only difference is the HAT" was never true.
+**A conclusion from elimination is only as good as the list of things you thought to eliminate.**
 
-A note on the threshold: it was first set at 2,000 discarded bytes and **never fired**, because the
-session that motivated it discarded only ~945. A check that cannot trip in its own worked example is
-worse than no check - it reads as "the line is fine". It is now 128, which clears connect-time glitches
-and trips within seconds of a held line.
+**Three fixes came out of it, all worth having regardless of the wiring:**
+
+- `gpio_init_uart` sets a **pull-up on GPIO15 (RX)**. It used to disable the pull on both UART pins,
+  reasoning they are "externally driven" - true of GPIO14 (TX, which we drive) and false of RX, which is
+  an input and floats whenever nothing drives it. Any Pi running this port with no serial cable attached
+  had a floating RX pin. (With the cable out, this alone makes it silent.)
+- `pl011_rx_drain` **discards bytes the UART flagged** framing/parity/break/overrun instead of masking the
+  flags off with `DR & 0xFF`, which promoted genuine line errors to input. Free on a healthy line. Note
+  this did NOT fix the fault above, because those bytes carry no flags - it is a separate real bug found
+  along the way.
+- The receiver **shuts itself off** after 4096 bytes dropped for lack of ring space, reports loudly, and
+  hands the ring to the keyboard. Serial output is untouched. It latches until reboot rather than
+  retrying, because silently resuming a line just declared faulty is the fallback §26.7 forbids.
+
+**A note on that threshold, because the first two attempts were wrong.** It first fired at 2000 discarded
+*error* bytes and never triggered (the real fault produced ~945 in the session that motivated it, and
+those had no error flags anyway). The second attempt looked for 512 *identical consecutive* bytes and also
+never fired, because occasional `0x00`s among the `0xFF`s reset the run counter. Both were measuring a
+proxy. The third measures the harm itself - bytes dropped because the ring was full - which is exactly the
+starvation that matters and is indifferent to what the bytes contain. **A check that cannot fire in its
+own worked example is worse than no check: it reads as "the line is fine".**
+
+> **Unproven in the field.** The shut-off has been verified in QEMU not to false-positive on a healthy
+> line, but has never been observed *firing* on real hardware - the Pi it was written for was fixed by
+> unplugging the cable instead. Treat it as untested until something trips it.
+
