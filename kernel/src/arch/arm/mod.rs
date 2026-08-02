@@ -1128,18 +1128,25 @@ static KBD_DROP_REPORTED: AtomicBool = AtomicBool::new(false);
 /// Set once the receiver has been shut off because the line is faulty. Latches until reboot.
 static RX_SHUT_OFF: AtomicBool = AtomicBool::new(false);
 
-/// Dropped-for-no-space bytes at which the RX line is judged faulty rather than busy.
+/// Microsecond timestamp at which the ring began overflowing without pause; 0 = not overflowing.
+static RX_OVERFLOW_SINCE: AtomicU32 = AtomicU32::new(0);
+
+/// How long the ring must overflow WITHOUT PAUSE before the line is judged faulty.
 ///
-/// **Measure the harm, not a proxy for it.** The first attempt looked for 512 IDENTICAL consecutive
-/// bytes, on the theory that a stuck line repeats. It never fired: the real fault delivered mostly 0xFF
-/// with the occasional 0x00 mixed in, and every one of those reset the run counter. Meanwhile the actual
-/// damage was plain in the numbers - the line produced ~148 bytes/s while the consumer managed ~7/s.
+/// **A duration, not a count, and that distinction cost three attempts.** Each earlier version picked a
+/// magic number and none of them fired in the very scenario they were written for:
 ///
-/// What matters is not what the bytes ARE, it is that one producer is filling a shared ring faster than
-/// anything can drain it, which starves every other input source (§26.6: a subsystem must explain its
-/// saturation behaviour). Overrun counts exactly that. A human paste can briefly overflow a 256-byte
-/// ring; 4096 dropped bytes cannot happen by accident on a working line.
-const RX_OVERRUN_LIMIT: u32 = 4096;
+/// - 2000 discarded *error* bytes: the fault carries no error flags, so the counter never moved.
+/// - 512 *identical consecutive* bytes: occasional 0x00s among the 0xFFs reset the run every time.
+/// - 4096 *dropped* bytes: right quantity, wrong units. At the measured ~141 drops/s that is 29 seconds
+///   of an unusable machine before the self-heal engages - longer than anyone waits before giving up, so
+///   in practice it never engaged either.
+///
+/// The failure's actual signature is not "many drops", it is "the ring has been full CONTINUOUSLY".
+/// A burst (a paste, a fast typist) overflows briefly and then drains, resetting the timer; a faulty
+/// line never lets it drain. Two seconds is far longer than any burst survives and short enough that the
+/// machine heals before a user concludes it is dead.
+const RX_OVERFLOW_FAULT_US: u32 = 2_000_000;
 static RX_LINE_ERRORS_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Discarded-byte count at which the line is judged genuinely faulty rather than momentarily glitched.
@@ -1176,6 +1183,7 @@ fn pl011_rx_drain() {
         return;
     }
     let mut stuck: Option<(u8, u32)> = None;
+    let mut overflowed = false;
     let saved = interrupts::local_irq_save();
     // SAFETY: reading the PL011 FR/DR (Device-mapped MMIO) and appending to the ring; core-0-only and
     // IRQ-masked (above), so this is the only producer executing.
@@ -1222,7 +1230,14 @@ fn pl011_rx_drain() {
                 // discarded for want of space. That is how a Pi 2 became unquittable: `edit` repainted on
                 // phantom bytes and Ctrl+Q never got in, leaving the power switch as the only way out.
                 let over = RX_OVERRUN.fetch_add(1, Ordering::Relaxed) + 1;
-                if over >= RX_OVERRUN_LIMIT && !RX_SHUT_OFF.swap(true, Ordering::AcqRel) {
+                overflowed = true;
+                let now = timer::systimer_us();
+                let since = RX_OVERFLOW_SINCE.load(Ordering::Relaxed);
+                if since == 0 {
+                    RX_OVERFLOW_SINCE.store(now | 1, Ordering::Relaxed); // never store 0 ("not overflowing")
+                } else if now.wrapping_sub(since) > RX_OVERFLOW_FAULT_US
+                    && !RX_SHUT_OFF.swap(true, Ordering::AcqRel)
+                {
                     let cr = PL011_CR.read_volatile();
                     PL011_CR.write_volatile(cr & !(1 << 9)); // clear RXE - stop receiving
                     stuck = Some((b, over));
@@ -1232,6 +1247,11 @@ fn pl011_rx_drain() {
             RX_BUF[tail] = b;
             RX_TAIL.store(next as u32, Ordering::Release);
         }
+    }
+    // A drain that placed every byte means the consumer is keeping up: the overflow was a burst, not a
+    // fault, so restart the clock. Only UNBROKEN overflow counts.
+    if !overflowed {
+        RX_OVERFLOW_SINCE.store(0, Ordering::Relaxed);
     }
     interrupts::local_irq_restore(saved);
     // Released on every path: the critical section above is bounded (it ends when the FIFO reads empty),
