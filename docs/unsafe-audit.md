@@ -13,6 +13,22 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4 milestone 4: GIC-400 + generic timer (feat/pi4-aarch64)
+
+A periodic tick: the standard GICv2 the Pi 4 has (unlike the Pi 2's bespoke Broadcom controller, this
+is spec-driven and transfers to any GICv2 board) plus the architectural generic timer. The IRQ vectors
+gained a RETURN path - previously every vector reported and halted, which for a tick is not a tick.
+
+Two disciplines carried over from the 32-bit port's scars: the counter frequency is **read from
+`CNTFRQ_EL0`, never assumed** (a hardcoded guess made every sleep on that board wrong by orders of
+magnitude and hid for months), and the wait for the first ticks is **bounded** so a timer that never
+fires reports instead of hanging the boot looking busy.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/gic.rs` | new, 4 | Four Device-mapped MMIO accessors: `init` (quiesce, priority mask, enable distributor + CPU interface), `enable` (priority, target, set-enable bit), `acknowledge` (GICC_IAR - a read WITH the architectural side effect of acknowledging), `eoi` (GICC_EOIR). Each is a single volatile access to a register the GICv2 spec defines. |
+| `arch/aarch64/timer.rs` | new, 5 | System-register access only: `CNTFRQ_EL0` and `CNTPCT_EL0` reads (side-effect-free), `CNTP_TVAL_EL0`/`CNTP_CTL_EL0` writes to arm and disable, and `msr daifclr, #2` to unmask IRQs at EL1. EL2 granted EL1 access to the physical timer during the boot drop (CNTHCTL_EL2), so none of these trap. |
+
 ## 2026-08-03 - Pi 4 milestone 3: exception vectors (feat/pi4-aarch64)
 
 `VBAR_EL1` and a 16-entry vector table. This comes before the timer or the GIC because until it exists
@@ -1159,6 +1175,8 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 |---|---|---|
 | arch/aarch64/mod.rs | 28 | permitted |
 | arch/aarch64/exceptions.rs | 5 | permitted |
+| arch/aarch64/gic.rs | 4 | permitted |
+| arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 2 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |

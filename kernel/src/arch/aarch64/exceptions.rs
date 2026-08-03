@@ -55,29 +55,38 @@ global_asm!(
     b    aarch64_trap_common
 .endm
 
+// IRQ vectors must RETURN, not report and halt - a timer tick that halts the machine is not a tick.
+.macro VECTOR_IRQ kind
+    .align 7
+    sub  sp, sp, #272
+    stp  x0, x1, [sp, #0]
+    mov  x0, #\kind
+    b    aarch64_irq_common
+.endm
+
     .section .text
     .globl aarch64_vectors
     .align 11                      // VBAR_EL1 requires 2 KiB alignment
 aarch64_vectors:
     VECTOR_ENTRY 0                 // Current EL, SP_EL0:  Synchronous
-    VECTOR_ENTRY 1                 //                      IRQ
+    VECTOR_IRQ   1                 //                      IRQ
     VECTOR_ENTRY 2                 //                      FIQ
     VECTOR_ENTRY 3                 //                      SError
     VECTOR_ENTRY 4                 // Current EL, SP_ELx:  Synchronous
-    VECTOR_ENTRY 5                 //                      IRQ
+    VECTOR_IRQ   5                 //                      IRQ
     VECTOR_ENTRY 6                 //                      FIQ
     VECTOR_ENTRY 7                 //                      SError
     VECTOR_ENTRY 8                 // Lower EL, AArch64:   Synchronous
-    VECTOR_ENTRY 9                 //                      IRQ
+    VECTOR_IRQ   9                 //                      IRQ
     VECTOR_ENTRY 10                //                      FIQ
     VECTOR_ENTRY 11                //                      SError
     VECTOR_ENTRY 12                // Lower EL, AArch32:   Synchronous
-    VECTOR_ENTRY 13                //                      IRQ
+    VECTOR_IRQ   13                //                      IRQ
     VECTOR_ENTRY 14                //                      FIQ
     VECTOR_ENTRY 15                //                      SError
 
-// Shared tail. x0 = vector index, x1 clobbered, both already saved.
-aarch64_trap_common:
+// Save x2..x30 plus ELR/SPSR into the frame the vector entry opened. Used by both tails.
+.macro SAVE_REST
     stp  x2,  x3,  [sp, #16]
     stp  x4,  x5,  [sp, #32]
     stp  x6,  x7,  [sp, #48]
@@ -96,10 +105,44 @@ aarch64_trap_common:
     mrs  x3, spsr_el1
     stp  x30, x2,  [sp, #240]      // x30, then ELR
     str  x3,       [sp, #256]      // SPSR
+.endm
+
+// Synchronous / FIQ / SError: report and stop. Nothing here can handle a fault yet, and returning to a
+// faulting instruction would re-fault and re-print forever.
+aarch64_trap_common:
+    SAVE_REST
     mov  x1, sp                    // arg1 = &TrapFrame
     bl   aarch64_trap_report       // (vector: u64, frame: *const TrapFrame) -> !
 1:  wfe
     b    1b
+
+// IRQ: save, handle, restore, return. The restore order matters - x2/x3 carry ELR/SPSR into their
+// system registers and are only reloaded with their real values afterwards.
+aarch64_irq_common:
+    SAVE_REST
+    mov  x1, sp
+    bl   aarch64_irq_dispatch      // (vector: u64, frame: *mut TrapFrame)
+    ldr  x3,       [sp, #256]      // SPSR
+    ldp  x30, x2,  [sp, #240]      // x30, ELR
+    msr  elr_el1,  x2
+    msr  spsr_el1, x3
+    ldp  x2,  x3,  [sp, #16]
+    ldp  x4,  x5,  [sp, #32]
+    ldp  x6,  x7,  [sp, #48]
+    ldp  x8,  x9,  [sp, #64]
+    ldp  x10, x11, [sp, #80]
+    ldp  x12, x13, [sp, #96]
+    ldp  x14, x15, [sp, #112]
+    ldp  x16, x17, [sp, #128]
+    ldp  x18, x19, [sp, #144]
+    ldp  x20, x21, [sp, #160]
+    ldp  x22, x23, [sp, #176]
+    ldp  x24, x25, [sp, #192]
+    ldp  x26, x27, [sp, #208]
+    ldp  x28, x29, [sp, #224]
+    ldp  x0,  x1,  [sp, #0]
+    add  sp, sp, #272
+    eret
 "#
 );
 
@@ -173,6 +216,29 @@ fn ec_name(esr: u64) -> &'static [u8] {
         0b111100 => b"BRK instruction",
         _ => b"see ARM ARM D17.2.37 for this EC",
     }
+}
+
+/// Ticks seen, so the boot can report progress instead of asserting the timer works.
+pub static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// IRQ entry. Acknowledge at the GIC, handle, end-of-interrupt, return.
+///
+/// The EOI is not optional bookkeeping: the CPU interface keeps a priority active for every
+/// acknowledged interrupt, so skipping it silently blocks all later interrupts of equal or lower
+/// priority. The symptom is "interrupts stopped" with nothing to point at, which is why the retire
+/// happens on every path out of here including the spurious one.
+#[no_mangle]
+extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
+    let id = super::gic::acknowledge();
+    if id == super::gic::SPURIOUS {
+        return; // nothing pending - do NOT EOI an ID that was never raised
+    }
+    if id == super::timer::TIMER_PPI {
+        TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // Re-arm: the generic timer is one-shot, so a periodic tick means reloading it every time.
+        super::timer::arm(super::TIMER_INTERVAL.load(core::sync::atomic::Ordering::Relaxed));
+    }
+    super::gic::eoi(id);
 }
 
 /// Report an exception and halt.

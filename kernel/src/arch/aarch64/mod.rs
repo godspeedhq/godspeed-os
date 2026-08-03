@@ -14,7 +14,17 @@ use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 #[cfg(feature = "pi4")]
 pub mod exceptions;
 #[cfg(feature = "pi4")]
+pub mod gic;
+#[cfg(feature = "pi4")]
 pub mod mmu;
+#[cfg(feature = "pi4")]
+pub mod timer;
+
+/// Reload value for the periodic tick, in generic-timer counter ticks. The timer is one-shot, so the
+/// IRQ handler re-arms with this every time. Published here because the handler runs in an interrupt
+/// context and must not recompute it.
+#[cfg(feature = "pi4")]
+pub static TIMER_INTERVAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // ============================ Boot bring-up ============================
 //
@@ -233,14 +243,48 @@ extern "C" fn aarch64_boot_main() -> ! {
         } else {
             put_str(b"aarch64: WARN VBAR_EL1 did not take the write\r\n");
         }
-        // Prove they work rather than assert it. `brk #0` raises a synchronous exception from the
-        // current EL on the current stack - vector 4 - so a correct table reports it and halts, and a
-        // broken one hangs silently. A self-test that cannot fail is worth nothing (the lesson from
-        // kernel-audit A9-1), so this is deliberately a real fault, not a simulated one.
-        put_str(b"aarch64: raising a deliberate BRK to prove the vectors fire...\r\n");
-        // SAFETY: `brk #0` is a breakpoint instruction; with vectors installed it is taken to the
-        // synchronous handler above, which reports and halts. It never returns.
-        unsafe { core::arch::asm!("brk #0", options(nostack)) };
+        // The deliberate `brk #0` that proved this table lived here. It has served its purpose - the
+        // vectors reported it correctly on hardware (ESR EC 0b111100, vector 4) - and it is removed
+        // rather than left behind, because it halts the boot and everything past this point needs to
+        // run. The synchronous path it exercised is unchanged.
+    }
+
+    // --- GIC-400 + generic timer -------------------------------------------------------------
+    #[cfg(feature = "pi4")]
+    {
+        gic::init();
+        let freq = timer::frequency();
+        put_str(b"aarch64: generic timer CNTFRQ_EL0=");
+        put_dec(freq);
+        put_str(b" Hz (read from the register, never assumed)\r\n");
+
+        const TICK_HZ: u64 = 100; // 10 ms, matching §9.1's quantum
+        let interval = timer::start(TICK_HZ);
+        TIMER_INTERVAL.store(interval, Ordering::Relaxed);
+        put_str(b"aarch64: tick armed at 100 Hz (reload ");
+        put_dec(interval);
+        put_str(b" counter ticks), PPI 30 enabled at the GIC\r\n");
+
+        // Nothing is delivered until PSTATE.I is cleared, however well the GIC is programmed.
+        timer::unmask_irqs();
+
+        // Wait for the tick to prove itself, BOUNDED - a timer that never fires must report that
+        // rather than hang the boot looking busy (invariant 12).
+        let mut spins: u64 = 0;
+        while exceptions::TICKS.load(Ordering::Relaxed) < 10 && spins < 500_000_000 {
+            spins += 1;
+            core::hint::spin_loop();
+        }
+        let ticks = exceptions::TICKS.load(Ordering::Relaxed);
+        if ticks >= 10 {
+            put_str(b"aarch64: timer IRQs DELIVERING - ");
+            put_dec(ticks);
+            put_str(b" ticks taken through the GIC and the IRQ vector\r\n");
+        } else {
+            put_str(b"aarch64: WARN no timer IRQ after a bounded wait (ticks=");
+            put_dec(ticks);
+            put_str(b") - GIC or CNTP configuration is wrong\r\n");
+        }
     }
 
     put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.\r\n");
@@ -280,6 +324,24 @@ pub(crate) fn put_hex(v: u64) {
             put_byte(if nib < 10 { b'0' + nib } else { b'a' + nib - 10 });
         }
     }
+}
+
+/// Print a u64 in decimal. Frequencies and tick counts read as nonsense in hex, and a reader should
+/// not have to convert to check whether 54 MHz is what the board reports.
+pub(crate) fn put_dec(v: u64) {
+    if v == 0 {
+        put_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut n = v;
+    let mut i = buf.len();
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    put_str(&buf[i..]);
 }
 
 pub(crate) fn put_str(s: &[u8]) {
