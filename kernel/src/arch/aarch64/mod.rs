@@ -11,6 +11,9 @@
 
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
+#[cfg(feature = "pi4")]
+pub mod mmu;
+
 // ============================ Boot bring-up ============================
 //
 // Two boards share this file, selected by the `pi4` cargo feature:
@@ -186,22 +189,36 @@ extern "C" fn aarch64_boot_main() -> ! {
     unsafe { core::arch::asm!("mrs {}, CurrentEL", out(reg) el, options(nomem, nostack)) };
     let el = (el >> 2) & 0x3;
 
-    put_str(b"
-GodspeedOS aarch64: PL011 alive at EL");
+    put_str(b"\r\nGodspeedOS aarch64: PL011 alive at EL");
     put_byte(b'0' + el as u8);
     put_str(if cfg!(feature = "pi4") {
-        b" (Raspberry Pi 4 / BCM2711, PL011 @ 0xFE201000)
-"
+        b" (Raspberry Pi 4 / BCM2711, PL011 @ 0xFE201000)\r\n" as &[u8]
     } else {
-        b" (QEMU virt, PL011 @ 0x09000000)
-"
+        b" (QEMU virt, PL011 @ 0x09000000)\r\n" as &[u8]
     });
     if el != 1 {
-        put_str(b"aarch64: WARN not at EL1 - the EL2 drop did not happen; FP/SIMD will trap
-");
+        put_str(b"aarch64: WARN not at EL1 - the EL2 drop did not happen; FP/SIMD will trap\r\n");
     }
-    put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.
-");
+
+    // Turn translation on. The map is identity, so the PC, the stack and the UART all keep the
+    // addresses they already had - which is the only reason the line after this can print.
+    #[cfg(feature = "pi4")]
+    {
+        put_str(b"aarch64: enabling MMU (4 KiB granule, 39-bit VA, 2 MiB blocks over the low 4 GiB)\r\n");
+        let ttbr = mmu::enable();
+        // Read SCTLR_EL1.M back rather than assume the write took. Without this we would still be
+        // printing with the MMU off, and the first fault later would be blamed on whatever touched
+        // memory next rather than on translation never having been enabled.
+        if mmu::is_enabled() {
+            put_str(b"aarch64: MMU ON, TTBR0_EL1=");
+            put_hex(ttbr);
+            put_str(b" - this line is running translated\r\n");
+        } else {
+            put_str(b"aarch64: WARN MMU did NOT enable - SCTLR_EL1.M still clear\r\n");
+        }
+    }
+
+    put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.\r\n");
     loop {
         // SAFETY: WFI is always valid; wait for an interrupt that never comes (halt).
         unsafe { core::arch::asm!("wfi"); }
@@ -224,6 +241,19 @@ fn put_byte(b: u8) {
             if spins > 1_000_000 { return; } // drop the byte rather than hang forever
         }
         PL011_DR.write_volatile(b);
+    }
+}
+
+/// Print a u64 as `0x...` - enough diagnostics to report a register without pulling in formatting.
+fn put_hex(v: u64) {
+    put_str(b"0x");
+    let mut started = false;
+    for shift in (0..16).rev() {
+        let nib = ((v >> (shift * 4)) & 0xF) as u8;
+        if nib != 0 { started = true; }
+        if started || shift == 0 {
+            put_byte(if nib < 10 { b'0' + nib } else { b'a' + nib - 10 });
+        }
     }
 }
 

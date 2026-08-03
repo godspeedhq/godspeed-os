@@ -13,6 +13,22 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4 milestone 2: the MMU (feat/pi4-aarch64)
+
+Identity-mapping the low 4 GiB and turning translation on. 4 KiB granule, 39-bit VA (so the walk starts
+at L1 and there is no L0 to carry), 2 MiB blocks at L2 - one L1 plus four L2 tables, exactly 20 KiB of
+`.bss`, a fixed and visible footprint (§26.6.1).
+
+The RAM/device split is the part that matters for correctness. Device memory is mapped
+**Device-nGnRnE** and never-execute; RAM is Normal write-back, inner-shareable. Mapping MMIO as Normal
+does not fail cleanly - the core may reorder, merge or speculatively repeat accesses to a peripheral
+register, and the symptom is a device behaving erratically rather than a fault that names the mapping.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mmu.rs` | new, 2 | (1) One block builds the tables and installs them: plain stores to two `.bss` statics this function owns exclusively while the MMU is still off and no other core runs, then `msr` of MAIR/TCR/TTBR0, a `tlbi vmalle1` (the TLB is architecturally UNKNOWN out of reset, so entering with whatever it holds is a real hazard), and finally `SCTLR_EL1.M|C|I`. Because the map is identity, the instruction after the `isb` executes translated at the same address. (2) `is_enabled` reads `SCTLR_EL1` back - a side-effect-free system-register read - so the boot reports what actually happened rather than asserting the write took. |
+| `arch/aarch64/mod.rs` | 25 -> 27 (+2) | `pl011_init` (UART disable/drain/line-control/enable) and `gpio_init_uart` (mux GPIO14/15 to ALT0, pull-up on RX). Both are identity-mapped MMIO writes during single-threaded boot; the BUSY drain is bounded so a wedged UART cannot hang the boot (invariant 12). |
+
 ## 2026-08-03 - Raspberry Pi 4 (aarch64) bring-up + the stale arch stubs
 
 Milestone 1 of the Pi 4 port, plus the arch stubs it exposed as out of date.
@@ -1125,7 +1141,8 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 25 | permitted |
+| arch/aarch64/mod.rs | 27 | permitted |
+| arch/aarch64/mmu.rs | 2 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
