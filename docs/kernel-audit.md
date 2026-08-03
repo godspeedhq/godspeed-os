@@ -22,6 +22,21 @@ and MMIO-mapping path, both of the same shape. Both FIXED (2026-08-03, `fix/mmio
 > applied. The SAFETY comments now describe what the code establishes rather than what it assumed.
 > Verified: identity 24/24, and a boot still reports `ioapic: mapped at 0xfec00000 (ver=0x20, 24
 > redirection entries)` plus `pci: MSI-X enabled` - the new branches are inert on a healthy machine.
+>
+> **Silicon coverage (2026-08-03, after v0.9.1 shipped).** The release notes recorded that
+> `program_msix` had not been reached on hardware. It has now. `program_msi` is tried first and
+> short-circuits the `||`, so `program_msix` only runs on a device with MSI-X *and no MSI* - which no
+> machine here has, so the path was QEMU-only. A throwaway build with the order flipped
+> (`diag/msix-first`, deleted) reached it on the T630: `pci: MSI-X enabled on 00:10.0 vector=0x28
+> bir=0 tbl@0xfeb69000` - a real physical address, not QEMU's `0xc000003000`. The same device reported
+> `MSI enabled` under the normal order, confirming it supports both and the short-circuit was hiding
+> MSI-X. USB stayed healthy (HID keyboard enumerated, xHCI 8 ports) and `selfcheck` was 349/0, so the
+> interrupt delivers rather than merely programming. The EHCI on the same box fell back to
+> `legacy INTx routed via IOAPIC`, exercising the `ioapic.rs` half in the same boot.
+>
+> **Still unobserved:** the `AlreadyMapped` branch (no firmware here maps that MMIO page with a large
+> page - the A9-1 case remains theoretical on the machines available) and `FrameAllocFailed` (needs
+> allocator exhaustion).
 
 | ID | Severity | Commandment | Finding |
 |----|----------|-------------|---------|
