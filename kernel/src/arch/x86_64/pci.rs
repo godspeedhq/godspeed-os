@@ -603,10 +603,32 @@ pub fn program_msi(bdf: u32, vector: u8, dest_apic: u8) -> bool {
 /// reach for the one that does only when the device leaves no choice (`qemu-xhci` exposes MSI-X and no
 /// MSI, which is what keeps that path exercised at all).
 ///
-/// **When this should change.** The day something here genuinely wants multiple interrupters - per-core
-/// xHCI event rings, say - MSI-X earns its place and this order should flip. That is a real change
-/// (multiple vectors, per-vector routing and masking, a driver that can use them), not an ordering
-/// swap. Flipping the order alone buys nothing and re-introduces the mapping path for no benefit.
+/// **Why multiple interrupters are further off than "we do not need them yet".** The obvious rebuttal
+/// is that MSI-X is simply the better mechanism, so we should take it. But the thing that makes it
+/// better does not currently compose with this architecture:
+///
+/// - A service is **one task**, single-threaded. A second vector for the same device is delivered to
+///   the same task, on the same core, as another IPC message. No parallelism is gained.
+/// - Services are **pinned and never migrate** (§9.2), so nothing would spread the load even if the
+///   vectors existed.
+/// - Getting real benefit needs either several driver tasks sharing device state - which Invariant 2
+///   and Commandment VI forbid - or a multi-threaded service, which a task cannot be.
+///
+/// So this is not a driver deciding it would like more vectors; it is an architectural change that runs
+/// into invariants rather than merely unwritten code.
+///
+/// **The one benefit that survives single-threading**, named so the case is not overstated: distinct
+/// vectors let a driver know *why* it was interrupted (error vs completion) without an uncached MMIO
+/// status read, which is genuinely slow. It is modest here because the interrupt reaches a userspace
+/// driver as an IPC message and the round-trip dominates any saved register read, and §20 requires a
+/// benchmark before a performance argument drives a design change. The kernel's interrupt router would
+/// also have to encode which vector fired, which it does not.
+///
+/// **When this should change**, concretely: a device here whose MSI is erratum-broken while its MSI-X
+/// works (a per-device quirk, not a default change); a *measured* case where distinguishing interrupt
+/// cause without an MMIO read moves a benchmark; or an architecture that grows a way to consume
+/// multiple vectors at all. Until one of those is true, flipping the order buys nothing we can use and
+/// re-introduces the mapping path for it.
 ///
 /// *Recorded because it reads as an oversight and is not.* During kernel-audit Audit 9 this was
 /// mistaken for a backwards default on exactly the "most OSes prefer MSI-X" reasoning above, before
@@ -659,7 +681,12 @@ pub fn program_msix(bdf: u32, vector: u8, dest_apic: u8) -> bool {
                     | PageFlags::PCD.bits();
                 // SAFETY: page-aligned MMIO page (the device's MSI-X table BAR), uncached;
                 // already-present is a no-op.
+                #[cfg(not(feature = "mmio-map-fault-test"))]
                 let mapped = unsafe { map_in_active_tables(va_page, page_phys, flags) };
+                // Fault injection - see `ioapic::init` and the feature's note in Cargo.toml.
+                #[cfg(feature = "mmio-map-fault-test")]
+                let mapped: Result<(), crate::arch::x86_64::page_tables::MapError> =
+                    Err(crate::arch::x86_64::page_tables::MapError::FrameAllocFailed);
                 // CHECK the verdict. This used to be `let _ =`, and the MSI-X table writes below went
                 // ahead regardless (kernel-audit A9-2). `map_in_active_tables` can fail with
                 // `FrameAllocFailed`, and writing an unmapped VA is a ring-0 page fault. Declining

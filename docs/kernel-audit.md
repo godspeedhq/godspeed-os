@@ -41,9 +41,27 @@ and MMIO-mapping path, both of the same shape. Both FIXED (2026-08-03, `fix/mmio
 > order too, which is why the diagnostic was not repeated here. Coverage for these fixes is therefore
 > two vendors, two IOAPIC geometries, and both font scales (1x and 3x).
 >
-> **Still unobserved:** the `AlreadyMapped` branch (no firmware here maps that MMIO page with a large
-> page - the A9-1 case remains theoretical on the machines available) and `FrameAllocFailed` (needs
-> allocator exhaustion).
+> **The A9-2 error paths are now EXERCISED, not merely reasoned about** (2026-08-03,
+> `mmio-map-fault-test`). `FrameAllocFailed` cannot be reached by arranging real conditions - the
+> allocator is not exhaustible at boot - so a cargo feature forces it at both call sites, following the
+> `arm-fault-test` / `iommu-fault-test` precedent. Commandment IX: *if recovery cannot be tested, it
+> does not exist*. Off by default; `KERNEL_FEATURES=mmio-map-fault-test` turns it on. Results:
+>
+> - **`ioapic`:** `MMIO map FAILED (FrameAllocFailed) for 0xfec00000 - no interrupt routing on this
+>   machine`, and the kernel **survived** - reached `gsh>` and ran a full-screen editor, zero panics.
+>   Before the fix this same condition read an unmapped VA in ring 0.
+> - **`pci`:** took the *already-mapped* branch and continued, MSI-X programmed successfully, USB
+>   working. Graceful on both sides of the decision.
+>
+> **A claim in the Audit 9 write-up was wrong, and this is the correction.** The `AlreadyMapped`-style
+> branch was described as structurally unreachable, reasoning from the comment at `pci.rs` that
+> "Limine's HHDM covers RAM but not MMIO". Under injection `entry_for_va` found the MSI-X table's HHDM
+> alias **already mapped** - so the HHDM *does* cover that MMIO here. The conclusion survives but for a
+> different reason: a normal (uninjected) boot maps it with no warning, which means the walk reaches a
+> present 4 KiB page table rather than a large-page entry, so **A9-1's large-page case is still
+> unobserved** - not because the page is absent, but because it is mapped at 4 KiB granularity.
+>
+> **Still unobserved:** a large page covering a `map_in_active_tables` target (A9-1's actual trigger).
 
 | ID | Severity | Commandment | Finding |
 |----|----------|-------------|---------|

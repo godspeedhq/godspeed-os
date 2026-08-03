@@ -65,7 +65,13 @@ pub fn init() {
             | PageFlags::PWT.bits()
             | PageFlags::PCD.bits();
         // SAFETY: page-aligned MMIO page (the IOAPIC register window), uncached.
+        #[cfg(not(feature = "mmio-map-fault-test"))]
         let mapped = unsafe { map_in_active_tables(va, phys, flags) };
+        // Fault injection: pretend the allocator could not supply a page-table frame, so the recovery
+        // below is exercised on a machine where it would otherwise never run.
+        #[cfg(feature = "mmio-map-fault-test")]
+        let mapped: Result<(), crate::arch::x86_64::page_tables::MapError> =
+            Err(crate::arch::x86_64::page_tables::MapError::FrameAllocFailed);
         // CHECK the verdict. This used to be `let _ =`, and the register read below went ahead anyway
         // under a SAFETY comment asserting the page was "just mapped" - an assertion whose evidence
         // this code had discarded (kernel-audit A9-2). `map_in_active_tables` really can fail
