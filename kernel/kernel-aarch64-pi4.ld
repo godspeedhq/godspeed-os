@@ -17,16 +17,43 @@
 
 ENTRY(_start)
 
-SECTIONS {
-    . = 0x80000;
+/* The kernel is LINKED high and LOADED low.
+ *
+ * VMA = KERNEL_VA + 0x80000, LMA = 0x80000. The firmware still drops a flat
+ * binary at physical 0x80000 and branches to byte 0 (objcopy -O binary emits by
+ * LMA), but every symbol address is a high, TTBR1 address.
+ *
+ * Why this works across the transition, which is the part worth understanding:
+ *
+ *  - Before the MMU is on, `_start` reaches symbols only through `adrp`/`add`,
+ *    which are PURELY PC-RELATIVE. The linker computes the delta between two
+ *    high addresses; adding that delta to a low PC yields the correct LOW
+ *    physical address. So the same instruction is right in both worlds.
+ *  - Once the MMU is on with TTBR0 = identity AND TTBR1 = high, BOTH address
+ *    ranges translate at the same time. That overlap is what makes the jump to
+ *    the high half safe: there is no instant at which the code is running from
+ *    an address that does not resolve.
+ *  - After the jump, TTBR0 is free for a task, which is the entire point.
+ *
+ * The dangerous case is code running BEFORE the MMU that materialises a symbol
+ * address absolutely (movz/movk) rather than PC-relatively - that yields a high
+ * address with no translation yet. `relocation-model=static` with the small code
+ * model emits adrp for statics, which is why this holds, but it is an assumption
+ * about codegen rather than a guarantee, so the early boot deliberately prints
+ * as soon as it possibly can.
+ */
+KERNEL_VA = 0xFFFFFF8000000000;
 
-    .text : ALIGN(0x1000) {
+SECTIONS {
+    . = KERNEL_VA + 0x80000;
+
+    .text : AT(ADDR(.text) - KERNEL_VA) ALIGN(0x1000) {
         KEEP(*(.text.boot))     /* _start first - the firmware branches to byte 0 */
         *(.text .text.*)
     }
 
-    .rodata : ALIGN(0x1000) { *(.rodata .rodata.*) }
-    .data   : ALIGN(0x1000) { *(.data .data.*) }
+    .rodata : AT(ADDR(.rodata) - KERNEL_VA) ALIGN(0x1000) { *(.rodata .rodata.*) }
+    .data   : AT(ADDR(.data)   - KERNEL_VA) ALIGN(0x1000) { *(.data .data.*) }
 
     /* EL0 region, on its own 2 MiB boundary.
      *
@@ -46,7 +73,7 @@ SECTIONS {
      * EL0 access can be granted without dragging kernel code in with it. */
     . = ALIGN(0x200000);
     __el0_start = .;
-    .el0 : ALIGN(0x1000) {
+    .el0 : AT(ADDR(.el0) - KERNEL_VA) ALIGN(0x1000) {
         *(.el0.text)
         *(.el0.data)
     }
@@ -69,7 +96,7 @@ SECTIONS {
      * initialisation at all. */
     . = ALIGN(16);
     __bss_start = .;
-    .bss : { *(.bss .bss.*) *(COMMON) }
+    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }
     . = ALIGN(16);
     __bss_end = .;
 

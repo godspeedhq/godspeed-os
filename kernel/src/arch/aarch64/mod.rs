@@ -56,6 +56,41 @@ const PL011_BASE: usize = 0x0900_0000; // QEMU `virt`
 #[cfg(feature = "pi4")]
 const PL011_BASE: usize = 0xFE20_1000; // BCM2711 (peripheral base 0xFE00_0000 + 0x20_1000)
 
+/// Offset added to every peripheral address, so the same MMIO code works on both sides of the move to
+/// the high half.
+///
+/// Before the kernel relocates, peripherals are reached at their physical addresses through the low
+/// identity map, and this is `0`. Afterwards `TTBR0` belongs to a task and the low map is gone, so the
+/// only route to a device register is the kernel's high direct map - and this becomes `KERNEL_VA_BASE`.
+///
+/// **This is what made the low map look load-bearing when it was not.** Retiring `TTBR0` immediately
+/// killed the boot, and the cause was not the kernel's code or stack (both already high) but
+/// `put_str` writing to the UART at `0xFE20_1000`. The machine went silent at exactly the instruction
+/// that would have reported the problem, which is the least informative failure available.
+#[cfg(feature = "pi4")]
+static MMIO_OFF: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// A peripheral register's address, wherever the kernel currently reaches peripherals from.
+#[cfg(feature = "pi4")]
+#[inline]
+fn mmio(phys: usize) -> usize {
+    phys + MMIO_OFF.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Switch every peripheral access to the high half. Called once, right after the kernel relocates and
+/// before the low map is retired.
+#[cfg(feature = "pi4")]
+fn mmio_go_high() {
+    MMIO_OFF.store(
+        mmu::KERNEL_VA_BASE as usize,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[cfg(not(feature = "pi4"))]
+#[inline]
+fn mmio(phys: usize) -> usize { phys }
+
 const PL011_DR: *mut u8 = PL011_BASE as *mut u8;
 /// Flag register (+0x18). Bit 5 = TXFF (transmit FIFO full), bit 3 = BUSY.
 const PL011_FR: *const u32 = (PL011_BASE + 0x18) as *const u32;
@@ -95,16 +130,18 @@ fn gpio_init_uart() {
     // GPFSEL1 touches only GPIO14/15's function fields; the pull register is written whole with only
     // those two pins' fields changed.
     unsafe {
-        let mut sel = GPFSEL1.read_volatile();
+        let gpfsel1 = mmio(GPFSEL1 as usize) as *mut u32;
+        let mut sel = gpfsel1.read_volatile();
         sel &= !((0b111 << 12) | (0b111 << 15)); // clear GPIO14, GPIO15 function fields
         sel |= (0b100 << 12) | (0b100 << 15);    // ALT0 = TXD0 / RXD0
-        GPFSEL1.write_volatile(sel);
+        gpfsel1.write_volatile(sel);
 
-        let mut pud = GPIO_PUP_PDN_CNTRL_REG0.read_volatile();
+        let pud_reg = mmio(GPIO_PUP_PDN_CNTRL_REG0 as usize) as *mut u32;
+        let mut pud = pud_reg.read_volatile();
         pud &= !(0b11 << 28); // GPIO14 (TX): no pull - we drive it
         pud &= !(0b11 << 30);
         pud |= 0b01 << 30;    // GPIO15 (RX): pull-up, so an absent peer reads as idle, not noise
-        GPIO_PUP_PDN_CNTRL_REG0.write_volatile(pud);
+        pud_reg.write_volatile(pud);
     }
 }
 
@@ -123,15 +160,17 @@ fn pl011_init() {
     // SAFETY: BCM2711 UART0 registers, identity-mapped MMIO, single-threaded boot. Writes in the order
     // the PL011 spec requires (disable, drain, set line control, enable).
     unsafe {
-        PL011_CR.write_volatile(0);
+        let cr = mmio(PL011_CR as usize) as *mut u32;
+        let fr = mmio(PL011_FR as usize) as *const u32;
+        cr.write_volatile(0);
         // Bounded: a present-but-wedged UART must not hang the boot on BUSY (invariant 12).
         let mut t = 0u32;
-        while PL011_FR.read_volatile() & PL011_FR_BUSY != 0 {
+        while fr.read_volatile() & PL011_FR_BUSY != 0 {
             t += 1;
             if t > 1_000_000 { break; }
         }
-        PL011_LCRH.write_volatile(PL011_LCRH_8N1);
-        PL011_CR.write_volatile(PL011_CR_ON);
+        (mmio(PL011_LCRH as usize) as *mut u32).write_volatile(PL011_LCRH_8N1);
+        cr.write_volatile(PL011_CR_ON);
     }
 }
 
@@ -276,6 +315,311 @@ extern "C" fn aarch64_boot_main(dtb: u64) -> ! {
         }
     }
 
+    // Prove the high half translates while BOTH maps are live - the only window in which "these two
+    // addresses are the same memory" can be checked at all.
+    #[cfg(feature = "pi4")]
+    match mmu::selftest_high_half() {
+        Some((phys, high)) => {
+            put_str(b"aarch64: TTBR1 high half LIVE - phys ");
+            put_hex(phys);
+            put_str(b" reads/writes as ");
+            put_hex(high);
+            put_str(b"
+");
+        }
+        None => put_str(b"aarch64: WARN high half did NOT translate - check TG1/EPD1/TTBR1_EL1
+"),
+    }
+
+    // --- Move the kernel into the high half --------------------------------------------------
+    // Done here, while BOTH halves translate, and never later: from this point the kernel executes
+    // from TTBR1 and TTBR0 belongs to whatever task is running. Everything past this line lives in
+    // `boot_high`, because the jump abandons this stack along with every local on it.
+    #[cfg(feature = "pi4")]
+    // SAFETY: `mmu::enable` installed both TTBR0 (identity) and TTBR1 (high); `boot_high` is a
+    // no-mangle extern "C" fn that never returns.
+    unsafe { mmu::jump_high(boot_high) };
+
+    put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.\r\n");
+    loop {
+        // SAFETY: WFI is always valid; wait for an interrupt that never comes (halt).
+        unsafe { core::arch::asm!("wfi"); }
+    }
+}
+
+/// Transmit one byte, waiting for FIFO space with a **bounded** spin.
+///
+/// Every hardware wait in this kernel is bounded (invariant 12): a dead or absent UART must never hang
+/// the boot. On a board where the firmware left the UART off, the FIFO never drains - dropping the byte
+/// and continuing is right, because the alternative is a machine that appears bricked with no output at
+/// all to say why.
+pub(crate) fn put_byte(b: u8) {
+    let mut spins = 0u32;
+    // SAFETY: PL011_FR/PL011_DR are the flag and data registers of the board's UART, identity-mapped
+    // MMIO. The MMU is off at this point, so these are physical addresses.
+    unsafe {
+        while (mmio(PL011_FR as usize) as *const u32).read_volatile() & PL011_FR_TXFF != 0 {
+            spins += 1;
+            if spins > 1_000_000 { return; } // drop the byte rather than hang forever
+        }
+        (mmio(PL011_DR as usize) as *mut u8).write_volatile(b);
+    }
+}
+
+/// Where the kernel reaches a physical address: the high direct map.
+///
+/// Since the kernel moved to `TTBR1`, a physical address is not a pointer - `TTBR0` belongs to a task.
+#[cfg(feature = "pi4")]
+#[inline]
+fn hhdm(pa: u64) -> u64 { mmu::KERNEL_VA_BASE + pa }
+
+/// Prove the neutral frame allocator actually works on this board, rather than merely returning.
+///
+/// A count printed by `memory::init` shows the map was parsed; it does not show that a returned frame
+/// is real, distinct, writable, or reusable. Each of those is checked:
+///
+/// 1. **Distinct and aligned** - a batch of frames, no repeats, all 4 KiB aligned and inside RAM the
+///    map called usable. A double-hand-out is the failure that corrupts everything downstream.
+/// 2. **Backed by real memory** - each frame is written with a value derived from its own address and
+///    read back. Identity-mapped, so the physical address IS the pointer. This catches a map that
+///    describes RAM the board does not have, which is exactly what a mis-parsed device tree produces.
+/// 3. **Reusable** - free them all, and the free count must return to where it started. A leak here
+///    would be invisible until the machine ran out much later.
+#[cfg(feature = "pi4")]
+fn allocator_selftest() {
+    use crate::memory::allocator::{alloc_frame, free_frame, free_frame_count};
+
+    const N: usize = 64;
+    let before = free_frame_count();
+    let mut frames = [0u64; N];
+    let mut got = 0usize;
+
+    while got < N {
+        match alloc_frame() {
+            Some(f) => {
+                frames[got] = f.phys_addr().0;
+                got += 1;
+            }
+            None => break,
+        }
+    }
+
+    let mut bad_align = 0;
+    let mut dupes = 0;
+    let mut bad_readback = 0;
+
+    for i in 0..got {
+        let pa = frames[i];
+        if pa & 0xFFF != 0 {
+            bad_align += 1;
+        }
+        if frames[..i].contains(&pa) {
+            dupes += 1;
+        }
+    }
+
+    // Write EVERY frame first, then verify every frame - deliberately two passes rather than
+    // write-then-read each in turn. A single pass cannot detect ALIASING: two distinct physical
+    // addresses backed by the same RAM would each read back correctly the instant after being
+    // written. Separating the passes means an alias overwrites the earlier frame's value and the
+    // verify catches it. That matters here specifically, because a memory map claiming RAM the board
+    // does not have usually shows up as address wrap or aliasing on real silicon, not as a fault.
+    // The value is derived from the frame's own address so no two frames expect the same bytes.
+    for i in 0..got {
+        // SAFETY: `frames[i]` is a frame the allocator just handed us, reached through the kernel's
+        // direct map (a physical address is not a pointer now that TTBR0 belongs to tasks). Nothing
+        // else holds these frames.
+        unsafe { (hhdm(frames[i]) as *mut u64).write_volatile(frames[i] ^ 0x5A5A_A5A5_DEAD_C0DE) };
+    }
+    for i in 0..got {
+        // SAFETY: as above - the frame is still owned by this function until it is freed below.
+        let got_val = unsafe { (hhdm(frames[i]) as *const u64).read_volatile() };
+        if got_val != frames[i] ^ 0x5A5A_A5A5_DEAD_C0DE {
+            bad_readback += 1;
+        }
+    }
+
+    for i in 0..got {
+        // SAFETY: each frame came from `alloc_frame` above and is freed exactly once.
+        unsafe { free_frame(crate::memory::frame::Frame::from_phys(crate::memory::frame::PhysAddr(frames[i]))) };
+    }
+
+    let after = free_frame_count();
+    let ok = got == N && bad_align == 0 && dupes == 0 && bad_readback == 0 && after == before;
+
+    if ok {
+        crate::kprintln!(
+            "aarch64: frame allocator OK - {} frames distinct, aligned, read-back verified, all returned ({} free)",
+            got, after
+        );
+    } else {
+        crate::kprintln!(
+            "aarch64: WARN allocator selftest FAILED - got {}/{}, {} misaligned, {} duplicate, {} bad read-back, free {} -> {}",
+            got, N, bad_align, dupes, bad_readback, before, after
+        );
+    }
+}
+
+/// Prove a per-task address space works, including the `TTBR0_EL1` swap that had no exercise until now.
+///
+/// The checks, in the order they would fail:
+///
+/// 1. **A private space is built** from the kernel L1, with its own L2 copies.
+/// 2. **A page maps at a VA the task owns outright** - above the low 4 GiB the kernel identity-maps,
+///    so the walk allocates a fresh L2 and L3 rather than colliding with a kernel block. See `ptables`
+///    for why a VA *below* 4 GiB cannot be used yet: it would shadow the kernel's identity mapping.
+/// 3. **The switch actually takes**: install the new TTBR0, and read back a value written through the
+///    new mapping. This is the first time the address-space branch of `switch_context` is exercised.
+/// 4. **The kernel survived the switch** - it is still executing, printing, and its own data reads
+///    back correctly under the task's table.
+/// 5. **Switching back and reclaiming** returns every table frame, checked against the free count.
+#[cfg(feature = "pi4")]
+fn page_table_selftest() {
+    use crate::memory::allocator::{alloc_frame, free_frame, free_frame_count};
+
+    // ABOVE the kernel's identity map (which covers the low 4 GiB), so this address space genuinely
+    // owns the address: no kernel block to collide with, no shadowing. Choosing a VA below 4 GiB is
+    // what surfaced the TTBR1 finding recorded in `ptables` - a task page there would displace the
+    // kernel's identity mapping of the same physical range.
+    const TEST_VA: u64 = 0x1_0000_0000;
+    const MAGIC: u64 = 0xC0FF_EE00_1234_5678;
+
+    let before = free_frame_count();
+
+    // A kernel-owned frame, written before the switch and read back through its IDENTITY address while
+    // the task's table is installed. That is the real question about a copied kernel map: does kernel
+    // memory stay reachable under a task's address space? If the L2 copies were wrong this read comes
+    // back garbage, or the machine dies before printing at all.
+    let canary_frame = match alloc_frame() {
+        Some(f) => f,
+        None => { crate::kprintln!("aarch64: WARN page-table selftest could not allocate"); return; }
+    };
+    let canary_pa = canary_frame.phys_addr().0;
+    // SAFETY: a frame the allocator just handed us, reached through the kernel's direct map.
+    unsafe { (hhdm(canary_pa) as *mut u64).write_volatile(MAGIC ^ 0xFFFF) };
+
+    let mut pt = match ptables::PageTable::new() {
+        Ok(p) => p,
+        Err(_) => { crate::kprintln!("aarch64: WARN page-table selftest could not build a space"); return; }
+    };
+
+    let data = match alloc_frame() {
+        Some(f) => f,
+        None => { crate::kprintln!("aarch64: WARN page-table selftest could not allocate"); return; }
+    };
+    let data_pa = data.phys_addr().0;
+    // SAFETY: ours, reached through the direct map.
+    unsafe { (hhdm(data_pa) as *mut u64).write_volatile(MAGIC) };
+
+    if pt.map(TEST_VA, data_pa, false, true, false).is_err() {
+        crate::kprintln!("aarch64: WARN page-table selftest map failed");
+        return;
+    }
+
+    let new_ttbr = pt.ttbr();
+    let old_ttbr: u64;
+    // SAFETY: reading TTBR0_EL1 is side-effect free.
+    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) old_ttbr, options(nomem, nostack)) };
+
+    // --- the switch itself -------------------------------------------------------------------
+    // SAFETY: `new_ttbr` maps the kernel (copied from the boot L1), so the instruction stream, the
+    // stack and the UART all stay translated across the change. The invalidate is required: writing
+    // TTBR0 flushes nothing on AArch64 (SEC-26).
+    unsafe {
+        core::arch::asm!(
+            "msr ttbr0_el1, {t}", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
+            t = in(reg) new_ttbr, options(nostack),
+        );
+    }
+
+    // Read through the NEW mapping, and re-read the canary through the split block.
+    // SAFETY: TEST_VA is mapped by the table now installed; the canary is read through the kernel's
+    // high direct map, which every address space shares because it lives in TTBR1.
+    let through_va = unsafe { (TEST_VA as *const u64).read_volatile() };
+    let canary_back = unsafe { (hhdm(canary_pa) as *const u64).read_volatile() };
+
+    // --- back to the kernel space ------------------------------------------------------------
+    // SAFETY: `old_ttbr` is the boot L1 that was live a moment ago.
+    unsafe {
+        core::arch::asm!(
+            "msr ttbr0_el1, {t}", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
+            t = in(reg) old_ttbr, options(nostack),
+        );
+    }
+
+    let mapped_ok = through_va == MAGIC;
+    let canary_ok = canary_back == (MAGIC ^ 0xFFFF);
+
+    // Reclaim: unmap gives the data frame back, dropping the table frees every table frame.
+    let unmapped = pt.unmap(TEST_VA).is_ok();
+    drop(pt);
+    // SAFETY: both frames came from the allocator and are freed exactly once.
+    unsafe { free_frame(data); free_frame(canary_frame); }
+
+    let after = free_frame_count();
+    if mapped_ok && canary_ok && unmapped && after == before {
+        crate::kprintln!(
+            "aarch64: per-task page table OK - own space built, TTBR0 swapped and read through, \
+             kernel reachable under it, all frames reclaimed ({} free)",
+            after
+        );
+    } else {
+        crate::kprintln!(
+            "aarch64: WARN page-table selftest FAILED - mapped={} canary={} unmapped={} frames {} -> {}",
+            mapped_ok, canary_ok, unmapped, before, after
+        );
+    }
+}
+
+
+/// The boot, continued from the high half.
+///
+/// Split from `aarch64_boot_main` because [`mmu::jump_high`] relocates `SP` as well as `PC`: every
+/// frame pointer and return address on the old stack names a low address, so the jump cannot return and
+/// the remaining work has to live in a function it branches to instead. Nothing here differs in kind
+/// from what ran before - only the addresses it runs at.
+#[cfg(feature = "pi4")]
+#[no_mangle]
+extern "C" fn boot_high() -> ! {
+    if mmu::running_high() {
+        put_str(b"aarch64: kernel RUNNING FROM THE HIGH HALF (TTBR1), PC above ");
+        put_hex(mmu::KERNEL_VA_BASE);
+        put_str(b"\r\n");
+    } else {
+        put_str(b"aarch64: WARN jump_high did not take - PC is still low\r\n");
+    }
+
+    // Report SP, not just PC. The jump relocates BOTH, and the stack is the half that fails silently:
+    // a PC that did not move stops the machine instantly, whereas an SP that did not move keeps
+    // working perfectly until the low map is retired and then dies somewhere unrelated. That is not
+    // hypothetical - it is exactly what happened here, and this line is what settled it.
+    {
+        let sp: u64;
+        // SAFETY: reading SP is side-effect free.
+        unsafe { core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack)) };
+        if sp >= mmu::KERNEL_VA_BASE {
+            put_str(b"aarch64: stack relocated too, SP = ");
+            put_hex(sp);
+            put_str(b"\r\n");
+        } else {
+            put_str(b"aarch64: WARN SP is STILL LOW after the jump - it will die when TTBR0 is dropped\r\n");
+        }
+    }
+
+    // Peripherals move first. The kernel's code and stack are already high, but a device register is
+    // still named by its physical address, and the UART is the one thing that must keep working across
+    // this step or the next failure reports nothing at all.
+    mmio_go_high();
+
+    // Retire the low identity map IMMEDIATELY, not eventually. Everything below then runs with TTBR0
+    // empty, so any surviving reliance on "a physical address is a pointer" faults HERE, in a boot that
+    // is still printing, rather than surviving until the first real task installs its own address space
+    // and turns it into a mystery.
+    // SAFETY: we are executing from the high half (checked just above), so nothing the kernel needs is
+    // reached through TTBR0 any more.
+    unsafe { mmu::drop_low_map() };
+    put_str(b"aarch64: low identity map RETIRED - TTBR0_EL1 is free for a task\r\n");
+
     // Vectors AFTER the MMU, because VBAR_EL1 holds a virtual address and installing it before
     // translation is live would point at an address that is about to mean something else. From here on
     // a fault reports itself instead of wandering off into whatever sits at the reset vector.
@@ -307,30 +651,9 @@ extern "C" fn aarch64_boot_main(dtb: u64) -> ! {
     // allocator reports itself instead of wandering.
     #[cfg(feature = "pi4")]
     let boot_info = {
-        let bi = memmap::boot_info(boot_map);
+        let bi = memmap::boot_info(memmap::current_map());
         crate::memory::init(&bi);
         allocator_selftest();
-
-        // Prove the high half BEFORE building anything on it. A frame from the allocator is used as
-        // scratch so the test writes somewhere the kernel definitely owns.
-        if let Some(f) = crate::memory::allocator::alloc_frame() {
-            let pa = f.phys_addr().0;
-            match mmu::selftest_high_half(pa) {
-                Some(high) => {
-                    put_str(b"aarch64: TTBR1 high half LIVE - phys ");
-                    put_hex(pa);
-                    put_str(b" also reads/writes at ");
-                    put_hex(high);
-                    put_str(b"\r\n");
-                }
-                None => put_str(
-                    b"aarch64: WARN TTBR1 high half did NOT translate - check TG1/EPD1/TTBR1_EL1\r\n",
-                ),
-            }
-            // SAFETY: the frame came from `alloc_frame` and is freed exactly once.
-            unsafe { crate::memory::allocator::free_frame(f) };
-        }
-
         page_table_selftest();
         bi
     };
@@ -394,22 +717,28 @@ extern "C" fn aarch64_boot_main(dtb: u64) -> ! {
     }
 
     // --- EL0 + the svc syscall path ------------------------------------------------------------
+    //
+    // RETIRED BY THE TTBR1 SPLIT, deliberately, and worth understanding rather than just skipping.
+    //
+    // The milestone-6 demo put its EL0 code and stack in a linker-placed `.el0` region and reached them
+    // through the kernel's own identity map, granting EL0 access to those 2 MiB blocks. That worked
+    // only because kernel and user shared one address space. Now the kernel lives in TTBR1, which EL0
+    // cannot reach **at all** - the architecture gives EL0 no access to the high half - so running the
+    // demo unchanged takes an instruction abort from the lower EL the instant it `eret`s (observed:
+    // `ESR 0x8200000e`, `FAR 0xffffff8000200000`, reported cleanly by the vectors).
+    //
+    // That is the split working, not breaking. What replaces it is a real EL0 task: its code and stack
+    // in frames mapped into its OWN TTBR0 address space, at a low VA it now genuinely owns because the
+    // kernel is no longer sitting there. Every piece of that exists - `ptables` builds the space,
+    // `switch_context` installs it - so this is the next milestone rather than a gap.
+    //
+    // The mechanism it proved (EL0 entry, `svc` decode from `ESR_EL1.imm16`, the return value, the
+    // clean exit) is unchanged and hardware-verified; only where the code LIVES changes.
     #[cfg(feature = "pi4")]
-    {
-        // EL0 access is already granted: `mmu::enable` builds the shim ranges EL0-accessible, so there
-        // is nothing to patch here. The earlier version flipped AP on the live map and flushed, and the
-        // flush killed the machine - see `mmu::EL0_SHIM_LIMIT` for what that cost and why building it in
-        // is also the design a per-task port wants.
-        usermode::prepare();
-        if usermode::run() {
-            put_str(b"aarch64: EL0 + svc OK - dropped to EL0, syscall round trip checked, exited cleanly\r\n");
-        } else {
-            put_str(b"aarch64: WARN EL0/svc round trip did NOT check out\r\n");
-        }
-        put_str(b"aarch64: ticks since boot = ");
-        put_dec(exceptions::TICKS.load(Ordering::Relaxed));
-        put_str(b" (the timer ticked through EL0 too)\r\n");
-    }
+    put_str(
+        b"aarch64: EL0 demo retired by the TTBR1 split - EL0 cannot reach the high half; \
+          a real task needs its own TTBR0 space (next milestone)\r\n",
+    );
 
     // --- The neutral scheduler (gated) -------------------------------------------------------
     // LAST, and last for two reasons. `scheduler::run` IS the idle loop and never returns, so anything
@@ -420,226 +749,11 @@ extern "C" fn aarch64_boot_main(dtb: u64) -> ! {
     #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
     sched_demo::run(&boot_info);
 
-    put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.\r\n");
+    put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.
+");
     loop {
-        // SAFETY: WFI is always valid; wait for an interrupt that never comes (halt).
-        unsafe { core::arch::asm!("wfi"); }
-    }
-}
-
-/// Transmit one byte, waiting for FIFO space with a **bounded** spin.
-///
-/// Every hardware wait in this kernel is bounded (invariant 12): a dead or absent UART must never hang
-/// the boot. On a board where the firmware left the UART off, the FIFO never drains - dropping the byte
-/// and continuing is right, because the alternative is a machine that appears bricked with no output at
-/// all to say why.
-pub(crate) fn put_byte(b: u8) {
-    let mut spins = 0u32;
-    // SAFETY: PL011_FR/PL011_DR are the flag and data registers of the board's UART, identity-mapped
-    // MMIO. The MMU is off at this point, so these are physical addresses.
-    unsafe {
-        while PL011_FR.read_volatile() & PL011_FR_TXFF != 0 {
-            spins += 1;
-            if spins > 1_000_000 { return; } // drop the byte rather than hang forever
-        }
-        PL011_DR.write_volatile(b);
-    }
-}
-
-/// Prove the neutral frame allocator actually works on this board, rather than merely returning.
-///
-/// A count printed by `memory::init` shows the map was parsed; it does not show that a returned frame
-/// is real, distinct, writable, or reusable. Each of those is checked:
-///
-/// 1. **Distinct and aligned** - a batch of frames, no repeats, all 4 KiB aligned and inside RAM the
-///    map called usable. A double-hand-out is the failure that corrupts everything downstream.
-/// 2. **Backed by real memory** - each frame is written with a value derived from its own address and
-///    read back. Identity-mapped, so the physical address IS the pointer. This catches a map that
-///    describes RAM the board does not have, which is exactly what a mis-parsed device tree produces.
-/// 3. **Reusable** - free them all, and the free count must return to where it started. A leak here
-///    would be invisible until the machine ran out much later.
-#[cfg(feature = "pi4")]
-fn allocator_selftest() {
-    use crate::memory::allocator::{alloc_frame, free_frame, free_frame_count};
-
-    const N: usize = 64;
-    let before = free_frame_count();
-    let mut frames = [0u64; N];
-    let mut got = 0usize;
-
-    while got < N {
-        match alloc_frame() {
-            Some(f) => {
-                frames[got] = f.phys_addr().0;
-                got += 1;
-            }
-            None => break,
-        }
-    }
-
-    let mut bad_align = 0;
-    let mut dupes = 0;
-    let mut bad_readback = 0;
-
-    for i in 0..got {
-        let pa = frames[i];
-        if pa & 0xFFF != 0 {
-            bad_align += 1;
-        }
-        if frames[..i].contains(&pa) {
-            dupes += 1;
-        }
-    }
-
-    // Write EVERY frame first, then verify every frame - deliberately two passes rather than
-    // write-then-read each in turn. A single pass cannot detect ALIASING: two distinct physical
-    // addresses backed by the same RAM would each read back correctly the instant after being
-    // written. Separating the passes means an alias overwrites the earlier frame's value and the
-    // verify catches it. That matters here specifically, because a memory map claiming RAM the board
-    // does not have usually shows up as address wrap or aliasing on real silicon, not as a fault.
-    // The value is derived from the frame's own address so no two frames expect the same bytes.
-    for i in 0..got {
-        // SAFETY: `frames[i]` is a frame the allocator just handed us, and the low 4 GiB is identity
-        // mapped as Normal writable memory, so the physical address is a valid pointer. Nothing else
-        // holds these frames.
-        unsafe { (frames[i] as *mut u64).write_volatile(frames[i] ^ 0x5A5A_A5A5_DEAD_C0DE) };
-    }
-    for i in 0..got {
-        // SAFETY: as above - the frame is still owned by this function until it is freed below.
-        let got_val = unsafe { (frames[i] as *const u64).read_volatile() };
-        if got_val != frames[i] ^ 0x5A5A_A5A5_DEAD_C0DE {
-            bad_readback += 1;
-        }
-    }
-
-    for i in 0..got {
-        // SAFETY: each frame came from `alloc_frame` above and is freed exactly once.
-        unsafe { free_frame(crate::memory::frame::Frame::from_phys(crate::memory::frame::PhysAddr(frames[i]))) };
-    }
-
-    let after = free_frame_count();
-    let ok = got == N && bad_align == 0 && dupes == 0 && bad_readback == 0 && after == before;
-
-    if ok {
-        crate::kprintln!(
-            "aarch64: frame allocator OK - {} frames distinct, aligned, read-back verified, all returned ({} free)",
-            got, after
-        );
-    } else {
-        crate::kprintln!(
-            "aarch64: WARN allocator selftest FAILED - got {}/{}, {} misaligned, {} duplicate, {} bad read-back, free {} -> {}",
-            got, N, bad_align, dupes, bad_readback, before, after
-        );
-    }
-}
-
-/// Prove a per-task address space works, including the `TTBR0_EL1` swap that had no exercise until now.
-///
-/// The checks, in the order they would fail:
-///
-/// 1. **A private space is built** from the kernel L1, with its own L2 copies.
-/// 2. **A page maps at a VA the task owns outright** - above the low 4 GiB the kernel identity-maps,
-///    so the walk allocates a fresh L2 and L3 rather than colliding with a kernel block. See `ptables`
-///    for why a VA *below* 4 GiB cannot be used yet: it would shadow the kernel's identity mapping.
-/// 3. **The switch actually takes**: install the new TTBR0, and read back a value written through the
-///    new mapping. This is the first time the address-space branch of `switch_context` is exercised.
-/// 4. **The kernel survived the switch** - it is still executing, printing, and its own data reads
-///    back correctly under the task's table.
-/// 5. **Switching back and reclaiming** returns every table frame, checked against the free count.
-#[cfg(feature = "pi4")]
-fn page_table_selftest() {
-    use crate::memory::allocator::{alloc_frame, free_frame, free_frame_count};
-
-    // ABOVE the kernel's identity map (which covers the low 4 GiB), so this address space genuinely
-    // owns the address: no kernel block to collide with, no shadowing. Choosing a VA below 4 GiB is
-    // what surfaced the TTBR1 finding recorded in `ptables` - a task page there would displace the
-    // kernel's identity mapping of the same physical range.
-    const TEST_VA: u64 = 0x1_0000_0000;
-    const MAGIC: u64 = 0xC0FF_EE00_1234_5678;
-
-    let before = free_frame_count();
-
-    // A kernel-owned frame, written before the switch and read back through its IDENTITY address while
-    // the task's table is installed. That is the real question about a copied kernel map: does kernel
-    // memory stay reachable under a task's address space? If the L2 copies were wrong this read comes
-    // back garbage, or the machine dies before printing at all.
-    let canary_frame = match alloc_frame() {
-        Some(f) => f,
-        None => { crate::kprintln!("aarch64: WARN page-table selftest could not allocate"); return; }
-    };
-    let canary_pa = canary_frame.phys_addr().0;
-    // SAFETY: a frame the allocator just handed us, in identity-mapped writable RAM.
-    unsafe { (canary_pa as *mut u64).write_volatile(MAGIC ^ 0xFFFF) };
-
-    let mut pt = match ptables::PageTable::new() {
-        Ok(p) => p,
-        Err(_) => { crate::kprintln!("aarch64: WARN page-table selftest could not build a space"); return; }
-    };
-
-    let data = match alloc_frame() {
-        Some(f) => f,
-        None => { crate::kprintln!("aarch64: WARN page-table selftest could not allocate"); return; }
-    };
-    let data_pa = data.phys_addr().0;
-    // SAFETY: ours, identity-mapped.
-    unsafe { (data_pa as *mut u64).write_volatile(MAGIC) };
-
-    if pt.map(TEST_VA, data_pa, false, true, false).is_err() {
-        crate::kprintln!("aarch64: WARN page-table selftest map failed");
-        return;
-    }
-
-    let new_ttbr = pt.ttbr();
-    let old_ttbr: u64;
-    // SAFETY: reading TTBR0_EL1 is side-effect free.
-    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) old_ttbr, options(nomem, nostack)) };
-
-    // --- the switch itself -------------------------------------------------------------------
-    // SAFETY: `new_ttbr` maps the kernel (copied from the boot L1), so the instruction stream, the
-    // stack and the UART all stay translated across the change. The invalidate is required: writing
-    // TTBR0 flushes nothing on AArch64 (SEC-26).
-    unsafe {
-        core::arch::asm!(
-            "msr ttbr0_el1, {t}", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
-            t = in(reg) new_ttbr, options(nostack),
-        );
-    }
-
-    // Read through the NEW mapping, and re-read the canary through the split block.
-    // SAFETY: TEST_VA is mapped by the table now installed; `canary_pa` is identity-mapped in it too.
-    let through_va = unsafe { (TEST_VA as *const u64).read_volatile() };
-    let canary_back = unsafe { (canary_pa as *const u64).read_volatile() };
-
-    // --- back to the kernel space ------------------------------------------------------------
-    // SAFETY: `old_ttbr` is the boot L1 that was live a moment ago.
-    unsafe {
-        core::arch::asm!(
-            "msr ttbr0_el1, {t}", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
-            t = in(reg) old_ttbr, options(nostack),
-        );
-    }
-
-    let mapped_ok = through_va == MAGIC;
-    let canary_ok = canary_back == (MAGIC ^ 0xFFFF);
-
-    // Reclaim: unmap gives the data frame back, dropping the table frees every table frame.
-    let unmapped = pt.unmap(TEST_VA).is_ok();
-    drop(pt);
-    // SAFETY: both frames came from the allocator and are freed exactly once.
-    unsafe { free_frame(data); free_frame(canary_frame); }
-
-    let after = free_frame_count();
-    if mapped_ok && canary_ok && unmapped && after == before {
-        crate::kprintln!(
-            "aarch64: per-task page table OK - own space built, TTBR0 swapped and read through, \
-             kernel reachable under it, all frames reclaimed ({} free)",
-            after
-        );
-    } else {
-        crate::kprintln!(
-            "aarch64: WARN page-table selftest FAILED - mapped={} canary={} unmapped={} frames {} -> {}",
-            mapped_ok, canary_ok, unmapped, before, after
-        );
+        // SAFETY: WFE is always valid.
+        unsafe { core::arch::asm!("wfe") };
     }
 }
 
@@ -899,13 +1013,24 @@ pub mod page_tables {
         pub fn into_cr3(self) -> u64 { self.root }
     }
 
-    /// A physical address is directly addressable: the Pi 4 port identity-maps the low 4 GiB, so
-    /// `VA == PA` and there is no higher-half direct map to offset through. This is what lets the
-    /// neutral allocator run with `hhdm_offset == 0` instead of treating zero as "caller forgot".
-    /// Same posture as the 32-bit ARM port; the opposite of x86, where Limine supplies an HHDM.
+    /// A physical address is NOT directly addressable on the Pi 4 any more.
+    ///
+    /// It was, while the kernel ran identity-mapped from `TTBR0`. Now the kernel lives in the high half
+    /// and `TTBR0` belongs to a task, so physical memory is reached only through the direct map at
+    /// `KERNEL_VA_BASE` - the same arrangement as x86's Limine HHDM, and `false` for the same reason.
+    #[cfg(feature = "pi4")]
+    pub const PHYS_IS_IDENTITY: bool = false;
+    #[cfg(not(feature = "pi4"))]
     pub const PHYS_IS_IDENTITY: bool = true;
-    pub fn get_hhdm_offset() -> u64 { 0 }
-    pub unsafe fn set_hhdm_offset(offset: u64) {}
+    /// The direct-map base the neutral allocator was handed. Stored rather than assumed so a caller
+    /// that forgot `set_hhdm_offset` reads zero and fails loudly instead of quietly translating wrong.
+    static HHDM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    pub fn get_hhdm_offset() -> u64 { HHDM.load(core::sync::atomic::Ordering::Acquire) }
+    /// # Safety
+    /// Called once by `memory::init` before any physical address is dereferenced through the map.
+    pub unsafe fn set_hhdm_offset(offset: u64) {
+        HHDM.store(offset, core::sync::atomic::Ordering::Release);
+    }
     pub fn read_page_table_base() -> u64 { 0 }               // TTBR0_EL1
     pub unsafe fn write_page_table_base(base: u64) {}
     pub unsafe fn invalidate_tlb_page(addr: u64) {}          // TLBI VAE1

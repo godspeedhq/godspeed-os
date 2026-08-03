@@ -33,7 +33,14 @@ import subprocess, sys, os, pathlib, re
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROFILE = "debug" if "--debug" in sys.argv else "release"
 TARGET = "aarch64-unknown-none"
-EXPECT_LOAD = 0x80000  # the Pi's 64-bit flat-load address (NOT the 32-bit port's 0x8000)
+# The kernel is LINKED high (TTBR1) and LOADED low. objcopy -O binary emits by LMA,
+# so the flat image still starts at the Pi's 0x80000 flat-load address, while every
+# symbol is a high virtual address. Both are checked: the LMA because a wrong one
+# produces an image the firmware drops at the wrong place, and the VMA because it is
+# what distinguishes the Pi 4 build from the QEMU `virt` build (which is linked at
+# 0x4008_0000 and would otherwise pass an LMA-only check by accident).
+EXPECT_LOAD = 0x80000               # LMA: where the firmware puts the flat binary
+EXPECT_VMA  = 0xFFFFFF8000080000    # VMA: KERNEL_VA + 0x80000, see kernel-aarch64-pi4.ld
 
 def run(cmd, **kw):
     print(">", " ".join(str(c) for c in cmd))
@@ -68,18 +75,20 @@ img.parent.mkdir(exist_ok=True)
 # A wrong-board image is indistinguishable from a code bug once it is on a card.
 out = subprocess.run([tool("rust-objdump"), "-h", str(elf)],
                      cwd=ROOT, capture_output=True, text=True).stdout
-m = re.search(r"\.text\s+[0-9a-f]+\s+([0-9a-f]{8,16})", out)
+m = re.search(r"\.text\s+[0-9a-f]+\s+([0-9a-f]{16})\s+([0-9a-f]{16})", out)
 if not m:
-    sys.exit("could not read the .text address from the ELF - refusing to emit an image")
-addr = int(m.group(1), 16)
-if addr != EXPECT_LOAD:
+    sys.exit("could not read the .text VMA/LMA from the ELF - refusing to emit an image")
+vma, lma = int(m.group(1), 16), int(m.group(2), 16)
+if lma != EXPECT_LOAD or vma != EXPECT_VMA:
     sys.exit(
-        f"WRONG BOARD: .text is linked at {addr:#x}, expected {EXPECT_LOAD:#x}.\n"
-        f"That is the QEMU `virt` layout, not the Pi 4's. The artifact was probably\n"
-        f"overwritten by a non-pi4 build. Re-run this script alone."
+        f"WRONG BOARD: .text VMA={vma:#x} LMA={lma:#x}, "
+        f"expected VMA={EXPECT_VMA:#x} LMA={EXPECT_LOAD:#x}.\n"
+        f"A low VMA means the QEMU `virt` build overwrote the artifact; a wrong LMA means\n"
+        f"the firmware would drop the image somewhere it cannot run. Re-run this script alone."
     )
+addr = lma
 
 run([tool("rust-objcopy"), "-O", "binary", str(elf), str(img)])
 print(f"OK  {img.relative_to(ROOT)}  ({img.stat().st_size} bytes, "
-      f".text @ {addr:#x}, feature={FEATURES}, profile={PROFILE})")
+      f".text VMA {vma:#x} / LMA {addr:#x}, feature={FEATURES}, profile={PROFILE})")
 print("Deploy: copy build/kernel8.img to the SD card as the name config.txt's `kernel=` line points at.")

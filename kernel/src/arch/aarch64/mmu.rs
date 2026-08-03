@@ -90,7 +90,14 @@ extern "C" {
 /// they are built complete and then switched to.
 fn el0_region() -> (u64, u64) {
     // SAFETY: linker-provided symbols; taking their addresses does not dereference them.
-    unsafe { (core::ptr::addr_of!(__el0_start) as u64, core::ptr::addr_of!(__el0_end) as u64) }
+    // Converted to PHYSICAL: the comparison below is against a physical block address, and the kernel
+    // is linked high, so the raw symbols would never match anything.
+    unsafe {
+        (
+            virt_to_phys(core::ptr::addr_of!(__el0_start) as u64),
+            virt_to_phys(core::ptr::addr_of!(__el0_end) as u64),
+        )
+    }
 }
 
 // --- Descriptor bits (Armv8-A long descriptor, stage 1) ---
@@ -136,6 +143,21 @@ static mut L2: [Table; L1_USED] = [
 /// than by a second, subtly-different one.
 pub const KERNEL_VA_BASE: u64 = 0xFFFF_FF80_0000_0000;
 
+/// Convert a kernel virtual address to its physical address.
+///
+/// The kernel is linked high (see the linker script), so the address of any static is a `TTBR1`
+/// address. Anything the HARDWARE consumes - a `TTBR` value, a page-table entry's output address, a
+/// DMA address - must be physical, and this is the one conversion that gets it there.
+///
+/// It tolerates an address that is already physical (below the high base) so it can be used on both
+/// sides of the boot transition without a second function that callers must remember to choose
+/// between. Before the jump a static's address is still high (the linker made it so), so the
+/// conversion is doing real work even then.
+#[inline]
+pub fn virt_to_phys(va: u64) -> u64 {
+    if va >= KERNEL_VA_BASE { va - KERNEL_VA_BASE } else { va }
+}
+
 static mut L1_HIGH: Table = Table([0; ENTRIES]);
 static mut L2_HIGH: [Table; L1_USED] = [
     Table([0; ENTRIES]),
@@ -158,7 +180,7 @@ pub fn enable() -> u64 {
 
         for i in 0..L1_USED {
             // L1 entry i -> L2 table i.
-            let l2_pa = (&raw const (*l2)[i]) as u64;
+            let l2_pa = virt_to_phys((&raw const (*l2)[i]) as u64);
             (*l1).0[i] = l2_pa | DESC_TABLE;
 
             for j in 0..ENTRIES {
@@ -186,7 +208,7 @@ pub fn enable() -> u64 {
         let l1h = &raw mut L1_HIGH;
         let l2h = &raw mut L2_HIGH;
         for i in 0..L1_USED {
-            let l2_pa = (&raw const (*l2h)[i]) as u64;
+            let l2_pa = virt_to_phys((&raw const (*l2h)[i]) as u64);
             (*l1h).0[i] = l2_pa | DESC_TABLE;
             for j in 0..ENTRIES {
                 let pa = (i as u64) * (ENTRIES as u64) * BLOCK_SIZE + (j as u64) * BLOCK_SIZE;
@@ -200,8 +222,8 @@ pub fn enable() -> u64 {
             }
         }
 
-        let ttbr = l1 as u64;
-        let ttbr1 = l1h as u64;
+        let ttbr = virt_to_phys(l1 as u64);
+        let ttbr1 = virt_to_phys(l1h as u64);
 
         // TCR_EL1. T0SZ=T1SZ=25 gives a 39-bit VA at each end, so both walks start at L1.
         //
@@ -271,6 +293,84 @@ pub fn enable() -> u64 {
 /// (see `EL0_SHIM_LIMIT`). EL0 access is now decided when the tables are built, so there is no live
 /// mutation and no maintenance to get wrong. Kept as a note rather than dead code so the next person
 /// does not reinvent it.
+/// Move the running kernel into the high half: `SP` and `PC` both, in one step.
+///
+/// Called immediately after [`enable`], while **both** halves translate - TTBR0 still holds the
+/// identity map and TTBR1 the high one. That overlap is what makes this safe: at no instant is the
+/// core executing from an address that does not resolve.
+///
+/// It cannot be written as an ordinary function call. Adding the offset to `SP` invalidates every
+/// frame pointer and return address already on the stack (they name low addresses), so the return path
+/// must not be taken. Instead the caller passes the function to continue into, and this jumps there
+/// with a fresh high stack - a one-way transition, which is why `continue_at` returns `!`.
+///
+/// # Safety
+/// `enable` must have run (both TTBR0 and TTBR1 live), and `continue_at` must be a `#[no_mangle]`
+/// `extern "C"` function that never returns. Anything still on the low stack is abandoned.
+pub unsafe fn jump_high(continue_at: extern "C" fn() -> !) -> ! {
+    let target = (continue_at as usize as u64) | KERNEL_VA_BASE;
+    // SAFETY: `target` is the high alias of a mapped kernel function and the high half maps the whole
+    // stack region, so the relocated SP is valid. Both the branch target and the new stack translate
+    // through TTBR1, which `enable` just installed.
+    unsafe {
+        // The new SP is computed in Rust and handed in as a plain input, so this asm needs no scratch
+        // register at all.
+        //
+        // The first version did the arithmetic in assembly with a hardcoded `x9` as scratch, while
+        // letting the compiler allocate `{base}` - and it chose `x9` too. `mov x9, sp` destroyed the
+        // base, `orr x9, x9, x9` was a no-op, and SP was left exactly as it had been.
+        //
+        // The resulting failure is worth remembering, because nothing about it pointed at the asm: the
+        // kernel ran on perfectly, printing several more lines from its still-mapped low stack, and
+        // only died when `drop_low_map` took that stack away - whereupon the exception handler faulted
+        // on its own push and recursed, walking FAR down by one 272-byte frame each time. Reading SP
+        // back and printing it settled it in a single run.
+        let sp_now: u64;
+        core::arch::asm!("mov {}, sp", out(reg) sp_now, options(nomem, nostack));
+        let sp_high = sp_now | KERNEL_VA_BASE; // the same physical stack, named through the high half
+
+        core::arch::asm!(
+            "mov  sp, {sp}",
+            "br   {target}",
+            sp = in(reg) sp_high,
+            target = in(reg) target,
+            options(noreturn, nostack),
+        );
+    }
+}
+
+/// Are we executing from the high half? Read from the PC rather than assumed.
+pub fn running_high() -> bool {
+    let pc: u64;
+    // SAFETY: `adr` of a local label is a plain PC-relative address computation.
+    unsafe { core::arch::asm!("adr {}, .", out(reg) pc, options(nomem, nostack)) };
+    pc >= KERNEL_VA_BASE
+}
+
+/// Retire the low identity map from `TTBR0_EL1`.
+///
+/// After this, TTBR0 translates nothing until a task's address space is installed - which is the whole
+/// point of the move: a task table no longer has to carry the kernel, so a task page below 4 GiB can no
+/// longer collide with it.
+///
+/// # Safety
+/// The caller must already be executing from the high half ([`running_high`]), and nothing may still
+/// hold a low pointer.
+pub unsafe fn drop_low_map() {
+    // SAFETY: caller is running high, so retiring the low map cannot pull the ground out from under the
+    // instruction stream or the stack. The invalidate is required - writing TTBR0 flushes nothing.
+    unsafe {
+        core::arch::asm!(
+            "msr ttbr0_el1, xzr",
+            "dsb ish",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            options(nostack),
+        );
+    }
+}
+
 /// Prove the high half translates, before anything is built on it.
 ///
 /// Writes a value through a physical (identity) address and reads it back through
@@ -278,25 +378,44 @@ pub fn enable() -> u64 {
 /// where it shows - at the point of the mistake, rather than as an unexplained fault later in whatever
 /// first touched a high address.
 ///
-/// Returns the high address it used, so the caller can report a concrete number instead of "ok".
-pub fn selftest_high_half(scratch_phys: u64) -> Option<u64> {
+/// Returns the (physical, high) pair it used, so the caller reports concrete numbers instead of "ok".
+///
+/// **Must run between [`enable`] and [`jump_high`]**, in the window where both halves translate. That
+/// window is the only place the claim "these two addresses are the same memory" can be checked at all:
+/// afterwards the low map is gone and the physical address is not addressable, which is precisely what
+/// the move was for. Running it later faults on the low write - reported cleanly by the vectors, but a
+/// test that cannot pass is not a test.
+pub fn selftest_high_half() -> Option<(u64, u64)> {
     const MAGIC: u64 = 0x1122_3344_5566_7788;
-    let high = KERNEL_VA_BASE + scratch_phys;
-    // SAFETY: `scratch_phys` is a frame the caller owns, identity-mapped low and now also mapped at
-    // `high` by the table built above. Both are ordinary Normal memory; the `dsb`/`isb` in `enable`
-    // already published the tables.
+    static mut SCRATCH: u64 = 0;
+
+    // SAFETY: taking the address of this module's own static; no dereference yet.
+    let addr = unsafe { (&raw const SCRATCH) as u64 };
+    // Normalise to physical, then construct the high alias EXPLICITLY.
+    //
+    // Do not assume the symbol's address is high just because the kernel is linked high: this runs
+    // before the jump, where the compiler reaches statics with PC-relative `adrp`, and a low PC
+    // therefore yields a LOW address. The first version used the symbol address as the "high" side
+    // and `virt_to_phys` of it as the "low" side - which produced the same number twice and passed
+    // while comparing an address against itself.
+    let phys = virt_to_phys(addr);
+    let high = KERNEL_VA_BASE + phys;
+
+    // SAFETY: `SCRATCH` is a live static, reachable at its physical address through the low identity
+    // map and at `high` through the map just built. Both are ordinary Normal memory and the `dsb`/`isb`
+    // in `enable` published the tables before either is touched.
     unsafe {
-        (scratch_phys as *mut u64).write_volatile(MAGIC);
+        (phys as *mut u64).write_volatile(MAGIC);
         if (high as *const u64).read_volatile() != MAGIC {
             return None;
         }
-        // And the other direction, so this cannot pass on a stale cache line that happened to match.
+        // And the other direction, so this cannot pass on a stale line that happened to match.
         (high as *mut u64).write_volatile(!MAGIC);
-        if (scratch_phys as *const u64).read_volatile() != !MAGIC {
+        if (phys as *const u64).read_volatile() != !MAGIC {
             return None;
         }
     }
-    Some(high)
+    Some((phys, high))
 }
 
 /// The kernel's own boot L1, as a physical address.
@@ -307,7 +426,7 @@ pub fn selftest_high_half(scratch_phys: u64) -> Option<u64> {
 /// spawner. The boot L1 holds only kernel mappings and cannot die, so it is the one safe source.
 pub fn kernel_l1_root() -> u64 {
     // SAFETY: taking the address of this module's static; no dereference.
-    unsafe { (&raw const L1) as u64 }
+    unsafe { virt_to_phys((&raw const L1) as u64) }
 }
 
 /// Whether translation is currently on, read back from `SCTLR_EL1.M` rather than assumed.

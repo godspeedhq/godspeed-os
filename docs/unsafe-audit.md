@@ -13,6 +13,37 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4 milestone 11b: the kernel moves to the high half (feat/pi4-aarch64)
+
+The kernel is now LINKED high and LOADED low (VMA `KERNEL_VA + 0x80000`, LMA `0x80000`), relocates
+itself into `TTBR1` early in boot, and then **retires the low identity map**. `TTBR0_EL1` is empty from
+that point on, which removes the collision milestone 10 documented: a task page below 4 GiB can no
+longer shadow the kernel, because the kernel is not there.
+
+Three things make the transition safe, and they are all in the code rather than in anyone's head:
+
+- `_start` reaches symbols only through `adrp`/`add`, which is purely PC-relative, so the same
+  instruction yields the right LOW address while the MMU is off and the right HIGH one afterwards.
+- Between `enable` and the jump, BOTH halves translate. There is no instant at which the core executes
+  from an address that does not resolve.
+- Peripherals move first (`mmio_go_high`), because a device register is still named by its physical
+  address and the UART must survive the step or the next failure reports nothing.
+
+**Two mistakes here are worth keeping.** The relocation asm used a hardcoded `x9` as scratch while
+letting the compiler allocate `{base}` - and it chose `x9` too, so `mov x9, sp` destroyed the base and
+`orr x9, x9, x9` left SP unchanged. The kernel then ran on happily from its still-mapped low stack and
+only died when the low map was retired, whereupon the handler faulted on its own push and recursed,
+walking `FAR` down by one 272-byte frame per iteration. Nothing pointed at the asm; reading SP back and
+printing it settled it in one run, and the boot now reports SP permanently for that reason. Separately,
+the high-half selftest initially compared an address against itself (it took the symbol's address as
+the "high" side, but pre-jump codegen yields a LOW address) - it passed while testing nothing.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mmu.rs` | 5 -> 11 (+6) | `virt_to_phys` (linker symbols are high; anything the HARDWARE consumes must be physical); the high-half table build; `jump_high` (reads SP, then relocates SP and PC together); `running_high` (reads the PC rather than assuming); `drop_low_map` (`msr ttbr0_el1, xzr` + invalidate); and the corrected selftest. |
+| `arch/aarch64/mod.rs` | 42 -> 45 (+3) | The `mmio()` indirection now used by every PL011/GPIO access, and the SP read-back that reports the stack relocated. |
+| `arch/aarch64/memmap.rs` | 7 -> 8 (+1) | `current_map`, which re-derives the map after the jump abandons the low stack along with every local on it. |
+
 ## 2026-08-03 - Pi 4 milestone 11a: the TTBR1 high half goes live (feat/pi4-aarch64)
 
 Stage one of moving the kernel out of `TTBR0`. The high half (`TTBR1_EL1`) now maps physical `P` at
@@ -1348,18 +1379,18 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 42 | permitted |
+| arch/aarch64/mod.rs | 45 | permitted |
 | arch/aarch64/exceptions.rs | 7 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 4 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
-| arch/aarch64/mmu.rs | 5 | permitted |
+| arch/aarch64/mmu.rs | 11 | permitted |
 | arch/aarch64/ptables.rs | 19 | permitted |
 | arch/aarch64/usermode.rs | 11 | permitted |
 | arch/aarch64/mailbox.rs | 3 | permitted |
-| arch/aarch64/memmap.rs | 7 | permitted |
+| arch/aarch64/memmap.rs | 8 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |

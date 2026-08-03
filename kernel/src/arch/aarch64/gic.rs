@@ -16,7 +16,10 @@
 //! PPIs (private per core - the generic timer lives here), 32+ are SPIs (shared peripherals).
 
 /// GIC-400 base on BCM2711.
-const GIC_BASE: usize = 0xFF84_0000;
+/// The GIC is only ever touched AFTER the kernel has relocated to the high half, so its registers are
+/// named through the direct map directly rather than via the runtime `mmio()` offset the UART needs
+/// (the UART is used on both sides of the move; this is not).
+const GIC_BASE: usize = super::mmu::KERNEL_VA_BASE as usize + 0xFF84_0000;
 const GICD: usize = GIC_BASE + 0x1000;
 const GICC: usize = GIC_BASE + 0x2000;
 

@@ -65,21 +65,32 @@ fn idx(va: u64, level: u8) -> usize {
     ((va >> shift) as usize) & (ENTRIES - 1)
 }
 
-/// Read/write a table entry. The tables are identity-mapped RAM, so the physical address IS the
-/// pointer - the one simplification this port's identity map buys.
+/// Where the kernel can reach a physical address: through the `TTBR1` direct map.
+///
+/// **Not the physical address itself.** Table frames come from the allocator as physical addresses, and
+/// while the kernel ran identity-mapped those doubled as pointers. Once TTBR0 belongs to a task, a
+/// physical address is not addressable at all - the only way the kernel reaches a frame is the high
+/// alias. Getting this wrong would work fine right up until the first real task, then fault inside the
+/// page-table code with no obvious link to the address space that had just been installed.
+#[inline]
+fn phys_to_virt(pa: u64) -> u64 {
+    super::mmu::KERNEL_VA_BASE + pa
+}
+
+/// Read/write a table entry, addressed through the kernel's high direct map.
 ///
 /// # Safety
-/// `table` must be a live, 4 KiB-aligned page-table frame and `i < 512`.
+/// `table` must be a live, 4 KiB-aligned page-table frame (physical) and `i < 512`.
 unsafe fn get(table: u64, i: usize) -> u64 {
-    // SAFETY: caller's contract; identity-mapped RAM.
-    unsafe { ((table + (i as u64) * 8) as *const u64).read_volatile() }
+    // SAFETY: caller's contract; the high half maps all physical RAM.
+    unsafe { ((phys_to_virt(table) + (i as u64) * 8) as *const u64).read_volatile() }
 }
 
 /// # Safety
 /// As [`get`].
 unsafe fn set(table: u64, i: usize, v: u64) {
-    // SAFETY: caller's contract; identity-mapped RAM.
-    unsafe { ((table + (i as u64) * 8) as *mut u64).write_volatile(v) }
+    // SAFETY: caller's contract; the high half maps all physical RAM.
+    unsafe { ((phys_to_virt(table) + (i as u64) * 8) as *mut u64).write_volatile(v) }
 }
 
 /// Allocate a zeroed table frame.
@@ -89,7 +100,7 @@ fn alloc_table() -> Option<u64> {
     // SAFETY: a freshly allocated frame is ours alone, and identity-mapped RAM is writable. Zeroing
     // matters: a table with garbage in it has VALID bits set at random, and the walker will follow
     // them into whatever the bits happen to name.
-    unsafe { core::ptr::write_bytes(pa as *mut u8, 0, 4096) };
+    unsafe { core::ptr::write_bytes(phys_to_virt(pa) as *mut u8, 0, 4096) };
     Some(pa)
 }
 
@@ -131,7 +142,13 @@ impl PageTable {
                 }
             };
             // SAFETY: both are live 4 KiB table frames in identity-mapped RAM, and `dst_l2` is ours.
-            unsafe { core::ptr::copy_nonoverlapping(src_l2 as *const u8, dst_l2 as *mut u8, 4096) };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys_to_virt(src_l2) as *const u8,
+                    phys_to_virt(dst_l2) as *mut u8,
+                    4096,
+                )
+            };
             // SAFETY: `root` is ours and `i < 512`.
             unsafe { set(root, i, dst_l2 | DESC_TABLE) };
         }

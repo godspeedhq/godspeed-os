@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-9 done on real hardware, 10 in QEMU (2026-08-03)
+> ## STATUS: milestones 1-10 done on real hardware, 11 (TTBR1 split) in QEMU (2026-08-03)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -44,7 +44,8 @@
 > | 7. Memory map | `source = device tree (authoritative)`; two banks, 1968 MiB usable, the 76 MiB GPU split correctly excluded |
 > | 8. Neutral frame allocator | The first arch-neutral code on this board: `crate::memory::init` unmodified, 1968 MiB free, 64 frames distinct, aligned, read-back verified, all returned |
 > | 9. Neutral scheduler + preemption | Three never-yielding kernel tasks round-robined by `scheduler::run` under the 100 Hz tick; on the board, counters 194/194/195 and lines torn mid-word by the tick |
-> | 10. Per-task page tables | A private address space built, `TTBR0_EL1` swapped, a page read back through the new mapping, kernel still reachable, every frame reclaimed (QEMU first, board pending) |
+> | 10. Per-task page tables | A private address space built, `TTBR0_EL1` swapped, a page read back through the new mapping, kernel still reachable, every frame reclaimed |
+> | 11. TTBR1 split | Kernel linked high / loaded low, relocates PC **and** SP into `TTBR1`, then RETIRES the low map - `TTBR0_EL1` empty and free for a task (QEMU first, board pending) |
 >
 > The timer evidence is a rate check, not just a delivery check: the log timestamps put 10 ticks 111 ms
 > apart, which is 100 Hz. A wrong reload would still have delivered ten interrupts.
@@ -223,7 +224,54 @@
 > Speculative block-splitting code that would have papered over the collision was written and then
 > **deleted** rather than kept (§26.2): it only exists to serve a layout this port is going to abandon.
 >
-> **Not done:** the TTBR1 split, EL0 tasks under the scheduler, PSCI SMP, and `kernel_main` itself.
+> **Milestone 11 - the TTBR1 split, which removes the limit milestone 10 hit.** The kernel is now
+> LINKED high and LOADED low (VMA `KERNEL_VA + 0x80000`, LMA `0x80000`): the firmware still drops a flat
+> binary at `0x80000`, but every symbol is a high address. Early in boot the kernel relocates itself into
+> `TTBR1` and then **retires the low identity map**, leaving `TTBR0_EL1` empty. A task page below 4 GiB
+> can no longer shadow the kernel, because the kernel is not there.
+>
+> ```
+> aarch64: TTBR1 high half LIVE - phys 0x418530 reads/writes as 0xffffff8000418530
+> aarch64: kernel RUNNING FROM THE HIGH HALF (TTBR1), PC above 0xffffff8000000000
+> aarch64: stack relocated too, SP = 0xffffff80004980a0
+> aarch64: low identity map RETIRED - TTBR0_EL1 is free for a task
+> memory: kernel phys [0x80000, 0x499000) hhdm=0xffffff8000000000
+> ```
+>
+> Three things make the transition safe, and all three are in the code rather than in anyone's head:
+>
+> - `_start` reaches symbols only through `adrp`/`add`, which is **purely PC-relative** - the same
+>   instruction gives the right LOW address with the MMU off and the right HIGH one after. (Confirmed
+>   accidentally, when a selftest printed a low address for a static before the jump.)
+> - Between enabling the MMU and jumping, **both halves translate at once**. There is no instant where
+>   the core executes from an address that does not resolve.
+> - **Peripherals move first.** A device register is still named by its physical address, and the UART
+>   must survive the step or the next failure reports nothing at all.
+>
+> `hhdm_offset` is now `KERNEL_VA_BASE` and `PHYS_IS_IDENTITY` is `false` - exactly the arrangement x86
+> has with Limine's HHDM, so the neutral allocator's existing handling applies unchanged.
+>
+> **Two mistakes here are worth keeping.** The relocation asm used a hardcoded `x9` as scratch while
+> letting the compiler allocate `{base}` - and it chose `x9` too, so `mov x9, sp` destroyed the base and
+> `orr x9, x9, x9` left SP exactly as it was. The kernel then ran on perfectly from its still-mapped low
+> stack, printed several more lines, and only died when the low map was retired - whereupon the
+> exception handler faulted on its own push and recursed, walking `FAR` down by one 272-byte frame each
+> time. Nothing pointed at the asm. **Printing SP settled it in one run**, which is why the boot now
+> reports SP permanently: a PC that fails to relocate stops the machine instantly, but an SP that fails
+> to relocate works fine until something unrelated takes the ground away.
+>
+> Separately, the high-half selftest first compared an address against *itself* - it took the symbol's
+> address as the "high" side, but pre-jump codegen yields a low one - and passed while testing nothing.
+> It now constructs the alias explicitly.
+>
+> **The EL0 demo is retired by this, on purpose.** It put its code in a linker-placed `.el0` region
+> reached through the kernel's identity map, which only worked while kernel and user shared one address
+> space. EL0 cannot reach the high half at all, so it now takes an instruction abort from the lower EL
+> (`ESR 0x8200000e`) - reported cleanly by the vectors. That is the split working. Its replacement is a
+> real EL0 task with its code and stack mapped into its **own** TTBR0 space at a low VA it genuinely
+> owns; every piece needed for that already exists.
+>
+> **Not done:** EL0 tasks in their own address space, PSCI SMP, and `kernel_main` itself.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
 > init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already

@@ -62,8 +62,10 @@ extern "C" {
 const KERNEL_PHYS_START: u64 = 0x8_0000;
 
 fn kernel_phys_end() -> u64 {
-    // SAFETY: linker-provided symbol; taking its address does not dereference it.
-    unsafe { core::ptr::addr_of!(__kernel_end) as u64 }
+    // SAFETY: linker-provided symbol; taking its address does not dereference it. The kernel is linked
+    // high, so this is a TTBR1 address and must be converted - a memory map built from the raw symbol
+    // would carve a hole in the wrong place entirely and hand the allocator the kernel's own RAM.
+    unsafe { super::mmu::virt_to_phys(core::ptr::addr_of!(__kernel_end) as u64) }
 }
 
 /// A bank of RAM as the firmware describes it.
@@ -351,12 +353,26 @@ pub fn build(dtb: u64, board: &BoardInfo) -> (&'static [MemoryRegion], Source) {
     (map, source)
 }
 
+/// The map built by [`build`], re-reachable after the boot abandons its low stack.
+///
+/// The jump into the high half discards every local, so the continuation cannot be handed the slice as
+/// an argument. `REGIONS` is a static and the kernel is linked high, so its address is a high one that
+/// translates on both sides of the jump - which is why re-deriving is sound rather than a workaround.
+pub fn current_map() -> &'static [MemoryRegion] {
+    // SAFETY: `build` has run and wrote `REGION_COUNT` entries; nothing rebuilds the map afterwards, so
+    // the slice is immutable for the rest of the boot.
+    unsafe {
+        core::slice::from_raw_parts((&raw const REGIONS) as *const MemoryRegion, REGION_COUNT)
+    }
+}
+
 /// Assemble the arch `BootInfo` the neutral kernel consumes.
 ///
-/// `hhdm_offset = 0` is the **correct** value here, not a missing one: the low 4 GiB is identity
-/// mapped, so a physical address is already addressable and there is nothing to offset through. The
-/// allocator distinguishes the two cases via `page_tables::PHYS_IS_IDENTITY` rather than treating a
-/// zero offset as an error, which is why that constant had to become `true` for this port.
+/// `hhdm_offset` is the kernel's high-half base. Once the kernel moved to `TTBR1`, physical memory is
+/// reachable only through that direct map - a physical address is not a pointer any more, because
+/// `TTBR0` belongs to whatever task is running. This is exactly the role Limine's HHDM plays on x86,
+/// so the neutral allocator's existing handling applies unchanged and `PHYS_IS_IDENTITY` is `false`
+/// again, as it is there.
 ///
 /// `rsdp_addr = 0` because there is no ACPI on this board. The IOMMU path that consumes it is x86-only
 /// (AMD-Vi via IVRS), and the Pi 4 has no usable SMMU regardless - see `docs/aarch64.md` on why the
@@ -366,7 +382,7 @@ pub fn boot_info(map: &'static [MemoryRegion]) -> super::BootInfo {
         memory_map: map,
         kernel_phys_start: KERNEL_PHYS_START,
         kernel_phys_end: (kernel_phys_end() + 0xFFF) & !0xFFF,
-        hhdm_offset: 0,
+        hhdm_offset: super::mmu::KERNEL_VA_BASE,
         rsdp_addr: 0,
     }
 }
