@@ -575,6 +575,44 @@ pub fn program_msi(bdf: u32, vector: u8, dest_apic: u8) -> bool {
 /// the table's page uncached at its HHDM alias (the same pattern the IOMMU MMIO uses) and
 /// writes entry 0. The device must also be a bus master (Command bit 2) to issue the
 /// upstream MSI memory write. The caller installs the IDT handler for `vector` first.
+/// **Why MSI is tried before MSI-X, when the usual advice says the opposite.**
+///
+/// The stock guidance is that an OS should prefer MSI-X: it offers many vectors and per-vector
+/// masking, where MSI gives you (at best) a small power-of-two block sharing one mask. That guidance
+/// is written for kernels that want **a vector per queue per core** - one interrupt per NIC receive
+/// ring, per NVMe submission queue, per xHCI interrupter - so the work spreads across cores without
+/// the vectors contending.
+///
+/// **We want none of that, and taking it would cost us something real.** Every caller here asks for a
+/// single fixed vector per controller (`XHCI_MSI_VECTOR`, `EHCI_MSI_VECTOR`), delivered to the one core
+/// its driver is pinned to (§9.2 - services never migrate). `program_msix` accordingly programs table
+/// entry 0 and nothing else, and never even reads the Table Size field. So at one vector the two
+/// mechanisms are *functionally identical*, and the cost is not:
+///
+/// - **MSI** is config-space writes. Nothing else.
+/// - **MSI-X** means locating the BAR, computing the table's physical address, **mapping an MMIO page
+///   into the active page tables**, and writing the table entry through it.
+///
+/// That extra machinery is exactly the code kernel-audit A9-1 and A9-2 were about: the page-table walk
+/// that could write into a large page's data frame, and the mapping verdicts that were discarded under
+/// SAFETY comments asserting what the code had not established. Preferring MSI means the common case
+/// never touches any of it. That is Commandment X (complexity in the layer that needs it) and §26.2
+/// (features are pulled into existence by a requirement, not adopted because other systems have them).
+///
+/// So the fallback is not a compromise - it is the point. Use the mechanism that needs no page tables;
+/// reach for the one that does only when the device leaves no choice (`qemu-xhci` exposes MSI-X and no
+/// MSI, which is what keeps that path exercised at all).
+///
+/// **When this should change.** The day something here genuinely wants multiple interrupters - per-core
+/// xHCI event rings, say - MSI-X earns its place and this order should flip. That is a real change
+/// (multiple vectors, per-vector routing and masking, a driver that can use them), not an ordering
+/// swap. Flipping the order alone buys nothing and re-introduces the mapping path for no benefit.
+///
+/// *Recorded because it reads as an oversight and is not.* During kernel-audit Audit 9 this was
+/// mistaken for a backwards default on exactly the "most OSes prefer MSI-X" reasoning above, before
+/// checking whether the premise held here. It does not.
+pub mod msi_ordering {}
+
 pub fn program_msix(bdf: u32, vector: u8, dest_apic: u8) -> bool {
     let bus = ((bdf >> 8) & 0xff) as u8;
     let dev = ((bdf >> 3) & 0x1f) as u8;
@@ -688,7 +726,9 @@ pub fn program_xhci_msi() -> bool {
     let bdf = XHCI_BDF.load(Ordering::Relaxed);
     let vector = crate::arch::x86_64::interrupts::XHCI_MSI_VECTOR;
     let dest = usb_irq_dest_lapic(crate::task::XHCI_CORE);
-    // Prefer plain MSI; fall back to MSI-X (what qemu-xhci and most real xHCIs expose).
+    // Prefer plain MSI; fall back to MSI-X only when the device offers no MSI (what `qemu-xhci` does).
+    // See `msi_ordering` below for WHY this order - it looks backwards against the usual advice and is
+    // not.
     program_msi(bdf, vector, dest) || program_msix(bdf, vector, dest)
 }
 
@@ -719,6 +759,7 @@ pub fn program_ehci_msi() -> bool {
     let bdf = EHCI_BDF.load(Ordering::Relaxed);
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
     let dest = usb_irq_dest_lapic(crate::task::EHCI_CORE);
+    // MSI first, MSI-X only as a fallback - see `msi_ordering`.
     let ok = program_msi(bdf, vector, dest) || program_msix(bdf, vector, dest);
     if !ok {
         crate::kprintln!(
