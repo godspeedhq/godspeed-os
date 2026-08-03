@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-11 done on real hardware; 12-15 in QEMU (2026-08-03)
+> ## STATUS: milestones 1-11 done on real hardware; 12-16 in QEMU (2026-08-03)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -369,8 +369,31 @@
 > recovered faults** so "the unmapped pointer survived" is backed by evidence the fixup fired rather than
 > by something upstream having quietly rejected the pointer.
 >
-> **Not done:** real syscall dispatch into the neutral handler, `TaskContext::new_user`, `arch::init` +
-> the `kernel_main` handoff, UART RX, PSCI SMP.
+> **Milestone 16 - real syscall dispatch.** `svc` now reaches the **neutral** `syscall_handler`, the same
+> function x86 and arm32 call, with the same numbering. Bring-up numbers sit above every real one so the
+> ranges cannot collide, and disappear with the demo.
+>
+> From real userspace, through the real ABI, the EL0 task proves two things:
+>
+> ```
+> [EL0] real syscall Log(no cap) -> 2 (negative = REFUSED, no ambient authority),
+>       unknown syscall -> 1 (defined error, not a crash)
+> ```
+>
+> - **`Log` with no capability is refused** (`-2`, `CapNotHeld`). §3.1 enforced end to end on AArch64:
+>   authority comes from holding a capability, never from being the caller. The kernel does not log; it
+>   says no.
+> - **An unknown syscall number returns a defined error** (`-1`), not a fault (§22 Fuzz F2).
+>
+> The neutral subsystems moved into the main boot rather than only the scheduler demo, because a real
+> syscall reaches `current_task_lookup_cap` and therefore per-core state - reaching that before it
+> exists is exactly how milestone 15 went silent.
+>
+> The unknown-number test needed fixing *after it appeared to pass*: `0xBEEF` is above the bring-up base,
+> so the call went to the demo handler and proved nothing about the neutral path. `WARN unknown svc
+> #48879` in the log is what gave it away.
+>
+> **Not done:** `TaskContext::new_user`, `arch::init` + the `kernel_main` handoff, UART RX, PSCI SMP.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
 > init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already

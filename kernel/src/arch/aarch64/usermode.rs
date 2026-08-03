@@ -38,10 +38,15 @@ const USER_CODE_VA: u64 = 0x1_0000;
 const USER_STACK_VA: u64 = 0x2_0000;
 const PAGE: u64 = 4096;
 
-/// Demo syscall numbers, deliberately not the real ABI.
-const SYS_ECHO: u64 = 0;
-const SYS_EXIT: u64 = 1;
-const SYS_VERDICT: u64 = 2;
+/// Bring-up syscall numbers, placed ABOVE every real one so the two ranges cannot collide while both
+/// exist. The dispatcher routes anything below this to the neutral `syscall_handler`; anything at or
+/// above it to this module. The whole range disappears with the demo.
+pub const BRINGUP_SYSCALL_BASE: u64 = 0x1000;
+const SYS_ECHO: u64 = BRINGUP_SYSCALL_BASE;
+const SYS_EXIT: u64 = BRINGUP_SYSCALL_BASE + 1;
+const SYS_VERDICT: u64 = BRINGUP_SYSCALL_BASE + 2;
+/// Result the neutral dispatcher gave for the real syscalls the task issued - reported by `run`.
+const SYS_REPORT_REAL: u64 = BRINGUP_SYSCALL_BASE + 3;
 
 /// A magic the task sends and the value the kernel returns, so the round trip is checked in both
 /// directions rather than assumed - a syscall returning nothing observable proves only that it did not
@@ -61,7 +66,35 @@ core::arch::global_asm!(
 // emits, not a demo convention. This blob is the only EL0 code that exists yet, so it is also the only
 // thing that can prove the ABI, and it would be worth very little if it proved a different one.
 el0_blob_start:
-    mov  x8, #0                      // SYS_ECHO
+    // --- a REAL syscall, through the NEUTRAL dispatcher ---------------------------------------
+    // Log (5) with no capability. The kernel must REFUSE it: this task holds no caps, and §3.1 says
+    // authority comes from holding one, never from being the caller. A negative result here is the
+    // no-ambient-authority rule enforced end to end on AArch64 - kernel refusal, not a log line.
+    mov  x8, #5                      // SyscallNumber::Log
+    mov  x0, #0                      // cap slot 0 - which this task does not hold
+    mov  x1, #0x10000                // a mapped user pointer (its own code page)
+    mov  x2, #8                      // length
+    svc  #0
+    mov  x19, x0                     // keep the result
+
+    // --- an UNKNOWN syscall number ------------------------------------------------------------
+    // Must come back as a defined error rather than a crash (§22 Fuzz F2). A task can name any
+    // number; the kernel owes it an answer, not a fault.
+    //
+    // 0x0FFF is chosen to be BELOW the bring-up base, so it reaches the NEUTRAL dispatcher. The first
+    // version used 0xBEEF, which is above it - the call went to the demo handler instead, and the test
+    // passed while proving nothing about the path it was meant to exercise.
+    mov  x8, #0x0FFF
+    svc  #0
+    mov  x20, x0
+
+    // Hand both results to the kernel to check and report.
+    mov  x8, #0x1003                 // SYS_REPORT_REAL
+    mov  x0, x19
+    mov  x1, x20
+    svc  #0
+
+    movz x8, #0x1000                 // SYS_ECHO
     movz x0, #0x4242                 // x0 = ECHO_ARG
     movk x0, #0x4242, lsl #16
     svc  #0                          // -> kernel; returns ECHO_REPLY in x0
@@ -70,10 +103,10 @@ el0_blob_start:
     movk x1, #0x1234, lsl #16
     cmp  x0, x1
     cset x0, eq                      // x0 = 1 if the reply came back intact, else 0
-    mov  x8, #2                      // SYS_VERDICT
+    movz x8, #0x1002                 // SYS_VERDICT
     svc  #0                          // report the verdict THROUGH the kernel
 
-    mov  x8, #1                      // SYS_EXIT
+    movz x8, #0x1001                 // SYS_EXIT
     svc  #0                          // ask the kernel to stop this task; does not return
 1:  b    1b                          // unreachable
 el0_blob_end:
@@ -91,6 +124,9 @@ static mut ECHO_OK: bool = false;
 static mut VERDICT_OK: bool = false;
 /// Number of syscalls serviced.
 static mut CALLS: u64 = 0;
+/// Set when the neutral dispatcher refused the uncapped Log AND gave a defined error for an unknown
+/// number - the two properties the real syscall path owes.
+static mut REAL_DISPATCH_OK: bool = false;
 /// Where to resume when the task exits, and a scratch to save the dying context into.
 static mut CTX_KERNEL: TaskContext = TaskContext::empty();
 static mut CTX_DISCARD: TaskContext = TaskContext::empty();
@@ -115,6 +151,18 @@ pub fn syscall(number: u64, frame: &mut TrapFrame) {
             // SAFETY: as above.
             unsafe { ECHO_OK = arg == ECHO_ARG };
             frame.x[0] = ECHO_REPLY;
+        }
+        SYS_REPORT_REAL => {
+            let log_result = frame.x[0] as i64;
+            let unknown_result = frame.x[1] as i64;
+            put_str(b"    [EL0] real syscall Log(no cap) -> ");
+            put_dec(log_result.unsigned_abs());
+            put_str(b" (negative = REFUSED, no ambient authority), unknown syscall -> ");
+            put_dec(unknown_result.unsigned_abs());
+            put_str(b" (defined error, not a crash)
+");
+            // SAFETY: module-owned static, single-threaded bring-up.
+            unsafe { REAL_DISPATCH_OK = log_result < 0 && unknown_result < 0 };
         }
         SYS_VERDICT => {
             let ok = frame.x[0] == 1;
@@ -261,7 +309,7 @@ pub fn run() -> bool {
     drop(task.space);
 
     // SAFETY: module-owned statics, single-threaded.
-    unsafe { ECHO_OK && VERDICT_OK && CALLS >= 3 }
+    unsafe { ECHO_OK && VERDICT_OK && REAL_DISPATCH_OK && CALLS >= 4 }
 }
 
 /// The address space to install on the way into EL0.

@@ -365,7 +365,21 @@ extern "C" fn aarch64_sync_lower_dispatch(vector: u64, frame: *mut TrapFrame) {
     // SAFETY: `frame` is the trap frame the vector assembly built on the current stack.
     let f = unsafe { &mut *frame };
     let nr = f.x[8];
-    super::usermode::syscall(nr, f);
+
+    // Bring-up numbers are handled here; everything else goes to the NEUTRAL dispatcher - the same
+    // `syscall_handler` x86 and arm32 call, with the same numbering. The bring-up range is deliberately
+    // above every real syscall so the two cannot collide, and it disappears with the demo.
+    if nr >= super::usermode::BRINGUP_SYSCALL_BASE {
+        super::usermode::syscall(nr, f);
+        return;
+    }
+
+    // The result goes back in x0, which the restore path reloads from the frame. Arguments come from
+    // x0-x2 per the ABI the SDK emits.
+    // SAFETY: this is the ring-3 -> ring-0 transition the handler is written for. It treats every
+    // argument as untrusted and validates any pointer through the user-copy seam before use.
+    let ret = unsafe { crate::syscall::dispatch::syscall_handler(nr, f.x[0], f.x[1], f.x[2]) };
+    f.x[0] = ret as u64;
 }
 
 /// Report an exception and halt.

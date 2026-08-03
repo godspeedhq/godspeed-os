@@ -687,6 +687,14 @@ extern "C" fn boot_high() -> ! {
         crate::memory::init(&bi);
         allocator_selftest();
 
+        // The neutral subsystems, in the order the x86 boot brings them up. Done HERE rather than only
+        // in the scheduler demo, because a real syscall reaches `current_task_lookup_cap`, which indexes
+        // per-core state - and reaching that before it exists is how the user-copy seam went silent
+        // earlier today.
+        crate::smp::percpu_init(&bi);
+        crate::task::scheduler::init_arenas(crate::smp::percpu::num_cores());
+        crate::capability::init();
+
 
 
         page_table_selftest();

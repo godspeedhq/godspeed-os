@@ -61,12 +61,9 @@ fn run_task(id: u8) -> ! {
 /// Commit three spinning kernel tasks and enter `scheduler::run(0)`. Does not return - `run` IS the
 /// idle loop from here on.
 pub fn run(boot_info: &crate::arch::imp::BootInfo) -> ! {
-    // Neutral bootstrap, in the order the x86 boot uses: per-core arenas, scheduler slots, capability
-    // table. All three are arch-neutral code; if any of them needed an arch tweak, the demarcation
-    // claim would be weaker than advertised.
-    crate::smp::percpu_init(boot_info);
-    crate::task::scheduler::init_arenas(crate::smp::percpu::num_cores());
-    crate::capability::init();
+    // The neutral bootstrap (per-core arenas, scheduler slots, capability table) now happens in the
+    // main boot, because a real syscall needs it long before this demo runs.
+    let _ = boot_info;
 
     let entries: [unsafe extern "C" fn() -> !; NUM] = [task_a, task_b, task_c];
     let names: [&'static str; NUM] = ["task-a", "task-b", "task-c"];

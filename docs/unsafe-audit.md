@@ -13,6 +13,32 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4 milestone 16: real syscall dispatch (feat/pi4-aarch64)
+
+`svc` now reaches the **neutral** `syscall::dispatch::syscall_handler` - the same function x86 and
+arm32 call, with the same numbering. Bring-up numbers live above every real one (`>= 0x1000`) so the
+two ranges cannot collide while both exist, and the whole bring-up range disappears with the demo.
+
+The neutral subsystems (per-core arenas, scheduler slots, capability table) moved into the main boot
+rather than only the scheduler demo, because a real syscall reaches `current_task_lookup_cap`, which
+indexes per-core state - and reaching that before it exists is exactly how the user-copy seam went
+silent in milestone 15.
+
+What the EL0 task now proves, from real userspace through the real ABI:
+
+- **`Log` with no capability is REFUSED** (`-2`, `CapNotHeld`). §3.1 enforced end to end on AArch64:
+  authority comes from holding a capability, never from being the caller.
+- **An unknown syscall number returns a defined error** (`-1`), not a fault (§22 Fuzz F2).
+
+The unknown-number test needed fixing after it appeared to pass: `0xBEEF` is *above* the bring-up base,
+so the call went to the demo handler and proved nothing about the neutral path. `0x0FFF` reaches the
+dispatcher. The log's `WARN unknown svc #48879` is what gave it away.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/exceptions.rs` | 9 -> 10 (+1) | Calling the neutral `syscall_handler` - the ring-3 to ring-0 transition it is written for; it treats every argument as untrusted and validates pointers through the user-copy seam. |
+| `arch/aarch64/usermode.rs` | 13 -> 14 (+1) | Recording the dispatcher's verdicts in a module-owned static so `run` can check both. |
+
 ## 2026-08-03 - Pi 4 milestone 15: the user-pointer copy seam (feat/pi4-aarch64)
 
 Where the kernel touches memory a task chose the address of. Three defences, because each catches what
@@ -1465,7 +1491,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
 | arch/aarch64/mod.rs | 50 | permitted |
-| arch/aarch64/exceptions.rs | 9 | permitted |
+| arch/aarch64/exceptions.rs | 10 | permitted |
 | arch/aarch64/uaccess.rs | 5 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
@@ -1474,7 +1500,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 11 | permitted |
 | arch/aarch64/ptables.rs | 19 | permitted |
-| arch/aarch64/usermode.rs | 13 | permitted |
+| arch/aarch64/usermode.rs | 14 | permitted |
 | arch/aarch64/mailbox.rs | 3 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
