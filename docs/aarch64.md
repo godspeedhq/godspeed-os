@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-7 done on real hardware, 8 in QEMU (2026-08-03)
+> ## STATUS: milestones 1-8 done on real hardware (2026-08-03)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -42,7 +42,7 @@
 > | 5. Context switch | Two kernel tasks ping-ponging; witnesses in callee-saved integer AND `d8`-`d15` verified on resume |
 > | 6. EL0 + `svc` | Dropped to EL0, syscall round trip checked in both directions, clean exit; ticks 13 -> 15 across the excursion, so IRQs stayed live at EL0 |
 > | 7. Memory map | `source = device tree (authoritative)`; two banks, 1968 MiB usable, the 76 MiB GPU split correctly excluded |
-> | 8. Neutral frame allocator | The first arch-neutral code on this board: `crate::memory::init` unmodified, then 64 frames distinct, aligned, read-back verified, all returned (QEMU first, board pending) |
+> | 8. Neutral frame allocator | The first arch-neutral code on this board: `crate::memory::init` unmodified, 1968 MiB free, 64 frames distinct, aligned, read-back verified, all returned |
 >
 > The timer evidence is a rate check, not just a delivery check: the log timestamps put 10 ticks 111 ms
 > apart, which is 100 Hz. A wrong reload would still have delivered ten interrupts.
@@ -121,12 +121,25 @@
 > compiled without modification. It is the demarcation claim tested on a second ISA in the place it is
 > easiest to get wrong.
 >
+> On the board:
+>
 > ```
 > memory: kernel phys [0x80000, 0x400000) hhdm=0x0
-> allocator: frame bitmap 30 KiB x2 covers 245760 frames, carved at phys 0x3bff1000
-> memory: frame allocator ready (956 MiB free)
-> aarch64: frame allocator OK - 64 frames distinct, aligned, read-back verified, all returned
+> allocator: frame bitmap 64 KiB x2 covers 524288 frames (2048 MiB), carved at phys 0x7ffe0000
+> memory: frame allocator ready (1968 MiB free)
+> aarch64: frame allocator OK - 64 frames distinct, aligned, read-back verified, all returned (503904 free)
 > ```
+>
+> The numbers close: 503904 frames x 4 KiB is exactly the 1968 MiB the map reported, and the free count
+> returned to its starting value after every frame was released.
+>
+> **The board exercised something QEMU structurally could not.** The bitmap is carved from the top of
+> the largest usable region, and on hardware that is the *second* bank - `0x7ffe0000`, inside
+> `0x40000000..0x80000000`. QEMU's `raspi4b` has a single 960 MiB bank, so under emulation the carve
+> always landed in low RAM. The high bank is therefore not merely described by the map, it is written
+> and read back 128 KiB at a time by the allocator's own bookkeeping before a single frame is handed
+> out. A memory map that had over-claimed the second bank would have failed here rather than at some
+> later allocation.
 >
 > `hhdm_offset = 0` is the **correct** value, not a missing one: the low 4 GiB is identity mapped, so a
 > physical address is already addressable. The allocator distinguishes "identity" from "caller forgot"
