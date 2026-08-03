@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-11 done on real hardware; 12-14 in QEMU (2026-08-03)
+> ## STATUS: milestones 1-11 done on real hardware; 12-15 in QEMU (2026-08-03)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -341,10 +341,36 @@
 > of memory. The selftest maps extra pages, reclaims the space, and checks both the count and the
 > allocator's free total - `4 pages reclaimed, all frames returned`.
 >
-> **Not done:** the user-pointer copy seam (`validate_user_ptr` / `read_user_bytes` / `write_user_bytes`
-> still return `false`/`None`), real syscall dispatch into the neutral handler, wiring `ptables` in as
-> `page_tables::PageTable` (`loader.rs` still calls the `unimplemented!()` stub), `TaskContext::new_user`,
-> `arch::init` + the `kernel_main` handoff, UART RX, PSCI SMP.
+> **Milestone 15 - the user-pointer copy seam.** Where the kernel touches memory a task chose the
+> address of. Three defences, because each catches what the others cannot:
+>
+> 1. **A range check** - pointer and length inside the user half, addition checked for overflow.
+> 2. **`ldtrb` / `sttrb`, not `ldrb` / `strb`** - the *unprivileged* load and store. Executed at EL1 they
+>    apply **EL0 permissions**, so the hardware refuses a kernel address even if the range check were
+>    wrong. Defence in depth at no cost: same instruction count, same speed, and a bug in check (1) stops
+>    being exploitable.
+> 3. **A fault fixup** - a range-valid pointer can still be unmapped, and the abort lands at EL1 looking
+>    exactly like a kernel bug. Unguarded that halts the machine, which is a denial of service any
+>    service could trigger by passing a bad pointer. Vector 4 became recoverable, and the fixup covers
+>    *only* the faulting instruction - so a kernel bug faulting anywhere else still halts loudly.
+>
+> Reads are **copied** into a per-core buffer rather than borrowed: handing the kernel a pointer into
+> user memory leaves every later read racing the task, which can change the bytes between validation and
+> use.
+>
+> **The bug this cost is worth keeping.** The per-core state was first indexed via `current_core_id()`,
+> which needs tables that are not up when the first copy runs - and, far worse, the **fault handler**
+> calls into this module. Indexing an unallocated arena from a fault handler faults again, and the
+> second fault happens while reporting the first, so the machine went **completely silent** with nothing
+> printed at all. A fault handler must not depend on initialisation order; it now indexes a fixed array
+> by `MPIDR_EL1.Aff0`, which needs no setup and cannot fail.
+>
+> The selftest drives all four outcomes, including the two that only fire on bad input, and **counts
+> recovered faults** so "the unmapped pointer survived" is backed by evidence the fixup fired rather than
+> by something upstream having quietly rejected the pointer.
+>
+> **Not done:** real syscall dispatch into the neutral handler, `TaskContext::new_user`, `arch::init` +
+> the `kernel_main` handoff, UART RX, PSCI SMP.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
 > init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already

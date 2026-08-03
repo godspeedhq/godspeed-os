@@ -209,6 +209,36 @@ pub fn run() -> bool {
     put_hex(USER_STACK_VA);
     put_str(b" (NO kernel entries - the kernel is in TTBR1)\r\n");
 
+    // With a task address space in hand, the user-copy seam can be exercised against a REAL user page -
+    // the only way to test it, since every check it makes concerns an address the kernel does not own.
+    // Done before entering EL0, while the space is installed but nothing is running in it.
+    //
+    // SAFETY: installs the task's TTBR0 so the user VAs below translate. The kernel is in TTBR1 and is
+    // untouched by the switch; TTBR0 is retired again immediately afterwards.
+    unsafe {
+        core::arch::asm!(
+            "msr ttbr0_el1, {t}", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
+            t = in(reg) task.ttbr, options(nostack),
+        );
+    }
+    let (rw, kernel_refused, unmapped_survived, fixup_fired) = super::uaccess::selftest(USER_STACK_VA);
+    // SAFETY: retire the task's map again; the kernel never depended on it.
+    unsafe { super::mmu::drop_low_map() };
+
+    if rw && kernel_refused && unmapped_survived && fixup_fired {
+        put_str(b"aarch64: user-copy seam OK - user page read/written, kernel address refused, unmapped pointer recovered by the fault fixup (which fired)\r\n");
+    } else {
+        put_str(b"aarch64: WARN user-copy seam FAILED - rw=");
+        put_dec(rw as u64);
+        put_str(b" kernel_refused=");
+        put_dec(kernel_refused as u64);
+        put_str(b" unmapped_survived=");
+        put_dec(unmapped_survived as u64);
+        put_str(b" fixup_fired=");
+        put_dec(fixup_fired as u64);
+        put_str(b"\r\n");
+    }
+
     // SAFETY: single-threaded bring-up; the statics are this module's.
     unsafe {
         ENTER_TTBR = task.ttbr;

@@ -32,6 +32,8 @@ pub mod sched_demo;
 #[cfg(feature = "pi4")]
 pub mod timer;
 #[cfg(feature = "pi4")]
+pub mod uaccess;
+#[cfg(feature = "pi4")]
 pub mod usermode;
 
 /// Reload value for the periodic tick, in generic-timer counter ticks. The timer is one-shot, so the
@@ -684,6 +686,9 @@ extern "C" fn boot_high() -> ! {
         let bi = memmap::boot_info(memmap::current_map());
         crate::memory::init(&bi);
         allocator_selftest();
+
+
+
         page_table_selftest();
         bi
     };
@@ -1125,8 +1130,20 @@ pub mod syscall_entry {
     pub fn syscall_slot(core_id: usize) -> *mut PerCoreSyscallData { core::ptr::null_mut() }
     pub fn init_percore_syscall_arena(n: usize) {}
     pub fn init_percore_arenas(n: usize) {}
+    /// The user-pointer seam. Real bodies live in `uaccess`, which is where the reasoning about what
+    /// the kernel may and may not trust belongs.
+    #[cfg(feature = "pi4")]
+    pub fn validate_user_ptr(ptr: u64, len: usize) -> bool { super::uaccess::validate_user_ptr(ptr, len) }
+    #[cfg(feature = "pi4")]
+    pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> { super::uaccess::read_user_bytes(ptr, len) }
+    #[cfg(feature = "pi4")]
+    pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool { super::uaccess::write_user_bytes(dst, src) }
+
+    #[cfg(not(feature = "pi4"))]
     pub fn validate_user_ptr(ptr: u64, len: usize) -> bool { false }
+    #[cfg(not(feature = "pi4"))]
     pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> { None }
+    #[cfg(not(feature = "pi4"))]
     pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool { false }
     /// The free-running physical counter. Monotonic, never reset, shared by all cores - which is what
     /// the neutral liveness watchdog needs to compare a timestamp taken on one core against a deadline

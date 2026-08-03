@@ -13,6 +13,44 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4 milestone 15: the user-pointer copy seam (feat/pi4-aarch64)
+
+Where the kernel touches memory a task chose the address of. Three defences, because each catches what
+the others cannot:
+
+1. **A range check** - pointer and length inside the user half, addition checked for overflow.
+2. **`ldtrb` / `sttrb`, not `ldrb` / `strb`** - the UNPRIVILEGED load and store. Executed at EL1 they
+   apply **EL0 permissions**, so the hardware refuses a kernel address even if the range check were
+   wrong. Defence in depth at no cost: same instruction count, same speed, and a bug in check (1) stops
+   being exploitable.
+3. **A fault fixup** - a range-valid pointer can still be unmapped, and the abort lands at EL1 looking
+   exactly like a kernel bug. Unguarded, that halts the machine: a denial of service any service could
+   trigger by passing a bad pointer. Vector 4 (same-EL synchronous) became recoverable, and the copy
+   helpers register a recovery address around *only* the faulting instruction - so a kernel bug faulting
+   anywhere else still halts loudly, which is what makes this safe rather than a blanket "ignore kernel
+   faults".
+
+Reads are **copied** into a per-core staging buffer rather than borrowed: handing the kernel a pointer
+into user memory leaves every later read racing the task, which can change the bytes between validation
+and use.
+
+**The bug this cost is the one worth keeping.** The per-core state was first indexed via
+`current_core_id()`, which needs tables that are not up when the first copy runs - and, far worse, the
+FAULT HANDLER calls into this module. Indexing an unallocated arena from a fault handler faults again,
+and the second fault happens while reporting the first, so the machine went completely silent with
+nothing printed. A fault handler must not depend on initialisation order. It now indexes a fixed array
+by `MPIDR_EL1.Aff0`, which needs no setup and cannot fail.
+
+The selftest drives all four outcomes including the two that only fire on bad input, and counts
+recovered faults so "the unmapped pointer survived" is backed by evidence the fixup FIRED rather than by
+something upstream having quietly rejected the pointer.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/uaccess.rs` | new, 5 | `core_index` (an `MPIDR_EL1` read), the two `asm!` copy loops (unprivileged accesses plus fixup arm/disarm), the staging-buffer pointer, and the slice built over the copied bytes. |
+| `arch/aarch64/exceptions.rs` | 7 -> 9 (+2) | `aarch64_sync_current_dispatch`: reading `ESR_EL1` and rewriting the trap frame's `elr` to the recovery address. |
+| `arch/aarch64/usermode.rs` | 11 -> 13 (+2) | Installing the task's `TTBR0` around the seam selftest, so it runs against a REAL user page - the only way to test checks that are all about an address the kernel does not own. |
+
 ## 2026-08-03 - Pi 4 milestone 14: `ptables` becomes the real `page_tables::PageTable` (feat/pi4-aarch64)
 
 `loader.rs` calls `arch::imp::page_tables::PageTable::new()`, which was still the `unimplemented!()`
@@ -1427,7 +1465,8 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
 | arch/aarch64/mod.rs | 50 | permitted |
-| arch/aarch64/exceptions.rs | 7 | permitted |
+| arch/aarch64/exceptions.rs | 9 | permitted |
+| arch/aarch64/uaccess.rs | 5 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
@@ -1435,7 +1474,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 11 | permitted |
 | arch/aarch64/ptables.rs | 19 | permitted |
-| arch/aarch64/usermode.rs | 11 | permitted |
+| arch/aarch64/usermode.rs | 13 | permitted |
 | arch/aarch64/mailbox.rs | 3 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |

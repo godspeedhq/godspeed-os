@@ -65,6 +65,16 @@ global_asm!(
     b    aarch64_sync_lower_common
 .endm
 
+// Synchronous exceptions at the CURRENT EL must be able to return, because one of them is expected: a
+// user-copy touching a range-valid but unmapped page. See `aarch64_sync_current_dispatch`.
+.macro VECTOR_SYNC_CURRENT kind
+    .align 7
+    sub  sp, sp, #272
+    stp  x0, x1, [sp, #0]
+    mov  x0, #\kind
+    b    aarch64_sync_current_common
+.endm
+
 // IRQ vectors must RETURN, not report and halt - a timer tick that halts the machine is not a tick.
 .macro VECTOR_IRQ kind
     .align 7
@@ -82,7 +92,7 @@ aarch64_vectors:
     VECTOR_IRQ   1                 //                      IRQ
     VECTOR_ENTRY 2                 //                      FIQ
     VECTOR_ENTRY 3                 //                      SError
-    VECTOR_ENTRY 4                 // Current EL, SP_ELx:  Synchronous
+    VECTOR_SYNC_CURRENT 4          // Current EL, SP_ELx:  Synchronous (user-copy faults land here)
     VECTOR_IRQ   5                 //                      IRQ
     VECTOR_ENTRY 6                 //                      FIQ
     VECTOR_ENTRY 7                 //                      SError
@@ -128,6 +138,12 @@ aarch64_trap_common:
 
 // IRQ: save, handle, restore, return. The restore order matters - x2/x3 carry ELR/SPSR into their
 // system registers and are only reloaded with their real values afterwards.
+aarch64_sync_current_common:
+    SAVE_REST
+    mov  x1, sp
+    bl   aarch64_sync_current_dispatch // (vector: u64, frame: *mut TrapFrame) - may rewrite frame.elr
+    b    aarch64_exception_return
+
 aarch64_sync_lower_common:
     SAVE_REST
     mov  x1, sp
@@ -288,6 +304,37 @@ pub static NEUTRAL_SCHED: core::sync::atomic::AtomicBool =
 
 /// Exception class for `SVC` taken from AArch64.
 const EC_SVC64: u64 = 0b010101;
+/// Data abort taken from the same EL (a kernel-mode access that faulted).
+const EC_DATA_ABORT_SAME: u64 = 0b100101;
+
+/// Synchronous exception at the CURRENT EL - a kernel-mode fault.
+///
+/// Almost all of these are genuine kernel bugs and must halt loudly. **One is expected**: the kernel
+/// copying to or from a user pointer that passed the range check but is not actually mapped. That is
+/// reachable by any service passing a bad pointer to a syscall, and halting on it would be a
+/// whole-machine denial of service triggered by a single misbehaving task.
+///
+/// So when a user copy is in progress, a data abort here is treated as "that pointer was bad": the
+/// return address is rewritten to the copy helper's recovery label, which reports the failure to the
+/// syscall rather than to the machine. The window is **narrow by construction** - it covers only the
+/// instruction that touches user memory - so a kernel bug faulting anywhere else still halts loudly,
+/// which is the property that makes this safe rather than a blanket "ignore kernel faults".
+#[no_mangle]
+extern "C" fn aarch64_sync_current_dispatch(vector: u64, frame: *mut TrapFrame) {
+    let esr: u64;
+    // SAFETY: reading ESR_EL1 at EL1 is a side-effect-free system-register read.
+    unsafe { core::arch::asm!("mrs {}, esr_el1", out(reg) esr, options(nomem, nostack)) };
+
+    if (esr >> 26) & 0x3F == EC_DATA_ABORT_SAME {
+        if let Some(recovery) = super::uaccess::take_fixup() {
+            // SAFETY: `frame` is the trap frame the vector assembly built on the current stack; the
+            // return path reloads ELR_EL1 from it.
+            unsafe { (*frame).elr = recovery };
+            return;
+        }
+    }
+    aarch64_trap_report(vector, frame);
+}
 
 /// Synchronous exception from a lower EL. Today that means `svc` from EL0.
 ///
