@@ -220,6 +220,17 @@ pub fn enable() -> u64 {
 /// (see `EL0_SHIM_LIMIT`). EL0 access is now decided when the tables are built, so there is no live
 /// mutation and no maintenance to get wrong. Kept as a note rather than dead code so the next person
 /// does not reinvent it.
+/// The kernel's own boot L1, as a physical address.
+///
+/// Per-task address spaces copy their kernel half from **this**, never from the live `TTBR0_EL1`. The
+/// live root belongs to whichever task is running, and on the 32-bit port copying from it gave a child
+/// its spawner's user entries - which the child's reclaim later freed out from under the still-running
+/// spawner. The boot L1 holds only kernel mappings and cannot die, so it is the one safe source.
+pub fn kernel_l1_root() -> u64 {
+    // SAFETY: taking the address of this module's static; no dereference.
+    unsafe { (&raw const L1) as u64 }
+}
+
 /// Whether translation is currently on, read back from `SCTLR_EL1.M` rather than assumed.
 pub fn is_enabled() -> bool {
     let sctlr: u64;

@@ -25,6 +25,8 @@ pub mod mailbox;
 pub mod memmap;
 #[cfg(feature = "pi4")]
 pub mod mmu;
+#[cfg(feature = "pi4")]
+pub mod ptables;
 #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
 pub mod sched_demo;
 #[cfg(feature = "pi4")]
@@ -308,6 +310,7 @@ extern "C" fn aarch64_boot_main(dtb: u64) -> ! {
         let bi = memmap::boot_info(boot_map);
         crate::memory::init(&bi);
         allocator_selftest();
+        page_table_selftest();
         bi
     };
 
@@ -505,6 +508,116 @@ fn allocator_selftest() {
         crate::kprintln!(
             "aarch64: WARN allocator selftest FAILED - got {}/{}, {} misaligned, {} duplicate, {} bad read-back, free {} -> {}",
             got, N, bad_align, dupes, bad_readback, before, after
+        );
+    }
+}
+
+/// Prove a per-task address space works, including the `TTBR0_EL1` swap that had no exercise until now.
+///
+/// The checks, in the order they would fail:
+///
+/// 1. **A private space is built** from the kernel L1, with its own L2 copies.
+/// 2. **A page maps at a VA the task owns outright** - above the low 4 GiB the kernel identity-maps,
+///    so the walk allocates a fresh L2 and L3 rather than colliding with a kernel block. See `ptables`
+///    for why a VA *below* 4 GiB cannot be used yet: it would shadow the kernel's identity mapping.
+/// 3. **The switch actually takes**: install the new TTBR0, and read back a value written through the
+///    new mapping. This is the first time the address-space branch of `switch_context` is exercised.
+/// 4. **The kernel survived the switch** - it is still executing, printing, and its own data reads
+///    back correctly under the task's table.
+/// 5. **Switching back and reclaiming** returns every table frame, checked against the free count.
+#[cfg(feature = "pi4")]
+fn page_table_selftest() {
+    use crate::memory::allocator::{alloc_frame, free_frame, free_frame_count};
+
+    // ABOVE the kernel's identity map (which covers the low 4 GiB), so this address space genuinely
+    // owns the address: no kernel block to collide with, no shadowing. Choosing a VA below 4 GiB is
+    // what surfaced the TTBR1 finding recorded in `ptables` - a task page there would displace the
+    // kernel's identity mapping of the same physical range.
+    const TEST_VA: u64 = 0x1_0000_0000;
+    const MAGIC: u64 = 0xC0FF_EE00_1234_5678;
+
+    let before = free_frame_count();
+
+    // A kernel-owned frame, written before the switch and read back through its IDENTITY address while
+    // the task's table is installed. That is the real question about a copied kernel map: does kernel
+    // memory stay reachable under a task's address space? If the L2 copies were wrong this read comes
+    // back garbage, or the machine dies before printing at all.
+    let canary_frame = match alloc_frame() {
+        Some(f) => f,
+        None => { crate::kprintln!("aarch64: WARN page-table selftest could not allocate"); return; }
+    };
+    let canary_pa = canary_frame.phys_addr().0;
+    // SAFETY: a frame the allocator just handed us, in identity-mapped writable RAM.
+    unsafe { (canary_pa as *mut u64).write_volatile(MAGIC ^ 0xFFFF) };
+
+    let mut pt = match ptables::PageTable::new() {
+        Ok(p) => p,
+        Err(_) => { crate::kprintln!("aarch64: WARN page-table selftest could not build a space"); return; }
+    };
+
+    let data = match alloc_frame() {
+        Some(f) => f,
+        None => { crate::kprintln!("aarch64: WARN page-table selftest could not allocate"); return; }
+    };
+    let data_pa = data.phys_addr().0;
+    // SAFETY: ours, identity-mapped.
+    unsafe { (data_pa as *mut u64).write_volatile(MAGIC) };
+
+    if pt.map(TEST_VA, data_pa, false, true, false).is_err() {
+        crate::kprintln!("aarch64: WARN page-table selftest map failed");
+        return;
+    }
+
+    let new_ttbr = pt.ttbr();
+    let old_ttbr: u64;
+    // SAFETY: reading TTBR0_EL1 is side-effect free.
+    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) old_ttbr, options(nomem, nostack)) };
+
+    // --- the switch itself -------------------------------------------------------------------
+    // SAFETY: `new_ttbr` maps the kernel (copied from the boot L1), so the instruction stream, the
+    // stack and the UART all stay translated across the change. The invalidate is required: writing
+    // TTBR0 flushes nothing on AArch64 (SEC-26).
+    unsafe {
+        core::arch::asm!(
+            "msr ttbr0_el1, {t}", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
+            t = in(reg) new_ttbr, options(nostack),
+        );
+    }
+
+    // Read through the NEW mapping, and re-read the canary through the split block.
+    // SAFETY: TEST_VA is mapped by the table now installed; `canary_pa` is identity-mapped in it too.
+    let through_va = unsafe { (TEST_VA as *const u64).read_volatile() };
+    let canary_back = unsafe { (canary_pa as *const u64).read_volatile() };
+
+    // --- back to the kernel space ------------------------------------------------------------
+    // SAFETY: `old_ttbr` is the boot L1 that was live a moment ago.
+    unsafe {
+        core::arch::asm!(
+            "msr ttbr0_el1, {t}", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
+            t = in(reg) old_ttbr, options(nostack),
+        );
+    }
+
+    let mapped_ok = through_va == MAGIC;
+    let canary_ok = canary_back == (MAGIC ^ 0xFFFF);
+
+    // Reclaim: unmap gives the data frame back, dropping the table frees every table frame.
+    let unmapped = pt.unmap(TEST_VA).is_ok();
+    drop(pt);
+    // SAFETY: both frames came from the allocator and are freed exactly once.
+    unsafe { free_frame(data); free_frame(canary_frame); }
+
+    let after = free_frame_count();
+    if mapped_ok && canary_ok && unmapped && after == before {
+        crate::kprintln!(
+            "aarch64: per-task page table OK - own space built, TTBR0 swapped and read through, \
+             kernel reachable under it, all frames reclaimed ({} free)",
+            after
+        );
+    } else {
+        crate::kprintln!(
+            "aarch64: WARN page-table selftest FAILED - mapped={} canary={} unmapped={} frames {} -> {}",
+            mapped_ok, canary_ok, unmapped, before, after
         );
     }
 }

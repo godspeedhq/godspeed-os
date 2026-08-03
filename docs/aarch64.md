@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-8 done on real hardware, 9 in QEMU (2026-08-03)
+> ## STATUS: milestones 1-9 done on real hardware, 10 in QEMU (2026-08-03)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -43,7 +43,8 @@
 > | 6. EL0 + `svc` | Dropped to EL0, syscall round trip checked in both directions, clean exit; ticks 13 -> 15 across the excursion, so IRQs stayed live at EL0 |
 > | 7. Memory map | `source = device tree (authoritative)`; two banks, 1968 MiB usable, the 76 MiB GPU split correctly excluded |
 > | 8. Neutral frame allocator | The first arch-neutral code on this board: `crate::memory::init` unmodified, 1968 MiB free, 64 frames distinct, aligned, read-back verified, all returned |
-> | 9. Neutral scheduler + preemption | Three never-yielding kernel tasks round-robined by `scheduler::run` under the 100 Hz tick; 45 s run gave 926/936/925 lines, no panics (QEMU first, board pending) |
+> | 9. Neutral scheduler + preemption | Three never-yielding kernel tasks round-robined by `scheduler::run` under the 100 Hz tick; on the board, counters 194/194/195 and lines torn mid-word by the tick |
+> | 10. Per-task page tables | A private address space built, `TTBR0_EL1` swapped, a page read back through the new mapping, kernel still reachable, every frame reclaimed (QEMU first, board pending) |
 >
 > The timer evidence is a rate check, not just a delivery check: the log timestamps put 10 ticks 111 ms
 > apart, which is 100 Hz. A wrong reload would still have delivered ten interrupts.
@@ -195,9 +196,34 @@
 > `.bss` and the boot stack now come last, the image ends at `__el0_end`, and `__kernel_end` still spans
 > everything the kernel owns so the allocator is not handed the stack it is standing on.
 >
-> **Not done:** per-task page tables (and with them the `TTBR0_EL1` swap in `switch_context`, which is
-> written but **not yet exercised** - every task currently shares the kernel identity map), EL0 tasks
-> under the scheduler, PSCI SMP, and `kernel_main` itself.
+> **Milestone 10 - per-task page tables, and the limit they exposed.** An address space is a private L1
+> plus **its own copies** of the four kernel L2 tables. Sharing them (what the 32-bit port does) saves
+> 20 KiB and buys an aliasing hazard: a table split in one space is seen by all of them, and reclaim
+> then has to tell a table the task owns from one it merely points at. Copying means nothing is aliased,
+> so reclaim frees everything the root reaches with no ownership test. The selftest finally exercises
+> the `TTBR0_EL1` swap milestone 9 shipped unexercised - install the new table, read a value back
+> through the new mapping, confirm kernel memory is still reachable under it, switch back, check every
+> frame returned.
+>
+> **The limit: this port cannot give a task a VA below 4 GiB, and that blocks real user tasks.** The
+> kernel is identity-mapped across the whole low 4 GiB, so a task page there lands inside a kernel 2 MiB
+> block and would shadow the kernel's own view of that physical range. `USER_STACK_TOP` (0x8000_0000)
+> sits directly above the frame allocator's bitmap, so this is the *normal* case for a real task, not a
+> corner. `map` refuses it loudly. The 32-bit port escapes the same collision only by accident of scale:
+> its RAM identity map ends at 1 GiB, well below its 2 GiB user range.
+>
+> **The fix is TTBR1, and it is the next milestone.** AArch64 splits translation between `TTBR0_EL1`
+> (low VA) and `TTBR1_EL1` (high VA). Putting the kernel in TTBR1 leaves TTBR0 *entirely* to the task:
+> no kernel entries in a task table, no collision possible, no kernel-copying half to this file, and the
+> same kernel-high / user-low shape x86 already has (so `hhdm_offset` and `PHYS_IS_IDENTITY` stop being
+> special-cased). The cost is relinking the kernel at a high address and jumping across the transition
+> during boot, plus mapping the peripherals through the high half. Deliberately not attempted as a
+> tail-end change to a boot path that is nine milestones deep and hardware-proven.
+>
+> Speculative block-splitting code that would have papered over the collision was written and then
+> **deleted** rather than kept (§26.2): it only exists to serve a layout this port is going to abandon.
+>
+> **Not done:** the TTBR1 split, EL0 tasks under the scheduler, PSCI SMP, and `kernel_main` itself.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
 > init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already

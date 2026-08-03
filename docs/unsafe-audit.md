@@ -13,6 +13,35 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4 milestone 10: per-task page tables (feat/pi4-aarch64)
+
+An address space is a private L1 plus **its own copies** of the four kernel L2 tables. The alternative
+- pointing each task's L1 at the shared kernel L2s, as the 32-bit port does - saves 20 KiB and buys an
+aliasing hazard: a table split in one address space is seen by all of them, and reclaim then has to
+distinguish a table the task owns from one it merely points at. Copying means **nothing is aliased**,
+so reclaim frees everything the root reaches without a single ownership test.
+
+**This milestone also surfaced a real architectural limit, and the code says so rather than working
+around it.** A task page below 4 GiB would land inside a 2 MiB block of the kernel's identity map, and
+mapping it would shadow the kernel's own view of that physical range - `USER_STACK_TOP` (0x8000_0000)
+sits directly above the frame allocator's bitmap. `map` refuses that case loudly instead of splitting
+the block, because the honest fix is to stop putting the kernel in TTBR0 at all: the kernel belongs in
+TTBR1 (high VA), leaving TTBR0 entirely to the task. The speculative block-splitting code that would
+have papered over it was written and then **deleted** (§26.2 - features are pulled into existence, not
+kept in case).
+
+The selftest exercises the `TTBR0_EL1` swap that milestone 9 shipped unexercised: build a space, map a
+page above the kernel map, install the new TTBR0, read the value back through the new mapping, confirm
+kernel memory is still reachable under the task's table, switch back, and check every frame returned.
+Proven to fail by inverting the value comparison (`mapped=false`, every other counter clean), and the
+`map failed` path fired on its own during development.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/ptables.rs` | new, 19 | Page-table walking and construction: `get`/`set` on identity-mapped table frames, zeroing a freshly allocated table (garbage would have VALID bits set at random and the walker follows them), copying the kernel L2s, and `free_all` reclaiming the tree. Every one is a raw access to a frame this module allocated or to the kernel's own boot L1. |
+| `arch/aarch64/mmu.rs` | 3 -> 4 (+1) | `kernel_l1_root` takes the address of this module's static L1 - no dereference. Per-task spaces copy from THIS, never from the live `TTBR0_EL1`, which belongs to whichever task is running; the 32-bit port copied the live root and gave a child its spawner's user entries, which the child's reclaim later freed out from under the still-running spawner. |
+| `arch/aarch64/mod.rs` | 33 -> 41 (+8) | The page-table selftest: writing and reading the test frame and the kernel canary through identity addresses, reading `TTBR0_EL1`, the two `msr ttbr0_el1` + `tlbi vmalle1` switches, and freeing the two frames. The switch is safe because the new space maps the kernel (copied from the boot L1), so the instruction stream, stack and UART stay translated across it. |
+
 ## 2026-08-03 - Pi 4 milestone 9: the neutral scheduler preempts (feat/pi4-aarch64)
 
 Three kernel tasks that deliberately never yield, round-robined by the neutral `scheduler::run` under
@@ -1299,14 +1328,15 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 33 | permitted |
+| arch/aarch64/mod.rs | 41 | permitted |
 | arch/aarch64/exceptions.rs | 7 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 4 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
-| arch/aarch64/mmu.rs | 3 | permitted |
+| arch/aarch64/mmu.rs | 4 | permitted |
+| arch/aarch64/ptables.rs | 19 | permitted |
 | arch/aarch64/usermode.rs | 11 | permitted |
 | arch/aarch64/mailbox.rs | 3 | permitted |
 | arch/aarch64/memmap.rs | 7 | permitted |
