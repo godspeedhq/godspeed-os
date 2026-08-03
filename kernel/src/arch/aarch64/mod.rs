@@ -310,6 +310,27 @@ extern "C" fn aarch64_boot_main(dtb: u64) -> ! {
         let bi = memmap::boot_info(boot_map);
         crate::memory::init(&bi);
         allocator_selftest();
+
+        // Prove the high half BEFORE building anything on it. A frame from the allocator is used as
+        // scratch so the test writes somewhere the kernel definitely owns.
+        if let Some(f) = crate::memory::allocator::alloc_frame() {
+            let pa = f.phys_addr().0;
+            match mmu::selftest_high_half(pa) {
+                Some(high) => {
+                    put_str(b"aarch64: TTBR1 high half LIVE - phys ");
+                    put_hex(pa);
+                    put_str(b" also reads/writes at ");
+                    put_hex(high);
+                    put_str(b"\r\n");
+                }
+                None => put_str(
+                    b"aarch64: WARN TTBR1 high half did NOT translate - check TG1/EPD1/TTBR1_EL1\r\n",
+                ),
+            }
+            // SAFETY: the frame came from `alloc_frame` and is freed exactly once.
+            unsafe { crate::memory::allocator::free_frame(f) };
+        }
+
         page_table_selftest();
         bi
     };

@@ -125,6 +125,25 @@ static mut L2: [Table; L1_USED] = [
     Table([0; ENTRIES]),
 ];
 
+/// Base of the kernel's high half - the `TTBR1_EL1` region.
+///
+/// With `T1SZ = 25` the high range is the top 512 GiB of the 64-bit space, and physical `P` is mapped
+/// at `KERNEL_VA_BASE + P`. That makes it a **direct map**, the same thing Limine's HHDM is on x86, so
+/// the neutral allocator's `hhdm_offset` has a real value here once the kernel moves up.
+///
+/// The address is chosen so that `KERNEL_VA_BASE >> 30 & 511 == 0`: the high L1's entry *i* covers the
+/// same GiB as the low L1's entry *i*, so the high tables are built by exactly the same loop rather
+/// than by a second, subtly-different one.
+pub const KERNEL_VA_BASE: u64 = 0xFFFF_FF80_0000_0000;
+
+static mut L1_HIGH: Table = Table([0; ENTRIES]);
+static mut L2_HIGH: [Table; L1_USED] = [
+    Table([0; ENTRIES]),
+    Table([0; ENTRIES]),
+    Table([0; ENTRIES]),
+    Table([0; ENTRIES]),
+];
+
 /// Build the identity map and turn translation on.
 ///
 /// Returns the physical address installed in `TTBR0_EL1`, so the caller can report it rather than
@@ -160,28 +179,60 @@ pub fn enable() -> u64 {
             }
         }
 
-        let ttbr = l1 as u64;
+        // The HIGH half: physical P at KERNEL_VA_BASE + P, kernel-only, same 2 MiB blocks. Built by
+        // the same walk as the low map because the base was chosen to make the L1 indices line up.
+        // No EL0 bit anywhere in here - the whole point of moving the kernel up is that a task's
+        // address space (TTBR0) cannot name it at all.
+        let l1h = &raw mut L1_HIGH;
+        let l2h = &raw mut L2_HIGH;
+        for i in 0..L1_USED {
+            let l2_pa = (&raw const (*l2h)[i]) as u64;
+            (*l1h).0[i] = l2_pa | DESC_TABLE;
+            for j in 0..ENTRIES {
+                let pa = (i as u64) * (ENTRIES as u64) * BLOCK_SIZE + (j as u64) * BLOCK_SIZE;
+                (*l2h)[i].0[j] = if pa >= DEVICE_BASE {
+                    pa | DESC_BLOCK | DESC_AF | DESC_AP_RW_EL1
+                        | attr_idx(MAIR_IDX_DEVICE) | DESC_PXN | DESC_UXN
+                } else {
+                    pa | DESC_BLOCK | DESC_AF | DESC_SH_INNER | DESC_AP_RW_EL1
+                        | attr_idx(MAIR_IDX_NORMAL) | DESC_UXN
+                };
+            }
+        }
 
-        // TCR_EL1. T0SZ=25 gives a 39-bit VA so the walk starts at L1; TTBR1 is disabled because
-        // nothing uses the upper half yet, and leaving it enabled would let a stray high address walk
-        // a table we never built.
+        let ttbr = l1 as u64;
+        let ttbr1 = l1h as u64;
+
+        // TCR_EL1. T0SZ=T1SZ=25 gives a 39-bit VA at each end, so both walks start at L1.
+        //
+        // **TG1 does not use TG0's encoding.** TG0 spells 4 KiB as `0b00`; TG1 spells it `0b10`
+        // (TG1: 01=16K, 10=4K, 11=64K). Copying the TG0 value into TG1 selects a 16 KiB granule, every
+        // high walk fails, and the fault points at whatever first touched a high address rather than at
+        // this register.
         let tcr: u64 = 25          // T0SZ
             | (0b01 << 8)          // IRGN0: inner write-back write-allocate
             | (0b01 << 10)         // ORGN0: outer write-back write-allocate
             | (0b11 << 12)         // SH0: inner shareable
             | (0b00 << 14)         // TG0: 4 KiB granule
-            | (1 << 23)            // EPD1: no table walks via TTBR1
+            | (25 << 16)           // T1SZ: 39-bit high VA
+            | (0b01 << 24)         // IRGN1
+            | (0b01 << 26)         // ORGN1
+            | (0b11 << 28)         // SH1: inner shareable
+            | (0b10 << 30)         // TG1: 4 KiB granule - NOT 0b00, see above
             | (0b010 << 32);       // IPS: 40-bit intermediate physical address (1 TiB) - covers 4 GiB
+        // Note EPD1 (bit 23) is now CLEAR: high walks are enabled.
 
         core::arch::asm!(
             "msr mair_el1, {mair}",
             "msr tcr_el1,  {tcr}",
             "msr ttbr0_el1,{ttbr}",
+            "msr ttbr1_el1,{ttbr1}",
             "dsb ish",             // publish the tables before anything may walk them
             "isb",
             mair = in(reg) MAIR_VALUE,
             tcr  = in(reg) tcr,
             ttbr = in(reg) ttbr,
+            ttbr1 = in(reg) ttbr1,
             options(nostack),
         );
 
@@ -220,6 +271,34 @@ pub fn enable() -> u64 {
 /// (see `EL0_SHIM_LIMIT`). EL0 access is now decided when the tables are built, so there is no live
 /// mutation and no maintenance to get wrong. Kept as a note rather than dead code so the next person
 /// does not reinvent it.
+/// Prove the high half translates, before anything is built on it.
+///
+/// Writes a value through a physical (identity) address and reads it back through
+/// `KERNEL_VA_BASE + phys`. If `TG1` were wrong, or `EPD1` still set, or `TTBR1_EL1` unwritten, this is
+/// where it shows - at the point of the mistake, rather than as an unexplained fault later in whatever
+/// first touched a high address.
+///
+/// Returns the high address it used, so the caller can report a concrete number instead of "ok".
+pub fn selftest_high_half(scratch_phys: u64) -> Option<u64> {
+    const MAGIC: u64 = 0x1122_3344_5566_7788;
+    let high = KERNEL_VA_BASE + scratch_phys;
+    // SAFETY: `scratch_phys` is a frame the caller owns, identity-mapped low and now also mapped at
+    // `high` by the table built above. Both are ordinary Normal memory; the `dsb`/`isb` in `enable`
+    // already published the tables.
+    unsafe {
+        (scratch_phys as *mut u64).write_volatile(MAGIC);
+        if (high as *const u64).read_volatile() != MAGIC {
+            return None;
+        }
+        // And the other direction, so this cannot pass on a stale cache line that happened to match.
+        (high as *mut u64).write_volatile(!MAGIC);
+        if (scratch_phys as *const u64).read_volatile() != !MAGIC {
+            return None;
+        }
+    }
+    Some(high)
+}
+
 /// The kernel's own boot L1, as a physical address.
 ///
 /// Per-task address spaces copy their kernel half from **this**, never from the live `TTBR0_EL1`. The

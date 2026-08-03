@@ -13,6 +13,26 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4 milestone 11a: the TTBR1 high half goes live (feat/pi4-aarch64)
+
+Stage one of moving the kernel out of `TTBR0`. The high half (`TTBR1_EL1`) now maps physical `P` at
+`KERNEL_VA_BASE + P` - a direct map, the same thing Limine's HHDM is on x86 - alongside the existing
+low identity map. Nothing has moved yet; this proves the mapping works before anything is built on it.
+
+`KERNEL_VA_BASE` is chosen so `>> 30 & 511 == 0`, which makes the high L1's entry *i* cover the same
+GiB as the low L1's entry *i*, so both maps are built by the same loop rather than by two subtly
+different ones.
+
+**`TG1` does not share `TG0`'s encoding.** TG0 spells 4 KiB as `0b00`; TG1 spells it `0b10`. Copying
+the TG0 value across selects a 16 KiB granule, every high walk fails, and the fault points at whatever
+first touched a high address rather than at the register. The selftest exists to catch exactly that
+class at the point of the mistake.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mmu.rs` | 4 -> 5 (+1) | `selftest_high_half` writes through the physical (identity) address and reads back through the high alias, then reverses the direction so it cannot pass on a stale line that happened to match. The high tables themselves are built inside the existing `enable` block, so they add no new `unsafe`. |
+| `arch/aarch64/mod.rs` | 41 -> 42 (+1) | Freeing the scratch frame the selftest borrowed from the allocator. |
+
 ## 2026-08-03 - Pi 4 milestone 10: per-task page tables (feat/pi4-aarch64)
 
 An address space is a private L1 plus **its own copies** of the four kernel L2 tables. The alternative
@@ -1328,14 +1348,14 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 41 | permitted |
+| arch/aarch64/mod.rs | 42 | permitted |
 | arch/aarch64/exceptions.rs | 7 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 4 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
-| arch/aarch64/mmu.rs | 4 | permitted |
+| arch/aarch64/mmu.rs | 5 | permitted |
 | arch/aarch64/ptables.rs | 19 | permitted |
 | arch/aarch64/usermode.rs | 11 | permitted |
 | arch/aarch64/mailbox.rs | 3 | permitted |
