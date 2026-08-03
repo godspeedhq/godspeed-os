@@ -13,6 +13,28 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4: EL0 gets its own 2 MiB region (feat/pi4-aarch64)
+
+Follow-up to milestone 6, after two hardware failures traced to one cause.
+
+**In the EL1&0 translation regime, a region accessible from EL0 is forced PXN** - the kernel may not
+execute what userspace can reach (ARM's equivalent of x86 SMEP). Granting EL0 access to the block
+holding the kernel's `.text` therefore made the kernel non-executable at EL1, and the core died on its
+next instruction fetch with no way to report it: the exception handler could not fetch its vector
+either. It presented first as `tlbi vmalle1` hanging and then as the MMU enable hanging - the same
+permission fault landing wherever the new mapping took effect. The `tlbi` was never at fault, and the
+earlier "suspect CPUECTLR_EL1.SMPEN" note was wrong.
+
+EL0 code and stack now live in a linker-placed, 2 MiB-aligned `.el0` region, and only that region is
+granted EL0 access. The EL0 task consequently cannot call kernel print functions at all, so it reports
+its verdict through a syscall argument - the first place the EL0/EL1 boundary is real rather than
+notional.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mmu.rs` | 2 -> 3 (+1) | `el0_region` reads the linker's `__el0_start`/`__el0_end`; taking a linker symbol's address does not dereference it. |
+| `arch/aarch64/usermode.rs` | 9 -> 11 (+2) | The `svc #2` verdict call from EL0, and the EL0 stack now living in `.el0.data`. |
+
 ## 2026-08-03 - Pi 4 milestone 6: EL0 and the svc path (feat/pi4-aarch64)
 
 Dropping to EL0, taking `svc` back to EL1, returning a value, and exiting cleanly.
@@ -1213,8 +1235,8 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 4 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
-| arch/aarch64/mmu.rs | 2 | permitted |
-| arch/aarch64/usermode.rs | 9 | permitted |
+| arch/aarch64/mmu.rs | 3 | permitted |
+| arch/aarch64/usermode.rs | 11 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |

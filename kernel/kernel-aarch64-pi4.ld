@@ -40,5 +40,30 @@ SECTIONS {
     . += 0x80000;
     __stack_top = .;
 
+    /* EL0 region, on its own 2 MiB boundary.
+     *
+     * This has to be a SEPARATE 2 MiB block from the kernel, not merely separate
+     * bytes. In the EL1&0 translation regime, a region that is accessible from
+     * EL0 is forced PXN - the kernel may not execute code that userspace can
+     * reach (ARM's equivalent of x86 SMEP). So granting EL0 access to the block
+     * holding the kernel's own .text makes the kernel non-executable at EL1, and
+     * the core dies on its next instruction fetch with no way to report it: the
+     * exception handler cannot fetch its vector either.
+     *
+     * That cost two hardware round trips. It presented first as `tlbi vmalle1`
+     * hanging, and then as the MMU enable hanging - the same permission fault,
+     * just landing at whichever point the new mapping took effect.
+     *
+     * The map uses 2 MiB blocks, so 2 MiB alignment is the granularity at which
+     * EL0 access can be granted without dragging kernel code in with it. */
+    . = ALIGN(0x200000);
+    __el0_start = .;
+    .el0 : ALIGN(0x1000) {
+        *(.el0.text)
+        *(.el0.data)
+    }
+    . = ALIGN(0x200000);
+    __el0_end = .;
+
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) *(.eh_frame_hdr) *(.ARM.attributes) }
 }

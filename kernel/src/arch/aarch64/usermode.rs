@@ -22,14 +22,19 @@ use super::{put_dec, put_hex, put_str};
 /// Demo syscall numbers, chosen to be obviously not-the-real-ABI.
 const SYS_ECHO: u64 = 0;
 const SYS_EXIT: u64 = 1;
+const SYS_VERDICT: u64 = 2;
 
 /// A magic the demo user task sends, and the value the kernel hands back, so the round trip is checked
 /// rather than assumed - a syscall that returns nothing observable proves only that it did not crash.
 const ECHO_ARG: u64 = 0x4242_4242;
 const ECHO_REPLY: u64 = 0x1234_5678;
 
-/// 16 KiB EL0 stack, `.bss`, sized once and visible (§26.6.1).
+/// 16 KiB EL0 stack, in the linker's `.el0` region so it shares a 2 MiB block with the EL0 code and
+/// NOT with kernel code - see `mmu::el0_region` for why that separation is mandatory rather than tidy.
+/// Sized once and visible (§26.6.1). It costs image space rather than `.bss` because the region has to
+/// be placed, and that is the price of the separation.
 const USER_STACK: usize = 16 * 1024;
+#[link_section = ".el0.data"]
 static mut EL0_STACK: [u8; USER_STACK] = [0; USER_STACK];
 
 /// Where to resume when the user task exits. Saved before dropping to EL0.
@@ -63,6 +68,15 @@ pub fn syscall(number: u64, frame: &mut TrapFrame) {
             unsafe { ECHO_OK = arg == ECHO_ARG };
             frame.x[0] = ECHO_REPLY; // the restore path reloads x0 from here
         }
+        SYS_VERDICT => {
+            if frame.x[0] == 1 {
+                put_str(b"    [EL0] round trip OK - kernel reply arrived in x0\r\n");
+            } else {
+                // SAFETY: single-threaded bring-up.
+                unsafe { ECHO_OK = false };
+                put_str(b"    [EL0] CORRUPT - wrong value came back in x0\r\n");
+            }
+        }
         SYS_EXIT => {
             put_str(b"    [EL0] svc #1 (exit) - leaving EL0\r\n");
             // Do not `eret` back to a task that asked to stop. Switch to the kernel context saved
@@ -84,6 +98,7 @@ pub fn syscall(number: u64, frame: &mut TrapFrame) {
 ///
 /// `extern "C"` and `naked`-free on purpose - it is ordinary compiled code, which is the point. If a
 /// plain Rust function can run at EL0 and come back through `svc`, the mechanism is real.
+#[link_section = ".el0.text"]
 extern "C" fn el0_task() -> ! {
     let reply: u64;
     // SAFETY: `svc` is the architectural syscall instruction; at EL0 it traps to EL1's synchronous
@@ -101,10 +116,20 @@ extern "C" fn el0_task() -> ! {
         );
     }
 
-    if reply == ECHO_REPLY {
-        put_str_el0(b"    [EL0] round trip OK - kernel reply arrived in x0\r\n");
-    } else {
-        put_str_el0(b"    [EL0] CORRUPT - wrong value came back in x0\r\n");
+    // Report the verdict THROUGH the kernel, as a syscall argument, rather than by calling a kernel
+    // print function. EL0 cannot execute kernel `.text` - that separation is the entire reason this
+    // task lives in its own 2 MiB region - so calling into it would fault immediately. This is the
+    // first place the EL0/EL1 boundary is real rather than notional.
+    let verdict: u64 = if reply == ECHO_REPLY { 1 } else { 0 };
+    // SAFETY: `svc #2` hands the verdict to the kernel, which prints it and returns.
+    unsafe {
+        core::arch::asm!(
+            "mov x0, {v}",
+            "svc #2",
+            v = in(reg) verdict,
+            out("x0") _,
+            options(nostack),
+        );
     }
 
     // SAFETY: `svc #1` asks the kernel to stop this task; it does not return.
@@ -113,14 +138,6 @@ extern "C" fn el0_task() -> ! {
         // SAFETY: WFE is always valid. Unreachable - the exit syscall does not come back.
         unsafe { core::arch::asm!("wfe") };
     }
-}
-
-/// EL0 cannot touch the UART directly once real address spaces exist - but during this demo the
-/// identity map is shared and the peripheral block is EL0-accessible, so it can. Kept as a separate
-/// function so the day that stops being true, the compiler points here rather than at scattered call
-/// sites.
-fn put_str_el0(s: &[u8]) {
-    put_str(s);
 }
 
 /// Drop to EL0, run the demo task, and come back. Returns true if the round trip checked out.

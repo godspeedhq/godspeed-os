@@ -48,7 +48,12 @@ const BLOCK_SIZE: u64 = 2 * 1024 * 1024;
 /// both with one comparison and costs at most a little RAM that the firmware had already taken.
 const DEVICE_BASE: u64 = 0xFC00_0000;
 
-/// Bring-up shim: blocks below this, plus the peripheral window, are built **EL0-accessible**.
+extern "C" {
+    static __el0_start: u8;
+    static __el0_end: u8;
+}
+
+/// Bring-up shim: the linker-placed EL0 region, plus the peripheral window, are built EL0-accessible.
 ///
 /// EL0 currently shares the kernel's single identity map, so the demo task needs `AP` granting it
 /// access to the image, its stacks, and the UART it prints through. Real tasks get their own page
@@ -61,12 +66,25 @@ const DEVICE_BASE: u64 = 0xFC00_0000;
 /// report - which is what a failed instruction fetch looks like when the handler cannot fetch its own
 /// vector either.
 ///
-/// Rather than fight that, the access is decided before translation is on, where no maintenance is
-/// needed. That is also what a real design does: mutating a live translation table requires
-/// break-before-make, and per-task tables are built complete and then switched to, never patched
-/// underneath a running core. The `tlbi`-with-MMU-on question is real and deferred, not solved - see
-/// `docs/aarch64.md`.
-const EL0_SHIM_LIMIT: u64 = 0x40_0000;
+/// **The region must not share a 2 MiB block with kernel code, and that is the whole point.** In the
+/// EL1&0 translation regime a region accessible from EL0 is forced **PXN** - the kernel may not execute
+/// what userspace can reach (ARM's equivalent of x86 SMEP). Granting EL0 access to the block holding
+/// the kernel's `.text` therefore makes the kernel non-executable at EL1, and the core dies on its next
+/// instruction fetch with no way to say so, because the exception handler cannot fetch its vector
+/// either.
+///
+/// That cost two hardware round trips, presenting first as `tlbi vmalle1` hanging and then as the MMU
+/// enable hanging - the same permission fault, landing wherever the new mapping happened to take
+/// effect. The `tlbi` was never at fault.
+///
+/// So the EL0 code and stack live in their own 2 MiB-aligned `.el0` region (see the linker script), and
+/// only that region is granted EL0 access. Deciding it at table-build time also avoids mutating a live
+/// map, which would need break-before-make - and which per-task tables (§10.1) will not do either, since
+/// they are built complete and then switched to.
+fn el0_region() -> (u64, u64) {
+    // SAFETY: linker-provided symbols; taking their addresses does not dereference them.
+    unsafe { (core::ptr::addr_of!(__el0_start) as u64, core::ptr::addr_of!(__el0_end) as u64) }
+}
 
 // --- Descriptor bits (Armv8-A long descriptor, stage 1) ---
 const DESC_TABLE: u64 = 0b11; // points at a next-level table
@@ -110,6 +128,7 @@ pub fn enable() -> u64 {
     let ttbr = unsafe {
         let l1 = &raw mut L1;
         let l2 = &raw mut L2;
+        let (el0_lo, el0_hi) = el0_region();
 
         for i in 0..L1_USED {
             // L1 entry i -> L2 table i.
@@ -119,7 +138,7 @@ pub fn enable() -> u64 {
             for j in 0..ENTRIES {
                 let pa = (i as u64) * (ENTRIES as u64) * BLOCK_SIZE + (j as u64) * BLOCK_SIZE;
                 // EL0 access for the shim ranges, decided here rather than patched in later.
-                let el0 = if pa < EL0_SHIM_LIMIT || pa >= DEVICE_BASE { 1 << 6 } else { 0 };
+                let el0 = if (pa >= el0_lo && pa < el0_hi) || pa >= DEVICE_BASE { 1 << 6 } else { 0 };
                 (*l2)[i].0[j] = el0 | if pa >= DEVICE_BASE {
                     // MMIO: Device-nGnRnE, never executable. No shareability - it is meaningless for
                     // Device memory and the architecture ignores the field.
