@@ -58,6 +58,21 @@ pub fn fault_noncanonical_read() {
     unsafe { let _ = core::ptr::read_volatile(0xFFFF_FFF0 as *const u8); }
 }
 
+/// AArch64 has a genuine analog of x86's non-canonical address: the **VA hole**. With a 39-bit range
+/// at each end (`T0SZ = T1SZ = 25`), addresses between the top of the `TTBR0` range and the bottom of
+/// the `TTBR1` range belong to neither table and fault on any access, from any EL. `0x0000_8000_0000_0000`
+/// sits squarely in that hole - the same "this address cannot possibly be valid" property #GP tests on
+/// x86, rather than merely an address that happens to be unmapped today.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn fault_noncanonical_read() {
+    // SAFETY: an intentional data abort for the A14 regression; a conforming kernel kills this task at
+    // the EL0 abort. The address is in the architectural VA hole, so no mapping can ever make it valid.
+    unsafe {
+        let _ = core::ptr::read_volatile(0x0000_8000_0000_0000u64 as *const u8);
+    }
+}
+
 /// Deliberately divide by zero, raising a ring-3 divide-error (#DE, vector 0) at CPL3 - §22 A14. Uses
 /// raw asm because Rust inserts a divide guard that would PANIC (unwind) instead of faulting, and the
 /// threat model includes adversarial asm services. The kernel must kill this task, not halt.
@@ -87,6 +102,23 @@ pub fn fault_divide_by_zero() {
 pub fn fault_divide_by_zero() {
     // SAFETY: an intentional undefined-instruction fault for the A14 regression. `udf #0` raises a
     // ring-3 undefined-instruction exception; a conforming kernel kills this task and never resumes it.
+    unsafe {
+        core::arch::asm!("udf #0", options(nostack, nomem));
+    }
+}
+
+/// AArch64 has **no trapping integer divide** either - `sdiv`/`udiv` by zero return 0 rather than
+/// faulting, with no control bit to change that (unlike ARMv7's `SCTLR.DZ`). So, as on the 32-bit port,
+/// the equivalent EL0 CPU fault is an **undefined instruction**, which the kernel must handle by
+/// killing the task rather than halting - the same A14/C1 property the x86 `#DE` tests.
+///
+/// The name is kept across all three architectures so the test suite names one behaviour rather than
+/// three; what differs is only which instruction produces the fault.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn fault_divide_by_zero() {
+    // SAFETY: an intentional undefined-instruction fault for the A14 regression. `udf #0` is the
+    // permanently-undefined encoding; a conforming kernel kills this task and never resumes it.
     unsafe {
         core::arch::asm!("udf #0", options(nostack, nomem));
     }

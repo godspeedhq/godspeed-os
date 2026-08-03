@@ -57,7 +57,11 @@ core::arch::global_asm!(
     .globl el0_blob_end
 // Position-independent EL0 payload. Copied into a task frame and executed there, so it must not
 // reference any address: every operand below is an immediate or a register.
+// The syscall number goes in x8 and the arguments in x0-x2 - the REAL ABI the SDK's `raw_syscall`
+// emits, not a demo convention. This blob is the only EL0 code that exists yet, so it is also the only
+// thing that can prove the ABI, and it would be worth very little if it proved a different one.
 el0_blob_start:
+    mov  x8, #0                      // SYS_ECHO
     movz x0, #0x4242                 // x0 = ECHO_ARG
     movk x0, #0x4242, lsl #16
     svc  #0                          // -> kernel; returns ECHO_REPLY in x0
@@ -66,9 +70,11 @@ el0_blob_start:
     movk x1, #0x1234, lsl #16
     cmp  x0, x1
     cset x0, eq                      // x0 = 1 if the reply came back intact, else 0
-    svc  #2                          // report the verdict THROUGH the kernel
+    mov  x8, #2                      // SYS_VERDICT
+    svc  #0                          // report the verdict THROUGH the kernel
 
-    svc  #1                          // ask the kernel to stop this task; does not return
+    mov  x8, #1                      // SYS_EXIT
+    svc  #0                          // ask the kernel to stop this task; does not return
 1:  b    1b                          // unreachable
 el0_blob_end:
 "#

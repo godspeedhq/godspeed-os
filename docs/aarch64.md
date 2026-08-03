@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-11 (TTBR1 split) done on real hardware (2026-08-03)
+> ## STATUS: milestones 1-11 done on real hardware; 12-13 (EL0 task, SDK ABI) in QEMU (2026-08-03)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -289,7 +289,42 @@
 > round-robining three never-yielding tasks at **153 / 153 / 153** lines (counters 152 / 152 / 152).
 > No exceptions, no warnings.
 >
-> **Not done:** EL0 tasks in their own address space, PSCI SMP, and `kernel_main` itself.
+> **Milestone 12 - an EL0 task in its own `TTBR0` space.** `PageTable::new` now allocates **one** frame
+> and copies nothing: a task table holds the task and nothing else, because the kernel is in `TTBR1`
+> where no `TTBR0` switch can disturb it and no EL0 access can reach it. That deleted both the 20 KiB
+> kernel-copy per address space and the collision class it carried. The task is frames, not linker
+> sections - a code page and a stack page with a position-independent payload copied in.
+>
+> Page 0 is now reserved: the allocator handed out physical frame 0 as a page-table root, printing
+> `TTBR0=0x0`, which works only by coincidence and collides with the `cr3 == 0` sentinel
+> `switch_context` uses for "no address space".
+>
+> **Milestone 13 - the SDK syscall ABI, and a design correction.** `raw_syscall` now has an AArch64 arm:
+> number in `x8`, arguments in `x0`-`x2`, result in `x0`, via `svc #0` - the same shape Linux uses here.
+>
+> Milestone 6 read the syscall number from `ESR_EL1.imm16` and justified it as userspace being unable to
+> lie about which call it made. **That was wrong twice.** `svc #N` encodes `N` in the instruction, so it
+> must be a compile-time constant - a real ABI whose caller picks the number at runtime cannot express
+> it at all. And there was no security property to lose: a task is entitled to request any syscall
+> number, and what stops it doing something it should not is the capability check inside the handler,
+> which trusts neither the register nor the immediate. The EL0 demo blob was updated to the register
+> convention, so the one piece of EL0 code that exists proves the ABI that services will actually use.
+>
+> Nothing is truncated on this path, unlike the 32-bit ARM one: registers are 64-bit, so a `u64`
+> argument passes whole and the whole class of "does this value exceed 32 bits" bugs does not arise.
+>
+> The SDK builds for `aarch64-unknown-none`, `x86_64-unknown-none` and `armv7a-none-eabi`, and the
+> **`logger` service compiles for AArch64** with `e_entry` correctly resolving to `service_main` (the
+> `#[no_mangle]` trap that produced `e_entry = 0` on the 32-bit port). `adversarial.rs` gained AArch64
+> arms too, which the SDK's clean compile would NOT have caught - those functions are `pub` and only
+> fail when a service calls them. AArch64 has no trapping integer divide (like ARMv7), so
+> `fault_divide_by_zero` is `udf #0`; and it has a genuine non-canonical analog in the **VA hole**
+> between the `TTBR0` and `TTBR1` ranges, which no mapping can ever make valid.
+>
+> **Not done:** the user-pointer copy seam (`validate_user_ptr` / `read_user_bytes` / `write_user_bytes`
+> still return `false`/`None`), real syscall dispatch into the neutral handler, wiring `ptables` in as
+> `page_tables::PageTable` (`loader.rs` still calls the `unimplemented!()` stub), `TaskContext::new_user`,
+> `arch::init` + the `kernel_main` handoff, UART RX, PSCI SMP.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
 > init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already

@@ -291,9 +291,18 @@ const EC_SVC64: u64 = 0b010101;
 
 /// Synchronous exception from a lower EL. Today that means `svc` from EL0.
 ///
-/// The syscall number is the `imm16` the instruction carried, which the hardware puts in the low 16
-/// bits of `ESR_EL1` - reading it from there rather than from a register means userspace cannot lie
-/// about which call it made by clobbering a register on the way in.
+/// **The syscall number comes from `x8`, not from the instruction's `imm16`.**
+///
+/// Milestone 6 read it from `ESR_EL1.imm16` and justified that as userspace being unable to lie about
+/// which call it made. That justification was wrong twice over. First, `svc #N` encodes `N` in the
+/// instruction, so it must be a compile-time constant - a real ABI whose caller selects the number at
+/// runtime cannot express it at all, which is exactly what the SDK's `raw_syscall(nr, ...)` needs.
+/// Second, there was no security property to lose: a task is *entitled* to request any syscall number,
+/// and what stops it doing something it should not is the capability check inside the handler, which
+/// trusts neither the register nor the immediate.
+///
+/// So this follows the same shape Linux uses on AArch64: number in `x8`, arguments in `x0`-`x2`, result
+/// back in `x0`. Keeping `x0`-`x2` free for arguments is the practical reason for `x8` specifically.
 ///
 /// Anything that is NOT an SVC is a genuine userspace fault (a bad address, an illegal instruction).
 /// Those still report and halt: killing the task is what a real port does, and there is no task
@@ -306,10 +315,10 @@ extern "C" fn aarch64_sync_lower_dispatch(vector: u64, frame: *mut TrapFrame) {
     if (esr >> 26) & 0x3F != EC_SVC64 {
         aarch64_trap_report(vector, frame);
     }
-    let imm = esr & 0xFFFF;
     // SAFETY: `frame` is the trap frame the vector assembly built on the current stack.
     let f = unsafe { &mut *frame };
-    super::usermode::syscall(imm, f);
+    let nr = f.x[8];
+    super::usermode::syscall(nr, f);
 }
 
 /// Report an exception and halt.
