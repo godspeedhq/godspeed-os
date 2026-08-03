@@ -41,6 +41,10 @@ proptest = "1"
 panic = "abort"
 
 [features]
+# Target the Raspberry Pi 4 Model B (BCM2711) rather than QEMU's `virt` machine, for the aarch64 build.
+# Selects the 0x80000 flat-load linker script and the BCM2711 peripheral base (PL011 at 0xFE201000);
+# without it the aarch64 build stays the QEMU `virt` boundary-demarcation target it has been.
+pi4 = []
 # Force `map_in_active_tables` to fail at the MMIO call sites (ioapic, pci MSI-X), so the error paths
 # added for kernel-audit A9-2 are actually EXERCISED rather than merely reasoned about. Those paths are
 # otherwise unreachable without exhausting the frame allocator, which cannot be arranged at boot.

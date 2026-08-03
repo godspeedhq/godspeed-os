@@ -146,7 +146,39 @@ pub mod boot {
 }
 
 // ---------------------------------------------------------------------------
+/// Hook called when the scheduler commits a **user** task. x86 ignores it; ARM records the slot so the
+/// timer runs its syscalls atomically. Nothing to do on this stub yet.
+pub fn note_user_task(_slot: usize) {}
+
+// --- Framebuffer console backend (`crate::fbcon`) ---
+// The neutral console owes each arch two items (see `crate::fbcon`'s module header). No framebuffer is
+// mapped on this stub, so the console never initialises and every entry point no-ops.
+
+/// `false` selects the repaint-from-shadow-grid scroll, which never reads the framebuffer back - the
+/// conservative choice while no framebuffer exists.
+pub const FB_READBACK_CHEAP: bool = false;
+
+/// Publish a written rectangle. Nothing to publish yet.
+pub fn fb_commit(
+    _base: usize, _pitch: usize, _bpp: usize,
+    _x: usize, _y: usize, _w: usize, _h: usize,
+) {}
+
 pub mod page_tables {
+
+    /// Arch hook run once a service's address space is built. x86 needs nothing; ARM clones the kernel
+    /// identity mapping into it.
+    ///
+    /// # Safety
+    /// `_root` must be a page-table root this task owns.
+    pub unsafe fn finalize_service_address_space(_root: u64) {}
+
+    /// Free a task's page-table root and the structure below it, at task death.
+    ///
+    /// # Safety
+    /// `_root` must belong to a task already marked Dead, after a TLB shootdown.
+    pub unsafe fn free_page_table_root(_root: u64) {}
+
     use crate::memory::frame::{Frame, PhysAddr};
 
     pub const PAGE_SIZE: usize = 4096;

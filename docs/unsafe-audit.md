@@ -13,6 +13,29 @@ comment.
 
 ---
 
+## 2026-08-03 - Raspberry Pi 4 (aarch64) bring-up + the stale arch stubs
+
+Milestone 1 of the Pi 4 port, plus the arch stubs it exposed as out of date.
+
+**The stubs had drifted.** The neutral kernel gained `arch::imp` items over time (`note_user_task`,
+`page_tables::finalize_service_address_space`, `page_tables::free_page_table_root`, and from the v0.9.0
+console work `fb_commit` + `FB_READBACK_CHEAP`) without every arch stub being updated, so the
+demarcation builds `docs/multi-arch.md` claims had quietly stopped compiling. The Pi 4 build surfaced
+it: the compiler names the surface a port still owes, which is the workflow `arch/CLAUDE.md` describes.
+All five arch stubs are current again and compile clean.
+
+Each stub's `+2` is the two `unsafe fn` DECLARATIONS (the keyword is what the scanner counts) - both are
+empty no-ops, since a stub has no address spaces to finalize or free. They carry `# Safety` contracts
+matching the x86/ARM implementations so a real port inherits the obligation rather than discovering it.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. The boot path was also reworked for the Pi 4 (EL2 -> EL1 drop, BCM2711 PL011 at 0xFE201000, a bounded TXFF wait) but that is net-neutral on the count: `CurrentEL` read and the UART poll replace the old unguarded byte writes. |
+| `arch/loongarch64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. |
+| `arch/riscv64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. |
+| `arch/riscv32/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. |
+| `arch/s390x/mod.rs` | 18 -> 20 (+2) | The two `unsafe fn` page-table stubs. |
+
 ## 2026-08-03 - the A9-1 large-page guard selftest (test/large-page-guard)
 
 Kernel-audit A9-1 fixed a walk that could write into a mapped data frame, but the trigger (a large page
@@ -1102,7 +1125,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 23 | permitted |
+| arch/aarch64/mod.rs | 25 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
@@ -1122,10 +1145,10 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
 | arch/arm/mod.rs | 44 | permitted |
-| arch/loongarch64/mod.rs | 23 | permitted |
-| arch/riscv32/mod.rs | 23 | permitted |
-| arch/riscv64/mod.rs | 23 | permitted |
-| arch/s390x/mod.rs | 18 | permitted |
+| arch/loongarch64/mod.rs | 25 | permitted |
+| arch/riscv32/mod.rs | 25 | permitted |
+| arch/riscv64/mod.rs | 25 | permitted |
+| arch/s390x/mod.rs | 20 | permitted |
 | arch/x86_64/ap_boot.rs | 2 | permitted |
 | arch/x86_64/boot.rs | 107 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |

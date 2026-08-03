@@ -11,10 +11,26 @@
 
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
-// ============================ Boot bring-up (QEMU `virt`) ============================
-// The PL011 UART data register on QEMU's `virt` machine. Writing a byte transmits it; no init needed
-// for basic output under QEMU. (A real port polls the flag register at +0x18 for TXFF.)
-const PL011_DR: *mut u8 = 0x0900_0000 as *mut u8;
+// ============================ Boot bring-up ============================
+//
+// Two boards share this file, selected by the `pi4` cargo feature:
+//
+// - **QEMU `virt`** (default): the arch-boundary demarcation target. PL011 at 0x0900_0000, image
+//   loaded at 0x4008_0000, entry at EL1.
+// - **Raspberry Pi 4 Model B** (`--features pi4`): BCM2711. Peripherals at 0xFE00_0000 (low-peripheral
+//   mode), so PL011 is at 0xFE20_1000. The VideoCore firmware loads a flat `kernel8.img` at 0x80000 -
+//   note 0x80000, not the 32-bit port's 0x8000 - and enters at **EL2**.
+
+/// PL011 base for the selected board.
+#[cfg(not(feature = "pi4"))]
+const PL011_BASE: usize = 0x0900_0000; // QEMU `virt`
+#[cfg(feature = "pi4")]
+const PL011_BASE: usize = 0xFE20_1000; // BCM2711 (peripheral base 0xFE00_0000 + 0x20_1000)
+
+const PL011_DR: *mut u8 = PL011_BASE as *mut u8;
+/// Flag register (+0x18). Bit 5 = TXFF (transmit FIFO full).
+const PL011_FR: *const u32 = (PL011_BASE + 0x18) as *const u32;
+const PL011_FR_TXFF: u32 = 1 << 5;
 
 /// ELF entry point - `qemu-system-aarch64 -M virt -kernel` jumps here (EL1/EL2). Park the secondary
 /// cores (WFE loop), set the boot stack, zero BSS, then call the Rust boot. `.text.boot` so the linker
@@ -24,6 +40,32 @@ const PL011_DR: *mut u8 = 0x0900_0000 as *mut u8;
 #[link_section = ".text.boot"]
 pub unsafe extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
+        // --- Drop to EL1 if we entered at EL2 -------------------------------------------------
+        // QEMU `virt -kernel` enters at EL1, but the Pi 4's armstub hands the primary core over at
+        // **EL2**. At EL2 the EL1 system registers below are writable but do not govern us, and FP/SIMD
+        // is gated by CPTR_EL2 rather than CPACR_EL1 - so Rust's NEON memcpy would trap even though
+        // CPACR_EL1 says otherwise. Rather than special-case the whole file by exception level, drop to
+        // EL1 first and let everything after this assume EL1.
+        "mrs  x0, CurrentEL",
+        "lsr  x0, x0, #2",
+        "cmp  x0, #2",
+        "b.ne 4f",                           // already EL1 (QEMU): skip the drop
+        "mov  x0, #(1 << 31)",               // HCR_EL2.RW = 1: EL1 is AArch64, not AArch32
+        "msr  hcr_el2, x0",
+        "mrs  x0, cnthctl_el2",              // let EL1 read the physical counter/timer without trapping
+        "orr  x0, x0, #3",                   //   EL1PCTEN | EL1PCEN
+        "msr  cnthctl_el2, x0",
+        "msr  cntvoff_el2, xzr",             // no virtual-time offset
+        "mov  x0, #0x0800",                  // SCTLR_EL1: MMU off, caches off, res1 bits set
+        "movk x0, #0x30d0, lsl #16",
+        "msr  sctlr_el1, x0",
+        "mov  x0, #0x3c5",                   // SPSR_EL2: D|A|I|F masked, M[3:0] = 0b0101 (EL1h)
+        "msr  spsr_el2, x0",
+        "adr  x0, 4f",                       // return to the next instruction, but at EL1
+        "msr  elr_el2, x0",
+        "eret",
+        "4:",
+        // --- From here on we are at EL1 on either board --------------------------------------
         "mov  x0, #(3 << 20)",               // CPACR_EL1.FPEN = 0b11: DON'T trap FP/SIMD at EL1.
         "msr  cpacr_el1, x0",                //   (Rust emits NEON for memcpy/byte-copy; default EL1
         "isb",                               //    traps it -> ESR 0x07 undefined-instruction fault.)
@@ -55,18 +97,63 @@ pub unsafe extern "C" fn _start() -> ! {
 /// Rust side of boot. Milestone 1: write a line to the PL011 and halt. Later this grows into the real
 /// init (MMU, EL1 exceptions, GIC, generic timer, PSCI) and finally calls the neutral `kernel_main`.
 extern "C" fn aarch64_boot_main() -> ! {
-    for &b in b"\r\nGodspeedOS aarch64: _start reached EL1, PL011 UART alive - the demarcation BOOTS.\r\n" {
-        // SAFETY: PL011_DR is QEMU virt's UART data register; a byte write transmits it.
-        unsafe { PL011_DR.write_volatile(b); }
+    // Report the exception level we ended up in, not just that we printed something. On the Pi 4 the
+    // armstub hands the primary core over at EL2 and `_start` drops to EL1; on QEMU `virt` we arrive at
+    // EL1 already. Either way this must say EL1 - if it says EL2 the drop silently did not happen, and
+    // the next thing to touch FP/SIMD would fault for a reason that has nothing to do with the code
+    // that faulted.
+    let el: u64;
+    // SAFETY: reading CurrentEL is a side-effect-free system-register read valid at any EL.
+    unsafe { core::arch::asm!("mrs {}, CurrentEL", out(reg) el, options(nomem, nostack)) };
+    let el = (el >> 2) & 0x3;
+
+    put_str(b"
+GodspeedOS aarch64: PL011 alive at EL");
+    put_byte(b'0' + el as u8);
+    put_str(if cfg!(feature = "pi4") {
+        b" (Raspberry Pi 4 / BCM2711, PL011 @ 0xFE201000)
+"
+    } else {
+        b" (QEMU virt, PL011 @ 0x09000000)
+"
+    });
+    if el != 1 {
+        put_str(b"aarch64: WARN not at EL1 - the EL2 drop did not happen; FP/SIMD will trap
+");
     }
-    for &b in b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.\r\n" {
-        unsafe { PL011_DR.write_volatile(b); }
-    }
+    put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.
+");
     loop {
         // SAFETY: WFI is always valid; wait for an interrupt that never comes (halt).
         unsafe { core::arch::asm!("wfi"); }
     }
 }
+
+/// Transmit one byte, waiting for FIFO space with a **bounded** spin.
+///
+/// Every hardware wait in this kernel is bounded (invariant 12): a dead or absent UART must never hang
+/// the boot. On a board where the firmware left the UART off, the FIFO never drains - dropping the byte
+/// and continuing is right, because the alternative is a machine that appears bricked with no output at
+/// all to say why.
+fn put_byte(b: u8) {
+    let mut spins = 0u32;
+    // SAFETY: PL011_FR/PL011_DR are the flag and data registers of the board's UART, identity-mapped
+    // MMIO. The MMU is off at this point, so these are physical addresses.
+    unsafe {
+        while PL011_FR.read_volatile() & PL011_FR_TXFF != 0 {
+            spins += 1;
+            if spins > 1_000_000 { return; } // drop the byte rather than hang forever
+        }
+        PL011_DR.write_volatile(b);
+    }
+}
+
+fn put_str(s: &[u8]) {
+    for &b in s {
+        put_byte(b);
+    }
+}
+
 
 // ---- Boot info (shape shared with x86; a real port fills it from the DTB / UEFI) ----
 #[repr(C)]
@@ -127,6 +214,27 @@ pub fn usb_disk_flush() -> bool { false }
 /// arch cannot say (no calibrated counter rate yet), so the check stays off - see the x86 and arm
 /// implementations for what a real answer looks like.
 pub fn liveness_deadline_cycles() -> u64 { 0 }
+
+/// Hook called when the scheduler commits a **user** task. x86 ignores it; ARM records the slot so the
+/// timer runs its syscalls atomically. Nothing to do here yet.
+pub fn note_user_task(_slot: usize) {}
+
+// --- Framebuffer console backend (`crate::fbcon`) ---
+//
+// The neutral console owes each arch two things (see `crate::fbcon`'s module header). Until this port
+// maps the Pi's framebuffer there is nothing to publish, so `fb_commit` is a no-op and the console
+// simply never initialises - `fbcon::ready()` stays false and every entry point no-ops.
+
+/// No framebuffer is mapped yet, so the scroll strategy is moot. `false` is the conservative choice:
+/// it selects the repaint-from-shadow-grid path, which never reads the framebuffer back.
+pub const FB_READBACK_CHEAP: bool = false;
+
+/// Publish a written rectangle. Nothing to do until a framebuffer exists; when one does, this becomes
+/// either a cache clean (if it is mapped cacheable, as on the Pi 2) or a barrier.
+pub fn fb_commit(
+    _base: usize, _pitch: usize, _bpp: usize,
+    _x: usize, _y: usize, _w: usize, _h: usize,
+) {}
 
 pub fn usb_disk_busy() -> bool { false }
 /// Is there no USB disk attached at all? Distinct from busy - see `USB_DISK_ABSENT` in the syscall
@@ -202,6 +310,20 @@ pub mod page_tables {
     use crate::memory::frame::{Frame, PhysAddr};
 
     pub const PAGE_SIZE: usize = 4096;
+
+    /// Arch hook run once a service's address space is built. x86 needs nothing; ARM clones the kernel
+    /// identity mapping into it. No address spaces exist on this port yet.
+    ///
+    /// # Safety
+    /// `_root` must be a page-table root this task owns.
+    pub unsafe fn finalize_service_address_space(_root: u64) {}
+
+    /// Free a task's page-table root and the structure below it, at task death.
+    ///
+    /// # Safety
+    /// `_root` must belong to a task already marked Dead, after a TLB shootdown, so no page-walker can
+    /// still reach it.
+    pub unsafe fn free_page_table_root(_root: u64) {}
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     pub struct VirtAddr(pub u64);

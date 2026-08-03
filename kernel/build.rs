@@ -16,10 +16,19 @@ fn main() {
     if target == "x86_64-unknown-none" {
         println!("cargo:rustc-link-arg=-T{}", kernel_ld.display());
     }
+    // Two aarch64 layouts: QEMU `virt` loads at 0x4008_0000, the Pi 4's VideoCore firmware loads a
+    // flat kernel8.img at 0x80000. The `pi4` feature selects the board.
     let kernel_ld_aarch64 = workspace.join("kernel").join("kernel-aarch64.ld");
+    let kernel_ld_aarch64_pi4 = workspace.join("kernel").join("kernel-aarch64-pi4.ld");
     println!("cargo:rerun-if-changed={}", kernel_ld_aarch64.display());
+    println!("cargo:rerun-if-changed={}", kernel_ld_aarch64_pi4.display());
     if target == "aarch64-unknown-none" {
-        println!("cargo:rustc-link-arg=-T{}", kernel_ld_aarch64.display());
+        let script = if std::env::var("CARGO_FEATURE_PI4").is_ok() {
+            &kernel_ld_aarch64_pi4
+        } else {
+            &kernel_ld_aarch64
+        };
+        println!("cargo:rustc-link-arg=-T{}", script.display());
     }
     let kernel_ld_riscv64 = workspace.join("kernel").join("kernel-riscv64.ld");
     println!("cargo:rerun-if-changed={}", kernel_ld_riscv64.display());
