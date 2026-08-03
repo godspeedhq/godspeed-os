@@ -39,6 +39,8 @@
 > | 2. MMU | `MMU ON, TTBR0_EL1=0x89000 - this line is running translated`; identity map, 4 KiB granule, 39-bit VA, 2 MiB blocks, 20 KiB of tables |
 > | 3. Exception vectors | `VBAR_EL1=0x80800`, proven by a real `brk #0` reporting EC `0b111100` on vector 4 |
 > | 4. GIC-400 + timer | `CNTFRQ_EL0=54000000 Hz`, 100 Hz tick, `timer IRQs DELIVERING - 10 ticks` |
+> | 5. Context switch | Two kernel tasks ping-ponging; witnesses in callee-saved integer AND `d8`-`d15` verified on resume |
+> | 6. EL0 + `svc` | Dropped to EL0, syscall round trip checked in both directions, clean exit; ticks 13 -> 15 across the excursion, so IRQs stayed live at EL0 |
 >
 > The timer evidence is a rate check, not just a delivery check: the log timestamps put 10 ticks 111 ms
 > apart, which is 100 Hz. A wrong reload would still have delivered ten interrupts.
@@ -47,9 +49,19 @@
 > muxed to ALT0 with a pull-up on RX. Note BCM2711 replaced the Pi 2's `GPPUD`/`GPPUDCLK` strobe with
 > direct 2-bit-per-pin registers at `0xE4` - porting the old code verbatim would compile and do nothing.
 >
-> **Not done:** context switch, EL0/user mode, the `svc` syscall path, PSCI SMP, and `kernel_main`
-> itself. The rest of `arch/aarch64/` is still stubs; the neutral kernel is linked but not reached.
-> Next per §6 is the context switch, then user mode, then the neutral scheduler.
+> **The hard-won one: an EL0-accessible region is PXN at EL1.** The kernel may not execute what
+> userspace can reach - ARM's equivalent of x86 SMEP. Granting EL0 access to the 2 MiB block holding
+> the kernel's `.text` therefore makes the KERNEL non-executable, and the core dies on its next
+> instruction fetch with no way to report it (the handler cannot fetch its vector either). It cost two
+> hardware round trips, presenting first as `tlbi vmalle1` hanging and then as the MMU enable hanging -
+> the same fault landing wherever the new mapping took effect. EL0 code and stack now live in a
+> linker-placed, 2 MiB-aligned `.el0` region. A real consequence: the EL0 task cannot call kernel print
+> functions at all, and reports through a syscall argument instead.
+>
+> **Not done:** `BootInfo` with a real memory map (the VideoCore mailbox, not Limine), per-task page
+> tables, the neutral scheduler, PSCI SMP, and `kernel_main` itself. The remaining `arch/aarch64/`
+> surface is still stubs. Every mechanism a scheduler needs now exists and is hardware-proven; what
+> remains is wiring the neutral kernel onto them.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
 > init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already
