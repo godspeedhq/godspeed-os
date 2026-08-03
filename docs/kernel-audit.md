@@ -5,6 +5,40 @@
 
 
 
+## Audit 9 - the shared framebuffer console + a full-kernel sweep (2026-08-03, `main` @ v0.9.0)
+
+Scope: the ~1400 lines of `kernel/src/fbcon/` and the ARM input path shipped in v0.9.0 with no audit
+pass, plus a sweep of the whole kernel for the classes the Commandments name.
+
+**Verdict: 0 Commandment violations in the new code. 2 pre-existing defects found in the x86 page-table
+and MMIO-mapping path, both of the same shape.**
+
+| ID | Severity | Commandment | Finding |
+|----|----------|-------------|---------|
+| A9-1 | MED | Invariant 12, X | `walk_or_alloc` (`arch/x86_64/page_tables.rs:492`) does **not check `PAGE_SIZE_BIT`**. `PAGE_SIZE_BIT` is tested only in the read-only walk (lines 325/331). So if `map_in_active_tables` is ever called on a VA already covered by a 2 MiB or 1 GiB page, the walk treats that large page's **data frame** as a page table and `read_entry`/`write_entry` at `pt_idx(virt)` reads and writes 8 bytes *into that data*. Silent memory corruption, no error. It does not fire today only because both call sites target MMIO holes (IOAPIC, MSI-X BAR) that Limine's HHDM leaves unmapped, so the PD entry is absent and a fresh PT is allocated - **correct by accident, not by construction**, and nothing checks or documents the assumption. |
+| A9-2 | MED | V, §18.3 | Two call sites discard the mapping verdict and then immediately dereference the address: `ioapic.rs:68` (`let _ = map_in_active_tables(...)` then `unsafe { read(va, 0x01) }`) and `pci.rs:624` (same, then `write_volatile` to the MSI-X table). `map_in_active_tables` returns `Err(FrameAllocFailed)` when the allocator cannot supply a page-table frame. Both dereferences carry a SAFETY comment asserting the page was "just mapped" - an assertion the code throws away the evidence for. §18.3 requires a SAFETY comment to be *true*; here it is an assumption. |
+| A9-3 | LOW | V | `handle_remove_cap` (`syscall/dispatch.rs:1476`) returns `0` unconditionally, discarding whether the slot was actually held. A caller cannot distinguish "removed" from "there was nothing there". |
+| A9-4 | LOW (doc) | VII | `handle_resource_revoke` authorises by **ownership** (`revoke_owned(id, caller_endpoint)`), which is a *third* validation form. `kernel/src/syscall/CLAUDE.md` documents exactly two (cap-slot and holdings) and says "There are no exceptions to this rule". The code is **correct** - ownership is established only through the `RESOURCE_MINT`-gated `resource_mint`, so authority does derive from a capability and a task that never minted owns nothing - but an undocumented third form sits close enough to "authority by identity" (which VII forbids outright) that it needs to be written down rather than inferred. |
+
+**Clean results, stated because they are the point of auditing:**
+
+- **`kernel/src/fbcon/` (new, ~1400 lines): no discarded verdicts, no unbounded loops, no `unsafe`.**
+  The neutral console is `unsafe`-free by construction - the arch hands the framebuffer over as a
+  `&'static mut [u8]`, so `fbcon/` needed no §18.1 amendment to exist outside the four permitted layers.
+- **Every hardware wait in `arch/` is bounded.** 15 candidate `while`-on-MMIO loops were checked
+  individually; all carry an in-body counter or a real-time deadline and a loud report on expiry
+  (`dwc2` reset/port-enable, PL011 TX, the BCM2835 RNG, the GPU mailbox, x86 `apic_wait_icr_idle`).
+  Invariant 12 and Commandment VIII hold across the layer.
+- **46 syscall handlers; 41 validate a capability explicitly.** The 5 that do not are each justified:
+  `sleep` and `alloc_mem` are task-neutral (documented in the syscall table), `remove_cap` and
+  `take_pending_cap` act only on the caller's own table, and `resource_revoke` is A9-4 above.
+- **The shadow grid is not a second truth (III).** It is the source for repaint and the framebuffer is
+  its derived view; the cursor underline is the one thing painted outside it, and it is provably erased
+  before every scroll (`advance_line` is only reached from paths that call `cursor_off` first).
+- **The two `READY` flags (neutral `fbcon` and `arch/arm/fbcon.rs`) are a deliberate, documented
+  duplication**, not a III violation: the ARM copy exists because the pre-MMU serial path must touch
+  nothing but a plain load, and it reduces to the same event (`crate::fbcon::init` returning).
+
 ## Audit 8 - the liveness watchdog, the MMIO reclaim, and the idle contract (2026-07-31, `feat/arm-usb-interrupt`)
 
 **Scope:** `d8de0f2..HEAD` - the per-arch `liveness_deadline_cycles`, the arm32 device-MMIO reclaim

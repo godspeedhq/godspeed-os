@@ -7,6 +7,32 @@
 
 
 
+## Audit 8 - full-userspace sweep against the Commandments (2026-08-03, `main` @ v0.9.0)
+
+**Scope:** all of `services/`, `sdk/`, and `examples/` (~31k lines), swept for the violation classes the
+Commandments name, with attention to the shell paths the v0.9.0 console work touched.
+
+**Verdict: 0 Commandment violations. 1 LOW finding.**
+
+| ID | Severity | Commandment | Finding |
+|----|----------|-------------|---------|
+| A8-1 | LOW | VIII, V | The block-driver reply paths (`ahci.rs` lines 417-563, `sdhci.rs` 403-447) discard the verdict of `send_by_handle` when replying to a client. If a reply is ever dropped, the client stays blocked - and `ReplyDead` does **not** rescue it, because that fires when the *replier dies*, not when a live replier's reply fails to queue. So the one case the discarded verdict covers is exactly the case the kernel's death-wake cannot. Commandment VIII's "the truth must include failure" is about the waiter; this is the same requirement seen from the replier's side. Discarding is defensible when the client is already dead (nothing to do), but the code cannot currently tell the two apart. |
+
+**Clean results:**
+
+- **Zero `unsafe` in `services/` (§18.2)**, mechanically confirmed by `scripts/unsafe_check.py`.
+- **Every service `sleep` is CPU conservation, not a correctness wait (VIII).** All 13 sites are
+  drain-then-park (`xhci`/`ehci` idle loops), a paced repaint (`observe`, the shell's muted poll), or a
+  demo tick (`counter`). The one timing-shaped wait, the shell's bare-Escape timeout, is terminal
+  protocol - it counts scheduler quanta rather than cycles, which is why it is arch-portable.
+- **The `reacquire_by_name` discards are correct (V).** `fs` lines 355/411/515 and net-stack/shell sites
+  drop the boolean, but each sits inside a bounded loop whose *aggregate* failure is reported loudly -
+  `fs` logs "block-driver did not report capacity after bounded attempts - coming up storage-unavailable"
+  and keeps `storage_unreadable` set, so no failed recovery is converted into a silent success. This is
+  the pattern Commandment V asks for and it is the LS1 work holding.
+- **Contracts (IV):** `contract_check.py` reconciles all 6 contracts against their kernel
+  `service_config` (memory limit, placement core, ipc_send).
+
 ## Audit 7 - the wait helpers, the block-driver visibility, and the chaos harness (2026-07-31, `feat/arm-usb-interrupt`)
 
 **Scope:** `d8de0f2..HEAD` - the SDK wait-helper reversal, block-driver's slow-request reporting,

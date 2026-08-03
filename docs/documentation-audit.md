@@ -8,6 +8,24 @@
 > First audit: 2026-07-15.
 
 
+## Audit 3 - drift against the v0.9.0 console work (2026-08-03, `main`)
+
+**Scope:** `docs/`, `CLAUDE.md`, and the per-directory `CLAUDE.md` files, checked for claims the code no
+longer supports after the shared framebuffer console landed.
+
+**Verdict: 1 LOW finding. No misleading architectural claims.**
+
+| ID | Severity | Finding |
+|----|----------|---------|
+| A3-1 | LOW | `docs/console-service.md:177` enumerates the fbcon's ANSI support as "clear, cursor position, erase line, hide/show cursor". That list is now **incomplete**: the shared console also implements SGR reverse video (`ESC[7m`/`ESC[0m`), relative cursor movement (CUU/CUD/CUF/CUB), and erase-to-end-of-screen (`ESC[J`). An enumeration that silently falls behind the code is the drift this audit exists to catch - a reader planning console work would under-estimate what already exists. |
+
+**Clean results:** `kernel/CLAUDE.md` (module map + the `fbcon/` section), `kernel/src/arch/CLAUDE.md`
+(the porting checklist now names `fb_commit`/`FB_READBACK_CHEAP`), `kernel/src/arch/x86_64/CLAUDE.md`
+(the file table), `docs/CLAUDE.md` (indexes `logging.md`), `docs/unsafe-audit.md` (counts re-baselined
+to the 11 -> 3 reduction), and `docs/arm32-status.md` (the HAT section corrected from "it is the HAT" to
+the measured cable evidence) were all updated with the work rather than after it. The shell comment
+asserting reverse video is "a no-op on the fbcon" was corrected in the same commit that made it render.
+
 ## Audit 3 - stale documentation that actively caused wrong diagnoses (2026-07-31, `feat/arm-usb-interrupt`)
 
 **North-star restated:** the least-capable reader, cold, should not have to GUESS. This audit found the
