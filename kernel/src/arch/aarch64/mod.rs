@@ -23,6 +23,8 @@ pub mod gic;
 pub mod mmu;
 #[cfg(feature = "pi4")]
 pub mod timer;
+#[cfg(feature = "pi4")]
+pub mod usermode;
 
 /// Reload value for the periodic tick, in generic-timer counter ticks. The timer is one-shot, so the
 /// IRQ handler re-arms with this every time. Published here because the handler runs in an interrupt
@@ -305,6 +307,25 @@ extern "C" fn aarch64_boot_main() -> ! {
         put_str(b"aarch64: ticks since boot = ");
         put_dec(exceptions::TICKS.load(Ordering::Relaxed));
         put_str(b" (the timer kept running throughout)\r\n");
+    }
+
+    // --- EL0 + the svc syscall path ------------------------------------------------------------
+    #[cfg(feature = "pi4")]
+    {
+        // Bring-up shim: EL0 currently shares the kernel's identity map, so it needs AP granting EL0
+        // access to the low blocks holding this image and its stacks, plus the peripheral window it
+        // prints through. Real tasks get their own page tables (§10.1) and none of this.
+        mmu::allow_el0(0, 0x40_0000);
+        mmu::allow_el0(0xFE00_0000, 0xFE20_2000);
+        usermode::prepare();
+        if usermode::run() {
+            put_str(b"aarch64: EL0 + svc OK - dropped to EL0, syscall round trip checked, exited cleanly\r\n");
+        } else {
+            put_str(b"aarch64: WARN EL0/svc round trip did NOT check out\r\n");
+        }
+        put_str(b"aarch64: ticks since boot = ");
+        put_dec(exceptions::TICKS.load(Ordering::Relaxed));
+        put_str(b" (the timer ticked through EL0 too)\r\n");
     }
 
     put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.\r\n");

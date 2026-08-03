@@ -55,6 +55,16 @@ global_asm!(
     b    aarch64_trap_common
 .endm
 
+// Synchronous exceptions from a LOWER EL must return too - that is where `svc` lands, and a syscall
+// that halts the machine is not a syscall.
+.macro VECTOR_SYNC_LOWER kind
+    .align 7
+    sub  sp, sp, #272
+    stp  x0, x1, [sp, #0]
+    mov  x0, #\kind
+    b    aarch64_sync_lower_common
+.endm
+
 // IRQ vectors must RETURN, not report and halt - a timer tick that halts the machine is not a tick.
 .macro VECTOR_IRQ kind
     .align 7
@@ -76,7 +86,7 @@ aarch64_vectors:
     VECTOR_IRQ   5                 //                      IRQ
     VECTOR_ENTRY 6                 //                      FIQ
     VECTOR_ENTRY 7                 //                      SError
-    VECTOR_ENTRY 8                 // Lower EL, AArch64:   Synchronous
+    VECTOR_SYNC_LOWER 8            // Lower EL, AArch64:   Synchronous (svc lands here)
     VECTOR_IRQ   9                 //                      IRQ
     VECTOR_ENTRY 10                //                      FIQ
     VECTOR_ENTRY 11                //                      SError
@@ -118,10 +128,17 @@ aarch64_trap_common:
 
 // IRQ: save, handle, restore, return. The restore order matters - x2/x3 carry ELR/SPSR into their
 // system registers and are only reloaded with their real values afterwards.
+aarch64_sync_lower_common:
+    SAVE_REST
+    mov  x1, sp
+    bl   aarch64_sync_lower_dispatch  // (vector: u64, frame: *mut TrapFrame)
+    b    aarch64_exception_return
+
 aarch64_irq_common:
     SAVE_REST
     mov  x1, sp
     bl   aarch64_irq_dispatch      // (vector: u64, frame: *mut TrapFrame)
+aarch64_exception_return:
     ldr  x3,       [sp, #256]      // SPSR
     ldp  x30, x2,  [sp, #240]      // x30, ELR
     msr  elr_el1,  x2
@@ -239,6 +256,32 @@ extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
         super::timer::arm(super::TIMER_INTERVAL.load(core::sync::atomic::Ordering::Relaxed));
     }
     super::gic::eoi(id);
+}
+
+/// Exception class for `SVC` taken from AArch64.
+const EC_SVC64: u64 = 0b010101;
+
+/// Synchronous exception from a lower EL. Today that means `svc` from EL0.
+///
+/// The syscall number is the `imm16` the instruction carried, which the hardware puts in the low 16
+/// bits of `ESR_EL1` - reading it from there rather than from a register means userspace cannot lie
+/// about which call it made by clobbering a register on the way in.
+///
+/// Anything that is NOT an SVC is a genuine userspace fault (a bad address, an illegal instruction).
+/// Those still report and halt: killing the task is what a real port does, and there is no task
+/// structure to kill yet. Reporting beats returning to re-fault forever.
+#[no_mangle]
+extern "C" fn aarch64_sync_lower_dispatch(vector: u64, frame: *mut TrapFrame) {
+    let esr: u64;
+    // SAFETY: reading ESR_EL1 at EL1 is side-effect-free and describes the exception just taken.
+    unsafe { core::arch::asm!("mrs {}, esr_el1", out(reg) esr, options(nomem, nostack)) };
+    if (esr >> 26) & 0x3F != EC_SVC64 {
+        aarch64_trap_report(vector, frame);
+    }
+    let imm = esr & 0xFFFF;
+    // SAFETY: `frame` is the trap frame the vector assembly built on the current stack.
+    let f = unsafe { &mut *frame };
+    super::usermode::syscall(imm, f);
 }
 
 /// Report an exception and halt.

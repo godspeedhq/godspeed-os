@@ -168,6 +168,34 @@ pub fn enable() -> u64 {
     ttbr
 }
 
+/// Grant EL0 access to the 2 MiB blocks covering `[start, end)`.
+///
+/// **This is a bring-up shim, not the address-space model.** Real tasks get their own page tables with
+/// only their own pages mapped (§10.1); this flips `AP` on blocks in the single identity map that
+/// everything currently shares, which means the EL0 code it enables can reach kernel memory. It exists
+/// to prove the EL0 entry and `svc` return path in isolation, before per-task tables exist, and the
+/// caller is expected to be a bring-up demo rather than anything that outlives it.
+///
+/// `AP[1]` (bit 6) set turns `EL1 RW / EL0 none` into `EL1 RW / EL0 RW`. Execution needs `UXN` clear,
+/// which it already is for Normal memory.
+pub fn allow_el0(start: u64, end: u64) {
+    // SAFETY: L2 is this module's static, already populated by `enable`. Writing descriptors for
+    // blocks we built is in-bounds; the TLB is invalidated below so no stale translation survives.
+    unsafe {
+        let l2 = &raw mut L2;
+        let mut pa = start & !(BLOCK_SIZE - 1);
+        while pa < end {
+            let l1_idx = (pa / (ENTRIES as u64 * BLOCK_SIZE)) as usize;
+            let l2_idx = ((pa / BLOCK_SIZE) % ENTRIES as u64) as usize;
+            if l1_idx < L1_USED {
+                (*l2)[l1_idx].0[l2_idx] |= 1 << 6; // AP[1]: EL0 gains the access EL1 has
+            }
+            pa += BLOCK_SIZE;
+        }
+        core::arch::asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb", options(nostack));
+    }
+}
+
 /// Whether translation is currently on, read back from `SCTLR_EL1.M` rather than assumed.
 pub fn is_enabled() -> bool {
     let sctlr: u64;
