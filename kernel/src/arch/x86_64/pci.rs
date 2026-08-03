@@ -621,7 +621,27 @@ pub fn program_msix(bdf: u32, vector: u8, dest_apic: u8) -> bool {
                     | PageFlags::PCD.bits();
                 // SAFETY: page-aligned MMIO page (the device's MSI-X table BAR), uncached;
                 // already-present is a no-op.
-                let _ = unsafe { map_in_active_tables(va_page, page_phys, flags) };
+                let mapped = unsafe { map_in_active_tables(va_page, page_phys, flags) };
+                // CHECK the verdict. This used to be `let _ =`, and the MSI-X table writes below went
+                // ahead regardless (kernel-audit A9-2). `map_in_active_tables` can fail with
+                // `FrameAllocFailed`, and writing an unmapped VA is a ring-0 page fault. Declining
+                // leaves the caller to fall back to legacy INTx, which is a working outcome; faulting
+                // is not.
+                if let Err(e) = mapped {
+                    if crate::arch::x86_64::page_tables::entry_for_va(va_page).is_none() {
+                        crate::kprintln!(
+                            "pci: MSI-X table map FAILED ({:?}) for {:#x} - declining MSI-X, \
+                             caller should fall back to INTx",
+                            e, page_phys
+                        );
+                        return false;
+                    }
+                    crate::kprintln!(
+                        "pci: MSI-X table page {:#x} was already mapped ({:?}); using it, but the \
+                         requested uncached (PCD|PWT) flags were NOT applied",
+                        page_phys, e
+                    );
+                }
             }
             let entry = hhdm.wrapping_add(tbl_phys); // table entry 0 (16 bytes)
             // SAFETY: `entry` addresses MSI-X table entry 0 in the just-mapped MMIO page.

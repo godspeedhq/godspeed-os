@@ -493,6 +493,20 @@ fn walk_or_alloc(table_phys: u64, idx: usize, flags: u64) -> Result<u64, MapErro
     // SAFETY: table_phys valid (caller chain guarantees it).
     let entry = unsafe { read_entry(table_phys, idx) };
     if entry_present(entry) {
+        // A large-page entry (PS=1) maps DATA directly - it is NOT a pointer to a child table.
+        //
+        // Without this check the walk took the mapped frame's address as if it were a page table and
+        // `read_entry`/`write_entry` at the next index then read and wrote 8 bytes **into whatever
+        // occupies that frame**: silent memory corruption, reported as success. The read-only walk
+        // (`entry_for_va`) has always made this distinction; this path never did (kernel-audit A9-1).
+        //
+        // It has not fired to date only because every caller targets an MMIO hole, and Limine's HHDM
+        // covers RAM but not MMIO - so the entry is absent and a fresh table gets allocated. That made
+        // the code correct by accident. `AlreadyMapped` makes it correct by construction, and says
+        // something true besides: the address IS mapped, just not by us and not with our flags.
+        if entry & PAGE_SIZE_BIT != 0 {
+            return Err(MapError::AlreadyMapped);
+        }
         return Ok(entry_phys(entry));
     }
 
