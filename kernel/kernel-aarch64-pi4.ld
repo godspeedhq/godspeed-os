@@ -65,5 +65,11 @@ SECTIONS {
     . = ALIGN(0x200000);
     __el0_end = .;
 
+    /* End of everything the image occupies. `memmap` carves this range out of
+     * usable RAM, so it must sit after the LAST thing the kernel owns - both the
+     * boot stack and the EL0 region are above .bss, and a map built from
+     * __bss_end alone would hand the allocator the stack it is standing on. */
+    __kernel_end = .;
+
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) *(.eh_frame_hdr) *(.ARM.attributes) }
 }

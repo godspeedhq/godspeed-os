@@ -51,6 +51,13 @@ pi4 = []
 # Commandment IX: "If recovery cannot be tested, it does not exist." Off by default; test builds only.
 # See `arch/x86_64/pci.rs::msi_ordering` and `docs/kernel-audit.md` Audit 9.
 mmio-map-fault-test = []
+# Inject synthetic memory banks that extend past the identity-map limit, so `memmap`'s clamp is
+# EXERCISED rather than merely reasoned about. The clamp matters on an 8 GiB Pi 4, whose firmware
+# reports banks above 4 GiB that the low-4-GiB identity map does not reach - recording those as usable
+# would hand the allocator RAM with no translation. QEMU's `raspi4b` is fixed at 2 GiB, so the
+# condition cannot be reached by configuration. Commandment IX: "If recovery cannot be tested, it does
+# not exist." Off by default; test builds only. See `arch/aarch64/memmap.rs`.
+memmap-clamp-test = []
 # Run the minimal ARM logger spawn at boot (arch/arm/spawn.rs). Off by default: the spawn currently
 # reaches PL0 and issues real syscalls, but the kernel's cap-table spinlock (LDREX/STREX) does not yet
 # work under the service's dual-mapped address space, so the boot would block. Gated so the default

@@ -20,6 +20,10 @@ pub mod exceptions;
 #[cfg(feature = "pi4")]
 pub mod gic;
 #[cfg(feature = "pi4")]
+pub mod mailbox;
+#[cfg(feature = "pi4")]
+pub mod memmap;
+#[cfg(feature = "pi4")]
 pub mod mmu;
 #[cfg(feature = "pi4")]
 pub mod timer;
@@ -135,6 +139,19 @@ fn pl011_init() {
 #[link_section = ".text.boot"]
 pub unsafe extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
+        // --- Save the boot handoff BEFORE touching x0 ----------------------------------------
+        // The firmware branches here with the **device tree pointer in x0** (the Linux AArch64 boot
+        // protocol, which the Pi's stock firmware follows). The very next instruction clobbers x0, so
+        // it is stashed in a callee-saved register first and stored once `.bss` is zeroed - storing it
+        // before then would be overwritten by the zeroing loop.
+        //
+        // The DTB matters because it is the AUTHORITATIVE memory map on this board. The mailbox's
+        // legacy GET-ARM-MEMORY tag returns a 32-bit size and, on firmware configured the usual way,
+        // describes only the low portion of a >1 GiB board. Keeping the pointer costs one register and
+        // leaves the door open; throwing it away would mean re-deriving the map from something worse.
+        //
+        // x19 survives the `eret` below - exception return does not alter general-purpose registers.
+        "mov  x19, x0",
         // --- Drop to EL1 if we entered at EL2 -------------------------------------------------
         // QEMU `virt -kernel` enters at EL1, but the Pi 4's armstub hands the primary core over at
         // **EL2**. At EL2 the EL1 system registers below are writable but do not govern us, and FP/SIMD
@@ -181,6 +198,7 @@ pub unsafe extern "C" fn _start() -> ! {
         "str  xzr, [x1], #8",
         "b    1b",
         "3:",
+        "mov  x0, x19",                      // hand the DTB pointer to Rust as the first argument
         "bl   {main}",                       // -> aarch64_boot_main (never returns)
         "2:",
         "wfe",
@@ -191,7 +209,7 @@ pub unsafe extern "C" fn _start() -> ! {
 
 /// Rust side of boot. Milestone 1: write a line to the PL011 and halt. Later this grows into the real
 /// init (MMU, EL1 exceptions, GIC, generic timer, PSCI) and finally calls the neutral `kernel_main`.
-extern "C" fn aarch64_boot_main() -> ! {
+extern "C" fn aarch64_boot_main(dtb: u64) -> ! {
     // Report the exception level we ended up in, not just that we printed something. On the Pi 4 the
     // armstub hands the primary core over at EL2 and `_start` drops to EL1; on QEMU `virt` we arrive at
     // EL1 already. Either way this must say EL1 - if it says EL2 the drop silently did not happen, and
@@ -216,6 +234,23 @@ extern "C" fn aarch64_boot_main() -> ! {
     });
     if el != 1 {
         put_str(b"aarch64: WARN not at EL1 - the EL2 drop did not happen; FP/SIMD will trap\r\n");
+    }
+
+    // Ask the firmware about the machine BEFORE the MMU and caches come on. The GPU reads the request
+    // buffer straight out of RAM, so a cacheable buffer would need explicit maintenance; asking now
+    // makes that a non-question. See `mailbox` for the full reasoning.
+    #[cfg(feature = "pi4")]
+    {
+        let info = mailbox::query();
+        mailbox::report(&info);
+
+        // The device tree is the authoritative map; the mailbox tag is the fallback. Both are read
+        // here, with caches off, and the result is kept for the allocator.
+        put_str(b"aarch64: device tree pointer (x0 at entry) = ");
+        put_hex(dtb);
+        put_str(b"\r\n");
+        let (map, source) = memmap::build(dtb, &info);
+        memmap::report(map, source);
     }
 
     // Turn translation on. The map is identity, so the PC, the stack and the UART all keep the

@@ -41,6 +41,7 @@
 > | 4. GIC-400 + timer | `CNTFRQ_EL0=54000000 Hz`, 100 Hz tick, `timer IRQs DELIVERING - 10 ticks` |
 > | 5. Context switch | Two kernel tasks ping-ponging; witnesses in callee-saved integer AND `d8`-`d15` verified on resume |
 > | 6. EL0 + `svc` | Dropped to EL0, syscall round trip checked in both directions, clean exit; ticks 13 -> 15 across the excursion, so IRQs stayed live at EL0 |
+> | 7. Memory map | Device tree + mailbox read before the MMU; banks split around the kernel image and clamped to the identity map (QEMU first, board pending) |
 >
 > The timer evidence is a rate check, not just a delivery check: the log timestamps put 10 ticks 111 ms
 > apart, which is 100 Hz. A wrong reload would still have delivered ten interrupts.
@@ -58,10 +59,41 @@
 > linker-placed, 2 MiB-aligned `.el0` region. A real consequence: the EL0 task cannot call kernel print
 > functions at all, and reports through a syscall argument instead.
 >
-> **Not done:** `BootInfo` with a real memory map (the VideoCore mailbox, not Limine), per-task page
-> tables, the neutral scheduler, PSCI SMP, and `kernel_main` itself. The remaining `arch/aarch64/`
-> surface is still stubs. Every mechanism a scheduler needs now exists and is hardware-proven; what
-> remains is wiring the neutral kernel onto them.
+> **Milestone 7 - the memory map, and where it comes from.** The ARM is not told how much RAM it has.
+> Two sources are read, both **before the MMU and caches come on** (the GPU reads the request buffer
+> straight out of RAM, so asking early removes the cache-maintenance question rather than answering it):
+>
+> - **The device tree**, pointer in `x0` at entry - authoritative, full 64-bit banks. `_start` was
+>   throwing this pointer away: its very first instruction (`mrs x0, CurrentEL`) clobbered `x0`. It is
+>   now stashed in `x19`, which survives the `eret`, and handed to Rust.
+> - **The mailbox** `GET ARM MEMORY` tag - a deliberately weak fallback. It returns a 32-bit base and
+>   size, so it cannot describe RAM above 4 GiB and under-reports a >1 GiB board. Which source was used
+>   is **printed**, because "960 MiB" means something different depending on whether it is the machine's
+>   RAM or merely all the fallback could describe.
+>
+> The device tree is **untrusted firmware input**, parsed accordingly: every offset bounds-checked
+> against the header's own `totalsize` before it is read, the walk iteration-bounded, and anything that
+> fails to parse yielding no map rather than a partially-believed one. Root `#address-cells` /
+> `#size-cells` are read, not assumed - they set the width of every field in `reg`, and guessing them
+> mis-parses every address on a board that differs.
+>
+> **The map is clamped to what the identity map actually reaches**, and that clamp is the part worth
+> knowing about. The identity map covers the low 4 GiB; an 8 GiB Pi 4's firmware reports banks above it.
+> Recording those as usable would hand the allocator RAM with no translation - a fault much later,
+> blamed on whatever touched it. Dropping capacity is the safe direction, and the drop is reported.
+> QEMU's `raspi4b` is fixed at 2 GiB, so the condition cannot be reached by configuration; the
+> `memmap-clamp-test` feature injects synthetic over-limit banks and both paths were observed firing
+> (an 8 GiB bank truncated, a 6 GiB bank dropped). Commandment IX - a guard never seen firing is not
+> evidence that it fires.
+>
+> Verified against the real `bcm2711-rpi-4-b.dtb`. Worth knowing: that file's `/memory` node is a
+> **zero-size placeholder** (`reg = <0x0 0x0 0x0>`) which the firmware patches at boot, so a parser
+> tested only against the on-disk file would conclude the board has no RAM.
+>
+> **Not done:** assembling this into the arch's `BootInfo` and handing it to the neutral allocator,
+> per-task page tables, the neutral scheduler, PSCI SMP, and `kernel_main` itself. The remaining
+> `arch/aarch64/` surface is still stubs. Every mechanism a scheduler needs now exists and is
+> hardware-proven; what remains is wiring the neutral kernel onto them.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
 > init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already

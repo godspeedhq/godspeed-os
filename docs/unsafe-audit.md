@@ -13,6 +13,31 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4 milestone 7: the memory map (feat/pi4-aarch64)
+
+The board does not tell the ARM how much RAM it has unless asked. Two sources are read, both before the
+MMU and caches come on: the **device tree** the firmware passes in `x0` (authoritative), and the
+**mailbox** `GET ARM MEMORY` tag (a fallback that cannot describe RAM above 4 GiB and, on the usual
+firmware configuration, under-reports a board with more than 1 GiB).
+
+Both are **untrusted firmware input**, and the `unsafe` here is dominated by that fact rather than by
+the hardware access. Every device-tree offset is bounds-checked against the header's own `totalsize`
+before it is read, the structure walk is iteration-bounded, and anything that fails to parse yields
+`None` rather than a partially-believed map. That asymmetry is deliberate: a map that is wrong in the
+safe direction costs capacity, while one that is wrong in the unsafe direction hands the allocator RAM
+that does not exist and surfaces much later as corruption.
+
+`_start` also gained one instruction, and it closes a real hole: the firmware hands over the device-tree
+pointer in `x0`, and the first instruction of the EL2 check clobbered `x0`. The pointer was being thrown
+away before anything could read it. It is now stashed in `x19` (which survives the `eret`) and stored
+after `.bss` is zeroed.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mailbox.rs` | new, 3 | (1) The mailbox handshake: volatile reads of `MBOX_STATUS`/`MBOX_READ` and a write to `MBOX_WRITE`, all identity-mapped Device memory, both waits bounded so a silent GPU cannot hang the boot (invariant 12). (2)+(3) Staging the request in a module-owned 16-byte-aligned static and reading the reply back, during single-threaded boot with caches off - which is the point: the GPU reads the buffer out of RAM directly, so running before `mmu::enable` removes the cache-maintenance question rather than answering it. |
+| `arch/aarch64/memmap.rs` | new, 7 | (1) Reading the linker's `__kernel_end` - taking a symbol's address does not dereference it. (2)-(4) The three bounds-checked device-tree accessors (`u32_at`, `u8_at`, and the header/magic read in `open`); each refuses any offset outside `totalsize` BEFORE reading, so a malformed blob produces `None` rather than a wild read. (5)+(6) Building the region array in a module-owned `.bss` static during single-threaded boot. (7) Handing that array out as a `&'static [MemoryRegion]` - the storage is static and the slice is read-only and never rebuilt. |
+| `arch/aarch64/mod.rs` | 28 -> 28 (net 0) | The `_start` change is inside the existing `naked_asm!` block, so the count is unchanged: `mov x19, x0` before the EL2 check preserves the device-tree pointer, and `mov x0, x19` hands it to Rust. |
+
 ## 2026-08-03 - Pi 4: EL0 gets its own 2 MiB region (feat/pi4-aarch64)
 
 Follow-up to milestone 6, after two hardware failures traced to one cause.
@@ -1237,6 +1262,8 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 3 | permitted |
 | arch/aarch64/usermode.rs | 11 | permitted |
+| arch/aarch64/mailbox.rs | 3 | permitted |
+| arch/aarch64/memmap.rs | 7 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |

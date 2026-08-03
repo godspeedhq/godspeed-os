@@ -37,6 +37,13 @@ const ENTRIES: usize = 512;
 /// How much of the physical address space we identity-map: the low 4 GiB, which covers the Pi 4's RAM
 /// and every peripheral window. Four L1 entries at 1 GiB each.
 const L1_USED: usize = 4;
+
+/// One past the highest physical address the identity map reaches.
+///
+/// Exported because `memmap` must clamp the firmware's memory map to it: an 8 GiB Pi 4 reports banks
+/// above 4 GiB, and recording those as usable would hand the allocator RAM that is never mapped. The
+/// two numbers must agree, so there is exactly one of them.
+pub const IDENTITY_MAP_LIMIT: u64 = (L1_USED as u64) * 1024 * 1024 * 1024;
 /// Bytes described by one L2 block descriptor.
 const BLOCK_SIZE: u64 = 2 * 1024 * 1024;
 
