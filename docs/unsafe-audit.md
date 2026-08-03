@@ -13,6 +13,33 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4 milestone 14: `ptables` becomes the real `page_tables::PageTable` (feat/pi4-aarch64)
+
+`loader.rs` calls `arch::imp::page_tables::PageTable::new()`, which was still the `unimplemented!()`
+stub - so no service ELF could be loaded no matter what else worked. The hardware-proven implementation
+is now wired in behind the neutral signature (`map(VirtAddr, PhysAddr, PageFlags)`), and the arch-native
+form is kept as `map_raw` for the EL0 bring-up path.
+
+The flag translation has one decision worth naming: **`PCD | PWT`**. On x86 those disable caching for an
+MMIO mapping; the faithful AArch64 equivalent is not "uncached Normal" but the **Device** attribute,
+which additionally forbids the reordering, merging and speculative repetition that make a wrongly-typed
+MMIO mapping misbehave in ways no fault points at.
+
+Two hooks that were empty stubs now have bodies, and one is deliberately still empty:
+`free_page_table_root` frees the table tree; `reclaim_user_frames` frees the leaf pages (an empty stub
+there would not fail loudly - it would leak every page of every task that ever died, surfacing only as
+the machine slowly running out of memory); and `finalize_service_address_space` is genuinely a no-op,
+because unlike the 32-bit port there is no kernel map to clone into a new space.
+
+Reclaim is **proven, not assumed**: the selftest now maps extra pages, hands the space to
+`reclaim_user_frames`, and checks both the count returned and the allocator's free total - `4 pages
+reclaimed, all frames returned`.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 45 -> 50 (+5) | `free_page_table_root` and `reclaim_user_frames` forwarding to `ptables`, plus the selftest's reclaim exercise (mapping extra pages and calling reclaim on the space). |
+| `arch/aarch64/ptables.rs` | 19 (net 0) | `reclaim_pages` walks the tree and frees each leaf, using the same `get`/`set` accessors already audited; the kernel-copy loop it replaces was the same count. |
+
 ## 2026-08-03 - Pi 4 milestone 12: an EL0 task in its own address space (feat/pi4-aarch64)
 
 The payoff of the TTBR1 split, and the first place the separation is enforced by hardware rather than
@@ -1399,7 +1426,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 45 | permitted |
+| arch/aarch64/mod.rs | 50 | permitted |
 | arch/aarch64/exceptions.rs | 7 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |

@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-11 done on real hardware; 12-13 (EL0 task, SDK ABI) in QEMU (2026-08-03)
+> ## STATUS: milestones 1-11 done on real hardware; 12-14 in QEMU (2026-08-03)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -320,6 +320,26 @@
 > fail when a service calls them. AArch64 has no trapping integer divide (like ARMv7), so
 > `fault_divide_by_zero` is `udf #0`; and it has a genuine non-canonical analog in the **VA hole**
 > between the `TTBR0` and `TTBR1` ranges, which no mapping can ever make valid.
+>
+> **Milestone 14 - `ptables` becomes the real `page_tables::PageTable`.** `loader.rs` was calling the
+> `unimplemented!()` stub, so no service ELF could load no matter what else worked. The
+> hardware-proven implementation is now behind the neutral signature, with the arch-native form kept as
+> `map_raw` for the EL0 path - so the bring-up path and the real ELF path share one flag translation
+> rather than two that could drift.
+>
+> The translation has one decision worth naming: **`PCD | PWT`**. On x86 those disable caching for MMIO;
+> the faithful AArch64 equivalent is not "uncached Normal" but the **Device** attribute, which
+> additionally forbids the reordering, merging and speculative repetition that make a wrongly-typed MMIO
+> mapping misbehave in ways no fault points at.
+>
+> Two hooks gained bodies and one is deliberately still empty: `free_page_table_root` frees the table
+> tree, `reclaim_user_frames` frees the leaf pages, and `finalize_service_address_space` is a genuine
+> no-op because - unlike the 32-bit port - there is no kernel map to clone into a new space.
+>
+> Reclaim is **proven rather than assumed**, because it is the one that fails silently: an empty stub
+> would leak every page of every task that ever died and show up only as the machine slowly running out
+> of memory. The selftest maps extra pages, reclaims the space, and checks both the count and the
+> allocator's free total - `4 pages reclaimed, all frames returned`.
 >
 > **Not done:** the user-pointer copy seam (`validate_user_ptr` / `read_user_bytes` / `write_user_bytes`
 > still return `false`/`None`), real syscall dispatch into the neutral handler, wiring `ptables` in as

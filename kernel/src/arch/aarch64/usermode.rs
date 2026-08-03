@@ -27,7 +27,7 @@
 
 use super::context::TaskContext;
 use super::exceptions::TrapFrame;
-use super::ptables::PageTable;
+use super::page_tables::{PageFlags, PageTable, VirtAddr};
 use super::{put_dec, put_hex, put_str};
 use crate::memory::allocator::{alloc_frame, free_frame};
 use crate::memory::frame::Frame;
@@ -172,11 +172,25 @@ fn build() -> Option<UserTask> {
         core::ptr::copy_nonoverlapping(src, dst, len);
     }
 
-    // Code: user, read-only, executable. Stack: user, writable, NOT executable.
-    space.map(USER_CODE_VA, code.phys_addr().0, true, false, true).ok()?;
-    space.map(USER_STACK_VA, stack.phys_addr().0, true, true, false).ok()?;
+    // Code: user, read-only, executable. Stack: user, writable, NOT executable. Expressed in the
+    // neutral `PageFlags` the loader uses, so this path and the real ELF path go through the same
+    // translation rather than two that could drift.
+    space
+        .map(
+            VirtAddr(USER_CODE_VA),
+            code.phys_addr(),
+            PageFlags::PRESENT | PageFlags::USER,
+        )
+        .ok()?;
+    space
+        .map(
+            VirtAddr(USER_STACK_VA),
+            stack.phys_addr(),
+            PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE | PageFlags::NO_EXEC,
+        )
+        .ok()?;
 
-    let ttbr = space.ttbr();
+    let ttbr = space.cr3_value();
     Some(UserTask { space, code, stack, ttbr })
 }
 

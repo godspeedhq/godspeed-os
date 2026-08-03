@@ -498,7 +498,7 @@ fn page_table_selftest() {
     // SAFETY: a frame the allocator just handed us, reached through the kernel's direct map.
     unsafe { (hhdm(canary_pa) as *mut u64).write_volatile(MAGIC ^ 0xFFFF) };
 
-    let mut pt = match ptables::PageTable::new() {
+    let mut pt = match page_tables::PageTable::new() {
         Ok(p) => p,
         Err(_) => { crate::kprintln!("aarch64: WARN page-table selftest could not build a space"); return; }
     };
@@ -511,12 +511,22 @@ fn page_table_selftest() {
     // SAFETY: ours, reached through the direct map.
     unsafe { (hhdm(data_pa) as *mut u64).write_volatile(MAGIC) };
 
-    if pt.map(TEST_VA, data_pa, false, true, false).is_err() {
+    let test_flags = page_tables::PageFlags::PRESENT
+        | page_tables::PageFlags::WRITABLE
+        | page_tables::PageFlags::NO_EXEC;
+    if pt
+        .map(
+            page_tables::VirtAddr(TEST_VA),
+            crate::memory::frame::PhysAddr(data_pa),
+            test_flags,
+        )
+        .is_err()
+    {
         crate::kprintln!("aarch64: WARN page-table selftest map failed");
         return;
     }
 
-    let new_ttbr = pt.ttbr();
+    let new_ttbr = pt.cr3_value();
     let old_ttbr: u64;
     // SAFETY: reading TTBR0_EL1 is side-effect free.
     unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) old_ttbr, options(nomem, nostack)) };
@@ -550,23 +560,43 @@ fn page_table_selftest() {
     let mapped_ok = through_va == MAGIC;
     let canary_ok = canary_back == (MAGIC ^ 0xFFFF);
 
-    // Reclaim: unmap gives the data frame back, dropping the table frees every table frame.
-    let unmapped = pt.unmap(TEST_VA).is_ok();
+    // Exercise RECLAIM as well, because it is the path that fails silently: a reclaim that frees
+    // nothing leaks every page of every task that ever dies, and shows up only as the machine slowly
+    // running out of memory with nothing to point at. Map a few extra pages, hand the whole space to
+    // `reclaim_user_frames`, and check both the count it reports and the frames it actually returned.
+    let mut extra = 0usize;
+    for i in 1..4u64 {
+        if let Some(f) = alloc_frame() {
+            if pt.map(page_tables::VirtAddr(TEST_VA + i * 0x1000), f.phys_addr(), test_flags).is_ok() {
+                extra += 1;
+            }
+        }
+    }
+    let before_reclaim = free_frame_count();
+    // SAFETY: nothing is executing under this space - TTBR0 was switched back above - so freeing the
+    // pages it maps cannot pull memory out from under a live task.
+    let reclaimed = unsafe { page_tables::reclaim_user_frames(pt.cr3_value()) };
+    let reclaim_ok = reclaimed == extra + 1 && free_frame_count() == before_reclaim + reclaimed;
+
+    // The data frame went back via reclaim, so `unmap` must now report it as already gone.
+    let unmapped = pt.unmap(page_tables::VirtAddr(TEST_VA)).is_err();
     drop(pt);
-    // SAFETY: both frames came from the allocator and are freed exactly once.
-    unsafe { free_frame(data); free_frame(canary_frame); }
+    // `data` was returned by reclaim, so only the canary is still ours to free.
+    // SAFETY: `canary_frame` came from the allocator and is freed exactly once.
+    unsafe { free_frame(canary_frame) };
+    let _ = data;
 
     let after = free_frame_count();
-    if mapped_ok && canary_ok && unmapped && after == before {
+    if mapped_ok && canary_ok && unmapped && reclaim_ok && after == before {
         crate::kprintln!(
             "aarch64: per-task page table OK - own space built, TTBR0 swapped and read through, \
-             kernel reachable under it, all frames reclaimed ({} free)",
-            after
+             kernel reachable under it, {} pages reclaimed, all frames returned ({} free)",
+            reclaimed, after
         );
     } else {
         crate::kprintln!(
-            "aarch64: WARN page-table selftest FAILED - mapped={} canary={} unmapped={} frames {} -> {}",
-            mapped_ok, canary_ok, unmapped, before, after
+            "aarch64: WARN page-table selftest FAILED - mapped={} canary={} unmapped={} reclaim={} ({} of {}) frames {} -> {}",
+            mapped_ok, canary_ok, unmapped, reclaim_ok, reclaimed, extra + 1, before, after
         );
     }
 }
@@ -978,8 +1008,12 @@ pub mod page_tables {
 
     pub const PAGE_SIZE: usize = 4096;
 
-    /// Arch hook run once a service's address space is built. x86 needs nothing; ARM clones the kernel
-    /// identity mapping into it. No address spaces exist on this port yet.
+    /// Arch hook run once a service's address space is built.
+    ///
+    /// **Nothing to do here, and that is the point.** The 32-bit ARM port clones the kernel identity
+    /// map into every new service table at this hook, because its kernel is reached through `TTBR0`.
+    /// This port's kernel lives in `TTBR1`, so a task's table needs no kernel entries at all and there
+    /// is nothing to finalize. A genuinely empty hook, not an unimplemented one.
     ///
     /// # Safety
     /// `_root` must be a page-table root this task owns.
@@ -988,8 +1022,14 @@ pub mod page_tables {
     /// Free a task's page-table root and the structure below it, at task death.
     ///
     /// # Safety
-    /// `_root` must belong to a task already marked Dead, after a TLB shootdown, so no page-walker can
+    /// `root` must belong to a task already marked Dead, after a TLB shootdown, so no page-walker can
     /// still reach it.
+    #[cfg(feature = "pi4")]
+    pub unsafe fn free_page_table_root(root: u64) {
+        // SAFETY: caller's contract - the space is dead and unreachable.
+        unsafe { super::ptables::free_all(root) }
+    }
+    #[cfg(not(feature = "pi4"))]
     pub unsafe fn free_page_table_root(_root: u64) {}
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1010,7 +1050,14 @@ pub mod page_tables {
     #[derive(Debug)]
     pub enum MapError { FrameAllocFailed, AlreadyMapped, NotMapped }
 
+    /// On the Pi 4 this IS the real implementation (`ptables`), hardware-proven since milestone 10.
+    /// The stub below remains for the QEMU `virt` demarcation build, which only has to compile.
+    #[cfg(feature = "pi4")]
+    pub use super::ptables::PageTable;
+
+    #[cfg(not(feature = "pi4"))]
     pub struct PageTable { root: u64 }
+    #[cfg(not(feature = "pi4"))]
     impl PageTable {
         pub fn new() -> Result<Self, MapError> { unimplemented!() }
         pub fn map(&mut self, virt: VirtAddr, phys: PhysAddr, flags: PageFlags) -> Result<(), MapError> { unimplemented!() }
@@ -1053,6 +1100,19 @@ pub mod page_tables {
     pub fn entry_for_va(virt: u64) -> Option<u64> { None }
     pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {}
     pub fn harden_hhdm_nx() {}
+    /// Free every page a dead task mapped, returning how many.
+    ///
+    /// An empty stub here would not fail loudly - it would leak every frame of every task that ever
+    /// died, and only show up as the machine slowly running out of memory with nothing to point at.
+    ///
+    /// # Safety
+    /// `cr3` must belong to a task already Dead, with `TTBR0_EL1` switched away and invalidated.
+    #[cfg(feature = "pi4")]
+    pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
+        // SAFETY: caller's contract.
+        unsafe { super::ptables::reclaim_pages(cr3) }
+    }
+    #[cfg(not(feature = "pi4"))]
     pub unsafe fn reclaim_user_frames(cr3: u64) -> usize { 0 }
 }
 

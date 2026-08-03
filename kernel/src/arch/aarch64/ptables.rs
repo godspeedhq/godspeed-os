@@ -1,38 +1,30 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Per-task page tables for the Raspberry Pi 4.
 //!
-//! An address space here is a full L1 plus **its own copies** of the four kernel L2 tables, and that
-//! copy is the whole design decision. The alternative - pointing each task's L1 at the *shared* kernel
-//! L2s - is what the 32-bit ARM port does, and it costs less memory but buys two sharp edges:
+//! An address space here is **one frame**, holding the task and nothing else. No kernel entries, no
+//! copies, no sharing - because the kernel lives in `TTBR1`, where no `TTBR0` switch can disturb it and
+//! no EL0 access can reach it.
 //!
-//! - A user page must land at 4 KiB granularity *inside* a 2 MiB kernel block, so the block has to be
-//!   split. Split a **shared** table and every other address space sees it.
-//! - Reclaim then has to distinguish "a table this task owns" from "a table it merely points at", and
-//!   freeing the wrong one corrupts every other task. The 32-bit port hit exactly this.
+//! That is worth stating plainly because it was not free. Before the TTBR1 split (milestone 11) the
+//! kernel ran identity-mapped from `TTBR0`, so **every** task table had to carry a copy of the kernel
+//! map - 5 frames, 20 KiB apiece - or a task would have had no vectors, no kernel code and no kernel
+//! stack to trap into. Worse, a task page below 4 GiB then landed inside a 2 MiB kernel block and had
+//! to shadow it, which is a collision the 32-bit port hit head-on. Moving the kernel to the high half
+//! deleted the copy and the collision together.
 //!
-//! Copying costs 5 frames (20 KiB) per address space: one L1 and four L2s, plus an L3 per 2 MiB region
-//! the task actually uses. In exchange **nothing is aliased**, so a split is local by construction and
-//! reclaim can free everything the root reaches without a single ownership test. That is the trade this
-//! port makes: a fixed, visible 20 KiB against a class of bug that is invisible until it corrupts an
-//! unrelated task (§26.13 - boring and inspectable beats clever and cramped).
+//! ## What a task may address
 //!
-//! The consequence to know: a change to the kernel map after a task is created does **not** propagate
-//! to it. Nothing changes the kernel map after boot, so this is currently free - but it is a real
-//! constraint and is written down rather than discovered later.
+//! Anything the architecture gives it. There is no kernel mapping in here to collide with, so the
+//! usual x86-shaped layout (code low, stack at `USER_STACK_TOP`) works unchanged - which is the whole
+//! point of matching x86's kernel-high/user-low arrangement rather than inventing a third one.
 //!
-//! ## Why the kernel is in here at all
+//! ## Reclaim
 //!
-//! This port runs the kernel from **TTBR0**, identity-mapped in the low 4 GiB, because the image is
-//! loaded and linked at `0x80000`. So every task's address space must also map the kernel: when a task
-//! traps, the vectors, kernel code and kernel stack are reached through whatever `TTBR0_EL1` currently
-//! holds, which is the task's table. The kernel entries are EL1-only (no `AP[1]`), so a task cannot
-//! read them - present-but-privileged, which is the split a user address space needs.
-//!
-//! The architecturally cleaner shape is the kernel in **TTBR1** (high VA) with TTBR0 purely user, as
-//! x86 does with its higher half. That needs the kernel relinked at a high address and a jump across
-//! the transition, and it would delete this whole file's kernel-copying half. It is the right long-term
-//! move and is deliberately not being made mid-port; recorded per §26.3 rather than silently foregone.
+//! Nothing is aliased, so teardown needs no ownership test: [`free_all`] frees every table frame the
+//! root reaches, and [`reclaim_pages`] frees the leaf pages. They are separate because the neutral kill
+//! path reclaims a task's data and its page tables at different moments.
 
+use super::page_tables::{MapError, PageFlags, VirtAddr};
 use crate::memory::allocator::{alloc_frame, free_frame};
 use crate::memory::frame::{Frame, PhysAddr};
 
@@ -51,6 +43,7 @@ const DESC_AP_RO: u64 = 1 << 7; // AP[2]: read-only
 const DESC_PXN: u64 = 1 << 53;
 const DESC_UXN: u64 = 1 << 54;
 const ATTR_NORMAL: u64 = 1 << 2; // AttrIndx = 1 (MAIR slot 1), matching mmu.rs
+const ATTR_DEVICE: u64 = 0; // AttrIndx = 0 (MAIR slot 0) = Device-nGnRnE, matching mmu.rs
 
 const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
@@ -104,13 +97,6 @@ fn alloc_table() -> Option<u64> {
     Some(pa)
 }
 
-#[derive(Debug)]
-pub enum MapError {
-    FrameAllocFailed,
-    AlreadyMapped,
-    NotMapped,
-}
-
 /// One task's address space.
 pub struct PageTable {
     root: u64,
@@ -133,8 +119,34 @@ impl PageTable {
         Ok(PageTable { root })
     }
 
-    /// Map one 4 KiB page, splitting a 2 MiB block if the address lands inside one.
-    pub fn map(&mut self, virt: u64, phys: u64, user: bool, writable: bool, exec: bool)
+    /// The neutral `arch::imp::page_tables::PageTable::map`, as `loader.rs` and `task/` call it.
+    ///
+    /// Translates the x86-shaped `PageFlags` the neutral layers speak into AArch64 descriptor bits.
+    /// The interesting one is **`PCD | PWT`**: on x86 those disable caching for an MMIO mapping, and
+    /// the faithful AArch64 equivalent is not "uncached Normal" but the **Device** memory attribute -
+    /// which additionally forbids the reordering, merging and speculative repetition that make a
+    /// wrongly-typed MMIO mapping misbehave in ways no fault points at.
+    pub fn map(&mut self, virt: VirtAddr, phys: PhysAddr, flags: PageFlags)
+        -> Result<(), MapError>
+    {
+        if !flags.contains(PageFlags::PRESENT) {
+            // A mapping request that does not ask for PRESENT is a caller bug, not a way to remove a
+            // mapping - `unmap` is that. Refusing is louder than installing an invalid descriptor.
+            return Err(MapError::NotMapped);
+        }
+        let device = flags.contains(PageFlags::PCD) || flags.contains(PageFlags::PWT);
+        self.map_raw(
+            virt.0,
+            phys.0,
+            flags.contains(PageFlags::USER),
+            flags.contains(PageFlags::WRITABLE),
+            !flags.contains(PageFlags::NO_EXEC),
+            device,
+        )
+    }
+
+    /// Map one 4 KiB page. The arch-native form, also used directly by the EL0 bring-up path.
+    pub fn map_raw(&mut self, virt: u64, phys: u64, user: bool, writable: bool, exec: bool, device: bool)
         -> Result<(), MapError>
     {
         let l1i = idx(virt, 1);
@@ -182,7 +194,13 @@ impl PageTable {
             return Err(MapError::AlreadyMapped);
         }
 
-        let mut e = (phys & ADDR_MASK) | DESC_PAGE | DESC_AF | DESC_SH_INNER | ATTR_NORMAL;
+        // Device memory takes no shareability (the field is meaningless for it) and is never
+        // executable; Normal memory is inner-shareable and cacheable.
+        let mut e = if device {
+            (phys & ADDR_MASK) | DESC_PAGE | DESC_AF | ATTR_DEVICE | DESC_UXN | DESC_PXN
+        } else {
+            (phys & ADDR_MASK) | DESC_PAGE | DESC_AF | DESC_SH_INNER | ATTR_NORMAL
+        };
         if user {
             e |= DESC_AP_EL0;
             // An EL0-accessible region is forced PXN at EL1 anyway (the milestone-6 lesson); saying so
@@ -203,7 +221,8 @@ impl PageTable {
     }
 
     /// Remove a mapping and hand back the frame it pointed at.
-    pub fn unmap(&mut self, virt: u64) -> Result<Frame, MapError> {
+    pub fn unmap(&mut self, virt: VirtAddr) -> Result<Frame, MapError> {
+        let virt = virt.0;
         // SAFETY: walking this table's own live frames.
         unsafe {
             let l1e = get(self.root, idx(virt, 1));
@@ -220,7 +239,11 @@ impl PageTable {
     }
 
     /// The value to install in `TTBR0_EL1` for this address space.
+    ///
+    /// Named `cr3_value` as well, because that is what the neutral scheduler calls it - the same
+    /// naming compromise `TaskContext::cr3` makes, and for the same reason.
     pub fn ttbr(&self) -> u64 { self.root }
+    pub fn cr3_value(&self) -> u64 { self.root }
 
     /// Give up ownership of the root without freeing it - the scheduler stores the raw value in a
     /// task's context and frees it via `free_page_table_root` at death.
@@ -229,6 +252,8 @@ impl PageTable {
         core::mem::forget(self);
         r
     }
+    /// The neutral name for [`into_root`].
+    pub fn into_cr3(self) -> u64 { self.into_root() }
 }
 
 /// Free every frame reachable from `root`: the L3s, the L2s, then the root.
@@ -258,6 +283,43 @@ pub unsafe fn free_all(root: u64) {
         }
         free_frame(Frame::from_phys(PhysAddr(root)));
     }
+}
+
+/// Free every LEAF page the address space maps, returning how many.
+///
+/// Separate from [`free_all`], which frees the TABLE frames. The neutral kill path reclaims a task's
+/// data pages and its page tables at different moments, so conflating them would free one of them
+/// twice or not at all.
+///
+/// Every mapping in here belongs to the task by construction - the table holds nothing else - so there
+/// is no "is this mine?" test to get wrong, which is the property the one-frame design buys.
+///
+/// # Safety
+/// The address space must belong to a task already dead, with `TTBR0_EL1` switched away and
+/// invalidated, so no walker can still reach it.
+pub unsafe fn reclaim_pages(root: u64) -> usize {
+    let mut freed = 0usize;
+    // SAFETY: caller's contract; tables reached through the kernel's direct map.
+    unsafe {
+        for i in 0..ENTRIES {
+            let l1e = get(root, i);
+            if l1e & DESC_VALID == 0 || l1e & 0b11 != DESC_TABLE { continue; }
+            let l2 = l1e & ADDR_MASK;
+            for j in 0..ENTRIES {
+                let l2e = get(l2, j);
+                if l2e & DESC_VALID == 0 || l2e & 0b11 != DESC_TABLE { continue; }
+                let l3 = l2e & ADDR_MASK;
+                for k in 0..ENTRIES {
+                    let l3e = get(l3, k);
+                    if l3e & DESC_VALID == 0 { continue; }
+                    set(l3, k, 0);
+                    free_frame(Frame::from_phys(PhysAddr(l3e & ADDR_MASK)));
+                    freed += 1;
+                }
+            }
+        }
+    }
+    freed
 }
 
 impl Drop for PageTable {
