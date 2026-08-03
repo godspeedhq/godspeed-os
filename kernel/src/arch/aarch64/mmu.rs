@@ -48,6 +48,26 @@ const BLOCK_SIZE: u64 = 2 * 1024 * 1024;
 /// both with one comparison and costs at most a little RAM that the firmware had already taken.
 const DEVICE_BASE: u64 = 0xFC00_0000;
 
+/// Bring-up shim: blocks below this, plus the peripheral window, are built **EL0-accessible**.
+///
+/// EL0 currently shares the kernel's single identity map, so the demo task needs `AP` granting it
+/// access to the image, its stacks, and the UART it prints through. Real tasks get their own page
+/// tables (§10.1) and none of this.
+///
+/// **Decided at table-BUILD time, deliberately.** The first attempt flipped `AP` on the live map and
+/// then flushed - and `tlbi vmalle1`, the first TLB maintenance ever executed with the MMU on, never
+/// returned. The descriptors were provably correct either side of the change (`0x705 -> 0x745`,
+/// verified on hardware), `dsb` completed, and the machine died on the invalidate with no exception
+/// report - which is what a failed instruction fetch looks like when the handler cannot fetch its own
+/// vector either.
+///
+/// Rather than fight that, the access is decided before translation is on, where no maintenance is
+/// needed. That is also what a real design does: mutating a live translation table requires
+/// break-before-make, and per-task tables are built complete and then switched to, never patched
+/// underneath a running core. The `tlbi`-with-MMU-on question is real and deferred, not solved - see
+/// `docs/aarch64.md`.
+const EL0_SHIM_LIMIT: u64 = 0x40_0000;
+
 // --- Descriptor bits (Armv8-A long descriptor, stage 1) ---
 const DESC_TABLE: u64 = 0b11; // points at a next-level table
 const DESC_BLOCK: u64 = 0b01; // maps a block directly (valid at L1 and L2)
@@ -98,7 +118,9 @@ pub fn enable() -> u64 {
 
             for j in 0..ENTRIES {
                 let pa = (i as u64) * (ENTRIES as u64) * BLOCK_SIZE + (j as u64) * BLOCK_SIZE;
-                (*l2)[i].0[j] = if pa >= DEVICE_BASE {
+                // EL0 access for the shim ranges, decided here rather than patched in later.
+                let el0 = if pa < EL0_SHIM_LIMIT || pa >= DEVICE_BASE { 1 << 6 } else { 0 };
+                (*l2)[i].0[j] = el0 | if pa >= DEVICE_BASE {
                     // MMIO: Device-nGnRnE, never executable. No shareability - it is meaningless for
                     // Device memory and the architecture ignores the field.
                     pa | DESC_BLOCK | DESC_AF | DESC_AP_RW_EL1
@@ -168,34 +190,10 @@ pub fn enable() -> u64 {
     ttbr
 }
 
-/// Grant EL0 access to the 2 MiB blocks covering `[start, end)`.
-///
-/// **This is a bring-up shim, not the address-space model.** Real tasks get their own page tables with
-/// only their own pages mapped (§10.1); this flips `AP` on blocks in the single identity map that
-/// everything currently shares, which means the EL0 code it enables can reach kernel memory. It exists
-/// to prove the EL0 entry and `svc` return path in isolation, before per-task tables exist, and the
-/// caller is expected to be a bring-up demo rather than anything that outlives it.
-///
-/// `AP[1]` (bit 6) set turns `EL1 RW / EL0 none` into `EL1 RW / EL0 RW`. Execution needs `UXN` clear,
-/// which it already is for Normal memory.
-pub fn allow_el0(start: u64, end: u64) {
-    // SAFETY: L2 is this module's static, already populated by `enable`. Writing descriptors for
-    // blocks we built is in-bounds; the TLB is invalidated below so no stale translation survives.
-    unsafe {
-        let l2 = &raw mut L2;
-        let mut pa = start & !(BLOCK_SIZE - 1);
-        while pa < end {
-            let l1_idx = (pa / (ENTRIES as u64 * BLOCK_SIZE)) as usize;
-            let l2_idx = ((pa / BLOCK_SIZE) % ENTRIES as u64) as usize;
-            if l1_idx < L1_USED {
-                (*l2)[l1_idx].0[l2_idx] |= 1 << 6; // AP[1]: EL0 gains the access EL1 has
-            }
-            pa += BLOCK_SIZE;
-        }
-        core::arch::asm!("dsb ish", "tlbi vmalle1", "dsb ish", "isb", options(nostack));
-    }
-}
-
+/// Was `allow_el0` - REMOVED. It patched `AP` on the live map and flushed, and the flush was fatal
+/// (see `EL0_SHIM_LIMIT`). EL0 access is now decided when the tables are built, so there is no live
+/// mutation and no maintenance to get wrong. Kept as a note rather than dead code so the next person
+/// does not reinvent it.
 /// Whether translation is currently on, read back from `SCTLR_EL1.M` rather than assumed.
 pub fn is_enabled() -> bool {
     let sctlr: u64;

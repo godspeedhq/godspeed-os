@@ -26,7 +26,7 @@ that it did not crash.
 |------|--------|-----|
 | `arch/aarch64/usermode.rs` | new, 9 | The EL0 entry (`msr sp_el0` / `elr_el1` / `spsr_el1` then `eret` - all three must be set before the eret; an unset `SP_EL0` faults on the first push and points at the user code rather than the entry), the demo task's `svc` calls, the exit path's context switch back to the saved kernel context, module-owned static setup, and one unreachable `wfe` park. |
 | `arch/aarch64/exceptions.rs` | 5 -> 7 (+2) | The synchronous-lower-EL dispatcher: `mrs esr_el1` to read the exception class and `imm16`, and dereferencing the trap frame the vector assembly built on the current stack. |
-| `arch/aarch64/mmu.rs` | 2 -> 3 (+1) | `allow_el0`, which flips `AP[1]` on already-built L2 descriptors and invalidates the TLB. Explicitly a bring-up shim: it grants EL0 access within the single shared identity map, which real per-task page tables (§10.1) will replace. |
+| `arch/aarch64/mmu.rs` | 2 -> 3 -> **2** (net 0) | `allow_el0` was added here and then REMOVED: it patched `AP` on the live map and invalidated the TLB, and on hardware the `tlbi` never returned. EL0 access is now decided when the tables are built, before translation is on, so there is no live mutation and no maintenance. Net effect on the count is nil. |
 
 ## 2026-08-03 - Pi 4 milestone 5: context switch (feat/pi4-aarch64)
 
@@ -1207,13 +1207,13 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 28 | permitted |
+| arch/aarch64/mod.rs | 27 | permitted |
 | arch/aarch64/exceptions.rs | 7 | permitted |
 | arch/aarch64/context.rs | 2 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 4 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
-| arch/aarch64/mmu.rs | 3 | permitted |
+| arch/aarch64/mmu.rs | 2 | permitted |
 | arch/aarch64/usermode.rs | 9 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |

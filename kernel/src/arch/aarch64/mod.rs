@@ -312,11 +312,10 @@ extern "C" fn aarch64_boot_main() -> ! {
     // --- EL0 + the svc syscall path ------------------------------------------------------------
     #[cfg(feature = "pi4")]
     {
-        // Bring-up shim: EL0 currently shares the kernel's identity map, so it needs AP granting EL0
-        // access to the low blocks holding this image and its stacks, plus the peripheral window it
-        // prints through. Real tasks get their own page tables (§10.1) and none of this.
-        mmu::allow_el0(0, 0x40_0000);
-        mmu::allow_el0(0xFE00_0000, 0xFE20_2000);
+        // EL0 access is already granted: `mmu::enable` builds the shim ranges EL0-accessible, so there
+        // is nothing to patch here. The earlier version flipped AP on the live map and flushed, and the
+        // flush killed the machine - see `mmu::EL0_SHIM_LIMIT` for what that cost and why building it in
+        // is also the design a per-task port wants.
         usermode::prepare();
         if usermode::run() {
             put_str(b"aarch64: EL0 + svc OK - dropped to EL0, syscall round trip checked, exited cleanly\r\n");
