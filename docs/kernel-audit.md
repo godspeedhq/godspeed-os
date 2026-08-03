@@ -34,6 +34,13 @@ and MMIO-mapping path, both of the same shape. Both FIXED (2026-08-03, `fix/mmio
 > interrupt delivers rather than merely programming. The EHCI on the same box fell back to
 > `legacy INTx routed via IOAPIC`, exercising the `ioapic.rs` half in the same boot.
 >
+> **Second machine (Wyse 5070, Intel).** The shipped v0.9.1 image was then run on a different vendor
+> and chipset: `ioapic: mapped at 0xfec00000 (ver=0x20, 120 redirection entries)` - a table five times
+> the T630's 24 - with `selfcheck` 349/0, no panics, and none of the new branches firing. Its xHCI
+> reports `MSI enabled on 00:15.0`, so it has MSI and would have fallen straight through the flipped
+> order too, which is why the diagnostic was not repeated here. Coverage for these fixes is therefore
+> two vendors, two IOAPIC geometries, and both font scales (1x and 3x).
+>
 > **Still unobserved:** the `AlreadyMapped` branch (no firmware here maps that MMIO page with a large
 > page - the A9-1 case remains theoretical on the machines available) and `FrameAllocFailed` (needs
 > allocator exhaustion).
