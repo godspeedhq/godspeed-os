@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-8 done on real hardware (2026-08-03)
+> ## STATUS: milestones 1-8 done on real hardware, 9 in QEMU (2026-08-03)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -43,6 +43,7 @@
 > | 6. EL0 + `svc` | Dropped to EL0, syscall round trip checked in both directions, clean exit; ticks 13 -> 15 across the excursion, so IRQs stayed live at EL0 |
 > | 7. Memory map | `source = device tree (authoritative)`; two banks, 1968 MiB usable, the 76 MiB GPU split correctly excluded |
 > | 8. Neutral frame allocator | The first arch-neutral code on this board: `crate::memory::init` unmodified, 1968 MiB free, 64 frames distinct, aligned, read-back verified, all returned |
+> | 9. Neutral scheduler + preemption | Three never-yielding kernel tasks round-robined by `scheduler::run` under the 100 Hz tick; 45 s run gave 926/936/925 lines, no panics (QEMU first, board pending) |
 >
 > The timer evidence is a rate check, not just a delivery check: the log timestamps put 10 ticks 111 ms
 > apart, which is 100 Hz. A wrong reload would still have delivered ten interrupts.
@@ -160,9 +161,43 @@
 > would have read as a kernel fault rather than a UART one. Both now route through `put_byte`, and `\n`
 > is expanded to `\r\n` since the neutral log emits bare LF.
 >
-> **Not done:** per-task page tables, the neutral scheduler, PSCI SMP, and `kernel_main` itself. The
-> remaining `arch/aarch64/` surface is still stubs. Every mechanism a scheduler needs now exists and is
-> hardware-proven; what remains is wiring the neutral kernel onto them.
+> **Milestone 9 - the neutral scheduler preempts tasks that never yield.** Milestone 5 proved a switch
+> between tasks that *called* the switch, which is cooperative scheduling and not what a service does: a
+> service blocks on `recv` and never yields, so only the timer can take the core from it. Three kernel
+> tasks that deliberately spin are now round-robined by the **neutral** `scheduler::run` under the
+> 100 Hz tick. A 45 second run gave 926 / 936 / 925 lines - fair share within 1% - with no panic.
+>
+> Two arch-side pieces were load-bearing, and both failed in ways that looked like something else:
+>
+> - **A first-entry trampoline.** The scheduler masks IRQs before its initial `switch_context`, so a
+>   task whose `lr` pointed straight at its entry begins with `DAIF.I` set and, never yielding, never
+>   has it cleared. Observed exactly: **task A ran correctly and forever while B and C starved** - which
+>   reads as a broken scheduler when in fact it was never given a tick. x86 solves this the same way
+>   (`task_entry_trampoline` does `sti` then `ret`); this port carries the entry in `x19` instead of on
+>   the stack, because `ret` here jumps to `lr` rather than popping.
+> - **The GIC EOI moved before the switch.** The neutral tick switches tasks *inside* the IRQ handler
+>   and may never return on this task's stack. The GIC keeps a priority active until the interrupt is
+>   retired, so an EOI deferred past the switch leaves the timer permanently active and blocks every
+>   later interrupt: one tick, then silence.
+>
+> Also here: `enable`/`disable_interrupts`, `local_irq_save`, `wait_for_interrupt` and
+> `read_cycle_counter` became real (they were no-op stubs). Note `DAIF` is a **mask**, so its polarity
+> is inverted from x86's `IF` - an easy place to write a plausible inversion that deadlocks the machine
+> at the first critical section. With a real cycle counter, `liveness_deadline_cycles` is now answered
+> too, so the **cross-core wedge watchdog is armed and says so** (`a core dark for 625000000 counter
+> ticks panics`) - the 32-bit port ran its entire bring-up silently undefended because that value keyed
+> off an unrelated stub.
+>
+> **A packaging bug worth recording:** the image jumped from 1.5 MB to **18 MB**. `objcopy -O binary`
+> emits every byte up to the last allocated section, and the linker script placed `.el0` *after* `.bss`
+> - so the neutral scheduler's large static arrays were materialised into the file as literal zeros the
+> firmware had to read off the card every boot. Harmless while `.bss` was a few KiB of arch state.
+> `.bss` and the boot stack now come last, the image ends at `__el0_end`, and `__kernel_end` still spans
+> everything the kernel owns so the allocator is not handed the stack it is standing on.
+>
+> **Not done:** per-task page tables (and with them the `TTBR0_EL1` swap in `switch_context`, which is
+> written but **not yet exercised** - every task currently shares the kernel identity map), EL0 tasks
+> under the scheduler, PSCI SMP, and `kernel_main` itself.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
 > init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already

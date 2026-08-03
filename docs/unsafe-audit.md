@@ -13,6 +13,31 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4 milestone 9: the neutral scheduler preempts (feat/pi4-aarch64)
+
+Three kernel tasks that deliberately never yield, round-robined by the neutral `scheduler::run` under
+the 100 Hz generic timer. The scheduling decision is the same neutral code x86 runs; what this commit
+adds is the arch side it stands on.
+
+**The trampoline is the load-bearing piece.** The scheduler masks IRQs before its initial
+`switch_context`, so a task whose `lr` pointed straight at its entry begins running with `DAIF.I` set
+and - never yielding - never has it cleared. Observed exactly: task A ran correctly and forever while
+B and C starved, which reads as a broken scheduler when in fact it was never given a tick. x86 solves
+it the same way (`task_entry_trampoline` does `sti` then `ret`); this port carries the entry in x19
+rather than on the stack, because `ret` here jumps to `lr` rather than popping.
+
+**The GIC EOI had to move before the switch, not after.** The neutral tick performs a preemptive
+`switch_context` internally and may not return on this task's stack at all. The GIC CPU interface keeps
+a priority active until the interrupt is retired, so an EOI deferred past the switch leaves the timer
+interrupt permanently active and blocks every later interrupt of equal or lower priority - one tick,
+then silence, with the scheduler looking like the culprit.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/context.rs` | 2 -> 9 (+7) | The `TTBR0_EL1` read/write/invalidate in `switch_context` (SEC-26: writing TTBR0 flushes nothing on AArch64, so the switch must invalidate on an address-space change - route (a) from `arch/CLAUDE.md`); the entry-trampoline `global_asm!` and its extern; and `new_user`, which is a loud `unimplemented!` rather than a context that would `ret` into a user address at EL1. Note the TTBR0 branch is NOT yet exercised - every task shares the kernel identity map - and that is stated in the code rather than assumed. |
+| `arch/aarch64/mod.rs` | 28 -> 33 (+5) | Real bodies for primitives the neutral scheduler depends on, previously no-op stubs: `enable`/`disable_interrupts` (`msr daifclr/daifset, #2` - note DAIF is a MASK, so the polarity is inverted from x86's `IF`), `local_irq_save` (reads DAIF), `wait_for_interrupt` (`wfi`), and `read_cycle_counter` (`CNTPCT_EL0`, with an `isb` first so the read is not speculated earlier and a measured duration does not come out short). |
+| `arch/aarch64/sched_demo.rs` | new, 5 | Demo-only: three 64 KiB `.bss` stacks this module owns, built into task contexts and committed to freshly reserved scheduler slots during single-threaded boot. |
+
 ## 2026-08-03 - Pi 4 milestone 8: the neutral frame allocator (feat/pi4-aarch64)
 
 The first arch-neutral kernel code to run on this board. `crate::memory::init` is the same code the
@@ -1274,9 +1299,10 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 28 | permitted |
+| arch/aarch64/mod.rs | 33 | permitted |
 | arch/aarch64/exceptions.rs | 7 | permitted |
-| arch/aarch64/context.rs | 2 | permitted |
+| arch/aarch64/context.rs | 9 | permitted |
+| arch/aarch64/sched_demo.rs | 5 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 4 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |

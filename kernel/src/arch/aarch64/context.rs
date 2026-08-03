@@ -42,11 +42,63 @@ pub struct TaskContext {
     _pad: u64,
     /// d8-d15, at offsets 112..176.
     pub d: [u64; 8],
+    /// The task's page-table base - `TTBR0_EL1` here, not an x86 CR3.
+    ///
+    /// **The name is a deliberate compromise, not an oversight.** The neutral scheduler reads this
+    /// field by name (`scheduler.rs` sets `CORE_SCHED_CTX[cid].cr3`), so renaming it would mean
+    /// touching neutral code to accommodate an arch - exactly the direction the seam exists to
+    /// prevent. The 32-bit ARM port made the same call. Cleaning it up is a neutral-side rename of
+    /// one field across every arch at once, which is worth doing and is not this port's job.
+    ///
+    /// Offset 176. Not touched by the assembly below, which only moves registers; the address-space
+    /// swap is done in `switch_context` before the register switch.
+    pub cr3: u64,
 }
 
 impl TaskContext {
     pub const fn empty() -> Self {
-        TaskContext { x: [0; 10], fp: 0, lr: 0, sp: 0, _pad: 0, d: [0; 8] }
+        TaskContext { x: [0; 10], fp: 0, lr: 0, sp: 0, _pad: 0, d: [0; 8], cr3: 0 }
+    }
+
+    /// All-zero context, named so neutral code can build one without naming a register.
+    pub const ZERO: Self = Self::empty();
+
+    /// Build a context that begins executing `entry` on `stack_top` in the address space `cr3`.
+    ///
+    /// The neutral scheduler's constructor. It differs from [`TaskContext::init`] only in taking the
+    /// address-space base and an `unsafe extern "C"` entry, which is the signature `task/` uses.
+    ///
+    /// # Safety
+    /// `stack_top` must be the top of a stack this task exclusively owns, and `cr3` must be a live
+    /// page-table base (or the current one, for a task sharing the kernel address space).
+    pub unsafe fn new_kernel(entry: unsafe extern "C" fn() -> !, stack_top: *mut u8, cr3: u64) -> Self {
+        let mut c = Self::empty();
+        // Enter through the trampoline, not the entry directly - see `aarch64_task_entry_trampoline`.
+        // The real entry rides in x19, which the switch restores just before jumping.
+        c.lr = aarch64_task_entry_trampoline as usize as u64;
+        c.x[0] = entry as usize as u64; // x[0] IS x19 (offset 0), per the assembly's `stp x19, x20`
+        c.sp = (stack_top as u64) & !0xF; // AArch64 faults on a misaligned SP the moment anything pushes
+        c.cr3 = cr3;
+        c
+    }
+
+    /// Build a context that enters USER mode at `user_entry`.
+    ///
+    /// Not implemented yet: entering EL0 needs the trap-frame shape the exception vectors restore
+    /// through (`ELR_EL1`/`SPSR_EL1`/`SP_EL0`), which is a different mechanism from the callee-saved
+    /// switch above - `usermode.rs` proved it separately at milestone 6, but wiring it into a scheduled
+    /// task is the next milestone's work. Loud rather than silently returning a context that would
+    /// `ret` into a user address at EL1 (§26.7).
+    ///
+    /// # Safety
+    /// Same contract as `new_kernel`, plus `user_entry`/`user_stack_top` being mapped in `cr3`.
+    pub unsafe fn new_user(
+        _kernel_stack_top: *mut u8,
+        _user_entry: u64,
+        _user_stack_top: u64,
+        _cr3: u64,
+    ) -> Self {
+        unimplemented!("aarch64 new_user: EL0 tasks are the next milestone, see usermode.rs")
     }
 
     /// Prepare a context that, when switched to, begins executing `entry` on `stack_top`.
@@ -103,8 +155,31 @@ aarch64_switch_context:
 "#
 );
 
+global_asm!(
+    r#"
+    .section .text
+    .globl aarch64_task_entry_trampoline
+// First-entry trampoline for a brand-new kernel task.
+//   x19 = the real entry point, placed there by TaskContext::new_kernel.
+// Unmask IRQs, then branch to the entry. Never returns.
+aarch64_task_entry_trampoline:
+    msr  daifclr, #2
+    br   x19
+"#
+);
+
 extern "C" {
     fn aarch64_switch_context(current: *mut TaskContext, next: *const TaskContext);
+    /// See the assembly above and [`TaskContext::new_kernel`].
+    ///
+    /// **Why a trampoline rather than entering the task directly.** The scheduler masks IRQs before
+    /// its initial `switch_context`, so a task whose `lr` pointed straight at its entry would begin
+    /// running with `DAIF.I` still set - and, never yielding, would never have it cleared. The symptom
+    /// is exact and misleading: the first task runs correctly and forever, every other task starves,
+    /// and the scheduler looks broken when in fact it was never given a tick. x86 solves this the same
+    /// way (`task_entry_trampoline` does `sti` then `ret`); this port carries the entry in x19 rather
+    /// than on the stack, because `ret` here jumps to `lr` rather than popping.
+    fn aarch64_task_entry_trampoline() -> !;
 }
 
 /// Save the running context into `current` and resume `next`.
@@ -116,5 +191,51 @@ extern "C" {
 /// itself would save over the registers mid-restore.
 pub unsafe fn switch(current: *mut TaskContext, next: *const TaskContext) {
     // SAFETY: the caller's contract above.
+    unsafe { aarch64_switch_context(current, next) }
+}
+
+/// The neutral scheduler's switch: swap the address space if it changes, then swap registers.
+///
+/// **The address-space half is an obligation, not an optimisation (SEC-26).** The neutral kill path
+/// elides a cross-core TLB shootdown for a pinned task on the grounds that "a CR3 reload flushes
+/// non-global TLB entries" - an *x86* semantic. Writing `TTBR0_EL1` flushes nothing on AArch64, so
+/// this port takes route (a) from `arch/CLAUDE.md`: the context switch itself invalidates on an
+/// address-space change. Omitting it would leave a dead task's translations live for the next one,
+/// which is the same use-after-free class as SEC-1 and would not show up until something reused the
+/// frames.
+///
+/// **The invalidate is not yet exercised**, and that is stated rather than glossed: every task on this
+/// port currently shares the kernel identity map, so `next.cr3` always equals the live `TTBR0_EL1` and
+/// the branch is not taken. It must be proven when per-task page tables land - which is precisely the
+/// milestone that makes it load-bearing. Recorded per §26.3 rather than assumed correct.
+///
+/// # Safety
+/// As [`switch`], plus: `next.cr3` must be a live page-table base, since it is installed before the
+/// register switch and the very next instruction fetch translates through it.
+pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const TaskContext) {
+    // SAFETY: `next` is a valid context per the caller's contract.
+    let next_ttbr = unsafe { (*next).cr3 };
+    if next_ttbr != 0 {
+        let cur: u64;
+        // SAFETY: reading TTBR0_EL1 at EL1 is a side-effect-free system-register read.
+        unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) cur, options(nomem, nostack)) };
+        if cur != next_ttbr {
+            // SAFETY: installing a live page-table base, then invalidating the stale translations it
+            // replaces. `dsb ish` before the invalidate orders the TTBR write ahead of it; `isb` after
+            // ensures the next instruction fetch uses the new map.
+            unsafe {
+                core::arch::asm!(
+                    "msr ttbr0_el1, {t}",
+                    "dsb ish",
+                    "tlbi vmalle1",
+                    "dsb ish",
+                    "isb",
+                    t = in(reg) next_ttbr,
+                    options(nostack),
+                );
+            }
+        }
+    }
+    // SAFETY: the caller's contract.
     unsafe { aarch64_switch_context(current, next) }
 }

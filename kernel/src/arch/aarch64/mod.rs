@@ -25,6 +25,8 @@ pub mod mailbox;
 pub mod memmap;
 #[cfg(feature = "pi4")]
 pub mod mmu;
+#[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
+pub mod sched_demo;
 #[cfg(feature = "pi4")]
 pub mod timer;
 #[cfg(feature = "pi4")]
@@ -302,11 +304,16 @@ extern "C" fn aarch64_boot_main(dtb: u64) -> ! {
     // 128 KiB with caches off would be needlessly slow) and AFTER the vectors, so a fault in the
     // allocator reports itself instead of wandering.
     #[cfg(feature = "pi4")]
-    {
+    let boot_info = {
         let bi = memmap::boot_info(boot_map);
         crate::memory::init(&bi);
         allocator_selftest();
-    }
+        bi
+    };
+
+    // --- The neutral scheduler, preempting spinning tasks ------------------------------------
+    // Placed after the GIC + timer come up (below) via a second gate: the demo needs a live tick, and
+    // it never returns, so it must be the last thing the boot does.
 
     // --- GIC-400 + generic timer -------------------------------------------------------------
     #[cfg(feature = "pi4")]
@@ -379,6 +386,15 @@ extern "C" fn aarch64_boot_main(dtb: u64) -> ! {
         put_dec(exceptions::TICKS.load(Ordering::Relaxed));
         put_str(b" (the timer ticked through EL0 too)\r\n");
     }
+
+    // --- The neutral scheduler (gated) -------------------------------------------------------
+    // LAST, and last for two reasons. `scheduler::run` IS the idle loop and never returns, so anything
+    // placed after it is dead code the linker removes - including, when this sat higher up, the entire
+    // `.el0` region, which silently turned the image into one that could not exercise milestones 5 and
+    // 6 at all. Running it here means a single boot re-verifies everything above and then hands the
+    // machine to the scheduler.
+    #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
+    sched_demo::run(&boot_info);
 
     put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.\r\n");
     loop {
@@ -586,9 +602,19 @@ pub fn usb_disk_sectors() -> u64 { 0 }
 pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
 pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
 pub fn usb_disk_flush() -> bool { false }
-/// Counter ticks a core may make NO forward progress before the liveness watchdog panics. `0` = this
-/// arch cannot say (no calibrated counter rate yet), so the check stays off - see the x86 and arm
-/// implementations for what a real answer looks like.
+/// Counter ticks a core may make NO forward progress before the liveness watchdog panics.
+///
+/// Ten seconds of `CNTPCT_EL0`, from the frequency the hardware reports in `CNTFRQ_EL0` rather than a
+/// constant - the Pi 4 runs the generic timer at 54 MHz where QEMU says 62.5 MHz, so a hardcoded rate
+/// would make the margin wrong on one of them.
+///
+/// **This is answered rather than left at `0` deliberately.** `0` disables the check, and the 32-bit
+/// ARM port spent its entire bring-up silently undefended that way - the watchdog was inert because it
+/// keyed off an unrelated stubbed constant, so a real wedge produced no diagnostic at all. A safety net
+/// that is absent should at least be absent loudly (§26.4); here it is simply present.
+#[cfg(feature = "pi4")]
+pub fn liveness_deadline_cycles() -> u64 { timer::frequency().saturating_mul(10) }
+#[cfg(not(feature = "pi4"))]
 pub fn liveness_deadline_cycles() -> u64 { 0 }
 
 /// Hook called when the scheduler commits a **user** task. x86 ignores it; ARM records the slot so the
@@ -768,6 +794,19 @@ pub mod syscall_entry {
     pub fn validate_user_ptr(ptr: u64, len: usize) -> bool { false }
     pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> { None }
     pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool { false }
+    /// The free-running physical counter. Monotonic, never reset, shared by all cores - which is what
+    /// the neutral liveness watchdog needs to compare a timestamp taken on one core against a deadline
+    /// checked on another.
+    #[cfg(feature = "pi4")]
+    pub fn read_cycle_counter() -> u64 {
+        let v: u64;
+        // SAFETY: CNTPCT_EL0 is readable at EL1 (EL2 granted EL1 access during the boot drop via
+        // CNTHCTL_EL2). `isb` first because the counter read is otherwise free to be speculated
+        // earlier, which would make a duration measured across it come out short.
+        unsafe { core::arch::asm!("isb", "mrs {}, cntpct_el0", out(reg) v, options(nomem, nostack)) };
+        v
+    }
+    #[cfg(not(feature = "pi4"))]
     pub fn read_cycle_counter() -> u64 { 0 }                 // CNTPCT_EL0
 }
 
@@ -775,17 +814,68 @@ pub mod syscall_entry {
 pub mod interrupts {
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
     pub const EHCI_MSI_VECTOR: u8 = 0x29;
+    /// `DAIF.I` is the IRQ mask. It is a MASK, so **clearing** it enables interrupts and setting it
+    /// disables them - the opposite polarity to x86's `IF`, and an easy place to write a plausible
+    /// inversion that deadlocks the machine at the first critical section.
+    #[cfg(feature = "pi4")]
+    pub fn enable_interrupts() {
+        // SAFETY: unmasking IRQs at EL1 is architecturally always valid.
+        unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };
+    }
+    #[cfg(feature = "pi4")]
+    pub fn disable_interrupts() {
+        // SAFETY: masking IRQs at EL1 is architecturally always valid.
+        unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)) };
+    }
+    /// Returns whether IRQs were ENABLED, matching the neutral `local_irq_restore(was_enabled)`
+    /// contract. Note the inversion: `DAIF.I` set means masked, so "enabled" is the bit being clear.
+    #[cfg(feature = "pi4")]
+    pub fn local_irq_save() -> bool {
+        let daif: u64;
+        // SAFETY: reading DAIF is a side-effect-free system-register read.
+        unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)) };
+        disable_interrupts();
+        daif & (1 << 7) == 0 // I bit clear == IRQs were enabled
+    }
+    #[cfg(feature = "pi4")]
+    pub fn local_irq_restore(was_enabled: bool) {
+        if was_enabled { enable_interrupts(); }
+    }
+    #[cfg(feature = "pi4")]
+    pub fn wait_for_interrupt() {
+        // SAFETY: WFI at EL1 is always valid. It returns on any pending interrupt (or spuriously),
+        // so every caller must re-check its condition rather than assume a wake means progress.
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+    }
+    /// The idle loop may `wfi`: the generic timer keeps ticking through it, so a halted core is woken
+    /// by its own 100 Hz tick even if nothing else ever targets it.
+    #[cfg(feature = "pi4")]
+    pub fn idle_can_halt() -> bool { true }
+
+    #[cfg(not(feature = "pi4"))]
     pub fn enable_interrupts() {}                            // msr daifclr
+    #[cfg(not(feature = "pi4"))]
     pub fn disable_interrupts() {}                           // msr daifset
+    #[cfg(not(feature = "pi4"))]
     pub fn local_irq_save() -> bool { false }                // mrs DAIF
+    #[cfg(not(feature = "pi4"))]
     pub fn local_irq_restore(was_enabled: bool) {}
+    #[cfg(not(feature = "pi4"))]
     pub fn wait_for_interrupt() {}                           // wfi
+    #[cfg(not(feature = "pi4"))]
     pub fn idle_can_halt() -> bool { false }
     pub fn send_eoi() {}                                     // GIC EOIR
     pub fn fire_test_irq(irq: u8) {}
 }
 
 // ---------------------------------------------------------------------------
+/// On the Pi 4 the neutral scheduler's context switch IS the real, hardware-proven one in `context`
+/// (milestone 5: callee-saved integers, `d8`-`d15`, SP, plus the `TTBR0_EL1` swap SEC-26 requires).
+/// The stub below remains for the QEMU `virt` boundary-demarcation build, which only has to compile.
+#[cfg(feature = "pi4")]
+pub use context as context_switch;
+
+#[cfg(not(feature = "pi4"))]
 pub mod context_switch {
     // AArch64: callee-saved x19-x28, fp/lr, sp + the page-table base. Field names kept x86-ish for the
     // stub compile; a real port renames them (and `cr3` in the neutral scheduler is a leak to address).

@@ -20,7 +20,13 @@ This script builds ONLY the pi4 variant and objcopies immediately, so the two
 cannot be interleaved. It then VERIFIES the link address rather than trusting it,
 because the failure mode is silent.
 
-usage:  python scripts/pi4_build.py [--debug]
+Extra cargo features may be appended with --features (comma separated). They are
+added ALONGSIDE `pi4`, never instead of it, so no invocation of this script can
+accidentally produce a non-Pi image:
+
+    python scripts/pi4_build.py --features pi4-sched-demo
+
+usage:  python scripts/pi4_build.py [--debug] [--features a,b]
 """
 import subprocess, sys, os, pathlib, re
 
@@ -41,7 +47,15 @@ def tool(name):
     cargo_bin = pathlib.Path.home() / ".cargo" / "bin" / f"{name}.exe"
     return str(cargo_bin) if cargo_bin.exists() else name
 
-args = ["cargo", "build", "-p", "kernel", "--target", TARGET, "--features", "pi4"]
+# `pi4` is always present; anything passed is added to it, not substituted for it.
+FEATURES = "pi4"
+if "--features" in sys.argv:
+    i = sys.argv.index("--features")
+    if i + 1 >= len(sys.argv):
+        sys.exit("--features needs a comma-separated list")
+    FEATURES = "pi4," + sys.argv[i + 1]
+
+args = ["cargo", "build", "-p", "kernel", "--target", TARGET, "--features", FEATURES]
 if PROFILE == "release":
     args.append("--release")
 run(args)
@@ -67,5 +81,5 @@ if addr != EXPECT_LOAD:
 
 run([tool("rust-objcopy"), "-O", "binary", str(elf), str(img)])
 print(f"OK  {img.relative_to(ROOT)}  ({img.stat().st_size} bytes, "
-      f".text @ {addr:#x}, feature=pi4, profile={PROFILE})")
+      f".text @ {addr:#x}, feature={FEATURES}, profile={PROFILE})")
 print("Deploy: copy build/kernel8.img to the SD card as the name config.txt's `kernel=` line points at.")

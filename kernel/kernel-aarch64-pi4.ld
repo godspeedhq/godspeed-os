@@ -28,18 +28,6 @@ SECTIONS {
     .rodata : ALIGN(0x1000) { *(.rodata .rodata.*) }
     .data   : ALIGN(0x1000) { *(.data .data.*) }
 
-    . = ALIGN(16);
-    __bss_start = .;
-    .bss : { *(.bss .bss.*) *(COMMON) }
-    . = ALIGN(16);
-    __bss_end = .;
-
-    /* 512 KiB boot stack, top-aligned. AAPCS64 requires SP 16-byte aligned; the
-     * ALIGN(16) above plus a multiple-of-16 size keeps __stack_top aligned. */
-    . = ALIGN(16);
-    . += 0x80000;
-    __stack_top = .;
-
     /* EL0 region, on its own 2 MiB boundary.
      *
      * This has to be a SEPARATE 2 MiB block from the kernel, not merely separate
@@ -65,10 +53,37 @@ SECTIONS {
     . = ALIGN(0x200000);
     __el0_end = .;
 
-    /* End of everything the image occupies. `memmap` carves this range out of
-     * usable RAM, so it must sit after the LAST thing the kernel owns - both the
-     * boot stack and the EL0 region are above .bss, and a map built from
-     * __bss_end alone would hand the allocator the stack it is standing on. */
+    /* .bss and the boot stack come AFTER the EL0 region, and that ordering is
+     * about image SIZE, not addresses.
+     *
+     * `objcopy -O binary` emits every byte from the load address up to the last
+     * allocated section, so anything placed beyond .bss drags .bss into the file
+     * as literal zeros. That went unnoticed while .bss was a few KiB of arch
+     * state; the moment the neutral scheduler linked in (its per-task slots and
+     * routing queues are large static arrays) the image jumped from 1.5 MB to
+     * 18 MB of mostly zeros - which the firmware then has to read off the card
+     * on every boot.
+     *
+     * With .bss last, the image ends at __el0_end and .bss is simply RAM beyond
+     * it, which `_start` zeroes anyway. The stack sits above .bss and needs no
+     * initialisation at all. */
+    . = ALIGN(16);
+    __bss_start = .;
+    .bss : { *(.bss .bss.*) *(COMMON) }
+    . = ALIGN(16);
+    __bss_end = .;
+
+    /* 512 KiB boot stack, top-aligned. AAPCS64 requires SP 16-byte aligned; the
+     * ALIGN(16) above plus a multiple-of-16 size keeps __stack_top aligned. */
+    . = ALIGN(16);
+    . += 0x80000;
+    __stack_top = .;
+
+    /* End of everything the kernel occupies. `memmap` carves this range out of
+     * usable RAM, so it must sit after the LAST thing the kernel owns - the boot
+     * stack included, or the allocator would be handed the stack it is standing
+     * on. Note this is deliberately BEYOND the end of the image file: the image
+     * stops at __el0_end, but the kernel still owns the .bss and stack above it. */
     __kernel_end = .;
 
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) *(.eh_frame_hdr) *(.ARM.attributes) }

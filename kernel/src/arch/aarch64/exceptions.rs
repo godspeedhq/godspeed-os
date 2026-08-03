@@ -254,9 +254,37 @@ extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
         TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // Re-arm: the generic timer is one-shot, so a periodic tick means reloading it every time.
         super::timer::arm(super::TIMER_INTERVAL.load(core::sync::atomic::Ordering::Relaxed));
+
+        // **EOI BEFORE handing control to the scheduler, not after.** The neutral tick performs a
+        // preemptive `switch_context` INTERNALLY: it may not return here for a whole quantum, and on a
+        // busy core it may never return on this task's stack at all. The GIC CPU interface keeps a
+        // priority active until the interrupt is retired, so an EOI deferred past the switch leaves
+        // this timer interrupt permanently active - blocking every later interrupt of equal or lower
+        // priority. The machine would take exactly one tick and then go silent, with the scheduler
+        // looking like the culprit.
+        //
+        // Retiring first is safe because the timer is already re-armed above: the interrupt this call
+        // retires is finished with, and the next one is a fresh assertion.
+        super::gic::eoi(id);
+
+        if NEUTRAL_SCHED.load(core::sync::atomic::Ordering::Relaxed) {
+            // Drives the neutral round-robin: it picks the next task and switches to it. Arguments are
+            // the x86 interrupted-frame triple, which this port does not use - the frame is on the
+            // task's own kernel stack and the vector below restores it.
+            crate::task::scheduler::timer_tick_from_irq(0, 0, 0);
+        }
+        return;
     }
     super::gic::eoi(id);
 }
+
+/// Set once the neutral scheduler owns preemption.
+///
+/// Until then the timer only counts ticks (milestones 4-8 rely on that). Flipping this is what turns
+/// the tick into a preemption point, and it is deliberately a runtime flag rather than a compile-time
+/// one so the earlier milestones keep running unchanged in the same image.
+pub static NEUTRAL_SCHED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Exception class for `SVC` taken from AArch64.
 const EC_SVC64: u64 = 0b010101;
