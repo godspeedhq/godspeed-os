@@ -51,7 +51,7 @@ const MAX_BANKS: usize = 8;
 
 /// How many regions the assembled map can hold: the banks, split around the kernel image, plus the
 /// kernel region itself.
-const MAX_REGIONS: usize = MAX_BANKS * 2 + 2;
+const MAX_REGIONS: usize = MAX_BANKS * 2 + 3; // banks split around the kernel, the kernel, and page 0
 
 extern "C" {
     static __kernel_end: u8;
@@ -60,6 +60,9 @@ extern "C" {
 /// The kernel image occupies `[0x80000, __kernel_end)`. The load address is fixed by the firmware's
 /// flat-binary contract (see the linker script), so it is a constant rather than a symbol.
 const KERNEL_PHYS_START: u64 = 0x8_0000;
+
+/// One frame. The first one is reserved rather than handed out - see `build`.
+const PAGE_SIZE: u64 = 4096;
 
 fn kernel_phys_end() -> u64 {
     // SAFETY: linker-provided symbol; taking its address does not dereference it. The kernel is linked
@@ -314,12 +317,21 @@ pub fn build(dtb: u64, board: &BoardInfo) -> (&'static [MemoryRegion], Source) {
             }
         };
 
+        // The first page is never usable. Physical 0 is a legitimate frame on this board (RAM starts
+        // at 0 and the firmware leaves the low 512 KiB alone), and the allocator will hand it out - it
+        // did, as the root of the first task page table, which then printed `TTBR0=0x0`.
+        //
+        // That works, and works by coincidence. `0` is a sentinel in several places (`switch_context`
+        // treats `cr3 == 0` as "no address space to install"), and a null pointer must never be a valid
+        // allocation. Reserving the page costs 4 KiB and removes a whole class of ambiguity.
+        push(0, PAGE_SIZE, MemoryKind::Reserved);
+
         for b in banks.iter().take(n) {
             // Clamp to what the identity map actually reaches. An 8 GiB Pi 4 reports banks above
             // 4 GiB, and recording them as usable would hand the allocator RAM with no translation -
             // a fault much later, blamed on whatever touched it. Dropping capacity is the safe
             // direction, and the drop is reported rather than silently taken (invariant 12).
-            let (lo, hi) = (b.base, (b.base + b.len).min(super::mmu::IDENTITY_MAP_LIMIT));
+            let (lo, hi) = (b.base.max(PAGE_SIZE), (b.base + b.len).min(super::mmu::IDENTITY_MAP_LIMIT));
             if lo >= hi {
                 put_str(b"memmap: NOTE bank at ");
                 put_hex(b.base);

@@ -735,10 +735,16 @@ extern "C" fn boot_high() -> ! {
     // The mechanism it proved (EL0 entry, `svc` decode from `ESR_EL1.imm16`, the return value, the
     // clean exit) is unchanged and hardware-verified; only where the code LIVES changes.
     #[cfg(feature = "pi4")]
-    put_str(
-        b"aarch64: EL0 demo retired by the TTBR1 split - EL0 cannot reach the high half; \
-          a real task needs its own TTBR0 space (next milestone)\r\n",
-    );
+    {
+        if usermode::run() {
+            put_str(b"aarch64: EL0 TASK OK - own address space, syscall round trip checked, exited cleanly\r\n");
+        } else {
+            put_str(b"aarch64: WARN EL0 task did NOT check out\r\n");
+        }
+        put_str(b"aarch64: ticks since boot = ");
+        put_dec(exceptions::TICKS.load(Ordering::Relaxed));
+        put_str(b" (the timer ticked through EL0 too)\r\n");
+    }
 
     // --- The neutral scheduler (gated) -------------------------------------------------------
     // LAST, and last for two reasons. `scheduler::run` IS the idle loop and never returns, so anything

@@ -13,6 +13,26 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4 milestone 12: an EL0 task in its own address space (feat/pi4-aarch64)
+
+The payoff of the TTBR1 split, and the first place the separation is enforced by hardware rather than
+by leaving the right bits clear. `PageTable::new` now allocates **one** frame and copies nothing: a task
+table holds the task and nothing else, because the kernel is in `TTBR1` where no `TTBR0` switch can
+disturb it and no EL0 access can reach it. That deleted the 20 KiB kernel-copy per address space AND
+the collision class it carried.
+
+The task is frames, not linker sections: a code page and a stack page from the allocator, with a
+position-independent payload copied in. Position-independent because it is linked into the kernel at a
+high address and executed at a low one - trivially so, being register operations and `svc` with no
+memory reference.
+
+Net unsafe is unchanged: what `usermode.rs` gained (building the space, copying the payload, installing
+`TTBR0` before the `eret`) is offset by what `ptables.rs` lost with the kernel-copy loop.
+
+**Page 0 is now reserved.** The allocator handed out physical frame 0 as a page-table root, which
+printed `TTBR0=0x0` - working, but by coincidence, and colliding with the `cr3 == 0` sentinel
+`switch_context` uses for "no address space". A null physical address must never be a valid allocation.
+
 ## 2026-08-03 - Pi 4 milestone 11b: the kernel moves to the high half (feat/pi4-aarch64)
 
 The kernel is now LINKED high and LOADED low (VMA `KERNEL_VA + 0x80000`, LMA `0x80000`), relocates

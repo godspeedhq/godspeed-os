@@ -117,42 +117,19 @@ pub struct PageTable {
 }
 
 impl PageTable {
-    /// Build a fresh address space: the kernel map, privately copied, and nothing else.
+    /// Build a fresh, **empty** address space.
+    ///
+    /// One frame. No kernel entries at all - which is the whole payoff of the TTBR1 split. Before it,
+    /// every task table had to carry a copy of the kernel map (5 frames, 20 KiB), because the kernel
+    /// was reached through `TTBR0` and a task running with its own table would otherwise have had no
+    /// vectors, no kernel code and no kernel stack to trap into. Now the kernel is in `TTBR1`, which no
+    /// `TTBR0` switch can disturb and no EL0 access can reach, so a task's table describes the task and
+    /// nothing else.
+    ///
+    /// That is not only cheaper, it removes the failure mode: there is no kernel mapping in here to
+    /// collide with a task's own pages, so a task may use any address the architecture gives it.
     pub fn new() -> Result<Self, MapError> {
         let root = alloc_table().ok_or(MapError::FrameAllocFailed)?;
-        let kernel_l1 = super::mmu::kernel_l1_root();
-
-        for i in 0..L1_KERNEL_ENTRIES {
-            // SAFETY: `kernel_l1` is the live boot L1 and `i < 4`.
-            let src_entry = unsafe { get(kernel_l1, i) };
-            if src_entry & DESC_VALID == 0 {
-                continue;
-            }
-            let src_l2 = src_entry & ADDR_MASK;
-
-            let dst_l2 = match alloc_table() {
-                Some(t) => t,
-                None => {
-                    // Give back everything already taken rather than leak it - a partial address space
-                    // is not returned, so nothing else can free it (kernel-audit T1 was this exact
-                    // leak on the x86 spawn path).
-                    // SAFETY: `root` is a table this function built and nothing else references.
-                    unsafe { free_all(root) };
-                    return Err(MapError::FrameAllocFailed);
-                }
-            };
-            // SAFETY: both are live 4 KiB table frames in identity-mapped RAM, and `dst_l2` is ours.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    phys_to_virt(src_l2) as *const u8,
-                    phys_to_virt(dst_l2) as *mut u8,
-                    4096,
-                )
-            };
-            // SAFETY: `root` is ours and `i < 512`.
-            unsafe { set(root, i, dst_l2 | DESC_TABLE) };
-        }
-
         Ok(PageTable { root })
     }
 
