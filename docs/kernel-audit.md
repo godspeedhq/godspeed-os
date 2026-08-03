@@ -11,12 +11,22 @@ Scope: the ~1400 lines of `kernel/src/fbcon/` and the ARM input path shipped in 
 pass, plus a sweep of the whole kernel for the classes the Commandments name.
 
 **Verdict: 0 Commandment violations in the new code. 2 pre-existing defects found in the x86 page-table
-and MMIO-mapping path, both of the same shape.**
+and MMIO-mapping path, both of the same shape. Both FIXED (2026-08-03, `fix/mmio-map-verdicts`).**
+
+> **Fix (A9-1, A9-2).** `walk_or_alloc` now returns `Err(AlreadyMapped)` when it meets a large-page
+> entry instead of walking into the mapped data, and both MMIO call sites check the verdict. Because
+> `AlreadyMapped` means the address IS usable (just not with our flags), the call sites distinguish it
+> from a genuine failure with `entry_for_va`: an unmapped address makes `ioapic::init` return (leaving
+> `IOAPIC_VA` 0, so `set_redir` no-ops) and `program_msix` return `false` (so the caller falls back to
+> INTx), while an already-mapped one proceeds with a loud note that the uncached PCD|PWT flags were not
+> applied. The SAFETY comments now describe what the code establishes rather than what it assumed.
+> Verified: identity 24/24, and a boot still reports `ioapic: mapped at 0xfec00000 (ver=0x20, 24
+> redirection entries)` plus `pci: MSI-X enabled` - the new branches are inert on a healthy machine.
 
 | ID | Severity | Commandment | Finding |
 |----|----------|-------------|---------|
-| A9-1 | MED | Invariant 12, X | `walk_or_alloc` (`arch/x86_64/page_tables.rs:492`) does **not check `PAGE_SIZE_BIT`**. `PAGE_SIZE_BIT` is tested only in the read-only walk (lines 325/331). So if `map_in_active_tables` is ever called on a VA already covered by a 2 MiB or 1 GiB page, the walk treats that large page's **data frame** as a page table and `read_entry`/`write_entry` at `pt_idx(virt)` reads and writes 8 bytes *into that data*. Silent memory corruption, no error. It does not fire today only because both call sites target MMIO holes (IOAPIC, MSI-X BAR) that Limine's HHDM leaves unmapped, so the PD entry is absent and a fresh PT is allocated - **correct by accident, not by construction**, and nothing checks or documents the assumption. |
-| A9-2 | MED | V, §18.3 | Two call sites discard the mapping verdict and then immediately dereference the address: `ioapic.rs:68` (`let _ = map_in_active_tables(...)` then `unsafe { read(va, 0x01) }`) and `pci.rs:624` (same, then `write_volatile` to the MSI-X table). `map_in_active_tables` returns `Err(FrameAllocFailed)` when the allocator cannot supply a page-table frame. Both dereferences carry a SAFETY comment asserting the page was "just mapped" - an assertion the code throws away the evidence for. §18.3 requires a SAFETY comment to be *true*; here it is an assumption. |
+| A9-1 | MED **(FIXED)** | Invariant 12, X | `walk_or_alloc` (`arch/x86_64/page_tables.rs:492`) does **not check `PAGE_SIZE_BIT`**. `PAGE_SIZE_BIT` is tested only in the read-only walk (lines 325/331). So if `map_in_active_tables` is ever called on a VA already covered by a 2 MiB or 1 GiB page, the walk treats that large page's **data frame** as a page table and `read_entry`/`write_entry` at `pt_idx(virt)` reads and writes 8 bytes *into that data*. Silent memory corruption, no error. It does not fire today only because both call sites target MMIO holes (IOAPIC, MSI-X BAR) that Limine's HHDM leaves unmapped, so the PD entry is absent and a fresh PT is allocated - **correct by accident, not by construction**, and nothing checks or documents the assumption. |
+| A9-2 | MED **(FIXED)** | V, §18.3 | Two call sites discard the mapping verdict and then immediately dereference the address: `ioapic.rs:68` (`let _ = map_in_active_tables(...)` then `unsafe { read(va, 0x01) }`) and `pci.rs:624` (same, then `write_volatile` to the MSI-X table). `map_in_active_tables` returns `Err(FrameAllocFailed)` when the allocator cannot supply a page-table frame. Both dereferences carry a SAFETY comment asserting the page was "just mapped" - an assertion the code throws away the evidence for. §18.3 requires a SAFETY comment to be *true*; here it is an assumption. |
 | A9-3 | LOW | V | `handle_remove_cap` (`syscall/dispatch.rs:1476`) returns `0` unconditionally, discarding whether the slot was actually held. A caller cannot distinguish "removed" from "there was nothing there". |
 | A9-4 | LOW (doc) | VII | `handle_resource_revoke` authorises by **ownership** (`revoke_owned(id, caller_endpoint)`), which is a *third* validation form. `kernel/src/syscall/CLAUDE.md` documents exactly two (cap-slot and holdings) and says "There are no exceptions to this rule". The code is **correct** - ownership is established only through the `RESOURCE_MINT`-gated `resource_mint`, so authority does derive from a capability and a task that never minted owns nothing - but an undocumented third form sits close enough to "authority by identity" (which VII forbids outright) that it needs to be written down rather than inferred. |
 

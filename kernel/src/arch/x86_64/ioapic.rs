@@ -65,11 +65,33 @@ pub fn init() {
             | PageFlags::PWT.bits()
             | PageFlags::PCD.bits();
         // SAFETY: page-aligned MMIO page (the IOAPIC register window), uncached.
-        let _ = unsafe { map_in_active_tables(va, phys, flags) };
+        let mapped = unsafe { map_in_active_tables(va, phys, flags) };
+        // CHECK the verdict. This used to be `let _ =`, and the register read below went ahead anyway
+        // under a SAFETY comment asserting the page was "just mapped" - an assertion whose evidence
+        // this code had discarded (kernel-audit A9-2). `map_in_active_tables` really can fail
+        // (`FrameAllocFailed`), and reading an unmapped VA here is a ring-0 page fault at boot.
+        if let Err(e) = mapped {
+            // Distinguish "not mapped" from "already mapped by someone else": `AlreadyMapped` means the
+            // address is usable but our uncached flags were not applied, which is worth saying out loud
+            // for MMIO but is not a reason to give up interrupt routing.
+            if crate::arch::x86_64::page_tables::entry_for_va(va).is_none() {
+                crate::kprintln!(
+                    "ioapic: MMIO map FAILED ({:?}) for {:#x} - no interrupt routing on this machine",
+                    e, phys
+                );
+                return; // IOAPIC_VA stays 0, so `set_redir` no-ops rather than touching a bad address
+            }
+            crate::kprintln!(
+                "ioapic: {:#x} was already mapped ({:?}); using it, but the requested uncached \
+                 (PCD|PWT) flags were NOT applied",
+                phys, e
+            );
+        }
     }
     IOAPIC_VA.store(va, Ordering::Relaxed);
     // IOAPIC Version register (0x01) bits[23:16] = max redirection entry (table size - 1).
-    // SAFETY: MMIO just mapped.
+    // SAFETY: the mapping above was checked - either we established it, or `entry_for_va` confirmed
+    // the address is already mapped. Both paths reach here only with `va` mapped.
     let ver = unsafe { read(va, 0x01) };
     crate::kprintln!(
         "ioapic: mapped at {:#x} (ver={:#04x}, {} redirection entries)",
