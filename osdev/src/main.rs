@@ -380,7 +380,9 @@ pub fn cmd_build() {
     }
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -388,6 +390,28 @@ pub fn cmd_build() {
         std::process::exit(1);
     }
     println!("build: kernel OK");
+}
+
+/// Extra cargo features to compile the KERNEL with, from the `KERNEL_FEATURES` environment variable.
+///
+/// The service-side build variants below are hardcoded functions because each is a fixed, named
+/// configuration. A kernel *fault-injection* feature is different: it is a one-off diagnostic, used
+/// once to prove an error path runs and then not again, so minting a subcommand per experiment would
+/// be machinery outliving its purpose. This passes any feature straight through:
+///
+/// ```text
+/// KERNEL_FEATURES=mmio-map-fault-test cargo run -p osdev --release -- image
+/// ```
+///
+/// Empty by default, so an ordinary build is byte-identical to one without this.
+fn kernel_feature_args() -> Vec<String> {
+    match std::env::var("KERNEL_FEATURES") {
+        Ok(f) if !f.trim().is_empty() => {
+            println!("build: kernel EXTRA FEATURES = {}", f.trim());
+            vec!["--features".to_string(), f.trim().to_string()]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Build for bare-metal USB: supervisor with `--features bare-metal` (pong + ping only,
@@ -420,7 +444,9 @@ pub fn cmd_build_bare_metal() {
     println!("build: supervisor (bare-metal) OK");
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -463,7 +489,9 @@ pub fn cmd_build_counter() {
     println!("build: supervisor (bare-metal + counter-test) OK");
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -506,7 +534,9 @@ pub fn cmd_build_reply() {
     println!("build: supervisor (bare-metal + reply-test) OK");
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -550,7 +580,9 @@ pub fn cmd_build_resource() {
     println!("build: supervisor (bare-metal + resource-test) OK");
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -592,7 +624,9 @@ pub fn cmd_build_idle() {
     println!("build: supervisor (idle-only) OK");
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -636,7 +670,9 @@ pub fn cmd_build_identity() {
     println!("build: supervisor (identity-only) OK");
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -678,7 +714,9 @@ pub fn cmd_build_perf() {
     println!("build: supervisor (perf-only) OK");
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -719,7 +757,9 @@ pub fn cmd_build_stress() {
     println!("build: supervisor (stress-only) OK");
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -763,7 +803,9 @@ pub fn cmd_build_fuzz() {
     println!("build: supervisor (fuzz-only) OK");
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -803,7 +845,9 @@ pub fn cmd_build_chaos() {
     println!("build: supervisor (chaos-only) OK");
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -844,7 +888,9 @@ pub fn cmd_build_b2_only() {
     println!("build: supervisor (b2-only) OK");
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -889,7 +935,9 @@ pub fn cmd_build_perf_iso(feature: &str) {
     println!("build: supervisor ({}) OK", feature);
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -927,7 +975,9 @@ pub fn cmd_build_bp2_only() {
     println!("build: supervisor (bp2-only) OK");
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -968,7 +1018,9 @@ pub fn cmd_build_adv() {
     println!("build: supervisor (adv-only) OK");
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -1008,7 +1060,9 @@ pub fn cmd_build_brutal_perf() {
     println!("build: supervisor (perf-brutal-only) OK");
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {
@@ -1421,7 +1475,9 @@ fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
     println!("build: supervisor (bare-metal,blockdev) OK");
 
     let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"])
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
         .status().expect("failed to run cargo build for kernel");
     if !status.success() { eprintln!("build: kernel FAILED"); std::process::exit(1); }
     println!("build: kernel OK");
