@@ -28,9 +28,83 @@ const PL011_BASE: usize = 0x0900_0000; // QEMU `virt`
 const PL011_BASE: usize = 0xFE20_1000; // BCM2711 (peripheral base 0xFE00_0000 + 0x20_1000)
 
 const PL011_DR: *mut u8 = PL011_BASE as *mut u8;
-/// Flag register (+0x18). Bit 5 = TXFF (transmit FIFO full).
+/// Flag register (+0x18). Bit 5 = TXFF (transmit FIFO full), bit 3 = BUSY.
 const PL011_FR: *const u32 = (PL011_BASE + 0x18) as *const u32;
 const PL011_FR_TXFF: u32 = 1 << 5;
+#[cfg(feature = "pi4")]
+const PL011_FR_BUSY: u32 = 1 << 3;
+#[cfg(feature = "pi4")]
+const PL011_LCRH: *mut u32 = (PL011_BASE + 0x2C) as *mut u32;
+#[cfg(feature = "pi4")]
+const PL011_CR: *mut u32 = (PL011_BASE + 0x30) as *mut u32;
+#[cfg(feature = "pi4")]
+const PL011_LCRH_8N1: u32 = (3 << 5) | (1 << 4); // WLEN=8, FIFOs enabled
+#[cfg(feature = "pi4")]
+const PL011_CR_ON: u32 = (1 << 0) | (1 << 8) | (1 << 9); // UARTEN | TXE | RXE
+
+// BCM2711 GPIO. Peripheral base + 0x20_0000.
+#[cfg(feature = "pi4")]
+const GPIO_BASE: usize = 0xFE20_0000;
+#[cfg(feature = "pi4")]
+const GPFSEL1: *mut u32 = (GPIO_BASE + 0x04) as *mut u32; // function select, GPIO10-19
+/// BCM2711 pull-up/down control. **This is not the BCM2835 mechanism.** The older SoC used a
+/// GPPUD + GPPUDCLK strobe sequence; BCM2711 replaced it with direct 2-bits-per-pin registers
+/// (00 = none, 01 = pull-up, 10 = pull-down). REG0 covers GPIO0-15, so GPIO14 is bits [29:28] and
+/// GPIO15 is bits [31:30]. Porting the Pi 2's pull code verbatim would silently do nothing here.
+#[cfg(feature = "pi4")]
+const GPIO_PUP_PDN_CNTRL_REG0: *mut u32 = (GPIO_BASE + 0xE4) as *mut u32;
+
+/// Mux GPIO14/15 to the PL011 and give the RX pin a pull-up.
+///
+/// The pull-up is not optional garnish: an undriven UART input floats, and a floating pin beside a
+/// switching TX line frames noise into well-formed bytes with no error flags. That cost real time on
+/// the Pi 2 (see `docs/arm32-status.md`), where a faulty RX line filled the shared input ring and
+/// starved the keyboard. Set it here rather than rediscover it.
+#[cfg(feature = "pi4")]
+fn gpio_init_uart() {
+    // SAFETY: BCM2711 GPIO registers, identity-mapped MMIO with the MMU off. Read-modify-write of
+    // GPFSEL1 touches only GPIO14/15's function fields; the pull register is written whole with only
+    // those two pins' fields changed.
+    unsafe {
+        let mut sel = GPFSEL1.read_volatile();
+        sel &= !((0b111 << 12) | (0b111 << 15)); // clear GPIO14, GPIO15 function fields
+        sel |= (0b100 << 12) | (0b100 << 15);    // ALT0 = TXD0 / RXD0
+        GPFSEL1.write_volatile(sel);
+
+        let mut pud = GPIO_PUP_PDN_CNTRL_REG0.read_volatile();
+        pud &= !(0b11 << 28); // GPIO14 (TX): no pull - we drive it
+        pud &= !(0b11 << 30);
+        pud |= 0b01 << 30;    // GPIO15 (RX): pull-up, so an absent peer reads as idle, not noise
+        GPIO_PUP_PDN_CNTRL_REG0.write_volatile(pud);
+    }
+}
+
+/// Bring the PL011 up for output, **preserving whatever baud divisors the firmware programmed**.
+///
+/// Do not assume the firmware did this - that lesson is already recorded for the 32-bit port, where an
+/// uninitialised PL011 silently swallows every write. `enable_uart=1` in `config.txt` is what makes the
+/// firmware configure it, and if that is missing (or the console was handed to Bluetooth instead of
+/// GPIO14/15) the UART is off and `TXFF` never clears.
+///
+/// IBRD/FBRD are deliberately NOT touched: the reference clock differs between firmware versions and
+/// boards, so recomputing the divisors is how you turn a working console into garbage.
+#[cfg(feature = "pi4")]
+fn pl011_init() {
+    gpio_init_uart();
+    // SAFETY: BCM2711 UART0 registers, identity-mapped MMIO, single-threaded boot. Writes in the order
+    // the PL011 spec requires (disable, drain, set line control, enable).
+    unsafe {
+        PL011_CR.write_volatile(0);
+        // Bounded: a present-but-wedged UART must not hang the boot on BUSY (invariant 12).
+        let mut t = 0u32;
+        while PL011_FR.read_volatile() & PL011_FR_BUSY != 0 {
+            t += 1;
+            if t > 1_000_000 { break; }
+        }
+        PL011_LCRH.write_volatile(PL011_LCRH_8N1);
+        PL011_CR.write_volatile(PL011_CR_ON);
+    }
+}
 
 /// ELF entry point - `qemu-system-aarch64 -M virt -kernel` jumps here (EL1/EL2). Park the secondary
 /// cores (WFE loop), set the boot stack, zero BSS, then call the Rust boot. `.text.boot` so the linker
@@ -102,6 +176,11 @@ extern "C" fn aarch64_boot_main() -> ! {
     // EL1 already. Either way this must say EL1 - if it says EL2 the drop silently did not happen, and
     // the next thing to touch FP/SIMD would fault for a reason that has nothing to do with the code
     // that faulted.
+    // Bring the UART up before trying to use it. On QEMU `virt` the UART needs no init; on the Pi the
+    // firmware may or may not have configured it, and assuming is how you get silence with no clue.
+    #[cfg(feature = "pi4")]
+    pl011_init();
+
     let el: u64;
     // SAFETY: reading CurrentEL is a side-effect-free system-register read valid at any EL.
     unsafe { core::arch::asm!("mrs {}, CurrentEL", out(reg) el, options(nomem, nostack)) };

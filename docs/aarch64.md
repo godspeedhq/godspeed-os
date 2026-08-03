@@ -5,6 +5,44 @@
 > AArch64 (64-bit).** This doc captures the bring-up plan and, more importantly, the *measured*
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
+
+> ## STATUS: milestone 1 done on real hardware (2026-08-03)
+>
+> **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
+>
+> ```
+> GodspeedOS aarch64: PL011 alive at EL1 (Raspberry Pi 4 / BCM2711, PL011 @ 0xFE201000)
+> aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.
+> ```
+>
+> `EL1` is the load-bearing word: the Pi's armstub hands the primary core over at **EL2**, and `_start`
+> drops to EL1 before any Rust runs. At EL2 the EL1 registers it writes are settable but do not govern
+> it, and FP/SIMD is gated by `CPTR_EL2` rather than `CPACR_EL1` - so Rust's NEON `memcpy` would trap
+> despite `CPACR_EL1` saying otherwise. The message reports the level reached rather than merely that
+> something printed, so a silent failure of the drop cannot be mistaken for success.
+>
+> **Boot path taken:** the stock GPU bootloader (§5's second option), not the UEFI+Limine lean. It needs
+> nothing on the card but the image, and does not foreclose UEFI - that would be a different linker
+> script and entry, not a change above the arch layer.
+>
+> **Built with `python scripts/pi4_build.py`**, which exists because the two aarch64 board variants share
+> one cargo artifact path: building `virt` after `pi4` silently replaces it, and the resulting image is
+> linked at `0x4008_0000` with its UART at `0x0900_0000`. That is unbootable on a Pi and looks exactly
+> like a code bug. The script builds only the Pi 4 variant and **verifies `.text` is at `0x80000`**
+> before emitting an image. It cost one hardware round trip to learn.
+>
+> **Done:** EL2 to EL1 drop, BCM2711 PL011 (init + bounded TXFF wait, baud divisors left alone), GPIO14/15
+> muxed to ALT0 with a pull-up on RX (note BCM2711 replaced the Pi 2's `GPPUD`/`GPPUDCLK` strobe with
+> direct 2-bit-per-pin registers at `0xE4` - porting the old code verbatim would compile and do nothing).
+>
+> **Not done:** everything else. MMU, exception vectors, GIC-400, generic timer, PSCI SMP, then
+> `kernel_main`. The stubs in `arch/aarch64/` are still stubs; the neutral kernel is linked but not
+> reached. Next per §6 is the MMU and exception vectors.
+>
+> **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
+> init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already
+> enabled the UART, making our init merely redundant, is untested.
+
 ## 1. Why the port is bounded (measured, not asserted)
 
 The whole bet is that the microkernel isolates hardware to `kernel/src/arch/x86_64/`, so the
