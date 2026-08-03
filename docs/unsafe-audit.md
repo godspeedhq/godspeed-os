@@ -13,6 +13,25 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4 milestone 5: context switch (feat/pi4-aarch64)
+
+Saving and restoring the AAPCS64 callee-saved set, proven by two kernel tasks ping-ponging.
+
+The context switch is the first piece here that can corrupt state **silently**: a wrong byte offset or
+a dropped register does not fault, it resumes a task holding someone else's value and the damage
+surfaces later somewhere unrelated. So it is proven on its own, and the demo *checks* rather than
+merely runs - each task holds witnesses in callee-saved integer and FP registers across the switch and
+reports a mismatch. A test that cannot fail is worth nothing (A9-1).
+
+`d8`-`d15` are saved even though skipping them would look harmless: the kernel is built for a target
+with FP/SIMD, LLVM emits NEON for bulk copies without being asked (the Pi 2 hit this with `memcpy`),
+and omitting them yields corruption only when a switch lands between a NEON spill and its reload.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/context.rs` | new, 2 | (1) `global_asm!` for the switch itself - a context switch cannot be expressed in Rust. (2) The `switch` wrapper is `unsafe fn` and calls the extern; its contract names what the caller owes (valid non-aliasing contexts, `next` either previously saved or prepared by `init`). |
+| `arch/aarch64/ctxdemo.rs` | new, 7 | Demo-only. Six are `switch` calls plus context/stack setup on statics this module owns during single-threaded boot; one is the `wfe` park on an unreachable path. The statics are `TaskContext`s and two 16 KiB `.bss` stacks, sized once and visible (§26.6.1). |
+
 ## 2026-08-03 - Pi 4 milestone 4: GIC-400 + generic timer (feat/pi4-aarch64)
 
 A periodic tick: the standard GICv2 the Pi 4 has (unlike the Pi 2's bespoke Broadcom controller, this
@@ -1175,6 +1194,8 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 |---|---|---|
 | arch/aarch64/mod.rs | 28 | permitted |
 | arch/aarch64/exceptions.rs | 5 | permitted |
+| arch/aarch64/context.rs | 2 | permitted |
+| arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 4 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 2 | permitted |

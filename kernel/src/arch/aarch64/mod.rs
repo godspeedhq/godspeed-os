@@ -12,6 +12,10 @@
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
 #[cfg(feature = "pi4")]
+pub mod context;
+#[cfg(feature = "pi4")]
+pub mod ctxdemo;
+#[cfg(feature = "pi4")]
 pub mod exceptions;
 #[cfg(feature = "pi4")]
 pub mod gic;
@@ -285,6 +289,22 @@ extern "C" fn aarch64_boot_main() -> ! {
             put_dec(ticks);
             put_str(b") - GIC or CNTP configuration is wrong\r\n");
         }
+    }
+
+    // --- Context switch ----------------------------------------------------------------------
+    // Proven on its own before anything is built on it: a wrong offset or a dropped callee-saved
+    // register does not fault, it resumes a task holding someone else's value and the damage surfaces
+    // somewhere unrelated later.
+    #[cfg(feature = "pi4")]
+    {
+        if ctxdemo::run() {
+            put_str(b"aarch64: context switch OK - callee-saved integer AND d8-d15 state preserved\r\n");
+        } else {
+            put_str(b"aarch64: WARN context switch LOST register state - see the CORRUPT lines above\r\n");
+        }
+        put_str(b"aarch64: ticks since boot = ");
+        put_dec(exceptions::TICKS.load(Ordering::Relaxed));
+        put_str(b" (the timer kept running throughout)\r\n");
     }
 
     put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.\r\n");
