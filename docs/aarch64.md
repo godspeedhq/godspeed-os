@@ -31,13 +31,25 @@
 > like a code bug. The script builds only the Pi 4 variant and **verifies `.text` is at `0x80000`**
 > before emitting an image. It cost one hardware round trip to learn.
 >
-> **Done:** EL2 to EL1 drop, BCM2711 PL011 (init + bounded TXFF wait, baud divisors left alone), GPIO14/15
-> muxed to ALT0 with a pull-up on RX (note BCM2711 replaced the Pi 2's `GPPUD`/`GPPUDCLK` strobe with
-> direct 2-bit-per-pin registers at `0xE4` - porting the old code verbatim would compile and do nothing).
+> **Done, each verified on the board:**
 >
-> **Not done:** everything else. MMU, exception vectors, GIC-400, generic timer, PSCI SMP, then
-> `kernel_main`. The stubs in `arch/aarch64/` are still stubs; the neutral kernel is linked but not
-> reached. Next per §6 is the MMU and exception vectors.
+> | Milestone | Evidence |
+> |---|---|
+> | 1. Boot + UART | `PL011 alive at EL1` - the EL2 drop worked |
+> | 2. MMU | `MMU ON, TTBR0_EL1=0x89000 - this line is running translated`; identity map, 4 KiB granule, 39-bit VA, 2 MiB blocks, 20 KiB of tables |
+> | 3. Exception vectors | `VBAR_EL1=0x80800`, proven by a real `brk #0` reporting EC `0b111100` on vector 4 |
+> | 4. GIC-400 + timer | `CNTFRQ_EL0=54000000 Hz`, 100 Hz tick, `timer IRQs DELIVERING - 10 ticks` |
+>
+> The timer evidence is a rate check, not just a delivery check: the log timestamps put 10 ticks 111 ms
+> apart, which is 100 Hz. A wrong reload would still have delivered ten interrupts.
+>
+> Also done: BCM2711 PL011 init (bounded TXFF wait, baud divisors deliberately untouched), GPIO14/15
+> muxed to ALT0 with a pull-up on RX. Note BCM2711 replaced the Pi 2's `GPPUD`/`GPPUDCLK` strobe with
+> direct 2-bit-per-pin registers at `0xE4` - porting the old code verbatim would compile and do nothing.
+>
+> **Not done:** context switch, EL0/user mode, the `svc` syscall path, PSCI SMP, and `kernel_main`
+> itself. The rest of `arch/aarch64/` is still stubs; the neutral kernel is linked but not reached.
+> Next per §6 is the context switch, then user mode, then the neutral scheduler.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
 > init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already
