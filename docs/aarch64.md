@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestone 1 done on real hardware (2026-08-03)
+> ## STATUS: milestones 1-7 done on real hardware (2026-08-03)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -41,7 +41,7 @@
 > | 4. GIC-400 + timer | `CNTFRQ_EL0=54000000 Hz`, 100 Hz tick, `timer IRQs DELIVERING - 10 ticks` |
 > | 5. Context switch | Two kernel tasks ping-ponging; witnesses in callee-saved integer AND `d8`-`d15` verified on resume |
 > | 6. EL0 + `svc` | Dropped to EL0, syscall round trip checked in both directions, clean exit; ticks 13 -> 15 across the excursion, so IRQs stayed live at EL0 |
-> | 7. Memory map | Device tree + mailbox read before the MMU; banks split around the kernel image and clamped to the identity map (QEMU first, board pending) |
+> | 7. Memory map | `source = device tree (authoritative)`; two banks, 1968 MiB usable, the 76 MiB GPU split correctly excluded |
 >
 > The timer evidence is a rate check, not just a delivery check: the log timestamps put 10 ticks 111 ms
 > apart, which is 100 Hz. A wrong reload would still have delivered ten interrupts.
@@ -86,9 +86,34 @@
 > (an 8 GiB bank truncated, a 6 GiB bank dropped). Commandment IX - a guard never seen firing is not
 > evidence that it fires.
 >
-> Verified against the real `bcm2711-rpi-4-b.dtb`. Worth knowing: that file's `/memory` node is a
-> **zero-size placeholder** (`reg = <0x0 0x0 0x0>`) which the firmware patches at boot, so a parser
-> tested only against the on-disk file would conclude the board has no RAM.
+Worth knowing: the on-disk `bcm2711-rpi-4-b.dtb`'s `/memory` node is a **zero-size placeholder**
+> (`reg = <0x0 0x0 0x0>`) which the firmware patches at boot, so a parser tested only against the file
+> would conclude the board has no RAM.
+>
+> **On the board (Pi 4 Model B rev 1.5, 2 GB, BCM2711 - decoded from `board revision 0xb03115`):**
+>
+> ```
+> mailbox: ARM memory base 0x0 size 948 MiB
+> aarch64: device tree pointer (x0 at entry) = 0x2eff1c00
+> memmap: source = device tree (authoritative)
+> memmap:   0x0..0x80000          usable       512 KiB
+> memmap:   0x80000..0x400000     kernel image 3584 KiB
+> memmap:   0x400000..0x3b400000  usable       966656 KiB
+> memmap:   0x40000000..0x80000000 usable      1048576 KiB
+> memmap: usable RAM 1968 MiB across 4 regions
+> ```
+>
+> **The two sources disagree by a factor of two, and that is the whole justification for parsing the
+> device tree.** The mailbox reported 948 MiB; the device tree reported 1968 MiB across **two banks**.
+> Taking the fallback would have cost 1020 MiB - 52% of the machine's usable RAM - and it would have
+> looked entirely reasonable in the log. Note that under QEMU the two sources *agreed* (960 MiB each),
+> so emulation could never have revealed this: it is exactly the class of thing only silicon shows.
+>
+> The 76 MiB hole between the banks (`0x3b400000..0x40000000`) is the default `gpu_mem` split, which the
+> firmware excludes from `/memory` for us. Two banks also means the multi-bank path - `#address-cells=2`,
+> `#size-cells=1`, several `reg` pairs in one property - is hardware-exercised rather than reasoned
+> about. The clamp correctly did **not** fire: every bank on a 2 GB board is below the identity-map
+> limit, which is why it needed the injected test to be proven at all.
 >
 > **Not done:** assembling this into the arch's `BootInfo` and handing it to the neutral allocator,
 > per-task page tables, the neutral scheduler, PSCI SMP, and `kernel_main` itself. The remaining
