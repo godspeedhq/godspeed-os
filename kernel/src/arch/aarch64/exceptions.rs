@@ -1,0 +1,217 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//! AArch64 exception vectors (`VBAR_EL1`) for the Raspberry Pi 4.
+//!
+//! **Why this comes before the timer, the GIC, or anything else.** Until `VBAR_EL1` points at a real
+//! table, a fault is a silent lockup: the core takes the exception, branches into whatever happens to
+//! be at the reset vector address, and wanders off. Every milestone after this one adds code that can
+//! fault, so this is the difference between "the Pi stopped" and a message naming the cause. That is
+//! invariant 12 applied to the port itself - failures loud, never silent.
+//!
+//! ## Table shape
+//!
+//! The architecture fixes the layout: `VBAR_EL1` must be 2 KiB aligned, and holds **16 entries of 128
+//! bytes each**, in four groups of four (Synchronous, IRQ, FIQ, SError):
+//!
+//! | Group | Taken from |
+//! |---|---|
+//! | 0 | Current EL, using `SP_EL0` |
+//! | 1 | Current EL, using `SP_ELx` - where kernel faults land |
+//! | 2 | Lower EL, AArch64 - where userspace faults and `svc` will land |
+//! | 3 | Lower EL, AArch32 - we never run 32-bit, so reaching it is itself a bug |
+//!
+//! 128 bytes is only 32 instructions, which is why each entry does the minimum (open a frame, record
+//! which vector fired, branch) and the shared tail does the real work.
+//!
+//! ## What it does today
+//!
+//! Saves the general-purpose registers plus `ELR_EL1`/`SPSR_EL1`, reports the vector, `ESR_EL1`,
+//! `FAR_EL1`, `ELR_EL1` and `SPSR_EL1`, and halts. It deliberately does **not** return: nothing here
+//! can yet handle a fault, and returning to a faulting instruction would loop forever printing. When
+//! the scheduler and userspace arrive, group 2 grows a real syscall path and a task-kill path; the
+//! frame is already laid out for that.
+
+use core::arch::global_asm;
+
+/// Trap frame the assembly builds on the stack. `#[repr(C)]` because assembly writes it.
+#[repr(C)]
+pub struct TrapFrame {
+    /// x0..x30.
+    pub x: [u64; 31],
+    /// Exception Link Register - the instruction to return to.
+    pub elr: u64,
+    /// Saved Program Status Register - the interrupted context's PSTATE.
+    pub spsr: u64,
+}
+
+global_asm!(
+    r#"
+// Each vector entry gets 128 bytes (.align 7). Do the minimum here: open the frame, stash x0/x1 so we
+// have scratch, record which of the 16 vectors fired, and branch to the shared tail.
+.macro VECTOR_ENTRY kind
+    .align 7
+    sub  sp, sp, #272
+    stp  x0, x1, [sp, #0]
+    mov  x0, #\kind
+    b    aarch64_trap_common
+.endm
+
+    .section .text
+    .globl aarch64_vectors
+    .align 11                      // VBAR_EL1 requires 2 KiB alignment
+aarch64_vectors:
+    VECTOR_ENTRY 0                 // Current EL, SP_EL0:  Synchronous
+    VECTOR_ENTRY 1                 //                      IRQ
+    VECTOR_ENTRY 2                 //                      FIQ
+    VECTOR_ENTRY 3                 //                      SError
+    VECTOR_ENTRY 4                 // Current EL, SP_ELx:  Synchronous
+    VECTOR_ENTRY 5                 //                      IRQ
+    VECTOR_ENTRY 6                 //                      FIQ
+    VECTOR_ENTRY 7                 //                      SError
+    VECTOR_ENTRY 8                 // Lower EL, AArch64:   Synchronous
+    VECTOR_ENTRY 9                 //                      IRQ
+    VECTOR_ENTRY 10                //                      FIQ
+    VECTOR_ENTRY 11                //                      SError
+    VECTOR_ENTRY 12                // Lower EL, AArch32:   Synchronous
+    VECTOR_ENTRY 13                //                      IRQ
+    VECTOR_ENTRY 14                //                      FIQ
+    VECTOR_ENTRY 15                //                      SError
+
+// Shared tail. x0 = vector index, x1 clobbered, both already saved.
+aarch64_trap_common:
+    stp  x2,  x3,  [sp, #16]
+    stp  x4,  x5,  [sp, #32]
+    stp  x6,  x7,  [sp, #48]
+    stp  x8,  x9,  [sp, #64]
+    stp  x10, x11, [sp, #80]
+    stp  x12, x13, [sp, #96]
+    stp  x14, x15, [sp, #112]
+    stp  x16, x17, [sp, #128]
+    stp  x18, x19, [sp, #144]
+    stp  x20, x21, [sp, #160]
+    stp  x22, x23, [sp, #176]
+    stp  x24, x25, [sp, #192]
+    stp  x26, x27, [sp, #208]
+    stp  x28, x29, [sp, #224]
+    mrs  x2, elr_el1
+    mrs  x3, spsr_el1
+    stp  x30, x2,  [sp, #240]      // x30, then ELR
+    str  x3,       [sp, #256]      // SPSR
+    mov  x1, sp                    // arg1 = &TrapFrame
+    bl   aarch64_trap_report       // (vector: u64, frame: *const TrapFrame) -> !
+1:  wfe
+    b    1b
+"#
+);
+
+extern "C" {
+    /// The vector table, defined in the assembly above.
+    static aarch64_vectors: u8;
+}
+
+/// Install the table. Read back rather than assumed - see `installed`.
+pub fn init() -> u64 {
+    let vbar = core::ptr::addr_of!(aarch64_vectors) as u64;
+    // SAFETY: `aarch64_vectors` is the 2 KiB-aligned table defined above, in this image's `.text`, and
+    // writing VBAR_EL1 at EL1 only changes where exceptions are taken to.
+    unsafe {
+        core::arch::asm!(
+            "msr vbar_el1, {v}",
+            "isb",
+            v = in(reg) vbar,
+            options(nostack),
+        );
+    }
+    vbar
+}
+
+/// The installed `VBAR_EL1`, read back from the register.
+pub fn installed() -> u64 {
+    let v: u64;
+    // SAFETY: reading VBAR_EL1 at EL1 is a side-effect-free system-register read.
+    unsafe { core::arch::asm!("mrs {}, vbar_el1", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+/// Human-readable name for each of the 16 vectors, so a report says which one fired rather than
+/// printing an index the reader has to look up.
+fn vector_name(v: u64) -> &'static [u8] {
+    match v {
+        0 => b"CurrentEL/SP0 Synchronous",
+        1 => b"CurrentEL/SP0 IRQ",
+        2 => b"CurrentEL/SP0 FIQ",
+        3 => b"CurrentEL/SP0 SError",
+        4 => b"CurrentEL/SPx Synchronous",
+        5 => b"CurrentEL/SPx IRQ",
+        6 => b"CurrentEL/SPx FIQ",
+        7 => b"CurrentEL/SPx SError",
+        8 => b"LowerEL/A64 Synchronous",
+        9 => b"LowerEL/A64 IRQ",
+        10 => b"LowerEL/A64 FIQ",
+        11 => b"LowerEL/A64 SError",
+        12 => b"LowerEL/A32 Synchronous",
+        13 => b"LowerEL/A32 IRQ",
+        14 => b"LowerEL/A32 FIQ",
+        15 => b"LowerEL/A32 SError",
+        _ => b"unknown",
+    }
+}
+
+/// Decode the Exception Class field of `ESR_EL1` (bits 31:26) for the cases this port can currently
+/// hit. Not exhaustive - naming the common ones is what turns a hex dump into a diagnosis.
+fn ec_name(esr: u64) -> &'static [u8] {
+    match (esr >> 26) & 0x3F {
+        0b000000 => b"unknown reason",
+        0b000111 => b"SVE/SIMD/FP access trapped (CPACR/CPTR)",
+        0b010101 => b"SVC from AArch64",
+        0b100000 => b"instruction abort, lower EL",
+        0b100001 => b"instruction abort, same EL",
+        0b100010 => b"PC alignment fault",
+        0b100100 => b"data abort, lower EL",
+        0b100101 => b"data abort, same EL",
+        0b100110 => b"SP alignment fault",
+        0b101100 => b"trapped FP exception",
+        0b111100 => b"BRK instruction",
+        _ => b"see ARM ARM D17.2.37 for this EC",
+    }
+}
+
+/// Report an exception and halt.
+///
+/// Deliberately does not return. Nothing here can handle a fault yet, and returning to the faulting
+/// instruction would loop forever re-faulting and re-printing - a machine that looks busy while making
+/// no progress, which is worse than one that stops with a reason.
+#[no_mangle]
+extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
+    let (esr, far): (u64, u64);
+    // SAFETY: reading ESR_EL1/FAR_EL1 at EL1 is side-effect-free; both describe the exception just
+    // taken.
+    unsafe {
+        core::arch::asm!("mrs {}, esr_el1", out(reg) esr, options(nomem, nostack));
+        core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
+    }
+    // SAFETY: `frame` is the trap frame the vector assembly just built on the current stack; it is
+    // valid for the life of this call and nothing else aliases it.
+    let f = unsafe { &*frame };
+
+    super::put_str(b"\r\n*** aarch64 EXCEPTION: ");
+    super::put_str(vector_name(vector));
+    super::put_str(b"\r\n    ESR_EL1  = ");
+    super::put_hex(esr);
+    super::put_str(b"  (");
+    super::put_str(ec_name(esr));
+    super::put_str(b")\r\n    FAR_EL1  = ");
+    super::put_hex(far);
+    super::put_str(b"\r\n    ELR_EL1  = ");
+    super::put_hex(f.elr);
+    super::put_str(b"\r\n    SPSR_EL1 = ");
+    super::put_hex(f.spsr);
+    super::put_str(b"\r\n    x0 = ");
+    super::put_hex(f.x[0]);
+    super::put_str(b"  x1 = ");
+    super::put_hex(f.x[1]);
+    super::put_str(b"\r\n    halting.\r\n");
+    loop {
+        // SAFETY: WFE is always valid; park forever.
+        unsafe { core::arch::asm!("wfe") };
+    }
+}

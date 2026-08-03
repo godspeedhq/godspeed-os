@@ -12,6 +12,8 @@
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
 #[cfg(feature = "pi4")]
+pub mod exceptions;
+#[cfg(feature = "pi4")]
 pub mod mmu;
 
 // ============================ Boot bring-up ============================
@@ -218,6 +220,29 @@ extern "C" fn aarch64_boot_main() -> ! {
         }
     }
 
+    // Vectors AFTER the MMU, because VBAR_EL1 holds a virtual address and installing it before
+    // translation is live would point at an address that is about to mean something else. From here on
+    // a fault reports itself instead of wandering off into whatever sits at the reset vector.
+    #[cfg(feature = "pi4")]
+    {
+        let vbar = exceptions::init();
+        if exceptions::installed() == vbar {
+            put_str(b"aarch64: exception vectors installed, VBAR_EL1=");
+            put_hex(vbar);
+            put_str(b"\r\n");
+        } else {
+            put_str(b"aarch64: WARN VBAR_EL1 did not take the write\r\n");
+        }
+        // Prove they work rather than assert it. `brk #0` raises a synchronous exception from the
+        // current EL on the current stack - vector 4 - so a correct table reports it and halts, and a
+        // broken one hangs silently. A self-test that cannot fail is worth nothing (the lesson from
+        // kernel-audit A9-1), so this is deliberately a real fault, not a simulated one.
+        put_str(b"aarch64: raising a deliberate BRK to prove the vectors fire...\r\n");
+        // SAFETY: `brk #0` is a breakpoint instruction; with vectors installed it is taken to the
+        // synchronous handler above, which reports and halts. It never returns.
+        unsafe { core::arch::asm!("brk #0", options(nostack)) };
+    }
+
     put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.\r\n");
     loop {
         // SAFETY: WFI is always valid; wait for an interrupt that never comes (halt).
@@ -231,7 +256,7 @@ extern "C" fn aarch64_boot_main() -> ! {
 /// the boot. On a board where the firmware left the UART off, the FIFO never drains - dropping the byte
 /// and continuing is right, because the alternative is a machine that appears bricked with no output at
 /// all to say why.
-fn put_byte(b: u8) {
+pub(crate) fn put_byte(b: u8) {
     let mut spins = 0u32;
     // SAFETY: PL011_FR/PL011_DR are the flag and data registers of the board's UART, identity-mapped
     // MMIO. The MMU is off at this point, so these are physical addresses.
@@ -245,7 +270,7 @@ fn put_byte(b: u8) {
 }
 
 /// Print a u64 as `0x...` - enough diagnostics to report a register without pulling in formatting.
-fn put_hex(v: u64) {
+pub(crate) fn put_hex(v: u64) {
     put_str(b"0x");
     let mut started = false;
     for shift in (0..16).rev() {
@@ -257,7 +282,7 @@ fn put_hex(v: u64) {
     }
 }
 
-fn put_str(s: &[u8]) {
+pub(crate) fn put_str(s: &[u8]) {
     for &b in s {
         put_byte(b);
     }

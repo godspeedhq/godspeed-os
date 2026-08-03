@@ -13,6 +13,22 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4 milestone 3: exception vectors (feat/pi4-aarch64)
+
+`VBAR_EL1` and a 16-entry vector table. This comes before the timer or the GIC because until it exists
+a fault is a silent lockup: the core takes the exception and branches into whatever sits at the reset
+vector. Every milestone after this adds code that can fault, so this is what makes the rest debuggable
+(invariant 12 applied to the port itself).
+
+The table is proven by **raising a real `brk #0`**, not by asserting the register took. A self-test that
+cannot fail is worth nothing - the lesson from A9-1, where an odd sentinel let a test pass without the
+fix it was meant to prove.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/exceptions.rs` | new, 5 | (1) `global_asm!` for the 2 KiB-aligned table and the shared save-and-report tail - assembly is the only way to express a vector table. (2) `msr vbar_el1` in `init`, which only changes where exceptions are taken to. (3) `mrs vbar_el1` in `installed`, side-effect-free. (4) `mrs esr_el1`/`far_el1` in the reporter, likewise. (5) dereferencing the trap frame the vector assembly just built on the current stack - valid for the call, unaliased. |
+| `arch/aarch64/mod.rs` | 27 -> 28 (+1) | The deliberate `brk #0` that proves the vectors fire. It never returns: with the table installed it is taken to the synchronous handler, which reports and halts. |
+
 ## 2026-08-03 - Pi 4 milestone 2: the MMU (feat/pi4-aarch64)
 
 Identity-mapping the low 4 GiB and turning translation on. 4 KiB granule, 39-bit VA (so the walk starts
@@ -1141,7 +1157,8 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 27 | permitted |
+| arch/aarch64/mod.rs | 28 | permitted |
+| arch/aarch64/exceptions.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 2 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
