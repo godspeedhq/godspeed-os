@@ -13,6 +13,22 @@ comment.
 
 ---
 
+## 2026-08-03 - the A9-1 large-page guard selftest (test/large-page-guard)
+
+Kernel-audit A9-1 fixed a walk that could write into a mapped data frame, but the trigger (a large page
+covering a `map_in_active_tables` target) does not occur on any machine available, so the guard was
+unproven. `selftest_large_page_guard` manufactures the condition rather than mocking it: it installs a
+real 2 MiB `PS=1` entry over an unused canonical VA, calls the real `map_in_active_tables` inside it,
+and checks the mapped frame is byte-for-byte untouched. Verified in **both** directions - the test
+reports `CORRUPTION at u64 index 1` with the guard removed, and PASS with it restored.
+
+Feature-gated behind `mmio-map-fault-test`; a default build does not compile it (confirmed: the default
+image never prints `pt-selftest`, and identity is 24/24).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/x86_64/page_tables.rs` | 48 -> 51 (+3) | (1) `asm!` reading CR3 to find the active PML4 - a register read with no memory effect. (2) One block covering the test body: filling the frame with a sentinel, building PML4/PDPT/PD, installing the large-page entry, running the walk, checking the sentinel, tearing the entry down and `invlpg`-ing it. The VA is confirmed unmapped by `entry_for_va` before anything is written, so no live mapping is touched, and the frame comes exclusively from the allocator. (3) `free_phys_frame` after the entry is cleared and flushed, so no page-walker can still reach it. Permitted layer (§18.1), each block SAFETY-commented. |
+
 ## 2026-08-01 - one framebuffer console for every arch: unsafe 11 -> 3 (refactor/fbcon-neutral)
 
 `arch/x86_64/fb.rs` (790 lines) and `arch/arm/fbcon.rs` (512 lines) were two independent
@@ -1118,7 +1134,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/ioapic.rs | 8 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
 | arch/x86_64/mod.rs | 36 | permitted |
-| arch/x86_64/page_tables.rs | 48 | permitted |
+| arch/x86_64/page_tables.rs | 51 | permitted |
 | arch/x86_64/pci.rs | 19 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 15 | permitted |

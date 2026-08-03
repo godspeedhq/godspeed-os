@@ -636,3 +636,106 @@ pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
     // points to it, §10.5 / CORE_PENDING_PML4) or frees it directly.
     freed
 }
+
+// ---------------------------------------------------------------------------
+// A9-1 selftest: the large-page guard in `walk_or_alloc` (feature-gated).
+// ---------------------------------------------------------------------------
+
+/// Prove the large-page guard by building the exact condition it exists for, and checking the thing
+/// that actually mattered: that **no bytes are written into the mapped frame**.
+///
+/// A9-1 could not be reached by testing real hardware. Both `map_in_active_tables` call sites target
+/// MMIO whose HHDM alias is mapped at 4 KiB granularity, so the walk never meets a `PS=1` entry - the
+/// fault-injection pass proved the alias is mapped, but with a normal page table, not a large page. No
+/// machine available produces the trigger, so the trigger is manufactured here.
+///
+/// This deliberately does NOT mock the return value. It installs a real 2 MiB large-page entry over an
+/// unused VA and calls the real `map_in_active_tables`, so the guard's own detection
+/// (`entry & PAGE_SIZE_BIT != 0`) is what is under test. Before the fix the walk would have taken the
+/// entry's frame address as a page table and written 8 bytes at `pt_idx * 8` into it; the sentinel
+/// check below is exactly that byte range, so a regression fails loudly rather than silently.
+///
+/// Returns true if the guard held. Feature-gated: it mutates page tables, which is not something an
+/// ordinary boot should do for a test.
+#[cfg(feature = "mmio-map-fault-test")]
+pub fn selftest_large_page_guard() -> bool {
+    // A canonical VA far above both the HHDM (which starts at Limine's offset and spans physical RAM)
+    // and the kernel image at -2 GiB. 2 MiB aligned, as a large-page mapping requires.
+    const TEST_VA: u64 = 0xFFFF_9000_0000_0000;
+    // MUST be even. `map_in_active_tables` only writes a PT entry when the existing one reads as
+    // not-present (bit 0 clear), so an odd sentinel would be mistaken for a live entry and the
+    // corrupting write would be skipped - making the test pass for the wrong reason. Found by removing
+    // the guard and watching the test report "walk did not refuse" with the frame intact.
+    const SENTINEL: u64 = 0xA5A5_5A5A_DEAD_BEEE;
+
+    // Refuse to run if anything already lives here - never disturb a live mapping for a test.
+    if entry_for_va(TEST_VA).is_some() || entry_for_va(TEST_VA + 0x1000).is_some() {
+        crate::kprintln!("pt-selftest: SKIP - {:#x} is already mapped", TEST_VA);
+        return false;
+    }
+
+    let frame = match crate::memory::allocator::alloc_frame() {
+        Some(f) => f,
+        None => {
+            crate::kprintln!("pt-selftest: SKIP - no frame available");
+            return false;
+        }
+    };
+    let frame_phys = frame.phys_addr().0;
+
+    let cr3: u64;
+    // SAFETY: reading CR3 in ring 0 has no memory effect.
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)) };
+    let pml4 = cr3 & !0xFFF;
+    let inter = PageFlags::PRESENT.bits() | PageFlags::WRITABLE.bits();
+
+    // SAFETY: TEST_VA is confirmed unmapped above, so the tables built here are fresh and touch no
+    // live mapping. Every write below is to a page-table frame this function owns for its duration,
+    // or to `frame`, which the allocator just handed us exclusively.
+    let held = unsafe {
+        // Fill the frame with a sentinel. Index 1 (byte offset 8) is where a regressed walk would
+        // write, because pt_idx(TEST_VA + 0x1000) == 1.
+        let f = phys_to_virt(frame_phys);
+        for i in 0..8 {
+            f.add(i).write_volatile(SENTINEL);
+        }
+
+        // Build PML4 -> PDPT -> PD, then install a real 2 MiB large page at the PD level.
+        let pdpt = match walk_or_alloc(pml4, pml4_idx(TEST_VA), inter) { Ok(t) => t, Err(_) => return false };
+        let pd   = match walk_or_alloc(pdpt, pdpt_idx(TEST_VA), inter) { Ok(t) => t, Err(_) => return false };
+        write_entry(pd, pd_idx(TEST_VA), frame_phys | inter | PAGE_SIZE_BIT);
+
+        // THE TEST: map a 4 KiB page inside the large page's range. The walk must refuse.
+        let verdict = map_in_active_tables(TEST_VA + 0x1000, frame_phys, inter);
+        let refused = matches!(verdict, Err(MapError::AlreadyMapped));
+
+        // THE POINT: the frame must be untouched. A regressed walk writes at index 1.
+        let mut intact = true;
+        for i in 0..8 {
+            if f.add(i).read_volatile() != SENTINEL {
+                intact = false;
+                crate::kprintln!("pt-selftest: CORRUPTION at u64 index {} - the guard did not hold", i);
+            }
+        }
+
+        // Tear the large page down before anything can walk it, then flush it from this core's TLB.
+        write_entry(pd, pd_idx(TEST_VA), 0);
+        core::arch::asm!("invlpg [{}]", in(reg) TEST_VA, options(nostack, preserves_flags));
+
+        if !refused {
+            crate::kprintln!("pt-selftest: FAIL - walk did not refuse the large page ({:?})", verdict);
+        }
+        refused && intact
+    };
+
+    // SAFETY: the large-page entry is cleared and the TLB entry flushed above, so no page-walker can
+    // reach this frame any more. The two intermediate tables are intentionally left in place (a
+    // bounded, test-only cost of two frames on a feature-gated build).
+    unsafe { free_phys_frame(frame_phys) };
+
+    crate::kprintln!(
+        "pt-selftest: large-page guard {} (A9-1: walk refused, mapped frame untouched)",
+        if held { "PASS" } else { "FAIL" }
+    );
+    held
+}

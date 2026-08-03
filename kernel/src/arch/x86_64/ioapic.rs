@@ -54,6 +54,12 @@ pub fn init() {
     if IOAPIC_VA.load(Ordering::Relaxed) != 0 {
         return;
     }
+    // A9-1: prove the large-page guard before this function exercises the mapping path. Sited here
+    // rather than in `kernel_main` because neutral code may not name a specific arch (the
+    // arch-boundary guard), and because this is the subsystem the A9 findings concern. By now the
+    // frame allocator is up, which the selftest needs.
+    #[cfg(feature = "mmio-map-fault-test")]
+    let _ = crate::arch::x86_64::page_tables::selftest_large_page_guard();
     let phys = IOAPIC_PHYS_DEFAULT;
     let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
     let va = hhdm.wrapping_add(phys);
