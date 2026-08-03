@@ -29,6 +29,8 @@ pub mod mmu;
 pub mod ptables;
 #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
 pub mod sched_demo;
+#[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
+pub mod sched_user;
 #[cfg(feature = "pi4")]
 pub mod timer;
 #[cfg(feature = "pi4")]
@@ -1135,6 +1137,30 @@ pub mod syscall_entry {
     pub struct PerCoreSyscallData { pub user_rsp: u64, pub kernel_rsp: u64 }
 
     pub const USER_END: u64 = 0x0000_8000_0000_0000;
+    /// Per-core syscall scratch the neutral scheduler maintains for every user task.
+    ///
+    /// **These fields are not used by this port's syscall path**, and that is worth saying plainly. On
+    /// x86 the entry stub has to switch stacks itself, so it reads `kernel_rsp` from here; on AArch64
+    /// the exception mechanism does it architecturally (`SP_EL1` is selected by the hardware on entry
+    /// from EL0), so nothing here is consulted. The neutral scheduler still writes them for every
+    /// ring-3 switch, so they need real storage.
+    ///
+    /// It returned `null_mut()` until a task was first marked `is_user` - at which point
+    /// `prepare_ring3_switch` wrote through it. A stub that is only reachable down one path stays
+    /// invisible until something takes that path, which is why the crash arrived a whole milestone
+    /// after the stub was written.
+    ///
+    /// A fixed array, not the per-core arena, for the same reason `uaccess` uses one: this is on the
+    /// context-switch path and must not depend on an allocation having happened.
+    #[cfg(feature = "pi4")]
+    pub fn syscall_slot(core_id: usize) -> *mut PerCoreSyscallData {
+        const MAX_CORES: usize = 4; // the BCM2711 has exactly four Cortex-A72 cores
+        static mut SLOTS: [PerCoreSyscallData; MAX_CORES] =
+            [const { PerCoreSyscallData { user_rsp: 0, kernel_rsp: 0 } }; MAX_CORES];
+        // SAFETY: one slot per core, written only by the core that owns it.
+        unsafe { (&raw mut SLOTS[core_id.min(MAX_CORES - 1)]) as *mut PerCoreSyscallData }
+    }
+    #[cfg(not(feature = "pi4"))]
     pub fn syscall_slot(core_id: usize) -> *mut PerCoreSyscallData { core::ptr::null_mut() }
     pub fn init_percore_syscall_arena(n: usize) {}
     pub fn init_percore_arenas(n: usize) {}

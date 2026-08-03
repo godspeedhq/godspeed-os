@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-11 done on real hardware; 12-16 in QEMU (2026-08-03)
+> ## STATUS: milestones 1-11 done on real hardware; 12-17 in QEMU (2026-08-03)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -393,7 +393,32 @@
 > so the call went to the demo handler and proved nothing about the neutral path. `WARN unknown svc
 > #48879` in the log is what gave it away.
 >
-> **Not done:** `TaskContext::new_user`, `arch::init` + the `kernel_main` handoff, UART RX, PSCI SMP.
+> **Milestone 17 - an EL0 task under the neutral scheduler.** Every earlier EL0 excursion was a
+> one-shot. This one the **scheduler** enters, the timer preempts, and kernel tasks share a core with:
+>
+> ```
+> [EL0 task] tick 0 (scheduled, preemptible, in its own address space)
+> sched: [from a kernel task] EL0 task has reported 255 ticks - EL0 and EL1 tasks are sharing the core
+> ...                                                509 ...  749 ...  998
+> ```
+>
+> The progress report comes from a **kernel** task, so "both are running" is one observation rather than
+> two that might not overlap. Over 40 s: kernel tasks 609/614/613 lines, EL0 ticks rising steadily, no
+> panics.
+>
+> `TaskContext::new_user` bridges a real mismatch: `switch_context` ends in `ret` and stays at EL1, while
+> entering EL0 needs an `eret`. The context therefore points at a trampoline that performs the `eret`,
+> carrying the user entry and stack in `x19`/`x20` - the same shape x86 uses, differing only in where the
+> values ride. Its `sp` is the task's KERNEL stack, load-bearing beyond first entry: after the `eret` it
+> stays in `SP_EL1`, so it is the stack every later trap from this task lands on.
+>
+> **The bug this found had been sitting there for four milestones.** `syscall_slot` returned
+> `null_mut()`, and `prepare_ring3_switch` - which runs *only* for tasks marked `is_user` - writes
+> through it. Nothing had ever been marked user, so the stub was unreachable and invisible; the first
+> scheduled EL0 task turned it into a null write on the context-switch path. A stub reachable down
+> exactly one path stays silent until something takes that path.
+>
+> **Not done:** `arch::init` + the `kernel_main` handoff, UART RX, PSCI SMP.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
 > init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already

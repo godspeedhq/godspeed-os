@@ -182,6 +182,8 @@ pub fn syscall(number: u64, frame: &mut TrapFrame) {
             // has switched since, so it is a valid context to resume.
             unsafe { super::context::switch(&raw mut CTX_DISCARD, &raw const CTX_KERNEL) };
         }
+        #[cfg(feature = "pi4-sched-demo")]
+        n if n == super::sched_user::SYS_TICK => super::sched_user::tick(frame),
         _ => {
             put_str(b"    [EL0] WARN unknown svc #");
             put_dec(number);

@@ -82,23 +82,36 @@ impl TaskContext {
         c
     }
 
-    /// Build a context that enters USER mode at `user_entry`.
+    /// Build a context that, when the scheduler switches to it, ends up running at **EL0**.
     ///
-    /// Not implemented yet: entering EL0 needs the trap-frame shape the exception vectors restore
-    /// through (`ELR_EL1`/`SPSR_EL1`/`SP_EL0`), which is a different mechanism from the callee-saved
-    /// switch above - `usermode.rs` proved it separately at milestone 6, but wiring it into a scheduled
-    /// task is the next milestone's work. Loud rather than silently returning a context that would
-    /// `ret` into a user address at EL1 (§26.7).
+    /// Switching and exception-returning are different mechanisms: `switch_context` ends in `ret`,
+    /// which stays at EL1, while entering EL0 needs an `eret` with `ELR_EL1`, `SPSR_EL1` and `SP_EL0`
+    /// set. So the context does not point at the user code at all - it points at a **trampoline** that
+    /// performs the `eret`, and carries the user entry and stack in `x19`/`x20`, which the switch
+    /// restores on the way in. x86 solves the same mismatch the same way (`ring3_entry_trampoline` and
+    /// an `iretq`), differing only in where the values ride.
+    ///
+    /// `sp` is the task's **kernel** stack, and that is load-bearing beyond the first entry: after the
+    /// `eret` it stays in `SP_EL1`, so it is the stack every later trap from this task lands on. A task
+    /// whose kernel stack were wrong would run correctly at EL0 and corrupt something the first time it
+    /// made a syscall.
     ///
     /// # Safety
-    /// Same contract as `new_kernel`, plus `user_entry`/`user_stack_top` being mapped in `cr3`.
+    /// Same contract as `new_kernel`, plus: `user_entry` and `user_stack_top` must be mapped in `cr3`
+    /// with EL0 access, and `kernel_stack_top` must be a stack this task exclusively owns.
     pub unsafe fn new_user(
-        _kernel_stack_top: *mut u8,
-        _user_entry: u64,
-        _user_stack_top: u64,
-        _cr3: u64,
+        kernel_stack_top: *mut u8,
+        user_entry: u64,
+        user_stack_top: u64,
+        cr3: u64,
     ) -> Self {
-        unimplemented!("aarch64 new_user: EL0 tasks are the next milestone, see usermode.rs")
+        let mut c = Self::empty();
+        c.lr = aarch64_user_entry_trampoline as usize as u64;
+        c.x[0] = user_entry; // x19
+        c.x[1] = user_stack_top; // x20
+        c.sp = (kernel_stack_top as u64) & !0xF;
+        c.cr3 = cr3;
+        c
     }
 
     /// Prepare a context that, when switched to, begins executing `entry` on `stack_top`.
@@ -165,6 +178,18 @@ global_asm!(
 aarch64_task_entry_trampoline:
     msr  daifclr, #2
     br   x19
+
+    .globl aarch64_user_entry_trampoline
+// First-entry trampoline for a brand-new EL0 task.
+//   x19 = user entry point, x20 = user stack top, placed there by TaskContext::new_user.
+// TTBR0 was already installed by switch_context (it swaps on a cr3 change), so the user addresses
+// below already translate by the time this runs. SP_EL1 keeps the task's kernel stack, which is what
+// every later trap from this task lands on.
+aarch64_user_entry_trampoline:
+    msr  sp_el0, x20               // the user stack - EL0 has its own SP and it must be set separately
+    msr  elr_el1, x19              // where EL0 starts executing
+    msr  spsr_el1, xzr             // M[3:0]=0000 (EL0t), DAIF clear so the timer can preempt it
+    eret
 "#
 );
 
@@ -180,6 +205,9 @@ extern "C" {
     /// way (`task_entry_trampoline` does `sti` then `ret`); this port carries the entry in x19 rather
     /// than on the stack, because `ret` here jumps to `lr` rather than popping.
     fn aarch64_task_entry_trampoline() -> !;
+    /// See the assembly above and [`TaskContext::new_user`]. Performs the `eret` that a
+    /// callee-saved switch cannot.
+    fn aarch64_user_entry_trampoline() -> !;
 }
 
 /// Save the running context into `current` and resume `next`.

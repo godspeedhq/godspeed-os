@@ -13,6 +13,33 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4 milestone 17: an EL0 task under the neutral scheduler (feat/pi4-aarch64)
+
+Every earlier EL0 excursion was a one-shot: the boot dropped to EL0, the task ran, control came back.
+This is an EL0 task the **scheduler** enters, the timer preempts, and other tasks share a core with.
+
+`TaskContext::new_user` bridges a real mismatch: `switch_context` ends in `ret` and stays at EL1, while
+entering EL0 needs an `eret`. So the context points at a trampoline that performs the `eret`, carrying
+the user entry and stack in `x19`/`x20`. x86 solves the same mismatch the same way, differing only in
+where the values ride. The context's `sp` is the task's KERNEL stack, and that is load-bearing beyond
+first entry: after the `eret` it stays in `SP_EL1`, so it is the stack every later trap from this task
+lands on.
+
+**The bug this found had been sitting there for four milestones.** `syscall_slot` returned
+`core::ptr::null_mut()`, and `prepare_ring3_switch` - which runs *only* for tasks marked `is_user` -
+writes through it. Nothing had ever been marked user, so the stub was unreachable and invisible; the
+first scheduled EL0 task turned it into a null write on the context-switch path. A stub reachable down
+exactly one path stays silent until something takes that path, which is why the crash arrived a whole
+milestone after the stub was written. It is now a fixed array (not the per-core arena, for the same
+reason `uaccess` uses one: the context-switch path must not depend on an allocation having happened),
+with a comment saying plainly that AArch64 does not consult these fields - the hardware selects
+`SP_EL1` architecturally - but the neutral scheduler maintains them, so they need real storage.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/sched_user.rs` | new, 4 | Copying the position-independent EL0 payload into its frame, and building + committing the task (its kernel stack is a module-owned static; the slot is freshly reserved; the user pages are mapped with EL0 access in the table the switch installs). |
+| `arch/aarch64/mod.rs` | 50 -> 51 (+1) | `syscall_slot` handing out a pointer into its fixed per-core array. |
+
 ## 2026-08-03 - Pi 4 milestone 16: real syscall dispatch (feat/pi4-aarch64)
 
 `svc` now reaches the **neutral** `syscall::dispatch::syscall_handler` - the same function x86 and
@@ -1490,7 +1517,8 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 50 | permitted |
+| arch/aarch64/mod.rs | 51 | permitted |
+| arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/exceptions.rs | 10 | permitted |
 | arch/aarch64/uaccess.rs | 5 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |

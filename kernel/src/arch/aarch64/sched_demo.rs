@@ -20,7 +20,7 @@
 //! ordering; the scheduling decision is the same neutral code x86 runs.
 
 use crate::arch::imp::context_switch::TaskContext;
-use super::put_str;
+use super::{put_dec, put_str};
 
 const NUM: usize = 3;
 
@@ -49,6 +49,14 @@ fn run_task(id: u8) -> ! {
             v /= 10;
         }
         put_str(&line);
+        // Report the EL0 task's progress from a KERNEL task, so "both are running" is one observation
+        // rather than two that might not overlap.
+        if id == b'A' && n % 150 == 3 {
+            put_str(b"sched: [from a kernel task] EL0 task has reported ");
+            put_dec(super::sched_user::el0_ticks());
+            put_str(b" ticks - EL0 and EL1 tasks are sharing the core
+");
+        }
         n += 1;
         // Long enough that the ~10 ms quantum expires several times inside it. If the counters still
         // advance for all three ids, the timer really did preempt a task mid-spin.
@@ -89,6 +97,17 @@ pub fn run(boot_info: &crate::arch::imp::BootInfo) -> ! {
             let _ = crate::task::scheduler::task_cap_init_empty(slot); // the demo needs no caps
             crate::task::scheduler::commit_task(slot, names[i], ctx, false, stack_top as u64, None);
         }
+    }
+
+    // The EL0 task, committed alongside them. This is the piece that was impossible before
+    // `TaskContext::new_user`: an unprivileged task the SCHEDULER enters, rather than a one-shot
+    // excursion the boot makes and returns from.
+    if super::sched_user::spawn_el0_task() {
+        put_str(b"sched-demo: EL0 task committed - it will be entered by the scheduler and preempted
+");
+    } else {
+        put_str(b"sched-demo: WARN could not build the EL0 task
+");
     }
 
     // Mask IRQs while arming, so a tick cannot land between setting the flag and entering `run` - at
