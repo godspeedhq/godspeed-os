@@ -351,6 +351,26 @@ pub fn build(dtb: u64, board: &BoardInfo) -> (&'static [MemoryRegion], Source) {
     (map, source)
 }
 
+/// Assemble the arch `BootInfo` the neutral kernel consumes.
+///
+/// `hhdm_offset = 0` is the **correct** value here, not a missing one: the low 4 GiB is identity
+/// mapped, so a physical address is already addressable and there is nothing to offset through. The
+/// allocator distinguishes the two cases via `page_tables::PHYS_IS_IDENTITY` rather than treating a
+/// zero offset as an error, which is why that constant had to become `true` for this port.
+///
+/// `rsdp_addr = 0` because there is no ACPI on this board. The IOMMU path that consumes it is x86-only
+/// (AMD-Vi via IVRS), and the Pi 4 has no usable SMMU regardless - see `docs/aarch64.md` on why the
+/// §6.4 posture does not travel here.
+pub fn boot_info(map: &'static [MemoryRegion]) -> super::BootInfo {
+    super::BootInfo {
+        memory_map: map,
+        kernel_phys_start: KERNEL_PHYS_START,
+        kernel_phys_end: (kernel_phys_end() + 0xFFF) & !0xFFF,
+        hhdm_offset: 0,
+        rsdp_addr: 0,
+    }
+}
+
 /// Report the map, with enough detail that a reader can check it against the board they are holding.
 pub fn report(map: &[MemoryRegion], source: Source) {
     match source {

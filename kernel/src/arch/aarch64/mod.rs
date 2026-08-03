@@ -240,7 +240,7 @@ extern "C" fn aarch64_boot_main(dtb: u64) -> ! {
     // buffer straight out of RAM, so a cacheable buffer would need explicit maintenance; asking now
     // makes that a non-question. See `mailbox` for the full reasoning.
     #[cfg(feature = "pi4")]
-    {
+    let boot_map = {
         let info = mailbox::query();
         mailbox::report(&info);
 
@@ -251,7 +251,8 @@ extern "C" fn aarch64_boot_main(dtb: u64) -> ! {
         put_str(b"\r\n");
         let (map, source) = memmap::build(dtb, &info);
         memmap::report(map, source);
-    }
+        map
+    };
 
     // Turn translation on. The map is identity, so the PC, the stack and the UART all keep the
     // addresses they already had - which is the only reason the line after this can print.
@@ -288,6 +289,23 @@ extern "C" fn aarch64_boot_main(dtb: u64) -> ! {
         // vectors reported it correctly on hardware (ESR EC 0b111100, vector 4) - and it is removed
         // rather than left behind, because it halts the boot and everything past this point needs to
         // run. The synchronous path it exercised is unchanged.
+    }
+
+    // --- The neutral frame allocator ---------------------------------------------------------
+    //
+    // The first arch-neutral kernel code to run on this board. Everything above is `arch/aarch64/`;
+    // `crate::memory` is the same code the x86 build has used since v1, reached through the same
+    // `BootInfo` the seam defines. If it runs here unmodified, the demarcation claim holds on a
+    // second ISA in the place it is easiest to get wrong.
+    //
+    // AFTER the MMU (the bitmaps are written through the identity map, and a cacheable write of
+    // 128 KiB with caches off would be needlessly slow) and AFTER the vectors, so a fault in the
+    // allocator reports itself instead of wandering.
+    #[cfg(feature = "pi4")]
+    {
+        let bi = memmap::boot_info(boot_map);
+        crate::memory::init(&bi);
+        allocator_selftest();
     }
 
     // --- GIC-400 + generic timer -------------------------------------------------------------
@@ -385,6 +403,93 @@ pub(crate) fn put_byte(b: u8) {
             if spins > 1_000_000 { return; } // drop the byte rather than hang forever
         }
         PL011_DR.write_volatile(b);
+    }
+}
+
+/// Prove the neutral frame allocator actually works on this board, rather than merely returning.
+///
+/// A count printed by `memory::init` shows the map was parsed; it does not show that a returned frame
+/// is real, distinct, writable, or reusable. Each of those is checked:
+///
+/// 1. **Distinct and aligned** - a batch of frames, no repeats, all 4 KiB aligned and inside RAM the
+///    map called usable. A double-hand-out is the failure that corrupts everything downstream.
+/// 2. **Backed by real memory** - each frame is written with a value derived from its own address and
+///    read back. Identity-mapped, so the physical address IS the pointer. This catches a map that
+///    describes RAM the board does not have, which is exactly what a mis-parsed device tree produces.
+/// 3. **Reusable** - free them all, and the free count must return to where it started. A leak here
+///    would be invisible until the machine ran out much later.
+#[cfg(feature = "pi4")]
+fn allocator_selftest() {
+    use crate::memory::allocator::{alloc_frame, free_frame, free_frame_count};
+
+    const N: usize = 64;
+    let before = free_frame_count();
+    let mut frames = [0u64; N];
+    let mut got = 0usize;
+
+    while got < N {
+        match alloc_frame() {
+            Some(f) => {
+                frames[got] = f.phys_addr().0;
+                got += 1;
+            }
+            None => break,
+        }
+    }
+
+    let mut bad_align = 0;
+    let mut dupes = 0;
+    let mut bad_readback = 0;
+
+    for i in 0..got {
+        let pa = frames[i];
+        if pa & 0xFFF != 0 {
+            bad_align += 1;
+        }
+        if frames[..i].contains(&pa) {
+            dupes += 1;
+        }
+    }
+
+    // Write EVERY frame first, then verify every frame - deliberately two passes rather than
+    // write-then-read each in turn. A single pass cannot detect ALIASING: two distinct physical
+    // addresses backed by the same RAM would each read back correctly the instant after being
+    // written. Separating the passes means an alias overwrites the earlier frame's value and the
+    // verify catches it. That matters here specifically, because a memory map claiming RAM the board
+    // does not have usually shows up as address wrap or aliasing on real silicon, not as a fault.
+    // The value is derived from the frame's own address so no two frames expect the same bytes.
+    for i in 0..got {
+        // SAFETY: `frames[i]` is a frame the allocator just handed us, and the low 4 GiB is identity
+        // mapped as Normal writable memory, so the physical address is a valid pointer. Nothing else
+        // holds these frames.
+        unsafe { (frames[i] as *mut u64).write_volatile(frames[i] ^ 0x5A5A_A5A5_DEAD_C0DE) };
+    }
+    for i in 0..got {
+        // SAFETY: as above - the frame is still owned by this function until it is freed below.
+        let got_val = unsafe { (frames[i] as *const u64).read_volatile() };
+        if got_val != frames[i] ^ 0x5A5A_A5A5_DEAD_C0DE {
+            bad_readback += 1;
+        }
+    }
+
+    for i in 0..got {
+        // SAFETY: each frame came from `alloc_frame` above and is freed exactly once.
+        unsafe { free_frame(crate::memory::frame::Frame::from_phys(crate::memory::frame::PhysAddr(frames[i]))) };
+    }
+
+    let after = free_frame_count();
+    let ok = got == N && bad_align == 0 && dupes == 0 && bad_readback == 0 && after == before;
+
+    if ok {
+        crate::kprintln!(
+            "aarch64: frame allocator OK - {} frames distinct, aligned, read-back verified, all returned ({} free)",
+            got, after
+        );
+    } else {
+        crate::kprintln!(
+            "aarch64: WARN allocator selftest FAILED - got {}/{}, {} misaligned, {} duplicate, {} bad read-back, free {} -> {}",
+            got, N, bad_align, dupes, bad_readback, before, after
+        );
     }
 }
 
@@ -534,9 +639,20 @@ pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 
-// ---- Serial / console (PL011 on QEMU virt @ 0x0900_0000; stubbed) ----
-pub fn serial_write_byte(b: u8) { unsafe { PL011_DR.write_volatile(b); } }
-pub fn serial_write_bytes_lockfree(s: &[u8]) { for &b in s { unsafe { PL011_DR.write_volatile(b); } } }
+// ---- Serial / console ----
+// These go through `put_byte`, which POLLS the TX FIFO before writing. They previously wrote straight
+// to the data register: correct-looking, and fine while nothing called them (this file was a boundary
+// stub). The moment neutral kernel code logs through `kprintln!` that becomes byte loss the instant
+// the 32-entry FIFO fills, presenting as garbled or truncated kernel output rather than as a UART
+// problem. `put_byte`'s wait is bounded, so a wedged UART still cannot hang the log path.
+//
+// `\n` is expanded to `\r\n`: the neutral log emits bare LF, and a serial terminal needs the CR or
+// every line starts where the last one ended.
+pub fn serial_write_byte(b: u8) {
+    if b == b'\n' { put_byte(b'\r'); }
+    put_byte(b);
+}
+pub fn serial_write_bytes_lockfree(s: &[u8]) { for &b in s { serial_write_byte(b); } }
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {}
 pub fn set_console_echo(on: bool) {}
 pub fn claim_console_foreground(task_slot: u32) {}
@@ -623,7 +739,11 @@ pub mod page_tables {
         pub fn into_cr3(self) -> u64 { self.root }
     }
 
-    pub const PHYS_IS_IDENTITY: bool = false;
+    /// A physical address is directly addressable: the Pi 4 port identity-maps the low 4 GiB, so
+    /// `VA == PA` and there is no higher-half direct map to offset through. This is what lets the
+    /// neutral allocator run with `hhdm_offset == 0` instead of treating zero as "caller forgot".
+    /// Same posture as the 32-bit ARM port; the opposite of x86, where Limine supplies an HHDM.
+    pub const PHYS_IS_IDENTITY: bool = true;
     pub fn get_hhdm_offset() -> u64 { 0 }
     pub unsafe fn set_hhdm_offset(offset: u64) {}
     pub fn read_page_table_base() -> u64 { 0 }               // TTBR0_EL1

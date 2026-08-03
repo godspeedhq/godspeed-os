@@ -13,6 +13,26 @@ comment.
 
 ---
 
+## 2026-08-03 - Pi 4 milestone 8: the neutral frame allocator (feat/pi4-aarch64)
+
+The first arch-neutral kernel code to run on this board. `crate::memory::init` is the same code the
+x86 build has used since v1, reached through the `BootInfo` the seam defines - the demarcation claim
+tested on a second ISA in the place it is easiest to get wrong.
+
+The `unsafe` added is a **selftest**, not plumbing. `memory::init` printing a free count shows the map
+parsed; it does not show that a returned frame is real, distinct, writable, or reusable. The selftest
+writes every frame with a value derived from its own physical address, then verifies every frame in a
+SECOND pass. The two passes are the point: write-then-read each frame in turn cannot detect ALIASING,
+because two distinct physical addresses backed by the same RAM would each read back correctly the
+instant after being written. A memory map claiming RAM the board does not have shows up as address
+wrap or aliasing on real silicon far more often than as a fault, so this is the failure the port is
+actually exposed to. Proven to fire by corrupting one frame: `1 bad read-back`, correct index counted,
+every other counter clean.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 27 -> 28 (+1) | The allocator selftest's frame writes and read-backs, plus the `free_frame` calls that return them. The frames come from `alloc_frame` and the low 4 GiB is identity mapped as Normal writable memory, so a physical address is a valid pointer and nothing else holds these frames. Also in this commit, at no cost to the count: `serial_write_byte` now routes through `put_byte` (which polls TXFF) instead of writing the data register directly - it previously dropped bytes the moment the 32-entry FIFO filled, which nothing had noticed because nothing called it until neutral code began logging. |
+
 ## 2026-08-03 - Pi 4 milestone 7: the memory map (feat/pi4-aarch64)
 
 The board does not tell the ARM how much RAM it has unless asked. Two sources are read, both before the
@@ -36,7 +56,7 @@ after `.bss` is zeroed.
 |------|--------|-----|
 | `arch/aarch64/mailbox.rs` | new, 3 | (1) The mailbox handshake: volatile reads of `MBOX_STATUS`/`MBOX_READ` and a write to `MBOX_WRITE`, all identity-mapped Device memory, both waits bounded so a silent GPU cannot hang the boot (invariant 12). (2)+(3) Staging the request in a module-owned 16-byte-aligned static and reading the reply back, during single-threaded boot with caches off - which is the point: the GPU reads the buffer out of RAM directly, so running before `mmu::enable` removes the cache-maintenance question rather than answering it. |
 | `arch/aarch64/memmap.rs` | new, 7 | (1) Reading the linker's `__kernel_end` - taking a symbol's address does not dereference it. (2)-(4) The three bounds-checked device-tree accessors (`u32_at`, `u8_at`, and the header/magic read in `open`); each refuses any offset outside `totalsize` BEFORE reading, so a malformed blob produces `None` rather than a wild read. (5)+(6) Building the region array in a module-owned `.bss` static during single-threaded boot. (7) Handing that array out as a `&'static [MemoryRegion]` - the storage is static and the slice is read-only and never rebuilt. |
-| `arch/aarch64/mod.rs` | 28 -> 28 (net 0) | The `_start` change is inside the existing `naked_asm!` block, so the count is unchanged: `mov x19, x0` before the EL2 check preserves the device-tree pointer, and `mov x0, x19` hands it to Rust. |
+| `arch/aarch64/mod.rs` | 27 -> 27 (net 0) | The `_start` change is inside the existing `naked_asm!` block, so the count is unchanged: `mov x19, x0` before the EL2 check preserves the device-tree pointer, and `mov x0, x19` hands it to Rust. |
 
 ## 2026-08-03 - Pi 4: EL0 gets its own 2 MiB region (feat/pi4-aarch64)
 
@@ -1254,7 +1274,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 27 | permitted |
+| arch/aarch64/mod.rs | 28 | permitted |
 | arch/aarch64/exceptions.rs | 7 | permitted |
 | arch/aarch64/context.rs | 2 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |

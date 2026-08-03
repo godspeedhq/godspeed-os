@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-7 done on real hardware (2026-08-03)
+> ## STATUS: milestones 1-7 done on real hardware, 8 in QEMU (2026-08-03)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -42,6 +42,7 @@
 > | 5. Context switch | Two kernel tasks ping-ponging; witnesses in callee-saved integer AND `d8`-`d15` verified on resume |
 > | 6. EL0 + `svc` | Dropped to EL0, syscall round trip checked in both directions, clean exit; ticks 13 -> 15 across the excursion, so IRQs stayed live at EL0 |
 > | 7. Memory map | `source = device tree (authoritative)`; two banks, 1968 MiB usable, the 76 MiB GPU split correctly excluded |
+> | 8. Neutral frame allocator | The first arch-neutral code on this board: `crate::memory::init` unmodified, then 64 frames distinct, aligned, read-back verified, all returned (QEMU first, board pending) |
 >
 > The timer evidence is a rate check, not just a delivery check: the log timestamps put 10 ticks 111 ms
 > apart, which is 100 Hz. A wrong reload would still have delivered ten interrupts.
@@ -115,9 +116,39 @@ Worth knowing: the on-disk `bcm2711-rpi-4-b.dtb`'s `/memory` node is a **zero-si
 > about. The clamp correctly did **not** fire: every bank on a 2 GB board is below the identity-map
 > limit, which is why it needed the injected test to be proven at all.
 >
-> **Not done:** assembling this into the arch's `BootInfo` and handing it to the neutral allocator,
-> per-task page tables, the neutral scheduler, PSCI SMP, and `kernel_main` itself. The remaining
-> `arch/aarch64/` surface is still stubs. Every mechanism a scheduler needs now exists and is
+> **Milestone 8 - the first arch-neutral kernel code on this board.** `crate::memory::init` is the same
+> allocator the x86 build has used since v1, reached through the `BootInfo` the seam defines and
+> compiled without modification. It is the demarcation claim tested on a second ISA in the place it is
+> easiest to get wrong.
+>
+> ```
+> memory: kernel phys [0x80000, 0x400000) hhdm=0x0
+> allocator: frame bitmap 30 KiB x2 covers 245760 frames, carved at phys 0x3bff1000
+> memory: frame allocator ready (956 MiB free)
+> aarch64: frame allocator OK - 64 frames distinct, aligned, read-back verified, all returned
+> ```
+>
+> `hhdm_offset = 0` is the **correct** value, not a missing one: the low 4 GiB is identity mapped, so a
+> physical address is already addressable. The allocator distinguishes "identity" from "caller forgot"
+> via `page_tables::PHYS_IS_IDENTITY`, which this port had to set `true` (it was `false`, inherited from
+> the stub). Same posture as the 32-bit ARM port, opposite to x86.
+>
+> **The selftest writes every frame, then verifies every frame - two passes, deliberately.** A single
+> write-then-read pass cannot detect **aliasing**, because two distinct physical addresses backed by the
+> same RAM each read back correctly the instant after being written. Separating the passes means an
+> alias overwrites the earlier frame's value and the verify catches it. That is the failure this port is
+> actually exposed to: a memory map claiming RAM the board does not have shows up as address wrap or
+> aliasing on real silicon far more often than as a clean fault. Proven to fire by corrupting one frame.
+>
+> **A latent bug found on the way in:** `serial_write_byte` and `serial_write_bytes_lockfree` - the path
+> `kprintln!` uses - wrote straight to the PL011 data register with no `TXFF` poll, while the arch's own
+> `put_byte` polled correctly. Harmless while this file was a boundary stub that nothing called; the
+> moment neutral code began logging it would drop bytes as soon as the 32-entry FIFO filled, and it
+> would have read as a kernel fault rather than a UART one. Both now route through `put_byte`, and `\n`
+> is expanded to `\r\n` since the neutral log emits bare LF.
+>
+> **Not done:** per-task page tables, the neutral scheduler, PSCI SMP, and `kernel_main` itself. The
+> remaining `arch/aarch64/` surface is still stubs. Every mechanism a scheduler needs now exists and is
 > hardware-proven; what remains is wiring the neutral kernel onto them.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
