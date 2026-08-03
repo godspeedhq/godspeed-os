@@ -252,6 +252,11 @@ pub mod page_tables {
     }
 
     pub const PHYS_IS_IDENTITY: bool = false;
+
+    /// No bootloader placed page tables for this port - the kernel builds its own, in `.bss` inside the
+    /// kernel image, which the memory map already excludes from usable RAM. So there is nothing for
+    /// `protect_kernel_page_table_frames` to protect, and its x86-format walk must not run here.
+    pub const BOOTLOADER_PLACED_TABLES: bool = false;
     pub fn get_hhdm_offset() -> u64 { 0 }
     pub unsafe fn set_hhdm_offset(offset: u64) {}
     pub fn read_page_table_base() -> u64 { 0 }               // TTBR0_EL1

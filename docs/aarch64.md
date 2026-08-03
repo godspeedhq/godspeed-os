@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-10 done on real hardware, 11 (TTBR1 split) in QEMU (2026-08-03)
+> ## STATUS: milestones 1-11 (TTBR1 split) done on real hardware (2026-08-03)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -45,7 +45,7 @@
 > | 8. Neutral frame allocator | The first arch-neutral code on this board: `crate::memory::init` unmodified, 1968 MiB free, 64 frames distinct, aligned, read-back verified, all returned |
 > | 9. Neutral scheduler + preemption | Three never-yielding kernel tasks round-robined by `scheduler::run` under the 100 Hz tick; on the board, counters 194/194/195 and lines torn mid-word by the tick |
 > | 10. Per-task page tables | A private address space built, `TTBR0_EL1` swapped, a page read back through the new mapping, kernel still reachable, every frame reclaimed |
-> | 11. TTBR1 split | Kernel linked high / loaded low, relocates PC **and** SP into `TTBR1`, then RETIRES the low map - `TTBR0_EL1` empty and free for a task (QEMU first, board pending) |
+> | 11. TTBR1 split | Kernel linked high / loaded low, relocates PC **and** SP into `TTBR1`, then RETIRES the low map - `TTBR0_EL1` empty and free for a task |
 >
 > The timer evidence is a rate check, not just a delivery check: the log timestamps put 10 ticks 111 ms
 > apart, which is 100 Hz. A wrong reload would still have delivered ten interrupts.
@@ -270,6 +270,19 @@
 > (`ESR 0x8200000e`) - reported cleanly by the vectors. That is the split working. Its replacement is a
 > real EL0 task with its code and stack mapped into its **own** TTBR0 space at a low VA it genuinely
 > owns; every piece needed for that already exists.
+>
+> **The board found a bug QEMU could not.** With `hhdm_offset` finally holding a real value, the neutral
+> `protect_kernel_page_table_frames` began running for the first time on this port - and it walks **x86
+> PML4 tables** by their x86 format, treating indices 256..512 as the kernel half. It followed a garbage
+> descriptor and took a data abort (`ESR 0x96000004`, `FAR 0xc60e972657000`), symbolized to that
+> function inlined into `boot_high`.
+>
+> It had been harmless only because it early-returns when `hhdm == 0` - a *different claim* that merely
+> happened to hold on every non-x86 port. The real condition is whether a **bootloader** placed the
+> kernel's page tables in RAM the allocator would otherwise hand out, so that is now what is asked:
+> `page_tables::BOOTLOADER_PLACED_TABLES`, `true` on x86 (Limine does exactly that) and `false`
+> everywhere else, where the kernel builds its own tables in `.bss` inside the image the memory map
+> already excludes. The 32-bit ARM port was relying on the same accident and is now explicit too.
 >
 > **Not done:** EL0 tasks in their own address space, PSCI SMP, and `kernel_main` itself.
 >

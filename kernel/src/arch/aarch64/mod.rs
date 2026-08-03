@@ -1022,6 +1022,15 @@ pub mod page_tables {
     pub const PHYS_IS_IDENTITY: bool = false;
     #[cfg(not(feature = "pi4"))]
     pub const PHYS_IS_IDENTITY: bool = true;
+
+    /// No bootloader placed page tables for this port - the kernel builds its own, in `.bss` inside
+    /// the kernel image, which the memory map already excludes from usable RAM. So there is nothing
+    /// for `protect_kernel_page_table_frames` to protect, and its x86-format PML4 walk must not run.
+    ///
+    /// This constant exists because that walk was previously gated on `hhdm == 0`, which is a
+    /// different claim that merely happened to hold here. Giving this port a real direct-map offset
+    /// turned the walk loose on the ARM tables and it took a data abort on hardware.
+    pub const BOOTLOADER_PLACED_TABLES: bool = false;
     /// The direct-map base the neutral allocator was handed. Stored rather than assumed so a caller
     /// that forgot `set_hhdm_offset` reads zero and fails loudly instead of quietly translating wrong.
     static HHDM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

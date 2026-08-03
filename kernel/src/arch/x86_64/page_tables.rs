@@ -28,6 +28,12 @@ static mut HHDM_OFFSET: u64 = 0;
 /// rather than "unset". x86 reaches frames through Limine's higher-half direct map, so this is false.
 pub const PHYS_IS_IDENTITY: bool = false;
 
+/// The BOOTLOADER placed this kernel's page tables in RAM the allocator would otherwise hand out, so
+/// `protect_kernel_page_table_frames` must walk them and mark those frames used. True here: Limine
+/// builds the initial tables and leaves them in bootloader-reclaimable memory.
+pub const BOOTLOADER_PLACED_TABLES: bool = true;
+
+
 /// Returns 0 if called before `set_hhdm_offset`.
 #[inline]
 pub fn get_hhdm_offset() -> u64 {

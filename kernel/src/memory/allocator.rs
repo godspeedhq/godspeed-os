@@ -609,6 +609,20 @@ pub fn phys_in_ram(phys: u64) -> bool {
 /// Must be called after `allocator::init` (bitmap populated) and after
 /// `set_hhdm_offset` (physical↔virtual translation live).
 pub fn protect_kernel_page_table_frames() {
+    // Only meaningful where a BOOTLOADER placed the kernel's page tables in RAM the allocator would
+    // otherwise hand out. The walk below reads x86 PML4/PDPT/PD entries by their x86 format and treats
+    // indices 256..512 as the kernel half - none of which describes a port that builds its own tables.
+    //
+    // This used to be gated only by `hhdm == 0`, which is not the same claim and merely happened to be
+    // true on the ports where the walk is meaningless. The moment the AArch64 port gained a real
+    // direct-map offset, this function began walking whatever `read_page_table_base` returned as though
+    // it were an x86 PML4, followed a garbage descriptor, and took a data abort - with the ARM port's
+    // own tables never having been at risk in the first place, because they live in `.bss` inside the
+    // kernel image the memory map already excludes.
+    if !crate::arch::imp::page_tables::BOOTLOADER_PLACED_TABLES {
+        return;
+    }
+
     let hhdm = crate::arch::imp::page_tables::get_hhdm_offset();
     if hhdm == 0 {
         return; // HHDM not initialised - cannot walk tables safely.
