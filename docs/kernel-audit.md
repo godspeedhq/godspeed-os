@@ -61,7 +61,23 @@ and MMIO-mapping path, both of the same shape. Both FIXED (2026-08-03, `fix/mmio
 > present 4 KiB page table rather than a large-page entry, so **A9-1's large-page case is still
 > unobserved** - not because the page is absent, but because it is mapped at 4 KiB granularity.
 >
-> **Still unobserved:** a large page covering a `map_in_active_tables` target (A9-1's actual trigger).
+> **A9-1 is now CLOSED too - the bug is reproduced, not merely guarded against**
+> (`selftest_large_page_guard`, same feature). No machine here produces the trigger, so the trigger is
+> manufactured: the test installs a real 2 MiB `PS=1` entry over an unused canonical VA and calls the
+> real `map_in_active_tables` inside it, so the guard's own detection is what is under test rather than
+> a mocked return. It then checks the property that actually mattered - that the mapped frame is
+> **byte-for-byte untouched**.
+>
+> **Both directions verified**, because a test that has never failed proves nothing:
+> - guard present: `pt-selftest: large-page guard PASS (walk refused, mapped frame untouched)`
+> - guard removed: `pt-selftest: CORRUPTION at u64 index 1 - the guard did not hold`, at exactly the
+>   index predicted (`pt_idx(TEST_VA + 0x1000) == 1`). That is the A9-1 defect, executed.
+>
+> **The failure run also exposed a flaw in the test itself.** The first sentinel was odd, and
+> `map_in_active_tables` only writes a PT entry whose existing value reads as not-present (bit 0
+> clear) - so the corrupting write was skipped and the frame stayed intact for the *wrong reason*. The
+> sentinel is now even, and the comment says why. Had the guard-removed run not been done, a test that
+> could pass without the fix would have been recorded as proof of it.
 
 | ID | Severity | Commandment | Finding |
 |----|----------|-------------|---------|
