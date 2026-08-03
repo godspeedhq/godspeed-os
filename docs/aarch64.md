@@ -284,6 +284,11 @@
 > everywhere else, where the kernel builds its own tables in `.bss` inside the image the memory map
 > already excludes. The 32-bit ARM port was relying on the same accident and is now explicit too.
 >
+> With that fixed the board runs the whole stack clean: **1954 MiB** free, allocator and page-table
+> selftests both passing, the timer at the board's real 54 MHz, the watchdog armed, and the scheduler
+> round-robining three never-yielding tasks at **153 / 153 / 153** lines (counters 152 / 152 / 152).
+> No exceptions, no warnings.
+>
 > **Not done:** EL0 tasks in their own address space, PSCI SMP, and `kernel_main` itself.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
