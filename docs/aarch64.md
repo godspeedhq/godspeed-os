@@ -87,7 +87,7 @@
 > (an 8 GiB bank truncated, a 6 GiB bank dropped). Commandment IX - a guard never seen firing is not
 > evidence that it fires.
 >
-Worth knowing: the on-disk `bcm2711-rpi-4-b.dtb`'s `/memory` node is a **zero-size placeholder**
+> Worth knowing: the on-disk `bcm2711-rpi-4-b.dtb`'s `/memory` node is a **zero-size placeholder**
 > (`reg = <0x0 0x0 0x0>`) which the firmware patches at boot, so a parser tested only against the file
 > would conclude the board has no RAM.
 >
