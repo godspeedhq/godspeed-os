@@ -39,6 +39,7 @@ use super::{put_dec, put_hex, put_str};
 const PCIE_BASE: u64 = 0xFD50_0000;
 
 // --- Root-complex registers (offsets from PCIE_BASE) ------------------------------------------
+const RC_CFG_VENDOR_SPECIFIC_REG1: u64 = 0x0188;
 const RC_CFG_PRIV1_ID_VAL3: u64 = 0x043c;
 const MISC_CTRL: u64 = 0x4008;
 const MEM_WIN0_LO: u64 = 0x400c;
@@ -52,6 +53,7 @@ const MEM_WIN0_BASE_LIMIT: u64 = 0x4070;
 const MEM_WIN0_BASE_HI: u64 = 0x4080;
 const MEM_WIN0_LIMIT_HI: u64 = 0x4084;
 const HARD_DEBUG: u64 = 0x4204;
+const UBUS_BAR2_CONFIG_REMAP: u64 = 0x40b4;
 const MSI_INTR2_MASK_SET: u64 = 0x4500 + 0x10;
 const EXT_CFG_DATA: u64 = 0x8000;
 const EXT_CFG_INDEX: u64 = 0x9000;
@@ -253,6 +255,12 @@ pub fn init(ram_bytes: u64) -> Option<Device> {
     set_bits(RC_BAR1_CONFIG_LO, 0x1F, 0);
     set_bits(RC_BAR3_CONFIG_LO, 0x1F, 0);
 
+    // 5b. The inbound window's endian mode and its UBUS access enable. Both are unconditional in the
+    //     reference, on every chip it supports, and neither has an obvious symptom when missing - which
+    //     is precisely why they are copied rather than reasoned about.
+    set_bits(RC_CFG_VENDOR_SPECIFIC_REG1, 0xC, 0x0); // BAR2 endian mode: little
+    set_bits(UBUS_BAR2_CONFIG_REMAP, 0, 1); // access enable
+
     // 6. Mask every MSI. Interrupts are not routed yet - the event ring is polled - and an unmasked
     //    source with no handler is a live interrupt storm waiting for the first packet.
     wr(MSI_INTR2_MASK_SET, 0xFFFF_FFFF);
@@ -275,8 +283,9 @@ pub fn init(ram_bytes: u64) -> Option<Device> {
     put_str(b"ms\r\n");
 
     // 8. Present the RC as a PCI-to-PCI bridge. Enumeration software (including the code below) reads
-    //    the class to decide whether to look for a bus behind it.
-    wr(RC_CFG_PRIV1_ID_VAL3, 0x0604_00);
+    //    the class to decide whether to look for a bus behind it. The class code is a 24-bit FIELD in
+    //    this register, so it is a masked write - a whole-register write zeroes the byte above it.
+    set_bits(RC_CFG_PRIV1_ID_VAL3, 0x00FF_FFFF, 0x0006_0400);
 
     // 9. Outbound window: CPU addresses that reach the bus.
     let (cpu_base, cpu_size) = super::mmu::pcie_window();
@@ -296,17 +305,29 @@ fn set_outbound_window(cpu_addr: u64, bus_addr: u64, size: u64) {
     // registers carry what is left over above 4 GiB. Splitting them is why a window at 0x6_0000_0000
     // needs three writes and not one.
     //
-    // **Read-modify-write, not plain write.** These registers hold only the base and limit fields as
-    // far as this file is concerned, and a plain write is the obvious thing - but the reference
-    // implementations both do read-modify-write, and the bits neither of them names are exactly the
-    // ones you cannot afford to zero on a guess. Preserving them costs a read.
+    // **LIMIT occupies bits 31:20 and BASE occupies bits 15:4 - not the other way round.** The name of
+    // the register reads "BASE_LIMIT", the fields appear in that order in every description of it, and
+    // the obvious guess is that base is the high half. It is not:
+    //
+    //     PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_LIMIT_LIMIT_MASK  0xfff00000
+    //     PCIE_MISC_CPU_2_PCIE_MEM_WIN0_BASE_LIMIT_BASE_MASK   0xfff0
+    //
+    // Getting it backwards writes a base ABOVE the limit, which is how PCI spells "this window is
+    // closed" - so the root complex accepts every register write, reads them all back exactly as
+    // written, reports the link up, and forwards nothing. The symptom is a poison value from the far
+    // side, indistinguishable from a device that is not answering. Four hardware iterations were spent
+    // on that, and none of them could have found it by reasoning: the readback was `0x3f0`, which looks
+    // like a plausible small number either way round.
+    //
+    // Read-modify-write, as the reference does, so bits outside these two fields are preserved.
     let base_mb = cpu_addr >> 20;
     let limit_mb = (cpu_addr + size - 1) >> 20;
     set_bits(
         MEM_WIN0_BASE_LIMIT,
         0xFFF0_FFF0,
-        (((base_mb & 0xFFF) as u32) << 20) | (((limit_mb & 0xFFF) as u32) << 4),
+        (((limit_mb & 0xFFF) as u32) << 20) | (((base_mb & 0xFFF) as u32) << 4),
     );
+    // The upper bits of each are shifted by the WIDTH of the base field (12), not by 20.
     set_bits(MEM_WIN0_BASE_HI, 0xFF, (base_mb >> 12) as u32 & 0xFF);
     set_bits(MEM_WIN0_LIMIT_HI, 0xFF, (limit_mb >> 12) as u32 & 0xFF);
 }
@@ -404,7 +425,7 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
         //
         // Re-applying is cheap and idempotent. Assuming they survived is how a correct sequence
         // produces a dead device, with the log showing every step succeeding.
-        wr(RC_CFG_PRIV1_ID_VAL3, 0x0604_00);
+        set_bits(RC_CFG_PRIV1_ID_VAL3, 0x00FF_FFFF, 0x0006_0400);
         set_outbound_window(cpu_base, PCI_WIN_BUS_ADDR, cpu_size);
         cfg_write(0, 0, 0, 0x18, 0x0001_0100);
 
