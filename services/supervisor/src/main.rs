@@ -482,6 +482,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
+    // Not on the ARM ports: there the USB host controller is driven IN-KERNEL (aarch64 xHCI over the
+    // PCIe root complex, arm32 DWC2), because neither routes device IRQs to userspace yet. There is no
+    // userspace driver ELF to load, so this spawn can only ever fail - and it failed LOUDLY every boot
+    // with `LoadFailed(TooSmall)`, which is a real error message for a service that was never supposed
+    // to exist here. Loud failure is right for a thing that should have worked (invariant 12); a
+    // permanent error for a thing that is not part of this architecture is just noise that trains the
+    // reader to ignore the log. When ARM routes device IRQs to userspace and the driver moves out of
+    // the kernel, this gate is what comes off.
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     spawn_mapped(&ctx, &mut name_map, "xhci", 0xFFFF);
 
     // ehci: USB 2.0 host-controller driver (§12) for the back ports. Same builds
@@ -492,6 +501,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     if ctx.ehci_present() {
         spawn_mapped(&ctx, &mut name_map, "ehci", 0xFFFF);
     } else {

@@ -398,6 +398,27 @@ const DMA_RING_BUF_EN_SHIFT: u32 = 1;
 const DMA_RING_BUF_SIZE: u64 = 0x10;
 const DMA_START_ADDR: u64 = 0x14;
 const DMA_END_ADDR: u64 = 0x1C;
+
+// The ring POSITION registers. Like the index pair, these share offsets between the two directions and
+// swap meaning: `RDMA_WRITE_PTR` and `TDMA_READ_PTR` are both 0x00, `RDMA_READ_PTR` and
+// `TDMA_WRITE_PTR` are both 0x2C. Whoever writes the data owns the write pointer - the hardware on
+// receive, the driver on transmit - so the same offset is the hardware's register on one ring and ours
+// on the other. Reading the header down the wrong column is how the index pair was mis-named earlier.
+/// Where the receive DMA writes the next descriptor. Uninitialised, the engine has no valid position
+/// in the ring, which is a ring that never advances rather than one that misbehaves visibly.
+const RDMA_WRITE_PTR: u64 = 0x00;
+const RDMA_WRITE_PTR_HI: u64 = 0x04;
+/// Flow-control thresholds, packed XOFF in the upper half and XON in the lower.
+const RDMA_XON_XOFF_THRESH: u64 = 0x28;
+/// Where the receive DMA reads from. Paired with `TDMA_WRITE_PTR` at the same offset.
+const RDMA_READ_PTR: u64 = 0x2C;
+const RDMA_READ_PTR_HI: u64 = 0x30;
+
+/// Linux computes these from its 256-descriptor pool: `DMA_FC_THRESH_HI` is `TOTAL_DESC >> 4` and
+/// `DMA_FC_THRESH_LO` is a flat 5.
+const DMA_FC_THRESH_HI: u32 = 256 >> 4;
+const DMA_FC_THRESH_LO: u32 = 5;
+const DMA_XOFF_THRESHOLD_SHIFT: u32 = 16;
 /// The index registers are paired by DIRECTION, and the pairing is easy to read backwards:
 ///
 ///     [TDMA_CONS_INDEX] = 0x08,   [RDMA_PROD_INDEX] = 0x08,
@@ -581,6 +602,23 @@ pub fn init_rx_ring() -> bool {
     // How many descriptors the hardware fills before it counts a batch done. 1 = report every frame,
     // which is what a polled driver wants.
     wr(ring_reg(RDMA_OFFSET, RX_RING_INDEX, DMA_MBUF_DONE_THRESH), 1);
+
+    // The ring POSITION pointers, in words, matching `DMA_START_ADDR`. These were missing entirely:
+    // the geometry said where the ring lives and the indices said it was empty, but nothing told the
+    // engine where in it to start writing. An engine with no position never advances - which is a ring
+    // that reports exactly what a filtered-out or disabled MAC reports, and is why this survived three
+    // separate fixes upstream of it.
+    wr(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_WRITE_PTR), 0);
+    wr(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_WRITE_PTR_HI), 0);
+    wr(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_READ_PTR), 0);
+    wr(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_READ_PTR_HI), 0);
+
+    // Flow-control thresholds. Linux programs these on every ring; a zero XOFF threshold is a receiver
+    // permanently asking the far end to stop.
+    wr(
+        ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_XON_XOFF_THRESH),
+        (DMA_FC_THRESH_LO << DMA_XOFF_THRESHOLD_SHIFT) | DMA_FC_THRESH_HI,
+    );
 
     // Read the geometry back. A ring whose registers did not take is a ring the controller would walk
     // using whatever they do hold - and the descriptors above are already pointing at real memory.
