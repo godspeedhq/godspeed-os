@@ -73,6 +73,7 @@ entry, because a malformed descriptor from an untrusted device must end the walk
 | `arch/aarch64/uaccess.rs` | 5 -> 7 (+2) | `probe_read32`: the fixup pointer, and the one-instruction `asm!` block that arms it, does the load, and clears it on both exit paths. |
 | `arch/aarch64/mmu.rs` | 12 -> 15 (+3) | `dma_sync` (`dc civac` over a range shared with a bus master - the BCM2711's PCIe is not I/O-coherent, SEC-28), and the two `fill_device_window` writes that build the sparse PCIe outbound-window table. |
 | `arch/aarch64/mod.rs` | 59 -> 61 (+2) | The write and the read of `PCIE_XHCI`, the static carrying the discovered controller from the boot probe to the driver. |
+| `arch/aarch64/exceptions.rs` | 11 -> 12 (+1) | `end_probe`: `dsb sy` to complete outstanding accesses, then briefly unmask `PSTATE.A` so a pending SError is delivered INSIDE the probe window rather than at the next entry to EL0 - which is where the first bring-up's abort actually surfaced, blaming an EL0 selftest 180 ms and one subsystem away from the write that caused it. |
 | `arch/aarch64/uart_rx.rs` | 2 -> 3 (+1) | `push`: a keyboard delivering a byte into the ring the console reader already drains. The ring is shared with serial deliberately - the console has one input stream, and a blocked reader should not have to know which device a byte came from. |
 
 ## 2026-08-04 - Pi 4: the page-table primitives the chaos run needed (feat/pi4-aarch64)
@@ -1716,7 +1717,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/sched_spawn.rs | 2 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
-| arch/aarch64/exceptions.rs | 11 | permitted |
+| arch/aarch64/exceptions.rs | 12 | permitted |
 | arch/aarch64/uaccess.rs | 7 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |

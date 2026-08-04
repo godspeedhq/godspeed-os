@@ -84,6 +84,23 @@ global_asm!(
     b    aarch64_sync_current_common
 .endm
 
+// SError vectors need a decision rather than a fixed answer. An SError is an ASYNCHRONOUS external
+// abort - the interconnect reporting that some earlier posted write went nowhere - so it does not land
+// on the instruction that caused it, and by default it is a halt, correctly: a machine that has been
+// told a write vanished has no idea what state it is in.
+//
+// The exception is a DELIBERATE PROBE of hardware that may not be there. Bringing up the PCIe root
+// complex writes registers that a board without one will refuse, and the refusal arrives later, as a
+// pending SError that detonates on the next entry to EL0 - a trap report pointing at a userspace task
+// that did nothing wrong. See `aarch64_serror_dispatch`.
+.macro VECTOR_SERROR kind
+    .align 7
+    sub  sp, sp, #272
+    stp  x0, x1, [sp, #0]
+    mov  x0, #\kind
+    b    aarch64_serror_common
+.endm
+
 // IRQ vectors must RETURN, not report and halt - a timer tick that halts the machine is not a tick.
 .macro VECTOR_IRQ kind
     .align 7
@@ -100,19 +117,19 @@ aarch64_vectors:
     VECTOR_ENTRY 0                 // Current EL, SP_EL0:  Synchronous
     VECTOR_IRQ   1                 //                      IRQ
     VECTOR_ENTRY 2                 //                      FIQ
-    VECTOR_ENTRY 3                 //                      SError
+    VECTOR_SERROR 3               //                      SError
     VECTOR_SYNC_CURRENT 4          // Current EL, SP_ELx:  Synchronous (user-copy faults land here)
     VECTOR_IRQ   5                 //                      IRQ
     VECTOR_ENTRY 6                 //                      FIQ
-    VECTOR_ENTRY 7                 //                      SError
+    VECTOR_SERROR 7               //                      SError
     VECTOR_SYNC_LOWER 8            // Lower EL, AArch64:   Synchronous (svc lands here)
     VECTOR_IRQ   9                 //                      IRQ
     VECTOR_ENTRY 10                //                      FIQ
-    VECTOR_ENTRY 11                //                      SError
+    VECTOR_SERROR 11              //                      SError
     VECTOR_ENTRY 12                // Lower EL, AArch32:   Synchronous
     VECTOR_IRQ   13                //                      IRQ
     VECTOR_ENTRY 14                //                      FIQ
-    VECTOR_ENTRY 15                //                      SError
+    VECTOR_SERROR 15              //                      SError
 
 // Save x2..x30 plus ELR/SPSR into the frame the vector entry opened. Used by both tails.
 .macro SAVE_REST
@@ -148,6 +165,22 @@ aarch64_trap_common:
 
 // IRQ: save, handle, restore, return. The restore order matters - x2/x3 carry ELR/SPSR into their
 // system registers and are only reloaded with their real values afterwards.
+// SError: ask whether it was expected. `aarch64_serror_dispatch` returns non-zero when the kernel was
+// deliberately probing hardware that might not answer, in which case we resume; otherwise fall through
+// to the same report-and-halt every other unexpected trap gets.
+aarch64_serror_common:
+    SAVE_REST
+    mov  x19, x0                   // keep the vector number across the call
+    mov  x1, sp
+    bl   aarch64_serror_dispatch   // (vector: u64, frame: *mut TrapFrame) -> u64
+    cbz  x0, 1f
+    b    aarch64_exception_return
+1:  mov  x0, x19
+    mov  x1, sp
+    bl   aarch64_trap_report
+2:  wfe
+    b    2b
+
 aarch64_sync_current_common:
     SAVE_REST
     mov  x1, sp
@@ -353,6 +386,59 @@ const EC_DATA_ABORT_SAME: u64 = 0b100101;
 /// syscall rather than to the machine. The window is **narrow by construction** - it covers only the
 /// instruction that touches user memory - so a kernel bug faulting anywhere else still halts loudly,
 /// which is the property that makes this safe rather than a blanket "ignore kernel faults".
+/// Set while the kernel is deliberately poking hardware that may not be there.
+static PROBING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// SErrors absorbed while probing. A count, so the probe can report what it cost.
+static SERRORS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Open the probe window: SErrors are counted and resumed from rather than halting.
+///
+/// The window is closed by [`end_probe`], which also DRAINS: an SError raised by a posted write is
+/// asynchronous and stays pending while `PSTATE.A` is masked, which it is throughout boot. Left
+/// pending, it fires at the first `eret` into EL0 - where SPSR clears DAIF - and reports a userspace
+/// task that did nothing wrong, at an address in a completely different subsystem. That is exactly how
+/// the first PCIe bring-up presented: a clean "link did not train" line, and then an SError blamed on
+/// the EL0 selftest 180 ms later.
+pub fn begin_probe() {
+    SERRORS.store(0, core::sync::atomic::Ordering::Relaxed);
+    PROBING.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Close the probe window, collecting anything still in flight. Returns how many were absorbed.
+pub fn end_probe() -> u32 {
+    // SAFETY: `dsb sy` waits for outstanding accesses to complete, so a write that is going to be
+    // refused has been refused by the time the mask is lifted. Unmasking SError briefly lets any
+    // pending one be delivered HERE, inside the window, rather than at the next entry to EL0. The
+    // `nop`s give it somewhere to land; the mask goes straight back on.
+    unsafe {
+        core::arch::asm!(
+            "dsb sy",
+            "isb",
+            "msr daifclr, #4", // unmask SError (PSTATE.A)
+            "nop", "nop", "nop", "nop",
+            "isb",
+            "msr daifset, #4", // mask it again
+            options(nostack),
+        );
+    }
+    PROBING.store(false, core::sync::atomic::Ordering::Release);
+    SERRORS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// An asynchronous external abort. Returns non-zero to resume, zero to report and halt.
+///
+/// Resuming is right only inside a probe window (see [`begin_probe`]). Everywhere else an SError means
+/// the interconnect has told us a write went nowhere, and a kernel that shrugs at that is a kernel
+/// running on state it cannot account for - so the default stays halt.
+#[no_mangle]
+extern "C" fn aarch64_serror_dispatch(_vector: u64, _frame: *mut TrapFrame) -> u64 {
+    if PROBING.load(core::sync::atomic::Ordering::Acquire) {
+        SERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return 1;
+    }
+    0
+}
+
 #[no_mangle]
 extern "C" fn aarch64_sync_current_dispatch(vector: u64, frame: *mut TrapFrame) {
     let esr: u64;

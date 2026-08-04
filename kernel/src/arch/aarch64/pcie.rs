@@ -47,7 +47,6 @@ const RC_BAR1_CONFIG_LO: u64 = 0x402c;
 const RC_BAR2_CONFIG_LO: u64 = 0x4034;
 const RC_BAR2_CONFIG_HI: u64 = 0x4038;
 const RC_BAR3_CONFIG_LO: u64 = 0x403c;
-const PCIE_CTRL: u64 = 0x4064;
 const PCIE_STATUS: u64 = 0x4068;
 const MEM_WIN0_BASE_LIMIT: u64 = 0x4070;
 const MEM_WIN0_BASE_HI: u64 = 0x4080;
@@ -59,8 +58,8 @@ const EXT_CFG_INDEX: u64 = 0x9000;
 const RGR1_SW_INIT_1: u64 = 0x9210;
 
 // --- Field masks ------------------------------------------------------------------------------
+const SW_INIT_1_PERST: u32 = 1 << 0;
 const SW_INIT_1_INIT_GENERIC: u32 = 1 << 1;
-const PCIE_CTRL_PERSTB: u32 = 1 << 2;
 const HARD_DEBUG_SERDES_IDDQ: u32 = 1 << 27;
 const MISC_CTRL_SCB_ACCESS_EN: u32 = 1 << 12;
 const MISC_CTRL_CFG_READ_UR_MODE: u32 = 1 << 13;
@@ -130,12 +129,15 @@ fn bridge_reset(assert: bool) {
 
 /// Assert or release PERST# to the endpoint.
 ///
-/// The register bit is **PERSTB** - "PERST bar", active low - so the value written is the inverse of
-/// "assert reset". Copying the sense across from the bridge reset above (where 1 means assert) leaves
-/// the endpoint permanently in reset, and the only symptom is a link that never trains.
+/// **On the BCM2711 this is `RGR1_SW_INIT_1` bit 0, not the `PCIE_CTRL.PERSTB` bit.** Both registers
+/// exist and both look plausible; the Broadcom family uses different ones per chip, and the 2711 takes
+/// the "generic" path (`brcm_pcie_perst_set_generic` in Linux), which is this register, with 1 meaning
+/// ASSERT. Writing the other one leaves the endpoint held in reset with every register read looking
+/// healthy - the first bring-up on real hardware did exactly that and reported `status 0x80`: the port
+/// bit set, and both link bits clear.
 fn perst(assert: bool) {
-    let v = rd(PCIE_CTRL);
-    wr(PCIE_CTRL, if assert { v & !PCIE_CTRL_PERSTB } else { v | PCIE_CTRL_PERSTB });
+    let v = rd(RGR1_SW_INIT_1);
+    wr(RGR1_SW_INIT_1, if assert { v | SW_INIT_1_PERST } else { v & !SW_INIT_1_PERST });
 }
 
 fn link_up() -> bool {
