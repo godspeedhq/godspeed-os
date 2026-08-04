@@ -70,6 +70,22 @@ static AP_GO: AtomicU32 = AtomicU32::new(0);
 #[no_mangle]
 pub static AP_TABLES_READY: AtomicU32 = AtomicU32::new(0);
 
+/// How far each core got, written by that core and read by the boot core.
+///
+/// **Memory, not the UART.** Raw probe characters were the previous attempt and they lost the argument
+/// to the hardware: four cores writing a shared FIFO with no lock drop bytes when it fills, so a
+/// missing character meant either "that core never got there" or "the FIFO ate it" - the exact
+/// ambiguity the probe existed to remove. One byte of memory per core has no such failure mode, and the
+/// boot core prints all four in a single line that cannot interleave.
+///
+/// 0 = never arrived, 1 = reached the park, 2 = left the park, 3 = in the scheduler.
+static AP_PROGRESS: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
 /// Spin-table release addresses for cores 1..3, as the Pi's armstub parks them.
 const SPIN_TABLE: [u64; SECONDARIES] = [0xE0, 0xE8, 0xF0];
 
@@ -186,9 +202,13 @@ pub fn report_cores_up() {
     // the line has to BE one write. `console_notice_fmt` renders it into a fixed buffer first and emits
     // it once.
     super::console_notice_fmt(format_args!(
-        "smp: cores in the scheduler: {} (mask {:#x})",
+        "smp: cores in the scheduler: {} (mask {:#x}); progress 0/1/2/3 = {}{}{}{}          (0=absent 1=parked 2=released 3=scheduling)",
         crate::smp::core::ready_count(),
-        mask
+        mask,
+        AP_PROGRESS[0].load(Ordering::Acquire),
+        AP_PROGRESS[1].load(Ordering::Acquire),
+        AP_PROGRESS[2].load(Ordering::Acquire),
+        AP_PROGRESS[3].load(Ordering::Acquire),
     ));
 }
 
@@ -315,12 +335,12 @@ extern "C" fn ap_high_entry() -> ! {
     // `a`/`b`/`c` = entered the park, left the park, reached the scheduler. Three bytes per core is all
     // it takes to turn "one core is in the scheduler" into "core 2 stopped between the park and
     // `mark_ready`".
-    super::put_byte(b'a');
+    AP_PROGRESS[core_id as usize & 3].store(1, Ordering::Release); // reached the park
     while AP_GO.load(Ordering::Acquire) == 0 {
         // SAFETY: `wfe` waits for the `sev` in `release_secondaries`. Spurious wakes just re-check.
         unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
     }
-    super::put_byte(b'b');
+    AP_PROGRESS[core_id as usize & 3].store(2, Ordering::Release); // left the park
 
     crate::kprintln!("smp: core {} online", core_id);
 
@@ -334,7 +354,7 @@ extern "C" fn ap_high_entry() -> ! {
     // thing at the same point, one line before `mark_ready`, and comparing the two is what found it.
     crate::smp::core::set_core_lapic_id(core_id as u32, core_id as u32);
     crate::smp::core::mark_ready(core_id as u32);
-    super::put_byte(b'c');
+    AP_PROGRESS[core_id as usize & 3].store(3, Ordering::Release); // in the scheduler
 
     // This core's own GIC interface and its own timer. The distributor is shared and already
     // configured; the CPU interface and the per-core timer are not.
