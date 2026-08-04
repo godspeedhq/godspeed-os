@@ -61,7 +61,7 @@ fn main() {
     let is_s390x = target == "s390x-unknown-none-softfloat";
     let is_riscv32 = target == "riscv32imac-unknown-none-elf";
     let is_arm = target == "armv7a-none-eabi";
-    let use_placeholder = is_aarch64 || is_riscv64 || is_loongarch64 || is_s390x || is_riscv32 || is_arm;
+    let use_placeholder = is_riscv64 || is_loongarch64 || is_s390x || is_riscv32 || is_arm || is_aarch64;
     let placeholder = workspace.join("kernel").join("svc-placeholder.bin");
 
     // (env-var suffix, binary name in target dir)
@@ -116,11 +116,26 @@ fn main() {
         .join("armv7a-none-eabi")
         .join(&profile);
 
+    // AArch64 (Raspberry Pi 4) userspace is being brought up the same way, service by service, for the
+    // same reason: a service is embedded for real only once it is built for aarch64-unknown-none. Any
+    // not yet ported keep the empty placeholder so the kernel still links. The hardware drivers stay
+    // placeholders until real Pi 4 drivers exist (SD/EMMC, GENET, VL805 xHCI over PCIe) - they compile,
+    // but hunt for x86 hardware that is not there.
+    let aarch64_built: &[&str] = &["logger"];
+    let aarch64_dir = workspace
+        .join("target")
+        .join("aarch64-unknown-none")
+        .join(&profile);
+
     for (env_name, bin_name) in services {
         let elf = if is_arm {
             // A ported ARM service if its binary exists; otherwise the placeholder.
             let arm_bin = arm_dir.join(bin_name);
             if arm_built.contains(bin_name) && arm_bin.exists() { arm_bin } else { placeholder.clone() }
+        } else if is_aarch64 {
+            // A ported AArch64 service if its binary exists; otherwise the placeholder.
+            let a64_bin = aarch64_dir.join(bin_name);
+            if aarch64_built.contains(bin_name) && a64_bin.exists() { a64_bin } else { placeholder.clone() }
         } else if use_placeholder {
             placeholder.clone()
         } else {

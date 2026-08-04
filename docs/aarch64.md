@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-17 ALL done on real hardware (2026-08-04)
+> ## STATUS: milestones 1-17 done on real hardware; 18 (a REAL service runs) in QEMU (2026-08-04)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -437,6 +437,27 @@
 > I-cache over it, with line sizes read from `CTR_EL0` rather than assumed. **This is not a demo fix:**
 > the kernel writes code every time it loads a program, so the ELF loader needs it the moment it loads a
 > service's text - and it would have been a far more confusing bug to meet there.
+>
+> **Milestone 18 - a REAL service runs.** Not a hand-written blob: `services/logger`, compiled from Rust
+> against the SDK for `aarch64-unknown-none`, embedded in the kernel image, and loaded by
+> `task::spawn_service_with_config` - the exact machinery the supervisor's spawn syscall uses.
+>
+> ```
+> sched-spawn: spawning the logger service through the NEUTRAL spawn path
+> task: 'logger' spawned OK on core 0 (slot 0)
+> sched-spawn: entering scheduler::run(0) - watch for 'logger: ready'
+> logger: ready
+> ```
+>
+> That one call exercises nearly everything the port has built: the **ELF loader** parsing real program
+> headers, **`page_tables::PageTable`** (the loader creates and maps through it), **`sync_instruction_cache`**
+> (the loader writes a service's text, so the I-cache must not hold what those frames held before), the
+> kernel stack pool, capability wiring, the service context page, **`TaskContext::new_user`**, and then
+> the **SDK ABI** and **syscall dispatch** the moment the service makes its first call.
+>
+> `logger: ready` therefore means far more than the logger working: a compiled Rust service ran on this
+> board and talked to the kernel. Services are embedded incrementally, exactly as the 32-bit port does -
+> `aarch64_built` in `kernel/build.rs` currently lists `logger`; the rest keep the placeholder.
 >
 > **Not done:** `arch::init` + the `kernel_main` handoff, UART RX, PSCI SMP.
 >

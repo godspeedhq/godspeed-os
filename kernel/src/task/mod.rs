@@ -3937,7 +3937,10 @@ pub fn spawn_supervisor() {
 /// (page tables + kstack pool + cap wiring + ctx page + the ARM `finalize_service_address_space` hook).
 /// The full-OS build spawns via the supervisor instead; this is the direct probe. Requires the neutral
 /// bootstrap (percpu / scheduler arenas / capability) to have run first.
-#[cfg(target_arch = "arm")]
+/// Also used by the AArch64 (Pi 4) bring-up, which reaches the same milestone by the same route. The
+/// name keeps its `arm_` prefix because it is the ARM family's bring-up probe and renaming it would
+/// churn the 32-bit port for nothing; both ports delete it once the supervisor spawns their services.
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 pub fn arm_spawn_logger_neutral() {
     static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
     match spawn_service_with_config(

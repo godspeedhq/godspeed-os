@@ -62,6 +62,11 @@ memmap-clamp-test = []
 # preempted by the 100 Hz generic timer. The aarch64 twin of `arm-sched-demo`. Gated because it does
 # not return - scheduler::run IS the idle loop - so it replaces the rest of the boot.
 pi4-sched-demo = []
+# Spawn a REAL service (the logger) through the neutral spawn path on the Pi 4
+# (arch/aarch64/sched_spawn.rs) and run it under the scheduler. The aarch64 twin of
+# `arm-sched-spawn`. Exercises the ELF loader, per-task page tables, the instruction-cache
+# maintenance a loader needs, the kstack pool, cap wiring, and the SDK ABI - in one call.
+pi4-sched-spawn = []
 # Run the minimal ARM logger spawn at boot (arch/arm/spawn.rs). Off by default: the spawn currently
 # reaches PL0 and issues real syscalls, but the kernel's cap-table spinlock (LDREX/STREX) does not yet
 # work under the service's dual-mapped address space, so the boot would block. Gated so the default

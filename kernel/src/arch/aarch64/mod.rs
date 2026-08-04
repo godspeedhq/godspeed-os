@@ -29,6 +29,8 @@ pub mod mmu;
 pub mod ptables;
 #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
 pub mod sched_demo;
+#[cfg(all(feature = "pi4", feature = "pi4-sched-spawn"))]
+pub mod sched_spawn;
 #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
 pub mod sched_user;
 #[cfg(feature = "pi4")]
@@ -797,6 +799,11 @@ extern "C" fn boot_high() -> ! {
     // `.el0` region, which silently turned the image into one that could not exercise milestones 5 and
     // 6 at all. Running it here means a single boot re-verifies everything above and then hands the
     // machine to the scheduler.
+    // A REAL service through the neutral spawn path. Checked first: if both features are on, running a
+    // compiled service is the more informative of the two, and neither returns.
+    #[cfg(all(feature = "pi4", feature = "pi4-sched-spawn"))]
+    sched_spawn::run();
+
     #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
     sched_demo::run(&boot_info);
 
