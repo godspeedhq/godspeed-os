@@ -303,10 +303,24 @@ extern "C" fn ap_high_entry() -> ! {
     // Park until the boot core has built the per-core arenas. Entering the scheduler before they exist
     // indexes state that has not been allocated - the same class of bug as reaching the user-copy seam
     // before its per-core arena existed, and just as quiet.
+    // A single raw character per core, straight at the UART, at three points on the way in.
+    //
+    // Every higher-level report has now failed to answer this question. The per-core `kprintln` lines
+    // were shredded before the console had a lock; with the lock they can still be dropped by a
+    // contended writer; and the one atomic line says only how many cores ARRIVED, not where the others
+    // stopped. `put_byte` is a single store to the FIFO with nothing in front of it - no formatting, no
+    // claim, no buffer to be lost - so a character that does not appear is a core that did not get
+    // there, rather than a report that did not survive.
+    //
+    // `a`/`b`/`c` = entered the park, left the park, reached the scheduler. Three bytes per core is all
+    // it takes to turn "one core is in the scheduler" into "core 2 stopped between the park and
+    // `mark_ready`".
+    super::put_byte(b'a');
     while AP_GO.load(Ordering::Acquire) == 0 {
         // SAFETY: `wfe` waits for the `sev` in `release_secondaries`. Spurious wakes just re-check.
         unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
     }
+    super::put_byte(b'b');
 
     crate::kprintln!("smp: core {} online", core_id);
 
@@ -320,6 +334,7 @@ extern "C" fn ap_high_entry() -> ! {
     // thing at the same point, one line before `mark_ready`, and comparing the two is what found it.
     crate::smp::core::set_core_lapic_id(core_id as u32, core_id as u32);
     crate::smp::core::mark_ready(core_id as u32);
+    super::put_byte(b'c');
 
     // This core's own GIC interface and its own timer. The distributor is shared and already
     // configured; the CPU interface and the per-core timer are not.
