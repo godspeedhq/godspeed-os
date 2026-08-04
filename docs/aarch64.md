@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-11 done on real hardware; 12-17 in QEMU (2026-08-03)
+> ## STATUS: milestones 1-17 ALL done on real hardware (2026-08-04)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -46,6 +46,12 @@
 > | 9. Neutral scheduler + preemption | Three never-yielding kernel tasks round-robined by `scheduler::run` under the 100 Hz tick; on the board, counters 194/194/195 and lines torn mid-word by the tick |
 > | 10. Per-task page tables | A private address space built, `TTBR0_EL1` swapped, a page read back through the new mapping, kernel still reachable, every frame reclaimed |
 > | 11. TTBR1 split | Kernel linked high / loaded low, relocates PC **and** SP into `TTBR1`, then RETIRES the low map - `TTBR0_EL1` empty and free for a task |
+> | 12. EL0 task, own address space | A task table of ONE frame, no kernel entries; separation enforced by hardware |
+> | 13. SDK syscall ABI | `x8` = number, `x0`-`x2` = args, `svc #0`; the `logger` service compiles for AArch64 |
+> | 14. Real `page_tables::PageTable` | `loader.rs` can load a service ELF; reclaim proven (`4 pages reclaimed`) |
+> | 15. User-copy seam | Range check + `ldtrb`/`sttrb` (EL0 permissions) + fault fixup, **which fired on the board** |
+> | 16. Real syscall dispatch | `Log` with no cap **REFUSED** (`-2`); unknown number returns a defined error |
+> | 17. EL0 task under the scheduler | Kernel tasks 95/95/95 with an EL0 task interleaved, 55 EL0 ticks, no panics |
 >
 > The timer evidence is a rate check, not just a delivery check: the log timestamps put 10 ticks 111 ms
 > apart, which is 100 Hz. A wrong reload would still have delivered ten interrupts.
