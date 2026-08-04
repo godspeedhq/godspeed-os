@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-17 done on real hardware; 18 (a REAL service runs) in QEMU (2026-08-04)
+> ## STATUS: milestones 1-18 ALL done on real hardware - a REAL SERVICE RUNS (2026-08-04)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -52,6 +52,7 @@
 > | 15. User-copy seam | Range check + `ldtrb`/`sttrb` (EL0 permissions) + fault fixup, **which fired on the board** |
 > | 16. Real syscall dispatch | `Log` with no cap **REFUSED** (`-2`); unknown number returns a defined error |
 > | 17. EL0 task under the scheduler | Kernel tasks 95/95/95 with an EL0 task interleaved, 55 EL0 ticks, no panics |
+> | 18. **A real service runs** | `logger: ready` - compiled Rust, loaded by the neutral ELF loader, one spawn, slot 0, no faults |
 >
 > The timer evidence is a rate check, not just a delivery check: the log timestamps put 10 ticks 111 ms
 > apart, which is 100 Hz. A wrong reload would still have delivered ten interrupts.
@@ -478,7 +479,8 @@
 >   not running, so this class of mistake costs one loud refusal instead of a boot loop.
 >
 > The hook reports its page count (`67 pages I-cache synced`) because QEMU cannot demonstrate the fix -
-> a silent hook is how this shipped once already.
+> a silent hook is how this shipped once already. With both fixes the board runs it clean: one spawn,
+> slot 0, `logger: ready`, no faults.
 >
 > **Not done:** `arch::init` + the `kernel_main` handoff, UART RX, PSCI SMP.
 >
