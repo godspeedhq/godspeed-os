@@ -23,6 +23,28 @@ pub fn frequency() -> u64 {
     f
 }
 
+/// The counter value at boot, so elapsed time can be measured from zero.
+///
+/// The raw counter is NOT seconds-since-boot: QEMU seeds it at a large value while real silicon starts
+/// near zero, so anything derived from it directly is a wildly different number on the two. Recording a
+/// baseline is what makes "how long has this machine been up" the same question on both.
+static BOOT_COUNT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
+/// Record the boot baseline. Called once, as early as the counter is readable.
+pub fn record_boot_baseline() {
+    BOOT_COUNT.store(count(), core::sync::atomic::Ordering::Release);
+}
+
+/// Seconds since boot, from the generic timer.
+pub fn secs_since_boot() -> i64 {
+    let hz = frequency();
+    if hz == 0 {
+        return 0; // no timer: report 0 rather than divide by it
+    }
+    let base = BOOT_COUNT.load(core::sync::atomic::Ordering::Acquire);
+    (count().saturating_sub(base) / hz) as i64
+}
+
 /// The free-running physical counter.
 pub fn count() -> u64 {
     let c: u64;

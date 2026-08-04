@@ -345,6 +345,13 @@ extern "C" fn aarch64_boot_main(dtb: u64) -> ! {
     // makes that a non-question. See `mailbox` for the full reasoning.
     #[cfg(feature = "pi4")]
     let boot_map = {
+        // Stamp the counter baseline first, so "seconds since boot" counts from as close to boot as the
+        // counter can be read rather than from whenever the timer is later armed. Without it the
+        // baseline stays 0 and elapsed time becomes the RAW counter, which QEMU seeds at a large value -
+        // an uptime of several decades on the emulator and a plausible one on hardware, which is the
+        // worse pairing of the two.
+        timer::record_boot_baseline();
+
         let info = mailbox::query();
         mailbox::report(&info);
 
@@ -1838,7 +1845,14 @@ pub mod rtc {
     pub fn boot_datetime() -> u64 { 0 }
     pub fn read_datetime() -> u64 { 0 }
     pub fn set_wall_clock(_epoch: i64) -> bool { false } // no RTC on this stub; SNTP wall clock unused (arm is the live RTC-less port)
-    pub fn now_epoch_monotonic() -> i64 { 0 }
+    /// Seconds since the Unix epoch - or, on a board with no clock, seconds since boot.
+    ///
+    /// **The Pi 4 has no RTC.** Returning a constant 0 made this read as 1970 and, worse, made `uptime`
+    /// stand still and `date epoch` report a negative year-0 timestamp: a machine that had been up for
+    /// twenty minutes insisted it had been up for none. Seconds-since-boot is not the wall clock, but it
+    /// is MONOTONIC and it is true, which is what everything measuring a duration actually needs. The
+    /// wall clock arrives with SNTP, as it did on the Pi 2, and needs the network first.
+    pub fn now_epoch_monotonic() -> i64 { super::timer::secs_since_boot() }
 }
 
 // ---------------------------------------------------------------------------
