@@ -311,3 +311,53 @@ fn cmd_speed(mbps: u32) -> u32 {
     };
     (sel & CMD_SPEED_MASK) << CMD_SPEED_SHIFT
 }
+
+// --- DMA rings: confirmed descriptor format, offsets still to be read ---------------------------
+//
+// These constants ARE verified against Linux's `bcmgenet.h`. The ring REGISTER offsets - the RDMA and
+// TDMA block bases for v5, and the per-ring `DMA_START_ADDR` / `DMA_PROD_INDEX` / `DMA_CONS_INDEX` /
+// `DMA_RING_BUF_SIZE` - are NOT yet read, and nothing below programs the hardware.
+//
+// That split is deliberate. Ring setup tells the controller where to WRITE into system memory, so a
+// wrong base does not return a wrong value the way a bad MDIO offset did - it corrupts RAM. This driver
+// has already had one offset taken from a `#define` without checking how the header used it
+// (`UMAC_MDIO_CMD`, which is UMAC-relative); repeating that on a DMA base is not a read that comes back
+// zero, it is a device writing frames into whatever happens to live there.
+//
+// So the format goes in now, where it is checked, and the addresses come with the code that uses them.
+
+/// Descriptors per ring, and the ring register block stride. `TOTAL_DESC` is Linux's figure.
+#[allow(dead_code)]
+const TOTAL_DESC: usize = 256;
+#[allow(dead_code)]
+const DMA_RING_SIZE: u64 = 0x40;
+
+/// One descriptor is three words: length+status, address low, address high.
+#[allow(dead_code)]
+const DMA_DESC_LENGTH_STATUS: u64 = 0x00;
+#[allow(dead_code)]
+const DMA_DESC_ADDRESS_LO: u64 = 0x04;
+#[allow(dead_code)]
+const DMA_DESC_ADDRESS_HI: u64 = 0x08;
+
+// Bits in the length/status word. The buffer length sits in the UPPER half, which is the detail most
+// likely to be got wrong by assuming a length field starts at bit 0.
+#[allow(dead_code)]
+const DMA_BUFLENGTH_MASK: u32 = 0x0FFF;
+#[allow(dead_code)]
+const DMA_BUFLENGTH_SHIFT: u32 = 16;
+/// Ownership: set means the CONTROLLER owns the descriptor, not us.
+#[allow(dead_code)]
+const DMA_OWN: u32 = 0x8000;
+#[allow(dead_code)]
+const DMA_EOP: u32 = 0x4000;
+#[allow(dead_code)]
+const DMA_SOP: u32 = 0x2000;
+#[allow(dead_code)]
+const DMA_TX_QTAG_SHIFT: u32 = 7;
+
+/// The master DMA enable, in each of the RDMA and TDMA control registers.
+#[allow(dead_code)]
+const DMA_EN: u32 = 1 << 0;
+#[allow(dead_code)]
+const DMA_RING_BUF_EN_SHIFT: u32 = 1;
