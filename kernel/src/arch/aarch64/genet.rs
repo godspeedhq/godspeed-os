@@ -66,6 +66,26 @@ const UMAC_CMD: u64 = GENET_UMAC_OFF + 0x008;
 const UMAC_MAC0: u64 = GENET_UMAC_OFF + 0x00C;
 const UMAC_MAC1: u64 = GENET_UMAC_OFF + 0x010;
 const UMAC_MAX_FRAME_LEN: u64 = GENET_UMAC_OFF + 0x014;
+
+// The MAC's own statistics counters. These are the measurement that splits the receive path in half:
+// they count what the MAC itself took off the wire, BEFORE the RBUF and the DMA see any of it. A
+// receive path that reports nothing tells you where to look only if you can ask each half separately,
+// and the ring can only ever speak for the DMA end.
+const UMAC_MIB_CTRL: u64 = GENET_UMAC_OFF + 0x580;
+const MIB_RESET_RX: u32 = 1 << 0;
+const MIB_RESET_RUNT: u32 = 1 << 1;
+const MIB_RESET_TX: u32 = 1 << 2;
+/// Received packet count. Linux's `bcmgenet_rx_counters` places it after the ten packet-size buckets,
+/// which is why it sits at `MIB_START + 0x28` rather than at the start of the block.
+const UMAC_MIB_RX_PKT: u64 = GENET_UMAC_OFF + 0x428;
+/// Received broadcast count. On an idle network this is the counter that moves first.
+const UMAC_MIB_RX_BCA: u64 = GENET_UMAC_OFF + 0x434;
+/// FCS errors: frames that arrived and failed their checksum. Nonzero here means the wire and the PHY
+/// are delivering bits and something about how we clock or frame them is wrong.
+const UMAC_MIB_RX_FCS: u64 = GENET_UMAC_OFF + 0x438;
+/// Receive overflow: the MAC took frames the downstream could not drain. Nonzero here would mean the
+/// MAC is fine and the RBUF or DMA is the blockage.
+const UMAC_MIB_RX_OVR: u64 = GENET_UMAC_OFF + 0x458;
 /// The MDIO command register.
 ///
 /// **`0x614` is UMAC-RELATIVE, not absolute.** `bcmgenet.h` defines it as a bare `0x614`, which reads
@@ -285,6 +305,11 @@ pub fn umac_init(mac: [u8; 6]) -> Option<u32> {
     if !umac_reset() {
         return None;
     }
+    // Zero the statistics, so anything they report later was counted by us and not inherited from
+    // whatever the firmware did with this MAC before we took it over.
+    wr(UMAC_MIB_CTRL, MIB_RESET_RX | MIB_RESET_TX | MIB_RESET_RUNT);
+    wr(UMAC_MIB_CTRL, 0);
+
     wr(UMAC_MAX_FRAME_LEN, MAX_FRAME);
     set_mac_address(mac);
 
@@ -788,6 +813,17 @@ pub fn await_first_frame() {
     put_hex(rd(dma_reg(RDMA_OFFSET, DMA_RING_CFG)) as u64);
     put_str(b" umac_cmd ");
     put_hex(rd(UMAC_CMD) as u64);
+    put_str(b"\r\n");
+
+    // What the MAC itself counted, which is the half of the path the ring cannot speak for.
+    put_str(b"genet: MAC counters - rx_pkt ");
+    put_hex(rd(UMAC_MIB_RX_PKT) as u64);
+    put_str(b" broadcast ");
+    put_hex(rd(UMAC_MIB_RX_BCA) as u64);
+    put_str(b" fcs_err ");
+    put_hex(rd(UMAC_MIB_RX_FCS) as u64);
+    put_str(b" overflow ");
+    put_hex(rd(UMAC_MIB_RX_OVR) as u64);
     put_str(b"\r\n");
 }
 
