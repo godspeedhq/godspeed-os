@@ -88,6 +88,31 @@ Five consecutive boots now report `cores in the scheduler: 4 (mask 0xf)` intact.
 
 No new `unsafe`.
 
+## 2026-08-04 - Pi 4 GENET milestone 2: the MAC and the MDIO bus (feat/pi4-aarch64)
+
+Resets the UniMAC, programs the station address and frame limit, selects the external gigabit PHY mode,
+and reads the PHY's identity over MDIO. The data path stays OFF: this brings up the MAC, not the rings,
+and a receiver enabled with no ring behind it fills a FIFO nobody drains.
+
+The PHY id is the milestone worth reaching. A real id means three separate things are true at once -
+the MAC is alive, the MDIO bus is clocking, and the PHY is answering - and a later DMA failure would
+otherwise be blamed for any of them.
+
+Three details that would each produce a plausible-looking wrong result:
+
+- **`UMAC_CMD` and friends are not in `bcmgenet.h`.** Modern Linux moved the UniMAC registers to a
+  shared `unimac.h`. Searching the obvious header finds nothing, and the obvious conclusion - that this
+  part has no such register - is wrong.
+- **MDIO `READ_FAIL` must be checked.** A read of an absent PHY returns a perfectly plausible `0xFFFF`
+  with that bit set; a driver that checks only the data concludes the PHY answered with every
+  capability enabled.
+- **The link bit latches low.** A single read of the basic status register reports a link that has been
+  up all along as DOWN, so it is read twice.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/genet.rs` | 1 -> 3 (+2) | The register read and write helpers - volatile accesses inside the kernel's Device mapping, to a controller whose presence the milestone-1 probe already established. |
+
 ## 2026-08-04 - Pi 4 GENET milestone 1: find the controller and identify it (feat/pi4-aarch64)
 
 The Pi 2 has no Ethernet MAC - its port hangs off a LAN9514 behind the USB hub, which is why that
@@ -2009,7 +2034,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/aarch64/video.rs | 2 | permitted |
-| arch/aarch64/genet.rs | 1 | permitted |
+| arch/aarch64/genet.rs | 3 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
 | arch/aarch64/smp_boot.rs | 9 | permitted |
 | arch/aarch64/xhci.rs | 37 | permitted |

@@ -868,7 +868,12 @@ extern "C" fn boot_high() -> ! {
         let ram_top = bi.memory_map.iter().map(|r| r.base + r.len).max().unwrap_or(0);
         // The on-board ethernet controller. Identified here, next to the other device probes, and
         // inside the same window: an absent controller answers with an abort, not a value.
-        genet::probe();
+        if genet::probe().is_some() {
+            // A locally-administered address derived from the board serial would be better; the Pi's
+            // real MAC comes from the firmware and reading it is its own step. Fixed for now, and
+            // flagged, because a hardcoded MAC is exactly the kind of placeholder that quietly ships.
+            genet::umac_init([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        }
 
         // The whole USB bring-up runs inside the probe window, not just the PCIe half. A read that does
         // not reach the controller completes with a poison value rather than faulting, but the WRITES
