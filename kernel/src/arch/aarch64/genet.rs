@@ -361,6 +361,18 @@ const TOTAL_DESC: usize = 256;
 #[allow(dead_code)]
 const DMA_RING_SIZE: u64 = 0x40;
 
+/// The space the 17 per-ring register blocks occupy: rings 0 through `DESC_INDEX` inclusive.
+///
+/// The block-wide DMA control registers (`DMA_RING_CFG`, `DMA_CTRL`, `DMA_STATUS`,
+/// `DMA_SCB_BURST_SIZE`) live **after** those blocks, at `GENET_RDMA_REG_OFF + DMA_RINGS_SIZE`, not at
+/// the start of the register area. Omitting this lands every one of them inside RING 0's registers,
+/// which are perfectly writable and read back whatever was written - so the mistake produces confident,
+/// entirely fictional readings rather than an error. That is what happened here: "ring_cfg 0x10000" was
+/// ring 0's write pointer, "dma_status 0x0" was ring 0's producer index, and the write that was
+/// supposed to enable the receive DMA went into ring 0's write-pointer high word. The engine was never
+/// switched on, and four rounds of diagnostics reported it running.
+const DMA_RINGS_SIZE: u64 = DMA_RING_SIZE * (RX_RING_INDEX + 1);
+
 /// One descriptor is three words: length+status, address low, address high.
 #[allow(dead_code)]
 const DMA_DESC_LENGTH_STATUS: u64 = 0x00;
@@ -653,7 +665,7 @@ const DMA_DISABLED: u32 = 1 << 0;
 
 /// Address of a DMA control register (block-wide, not per-ring).
 fn dma_reg(block: u64, reg: u64) -> u64 {
-    block + DMA_REGS_OFF + reg
+    block + DMA_REGS_OFF + DMA_RINGS_SIZE + reg
 }
 
 /// Point every ring we are NOT using at nothing, before enabling anything.
