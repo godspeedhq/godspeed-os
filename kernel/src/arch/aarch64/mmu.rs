@@ -217,6 +217,57 @@ unsafe fn fill_device_window(t: *mut Table, base: u64, len: u64, high: bool) {
 ///
 /// Returns the physical address installed in `TTBR0_EL1`, so the caller can report it rather than
 /// assert that something happened.
+/// Turn translation on for a SECONDARY core, using the tables the boot core already built.
+///
+/// A secondary must not rebuild anything: the tables are shared, and a second core writing them while
+/// the first is running under them is a race with no upside. It installs the same `MAIR`/`TCR`/`TTBR`
+/// values and enables the same bits, so every core sees one identical address space.
+///
+/// Returns the `TTBR0` installed, so the caller can report rather than assert.
+///
+/// # Safety
+/// Called once per secondary core, after `enable()` has run on the boot core and before that core
+/// touches any high address.
+pub unsafe fn enable_secondary() -> u64 {
+    // SAFETY: the tables are already built and are read-only from here; taking their addresses and
+    // installing them alters only this core's translation state.
+    unsafe {
+        let ttbr = virt_to_phys((&raw const L1) as u64);
+        let ttbr1 = virt_to_phys((&raw const L1_HIGH) as u64);
+        let tcr: u64 = 25
+            | (0b01 << 8)
+            | (0b01 << 10)
+            | (0b11 << 12)
+            | (0b00 << 14)
+            | (25 << 16)
+            | (0b01 << 24)
+            | (0b01 << 26)
+            | (0b11 << 28)
+            | (0b10 << 30)
+            | (0b010 << 32);
+        core::arch::asm!(
+            "msr mair_el1, {mair}",
+            "msr tcr_el1,  {tcr}",
+            "msr ttbr0_el1,{ttbr}",
+            "msr ttbr1_el1,{ttbr1}",
+            "dsb ish",
+            "isb",
+            mair = in(reg) MAIR_VALUE,
+            tcr  = in(reg) tcr,
+            ttbr = in(reg) ttbr,
+            ttbr1 = in(reg) ttbr1,
+            options(nostack),
+        );
+        core::arch::asm!("tlbi vmalle1", "dsb ish", "isb", options(nostack));
+        compiler_fence(Ordering::SeqCst);
+        let mut sctlr: u64;
+        core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nomem, nostack));
+        sctlr |= (1 << 0) | (1 << 2) | (1 << 12);
+        core::arch::asm!("msr sctlr_el1, {v}", "isb", v = in(reg) sctlr, options(nostack));
+        ttbr
+    }
+}
+
 pub fn enable() -> u64 {
     // SAFETY: single-threaded boot, MMU still off, and these statics are this function's exclusively
     // until translation is live. Every write below is a plain store to `.bss` we own.

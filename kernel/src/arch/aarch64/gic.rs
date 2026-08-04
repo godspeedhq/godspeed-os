@@ -56,6 +56,20 @@ pub fn init() {
     }
 }
 
+/// Bring up a SECONDARY core's GIC CPU interface.
+///
+/// The distributor is shared and already configured by the boot core - reconfiguring it from a
+/// secondary would quiesce interrupts for every core that is already running. The CPU interface and its
+/// priority mask are **banked per core**, so each one has to enable its own or it simply never receives
+/// anything, including its own timer.
+pub fn init_secondary() {
+    // SAFETY: this core's banked GIC CPU-interface registers, Device-mapped. Nothing here is shared.
+    unsafe {
+        GICC_PMR.write_volatile(0xFF);
+        GICC_CTLR.write_volatile(1);
+    }
+}
+
 /// Enable one interrupt ID, at a middling priority, targeted at core 0.
 ///
 /// Priority and target are only meaningful for SPIs (ID >= 32): PPIs and SGIs are banked per core, so

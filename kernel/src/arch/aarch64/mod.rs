@@ -41,6 +41,12 @@ pub mod timer;
 pub mod uart_rx;
 #[cfg(feature = "pi4")]
 pub mod pcie;
+// Always compiled, even when SMP is off: `_start` branches secondaries here, and a `naked_asm!` symbol
+// reference cannot be conditional. With the feature off nothing ever sets `AP_TABLES_READY`, so a
+// secondary that reaches it simply parks in `wfe` - exactly the behaviour it had before, and reached by
+// one code path rather than two.
+#[cfg(feature = "pi4")]
+pub mod smp_boot;
 #[cfg(feature = "pi4")]
 pub mod video;
 #[cfg(feature = "pi4")]
@@ -49,6 +55,23 @@ pub mod xhci;
 pub mod uaccess;
 #[cfg(feature = "pi4")]
 pub mod usermode;
+
+/// The exception level the firmware handed this kernel over at.
+///
+/// **This decides whether PSCI exists.** If we were handed EL3 then nothing else owns it: the kernel
+/// performs its own drop, leaves no handler behind, and an `smc` traps to a vector nobody installed -
+/// which hangs the machine rather than returning "not supported". If we were handed EL2, something is
+/// still resident at EL3 and may answer. Under QEMU it is the first case; on a Pi with the GIC armstub
+/// it is the second, and the difference is not visible any other way once the drop has happened.
+#[cfg(feature = "pi4")]
+static mut ENTRY_EL: u64 = 1;
+
+/// Was this kernel handed control at EL3? Then it owns EL3, and there is no PSCI to call.
+#[cfg(feature = "pi4")]
+pub fn booted_at_el3() -> bool {
+    // SAFETY: written once during single-threaded boot, read-only afterwards.
+    unsafe { ENTRY_EL >= 3 }
+}
 
 /// Framebuffer geometry, obtained before the MMU and consumed after the jump to the high half.
 ///
@@ -229,6 +252,11 @@ pub unsafe extern "C" fn _start() -> ! {
         //
         // x19 survives the `eret` below - exception return does not alter general-purpose registers.
         "mov  x19, x0",
+        // Capture the exception level we were HANDED OVER AT, before any of the drops below change it.
+        // It is the only way to know afterwards whether EL3 firmware still exists - and therefore
+        // whether a PSCI `smc` has anything to answer it. x20 survives `eret` like x19.
+        "mrs  x20, CurrentEL",
+        "lsr  x20, x20, #2",
         // --- Drop to EL2 if we entered at EL3 -------------------------------------------------
         // QEMU's `raspi4b` implements EL3 and starts there; the real board's armstub has already been
         // through EL3 and hands over at EL2. Nothing below is written for EL3 - the EL1 registers are
@@ -285,9 +313,13 @@ pub unsafe extern "C" fn _start() -> ! {
         "mov  x0, #(3 << 20)",               // CPACR_EL1.FPEN = 0b11: DON'T trap FP/SIMD at EL1.
         "msr  cpacr_el1, x0",                //   (Rust emits NEON for memcpy/byte-copy; default EL1
         "isb",                               //    traps it -> ESR 0x07 undefined-instruction fault.)
-        "mrs  x1, mpidr_el1",                // only the primary core boots
+        "mrs  x1, mpidr_el1",                // only the primary core continues into the kernel boot
         "and  x1, x1, #0xff",
-        "cbnz x1, 2f",
+        // A secondary goes to the SAME entry the firmware release path uses, rather than parking here.
+        // Environments differ on which of the two happens - firmware parks its cores and we release
+        // them; QEMU delivers every core to this label - and a secondary that parked here would simply
+        // never be reachable by the release. Converging both on one entry means one path gets tested.
+        "cbnz x1, 6f",
         "adrp x1, __stack_top",              // sp = __stack_top
         "add  x1, x1, :lo12:__stack_top",
         "and  x1, x1, #0xfffffffffffffff0",   // SP must be 16-byte aligned (EL1 SP-align check)
@@ -303,17 +335,23 @@ pub unsafe extern "C" fn _start() -> ! {
         "b    1b",
         "3:",
         "mov  x0, x19",                      // hand the DTB pointer to Rust as the first argument
+        "mov  x1, x20",                      // and the exception level we were handed over at
         "bl   {main}",                       // -> aarch64_boot_main (never returns)
         "2:",
         "wfe",
         "b    2b",
+        "6:",
+        "b    {ap}",
         main = sym aarch64_boot_main,
+        ap = sym crate::arch::aarch64::smp_boot::ap_entry_sym,
     )
 }
 
 /// Rust side of boot. Milestone 1: write a line to the PL011 and halt. Later this grows into the real
 /// init (MMU, EL1 exceptions, GIC, generic timer, PSCI) and finally calls the neutral `kernel_main`.
-extern "C" fn aarch64_boot_main(dtb: u64) -> ! {
+extern "C" fn aarch64_boot_main(dtb: u64, entry_el: u64) -> ! {
+    // SAFETY: single-threaded boot; written once here before anything reads it.
+    unsafe { ENTRY_EL = entry_el };
     // Report the exception level we ended up in, not just that we printed something. On the Pi 4 the
     // armstub hands the primary core over at EL2 and `_start` drops to EL1; on QEMU `virt` we arrive at
     // EL1 already. Either way this must say EL1 - if it says EL2 the drop silently did not happen, and
@@ -771,6 +809,15 @@ extern "C" fn boot_high() -> ! {
         // in the scheduler demo, because a real syscall reaches `current_task_lookup_cap`, which indexes
         // per-core state - and reaching that before it exists is how the user-copy seam went silent
         // earlier today.
+        // Release the other cores FIRST: `percpu_init` sizes its per-core arenas from `ap_count()`, so
+        // it has to run after they have checked in. They park immediately afterwards and do not enter a
+        // scheduler until `release_secondaries` says the arenas exist.
+        #[cfg(feature = "pi4-smp")]
+        {
+            let up = smp_boot::start_secondaries();
+            AP_COUNT.store(up as u32, core::sync::atomic::Ordering::Release);
+        }
+
         crate::smp::percpu_init(&bi);
         crate::task::scheduler::init_arenas(crate::smp::percpu::num_cores());
         crate::capability::init();
@@ -782,6 +829,10 @@ extern "C" fn boot_high() -> ! {
         // spec decision rather than a missing init call. Marked here rather than in `smp::init`, which
         // this port does not run yet (it starts APs; PSCI SMP is a later milestone).
         crate::smp::core::mark_ready(0);
+
+        // The arenas exist and core 0 is registered: the parked secondaries may now enter the scheduler.
+        #[cfg(feature = "pi4-smp")]
+        smp_boot::release_secondaries();
 
         // The PCIe root complex, and the xHCI controller the USB-A ports hang off. After the frame
         // allocator, because the inbound DMA window is sized from the memory map; before the scheduler,
@@ -1006,6 +1057,14 @@ pub enum MemoryKind {
 }
 
 // ---- Lifecycle ----
+/// How many secondaries came up. Zero without the SMP feature, and zero if none checked in - both of
+/// which leave the machine correctly running single-core rather than indexing arenas for cores that do
+/// not exist.
+#[cfg(feature = "pi4")]
+static AP_COUNT: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "pi4")]
+pub fn ap_count() -> usize { AP_COUNT.load(Ordering::Acquire) as usize }
+#[cfg(not(feature = "pi4"))]
 pub fn ap_count() -> usize { 0 }
 pub fn init(boot_info: &BootInfo) { unimplemented!("aarch64::init") }
 pub fn init_timer() { unimplemented!("aarch64::init_timer") }

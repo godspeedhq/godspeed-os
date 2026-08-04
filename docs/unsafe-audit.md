@@ -43,6 +43,32 @@ somewhere that names neither the GPU nor the map (§26.7).
 | `arch/aarch64/mailbox.rs` | 3 -> 4 (+1) | `property_call`: copies an arbitrary tag request into this module's 16-byte-aligned static and the reply back out, length-checked against the buffer at both ends. The static rather than the caller's array because the mailbox packs the channel into the low 4 bits of the address it is handed - an arbitrarily-aligned caller buffer would send the message to the wrong channel, so the alignment guarantee stays in one place. |
 | `arch/aarch64/mod.rs` | 53 -> 55 (+2) | The write and the read of `FB_INFO`, the static that carries the geometry across the jump to the high half. A static rather than a local because the jump abandons the low stack along with every local on it - the same reason `memmap::current_map` exists. Single-threaded boot: written once before the jump, read once after. |
 
+## 2026-08-04 - Pi 4: secondary cores, behind a feature and NOT working yet (feat/pi4-aarch64)
+
+`pi4-smp` releases the other three cores. It is **gated off and it is not finished**: one QEMU boot
+reaches all four cores and a shell, the next hangs at the release. An intermittent race is worse than a
+missing feature, so the default image is unchanged.
+
+Two findings are worth keeping regardless, because both are traps rather than bugs:
+
+- **An `smc` is only safe if something still owns EL3.** When the firmware hands this kernel control AT
+  EL3 - which is what QEMU does - the kernel performs its own drop and leaves no handler behind, so a
+  PSCI call traps to a vector nobody installed and the machine stops dead with nothing to report it.
+  The entry exception level is now captured in `_start` (x20, alongside the DTB in x19) because it is
+  the only way to know afterwards, and PSCI is skipped when we were the highest level.
+- **A secondary arrives by one of two completely different routes**, and which one is not a choice:
+  firmware that parks its cores releases them when the spin table is written, while QEMU delivers every
+  core to `_start` immediately. Parking them at `_start` makes them unreachable by the release; both now
+  funnel into one entry that waits for the page tables, so one path gets exercised instead of two that
+  each only work somewhere.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/smp_boot.rs` | new, 9 | The secondary entry stub (its own exception-level ladder, FP enable, per-core stack selection and the wait for the boot core's tables), the PSCI `smc`, the spin-table write with the cache clean a core polling with its caches off requires, and the `sev` pair that wakes them. |
+| `arch/aarch64/mmu.rs` | 15 -> 17 (+2) | `enable_secondary`: installs the tables the boot core already built rather than rebuilding them, because a second core writing shared tables while the first runs under them is a race with no upside. |
+| `arch/aarch64/mod.rs` | 62 -> 64 (+2) | Recording and reading the entry exception level. |
+| `arch/aarch64/gic.rs` | 4 -> 5 (+1) | `init_secondary`: a core's GIC CPU interface and priority mask are BANKED per core, so each must enable its own or it never receives its own timer. The distributor is shared and deliberately untouched. |
+
 ## 2026-08-04 - Pi 4: auditing the new USB code (feat/pi4-aarch64)
 
 ~2,500 lines of new ring-0 driver code that parses untrusted device input had been reviewed only
@@ -1839,7 +1865,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 62 | permitted |
+| arch/aarch64/mod.rs | 64 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/sched_spawn.rs | 2 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
@@ -1848,15 +1874,16 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
-| arch/aarch64/gic.rs | 4 | permitted |
+| arch/aarch64/gic.rs | 5 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
-| arch/aarch64/mmu.rs | 15 | permitted |
+| arch/aarch64/mmu.rs | 17 | permitted |
 | arch/aarch64/ptables.rs | 20 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/aarch64/video.rs | 2 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
+| arch/aarch64/smp_boot.rs | 9 | permitted |
 | arch/aarch64/xhci.rs | 37 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
