@@ -789,7 +789,7 @@ extern "C" fn boot_high() -> ! {
         unsafe { PCIE_XHCI = pcie::init(ram_top) };
         // SAFETY: read-once of the static just written, still single-threaded.
         if let Some(dev) = unsafe { PCIE_XHCI } {
-            xhci::init(dev.bar0);
+            xhci::init(dev.bar0, dev.bar0_len);
         }
 
         page_table_selftest();

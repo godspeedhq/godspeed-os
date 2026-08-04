@@ -343,16 +343,57 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
         cfg_write(1, dev, 0, 0x10, PCI_WIN_BUS_ADDR as u32);
         cfg_write(1, dev, 0, 0x14, 0);
 
-        // Memory space + bus master. Bus master is what lets the controller DMA at all; without it the
-        // controller initialises, accepts commands, and silently never reads a single ring entry.
-        let cmd = cfg_read(1, dev, 0, 0x04);
+        // **Open the bridge's memory window, or nothing downstream is reachable.**
+        //
+        // The root complex is a PCI-to-PCI bridge, and a bridge forwards a memory transaction to its
+        // secondary bus only if the address falls inside its Memory Base/Limit window. Assigning the
+        // endpoint a BAR without opening that window gives a device that is correctly configured and
+        // completely unreachable: every read comes back as the root complex's poison value rather than
+        // as an error, so the driver above sees plausible-looking register contents made of `0xDEAD`
+        // and computes offsets from them. The first bring-up read `caplen = 0xad` out of `0xDEADDEAD`
+        // and took an alignment fault on the operational base it derived - a fault three layers away
+        // from the missing register write.
+        //
+        // Base and limit are in 1 MiB units in bits 31:20 of a 16-bit field, hence the `>> 16` with the
+        // low nibble left clear.
+        let win_end = PCI_WIN_BUS_ADDR + cpu_size - 1;
+        let base_f = ((PCI_WIN_BUS_ADDR >> 16) & 0xFFF0) as u32;
+        let limit_f = ((win_end >> 16) & 0xFFF0) as u32;
+        cfg_write(0, 0, 0, 0x20, (limit_f << 16) | base_f);
+        // Disable the prefetchable window explicitly: base above limit is how PCI spells "closed", and
+        // leaving whatever the firmware left there is a second window we did not choose.
+        cfg_write(0, 0, 0, 0x24, 0x0000_FFF0);
+
+        // Memory space + bus master, on the BRIDGE and on the endpoint. Bus master is what lets the
+        // controller DMA at all; without it the controller initialises, accepts commands, and silently
+        // never reads a single ring entry. The command word is masked to 16 bits because the upper half
+        // of that dword is the status register, whose bits are write-1-to-clear - writing a read-back
+        // value straight back acknowledges errors nothing has looked at.
+        let bcmd = cfg_read(0, 0, 0, 0x04) & 0xFFFF;
+        cfg_write(0, 0, 0, 0x04, bcmd | 0x6);
+        let cmd = cfg_read(1, dev, 0, 0x04) & 0xFFFF;
         cfg_write(1, dev, 0, 0x04, cmd | 0x6);
 
-        put_str(b"pcie: xHCI at CPU ");
+        // Read the BAR back rather than assume the write took. A BAR that did not stick is the same
+        // silence as a bridge window that was never opened, and the two want different fixes.
+        let bar_back = cfg_read(1, dev, 0, 0x10) & !0xF;
+        put_str(b"pcie: xHCI BAR0 assigned bus ");
+        put_hex(bar_back as u64);
+        put_str(b" -> CPU ");
         put_hex(cpu_base);
         put_str(b" (");
         put_dec(len as u64);
-        put_str(b" bytes), bus master on\r\n");
+        put_str(b" bytes), bridge window ");
+        put_hex(PCI_WIN_BUS_ADDR);
+        put_str(b"..");
+        put_hex(win_end);
+        put_str(b", command ");
+        put_hex((cfg_read(1, dev, 0, 0x04) & 0xFFFF) as u64);
+        put_str(b"\r\n");
+        if bar_back as u64 != PCI_WIN_BUS_ADDR {
+            put_str(b"pcie: BAR0 did not take the address it was given - not usable\r\n");
+            continue;
+        }
 
         return Some(Device {
             bus: 1,

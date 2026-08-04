@@ -270,10 +270,44 @@ fn delay_us(us: u64) {
 }
 
 /// Bring the controller up and find a keyboard. Returns false (loudly) at the stage that failed.
-pub fn init(bar0: u64) -> bool {
+pub fn init(bar0: u64, bar0_len: u32) -> bool {
     let base = mmu::KERNEL_VA_BASE + bar0;
 
-    let caplen = (rd32(base + CAP_CAPLENGTH) & 0xFF) as u64;
+    // **Check that reads are reaching the controller at all, before deriving anything from them.**
+    //
+    // A read that does not reach the device does not fault: the BCM2711 root complex completes it with
+    // a poison value. `0xDEADDEAD` is what the first bring-up got for every register, and the driver
+    // dutifully read `caplen = 0xad` out of it, computed an unaligned operational base, and took an
+    // alignment fault - three layers away from the real problem, which was a bridge window that had
+    // never been opened. A dword of all-ones is the same story with a different poison.
+    //
+    // So the first thing checked is not a field but the WHOLE dword, and then the version, which is the
+    // one register whose valid values are narrow enough to be a real test.
+    let cap0 = rd32(base + CAP_CAPLENGTH);
+    if cap0 == 0xDEAD_DEAD || cap0 == 0xFFFF_FFFF || cap0 == 0 {
+        put_str(b"xhci: reads are not reaching the controller (first dword ");
+        put_hex(cap0 as u64);
+        put_str(b") - the bridge window or the BAR is wrong, not the controller\r\n");
+        return false;
+    }
+    let hciversion = (cap0 >> 16) & 0xFFFF;
+    if !(0x0090..=0x0130).contains(&hciversion) {
+        put_str(b"xhci: implausible HCIVERSION ");
+        put_hex(hciversion as u64);
+        put_str(b" - this is not an xHCI register block\r\n");
+        return false;
+    }
+
+    let caplen = (cap0 & 0xFF) as u64;
+    // The operational registers are reached by 32-bit accesses to Device memory, which the architecture
+    // requires to be naturally aligned. An unaligned `caplen` is therefore not a slow path, it is the
+    // alignment fault above - so it is refused here, where the reason is still legible.
+    if caplen & 0x3 != 0 {
+        put_str(b"xhci: CAPLENGTH ");
+        put_hex(caplen);
+        put_str(b" is not 4-byte aligned - refusing to derive the operational base from it\r\n");
+        return false;
+    }
     let hcs1 = rd32(base + CAP_HCSPARAMS1);
     let hcc1 = rd32(base + CAP_HCCPARAMS1);
     let dboff = (rd32(base + CAP_DBOFF) & !0x3) as u64;
@@ -282,12 +316,43 @@ pub fn init(bar0: u64) -> bool {
     let max_ports = ((hcs1 >> 24) & 0xFF) as u8;
     let csz64 = hcc1 & (1 << 2) != 0;
 
-    if caplen == 0 || caplen > 0x100 || max_ports == 0 || max_slots == 0 {
+    // Slots and ports are 8-bit fields, so any value fits and none of them can be rejected on width.
+    // 64 is well above what any real controller reports (the VL805 has a handful) and well below the
+    // 255 a garbage read produces, which makes it a test rather than a formality.
+    if caplen == 0 || caplen > 0x100 || max_ports == 0 || max_slots == 0
+        || max_ports > 64 || max_slots > 64
+    {
         put_str(b"xhci: capability registers look wrong (caplen ");
         put_hex(caplen);
         put_str(b", hcsparams1 ");
         put_hex(hcs1 as u64);
         put_str(b") - the BAR is probably not mapped where we think\r\n");
+        return false;
+    }
+
+    // The layout is reported BEFORE it is judged, so a rejection still shows the numbers it judged on.
+    // A check that fails without printing its inputs replaces one mystery with another.
+    put_str(b"xhci: version ");
+    put_hex(hciversion as u64);
+    put_str(b", caplen ");
+    put_hex(caplen);
+    put_str(b", dboff ");
+    put_hex(dboff);
+    put_str(b", rtsoff ");
+    put_hex(rtsoff);
+    put_str(b", bar0 ");
+    put_hex(bar0_len as u64);
+    put_str(b"\r\n");
+
+    // The register block has four regions (capability, operational, runtime, doorbell) and they all
+    // live inside BAR0. A doorbell or runtime offset past the end of it means an access that leaves the
+    // outbound window - which is not a fault, it is another poison read, and then a controller that
+    // never responds to a doorbell it never received.
+    let need = (rtsoff.max(dboff) + 0x400).max(caplen + 0x400);
+    if need > bar0_len as u64 {
+        put_str(b"xhci: register regions do not fit in BAR0 (needs ");
+        put_hex(need);
+        put_str(b") - the BAR was sized wrong\r\n");
         return false;
     }
 
