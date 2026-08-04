@@ -69,7 +69,7 @@ entry, because a malformed descriptor from an untrusted device must end the walk
 | File | Change | Why |
 |------|--------|-----|
 | `arch/aarch64/xhci.rs` | new, 18 | Ring and context construction, and the report buffer. Every one is a write to a page this module allocated from the frame allocator and named through the direct map, whose layout is the xHCI 1.2 structure the controller reads. The two `read_volatile`/`write_volatile` register helpers are the controller's BAR, which `pcie` mapped and assigned. `parse_config` builds a slice over the descriptor buffer so the walk itself is bounds-checked. The scratchpad pointer-array writes are bounded by an explicit refusal above 512 entries, so a controller asking for more than one page can index is turned away rather than allowed to overrun it. |
-| `arch/aarch64/pcie.rs` | new, 3 | The root-complex register read and write helpers (volatile accesses inside the kernel's Device mapping), and the presence probe. |
+| `arch/aarch64/pcie.rs` | new, 4 | The root-complex register read and write helpers (volatile accesses inside the kernel's Device mapping), the presence probe, and the probe read of the first dword through the outbound window - which distinguishes "the CPU address is not decoded to PCIe" (abort) from "it reaches the root complex, which will not forward it" (poison) from "it arrived". Those want three different fixes, and guessing between them cost two hardware iterations. |
 | `arch/aarch64/uaccess.rs` | 5 -> 7 (+2) | `probe_read32`: the fixup pointer, and the one-instruction `asm!` block that arms it, does the load, and clears it on both exit paths. |
 | `arch/aarch64/mmu.rs` | 12 -> 15 (+3) | `dma_sync` (`dc civac` over a range shared with a bus master - the BCM2711's PCIe is not I/O-coherent, SEC-28), and the two `fill_device_window` writes that build the sparse PCIe outbound-window table. |
 | `arch/aarch64/mod.rs` | 59 -> 61 (+2) | The write and the read of `PCIE_XHCI`, the static carrying the discovered controller from the boot probe to the driver. |
@@ -1730,7 +1730,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/aarch64/video.rs | 2 | permitted |
-| arch/aarch64/pcie.rs | 3 | permitted |
+| arch/aarch64/pcie.rs | 4 | permitted |
 | arch/aarch64/xhci.rs | 18 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |

@@ -287,14 +287,55 @@ fn set_outbound_window(cpu_addr: u64, bus_addr: u64, size: u64) {
     // Base and limit are in MiB units: the low register carries bits 31:20 of each, and the two HI
     // registers carry what is left over above 4 GiB. Splitting them is why a window at 0x6_0000_0000
     // needs three writes and not one.
+    //
+    // **Read-modify-write, not plain write.** These registers hold only the base and limit fields as
+    // far as this file is concerned, and a plain write is the obvious thing - but the reference
+    // implementations both do read-modify-write, and the bits neither of them names are exactly the
+    // ones you cannot afford to zero on a guess. Preserving them costs a read.
     let base_mb = cpu_addr >> 20;
     let limit_mb = (cpu_addr + size - 1) >> 20;
-    wr(
+    set_bits(
         MEM_WIN0_BASE_LIMIT,
+        0xFFF0_FFF0,
         (((base_mb & 0xFFF) as u32) << 20) | (((limit_mb & 0xFFF) as u32) << 4),
     );
-    wr(MEM_WIN0_BASE_HI, (base_mb >> 12) as u32 & 0xFF);
-    wr(MEM_WIN0_LIMIT_HI, (limit_mb >> 12) as u32 & 0xFF);
+    set_bits(MEM_WIN0_BASE_HI, 0xFF, (base_mb >> 12) as u32 & 0xFF);
+    set_bits(MEM_WIN0_LIMIT_HI, 0xFF, (limit_mb >> 12) as u32 & 0xFF);
+}
+
+/// Read the routing state back and print it.
+///
+/// Called after everything is configured, because at this point reasoning has been wrong twice: the
+/// bridge window was genuinely missing, and the controller had genuinely lost its firmware, and
+/// neither fix made the reads land. What has NOT been done is look at what the registers actually hold
+/// afterwards - and a firmware call that resets and re-initialises the endpoint is exactly the kind of
+/// thing that can put the root complex back the way it found it.
+///
+/// Every value here was written by this file. Any of them reading back differently says which write did
+/// not stick, and that is a different bug from every one considered so far.
+fn report_routing() {
+    put_str(b"pcie: win0 lo/hi ");
+    put_hex(rd(MEM_WIN0_LO) as u64);
+    put_str(b"/");
+    put_hex(rd(MEM_WIN0_HI) as u64);
+    put_str(b" base-limit ");
+    put_hex(rd(MEM_WIN0_BASE_LIMIT) as u64);
+    put_str(b" hi ");
+    put_hex(rd(MEM_WIN0_BASE_HI) as u64);
+    put_str(b"/");
+    put_hex(rd(MEM_WIN0_LIMIT_HI) as u64);
+    put_str(b"\r\n");
+    put_str(b"pcie: bridge buses ");
+    put_hex(cfg_read(0, 0, 0, 0x18) as u64);
+    put_str(b" memwin ");
+    put_hex(cfg_read(0, 0, 0, 0x20) as u64);
+    put_str(b" cmd ");
+    put_hex((cfg_read(0, 0, 0, 0x04) & 0xFFFF) as u64);
+    put_str(b" class ");
+    put_hex((cfg_read(0, 0, 0, 0x08) >> 8) as u64);
+    put_str(b" status ");
+    put_hex(rd(PCIE_STATUS) as u64);
+    put_str(b"\r\n");
 }
 
 /// Walk bus 1 looking for a VIA xHCI controller, and give it a BAR inside the window.
@@ -344,6 +385,20 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
         // The reload is not instant, and there is nothing to poll: the tag returns as soon as the
         // request is accepted, not when the controller is ready. Linux waits in the same shape.
         delay_us(200_000);
+
+        // **Re-apply the root complex's own routing after the firmware has been in here.**
+        //
+        // The notify above does not just hand the controller a blob: the firmware resets and
+        // re-initialises the endpoint, and it reaches it through this same root complex. Anything it
+        // does to the RC on the way - retraining the link, resetting the bridge, reprogramming the
+        // outbound window it wants for its own access - lands on registers this file configured
+        // several steps earlier and has not looked at since.
+        //
+        // Re-applying is cheap and idempotent. Assuming they survived is how a correct sequence
+        // produces a dead device, with the log showing every step succeeding.
+        wr(RC_CFG_PRIV1_ID_VAL3, 0x0604_00);
+        set_outbound_window(cpu_base, PCI_WIN_BUS_ADDR, cpu_size);
+        cfg_write(0, 0, 0, 0x18, 0x0001_0100);
 
         // Size BAR0 the standard way: write all-ones, read back the writable bits.
         cfg_write(1, dev, 0, 0x10, 0xFFFF_FFFF);
@@ -412,6 +467,28 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
         if bar_back as u64 != PCI_WIN_BUS_ADDR {
             put_str(b"pcie: BAR0 did not take the address it was given - not usable\r\n");
             continue;
+        }
+
+        // Everything that decides whether a read reaches the device, read back from the hardware.
+        report_routing();
+
+        // And then the question itself: does a read through the window reach the controller? Probed,
+        // so an abort is caught and named rather than counted anonymously later. Three outcomes, and
+        // they want three different fixes: an abort means the CPU address is not decoded to PCIe at
+        // all; poison means it reaches the root complex and stops there; anything else means it
+        // arrived. Reporting which one it is costs one read and has been the missing fact twice.
+        // SAFETY: 4-byte aligned, inside the Device mapping `mmu` built for this window.
+        let first = unsafe { super::uaccess::probe_read32(super::mmu::PCIE_WIN_VA) };
+        put_str(b"pcie: first dword through the window: ");
+        match first {
+            None => put_str(b"ABORTED - the CPU address is not decoded to PCIe\r\n"),
+            Some(0xDEAD_DEAD) => {
+                put_str(b"0xdeaddead - reaches the root complex, which will not forward it\r\n")
+            }
+            Some(v) => {
+                put_hex(v as u64);
+                put_str(b" - the read arrived\r\n");
+            }
         }
 
         return Some(Device {
