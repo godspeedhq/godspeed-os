@@ -1030,15 +1030,30 @@ pub mod page_tables {
 
     pub const PAGE_SIZE: usize = 4096;
 
-    /// Arch hook run once a service's address space is built.
+    /// Arch hook run once a service's address space is built, before anything runs in it.
     ///
-    /// **Nothing to do here, and that is the point.** The 32-bit ARM port clones the kernel identity
-    /// map into every new service table at this hook, because its kernel is reached through `TTBR0`.
-    /// This port's kernel lives in `TTBR1`, so a task's table needs no kernel entries at all and there
-    /// is nothing to finalize. A genuinely empty hook, not an unimplemented one.
+    /// No kernel map to clone - unlike the 32-bit port, this kernel lives in `TTBR1` - but there IS
+    /// cache maintenance to do, and it is not optional. The loader has just written the service's text
+    /// through the kernel's cacheable direct map; the I-cache is not coherent with that, and the frames
+    /// it used may be ones a previous task executed from. Without this the core fetches the previous
+    /// task's instructions.
+    ///
+    /// That is not hypothetical: it looped the boot on hardware until the endpoint table filled. The
+    /// hand-written payload paths had already been fixed individually, which is precisely why fixing it
+    /// **here** matters - this hook covers every service the loader will ever produce.
     ///
     /// # Safety
-    /// `_root` must be a page-table root this task owns.
+    /// `root` must be a page-table root this task owns, with nothing executing under it yet.
+    #[cfg(feature = "pi4")]
+    pub unsafe fn finalize_service_address_space(root: u64) {
+        // SAFETY: caller's contract - the space belongs to a task that has not started.
+        let synced = unsafe { super::ptables::sync_all_pages(root) };
+        // Report the count. QEMU cannot demonstrate this fix - it models no separate I-cache - so the
+        // only evidence available in emulation is that the hook ran and did work. A silent hook is
+        // exactly how the same bug got shipped once already: the fix existed, in two other places.
+        crate::kprintln!("aarch64: service address space finalized - {} pages I-cache synced", synced);
+    }
+    #[cfg(not(feature = "pi4"))]
     pub unsafe fn finalize_service_address_space(_root: u64) {}
 
     /// Free a task's page-table root and the structure below it, at task death.

@@ -13,6 +13,35 @@ comment.
 
 ---
 
+## 2026-08-04 - Pi 4: the SAME cache bug, in the loader this time (feat/pi4-aarch64)
+
+The fix below was applied to the two hand-written payload copies and **not to the ELF loader** - even
+though its own commit message said the loader would need it. Fixing the instances rather than the class
+left it open where it mattered most.
+
+On hardware, the logger's text landed in frames the one-shot EL0 demo had just executed from and freed.
+The I-cache still held the old blob, so the "logger" ran the DEMO's code, hit the demo's exit syscall,
+switched to a `CTX_KERNEL` saved during boot, and resumed execution in the middle of `boot_high` - which
+re-ran the rest of the boot. It looped until the endpoint table filled, 95 task slots later.
+
+Two fixes, because the bug had a cause and an amplifier:
+
+- **Cause:** `finalize_service_address_space` - the arch hook the neutral loader already calls for every
+  service - now syncs the I-cache over every page of the new address space. Applying it at the hook
+  covers every service the loader will ever produce, rather than the ones someone remembered.
+- **Amplifier:** `CTX_KERNEL` was a resurrection point. The exit syscall now refuses when the demo is
+  not running, so the same class of mistake costs one loud refusal instead of a boot loop.
+
+The hook reports how many pages it synced, because QEMU models no separate I-cache and cannot
+demonstrate the fix - the only evidence available in emulation is that the hook ran and did work. A
+silent hook is exactly how this shipped once already.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/ptables.rs` | 19 -> 21 (+2) | `sync_all_pages` walks the new address space and syncs each leaf through the kernel's direct map (cache maintenance is by physical line, so the task's own VAs need not be mapped). |
+| `arch/aarch64/mod.rs` | 51 -> 53 (+2) | `finalize_service_address_space` calling it, and the count it reports. |
+| `arch/aarch64/usermode.rs` | 14 -> 16 (+2) | The `DEMO_ACTIVE` guard around the exit switch, and setting/clearing it around the demo. |
+
 ## 2026-08-04 - Pi 4: writing code needs cache maintenance (feat/pi4-aarch64)
 
 Found on hardware, on the first boot of milestone 17, and **structurally invisible under emulation**.
@@ -1541,7 +1570,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 51 | permitted |
+| arch/aarch64/mod.rs | 53 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/exceptions.rs | 10 | permitted |
 | arch/aarch64/uaccess.rs | 5 | permitted |
@@ -1551,8 +1580,8 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/gic.rs | 4 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 12 | permitted |
-| arch/aarch64/ptables.rs | 19 | permitted |
-| arch/aarch64/usermode.rs | 14 | permitted |
+| arch/aarch64/ptables.rs | 21 | permitted |
+| arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 3 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |

@@ -459,6 +459,27 @@
 > board and talked to the kernel. Services are embedded incrementally, exactly as the 32-bit port does -
 > `aarch64_built` in `kernel/build.rs` currently lists `logger`; the rest keep the placeholder.
 >
+> **The same cache bug again, in the loader - and the lesson is the interesting part.** Milestone 18
+> passed in QEMU and looped on the board: the boot re-entered itself until the endpoint table filled, 95
+> task slots later. The logger's text had landed in frames the one-shot EL0 demo just freed; the I-cache
+> still held the old blob, so the "logger" ran the DEMO's code, hit its exit syscall, and switched to a
+> `CTX_KERNEL` saved during boot.
+>
+> The cache fix had been written the day before - and applied only to the two hand-written payload
+> copies, not to the ELF loader, **even though its own commit message said the loader would need it**.
+> Fixing the instances rather than the class left it open exactly where it mattered.
+>
+> Two fixes, because the bug had a cause and an amplifier:
+>
+> - **Cause:** `finalize_service_address_space` - the arch hook the neutral loader already calls per
+>   service - now syncs the I-cache over every page of the new address space. At the hook, it covers
+>   every service the loader will ever produce.
+> - **Amplifier:** `CTX_KERNEL` was a resurrection point. The exit syscall now refuses when the demo is
+>   not running, so this class of mistake costs one loud refusal instead of a boot loop.
+>
+> The hook reports its page count (`67 pages I-cache synced`) because QEMU cannot demonstrate the fix -
+> a silent hook is how this shipped once already.
+>
 > **Not done:** `arch::init` + the `kernel_main` handoff, UART RX, PSCI SMP.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011

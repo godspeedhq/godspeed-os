@@ -127,6 +127,17 @@ static mut CALLS: u64 = 0;
 /// Set when the neutral dispatcher refused the uncapped Log AND gave a defined error for an unknown
 /// number - the two properties the real syscall path owes.
 static mut REAL_DISPATCH_OK: bool = false;
+/// True only while `run` is actually inside the one-shot demo.
+///
+/// Without this, `CTX_KERNEL` is a **resurrection point**: any later `svc` carrying the exit number
+/// switches to a context saved during boot, and execution resumes in the middle of `boot_high` - which
+/// then re-runs the rest of the boot. That is not hypothetical. On hardware, a service whose text was
+/// fetched stale from the I-cache executed this demo's exit call, and the boot re-entered itself over
+/// and over until the endpoint table filled and the kernel panicked, 95 task slots later.
+///
+/// The I-cache fix removes the cause; this removes the AMPLIFIER. A stale context must not be
+/// resumable, so that the same class of mistake costs one loud refusal instead of a boot loop.
+static mut DEMO_ACTIVE: bool = false;
 /// Where to resume when the task exits, and a scratch to save the dying context into.
 static mut CTX_KERNEL: TaskContext = TaskContext::empty();
 static mut CTX_DISCARD: TaskContext = TaskContext::empty();
@@ -175,6 +186,12 @@ pub fn syscall(number: u64, frame: &mut TrapFrame) {
             }
         }
         SYS_EXIT => {
+            // SAFETY: module-owned static, single-threaded bring-up.
+            if !unsafe { DEMO_ACTIVE } {
+                put_str(b"    [EL0] REFUSED exit - the demo is not running, so CTX_KERNEL is stale and resuming it would re-enter the boot\r\n");
+                frame.x[0] = u64::MAX;
+                return;
+            }
             put_str(b"    [EL0] svc #1 (exit) - leaving EL0\r\n");
             // Do not return to a task that asked to stop. Switch to the kernel context saved before we
             // entered EL0; `run` resumes just after its switch.
@@ -295,12 +312,16 @@ pub fn run() -> bool {
 
     // SAFETY: single-threaded bring-up; the statics are this module's.
     unsafe {
+        DEMO_ACTIVE = true;
         ENTER_TTBR = task.ttbr;
         (*(&raw mut CTX_SHIM)).init(enter_el0, shim_stack_top());
         // Save where to come back to, then enter the task. The exit syscall switches back into
         // CTX_KERNEL, which resumes right here.
         super::context::switch(&raw mut CTX_KERNEL, &raw const CTX_SHIM);
     }
+
+    // SAFETY: module-owned static; the demo is over, so CTX_KERNEL must stop being resumable.
+    unsafe { DEMO_ACTIVE = false };
 
     // Back in the kernel. Retire the task's address space before freeing anything it mapped.
     // SAFETY: we are executing from the high half, so clearing TTBR0 removes only the task's map.

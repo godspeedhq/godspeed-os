@@ -285,6 +285,48 @@ pub unsafe fn free_all(root: u64) {
     }
 }
 
+/// Make every page this address space maps safe to execute.
+///
+/// The kernel has just written a program's text into these frames through its own cacheable direct
+/// map. The instruction and data caches are not coherent, so without this the core may fetch whatever
+/// the I-cache still holds for those physical addresses - and when the allocator recycles frames a
+/// previous task executed from, that is the previous task's code.
+///
+/// **This is the loader's version of the bug already fixed in the hand-written payload paths.** Fixing
+/// those and not this one left the class open: the ELF loader writes far more code, into far more
+/// recycled frames, and the failure it produced was a boot that silently re-entered itself until the
+/// endpoint table filled. Applying the fix at the arch hook the neutral loader already calls covers
+/// every service, not just the ones someone remembered.
+///
+/// Pages are synced through the kernel's direct map, which is where the writes went; cache maintenance
+/// is by physical line, so the task's own virtual addresses do not need to be mapped here.
+///
+/// # Safety
+/// `root` must be an address space this task owns and nothing is executing under yet.
+pub unsafe fn sync_all_pages(root: u64) -> usize {
+    let mut synced = 0usize;
+    // SAFETY: caller's contract; tables reached through the kernel's direct map.
+    unsafe {
+        for i in 0..ENTRIES {
+            let l1e = get(root, i);
+            if l1e & DESC_VALID == 0 || l1e & 0b11 != DESC_TABLE { continue; }
+            let l2 = l1e & ADDR_MASK;
+            for j in 0..ENTRIES {
+                let l2e = get(l2, j);
+                if l2e & DESC_VALID == 0 || l2e & 0b11 != DESC_TABLE { continue; }
+                let l3 = l2e & ADDR_MASK;
+                for k in 0..ENTRIES {
+                    let l3e = get(l3, k);
+                    if l3e & DESC_VALID == 0 { continue; }
+                    super::mmu::sync_instruction_cache(phys_to_virt(l3e & ADDR_MASK), 4096);
+                    synced += 1;
+                }
+            }
+        }
+    }
+    synced
+}
+
 /// Free every LEAF page the address space maps, returning how many.
 ///
 /// Separate from [`free_all`], which frees the TABLE frames. The neutral kill path reclaims a task's
