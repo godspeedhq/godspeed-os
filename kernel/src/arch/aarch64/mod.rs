@@ -875,6 +875,7 @@ extern "C" fn boot_high() -> ! {
             if genet::umac_init([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).is_some() {
                 // Prove the DMA block bases before anything hands the controller a buffer.
                 if genet::verify_dma_layout() {
+                    genet::apply_link_settings();
                     if genet::init_rx_ring() && genet::enable_rx() {
                         genet::await_first_frame();
                     }

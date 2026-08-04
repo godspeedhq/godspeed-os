@@ -301,8 +301,7 @@ pub fn umac_init(mac: [u8; 6]) -> Option<u32> {
 }
 
 /// The speed field the MAC needs, from the PHY's negotiated speed. Kept next to the register bits it
-/// encodes so the two cannot drift; used when the data path is enabled.
-#[allow(dead_code)]
+/// encodes so the two cannot drift.
 fn cmd_speed(mbps: u32) -> u32 {
     let sel = match mbps {
         1000 => 2,
@@ -652,4 +651,55 @@ pub fn await_first_frame() {
         waited += 1;
     }
     put_str(b"genet: no frame in 3s - link is up and the ring is armed, but nothing arrived\r\n");
+}
+
+/// `DMA_SCB_BURST_SIZE`, from the same verified v3plus table. Linux programs it as part of DMA init.
+const DMA_SCB_BURST_SIZE: u64 = 0x0C;
+/// Linux's `DMA_MAX_BURST_LENGTH`.
+const DMA_MAX_BURST_LENGTH: u32 = 0x08;
+
+/// The BCM54213PE's auxiliary status register, where the NEGOTIATED mode lands once auto-negotiation
+/// finishes. The standard MII registers say what both ends can do; this says what they agreed on.
+const BCM_AUX_STATUS: u32 = 0x19;
+
+/// Read the speed the PHY actually negotiated, in Mbit.
+///
+/// **The MAC does not learn this by itself.** It has a speed field that defaults to 10 Mbit, and on
+/// RGMII a MAC clocking at one speed while the PHY runs at another exchanges nothing at all - link up,
+/// ring armed, and not a single frame. That is exactly the state the first enable produced.
+fn negotiated_speed() -> u32 {
+    let Some(aux) = mdio(1, BCM_AUX_STATUS, None) else { return 0 };
+    // Bits 10:8 hold the auto-negotiation result on this family.
+    match (aux >> 8) & 0x7 {
+        0b111 => 1000, // 1000BASE-T full duplex
+        0b110 => 1000, // 1000BASE-T half duplex
+        0b101 => 100,  // 100BASE-TX full duplex
+        0b011 => 100,  // 100BASE-TX half duplex
+        0b010 => 10,   // 10BASE-T full duplex
+        0b001 => 10,   // 10BASE-T half duplex
+        _ => 0,        // still negotiating, or no link
+    }
+}
+
+/// Tell the MAC what speed the PHY settled on, and program the DMA burst size.
+///
+/// Both were missing from the first receive enable, and either alone is enough to receive nothing:
+/// the speed because the MAC and PHY must clock together, and the burst size because it is part of the
+/// DMA init sequence Linux performs before starting the engine.
+pub fn apply_link_settings() -> u32 {
+    wr(dma_reg(RDMA_OFFSET, DMA_SCB_BURST_SIZE), DMA_MAX_BURST_LENGTH);
+    wr(dma_reg(TDMA_OFFSET, DMA_SCB_BURST_SIZE), DMA_MAX_BURST_LENGTH);
+
+    let mbps = negotiated_speed();
+    if mbps == 0 {
+        put_str(b"genet: the PHY has not settled on a speed - leaving the MAC at its default\r\n");
+        return 0;
+    }
+    let cmd = rd(UMAC_CMD) & !((CMD_SPEED_MASK) << CMD_SPEED_SHIFT);
+    wr(UMAC_CMD, cmd | cmd_speed(mbps));
+
+    put_str(b"genet: PHY negotiated ");
+    super::put_dec(mbps as u64);
+    put_str(b" Mbit - MAC speed set to match\r\n");
+    mbps
 }
