@@ -220,6 +220,10 @@ fn build() -> Option<UserTask> {
         }
         let dst = (super::mmu::KERNEL_VA_BASE + code.phys_addr().0) as *mut u8;
         core::ptr::copy_nonoverlapping(src, dst, len);
+        // The bytes just written are CODE. Without this the core may fetch whatever the
+        // I-cache still holds for this physical frame - which, when the allocator recycles a
+        // frame another task executed from, is that task's instructions.
+        super::mmu::sync_instruction_cache(dst as u64, len);
     }
 
     // Code: user, read-only, executable. Stack: user, writable, NOT executable. Expressed in the

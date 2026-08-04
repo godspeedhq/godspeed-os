@@ -418,6 +418,52 @@ pub fn selftest_high_half() -> Option<(u64, u64)> {
     Some((phys, high))
 }
 
+/// Make freshly-written bytes executable: clean them out of the D-cache and drop any stale copy from
+/// the I-cache.
+///
+/// **Required on ARM whenever the kernel writes code**, which it does every time it loads a program -
+/// an ELF's text, a task payload copied into a frame. The instruction and data caches are not coherent
+/// with each other, so a store lands in the D-cache while the I-cache may still hold whatever was
+/// previously at that physical address. The CPU then fetches the old instructions.
+///
+/// **This is not theoretical, and it is invisible under emulation.** On the Pi 4 a task payload was
+/// copied into a frame the previous task had just executed from and freed; the allocator handed the
+/// same frame straight back, the I-cache still held the old blob, and the core ran the *previous*
+/// task's code until it fell off the end into an Illegal Execution State (`ESR` EC `0b001110`,
+/// `PSTATE.IL` set). QEMU models no separate I-cache, so it had passed there a dozen times.
+///
+/// Line sizes come from `CTR_EL0` rather than being assumed: `DminLine` and `IminLine` differ between
+/// implementations, and a hardcoded 64 either does needless work or - if too large - skips lines.
+pub fn sync_instruction_cache(va: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // SAFETY: `CTR_EL0` is readable at EL1 and side-effect free. `dc cvau` / `ic ivau` are cache
+    // maintenance by virtual address over a range the caller just wrote; they alter no architectural
+    // state beyond the caches, and the `dsb`/`isb` order them against the fetch that follows.
+    unsafe {
+        let ctr: u64;
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
+        let dline = 4u64 << ((ctr >> 16) & 0xF); // DminLine, in words
+        let iline = 4u64 << (ctr & 0xF); // IminLine, in words
+        let end = va + len as u64;
+
+        let mut a = va & !(dline - 1);
+        while a < end {
+            core::arch::asm!("dc cvau, {}", in(reg) a, options(nostack));
+            a += dline;
+        }
+        core::arch::asm!("dsb ish", options(nostack));
+
+        let mut a = va & !(iline - 1);
+        while a < end {
+            core::arch::asm!("ic ivau, {}", in(reg) a, options(nostack));
+            a += iline;
+        }
+        core::arch::asm!("dsb ish", "isb", options(nostack));
+    }
+}
+
 /// The kernel's own boot L1, as a physical address.
 ///
 /// Per-task address spaces copy their kernel half from **this**, never from the live `TTBR0_EL1`. The

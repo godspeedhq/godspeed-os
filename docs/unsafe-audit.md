@@ -13,6 +13,30 @@ comment.
 
 ---
 
+## 2026-08-04 - Pi 4: writing code needs cache maintenance (feat/pi4-aarch64)
+
+Found on hardware, on the first boot of milestone 17, and **structurally invisible under emulation**.
+
+The instruction and data caches are not coherent on ARM. A store lands in the D-cache while the I-cache
+may still hold whatever was previously at that physical address. The kernel writes code every time it
+loads a program, so this is not a demo concern - the ELF loader will hit it the moment it loads a
+service's text.
+
+What happened: a task payload was copied into a frame the previous EL0 task had just executed from and
+freed. The allocator handed the same frame straight back, the I-cache still held the old blob, and the
+core executed the **previous task's instructions** until it ran off the end into an Illegal Execution
+State (`ESR` EC `0b001110`, `PSTATE.IL` set). The give-away in the log was the scheduled task printing
+the one-shot demo's messages. QEMU models no separate I-cache, so it had passed there a dozen times.
+
+`sync_instruction_cache` cleans the range out of the D-cache to the point of unification and
+invalidates the I-cache over it. Line sizes come from `CTR_EL0` rather than being assumed - `DminLine`
+and `IminLine` differ between implementations, and a hardcoded 64 either does needless work or, if too
+large, skips lines.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mmu.rs` | 11 -> 12 (+1) | `sync_instruction_cache`: reads `CTR_EL0` for the line sizes, then `dc cvau` / `ic ivau` over the range with the `dsb`/`isb` that order them against the fetch which follows. Cache maintenance by VA alters no architectural state beyond the caches. |
+
 ## 2026-08-03 - Pi 4 milestone 17: an EL0 task under the neutral scheduler (feat/pi4-aarch64)
 
 Every earlier EL0 excursion was a one-shot: the boot dropped to EL0, the task ran, control came back.
@@ -1526,7 +1550,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 4 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
-| arch/aarch64/mmu.rs | 11 | permitted |
+| arch/aarch64/mmu.rs | 12 | permitted |
 | arch/aarch64/ptables.rs | 19 | permitted |
 | arch/aarch64/usermode.rs | 14 | permitted |
 | arch/aarch64/mailbox.rs | 3 | permitted |

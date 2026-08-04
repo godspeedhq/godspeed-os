@@ -418,6 +418,20 @@
 > scheduled EL0 task turned it into a null write on the context-switch path. A stub reachable down
 > exactly one path stays silent until something takes that path.
 >
+> **Writing code needs cache maintenance - found on hardware, invisible in QEMU.** The first board boot
+> of milestone 17 died with `ESR` EC `0b001110` (Illegal Execution State, `PSTATE.IL` set), and the log
+> showed the scheduled task printing the *one-shot demo's* messages.
+>
+> The instruction and data caches are not coherent on ARM. The payload was copied into a frame the
+> previous EL0 task had just executed from and freed; the allocator handed the same frame straight back,
+> the I-cache still held the old blob, and the core ran the previous task's instructions until it fell
+> off the end. QEMU models no separate I-cache, so it had passed there a dozen times.
+>
+> `mmu::sync_instruction_cache` now cleans the range to the point of unification and invalidates the
+> I-cache over it, with line sizes read from `CTR_EL0` rather than assumed. **This is not a demo fix:**
+> the kernel writes code every time it loads a program, so the ELF loader needs it the moment it loads a
+> service's text - and it would have been a far more confusing bug to meet there.
+>
 > **Not done:** `arch::init` + the `kernel_main` handoff, UART RX, PSCI SMP.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
