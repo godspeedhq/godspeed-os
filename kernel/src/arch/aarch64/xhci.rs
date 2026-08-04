@@ -1427,7 +1427,7 @@ fn hotplug_tick(hc: &mut Xhci) {
         }
 
         if was && !now_conn {
-            crate::kprintln!("usb: device REMOVED from hub port {}", p);
+            super::console_notice_fmt(format_args!("usb: device REMOVED from hub port {}", p));
             stand_down(hc, &mut hub, p);
             hub.connected &= !bit;
             hub.tries[p as usize] = 0; // a fresh set of attempts for whatever arrives next
@@ -1436,14 +1436,14 @@ fn hotplug_tick(hc: &mut Xhci) {
                 continue; // said its piece already; wait for the port to change again
             }
             hub.tries[p as usize] += 1;
-            crate::kprintln!("usb: device ATTACHED to hub port {} - enumerating", p);
+            super::console_notice_fmt(format_args!("usb: device ATTACHED to hub port {} - enumerating", p));
             hc.xfer_ms = 500; // enumeration is allowed to be slow
             let ok = hc.bring_up_hub_port(&mut hub, topo, p);
             hc.xfer_ms = 50;
             if ok {
                 hub.connected |= bit;
                 hub.tries[p as usize] = 0;
-                crate::kprintln!("usb: keyboard on hub port {} is ready", p);
+                super::console_notice_fmt(format_args!("usb: keyboard on hub port {} is ready", p));
             } else if hub.tries[p as usize] >= HOTPLUG_MAX_TRIES {
                 crate::kprintln!(
                     "usb: hub port {} device did not come up in {} attempts - leaving it until the \
@@ -1479,7 +1479,7 @@ fn stand_down(hc: &mut Xhci, hub: &mut Hub, p: u8) {
     ks.rep.disarm();
     ks.last = [0; 6];
     hc.command(0, TRB_DISABLE_SLOT, (slot as u32) << 24);
-    crate::kprintln!("usb: keyboard on hub port {} stood down, slot {} released", p, slot);
+    super::console_notice_fmt(format_args!("usb: keyboard on hub port {} stood down, slot {} released", p, slot));
     // ACTIVE is deliberately NOT cleared: the hub is still there, and the watcher that will notice the
     // keyboard coming back is the same poll this runs inside.
 }

@@ -35,9 +35,6 @@ use super::{put_dec, put_hex, put_str};
 /// Set once the shared console has a framebuffer. Read before every mirror.
 static CONSOLE_UP: AtomicBool = AtomicBool::new(false);
 
-/// Held by whoever is currently rendering. See [`mirror`].
-static RENDERING: AtomicBool = AtomicBool::new(false);
-
 /// Whether the KERNEL LOG still mirrors to the display. True during boot, so the machine shows what it
 /// is doing on a screen with no serial cable attached; false once the shell takes the console, so a
 /// late service log does not land in the middle of the prompt. Serial keeps the full stream either way.
@@ -49,6 +46,23 @@ static BOOT_DISMISSED: AtomicBool = AtomicBool::new(false);
 /// Mirror a KERNEL LOG line, which stops at [`boot_complete`]. Console output uses [`mirror`].
 pub fn mirror_log(s: &[u8]) {
     if BOOT_LOG_TO_FB.load(Ordering::Relaxed) {
+        mirror(s);
+    }
+}
+
+/// An operator-facing NOTICE: reaches the display even after the boot log has stopped mirroring.
+///
+/// The kernel log deliberately stops reaching the TV once the shell owns the console, so a late
+/// service line cannot land in the middle of the prompt. That is right for logging and wrong for the
+/// small class of events the person at the keyboard needs to see *because they just did something* -
+/// a USB device arriving or leaving. Those went to serial only, which is no use to someone sitting in
+/// front of the television holding the cable they just pulled.
+///
+/// It still yields to a full-screen app: if anything holds the console foreground it is painting the
+/// whole screen, and a notice smeared across its frame would be worse than a missing one. Serial keeps
+/// it either way, so nothing is lost - only deferred to the log.
+pub fn notice(s: &[u8]) {
+    if super::console_foreground_is_free() {
         mirror(s);
     }
 }
@@ -68,13 +82,7 @@ pub fn boot_complete() {
     }
 }
 
-/// Mirror a run of serial bytes to the display, **at most one writer at a time**.
-///
-/// Serial is the source of truth and has already taken these bytes; the framebuffer is a mirror, so
-/// dropping a contended write costs nothing visible but avoids a real hazard. The neutral console is
-/// behind a spinlock, and a spinlock is not reentrant: the timer tick can log while boot code is
-/// part-way through rendering, and a same-core re-entry would spin until the lock watchdog panicked.
-/// This flag makes the interrupted writer's mirror a no-op instead - the bytes still reach serial.
+/// Mirror a run of bytes to the display.
 ///
 /// The `CONSOLE_UP` test comes first and stays lock-free, which is what keeps every pre-MMU boot
 /// message out of the code below: those run with the caches off, where the console's exclusive
@@ -83,11 +91,16 @@ pub fn mirror(s: &[u8]) {
     if !CONSOLE_UP.load(Ordering::Relaxed) {
         return;
     }
-    if RENDERING.swap(true, Ordering::Acquire) {
-        return; // another writer (or a preempted self) owns the console; serial already has the bytes
-    }
-    crate::fbcon::put_bytes(s);
-    RENDERING.store(false, Ordering::Release);
+    // **Mask interrupts rather than take a flag.** The hazard being guarded is same-core re-entry: the
+    // timer tick can log while a task is part-way through rendering, and the neutral console is behind
+    // a spinlock, which is not reentrant. Masking removes that directly.
+    //
+    // The flag this replaces was a second lock, and it could LATCH. A task killed between claiming it
+    // and releasing it - which `chaos` does to the shell dozens of times a run - would leave it held
+    // forever, and every later write would be silently dropped: a television that goes dead and stays
+    // dead, with serial still perfectly healthy and nothing in the log. Masked interrupts cannot latch,
+    // because a task that cannot be preempted cannot be killed part-way through.
+    crate::smp::without_interrupts(|| crate::fbcon::put_bytes(s));
 }
 
 /// Framebuffer geometry as the GPU reported it.

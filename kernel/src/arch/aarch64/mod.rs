@@ -1215,6 +1215,62 @@ pub fn console_foreground_allows(task_slot: u32) -> bool {
     console_fg_lapsed() // a claim nobody is renewing does not keep the console
 }
 
+/// Is the console unclaimed - nobody painting a full screen right now?
+#[cfg(feature = "pi4")]
+pub fn console_foreground_is_free() -> bool {
+    CONSOLE_FOREGROUND.load(Ordering::Acquire) == u32::MAX
+}
+
+/// Print an operator-facing notice: serial always, and the display too unless a full-screen app owns
+/// it. For the small class of events the person at the keyboard needs to see because they just caused
+/// them - a USB cable going in or out. Ordinary logging stays on `kprintln!`.
+#[cfg(feature = "pi4")]
+pub fn console_notice(s: &[u8]) {
+    serial_write_bytes_lockfree_no_fb(s);
+    video::notice(s);
+}
+
+/// Serial only, no display mirror - the mirror is decided by the caller.
+#[cfg(feature = "pi4")]
+fn serial_write_bytes_lockfree_no_fb(s: &[u8]) {
+    for &b in s {
+        serial_write_byte(b);
+    }
+}
+
+/// A fixed stack buffer that `write!` can render into. No heap (§26.6.1): the bound is the buffer,
+/// and a message that would not fit is TRUNCATED rather than dropped - a clipped notice still tells
+/// the operator a cable moved, which is the whole job.
+#[cfg(feature = "pi4")]
+struct NoticeBuf {
+    buf: [u8; 160],
+    n: usize,
+}
+
+#[cfg(feature = "pi4")]
+impl core::fmt::Write for NoticeBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.n < self.buf.len() {
+                self.buf[self.n] = b;
+                self.n += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Render a formatted operator notice and print it. See [`console_notice`].
+#[cfg(feature = "pi4")]
+pub fn console_notice_fmt(args: core::fmt::Arguments) {
+    use core::fmt::Write;
+    let mut nb = NoticeBuf { buf: [0; 160], n: 0 };
+    let _ = nb.write_fmt(args);
+    let _ = nb.write_str("
+");
+    console_notice(&nb.buf[..nb.n]);
+}
+
 /// Wake a task parked in a muted blocking console read, so releasing the foreground resumes it at once
 /// instead of leaving it asleep until the next keystroke - which is exactly why the prompt did not come
 /// back on its own when `chaos` exited.
