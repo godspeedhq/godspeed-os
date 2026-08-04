@@ -88,6 +88,24 @@ Five consecutive boots now report `cores in the scheduler: 4 (mask 0xf)` intact.
 
 No new `unsafe`.
 
+## 2026-08-04 - Pi 4 GENET milestone 1: find the controller and identify it (feat/pi4-aarch64)
+
+The Pi 2 has no Ethernet MAC - its port hangs off a LAN9514 behind the USB hub, which is why that
+port's networking rides the in-kernel DWC2 stack. The Pi 4 has a real MAC on the SoC (GENET v5 at
+`0xFD58_0000`) with its own DMA rings and an external RGMII PHY over MDIO. None of the Pi 2's network
+path transfers; only the seam above it does.
+
+This milestone reads `SYS_REV_CTRL` and reports the revision, and stops there deliberately. It proves
+the MMIO window decodes **before** any driver above it can blame its own logic for a dead read - the
+PCIe bring-up on this board spent four hardware rounds on a window that was silently not forwarding,
+and every one of them was spent looking at the driver. The revision also selects the register layout:
+v1..v5 move the DMA rings, so a driver written against v5 offsets on a v3 part reads plausible values
+from the wrong places.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/genet.rs` | new, 1 | The revision read, through `probe_read32` so an absent controller is reported rather than taken as an external abort that surfaces later blaming something unrelated. |
+
 ## 2026-08-04 - Pi 4 SMP: the PSCI attempt hung the board, and is removed (feat/pi4-aarch64)
 
 Four cores came up on six consecutive QEMU boots and the board hung on the release line. The cause was
@@ -1991,6 +2009,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/aarch64/video.rs | 2 | permitted |
+| arch/aarch64/genet.rs | 1 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
 | arch/aarch64/smp_boot.rs | 9 | permitted |
 | arch/aarch64/xhci.rs | 37 | permitted |

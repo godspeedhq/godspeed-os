@@ -40,6 +40,8 @@ pub mod timer;
 #[cfg(feature = "pi4")]
 pub mod uart_rx;
 #[cfg(feature = "pi4")]
+pub mod genet;
+#[cfg(feature = "pi4")]
 pub mod pcie;
 // Always compiled, even when SMP is off: `_start` branches secondaries here, and a `naked_asm!` symbol
 // reference cannot be conditional. With the feature off nothing ever sets `AP_TABLES_READY`, so a
@@ -864,6 +866,10 @@ extern "C" fn boot_high() -> ! {
         // has to cover the highest address a bus master may be handed, and a map with a hole in it
         // (which the Pi 4's is - the GPU carve sits between the two banks) sums to less than that.
         let ram_top = bi.memory_map.iter().map(|r| r.base + r.len).max().unwrap_or(0);
+        // The on-board ethernet controller. Identified here, next to the other device probes, and
+        // inside the same window: an absent controller answers with an abort, not a value.
+        genet::probe();
+
         // The whole USB bring-up runs inside the probe window, not just the PCIe half. A read that does
         // not reach the controller completes with a poison value rather than faulting, but the WRITES
         // that go with it can be refused - and that refusal arrives later, as an asynchronous SError
