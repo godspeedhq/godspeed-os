@@ -129,6 +129,7 @@ const TRB_DATA: u32 = 3;
 const TRB_STATUS: u32 = 4;
 const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
+const TRB_DISABLE_SLOT: u32 = 10;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 const TRB_EV_TRANSFER: u32 = 32;
@@ -237,12 +238,26 @@ struct Xhci {
     event_deq: usize,
     event_cycle: u32,
 
+    /// How long a transfer may take before it is given up on, in milliseconds.
+    ///
+    /// A field rather than a constant because the two callers have opposite needs and both are right.
+    /// Enumeration is rare and legitimately slow, so it gets a generous bound. The hot-plug watcher
+    /// runs **inside the timer tick with interrupts masked**, once a second, forever - so a transfer
+    /// that hangs there does not merely delay the watcher, it stops the scheduler. Its bound is short
+    /// enough that a whole visit costs less than one quantum even if every port fails to answer.
+    xfer_ms: u32,
+
     /// The keyboard, once found.
     kbd: Option<Keyboard>,
+    /// The internal hub, kept alive after enumeration so its ports can be watched. Everything plugged
+    /// into this board is behind it, so without this a keyboard unplugged once stays dead until reboot.
+    hub: Option<Hub>,
 }
 
 struct Keyboard {
     slot: u8,
+    /// Which downstream port of the hub it is on, so a disconnect there can be matched to it.
+    hub_port: u8,
     /// Doorbell target for the interrupt IN endpoint.
     ep_dci: u32,
     ring: Ring,
@@ -254,6 +269,29 @@ struct Keyboard {
     max_packet: u32,
 }
 
+/// The internal hub and what we believe is plugged into it.
+struct Hub {
+    slot: u8,
+    ep0: Ring,
+    nports: u8,
+    buf_va: u64,
+    buf_phys: u64,
+    /// Bit `p` set = we believe port `p` holds a device.
+    connected: u16,
+    /// Per-port attempts to bring a device up. **Bounded**: a device that arrives and refuses to
+    /// enumerate must not be retried forever, which is the unbounded-retry shape §26.6 forbids. Reset
+    /// when the port empties, so an unplug/replug always gets a fresh set.
+    tries: [u8; 16],
+}
+
+/// How many times a single arrival is retried before the port is left alone until it changes again.
+const HOTPLUG_MAX_TRIES: u8 = 3;
+
+/// Counter value at the last hot-plug visit; 0 = never. One visit per second is plenty for a human
+/// plugging a cable, and it keeps the steady-state cost to one control transfer per port per second.
+static HOTPLUG_LAST: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
+/// True once anything USB is worth polling - a keyboard, or a hub whose ports are being watched.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static mut XHCI: Option<Xhci> = None;
 static mut KBD_STATE: KbdState = KbdState {
@@ -422,7 +460,9 @@ pub fn init(bar0: u64, bar0_len: u32) -> bool {
         event_phys: 0,
         event_deq: 0,
         event_cycle: 1,
+        xfer_ms: 500,
         kbd: None,
+        hub: None,
     };
 
     if !hc.reset() {
@@ -455,7 +495,10 @@ pub fn init(bar0: u64, bar0_len: u32) -> bool {
         ACTIVE.store(true, Ordering::Release);
         put_str(b"xhci: keyboard ready\r\n");
     } else {
-        put_str(b"xhci: no keyboard found on any port - serial input still works\r\n");
+        // NOT a reason to stop polling. `walk_hub` already armed the watcher if a hub was found, and
+        // booting with the keyboard unplugged is the ordinary case that hot-plug exists to handle -
+        // switching the poll off here would mean it only ever worked if the cable was in at power-on.
+        put_str(b"xhci: no keyboard yet - serial input works, and the hub is being watched\r\n");
     }
     found
 }
@@ -879,6 +922,7 @@ impl Xhci {
         let _ = dev_va;
         self.kbd = Some(Keyboard {
             slot,
+            hub_port: 0,
             ep_dci: dci,
             ring: int_ring,
             buf_va,
@@ -939,7 +983,7 @@ impl Xhci {
         }
 
         // Power every port first, then let them settle together. Powering one at a time and waiting
-        // after each turns a 100 ms settle into 100 ms per port for no benefit.
+        // after each turns a 200 ms settle into 200 ms per port for no benefit.
         for p in 1..=nports {
             self.control_out(
                 slot, ep0, HUB_SET_PORT_FEATURE.0, HUB_SET_PORT_FEATURE.1, PORT_FEAT_POWER, p as u16,
@@ -947,88 +991,128 @@ impl Xhci {
         }
         delay_us(200_000);
 
-        for p in 1..=nports {
-            if !self.control_in(
-                slot, ep0, HUB_GET_PORT_STATUS.0, HUB_GET_PORT_STATUS.1, 0, p as u16, 4, buf_phys,
-                buf_va,
-            ) {
-                continue;
-            }
-            // SAFETY: the 4-byte port status this module owns, just filled.
-            let status = unsafe { (buf_va as *const u16).read_volatile() };
-            if status & PS_CONNECTION == 0 {
-                continue;
-            }
-            put_str(b"xhci: hub port ");
-            put_dec(p as u64);
-            put_str(b" has a device (status ");
-            put_hex(status as u64);
-            put_str(b")\r\n");
+        // Keep the hub. Everything on this board is behind it, so a keyboard unplugged once would stay
+        // dead until reboot without something still holding its control endpoint.
+        let mut hub = Hub {
+            slot,
+            ep0: match Ring::new() {
+                Some(r) => r,
+                None => return false,
+            },
+            nports,
+            buf_va,
+            buf_phys,
+            connected: 0,
+            tries: [0; 16],
+        };
+        // The ring built above is a placeholder to satisfy the type; the real control endpoint is the
+        // one already addressed, so hand that over and let the placeholder go.
+        core::mem::swap(&mut hub.ep0, ep0);
 
-            // Reset it, and give it the USB reset recovery time.
-            self.control_out(
-                slot, ep0, HUB_SET_PORT_FEATURE.0, HUB_SET_PORT_FEATURE.1, PORT_FEAT_RESET, p as u16,
-            );
-            let mut n = 0;
-            let mut status = 0u16;
-            while n < 100 {
-                delay_us(10_000);
-                n += 1;
-                if !self.control_in(
-                    slot, ep0, HUB_GET_PORT_STATUS.0, HUB_GET_PORT_STATUS.1, 0, p as u16, 4,
-                    buf_phys, buf_va,
-                ) {
-                    break;
+        let mut found = false;
+        for p in 1..=nports.min(15) {
+            if self.hub_port_connected(&mut hub, p) {
+                hub.connected |= 1 << p;
+                if !found && self.bring_up_hub_port(&mut hub, topo, p) {
+                    found = true; // one keyboard is enough, but keep walking to record what is where
                 }
-                // SAFETY: as above.
-                status = unsafe { (buf_va as *const u16).read_volatile() };
-                if status & PS_ENABLE != 0 {
-                    break;
-                }
-            }
-            // Acknowledge the change bits, or the hub keeps reporting them.
-            self.control_out(
-                slot, ep0, HUB_CLEAR_PORT_FEATURE.0, HUB_CLEAR_PORT_FEATURE.1, PORT_FEAT_C_RESET,
-                p as u16,
-            );
-            self.control_out(
-                slot, ep0, HUB_CLEAR_PORT_FEATURE.0, HUB_CLEAR_PORT_FEATURE.1,
-                PORT_FEAT_C_CONNECTION, p as u16,
-            );
-            if status & PS_ENABLE == 0 {
-                put_str(b"xhci: hub port did not enable after reset\r\n");
-                continue;
-            }
-
-            // The hub reports the speed; PORTSC cannot, because the root port sees only the hub.
-            let speed = if status & PS_LOW_SPEED != 0 {
-                2 // low
-            } else if status & PS_HIGH_SPEED != 0 {
-                3 // high
-            } else {
-                1 // full
-            };
-            put_str(b"xhci: hub port ");
-            put_dec(p as u64);
-            put_str(b" enabled, speed ");
-            put_dec(speed as u64);
-            put_str(b"\r\n");
-
-            // A low or full speed device behind a high-speed hub reaches the controller only through
-            // that hub's transaction translator, which the slot context has to name.
-            let needs_tt = speed == 1 || speed == 2;
-            let child = Topology {
-                root_port: topo.root_port,
-                route: (topo.route << 4) | (p as u32 & 0xF),
-                tt_slot: if needs_tt { slot } else { 0 },
-                tt_port: if needs_tt { p } else { 0 },
-                speed,
-            };
-            if self.setup_at(child) {
-                return true; // one keyboard is enough
             }
         }
-        put_str(b"xhci: nothing on the hub's ports was a boot keyboard\r\n");
+        if !found {
+            put_str(b"xhci: nothing on the hub's ports was a boot keyboard (yet - hot-plug is watching)\r\n");
+        }
+        self.hub = Some(hub);
+        // Watch the ports whether or not a keyboard was found: plugging one in later is the whole point.
+        ACTIVE.store(true, Ordering::Release);
+        found
+    }
+
+    /// Is there something on this hub port right now?
+    fn hub_port_connected(&mut self, hub: &mut Hub, p: u8) -> bool {
+        let (slot, bp, bv) = (hub.slot, hub.buf_phys, hub.buf_va);
+        if !self.control_in(
+            slot, &mut hub.ep0, HUB_GET_PORT_STATUS.0, HUB_GET_PORT_STATUS.1, 0, p as u16, 4, bp, bv,
+        ) {
+            return false;
+        }
+        // SAFETY: the 4-byte port status this module owns, just filled by the transfer above.
+        let status = unsafe { (bv as *const u16).read_volatile() };
+        status & PS_CONNECTION != 0
+    }
+
+    /// Reset one hub port and address whatever is on it. Used by the boot walk and by hot-plug, so a
+    /// device plugged in later goes through exactly the sequence that worked at boot.
+    fn bring_up_hub_port(&mut self, hub: &mut Hub, topo: Topology, p: u8) -> bool {
+        let (slot, bp, bv) = (hub.slot, hub.buf_phys, hub.buf_va);
+        put_str(b"xhci: hub port ");
+        put_dec(p as u64);
+        put_str(b" has a device\r\n");
+
+        self.control_out(
+            slot, &mut hub.ep0, HUB_SET_PORT_FEATURE.0, HUB_SET_PORT_FEATURE.1, PORT_FEAT_RESET,
+            p as u16,
+        );
+        let mut n = 0;
+        let mut status = 0u16;
+        while n < 100 {
+            delay_us(10_000);
+            n += 1;
+            if !self.control_in(
+                slot, &mut hub.ep0, HUB_GET_PORT_STATUS.0, HUB_GET_PORT_STATUS.1, 0, p as u16, 4, bp,
+                bv,
+            ) {
+                break;
+            }
+            // SAFETY: as above.
+            status = unsafe { (bv as *const u16).read_volatile() };
+            if status & PS_ENABLE != 0 {
+                break;
+            }
+        }
+        // Acknowledge the change bits, or the hub keeps reporting the same event forever.
+        self.control_out(
+            slot, &mut hub.ep0, HUB_CLEAR_PORT_FEATURE.0, HUB_CLEAR_PORT_FEATURE.1, PORT_FEAT_C_RESET,
+            p as u16,
+        );
+        self.control_out(
+            slot, &mut hub.ep0, HUB_CLEAR_PORT_FEATURE.0, HUB_CLEAR_PORT_FEATURE.1,
+            PORT_FEAT_C_CONNECTION, p as u16,
+        );
+        if status & PS_ENABLE == 0 {
+            put_str(b"xhci: hub port did not enable after reset\r\n");
+            return false;
+        }
+
+        // The hub reports the speed; PORTSC cannot, because the root port sees only the hub.
+        let speed = if status & PS_LOW_SPEED != 0 {
+            2 // low
+        } else if status & PS_HIGH_SPEED != 0 {
+            3 // high
+        } else {
+            1 // full
+        };
+        put_str(b"xhci: hub port ");
+        put_dec(p as u64);
+        put_str(b" enabled, speed ");
+        put_dec(speed as u64);
+        put_str(b"\r\n");
+
+        // A low or full speed device behind a high-speed hub reaches the controller only through that
+        // hub's transaction translator, which the slot context has to name.
+        let needs_tt = speed == 1 || speed == 2;
+        let child = Topology {
+            root_port: topo.root_port,
+            route: (topo.route << 4) | (p as u32 & 0xF),
+            tt_slot: if needs_tt { slot } else { 0 },
+            tt_port: if needs_tt { p } else { 0 },
+            speed,
+        };
+        if self.setup_at(child) {
+            if let Some(k) = self.kbd.as_mut() {
+                k.hub_port = p;
+            }
+            return true;
+        }
         false
     }
 
@@ -1107,7 +1191,7 @@ impl Xhci {
 
     fn await_transfer(&mut self, at: u64) -> bool {
         let mut waited = 0;
-        while waited < 500 {
+        while waited < self.xfer_ms {
             while let Some(ev) = self.next_event() {
                 if (ev.control >> 10) & 0x3F == TRB_EV_TRANSFER && ev.param == at {
                     let code = (ev.status >> 24) & 0xFF;
@@ -1275,6 +1359,131 @@ fn parse_config(va: u64) -> Option<(u8, u8, u32, u8, u8)> {
     None
 }
 
+/// Watch the hub's ports for a device arriving or leaving, at most once a second.
+///
+/// **This is the whole reason a keyboard can be unplugged and plugged back in.** On this board every
+/// device is behind the internal hub, so without a watcher the machine enumerates once at boot and
+/// anything moved afterwards is gone until reboot.
+///
+/// Two things it does not do, both deliberately: it does not act on a change it could not acknowledge
+/// (an event whose latch will not clear is one that would be re-reported forever, standing a working
+/// device down once a second), and it does not retry an arrival unboundedly - a device that will not
+/// enumerate gets [`HOTPLUG_MAX_TRIES`] attempts and is then left alone until the port changes again.
+///
+/// Every transition is announced. A keyboard that silently stops working is indistinguishable from a
+/// broken driver, and the operator is the one holding the cable.
+fn hotplug_tick(hc: &mut Xhci) {
+    let Some(mut hub) = hc.hub.take() else { return };
+
+    let hz = super::timer::frequency().max(1);
+    let now = super::read_cycle_counter();
+    let last = HOTPLUG_LAST.load(Ordering::Relaxed);
+    if last != 0 && now.wrapping_sub(last) < hz {
+        hc.hub = Some(hub);
+        return;
+    }
+    HOTPLUG_LAST.store(now.max(1), Ordering::Relaxed);
+
+    // Short bound for the status reads: see `Xhci::xfer_ms`. Restored before returning, so the
+    // enumeration this visit may trigger still gets the generous one it needs.
+    hc.xfer_ms = 50;
+
+    let topo = Topology { root_port: 1, route: 0, tt_slot: 0, tt_port: 0, speed: 0 };
+    for p in 1..=hub.nports.min(15) {
+        let bit = 1u16 << p;
+        let (slot, bp, bv) = (hub.slot, hub.buf_phys, hub.buf_va);
+        if !hc.control_in(
+            slot, &mut hub.ep0, HUB_GET_PORT_STATUS.0, HUB_GET_PORT_STATUS.1, 0, p as u16, 4, bp, bv,
+        ) {
+            continue; // could not ask; try again next visit
+        }
+        // SAFETY: the 4-byte port status this module owns, just filled.
+        let (status, change) = unsafe {
+            ((bv as *const u16).read_volatile(), (bv as *const u16).add(1).read_volatile())
+        };
+        let now_conn = status & PS_CONNECTION != 0;
+        let mut was = hub.connected & bit != 0;
+
+        if change & 1 != 0 {
+            // Clear the latch, and CHECK it cleared before acting. An event we cannot acknowledge is
+            // one we cannot safely consume - it would be re-reported on every visit, and a still-
+            // occupied port would be torn down and re-enumerated once a second, forever.
+            if !hc.control_out(
+                slot, &mut hub.ep0, HUB_CLEAR_PORT_FEATURE.0, HUB_CLEAR_PORT_FEATURE.1,
+                PORT_FEAT_C_CONNECTION, p as u16,
+            ) {
+                continue;
+            }
+            // A latched change on a port that is STILL occupied is the case levels cannot see: unplugged
+            // and replugged, or swapped, between two visits. What we believed is no longer true.
+            if was && now_conn {
+                stand_down(hc, &mut hub, p);
+                was = false;
+                hub.connected &= !bit;
+                hub.tries[p as usize] = 0;
+            }
+        } else if now_conn == was {
+            continue; // no latch, no level change
+        }
+
+        if was && !now_conn {
+            crate::kprintln!("usb: device REMOVED from hub port {}", p);
+            stand_down(hc, &mut hub, p);
+            hub.connected &= !bit;
+            hub.tries[p as usize] = 0; // a fresh set of attempts for whatever arrives next
+        } else if !was && now_conn {
+            if hub.tries[p as usize] >= HOTPLUG_MAX_TRIES {
+                continue; // said its piece already; wait for the port to change again
+            }
+            hub.tries[p as usize] += 1;
+            crate::kprintln!("usb: device ATTACHED to hub port {} - enumerating", p);
+            hc.xfer_ms = 500; // enumeration is allowed to be slow
+            let ok = hc.bring_up_hub_port(&mut hub, topo, p);
+            hc.xfer_ms = 50;
+            if ok {
+                hub.connected |= bit;
+                hub.tries[p as usize] = 0;
+                crate::kprintln!("usb: keyboard on hub port {} is ready", p);
+            } else if hub.tries[p as usize] >= HOTPLUG_MAX_TRIES {
+                crate::kprintln!(
+                    "usb: hub port {} device did not come up in {} attempts - leaving it until the \
+                     port changes again",
+                    p, HOTPLUG_MAX_TRIES
+                );
+                // Recorded as occupied even though it failed: otherwise every visit re-tries the
+                // arrival branch and the bound above never holds.
+                hub.connected |= bit;
+            }
+        }
+    }
+    hc.xfer_ms = 500;
+    hc.hub = Some(hub);
+}
+
+/// Forget the device on a hub port, and give the controller its slot back.
+///
+/// Releasing the slot matters: a slot is a bounded resource (32 on this controller), and an
+/// unplug/replug cycle that leaked one would run the machine out after 30 cable pulls. The keyboard's
+/// auto-repeat is disarmed too - an unplugged key is not being held down, and our view of which keys
+/// are down is now stale.
+fn stand_down(hc: &mut Xhci, hub: &mut Hub, p: u8) {
+    let _ = hub;
+    let Some(k) = hc.kbd.as_ref() else { return };
+    if k.hub_port != p {
+        return;
+    }
+    let slot = k.slot;
+    hc.kbd = None;
+    // SAFETY: single caller, from the timer tick on core 0. See `poll`.
+    let ks = unsafe { &mut *core::ptr::addr_of_mut!(KBD_STATE) };
+    ks.rep.disarm();
+    ks.last = [0; 6];
+    hc.command(0, TRB_DISABLE_SLOT, (slot as u32) << 24);
+    crate::kprintln!("usb: keyboard on hub port {} stood down, slot {} released", p, slot);
+    // ACTIVE is deliberately NOT cleared: the hub is still there, and the watcher that will notice the
+    // keyboard coming back is the same poll this runs inside.
+}
+
 /// Queue one interrupt-IN transfer for the next report.
 fn arm_transfer(hc: &mut Xhci) {
     let Some(kbd) = hc.kbd.as_mut() else { return };
@@ -1351,6 +1560,8 @@ pub fn poll() {
     let _ = got;
     ks.rep.poll(now, super::console_push_byte);
     arm_transfer(hc);
+    // Watch for a cable being pulled or pushed. Rate-limited to one visit a second inside.
+    hotplug_tick(hc);
 }
 
 /// Microseconds since boot, from the generic timer.

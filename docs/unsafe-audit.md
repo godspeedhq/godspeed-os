@@ -43,6 +43,27 @@ somewhere that names neither the GPU nor the map (§26.7).
 | `arch/aarch64/mailbox.rs` | 3 -> 4 (+1) | `property_call`: copies an arbitrary tag request into this module's 16-byte-aligned static and the reply back out, length-checked against the buffer at both ends. The static rather than the caller's array because the mailbox packs the channel into the low 4 bits of the address it is handed - an arbitrarily-aligned caller buffer would send the message to the wrong channel, so the alignment guarantee stays in one place. |
 | `arch/aarch64/mod.rs` | 53 -> 55 (+2) | The write and the read of `FB_INFO`, the static that carries the geometry across the jump to the high half. A static rather than a local because the jump abandons the low stack along with every local on it - the same reason `memmap::current_map` exists. Single-threaded boot: written once before the jump, read once after. |
 
+## 2026-08-04 - Pi 4: USB hot-plug (feat/pi4-aarch64)
+
+Everything on this board is behind the internal hub, so a driver that enumerates once at boot leaves a
+keyboard unplugged mid-session dead until reboot - and, worse, means the keyboard only ever works if the
+cable happened to be in at power-on. The watcher visits the hub's ports once a second and announces every
+transition, the same way the x86 and Pi 2 ports do.
+
+Two bounds it is built around. It does **not act on a change it could not acknowledge**: an event whose
+latch will not clear is re-reported on every visit, which would tear down a working device once a second
+forever. And an arrival gets **three attempts**, not unbounded retries (§26.6) - a device that will not
+enumerate is left alone until the port changes again. Standing a device down also **releases its slot**,
+because a slot is a bounded resource and a leak would run the controller out after thirty cable pulls.
+
+The watcher runs inside the timer tick with interrupts masked, so its transfers use a short deadline
+(50 ms) while enumeration keeps the generous one (500 ms). A transfer that hangs there does not merely
+delay the watcher; it stops the scheduler.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | 24 -> 26 (+2) | Reading the port status and change words in the watcher, and the keyboard-state static it disarms when a device is stood down. Both are the module's own memory, read immediately after the transfer that filled it. |
+
 ## 2026-08-04 - Pi 4: hub enumeration (feat/pi4-aarch64)
 
 The Pi 4's USB-A sockets do not hang off the VL805's root ports. They hang off an **internal VIA hub**,
@@ -1751,7 +1772,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/aarch64/video.rs | 2 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
-| arch/aarch64/xhci.rs | 24 | permitted |
+| arch/aarch64/xhci.rs | 26 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
