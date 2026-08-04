@@ -249,6 +249,8 @@ struct Xhci {
 
     /// The keyboard, once found.
     kbd: Option<Keyboard>,
+    /// The USB stick, once found. The SD card is never a candidate - see `setup_at`.
+    disk: Option<Disk>,
     /// The internal hub, kept alive after enumeration so its ports can be watched. Everything plugged
     /// into this board is behind it, so without this a keyboard unplugged once stays dead until reboot.
     hub: Option<Hub>,
@@ -268,6 +270,58 @@ struct Keyboard {
     pending: bool,
     max_packet: u32,
 }
+
+/// A USB mass-storage stick, spoken to over Bulk-Only Transport.
+struct Disk {
+    slot: u8,
+    in_dci: u32,
+    out_dci: u32,
+    in_ring: Ring,
+    out_ring: Ring,
+    /// One page for block data.
+    data_va: u64,
+    data_phys: u64,
+    /// The CBW at offset 0 and the CSW at offset 64 of one page, kept apart so a device that writes
+    /// the status early cannot land it on top of the command still being read.
+    cmd_va: u64,
+    cmd_phys: u64,
+    sectors: u64,
+    tag: u32,
+}
+
+impl Disk {
+    /// A stand-in used only to move a `Disk` out of its option while it is being operated on. Never
+    /// reachable as a disk: every field is zero, so any use faults on the first transfer rather than
+    /// quietly reading block zero of nothing.
+    fn placeholder() -> Disk {
+        Disk {
+            slot: 0,
+            in_dci: 0,
+            out_dci: 0,
+            in_ring: Ring { va: 0, phys: 0, enqueue: 0, cycle: 1 },
+            out_ring: Ring { va: 0, phys: 0, enqueue: 0, cycle: 1 },
+            data_va: 0,
+            data_phys: 0,
+            cmd_va: 0,
+            cmd_phys: 0,
+            sectors: 0,
+            tag: 0,
+        }
+    }
+}
+
+/// Sector count of the attached USB disk, 0 when there is none. Published as an atomic because the
+/// block-driver asks for it from a SYSCALL while the driver itself lives behind the tick.
+static DISK_SECTORS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
+/// Set while a disk transfer owns the event ring.
+///
+/// The disk is driven from a **syscall** (a task), and the keyboard from the **timer tick** (an ISR),
+/// and both consume the same event ring. An ISR that pops the disk's completion leaves the disk waiting
+/// forever for an event that has already been thrown away. So the ISR yields: it skips its poll while
+/// this is set, costing at most one keyboard sample. The task cannot lose the race in the other
+/// direction, because on this single-core port the ISR only runs when the task is not.
+static DISK_IO: AtomicBool = AtomicBool::new(false);
 
 /// The internal hub and what we believe is plugged into it.
 struct Hub {
@@ -462,6 +516,7 @@ pub fn init(bar0: u64, bar0_len: u32) -> bool {
         event_cycle: 1,
         xfer_ms: 500,
         kbd: None,
+        disk: None,
         hub: None,
     };
 
@@ -867,6 +922,14 @@ impl Xhci {
             return false;
         }
 
+        // A mass-storage device is the OTHER thing worth keeping on this board. `fs` needs a disk, and
+        // the SD card cannot be one: it is the boot medium, and GSFS's superblock lives at LBA 0 where
+        // its partition table is. The Pi 2 port learned that by destroying two cards. So storage here
+        // means a USB stick, exactly as it does there.
+        if let Some(msc) = parse_msc(buf_va) {
+            return self.setup_msc(slot, &mut ep0, msc, buf_phys, buf_va);
+        }
+
         let Some((iface_num, ep_addr, ep_mps, ep_interval, cfg_value)) = parse_config(buf_va) else {
             report_config(buf_va);
             return false;
@@ -1013,8 +1076,11 @@ impl Xhci {
         for p in 1..=nports.min(15) {
             if self.hub_port_connected(&mut hub, p) {
                 hub.connected |= 1 << p;
-                if !found && self.bring_up_hub_port(&mut hub, topo, p) {
-                    found = true; // one keyboard is enough, but keep walking to record what is where
+                // Keep walking after a device is brought up: this board can have a stick on one port
+                // and a keyboard on another, and stopping at the first would silently pick whichever
+                // socket happened to be lower-numbered.
+                if self.bring_up_hub_port(&mut hub, topo, p) {
+                    found = true;
                 }
             }
         }
@@ -1114,6 +1180,214 @@ impl Xhci {
             return true;
         }
         false
+    }
+
+    /// Configure a USB stick's two bulk endpoints and ask it how big it is.
+    fn setup_msc(
+        &mut self,
+        slot: u8,
+        ep0: &mut Ring,
+        msc: MscInfo,
+        buf_phys: u64,
+        buf_va: u64,
+    ) -> bool {
+        if !self.control_out(slot, ep0, 0x00, 0x09, msc.cfg_value as u16, 0) {
+            put_str(b"xhci: mass storage: Set Configuration failed\r\n");
+            return false;
+        }
+
+        let Some(in_ring) = Ring::new() else { return false };
+        let Some(out_ring) = Ring::new() else { return false };
+        let Some((data_va, data_phys)) = dma_page() else { return false };
+
+        let in_dci = ((msc.in_ep & 0x0F) as u32) * 2 + 1; // IN endpoints are odd
+        let out_dci = ((msc.out_ep & 0x0F) as u32) * 2; // OUT endpoints are even
+        let last = in_dci.max(out_dci);
+
+        // Both endpoints go in ONE Configure Endpoint. Issuing two commands would leave the device
+        // half-configured between them, and the second would be rebuilding a slot context the first had
+        // already changed.
+        let Some((in_va, in_phys)) = dma_page() else { return false };
+        let cs = self.ctx_size();
+        // SAFETY: the input-context page this module owns; offsets are the xHCI 1.2 layout.
+        unsafe {
+            ((in_va + 4) as *mut u32).write_volatile(1 | (1 << in_dci) | (1 << out_dci));
+            // The slot context must be re-stated, and `Context Entries` must reach the HIGHEST endpoint
+            // in use - not the one being added. A lower value leaves the controller believing the upper
+            // endpoint does not exist, and its doorbell is then simply ignored.
+            let dev_ctx_src = self.dcbaa_va + (slot as u64) * 8;
+            let _ = dev_ctx_src;
+            ((in_va + cs) as *mut u32).write_volatile(last << 27);
+            for (dci, ring, epty) in [(in_dci, &in_ring, 2u32), (out_dci, &out_ring, 2u32)] {
+                let ep = in_va + cs * (dci as u64 + 1);
+                // Bulk IN is endpoint type 6, Bulk OUT is 2.
+                let ty = if dci == in_dci { 6 } else { epty };
+                ((ep + 4) as *mut u32)
+                    .write_volatile((ty << 3) | (3 << 1) | (msc.mps << 16));
+                ((ep + 8) as *mut u64).write_volatile(ring.phys | 1);
+                ((ep + 16) as *mut u32).write_volatile(msc.mps);
+            }
+        }
+        mmu::dma_sync(in_va, 4096);
+
+        let (code, _) = match self.command(in_phys, TRB_CONFIGURE_ENDPOINT, (slot as u32) << 24) {
+            Some(v) => v,
+            None => return false,
+        };
+        if code != 1 {
+            put_str(b"xhci: mass storage: Configure Endpoint failed (code ");
+            put_dec(code as u64);
+            put_str(b")\r\n");
+            return false;
+        }
+
+        let mut disk = Disk {
+            slot,
+            in_dci,
+            out_dci,
+            in_ring,
+            out_ring,
+            data_va,
+            data_phys,
+            cmd_va: buf_va,
+            cmd_phys: buf_phys,
+            sectors: 0,
+            tag: 1,
+        };
+
+        // A stick that has just been reset answers NOT READY for a while. Asking once and believing the
+        // answer reports a perfectly good disk as absent.
+        let mut n = 0;
+        while n < 20 && !self.scsi_test_unit_ready(&mut disk) {
+            delay_us(100_000);
+            n += 1;
+        }
+
+        match self.scsi_read_capacity(&mut disk) {
+            Some(sectors) => {
+                disk.sectors = sectors;
+                put_str(b"xhci: USB disk ready - ");
+                put_dec(sectors);
+                put_str(b" sectors (");
+                put_dec(sectors / 2048);
+                put_str(b" MiB)\r\n");
+                self.disk = Some(disk);
+                DISK_SECTORS.store(sectors, Ordering::Release);
+                ACTIVE.store(true, Ordering::Release);
+                true
+            }
+            None => {
+                put_str(b"xhci: mass storage did not report a capacity - not usable as a disk\r\n");
+                false
+            }
+        }
+    }
+
+    /// One Bulk-Only Transport command: CBW out, optional data, CSW in.
+    ///
+    /// Returns the CSW status byte (0 = good). BOT is deliberately literal here - three transfers, in
+    /// order, every time - because the interesting failures are all about a stage being skipped or
+    /// reordered, and a device left mid-command answers the NEXT command with the previous one's data.
+    fn bot(&mut self, cmd: &[u8], data_len: u32, data_in: bool) -> Option<u8> {
+        let mut disk = self.disk.take()?;
+        let ok = self.bot_inner(&mut disk, cmd, data_len, data_in);
+        self.disk = Some(disk);
+        ok
+    }
+
+    fn bot_inner(&mut self, d: &mut Disk, cmd: &[u8], data_len: u32, data_in: bool) -> Option<u8> {
+        let tag = d.tag;
+        d.tag = d.tag.wrapping_add(1);
+
+        // Command Block Wrapper: 31 bytes, little-endian, signature 'USBC'.
+        // SAFETY: the command page this module owns.
+        unsafe {
+            let p = d.cmd_va as *mut u8;
+            core::ptr::write_bytes(p, 0, 31);
+            let sig: [u8; 4] = [0x55, 0x53, 0x42, 0x43];
+            core::ptr::copy_nonoverlapping(sig.as_ptr(), p, 4);
+            core::ptr::copy_nonoverlapping(tag.to_le_bytes().as_ptr(), p.add(4), 4);
+            core::ptr::copy_nonoverlapping(data_len.to_le_bytes().as_ptr(), p.add(8), 4);
+            p.add(12).write_volatile(if data_in { 0x80 } else { 0x00 });
+            p.add(13).write_volatile(0); // LUN 0
+            p.add(14).write_volatile(cmd.len() as u8);
+            core::ptr::copy_nonoverlapping(cmd.as_ptr(), p.add(15), cmd.len().min(16));
+        }
+        mmu::dma_sync(d.cmd_va, 32);
+
+        let (slot, out_dci, in_dci) = (d.slot, d.out_dci, d.in_dci);
+        let at = d.out_ring.push(d.cmd_phys, 31, TRB_NORMAL, TRB_IOC);
+        self.doorbell(slot, out_dci);
+        if !self.await_transfer(at) {
+            return None;
+        }
+
+        if data_len > 0 {
+            let ring = if data_in { &mut d.in_ring } else { &mut d.out_ring };
+            let at = ring.push(d.data_phys, data_len, TRB_NORMAL, TRB_IOC);
+            self.doorbell(slot, if data_in { in_dci } else { out_dci });
+            if !self.await_transfer(at) {
+                return None;
+            }
+            if data_in {
+                mmu::dma_sync(d.data_va, data_len as usize);
+            }
+        }
+
+        // Command Status Wrapper: 13 bytes. Its tag must match the CBW's, or we are looking at the
+        // answer to an earlier command - which is exactly what a device does after a stall.
+        let at = d.in_ring.push(d.cmd_phys + 64, 13, TRB_NORMAL, TRB_IOC);
+        self.doorbell(slot, in_dci);
+        if !self.await_transfer(at) {
+            return None;
+        }
+        mmu::dma_sync(d.cmd_va + 64, 16);
+        // SAFETY: the command page this module owns, just synced.
+        let (csw_tag, status) = unsafe {
+            let p = (d.cmd_va + 64) as *const u8;
+            let mut t = [0u8; 4];
+            core::ptr::copy_nonoverlapping(p.add(4), t.as_mut_ptr(), 4);
+            (u32::from_le_bytes(t), p.add(12).read_volatile())
+        };
+        if csw_tag != tag {
+            return None; // a reply to something else; treat as failure rather than as this command's
+        }
+        Some(status)
+    }
+
+    fn scsi_test_unit_ready(&mut self, d: &mut Disk) -> bool {
+        let cmd = [0u8; 6];
+        let mut disk = core::mem::replace(d, Disk::placeholder());
+        let r = self.bot_inner(&mut disk, &cmd, 0, true);
+        *d = disk;
+        r == Some(0)
+    }
+
+    fn scsi_read_capacity(&mut self, d: &mut Disk) -> Option<u64> {
+        let cmd = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // READ CAPACITY(10)
+        let mut disk = core::mem::replace(d, Disk::placeholder());
+        let r = self.bot_inner(&mut disk, &cmd, 8, true);
+        let data_va = disk.data_va;
+        *d = disk;
+        if r != Some(0) {
+            return None;
+        }
+        // SAFETY: the data page this module owns, synced by `bot_inner`.
+        let (last_lba, blen) = unsafe {
+            let p = data_va as *const u8;
+            let mut a = [0u8; 4];
+            let mut b = [0u8; 4];
+            core::ptr::copy_nonoverlapping(p, a.as_mut_ptr(), 4);
+            core::ptr::copy_nonoverlapping(p.add(4), b.as_mut_ptr(), 4);
+            (u32::from_be_bytes(a), u32::from_be_bytes(b))
+        };
+        // SCSI reports the LAST addressable block, not the count. Off by one here is a filesystem that
+        // believes in a sector the device does not have.
+        if blen != 512 {
+            put_str(b"xhci: USB disk block size is not 512 - unsupported\r\n");
+            return None;
+        }
+        Some(last_lba as u64 + 1)
     }
 
     /// A control IN transfer with an arbitrary request type.
@@ -1326,6 +1600,69 @@ fn report_config(va: u64) {
     }
 }
 
+/// What a mass-storage interface needs: config value, interface number, and its two bulk endpoints.
+#[derive(Clone, Copy)]
+struct MscInfo {
+    cfg_value: u8,
+    iface: u8,
+    in_ep: u8,
+    out_ep: u8,
+    mps: u32,
+}
+
+/// Find a **Bulk-Only Transport, SCSI transparent** mass-storage interface and its two bulk endpoints.
+///
+/// Class 8 / subclass 6 / protocol 0x50 is the combination essentially every USB stick presents, and
+/// the only one this driver speaks. Anything else - a UAS-only device, or CBI - is left alone rather
+/// than half-driven, because a storage device driven by a protocol it does not implement is a device
+/// that returns plausible garbage where a filesystem expects blocks.
+fn parse_msc(va: u64) -> Option<MscInfo> {
+    // SAFETY: the descriptor buffer this module owns, filled by the control transfer above.
+    let buf = unsafe { core::slice::from_raw_parts(va as *const u8, 256) };
+    let total = (buf[2] as usize) | ((buf[3] as usize) << 8);
+    let end = total.min(256);
+    let cfg_value = buf[5];
+
+    let mut i = 9usize;
+    let mut in_msc = false;
+    let mut iface = 0u8;
+    let (mut in_ep, mut out_ep, mut mps) = (0u8, 0u8, 0u32);
+    while i + 2 <= end {
+        let len = buf[i] as usize;
+        let ty = buf[i + 1];
+        if len < 2 || i + len > end {
+            break; // a malformed descriptor ends the walk; it never spins it
+        }
+        if ty == 0x04 && len >= 9 {
+            iface = buf[i + 2];
+            in_msc = buf[i + 5] == 0x08 && buf[i + 6] == 0x06 && buf[i + 7] == 0x50;
+            if !in_msc {
+                // A different interface's endpoints must not be adopted by the previous one.
+                in_ep = 0;
+                out_ep = 0;
+            }
+        } else if ty == 0x05 && len >= 7 && in_msc {
+            let addr = buf[i + 2];
+            // attrs bits 1:0 == 2 is Bulk. An interrupt endpoint on the same interface is not a data
+            // pipe and taking it would send commands somewhere they are never read.
+            if buf[i + 3] & 0x03 == 0x02 {
+                mps = ((buf[i + 4] as u32) | ((buf[i + 5] as u32) << 8)) & 0x7FF;
+                if addr & 0x80 != 0 {
+                    in_ep = addr;
+                } else {
+                    out_ep = addr;
+                }
+            }
+        }
+        i += len;
+    }
+    if in_msc && in_ep != 0 && out_ep != 0 && mps != 0 {
+        Some(MscInfo { cfg_value, iface, in_ep, out_ep, mps })
+    } else {
+        None
+    }
+}
+
 fn parse_config(va: u64) -> Option<(u8, u8, u32, u8, u8)> {
     // SAFETY: the buffer page this module owns, filled by the control transfer above.
     let buf = unsafe { core::slice::from_raw_parts(va as *const u8, 256) };
@@ -1484,6 +1821,135 @@ fn stand_down(hc: &mut Xhci, hub: &mut Hub, p: u8) {
     // keyboard coming back is the same poll this runs inside.
 }
 
+// --- The block interface the `block-driver` service reaches through syscalls ---------------------
+//
+// These run in TASK context, not the tick. `DISK_IO` is what keeps them from racing the keyboard poll
+// for the event ring - see its comment.
+
+/// How many 512-byte sectors the attached USB disk has. 0 = no disk.
+pub fn disk_sectors() -> u64 {
+    DISK_SECTORS.load(Ordering::Acquire)
+}
+
+/// Whether the last transfer failed in a way that is worth retrying (device busy), rather than
+/// permanently. Distinguishing them is what lets the block driver retry instead of failing a mount.
+static DISK_BUSY: AtomicBool = AtomicBool::new(false);
+
+pub fn disk_busy() -> bool {
+    DISK_BUSY.load(Ordering::Relaxed)
+}
+
+/// Borrow the controller for a disk operation, with the event ring held against the tick.
+fn with_disk<R>(f: impl FnOnce(&mut Xhci) -> R, absent: R) -> R {
+    if DISK_SECTORS.load(Ordering::Acquire) == 0 {
+        return absent;
+    }
+    DISK_IO.store(true, Ordering::Release);
+    // SAFETY: task context on core 0. `DISK_IO` keeps the timer tick's poll out of the controller for
+    // the duration, and this port runs one core, so there is no second task to contend with. A future
+    // SMP port needs a real lock here, not this flag.
+    let r = unsafe {
+        match (&raw mut XHCI).as_mut().and_then(|o| o.as_mut()) {
+            Some(hc) => f(hc),
+            None => {
+                DISK_IO.store(false, Ordering::Release);
+                return absent;
+            }
+        }
+    };
+    DISK_IO.store(false, Ordering::Release);
+    r
+}
+
+/// Read one 512-byte block.
+pub fn disk_read(lba: u64, dst: &mut [u8]) -> bool {
+    if dst.len() < 512 {
+        return false;
+    }
+    with_disk(
+        |hc| {
+            // READ(10): opcode, flags, 4-byte big-endian LBA, reserved, 2-byte block count.
+            let b = (lba as u32).to_be_bytes();
+            let cmd = [0x28u8, 0, b[0], b[1], b[2], b[3], 0, 0, 1, 0];
+            match hc.bot(&cmd, 512, true) {
+                Some(0) => {
+                    let Some(d) = hc.disk.as_ref() else { return false };
+                    // SAFETY: the data page this module owns, synced by `bot`.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(d.data_va as *const u8, dst.as_mut_ptr(), 512)
+                    };
+                    DISK_BUSY.store(false, Ordering::Relaxed);
+                    true
+                }
+                // A non-zero status is the device refusing THIS command - often "not ready" while it
+                // finishes an internal operation. Recorded as busy so the caller retries rather than
+                // concluding the disk is gone.
+                Some(_) => {
+                    DISK_BUSY.store(true, Ordering::Relaxed);
+                    false
+                }
+                None => {
+                    DISK_BUSY.store(false, Ordering::Relaxed);
+                    false
+                }
+            }
+        },
+        false,
+    )
+}
+
+/// Write one 512-byte block.
+pub fn disk_write(lba: u64, src: &[u8]) -> bool {
+    if src.len() < 512 {
+        return false;
+    }
+    with_disk(
+        |hc| {
+            {
+                let Some(d) = hc.disk.as_ref() else { return false };
+                // SAFETY: the data page this module owns; the caller's slice is at least 512 bytes.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(src.as_ptr(), d.data_va as *mut u8, 512)
+                };
+                mmu::dma_sync(d.data_va, 512);
+            }
+            let b = (lba as u32).to_be_bytes();
+            let cmd = [0x2Au8, 0, b[0], b[1], b[2], b[3], 0, 0, 1, 0]; // WRITE(10)
+            match hc.bot(&cmd, 512, false) {
+                Some(0) => {
+                    DISK_BUSY.store(false, Ordering::Relaxed);
+                    true
+                }
+                Some(_) => {
+                    DISK_BUSY.store(true, Ordering::Relaxed);
+                    false
+                }
+                None => {
+                    DISK_BUSY.store(false, Ordering::Relaxed);
+                    false
+                }
+            }
+        },
+        false,
+    )
+}
+
+/// Make previously acknowledged writes durable.
+///
+/// A write completing means the stick took the bytes, not that they are on flash - it acknowledges
+/// into its own volatile buffer. `fs` asks for durability explicitly at the points where it promises
+/// it (format, journal commit), and a device that refuses `SYNCHRONIZE CACHE` must say so rather than
+/// let the filesystem imply a guarantee it does not have (§6.1, 2026-07-25 amendment).
+pub fn disk_flush() -> bool {
+    with_disk(
+        |hc| {
+            let cmd = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // SYNCHRONIZE CACHE(10)
+            matches!(hc.bot(&cmd, 0, false), Some(0))
+        },
+        false,
+    )
+}
+
 /// Queue one interrupt-IN transfer for the next report.
 fn arm_transfer(hc: &mut Xhci) {
     let Some(kbd) = hc.kbd.as_mut() else { return };
@@ -1506,6 +1972,12 @@ fn arm_transfer(hc: &mut Xhci) {
 /// reports only on CHANGE, so a held key sends nothing and the repeat must come from here.
 pub fn poll() {
     if !ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    // A disk transfer owns the event ring. Popping its completion here would leave the block driver
+    // waiting forever for an event that has been thrown away - see `DISK_IO`. Skipping costs one
+    // keyboard sample, which is 10 ms of typing latency during a disk read and nothing else.
+    if DISK_IO.load(Ordering::Acquire) {
         return;
     }
     // SAFETY: core 0's timer tick is the only caller after boot, and boot completed before `ACTIVE`

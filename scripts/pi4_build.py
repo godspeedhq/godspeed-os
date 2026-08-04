@@ -66,6 +66,9 @@ PI4_SERVICES = [
     # The chaos service is what the carnage gate runs; `observe` is how the machine is watched while it
     # runs. Both are arch-neutral - they needed building, not porting.
     "chaos", "observe", "mem-pressure",
+    # Storage: the USB stick, never the SD card (which is the boot medium - see block-driver's
+    # `backend_run`). `fs` is arch-neutral and rides on whatever block-driver serves.
+    "block-driver", "fs",
 ]
 
 # `pi4` is always present; anything passed is added to it, not substituted for it.

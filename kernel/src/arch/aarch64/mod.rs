@@ -1021,9 +1021,29 @@ pub fn emmc_base_clock_hz() -> u32 { 0 }
 
 /// USB mass-storage block device (the ARM DWC2 Bulk-Only bridge). Only the Pi's ARM port has an
 /// in-kernel USB stack; elsewhere disks are userspace drivers, so there is no device here.
+/// Storage on this board is a USB stick, never the SD card.
+///
+/// The Pi 4 has a single SD slot and boots from it: firmware, kernel image, FAT partition. GSFS puts
+/// its superblock at LBA 0, exactly where that card's partition table is, so handing the card to the
+/// filesystem overwrites the boot medium. The 32-bit port established that the hard way - it corrupted
+/// two boot cards to RAW before the SD backend was withdrawn - and this board has the same topology,
+/// so it inherits the same rule rather than rediscovering it.
+#[cfg(feature = "pi4")]
+pub fn usb_disk_sectors() -> u64 { xhci::disk_sectors() }
+#[cfg(feature = "pi4")]
+pub fn usb_disk_read(lba: u64, dst: &mut [u8]) -> bool { xhci::disk_read(lba, dst) }
+#[cfg(feature = "pi4")]
+pub fn usb_disk_write(lba: u64, src: &[u8]) -> bool { xhci::disk_write(lba, src) }
+#[cfg(feature = "pi4")]
+pub fn usb_disk_flush() -> bool { xhci::disk_flush() }
+
+#[cfg(not(feature = "pi4"))]
 pub fn usb_disk_sectors() -> u64 { 0 }
+#[cfg(not(feature = "pi4"))]
 pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
+#[cfg(not(feature = "pi4"))]
 pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
+#[cfg(not(feature = "pi4"))]
 pub fn usb_disk_flush() -> bool { false }
 /// Counter ticks a core may make NO forward progress before the liveness watchdog panics.
 ///
@@ -1066,10 +1086,16 @@ pub fn fb_commit(
     _x: usize, _y: usize, _w: usize, _h: usize,
 ) {}
 
+#[cfg(feature = "pi4")]
+pub fn usb_disk_busy() -> bool { xhci::disk_busy() }
+#[cfg(not(feature = "pi4"))]
 pub fn usb_disk_busy() -> bool { false }
 /// Is there no USB disk attached at all? Distinct from busy - see `USB_DISK_ABSENT` in the syscall
 /// dispatch. This arch has no USB-disk backend, so a request never reaches one and the question is
 /// moot; the read/write primitives already answer false.
+#[cfg(feature = "pi4")]
+pub fn usb_disk_absent() -> bool { xhci::disk_sectors() == 0 }
+#[cfg(not(feature = "pi4"))]
 pub fn usb_disk_absent() -> bool { true }
 
 

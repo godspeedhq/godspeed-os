@@ -43,6 +43,29 @@ somewhere that names neither the GPU nor the map (§26.7).
 | `arch/aarch64/mailbox.rs` | 3 -> 4 (+1) | `property_call`: copies an arbitrary tag request into this module's 16-byte-aligned static and the reply back out, length-checked against the buffer at both ends. The static rather than the caller's array because the mailbox packs the channel into the low 4 bits of the address it is handed - an arbitrarily-aligned caller buffer would send the message to the wrong channel, so the alignment guarantee stays in one place. |
 | `arch/aarch64/mod.rs` | 53 -> 55 (+2) | The write and the read of `FB_INFO`, the static that carries the geometry across the jump to the high half. A static rather than a local because the jump abandons the low stack along with every local on it - the same reason `memmap::current_map` exists. Single-threaded boot: written once before the jump, read once after. |
 
+## 2026-08-04 - Pi 4: USB mass storage (feat/pi4-aarch64)
+
+Storage on the Pi 4 is the **USB stick, never the SD card**. The board has one SD slot and boots from
+it - firmware, kernel image, FAT partition - and GSFS puts its superblock at LBA 0, exactly where that
+card's partition table is. The 32-bit port established this by corrupting two boot cards to RAW before
+its SD backend was withdrawn; the Pi 4 has the same topology and inherits the rule rather than
+rediscovering it.
+
+Bulk-Only Transport over the two bulk endpoints, with SCSI `TEST UNIT READY` / `READ CAPACITY(10)` /
+`READ(10)` / `WRITE(10)` / `SYNCHRONIZE CACHE(10)`. Above the driver nothing changed: the existing
+`arch::imp::usb_disk_*` seam, `usbdisk.rs` and `fs` are all arch-neutral and were already waiting for a
+backend.
+
+The one genuinely new hazard is that the disk is driven from a **syscall** while the keyboard is driven
+from the **timer tick**, and both consume the same event ring. An ISR that pops the disk's completion
+leaves the block driver waiting forever for an event that has been thrown away. `DISK_IO` makes the ISR
+yield for the duration - it costs one keyboard sample. A future SMP port needs a real lock there, and
+the comment says so.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | 26 -> 34 (+8) | Building the 31-byte Command Block Wrapper and reading the 13-byte Command Status Wrapper back (the CSW is placed 64 bytes clear of the CBW so a device that writes status early cannot land it on the command still being read); the `READ CAPACITY` reply; the block copies in and out of the DMA page, both length-checked against 512 by their callers; the input context for a two-endpoint Configure Endpoint; and the borrow of the controller in `with_disk`. |
+
 ## 2026-08-04 - Pi 4: USB hot-plug (feat/pi4-aarch64)
 
 Everything on this board is behind the internal hub, so a driver that enumerates once at boot leaves a
@@ -1772,7 +1795,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/aarch64/video.rs | 2 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
-| arch/aarch64/xhci.rs | 26 | permitted |
+| arch/aarch64/xhci.rs | 34 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
