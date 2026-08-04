@@ -200,13 +200,27 @@ pub fn report_cores_up() {
             mask |= 1 << c;
         }
     }
+    // Let the secondaries' own "core N ready" lines drain before printing the summary. They are emitted
+    // by four cores at once, and the serial claim is try-once (it must be - spinning for a log line is
+    // what turned a boot into a two-minute crawl), so a summary printed into that burst is shredded by
+    // it. The wait is a settling pause, not a synchronisation: bounded, and the summary prints either
+    // way.
+    let settle = super::read_cycle_counter();
+    while super::read_cycle_counter().wrapping_sub(settle) < hz / 10 {
+        core::hint::spin_loop();
+    }
+
     // ONE write, not five. Each `put_str` takes and releases the serial claim, so a five-call line is
     // five chances for another core to land in the middle of it - which is exactly what it did, over
     // and over: `smp: cores in the scheduler: smp: core 3 ready`. The lock was never the missing piece;
     // the line has to BE one write. `console_notice_fmt` renders it into a fixed buffer first and emits
     // it once.
+    // The line the other two ports print, in the same words, so a Pi 4 boot log reads like an x86 or
+    // Pi 2 one. The per-core progress digits stay on the end: they cost nothing, they are what found
+    // this bug, and a machine that comes up with fewer cores than it has should say where they stopped
+    // rather than only how many arrived.
     super::console_notice_fmt(format_args!(
-        "smp: cores in the scheduler: {} (mask {:#x}); progress 0/1/2/3 = {}{}{}{}          (0=absent 1=parked 2=released 3=scheduling)",
+        "smp: {} cores ready (mask {:#x}, progress {}{}{}{})",
         crate::smp::core::ready_count(),
         mask,
         AP_PROGRESS[0].load(Ordering::Acquire),
