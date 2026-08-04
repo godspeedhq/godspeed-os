@@ -112,6 +112,29 @@ than inferred (§26.6.1).
 |------|--------|-----|
 | `arch/aarch64/genet.rs` | 3 -> 4 (+1) | Recording each buffer's physical address in this module's own array, indexed inside its length during single-threaded boot, so the descriptors and the eventual drain path agree on one answer. |
 
+## 2026-08-04 - Pi 4 GENET milestone 4: transmit ring and the receive drain (feat/pi4-aarch64)
+
+Frames now arrive (the RGMII block had never been enabled, so the MAC could negotiate with the PHY
+over MDIO and hear nothing from it). This adds the transmit half and the drain that recycles receive
+descriptors, so the whole path is exercised in a single boot rather than one hypothesis per card swap.
+
+The five new blocks are all the same two shapes, and both are the shapes this file already had:
+
+- **This module's own `static mut` arrays and cursor** (`TX_BUFS`, `TX_NEXT`, `RX_BUFS`), indexed
+  inside their length during single-threaded boot. Identical to the `RX_BUFS` entry above.
+- **One copy through the direct map** in `transmit`: the frame is written to a physical frame handed
+  back by the frame allocator, addressed through `KERNEL_VA_BASE + phys`, bounded by an explicit
+  length check against `RX_BUF_LENGTH` before the copy.
+
+Worth recording because it is a portability trap rather than a soundness one: both directions need
+`dma_sync` (`dc civac`). AArch64 DMA is **not** cache coherent (SEC-28), so a transmitted frame that
+exists only in this core's cache is sent as stale bytes, and a received frame read without an
+invalidate is read as whatever was cached before. x86 needs neither and would hide both.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/genet.rs` | 4 -> 9 (+5) | Transmit buffer table and cursor, the receive buffer lookup in the drain, and one bounded copy through the direct map into a DMA frame. Same two shapes as the existing entries; each block carries its own SAFETY comment. |
+
 ## 2026-08-04 - Pi 4 GENET milestone 2: the MAC and the MDIO bus (feat/pi4-aarch64)
 
 Resets the UniMAC, programs the station address and frame limit, selects the external gigabit PHY mode,
@@ -2058,7 +2081,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/aarch64/video.rs | 2 | permitted |
-| arch/aarch64/genet.rs | 4 | permitted |
+| arch/aarch64/genet.rs | 9 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
 | arch/aarch64/smp_boot.rs | 9 | permitted |
 | arch/aarch64/xhci.rs | 37 | permitted |

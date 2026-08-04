@@ -878,6 +878,7 @@ extern "C" fn boot_high() -> ! {
                     genet::apply_link_settings();
                     if genet::init_rx_ring() && genet::enable_rx() {
                         genet::await_first_frame();
+                        genet::selftest([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
                     }
                 }
             }

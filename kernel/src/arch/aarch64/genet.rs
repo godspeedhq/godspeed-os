@@ -944,3 +944,272 @@ pub fn apply_link_settings() -> u32 {
     put_str(b" Mbit - MAC speed set to match\r\n");
     mbps
 }
+
+// ---------------------------------------------------------------------------
+// Transmit, and the continuous receive drain.
+//
+// Built as one piece deliberately. Every round of this bring-up costs a card swap, a power cycle and a
+// log capture, so testing one hypothesis per boot was the wrong shape for the loop - it spent nine
+// boots to find six bugs. What follows programs the whole remaining path and reports enough on ANY
+// failure to fix it without another boot.
+// ---------------------------------------------------------------------------
+
+/// The default transmit queue, matching the receive side's use of the catch-all ring.
+const TX_RING_INDEX: u64 = 16;
+const TX_RING_DESCS: u64 = 32;
+
+/// `TDMA_READ_PTR` and `TDMA_WRITE_PTR`. Paired by direction with the RDMA pointers at the same
+/// offsets, and swapped: the DRIVER writes the data on transmit, so the write pointer is ours here and
+/// the hardware's on receive. Reading this column wrong is what mis-named the index registers earlier.
+const TDMA_READ_PTR: u64 = 0x00;
+const TDMA_READ_PTR_HI: u64 = 0x04;
+const TDMA_WRITE_PTR: u64 = 0x2C;
+const TDMA_WRITE_PTR_HI: u64 = 0x30;
+/// Rate control. Zero disables it, which is what a driver with no shaping policy wants.
+const TDMA_FLOW_PERIOD: u64 = 0x28;
+
+/// Let the MAC append the frame check sequence, so the driver never computes a CRC.
+/// (`DMA_SOP`, `DMA_EOP` and `DMA_TX_QTAG_SHIFT` are already defined with the descriptor bits above.)
+const DMA_TX_APPEND_CRC: u32 = 1 << 6;
+/// The v5 QTAG mask, from this part's `hw_params`.
+const DMA_TX_QTAG_MASK: u32 = 0x3F;
+
+/// Transmit buffers, one physical frame each, mirroring the receive side.
+static mut TX_BUFS: [u64; TX_RING_DESCS as usize] = [0; TX_RING_DESCS as usize];
+/// The next transmit descriptor to fill. Ours alone; the hardware owns the consumer index.
+static mut TX_NEXT: u32 = 0;
+
+/// The kernel's view of a physical address, through the direct map.
+fn phys_to_virt(phys: u64) -> u64 {
+    phys + super::mmu::KERNEL_VA_BASE
+}
+
+/// Build the transmit ring: same shape as the receive ring, and the same refusal to enable anything
+/// until the geometry has been read back.
+pub fn init_tx_ring() -> bool {
+    for i in 0..TX_RING_DESCS {
+        let Some(frame) = crate::memory::allocator::alloc_frame() else {
+            put_str(b"genet: out of memory building the transmit ring\r\n");
+            return false;
+        };
+        let phys = frame.phys_addr().0;
+        // SAFETY: this module's own array, indexed inside its length, during single-threaded boot.
+        unsafe { TX_BUFS[i as usize] = phys };
+        wr(desc_word(TDMA_OFFSET, i, DMA_DESC_ADDRESS_LO), phys as u32);
+        wr(desc_word(TDMA_OFFSET, i, DMA_DESC_ADDRESS_HI), (phys >> 32) as u32);
+        wr(desc_word(TDMA_OFFSET, i, DMA_DESC_LENGTH_STATUS), 0);
+    }
+
+    let buf_size = ((TX_RING_DESCS as u32) << 16) | RX_BUF_LENGTH;
+    wr(ring_reg(TDMA_OFFSET, TX_RING_INDEX, DMA_RING_BUF_SIZE), buf_size);
+    wr(ring_reg(TDMA_OFFSET, TX_RING_INDEX, DMA_START_ADDR), 0);
+    wr(
+        ring_reg(TDMA_OFFSET, TX_RING_INDEX, DMA_END_ADDR),
+        (TX_RING_DESCS * WORDS_PER_BD - 1) as u32,
+    );
+    wr(ring_reg(TDMA_OFFSET, TX_RING_INDEX, TDMA_PROD_INDEX), 0);
+    wr(ring_reg(TDMA_OFFSET, TX_RING_INDEX, TDMA_CONS_INDEX), 0);
+    wr(ring_reg(TDMA_OFFSET, TX_RING_INDEX, DMA_MBUF_DONE_THRESH), 1);
+    wr(ring_reg(TDMA_OFFSET, TX_RING_INDEX, TDMA_FLOW_PERIOD), 0);
+    wr(ring_reg(TDMA_OFFSET, TX_RING_INDEX, TDMA_READ_PTR), 0);
+    wr(ring_reg(TDMA_OFFSET, TX_RING_INDEX, TDMA_READ_PTR_HI), 0);
+    wr(ring_reg(TDMA_OFFSET, TX_RING_INDEX, TDMA_WRITE_PTR), 0);
+    wr(ring_reg(TDMA_OFFSET, TX_RING_INDEX, TDMA_WRITE_PTR_HI), 0);
+
+    let got = rd(ring_reg(TDMA_OFFSET, TX_RING_INDEX, DMA_RING_BUF_SIZE));
+    if got != buf_size {
+        put_str(b"genet: transmit ring geometry did not take (wrote ");
+        put_hex(buf_size as u64);
+        put_str(b" read ");
+        put_hex(got as u64);
+        put_str(b")\r\n");
+        return false;
+    }
+    true
+}
+
+/// Start the transmit DMA and let the MAC send.
+pub fn enable_tx() -> bool {
+    let ring_bit = 1u32 << TX_RING_INDEX;
+    wr(dma_reg(TDMA_OFFSET, DMA_RING_CFG), ring_bit);
+    wr(
+        dma_reg(TDMA_OFFSET, DMA_CTRL),
+        DMA_EN | (ring_bit << DMA_RING_BUF_EN_SHIFT),
+    );
+
+    let mut n = 0;
+    while n < 1000 && rd(dma_reg(TDMA_OFFSET, DMA_STATUS)) & DMA_DISABLED != 0 {
+        delay_us(100);
+        n += 1;
+    }
+    if rd(dma_reg(TDMA_OFFSET, DMA_STATUS)) & DMA_DISABLED != 0 {
+        wr(dma_reg(TDMA_OFFSET, DMA_CTRL), 0);
+        wr(dma_reg(TDMA_OFFSET, DMA_RING_CFG), 0);
+        put_str(b"genet: transmit DMA would not start - backed out\r\n");
+        return false;
+    }
+
+    wr(UMAC_CMD, rd(UMAC_CMD) | CMD_TX_EN);
+    if rd(UMAC_CMD) & CMD_TX_EN == 0 {
+        put_str(b"genet: TX_EN would not set - the MAC will not transmit\r\n");
+        return false;
+    }
+    true
+}
+
+/// Queue one frame for transmission. Returns false if the frame does not fit a buffer.
+pub fn transmit(frame: &[u8]) -> bool {
+    if frame.len() > RX_BUF_LENGTH as usize {
+        return false;
+    }
+    // SAFETY: this module's own transmit cursor and buffer table, during single-threaded boot.
+    let (slot, phys) = unsafe {
+        let s = TX_NEXT % TX_RING_DESCS as u32;
+        (s, TX_BUFS[s as usize])
+    };
+
+    // Copy through the direct map, then push it out of the cache. AArch64 DMA is NOT coherent, so a
+    // frame that exists only in this core's cache is a frame the controller transmits as stale bytes.
+    let va = phys_to_virt(phys);
+    // SAFETY: `phys` came from the frame allocator and the direct map covers all of physical memory,
+    // so `va` addresses that frame. The copy is bounded by the length check above.
+    unsafe {
+        core::ptr::copy_nonoverlapping(frame.as_ptr(), va as *mut u8, frame.len());
+    }
+    super::mmu::dma_sync(va, frame.len());
+
+    let len_stat = ((frame.len() as u32) << 16)
+        | DMA_SOP
+        | DMA_EOP
+        | DMA_TX_APPEND_CRC
+        | (DMA_TX_QTAG_MASK << DMA_TX_QTAG_SHIFT);
+    wr(
+        desc_word(TDMA_OFFSET, slot as u64, DMA_DESC_LENGTH_STATUS),
+        len_stat,
+    );
+
+    // Publishing the producer index IS the handover, so it goes last.
+    // SAFETY: this module's own cursor, during single-threaded boot.
+    let prod = unsafe {
+        TX_NEXT = TX_NEXT.wrapping_add(1);
+        TX_NEXT
+    };
+    wr(
+        ring_reg(TDMA_OFFSET, TX_RING_INDEX, TDMA_PROD_INDEX),
+        prod & 0xFFFF,
+    );
+    true
+}
+
+/// Take every frame the hardware has delivered, returning how many were seen.
+///
+/// Advancing the consumer index is what returns a descriptor to the hardware, so a driver that reads
+/// frames without advancing it receives exactly `RX_RING_DESCS` of them and then stops forever.
+pub fn drain_rx() -> u32 {
+    let prod = rd(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_PROD_INDEX)) & 0xFFFF;
+    let mut cons = rd(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_CONS_INDEX)) & 0xFFFF;
+    let mut seen = 0;
+
+    while cons != prod {
+        let slot = (cons % RX_RING_DESCS as u32) as u64;
+        let status = rd(desc_word(RDMA_OFFSET, slot, DMA_DESC_LENGTH_STATUS));
+        let len = (status >> 16) & 0x0FFF;
+
+        // The controller wrote this buffer behind the CPU's back, so drop any stale cached copy before
+        // anything reads it.
+        // SAFETY: this module's own buffer table, indexed inside its length.
+        let phys = unsafe { RX_BUFS[slot as usize] };
+        if len > 0 && len <= RX_BUF_LENGTH {
+            super::mmu::dma_sync(phys_to_virt(phys), len as usize);
+        }
+
+        cons = cons.wrapping_add(1) & 0xFFFF;
+        seen += 1;
+    }
+
+    if seen > 0 {
+        wr(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_CONS_INDEX), cons);
+    }
+    seen
+}
+
+/// A broadcast ARP probe: the smallest frame that proves transmission without needing a peer to
+/// answer or an address of our own to be correct. Both protocol addresses are 0.0.0.0, which makes it
+/// a probe rather than a claim, so it cannot disturb anything else on the segment.
+fn arp_probe(mac: [u8; 6]) -> [u8; 60] {
+    let mut f = [0u8; 60]; // 60 is the minimum Ethernet frame less the CRC, which the MAC appends
+    f[0..6].copy_from_slice(&[0xFF; 6]);
+    f[6..12].copy_from_slice(&mac);
+    f[12] = 0x08;
+    f[13] = 0x06; // ARP
+    f[15] = 0x01; // Ethernet
+    f[16] = 0x08; // IPv4
+    f[18] = 6;
+    f[19] = 4;
+    f[21] = 0x01; // request
+    f[22..28].copy_from_slice(&mac);
+    f
+}
+
+/// Exercise the whole path in one boot: receive continuously, then transmit and confirm the hardware
+/// took the frame.
+pub fn selftest(mac: [u8; 6]) {
+    let mut frames = 0;
+    for _ in 0..300 {
+        frames += drain_rx();
+        delay_us(10_000);
+    }
+    put_str(b"genet: receive drained ");
+    put_hex(frames as u64);
+    put_str(b" frames in 3s\r\n");
+    if frames == 0 {
+        put_str(b"genet: nothing received - rx_pkt ");
+        put_hex(rd(UMAC_MIB_RX_PKT) as u64);
+        put_str(b" prod ");
+        put_hex(rd(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_PROD_INDEX)) as u64);
+        put_str(b"\r\n");
+    }
+
+    if !init_tx_ring() || !enable_tx() {
+        return;
+    }
+    let before = rd(ring_reg(TDMA_OFFSET, TX_RING_INDEX, TDMA_CONS_INDEX)) & 0xFFFF;
+    if !transmit(&arp_probe(mac)) {
+        put_str(b"genet: transmit rejected the frame\r\n");
+        return;
+    }
+
+    // The consumer index advancing is the hardware saying it took the descriptor and sent it. Nothing
+    // else on this board can move that register.
+    let mut n = 0;
+    while n < 500 && rd(ring_reg(TDMA_OFFSET, TX_RING_INDEX, TDMA_CONS_INDEX)) & 0xFFFF == before {
+        delay_us(1000);
+        n += 1;
+    }
+    let after = rd(ring_reg(TDMA_OFFSET, TX_RING_INDEX, TDMA_CONS_INDEX)) & 0xFFFF;
+    if after == before {
+        put_str(b"genet: FRAME NOT SENT - cons stuck at ");
+        put_hex(before as u64);
+        put_str(b" prod ");
+        put_hex(rd(ring_reg(TDMA_OFFSET, TX_RING_INDEX, TDMA_PROD_INDEX)) as u64);
+        put_str(b" tdma_status ");
+        put_hex(rd(dma_reg(TDMA_OFFSET, DMA_STATUS)) as u64);
+        put_str(b" tdma_ring_cfg ");
+        put_hex(rd(dma_reg(TDMA_OFFSET, DMA_RING_CFG)) as u64);
+        put_str(b" umac_cmd ");
+        put_hex(rd(UMAC_CMD) as u64);
+        put_str(b"\r\n");
+        return;
+    }
+
+    put_str(b"genet: FRAME SENT - transmit consumer advanced to ");
+    put_hex(after as u64);
+    put_str(b"\r\n");
+
+    let more = drain_rx();
+    if more > 0 {
+        put_str(b"genet: ");
+        put_hex(more as u64);
+        put_str(b" more frames received after transmit\r\n");
+    }
+}
