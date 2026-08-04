@@ -54,8 +54,18 @@ const UMAC_CMD: u64 = GENET_UMAC_OFF + 0x008;
 const UMAC_MAC0: u64 = GENET_UMAC_OFF + 0x00C;
 const UMAC_MAC1: u64 = GENET_UMAC_OFF + 0x010;
 const UMAC_MAX_FRAME_LEN: u64 = GENET_UMAC_OFF + 0x014;
-/// The MDIO command register, which IS in `bcmgenet.h` - an absolute offset, not UMAC-relative.
-const UMAC_MDIO_CMD: u64 = 0x614;
+/// The MDIO command register.
+///
+/// **`0x614` is UMAC-RELATIVE, not absolute.** `bcmgenet.h` defines it as a bare `0x614`, which reads
+/// like an offset from the register base - and I wrote it down that way. It is not: every `UMAC_*`
+/// constant in that header is consumed by `bcmgenet_umac_writel()`, which adds `GENET_UMAC_OFF` before
+/// touching the bus. The real address is `0x800 + 0x614 = 0xE14`, and the Pi 4's own device tree names
+/// the node **`mdio@e14`**, which settles it beyond argument.
+///
+/// The wrong address did not fail loudly. The bus went idle, `READ_FAIL` stayed clear, and the read
+/// returned a clean `0x0` - a well-formed answer from a register that is not the MDIO controller. An
+/// offset taken from a header without checking how the header USES it is a whole class of this.
+const UMAC_MDIO_CMD: u64 = GENET_UMAC_OFF + 0x614;
 
 const CMD_TX_EN: u32 = 1 << 0;
 const CMD_RX_EN: u32 = 1 << 1;
