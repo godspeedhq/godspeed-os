@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-18 done on real hardware; 19 (serial INPUT) in QEMU (2026-08-04)
+> ## STATUS: milestones 1-20 done on real hardware - CROSS-SERVICE IPC RUNS (2026-08-04)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -529,13 +529,28 @@
 > hypothesis (that the syscall number in `x8` collided with AAPCS64's indirect result register) was
 > **disproved** by the fault surviving the change unaltered.
 >
-> **Still open:** after roughly 4000 messages a kernel-mode data abort appears in
-> `aarch64_exception_return`, with `SP_EL1` holding the high alias of physical `0x8000_0000` - a kernel
-> stack pointer gone bad, and an *external* abort (`DFSC 0x10`) because that physical address does not
-> exist on the board. Separate from the fix above, and not yet diagnosed.
+> **On the board: 63,579 messages in 2 minutes 12 seconds, zero faults.**
 >
-> **Not done:** the ~4000-message fault, `arch::init` + the `kernel_main` handoff, PSCI SMP, the
-> supervisor, the shell.
+> **A QEMU-only fault, and worth recording as such.** Emulation reports a kernel-mode data abort in
+> `aarch64_exception_return` after anywhere between **257 and 12,088** messages - wildly
+> non-deterministic - with `SP_EL1` holding a bad value. The same build runs 63,579 messages clean on
+> the real board, roughly 250 times longer than QEMU's worst case and 5 times its best.
+>
+> QEMU's `raspi4b` model is visibly partial (it disables PCIe, RNG, thermal and GENET at startup and is
+> fixed at 2 GiB), so an emulation artefact is the likeliest explanation. **This is not a proof of
+> absence** - 63k messages is strong evidence, not certainty, and a rare race could still exist - so it
+> stays written down rather than closed (§26.3). If it resurfaces, the diagnostics to start from are
+> already in place: `SP_EL0`, the faulting task's name, and all 31 registers.
+>
+> Note the direction: every other bug this port hit was found *by* hardware and hidden by emulation.
+> This is the only one that runs the other way, which is itself a reason to treat it as the emulator's.
+>
+> Two real bugs were fixed while chasing it, both worth having independently: `smp::core::mark_ready(0)`
+> was never called (so the strict contracted-placement rule refused every explicit override), and
+> `uart_rx::drain` was reachable from the timer tick, a blocked console reader, and any polling task
+> without a reentrancy guard, while calling `wake_by_slot` into scheduler state.
+>
+> **Not done:** `arch::init` + the `kernel_main` handoff, PSCI SMP, the supervisor, the shell.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
 > init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already

@@ -64,6 +64,20 @@ pub fn drain() {
     if RX_SHUT_OFF.load(Ordering::Relaxed) {
         return; // the line is stuck and we are no longer listening to it
     }
+    // **Reentrancy guard, and it is not optional.** This is reachable from three places: the timer
+    // tick, a console reader blocked in a syscall, and any task that polls. It reads and advances the
+    // ring's tail and then calls `wake_by_slot`, which touches scheduler state. A task interrupted
+    // half-way through and re-entered from the tick would advance the tail twice from the same stale
+    // value, and would re-enter the wake path while the scheduler is mid-update.
+    //
+    // Masking is the right tool rather than a lock: the body is short, bounded (at most one FIFO's
+    // worth), and runs on the core that owns the ring, so there is nothing to contend with once
+    // interrupts are out of the way.
+    crate::smp::without_interrupts(drain_locked)
+}
+
+/// The body of [`drain`], with interrupts already masked.
+fn drain_locked() {
 
     let mut woke = false;
     let mut stuck: Option<(u8, u32)> = None;
