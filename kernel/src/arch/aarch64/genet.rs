@@ -327,7 +327,6 @@ fn cmd_speed(mbps: u32) -> u32 {
 // So the format goes in now, where it is checked, and the addresses come with the code that uses them.
 
 /// Descriptors per ring, and the ring register block stride. `TOTAL_DESC` is Linux's figure.
-#[allow(dead_code)]
 const TOTAL_DESC: usize = 256;
 #[allow(dead_code)]
 const DMA_RING_SIZE: u64 = 0x40;
@@ -374,6 +373,21 @@ const RDMA_CONS_INDEX: u64 = 0x08;
 #[allow(dead_code)]
 const DMA_MBUF_DONE_THRESH: u64 = 0x24;
 
+/// Words per descriptor on v4/v5: length+status, address low, address high.
+const WORDS_PER_BD: u64 = 3;
+/// The descriptor area occupies the start of each DMA block; the ring CONTROL REGISTERS follow it.
+///
+/// **This is what the last "bases confirmed" line actually missed.** `bcmgenet.h` spells the register
+/// base as `rdma_offset + TOTAL_DESC * WORDS_PER_BD * sizeof(u32)` - so `0x2000` is where the
+/// DESCRIPTORS live, and the registers begin `0xC00` further on. The write-readback test passed at
+/// `0x2000 + 0x14` for a perfectly good reason that was not the one claimed: descriptor memory is
+/// read/write, so a pattern written there reads back intact whether or not it is a ring register.
+///
+/// The test proved the block exists and is writable. It did NOT prove the register offset, and saying
+/// it did would have put every subsequent ring write 0xC00 low - into descriptor storage, silently, with
+/// the controller later fetching descriptors from whatever those writes displaced.
+const DMA_REGS_OFF: u64 = (TOTAL_DESC as u64) * WORDS_PER_BD * 4;
+
 /// The RX and TX DMA block bases for GENET v4/v5.
 ///
 /// **These are the one thing in this file not confirmed from source in the session that wrote it.**
@@ -388,9 +402,14 @@ const DMA_MBUF_DONE_THRESH: u64 = 0x24;
 const RDMA_OFFSET: u64 = 0x2000;
 const TDMA_OFFSET: u64 = 0x4000;
 
-/// Address of one ring register.
+/// Address of one ring CONTROL register - past the descriptor area, not at the block base.
 fn ring_reg(block: u64, index: u64, reg: u64) -> u64 {
-    block + index * DMA_RING_SIZE + reg
+    block + DMA_REGS_OFF + index * DMA_RING_SIZE + reg
+}
+
+/// Address of descriptor `n`'s first word, at the START of the block.
+fn desc_word(block: u64, n: u64, word: u64) -> u64 {
+    block + n * WORDS_PER_BD * 4 + word
 }
 
 /// Does this block base actually address a DMA ring?
@@ -404,7 +423,9 @@ fn ring_reg(block: u64, index: u64, reg: u64) -> u64 {
 /// clear, and there was nothing to catch it because a read alone cannot tell a wrong address from a
 /// register that legitimately holds zero. A WRITE-then-read can.
 fn verify_dma_base(block: u64, name: &[u8]) -> bool {
-    // Ring 0's start address. Nothing is enabled yet, so scribbling here disturbs nothing.
+    // Ring 0's start address, in the CONTROL register area past the descriptors. The previous version
+    // of this test addressed the descriptor area instead and passed on writable memory rather than on a
+    // register - a pass for the wrong reason, which is the failure mode this whole check exists against.
     let addr = ring_reg(block, 0, DMA_START_ADDR);
     let saved = rd(addr);
     const PATTERN: u32 = 0x0000_5A5A;
