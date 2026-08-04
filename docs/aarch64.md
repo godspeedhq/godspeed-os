@@ -579,6 +579,13 @@
 > built for AArch64, so they hold the placeholder ELF and fail loudly with `LoadFailed(TooSmall)` -
 > which is the supervisor behaving correctly, not a port fault.
 >
+> **`ping`/`pong` are opt-in (`pi4-demo-services`), and that is a usability fix rather than a tidy-up.**
+> They pace with `yield_cpu`, not a sleep, so they emit ~500 log lines a second - on the board that was
+> 41,743 lines in 87 seconds. The shell came up correctly underneath all of it, but a prompt scrolling
+> past faster than a human can read is not a working prompt. Cross-service IPC is already
+> hardware-proven at 63,579 messages, so the demo is now something you turn on to watch IPC rather than
+> something every image carries.
+>
 > **Not done:** hardware verification of the prompt, `arch::init` + the `kernel_main` handoff, PSCI SMP,
 > and the drivers the storage/network/USB commands need (SD/EMMC, GENET, VL805 xHCI).
 >

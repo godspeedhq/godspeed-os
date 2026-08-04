@@ -121,7 +121,17 @@ fn main() {
     // not yet ported keep the empty placeholder so the kernel still links. The hardware drivers stay
     // placeholders until real Pi 4 drivers exist (SD/EMMC, GENET, VL805 xHCI over PCIe) - they compile,
     // but hunt for x86 hardware that is not there.
-    let aarch64_built: &[&str] = &["logger", "ping", "pong", "supervisor", "shell"];
+    // `ping`/`pong` are DEMO services: they send as fast as the scheduler runs them (they pace with
+    // `yield_cpu`, not a sleep), which is ~500 log lines a second. That is fine when the point is to
+    // prove IPC, and unusable when the point is to type at a prompt - the shell's output scrolls past
+    // faster than a human can read it. Cross-service IPC is already hardware-proven (63,579 messages),
+    // so they are opt-in via `pi4-demo-services` rather than always present.
+    let aarch64_demo = std::env::var("CARGO_FEATURE_PI4_DEMO_SERVICES").is_ok();
+    let aarch64_built: &[&str] = if aarch64_demo {
+        &["logger", "ping", "pong", "supervisor", "shell"]
+    } else {
+        &["logger", "supervisor", "shell"]
+    };
     let aarch64_dir = workspace
         .join("target")
         .join("aarch64-unknown-none")
