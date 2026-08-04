@@ -671,7 +671,19 @@ pub fn await_first_frame() {
         delay_us(1000);
         waited += 1;
     }
-    put_str(b"genet: no frame in 3s - link is up and the ring is armed, but nothing arrived\r\n");
+    // Report the registers that say whether the hardware is even trying. Three rounds of "no frame"
+    // have now told me nothing, and each cost a boot. A dump makes the next one a diagnosis.
+    put_str(b"genet: no frame in 3s - prod ");
+    put_hex(rd(idx_reg) as u64);
+    put_str(b" cons ");
+    put_hex(rd(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_CONS_INDEX)) as u64);
+    put_str(b" dma_status ");
+    put_hex(rd(dma_reg(RDMA_OFFSET, DMA_STATUS)) as u64);
+    put_str(b" ring_cfg ");
+    put_hex(rd(dma_reg(RDMA_OFFSET, DMA_RING_CFG)) as u64);
+    put_str(b" umac_cmd ");
+    put_hex(rd(UMAC_CMD) as u64);
+    put_str(b"\r\n");
 }
 
 /// `DMA_SCB_BURST_SIZE`, from the same verified v3plus table. Linux programs it as part of DMA init.
