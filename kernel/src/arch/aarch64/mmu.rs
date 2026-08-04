@@ -166,6 +166,53 @@ static mut L2_HIGH: [Table; L1_USED] = [
     Table([0; ENTRIES]),
 ];
 
+/// The PCIe outbound window: CPU physical addresses that reach devices on the bus.
+///
+/// The BCM2711's PCIe root complex forwards a window of CPU physical addresses to the PCI bus, and the
+/// conventional base - the one the Pi's own device tree uses, and therefore the one the firmware and
+/// every other OS agree is free - is **`0x6_0000_0000`**, which is above 4 GiB and so outside the
+/// identity/direct map entirely.
+///
+/// It is mapped as **one sparse GiB**, not by widening the map. Extending `L1_USED` from 4 to 25 to
+/// reach it would spend 200 KiB of `.bss` on tables and, much worse, would mark 21 GiB of *absent*
+/// physical space as Normal cacheable memory - which the CPU is free to access speculatively, and a
+/// speculative read of nothing is an external abort with no instruction to blame it on. One L1 entry
+/// with one L2 table, all of it Device, describes exactly the window and nothing else.
+const PCIE_WIN_BASE: u64 = 0x6_0000_0000;
+const PCIE_WIN_SIZE: u64 = 64 * 1024 * 1024;
+/// Which L1 slot the window falls in (each L1 entry covers 1 GiB).
+const PCIE_L1_IDX: usize = (PCIE_WIN_BASE / (1024 * 1024 * 1024)) as usize;
+
+static mut L2_PCIE: Table = Table([0; ENTRIES]);
+static mut L2_PCIE_HIGH: Table = Table([0; ENTRIES]);
+
+/// Where the kernel names the PCIe window once it is running in the high half.
+pub const PCIE_WIN_VA: u64 = KERNEL_VA_BASE + PCIE_WIN_BASE;
+/// Base and length of the CPU-side PCIe window, for the root-complex driver to program into the
+/// outbound-window registers. One definition, so the mapping and the hardware cannot disagree.
+pub const fn pcie_window() -> (u64, u64) { (PCIE_WIN_BASE, PCIE_WIN_SIZE) }
+
+/// Fill one L2 table so that the first `len` bytes from `base` are Device, and everything else invalid.
+///
+/// # Safety
+/// `t` must point at a live, exclusively-owned table during single-threaded boot.
+unsafe fn fill_device_window(t: *mut Table, base: u64, len: u64, high: bool) {
+    let blocks = (len / BLOCK_SIZE) as usize;
+    for j in 0..ENTRIES {
+        // SAFETY: `j < ENTRIES`, and the caller owns the table.
+        unsafe {
+            (*t).0[j] = if j < blocks {
+                let pa = base + (j as u64) * BLOCK_SIZE;
+                let uxn = if high { DESC_UXN } else { 0 };
+                pa | DESC_BLOCK | DESC_AF | DESC_AP_RW_EL1
+                    | attr_idx(MAIR_IDX_DEVICE) | DESC_PXN | DESC_UXN | uxn
+            } else {
+                0 // invalid: nothing here, and a walk that reaches it faults rather than inventing RAM
+            };
+        }
+    }
+}
+
 /// Build the identity map and turn translation on.
 ///
 /// Returns the physical address installed in `TTBR0_EL1`, so the caller can report it rather than
@@ -221,6 +268,17 @@ pub fn enable() -> u64 {
                 };
             }
         }
+
+        // The PCIe outbound window, in BOTH halves. Low, because the root-complex bring-up runs before
+        // the jump; high, because everything after it names devices through the direct map. One L1 slot
+        // each, well above `L1_USED`, so nothing else in the map moves.
+        let l2p = &raw mut L2_PCIE;
+        fill_device_window(l2p, PCIE_WIN_BASE, PCIE_WIN_SIZE, false);
+        (*l1).0[PCIE_L1_IDX] = virt_to_phys(l2p as u64) | DESC_TABLE;
+
+        let l2ph = &raw mut L2_PCIE_HIGH;
+        fill_device_window(l2ph, PCIE_WIN_BASE, PCIE_WIN_SIZE, true);
+        (*l1h).0[PCIE_L1_IDX] = virt_to_phys(l2ph as u64) | DESC_TABLE;
 
         let ttbr = virt_to_phys(l1 as u64);
         let ttbr1 = virt_to_phys(l1h as u64);
@@ -434,6 +492,37 @@ pub fn selftest_high_half() -> Option<(u64, u64)> {
 ///
 /// Line sizes come from `CTR_EL0` rather than being assumed: `DminLine` and `IminLine` differ between
 /// implementations, and a hardcoded 64 either does needless work or - if too large - skips lines.
+/// Clean AND invalidate a range to the point of coherency, for memory shared with a **bus master**.
+///
+/// The BCM2711's PCIe is not I/O-coherent: a device reading RAM does not see the CPU's dirty cache
+/// lines, and the CPU reading RAM the device just wrote may hit a stale line instead. Both directions
+/// have to be handled, and `dc civac` handles both with one operation - clean (so the device sees what
+/// we wrote) and invalidate (so we do not see what we cached). It is marginally more work than picking
+/// the right one-way operation per site, and it removes the whole class of bug where the *direction* of
+/// a transfer is reasoned about wrongly at one call site out of thirty.
+///
+/// The `dsb` afterwards is what makes the maintenance ordered against the device's next access; without
+/// it the doorbell write can overtake the clean.
+pub fn dma_sync(va: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // SAFETY: `CTR_EL0` is readable at EL1 and side-effect free. `dc civac` is cache maintenance by
+    // virtual address over a range the caller owns; it alters no architectural state beyond the caches.
+    unsafe {
+        let ctr: u64;
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
+        let dline = 4u64 << ((ctr >> 16) & 0xF); // DminLine, in words
+        let end = va + len as u64;
+        let mut a = va & !(dline - 1);
+        while a < end {
+            core::arch::asm!("dc civac, {}", in(reg) a, options(nostack));
+            a += dline;
+        }
+        core::arch::asm!("dsb sy", options(nostack));
+    }
+}
+
 pub fn sync_instruction_cache(va: u64, len: usize) {
     if len == 0 {
         return;

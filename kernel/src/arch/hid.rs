@@ -1,19 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! USB HID boot-protocol keyboard decoding for the ARM in-kernel USB driver.
+//! USB HID boot-protocol keyboard decoding, shared by every in-kernel USB driver.
 //!
 //! **Why this exists here and not in the SDK.** On x86 the USB drivers are userspace *services* and
-//! share `sdk/rust/src/hid.rs`. The ARM port does not yet route device IRQs to userspace, so its USB
-//! driver runs **in the kernel** (`arch/arm/CLAUDE.md`, "Drivers on ARM") - and the kernel cannot link
-//! the SDK (it is a separate, differently-licensed crate; the kernel depends on no service code). So the
-//! ARM side implements the *same behaviour contract* kernel-side. When ARM routes device IRQs to
-//! userspace and the driver becomes a service, it drops this module and uses the SDK's, like x86.
-//! Keep the two in step: this is the same decode a serial terminal produces, so the shell's ONE input
-//! parser handles USB and serial alike.
+//! share `sdk/rust/src/hid.rs`. Neither ARM port routes device IRQs to userspace yet, so their USB
+//! drivers run **in the kernel** (`arch/arm/CLAUDE.md`, "Drivers on ARM") - and the kernel cannot link
+//! the SDK (it is a separate, differently-licensed crate; the kernel depends on no service code). So
+//! the kernel side implements the *same behaviour contract*. When device IRQs reach userspace and the
+//! drivers become services, they drop this module and use the SDK's, like x86. Keep the two in step:
+//! this is the same decode a serial terminal produces, so the shell's ONE input parser handles USB and
+//! serial alike.
 //!
-//! Pure logic - no MMIO, no I/O. The driver reads the fixed 8-byte boot report and hands it here; the
-//! side effect (pushing a byte to the console ring) stays in the driver, passed in as a closure.
-
-use super::timer::systimer_us;
+//! **Why it sits in `arch/` rather than in one arch's directory.** It started under `arch/arm/`, where
+//! it was the only in-kernel USB driver. The Pi 4's xHCI is the second, and copying 234 lines of key
+//! tables and repeat timing to sit beside it is exactly the mistake `crate::fbcon` was created to undo:
+//! two consoles drifted apart, each having fixed terminal bugs the other still had. One copy, two
+//! callers. There is nothing CPU-specific in here to make it arch-specific in the first place.
+//!
+//! Pure logic - no MMIO, no I/O, and **no clock**. Time comes in as a parameter, because the two ports
+//! read different counters (a 1 MHz system timer on the Pi 2, the generic timer on the Pi 4) and a
+//! module that reached for one of them by name would only work on one machine. The driver reads the
+//! fixed 8-byte boot report and hands it here; the side effect (pushing a byte to the console ring)
+//! stays in the driver, passed in as a closure.
 
 /// HID usage of the Caps Lock key. It is a host-tracked LATCH: the modifier byte never reports it, so
 /// the host toggles a `caps` flag on each fresh press.
@@ -130,8 +137,9 @@ fn emit_key(k: u8, mods: u8, caps: bool, emit: &mut impl FnMut(u8)) -> bool {
 /// Typematic auto-repeat: a USB boot keyboard reports only on CHANGE - a held key sends one down
 /// report and then nothing until release - so the host must synthesise repeat itself.
 ///
-/// Time is in **microseconds from the BCM2835 1 MHz System Timer** (`timer::systimer_us`). Unlike
-/// x86's TSC this needs no calibration (it is exactly 1 MHz by construction), so the delays are true
+/// Time is in **microseconds**, supplied by the caller. On the Pi 2 that is the BCM2835 1 MHz System
+/// Timer, which needs no calibration (it is exactly 1 MHz by construction); on the Pi 4 it is derived
+/// from the generic timer, whose frequency is read from `CNTFRQ_EL0`. Either way the delays are true
 /// wall-clock and cannot drift the way the calibrated-TSC path did on the Wyse.
 pub struct KeyRepeat {
     key: u8,       // HID usage being repeated (0 = nothing armed)
@@ -175,9 +183,8 @@ impl KeyRepeat {
     /// Emit a repeat of the held key if one is due. The driver calls this EVERY poll (every timer
     /// tick), including ticks where the keyboard sent no report - a held key sends nothing, so the
     /// repeat must come from here.
-    pub fn poll(&mut self, mut emit: impl FnMut(u8)) {
+    pub fn poll(&mut self, now: u32, mut emit: impl FnMut(u8)) {
         if self.key == 0 { return; }
-        let now = systimer_us();
         if !due(now, self.next_at) { return; }
         emit_key(self.key, self.mods, self.caps, &mut emit);
         self.next_at = now.wrapping_add(REPEAT_INTERVAL_US);
@@ -200,13 +207,13 @@ pub fn decode_keyboard(
     last: &mut [u8; 6],
     rep: &mut KeyRepeat,
     caps: &mut bool,
+    now: u32,
     mut emit: impl FnMut(u8),
 ) {
     // Byte 1 is reserved and always 0 in a real report; an all-0xff report is the signature of a
     // failed/stale read (device gone mid-transaction). Decoding it would spew 0xff "keystrokes" AND
     // poison `last` so later real keys diff wrong. Drop it untouched.
     if report[1] != 0 { return; }
-    let now = systimer_us();
     let mods = report[0];
     let cur = [report[2], report[3], report[4], report[5], report[6], report[7]];
     for &k in cur.iter() {

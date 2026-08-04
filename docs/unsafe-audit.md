@@ -43,6 +43,38 @@ somewhere that names neither the GPU nor the map (§26.7).
 | `arch/aarch64/mailbox.rs` | 3 -> 4 (+1) | `property_call`: copies an arbitrary tag request into this module's 16-byte-aligned static and the reply back out, length-checked against the buffer at both ends. The static rather than the caller's array because the mailbox packs the channel into the low 4 bits of the address it is handed - an arbitrarily-aligned caller buffer would send the message to the wrong channel, so the alignment guarantee stays in one place. |
 | `arch/aarch64/mod.rs` | 53 -> 55 (+2) | The write and the read of `FB_INFO`, the static that carries the geometry across the jump to the high half. A static rather than a local because the jump abandons the low stack along with every local on it - the same reason `memmap::current_map` exists. Single-threaded boot: written once before the jump, read once after. |
 
+## 2026-08-04 - Pi 4 milestone 23: PCIe and the USB keyboard (feat/pi4-aarch64)
+
+The Pi 2's USB host controller sits on the SoC's peripheral bus at a fixed address. The Pi 4's does
+not: its USB-A ports are behind a **VIA VL805**, an off-SoC xHCI controller on the far side of a PCIe
+Gen2 link. Before one USB register can be read, the root complex has to leave reset, the link has to
+train, an address window has to be opened onto the bus, config space reached through it, and a BAR
+assigned inside it. `pcie.rs` does that and stops - it knows nothing about USB. `xhci.rs` starts at the
+BAR and ends where `crate::arch::hid` begins.
+
+**A probe read that tolerates an external abort (`uaccess::probe_read32`) is what keeps QEMU usable.**
+The root complex is at a fixed address on a real Pi 4 and at *nothing* under `raspi4b`, and the
+difference does not present as a translation fault - the mapping is perfectly valid - but as an
+external abort from the interconnect, which at EL1 is indistinguishable from a kernel bug and halts the
+machine. That is the right default and the wrong answer for a probe, whose entire question is "is
+anything there?". It reuses the user-copy seam's fixup for exactly one load, so a fault anywhere else
+still halts loudly.
+
+**The driver runs in ring 0 and this is a TCB expansion**, the same one §6.4's 2026-07-23 amendment
+already records for ARM: neither ARM port routes device IRQs to userspace, so an in-kernel driver parses
+untrusted device-supplied descriptors, on a board with no IOMMU to confine its DMA. Recorded rather than
+papered over (§26.3). Every descriptor walk here is bounded by the length byte and refuses a zero-length
+entry, because a malformed descriptor from an untrusted device must end the walk, not spin it forever.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | new, 18 | Ring and context construction, and the report buffer. Every one is a write to a page this module allocated from the frame allocator and named through the direct map, whose layout is the xHCI 1.2 structure the controller reads. The two `read_volatile`/`write_volatile` register helpers are the controller's BAR, which `pcie` mapped and assigned. `parse_config` builds a slice over the descriptor buffer so the walk itself is bounds-checked. The scratchpad pointer-array writes are bounded by an explicit refusal above 512 entries, so a controller asking for more than one page can index is turned away rather than allowed to overrun it. |
+| `arch/aarch64/pcie.rs` | new, 3 | The root-complex register read and write helpers (volatile accesses inside the kernel's Device mapping), and the presence probe. |
+| `arch/aarch64/uaccess.rs` | 5 -> 7 (+2) | `probe_read32`: the fixup pointer, and the one-instruction `asm!` block that arms it, does the load, and clears it on both exit paths. |
+| `arch/aarch64/mmu.rs` | 12 -> 15 (+3) | `dma_sync` (`dc civac` over a range shared with a bus master - the BCM2711's PCIe is not I/O-coherent, SEC-28), and the two `fill_device_window` writes that build the sparse PCIe outbound-window table. |
+| `arch/aarch64/mod.rs` | 59 -> 61 (+2) | The write and the read of `PCIE_XHCI`, the static carrying the discovered controller from the boot probe to the driver. |
+| `arch/aarch64/uart_rx.rs` | 2 -> 3 (+1) | `push`: a keyboard delivering a byte into the ring the console reader already drains. The ring is shared with serial deliberately - the console has one input stream, and a blocked reader should not have to know which device a byte came from. |
+
 ## 2026-08-04 - Pi 4: the page-table primitives the chaos run needed (feat/pi4-aarch64)
 
 Four `page_tables` primitives were still stubs, and the difference between them mattered. Three were
@@ -1680,23 +1712,25 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 59 | permitted |
+| arch/aarch64/mod.rs | 61 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/sched_spawn.rs | 2 | permitted |
-| arch/aarch64/uart_rx.rs | 2 | permitted |
+| arch/aarch64/uart_rx.rs | 3 | permitted |
 | arch/aarch64/exceptions.rs | 11 | permitted |
-| arch/aarch64/uaccess.rs | 5 | permitted |
+| arch/aarch64/uaccess.rs | 7 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 4 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
-| arch/aarch64/mmu.rs | 12 | permitted |
+| arch/aarch64/mmu.rs | 15 | permitted |
 | arch/aarch64/ptables.rs | 20 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/aarch64/video.rs | 2 | permitted |
+| arch/aarch64/pcie.rs | 3 | permitted |
+| arch/aarch64/xhci.rs | 18 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |

@@ -145,6 +145,36 @@ fn drain_locked() {
     }
 }
 
+/// Keystrokes discarded because the ring was full. Counted, never silent - see [`push`].
+static KBD_DROPPED: AtomicU32 = AtomicU32::new(0);
+
+/// Push one byte into the console input ring from a producer that is **not** the UART - a keyboard.
+///
+/// The ring is deliberately shared with serial rather than duplicated: the console has one input
+/// stream, and a reader blocked on it should not have to know which device a byte came from. That is
+/// also why the UART side shuts a stuck line off (see the module header) - a producer that floods this
+/// ring starves the other one.
+///
+/// A full ring means a KEYSTROKE is being lost, which is the one drop here that a user notices and
+/// cannot explain. It is counted and reported the first time, rather than letting a keyboard that
+/// appears dead give no account of itself (invariant 12).
+pub fn push(b: u8) {
+    let tail = RX_TAIL.load(Ordering::Relaxed) as usize;
+    let head = RX_HEAD.load(Ordering::Acquire) as usize;
+    let next = (tail + 1) % RX_BUF_SIZE;
+    if next != head {
+        // SAFETY: `tail` is in bounds by construction and this is the only writer of that slot until
+        // the Release store below publishes it.
+        unsafe { RX_BUF[tail] = b };
+        RX_TAIL.store(next as u32, Ordering::Release);
+        wake_console_reader();
+    } else if KBD_DROPPED.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::kprintln!(
+            "aarch64: console input ring FULL - a keystroke was dropped (nothing is draining it)"
+        );
+    }
+}
+
 /// Take one byte, if there is one.
 pub fn pop() -> Option<u8> {
     let head = RX_HEAD.load(Ordering::Relaxed) as usize;

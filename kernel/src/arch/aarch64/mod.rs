@@ -40,7 +40,11 @@ pub mod timer;
 #[cfg(feature = "pi4")]
 pub mod uart_rx;
 #[cfg(feature = "pi4")]
+pub mod pcie;
+#[cfg(feature = "pi4")]
 pub mod video;
+#[cfg(feature = "pi4")]
+pub mod xhci;
 #[cfg(feature = "pi4")]
 pub mod uaccess;
 #[cfg(feature = "pi4")]
@@ -52,6 +56,11 @@ pub mod usermode;
 /// the same reason `memmap::current_map` exists.
 #[cfg(feature = "pi4")]
 static mut FB_INFO: Option<video::FbInfo> = None;
+
+/// The xHCI controller found behind the PCIe root complex, if any. `None` means no USB this boot -
+/// serial still works, so it is a degradation, not a failure.
+#[cfg(feature = "pi4")]
+static mut PCIE_XHCI: Option<pcie::Device> = None;
 
 /// Reload value for the periodic tick, in generic-timer counter ticks. The timer is one-shot, so the
 /// IRQ handler re-arms with this every time. Published here because the handler runs in an interrupt
@@ -767,7 +776,21 @@ extern "C" fn boot_high() -> ! {
         // this port does not run yet (it starts APs; PSCI SMP is a later milestone).
         crate::smp::core::mark_ready(0);
 
-
+        // The PCIe root complex, and the xHCI controller the USB-A ports hang off. After the frame
+        // allocator, because the inbound DMA window is sized from the memory map; before the scheduler,
+        // because a keyboard that appears after the shell has already decided the input path is up is
+        // a keyboard nobody is reading. `None` is not fatal - the machine still has serial.
+        //
+        // The window is sized from the TOP of the memory map, not the sum of the usable regions: it
+        // has to cover the highest address a bus master may be handed, and a map with a hole in it
+        // (which the Pi 4's is - the GPU carve sits between the two banks) sums to less than that.
+        let ram_top = bi.memory_map.iter().map(|r| r.base + r.len).max().unwrap_or(0);
+        // SAFETY: single-threaded boot; written once here, read by the USB driver afterwards.
+        unsafe { PCIE_XHCI = pcie::init(ram_top) };
+        // SAFETY: read-once of the static just written, still single-threaded.
+        if let Some(dev) = unsafe { PCIE_XHCI } {
+            xhci::init(dev.bar0);
+        }
 
         page_table_selftest();
         bi
@@ -1103,15 +1126,111 @@ pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
 #[cfg(not(feature = "pi4"))]
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {}
 pub fn set_console_echo(on: bool) {}
+
+// Console FOREGROUND. `u32::MAX` = unclaimed (anyone may read, everything reaches the display);
+// otherwise the task slot of the full-screen app that owns the console.
+//
+// These were empty stubs with `console_foreground_allows` hardwired to `true`, and that single `true`
+// is the whole reason a `chaos` run on this board looked broken. The SAME predicate gates console reads
+// and console writes, so with it always true: the shell kept consuming input while `chaos` was drawing,
+// which is why `q` reached the shell instead of the app waiting for it and why a typed line came back
+// mangled (two writers, one line); and when the app finally exited, nothing woke the shell out of its
+// blocked read, so the prompt never came back and the machine looked frozen. Same semantics as x86 and
+// the Pi 2 port - this port simply had not implemented its half.
+#[cfg(feature = "pi4")]
+static CONSOLE_FOREGROUND: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// How long a console claim survives without the owner producing output. A full-screen app renews by
+/// DRAWING - which is what such an app does, every frame - so a working one never notices this. One
+/// that has stopped drawing has stopped being a full-screen app, whatever its task state says.
+///
+/// Without the lease, a claim is the one authority here a task can hold forever after it has stopped
+/// using it: the shell stays muted, the screen keeps the dead app's last frame, and the only way back
+/// is the power switch. Generous enough to cover the slowest legitimate gap between repaints.
+#[cfg(feature = "pi4")]
+const CONSOLE_FG_LEASE_SECS: u64 = 45;
+#[cfg(feature = "pi4")]
+static CONSOLE_FG_RENEWED: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
+/// Claim exclusive console input and output, for a BOUNDED term.
+#[cfg(feature = "pi4")]
+pub fn claim_console_foreground(task_slot: u32) {
+    CONSOLE_FG_RENEWED.store(read_cycle_counter(), Ordering::Relaxed);
+    CONSOLE_FOREGROUND.store(task_slot, Ordering::Release);
+}
+
+/// Has the current claim lapsed? Released and reported once, at the moment it happens (invariant 12).
+#[cfg(feature = "pi4")]
+fn console_fg_lapsed() -> bool {
+    if CONSOLE_FOREGROUND.load(Ordering::Acquire) == u32::MAX {
+        return false;
+    }
+    let hz = timer::frequency().max(1);
+    let since = read_cycle_counter().wrapping_sub(CONSOLE_FG_RENEWED.load(Ordering::Relaxed));
+    if since / hz < CONSOLE_FG_LEASE_SECS {
+        return false;
+    }
+    CONSOLE_FOREGROUND.store(u32::MAX, Ordering::Release);
+    wake_console_waiter();
+    put_str(b"console: the foreground app stopped drawing - its claim lapsed, console returned\r\n");
+    true
+}
+
+#[cfg(feature = "pi4")]
+pub fn release_console_foreground() {
+    CONSOLE_FOREGROUND.store(u32::MAX, Ordering::Release);
+    wake_console_waiter();
+}
+
+#[cfg(feature = "pi4")]
+pub fn release_console_foreground_if_owner(task_slot: u32) {
+    if CONSOLE_FOREGROUND
+        .compare_exchange(task_slot, u32::MAX, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        wake_console_waiter();
+    }
+}
+
+/// May `task_slot` read console input, and does its output reach the display? True when the foreground
+/// is unclaimed or this task holds it.
+#[cfg(feature = "pi4")]
+pub fn console_foreground_allows(task_slot: u32) -> bool {
+    let owner = CONSOLE_FOREGROUND.load(Ordering::Acquire);
+    if owner == u32::MAX || owner == task_slot {
+        return true;
+    }
+    console_fg_lapsed() // a claim nobody is renewing does not keep the console
+}
+
+/// Wake a task parked in a muted blocking console read, so releasing the foreground resumes it at once
+/// instead of leaving it asleep until the next keystroke - which is exactly why the prompt did not come
+/// back on its own when `chaos` exited.
+#[cfg(feature = "pi4")]
+fn wake_console_waiter() {
+    let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
+    if waiter != u32::MAX {
+        crate::task::scheduler::wake_by_slot(waiter as usize, 0);
+    }
+}
+
+#[cfg(not(feature = "pi4"))]
 pub fn claim_console_foreground(task_slot: u32) {}
+#[cfg(not(feature = "pi4"))]
 pub fn release_console_foreground() {}
+#[cfg(not(feature = "pi4"))]
 pub fn release_console_foreground_if_owner(task_slot: u32) {}
+#[cfg(not(feature = "pi4"))]
 pub fn console_foreground_allows(task_slot: u32) -> bool { true }
 /// The shell has the console: dismiss the boot screen and present a clean prompt.
 #[cfg(feature = "pi4")]
 pub fn console_boot_complete() { video::boot_complete(); }
 #[cfg(not(feature = "pi4"))]
 pub fn console_boot_complete() {}
+/// A non-UART producer (a keyboard) delivering one byte to the console input ring.
+#[cfg(feature = "pi4")]
+pub fn console_push_byte(b: u8) { uart_rx::push(b) }
+#[cfg(not(feature = "pi4"))]
 pub fn console_push_byte(b: u8) {}
 /// Whether the machine's console INPUT path is up, which gates the shell's prompt.
 ///
@@ -1137,7 +1256,12 @@ pub fn com2_try_read_byte() -> Option<u8> { None }
 pub fn uart_rx_pop() -> Option<u8> { uart_rx::pop() }
 /// Called from the core-0 timer tick, every 10 ms.
 #[cfg(feature = "pi4")]
-pub fn uart_rx_poll() { uart_rx::drain() }
+pub fn uart_rx_poll() {
+    uart_rx::drain();
+    // The USB keyboard shares this tick. It is polled rather than interrupt-driven for the reason in
+    // `xhci`'s module header, and it no-ops in a few instructions when no keyboard was found.
+    xhci::poll();
+}
 /// Called directly by a blocked console reader: a timer ISR starved under load would otherwise leave a
 /// byte stranded in the FIFO with a reader asleep waiting for it.
 #[cfg(feature = "pi4")]

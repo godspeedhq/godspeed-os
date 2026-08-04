@@ -3956,7 +3956,7 @@ pub fn poll() {
             // in a row mean we have lost track of the keyboard entirely - disarm rather than guess.
             if ci & HCINT_NAK != 0 {
                 ks.unhealthy = 0;
-                ks.rep.poll(super::console_push_byte);
+                ks.rep.poll(super::timer::systimer_us(), super::console_push_byte);
             } else {
                 ks.unhealthy = ks.unhealthy.saturating_add(1);
                 if ks.unhealthy > 3 { ks.rep.disarm(); }
@@ -3974,8 +3974,8 @@ pub fn poll() {
             return;
         }
         super::hid::decode_keyboard(&report, &mut ks.last, &mut ks.rep, &mut ks.caps,
-                                    super::console_push_byte);
+                                    super::timer::systimer_us(), super::console_push_byte);
         // Also service repeat on a report tick, so a held key keeps repeating while another is tapped.
-        ks.rep.poll(super::console_push_byte);
+        ks.rep.poll(super::timer::systimer_us(), super::console_push_byte);
     }
 }

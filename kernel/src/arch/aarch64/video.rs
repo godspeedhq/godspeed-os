@@ -149,9 +149,18 @@ const TAG_GET_PITCH: u32 = 0x0004_0008;
 const TAG_GET_PHYS_WH: u32 = 0x0004_0003;
 
 /// Ask the GPU what the attached display's resolution is, so the console matches the screen instead of
-/// imposing a size on it. Falls back to a safe default if the display does not answer.
+/// imposing a size on it.
+///
+/// The fallback is **1280x720**, the same one the Pi 2 port uses. It matters more than a default
+/// usually does, because it is what the console's width comes from when the query is unhelpful: the
+/// font scale is `height / 600`, so at 720p and below the cell size is fixed and the column count is
+/// simply the pixel width divided by it. 1024 wide gave 102 columns, which is narrower than the Pi 2's
+/// and narrow enough to wrap `observe` and the chaos table.
+///
+/// Whether the number came from the display or from the fallback is **logged**, because the two look
+/// identical afterwards and only one of them is worth investigating.
 fn query_display_size() -> (u32, u32) {
-    const FALLBACK: (u32, u32) = (1024, 768);
+    const FALLBACK: (u32, u32) = (1280, 720);
     let mut req = [0u32; 8];
     req[0] = 7 * 4;
     req[1] = 0;
@@ -161,17 +170,44 @@ fn query_display_size() -> (u32, u32) {
     req[5] = 0;
     req[6] = 0;
     req[7] = 0; // end tag
-    match super::mailbox::property_call(&mut req) {
-        // A display can report an absurd size (or none at all, unplugged); cap it rather than let it
-        // drive a fill loop and a mapping length.
-        Some(_) if req[5] > 0 && req[6] > 0 && req[5] <= 4096 && req[6] <= 4096 => (req[5], req[6]),
-        _ => FALLBACK,
+    let answered = super::mailbox::property_call(&mut req).is_some();
+    // A display can report an absurd size (or none at all, unplugged); cap it rather than let it drive
+    // a fill loop and a mapping length.
+    let good = answered && req[5] > 0 && req[6] > 0 && req[5] <= 4096 && req[6] <= 4096;
+    if good {
+        put_str(b"aarch64: display reports ");
+        put_dec(req[5] as u64);
+        put_str(b"x");
+        put_dec(req[6] as u64);
+        put_str(b" (native)\r\n");
+        (req[5], req[6])
+    } else {
+        put_str(b"aarch64: display did not report a usable size - asking for 1280x720\r\n");
+        FALLBACK
     }
 }
 
+/// The narrowest mode worth asking for, and the Pi 2's fallback.
+///
+/// The firmware reports **1024x768** when it has not applied the display's EDID - which is what a Pi 4
+/// booting straight into our kernel (no KMS driver, `disable_fw_kms_setup=1`) tends to get on a TV that
+/// is in fact 1080p. 1024 wide is 102 columns, narrow enough to wrap `observe` and the chaos table.
+///
+/// So when the reported size is below this floor, ask for the floor instead. That is safe rather than a
+/// gamble, because the request is not the answer: `SET_PHYS_WH` replies with the mode the GPU actually
+/// applied, and this code uses the reply. If the display really is 1024x768, the GPU clamps and we get
+/// 1024x768 back, exactly as before.
+const MIN_MODE: (u32, u32) = (1280, 720);
+
 /// Allocate a framebuffer. Call once, before the MMU is enabled.
 pub fn init() -> Option<FbInfo> {
-    let (width, height) = query_display_size();
+    let reported = query_display_size();
+    let (width, height) = if reported.0 < MIN_MODE.0 {
+        put_str(b"aarch64: reported mode is narrower than 1280 - asking for 1280x720 instead\r\n");
+        MIN_MODE
+    } else {
+        reported
+    };
 
     let mut req = [0u32; 36];
     req[0] = 35 * 4;

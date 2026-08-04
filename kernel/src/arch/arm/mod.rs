@@ -31,7 +31,9 @@ pub mod fbcon;
 /// See `crate::fbcon`'s module header for the contract each one owes.
 pub use fbcon::{fb_commit, FB_READBACK_CHEAP};
 pub mod dwc2;
-pub mod hid;
+/// The shared in-kernel HID decoder, re-exported under its old name so this port's call sites are
+/// unchanged. It moved to `arch/hid.rs` when the Pi 4's xHCI became its second caller.
+pub use crate::arch::hid;
 // USB-net bridge (the mechanism the userspace ARM `nic-driver` calls): move ethernet frames to/from the
 // in-kernel CDC-ECM device. On ARM these are the real DWC2 functions; other arches stub them (net there is
 // a userspace PCIe driver, not this in-kernel USB path).

@@ -144,6 +144,52 @@ pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool {
     copy_to_user(dst, src.as_ptr(), src.len())
 }
 
+/// Read one 32-bit MMIO register, tolerating a **synchronous external abort**.
+///
+/// Not every address the kernel believes is a device actually decodes to one. The BCM2711's PCIe root
+/// complex is at a fixed address on a real Pi 4 and at *nothing* under QEMU's `raspi4b`, and the
+/// difference does not show up as a translation fault - the mapping is perfectly valid - but as an
+/// external abort from the interconnect, which at EL1 is indistinguishable from a kernel bug and halts
+/// the machine. That is the right default and the wrong answer for a **probe**, whose entire question
+/// is "is anything there?".
+///
+/// So this reuses the user-copy seam's fixup for exactly one instruction: `None` means the read
+/// aborted, and the caller degrades (no USB, still a serial console) instead of taking the boot down.
+/// The window is one load wide, so a fault anywhere else still halts loudly - which is the property
+/// that makes this a probe rather than a blanket "ignore kernel faults".
+///
+/// # Safety
+/// `addr` must be 4-byte aligned and inside a Device mapping the kernel owns.
+pub unsafe fn probe_read32(addr: u64) -> Option<u32> {
+    let fixup = &FIXUP[core_index()] as *const AtomicU64;
+    let ok: u64;
+    let val: u64;
+    // SAFETY: caller's contract for `addr`; the fixup is armed around the single load and cleared on
+    // both exit paths, so no later fault is silently absorbed.
+    unsafe {
+        core::arch::asm!(
+            "adr  {tmp}, 3f",
+            "str  {tmp}, [{fixup}]",
+            "mov  {ok}, #1",
+            "ldr  {val:w}, [{addr}]",
+            "str  xzr, [{fixup}]",
+            "b    4f",
+            "3:",
+            "str  xzr, [{fixup}]",
+            "mov  {ok}, #0",
+            "mov  {val}, #0",
+            "4:",
+            addr = in(reg) addr,
+            fixup = in(reg) fixup,
+            tmp = out(reg) _,
+            ok = out(reg) ok,
+            val = out(reg) val,
+            options(nostack),
+        );
+    }
+    if ok != 0 { Some(val as u32) } else { None }
+}
+
 /// The actual read, one byte at a time through `ldtrb`.
 ///
 /// Byte-at-a-time is deliberate for now: it is obviously correct, and the fixup has to cover exactly
