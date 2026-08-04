@@ -287,6 +287,8 @@ struct Disk {
     cmd_phys: u64,
     sectors: u64,
     tag: u32,
+    /// Which hub port it is on, so its removal stands the DISK down and not the keyboard.
+    hub_port: u8,
 }
 
 impl Disk {
@@ -306,6 +308,7 @@ impl Disk {
             cmd_phys: 0,
             sectors: 0,
             tag: 0,
+            hub_port: 0,
         }
     }
 }
@@ -314,14 +317,30 @@ impl Disk {
 /// block-driver asks for it from a SYSCALL while the driver itself lives behind the tick.
 static DISK_SECTORS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
-/// Set while a disk transfer owns the event ring.
+/// Whoever holds this owns the controller: the event ring, the command ring, and every device on it.
 ///
-/// The disk is driven from a **syscall** (a task), and the keyboard from the **timer tick** (an ISR),
-/// and both consume the same event ring. An ISR that pops the disk's completion leaves the disk waiting
-/// forever for an event that has already been thrown away. So the ISR yields: it skips its poll while
-/// this is set, costing at most one keyboard sample. The task cannot lose the race in the other
-/// direction, because on this single-core port the ISR only runs when the task is not.
-static DISK_IO: AtomicBool = AtomicBool::new(false);
+/// **Three unrelated contexts drive this hardware** - the timer tick (keyboard), a syscall (disk I/O),
+/// and the idle loop (hot-plug enumeration) - and they all consume the SAME event ring. Two of them
+/// running at once is not a slow path, it is one of them silently eating the other's completion event
+/// and waiting forever for it.
+///
+/// So exclusion is a claim rather than a masked section: the holder runs with interrupts ENABLED, and
+/// everyone else stands aside. The tick skips a keyboard sample. The disk answers BUSY, which the block
+/// driver already knows how to retry (`with_busy_retry` in `usbdisk.rs`). Hot-plug waits a second and
+/// tries again. This is the protocol the Pi 2 arrived at for the same three-way collision, and for the
+/// same reason: masking instead would suppress the tick for the ~100 ms an enumeration takes.
+static USB_CLAIM: AtomicBool = AtomicBool::new(false);
+
+/// Take the controller, or report that someone else has it.
+fn claim_usb() -> bool {
+    USB_CLAIM
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+fn release_usb() {
+    USB_CLAIM.store(false, Ordering::Release);
+}
 
 /// The internal hub and what we believe is plugged into it.
 struct Hub {
@@ -712,9 +731,10 @@ impl Xhci {
                 if (ev.control >> 10) & 0x3F == TRB_EV_CMD_COMPLETE && ev.param == at {
                     return Some(((ev.status >> 24) & 0xFF, (ev.control >> 24) as u8));
                 }
-                // Any other event (a port-status change, say) is not what we are waiting for. Dropping
-                // it is correct here: the port scan re-reads PORTSC directly rather than relying on
-                // having seen the event.
+                // A port-status change is safely dropped - the port scan re-reads PORTSC rather than
+                // relying on having seen the event. A TRANSFER event is not: it may be the keyboard's,
+                // and dropping that one wedges it. See `absorb_foreign_event`.
+                self.absorb_foreign_event(&ev);
             }
             delay_us(1000);
             waited += 1;
@@ -1174,8 +1194,19 @@ impl Xhci {
             speed,
         };
         if self.setup_at(child) {
+            // Record the port on whichever device this actually was. Setting it unconditionally on the
+            // KEYBOARD was wrong in a way that only shows up later: bringing up a stick on port 2 would
+            // relabel the keyboard as being on port 2, so unplugging the stick stood the keyboard down
+            // and unplugging the keyboard did nothing.
+            if let Some(d) = self.disk.as_mut() {
+                if d.hub_port == 0 {
+                    d.hub_port = p;
+                }
+            }
             if let Some(k) = self.kbd.as_mut() {
-                k.hub_port = p;
+                if k.hub_port == 0 {
+                    k.hub_port = p;
+                }
             }
             return true;
         }
@@ -1253,6 +1284,7 @@ impl Xhci {
             cmd_phys: buf_phys,
             sectors: 0,
             tag: 1,
+            hub_port: 0,
         };
 
         // A stick that has just been reset answers NOT READY for a while. Asking once and believing the
@@ -1472,12 +1504,37 @@ impl Xhci {
                     // 1 = success, 13 = short packet, which for a descriptor read is the normal case.
                     return code == 1 || code == 13;
                 }
+                self.absorb_foreign_event(&ev);
             }
             delay_us(1000);
             waited += 1;
         }
         put_str(b"xhci: transfer timed out\r\n");
         false
+    }
+
+    /// Deal with an event that arrived while waiting for a different one.
+    ///
+    /// **Discarding it silently kills the keyboard.** There is one event ring for the whole controller,
+    /// so a disk transfer waiting for its own completion also receives the keyboard's. Dropping that
+    /// leaves `pending` set forever: `arm_transfer` never queues another interrupt transfer, no further
+    /// report ever arrives, and the keyboard is dead until it is physically unplugged and replugged -
+    /// which is exactly what happened after the first disk enumeration.
+    ///
+    /// The event is matched against the keyboard's transfer ring by address, so this cannot mistake an
+    /// unrelated completion for the keyboard's and re-arm a transfer that is still outstanding.
+    fn absorb_foreign_event(&mut self, ev: &Trb) {
+        if (ev.control >> 10) & 0x3F != TRB_EV_TRANSFER {
+            return;
+        }
+        if let Some(kbd) = self.kbd.as_mut() {
+            if ev.param >= kbd.ring.phys && ev.param < kbd.ring.phys + 4096 {
+                // The report itself is not decoded here - this runs inside a disk transfer, and a
+                // keystroke that arrived during a block read can wait for the next tick. What matters
+                // is that the endpoint is marked free so the next poll re-arms it.
+                kbd.pending = false;
+            }
+        }
     }
 }
 
@@ -1709,6 +1766,28 @@ fn parse_config(va: u64) -> Option<(u8, u8, u32, u8, u8)> {
 ///
 /// Every transition is announced. A keyboard that silently stops working is indistinguishable from a
 /// broken driver, and the operator is the one holding the cable.
+pub fn hotplug_poll() {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    // Cheap rate-limit BEFORE claiming, so an idle machine does not take and release the claim a
+    // hundred times a second just to decide it has nothing to do.
+    let hz = super::timer::frequency().max(1);
+    let now = super::read_cycle_counter();
+    let last = HOTPLUG_LAST.load(Ordering::Relaxed);
+    if last != 0 && now.wrapping_sub(last) < hz {
+        return;
+    }
+    if !claim_usb() {
+        return; // the tick or a disk transfer has it; a second from now is fine
+    }
+    // SAFETY: the claim above makes this the only context touching the controller.
+    if let Some(hc) = unsafe { (&raw mut XHCI).as_mut().and_then(|o| o.as_mut()) } {
+        hotplug_tick(hc);
+    }
+    release_usb();
+}
+
 fn hotplug_tick(hc: &mut Xhci) {
     let Some(mut hub) = hc.hub.take() else { return };
 
@@ -1726,6 +1805,7 @@ fn hotplug_tick(hc: &mut Xhci) {
     hc.xfer_ms = 50;
 
     let topo = Topology { root_port: 1, route: 0, tt_slot: 0, tt_port: 0, speed: 0 };
+    let mut announced = false;
     for p in 1..=hub.nports.min(15) {
         let bit = 1u16 << p;
         let (slot, bp, bv) = (hub.slot, hub.buf_phys, hub.buf_va);
@@ -1765,6 +1845,7 @@ fn hotplug_tick(hc: &mut Xhci) {
 
         if was && !now_conn {
             super::console_notice_fmt(format_args!("usb: device REMOVED from hub port {}", p));
+            announced = true;
             stand_down(hc, &mut hub, p);
             hub.connected &= !bit;
             hub.tries[p as usize] = 0; // a fresh set of attempts for whatever arrives next
@@ -1774,13 +1855,21 @@ fn hotplug_tick(hc: &mut Xhci) {
             }
             hub.tries[p as usize] += 1;
             super::console_notice_fmt(format_args!("usb: device ATTACHED to hub port {} - enumerating", p));
+            announced = true;
             hc.xfer_ms = 500; // enumeration is allowed to be slow
             let ok = hc.bring_up_hub_port(&mut hub, topo, p);
             hc.xfer_ms = 50;
             if ok {
                 hub.connected |= bit;
                 hub.tries[p as usize] = 0;
-                super::console_notice_fmt(format_args!("usb: keyboard on hub port {} is ready", p));
+                let what: &[u8] = if hc.disk.as_ref().is_some_and(|d| d.hub_port == p) {
+                    b"disk"
+                } else {
+                    b"keyboard"
+                };
+                super::console_notice_fmt(format_args!(
+                    "usb: {} on hub port {} is ready",
+                    core::str::from_utf8(what).unwrap_or("device"), p));
             } else if hub.tries[p as usize] >= HOTPLUG_MAX_TRIES {
                 crate::kprintln!(
                     "usb: hub port {} device did not come up in {} attempts - leaving it until the \
@@ -1795,6 +1884,18 @@ fn hotplug_tick(hc: &mut Xhci) {
     }
     hc.xfer_ms = 500;
     hc.hub = Some(hub);
+
+    // Give the operator a PROMPT back. Every announcement above scrolls `gsh>` away, and the shell is
+    // blocked in `console_read` with no reason to redraw - so a working machine presents as a dead one,
+    // which is exactly what invariant 12 is about: what the OPERATOR can see. One newline makes the
+    // shell finish an empty line and print a fresh prompt; an empty command runs nothing.
+    //
+    // This grants no authority that was not already there. A keyboard driver can synthesize keystrokes
+    // by definition (the SEC-2 residual, CLAUDE.md §6.4) - which is precisely why it may synthesize the
+    // one that says "you may type now".
+    if announced {
+        super::console_push_byte(b'\n');
+    }
 }
 
 /// Forget the device on a hub port, and give the controller its slot back.
@@ -1805,6 +1906,21 @@ fn hotplug_tick(hc: &mut Xhci) {
 /// are down is now stale.
 fn stand_down(hc: &mut Xhci, hub: &mut Hub, p: u8) {
     let _ = hub;
+
+    // The DISK, if that is what left. Publishing 0 sectors is the load-bearing part: `fs` and the block
+    // driver ask the kernel how big the disk is, and a stale non-zero answer means every later read is
+    // aimed at a device that is no longer there - which fails slowly, one bounded timeout at a time,
+    // instead of saying "no disk".
+    if hc.disk.as_ref().is_some_and(|d| d.hub_port == p) {
+        let slot = hc.disk.as_ref().map(|d| d.slot).unwrap_or(0);
+        hc.disk = None;
+        DISK_SECTORS.store(0, Ordering::Release);
+        hc.command(0, TRB_DISABLE_SLOT, (slot as u32) << 24);
+        super::console_notice_fmt(format_args!(
+            "usb: disk on hub port {} stood down, slot {} released", p, slot));
+        return;
+    }
+
     let Some(k) = hc.kbd.as_ref() else { return };
     if k.hub_port != p {
         return;
@@ -1840,24 +1956,27 @@ pub fn disk_busy() -> bool {
 }
 
 /// Borrow the controller for a disk operation, with the event ring held against the tick.
-fn with_disk<R>(f: impl FnOnce(&mut Xhci) -> R, absent: R) -> R {
+fn with_disk<R>(f: impl FnOnce(&mut Xhci) -> R, absent: R, busy: R) -> R {
     if DISK_SECTORS.load(Ordering::Acquire) == 0 {
         return absent;
     }
-    DISK_IO.store(true, Ordering::Release);
-    // SAFETY: task context on core 0. `DISK_IO` keeps the timer tick's poll out of the controller for
-    // the duration, and this port runs one core, so there is no second task to contend with. A future
-    // SMP port needs a real lock here, not this flag.
+    if !claim_usb() {
+        // Someone is enumerating or sampling the keyboard. BUSY is not a failure - the block driver
+        // retries it - and it is the one answer that does not corrupt the other holder's transfer.
+        DISK_BUSY.store(true, Ordering::Relaxed);
+        return busy;
+    }
+    // SAFETY: the claim above makes this the only context touching the controller.
     let r = unsafe {
         match (&raw mut XHCI).as_mut().and_then(|o| o.as_mut()) {
             Some(hc) => f(hc),
             None => {
-                DISK_IO.store(false, Ordering::Release);
+                release_usb();
                 return absent;
             }
         }
     };
-    DISK_IO.store(false, Ordering::Release);
+    release_usb();
     r
 }
 
@@ -1895,6 +2014,7 @@ pub fn disk_read(lba: u64, dst: &mut [u8]) -> bool {
             }
         },
         false,
+        false,
     )
 }
 
@@ -1931,6 +2051,7 @@ pub fn disk_write(lba: u64, src: &[u8]) -> bool {
             }
         },
         false,
+        false,
     )
 }
 
@@ -1946,6 +2067,7 @@ pub fn disk_flush() -> bool {
             let cmd = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // SYNCHRONIZE CACHE(10)
             matches!(hc.bot(&cmd, 0, false), Some(0))
         },
+        false,
         false,
     )
 }
@@ -1974,10 +2096,10 @@ pub fn poll() {
     if !ACTIVE.load(Ordering::Relaxed) {
         return;
     }
-    // A disk transfer owns the event ring. Popping its completion here would leave the block driver
-    // waiting forever for an event that has been thrown away - see `DISK_IO`. Skipping costs one
-    // keyboard sample, which is 10 ms of typing latency during a disk read and nothing else.
-    if DISK_IO.load(Ordering::Acquire) {
+    // Someone else owns the controller (a disk transfer, or an enumeration in the idle loop). Skipping
+    // costs one keyboard sample - 10 ms of typing latency - and taking it anyway would eat their
+    // completion event. See `USB_CLAIM`.
+    if !claim_usb() {
         return;
     }
     // SAFETY: core 0's timer tick is the only caller after boot, and boot completed before `ACTIVE`
@@ -2032,8 +2154,7 @@ pub fn poll() {
     let _ = got;
     ks.rep.poll(now, super::console_push_byte);
     arm_transfer(hc);
-    // Watch for a cable being pulled or pushed. Rate-limited to one visit a second inside.
-    hotplug_tick(hc);
+    release_usb();
 }
 
 /// Microseconds since boot, from the generic timer.

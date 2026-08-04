@@ -472,9 +472,14 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // reader is not misled; the shell ships no contract, so the kernel is trivially its only record.
         //   nic-driver bridges ethernet frames to/from the in-kernel USB-net device (NetFrame*, 42-44).
         net_device: cfg!(target_arch = "arm") && matches!(name, "nic-driver"),
-        // USB_DISK: on ARM the USB stack is in-kernel, so `block-driver` reaches a USB stick through
-        // syscalls 46-48 rather than MMIO. Whole-device read/write reach, granted to that one service.
-        usb_disk: cfg!(target_arch = "arm") && matches!(name, "block-driver"),
+        // USB_DISK: on BOTH ARM ports the USB stack is in-kernel, so `block-driver` reaches a USB stick
+        // through syscalls 46-48 rather than MMIO. Whole-device read/write reach, granted to that one
+        // service. The Pi 4 needs it for the same reason the Pi 2 does, and needed it here: without the
+        // grant the kernel found a 15 GB stick, the service asked for its capacity, and the syscall
+        // refused with `CapNotHeld` - which surfaced as `drives` reporting a 0 MiB unformatted disk,
+        // three layers from the missing line.
+        usb_disk: cfg!(any(target_arch = "arm", target_arch = "aarch64"))
+            && matches!(name, "block-driver"),
         //   the shell's `gpio` command drives the SoC pins (the gated `Gpio` syscall, 45).
         gpio: cfg!(target_arch = "arm") && matches!(name, "shell"),
         //   SET_CLOCK, in two strengths (rights narrow, §7.4). WRITE = set the wall clock itself, held only

@@ -1704,6 +1704,18 @@ pub mod interrupts {
     }
     #[cfg(feature = "pi4")]
     pub fn wait_for_interrupt() {
+        // Watch the USB hub's ports from HERE, not from the timer tick.
+        //
+        // Enumerating a device takes ~100 ms of port resets, descriptor fetches and - for a USB stick -
+        // SCSI retries while it finishes coming ready. Doing that inside the tick means that long with
+        // interrupts masked, which is not a delay but a **frozen machine**: no scheduling, no console,
+        // no liveness stamp. Unplugging a stick did exactly that. The idle loop is interruptible, so
+        // the tick keeps running underneath and the work simply takes as long as it takes.
+        //
+        // Exclusion is `USB_CLAIM`, not masking - see its comment. Rate-limited to one visit a second
+        // inside, so an idle machine spends nothing here.
+        #[cfg(feature = "pi4")]
+        super::xhci::hotplug_poll();
         // SAFETY: WFI at EL1 is always valid. It returns on any pending interrupt (or spuriously),
         // so every caller must re-check its condition rather than assume a wake means progress.
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };

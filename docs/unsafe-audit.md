@@ -43,6 +43,29 @@ somewhere that names neither the GPU nor the map (§26.7).
 | `arch/aarch64/mailbox.rs` | 3 -> 4 (+1) | `property_call`: copies an arbitrary tag request into this module's 16-byte-aligned static and the reply back out, length-checked against the buffer at both ends. The static rather than the caller's array because the mailbox packs the channel into the low 4 bits of the address it is handed - an arbitrarily-aligned caller buffer would send the message to the wrong channel, so the alignment guarantee stays in one place. |
 | `arch/aarch64/mod.rs` | 53 -> 55 (+2) | The write and the read of `FB_INFO`, the static that carries the geometry across the jump to the high half. A static rather than a local because the jump abandons the low stack along with every local on it - the same reason `memmap::current_map` exists. Single-threaded boot: written once before the jump, read once after. |
 
+## 2026-08-04 - Pi 4: the four hot-plug bugs the hardware found (feat/pi4-aarch64)
+
+Storage and hot-plug both worked at boot and then interacted badly. Four faults, one of them shared:
+
+1. **Unplugging the stick froze the machine.** Enumeration was running in the TIMER TICK, and enumerating
+   a device costs ~100 ms of port resets, descriptor fetches and SCSI retries - all with interrupts
+   masked. It moved to the idle loop, which is interruptible.
+2. **The keyboard died after a disk transfer.** One event ring serves the whole controller, so a disk
+   transfer waiting for its own completion also RECEIVES the keyboard's, and discarded it. `pending`
+   then stayed set forever and no further report was ever queued.
+3. **A disk brought up on one port relabelled the keyboard as being on that port**, so unplugging the
+   stick stood the keyboard down and unplugging the keyboard did nothing.
+4. **`drives` reported 0 MiB** while the kernel had found a 15 GB stick: `block-driver` was never
+   granted `USB_DISK` on aarch64, so the capacity syscall refused with `CapNotHeld`.
+
+Exclusion is now one claim (`USB_CLAIM`) across all three drivers of this hardware - tick, syscall,
+idle - rather than a one-way flag, and holders run with interrupts enabled while everyone else stands
+aside. The disk answers BUSY, which the block driver already retries.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | 34 -> 35 (+1) | `hotplug_poll` borrowing the controller from the idle loop, under the claim that makes it the only context touching it. |
+
 ## 2026-08-04 - Pi 4: USB mass storage (feat/pi4-aarch64)
 
 Storage on the Pi 4 is the **USB stick, never the SD card**. The board has one SD slot and boots from
@@ -1795,7 +1818,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/aarch64/video.rs | 2 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
-| arch/aarch64/xhci.rs | 34 | permitted |
+| arch/aarch64/xhci.rs | 35 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
