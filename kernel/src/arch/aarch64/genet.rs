@@ -38,6 +38,18 @@ const GENET_BASE: u64 = 0xFD58_0000;
 const GENET_SYS_OFF: u64 = 0x0000;
 /// `SYS_PORT_CTRL`, which selects the interface the MAC drives. The Pi 4 has an external gigabit PHY.
 const SYS_PORT_CTRL: u64 = GENET_SYS_OFF + 0x04;
+/// `SYS_RBUF_FLUSH_CTRL`. This register holds a `umac_sw_rst` bit, and **the part powers up with that
+/// bit set** - Linux clears it as the first action of `reset_umac`, under the comment "7358a0/7552a0:
+/// bad default in RBUF_FLUSH_CTRL.umac_sw_rst".
+///
+/// While it is set the MAC is held in software reset and `UMAC_CMD` silently discards every write,
+/// reading back zero forever. MDIO keeps working throughout, because it is clocked separately - so the
+/// failure looks like "the MAC is fine but refuses to receive" rather than "the MAC is in reset". That
+/// combination cost several boots here; the register is worth its comment.
+///
+/// Note this is in the **SYS** block on GENET v2 and later, not the RBUF block whose name it carries -
+/// `bcmgenet_rbuf_ctrl_set` only writes `RBUF_FLUSH_CTRL_V1` on v1 silicon.
+const SYS_RBUF_FLUSH_CTRL: u64 = GENET_SYS_OFF + 0x08;
 const PORT_MODE_EXT_GPHY: u32 = 3;
 #[allow(dead_code)]
 const GENET_EXT_OFF: u64 = 0x0080;
@@ -223,11 +235,28 @@ fn mdio(phy: u32, reg_num: u32, write: Option<u16>) -> Option<u16> {
 /// The reset bit is **self-clearing and must be given time**; Linux writes it, waits, then clears the
 /// command register outright. Leaving TX or RX enabled through a reset is how a MAC comes back still
 /// holding half a frame.
-fn umac_reset() {
+fn umac_reset() -> bool {
+    // Release the MAC from the software reset the part powers up holding it in. Until this lands,
+    // every write below is discarded and the MAC never receives a thing. See SYS_RBUF_FLUSH_CTRL.
+    wr(SYS_RBUF_FLUSH_CTRL, 0);
+    delay_us(10);
+
     wr(UMAC_CMD, CMD_SW_RESET);
     delay_us(10);
     wr(UMAC_CMD, 0);
     delay_us(10);
+
+    // Prove the release worked rather than trusting it. A register that cannot hold a bit is the exact
+    // failure this function exists to clear, and it is invisible until frames fail to arrive much later.
+    // Writing a bit that is harmless on its own (pause-ignore, with TX and RX still disabled) turns a
+    // silent dead MAC into a loud one here, at the point the cause is still obvious.
+    wr(UMAC_CMD, CMD_RX_PAUSE_IGNORE);
+    if rd(UMAC_CMD) & CMD_RX_PAUSE_IGNORE == 0 {
+        put_str(b"genet: UMAC_CMD will not hold a write - the MAC is still held in reset\r\n");
+        return false;
+    }
+    wr(UMAC_CMD, 0);
+    true
 }
 
 /// Program the station address the MAC filters on.
@@ -253,7 +282,9 @@ pub fn umac_init(mac: [u8; 6]) -> Option<u32> {
     // something that is not on this board.
     wr(SYS_PORT_CTRL, PORT_MODE_EXT_GPHY);
 
-    umac_reset();
+    if !umac_reset() {
+        return None;
+    }
     wr(UMAC_MAX_FRAME_LEN, MAX_FRAME);
     set_mac_address(mac);
 
@@ -636,6 +667,12 @@ pub fn enable_rx() -> bool {
     // Only now let the MAC accept frames. RX_EN before the ring is running is a receiver with nowhere
     // to put what it takes.
     wr(UMAC_CMD, rd(UMAC_CMD) | CMD_RX_EN);
+    if rd(UMAC_CMD) & CMD_RX_EN == 0 {
+        wr(dma_reg(RDMA_OFFSET, DMA_CTRL), 0);
+        wr(dma_reg(RDMA_OFFSET, DMA_RING_CFG), 0);
+        put_str(b"genet: RX_EN would not set - the MAC is not accepting frames, backed out\r\n");
+        return false;
+    }
     put_str(b"genet: receive ENABLED - waiting for a frame\r\n");
     true
 }
