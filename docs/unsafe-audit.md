@@ -43,6 +43,33 @@ somewhere that names neither the GPU nor the map (§26.7).
 | `arch/aarch64/mailbox.rs` | 3 -> 4 (+1) | `property_call`: copies an arbitrary tag request into this module's 16-byte-aligned static and the reply back out, length-checked against the buffer at both ends. The static rather than the caller's array because the mailbox packs the channel into the low 4 bits of the address it is handed - an arbitrarily-aligned caller buffer would send the message to the wrong channel, so the alignment guarantee stays in one place. |
 | `arch/aarch64/mod.rs` | 53 -> 55 (+2) | The write and the read of `FB_INFO`, the static that carries the geometry across the jump to the high half. A static rather than a local because the jump abandons the low stack along with every local on it - the same reason `memmap::current_map` exists. Single-threaded boot: written once before the jump, read once after. |
 
+## 2026-08-04 - Pi 4 SMP: two real bugs found by reading the 32-bit port (feat/pi4-aarch64)
+
+Still gated off and still not reliable (one boot in five reaches a shell), but two genuine defects were
+found, and the second only because the working port was compared against rather than reasoned from.
+
+**The flag the secondaries poll was never cleaned to memory.** The boot core stores it through a
+cacheable mapping; a parked core reads it with translation and caches OFF, straight out of physical
+memory. Nothing forces the line out, so whether the cores ever started depended on when the cache
+happened to evict it. The spin-table write two lines away already did this - the same lesson applied to
+one of the two places it applies to. With the clean, three of three check in on every boot.
+
+**`get_lapic_id` returned a hardcoded 0.** The neutral `scheduler::current_core_id` is built on it, so
+the moment the other cores came up, every one of them believed it was core 0 - four cores sharing one
+run queue, one scheduler context, one set of per-core state. With a single core it was indistinguishable
+from correct, which is why it survived twenty-odd milestones. The 32-bit port has always returned
+`mpidr & 3` there.
+
+Also learned by comparison and worth recording: the 32-bit port runs four cores with **both IPI senders
+still empty stubs**. Cross-core IPIs are a latency improvement, not a correctness requirement - every
+core ticks on its own timer and picks up work then. The SGI path added here is therefore a nicety, and
+the remaining flakiness is somewhere else.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/gic.rs` | 5 -> 6 (+1) | `send_sgi`: the distributor's SGI register. Writing it raises an interrupt on the targeted cores and does nothing else. |
+| `arch/aarch64/mod.rs` | 64 -> 65 (+1) | `get_lapic_id`: an `MPIDR_EL1` read, side-effect free. |
+
 ## 2026-08-04 - Pi 4: secondary cores, behind a feature and NOT working yet (feat/pi4-aarch64)
 
 `pi4-smp` releases the other three cores. It is **gated off and it is not finished**: one QEMU boot
@@ -1865,7 +1892,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 64 | permitted |
+| arch/aarch64/mod.rs | 65 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/sched_spawn.rs | 2 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
@@ -1874,7 +1901,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
-| arch/aarch64/gic.rs | 5 | permitted |
+| arch/aarch64/gic.rs | 6 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 17 | permitted |
 | arch/aarch64/ptables.rs | 20 | permitted |

@@ -29,6 +29,43 @@ const GICD_ISENABLER: *mut u32 = (GICD + 0x100) as *mut u32; // 1 bit per interr
 const GICD_IPRIORITYR: *mut u8 = (GICD + 0x400) as *mut u8; // 1 byte per interrupt
 const GICD_ITARGETSR: *mut u8 = (GICD + 0x800) as *mut u8; // 1 byte per interrupt (CPU mask)
 
+/// Software Generated Interrupt register - how one core interrupts another.
+const GICD_SGIR: *mut u32 = (GICD + 0xF00) as *mut u32;
+
+/// The SGI IDs this kernel uses. IDs 0..15 are the only ones a core may send to another core, so the
+/// neutral layer's x86-style vector numbers (0xF0, 0xF1, 0xF2) have to be mapped into that range
+/// rather than sent as-is - a vector of 0xF0 written into a 4-bit field is 0, which is a different
+/// interrupt entirely and would silently deliver the wrong thing.
+pub const SGI_WAKE: u32 = 0;
+pub const SGI_TLB: u32 = 1;
+pub const SGI_TICK: u32 = 2;
+
+/// Send a Software Generated Interrupt to one core, or to every core but this one.
+///
+/// This is the AArch64 equivalent of the x86 IPI the neutral scheduler already depends on, and its
+/// absence is not a missing optimisation: a task blocking on one core is woken by another core sending
+/// exactly this. With the send a no-op, the wake never arrives, and the machine deadlocks the moment
+/// services are placed on more than one core - which is precisely what happens when the other three
+/// come up.
+pub fn send_sgi(target: SgiTarget, id: u32) {
+    let word = match target {
+        SgiTarget::Core(c) => ((1u32 << (c & 0x7)) << 16) | (id & 0xF),
+        // Filter 0b01 = "every core except the one sending", so no target list is needed.
+        SgiTarget::AllButSelf => (0b01 << 24) | (id & 0xF),
+    };
+    // SAFETY: the distributor's SGI register, Device-mapped. Writing it raises an interrupt on the
+    // targeted cores and does nothing else.
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack));
+        GICD_SGIR.write_volatile(word);
+    }
+}
+
+pub enum SgiTarget {
+    Core(u32),
+    AllButSelf,
+}
+
 // CPU interface registers.
 const GICC_CTLR: *mut u32 = GICC as *mut u32;
 const GICC_PMR: *mut u32 = (GICC + 0x004) as *mut u32; // priority mask

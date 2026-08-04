@@ -127,8 +127,21 @@ pub fn start_secondaries() -> usize {
     // see it set by the time the release below reaches them. Either way it is set before anything can
     // enable an MMU against a table that does not exist yet.
     AP_TABLES_READY.store(1, Ordering::Release);
-    // SAFETY: `sev` only wakes cores waiting on an event.
-    unsafe { core::arch::asm!("dsb sy", "sev", options(nostack)) };
+    // **Clean the flag to memory, because the cores reading it have their caches OFF.**
+    //
+    // This store goes through the boot core's cacheable high mapping. A parked secondary polls the same
+    // location with translation and caches disabled, so it reads physical memory directly - and a write
+    // sitting in the boot core's D-cache is invisible to it. Nothing forces that line out, so whether
+    // the secondaries ever start depends on when the cache happens to evict it: sometimes all three come
+    // up, sometimes none do, from the same image. That intermittency was the whole bug.
+    //
+    // The spin-table write a few lines below already did this. Doing it there and not here is the same
+    // lesson applied to one of the two places it applies to.
+    // SAFETY: cache maintenance over this module's own static, then `sev` to re-check the poll.
+    unsafe {
+        super::mmu::dma_sync((&raw const AP_TABLES_READY) as u64, 4);
+        core::arch::asm!("dsb sy", "sev", options(nostack));
+    }
 
     let entry = ap_entry_phys();
     put_str(b"smp: releasing 3 secondary core(s), entry at ");

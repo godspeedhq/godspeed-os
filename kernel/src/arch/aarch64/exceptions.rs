@@ -333,6 +333,16 @@ extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
     if id == super::gic::SPURIOUS {
         return; // nothing pending - do NOT EOI an ID that was never raised
     }
+    // IDs 0..15 are Software Generated Interrupts - one core waking another. Acknowledging and retiring
+    // them is the whole job: the wake's PURPOSE is to make this core leave `wfi` and re-enter the
+    // scheduler, which it does on the way out of this handler. There is no per-vector work to do, which
+    // is exactly why the 32-bit port runs four cores with its IPI senders still stubbed - every core
+    // ticks on its own timer and picks up work then, so an IPI is a latency improvement rather than a
+    // correctness requirement.
+    if id < 16 {
+        super::gic::eoi(id);
+        return;
+    }
     if id == super::timer::TIMER_PPI {
         TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // Re-arm: the generic timer is one-shot, so a periodic tick means reloading it every time.

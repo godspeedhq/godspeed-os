@@ -73,6 +73,20 @@ pub fn booted_at_el3() -> bool {
     unsafe { ENTRY_EL >= 3 }
 }
 
+/// Map a neutral IPI vector onto the GIC's 4-bit SGI id space.
+///
+/// The neutral layer names its IPIs with x86 vector numbers (0xF0..0xF2). An SGI id is four bits, so
+/// writing a vector straight into that field truncates 0xF0 to 0 - a different interrupt, delivered
+/// silently. The mapping is explicit for that reason.
+#[cfg(feature = "pi4")]
+pub fn vector_to_sgi(vector: u8) -> u32 {
+    match vector {
+        crate::smp::ipi::vectors::TLB_SHOOTDOWN => gic::SGI_TLB,
+        crate::smp::ipi::vectors::SCHEDULER_TICK => gic::SGI_TICK,
+        _ => gic::SGI_WAKE,
+    }
+}
+
 /// Framebuffer geometry, obtained before the MMU and consumed after the jump to the high half.
 ///
 /// A static rather than a local because the jump abandons the low stack along with every local on it -
@@ -1524,9 +1538,40 @@ pub mod boot {
     pub fn tsc_ticks_per_quantum() -> u64 { 0 }
     pub unsafe fn rearm_tsc_deadline() {}
     pub unsafe fn apic_send_eoi() {}
-    pub unsafe fn get_lapic_id() -> u32 { 0 }
-    pub unsafe fn send_ipi_to_lapic(lapic_id: u32, vector: u8) {}
-    pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {}
+    /// Which core is executing this.
+    ///
+    /// **This returned a hardcoded 0**, and with one core that was indistinguishable from correct. The
+    /// neutral `scheduler::current_core_id` is built on it, so the moment the other three cores came up
+    /// every one of them believed it was core 0: four cores sharing one run queue, one scheduler
+    /// context and one set of per-core state. The symptom was an intermittent hang during boot, which
+    /// is what that race looks like from outside.
+    ///
+    /// The 32-bit port has always returned `mpidr & 3` here. Comparing the two ports is what found this
+    /// - the missing piece was never SMP-specific machinery, it was a stub that only one core could
+    /// make look right.
+    ///
+    /// # Safety
+    /// A side-effect-free system-register read.
+    pub unsafe fn get_lapic_id() -> u32 {
+        let m: u64;
+        // SAFETY: reading MPIDR_EL1 at EL1 is side-effect free.
+        unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) m, options(nomem, nostack)) };
+        (m & 0xFF) as u32
+    }
+    /// Wake another core. The neutral layer speaks in x86 vector numbers; the GIC speaks in 4-bit SGI
+    /// ids, so they are mapped rather than passed through - see `gic::SGI_WAKE`.
+    ///
+    /// # Safety
+    /// Raises an interrupt on the target core and nothing else.
+    pub unsafe fn send_ipi_to_lapic(lapic_id: u32, vector: u8) {
+        super::gic::send_sgi(super::gic::SgiTarget::Core(lapic_id), super::vector_to_sgi(vector));
+    }
+
+    /// # Safety
+    /// As above, for every core but this one.
+    pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {
+        super::gic::send_sgi(super::gic::SgiTarget::AllButSelf, super::vector_to_sgi(vector));
+    }
     pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {}
 }
 
