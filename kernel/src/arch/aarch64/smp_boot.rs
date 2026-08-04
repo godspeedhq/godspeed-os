@@ -241,6 +241,27 @@ pub unsafe extern "C" fn ap_entry() -> ! {
         "lsr  x0, x0, #2",
         "cmp  x0, #2",
         "b.ne 4f",
+        // **Join the coherency domain, at EL2, before the drop and before any cache is enabled.**
+        //
+        // On the Cortex-A72 a core's data cache does not participate in coherency until
+        // `CPUECTLR_EL1.SMPEN` is set. Until then a secondary reads its own cached copy and another
+        // core's stores are invisible to it - which is exactly what the board reported: all three
+        // secondaries reached the park and not one ever observed `AP_GO`.
+        //
+        // **It has to be written from EL2, not EL1.** Despite the `_EL1` name the register is an
+        // IMPLEMENTATION-DEFINED control that a higher exception level must grant access to, and the
+        // stock armstub does not. Writing it after the drop traps - and a secondary has no vectors
+        // installed yet, so the trap is silent death. That is measurable rather than argued: with the
+        // write at EL1 the progress array went from `0111` (parked, never released) to `0000` (never
+        // arrived at all), which is the signature of dying earlier, not of a coherency fix.
+        //
+        // The 32-bit port sets the equivalent `ACTLR` bit 6 on each secondary "before caches/MMU" for
+        // the identical reason; it has no exception levels to get wrong, which is the one part of this
+        // that does not carry across.
+        "mrs  x0, S3_1_c15_c2_1",
+        "orr  x0, x0, #(1 << 6)",
+        "msr  S3_1_c15_c2_1, x0",
+        "isb",
         "mov  x0, #(1 << 31)",
         "msr  hcr_el2, x0",
         "mrs  x0, cnthctl_el2",
@@ -260,30 +281,7 @@ pub unsafe extern "C" fn ap_entry() -> ! {
         "mov  x0, #(3 << 20)",
         "msr  cpacr_el1, x0",
         "isb",
-        // **Join the coherency domain, BEFORE any cache is enabled.**
-        //
-        // On the Cortex-A72 a core's data cache does not participate in coherency until
-        // `CPUECTLR_EL1.SMPEN` is set. Without it a secondary reads its own cached copy of memory and
-        // never sees another core's writes - which is exactly what the board reported: all three
-        // secondaries reached the park (`progress = 0111`) and not one of them ever observed `AP_GO`,
-        // while the boot core had set it and moved on.
-        //
-        // The boot core does not need this done here because the firmware sets it before handing over;
-        // a core released from the spin table gets no such favour. QEMU models coherency
-        // unconditionally, so this is invisible there - four cores worked on the emulator through every
-        // iteration of this bug.
-        //
-        // This is not a guess about the A72: the 32-bit port does the identical thing for the identical
-        // reason, and says so - `ACTLR` bit 6 on the Cortex-A7, set on each secondary "before
-        // caches/MMU", with the comment "coherency + exclusives for shareable memory". Same bit
-        // position, same ordering rule, one architecture along. Reading that is what turned this from a
-        // hypothesis into a citation.
-        //
-        // Set with the MMU still off, so there are no stale cached lines to reconcile afterwards.
-        "mrs  x0, S3_1_c15_c2_1",
-        "orr  x0, x0, #(1 << 6)",
-        "msr  S3_1_c15_c2_1, x0",
-        "isb",
+
         // Stack: AP_STACKS[core - 1], top down. Computed PC-relative so it is a physical address, which
         // is what this core can use until its MMU is on.
         "mrs  x1, mpidr_el1",
