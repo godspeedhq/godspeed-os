@@ -167,6 +167,10 @@ pub fn start_secondaries() -> usize {
 /// Let the parked secondaries enter the scheduler. Called once the per-core arenas exist.
 pub fn release_secondaries() {
     AP_GO.store(1, Ordering::Release);
+    // Clean it to memory as well, for the same reason `AP_TABLES_READY` is cleaned: a secondary that is
+    // not snooping cannot see this store while it sits in this core's cache.
+    // SAFETY: cache maintenance over this module's own static.
+    unsafe { super::mmu::dma_sync((&raw const AP_GO) as u64, 4) };
     // The parked cores are in a `wfe` loop, so they need an event to look again.
     // SAFETY: `sev` is always valid; it only wakes cores waiting on an event.
     unsafe { core::arch::asm!("sev", options(nostack)) };
@@ -358,9 +362,23 @@ extern "C" fn ap_high_entry() -> ! {
     // it takes to turn "one core is in the scheduler" into "core 2 stopped between the park and
     // `mark_ready`".
     AP_PROGRESS[core_id as usize & 3].store(1, Ordering::Release); // reached the park
+    // **Invalidate before every read, because this core may not be snooping.**
+    //
+    // The evidence is an asymmetry: this core's writes reach the boot core (the progress array reads
+    // back `111`), while the boot core's write to `AP_GO` never reaches this one. That is what a core
+    // outside the coherency domain looks like - its stores drain to memory, its loads keep hitting a
+    // cached copy taken before the other core wrote.
+    //
+    // `AP_TABLES_READY`, two flags away, already had exactly this problem and was fixed by cleaning it
+    // to memory. Applying that to one of the two flags and not the other is the third time this session
+    // I have fixed one instance of a thing rather than the class.
     while AP_GO.load(Ordering::Acquire) == 0 {
-        // SAFETY: `wfe` waits for the `sev` in `release_secondaries`. Spurious wakes just re-check.
-        unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
+        // SAFETY: cache maintenance over this module's own static, then `wfe` for the `sev` in
+        // `release_secondaries`. Spurious wakes just re-check.
+        unsafe {
+            super::mmu::dma_sync((&raw const AP_GO) as u64, 4);
+            core::arch::asm!("wfe", options(nomem, nostack));
+        }
     }
     AP_PROGRESS[core_id as usize & 3].store(2, Ordering::Release); // left the park
 
