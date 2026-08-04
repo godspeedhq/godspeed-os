@@ -13,6 +13,33 @@ comment.
 
 ---
 
+## 2026-08-04 - Pi 4 milestone 19: serial input (feat/pi4-aarch64)
+
+Nothing on this port had read input before; output has been one-way since milestone 1, which is why
+there is still no prompt. The PL011 receive FIFO now drains into a ring the neutral `ConsoleRead` path
+pops from, driven both by the timer tick and directly by a blocked reader (a starved ISR would
+otherwise leave a byte stranded in the FIFO with a reader asleep waiting for it).
+
+**The 32-bit port's hard-won lesson is inherited rather than rediscovered:** the PL011 reports receive
+errors in the SAME read as the data, in `DR` bits 11:8. Masking them off - the obvious thing to write -
+silently promotes line noise to input. On the Pi 2 a GPIO HAT held RX low, which the PL011 reports as a
+continuous break; each one enqueued a spurious `0x00`, the ring filled with nulls, and a full-screen
+editor blocked on `ConsoleRead` repainted 966 times while the document changed twice. Flagged bytes are
+discarded here from the outset.
+
+A persistently overflowing line is switched off (`RXE` cleared, output untouched, latching until
+reboot) after a **duration** of unbroken overflow rather than a byte count - a count is not a measure of
+how long a condition has persisted, and choosing one is how you get a threshold that either fires on a
+fast typist or never fires at all.
+
+Proven by feeding characters in: `gsh test 123` echoed back, 12 of 12, in order, with the logger service
+still running alongside.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/uart_rx.rs` | new, 2 | The bounded FIFO drain (volatile PL011 reads plus the error-clear write) and the ring `pop`, whose slot the producer published with a Release store. |
+| `arch/aarch64/sched_spawn.rs` | 0 -> 2 (+2) | The echo task's stack and context - the only way to prove serial input end to end short of a shell, which cannot exist until this does. |
+
 ## 2026-08-04 - Pi 4: the SAME cache bug, in the loader this time (feat/pi4-aarch64)
 
 The fix below was applied to the two hand-written payload copies and **not to the ELF loader** - even
@@ -1572,6 +1599,8 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 |---|---|---|
 | arch/aarch64/mod.rs | 53 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
+| arch/aarch64/sched_spawn.rs | 2 | permitted |
+| arch/aarch64/uart_rx.rs | 2 | permitted |
 | arch/aarch64/exceptions.rs | 10 | permitted |
 | arch/aarch64/uaccess.rs | 5 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |

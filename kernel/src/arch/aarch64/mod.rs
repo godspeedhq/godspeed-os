@@ -36,6 +36,8 @@ pub mod sched_user;
 #[cfg(feature = "pi4")]
 pub mod timer;
 #[cfg(feature = "pi4")]
+pub mod uart_rx;
+#[cfg(feature = "pi4")]
 pub mod uaccess;
 #[cfg(feature = "pi4")]
 pub mod usermode;
@@ -101,6 +103,12 @@ const PL011_DR: *mut u8 = PL011_BASE as *mut u8;
 /// Flag register (+0x18). Bit 5 = TXFF (transmit FIFO full), bit 3 = BUSY.
 const PL011_FR: *const u32 = (PL011_BASE + 0x18) as *const u32;
 const PL011_FR_TXFF: u32 = 1 << 5;
+/// Receive FIFO empty. Bit 4 of the flag register.
+#[cfg(feature = "pi4")]
+const PL011_FR_RXFE: u32 = 1 << 4;
+/// Error clear register (+0x04). Any write clears the sticky receive-error status.
+#[cfg(feature = "pi4")]
+const PL011_ECR: *mut u32 = (PL011_BASE + 0x04) as *mut u32;
 #[cfg(feature = "pi4")]
 const PL011_FR_BUSY: u32 = 1 << 3;
 #[cfg(feature = "pi4")]
@@ -997,8 +1005,22 @@ pub fn set_input_ready() {}
 pub fn input_ready() -> bool { false }
 pub fn com2_init() {}
 pub fn com2_try_read_byte() -> Option<u8> { None }
+/// Serial input. Real bodies in `uart_rx`, which is where the reasoning about a misbehaving line lives.
+#[cfg(feature = "pi4")]
+pub fn uart_rx_pop() -> Option<u8> { uart_rx::pop() }
+/// Called from the core-0 timer tick, every 10 ms.
+#[cfg(feature = "pi4")]
+pub fn uart_rx_poll() { uart_rx::drain() }
+/// Called directly by a blocked console reader: a timer ISR starved under load would otherwise leave a
+/// byte stranded in the FIFO with a reader asleep waiting for it.
+#[cfg(feature = "pi4")]
+pub fn uart_rx_drain_now() { uart_rx::drain() }
+
+#[cfg(not(feature = "pi4"))]
 pub fn uart_rx_pop() -> Option<u8> { None }
+#[cfg(not(feature = "pi4"))]
 pub fn uart_rx_poll() {}
+#[cfg(not(feature = "pi4"))]
 pub fn uart_rx_drain_now() {}
 
 pub static CONSOLE_READ_WAITER: AtomicU32 = AtomicU32::new(u32::MAX);

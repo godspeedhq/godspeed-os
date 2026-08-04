@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-18 ALL done on real hardware - a REAL SERVICE RUNS (2026-08-04)
+> ## STATUS: milestones 1-18 done on real hardware; 19 (serial INPUT) in QEMU (2026-08-04)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -482,7 +482,28 @@
 > a silent hook is how this shipped once already. With both fixes the board runs it clean: one spawn,
 > slot 0, `logger: ready`, no faults.
 >
-> **Not done:** `arch::init` + the `kernel_main` handoff, UART RX, PSCI SMP.
+> **Milestone 19 - serial INPUT.** Output has been one-way since milestone 1; this is the first time the
+> port can be typed at, and the shell cannot exist until it can. The PL011 receive FIFO drains into a
+> ring the neutral `ConsoleRead` path pops from, driven both by the timer tick and directly by a blocked
+> reader (a starved ISR would otherwise strand a byte in the FIFO with a reader asleep waiting for it).
+>
+> ```
+> aarch64: serial RX ready - 256 byte ring, PL011 error bits discarded (DR[11:8]), ...
+> echo: got 'g' (total 1) ... "gsh test 123" - 12 of 12, in order
+> ```
+>
+> **The 32-bit port's lesson is inherited, not rediscovered:** the PL011 reports receive errors in the
+> SAME read as the data (`DR` bits 11:8), so masking them off silently promotes line noise to input. On
+> the Pi 2 a GPIO HAT held RX low - a continuous break - and each one enqueued a spurious `0x00` until a
+> full-screen editor repainted 966 times while the document changed twice. Flagged bytes are discarded
+> here from the outset.
+>
+> A persistently overflowing line is switched off after a **duration** of unbroken overflow, not a byte
+> count: a count does not measure how long a condition has persisted, and choosing one is how you get a
+> threshold that either fires on a fast typist or never fires at all.
+>
+> **Not done:** `arch::init` + the `kernel_main` handoff, PSCI SMP, and the remaining ladder to a
+> prompt - `ping`/`pong` IPC, the supervisor, the shell.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
 > init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already
