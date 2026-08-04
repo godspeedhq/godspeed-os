@@ -872,7 +872,10 @@ extern "C" fn boot_high() -> ! {
             // A locally-administered address derived from the board serial would be better; the Pi's
             // real MAC comes from the firmware and reading it is its own step. Fixed for now, and
             // flagged, because a hardcoded MAC is exactly the kind of placeholder that quietly ships.
-            genet::umac_init([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+            if genet::umac_init([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).is_some() {
+                // Prove the DMA block bases before anything hands the controller a buffer.
+                genet::verify_dma_layout();
+            }
         }
 
         // The whole USB bring-up runs inside the probe window, not just the PCIe half. A read that does

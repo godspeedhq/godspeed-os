@@ -361,3 +361,91 @@ const DMA_TX_QTAG_SHIFT: u32 = 7;
 const DMA_EN: u32 = 1 << 0;
 #[allow(dead_code)]
 const DMA_RING_BUF_EN_SHIFT: u32 = 1;
+
+// --- Ring register map, and proving the base addresses before trusting them ---------------------
+
+/// Per-ring register offsets, verified from Linux's `genet_dma_ring_regs_v4` table (v4 and v5 share
+/// it). A ring's register address is `block_base + index * DMA_RING_SIZE + reg`.
+const DMA_RING_BUF_SIZE: u64 = 0x10;
+const DMA_START_ADDR: u64 = 0x14;
+const DMA_END_ADDR: u64 = 0x1C;
+const TDMA_PROD_INDEX: u64 = 0x0C;
+const RDMA_CONS_INDEX: u64 = 0x08;
+#[allow(dead_code)]
+const DMA_MBUF_DONE_THRESH: u64 = 0x24;
+
+/// The RX and TX DMA block bases for GENET v4/v5.
+///
+/// **These are the one thing in this file not confirmed from source in the session that wrote it.**
+/// They come from `bcmgenet_hw_params`, which two attempts to extract did not surface, and this driver
+/// has already been bitten twice by an address recalled rather than read (`UMAC_MDIO_CMD`, and the PCIe
+/// `BASE_LIMIT` field order before it).
+///
+/// So they are treated as a HYPOTHESIS the hardware gets to refute. [`verify_dma_base`] writes a known
+/// pattern to a ring register, reads it back, and restores it - and **nothing enables DMA unless that
+/// readback matches**. A wrong base then costs a printed line instead of a controller writing frames
+/// into whatever lives at that address, which on a board with no IOMMU is the whole of memory.
+const RDMA_OFFSET: u64 = 0x2000;
+const TDMA_OFFSET: u64 = 0x4000;
+
+/// Address of one ring register.
+fn ring_reg(block: u64, index: u64, reg: u64) -> u64 {
+    block + index * DMA_RING_SIZE + reg
+}
+
+/// Does this block base actually address a DMA ring?
+///
+/// Writes a pattern to a harmless ring register (the start address of a ring nothing has enabled),
+/// reads it back, and restores whatever was there. A base that points at the wrong block reads back
+/// something other than what was written - or reads back zero, which is the common case for a register
+/// that is not there at all.
+///
+/// This is the check the MDIO offset did not have. `0x614` produced a clean `0x0` with every error bit
+/// clear, and there was nothing to catch it because a read alone cannot tell a wrong address from a
+/// register that legitimately holds zero. A WRITE-then-read can.
+fn verify_dma_base(block: u64, name: &[u8]) -> bool {
+    // Ring 0's start address. Nothing is enabled yet, so scribbling here disturbs nothing.
+    let addr = ring_reg(block, 0, DMA_START_ADDR);
+    let saved = rd(addr);
+    const PATTERN: u32 = 0x0000_5A5A;
+    wr(addr, PATTERN);
+    let got = rd(addr);
+    wr(addr, saved);
+    if got != PATTERN {
+        put_str(b"genet: ");
+        put_str(name);
+        put_str(b" base does not behave like a DMA ring (wrote 0x5a5a, read ");
+        put_hex(got as u64);
+        put_str(b") - NOT enabling DMA\r\n");
+        return false;
+    }
+    true
+}
+
+/// Prove the DMA block bases on this hardware, without enabling anything.
+///
+/// The milestone deliberately stops at proof. Ring setup tells the controller where to WRITE into
+/// system memory, so the address has to be established before a single buffer is handed over - and
+/// establishing it is a self-contained thing that one boot can answer.
+pub fn verify_dma_layout() -> bool {
+    let rx_ok = verify_dma_base(RDMA_OFFSET, b"RDMA");
+    let tx_ok = verify_dma_base(TDMA_OFFSET, b"TDMA");
+    if rx_ok && tx_ok {
+        put_str(b"genet: DMA ring registers respond at RDMA 0x2000 / TDMA 0x4000 - bases confirmed\r\n");
+    }
+    // Leave both blocks disabled either way. Nothing here has given the controller a buffer, and a
+    // controller enabled without one is a device writing to whatever its registers happen to hold.
+    rx_ok && tx_ok
+}
+
+/// The ring geometry the next stage will program, kept here so the readback above and the setup below
+/// cannot drift apart. Unused until frames are wired up.
+#[allow(dead_code)]
+fn describe_ring(block: u64, index: u64) -> (u64, u64, u64, u64) {
+    (
+        ring_reg(block, index, DMA_RING_BUF_SIZE),
+        ring_reg(block, index, DMA_START_ADDR),
+        ring_reg(block, index, DMA_END_ADDR),
+        ring_reg(block, index, if block == TDMA_OFFSET { TDMA_PROD_INDEX } else { RDMA_CONS_INDEX }),
+    )
+}
