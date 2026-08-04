@@ -676,7 +676,13 @@ impl Xhci {
         if self.csz64 { 64 } else { 32 }
     }
 
+    /// Bring up whatever is on a ROOT port. See [`Topology`] for why anything deeper needs more.
     fn setup_device(&mut self, port: u8) -> bool {
+        self.setup_at(Topology { root_port: port, route: 0, tt_slot: 0, tt_port: 0, speed: 0 })
+    }
+
+    fn setup_at(&mut self, topo: Topology) -> bool {
+        let port = topo.root_port;
         let (code, slot) = match self.command(0, TRB_ENABLE_SLOT, 0) {
             Some(v) => v,
             None => return false,
@@ -702,7 +708,13 @@ impl Xhci {
         let slot_ctx = in_va + cs; // input control context comes first
         let ep0_ctx = in_va + cs * 2;
 
-        let speed = (rd32(self.portsc(port)) >> 10) & 0xF;
+        // A device behind a hub has already had its speed reported BY that hub; only a root-port device
+        // reads it from PORTSC, which sees the hub rather than what is plugged into it.
+        let speed = if topo.route == 0 {
+            (rd32(self.portsc(port)) >> 10) & 0xF
+        } else {
+            topo.speed
+        };
         let mps0 = default_max_packet(speed);
         put_str(b"xhci: slot ");
         put_dec(slot as u64);
@@ -717,9 +729,16 @@ impl Xhci {
         unsafe {
             // Input control: add context flags for slot (bit 0) and EP0 (bit 1).
             ((in_va + 4) as *mut u32).write_volatile(0b11);
-            // Slot: context entries = 1, speed, root hub port number.
-            ((slot_ctx) as *mut u32).write_volatile((1 << 27) | (speed << 20));
+            // Slot: context entries = 1, speed, route string, root hub port number, and the
+            // transaction translator that reaches a slow device behind a fast hub.
+            ((slot_ctx) as *mut u32)
+                .write_volatile((1 << 27) | (speed << 20) | (topo.route & 0xF_FFFF));
             ((slot_ctx + 4) as *mut u32).write_volatile((port as u32) << 16);
+            if topo.tt_slot != 0 {
+                // tt_info: TT hub slot id in bits 7:0, TT port number in bits 15:8.
+                ((slot_ctx + 8) as *mut u32)
+                    .write_volatile((topo.tt_slot as u32) | ((topo.tt_port as u32) << 8));
+            }
             // EP0: Control endpoint (type 4), CErr 3, max packet size, dequeue pointer + DCS.
             ((ep0_ctx + 4) as *mut u32).write_volatile((4 << 3) | (3 << 1) | (mps0 << 16));
             ((ep0_ctx + 8) as *mut u64).write_volatile(ep0.phys | 1);
@@ -741,15 +760,56 @@ impl Xhci {
         put_dec(slot as u64);
         put_str(b"\r\n");
 
+        // The DEVICE descriptor first. It is not needed to configure anything - the configuration
+        // descriptor carries the endpoint - but it is the only thing that says WHAT this is, and
+        // "device is not a HID boot keyboard" is a useless sentence when the device might equally be a
+        // hub, a composite device, or a successful transfer that delivered nothing.
+        if !self.get_descriptor(slot, &mut ep0, 0x0100, 18, buf_phys, buf_va) {
+            put_str(b"xhci: could not read the device descriptor\r\n");
+            return false;
+        }
+        // SAFETY: the descriptor buffer this module owns, just filled and synced by `control_in`.
+        let dd = unsafe { core::slice::from_raw_parts(buf_va as *const u8, 18) };
+        let dev_class = dd[4];
+        put_str(b"xhci: device descriptor: len ");
+        put_dec(dd[0] as u64);
+        put_str(b" class ");
+        put_hex(dev_class as u64);
+        put_str(b"/");
+        put_hex(dd[5] as u64);
+        put_str(b"/");
+        put_hex(dd[6] as u64);
+        put_str(b" mps0 ");
+        put_dec(dd[7] as u64);
+        put_str(b" vid:pid ");
+        put_hex(((dd[9] as u64) << 8) | dd[8] as u64);
+        put_str(b":");
+        put_hex(((dd[11] as u64) << 8) | dd[10] as u64);
+        put_str(b"\r\n");
+
+        if dd[0] != 18 {
+            put_str(b"xhci: the device descriptor did not arrive (length byte wrong) - the control \
+                      transfer completed but delivered nothing\r\n");
+            return false;
+        }
+
+        // Class 9 is a HUB, and on this board that is the expected answer rather than an obstacle: the
+        // Pi 4's USB-A sockets hang off an internal VIA hub, so NOTHING plugged into the machine
+        // appears on a root port. Walk it.
+        if dev_class == 0x09 {
+            put_str(b"xhci: this is a USB hub - walking its downstream ports\r\n");
+            return self.walk_hub(slot, &mut ep0, topo, buf_phys, buf_va);
+        }
+
         // Read the configuration descriptor: it carries the interface class and the interrupt IN
         // endpoint, which is everything still needed.
-        if !self.control_in(slot, &mut ep0, 0x0200, 0, 64, buf_phys, buf_va) {
+        if !self.get_descriptor(slot, &mut ep0, 0x0200, 64, buf_phys, buf_va) {
             put_str(b"xhci: could not read the configuration descriptor\r\n");
             return false;
         }
 
         let Some((iface_num, ep_addr, ep_mps, ep_interval, cfg_value)) = parse_config(buf_va) else {
-            put_str(b"xhci: device is not a HID boot keyboard - ignoring it\r\n");
+            report_config(buf_va);
             return false;
         };
 
@@ -773,8 +833,13 @@ impl Xhci {
         unsafe {
             core::ptr::write_bytes(in_va as *mut u8, 0, 4096);
             ((in_va + 4) as *mut u32).write_volatile(1 | (1 << dci)); // slot + this endpoint
-            ((slot_ctx) as *mut u32).write_volatile((dci << 27) | (speed << 20));
+            ((slot_ctx) as *mut u32)
+                .write_volatile((dci << 27) | (speed << 20) | (topo.route & 0xF_FFFF));
             ((slot_ctx + 4) as *mut u32).write_volatile((port as u32) << 16);
+            if topo.tt_slot != 0 {
+                ((slot_ctx + 8) as *mut u32)
+                    .write_volatile((topo.tt_slot as u32) | ((topo.tt_port as u32) << 8));
+            }
             let ep = in_va + cs * (dci as u64 + 1);
             ((ep) as *mut u32).write_volatile(encode_interval(speed, ep_interval) << 16);
             // Interrupt IN = type 7, CErr 3, max packet size.
@@ -809,10 +874,159 @@ impl Xhci {
     }
 
     /// A control IN transfer: setup, data, status. Used only for descriptors during bring-up.
+    /// Configure a hub, then look for a keyboard on each of its downstream ports.
+    ///
+    /// A hub has to be **configured** before its ports do anything - an unconfigured hub reports every
+    /// port as empty and unpowered, which reads exactly like nothing being plugged in. After that the
+    /// sequence per port is the USB one: power it, wait for the connect to settle, reset it, read the
+    /// speed the hub reports, and address whatever is there with a route string that says how to get
+    /// back to it.
+    ///
+    /// Only one tier is walked. That covers this board (sockets -> internal hub) and a keyboard plugged
+    /// directly into it; a hub plugged into a hub is not handled, and says so rather than recursing
+    /// into an unbounded walk of someone's docking station.
+    fn walk_hub(
+        &mut self,
+        slot: u8,
+        ep0: &mut Ring,
+        topo: Topology,
+        buf_phys: u64,
+        buf_va: u64,
+    ) -> bool {
+        // Configure it. Reading the configuration descriptor first is what gives us the value to set.
+        if !self.get_descriptor(slot, ep0, 0x0200, 64, buf_phys, buf_va) {
+            put_str(b"xhci: could not read the hub's configuration descriptor\r\n");
+            return false;
+        }
+        // SAFETY: the descriptor buffer this module owns, just filled.
+        let cfg_value = unsafe { *(buf_va as *const u8).add(5) };
+        if !self.control_out(slot, ep0, 0x00, 0x09, cfg_value as u16, 0) {
+            put_str(b"xhci: could not configure the hub\r\n");
+            return false;
+        }
+
+        // The hub descriptor says how many downstream ports there are. Class request, not standard.
+        if !self.control_in(
+            slot, ep0, HUB_GET_DESCRIPTOR.0, HUB_GET_DESCRIPTOR.1, 0x2900, 0, 16, buf_phys, buf_va,
+        ) {
+            put_str(b"xhci: could not read the hub descriptor\r\n");
+            return false;
+        }
+        // SAFETY: as above.
+        let nports = unsafe { *(buf_va as *const u8).add(2) };
+        put_str(b"xhci: hub has ");
+        put_dec(nports as u64);
+        put_str(b" downstream port(s)\r\n");
+        if nports == 0 || nports > 15 {
+            put_str(b"xhci: implausible downstream port count - not walking it\r\n");
+            return false;
+        }
+
+        // Power every port first, then let them settle together. Powering one at a time and waiting
+        // after each turns a 100 ms settle into 100 ms per port for no benefit.
+        for p in 1..=nports {
+            self.control_out(
+                slot, ep0, HUB_SET_PORT_FEATURE.0, HUB_SET_PORT_FEATURE.1, PORT_FEAT_POWER, p as u16,
+            );
+        }
+        delay_us(200_000);
+
+        for p in 1..=nports {
+            if !self.control_in(
+                slot, ep0, HUB_GET_PORT_STATUS.0, HUB_GET_PORT_STATUS.1, 0, p as u16, 4, buf_phys,
+                buf_va,
+            ) {
+                continue;
+            }
+            // SAFETY: the 4-byte port status this module owns, just filled.
+            let status = unsafe { (buf_va as *const u16).read_volatile() };
+            if status & PS_CONNECTION == 0 {
+                continue;
+            }
+            put_str(b"xhci: hub port ");
+            put_dec(p as u64);
+            put_str(b" has a device (status ");
+            put_hex(status as u64);
+            put_str(b")\r\n");
+
+            // Reset it, and give it the USB reset recovery time.
+            self.control_out(
+                slot, ep0, HUB_SET_PORT_FEATURE.0, HUB_SET_PORT_FEATURE.1, PORT_FEAT_RESET, p as u16,
+            );
+            let mut n = 0;
+            let mut status = 0u16;
+            while n < 100 {
+                delay_us(10_000);
+                n += 1;
+                if !self.control_in(
+                    slot, ep0, HUB_GET_PORT_STATUS.0, HUB_GET_PORT_STATUS.1, 0, p as u16, 4,
+                    buf_phys, buf_va,
+                ) {
+                    break;
+                }
+                // SAFETY: as above.
+                status = unsafe { (buf_va as *const u16).read_volatile() };
+                if status & PS_ENABLE != 0 {
+                    break;
+                }
+            }
+            // Acknowledge the change bits, or the hub keeps reporting them.
+            self.control_out(
+                slot, ep0, HUB_CLEAR_PORT_FEATURE.0, HUB_CLEAR_PORT_FEATURE.1, PORT_FEAT_C_RESET,
+                p as u16,
+            );
+            self.control_out(
+                slot, ep0, HUB_CLEAR_PORT_FEATURE.0, HUB_CLEAR_PORT_FEATURE.1,
+                PORT_FEAT_C_CONNECTION, p as u16,
+            );
+            if status & PS_ENABLE == 0 {
+                put_str(b"xhci: hub port did not enable after reset\r\n");
+                continue;
+            }
+
+            // The hub reports the speed; PORTSC cannot, because the root port sees only the hub.
+            let speed = if status & PS_LOW_SPEED != 0 {
+                2 // low
+            } else if status & PS_HIGH_SPEED != 0 {
+                3 // high
+            } else {
+                1 // full
+            };
+            put_str(b"xhci: hub port ");
+            put_dec(p as u64);
+            put_str(b" enabled, speed ");
+            put_dec(speed as u64);
+            put_str(b"\r\n");
+
+            // A low or full speed device behind a high-speed hub reaches the controller only through
+            // that hub's transaction translator, which the slot context has to name.
+            let needs_tt = speed == 1 || speed == 2;
+            let child = Topology {
+                root_port: topo.root_port,
+                route: (topo.route << 4) | (p as u32 & 0xF),
+                tt_slot: if needs_tt { slot } else { 0 },
+                tt_port: if needs_tt { p } else { 0 },
+                speed,
+            };
+            if self.setup_at(child) {
+                return true; // one keyboard is enough
+            }
+        }
+        put_str(b"xhci: nothing on the hub's ports was a boot keyboard\r\n");
+        false
+    }
+
+    /// A control IN transfer with an arbitrary request type.
+    ///
+    /// `req_type` is a parameter rather than hardcoded to `0x80` because hub requests are **class**
+    /// requests (`0xA0` to the hub, `0xA3` to one of its ports), and a hub is how anything reaches the
+    /// Pi 4's USB-A sockets.
     fn control_in(
         &mut self,
         slot: u8,
         ep0: &mut Ring,
+        req_type: u8,
+        request: u8,
         value: u16,
         index: u16,
         len: u16,
@@ -826,8 +1040,8 @@ impl Xhci {
 
         // Setup stage. The 8 setup bytes travel INSIDE the TRB (immediate data), which is why the
         // parameter field is the request itself rather than a pointer to it.
-        let setup: u64 = 0x80 // bmRequestType: device-to-host, standard, device
-            | (0x06u64 << 8) // bRequest: GET_DESCRIPTOR
+        let setup: u64 = (req_type as u64)
+            | ((request as u64) << 8)
             | ((value as u64) << 16)
             | ((index as u64) << 32)
             | ((len as u64) << 48);
@@ -840,6 +1054,19 @@ impl Xhci {
         }
         mmu::dma_sync(buf_va, 256);
         true
+    }
+
+    /// Fetch a standard descriptor. The common case of [`control_in`].
+    fn get_descriptor(
+        &mut self,
+        slot: u8,
+        ep0: &mut Ring,
+        value: u16,
+        len: u16,
+        buf_phys: u64,
+        buf_va: u64,
+    ) -> bool {
+        self.control_in(slot, ep0, 0x80, 0x06, value, 0, len, buf_phys, buf_va)
     }
 
     /// A control OUT transfer with no data stage (SET_CONFIGURATION, SET_PROTOCOL).
@@ -920,6 +1147,85 @@ fn default_max_packet(speed: u32) -> u32 {
 /// zero-length one - a malformed descriptor from an untrusted device must end the walk, not spin it
 /// forever. This runs in ring 0 on device-supplied bytes (see the module header), so every bound here
 /// is doing real work.
+/// Where a device sits on the bus. See `setup_device`.
+#[derive(Clone, Copy)]
+struct Topology {
+    /// The root-hub port everything below this point hangs off.
+    root_port: u8,
+    /// Route string: 4 bits per tier, downstream port number at each. 0 = on the root port itself.
+    route: u32,
+    /// Slot of the hub providing the transaction translator, or 0 when none is needed.
+    tt_slot: u8,
+    /// Port on that hub.
+    tt_port: u8,
+    /// The speed the parent hub reported for this device.
+    speed: u32,
+}
+
+/// Hub class request types and features (USB 2.0 chapter 11).
+const HUB_GET_DESCRIPTOR: (u8, u8) = (0xA0, 0x06);
+const HUB_GET_PORT_STATUS: (u8, u8) = (0xA3, 0x00);
+const HUB_SET_PORT_FEATURE: (u8, u8) = (0x23, 0x03);
+const HUB_CLEAR_PORT_FEATURE: (u8, u8) = (0x23, 0x01);
+const PORT_FEAT_RESET: u16 = 4;
+const PORT_FEAT_POWER: u16 = 8;
+const PORT_FEAT_C_CONNECTION: u16 = 16;
+const PORT_FEAT_C_RESET: u16 = 20;
+/// wPortStatus bits.
+const PS_CONNECTION: u16 = 1 << 0;
+const PS_ENABLE: u16 = 1 << 1;
+const PS_LOW_SPEED: u16 = 1 << 9;
+const PS_HIGH_SPEED: u16 = 1 << 10;
+
+/// Say what a configuration descriptor actually contained, when it did not contain a boot keyboard.
+///
+/// Walking it a second time to print it is cheap, and it is the difference between "not a keyboard"
+/// and a fact. The three interesting cases look identical from the outside: a device that is something
+/// else, a device whose interface is a HID keyboard in REPORT protocol rather than boot protocol, and
+/// a transfer that completed while delivering nothing.
+fn report_config(va: u64) {
+    // SAFETY: the descriptor buffer this module owns, filled by the control transfer above.
+    let buf = unsafe { core::slice::from_raw_parts(va as *const u8, 256) };
+    let total = (buf[2] as usize) | ((buf[3] as usize) << 8);
+    put_str(b"xhci: config descriptor: len ");
+    put_dec(buf[0] as u64);
+    put_str(b" total ");
+    put_dec(total as u64);
+    put_str(b" interfaces ");
+    put_dec(buf[4] as u64);
+    put_str(b"\r\n");
+
+    let end = total.min(256);
+    let mut i = 9usize;
+    while i + 2 <= end {
+        let len = buf[i] as usize;
+        let ty = buf[i + 1];
+        if len < 2 || i + len > end {
+            break;
+        }
+        if ty == 0x04 && len >= 9 {
+            put_str(b"xhci:   interface ");
+            put_dec(buf[i + 2] as u64);
+            put_str(b" class ");
+            put_hex(buf[i + 5] as u64);
+            put_str(b"/");
+            put_hex(buf[i + 6] as u64);
+            put_str(b"/");
+            put_hex(buf[i + 7] as u64);
+            put_str(b" (class/subclass/protocol; 3/1/1 is a boot keyboard)\r\n");
+        } else if ty == 0x05 && len >= 7 {
+            put_str(b"xhci:   endpoint ");
+            put_hex(buf[i + 2] as u64);
+            put_str(b" attrs ");
+            put_hex(buf[i + 3] as u64);
+            put_str(b" interval ");
+            put_dec(buf[i + 6] as u64);
+            put_str(b"\r\n");
+        }
+        i += len;
+    }
+}
+
 fn parse_config(va: u64) -> Option<(u8, u8, u32, u8, u8)> {
     // SAFETY: the buffer page this module owns, filled by the control transfer above.
     let buf = unsafe { core::slice::from_raw_parts(va as *const u8, 256) };

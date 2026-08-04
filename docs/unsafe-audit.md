@@ -43,6 +43,26 @@ somewhere that names neither the GPU nor the map (§26.7).
 | `arch/aarch64/mailbox.rs` | 3 -> 4 (+1) | `property_call`: copies an arbitrary tag request into this module's 16-byte-aligned static and the reply back out, length-checked against the buffer at both ends. The static rather than the caller's array because the mailbox packs the channel into the low 4 bits of the address it is handed - an arbitrarily-aligned caller buffer would send the message to the wrong channel, so the alignment guarantee stays in one place. |
 | `arch/aarch64/mod.rs` | 53 -> 55 (+2) | The write and the read of `FB_INFO`, the static that carries the geometry across the jump to the high half. A static rather than a local because the jump abandons the low stack along with every local on it - the same reason `memmap::current_map` exists. Single-threaded boot: written once before the jump, read once after. |
 
+## 2026-08-04 - Pi 4: hub enumeration (feat/pi4-aarch64)
+
+The Pi 4's USB-A sockets do not hang off the VL805's root ports. They hang off an **internal VIA hub**,
+which the root port reports as a single high-speed device - so a keyboard plugged into the machine is
+one tier further out than the driver could see, and the bring-up ended at "device is not a HID boot
+keyboard" while pointing at a hub.
+
+Walking a hub adds three things the root-port path never needed, and leaving any of them out produces
+an `Address Device` failure whose completion code points somewhere else: the **route string** (which
+downstream port to take at each tier), the **transaction translator** that a high-speed hub provides so
+a low or full speed device can be reached across a fast link, and the fact that the device's speed comes
+from the **hub's** port status rather than from `PORTSC`, which sees only the hub.
+
+Only one tier is walked. That covers this board and a keyboard plugged into it; a hub plugged into a hub
+says so rather than recursing into an unbounded walk of someone's docking station.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | 18 -> 24 (+6) | Reading the hub descriptor's port count, the 4-byte port-status replies (one per port, and again while polling a reset), the configuration descriptor's `bConfigurationValue`, and the device descriptor slice that identifies what was found. Every one is a read of the module's own descriptor buffer immediately after a control transfer filled and synced it; the two that index it do so at fixed offsets inside a 16-byte or 18-byte reply whose length was checked. |
+
 ## 2026-08-04 - Pi 4 milestone 23: PCIe and the USB keyboard (feat/pi4-aarch64)
 
 The Pi 2's USB host controller sits on the SoC's peripheral bus at a fixed address. The Pi 4's does
@@ -1731,7 +1751,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/aarch64/video.rs | 2 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
-| arch/aarch64/xhci.rs | 18 | permitted |
+| arch/aarch64/xhci.rs | 24 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
