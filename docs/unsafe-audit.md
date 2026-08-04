@@ -88,6 +88,30 @@ Five consecutive boots now report `cores in the scheduler: 4 (mask 0xf)` intact.
 
 No new `unsafe`.
 
+## 2026-08-04 - Pi 4 GENET milestone 3: the receive ring (feat/pi4-aarch64)
+
+Allocates 32 receive buffers of 2 KiB, writes their PHYSICAL addresses into the descriptor area,
+programs the ring geometry on queue 16, and reads it back. **Receive is deliberately left DISABLED.**
+
+The split is the point. Every address handed over here is one the MAC will eventually write into, on a
+board with no IOMMU behind it - so "the values reached the hardware" and "the hardware is running" are
+separated, and only the first is claimed. The readback is what distinguishes them.
+
+Two details that would each corrupt memory rather than return a wrong value:
+
+- The descriptor address words are **physical**. The kernel's own view of that memory is the direct-map
+  alias, and handing a virtual address to a bus master is a device writing to an address that means
+  nothing to it.
+- `DMA_RING_BUF_SIZE` packs the descriptor COUNT in the upper half and the buffer LENGTH in the lower -
+  two different units in one register, and a swap reads back plausibly.
+
+Ring size is 32 rather than Linux's 256: 64 KiB of pinned memory, a bound visible in the source rather
+than inferred (§26.6.1).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/genet.rs` | 3 -> 4 (+1) | Recording each buffer's physical address in this module's own array, indexed inside its length during single-threaded boot, so the descriptors and the eventual drain path agree on one answer. |
+
 ## 2026-08-04 - Pi 4 GENET milestone 2: the MAC and the MDIO bus (feat/pi4-aarch64)
 
 Resets the UniMAC, programs the station address and frame limit, selects the external gigabit PHY mode,
@@ -2034,7 +2058,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/aarch64/video.rs | 2 | permitted |
-| arch/aarch64/genet.rs | 3 | permitted |
+| arch/aarch64/genet.rs | 4 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
 | arch/aarch64/smp_boot.rs | 9 | permitted |
 | arch/aarch64/xhci.rs | 37 | permitted |

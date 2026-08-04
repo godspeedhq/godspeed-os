@@ -471,3 +471,84 @@ fn describe_ring(block: u64, index: u64) -> (u64, u64, u64, u64) {
         ring_reg(block, index, if block == TDMA_OFFSET { TDMA_PROD_INDEX } else { RDMA_CONS_INDEX }),
     )
 }
+
+// --- RX ring: buffers, descriptors, and a readback before anything is enabled -------------------
+
+/// Bytes per receive buffer. Linux's `RX_BUF_LENGTH`; one 2 KiB buffer holds any Ethernet frame this
+/// MAC will accept, so a frame never spans descriptors and the driver never has to reassemble.
+const RX_BUF_LENGTH: u32 = 2048;
+
+/// Descriptors in the receive ring. Smaller than Linux's 256 on purpose: 32 buffers is 64 KiB of
+/// pinned memory, enough to absorb a burst while the tick drains it, and a bound that is obvious in
+/// the source rather than inferred (§26.6.1).
+const RX_RING_DESCS: u64 = 32;
+
+/// The default receive queue. GENET numbers its priority queues 0..15 and puts the catch-all at 16;
+/// a single-queue driver uses that one, as Linux does.
+const RX_RING_INDEX: u64 = 16;
+
+/// Where the RX buffers live, so the descriptors and the drain path agree on one answer.
+static mut RX_BUFS: [u64; RX_RING_DESCS as usize] = [0; RX_RING_DESCS as usize];
+
+/// Build the receive ring: one buffer per descriptor, the ring bounds, and the indices.
+///
+/// **This programs the controller but deliberately does NOT enable it.** Every address handed over
+/// here is a physical address the MAC will eventually write into, and this port has spent four commits
+/// establishing that the register offsets are what they are believed to be. Programming and then
+/// verifying by readback separates "the values reached the hardware" from "the hardware is running",
+/// and only the first is being claimed today.
+pub fn init_rx_ring() -> bool {
+    // One page per two buffers (4096 / 2048). Allocated from the frame allocator, which hands back
+    // physical frames the direct map already covers.
+    for i in 0..RX_RING_DESCS {
+        let Some(frame) = crate::memory::allocator::alloc_frame() else {
+            put_str(b"genet: out of memory building the receive ring\r\n");
+            return false;
+        };
+        let phys = frame.phys_addr().0;
+        // SAFETY: this module's own array, indexed inside its length, during single-threaded boot.
+        unsafe { RX_BUFS[i as usize] = phys };
+
+        // The descriptor's address words. The controller reads these to find where to put a frame, so
+        // they are PHYSICAL - the kernel's own view of that memory is the direct-map alias, and handing
+        // over a virtual address is a device writing to an address that means nothing to it.
+        wr(desc_word(RDMA_OFFSET, i, DMA_DESC_ADDRESS_LO), phys as u32);
+        wr(desc_word(RDMA_OFFSET, i, DMA_DESC_ADDRESS_HI), (phys >> 32) as u32);
+        // Length/status starts clear: ownership is granted by the producer index, not by a bit here.
+        wr(desc_word(RDMA_OFFSET, i, DMA_DESC_LENGTH_STATUS), 0);
+    }
+
+    // Ring geometry. `DMA_RING_BUF_SIZE` packs the descriptor count in the upper half and the buffer
+    // length in the lower - two different units in one register, which is the kind of field that reads
+    // fine and behaves wrongly if the halves are swapped.
+    let buf_size = ((RX_RING_DESCS as u32) << 16) | RX_BUF_LENGTH;
+    wr(ring_reg(RDMA_OFFSET, RX_RING_INDEX, DMA_RING_BUF_SIZE), buf_size);
+
+    // Start and end are in WORDS, not descriptors and not bytes - `start_ptr * words_per_bd` in Linux.
+    // The end is inclusive, hence the minus one.
+    wr(ring_reg(RDMA_OFFSET, RX_RING_INDEX, DMA_START_ADDR), 0);
+    wr(
+        ring_reg(RDMA_OFFSET, RX_RING_INDEX, DMA_END_ADDR),
+        (RX_RING_DESCS * WORDS_PER_BD - 1) as u32,
+    );
+    wr(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_CONS_INDEX), 0);
+
+    // Read the geometry back. A ring whose registers did not take is a ring the controller would walk
+    // using whatever they do hold - and the descriptors above are already pointing at real memory.
+    let got = rd(ring_reg(RDMA_OFFSET, RX_RING_INDEX, DMA_RING_BUF_SIZE));
+    if got != buf_size {
+        put_str(b"genet: receive ring geometry did not take (wrote ");
+        put_hex(buf_size as u64);
+        put_str(b", read ");
+        put_hex(got as u64);
+        put_str(b") - NOT enabling receive\r\n");
+        return false;
+    }
+
+    put_str(b"genet: receive ring programmed - ");
+    super::put_dec(RX_RING_DESCS);
+    put_str(b" descriptors of ");
+    super::put_dec(RX_BUF_LENGTH as u64);
+    put_str(b" bytes on queue 16, geometry verified (receive still DISABLED)\r\n");
+    true
+}
