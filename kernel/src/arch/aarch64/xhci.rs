@@ -1,6 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! The VL805 xHCI host controller: bringing up a USB keyboard on the Pi 4.
 //!
+//! ## The topology, which is not what you would guess
+//!
+//! Nothing plugged into a Pi 4 appears on a root port. The four USB-A sockets hang off an **internal
+//! VIA hub** (`2109:3431`), which the root port reports as a single high-speed device, so the real
+//! shape is:
+//!
+//! ```text
+//!   root port 1 -> VIA hub (high speed)
+//!                    +- port 2 -> whatever is in socket 2
+//!                    +- port 4 -> a low-speed keyboard
+//! ```
+//!
+//! A low-speed device behind a high-speed hub is reachable only through that hub's **transaction
+//! translator**, which the slot context has to name. `link speed 3` on a root port is the tell that
+//! you are looking at the hub rather than at a keyboard.
+//!
 //! ## Where this sits
 //!
 //! [`super::pcie`] brings the root complex up, finds the controller, and assigns its BAR. Everything
