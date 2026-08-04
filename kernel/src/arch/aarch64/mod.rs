@@ -1117,6 +1117,66 @@ pub const ELF_MACHINE: u16 = 183;
 pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
 
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
+/// Reset the SoC through the BCM2711 watchdog, exactly as the 32-bit port does.
+///
+/// This was a `loop { spin_loop() }` stub, which is why `reboot` printed "rebooting..." and then did
+/// nothing at all - the shell had already done its part, the kernel simply never asked the hardware.
+///
+/// **Clearing the boot partition in `PM_RSTS` is not optional.** The firmware reads that field back out
+/// after the watchdog fires to decide what to boot; left at whatever it held, the SoC resets and then
+/// sits dark, which reads as "reboot does nothing" in precisely the same way. The 32-bit port hit that
+/// and recorded it, so this inherits the fix rather than the symptom.
+#[cfg(feature = "pi4")]
+pub fn hardware_reset() -> ! {
+    const PM_RSTC: usize = 0xFE10_001C;
+    const PM_RSTS: usize = 0xFE10_0020;
+    const PM_WDOG: usize = 0xFE10_0024;
+    const PM_PASSWORD: u32 = 0x5A00_0000;
+    const PM_RSTC_WRCFG_FULL_RESET: u32 = 0x0000_0020;
+    const PM_RSTC_WRCFG_CLR: u32 = 0xFFFF_FFCF;
+    /// The boot partition, scattered across these bits. Clearing them selects partition 0 - the
+    /// normal boot.
+    const PM_RSTS_PARTITION: u32 = 0xFFFF_FAAA;
+
+    // SAFETY: the BCM2711 power-management registers, reached through the kernel's Device mapping
+    // (`mmio` resolves correctly on both sides of the high-half jump). Volatile 32-bit writes gated by
+    // the 0x5A password - the documented reset poke, and the only thing these writes can do.
+    unsafe {
+        let rstc = mmio(PM_RSTC) as *mut u32;
+        let rsts = mmio(PM_RSTS) as *mut u32;
+        let wdog = mmio(PM_WDOG) as *mut u32;
+
+        let rsts_val = PM_PASSWORD | (rsts.read_volatile() & !PM_RSTS_PARTITION);
+        rsts.write_volatile(rsts_val);
+        let rstc_val =
+            PM_PASSWORD | (rstc.read_volatile() & PM_RSTC_WRCFG_CLR) | PM_RSTC_WRCFG_FULL_RESET;
+
+        // Re-issue the poke every iteration so a write that did not take (a briefly-unready PM block) is
+        // retried, rather than spinning forever on one failed attempt.
+        //
+        // BOUNDED, because "this never returns" is an assumption about hardware, and assumptions are
+        // what invariant 12 exists for. If the SoC has not reset after a generous window the reset did
+        // NOT work, and an operator staring at `rebooting...` deserves to be told rather than left
+        // guessing whether to wait or pull the plug. Then keep poking - a late reset is still a reset.
+        let mut n: u32 = 0;
+        loop {
+            wdog.write_volatile(PM_PASSWORD | 10);
+            rstc.write_volatile(rstc_val);
+            n = n.saturating_add(1);
+            if n == 2_000_000 {
+                serial_write_bytes_lockfree(
+                    b"\r\nreset: the SoC did NOT reset - the watchdog poke had no effect.\r\n",
+                );
+                serial_write_bytes_lockfree(
+                    b"reset: power-cycle the board. (still poking in case it takes late)\r\n",
+                );
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+#[cfg(not(feature = "pi4"))]
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 
 // ---- Serial / console ----

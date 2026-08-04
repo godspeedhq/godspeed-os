@@ -43,6 +43,22 @@ somewhere that names neither the GPU nor the map (§26.7).
 | `arch/aarch64/mailbox.rs` | 3 -> 4 (+1) | `property_call`: copies an arbitrary tag request into this module's 16-byte-aligned static and the reply back out, length-checked against the buffer at both ends. The static rather than the caller's array because the mailbox packs the channel into the low 4 bits of the address it is handed - an arbitrarily-aligned caller buffer would send the message to the wrong channel, so the alignment guarantee stays in one place. |
 | `arch/aarch64/mod.rs` | 53 -> 55 (+2) | The write and the read of `FB_INFO`, the static that carries the geometry across the jump to the high half. A static rather than a local because the jump abandons the low stack along with every local on it - the same reason `memmap::current_map` exists. Single-threaded boot: written once before the jump, read once after. |
 
+## 2026-08-04 - Pi 4: reboot actually reboots (feat/pi4-aarch64)
+
+`hardware_reset` was `loop { spin_loop() }`. The shell printed "rebooting...", the kernel never asked
+the hardware, and the board had to be power-cycled by hand - which is indistinguishable from a reset
+that failed.
+
+Ported from the 32-bit implementation, including the part that was learned the hard way there: the boot
+partition in `PM_RSTS` must be cleared. The firmware reads that field back after the watchdog fires;
+left at whatever it held, the SoC resets and then sits dark, producing the *same* "reboot does nothing"
+symptom one layer further on. The poke is re-issued rather than spun on, and it is bounded and loud,
+because "this never returns" is an assumption about hardware.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 61 -> 62 (+1) | The BCM2711 power-management registers, reached through the kernel's Device mapping. Volatile 32-bit writes gated by the 0x5A password - the documented reset poke, and the only thing these writes can do. |
+
 ## 2026-08-04 - Pi 4: the four hot-plug bugs the hardware found (feat/pi4-aarch64)
 
 Storage and hot-plug both worked at boot and then interacted badly. Four faults, one of them shared:
@@ -1800,7 +1816,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 61 | permitted |
+| arch/aarch64/mod.rs | 62 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/sched_spawn.rs | 2 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
