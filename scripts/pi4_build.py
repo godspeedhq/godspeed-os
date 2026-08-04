@@ -71,13 +71,15 @@ PI4_SERVICES = [
     "block-driver", "fs",
 ]
 
-# `pi4` is always present; anything passed is added to it, not substituted for it.
-FEATURES = "pi4"
+# `pi4` is always present; anything passed is added to it, not substituted for it. `pi4-smp` rides with
+# it now that all four cores come up on every boot and survive a carnage run - a Pi 4 running on one of
+# its four cores is not the machine.
+FEATURES = "pi4,pi4-smp"
 if "--features" in sys.argv:
     i = sys.argv.index("--features")
     if i + 1 >= len(sys.argv):
         sys.exit("--features needs a comma-separated list")
-    FEATURES = "pi4," + sys.argv[i + 1]
+    FEATURES = "pi4,pi4-smp," + sys.argv[i + 1]
 
 rel = ["--release"] if PROFILE == "release" else []
 

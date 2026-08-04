@@ -311,6 +311,16 @@ extern "C" fn ap_high_entry() -> ! {
     }
 
     crate::kprintln!("smp: core {} online", core_id);
+
+    // **Register this core's id before announcing ready.** The neutral `current_core_id` resolves a
+    // core by searching the lapic-id table for its hardware id, and a core that is not in that table
+    // falls through to `return 0` - so an unregistered core does not fail, it silently answers "I am
+    // core 0" and starts using core 0's run queue, scheduler context and per-core state.
+    //
+    // On this SoC the hardware id IS the core index, so the mapping is the identity - which is exactly
+    // why its absence was invisible on one core and catastrophic on four. The 32-bit port does the same
+    // thing at the same point, one line before `mark_ready`, and comparing the two is what found it.
+    crate::smp::core::set_core_lapic_id(core_id as u32, core_id as u32);
     crate::smp::core::mark_ready(core_id as u32);
 
     // This core's own GIC interface and its own timer. The distributor is shared and already

@@ -43,6 +43,23 @@ somewhere that names neither the GPU nor the map (§26.7).
 | `arch/aarch64/mailbox.rs` | 3 -> 4 (+1) | `property_call`: copies an arbitrary tag request into this module's 16-byte-aligned static and the reply back out, length-checked against the buffer at both ends. The static rather than the caller's array because the mailbox packs the channel into the low 4 bits of the address it is handed - an arbitrarily-aligned caller buffer would send the message to the wrong channel, so the alignment guarantee stays in one place. |
 | `arch/aarch64/mod.rs` | 53 -> 55 (+2) | The write and the read of `FB_INFO`, the static that carries the geometry across the jump to the high half. A static rather than a local because the jump abandons the low stack along with every local on it - the same reason `memmap::current_map` exists. Single-threaded boot: written once before the jump, read once after. |
 
+## 2026-08-04 - Pi 4 SMP: four cores, on by default (feat/pi4-aarch64)
+
+The last piece was a **single missing line**, and the 32-bit port had it all along
+(`arch/arm/mod.rs`: `set_core_lapic_id(core_id, core_id)`).
+
+`lapic_to_core_id` resolves a core by searching the id table and, finding nothing, **returns 0**. So a
+core that never registers itself does not fail - it silently answers "I am core 0" and starts using core
+0's run queue, scheduler context and per-core state. The fallback is correct for exactly one core, which
+is why nothing showed until the other three arrived, and why the symptom was an intermittent hang rather
+than an error.
+
+Six consecutive QEMU boots now reach a shell on four cores, and `chaos max-carnage` survives 6 rounds /
+18 kills with the kernel alive. Enabled by default; the feature remains separate so a single-core image
+is one flag away if a hardware fault ever needs bisecting against it.
+
+No new `unsafe`.
+
 ## 2026-08-04 - Pi 4 SMP: two real bugs found by reading the 32-bit port (feat/pi4-aarch64)
 
 Still gated off and still not reliable (one boot in five reaches a shell), but two genuine defects were

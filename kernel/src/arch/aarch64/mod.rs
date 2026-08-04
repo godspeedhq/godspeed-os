@@ -842,6 +842,10 @@ extern "C" fn boot_high() -> ! {
         // requested core that is not ready - correctly, and with `PlacementInvalid`, which reads like a
         // spec decision rather than a missing init call. Marked here rather than in `smp::init`, which
         // this port does not run yet (it starts APs; PSCI SMP is a later milestone).
+        // The boot core registers its own mapping too. `mark_ready` alone is not enough: the lookup
+        // matches on the lapic-id TABLE, not on the ready flag, and core 0 only resolved correctly
+        // because an unregistered core falls back to 0 - the right answer for exactly one core.
+        crate::smp::core::set_core_lapic_id(0, 0);
         crate::smp::core::mark_ready(0);
 
         // The arenas exist and core 0 is registered: the parked secondaries may now enter the scheduler.
