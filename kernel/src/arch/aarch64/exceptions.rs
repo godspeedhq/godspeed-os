@@ -165,6 +165,19 @@ aarch64_irq_common:
     mov  x1, sp
     bl   aarch64_irq_dispatch      // (vector: u64, frame: *mut TrapFrame)
 aarch64_exception_return:
+    // MASK INTERRUPTS FOR THE WHOLE RETURN SEQUENCE.
+    //
+    // Below, ELR_EL1 and SPSR_EL1 are written and then a dozen more instructions run before the `eret`.
+    // An interrupt taken in that window is not merely inconvenient: the hardware OVERWRITES ELR_EL1 and
+    // SPSR_EL1 with the interrupted context, destroying the user state just loaded. The `eret` then
+    // returns somewhere in this very function, at whatever EL the stale SPSR names - which is exactly
+    // what was observed, an EL0 task with its PC inside `aarch64_exception_return`.
+    //
+    // Exception ENTRY masks interrupts automatically, so this window is closed for the common path.
+    // It is not closed for a task resumed after blocking: the scheduler re-enables interrupts around
+    // the switch, so that task unwinds back through here with IRQs live. Masking here costs nothing -
+    // `eret` restores DAIF from SPSR - and makes the sequence atomic regardless of how it was reached.
+    msr  daifset, #3               // mask IRQ and FIQ until the eret
     ldp  x3,  x4,  [sp, #256]      // SPSR, user SP
     ldp  x30, x2,  [sp, #240]      // x30, ELR
     msr  elr_el1,  x2

@@ -31,6 +31,8 @@ pub mod ptables;
 pub mod sched_demo;
 #[cfg(all(feature = "pi4", feature = "pi4-sched-spawn"))]
 pub mod sched_spawn;
+#[cfg(all(feature = "pi4", feature = "pi4-supervisor"))]
+pub mod sched_supervisor;
 #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
 pub mod sched_user;
 #[cfg(feature = "pi4")]
@@ -817,6 +819,10 @@ extern "C" fn boot_high() -> ! {
     // machine to the scheduler.
     // A REAL service through the neutral spawn path. Checked first: if both features are on, running a
     // compiled service is the more informative of the two, and neither returns.
+    // The real OS bootstrap: the kernel's ONE direct spawn is the supervisor, which spawns the rest.
+    #[cfg(all(feature = "pi4", feature = "pi4-supervisor"))]
+    sched_supervisor::run();
+
     #[cfg(all(feature = "pi4", feature = "pi4-sched-spawn"))]
     sched_spawn::run();
 
@@ -1001,6 +1007,23 @@ pub fn serial_write_byte(b: u8) {
     put_byte(b);
 }
 pub fn serial_write_bytes_lockfree(s: &[u8]) { for &b in s { serial_write_byte(b); } }
+/// A service's CONSOLE output - the shell's prompt, and everything it prints.
+///
+/// A no-op stub until now, which is why the shell spawned, ran, and produced nothing: it was writing
+/// into a function that discarded every byte. Distinct from `serial_write_bytes_lockfree`, which is the
+/// KERNEL log; this is userspace console output, and the two are separate so a full-screen app can own
+/// the display while kernel logging continues.
+///
+/// `to_fb` is the foreground gate: false means a full-screen app owns the display and this text belongs
+/// on serial only. This port has no framebuffer console yet, so serial is the only destination and the
+/// gate has nothing to select - honoured as soon as one exists.
+#[cfg(feature = "pi4")]
+pub fn console_write_bytes_gated(s: &[u8], _to_fb: bool) {
+    for &b in s {
+        serial_write_byte(b);
+    }
+}
+#[cfg(not(feature = "pi4"))]
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {}
 pub fn set_console_echo(on: bool) {}
 pub fn claim_console_foreground(task_slot: u32) {}
@@ -1009,7 +1032,22 @@ pub fn release_console_foreground_if_owner(task_slot: u32) {}
 pub fn console_foreground_allows(task_slot: u32) -> bool { true }
 pub fn console_boot_complete() {}
 pub fn console_push_byte(b: u8) {}
+/// Whether the machine's console INPUT path is up, which gates the shell's prompt.
+///
+/// On x86 this is raised when `xhci` comes up, because a USB keyboard is the input path. Here the
+/// input path is the PL011 receiver, which is up from boot - and `xhci` is a placeholder that never
+/// spawns. Left as the `false` stub it was, the supervisor-spawned shell would wait for its prompt
+/// forever, with nothing in the log to say why.
+#[cfg(feature = "pi4")]
+static INPUT_READY: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "pi4")]
+pub fn set_input_ready() { INPUT_READY.store(true, Ordering::Release); }
+#[cfg(feature = "pi4")]
+pub fn input_ready() -> bool { INPUT_READY.load(Ordering::Acquire) }
+
+#[cfg(not(feature = "pi4"))]
 pub fn set_input_ready() {}
+#[cfg(not(feature = "pi4"))]
 pub fn input_ready() -> bool { false }
 pub fn com2_init() {}
 pub fn com2_try_read_byte() -> Option<u8> { None }
@@ -1045,6 +1083,19 @@ pub mod boot {
     pub fn rearm_idle_timer() {}
     pub fn rearm_quantum_timer() {}
     pub fn audit_wx() {}
+    /// Counter ticks in one 10 ms scheduler quantum.
+    ///
+    /// **`0` means "this arch cannot say", and the neutral code takes it literally**: `cycles_to_ticks`
+    /// collapses EVERY timed wait to a single tick. Left stubbed, a service asking to sleep one second
+    /// slept 10 ms - so `ping`, which sends once a second by contract, sent about a hundred times that
+    /// and buried the shell's prompt under 96,000 log lines. The 32-bit port spent its whole bring-up
+    /// with the same stub and the same silent 100x error.
+    ///
+    /// Derived from the frequency the hardware reports, not a constant: the Pi 4's generic timer runs at
+    /// 54 MHz where QEMU says 62.5 MHz.
+    #[cfg(feature = "pi4")]
+    pub fn tsc_ticks_per_quantum() -> u64 { (super::timer::frequency() / 100).max(1) }
+    #[cfg(not(feature = "pi4"))]
     pub fn tsc_ticks_per_quantum() -> u64 { 0 }
     pub unsafe fn rearm_tsc_deadline() {}
     pub unsafe fn apic_send_eoi() {}

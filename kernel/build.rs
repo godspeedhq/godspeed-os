@@ -121,7 +121,7 @@ fn main() {
     // not yet ported keep the empty placeholder so the kernel still links. The hardware drivers stay
     // placeholders until real Pi 4 drivers exist (SD/EMMC, GENET, VL805 xHCI over PCIe) - they compile,
     // but hunt for x86 hardware that is not there.
-    let aarch64_built: &[&str] = &["logger", "ping", "pong"];
+    let aarch64_built: &[&str] = &["logger", "ping", "pong", "supervisor", "shell"];
     let aarch64_dir = workspace
         .join("target")
         .join("aarch64-unknown-none")

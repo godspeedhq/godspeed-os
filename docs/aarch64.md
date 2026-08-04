@@ -6,7 +6,7 @@
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
 
 
-> ## STATUS: milestones 1-20 done on real hardware - CROSS-SERVICE IPC RUNS (2026-08-04)
+> ## STATUS: milestones 1-20 on hardware; 21 - THE gsh PROMPT RUNS (QEMU) (2026-08-04)
 >
 > **GodspeedOS boots on a Raspberry Pi 4 Model B and prints over the PL011.** First AArch64 silicon.
 >
@@ -531,26 +531,56 @@
 >
 > **On the board: 63,579 messages in 2 minutes 12 seconds, zero faults.**
 >
-> **A QEMU-only fault, and worth recording as such.** Emulation reports a kernel-mode data abort in
-> `aarch64_exception_return` after anywhere between **257 and 12,088** messages - wildly
-> non-deterministic - with `SP_EL1` holding a bad value. The same build runs 63,579 messages clean on
-> the real board, roughly 250 times longer than QEMU's worst case and 5 times its best.
+> **The fault I called "QEMU-only" was real, and I was wrong to lean that way.** Emulation reported a
+> kernel abort in `aarch64_exception_return` after anywhere between 257 and 12,088 messages; the board
+> ran 63,579 clean, so an emulation artefact looked likeliest. It was a genuine race:
 >
-> QEMU's `raspi4b` model is visibly partial (it disables PCIe, RNG, thermal and GENET at startup and is
-> fixed at 2 GiB), so an emulation artefact is the likeliest explanation. **This is not a proof of
-> absence** - 63k messages is strong evidence, not certainty, and a rare race could still exist - so it
-> stays written down rather than closed (§26.3). If it resurfaces, the diagnostics to start from are
-> already in place: `SP_EL0`, the faulting task's name, and all 31 registers.
+> The return path writes `ELR_EL1` and `SPSR_EL1` and then runs a dozen more instructions before the
+> `eret`. **An interrupt in that window makes the hardware overwrite both**, destroying the user context
+> just loaded - and the `eret` then returns into `aarch64_exception_return` itself, at whatever EL the
+> stale `SPSR` names. Exception ENTRY masks interrupts, so the window is closed for the common path; it
+> is open for a task resumed after blocking, because the scheduler re-enables interrupts around the
+> switch. The sequence now masks IRQ and FIQ for its whole length (the `eret` restores `DAIF` from
+> `SPSR` regardless, so it costs nothing).
 >
-> Note the direction: every other bug this port hit was found *by* hardware and hidden by emulation.
-> This is the only one that runs the other way, which is itself a reason to treat it as the emulator's.
+> After the fix: three runs of **~107,000 to 109,000 messages each, zero faults**, where the same build
+> previously died in the hundreds. The lesson is worth more than the fix: *"does not reproduce on
+> hardware in two minutes"* is not *"not a real bug"* - the emulator's different timing made a narrow
+> race far more visible, which is the opposite of the pattern every other bug in this port followed.
 >
-> Two real bugs were fixed while chasing it, both worth having independently: `smp::core::mark_ready(0)`
-> was never called (so the strict contracted-placement rule refused every explicit override), and
-> `uart_rx::drain` was reachable from the timer tick, a blocked console reader, and any polling task
-> without a reentrancy guard, while calling `wake_by_slot` into scheduler state.
+> > **Milestone 21 - the `gsh` prompt.** The real bootstrap: the kernel makes its **one** direct spawn
+> (§11.1, the supervisor), and the supervisor spawns everything else from its own manifest - logger,
+> pong, ping, and the shell with a `CONSOLE_READ` cap.
 >
-> **Not done:** `arch::init` + the `kernel_main` handoff, PSCI SMP, the supervisor, the shell.
+> ```
+> supervisor: ready
+> shell: ready (type 'help')
+> version
+> GodspeedOS 0.9.1 aarch64 (5cd0e00)
+> ```
+>
+> A command typed on the serial console, executed, answered. That is the whole path: keystroke -> PL011
+> receiver -> ring -> `ConsoleRead` syscall -> shell -> command -> console output.
+>
+> Three stubs stood between "the shell spawned" and "the shell works", and each failed silently:
+>
+> - **`input_ready()` returned `false` forever.** On x86 the prompt is gated on a signal raised when
+>   `xhci` comes up, because a USB keyboard is the input path there. Here the input path is the PL011,
+>   which has been up since milestone 1, and `xhci` is a placeholder that never spawns - so nothing
+>   would ever have raised it and the shell would have waited for a prompt that never came.
+> - **`console_write_bytes_gated` was a no-op.** The shell spawned, ran, and produced nothing, because
+>   every byte it printed went into a function that discarded it. It is distinct from the kernel log
+>   path on purpose, so a full-screen app can own the display while kernel logging continues.
+> - **`tsc_ticks_per_quantum()` returned `0`**, which the neutral `cycles_to_ticks` takes literally and
+>   collapses *every* timed wait to one 10 ms tick. A service asking for a second slept 10 ms. The
+>   32-bit port ran its entire bring-up with the same stub and the same silent 100x error.
+>
+> The `probe-*` and `brutal-*` spawn failures in the log are expected: those are test services not yet
+> built for AArch64, so they hold the placeholder ELF and fail loudly with `LoadFailed(TooSmall)` -
+> which is the supervisor behaving correctly, not a port fault.
+>
+> **Not done:** hardware verification of the prompt, `arch::init` + the `kernel_main` handoff, PSCI SMP,
+> and the drivers the storage/network/USB commands need (SD/EMMC, GENET, VL805 xHCI).
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
 > init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already
