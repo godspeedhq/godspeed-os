@@ -666,7 +666,21 @@ pub fn enable_rx() -> bool {
 
     // Only now let the MAC accept frames. RX_EN before the ring is running is a receiver with nowhere
     // to put what it takes.
-    wr(UMAC_CMD, rd(UMAC_CMD) | CMD_RX_EN);
+    // Accept every frame on the wire, for now.
+    //
+    // The MAC filters on the station address unless told otherwise, and the address we programmed is
+    // the placeholder 02:00:00:00:00:01 - an address nothing on this network has any reason to send to.
+    // The only frames that could ever reach us are broadcast and multicast, and those are gated by the
+    // MDF filter (`UMAC_MDF_CTRL`), which Linux programs in `bcmgenet_set_rx_mode` and this driver has
+    // never written. Left at zero it admits nothing. So a healthy MAC on a live wire discards
+    // everything, which is exactly what the ring has been reporting.
+    //
+    // Promiscuous is the honest setting for a receive path with no address of its own yet: it is what
+    // Linux itself falls back to when the filter cannot express the wanted set. It is NOT the end state.
+    // Once the firmware-supplied MAC replaces the placeholder, this narrows to that address plus
+    // broadcast via the MDF filter - a receiver that quietly keeps every frame on the segment is a
+    // privilege the driver should not hold longer than bring-up needs it.
+    wr(UMAC_CMD, rd(UMAC_CMD) | CMD_RX_EN | CMD_PROMISC);
     if rd(UMAC_CMD) & CMD_RX_EN == 0 {
         wr(dma_reg(RDMA_OFFSET, DMA_CTRL), 0);
         wr(dma_reg(RDMA_OFFSET, DMA_RING_CFG), 0);
