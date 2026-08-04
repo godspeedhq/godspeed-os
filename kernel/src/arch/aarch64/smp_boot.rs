@@ -1,19 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Bringing up the Pi 4's other three cores.
 //!
-//! ## Two release mechanisms, and which one you get is not your choice
+//! ## How a secondary is released
 //!
-//! A secondary core on this board is parked by the firmware, and how it is released depends on which
-//! **armstub** the firmware loaded:
+//! The stock armstub parks each secondary polling a fixed physical address (`0xE0`, `0xE8`, `0xF0` for
+//! cores 1..3). Writing an entry point there and executing `sev` releases it. That is the mechanism this
+//! file uses, and the only one.
 //!
-//! - **PSCI.** The GIC-enabled stub installs an EL3 handler, and `CPU_ON` via `smc` starts a core at an
-//!   address of our choosing. This is what a device tree with `enable-method = "psci"` describes.
-//! - **A spin table.** The plain stub parks each core polling a fixed physical address (`0xE0`, `0xE8`,
-//!   `0xF0` for cores 1..3). Writing an entry point there and executing `sev` releases it.
+//! ## Why there is no PSCI attempt here
 //!
-//! Both are tried, PSCI first, and **the one that worked is reported**. Guessing would produce a
-//! machine that silently runs on one core on half the firmware versions in the field - and "why is this
-//! board slower" is a much worse question than a line in the boot log.
+//! PSCI would be the tidier answer, and an earlier version tried `CPU_ON` first and fell back. **It hung
+//! the board.** An `smc` with no handler installed at EL3 does not return an error - it traps to a
+//! vector that was never populated and the machine stops dead, before it can report anything. And there
+//! is no way to ask first: a PSCI version query is itself an `smc`, so probing has exactly the failure
+//! it is probing for.
+//!
+//! The guard that was there ("we booted at EL2, so something must own EL3") is not the same claim: the
+//! stock Pi 4 armstub passes control at EL2 and implements no PSCI handler at all. QEMU, which hands
+//! over at EL3, was the only environment where the guard did the right thing - so the bug was invisible
+//! in the one place it was tested. The spin table is what this firmware implements, it is what the
+//! board's own device tree describes, and it needs no `smc` to find out.
 //!
 //! ## Two phases, because the APs are ready before the kernel is
 //!
@@ -64,9 +70,6 @@ static AP_GO: AtomicU32 = AtomicU32::new(0);
 #[no_mangle]
 pub static AP_TABLES_READY: AtomicU32 = AtomicU32::new(0);
 
-/// PSCI `CPU_ON`, 64-bit calling convention.
-const PSCI_CPU_ON: u64 = 0xC400_0003;
-
 /// Spin-table release addresses for cores 1..3, as the Pi's armstub parks them.
 const SPIN_TABLE: [u64; SECONDARIES] = [0xE0, 0xE8, 0xF0];
 
@@ -77,34 +80,6 @@ const SPIN_TABLE: [u64; SECONDARIES] = [0xE0, 0xE8, 0xF0];
 /// address that means nothing to it, and the only symptom is a core that never checks in.
 fn ap_entry_phys() -> u64 {
     super::mmu::virt_to_phys(ap_entry as usize as u64)
-}
-
-/// Ask EL3 to start a core. `None` when there is no EL3 firmware to ask.
-///
-/// **An `smc` is only safe if something still owns EL3.** When the firmware hands this kernel control
-/// AT EL3, the kernel does its own drop and leaves no handler behind - so an `smc` traps to an EL3
-/// vector nobody installed, and the machine hangs on the spot rather than returning "not supported".
-/// That is not a hypothetical: it hung the first SMP boot immediately after the release line, with no
-/// fault report, because a hang inside EL3 has nothing left to report with.
-fn psci_cpu_on(mpidr: u64, entry: u64) -> Option<i64> {
-    if super::booted_at_el3() {
-        return None; // we ARE the highest level; there is nobody to call
-    }
-    let ret: i64;
-    // SAFETY: an SMC with the PSCI function id in x0. On firmware without a PSCI handler this returns
-    // NOT_SUPPORTED rather than trapping, which is exactly the distinction being tested.
-    unsafe {
-        core::arch::asm!(
-            "smc #0",
-            inout("x0") PSCI_CPU_ON => ret,
-            in("x1") mpidr,
-            in("x2") entry,
-            in("x3") 0u64,
-            lateout("x4") _, lateout("x5") _, lateout("x6") _, lateout("x7") _,
-            options(nostack),
-        );
-    }
-    Some(ret)
 }
 
 /// Release a core through the firmware's spin table.
@@ -148,23 +123,10 @@ pub fn start_secondaries() -> usize {
     super::put_hex(entry);
     put_str(b"\r\n");
 
-    let mut psci_worked = false;
     for i in 0..SECONDARIES {
-        // MPIDR for a BCM2711 core is simply its affinity-0 index.
-        let mpidr = (i + 1) as u64;
-        if let Some(r) = psci_cpu_on(mpidr, entry) {
-            if r == 0 {
-                psci_worked = true;
-                continue;
-            }
-        }
         spin_table_release(i, entry);
     }
-    put_str(if psci_worked {
-        b"smp: released via PSCI CPU_ON\r\n" as &[u8]
-    } else {
-        b"smp: PSCI declined - released via the firmware spin table\r\n" as &[u8]
-    });
+    put_str(b"smp: released via the firmware spin table\r\n");
 
     // Bounded wait. A core that never checks in leaves the machine running on the ones that did, which
     // is what §11.3 requires; hanging here would trade three cores for none.

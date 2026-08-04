@@ -43,6 +43,26 @@ somewhere that names neither the GPU nor the map (§26.7).
 | `arch/aarch64/mailbox.rs` | 3 -> 4 (+1) | `property_call`: copies an arbitrary tag request into this module's 16-byte-aligned static and the reply back out, length-checked against the buffer at both ends. The static rather than the caller's array because the mailbox packs the channel into the low 4 bits of the address it is handed - an arbitrarily-aligned caller buffer would send the message to the wrong channel, so the alignment guarantee stays in one place. |
 | `arch/aarch64/mod.rs` | 53 -> 55 (+2) | The write and the read of `FB_INFO`, the static that carries the geometry across the jump to the high half. A static rather than a local because the jump abandons the low stack along with every local on it - the same reason `memmap::current_map` exists. Single-threaded boot: written once before the jump, read once after. |
 
+## 2026-08-04 - Pi 4 SMP: the PSCI attempt hung the board, and is removed (feat/pi4-aarch64)
+
+Four cores came up on six consecutive QEMU boots and the board hung on the release line. The cause was
+the PSCI attempt, and the guard around it was the wrong claim.
+
+**An `smc` with no EL3 handler does not return an error - it traps to a vector nobody populated and the
+machine stops dead**, before it can report anything. There is also no way to ask first: a PSCI version
+query is itself an `smc`, so probing has exactly the failure it is probing for.
+
+The guard was "we booted at EL2, so something must own EL3". That is not the same claim. The stock Pi 4
+armstub passes control at EL2 and implements **no PSCI handler at all**. QEMU, which hands over at EL3,
+was the only environment where the guard did the right thing - so the bug was invisible in the one place
+it was tested, and the fix that made QEMU pass is what made hardware hang.
+
+The spin table is what this firmware implements, what the board's own device tree describes, and it
+needs no `smc` to find out. It is now the only mechanism.
+
+No new `unsafe` (the PSCI `smc` block is gone; the count is unchanged because the spin-table write and
+the cache clean it needs were already there).
+
 ## 2026-08-04 - Pi 4 SMP: four cores, on by default (feat/pi4-aarch64)
 
 The last piece was a **single missing line**, and the 32-bit port had it all along
