@@ -326,6 +326,25 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
             continue;
         }
 
+        // **Ask the firmware to reload the controller's firmware, before touching its BAR.**
+        //
+        // The VL805's firmware lives in an SPI EEPROM and is loaded into it by the VideoCore at
+        // power-on. The PERST# assertion this bring-up performs wipes it, leaving a device whose config
+        // space answers perfectly (that is the PCIe core) and whose memory BAR answers not at all (that
+        // is the firmware). See `mailbox::notify_xhci_reset` for why that is worth a paragraph.
+        let dev_addr = (1u32 << 20) | ((dev as u32) << 15);
+        if super::mailbox::notify_xhci_reset(dev_addr) {
+            put_str(b"pcie: firmware notified of the xHCI reset - reloading controller firmware\r\n");
+        } else {
+            // Not fatal, and not silently ignored: on a board whose firmware predates the tag this is
+            // expected, and on one where it should have worked it is the single most likely reason the
+            // BAR reads back as poison a few lines from here.
+            put_str(b"pcie: firmware REFUSED the xHCI reset notify - the controller may have no firmware\r\n");
+        }
+        // The reload is not instant, and there is nothing to poll: the tag returns as soon as the
+        // request is accepted, not when the controller is ready. Linux waits in the same shape.
+        delay_us(200_000);
+
         // Size BAR0 the standard way: write all-ones, read back the writable bits.
         cfg_write(1, dev, 0, 0x10, 0xFFFF_FFFF);
         let probe = cfg_read(1, dev, 0, 0x10);

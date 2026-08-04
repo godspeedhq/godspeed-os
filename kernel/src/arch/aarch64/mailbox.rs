@@ -27,9 +27,13 @@ use super::{put_dec, put_hex, put_str};
 
 /// Mailbox registers: BCM2711 peripheral base + 0xB880.
 const MBOX_BASE: usize = 0xFE00_B880;
-const MBOX_READ: *const u32 = MBOX_BASE as *const u32;
-const MBOX_STATUS: *const u32 = (MBOX_BASE + 0x18) as *const u32;
-const MBOX_WRITE: *mut u32 = (MBOX_BASE + 0x20) as *mut u32;
+/// Reached through `mmio()` rather than as raw constants, so these work on BOTH sides of the jump to
+/// the high half. As fixed low addresses they were correct only until `drop_low_map`, which is fine
+/// while the only caller is the pre-MMU board query - and a translation fault the moment anything
+/// later wants the mailbox, which the xHCI reset notify does.
+fn mbox_read() -> *const u32 { super::mmio(MBOX_BASE) as *const u32 }
+fn mbox_status() -> *const u32 { super::mmio(MBOX_BASE + 0x18) as *const u32 }
+fn mbox_write() -> *mut u32 { super::mmio(MBOX_BASE + 0x20) as *mut u32 }
 
 const MBOX_FULL: u32 = 0x8000_0000;
 const MBOX_EMPTY: u32 = 0x4000_0000;
@@ -66,40 +70,51 @@ pub struct BoardInfo {
 
 /// Send the staged message and wait for the reply. Returns false on timeout or an error response.
 ///
+/// Works before and after `mmu::enable`. Before it, caches are off and the GPU trivially sees what we
+/// wrote. After, the buffer is cacheable and the GPU reads RAM directly, so it is cleaned before the
+/// doorbell and invalidated before the reply is read - the same DMA-coherency obligation every other
+/// bus master on this board has.
+///
 /// # Safety
-/// Must run before `mmu::enable` (caches off) - see the module header.
+/// `MBOX` must not be in use by another caller. Boot is single-threaded, and the only later caller is
+/// the xHCI reset notify, which runs from the same boot path.
 unsafe fn call() -> bool {
-    // SAFETY: mailbox MMIO on the identity-mapped peripheral window, single-threaded boot, caches off
-    // so the buffer the GPU reads is the buffer we wrote.
+    // SAFETY: mailbox MMIO through the kernel's peripheral mapping, single-threaded boot.
     unsafe {
-        let addr = (&raw const MBOX) as u32;
+        // The GPU is handed a PHYSICAL address. Before the jump the static's address is already
+        // physical; after it, it is a high-half virtual one, and `virt_to_phys` is the conversion that
+        // makes the difference explicit rather than relying on the low 32 bits happening to match.
+        let addr = super::mmu::virt_to_phys((&raw const MBOX) as u64) as u32;
+        super::mmu::dma_sync((&raw const MBOX) as u64, 36 * 4);
         // Wait for room, bounded.
         let mut spins = 0;
-        while MBOX_STATUS.read_volatile() & MBOX_FULL != 0 {
+        while mbox_status().read_volatile() & MBOX_FULL != 0 {
             spins += 1;
             if spins > MBOX_SPINS {
                 put_str(b"mailbox: WARN status stuck FULL - no GPU?\r\n");
                 return false;
             }
         }
-        MBOX_WRITE.write_volatile((addr | BUS_ALIAS) | CHANNEL_PROP);
+        mbox_write().write_volatile((addr | BUS_ALIAS) | CHANNEL_PROP);
 
         // Wait for a reply on OUR channel, bounded. The mailbox is shared, so a reply for a different
         // channel is discarded rather than mistaken for ours.
         spins = 0;
         loop {
-            while MBOX_STATUS.read_volatile() & MBOX_EMPTY != 0 {
+            while mbox_status().read_volatile() & MBOX_EMPTY != 0 {
                 spins += 1;
                 if spins > MBOX_SPINS {
                     put_str(b"mailbox: WARN no reply before the bound expired\r\n");
                     return false;
                 }
             }
-            let msg = MBOX_READ.read_volatile();
+            let msg = mbox_read().read_volatile();
             if msg & 0xF == CHANNEL_PROP {
                 break;
             }
         }
+        // Invalidate before reading the reply: the GPU wrote it to RAM, not through our caches.
+        super::mmu::dma_sync((&raw const MBOX) as u64, 36 * 4);
         // 0x8000_0000 = request succeeded. Anything else means the firmware rejected it, and the
         // caller must not read the value buffer.
         (&raw const MBOX).read_volatile().0[1] == 0x8000_0000
@@ -135,6 +150,35 @@ pub fn property_call(req: &mut [u32]) -> Option<()> {
         }
     }
     Some(())
+}
+
+/// Tell the firmware we have reset the VL805, so it reloads the controller's firmware.
+///
+/// **This is the step without which the Pi 4's USB does not exist.** The VL805 is not a
+/// self-contained controller: its firmware lives in an SPI EEPROM on the board and is loaded into it by
+/// the VideoCore at power-on. Asserting PERST# during PCIe bring-up - which the bring-up must do, to
+/// give the endpoint a clean reset edge - wipes it. What is left answers CONFIG space perfectly,
+/// because that is the PCIe core, and does not answer its memory BAR at all, because that is the
+/// firmware. Every register read comes back as the root complex's poison value.
+///
+/// That failure is indistinguishable from a bridge window that was never opened, which is how the
+/// first two hardware iterations were spent. The firmware exposes this tag precisely so an OS that
+/// resets the controller can ask for the reload; Linux calls it from the same place for the same
+/// reason.
+///
+/// `dev_addr` is the controller's PCI address in the usual `(bus << 20) | (dev << 15) | (fn << 12)`
+/// encoding.
+pub fn notify_xhci_reset(dev_addr: u32) -> bool {
+    const TAG_NOTIFY_XHCI_RESET: u32 = 0x0003_0058;
+    let mut req = [0u32; 7];
+    req[0] = 7 * 4;
+    req[1] = 0;
+    req[2] = TAG_NOTIFY_XHCI_RESET;
+    req[3] = 4;
+    req[4] = 4;
+    req[5] = dev_addr;
+    req[6] = 0; // end tag
+    property_call(&mut req).is_some()
 }
 
 /// Ask the firmware what it knows. Call once, early, with caches off.

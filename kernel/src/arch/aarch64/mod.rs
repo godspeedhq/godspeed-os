@@ -785,11 +785,23 @@ extern "C" fn boot_high() -> ! {
         // has to cover the highest address a bus master may be handed, and a map with a hole in it
         // (which the Pi 4's is - the GPU carve sits between the two banks) sums to less than that.
         let ram_top = bi.memory_map.iter().map(|r| r.base + r.len).max().unwrap_or(0);
+        // The whole USB bring-up runs inside the probe window, not just the PCIe half. A read that does
+        // not reach the controller completes with a poison value rather than faulting, but the WRITES
+        // that go with it can be refused - and that refusal arrives later, as an asynchronous SError
+        // that detonates at the next entry to EL0 and blames a userspace task. That is what happened on
+        // the second hardware iteration: xhci reported "reads are not reaching the controller" and
+        // returned cleanly, and the machine died 190 ms later in the EL0 selftest.
+        exceptions::begin_probe();
         // SAFETY: single-threaded boot; written once here, read by the USB driver afterwards.
         unsafe { PCIE_XHCI = pcie::init(ram_top) };
         // SAFETY: read-once of the static just written, still single-threaded.
         if let Some(dev) = unsafe { PCIE_XHCI } {
             xhci::init(dev.bar0, dev.bar0_len);
+        }
+        let aborts = exceptions::end_probe();
+        if aborts > 0 {
+            crate::kprintln!(
+                "usb: {} device access(es) were REFUSED by the interconnect during bring-up", aborts);
         }
 
         page_table_selftest();
