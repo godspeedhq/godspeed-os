@@ -452,7 +452,8 @@ pub fn verify_dma_layout() -> bool {
     let rx_ok = verify_dma_base(RDMA_OFFSET, b"RDMA");
     let tx_ok = verify_dma_base(TDMA_OFFSET, b"TDMA");
     if rx_ok && tx_ok {
-        put_str(b"genet: DMA ring registers respond at RDMA 0x2000 / TDMA 0x4000 - bases confirmed\r\n");
+        put_str(b"genet: DMA ring registers respond at RDMA 0x2c00 / TDMA 0x4c00 \
+                  (descriptors at 0x2000 / 0x4000) - bases confirmed\r\n");
     }
     // Leave both blocks disabled either way. Nothing here has given the controller a buffer, and a
     // controller enabled without one is a device writing to whatever its registers happen to hold.
