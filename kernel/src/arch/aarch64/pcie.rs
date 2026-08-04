@@ -145,14 +145,19 @@ fn link_up() -> bool {
     (s & STATUS_DL_ACTIVE) != 0 && (s & STATUS_PHYLINKUP) != 0
 }
 
-/// Encode an inbound-window size the way `RC_BAR2_CONFIG_LO` wants it: `log2(size) - 15`, for sizes
-/// from 64 KiB up.
+/// Encode an inbound-window size the way `RC_BAR2_CONFIG_LO` wants it.
+///
+/// `log2(size) - 15` for 64 KiB..32 GiB, and 0 (disabled) for anything outside that. The `+ 1` this
+/// carried was simply wrong - it opened a window twice the size of RAM. That does not affect the
+/// outbound reads being chased here, because this register sizes what a bus master may reach INBOUND,
+/// but it would have shown up later as the xHCI controller being able to DMA past the end of memory,
+/// which is a security property and not a performance one.
 fn encode_ibar_size(size: u64) -> u32 {
-    if size < 64 * 1024 {
-        return 0;
-    }
     let lg = 63 - size.next_power_of_two().leading_zeros() as u64;
-    (lg - 15) as u32 + 1
+    if !(16..=35).contains(&lg) {
+        return 0; // outside what the field can express: leave the window shut
+    }
+    (lg - 15) as u32
 }
 
 // --- Config space -----------------------------------------------------------------------------
@@ -237,7 +242,10 @@ pub fn init(ram_bytes: u64) -> Option<Device> {
     let enc = encode_ibar_size(size);
     wr(RC_BAR2_CONFIG_LO, enc & 0x1F);
     wr(RC_BAR2_CONFIG_HI, 0);
-    let scb = if enc >= 1 { enc - 1 } else { 0 };
+    // SCB0_SIZE uses the SAME encoding as the inbound window, not one less than it. The `enc - 1` this
+    // carried was a guess that happened to compile; the reference computes `ilog2(size) - 15` for both.
+    // 0x1F is the "no memory controller" value, which is what a size we cannot express should mean.
+    let scb = if enc == 0 { 0x1F } else { enc };
     set_bits(MISC_CTRL, 0x1F << MISC_CTRL_SCB0_SIZE_SHIFT, scb << MISC_CTRL_SCB0_SIZE_SHIFT);
 
     // 5. The other two inbound windows stay shut - nothing here uses them, and an open window is
@@ -472,24 +480,52 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
         // Everything that decides whether a read reaches the device, read back from the hardware.
         report_routing();
 
-        // And then the question itself: does a read through the window reach the controller? Probed,
-        // so an abort is caught and named rather than counted anonymously later. Three outcomes, and
-        // they want three different fixes: an abort means the CPU address is not decoded to PCIe at
-        // all; poison means it reaches the root complex and stops there; anything else means it
-        // arrived. Reporting which one it is costs one read and has been the missing fact twice.
+        // And then the question itself, asked so the ANSWER distinguishes the remaining possibilities
+        // rather than merely restating the symptom.
+        //
+        // A poison value on its own is ambiguous: it is what the root complex returns when it forwards
+        // a read and nobody completes it, AND what comes back when nothing decodes the address at all.
+        // Those want opposite fixes. The bridge's **secondary status** register settles it, because a
+        // bridge that forwarded a transaction and received no completer records a Master Abort. So the
+        // bit is cleared, the read is made, and the bit is read back.
+        //
+        // Secondary status is the upper half of the dword at config offset 0x1C, and its error bits are
+        // write-1-to-clear.
+        let sec = cfg_read(0, 0, 0, 0x1C);
+        cfg_write(0, 0, 0, 0x1C, sec | 0xFFFF_0000);
+
         // SAFETY: 4-byte aligned, inside the Device mapping `mmu` built for this window.
         let first = unsafe { super::uaccess::probe_read32(super::mmu::PCIE_WIN_VA) };
+        let sec_after = (cfg_read(0, 0, 0, 0x1C) >> 16) & 0xFFFF;
+        const SEC_MASTER_ABORT: u32 = 1 << 13;
+
         put_str(b"pcie: first dword through the window: ");
         match first {
-            None => put_str(b"ABORTED - the CPU address is not decoded to PCIe\r\n"),
-            Some(0xDEAD_DEAD) => {
-                put_str(b"0xdeaddead - reaches the root complex, which will not forward it\r\n")
-            }
+            None => put_str(b"ABORTED - the CPU address is not decoded to PCIe at all\r\n"),
             Some(v) => {
                 put_hex(v as u64);
-                put_str(b" - the read arrived\r\n");
+                if v == 0xDEAD_DEAD || v == 0xFFFF_FFFF {
+                    if sec_after & SEC_MASTER_ABORT != 0 {
+                        put_str(b" - the bridge FORWARDED it and no device completed it: the endpoint \
+                                  is not decoding its BAR\r\n");
+                    } else {
+                        put_str(b" - the bridge did NOT forward it (no master abort recorded): the \
+                                  outbound window or the bridge window is not routing\r\n");
+                    }
+                } else {
+                    put_str(b" - the read arrived\r\n");
+                }
             }
         }
+        put_str(b"pcie: bridge secondary status ");
+        put_hex(sec_after as u64);
+        put_str(b", device status ");
+        put_hex(((cfg_read(1, dev, 0, 0x04) >> 16) & 0xFFFF) as u64);
+        put_str(b", device bar0 ");
+        put_hex(cfg_read(1, dev, 0, 0x10) as u64);
+        put_str(b", device cmd ");
+        put_hex((cfg_read(1, dev, 0, 0x04) & 0xFFFF) as u64);
+        put_str(b"\r\n");
 
         return Some(Device {
             bus: 1,
