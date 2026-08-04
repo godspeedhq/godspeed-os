@@ -106,6 +106,37 @@ unsafe fn call() -> bool {
     }
 }
 
+/// Run an arbitrary property-tag request: copy it into the aligned mailbox buffer, call, copy the
+/// reply back. Returns `None` if the firmware rejected it.
+///
+/// The buffer has to be this module's 16-byte-aligned static rather than the caller's array, because
+/// the mailbox packs the channel into the low 4 bits of the address it is handed - a caller's
+/// arbitrarily-aligned buffer would send the message to the wrong channel. Copying in and out is the
+/// price of keeping that alignment guarantee in one place.
+///
+/// # Safety of timing
+/// Like every other user of this mailbox, must run before `mmu::enable` - see the module header.
+pub fn property_call(req: &mut [u32]) -> Option<()> {
+    if req.len() > 36 {
+        return None; // larger than the shared buffer; a caller bug, refused rather than truncated
+    }
+    // SAFETY: single-threaded boot, caches off, and MBOX is this module's static. The length is
+    // checked above, so neither copy can run past either end.
+    unsafe {
+        let b = &raw mut MBOX;
+        for (i, w) in req.iter().enumerate() {
+            (*b).0[i] = *w;
+        }
+        if !call() {
+            return None;
+        }
+        for (i, w) in req.iter_mut().enumerate() {
+            *w = (*b).0[i];
+        }
+    }
+    Some(())
+}
+
 /// Ask the firmware what it knows. Call once, early, with caches off.
 pub fn query() -> BoardInfo {
     let mut info = BoardInfo::default();

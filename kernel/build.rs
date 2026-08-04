@@ -128,9 +128,11 @@ fn main() {
     // so they are opt-in via `pi4-demo-services` rather than always present.
     let aarch64_demo = std::env::var("CARGO_FEATURE_PI4_DEMO_SERVICES").is_ok();
     let aarch64_built: &[&str] = if aarch64_demo {
-        &["logger", "ping", "pong", "supervisor", "shell"]
+        &["logger", "ping", "pong", "supervisor", "shell", "chaos", "observe", "mem-pressure"]
     } else {
-        &["logger", "supervisor", "shell"]
+        // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
+        // carnage, and observe is how it is watched while it does. Both are arch-neutral.
+        &["logger", "supervisor", "shell", "chaos", "observe", "mem-pressure"]
     };
     let aarch64_dir = workspace
         .join("target")

@@ -13,6 +13,63 @@ comment.
 
 ---
 
+## 2026-08-04 - Pi 4 milestone 22: the display (feat/pi4-aarch64)
+
+The Pi has no bootloader-supplied framebuffer descriptor the way x86 does with Limine, so the ARM asks
+the VideoCore for one through the same property mailbox that reported the board revision and the RAM
+size at milestone 7 - and in the same caches-off window, for the same reason: the GPU reads the request
+straight out of RAM, so asking before the caches are on removes the coherency question instead of
+answering it.
+
+**The console itself is arch-neutral and stays `unsafe`-free.** `crate::fbcon` - the ANSI parser, the
+UTF-8 decoder, the character grid, glyph rendering, scrolling - is shared with x86 and the 32-bit ARM
+port. This arch owes it exactly three things (`fb_commit`, `FB_READBACK_CHEAP`, and the framebuffer as a
+`&'static mut [u8]`) and gets a full terminal for them. Handing over a **slice** rather than a base
+address is what keeps every pixel write in the neutral console bounds-checked: the one `unsafe` that
+buys the display lives here in `arch/`, where the mapping's validity is actually known.
+
+Three checks stand between the GPU's reply and that slice, because a mailbox reply is firmware-supplied
+input and a plausible-looking wrong answer is the failure mode: the bus-address alias is masked back to
+an ARM physical address (skipping that yields an address that points nowhere and a display that stays
+dark with no error); the geometry is range-checked before it drives a fill loop and a slice length; and
+the framebuffer must lie inside the kernel's direct map AND below `mmu::DEVICE_BASE`, since everything
+above that is mapped Device-nGnRnE, which forbids the unaligned accesses the glyph renderer makes. Each
+failure keeps the machine on serial and says so, rather than mapping something and faulting later
+somewhere that names neither the GPU nor the map (§26.7).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/video.rs` | new, 2 | `fb_commit`'s cache clean over the written rectangle (`dc cvac` by VA - the framebuffer is cacheable and the GPU reads RAM directly, not through the CPU's caches, so it would otherwise scan out stale pixels); and the one slice construction in `start_console`, over a framebuffer the GPU allocated and owns nothing else in, whose length is its own bounds-checked `pitch * height`, at a direct-map address checked to be inside the map. |
+| `arch/aarch64/mailbox.rs` | 3 -> 4 (+1) | `property_call`: copies an arbitrary tag request into this module's 16-byte-aligned static and the reply back out, length-checked against the buffer at both ends. The static rather than the caller's array because the mailbox packs the channel into the low 4 bits of the address it is handed - an arbitrarily-aligned caller buffer would send the message to the wrong channel, so the alignment guarantee stays in one place. |
+| `arch/aarch64/mod.rs` | 53 -> 55 (+2) | The write and the read of `FB_INFO`, the static that carries the geometry across the jump to the high half. A static rather than a local because the jump abandons the low stack along with every local on it - the same reason `memmap::current_map` exists. Single-threaded boot: written once before the jump, read once after. |
+
+## 2026-08-04 - Pi 4: the page-table primitives the chaos run needed (feat/pi4-aarch64)
+
+Four `page_tables` primitives were still stubs, and the difference between them mattered. Three were
+*quiet* stubs (`read_page_table_base` returning 0, `write_page_table_base` and `invalidate_tlb_page`
+doing nothing); one, `map_in_active_tables`, was an `unimplemented!()` - which is not a stub that fails
+at its caller, it is a **kernel panic**. The first thing to reach it was a chaos run's memory pressure:
+a service asking for heap took the whole machine down. Nothing had reached it in twenty-one milestones
+because no service had grown its heap.
+
+`map_in_active_tables` maps into whatever `TTBR0_EL1` holds, which is the *running* task's table. That
+cannot go through a `PageTable`, whose `Drop` frees the tree - wrapping the live root in one and letting
+it fall out of scope would free the address space of the task currently executing. `ptables::map_in_root`
+says the intended thing instead: borrow the root, do not own it.
+
+`write_page_table_base` deliberately performs **no** TLB maintenance, and the reason is recorded at the
+primitive rather than left to be rediscovered (SEC-27, `arch/CLAUDE.md`: every `arch::imp` primitive owes
+a documented semantic, not just a signature). On AArch64 a `TTBR0_EL1` write flushes nothing, so an
+address-space *change* must invalidate - and `context::switch_context` does, which is the only path that
+switches between two task spaces. This primitive exists for the shootdown path, which rewrites the value
+already installed; a flush here would be a second, redundant one on every context switch.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 55 -> 59 (+4) | `read_page_table_base` (an `mrs`, side-effect-free); `write_page_table_base` (`msr ttbr0_el1` + `isb`, so the next access is translated by the new table); `invalidate_tlb_page` (`dsb ishst` / `tlbi vaae1is` / `dsb ish` / `isb` - by VA, all ASIDs, inner-shareable, because the neutral shootdown path needs it visible machine-wide); and `map_in_active_tables` forwarding to `ptables::map_in_root`. |
+| `arch/aarch64/ptables.rs` | 19 -> 20 (+1) | `map_in_root`: maps one page into a live root the caller does not own, via `ManuallyDrop` so the borrow cannot free the running task's address space. Uses the same `map` path already audited. |
+
+
 ## 2026-08-04 - Pi 4: real services + the diagnostics that found the next bug (feat/pi4-aarch64)
 
 `ping` and `pong` are now built and embedded for aarch64, and spawned by name through
@@ -1623,7 +1680,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 53 | permitted |
+| arch/aarch64/mod.rs | 59 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/sched_spawn.rs | 2 | permitted |
 | arch/aarch64/uart_rx.rs | 2 | permitted |
@@ -1635,10 +1692,11 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/gic.rs | 4 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 12 | permitted |
-| arch/aarch64/ptables.rs | 21 | permitted |
+| arch/aarch64/ptables.rs | 20 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
-| arch/aarch64/mailbox.rs | 3 | permitted |
+| arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
+| arch/aarch64/video.rs | 2 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |

@@ -54,6 +54,20 @@ def tool(name):
     cargo_bin = pathlib.Path.home() / ".cargo" / "bin" / f"{name}.exe"
     return str(cargo_bin) if cargo_bin.exists() else name
 
+# The services embedded in the Pi 4 image. The kernel's `build.rs` picks up each one from
+# `target/aarch64-unknown-none/<profile>/` if it is in the matching list there, and falls back to the
+# empty placeholder otherwise (which is what a `LoadFailed(TooSmall)` at boot means: not ported yet).
+# Building them HERE rather than by hand is what keeps the two lists honest - a service added to
+# `build.rs` but never built silently stays a placeholder, and the boot log says so in a line that is
+# easy to read past.
+PI4_SERVICES = [
+    "logger", "supervisor", "shell",
+    "ping", "pong",
+    # The chaos service is what the carnage gate runs; `observe` is how the machine is watched while it
+    # runs. Both are arch-neutral - they needed building, not porting.
+    "chaos", "observe", "mem-pressure",
+]
+
 # `pi4` is always present; anything passed is added to it, not substituted for it.
 FEATURES = "pi4"
 if "--features" in sys.argv:
@@ -62,9 +76,15 @@ if "--features" in sys.argv:
         sys.exit("--features needs a comma-separated list")
     FEATURES = "pi4," + sys.argv[i + 1]
 
-args = ["cargo", "build", "-p", "kernel", "--target", TARGET, "--features", FEATURES]
-if PROFILE == "release":
-    args.append("--release")
+rel = ["--release"] if PROFILE == "release" else []
+
+# 1. The services first - the kernel embeds their ELFs, so a stale service is baked into the image.
+for svc in PI4_SERVICES:
+    feats = ["--features", "bare-metal"] if svc == "supervisor" else []
+    run(["cargo", "build", "-p", svc, "--target", TARGET] + feats + rel)
+
+# 2. The kernel.
+args = ["cargo", "build", "-p", "kernel", "--target", TARGET, "--features", FEATURES] + rel
 run(args)
 
 elf = ROOT / "target" / TARGET / PROFILE / "kernel"

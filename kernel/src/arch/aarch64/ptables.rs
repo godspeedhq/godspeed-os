@@ -256,6 +256,23 @@ impl PageTable {
     pub fn into_cr3(self) -> u64 { self.into_root() }
 }
 
+/// Map one page into an address space named only by its root, without owning it.
+///
+/// This is what the neutral `map_in_active_tables` needs: `AllocMem` grows the *running* task's heap,
+/// and the running task's table is whatever `TTBR0_EL1` holds. A `PageTable` cannot be used directly
+/// for that, because its `Drop` frees the tree - wrapping the live root in one and letting it fall out
+/// of scope would free the address space of the task that is currently executing. `ManuallyDrop` says
+/// exactly that: borrow the root, do not own it.
+///
+/// # Safety
+/// `root` must be a live L1 built by this module (the value in `TTBR0_EL1`, or a table the caller
+/// owns). The caller is responsible for any TLB maintenance a *re*mapping would need; this is used for
+/// fresh mappings, where there is no stale entry to invalidate.
+pub unsafe fn map_in_root(root: u64, virt: u64, phys: u64, flags: PageFlags) -> Result<(), MapError> {
+    let mut t = core::mem::ManuallyDrop::new(PageTable { root });
+    t.map(VirtAddr(virt), PhysAddr(phys), flags)
+}
+
 /// Free every frame reachable from `root`: the L3s, the L2s, then the root.
 ///
 /// Safe to do wholesale precisely because nothing is shared - see the module header. It frees only

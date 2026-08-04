@@ -31,7 +31,7 @@ pub mod ptables;
 pub mod sched_demo;
 #[cfg(all(feature = "pi4", feature = "pi4-sched-spawn"))]
 pub mod sched_spawn;
-#[cfg(all(feature = "pi4", feature = "pi4-supervisor"))]
+#[cfg(feature = "pi4")]
 pub mod sched_supervisor;
 #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
 pub mod sched_user;
@@ -40,9 +40,18 @@ pub mod timer;
 #[cfg(feature = "pi4")]
 pub mod uart_rx;
 #[cfg(feature = "pi4")]
+pub mod video;
+#[cfg(feature = "pi4")]
 pub mod uaccess;
 #[cfg(feature = "pi4")]
 pub mod usermode;
+
+/// Framebuffer geometry, obtained before the MMU and consumed after the jump to the high half.
+///
+/// A static rather than a local because the jump abandons the low stack along with every local on it -
+/// the same reason `memmap::current_map` exists.
+#[cfg(feature = "pi4")]
+static mut FB_INFO: Option<video::FbInfo> = None;
 
 /// Reload value for the periodic tick, in generic-timer counter ticks. The timer is one-shot, so the
 /// IRQ handler re-arms with this every time. Published here because the handler runs in an interrupt
@@ -211,12 +220,39 @@ pub unsafe extern "C" fn _start() -> ! {
         //
         // x19 survives the `eret` below - exception return does not alter general-purpose registers.
         "mov  x19, x0",
-        // --- Drop to EL1 if we entered at EL2 -------------------------------------------------
+        // --- Drop to EL2 if we entered at EL3 -------------------------------------------------
+        // QEMU's `raspi4b` implements EL3 and starts there; the real board's armstub has already been
+        // through EL3 and hands over at EL2. Nothing below is written for EL3 - the EL1 registers are
+        // writable there but govern nothing, so a kernel that stayed at EL3 would enable an MMU that
+        // does not translate it, and the first high-half access would fault with every register looking
+        // correct. That is exactly what it did: `MMU ON` printed, and the high-half selftest died.
+        //
+        // So drop to EL2 and rejoin the path the hardware takes. This is dead code on a real Pi, and it
+        // is worth its ten instructions anyway: without it the port can only ever be tested on hardware,
+        // and a port that cannot be run under emulation cannot be run under chaos.
+        "mrs  x0, CurrentEL",
+        "lsr  x0, x0, #2",
+        "cmp  x0, #3",
+        "b.ne 5f",                           // not EL3: nothing to do here
+        "mov  x0, #0x531",                   // SCR_EL3: NS | RW(EL2 is AArch64) | HCE | IRQ | RES1
+        "movk x0, #0, lsl #16",
+        "msr  scr_el3, x0",
+        "msr  cptr_el3, xzr",                // do not trap FP/SIMD from lower ELs at EL3
+        "mov  x0, #0x3c9",                   // SPSR_EL3: D|A|I|F masked, M[3:0] = 0b1001 (EL2h)
+        "msr  spsr_el3, x0",
+        "adr  x0, 5f",
+        "msr  elr_el3, x0",
+        "eret",
+        "5:",
+        // --- Drop to EL1 if we are at EL2 -----------------------------------------------------
         // QEMU `virt -kernel` enters at EL1, but the Pi 4's armstub hands the primary core over at
-        // **EL2**. At EL2 the EL1 system registers below are writable but do not govern us, and FP/SIMD
-        // is gated by CPTR_EL2 rather than CPACR_EL1 - so Rust's NEON memcpy would trap even though
-        // CPACR_EL1 says otherwise. Rather than special-case the whole file by exception level, drop to
-        // EL1 first and let everything after this assume EL1.
+        // **EL2** (and the EL3 drop just above lands here too). At EL2 the EL1 system registers below
+        // are writable but do not govern us, and FP/SIMD is gated by CPTR_EL2 rather than CPACR_EL1 -
+        // so Rust's NEON memcpy would trap even though CPACR_EL1 says otherwise. Rather than
+        // special-case the whole file by exception level, drop to EL1 and let everything after this
+        // assume EL1.
+        //
+        // CurrentEL is re-read rather than assumed: we may have arrived here from either level.
         "mrs  x0, CurrentEL",
         "lsr  x0, x0, #2",
         "cmp  x0, #2",
@@ -310,6 +346,13 @@ extern "C" fn aarch64_boot_main(dtb: u64) -> ! {
         put_str(b"\r\n");
         let (map, source) = memmap::build(dtb, &info);
         memmap::report(map, source);
+
+        // Ask the GPU for a framebuffer in the SAME caches-off window, and for the same reason: it
+        // reads the request straight out of RAM. The console cannot start until the kernel is in the
+        // high half, so the geometry is kept and used after the jump.
+        // SAFETY: single-threaded boot; this static is written once here and read once after the jump.
+        unsafe { FB_INFO = video::init() };
+
         map
     };
 
@@ -666,6 +709,13 @@ extern "C" fn boot_high() -> ! {
     unsafe { mmu::drop_low_map() };
     put_str(b"aarch64: low identity map RETIRED - TTBR0_EL1 is free for a task\r\n");
 
+    // Now that the kernel addresses memory through the high half, the framebuffer can be handed to the
+    // shared console as a slice. Before the jump its only name was a physical address.
+    // SAFETY: single-threaded boot; `FB_INFO` was written before the jump and is read exactly once here.
+    if let Some(fb) = unsafe { FB_INFO } {
+        video::start_console(fb);
+    }
+
     // Vectors AFTER the MMU, because VBAR_EL1 holds a virtual address and installing it before
     // translation is live would point at an address that is about to mean something else. From here on
     // a fault reports itself instead of wandering off into whatever sits at the reset vector.
@@ -819,15 +869,21 @@ extern "C" fn boot_high() -> ! {
     // machine to the scheduler.
     // A REAL service through the neutral spawn path. Checked first: if both features are on, running a
     // compiled service is the more informative of the two, and neither returns.
-    // The real OS bootstrap: the kernel's ONE direct spawn is the supervisor, which spawns the rest.
-    #[cfg(all(feature = "pi4", feature = "pi4-supervisor"))]
-    sched_supervisor::run();
-
+    // A demo, if one was asked for. Explicit request wins: the point of building with one is to watch it.
     #[cfg(all(feature = "pi4", feature = "pi4-sched-spawn"))]
     sched_spawn::run();
 
     #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
     sched_demo::run(&boot_info);
+
+    // Otherwise the real OS bootstrap: the kernel's ONE direct spawn is the supervisor, which spawns
+    // the rest. This is the DEFAULT, so `--features pi4` builds the OS rather than a kernel that boots
+    // and halts - the deployed image and the tested image are then the same build.
+    #[cfg(all(
+        feature = "pi4",
+        not(any(feature = "pi4-sched-spawn", feature = "pi4-sched-demo"))
+    ))]
+    sched_supervisor::run();
 
     put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.
 ");
@@ -872,6 +928,10 @@ pub(crate) fn put_str(s: &[u8]) {
     for &b in s {
         put_byte(b);
     }
+    // Serial first, then the display: serial is the source of truth, and a mirror that ran first would
+    // put the display ahead of the log it is mirroring.
+    #[cfg(feature = "pi4")]
+    video::mirror_log(s);
 }
 
 
@@ -951,16 +1011,21 @@ pub fn note_user_task(_slot: usize) {}
 
 // --- Framebuffer console backend (`crate::fbcon`) ---
 //
-// The neutral console owes each arch two things (see `crate::fbcon`'s module header). Until this port
-// maps the Pi's framebuffer there is nothing to publish, so `fb_commit` is a no-op and the console
-// simply never initialises - `fbcon::ready()` stays false and every entry point no-ops.
+// The neutral console owes each arch two things (see `crate::fbcon`'s module header): publish a written
+// rectangle, and say whether reading the framebuffer back is cheap. On the Pi 4 both live in `video`,
+// next to the mailbox call that obtained the framebuffer in the first place.
 
-/// No framebuffer is mapped yet, so the scroll strategy is moot. `false` is the conservative choice:
-/// it selects the repaint-from-shadow-grid path, which never reads the framebuffer back.
+/// On the Pi 4 the framebuffer is ordinary RAM the GPU scans out of, covered by the kernel's direct map
+/// as Normal cacheable memory - so reading it back costs what writing it does, and the console can
+/// scroll by copying within the framebuffer instead of repainting from its shadow grid.
+#[cfg(feature = "pi4")]
+pub use video::{fb_commit, FB_READBACK_CHEAP};
+
+/// No framebuffer on the QEMU `virt` demarcation target. `false` selects the repaint-from-shadow-grid
+/// path, which never reads the framebuffer back.
+#[cfg(not(feature = "pi4"))]
 pub const FB_READBACK_CHEAP: bool = false;
-
-/// Publish a written rectangle. Nothing to do until a framebuffer exists; when one does, this becomes
-/// either a cache clean (if it is mapped cacheable, as on the Pi 2) or a barrier.
+#[cfg(not(feature = "pi4"))]
 pub fn fb_commit(
     _base: usize, _pitch: usize, _bpp: usize,
     _x: usize, _y: usize, _w: usize, _h: usize,
@@ -1006,7 +1071,14 @@ pub fn serial_write_byte(b: u8) {
     if b == b'\n' { put_byte(b'\r'); }
     put_byte(b);
 }
-pub fn serial_write_bytes_lockfree(s: &[u8]) { for &b in s { serial_write_byte(b); } }
+pub fn serial_write_bytes_lockfree(s: &[u8]) {
+    for &b in s { serial_write_byte(b); }
+    // Mirror the whole run to the display, not byte by byte: the neutral log stages a complete line
+    // before calling here, and the console's lock is worth taking once per line rather than per byte.
+    // Log traffic stops mirroring once the shell owns the console - see `video::boot_complete`.
+    #[cfg(feature = "pi4")]
+    video::mirror_log(s);
+}
 /// A service's CONSOLE output - the shell's prompt, and everything it prints.
 ///
 /// A no-op stub until now, which is why the shell spawned, ran, and produced nothing: it was writing
@@ -1018,9 +1090,14 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) { for &b in s { serial_write_byte(b
 /// on serial only. This port has no framebuffer console yet, so serial is the only destination and the
 /// gate has nothing to select - honoured as soon as one exists.
 #[cfg(feature = "pi4")]
-pub fn console_write_bytes_gated(s: &[u8], _to_fb: bool) {
+pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
     for &b in s {
         serial_write_byte(b);
+    }
+    // The gate is now real: `false` means a full-screen app owns the display, so this text belongs on
+    // serial only.
+    if to_fb {
+        video::mirror(s);
     }
 }
 #[cfg(not(feature = "pi4"))]
@@ -1030,6 +1107,10 @@ pub fn claim_console_foreground(task_slot: u32) {}
 pub fn release_console_foreground() {}
 pub fn release_console_foreground_if_owner(task_slot: u32) {}
 pub fn console_foreground_allows(task_slot: u32) -> bool { true }
+/// The shell has the console: dismiss the boot screen and present a clean prompt.
+#[cfg(feature = "pi4")]
+pub fn console_boot_complete() { video::boot_complete(); }
+#[cfg(not(feature = "pi4"))]
 pub fn console_boot_complete() {}
 pub fn console_push_byte(b: u8) {}
 /// Whether the machine's console INPUT path is up, which gates the shell's prompt.
@@ -1211,10 +1292,84 @@ pub mod page_tables {
     pub unsafe fn set_hhdm_offset(offset: u64) {
         HHDM.store(offset, core::sync::atomic::Ordering::Release);
     }
-    pub fn read_page_table_base() -> u64 { 0 }               // TTBR0_EL1
-    pub unsafe fn write_page_table_base(base: u64) {}
-    pub unsafe fn invalidate_tlb_page(addr: u64) {}          // TLBI VAE1
-    pub unsafe fn map_in_active_tables(virt: u64, phys: u64, flags: u64) -> Result<(), MapError> { unimplemented!() }
+    /// The running address space, as `TTBR0_EL1` holds it.
+    ///
+    /// Returned raw. The ASID lives in the top 16 bits and is 0 on this port, but neutral callers mask
+    /// with `& !0xFFF` anyway, so returning the register verbatim keeps this honest if an ASID is ever
+    /// used.
+    pub fn read_page_table_base() -> u64 {
+        let v: u64;
+        // SAFETY: a side-effect-free system-register read.
+        unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) v, options(nomem, nostack)) };
+        v
+    }
+
+    /// Install an address space.
+    ///
+    /// **No TLB maintenance here, and that is deliberate** (SEC-26, `arch/CLAUDE.md`): on AArch64 a
+    /// `TTBR0_EL1` write flushes nothing, so an address-space *change* must invalidate - and it does,
+    /// in `context::switch_context`, which is the only path that switches between two task spaces.
+    /// This primitive exists for the shootdown path, which writes back the value already installed to
+    /// force a walk; adding a flush here would be a second, redundant one on every context switch.
+    ///
+    /// # Safety
+    /// `base` must be a live L1 root for the calling core.
+    pub unsafe fn write_page_table_base(base: u64) {
+        // SAFETY: caller's contract. The `isb` orders the switch against the instructions after it, so
+        // the next access is translated by the new table rather than possibly by the old one.
+        unsafe {
+            core::arch::asm!("msr ttbr0_el1, {}", "isb", in(reg) base, options(nostack));
+        }
+    }
+
+    /// Invalidate one page's translation.
+    ///
+    /// `tlbi vaae1is`: by VA, ALL ASIDs, Inner-Shareable (every core), because the neutral shootdown
+    /// path uses this to make an unmap visible machine-wide. The `dsb ish` before it orders the
+    /// page-table write that preceded; the one after waits for the invalidate to complete, and the
+    /// `isb` keeps already-fetched instructions from using a stale translation.
+    ///
+    /// # Safety
+    /// Cache/TLB maintenance alters no architectural state beyond the TLB.
+    pub unsafe fn invalidate_tlb_page(addr: u64) {
+        // TLBI operands are VA >> 12.
+        let page = addr >> 12;
+        // SAFETY: as above.
+        unsafe {
+            core::arch::asm!(
+                "dsb ishst",
+                "tlbi vaae1is, {}",
+                "dsb ish",
+                "isb",
+                in(reg) page,
+                options(nostack),
+            );
+        }
+    }
+
+    /// Map a page into the **running** task's address space.
+    ///
+    /// The neutral `AllocMem` syscall grows the calling task's heap, and the calling task's table is
+    /// whatever `TTBR0_EL1` holds during the syscall. This was an `unimplemented!()`, which is not a
+    /// stub that fails at the caller: it PANICS THE KERNEL, and the first thing to reach it was a chaos
+    /// run's memory pressure - a service asking for heap took the whole machine down with it.
+    ///
+    /// # Safety
+    /// `virt` is a user address in the calling task's space and `phys` comes from the frame allocator;
+    /// the caller has already decided the page is unmapped.
+    pub unsafe fn map_in_active_tables(virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
+        let root = read_page_table_base() & !0xFFF_u64;
+        // SAFETY: `root` is the live L1 this core is executing under, borrowed rather than owned - see
+        // `ptables::map_in_root`. The mapping is fresh, so there is no stale TLB entry to invalidate.
+        unsafe {
+            super::ptables::map_in_root(
+                root,
+                virt,
+                phys,
+                PageFlags::from_bits_truncate(flags),
+            )
+        }
+    }
     pub fn entry_for_va(virt: u64) -> Option<u64> { None }
     pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {}
     pub fn harden_hhdm_nx() {}

@@ -53,7 +53,7 @@ const BLOCK_SIZE: u64 = 2 * 1024 * 1024;
 /// at `0xFF84_0000`. The VideoCore also reserves memory at the top of RAM, so the ARM never owns the
 /// space immediately below the peripherals either. Rounding the boundary down to `0xFC00_0000` covers
 /// both with one comparison and costs at most a little RAM that the firmware had already taken.
-const DEVICE_BASE: u64 = 0xFC00_0000;
+pub const DEVICE_BASE: u64 = 0xFC00_0000;
 
 extern "C" {
     static __el0_start: u8;

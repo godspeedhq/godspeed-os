@@ -70,6 +70,12 @@ pi4-sched-spawn = []
 # The real OS bootstrap on the Pi 4: the kernel makes its ONE direct spawn (the supervisor), which then
 # spawns the services - including the shell, with a CONSOLE_READ cap wired to the PL011 receiver. The
 # aarch64 twin of `arm-supervisor`. This is the build that gives a `gsh>` prompt.
+#
+# **This is what `--features pi4` does by default** - it is the OS, not an option. The feature is kept
+# so the intent can still be named explicitly, but it does not have to be passed: the boot runs the
+# supervisor unless a demo feature above claims the machine instead. Defaulting the other way (a build
+# that boots and halts) meant the deployable image and the tested image were different builds, which is
+# exactly the gap a `--features` flag is good at hiding.
 pi4-supervisor = []
 # Embed the ping/pong DEMO services in the Pi 4 image. They pace with `yield_cpu`, not a sleep, so they
 # emit ~500 log lines a second - proof of IPC, but it buries the shell prompt. Off by default so the
