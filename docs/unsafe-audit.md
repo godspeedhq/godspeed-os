@@ -43,6 +43,25 @@ somewhere that names neither the GPU nor the map (§26.7).
 | `arch/aarch64/mailbox.rs` | 3 -> 4 (+1) | `property_call`: copies an arbitrary tag request into this module's 16-byte-aligned static and the reply back out, length-checked against the buffer at both ends. The static rather than the caller's array because the mailbox packs the channel into the low 4 bits of the address it is handed - an arbitrarily-aligned caller buffer would send the message to the wrong channel, so the alignment guarantee stays in one place. |
 | `arch/aarch64/mod.rs` | 53 -> 55 (+2) | The write and the read of `FB_INFO`, the static that carries the geometry across the jump to the high half. A static rather than a local because the jump abandons the low stack along with every local on it - the same reason `memmap::current_map` exists. Single-threaded boot: written once before the jump, read once after. |
 
+## 2026-08-04 - Pi 4: the serial lock made the machine crawl, and is now try-once (feat/pi4-aarch64)
+
+The console lock below fixed the shredding and broke the machine. Boot went from seconds to **104
+seconds**, characters trickled out one at a time, and `chaos` ended in a liveness-watchdog panic.
+
+Two mistakes compounded. The claim **spun** up to two million times, and it was **held across the
+framebuffer render** - glyph drawing plus cache maintenance over a rectangle, far more expensive than
+the UART write it was protecting. So every core queued behind every other core's rendering, and a core
+that had spent ten seconds spinning was correctly declared wedged.
+
+Now: **one attempt, never a spin.** A contended writer emits its bytes anyway and skips only the display
+mirror - the expensive part, and the part nobody reads during contention. Lines can interleave under
+load, which is exactly the trade the 32-bit port makes and for exactly this reason. A log line must
+never make a core wait.
+
+Boot is back to 8 seconds with four cores on every run, and a carnage run survives.
+
+No new `unsafe`.
+
 ## 2026-08-04 - Pi 4: the serial console had no lock, and four cores made that matter (feat/pi4-aarch64)
 
 Removing PSCI got the board past the release: all three secondaries check in, the machine boots, reboots

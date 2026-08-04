@@ -1305,38 +1305,34 @@ pub fn serial_write_byte(b: u8) {
 #[cfg(feature = "pi4")]
 static SERIAL_BUSY: AtomicBool = AtomicBool::new(false);
 
-/// Take the serial claim, or give up and write anyway.
+/// Try ONCE for the serial claim. Never spins.
 ///
-/// Bounded and never fatal: a core that cannot get it writes regardless rather than spinning forever.
-/// A garbled line is bad; a core deadlocked inside the panic handler trying to report why is worse, and
-/// both writers here are reachable from panics and ISRs.
+/// **A log line must never make a core wait.** The first version spun up to two million times for the
+/// claim, and held it across the framebuffer render - so every core stalled behind every other core's
+/// glyph drawing and cache maintenance. Boot went from seconds to 104 SECONDS, characters trickled out
+/// one at a time, and a core that had spent ten seconds spinning was correctly declared wedged by the
+/// liveness watchdog. Tidy logs are not worth a stalled scheduler; that trade was never mine to make.
+///
+/// So: one attempt. A contended writer emits its bytes anyway and skips only the display mirror, which
+/// is the expensive part and the part nobody is reading during contention. Lines can interleave under
+/// load - which is what the 32-bit port accepts, for exactly this reason.
 #[cfg(feature = "pi4")]
 fn claim_serial() -> bool {
-    let mut spins = 0u32;
-    loop {
-        if SERIAL_BUSY
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            return true;
-        }
-        spins += 1;
-        if spins > 2_000_000 {
-            return false;
-        }
-        core::hint::spin_loop();
-    }
+    SERIAL_BUSY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
 }
 
 #[cfg(feature = "pi4")]
 pub fn serial_write_bytes_lockfree(s: &[u8]) {
     let held = claim_serial();
     for &b in s { serial_write_byte(b); }
-    // Mirror the whole run to the display, not byte by byte: the neutral log stages a complete line
-    // before calling here, and the console's lock is worth taking once per line rather than per byte.
-    // Log traffic stops mirroring once the shell owns the console - see `video::boot_complete`.
-    video::mirror_log(s);
+    // The display mirror happens ONLY for the core that holds the claim. It renders glyphs and cleans
+    // cache lines, which is far more expensive than the UART write - making every other core wait for
+    // it is what turned a boot into a two-minute crawl. A contended writer's bytes still reach serial,
+    // which is the record that matters.
     if held {
+        video::mirror_log(s);
         SERIAL_BUSY.store(false, Ordering::Release);
     }
 }
