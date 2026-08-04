@@ -51,11 +51,24 @@ const SYS_PORT_CTRL: u64 = GENET_SYS_OFF + 0x04;
 /// `bcmgenet_rbuf_ctrl_set` only writes `RBUF_FLUSH_CTRL_V1` on v1 silicon.
 const SYS_RBUF_FLUSH_CTRL: u64 = GENET_SYS_OFF + 0x08;
 const PORT_MODE_EXT_GPHY: u32 = 3;
-#[allow(dead_code)]
+/// The EXT block, which holds the RGMII interface controls.
 const GENET_EXT_OFF: u64 = 0x0080;
 #[allow(dead_code)]
 const GENET_INTRL2_0_OFF: u64 = 0x0200;
-#[allow(dead_code)]
+/// `EXT_RGMII_OOB_CTRL`. This register switches on the RGMII block itself - the parallel data path
+/// between the MAC and an external PHY.
+///
+/// Nothing else on the receive path substitutes for it. MDIO is a separate management bus, so the PHY
+/// can negotiate, report 1000 Mbit and assert link while this register is clear and NOT ONE BIT of
+/// frame data crosses to the MAC. That is precisely what the MAC's counters showed here: rx_pkt 0,
+/// broadcast 0, and fcs_err 0 - no frames, and not even damaged ones.
+const EXT_RGMII_OOB_CTRL: u64 = GENET_EXT_OFF + 0x0C;
+const OOB_DISABLE: u32 = 1 << 5;
+const RGMII_MODE_EN: u32 = 1 << 6;
+/// Disables the internal RGMII delay. The Pi 4 runs `rgmii-rxid` (delay on receive), so this stays
+/// CLEAR - Linux sets it only for plain `rgmii`, where the board provides the delay instead.
+const ID_MODE_DIS: u32 = 1 << 16;
+
 const GENET_RBUF_OFF: u64 = 0x0300;
 const GENET_UMAC_OFF: u64 = 0x0800;
 
@@ -301,6 +314,19 @@ pub fn umac_init(mac: [u8; 6]) -> Option<u32> {
     // Drive the external gigabit PHY, not one of the internal modes. Wrong here and the MAC talks to
     // something that is not on this board.
     wr(SYS_PORT_CTRL, PORT_MODE_EXT_GPHY);
+
+    // Switch on the RGMII block. Selecting the port mode above says WHICH interface the MAC drives;
+    // this enables the interface itself. Without it the MAC is wired to a PHY it can negotiate with
+    // over MDIO and receive nothing from.
+    let mut oob = rd(EXT_RGMII_OOB_CTRL);
+    oob &= !OOB_DISABLE;
+    oob &= !ID_MODE_DIS; // rgmii-rxid: the PHY supplies the receive delay, so leave ID mode enabled
+    oob |= RGMII_MODE_EN;
+    wr(EXT_RGMII_OOB_CTRL, oob);
+    if rd(EXT_RGMII_OOB_CTRL) & RGMII_MODE_EN == 0 {
+        put_str(b"genet: RGMII block will not enable - the MAC cannot reach the PHY\r\n");
+        return None;
+    }
 
     if !umac_reset() {
         return None;
