@@ -552,3 +552,104 @@ pub fn init_rx_ring() -> bool {
     put_str(b" bytes on queue 16, geometry verified (receive still DISABLED)\r\n");
     true
 }
+
+// --- Enabling receive -----------------------------------------------------------------------------
+
+/// DMA control registers, from Linux's `bcmgenet_dma_regs_v3plus` table. These are offsets into the
+/// ring-register area (past the descriptors), not the block base.
+const DMA_RING_CFG: u64 = 0x00;
+const DMA_CTRL: u64 = 0x04;
+const DMA_STATUS: u64 = 0x08;
+
+/// `DMA_STATUS` bit 0 reads back set while the engine is STOPPED.
+const DMA_DISABLED: u32 = 1 << 0;
+
+/// Address of a DMA control register (block-wide, not per-ring).
+fn dma_reg(block: u64, reg: u64) -> u64 {
+    block + DMA_REGS_OFF + reg
+}
+
+/// Point every ring we are NOT using at nothing, before enabling anything.
+///
+/// **This is the step that makes a mistake survivable.** Rings 0..15 have never been programmed, so
+/// their descriptors hold whatever the register file powered up with - and a ring enabled with a
+/// garbage descriptor is a bus master writing to a garbage physical address, on a board with no IOMMU.
+/// Zeroing their descriptors first means the worst case of a wrong enable is a write to physical 0,
+/// which the memory map already reserves, instead of a write into the kernel.
+///
+/// It costs one loop at boot and it is the difference between a bug that prints something and a bug
+/// that corrupts memory somewhere else entirely.
+fn quiesce_unused_rings() {
+    for d in RX_RING_DESCS..(TOTAL_DESC as u64) {
+        wr(desc_word(RDMA_OFFSET, d, DMA_DESC_ADDRESS_LO), 0);
+        wr(desc_word(RDMA_OFFSET, d, DMA_DESC_ADDRESS_HI), 0);
+        wr(desc_word(RDMA_OFFSET, d, DMA_DESC_LENGTH_STATUS), 0);
+    }
+}
+
+/// Turn the receiver on, and refuse to leave it on if the controller does not agree.
+pub fn enable_rx() -> bool {
+    quiesce_unused_rings();
+
+    // Enable ONLY ring 16. `DMA_RING_CFG` is a bitmask of rings, so writing anything wider here is
+    // what would start the rings just zeroed above.
+    let ring_bit = 1u32 << RX_RING_INDEX;
+    wr(dma_reg(RDMA_OFFSET, DMA_RING_CFG), ring_bit);
+
+    // `DMA_CTRL` carries the master enable in bit 0 and the per-ring enables from bit 1 up.
+    let ctrl = DMA_EN | (ring_bit << DMA_RING_BUF_EN_SHIFT);
+    wr(dma_reg(RDMA_OFFSET, DMA_CTRL), ctrl);
+
+    // Confirm the engine actually started. `DMA_STATUS` bit 0 reads SET while it is stopped, so a
+    // controller that ignored the enable says so here rather than by silently receiving nothing.
+    let mut n = 0;
+    while n < 1000 && rd(dma_reg(RDMA_OFFSET, DMA_STATUS)) & DMA_DISABLED != 0 {
+        delay_us(100);
+        n += 1;
+    }
+    if rd(dma_reg(RDMA_OFFSET, DMA_STATUS)) & DMA_DISABLED != 0 {
+        // Back out rather than leave a half-enabled engine pointing at our buffers.
+        wr(dma_reg(RDMA_OFFSET, DMA_CTRL), 0);
+        wr(dma_reg(RDMA_OFFSET, DMA_RING_CFG), 0);
+        put_str(b"genet: receive DMA would not start (status still says disabled) - backed out\r\n");
+        return false;
+    }
+
+    // Only now let the MAC accept frames. RX_EN before the ring is running is a receiver with nowhere
+    // to put what it takes.
+    wr(UMAC_CMD, rd(UMAC_CMD) | CMD_RX_EN);
+    put_str(b"genet: receive ENABLED - waiting for a frame\r\n");
+    true
+}
+
+/// Wait for the controller to hand us a frame, and describe the first one.
+///
+/// The consumer index counts descriptors the hardware has filled. It is the honest test: a link that is
+/// up and a ring that is programmed still prove nothing until something actually lands in a buffer.
+/// Broadcast traffic alone is normally enough within a second or two on a live network.
+pub fn await_first_frame() {
+    let idx_reg = ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_CONS_INDEX);
+    let start_idx = rd(idx_reg) & 0xFFFF;
+
+    let mut waited = 0;
+    while waited < 3000 {
+        let now = rd(idx_reg) & 0xFFFF;
+        if now != start_idx {
+            // Descriptor 0's status word carries the length in its upper half.
+            // SAFETY: the descriptor area is Device-mapped register file this module already programs.
+            let status = rd(desc_word(RDMA_OFFSET, 0, DMA_DESC_LENGTH_STATUS));
+            let len = (status >> DMA_BUFLENGTH_SHIFT) & DMA_BUFLENGTH_MASK;
+            put_str(b"genet: FRAME RECEIVED - consumer index ");
+            super::put_dec(now as u64);
+            put_str(b", first descriptor status ");
+            put_hex(status as u64);
+            put_str(b" (");
+            super::put_dec(len as u64);
+            put_str(b" bytes)\r\n");
+            return;
+        }
+        delay_us(1000);
+        waited += 1;
+    }
+    put_str(b"genet: no frame in 3s - link is up and the ring is armed, but nothing arrived\r\n");
+}
