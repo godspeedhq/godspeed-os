@@ -416,6 +416,26 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     super::put_hex(f.x[0]);
     super::put_str(b"  x1 = ");
     super::put_hex(f.x[1]);
+
+    // SP_EL0 too. A fault in userspace is very often the stack rather than the code, and without the
+    // stack pointer there is no way to tell "wrote past its frame" from "SP was never set correctly" -
+    // which look identical in FAR alone.
+    let sp_el0: u64;
+    // SAFETY: reading SP_EL0 at EL1 is a side-effect-free system-register read.
+    unsafe { core::arch::asm!("mrs {}, sp_el0", out(reg) sp_el0, options(nomem, nostack)) };
+    super::put_str(b"\r\n    SP_EL0   = ");
+    super::put_hex(sp_el0);
+
+    // And WHICH task. A user-mode fault reported without the task's name makes the reader guess from
+    // the address, and a guess about which service faulted is the wrong place to start.
+    let slot = crate::task::scheduler::current_task_slot();
+    if slot < 64 {
+        super::put_str(b"\r\n    task     = ");
+        super::put_str(crate::task::scheduler::task_stat(slot).name.as_bytes());
+        super::put_str(b" (slot ");
+        super::put_dec(slot as u64);
+        super::put_str(b")");
+    }
     super::put_str(b"\r\n    halting.\r\n");
     loop {
         // SAFETY: WFE is always valid; park forever.

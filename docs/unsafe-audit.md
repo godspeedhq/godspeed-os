@@ -13,6 +13,32 @@ comment.
 
 ---
 
+## 2026-08-04 - Pi 4: real services + the diagnostics that found the next bug (feat/pi4-aarch64)
+
+`ping` and `pong` are now built and embedded for aarch64, and spawned by name through
+`spawn_service_by_name` - the same path the supervisor's spawn syscall takes.
+
+**Two real bugs, one in the port and one still open:**
+
+`pong` would not spawn at all: `PlacementInvalid`. It contracts core 1 and this port has one core, so it
+needs an explicit override (§14.4) - but the override checks `smp::core::is_ready(0)`, and **this port
+never told the neutral SMP layer that core 0 exists**. Nothing else noticed, because every other
+placement path falls back with `.max(1)` and lands on core 0 regardless; the STRICT contracted-placement
+rule is the one path that asks properly, and it correctly refused. `mark_ready(0)` at boot.
+
+Still open: `pong` faults at EL0 inside `memcpy`, storing 8 bytes at exactly `0x8000_0000` - one word
+past `USER_STACK_TOP`. The top stack page IS mapped (`[0x7FFFF000, 0x80000000)`), so this is a genuine
+overrun rather than a mapping gap.
+
+**The trap report gained `SP_EL0` and the faulting task's NAME**, and both earned their place
+immediately. Without the name I spent several rounds disassembling `ping` - the wrong binary - because I
+had assumed which service faulted. A user-mode fault reported without the task's name makes the reader
+guess, and a guess about which service faulted is the wrong place to start.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/exceptions.rs` | 10 -> 11 (+1) | Reading `SP_EL0` in the trap report - a side-effect-free system-register read. A userspace fault is very often the stack rather than the code, and `FAR` alone cannot distinguish "wrote past its frame" from "SP was never set correctly". |
+
 ## 2026-08-04 - Pi 4 milestone 19: serial input (feat/pi4-aarch64)
 
 Nothing on this port had read input before; output has been one-way since milestone 1, which is why
@@ -1601,7 +1627,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/sched_spawn.rs | 2 | permitted |
 | arch/aarch64/uart_rx.rs | 2 | permitted |
-| arch/aarch64/exceptions.rs | 10 | permitted |
+| arch/aarch64/exceptions.rs | 11 | permitted |
 | arch/aarch64/uaccess.rs | 5 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |

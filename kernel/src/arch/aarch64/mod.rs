@@ -707,6 +707,14 @@ extern "C" fn boot_high() -> ! {
         crate::task::scheduler::init_arenas(crate::smp::percpu::num_cores());
         crate::capability::init();
 
+        // Tell the neutral SMP layer this core exists. Easy to omit, because almost nothing notices:
+        // most placement paths fall back with `.max(1)` and land on core 0 regardless. The one that
+        // does notice is the STRICT contracted-placement rule (§9.2), which refuses an explicitly
+        // requested core that is not ready - correctly, and with `PlacementInvalid`, which reads like a
+        // spec decision rather than a missing init call. Marked here rather than in `smp::init`, which
+        // this port does not run yet (it starts APs; PSCI SMP is a later milestone).
+        crate::smp::core::mark_ready(0);
+
 
 
         page_table_selftest();

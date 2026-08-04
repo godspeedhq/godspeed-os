@@ -79,6 +79,31 @@ pub fn run() -> ! {
     put_str(b"sched-spawn: spawning the logger service through the NEUTRAL spawn path\r\n");
     crate::task::arm_spawn_logger_neutral();
 
+    // --- ping / pong: two real services talking over kernel IPC ------------------------------
+    //
+    // Spawned BY NAME through `spawn_service_by_name`, which is the same path the supervisor's spawn
+    // syscall takes: it reads the static service config, creates the receive endpoint, wires the send
+    // caps to the declared peers, and records the name in the kernel directory. Nothing here knows what
+    // ping or pong do.
+    //
+    // **pong is contracted to core 1 and this port has one core**, so it needs an explicit placement
+    // override (§14.4). That is deliberate rather than convenient: §9.2 is STRICT - an unavailable
+    // contracted core is rejected with `PlacementInvalid`, never silently rerouted - so the override is
+    // the mechanism the spec provides for saying "yes, place it elsewhere, I mean it". PSCI SMP will
+    // let pong take the core its contract actually asks for, and this override goes away.
+    put_str(b"sched-spawn: spawning pong (core override 0 - it contracts core 1, and SMP is not up)\r\n");
+    match crate::task::spawn_service_by_name("pong", Some(0)) {
+        Ok(_) => put_str(b"sched-spawn: pong spawned\r\n"),
+        // Print the REASON. Discarding it cost a round trip: "FAILED" says a recovery did not work
+        // without saying what to fix, which is the failure §26.7 is about.
+        Err(e) => crate::kprintln!("sched-spawn: WARN pong spawn FAILED: {:?}", e),
+    }
+    put_str(b"sched-spawn: spawning ping (it sends to pong, reacquiring by name if pong dies)\r\n");
+    match crate::task::spawn_service_by_name("ping", None) {
+        Ok(_) => put_str(b"sched-spawn: ping spawned - watch for cross-service IPC\r\n"),
+        Err(_) => put_str(b"sched-spawn: WARN ping spawn FAILED\r\n"),
+    }
+
     // Mask IRQs before arming the neutral scheduler: the timer must not preempt into the scheduler
     // context before `run(0)` has seeded it, or the first task to block wedges the core. The 32-bit
     // port hit exactly that (kernel-audit Audit 5).
