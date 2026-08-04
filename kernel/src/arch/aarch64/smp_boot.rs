@@ -156,6 +156,42 @@ pub fn release_secondaries() {
     unsafe { core::arch::asm!("sev", options(nostack)) };
 }
 
+/// Report which cores actually entered the scheduler, in ONE line written by ONE core.
+///
+/// Per-core "I am up" messages cannot be trusted here: four cores share one UART, and even with a lock
+/// on the log path the arch's own `put_str` is unlocked, so lines get shredded. The first four-core
+/// hardware boot printed no "core N online" lines at all while QEMU printed every one - the cores were
+/// running, the evidence was not surviving. A single line emitted by the boot core after the others have
+/// settled cannot interleave with anything, so it is the one statement about core count worth believing.
+pub fn report_cores_up() {
+    // Give the released cores a moment to reach `mark_ready`. Bounded: this is a report, and a report
+    // that hangs the boot is worse than an incomplete one.
+    let hz = super::timer::frequency().max(1);
+    let start = super::read_cycle_counter();
+    while crate::smp::core::ready_count() < (AP_READY.load(Ordering::Acquire) + 1) {
+        if super::read_cycle_counter().wrapping_sub(start) > hz / 2 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let mut mask = 0u32;
+    for c in 0..4u32 {
+        if crate::smp::core::is_ready(c) {
+            mask |= 1 << c;
+        }
+    }
+    // ONE write, not five. Each `put_str` takes and releases the serial claim, so a five-call line is
+    // five chances for another core to land in the middle of it - which is exactly what it did, over
+    // and over: `smp: cores in the scheduler: smp: core 3 ready`. The lock was never the missing piece;
+    // the line has to BE one write. `console_notice_fmt` renders it into a fixed buffer first and emits
+    // it once.
+    super::console_notice_fmt(format_args!(
+        "smp: cores in the scheduler: {} (mask {:#x})",
+        crate::smp::core::ready_count(),
+        mask
+    ));
+}
+
 /// The symbol `_start` branches a secondary to. Same function; named for the assembly reference.
 pub use ap_entry as ap_entry_sym;
 

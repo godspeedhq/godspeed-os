@@ -43,6 +43,32 @@ somewhere that names neither the GPU nor the map (§26.7).
 | `arch/aarch64/mailbox.rs` | 3 -> 4 (+1) | `property_call`: copies an arbitrary tag request into this module's 16-byte-aligned static and the reply back out, length-checked against the buffer at both ends. The static rather than the caller's array because the mailbox packs the channel into the low 4 bits of the address it is handed - an arbitrarily-aligned caller buffer would send the message to the wrong channel, so the alignment guarantee stays in one place. |
 | `arch/aarch64/mod.rs` | 53 -> 55 (+2) | The write and the read of `FB_INFO`, the static that carries the geometry across the jump to the high half. A static rather than a local because the jump abandons the low stack along with every local on it - the same reason `memmap::current_map` exists. Single-threaded boot: written once before the jump, read once after. |
 
+## 2026-08-04 - Pi 4: the serial console had no lock, and four cores made that matter (feat/pi4-aarch64)
+
+Removing PSCI got the board past the release: all three secondaries check in, the machine boots, reboots
+and reads files back. But it reported **three** cores where QEMU reported four, and printed **no**
+"core N online" lines at all - while QEMU printed every one.
+
+The cores were running. The evidence was not surviving. Four cores wrote a byte at a time into one
+UART with no serialisation, so lines were shredded into each other at character granularity. Debugging
+SMP through that means drawing conclusions from an instrument that destroys the measurement, which is
+worse than having none - it looks like a result.
+
+Three fixes, each of which was necessary and none of which was sufficient alone:
+
+1. **A claim on the log path.** Bounded and never fatal: a core that cannot get it writes anyway rather
+   than spinning forever, because this path is reachable from panics and ISRs and a core deadlocked
+   while reporting why is worse than a garbled line.
+2. **The same claim on `put_str`.** Locking one writer and not the other leaves exactly the hole it was
+   meant to close - the boot core's own lines were still being shredded by an AP's `kprintln`.
+3. **The line has to BE one write.** `kprintln!` flushes as it formats, so a line assembled from
+   fragments is several writes with gaps between them. The lock was never the missing piece. The report
+   is now rendered into a fixed buffer and emitted once.
+
+Five consecutive boots now report `cores in the scheduler: 4 (mask 0xf)` intact.
+
+No new `unsafe`.
+
 ## 2026-08-04 - Pi 4 SMP: the PSCI attempt hung the board, and is removed (feat/pi4-aarch64)
 
 Four cores came up on six consecutive QEMU boots and the board hung on the release line. The cause was

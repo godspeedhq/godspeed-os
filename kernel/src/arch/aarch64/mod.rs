@@ -850,7 +850,10 @@ extern "C" fn boot_high() -> ! {
 
         // The arenas exist and core 0 is registered: the parked secondaries may now enter the scheduler.
         #[cfg(feature = "pi4-smp")]
-        smp_boot::release_secondaries();
+        {
+            smp_boot::release_secondaries();
+            smp_boot::report_cores_up();
+        }
 
         // The PCIe root complex, and the xHCI controller the USB-A ports hang off. After the frame
         // allocator, because the inbound DMA window is sized from the memory map; before the scheduler,
@@ -1036,8 +1039,19 @@ pub(crate) fn put_dec(v: u64) {
 }
 
 pub(crate) fn put_str(s: &[u8]) {
+    // Serialised on the same claim as the log path. Locking one and not the other leaves exactly the
+    // hole it was meant to close: with four cores logging, a boot-core line written through here was
+    // still being shredded by an AP's `kprintln` - including, on two runs out of three, the very line
+    // reporting how many cores had come up. An instrument that loses the measurement is worse than no
+    // instrument, because it looks like a result.
+    #[cfg(feature = "pi4")]
+    let held = claim_serial();
     for &b in s {
         put_byte(b);
+    }
+    #[cfg(feature = "pi4")]
+    if held {
+        SERIAL_BUSY.store(false, Ordering::Release);
     }
     // Serial first, then the display: serial is the source of truth, and a mirror that ran first would
     // put the display ahead of the log it is mirroring.
@@ -1276,6 +1290,58 @@ pub fn serial_write_byte(b: u8) {
     if b == b'\n' { put_byte(b'\r'); }
     put_byte(b);
 }
+/// Held by whichever core is mid-line on the UART.
+///
+/// **Without this, multi-core logging is not merely untidy - it is unreadable, and it lies.** Four cores
+/// writing a byte at a time into one FIFO interleave at character granularity, so lines vanish into each
+/// other. The first four-core hardware boot printed `3 of 3 secondaries checked in` and then **no**
+/// "core N online" lines at all, while QEMU printed every one: not because the cores did not run, but
+/// because their output was shredded by the boot core's. Debugging SMP through that instrument means
+/// drawing conclusions from evidence the instrument destroyed.
+///
+/// The claim is BOUNDED and never fatal: a core that cannot get it writes anyway rather than spinning
+/// forever. A garbled line is bad; a core deadlocked inside the panic handler trying to report why is
+/// worse, and this path is reachable from panics and ISRs.
+#[cfg(feature = "pi4")]
+static SERIAL_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Take the serial claim, or give up and write anyway.
+///
+/// Bounded and never fatal: a core that cannot get it writes regardless rather than spinning forever.
+/// A garbled line is bad; a core deadlocked inside the panic handler trying to report why is worse, and
+/// both writers here are reachable from panics and ISRs.
+#[cfg(feature = "pi4")]
+fn claim_serial() -> bool {
+    let mut spins = 0u32;
+    loop {
+        if SERIAL_BUSY
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return true;
+        }
+        spins += 1;
+        if spins > 2_000_000 {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(feature = "pi4")]
+pub fn serial_write_bytes_lockfree(s: &[u8]) {
+    let held = claim_serial();
+    for &b in s { serial_write_byte(b); }
+    // Mirror the whole run to the display, not byte by byte: the neutral log stages a complete line
+    // before calling here, and the console's lock is worth taking once per line rather than per byte.
+    // Log traffic stops mirroring once the shell owns the console - see `video::boot_complete`.
+    video::mirror_log(s);
+    if held {
+        SERIAL_BUSY.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(not(feature = "pi4"))]
 pub fn serial_write_bytes_lockfree(s: &[u8]) {
     for &b in s { serial_write_byte(b); }
     // Mirror the whole run to the display, not byte by byte: the neutral log stages a complete line
@@ -1401,10 +1467,18 @@ pub fn console_notice(s: &[u8]) {
 }
 
 /// Serial only, no display mirror - the mirror is decided by the caller.
+///
+/// Takes the same claim as every other writer. It is the tail of `console_notice_fmt`, which renders a
+/// whole line into a fixed buffer precisely so it can be emitted in ONE call - and a single unlocked
+/// call is still a line another core can land inside.
 #[cfg(feature = "pi4")]
 fn serial_write_bytes_lockfree_no_fb(s: &[u8]) {
+    let held = claim_serial();
     for &b in s {
         serial_write_byte(b);
+    }
+    if held {
+        SERIAL_BUSY.store(false, Ordering::Release);
     }
 }
 
