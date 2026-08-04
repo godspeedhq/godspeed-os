@@ -215,19 +215,25 @@ pub fn report_cores_up() {
     // and over: `smp: cores in the scheduler: smp: core 3 ready`. The lock was never the missing piece;
     // the line has to BE one write. `console_notice_fmt` renders it into a fixed buffer first and emits
     // it once.
-    // The line the other two ports print, in the same words, so a Pi 4 boot log reads like an x86 or
-    // Pi 2 one. The per-core progress digits stay on the end: they cost nothing, they are what found
-    // this bug, and a machine that comes up with fewer cores than it has should say where they stopped
-    // rather than only how many arrived.
-    super::console_notice_fmt(format_args!(
-        "smp: {} cores ready (mask {:#x}, progress {}{}{}{})",
-        crate::smp::core::ready_count(),
-        mask,
-        AP_PROGRESS[0].load(Ordering::Acquire),
-        AP_PROGRESS[1].load(Ordering::Acquire),
-        AP_PROGRESS[2].load(Ordering::Acquire),
-        AP_PROGRESS[3].load(Ordering::Acquire),
-    ));
+    // The SHARED sentence, worded once in `smp::core` so this port cannot drift from the others.
+    crate::smp::core::report_cores_ready();
+
+    // The arch-specific detail is a SEPARATE line, and only when it has something to say. A machine
+    // that came up short should report where its cores stopped; a machine that came up whole should
+    // read exactly like an x86 or Pi 2 one, with no Pi-4-shaped noise to translate.
+    let expected = crate::arch::imp::ap_count() as u32 + 1;
+    if crate::smp::core::ready_count() < expected {
+        super::console_notice_fmt(format_args!(
+            "smp: only {} of {} cores reached the scheduler (mask {:#x}, progress {}{}{}{};              0=absent 1=parked 2=released 3=scheduling)",
+            crate::smp::core::ready_count(),
+            expected,
+            mask,
+            AP_PROGRESS[0].load(Ordering::Acquire),
+            AP_PROGRESS[1].load(Ordering::Acquire),
+            AP_PROGRESS[2].load(Ordering::Acquire),
+            AP_PROGRESS[3].load(Ordering::Acquire),
+        ));
+    }
 }
 
 /// The symbol `_start` branches a secondary to. Same function; named for the assembly reference.

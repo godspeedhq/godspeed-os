@@ -464,7 +464,8 @@ pub fn smp_bringup() {
             crate::kprintln!("smp: WARNING - core {} did NOT come up; continuing without it", core);
         }
     }
-    crate::kprintln!("smp: {} cores ready", AP_ONLINE.load(core::sync::atomic::Ordering::Relaxed) + 1);
+    // The shared sentence, so this port and every other say it identically (`smp::core`).
+    crate::smp::core::report_cores_ready();
 }
 
 /// Write one byte to the PL011, waiting for room in the transmit FIFO.
