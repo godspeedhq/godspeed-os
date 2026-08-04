@@ -367,9 +367,22 @@ const DMA_RING_BUF_EN_SHIFT: u32 = 1;
 const DMA_RING_BUF_SIZE: u64 = 0x10;
 const DMA_START_ADDR: u64 = 0x14;
 const DMA_END_ADDR: u64 = 0x1C;
+/// The index registers are paired by DIRECTION, and the pairing is easy to read backwards:
+///
+///     [TDMA_CONS_INDEX] = 0x08,   [RDMA_PROD_INDEX] = 0x08,
+///     [TDMA_PROD_INDEX] = 0x0C,   [RDMA_CONS_INDEX] = 0x0C,
+///
+/// Whoever WRITES data owns the producer index. On TX that is the driver; on RX it is the hardware. So
+/// the same offset is the driver's register on one ring and the hardware's on the other, and naming
+/// `0x08` "RDMA_CONS_INDEX" - which is what this file did - inverts exactly that.
+///
+/// The consequence was not a wrong value but a missing initialisation: `init_rx_ring` zeroed the
+/// HARDWARE's producer index and never touched the driver's consumer index, so the ring was armed with
+/// one end of it never set.
+const TDMA_CONS_INDEX: u64 = 0x08;
+const RDMA_PROD_INDEX: u64 = 0x08;
 const TDMA_PROD_INDEX: u64 = 0x0C;
-const RDMA_CONS_INDEX: u64 = 0x08;
-#[allow(dead_code)]
+const RDMA_CONS_INDEX: u64 = 0x0C;
 const DMA_MBUF_DONE_THRESH: u64 = 0x24;
 
 /// Words per descriptor on v4/v5: length+status, address low, address high.
@@ -530,7 +543,13 @@ pub fn init_rx_ring() -> bool {
         ring_reg(RDMA_OFFSET, RX_RING_INDEX, DMA_END_ADDR),
         (RX_RING_DESCS * WORDS_PER_BD - 1) as u32,
     );
+    // BOTH indices, and each is a different party's register: the producer is the hardware's, the
+    // consumer is ours. Zeroing only one leaves the ring half-initialised.
+    wr(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_PROD_INDEX), 0);
     wr(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_CONS_INDEX), 0);
+    // How many descriptors the hardware fills before it counts a batch done. 1 = report every frame,
+    // which is what a polled driver wants.
+    wr(ring_reg(RDMA_OFFSET, RX_RING_INDEX, DMA_MBUF_DONE_THRESH), 1);
 
     // Read the geometry back. A ring whose registers did not take is a ring the controller would walk
     // using whatever they do hold - and the descriptors above are already pointing at real memory.
@@ -627,7 +646,9 @@ pub fn enable_rx() -> bool {
 /// up and a ring that is programmed still prove nothing until something actually lands in a buffer.
 /// Broadcast traffic alone is normally enough within a second or two on a live network.
 pub fn await_first_frame() {
-    let idx_reg = ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_CONS_INDEX);
+    // Poll the PRODUCER index - the one the hardware advances as it fills descriptors. Watching the
+    // consumer index would be watching our own writes.
+    let idx_reg = ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_PROD_INDEX);
     let start_idx = rd(idx_reg) & 0xFFFF;
 
     let mut waited = 0;
