@@ -52,7 +52,7 @@ core::arch::global_asm!(
 // yields, so only the timer can take the core away from it.
 el0_loop_start:
     mov  x21, #0                     // the counter, in a callee-saved register so the switch keeps it
-1:  mov  x8, #0x1004                 // SYS_TICK
+1:  mov  x16, #0x1004                 // SYS_TICK
     mov  x0, x21
     svc  #0
     add  x21, x21, #1

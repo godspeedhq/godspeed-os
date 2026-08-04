@@ -41,6 +41,15 @@ pub struct TrapFrame {
     pub elr: u64,
     /// Saved Program Status Register - the interrupted context's PSTATE.
     pub spsr: u64,
+    /// The interrupted task's USER stack pointer.
+    ///
+    /// **`SP_EL0` is one register shared by every EL0 task**, and the kernel does not run on it - so
+    /// nothing else saves it. Without it here, whichever task ran last leaves its user stack pointer
+    /// behind and the next task to `eret` resumes on it. That is survivable with a single EL0 task,
+    /// which is exactly why it stayed hidden through several milestones; with three services it made
+    /// one of them build its stack frame on another's stack and write past the top of the mapped
+    /// region. Offset 264, inside the 272-byte frame the vectors already reserve.
+    pub sp_el0: u64,
 }
 
 global_asm!(
@@ -124,7 +133,8 @@ aarch64_vectors:
     mrs  x2, elr_el1
     mrs  x3, spsr_el1
     stp  x30, x2,  [sp, #240]      // x30, then ELR
-    str  x3,       [sp, #256]      // SPSR
+    mrs  x4, sp_el0
+    stp  x3,  x4,  [sp, #256]      // SPSR, then the task's USER stack pointer
 .endm
 
 // Synchronous / FIQ / SError: report and stop. Nothing here can handle a fault yet, and returning to a
@@ -155,10 +165,21 @@ aarch64_irq_common:
     mov  x1, sp
     bl   aarch64_irq_dispatch      // (vector: u64, frame: *mut TrapFrame)
 aarch64_exception_return:
-    ldr  x3,       [sp, #256]      // SPSR
+    ldp  x3,  x4,  [sp, #256]      // SPSR, user SP
     ldp  x30, x2,  [sp, #240]      // x30, ELR
     msr  elr_el1,  x2
     msr  spsr_el1, x3
+    // Restore the user stack ONLY when returning to EL0 (SPSR.M[3:0] == 0 selects EL0t).
+    //
+    // Restoring it unconditionally is wrong and was tried: an exception taken at EL1 captures whatever
+    // SP_EL0 happens to hold - typically some other task's user SP, or zero before any task has run -
+    // and re-imposing that on the way back out clobbers the value belonging to whichever task is
+    // actually at EL0. The kernel never runs on SP_EL0, so for an EL1 return there is nothing to
+    // restore and doing so can only do harm.
+    tst  x3, #0xF
+    b.ne 5f
+    msr  sp_el0,   x4
+5:
     ldp  x2,  x3,  [sp, #16]
     ldp  x4,  x5,  [sp, #32]
     ldp  x6,  x7,  [sp, #48]
@@ -348,8 +369,14 @@ extern "C" fn aarch64_sync_current_dispatch(vector: u64, frame: *mut TrapFrame) 
 /// and what stops it doing something it should not is the capability check inside the handler, which
 /// trusts neither the register nor the immediate.
 ///
-/// So this follows the same shape Linux uses on AArch64: number in `x8`, arguments in `x0`-`x2`, result
-/// back in `x0`. Keeping `x0`-`x2` free for arguments is the practical reason for `x8` specifically.
+/// So the number comes from a register: **`x16`**, with arguments in `x0`-`x2` and the result back in
+/// `x0`.
+///
+/// **Not `x8`, which is what Linux uses.** AAPCS64 makes `x8` the *indirect result register* - a
+/// function returning a large struct receives its destination pointer there - and the SDK's
+/// `raw_syscall` is `#[inline]`, so the `svc` lands inside functions doing exactly that (`recv()`
+/// returns a ~4 KiB `Message` by value). The number would overwrite the return-value destination.
+/// Linux is safe because its syscalls sit behind a non-inlined wrapper; ours are not.
 ///
 /// Anything that is NOT an SVC is a genuine userspace fault (a bad address, an illegal instruction).
 /// Those still report and halt: killing the task is what a real port does, and there is no task
@@ -364,7 +391,7 @@ extern "C" fn aarch64_sync_lower_dispatch(vector: u64, frame: *mut TrapFrame) {
     }
     // SAFETY: `frame` is the trap frame the vector assembly built on the current stack.
     let f = unsafe { &mut *frame };
-    let nr = f.x[8];
+    let nr = f.x[16];
 
     // Bring-up numbers are handled here; everything else goes to the NEUTRAL dispatcher - the same
     // `syscall_handler` x86 and arm32 call, with the same numbering. The bring-up range is deliberately
@@ -435,6 +462,19 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
         super::put_str(b" (slot ");
         super::put_dec(slot as u64);
         super::put_str(b")");
+    }
+    // Every register. A fault localised to one instruction is usually solved by seeing which register
+    // held the bad address and which held the length, and choosing two to print in advance is guessing
+    // the answer before the question.
+    for i in 0..31 {
+        if i % 4 == 0 {
+            super::put_str(b"\r\n    ");
+        }
+        super::put_str(b"x");
+        super::put_dec(i as u64);
+        super::put_str(b"=");
+        super::put_hex(f.x[i]);
+        super::put_str(b" ");
     }
     super::put_str(b"\r\n    halting.\r\n");
     loop {

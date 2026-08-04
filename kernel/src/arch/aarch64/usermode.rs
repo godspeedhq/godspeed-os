@@ -62,7 +62,7 @@ core::arch::global_asm!(
     .globl el0_blob_end
 // Position-independent EL0 payload. Copied into a task frame and executed there, so it must not
 // reference any address: every operand below is an immediate or a register.
-// The syscall number goes in x8 and the arguments in x0-x2 - the REAL ABI the SDK's `raw_syscall`
+// The syscall number goes in x16 and the arguments in x0-x2 - the REAL ABI the SDK's `raw_syscall`
 // emits, not a demo convention. This blob is the only EL0 code that exists yet, so it is also the only
 // thing that can prove the ABI, and it would be worth very little if it proved a different one.
 el0_blob_start:
@@ -70,7 +70,7 @@ el0_blob_start:
     // Log (5) with no capability. The kernel must REFUSE it: this task holds no caps, and §3.1 says
     // authority comes from holding one, never from being the caller. A negative result here is the
     // no-ambient-authority rule enforced end to end on AArch64 - kernel refusal, not a log line.
-    mov  x8, #5                      // SyscallNumber::Log
+    mov  x16, #5                     // SyscallNumber::Log
     mov  x0, #0                      // cap slot 0 - which this task does not hold
     mov  x1, #0x10000                // a mapped user pointer (its own code page)
     mov  x2, #8                      // length
@@ -84,17 +84,17 @@ el0_blob_start:
     // 0x0FFF is chosen to be BELOW the bring-up base, so it reaches the NEUTRAL dispatcher. The first
     // version used 0xBEEF, which is above it - the call went to the demo handler instead, and the test
     // passed while proving nothing about the path it was meant to exercise.
-    mov  x8, #0x0FFF
+    mov  x16, #0x0FFF
     svc  #0
     mov  x20, x0
 
     // Hand both results to the kernel to check and report.
-    mov  x8, #0x1003                 // SYS_REPORT_REAL
+    mov  x16, #0x1003                 // SYS_REPORT_REAL
     mov  x0, x19
     mov  x1, x20
     svc  #0
 
-    movz x8, #0x1000                 // SYS_ECHO
+    movz x16, #0x1000                 // SYS_ECHO
     movz x0, #0x4242                 // x0 = ECHO_ARG
     movk x0, #0x4242, lsl #16
     svc  #0                          // -> kernel; returns ECHO_REPLY in x0
@@ -103,10 +103,10 @@ el0_blob_start:
     movk x1, #0x1234, lsl #16
     cmp  x0, x1
     cset x0, eq                      // x0 = 1 if the reply came back intact, else 0
-    movz x8, #0x1002                 // SYS_VERDICT
+    movz x16, #0x1002                 // SYS_VERDICT
     svc  #0                          // report the verdict THROUGH the kernel
 
-    movz x8, #0x1001                 // SYS_EXIT
+    movz x16, #0x1001                 // SYS_EXIT
     svc  #0                          // ask the kernel to stop this task; does not return
 1:  b    1b                          // unreachable
 el0_blob_end:

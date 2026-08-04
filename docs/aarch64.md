@@ -502,8 +502,40 @@
 > count: a count does not measure how long a condition has persisted, and choosing one is how you get a
 > threshold that either fires on a fast typist or never fires at all.
 >
-> **Not done:** `arch::init` + the `kernel_main` handoff, PSCI SMP, and the remaining ladder to a
-> prompt - `ping`/`pong` IPC, the supervisor, the shell.
+> **Milestone 20 - cross-service IPC.** `ping` and `pong`, both compiled Rust services, spawned by name
+> through the same path the supervisor's spawn syscall takes, talking over kernel IPC:
+>
+> ```
+> pong: received "1" ... pong: received "3962"
+> ```
+>
+> 3962 messages, in order, no gaps.
+>
+> **The bug that stood in the way is worth knowing about, because it is invisible with one task.**
+> `SP_EL0` is a **single register shared by every EL0 task**, and the kernel never runs on it - so
+> nothing else saves it. The trap frame did not either. With one user task that is survivable, which is
+> exactly why it stayed hidden from milestone 12 through 19; with three services, whichever ran last
+> left its user stack pointer behind and the next task to `eret` built its stack frame on another
+> task's stack, writing past the top of the mapped region.
+>
+> The frame now carries `SP_EL0` (offset 264, inside the 272 bytes the vectors already reserved), and it
+> is restored **only when returning to EL0** (`SPSR.M[3:0] == 0`). Restoring it unconditionally was
+> tried and is wrong: an exception taken at EL1 captures whatever `SP_EL0` happens to hold - another
+> task's, or zero - and re-imposing that on the way out clobbers the task actually at EL0.
+>
+> Finding it needed one diagnostic and one disproof. The register dump gave `dest = sp + 0x307b`,
+> `src = sp + 0x1040` at the faulting `memcpy`, which pinned `sp` exactly - and from there the frame
+> arithmetic said the entry stack pointer had been `0x8000_2020` rather than `0x8000_0000`. An earlier
+> hypothesis (that the syscall number in `x8` collided with AAPCS64's indirect result register) was
+> **disproved** by the fault surviving the change unaltered.
+>
+> **Still open:** after roughly 4000 messages a kernel-mode data abort appears in
+> `aarch64_exception_return`, with `SP_EL1` holding the high alias of physical `0x8000_0000` - a kernel
+> stack pointer gone bad, and an *external* abort (`DFSC 0x10`) because that physical address does not
+> exist on the board. Separate from the fix above, and not yet diagnosed.
+>
+> **Not done:** the ~4000-message fault, `arch::init` + the `kernel_main` handoff, PSCI SMP, the
+> supervisor, the shell.
 >
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
 > init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already
