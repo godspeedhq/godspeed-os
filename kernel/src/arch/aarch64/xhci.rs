@@ -71,9 +71,33 @@ const PORTSC_PR: u32 = 1 << 4; // port reset
 const PORTSC_PP: u32 = 1 << 9; // port power
 const PORTSC_CSC: u32 = 1 << 17; // connect status change
 const PORTSC_PRC: u32 = 1 << 21; // port reset change
-/// The bits in PORTSC that are write-1-to-clear. A read-modify-write that does not mask these off
-/// clears status the driver has not looked at yet - the classic xHCI foot-gun.
-const PORTSC_RW1CS: u32 = 0x00FE_0000;
+/// PORTSC bits that are **read-only** (`XHCI_PORT_RO` in Linux): connect status, over-current, the
+/// port speed field, and device-removable.
+const PORTSC_RO: u32 = (1 << 0) | (1 << 3) | (0xF << 10) | (1 << 30);
+/// PORTSC bits that are read-write and must be **preserved** across a modify (`XHCI_PORT_RWS`): the
+/// port link state, port power, the indicator control, and the speed-change bits.
+const PORTSC_RWS: u32 = (0xF << 5) | (1 << 9) | (0x3 << 14) | (0x7 << 25);
+
+/// Reduce a PORTSC value to something safe to write back.
+///
+/// **PORTSC cannot be read-modify-written.** Two different classes of bit make a plain write-back
+/// destructive, and one of them is silent:
+///
+/// - The change bits (17..23) are **write-1-to-clear**, so writing a read-back value acknowledges
+///   status the driver has not looked at yet.
+/// - Bit 1, `PED`, is **write-1-to-DISABLE**. A port that has just been enabled reads back with `PED`
+///   set, so writing that value straight back turns the port off again. Nothing reports an error: the
+///   `Enable Slot` command still succeeds, because that only allocates a slot, and the failure surfaces
+///   one command later as `Address Device` returning **Context State Error** - a code that points at
+///   the context, which is the one thing that was correct.
+///
+/// So the write value is built from scratch: keep the read-only bits and the ones that must survive,
+/// drop everything else, then OR in exactly the action intended. This is Linux's
+/// `xhci_port_state_to_neutral`, and the reason it exists as a named function there is the same reason
+/// it exists here.
+fn port_neutral(state: u32) -> u32 {
+    state & (PORTSC_RO | PORTSC_RWS)
+}
 
 // --- Runtime / interrupter 0 ---------------------------------------------------------------------
 const RT_IR0: u64 = 0x20;
@@ -609,29 +633,39 @@ impl Xhci {
 
     fn reset_port(&mut self, port: u8) -> bool {
         let a = self.portsc(port);
-        // Power first: a port that is not powered reports a connect and then refuses to reset.
+        // Power first: a port that is not powered reports a connect and then refuses to reset. Every
+        // write here goes through `port_neutral` - see its comment for what a plain write-back costs.
         let sc = rd32(a);
         if sc & PORTSC_PP == 0 {
-            wr32(a, (sc & !PORTSC_RW1CS) | PORTSC_PP);
+            wr32(a, port_neutral(sc) | PORTSC_PP);
             delay_us(20_000);
         }
-        // Mask the write-1-to-clear bits out of the value read back, or this write silently acknowledges
-        // changes nothing has looked at.
-        wr32(a, (rd32(a) & !PORTSC_RW1CS) | PORTSC_PR);
+        wr32(a, port_neutral(rd32(a)) | PORTSC_PR);
         let mut n = 0;
         while n < 500 && rd32(a) & PORTSC_PRC == 0 {
             delay_us(1000);
             n += 1;
         }
         let sc = rd32(a);
-        // Acknowledge the reset-complete and connect-change bits explicitly.
-        wr32(a, (sc & !PORTSC_RW1CS) | PORTSC_PRC | PORTSC_CSC);
+        // Acknowledge the reset-complete and connect-change bits explicitly, without disturbing the
+        // port's enable state.
+        wr32(a, port_neutral(sc) | PORTSC_PRC | PORTSC_CSC);
         if sc & PORTSC_PED == 0 {
             put_str(b"xhci: port did not enable after reset (portsc ");
             put_hex(sc as u64);
             put_str(b")\r\n");
             return false;
         }
+        // USB requires a recovery interval after the reset before the device will answer. Addressing it
+        // during that window is a transaction error blamed on the address, not on the timing.
+        delay_us(20_000);
+        put_str(b"xhci: port ");
+        put_dec(port as u64);
+        put_str(b" enabled after ");
+        put_dec(n);
+        put_str(b"ms, portsc ");
+        put_hex(rd32(a) as u64);
+        put_str(b"\r\n");
         true
     }
 
@@ -670,6 +704,14 @@ impl Xhci {
 
         let speed = (rd32(self.portsc(port)) >> 10) & 0xF;
         let mps0 = default_max_packet(speed);
+        put_str(b"xhci: slot ");
+        put_dec(slot as u64);
+        put_str(b", link speed ");
+        put_dec(speed as u64);
+        put_str(b", EP0 max packet ");
+        put_dec(mps0 as u64);
+        put_str(b"
+");
 
         // SAFETY: the input-context page this module owns. Field offsets are the xHCI 1.2 layout.
         unsafe {
