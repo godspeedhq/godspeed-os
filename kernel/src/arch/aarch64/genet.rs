@@ -716,6 +716,10 @@ pub fn enable_rx() -> bool {
 
     // Only now let the MAC accept frames. RX_EN before the ring is running is a receiver with nowhere
     // to put what it takes.
+    // Nothing between the MAC and the DMA may drop a frame. Linux clears the filter block here too:
+    // after the DMA is running, before the receiver is switched on.
+    hfb_clear();
+
     // Accept every frame on the wire, for now.
     //
     // The MAC filters on the station address unless told otherwise, and the address we programmed is
@@ -789,6 +793,47 @@ pub fn await_first_frame() {
 
 /// `DMA_SCB_BURST_SIZE`, from the same verified v3plus table. Linux programs it as part of DMA init.
 const DMA_SCB_BURST_SIZE: u64 = 0x0C;
+
+// The hardware filter block. It sits between the MAC and the receive DMA and drops what it is
+// configured to drop, so a block left enabled with somebody else's filters discards frames that the
+// MAC accepted and the DMA is waiting for - silently, and with every register upstream reading healthy.
+//
+// This driver has never touched it, and it is NOT safe to assume it is at its reset default: the Pi 4
+// firmware drives GENET itself (the board can netboot), and this port has already been bitten once by
+// firmware leaving a block in a non-default state - the UMAC arrives held in software reset. Linux
+// clears HFB unconditionally at init for the same reason.
+/// Filter RAM, and the filter control registers, at the V5 offsets.
+const HFB_OFF: u64 = 0x8000;
+const HFB_REG_OFF: u64 = 0xFC00;
+const HFB_CTRL: u64 = 0x00;
+const HFB_FLT_ENABLE_V3PLUS: u64 = 0x04;
+const HFB_FLT_LEN_V3PLUS: u64 = 0x1C;
+const HFB_FILTER_CNT: u64 = 48;
+const HFB_FILTER_SIZE: u64 = 128;
+/// `DMA_INDEX2RING_0`, the first of eight filter-to-ring steering registers in the RDMA block.
+const DMA_INDEX2RING_0: u64 = 0x70;
+
+/// Disable every hardware filter, so nothing between the MAC and the DMA drops a frame.
+fn hfb_clear() {
+    wr(HFB_REG_OFF + HFB_CTRL, 0);
+    wr(HFB_REG_OFF + HFB_FLT_ENABLE_V3PLUS, 0);
+    wr(HFB_REG_OFF + HFB_FLT_ENABLE_V3PLUS + 4, 0);
+
+    // Filter-to-ring steering: eight registers in the RDMA block, not the HFB one.
+    for i in 0..8 {
+        wr(dma_reg(RDMA_OFFSET, DMA_INDEX2RING_0 + i * 4), 0);
+    }
+
+    // Per-filter lengths, packed four to a register.
+    for i in 0..(HFB_FILTER_CNT / 4) {
+        wr(HFB_REG_OFF + HFB_FLT_LEN_V3PLUS + i * 4, 0);
+    }
+
+    // The filter RAM itself. Bounded and one-time: 48 filters of 128 words.
+    for i in 0..(HFB_FILTER_CNT * HFB_FILTER_SIZE) {
+        wr(HFB_OFF + i * 4, 0);
+    }
+}
 /// Linux's `DMA_MAX_BURST_LENGTH`.
 const DMA_MAX_BURST_LENGTH: u32 = 0x08;
 
