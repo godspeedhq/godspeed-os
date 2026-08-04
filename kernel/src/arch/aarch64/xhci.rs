@@ -174,6 +174,16 @@ impl Ring {
         Some(r)
     }
 
+    /// Re-establish the wrap-around Link TRB after the ring has been zeroed and rewound.
+    fn rearm_link(&self) {
+        let link = Trb {
+            param: self.phys,
+            status: 0,
+            control: (TRB_LINK << 10) | (1 << 1) | self.cycle,
+        };
+        self.write(TRBS_PER_RING - 1, link);
+    }
+
     /// Write one TRB, **control dword last**.
     ///
     /// The control dword carries the cycle bit, which is what tells the controller "this entry is
@@ -377,6 +387,53 @@ struct KbdState {
     last: [u8; 6],
     caps: bool,
     rep: crate::arch::hid::KeyRepeat,
+}
+
+/// Transient pages every enumeration needs and no device keeps: the input context, the control-endpoint
+/// ring, and the descriptor buffer.
+///
+/// **Allocated once and reused**, because enumeration has ~40 failure paths and none of them freed
+/// anything. A device that refuses to come up is retried three times per arrival, so repeated plugging
+/// leaked pages steadily - the unbounded-resource shape §26.6 forbids, arrived at by omission rather
+/// than by design. A fixed arena removes the question instead of answering it forty times: the pages
+/// are cheap, the footprint is three pages forever, and bring-up is serialised under `USB_CLAIM` so
+/// there is never a second user.
+struct Scratch {
+    in_va: u64,
+    in_phys: u64,
+    ep0: Ring,
+    buf_va: u64,
+    buf_phys: u64,
+}
+
+static mut SCRATCH: Option<Scratch> = None;
+
+/// Hand out the enumeration scratch, allocating it the first time. The control ring is REWOUND rather
+/// than rebuilt: a fresh device starts its own transfers at the ring's head, and leaving the previous
+/// device's enqueue position would have the controller walk stale TRBs it has already executed.
+fn scratch() -> Option<&'static mut Scratch> {
+    // SAFETY: bring-up is serialised under `USB_CLAIM`, so this is the only live borrow.
+    let slot = unsafe { &mut *core::ptr::addr_of_mut!(SCRATCH) };
+    if slot.is_none() {
+        let (in_va, in_phys) = dma_page()?;
+        let ep0 = Ring::new()?;
+        let (buf_va, buf_phys) = dma_page()?;
+        *slot = Some(Scratch { in_va, in_phys, ep0, buf_va, buf_phys });
+    }
+    let sc = slot.as_mut()?;
+    // SAFETY: pages this module owns, sized 4096 by `dma_page`.
+    unsafe {
+        core::ptr::write_bytes(sc.in_va as *mut u8, 0, 4096);
+        core::ptr::write_bytes(sc.buf_va as *mut u8, 0, 4096);
+        core::ptr::write_bytes(sc.ep0.va as *mut u8, 0, 4096);
+    }
+    sc.ep0.enqueue = 0;
+    sc.ep0.cycle = 1;
+    sc.ep0.rearm_link();
+    mmu::dma_sync(sc.in_va, 4096);
+    mmu::dma_sync(sc.buf_va, 4096);
+    mmu::dma_sync(sc.ep0.va, 4096);
+    Some(sc)
 }
 
 /// Allocate one zeroed page for the controller to share, returning `(kernel va, physical)`.
@@ -828,10 +885,19 @@ impl Xhci {
             return false;
         }
 
+        // The three transient pages come from the reusable arena, so the ~40 failure paths below leak
+        // nothing. Only the DEVICE CONTEXT is per-device, because the controller keeps writing to it for
+        // as long as the slot is addressed - it cannot be shared with the next enumeration.
+        //
+        // The device context IS still allocated per bring-up and not freed on the failure paths after
+        // this point. That is one page per failed attempt rather than four, and it is bounded by the
+        // three-attempt cap in `hotplug_tick`; freeing it properly wants the slot teardown that
+        // `stand_down` does, applied to a device that never finished coming up. Recorded rather than
+        // claimed fixed (§26.3).
         let Some((dev_va, dev_phys)) = dma_page() else { return false };
-        let Some((in_va, in_phys)) = dma_page() else { return false };
-        let Some(mut ep0) = Ring::new() else { return false };
-        let Some((buf_va, buf_phys)) = dma_page() else { return false };
+        let Some(sc) = scratch() else { return false };
+        let (in_va, in_phys, buf_va, buf_phys) = (sc.in_va, sc.in_phys, sc.buf_va, sc.buf_phys);
+        let mut ep0 = &mut sc.ep0;
 
         // Register the device context before addressing: the controller writes its output there.
         // SAFETY: the DCBAA page this module owns; `slot` is within the enabled slot count.
@@ -1980,9 +2046,22 @@ fn with_disk<R>(f: impl FnOnce(&mut Xhci) -> R, absent: R, busy: R) -> R {
     r
 }
 
+/// The highest block `READ(10)`/`WRITE(10)` can name: their LBA field is 32 bits.
+///
+/// The block protocol carries a **u64** LBA on purpose (`fs` sizes capacity in u64), so a cast down to
+/// `u32` is not a formality - it silently WRAPS. Block `0x1_0000_0000` would become block 0, which for
+/// a write means the superblock is overwritten by whatever was meant for the far end of the disk, with
+/// every layer reporting success. The device in hand is 31M sectors so it cannot reach this, and that
+/// is exactly why it has to be refused rather than left to a bigger stick to discover.
+const MAX_LBA_10: u64 = u32::MAX as u64;
+
 /// Read one 512-byte block.
 pub fn disk_read(lba: u64, dst: &mut [u8]) -> bool {
     if dst.len() < 512 {
+        return false;
+    }
+    if lba > MAX_LBA_10 {
+        put_str(b"xhci: block address is beyond what READ(10) can address - refusing\r\n");
         return false;
     }
     with_disk(
@@ -2021,6 +2100,12 @@ pub fn disk_read(lba: u64, dst: &mut [u8]) -> bool {
 /// Write one 512-byte block.
 pub fn disk_write(lba: u64, src: &[u8]) -> bool {
     if src.len() < 512 {
+        return false;
+    }
+    // See `MAX_LBA_10`. A wrapped WRITE is the worse half: it corrupts a block nobody asked about.
+    if lba > MAX_LBA_10 {
+        put_str(b"xhci: block address is beyond what WRITE(10) can address - refusing
+");
         return false;
     }
     with_disk(

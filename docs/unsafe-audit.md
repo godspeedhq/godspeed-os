@@ -43,6 +43,29 @@ somewhere that names neither the GPU nor the map (§26.7).
 | `arch/aarch64/mailbox.rs` | 3 -> 4 (+1) | `property_call`: copies an arbitrary tag request into this module's 16-byte-aligned static and the reply back out, length-checked against the buffer at both ends. The static rather than the caller's array because the mailbox packs the channel into the low 4 bits of the address it is handed - an arbitrarily-aligned caller buffer would send the message to the wrong channel, so the alignment guarantee stays in one place. |
 | `arch/aarch64/mod.rs` | 53 -> 55 (+2) | The write and the read of `FB_INFO`, the static that carries the geometry across the jump to the high half. A static rather than a local because the jump abandons the low stack along with every local on it - the same reason `memmap::current_map` exists. Single-threaded boot: written once before the jump, read once after. |
 
+## 2026-08-04 - Pi 4: auditing the new USB code (feat/pi4-aarch64)
+
+~2,500 lines of new ring-0 driver code that parses untrusted device input had been reviewed only
+ad-hoc. Two real defects, both of the "works on the device in hand" kind:
+
+**A silently truncated block address.** The block protocol carries a u64 LBA on purpose, and
+`READ(10)`/`WRITE(10)` name only 32 bits, so `lba as u32` WRAPS. Block `0x1_0000_0000` becomes block 0
+- for a write, the superblock overwritten by data meant for the far end of the disk, with every layer
+reporting success. The stick in hand is 31M sectors and cannot reach it, which is exactly why it had to
+be refused here rather than left for a larger device to find.
+
+**Leaked pages on every failed enumeration.** Twelve DMA allocations, ~40 failure paths, and no
+`free_frame` anywhere. Hot-plug retries an arrival three times, so a device that refuses to come up
+leaked steadily as it was replugged - the unbounded-resource shape of §26.6, arrived at by omission
+rather than design. The three transient pages (input context, control ring, descriptor buffer) now come
+from a fixed arena allocated once and reused; enumeration is serialised under `USB_CLAIM`, so there is
+never a second user. The residual - one device-context page per failed attempt, bounded by the
+three-attempt cap - is recorded in the code rather than claimed fixed (§26.3).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | 35 -> 37 (+2) | The scratch arena's borrow (serialised by `USB_CLAIM`, so the only live one) and the zeroing of its three pages between devices - a ring left holding the previous device's TRBs would have the controller execute entries it has already run. |
+
 ## 2026-08-04 - Pi 4: reboot actually reboots (feat/pi4-aarch64)
 
 `hardware_reset` was `loop { spin_loop() }`. The shell printed "rebooting...", the kernel never asked
@@ -1834,7 +1857,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/aarch64/video.rs | 2 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
-| arch/aarch64/xhci.rs | 35 | permitted |
+| arch/aarch64/xhci.rs | 37 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
