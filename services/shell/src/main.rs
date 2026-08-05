@@ -7328,8 +7328,15 @@ fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<()
             // test that cannot fail is not a test (Commandment II), and one that reports success is
             // worse than one that is absent.
             NetQ::Reply(r) if r.payload_bytes().first() == Some(&0) => {
+                // Two writes rather than one continued literal. A `\` continuation inside a string is
+                // easy to lose to a scripted edit, and when it goes the SOURCE INDENTATION becomes part
+                // of the message - which is exactly what shipped: runs of spaces mid-sentence on the
+                // console. Short literals cannot do that.
                 ctx.console_writeln(
-                    "chaos link-flap: NOT SUPPORTED by this NIC backend - nothing was forced,                      nothing was tested (the in-kernel ARM NICs have no override; unplug the cable                      to test link recovery for real)");
+                    "chaos link-flap: NOT SUPPORTED by this NIC backend - nothing was forced.");
+                ctx.console_writeln(
+                    "  The in-kernel ARM NICs have no link override. Unplug the cable to test link \
+recovery for real.");
                 return Ok(());
             }
             _ => {}
