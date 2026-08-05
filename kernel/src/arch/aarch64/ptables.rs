@@ -75,14 +75,36 @@ fn phys_to_virt(pa: u64) -> u64 {
 /// # Safety
 /// `table` must be a live, 4 KiB-aligned page-table frame (physical) and `i < 512`.
 unsafe fn get(table: u64, i: usize) -> u64 {
-    // SAFETY: caller's contract; the high half maps all physical RAM.
+    // REFUSE to follow an address that is not RAM, and say so.
+    //
+    // Every walk in this file dereferences a descriptor's output address. A stale or corrupt entry
+    // therefore turns a reclaim - the recovery path - into a kernel data abort, which is the one thing
+    // a recovery path must never become. x86 gained exactly this guard after a real `chaos max-carnage`
+    // run followed a corrupt entry to physical ~68 GB (`arch/x86_64/page_tables.rs::walk`); the
+    // semantic did not cross the seam with the signature (SEC-27).
+    //
+    // It bites harder here: the aarch64 high map covers only the low 4 GiB, so any descriptor naming
+    // above that yields an unmapped VA and faults, where x86 would merely read rubbish. Returning 0
+    // reads as "not valid" at every call site, so a corrupt subtree is skipped rather than followed,
+    // and the frame is not then handed to `free_frame`.
+    if !crate::memory::allocator::phys_in_ram(table) {
+        crate::kprintln!("ptables: REFUSING a walk into {:#x} - not RAM; subtree skipped", table);
+        return 0;
+    }
+    // SAFETY: caller's contract, and the address is now known to be RAM the high half maps.
     unsafe { ((phys_to_virt(table) + (i as u64) * 8) as *const u64).read_volatile() }
 }
 
 /// # Safety
 /// As [`get`].
 unsafe fn set(table: u64, i: usize, v: u64) {
-    // SAFETY: caller's contract; the high half maps all physical RAM.
+    // Same guard as `get`, and more important: a write through a corrupt address does not merely fault,
+    // it corrupts whatever it lands on if the address happens to be mapped.
+    if !crate::memory::allocator::phys_in_ram(table) {
+        crate::kprintln!("ptables: REFUSING a write into {:#x} - not RAM", table);
+        return;
+    }
+    // SAFETY: caller's contract, and the address is now known to be RAM the high half maps.
     unsafe { ((phys_to_virt(table) + (i as u64) * 8) as *mut u64).write_volatile(v) }
 }
 
