@@ -173,6 +173,24 @@ TABLE at L1/L2 and PAGE at L3, and the address field is bits [47:21] for a block
 |------|--------|-----|
 | `arch/aarch64/mmu.rs` | 17 -> 23 (+6) | High-half L2 lookup, split-table arena hand-out, the block split and page clear, the verify read, and TLB maintenance. All page-table work, in the layer where it belongs (§18.1); the neutral caller stays a safe `fn`. |
 
+## 2026-08-05 - Pi 4 AUDIT 8: RX buffers cleaned and zeroed before the device owns them
+
+Audit 8 (four parallel auditors) found that GENET hands the controller RX buffers with no cache
+maintenance at all. `alloc_frame` neither zeroes nor cleans, and `allocator_selftest` writes read-back
+patterns into frames and frees them immediately before this driver probes - so a buffer can arrive
+carrying DIRTY lines. The device DMAs into that physical memory behind the cache, and the read side's
+`dma_sync` is `dc civac`: clean THEN invalidate. The clean writes the stale line back OVER the frame the
+controller just delivered. The operation intended to make the DMA visible is the one that corrupts it -
+intermittently, and invisibly under QEMU.
+
+Zeroing the buffer at ring build closes a second issue in the same line: `receive_one` trusts the
+controller's length for how many bytes are MEANINGFUL, so a device reporting more than it wrote would
+hand a `NET_DEVICE` holder whatever kernel data previously occupied the frame (the SEC-21 class).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/genet.rs` | 13 -> 14 (+1) | `write_bytes` zeroing each RX buffer before it is handed to the controller, paired with a `dma_sync` clean so no dirty line can be written back over delivered data. |
+
 ## 2026-08-05 - Pi 4 AUDIT: the barrier class, swept (SEC-25/26/27)
 
 Auditing by DEFECT CLASS rather than by file, after the respawn fault turned out to be one missing
@@ -2205,7 +2223,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/aarch64/video.rs | 2 | permitted |
-| arch/aarch64/genet.rs | 13 | permitted |
+| arch/aarch64/genet.rs | 14 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
 | arch/aarch64/smp_boot.rs | 9 | permitted |
 | arch/aarch64/xhci.rs | 38 | permitted |

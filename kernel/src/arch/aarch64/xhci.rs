@@ -1083,13 +1083,25 @@ impl Xhci {
         }
 
         let _ = dev_va;
+        let (kbd_buf_va, kbd_buf_phys) = match dma_page() {
+            Some(p) => p,
+            None => return false,
+        };
         self.kbd = Some(Keyboard {
             slot,
             hub_port: 0,
             ep_dci: dci,
             ring: int_ring,
-            buf_va,
-            buf_phys,
+            // Its OWN page, not the shared enumeration scratch. The `Scratch` doc says "no device
+            // keeps" that buffer, and three long-lived owners were keeping it: the keyboard's report
+            // target, the hub's port-status target, and the disk's CBW/CSW page. The keyboard's
+            // interrupt transfer stays permanently ARMED, so the controller DMAs into it on any
+            // keypress regardless of who holds USB_CLAIM - which serialises the driver, not the
+            // hardware. A keystroke therefore overwrote hub port status (the all-zero reads that were
+            // worked around as "a read that did not happen") and the disk's CBW signature mid-command,
+            // which is a strong candidate for the BOT wedges recovery was built to clean up after.
+            buf_va: kbd_buf_va,
+            buf_phys: kbd_buf_phys,
             pending: false,
             max_packet: ep_mps.min(8),
         });
@@ -1156,6 +1168,10 @@ impl Xhci {
 
         // Keep the hub. Everything on this board is behind it, so a keyboard unplugged once would stay
         // dead until reboot without something still holding its control endpoint.
+        let (hub_buf_va, hub_buf_phys) = match dma_page() {
+            Some(p) => p,
+            None => return false,
+        };
         let mut hub = Hub {
             slot,
             ep0: match Ring::new() {
@@ -1163,8 +1179,16 @@ impl Xhci {
                 None => return false,
             },
             nports,
-            buf_va,
-            buf_phys,
+            // Its OWN page, not the shared enumeration scratch. The `Scratch` doc says "no device
+            // keeps" that buffer, and three long-lived owners were keeping it: the keyboard's report
+            // target, the hub's port-status target, and the disk's CBW/CSW page. The keyboard's
+            // interrupt transfer stays permanently ARMED, so the controller DMAs into it on any
+            // keypress regardless of who holds USB_CLAIM - which serialises the driver, not the
+            // hardware. A keystroke therefore overwrote hub port status (the all-zero reads that were
+            // worked around as "a read that did not happen") and the disk's CBW signature mid-command,
+            // which is a strong candidate for the BOT wedges recovery was built to clean up after.
+            buf_va: hub_buf_va,
+            buf_phys: hub_buf_phys,
             connected: 0,
             tries: [0; 16],
         };
@@ -1352,6 +1376,10 @@ impl Xhci {
             return false;
         }
 
+        let (disk_cmd_va, disk_cmd_phys) = match dma_page() {
+            Some(p) => p,
+            None => return false,
+        };
         let mut disk = Disk {
             slot,
             in_dci,
@@ -1360,8 +1388,16 @@ impl Xhci {
             out_ring,
             data_va,
             data_phys,
-            cmd_va: buf_va,
-            cmd_phys: buf_phys,
+            // Its OWN page, not the shared enumeration scratch. The `Scratch` doc says "no device
+            // keeps" that buffer, and three long-lived owners were keeping it: the keyboard's report
+            // target, the hub's port-status target, and the disk's CBW/CSW page. The keyboard's
+            // interrupt transfer stays permanently ARMED, so the controller DMAs into it on any
+            // keypress regardless of who holds USB_CLAIM - which serialises the driver, not the
+            // hardware. A keystroke therefore overwrote hub port status (the all-zero reads that were
+            // worked around as "a read that did not happen") and the disk's CBW signature mid-command,
+            // which is a strong candidate for the BOT wedges recovery was built to clean up after.
+            cmd_va: disk_cmd_va,
+            cmd_phys: disk_cmd_phys,
             sectors: 0,
             tag: 1,
             hub_port: 0,
@@ -2471,6 +2507,21 @@ pub fn poll() {
         }
         let code = (ev.status >> 24) & 0xFF;
         if let Some(kbd) = hc.kbd.as_mut() {
+            // Is this event actually the KEYBOARD'S? The event ring is shared by every endpoint, and
+            // this loop used to treat any transfer completion as a report: it cleared `pending` and
+            // decoded 8 bytes of the buffer straight into console keystrokes.
+            //
+            // Orphaned completions are routine, not hypothetical - every `await_transfer` timeout
+            // leaves a TRB in flight whose completion lands later, and `TIMEOUT_RUN_MAX = 60` presumes
+            // sixty of them. Two consequences, both live: `pending` cleared while the real transfer is
+            // still outstanding queues a second TRB into one 8-byte buffer and desynchronises the count
+            // permanently; and whatever bytes happen to be in that buffer get decoded as HID usages and
+            // INJECTED INTO THE CONSOLE - a `CONSOLE_PUSH` path, inside the shell's trust perimeter
+            // (§6.4 SEC-2). `absorb_foreign_event` does this check and documents it as load-bearing;
+            // this path simply did not.
+            if ev.param < kbd.ring.phys || ev.param >= kbd.ring.phys + 4096 {
+                continue; // somebody else's completion
+            }
             kbd.pending = false;
             // 1 = success, 13 = short packet. Anything else means the transfer did not deliver a
             // report, and decoding the buffer would decode whatever was there before.

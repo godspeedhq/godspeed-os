@@ -640,6 +640,28 @@ pub fn init_rx_ring() -> bool {
         // SAFETY: this module's own array, indexed inside its length, during single-threaded boot.
         unsafe { RX_BUFS[i as usize] = phys };
 
+        // ZERO the buffer and CLEAN it out of the cache BEFORE the device owns it.
+        //
+        // Two bugs closed by one operation, and the first is vicious. `alloc_frame` neither zeroes nor
+        // cleans, and `allocator_selftest` writes read-back patterns into frames and frees them just
+        // before this driver probes - so a buffer can arrive carrying DIRTY cache lines. The device then
+        // DMAs into that physical memory behind the cache, and the `dma_sync` on the read side is
+        // `dc civac`: clean THEN invalidate. The clean writes the stale line back OVER the frame the
+        // controller just delivered. The one operation meant to make the DMA visible is the one that
+        // corrupts it, intermittently, depending on whether the line happened to be evicted first - and
+        // invisible under QEMU, which models no such cache.
+        //
+        // Zeroing also closes an info leak: `receive_one` trusts the controller's length for how many
+        // bytes are MEANINGFUL, so a device reporting more than it wrote would hand a NET_DEVICE holder
+        // whatever kernel data previously occupied the frame (the SEC-21 class).
+        //
+        // SAFETY: `phys` came from the frame allocator and the direct map covers all of physical memory,
+        // so this addresses that frame and nothing else; the length is one frame.
+        unsafe {
+            core::ptr::write_bytes(phys_to_virt(phys) as *mut u8, 0, RX_BUF_LENGTH as usize);
+        }
+        super::mmu::dma_sync(phys_to_virt(phys), RX_BUF_LENGTH as usize);
+
         // The descriptor's address words. The controller reads these to find where to put a frame, so
         // they are PHYSICAL - the kernel's own view of that memory is the direct-map alias, and handing
         // over a virtual address is a device writing to an address that means nothing to it.
@@ -1186,17 +1208,29 @@ pub fn config_phy_clock_delay() {
         return;
     };
     misc |= AUXCTL_MISC_WREN | AUXCTL_MISC_RGMII_SKEW_EN;
-    let _ = auxctl_write(AUXCTL_SHDWSEL_MISC, misc);
+    let wrote_rx = auxctl_write(AUXCTL_SHDWSEL_MISC, misc).is_some();
 
     let Some(clk) = shadow_read(SHD_CLK_CTL) else {
         put_str(b"genet: PHY shadow read failed - transmit clock delay left as found\r\n");
         return;
     };
-    let _ = shadow_write(SHD_CLK_CTL, clk & !SHD_CLK_CTL_GTXCLK_EN);
+    let wrote_tx = shadow_write(SHD_CLK_CTL, clk & !SHD_CLK_CTL_GTXCLK_EN).is_some();
 
-    put_str(b"genet: PHY clock delays set for rgmii-rxid (rx skew on, internal tx delay off) - was ");
-    put_hex(clk as u64);
-    put_str(b"\r\n");
+    // Announce what actually happened. Both verdicts used to be discarded and the success line printed
+    // unconditionally, so an MDIO timeout reported the delays as SET while the PHY kept the firmware's -
+    // precisely the fault this function exists to prevent, and the one that is invisible from the board
+    // (link, speed and MDIO all stay healthy while every frame arrives corrupt).
+    if wrote_rx && wrote_tx {
+        put_str(b"genet: PHY clock delays set for rgmii-rxid (rx skew on, internal tx delay off) - was ");
+        put_hex(clk as u64);
+        put_str(b"\r\n");
+    } else {
+        put_str(b"genet: PHY clock delay write FAILED (rx ok ");
+        put_str(if wrote_rx { b"y" as &[u8] } else { b"n" });
+        put_str(b", tx ok ");
+        put_str(if wrote_tx { b"y" as &[u8] } else { b"n" });
+        put_str(b") - the PHY keeps the firmware's skew, frames may arrive corrupt\r\n");
+    }
 }
 
 /// The board's real MAC address, from the firmware.
