@@ -493,7 +493,12 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         //   off the disk at startup and records it before a reboot. The shell needs the bound, not the
         //   clock, so it does not get the power to step every task's time of day. A kernel-only by-name
         //   grant like NET_DEVICE (not a contract cap). ARM-gated: x86's CMOS RTC is the authority there.
-        set_clock:       cfg!(target_arch = "arm") && matches!(name, "net-stack"),
+        // aarch64 joins arm for the same reason arm has it: the Pi 4 has no RTC either, so SNTP is the
+        // only source of a wall clock. Without the grant net-stack does the whole query, gets a real
+        // answer, and is refused at the last step - the clock stays at the boot epoch while the log
+        // says the time was fetched.
+        set_clock:       cfg!(any(target_arch = "arm", target_arch = "aarch64"))
+            && matches!(name, "net-stack"),
         set_clock_floor: cfg!(target_arch = "arm") && matches!(name, "shell"),
     }
 }

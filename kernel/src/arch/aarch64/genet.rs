@@ -1099,30 +1099,16 @@ pub fn transmit(frame: &[u8]) -> bool {
     // counters cannot answer it. 32 bytes covers destination MAC, source MAC, ethertype and the start
     // of the IP header - enough to tell a broadcast DHCP discover from something malformed, without
     // building a protocol decoder in the kernel (which is not the kernel's business, §4.4).
-    let first = TX_REPORTS.load(core::sync::atomic::Ordering::Relaxed) == 0;
-    if first {
-        put_str(b"genet: first TX frame, len ");
-        put_hex(frame.len() as u64);
-        put_str(b", head");
-        for b in frame.iter().take(32) {
-            put_str(b" ");
-            put_hex(*b as u64);
-        }
-        put_str(b"\r\n");
-    }
-
     // Report the counters right after a transmit, bounded to a handful.
     //
-    // This lives HERE, and not in the timer tick where it started, for two reasons the last boot
-    // taught. First, the tick runs at roughly 12 kHz on this board, so a report every 1500 ticks
-    // burned all eight inside the first second - nowhere near the DHCP window it was meant to observe.
-    // Transmits are paced by the stack actually trying something, which is exactly when the counters
-    // are worth reading. Second, and worse, printing from the ISR RACED the boot path's serial writes
-    // and produced a genuinely corrupt line - "genet: ready" and "genet: counters" interleaved
-    // character by character, which read as the driver having failed to come up when it had not.
-    // A diagnostic that corrupts the log it is written to is worse than no diagnostic.
+    // Kept at a small count, and only on transmit, because this is a hot path: it is the thing that
+    // proved the RGMII clock skew (frames well-formed, tx_pkt climbing, nothing ever answering), and
+    // it is worth keeping for the next time this port cannot reach the network. It lives HERE and not
+    // in the timer tick where it started, because printing from the ISR RACED the boot path's serial
+    // writes and produced a genuinely corrupt line - "genet: ready" and "genet: counters" interleaved
+    // character by character - which read as the driver failing to come up when it had not.
     let n = TX_REPORTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if n < 8 {
+    if n < 4 {
         report_counters();
     }
 
