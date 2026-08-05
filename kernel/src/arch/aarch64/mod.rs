@@ -876,6 +876,11 @@ extern "C" fn boot_high() -> ! {
             if genet::umac_init(mac).is_some() {
                 // Prove the DMA block bases before anything hands the controller a buffer.
                 if genet::verify_dma_layout() {
+                    // Set the PHY's RGMII clock delays before any traffic moves. Skipping this leaves
+                    // whatever the firmware happened to configure, which is the one thing Linux does
+                    // here that this driver never did - and a clock skew that is wrong corrupts
+                    // frames while leaving link, speed and MDIO all perfectly healthy.
+                    genet::config_phy_clock_delay();
                     genet::apply_link_settings();
                     // Both rings up, then declare the driver open. The 3-second receive selftest that
                     // proved this path is gone: it has done its job, and paying it on every boot

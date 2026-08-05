@@ -1139,6 +1139,80 @@ pub fn transmit(frame: &[u8]) -> bool {
     true
 }
 
+// --- PHY internal clock delays (BCM54213PE) ------------------------------------------------------
+//
+// RGMII carries data and its clock on separate traces, and the receiver samples the data against that
+// clock. If the two are not skewed relative to each other by about 2ns, sampling lands on the
+// transition instead of the middle of the eye and frames arrive corrupt. Nothing about this shows up
+// in link state: autonegotiation, the link bit, the speed, and the whole MDIO management bus are
+// unaffected, because MDIO is a separate low-speed bus. The symptom is exactly what this port shows -
+// a perfect 1000 Mbit link that nobody answers.
+//
+// The Pi 4 runs `rgmii-rxid`: the PHY adds the RECEIVE delay, and the transmit delay is NOT the PHY's
+// to add. This driver has never written a single PHY register, so whatever the firmware left behind is
+// what has been running. Linux configures this explicitly in `bcm54xx_config_clock_delay` for every
+// RGMII variant, which is the difference between a Pi 4 that gets a DHCP lease under Raspberry Pi OS
+// and this one.
+/// Auxiliary control register, and the shadow selector within it.
+const MII_BCM54XX_AUX_CTL: u32 = 0x18;
+const AUXCTL_SHDWSEL_MISC: u16 = 0x07;
+const AUXCTL_MISC_WREN: u16 = 0x8000;
+const AUXCTL_MISC_RGMII_SKEW_EN: u16 = 0x0100;
+const AUXCTL_SHDWSEL_MASK: u16 = 0x0007;
+const AUXCTL_SHDWSEL_READ_SHIFT: u16 = 12;
+/// Shadow register window, where the transmit clock control lives.
+const MII_BCM54XX_SHD: u32 = 0x1C;
+const SHD_WRITE: u16 = 0x8000;
+const SHD_CLK_CTL: u16 = 0x3;
+const SHD_CLK_CTL_GTXCLK_EN: u16 = 1 << 9;
+
+/// Read an auxiliary-control shadow register. The selector goes in TWICE - once in the low bits and
+/// once in the read-select field - which is the part that silently returns the wrong shadow if missed.
+fn auxctl_read(sel: u16) -> Option<u16> {
+    mdio(1, MII_BCM54XX_AUX_CTL, Some(AUXCTL_SHDWSEL_MASK | (sel << AUXCTL_SHDWSEL_READ_SHIFT)))?;
+    mdio(1, MII_BCM54XX_AUX_CTL, None)
+}
+
+fn auxctl_write(sel: u16, val: u16) -> Option<u16> {
+    mdio(1, MII_BCM54XX_AUX_CTL, Some(sel | val))
+}
+
+fn shadow_read(shadow: u16) -> Option<u16> {
+    mdio(1, MII_BCM54XX_SHD, Some((shadow & 0x1F) << 10))?;
+    Some(mdio(1, MII_BCM54XX_SHD, None)? & 0x3FF)
+}
+
+fn shadow_write(shadow: u16, val: u16) -> Option<u16> {
+    mdio(
+        1,
+        MII_BCM54XX_SHD,
+        Some(SHD_WRITE | ((shadow & 0x1F) << 10) | (val & 0x3FF)),
+    )
+}
+
+/// Set the PHY's internal clock delays for `rgmii-rxid`, the mode the Pi 4 wires.
+///
+/// Receive skew ON (the PHY supplies that delay) and the internal transmit clock delay OFF (it is not
+/// the PHY's to add in this mode). Exactly what `bcm54xx_config_clock_delay` does for `RGMII_RXID`.
+pub fn config_phy_clock_delay() {
+    let Some(mut misc) = auxctl_read(AUXCTL_SHDWSEL_MISC) else {
+        put_str(b"genet: PHY auxctl read failed - clock delays left as the firmware set them\r\n");
+        return;
+    };
+    misc |= AUXCTL_MISC_WREN | AUXCTL_MISC_RGMII_SKEW_EN;
+    let _ = auxctl_write(AUXCTL_SHDWSEL_MISC, misc);
+
+    let Some(clk) = shadow_read(SHD_CLK_CTL) else {
+        put_str(b"genet: PHY shadow read failed - transmit clock delay left as found\r\n");
+        return;
+    };
+    let _ = shadow_write(SHD_CLK_CTL, clk & !SHD_CLK_CTL_GTXCLK_EN);
+
+    put_str(b"genet: PHY clock delays set for rgmii-rxid (rx skew on, internal tx delay off) - was ");
+    put_hex(clk as u64);
+    put_str(b"\r\n");
+}
+
 /// The board's real MAC address, from the firmware.
 ///
 /// Every frame this port has transmitted so far carried `02:00:00:00:00:01`, a made-up
