@@ -54,6 +54,18 @@ pub fn kstack_pool_base() -> u64 {
     unsafe { core::ptr::addr_of!(KSTACK_STORAGE.data) as *const u8 as u64 }
 }
 
+/// The kernel-stack pool as `(base, len)`, for an arch that must know which of its page-table entries
+/// will need to describe 4 KiB pages rather than a larger block.
+///
+/// AArch64 maps the kernel half with 2 MiB blocks, and punching a guard page out of a LIVE block would
+/// mean changing its size while executing from it - which the architecture forbids without
+/// break-before-make, and break-before-make is itself fatal on a block you are running from. Knowing
+/// the span at table-build time lets that arch emit those blocks as page tables in the first place, so
+/// the live map is never mutated at all. Arches that map at 4 KiB (x86) can ignore this.
+pub fn kstack_pool_span() -> (u64, usize) {
+    (kstack_pool_base(), KSTACK_STRIDE * TASK_KSTACK_MAX)
+}
+
 /// Install a guard page below every kstack slot (hardening H4 guard-pages). The
 /// low 4 KiB page of each 68 KiB slot is unmapped; the 64 KiB usable stack sits
 /// above it. A kernel-stack overflow grows down from the top, past the 64 KiB of

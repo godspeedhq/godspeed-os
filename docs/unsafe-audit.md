@@ -173,6 +173,26 @@ TABLE at L1/L2 and PAGE at L3, and the address field is bits [47:21] for a block
 |------|--------|-----|
 | `arch/aarch64/mmu.rs` | 17 -> 23 (+6) | High-half L2 lookup, split-table arena hand-out, the block split and page clear, the verify read, and TLB maintenance. All page-table work, in the layer where it belongs (§18.1); the neutral caller stays a safe `fn`. |
 
+## 2026-08-05 - Pi 4: break-before-make satisfied by never needing it
+
+The guard-page split used to convert a LIVE 2 MiB block into a table. Changing a mapping's block size
+requires break-before-make, and BBM is itself fatal on a block you are executing from or whose stack you
+are standing on - which is exactly this case: the guard install runs on the kernel stack and logs through
+`.bss`, either of which can live in a block it re-points. So it was done with no BBM at all, leaving the
+TLB free to hold the 2 MiB block AND the new 4 KiB pages for one VA simultaneously (CONSTRAINED
+UNPREDICTABLE; permitted to raise a TLB conflict abort or amalgamate them).
+
+Fixed by removing the need rather than performing the dance: `enable()` now emits the blocks overlapping
+the kernel-stack pool as page TABLES from the start, before the MMU is ever on. The runtime path only
+clears an L3 entry - a valid-to-invalid transition, which needs an invalidate and no BBM. A live block
+found at guard time is now REFUSED and reported rather than split.
+
+`task::kstack_pool_span()` is the new neutral accessor; x86 maps at 4 KiB and ignores it.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mmu.rs` | 23 -> 24 (+1) | `split_block_at_build` filling one arena L3 table with the 512 pages that reproduce a block verbatim, during table construction with the MMU off. The runtime split (and its two barriers) is deleted. |
+
 ## 2026-08-05 - Pi 4 AUDIT 8 follow-up: reclaim a departed device's DMA pages
 
 `dma_page` never had a counterpart, so this driver freed nothing. Every unplug/replug cycle leaked the
@@ -2231,7 +2251,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 6 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
-| arch/aarch64/mmu.rs | 23 | permitted |
+| arch/aarch64/mmu.rs | 24 | permitted |
 | arch/aarch64/ptables.rs | 21 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 4 | permitted |
