@@ -1155,7 +1155,41 @@ pub fn ap_init(core_id: u32) { unimplemented!("aarch64::ap_init") }
 pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, local_irq_save, local_irq_restore};
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
 /// Non-PCI fixed-physical peripheral MMIO grant (ARM Pi path); no fixed windows on this arch stub.
-pub fn map_fixed_driver_mmio(_pt: &mut page_tables::PageTable, _name: &str) -> Option<(u64, u64)> { None }
+/// Where a driver service sees its device registers, in ITS OWN address space.
+///
+/// Chosen well above any service image and below the 39-bit VA ceiling this MMU translates.
+pub const DRIVER_MMIO_VA: u64 = 0x6000_0000;
+
+/// Grant a named driver service the MMIO window its device lives at - by NAME, at spawn, and nothing
+/// else (§3.1: authority is granted deliberately or not at all).
+///
+/// This returned `None`, which is why `genet` and `xhci` are still IN the kernel: a service cannot
+/// drive a device whose registers it cannot name. Step 2 of getting them out (step 1 was routing the
+/// device IRQ, `exceptions.rs`), and the reason Commandment I is currently broken on this port.
+///
+/// Mapped Device-nGnRnE via `PCD` (`ptables::map_raw` reads that as the device attribute) and
+/// NO_EXEC - a register window is never code. USER because the point is for EL0 to reach it.
+pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Option<(u64, u64)> {
+    use crate::memory::frame::PhysAddr;
+    use page_tables::{PageFlags, VirtAddr};
+
+    // One entry per device this port knows how to grant. A name that is not here gets NOTHING, which
+    // is the default that keeps this a grant rather than an ambient window.
+    let (phys, pages): (u64, u64) = match name {
+        // The GENET v5 ethernet MAC. 64 KiB covers the SYS/EXT/RBUF/UMAC/MDIO blocks and both DMA
+        // register files (the RDMA/TDMA rings sit at +0x2000 and +0x4000).
+        "nic-driver" => (0xFD58_0000, 16),
+        _ => return None,
+    };
+
+    let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE
+        | PageFlags::NO_EXEC | PageFlags::PCD;
+    for i in 0..pages {
+        let off = i * 0x1000;
+        pt.map(VirtAddr(DRIVER_MMIO_VA + off), PhysAddr(phys + off), flags).ok()?;
+    }
+    Some((DRIVER_MMIO_VA, pages * 0x1000))
+}
 
 // USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
 pub fn net_frame_tx(frame: &[u8]) -> bool {
