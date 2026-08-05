@@ -320,10 +320,6 @@ fn ec_name(esr: u64) -> &'static [u8] {
 
 /// Ticks seen, so the boot can report progress instead of asserting the timer works.
 pub static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// How many network counter reports have been emitted, so the diagnostic is bounded (§26.6) rather
-/// than a console flood for the life of the boot.
-#[cfg(feature = "pi4")]
-static NET_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// IRQ entry. Acknowledge at the GIC, handle, end-of-interrupt, return.
 ///
@@ -352,25 +348,7 @@ extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
         // Re-arm: the generic timer is one-shot, so a periodic tick means reloading it every time.
         super::timer::arm(super::TIMER_INTERVAL.load(core::sync::atomic::Ordering::Relaxed));
 
-        // Network counters, repeatedly, while the userspace stack is trying to configure.
-        //
-        // The first attempt at this fired once at a fixed tick and landed BEFORE the driver was even
-        // marked ready, let alone before net-stack existed - so it reported all-zeroes for a path
-        // nothing had used yet. Read at face value that says "nic-driver never transmits", which is a
-        // service bug that may not exist. A measurement taken at the wrong moment is not a weaker
-        // measurement, it is a false one.
-        //
-        // So: gate on the driver actually being up, repeat on a period, and stop after a handful so the
-        // console is not flooded. Some report is then guaranteed to land inside the DHCP window
-        // whatever the tick rate turns out to be, which is the thing the fixed threshold assumed and
-        // got wrong.
-        #[cfg(feature = "pi4")]
-        if t % 1500 == 0 && super::genet::ready() {
-            let n = NET_REPORTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n < 8 {
-                super::genet::report_counters();
-            }
-        }
+        let _ = t;
 
         // **EOI BEFORE handing control to the scheduler, not after.** The neutral tick performs a
         // preemptive `switch_context` INTERNALLY: it may not return here for a whole quantum, and on a

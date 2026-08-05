@@ -978,6 +978,8 @@ const DMA_TX_QTAG_MASK: u32 = 0x3F;
 static mut TX_BUFS: [u64; TX_RING_DESCS as usize] = [0; TX_RING_DESCS as usize];
 /// The next transmit descriptor to fill. Ours alone; the hardware owns the consumer index.
 static mut TX_NEXT: u32 = 0;
+/// Bounds the post-transmit counter report, so the diagnostic cannot become a console flood (§26.6).
+static TX_REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// The kernel's view of a physical address, through the direct map.
 fn phys_to_virt(phys: u64) -> u64 {
@@ -1087,6 +1089,21 @@ pub fn transmit(frame: &[u8]) -> bool {
         desc_word(TDMA_OFFSET, slot as u64, DMA_DESC_LENGTH_STATUS),
         len_stat,
     );
+
+    // Report the counters right after a transmit, bounded to a handful.
+    //
+    // This lives HERE, and not in the timer tick where it started, for two reasons the last boot
+    // taught. First, the tick runs at roughly 12 kHz on this board, so a report every 1500 ticks
+    // burned all eight inside the first second - nowhere near the DHCP window it was meant to observe.
+    // Transmits are paced by the stack actually trying something, which is exactly when the counters
+    // are worth reading. Second, and worse, printing from the ISR RACED the boot path's serial writes
+    // and produced a genuinely corrupt line - "genet: ready" and "genet: counters" interleaved
+    // character by character, which read as the driver having failed to come up when it had not.
+    // A diagnostic that corrupts the log it is written to is worse than no diagnostic.
+    let n = TX_REPORTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n < 8 {
+        report_counters();
+    }
 
     // Publishing the producer index IS the handover, so it goes last.
     // SAFETY: this module's own cursor, during single-threaded boot.
