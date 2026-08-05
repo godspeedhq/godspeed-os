@@ -1130,6 +1130,85 @@ pub fn mark_ready(mac: [u8; 6]) {
     GENET_READY.store(true, core::sync::atomic::Ordering::Release);
 }
 
+/// The destination-address filter. Two registers per address, UMAC-relative.
+const UMAC_MDF_CTRL: u64 = GENET_UMAC_OFF + 0x650;
+const UMAC_MDF_ADDR: u64 = GENET_UMAC_OFF + 0x654;
+/// Filters enable from the TOP bit down: filter `i` is enabled by bit `MAX_MDF_FILTER - 1 - i`, which
+/// is what Linux's `GENMASK(MAX_MDF_FILTER - 1, MAX_MDF_FILTER - nfilter)` computes. Reading that as
+/// "bit i enables filter i" programs the addresses correctly and enables the wrong ones.
+const MAX_MDF_FILTER: u32 = 17;
+
+/// Write one address into filter slot `i`, as the two registers the hardware splits it across.
+fn set_mdf_addr(i: u32, mac: [u8; 6]) {
+    wr(
+        UMAC_MDF_ADDR + (i * 4) as u64,
+        ((mac[0] as u32) << 8) | mac[1] as u32,
+    );
+    wr(
+        UMAC_MDF_ADDR + ((i + 1) * 4) as u64,
+        ((mac[2] as u32) << 24)
+            | ((mac[3] as u32) << 16)
+            | ((mac[4] as u32) << 8)
+            | mac[5] as u32,
+    );
+}
+
+/// Accept our own address and broadcast, and nothing else.
+///
+/// This replaces the promiscuous mode bring-up used, and it is not merely tidying. Promiscuous puts
+/// EVERY frame on the segment into a 32-descriptor ring that userspace drains one frame per syscall
+/// round-trip. On a live network that ring fills with other people's broadcast traffic, and the
+/// producer index's upper half - which counts DISCARDS - is the hardware saying so. A DHCP offer
+/// addressed to us is then thrown away before the stack ever asks for it.
+///
+/// Broadcast is filter 0 and our own address filter 1, so ARP and DHCP both still arrive.
+pub fn set_rx_filter(mac: [u8; 6]) {
+    set_mdf_addr(0, [0xFF; 6]);
+    set_mdf_addr(2, mac);
+
+    // Two filters, enabled from the top: bits 16 and 15.
+    let enable = ((1u32 << MAX_MDF_FILTER) - 1) & !((1u32 << (MAX_MDF_FILTER - 2)) - 1);
+    wr(UMAC_MDF_CTRL, enable);
+
+    // With a real filter in place, stop accepting everything.
+    wr(UMAC_CMD, rd(UMAC_CMD) & !CMD_PROMISC);
+}
+
+/// Report what each half of the path has actually moved.
+///
+/// Called once, well after the userspace stack has tried and failed, because "DHCP got no offer" and
+/// "ARP got no reply" are both consistent with three different faults and cannot tell them apart:
+///
+///   `tx_prod` climbing, `tx_cons` following   frames ARE reaching the wire; the failure is inbound
+///   `tx_prod` climbing, `tx_cons` stuck       the DMA is not taking what we queue
+///   `tx_prod` at 0                            nic-driver is not calling transmit at all
+///   `rx_pkt` climbing, `rx_prod` at 0         the MAC hears the wire but the ring gets nothing
+///   `rx_prod` far ahead of `rx_cons`          frames ARRIVE and nothing is draining them, so the
+///                                             syscall path, not the hardware, is where they are lost
+///
+/// Every address used here is one already proven correct on this board, deliberately: a fresh offset
+/// would read back plausible nonsense and this is a measurement, not another guess.
+pub fn report_counters() {
+    put_str(b"genet: counters - rx_pkt ");
+    put_hex(rd(UMAC_MIB_RX_PKT) as u64);
+    put_str(b" rx_bcast ");
+    put_hex(rd(UMAC_MIB_RX_BCA) as u64);
+    // The producer register's UPPER half is a DISCARD COUNT - frames the hardware had nowhere to put.
+    // Masking it off (which every read of this register in this driver was doing) throws away the one
+    // number that distinguishes "nothing arrived" from "everything arrived and was dropped".
+    put_str(b" rx_discards ");
+    put_hex((rd(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_PROD_INDEX)) >> 16) as u64);
+    put_str(b" rx_prod ");
+    put_hex((rd(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_PROD_INDEX)) & 0xFFFF) as u64);
+    put_str(b" rx_cons ");
+    put_hex((rd(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_CONS_INDEX)) & 0xFFFF) as u64);
+    put_str(b" tx_prod ");
+    put_hex((rd(ring_reg(TDMA_OFFSET, TX_RING_INDEX, TDMA_PROD_INDEX)) & 0xFFFF) as u64);
+    put_str(b" tx_cons ");
+    put_hex((rd(ring_reg(TDMA_OFFSET, TX_RING_INDEX, TDMA_CONS_INDEX)) & 0xFFFF) as u64);
+    put_str(b"\r\n");
+}
+
 /// Say so on the console, using this module's own serial writer.
 pub fn announce_ready() {
     put_str(b"genet: ready - receive and transmit both up, NET_DEVICE syscalls live\r\n");

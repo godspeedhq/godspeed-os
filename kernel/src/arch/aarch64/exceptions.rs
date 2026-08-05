@@ -344,9 +344,17 @@ extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
         return;
     }
     if id == super::timer::TIMER_PPI {
-        TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let t = TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // Re-arm: the generic timer is one-shot, so a periodic tick means reloading it every time.
         super::timer::arm(super::TIMER_INTERVAL.load(core::sync::atomic::Ordering::Relaxed));
+
+        // One network report, once, after the userspace stack has had time to try and fail. It answers
+        // WHICH HALF is broken - frames not reaching the wire, or replies not reaching the stack - which
+        // no amount of reading net-stack's timeouts can distinguish.
+        #[cfg(feature = "pi4")]
+        if t == 2500 {
+            super::genet::report_counters();
+        }
 
         // **EOI BEFORE handing control to the scheduler, not after.** The neutral tick performs a
         // preemptive `switch_context` INTERNALLY: it may not return here for a whole quantum, and on a

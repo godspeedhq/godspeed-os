@@ -885,6 +885,10 @@ extern "C" fn boot_high() -> ! {
                         && genet::init_tx_ring()
                         && genet::enable_tx()
                     {
+                        // Narrow to our address plus broadcast before any traffic is admitted. The
+                        // bring-up ran promiscuous, which floods a 32-descriptor ring with the whole
+                        // segment's broadcast traffic and discards what was actually addressed to us.
+                        genet::set_rx_filter(MAC);
                         genet::mark_ready(MAC);
                         genet::announce_ready();
                     }
