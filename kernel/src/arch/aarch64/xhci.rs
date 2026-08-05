@@ -132,7 +132,16 @@ const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_DISABLE_SLOT: u32 = 10;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
-/// Take an endpoint out of Halted after a failed transfer.
+/// Abort whatever is in flight and take a RUNNING endpoint to Stopped.
+///
+/// This is the step the first recovery attempt was missing, and the hardware said so exactly:
+/// `set-dequeue dci 0x3 refused, cc 0x13` - Context State Error, because Set TR Dequeue Pointer is only
+/// legal on a Stopped or Error endpoint. A timed-out transfer does NOT halt the endpoint: the command is
+/// still pending, the endpoint is still Running, and Reset Endpoint (which only applies to Halted) does
+/// nothing at all. So the ring could never be re-pointed and the recovery could never take.
+const TRB_STOP_ENDPOINT: u32 = 15;
+/// Take an endpoint out of Halted after a failed transfer. Only legal when it IS halted, which is why
+/// a Context State Error here is accepted rather than treated as failure.
 const TRB_RESET_ENDPOINT: u32 = 14;
 /// Tell the controller where to resume on a reset endpoint. Required after a reset: without it the
 /// stale dequeue pointer is kept and the ring stays desynchronised even though the halt is cleared.
@@ -1416,13 +1425,28 @@ impl Xhci {
         let (slot, in_dci, out_dci) = (d.slot, d.in_dci, d.out_dci);
         let (in_phys, out_phys) = (d.in_ring.phys, d.out_ring.phys);
 
-        put_str(b"xhci: bulk endpoint wedged - running BOT reset recovery
-");
+        put_str(b"xhci: bulk endpoint wedged - running BOT reset recovery\r\n");
 
         let mut ok = true;
         for (dci, phys) in [(in_dci, in_phys), (out_dci, out_phys)] {
+            // STOP first. A timed-out transfer leaves the endpoint RUNNING with the command still
+            // pending, not Halted - so this, not Reset, is what actually ends it, and without it the
+            // Set TR Dequeue below is illegal and the whole repair is a no-op. A context-state error
+            // here means it was already stopped, which is fine.
+            let st = self.command(0, TRB_STOP_ENDPOINT, (slot as u32) << 24 | dci << 16);
+            match st {
+                Some((1, _)) | Some((19, _)) => {}
+                other => {
+                    ok = false;
+                    put_str(b"xhci:   stop-endpoint dci ");
+                    put_hex(dci as u64);
+                    put_str(b" refused, cc ");
+                    put_hex(other.map(|(c, _)| c as u64).unwrap_or(0xFFFF));
+                    put_str(b"\r\n");
+                }
+            }
             // Reset Endpoint. A "context state" completion here means it was not halted after all,
-            // which is not an error - the other endpoint may have been the stuck one.
+            // which is not an error - a stopped-but-unhalted endpoint is exactly what a timeout leaves.
             let rc = self.command(0, TRB_RESET_ENDPOINT, (slot as u32) << 24 | dci << 16);
             match rc {
                 Some((1, _)) | Some((19, _)) => {}
