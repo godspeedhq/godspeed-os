@@ -52,6 +52,32 @@ use godspeed_sdk::{Message, ServiceContext, USB_DISK_BUSY, USB_DISK_ABSENT};
 /// Cost when it does happen: this task yields between attempts, so the wait costs nothing but its own
 /// latency - interrupts stay on, the timer runs, every other service runs.
 const BUSY_RETRIES: u32 = 6_000;
+
+/// How long a busy device may hold us off before we call it a failure - **the budget that actually
+/// means what it says**.
+///
+/// `BUSY_RETRIES` above is a COUNT, and a count is not a duration. It bounded the wait to ~30 s only
+/// because of an accident of the arm32 backend: DWC2 polls inside the syscall for about 5 ms per
+/// attempt, so 6000 of them happened to add up to the intended half-minute. The aarch64 backend
+/// returns BUSY immediately - correctly, it has nothing to wait on there - and the identical loop then
+/// burned its whole budget in **173 ms**, measured on the board. The device was never given time to
+/// finish, and a stick doing a block remap was declared broken a fifth of a second in.
+///
+/// That is the same trap as the chaos harness's `PACE_YIELDS`, where a yield count was read as a
+/// duration: a proxy for time that holds on one arch and silently means something else on the next.
+/// The tell is a bound whose real value depends on how fast the loop happens to run.
+///
+/// So the wait is bounded by the CLOCK, and the attempt count stays only as a runaway backstop.
+const BUSY_BUDGET_SECS: i64 = 30;
+
+/// Attempts to spend spinning before switching to a paced poll.
+///
+/// A device that is momentarily busy answers within a handful of attempts, and for that case a yield
+/// is exactly right - no sleep latency on the common path. Past this, the device is genuinely working
+/// (a remap, or garbage collection) and asking again 34,000 times a second neither helps it nor leaves
+/// this core free. One millisecond between attempts is still far finer than the device's own timescale.
+const SPIN_ATTEMPTS: u32 = 64;
+const BUSY_POLL_MS: u64 = 1;
 /// Seconds a single request may be re-asked before the operator is told it is still going.
 ///
 /// A healthy request is sub-millisecond, so crossing this means the device really is holding us off.
@@ -115,7 +141,22 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
                         _ => {}
                     }
                 }
-                ctx.yield_cpu();   // hand the CPU on, ask again
+                // Pace the retry, then check the wait against the CLOCK rather than the attempt count.
+                //
+                // Yielding alone is not a wait: it returns immediately when nothing else is runnable,
+                // which is how the whole budget went by in 173 ms on aarch64. Spin briefly for the
+                // momentarily-busy case, then poll at 1 kHz so the device gets real time and this core
+                // is genuinely free in between.
+                if n < SPIN_ATTEMPTS {
+                    ctx.yield_cpu();
+                } else {
+                    ctx.sleep_ms(BUSY_POLL_MS);
+                    if let Some(start) = t0 {
+                        if ctx.epoch_secs_monotonic() - start >= BUSY_BUDGET_SECS {
+                            break; // the budget is a duration, and it is spent
+                        }
+                    }
+                }
             }
             // NOTHING THERE. Not the same as busy, and the difference is the whole point of the code:
             // waiting is only ever right when the device is present and asking for time. Against an
@@ -152,9 +193,13 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
     // explaining why, which is precisely the unexplained failure §26.7 exists to prevent. The count
     // is the useful fact: it says the device was ALIVE and asking us to wait, for this long, and we
     // stopped - which is a different problem from a device that is broken, and has a different fix.
+    // Report the ELAPSED TIME, not the attempt count. The count was the misleading number all along:
+    // "gave up after 6000 busy retries" reads like half a minute of patience and was a sixth of a
+    // second, and nothing in the line said which. Seconds are the fact an operator can act on.
+    let waited = t0.map(|s| ctx.epoch_secs_monotonic() - s).unwrap_or(0);
     ctx.log_fmt(format_args!(
-        "block-driver: {} lba {} gave up after {} busy retries - the device stayed busy, it did not fail",
-        what, lba, BUSY_RETRIES));
+        "block-driver: {} lba {} gave up after {}s busy - the device stayed busy, it did not fail",
+        what, lba, waited));
     false
 }
 
