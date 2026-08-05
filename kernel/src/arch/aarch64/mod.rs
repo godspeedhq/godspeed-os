@@ -1757,6 +1757,35 @@ pub mod page_tables {
     /// still reach it.
     #[cfg(feature = "pi4")]
     pub unsafe fn free_page_table_root(root: u64) {
+        // Invalidate every translation this address space owned, on EVERY core, BEFORE its frames go
+        // back to the allocator.
+        //
+        // Without this a respawn can inherit the dead space's TLB. `switch_context` skips the TTBR
+        // install when the incoming base equals the outgoing one - a sound optimisation only while a
+        // TTBR value identifies an address space, and it stops identifying one the moment root frames
+        // are recycled. The allocator hands a just-freed frame straight back, so a service that dies
+        // and respawns can get the SAME root physical address with entirely different contents: the
+        // switch is skipped as a no-op, and the new task runs on the dead task's mappings, whose frames
+        // have already been reclaimed and handed to somebody else.
+        //
+        // That is what killed `chaos kill-storm supervisor` on this port. Seven fresh boot spawns were
+        // fine - all distinct roots - and the first RESPAWN took an instruction abort (ESR 0x82000007,
+        // translation fault level 3) on its very first fetch, then wedged core 0 hard enough that the
+        // other three cores raised the liveness panic.
+        //
+        // `vmalle1is` is the inner-shareable form on purpose: the dying task's entries may sit in a
+        // core other than the one running the kill, and a local `vmalle1` would leave them there.
+        //
+        // SAFETY: TLB maintenance, and the caller's contract that the space is dead and unreachable.
+        unsafe {
+            core::arch::asm!(
+                "dsb ishst",
+                "tlbi vmalle1is",
+                "dsb ish",
+                "isb",
+                options(nostack),
+            );
+        }
         // SAFETY: caller's contract - the space is dead and unreachable.
         unsafe { super::ptables::free_all(root) }
     }

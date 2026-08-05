@@ -135,6 +135,29 @@ invalidate is read as whatever was cached before. x86 needs neither and would hi
 |------|--------|-----|
 | `arch/aarch64/genet.rs` | 4 -> 9 (+5) | Transmit buffer table and cursor, the receive buffer lookup in the drain, and one bounded copy through the direct map into a DMA frame. Same two shapes as the existing entries; each block carries its own SAFETY comment. |
 
+## 2026-08-05 - Pi 4: invalidate a dead address space's TLB before its frames are recycled
+
+`chaos kill-storm supervisor` killed the machine on this port: the RESPAWNED supervisor took an
+instruction abort on its first fetch (ESR `0x82000007`, translation fault level 3) and wedged core 0
+hard enough that the other three raised the liveness panic. Seven boot spawns were fine; the first
+respawn died.
+
+`switch_context` skips installing TTBR0 when the incoming base equals the outgoing one. That is sound
+only while a TTBR value identifies an address space, and it stops identifying one as soon as root
+frames are recycled - the allocator hands a just-freed frame straight back, so a service that dies and
+respawns can get the SAME root physical address with entirely different contents. The switch is elided
+as a no-op and the new task runs on the dead task's mappings, whose frames have already been reclaimed.
+
+One `tlbi vmalle1is` in `free_page_table_root`, before the frames are handed back. Inner-shareable on
+purpose: the dying task's entries may live in a core other than the one running the kill, and a local
+`vmalle1` would leave them there. This is the SEC-26/SEC-27 obligation in `arch/CLAUDE.md` - an
+AArch64 address-space change does not implicitly flush - met at the point where the invariant actually
+breaks rather than by flushing on every context switch.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 65 -> 66 (+1) | TLB maintenance (`tlbi vmalle1is`) at address-space teardown, so a recycled root frame cannot inherit the dead space's translations. |
+
 ## 2026-08-05 - Pi 4 GENET milestone 5: the NET_DEVICE bridge (feat/pi4-aarch64)
 
 Wires the working driver to the arch-neutral `net_frame_tx` / `net_frame_rx` / `net_info` seam, so the
@@ -2082,7 +2105,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 65 | permitted |
+| arch/aarch64/mod.rs | 66 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/sched_spawn.rs | 2 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
