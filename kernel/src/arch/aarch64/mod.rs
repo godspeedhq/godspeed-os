@@ -869,17 +869,18 @@ extern "C" fn boot_high() -> ! {
         // The on-board ethernet controller. Identified here, next to the other device probes, and
         // inside the same window: an absent controller answers with an abort, not a value.
         if genet::probe().is_some() {
-            // A locally-administered address derived from the board serial would be better; the Pi's
-            // real MAC comes from the firmware and reading it is its own step. Fixed for now, and
-            // flagged, because a hardcoded MAC is exactly the kind of placeholder that quietly ships.
-            if genet::umac_init([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).is_some() {
+            // The board's real address, from the firmware. It was a hardcoded placeholder through
+            // bring-up - which was the right scope while the question was whether the wire worked at
+            // all, and the wrong address to keep the moment the question became why nothing replies.
+            let mac = genet::firmware_mac();
+            if genet::umac_init(mac).is_some() {
                 // Prove the DMA block bases before anything hands the controller a buffer.
                 if genet::verify_dma_layout() {
                     genet::apply_link_settings();
                     // Both rings up, then declare the driver open. The 3-second receive selftest that
                     // proved this path is gone: it has done its job, and paying it on every boot
                     // would be a permanent cost for a one-time question.
-                    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+
                     if genet::init_rx_ring()
                         && genet::enable_rx()
                         && genet::init_tx_ring()
@@ -888,8 +889,8 @@ extern "C" fn boot_high() -> ! {
                         // Narrow to our address plus broadcast before any traffic is admitted. The
                         // bring-up ran promiscuous, which floods a 32-descriptor ring with the whole
                         // segment's broadcast traffic and discards what was actually addressed to us.
-                        genet::set_rx_filter(MAC);
-                        genet::mark_ready(MAC);
+                        genet::set_rx_filter(mac);
+                        genet::mark_ready(mac);
                         genet::announce_ready();
                     }
                 }

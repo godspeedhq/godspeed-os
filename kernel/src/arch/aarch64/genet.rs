@@ -1139,6 +1139,60 @@ pub fn transmit(frame: &[u8]) -> bool {
     true
 }
 
+/// The board's real MAC address, from the firmware.
+///
+/// Every frame this port has transmitted so far carried `02:00:00:00:00:01`, a made-up
+/// locally-administered address. That was fine for proving the wire works and is not fine for talking
+/// to a network: the frames are well-formed and the MAC does put them on the wire (`tx_pkt` climbs),
+/// but nothing has ever answered one, and an address no equipment on the segment has any reason to
+/// trust is the outstanding difference between this port and the Pi 2, which gets a DHCP lease.
+///
+/// The Pi's own address lives in the firmware and is what the board is known by. Falls back to the
+/// placeholder if the mailbox will not answer, and **says which**, because the two are indistinguishable
+/// afterwards and only one of them is worth investigating (invariant 12).
+pub fn firmware_mac() -> [u8; 6] {
+    const TAG_GET_MAC_ADDRESS: u32 = 0x0001_0003;
+    const PLACEHOLDER: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+
+    let mut req = [0u32; 8];
+    req[0] = 7 * 4;
+    req[1] = 0;
+    req[2] = TAG_GET_MAC_ADDRESS;
+    req[3] = 8; // six bytes of value, in two words
+    req[4] = 0;
+    req[7] = 0; // end tag
+
+    if super::mailbox::property_call(&mut req).is_none() {
+        put_str(b"genet: firmware would not report a MAC - using the placeholder 02:00:00:00:00:01\r\n");
+        return PLACEHOLDER;
+    }
+
+    let mac = [
+        (req[5] & 0xFF) as u8,
+        ((req[5] >> 8) & 0xFF) as u8,
+        ((req[5] >> 16) & 0xFF) as u8,
+        ((req[5] >> 24) & 0xFF) as u8,
+        (req[6] & 0xFF) as u8,
+        ((req[6] >> 8) & 0xFF) as u8,
+    ];
+    // All-zero or all-ones is the signature of a tag that returned nothing useful rather than a real
+    // address, and either would be a worse station address than the placeholder.
+    if mac == [0; 6] || mac == [0xFF; 6] {
+        put_str(b"genet: firmware returned an unusable MAC - using the placeholder\r\n");
+        return PLACEHOLDER;
+    }
+
+    put_str(b"genet: firmware MAC ");
+    for (i, b) in mac.iter().enumerate() {
+        if i > 0 {
+            put_str(b":");
+        }
+        put_hex(*b as u64);
+    }
+    put_str(b"\r\n");
+    mac
+}
+
 /// Is the link up right now?
 ///
 /// Read live over MDIO rather than remembered from boot, so a cable pulled afterwards reports down.
