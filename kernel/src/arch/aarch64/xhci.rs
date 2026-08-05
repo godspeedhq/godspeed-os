@@ -2102,8 +2102,21 @@ pub fn disk_read(lba: u64, dst: &mut [u8]) -> bool {
                     DISK_BUSY.store(true, Ordering::Relaxed);
                     false
                 }
+                // The transfer did not complete in its window. That is NOT a failed device: the disk
+                // enumerated, it answered until now, and absence is a separate question already asked
+                // first by the syscall. A stick doing a block remap or garbage collection simply takes
+                // longer than one command budget, and "come back" is the honest answer.
+                //
+                // Recording this as a hard failure is what broke the mount path: `block-driver` keys its
+                // entire retry-with-backoff on BUSY, so a timeout skipped the wait completely and failed
+                // instantly, `fs` re-mounted, the re-mount read LBA 0, timed out again, and cascaded -
+                // 19 identical failures per run and not one `gave up after` line, because the wait was
+                // never entered at all.
+                //
+                // The 30-second duration budget in block-driver is what decides when to actually give
+                // up, and it announces at 2s, so a genuinely stuck device is still bounded and loud.
                 None => {
-                    DISK_BUSY.store(false, Ordering::Relaxed);
+                    DISK_BUSY.store(true, Ordering::Relaxed);
                     false
                 }
             }
@@ -2145,8 +2158,21 @@ pub fn disk_write(lba: u64, src: &[u8]) -> bool {
                     DISK_BUSY.store(true, Ordering::Relaxed);
                     false
                 }
+                // The transfer did not complete in its window. That is NOT a failed device: the disk
+                // enumerated, it answered until now, and absence is a separate question already asked
+                // first by the syscall. A stick doing a block remap or garbage collection simply takes
+                // longer than one command budget, and "come back" is the honest answer.
+                //
+                // Recording this as a hard failure is what broke the mount path: `block-driver` keys its
+                // entire retry-with-backoff on BUSY, so a timeout skipped the wait completely and failed
+                // instantly, `fs` re-mounted, the re-mount read LBA 0, timed out again, and cascaded -
+                // 19 identical failures per run and not one `gave up after` line, because the wait was
+                // never entered at all.
+                //
+                // The 30-second duration budget in block-driver is what decides when to actually give
+                // up, and it announces at 2s, so a genuinely stuck device is still bounded and loud.
                 None => {
-                    DISK_BUSY.store(false, Ordering::Relaxed);
+                    DISK_BUSY.store(true, Ordering::Relaxed);
                     false
                 }
             }
