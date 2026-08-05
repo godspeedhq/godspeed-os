@@ -1426,16 +1426,27 @@ impl Xhci {
             let rc = self.command(0, TRB_RESET_ENDPOINT, (slot as u32) << 24 | dci << 16);
             match rc {
                 Some((1, _)) | Some((19, _)) => {}
-                _ => ok = false,
+                other => {
+                    ok = false;
+                    put_str(b"xhci:   reset-endpoint dci ");
+                    put_hex(dci as u64);
+                    put_str(b" refused, cc ");
+                    put_hex(other.map(|(c, _)| c as u64).unwrap_or(0xFFFF));
+                    put_str(b"
+");
+                }
             }
             // Set TR Dequeue Pointer: resume at the ring head, cycle 1, matching the rewind below.
             // Without this the controller resumes from wherever the failed transfer left it.
-            if self
-                .command(phys | 1, TRB_SET_TR_DEQUEUE, (slot as u32) << 24 | dci << 16)
-                .map(|(c, _)| c != 1)
-                .unwrap_or(true)
-            {
+            let dq = self.command(phys | 1, TRB_SET_TR_DEQUEUE, (slot as u32) << 24 | dci << 16);
+            if dq.map(|(c, _)| c != 1).unwrap_or(true) {
                 ok = false;
+                put_str(b"xhci:   set-dequeue dci ");
+                put_hex(dci as u64);
+                put_str(b" refused, cc ");
+                put_hex(dq.map(|(c, _)| c as u64).unwrap_or(0xFFFF));
+                put_str(b"
+");
             }
         }
 
@@ -1464,6 +1475,8 @@ impl Xhci {
             // Bulk-Only Mass Storage Reset: class request to the interface, no data stage.
             if !self.control_out(slot, ep0, 0x21, 0xFF, 0, 0) {
                 ok = false;
+                put_str(b"xhci:   BOT class reset (EP0) refused
+");
             }
             // Clear the HALT feature on each bulk endpoint, by ADDRESS (dci = 2*ep + in), not by dci.
             for (dci, is_in) in [(in_dci, true), (out_dci, false)] {
@@ -1471,6 +1484,10 @@ impl Xhci {
                 let addr = if is_in { 0x80 | ep_num } else { ep_num };
                 if !self.control_out(slot, ep0, 0x02, 0x01, 0, addr as u16) {
                     ok = false;
+                    put_str(b"xhci:   clear-halt ep ");
+                    put_hex(addr as u64);
+                    put_str(b" refused
+");
                 }
             }
         } else {
