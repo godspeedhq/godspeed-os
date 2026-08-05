@@ -287,6 +287,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // "muted": it stays quiet (no prompt, no read) so it can neither smear that app's screen nor
     // swallow its `q`, and prints a fresh prompt only when it regains the keyboard. `muted` tracks it.
     let mut muted = false;
+    // Ceiling on the regain drain. The console ring is finite, so this only has to be larger than it;
+    // the bound exists so a writer cannot hold the loop, not because the ring is expected to be full.
+    const CONSOLE_DRAIN_MAX: usize = 512;
     // Whether this boot's automatic network clock has been written to the on-disk floor yet. One
     // attempt per boot: a failed write is a degraded state to report, not a thing to retry forever.
     let mut clock_floor_recorded = false;
@@ -305,7 +308,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             muted = true;
             continue;
         }
-        if muted { ctx.console_write("gsh> "); muted = false; } // regained the keyboard: a fresh prompt
+        // Regained the keyboard: a fresh prompt - and exactly ONE.
+        //
+        // There are two ways the shell learns a foreground app has finished, and they used to be able
+        // to fire together. If the shell reached the top of this loop while the app held the console it
+        // is MUTED, and this branch draws the prompt. If the app claimed the console while the shell was
+        // already blocked in `console_read`, it never got here, so the kernel pushes a newline on
+        // release to wake it - which the shell then reads as an empty command and answers with a prompt
+        // of its own. When the shell was muted AND a wake newline was queued, both happened: two
+        // prompts, which is how this presented.
+        //
+        // Draining first makes the two cases converge. Muted: the wake byte is discarded here and this
+        // branch draws the one prompt. Blocked: nothing is muted, the newline wakes the read and the
+        // empty-command path draws the one prompt. Bounded by the ring, not by the writer (§26.6).
+        if muted {
+            for _ in 0..CONSOLE_DRAIN_MAX {
+                if ctx.try_console_read().is_none() {
+                    break;
+                }
+            }
+            ctx.console_write("gsh> ");
+            muted = false;
+        }
 
         // Record the floor once, when the NETWORK has set the clock on its own at boot.
         //
