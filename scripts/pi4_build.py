@@ -75,6 +75,11 @@ PI4_SERVICES = [
     # BUILDING, and until they were on this list the kernel embedded an empty placeholder and every
     # boot reported `LoadFailed(TooSmall)`.
     "nic-driver", "net-stack",
+    # The pipe/IPC example services the shell composes (`roster | shell`, `greet`, `upper`, ...). All
+    # arch-neutral SDK users - they needed building, not porting - and selfcheck exercises them, so a
+    # missing one is 30 FAIL lines that look like a broken pipe implementation rather than an absent
+    # binary.
+    "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder",
 ]
 
 # `pi4` is always present; anything passed is added to it, not substituted for it. `pi4-smp` rides with

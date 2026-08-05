@@ -135,12 +135,14 @@ fn main() {
     // boot reports `LoadFailed(TooSmall)` - which reads like a broken binary rather than an absent one.
     let aarch64_built: &[&str] = if aarch64_demo {
         &["logger", "ping", "pong", "supervisor", "shell", "chaos", "observe", "mem-pressure",
-          "block-driver", "fs", "nic-driver", "net-stack"]
+          "block-driver", "fs", "nic-driver", "net-stack",
+          "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     } else {
         // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
         // carnage, and observe is how it is watched while it does. Both are arch-neutral.
         &["logger", "supervisor", "shell", "chaos", "observe", "mem-pressure",
-          "block-driver", "fs", "nic-driver", "net-stack"]
+          "block-driver", "fs", "nic-driver", "net-stack",
+          "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     };
     let aarch64_dir = workspace
         .join("target")
