@@ -821,6 +821,18 @@ extern "C" fn boot_high() -> ! {
         crate::memory::init(&bi);
         allocator_selftest();
 
+        // Kernel-stack guard pages. RIGHT HERE and nowhere else: after `memory::init` so the page
+        // tables are live, and before the secondaries are released and before the first kstack is
+        // handed out - so this core owns the only TLB that can hold these translations, and every
+        // stack ever allocated already carries its guard.
+        //
+        // The neutral `main.rs` calls this at the equivalent point on x86; the Pi 4 boot path does not
+        // go through there, so without this line the whole mechanism was inert on this arch - 224
+        // stacks packed end to end with nothing between them, where an overflow silently corrupts the
+        // neighbouring task's stack instead of faulting. That is the exact bug guard pages exist to
+        // turn into a loud one.
+        crate::task::install_kstack_guards();
+
         // The neutral subsystems, in the order the x86 boot brings them up. Done HERE rather than only
         // in the scheduler demo, because a real syscall reaches `current_task_lookup_cap`, which indexes
         // per-core state - and reaching that before it exists is how the user-copy seam went silent
@@ -1931,8 +1943,18 @@ pub mod page_tables {
             )
         }
     }
-    pub fn entry_for_va(virt: u64) -> Option<u64> { None }
-    pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {}
+    /// Kernel-stack guard pages. Real on the Pi 4, where the high half is a live 2 MiB-block map that
+    /// `mmu` can split; a no-op on the QEMU `virt` build, which does not run tasks.
+    #[cfg(feature = "pi4")]
+    pub fn entry_for_va(virt: u64) -> Option<u64> { super::mmu::entry_for_va(virt) }
+    #[cfg(feature = "pi4")]
+    pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {
+        super::mmu::unmap_4k_strided(base, stride, count)
+    }
+    #[cfg(not(feature = "pi4"))]
+    pub fn entry_for_va(_virt: u64) -> Option<u64> { None }
+    #[cfg(not(feature = "pi4"))]
+    pub fn unmap_4k_strided(_base: u64, _stride: u64, _count: usize) {}
     pub fn harden_hhdm_nx() {}
     /// Free every page a dead task mapped, returning how many.
     ///

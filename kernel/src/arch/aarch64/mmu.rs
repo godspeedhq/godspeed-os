@@ -610,6 +610,155 @@ pub fn sync_instruction_cache(va: u64, len: usize) {
 /// live root belongs to whichever task is running, and on the 32-bit port copying from it gave a child
 /// its spawner's user entries - which the child's reclaim later freed out from under the still-running
 /// spawner. The boot L1 holds only kernel mappings and cannot die, so it is the one safe source.
+// --- Kernel-stack guard pages -------------------------------------------------------------------
+//
+// The high half is mapped with 2 MiB BLOCKS, which is right for a direct map and useless for punching
+// a 4 KiB hole. To unmap one guard page the containing block has to be SPLIT: build an L3 table whose
+// 512 page descriptors reproduce the block exactly, repoint the L2 entry at it, then clear the one
+// entry. Everything the block described stays described, byte for byte, except the guard.
+//
+// Tables come from a fixed arena, not a heap (§26.6.1): the kstack pool is 224 slots of 68 KiB, about
+// 14.9 MiB, so it spans at most nine 2 MiB blocks even when badly aligned. Twelve is headroom, and
+// running out is reported rather than silently skipped - a guard page that was not installed is
+// exactly the kind of absent protection that must never pass quietly (invariant 12).
+const SPLIT_TABLES: usize = 12;
+static mut L3_SPLIT: [Table; SPLIT_TABLES] = [const { Table([0; ENTRIES]) }; SPLIT_TABLES];
+static SPLIT_USED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// A 4 KiB page descriptor is `0b11` at L3 - the SAME encoding that means "table" at L1 and L2.
+/// Reading a level's type bits with the wrong level's meaning is the classic long-descriptor mistake.
+const DESC_PAGE_L3: u64 = 0b11;
+/// Address field of a 4 KiB-granule descriptor: bits [47:12].
+const ADDR_MASK_4K: u64 = 0x0000_FFFF_FFFF_F000;
+/// Address field of an L2 block descriptor: bits [47:21].
+const ADDR_MASK_2M: u64 = 0x0000_FFFF_FFE0_0000;
+/// Attribute bits worth carrying from a block down to the pages that replace it: the low set
+/// (AttrIndx, NS, AP, SH, AF, nG) and the high set (the execute-never bits and friends).
+const ATTR_LOW: u64 = 0xFFC;
+const ATTR_HIGH: u64 = 0xFFF0_0000_0000_0000;
+
+/// The L2 entry describing `va` in the high-half map, or `None` if it is not a kernel address.
+///
+/// # Safety
+/// Returns a pointer into this module's page tables; the caller must not race a concurrent walk.
+unsafe fn high_l2_entry(va: u64) -> Option<*mut u64> {
+    if va < KERNEL_VA_BASE {
+        return None;
+    }
+    let pa = va - KERNEL_VA_BASE;
+    let i = (pa >> 30) as usize;
+    if i >= L1_USED {
+        return None;
+    }
+    let j = ((pa >> 21) & (ENTRIES as u64 - 1)) as usize;
+    // SAFETY: indices bounded above; taking the address of this module's own static.
+    unsafe {
+        let l2h = &raw mut L2_HIGH;
+        Some(&raw mut (*l2h)[i].0[j])
+    }
+}
+
+/// Take the next split table from the arena.
+fn take_split_table() -> Option<*mut Table> {
+    let n = SPLIT_USED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n >= SPLIT_TABLES {
+        return None;
+    }
+    // SAFETY: `n` is bounded by the check above; the arena is this module's static and each index is
+    // handed out exactly once, so no two callers can hold the same table.
+    unsafe {
+        let a = &raw mut L3_SPLIT;
+        Some(&raw mut (*a)[n])
+    }
+}
+
+/// Unmap one 4 KiB page from the high-half kernel map, splitting its block if needed.
+fn unmap_high_4k(va: u64) -> bool {
+    // SAFETY: single-threaded boot before APs start (the caller's contract), so no concurrent walk and
+    // no other core's TLB to consider. Every pointer below is into this module's own tables.
+    unsafe {
+        let Some(e) = high_l2_entry(va) else { return false };
+        let d = e.read_volatile();
+
+        let l3_va = match d & 0b11 {
+            DESC_BLOCK => {
+                let Some(t) = take_split_table() else {
+                    crate::kprintln!(
+                        "kstack: OUT OF SPLIT TABLES at {:#x} - guard page NOT installed", va);
+                    return false;
+                };
+                // Reproduce the block as 512 pages, carrying its attributes verbatim. Anything dropped
+                // here silently changes the memory type or permissions of 2 MiB of live kernel map.
+                let block_pa = d & ADDR_MASK_2M;
+                let attrs = (d & ATTR_LOW) | (d & ATTR_HIGH);
+                for k in 0..ENTRIES {
+                    (*t).0[k] = (block_pa + (k as u64) * 4096) | attrs | DESC_PAGE_L3;
+                }
+                // Publish the table BEFORE the entry that points at it. The walker is coherent with the
+                // data caches here (Normal, inner-shareable, SMPEN set), so ordering is all that is
+                // owed - a `dsb ishst`, not a cache clean.
+                core::arch::asm!("dsb ishst", options(nostack));
+                e.write_volatile(virt_to_phys(t as u64) | DESC_TABLE);
+                core::arch::asm!("dsb ishst", options(nostack));
+                t as u64
+            }
+            // Already split by an earlier guard in the same block - the common case, since 68 KiB of
+            // stride puts about thirty slots inside every 2 MiB block.
+            DESC_TABLE => (d & ADDR_MASK_4K) + KERNEL_VA_BASE,
+            _ => return false, // nothing mapped here to begin with
+        };
+
+        let k = ((va >> 12) & (ENTRIES as u64 - 1)) as usize;
+        (l3_va as *mut u64).add(k).write_volatile(0);
+        true
+    }
+}
+
+/// Unmap `count` pages at `base`, `base + stride`, ... - the kernel-stack guard pages.
+///
+/// Boot-ordering contract (see `task::install_kstack_guards`): BSP only, before any AP starts and
+/// before the first kstack is handed out, so the only TLB that can hold these translations is this
+/// core's.
+pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {
+    let mut done = 0usize;
+    for n in 0..count {
+        if unmap_high_4k(base + (n as u64) * stride) {
+            done += 1;
+        }
+    }
+    // SAFETY: TLB maintenance. Inner-shareable even though only this core is running: it costs
+    // nothing here and is correct if this is ever called with others up.
+    unsafe {
+        core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack));
+    }
+    if done != count {
+        crate::kprintln!("kstack: only {}/{} guard pages installed", done, count);
+    }
+}
+
+/// The descriptor mapping `va` in the high half, or `None` if nothing is mapped there.
+///
+/// Used to VERIFY the guards took, which matters more than usual: a guard page that quietly failed to
+/// install looks exactly like one that worked, right up until an overflow walks into the next stack.
+pub fn entry_for_va(va: u64) -> Option<u64> {
+    // SAFETY: reads only, of this module's own tables.
+    unsafe {
+        let e = high_l2_entry(va)?;
+        let d = e.read_volatile();
+        match d & 0b11 {
+            DESC_BLOCK => Some(d),
+            DESC_TABLE => {
+                let l3 = (d & ADDR_MASK_4K) + KERNEL_VA_BASE;
+                let k = ((va >> 12) & (ENTRIES as u64 - 1)) as usize;
+                let ed = (l3 as *const u64).add(k).read_volatile();
+                // At L3 `0b11` is a PAGE, and `0b01` is not valid at all.
+                if ed & 0b11 == DESC_PAGE_L3 { Some(ed) } else { None }
+            }
+            _ => None,
+        }
+    }
+}
+
 pub fn kernel_l1_root() -> u64 {
     // SAFETY: taking the address of this module's static; no dereference.
     unsafe { virt_to_phys((&raw const L1) as u64) }

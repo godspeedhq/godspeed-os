@@ -135,6 +135,30 @@ invalidate is read as whatever was cached before. x86 needs neither and would hi
 |------|--------|-----|
 | `arch/aarch64/genet.rs` | 4 -> 9 (+5) | Transmit buffer table and cursor, the receive buffer lookup in the drain, and one bounded copy through the direct map into a DMA frame. Same two shapes as the existing entries; each block carries its own SAFETY comment. |
 
+## 2026-08-05 - Pi 4: kernel-stack guard pages (block splitting)
+
+`install_kstack_guards` was inert on this arch twice over: the neutral `main.rs` call site is not on the
+Pi 4 boot path, and both arch primitives were stubs. So 224 kernel stacks sat end to end with nothing
+between them, and an overflow corrupted the neighbouring task's stack instead of faulting - the exact
+failure guard pages exist to make loud.
+
+The high half is mapped with 2 MiB BLOCKS, so a 4 KiB hole cannot simply be cleared: the containing
+block is SPLIT into an L3 table whose 512 page descriptors reproduce it verbatim (address, memory type,
+shareability, AP, AF and the execute-never bits all carried across), the L2 entry is repointed, and then
+the single guard entry is cleared. About thirty guards share each block, so the split happens once per
+block rather than per guard.
+
+Tables come from a fixed 12-entry arena in `.bss`, not a heap (§26.6.1) - the pool spans at most nine
+2 MiB blocks - and exhaustion is REPORTED, because a guard page that failed to install is indistinguishable
+from one that worked until something overflows.
+
+Two long-descriptor details worth their comments, both of which read wrong at a glance: `0b11` means
+TABLE at L1/L2 and PAGE at L3, and the address field is bits [47:21] for a block but [47:12] for a page.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mmu.rs` | 17 -> 23 (+6) | High-half L2 lookup, split-table arena hand-out, the block split and page clear, the verify read, and TLB maintenance. All page-table work, in the layer where it belongs (§18.1); the neutral caller stays a safe `fn`. |
+
 ## 2026-08-05 - Pi 4: invalidate a dead address space's TLB before its frames are recycled
 
 `chaos kill-storm supervisor` killed the machine on this port: the RESPAWNED supervisor took an
@@ -2116,7 +2140,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 6 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
-| arch/aarch64/mmu.rs | 17 | permitted |
+| arch/aarch64/mmu.rs | 23 | permitted |
 | arch/aarch64/ptables.rs | 20 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 4 | permitted |
