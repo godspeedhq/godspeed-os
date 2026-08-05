@@ -471,7 +471,12 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // nic-driver (which DOES ship a contract) carries an ARM note in nic-driver.toml so a contract
         // reader is not misled; the shell ships no contract, so the kernel is trivially its only record.
         //   nic-driver bridges ethernet frames to/from the in-kernel USB-net device (NetFrame*, 42-44).
-        net_device: cfg!(target_arch = "arm") && matches!(name, "nic-driver"),
+        // aarch64 joins arm here: the Pi 4's GENET driver backs the same NET_DEVICE syscalls the Pi 2's
+        // in-kernel USB-net bridge does, so `nic-driver` needs the same grant to reach it. Without it
+        // the service loads and runs and every frame call is denied, which looks like a dead network
+        // rather than a missing capability.
+        net_device: cfg!(any(target_arch = "arm", target_arch = "aarch64"))
+            && matches!(name, "nic-driver"),
         // USB_DISK: on BOTH ARM ports the USB stack is in-kernel, so `block-driver` reaches a USB stick
         // through syscalls 46-48 rather than MMIO. Whole-device read/write reach, granted to that one
         // service. The Pi 4 needs it for the same reason the Pi 2 does, and needed it here: without the
@@ -704,8 +709,10 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true, // will serve the frame interface to net-stack (§12)
             send_peers:        &[],
             send_peers_grant:  false,
-            // ARM: the NIC is the in-kernel DWC2 USB device, driven only from core 0 - the ARM backend's
-            // NET_DEVICE syscalls guard on that core. x86: core 1 (co-located with net-stack + fs).
+            // ARM (Pi 2): the NIC is the in-kernel DWC2 USB device, driven only from core 0 - the ARM
+            // backend's NET_DEVICE syscalls guard on that core. x86 and aarch64 (Pi 4): core 1,
+            // co-located with net-stack + fs. The Pi 4 has no core-0 constraint because GENET is
+            // reached by MMIO from whichever core makes the syscall, not from a timer tick.
             preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,

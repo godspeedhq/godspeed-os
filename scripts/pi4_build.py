@@ -69,6 +69,12 @@ PI4_SERVICES = [
     # Storage: the USB stick, never the SD card (which is the boot medium - see block-driver's
     # `backend_run`). `fs` is arch-neutral and rides on whatever block-driver serves.
     "block-driver", "fs",
+    # Networking. Both are arch-neutral: `nic-driver` reaches the hardware through the NET_DEVICE
+    # syscalls, which the aarch64 arch layer now backs with the GENET driver, and `net-stack` sits on
+    # top of nic-driver and never touches hardware at all. Neither needed porting - they needed
+    # BUILDING, and until they were on this list the kernel embedded an empty placeholder and every
+    # boot reported `LoadFailed(TooSmall)`.
+    "nic-driver", "net-stack",
 ]
 
 # `pi4` is always present; anything passed is added to it, not substituted for it. `pi4-smp` rides with

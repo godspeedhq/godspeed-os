@@ -127,12 +127,20 @@ fn main() {
     // faster than a human can read it. Cross-service IPC is already hardware-proven (63,579 messages),
     // so they are opt-in via `pi4-demo-services` rather than always present.
     let aarch64_demo = std::env::var("CARGO_FEATURE_PI4_DEMO_SERVICES").is_ok();
+    // Networking on the Pi 4: nic-driver reaches the hardware through the NET_DEVICE syscalls, which
+    // the aarch64 arch layer now backs with the GENET driver (receive and transmit both hardware
+    // proven); net-stack is arch-neutral and rides on nic-driver without touching hardware at all.
+    // Neither needed porting - they needed BUILDING and then listing HERE. Being built is not enough:
+    // a service missing from this list embeds the empty placeholder however well it compiled, and the
+    // boot reports `LoadFailed(TooSmall)` - which reads like a broken binary rather than an absent one.
     let aarch64_built: &[&str] = if aarch64_demo {
-        &["logger", "ping", "pong", "supervisor", "shell", "chaos", "observe", "mem-pressure", "block-driver", "fs"]
+        &["logger", "ping", "pong", "supervisor", "shell", "chaos", "observe", "mem-pressure",
+          "block-driver", "fs", "nic-driver", "net-stack"]
     } else {
         // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
         // carnage, and observe is how it is watched while it does. Both are arch-neutral.
-        &["logger", "supervisor", "shell", "chaos", "observe", "mem-pressure", "block-driver", "fs"]
+        &["logger", "supervisor", "shell", "chaos", "observe", "mem-pressure",
+          "block-driver", "fs", "nic-driver", "net-stack"]
     };
     let aarch64_dir = workspace
         .join("target")
