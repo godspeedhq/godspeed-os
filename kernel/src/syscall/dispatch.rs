@@ -1643,6 +1643,20 @@ fn handle_console_foreground(cap_slot: u64, op: u64) -> i64 {
     }
     if op == 0 {
         crate::arch::imp::release_console_foreground();
+        // WAKE whoever is blocked reading the console, so the prompt comes back on its own.
+        //
+        // The shell checks the foreground at the TOP of its loop and then BLOCKS in `console_read`. If a
+        // foreground app claimed the console while the shell was already blocked there, the shell never
+        // reached that check, so it is not "muted" - it is asleep on the ring. Releasing the foreground
+        // then changes a flag nobody is looking at, and the shell stays asleep until a key arrives.
+        // That is why a finished `chaos max-carnage` needed an Enter press to get `gsh>` back: the
+        // handover was correct and the sleeper was never told.
+        //
+        // A newline is the right wake: the blocked read returns it, the shell finishes an empty line and
+        // draws a fresh prompt, and an empty command runs nothing. Exactly the remedy the USB hot-plug
+        // path uses for the same reason - a working machine that presents as a dead one is what
+        // invariant 12 is about, and it is measured in what the OPERATOR can see.
+        crate::arch::imp::console_push_byte(b'\n');
     } else {
         crate::arch::imp::claim_console_foreground(scheduler::current_task_slot() as u32);
     }
