@@ -174,6 +174,12 @@ struct Ring {
 }
 
 impl Ring {
+    /// A ring that names nothing, for `Disk::placeholder` - which exists only to move a `Disk` out of
+    /// its option and must never be used as a device.
+    const fn null() -> Ring {
+        Ring { va: 0, phys: 0, enqueue: 0, cycle: 0 }
+    }
+
     fn new() -> Option<Ring> {
         let (va, phys) = dma_page()?;
         let r = Ring { va, phys, enqueue: 0, cycle: 1 };
@@ -282,6 +288,15 @@ struct Xhci {
 
 struct Keyboard {
     slot: u8,
+    /// The control ring THIS device's EP0 context names.
+    ///
+    /// Not the shared enumeration scratch. xHCI keeps an independent dequeue pointer per endpoint
+    /// context, so two slots pointing at one ring means each executes the other's TRBs and neither's
+    /// dequeue matches the software `enqueue`. The hub already avoided this by swapping a fresh ring
+    /// into the scratch and keeping the one its context named; the keyboard and the disk did not, so
+    /// every device enumerated after them shared a ring with them.
+    ep0: Ring,
+
     /// Which downstream port of the hub it is on, so a disconnect there can be matched to it.
     hub_port: u8,
     /// Doorbell target for the interrupt IN endpoint.
@@ -298,6 +313,15 @@ struct Keyboard {
 /// A USB mass-storage stick, spoken to over Bulk-Only Transport.
 struct Disk {
     slot: u8,
+    /// The control ring THIS device's EP0 context names.
+    ///
+    /// Not the shared enumeration scratch. xHCI keeps an independent dequeue pointer per endpoint
+    /// context, so two slots pointing at one ring means each executes the other's TRBs and neither's
+    /// dequeue matches the software `enqueue`. The hub already avoided this by swapping a fresh ring
+    /// into the scratch and keeping the one its context named; the keyboard and the disk did not, so
+    /// every device enumerated after them shared a ring with them.
+    ep0: Ring,
+
     in_dci: u32,
     out_dci: u32,
     in_ring: Ring,
@@ -322,6 +346,7 @@ impl Disk {
     fn placeholder() -> Disk {
         Disk {
             slot: 0,
+            ep0: Ring::null(),
             in_dci: 0,
             out_dci: 0,
             in_ring: Ring { va: 0, phys: 0, enqueue: 0, cycle: 1 },
@@ -1087,8 +1112,16 @@ impl Xhci {
             Some(p) => p,
             None => return false,
         };
+        // Take the ring this device's EP0 context names, leaving a fresh one behind for the next
+        // enumeration - the same swap the hub does, and for the same reason.
+        let mut kbd_ep0 = match Ring::new() {
+            Some(r) => r,
+            None => return false,
+        };
+        core::mem::swap(&mut kbd_ep0, ep0);
         self.kbd = Some(Keyboard {
             slot,
+            ep0: kbd_ep0,
             hub_port: 0,
             ep_dci: dci,
             ring: int_ring,
@@ -1380,8 +1413,14 @@ impl Xhci {
             Some(p) => p,
             None => return false,
         };
+        let mut disk_ep0 = match Ring::new() {
+            Some(r) => r,
+            None => return false,
+        };
+        core::mem::swap(&mut disk_ep0, ep0);
         let mut disk = Disk {
             slot,
+            ep0: disk_ep0,
             in_dci,
             out_dci,
             in_ring,
@@ -1527,20 +1566,33 @@ impl Xhci {
         // Interface 0 is assumed. Every mass-storage device this port enumerates presents its BOT
         // interface first, and the interface number is not retained at enumeration; if a device ever
         // needs a different one, this is the line that will say so by failing loudly.
-        if let Some(sc) = scratch() {
-            let ep0 = &mut sc.ep0;
-            ep0.enqueue = 0;
-            ep0.cycle = 1;
-            ep0.rearm_link();
+        // Repair the DISK'S OWN control ring, not the enumeration scratch.
+        //
+        // This used to reach for `scratch()`, which was wrong twice over: it rewound a ring shared with
+        // every other device (clobbering whatever the keyboard or hub had in flight), and it re-pointed
+        // a ring that this slot's EP0 context may not even have named. Now each device owns the ring its
+        // context names, so the thing repaired is the thing the controller reads.
+        {
+            let (ep0_va, ep0_phys) = {
+                let d = match self.disk.as_mut() {
+                    Some(d) => d,
+                    None => return false,
+                };
+                d.ep0.enqueue = 0;
+                d.ep0.cycle = 1;
+                d.ep0.rearm_link();
+                // SEC-28: the rewind zeroed 4 KiB through the cache, and the controller is not coherent
+                // with it. Without this the xHC still sees the OLD TRBs in RAM - several carrying
+                // cycle == 1 - and runs on into them once it consumes what we push. `scratch()` does this
+                // for the same operation; this path did not.
+                mmu::dma_sync(d.ep0.va, 4096);
+                (d.ep0.va, d.ep0.phys)
+            };
+            let _ = ep0_va;
 
-            // Tell the CONTROLLER about that rewind, exactly as the bulk endpoints needed.
-            //
-            // The scratch control ring is SHARED with enumeration, so this slot's EP0 context holds a
-            // dequeue pointer from wherever the last device to use it finished - while the rewind above
-            // moved only our software view to the head. The controller then reads from one place and we
-            // write to another, and every control transfer times out. That is why all three EP0 steps
-            // were refused while the bulk half had already started succeeding: same desynchronisation,
-            // one level up, and it needed the same cure rather than a different theory.
+            // Tell the CONTROLLER about that rewind, exactly as the bulk endpoints needed: it keeps an
+            // independent dequeue pointer per endpoint context, so moving only our software view to the
+            // head leaves the two reading different places and every control transfer times out.
             //
             // EP0 is DCI 1. `| 1` is the dequeue cycle state, matching `cycle = 1` above.
             //
@@ -1548,42 +1600,61 @@ impl Xhci {
             // is only legal on a Stopped or Error endpoint, and a running EP0 refuses it with a context
             // state error - which is exactly what the last boot showed once the bulk half started
             // working. A context-state completion HERE means it was already stopped, which is fine.
-            let ep0_phys = ep0.phys;
+            // STOP first, then RESET, then re-point - the same three steps the bulk endpoints get.
+            //
+            // Reset was missing here. Set TR Dequeue is legal only on a Stopped or Error endpoint, and
+            // `Halted` leaves ONLY via Reset Endpoint - so if EP0 were halted, which is the one state
+            // actually needing repair, Stop returned a context-state error, Set TR Dequeue was refused,
+            // and the device-side half could never run. A context-state completion on either is fine:
+            // it means the endpoint was already in the state that command would have produced.
             let _ = self.command(0, TRB_STOP_ENDPOINT, (slot as u32) << 24 | 1 << 16);
+            let _ = self.command(0, TRB_RESET_ENDPOINT, (slot as u32) << 24 | 1 << 16);
             let dq0 = self.command(ep0_phys | 1, TRB_SET_TR_DEQUEUE, (slot as u32) << 24 | 1 << 16);
             if dq0.map(|(c, _)| c != 1).unwrap_or(true) {
-                // Print the completion code. The previous message said only "refused", which cost a
-                // boot: a context-state error and a parameter error mean different fixes, and the one
-                // line that could have distinguished them did not.
+                // Print the completion code: a context-state error and a parameter error mean different
+                // fixes, and a message that says only "refused" costs a boot to learn which.
+                ok = false; // and COUNT it - this step failing is why control transfers do not land,
+                            // yet it alone was reported without failing the recovery (§26.7).
                 put_str(b"xhci:   set-dequeue EP0 refused, cc ");
                 put_hex(dq0.map(|(c, _)| c as u64).unwrap_or(0xFFFF));
                 put_str(b" - control transfers will not land\r\n");
             }
+
+            // Take the disk out to talk on its own ring: `control_out` needs `&mut self`, and the ring
+            // lives in `self.disk`. `placeholder` exists for exactly this move, and the disk is put back
+            // before returning on every path.
+            let mut d = match self.disk.take() {
+                Some(d) => d,
+                None => return false,
+            };
+            let mut ep0 = core::mem::replace(&mut d.ep0, Ring::null());
+            self.disk = Some(d);
+
             // Bulk-Only Mass Storage Reset: class request to the interface, no data stage.
-            if !self.control_out(slot, ep0, 0x21, 0xFF, 0, 0) {
+            if !self.control_out(slot, &mut ep0, 0x21, 0xFF, 0, 0) {
                 ok = false;
-                put_str(b"xhci:   BOT class reset (EP0) refused
-");
+                put_str(b"xhci:   BOT class reset (EP0) refused\r\n");
             }
             // Clear the HALT feature on each bulk endpoint, by ADDRESS (dci = 2*ep + in), not by dci.
             for (dci, is_in) in [(in_dci, true), (out_dci, false)] {
                 let ep_num = dci / 2;
                 let addr = if is_in { 0x80 | ep_num } else { ep_num };
-                if !self.control_out(slot, ep0, 0x02, 0x01, 0, addr as u16) {
+                if !self.control_out(slot, &mut ep0, 0x02, 0x01, 0, addr as u16) {
                     ok = false;
                     put_str(b"xhci:   clear-halt ep ");
                     put_hex(addr as u64);
-                    put_str(b" refused
-");
+                    put_str(b" refused\r\n");
                 }
             }
-        } else {
-            ok = false;
+            // Give the ring back. The disk keeps the ring its EP0 context names, for the next command
+            // and the next recovery.
+            if let Some(d) = self.disk.as_mut() {
+                d.ep0 = ep0;
+            }
         }
 
         if !ok {
-            put_str(b"xhci: BOT reset recovery did NOT complete - the device may stay wedged
-");
+            put_str(b"xhci: BOT reset recovery did NOT complete - the device may stay wedged\r\n");
         }
         ok
     }
