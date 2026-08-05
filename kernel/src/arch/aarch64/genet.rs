@@ -153,6 +153,24 @@ fn reg(off: u64) -> *mut u32 {
     super::mmio((GENET_BASE + off) as usize) as *mut u32
 }
 
+/// Did a GENET controller ANSWER at boot? Distinct from [`ready`], which additionally means *this
+/// kernel* drove it all the way up.
+///
+/// The spawn path reads this to decide whether to hand `nic-driver` the GENET register window. A
+/// window granted for a controller that is not on the board is authority with no resource behind it,
+/// and it is not harmless: the read that discovers the absence is an **external abort**, which a
+/// service cannot catch the way [`probe`] does. Under QEMU's `raspi4b` (which emulates no GENET) an
+/// ungated grant would hand the driver a window whose first read kills it, and the supervisor would
+/// respawn it forever. So the grant follows the probe, and a board with no controller simply leaves
+/// `ctx.mmio()` empty - the same shape x86 already has when its NIC scan finds nothing.
+static GENET_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether a controller answered the boot probe. False before the probe runs, and on any board
+/// without one.
+pub fn present() -> bool {
+    GENET_PRESENT.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Find the controller and report which revision it is.
 ///
 /// Returns `None` - loudly - when nothing answers, rather than letting a later stage discover it. A
@@ -206,6 +224,9 @@ pub fn probe() -> Option<GenetInfo> {
         put_str(b"genet: WARNING expected v5 on a BCM2711 - the register map is written for v5\r\n");
     }
 
+    // A real controller answered. Record it before anything else, because the register-window grant
+    // (see `GENET_PRESENT`) depends on the answer and not on whether this kernel goes on to drive it.
+    GENET_PRESENT.store(true, core::sync::atomic::Ordering::Release);
     Some(GenetInfo { major, minor, raw })
 }
 

@@ -881,43 +881,65 @@ extern "C" fn boot_high() -> ! {
         // The on-board ethernet controller. Identified here, next to the other device probes, and
         // inside the same window: an absent controller answers with an abort, not a value.
         if genet::probe().is_some() {
-            // The board's real address, from the firmware. It was a hardcoded placeholder through
-            // bring-up - which was the right scope while the question was whether the wire worked at
-            // all, and the wrong address to keep the moment the question became why nothing replies.
-            let mac = genet::firmware_mac();
-            if genet::umac_init(mac).is_some() {
-                // Prove the DMA block bases before anything hands the controller a buffer.
-                if genet::verify_dma_layout() {
-                    // Set the PHY's RGMII clock delays before any traffic moves. Skipping this leaves
-                    // whatever the firmware happened to configure, which is the one thing Linux does
-                    // here that this driver never did - and a clock skew that is wrong corrupts
-                    // frames while leaving link, speed and MDIO all perfectly healthy.
-                    genet::config_phy_clock_delay();
-                    genet::apply_link_settings();
-                    // Both rings up, then declare the driver open. The 3-second receive selftest that
-                    // proved this path is gone: it has done its job, and paying it on every boot
-                    // would be a permanent cost for a one-time question.
+            // The controller answered. Who DRIVES it from here is a build-time choice, and the
+            // default is still this kernel (nothing about a working machine changes without the
+            // feature). See `genet-userspace` in `kernel/Cargo.toml`.
+            #[cfg(feature = "genet-userspace")]
+            {
+                // Commandment I: an ethernet driver is not the kernel's business (§4.4). With this
+                // feature the kernel does exactly two things about GENET - it establishes that the
+                // controller is there, and it says so - and the `nic-driver` SERVICE does the rest
+                // through the register window and DMA arena the spawn path grants it.
+                //
+                // `NIC_FOUND` is what gates that DMA arena (`HwClass::needs_dma`), and it is set HERE
+                // rather than after a bring-up that no longer happens. Its meaning is "a NIC this port
+                // can drive was found", which a probed-and-present GENET satisfies.
+                pci::NIC_FOUND.store(true, core::sync::atomic::Ordering::Release);
+                put_str(b"genet: controller present - left to the nic-driver SERVICE \
+                          (kernel drives no ethernet, Commandment I)\r\n");
+            }
+            #[cfg(not(feature = "genet-userspace"))]
+            {
+                // The board's real address, from the firmware. It was a hardcoded placeholder through
+                // bring-up - which was the right scope while the question was whether the wire worked
+                // at all, and the wrong address to keep the moment the question became why nothing
+                // replies.
+                let mac = genet::firmware_mac();
+                if genet::umac_init(mac).is_some() {
+                    // Prove the DMA block bases before anything hands the controller a buffer.
+                    if genet::verify_dma_layout() {
+                        // Set the PHY's RGMII clock delays before any traffic moves. Skipping this
+                        // leaves whatever the firmware happened to configure, which is the one thing
+                        // Linux does here that this driver never did - and a clock skew that is wrong
+                        // corrupts frames while leaving link, speed and MDIO all perfectly healthy.
+                        genet::config_phy_clock_delay();
+                        genet::apply_link_settings();
+                        // Both rings up, then declare the driver open. The 3-second receive selftest
+                        // that proved this path is gone: it has done its job, and paying it on every
+                        // boot would be a permanent cost for a one-time question.
 
-                    if genet::init_rx_ring()
-                        && genet::enable_rx()
-                        && genet::init_tx_ring()
-                        && genet::enable_tx()
-                    {
-                        // Narrow to our address plus broadcast before any traffic is admitted. The
-                        // bring-up ran promiscuous, which floods a 32-descriptor ring with the whole
-                        // segment's broadcast traffic and discards what was actually addressed to us.
-                        genet::set_rx_filter(mac);
-                        genet::mark_ready(mac);
-                        // Declare a NIC present, so the spawn path grants `nic-driver` its DMA arena.
-                        //
-                        // `HwClass::needs_dma` gates on `pci::NIC_FOUND`, which on x86 is set by the PCI
-                        // scan. GENET is an SoC peripheral and never appears on a PCI bus, so the flag
-                        // stayed false and the arena was never granted - the third reason the driver had
-                        // to stay in the kernel. The flag's MEANING is "a NIC this port can drive was
-                        // found", not "a PCI device was enumerated"; setting it here is honouring that
-                        // meaning on a board whose NIC is soldered to the SoC.
-                        pci::NIC_FOUND.store(true, core::sync::atomic::Ordering::Release);
-                        genet::announce_ready();
+                        if genet::init_rx_ring()
+                            && genet::enable_rx()
+                            && genet::init_tx_ring()
+                            && genet::enable_tx()
+                        {
+                            // Narrow to our address plus broadcast before any traffic is admitted. The
+                            // bring-up ran promiscuous, which floods a 32-descriptor ring with the
+                            // whole segment's broadcast traffic and discards what was addressed to us.
+                            genet::set_rx_filter(mac);
+                            genet::mark_ready(mac);
+                            // Declare a NIC present, so the spawn path grants `nic-driver` its arena.
+                            //
+                            // `HwClass::needs_dma` gates on `pci::NIC_FOUND`, which on x86 is set by
+                            // the PCI scan. GENET is an SoC peripheral and never appears on a PCI bus,
+                            // so the flag stayed false and the arena was never granted - the third
+                            // reason the driver had to stay in the kernel. The flag's MEANING is "a
+                            // NIC this port can drive was found", not "a PCI device was enumerated";
+                            // setting it here honours that meaning on a board whose NIC is soldered
+                            // to the SoC.
+                            pci::NIC_FOUND.store(true, core::sync::atomic::Ordering::Release);
+                            genet::announce_ready();
+                        }
                     }
                 }
             }
@@ -1172,32 +1194,51 @@ pub const DRIVER_MMIO_VA: u64 = 0x6000_0000;
 /// Grant a named driver service the MMIO window its device lives at - by NAME, at spawn, and nothing
 /// else (§3.1: authority is granted deliberately or not at all).
 ///
-/// This returned `None`, which is why `genet` and `xhci` are still IN the kernel: a service cannot
+/// This returned `None`, which is why `genet` and `xhci` were still IN the kernel: a service cannot
 /// drive a device whose registers it cannot name. Step 2 of getting them out (step 1 was routing the
-/// device IRQ, `exceptions.rs`), and the reason Commandment I is currently broken on this port.
+/// device IRQ, `exceptions.rs`).
+///
+/// The grant is conditional on the device having ANSWERED the boot probe, which is the same posture
+/// x86 already has (the PCI scan finds the BAR, or the driver gets nothing). It is not tidiness: on a
+/// board with no GENET the read that discovers the absence is an **external abort**, and userspace has
+/// no `probe_read32` to survive one. Granting the window regardless would hand `nic-driver` a range
+/// whose first register read kills it, and the supervisor would respawn it forever. QEMU's `raspi4b`
+/// emulates no GENET, so that is not a hypothetical board.
 ///
 /// Mapped Device-nGnRnE via `PCD` (`ptables::map_raw` reads that as the device attribute) and
 /// NO_EXEC - a register window is never code. USER because the point is for EL0 to reach it.
 pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Option<(u64, u64)> {
-    use crate::memory::frame::PhysAddr;
-    use page_tables::{PageFlags, VirtAddr};
-
-    // One entry per device this port knows how to grant. A name that is not here gets NOTHING, which
-    // is the default that keeps this a grant rather than an ambient window.
-    let (phys, pages): (u64, u64) = match name {
-        // The GENET v5 ethernet MAC. 64 KiB covers the SYS/EXT/RBUF/UMAC/MDIO blocks and both DMA
-        // register files (the RDMA/TDMA rings sit at +0x2000 and +0x4000).
-        "nic-driver" => (0xFD58_0000, 16),
-        _ => return None,
-    };
-
-    let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE
-        | PageFlags::NO_EXEC | PageFlags::PCD;
-    for i in 0..pages {
-        let off = i * 0x1000;
-        pt.map(VirtAddr(DRIVER_MMIO_VA + off), PhysAddr(phys + off), flags).ok()?;
+    #[cfg(not(feature = "pi4"))]
+    {
+        // No fixed peripheral windows on the QEMU `virt` variant: it has no GENET and no Pi
+        // peripherals at all, so there is nothing to name.
+        let _ = (pt, name);
+        None
     }
-    Some((DRIVER_MMIO_VA, pages * 0x1000))
+
+    #[cfg(feature = "pi4")]
+    {
+        use crate::memory::frame::PhysAddr;
+        use page_tables::{PageFlags, VirtAddr};
+
+        // One entry per device this port knows how to grant. A name that is not here gets NOTHING,
+        // which is the default that keeps this a grant rather than an ambient window.
+        let (phys, pages): (u64, u64) = match name {
+            // The GENET v5 ethernet MAC. 64 KiB covers the SYS/EXT/RBUF/UMAC/MDIO blocks, both DMA
+            // register files (the RDMA/TDMA rings sit at +0x2000 and +0x4000), and the hardware
+            // filter block at +0x8000 that has to be cleared before a frame can reach the DMA.
+            "nic-driver" if genet::present() => (0xFD58_0000, 16),
+            _ => return None,
+        };
+
+        let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE
+            | PageFlags::NO_EXEC | PageFlags::PCD;
+        for i in 0..pages {
+            let off = i * 0x1000;
+            pt.map(VirtAddr(DRIVER_MMIO_VA + off), PhysAddr(phys + off), flags).ok()?;
+        }
+        Some((DRIVER_MMIO_VA, pages * 0x1000))
+    }
 }
 
 // USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
