@@ -7315,10 +7315,24 @@ fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<()
     for cycle in 1..=cycles {
         ctx.console_writeln_fmt(format_args!(
             "chaos link-flap: cycle {}/{} - forcing link DOWN (press q to abort)", cycle, cycles));
-        if let NetQ::Aborted = net_query(ctx, "nic-driver", &down, 3) {
-            let _ = net_query(ctx, "nic-driver", &clr, 2);
-            ctx.console_writeln("chaos link-flap: aborted (link override cleared)");
-            return Ok(());
+        match net_query(ctx, "nic-driver", &down, 3) {
+            NetQ::Aborted => {
+                let _ = net_query(ctx, "nic-driver", &clr, 2);
+                ctx.console_writeln("chaos link-flap: aborted (link override cleared)");
+                return Ok(());
+            }
+            // CHECK THE ANSWER. The driver replies `[0]` when its backend has no force-link override -
+            // which is every ARM port, where the NIC is in-kernel and there is nothing to override. This
+            // used to be discarded, so the trial announced "forcing link DOWN ... done" having done
+            // nothing: a chaos run that reads as exercising link recovery and exercises none of it. A
+            // test that cannot fail is not a test (Commandment II), and one that reports success is
+            // worse than one that is absent.
+            NetQ::Reply(r) if r.payload_bytes().first() == Some(&0) => {
+                ctx.console_writeln(
+                    "chaos link-flap: NOT SUPPORTED by this NIC backend - nothing was forced,                      nothing was tested (the in-kernel ARM NICs have no override; unplug the cable                      to test link recovery for real)");
+                return Ok(());
+            }
+            _ => {}
         }
         if hold_or_abort(ctx, HOLD_SECS) {
             let _ = net_query(ctx, "nic-driver", &clr, 2);
