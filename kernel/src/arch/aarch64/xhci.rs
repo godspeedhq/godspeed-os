@@ -1507,13 +1507,21 @@ impl Xhci {
             // one level up, and it needed the same cure rather than a different theory.
             //
             // EP0 is DCI 1. `| 1` is the dequeue cycle state, matching `cycle = 1` above.
+            //
+            // STOP it first, for the same reason the bulk endpoints needed it: Set TR Dequeue Pointer
+            // is only legal on a Stopped or Error endpoint, and a running EP0 refuses it with a context
+            // state error - which is exactly what the last boot showed once the bulk half started
+            // working. A context-state completion HERE means it was already stopped, which is fine.
             let ep0_phys = ep0.phys;
-            if self
-                .command(ep0_phys | 1, TRB_SET_TR_DEQUEUE, (slot as u32) << 24 | 1 << 16)
-                .map(|(c, _)| c != 1)
-                .unwrap_or(true)
-            {
-                put_str(b"xhci:   set-dequeue EP0 refused - control transfers will not land\r\n");
+            let _ = self.command(0, TRB_STOP_ENDPOINT, (slot as u32) << 24 | 1 << 16);
+            let dq0 = self.command(ep0_phys | 1, TRB_SET_TR_DEQUEUE, (slot as u32) << 24 | 1 << 16);
+            if dq0.map(|(c, _)| c != 1).unwrap_or(true) {
+                // Print the completion code. The previous message said only "refused", which cost a
+                // boot: a context-state error and a parameter error mean different fixes, and the one
+                // line that could have distinguished them did not.
+                put_str(b"xhci:   set-dequeue EP0 refused, cc ");
+                put_hex(dq0.map(|(c, _)| c as u64).unwrap_or(0xFFFF));
+                put_str(b" - control transfers will not land\r\n");
             }
             // Bulk-Only Mass Storage Reset: class request to the interface, no data stage.
             if !self.control_out(slot, ep0, 0x21, 0xFF, 0, 0) {
