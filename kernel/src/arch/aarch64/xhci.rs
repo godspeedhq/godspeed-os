@@ -1496,6 +1496,25 @@ impl Xhci {
             ep0.enqueue = 0;
             ep0.cycle = 1;
             ep0.rearm_link();
+
+            // Tell the CONTROLLER about that rewind, exactly as the bulk endpoints needed.
+            //
+            // The scratch control ring is SHARED with enumeration, so this slot's EP0 context holds a
+            // dequeue pointer from wherever the last device to use it finished - while the rewind above
+            // moved only our software view to the head. The controller then reads from one place and we
+            // write to another, and every control transfer times out. That is why all three EP0 steps
+            // were refused while the bulk half had already started succeeding: same desynchronisation,
+            // one level up, and it needed the same cure rather than a different theory.
+            //
+            // EP0 is DCI 1. `| 1` is the dequeue cycle state, matching `cycle = 1` above.
+            let ep0_phys = ep0.phys;
+            if self
+                .command(ep0_phys | 1, TRB_SET_TR_DEQUEUE, (slot as u32) << 24 | 1 << 16)
+                .map(|(c, _)| c != 1)
+                .unwrap_or(true)
+            {
+                put_str(b"xhci:   set-dequeue EP0 refused - control transfers will not land\r\n");
+            }
             // Bulk-Only Mass Storage Reset: class request to the interface, no data stage.
             if !self.control_out(slot, ep0, 0x21, 0xFF, 0, 0) {
                 ok = false;
