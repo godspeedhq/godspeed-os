@@ -99,6 +99,10 @@ const UMAC_MIB_RX_FCS: u64 = GENET_UMAC_OFF + 0x438;
 /// Receive overflow: the MAC took frames the downstream could not drain. Nonzero here would mean the
 /// MAC is fine and the RBUF or DMA is the blockage.
 const UMAC_MIB_RX_OVR: u64 = GENET_UMAC_OFF + 0x458;
+/// Transmitted packet count. The MAC's own tally, which is a different claim from the DMA consumer
+/// index: that index says the engine took our descriptor, this says the MAC put a frame on the wire.
+/// Linux's `bcmgenet_tx_counters` places `pkts` at `0x4a8`, past the whole RX block.
+const UMAC_MIB_TX_PKT: u64 = GENET_UMAC_OFF + 0x4A8;
 /// The MDIO command register.
 ///
 /// **`0x614` is UMAC-RELATIVE, not absolute.** `bcmgenet.h` defines it as a bare `0x614`, which reads
@@ -1090,6 +1094,23 @@ pub fn transmit(frame: &[u8]) -> bool {
         len_stat,
     );
 
+    // Dump the head of the first frame we are asked to send. Whether the MAC transmits is one
+    // question; whether what we hand it is a well-formed DHCP discover is a separate one, and the
+    // counters cannot answer it. 32 bytes covers destination MAC, source MAC, ethertype and the start
+    // of the IP header - enough to tell a broadcast DHCP discover from something malformed, without
+    // building a protocol decoder in the kernel (which is not the kernel's business, §4.4).
+    let first = TX_REPORTS.load(core::sync::atomic::Ordering::Relaxed) == 0;
+    if first {
+        put_str(b"genet: first TX frame, len ");
+        put_hex(frame.len() as u64);
+        put_str(b", head");
+        for b in frame.iter().take(32) {
+            put_str(b" ");
+            put_hex(*b as u64);
+        }
+        put_str(b"\r\n");
+    }
+
     // Report the counters right after a transmit, bounded to a handful.
     //
     // This lives HERE, and not in the timer tick where it started, for two reasons the last boot
@@ -1219,6 +1240,11 @@ pub fn report_counters() {
     put_hex((rd(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_PROD_INDEX)) & 0xFFFF) as u64);
     put_str(b" rx_cons ");
     put_hex((rd(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_CONS_INDEX)) & 0xFFFF) as u64);
+    // The MAC's own transmit tally. The consumer index below says the DMA took our descriptor; this
+    // says the MAC actually put a frame on the wire. They are different claims and only one of them
+    // means the network could have heard us.
+    put_str(b" tx_pkt ");
+    put_hex(rd(UMAC_MIB_TX_PKT) as u64);
     put_str(b" tx_prod ");
     put_hex((rd(ring_reg(TDMA_OFFSET, TX_RING_INDEX, TDMA_PROD_INDEX)) & 0xFFFF) as u64);
     put_str(b" tx_cons ");
