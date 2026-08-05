@@ -3790,10 +3790,22 @@ fn spawn_service_with_config(
         };
         match arena {
             Some(phys) => {
-                let flags = PageFlags::PRESENT
+                // Cacheable or not is the ARCH's call, not this function's.
+                //
+                // The SDK's `Dma` wrapper does no cache maintenance, and says so: it assumes x86 DMA
+                // coherence and warns that a non-coherent arch "must add cache maintenance here ... or
+                // map the arena non-cacheable" (SEC-28). AArch64 and ARMv7 are non-coherent, so a
+                // userspace driver there would exchange stale data with its device and never be told -
+                // the same fault the in-kernel GENET driver had until every buffer got an explicit
+                // `dma_sync`. A service has no such primitive, so the MAPPING removes the need rather
+                // than resting on the driver author remembering.
+                let mut flags = PageFlags::PRESENT
                     | PageFlags::WRITABLE
                     | PageFlags::USER
                     | PageFlags::NO_EXEC;
+                if crate::arch::imp::DMA_ARENA_UNCACHED {
+                    flags |= PageFlags::PCD;
+                }
                 for i in 0..dma_pages {
                     let off = i * PAGE_SIZE as u64;
                     page_table

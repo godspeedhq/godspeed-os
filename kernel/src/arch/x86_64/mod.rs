@@ -966,3 +966,7 @@ unsafe fn inb(port: u16) -> u8 {
     val
 }
 
+/// Must a driver's DMA arena be mapped UNCACHED on this architecture?
+///
+/// x86 DMA is cache-coherent: the arena stays cacheable and needs no maintenance.
+pub const DMA_ARENA_UNCACHED: bool = false;

@@ -1712,3 +1712,8 @@ pub mod ioapic {
 pub mod ap_boot {
     pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 { 0 }
 }
+
+/// Must a driver's DMA arena be mapped UNCACHED on this architecture?
+///
+/// ARMv7 DMA is not coherent either - same reasoning as the 64-bit port.
+pub const DMA_ARENA_UNCACHED: bool = true;

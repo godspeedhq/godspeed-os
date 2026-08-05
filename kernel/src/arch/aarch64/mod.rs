@@ -2303,3 +2303,11 @@ pub mod ioapic {
 pub mod ap_boot {
     pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 { 0 }
 }
+
+/// Must a driver's DMA arena be mapped UNCACHED on this architecture?
+///
+/// AArch64 DMA is NOT coherent (SEC-28). The arena is mapped UNCACHED so a userspace driver
+/// cannot silently exchange stale data with its device - the in-kernel GENET driver hit exactly that
+/// and needed explicit `dma_sync` on every buffer; a service has no such primitive, so the mapping
+/// must remove the need rather than rely on the driver author remembering.
+pub const DMA_ARENA_UNCACHED: bool = true;
