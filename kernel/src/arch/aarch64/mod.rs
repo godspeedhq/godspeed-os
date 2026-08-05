@@ -876,9 +876,17 @@ extern "C" fn boot_high() -> ! {
                 // Prove the DMA block bases before anything hands the controller a buffer.
                 if genet::verify_dma_layout() {
                     genet::apply_link_settings();
-                    if genet::init_rx_ring() && genet::enable_rx() {
-                        genet::await_first_frame();
-                        genet::selftest([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+                    // Both rings up, then declare the driver open. The 3-second receive selftest that
+                    // proved this path is gone: it has done its job, and paying it on every boot
+                    // would be a permanent cost for a one-time question.
+                    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+                    if genet::init_rx_ring()
+                        && genet::enable_rx()
+                        && genet::init_tx_ring()
+                        && genet::enable_tx()
+                    {
+                        genet::mark_ready(MAC);
+                        genet::announce_ready();
                     }
                 }
             }
@@ -1128,7 +1136,16 @@ pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tl
 pub fn map_fixed_driver_mmio(_pt: &mut page_tables::PageTable, _name: &str) -> Option<(u64, u64)> { None }
 
 // USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
-pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
+pub fn net_frame_tx(frame: &[u8]) -> bool {
+    #[cfg(feature = "pi4")]
+    {
+        if genet::ready() {
+            return genet::transmit(frame);
+        }
+    }
+    let _ = frame;
+    false
+}
 // No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
 pub fn hw_random() -> Option<u32> { None }
 
@@ -1219,8 +1236,30 @@ pub fn usb_disk_absent() -> bool { true }
 
 // No GPIO on this arch (the ARM `gpio` shell command is Pi-only).
 pub fn gpio_op(_op: u32, _pin: u32) -> i64 { -1 }
-pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }
-pub fn net_info() -> Option<([u8; 6], bool)> { None }
+pub fn net_frame_rx(dst: &mut [u8]) -> usize {
+    #[cfg(feature = "pi4")]
+    {
+        return genet::receive_one(dst);
+    }
+    #[cfg(not(feature = "pi4"))]
+    {
+        let _ = dst;
+        0
+    }
+}
+
+/// The station address and the live link state, for a driver service that has to report both.
+pub fn net_info() -> Option<([u8; 6], bool)> {
+    #[cfg(feature = "pi4")]
+    {
+        if genet::ready() {
+            // The link is re-read rather than remembered: a cable pulled after boot must show as down,
+            // not as whatever was true when the driver started.
+            return Some((genet::mac(), genet::link_is_up()));
+        }
+    }
+    None
+}
 pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
 
 /// Switch to a new stack top - `sp` on AArch64. `#[inline(always)]` for the same reason as x86.

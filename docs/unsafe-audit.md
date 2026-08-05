@@ -135,6 +135,24 @@ invalidate is read as whatever was cached before. x86 needs neither and would hi
 |------|--------|-----|
 | `arch/aarch64/genet.rs` | 4 -> 9 (+5) | Transmit buffer table and cursor, the receive buffer lookup in the drain, and one bounded copy through the direct map into a DMA frame. Same two shapes as the existing entries; each block carries its own SAFETY comment. |
 
+## 2026-08-05 - Pi 4 GENET milestone 5: the NET_DEVICE bridge (feat/pi4-aarch64)
+
+Wires the working driver to the arch-neutral `net_frame_tx` / `net_frame_rx` / `net_info` seam, so the
+unchanged userspace `nic-driver` and net-stack can drive it. Four new blocks, same shapes again: the
+station-address store, and one bounded copy OUT of a DMA buffer in `receive_one`.
+
+One is worth stating explicitly because it is the only place device-supplied data sizes a copy. The
+frame length in `receive_one` comes out of a descriptor **the controller wrote**, so it is untrusted
+input on a path reachable from userspace via a syscall. It is clamped to BOTH the caller's slice length
+and `RX_BUF_LENGTH` before the copy, so a controller reporting a nonsense length can overrun neither
+the destination nor the source buffer. `GENET_READY` gates every one of these entry points, so a board
+where the controller was absent or a ring refused to program cannot be driven into uninitialised
+registers from userspace at all.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/genet.rs` | 9 -> 13 (+4) | Station-address store (written once before the Release that publishes readiness), the receive buffer lookup, and one copy out of a DMA buffer whose length is device-supplied and clamped to both source and destination before use. |
+
 ## 2026-08-04 - Pi 4 GENET milestone 2: the MAC and the MDIO bus (feat/pi4-aarch64)
 
 Resets the UniMAC, programs the station address and frame limit, selects the external gigabit PHY mode,
@@ -2081,7 +2099,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/aarch64/video.rs | 2 | permitted |
-| arch/aarch64/genet.rs | 9 | permitted |
+| arch/aarch64/genet.rs | 13 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
 | arch/aarch64/smp_boot.rs | 9 | permitted |
 | arch/aarch64/xhci.rs | 37 | permitted |

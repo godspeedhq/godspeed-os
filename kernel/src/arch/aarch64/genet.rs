@@ -1101,6 +1101,92 @@ pub fn transmit(frame: &[u8]) -> bool {
     true
 }
 
+/// Is the link up right now?
+///
+/// Read live over MDIO rather than remembered from boot, so a cable pulled afterwards reports down.
+/// The basic status register's link bit is **latching-low**, so it is read twice: a single read of a
+/// link that has been up all along returns the latched DOWN and reports a healthy cable as dead.
+pub fn link_is_up() -> bool {
+    let _ = mdio(1, 1, None);
+    matches!(mdio(1, 1, None), Some(bmsr) if bmsr & (1 << 2) != 0)
+}
+
+/// Whether the driver came all the way up.
+///
+/// The `NET_DEVICE` syscalls are reachable from userspace, so they must not touch a single GENET
+/// register on a board where the controller was absent, the PHY never answered, or a ring refused to
+/// program. Without this a `nic-driver` on a Pi with no link would drive reads into a controller that
+/// was never initialised.
+static GENET_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The station address the MAC was programmed with, so the bridge reports the same one the hardware
+/// filters on rather than a second copy that can drift from it.
+static mut GENET_MAC: [u8; 6] = [0; 6];
+
+/// Declare the driver open for business. Called once, after every ring is programmed and enabled.
+pub fn mark_ready(mac: [u8; 6]) {
+    // SAFETY: written once during single-threaded boot, before `ready()` can report true and so before
+    // any reader of `mac()` exists.
+    unsafe { GENET_MAC = mac };
+    GENET_READY.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Say so on the console, using this module's own serial writer.
+pub fn announce_ready() {
+    put_str(b"genet: ready - receive and transmit both up, NET_DEVICE syscalls live\r\n");
+}
+
+pub fn ready() -> bool {
+    GENET_READY.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// The station address the MAC filters on.
+pub fn mac() -> [u8; 6] {
+    // SAFETY: written once before `ready()` turns true; every reader gets there through that Acquire.
+    unsafe { GENET_MAC }
+}
+
+/// Take ONE frame, copying it into `dst`. Returns the byte count, or 0 when the ring is empty.
+///
+/// This is the primitive behind the `NET_DEVICE` receive syscall, so it is non-blocking by
+/// construction: a driver service polling an idle network must get an immediate zero rather than a
+/// kernel that waits for traffic while holding the core.
+pub fn receive_one(dst: &mut [u8]) -> usize {
+    if !ready() {
+        return 0;
+    }
+    let prod = rd(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_PROD_INDEX)) & 0xFFFF;
+    let cons = rd(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_CONS_INDEX)) & 0xFFFF;
+    if cons == prod {
+        return 0;
+    }
+
+    let slot = (cons % RX_RING_DESCS as u32) as u64;
+    let status = rd(desc_word(RDMA_OFFSET, slot, DMA_DESC_LENGTH_STATUS));
+    let len = ((status >> 16) & 0x0FFF) as usize;
+    // SAFETY: this module's own buffer table, indexed inside its length.
+    let phys = unsafe { RX_BUFS[slot as usize] };
+
+    // Clamp to BOTH the caller's buffer and the buffer the hardware was given. The length comes from a
+    // descriptor the controller wrote, so it is device-supplied and not to be trusted with a copy size.
+    let n = len.min(dst.len()).min(RX_BUF_LENGTH as usize);
+    if n > 0 {
+        let va = phys_to_virt(phys);
+        super::mmu::dma_sync(va, n);
+        // SAFETY: `phys` came from the frame allocator and the direct map covers it; `n` is clamped
+        // above to both the source buffer's size and the destination slice's length.
+        unsafe {
+            core::ptr::copy_nonoverlapping(va as *const u8, dst.as_mut_ptr(), n);
+        }
+    }
+
+    // Returning the descriptor to the hardware is what keeps receive alive past the first ring's worth.
+    wr(
+        ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_CONS_INDEX),
+        cons.wrapping_add(1) & 0xFFFF,
+    );
+    n
+}
+
 /// Take every frame the hardware has delivered, returning how many were seen.
 ///
 /// Advancing the consumer index is what returns a descriptor to the hardware, so a driver that reads
