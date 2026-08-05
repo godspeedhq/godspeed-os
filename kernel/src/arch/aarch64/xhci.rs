@@ -2205,9 +2205,23 @@ static DISK_BUSY: AtomicBool = AtomicBool::new(false);
 /// its endpoints mid-operation would be the cure causing the disease. A handful in a row cannot be
 /// anything but a halted endpoint. Reset by any success, so a merely-slow device never triggers it.
 static TIMEOUT_RUN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// About 4 timeouts, which at the driver's command budget is a couple of seconds of silence - well past
-/// anything flow control explains, and far short of the 30 s the caller is willing to wait.
-const TIMEOUT_RUN_MAX: u32 = 4;
+/// How long a device may go without answering before we conclude it is stuck rather than working.
+///
+/// This was 4, and 4 was actively harmful. At the 500 ms transfer budget that is TWO SECONDS, after
+/// which recovery issues Stop Endpoint - which ABORTS the command the device is still working on. A
+/// stick doing a block remap or garbage collection takes seconds, so it was being interrupted every
+/// time, and then needed ~30 s to settle from the interruption. That is the whole shape of the last
+/// run: 62 wedges, recovery completing 62 times because OUR commands were fine, and the device still
+/// unresponsive afterwards because we kept killing its work.
+///
+/// Recovery is surgery, not a retry. It must fire only when the device is genuinely stuck - never
+/// because it is merely slow. Linux's `usb-storage` waits 30 seconds before resetting, and the Pi 2
+/// driver reaches the same conclusion in its own words: "no device is occupied for 30 seconds; a device
+/// that never once pauses is not busy, it is stuck".
+///
+/// 60 timeouts at 500 ms is 30 s of unbroken silence, matched to that and to the caller's own budget.
+/// Any success resets the run, so a device that pauses even once is never touched.
+const TIMEOUT_RUN_MAX: u32 = 60;
 
 pub fn disk_busy() -> bool {
     DISK_BUSY.load(Ordering::Relaxed)
