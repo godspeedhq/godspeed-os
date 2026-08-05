@@ -1437,7 +1437,17 @@ pub fn drain_rx() -> u32 {
     let mut cons = rd(ring_reg(RDMA_OFFSET, RX_RING_INDEX, RDMA_CONS_INDEX)) & 0xFFFF;
     let mut seen = 0;
 
-    while cons != prod {
+    // BOUNDED by the ring, not by the device (§26.6).
+    //
+    // `prod` is a HARDWARE register. Looping until our index happens to equal it puts a device-supplied
+    // value in charge of when kernel code stops, and a register that reads garbage - or two indices that
+    // simply never converge - spins here forever holding the core. That is not a hypothetical shape on
+    // this port: it is exactly what a liveness wedge looks like from the outside, and this driver has
+    // already been caught reading a register that returned confident nonsense.
+    //
+    // A ring of N descriptors can never legitimately hand back more than N frames in one pass, so N is
+    // the honest ceiling. Anything beyond it is a lie from the device, and the loop stops either way.
+    while cons != prod && (seen as u64) < RX_RING_DESCS {
         let slot = (cons % RX_RING_DESCS as u32) as u64;
         let status = rd(desc_word(RDMA_OFFSET, slot, DMA_DESC_LENGTH_STATUS));
         let len = (status >> 16) & 0x0FFF;
