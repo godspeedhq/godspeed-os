@@ -1887,6 +1887,22 @@ fn hotplug_tick(hc: &mut Xhci) {
         let now_conn = status & PS_CONNECTION != 0;
         let mut was = hub.connected & bit != 0;
 
+        // An all-zero answer on a port we believed OCCUPIED is a read that did not happen, not a
+        // device that left.
+        //
+        // The buffer is zeroed before the transfer so a short read cannot be mistaken for old data,
+        // and `await_transfer` succeeding does not promise all four bytes arrived. A completion that
+        // delivers nothing therefore leaves exactly "not connected, nothing changed" - which is a
+        // perfectly good answer for an empty port and a fabricated disconnect for an occupied one.
+        //
+        // What separates them is the latch: a real removal ALWAYS sets C_CONNECTION, because the
+        // connection state changed. Zero status with zero change is the signature of a lost reply.
+        // Believing it tore the device down and re-enumerated it seconds later, which is what put
+        // "device REMOVED / device ATTACHED" in the log of a machine nobody was touching.
+        if was && status == 0 && change == 0 {
+            continue; // ask again next visit
+        }
+
         if change & 1 != 0 {
             // Clear the latch, and CHECK it cleared before acting. An event we cannot acknowledge is
             // one we cannot safely consume - it would be re-reported on every visit, and a still-

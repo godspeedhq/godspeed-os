@@ -287,6 +287,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // "muted": it stays quiet (no prompt, no read) so it can neither smear that app's screen nor
     // swallow its `q`, and prints a fresh prompt only when it regains the keyboard. `muted` tracks it.
     let mut muted = false;
+    // Whether this boot's automatic network clock has been written to the on-disk floor yet. One
+    // attempt per boot: a failed write is a degraded state to report, not a thing to retry forever.
+    let mut clock_floor_recorded = false;
 
     loop {
         // Muted: a foreground app owns the console. Sleep + skip - don't draw, don't blocking-read. The
@@ -303,6 +306,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             continue;
         }
         if muted { ctx.console_write("gsh> "); muted = false; } // regained the keyboard: a fresh prompt
+
+        // Record the floor once, when the NETWORK has set the clock on its own at boot.
+        //
+        // net-stack syncs by SNTP without being asked, which is what makes a board with no RTC know the
+        // time at all - but the shell owns the on-disk floor, and until now it only wrote one on an
+        // explicit `date sync` or on the way down. A machine that booted with a cable in, learned the
+        // real time, and then lost power recorded nothing: the knowledge was in RAM and died there.
+        //
+        // Checked here rather than at startup because the sync is not instant - net-stack has to get a
+        // lease, resolve a server and complete the exchange - so a one-shot test during boot would
+        // almost always run too early and conclude there was no clock. This costs one syscall per
+        // keypress until it fires, and nothing at all afterwards.
+        if !clock_floor_recorded && ctx.clock_source() == ClockSource::Ntp {
+            clock_floor_recorded = true; // once per boot, whether or not the write lands
+            if let Some(f) = ctx.clock_floor() {
+                if (0..=u32::MAX as i64).contains(&f) {
+                    clock_floor_persist(&ctx, f as u32, true);
+                }
+            }
+        }
 
         let b = ctx.console_read();
 
