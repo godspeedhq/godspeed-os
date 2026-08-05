@@ -497,8 +497,14 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // only source of a wall clock. Without the grant net-stack does the whole query, gets a real
         // answer, and is refused at the last step - the clock stays at the boot epoch while the log
         // says the time was fetched.
+        // The `shell` needs it too, for a narrower job: raising the clock FLOOR - the "we demonstrably
+        // ran at least this late" mark it persists to /clock.last on `date sync` and on the way down,
+        // so a network sync survives a power cycle on a board with no RTC. The floor rides the same
+        // syscall as setting the clock (SetClock, kind 1), so there is no narrower right to hand out.
+        // Without it the shell is refused by the kernel and never reaches the filesystem write at all,
+        // which reads as "no filesystem?" when the actual answer is "no authority".
         set_clock:       cfg!(any(target_arch = "arm", target_arch = "aarch64"))
-            && matches!(name, "net-stack"),
+            && matches!(name, "net-stack" | "shell"),
         set_clock_floor: cfg!(target_arch = "arm") && matches!(name, "shell"),
     }
 }
