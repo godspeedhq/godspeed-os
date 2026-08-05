@@ -607,7 +607,20 @@ fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
     // forward jump of up to a day, so a CMOS misread that cuts the measurement window short yields a few
     // MHz on a GHz TSC - which the old floor rejected and a 0.5 MHz floor would accept, poisoning every
     // RTT and deadline for the life of the process. Each arch keeps the floor that fits its clock.
-    let floor: u64 = if cfg!(target_arch = "arm") { 500_000 } else { 100_000_000 };
+    // AArch64 belongs with arm, not with x86. The Pi 4's generic timer runs at ~54 MHz, which is BELOW
+    // the 100 MHz x86 floor - so calibration returned 0 on every boot, and the paragraph above then
+    // describes exactly what was observed on the board: RTT reported as 0 (rendered `time<1us`, which
+    // is impossible for a round trip to 8.8.8.8) AND the poll window `tsc_hz/3` collapsing to ~0 cycles,
+    // so a reply was only caught if it landed inside the initial drain. That is the 33% "packet loss" -
+    // one broken constant presenting as two unrelated faults, a measurement bug and a throughput bug.
+    //
+    // The per-arch floor is right and stays; aarch64 was simply never added to it when the port arrived.
+    // 500 kHz clears a 54 MHz timer comfortably while still rejecting a clock that is merely creeping.
+    let floor: u64 = if cfg!(any(target_arch = "arm", target_arch = "aarch64")) {
+        500_000
+    } else {
+        100_000_000
+    };
     if (floor..=10_000_000_000).contains(&hz) { hz } else { 0 }
 }
 
