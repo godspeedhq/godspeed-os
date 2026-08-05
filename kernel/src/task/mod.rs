@@ -497,15 +497,16 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // only source of a wall clock. Without the grant net-stack does the whole query, gets a real
         // answer, and is refused at the last step - the clock stays at the boot epoch while the log
         // says the time was fetched.
-        // The `shell` needs it too, for a narrower job: raising the clock FLOOR - the "we demonstrably
-        // ran at least this late" mark it persists to /clock.last on `date sync` and on the way down,
-        // so a network sync survives a power cycle on a board with no RTC. The floor rides the same
-        // syscall as setting the clock (SetClock, kind 1), so there is no narrower right to hand out.
-        // Without it the shell is refused by the kernel and never reaches the filesystem write at all,
-        // which reads as "no filesystem?" when the actual answer is "no authority".
         set_clock:       cfg!(any(target_arch = "arm", target_arch = "aarch64"))
-            && matches!(name, "net-stack" | "shell"),
-        set_clock_floor: cfg!(target_arch = "arm") && matches!(name, "shell"),
+            && matches!(name, "net-stack"),
+        // aarch64 joins arm: the Pi 4 has no RTC either, so the floor the shell persists to
+        // /clock.last is what carries a network sync across a power cycle. READ, not WRITE - raising
+        // the floor only constrains which clock values are acceptable, where WRITE would let the shell
+        // step every task's view of the time of day. The narrower right already existed here; granting
+        // the shell plain `set_clock` instead would have handed it exactly the authority this split was
+        // built to withhold, and would have failed anyway - a WRITE cap does not satisfy a READ check.
+        set_clock_floor: cfg!(any(target_arch = "arm", target_arch = "aarch64"))
+            && matches!(name, "shell"),
     }
 }
 
