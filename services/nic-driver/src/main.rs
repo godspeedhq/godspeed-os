@@ -531,13 +531,21 @@ fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
     }
 }
 
-/// ARM USB-net backend: bridge the frame IPC (the request/reply contract net-stack speaks) to the
-/// in-kernel DWC2 CDC-ECM device via the NET_DEVICE syscalls. Pure mechanism, mirroring the e1000/rtl
-/// serve loops - the frame IS the message; net-stack owns all protocol. Pinned to core 0 (its contract),
-/// where the single-channel DWC2 lives. A request payload of exactly 1 byte 3/4/5/6/7/8/9 is an opcode;
-/// any other payload is a raw ethernet frame to transmit.
-#[cfg(target_arch = "arm")]
-fn usb_net_main(ctx: ServiceContext) -> ! {
+/// Kernel-NIC backend: bridge the frame IPC (the request/reply contract net-stack speaks) to whatever
+/// network device the kernel drives, via the NET_DEVICE syscalls. Pure mechanism, mirroring the
+/// e1000/rtl serve loops - the frame IS the message; net-stack owns all protocol. A request payload of
+/// exactly 1 byte 3/4/5/6/7/8/9 is an opcode; any other payload is a raw ethernet frame to transmit.
+///
+/// Used by both ARM ports, and deliberately named for the SEAM rather than the device behind it:
+/// - **Pi 2 (arm)**: an in-kernel DWC2 CDC-ECM USB-net device, pinned to core 0 by its contract
+///   because that is where the single-channel DWC2 is driven from.
+/// - **Pi 4 (aarch64)**: the on-board GENET Ethernet MAC, with no core constraint - GENET is reached
+///   by MMIO from whichever core makes the syscall, so it sits on core 1 with net-stack and fs.
+///
+/// This function knows about neither. It was `usb_net_main` while USB was the only thing behind the
+/// syscalls; on the Pi 4 that name would have described the transport of a different board.
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+fn kernel_net_main(ctx: ServiceContext) -> ! {
     // How many bulk-IN polls to try when a request wants a received frame (net-stack also re-polls via
     // ops 4/9 under its own deadline, so this is a bounded best-effort, not a spin).
     const RX_TRIES: usize = 8;
@@ -637,15 +645,16 @@ fn usb_net_main(ctx: ServiceContext) -> ! {
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("nic-driver: starting");
 
-    // ARM (Raspberry Pi 2): there is no PCIe NIC. The NIC is a USB device driven in-kernel (DWC2 CDC-ECM);
-    // this backend bridges the same frame IPC net-stack speaks to the kernel USB-net syscalls. Same
-    // request/reply contract, different transport - exactly the block-driver x86/ARM split.
-    #[cfg(target_arch = "arm")]
-    usb_net_main(ctx);
+    // Both ARM ports: there is no PCIe NIC to scan for. The device is driven in-kernel (Pi 2: a DWC2
+    // CDC-ECM USB adapter; Pi 4: the on-board GENET MAC) and this backend bridges the same frame IPC
+    // net-stack speaks to the NET_DEVICE syscalls. Same request/reply contract, different transport -
+    // exactly the block-driver x86/ARM split.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    kernel_net_main(ctx);
 
     // Which NIC did the kernel find? nic-driver drives an Intel e1000 (the QEMU dev NIC) or a Realtek
     // RTL8168 (the T630); the kernel maps whichever one's BAR. Dispatch on the PCI identity (Phase 4).
-    #[cfg(not(target_arch = "arm"))]
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     if ctx.nic_vendor_device() == 0x8168_10EC {
         realtek_main(ctx); // RTL8168 - a separate path that never returns
     }
