@@ -173,6 +173,31 @@ TABLE at L1/L2 and PAGE at L3, and the address field is bits [47:21] for a block
 |------|--------|-----|
 | `arch/aarch64/mmu.rs` | 17 -> 23 (+6) | High-half L2 lookup, split-table arena hand-out, the block split and page clear, the verify read, and TLB maintenance. All page-table work, in the layer where it belongs (§18.1); the neutral caller stays a safe `fn`. |
 
+## 2026-08-05 - Pi 4 AUDIT: the barrier class, swept (SEC-25/26/27)
+
+Auditing by DEFECT CLASS rather than by file, after the respawn fault turned out to be one missing
+barrier. The question asked of every site: where aarch64 writes a page-table descriptor, is it published
+before something can walk it, and where one is REMOVED, is the translation invalidated before the frame
+is reused?
+
+Barrier coverage was already correct in `mmu::enable`, `enable_secondary`, `drop_low_map`,
+`invalidate_tlb_page`, `switch_context`, `free_page_table_root` and the guard-page unmap. The gap was
+`ptables.rs` - the file the neutral kernel actually maps and unmaps through - which had **no barriers at
+all**. Three findings, all one class:
+
+1. `finalize_service_address_space` (previous entry) - a new address space installed before its
+   descriptors were visible. The supervisor-respawn fault.
+2. `map_in_root` - called by `map_in_active_tables` against THIS CORE'S LIVE TABLES, so the walker can
+   reach a descriptor that has not become visible. Same defect, tighter window.
+3. `unmap` - cleared the descriptor and handed the `Frame` back to the allocator with no barrier and no
+   TLB invalidate. The previous owner can then read and write a frame that belongs to another address
+   space: a use-after-free the MMU actively enables, reported by nothing. x86 does not need it here
+   because its neutral kill path shoots down; that is exactly why the omission reads as complete.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/ptables.rs` | 20 -> 21 (+1) | `dsb ishst` publishing descriptors in `map_in_root`, and `dsb ishst` + `tlbi vaae1is` + `dsb ish` + `isb` in `unmap` before the frame is released. |
+
 ## 2026-08-05 - Pi 4 AUDIT: publish page tables before the walker can reach them (SEC-25/27)
 
 First finding of the aarch64 kernel audit, and the cause of the supervisor-respawn fault that the
@@ -2175,7 +2200,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/gic.rs | 6 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 23 | permitted |
-| arch/aarch64/ptables.rs | 20 | permitted |
+| arch/aarch64/ptables.rs | 21 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |

@@ -234,6 +234,28 @@ impl PageTable {
             let l3e = get(l3, l3i);
             if l3e & DESC_VALID == 0 { return Err(MapError::NotMapped); }
             set(l3, l3i, 0);
+            // PUBLISH the clear, then INVALIDATE, before the frame is handed back.
+            //
+            // The caller receives an owned `Frame` and returns it to the allocator, where it is handed
+            // to somebody else. If the translation is still in a TLB at that moment, the previous owner
+            // can read and write a frame that now belongs to another address space - a use-after-free
+            // the MMU actively enables, and one no fault reports.
+            //
+            // x86 does not need this HERE because its neutral kill path issues a shootdown, and that is
+            // exactly why the omission survives review: the primitive looks complete against the arch
+            // whose semantics were in mind when it was written. `arch/CLAUDE.md` (SEC-26/27) says a
+            // primitive owes its SEMANTIC and not just its signature; this is that debt.
+            //
+            // Inner-shareable and by VA across all ASIDs: the entry may sit in any core's TLB, and the
+            // task that owned it is not necessarily the one running this.
+            core::arch::asm!(
+                "dsb ishst",
+                "tlbi vaae1is, {}",
+                "dsb ish",
+                "isb",
+                in(reg) virt >> 12,
+                options(nostack),
+            );
             Ok(Frame::from_phys(PhysAddr(l3e & ADDR_MASK)))
         }
     }
@@ -270,7 +292,21 @@ impl PageTable {
 /// fresh mappings, where there is no stale entry to invalidate.
 pub unsafe fn map_in_root(root: u64, virt: u64, phys: u64, flags: PageFlags) -> Result<(), MapError> {
     let mut t = core::mem::ManuallyDrop::new(PageTable { root });
-    t.map(VirtAddr(virt), PhysAddr(phys), flags)
+    let r = t.map(VirtAddr(virt), PhysAddr(phys), flags);
+    // Publish the descriptors before anything walks them.
+    //
+    // The doc above is right that a FRESH mapping needs no TLB invalidate - and that is a different
+    // obligation from this one. The entries are ordinary stores, and `map_in_active_tables` calls this
+    // against the tables THIS CORE IS EXECUTING UNDER, so the walker may reach for a descriptor that
+    // has not become visible yet and fault on a page that is mapped. Same defect as the respawn fault,
+    // in a tighter window: there, work happened between building a space and entering it; here the
+    // next instruction can touch the page.
+    //
+    // SAFETY: a barrier; no memory is accessed.
+    unsafe {
+        core::arch::asm!("dsb ishst", options(nostack));
+    }
+    r
 }
 
 /// Free every frame reachable from `root`: the L3s, the L2s, then the root.
