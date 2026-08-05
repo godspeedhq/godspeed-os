@@ -908,7 +908,7 @@ impl Xhci {
 
     /// Bring up whatever is on a ROOT port. See [`Topology`] for why anything deeper needs more.
     fn setup_device(&mut self, port: u8) -> bool {
-        self.setup_at(Topology { root_port: port, route: 0, tt_slot: 0, tt_port: 0, speed: 0 })
+        self.setup_at(Topology { tier: 0, root_port: port, route: 0, tt_slot: 0, tt_port: 0, speed: 0 })
     }
 
     fn setup_at(&mut self, topo: Topology) -> bool {
@@ -1036,6 +1036,19 @@ impl Xhci {
         // Pi 4's USB-A sockets hang off an internal VIA hub, so NOTHING plugged into the machine
         // appears on a root port. Walk it.
         if dev_class == 0x09 {
+            // One tier, and say so rather than recursing - which is what `walk_hub`'s doc has always
+            // claimed and nothing enforced. The walk is MUTUALLY RECURSIVE (walk_hub ->
+            // bring_up_hub_port -> setup_at -> walk_hub) with its depth chosen by a device-supplied
+            // `bDeviceClass`, on the KERNEL STACK. A device reporting class 9 forever, or a real chain
+            // of hubs in a docking station, walks until the stack meets its guard page.
+            //
+            // The Pi 4's own USB-A sockets are behind an internal hub, so tier 1 is the NORMAL case
+            // here; tier 2 is a hub plugged into that. Refusing it loudly is a bounded, explicable
+            // limit (§26.6); recursing is a stack overflow whose depth a stranger's hardware picks.
+            if topo.tier >= HUB_TIER_MAX {
+                put_str(b"xhci: hub beyond tier 1 - not walked (a hub behind a hub is not supported)\r\n");
+                return false;
+            }
             put_str(b"xhci: this is a USB hub - walking its downstream ports\r\n");
             return self.walk_hub(slot, &mut ep0, topo, buf_phys, buf_va);
         }
@@ -1324,6 +1337,7 @@ impl Xhci {
         // hub's transaction translator, which the slot context has to name.
         let needs_tt = speed == 1 || speed == 2;
         let child = Topology {
+            tier: topo.tier.saturating_add(1), // one hub deeper; the dispatch refuses past HUB_TIER_MAX
             root_port: topo.root_port,
             route: (topo.route << 4) | (p as u32 & 0xF),
             tt_slot: if needs_tt { slot } else { 0 },
@@ -1918,8 +1932,18 @@ fn default_max_packet(speed: u32) -> u32 {
 /// forever. This runs in ring 0 on device-supplied bytes (see the module header), so every bound here
 /// is doing real work.
 /// Where a device sits on the bus. See `setup_device`.
+/// How many hubs deep enumeration will walk. The Pi 4's USB-A sockets are behind an internal hub, so
+/// tier 1 is the ordinary case; a hub plugged into that is tier 2 and is refused.
+const HUB_TIER_MAX: u8 = 1;
+
 #[derive(Clone, Copy)]
 struct Topology {
+    /// How many hubs deep this device sits. 0 = on a root port, 1 = behind one hub.
+    ///
+    /// Exists to BOUND the mutually-recursive walk (`walk_hub` -> `bring_up_hub_port` -> `setup_at` ->
+    /// `walk_hub`), whose depth is otherwise chosen by a device-supplied `bDeviceClass` and spent on
+    /// the kernel stack.
+    tier: u8,
     /// The root-hub port everything below this point hangs off.
     root_port: u8,
     /// Route string: 4 bits per tier, downstream port number at each. 0 = on the root port itself.
@@ -2143,7 +2167,7 @@ fn hotplug_tick(hc: &mut Xhci) {
     // enumeration this visit may trigger still gets the generous one it needs.
     hc.xfer_ms = 50;
 
-    let topo = Topology { root_port: 1, route: 0, tt_slot: 0, tt_port: 0, speed: 0 };
+    let topo = Topology { tier: 0, root_port: 1, route: 0, tt_slot: 0, tt_port: 0, speed: 0 };
     let mut announced = false;
     for p in 1..=hub.nports.min(15) {
         let bit = 1u16 << p;
