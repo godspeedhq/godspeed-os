@@ -1154,16 +1154,21 @@ pub fn firmware_mac() -> [u8; 6] {
     const TAG_GET_MAC_ADDRESS: u32 = 0x0001_0003;
     const PLACEHOLDER: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 
+    // The sizes matter, and the first attempt got both wrong by copying the display query's header.
+    // `req[0]` is the TOTAL buffer size and must cover the end tag: eight words is 32, not the 28 that
+    // was copied across, which left the terminator outside the buffer the firmware was told about.
+    // `req[3]` is the VALUE size, which for this tag is the six bytes of a MAC and not the eight the
+    // two words happen to occupy. The display tag tolerates the sloppy version; this one rejects it.
     let mut req = [0u32; 8];
-    req[0] = 7 * 4;
-    req[1] = 0;
+    req[0] = 8 * 4; // total size, including the end tag
+    req[1] = 0; // request
     req[2] = TAG_GET_MAC_ADDRESS;
-    req[3] = 8; // six bytes of value, in two words
-    req[4] = 0;
+    req[3] = 6; // value buffer size: six bytes of address
+    req[4] = 0; // request code
     req[7] = 0; // end tag
 
     if super::mailbox::property_call(&mut req).is_none() {
-        put_str(b"genet: firmware would not report a MAC - using the placeholder 02:00:00:00:00:01\r\n");
+        put_str(b"genet: firmware would not report a MAC (tag rejected) - using the placeholder\r\n");
         return PLACEHOLDER;
     }
 
