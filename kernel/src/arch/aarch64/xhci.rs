@@ -132,6 +132,11 @@ const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_DISABLE_SLOT: u32 = 10;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
+/// Take an endpoint out of Halted after a failed transfer.
+const TRB_RESET_ENDPOINT: u32 = 14;
+/// Tell the controller where to resume on a reset endpoint. Required after a reset: without it the
+/// stale dequeue pointer is kept and the ring stays desynchronised even though the halt is cleared.
+const TRB_SET_TR_DEQUEUE: u32 = 16;
 const TRB_EV_TRANSFER: u32 = 32;
 const TRB_EV_CMD_COMPLETE: u32 = 33;
 
@@ -1386,6 +1391,99 @@ impl Xhci {
     /// Returns the CSW status byte (0 = good). BOT is deliberately literal here - three transfers, in
     /// order, every time - because the interesting failures are all about a stage being skipped or
     /// reordered, and a device left mid-command answers the NEXT command with the previous one's data.
+    /// Repair a wedged bulk endpoint pair.
+    ///
+    /// A transfer that times out does not leave the device merely late - it leaves the endpoint HALTED
+    /// and its transfer ring desynchronised, and re-issuing the same command can never clear that. This
+    /// is why 32 seconds of retries produced 106 identical timeouts: every attempt after the first was
+    /// asking a stopped endpoint to run.
+    ///
+    /// Two layers have to be repaired, and BOTH are required:
+    ///
+    /// 1. **xHCI**: `Reset Endpoint` takes the endpoint out of Halted, and `Set TR Dequeue Pointer`
+    ///    tells the controller where to resume - without which it keeps the stale dequeue pointer and
+    ///    the ring stays desynchronised even though the halt is gone. This half has no equivalent in
+    ///    the Pi 2's DWC2 driver, which is why that port's recovery could not simply be copied.
+    /// 2. **Bulk-Only Transport**: the DEVICE also has state. The classic wedge is a CSW we never
+    ///    collected, which the device waits on before it will accept any new CBW, so a controller-side
+    ///    reset alone leaves it stuck. The class reset plus Clear-Feature HALT on both endpoints is what
+    ///    Linux's `usb-storage` runs at exactly this point.
+    ///
+    /// Returns whether every step was accepted. Loud on failure: a repair that silently did nothing is
+    /// indistinguishable from one that worked, right up to the next timeout.
+    fn bot_recover(&mut self) -> bool {
+        let Some(d) = self.disk.as_ref() else { return false };
+        let (slot, in_dci, out_dci) = (d.slot, d.in_dci, d.out_dci);
+        let (in_phys, out_phys) = (d.in_ring.phys, d.out_ring.phys);
+
+        put_str(b"xhci: bulk endpoint wedged - running BOT reset recovery
+");
+
+        let mut ok = true;
+        for (dci, phys) in [(in_dci, in_phys), (out_dci, out_phys)] {
+            // Reset Endpoint. A "context state" completion here means it was not halted after all,
+            // which is not an error - the other endpoint may have been the stuck one.
+            let rc = self.command(0, TRB_RESET_ENDPOINT, (slot as u32) << 24 | dci << 16);
+            match rc {
+                Some((1, _)) | Some((19, _)) => {}
+                _ => ok = false,
+            }
+            // Set TR Dequeue Pointer: resume at the ring head, cycle 1, matching the rewind below.
+            // Without this the controller resumes from wherever the failed transfer left it.
+            if self
+                .command(phys | 1, TRB_SET_TR_DEQUEUE, (slot as u32) << 24 | dci << 16)
+                .map(|(c, _)| c != 1)
+                .unwrap_or(true)
+            {
+                ok = false;
+            }
+        }
+
+        // Rewind our own view of both rings to match what we just told the controller.
+        if let Some(d) = self.disk.as_mut() {
+            for r in [&mut d.in_ring, &mut d.out_ring] {
+                // SAFETY: this driver's own DMA page, 4 KiB, zeroed before reuse.
+                unsafe { core::ptr::write_bytes(r.va as *mut u8, 0, 4096) };
+                r.enqueue = 0;
+                r.cycle = 1;
+                r.rearm_link();
+            }
+        }
+
+        // Device-side recovery, over EP0. The scratch control ring is free here: enumeration is not
+        // running (we hold the USB claim), and it is rewound on every use.
+        //
+        // Interface 0 is assumed. Every mass-storage device this port enumerates presents its BOT
+        // interface first, and the interface number is not retained at enumeration; if a device ever
+        // needs a different one, this is the line that will say so by failing loudly.
+        if let Some(sc) = scratch() {
+            let ep0 = &mut sc.ep0;
+            ep0.enqueue = 0;
+            ep0.cycle = 1;
+            ep0.rearm_link();
+            // Bulk-Only Mass Storage Reset: class request to the interface, no data stage.
+            if !self.control_out(slot, ep0, 0x21, 0xFF, 0, 0) {
+                ok = false;
+            }
+            // Clear the HALT feature on each bulk endpoint, by ADDRESS (dci = 2*ep + in), not by dci.
+            for (dci, is_in) in [(in_dci, true), (out_dci, false)] {
+                let ep_num = dci / 2;
+                let addr = if is_in { 0x80 | ep_num } else { ep_num };
+                if !self.control_out(slot, ep0, 0x02, 0x01, 0, addr as u16) {
+                    ok = false;
+                }
+            }
+        } else {
+            ok = false;
+        }
+
+        if !ok {
+            put_str(b"xhci: BOT reset recovery did NOT complete - the device may stay wedged
+");
+        }
+        ok
+    }
+
     fn bot(&mut self, cmd: &[u8], data_len: u32, data_in: bool) -> Option<u8> {
         let mut disk = self.disk.take()?;
         let ok = self.bot_inner(&mut disk, cmd, data_len, data_in);
@@ -2033,6 +2131,16 @@ pub fn disk_sectors() -> u64 {
 /// permanently. Distinguishing them is what lets the block driver retry instead of failing a mount.
 static DISK_BUSY: AtomicBool = AtomicBool::new(false);
 
+/// Consecutive transfer timeouts with no success in between.
+///
+/// Recovery is keyed on a RUN, not on a single timeout: one timeout can be a slow device, and resetting
+/// its endpoints mid-operation would be the cure causing the disease. A handful in a row cannot be
+/// anything but a halted endpoint. Reset by any success, so a merely-slow device never triggers it.
+static TIMEOUT_RUN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// About 4 timeouts, which at the driver's command budget is a couple of seconds of silence - well past
+/// anything flow control explains, and far short of the 30 s the caller is willing to wait.
+const TIMEOUT_RUN_MAX: u32 = 4;
+
 pub fn disk_busy() -> bool {
     DISK_BUSY.load(Ordering::Relaxed)
 }
@@ -2093,6 +2201,7 @@ pub fn disk_read(lba: u64, dst: &mut [u8]) -> bool {
                         core::ptr::copy_nonoverlapping(d.data_va as *const u8, dst.as_mut_ptr(), 512)
                     };
                     DISK_BUSY.store(false, Ordering::Relaxed);
+                    TIMEOUT_RUN.store(0, Ordering::Relaxed); // one success ends the run
                     true
                 }
                 // A non-zero status is the device refusing THIS command - often "not ready" while it
@@ -2117,6 +2226,14 @@ pub fn disk_read(lba: u64, dst: &mut [u8]) -> bool {
                 // up, and it announces at 2s, so a genuinely stuck device is still bounded and loud.
                 None => {
                     DISK_BUSY.store(true, Ordering::Relaxed);
+                    // A RUN of timeouts unbroken by a single success is what tells stuck from slow -
+                    // duration is the only thing that distinguishes them, exactly as the Pi 2 port
+                    // records. A device that is merely working pauses and then answers; one that never
+                    // answers has a halted endpoint, and no number of retries will clear it.
+                    if TIMEOUT_RUN.fetch_add(1, Ordering::Relaxed) + 1 >= TIMEOUT_RUN_MAX {
+                        TIMEOUT_RUN.store(0, Ordering::Relaxed);
+                        hc.bot_recover();
+                    }
                     false
                 }
             }
@@ -2152,6 +2269,7 @@ pub fn disk_write(lba: u64, src: &[u8]) -> bool {
             match hc.bot(&cmd, 512, false) {
                 Some(0) => {
                     DISK_BUSY.store(false, Ordering::Relaxed);
+                    TIMEOUT_RUN.store(0, Ordering::Relaxed); // one success ends the run
                     true
                 }
                 Some(_) => {
@@ -2173,6 +2291,14 @@ pub fn disk_write(lba: u64, src: &[u8]) -> bool {
                 // up, and it announces at 2s, so a genuinely stuck device is still bounded and loud.
                 None => {
                     DISK_BUSY.store(true, Ordering::Relaxed);
+                    // A RUN of timeouts unbroken by a single success is what tells stuck from slow -
+                    // duration is the only thing that distinguishes them, exactly as the Pi 2 port
+                    // records. A device that is merely working pauses and then answers; one that never
+                    // answers has a halted endpoint, and no number of retries will clear it.
+                    if TIMEOUT_RUN.fetch_add(1, Ordering::Relaxed) + 1 >= TIMEOUT_RUN_MAX {
+                        TIMEOUT_RUN.store(0, Ordering::Relaxed);
+                        hc.bot_recover();
+                    }
                     false
                 }
             }

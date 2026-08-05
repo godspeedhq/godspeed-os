@@ -135,6 +135,20 @@ invalidate is read as whatever was cached before. x86 needs neither and would hi
 |------|--------|-----|
 | `arch/aarch64/genet.rs` | 4 -> 9 (+5) | Transmit buffer table and cursor, the receive buffer lookup in the drain, and one bounded copy through the direct map into a DMA frame. Same two shapes as the existing entries; each block carries its own SAFETY comment. |
 
+## 2026-08-05 - Pi 4: BOT reset recovery for a wedged bulk endpoint
+
+A bulk transfer that times out leaves the endpoint HALTED and its transfer ring desynchronised, and
+re-issuing the command can never clear that: 32 seconds of retries produced 106 identical timeouts,
+every one asking a stopped endpoint to run. Recovery repairs both layers - xHCI `Reset Endpoint` +
+`Set TR Dequeue Pointer` (the controller half, which the Pi 2's DWC2 driver has no equivalent of), then
+the Bulk-Only class reset and Clear-Feature HALT on both endpoints (the device half, for the uncollected
+CSW the device waits on before accepting any new CBW). Keyed on a RUN of timeouts, reset by any success,
+so a merely-slow device never triggers it.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | 37 -> 38 (+1) | Zeroing the two bulk transfer rings before republishing their dequeue pointers - this driver's own DMA pages, 4 KiB each, while it holds the USB claim. |
+
 ## 2026-08-05 - Pi 4: kernel-stack guard pages (block splitting)
 
 `install_kstack_guards` was inert on this arch twice over: the neutral `main.rs` call site is not on the
@@ -2149,7 +2163,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/genet.rs | 13 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
 | arch/aarch64/smp_boot.rs | 9 | permitted |
-| arch/aarch64/xhci.rs | 37 | permitted |
+| arch/aarch64/xhci.rs | 38 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
