@@ -1752,6 +1752,30 @@ pub mod page_tables {
     /// `root` must be a page-table root this task owns, with nothing executing under it yet.
     #[cfg(feature = "pi4")]
     pub unsafe fn finalize_service_address_space(root: u64) {
+        // PUBLISH THE PAGE TABLES before anything can walk them.
+        //
+        // `ptables` builds this address space with ordinary stores and contains not one barrier. On
+        // x86 that is free: page-table walks are strongly ordered, so entries are visible as soon as
+        // they are written. On AArch64 they are plain memory writes, and nothing orders them against
+        // the TTBR0 install that follows - the hardware walker can observe entries that have not
+        // reached the point of unification yet, and report a TRANSLATION FAULT for a page whose
+        // descriptor this core has already written.
+        //
+        // That is the respawn fault exactly: ESR 0x82000007, an instruction abort on the first fetch of
+        // a freshly-spawned supervisor whose 69 pages were all mapped correctly. Boot spawns survive
+        // because plenty of other work (and its incidental barriers) happens between building a space
+        // and entering it; a respawn does both back to back, which is why it is the respawn that dies
+        // and why it is intermittent rather than reliable.
+        //
+        // `dsb ishst` is the whole obligation: make the stores visible inner-shareable before the space
+        // is installed anywhere. This is the SEC-25/SEC-27 weak-memory contract in `arch/CLAUDE.md` -
+        // "every `arch::imp` primitive owes a documented SEMANTIC, not just a signature" - met at the
+        // one point where a new address space becomes reachable.
+        //
+        // SAFETY: a barrier; no memory is accessed.
+        unsafe {
+            core::arch::asm!("dsb ishst", options(nostack));
+        }
         // SAFETY: caller's contract - the space belongs to a task that has not started.
         let synced = unsafe { super::ptables::sync_all_pages(root) };
         // Report the count. QEMU cannot demonstrate this fix - it models no separate I-cache - so the

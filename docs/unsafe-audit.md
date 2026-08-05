@@ -173,6 +173,26 @@ TABLE at L1/L2 and PAGE at L3, and the address field is bits [47:21] for a block
 |------|--------|-----|
 | `arch/aarch64/mmu.rs` | 17 -> 23 (+6) | High-half L2 lookup, split-table arena hand-out, the block split and page clear, the verify read, and TLB maintenance. All page-table work, in the layer where it belongs (§18.1); the neutral caller stays a safe `fn`. |
 
+## 2026-08-05 - Pi 4 AUDIT: publish page tables before the walker can reach them (SEC-25/27)
+
+First finding of the aarch64 kernel audit, and the cause of the supervisor-respawn fault that the
+earlier TLB fix reduced but did not cure.
+
+`ptables.rs` builds a task's address space with ordinary stores and contains **zero barriers** - grep
+finds not one `dsb` in the file. On x86 that is free, because page-table walks are strongly ordered. On
+AArch64 the entries are plain memory writes with nothing ordering them against the TTBR0 install that
+follows, so the hardware walker can observe a descriptor this core has already written as absent, and
+raise a translation fault for a page that is mapped.
+
+That is the fault signature exactly: ESR `0x82000007`, instruction abort on the first fetch of a
+freshly-spawned supervisor whose 69 pages were all mapped correctly. Boot spawns survive because other
+work (and its incidental barriers) separates building a space from entering it; a respawn does both back
+to back, which is why the respawn is the one that dies and why it is intermittent.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 66 -> 67 (+1) | `dsb ishst` in `finalize_service_address_space`, publishing a new address space's descriptors inner-shareable before it can be installed or walked. A barrier; touches no memory. |
+
 ## 2026-08-05 - Pi 4: invalidate a dead address space's TLB before its frames are recycled
 
 `chaos kill-storm supervisor` killed the machine on this port: the RESPAWNED supervisor took an
@@ -2143,7 +2163,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 66 | permitted |
+| arch/aarch64/mod.rs | 67 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/sched_spawn.rs | 2 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
