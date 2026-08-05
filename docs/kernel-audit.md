@@ -796,3 +796,70 @@ check fixed for the bulk path in this range):
 - **A8-22 (LOW).** Two stale comments this range's own changes falsified: `dispatch.rs:1301` SAFETY says
   "task heap range (0x1_0000_0000+)", false on 32-bit since the split; and `map_in_active_tables(virt: u64)`
   silently narrows to `u32` with no assert - the primitive behind the bug `f886d6b` worked around.
+
+## Audit 7 - the AArch64 (Raspberry Pi 4) port (2026-08-05, `feat/pi4-aarch64` @ f6e51efc)
+
+**Scope.** All aarch64 kernel code written during the Pi 4 bring-up: `genet.rs` (GENET ethernet),
+`xhci.rs` (USB over PCIe, incl. the new BOT recovery), `mmu.rs` (kernel-stack guard pages),
+`ptables.rs`, the `mod.rs` arch surface, and the aarch64 capability grants in `task/mod.rs`.
+
+**Method.** By DEFECT CLASS, not by file. The port's own standing lesson is "fix the class, not the
+instances", and the first finding arrived by accident while chasing a bug - which is the argument for
+sweeping deliberately.
+
+**North star unchanged:** nothing above the kernel may panic or wedge it.
+
+### Findings (5 CONFIRMED, all fixed)
+
+| # | Finding | Class | Where |
+|---|---------|-------|-------|
+| A7-1 | `drain_rx` looped `while cons != prod` with `prod` read from a HARDWARE REGISTER - a device-supplied value deciding when kernel code stops | unbounded (§26.6) | `genet.rs` |
+| A7-2 | A new address space was installed before its descriptors were visible. **The supervisor-respawn fault** (ESR `0x82000007`) | weak-memory publication (SEC-25/27) | `mod.rs::finalize_service_address_space` |
+| A7-3 | `map_in_root` published nothing while mapping into the tables THIS CORE EXECUTES UNDER | weak-memory publication | `ptables.rs` |
+| A7-4 | `unmap` released a `Frame` to the allocator with no barrier and **no TLB invalidate** - a use-after-free the MMU actively enables, reported by nothing | stale translation (SEC-26) | `ptables.rs` |
+| A7-5 | Event drain unbounded in the TIMER TICK - an IRQ-storm livelock. Same class arm32 Audit 6 already recorded HIGH (`net_rx_isr`) | unbounded (§26.6) | `xhci.rs` |
+
+`ptables.rs` - the file the neutral kernel maps and unmaps THROUGH - contained **zero barriers**.
+A7-2/3/4 are one class; fixing only A7-2 (the one causing the visible bug) would have left the
+use-after-free live.
+
+### Classes swept clean
+
+- **USB descriptor parsers** - all three guard `len < 2` and break, so a zero-length descriptor ends
+  the walk rather than spinning it (the classic USB parse bug, already handled).
+- **Device-supplied lengths** - every copy is fixed-size or `.min()`-clamped against BOTH source and
+  destination. No device value sizes a copy unchecked.
+- **Capability grants** - every aarch64 grant is arch-gated AND name-scoped to exactly one service;
+  the `SetClock` rights split is correct least-privilege (WRITE to `net-stack`, READ-only floor to
+  `shell`).
+- **Bounded waits** - `command()` and the transfer waits carry explicit iteration bounds.
+- **Userspace reply sends** - the discarded `send_by_handle(reply, ..)` result is the established
+  convention across all three block backends (ahci 8, sdhci 7, usbdisk 6): a failed reply means the
+  caller is gone and there is nothing to retry. Reviewed and accepted, not a finding.
+
+### Verification
+
+`chaos max-carnage`: 23 rounds, 77 kills, 53 flooded, 23 mem-pressure, 23 spawns. Kernel ALIVE,
+**0 panics, 0 exceptions, 10 supervisor respawns all reconciled**, shell back at a prompt. Before
+A7-2/3/4 the supervisor faulted on the first or second respawn.
+
+### NOT audited (honest coverage)
+
+- `mmu.rs` block splitting, line by line. Written the same day, page-table surgery, and verified only
+  by the `guard_unmapped=true usable_mapped=true` line - which proves ONE page, not the general case.
+- `bot_recover` against the xHCI specification. Built, and **never exercised**: no timeout has occurred
+  since it landed, so `stop -> reset -> set-dequeue` has not run once.
+- **Open suspicion, unresolved:** the BOT class reset and both clear-halts are refused over EP0. The
+  scratch control ring is shared with enumeration, so the disk's EP0 context may no longer point at the
+  ring this code rings a doorbell for. That is a design question, not a tuning one.
+- Userspace beyond the block backends: the shell's clock-floor path and `net-stack` were not read.
+
+### Process finding
+
+Every one of A7-1..A7-5 is in code written the same day it was audited, and three sat on the path a
+hardware test was about to exercise. The standing rule is to audit new code against the Commandments
+BEFORE presenting it for a hardware test; that did not happen once across a driver, a recovery path,
+guard-page block splitting and four capability grants. Bugs then chased over multiple hardware rounds
+were audit-shaped: a discarded verdict, a bound that was not a bound, a diagnostic that could not fail
+loudly. A7-5 had already been recorded as HIGH on arm32, on a different device, and was written again.
+
