@@ -2090,8 +2090,38 @@ pub mod rtc {
     pub use crate::clock::epoch_secs;
     pub fn capture_boot_time() {}
     pub fn boot_datetime() -> u64 { 0 }
-    pub fn read_datetime() -> u64 { 0 }
-    pub fn set_wall_clock(_epoch: i64) -> bool { false } // no RTC on this stub; SNTP wall clock unused (arm is the live RTC-less port)
+    /// Where the network-supplied wall clock is anchored: the real epoch at the moment it was set,
+    /// minus the monotonic seconds already elapsed. Zero until SNTP succeeds, and `date` shows zeros
+    /// rather than inventing a time.
+    static WALL_EPOCH_BASE: portable_atomic::AtomicI64 = portable_atomic::AtomicI64::new(0);
+
+    /// The packed wall-clock datetime (query 11). Reconstructed from the SNTP anchor plus monotonic
+    /// seconds, because the Pi 4 has no hardware clock to read.
+    pub fn read_datetime() -> u64 {
+        let base = WALL_EPOCH_BASE.load(core::sync::atomic::Ordering::Relaxed);
+        if base == 0 {
+            return 0; // no wall clock yet
+        }
+        crate::clock::packed_from_epoch(base + now_epoch_monotonic())
+    }
+
+    /// Adopt a wall clock from the network.
+    ///
+    /// **The Pi 4 has no RTC**, so a network time IS the authority here - exactly as on the Pi 2. This
+    /// returned `false` while the port had no networking, and the generic layer reads that as "this
+    /// board's hardware clock is the authority" and refuses the value. Once SNTP worked, that stale
+    /// `false` meant net-stack completed the whole exchange, got a correct epoch from a real server,
+    /// and had it thrown away one call from the finish line.
+    ///
+    /// Anchors base = epoch - monotonic, so every later read reconstructs the current time by adding
+    /// the monotonic counter back. Cap-gated at the syscall by SET_CLOCK, never ambient.
+    pub fn set_wall_clock(epoch: i64) -> bool {
+        WALL_EPOCH_BASE.store(
+            epoch - now_epoch_monotonic(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        true
+    }
     /// Seconds since the Unix epoch - or, on a board with no clock, seconds since boot.
     ///
     /// **The Pi 4 has no RTC.** Returning a constant 0 made this read as 1970 and, worse, made `uptime`
