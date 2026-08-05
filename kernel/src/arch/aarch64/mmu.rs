@@ -310,38 +310,12 @@ pub fn enable() -> u64 {
             (*l1h).0[i] = l2_pa | DESC_TABLE;
             for j in 0..ENTRIES {
                 let pa = (i as u64) * (ENTRIES as u64) * BLOCK_SIZE + (j as u64) * BLOCK_SIZE;
-                let desc = if pa >= DEVICE_BASE {
+                (*l2h)[i].0[j] = if pa >= DEVICE_BASE {
                     pa | DESC_BLOCK | DESC_AF | DESC_AP_RW_EL1
                         | attr_idx(MAIR_IDX_DEVICE) | DESC_PXN | DESC_UXN
                 } else {
                     pa | DESC_BLOCK | DESC_AF | DESC_SH_INNER | DESC_AP_RW_EL1
                         | attr_idx(MAIR_IDX_NORMAL) | DESC_UXN
-                };
-                // A block that will need a 4 KiB hole punched in it is built as a TABLE from the start.
-                //
-                // This is break-before-make satisfied by never needing it. Changing a live mapping's
-                // BLOCK SIZE requires BBM - invalidate, barrier, TLBI, barrier, write - and BBM is
-                // itself fatal on a block you are EXECUTING FROM or whose stack you are standing on,
-                // which is exactly the case here: the guard install runs on the kernel stack, logs
-                // through `.bss`, and both can live in the very blocks it re-points. So the split used
-                // to happen live, with no BBM at all, leaving the TLB free to hold the 2 MiB block and
-                // the new 4 KiB pages for the same VA simultaneously - CONSTRAINED UNPREDICTABLE, and
-                // permitted to raise a TLB conflict abort or amalgamate the two.
-                //
-                // Emitting a table here means the map is complete and correct before the MMU is ever
-                // enabled, and `unmap_4k_strided` afterwards only ever CLEARS an L3 entry - a
-                // valid-to-invalid transition, which needs no BBM, only an invalidate. The mapping's
-                // size never changes while it is live, so the architectural rule is not bent, it is
-                // not engaged.
-                (*l2h)[i].0[j] = if pa < DEVICE_BASE && block_needs_pages(pa) {
-                    match split_block_at_build(desc) {
-                        Some(table_desc) => table_desc,
-                        // Out of split tables: keep the block. The guard install will then report the
-                        // shortfall rather than silently leaving stacks unguarded (§26.7).
-                        None => desc,
-                    }
-                } else {
-                    desc
                 };
             }
         }
@@ -663,41 +637,6 @@ const ADDR_MASK_2M: u64 = 0x0000_FFFF_FFE0_0000;
 const ATTR_LOW: u64 = 0xFFC;
 const ATTR_HIGH: u64 = 0xFFF0_0000_0000_0000;
 
-/// Does the 2 MiB block at physical `pa` overlap the kernel-stack pool?
-///
-/// Asked at table-build time so those blocks can be emitted as page tables rather than converted
-/// later. The pool is a `.bss` static, so its address is fixed at link time and known here - long
-/// before the MMU is on.
-fn block_needs_pages(pa: u64) -> bool {
-    let (base_va, len) = crate::task::kstack_pool_span();
-    if len == 0 {
-        return false;
-    }
-    // The pool is named by a kernel VA; before the jump high that IS its physical address, and
-    // `virt_to_phys` is the conversion that makes the difference explicit rather than assuming.
-    let base = virt_to_phys(base_va);
-    let end = base + len as u64;
-    pa < end && (pa + BLOCK_SIZE) > base
-}
-
-/// Build an L3 table reproducing `block` as 512 pages, and return the L2 descriptor naming it.
-///
-/// Identical translation, byte for byte: same addresses, same memory type, shareability, access
-/// permissions, access flag and execute-never bits. The only difference is granularity, which is the
-/// whole point - a 4 KiB entry can be cleared later, a 2 MiB block cannot without changing its size.
-fn split_block_at_build(block: u64) -> Option<u64> {
-    let t = take_split_table()?;
-    let block_pa = block & ADDR_MASK_2M;
-    let attrs = (block & ATTR_LOW) | (block & ATTR_HIGH);
-    // SAFETY: a table from this module's own arena, handed out exactly once, before the MMU is on.
-    unsafe {
-        for k in 0..ENTRIES {
-            (*t).0[k] = (block_pa + (k as u64) * 4096) | attrs | DESC_PAGE_L3;
-        }
-        Some(virt_to_phys(t as u64) | DESC_TABLE)
-    }
-}
-
 /// The L2 entry describing `va` in the high-half map, or `None` if it is not a kernel address.
 ///
 /// # Safety
@@ -742,20 +681,29 @@ fn unmap_high_4k(va: u64) -> bool {
         let d = e.read_volatile();
 
         let l3_va = match d & 0b11 {
-            // A LIVE block here means the build-time pass did not cover this address, and splitting it
-            // now would be the break-before-make hazard that pass exists to avoid: this code runs on
-            // the kernel stack and logs through `.bss`, either of which can live in the block being
-            // re-pointed. Refuse and report, rather than perform the unsound transition quietly.
             DESC_BLOCK => {
-                crate::kprintln!(
-                    "kstack: {:#x} is still a 2 MiB block - guard NOT installed (build-time split \
-                     missed it; splitting a live block is unsound)",
-                    va
-                );
-                return false;
+                let Some(t) = take_split_table() else {
+                    crate::kprintln!(
+                        "kstack: OUT OF SPLIT TABLES at {:#x} - guard page NOT installed", va);
+                    return false;
+                };
+                // Reproduce the block as 512 pages, carrying its attributes verbatim. Anything dropped
+                // here silently changes the memory type or permissions of 2 MiB of live kernel map.
+                let block_pa = d & ADDR_MASK_2M;
+                let attrs = (d & ATTR_LOW) | (d & ATTR_HIGH);
+                for k in 0..ENTRIES {
+                    (*t).0[k] = (block_pa + (k as u64) * 4096) | attrs | DESC_PAGE_L3;
+                }
+                // Publish the table BEFORE the entry that points at it. The walker is coherent with the
+                // data caches here (Normal, inner-shareable, SMPEN set), so ordering is all that is
+                // owed - a `dsb ishst`, not a cache clean.
+                core::arch::asm!("dsb ishst", options(nostack));
+                e.write_volatile(virt_to_phys(t as u64) | DESC_TABLE);
+                core::arch::asm!("dsb ishst", options(nostack));
+                t as u64
             }
-            // The expected case now: the build-time pass emitted a table here, so the guard is a single
-            // L3 clear. About thirty 68 KiB slots fall inside each 2 MiB block, so one table serves many.
+            // Already split by an earlier guard in the same block - the common case, since 68 KiB of
+            // stride puts about thirty slots inside every 2 MiB block.
             DESC_TABLE => (d & ADDR_MASK_4K) + KERNEL_VA_BASE,
             _ => return false, // nothing mapped here to begin with
         };
