@@ -320,6 +320,8 @@ fn ec_name(esr: u64) -> &'static [u8] {
 
 /// Ticks seen, so the boot can report progress instead of asserting the timer works.
 pub static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Said once: an SPI too high to express in the neutral routing table's `u8` key.
+static SPI_TOO_HIGH_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// IRQ entry. Acknowledge at the GIC, handle, end-of-interrupt, return.
 ///
@@ -340,6 +342,30 @@ extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
     // ticks on its own timer and picks up work then, so an IPI is a latency improvement rather than a
     // correctness requirement.
     if id < 16 {
+        super::gic::eoi(id);
+        return;
+    }
+    // DEVICE interrupts (GIC Shared Peripheral Interrupts, ID 32 and up) go to USERSPACE.
+    //
+    // This one branch is what `docs/aarch64.md` and the §6.4 amendment called the reason drivers must
+    // live in the kernel on ARM: "the arch does not yet route device IRQs to userspace". It was never a
+    // hardware limitation - the GIC-400 delivers SPIs perfectly well and the neutral router
+    // (`interrupt::route`) is arch-agnostic and already complete. Nobody had connected the two. An
+    // unimplemented branch was read as an architectural constraint, and a Commandment I violation was
+    // accepted on the strength of it.
+    //
+    // IDs are bounded to a byte because the neutral routing table is keyed by `u8` (an x86 vector). The
+    // GIC numbers SPIs up to 1020, so anything above 255 cannot be expressed and is retired rather than
+    // silently dropped into the wrong bucket - loud about the limit instead of wrong about the IRQ.
+    if id >= 32 {
+        if id <= u8::MAX as u32 {
+            // SAFETY: called from the IRQ handler with interrupts masked, which is the contract the x86
+            // caller documents for this function.
+            unsafe { crate::interrupt::route::deliver(id as u8) };
+        } else if !SPI_TOO_HIGH_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            crate::kprintln!(
+                "gic: SPI {} is above the routing table's u8 range - not deliverable to userspace", id);
+        }
         super::gic::eoi(id);
         return;
     }

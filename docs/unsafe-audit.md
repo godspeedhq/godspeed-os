@@ -173,6 +173,22 @@ TABLE at L1/L2 and PAGE at L3, and the address field is bits [47:21] for a block
 |------|--------|-----|
 | `arch/aarch64/mmu.rs` | 17 -> 23 (+6) | High-half L2 lookup, split-table arena hand-out, the block split and page clear, the verify read, and TLB maintenance. All page-table work, in the layer where it belongs (§18.1); the neutral caller stays a safe `fn`. |
 
+## 2026-08-05 - Pi 4: route device IRQs to userspace (Commandment I remediation, step 1)
+
+The Pi 4 kernel contains a USB stack and an Ethernet driver, which expands kernel responsibility and
+breaks Commandment I. The justification on record - "the arch does not yet route device IRQs to
+userspace" - turned out to be an UNIMPLEMENTED BRANCH, not a hardware limit: the GIC-400 delivers SPIs
+perfectly well, the neutral `interrupt::route` is arch-agnostic and complete, and both ARM arches already
+carry the stubs it needs. Nobody had connected the two.
+
+One branch in the GIC dispatcher now hands SPIs (ID 32+) to the neutral router, which is the mechanism a
+userspace driver blocks on. IDs above 255 are retired with a one-shot loud line rather than truncated
+into the wrong routing slot, because the neutral table is keyed by a `u8` vector.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/exceptions.rs` | 12 -> 13 (+1) | `interrupt::route::deliver(id)` from the IRQ handler, called with interrupts masked - the same contract the x86 caller documents. |
+
 ## 2026-08-05 - Pi 4 AUDIT 8 follow-up: reclaim a departed device's DMA pages
 
 `dma_page` never had a counterpart, so this driver freed nothing. Every unplug/replug cycle leaked the
@@ -2224,7 +2240,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/sched_spawn.rs | 2 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
-| arch/aarch64/exceptions.rs | 12 | permitted |
+| arch/aarch64/exceptions.rs | 13 | permitted |
 | arch/aarch64/uaccess.rs | 7 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
