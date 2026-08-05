@@ -2409,7 +2409,22 @@ pub fn poll() {
     let now = now_us();
 
     let mut got = false;
+    // BOUNDED per visit (§26.6). This runs on the TIMER TICK, and the loop ends only when the
+    // controller stops producing events - so a device or controller generating them faster than we
+    // consume holds core 0 inside the tick and nothing else on that core runs again. The arm32 audit
+    // already recorded this exact shape as a HIGH finding (`net_rx_isr` IRQ-storm livelock); it is the
+    // same defect on a different device.
+    //
+    // A tick's worth is a tick's worth: whatever is left stays queued and the next tick takes it, which
+    // is the behaviour a ring exists to provide. 64 is far more than a keyboard can generate in 10 ms
+    // and far less than a storm needs to wedge the core.
+    const EVENTS_PER_VISIT: u32 = 64;
+    let mut drained = 0u32;
     while let Some(ev) = hc.next_event() {
+        drained += 1;
+        if drained > EVENTS_PER_VISIT {
+            break;
+        }
         if (ev.control >> 10) & 0x3F != TRB_EV_TRANSFER {
             continue;
         }
