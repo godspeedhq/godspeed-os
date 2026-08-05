@@ -26,7 +26,10 @@ accidentally produce a non-Pi image:
 
     python scripts/pi4_build.py --features pi4-sched-demo
 
-usage:  python scripts/pi4_build.py [--debug] [--features a,b]
+`--genet-userspace` is separate from `--features` because it has to reach TWO crates: the kernel (stop
+driving GENET) and the `nic-driver` service (start driving it). See where it is handled below.
+
+usage:  python scripts/pi4_build.py [--debug] [--features a,b] [--genet-userspace]
 """
 import subprocess, sys, os, pathlib, re
 
@@ -92,11 +95,25 @@ if "--features" in sys.argv:
         sys.exit("--features needs a comma-separated list")
     FEATURES = "pi4,pi4-smp," + sys.argv[i + 1]
 
+# --genet-userspace: take the ethernet driver OUT of the kernel and run it in the `nic-driver` service.
+#
+# The feature has the same name in two crates and BOTH have to get it. The kernel's copy stops the
+# kernel from driving GENET; the service's copy makes the service drive it. Set only one and you get
+# either two drivers fighting over one MAC or no driver at all - a footgun with no diagnostic, because
+# both halves build and boot perfectly well on their own. That is exactly why it is one flag here
+# rather than two features to remember, and why it is not left to `--features` (which reaches only the
+# kernel).
+GENET_USERSPACE = "--genet-userspace" in sys.argv
+if GENET_USERSPACE:
+    FEATURES += ",genet-userspace"
+
 rel = ["--release"] if PROFILE == "release" else []
 
 # 1. The services first - the kernel embeds their ELFs, so a stale service is baked into the image.
 for svc in PI4_SERVICES:
     feats = ["--features", "bare-metal"] if svc == "supervisor" else []
+    if svc == "nic-driver" and GENET_USERSPACE:
+        feats = ["--features", "genet-userspace"]
     run(["cargo", "build", "-p", svc, "--target", TARGET] + feats + rel)
 
 # 2. The kernel.

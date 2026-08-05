@@ -9,3 +9,11 @@ path = "src/main.rs"
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
+
+[features]
+# Drive the Pi 4's GENET ethernet MAC from HERE, in userspace, instead of bridging to the in-kernel
+# driver through the NET_DEVICE syscalls (src/genet.rs). Must be enabled TOGETHER with the KERNEL
+# feature of the same name, which is what stops the kernel from also driving the controller; enabling
+# one alone leaves either two drivers on one MAC or none. `scripts/pi4_build.py --genet-userspace`
+# passes both, which is the only supported way to turn it on.
+genet-userspace = []
