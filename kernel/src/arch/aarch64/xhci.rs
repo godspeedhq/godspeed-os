@@ -490,6 +490,24 @@ fn dma_page() -> Option<(u64, u64)> {
     Some((va, phys))
 }
 
+/// Give a DMA page back to the frame allocator.
+///
+/// The counterpart `dma_page` never had one, so this driver freed nothing: every unplug/replug cycle
+/// leaked the departing device's pages - the keyboard's interrupt ring, or the disk's two bulk rings,
+/// data page, command page and control ring. Roughly four to six pages per cycle, forever, from an
+/// ordinary operator action and the very one `stand_down` exists to handle.
+///
+/// # Safety
+/// `phys` must be a page this module obtained from `dma_page` and no longer names anywhere - no
+/// descriptor, ring pointer or endpoint context may still reach it.
+unsafe fn free_dma_page(phys: u64) {
+    if phys == 0 {
+        return; // a placeholder ring names nothing
+    }
+    // SAFETY: caller's contract - the page came from `dma_page` and is unreachable.
+    unsafe { crate::memory::allocator::free_frame(crate::memory::frame::Frame::from_phys(crate::memory::frame::PhysAddr(phys))) }
+}
+
 fn rd32(a: u64) -> u32 {
     // SAFETY: a volatile read inside the controller's BAR, which `pcie` mapped and assigned.
     unsafe { (a as *const u32).read_volatile() }
@@ -2292,7 +2310,18 @@ fn stand_down(hc: &mut Xhci, hub: &mut Hub, p: u8) {
     // instead of saying "no disk".
     if hc.disk.as_ref().is_some_and(|d| d.hub_port == p) {
         let slot = hc.disk.as_ref().map(|d| d.slot).unwrap_or(0);
-        hc.disk = None;
+        // Reclaim the device's pages before dropping it. Taken by value so nothing can still name them.
+        if let Some(d) = hc.disk.take() {
+            // SAFETY: the disk is being torn down and its slot disabled below; no descriptor, ring
+            // pointer or endpoint context reaches these pages once it is dropped.
+            unsafe {
+                free_dma_page(d.in_ring.phys);
+                free_dma_page(d.out_ring.phys);
+                free_dma_page(d.ep0.phys);
+                free_dma_page(d.data_phys);
+                free_dma_page(d.cmd_phys);
+            }
+        }
         DISK_SECTORS.store(0, Ordering::Release);
         hc.command(0, TRB_DISABLE_SLOT, (slot as u32) << 24);
         super::console_notice_fmt(format_args!(
@@ -2305,7 +2334,14 @@ fn stand_down(hc: &mut Xhci, hub: &mut Hub, p: u8) {
         return;
     }
     let slot = k.slot;
-    hc.kbd = None;
+    if let Some(k) = hc.kbd.take() {
+        // SAFETY: as above - the keyboard is being torn down and its slot disabled.
+        unsafe {
+            free_dma_page(k.ring.phys);
+            free_dma_page(k.ep0.phys);
+            free_dma_page(k.buf_phys);
+        }
+    }
     // SAFETY: single caller, from the timer tick on core 0. See `poll`.
     let ks = unsafe { &mut *core::ptr::addr_of_mut!(KBD_STATE) };
     ks.rep.disarm();

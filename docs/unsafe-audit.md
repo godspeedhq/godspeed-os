@@ -173,6 +173,20 @@ TABLE at L1/L2 and PAGE at L3, and the address field is bits [47:21] for a block
 |------|--------|-----|
 | `arch/aarch64/mmu.rs` | 17 -> 23 (+6) | High-half L2 lookup, split-table arena hand-out, the block split and page clear, the verify read, and TLB maintenance. All page-table work, in the layer where it belongs (§18.1); the neutral caller stays a safe `fn`. |
 
+## 2026-08-05 - Pi 4 AUDIT 8 follow-up: reclaim a departed device's DMA pages
+
+`dma_page` never had a counterpart, so this driver freed nothing. Every unplug/replug cycle leaked the
+departing device's pages - the keyboard's interrupt ring, EP0 ring and report buffer; the disk's two
+bulk rings, EP0 ring, data page and command page. Four to six pages per cycle, forever, from an
+ordinary operator action and precisely the one `stand_down` exists to handle.
+
+`free_dma_page` returns one, and `stand_down` now takes the device by value before dropping it, so
+nothing can still name the pages when they go back to the allocator.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | 38 -> 42 (+4) | One `free_frame` wrapper, and its use on the disk and keyboard teardown paths - each guarded by the device being taken out of its option first, so no descriptor, ring pointer or endpoint context reaches the page. |
+
 ## 2026-08-05 - Pi 4 AUDIT 8: RX buffers cleaned and zeroed before the device owns them
 
 Audit 8 (four parallel auditors) found that GENET hands the controller RX buffers with no cache
@@ -2226,7 +2240,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/genet.rs | 14 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
 | arch/aarch64/smp_boot.rs | 9 | permitted |
-| arch/aarch64/xhci.rs | 38 | permitted |
+| arch/aarch64/xhci.rs | 42 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |

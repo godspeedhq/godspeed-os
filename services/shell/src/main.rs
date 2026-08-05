@@ -303,6 +303,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // increments CORE_TOTAL_TICKS, so the spin inflated the very denominator every CPU% is divided
         // by - the observer distorting what it observes. Park + wake-on-release is still the endgame;
         // this is the cheap 99% of it. Regain latency stays one sleep, imperceptible at the prompt.
+        // The boot clock-floor check runs ABOVE the mute gate and does not wait for a keypress.
+        //
+        // It used to sit below both, in front of a BLOCKING `console_read` - so it only ran when
+        // somebody typed, and it was skipped entirely while a foreground app held the console. The case
+        // it exists for is a machine that boots with a cable in, learns the time by SNTP, and then
+        // loses power: an UNATTENDED machine, which is exactly the one that never types. The feature was
+        // dead on arrival for its own scenario.
+        //
+        // Cheap: one syscall per pass until it fires, then a plain bool test forever.
+        if !clock_floor_recorded && ctx.clock_source() == ClockSource::Ntp {
+            clock_floor_recorded = true;
+            if let Some(f) = ctx.clock_floor() {
+                if (0..=u32::MAX as i64).contains(&f) {
+                    // NOT quiet. `quiet` is right for the reboot path, where the machine is resetting
+                    // and a failed floor is not worth an operator's attention. Here it suppressed both
+                    // failure reports while latching the flag before the attempt, so a write that lost
+                    // its race with a still-mounting `fs` was neither retried nor mentioned - a
+                    // degraded state made invisible (§26.7).
+                    clock_floor_persist(&ctx, f as u32, false);
+                }
+            }
+        }
+
         if !ctx.is_console_foreground() {
             ctx.sleep_ms(MUTED_POLL_MS);
             muted = true;
@@ -331,27 +354,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             muted = false;
         }
 
-        // Record the floor once, when the NETWORK has set the clock on its own at boot.
+        // Read the next byte - but do NOT block indefinitely while the boot floor is still unrecorded.
         //
-        // net-stack syncs by SNTP without being asked, which is what makes a board with no RTC know the
-        // time at all - but the shell owns the on-disk floor, and until now it only wrote one on an
-        // explicit `date sync` or on the way down. A machine that booted with a cable in, learned the
-        // real time, and then lost power recorded nothing: the knowledge was in RAM and died there.
-        //
-        // Checked here rather than at startup because the sync is not instant - net-stack has to get a
-        // lease, resolve a server and complete the exchange - so a one-shot test during boot would
-        // almost always run too early and conclude there was no clock. This costs one syscall per
-        // keypress until it fires, and nothing at all afterwards.
-        if !clock_floor_recorded && ctx.clock_source() == ClockSource::Ntp {
-            clock_floor_recorded = true; // once per boot, whether or not the write lands
-            if let Some(f) = ctx.clock_floor() {
-                if (0..=u32::MAX as i64).contains(&f) {
-                    clock_floor_persist(&ctx, f as u32, true);
+        // An idle shell blocks here forever, so the loop never turns and the check above never runs. On
+        // an unattended machine - the only kind the boot floor is FOR - that meant the record was made
+        // when somebody eventually pressed a key, or never. Polling until the sync lands and blocking
+        // ever after costs a wakeup every MUTED_POLL_MS for the few seconds SNTP takes, and nothing at
+        // all for the rest of the boot.
+        let b = if clock_floor_recorded {
+            ctx.console_read()
+        } else {
+            match ctx.try_console_read() {
+                Some(b) => b,
+                None => {
+                    ctx.sleep_ms(MUTED_POLL_MS);
+                    continue;
                 }
             }
-        }
-
-        let b = ctx.console_read();
+        };
 
         match b {
             // Ctrl+Alt+Del (the SEC-2 follow-up). The USB driver cannot reboot - SEC-2 took REBOOT
