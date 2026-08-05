@@ -619,8 +619,18 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             out[0] = count;
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos]));
         } else if p.len() == 1 && matches!(p[0], 5 | 6 | 7 | 8) {
-            // Diagnostics / chaos force-link: not applicable to usb-net; ack so callers don't hang.
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[1u8]));
+            // UNSUPPORTED on this backend - answered `[0]`, not `[1]`.
+            //
+            // Ops 6/7/8 are the chaos force-link override. Acking them with `1` (success) meant
+            // `chaos link-flap` printed "forcing link DOWN ... net-stack should self-configure ... done"
+            // while nothing had been overridden: a chaos trial reporting it had exercised link recovery
+            // having exercised nothing. A test that cannot fail is not a test (Commandment II), and this
+            // one was worse than absent because it read as passing.
+            //
+            // Op 5 is a register dump; answering 1 byte to a caller expecting 25 is the same lie in
+            // miniature. The original comment was right that a caller must not hang and wrong that an
+            // ack was the remedy: the caller needs an ANSWER, and "not supported here" is one.
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8]));
         } else {
             // TX FRAME (any multi-byte payload) + coupled RX: transmit, then hand back one received frame.
             // A failed transmit used to be dropped on the floor: the reply still came back normally, so

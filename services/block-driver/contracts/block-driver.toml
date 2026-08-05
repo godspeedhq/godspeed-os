@@ -1,4 +1,4 @@
-# ARM NOTE (userspace-audit A6, same class as A5-U1): on the arm32 port this service is ALSO granted
+# ARM NOTE (userspace-audit A6, same class as A5-U1): on BOTH ARM ports (arm32 Pi 2 and aarch64 Pi 4) this service is ALSO granted
 # USB_DISK - whole-device read/write reach over the in-kernel USB mass-storage stack (syscalls 46-49) -
 # by kernel name-match, because the ARM USB stack lives in the kernel and there is no `hw_device` name
 # that resolves to it. It is therefore NOT visible in the capability list below, and `contract_check.py`

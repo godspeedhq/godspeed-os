@@ -2054,6 +2054,17 @@ struct MscInfo {
 /// the only one this driver speaks. Anything else - a UAS-only device, or CBI - is left alone rather
 /// than half-driven, because a storage device driven by a protocol it does not implement is a device
 /// that returns plausible garbage where a filesystem expects blocks.
+/// A bulk endpoint must have a non-zero endpoint NUMBER, not merely a non-zero address.
+///
+/// `dci = (num)*2 + in`, so `num == 0` gives `out_dci == 0` - whose add-context flag collides with the
+/// slot flag, writing endpoint fields over the slot context - and `in_dci == 1`, which reconfigures EP0
+/// as a bulk pipe. Both are caught downstream by a Configure Endpoint parameter error, so this is
+/// robustness rather than corruption; but ring-0 code parsing a stranger's descriptors should reject
+/// them where the reason is legible.
+fn ep_num_ok(addr: u8) -> bool {
+    addr & 0x0F != 0
+}
+
 fn parse_msc(va: u64) -> Option<MscInfo> {
     // SAFETY: the descriptor buffer this module owns, filled by the control transfer above.
     let buf = unsafe { core::slice::from_raw_parts(va as *const u8, 256) };
@@ -2094,7 +2105,7 @@ fn parse_msc(va: u64) -> Option<MscInfo> {
         }
         i += len;
     }
-    if in_msc && in_ep != 0 && out_ep != 0 && mps != 0 {
+    if in_msc && ep_num_ok(in_ep) && ep_num_ok(out_ep) && mps != 0 {
         Some(MscInfo { cfg_value, iface, in_ep, out_ep, mps })
     } else {
         None
@@ -2567,7 +2578,31 @@ pub fn disk_flush() -> bool {
     with_disk(
         |hc| {
             let cmd = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // SYNCHRONIZE CACHE(10)
-            matches!(hc.bot(&cmd, 0, false), Some(0))
+            // Three arms, like read and write - not `matches!(.., Some(0))`, which reported a device
+            // that NAKed identically to one that REFUSED the command. Those are different facts and the
+            // difference lands on `fs`'s journal barrier: §6.1's 2026-07-25 amendment turns on whether
+            // the backend can be ordered, so "was busy this instant" must not be told as "cannot be
+            // ordered". A flush is also the command most likely to be NAKed, arriving right after the
+            // burst of writes it exists to commit.
+            match hc.bot(&cmd, 0, false) {
+                Some(0) => {
+                    DISK_BUSY.store(false, Ordering::Relaxed);
+                    TIMEOUT_RUN.store(0, Ordering::Relaxed);
+                    true
+                }
+                Some(_) => {
+                    DISK_BUSY.store(true, Ordering::Relaxed);
+                    false
+                }
+                None => {
+                    DISK_BUSY.store(true, Ordering::Relaxed);
+                    if TIMEOUT_RUN.fetch_add(1, Ordering::Relaxed) + 1 >= TIMEOUT_RUN_MAX {
+                        TIMEOUT_RUN.store(0, Ordering::Relaxed);
+                        hc.bot_recover();
+                    }
+                    false
+                }
+            }
         },
         false,
         false,
@@ -2609,7 +2644,15 @@ pub fn poll() {
     let hc = unsafe {
         match (&raw mut XHCI).as_mut().and_then(|o| o.as_mut()) {
             Some(h) => h,
-            None => return,
+            // RELEASE the claim on the way out. `with_disk` handles this same case correctly, which is
+            // what makes the omission an oversight rather than a choice. Reachable only in the boot
+            // window where enumeration sets ACTIVE before XHCI is published - and today `gic::init`
+            // runs after `xhci::init`, so IRQs are masked there. If it ever did fire the claim would be
+            // stuck true forever: no keyboard, no hot-plug, and every disk operation answering BUSY.
+            None => {
+                release_usb();
+                return;
+            }
         }
     };
     // SAFETY: same single-caller argument.
