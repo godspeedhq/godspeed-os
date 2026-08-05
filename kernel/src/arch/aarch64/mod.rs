@@ -908,6 +908,15 @@ extern "C" fn boot_high() -> ! {
                         // segment's broadcast traffic and discards what was actually addressed to us.
                         genet::set_rx_filter(mac);
                         genet::mark_ready(mac);
+                        // Declare a NIC present, so the spawn path grants `nic-driver` its DMA arena.
+                        //
+                        // `HwClass::needs_dma` gates on `pci::NIC_FOUND`, which on x86 is set by the PCI
+                        // scan. GENET is an SoC peripheral and never appears on a PCI bus, so the flag
+                        // stayed false and the arena was never granted - the third reason the driver had
+                        // to stay in the kernel. The flag's MEANING is "a NIC this port can drive was
+                        // found", not "a PCI device was enumerated"; setting it here is honouring that
+                        // meaning on a board whose NIC is soldered to the SoC.
+                        pci::NIC_FOUND.store(true, core::sync::atomic::Ordering::Release);
                         genet::announce_ready();
                     }
                 }
