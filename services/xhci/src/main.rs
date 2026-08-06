@@ -1078,6 +1078,7 @@ fn serve_if_block(
     let mut out = [0u8; 520];
     let mut eaten = 0u32;
     let n = msc::serve_block(
+        ctx,
         dma, mmio, dboff, ir0, disk, msg.payload_bytes(), &mut out, ev_idx, ev_cycle, &mut eaten,
     );
     let _ = ctx.send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n]));
@@ -1215,7 +1216,8 @@ fn bind_msc(
     let mut ready = false;
     for _ in 0..16 {
         if msc::test_unit_ready(
-            dma, mmio, dboff, ir0, &mut disk, ev_idx, ev_cycle, &mut eaten,
+            ctx,
+        dma, mmio, dboff, ir0, &mut disk, ev_idx, ev_cycle, &mut eaten,
         ) {
             ready = true;
             break;
@@ -1227,6 +1229,7 @@ fn bind_msc(
     }
 
     match msc::read_capacity(
+        ctx,
         dma, mmio, dboff, ir0, &mut disk, ev_idx, ev_cycle, &mut eaten,
     ) {
         Some(n) => {
@@ -2136,6 +2139,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         if let Some(d) = disk.as_mut() {
             let mut eaten = 0u32;
             if msc::read10(
+                &ctx,
                 &dma,
                 &mmio,
                 dboff,

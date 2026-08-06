@@ -41,7 +41,7 @@
 //!   buffer on any keypress, regardless of which driver code thinks it holds the device. The disk's
 //!   CBW/CSW page here is the disk's alone - see `DISK_BASE`.
 
-use godspeed_sdk::{Dma, Mmio};
+use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 use crate::{next_event, TRB_NORMAL, TRB_SIZE, TRB_TRANSFER_EVENT};
 
@@ -72,14 +72,32 @@ pub const MAX_XFER: u32 = 0x1000;
 /// driven with a wrong stride, which would read plausible bytes from the wrong offsets.
 pub const SECTOR: u32 = 512;
 
-/// How long to wait for one bulk transfer to complete, in `next_event` polling attempts.
+/// How long to wait for one bulk transfer to complete - a REAL DURATION, in milliseconds.
 ///
-/// This is the constant that taught the port "a count is not a duration" TWICE. It is generous on
-/// purpose: a USB stick doing an internal block remap legitimately stops answering for seconds, and
-/// the previous 2 s budget aborted live commands and then blamed the device for the desynchronised
-/// endpoint that followed. 62 wedges in one run were all ours. A device that is merely slow must be
-/// waited out; only a device that never answers at all is broken.
-const XFER_TRIES: u32 = 300_000_000;
+/// This constant was first written as `XFER_TRIES = 300_000_000`, a raw spin count handed to
+/// `next_event`, with a comment claiming it was "a real duration and generous". It was neither. A
+/// count is not a duration: the same number is seconds on one machine and minutes on another,
+/// because what it actually measures is how fast the polling loop happens to run - and on AArch64
+/// each poll is an UNCACHED DMA read, so it runs far slower than the x86 figure it was eyeballed
+/// against. Worse, `await_on_slot` looped up to 64 times around it, so the true worst case was ~19
+/// billion reads: a hang wearing a timeout's clothing.
+///
+/// This port has now been taught that lesson three times (chaos `PACE_YIELDS`, the storage
+/// `BUSY_RETRIES`, and this). The tell is always the same: **a bound whose real value depends on how
+/// fast the loop happens to run.** Bound by the clock and report seconds.
+///
+/// 30 s is deliberately generous, for the reason the predecessor's 2 s budget was not: a stick doing
+/// an internal block remap legitimately stops answering for seconds, and aborting a command it is
+/// still working on is what CAUSED the wedges that recovery was then built to clean up.
+const XFER_TIMEOUT_MS: u64 = 30_000;
+
+/// Poll iterations per `next_event` call. Small on purpose: it is only the granularity at which the
+/// CLOCK is re-checked, never the bound itself.
+const POLL_GRANULARITY: u32 = 4096;
+
+/// Unrelated transfer events tolerated while waiting for ours. Bounds an event storm (a keyboard
+/// held down) without bounding the WAIT, which is the clock's job.
+const MAX_UNRELATED_EVENTS: u32 = 4096;
 
 /// A bulk endpoint's transfer ring: a one-page producer cursor with a Link TRB at the tail.
 ///
@@ -186,9 +204,16 @@ impl Disk {
 ///
 /// A keyboard's interrupt endpoint stays ARMED, so its completions arrive at any time - including in
 /// the middle of a disk command. Matching on slot is what keeps a keystroke from being read as this
-/// transfer's status. Returns the completion code, or `None` if nothing arrived in the budget.
+/// transfer's status. Returns the completion code, or `None` if the device did not answer inside
+/// `XFER_TIMEOUT_MS`.
+///
+/// The bound is the CLOCK. Two things are counted as well, and neither is the timeout: the poll
+/// granularity (how often the clock is re-read) and the number of unrelated events tolerated (an
+/// event storm must not livelock this loop, §26.6). Mixing those up is what produced a 19-billion-
+/// iteration "timeout" in the first draft.
 #[allow(clippy::too_many_arguments)]
 fn await_on_slot(
+    ctx: &ServiceContext,
     dma: &Dma,
     mmio: &Mmio,
     ir0: usize,
@@ -197,10 +222,10 @@ fn await_on_slot(
     ev_cycle: &mut u32,
     eaten: &mut u32,
 ) -> Option<u32> {
-    // Bounded: at most this many unrelated events before we give up rather than spin forever on a
-    // storm (§26.6 - every device loop is bounded).
-    for _ in 0..64 {
-        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, XFER_TRIES) {
+    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(XFER_TIMEOUT_MS));
+    let mut unrelated = 0u32;
+    loop {
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, POLL_GRANULARITY) {
             Some((TRB_TRANSFER_EVENT, cc, sid)) if sid == slot => return Some(cc),
             // Another device's transfer completed (a keystroke). Record it so the caller can re-arm
             // that endpoint - its in-flight TRB is spent - and keep waiting for ours.
@@ -208,12 +233,23 @@ fn await_on_slot(
                 if sid < 32 {
                     *eaten |= 1 << sid;
                 }
+                unrelated += 1;
+                if unrelated >= MAX_UNRELATED_EVENTS {
+                    ctx.log("xhci: gave up waiting for a disk transfer - too many unrelated events");
+                    return None;
+                }
             }
             Some(_) => {} // port change or command completion; not ours
-            None => return None,
+            None => {}    // this poll window saw nothing; the clock below decides whether to stop
+        }
+        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+            ctx.log_fmt(format_args!(
+                "xhci: disk transfer got no completion in {} s - the device stopped answering",
+                XFER_TIMEOUT_MS / 1000
+            ));
+            return None;
         }
     }
-    None
 }
 
 /// One Bulk-Only Transport command: CBW out, optional data, CSW in.
@@ -223,6 +259,7 @@ fn await_on_slot(
 /// an OUT and reads it after an IN.
 #[allow(clippy::too_many_arguments)]
 pub fn bot(
+    ctx: &ServiceContext,
     dma: &Dma,
     mmio: &Mmio,
     dboff: usize,
@@ -257,7 +294,7 @@ pub fn bot(
 
     d.out_ring.push(dma, dma.phys_at(CMD_PAGE), 31);
     mmio.write32(dboff + d.slot as usize * 4, d.out_dci);
-    let cc = await_on_slot(dma, mmio, ir0, d.slot, ev_idx, ev_cycle, eaten)?;
+    let cc = await_on_slot(ctx, dma, mmio, ir0, d.slot, ev_idx, ev_cycle, eaten)?;
     if cc != 1 && cc != 13 {
         return None;
     }
@@ -271,7 +308,7 @@ pub fn bot(
         };
         ring.push(dma, dma.phys_at(DATA_BUF), data_len);
         mmio.write32(dboff + d.slot as usize * 4, dci);
-        let cc = await_on_slot(dma, mmio, ir0, d.slot, ev_idx, ev_cycle, eaten)?;
+        let cc = await_on_slot(ctx, dma, mmio, ir0, d.slot, ev_idx, ev_cycle, eaten)?;
         // 13 is Short Packet: the device sent less than asked, which for a data stage is normal.
         if cc != 1 && cc != 13 {
             return None;
@@ -280,7 +317,7 @@ pub fn bot(
 
     d.in_ring.push(dma, dma.phys_at(CSW_OFF), 13);
     mmio.write32(dboff + d.slot as usize * 4, d.in_dci);
-    let cc = await_on_slot(dma, mmio, ir0, d.slot, ev_idx, ev_cycle, eaten)?;
+    let cc = await_on_slot(ctx, dma, mmio, ir0, d.slot, ev_idx, ev_cycle, eaten)?;
     if cc != 1 && cc != 13 {
         return None;
     }
@@ -295,6 +332,7 @@ pub fn bot(
 /// SCSI TEST UNIT READY - is the medium present and the device willing?
 #[allow(clippy::too_many_arguments)]
 pub fn test_unit_ready(
+    ctx: &ServiceContext,
     dma: &Dma,
     mmio: &Mmio,
     dboff: usize,
@@ -306,6 +344,7 @@ pub fn test_unit_ready(
 ) -> bool {
     let cmd = [0u8; 6];
     bot(
+        ctx,
         dma, mmio, dboff, ir0, d, &cmd, 0, true, ev_idx, ev_cycle, eaten,
     ) == Some(0)
 }
@@ -317,6 +356,7 @@ pub fn test_unit_ready(
 /// believes in one the device does not have.
 #[allow(clippy::too_many_arguments)]
 pub fn read_capacity(
+    ctx: &ServiceContext,
     dma: &Dma,
     mmio: &Mmio,
     dboff: usize,
@@ -328,6 +368,7 @@ pub fn read_capacity(
 ) -> Option<u64> {
     let cmd = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     if bot(
+        ctx,
         dma, mmio, dboff, ir0, d, &cmd, 8, true, ev_idx, ev_cycle, eaten,
     ) != Some(0)
     {
@@ -345,6 +386,7 @@ pub fn read_capacity(
 /// SCSI READ(10) into the data buffer. `count` sectors, at most `MAX_XFER / SECTOR`.
 #[allow(clippy::too_many_arguments)]
 pub fn read10(
+    ctx: &ServiceContext,
     dma: &Dma,
     mmio: &Mmio,
     dboff: usize,
@@ -356,7 +398,11 @@ pub fn read10(
     ev_cycle: &mut u32,
     eaten: &mut u32,
 ) -> bool {
-    if count == 0 || count * SECTOR > MAX_XFER || lba > u32::MAX as u64 {
+    // `count * SECTOR` is checked as a DIVISION, not a multiplication: `count` is attacker- or
+    // caller-supplied and `count * SECTOR` overflows u32 above 8388608, wrapping to a SMALL value
+    // that sails through a naive bound. The command would then name one length and the data stage
+    // transfer another - a protocol desync, not a rejected request.
+    if count == 0 || count > MAX_XFER / SECTOR || lba > u32::MAX as u64 {
         return false;
     }
     let l = lba as u32;
@@ -373,6 +419,7 @@ pub fn read10(
         0,
     ];
     bot(
+        ctx,
         dma,
         mmio,
         dboff,
@@ -390,6 +437,7 @@ pub fn read10(
 /// SCSI WRITE(10) from the data buffer, which the caller fills first via `data_write`.
 #[allow(clippy::too_many_arguments)]
 pub fn write10(
+    ctx: &ServiceContext,
     dma: &Dma,
     mmio: &Mmio,
     dboff: usize,
@@ -401,7 +449,11 @@ pub fn write10(
     ev_cycle: &mut u32,
     eaten: &mut u32,
 ) -> bool {
-    if count == 0 || count * SECTOR > MAX_XFER || lba > u32::MAX as u64 {
+    // `count * SECTOR` is checked as a DIVISION, not a multiplication: `count` is attacker- or
+    // caller-supplied and `count * SECTOR` overflows u32 above 8388608, wrapping to a SMALL value
+    // that sails through a naive bound. The command would then name one length and the data stage
+    // transfer another - a protocol desync, not a rejected request.
+    if count == 0 || count > MAX_XFER / SECTOR || lba > u32::MAX as u64 {
         return false;
     }
     let l = lba as u32;
@@ -418,6 +470,7 @@ pub fn write10(
         0,
     ];
     bot(
+        ctx,
         dma,
         mmio,
         dboff,
@@ -440,6 +493,7 @@ pub fn write10(
 /// deliver.
 #[allow(clippy::too_many_arguments)]
 pub fn sync_cache(
+    ctx: &ServiceContext,
     dma: &Dma,
     mmio: &Mmio,
     dboff: usize,
@@ -451,6 +505,7 @@ pub fn sync_cache(
 ) -> bool {
     let cmd = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     bot(
+        ctx,
         dma, mmio, dboff, ir0, d, &cmd, 0, true, ev_idx, ev_cycle, eaten,
     ) == Some(0)
 }
@@ -577,6 +632,7 @@ pub const STATUS_ERR: u8 = 1;
 /// (§26.7 - a failure has to be visible, and an answer that never comes is the least visible kind).
 #[allow(clippy::too_many_arguments)]
 pub fn serve_block(
+    ctx: &ServiceContext,
     dma: &Dma,
     mmio: &Mmio,
     dboff: usize,
@@ -607,7 +663,7 @@ pub fn serve_block(
             // buffer, so without SYNCHRONIZE CACHE a reset loses the tail of everything just
             // written. Its outcome is reported, never assumed (§6.1, the backend-conditional
             // durability amendment).
-            out[0] = if sync_cache(dma, mmio, dboff, ir0, d, ev_idx, ev_cycle, eaten) {
+            out[0] = if sync_cache(ctx, dma, mmio, dboff, ir0, d, ev_idx, ev_cycle, eaten) {
                 STATUS_OK
             } else {
                 STATUS_ERR
@@ -621,7 +677,7 @@ pub fn serve_block(
             let lba = u64::from_le_bytes([
                 req[1], req[2], req[3], req[4], req[5], req[6], req[7], req[8],
             ]);
-            if read10(dma, mmio, dboff, ir0, d, lba, 1, ev_idx, ev_cycle, eaten) {
+            if read10(ctx, dma, mmio, dboff, ir0, d, lba, 1, ev_idx, ev_cycle, eaten) {
                 out[0] = STATUS_OK;
                 for i in 0..SECTOR as usize {
                     out[1 + i] = data_read8(dma, i);
@@ -638,7 +694,7 @@ pub fn serve_block(
             for i in 0..SECTOR as usize {
                 data_write8(dma, i, req[9 + i]);
             }
-            out[0] = if write10(dma, mmio, dboff, ir0, d, lba_of(req), 1, ev_idx, ev_cycle, eaten) {
+            out[0] = if write10(ctx, dma, mmio, dboff, ir0, d, lba_of(req), 1, ev_idx, ev_cycle, eaten) {
                 STATUS_OK
             } else {
                 STATUS_ERR
@@ -656,12 +712,17 @@ pub fn serve_block(
             for i in 0..SECTOR as usize {
                 data_write8(dma, i, 0);
             }
+            // The count comes off the wire, so it gets a CEILING of its own. "Bounded by the
+            // request" is not a bound - it delegates the limit to the caller, and each iteration
+            // here is a command that may itself wait out the full transfer timeout. A `u64::MAX`
+            // would be indistinguishable from a hang. The disk's own size is the honest ceiling: no
+            // legitimate zeroing extends past the last sector.
+            if count > d.sectors.saturating_sub(lba) {
+                return 1;
+            }
             let mut ok = true;
-            // Bounded by the request, and the request comes from `fs` zeroing a known extent. Each
-            // iteration is one awaited command, so a device that stops answering ends the loop
-            // through the transfer budget rather than spinning here.
             for i in 0..count {
-                if !write10(dma, mmio, dboff, ir0, d, lba + i, 1, ev_idx, ev_cycle, eaten) {
+                if !write10(ctx, dma, mmio, dboff, ir0, d, lba + i, 1, ev_idx, ev_cycle, eaten) {
                     ok = false;
                     break;
                 }
