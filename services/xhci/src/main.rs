@@ -1050,6 +1050,40 @@ fn read_config_and_bind(
     )
 }
 
+/// Answer a received message IF it is a block-IPC request; otherwise let it go.
+///
+/// The discriminator is the **reply cap**, not the payload. An interrupt wakeup from the kernel
+/// carries no reply cap and nothing that needs answering, so it is discarded exactly as before; a
+/// `request_with_reply` from `block-driver` carries one, and something is blocked awaiting the
+/// answer. Guessing from the payload instead would mean an interrupt wakeup whose first byte
+/// happened to be 1 got treated as a sector read.
+///
+/// NOTE on the shared event ring: serving a request consumes transfer events, and a HID completion
+/// that lands in that window is recorded as "eaten" by `await_on_slot` - the same rare dropped
+/// keystroke the hub port-status poll can already cause. It is a lost report, not a stalled
+/// endpoint, and it is the honest cost of one event ring shared by input and storage.
+#[allow(clippy::too_many_arguments)]
+fn serve_if_block(
+    ctx: &ServiceContext,
+    dma: &Dma,
+    mmio: &Mmio,
+    dboff: usize,
+    ir0: usize,
+    disk: &mut Option<msc::Disk>,
+    msg: &godspeed_sdk::Message,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+) {
+    let Some(reply) = ctx.take_pending_cap() else { return };
+    let mut out = [0u8; 520];
+    let mut eaten = 0u32;
+    let n = msc::serve_block(
+        dma, mmio, dboff, ir0, disk, msg.payload_bytes(), &mut out, ev_idx, ev_cycle, &mut eaten,
+    );
+    let _ = ctx.send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n]));
+    ctx.remove_cap(reply);
+}
+
 /// Configure an addressed mass-storage device's two BULK endpoints and read its geometry.
 ///
 /// The shape mirrors the HID path exactly - one Configure Endpoint carrying the slot context plus the
@@ -2332,9 +2366,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             } else {
                 base.saturating_mul(25)
             };
-            let _ = ctx.recv_timeout(deadline);
+            // This is the driver's idle point, and therefore where block requests are answered.
+            // Both the timed wait and the drain below used to DISCARD whatever arrived, which was
+            // right when every message was an interrupt wakeup carrying no information. A block
+            // request is not that: it carries a reply cap, and dropping it would hang the caller
+            // forever on a disk that was working. `serve_if_block` tells them apart by that cap.
+            if let Some(m) = ctx.recv_timeout(deadline) {
+                serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle);
+            }
             // Drain any further queued interrupt-event IPCs (an MSI-X mid-processing must not pile up).
-            while ctx.try_recv().is_some() {}
+            while let Some(m) = ctx.try_recv() {
+                serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle);
+            }
             // Ack the interrupter (clear IP, keep IE) BEFORE draining the ring, so an event
             // arriving mid-drain re-sets IP and re-arms a fresh MSI-X (no missed events).
             mmio.write32(ir0 + 0x00, IMAN_IE | IMAN_IP);

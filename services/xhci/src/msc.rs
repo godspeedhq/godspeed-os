@@ -545,3 +545,136 @@ pub fn parse_msc(dma: &Dma, buf_off: usize, buf_len: usize) -> Option<MscInfo> {
         None
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Block-IPC server
+// ---------------------------------------------------------------------------------------------
+//
+// This is what makes the userspace disk REACHABLE. Reading sectors is useless if nothing can ask
+// for one, and until now the only way to reach a USB disk was the four `usb_disk_*` syscalls -
+// which exist solely to expose the IN-KERNEL stack. Serving the block protocol here is what lets
+// those syscalls, and the stack behind them, be deleted.
+//
+// The wire protocol is EXACTLY the one `block-driver` already speaks to `fs`, deliberately: `fs`
+// does not learn that its disk moved out of the kernel, and `block-driver` translates nothing. The
+// chain becomes fs -> block-driver -> xhci -> device, with the same bytes at every hop.
+
+/// Block-IPC opcodes. These are not ours to choose - they must match `block-driver`'s constants,
+/// because the whole point is that this speaks the protocol that already exists.
+pub const OP_READ_BLOCK: u8 = 1;
+pub const OP_WRITE_BLOCK: u8 = 2;
+pub const OP_CAPACITY: u8 = 3;
+pub const OP_WRITE_ZEROS: u8 = 4;
+pub const OP_FLUSH: u8 = 5;
+pub const STATUS_OK: u8 = 0;
+pub const STATUS_ERR: u8 = 1;
+
+/// Build the reply for one block-IPC request, into `out`, returning how many bytes of it are valid.
+///
+/// Returns `STATUS_ERR` rather than nothing whenever the request cannot be honoured - a malformed
+/// request, no disk attached, or a device that failed. A caller blocked awaiting a reply must always
+/// get one; silently dropping the request would hang `fs` on a disk that merely returned an error
+/// (§26.7 - a failure has to be visible, and an answer that never comes is the least visible kind).
+#[allow(clippy::too_many_arguments)]
+pub fn serve_block(
+    dma: &Dma,
+    mmio: &Mmio,
+    dboff: usize,
+    ir0: usize,
+    disk: &mut Option<Disk>,
+    req: &[u8],
+    out: &mut [u8; 520],
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    eaten: &mut u32,
+) -> usize {
+    out[0] = STATUS_ERR;
+    if req.is_empty() {
+        return 1;
+    }
+    let Some(d) = disk.as_mut() else {
+        return 1; // no disk bound - a defined error, not a hang
+    };
+
+    match req[0] {
+        OP_CAPACITY => {
+            out[0] = STATUS_OK;
+            out[1..9].copy_from_slice(&d.sectors.to_le_bytes());
+            9
+        }
+        OP_FLUSH => {
+            // The one command a stick genuinely needs: it acknowledges a WRITE(10) into its own
+            // buffer, so without SYNCHRONIZE CACHE a reset loses the tail of everything just
+            // written. Its outcome is reported, never assumed (§6.1, the backend-conditional
+            // durability amendment).
+            out[0] = if sync_cache(dma, mmio, dboff, ir0, d, ev_idx, ev_cycle, eaten) {
+                STATUS_OK
+            } else {
+                STATUS_ERR
+            };
+            1
+        }
+        OP_READ_BLOCK => {
+            if req.len() < 9 {
+                return 1;
+            }
+            let lba = u64::from_le_bytes([
+                req[1], req[2], req[3], req[4], req[5], req[6], req[7], req[8],
+            ]);
+            if read10(dma, mmio, dboff, ir0, d, lba, 1, ev_idx, ev_cycle, eaten) {
+                out[0] = STATUS_OK;
+                for i in 0..SECTOR as usize {
+                    out[1 + i] = data_read8(dma, i);
+                }
+                1 + SECTOR as usize
+            } else {
+                1
+            }
+        }
+        OP_WRITE_BLOCK => {
+            if req.len() < 9 + SECTOR as usize {
+                return 1;
+            }
+            for i in 0..SECTOR as usize {
+                data_write8(dma, i, req[9 + i]);
+            }
+            out[0] = if write10(dma, mmio, dboff, ir0, d, lba_of(req), 1, ev_idx, ev_cycle, eaten) {
+                STATUS_OK
+            } else {
+                STATUS_ERR
+            };
+            1
+        }
+        OP_WRITE_ZEROS => {
+            if req.len() < 17 {
+                return 1;
+            }
+            let lba = lba_of(req);
+            let count = u64::from_le_bytes([
+                req[9], req[10], req[11], req[12], req[13], req[14], req[15], req[16],
+            ]);
+            for i in 0..SECTOR as usize {
+                data_write8(dma, i, 0);
+            }
+            let mut ok = true;
+            // Bounded by the request, and the request comes from `fs` zeroing a known extent. Each
+            // iteration is one awaited command, so a device that stops answering ends the loop
+            // through the transfer budget rather than spinning here.
+            for i in 0..count {
+                if !write10(dma, mmio, dboff, ir0, d, lba + i, 1, ev_idx, ev_cycle, eaten) {
+                    ok = false;
+                    break;
+                }
+            }
+            out[0] = if ok { STATUS_OK } else { STATUS_ERR };
+            1
+        }
+        _ => 1,
+    }
+}
+
+fn lba_of(req: &[u8]) -> u64 {
+    u64::from_le_bytes([
+        req[1], req[2], req[3], req[4], req[5], req[6], req[7], req[8],
+    ])
+}
