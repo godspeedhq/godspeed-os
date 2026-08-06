@@ -482,15 +482,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    // Not on the ARM ports: there the USB host controller is driven IN-KERNEL (aarch64 xHCI over the
-    // PCIe root complex, arm32 DWC2), because neither routes device IRQs to userspace yet. There is no
-    // userspace driver ELF to load, so this spawn can only ever fail - and it failed LOUDLY every boot
-    // with `LoadFailed(TooSmall)`, which is a real error message for a service that was never supposed
-    // to exist here. Loud failure is right for a thing that should have worked (invariant 12); a
-    // permanent error for a thing that is not part of this architecture is just noise that trains the
-    // reader to ignore the log. When ARM routes device IRQs to userspace and the driver moves out of
-    // the kernel, this gate is what comes off.
-    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+    // Not on the arm32 port: there the USB host controller (DWC2) is driven IN-KERNEL, because that
+    // port does not route device IRQs to userspace yet. There is no userspace driver ELF to load, so
+    // this spawn can only ever fail - and it failed LOUDLY every boot with `LoadFailed(TooSmall)`,
+    // which is a real error message for a service that was never supposed to exist here. Loud failure
+    // is right for a thing that should have worked (invariant 12); a permanent error for a thing that
+    // is not part of this architecture is just noise that trains the reader to ignore the log.
+    //
+    // **aarch64 is off that list under `xhci-userspace`, which is this gate coming off.** The Pi 4's
+    // VL805 is a PCIe endpoint the kernel already discovers and BAR-assigns; with the feature the
+    // kernel publishes it in `pci::XHCI_*` and stops driving it, and the SAME service x86 has always
+    // spawned takes over - same binary, same CONSOLE_PUSH capability, same MMIO/DMA grant path. That
+    // is the point of reusing it: a second xHCI implementation would be the duplication Commandment
+    // III forbids, and this controller is standards-conformant silicon behind a standards-conformant
+    // bus, so there was nothing to reimplement.
+    //
+    // Kept as a supervisor feature rather than an unconditional aarch64 spawn because the KERNEL side
+    // is a feature too. Spawn the service without it and two drivers own one controller.
+    #[cfg(not(any(target_arch = "arm",
+                  all(target_arch = "aarch64", not(feature = "xhci-userspace")))))]
     spawn_mapped(&ctx, &mut name_map, "xhci", 0xFFFF);
 
     // ehci: USB 2.0 host-controller driver (§12) for the back ports. Same builds

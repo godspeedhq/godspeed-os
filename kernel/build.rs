@@ -133,15 +133,22 @@ fn main() {
     // Neither needed porting - they needed BUILDING and then listing HERE. Being built is not enough:
     // a service missing from this list embeds the empty placeholder however well it compiled, and the
     // boot reports `LoadFailed(TooSmall)` - which reads like a broken binary rather than an absent one.
+    // `xhci` is the userspace USB host-controller driver for the Pi 4's VL805. It is embedded
+    // unconditionally rather than behind `xhci-userspace`, and that is deliberate: an ELF the kernel
+    // carries but never spawns costs image bytes and nothing else, whereas a service the supervisor
+    // spawns and the kernel embedded as a PLACEHOLDER fails with `LoadFailed(TooSmall)` - which reads
+    // like a broken binary rather than a build-list omission, and is exactly the trap this comment
+    // block warns about two paragraphs up. Cheap insurance against the failure mode with the worst
+    // diagnostic. The spawn is what the feature gates (`services/supervisor`), not the embedding.
     let aarch64_built: &[&str] = if aarch64_demo {
         &["logger", "ping", "pong", "supervisor", "shell", "chaos", "observe", "mem-pressure",
-          "block-driver", "fs", "nic-driver", "net-stack",
+          "block-driver", "fs", "nic-driver", "net-stack", "xhci",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     } else {
         // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
         // carnage, and observe is how it is watched while it does. Both are arch-neutral.
         &["logger", "supervisor", "shell", "chaos", "observe", "mem-pressure",
-          "block-driver", "fs", "nic-driver", "net-stack",
+          "block-driver", "fs", "nic-driver", "net-stack", "xhci",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     };
     let aarch64_dir = workspace

@@ -26,10 +26,11 @@ accidentally produce a non-Pi image:
 
     python scripts/pi4_build.py --features pi4-sched-demo
 
-`--genet-userspace` is separate from `--features` because it has to reach TWO crates: the kernel (stop
-driving GENET) and the `nic-driver` service (start driving it). See where it is handled below.
+`--xhci-userspace` is separate from `--features` because it has to reach TWO
+crates: the kernel (stop driving the VL805) and the `supervisor` (start spawning
+the `xhci` service that drives it instead). See where it is handled below.
 
-usage:  python scripts/pi4_build.py [--debug] [--features a,b] [--genet-userspace]
+usage:  python scripts/pi4_build.py [--debug] [--features a,b] [--xhci-userspace]
 """
 import subprocess, sys, os, pathlib, re
 
@@ -78,6 +79,11 @@ PI4_SERVICES = [
     # BUILDING, and until they were on this list the kernel embedded an empty placeholder and every
     # boot reported `LoadFailed(TooSmall)`.
     "nic-driver", "net-stack",
+    # The userspace USB host-controller driver for the VL805. Built on EVERY invocation, not only
+    # under --xhci-userspace, for the reason `kernel/build.rs` gives at its own list: an unspawned ELF
+    # in the image costs bytes, while a spawned service the kernel embedded as a placeholder fails
+    # with `LoadFailed(TooSmall)` - a diagnostic that points at the binary rather than at the list.
+    "xhci",
     # The pipe/IPC example services the shell composes (`roster | shell`, `greet`, `upper`, ...). All
     # arch-neutral SDK users - they needed building, not porting - and selfcheck exercises them, so a
     # missing one is 30 FAIL lines that look like a broken pipe implementation rather than an absent
@@ -95,25 +101,30 @@ if "--features" in sys.argv:
         sys.exit("--features needs a comma-separated list")
     FEATURES = "pi4,pi4-smp," + sys.argv[i + 1]
 
-# --genet-userspace: take the ethernet driver OUT of the kernel and run it in the `nic-driver` service.
+# --xhci-userspace: take the USB stack OUT of the kernel and run it in the `xhci` service.
 #
 # The feature has the same name in two crates and BOTH have to get it. The kernel's copy stops the
-# kernel from driving GENET; the service's copy makes the service drive it. Set only one and you get
-# either two drivers fighting over one MAC or no driver at all - a footgun with no diagnostic, because
-# both halves build and boot perfectly well on their own. That is exactly why it is one flag here
-# rather than two features to remember, and why it is not left to `--features` (which reaches only the
-# kernel).
-GENET_USERSPACE = "--genet-userspace" in sys.argv
-if GENET_USERSPACE:
-    FEATURES += ",genet-userspace"
+# kernel from driving the VL805 (and publishes the BAR its PCIe scan found, so the spawn path can hand
+# it over); the supervisor's copy makes it spawn the service that drives it instead. Set only one and
+# you get either two drivers fighting over one host controller or no driver at all - a footgun with no
+# diagnostic, because both halves build and boot perfectly well on their own. That is exactly why it
+# is one flag here rather than two features to remember, and why it is not left to `--features` (which
+# reaches only the kernel).
+#
+# It costs USB MASS STORAGE, and that is not a bug to be found later: the `xhci` service is HID-only,
+# so with the in-kernel stack idle nothing implements Bulk-Only Transport and `block-driver` reports
+# no disk. The kernel says so on the boot line next to "left to the xhci SERVICE".
+XHCI_USERSPACE = "--xhci-userspace" in sys.argv
+if XHCI_USERSPACE:
+    FEATURES += ",xhci-userspace"
 
 rel = ["--release"] if PROFILE == "release" else []
 
 # 1. The services first - the kernel embeds their ELFs, so a stale service is baked into the image.
 for svc in PI4_SERVICES:
     feats = ["--features", "bare-metal"] if svc == "supervisor" else []
-    if svc == "nic-driver" and GENET_USERSPACE:
-        feats = ["--features", "genet-userspace"]
+    if svc == "supervisor" and XHCI_USERSPACE:
+        feats = ["--features", "bare-metal,xhci-userspace"]
     run(["cargo", "build", "-p", svc, "--target", TARGET] + feats + rel)
 
 # 2. The kernel.

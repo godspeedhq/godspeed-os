@@ -15,6 +15,12 @@ path = "src/main.rs"
 # (bare-metal USB) so core 0 is not loaded with harness-driven probes that
 # require the QEMU control port to complete (e.g. probe-4b, probe-hog).
 bare-metal = []
+# Spawn the `xhci` service on aarch64 (the Pi 4's VL805 over PCIe), which is otherwise skipped there
+# because the USB stack lives in the kernel. Must be enabled TOGETHER with the KERNEL feature of the
+# same name, which is what stops the kernel from also driving the controller; enabling one alone
+# leaves either two drivers on one host controller or none. `scripts/pi4_build.py --xhci-userspace`
+# passes both, which is the only supported way to turn it on.
+xhci-userspace = []
 # Additionally spawn `block-driver` (persistence smoke test, docs/persistence.md
 # Phase 1). Combined with `bare-metal` by `osdev test blockdev`, which attaches a
 # disk on the ATA secondary channel; block-driver reads sector 0 and logs it.
