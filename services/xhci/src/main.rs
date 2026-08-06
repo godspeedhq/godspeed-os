@@ -10,6 +10,11 @@
 
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
+/// USB mass storage (Bulk-Only Transport + SCSI). Split out because it is a self-contained protocol
+/// on top of the bulk endpoints this file configures - and because it is the capability whose absence
+/// kept a USB stack in the kernel.
+mod msc;
+
 // Capability registers (BAR + 0).
 const CAP_CAPLEN_VERSION: usize = 0x00;
 const CAP_HCSPARAMS1: usize = 0x04;
@@ -160,18 +165,18 @@ fn dev_sig(d: &Hid) -> u32 {
 }
 
 const EVENT_RING_TRBS: usize = 16;
-const TRB_SIZE: usize = 16;
+pub(crate) const TRB_SIZE: usize = 16;
 
-const TRB_NORMAL: u32 = 1;
+pub(crate) const TRB_NORMAL: u32 = 1;
 const TRB_SETUP_STAGE: u32 = 2;
 const TRB_DATA_STAGE: u32 = 3;
 const TRB_STATUS_STAGE: u32 = 4;
-const TRB_LINK: u32 = 6;
+pub(crate) const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_DISABLE_SLOT: u32 = 10;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
-const TRB_TRANSFER_EVENT: u32 = 32;
+pub(crate) const TRB_TRANSFER_EVENT: u32 = 32;
 const TRB_CMD_COMPLETION: u32 = 33;
 const TRB_PORT_STATUS_CHANGE: u32 = 34;
 
@@ -311,7 +316,7 @@ fn idle(ctx: &ServiceContext) -> ! {
 /// it is fully non-blocking - otherwise, while a key is held (no new transfer events),
 /// this would busy-spin millions of times before returning `None`, starving the
 /// typematic auto-repeat poll at the bottom of the loop.
-fn next_event(
+pub(crate) fn next_event(
     dma: &Dma,
     mmio: &Mmio,
     ir0: usize,
@@ -647,7 +652,7 @@ fn read_config_and_bind(
     slot: u32, dev_idx: usize, speed: u32, port: u32,
     route: u32, root_port: u32, parent_slot: u32, parent_port: u32, ttt: u32,
     ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
-) -> (Option<Hid>, u8) {
+) -> (Option<Hid>, Option<msc::Disk>, u8) {
     // Get Configuration Descriptor (64 bytes) at EP0 ring offset 48 - contiguous after the 3-TRB
     // device-descriptor read at offset 0 - then walk it for the boot-HID interrupt-IN endpoint.
     let cfg_phys = dma.phys_at(CONFIG_BUF_OFF);
@@ -675,7 +680,7 @@ fn read_config_and_bind(
     }
     if !cfg_ok {
         ctx.log("xhci: Get Config Descriptor failed");
-        return (None, 0);
+        return (None, None, 0);
     }
     // Walk config -> interface -> endpoint; bind the boot keyboard (class 3, proto 1) or mouse
     // (proto 2) interface's interrupt-IN endpoint, not whichever endpoint comes last.
@@ -717,8 +722,19 @@ fn read_config_and_bind(
         i += blen;
     }
     if ep_addr == 0 {
-        // No boot-HID interrupt-IN endpoint: a hub (caller walks it with cfg_val) or a non-HID device.
-        return (None, cfg_val);
+        // No boot-HID interrupt-IN endpoint. Before giving up on the device, check whether it is a
+        // MASS-STORAGE one - that is the capability whose absence kept a USB stack in the kernel, so
+        // "not a keyboard" must no longer mean "not ours".
+        if let Some(m) = msc::parse_msc(dma, CONFIG_BUF_OFF, 64) {
+            let disk = bind_msc(
+                ctx, dma, mmio, dboff, ir0, ctx_size, slot, dev_idx, speed, port,
+                route, root_port, parent_slot, parent_port, ttt, &m,
+                ev_idx, ev_cycle, cmd_idx,
+            );
+            return (None, disk, cfg_val);
+        }
+        // A hub (the caller walks it with cfg_val) or a device this driver does not speak for.
+        return (None, None, cfg_val);
     }
     let is_mouse = hid_proto == 2;
     let ep_num = (ep_addr & 0x0F) as u32;
@@ -804,7 +820,128 @@ fn read_config_and_bind(
     dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | 1);
 
     // hub_* default to 0/direct; the downstream caller patches them for a device behind a hub.
-    (Some(Hid { slot, dci, port, idx: dev_idx, is_mouse, hub_slot: 0, hub_dev: 0, hub_port: 0, hub_off: 0, hub_nports: 0 }), cfg_val)
+    (Some(Hid { slot, dci, port, idx: dev_idx, is_mouse, hub_slot: 0, hub_dev: 0, hub_port: 0, hub_off: 0, hub_nports: 0 }), None, cfg_val)
+}
+
+/// Configure an addressed mass-storage device's two BULK endpoints and read its geometry.
+///
+/// The shape mirrors the HID path exactly - one Configure Endpoint carrying the slot context plus the
+/// endpoints being added, then Set Configuration - with two differences that matter:
+///
+/// * **Two endpoints in one command, not one.** Bulk transport needs both directions, and adding them
+///   in a single Configure Endpoint is what keeps the device's context consistent; adding them in two
+///   commands would leave a window where the device is half-configured.
+/// * **Endpoint type is directional.** Bulk OUT is type 2 and bulk IN is type 6 (xHCI 6.2.3). Getting
+///   this wrong does not fail loudly - it configures a pipe that accepts TRBs and never completes them.
+///
+/// Returns the bound `Disk` only if it also answered READ CAPACITY, because a disk whose size is
+/// unknown is not usable and reporting one as present would push the failure to the first read.
+#[allow(clippy::too_many_arguments)]
+fn bind_msc(
+    ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize, ctx_size: usize,
+    slot: u32, dev_idx: usize, speed: u32, port: u32,
+    route: u32, root_port: u32, parent_slot: u32, parent_port: u32, ttt: u32,
+    m: &msc::MscInfo,
+    ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
+) -> Option<msc::Disk> {
+    let mut disk = msc::Disk::new(slot, m.out_ep, m.in_ep, port);
+    let (out_dci, in_dci) = (disk.out_dci(), disk.in_dci());
+    let max_dci = out_dci.max(in_dci);
+    ctx.log_fmt(format_args!(
+        "xhci: USB mass storage on port {} (slot {}, bulk OUT DCI {} / IN DCI {}, mps={})",
+        port, slot, out_dci, in_dci, m.mps
+    ));
+
+    // Input context: add the slot plus BOTH bulk endpoints.
+    let islot = INPUT_CTX_OFF + ctx_size;
+    dma.write32(INPUT_CTX_OFF, 0); // Drop flags
+    dma.write32(INPUT_CTX_OFF + 4, 1 | (1 << out_dci) | (1 << in_dci));
+    dma.write32(islot, (max_dci << 27) | (speed << 20) | (route & 0xFFFFF));
+    dma.write32(islot + 4, root_port << 16);
+    let tt = if speed == 1 || speed == 2 {
+        (parent_slot & 0xFF) | ((parent_port & 0xFF) << 8) | ((ttt & 0x3) << 16)
+    } else {
+        0
+    };
+    dma.write32(islot + 8, tt);
+
+    // Endpoint contexts. Interval is 0 for bulk (it is not a periodic endpoint); CErr = 3 is the
+    // standard retry count; Average TRB Length is the max packet size, which is what BOT transfers
+    // are built from.
+    for (dci, ep_type) in [(out_dci, 2u32), (in_dci, 6u32)] {
+        let ring = if ep_type == 2 { disk.out_ring_phys(dma) } else { disk.in_ring_phys(dma) };
+        let iep = INPUT_CTX_OFF + (1 + dci as usize) * ctx_size;
+        dma.write32(iep, 0);
+        dma.write32(iep + 4, (3 << 1) | (ep_type << 3) | ((m.mps as u32) << 16));
+        // Bit 0 is the Dequeue Cycle State, which must match the ring's initial producer cycle (1).
+        dma.write32(iep + 8, (ring as u32 & !0xF) | 1);
+        dma.write32(iep + 12, (ring >> 32) as u32);
+        dma.write32(iep + 16, m.mps as u32);
+    }
+
+    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    *cmd_idx += 1;
+    let in_phys = dma.phys_at(INPUT_CTX_OFF);
+    let ce = run_command(
+        ctx, dma, mmio, dboff, ir0, cmd_off,
+        in_phys as u32, (in_phys >> 32) as u32, 0,
+        (TRB_CONFIGURE_ENDPOINT << 10) | (slot << 24) | 1,
+        ev_idx, ev_cycle,
+    )
+    .map(|(c, _)| c)
+    .unwrap_or(0);
+    if ce != 1 {
+        ctx.log_fmt(format_args!(
+            "xhci: mass storage Configure Endpoint failed (completion={}) - disk not bound", ce
+        ));
+        return None;
+    }
+
+    // Set Configuration at EP0 ring offset 96, past the 3-TRB config-descriptor read at 48.
+    if !control(
+        dma, mmio, dboff, ir0, slot, dev_idx, 96,
+        ev_idx, ev_cycle, 0x00, 9, m.cfg_value as u32, 0, 0, 0,
+    ) {
+        ctx.log("xhci: mass storage Set Configuration failed - disk not bound");
+        return None;
+    }
+
+    // TEST UNIT READY is allowed to fail a few times: a stick that has just been configured is often
+    // still spinning up its controller and answers NOT READY until it is. Bounded, and the bound is a
+    // COUNT of attempts here only because each attempt already carries its own generous transfer
+    // budget - the loop cannot outlive the device's own answer.
+    let mut eaten = 0u32;
+    let mut ready = false;
+    for _ in 0..16 {
+        if msc::test_unit_ready(dma, mmio, dboff, ir0, &mut disk, ev_idx, ev_cycle, &mut eaten) {
+            ready = true;
+            break;
+        }
+    }
+    if !ready {
+        ctx.log("xhci: mass storage never reported ready - disk not bound");
+        return None;
+    }
+
+    match msc::read_capacity(dma, mmio, dboff, ir0, &mut disk, ev_idx, ev_cycle, &mut eaten) {
+        Some(n) => {
+            disk.sectors = n;
+            ctx.log_fmt(format_args!(
+                "xhci: USB disk ready - {} sectors of {} B ({} MiB)",
+                n, msc::SECTOR, (n * msc::SECTOR as u64) / (1024 * 1024)
+            ));
+            Some(disk)
+        }
+        None => {
+            // Either the command failed or the device reported a sector size this driver does not
+            // speak. Both are "unusable", and saying so beats binding a disk whose geometry is a guess.
+            ctx.log_fmt(format_args!(
+                "xhci: USB disk READ CAPACITY failed or block size is not {} - disk not bound",
+                msc::SECTOR
+            ));
+            None
+        }
+    }
 }
 
 /// Enumerate whatever is attached to root-hub `port`, binding every boot HID it finds - directly on
@@ -894,6 +1031,9 @@ fn enumerate_one(
     devs: &mut [Hid; MAX_HID],
     ndev: &mut usize,
     saw_hub: &mut bool,
+    // The bound mass-storage device, if this port produced one. An out-param rather than a return
+    // value because a port can yield a HID *and* (behind a hub) a disk - one pass, two results.
+    disk: &mut Option<msc::Disk>,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
     cmd_idx: &mut usize,
@@ -1059,10 +1199,13 @@ fn enumerate_one(
     ));
 
     // Read the config descriptor and bind if it's a boot HID (root device: route=0, parent_*=0).
-    let (bound, cfg_val) = read_config_and_bind(
+    let (bound, found_disk, cfg_val) = read_config_and_bind(
         ctx, dma, mmio, dboff, ir0, ctx_size, slot, dev_idx, speed, port,
         0, port, 0, 0, 0, ev_idx, ev_cycle, cmd_idx,
     );
+    // First disk wins. A second one is left unbound rather than silently replacing the first, which
+    // would swap the filesystem's device out from under it.
+    if disk.is_none() { *disk = found_disk; }
     if let Some(hid) = bound {
         if *ndev < MAX_HID {
             devs[*ndev] = hid;
@@ -1073,10 +1216,19 @@ fn enumerate_one(
         }
         return;
     }
+    // A device this pass bound AS THE DISK keeps its slice and its slot. Everything below tears down
+    // a device the driver has no use for, and until mass storage existed that included every disk -
+    // the old comment here said so outright ("e.g. the mass-storage boot drive"). Releasing the slot
+    // now would disable the endpoints that were just configured, so the disk would report its
+    // capacity and then answer nothing, which reads as a broken device rather than a driver that
+    // threw it away.
+    if disk.as_ref().is_some_and(|d| d.slot == slot) {
+        return;
+    }
     if dclass != 0x09 {
-        // Not a HID and not a hub (e.g. the mass-storage boot drive) - release the slice + slot.
+        // Not a HID, not a hub, and not a disk - release the slice + slot so neither leaks.
         ctx.log_fmt(format_args!(
-            "xhci: port {} device has no interrupt-IN endpoint (not a keyboard/mouse)",
+            "xhci: port {} device is not a keyboard, mouse, hub or disk - releasing it",
             port
         ));
         sa.free(dev_idx);
@@ -1189,10 +1341,11 @@ fn enumerate_one(
                 }
                 // Bind it exactly like a root-port HID, but with the route string + parent-TT so its
                 // slot context keeps routing through the hub.
-                let (dbound, _) = read_config_and_bind(
+                let (dbound, d_disk, _) = read_config_and_bind(
                     ctx, dma, mmio, dboff, ir0, ctx_size, dslot, d_idx, dspeed, port,
                     dp as u32 & 0xF, port, slot, dp as u32, ttt, ev_idx, ev_cycle, cmd_idx,
                 );
+                if disk.is_none() { *disk = d_disk; }
                 match dbound {
                     Some(mut hid) => {
                         ctx.log_fmt(format_args!(
@@ -1423,6 +1576,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut ndev = 0usize;
         let mut sa = SliceAlloc::new();
         let mut saw_hub = false;
+        // Re-declared per enumeration pass, alongside the HID array and the slice allocator, for the
+        // same reason they are: a pass re-inits the controller, so every slot, ring and context from
+        // the previous one is gone. Carrying a Disk across would leave it pointing at a slot the
+        // controller no longer has.
+        let mut disk: Option<msc::Disk> = None;
         let mut hc_wedged = false;
         for p in 1..=max_ports {
             if ndev >= MAX_HID { break; }
@@ -1437,7 +1595,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if p < 64 && poisoned & (1u64 << p) != 0 { continue; }
             enumerate_one(
                 &ctx, &dma, &mmio, dboff, ir0, op, ctx_size,
-                p, &mut sa, &mut devs, &mut ndev, &mut saw_hub,
+                p, &mut sa, &mut devs, &mut ndev, &mut saw_hub, &mut disk,
                 &mut ev_idx, &mut ev_cycle, &mut cmd_idx, &mut hc_wedged,
             );
             if hc_wedged {
@@ -1446,6 +1604,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ));
                 if p < 64 { poisoned |= 1u64 << p; }
                 continue 'reenum;
+            }
+        }
+
+        // If this pass bound a disk, prove the bulk path end to end before anything depends on it: a
+        // real READ(10) of sector 0, reported with what came back. A driver that reports a disk it
+        // has never successfully read from pushes the first failure into the filesystem, where it
+        // reads as corruption rather than as a driver that does not work (§26.7).
+        if let Some(d) = disk.as_mut() {
+            let mut eaten = 0u32;
+            if msc::read10(&dma, &mmio, dboff, ir0, d, 0, 1, &mut ev_idx, &mut ev_cycle, &mut eaten) {
+                // 0x55AA at offset 510 is the boot signature. Its ABSENCE is not an error - a raw or
+                // GSFS-formatted stick has no MBR - so it is reported as an observation, not a verdict.
+                let sig = (msc::data_read8(&dma, 510) as u16) | ((msc::data_read8(&dma, 511) as u16) << 8);
+                ctx.log_fmt(format_args!(
+                    "xhci: USB disk sector 0 read OK - first bytes {:02x} {:02x} {:02x} {:02x}, sig={:#06x}{}",
+                    msc::data_read8(&dma, 0), msc::data_read8(&dma, 1),
+                    msc::data_read8(&dma, 2), msc::data_read8(&dma, 3),
+                    sig,
+                    if sig == 0xAA55 { " (MBR)" } else { " (no MBR - raw or GSFS)" }
+                ));
+            } else {
+                ctx.log("xhci: USB disk sector 0 read FAILED - the disk is bound but not usable");
             }
         }
 
