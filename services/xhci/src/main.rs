@@ -1267,11 +1267,52 @@ fn bind_msc(
 /// `true` if the controller has WEDGED (Item 3, Fix 1). A wedged HC does not just fail this one command
 /// - it stops executing entirely, including an already-bound keyboard's interrupt transfers, so the
 /// caller must poison the offending port and re-initialise the controller rather than issue more doomed
+/// One-line reminder of what the dump below distinguishes, so a log reader does not have to hold the
+/// xHCI spec in their head. Kept as a constant so it cannot drift from `dump_ring_state`.
+const DIAG_HINT: &str = "command diagnosis - CRR=0 means the controller never started the command ring; TRB readback wrong means our write is not reaching RAM the device sees; EVT cycle unchanged means it never posted a completion";
+
+/// Dump the DMA-side state a "no completion" failure turns on, because USBSTS alone cannot tell the
+/// three causes apart and they need completely different fixes:
+///
+/// * **CRCR.CRR = 0** - the controller is not running the command ring at all. Our CRCR programming
+///   or the ring's physical address is wrong.
+/// * **The command TRB does not read back as written** - our stores are not landing in memory the
+///   device can see. On AArch64 that is the arena's cache attributes (it must be Device/nC), which
+///   is exactly the class that makes MMIO look perfect while every DMA silently fails.
+/// * **Both fine, event ring untouched** - the controller consumed the command and never posted a
+///   completion, or posted one we cannot see because the event ring or its cycle bit is misprogrammed.
+///
+/// This exists because the Pi 4's first userspace-USB boot failed at the very first Enable Slot with
+/// a HEALTHY controller (HCH=0 HSE=0 HCE=0), and no amount of reasoning from that line alone can
+/// choose between the three. Measure, do not guess.
+#[allow(clippy::too_many_arguments)]
+fn dump_ring_state(
+    ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, op: usize, ir0: usize,
+    cmd_off: usize, ev_idx: usize, ev_cycle: u32,
+) {
+    let crcr_lo = mmio.read32(op + OP_CRCR);
+    let dcbaap_lo = mmio.read32(op + OP_DCBAAP);
+    ctx.log_fmt(format_args!(
+        "xhci: CRCR={:#010x} (CRR={}) DCBAAP={:#010x} cmd_ring_phys={:#x}",
+        crcr_lo, (crcr_lo & (1 << 3) != 0) as u8, dcbaap_lo, dma.phys_at(CMD_RING_OFF)));
+    ctx.log_fmt(format_args!(
+        "xhci: cmd TRB @{:#x} readback {:#010x} {:#010x} {:#010x} {:#010x}",
+        cmd_off,
+        dma.read32(cmd_off), dma.read32(cmd_off + 4),
+        dma.read32(cmd_off + 8), dma.read32(cmd_off + 12)));
+    let ev = EVENT_RING_OFF + ev_idx * TRB_SIZE;
+    ctx.log_fmt(format_args!(
+        "xhci: EVT[{}] @{:#x} ctrl={:#010x} (want cycle {}) ERDP={:#010x} ev_ring_phys={:#x}",
+        ev_idx, ev, dma.read32(ev + 12), ev_cycle,
+        mmio.read32(ir0 + 0x18), dma.phys_at(EVENT_RING_OFF)));
+}
+
 /// commands. Pure diagnosis when it returns false (e.g. a device-level Transaction Error with the HC
 /// still running); the log is the breadcrumb that tells us, on the Wyse, which case a port hit.
 fn hc_wedged_now(ctx: &ServiceContext, mmio: &Mmio, op: usize) -> bool {
     let sts = mmio.read32(op + OP_USBSTS);
     let wedged = sts & STS_WEDGED != 0;
+    ctx.log_fmt(format_args!("xhci: {}", DIAG_HINT));
     ctx.log_fmt(format_args!(
         "xhci: post-command USBSTS={:#010x} (HCH={} HSE={} HCE={} CNR={}){}",
         sts,
@@ -1423,6 +1464,9 @@ fn enumerate_one(
         Some(r) => r,
         None => {
             ctx.log("xhci: Enable Slot - no completion");
+            // The FIRST command on a fresh controller. If this one gets no completion, nothing about
+            // the DMA side has ever been proven, so dump it rather than guess (see `dump_ring_state`).
+            dump_ring_state(ctx, dma, mmio, op, ir0, cmd_off, *ev_idx, *ev_cycle);
             *hc_wedged = hc_wedged_now(ctx, mmio, op);
             sa.free(dev_idx);
             return;
@@ -1886,10 +1930,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let max_slots = hcs1 & 0xFF;
     let max_ports = (hcs1 >> 24) & 0xFF;
     let hcs2 = mmio.read32(CAP_HCSPARAMS2);
-    // Max Scratchpad Buffers: HCSPARAMS2 bits [31:27] (hi) and [25:21] (lo). Real
-    // controllers need these pages allocated and DCBAA[0] pointed at the buffer
-    // array before they run; if non-zero we must set them up (§ scratchpad).
-    let max_scratch = (((hcs2 >> 27) & 0x1F) << 5) | ((hcs2 >> 21) & 0x1F);
+    // Max Scratchpad Buffers: **Hi is bits [25:21], Lo is bits [31:27]** (xHCI 1.1 Table 5-11),
+    // value = (Hi << 5) | Lo.
+    //
+    // These two were SWAPPED here, and the Pi 4 caught it: the VL805 reported `max_scratch=992` to
+    // this service while the in-kernel driver - which has the fields the right way round - refuses
+    // loudly above 512 and has always driven this board fine. Decoding 992 backwards (31<<5 | 0)
+    // gives Hi=0, Lo=31: the controller wants **31** buffers, not 992.
+    //
+    // On THIS board the mistake over-provisions and is survivable. It is still a real bug, because
+    // the error is not symmetric: a controller with Hi != 0 (say Hi=1, Lo=0, wanting 32) would be
+    // read as wanting 1, and UNDER-providing scratchpad is a controller that DMAs into memory it
+    // was never given - the failure the paragraph below is about.
+    let max_scratch = (((hcs2 >> 21) & 0x1F) << 5) | ((hcs2 >> 27) & 0x1F);
     let ctx_size = if hcc1 & (1 << 2) != 0 { 64 } else { 32 }; // CSZ
     let dboff = (mmio.read32(CAP_DBOFF) & !0x3) as usize;
     let rtsoff = (mmio.read32(CAP_RTSOFF) & !0x1F) as usize;
@@ -1990,7 +2043,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Scratchpad: build the SBA (N pointers to page-aligned buffers) and point
         // DCBAA[0] at it, so the controller has the runtime workspace it requires
         // (MaxScratchpadBufs); without it real xHCI drops devices after binding.
-        let n_scratch = (max_scratch as usize).min(MAX_SCRATCHPAD);
+        // A controller that asks for more scratchpad than we can provide must be REFUSED, not
+        // quietly short-changed: it will DMA into the buffers it thinks it owns, and the ones past
+        // our cap are memory it was never granted. Silently capping turns "unsupported controller"
+        // into "random corruption" (§26.7).
+        if max_scratch as usize > MAX_SCRATCHPAD {
+            ctx.log_fmt(format_args!(
+                "xhci: controller wants {} scratchpad buffers, this arena holds {} - REFUSING to run it rather than short-change its DMA",
+                max_scratch, MAX_SCRATCHPAD));
+            idle(&ctx);
+        }
+        let n_scratch = max_scratch as usize;
         if n_scratch > 0 {
             for i in 0..n_scratch {
                 dma.write64(

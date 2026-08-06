@@ -943,8 +943,7 @@ extern "C" fn boot_high() -> ! {
                 let _ = &dev;
                 put_str(b"xhci: controller present - left to the xhci SERVICE \
                           (kernel drives no USB, Commandment I)\r\n");
-                put_str(b"xhci: NOTE the service is HID-only, so USB mass storage is unavailable \
-                          in this build - block-driver will report no disk\r\n");
+                put_str(b"xhci: the service drives HID and mass storage; block-driver reaches the disk through it\r\n");
             }
             #[cfg(not(feature = "xhci-userspace"))]
             xhci::init(dev.bar0, dev.bar0_len);

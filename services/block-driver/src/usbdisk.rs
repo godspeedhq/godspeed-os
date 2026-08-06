@@ -181,7 +181,14 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
             // was only true of transport failures.
             code => {
                 ctx.log_fmt(format_args!(
-                    "block-driver: {} lba {} refused by kernel, status {}", what, lba, code));
+                    // WHO refused matters: under `usb-via-xhci` this failure came from the xhci
+                    // SERVICE, not the kernel, and naming the wrong one sends an operator to read
+                    // the wrong log. It said "refused by kernel" on the Pi 4's first userspace-USB
+                    // boot, where the kernel was not in the path at all.
+                    "block-driver: {} lba {} refused by {}, status {}",
+                    what, lba,
+                    if cfg!(feature = "usb-via-xhci") { "the xhci service" } else { "the kernel" },
+                    code));
                 return false;
             }
         }
