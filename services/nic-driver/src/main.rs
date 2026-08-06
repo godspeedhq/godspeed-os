@@ -28,10 +28,9 @@ use godspeed_sdk::{ServiceContext, Message, Mmio, Dma};
 ///
 /// Compiled on every aarch64 build so it is type-checked by the same command that builds the shipping
 /// image - a backend that only compiles under its own feature is a backend that quietly rots. Which
-/// one actually runs is decided in `service_main`, by the `genet-userspace` feature, which must be
-/// passed to the kernel as well: it is what stops the kernel from driving the same controller.
+/// one actually runs is decided in `service_main` by the target architecture: on aarch64 this backend
+/// is the ONLY path - the kernel drives no ethernet at all (Commandment I).
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(feature = "genet-userspace"), allow(dead_code))]
 mod genet;
 
 // Intel 82540EM register offsets (byte offsets into the BAR0 MMIO window).
@@ -668,15 +667,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Pi 4, with the driver where it belongs: the GENET MAC is ours, reached through the register
     // window and DMA arena the kernel granted this service by name. No NET_DEVICE syscall is involved
     // and the kernel drives no ethernet at all - which is the whole point (Commandment I, §4.4).
-    #[cfg(all(target_arch = "aarch64", feature = "genet-userspace"))]
+    #[cfg(target_arch = "aarch64")]
     genet::genet_main(ctx);
 
     // Both ARM ports, otherwise: there is no PCIe NIC to scan for. The device is driven in-kernel
     // (Pi 2: a DWC2 CDC-ECM USB adapter; Pi 4: the on-board GENET MAC) and this backend bridges the
     // same frame IPC net-stack speaks to the NET_DEVICE syscalls. Same request/reply contract,
     // different transport - exactly the block-driver x86/ARM split.
-    #[cfg(all(any(target_arch = "arm", target_arch = "aarch64"),
-              not(all(target_arch = "aarch64", feature = "genet-userspace"))))]
+    #[cfg(target_arch = "arm")]
     kernel_net_main(ctx);
 
     // Which NIC did the kernel find? nic-driver drives an Intel e1000 (the QEMU dev NIC) or a Realtek

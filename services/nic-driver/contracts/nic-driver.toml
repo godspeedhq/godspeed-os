@@ -22,13 +22,17 @@ log_write = true
 # of this service is: NET_DEVICE (move ethernet frames) + log_write. Stated here so a contract reader is
 # not misled by the x86-shaped `hw_device` line above.
 #
-# PI 4, BUILT WITH `--genet-userspace`: none of the paragraph above applies. The GENET driver moves out of
-# the kernel and into this service (`src/genet.rs`), so the authority becomes the x86 shape after all -
-# a fixed MMIO window (physical 0xFD58_0000, 64 KiB, reached via `ctx.mmio()`) plus a 64 KiB DMA arena,
-# both granted by name at spawn and only when the kernel's boot probe found a controller. NET_DEVICE is
-# still granted and simply goes unused; the service never calls those syscalls in this mode. The grant is
-# not conditional on the feature because the kernel cannot see which nic-driver binary it embedded, and an
-# unused capability is a smaller problem than a driver that cannot reach its device.
+# PI 4: none of the paragraph above applies - it describes the Pi 2 only. The GENET driver lives in THIS
+# service (`src/genet.rs`), not in the kernel, so the authority takes the x86 shape after all: a fixed
+# MMIO window (physical 0xFD58_0000, 64 KiB, reached via `ctx.mmio()`) plus a 64 KiB DMA arena, both
+# granted by name at spawn and only when the kernel's boot probe found a controller. The kernel's own
+# GENET code is now discovery ONLY (`arch/aarch64/genet.rs` reads one revision register and writes none);
+# there is no in-kernel driver left to fall back to, which is deliberate - a second path that is not
+# exercised does not stay working, and the unexercised one here was the one that obeyed Commandment I.
+# NET_DEVICE is still granted on aarch64 and simply goes unused; the service never calls those syscalls
+# on this board. The grant is unconditional because the kernel cannot see which board's backend the
+# embedded binary selected, and an unused capability is a smaller problem than a driver that cannot
+# reach its device.
 
 [placement]
 core = 1   # a driver pins to the core its IRQ will route to (interrupt locality, §12.2)

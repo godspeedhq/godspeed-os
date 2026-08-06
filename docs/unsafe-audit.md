@@ -350,6 +350,28 @@ from the wrong places.
 |------|--------|-----|
 | `arch/aarch64/genet.rs` | new, 1 | The revision read, through `probe_read32` so an absent controller is reported rather than taken as an external abort that surfaces later blaming something unrelated. |
 
+## 2026-08-06 - the in-kernel GENET driver is DELETED: 14 unsafe lines to 1 (feat/pi4-aarch64)
+
+The largest single reduction in this audit's history, and it is a reduction because the code did not
+move to a safer place in the kernel - it left the kernel entirely. `arch/aarch64/genet.rs` was a
+~1500-line Ethernet driver (MDIO, UMAC bring-up, PHY clock delays, RX/TX descriptor rings, the address
+filter, the frame data path) holding 14 audited unsafe lines. It is now 113 lines that read one
+revision register and write none.
+
+The driver lives in `services/nic-driver/src/genet.rs`, a restartable userspace service with **zero**
+unsafe. That is not a coincidence of style: a service reaches its controller through an MMIO capability
+and a DMA arena, both handed to it by name at spawn, and the SDK's `Mmio`/`Dma` wrappers are the only
+things that touch a raw address. The unsafe did not get rewritten more carefully - the *need* for it
+was removed by putting the driver on the other side of the capability boundary (§18.1, §18.2).
+
+Worth stating plainly because it is the point of the whole exercise: those 14 lines parsed frames that
+arrive unbidden from anywhere on the network, in ring 0. The new driver parses the same frames in a
+task that chaos killed 46 times during a carnage run while the machine stayed up.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/genet.rs` | 14 -> 1 (-13) | The driver is deleted. The one line left is the milestone-1 revision read through `probe_read32` - discovery, which the kernel owes (it gates the register-window grant), not driving, which it does not. |
+
 ## 2026-08-04 - Pi 4 SMP: the PSCI attempt hung the board, and is removed (feat/pi4-aarch64)
 
 Four cores came up on six consecutive QEMU boots and the board hung on the release line. The cause was
@@ -2253,7 +2275,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
 | arch/aarch64/video.rs | 2 | permitted |
-| arch/aarch64/genet.rs | 14 | permitted |
+| arch/aarch64/genet.rs | 1 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
 | arch/aarch64/smp_boot.rs | 9 | permitted |
 | arch/aarch64/xhci.rs | 42 | permitted |

@@ -127,9 +127,10 @@ pi4-smp = []
 #     timeout instead of on an IRQ. That is the same ~250 ms idle poll the in-kernel driver had (it
 #     masked the interrupter outright), so nothing regresses; it is simply not yet an improvement.
 #
-# It is a feature rather than the default for the same reason `genet-userspace` is: the in-kernel
-# driver is HARDWARE-VERIFIED on a real Pi 4 and the service one is not, and a working machine does
-# not get replaced by an unproven one on the strength of an argument. Build both sides with it
+# It is a feature rather than the default because the in-kernel driver is HARDWARE-VERIFIED on a real
+# Pi 4 and the service one is not, and a working machine does not get replaced by an unproven one on
+# the strength of an argument. (GENET went through the same staging and is now the only path.) Build
+# both sides with it
 # (`pi4_build.py --xhci-userspace`), which is the only supported way to turn it on.
 xhci-userspace = []
 # Run the minimal ARM logger spawn at boot (arch/arm/spawn.rs). Off by default: the spawn currently

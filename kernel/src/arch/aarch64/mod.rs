@@ -881,22 +881,22 @@ extern "C" fn boot_high() -> ! {
         // The on-board ethernet controller. Identified here, next to the other device probes, and
         // inside the same window: an absent controller answers with an abort, not a value.
         if genet::probe().is_some() {
-            // The controller answered. Who DRIVES it from here is a build-time choice, and the
-            // default is still this kernel (nothing about a working machine changes without the
-            // feature). See `genet-userspace` in `kernel/Cargo.toml`.
-            {
-                // Commandment I: an ethernet driver is not the kernel's business (§4.4). With this
-                // feature the kernel does exactly two things about GENET - it establishes that the
-                // controller is there, and it says so - and the `nic-driver` SERVICE does the rest
-                // through the register window and DMA arena the spawn path grants it.
-                //
-                // `NIC_FOUND` is what gates that DMA arena (`HwClass::needs_dma`), and it is set HERE
-                // rather than after a bring-up that no longer happens. Its meaning is "a NIC this port
-                // can drive was found", which a probed-and-present GENET satisfies.
-                pci::NIC_FOUND.store(true, core::sync::atomic::Ordering::Release);
-                put_str(b"genet: controller present - left to the nic-driver SERVICE \
-                          (kernel drives no ethernet, Commandment I)\r\n");
-            }
+            // The controller answered, and that is the LAST thing this kernel does about ethernet.
+            // Commandment I: an ethernet driver is not the kernel's business (§4.4). The kernel
+            // establishes that the controller is there and says so; the `nic-driver` SERVICE does
+            // everything else, through the register window and DMA arena the spawn path grants it.
+            //
+            // There is no build-time choice here any more. The kernel driver USED to be the default
+            // and the service was reached with a `--genet-userspace` flag, which meant the shipping
+            // machine ran the constitutional violation and the compliant path was the opt-in. A
+            // second path also has to be kept working to be worth having, and this one was not being
+            // exercised. The driver is deleted, so this is the only path and cannot rot.
+            //
+            // `NIC_FOUND` is what gates the DMA arena (`HwClass::needs_dma`), and it is set HERE
+            // rather than after a bring-up that no longer happens. Its meaning is "a NIC this port
+            // can drive was found", which a probed-and-present GENET satisfies.
+            pci::NIC_FOUND.store(true, core::sync::atomic::Ordering::Release);
+            put_str(b"genet: controller present - left to the nic-driver SERVICE (Commandment I)\r\n");
         }
 
         // The whole USB bring-up runs inside the probe window, not just the PCIe half. A read that does
