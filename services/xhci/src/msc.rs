@@ -100,7 +100,11 @@ impl Ring {
     const BYTES: usize = 0x1000;
 
     fn new(base: usize) -> Self {
-        Ring { base, cur: 0, pcs: 1 }
+        Ring {
+            base,
+            cur: 0,
+            pcs: 1,
+        }
     }
 
     /// Post one Normal TRB pointing at `buf_phys` for `len` bytes, with Interrupt On Completion.
@@ -114,7 +118,10 @@ impl Ring {
             dma.write32(self.base + self.cur + 4, (bp >> 32) as u32);
             dma.write32(self.base + self.cur + 8, 0);
             // Toggle Cycle (bit 1) tells the controller to flip ITS cycle when it follows the link.
-            dma.write32(self.base + self.cur + 12, (crate::TRB_LINK << 10) | (1 << 1) | self.pcs);
+            dma.write32(
+                self.base + self.cur + 12,
+                (crate::TRB_LINK << 10) | (1 << 1) | self.pcs,
+            );
             self.cur = 0;
             self.pcs ^= 1;
         }
@@ -257,7 +264,11 @@ pub fn bot(
 
     if data_len > 0 {
         let dci = if data_in { d.in_dci } else { d.out_dci };
-        let ring = if data_in { &mut d.in_ring } else { &mut d.out_ring };
+        let ring = if data_in {
+            &mut d.in_ring
+        } else {
+            &mut d.out_ring
+        };
         ring.push(dma, dma.phys_at(DATA_BUF), data_len);
         mmio.write32(dboff + d.slot as usize * 4, dci);
         let cc = await_on_slot(dma, mmio, ir0, d.slot, ev_idx, ev_cycle, eaten)?;
@@ -284,11 +295,19 @@ pub fn bot(
 /// SCSI TEST UNIT READY - is the medium present and the device willing?
 #[allow(clippy::too_many_arguments)]
 pub fn test_unit_ready(
-    dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize, d: &mut Disk,
-    ev_idx: &mut usize, ev_cycle: &mut u32, eaten: &mut u32,
+    dma: &Dma,
+    mmio: &Mmio,
+    dboff: usize,
+    ir0: usize,
+    d: &mut Disk,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    eaten: &mut u32,
 ) -> bool {
     let cmd = [0u8; 6];
-    bot(dma, mmio, dboff, ir0, d, &cmd, 0, true, ev_idx, ev_cycle, eaten) == Some(0)
+    bot(
+        dma, mmio, dboff, ir0, d, &cmd, 0, true, ev_idx, ev_cycle, eaten,
+    ) == Some(0)
 }
 
 /// SCSI READ CAPACITY(10) - returns the sector COUNT.
@@ -298,11 +317,20 @@ pub fn test_unit_ready(
 /// believes in one the device does not have.
 #[allow(clippy::too_many_arguments)]
 pub fn read_capacity(
-    dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize, d: &mut Disk,
-    ev_idx: &mut usize, ev_cycle: &mut u32, eaten: &mut u32,
+    dma: &Dma,
+    mmio: &Mmio,
+    dboff: usize,
+    ir0: usize,
+    d: &mut Disk,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    eaten: &mut u32,
 ) -> Option<u64> {
     let cmd = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    if bot(dma, mmio, dboff, ir0, d, &cmd, 8, true, ev_idx, ev_cycle, eaten) != Some(0) {
+    if bot(
+        dma, mmio, dboff, ir0, d, &cmd, 8, true, ev_idx, ev_cycle, eaten,
+    ) != Some(0)
+    {
         return None;
     }
     // Both fields are BIG-endian, unlike everything else in BOT.
@@ -317,37 +345,91 @@ pub fn read_capacity(
 /// SCSI READ(10) into the data buffer. `count` sectors, at most `MAX_XFER / SECTOR`.
 #[allow(clippy::too_many_arguments)]
 pub fn read10(
-    dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize, d: &mut Disk, lba: u64, count: u32,
-    ev_idx: &mut usize, ev_cycle: &mut u32, eaten: &mut u32,
+    dma: &Dma,
+    mmio: &Mmio,
+    dboff: usize,
+    ir0: usize,
+    d: &mut Disk,
+    lba: u64,
+    count: u32,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    eaten: &mut u32,
 ) -> bool {
     if count == 0 || count * SECTOR > MAX_XFER || lba > u32::MAX as u64 {
         return false;
     }
     let l = lba as u32;
     let cmd = [
-        0x28, 0,
-        (l >> 24) as u8, (l >> 16) as u8, (l >> 8) as u8, l as u8,
-        0, (count >> 8) as u8, count as u8, 0,
+        0x28,
+        0,
+        (l >> 24) as u8,
+        (l >> 16) as u8,
+        (l >> 8) as u8,
+        l as u8,
+        0,
+        (count >> 8) as u8,
+        count as u8,
+        0,
     ];
-    bot(dma, mmio, dboff, ir0, d, &cmd, count * SECTOR, true, ev_idx, ev_cycle, eaten) == Some(0)
+    bot(
+        dma,
+        mmio,
+        dboff,
+        ir0,
+        d,
+        &cmd,
+        count * SECTOR,
+        true,
+        ev_idx,
+        ev_cycle,
+        eaten,
+    ) == Some(0)
 }
 
 /// SCSI WRITE(10) from the data buffer, which the caller fills first via `data_write`.
 #[allow(clippy::too_many_arguments)]
 pub fn write10(
-    dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize, d: &mut Disk, lba: u64, count: u32,
-    ev_idx: &mut usize, ev_cycle: &mut u32, eaten: &mut u32,
+    dma: &Dma,
+    mmio: &Mmio,
+    dboff: usize,
+    ir0: usize,
+    d: &mut Disk,
+    lba: u64,
+    count: u32,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    eaten: &mut u32,
 ) -> bool {
     if count == 0 || count * SECTOR > MAX_XFER || lba > u32::MAX as u64 {
         return false;
     }
     let l = lba as u32;
     let cmd = [
-        0x2A, 0,
-        (l >> 24) as u8, (l >> 16) as u8, (l >> 8) as u8, l as u8,
-        0, (count >> 8) as u8, count as u8, 0,
+        0x2A,
+        0,
+        (l >> 24) as u8,
+        (l >> 16) as u8,
+        (l >> 8) as u8,
+        l as u8,
+        0,
+        (count >> 8) as u8,
+        count as u8,
+        0,
     ];
-    bot(dma, mmio, dboff, ir0, d, &cmd, count * SECTOR, false, ev_idx, ev_cycle, eaten) == Some(0)
+    bot(
+        dma,
+        mmio,
+        dboff,
+        ir0,
+        d,
+        &cmd,
+        count * SECTOR,
+        false,
+        ev_idx,
+        ev_cycle,
+        eaten,
+    ) == Some(0)
 }
 
 /// SCSI SYNCHRONIZE CACHE(10) - the durability barrier a journal's ordering depends on.
@@ -358,11 +440,19 @@ pub fn write10(
 /// deliver.
 #[allow(clippy::too_many_arguments)]
 pub fn sync_cache(
-    dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize, d: &mut Disk,
-    ev_idx: &mut usize, ev_cycle: &mut u32, eaten: &mut u32,
+    dma: &Dma,
+    mmio: &Mmio,
+    dboff: usize,
+    ir0: usize,
+    d: &mut Disk,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    eaten: &mut u32,
 ) -> bool {
     let cmd = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    bot(dma, mmio, dboff, ir0, d, &cmd, 0, true, ev_idx, ev_cycle, eaten) == Some(0)
+    bot(
+        dma, mmio, dboff, ir0, d, &cmd, 0, true, ev_idx, ev_cycle, eaten,
+    ) == Some(0)
 }
 
 /// Read one byte out of the data buffer (after a `read10`).
@@ -444,7 +534,13 @@ pub fn parse_msc(dma: &Dma, buf_off: usize, buf_len: usize) -> Option<MscInfo> {
         i += len;
     }
     if in_msc && ep_num_ok(in_ep) && ep_num_ok(out_ep) && mps != 0 {
-        Some(MscInfo { cfg_value, iface, in_ep, out_ep, mps })
+        Some(MscInfo {
+            cfg_value,
+            iface,
+            in_ep,
+            out_ep,
+            mps,
+        })
     } else {
         None
     }
