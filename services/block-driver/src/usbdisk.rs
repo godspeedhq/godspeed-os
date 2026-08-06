@@ -203,6 +203,48 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
     false
 }
 
+
+// --- Which USB stack backs this disk -----------------------------------------------------------
+//
+// Two routes to the same device, chosen at BUILD time and never at runtime. The in-kernel stack is
+// reached by syscall; the `xhci` SERVICE is reached by IPC. They are never mixed and there is no
+// fallback between them: a silent switch from the userspace driver to the kernel one would hide
+// exactly the failure this port exists to eliminate (§26.7), and would keep alive the in-kernel
+// stack that Commandment I says must go.
+//
+// The choice is a build flag rather than a probe because only the BUILD knows the answer: the
+// kernel's `xhci-userspace` feature is what stops it driving the controller, and a service cannot
+// ask the kernel whether it did. `scripts/pi4_build.py --xhci-userspace` sets both, which is why it
+// is one switch reaching several crates rather than a feature to remember per crate.
+
+// The return is the syscall's TRI-STATE i64 (0 = done, USB_DISK_BUSY, USB_DISK_ABSENT, other =
+// error), not a bool, because `with_busy_retry` acts differently on each and flattening them would
+// turn "the stick is thinking" into "the read failed".
+//
+// The service path never reports BUSY, and that is correct rather than a gap: the BOT layer inside
+// `xhci` already waits a slow device out (its transfer budget is generous precisely because the old
+// 2 s one aborted healthy commands). By the time it answers, the waiting has happened - so a failure
+// here is a real I/O error, and returning BUSY would send this loop off to wait another 30 s for a
+// device that already gave its answer.
+#[cfg(not(feature = "usb-via-xhci"))]
+fn dev_read(ctx: &ServiceContext, lba: u64, buf: &mut [u8; 512]) -> i64 { ctx.usb_disk_read_status(lba, buf) }
+#[cfg(feature = "usb-via-xhci")]
+fn dev_read(ctx: &ServiceContext, lba: u64, buf: &mut [u8; 512]) -> i64 {
+    if super::xhciblk::read(ctx, lba, buf) { 0 } else { -1 }
+}
+
+#[cfg(not(feature = "usb-via-xhci"))]
+fn dev_write(ctx: &ServiceContext, lba: u64, buf: &[u8; 512]) -> i64 { ctx.usb_disk_write_status(lba, buf) }
+#[cfg(feature = "usb-via-xhci")]
+fn dev_write(ctx: &ServiceContext, lba: u64, buf: &[u8; 512]) -> i64 {
+    if super::xhciblk::write(ctx, lba, buf) { 0 } else { -1 }
+}
+
+#[cfg(not(feature = "usb-via-xhci"))]
+fn dev_flush(ctx: &ServiceContext) -> bool { ctx.usb_disk_flush() }
+#[cfg(feature = "usb-via-xhci")]
+fn dev_flush(ctx: &ServiceContext) -> bool { super::xhciblk::flush(ctx) }
+
 /// Serve one block-IPC request. Same wire protocol as the AHCI and EMMC backends - `fs` is unaware of
 /// which one it is talking to.
 fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapHandle) {
@@ -212,7 +254,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
     if p[0] == OP_FLUSH {
         // The one backend that genuinely needs this: a stick acknowledges a WRITE(10) into its own
         // buffer, so without SYNCHRONIZE CACHE a reset loses the tail of everything just written.
-        let status = if ctx.usb_disk_flush() { STATUS_OK } else { STATUS_ERR };
+        let status = if dev_flush(ctx) { STATUS_OK } else { STATUS_ERR };
         let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
         return;
     }
@@ -228,7 +270,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
     match p[0] {
         OP_READ_BLOCK => {
             let mut buf = [0u8; 512];
-            if with_busy_retry(ctx, "read", lba, || ctx.usb_disk_read_status(lba, &mut buf)) {
+            if with_busy_retry(ctx, "read", lba, || dev_read(ctx, lba, &mut buf)) {
                 let mut out = [0u8; 513];
                 out[0] = STATUS_OK;
                 out[1..].copy_from_slice(&buf);
@@ -239,7 +281,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
             if p.len() < 521 { return err(ctx); }
             let mut buf = [0u8; 512];
             buf.copy_from_slice(&p[9..521]);
-            let status = if with_busy_retry(ctx, "write", lba, || ctx.usb_disk_write_status(lba, &buf)) { STATUS_OK } else { STATUS_ERR };
+            let status = if with_busy_retry(ctx, "write", lba, || dev_write(ctx, lba, &buf)) { STATUS_OK } else { STATUS_ERR };
             let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
         }
         OP_WRITE_ZEROS => {
@@ -248,7 +290,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
             let zero = [0u8; 512];
             let mut ok = true;
             for i in 0..count {
-                if !with_busy_retry(ctx, "write-zeros", lba + i, || ctx.usb_disk_write_status(lba + i, &zero)) { ok = false; break; }
+                if !with_busy_retry(ctx, "write-zeros", lba + i, || dev_write(ctx, lba + i, &zero)) { ok = false; break; }
             }
             let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[if ok { STATUS_OK } else { STATUS_ERR }]));
         }

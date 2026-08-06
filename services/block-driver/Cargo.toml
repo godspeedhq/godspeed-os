@@ -12,6 +12,14 @@ path = "src/main.rs"
 # retry + port-recovery path (Phase H) - QEMU never fails a real disk read. TEST BUILDS
 # ONLY; production never injects faults. Enabled by `osdev test fs-ioretry`.
 io-error-test = []
+# Reach the USB disk through the `xhci` SERVICE (IPC) instead of the in-kernel USB stack (syscalls).
+# Must be enabled TOGETHER with the KERNEL and SUPERVISOR features of the same name - the kernel's
+# copy stops it driving the controller, the supervisor's spawns the service that drives it instead,
+# and this one points block-driver at that service. `scripts/pi4_build.py --xhci-userspace` sets all
+# three, which is the only supported way to turn it on: setting a subset gives you two drivers on one
+# controller, or a block-driver talking to a service that is not there - and both halves build and
+# boot perfectly well on their own, so there is no diagnostic to catch it.
+usb-via-xhci = []
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }

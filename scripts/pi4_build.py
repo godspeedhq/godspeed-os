@@ -111,9 +111,14 @@ if "--features" in sys.argv:
 # is one flag here rather than two features to remember, and why it is not left to `--features` (which
 # reaches only the kernel).
 #
-# It costs USB MASS STORAGE, and that is not a bug to be found later: the `xhci` service is HID-only,
-# so with the in-kernel stack idle nothing implements Bulk-Only Transport and `block-driver` reports
-# no disk. The kernel says so on the boot line next to "left to the xhci SERVICE".
+# It reaches THREE crates, not two: `block-driver` also has to be pointed at the service (its
+# `usb-via-xhci` feature) or it will ask a kernel that is no longer driving the controller.
+#
+# It NO LONGER costs USB mass storage. The `xhci` service used to be HID-only, so nothing implemented
+# Bulk-Only Transport and `block-driver` reported no disk; the service now speaks BOT + SCSI and
+# serves the block protocol itself (`services/xhci/src/msc.rs`). QEMU-proven on x86 (`raspi4b`
+# emulates no PCIe, so the Pi 4 cannot exercise xhci in emulation at all); the block-driver -> xhci
+# hop is HARDWARE-UNPROVEN, because nothing in emulation can carry it.
 XHCI_USERSPACE = "--xhci-userspace" in sys.argv
 if XHCI_USERSPACE:
     FEATURES += ",xhci-userspace"
@@ -125,6 +130,12 @@ for svc in PI4_SERVICES:
     feats = ["--features", "bare-metal"] if svc == "supervisor" else []
     if svc == "supervisor" and XHCI_USERSPACE:
         feats = ["--features", "bare-metal,xhci-userspace"]
+    # The THIRD crate the one switch has to reach. block-driver must be told to fetch its sectors
+    # from the `xhci` SERVICE over IPC instead of from the in-kernel stack by syscall; without it the
+    # service drives the disk and block-driver asks a kernel that is no longer driving anything, so
+    # storage silently disappears with every individual piece looking correct.
+    if svc == "block-driver" and XHCI_USERSPACE:
+        feats = ["--features", "usb-via-xhci"]
     run(["cargo", "build", "-p", svc, "--target", TARGET] + feats + rel)
 
 # 2. The kernel.

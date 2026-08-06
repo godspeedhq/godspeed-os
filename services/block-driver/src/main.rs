@@ -28,6 +28,8 @@ use godspeed_sdk::ServiceContext;
 mod ahci;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 mod usbdisk;
+#[cfg(feature = "usb-via-xhci")]
+mod xhciblk;
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
 //   Request : [op:u8, lba:u64 LE, (WriteBlock only: 512 data bytes)]
@@ -73,7 +75,12 @@ fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { ahci::run(ct
 /// no-disk state (capacity 0, every read/write refused) WITHOUT touching the card.
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 fn backend_run(ctx: &ServiceContext) -> ! {
+    // Where the sector count comes from is the same build-time choice usbdisk.rs documents: the
+    // in-kernel stack by syscall, or the `xhci` service by IPC. No probe, no fallback.
+    #[cfg(not(feature = "usb-via-xhci"))]
     let sectors = ctx.usb_disk_sectors();
+    #[cfg(feature = "usb-via-xhci")]
+    let sectors = xhciblk::sectors(&ctx);
     if sectors == 0 {
         ctx.log("block-driver: no USB storage stick - NO disk (the SD card is the boot medium and is never written)");
     }
