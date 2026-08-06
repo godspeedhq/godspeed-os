@@ -100,8 +100,38 @@ pi4-smp = []
 # It is a feature rather than the default for one reason: the in-kernel driver is HARDWARE-VERIFIED on
 # a real Pi 4 and the service one is not yet, and a working machine does not get replaced by an
 # unproven one on the strength of an argument. Build both sides with it (`pi4_build.py
-# --genet-userspace`); enabling only one leaves either two drivers on one controller or none.
-genet-userspace = []
+# Hand the Pi 4's VL805 USB host controller to the `xhci` SERVICE, and take it out of the kernel.
+#
+# `kernel/src/arch/aarch64/xhci.rs` is ~2700 lines of USB stack living in ring 0 - controller
+# bring-up, TRB rings, hub enumeration, a HID keyboard and Bulk-Only-Transport mass storage - which
+# Commandment I forbids in one sentence and §4.4 forbids again by name. x86 has never had the problem:
+# `services/xhci` has always been a restartable userspace service. That file's own header already said
+# what should happen ("when device IRQs reach userspace this becomes a service and the existing `xhci`
+# service is what it becomes"); this feature is that sentence made true.
+#
+# With it on, the kernel's whole involvement with USB is the PCIe bring-up it already does: train the
+# link, ask the VideoCore to reload the VL805's firmware, assign the BAR, publish it in `pci::XHCI_*`,
+# and stop. The spawn path then hands the SERVICE that BAR and a DMA arena through the SAME neutral
+# code x86 uses - there is no aarch64-specific grant, because a discovered BAR is exactly the shape
+# that path was written for (unlike GENET, which is soldered to the SoC and needed
+# `map_fixed_driver_mmio`).
+#
+# TWO THINGS ARE LOST WITH IT ON, and they are lost loudly rather than papered over:
+#   * USB MASS STORAGE. `services/xhci` is HID-only - it explicitly releases the slot of any device
+#     that is not a keyboard, mouse or hub - so with the in-kernel stack gone there is no BOT/SCSI
+#     implementation anywhere. `usb_disk_*` therefore answers "absent", `block-driver` reports no disk
+#     and `fs` serves 0 sectors. Closing that gap means teaching the SERVICE bulk transfers; it does
+#     NOT mean a kernel syscall, which is what the in-kernel driver was.
+#   * INTERRUPT-DRIVEN keyboard latency. Nothing programs the VL805's MSI on this board yet
+#     (`pci::program_xhci_msi` is a stub), so the service's `recv_timeout` falls through on its
+#     timeout instead of on an IRQ. That is the same ~250 ms idle poll the in-kernel driver had (it
+#     masked the interrupter outright), so nothing regresses; it is simply not yet an improvement.
+#
+# It is a feature rather than the default for the same reason `genet-userspace` is: the in-kernel
+# driver is HARDWARE-VERIFIED on a real Pi 4 and the service one is not, and a working machine does
+# not get replaced by an unproven one on the strength of an argument. Build both sides with it
+# (`pi4_build.py --xhci-userspace`), which is the only supported way to turn it on.
+xhci-userspace = []
 # Run the minimal ARM logger spawn at boot (arch/arm/spawn.rs). Off by default: the spawn currently
 # reaches PL0 and issues real syscalls, but the kernel's cap-table spinlock (LDREX/STREX) does not yet
 # work under the service's dual-mapped address space, so the boot would block. Gated so the default

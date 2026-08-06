@@ -884,7 +884,6 @@ extern "C" fn boot_high() -> ! {
             // The controller answered. Who DRIVES it from here is a build-time choice, and the
             // default is still this kernel (nothing about a working machine changes without the
             // feature). See `genet-userspace` in `kernel/Cargo.toml`.
-            #[cfg(feature = "genet-userspace")]
             {
                 // Commandment I: an ethernet driver is not the kernel's business (§4.4). With this
                 // feature the kernel does exactly two things about GENET - it establishes that the
@@ -897,51 +896,6 @@ extern "C" fn boot_high() -> ! {
                 pci::NIC_FOUND.store(true, core::sync::atomic::Ordering::Release);
                 put_str(b"genet: controller present - left to the nic-driver SERVICE \
                           (kernel drives no ethernet, Commandment I)\r\n");
-            }
-            #[cfg(not(feature = "genet-userspace"))]
-            {
-                // The board's real address, from the firmware. It was a hardcoded placeholder through
-                // bring-up - which was the right scope while the question was whether the wire worked
-                // at all, and the wrong address to keep the moment the question became why nothing
-                // replies.
-                let mac = genet::firmware_mac();
-                if genet::umac_init(mac).is_some() {
-                    // Prove the DMA block bases before anything hands the controller a buffer.
-                    if genet::verify_dma_layout() {
-                        // Set the PHY's RGMII clock delays before any traffic moves. Skipping this
-                        // leaves whatever the firmware happened to configure, which is the one thing
-                        // Linux does here that this driver never did - and a clock skew that is wrong
-                        // corrupts frames while leaving link, speed and MDIO all perfectly healthy.
-                        genet::config_phy_clock_delay();
-                        genet::apply_link_settings();
-                        // Both rings up, then declare the driver open. The 3-second receive selftest
-                        // that proved this path is gone: it has done its job, and paying it on every
-                        // boot would be a permanent cost for a one-time question.
-
-                        if genet::init_rx_ring()
-                            && genet::enable_rx()
-                            && genet::init_tx_ring()
-                            && genet::enable_tx()
-                        {
-                            // Narrow to our address plus broadcast before any traffic is admitted. The
-                            // bring-up ran promiscuous, which floods a 32-descriptor ring with the
-                            // whole segment's broadcast traffic and discards what was addressed to us.
-                            genet::set_rx_filter(mac);
-                            genet::mark_ready(mac);
-                            // Declare a NIC present, so the spawn path grants `nic-driver` its arena.
-                            //
-                            // `HwClass::needs_dma` gates on `pci::NIC_FOUND`, which on x86 is set by
-                            // the PCI scan. GENET is an SoC peripheral and never appears on a PCI bus,
-                            // so the flag stayed false and the arena was never granted - the third
-                            // reason the driver had to stay in the kernel. The flag's MEANING is "a
-                            // NIC this port can drive was found", not "a PCI device was enumerated";
-                            // setting it here honours that meaning on a board whose NIC is soldered
-                            // to the SoC.
-                            pci::NIC_FOUND.store(true, core::sync::atomic::Ordering::Release);
-                            genet::announce_ready();
-                        }
-                    }
-                }
             }
         }
 
@@ -956,6 +910,43 @@ extern "C" fn boot_high() -> ! {
         unsafe { PCIE_XHCI = pcie::init(ram_top) };
         // SAFETY: read-once of the static just written, still single-threaded.
         if let Some(dev) = unsafe { PCIE_XHCI } {
+            // Publish the controller the PCIe scan found, so the SPAWN PATH can hand it to a driver
+            // service. These three statics are the neutral kernel's whole vocabulary for "there is a
+            // USB host controller and here is where it lives" (`task::HwClass::Xhci`): x86 fills them
+            // from its PCI bus scan, and until now aarch64 left them at their stub values while the
+            // BAR it had just assigned sat in a private `Option<Device>` that nothing above the arch
+            // layer could see.
+            //
+            // Filling them is a statement of FACT about the machine, so it is not gated on the
+            // feature below. It is inert without one: the only consumer is the spawn of a service
+            // NAMED `xhci`, which is not spawned unless the userspace driver is built in.
+            //
+            // The BDF is the encoding `pci::clear_bus_master` and friends take on x86. Those are all
+            // stubs here (there is no generic config-space accessor exposed at this layer), so it is
+            // recorded for the log and for whoever wires the quiesce path, not acted on.
+            pci::XHCI_MMIO_BASE.store(dev.bar0, core::sync::atomic::Ordering::Relaxed);
+            pci::XHCI_BDF.store(
+                ((dev.bus as u32) << 8) | ((dev.dev as u32) << 3) | (dev.func as u32),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            pci::XHCI_FOUND.store(true, core::sync::atomic::Ordering::Release);
+
+            // Who DRIVES the controller from here is a build-time choice, and the default is still
+            // this kernel - nothing about a working machine changes without the feature. See
+            // `xhci-userspace` in `kernel/Cargo.toml`.
+            #[cfg(feature = "xhci-userspace")]
+            {
+                // Commandment I: a USB stack is not the kernel's business (§4.4). With this feature
+                // the kernel does exactly two things about USB - it establishes that the controller
+                // is there and reachable, and it says so - and the `xhci` SERVICE does the rest
+                // through the BAR window and DMA arena the spawn path grants it.
+                let _ = &dev;
+                put_str(b"xhci: controller present - left to the xhci SERVICE \
+                          (kernel drives no USB, Commandment I)\r\n");
+                put_str(b"xhci: NOTE the service is HID-only, so USB mass storage is unavailable \
+                          in this build - block-driver will report no disk\r\n");
+            }
+            #[cfg(not(feature = "xhci-userspace"))]
             xhci::init(dev.bar0, dev.bar0_len);
         }
         let aborts = exceptions::end_probe();
@@ -1241,15 +1232,18 @@ pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Opt
     }
 }
 
-// USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
-pub fn net_frame_tx(frame: &[u8]) -> bool {
-    #[cfg(feature = "pi4")]
-    {
-        if genet::ready() {
-            return genet::transmit(frame);
-        }
-    }
-    let _ = frame;
+// NO in-kernel network device on this arch, by design.
+//
+// These three hooks exist because the neutral `NET_DEVICE` syscalls (42-44) are arch-agnostic, and on
+// the Pi 2 they front an in-kernel USB-net adapter. Here they are deliberately inert: the NIC is driven
+// by the `nic-driver` SERVICE through its own register window, so a frame never passes through the
+// kernel at all. `nic-driver` still holds the NET_DEVICE capability and simply does not use it on this
+// board - an unused grant is a smaller problem than a driver that cannot reach its device, and the
+// kernel cannot see which backend the service was built with.
+//
+// Returning false/0/None is the honest answer, not a fallback: there IS no kernel network device, and
+// a service that asked would be told so rather than quietly given nothing.
+pub fn net_frame_tx(_frame: &[u8]) -> bool {
     false
 }
 // No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
@@ -1269,14 +1263,36 @@ pub fn emmc_base_clock_hz() -> u32 { 0 }
 /// filesystem overwrites the boot medium. The 32-bit port established that the hard way - it corrupted
 /// two boot cards to RAW before the SD backend was withdrawn - and this board has the same topology,
 /// so it inherits the same rule rather than rediscovering it.
+///
+/// **With `xhci-userspace` there is no USB disk at all, and that is reported rather than hidden.**
+/// These four entry points exist only because the USB stack was in the kernel; hand the controller to
+/// the `xhci` SERVICE and the kernel has no way to reach a mass-storage device - nor should it. The
+/// service is HID-only (it releases the slot of anything that is not a keyboard, mouse or hub), so
+/// nothing else picks the job up either. Answering 0/false makes `usb_disk_absent()` true, which is
+/// the syscall's existing "no stick plugged in" answer: `block-driver` logs it and serves 0 sectors,
+/// `fs` mounts nothing, and the shell says so. A degraded machine that SAYS it is degraded (§26.7),
+/// not a fabricated success. The honest close is bulk transfers in the service - not a syscall back
+/// into a kernel that no longer has a driver behind it.
 #[cfg(feature = "pi4")]
-pub fn usb_disk_sectors() -> u64 { xhci::disk_sectors() }
+pub fn usb_disk_sectors() -> u64 {
+    #[cfg(feature = "xhci-userspace")] { 0 }
+    #[cfg(not(feature = "xhci-userspace"))] { xhci::disk_sectors() }
+}
 #[cfg(feature = "pi4")]
-pub fn usb_disk_read(lba: u64, dst: &mut [u8]) -> bool { xhci::disk_read(lba, dst) }
+pub fn usb_disk_read(lba: u64, dst: &mut [u8]) -> bool {
+    #[cfg(feature = "xhci-userspace")] { let _ = (lba, dst); false }
+    #[cfg(not(feature = "xhci-userspace"))] { xhci::disk_read(lba, dst) }
+}
 #[cfg(feature = "pi4")]
-pub fn usb_disk_write(lba: u64, src: &[u8]) -> bool { xhci::disk_write(lba, src) }
+pub fn usb_disk_write(lba: u64, src: &[u8]) -> bool {
+    #[cfg(feature = "xhci-userspace")] { let _ = (lba, src); false }
+    #[cfg(not(feature = "xhci-userspace"))] { xhci::disk_write(lba, src) }
+}
 #[cfg(feature = "pi4")]
-pub fn usb_disk_flush() -> bool { xhci::disk_flush() }
+pub fn usb_disk_flush() -> bool {
+    #[cfg(feature = "xhci-userspace")] { false }
+    #[cfg(not(feature = "xhci-userspace"))] { xhci::disk_flush() }
+}
 
 #[cfg(not(feature = "pi4"))]
 pub fn usb_disk_sectors() -> u64 { 0 }
@@ -1328,42 +1344,32 @@ pub fn fb_commit(
 ) {}
 
 #[cfg(feature = "pi4")]
-pub fn usb_disk_busy() -> bool { xhci::disk_busy() }
+pub fn usb_disk_busy() -> bool {
+    #[cfg(feature = "xhci-userspace")] { false }
+    #[cfg(not(feature = "xhci-userspace"))] { xhci::disk_busy() }
+}
 #[cfg(not(feature = "pi4"))]
 pub fn usb_disk_busy() -> bool { false }
 /// Is there no USB disk attached at all? Distinct from busy - see `USB_DISK_ABSENT` in the syscall
 /// dispatch. This arch has no USB-disk backend, so a request never reaches one and the question is
 /// moot; the read/write primitives already answer false.
 #[cfg(feature = "pi4")]
-pub fn usb_disk_absent() -> bool { xhci::disk_sectors() == 0 }
+pub fn usb_disk_absent() -> bool {
+    #[cfg(feature = "xhci-userspace")] { true }
+    #[cfg(not(feature = "xhci-userspace"))] { xhci::disk_sectors() == 0 }
+}
 #[cfg(not(feature = "pi4"))]
 pub fn usb_disk_absent() -> bool { true }
 
 
 // No GPIO on this arch (the ARM `gpio` shell command is Pi-only).
 pub fn gpio_op(_op: u32, _pin: u32) -> i64 { -1 }
-pub fn net_frame_rx(dst: &mut [u8]) -> usize {
-    #[cfg(feature = "pi4")]
-    {
-        return genet::receive_one(dst);
-    }
-    #[cfg(not(feature = "pi4"))]
-    {
-        let _ = dst;
-        0
-    }
+pub fn net_frame_rx(_dst: &mut [u8]) -> usize {
+    0
 }
 
 /// The station address and the live link state, for a driver service that has to report both.
 pub fn net_info() -> Option<([u8; 6], bool)> {
-    #[cfg(feature = "pi4")]
-    {
-        if genet::ready() {
-            // The link is re-read rather than remembered: a cable pulled after boot must show as down,
-            // not as whatever was true when the driver started.
-            return Some((genet::mac(), genet::link_is_up()));
-        }
-    }
     None
 }
 pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
@@ -1733,6 +1739,12 @@ pub fn uart_rx_poll() {
     uart_rx::drain();
     // The USB keyboard shares this tick. It is polled rather than interrupt-driven for the reason in
     // `xhci`'s module header, and it no-ops in a few instructions when no keyboard was found.
+    //
+    // With `xhci-userspace` there is nothing to poll HERE: the driver is a task, and a task polls
+    // itself on its own schedule (`recv_timeout`) without borrowing the tick. Keystrokes still land
+    // in this same ring - the service pushes them through the CONSOLE_PUSH capability, which is
+    // exactly the authority this in-tick call took ambiently by being kernel code.
+    #[cfg(not(feature = "xhci-userspace"))]
     xhci::poll();
 }
 /// Called directly by a blocked console reader: a timer ISR starved under load would otherwise leave a
@@ -2187,7 +2199,10 @@ pub mod interrupts {
         //
         // Exclusion is `USB_CLAIM`, not masking - see its comment. Rate-limited to one visit a second
         // inside, so an idle machine spends nothing here.
-        #[cfg(feature = "pi4")]
+        //
+        // With `xhci-userspace` this is gone too: hot-plug is the driver's own outer `'reenum` loop,
+        // which is preemptible because it is a task rather than the idle path of a core.
+        #[cfg(all(feature = "pi4", not(feature = "xhci-userspace")))]
         super::xhci::hotplug_poll();
         // SAFETY: WFI at EL1 is always valid. It returns on any pending interrupt (or spuriously),
         // so every caller must re-check its condition rather than assume a wake means progress.
