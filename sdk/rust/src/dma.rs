@@ -64,10 +64,34 @@ impl Dma {
     }
 
     /// Zero the whole arena.
+    ///
+    /// **Deliberately not `write_bytes`.** That lowers to `memset`, and a `memset` is free to reach
+    /// for whatever the ISA makes fastest - unaligned stores, cache-line zeroing hints (AArch64's
+    /// `DC ZVA`), non-temporal stores. Every one of those is legal on the Normal cacheable memory
+    /// x86 maps this arena as, and every one of them is a **fault** on the Device memory a
+    /// non-coherent port maps it as instead (`DMA_ARENA_UNCACHED`, the SEC-28 answer): Device-nGnRnE
+    /// forbids unaligned access outright and cache maintenance by address on it is not meaningful.
+    ///
+    /// So the clear is an explicit aligned 64-bit volatile loop, which is the one shape that is
+    /// correct on both. The arena is page-based (a whole number of 4 KiB frames at a page-aligned
+    /// VA), so the fast path always applies; the byte tail exists only so this function is total
+    /// rather than silently leaving a remainder, and it cannot run on a real grant.
+    ///
+    /// `volatile` matters as much as the alignment: an ordinary store loop over Device memory is
+    /// something the optimiser may merge back into a `memset` call, which would reintroduce exactly
+    /// what this avoids.
     pub fn zero(&self) {
-        // SAFETY: base..base+len is the kernel-granted mapped arena (Dma is only
-        // constructed from one); zeroing across it is in-bounds.
-        unsafe { core::ptr::write_bytes(self.base, 0, self.len) }
+        let words = self.len / 8;
+        for i in 0..words {
+            // SAFETY: base..base+len is the kernel-granted mapped arena (Dma is only constructed
+            // from one) and is page-aligned, so `base + i*8` is 8-byte aligned and in bounds for
+            // every i < len/8.
+            unsafe { core::ptr::write_volatile(self.base.add(i * 8) as *mut u64, 0) }
+        }
+        for off in words * 8..self.len {
+            // SAFETY: off < len, so this is in bounds; a byte store needs no alignment.
+            unsafe { core::ptr::write_volatile(self.base.add(off), 0) }
+        }
     }
 
     /// Read an 8-bit value at byte offset `off` (`off < len`).

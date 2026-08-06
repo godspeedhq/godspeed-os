@@ -81,34 +81,8 @@ const MAX_HID: usize = 2;
 // setup (`KeyRepeat::new_calibrated(ctx.tsc_ticks_per_10ms())`), not hardcoded here: assuming ~2 GHz
 // made one keypress repeat into `qqqqq` on the differently-clocked Goldmont+ Wyse. read_tsc is
 // hardware-proven to advance (perf §22); tsc_ticks_per_10ms is the kernel's PIT-calibrated rate.
-/// Recovery hold after a root-port reset before addressing the device (Item 3, Fix 3). USB 2.0 requires
-/// a reset-recovery interval (TRSTRCY >= 10 ms) before a device can accept transactions; without it a
-/// high-speed root-port device (the Wyse's port 6) NAKs/times out on the Address Device SET_ADDRESS and
-/// returns a Transaction Error (completion=4). ~50-65 ms at ~1.5-2 GHz, matching the behind-a-hub reset
-/// hold; TSC-paced (always runs) and bounded (no heap, no spin on a device register).
-const RESET_RECOVERY_CYCLES: u64 = 100_000_000;
-/// How often the poll loop GET_STATUSes a hub's downstream port to notice a device unplugged from
-/// behind it (no root PORTSC reflects that). ~0.5 s at ~1.5-2 GHz - responsive enough for a "keyboard
-/// disconnected" notice, infrequent enough not to load the hub or eat keystrokes off the shared event
-/// ring (the check runs a control transfer; between checks the keyboard endpoint has the ring to
-/// itself).
-const HUB_POLL_CYCLES: u64 = 1_000_000_000;
-/// How long the "a hub is present but nothing usable is behind it" wait sleeps before re-walking the
-/// hub. A device replugged BEHIND a hub changes no root PORTSC, so the root-port wait would miss it;
-/// re-walking every ~1.5 s catches a back-port (re)connect. Only runs while NO HID is bound.
-const HUB_RESCAN_CYCLES: u64 = 3_000_000_000;
-
-/// Idle-wait pacing for the paths that have NO device to service (`idle`, `wait_for_port`, the hub
-/// re-walk). These used `yield_cpu`, which does not sleep - it pegs the core at ~100% forever, which
-/// is exactly what showed up as ~85k scheduler quanta/s on the T630 (its keyboard is on ehci, so
-/// xhci sits here permanently). `sleep` PARKS the task instead: the core can halt, and with the
-/// Phase 2a idle-tick slowdown it can also stretch its timer.
-///
-/// This deliberately keeps the SELF-DRIVEN poll these loops were built around - we still `try_recv`
-/// on our own schedule and need no cross-core wake, so the flood-storm drain property the previous
-/// comments relied on is preserved (a deeply-blocked `recv` on an AP was the unreliable part, and we
-/// still never do that). Granularity is one scheduler quantum, so this value only sets a floor.
-const IDLE_WAIT_CYCLES: u64 = 10_000_000;
+// The four timing budgets that used to live here are now MILLISECONDS, next to `spin` below, because
+// the cycle counts they were could not survive leaving x86. See `RESET_RECOVERY_MS` and friends.
 const DEV_BASE: usize = 0x7000;
 const DEV_STRIDE: usize = 0x4000; // 4 pages: device ctx, EP0 ring, int ring, report
 fn device_ctx_off(i: usize) -> usize { DEV_BASE + i * DEV_STRIDE }
@@ -202,12 +176,70 @@ const TRB_CMD_COMPLETION: u32 = 33;
 const TRB_PORT_STATUS_CHANGE: u32 = 34;
 
 
-fn spin<F: Fn() -> bool>(cond: F) {
-    let mut n = 0u32;
-    while !cond() && n < 5_000_000 {
-        n += 1;
+/// Wait for a controller register to reach a state, with a bound and a NAME.
+///
+/// Two things were wrong with the bare `while !cond() && n < 5_000_000` this replaces, and only one
+/// of them was a portability problem.
+///
+/// The portability one: **a count is not a duration** (§26.6). Five million iterations of an MMIO
+/// read is a few hundred milliseconds on an x86 machine whose uncached reads are ~50 ns, and several
+/// SECONDS on a board reaching a PCIe endpoint across a root complex. The same literal cannot mean
+/// both, so the bound is expressed in milliseconds and converted by the machine's own calibration.
+///
+/// The other one applies everywhere and was always a bug: expiry was **silent**. A controller that
+/// never cleared `CNR` produced no line at all, and the next step ran anyway on a device that was
+/// not ready - a failure discovered several registers later, as nonsense. §26.7 asks for the
+/// opposite, so expiry now says which wait gave up. `what` is the register condition in words; a
+/// caller passing something vague is passing up the whole point.
+fn spin<F: Fn() -> bool>(ctx: &ServiceContext, what: &str, ms: u64, cond: F) -> bool {
+    let budget = ctx.duration_cycles(ms);
+    let t0 = ctx.read_tsc();
+    while !cond() {
+        if ctx.read_tsc().wrapping_sub(t0) >= budget {
+            ctx.log_fmt(format_args!(
+                "xhci: TIMEOUT after ~{} ms waiting for {} - the controller did not answer",
+                ms, what
+            ));
+            return false;
+        }
     }
+    true
 }
+
+// Timing budgets, in milliseconds, converted per machine at the point of use.
+//
+// These were raw TSC-cycle literals chosen for a ~2 GHz x86 (`100_000_000` meaning "~50 ms"). A
+// cycle is not a portable unit - the AArch64 generic timer runs at 54 MHz on a Pi 4, where that same
+// literal asks for nearly two seconds and `HUB_RESCAN` asks for the better part of a minute. So the
+// numbers below are DURATIONS and `ctx.duration_cycles` does the conversion through the kernel's own
+// calibration, which is the portable path the SDK already documents for exactly this mistake.
+//
+/// Recovery hold after a root-port reset before addressing the device. USB 2.0 requires a
+/// reset-recovery interval (TRSTRCY >= 10 ms) before a device can accept transactions; without it a
+/// high-speed root-port device NAKs the Address Device SET_ADDRESS and returns a Transaction Error.
+/// Matches the behind-a-hub reset hold.
+const RESET_RECOVERY_MS: u64 = 55;
+/// How often the poll loop GET_STATUSes a hub's downstream port to notice a device unplugged from
+/// behind it (no root PORTSC reflects that). Responsive enough for a "keyboard disconnected" notice,
+/// infrequent enough not to load the hub or eat keystrokes off the shared event ring - the check runs
+/// a control transfer, and between checks the keyboard endpoint has the ring to itself.
+const HUB_POLL_MS: u64 = 500;
+/// How long the "a hub is present but nothing usable is behind it" wait sleeps before re-walking the
+/// hub. A device replugged BEHIND a hub changes no root PORTSC, so the root-port wait would miss it.
+/// Only runs while NO HID is bound.
+const HUB_RESCAN_MS: u64 = 1_500;
+
+/// Idle-wait pacing for the paths that have NO device to service (`idle`, `wait_for_port`, the hub
+/// re-walk). These used `yield_cpu`, which does not sleep - it pegs the core at ~100% forever, which
+/// is exactly what showed up as ~85k scheduler quanta/s on the T630 (its keyboard is on ehci, so
+/// xhci sits here permanently). `sleep` PARKS the task instead: the core can halt, and with the
+/// Phase 2a idle-tick slowdown it can also stretch its timer.
+///
+/// This deliberately keeps the SELF-DRIVEN poll these loops were built around - we still `try_recv`
+/// on our own schedule and need no cross-core wake, so the flood-storm drain property the previous
+/// comments relied on is preserved (a deeply-blocked `recv` on an AP was the unreliable part, and we
+/// still never do that). Granularity is one scheduler quantum, so this value only sets a floor.
+const IDLE_WAIT_MS: u64 = 5;
 
 /// Wait until a port reports a *newly* connected device, then return so the caller
 /// re-scans. Snapshots the ports already connected on entry (e.g. the USB boot
@@ -236,7 +268,7 @@ fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
         // flood-storm (or any stray send) fills our 16-deep queue and it sits at 16/16 FOREVER, exactly
         // the logger stub bug in another guise. try_recv is non-blocking, so the port poll is unaffected.
         while ctx.try_recv().is_some() {}
-        ctx.sleep(IDLE_WAIT_CYCLES);
+        ctx.sleep(ctx.duration_cycles(IDLE_WAIT_MS));
     }
 }
 
@@ -267,7 +299,7 @@ fn idle(ctx: &ServiceContext) -> ! {
     // on an AP is unreliable under QEMU TCG (the drain flaked in the flood-storm pin); the self-driven poll
     // drains every quantum with no wake needed (mirrors wait_for_port above + ehci idle_draining). Pinned by
     // the shell-test `chaos flood-storm xhci` step (xhci has no controller in QEMU, so it sits in this path).
-    loop { while ctx.try_recv().is_some() {} ctx.sleep(IDLE_WAIT_CYCLES); }
+    loop { while ctx.try_recv().is_some() {} ctx.sleep(ctx.duration_cycles(IDLE_WAIT_MS)); }
 }
 
 /// Poll the event ring for the next event TRB. Returns (trb_type, completion,
@@ -892,13 +924,15 @@ fn enumerate_one(
     // USB2 port-reset (PR) bit *disables* them. So only reset a not-yet-enabled (USB2) port.
     if psc & PORT_PED == 0 {
         mmio.write32(portsc_off, (psc & !PORT_RW1C) | PORT_PR);
-        spin(|| mmio.read32(portsc_off) & PORT_PED != 0);
+        spin(ctx, "PORTSC.PED after a root-port reset", 250,
+             || mmio.read32(portsc_off) & PORT_PED != 0);
         // Reset-recovery hold before we address the device (Fix 3): PED asserting does not mean the
         // device is ready for the SET_ADDRESS of Address Device. A high-speed root-port device (the
         // Wyse's port 6) returns a Transaction Error (completion=4) without this; the behind-a-hub path
         // already holds here. Bounded, TSC-paced.
         let t0 = ctx.read_tsc();
-        while ctx.read_tsc().wrapping_sub(t0) < RESET_RECOVERY_CYCLES {}
+        let hold = ctx.duration_cycles(RESET_RECOVERY_MS);
+        while ctx.read_tsc().wrapping_sub(t0) < hold {}
     }
     let psc = mmio.read32(portsc_off);
     let speed = (psc >> 10) & 0xF;
@@ -1300,7 +1334,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
         ctx.log_fmt(format_args!("xhci: reset: entering (USBCMD={:#010x} USBSTS={:#010x})", cmd, sts0));
         mmio.write32(op + OP_USBCMD, cmd & !CMD_RS);
-        spin(|| mmio.read32(op + OP_USBSTS) & STS_HCH != 0);
+        spin(&ctx, "USBSTS.HCH (controller to halt)", 250,
+              || mmio.read32(op + OP_USBSTS) & STS_HCH != 0);
         ctx.log_fmt(format_args!("xhci: reset: halted (USBSTS={:#010x})", mmio.read32(op + OP_USBSTS)));
         mmio.write32(op + OP_USBCMD, CMD_HCRST);
         // xHCI 5.4.1/5.4.2: after HCRST the controller asserts CNR (Controller Not Ready) and software
@@ -1314,8 +1349,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // cleared - USBCMD is never touched while the controller is not ready.
         let t0 = ctx.read_tsc();
         while ctx.read_tsc().wrapping_sub(t0) < 2_000_000 {} // ~1-2 ms settle (bounded; TSC always runs)
-        spin(|| mmio.read32(op + OP_USBSTS) & STS_CNR == 0);
-        spin(|| mmio.read32(op + OP_USBCMD) & CMD_HCRST == 0);
+        spin(&ctx, "USBSTS.CNR to clear after HCRST", 500,
+              || mmio.read32(op + OP_USBSTS) & STS_CNR == 0);
+        spin(&ctx, "USBCMD.HCRST to clear", 250,
+              || mmio.read32(op + OP_USBCMD) & CMD_HCRST == 0);
         ctx.log_fmt(format_args!(
             "xhci: reset: done (USBCMD={:#010x} USBSTS={:#010x})",
             mmio.read32(op + OP_USBCMD), mmio.read32(op + OP_USBSTS)
@@ -1350,7 +1387,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         mmio.write32(ir0 + 0x00, IMAN_IE | IMAN_IP);
         let c = mmio.read32(op + OP_USBCMD);
         mmio.write32(op + OP_USBCMD, c | CMD_RS | CMD_INTE);
-        spin(|| mmio.read32(op + OP_USBSTS) & STS_HCH == 0);
+        spin(&ctx, "USBSTS.HCH to clear (controller to run)", 250,
+              || mmio.read32(op + OP_USBSTS) & STS_HCH == 0);
 
         // Fresh ring bookkeeping for this pass.
         let mut ev_idx = 0usize;
@@ -1445,8 +1483,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         if !c { base_ports &= !(1 << p); }
                     }
                     if new_root { break; } // a front/root-port device appeared - re-walk now
-                    if ctx.read_tsc().wrapping_sub(t0) >= HUB_RESCAN_CYCLES { break; } // periodic re-walk
-                    ctx.sleep(IDLE_WAIT_CYCLES);
+                    if ctx.read_tsc().wrapping_sub(t0) >= ctx.duration_cycles(HUB_RESCAN_MS) { break; } // periodic re-walk
+                    ctx.sleep(ctx.duration_cycles(IDLE_WAIT_MS));
                 }
                 announce = true; // whatever we bind on the re-walk is a real plug event
                 continue 'reenum;
@@ -1643,7 +1681,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // leaves - its root port is the hub's, and the hub stays put - so it is instead detected by
             // GET_STATUSing the hub's downstream port, throttled (a control transfer, not free). Either
             // way: notify and break to fully re-initialize, re-binding whatever remains next pass.
-            let hub_due = ctx.read_tsc().wrapping_sub(last_hub_poll) > HUB_POLL_CYCLES;
+            let hub_due = ctx.read_tsc().wrapping_sub(last_hub_poll) > ctx.duration_cycles(HUB_POLL_MS);
             let mut eaten = 0u32; // HID slots whose events a hub check consumed (re-arm them below)
             for d in 0..ndev {
                 let gone = if devs[d].hub_slot == 0 {
