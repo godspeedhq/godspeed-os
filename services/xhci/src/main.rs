@@ -374,7 +374,8 @@ pub(crate) fn next_event(
             *ev_idx = 0;
             *ev_cycle ^= 1;
         }
-        mmio.write64(
+        wr64(
+            mmio,
             ir0 + 0x18,
             dma.phys_at(EVENT_RING_OFF + *ev_idx * TRB_SIZE) | (1 << 3),
         );
@@ -1267,6 +1268,24 @@ fn bind_msc(
 /// `true` if the controller has WEDGED (Item 3, Fix 1). A wedged HC does not just fail this one command
 /// - it stops executing entirely, including an already-bound keyboard's interrupt transfers, so the
 /// caller must poison the offending port and re-initialise the controller rather than issue more doomed
+/// Write a 64-bit xHCI register as TWO 32-BIT WRITES, low half first.
+///
+/// The SDK's `Mmio::write64` emits a single 64-bit store. Our in-kernel driver - the one that has
+/// always driven this exact VL805 on the Pi 4 - has never done that: its `wr64` is two 32-bit writes,
+/// and the difference had never been tested because QEMU accepts either.
+///
+/// It matters because these registers live behind the BCM2711's PCIe bridge, not in the SoC's own
+/// peripheral space, and a 64-bit store to a device BAR is not guaranteed to cross a bridge intact.
+/// The xHCI spec's own guidance is that software may only use a single 64-bit access where the
+/// controller declares support for it; two 32-bit writes are always legal.
+///
+/// Low half first is required, not stylistic: several of these registers (CRCR especially) latch on
+/// the write of the HIGH half, so writing high-then-low latches a half-updated pointer.
+fn wr64(mmio: &Mmio, off: usize, val: u64) {
+    mmio.write32(off, val as u32);
+    mmio.write32(off + 4, (val >> 32) as u32);
+}
+
 /// One-line reminder of what the dump below distinguishes, so a log reader does not have to hold the
 /// xHCI spec in their head. Kept as a constant so it cannot drift from `dump_ring_state`.
 const DIAG_HINT: &str = "command diagnosis - CRR=0 means the controller never started the command ring; TRB readback wrong means our write is not reaching RAM the device sees; EVT cycle unchanged means it never posted a completion";
@@ -1300,6 +1319,10 @@ fn dump_ring_state(
         cmd_off,
         dma.read32(cmd_off), dma.read32(cmd_off + 4),
         dma.read32(cmd_off + 8), dma.read32(cmd_off + 12)));
+    ctx.log_fmt(format_args!(
+        "xhci: ERSTSZ={} ERSTBA={:#010x} erst_phys={:#x} erst[0]={:#010x} size={}",
+        mmio.read32(ir0 + 0x08), mmio.read32(ir0 + 0x10), dma.phys_at(ERST_OFF),
+        dma.read32(ERST_OFF), dma.read32(ERST_OFF + 8)));
     let ev = EVENT_RING_OFF + ev_idx * TRB_SIZE;
     ctx.log_fmt(format_args!(
         "xhci: EVT[{}] @{:#x} ctrl={:#010x} (want cycle {}) ERDP={:#010x} ev_ring_phys={:#x}",
@@ -2063,13 +2086,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             dma.write64(DCBAA_OFF, dma.phys_at(SCRATCHPAD_SBA_OFF));
         }
-        mmio.write64(op + OP_DCBAAP, dma.phys_at(DCBAA_OFF));
-        mmio.write64(op + OP_CRCR, dma.phys_at(CMD_RING_OFF) | 1);
+        wr64(&mmio, op + OP_DCBAAP, dma.phys_at(DCBAA_OFF));
+        wr64(&mmio, op + OP_CRCR, dma.phys_at(CMD_RING_OFF) | 1);
         dma.write64(ERST_OFF, dma.phys_at(EVENT_RING_OFF));
         dma.write32(ERST_OFF + 8, EVENT_RING_TRBS as u32);
         mmio.write32(ir0 + 0x08, 1);
-        mmio.write64(ir0 + 0x10, dma.phys_at(ERST_OFF));
-        mmio.write64(ir0 + 0x18, dma.phys_at(EVENT_RING_OFF));
+        wr64(&mmio, ir0 + 0x10, dma.phys_at(ERST_OFF));
+        wr64(&mmio, ir0 + 0x18, dma.phys_at(EVENT_RING_OFF));
         mmio.write32(op + OP_CONFIG, max_slots);
         // P2 (interrupt-driven, §12): enable the interrupter so the controller raises its
         // MSI-X (kernel-programmed to vector 0x28) when it posts an event. IMAN: IE on, write
