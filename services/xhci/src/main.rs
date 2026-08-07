@@ -2551,6 +2551,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // position and cycle must continue where the controller's dequeue actually sits.
         // Consecutive probes that reported the disk's port disconnected. Persists across passes -
         // a counter reset every pass could never reach two.
+        // Hub ports we have already enumerated and did NOT end up binding anything from.
+        //
+        // "Connected" is not "newly arrived". A device we cannot bind - not a HID, not a disk, or a
+        // bind that failed - leaves its port connected forever, and a scan that equates the two
+        // re-enumerates on it every pass. That is the ~8-second loop on the Pi 4: hub port 4 held a
+        // keyboard that did not bind, so the driver rediscovered it, re-initialised the controller,
+        // failed to bind it again, and repeated - tearing down every other device each time.
+        //
+        // Root ports already had this concept (`poisoned`); hub ports did not. A bit is cleared when
+        // its port reports DISCONNECTED, so a genuine unplug-replug is still seen as new.
+        let mut hub_tried: u64 = 0;
         let mut disk_absent_seen: u32 = 0;
         let mut disk_hub_cur = 0usize;
         let mut disk_hub_pcs = 1u32;
@@ -2951,13 +2962,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         );
                         hub_cur[owner] = cur;
                         hub_pcs[owner] = pcs;
-                        if st == Some(true) {
-                            ctx.log_fmt(format_args!(
-                                "xhci: new device on hub slot {} port {} - re-enumerating",
-                                hub_slot, hp
-                            ));
-                            announce = true;
-                            break 'poll;
+                        // Same rule as the disk-hub scan: connected is not newly-arrived. Without
+                        // the retry mask, a port holding something we cannot bind re-enumerates the
+                        // whole controller on every pass.
+                        match st {
+                            Some(true) if hp < 64 && hub_tried & (1u64 << hp) == 0 => {
+                                hub_tried |= 1u64 << hp;
+                                ctx.log_fmt(format_args!(
+                                    "xhci: new device on hub slot {} port {} - re-enumerating",
+                                    hub_slot, hp
+                                ));
+                                announce = true;
+                                break 'poll;
+                            }
+                            Some(false) if hp < 64 => hub_tried &= !(1u64 << hp),
+                            _ => {}
                         }
                     }
                 }
@@ -2988,13 +3007,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             &dma, &mmio, dboff, ir0, hs, hd, hp,
                             &mut cur, &mut pcs, &mut ev_idx, &mut ev_cycle, &mut eaten,
                         );
-                        if st == Some(true) {
-                            ctx.log_fmt(format_args!(
-                                "xhci: device arrived on hub slot {} port {} - re-enumerating", hs, hp));
-                            announce = true;
-                            disk_hub_cur = cur;
-                            disk_hub_pcs = pcs;
-                            break 'poll;
+                        match st {
+                            // Connected AND not already tried: a real arrival.
+                            Some(true) if hp < 64 && hub_tried & (1u64 << hp) == 0 => {
+                                hub_tried |= 1u64 << hp;
+                                ctx.log_fmt(format_args!(
+                                    "xhci: device arrived on hub slot {} port {} - re-enumerating", hs, hp));
+                                announce = true;
+                                disk_hub_cur = cur;
+                                disk_hub_pcs = pcs;
+                                break 'poll;
+                            }
+                            // Gone: forget that we tried, so a replug counts as new again.
+                            Some(false) if hp < 64 => hub_tried &= !(1u64 << hp),
+                            _ => {}
                         }
                     }
                     disk_hub_cur = cur;
