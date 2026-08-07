@@ -1090,7 +1090,25 @@ fn serve_if_block(
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
 ) {
-    let Some(reply) = ctx.take_pending_cap() else { return };
+    // A message ARRIVED. Logged (bounded, first few only) because the Pi 4 showed block requests
+    // getting no reply at all while NEITHER failure path inside `serve_block` logged - which means
+    // it was never reached, and the two ways that can happen need different fixes: the poll loop is
+    // not running (no message ever arrives here), or a message arrives WITHOUT a reply cap and this
+    // function returns silently. Guessing between them has already cost two boots.
+    static mut SEEN: u32 = 0;
+    // SAFETY: single-threaded service; a diagnostic counter, not a correctness mechanism.
+    let n = unsafe { SEEN += 1; SEEN };
+    if n <= 8 {
+        ctx.log_fmt(format_args!(
+            "xhci: block-path message #{} arrived, {} bytes",
+            n, msg.payload_bytes().len()));
+    }
+    let Some(reply) = ctx.take_pending_cap() else {
+        if n <= 8 {
+            ctx.log("xhci: block request had NO reply cap - dropping it (the caller will block)");
+        }
+        return;
+    };
     let mut out = [0u8; 520];
     let mut eaten = 0u32;
     let n = msc::serve_block(
@@ -2390,6 +2408,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // The event ring is shared; transfer events are demultiplexed by slot id.
         // Each device has its own ring cursor (int_idx/int_cycle), re-arm flag, and
         // decode state (keyboard rollover buffer or mouse tracker).
+        // Says the poll loop was REACHED, and with what. If block requests go unanswered and this
+        // line is absent, the loop is not running and nothing inside it can be at fault.
+        ctx.log_fmt(format_args!(
+            "xhci: entering poll loop - {} HID(s), disk {}",
+            ndev, if disk.is_some() { "BOUND" } else { "none" }));
         let mut int_idx = [0usize; MAX_HID];
         let mut int_cycle = [1u32; MAX_HID];
         let mut need_queue = [true; MAX_HID];
