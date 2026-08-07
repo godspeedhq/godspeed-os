@@ -350,6 +350,21 @@ from the wrong places.
 |------|--------|-----|
 | `arch/aarch64/genet.rs` | new, 1 | The revision read, through `probe_read32` so an absent controller is reported rather than taken as an external abort that surfaces later blaming something unrelated. |
 
+## 2026-08-07 - MSI: the USB driver waits on an interrupt instead of a timer (feat/pi4-aarch64)
+
+The Pi 4's xHCI service could only find an event by waking on a timer and looking - the controller's
+MSIs were masked at PCIe bring-up ("interrupts are not routed yet - the event ring is polled"). That
+is a floor on input latency no tuning removes, because the wait is not waiting FOR anything.
+
+The BCM2711 raises ONE SPI for all 32 of its MSIs, so the handler is a demultiplexer: read
+`MSI_INTR2_STATUS`, clear it, deliver. The one added `unsafe` is the existing `route::deliver` call
+shape, in the arm that handles that SPI - the same call, under the same documented contract (IRQ
+handler, interrupts masked), as the generic SPI arm two lines below it.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/exceptions.rs` | 13 -> 14 (+1) | `route::deliver` for the demultiplexed PCIe MSI. Identical contract to the generic SPI delivery beside it: called from the IRQ handler with interrupts masked. |
+
 ## 2026-08-06 - the in-kernel GENET driver is DELETED: 14 unsafe lines to 1 (feat/pi4-aarch64)
 
 The largest single reduction in this audit's history, and it is a reduction because the code did not
@@ -2262,7 +2277,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/sched_spawn.rs | 2 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
-| arch/aarch64/exceptions.rs | 13 | permitted |
+| arch/aarch64/exceptions.rs | 14 | permitted |
 | arch/aarch64/uaccess.rs | 7 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |

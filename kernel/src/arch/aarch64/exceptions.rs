@@ -321,6 +321,12 @@ fn ec_name(esr: u64) -> &'static [u8] {
 /// Ticks seen, so the boot can report progress instead of asserting the timer works.
 pub static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Said once: an SPI too high to express in the neutral routing table's `u8` key.
+/// The BCM2711 PCIe controller's MSI interrupt: GIC SPI 148, so INTID 32 + 148.
+const PCIE_MSI_SPI: u32 = 32 + 148;
+/// The neutral IRQ number the `xhci` service is granted (`hw_irqs: &[0x28]`). It began as an x86 MSI
+/// vector; here it is simply the agreed name for "the USB controller's interrupt".
+const XHCI_MSI_VECTOR: u8 = 0x28;
+
 static SPI_TOO_HIGH_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// IRQ entry. Acknowledge at the GIC, handle, end-of-interrupt, return.
@@ -357,6 +363,24 @@ extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
     // IDs are bounded to a byte because the neutral routing table is keyed by `u8` (an x86 vector). The
     // GIC numbers SPIs up to 1020, so anything above 255 cannot be expressed and is retired rather than
     // silently dropped into the wrong bucket - loud about the limit instead of wrong about the IRQ.
+    // The PCIe controller raises ONE SPI for all 32 of its MSIs, so this is a demultiplexer, not a
+    // route. It must read the status register to learn which MSI fired and clear it before returning:
+    // the SPI is level-triggered, so an unacknowledged bit re-raises it immediately and the core makes
+    // no further progress - which the liveness watchdog turns into a panic.
+    //
+    // The MSI is translated into the NEUTRAL vector the service was granted (`hw_irqs: &[0x28]`)
+    // rather than delivered as SPI 180. That number began life as an x86 MSI vector, and keeping it
+    // means the `xhci` service's contract says the same thing on both architectures - the arch layer
+    // maps its own interrupt onto the shared name, which is what the seam exists for.
+    if id == PCIE_MSI_SPI {
+        let pending = super::pcie::msi_take_pending();
+        if pending & 1 != 0 {
+            // SAFETY: in the IRQ handler with interrupts masked - `deliver`'s documented contract.
+            unsafe { crate::interrupt::route::deliver(XHCI_MSI_VECTOR) };
+        }
+        super::gic::eoi(id);
+        return;
+    }
     if id >= 32 {
         if id <= u8::MAX as u32 {
             // SAFETY: called from the IRQ handler with interrupts masked, which is the contract the x86

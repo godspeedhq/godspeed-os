@@ -54,7 +54,33 @@ const MEM_WIN0_BASE_HI: u64 = 0x4080;
 const MEM_WIN0_LIMIT_HI: u64 = 0x4084;
 const HARD_DEBUG: u64 = 0x4204;
 const UBUS_BAR2_CONFIG_REMAP: u64 = 0x40b4;
+/// The MSI_INTR2 interrupt block. One SPI serves ALL 32 MSIs on this controller, so the handler has
+/// to read STATUS to find out which fired and CLR to acknowledge it. A bit left set re-raises the SPI
+/// immediately - an unacknowledged level interrupt is a storm, not a missed event.
+const MSI_INTR2_STATUS:   u64 = 0x4500;
+const MSI_INTR2_CLR:      u64 = 0x4500 + 0x08;
 const MSI_INTR2_MASK_SET: u64 = 0x4500 + 0x10;
+const MSI_INTR2_MASK_CLR: u64 = 0x4500 + 0x14;
+
+/// Where an endpoint writes to raise an MSI, and what the controller matches on.
+const MSI_BAR_CONFIG_LO:  u64 = 0x4044;
+const MSI_BAR_CONFIG_HI:  u64 = 0x4048;
+const MSI_DATA_CONFIG:    u64 = 0x404c;
+
+/// The MSI target address. It is deliberately an address the ENDPOINT can reach through the inbound
+/// window but that decodes to the controller rather than to RAM: an MSI is a posted write the
+/// controller intercepts, not a write anything stores. Linux uses this same constant for a
+/// controller whose inbound window sits below 4 GB, which is ours.
+const MSI_TARGET_ADDR: u64 = 0x0000_0000_FFFF_FFFC;
+/// Match-enable, bit 0 of the LO register.
+const MSI_BAR_CONFIG_LO_MATCH_EN: u32 = 1;
+/// The data pattern the controller matches for a 32-MSI configuration. The low 16 bits are the base
+/// the endpoint must send; the MSI index is OR'd into them.
+const MSI_DATA_CONFIG_VAL_32: u32 = 0xffe0_6540;
+
+/// PCI capability IDs and the MSI capability's register layout.
+const PCI_CAP_ID_MSI: u32 = 0x05;
+const PCI_STATUS_CAP_LIST: u32 = 1 << 20;
 const EXT_CFG_DATA: u64 = 0x8000;
 const EXT_CFG_INDEX: u64 = 0x9000;
 const RGR1_SW_INIT_1: u64 = 0x9210;
@@ -479,6 +505,20 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
 
         // Read the BAR back rather than assume the write took. A BAR that did not stick is the same
         // silence as a bridge window that was never opened, and the two want different fixes.
+        // MSI, before the BAR is reported and long before any driver touches the controller. The
+        // endpoint must know where to post an interrupt before it is ever asked to generate one.
+        //
+        // Unmasked immediately, and that is safe BECAUSE the handler acknowledges unconditionally:
+        // `msi_take_pending` clears whatever is set whether or not a service is listening, so an MSI
+        // arriving before the `xhci` service exists is absorbed rather than left to re-raise a
+        // level-triggered SPI forever. Waiting for the service to spawn would be the more obvious
+        // order and the wrong one - it leaves a window where the endpoint can post and nothing acks.
+        if enable_msi(1, dev, 0) {
+            unmask_msi();
+            put_str(b"pcie: xHCI MSI enabled - the driver waits on interrupts
+");
+        }
+
         let bar_back = cfg_read(1, dev, 0, 0x10) & !0xF;
         put_str(b"pcie: xHCI BAR0 assigned bus ");
         put_hex(bar_back as u64);
@@ -561,4 +601,98 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
 
     put_str(b"pcie: no xHCI controller found on bus 1 - no USB on this boot\r\n");
     None
+}
+
+/// Turn the controller's MSI receiver on, and program `bdf`'s MSI capability to use index 0.
+///
+/// Returns `true` if the endpoint had an MSI capability and it was programmed.
+///
+/// ## Why this is the fix and the polling was not
+///
+/// Until now `MSI_INTR2_MASK_SET` masked every MSI at init, with the comment "interrupts are not
+/// routed yet - the event ring is polled". So the `xhci` service could only discover an event by
+/// waking on a timer and looking, which is a floor on input latency no amount of tuning removes:
+/// the wait is not waiting FOR anything, it is waiting BEFORE looking.
+///
+/// ## The order matters
+///
+/// The controller's receiver is set up FIRST and the endpoint is enabled LAST. An endpoint allowed
+/// to post an MSI before the controller knows the target address writes to an address nothing
+/// claims; on this SoC that is an unclaimed posted write, not a fault, so it would be lost silently
+/// and the symptom would be "interrupts never arrive" with everything looking configured.
+///
+/// The MSI stays MASKED here regardless. Unmasking is `unmask_msi`, called only once a handler is
+/// installed - an unmasked source with nothing to acknowledge it is a level interrupt that re-fires
+/// forever, which is worse than the polling it replaces.
+pub fn enable_msi(bus: u8, dev: u8, func: u8) -> bool {
+    // 1. Controller side: where MSIs land, and what data pattern identifies them.
+    wr(MSI_BAR_CONFIG_LO, (MSI_TARGET_ADDR as u32) | MSI_BAR_CONFIG_LO_MATCH_EN);
+    wr(MSI_BAR_CONFIG_HI, (MSI_TARGET_ADDR >> 32) as u32);
+    wr(MSI_DATA_CONFIG, MSI_DATA_CONFIG_VAL_32);
+    // Acknowledge anything stale before a handler can see it, and keep everything masked.
+    wr(MSI_INTR2_CLR, 0xFFFF_FFFF);
+    wr(MSI_INTR2_MASK_SET, 0xFFFF_FFFF);
+
+    // 2. Endpoint side: find its MSI capability by walking the capability list.
+    if cfg_read(bus, dev, func, 0x04) & PCI_STATUS_CAP_LIST == 0 {
+        put_str(b"pcie: endpoint reports no capability list - cannot use MSI\r\n");
+        return false;
+    }
+    let mut off = (cfg_read(bus, dev, func, 0x34) & 0xFC) as u16;
+    // Bounded walk: a malformed or looping Next pointer must not spin the boot (§26.6).
+    for _ in 0..48 {
+        if off < 0x40 {
+            break;
+        }
+        let hdr = cfg_read(bus, dev, func, off);
+        if hdr & 0xFF == PCI_CAP_ID_MSI {
+            // Message Control is the upper half of the capability's first dword. Bit 7 = 64-bit
+            // address capable, which decides where the Data register sits - getting that wrong
+            // writes the vector into the address's high half and the interrupt never arrives.
+            let mc = (hdr >> 16) & 0xFFFF;
+            let is64 = mc & (1 << 7) != 0;
+            cfg_write(bus, dev, func, off + 0x04, MSI_TARGET_ADDR as u32);
+            let data_off = if is64 {
+                cfg_write(bus, dev, func, off + 0x08, (MSI_TARGET_ADDR >> 32) as u32);
+                off + 0x0C
+            } else {
+                off + 0x08
+            };
+            // Index 0. The controller matches the low 16 bits of its data pattern, and the MSI
+            // number is OR'd in - so index 0 is the pattern itself.
+            cfg_write(bus, dev, func, data_off, MSI_DATA_CONFIG_VAL_32 & 0xFFFF);
+            // Enable, and request exactly ONE vector (Multiple Message Enable = 0). Asking for more
+            // than the handler demultiplexes is how a driver receives interrupts it never handles.
+            let mc_new = (mc & !(0x7 << 4)) | 1;
+            cfg_write(bus, dev, func, off, (hdr & 0xFFFF) | (mc_new << 16));
+            put_str(b"pcie: endpoint MSI capability programmed (index 0, masked until a handler is installed)\r\n");
+            return true;
+        }
+        let next = (hdr >> 8) & 0xFF;
+        if next == 0 {
+            break;
+        }
+        off = next as u16;
+    }
+    put_str(b"pcie: endpoint has no MSI capability - falling back to the polled path\r\n");
+    false
+}
+
+/// Unmask MSI index 0. Called only after a handler exists to acknowledge it.
+pub fn unmask_msi() {
+    wr(MSI_INTR2_CLR, 0xFFFF_FFFF);
+    wr(MSI_INTR2_MASK_CLR, 1);
+}
+
+/// Read and ACKNOWLEDGE the pending MSI set. Returns the bits that were pending.
+///
+/// Clearing is not optional and not deferrable: the SPI this serves is level-triggered, so a bit
+/// left set re-raises it the instant the handler returns. That is an interrupt storm, and it would
+/// present as a core that never makes progress - which the liveness watchdog turns into a panic.
+pub fn msi_take_pending() -> u32 {
+    let status = rd(MSI_INTR2_STATUS);
+    if status != 0 {
+        wr(MSI_INTR2_CLR, status);
+    }
+    status
 }
