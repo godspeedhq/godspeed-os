@@ -690,6 +690,13 @@ pub fn unmask_msi() {
     // delivered because the SPI sat masked in the distributor. Only the timer PPI had ever been
     // enabled here, so this port had never needed the SPI path and nothing revealed the gap.
     super::gic::enable(super::exceptions::PCIE_MSI_SPI);
+    // Record the route as EDGE-triggered. An MSI is a posted write, not a held line, so there is
+    // nothing to mask while the driver works - and masking it would be worse than pointless: the
+    // xhci service does not call `irq_unmask`, so USB interrupts would stop after the first one and
+    // the driver would fall back to polling with nothing saying why. Registering it states that
+    // explicitly rather than leaving it to an absent table entry.
+    super::ioapic::register_route(
+        super::exceptions::XHCI_MSI_VECTOR, super::exceptions::PCIE_MSI_SPI, false);
 }
 
 /// Read and ACKNOWLEDGE the pending MSI set. Returns the bits that were pending.

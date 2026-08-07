@@ -350,6 +350,21 @@ from the wrong places.
 |------|--------|-----|
 | `arch/aarch64/genet.rs` | new, 1 | The revision read, through `probe_read32` so an absent controller is reported rather than taken as an external abort that surfaces later blaming something unrelated. |
 
+## 2026-08-07 - GIC disable: masking a level-triggered device IRQ for a userspace driver (feat/pi4-aarch64)
+
+A LEVEL-triggered device interrupt keeps its line asserted until the DEVICE's own status register is
+cleared - and on this port that register lives in MMIO only the userspace driver maps. So the kernel
+cannot acknowledge it; it can only stop listening until the driver says it has (the `IrqUnmask`
+syscall). Without `disable`, `route::deliver` returns with the line still high and the interrupt
+re-enters immediately, which the liveness watchdog turns into a panic.
+
+`GICD_ICENABLER` is write-1-to-clear, so the write touches only the named interrupt - a
+read-modify-write would race another core enabling a different one.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/gic.rs` | 6 -> 7 (+1) | `disable(id)`: one volatile write to `GICD_ICENABLER`, the counterpart of the existing `enable`. Same Device mapping, same bounds argument. |
+
 ## 2026-08-07 - MSI: the USB driver waits on an interrupt instead of a timer (feat/pi4-aarch64)
 
 The Pi 4's xHCI service could only find an event by waking on a timer and looking - the controller's
@@ -2282,7 +2297,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
-| arch/aarch64/gic.rs | 6 | permitted |
+| arch/aarch64/gic.rs | 7 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 23 | permitted |
 | arch/aarch64/ptables.rs | 21 | permitted |

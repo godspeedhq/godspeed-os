@@ -26,6 +26,7 @@ const GICC: usize = GIC_BASE + 0x2000;
 // Distributor registers.
 const GICD_CTLR: *mut u32 = GICD as *mut u32;
 const GICD_ISENABLER: *mut u32 = (GICD + 0x100) as *mut u32; // 1 bit per interrupt
+const GICD_ICENABLER: *mut u32 = (GICD + 0x180) as *mut u32; // 1 bit per interrupt, write 1 to DISABLE
 const GICD_IPRIORITYR: *mut u8 = (GICD + 0x400) as *mut u8; // 1 byte per interrupt
 const GICD_ITARGETSR: *mut u8 = (GICD + 0x800) as *mut u8; // 1 byte per interrupt (CPU mask)
 
@@ -124,6 +125,25 @@ pub fn enable(id: u32) {
         let reg = (id / 32) as usize;
         let bit = id % 32;
         GICD_ISENABLER.add(reg).write_volatile(1 << bit);
+    }
+}
+
+/// Stop an interrupt reaching a core, without touching its priority or target.
+///
+/// The counterpart of [`enable`], and the mechanism behind masking a LEVEL-triggered device
+/// interrupt while a userspace driver handles it. A level source keeps its line asserted until the
+/// DEVICE's own status register is cleared, and on this port that register lives in MMIO the kernel
+/// does not map - the driver owns it. So the kernel cannot ack; it can only stop listening until the
+/// driver says it has. Without that, `deliver` returns, the line is still high, and the interrupt
+/// re-enters immediately: a storm the liveness watchdog turns into a panic.
+pub fn disable(id: u32) {
+    // SAFETY: GIC-400 registers, Device-mapped; `id` indexes a bit array the controller defines to be
+    // at least this large for any valid interrupt ID. ICENABLER is write-1-to-clear, so this affects
+    // only the named interrupt - a read-modify-write would race another core enabling a different one.
+    unsafe {
+        let reg = (id / 32) as usize;
+        let bit = id % 32;
+        GICD_ICENABLER.add(reg).write_volatile(1 << bit);
     }
 }
 

@@ -2348,10 +2348,81 @@ pub mod fb {
 }
 
 // ---------------------------------------------------------------------------
+/// Masking a device interrupt while a userspace driver handles it.
+///
+/// Named `ioapic` because that is the x86 mechanism the neutral layer calls through; here it is the
+/// GIC distributor. The neutral `interrupt::route::deliver` masks a source before handing it to a
+/// driver, and the driver unmasks with the `IrqUnmask` syscall once it has cleared the device's own
+/// status register.
+///
+/// These were EMPTY STUBS, and that was survivable for exactly one reason: the only interrupt routed
+/// to userspace on this port is the xHCI's MSI, which is edge-triggered and needs no masking. A
+/// LEVEL-triggered source is different - its line stays asserted until the device is acked, and the
+/// kernel cannot ack it because the register lives in MMIO only the driver maps. Deliver, return,
+/// re-enter, forever.
+///
+/// ## Why the table carries a trigger mode
+///
+/// Masking an EDGE source would be actively harmful, not merely useless: the xHCI service does not
+/// call `irq_unmask` (it has never needed to), so masking its vector would stop USB interrupts after
+/// the first one and silently return the driver to polling. So the mask is applied ONLY to vectors
+/// registered as level-triggered. Edge vectors are recorded too, rather than omitted, so the table
+/// states the fact instead of leaving it to a missing entry.
 pub mod ioapic {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// One slot per routed device interrupt. Four is more than this board uses; a fixed table keeps
+    /// the bound readable and needs no allocator (§26.6).
+    const MAX_ROUTES: usize = 4;
+    /// Packed `vector | intid << 8 | level << 24`, or 0 for an empty slot. Vector 0 is not routable,
+    /// so 0 is unambiguous as "empty".
+    static ROUTES: [AtomicU32; MAX_ROUTES] = [
+        AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    ];
+
     pub fn init() {}
-    pub fn mask_vector(vector: u8) {}
-    pub fn unmask_vector(vector: u8) {}
+
+    /// Record that neutral `vector` is GIC `intid`, and whether it is level-triggered.
+    ///
+    /// Returns false if the table is full - loudly at the call site rather than silently dropping a
+    /// route, which would present as an interrupt that is simply never masked.
+    pub fn register_route(vector: u8, intid: u32, level: bool) -> bool {
+        let packed = vector as u32 | (intid << 8) | ((level as u32) << 24);
+        for slot in ROUTES.iter() {
+            if slot.compare_exchange(0, packed, Ordering::Release, Ordering::Relaxed).is_ok() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn lookup(vector: u8) -> Option<(u32, bool)> {
+        for slot in ROUTES.iter() {
+            let v = slot.load(Ordering::Acquire);
+            if v != 0 && (v & 0xFF) as u8 == vector {
+                return Some(((v >> 8) & 0xFFFF, v & (1 << 24) != 0));
+            }
+        }
+        None
+    }
+
+    pub fn mask_vector(vector: u8) {
+        if let Some((intid, level)) = lookup(vector) {
+            // Edge sources are left alone - see the module doc. This is the line that keeps the
+            // working xHCI path working.
+            if level {
+                super::gic::disable(intid);
+            }
+        }
+    }
+
+    pub fn unmask_vector(vector: u8) {
+        if let Some((intid, level)) = lookup(vector) {
+            if level {
+                super::gic::enable(intid);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -325,7 +325,7 @@ pub static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 pub const PCIE_MSI_SPI: u32 = 32 + 148;
 /// The neutral IRQ number the `xhci` service is granted (`hw_irqs: &[0x28]`). It began as an x86 MSI
 /// vector; here it is simply the agreed name for "the USB controller's interrupt".
-const XHCI_MSI_VECTOR: u8 = 0x28;
+pub const XHCI_MSI_VECTOR: u8 = 0x28;
 
 static SPI_TOO_HIGH_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
