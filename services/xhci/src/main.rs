@@ -422,6 +422,26 @@ fn run_command(
     None
 }
 
+/// Clear the whole Input Context before building one.
+///
+/// `INPUT_CTX_OFF` is a SINGLE buffer reused for every device and every command. Each path writes
+/// only the dwords it cares about, so everything it does not write keeps whatever the PREVIOUS
+/// device left there - `islot+12`, the endpoint contexts' dword0, the tail of the Input Control
+/// Context. The xHCI spec requires unused fields to be zero and the xHC VALIDATES them, so a stale
+/// bit is not a harmless leftover: it is a Parameter Error (completion 17) attributed to the device
+/// that inherited it.
+///
+/// The Pi 4 made this visible. A low-speed keyboard behind the internal hub failed Address Device
+/// with completion 17 while a high-speed stick on the same hub succeeded - and the keyboard is
+/// addressed AFTER the stick and the hub, so it is the one that inherits the most debris.
+///
+/// One Input Control Context + 32 endpoint contexts is the most any command here uses.
+fn clear_input_ctx(dma: &Dma, ctx_size: usize) {
+    for off in (0..(33 * ctx_size)).step_by(4) {
+        dma.write32(INPUT_CTX_OFF + off, 0);
+    }
+}
+
 /// EP0's Max Packet Size for a device's link speed, as the USB and xHCI specs REQUIRE it.
 ///
 /// These are not preferences the driver gets to choose. USB 2.0 mandates 64 bytes for a high-speed
@@ -620,6 +640,7 @@ fn configure_as_hub(
 ) -> bool {
     let islot = INPUT_CTX_OFF + ctx_size;
     let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
+    clear_input_ctx(dma, ctx_size);
     dma.write32(INPUT_CTX_OFF, 0); // Drop flags
     dma.write32(INPUT_CTX_OFF + 4, 0b11); // Add: slot + EP0
                                           // Slot dword0: Context Entries=1, Hub=1 (bit 26), MTT (bit 25), Speed (bits 23:20), Route (19:0).
@@ -712,6 +733,7 @@ fn address_downstream(
     // Input context: Add slot + EP0.
     let islot = INPUT_CTX_OFF + ctx_size;
     let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
+    clear_input_ctx(dma, ctx_size);
     dma.write32(INPUT_CTX_OFF, 0);
     dma.write32(INPUT_CTX_OFF + 4, 0b11);
     // Slot dword0: Context Entries=1, Speed [23:20], Route String [19:0]. (Not a hub, no MTT.)
@@ -760,6 +782,22 @@ fn address_downstream(
             "xhci: downstream Address Device failed (completion={}, route={:#x}, speed={}, ep0_mps={})",
             comp, route, speed, ep0_max_packet(speed)
         ));
+        // Completion 17 is Parameter Error: the xHC rejected a FIELD, and it does not say which. Dump
+        // the context we built so the answer is read off the log rather than reasoned toward. The slot
+        // dwords carry route/speed/context-entries, the root port, and the TT triple that only a
+        // low/full-speed device behind a high-speed hub uses - which is precisely the case that fails
+        // here while a high-speed device on the same hub succeeds.
+        let islot = INPUT_CTX_OFF + ctx_size;
+        let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
+        ctx.log_fmt(format_args!(
+            "xhci:   input ctrl add={:#010x} drop={:#010x} | slot {:#010x} {:#010x} {:#010x} {:#010x}",
+            dma.read32(INPUT_CTX_OFF + 4), dma.read32(INPUT_CTX_OFF),
+            dma.read32(islot), dma.read32(islot + 4), dma.read32(islot + 8), dma.read32(islot + 12)));
+        ctx.log_fmt(format_args!(
+            "xhci:   ep0 {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} | tt_slot={} tt_port={} ttt={}",
+            dma.read32(iep0), dma.read32(iep0 + 4), dma.read32(iep0 + 8),
+            dma.read32(iep0 + 12), dma.read32(iep0 + 16),
+            parent_slot, parent_port, ttt));
         return None;
     }
     // Read the device descriptor over the downstream slice's EP0 ring (offset 0).
@@ -945,6 +983,7 @@ fn read_config_and_bind(
     // routing (a root-port device passes route=0 / parent_*=0, reducing to the plain form).
     let int_tr = dma.phys_at(int_tr_off(dev_idx));
     let islot = INPUT_CTX_OFF + ctx_size;
+    clear_input_ctx(dma, ctx_size);
     dma.write32(INPUT_CTX_OFF, 0); // Drop flags
     dma.write32(INPUT_CTX_OFF + 4, 1 | (1 << dci)); // Add: slot + interrupt endpoint
     dma.write32(islot, (dci << 27) | (speed << 20) | (route & 0xFFFFF)); // Context Entries=dci, speed, route
@@ -1187,6 +1226,7 @@ fn bind_msc(
 
     // Input context: add the slot plus BOTH bulk endpoints.
     let islot = INPUT_CTX_OFF + ctx_size;
+    clear_input_ctx(dma, ctx_size);
     dma.write32(INPUT_CTX_OFF, 0); // Drop flags
     dma.write32(INPUT_CTX_OFF + 4, 1 | (1 << out_dci) | (1 << in_dci));
     dma.write32(islot, (max_dci << 27) | (speed << 20) | (route & 0xFFFFF));
