@@ -1845,22 +1845,41 @@ fn enumerate_one(
         8,
         DATA_BUF_OFF,
     );
-    let nports = if hub_ok {
-        dma.read8(DATA_BUF_OFF + 2)
-    } else {
-        0
-    };
-    let whubchar = dma.read16(DATA_BUF_OFF + 3); // wHubCharacteristics
-    let ttt = ((whubchar >> 5) & 0x3) as u32; // TT Think Time [6:5]
-    let mtt = dproto == 2; // bDeviceProtocol 2 = multi-TT hub
-    ctx.log_fmt(format_args!(
-        "xhci: USB hub on port {} (slot {}, {} downstream ports, mtt={}, ttt={})",
-        port, slot, nports, mtt, ttt
-    ));
-    // A SuperSpeed hub (the USB3 side of the Realtek hubs, 0x0411/0x0415) uses hub descriptor type
-    // 0x2A, so the 0x29 read returns 0 ports - skip it (the low-speed keyboard is on the USB2 hub).
+    let mut nports = if hub_ok { dma.read8(DATA_BUF_OFF + 2) } else { 0 };
+    // A SUPERSPEED hub answers descriptor type 0x2A, not 0x29, and returns nothing for the 0x29 we
+    // just asked for. The Pi 4's USB-A sockets are the SuperSpeed side of its internal hub, so
+    // refusing to walk one meant nothing plugged into a blue port was ever seen - not a regression,
+    // a capability this driver never had, hidden for as long as everything landed on the USB2 side.
+    //
+    // The two descriptors agree on the fields used here: bNbrPorts at offset 2, wHubCharacteristics
+    // at 3. Only the TYPE differs, so this is a second request, not a second parser.
+    //
+    // The retry consumes another 3 TRBs of the EP0 ring, which is why `hoff` starts past it below.
+    let mut ss_hub = false;
     if nports == 0 {
-        ctx.log("xhci: hub reports 0 ports (SuperSpeed hub? needs descriptor 0x2A) - not walking");
+        let ok2 = control(
+            dma, mmio, dboff, ir0, slot, dev_idx, 176,
+            ev_idx, ev_cycle, 0xA0, 6, 0x2A << 8, 0, 12, DATA_BUF_OFF,
+        );
+        if ok2 {
+            nports = dma.read8(DATA_BUF_OFF + 2);
+            ss_hub = nports != 0;
+        }
+    }
+    let whubchar = dma.read16(DATA_BUF_OFF + 3); // wHubCharacteristics
+    // A SuperSpeed hub has NO transaction translator - a TT exists to carry low/full-speed traffic
+    // across a high-speed link, and there is no such thing below a SuperSpeed one. Reporting a TT it
+    // does not have is the same class of illegal field that made the low-speed keyboard fail
+    // Address Device, so both are forced to zero rather than parsed out of wHubCharacteristics.
+    let ttt = if ss_hub { 0 } else { ((whubchar >> 5) & 0x3) as u32 };
+    let mtt = !ss_hub && dproto == 2; // bDeviceProtocol 2 = multi-TT hub
+    ctx.log_fmt(format_args!(
+        "xhci: USB{} hub on port {} (slot {}, {} downstream ports, mtt={}, ttt={})",
+        if ss_hub { "3 SuperSpeed" } else { "2" }, port, slot, nports, mtt, ttt
+    ));
+    // Neither descriptor produced a port count. Now it really is unusable.
+    if nports == 0 {
+        ctx.log("xhci: hub reports 0 ports on both descriptor 0x29 and 0x2A - not walking");
         sa.free(dev_idx);
         disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
         return;
@@ -1875,7 +1894,9 @@ fn enumerate_one(
     );
     // POWER every downstream port. The EP0 cursor stays contiguous (hub descriptor ended at ~176);
     // bounded so a many-port hub cannot overrun the one-page ring.
-    let mut hoff = 176usize;
+    // Past the hub-descriptor read, and past the SuperSpeed retry if one was issued - each is 3 TRBs
+    // of 16 bytes. Overlapping them would rewrite a TRB the controller may not have consumed.
+    let mut hoff = if ss_hub { 224usize } else { 176usize };
     for dp in 1..=nports {
         if hoff + 32 > 0xF00 {
             break;
