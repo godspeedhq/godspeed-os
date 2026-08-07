@@ -7,5 +7,13 @@ edition = "2021"
 name = "net-stack"
 path = "src/main.rs"
 
+[features]
+# Take a deliberate EL0 page fault at startup, to PROVE the kernel kills this task and keeps running
+# instead of halting the core - and that the supervisor then restarts it. TEST BUILDS ONLY.
+#
+# net-stack is the target because it actually spawns on a bare-metal Pi 4, it is restartable by
+# design, and losing networking for one restart cycle is a harmless thing to break on purpose.
+el0-fault-test = []
+
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }

@@ -870,6 +870,15 @@ fn link_is_up(ctx: &ServiceContext) -> bool {
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // Force the EL0 fault the kernel's recovery path must survive (this crate's `el0-fault-test`
+    // feature). The kernel must KILL this task and keep running, and the supervisor must restart it.
+    // If the machine stops here instead, the recovery is broken and the last log line names the task.
+    #[cfg(feature = "el0-fault-test")]
+    {
+        ctx.log("net-stack: el0-fault-test - deliberate null read; the kernel must kill ME, not the machine");
+        godspeed_sdk::adversarial::fault_null_read();
+        ctx.log("net-stack: STILL ALIVE after a null read - the kernel did NOT fault-kill this task");
+    }
     ctx.log("net-stack: starting");
     // Announce the API BEFORE the configuration dance. The dance can take seconds (DHCP and ARP each
     // wait out their budget when there is no link), and logging after it meant this line landed on the

@@ -120,6 +120,7 @@ if "--features" in sys.argv:
 # emulates no PCIe, so the Pi 4 cannot exercise xhci in emulation at all); the block-driver -> xhci
 # hop is HARDWARE-UNPROVEN, because nothing in emulation can carry it.
 XHCI_USERSPACE = "--xhci-userspace" in sys.argv
+EL0_FAULT_TEST = "--el0-fault-test" in sys.argv
 if XHCI_USERSPACE:
     FEATURES += ",xhci-userspace"
 
@@ -136,6 +137,10 @@ for svc in PI4_SERVICES:
     # storage silently disappears with every individual piece looking correct.
     if svc == "block-driver" and XHCI_USERSPACE:
         feats = ["--features", "usb-via-xhci"]
+    # Prove the EL0 fault-recovery path actually fires (see mem-pressure's feature doc). Test builds
+    # only; it kills mem-pressure on every boot by design.
+    if svc == "net-stack" and EL0_FAULT_TEST:
+        feats = ["--features", "el0-fault-test"]
     run(["cargo", "build", "-p", svc, "--target", TARGET] + feats + rel)
 
 # 2. The kernel.

@@ -613,6 +613,39 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
         super::put_hex(f.x[i]);
         super::put_str(b" ");
     }
+    // A fault from EL0 is the SERVICE's fault, not the kernel's - so the SERVICE dies, and the
+    // machine keeps running.
+    //
+    // This handler used to park the core here unconditionally, for every exception, including a
+    // userspace one. That made ANY service fault on this port fatal to the whole machine: the core
+    // stopped, the liveness watchdog saw it make no progress, and the kernel panicked. The Pi 4
+    // showed the whole sequence when the `xhci` service took an alignment fault:
+    //
+    //     task = xhci (slot 5) ... halting.
+    //     KERNEL PANIC: LIVENESS WEDGE: core 2 made NO progress ... last running task slot 5
+    //
+    // §10.4 says a protection violation terminates the SERVICE; invariant 6 says services are
+    // restartable; §6.2 says the kernel is the only thing that cannot be restarted. x86 and ARMv7
+    // both already do this - x86 from its #PF handler, ARMv7 from `arch/arm/exceptions.rs` - so
+    // AArch64 was the odd one out, and only because no service had faulted on it yet. A recovery
+    // path that has never run is indistinguishable from one that does not exist.
+    //
+    // The EL0 test is deliberately belt-and-braces. `vector` 8..=11 is the "lower EL, AArch64" set of
+    // vector slots, and `SPSR_EL1.M[4:0] == 0` is EL0t - the state the CPU was in when it faulted.
+    // Either alone would do; requiring both means a wrong vector-table index cannot be read as a
+    // userspace fault and silently kill a task over a KERNEL bug, which would hide the far more
+    // serious problem behind a restart.
+    let from_el0 = (8..=11).contains(&vector) && (f.spsr & 0x1F) == 0;
+    if from_el0 && slot < crate::task::scheduler::MAX_TASKS {
+        super::put_str(b"\r\n    EL0 fault - killing the task; the kernel and every other service continue.\r\n");
+        crate::task::kill_current();
+        // `kill_current` marks the task Dead and reschedules, so it does not come back. If it ever
+        // does, falling through to the halt below is right: resuming a corpse's context is worse
+        // than stopping, and the line above will be in the log to say what happened.
+    }
+
+    // A fault at EL1 IS the kernel's, and there is nothing above it to recover into. Halting loudly
+    // is the correct end of that path (§26.7), not a missing feature.
     super::put_str(b"\r\n    halting.\r\n");
     loop {
         // SAFETY: WFE is always valid; park forever.
