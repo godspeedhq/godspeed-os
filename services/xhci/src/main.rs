@@ -2282,7 +2282,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
 
-        if ndev == 0 {
+        // A DISK counts as something worth staying up for, even with no HID.
+        //
+        // Below this point is the "nothing is attached" path, whose job is to keep re-initialising
+        // the controller and re-walking the ports until something appears. That is right when the
+        // driver has found nothing - and catastrophic when it has found a disk: the Pi 4 bound its
+        // stick, read GSFS off sector 0, and then re-init tore the whole thing down and started
+        // over, forever. The block server never got to answer a single request.
+        //
+        // Guarding on `ndev` alone was the same "usable means HID" assumption that cost the two
+        // fixes before this one, at the third and last level it appears. With a disk bound we fall
+        // through to the poll loop, which is where block requests are served.
+        if ndev == 0 && disk.is_none() {
             // Nothing usable attached. Still report input-ready once so the shell's
             // boot-screen clear fires (the keyboard may be on the other controller).
             if !signaled {
