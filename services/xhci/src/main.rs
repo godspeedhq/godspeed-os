@@ -2017,7 +2017,13 @@ fn enumerate_one(
                     cmd_idx,
                 );
                 if disk.is_none() {
-                    *disk = d_disk;
+                    // Record WHERE it is, not just that it exists: the hot-plug scan needs the hub
+                    // coordinates to stop reading this disk as a newly-arrived device every pass.
+                    *disk = d_disk.map(|mut dk| {
+                        dk.hub_slot = slot;
+                        dk.hub_port = dp as u32;
+                        dk
+                    });
                 }
                 match dbound {
                     Some(mut hid) => {
@@ -2801,6 +2807,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             .any(|h| h.hub_slot == hub_slot && h.hub_port == hp)
                         {
                             continue; // already bound on this hub port
+                        }
+                        // The DISK is bound here too, and it is not in `devs` - that list is HIDs
+                        // only. Without this the scan reports the disk's own port as a new arrival
+                        // on every pass and re-enumerates forever, tearing down the keyboard it had
+                        // just bound each time.
+                        if disk.as_ref().is_some_and(|dk| dk.hub_slot == hub_slot && dk.hub_port == hp) {
+                            continue;
                         }
                         let (mut cur, mut pcs) = (hub_cur[owner], hub_pcs[owner]);
                         let st = hub_port_status(

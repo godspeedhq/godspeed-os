@@ -169,6 +169,15 @@ pub struct Disk {
     pub sectors: u64,
     /// The root port the device sits on, so a disconnect can be noticed.
     pub port: u32,
+    /// The parent hub's slot, and the hub port this disk occupies (0 = on a root port).
+    ///
+    /// The hot-plug scan walks a hub's downstream ports looking for devices it does not already
+    /// know about, and it knew only about bound HIDs. A disk behind a hub therefore read as a NEW
+    /// device on every pass, re-enumerating the controller forever - 12 times in one boot on the
+    /// Pi 4, tearing down the keyboard it had just bound each time. These two fields are what let
+    /// that scan account for it.
+    pub hub_slot: u32,
+    pub hub_port: u32,
 }
 
 impl Disk {
@@ -182,6 +191,8 @@ impl Disk {
             tag: 1,
             sectors: 0,
             port,
+            hub_slot: 0,
+            hub_port: 0,
         }
     }
 
