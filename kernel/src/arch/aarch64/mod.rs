@@ -896,6 +896,15 @@ extern "C" fn boot_high() -> ! {
             // rather than after a bring-up that no longer happens. Its meaning is "a NIC this port
             // can drive was found", which a probed-and-present GENET satisfies.
             pci::NIC_FOUND.store(true, core::sync::atomic::Ordering::Release);
+            // Route GENET's interrupt to userspace. Registered LEVEL-triggered, which is what makes
+            // `route::deliver` mask it before handing it over: GENET holds its line until the driver
+            // clears `INTRL2_0`, and that register is in MMIO only the driver maps.
+            //
+            // Safe even if the driver never unmasks - it would take exactly one interrupt and then
+            // stay masked, leaving the service on its existing poll. The failure mode of this half
+            // alone is "no interrupts", never a storm.
+            ioapic::register_route(exceptions::GENET_VECTOR, exceptions::GENET_SPI, true);
+            gic::enable(exceptions::GENET_SPI);
             put_str(b"genet: controller present - left to the nic-driver SERVICE (Commandment I)\r\n");
         }
 

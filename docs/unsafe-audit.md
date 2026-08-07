@@ -350,6 +350,17 @@ from the wrong places.
 |------|--------|-----|
 | `arch/aarch64/genet.rs` | new, 1 | The revision read, through `probe_read32` so an absent controller is reported rather than taken as an external abort that surfaces later blaming something unrelated. |
 
+## 2026-08-07 - GENET's interrupt routed to userspace (feat/pi4-aarch64)
+
+The third `route::deliver` call in this file, one per interrupt this port hands to a userspace
+driver, all under the same contract: called from the IRQ handler with interrupts masked. GENET's is
+registered LEVEL-triggered, so `deliver` masks the source before handing it over - the driver clears
+`INTRL2_0` and unmasks with the `IrqUnmask` syscall.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/exceptions.rs` | 14 -> 15 (+1) | `route::deliver` for GENET's macirq (SPI 157), translated to the neutral vector `nic-driver` is granted. Same contract as the MSI and generic SPI arms beside it. |
+
 ## 2026-08-07 - GIC disable: masking a level-triggered device IRQ for a userspace driver (feat/pi4-aarch64)
 
 A LEVEL-triggered device interrupt keeps its line asserted until the DEVICE's own status register is
@@ -2292,7 +2303,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/sched_spawn.rs | 2 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
-| arch/aarch64/exceptions.rs | 14 | permitted |
+| arch/aarch64/exceptions.rs | 15 | permitted |
 | arch/aarch64/uaccess.rs | 7 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |

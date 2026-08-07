@@ -327,6 +327,12 @@ pub const PCIE_MSI_SPI: u32 = 32 + 148;
 /// vector; here it is simply the agreed name for "the USB controller's interrupt".
 pub const XHCI_MSI_VECTOR: u8 = 0x28;
 
+/// GENET's "macirq" - BCM2711 device tree GIC_SPI 157, so INTID 32 + 157. LEVEL-triggered: the line
+/// stays asserted until the driver clears `INTRL2_0`, which is why it must be masked on delivery.
+pub const GENET_SPI: u32 = 32 + 157;
+/// The neutral vector `nic-driver` is granted for it.
+pub const GENET_VECTOR: u8 = 0x2A;
+
 static SPI_TOO_HIGH_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// IRQ entry. Acknowledge at the GIC, handle, end-of-interrupt, return.
@@ -372,6 +378,15 @@ extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
     // rather than delivered as SPI 180. That number began life as an x86 MSI vector, and keeping it
     // means the `xhci` service's contract says the same thing on both architectures - the arch layer
     // maps its own interrupt onto the shared name, which is what the seam exists for.
+    // GENET, translated to the neutral vector its contract names - the same shape as the MSI arm
+    // below. `deliver` masks it first (it is registered LEVEL), so the line cannot re-enter while the
+    // driver works; the driver unmasks with `IrqUnmask` once it has cleared `INTRL2_0`.
+    if id == GENET_SPI {
+        // SAFETY: in the IRQ handler with interrupts masked - `deliver`'s documented contract.
+        unsafe { crate::interrupt::route::deliver(GENET_VECTOR) };
+        super::gic::eoi(id);
+        return;
+    }
     if id == PCIE_MSI_SPI {
         let pending = super::pcie::msi_take_pending();
         if pending & 1 != 0 {

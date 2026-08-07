@@ -746,7 +746,12 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
-            hw_irqs:           &[], // Phase 1 step 2: reset + MAC only; RX IRQ wired later
+            // GENET's macirq on aarch64 (SPI 157 -> neutral vector 0x2A). x86's nic-driver is a
+            // PCIe NIC with no such route, so the grant is arch-gated rather than unconditional.
+            #[cfg(target_arch = "aarch64")]
+            hw_irqs:           &[0x2A],
+            #[cfg(not(target_arch = "aarch64"))]
+            hw_irqs:           &[],
             has_console_read:  false,
         })),
         // net-stack (services/net-stack): the model-AGNOSTIC half of networking (docs/networking.md).
