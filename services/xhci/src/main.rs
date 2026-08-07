@@ -2662,6 +2662,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // server below and the hub status checks further down can swallow a keyboard completion,
             // and either one owes the endpoint a re-arm - so the set spans them.
             let mut eaten = 0u32;
+            // Set by the hub scan when the disk's own port reports DISCONNECTED. Acted on AFTER the
+            // scan rather than inside it, so the scan's borrow of `disk` and the clearing of it do
+            // not overlap.
+            let mut disk_gone = false;
             // How long to wait before looking at the event ring ourselves.
             //
             // Where the controller's MSI reaches us, `recv_timeout` returns EARLY on the interrupt
@@ -2684,7 +2688,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // could plausibly have. The fallback works either way, so without a line here a silent
             // regression to polling is invisible.
             if polling && !poll_noted {
-                ctx.log("xhci: no interrupts arriving - falling back to a ~10ms poll (MSI not reaching us)");
+                // NOT necessarily a fault. With no USB activity there is nothing to interrupt
+                // about, so an idle machine reaches this legitimately - the first wording called
+                // that "MSI not reaching us" and made normal idle read as a broken feature.
+                // What matters is whether the interrupt line ever worked, which the companion
+                // message states from an observed delivery.
+                ctx.log("xhci: quiet - polling at ~10ms until the next event (normal when idle)");
                 poll_noted = true;
             }
             // Announced only from an OBSERVED delivery (`irq_seen`), never from the initial state.
@@ -2877,11 +2886,30 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         {
                             continue; // already bound on this hub port
                         }
-                        // The DISK is bound here too, and it is not in `devs` - that list is HIDs
-                        // only. Without this the scan reports the disk's own port as a new arrival
-                        // on every pass and re-enumerates forever, tearing down the keyboard it had
-                        // just bound each time.
+                        // The DISK is bound on one of these ports, and it is not in `devs` - that
+                        // list is HIDs only. It must not be treated as a new arrival (that
+                        // re-enumerated forever), but it DOES have to be watched for LEAVING.
+                        //
+                        // Until now an unplug was only noticed when a block request failed, so with
+                        // no I/O in flight the disk could be pulled and nothing would say so - and
+                        // the next `drives` then blocked on a device that was no longer there.
+                        // Absence is a fact about the hardware, not a consequence of asking.
                         if disk.as_ref().is_some_and(|dk| dk.hub_slot == hub_slot && dk.hub_port == hp) {
+                            let (mut c2, mut p2) = (hub_cur[owner], hub_pcs[owner]);
+                            let st = hub_port_status(
+                                &dma, &mmio, dboff, ir0, hub_slot, hub_dev, hp,
+                                &mut c2, &mut p2, &mut ev_idx, &mut ev_cycle, &mut eaten,
+                            );
+                            hub_cur[owner] = c2;
+                            hub_pcs[owner] = p2;
+                            // Only a definite `Some(false)` counts. `None` is a FAILED probe -
+                            // "unknown", not "gone" - and dropping a working disk on an unknown
+                            // would unmount a filesystem over a transient.
+                            if st == Some(false) {
+                                ctx.log("xhci: the USB disk was unplugged - dropping it");
+                                disk_gone = true;
+                                break;
+                            }
                             continue;
                         }
                         let (mut cur, mut pcs) = (hub_cur[owner], hub_pcs[owner]);
@@ -2950,6 +2978,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     disk_hub_cur = cur;
                     disk_hub_pcs = pcs;
                 }
+            }
+            if disk_gone {
+                // Drop it and re-scan. The filesystem above sees its next request fail and
+                // reacquires when the stick returns (§14.3) - the same recovery a service restart
+                // already asks of it.
+                disk = None;
+                announce = true;
+                continue 'reenum;
             }
             if hub_due {
                 last_hub_poll = ctx.read_tsc();
