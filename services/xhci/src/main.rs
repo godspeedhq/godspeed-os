@@ -742,8 +742,25 @@ fn address_downstream(
     dma.write32(islot + 4, root_port << 16);
     // Slot dword2: TT fields for a low/full-speed device (speed 1 or 2) behind a high-speed hub -
     // TT Hub Slot ID [7:0], TT Port Number [15:8], TT Think Time [17:16].
+    // TT Hub Slot ID [7:0] and TT Port Number [15:8] name the high-speed hub that translates for this
+    // low/full-speed device. TT Think Time [17:16] is deliberately NOT set here.
+    //
+    // xHCI 6.2.2 is explicit: TTT "shall be '0' if this device is not a High-speed hub". It is a
+    // property of the HUB, and it belongs in the HUB's own slot context - which `configure_as_hub`
+    // already sets. Stamping it into the DEVICE's slot context is an illegal field value, answered
+    // with Parameter Error (completion 17).
+    //
+    // That is exactly the shape the Pi 4 showed: the high-speed stick on the same hub enumerated
+    // fine because its whole TT block is zero, while the low-speed keyboard - the only device that
+    // populates these fields at all - was refused. The dump proved it, after two fixes aimed at EP0
+    // from reasoning alone had missed:
+    //
+    //     slot 0x08200004 0x00010000 0x00030401   <- dword2 bits 17:16 = 3, and must be 0
+    //
+    // Every other field in that dump was already correct.
     let tt = if speed == 1 || speed == 2 {
-        (parent_slot & 0xFF) | ((parent_port & 0xFF) << 8) | ((ttt & 0x3) << 16)
+        let _ = ttt; // the hub's think time; NOT this device's business (see above)
+        (parent_slot & 0xFF) | ((parent_port & 0xFF) << 8)
     } else {
         0
     };
@@ -988,8 +1005,25 @@ fn read_config_and_bind(
     dma.write32(INPUT_CTX_OFF + 4, 1 | (1 << dci)); // Add: slot + interrupt endpoint
     dma.write32(islot, (dci << 27) | (speed << 20) | (route & 0xFFFFF)); // Context Entries=dci, speed, route
     dma.write32(islot + 4, root_port << 16);
+    // TT Hub Slot ID [7:0] and TT Port Number [15:8] name the high-speed hub that translates for this
+    // low/full-speed device. TT Think Time [17:16] is deliberately NOT set here.
+    //
+    // xHCI 6.2.2 is explicit: TTT "shall be '0' if this device is not a High-speed hub". It is a
+    // property of the HUB, and it belongs in the HUB's own slot context - which `configure_as_hub`
+    // already sets. Stamping it into the DEVICE's slot context is an illegal field value, answered
+    // with Parameter Error (completion 17).
+    //
+    // That is exactly the shape the Pi 4 showed: the high-speed stick on the same hub enumerated
+    // fine because its whole TT block is zero, while the low-speed keyboard - the only device that
+    // populates these fields at all - was refused. The dump proved it, after two fixes aimed at EP0
+    // from reasoning alone had missed:
+    //
+    //     slot 0x08200004 0x00010000 0x00030401   <- dword2 bits 17:16 = 3, and must be 0
+    //
+    // Every other field in that dump was already correct.
     let tt = if speed == 1 || speed == 2 {
-        (parent_slot & 0xFF) | ((parent_port & 0xFF) << 8) | ((ttt & 0x3) << 16)
+        let _ = ttt; // the hub's think time; NOT this device's business (see above)
+        (parent_slot & 0xFF) | ((parent_port & 0xFF) << 8)
     } else {
         0
     };
@@ -1231,8 +1265,25 @@ fn bind_msc(
     dma.write32(INPUT_CTX_OFF + 4, 1 | (1 << out_dci) | (1 << in_dci));
     dma.write32(islot, (max_dci << 27) | (speed << 20) | (route & 0xFFFFF));
     dma.write32(islot + 4, root_port << 16);
+    // TT Hub Slot ID [7:0] and TT Port Number [15:8] name the high-speed hub that translates for this
+    // low/full-speed device. TT Think Time [17:16] is deliberately NOT set here.
+    //
+    // xHCI 6.2.2 is explicit: TTT "shall be '0' if this device is not a High-speed hub". It is a
+    // property of the HUB, and it belongs in the HUB's own slot context - which `configure_as_hub`
+    // already sets. Stamping it into the DEVICE's slot context is an illegal field value, answered
+    // with Parameter Error (completion 17).
+    //
+    // That is exactly the shape the Pi 4 showed: the high-speed stick on the same hub enumerated
+    // fine because its whole TT block is zero, while the low-speed keyboard - the only device that
+    // populates these fields at all - was refused. The dump proved it, after two fixes aimed at EP0
+    // from reasoning alone had missed:
+    //
+    //     slot 0x08200004 0x00010000 0x00030401   <- dword2 bits 17:16 = 3, and must be 0
+    //
+    // Every other field in that dump was already correct.
     let tt = if speed == 1 || speed == 2 {
-        (parent_slot & 0xFF) | ((parent_port & 0xFF) << 8) | ((ttt & 0x3) << 16)
+        let _ = ttt; // the hub's think time; NOT this device's business (see above)
+        (parent_slot & 0xFF) | ((parent_port & 0xFF) << 8)
     } else {
         0
     };
