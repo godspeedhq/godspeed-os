@@ -2555,6 +2555,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // One-shot latches so the mode is stated once each way, not on every pass.
         let mut poll_noted = false;
         let mut irq_noted = false;
+        // Set only when a wait actually ended in a delivered event.
+        let mut irq_seen = false;
         let mut int_idx = [0usize; MAX_HID];
         let mut int_cycle = [1u32; MAX_HID];
         let mut need_queue = [true; MAX_HID];
@@ -2685,7 +2687,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.log("xhci: no interrupts arriving - falling back to a ~10ms poll (MSI not reaching us)");
                 poll_noted = true;
             }
-            if !polling && quiet_waits == 0 && !irq_noted {
+            // Announced only from an OBSERVED delivery (`irq_seen`), never from the initial state.
+            // The first version tested `quiet_waits == 0`, which is true before anything has happened
+            // at all - so it declared interrupt mode on the first pass of a driver that had never
+            // received an interrupt, and the later fallback line read as "MSI worked then stopped".
+            // It had never started. A diagnostic that reports an ASSUMPTION as an observation is
+            // worse than none: it cost a whole debugging round pointed at the wrong mechanism.
+            if irq_seen && !irq_noted {
                 ctx.log("xhci: waking on interrupts (MSI) - not polling");
                 irq_noted = true;
             }
@@ -2703,7 +2711,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // forever on a disk that was working. `serve_if_block` tells them apart by that cap.
             let woke = ctx.recv_timeout(deadline);
             // Delivered event = something is waking us. Timeout = it is not.
-            if woke.is_some() { quiet_waits = 0; } else { quiet_waits = quiet_waits.saturating_add(1); }
+            if woke.is_some() { quiet_waits = 0; irq_seen = true; } else { quiet_waits = quiet_waits.saturating_add(1); }
             if let Some(m) = woke {
                 if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten) {
                     ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");

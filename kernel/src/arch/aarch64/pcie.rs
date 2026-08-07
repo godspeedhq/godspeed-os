@@ -682,6 +682,14 @@ pub fn enable_msi(bus: u8, dev: u8, func: u8) -> bool {
 pub fn unmask_msi() {
     wr(MSI_INTR2_CLR, 0xFFFF_FFFF);
     wr(MSI_INTR2_MASK_CLR, 1);
+    // And ENABLE THE SPI AT THE GIC. Unmasking at the controller only decides whether it drives its
+    // output; the distributor decides whether that output reaches a core, and by default it does not.
+    //
+    // This was the missing line. Everything else - target address, data pattern, the endpoint's own
+    // MSI capability, the demultiplexing handler - was correct, and not one interrupt was ever
+    // delivered because the SPI sat masked in the distributor. Only the timer PPI had ever been
+    // enabled here, so this port had never needed the SPI path and nothing revealed the gap.
+    super::gic::enable(super::exceptions::PCIE_MSI_SPI);
 }
 
 /// Read and ACKNOWLEDGE the pending MSI set. Returns the bits that were pending.

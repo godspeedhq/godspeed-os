@@ -322,7 +322,7 @@ fn ec_name(esr: u64) -> &'static [u8] {
 pub static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Said once: an SPI too high to express in the neutral routing table's `u8` key.
 /// The BCM2711 PCIe controller's MSI interrupt: GIC SPI 148, so INTID 32 + 148.
-const PCIE_MSI_SPI: u32 = 32 + 148;
+pub const PCIE_MSI_SPI: u32 = 32 + 148;
 /// The neutral IRQ number the `xhci` service is granted (`hw_irqs: &[0x28]`). It began as an x86 MSI
 /// vector; here it is simply the agreed name for "the USB controller's interrupt".
 const XHCI_MSI_VECTOR: u8 = 0x28;
