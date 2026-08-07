@@ -1751,6 +1751,9 @@ fn enumerate_one(
     // if it's a boot HID - exactly like a root-port device (read_config_and_bind). This is what makes
     // the back-port keyboard work.
     let ndev_before = *ndev;
+    // Whether a disk was already bound BEFORE walking this hub. A disk found behind it counts as
+    // "something usable is down there" exactly as a HID does - see the release check below.
+    let disk_before = disk.is_some();
     for dp in 1..=nports {
         if *ndev >= MAX_HID {
             break;
@@ -1899,8 +1902,18 @@ fn enumerate_one(
                         devs[*ndev] = hid; // room checked at loop top
                         *ndev += 1;
                     }
+                    None if disk.as_ref().is_some_and(|d| d.slot == dslot) => {
+                        // It IS the disk. "Not a HID" is not "not usable", and tearing this down
+                        // would disable the endpoints just configured - which is exactly what
+                        // happened on the Pi 4: the stick reported 15267 MiB and then its first
+                        // sector read failed, because this arm had already disabled its slot
+                        // between those two lines without logging a word.
+                        ctx.log_fmt(format_args!(
+                            "xhci: hub port {} is the USB disk (slot {}) - keeping it bound", dp, dslot));
+                    }
                     None => {
-                        // Connected but not a boot HID (or bind failed) - release its slice + slot.
+                        // Connected but not a boot HID or a disk (or bind failed) - release its
+                        // slice + slot so neither leaks.
                         sa.free(d_idx);
                         disable_slot(ctx, dma, mmio, dboff, ir0, dslot, ev_idx, ev_cycle, cmd_idx);
                     }
@@ -1915,11 +1928,16 @@ fn enumerate_one(
             }
         }
     }
-    if *ndev == ndev_before {
+    // "Nothing usable" has to mean nothing usable - a HID *or* a disk. Counting only HIDs released
+    // the hub while the Pi 4's USB stick was hanging off it, and disabling a hub's slot tears down
+    // the routing for everything behind it. The disk had already reported its geometry by then, so
+    // the failure surfaced one line later as a sector read that "failed", pointing at the disk
+    // rather than at the hub that had just been pulled out from under it.
+    if *ndev == ndev_before && disk.is_some() == disk_before {
         // Nothing usable behind this hub - it need not stay configured. Free its slice + slot so a
         // later hub/device can use them (bounded slice pool).
         ctx.log_fmt(format_args!(
-            "xhci: hub on port {} had no bound HID behind it - releasing",
+            "xhci: hub on port {} had nothing usable behind it - releasing",
             port
         ));
         sa.free(dev_idx);
