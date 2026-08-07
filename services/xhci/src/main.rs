@@ -2549,6 +2549,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // EP0 ring cursor for the DISK's hub, used only when no HID is bound (see the scan below).
         // Persistent across passes for the same reason the HID hub cursors are: the ring's producer
         // position and cycle must continue where the controller's dequeue actually sits.
+        // Consecutive probes that reported the disk's port disconnected. Persists across passes -
+        // a counter reset every pass could never reach two.
+        let mut disk_absent_seen: u32 = 0;
         let mut disk_hub_cur = 0usize;
         let mut disk_hub_pcs = 1u32;
         let mut quiet_waits: u32 = 0;
@@ -2905,10 +2908,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             // Only a definite `Some(false)` counts. `None` is a FAILED probe -
                             // "unknown", not "gone" - and dropping a working disk on an unknown
                             // would unmount a filesystem over a transient.
+                            // TWO consecutive disconnected reads, not one.
+                            //
+                            // A single `Some(false)` was enough, and it fired repeatedly on a disk
+                            // that had already been dropped - each false positive forcing a full
+                            // re-enumeration, which tears the KEYBOARD down and rebinds it. The
+                            // symptom was not "the disk flaps", it was "the keyboard stops working",
+                            // several layers from the cause.
+                            //
+                            // This probe is a control transfer on a ring shared with the HID status
+                            // checks, so a read can come back wrong without the device having moved.
+                            // A disconnect is not urgent - the port is not going to reconnect itself
+                            // between two passes - so confirming it costs one poll interval and buys
+                            // immunity to a single bad read.
                             if st == Some(false) {
-                                ctx.log("xhci: the USB disk was unplugged - dropping it");
-                                disk_gone = true;
-                                break;
+                                disk_absent_seen = disk_absent_seen.saturating_add(1);
+                                if disk_absent_seen >= 2 {
+                                    ctx.log("xhci: the USB disk was unplugged - dropping it");
+                                    disk_gone = true;
+                                    break;
+                                }
+                            } else if st.is_some() {
+                                // Present again - it was a bad read, not a removal.
+                                disk_absent_seen = 0;
                             }
                             continue;
                         }
