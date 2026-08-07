@@ -428,6 +428,13 @@ fn run_command(
 /// control endpoint and 8 for low-speed; SuperSpeed uses 512. The xHC VALIDATES the value in an
 /// Address Device input context and answers an illegal one with **Parameter Error (completion 17)**.
 ///
+/// **Full-speed starts at 8, not 64.** For FS the real value is 8, 16, 32 or 64 and is only
+/// discoverable by READING the device descriptor, so xHCI 4.3.3 has software address the device with
+/// 8 first and correct it afterwards. Putting 64 there is not a generous guess - it is an illegal
+/// initial value the xHC answers with Parameter Error, the same completion 17 that a high-speed
+/// device got from an EP0 of 8. Low-speed is always 8, high-speed always 64, SuperSpeed always 512;
+/// full-speed is the one that is not simply a property of the link.
+///
 /// This exists as ONE function because it was three copies, and one of them had drifted: the
 /// downstream (behind-a-hub) path said `_ => 8`, so every high-speed device behind the Pi 4's
 /// internal VL817 hub - which is where its keyboard and its USB stick actually live - was addressed
@@ -439,9 +446,11 @@ fn run_command(
 /// on the only devices a user actually plugs in.
 fn ep0_max_packet(speed: u32) -> u32 {
     match speed {
-        2 => 8,   // low-speed
-        4 => 512, // super-speed
-        _ => 64,  // full / high-speed
+        1 => 8,   // FULL-speed: see below - 8 INITIALLY, not 64
+        2 => 8,   // low-speed: always 8
+        4 => 512, // super-speed: always 512
+        3 => 64,  // high-speed: always 64, mandated by USB 2.0
+        _ => 8,   // unknown speed: the conservative value, never the largest
     }
 }
 
@@ -748,8 +757,8 @@ fn address_downstream(
     )?;
     if comp != 1 {
         ctx.log_fmt(format_args!(
-            "xhci: downstream Address Device failed (completion={}, route={:#x})",
-            comp, route
+            "xhci: downstream Address Device failed (completion={}, route={:#x}, speed={}, ep0_mps={})",
+            comp, route, speed, ep0_max_packet(speed)
         ));
         return None;
     }
@@ -1089,7 +1098,10 @@ fn serve_if_block(
     msg: &godspeed_sdk::Message,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
-) {
+    // `false` = the disk stopped answering a DATA operation, so the caller should drop it and
+    // re-scan. Returning this rather than swallowing it is what turns an unplugged stick from "the
+    // machine hangs" into "the disk went away".
+) -> bool {
     // A message ARRIVED. Logged (bounded, first few only) because the Pi 4 showed block requests
     // getting no reply at all while NEITHER failure path inside `serve_block` logged - which means
     // it was never reached, and the two ways that can happen need different fixes: the poll loop is
@@ -1110,7 +1122,7 @@ fn serve_if_block(
         if n <= 8 {
             ctx.log("xhci: block request had NO reply cap - dropping it (the caller will block)");
         }
-        return;
+        return true;
     };
     let mut out = [0u8; 520];
     let mut eaten = 0u32;
@@ -1120,6 +1132,14 @@ fn serve_if_block(
     );
     let _ = ctx.send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n]));
     ctx.remove_cap(reply);
+    // A data operation that FAILED means the device stopped answering - which on this board is
+    // usually that it was unplugged. Report it so the caller can re-enumerate rather than answer
+    // errors forever against a device that is no longer there: an unplugged stick left the disk
+    // "bound", every request paying the full transfer timeout before failing, which reads as the
+    // whole machine hanging rather than as a removed disk.
+    let was_data_op = matches!(msg.payload_bytes().first(),
+        Some(&msc::OP_READ_BLOCK) | Some(&msc::OP_WRITE_BLOCK) | Some(&msc::OP_WRITE_ZEROS));
+    !(was_data_op && out[0] == msc::STATUS_ERR)
 }
 
 /// Configure an addressed mass-storage device's two BULK endpoints and read its geometry.
@@ -2528,11 +2548,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // request is not that: it carries a reply cap, and dropping it would hang the caller
             // forever on a disk that was working. `serve_if_block` tells them apart by that cap.
             if let Some(m) = ctx.recv_timeout(deadline) {
-                serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle);
+                if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle) {
+                    ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
+                    disk = None;
+                    continue 'reenum;
+                }
             }
             // Drain any further queued interrupt-event IPCs (an MSI-X mid-processing must not pile up).
+            let mut disk_alive = true;
             while let Some(m) = ctx.try_recv() {
-                serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle);
+                disk_alive &= serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle);
+            }
+            if !disk_alive {
+                ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
+                disk = None;
+                continue 'reenum;
             }
             // Ack the interrupter (clear IP, keep IE) BEFORE draining the ring, so an event
             // arriving mid-drain re-sets IP and re-arms a fresh MSI-X (no missed events).
