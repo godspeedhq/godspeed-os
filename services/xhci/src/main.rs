@@ -1095,9 +1095,12 @@ fn serve_if_block(
     // it was never reached, and the two ways that can happen need different fixes: the poll loop is
     // not running (no message ever arrives here), or a message arrives WITHOUT a reply cap and this
     // function returns silently. Guessing between them has already cost two boots.
-    static mut SEEN: u32 = 0;
-    // SAFETY: single-threaded service; a diagnostic counter, not a correctness mechanism.
-    let n = unsafe { SEEN += 1; SEEN };
+    // An ATOMIC, not a `static mut`. The first draft of this counter used `static mut` + `unsafe`,
+    // and `scripts/unsafe_check.py` rejected it on the spot - correctly: §18.2 forbids `unsafe` in a
+    // service outright, and "it is only a diagnostic" is exactly the reasoning the rule exists to
+    // refuse. A relaxed atomic costs nothing and needs no exemption.
+    static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let n = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     if n <= 8 {
         ctx.log_fmt(format_args!(
             "xhci: block-path message #{} arrived, {} bytes",
