@@ -702,6 +702,18 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "block-driver" => Some(("block-driver", ServiceConfig {
             elf:               include_bytes!(env!("SVC_BLOCK_DRIVER_ELF")),
             has_recv_endpoint: true, // serves block read/write requests from fs (§4)
+            // With the USB stack in userspace, block-driver reaches the disk by IPC to the `xhci`
+            // SERVICE - so it needs a SEND cap to that name. Without one, `request_with_reply("xhci",
+            // ..)` finds no send slot and returns None INSTANTLY. That is exactly what the Pi 4
+            // showed: the service sat in its poll loop with the disk bound, never receiving a single
+            // message, while block-driver burned its whole 20 s wait failing to address it. Every
+            // layer looked healthy in isolation, because the missing piece was the EDGE between them.
+            //
+            // Gated on the KERNEL's feature, not the service's: this table is the kernel's, and only
+            // the kernel's build knows whether it handed USB over. Without it the list stays empty.
+            #[cfg(feature = "xhci-userspace")]
+            send_peers:        &["xhci"],
+            #[cfg(not(feature = "xhci-userspace"))]
             send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
             send_peers_grant:  false,
             // ARM pins this to core 0, and it is NOT a preference there - it is a requirement. The

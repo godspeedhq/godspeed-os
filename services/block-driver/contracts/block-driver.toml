@@ -23,3 +23,16 @@ log_write = true
 
 [placement]
 core = 1
+
+# Reach the `xhci` SERVICE by IPC. Present only when the USB stack runs in userspace
+# (`pi4_build.py --xhci-userspace`, which sets the kernel's `xhci-userspace` and this service's
+# `usb-via-xhci`); on every other build block-driver talks to its disk through AHCI (x86) or the
+# in-kernel USB syscalls (Pi 2), and this peer goes unused.
+#
+# It is declared UNCONDITIONALLY here while the kernel declares it under `cfg(feature)`, because a
+# TOML contract has no notion of a build feature and `contract_check.py` compares one text against
+# the other. The honest reading is "block-driver MAY send to xhci"; an unused send peer grants
+# authority that is never exercised, which is a smaller problem than the alternative - the missing
+# edge cost a full debugging round on the Pi 4, where every service looked healthy in isolation and
+# the disk was simply unaddressable.
+ipc_send = ["xhci"]
