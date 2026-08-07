@@ -2030,6 +2030,9 @@ fn enumerate_one(
                     *disk = d_disk.map(|mut dk| {
                         dk.hub_slot = slot;
                         dk.hub_port = dp as u32;
+                        dk.hub_dev = dev_idx as u32;
+                        dk.hub_nports = nports as u32;
+                        dk.hub_off = hoff;
                         dk
                     });
                 }
@@ -2543,6 +2546,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             ndev, if disk.is_some() { "BOUND" } else { "none" }));
         // Consecutive waits that ended in a TIMEOUT rather than a delivered event. It is how the
         // driver notices nothing is waking it - see the adaptive deadline below.
+        // EP0 ring cursor for the DISK's hub, used only when no HID is bound (see the scan below).
+        // Persistent across passes for the same reason the HID hub cursors are: the ring's producer
+        // position and cycle must continue where the controller's dequeue actually sits.
+        let mut disk_hub_cur = 0usize;
+        let mut disk_hub_pcs = 1u32;
         let mut quiet_waits: u32 = 0;
         let mut int_idx = [0usize; MAX_HID];
         let mut int_cycle = [1u32; MAX_HID];
@@ -2878,6 +2886,45 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             break 'poll;
                         }
                     }
+                }
+            }
+            // Scan the DISK's hub too, when no HID is bound to scan it for us.
+            //
+            // The loop above iterates bound HIDs, so with `ndev == 0` it scans nothing - and a device
+            // arriving behind a hub changes no root PORTSC, so the root-port check below cannot see it
+            // either. On the Pi 4 that meant unplugging the keyboard was noticed and plugging it back
+            // in was invisible: the disk was the only bound device, and nothing was watching its hub.
+            //
+            // Deliberately only when `ndev == 0`. With a HID bound the loop above already covers this
+            // hub (they share it), and scanning it twice would consume the same events twice.
+            if hub_due && ndev == 0 {
+                if let Some((hs, hd, hn, hoff)) = disk
+                    .as_ref()
+                    .filter(|dk| dk.hub_slot != 0)
+                    .map(|dk| (dk.hub_slot, dk.hub_dev as usize, dk.hub_nports, dk.hub_off))
+                {
+                    let (mut cur, mut pcs) = (disk_hub_cur.max(hoff), disk_hub_pcs);
+                    for hp in 1..=hn {
+                        // Skip the disk's own port; it is present by definition and probing it would
+                        // report the disk as a new arrival every pass.
+                        if disk.as_ref().is_some_and(|dk| dk.hub_port == hp) {
+                            continue;
+                        }
+                        let st = hub_port_status(
+                            &dma, &mmio, dboff, ir0, hs, hd, hp,
+                            &mut cur, &mut pcs, &mut ev_idx, &mut ev_cycle, &mut eaten,
+                        );
+                        if st == Some(true) {
+                            ctx.log_fmt(format_args!(
+                                "xhci: device arrived on hub slot {} port {} - re-enumerating", hs, hp));
+                            announce = true;
+                            disk_hub_cur = cur;
+                            disk_hub_pcs = pcs;
+                            break 'poll;
+                        }
+                    }
+                    disk_hub_cur = cur;
+                    disk_hub_pcs = pcs;
                 }
             }
             if hub_due {

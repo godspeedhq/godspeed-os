@@ -178,6 +178,15 @@ pub struct Disk {
     /// that scan account for it.
     pub hub_slot: u32,
     pub hub_port: u32,
+    /// The parent hub's DMA slice, its downstream port count, and the byte offset just past the
+    /// enumeration TRBs on its EP0 ring.
+    ///
+    /// Enough to POLL that hub's downstream ports. Without it, a machine whose only bound device is
+    /// this disk scans no hub at all - so a keyboard plugged in behind the same hub is never seen,
+    /// because a device behind a hub changes no root PORTSC when it arrives.
+    pub hub_dev: u32,
+    pub hub_nports: u32,
+    pub hub_off: usize,
 }
 
 impl Disk {
@@ -193,6 +202,9 @@ impl Disk {
             port,
             hub_slot: 0,
             hub_port: 0,
+            hub_dev: 0,
+            hub_nports: 0,
+            hub_off: 0,
         }
     }
 
