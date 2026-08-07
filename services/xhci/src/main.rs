@@ -2541,6 +2541,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.log_fmt(format_args!(
             "xhci: entering poll loop - {} HID(s), disk {}",
             ndev, if disk.is_some() { "BOUND" } else { "none" }));
+        // Consecutive waits that ended in a TIMEOUT rather than a delivered event. It is how the
+        // driver notices nothing is waking it - see the adaptive deadline below.
+        let mut quiet_waits: u32 = 0;
         let mut int_idx = [0usize; MAX_HID];
         let mut int_cycle = [1u32; MAX_HID];
         let mut need_queue = [true; MAX_HID];
@@ -2646,8 +2649,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // server below and the hub status checks further down can swallow a keyboard completion,
             // and either one owes the endpoint a re-arm - so the set spans them.
             let mut eaten = 0u32;
+            // How long to wait before looking at the event ring ourselves.
+            //
+            // Where the controller's MSI reaches us, `recv_timeout` returns EARLY on the interrupt
+            // and this is only a lost-wake safety net, so 250 ms costs nothing. On the Pi 4 nothing
+            // programs the VL805's MSI yet (`pci::program_xhci_msi` is a stub), so this timeout IS
+            // the polling interval - and 250 ms per keystroke is a quarter-second of lag on every
+            // character typed.
+            //
+            // Rather than shorten it everywhere, which would burn ~100 wakeups/second on boards that
+            // are already interrupt-driven and undo the power work, it ADAPTS: if several waits in a
+            // row have timed out while a HID is bound, nothing is waking us and we must wake
+            // ourselves. A single real wake-up restores the long interval.
+            //
+            // This is a workaround and is labelled as one. The fix is MSI - the interrupt path
+            // itself now exists on this port, only the VL805's MSI programming is missing.
+            let polling = ndev > 0 && quiet_waits >= 4;
             let deadline = if any_held {
                 base.saturating_mul(2)
+            } else if polling {
+                base // ~10 ms, the bound keyboard's own bInterval - no report waits on us
             } else {
                 base.saturating_mul(25)
             };
@@ -2656,7 +2677,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // right when every message was an interrupt wakeup carrying no information. A block
             // request is not that: it carries a reply cap, and dropping it would hang the caller
             // forever on a disk that was working. `serve_if_block` tells them apart by that cap.
-            if let Some(m) = ctx.recv_timeout(deadline) {
+            let woke = ctx.recv_timeout(deadline);
+            // Delivered event = something is waking us. Timeout = it is not.
+            if woke.is_some() { quiet_waits = 0; } else { quiet_waits = quiet_waits.saturating_add(1); }
+            if let Some(m) = woke {
                 if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten) {
                     ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
                     disk = None;
