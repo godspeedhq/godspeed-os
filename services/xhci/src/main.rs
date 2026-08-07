@@ -422,6 +422,29 @@ fn run_command(
     None
 }
 
+/// EP0's Max Packet Size for a device's link speed, as the USB and xHCI specs REQUIRE it.
+///
+/// These are not preferences the driver gets to choose. USB 2.0 mandates 64 bytes for a high-speed
+/// control endpoint and 8 for low-speed; SuperSpeed uses 512. The xHC VALIDATES the value in an
+/// Address Device input context and answers an illegal one with **Parameter Error (completion 17)**.
+///
+/// This exists as ONE function because it was three copies, and one of them had drifted: the
+/// downstream (behind-a-hub) path said `_ => 8`, so every high-speed device behind the Pi 4's
+/// internal VL817 hub - which is where its keyboard and its USB stick actually live - was addressed
+/// with an illegal 8-byte EP0 and refused. The two root-port copies were correct, which is exactly
+/// why it survived: the hub itself enumerated perfectly and only the devices behind it failed.
+///
+/// Commandment III: one truth, derived views. Three hand-maintained copies of a spec constant is
+/// three chances to be wrong, and being wrong here is not a subtle degradation - it is a hard refusal
+/// on the only devices a user actually plugs in.
+fn ep0_max_packet(speed: u32) -> u32 {
+    match speed {
+        2 => 8,   // low-speed
+        4 => 512, // super-speed
+        _ => 64,  // full / high-speed
+    }
+}
+
 /// Issue a control transfer on EP0 at `ep0_off` in device `dev`'s EP0 transfer
 /// ring (Setup, optional IN Data, Status). `wlen == 0` means a no-data transfer.
 /// Returns true on success/short-packet completion.
@@ -601,11 +624,7 @@ fn configure_as_hub(
     dma.write32(islot + 8, (ttt & 0x3) << 16);
     // Re-specify EP0 (Add A1 set) so the command carries a valid endpoint-0 context.
     let ep0_tr = dma.phys_at(ep0_tr_off(dev_idx));
-    let max_packet = match speed {
-        2 => 8,
-        4 => 512,
-        _ => 64,
-    };
+    let max_packet = ep0_max_packet(speed);
     dma.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
     dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
     dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
@@ -700,11 +719,7 @@ fn address_downstream(
     dma.write32(islot + 8, tt);
     // EP0 context.
     let ep0_tr = dma.phys_at(ep0_tr_off(dev_idx));
-    let max_packet = match speed {
-        2 => 8,
-        4 => 512,
-        _ => 8,
-    };
+    let max_packet = ep0_max_packet(speed);
     dma.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
     dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
     dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
@@ -1457,11 +1472,7 @@ fn enumerate_one(
     }
     let psc = mmio.read32(portsc_off);
     let speed = (psc >> 10) & 0xF;
-    let max_packet = match speed {
-        2 => 8,   // low-speed
-        4 => 512, // super-speed
-        _ => 64,  // full / high-speed
-    };
+    let max_packet = ep0_max_packet(speed);
     ctx.log_fmt(format_args!(
         "xhci: port {} ready; PORTSC={:#010x} speed={} max_packet={}",
         port, psc, speed, max_packet
