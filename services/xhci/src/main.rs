@@ -2552,6 +2552,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut disk_hub_cur = 0usize;
         let mut disk_hub_pcs = 1u32;
         let mut quiet_waits: u32 = 0;
+        // One-shot latches so the mode is stated once each way, not on every pass.
+        let mut poll_noted = false;
+        let mut irq_noted = false;
         let mut int_idx = [0usize; MAX_HID];
         let mut int_cycle = [1u32; MAX_HID];
         let mut need_queue = [true; MAX_HID];
@@ -2673,6 +2676,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // This is a workaround and is labelled as one. The fix is MSI - the interrupt path
             // itself now exists on this port, only the VL805's MSI programming is missing.
             let polling = ndev > 0 && quiet_waits >= 4;
+            // Say WHICH mode this driver is in, once each way. Otherwise "interrupts are enabled" is
+            // a claim about configuration, not about behaviour - and the two differ exactly when the
+            // MSI is programmed but never actually delivered, which is the failure this whole change
+            // could plausibly have. The fallback works either way, so without a line here a silent
+            // regression to polling is invisible.
+            if polling && !poll_noted {
+                ctx.log("xhci: no interrupts arriving - falling back to a ~10ms poll (MSI not reaching us)");
+                poll_noted = true;
+            }
+            if !polling && quiet_waits == 0 && !irq_noted {
+                ctx.log("xhci: waking on interrupts (MSI) - not polling");
+                irq_noted = true;
+            }
             let deadline = if any_held {
                 base.saturating_mul(2)
             } else if polling {
