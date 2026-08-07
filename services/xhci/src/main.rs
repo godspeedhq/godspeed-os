@@ -1171,6 +1171,15 @@ fn serve_if_block(
     msg: &godspeed_sdk::Message,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
+    // HID slots whose transfer events this disk operation consumed. The caller MUST re-arm them.
+    //
+    // This was a local variable, thrown away - and the comment above it called the loss "a rare
+    // dropped keystroke, not a stalled endpoint". That was wrong, and the Pi 4 proved it: the
+    // keyboard typed a few characters and then died. An interrupt endpoint's completion is what
+    // retires its in-flight TRB, so whoever consumes that event owes the re-arm. Swallowing it here
+    // meant the endpoint was never queued again and the keyboard was gone for good - not a lost
+    // report, a lost DEVICE.
+    eaten: &mut u32,
     // `false` = the disk stopped answering a DATA operation, so the caller should drop it and
     // re-scan. Returning this rather than swallowing it is what turns an unplugged stick from "the
     // machine hangs" into "the disk went away".
@@ -1198,10 +1207,9 @@ fn serve_if_block(
         return true;
     };
     let mut out = [0u8; 520];
-    let mut eaten = 0u32;
     let n = msc::serve_block(
         ctx,
-        dma, mmio, dboff, ir0, disk, msg.payload_bytes(), &mut out, ev_idx, ev_cycle, &mut eaten,
+        dma, mmio, dboff, ir0, disk, msg.payload_bytes(), &mut out, ev_idx, ev_cycle, eaten,
     );
     let _ = ctx.send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n]));
     ctx.remove_cap(reply);
@@ -2634,6 +2642,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // ~250 ms as the hot-plug watchdog. Never pass 0 (recv_timeout(0) blocks FOREVER).
             let any_held = (0..ndev).any(|d| !devs[d].is_mouse && kb_rep[d].armed());
             let base = rep_ticks.max(1);
+            // HID slots whose transfer events something else consumed this pass. BOTH the block
+            // server below and the hub status checks further down can swallow a keyboard completion,
+            // and either one owes the endpoint a re-arm - so the set spans them.
+            let mut eaten = 0u32;
             let deadline = if any_held {
                 base.saturating_mul(2)
             } else {
@@ -2645,7 +2657,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // request is not that: it carries a reply cap, and dropping it would hang the caller
             // forever on a disk that was working. `serve_if_block` tells them apart by that cap.
             if let Some(m) = ctx.recv_timeout(deadline) {
-                if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle) {
+                if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten) {
                     ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
                     disk = None;
                     continue 'reenum;
@@ -2654,7 +2666,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // Drain any further queued interrupt-event IPCs (an MSI-X mid-processing must not pile up).
             let mut disk_alive = true;
             while let Some(m) = ctx.try_recv() {
-                disk_alive &= serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle);
+                disk_alive &= serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten);
             }
             if !disk_alive {
                 ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
@@ -2729,7 +2741,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // way: notify and break to fully re-initialize, re-binding whatever remains next pass.
             let hub_due =
                 ctx.read_tsc().wrapping_sub(last_hub_poll) > ctx.duration_cycles(HUB_POLL_MS);
-            let mut eaten = 0u32; // HID slots whose events a hub check consumed (re-arm them below)
+            // (declared above, before the block-serving calls - a DISK transfer can consume a HID
+            // completion just as a hub check can, and both owe the same re-arm)
             for d in 0..ndev {
                 let gone = if devs[d].hub_slot == 0 {
                     let portsc_off = op + OP_PORTSC_BASE + (devs[d].port as usize - 1) * 0x10;
