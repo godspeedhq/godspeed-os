@@ -649,7 +649,11 @@ pub fn serve_block(
         return 1;
     }
     let Some(d) = disk.as_mut() else {
-        return 1; // no disk bound - a defined error, not a hang
+        // A defined error, not a hang - but SAY SO. "refused, status -1" on the client side cannot
+        // tell "no disk is bound here" from "the transfer failed", and those are different bugs
+        // needing different fixes.
+        ctx.log("xhci: block request but NO disk is bound - refusing");
+        return 1;
     };
 
     match req[0] {
@@ -677,7 +681,11 @@ pub fn serve_block(
             let lba = u64::from_le_bytes([
                 req[1], req[2], req[3], req[4], req[5], req[6], req[7], req[8],
             ]);
-            if read10(ctx, dma, mmio, dboff, ir0, d, lba, 1, ev_idx, ev_cycle, eaten) {
+            let ok = read10(ctx, dma, mmio, dboff, ir0, d, lba, 1, ev_idx, ev_cycle, eaten);
+            if !ok {
+                ctx.log_fmt(format_args!("xhci: READ(10) of lba {} FAILED on a bound disk", lba));
+            }
+            if ok {
                 out[0] = STATUS_OK;
                 for i in 0..SECTOR as usize {
                     out[1 + i] = data_read8(dma, i);

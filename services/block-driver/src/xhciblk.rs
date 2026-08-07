@@ -50,14 +50,21 @@ fn rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     ctx.request_with_reply(XHCI, &msg)
 }
 
-/// How many times to ask `xhci` for the capacity before coming up with no disk.
+/// How long to wait for `xhci` to report a capacity - a REAL DURATION, in milliseconds.
 ///
-/// This bound is not decoration. `block-driver` is spawned BEFORE `xhci` (slots 2 and 5 in the boot
-/// log), and even once spawned the service has to reset the controller, walk every root port,
-/// address the device and read its geometry. Asking once and believing the silence would report "no
-/// disk" on every boot of a machine that has one - the failure would look like broken hardware and
-/// be perfectly reproducible.
-const CAPACITY_ATTEMPTS: u32 = 200;
+/// This was `CAPACITY_ATTEMPTS = 200`, and the Pi 4 showed exactly what is wrong with that:
+///
+///     10:01:36.708  block-driver: xhci service never reported a capacity - NO disk
+///     10:01:40.848  xhci: USB disk ready - 31266816 sectors of 512 B (15267 MiB)
+///
+/// It gave up after ~0.2 s on something that takes ~4.3 s. Each "attempt" is a failed IPC plus a
+/// reacquire plus a yield, and when the peer is not answering those complete almost instantly - so
+/// 200 attempts measured how fast the loop spins, not how long the disk gets. A COUNT IS NOT A
+/// DURATION, and this is the fourth time that has bitten this port.
+///
+/// 20 s covers a USB stick enumerating behind a hub with room to spare, and it is bound by the
+/// CLOCK, so it means the same thing on any board.
+const CAPACITY_TIMEOUT_MS: u64 = 20_000;
 
 /// Total addressable sectors, or 0 for "no disk" - the same value the syscall reported, so every
 /// caller's no-disk handling is unchanged.
@@ -68,7 +75,10 @@ const CAPACITY_ATTEMPTS: u32 = 200;
 /// never answers is a failure-truth, not a reason to wait forever, so we come up with no disk and
 /// say so.
 pub fn sectors(ctx: &ServiceContext) -> u64 {
-    for attempt in 1..=CAPACITY_ATTEMPTS {
+    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(CAPACITY_TIMEOUT_MS));
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
         if let Some(r) = rpc(ctx, &[OP_CAPACITY]) {
             let p = r.payload_bytes();
             if p.len() >= 9 && p[0] == STATUS_OK {
@@ -85,8 +95,11 @@ pub fn sectors(ctx: &ServiceContext) -> u64 {
         // Not up yet, or its cap went stale across a restart. Both are recovered the same way.
         let _ = ctx.reacquire_by_name(XHCI);
         ctx.yield_cpu();
+        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+            break;
+        }
     }
-    ctx.log("block-driver: xhci service never reported a capacity - NO disk (the service is absent or stuck; storage is unavailable, data on the stick is untouched)");
+    ctx.log("block-driver: xhci service never reported a capacity within 20s - NO disk (the service is absent or stuck; storage is unavailable, data on the stick is untouched)");
     0
 }
 
