@@ -8101,7 +8101,14 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
     // No reply usually means `fs` restarted and our cached cap is now EndpointDead (Phase D,
     // §14.3). Reacquire a fresh `fs` cap by name and retry once; if `fs` hasn't
     // finished re-registering yet, this returns None and the next command retries.
-    if ctx.reacquire_by_name("fs") {
+    // Bracket the reacquire. The hang sits between the failed send and the retry, and two wrong
+    // diagnoses have already come from reasoning about which call blocks instead of proving it.
+    // "reacquiring" without "reacquired" = this call; neither = the send never returned; both = the
+    // retry below.
+    ctx.print("  [diag] fs send failed - reacquiring by name\r\n");
+    let got = ctx.reacquire_by_name("fs");
+    ctx.print(if got { "  [diag] reacquired fs - retrying\r\n" } else { "  [diag] reacquire FAILED\r\n" });
+    if got {
         drain_stale_fs_replies(ctx);
         // The retry is a NEW request and needs its own tag - reusing the first one would accept the
         // dead instance's late reply as this one's answer, which is the whole class of bug being closed.
