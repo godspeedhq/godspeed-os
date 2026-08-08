@@ -2929,8 +2929,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // input poll below its own latency budget. Anything left over is served next pass -
             // nothing is dropped, the service just stops starving one client to feed another.
             let mut disk_alive = true;
+            // FOUR per pass, not 64.
+            //
+            // 64 was chosen to stop a retrying `fs` starving the input poll, and it did - but it is
+            // still 64 BOT commands, each three awaited transfers, before the keyboard is looked at
+            // again. That is invisible while the disk is idle and very visible during file I/O,
+            // which is exactly where the user found it: typing stayed responsive through unplugs and
+            // replugs, then went laggy during a `read`.
+            //
+            // The input poll and the block server share one loop, so the queue bound IS the input
+            // latency bound. Four keeps a read's worth of work moving while capping the gap between
+            // keyboard polls at a few commands rather than dozens. Throughput costs a pass; latency
+            // is what a human notices.
             let mut served = 0u32;
-            while served < 64 {
+            while served < 4 {
                 let Some(m) = ctx.try_recv() else { break };
                 served += 1;
                 disk_alive &= serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten);
