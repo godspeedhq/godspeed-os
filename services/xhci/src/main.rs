@@ -3107,11 +3107,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // the next `drives` then blocked on a device that was no longer there.
                         // Absence is a fact about the hardware, not a consequence of asking.
                         if disk.as_ref().is_some_and(|dk| dk.hub_slot == hub_slot && dk.hub_port == hp) {
+                            // Bracketed: if "probing" prints and "probed" does not, THIS transfer is
+                            // where the driver stops once the device is physically gone - the
+                            // remaining explanation for the keyboard dying with the service otherwise
+                            // healthy. Only while the count is low, so it cannot itself spam.
+                            let noisy = disk_absent_seen < 4;
+                            if noisy { ctx.log_fmt(format_args!("xhci: [diag] probing disk port {}", hp)); }
                             let (mut c2, mut p2) = (hub_cur[owner], hub_pcs[owner]);
                             let st = hub_port_status(
                                 &dma, &mmio, dboff, ir0, hub_slot, hub_dev, hp,
                                 &mut c2, &mut p2, &mut ev_idx, &mut ev_cycle, &mut eaten,
                             );
+                            if noisy { ctx.log_fmt(format_args!("xhci: [diag] probed disk port {} -> {:?}", hp, st)); }
                             hub_cur[owner] = c2;
                             hub_pcs[owner] = p2;
                             // Only a definite `Some(false)` counts. `None` is a FAILED probe -
@@ -3130,17 +3137,30 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             // A disconnect is not urgent - the port is not going to reconnect itself
                             // between two passes - so confirming it costs one poll interval and buys
                             // immunity to a single bad read.
-                            if st == Some(false) {
-                                disk_absent_seen = disk_absent_seen.saturating_add(1);
-                                if disk_absent_seen >= 2 {
-                                    ctx.log("xhci: the USB disk was unplugged - dropping it");
-                                    notify(&ctx, "storage disconnected (xhci)");
-                                    disk_gone = true;
-                                    break;
-                                }
-                            } else if st.is_some() {
-                                // Present again - it was a bad read, not a removal.
-                                disk_absent_seen = 0;
+                            // A FAILED probe counts too, once it KEEPS failing.
+                            //
+                            // `None` was treated as "unknown, not gone" and nothing more. Right for
+                            // one bad read, wrong as a permanent rule: pulling the stick makes this
+                            // transfer FAIL rather than report disconnected, so the disk was never
+                            // dropped, no notification fired, and the port was probed forever. The Pi
+                            // 4 log ends on exactly that line - "status probe -> None" - with the
+                            // disk still bound and the keyboard dead.
+                            //
+                            // A port that cannot be probed REPEATEDLY is not unknown, it is
+                            // unreachable. Three failures, a stronger bar than the two a clean
+                            // `Some(false)` needs, because a failed transfer is weaker evidence.
+                            let gone_now = match st {
+                                Some(false) => { disk_absent_seen = disk_absent_seen.saturating_add(1); disk_absent_seen >= 2 }
+                                None => { disk_absent_seen = disk_absent_seen.saturating_add(1); disk_absent_seen >= 3 }
+                                Some(true) => { disk_absent_seen = 0; false }
+                            };
+                            if gone_now {
+                                ctx.log_fmt(format_args!(
+                                    "xhci: the USB disk is gone (port {} {}) - dropping it",
+                                    hp, if st.is_none() { "unreachable" } else { "reports disconnected" }));
+                                notify(&ctx, "storage disconnected (xhci)");
+                                disk_gone = true;
+                                break;
                             }
                             continue;
                         }
