@@ -1998,15 +1998,32 @@ fn enumerate_one(
         // A fixed hold is wrong in both directions: too short and the device is addressed before it
         // is ready (completion 4, which is what the Pi 4 showed), too long and every enumeration
         // pays for the slowest device on the bus. The port itself says when it is ready.
+        // FEWER, LONGER polls - because each one costs EP0 RING, not just time.
+        //
+        // Every status poll is a 3-TRB control transfer that advances `hoff`, and the ring is one
+        // page. At 100 polls x 48 bytes a single slow port consumed 4800 bytes of it, so later ports
+        // hit the `hoff` guard and were silently skipped. On the Pi 4 the disk sits on an early hub
+        // port and the keyboard on a later one, which is exactly why plugging the stick back in made
+        // the KEYBOARD disappear: the pass found the disk, ran out of ring, and never walked far
+        // enough to reach the keyboard - logging "0 HID device(s) bound" as though none were there.
+        //
+        // 12 polls at 20 ms is the same ~240 ms of patience for a port that is genuinely slow, at a
+        // twelfth of the ring cost. The budget was never the scarce resource; the ring was.
         let mut pstatus = 0u16;
-        for _ in 0..100 {
-            ctx.sleep(ctx.duration_cycles(10));
+        for _ in 0..12 {
+            ctx.sleep(ctx.duration_cycles(20));
             let ok = control(
                 dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle, 0xA3, 0, 0,
                 dp as u32, 4, DATA_BUF_OFF,
             );
             hoff += 48;
-            if hoff + 64 > 0xF00 { break; }
+            // Ring exhausted. Say so - this used to break out silently, and a port skipped for lack
+            // of ring is indistinguishable in the log from a port with nothing plugged into it.
+            if hoff + 64 > 0xF00 {
+                ctx.log_fmt(format_args!(
+                    "xhci: EP0 ring exhausted walking hub port {} - remaining ports not scanned this pass", dp));
+                break;
+            }
             if !ok { break; }
             pstatus = dma.read16(DATA_BUF_OFF);
             if pstatus & 0x2 != 0 { break; } // PORT_ENABLE
