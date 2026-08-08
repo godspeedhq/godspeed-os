@@ -103,6 +103,26 @@ pub fn sectors(ctx: &ServiceContext) -> u64 {
     0
 }
 
+/// Ask `xhci` for the capacity RIGHT NOW - one attempt, no waiting for enumeration.
+///
+/// Deliberately not `sectors()`. That one waits up to 20 s because it runs at startup, when the
+/// controller legitimately has not finished enumerating; using it to answer an interactive `drives`
+/// would hang the shell for 20 s on a machine with no stick in it.
+///
+/// This exists because `drives` reported 15267 MiB for a stick that had been unplugged minutes
+/// earlier: `block-driver` captured the sector count once at startup and served that number forever,
+/// so removing the device changed nothing anything above could see. That is a derived view outliving
+/// its source, which §26.4 and §14.3 both forbid - the disk is `xhci`'s truth, and a cached copy of
+/// another service's truth must be re-derived, not remembered.
+pub fn sectors_now(ctx: &ServiceContext) -> u64 {
+    let Some(r) = rpc(ctx, &[OP_CAPACITY]) else { return 0 };
+    let p = r.payload_bytes();
+    if p.len() < 9 || p[0] != STATUS_OK {
+        return 0;
+    }
+    u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]])
+}
+
 /// Read one 512-byte sector. `false` means the read did not happen - never a partially-filled buf.
 pub fn read(ctx: &ServiceContext, lba: u64, buf: &mut [u8; 512]) -> bool {
     let mut req = [0u8; 9];

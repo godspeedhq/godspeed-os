@@ -266,6 +266,18 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
         return;
     }
     if p[0] == OP_CAPACITY {
+        // Ask the DEVICE, do not recite what it said at boot.
+        //
+        // `sectors` here is the count captured once at startup. Serving it forever meant `drives`
+        // reported 15267 MiB for a stick that had been unplugged minutes before - the number was
+        // true when it was learned and had not been true since. A capacity is a fact about hardware
+        // that is present, so it is re-derived per request (§26.4: a cached view is legitimate only
+        // while it reconciles with its source; this one could not).
+        //
+        // Only under `usb-via-xhci`, where a live query is one IPC away. The AHCI and syscall paths
+        // keep their existing behaviour.
+        #[cfg(feature = "usb-via-xhci")]
+        let sectors = super::xhciblk::sectors_now(ctx);
         let mut out = [0u8; 9];
         out[0] = STATUS_OK;
         out[1..9].copy_from_slice(&sectors.to_le_bytes());

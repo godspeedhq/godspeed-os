@@ -1423,10 +1423,11 @@ fn bind_msc(
                 msc::SECTOR,
                 (n * msc::SECTOR as u64) / (1024 * 1024)
             ));
-            // ON SCREEN too, not only on serial. A keyboard announces itself via `notify` and storage
-            // never did, so plugging a stick into a machine with no serial attached gave no sign at
-            // all that anything had happened. Tell the user about the device they can see.
-            notify(ctx, "storage connected (xhci)");
+            // NOT announced here. This runs on the boot pass too, and the boot devices are
+            // deliberately silent - a keyboard present at power-on does not announce itself either
+            // (`announce` stays false for the first pass). Saying "storage connected" before the
+            // prompt reports a plug event that did not happen. The announce moved to the enumeration
+            // caller, which knows whether this pass is a boot or a hot-plug.
             Some(disk)
         }
         None => {
@@ -2553,6 +2554,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // real READ(10) of sector 0, reported with what came back. A driver that reports a disk it
         // has never successfully read from pushes the first failure into the filesystem, where it
         // reads as corruption rather than as a driver that does not work (§26.7).
+        // A newly-arrived disk announces itself, a boot disk does not - the same rule the HID
+        // announce follows two blocks down, and for the same reason: `announce` is false on the boot
+        // pass, so only a genuine plug reaches the screen.
+        if announce && disk.is_some() {
+            notify(&ctx, "storage connected (xhci)");
+        }
         if let Some(d) = disk.as_mut() {
             let mut eaten = 0u32;
             if msc::read10(
