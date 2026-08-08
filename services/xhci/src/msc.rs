@@ -155,6 +155,11 @@ impl Ring {
 }
 
 /// A bound mass-storage device: the coordinates needed to talk to it and the geometry it reported.
+/// Set once "no disk is bound" has been reported, so the refusal is not logged per request.
+static NO_DISK_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// As `NO_DISK_LOGGED`, for a bound disk whose reads have started failing.
+static READ_FAIL_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 pub struct Disk {
     pub slot: u32,
     /// Device Context Index of the bulk-OUT endpoint (`num * 2`).
@@ -191,6 +196,9 @@ pub struct Disk {
 
 impl Disk {
     pub fn new(slot: u32, out_ep: u8, in_ep: u8, port: u32) -> Self {
+        // A disk exists again - let the next absence be reported.
+        NO_DISK_LOGGED.store(false, core::sync::atomic::Ordering::Relaxed);
+        READ_FAIL_LOGGED.store(false, core::sync::atomic::Ordering::Relaxed);
         Disk {
             slot,
             out_dci: (out_ep & 0x0F) as u32 * 2,
@@ -675,7 +683,19 @@ pub fn serve_block(
         // A defined error, not a hang - but SAY SO. "refused, status -1" on the client side cannot
         // tell "no disk is bound here" from "the transfer failed", and those are different bugs
         // needing different fixes.
-        ctx.log("xhci: block request but NO disk is bound - refusing");
+        // ONCE, not per request.
+        //
+        // With the stick out and `fs` still mounted, `fs` retries block reads indefinitely - and this
+        // line fired on every one. Serial output costs about a millisecond a line, so the driver
+        // ended up spending its pass writing logs instead of polling the keyboard, and typing
+        // degraded the longer the machine sat with no disk. The diagnostic became the load it was
+        // added to diagnose.
+        //
+        // The fact is worth saying once per drop; saying it ten times a second adds nothing and costs
+        // the thing the user actually notices. Reset when a disk is bound again (see `Disk::new`).
+        if !NO_DISK_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+            ctx.log("xhci: block request but NO disk is bound - refusing (silenced until one is)");
+        }
         return 1;
     };
 
@@ -706,7 +726,12 @@ pub fn serve_block(
             ]);
             let ok = read10(ctx, dma, mmio, dboff, ir0, d, lba, 1, ev_idx, ev_cycle, eaten);
             if !ok {
-                ctx.log_fmt(format_args!("xhci: READ(10) of lba {} FAILED on a bound disk", lba));
+                // Also once. A disk that has stopped answering fails EVERY read `fs` retries, and
+                // one line per failure is the same self-inflicted load as the refusal above.
+                if !READ_FAIL_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    ctx.log_fmt(format_args!(
+                        "xhci: READ(10) of lba {} FAILED on a bound disk (further failures silenced)", lba));
+                }
             }
             if ok {
                 out[0] = STATUS_OK;
