@@ -8079,7 +8079,15 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
     // 3600 s here is the same "effectively unbounded, q is the real exit" budget the interactive path
     // uses: it bounds only the wait for a REPLACEMENT reply after discarding an overtaken one.
     if let ReqOutcome::Reply(r) = fs_take_tagged(
-        ctx, tag, ctx.request_with_reply("fs", &msg).map_or(ReqOutcome::Timeout, ReqOutcome::Reply), 3600) {
+        // ABORTABLE. This was a plain `request_with_reply`, which blocks with no way out - so every
+        // fs command (`drives`, `ls`, `read`, ...) sat unkillable while `fs` was slow or its device
+        // had gone. `drives` with an unplugged stick was the visible case: it simply hung, and the
+        // "press q" the conventions promise (utilities/0_conventions.md §1 rule 12, q-abortable
+        // blocking) was not there because nothing was listening for the key.
+        //
+        // The budget stays effectively unbounded - q is the real exit, not a timeout. What changes is
+        // that q now works.
+        ctx, tag, ctx.request_with_reply_abortable("fs", &msg, 3600), 3600) {
         return Some(r);
     }
     // No reply usually means `fs` restarted and our cached cap is now EndpointDead (Phase D,
@@ -8094,7 +8102,7 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
         req2[0] = tag2;
         let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
         if let ReqOutcome::Reply(r) = fs_take_tagged(
-            ctx, tag2, ctx.request_with_reply("fs", &msg2).map_or(ReqOutcome::Timeout, ReqOutcome::Reply), 3600) {
+            ctx, tag2, ctx.request_with_reply_abortable("fs", &msg2, 3600), 3600) {
             return Some(r);
         }
     }
