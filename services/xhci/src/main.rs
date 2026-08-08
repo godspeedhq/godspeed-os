@@ -256,6 +256,14 @@ const RESET_RECOVERY_MS: u64 = 55;
 /// behind it (no root PORTSC reflects that). Responsive enough for a "keyboard disconnected" notice,
 /// infrequent enough not to load the hub or eat keystrokes off the shared event ring - the check runs
 /// a control transfer, and between checks the keyboard endpoint has the ring to itself.
+/// How long to hold a hub's downstream port in reset. USB 2.0 asks for at least 10 ms; hubs and
+/// devices vary, and being generous here costs one enumeration, not a running system.
+const PORT_RESET_HOLD_MS: u64 = 60;
+/// TRSTRCY - the recovery interval a device is owed AFTER its port reset completes, before it can be
+/// addressed (USB 2.0 §7.1.7.5 gives 10 ms). 20 for margin: the cost is 20 ms per downstream port at
+/// enumeration, and the alternative is a device that never enumerates at all.
+const PORT_RECOVERY_MS: u64 = 20;
+
 const HUB_POLL_MS: u64 = 500;
 /// How long the "a hub is present but nothing usable is behind it" wait sleeps before re-walking the
 /// hub. A device replugged BEHIND a hub changes no root PORTSC, so the root-port wait would miss it.
@@ -1958,13 +1966,26 @@ fn enumerate_one(
             0,
         ); // Set_Feature(PORT_RESET = 4)
         hoff += 32;
+        // Hold the reset for a REAL DURATION. This was `< 100_000_000` raw cycles, commented
+        // "~50-65 ms" - a number true only on the machine it was measured on. Fifth time this class
+        // has appeared on this port; the constant now means milliseconds everywhere.
         let t0 = ctx.read_tsc();
-        while ctx.read_tsc().wrapping_sub(t0) < 100_000_000 {} // ~50-65 ms reset hold (bounded)
+        while ctx.read_tsc().wrapping_sub(t0) < ctx.duration_cycles(PORT_RESET_HOLD_MS) {}
         let _ = control(
             dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle, 0x23, 1, 0x14, dp as u32,
             0, 0,
         ); // Clear_Feature(C_PORT_RESET = 20)
         hoff += 32;
+        // TRSTRCY: a device is NOT addressable the instant its port reset completes. USB 2.0 §7.1.7.5
+        // gives it 10 ms to recover before it will answer on address 0, and this code went straight
+        // from clearing C_PORT_RESET into Address Device.
+        //
+        // That is what a completion 4 (Transaction Error) means here: the input context was ACCEPTED
+        // and the device did not answer - not an illegal field, not a flaky link. It also explains
+        // why retrying immediately could not help: three attempts 15 ms apart all land inside the
+        // recovery window, which is exactly what the Pi 4 showed (completion=4 three times in 45 ms,
+        // the code never changing).
+        ctx.sleep(ctx.duration_cycles(PORT_RECOVERY_MS));
         let _ = control(
             dma,
             mmio,
