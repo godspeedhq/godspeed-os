@@ -1238,7 +1238,16 @@ fn serve_if_block(
     // whole machine hanging rather than as a removed disk.
     let was_data_op = matches!(msg.payload_bytes().first(),
         Some(&msc::OP_READ_BLOCK) | Some(&msc::OP_WRITE_BLOCK) | Some(&msc::OP_WRITE_ZEROS));
-    !(was_data_op && out[0] == msc::STATUS_ERR)
+    // ... AND only while a disk is still bound.
+    //
+    // Once it has been dropped, `serve_block` answers STATUS_ERR for the honest reason "no disk" -
+    // and reading THAT as "the disk just stopped answering" restarts the whole enumeration again.
+    // `fs` retries, so every retry triggered another re-init: a storm every ~450 ms that tore down
+    // and rebound the KEYBOARD each time, which is how an unplugged stick presented as typing going
+    // laggy and then dead.
+    //
+    // A device can only stop answering once. The second report is not news, it is an echo.
+    !(was_data_op && out[0] == msc::STATUS_ERR && disk.is_some())
 }
 
 /// Configure an addressed mass-storage device's two BULK endpoints and read its geometry.
