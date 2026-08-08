@@ -1966,11 +1966,28 @@ fn enumerate_one(
             0,
         ); // Set_Feature(PORT_RESET = 4)
         hoff += 32;
-        // Hold the reset for a REAL DURATION. This was `< 100_000_000` raw cycles, commented
-        // "~50-65 ms" - a number true only on the machine it was measured on. Fifth time this class
-        // has appeared on this port; the constant now means milliseconds everywhere.
-        let t0 = ctx.read_tsc();
-        while ctx.read_tsc().wrapping_sub(t0) < ctx.duration_cycles(PORT_RESET_HOLD_MS) {}
+        // POLL the port until it reports ENABLED, rather than holding for a fixed time and hoping.
+        //
+        // Taken from the in-kernel driver still in this tree (`arch/aarch64/xhci.rs`), which has
+        // driven this exact hub for weeks. I had been re-deriving this sequence from the spec and
+        // getting it subtly wrong; the working version was sitting in the repo the whole time.
+        //
+        // A fixed hold is wrong in both directions: too short and the device is addressed before it
+        // is ready (completion 4, which is what the Pi 4 showed), too long and every enumeration
+        // pays for the slowest device on the bus. The port itself says when it is ready.
+        let mut pstatus = 0u16;
+        for _ in 0..100 {
+            ctx.sleep(ctx.duration_cycles(10));
+            let ok = control(
+                dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle, 0xA3, 0, 0,
+                dp as u32, 4, DATA_BUF_OFF,
+            );
+            hoff += 48;
+            if hoff + 64 > 0xF00 { break; }
+            if !ok { break; }
+            pstatus = dma.read16(DATA_BUF_OFF);
+            if pstatus & 0x2 != 0 { break; } // PORT_ENABLE
+        }
         let _ = control(
             dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle, 0x23, 1, 0x14, dp as u32,
             0, 0,
@@ -1985,6 +2002,22 @@ fn enumerate_one(
         // why retrying immediately could not help: three attempts 15 ms apart all land inside the
         // recovery window, which is exactly what the Pi 4 showed (completion=4 three times in 45 ms,
         // the code never changing).
+        // Acknowledge C_PORT_CONNECTION too. The in-kernel driver clears BOTH change bits with the
+        // comment "or the hub keeps reporting the same event forever" - and mine cleared only
+        // C_PORT_RESET. An unacknowledged connection-change is a hub that keeps announcing the same
+        // arrival, which is exactly the re-enumeration behaviour seen on this board.
+        let _ = control(
+            dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle, 0x23, 1, 0x10, dp as u32,
+            0, 0,
+        ); // Clear_Feature(C_PORT_CONNECTION = 16)
+        hoff += 32;
+        // If the port never enabled, addressing it cannot work - say so instead of trying.
+        if pstatus & 0x2 == 0 {
+            ctx.log_fmt(format_args!(
+                "xhci: hub port {} did not enable after reset (status {:#06x}) - skipping it",
+                dp, pstatus));
+            continue; // no slice allocated yet at this point - nothing to release
+        }
         ctx.sleep(ctx.duration_cycles(PORT_RECOVERY_MS));
         let _ = control(
             dma,
