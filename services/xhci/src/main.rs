@@ -1423,6 +1423,10 @@ fn bind_msc(
                 msc::SECTOR,
                 (n * msc::SECTOR as u64) / (1024 * 1024)
             ));
+            // ON SCREEN too, not only on serial. A keyboard announces itself via `notify` and storage
+            // never did, so plugging a stick into a machine with no serial attached gave no sign at
+            // all that anything had happened. Tell the user about the device they can see.
+            notify(ctx, "storage connected (xhci)");
             Some(disk)
         }
         None => {
@@ -2900,13 +2904,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if let Some(m) = woke {
                 if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten) {
                     ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
+                    notify(&ctx, "storage disconnected (xhci)");
                     disk = None;
                     continue 'reenum;
                 }
             }
             // Drain any further queued interrupt-event IPCs (an MSI-X mid-processing must not pile up).
+            // BOUNDED, for the same reason the event drain is.
+            //
+            // "Drain until the queue is empty" is not a bound when a peer can refill it as fast as we
+            // empty it. With the stick unplugged, `fs` retries block reads continuously; each retry
+            // is a message, so this loop never returned and the KEYBOARD was never polled again. On
+            // the Pi 4 that presented as typing working for a while after an unplug and then dying,
+            // with the driver still visibly alive and answering.
+            //
+            // 64 messages per pass is far more than a settled system produces and still leaves the
+            // input poll below its own latency budget. Anything left over is served next pass -
+            // nothing is dropped, the service just stops starving one client to feed another.
             let mut disk_alive = true;
-            while let Some(m) = ctx.try_recv() {
+            let mut served = 0u32;
+            while served < 64 {
+                let Some(m) = ctx.try_recv() else { break };
+                served += 1;
                 disk_alive &= serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten);
             }
             if !disk_alive {
@@ -3115,6 +3134,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 disk_absent_seen = disk_absent_seen.saturating_add(1);
                                 if disk_absent_seen >= 2 {
                                     ctx.log("xhci: the USB disk was unplugged - dropping it");
+                                    notify(&ctx, "storage disconnected (xhci)");
                                     disk_gone = true;
                                     break;
                                 }
