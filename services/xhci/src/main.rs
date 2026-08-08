@@ -259,6 +259,8 @@ const RESET_RECOVERY_MS: u64 = 55;
 /// How long to hold a hub's downstream port in reset. USB 2.0 asks for at least 10 ms; hubs and
 /// devices vary, and being generous here costs one enumeration, not a running system.
 const PORT_RESET_HOLD_MS: u64 = 60;
+/// How long to let a hub's port power settle before resetting anything on it.
+const PORT_POWER_SETTLE_MS: u64 = 200;
 /// TRSTRCY - the recovery interval a device is owed AFTER its port reset completes, before it can be
 /// addressed (USB 2.0 §7.1.7.5 gives 10 ms). 20 for margin: the cost is 20 ms per downstream port at
 /// enumeration, and the alternative is a device that never enumerates at all.
@@ -1923,6 +1925,18 @@ fn enumerate_one(
         ); // Set_Feature(PORT_POWER = 8)
         hoff += 32;
     }
+    // Let power settle before touching any port.
+    //
+    // The in-kernel driver waits 200 ms here and mine waited none. A port is powered, not ready: a
+    // device has to see VBUS, pull its speed-signalling resistor up, and be DETECTED by the hub
+    // before a reset can enable it. Reset it too early and the port answers "connected, powered, not
+    // enabled" - status 0x0301, exactly what the Pi 4 reported seven times over sixteen seconds
+    // before the device finally came up on a later re-scan.
+    //
+    // bPwrOn2PwrGood in the hub descriptor gives this in 2 ms units and would be the precise answer;
+    // 200 ms is the reference driver's figure and covers every hub it has met. Paid once per hub at
+    // enumeration.
+    ctx.sleep(ctx.duration_cycles(PORT_POWER_SETTLE_MS));
     // For each CONNECTED downstream port: reset it, read its speed, Address Device it with a route
     // string (this hub port, tier 1) + parent-TT into its OWN slice, then read its config and bind it
     // if it's a boot HID - exactly like a root-port device (read_config_and_bind). This is what makes
