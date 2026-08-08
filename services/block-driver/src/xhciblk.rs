@@ -114,6 +114,7 @@ pub fn sectors(ctx: &ServiceContext) -> u64 {
 /// so removing the device changed nothing anything above could see. That is a derived view outliving
 /// its source, which §26.4 and §14.3 both forbid - the disk is `xhci`'s truth, and a cached copy of
 /// another service's truth must be re-derived, not remembered.
+#[allow(dead_code)] // wired once `fs` stops serving its own cached capacity - see usbdisk.rs
 pub fn sectors_now(ctx: &ServiceContext) -> u64 {
     let Some(r) = rpc(ctx, &[OP_CAPACITY]) else { return 0 };
     let p = r.payload_bytes();

@@ -266,18 +266,17 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
         return;
     }
     if p[0] == OP_CAPACITY {
-        // Ask the DEVICE, do not recite what it said at boot.
+        // NOTE: this answers from the count captured at startup, and that is knowingly stale -
+        // `drives` will report a size for a stick that has been unplugged.
         //
-        // `sectors` here is the count captured once at startup. Serving it forever meant `drives`
-        // reported 15267 MiB for a stick that had been unplugged minutes before - the number was
-        // true when it was learned and had not been true since. A capacity is a fact about hardware
-        // that is present, so it is re-derived per request (§26.4: a cached view is legitimate only
-        // while it reconciles with its source; this one could not).
+        // An earlier attempt re-queried `xhci` here per request. It did NOT fix the symptom, because
+        // the number `drives` displays comes from `fs`'s OWN cached capacity, taken at mount - so the
+        // stale value survived regardless - and it added an IPC round-trip to every capacity request,
+        // which is latency on the path that also serves the keyboard. Reverted rather than left in:
+        // a change that costs something and fixes nothing is worse than the bug.
         //
-        // Only under `usb-via-xhci`, where a live query is one IPC away. The AHCI and syscall paths
-        // keep their existing behaviour.
-        #[cfg(feature = "usb-via-xhci")]
-        let sectors = super::xhciblk::sectors_now(ctx);
+        // The real fix belongs in `fs`: re-derive capacity (or drop the mount) when the device goes
+        // away, per §14.3. Recorded here so the next attempt starts in the right service.
         let mut out = [0u8; 9];
         out[0] = STATUS_OK;
         out[1..9].copy_from_slice(&sectors.to_le_bytes());
