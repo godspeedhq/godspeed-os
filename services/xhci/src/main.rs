@@ -811,10 +811,18 @@ fn address_downstream(
             dma.read32(INPUT_CTX_OFF + 4), dma.read32(INPUT_CTX_OFF),
             dma.read32(islot), dma.read32(islot + 4), dma.read32(islot + 8), dma.read32(islot + 12)));
         ctx.log_fmt(format_args!(
-            "xhci:   ep0 {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} | tt_slot={} tt_port={} ttt={}",
+            // Print what was WRITTEN, decoded from the slot context - not the arguments that went
+            // in. The first version printed `ttt` the parameter beside the dumped dwords, and I read
+            // it as the field's value: it showed 3 while the context correctly held 0, and I spent a
+            // night believing a fix had not applied when it had. A diagnostic that mixes inputs with
+            // observations is worse than one that omits them.
+            "xhci:   ep0 {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} | written tt_slot={} tt_port={} ttt={} (hub's own ttt={})",
             dma.read32(iep0), dma.read32(iep0 + 4), dma.read32(iep0 + 8),
             dma.read32(iep0 + 12), dma.read32(iep0 + 16),
-            parent_slot, parent_port, ttt));
+            dma.read32(islot + 8) & 0xFF,
+            (dma.read32(islot + 8) >> 8) & 0xFF,
+            (dma.read32(islot + 8) >> 16) & 0x3,
+            ttt));
         return None;
     }
     // Read the device descriptor over the downstream slice's EP0 ring (offset 0).
@@ -1993,7 +2001,25 @@ fn enumerate_one(
                 break;
             }
         };
-        match address_downstream(
+        // Address Device is RETRIED, because completion 4 (Transaction Error) means the context was
+        // ACCEPTED and the controller then failed to talk to the device over the wire - no response
+        // or a corrupt one. That is transient by definition, unlike completion 17 (Parameter Error),
+        // which means a field is illegal and will be illegal every time.
+        //
+        // The Pi 4's blue sockets produce exactly this: a low-speed keyboard there answers on the
+        // first attempt only sometimes. A low/full-speed device behind a high-speed hub reaches the
+        // controller through the hub's transaction translator, and the first transaction after a
+        // port reset is the one most likely to be missed.
+        //
+        // Bounded at 3. Every attempt logs its own failure - deliberately noisier than reporting
+        // only the last, because the interesting question for a flaky port is whether the completion
+        // code CHANGES between attempts (a device that answers on attempt 2 is a different problem
+        // from one that never answers). A retry that ultimately fails stays as loud as the original
+        // failure either way (§26.7).
+        let mut attempt = 0;
+        let addressed = loop {
+            attempt += 1;
+            let r = address_downstream(
             ctx,
             dma,
             mmio,
@@ -2010,7 +2036,13 @@ fn enumerate_one(
             ev_idx,
             ev_cycle,
             cmd_idx,
-        ) {
+            );
+            // Retry only while there is an attempt left; the callee reports the last failure.
+            if r.is_some() || attempt >= 3 {
+                break r;
+            }
+        };
+        match addressed {
             Some((dslot, vid, pid, cls)) => {
                 ctx.log_fmt(format_args!(
                     "xhci: hub port {} DEVICE: VID={:#06x} PID={:#06x} class={:#04x} speed={} (slot {})",
