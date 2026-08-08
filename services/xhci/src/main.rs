@@ -2818,7 +2818,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             //
             // This is a workaround and is labelled as one. The fix is MSI - the interrupt path
             // itself now exists on this port, only the VL805's MSI programming is missing.
-            let polling = ndev > 0 && quiet_waits >= 4;
+            // A BOUND HID means the short deadline, full stop - interrupts or not.
+            //
+            // This used to require `quiet_waits >= 4`, i.e. "only poll fast once we have proven
+            // nothing is waking us". On the Pi 4 that produced the worst of both worlds: MSI wakes
+            // arrived often enough to keep `quiet_waits` at 0, so the fallback never engaged, while
+            // keyboard completions evidently did NOT each raise one - so every keystroke waited out
+            // the 250 ms idle deadline. Typing was slower WITH interrupts working than without, and
+            // the "quiet - polling" line never printed to say so.
+            //
+            // An interrupt that arrives makes `recv_timeout` return early regardless, so the short
+            // deadline costs nothing where MSI is reliable and rescues latency where it is not. The
+            // 250 ms deadline is now only for a controller with NO input device bound, where there is
+            // nothing whose latency a human can feel.
+            let polling = ndev > 0;
             // Say WHICH mode this driver is in, once each way. Otherwise "interrupts are enabled" is
             // a claim about configuration, not about behaviour - and the two differ exactly when the
             // MSI is programmed but never actually delivered, which is the failure this whole change
@@ -2830,7 +2843,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // that "MSI not reaching us" and made normal idle read as a broken feature.
                 // What matters is whether the interrupt line ever worked, which the companion
                 // message states from an observed delivery.
-                ctx.log("xhci: quiet - polling at ~10ms until the next event (normal when idle)");
+                ctx.log("xhci: polling at ~10ms alongside interrupts (input latency floor)");
                 poll_noted = true;
             }
             // Announced only from an OBSERVED delivery (`irq_seen`), never from the initial state.
