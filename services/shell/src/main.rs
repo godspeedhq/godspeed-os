@@ -8078,17 +8078,25 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
     drain_stale_fs_replies(ctx);          // an earlier abandoned reply must not be read as ours
     // 3600 s here is the same "effectively unbounded, q is the real exit" budget the interactive path
     // uses: it bounds only the wait for a REPLACEMENT reply after discarding an overtaken one.
-    if let ReqOutcome::Reply(r) = fs_take_tagged(
-        // ABORTABLE. This was a plain `request_with_reply`, which blocks with no way out - so every
-        // fs command (`drives`, `ls`, `read`, ...) sat unkillable while `fs` was slow or its device
-        // had gone. `drives` with an unplugged stick was the visible case: it simply hung, and the
-        // "press q" the conventions promise (utilities/0_conventions.md §1 rule 12, q-abortable
-        // blocking) was not there because nothing was listening for the key.
-        //
-        // The budget stays effectively unbounded - q is the real exit, not a timeout. What changes is
-        // that q now works.
-        ctx, tag, ctx.request_with_reply_abortable("fs", &msg, 3600), 3600) {
-        return Some(r);
+    // ABORTABLE, so `q` works while `fs` is merely slow.
+    let first = ctx.request_with_reply_abortable("fs", &msg, 3600);
+    if matches!(first, ReqOutcome::Aborted) {
+        return None; // the user pressed q - that is an answer, not a failure to retry
+    }
+    // Wait for a REPLACEMENT only if a reply actually arrived (possibly an overtaken one).
+    //
+    // This is the stale-cap hang. When `fs` restarts, the shell's cached cap goes EndpointDead and
+    // the send fails outright - no reply, and none coming. Feeding that into a 3600-second wait for
+    // a "replacement" meant the reacquire-and-retry immediately below was NEVER REACHED: the
+    // recovery path existed, was correct, and sat behind an hour-long wait for something that could
+    // not arrive. Reproduced in QEMU with `kill fs` then `drives`: one gen-mismatch line and then
+    // silence, with q and every later command ignored.
+    //
+    // A missing reply is not a late reply. Only the latter is worth waiting for.
+    if matches!(first, ReqOutcome::Reply(_)) {
+        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag, first, 3600) {
+            return Some(r);
+        }
     }
     // No reply usually means `fs` restarted and our cached cap is now EndpointDead (Phase D,
     // §14.3). Reacquire a fresh `fs` cap by name and retry once; if `fs` hasn't
@@ -8101,8 +8109,15 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
         let mut req2 = req;
         req2[0] = tag2;
         let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
-        if let ReqOutcome::Reply(r) = fs_take_tagged(
-            ctx, tag2, ctx.request_with_reply_abortable("fs", &msg2, 3600), 3600) {
+        // Same rule on the retry: never wait out an hour for a reply that was never sent.
+        let second = ctx.request_with_reply_abortable("fs", &msg2, 3600);
+        if matches!(second, ReqOutcome::Aborted) {
+            return None;
+        }
+        if !matches!(second, ReqOutcome::Reply(_)) {
+            return None; // fs still unreachable - the next command retries (§14.3)
+        }
+        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag2, second, 3600) {
             return Some(r);
         }
     }
