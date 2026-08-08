@@ -2348,7 +2348,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // (let CNR assert), wait for CNR to clear reading ONLY USBSTS, THEN read USBCMD to confirm HCRST
         // cleared - USBCMD is never touched while the controller is not ready.
         let t0 = ctx.read_tsc();
-        while ctx.read_tsc().wrapping_sub(t0) < 2_000_000 {} // ~1-2 ms settle (bounded; TSC always runs)
+        // A REAL duration. This was `< 2_000_000` raw cycles commented "~1-2 ms" - true only on the
+        // machine it was measured on, and the sixth instance of that class found on this port.
+        while ctx.read_tsc().wrapping_sub(t0) < ctx.duration_cycles(2) {}
         spin(&ctx, "USBSTS.CNR to clear after HCRST", 500, || {
             mmio.read32(op + OP_USBSTS) & STS_CNR == 0
         });
@@ -2880,7 +2882,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // Drain ALL pending events. Transfer events → decode HID; other events (port
             // status change, etc.) are dequeued and ignored (hot-plug is handled by the
             // PORTSC checks below). next_event advances ERDP, which clears EHB.
+            // BOUNDED. The drain exits when the ring runs dry, which is the common case - but a
+            // device posting events as fast as we retire them never lets it run dry, and then this
+            // loop never returns. The keyboard stops being polled, block requests stop being served,
+            // and the service is alive but useless.
+            //
+            // Third occurrence of this class in this repo (arm A6-1 `net_rx_isr`, the aarch64 timer
+            // tick, now here). Every device loop is bounded (§26.6); "it stops when the hardware
+            // stops" is not a bound, because the hardware is the thing that might not stop.
+            //
+            // 4096 is far above any real burst - a full event ring is 256 TRBs - so reaching it means
+            // a storm, not a busy moment. The next pass drains the rest; nothing is lost.
+            let mut drained = 0u32;
             loop {
+                drained += 1;
+                if drained > 4096 {
+                    ctx.log("xhci: event drain hit its bound - the controller is posting faster than we retire (storm?)");
+                    break;
+                }
                 match next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle, 1) {
                     Some((TRB_TRANSFER_EVENT, _, slot_id)) => {
                         if let Some(d) = devs[..ndev].iter().position(|h| h.slot == slot_id) {
