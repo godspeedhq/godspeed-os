@@ -3170,7 +3170,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             // `Some(false)` needs, because a failed transfer is weaker evidence.
                             let gone_now = match st {
                                 Some(false) => { disk_absent_seen = disk_absent_seen.saturating_add(1); disk_absent_seen >= 2 }
-                                None => { disk_absent_seen = disk_absent_seen.saturating_add(1); disk_absent_seen >= 3 }
+                                // TWENTY consecutive failures, not three.
+                                //
+                                // Three was far too weak. This probe is a control transfer sharing
+                                // rings with HID polling and block I/O, so it fails transiently
+                                // whenever the controller is busy - and a busy moment then read as a
+                                // removal. The Pi 4 logged 72 connect/disconnect pairs for a stick
+                                // that never moved, each false drop forcing a re-enumeration that
+                                // rebinds the keyboard. The reported symptom was an unpredictable
+                                // keyboard; the cause was a disk that was never gone.
+                                //
+                                // At the hub poll interval this is ~10 s of UNBROKEN failure. A real
+                                // unplug stays failed forever and still gets noticed; contention
+                                // does not last ten seconds. I called a failed probe "weaker
+                                // evidence" when I added it and then set the bar as though it were
+                                // not - the threshold now matches the reasoning.
+                                None => { disk_absent_seen = disk_absent_seen.saturating_add(1); disk_absent_seen >= 20 }
                                 Some(true) => { disk_absent_seen = 0; false }
                             };
                             if gone_now {
