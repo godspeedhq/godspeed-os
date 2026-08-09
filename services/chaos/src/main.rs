@@ -420,9 +420,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Wall-clock status line: when it began, how long it has run, and a linear ETA (no outside truth -
         // a pure extrapolation of elapsed over round progress). until-q has no total, so remains is n/a.
         let elapsed = (ctx.epoch_secs_monotonic() - start_mono).max(0) as u64;
-        let _ = write!(f, "  started {} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  |  elapsed ",
-            WEEKDAYS[(start_dt.weekday() as usize) % 7], start_dt.year, start_dt.month, start_dt.day,
-            start_dt.hour, start_dt.minute, start_dt.second);
+        // Say "clock not set" rather than render a zero date as if it were a time.
+        //
+        // This board has no RTC, so before SNTP lands the wall clock is epoch 0 and this printed
+        // "Thu 1970-01-01 00:00:00" - a fiction with the shape of a fact. `elapsed` is unaffected: it
+        // comes from the MONOTONIC counter, which is real from boot, so the run's own timing stays
+        // honest either way. Report what is known, and say so when something is not (§26.7).
+        if start_dt.year >= 2000 {
+            let _ = write!(f, "  started {} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  |  elapsed ",
+                WEEKDAYS[(start_dt.weekday() as usize) % 7], start_dt.year, start_dt.month,
+                start_dt.day, start_dt.hour, start_dt.minute, start_dt.second);
+        } else {
+            let _ = write!(f, "  started (clock not set - `date sync`)  |  elapsed ");
+        }
         write_dur(&mut f, elapsed);
         if rounds > 0 && round > 0 {
             let _ = write!(f, "  |  remains ~");
