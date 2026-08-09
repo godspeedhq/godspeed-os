@@ -701,6 +701,27 @@ pub fn serve_block(
 
     match req[0] {
         OP_CAPACITY => {
+            // Ask the DEVICE whether it is still there before quoting its size.
+            //
+            // `d.sectors` is READ CAPACITY as it read at BIND time. Serving it unconditionally made
+            // this the last stale copy in the chain: with the stick pulled, the log showed
+            // block-driver correctly reporting "no USB disk attached" on every read while, in the
+            // same second, fs reported "capacity 31266816 sectors" - because the capacity path never
+            // consulted the device at all. `drives` then printed a row reading "raw ... not
+            // formatted", which describes a blank disk that is PRESENT rather than one that is gone.
+            //
+            // The same Commandment III error was fixed in `block-driver` (it held its own boot-time
+            // snapshot) and this was simply one layer further down, still holding one. A derived view
+            // is allowed only while something reconciles it; nothing reconciled this.
+            //
+            // TEST UNIT READY is the cheapest question that has a truthful answer, and this is not a
+            // hot path - a capacity is asked at mount and by `drives`. A device that does not answer
+            // it is reported as an error, and the caller in `main.rs` drops the disk and re-scans,
+            // exactly as a failed read already does.
+            if !test_unit_ready(ctx, dma, mmio, dboff, ir0, d, ev_idx, ev_cycle, eaten) {
+                out[0] = STATUS_ERR;
+                return 1;
+            }
             out[0] = STATUS_OK;
             out[1..9].copy_from_slice(&d.sectors.to_le_bytes());
             9
