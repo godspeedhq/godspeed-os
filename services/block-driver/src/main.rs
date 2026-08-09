@@ -79,8 +79,23 @@ fn backend_run(ctx: &ServiceContext) -> ! {
     // in-kernel stack by syscall, or the `xhci` service by IPC. No probe, no fallback.
     #[cfg(not(feature = "usb-via-xhci"))]
     let sectors = ctx.usb_disk_sectors();
+    // ONE quick question at startup, not a 20 s wait for an answer we no longer use.
+    //
+    // This called `sectors()`, which blocks up to 20 s for a capacity. That made every boot with no
+    // stick in it stall for 20 s before the first `drives` could answer - the reported "substantial
+    // delay on startup, subsequent ones are quick".
+    //
+    // The wait existed to capture a boot-time sector count. Since `serve()` re-derives capacity on
+    // every request, that number no longer answers anything: it is used for the startup log line and
+    // then shadowed. So the wait buys nothing and costs 20 s on exactly the machine that has the
+    // least to wait for.
+    //
+    // A stick present but still enumerating now reports 0 here and mounts slightly later, on the
+    // first request, through the same self-heal that already recovers a stick plugged in after boot -
+    // hardware-proven across several plug/unplug cycles. Trading a guaranteed 20 s stall for a
+    // recovery path that is exercised constantly is the right way round.
     #[cfg(feature = "usb-via-xhci")]
-    let sectors = xhciblk::sectors(&ctx);
+    let sectors = xhciblk::sectors_now(&ctx);
     if sectors == 0 {
         ctx.log("block-driver: no USB storage stick - NO disk (the SD card is the boot medium and is never written)");
     }
