@@ -1185,6 +1185,7 @@ fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     // FCAP-RESTART INSTRUMENTATION (temporary - remove when the post-restart escalation is closed).
     // The IDENTITY the kernel validated, which is the thing in question: a "read-only" cap that wrote
     // means this line reports rights containing WRITE for the slot the shell believed was read-only.
+    #[cfg(feature = "fcap-diag")]
     crate::log::write_fmt(format_args!(
         "[fcapr] kernel: slot={} declared={:#x} -> resource={} cap_rights={:#x} gen={}
 ",

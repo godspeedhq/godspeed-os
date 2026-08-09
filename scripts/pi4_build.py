@@ -31,7 +31,7 @@ service is the only driver and there is nothing to switch. It used to have to re
 crates: the kernel (stop driving the VL805) and the `supervisor` (start spawning
 the `xhci` service that drives it instead). See where it is handled below.
 
-usage:  python scripts/pi4_build.py [--debug] [--features a,b]
+usage:  python scripts/pi4_build.py [--debug] [--features a,b] [--fcap-diag]
 """
 import subprocess, sys, os, pathlib, re
 
@@ -110,6 +110,14 @@ if "--features" in sys.argv:
 #
 # arm32 (Pi 2) is unaffected: no PCIe and no device-IRQ routing to userspace, so its USB stack is
 # still in the kernel - see arch/arm/CLAUDE.md.
+# --fcap-diag: the `[fcapr]` capability-identity diagnostic on the file-cap path. OFF by default.
+#
+# One flag reaching THREE crates (kernel, shell, fs) for the same reason the old xhci switch did: set
+# it in one crate and you get half the picture with no hint that the other half is missing. The whole
+# value of these lines is COMPARING them across the layers.
+FCAP_DIAG = "--fcap-diag" in sys.argv
+if FCAP_DIAG:
+    FEATURES += ",fcap-diag"
 EL0_FAULT_TEST = "--el0-fault-test" in sys.argv
 
 rel = ["--release"] if PROFILE == "release" else []
@@ -117,6 +125,8 @@ rel = ["--release"] if PROFILE == "release" else []
 # 1. The services first - the kernel embeds their ELFs, so a stale service is baked into the image.
 for svc in PI4_SERVICES:
     feats = ["--features", "bare-metal"] if svc == "supervisor" else []
+    if svc in ("shell", "fs") and FCAP_DIAG:
+        feats = ["--features", "fcap-diag"]
     if svc == "supervisor":
         feats = ["--features", "bare-metal"]
     # The THIRD crate the one switch has to reach. block-driver must be told to fetch its sectors

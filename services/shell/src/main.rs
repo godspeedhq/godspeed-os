@@ -8449,6 +8449,7 @@ fn fc_open(ctx: &ServiceContext, path: &[u8], rights: u8) -> Option<CapHandle> {
         // rights here against the `[fcapr] kernel:` line for the same handle: if they disagree, the
         // handle names a different cap than the one fs minted, which is the identity-confusion
         // suspect rather than a rights-check bug.
+        #[cfg(feature = "fcap-diag")]
         if let Some(hh) = h {
             ctx.log_fmt(format_args!("[fcapr] shell: opened asked={:#x} handle={} holds={:?}",
                                      rights, hh.0, ctx.query_cap_rights(hh)));
@@ -8463,6 +8464,7 @@ fn fc_open(ctx: &ServiceContext, path: &[u8], rights: u8) -> Option<CapHandle> {
 fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
     // FCAP-RESTART INSTRUMENTATION (temporary). The handle + right at the moment of use, so a handle
     // that changed meaning between open and invoke is visible.
+    #[cfg(feature = "fcap-diag")]
     ctx.log_fmt(format_args!("[fcapr] shell: invoke handle={} declaring={:#x} holds={:?}",
                              file.0, right, ctx.query_cap_rights(file)));
     while ctx.try_recv().is_some() {}   // clear any stale late-reply a prior aborted invoke left behind
