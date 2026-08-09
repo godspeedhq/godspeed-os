@@ -549,6 +549,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // file cap - so its presence means "this is a trusted file-cap invocation", impossible to
         // forge over the ordinary fs send-cap. No badge → a name-addressed request.
         let badge = ctx.last_recv_badge();
+        // FCAP INSTRUMENTATION (temporary). The third and last measurement point: what fs RECEIVES.
+        // Printed only when a badge is present, so ordinary name-addressed traffic stays silent.
+        if let Some((rid, right)) = badge {
+            ctx.log_fmt(format_args!("[fcap] fs: badge rid={} right={:#x}", rid, right));
+        }
         let reply = match ctx.take_pending_cap() {
             Some(c) => c,
             None => continue,
