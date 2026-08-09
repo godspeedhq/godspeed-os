@@ -275,6 +275,13 @@ const HUB_POLL_MS: u64 = 500;
 /// Only runs while NO HID is bound.
 const HUB_RESCAN_MS: u64 = 1_500;
 
+/// How long a hub gets to answer a port-status probe - a REAL DURATION (see `hub_port_status`).
+///
+/// A hub answers GET_STATUS in about a millisecond. This is the bound for one that does not, and it
+/// is deliberately small: the probe runs per port per pass, so this is a direct input-latency cost
+/// whenever a hub is unresponsive.
+const PROBE_ANSWER_MS: u64 = 5;
+
 /// Idle-wait pacing for the paths that have NO device to service (`idle`, `wait_for_port`, the hub
 /// re-walk). These used `yield_cpu`, which does not sleep - it pegs the core at ~100% forever, which
 /// is exactly what showed up as ~85k scheduler quanta/s on the T630 (its keyboard is on ehci, so
@@ -616,7 +623,31 @@ fn hub_port_status(
         // 64k iterations is ample for a hub that is going to answer - it answers in the first few -
         // and cheap for one that is not. The removal is still detected; it just costs a fraction of
         // the time to conclude.
-        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 65_536) {
+        // Wait on the CLOCK, not on an iteration count.
+        //
+        // This read `next_event(.., 65_536)`, and the comment above defended it: "64k iterations is
+        // ample for a hub that is going to answer." That is the count-is-not-a-duration error, for
+        // the seventh time on this port. 64k reads of DMA memory take however long 64k reads happen
+        // to take - and that shrinks exactly when the keyboard's interrupt traffic is competing for
+        // the same event ring. So the probe gave up BEFORE a transfer that was still in flight.
+        //
+        // The evidence is decisive: the boot with the stick already attached logged ZERO probe
+        // failures, and the loaded run logged 1530. Same code, same board, different amount of
+        // competing traffic. It also explains why `chaos max-carnage` fixed it - a re-init quiets
+        // the ring long enough for 64k spins to once again outlast a 1 ms transfer.
+        //
+        // 5 ms is generous for a hub that answers in about one, and it is the same 5 ms on a fast
+        // board and a slow one. It stays SHORT deliberately: this runs per port per pass, and a long
+        // wait on a hub that will never answer is what made typing lag while the stick was out.
+        let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(PROBE_ANSWER_MS));
+        let mut ev;
+        loop {
+            ev = next_event(dma, mmio, ir0, ev_idx, ev_cycle, 4_096);
+            if ev.is_some() || ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+                break;
+            }
+        }
+        match ev {
             Some((TRB_TRANSFER_EVENT, cc, sid)) if sid == hub_slot => {
                 return if cc == 1 || cc == 13 {
                     Some(dma.read16(DATA_BUF_OFF) & 1 != 0) // wPortStatus bit0 = current connect
@@ -2261,15 +2292,36 @@ fn enumerate_one(
     // the routing for everything behind it. The disk had already reported its geometry by then, so
     // the failure surfaced one line later as a sector read that "failed", pointing at the disk
     // rather than at the hub that had just been pulled out from under it.
+    // THE HUB IS KEPT, always - even with nothing behind it.
+    //
+    // It used to be released whenever nothing was bound, to return its slice to the pool. On this
+    // board that is always wrong: every USB socket is behind this hub, so releasing it disables the
+    // one control endpoint through which an arrival could ever be noticed. Boot with no stick, and
+    // the hub goes; plug something in afterwards and nothing sees it - no INFO, `drives` stale, a
+    // keyboard that never rebinds. That is the entire session's report, from this one branch.
+    //
+    // The in-kernel driver reached the same conclusion and says so at the equivalent point: "Keep the
+    // hub. Everything on this board is behind it, so a keyboard unplugged once would stay dead until
+    // reboot without something still holding its control endpoint." I released it anyway.
+    //
+    // It also explains why `chaos max-carnage` FIXED everything: carnage restarts services, forcing a
+    // fresh enumeration that re-acquires the hub. The steady state was stuck; a re-init cleared it.
+    //
+    // The slice cost is one, bounded and constant - a hub is infrastructure, not a device that comes
+    // and goes, and the pool exists to bound growth rather than to reclaim the machine's own wiring.
     if *ndev == ndev_before && disk.is_some() == disk_before {
-        // Nothing usable behind this hub - it need not stay configured. Free its slice + slot so a
-        // later hub/device can use them (bounded slice pool).
         ctx.log_fmt(format_args!(
-            "xhci: hub on port {} had nothing usable behind it - releasing",
+            "xhci: hub on port {} has nothing behind it yet - KEEPING it so an arrival can be seen",
             port
         ));
-        sa.free(dev_idx);
-        disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
+        // Seed its poll cursor exactly as the bound case below does: the probes that watch for an
+        // arrival run on this hub's EP0 ring and must resume where enumeration left the controller's
+        // dequeue, not where it started.
+        for d in 0..*ndev {
+            if devs[d].hub_slot == slot {
+                devs[d].hub_off = hoff;
+            }
+        }
     } else {
         // A device was bound behind this hub; the hub's slice is KEPT. Seed each such device's poll
         // cursor to just past all the enumeration TRBs we wrote on the hub's EP0 ring (`hoff`), so the
