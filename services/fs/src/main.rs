@@ -329,7 +329,14 @@ const E_IO: &str = "storage unreadable (I/O error)";
 /// COMRESET) well within this, so it only ever fires as a safety floor against a genuinely dead
 /// device - after which fs comes up DEGRADED (serving storage-unavailable), never wedged. Bounded
 /// (§26.6); each attempt is a real block-driver IPC round-trip, so this is a meaningful interval.
+/// A9-6: kept as a BACKSTOP only - the real bound is the clock (`MOUNT_MAX_MS`).
+///
+/// On its own this was the count-is-not-a-duration bug both sibling files in this stack already had
+/// converted: each failed attempt returns almost instantly when the device is absent, so 1000 of them
+/// measured how fast the loop spins, not how long the disk got.
 const MOUNT_MAX_ATTEMPTS: u32 = 1000;
+/// How long mount waits for a device to answer - a REAL duration, the same on any board.
+const MOUNT_MAX_MS: u64 = 20_000;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
@@ -348,13 +355,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // mount below fails cleanly and we serve storage-unavailable) instead of spinning forever.
     let mut capacity = {
         let mut got = 0u64;
+        // Bounded by the CLOCK, with the attempt count kept only as a runaway backstop (A9-6). Each
+        // failed attempt returns almost instantly when the device is absent, so the count alone
+        // measured loop speed, not how long the disk was given - it meant a different wait on every
+        // board. 20 s is a real duration and covers a stick enumerating behind a hub.
+        let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(MOUNT_MAX_MS));
         for attempt in 1..=MOUNT_MAX_ATTEMPTS {
             match block_capacity(&ctx) {
                 Some(cap) => { got = cap; break; }
                 None => {
                     let _ = ctx.reacquire_by_name("block-driver");
-                    if attempt == MOUNT_MAX_ATTEMPTS {
-                        ctx.log("fs: block-driver did not report capacity after bounded attempts - coming up storage-unavailable (data intact; do NOT run 'drives flash')");
+                    let out_of_time = ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63);
+                    if out_of_time || attempt == MOUNT_MAX_ATTEMPTS {
+                        ctx.log("fs: block-driver did not report capacity within 20s - coming up storage-unavailable (data intact; do NOT run 'drives flash')");
+                        break;
                     }
                     ctx.yield_cpu();
                 }
@@ -500,6 +514,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         if let Some(f) = fs.as_ref() {
             if f.io_error_seen.get() {
                 ctx.log("fs: device I/O error seen - re-mounting before serving (a revival may have discarded buffered writes; cached geometry is not trusted across it)");
+                // A9-3: the caps this state handed out do not survive the state. Revoke before
+                // replacing it, so holders get CapRevoked (recoverable) rather than FS_NOTFOUND.
+                if let Some(old) = fs.as_mut() { old.revoke_all_open(&ctx); }
                 match Fs::mount(&ctx) {
                     Ok(nf) => { fs = Some(nf); }
                     Err(e) => {
@@ -2647,7 +2664,24 @@ impl Fs {
             // Carries the correlation tag like every other reply - this one is built here rather than
             // in `serve`'s buffer because it must embed the file CAPABILITY, and authority does not fit
             // in a byte buffer. Same wire shape, different construction site.
-            Some(c) => ctx.send_with_cap_by_handle(reply, c, &Message::from_bytes(&[tag, FS_OK])).is_ok(),
+            Some(c) => {
+                // A9-7: reclaim the DERIVED cap when the send fails.
+                //
+                // The kernel removes an embedded cap only on a CONFIRMED transfer (§8.5), so a failed
+                // send leaves `c` in our table. It was never removed on that path, so every failed
+                // grant leaked a slot until the table filled and `fs` could hand out no more files.
+                // Note the mirror hazard, which is why this removes ONLY on failure: on success the
+                // cap is already gone, and removing it again is the stale-index bug that deleted a
+                // file cap out of a reused slot (1ecfd98e).
+                match ctx.send_with_cap_by_handle(reply, c, &Message::from_bytes(&[tag, FS_OK])) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        ctx.remove_cap(c);
+                        ctx.log_fmt(format_args!("fs: file-cap grant send failed ({:?}) - slot reclaimed", e));
+                        false
+                    }
+                }
+            }
             None    => false,
         };
         ctx.remove_cap(cap);
@@ -2667,6 +2701,26 @@ impl Fs {
     }
 
     /// Free the open-file slot for `rid` (after a close/revoke). Idempotent.
+    /// A9-3: revoke EVERY outstanding file cap this instance minted, before its state is replaced.
+    ///
+    /// A remount builds a fresh `Fs`, and the new one has an empty `open_files` table. Without this,
+    /// caps handed out by the previous state stayed VALID at the kernel - the resource was never
+    /// revoked - so a holder's next use resolved to nothing and got `FS_NOTFOUND` instead of the
+    /// truthful `CapRevoked`, while the kernel-side resource leaked forever.
+    ///
+    /// §14.3 states the obligation this discharges: everything derived from the previous incarnation
+    /// must be re-established, not silently abandoned. Revoking is how the holder LEARNS (§7.5) -
+    /// a stale cap that fails loudly is recoverable, one that fails as "no such file" is a lie.
+    fn revoke_all_open(&mut self, ctx: &ServiceContext) {
+        for i in 0..self.open_files.len() {
+            let rid = self.open_files[i].rid;
+            if rid != 0 {
+                let _ = ctx.resource_revoke(rid);
+                self.open_files[i].rid = 0;
+            }
+        }
+    }
+
     fn open_free(&mut self, rid: u64) {
         if rid == 0 { return; }
         for o in self.open_files.iter_mut() {

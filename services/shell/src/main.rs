@@ -8077,7 +8077,14 @@ fn fs_raw(ctx: &ServiceContext, body: &[u8], max_secs: i64) -> Option<Message> {
     req[1..1 + n].copy_from_slice(&body[..n]);
     let msg = Message::from_bytes(&req[..1 + n]);
     drain_stale_fs_replies(ctx);
-    let first = ctx.request_with_reply("fs", &msg).map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
+    // A9-4: same abortable, reacquiring call `fs_request` uses.
+    //
+    // This was the plain `request_with_reply`, the one fs helper that was neither q-abortable nor
+    // reacquiring - so `drives`, `drives flash`, `reset` and `label` hung on a slow `fs` with no way
+    // out, and never recovered from an `fs` restart because nothing re-looked-up the name (§14.3).
+    // Every one of those is a command the operator runs precisely when storage is misbehaving, which
+    // is exactly when `fs` is most likely to be slow or restarting.
+    let first = ctx.request_with_reply_abortable("fs", &msg, max_secs);
     match fs_take_tagged(ctx, tag, first, max_secs) {
         ReqOutcome::Reply(r) => Some(r),
         _ => None,

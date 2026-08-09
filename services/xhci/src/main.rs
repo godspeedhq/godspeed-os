@@ -1617,7 +1617,19 @@ fn bind_msc(
     // budget - the loop cannot outlive the device's own answer.
     let mut eaten = 0u32;
     let mut ready = false;
+    // A9-5: bounded by the CLOCK as well as the count.
+    //
+    // The comment above argued the count was safe because "each attempt carries its own generous
+    // transfer budget". That is exactly what makes it unsafe: the budget is 30 s, so 16 attempts is
+    // up to EIGHT MINUTES of a driver that answers nothing - and this driver owns the keyboard. A
+    // per-attempt bound multiplied by a retry count is a total, and the total is what the user waits.
+    // 20 s covers a stick that is genuinely still spinning up; past that it is not coming.
+    let spinup_deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(20_000));
     for _ in 0..16 {
+        if ctx.read_tsc().wrapping_sub(spinup_deadline) < (1u64 << 63) {
+            ctx.log("xhci: mass storage still not ready after 20s - giving up on this bind");
+            break;
+        }
         if msc::test_unit_ready(
             ctx,
         dma, mmio, dboff, ir0, &mut disk, ev_idx, ev_cycle, &mut eaten,
