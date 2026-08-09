@@ -554,6 +554,7 @@ fn control(
 /// dropped keystroke, not a misread status).
 #[allow(clippy::too_many_arguments)]
 fn hub_port_status(
+    ctx: &ServiceContext,
     dma: &Dma,
     mmio: &Mmio,
     dboff: usize,
@@ -632,7 +633,19 @@ fn hub_port_status(
                 }
             }
             Some(_) => {} // a non-transfer event (port change, command) - ignore; keep waiting
-            None => return None,
+            None => {
+                // No event at all. If this is where the probes die after enumeration, the cursor and
+                // cycle printed here say why: a ring cursor left where the controller is not looking
+                // means every transfer is posted somewhere nothing will consume it.
+                //
+                // Gated on the FAULT - a working probe prints nothing. That is the property the
+                // earlier diagnostics lacked: they were gated on conditions that are TRUE when
+                // things are healthy, and became permanent spam.
+                ctx.log_fmt(format_args!(
+                    "xhci: [probe] hub {} port {} NO EVENT cur={:#x} pcs={} ev_idx={} ev_cycle={}",
+                    hub_slot, hub_port, *cur, *pcs, *ev_idx, *ev_cycle));
+                return None;
+            }
         }
     }
     None
@@ -3105,6 +3118,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     let owner = cursor_owner[d];
                     let (mut cur, mut pcs) = (hub_cur[owner], hub_pcs[owner]);
                     let st = hub_port_status(
+                        &ctx,
                         &dma,
                         &mmio,
                         dboff,
@@ -3195,6 +3209,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             // wrong" has to be a condition that is actually FALSE when they are not.
                             let (mut c2, mut p2) = (hub_cur[owner], hub_pcs[owner]);
                             let st = hub_port_status(
+                                &ctx,
                                 &dma, &mmio, dboff, ir0, hub_slot, hub_dev, hp,
                                 &mut c2, &mut p2, &mut ev_idx, &mut ev_cycle, &mut eaten,
                             );
@@ -3282,6 +3297,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         }
                         let (mut cur, mut pcs) = (hub_cur[owner], hub_pcs[owner]);
                         let st = hub_port_status(
+                            &ctx,
                             &dma,
                             &mmio,
                             dboff,
@@ -3340,6 +3356,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             continue;
                         }
                         let st = hub_port_status(
+                            &ctx,
                             &dma, &mmio, dboff, ir0, hs, hd, hp,
                             &mut cur, &mut pcs, &mut ev_idx, &mut ev_cycle, &mut eaten,
                         );
