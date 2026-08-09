@@ -2941,8 +2941,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // latency bound. Four keeps a read's worth of work moving while capping the gap between
             // keyboard polls at a few commands rather than dozens. Throughput costs a pass; latency
             // is what a human notices.
+            // ONE block request per pass.
+            //
+            // Not another tuning step - this is the split's GUARANTEE reached by serialisation
+            // instead of preemption. The input drain runs immediately after this block, so a budget
+            // of one means the gap between keystroke polls is bounded by a SINGLE BOT command rather
+            // than by however many `fs` had queued. The kernel driver got that bound from the timer
+            // interrupt; here it comes from refusing to batch.
+            //
+            // Throughput cost is real and accepted: a multi-sector read now takes one pass per
+            // sector. Latency is what a human notices, throughput is what a progress bar notices, and
+            // only one of those has been complaining.
+            //
+            // This is the INTERIM of docs/xhci-split.md, not its conclusion. The full fix delivers
+            // reports from inside the disk wait, where they are currently seen and discarded - that
+            // removes the coupling rather than bounding it, and needs the poll-loop state gathered
+            // into one struct first.
             let mut served = 0u32;
-            while served < 4 {
+            while served < 1 {
                 let Some(m) = ctx.try_recv() else { break };
                 served += 1;
                 disk_alive &= serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten);
