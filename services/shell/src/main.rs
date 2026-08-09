@@ -10434,7 +10434,7 @@ fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
     // cannot be reached (which is exactly what happened on the Pi 4).
     if u64_le(&p[2..10]) == 0 {
         ctx.console_writeln("  #  LABEL        STATUS   SIZE");
-        ctx.console_writeln("  (no drive attached)");
+        ctx.console_writeln("  (no drive(s) attached)");
         return Ok(());
     }
     let mib = u64_le(&p[2..10]) / 2048;
