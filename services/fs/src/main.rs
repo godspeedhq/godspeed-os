@@ -935,6 +935,38 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
     // drives API - INFO/FLASH work on a raw disk; LABEL/RESET as below.
     match p[0] & 0x7F {
         OP_DRIVES_INFO => {
+            // RE-DERIVE the capacity before answering, and drop the mount if the device has gone.
+            //
+            // `capacity` is what block-driver reported at MOUNT time, and it was served unchanged
+            // forever - so `drives` cheerfully reported 15267 MiB for a stick that had been unplugged
+            // minutes earlier. The number was true when it was learned and had not been true since.
+            //
+            // §14.3 is explicit that reacquiring an endpoint is necessary but NOT sufficient: every
+            // derived thing must be re-established, and §26.4 adds that a cached view is legitimate
+            // only while it reconciles with its source. A mounted volume is derived from a device
+            // that is now absent, so it is not a view that needs refreshing - it is a claim that has
+            // become false.
+            //
+            // Asked here rather than continuously: `drives` is the question "what storage is there",
+            // so it is the right moment to find out rather than to recite.
+            // `Some(0)` and `None` are NOT the same fact, and only one of them justifies unmounting.
+            //
+            // `Some(0)` is block-driver ANSWERING that there is no medium - authoritative, act on it.
+            // `None` is no answer at all: block-driver restarting, an IPC that did not land, a cap
+            // gone stale. Treating that as "no disk" would unmount a healthy filesystem over a
+            // transient, which is the same single-noisy-read mistake that made the disk flap 72 times
+            // earlier today. On no answer we keep what we had and report it unchanged.
+            let capacity = match block_capacity(ctx) {
+                Some(0) => {
+                    if vol.is_some() {
+                        ctx.log("fs: the device reports no capacity - dropping the mount (disk removed)");
+                    }
+                    *vol = None;
+                    0
+                }
+                Some(n) => n,
+                None => capacity, // unknown - say what we last knew rather than invent an absence
+            };
             // [FS_OK, mounted, capacity:u64, used:u64, flags:u8, label_len:u8, label…]
             // Report what this answer is made of. `drives` reporting "no disk" while the boot log shows a
             // mounted 15 GB volume is a contradiction between two of our own statements, and neither side
