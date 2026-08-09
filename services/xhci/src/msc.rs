@@ -718,7 +718,29 @@ pub fn serve_block(
             // hot path - a capacity is asked at mount and by `drives`. A device that does not answer
             // it is reported as an error, and the caller in `main.rs` drops the disk and re-scans,
             // exactly as a failed read already does.
-            if !test_unit_ready(ctx, dma, mmio, dboff, ir0, d, ev_idx, ev_cycle, eaten) {
+            // A SINGLE "not ready" is not an answer - it must fail every attempt.
+            //
+            // The first version of this asked once and reported absence on one no. That took a
+            // healthy plugged-in stick and reported "(no drive(s) attached)" until fs and
+            // block-driver were restarted, which is worse than the stale size it replaced: a wrong
+            // absence hides a disk that is RIGHT THERE, and the drop-and-re-scan then kept it hidden.
+            //
+            // The bind path 30 lines away already knew this and says so: a stick is "often still
+            // spinning up its controller and answers NOT READY until it is", so it allows 16
+            // attempts. I asked once anyway.
+            //
+            // 4 here, not 16: bind is a cold start, this is a device that has already been answering.
+            // Each attempt against a PRESENT device returns immediately, so the retries cost nothing
+            // in the common case, and only a device that fails all four is called gone.
+            let mut ready = false;
+            for _ in 0..4 {
+                if test_unit_ready(ctx, dma, mmio, dboff, ir0, d, ev_idx, ev_cycle, eaten) {
+                    ready = true;
+                    break;
+                }
+            }
+            if !ready {
+                ctx.log("xhci: the disk failed 4 ready checks - reporting no capacity (unplugged?)");
                 out[0] = STATUS_ERR;
                 return 1;
             }
