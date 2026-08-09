@@ -1432,7 +1432,22 @@ fn serve_if_block(
         ctx,
         dma, mmio, dboff, ir0, disk, msg.payload_bytes(), &mut out, ev_idx, ev_cycle, eaten,
     );
-    let _ = ctx.send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n]));
+    // A9-1: TRY_send the reply, and do NOT discard the verdict.
+    //
+    // This was a blocking `send` into a queue the caller cannot drain: `block-driver` is parked in
+    // `request_with_reply` waiting for exactly this reply, so if its 16-deep queue is full, it waits
+    // for us and we wait for it. §8.9 is explicit - where two services send to each other, at least
+    // one direction MUST be non-blocking - and neither was. It is reachable: `chaos` floods every
+    // service, and the one that wedges here owns the KEYBOARD.
+    //
+    // A dropped reply is recoverable and a deadlock is not: the caller's own deadline fires, it
+    // reacquires and retries (§14.3). So a full queue costs one retry instead of the machine.
+    if let Err(e) = ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n])) {
+        // Reported, never swallowed (§26.7). The caller will time out and retry; this line is how an
+        // operator knows WHY a block request went unanswered rather than inferring it.
+        ctx.log_fmt(format_args!(
+            "xhci: block reply not delivered ({:?}) - caller's queue full or gone; it will retry", e));
+    }
     ctx.remove_cap(reply);
     // A data operation that FAILED means the device stopped answering - which on this board is
     // usually that it was unplugged. Report it so the caller can re-enumerate rather than answer
@@ -3357,7 +3372,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // throttled hub-poll tick, GET_STATUS the hub's UNBOUND downstream ports; a connected one is a
             // fresh plug, so break to re-enumerate and bind it alongside the survivor(s). Same shared
             // per-hub EP0 cursor as the disconnect check; any report it consumes is re-armed just below.
-            if hub_due && ndev < MAX_HID {
+            // A9-2: this scan must run to WATCH, not only to BIND.
+            //
+            // It was gated on `ndev < MAX_HID` because a full HID table cannot bind an arrival. But
+            // the same loop carries the disk-removal watch AND the only increment of `PROBE_FAILS`,
+            // which is what triggers the halted-endpoint repair. With `MAX_HID = 2`, a keyboard plus
+            // a mouse satisfies neither this nor the `ndev == 0` fallback below, so BOTH went dead:
+            // an unplugged stick was never noticed and a wedged endpoint was never repaired. Hardware
+            // testing used a keyboard alone (`ndev == 1`), which is exactly why it looked healthy.
+            //
+            // Fifth instance today of a mechanism guarded by a condition that cannot be true in the
+            // failing case. The rule this keeps teaching: a guard belongs on the ACTION it protects,
+            // not on the observation that feeds it. So the scan runs whenever there is something to
+            // watch, and the bind-an-arrival arm carries the `ndev < MAX_HID` check itself.
+            if hub_due && (ndev < MAX_HID || disk.is_some()) {
                 let mut scanned_hubs = 0u32; // hub slots already scanned this tick (scan each hub once)
                 for d in 0..ndev {
                     let hub_slot = devs[d].hub_slot;
@@ -3609,7 +3637,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // the retry mask, a port holding something we cannot bind re-enumerates the
                         // whole controller on every pass.
                         match st {
-                            Some(true) if hp < 64 && hub_tried & (1u64 << hp) == 0 => {
+                            // The bind guard lives HERE now (see the scan gate above): only a free
+                            // HID slice makes an arrival actionable. A full table still watches.
+                            Some(true) if hp < 64 && ndev < MAX_HID && hub_tried & (1u64 << hp) == 0 => {
                                 hub_tried |= 1u64 << hp;
                                 ctx.log_fmt(format_args!(
                                     "xhci: new device on hub slot {} port {} - re-enumerating",
