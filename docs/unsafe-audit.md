@@ -262,6 +262,12 @@ freshly-spawned supervisor whose 69 pages were all mapped correctly. Boot spawns
 work (and its incidental barriers) separates building a space from entering it; a respawn does both back
 to back, which is why the respawn is the one that dies and why it is intermittent.
 
+## 2026-08-09 - Pi 4: a panic must halt every core (kernel audit A10-1)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 67 -> 68 (+1) | `park_core_forever`: `msr daifset, #0xf` then a `wfi` loop. `halt_all_cores` was `loop { spin_loop() }`, which masked nothing and stopped nobody - the panicking core kept taking the timer IRQ and was scheduled away, and the other cores never learned. Masking DAIF and halting at EL1 is always valid, and the function never returns, so no state is left inconsistent by the mask. Touches no memory. |
+
 | File | Change | Why |
 |------|--------|-----|
 | `arch/aarch64/mod.rs` | 66 -> 67 (+1) | `dsb ishst` in `finalize_service_address_space`, publishing a new address space's descriptors inner-shareable before it can be installed or walked. A barrier; touches no memory. |
@@ -2299,7 +2305,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 67 | permitted |
+| arch/aarch64/mod.rs | 68 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/sched_spawn.rs | 2 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |

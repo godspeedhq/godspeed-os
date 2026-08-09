@@ -1380,7 +1380,36 @@ pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("aarch64::switch_t
 pub const ELF_MACHINE: u16 = 183;
 pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
 
-pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
+/// A10-1: a panic must stop the MACHINE, not just the panicking core.
+///
+/// This was `loop { spin_loop() }`, which halted nothing. It did not mask the panicking core's own
+/// interrupts, so the timer ISR fired and the scheduler switched away - the "halted" core carried on
+/// running tasks - and the other cores never learned a panic had happened. A kernel that keeps
+/// scheduling after a panic is the silent-corruption case §19 and §6.2 exist to forbid, and it is the
+/// same defect SEC-18 fixed on x86.
+///
+/// Two halves, because either alone is insufficient:
+///   - THIS core masks D/A/I/F immediately, so nothing can preempt it out of the halt.
+///   - `PANIC_HALT` is published for every other core; the timer tick checks it and parks the core.
+///
+/// A flag rather than an SGI broadcast is deliberate: the panic path must not depend on the GIC still
+/// being sane. The cost is that another core halts at its next tick rather than instantly.
+pub static PANIC_HALT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Park THIS core forever with interrupts masked.
+pub fn park_core_forever() -> ! {
+    // SAFETY: masking DAIF and halting is always valid at EL1, and this never returns, so no state is
+    // left inconsistent by the mask.
+    unsafe {
+        core::arch::asm!("msr daifset, #0xf", options(nomem, nostack));
+        loop { core::arch::asm!("wfi", options(nomem, nostack)); }
+    }
+}
+
+pub fn halt_all_cores() -> ! {
+    PANIC_HALT.store(true, core::sync::atomic::Ordering::Release);
+    park_core_forever()
+}
 /// Reset the SoC through the BCM2711 watchdog, exactly as the 32-bit port does.
 ///
 /// This was a `loop { spin_loop() }` stub, which is why `reboot` printed "rebooting..." and then did
@@ -1731,6 +1760,9 @@ pub fn uart_rx_pop() -> Option<u8> { uart_rx::pop() }
 /// Called from the core-0 timer tick, every 10 ms.
 #[cfg(feature = "pi4")]
 pub fn uart_rx_poll() {
+    // A10-1: a core that learns of a panic stops here and never returns to scheduling. Checked on the
+    // tick because that is the one place every core passes through regularly.
+    if PANIC_HALT.load(core::sync::atomic::Ordering::Acquire) { park_core_forever(); }
     uart_rx::drain();
     // The USB keyboard shares this tick. It is polled rather than interrupt-driven for the reason in
     // `xhci`'s module header, and it no-ops in a few instructions when no keyboard was found.
