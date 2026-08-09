@@ -266,17 +266,19 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
         return;
     }
     if p[0] == OP_CAPACITY {
-        // NOTE: this answers from the count captured at startup, and that is knowingly stale -
-        // `drives` will report a size for a stick that has been unplugged.
+        // Ask the DEVICE. `sectors` (the startup count) is deliberately NOT used here.
         //
-        // An earlier attempt re-queried `xhci` here per request. It did NOT fix the symptom, because
-        // the number `drives` displays comes from `fs`'s OWN cached capacity, taken at mount - so the
-        // stale value survived regardless - and it added an IPC round-trip to every capacity request,
-        // which is latency on the path that also serves the keyboard. Reverted rather than left in:
-        // a change that costs something and fixes nothing is worse than the bug.
+        // It was the second copy of one fact: `xhci` knows what is attached, and this held a snapshot
+        // of what it said at boot. Commandment III allows a derived view only while it is reconciled
+        // with its source, and nothing ever reconciled this one - so `drives` reported a size for a
+        // stick that had been unplugged.
         //
-        // The real fix belongs in `fs`: re-derive capacity (or drop the mount) when the device goes
-        // away, per §14.3. Recorded here so the next attempt starts in the right service.
+        // Reconciled AT THE CALL SITE, which is the only repair path guaranteed to run: a repair path
+        // invoked somewhere else may never be invoked at all. An earlier attempt at this was reverted
+        // because it appeared to cost input latency - that turned out to be logging and a pessimistic
+        // probe timeout, both since fixed, and a capacity query is not a hot path (mount, and `drives`).
+        #[cfg(feature = "usb-via-xhci")]
+        let sectors = super::xhciblk::sectors_now(ctx);
         let mut out = [0u8; 9];
         out[0] = STATUS_OK;
         out[1..9].copy_from_slice(&sectors.to_le_bytes());

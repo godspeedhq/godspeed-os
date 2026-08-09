@@ -841,6 +841,15 @@ fn op_is_read_only(op: u8) -> bool {
 /// The reply is BUFFERED rather than sent from inside, which is what makes a second attempt possible at
 /// all - the first attempt's failure reply must not already be on the wire. Every arm of `serve_once`
 /// replies exactly once and returns (there are no loops around `send`), so buffering is faithful.
+/// `capacity` here is OPERATIONAL ONLY - bounds-checking block numbers, sizing a format. It is the
+/// number this service works WITH; it is never the number it ANSWERS with.
+///
+/// The distinction is the whole of the `drives` bug: this value is learned at mount and cannot notice
+/// a device leaving, so reporting it told the user about storage that was no longer there. Any query
+/// that ASKS about the device re-derives from `block-driver` (see `OP_DRIVES_INFO`), because the
+/// device is the source and this is a derived view (Commandment III - the source wins).
+///
+/// If a future query wants a size, it re-derives. It does not read this.
 fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8], reply: CapHandle) {
     // Split the CORRELATION TAG off the front. A name-addressed request carries one byte the client
     // chose, and its reply carries the same byte back, so the client can tell an answer to ITS question
