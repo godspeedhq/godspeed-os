@@ -231,6 +231,15 @@ about | assert contains GodspeedOS
 version | assert contains GodspeedOS
 cores | assert contains cores
 mem | assert contains used
+# KNOWN: this fails on the FIRST selfcheck after boot on a board with no RTC (the Pi 4), and passes on
+# every later one. `date` prints a time only once the clock is SET, and with no RTC that waits for
+# SNTP - so the result depends on how long ago you booted, which means this line is partly measuring
+# the network rather than `date`.
+#
+# Deliberately NOT "fixed" by wrapping it in `if date | contains :` - that reduces to asserting a
+# thing only when it already holds, a test that cannot fail. A known honest failure is worth more than
+# a green light that means nothing. The real fix is to sync (or skip loudly) before asserting format;
+# that needs a skip-with-reason the harness does not have yet.
 date | assert contains :
 help | assert contains status
 # uptime - a record producer (wall-clock RTC delta): bare grid + json + column projection.
