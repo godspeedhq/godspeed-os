@@ -754,16 +754,18 @@ fn hub_port_status(
             }
             Some(_) => {} // a non-transfer event (port change, command) - ignore; keep waiting
             None => {
-                // No event at all. If this is where the probes die after enumeration, the cursor and
-                // cycle printed here say why: a ring cursor left where the controller is not looking
-                // means every transfer is posted somewhere nothing will consume it.
+                // A probe that got no completion. NOT logged per occurrence any more.
                 //
-                // Gated on the FAULT - a working probe prints nothing. That is the property the
-                // earlier diagnostics lacked: they were gated on conditions that are TRUE when
-                // things are healthy, and became permanent spam.
-                ctx.log_fmt(format_args!(
-                    "xhci: [probe] hub {} port {} NO EVENT cur={:#x} pcs={} ev_idx={} ev_cycle={}",
-                    hub_slot, hub_port, *cur, *pcs, *ev_idx, *ev_cycle));
+                // This printed cursor/cycle state on every failure while the dequeue desync was being
+                // hunted, and it earned that: the frozen `ev_idx` against a climbing `cur` is what
+                // identified a halted endpoint. But a transient failure is now harmless and handled,
+                // so the line had no consumer left - 550 of them in one session, 4% of the serial log,
+                // emitted from the loop that also polls the keyboard.
+                //
+                // The escalations still report themselves, which is where the information belongs:
+                // `unreachable 20x` when it starts looking persistent, and `unreachable 200x -
+                // resetting it` when the endpoint is repaired. Silence here means "transient, and
+                // something is counting".
                 return None;
             }
         }
