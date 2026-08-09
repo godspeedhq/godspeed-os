@@ -511,13 +511,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
         }
-        if fs.is_none() && storage_unreadable {
+        // Self-heal whenever there is NO MOUNT, whatever unmounted it.
+        //
+        // This was `fs.is_none() && storage_unreadable`, and the second condition made the recovery
+        // unreachable from the path that most often unmounts: the drives-info handler drops the mount
+        // when the device reports no capacity, and it never sets `storage_unreadable`. So a single
+        // transient zero unmounted the filesystem permanently - `drives` then showed a non-zero size
+        // with mounted false, which prints as "raw - not formatted", and nothing re-mounted it. Only
+        // killing fs and block-driver fixed it, because a fresh instance mounts at startup. That is
+        // precisely the symptom reported, and the user's own diagnosis pointed here.
+        //
+        // A dropped mount is a dropped mount. Gating recovery on WHICH code path dropped it means
+        // every new drop path silently opts out of healing (§26.7 - a failed recovery must not be
+        // quietly skipped; not attempting one is the quietest skip there is).
+        if fs.is_none() {
             let _ = ctx.reacquire_by_name("block-driver");
             // Never probe an absent disk: capacity 0 -> block_capacity None, so a cardless boot does
             // not re-flood LBA-0 reads on every request. Only attempt the re-mount once block-driver
             // reports a real capacity again (a disk is back) - this preserves the LS1 self-heal for a
             // present-but-transiently-unreadable disk while suppressing the no-disk flood.
-            if block_capacity(&ctx).is_some() {
+            // A REAL capacity, not merely an answer. `block_capacity` returns `Some(0)` for a
+            // driver that answered "no disk" - the comment below meant `None` and the code accepted
+            // `Some(0)`, so a diskless machine attempted a mount on every request after all.
+            if block_capacity(&ctx).unwrap_or(0) > 0 {
                 if let Ok(f) = Fs::mount(&ctx) {
                     ctx.log_fmt(format_args!(
                         "fs: storage recovered - re-mounted GSFS0008 ({} blocks, {} free)",
