@@ -3625,11 +3625,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 {
                     let (mut cur, mut pcs) = (disk_hub_cur.max(hoff), disk_hub_pcs);
                     for hp in 1..=hn {
-                        // Skip the disk's own port; it is present by definition and probing it would
-                        // report the disk as a new arrival every pass.
-                        if disk.as_ref().is_some_and(|dk| dk.hub_port == hp) {
-                            continue;
-                        }
+                        // THE DISK'S OWN PORT IS PROBED HERE, not skipped.
+                        //
+                        // It used to `continue` past it, reasoning that the disk is "present by
+                        // definition". That is true right up until it is unplugged, which is the one
+                        // thing this scan exists to notice - and this is the ONLY scan that runs when
+                        // no HID is bound. So: unplug the keyboard, then unplug the stick, and nothing
+                        // saw it go. Exactly the reported sequence, and it explains why removal worked
+                        // perfectly while the keyboard was in (the HID-driven scan covers this hub)
+                        // and never worked once it was out.
+                        //
+                        // The concern behind the skip was real but belongs to the ARRIVAL arm: a
+                        // present disk would re-trigger "device arrived" every pass. So the port is
+                        // probed, and only the DISCONNECT arm acts on it - handled below.
+                        let is_disk_port = disk.as_ref().is_some_and(|dk| dk.hub_port == hp);
                         let st = hub_port_status(
                             &ctx,
                             &dma, &mmio, dboff, ir0, hs, hd, hp,
@@ -3637,6 +3646,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         );
                         topo.note(&ctx, hs, hp, st);
                         match st {
+                            // The disk's own port answering "disconnected" is a REMOVAL. Two
+                            // consecutive reads, the same two-strike rule the HID-driven scan uses,
+                            // because a single bad read on a shared control ring is not evidence.
+                            Some(false) if is_disk_port => {
+                                disk_absent_seen = disk_absent_seen.saturating_add(1);
+                                ctx.log_fmt(format_args!(
+                                    "xhci: disk port {} reports DISCONNECTED ({}/2)", hp, disk_absent_seen));
+                                if disk_absent_seen >= 2 {
+                                    ctx.log_fmt(format_args!(
+                                        "xhci: the USB disk is gone (port {} reports disconnected) - dropping it", hp));
+                                    notify(&ctx, "storage disconnected (xhci)");
+                                    disk_absent_seen = 0;
+                                    disk_hub_cur = cur;
+                                    disk_hub_pcs = pcs;
+                                    disk_gone = true;
+                                    break;
+                                }
+                            }
+                            // Still there: the count must be UNBROKEN to mean anything.
+                            Some(true) if is_disk_port => {
+                                disk_absent_seen = 0;
+                            }
                             // Connected AND not already tried: a real arrival.
                             Some(true) if hp < 64 && hub_tried & (1u64 << hp) == 0 => {
                                 hub_tried |= 1u64 << hp;
