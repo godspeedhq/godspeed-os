@@ -2351,6 +2351,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // an already-bound keyboard nor livelock the re-init. One bit per root port (max_ports <= 63 on real
     // HW; a port >= 64 simply is not poison-tracked, never poison-halted).
     let mut poisoned: u64 = 0;
+    // Consecutive probes reporting the disk's port absent or unreachable. ABOVE the enumeration loop
+    // on purpose: it was declared inside it and therefore reset to zero on EVERY pass, so it could
+    // only reach its threshold if twenty probes ran with no re-enumeration in between. Anything that
+    // triggers a pass - a keyboard replug, a hub rescan - put it back to zero, so the disk was never
+    // dropped, no "storage disconnected" was ever shown, and the port kept being probed forever.
+    //
+    // Evidence of absence must ACCUMULATE across passes, because absence is a property of the device,
+    // not of the pass that happened to look. Reset only when the port answers "present" (below) or a
+    // disk is bound.
+    let mut disk_absent_seen: u32 = 0;
     'reenum: loop {
         // Stop + reset the controller. The Wyse `chaos max-carnage` all-core freeze lands
         // DETERMINISTICALLY in this sequence (the log dies right after the "v..." line above), so bracket
@@ -2733,7 +2743,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Root ports already had this concept (`poisoned`); hub ports did not. A bit is cleared when
         // its port reports DISCONNECTED, so a genuine unplug-replug is still seen as new.
         let mut hub_tried: u64 = 0;
-        let mut disk_absent_seen: u32 = 0;
         let mut disk_hub_cur = 0usize;
         let mut disk_hub_pcs = 1u32;
         let mut quiet_waits: u32 = 0;
@@ -3199,7 +3208,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             // unreachable. Three failures, a stronger bar than the two a clean
                             // `Some(false)` needs, because a failed transfer is weaker evidence.
                             let gone_now = match st {
-                                Some(false) => { disk_absent_seen = disk_absent_seen.saturating_add(1); disk_absent_seen >= 2 }
+                                Some(false) => {
+                                    disk_absent_seen = disk_absent_seen.saturating_add(1);
+                                    ctx.log_fmt(format_args!(
+                                        "xhci: disk port {} reports DISCONNECTED ({}/2)", hp, disk_absent_seen));
+                                    disk_absent_seen >= 2
+                                }
                                 // TWENTY consecutive failures, not three.
                                 //
                                 // Three was far too weak. This probe is a control transfer sharing
@@ -3215,8 +3229,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 // does not last ten seconds. I called a failed probe "weaker
                                 // evidence" when I added it and then set the bar as though it were
                                 // not - the threshold now matches the reasoning.
-                                None => { disk_absent_seen = disk_absent_seen.saturating_add(1); disk_absent_seen >= 20 }
-                                Some(true) => { disk_absent_seen = 0; false }
+                                None => {
+                                    disk_absent_seen = disk_absent_seen.saturating_add(1);
+                                    // Only while it is climbing - silent once the disk is gone and
+                                    // dropped, so this cannot become the permanent spam the last
+                                    // diagnostic did.
+                                    ctx.log_fmt(format_args!(
+                                        "xhci: disk port {} probe UNREACHABLE ({}/20)", hp, disk_absent_seen));
+                                    disk_absent_seen >= 20
+                                }
+                                Some(true) => {
+                                    if disk_absent_seen != 0 {
+                                        ctx.log_fmt(format_args!(
+                                            "xhci: disk port {} present again after {} bad probe(s) - counter reset",
+                                            hp, disk_absent_seen));
+                                    }
+                                    disk_absent_seen = 0;
+                                    false
+                                }
                             };
                             if gone_now {
                                 ctx.log_fmt(format_args!(
