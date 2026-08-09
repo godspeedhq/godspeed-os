@@ -272,6 +272,10 @@ pub(crate) const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_DISABLE_SLOT: u32 = 10;
 /// Reset Endpoint (xHCI 4.6.8) - clears the HALTED state an errored transfer left on an endpoint.
+/// Consecutive hub-probe failures across ALL ports of a hub. A halt is a property of the shared EP0
+/// endpoint, so every port's probe fails together - which makes any of them evidence, and makes the
+/// count meaningful only when unbroken (a single success resets it).
+static PROBE_FAILS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 const TRB_RESET_ENDPOINT: u32 = 14;
 /// Set TR Dequeue Pointer (xHCI 4.6.10) - tells the controller where to resume on that endpoint.
 const TRB_SET_TR_DEQUEUE: u32 = 16;
@@ -3536,6 +3540,41 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         topo.note(&ctx, hub_slot, hp, st);
                         hub_cur[owner] = cur;
                         hub_pcs[owner] = pcs;
+                        // WEDGE DETECTION BELONGS HERE TOO - this is where the failures actually are.
+                        //
+                        // The first version of this counted only in the DISK's probe path, so on a
+                        // machine whose wedged endpoint is the keyboard's hub the counter never moved:
+                        // 508 failed probes in a session and the reset fired ZERO times. The detector
+                        // was correct and looking in the wrong place, which is indistinguishable from
+                        // no detector at all.
+                        //
+                        // Counting consecutive failures ACROSS ports of this hub, because the halt is a
+                        // property of the shared EP0 endpoint, not of one port: every port's probe
+                        // rides the same ring, so they all fail together and any of them is evidence.
+                        if st.is_none() {
+                            let n = PROBE_FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                            if n >= 200 {
+                                ctx.log_fmt(format_args!(
+                                    "xhci: hub slot {} unreachable {}x - endpoint looks HALTED (cursor advancing, no completions); resetting it",
+                                    hub_slot, n));
+                                PROBE_FAILS.store(0, core::sync::atomic::Ordering::Relaxed);
+                                let ok = reset_endpoint(
+                                    &ctx, &dma, &mmio, dboff, ir0, hub_slot, 1,
+                                    ep0_tr_off(hub_dev), &mut ev_idx, &mut ev_cycle, &mut cmd_idx,
+                                );
+                                // The producer cursor must match the dequeue just set, or the two
+                                // disagree about where the ring starts and it wedges again at once.
+                                hub_cur[owner] = 0;
+                                hub_pcs[owner] = 1;
+                                if !ok {
+                                    ctx.log("xhci: endpoint reset FAILED - falling back to a full re-enumeration");
+                                    announce = false;
+                                    continue 'reenum;
+                                }
+                            }
+                        } else {
+                            PROBE_FAILS.store(0, core::sync::atomic::Ordering::Relaxed);
+                        }
                         // Same rule as the disk-hub scan: connected is not newly-arrived. Without
                         // the retry mask, a port holding something we cannot bind re-enumerates the
                         // whole controller on every pass.
