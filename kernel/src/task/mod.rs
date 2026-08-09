@@ -3234,7 +3234,16 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // sink's endpoint at runtime via the kernel directory (`acquire_send_grant_cap`) -
             // no contracted peer.
             has_recv_endpoint: true,
-            send_peers:        &["fs"],
+            // `block-driver` as well as `fs`, so `drives` can ask the DEVICE about the device.
+            //
+            // "Is there a disk and how big" is block-driver's fact; "is it mounted, what label, how
+            // free" is fs's. Routing both through `fs` made it answer a hardware question from its
+            // own mount state - which is how `drives` reported 15 GB for an unplugged stick. Each
+            // fact now comes from its owner (Commandment III).
+            //
+            // It also gives a useful answer when `fs` is dead: "disk present, filesystem
+            // unavailable" instead of nothing at all (§26.7).
+            send_peers:        &["fs", "block-driver"],
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,
