@@ -5467,9 +5467,15 @@ fn sock_invoke(ctx: &ServiceContext, sock: CapHandle, right: u8, payload: &[u8])
     }
     // Await the reply FAILURE-AWARE (Commandment VIII): a bare `recv` would hang forever if net-stack
     // died after receiving the invocation but before replying. Reclaim the reply slot on every outcome.
+    // Same rule as the SDK: on a REPLY the cap is already gone (the send embedded it, and §8.5 removes
+    // an embedded cap from the sender's table), so removing it here removes whatever the kernel has
+    // since placed in that slot - which is how the file cap was being deleted. Reclaim it only on the
+    // paths where the send never delivered it.
     let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
-    ctx.remove_cap(reply);
-    match outcome { ReqOutcome::Reply(m) => Some(m), _ => None }
+    match outcome {
+        ReqOutcome::Reply(m) => Some(m),
+        _ => { ctx.remove_cap(reply); None }
+    }
 }
 
 /// Build a minimal DNS A-query for `host` into `buf`; returns the length. Just enough to elicit a UDP
@@ -8454,9 +8460,15 @@ fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -
     // Await the reply FAILURE-AWARE (Commandment VIII): a bare `recv` here would hang forever if fs
     // died after receiving the badged invocation but before replying. Reclaim the reply slot on every
     // outcome (the reply cap is one-shot; Aborted/Timeout means it was never consumed).
+    // Same rule as the SDK: on a REPLY the cap is already gone (the send embedded it, and §8.5 removes
+    // an embedded cap from the sender's table), so removing it here removes whatever the kernel has
+    // since placed in that slot - which is how the file cap was being deleted. Reclaim it only on the
+    // paths where the send never delivered it.
     let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
-    ctx.remove_cap(reply);
-    match outcome { ReqOutcome::Reply(m) => Some(m), _ => None }
+    match outcome {
+        ReqOutcome::Reply(m) => Some(m),
+        _ => { ctx.remove_cap(reply); None }
+    }
 }
 
 /// `fcap` - self-contained demonstration AND self-check of file-as-capability (§7.10). It is a

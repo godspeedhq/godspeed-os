@@ -768,7 +768,22 @@ impl ServiceContext {
             // truth, doing nothing (the same busy-wait the `observe` and muted loops were already fixed
             // for - see MUTED_POLL_SLEEP_CYCLES). Blocking parks the task, the core halts, idle work runs.
             if let Some(r) = self.try_recv() {
-                self.remove_cap(reply_cap);
+                // DO NOT remove the reply cap on a REPLY. The send already removed it.
+                //
+                // §8.5: a cap embedded in a message "is transferred and REMOVED from sender's table".
+                // The instant the request went out this slot stopped being ours, and by the time the
+                // reply lands the kernel has REUSED it - `CapTable::insert` hands out the first EMPTY
+                // slot, and this one is empty. When the reply carries an embedded cap (a file cap from
+                // `fs`), that cap lands in exactly this slot, so removing "the reply cap" DELETES IT.
+                //
+                // Measured on the Pi 4: `fcap` printed `file=12 reply=12` - the file handle and the
+                // next derived cap were the same slot, which is only possible if the slot was empty.
+                // Every file-cap read/write then failed before reaching `fs`, and two negative
+                // sub-checks "passed" vacuously because no invoke could get that far.
+                //
+                // A remove-by-stale-index can bite ANY request whose reply carries a cap, not just
+                // fcap. The abort and timeout paths below still remove it: there the send never
+                // delivered, so the cap IS still ours.
                 return ReqOutcome::Reply(r);
             }
             while let Some(b) = self.try_console_read() {
@@ -819,7 +834,22 @@ impl ServiceContext {
             // actually use (the "press q to abort" hint), so it is the one that kept core 0 permanently
             // busy during a continuous ping and starved the idle-path USB hot-plug watch.
             if let Some(r) = self.try_recv() {
-                self.remove_cap(reply_cap);
+                // DO NOT remove the reply cap on a REPLY. The send already removed it.
+                //
+                // §8.5: a cap embedded in a message "is transferred and REMOVED from sender's table".
+                // The instant the request went out this slot stopped being ours, and by the time the
+                // reply lands the kernel has REUSED it - `CapTable::insert` hands out the first EMPTY
+                // slot, and this one is empty. When the reply carries an embedded cap (a file cap from
+                // `fs`), that cap lands in exactly this slot, so removing "the reply cap" DELETES IT.
+                //
+                // Measured on the Pi 4: `fcap` printed `file=12 reply=12` - the file handle and the
+                // next derived cap were the same slot, which is only possible if the slot was empty.
+                // Every file-cap read/write then failed before reaching `fs`, and two negative
+                // sub-checks "passed" vacuously because no invoke could get that far.
+                //
+                // A remove-by-stale-index can bite ANY request whose reply carries a cap, not just
+                // fcap. The abort and timeout paths below still remove it: there the send never
+                // delivered, so the cap IS still ours.
                 return ReqOutcome::Reply(r);
             }
             while let Some(b) = self.try_console_read() {
