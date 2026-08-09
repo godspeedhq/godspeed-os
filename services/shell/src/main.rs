@@ -8556,7 +8556,17 @@ fn cmd_fcap(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
     }
 
     // 7. Unforgeable: a fabricated handle is not a capability.
-    match fc_invoke(ctx, CapHandle(60000), RIGHT_READ, &rbuf) {
+    // 4000, not 60000, so THE KERNEL does the rejecting.
+    //
+    // 60000 does not fit the 12-bit slot field, and the SDK now rejects it at the wrapper before any
+    // syscall happens. This check would then have passed without the kernel ever being asked - a test
+    // that proves the SDK's range check rather than the unforgeability it claims to prove, which is
+    // precisely the vacuous pass that let the fcap failure hide for so long.
+    //
+    // 4000 is a legal slot number that this task does not hold, so the request really is made and the
+    // kernel really refuses it. The out-of-range case is the SDK's own concern and is not what this
+    // line is for.
+    match fc_invoke(ctx, CapHandle(4000), RIGHT_READ, &rbuf) {
         None    => ctx.console_writeln("fcap: forged handle rejected"),
         Some(_) => { fail(ctx, "fcap: FAIL forged handle accepted"); ok = false; }
     }

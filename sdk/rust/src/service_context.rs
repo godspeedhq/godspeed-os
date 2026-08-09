@@ -1549,6 +1549,21 @@ impl ServiceContext {
         // `right` is a u8, so the whole thing lands in 24 bits with 8 to spare. This is the A-U1
         // rule from arch/arm/CLAUDE.md: on a 32-bit ABI, a syscall argument that does not fit in one
         // register must be narrowed at the wrapper, never assumed to survive.
+        // REJECT a handle that does not fit its field instead of letting it corrupt the next one.
+        //
+        // Each slot gets 12 bits. A handle above 4095 does not simply get truncated - its high bits
+        // land in the NEXT field. The `fcap` forged-handle check passes 60000 (0xEA60) and the kernel
+        // logged `file_slot=2656 reply_slot=14`: the 0xE spilled out of `file` and rewrote `reply`, so
+        // a bad file handle silently redirected the REPLY to whatever cap happened to sit in slot 14.
+        // The invocation was rejected for the right reason by luck, not by design.
+        //
+        // A slot above 4095 cannot be valid anyway (MAX_CAPS_PER_TASK is 64), so this rejects with the
+        // same error the kernel gives for a slot it does not hold - the caller sees no difference,
+        // and no neighbouring field is ever silently rewritten.
+        const SLOT_MAX: u32 = 0xFFF;
+        if file.0 > SLOT_MAX || reply.0 > SLOT_MAX {
+            return Err(crate::ipc::i64_to_ipc_error(-2)); // -2 = capability not held
+        }
         let packed = ((right as u64) << 24) | ((reply.0 as u64) << 12) | (file.0 as u64);
 
         let payload = msg.payload_bytes();
