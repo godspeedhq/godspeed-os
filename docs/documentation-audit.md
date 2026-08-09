@@ -8,6 +8,71 @@
 > First audit: 2026-07-15.
 
 
+## Audit 4 - drift left behind by deleting the in-kernel aarch64 USB driver (2026-08-09, `feat/pi4-aarch64`)
+
+**Scope:** everything that described USB on AArch64. Commit `e71e64a6` deleted
+`kernel/src/arch/aarch64/xhci.rs` (2742 lines of ring-0 USB stack) and the two cargo features that
+used to select between it and the userspace `services/xhci` (`xhci-userspace` in the kernel and the
+supervisor, `usb-via-xhci` in `block-driver`). ARM32 (Pi 2) is deliberately unchanged. This audit asks
+one question of every doc, comment and manifest that mentioned the old arrangement: **is it still
+true?**
+
+**Verdict: 5 HIGH, 5 MED, 3 LOW.** The constitution itself was amended correctly and in the same
+commit - `CLAUDE.md` §6.4's 2026-08-09 amendment is present, accurate, and explicitly keeps ARM32
+separate rather than blurring the two ports. The drift is everywhere *around* it. The dominant shape
+is new and worth naming: **the deletion was surgical on code and blunt on prose.** Three `[features]`
+blocks had their feature *declaration* line removed and their multi-paragraph *rationale* left in
+place, so three manifests now end a sentence mid-word and document a build option that does not
+exist. This is the DA3-2 lesson from the 2026-07-31 audit repeating at commit scale: a stale comment
+about a FINISHED stage reads as present tense, and here it reads as a live `--features` switch.
+
+The north-star failure is concrete and easy to state. A competent engineer coming cold and asking
+**"how does USB work on the Pi 4 now?"** has no entry point: there is no `services/xhci/CLAUDE.md`, no
+`kernel/src/arch/aarch64/CLAUDE.md`, the two design docs that would answer it are not in the docs
+index, and the primary onboarding doc for the port still opens with "Status: design, not built".
+
+### Ranked ledger
+
+| ID | Sev | File:line | Finding |
+|----|-----|-----------|---------|
+| **A4-1** | HIGH | `kernel/Cargo.toml:105-141`, `services/block-driver/Cargo.toml:15-20`, `services/supervisor/Cargo.toml:18-21` | **Three orphaned, mid-sentence-truncated feature rationales for flags that no longer exist.** The commit removed the `xhci-userspace = []` / `usb-via-xhci = []` declaration lines and the sentence that named them, leaving ~30, ~6 and ~4 lines of present-tense justification behind. `kernel/Cargo.toml` ends "Build both sides with it" with a dangling open paren and falls straight into the next feature's comment; `block-driver/Cargo.toml`'s `[features]` section trails off at "and both halves build and" with no period before `[dependencies]`; `supervisor/Cargo.toml`'s block runs without a blank line into `blockdev`'s comment, so **`blockdev = []` now reads as the flag that "spawns the `xhci` service on aarch64"** - it is an unrelated persistence smoke-test flag. A reader reasonably concludes `--features xhci-userspace` is a current build option. Verified: zero `#[cfg(feature = "xhci-userspace")]` or `"usb-via-xhci"` remain in any `.rs`, so this is dead prose, not dead code. |
+| **A4-2** | HIGH | `kernel/src/task/mod.rs:486-493` | **A false rationale sitting directly on top of a live capability grant.** The comment reads "on BOTH ARM ports the USB stack is in-kernel, so `block-driver` reaches a USB stick through syscalls 46-48 ... The Pi 4 needs it for the same reason the Pi 2 does." False for aarch64. The code below it is unchanged: `usb_disk: cfg!(any(target_arch = "arm", target_arch = "aarch64")) && matches!(name, "block-driver")`. On aarch64 the four syscalls that grant authorises are permanent stubs returning 0/false (`arch/aarch64/mod.rs:1277-1301`) and `block-driver` reaches the disk by IPC to the `xhci` service instead (`send_peers: &["xhci"]`, `task/mod.rs:716`). This is the worst class in this audit: the comment explains why an authority is needed, and the reason is gone. Filed as a security finding too - `security-audit.md` **SEC-37**. |
+| **A4-3** | HIGH | `services/block-driver/src/xhciblk.rs:1-8` | **The module header states the opposite of the truth.** "As long as they are the only route to a disk, `kernel/src/arch/aarch64/xhci.rs` - 2742 lines of ring 0 ... - **cannot be deleted**, and Commandment I stays broken on this port." It has been deleted and Commandment I is closed on this port. The one module whose whole purpose is the new arrangement documents itself as the reason the old one could not be dismantled. |
+| **A4-4** | HIGH | `docs/unsafe-audit.md:2322` | **A phantom row in the LIVE inventory, invisible to CI.** The `<!-- unsafe-inventory-start -->` .. `<!-- unsafe-inventory-end -->` table (lines 2299-2374) - the current, mechanically-parsed inventory, not a dated changelog - still carries a row reading `arch/aarch64/xhci.rs` / `42` / `permitted` for a file that does not exist, inflating the audited total by 42 lines. `scripts/unsafe_check.py` **passes**: it iterates real `.rs` files and checks each one's count is within its audited figure, and never checks the reverse direction (a row whose file is gone). So the enforcement mechanism `docs/CLAUDE.md` calls "special" has a blind spot exactly where a deletion lands. The dated changelog rows at 150, 204, 527, 566, 589, 610 and 657 are ratified history and are correct as they stand. |
+| **A4-5** | HIGH | `services/xhci/src/main.rs:2204` (+ 1665, 2149, 2255, 2450, 2530) | **Six present-tense provenance references to the deleted driver, one of which asserts it still exists.** Line 2204: "Taken from the in-kernel driver **still in this tree** (`arch/aarch64/xhci.rs`)". The other five ("has always driven this exact VL805", "waits 200 ms here", "clears BOTH change bits", "reached the same conclusion", "refuses loudly above 512") all describe behaviour of code a maintainer can no longer consult. These read as load-bearing hardware-provenance notes - precisely the kind a reader will go looking for when a USB bug appears. The provenance is real and worth keeping; the tense and the path are not. |
+| **A4-6** | MED | `kernel/src/syscall/CLAUDE.md:49` | **A doc that contradicts a shipped security fix.** The syscall table lists 18 `reboot` as "REBOOT (WRITE) - held by `shell` (its `reboot` cmd) + `xhci`/`ehci` (Ctrl+Alt+Del)". SEC-2 removed REBOOT from the USB drivers; the code is correct (`task/mod.rs:467`, `reboot: matches!(name, "shell")`) and the Ctrl+Alt+Del chord is routed through the shell via `hid::CTRL_ALT_DEL_SIGNAL` (SEC-2 follow-up, §6.4). A stale row in an authority table is worse than a stale prose line: it reads as the design, and a reader reasoning about who can reset the machine gets the pre-SEC-2 answer. Pre-existing (SEC-2 landed 2026-07-16), surfaced by this audit's authority sweep. |
+| **A4-7** | MED | `services/block-driver/src/usbdisk.rs:184, 216-225, 284`; `services/block-driver/contracts/block-driver.toml:1-6, 27-30` | **Five sites describe a build-flag mechanism that has been replaced by an architecture check.** "chosen at BUILD time ... the kernel's `xhci-userspace` feature is what stops it driving the controller ... `scripts/pi4_build.py --xhci-userspace` sets both", and "The re-derive above is cfg-gated to `usb-via-xhci`". The real gate is `#[cfg(target_arch = "arm")]` vs `not(...)`, unconditional on aarch64. The contract additionally claims the service is granted `USB_DISK` "because the ARM USB stack lives in the kernel" (false for aarch64, see A4-2) and calls the `ipc_send = ["xhci"]` peer "present only when the USB stack runs in userspace ... this peer goes unused" - on aarch64 it is the only path to the disk and is exercised on every block request. No dead code results (verified), but a reader will search for a feature flag that is not there and misread the actual mechanism. |
+| **A4-8** | MED | `kernel/src/arch/mod.rs:12-14` | The shared `hid` module is documented as "shared by the in-kernel USB drivers (`arch/arm/dwc2.rs` and `arch/aarch64/xhci.rs`)". Half of that is now false, and the half that matters is inverted: `hid` is now shared between an *in-kernel* driver (arm32) and a *userspace service* (`services/xhci`, via `sdk`). The sentence's own justification - "so the two ports cannot drift apart" - is still exactly right, which is why the stale naming is worth fixing rather than deleting. |
+| **A4-9** | MED | `docs/aarch64.md:1-6` (and its row in `docs/CLAUDE.md`) | **The Pi 4 port's primary doc opens by denying the port exists.** "**Status:** design, not built. Non-normative until the constitution is amended ... Target board: Raspberry Pi 4 Model B, **4 GB**". The body from line 9 documents milestones 1-21 hardware-verified through a live `gsh>` prompt; the constitution **has** been amended (§6.4, 2026-08-09, on disk); and the board is **2 GB** (rev 1.5) by the port's own memory-map evidence in the same file. The milestone log also stops at Milestone 21 (2026-08-04) with no entry for the USB deletion. The one section that is *correct and valuable* is §4's "no usable SMMU ... so H1/§6.4 does not travel" - it is the honest posture statement the new §6.4 amendment does not make (see A4-10). |
+| **A4-10** | MED | `CLAUDE.md` §6.4 (2026-08-09 amendment) vs §6.1 table + glossary | **The new amendment is accurate about the kernel and silent about the TCB, and a reader has to join two sections to get the right answer.** It says the driver is out of the kernel and Commandment I is closed - both true - but never states the trust consequence. §6.1's table row still governs and gives it: `xhci`/`ehci` are "in the TCB only on a machine with no IOMMU", and the Pi 4 has no usable SMMU (`arch/aarch64/mod.rs:2328-2334` - every `iommu::` entry point is a no-op stub, `confine_device` unconditionally returns `false`). So **the userspace `xhci` on the Pi 4 is a TCB member**, and the amendment reads as though it stopped being one. Separately, §6.4's standing promise that "which case holds is reported loudly at boot (invariant 12)" is **not met on this port** - nothing is printed in either direction (`security-audit.md` **SEC-34**). Both are one sentence each in §6.4. Related pre-existing drift found while checking: §12.1 still says "Essential drivers (block-driver) are trusted in v1" (Phase D dropped them) and the glossary's `TCB` entry still reads "Kernel + arch + smp + init + supervisor" (`init` was removed in Phase 5). |
+| **A4-11** | LOW | `scripts/pi4_build.py:29-32` and `:132-135` | Two small self-contradictions in the build script. The docstring says the removed flag "had to reach **TWO** crates: the kernel ... and the `supervisor`", contradicting the same file at line 107 ("the kernel, the supervisor AND block-driver") and the commit message ("three crates"). And lines 132-135 are a **dangling comment with no code**: "The THIRD crate the one switch has to reach. block-driver must be told to fetch its sectors from the `xhci` SERVICE ... without it storage silently disappears" now sits directly above an unrelated `if svc == "net-stack" and EL0_FAULT_TEST:` branch. The scenario it warns about can no longer occur (the backend is `cfg(target_arch)`), so it is a warning about an impossibility, attached to the wrong code. |
+| **A4-12** | LOW | `docs/CLAUDE.md` (index); absent `services/xhci/CLAUDE.md`, `kernel/src/arch/aarch64/CLAUDE.md` | **The discoverability gap, and the one this audit would fix first.** `docs/xhci-split.md` and `docs/xhci-topology.md` (both added 2026-08-09) are not in the docs index. There is no `services/xhci/CLAUDE.md` and no `kernel/src/arch/aarch64/CLAUDE.md` - note that `kernel/src/arch/arm/CLAUDE.md` exists precisely because DA4 of the 2026-07-23 audit found the same hole for the Pi 2 and called creating it "the single highest-leverage fix". The best available cold path to "how does USB work on the Pi 4?" today is a 800-line milestone log plus source comments, five of which are A4-5. |
+| **A4-13** | LOW | `docs/xhci-split.md:8-9` | Cites `arch/aarch64/mod.rs:1756` and `:1290` for the in-kernel driver's `poll()`/`disk_read()`. The doc's framing is already past-tense and correct (it was written hours before the deletion), but the two line-number citations no longer resolve to anything. Design-history doc, so the cost is a reader's wasted lookup, not a wrong belief. |
+
+### Verified still true (do not re-check)
+
+- **`CLAUDE.md` §6.4's 2026-08-09 amendment** is present, accurate, and correctly scoped - it closes
+  Commandment I on aarch64 without touching the 2026-07-23 ARM32 amendment below it, and says so
+  explicitly ("the two ports now differ in exactly this, and the difference is recorded rather than
+  blurred"). Its one gap is A4-10, which is additive, not a correction.
+- **`kernel/src/arch/aarch64/mod.rs:1258-1301`** and **`kernel/build.rs:130-145`** are current and
+  well-written: the former documents that the kernel drives no USB and why the `usb_disk_*` stubs
+  answer "absent" rather than fabricating success; the latter correctly explains that the `xhci` ELF is
+  embedded unconditionally and that the *supervisor* gates the spawn.
+- **`services/block-driver/src/main.rs`** is fully updated - it documents the `cfg(target_arch)`
+  backend split with no stale flag references. (Its sibling `usbdisk.rs` is A4-7.)
+- **`kernel/CLAUDE.md`, `services/CLAUDE.md`, `COMMANDMENTS.md`** carry no USB-specific claims and
+  needed no change.
+
+### Pre-existing lag, recorded but NOT counted against this commit
+
+`README.md:42` and `docs/multi-arch.md` still describe AArch64 as reaching a "boots + prints to UART"
+milestone, and `kernel/src/arch/CLAUDE.md` still calls `arch/aarch64/mod.rs` a stub at that milestone.
+These are weeks behind reality (full shell, USB service, GENET networking) but the lag predates this
+work and is not USB-specific. Flagged here so the next `main` merge does not ship them - the DA2 fix
+from the 2026-07-23 audit did exactly this job for arm32 and the aarch64 rows never got the same pass.
+
+
 ## Audit 3 - drift against the v0.9.0 console work (2026-08-03, `main`)
 
 **Scope:** `docs/`, `CLAUDE.md`, and the per-directory `CLAUDE.md` files, checked for claims the code no

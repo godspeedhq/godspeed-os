@@ -424,6 +424,198 @@ a real and previously under-documented TCB expansion versus x86's confined-users
 
 ---
 
+## Audit 3 - 2026-08-09 (the AArch64 USB stack moves to userspace; file-cap escalation)
+
+**Scope:** what commit `e71e64a6` changed on the Pi 4 - `kernel/src/arch/aarch64/xhci.rs` (2742 lines
+of ring-0 USB) deleted, USB now served by the userspace `services/xhci`. Three questions were asked:
+(1) does moving the driver out of the kernel actually change its trust posture on a board with no
+SMMU; (2) what authority does the service hold that it does not need; (3) how could the file-capability
+escalation observed once after a chaos run (a read-only cap performed a write) occur. ARM32 is out of
+scope and unchanged (Audit 2, SEC-29/30, still governs it).
+
+**Result: 1 HIGH (posture), 2 MED, 5 LOW.** No new cross-principal escalation was found. The USB
+service's authority is genuinely minimal in the capability model - it holds `CONSOLE_PUSH`, `log`, its
+own recv endpoint, its controller's BAR and its DMA arena, and **nothing else** (verified against
+`service_privileges`, not assumed). The HIGH is a posture correction, not a bug: **the move is a large
+reduction in the accident surface and no reduction at all in the authority ceiling**, and the
+constitution's own rule already says so - the amendment just does not repeat it. The file-cap
+escalation is explained by a confirmed client-side capability-handle desync in which **neither the
+kernel nor `fs` misbehaves**; both were re-read line by line and are correct.
+
+### The question, answered directly: is the userspace `xhci` on the Pi 4 least-privilege?
+
+**No. It is least-privilege in the capability model and still kernel-equivalent through DMA, and by
+`CLAUDE.md` §6.1's own rule it is therefore a TCB member on this board.**
+
+- **There is no IOMMU, and the code does not pretend otherwise - it just does not say so.**
+  `kernel/src/arch/aarch64/mod.rs:2328-2334`: `iommu::detect`, `bringup`, `release_device` and
+  `drain_event_log` are empty bodies and `confine_device` is `-> bool { false }`. `CONFINE_USB_DRIVERS`
+  is `true` (`task/mod.rs:172`) and `HwClass::Xhci::iommu_confine()` is `true` (`task/mod.rs:387`), so
+  `task/mod.rs:3871-3874` **does** call `confine_device` on every `xhci` spawn and **discards** its
+  `false`. The driver is never confined; nothing is printed either way (SEC-34).
+- **The service is handed the means to DMA anywhere.** 16 pages of the VL805's MMIO BAR
+  (`task/mod.rs:3779-3786`) plus a 292-page physically-contiguous DMA arena whose **physical** base is
+  handed to the service along with its VA (`task/mod.rs:3818-3855`). Holding the controller's
+  registers it can point `DCBAAP`, `CRCR`, `ERSTBA` and any TRB buffer pointer at an arbitrary
+  physical address, and the controller will execute those transfers.
+- **The only hardware bound is the PCIe inbound window, and it covers all of RAM.**
+  `arch/aarch64/pcie.rs:266-272` sizes `RC_BAR2` as `ram_bytes.next_power_of_two().max(64 KiB)` based
+  at 0. That is a genuine and deliberately-tightened bound (the `+ 1` that opened a window twice the
+  size of RAM was fixed, and `RC_BAR1`/`RC_BAR3` are explicitly shut, `pcie.rs:281-282`) - it stops a
+  bus master reaching past the end of memory. It does **not** separate kernel memory, page tables or
+  another service's pages from the driver's arena. It is a cap, not a confinement.
+- **So §6.4's no-IOMMU bullet describes this board exactly**: "it programs its controller's DMA engine
+  with physical addresses and can therefore read or write *anywhere* in RAM, regardless of the
+  capabilities it holds. Its compromise is unbounded, so it is trust-critical by necessity."
+  `docs/aarch64.md` §4 already reached this conclusion before the port existed ("no usable SMMU ... so
+  H1/§6.4 does not travel"). Nothing has changed it.
+
+**What the move genuinely bought, and it is a lot:**
+
+- **The accident surface.** The thing that parses hub descriptors, HID reports and SCSI status words
+  supplied by whatever is plugged in is no longer ring-0 code. A parser bug is now one killed service
+  that the supervisor respawns (`xhci` is in the death-notification set, `scheduler.rs:1948-1963`),
+  where before it was a kernel fault. That was the entire content of SEC-29 for arm32, and on aarch64
+  it is now closed.
+- **Ambient authority.** An in-kernel driver implicitly holds every kernel power (SEC-30's point: it
+  could call `hardware_reset` directly). The service holds an enumerable, checkable set. **SEC-2's win
+  now travels to aarch64** where it never travelled to arm32: no `REBOOT` (`task/mod.rs:467`), and the
+  Ctrl+Alt+Del chord reaches the shell as the out-of-band `hid::CTRL_ALT_DEL_SIGNAL` byte, exactly the
+  x86 arrangement.
+- **Restartability and the blast radius of a *bug*.** A compromised driver is unbounded; a *buggy* one
+  is now bounded to its own service and its own permanently-reserved arena.
+
+**The honest one-line form:** *a buggy USB driver on the Pi 4 is now bounded; a compromised one is
+still kernel-equivalent.* That is the same posture as an x86 machine without an IOMMU, and strictly
+better than arm32's in-kernel driver - but it is not the confined case, and the difference should be
+stated where a reader looks (SEC-33) and printed where §6.4 promises it will be (SEC-34).
+
+### Ranked ledger
+
+| ID | Sev | Conf | Principal | Finding | Fix direction |
+|----|-----|------|-----------|---------|---------------|
+| **SEC-33** | HIGH | CONFIRMED (posture) | `xhci` (aarch64) | **The userspace `xhci` on the Pi 4 is still a TCB member, and §6.4's 2026-08-09 amendment does not say so.** Full argument above. The amendment is accurate about the *kernel* (Commandment I is closed, the ring-0 code is gone) and silent about *trust*; §6.1's table row supplies the answer ("in the TCB only on a machine with no IOMMU") but a reader has to join two sections to get it, and the amendment's framing ("Commandment I is closed on this port, not merely satisfiable") reads as though the driver left the TCB. It did not. Recording it is the whole point of the machine-dependent posture: the same binary is least-privilege on an IOMMU machine and trust-critical here. | One paragraph in the §6.4 amendment: on the Pi 4 there is no usable SMMU, so the userspace `xhci` is a TCB member by §6.1's rule; what the move bought is the accident surface and the ambient authority, not the DMA ceiling. Per §26.3 this is **recorded**, not closed - there is no SMMU to close it with. |
+| **SEC-34** | MED | CONFIRMED | kernel/arch (aarch64) | **§6.4's "reported loudly at boot" promise is unmet on the port where the answer is worst, and a failed confinement is silently discarded.** §6.4 rests its whole machine-dependent posture on the case being "a printed boot fact rather than a hidden assumption" - on x86 that is `iommu: no IVRS table ... drivers stay in TCB` or `iommu: ... confined BDF ...`. On aarch64 `iommu::detect`/`bringup` print nothing (`mod.rs:2329-2330`), `confine_device` returns `false` in silence (`mod.rs:2331`), and the call site ignores the return (`task/mod.rs:3872`). The `else` branch that *would* have printed "left in IOMMU passthrough" is not reached, because `hw.iommu_confine()` is `true` for xhci. **A Pi 4 boot therefore prints nothing about DMA confinement in either direction.** This is also the §26.7 shape (a hardening step whose failure is discarded) and invariant 12 (failures are loud, never silent). | Check `confine_device`'s return at the call site and print the outcome either way; give the aarch64 `iommu::detect` a one-line "no SMMU on this SoC - DMA drivers stay in the TCB (§6.4)". Cheap, and it makes the posture self-reporting on every board. |
+| **SEC-35** | MED | CONFIRMED (mechanism); PLAUSIBLE (as the specific observed instance) | shell / SDK | **A discarded message's embedded capability stays queued, so `take_pending_cap()` can hand a later `open` an EARLIER open's capability - which reproduces the observed "read-only cap performed a write" with no kernel or `fs` bug.** Detail below. Two independent sub-causes, both confirmed by reading: (a) nothing pops the pending-cap FIFO when a *message* is thrown away, and the shell throws messages away in three places; (b) `TASK_PENDING_RECV_CAP_COUNT` is never reset, so a respawned task inherits a dead task's queue. | `fc_open` should verify the returned cap's rights against the rights it asked for (`query_cap_rights`, already used by the `[fcapr]` instrumentation) and fail loudly on a mismatch; the drain paths should pop the FIFO for every message they discard; and the pending-cap FIFO should be cleared when a task slot is reused. |
+| **SEC-36** | LOW | CONFIRMED (residual) | shell / SDK | **The abort/timeout paths still remove a reply cap the kernel already removed - the same remove-by-stale-index shape that `1ecfd98e` just fixed on the reply path.** `handle_resource_invoke` removes `reply_slot` from the caller's table on **every** delivering outcome (`dispatch.rs:1231`, `1236`, `1240` - including `QueueFull`). `fc_invoke` (`shell:8487`), `sock_invoke` (`shell:5460-5463`) and the two SDK sites still call `remove_cap(reply)` on `Timeout`/`Aborted`. The comment justifying it ("there the send never delivered, so the cap IS still ours") is true for the name-addressed `request_with_reply` path but **not** for `resource_invoke`, whose kernel handler frees the slot before the caller can time out. I could not construct a reachable exploitation (only a received message can refill the slot during the wait, and such a message becomes `Reply`), so it is LOW - but it is one path away from the bug that was just closed. | Remove the reply cap only where the wrapper knows the send did not deliver (the `resource_invoke` error return), never after a delivering send, on any outcome. |
+| **SEC-37** | LOW | CONFIRMED (latent) | kernel/task | **A vestigial `USB_DISK` grant on aarch64 - SEC-31 repeating one arch later.** `task/mod.rs:492-493` grants `USB_DISK` to `block-driver` on `arm` **or** `aarch64`. On aarch64 the four syscalls it authorises are permanent stubs returning 0/false (`arch/aarch64/mod.rs:1277-1292`), and `block-driver` reaches the disk by IPC to the `xhci` service instead (`send_peers: &["xhci"]`, `task/mod.rs:716`; `usbdisk.rs` routes to `xhciblk::`). The held cap authorises nothing today and becomes live the day a real aarch64 `usb_disk_*` is written - exactly SEC-31's `NET_DEVICE` finding, whose chosen fix (arch-gate the grant) was not extended when aarch64 joined the `cfg!` list. The comment above it still claims "on BOTH ARM ports the USB stack is in-kernel" (`documentation-audit.md` A4-2). | Drop `aarch64` from the `usb_disk` `cfg!` (leaving `arm`), and correct the rationale comment. |
+| **SEC-38** | LOW | CONFIRMED, materially mitigated | kernel/task (aarch64) | **The kill path cannot quiesce the controller on aarch64.** `scheduler.rs:1993-2010` clears PCI bus-mastering before reclaiming a dead driver's frames - the cure for the `max-carnage` page-table corruption. On aarch64 `pci::clear_bus_master` is an empty stub (`mod.rs:2317`), as are `set_bus_master` and `set_power_d0`. **Why this is LOW and not HIGH:** the DMA arena is allocated **once** via `allocator::alloc_dma_arena`, permanently reserved out of the general pool, and **reused** on every respawn (`task/mod.rs:177-183`, `3811-3824`) - so a still-live controller's stray DMA can only land in `xhci`'s own reserved arena, never in a page table, a kernel struct, or another service. **Residual:** the respawned instance initialises the *same* arena the old controller may still be writing, so a rapid kill/respawn can corrupt transient enumeration or disk data in the new instance. Bounded to `xhci`; not an escalation. | Implement `clear_bus_master` (PCIe config-space command register, which `pcie.rs` already reaches via `cfg_write`) so the kill path's quiesce is real rather than a no-op on this arch. |
+| **SEC-39** | LOW | CONFIRMED | `xhci` (robustness, not authority) | **Two missing clamps in the USB service, neither memory-unsafe.** (a) `OP_READ_BLOCK`/`OP_WRITE_BLOCK` (`msc.rs:754-793`) do not check `lba` against the device's own `d.sectors`; only `read10`/`write10`'s `lba > u32::MAX` guard applies (`msc.rs:436`, `487`). Memory-safe (`count` is hardcoded 1 and every buffer index is compile-time bounded), so this is a capacity-validation gap the layer above must not rely on `xhci` to close. `OP_WRITE_ZEROS` does check it (`msc.rs:794-812`), which is what makes the omission look like an oversight rather than a decision. (b) `main.rs:1135-1144`'s HID config-descriptor walk does not clamp the device-reported `wTotalLength` to the 64 bytes actually fetched - only a hardcoded `i < 200` bounds it - unlike `parse_msc`, which does `.min(buf_len)` (`msc.rs:580-585`). Stays inside the service's own DMA page so there is no OOB, but a lying device can make it parse the *previous* device's stale descriptor bytes as endpoints. | Mirror `parse_msc`'s clamp in the HID walk; bound `lba` by `d.sectors` in the two block ops. |
+| **SEC-40** | LOW | PLAUSIBLE | kernel/capability | **`handle_resource_invoke` validates the cap's generation and then reads the owner without re-checking; the two are not atomic.** The generation check is at `dispatch.rs:1181` and `delegated::owner_of` at `1196`, with no lock spanning them. The delegated band is shared by `fs`, `net-stack` and `resource-server` (`service_hw`, `task/mod.rs:424`), so in principle a concurrent `revoke_owned` + `allocate` on another core inside that window would route a badged message to a **different owning service** than the one whose resource the caller validated. The window is a few instructions with IF=0 on the calling core, I could not demonstrate it, and it does not produce the observed symptom - recorded so it is not re-discovered as new. | Read the owner under the same acquisition that validates the generation, or re-check the generation after the owner lookup and fail with `CapRevoked` on a change. |
+
+### SEC-35 in full: how a read-only file capability performed a write
+
+The observed failure is `fcap` step 5 printing **"FAIL ro cap wrote (escalation!)"** (`shell:8562`).
+Everything below was read, not inferred.
+
+**Both of the obvious suspects are innocent, and were checked first:**
+
+- **`fs` enforces `op <= right` correctly.** `serve_filecap` refuses `FOP_WRITE` unless the badge
+  carries `RIGHT_WRITE` (`services/fs/src/main.rs:1318`), refuses `FOP_READ`/`FOP_STAT` without
+  `RIGHT_READ` (`1301`, `1326`), and resolves `rid -> path` only through its own `open_path` table
+  (`1293`).
+- **The kernel validates before it badges.** `handle_resource_invoke` looks the cap up **with the
+  requested right** (`dispatch.rs:1181`), rejects anything outside the delegated band (`1193`), and
+  only then stamps `msg.badge_right` (`1219`).
+- **The delegated band is ABA-safe.** `allocate` re-registers a reused id at `prev_gen.bump()`
+  (`capability/delegated.rs:114-122`), so a stale cap from an id's previous life can never re-validate.
+  The `[fcapr]` instrumentation's "suspect 2" - a rid minted by a dead `fs` instance resolving in the
+  new one - is closed by design.
+- **A client cannot embed two caps to desync a reply-cap queue.** `build_message` leaves
+  `cap_count = 0` (`dispatch.rs:546-563`) and the only three assignments in the kernel set it to 1
+  (`965`, `1056`, `1221`). The multi-cap desync attack against `fs`'s own `take_pending_cap`
+  (`fs:553`) is therefore not reachable.
+
+**The actual mechanism is in the client's handle bookkeeping.**
+
+1. `handle_recv` / `handle_try_recv` install **every** embedded cap into the receiver's table and push
+   its slot onto a per-task FIFO (`dispatch.rs:330-340`, `383-392`, `443-452`). This happens for every
+   received message, regardless of what the service then does with the message.
+2. `pop_pending_recv_cap` is a **FIFO** - it returns index 0 and shifts down
+   (`scheduler.rs:754-768`).
+3. **Nothing pops the FIFO when a message is discarded**, and the shell discards messages in three
+   places: `drain_stale_fs_replies` (`shell:8226-8230`, up to 8 `try_recv`), `fc_invoke`'s
+   `while ctx.try_recv().is_some() {}` (`shell:8470`), and `fs_take_tagged`'s overtaken-reply discard
+   (`shell:8043-8060`). If any discarded message was an `OP_OPEN` reply, its file cap is now in the
+   shell's table and at the head of the queue, owned by nobody.
+4. **`TASK_PENDING_RECV_CAP_COUNT` is never reset** (`scheduler.rs:231`) - not at task death, not at
+   spawn (the array appears only at its definition and in push/pop). A task that dies with a pending
+   cap leaves its slot's count non-zero, and the next task to land in that slot inherits the queue.
+5. `fc_open` takes the head and **trusts it** (`shell:8444-8458`): it never checks the returned cap's
+   rights against the rights it asked for.
+
+**The scenario, end to end.** `fcap` opens `rw` (`READ|WRITE`, `shell:8530`) and later `ro` (`READ`,
+`shell:8554`). If the FIFO is one entry ahead - because a chaos-induced `fs` restart made an earlier
+reply late and it was drained, or because the shell was killed mid-`fcap` and respawned into the same
+task slot - then step 4's `take_pending_cap` returns **step 1's `READ|WRITE` cap**, and the shell's
+`ro` handle names it. Step 5 then invokes it declaring `RIGHT_WRITE`; the kernel validates a cap that
+genuinely holds `WRITE`, badges the message `WRITE`, and `fs` correctly serves the write. **Every layer
+behaves exactly as specified.** The escalation is a lie told by a handle number.
+
+**Why this is the live suspect rather than a theory.** The (now feature-gated) `[fcapr]`
+instrumentation was built to catch precisely this: `fc_open` logs `asked=` against `holds=`, and its
+own comment says *"if they disagree, the handle names a different cap than the one fs minted, which is
+the identity-confusion suspect rather than a rights-check bug"* (`shell:8448-8456`). And the same class
+was already confirmed and fixed in this code four hours before the deletion commit - `1ecfd98e`
+("stop removing a reply cap the SEND already transferred away"), whose commit message states the
+general rule plainly: *"a remove-by-stale-index can bite ANY request whose reply carries a cap"*.
+SEC-35 is that rule applied to the *insert* side rather than the remove side.
+
+**Ranked hypotheses, for the record:**
+
+1. **Pending-cap FIFO desync (SEC-35)** - CONFIRMED as a code defect, and the only one that reproduces
+   the exact symptom with correct kernel and `fs` behaviour. Sub-cause (b) (no reset across task
+   lives) explains the chaos correlation directly: chaos kills the shell.
+2. **The already-fixed remove-by-stale-index (`1ecfd98e`)** - CONFIRMED, and it produces the same
+   symptom by aliasing two handles onto one slot. Fixed on the reply path; SEC-36 is its residual on
+   the timeout path.
+3. **Cross-service TOCTOU on the owner lookup (SEC-40)** - PLAUSIBLE, extremely narrow, and does not
+   produce this symptom.
+4. **`fs` rights enforcement / delegated-id reuse** - RULED OUT by reading (above).
+
+**Severity judgement.** This is MED, not HIGH, and the reason matters: the shell already held the
+`READ|WRITE` cap, so **no principal gained authority beyond its grant** - the north-star holds. What
+broke is the model's integrity and a guarantee `CLAUDE.md` §22 Test 14 exists to pin ("non-escalation
+at both layers"), plus Commandment III (one truth: the handle number is a derived view of the kernel's
+cap table and it drifted with no reconciliation) and Commandment IX (a client must re-establish
+everything derived from a restarted dependency). It becomes HIGH the moment any service brokers caps
+between principals, because the same desync would hand one principal another's capability.
+
+### Verified sound in this pass (do not re-hunt)
+
+- **`services/xhci` holds no authority it does not need.** Checked against `service_privileges`
+  (`task/mod.rs:450-514`) and `service_hw` (`418-427`), not assumed: no `SPAWN`, no `SERVICE_CONTROL`,
+  no `REBOOT`, no `ACQUIRE_ANY`, no `INTROSPECT`, no `RESOURCE_MINT`, no `NET_DEVICE`, no `USB_DISK`,
+  no `GPIO_DEVICE`, no `SET_CLOCK`, no `CONSOLE_READ`. It holds `CONSOLE_PUSH`, `log`, its own recv
+  endpoint, 16 pages of its controller's BAR and its DMA arena. That is the whole set.
+- **`CONSOLE_PUSH` is genuinely narrow.** Only two push sites exist (`main.rs:203`, `211`, plus the
+  auto-repeat at `3759`). Everything pushed is either the output of `hid::emit_key`/`hid_to_ascii`'s
+  fixed lookup table (`sdk/rust/src/hid.rs:15-138`) or the single out-of-band
+  `CTRL_ALT_DEL_SIGNAL = 0x80` chord byte, which `is_ctrl_alt_del` gates on both modifier bits and the
+  Delete usage (`hid.rs:254-262`). **No raw device-supplied byte reaches the console ring.** SEC-2's
+  residual (a keyboard's keystrokes are commands) is unchanged and remains inherent; SEC-2's *win* now
+  holds on this port, unlike arm32.
+- **`services/xhci` contains no `unsafe`.** Three grep hits, all prose (`main.rs:6`, `1413-1414`). All
+  hardware access goes through the SDK's audited `Mmio`/`Dma` wrappers, satisfying §18.2, and
+  `scripts/unsafe_check.py` does walk `services/**/*.rs`, so a regression would be caught.
+- **Who can reach the block service.** `xhci` does not authenticate senders - it serves any message
+  carrying a reply cap (`main.rs:1385-1456`) - which is the correct capability-model answer: authority
+  is holding the SEND cap. `handle_acquire_send_cap` grants one only to a declared peer
+  (`block-driver`, `task/mod.rs:716`) or an `ACQUIRE_ANY` holder, so the reachable set is the intended
+  one.
+- **A crafted block request cannot overflow the service.** `read10`/`write10` bound `count` by
+  division rather than multiplication to avoid a u32 wrap (`msc.rs:432-436`, `483-487`); `serve_block`
+  length-checks every wire field before indexing (`req.len() < 9`, `< 9 + SECTOR`, `< 17`); the DMA
+  layout is provably non-overlapping (`DISK_BASE` page 288 = scratchpad base page 32 + 256 pages, and
+  `XHCI_DMA_PAGES = 32 + 256 + 4` matches exactly). The gaps are the two clamps in SEC-39, neither of
+  which is a memory-safety issue.
+- **Hub and mass-storage descriptor parsing is bounded.** `parse_msc` clamps `wTotalLength` to the
+  fetched length and breaks on a zero-length descriptor (`msc.rs:580-621`); the hub port walk guards
+  every EP0-ring write against overrunning its page (`main.rs:2136-2236`); the CSW tag check rejects a
+  device answering out of turn (`msc.rs:355-359`).
+
+---
+
 ## Fix log
 
 | Finding | Status | Commit | Notes |
