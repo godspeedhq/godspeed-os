@@ -8443,13 +8443,28 @@ fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(
 /// Open `path` via fs (`OP_OPEN`) and return the **file capability** the reply embeds, or `None`.
 fn fc_open(ctx: &ServiceContext, path: &[u8], rights: u8) -> Option<CapHandle> {
     let r = fs_request(ctx, OP_OPEN, path, &[rights])?;
-    if r.payload_bytes().first() == Some(&FS_OK) { ctx.take_pending_cap() } else { None }
+    if r.payload_bytes().first() == Some(&FS_OK) {
+        let h = ctx.take_pending_cap();
+        // FCAP-RESTART INSTRUMENTATION (temporary). What the shell BELIEVES it just got. Compare the
+        // rights here against the `[fcapr] kernel:` line for the same handle: if they disagree, the
+        // handle names a different cap than the one fs minted, which is the identity-confusion
+        // suspect rather than a rights-check bug.
+        if let Some(hh) = h {
+            ctx.log_fmt(format_args!("[fcapr] shell: opened asked={:#x} handle={} holds={:?}",
+                                     rights, hh.0, ctx.query_cap_rights(hh)));
+        }
+        h
+    } else { None }
 }
 
 /// Invoke a file cap (§7.10): the kernel validates `file` holds `right`, badges the request, and
 /// routes it to fs; fs replies on our endpoint. `None` means the kernel rejected the invocation
 /// (the cap lacks `right` - non-escalation - or is stale/revoked), so no reply comes back.
 fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -> Option<Message> {
+    // FCAP-RESTART INSTRUMENTATION (temporary). The handle + right at the moment of use, so a handle
+    // that changed meaning between open and invoke is visible.
+    ctx.log_fmt(format_args!("[fcapr] shell: invoke handle={} declaring={:#x} holds={:?}",
+                             file.0, right, ctx.query_cap_rights(file)));
     while ctx.try_recv().is_some() {}   // clear any stale late-reply a prior aborted invoke left behind
     let self_grant = ctx.self_grant_handle()?;
     let reply = ctx.derive_cap(self_grant)?;
