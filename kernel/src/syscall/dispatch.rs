@@ -1175,19 +1175,6 @@ fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let file_slot  = (packed & 0xFFF) as usize;
     let reply_slot = ((packed >> 12) & 0xFFF) as usize;
     let right_bits = ((packed >> 24) & 0xFF) as u8;
-    // FCAP INSTRUMENTATION (temporary - remove once the aarch64 fcap failure is closed).
-    //
-    // Four layers were read and each exonerated itself, so this prints what the kernel ACTUALLY
-    // received rather than what the source says it should. Safe to leave in for a diagnostic boot:
-    // ResourceInvoke is used only by the `fcap` self-check, so this cannot become log spam.
-    //
-    // Read it against the SDK line: if `packed` differs, the fault is the syscall transport; if
-    // `packed` matches but `right` is 0, the unpack is wrong; if both are right, the fault is
-    // downstream in badge delivery.
-    crate::log::write_fmt(format_args!(
-        "[fcap] kernel: packed={:#x} file_slot={} reply_slot={} right={:#x}
-",
-        packed, file_slot, reply_slot, right_bits));
     let required   = Rights(right_bits);
 
     // 1. Validate the file cap holds the requested right (generation + rights, global table).

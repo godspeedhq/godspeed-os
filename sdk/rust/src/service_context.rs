@@ -1550,11 +1550,7 @@ impl ServiceContext {
         // rule from arch/arm/CLAUDE.md: on a 32-bit ABI, a syscall argument that does not fit in one
         // register must be narrowed at the wrapper, never assumed to survive.
         let packed = ((right as u64) << 24) | ((reply.0 as u64) << 12) | (file.0 as u64);
-        // FCAP INSTRUMENTATION (temporary). The value as it LEAVES userspace, to compare against the
-        // kernel's "[fcap] kernel:" line. Only `fcap` invokes a delegated cap, so this is not spam.
-        self.log_fmt(format_args!(
-            "[fcap] sdk: packed={:#x} file={} reply={} right={:#x}",
-            packed, file.0, reply.0, right));
+
         let payload = msg.payload_bytes();
         // SAFETY: syscall(31) = ResourceInvoke; packed + payload are user values the kernel
         // validates (cap slots, rights, generation, and the message bounds) before acting.
