@@ -601,7 +601,18 @@ fn hub_port_status(
     *cur += 3 * 0x10;
     mmio.write32(dboff + hub_slot as usize * 4, 1); // ring the hub's EP0 doorbell (DCI 1)
     for _ in 0..8 {
-        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 5_000_000) {
+        // A hub port-status probe that will FAIL should fail fast.
+        //
+        // This ran to 5_000_000 poll iterations, eight times over - and a probe against a port whose
+        // device has been pulled fails EVERY time, every hub poll, on the loop that also polls the
+        // keyboard. So an unplugged stick did not merely stop working, it made typing worse for as
+        // long as it stayed unplugged, which is exactly the "keyboard gets laggy after a while" this
+        // driver kept being reported for.
+        //
+        // 64k iterations is ample for a hub that is going to answer - it answers in the first few -
+        // and cheap for one that is not. The removal is still detected; it just costs a fraction of
+        // the time to conclude.
+        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 65_536) {
             Some((TRB_TRANSFER_EVENT, cc, sid)) if sid == hub_slot => {
                 return if cc == 1 || cc == 13 {
                     Some(dma.read16(DATA_BUF_OFF) & 1 != 0) // wPortStatus bit0 = current connect
@@ -3142,18 +3153,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // the next `drives` then blocked on a device that was no longer there.
                         // Absence is a fact about the hardware, not a consequence of asking.
                         if disk.as_ref().is_some_and(|dk| dk.hub_slot == hub_slot && dk.hub_port == hp) {
-                            // Bracketed: if "probing" prints and "probed" does not, THIS transfer is
-                            // where the driver stops once the device is physically gone - the
-                            // remaining explanation for the keyboard dying with the service otherwise
-                            // healthy. Only while the count is low, so it cannot itself spam.
-                            let noisy = disk_absent_seen < 4;
-                            if noisy { ctx.log_fmt(format_args!("xhci: [diag] probing disk port {}", hp)); }
+                            // (A `[diag] probing/probed` bracket lived here while the stall was being
+                            // located. It was gated on `disk_absent_seen < 4`, which is ZERO whenever
+                            // the disk is healthy - so it logged on every hub poll forever, ~4 serial
+                            // lines a second at roughly a millisecond each, on the same loop that
+                            // polls the keyboard. It became 20% of the serial log and a permanent
+                            // latency tax. Removed once it had answered its question.
+                            //
+                            // The lesson is the same one this driver keeps teaching: a diagnostic on
+                            // a hot path is a feature with a cost, and "only while things are going
+                            // wrong" has to be a condition that is actually FALSE when they are not.
                             let (mut c2, mut p2) = (hub_cur[owner], hub_pcs[owner]);
                             let st = hub_port_status(
                                 &dma, &mmio, dboff, ir0, hub_slot, hub_dev, hp,
                                 &mut c2, &mut p2, &mut ev_idx, &mut ev_cycle, &mut eaten,
                             );
-                            if noisy { ctx.log_fmt(format_args!("xhci: [diag] probed disk port {} -> {:?}", hp, st)); }
                             hub_cur[owner] = c2;
                             hub_pcs[owner] = p2;
                             // Only a definite `Some(false)` counts. `None` is a FAILED probe -
