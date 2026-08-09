@@ -28,7 +28,7 @@ use godspeed_sdk::ServiceContext;
 mod ahci;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 mod usbdisk;
-#[cfg(feature = "usb-via-xhci")]
+#[cfg(not(target_arch = "arm"))]
 mod xhciblk;
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
@@ -77,7 +77,7 @@ fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { ahci::run(ct
 fn backend_run(ctx: &ServiceContext) -> ! {
     // Where the sector count comes from is the same build-time choice usbdisk.rs documents: the
     // in-kernel stack by syscall, or the `xhci` service by IPC. No probe, no fallback.
-    #[cfg(not(feature = "usb-via-xhci"))]
+    #[cfg(target_arch = "arm")]
     let sectors = ctx.usb_disk_sectors();
     // ONE quick question at startup, not a 20 s wait for an answer we no longer use.
     //
@@ -94,7 +94,7 @@ fn backend_run(ctx: &ServiceContext) -> ! {
     // first request, through the same self-heal that already recovers a stick plugged in after boot -
     // hardware-proven across several plug/unplug cycles. Trading a guaranteed 20 s stall for a
     // recovery path that is exercised constantly is the right way round.
-    #[cfg(feature = "usb-via-xhci")]
+    #[cfg(not(target_arch = "arm"))]
     let sectors = xhciblk::sectors_now(&ctx);
     if sectors == 0 {
         ctx.log("block-driver: no USB storage stick - NO disk (the SD card is the boot medium and is never written)");

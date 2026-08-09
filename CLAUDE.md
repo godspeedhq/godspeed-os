@@ -463,6 +463,29 @@ official, not the runtime behaviour.
 > type `reboot` - the residual named just above. Scope: the chord is handled at the shell prompt; while
 > a full-screen app owns the console the shell is not reading, so quit it first.
 
+> **Amendment 2026-08-09 (Pi 4 / AArch64): the USB stack is OUT of the kernel, and the in-kernel
+> driver is DELETED.** The amendment below records that on ARM the USB drivers are in-kernel TCB
+> members "by construction", and calls the userspace split "future work awaiting device-IRQ-to-userspace
+> routing". On **AArch64 (Raspberry Pi 4) that work is done**: `kernel/src/arch/aarch64/xhci.rs` (2742
+> lines of ring-0 code parsing descriptors supplied by whatever was plugged in) no longer exists. The
+> `xhci` SERVICE drives the controller through an MMIO capability and a DMA arena granted at spawn,
+> reaches the console through `CONSOLE_PUSH`, and serves storage over the block IPC protocol that
+> `block-driver` already spoke. The kernel's entire remaining involvement with USB is to establish that
+> the controller is present and reachable and to say so.
+>
+> This was a **feature flag** first (`xhci-userspace` / `usb-via-xhci`) so both drivers could exist
+> while the service was proven on hardware. The flags are now deleted too: a flag that selects between
+> a compliant and a non-compliant kernel leaves the violation one build away, and it was a genuine
+> footgun (it had to reach three crates; setting some of them gave two drivers on one controller, or
+> none, with every half booting fine alone). **There is no build of AArch64 GodspeedOS in which the
+> kernel drives USB.** Commandment I is closed on this port, not merely satisfiable.
+>
+> **ARM32 (Pi 2) is unchanged and the amendment below still governs it**: no PCIe and no
+> device-IRQ-to-userspace routing, so its DWC2 stack remains in the kernel and remains a TCB member.
+> The two ports now differ in exactly this, and the difference is recorded rather than blurred.
+> Verified: chaos max-carnage 100 rounds, selfcheck 349, hot-plug of keyboard and mass storage in both
+> directions, all on the userspace driver.
+
 > **Amendment 2026-07-23 (SEC-29/SEC-30): on the ARM32 (Raspberry Pi 2) port the USB drivers are
 > in-kernel TCB members - a machine/arch-dependent posture, the ARM analog of the no-IOMMU case above,
 > and larger.** The amendments above concern *userspace* USB drivers (`xhci`/`ehci`) confined - or not -

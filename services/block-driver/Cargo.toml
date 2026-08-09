@@ -18,8 +18,6 @@ io-error-test = []
 # and this one points block-driver at that service. `scripts/pi4_build.py --xhci-userspace` sets all
 # three, which is the only supported way to turn it on: setting a subset gives you two drivers on one
 # controller, or a block-driver talking to a service that is not there - and both halves build and
-# boot perfectly well on their own, so there is no diagnostic to catch it.
-usb-via-xhci = []
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }

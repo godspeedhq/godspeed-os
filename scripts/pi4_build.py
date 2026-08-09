@@ -26,11 +26,12 @@ accidentally produce a non-Pi image:
 
     python scripts/pi4_build.py --features pi4-sched-demo
 
-`--xhci-userspace` is separate from `--features` because it has to reach TWO
+(The former `--xhci-userspace` flag is gone: the in-kernel USB driver was deleted, so the
+service is the only driver and there is nothing to switch. It used to have to reach TWO
 crates: the kernel (stop driving the VL805) and the `supervisor` (start spawning
 the `xhci` service that drives it instead). See where it is handled below.
 
-usage:  python scripts/pi4_build.py [--debug] [--features a,b] [--xhci-userspace]
+usage:  python scripts/pi4_build.py [--debug] [--features a,b]
 """
 import subprocess, sys, os, pathlib, re
 
@@ -80,7 +81,7 @@ PI4_SERVICES = [
     # boot reported `LoadFailed(TooSmall)`.
     "nic-driver", "net-stack",
     # The userspace USB host-controller driver for the VL805. Built on EVERY invocation, not only
-    # under --xhci-userspace, for the reason `kernel/build.rs` gives at its own list: an unspawned ELF
+    # for the reason `kernel/build.rs` gives at its own list: an unspawned ELF
     # in the image costs bytes, while a spawned service the kernel embedded as a placeholder fails
     # with `LoadFailed(TooSmall)` - a diagnostic that points at the binary rather than at the list.
     "xhci",
@@ -101,42 +102,27 @@ if "--features" in sys.argv:
         sys.exit("--features needs a comma-separated list")
     FEATURES = "pi4,pi4-smp," + sys.argv[i + 1]
 
-# --xhci-userspace: take the USB stack OUT of the kernel and run it in the `xhci` service.
+# USB lives in the `xhci` SERVICE. There is no in-kernel USB driver on aarch64 any more - it was
+# deleted, along with the feature flags that used to choose between them, so there is nothing here to
+# set and nothing to forget to set. (The old footgun: the flag had to reach the kernel, the supervisor
+# AND block-driver, and setting only some of them gave you two drivers fighting over one controller,
+# or none, with both halves booting fine on their own.)
 #
-# The feature has the same name in two crates and BOTH have to get it. The kernel's copy stops the
-# kernel from driving the VL805 (and publishes the BAR its PCIe scan found, so the spawn path can hand
-# it over); the supervisor's copy makes it spawn the service that drives it instead. Set only one and
-# you get either two drivers fighting over one host controller or no driver at all - a footgun with no
-# diagnostic, because both halves build and boot perfectly well on their own. That is exactly why it
-# is one flag here rather than two features to remember, and why it is not left to `--features` (which
-# reaches only the kernel).
-#
-# It reaches THREE crates, not two: `block-driver` also has to be pointed at the service (its
-# `usb-via-xhci` feature) or it will ask a kernel that is no longer driving the controller.
-#
-# It NO LONGER costs USB mass storage. The `xhci` service used to be HID-only, so nothing implemented
-# Bulk-Only Transport and `block-driver` reported no disk; the service now speaks BOT + SCSI and
-# serves the block protocol itself (`services/xhci/src/msc.rs`). QEMU-proven on x86 (`raspi4b`
-# emulates no PCIe, so the Pi 4 cannot exercise xhci in emulation at all); the block-driver -> xhci
-# hop is HARDWARE-UNPROVEN, because nothing in emulation can carry it.
-XHCI_USERSPACE = "--xhci-userspace" in sys.argv
+# arm32 (Pi 2) is unaffected: no PCIe and no device-IRQ routing to userspace, so its USB stack is
+# still in the kernel - see arch/arm/CLAUDE.md.
 EL0_FAULT_TEST = "--el0-fault-test" in sys.argv
-if XHCI_USERSPACE:
-    FEATURES += ",xhci-userspace"
 
 rel = ["--release"] if PROFILE == "release" else []
 
 # 1. The services first - the kernel embeds their ELFs, so a stale service is baked into the image.
 for svc in PI4_SERVICES:
     feats = ["--features", "bare-metal"] if svc == "supervisor" else []
-    if svc == "supervisor" and XHCI_USERSPACE:
-        feats = ["--features", "bare-metal,xhci-userspace"]
+    if svc == "supervisor":
+        feats = ["--features", "bare-metal"]
     # The THIRD crate the one switch has to reach. block-driver must be told to fetch its sectors
     # from the `xhci` SERVICE over IPC instead of from the in-kernel stack by syscall; without it the
     # service drives the disk and block-driver asks a kernel that is no longer driving anything, so
     # storage silently disappears with every individual piece looking correct.
-    if svc == "block-driver" and XHCI_USERSPACE:
-        feats = ["--features", "usb-via-xhci"]
     # Prove the EL0 fault-recovery path actually fires (see mem-pressure's feature doc). Test builds
     # only; it kills mem-pressure on every boot by design.
     if svc == "net-stack" and EL0_FAULT_TEST:

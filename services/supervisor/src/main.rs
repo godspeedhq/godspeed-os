@@ -489,7 +489,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // is right for a thing that should have worked (invariant 12); a permanent error for a thing that
     // is not part of this architecture is just noise that trains the reader to ignore the log.
     //
-    // **aarch64 is off that list under `xhci-userspace`, which is this gate coming off.** The Pi 4's
+    // **aarch64 is off that list permanently - the in-kernel driver is deleted.** The Pi 4's
     // VL805 is a PCIe endpoint the kernel already discovers and BAR-assigns; with the feature the
     // kernel publishes it in `pci::XHCI_*` and stops driving it, and the SAME service x86 has always
     // spawned takes over - same binary, same CONSOLE_PUSH capability, same MMIO/DMA grant path. That
@@ -499,8 +499,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //
     // Kept as a supervisor feature rather than an unconditional aarch64 spawn because the KERNEL side
     // is a feature too. Spawn the service without it and two drivers own one controller.
-    #[cfg(not(any(target_arch = "arm",
-                  all(target_arch = "aarch64", not(feature = "xhci-userspace")))))]
+    // aarch64 spawns it unconditionally now: the in-kernel driver is DELETED, so this service is the
+    // only thing that can drive the controller. arm32 (Pi 2) is still excluded - it has no PCIe and
+    // no device-IRQ routing to userspace, so its USB stack remains in the kernel (arch/arm/CLAUDE.md).
+    #[cfg(not(target_arch = "arm"))]
     spawn_mapped(&ctx, &mut name_map, "xhci", 0xFFFF);
 
     // ehci: USB 2.0 host-controller driver (§12) for the back ports. Same builds

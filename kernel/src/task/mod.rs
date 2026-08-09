@@ -709,11 +709,12 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // message, while block-driver burned its whole 20 s wait failing to address it. Every
             // layer looked healthy in isolation, because the missing piece was the EDGE between them.
             //
-            // Gated on the KERNEL's feature, not the service's: this table is the kernel's, and only
-            // the kernel's build knows whether it handed USB over. Without it the list stays empty.
-            #[cfg(feature = "xhci-userspace")]
+            // block-driver reaches the disk THROUGH the xhci service on aarch64, so it needs a SEND
+            // cap to it. On arm32 the USB stack is still in the kernel (no PCIe, no device-IRQ
+            // routing to userspace yet), so there is no such peer there - see `arch/arm/CLAUDE.md`.
+            #[cfg(target_arch = "aarch64")]
             send_peers:        &["xhci"],
-            #[cfg(not(feature = "xhci-userspace"))]
+            #[cfg(not(target_arch = "aarch64"))]
             send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
             send_peers_grant:  false,
             // ARM pins this to core 0, and it is NOT a preference there - it is a requirement. The

@@ -131,8 +131,6 @@ pi4-smp = []
 # Pi 4 and the service one is not, and a working machine does not get replaced by an unproven one on
 # the strength of an argument. (GENET went through the same staging and is now the only path.) Build
 # both sides with it
-# (`pi4_build.py --xhci-userspace`), which is the only supported way to turn it on.
-xhci-userspace = []
 # Run the minimal ARM logger spawn at boot (arch/arm/spawn.rs). Off by default: the spawn currently
 # reaches PL0 and issues real syscalls, but the kernel's cap-table spinlock (LDREX/STREX) does not yet
 # work under the service's dual-mapped address space, so the boot would block. Gated so the default

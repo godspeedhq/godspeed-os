@@ -52,8 +52,6 @@ pub mod smp_boot;
 #[cfg(feature = "pi4")]
 pub mod video;
 #[cfg(feature = "pi4")]
-pub mod xhci;
-#[cfg(feature = "pi4")]
 pub mod uaccess;
 #[cfg(feature = "pi4")]
 pub mod usermode;
@@ -940,22 +938,17 @@ extern "C" fn boot_high() -> ! {
             );
             pci::XHCI_FOUND.store(true, core::sync::atomic::Ordering::Release);
 
-            // Who DRIVES the controller from here is a build-time choice, and the default is still
-            // this kernel - nothing about a working machine changes without the feature. See
-            // `xhci-userspace` in `kernel/Cargo.toml`.
-            #[cfg(feature = "xhci-userspace")]
+            // The kernel does not drive USB. There is no longer a build in which it does.
             {
-                // Commandment I: a USB stack is not the kernel's business (§4.4). With this feature
-                // the kernel does exactly two things about USB - it establishes that the controller
-                // is there and reachable, and it says so - and the `xhci` SERVICE does the rest
-                // through the BAR window and DMA arena the spawn path grants it.
+                // Commandment I: a USB stack is not the kernel's business (§4.4). The kernel does
+                // exactly two things about USB - it establishes that the controller is there and
+                // reachable, and it says so - and the `xhci` SERVICE does the rest through the BAR
+                // window and DMA arena the spawn path grants it.
                 let _ = &dev;
                 put_str(b"xhci: controller present - left to the xhci SERVICE \
                           (kernel drives no USB, Commandment I)\r\n");
                 put_str(b"xhci: the service drives HID and mass storage; block-driver reaches the disk through it\r\n");
             }
-            #[cfg(not(feature = "xhci-userspace"))]
-            xhci::init(dev.bar0, dev.bar0_len);
         }
         let aborts = exceptions::end_probe();
         if aborts > 0 {
@@ -1272,7 +1265,7 @@ pub fn emmc_base_clock_hz() -> u32 { 0 }
 /// two boot cards to RAW before the SD backend was withdrawn - and this board has the same topology,
 /// so it inherits the same rule rather than rediscovering it.
 ///
-/// **With `xhci-userspace` there is no USB disk at all, and that is reported rather than hidden.**
+/// **The kernel drives no USB at all, so there is no in-kernel disk: reported, not hidden.**
 /// These four entry points exist only because the USB stack was in the kernel; hand the controller to
 /// the `xhci` SERVICE and the kernel has no way to reach a mass-storage device - nor should it. The
 /// service is HID-only (it releases the slot of anything that is not a keyboard, mouse or hub), so
@@ -1283,23 +1276,19 @@ pub fn emmc_base_clock_hz() -> u32 { 0 }
 /// into a kernel that no longer has a driver behind it.
 #[cfg(feature = "pi4")]
 pub fn usb_disk_sectors() -> u64 {
-    #[cfg(feature = "xhci-userspace")] { 0 }
-    #[cfg(not(feature = "xhci-userspace"))] { xhci::disk_sectors() }
+    0
 }
 #[cfg(feature = "pi4")]
 pub fn usb_disk_read(lba: u64, dst: &mut [u8]) -> bool {
-    #[cfg(feature = "xhci-userspace")] { let _ = (lba, dst); false }
-    #[cfg(not(feature = "xhci-userspace"))] { xhci::disk_read(lba, dst) }
+    let _ = (lba, dst); false
 }
 #[cfg(feature = "pi4")]
 pub fn usb_disk_write(lba: u64, src: &[u8]) -> bool {
-    #[cfg(feature = "xhci-userspace")] { let _ = (lba, src); false }
-    #[cfg(not(feature = "xhci-userspace"))] { xhci::disk_write(lba, src) }
+    let _ = (lba, src); false
 }
 #[cfg(feature = "pi4")]
 pub fn usb_disk_flush() -> bool {
-    #[cfg(feature = "xhci-userspace")] { false }
-    #[cfg(not(feature = "xhci-userspace"))] { xhci::disk_flush() }
+    false
 }
 
 #[cfg(not(feature = "pi4"))]
@@ -1353,8 +1342,7 @@ pub fn fb_commit(
 
 #[cfg(feature = "pi4")]
 pub fn usb_disk_busy() -> bool {
-    #[cfg(feature = "xhci-userspace")] { false }
-    #[cfg(not(feature = "xhci-userspace"))] { xhci::disk_busy() }
+    false
 }
 #[cfg(not(feature = "pi4"))]
 pub fn usb_disk_busy() -> bool { false }
@@ -1363,8 +1351,7 @@ pub fn usb_disk_busy() -> bool { false }
 /// moot; the read/write primitives already answer false.
 #[cfg(feature = "pi4")]
 pub fn usb_disk_absent() -> bool {
-    #[cfg(feature = "xhci-userspace")] { true }
-    #[cfg(not(feature = "xhci-userspace"))] { xhci::disk_sectors() == 0 }
+    true
 }
 #[cfg(not(feature = "pi4"))]
 pub fn usb_disk_absent() -> bool { true }
@@ -1748,12 +1735,10 @@ pub fn uart_rx_poll() {
     // The USB keyboard shares this tick. It is polled rather than interrupt-driven for the reason in
     // `xhci`'s module header, and it no-ops in a few instructions when no keyboard was found.
     //
-    // With `xhci-userspace` there is nothing to poll HERE: the driver is a task, and a task polls
-    // itself on its own schedule (`recv_timeout`) without borrowing the tick. Keystrokes still land
-    // in this same ring - the service pushes them through the CONSOLE_PUSH capability, which is
-    // exactly the authority this in-tick call took ambiently by being kernel code.
-    #[cfg(not(feature = "xhci-userspace"))]
-    xhci::poll();
+    // Nothing to poll HERE: the driver is a task, and a task polls itself on its own schedule
+    // (`recv_timeout`) without borrowing the tick. Keystrokes still land in this same ring - the
+    // service pushes them through the CONSOLE_PUSH capability, which is exactly the authority the
+    // in-tick call this replaced took ambiently by being kernel code.
 }
 /// Called directly by a blocked console reader: a timer ISR starved under load would otherwise leave a
 /// byte stranded in the FIFO with a reader asleep waiting for it.
@@ -2208,10 +2193,8 @@ pub mod interrupts {
         // Exclusion is `USB_CLAIM`, not masking - see its comment. Rate-limited to one visit a second
         // inside, so an idle machine spends nothing here.
         //
-        // With `xhci-userspace` this is gone too: hot-plug is the driver's own outer `'reenum` loop,
-        // which is preemptible because it is a task rather than the idle path of a core.
-        #[cfg(all(feature = "pi4", not(feature = "xhci-userspace")))]
-        super::xhci::hotplug_poll();
+        // Hot-plug is the driver's own outer `'reenum` loop, which is preemptible because it is a
+        // task rather than the idle path of a core. Nothing to poll here.
         // SAFETY: WFI at EL1 is always valid. It returns on any pending interrupt (or spuriously),
         // so every caller must re-check its condition rather than assume a wake means progress.
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
