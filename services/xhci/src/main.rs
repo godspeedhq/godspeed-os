@@ -15,6 +15,9 @@ use godspeed_sdk::{Dma, Mmio, ServiceContext};
 /// kept a USB stack in the kernel.
 mod msc;
 
+/// Shadow topology model - observation only, see docs/xhci-topology.md.
+mod topo;
+
 // Capability registers (BAR + 0).
 const CAP_CAPLEN_VERSION: usize = 0x00;
 const CAP_HCSPARAMS1: usize = 0x04;
@@ -2361,6 +2364,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // not of the pass that happened to look. Reset only when the port answers "present" (below) or a
     // disk is bound.
     let mut disk_absent_seen: u32 = 0;
+    // Shadow model (docs/xhci-topology.md step 1). Fed from observations the driver already makes;
+    // it decides nothing. Above the loop because a topology is a fact about the MACHINE, not about
+    // the pass that happened to look - the same scope error that stopped the absence counter ever
+    // reaching its threshold.
+    let mut topo = topo::Topo::new();
     'reenum: loop {
         // Stop + reset the controller. The Wyse `chaos max-carnage` all-core freeze lands
         // DETERMINISTICALLY in this sequence (the log dies right after the "v..." line above), so bracket
@@ -2469,6 +2477,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // off the EHCI controller, which this driver does not drive.
         for p in 1..=max_ports {
             let psc = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10);
+            topo.note(&ctx, 0, p, Some(psc & PORT_CCS != 0));
             ctx.log_fmt(format_args!(
                 "xhci: port census {}/{}: PORTSC={:#010x} connected={} enabled={} speed={}",
                 p,
@@ -3098,6 +3107,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         &mut ev_cycle,
                         &mut eaten,
                     );
+                    topo.note(&ctx, devs[d].hub_slot, devs[d].hub_port, st);
                     hub_cur[owner] = cur;
                     hub_pcs[owner] = pcs;
                     // Log the first probe of the session, and an inconclusive None at most ONCE per device
@@ -3177,6 +3187,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 &dma, &mmio, dboff, ir0, hub_slot, hub_dev, hp,
                                 &mut c2, &mut p2, &mut ev_idx, &mut ev_cycle, &mut eaten,
                             );
+                            topo.note(&ctx, hub_slot, hp, st);
                             hub_cur[owner] = c2;
                             hub_pcs[owner] = p2;
                             // Only a definite `Some(false)` counts. `None` is a FAILED probe -
@@ -3273,6 +3284,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             &mut ev_cycle,
                             &mut eaten,
                         );
+                        topo.note(&ctx, hub_slot, hp, st);
                         hub_cur[owner] = cur;
                         hub_pcs[owner] = pcs;
                         // Same rule as the disk-hub scan: connected is not newly-arrived. Without
@@ -3320,6 +3332,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             &dma, &mmio, dboff, ir0, hs, hd, hp,
                             &mut cur, &mut pcs, &mut ev_idx, &mut ev_cycle, &mut eaten,
                         );
+                        topo.note(&ctx, hs, hp, st);
                         match st {
                             // Connected AND not already tried: a real arrival.
                             Some(true) if hp < 64 && hub_tried & (1u64 << hp) == 0 => {
@@ -3364,6 +3377,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // that was NOT connected at poll start becoming connected is a fresh
             // plug - break and re-enumerate to bind it alongside the existing
             // device(s). Tracks port leaves so a re-plug into the same port counts.
+            // Root ports are read here every poll pass, so the model sees them continuously - the
+            // enumeration census alone runs once per PASS and could never accumulate the two
+            // observations a transition needs.
+            //
+            // Deliberately outside the `ndev < MAX_HID` guard below: that guard exists to stop
+            // BINDING more devices than there are slots, and has nothing to do with whether a port
+            // should be OBSERVED. Gating observation on a binding condition is precisely the mistake
+            // that made the disk's port unobservable when no disk was bound.
+            for p in 1..=max_ports {
+                let c = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0;
+                topo.note(&ctx, 0, p, Some(c));
+            }
             if ndev < MAX_HID {
                 for p in 1..=max_ports {
                     let c =
