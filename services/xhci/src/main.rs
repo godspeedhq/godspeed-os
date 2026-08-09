@@ -3319,29 +3319,37 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                         "xhci: disk port {} reports DISCONNECTED ({}/2)", hp, disk_absent_seen));
                                     disk_absent_seen >= 2
                                 }
-                                // TWENTY consecutive failures, not three.
+                                // A FAILED QUESTION IS NOT AN ANSWER OF ABSENT. Ever.
                                 //
-                                // Three was far too weak. This probe is a control transfer sharing
-                                // rings with HID polling and block I/O, so it fails transiently
-                                // whenever the controller is busy - and a busy moment then read as a
-                                // removal. The Pi 4 logged 72 connect/disconnect pairs for a stick
-                                // that never moved, each false drop forcing a re-enumeration that
-                                // rebinds the keyboard. The reported symptom was an unpredictable
-                                // keyboard; the cause was a disk that was never gone.
+                                // This counted unreachable probes and declared the disk removed at
+                                // 20 of them. It was 3 before that, and raising it only moved the
+                                // threshold - the hardware then logged phantom disconnect/connect
+                                // pairs every 30 seconds for a stick nobody touched, each one forcing
+                                // a controller reset and a re-enumeration that rebinds the KEYBOARD.
                                 //
-                                // At the hub poll interval this is ~10 s of UNBROKEN failure. A real
-                                // unplug stays failed forever and still gets noticed; contention
-                                // does not last ten seconds. I called a failed probe "weaker
-                                // evidence" when I added it and then set the bar as though it were
-                                // not - the threshold now matches the reasoning.
+                                // The rule was wrong in kind, not in degree. `None` means WE COULD
+                                // NOT ASK - the probe shares rings with HID polling and block I/O and
+                                // times out when the controller is busy. That says something about
+                                // our timing, nothing about the device. `topo.rs` already states this
+                                // exact principle for the same reason, and this code contradicted it.
+                                //
+                                // A REAL removal answers: the hub is still there and reports connect
+                                // = 0, which is `Some(false)` and has its own 2-strike rule. Every
+                                // genuine unplug in the log took that path ("reports disconnected");
+                                // every phantom took this one ("unreachable"). So refusing to
+                                // conclude here loses no removal detection at all.
+                                //
+                                // Still LOUD, once, so a persistent inability to ask is visible
+                                // rather than silently ignored (§26.7) - it just no longer invents a
+                                // removal to explain itself.
                                 None => {
                                     disk_absent_seen = disk_absent_seen.saturating_add(1);
-                                    // Only while it is climbing - silent once the disk is gone and
-                                    // dropped, so this cannot become the permanent spam the last
-                                    // diagnostic did.
-                                    ctx.log_fmt(format_args!(
-                                        "xhci: disk port {} probe UNREACHABLE ({}/20)", hp, disk_absent_seen));
-                                    disk_absent_seen >= 20
+                                    if disk_absent_seen == 20 {
+                                        ctx.log_fmt(format_args!(
+                                            "xhci: disk port {} unreachable 20x - NOT concluding removal (a failed probe is not an answer); check probe timing",
+                                            hp));
+                                    }
+                                    false
                                 }
                                 Some(true) => {
                                     if disk_absent_seen != 0 {
