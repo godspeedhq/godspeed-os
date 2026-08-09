@@ -2826,6 +2826,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
         'poll: loop {
+            // Observe every root port FIRST, before anything in this pass can break out of the loop.
+            //
+            // The first placement was near the end, after four `break 'poll` sites, so a pass that
+            // exited early never recorded anything - and the model stayed silent. Observation belongs
+            // at the top for the same reason it is not gated on binding: it must happen on every
+            // pass, unconditionally, or the model is describing the passes that finished rather than
+            // the machine.
+            for rp in 1..=max_ports {
+                let c = mmio.read32(op + OP_PORTSC_BASE + (rp as usize - 1) * 0x10) & PORT_CCS != 0;
+                topo.note(&ctx, 0, rp, Some(c));
+            }
             // (Re-)arm each device's interrupt ring as needed, BEFORE blocking - so a fresh
             // HID report can post a transfer event (→ MSI-X) that wakes us.
             for d in 0..ndev {
@@ -3377,18 +3388,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // that was NOT connected at poll start becoming connected is a fresh
             // plug - break and re-enumerate to bind it alongside the existing
             // device(s). Tracks port leaves so a re-plug into the same port counts.
-            // Root ports are read here every poll pass, so the model sees them continuously - the
-            // enumeration census alone runs once per PASS and could never accumulate the two
-            // observations a transition needs.
-            //
-            // Deliberately outside the `ndev < MAX_HID` guard below: that guard exists to stop
-            // BINDING more devices than there are slots, and has nothing to do with whether a port
-            // should be OBSERVED. Gating observation on a binding condition is precisely the mistake
-            // that made the disk's port unobservable when no disk was bound.
-            for p in 1..=max_ports {
-                let c = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0;
-                topo.note(&ctx, 0, p, Some(c));
-            }
             if ndev < MAX_HID {
                 for p in 1..=max_ports {
                     let c =
