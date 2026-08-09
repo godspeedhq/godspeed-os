@@ -280,7 +280,23 @@ const HUB_RESCAN_MS: u64 = 1_500;
 /// A hub answers GET_STATUS in about a millisecond. This is the bound for one that does not, and it
 /// is deliberately small: the probe runs per port per pass, so this is a direct input-latency cost
 /// whenever a hub is unresponsive.
-const PROBE_ANSWER_MS: u64 = 5;
+const PROBE_ANSWER_MS: u64 = 50;
+
+// 50, not 5, and the reason is scheduling rather than the device.
+//
+// 5 ms was chosen while this driver was IN THE KERNEL, where the only thing between posting a
+// transfer and seeing its completion was the controller. As a userspace SERVICE it runs on a 10 ms
+// quantum (§9.1), so a 5 ms wall-clock deadline can elapse ENTIRELY while the service is descheduled.
+// It was measuring our scheduling, not the hardware: 832 failed probes in one idle session.
+//
+// That is why this matters beyond noise. A failed probe no longer invents a removal (correct), so a
+// probe that cannot complete makes a REAL removal invisible - the reported "unplugged the stick, no
+// INFO; unplugged the keyboard, no INFO, and it did not rebind". The absence rule was fixed; the
+// thing it depends on was still broken.
+//
+// 50 ms is five quanta, so the answer survives being preempted a few times, and it is still a real
+// duration that means the same on any board. The cost is bounded and paid only when a hub does not
+// answer, since a healthy probe returns as soon as the event lands.
 
 /// Idle-wait pacing for the paths that have NO device to service (`idle`, `wait_for_port`, the hub
 /// re-walk). These used `yield_cpu`, which does not sleep - it pegs the core at ~100% forever, which
