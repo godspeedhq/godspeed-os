@@ -1294,13 +1294,10 @@ fn serve_if_block(
     // errors forever against a device that is no longer there: an unplugged stick left the disk
     // "bound", every request paying the full transfer timeout before failing, which reads as the
     // whole machine hanging rather than as a removed disk.
-    // OP_CAPACITY counts too, because it now ASKS the device (a TEST UNIT READY) rather than quoting
-    // a bind-time snapshot. Its failure is therefore the same news a failed read is - the device
-    // stopped answering - and it must drop the disk and re-scan, or the next `drives` would ask a
-    // device that is gone all over again and report the stale size once more.
+    // OP_CAPACITY is NOT one: it does no device I/O (see `serve_block`), so it cannot report that
+    // the device stopped answering, and treating its failure that way dropped a live disk.
     let was_data_op = matches!(msg.payload_bytes().first(),
-        Some(&msc::OP_READ_BLOCK) | Some(&msc::OP_WRITE_BLOCK) | Some(&msc::OP_WRITE_ZEROS)
-        | Some(&msc::OP_CAPACITY));
+        Some(&msc::OP_READ_BLOCK) | Some(&msc::OP_WRITE_BLOCK) | Some(&msc::OP_WRITE_ZEROS));
     // ... AND only while a disk is still bound.
     //
     // Once it has been dropped, `serve_block` answers STATUS_ERR for the honest reason "no disk" -

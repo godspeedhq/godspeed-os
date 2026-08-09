@@ -718,32 +718,23 @@ pub fn serve_block(
             // hot path - a capacity is asked at mount and by `drives`. A device that does not answer
             // it is reported as an error, and the caller in `main.rs` drops the disk and re-scans,
             // exactly as a failed read already does.
-            // A SINGLE "not ready" is not an answer - it must fail every attempt.
+            // Answered from WHETHER A DISK IS BOUND - no device round trip.
             //
-            // The first version of this asked once and reported absence on one no. That took a
-            // healthy plugged-in stick and reported "(no drive(s) attached)" until fs and
-            // block-driver were restarted, which is worse than the stale size it replaced: a wrong
-            // absence hides a disk that is RIGHT THERE, and the drop-and-re-scan then kept it hidden.
+            // Two earlier versions of this were wrong in opposite directions. The first quoted
+            // `d.sectors` unconditionally, so an unplugged stick still reported 15267 MiB. The second
+            // asked the device with TEST UNIT READY, which made this a slow operation inside a
+            // request whose caller has a reply DEADLINE: fs re-mounted GSFS successfully and then
+            // dropped the mount 75 ms later because the capacity reply had not come back, and
+            // `sectors_now` reports a missing reply as 0 - the same "no answer is not the answer
+            // zero" confusion this port keeps making.
             //
-            // The bind path 30 lines away already knew this and says so: a stick is "often still
-            // spinning up its controller and answers NOT READY until it is", so it allows 16
-            // attempts. I asked once anyway.
+            // Reaching `d` at all already means a disk is bound, and that binding IS the reconciled
+            // truth now: removal is detected by the port probes and drops it (`disk = None`), which
+            // is what puts "device REMOVED" on screen. With no disk bound this function returned
+            // STATUS_ERR long before this match, so absence needs no probe here either.
             //
-            // 4 here, not 16: bind is a cold start, this is a device that has already been answering.
-            // Each attempt against a PRESENT device returns immediately, so the retries cost nothing
-            // in the common case, and only a device that fails all four is called gone.
-            let mut ready = false;
-            for _ in 0..4 {
-                if test_unit_ready(ctx, dma, mmio, dboff, ir0, d, ev_idx, ev_cycle, eaten) {
-                    ready = true;
-                    break;
-                }
-            }
-            if !ready {
-                ctx.log("xhci: the disk failed 4 ready checks - reporting no capacity (unplugged?)");
-                out[0] = STATUS_ERR;
-                return 1;
-            }
+            // So the honest answer is the fast one, and the window where it can be stale is the
+            // window before removal is noticed - which is bounded by the probe interval and visible.
             out[0] = STATUS_OK;
             out[1..9].copy_from_slice(&d.sectors.to_le_bytes());
             9
