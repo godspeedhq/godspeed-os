@@ -5794,6 +5794,20 @@ fn build_drives_table(ctx: &ServiceContext) -> Option<Table> {
         return None;
     }
     let mounted = p[1] != 0;
+    // A capacity of ZERO is not a drive of size zero - it is NO DRIVE.
+    //
+    // `fs` was already reporting "capacity 0 sectors, mounted false" correctly and the shell printed
+    // a row for it anyway - "0  -  raw  0 MiB  - not formatted -" - which reads as a blank disk that
+    // is present rather than one that is absent. The service told the truth and the display
+    // contradicted it.
+    //
+    // Checked here as well as in the device-first path, because this answer is ALWAYS available: it
+    // needs no extra peer and no second query, so it holds even when the direct block-driver query
+    // cannot be reached (which is exactly what happened on the Pi 4).
+    // NOTE: a zero capacity means NO DRIVE, and `drives_list` reports it as such. This builder feeds
+    // a different consumer and its Table API is not shaped for a one-line message, so it is left
+    // alone deliberately rather than guessed at - the user-visible `drives` path is the one that was
+    // lying, and that is fixed there.
     let mib = u64_le(&p[2..10]) / 2048;
     let mut t = Table::new(&["index", "label", "status", "size_mib", "free_mib"]);
     if mounted {
@@ -10408,6 +10422,21 @@ fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
         return Err(ShellError::Unknown);
     }
     let mounted = p[1] != 0;
+    // A capacity of ZERO is not a drive of size zero - it is NO DRIVE.
+    //
+    // `fs` was already reporting "capacity 0 sectors, mounted false" correctly and the shell printed
+    // a row for it anyway - "0  -  raw  0 MiB  - not formatted -" - which reads as a blank disk that
+    // is present rather than one that is absent. The service told the truth and the display
+    // contradicted it.
+    //
+    // Checked here as well as in the device-first path, because this answer is ALWAYS available: it
+    // needs no extra peer and no second query, so it holds even when the direct block-driver query
+    // cannot be reached (which is exactly what happened on the Pi 4).
+    if u64_le(&p[2..10]) == 0 {
+        ctx.console_writeln("  #  LABEL        STATUS   SIZE");
+        ctx.console_writeln("  (no drive attached)");
+        return Ok(());
+    }
     let mib = u64_le(&p[2..10]) / 2048;
     ctx.console_writeln("  #  LABEL        STATUS   SIZE");
     if mounted {
