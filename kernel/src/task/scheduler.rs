@@ -470,6 +470,19 @@ pub fn reserve_task_slot(core_id: u32) -> Option<usize> {
                     // x86 (TSO) an Acquire load / Release store is identical codegen to Relaxed (a plain
                     // mov), so this is behaviour-neutral there.
                     TASK_CORE[i]  = core_id;
+                    // SEC-35: a task slot must not inherit the previous occupant's pending caps.
+                    //
+                    // `TASK_PENDING_RECV_CAP_COUNT` was never reset across task lives, so a respawned
+                    // task started with entries queued by the DEAD one. `pop_pending_recv_cap` is
+                    // FIFO, so the next `take_pending_cap()` returned a cap the new instance never
+                    // asked for - and `fc_open` trusts what it is handed. That is the file-capability
+                    // escalation seen once after a chaos run: `fcap`'s "read-only" handle named an
+                    // earlier open's READ|WRITE cap, so a write under it succeeded.
+                    //
+                    // Reset HERE, where a slot is claimed, because that is the one point every task
+                    // life begins at - a reset on the death path would be missed by any death that
+                    // does not run it (a kill from another core, a panic-adjacent teardown).
+                    TASK_PENDING_RECV_CAP_COUNT[i] = 0;
                     TASK_VALID[i].store(true, Ordering::Release);
                     found = Some(i);
                     break;

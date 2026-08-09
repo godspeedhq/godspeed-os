@@ -480,6 +480,22 @@ official, not the runtime behaviour.
 > none, with every half booting fine alone). **There is no build of AArch64 GodspeedOS in which the
 > kernel drives USB.** Commandment I is closed on this port, not merely satisfiable.
 >
+> **What this does NOT buy: the driver is still a TCB member on this board (SEC-33).** The Pi 4 has
+> no IOMMU/SMMU wired up - every `iommu::` entry point on aarch64 is a stub and `confine_device`
+> returns `false` - and the service is granted its controller's BAR plus a DMA arena including its
+> physical base. So it can point the controller's DMA at any address, which is kernel-equivalent reach
+> by §6.4's own rule, exactly as an unconfined x86 driver would be. The honest statement is therefore:
+> **a buggy USB driver on the Pi 4 is now bounded; a compromised one is still kernel-equivalent.**
+>
+> That distinction is worth being precise about, because the milestone is real but narrower than
+> "Commandment I closed" sounds. What the move genuinely bought is (a) the ACCIDENT surface - ring-0
+> descriptor parsing became a restartable service, which is the whole content of SEC-29, now closed on
+> aarch64 - and (b) ambient authority: SEC-2's no-REBOOT win travels here (unlike arm32, where an
+> in-kernel driver implicitly holds every kernel authority), and the service holds only CONSOLE_PUSH,
+> its log, its endpoint, its BAR and its arena. The kernel-scope violation is closed; the TRUST posture
+> is unchanged until an SMMU confines the device. Also unmet on this port: §6.4 requires the confinement
+> case to be "reported loudly at boot", and nothing is printed either way (SEC-34).
+>
 > **ARM32 (Pi 2) is unchanged and the amendment below still governs it**: no PCIe and no
 > device-IRQ-to-userspace routing, so its DWC2 stack remains in the kernel and remains a TCB member.
 > The two ports now differ in exactly this, and the difference is recorded rather than blurred.

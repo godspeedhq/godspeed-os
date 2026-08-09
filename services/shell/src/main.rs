@@ -8233,6 +8233,17 @@ fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8], ma
 fn drain_stale_fs_replies(ctx: &ServiceContext) {
     for _ in 0..8 {
         if ctx.try_recv().is_none() { return; }
+        // SEC-35, client half: a discarded message may carry an EMBEDDED CAP, and the kernel has
+        // already installed it and queued its slot. Dropping the message does not drop the cap - it
+        // leaves an entry in a FIFO that `take_pending_cap()` reads from, so the NEXT `open` receives
+        // the cap belonging to this discarded reply. That is how `fcap`'s "read-only" handle came to
+        // name an earlier open's READ|WRITE cap and a write under it succeeded.
+        //
+        // Draining here keeps the queue's meaning honest: at most the caps of messages we actually
+        // kept. Removing it also reclaims the slot, so a discarded grant is not a leak either.
+        while let Some(h) = ctx.take_pending_cap() {
+            ctx.remove_cap(h);
+        }
     }
 }
 
