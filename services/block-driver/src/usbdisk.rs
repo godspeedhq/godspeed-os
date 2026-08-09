@@ -279,6 +279,19 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
         // probe timeout, both since fixed, and a capacity query is not a hot path (mount, and `drives`).
         #[cfg(feature = "usb-via-xhci")]
         let sectors = super::xhciblk::sectors_now(ctx);
+        // The SYSCALL path needs re-deriving every bit as much, and only the other one had it.
+        //
+        // The re-derive above is cfg-gated to `usb-via-xhci`, so a build without that feature served
+        // the BOOT-TIME snapshot forever. On a Pi 4 booted with no stick that snapshot is 0, so
+        // plugging a stick in changed nothing that anything above could see: xhci enumerated it and
+        // said "USB disk ready - 31266816 sectors" while `drives` reported no drive, for as long as
+        // the service lived. Killing block-driver fixed it because a fresh instance re-runs the
+        // startup query - which is the whole shape of the report, and the user diagnosed it from that.
+        //
+        // A snapshot of another component's truth has to be reconciled wherever it is served, not
+        // only on the backend that happened to get the fix first (§26.4, Commandment III).
+        #[cfg(not(feature = "usb-via-xhci"))]
+        let sectors = ctx.usb_disk_sectors();
         let mut out = [0u8; 9];
         out[0] = STATUS_OK;
         out[1..9].copy_from_slice(&sectors.to_le_bytes());
