@@ -163,6 +163,71 @@ fn disable_slot(
     );
 }
 
+/// Clear a HALTED endpoint and tell the controller where to resume: Reset Endpoint, then Set TR
+/// Dequeue Pointer (xHCI 4.6.8 + 4.6.10). Returns true if both commands succeeded.
+///
+/// This is the repair for the state the hardware kept reaching: an errored transfer leaves the
+/// endpoint HALTED, the controller stops executing its ring, and every later probe just adds TRBs
+/// nothing will run - `cur` climbing while `ev_idx` stays frozen, which is what the log showed. The
+/// endpoint never recovers on its own, so the keyboard behind it stayed dead until a reboot.
+///
+/// Both commands are required and in this order. Reset Endpoint clears the halt but leaves the
+/// dequeue pointer wherever it stopped, which is mid-ring and pointing at TRBs the controller already
+/// skipped; Set TR Dequeue is what makes the ring coherent again. The caller must reset ITS cursor to
+/// match the pointer set here, or the two disagree about where the ring starts and it wedges again.
+#[allow(clippy::too_many_arguments)]
+fn reset_endpoint(
+    ctx: &ServiceContext,
+    dma: &Dma,
+    mmio: &Mmio,
+    dboff: usize,
+    ir0: usize,
+    slot: u32,
+    dci: u32,
+    ring_off: usize,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    cmd_idx: &mut usize,
+) -> bool {
+    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    *cmd_idx += 1;
+    let cc = run_command(
+        ctx, dma, mmio, dboff, ir0, cmd_off, 0, 0, 0,
+        (TRB_RESET_ENDPOINT << 10) | (slot << 24) | (dci << 16) | 1,
+        ev_idx, ev_cycle,
+    );
+    // `run_command` yields (completion_code, slot); 1 = Success.
+    if !matches!(cc, Some((1, _))) {
+        ctx.log_fmt(format_args!(
+            "xhci: Reset Endpoint slot {} dci {} FAILED (cc {:?}) - endpoint stays halted",
+            slot, dci, cc));
+        return false;
+    }
+    // Resume at the ring BASE with Dequeue Cycle State = 1, the state a fresh ring is in. The caller
+    // resets its producer cursor to the same place, so both sides agree again.
+    let bp = dma.phys_at(ring_off);
+    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    *cmd_idx += 1;
+    let cc = run_command(
+        ctx, dma, mmio, dboff, ir0, cmd_off,
+        (bp as u32) | 1,          // low 32 bits | DCS=1
+        (bp >> 32) as u32,
+        0,
+        (TRB_SET_TR_DEQUEUE << 10) | (slot << 24) | (dci << 16) | 1,
+        ev_idx, ev_cycle,
+    );
+    if !matches!(cc, Some((1, _))) {
+        ctx.log_fmt(format_args!(
+            "xhci: Set TR Dequeue slot {} dci {} FAILED (cc {:?}) - ring left incoherent",
+            slot, dci, cc));
+        return false;
+    }
+    ctx.log_fmt(format_args!(
+        "xhci: endpoint slot {} dci {} RESET and dequeue re-pointed to the ring base - recovered",
+        slot, dci));
+    true
+}
+
 /// A bound HID device: its slot, interrupt-endpoint DCI, root-hub port (for
 /// disconnect detection), per-device DMA slice index, and whether it's a mouse.
 ///
@@ -206,6 +271,10 @@ const TRB_STATUS_STAGE: u32 = 4;
 pub(crate) const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_DISABLE_SLOT: u32 = 10;
+/// Reset Endpoint (xHCI 4.6.8) - clears the HALTED state an errored transfer left on an endpoint.
+const TRB_RESET_ENDPOINT: u32 = 14;
+/// Set TR Dequeue Pointer (xHCI 4.6.10) - tells the controller where to resume on that endpoint.
+const TRB_SET_TR_DEQUEUE: u32 = 16;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 pub(crate) const TRB_TRANSFER_EVENT: u32 = 32;
@@ -3387,11 +3456,32 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                     // This does NOT claim the device is gone - the caller only announces a
                                     // disconnect when the hub actually SAID so (`Some(false)`).
                                     if disk_absent_seen >= 200 {
+                                        // REPAIR THE ENDPOINT rather than re-enumerate the world.
+                                        //
+                                        // The previous version tore everything down and rebuilt it -
+                                        // effective, but it rebinds the KEYBOARD too, which is a
+                                        // visible stall for a fault that is confined to one endpoint.
+                                        // Reset Endpoint + Set TR Dequeue is the operation the
+                                        // hardware actually defines for this state (xHCI 4.6.8 /
+                                        // 4.6.10): clear the halt, then re-point the dequeue.
                                         ctx.log_fmt(format_args!(
-                                            "xhci: port {} unreachable 200x - the endpoint looks HALTED (cursor advancing, no completions); re-enumerating to recover",
+                                            "xhci: port {} unreachable 200x - endpoint looks HALTED (cursor advancing, no completions); resetting it",
                                             hp));
                                         disk_absent_seen = 0;
-                                        true
+                                        let ok = reset_endpoint(
+                                            &ctx, &dma, &mmio, dboff, ir0, hub_slot, 1,
+                                            ep0_tr_off(hub_dev), &mut ev_idx, &mut ev_cycle,
+                                            &mut cmd_idx,
+                                        );
+                                        // Our producer cursor MUST match the dequeue we just set, or
+                                        // the two disagree about where the ring begins and it wedges
+                                        // again on the next probe. Base, cycle 1 - a fresh ring.
+                                        hub_cur[owner] = 0;
+                                        hub_pcs[owner] = 1;
+                                        // If the reset itself failed, fall back to the bigger hammer:
+                                        // a failed recovery must not be quietly swallowed (§26.7), and
+                                        // leaving the machine wedged is not an option.
+                                        !ok
                                     } else {
                                         false
                                     }
