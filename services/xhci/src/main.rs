@@ -3365,7 +3365,36 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                             "xhci: disk port {} unreachable 20x - NOT concluding removal (a failed probe is not an answer); check probe timing",
                                             hp));
                                     }
-                                    false
+                                    // AT 200 THE RING IS WEDGED, NOT BUSY - recover instead of sitting dead.
+                                    //
+                                    // Signature from hardware: `cur` climbs 0x30 per probe while `ev_idx`
+                                    // stays FROZEN - we keep posting transfers and the controller executes
+                                    // none of them. That is a halted endpoint (an earlier transfer error
+                                    // stalls it until a Reset Endpoint + Set TR Dequeue), not contention,
+                                    // and it never clears itself: the keyboard stayed dead until reboot.
+                                    //
+                                    // Proper repair is Reset Endpoint + Set TR Dequeue on that endpoint.
+                                    // Until that exists, a re-enumeration rebuilds the rings and gets the
+                                    // machine back - the same recovery a user performs by replugging.
+                                    // Nothing above the kernel may leave the machine dead, and a driver
+                                    // that can see it is wedged and does nothing is exactly that.
+                                    //
+                                    // 200, not 20: 20 consecutive failures happen under load (172 to 832
+                                    // per session were measured), and re-enumerating on those would bring
+                                    // back the phantom flapping just fixed. 200 unbroken failures is a
+                                    // ring that has stopped, not one that is busy.
+                                    //
+                                    // This does NOT claim the device is gone - the caller only announces a
+                                    // disconnect when the hub actually SAID so (`Some(false)`).
+                                    if disk_absent_seen >= 200 {
+                                        ctx.log_fmt(format_args!(
+                                            "xhci: port {} unreachable 200x - the endpoint looks HALTED (cursor advancing, no completions); re-enumerating to recover",
+                                            hp));
+                                        disk_absent_seen = 0;
+                                        true
+                                    } else {
+                                        false
+                                    }
                                 }
                                 Some(true) => {
                                     if disk_absent_seen != 0 {
@@ -3381,7 +3410,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 ctx.log_fmt(format_args!(
                                     "xhci: the USB disk is gone (port {} {}) - dropping it",
                                     hp, if st.is_none() { "unreachable" } else { "reports disconnected" }));
-                                notify(&ctx, "storage disconnected (xhci)");
+                                // Announce a disconnect ONLY when the hub actually said so.
+                                //
+                                // The other way in here is now the wedged-ring recovery, where the hub
+                                // never answered at all. Telling the user "storage disconnected" for a
+                                // stick that is still plugged in is a false statement on the console -
+                                // and re-announcing "connected" a second later is the phantom flapping
+                                // this driver was just cured of. The recovery still happens and is still
+                                // logged loudly by the branch that triggers it; it just does not claim a
+                                // removal it did not observe.
+                                if st.is_some() {
+                                    notify(&ctx, "storage disconnected (xhci)");
+                                }
                                 disk_gone = true;
                                 break;
                             }
