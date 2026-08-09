@@ -397,6 +397,10 @@ const PORT_POWER_SETTLE_MS: u64 = 200;
 const PORT_RECOVERY_MS: u64 = 20;
 
 const HUB_POLL_MS: u64 = 500;
+/// How often the driver says it is still alive. See the heartbeat's comment in the poll loop: this
+/// exists because a STOPPED loop is otherwise indistinguishable from a quiet one, and every failure
+/// detector here counts failures that a stopped loop never produces.
+const HEARTBEAT_MS: u64 = 60_000;
 /// How long the "a hub is present but nothing usable is behind it" wait sleeps before re-walking the
 /// hub. A device replugged BEHIND a hub changes no root PORTSC, so the root-port wait would miss it.
 /// Only runs while NO HID is bound.
@@ -3060,6 +3064,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
         let mut last_hub_poll = ctx.read_tsc();
+        // LIVENESS HEARTBEAT. The driver must be able to say "I am still running".
+        //
+        // On hardware this driver went completely silent for two minutes - keyboard dead, hot-plug
+        // ignored - and every detector reported healthy, because they all count FAILING probes and a
+        // loop that has STOPPED produces no failures to count. The wedge repair added earlier today
+        // could not fire for the same reason. "The loop stopped" was undetectable by construction.
+        //
+        // A heartbeat is the one signal that distinguishes "nothing to report" from "no longer
+        // reporting". Rate-limited to once a minute so it cannot become the log noise the per-probe
+        // diagnostic became (that one was 4% of a session and sat on the same loop that polls the
+        // keyboard); over an overnight soak this is a few hundred lines and worth every one.
+        //
+        // It carries the pass count deliberately: a heartbeat whose counter has not moved says the
+        // loop is being ENTERED but not progressing, which is a different fault from silence.
+        let mut last_beat = ctx.read_tsc();
+        let mut passes: u64 = 0;
         let mut hub_probe_logged = false; // log the first downstream-status probe per session (diagnostic)
         let mut hub_none_logged = [false; MAX_HID]; // an inconclusive None logs at most ONCE per device (no spam)
         let mut kb_last = [[0u8; 6]; MAX_HID];
@@ -3318,6 +3338,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // leaves - its root port is the hub's, and the hub stays put - so it is instead detected by
             // GET_STATUSing the hub's downstream port, throttled (a control transfer, not free). Either
             // way: notify and break to fully re-initialize, re-binding whatever remains next pass.
+            passes = passes.wrapping_add(1);
+            if ctx.read_tsc().wrapping_sub(last_beat) > ctx.duration_cycles(HEARTBEAT_MS) {
+                last_beat = ctx.read_tsc();
+                ctx.log_fmt(format_args!(
+                    "xhci: alive - {} poll passes, {} HID bound, disk {}",
+                    passes, ndev, if disk.is_some() { "yes" } else { "no" }));
+            }
             let hub_due =
                 ctx.read_tsc().wrapping_sub(last_hub_poll) > ctx.duration_cycles(HUB_POLL_MS);
             // (declared above, before the block-serving calls - a DISK transfer can consume a HID
