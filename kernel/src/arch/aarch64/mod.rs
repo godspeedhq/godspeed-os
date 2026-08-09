@@ -1821,7 +1821,6 @@ pub mod boot {
 
 // ---------------------------------------------------------------------------
 pub mod page_tables {
-    use crate::memory::frame::{Frame, PhysAddr};
 
     pub const PAGE_SIZE: usize = 4096;
 
@@ -2299,7 +2298,7 @@ pub mod rtc {
 
 // ---------------------------------------------------------------------------
 pub mod pci {
-    use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
+    use core::sync::atomic::{AtomicBool, AtomicU32};
     use portable_atomic::AtomicU64;
     pub static XHCI_FOUND: AtomicBool = AtomicBool::new(false);
     pub static XHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
