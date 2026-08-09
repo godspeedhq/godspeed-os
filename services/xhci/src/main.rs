@@ -2279,6 +2279,20 @@ fn enumerate_one(
                 devs[d].hub_off = hoff;
             }
         }
+        // The DISK's cursor too, and for the same reason - it was captured INSIDE the per-port loop
+        // (at the moment the disk was bound), so it recorded `hoff` before the remaining ports had
+        // been walked. Every later port-power and status transfer advanced the ring past it, leaving
+        // the disk's probe cursor pointing at TRBs the controller had already consumed. A probe
+        // written behind the dequeue pointer is never looked at again: it is posted, the doorbell is
+        // rung, and no completion ever comes.
+        //
+        // That is the shape the `[probe]` diagnostic showed on hardware - `cur` climbing 0x30 per
+        // probe while `ev_idx` stood still, 296 times.
+        if let Some(dk) = disk.as_mut() {
+            if dk.hub_slot == slot {
+                dk.hub_off = hoff;
+            }
+        }
     }
 }
 
