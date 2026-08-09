@@ -163,6 +163,60 @@ fn disable_slot(
     );
 }
 
+/// Decode ONE completed HID report for device `d` and push it to the console.
+///
+/// Extracted so that BOTH paths that observe a completed report can deliver it. The poll loop always
+/// did. The other path - a hub port probe that consumes a keystroke completion while waiting for its
+/// own event - re-armed the endpoint and threw the report away, with a comment calling it "a rare
+/// dropped keystroke". It stopped being rare: probes run every `HUB_POLL_MS` across every hub port,
+/// and a FAILING probe holds its window open for the whole `PROBE_ANSWER_MS`, so a real amount of
+/// typing landed in those windows and was discarded. That is the dropped keys and the lag - a key that
+/// never arrives is also a key that seems to arrive late, when the next one finally re-triggers.
+///
+/// The report was never lost, only unread: the transfer completed into the device's DMA buffer, so
+/// this reads exactly what the poll loop would have read.
+#[allow(clippy::too_many_arguments)]
+fn deliver_hid_report(
+    ctx: &ServiceContext,
+    dma: &Dma,
+    d: usize,
+    devs: &[Hid; MAX_HID],
+    kb_last: &mut [[u8; 6]; MAX_HID],
+    kb_rep: &mut [godspeed_sdk::hid::KeyRepeat; MAX_HID],
+    kb_caps: &mut [bool; MAX_HID],
+    mouse: &mut [godspeed_sdk::hid::MouseTracker; MAX_HID],
+) {
+    let dev = devs[d].idx;
+    let mut rep = [0u8; 8];
+    for (j, b) in rep.iter_mut().enumerate() {
+        *b = dma.read8(report_off(dev) + j);
+    }
+    // An all-0xff report is a failed/stale DMA read from a device that vanished mid-transaction;
+    // decoding it would push 0xff "keystrokes". The real disconnect is caught by the CCS check.
+    if !godspeed_sdk::hid::report_is_valid(&rep) {
+        return;
+    }
+    if devs[d].is_mouse {
+        mouse[d].feed(&rep, |_mask, _down| {}, |_dx, _dy| {});
+    } else if godspeed_sdk::hid::is_ctrl_alt_del(&rep) {
+        // SEC-2: this driver holds no REBOOT. It SIGNALS the chord; the shell decides (§6.4).
+        ctx.console_push(godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL);
+    } else {
+        godspeed_sdk::hid::decode_keyboard(
+            &rep,
+            &mut kb_last[d],
+            &mut kb_rep[d],
+            &mut kb_caps[d],
+            ctx.read_tsc(),
+            |ch| ctx.console_push(ch),
+            |code| {
+                ctx.log_fmt(format_args!(
+                    "xhci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code))
+            },
+        );
+    }
+}
+
 /// Clear a HALTED endpoint and tell the controller where to resume: Reset Endpoint, then Set TR
 /// Dequeue Pointer (xHCI 4.6.8 + 4.6.10). Returns true if both commands succeeded.
 ///
@@ -3222,48 +3276,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 match next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle, 1) {
                     Some((TRB_TRANSFER_EVENT, _, slot_id)) => {
                         if let Some(d) = devs[..ndev].iter().position(|h| h.slot == slot_id) {
-                            let dev = devs[d].idx;
-                            let mut rep = [0u8; 8];
-                            for (j, b) in rep.iter_mut().enumerate() {
-                                *b = dma.read8(report_off(dev) + j);
-                            }
-                            // Skip an all-0xff report - a failed/stale DMA read from a device
-                            // that vanished mid-transaction (e.g. a rapid unplug/replug). Decoding
-                            // it would push 0xff "keystrokes" to the console; the real disconnect
-                            // is caught by the PORTSC CCS check below, which re-initialises.
-                            if !godspeed_sdk::hid::report_is_valid(&rep) {
-                                need_queue[d] = true;
-                                continue;
-                            }
-                            if devs[d].is_mouse {
-                                // Drain the mouse report (keeps the endpoint moving) but do NOT log every
-                                // button/move: GodspeedOS has no cursor or mouse consumer yet, so those
-                                // callbacks were pure bring-up diagnostics that FLOOD the console on every
-                                // movement (looks like a freeze under a scrolling framebuffer). When a real
-                                // mouse consumer exists, wire it into these callbacks instead of logging.
-                                mouse[d].feed(&rep, |_mask, _down| {}, |_dx, _dy| {});
-                            } else if godspeed_sdk::hid::is_ctrl_alt_del(&rep) {
-                                // SEC-2 follow-up: this driver holds no REBOOT and never resets the
-                                // machine itself. It only SIGNALS the chord on the console stream;
-                                // the shell - which legitimately holds REBOOT - decides. That keeps
-                                // what SEC-2 won (no direct reboot syscall from a driver, in any
-                                // context) while restoring the UX, and grants the driver nothing
-                                // new: a CONSOLE_PUSH holder can already type `reboot` (§6.4).
-                                ctx.console_push(godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL);
-                            } else {
-                                godspeed_sdk::hid::decode_keyboard(
-                                    &rep,
-                                    &mut kb_last[d],
-                                    &mut kb_rep[d],
-                                    &mut kb_caps[d],
-                                    ctx.read_tsc(),
-                                    |ch| ctx.console_push(ch),
-                                    |code| {
-                                        ctx.log_fmt(format_args!(
-                                        "xhci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code))
-                                    },
-                                );
-                            }
+                            deliver_hid_report(&ctx, &dma, d, &devs, &mut kb_last,
+                                               &mut kb_rep, &mut kb_caps, &mut mouse);
                             need_queue[d] = true;
                         }
                     }
@@ -3700,11 +3714,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if hub_due {
                 last_hub_poll = ctx.read_tsc();
             }
-            // Re-arm any HID endpoint whose in-flight report a hub check just consumed, so it does not
-            // stall (the report is discarded; the next keystroke lands on the fresh TRB).
+            // DELIVER the report a hub check consumed, then re-arm.
+            //
+            // This used to re-arm and drop it ("the report is discarded; the next keystroke lands on
+            // the fresh TRB"), which is exactly the dropped keys and input lag reported on hardware.
+            // The keystroke was never lost - it completed into the device's DMA buffer and simply went
+            // unread, so the same read the poll loop does recovers it.
             if eaten != 0 {
                 for k in 0..ndev {
                     if devs[k].slot < 32 && eaten & (1 << devs[k].slot) != 0 {
+                        deliver_hid_report(&ctx, &dma, k, &devs, &mut kb_last,
+                                           &mut kb_rep, &mut kb_caps, &mut mouse);
                         need_queue[k] = true;
                     }
                 }
