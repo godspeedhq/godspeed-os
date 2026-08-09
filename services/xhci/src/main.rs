@@ -2505,6 +2505,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Hot-plug state that persists across passes.
     let mut announce = false; // suppress the connect line for the boot device
+    // Whether a disk was bound at the END of the previous enumeration pass, so "storage connected"
+    // can be gated on an actual not-bound -> bound transition (see its use below).
+    let mut disk_was_bound = false;
     let mut signaled = false; // signal_input_ready (boot-screen clear) exactly once
     let mut prev_sigs: [u32; MAX_HID] = [u32::MAX; MAX_HID]; // per-device position sigs bound last pass (u32::MAX = empty)
     let mut rescan_noted = false; // "periodic back-port re-scan" logged once per idle spell
@@ -2757,9 +2760,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // A newly-arrived disk announces itself, a boot disk does not - the same rule the HID
         // announce follows two blocks down, and for the same reason: `announce` is false on the boot
         // pass, so only a genuine plug reaches the screen.
-        if announce && disk.is_some() {
+        // Announce a TRANSITION, not a pass.
+        //
+        // `announce` only means "this is not the boot pass". It is set by ANY re-enumeration - and
+        // unplugging the KEYBOARD causes one - so a disk that never moved got re-announced as
+        // "storage connected" while the user was pulling a different device out. The console stated a
+        // plug event that did not happen.
+        //
+        // Comparing against the previous pass makes the line mean what it says: it appears when the
+        // disk goes from not-bound to bound, and stays silent when a re-enumeration merely rebinds
+        // something that was already there.
+        if announce && disk.is_some() && !disk_was_bound {
             notify(&ctx, "storage connected (xhci)");
         }
+        disk_was_bound = disk.is_some();
         if let Some(d) = disk.as_mut() {
             let mut eaten = 0u32;
             if msc::read10(
