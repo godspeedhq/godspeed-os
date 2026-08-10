@@ -163,26 +163,9 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u
     for _ in 0..DANCE_TRIES {
         // Send the DISCOVER, then DRAIN + SCAN the RX ring for the OFFER: on a busy LAN the offer arrives
         // amid a flood of broadcast, so we scan every frame within the budget, not just the coupled one.
-        // DHCP MEASUREMENT (temporary - remove once the hot-plug failure is understood).
-        //
-        // A cable present AT BOOT gets an offer first try; the same dance HOT-PLUGGED never does. Three
-        // theories have been wrong about why, so this counts rather than guesses. It answers the one
-        // question that splits the field: do frames REACH US at all during the dance?
-        //
-        //   frames 0        -> nothing is arriving. Not a timing problem: the RX path is not
-        //                      delivering (ring not armed after a link transition?), and no amount of
-        //                      settle will help.
-        //   frames > 0, no offer -> frames arrive and the OFFER is absent or rejected by the filter
-        //                      above. A different bug entirely, in what we send or how we match.
-        //
-        // Cheap and bounded: two counters and one line per DISCOVER attempt, only while unconfigured.
-        let send_ok = nic_req(ctx, &req, LINK_SECS).is_some();
-        let mut seen_frames = 0u32;
-        let mut seen_ipv4 = 0u32;
+        let _ = nic_req(ctx, &req, LINK_SECS);
         let mut found: Option<([u8; 4], [u8; 4], [u8; 4])> = None;
         drain_scan(ctx, DANCE_SECS, |f| {
-            seen_frames += 1;
-            if f.len() >= 14 && f[12] == 0x08 && f[13] == 0x00 { seen_ipv4 += 1; }
             // A DHCP reply: IPv4 (0x0800, IHL 5), UDP (proto 17), BOOTP op = 2 (BOOTREPLY). yiaddr (our
             // offered IP) sits at BOOTP offset 16 = frame offset 58.
             if f.len() >= 62 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45 && f[23] == 17 && f[42] == 2 {
@@ -208,9 +191,6 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u
                 true
             } else { false }
         });
-        ctx.log_fmt(format_args!(
-            "net-stack: [dhcp] discover sent={} - saw {} frames ({} IPv4), offer {}",
-            send_ok, seen_frames, seen_ipv4, if found.is_some() { "YES" } else { "no" }));
         if let Some((ip, gw, dns)) = found {
             ctx.log_fmt(format_args!(
                 "net-stack: DHCP - offered {}.{}.{}.{}, gw {}.{}.{}.{}, dns {}.{}.{}.{}",
@@ -881,10 +861,6 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
 /// Read the NIC link state from nic-driver's `[3]` status. RTL8168: byte 7 = link up. On the QEMU e1000
 /// path the reply is short (no link byte) - a non-empty reply means "up" (slirp's virtual link is always
 /// up). Cheap; lets net-stack notice a cable plugged in after boot and self-configure without `net renew`.
-/// How long to let the PHY settle after link-up before driving DHCP over it. See the use site: a
-/// cable present at boot negotiates before we ever ask, but a HOT-PLUGGED one reports carrier before
-/// auto-negotiation finishes, and a DHCP discover sent into that window is simply lost.
-const PHY_SETTLE_MS: u64 = 2_000;
 
 /// How often an IDLE net-stack looks at the cable. Only reached when no client request arrived, and it
 /// costs one NIC status query - a cable is a human-speed event, so a second is ample and anything
@@ -1023,23 +999,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&10))
             && link_is_up(&ctx)
         {
-            // Let the PHY finish before asking it to carry DHCP.
-            //
-            // Hardware showed this precisely: with the cable in AT BOOT, DHCP is offered first try
-            // (11:05:46, 192.168.5.27). HOT-PLUGGED, the same dance got no offer and looped every
-            // ~25-30s forever - link-up fires as soon as the PHY reports carrier, which is before
-            // auto-negotiation has settled, so the DHCP discover goes out into a link that is not
-            // really ready yet. The LAN was never the problem.
-            //
-            // This is a HARDWARE SETTLE, the legitimate exception to waiting on truth: there is no
-            // finer signal to wait for - "negotiation complete" is not separately reported, so the
-            // only honest option is to give it its specified time. 2s covers 1000BASE-T
-            // auto-negotiation with margin, and it is paid ONCE per plug-in, not per retry.
-            // The announce lives on the TICK only. It was here too, so a plug-in printed "connected"
-            // twice - once when the tick saw the link change, then again when the next request drove
-            // auto-config. One event, one line: the tick owns the transition, this path owns the dance.
-            ctx.log("net-stack: link up while unconfigured - letting the PHY settle, then auto-configuring");
-            ctx.sleep(ctx.duration_cycles(PHY_SETTLE_MS));
+            // No settle here. One was added on the theory that a hot-plugged PHY needed time to
+            // negotiate before DHCP, and the measurement disproved it: the failure was ZERO frames
+            // arriving, because nic-driver only programmed MAC speed and DMA burst during `bring_up`
+            // (fixed in 27c719bd - it now re-applies on the link-up transition). The delay was solving
+            // a problem that did not exist, so it only postponed every hot-plug configure.
+            ctx.log("net-stack: link up while unconfigured - auto-configuring");
             let d = run_dance(&ctx);
             our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; have_mac = d.have_mac; dns_server = d.dns_server; status = d.status;
             synced_by_dance = true;   // run_dance ends in its own SNTP sync - op 10 must not repeat it
