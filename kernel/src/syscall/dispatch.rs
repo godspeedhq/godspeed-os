@@ -219,6 +219,10 @@ fn handle_print(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 /// log stream = serial only), this writes the CONSOLE path - serial AND the
 /// framebuffer - for interactive output (the shell prompt, `observe`). No newline
 /// is added; the caller includes one if wanted. See `docs/console-service.md`.
+/// Monotonic count of console writes - see `handle_console_write` for why this exists rather than a
+/// wake-up. Read via `InspectKernel` query 23; only ever compared against a previously-seen value.
+static CONSOLE_WRITE_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::WRITE) {
         Ok(c) => c,
@@ -236,6 +240,21 @@ fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     // Console foreground gate: while a TUI app (e.g. `chaos`, syscall 40) owns the screen, a
     // backgrounded task's output goes to serial only - it must not smear the app's framebuffer. The
     // owner (or unclaimed = the normal case) writes to both.
+    // Count every console write, so a blocked reader can notice that SOMETHING drew on the screen.
+    //
+    // The shell blocks waiting for a keystroke, so a line written by another service (e.g. net-stack's
+    // "NET: ethernet cable connected") appears with no prompt after it until the user presses a key.
+    // The obvious fix - waking `console_read` from here - would change that syscall's contract, since
+    // it returns a byte today and would then sometimes return nothing; every caller would have to
+    // handle a wake with no input, and getting THAT wrong leaves no usable prompt at all.
+    //
+    // A counter is additive instead: nothing existing behaves differently, and a reader can poll it on
+    // an idle timeout to decide whether the screen changed under it. Worst case if a reader gets it
+    // wrong is a prompt that does not redraw - never a shell that cannot take input.
+    //
+    // Relaxed: it is a change DETECTOR, not a lock. A reader only ever asks "is this different from
+    // the value I last saw", so a stale read costs one extra idle tick and nothing more.
+    CONSOLE_WRITE_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let to_fb = crate::arch::imp::console_foreground_allows(scheduler::current_task_slot() as u32);
     crate::arch::imp::console_write_bytes_gated(bytes, to_fb);
     0
@@ -1356,6 +1375,11 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // service needs this to lay out its terminal (pin the input line to the
         // bottom row). 0 if the framebuffer never initialised.
         9 => crate::fbcon::dims_packed() as i64,
+        // Console write sequence: bumped by every `console_write`. A reader compares it with the value
+        // it last saw to learn that something drew on the screen while it was idle, without anyone
+        // needing `console_push` (which injects into the INPUT ring and carries the SEC-2 trust
+        // perimeter - see §6.4). Ungated: it is a counter of writes, not their content.
+        23 => CONSOLE_WRITE_SEQ.load(core::sync::atomic::Ordering::Relaxed) as i64,
         // Input-ready flag - set by the xHCI driver when it finishes setup (the
         // last boot step). The shell watches it to auto-clear the boot screen.
         10 => crate::arch::imp::input_ready() as i64,
