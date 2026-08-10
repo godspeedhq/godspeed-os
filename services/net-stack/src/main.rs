@@ -163,9 +163,26 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u
     for _ in 0..DANCE_TRIES {
         // Send the DISCOVER, then DRAIN + SCAN the RX ring for the OFFER: on a busy LAN the offer arrives
         // amid a flood of broadcast, so we scan every frame within the budget, not just the coupled one.
-        let _ = nic_req(ctx, &req, LINK_SECS);
+        // DHCP MEASUREMENT (temporary - remove once the hot-plug failure is understood).
+        //
+        // A cable present AT BOOT gets an offer first try; the same dance HOT-PLUGGED never does. Three
+        // theories have been wrong about why, so this counts rather than guesses. It answers the one
+        // question that splits the field: do frames REACH US at all during the dance?
+        //
+        //   frames 0        -> nothing is arriving. Not a timing problem: the RX path is not
+        //                      delivering (ring not armed after a link transition?), and no amount of
+        //                      settle will help.
+        //   frames > 0, no offer -> frames arrive and the OFFER is absent or rejected by the filter
+        //                      above. A different bug entirely, in what we send or how we match.
+        //
+        // Cheap and bounded: two counters and one line per DISCOVER attempt, only while unconfigured.
+        let send_ok = nic_req(ctx, &req, LINK_SECS).is_some();
+        let mut seen_frames = 0u32;
+        let mut seen_ipv4 = 0u32;
         let mut found: Option<([u8; 4], [u8; 4], [u8; 4])> = None;
         drain_scan(ctx, DANCE_SECS, |f| {
+            seen_frames += 1;
+            if f.len() >= 14 && f[12] == 0x08 && f[13] == 0x00 { seen_ipv4 += 1; }
             // A DHCP reply: IPv4 (0x0800, IHL 5), UDP (proto 17), BOOTP op = 2 (BOOTREPLY). yiaddr (our
             // offered IP) sits at BOOTP offset 16 = frame offset 58.
             if f.len() >= 62 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45 && f[23] == 17 && f[42] == 2 {
@@ -191,6 +208,9 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u
                 true
             } else { false }
         });
+        ctx.log_fmt(format_args!(
+            "net-stack: [dhcp] discover sent={} - saw {} frames ({} IPv4), offer {}",
+            send_ok, seen_frames, seen_ipv4, if found.is_some() { "YES" } else { "no" }));
         if let Some((ip, gw, dns)) = found {
             ctx.log_fmt(format_args!(
                 "net-stack: DHCP - offered {}.{}.{}.{}, gw {}.{}.{}.{}, dns {}.{}.{}.{}",
