@@ -231,62 +231,21 @@ about | assert contains GodspeedOS
 version | assert contains GodspeedOS
 cores | assert contains cores
 mem | assert contains used
-# Commandment VIII: wait on the TRUTH, not on time - and bound the wait.
+# KNOWN, and deliberately left as an honest failure: this fails on the FIRST selfcheck after boot on a
+# board with no RTC (the Pi 4) and passes on every later one. `date` prints a time only once SNTP has
+# set the clock - measured on hardware, the prompt is up at boot+0.2s and the clock lands at boot+5.0s.
 #
-# This board has no RTC, so `date` prints a time only once SNTP has set the clock. Measured on a Pi 4:
-# the prompt is up at boot+0.2s and the clock is set at boot+5.0s, so a selfcheck run straight after
-# boot asserted against a fact the system had not established yet. That is not a broken clock, it is a
-# reader that does not wait for what it depends on.
+# A wait-then-skip-or-fail version of this was written and REVERTED: it used syntax that does not
+# exist (`$var = ...` instead of `let mut` + `var = ...`, and a bare `contains` as a pipe target -
+# there is only `assert contains`). The result was an undefined variable, a counter that never
+# incremented, and therefore an INFINITE `wait 1` loop that hung the whole suite. Worse than the
+# failure it was fixing, and a bounded wait that turned out to be unbounded is a poor advertisement
+# for Commandment VIII.
 #
-# The two tempting non-fixes are both wrong. A fixed `wait 15` waits on TIME: it would pass here and
-# fail on a slower link, and cost 15s on every run. Wrapping the assert in `if date | contains :`
-# reduces to asserting something only when it already holds - a test that cannot fail, which this
-# session has now seen enough of.
-#
-# So: poll the truth, bounded, then assert unconditionally. On a synced machine this costs one
-# iteration; on a machine with no network it costs 20s and then FAILS LOUDLY, which is correct - a
-# machine that cannot tell the time should not report a passing clock test.
-# THREE outcomes, not two - because "we could not check" is not the same as "it works".
-#
-#   clock set                -> assert the format. A real test that can fail.
-#   clock unset, network up  -> FAIL. SNTP is reachable and did not set the clock; that is a defect
-#                               and passing here would hide it.
-#   clock unset, no network  -> SKIP, said out loud, and NOT counted as a failure. A machine with no
-#                               internet cannot know the time, and failing a clock-FORMAT test for a
-#                               missing cable tests the LAN rather than GodspeedOS.
-#
-# The skip is the interesting case: passing outright would make this a test that cannot fail on any
-# offline machine, so a broken `date` would go green there. Skipping says what happened instead.
-$clockwait = 0
-loop {
-  if date | contains : { break }
-  $clockwait = $clockwait + 1
-  if $clockwait > 20 { break }
-  wait 1
-}
-if date | contains : {
-  date | assert contains :
-} else if net | contains unassigned {
-  echo 'SKIP  date - no network on this machine, so the clock cannot be set (not a failure)'
-} else {
-  # The network is up and the clock is still unset after the bounded wait. Try ONE explicit sync -
-  # not to rescue the test, but to tell two different faults apart:
-  #
-  #   sync works  -> the time source is fine and BOOT auto-sync is the defect. Still a failure: a
-  #                  machine that needs a manual command to know the time every boot is broken, and
-  #                  syncing here would hide that forever (the test would pass while every boot came
-  #                  up blind).
-  #   sync fails  -> no usable time source at all, despite a link. A different defect, worth naming.
-  #
-  # Either way this FAILS. The sync is a diagnostic, not a repair - a test that fixes the system
-  # before asserting is no longer measuring the system.
-  date sync
-  if date | contains : {
-    fail "date: boot auto-sync did not set the clock, but `date sync` works - the boot path is the defect"
-  } else {
-    fail "date: network is up but no time source could set the clock, even on an explicit `date sync`"
-  }
-}
+# Redo it against the real grammar (see section 7 of this file for `let mut` / `loop` / `break`), and
+# TEST IT before shipping. The intended shape stands: bounded poll of the clock, then pass / skip
+# (no network) / fail-with-diagnosis (network up but unset).
+date | assert contains :
 help | assert contains status
 # uptime - a record producer (wall-clock RTC delta): bare grid + json + column projection.
 assert ok uptime
