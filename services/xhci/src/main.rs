@@ -2629,6 +2629,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // the pass that happened to look - the same scope error that stopped the absence counter ever
     // reaching its threshold.
     let mut topo = topo::Topo::new();
+    // Heartbeat state - ABOVE `'reenum` so a re-enumeration cannot reset it (see its comment below).
+    let mut last_beat = ctx.read_tsc();
+    let mut passes: u64 = 0;
     'reenum: loop {
         // Stop + reset the controller. The Wyse `chaos max-carnage` all-core freeze lands
         // DETERMINISTICALLY in this sequence (the log dies right after the "v..." line above), so bracket
@@ -3078,8 +3081,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         //
         // It carries the pass count deliberately: a heartbeat whose counter has not moved says the
         // loop is being ENTERED but not progressing, which is a different fault from silence.
-        let mut last_beat = ctx.read_tsc();
-        let mut passes: u64 = 0;
+        //
+        // Its state is declared ABOVE `'reenum` (with `topo` and `disk_absent_seen`, hoisted for this
+        // same reason): declared here it was re-initialised by every re-enumeration, so under chaos -
+        // which re-enumerates far more often than once a minute - the timer never reached its
+        // interval and the heartbeat NEVER FIRED. 239,794 log lines with zero beats. A liveness
+        // signal that a busy system resets is not a liveness signal, and it is the sixth time this
+        // session that a mechanism sat behind a condition that could not occur when it was needed.
         let mut hub_probe_logged = false; // log the first downstream-status probe per session (diagnostic)
         let mut hub_none_logged = [false; MAX_HID]; // an inconclusive None logs at most ONCE per device (no spam)
         let mut kb_last = [[0u8; 6]; MAX_HID];
