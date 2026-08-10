@@ -861,6 +861,27 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
 /// Read the NIC link state from nic-driver's `[3]` status. RTL8168: byte 7 = link up. On the QEMU e1000
 /// path the reply is short (no link byte) - a non-empty reply means "up" (slirp's virtual link is always
 /// up). Cheap; lets net-stack notice a cable plugged in after boot and self-configure without `net renew`.
+/// How long to let the PHY settle after link-up before driving DHCP over it. See the use site: a
+/// cable present at boot negotiates before we ever ask, but a HOT-PLUGGED one reports carrier before
+/// auto-negotiation finishes, and a DHCP discover sent into that window is simply lost.
+const PHY_SETTLE_MS: u64 = 2_000;
+
+/// Announce a cable coming or going on the CONSOLE, the way the USB drivers announce a keyboard or a
+/// stick. Same idea, same place on screen, so "something was plugged in" reads the same whatever it was.
+///
+/// Uses `console_write` only, NOT `console_push`. That distinction is the whole security story here:
+/// `console_write` is gated on LOG_WRITE, which this service already holds, while `console_push`
+/// injects into the shell's INPUT ring and puts its holder inside the shell's trust perimeter (§6.4,
+/// SEC-2 - keystrokes are commands). A network service has no business holding that, so the newline
+/// goes inside the written string instead of being pushed. No new authority for a cosmetic feature.
+fn link_notify(ctx: &ServiceContext, msg: &str) {
+    ctx.console_write("
+ NET: ");
+    ctx.console_write(msg);
+    ctx.console_write("
+");
+}
+
 fn link_is_up(ctx: &ServiceContext) -> bool {
     match nic_req(ctx, &Message::from_bytes(&[3u8]), LINK_SECS) {
         Some(r) => { let p = r.payload_bytes(); if p.len() > 7 { p[7] != 0 } else { !p.is_empty() } }
@@ -953,7 +974,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&10))
             && link_is_up(&ctx)
         {
-            ctx.log("net-stack: link up while unconfigured - auto-configuring");
+            // Let the PHY finish before asking it to carry DHCP.
+            //
+            // Hardware showed this precisely: with the cable in AT BOOT, DHCP is offered first try
+            // (11:05:46, 192.168.5.27). HOT-PLUGGED, the same dance got no offer and looped every
+            // ~25-30s forever - link-up fires as soon as the PHY reports carrier, which is before
+            // auto-negotiation has settled, so the DHCP discover goes out into a link that is not
+            // really ready yet. The LAN was never the problem.
+            //
+            // This is a HARDWARE SETTLE, the legitimate exception to waiting on truth: there is no
+            // finer signal to wait for - "negotiation complete" is not separately reported, so the
+            // only honest option is to give it its specified time. 2s covers 1000BASE-T
+            // auto-negotiation with margin, and it is paid ONCE per plug-in, not per retry.
+            link_notify(&ctx, "ethernet cable connected");
+            ctx.log("net-stack: link up while unconfigured - letting the PHY settle, then auto-configuring");
+            ctx.sleep(ctx.duration_cycles(PHY_SETTLE_MS));
             let d = run_dance(&ctx);
             our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; have_mac = d.have_mac; dns_server = d.dns_server; status = d.status;
             synced_by_dance = true;   // run_dance ends in its own SNTP sync - op 10 must not repeat it
