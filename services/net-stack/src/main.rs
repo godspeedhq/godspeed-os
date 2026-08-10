@@ -1015,7 +1015,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // finer signal to wait for - "negotiation complete" is not separately reported, so the
             // only honest option is to give it its specified time. 2s covers 1000BASE-T
             // auto-negotiation with margin, and it is paid ONCE per plug-in, not per retry.
-            link_notify(&ctx, "ethernet cable connected");
+            // The announce lives on the TICK only. It was here too, so a plug-in printed "connected"
+            // twice - once when the tick saw the link change, then again when the next request drove
+            // auto-config. One event, one line: the tick owns the transition, this path owns the dance.
             ctx.log("net-stack: link up while unconfigured - letting the PHY settle, then auto-configuring");
             ctx.sleep(ctx.duration_cycles(PHY_SETTLE_MS));
             let d = run_dance(&ctx);
