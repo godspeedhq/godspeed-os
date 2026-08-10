@@ -374,11 +374,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 None => {
                     // Nothing typed. Did anything DRAW? If the console write counter moved, someone
                     // else wrote (e.g. "NET: ethernet cable connected") and the prompt is now buried.
-                    let seq = ctx.console_write_seq();
-                    if seq != last_console_seq {
-                        last_console_seq = seq;
+                    if ctx.console_write_seq() != last_console_seq {
                         ctx.console_write("gsh> ");
                         line.redraw_tail(&ctx);
+                        // Re-read AFTER drawing, not before: the redraw itself writes to the console
+                        // and bumps this very counter. Sampling first meant our own output looked like
+                        // somebody else's on the next tick, and the prompt redrew forever -
+                        // "gsh> gsh> gsh> ..." across the screen. A watcher that trips on its own
+                        // reaction has to account for that reaction.
+                        last_console_seq = ctx.console_write_seq();
                     }
                     continue;
                 }
