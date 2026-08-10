@@ -246,6 +246,17 @@ mem | assert contains used
 # So: poll the truth, bounded, then assert unconditionally. On a synced machine this costs one
 # iteration; on a machine with no network it costs 20s and then FAILS LOUDLY, which is correct - a
 # machine that cannot tell the time should not report a passing clock test.
+# THREE outcomes, not two - because "we could not check" is not the same as "it works".
+#
+#   clock set                -> assert the format. A real test that can fail.
+#   clock unset, network up  -> FAIL. SNTP is reachable and did not set the clock; that is a defect
+#                               and passing here would hide it.
+#   clock unset, no network  -> SKIP, said out loud, and NOT counted as a failure. A machine with no
+#                               internet cannot know the time, and failing a clock-FORMAT test for a
+#                               missing cable tests the LAN rather than GodspeedOS.
+#
+# The skip is the interesting case: passing outright would make this a test that cannot fail on any
+# offline machine, so a broken `date` would go green there. Skipping says what happened instead.
 $clockwait = 0
 loop {
   if date | contains : { break }
@@ -253,7 +264,13 @@ loop {
   if $clockwait > 20 { break }
   wait 1
 }
-date | assert contains :
+if date | contains : {
+  date | assert contains :
+} else if net | contains unassigned {
+  echo 'SKIP  date - no network on this machine, so the clock cannot be set (not a failure)'
+} else {
+  fail "date: the network is up but the clock never got set - SNTP is not working"
+}
 help | assert contains status
 # uptime - a record producer (wall-clock RTC delta): bare grid + json + column projection.
 assert ok uptime
