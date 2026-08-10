@@ -238,22 +238,29 @@ mem | assert contains used
 # passes; boot WITHOUT ethernet -> never set, and the old assertion failed for a missing cable rather
 # than for anything wrong with GodspeedOS.
 #
-# `date sync` is used as the PROBE because it is the only thing here that yields a testable outcome:
-# `assert contains` fails the suite rather than returning a boolean, and there is no bare `contains`.
-# It is cheap when the clock is already set and returns Err when there is no network.
+# The probe READS, it does not repair. An earlier version ran `date sync` here, and the user was right
+# to reject it: a check must not perform a network operation or set the machine's clock as a side
+# effect. That is a repair wearing a probe's face, it costs time on every run, and a test that changes
+# the system has stopped measuring it.
 #
-# NOT a repair dressed as a test: if the sync succeeds, the format is still asserted properly below,
-# so a broken `date` still fails. Only the "this machine cannot know the time" case is skipped, and it
-# is skipped OUT LOUD - a silent skip would be a test that quietly stops testing.
+# `date epoch` yields 0 when the clock is unset, so iterating its output (`for line in (producer)`,
+# section 6 above) gives a testable value without touching anything. `assert contains` cannot serve as
+# the probe because it FAILS the suite rather than returning a boolean, and there is no bare
+# `contains` - that dead end is what made an earlier attempt invent syntax.
+#
+# When the clock IS set the format is still asserted properly, so a broken `date` still fails. Only
+# "this machine cannot know the time" is skipped, and it is skipped OUT LOUD, because a silent skip is
+# a test that has quietly stopped testing.
 #
 # (An earlier version of this hung the whole suite: it used `$var = ...`, which is not an assignment,
 # so a counter never incremented and a `wait 1` loop ran forever. Real grammar is in section 7 above:
 # `let mut` to declare, `name = $name + 1` to assign. Test script changes on hardware before shipping.)
-date sync
-if result == Ok {
+let mut clockset = 0
+for line in (date epoch) { if $line > 0 { clockset = 1 } }
+if $clockset > 0 {
     date | assert contains :
 } else {
-    echo 'SKIP  date - no network on this machine, so the clock cannot be set (not a failure)'
+    echo 'SKIP  date - the clock is not set on this machine (no RTC, no network); not a failure'
 }
 help | assert contains status
 # uptime - a record producer (wall-clock RTC delta): bare grid + json + column projection.
