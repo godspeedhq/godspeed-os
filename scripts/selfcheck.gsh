@@ -231,15 +231,28 @@ about | assert contains GodspeedOS
 version | assert contains GodspeedOS
 cores | assert contains cores
 mem | assert contains used
-# KNOWN: this fails on the FIRST selfcheck after boot on a board with no RTC (the Pi 4), and passes on
-# every later one. `date` prints a time only once the clock is SET, and with no RTC that waits for
-# SNTP - so the result depends on how long ago you booted, which means this line is partly measuring
-# the network rather than `date`.
+# Commandment VIII: wait on the TRUTH, not on time - and bound the wait.
 #
-# Deliberately NOT "fixed" by wrapping it in `if date | contains :` - that reduces to asserting a
-# thing only when it already holds, a test that cannot fail. A known honest failure is worth more than
-# a green light that means nothing. The real fix is to sync (or skip loudly) before asserting format;
-# that needs a skip-with-reason the harness does not have yet.
+# This board has no RTC, so `date` prints a time only once SNTP has set the clock. Measured on a Pi 4:
+# the prompt is up at boot+0.2s and the clock is set at boot+5.0s, so a selfcheck run straight after
+# boot asserted against a fact the system had not established yet. That is not a broken clock, it is a
+# reader that does not wait for what it depends on.
+#
+# The two tempting non-fixes are both wrong. A fixed `wait 15` waits on TIME: it would pass here and
+# fail on a slower link, and cost 15s on every run. Wrapping the assert in `if date | contains :`
+# reduces to asserting something only when it already holds - a test that cannot fail, which this
+# session has now seen enough of.
+#
+# So: poll the truth, bounded, then assert unconditionally. On a synced machine this costs one
+# iteration; on a machine with no network it costs 20s and then FAILS LOUDLY, which is correct - a
+# machine that cannot tell the time should not report a passing clock test.
+$clockwait = 0
+loop {
+  if date | contains : { break }
+  $clockwait = $clockwait + 1
+  if $clockwait > 20 { break }
+  wait 1
+}
 date | assert contains :
 help | assert contains status
 # uptime - a record producer (wall-clock RTC delta): bare grid + json + column projection.
