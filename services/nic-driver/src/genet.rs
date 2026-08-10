@@ -949,7 +949,7 @@ impl<'a> Genet<'a> {
     /// Both were missing from the first receive enable, and either alone is enough to receive nothing:
     /// the speed because the MAC and PHY must clock together, and the burst size because it is part of
     /// the DMA init sequence Linux performs before starting the engine.
-    fn apply_link_settings(&self) -> u32 {
+    pub(crate) fn apply_link_settings(&self) -> u32 {
         self.wr(dma_reg(RDMA_OFFSET, DMA_SCB_BURST_SIZE), DMA_MAX_BURST_LENGTH);
         self.wr(dma_reg(TDMA_OFFSET, DMA_SCB_BURST_SIZE), DMA_MAX_BURST_LENGTH);
 
@@ -1276,6 +1276,10 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
     // because printing from the transmit path is what makes it useful: it is the thing that proved the
     // RGMII clock skew (frames well-formed, tx_pkt climbing, nothing ever answering).
     let mut tx_reports: u32 = 0;
+    // Link state as of the last status request, for edge-triggered re-apply (see its use below).
+    // SEEDED FROM THE CURRENT LINK, so a cable that was already present at bring-up is not treated as
+    // a fresh transition - `bring_up` has just applied the settings for it.
+    let mut link_was_up = g.link_is_up();
     let mut rxbuf = [0u8; FRAME_MAX];
 
     loop {
@@ -1290,7 +1294,29 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
             let mut out = [0u8; 8];
             out[0] = 1;
             out[1..7].copy_from_slice(&mac);
-            out[7] = g.link_is_up() as u8;
+            // RE-APPLY the link settings when a cable arrives after bring-up.
+            //
+            // `apply_link_settings` (MAC speed + DMA burst) runs only during `bring_up`. Boot WITH a
+            // cable and the PHY has negotiated by then, so the speed is programmed and the receiver
+            // works. Boot WITHOUT one and it logs "PHY has not settled on a speed - leaving the MAC at
+            // its default", and nothing ever ran it again - so when the cable appeared the MAC was
+            // still unclocked and NOTHING was received. Measured, not guessed: net-stack's DHCP dance
+            // reported "saw 0 frames" on every hot-plug attempt, against 4-5 frames per attempt on a
+            // cable-at-boot run.
+            //
+            // Done HERE because this is the one place the link is already read live, on the status
+            // request net-stack makes before it dances - so the settings are applied a moment before
+            // the frames that need them, with no polling added anywhere.
+            //
+            // Edge-triggered: only on a down -> up TRANSITION. Re-running it on every status request
+            // would rewrite MAC registers under live traffic for no reason.
+            let up_now = g.link_is_up();
+            if up_now && !link_was_up {
+                ctx.log("nic-driver: genet link came up after bring-up - re-applying MAC speed and DMA burst");
+                g.apply_link_settings();
+            }
+            link_was_up = up_now;
+            out[7] = up_now as u8;
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out));
         } else if p.len() == 1 && p[0] == 4 {
             // RX-only: one frame, no TX.
