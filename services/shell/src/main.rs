@@ -269,6 +269,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.console_write("(F1=help or type 'help')\ngsh> ");
 
     let mut line = Line::new();
+    // How many console writes we had seen when the prompt was last drawn. If it moves while we are
+    // waiting for a key, somebody else printed (e.g. net-stack's cable INFO) and the prompt is buried.
+    let mut last_console_seq = ctx.console_write_seq();
     // Current location on the (single) drive: the directory bare/relative paths target,
     // moved by `cd` (utilities/17_cd.md). Session state; resets to "/" each boot.
     let mut cwd = Cwd::root();
@@ -362,7 +365,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // ever after costs a wakeup every MUTED_POLL_MS for the few seconds SNTP takes, and nothing at
         // all for the rest of the boot.
         let b = if clock_floor_recorded {
-            ctx.console_read()
+            // Wait for a key, but wake periodically so a line another service printed does not leave
+            // the user staring at output with no prompt under it. Still BLOCKING (the kernel's timed
+            // wake, not a poll), so an idle shell stays idle - which is exactly why this used to be a
+            // bare `console_read`.
+            match ctx.console_read_timeout(ctx.duration_cycles(500)) {
+                Some(b) => b,
+                None => {
+                    // Nothing typed. Did anything DRAW? If the console write counter moved, someone
+                    // else wrote (e.g. "NET: ethernet cable connected") and the prompt is now buried.
+                    let seq = ctx.console_write_seq();
+                    if seq != last_console_seq {
+                        last_console_seq = seq;
+                        ctx.console_write("gsh> ");
+                        line.redraw_tail(&ctx);
+                    }
+                    continue;
+                }
+            }
         } else {
             match ctx.try_console_read() {
                 Some(b) => b,
