@@ -879,7 +879,24 @@ fn link_notify(ctx: &ServiceContext, msg: &str) {
     ctx.console_write("
  NET: ");
     ctx.console_write(msg);
+    // Say that the prompt is still there, rather than trying to redraw it.
+    //
+    // The USB drivers appear to "return to gsh>" but do something we must not: their notify ends with
+    // `console_push`, a byte into the shell's INPUT ring, and the shell simply reads it as a keypress.
+    // That is keystroke-injection authority, inherent to being a keyboard and wrong for a service that
+    // parses traffic from off the machine (SEC-2 - the kernel cannot tell an injected byte from a
+    // typed one).
+    //
+    // Reconstructing the redraw from outside was tried and removed: a kernel console-write counter, a
+    // timed console read, and a shell that redrew when the counter moved. Three moving parts to
+    // replace one byte, and it tripped on its own output ("gsh> gsh> gsh> ..." across the screen).
+    // A narrow "nudge" capability was considered and rejected too - it injects nothing, but it is a
+    // wake-anybody primitive (a DoS lever) that taxes every console reader with handling spurious
+    // wakes, which is a lot of new kernel surface for a cosmetic gain (§26.2).
+    //
+    // So: tell the truth instead. The prompt is waiting, the shell is fine, press a key.
     ctx.console_write("
+      (press Enter to return to the prompt)
 ");
 }
 

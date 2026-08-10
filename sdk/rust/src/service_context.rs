@@ -1014,14 +1014,6 @@ impl ServiceContext {
     /// Return the bytes dynamically allocated by this task so far.
     ///
     /// Wraps InspectKernel query 0. Used by property test P4 (§10.3).
-    /// Monotonic count of console writes. Compare it with a previously-seen value to learn that
-    /// SOMETHING drew on the screen (e.g. another service's INFO line) while you were waiting.
-    pub fn console_write_seq(&self) -> u64 {
-        // SAFETY: syscall(13) = InspectKernel; query_id=23 = console write sequence.
-        let ret = unsafe { raw_syscall(13, 23, 0, 0) };
-        if ret < 0 { 0 } else { ret as u64 }
-    }
-
     pub fn inspect_kernel_alloc_bytes(&self) -> u64 {
         // SAFETY: syscall(13) = InspectKernel; query_id=0 = task alloc bytes.
         let ret = unsafe { raw_syscall(13, 0, 0, 0) };
@@ -1625,19 +1617,6 @@ impl ServiceContext {
     ///
     /// Returns the byte value. Only usable by services that declared
     /// `has_console_read` in their kernel config (currently: shell only).
-    /// Blocking console read with a DEADLINE: `Some(byte)`, or `None` if it expired with no input.
-    ///
-    /// Blocks (it arms the kernel's timed wake, the same one `recv_timeout` and `sleep` use), so an
-    /// idle caller stays idle - this is not a poll. It exists so a caller can wait for a keystroke and
-    /// still get control back periodically, e.g. to notice that another service wrote to the console
-    /// (`inspect` query 23) and redraw its prompt.
-    pub fn console_read_timeout(&self, timeout_cycles: u64) -> Option<u8> {
-        // SAFETY: syscall(51) = ConsoleReadTimeout; the kernel validates the console cap itself.
-        let ret = unsafe { raw_syscall(51, 0, timeout_cycles, 0) };
-        // 256 = timed out (distinct from every byte value and from the negative error codes).
-        if (0..=255).contains(&ret) { Some(ret as u8) } else { None }
-    }
-
     pub fn console_read(&self) -> u8 {
         let data = Self::ctx();
         // A wrong magic means the kernel handed us a corrupt ServiceContext - `self.log()` reads the
