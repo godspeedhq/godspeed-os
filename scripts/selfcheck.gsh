@@ -269,7 +269,23 @@ if date | contains : {
 } else if net | contains unassigned {
   echo 'SKIP  date - no network on this machine, so the clock cannot be set (not a failure)'
 } else {
-  fail "date: the network is up but the clock never got set - SNTP is not working"
+  # The network is up and the clock is still unset after the bounded wait. Try ONE explicit sync -
+  # not to rescue the test, but to tell two different faults apart:
+  #
+  #   sync works  -> the time source is fine and BOOT auto-sync is the defect. Still a failure: a
+  #                  machine that needs a manual command to know the time every boot is broken, and
+  #                  syncing here would hide that forever (the test would pass while every boot came
+  #                  up blind).
+  #   sync fails  -> no usable time source at all, despite a link. A different defect, worth naming.
+  #
+  # Either way this FAILS. The sync is a diagnostic, not a repair - a test that fixes the system
+  # before asserting is no longer measuring the system.
+  date sync
+  if date | contains : {
+    fail "date: boot auto-sync did not set the clock, but `date sync` works - the boot path is the defect"
+  } else {
+    fail "date: network is up but no time source could set the clock, even on an explicit `date sync`"
+  }
 }
 help | assert contains status
 # uptime - a record producer (wall-clock RTC delta): bare grid + json + column projection.
