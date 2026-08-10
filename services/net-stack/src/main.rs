@@ -889,7 +889,37 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Configure the stack (DHCP -> ARP -> ICMP). These are `mut` because `net renew` (op 8) re-runs the
     // dance in place - a link that comes up after boot recovers without a reboot.
-    let d = run_dance(&ctx);
+    //
+    // SKIPPED ENTIRELY WHEN THERE IS NO LINK. The dance is ~25 s of DHCP and ARP budgets, and it runs
+    // on this thread - net-stack's serve loop is single-threaded, so for that whole time it cannot
+    // answer a client. Boot with the cable out and every `ping` reported "net-stack not responding",
+    // which is both useless and untrue: the service was alive, the cable was not. Hardware showed the
+    // two facts side by side - `nic-driver: genet up ... link down (no cable?)` at 10:33:53, then the
+    // dance grinding through its budgets from 10:34:05.
+    //
+    // The REQUEST path already checks the link before dancing; only this boot call did not, so the
+    // guard existed and this one site went around it.
+    //
+    // Nothing is lost by skipping: `link up while unconfigured - auto-configuring` already re-runs the
+    // dance the moment a cable appears, so a machine booted unplugged configures itself on plug-in
+    // rather than needing `net renew` or a reboot. Cheap too - one status query to the NIC, seconds
+    // saved on every diskless-network boot.
+    let d = if link_is_up(&ctx) {
+        run_dance(&ctx)
+    } else {
+        ctx.log("net-stack: no link at boot (cable unplugged?) - staying unconfigured and RESPONSIVE; will configure when the link comes up");
+        // The unconfigured state, spelled out rather than defaulted: no IP, no gateway, no DNS. The
+        // MAC is still learned - it is our hardware identity and true with or without a cable
+        // (Commandment III / audit U9) - so `net` can report who we are while saying we are offline.
+        NetState {
+            our_ip: [0; 4],
+            our_mac: learn_our_mac(&ctx).unwrap_or([0; 6]),
+            gw_mac: [0; 6],
+            have_mac: false,
+            dns_server: [0; 4],
+            status: *b"link down (no cable",
+        }
+    };
     let mut our_ip = d.our_ip;
     let mut our_mac = d.our_mac;                   // learned from the NIC (audit U9), re-learned on each dance
     let mut gw_mac = d.gw_mac;
