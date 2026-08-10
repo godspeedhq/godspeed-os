@@ -866,6 +866,11 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
 /// auto-negotiation finishes, and a DHCP discover sent into that window is simply lost.
 const PHY_SETTLE_MS: u64 = 2_000;
 
+/// How often an IDLE net-stack looks at the cable. Only reached when no client request arrived, and it
+/// costs one NIC status query - a cable is a human-speed event, so a second is ample and anything
+/// faster is just IPC for its own sake.
+const LINK_TICK_MS: u64 = 1_000;
+
 /// Announce a cable coming or going on the CONSOLE, the way the USB drivers announce a keyboard or a
 /// stick. Same idea, same place on screen, so "something was plugged in" reads the same whatever it was.
 ///
@@ -941,6 +946,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             status: *b"link down (no cable",
         }
     };
+    // Last link state we announced, seeded from what the boot path already established, so a cable
+    // present at boot does not announce itself as a plug-in event the moment the first tick runs.
+    let mut last_link = d.have_mac || link_is_up(&ctx);
     let mut our_ip = d.our_ip;
     let mut our_mac = d.our_mac;                   // learned from the NIC (audit U9), re-learned on each dance
     let mut gw_mac = d.gw_mac;
@@ -951,7 +959,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut ping_seq: u16 = 0;                    // unique ICMP seq per ping - see ping() (RTT accuracy)
     let tsc_hz = calibrate_tsc_hz(&ctx);          // RTC-calibrated TSC Hz for RTT (kernel calib is 0 on T630)
     loop {
-        let req = ctx.recv();                   // block for a client request
+        // A TICK, not a bare block. `ctx.recv()` here meant net-stack learned the link state ONLY
+        // while serving a request - so a cable plugged in on an idle machine was invisible: no
+        // console INFO, and no auto-configure until something happened to ask a network question.
+        // Hardware proved it: cable plugged in after boot with no `net`/`ping` run, and nothing fired.
+        //
+        // A timed receive gives the loop a heartbeat without changing how requests are served: a
+        // message is handled exactly as before, and a timeout is the one moment we look at the cable.
+        // That single change is what makes connect INFO, disconnect INFO and auto-config-on-plug-in
+        // possible at all.
+        let req = match ctx.recv_timeout(ctx.duration_cycles(LINK_TICK_MS)) {
+            Some(r) => r,
+            None => {
+                // Idle. Look at the cable, and announce only a CHANGE - a line every second would be
+                // noise, and this driver has already learned what a per-pass diagnostic costs.
+                let up = link_is_up(&ctx);
+                if up != last_link {
+                    last_link = up;
+                    link_notify(&ctx, if up { "ethernet cable connected" } else { "ethernet cable disconnected" });
+                }
+                continue;
+            }
+        };
         // A nonzero badge = a SOCKET-CAPABILITY invocation the kernel validated (§7.10). A plain
         // name-addressed request (status / DNS / open-socket) carries no badge.
         let badge = ctx.last_recv_badge();
