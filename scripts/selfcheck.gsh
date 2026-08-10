@@ -231,21 +231,30 @@ about | assert contains GodspeedOS
 version | assert contains GodspeedOS
 cores | assert contains cores
 mem | assert contains used
-# KNOWN, and deliberately left as an honest failure: this fails on the FIRST selfcheck after boot on a
-# board with no RTC (the Pi 4) and passes on every later one. `date` prints a time only once SNTP has
-# set the clock - measured on hardware, the prompt is up at boot+0.2s and the clock lands at boot+5.0s.
+# The clock: PASS if it can be set, SKIP if this machine has no way to know the time.
 #
-# A wait-then-skip-or-fail version of this was written and REVERTED: it used syntax that does not
-# exist (`$var = ...` instead of `let mut` + `var = ...`, and a bare `contains` as a pipe target -
-# there is only `assert contains`). The result was an undefined variable, a counter that never
-# incremented, and therefore an INFINITE `wait 1` loop that hung the whole suite. Worse than the
-# failure it was fixing, and a bounded wait that turned out to be unbounded is a poor advertisement
-# for Commandment VIII.
+# This board has no RTC, so `date` prints a time only once SNTP has set the clock. Three states,
+# confirmed on hardware: boot WITH ethernet -> set at boot+5s, passes; unplug afterwards -> stays set,
+# passes; boot WITHOUT ethernet -> never set, and the old assertion failed for a missing cable rather
+# than for anything wrong with GodspeedOS.
 #
-# Redo it against the real grammar (see section 7 of this file for `let mut` / `loop` / `break`), and
-# TEST IT before shipping. The intended shape stands: bounded poll of the clock, then pass / skip
-# (no network) / fail-with-diagnosis (network up but unset).
-date | assert contains :
+# `date sync` is used as the PROBE because it is the only thing here that yields a testable outcome:
+# `assert contains` fails the suite rather than returning a boolean, and there is no bare `contains`.
+# It is cheap when the clock is already set and returns Err when there is no network.
+#
+# NOT a repair dressed as a test: if the sync succeeds, the format is still asserted properly below,
+# so a broken `date` still fails. Only the "this machine cannot know the time" case is skipped, and it
+# is skipped OUT LOUD - a silent skip would be a test that quietly stops testing.
+#
+# (An earlier version of this hung the whole suite: it used `$var = ...`, which is not an assignment,
+# so a counter never incremented and a `wait 1` loop ran forever. Real grammar is in section 7 above:
+# `let mut` to declare, `name = $name + 1` to assign. Test script changes on hardware before shipping.)
+date sync
+if result == Ok {
+    date | assert contains :
+} else {
+    echo 'SKIP  date - no network on this machine, so the clock cannot be set (not a failure)'
+}
 help | assert contains status
 # uptime - a record producer (wall-clock RTC delta): bare grid + json + column projection.
 assert ok uptime
