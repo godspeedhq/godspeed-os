@@ -1432,7 +1432,12 @@ fn serve_if_block(
     // waiting - but once per instance says everything a hundred repeats do, and this is the loop that
     // also polls the keyboard.
     let Some(reply) = ctx.take_pending_cap() else {
-        if n == 1 {
+        // Counted SEPARATELY from `n`, which counts every block-path message. Gating on `n == 1`
+        // could only ever fire if the very FIRST message a fresh instance saw was the malformed one -
+        // a guard whose trigger cannot occur in the failing case, which is the eighth instance of that
+        // shape this cycle and one I introduced while fixing the log spam an hour earlier.
+        static NO_CAP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if NO_CAP.fetch_add(1, core::sync::atomic::Ordering::Relaxed) == 0 {
             ctx.log("xhci: block request had NO reply cap - dropping it (the caller will block; further occurrences silent)");
         }
         return true;

@@ -862,10 +862,6 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
 /// path the reply is short (no link byte) - a non-empty reply means "up" (slirp's virtual link is always
 /// up). Cheap; lets net-stack notice a cable plugged in after boot and self-configure without `net renew`.
 
-/// How often an IDLE net-stack looks at the cable. Only reached when no client request arrived, and it
-/// costs one NIC status query - a cable is a human-speed event, so a second is ample and anything
-/// faster is just IPC for its own sake.
-const LINK_TICK_MS: u64 = 1_000;
 
 /// Announce a cable coming or going on the CONSOLE, the way the USB drivers announce a keyboard or a
 /// stick. Same idea, same place on screen, so "something was plugged in" reads the same whatever it was.
@@ -952,9 +948,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             status: *b"link down (no cable",
         }
     };
-    // Last link state we announced, seeded from what the boot path already established, so a cable
-    // present at boot does not announce itself as a plug-in event the moment the first tick runs.
-    let mut last_link = d.have_mac || link_is_up(&ctx);
     let mut our_ip = d.our_ip;
     let mut our_mac = d.our_mac;                   // learned from the NIC (audit U9), re-learned on each dance
     let mut gw_mac = d.gw_mac;
@@ -965,28 +958,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut ping_seq: u16 = 0;                    // unique ICMP seq per ping - see ping() (RTT accuracy)
     let tsc_hz = calibrate_tsc_hz(&ctx);          // RTC-calibrated TSC Hz for RTT (kernel calib is 0 on T630)
     loop {
-        // A TICK, not a bare block. `ctx.recv()` here meant net-stack learned the link state ONLY
-        // while serving a request - so a cable plugged in on an idle machine was invisible: no
-        // console INFO, and no auto-configure until something happened to ask a network question.
-        // Hardware proved it: cable plugged in after boot with no `net`/`ping` run, and nothing fired.
+        // A BARE BLOCK, deliberately - the idle tick that was here is REVERTED (audit A10-1/A5-2).
         //
-        // A timed receive gives the loop a heartbeat without changing how requests are served: a
-        // message is handled exactly as before, and a timeout is the one moment we look at the cable.
-        // That single change is what makes connect INFO, disconnect INFO and auto-config-on-plug-in
-        // possible at all.
-        let req = match ctx.recv_timeout(ctx.duration_cycles(LINK_TICK_MS)) {
-            Some(r) => r,
-            None => {
-                // Idle. Look at the cable, and announce only a CHANGE - a line every second would be
-                // noise, and this driver has already learned what a per-pass diagnostic costs.
-                let up = link_is_up(&ctx);
-                if up != last_link {
-                    last_link = up;
-                    link_notify(&ctx, if up { "ethernet cable connected" } else { "ethernet cable disconnected" });
-                }
-                continue;
-            }
-        };
+        // The tick called `link_is_up()` every second to announce a cable, and that goes through
+        // `nic_req` -> a wait loop that `try_recv`s THIS SAME serve endpoint and returns whatever
+        // lands. So once a second it opened a window where a CLIENT request was read as the NIC's
+        // status reply: never served, its reply cap left on the kernel's pending FIFO (so the next
+        // reply went to the wrong client), and the real NIC reply then parsed as a different op.
+        //
+        // Two independent audits found it. It is a correctness bug bought with a cosmetic feature -
+        // announcing an unplug without being asked - so the feature goes. `NET: ethernet cable
+        // connected` still appears on the request path, where net-stack is answering anyway.
+        //
+        // The lesson for whoever restores it: net-stack serves clients and receives nic-driver replies
+        // on ONE untagged endpoint. Anything that talks to the NIC outside of serving a request will
+        // steal messages. Fix the endpoint (a separate one for driver replies, or correlation tags
+        // like fs uses) BEFORE adding a tick, not after.
+        let req = ctx.recv();
         // A nonzero badge = a SOCKET-CAPABILITY invocation the kernel validated (§7.10). A plain
         // name-addressed request (status / DNS / open-socket) carries no badge.
         let badge = ctx.last_recv_badge();
