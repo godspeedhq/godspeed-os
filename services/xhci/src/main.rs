@@ -2677,6 +2677,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Interrupts actually delivered, as distinct from messages received. Reported in the heartbeat so
     // "are we using interrupts?" is answered by a number instead of by a log line that could not tell.
     let mut msi_count: u64 = 0;
+    let mut msg_count: u64 = 0;
     // The vector the KERNEL programmed this controller's MSI to deliver on; an interrupt notification
     // arrives as exactly this one byte (kernel/src/ipc/message.rs), which is what makes a real IRQ
     // distinguishable from a block request on the same endpoint.
@@ -3337,6 +3338,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // evidence. Now it means what it says.
             let is_irq = woke.as_ref().is_some_and(|m| m.payload_bytes() == [MSI_VECTOR]);
             if is_irq { msi_count = msi_count.saturating_add(1); }
+            // Woken by a message that is NOT an interrupt - i.e. a block request, or anything else
+            // addressed to this endpoint. Counted because the arithmetic says something is: the idle
+            // deadline is HUB_POLL_MS (2 wakes/sec) and MSI runs ~5/sec, yet the loop turns ~39
+            // times/sec. Roughly 32 wakes/sec are unaccounted for, and at ~3.6 ms of work each that
+            // IS the service's remaining CPU. Guessing which sender it is has been the expensive move
+            // this week; this makes the log say it.
+            if let Some(m) = woke.as_ref() {
+                if !is_irq {
+                    msg_count = msg_count.saturating_add(1);
+                    // Say WHAT it is, once. Either something really is sending ~32 messages/sec, or
+                    // `is_irq` is wrong and these ARE interrupts miscounted - the kernel's
+                    // notification carries the IRQ number, and if that is not 0x28 on this board the
+                    // test above silently fails. One line settles which, and a wrong diagnostic that
+                    // ends an investigation is worse than none (see the "waking on interrupts" line
+                    // that cost this session a day).
+                    if msg_count == 1 {
+                        let p = m.payload_bytes();
+                        ctx.log_fmt(format_args!(
+                            "xhci: [wake] first non-IRQ message: len={} first={:#04x}",
+                            p.len(), p.first().copied().unwrap_or(0)));
+                    }
+                }
+            }
             if woke.is_some() { quiet_waits = 0; } else { quiet_waits = quiet_waits.saturating_add(1); }
             if is_irq { irq_seen = true; }
             if let Some(m) = woke {
@@ -3483,8 +3507,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // next step is comparing CNTPCT deltas against BSP tick counts - two independent
                 // clocks. Either way the log answers it without a rebuild.
                 ctx.log_fmt(format_args!(
-                    "xhci: alive - t={}s, {} poll passes, {} MSI, {} HID bound, disk {}",
-                    ctx.epoch_secs_monotonic(), passes, msi_count, ndev,
+                    "xhci: alive - t={}s, {} poll passes, {} MSI, {} msg, {} HID bound, disk {}",
+                    ctx.epoch_secs_monotonic(), passes, msi_count, msg_count, ndev,
                     if disk.is_some() { "yes" } else { "no" }));
             }
             let hub_due =
