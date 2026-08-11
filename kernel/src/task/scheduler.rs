@@ -548,7 +548,7 @@ pub unsafe fn commit_task(
     unsafe {
         TASK_CTX[slot].write(ctx);
         TASK_NAME[slot]             = name;
-        TASK_SPAWN_DT[slot].store(crate::arch::imp::rtc::now_epoch_monotonic().max(0) as u64, Ordering::Relaxed);
+        TASK_SPAWN_DT[slot].store(crate::arch::imp::rtc::now_epoch_monotonic().max(1).max(0) as u64, Ordering::Relaxed);
         TASK_IS_USER[slot]          = is_user;
         // Arch hook: on ARM a user task's syscalls must run atomically (the timer skips preempting it
         // in SVC), which needs the slot recorded arch-locally. No-op on x86 (it reads TASK_IS_USER).
@@ -588,7 +588,7 @@ pub fn enqueue(
                 TASK_CAP[i].write(caps);
                 TASK_STATE[i].store(TaskState::Ready as u8, Ordering::Relaxed);
                 TASK_NAME[i]             = name;
-                TASK_SPAWN_DT[i].store(crate::arch::imp::rtc::now_epoch_monotonic().max(0) as u64, Ordering::Relaxed);
+                TASK_SPAWN_DT[i].store(crate::arch::imp::rtc::now_epoch_monotonic().max(1).max(0) as u64, Ordering::Relaxed);
                 TASK_VALID[i].store(true, Ordering::Release);
                 TASK_CORE[i]             = core_id;
                 TASK_IS_USER[i]          = is_user;
@@ -898,6 +898,15 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
                 // and the deglitched RTC epoch on x86, so `now - spawn` is correct on both. saturating_sub
                 // floors a backwards read; the monotonic timeline caps it at the system uptime intrinsically
                 // (a task can't spawn before boot). 0 if never stamped (empty slot / spawned at second 0).
+                // 0 means UNSTAMPED (an empty slot), and only that.
+                //
+                // It used to also mean "spawned during the first second of boot", because the stamp
+                // is seconds-since-boot and every boot service spawns inside that window. On a board
+                // with no RTC that is every service, every boot: they all read a spawn of 0, hit this
+                // guard, and reported an uptime of 0 FOREVER - which is what `observe` shows. The
+                // stamp is now floored to 1 at the two sites that write it, so a real spawn is never
+                // confused with an empty slot, at a cost of at most one second on a task that started
+                // in the first second of the machine's life.
                 let spawn = TASK_SPAWN_DT[slot].load(Ordering::Relaxed);
                 if spawn == 0 { 0 } else {
                     (crate::arch::imp::rtc::now_epoch_monotonic().max(0) as u64).saturating_sub(spawn)
