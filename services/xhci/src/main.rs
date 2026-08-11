@@ -2678,6 +2678,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // "are we using interrupts?" is answered by a number instead of by a log line that could not tell.
     let mut msi_count: u64 = 0;
     let mut msg_count: u64 = 0;
+    let mut fast_waits: u64 = 0;
+    let mut idle_waits: u64 = 0;
     // The vector the KERNEL programmed this controller's MSI to deliver on; an interrupt notification
     // arrives as exactly this one byte (kernel/src/ipc/message.rs), which is what makes a real IRQ
     // distinguishable from a block request on the same endpoint.
@@ -3315,6 +3317,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // At rest that is ~2 passes/sec instead of ~85, which is where the service's ~23% CPU
             // goes. Moving the other two onto events would let the timed wake go entirely.
             let repeat_armed = (0..ndev).any(|d| !devs[d].is_mouse && kb_rep[d].armed());
+            // Which branch was actually taken, counted - because the observed pace (36 passes/sec,
+            // ~28 ms per wait) matches NEITHER the 10 ms repeat branch (100/sec) nor the 500 ms idle
+            // branch (2/sec), and only 5.6 wakes/sec come from messages. Reading the code cannot say
+            // which; counting can.
+            if repeat_armed { fast_waits = fast_waits.saturating_add(1); }
+            else { idle_waits = idle_waits.saturating_add(1); }
             let deadline = if repeat_armed {
                 base
             } else if polling {
@@ -3507,8 +3515,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // next step is comparing CNTPCT deltas against BSP tick counts - two independent
                 // clocks. Either way the log answers it without a rebuild.
                 ctx.log_fmt(format_args!(
-                    "xhci: alive - t={}s, {} poll passes, {} MSI, {} msg, {} HID bound, disk {}",
-                    ctx.epoch_secs_monotonic(), passes, msi_count, msg_count, ndev,
+                    "xhci: alive - t={}s, {} passes ({} fast/{} idle), {} MSI, {} msg, {} HID, disk {}",
+                    ctx.epoch_secs_monotonic(), passes, fast_waits, idle_waits, msi_count, msg_count, ndev,
                     if disk.is_some() { "yes" } else { "no" }));
             }
             let hub_due =
