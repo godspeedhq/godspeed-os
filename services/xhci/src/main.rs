@@ -2737,6 +2737,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut seg_mark:  u64 = 0;
     let mut fast_waits: u64 = 0;
     let mut idle_waits: u64 = 0;
+    // WHY the hub probes fail. Two mechanisms fit the evidence equally well so far, and they need
+    // opposite fixes, so guessing between them is how this loop gets churned a fourth time:
+    //
+    //   (a) the answer ARRIVES but too late - the probe gave up, and the next pass's drain eats the
+    //       completion. Correlation: several consumers, one event ring, nothing saying which
+    //       completion belongs to whom. The same shape as docs/net-tags-design.md, one layer down.
+    //   (b) the answer NEVER COMES - the TD is not executed at all (a halted EP0, a doorbell that
+    //       does not land, a TD queued behind an abandoned one that never retired).
+    //
+    // `posted` counts probes issued, `ok` counts probes that got their own answer, and `late`
+    // counts hub completions the DRAIN found - i.e. answers that arrived with no probe waiting.
+    //
+    //   posted ~= ok                  -> probes are fine, look elsewhere
+    //   posted >> ok, late ~= deficit -> (a) correlation: the answers exist, we throw them away
+    //   posted >> ok, late ~= 0       -> (b) the hub is not answering at all
+    //
+    // One line in the heartbeat decides it. Every previous round here counted events and could not
+    // separate these two, which is exactly why it took four attempts to find the last one.
+    let mut hub_posted: u64 = 0;
+    let mut hub_ok: u64 = 0;
+    let mut hub_late: u64 = 0;
     // The vector the KERNEL programmed this controller's MSI to deliver on; an interrupt notification
     // arrives as exactly this one byte (kernel/src/ipc/message.rs), which is what makes a real IRQ
     // distinguishable from a block request on the same endpoint.
@@ -3532,6 +3553,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             deliver_hid_report(&ctx, &dma, d, &devs, &mut kb_last,
                                                &mut kb_rep, &mut kb_caps, &mut mouse);
                             need_queue[d] = true;
+                        } else if devs[..ndev].iter().any(|h| h.hub_slot == slot_id) {
+                            // A completion for a HUB, found by the drain - so it arrived with no
+                            // probe waiting for it, i.e. AFTER the probe that asked gave up. This is
+                            // the answer to a question we already abandoned, and we are about to
+                            // throw it away. Count it: it is the whole difference between mechanism
+                            // (a) and mechanism (b) above.
+                            hub_late = hub_late.wrapping_add(1);
                         }
                     }
                     Some(_) => {} // non-transfer event (port change, command, etc.) - drained
@@ -3598,12 +3626,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // next step is comparing CNTPCT deltas against BSP tick counts - two independent
                 // clocks. Either way the log answers it without a rebuild.
                 ctx.log_fmt(format_args!(
-                    "xhci: alive - t={}s, {} passes ({} fast/{} idle), work {}ms (serve {} drain {} hub {}), {} MSI, {} msg, {} HID, disk {}",
+                    "xhci: alive - t={}s, {} passes ({} fast/{} idle), work {}ms (serve {} drain {} hub {}), probes {}/{} ok {} late, {} MSI, {} msg, {} HID, disk {}",
                     ctx.epoch_secs_monotonic(), passes, fast_waits, idle_waits,
                     work_cycles / ctx.duration_cycles(1).max(1),
                     seg_serve / ctx.duration_cycles(1).max(1),
                     seg_drain / ctx.duration_cycles(1).max(1),
                     seg_hub   / ctx.duration_cycles(1).max(1),
+                    hub_ok, hub_posted, hub_late,
                     msi_count, msg_count, ndev,
                     if disk.is_some() { "yes" } else { "no" }));
             }
@@ -3637,6 +3666,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         &mut eaten,
                         &mut abandoned,
                     );
+                    hub_posted = hub_posted.wrapping_add(1);
+                    if st.is_some() && !abandoned {
+                        hub_ok = hub_ok.wrapping_add(1);
+                    }
                     topo.note(&ctx, devs[d].hub_slot, devs[d].hub_port, st);
                     hub_cur[owner] = cur;
                     hub_pcs[owner] = pcs;
@@ -3742,6 +3775,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 &dma, &mmio, dboff, ir0, hub_slot, hub_dev, hp,
                                 &mut c2, &mut p2, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut abandoned,
                             );
+                            hub_posted = hub_posted.wrapping_add(1);
+                            if st.is_some() && !abandoned {
+                                hub_ok = hub_ok.wrapping_add(1);
+                            }
                             topo.note(&ctx, hub_slot, hp, st);
                             hub_cur[owner] = c2;
                             hub_pcs[owner] = p2;
@@ -3922,6 +3959,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             &mut eaten,
                             &mut abandoned,
                         );
+                        hub_posted = hub_posted.wrapping_add(1);
+                        if st.is_some() && !abandoned {
+                            hub_ok = hub_ok.wrapping_add(1);
+                        }
                         topo.note(&ctx, hub_slot, hp, st);
                         hub_cur[owner] = cur;
                         hub_pcs[owner] = pcs;
@@ -4028,6 +4069,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             &dma, &mmio, dboff, ir0, hs, hd, hp,
                             &mut cur, &mut pcs, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut abandoned,
                         );
+                        hub_posted = hub_posted.wrapping_add(1);
+                        if st.is_some() && !abandoned {
+                            hub_ok = hub_ok.wrapping_add(1);
+                        }
                         topo.note(&ctx, hs, hp, st);
                         match st {
                             // The disk's own port answering "disconnected" is a REMOVAL. Two
