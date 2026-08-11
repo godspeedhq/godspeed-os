@@ -66,6 +66,63 @@ const ERST_OFF: usize = 0x3000;
 const INPUT_CTX_OFF: usize = 0x4000; // transient: built per device for Address/Configure
 const DATA_BUF_OFF: usize = 0x5000; // transient: control-transfer data during enumeration
 const CONFIG_BUF_OFF: usize = 0x6000; // transient: config descriptor during enumeration
+/// The hub port-status probe's OWN 4-byte landing area.
+///
+/// It used to share `DATA_BUF_OFF` "unused by the poll loop, so safe to reuse here". That stopped
+/// being true once a probe's completion could be collected a pass after it was posted: an in-flight
+/// probe's data must survive whatever else runs in between. This sits in the ERST page, which the
+/// controller reads once at init (a single 16-byte segment entry) and never touches again, so the
+/// tail of that page is permanently free.
+const PROBE_BUF_OFF: usize = 0x3F00;
+
+/// A completion mailbox, one entry per xHCI slot id.
+///
+/// The event ring has SEVERAL consumers - the poll loop's drain, `msc::await_on_slot` serving disk
+/// requests, and `hub_port_status` probing hub ports - and only one of them is the intended owner of
+/// any given completion. Before this, a consumer that dequeued someone else's transfer event
+/// recorded only a re-arm BIT and threw the completion away. That silently destroyed hub probe
+/// answers (the disk path ate them a pass later), which is why USB hot-plug did nothing: the probes
+/// never got answers, and a probe with no answer correctly concludes nothing.
+///
+/// So a consumer that takes an event it does not own now FILES it here, and every waiter checks its
+/// own mailbox before touching the ring. Same fix `fs` needed for the same reason (replies matched by
+/// arrival order - "run `ls` twice and it is out of step"); `docs/net-tags-design.md` is the same
+/// problem one layer up. Full treatment: `docs/xhci-completion-correlation.md`.
+///
+/// Bounded and flat (§26.6.1): a fixed 32-entry array, no heap, indexed by slot id.
+pub(crate) struct EvMail {
+    /// Slots whose in-flight TRB was consumed by someone else. The poll loop re-arms these
+    /// endpoints - their TRB is spent. This is the original `eaten` bitmap, semantics unchanged.
+    pub have: u32,
+    /// The completion code that arrived with it, so the slot's real owner can still collect it
+    /// instead of waiting out a deadline for an answer that already came and was discarded.
+    cc: [u32; 32],
+}
+
+impl EvMail {
+    pub(crate) fn new() -> Self {
+        Self { have: 0, cc: [0; 32] }
+    }
+
+    /// File a completion belonging to a consumer other than the one that dequeued it.
+    pub(crate) fn put(&mut self, sid: u32, cc: u32) {
+        if sid < 32 {
+            self.have |= 1 << sid;
+            self.cc[sid as usize] = cc;
+        }
+    }
+
+    /// Collect this slot's completion if one was filed, clearing it. `None` means nothing is
+    /// waiting - which is a different fact from "the transfer failed", and callers must keep them
+    /// apart (a missing answer concludes nothing; §26.7).
+    pub(crate) fn take(&mut self, sid: u32) -> Option<u32> {
+        if sid < 32 && self.have & (1 << sid) != 0 {
+            self.have &= !(1 << sid);
+            return Some(self.cc[sid as usize]);
+        }
+        None
+    }
+}
 
 // Scratchpad: the controller's own runtime DMA workspace. DCBAA[0] points at the
 // Scratchpad Buffer Array (SBA) - an array of physical pointers to N page-aligned
@@ -738,10 +795,12 @@ fn hub_port_status(
     pcs: &mut u32,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
-    eaten: &mut u32,
+    eaten: &mut EvMail,
     // Set when the probe gave up its own transfer to deliver someone else's completion. NOT a
     // failure: it is evidence of nothing, and must never feed an absence or wedge counter.
     abandoned: &mut bool,
+    // Latch so a FAILED transfer completion is reported once per hub rather than once per probe.
+    cc_logged: &mut bool,
 ) -> Option<bool> {
     const RING: usize = 0x1000;
     let base = ep0_tr_off(hub_dev);
@@ -758,6 +817,20 @@ fn hub_port_status(
         *cur = 0;
         *pcs ^= 1;
     }
+    // RESYNCHRONISE before asking again.
+    //
+    // A probe that gave up leaves an UNRETIRED TD on this hub's EP0. Its completion lands later and
+    // is filed in the mailbox by whichever consumer dequeues it. If we post a fresh TD without
+    // clearing that, the next completion we accept is the PREVIOUS question's answer - about a
+    // possibly different port, with a stale data buffer - and every probe from then on is one
+    // behind. That is a lockstep desync, and it is exactly the bug `fs` had (replies matched by
+    // arrival order: "run `ls` twice and it is out of step").
+    //
+    // So: take any pending answer for this hub and DISCARD it explicitly. It answers a question we
+    // already abandoned, and acting on it would be worse than not having it.
+    if let Some(stale) = eaten.take(hub_slot) {
+        let _ = stale;
+    }
     let tr = base + *cur;
     let c = *pcs;
     // Setup: GET_STATUS(port) - bmRequestType 0xA3 (class, other, IN), bRequest 0, wValue 0,
@@ -767,7 +840,7 @@ fn hub_port_status(
     dma.write32(tr + 8, 8);
     dma.write32(tr + 12, c | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16)); // IDT, TRT=IN
                                                                               // Data: 4 bytes IN into DATA_BUF_OFF (unused by the poll loop, so safe to reuse here).
-    let dp = dma.phys_at(DATA_BUF_OFF);
+    let dp = dma.phys_at(PROBE_BUF_OFF);
     dma.write32(tr + 16, dp as u32);
     dma.write32(tr + 20, (dp >> 32) as u32);
     dma.write32(tr + 24, 4);
@@ -847,19 +920,35 @@ fn hub_port_status(
         }
         match ev {
             Some((TRB_TRANSFER_EVENT, cc, sid)) if sid == hub_slot => {
-                return if cc == 1 || cc == 13 {
-                    Some(dma.read16(DATA_BUF_OFF) & 1 != 0) // wPortStatus bit0 = current connect
-                } else {
-                    None
-                };
+                if cc == 1 || cc == 13 {
+                    return Some(dma.read16(PROBE_BUF_OFF) & 1 != 0); // wPortStatus bit0 = connect
+                }
+                // The transfer came back FAILED, and this used to return a bare `None` - identical
+                // to "no answer arrived", which is a completely different fact (§26.7: a failure
+                // must not be indistinguishable from an absence).
+                //
+                // It matters here specifically: a STALL halts EP0, and a halted endpoint retires
+                // NOTHING afterwards, so every later probe on this hub times out forever. That looks
+                // exactly like "the answers are being eaten" from the outside, and the two want
+                // opposite fixes. Printing the completion code separates them in one line.
+                //
+                // Once per hub, not per probe: a halted endpoint fails every probe, and this must
+                // report a fault, not become one.
+                if !*cc_logged {
+                    *cc_logged = true;
+                    ctx.log_fmt(format_args!(
+                        "xhci: hub slot {} port {} status transfer FAILED (cc {}) - not a timeout; \
+                         a halt here stops every later probe on this hub",
+                        hub_slot, hub_port, cc
+                    ));
+                }
+                return None;
             }
             // A stray HID transfer event (a keystroke landing in this check window) - record its slot
             // so the caller re-arms that endpoint (its in-flight TRB is now spent). The report itself
             // is lost, a rare dropped keystroke, but the endpoint does not stall. Keep waiting for ours.
-            Some((TRB_TRANSFER_EVENT, _, sid)) => {
-                if sid < 32 {
-                    *eaten |= 1 << sid;
-                }
+            Some((TRB_TRANSFER_EVENT, cc, sid)) => {
+                eaten.put(sid, cc);
                 // ABANDON THE PROBE and let the caller deliver the keystroke NOW.
                 //
                 // This used to keep waiting for its own event, so a key pressed during a probe sat
@@ -877,7 +966,7 @@ fn hub_port_status(
                 // is the interactive path; a removal noticed 500 ms later is not felt.
                 //
                 // FLAGGED as abandoned, because the caller cannot tell otherwise and the guard I
-                // first wrote (`None if eaten != 0`) did not work: `eaten` is re-zeroed every pass
+                // first wrote (`None if eaten.have != 0`) did not work: `eaten` is re-zeroed every pass
                 // (see its declaration), so a probe abandoned on pass N looked like a genuine failure
                 // on pass N+1. The counters then walked to 200, declared a HALTED endpoint that was
                 // running perfectly well, and the Reset Endpoint came back Context State Error - the
@@ -1480,7 +1569,7 @@ fn serve_if_block(
     // retires its in-flight TRB, so whoever consumes that event owes the re-arm. Swallowing it here
     // meant the endpoint was never queued again and the keyboard was gone for good - not a lost
     // report, a lost DEVICE.
-    eaten: &mut u32,
+    eaten: &mut EvMail,
     // `false` = the disk stopped answering a DATA operation, so the caller should drop it and
     // re-scan. Returning this rather than swallowing it is what turns an unplugged stick from "the
     // machine hangs" into "the disk went away".
@@ -1709,7 +1798,7 @@ fn bind_msc(
     // still spinning up its controller and answers NOT READY until it is. Bounded, and the bound is a
     // COUNT of attempts here only because each attempt already carries its own generous transfer
     // budget - the loop cannot outlive the device's own answer.
-    let mut eaten = 0u32;
+    let mut eaten = EvMail::new();
     let mut ready = false;
     // A9-5: bounded by the CLOCK as well as the count.
     //
@@ -2995,7 +3084,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
         disk_was_bound = disk.is_some();
         if let Some(d) = disk.as_mut() {
-            let mut eaten = 0u32;
+            let mut eaten = EvMail::new();
             if msc::read10(
                 &ctx,
                 &dma,
@@ -3219,6 +3308,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // signal that a busy system resets is not a liveness signal, and it is the sixth time this
         // session that a mechanism sat behind a condition that could not occur when it was needed.
         let mut hub_probe_logged = false; // log the first downstream-status probe per session (diagnostic)
+        // A FAILED status transfer (bad completion code) reports once per session, not once per
+        // probe: a halted EP0 fails every probe, and the report must not become the flood.
+        let mut hub_cc_logged = false;
         let mut hub_none_logged = [false; MAX_HID]; // an inconclusive None logs at most ONCE per device (no spam)
         let mut kb_last = [[0u8; 6]; MAX_HID];
         // Auto-repeat delays calibrated to THIS machine's TSC rate (0 under QEMU -> ~2 GHz fallback),
@@ -3299,7 +3391,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // HID slots whose transfer events something else consumed this pass. BOTH the block
             // server below and the hub status checks further down can swallow a keyboard completion,
             // and either one owes the endpoint a re-arm - so the set spans them.
-            let mut eaten = 0u32;
+            let mut eaten = EvMail::new();
             // Set by the hub scan when the disk's own port reports DISCONNECTED. Acted on AFTER the
             // scan rather than inside it, so the scan's borrow of `disk` and the clearing of it do
             // not overlap.
@@ -3548,12 +3640,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     break;
                 }
                 match next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle, 1) {
-                    Some((TRB_TRANSFER_EVENT, _, slot_id)) => {
+                    Some((TRB_TRANSFER_EVENT, cc, slot_id)) => {
                         if let Some(d) = devs[..ndev].iter().position(|h| h.slot == slot_id) {
                             deliver_hid_report(&ctx, &dma, d, &devs, &mut kb_last,
                                                &mut kb_rep, &mut kb_caps, &mut mouse);
                             need_queue[d] = true;
                         } else if devs[..ndev].iter().any(|h| h.hub_slot == slot_id) {
+                            // A hub's completion, dequeued here with no probe waiting - it arrived
+                            // after the probe that asked gave up. FILE IT rather than discard it, so
+                            // the next probe for this hub can recognise it as the stale answer to
+                            // the previous question and resynchronise instead of queueing a second
+                            // TD behind an unretired one.
+                            eaten.put(slot_id, cc);
                             // A completion for a HUB, found by the drain - so it arrived with no
                             // probe waiting for it, i.e. AFTER the probe that asked gave up. This is
                             // the answer to a question we already abandoned, and we are about to
@@ -3665,6 +3763,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         &mut ev_cycle,
                         &mut eaten,
                         &mut abandoned,
+                        &mut hub_cc_logged,
                     );
                     hub_posted = hub_posted.wrapping_add(1);
                     if st.is_some() && !abandoned {
@@ -3774,6 +3873,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 &ctx,
                                 &dma, &mmio, dboff, ir0, hub_slot, hub_dev, hp,
                                 &mut c2, &mut p2, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut abandoned,
+                                &mut hub_cc_logged,
                             );
                             hub_posted = hub_posted.wrapping_add(1);
                             if st.is_some() && !abandoned {
@@ -3847,7 +3947,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 // re-zeroed every pass, so a probe abandoned on one pass looked like a
                                 // genuine failure on the next, and that is what walked this counter to
                                 // 200 and re-initialised the controller every ~195 s.
-                                None if abandoned || eaten != 0 => false,
+                                None if abandoned || eaten.have != 0 => false,
                                 None => {
                                     disk_absent_seen = disk_absent_seen.saturating_add(1);
                                     if disk_absent_seen == 20 {
@@ -3958,6 +4058,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             &mut ev_cycle,
                             &mut eaten,
                             &mut abandoned,
+                            &mut hub_cc_logged,
                         );
                         hub_posted = hub_posted.wrapping_add(1);
                         if st.is_some() && !abandoned {
@@ -3977,14 +4078,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // Counting consecutive failures ACROSS ports of this hub, because the halt is a
                         // property of the shared EP0 endpoint, not of one port: every port's probe
                         // rides the same ring, so they all fail together and any of them is evidence.
-                        // `eaten != 0` means the probe was ABANDONED to deliver a keystroke, not that
+                        // `eaten.have != 0` means the probe was ABANDONED to deliver a keystroke, not that
                         // it failed. Counting it would let fast typing walk this counter to 200 and
                         // reset a perfectly healthy endpoint - a wedge repair firing because the user
                         // typed. The wedge case is unmistakable: nothing arrives at all, so `eaten`
                         // stays 0 and the count climbs as it should.
                         // Same rule for the wedge counter: an abandoned probe is evidence of
                         // nothing, so it must not push this toward the endpoint reset.
-                        if st.is_none() && !abandoned && eaten == 0 {
+                        if st.is_none() && !abandoned && eaten.have == 0 {
                             let n = PROBE_FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
                             if n >= 200 {
                                 ctx.log_fmt(format_args!(
@@ -4068,6 +4169,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             &ctx,
                             &dma, &mmio, dboff, ir0, hs, hd, hp,
                             &mut cur, &mut pcs, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut abandoned,
+                            &mut hub_cc_logged,
                         );
                         hub_posted = hub_posted.wrapping_add(1);
                         if st.is_some() && !abandoned {
@@ -4133,9 +4235,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // the fresh TRB"), which is exactly the dropped keys and input lag reported on hardware.
             // The keystroke was never lost - it completed into the device's DMA buffer and simply went
             // unread, so the same read the poll loop does recovers it.
-            if eaten != 0 {
+            if eaten.have != 0 {
                 for k in 0..ndev {
-                    if devs[k].slot < 32 && eaten & (1 << devs[k].slot) != 0 {
+                    if devs[k].slot < 32 && eaten.have & (1 << devs[k].slot) != 0 {
                         deliver_hid_report(&ctx, &dma, k, &devs, &mut kb_last,
                                            &mut kb_rep, &mut kb_caps, &mut mouse);
                         need_queue[k] = true;

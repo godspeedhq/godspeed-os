@@ -43,7 +43,7 @@
 
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
-use crate::{next_event, TRB_NORMAL, TRB_SIZE, TRB_TRANSFER_EVENT};
+use crate::{next_event, EvMail, TRB_NORMAL, TRB_SIZE, TRB_TRANSFER_EVENT};
 
 /// The disk's own DMA region, past the scratchpad tail (`SCRATCHPAD_BUF_BASE + MAX_SCRATCHPAD`).
 ///
@@ -251,19 +251,33 @@ fn await_on_slot(
     slot: u32,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
-    eaten: &mut u32,
+    eaten: &mut EvMail,
 ) -> Option<u32> {
     let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(XFER_TIMEOUT_MS));
     let mut unrelated = 0u32;
+    // Our answer may already be in hand: another consumer of the shared event ring can have
+    // dequeued it and filed it for us. Check the mailbox before touching the ring, or we would wait
+    // out a deadline for a completion that already arrived.
+    if let Some(cc) = eaten.take(slot) {
+        return Some(cc);
+    }
     loop {
         match next_event(dma, mmio, ir0, ev_idx, ev_cycle, POLL_GRANULARITY) {
             Some((TRB_TRANSFER_EVENT, cc, sid)) if sid == slot => return Some(cc),
-            // Another device's transfer completed (a keystroke). Record it so the caller can re-arm
-            // that endpoint - its in-flight TRB is spent - and keep waiting for ours.
-            Some((TRB_TRANSFER_EVENT, _, sid)) => {
-                if sid < 32 {
-                    *eaten |= 1 << sid;
-                }
+            // Another consumer's transfer completed. FILE IT - do not just note that it happened.
+            //
+            // This arm used to record a re-arm bit and DISCARD the completion, which was fine for a
+            // keystroke (the caller only needs to know the endpoint's TRB is spent) and destructive
+            // for anything with a waiter. A hub port-status probe posts its TD, gives up after its
+            // budget, and its answer retires during the NEXT pass's serve segment - right here,
+            // where it was silently dropped. The probe therefore never got an answer, and a probe
+            // with no answer correctly concludes nothing, so USB hot-plug did nothing at all.
+            //
+            // Measured: 328 probes posted, 151 answered, and ZERO late answers seen by the drain -
+            // because they never reached the drain. They were eaten here.
+            // `docs/xhci-completion-correlation.md`.
+            Some((TRB_TRANSFER_EVENT, cc, sid)) => {
+                eaten.put(sid, cc);
                 unrelated += 1;
                 if unrelated >= MAX_UNRELATED_EVENTS {
                     ctx.log("xhci: gave up waiting for a disk transfer - too many unrelated events");
@@ -301,7 +315,7 @@ pub fn bot(
     data_in: bool,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
-    eaten: &mut u32,
+    eaten: &mut EvMail,
 ) -> Option<u8> {
     if data_len > MAX_XFER {
         return None; // caller asked for more than the bounded data page holds
@@ -371,7 +385,7 @@ pub fn test_unit_ready(
     d: &mut Disk,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
-    eaten: &mut u32,
+    eaten: &mut EvMail,
 ) -> bool {
     let cmd = [0u8; 6];
     bot(
@@ -395,7 +409,7 @@ pub fn read_capacity(
     d: &mut Disk,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
-    eaten: &mut u32,
+    eaten: &mut EvMail,
 ) -> Option<u64> {
     let cmd = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     if bot(
@@ -427,7 +441,7 @@ pub fn read10(
     count: u32,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
-    eaten: &mut u32,
+    eaten: &mut EvMail,
 ) -> bool {
     // `count * SECTOR` is checked as a DIVISION, not a multiplication: `count` is attacker- or
     // caller-supplied and `count * SECTOR` overflows u32 above 8388608, wrapping to a SMALL value
@@ -478,7 +492,7 @@ pub fn write10(
     count: u32,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
-    eaten: &mut u32,
+    eaten: &mut EvMail,
 ) -> bool {
     // `count * SECTOR` is checked as a DIVISION, not a multiplication: `count` is attacker- or
     // caller-supplied and `count * SECTOR` overflows u32 above 8388608, wrapping to a SMALL value
@@ -532,7 +546,7 @@ pub fn sync_cache(
     d: &mut Disk,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
-    eaten: &mut u32,
+    eaten: &mut EvMail,
 ) -> bool {
     let cmd = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     bot(
@@ -673,7 +687,7 @@ pub fn serve_block(
     out: &mut [u8; 520],
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
-    eaten: &mut u32,
+    eaten: &mut EvMail,
 ) -> usize {
     out[0] = STATUS_ERR;
     if req.is_empty() {
