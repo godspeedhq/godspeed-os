@@ -972,8 +972,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         //
         // The lesson for whoever restores it: net-stack serves clients and receives nic-driver replies
         // on ONE untagged endpoint. Anything that talks to the NIC outside of serving a request will
-        // steal messages. Fix the endpoint (a separate one for driver replies, or correlation tags
-        // like fs uses) BEFORE adding a tick, not after.
+        // steal messages. Fix the correlation BEFORE adding a tick, not after - the design is written
+        // up in `docs/net-tags-design.md` (three phases, each independently testable). A second
+        // endpoint was considered and is NOT available: there is no CreateEndpoint syscall and the SDK
+        // carries one recv_slot.
         let req = ctx.recv();
         // A nonzero badge = a SOCKET-CAPABILITY invocation the kernel validated (§7.10). A plain
         // name-addressed request (status / DNS / open-socket) carries no badge.
