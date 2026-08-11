@@ -293,6 +293,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Whether this boot's automatic network clock has been written to the on-disk floor yet. One
     // attempt per boot: a failed write is a degraded state to report, not a thing to retry forever.
     let mut clock_floor_recorded = false;
+    // Set once the clock is judged never to be coming - see its use below. Separate from
+    // `clock_floor_recorded` because the floor genuinely was NOT recorded; this only says stop waiting.
+    let mut clock_gaveup = false;
 
     loop {
         // Muted: a foreground app owns the console. Sleep + skip - don't draw, don't blocking-read. The
@@ -312,6 +315,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // dead on arrival for its own scenario.
         //
         // Cheap: one syscall per pass until it fires, then a plain bool test forever.
+        // GIVE UP WAITING once the clock is clearly not coming, and go back to blocking.
+        //
+        // The polling branch below exists to keep this loop turning until SNTP lands. On a board with
+        // no RTC where SNTP never answers - no cable, or a network that will not resolve it - the
+        // latch above NEVER fires, so the shell polls every MUTED_POLL_MS (30 ms) FOREVER, with a
+        // sleep no keystroke can interrupt. Every character then waits 0-30 ms after the driver has
+        // already delivered it, in bursts: exactly the typing stutter reported on hardware, and the
+        // reason two fixes inside the USB driver made no visible difference - they are upstream of
+        // this quantiser.
+        //
+        // 30 s is far longer than a successful sync takes (measured: ~5 s from boot on this board when
+        // the network answers at all), so this cannot rob a machine that was going to sync. After it,
+        // polling can accomplish nothing - the condition it is waiting for cannot become true without
+        // a network - so continuing to pay for it is pure cost.
+        //
+        // Commandment VIII: wait on the truth, but BOUND the wait and act when it does not arrive.
+        if !clock_gaveup && ctx.epoch_secs_monotonic() > 30 {
+            clock_gaveup = true;
+            ctx.log("shell: no network clock after 30s - blocking on input again (the floor stays unrecorded)");
+        }
         if !clock_floor_recorded && ctx.clock_source() == ClockSource::Ntp {
             clock_floor_recorded = true;
             if let Some(f) = ctx.clock_floor() {
@@ -361,7 +384,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // when somebody eventually pressed a key, or never. Polling until the sync lands and blocking
         // ever after costs a wakeup every MUTED_POLL_MS for the few seconds SNTP takes, and nothing at
         // all for the rest of the boot.
-        let b = if clock_floor_recorded {
+        let b = if clock_floor_recorded || clock_gaveup {
             ctx.console_read()
         } else {
             match ctx.try_console_read() {

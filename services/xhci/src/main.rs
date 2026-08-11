@@ -1435,7 +1435,10 @@ fn serve_if_block(
     // service outright, and "it is only a diagnostic" is exactly the reasoning the rule exists to
     // refuse. A relaxed atomic costs nothing and needs no exemption.
     static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    let n = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    // Counted but not read: the arrival trace it fed was removed (f67f5c15) and the no-reply-cap
+    // warning now has its own counter. Kept because the count itself is the cheap part and a future
+    // diagnostic will want it; named `_n` so the compiler does not have to warn about our intent.
+    let _n = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     // The "block-path message #N arrived" trace is GONE, and the refusal below now speaks ONCE.
     //
     // Both were bounded per instance (`n <= 8`), which looked fine and was not: a 10-hour soak logged
@@ -3192,7 +3195,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // (docs/power.md §11). A held key emits no new USB reports, so while one is armed we
             // wake briskly (~20 ms) to synthesise typematic auto-repeat below; when idle we sleep
             // ~250 ms as the hot-plug watchdog. Never pass 0 (recv_timeout(0) blocks FOREVER).
-            let any_held = (0..ndev).any(|d| !devs[d].is_mouse && kb_rep[d].armed());
             let base = rep_ticks.max(1);
             // HID slots whose transfer events something else consumed this pass. BOTH the block
             // server below and the hub status checks further down can swallow a keyboard completion,
@@ -3206,7 +3208,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             //
             // Where the controller's MSI reaches us, `recv_timeout` returns EARLY on the interrupt
             // and this is only a lost-wake safety net, so 250 ms costs nothing. On the Pi 4 nothing
-            // programs the VL805's MSI yet (`pci::program_xhci_msi` is a stub), so this timeout IS
+            // programs the VL805's MSI yet (`pci::program_xhci_msi` WAS a stub; it is now programmed in arch/aarch64/pcie.rs), so this timeout IS
             // the polling interval - and 250 ms per keystroke is a quarter-second of lag on every
             // character typed.
             //
@@ -3242,7 +3244,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // that "MSI not reaching us" and made normal idle read as a broken feature.
                 // What matters is whether the interrupt line ever worked, which the companion
                 // message states from an observed delivery.
-                ctx.log("xhci: polling at ~2.5ms alongside interrupts (input latency floor)");
+                ctx.log("xhci: polling at the 10ms tick alongside interrupts (input latency floor)");
                 poll_noted = true;
             }
             // Announced only from an OBSERVED delivery (`irq_seen`), never from the initial state.
@@ -3255,25 +3257,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.log("xhci: waking on interrupts (MSI) - not polling");
                 irq_noted = true;
             }
-            let deadline = if any_held {
-                base.saturating_mul(2)
-            } else if polling {
-                // ~2.5 ms, a QUARTER of the keyboard's 10 ms bInterval.
-                //
-                // Matching bInterval exactly looked right and felt wrong: it means a report can sit
-                // for a whole interval before we look, so the floor was the interval, not half of it.
-                // Measured from the heartbeat's own counter - 78 passes/sec, ~12.8 ms each - which is
-                // the stutter under continuous typing.
-                //
-                // Sampling four times per interval puts the floor near 3 ms, below what a person
-                // notices, and it is the standard reason to oversample a periodic source: you cannot
-                // phase-align with a device that is free-running relative to you.
-                //
-                // The cost is wakeups - roughly 312/sec instead of 78 - and it is paid ONLY while a
-                // HID is bound (`polling`), on a mains-powered board. An idle machine with no keyboard
-                // still gets the 25x branch below and stays asleep. `.max(1)` because `recv_timeout(0)`
-                // blocks FOREVER, which would be the worst possible outcome of a latency fix.
-                (base / 4).max(1)
+            // ONE tick while a HID is bound. No `any_held` doubling, and no sub-tick pretence.
+            //
+            // Two errors were here at once, and hardware exposed both. The `any_held` branch asked for
+            // `base * 2` (20 ms) and was tested FIRST - and `armed()` is true from key-down until the
+            // release report - so the SLOWEST branch was selected exactly while the user was typing.
+            //
+            // And `base / 4` (2.5 ms) never existed: `scheduler::cycles_to_ticks` floors to whole
+            // 10 ms BSP ticks and clamps to >= 1, so it was byte-identical to `base`. Commit 464d8fed
+            // changed nothing, and its log line advertised a 2.5 ms floor the kernel cannot deliver.
+            // A constant is only as fine-grained as the clock that implements it - tuning below the
+            // quantum is tuning nothing.
+            //
+            // So: one tick, always, whenever a HID is bound. That halves the worst case while typing
+            // and removes the held/not-held alternation, which is the IRREGULAR part and therefore the
+            // part that reads as stutter rather than lag. Auto-repeat is over-served either way - its
+            // interval is ~50 ms and `kb_rep.poll()` runs every pass.
+            //
+            // The 10 ms floor itself is the kernel's tick granularity, not a constant here; going
+            // below it needs a sub-tick timed wake or a genuinely core-local interrupt (the aarch64
+            // GIC currently targets every SPI at core 0 while this service is pinned to core 2).
+            let deadline = if polling {
+                base
             } else {
                 base.saturating_mul(25)
             };
