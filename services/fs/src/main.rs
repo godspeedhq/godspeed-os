@@ -522,6 +522,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     Err(e) => {
                         // Loud, and DEGRADE rather than serve from state we have just declared stale.
                         ctx.log_fmt(format_args!("fs: re-mount after I/O error FAILED ({}) - degrading", e));
+                        // A10-5: `revoke_all_open` ran on the instance we are replacing, before the
+                        // mount was attempted, so the caps are already stale here - noted so a reader
+                        // does not add a second revoke against a moved-out value.
                         fs = None;
                         storage_unreadable = true;
                     }
@@ -1001,8 +1004,12 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             // earlier today. On no answer we keep what we had and report it unchanged.
             let capacity = match block_capacity(ctx) {
                 Some(0) => {
-                    if vol.is_some() {
+                    if let Some(f) = vol.as_mut() {
                         ctx.log("fs: the device reports no capacity - dropping the mount (disk removed)");
+                        // A10-5: the caps this mount handed out do not outlive it. Revoking makes a
+                        // holder's next use fail `CapRevoked` - recoverable and true - instead of
+                        // `FS_NOTFOUND`, which claims the file does not exist when the DISK is gone.
+                        f.revoke_all_open(ctx);
                     }
                     *vol = None;
                     0
@@ -1110,7 +1117,13 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
                 }
                 let z = [0u8; BLOCK];
                 let ok = block_write(ctx, 0, &z) && block_write(ctx, capacity - 1, &z);
-                if ok { *vol = None; send(&[FS_OK]); } else { send(&[FS_ERR]); }
+                if ok {
+                    // A10-5: the strongest case of the three - the disk has just been ERASED, so every
+                    // outstanding file cap names something that no longer exists anywhere.
+                    if let Some(f) = vol.as_mut() { f.revoke_all_open(ctx); }
+                    *vol = None;
+                    send(&[FS_OK]);
+                } else { send(&[FS_ERR]); }
             }
             return;
         }

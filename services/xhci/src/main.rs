@@ -3443,7 +3443,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // failing case. The rule this keeps teaching: a guard belongs on the ACTION it protects,
             // not on the observation that feeds it. So the scan runs whenever there is something to
             // watch, and the bind-an-arrival arm carries the `ndev < MAX_HID` check itself.
-            if hub_due && (ndev < MAX_HID || disk.is_some()) {
+            // A10-7: `hub_due` ALONE. The `(ndev < MAX_HID || disk.is_some())` qualifier still left the
+            // scan dead in one case - a full HID table with NO disk - and that case carries the only
+            // increment of `PROBE_FAILS`, so the halted-endpoint repair could not fire there either.
+            // A9-2 fixed the disk half of exactly this and I left the other half standing.
+            //
+            // There is nothing to gate: the scan's cost is one control transfer per hub port per
+            // `HUB_POLL_MS`, and its two jobs - watch for departures, and count failures so a wedged
+            // endpoint gets repaired - are wanted whenever a hub exists, regardless of what is bound
+            // behind it. The bind-an-arrival arm carries its own `ndev < MAX_HID` check, which is the
+            // only thing that ever needed one.
+            if hub_due {
                 let mut scanned_hubs = 0u32; // hub slots already scanned this tick (scan each hub once)
                 for d in 0..ndev {
                     let hub_slot = devs[d].hub_slot;

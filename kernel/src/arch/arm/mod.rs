@@ -790,12 +790,39 @@ pub unsafe fn switch_to_boot_stack(top: u64) {
 pub const ELF_MACHINE: u16 = 40;
 pub const ELF_CLASS: u8 = 1; // 1 = ELFCLASS32, 2 = ELFCLASS64
 
-/// A11-1 hook: called from the timer tick on every core so a panic can stop the machine, not just the
-/// panicking core. A no-op on this port until its `halt_all_cores` actually signals the other cores -
-/// see the aarch64 implementation for the shape (a published flag, checked here).
-pub fn panic_halt_check() {}
+/// A11-2: a panic must stop this machine too. The Pi 2 runs four cores on real hardware.
+///
+/// `halt_all_cores` was `loop { spin_loop() }` - it masked nothing, so the panicking core kept taking
+/// the timer IRQ and was scheduled away, and the other three never learned a panic had happened. Same
+/// defect A10-1 found on aarch64 and SEC-18 fixed on x86; this port was simply never revisited. It is
+/// worse here than on aarch64, because the arm liveness watchdog is armed off a measured timer and
+/// there is no second backstop if this fails.
+///
+/// Same two halves as aarch64: the panicking core masks interrupts immediately, and `PANIC_HALT` is
+/// published for the others, which check it on the tick every core takes.
+pub static PANIC_HALT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
+/// Park THIS core forever with IRQ+FIQ masked.
+pub fn park_core_forever() -> ! {
+    // SAFETY: `cpsid if` masks IRQ and FIQ in CPSR, and `wfi` halts until an unmasked event; both are
+    // always valid in a privileged mode, and this never returns, so nothing is left inconsistent.
+    unsafe {
+        core::arch::asm!("cpsid if", options(nomem, nostack));
+        loop { core::arch::asm!("wfi", options(nomem, nostack)); }
+    }
+}
+
+/// Called from the timer tick on EVERY core - see `PANIC_HALT`.
+pub fn panic_halt_check() {
+    if PANIC_HALT.load(core::sync::atomic::Ordering::Acquire) {
+        park_core_forever();
+    }
+}
+
+pub fn halt_all_cores() -> ! {
+    PANIC_HALT.store(true, core::sync::atomic::Ordering::Release);
+    park_core_forever()
+}
 
 /// Reset the machine via the BCM2835 power-management watchdog (the shell `reboot` command + Ctrl+Alt+Del).
 /// Arm a short watchdog timeout and request a FULL reset in `PM_RSTC`; the SoC resets when the watchdog

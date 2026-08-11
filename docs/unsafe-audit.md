@@ -262,6 +262,12 @@ freshly-spawned supervisor whose 69 pages were all mapped correctly. Boot spawns
 work (and its incidental barriers) separates building a space from entering it; a respawn does both back
 to back, which is why the respawn is the one that dies and why it is intermittent.
 
+## 2026-08-11 - Pi 2: a panic must halt every core there too (kernel audit A11-2)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 44 -> 45 (+1) | `park_core_forever`: `cpsid if` then a `wfi` loop. `halt_all_cores` was `loop { spin_loop() }` - masking nothing and signalling nobody - on a port running four cores on real hardware, so a panic left the other three scheduling and the panicking core taking timer IRQs. Masking IRQ+FIQ and halting is always valid in a privileged mode, and the function never returns, so nothing is left inconsistent. Touches no memory. |
+
 ## 2026-08-09 - Pi 4: a panic must halt every core (kernel audit A10-1)
 
 | File | Change | Why |
@@ -2344,7 +2350,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 44 | permitted |
+| arch/arm/mod.rs | 45 | permitted |
 | arch/loongarch64/mod.rs | 25 | permitted |
 | arch/riscv32/mod.rs | 25 | permitted |
 | arch/riscv64/mod.rs | 25 | permitted |
