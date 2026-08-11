@@ -1406,6 +1406,15 @@ pub fn park_core_forever() -> ! {
     }
 }
 
+/// Park this core if a panic has been declared anywhere. Called from the timer tick on EVERY core -
+/// see the note at that call site for why the previous placement (core 0 only) did not halt the
+/// machine.
+pub fn panic_halt_check() {
+    if PANIC_HALT.load(core::sync::atomic::Ordering::Acquire) {
+        park_core_forever();
+    }
+}
+
 pub fn halt_all_cores() -> ! {
     PANIC_HALT.store(true, core::sync::atomic::Ordering::Release);
     park_core_forever()
@@ -1760,9 +1769,6 @@ pub fn uart_rx_pop() -> Option<u8> { uart_rx::pop() }
 /// Called from the core-0 timer tick, every 10 ms.
 #[cfg(feature = "pi4")]
 pub fn uart_rx_poll() {
-    // A10-1: a core that learns of a panic stops here and never returns to scheduling. Checked on the
-    // tick because that is the one place every core passes through regularly.
-    if PANIC_HALT.load(core::sync::atomic::Ordering::Acquire) { park_core_forever(); }
     uart_rx::drain();
     // The USB keyboard shares this tick. It is polled rather than interrupt-driven for the reason in
     // `xhci`'s module header, and it no-ops in a few instructions when no keyboard was found.

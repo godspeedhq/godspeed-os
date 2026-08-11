@@ -790,6 +790,11 @@ pub unsafe fn switch_to_boot_stack(top: u64) {
 pub const ELF_MACHINE: u16 = 40;
 pub const ELF_CLASS: u8 = 1; // 1 = ELFCLASS32, 2 = ELFCLASS64
 
+/// A11-1 hook: called from the timer tick on every core so a panic can stop the machine, not just the
+/// panicking core. A no-op on this port until its `halt_all_cores` actually signals the other cores -
+/// see the aarch64 implementation for the shape (a published flag, checked here).
+pub fn panic_halt_check() {}
+
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 
 /// Reset the machine via the BCM2835 power-management watchdog (the shell `reboot` command + Ctrl+Alt+Del).

@@ -1313,9 +1313,23 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
             let up_now = g.link_is_up();
             if up_now && !link_was_up {
                 ctx.log("nic-driver: genet link came up after bring-up - re-applying MAC speed and DMA burst");
-                g.apply_link_settings();
+                // CONSUME THE EDGE ONLY IF THE RE-APPLY ACTUALLY WORKED (audit A5-1, Commandments V
+                // and IX). `apply_link_settings` returns 0 when the PHY has not settled - and it reads
+                // a DIFFERENT register (the aux status) from `link_is_up`'s BMSR bit, so it can fail on
+                // a link that genuinely is up, or on any failed MDIO read. Marking the edge consumed
+                // regardless meant one unlucky read left the MAC unclocked FOREVER: nothing received,
+                // and no second chance short of a physical replug.
+                //
+                // A recovery that fails must not be recorded as a recovery that happened. Leaving
+                // `link_was_up` false keeps the edge pending, so the next status request tries again.
+                if g.apply_link_settings() != 0 {
+                    link_was_up = true;
+                } else {
+                    ctx.log("nic-driver: genet re-apply did not take (PHY not settled?) - leaving the link edge pending to retry");
+                }
+            } else {
+                link_was_up = up_now;
             }
-            link_was_up = up_now;
             out[7] = up_now as u8;
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out));
         } else if p.len() == 1 && p[0] == 4 {

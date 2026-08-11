@@ -1148,6 +1148,19 @@ pub fn run(core_id: u32) -> ! {
 #[no_mangle]
 pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u64, _interrupted_rsp: u64) {
     let cid = current_core_id();
+    // A11-1: EVERY core checks the panic flag, on the tick every core takes.
+    //
+    // The A10-1 fix put this check in `uart_rx_poll`, whose only caller is the `cid == 0` branch
+    // below - so a panic parked the panicking core and core 0, and the remaining APs kept scheduling
+    // until the liveness watchdog fired ~10 s later and reported a WEDGE, which is not what happened.
+    // The doc comment on `halt_all_cores` asserted a mechanism that did not exist.
+    //
+    // Seventh instance this cycle of a guard whose trigger cannot occur in the failing case, and the
+    // worst placed: §19 and §6.2 require a panic to stop the MACHINE, and a kernel that keeps
+    // scheduling after one is the silent-corruption case those sections exist to forbid.
+    //
+    // Cheap: one relaxed load per core per tick, on a path that already runs.
+    crate::arch::imp::panic_halt_check();
     // Free any deferred kstack from a prior self-kill on this core.
     // RSP is now on the current task's kstack, not the dead task's, so
     // freeing the pending kstack is safe.  IF=0 (interrupt gate).

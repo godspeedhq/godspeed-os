@@ -8,6 +8,113 @@
 > First audit: 2026-07-15.
 
 
+## Audit 5 - the revert range: does the prose still describe machinery that was taken back out? (2026-08-11, `feat/pi4-aarch64`)
+
+**Scope:** everything committed since `5426c6db` - 20 commits, of which five ADDED a mechanism and a
+later one TOOK IT BACK OUT: a kernel console-write counter (`InspectKernel` query 23), the shell
+prompt-redraw built on it, a `ConsoleReadTimeout` syscall, a PHY settle before DHCP, and the "press
+Enter to return to the prompt" hint that replaced the redraw. A revert range is the sharpest test this
+audit has: prose survives a `git revert` that code does not. This audit asks two questions - **does
+anything still describe the machinery that is gone**, and **does the code that REMAINED obey the
+Commandments** (the second half at the user's explicit request).
+
+**Verdict: 0 HIGH, 3 MED, 4 LOW. Two Commandments are violated: V/IX (one finding) and VIII (one
+finding).** Everything else in the range is clean, and one result is worth stating first because it is
+the answer to the question that prompted the audit.
+
+**The reverts are complete. All five mechanisms left nothing behind, in code OR in prose.** Verified
+two ways rather than one: targeted greps for `console_write_seq`, `CONSOLE_WRITE_SEQ`,
+`ConsoleReadTimeout`, `console_read_timeout`, `query 23`, `PHY_SETTLE`, `press Enter to return` and
+`nudge` return **nothing** across the repo; and `git diff 5426c6db..HEAD` touches only **four files**
+(`scripts/selfcheck.gsh`, `services/net-stack/src/main.rs`, `services/nic-driver/src/genet.rs`,
+`services/xhci/src/main.rs`), so `kernel/src/syscall/dispatch.rs`, `sdk/rust/src/service_context.rs`
+and `services/shell/src/main.rs` are **byte-identical** to where the range began. `dispatch.rs` gained
+24 + 45 lines and lost 69; the `InspectKernel` query arms now run 4..22 with no 23. The two surviving
+`press Enter` strings are unrelated and correct (`chaos` describing a screen-switch glitch, and
+net-stack's own comment recording why the hint was removed). No doc, no `CLAUDE.md`, no manifest and no
+comment ever described any of the five, so there was nothing to sweep. **This is the clean result, and
+it is the exception in this document rather than the rule** - Audit 3 (2026-07-31) and Audit 4 both
+found the opposite shape.
+
+The drift that DOES exist in this range is a new shape and worth naming: **comments that describe what
+the change was MEANT to achieve rather than what it achieves.** A5-3 and A5-5 are both a paragraph of
+excellent, honest reasoning attached to code that stops one step short of the claim. That is harder to
+catch than a stale sentence, because the prose was written in the same commit as the code and reads as
+authoritative precisely because it is so specific.
+
+### Ranked ledger
+
+| ID | Sev | Kind | File:line | Finding | Confidence |
+|----|-----|------|-----------|---------|------------|
+| **A5-1** | MED | Commandment **V + IX** | `services/nic-driver/src/genet.rs:1314-1319` | **A recovery that consumes its own trigger and discards its own failure.** The new hot-plug fix re-applies MAC speed and DMA burst on a down -> up transition: `if up_now && !link_was_up { log(...); g.apply_link_settings(); } link_was_up = up_now;`. `apply_link_settings` **returns `u32`, and the return is dropped**. It returns `0` - after logging "PHY has not settled on a speed - leaving the MAC at its default" - in two reachable cases: the BCM aux-status HCD field (bits 10:8) has not resolved yet, and **any failed MDIO read** (`let Some(aux) = self.mdio(BCM_AUX_STATUS, None) else { return 0 }`, `genet.rs:566`). `link_is_up` reads a *different* register (BMSR bit 2, `genet.rs:585`), so the two can disagree. When they do, `link_was_up` is set to `true` regardless, **the edge is consumed, and the re-apply can never run again**: every later status request sees `up_now == link_was_up`. The MAC stays unclocked, nothing is received, and the only recovery is a physical unplug/replug. Commandment V is explicit that "a recovery whose own failure is discarded becomes a silent success"; here the failure is at least *logged*, so it is loud - but it is **not recovered**, which is Commandment IX. The one-line shape of the fix is to gate the state update on the result. | **CONFIRMED** (code + register divergence); frequency PLAUSIBLE |
+| **A5-2** | MED | Commandment **VIII** | `services/net-stack/src/main.rs:977-988` (with `:90-102`, `sdk/rust/src/service_context.rs:715-733`) | **The new idle tick opens a request-swallowing window once a second, forever.** net-stack serves clients and receives nic-driver's replies on **one endpoint** with **no correlation tag** (`task/mod.rs:762-765`: "Owns its endpoint (nic-driver replies frames there via the per-request reply cap)"). `nic_req` waits via `request_with_reply_deadline_outcome`, which polls **`try_recv()`** on that same endpoint (`service_context.rs:717`) - and `try_recv` and `recv` both read `data.recv_slot` (`:475-481`, `:487-493`). So any client request that lands while `link_is_up` is waiting is returned **as the link reply**: `link_is_up` reads `!p.is_empty()` as "up" (`main.rs:895`), and the client's message is dropped with its reply cap never taken. The client waits out its own deadline and reports a **false** "net-stack not responding". This is the same class as the `fs` reply-correlation desync already recorded in this repo. It is not new *in kind* - the request path has always called `link_is_up` - but it is newly **permanent**: before this change an idle net-stack sat in `ctx.recv()` and could not swallow anything, and now it opens the window ~86,400 times a day on a machine with no network traffic at all. Arguably HIGH; held at MED only because the window is one IPC round trip wide. | **CONFIRMED** code path; frequency PLAUSIBLE |
+| **A5-3** | MED | Doc drift (in-code) | `services/net-stack/src/main.rs:975-976` and `:934-938` | **Two comments promise auto-configuration on plug-in that the code does not perform.** The tick's comment says "That single change is what makes connect INFO, disconnect INFO **and auto-config-on-plug-in** possible at all", and the boot-skip's comment says "`link up while unconfigured - auto-configuring` already re-runs the dance **the moment a cable appears**". Neither is true: on timeout the tick announces and **`continue`s** (`:987`), skipping the auto-configure block entirely. `run_dance` has exactly three call sites - boot (`:940`), a **client request** that needs the network (`:1018`, gated on `badge.is_none() && !have_mac && matches!(pl.first(), ...)`), and `net renew` (`:1127`). So a Pi 4 booted with the cable out, then plugged in and left alone, prints `NET: ethernet cable connected` and **stays unconfigured** until somebody runs a network command. The behaviour is defensible; the claim is not, and it is exactly the claim a reader would rely on when deciding this path needs no further work. | **CONFIRMED** |
+| **A5-4** | LOW | Doc drift (in-code) | `scripts/selfcheck.gsh:246-247` | **"`date epoch` yields 0 when the clock is unset" is false on the board this was written for.** The kernel returns packed `0` for an unset clock (`arch/aarch64/mod.rs:2296-2300`), the SDK unpacks that to year/month/day = 0/0/0 (`service_context.rs:1394-1403`), and Hinnant's `days_since_epoch` maps it to **-719,560 days**, so `date epoch` prints **`-62169984000`**. The check still behaves correctly - `parse_i64` accepts the leading `-` (`shell/src/main.rs:2208`) and `-62169984000 > 0` is false, so it SKIPs - but it works for a reason the comment does not state. A future maintainer "tidying" the guard to `== 0` or `!= 0` would silently break the skip, or worse, make it fire on a machine whose clock IS set. | **CONFIRMED** (arithmetic + code) |
+| **A5-5** | LOW | Doc drift (in-code) | `scripts/selfcheck.gsh:238-241` | **The stated principle and the chosen mechanism disagree.** The comment argues, correctly and at length, that "The probe READS, it does not repair ... a check must not perform a network operation or set the machine's clock as a side effect ... a test that changes the system has stopped measuring it". The mechanism it then picks, `for line in (date epoch)`, **writes a temp file through `fs`** on every run: `forlines_capture` deletes, creates and writes `/.fl<id>~`, and `forlines_step` deletes it at EOF (`shell/src/main.rs:2977-3037`). The side effect is small and self-cleaning, but it is a side effect, and it is a **storage dependency in a clock probe**. Sharper consequence: if `fs` cannot serve the write, `forlines_capture` prints "gsh: for line: capture write failed" and **counts a failure** (`:3413`) - so a storage fault now fails the *clock* check, the opposite of the skip-with-reason this rewrite exists to provide. | **CONFIRMED** |
+| **A5-6** | LOW | Doc drift (in-code) | `services/net-stack/src/main.rs:966` vs `:977` | **The file contradicts itself about whether the kernel's quantum calibration works.** Line 977 (new) paces the serve loop with `ctx.duration_cycles(LINK_TICK_MS)`; line 966 (pre-existing) says the kernel's calibration "is 0 on T630" and calibrates its own `tsc_hz` for that reason. Both cannot be current. It matters because the failure is silent and 100x: `duration_cycles` floors to `1` when `tsc_ticks_per_10ms()` is 0 (`service_context.rs:1305`), and `cycles_to_ticks` then floors to **one scheduler tick** (`scheduler.rs:171-174`), so the "one second" tick becomes ~10 ms - a hundred NIC round trips per second on an idle machine, and a hundred times the A5-2 window. x86 now PIT-calibrates the quantum for every CPU (`arch/x86_64/boot.rs:376-383`), so the line-966 comment is *probably* the stale half - but one boot settles it and neither line should be left standing as written. | **PLAUSIBLE** (needs one T630 boot to decide which line is stale) |
+| **A5-7** | LOW | Doc drift | `docs/xhci-topology.md:100-105`, and its absence from `docs/CLAUDE.md` | **Step 1 of the plan has landed and the plan still reads as unstarted.** `services/xhci/src/topo.rs` exists, and its own header says so honestly ("**Step 1 of `docs/xhci-topology.md`, and deliberately behaviour-neutral**"). The doc's "Order of work" still presents step 1 in the imperative with no status marker, and its "What this deletes" list names `disk_absent_seen` and `hub_tried` as subsumed while both are still live (`xhci/src/main.rs:2632`, `:3034`). The code is the honest half; the doc is one-way. Compounded by A4-12, which is still open: neither `xhci-topology.md` nor `xhci-split.md` is in the docs index, so the only way to find either is to already know it exists. | **CONFIRMED** |
+
+### Verified still true (do not re-check)
+
+- **`docs/xhci-split.md` is still accurate.** Its central claim - that the service does disk work and
+  HID polling on one pass, and that its recommended fix (option 1, a HID callback during disk waits)
+  is not yet done - holds: `msc::await_on_slot` still takes `eaten: &mut u32` and no callback
+  (`services/xhci/src/msc.rs:246-254`). Only A4-13 applies (two dead line citations into the deleted
+  in-kernel driver).
+- **The `xhci` liveness heartbeat is correctly built** (`services/xhci/src/main.rs:3354-3359`). Its
+  state is hoisted above `'reenum` so a re-enumeration cannot reset it (the bug its own comment
+  records), it sits **before** the only `break 'poll` (`:3419`), and the loop it beats from always
+  waits on a bounded `recv_timeout` (`:3245`), so an idle driver still beats and a stopped one does
+  not. It cannot become the log flood it replaced. The one nit is cosmetic: `passes` counts passes
+  that reach `:3354`, not every pass, and the line says "poll passes".
+- **`link_notify` gets the authority question right, deliberately**
+  (`services/net-stack/src/main.rs:869-897`). It uses `console_write` (LOG_WRITE, slot 0, held by
+  every service - `task/mod.rs:3497`) and explicitly **not** `console_push`, with the SEC-2 reasoning
+  written into the comment: a `CONSOLE_PUSH` holder is inside the shell's trust perimeter because
+  keystrokes are commands (§6.4). A cosmetic notice buys no new authority. This is the pattern the
+  USB drivers' `notify` does *not* follow (`xhci/src/main.rs:478-490`, `ehci/src/main.rs:871-884`,
+  both pre-existing and both justified there).
+- **The reverted prompt-redraw was the range's one real §26.10 problem, and it is gone.** A kernel
+  counter whose only purpose is to let the shell decide when to repaint a prompt is shell *policy*
+  living in the kernel. It was added, found to trip on its own output, and removed - and the
+  replacement hint was then removed too, for the better reason that net-stack cannot know whether the
+  shell is at a prompt. The end state prints only the fact it actually knows.
+
+### Carried over from Audit 4 - still open, NOT counted against this range
+
+Nothing in this range touched a doc, a manifest or `CLAUDE.md`, so **the entire Audit 4 ledger stands
+unfixed**. Spot-verified this session: `docs/unsafe-audit.md:2328` still carries the phantom
+`arch/aarch64/xhci.rs | 42 | permitted` row in the LIVE inventory (A4-4); `kernel/src/task/mod.rs:486`
+still justifies the `USB_DISK` grant with "on BOTH ARM ports the USB stack is in-kernel" (A4-2 /
+SEC-37); `services/block-driver/src/xhciblk.rs:5` still says the in-kernel driver "cannot be deleted"
+(A4-3); `docs/aarch64.md:3` still opens "**Status:** design, not built ... 4 GB" (A4-9);
+`kernel/src/arch/mod.rs:13`, `services/block-driver/contracts/block-driver.toml:28`,
+`kernel/Cargo.toml:113`, `scripts/pi4_build.py:29` and `services/xhci/src/main.rs:2241` ("still in
+this tree") are all unchanged (A4-1, A4-5, A4-7, A4-8, A4-11). **A4-10 also stands**: §6.4's
+2026-08-09 amendment remains accurate about the kernel and silent about the TCB consequence, while
+§6.1's table row and the glossary's `TCB` entry ("Kernel + arch + smp + init + supervisor" - `init`
+was removed in Phase 5) still give the answer it omits. One addition to A4-10 found here: `CLAUDE.md`
+§6.4's ARM32 amendment cites `selfcheck 349` as verification evidence, and after A5-4/A5-5 the
+selfcheck's assertion count is **machine-dependent** (348 when the clock check skips), so an exact
+number is now a fragile thing to pin in the constitution.
+
+### Commandment-by-commandment compliance (the four files changed in this range)
+
+| # | Commandment | Verdict | Evidence |
+|---|-------------|---------|----------|
+| **I** | Kernel responsibilities are complete | **RESPECTED, and improved** | The kernel is **byte-identical** to `5426c6db` across the whole range. Nothing new was added to it, and the one thing that was - a console-write counter existing so the shell could time a prompt repaint - was reverted whole. No policy, no device logic, no new syscall. |
+| **II** | Trust in Chaos | **Partly exercised** | The `xhci` log-rate fix (`f67f5c15`) came *out of* a 10-hour soak in which chaos restarted services 501 times, which is Chaos working as intended. The new net-stack tick and the nic-driver re-apply have **no chaos evidence on this branch**; A5-1 and A5-2 are both the kind of defect a kill-storm against `nic-driver` would surface. Recorded as an observation, not a violation. |
+| **III** | One irreducible truth | **RESPECTED** | Four new pieces of derived state, all reconcilable and subordinate: `last_link` (net-stack, re-read from the NIC every tick), `link_was_up` (nic-driver, re-read from the PHY every status request), `passes` (a pure counter), `clockset` (recomputed each selfcheck run). None is authoritative and none can outlive its source. Two *services* holding a view of the same PHY is not a second truth - each reconciles against the hardware. |
+| **IV** | Honor service contracts | **RESPECTED** | No contract was touched and none needed to be. `console_write` rides the LOG_WRITE slot every service already holds; no new peer, no new capability, no back channel. |
+| **V** | No service is special; surface a failed recovery | **VIOLATED - A5-1** | `genet.rs:1317-1319` runs a recovery, drops its `u32` result, and marks the transition handled either way. The failure is logged by the callee, so it is not silent - but the caller proceeds as though it had succeeded. |
+| **VI** | No shared mutable state | **RESPECTED** | Nothing new is shared. The `static SEEN: AtomicU32` in `xhci::serve_if_block` is pre-existing, service-local, and only had its threshold changed. |
+| **VII** | No ambient authority | **RESPECTED, notably well** | See "Verified still true": `link_notify` reasons explicitly about `console_write` vs `console_push` and takes the lesser authority for a cosmetic feature. |
+| **VIII** | Wait on truth, bounded, including failure | **VIOLATED - A5-2** | The *bounding* is exemplary: every new wait is clock-bounded (`recv_timeout(duration_cycles(LINK_TICK_MS))`, `nic_req`'s seconds deadline, `HEARTBEAT_MS`, the always-bounded xhci `recv_timeout`), and **no count-bounded wait was added anywhere in the range**. The violation is the other half - the truth waited on is not distinguishable from a different message. A shared, untagged endpoint plus a `try_recv` poll loop means the tick can accept a client request *as* the link reply, and the real client then times out against a service that is alive. A5-6 is the related hazard: if the quantum calibration is 0 on any target, the "one second" bound silently becomes ~10 ms. |
+| **IX** | Plan for recovery | **VIOLATED - A5-1** | The consumed edge leaves the NIC in a state nothing recovers from except a human touching the cable. Note the *good* IX work in the same range for contrast: the boot no-link skip (`main.rs:939-953`) turns ~25 s of unresponsive DHCP budgets into an immediately responsive service that says exactly why it is unconfigured, and `nic_req` reacquires nic-driver by name after a restart (`:95`). |
+| **X** | Complexity in the right place | **RESPECTED** | Same evidence as I. The redraw put prompt policy in the kernel; the revert put it back in the only layer that can know the answer, and then removed the guess entirely. |
+| **-** | **The rule above the rules** (nothing above the kernel may hang or crash the machine) | **HELD** | Every new wait terminates on a clock. No new unbounded loop, no new blocking send, no new panic path. The two violations degrade *correctness*, not liveness: A5-1 leaves the network dead but the machine and every service alive and responsive; A5-2 makes a client report a loud, bounded "net-stack not responding" - wrong, but returned, not hung. The range's largest single improvement is on exactly this axis (the boot no-link skip). |
+
+
 ## Audit 4 - drift left behind by deleting the in-kernel aarch64 USB driver (2026-08-09, `feat/pi4-aarch64`)
 
 **Scope:** everything that described USB on AArch64. Commit `e71e64a6` deleted

@@ -7,6 +7,93 @@
 
 
 
+## Audit 10 - the link tick, the cable edge, and four reverts (2026-08-11, `feat/pi4-aarch64` @ f67f5c15)
+
+**Scope:** everything committed since `5426c6db` (20 commits) across `services/`, `sdk/`, and
+`scripts/selfcheck.gsh`. The surviving net diff is small - `net-stack/src/main.rs`,
+`nic-driver/src/genet.rs`, `xhci/src/main.rs`, `selfcheck.gsh` - because four things were **added and
+then reverted** inside the range (the kernel console-write counter + the shell prompt-redraw
+machinery; net-stack's "press Enter" hint; net-stack's PHY settle; net-stack's DHCP frame
+instrumentation). Verifying those reverts was half the brief. Audit 9's own fixes (A9-1 through A9-4)
+landed just *before* the range, so they were re-checked as delivered rather than as claimed.
+
+**Verdict: 2 HIGH, 5 MED, 3 LOW.** The reverts are clean - byte-clean, in fact. The real defects are
+all one shape: **the new link machinery is a chain of three edge-triggered mechanisms across two
+services, and every link in it consumes its trigger whether or not it did its job.** net-stack's tick
+consumes messages that were not its reply; nic-driver's re-apply consumes the cable edge even when it
+failed; the boot gate consumes its one and only probe. Each was written as if the thing it asks is
+guaranteed to answer.
+
+| ID | Sev | Commandment | Finding |
+|----|-----|-------------|---------|
+| A10-1 | HIGH | III, VIII, §8 | **net-stack's idle tick opens a message-stealing window on its own serve endpoint, once a second, forever.** `services/net-stack/src/main.rs:982` calls `link_is_up` from the timeout arm; `link_is_up` (`:896`) -> `nic_req` (`:90`) -> `ServiceContext::request_with_reply_deadline_outcome`, whose wait loop is `if let Some(r) = self.try_recv() { return DeadlineOutcome::Reply(r); }` (`sdk/rust/src/service_context.rs:717`). That is the **same endpoint net-stack serves clients on**, and the loop returns the first message that lands there, whatever it is. Three consequences, all confirmed by reading: (a) the link verdict is derived from a client's payload - a shell `net` is `[0]`, so `p.len() > 7` is false and `!p.is_empty()` is true, and `link_is_up` returns **true** regardless of the cable, which can flip `last_link` and print a **false** `NET: ethernet cable connected` on the console; (b) the client's request is consumed and never served, while the kernel has already installed its embedded reply cap and pushed it onto the per-task pending FIFO (`kernel/src/syscall/dispatch.rs:388-397`, `scheduler.rs:767` - strictly FIFO), so the **next** message net-stack serves is answered on the **wrong client's** cap; (c) nic-driver's real op-3 reply then arrives and is parsed as a request - `[1, mac(6), link(1)]`, first byte 1 = op 1 = **DNS lookup**. On a healthy NIC the window is the op-3 round trip (ms) and the FIFO rebalances after one bad exchange; when nic-driver is slow, restarting, or newly respawned the window is the full `LINK_SECS = 1` s against a 1 s tick, and each stolen request leaves the FIFO one entry deeper - a persistent reply-to-the-wrong-requester offset plus a leaked cap slot each time. The SDK comment at `service_context.rs:726-729` names exactly half of this ("this variant cannot drain blindly, because a service that also SERVES on this endpoint (net-stack) would discard live client requests") and then the loop consumes anyway. **Not new in kind** - the request path already called `nic_req` on this endpoint - but it *is* newly reachable, because a client is only free to send while net-stack is idle, and idle is precisely when the tick now runs. CONFIRMED code path; the interleaving is PLAUSIBLE and is produced by any `net`/`ping` typed during a NIC hiccup. |
+| A10-2 | HIGH | V, IX, §26.7 | **nic-driver spends the cable edge even when the re-apply failed, and there is no second edge.** `services/nic-driver/src/genet.rs:1315-1319`: `if up_now && !link_was_up { g.apply_link_settings(); }` then `link_was_up = up_now;` - unconditionally. `apply_link_settings` returns `u32` and has an explicit failure branch (`:956-960`): when `negotiated_speed()` reads 0 it logs "PHY has not settled on a speed - leaving the MAC at its default" and **returns 0 without programming the speed**. That verdict is discarded, the edge is marked consumed, and `apply_link_settings` has no other caller after `bring_up` (`:1095`) - so the MAC stays at its default clock and **receives nothing** until the cable is physically unplugged and replugged. The window is not exotic, it is the expected one: `link_is_up()` reads BMSR bit 2 (`:585-588`) while `negotiated_speed()` reads the vendor AUX status auto-negotiation result (`:565-577`) - two different registers, and nothing gates the second on `BMSR_ANEGCOMPLETE`. net-stack's tick probes at 1 s while copper auto-negotiation takes seconds, so the very promptness the tick was added for is what makes the transition likely to be seen before the speed resolves. This is also the hole the removed PHY settle used to cover: `51ba26cf` deleted it on the strength of `27c719bd`'s re-apply, and `27c719bd`'s re-apply is one-shot. Same class as the "storage recovered" and `sdhci` step-up discards (A8-1, U6-2, U6-10): a failed recovery recorded as a completed one. CONFIRMED code fact; the trigger frequency is PLAUSIBLE, not measured. |
+| A10-3 | MED | III, VIII, §26.7 | **The boot link gate is a single un-retried 1 s probe, taken at the moment nic-driver is least able to answer.** `net-stack/src/main.rs:939` replaced an unconditional `run_dance` - which retries `DANCE_TRIES = 6` times over `DANCE_SECS` budgets and therefore tolerated a peer that was still starting - with one `link_is_up`, whose only budget is `LINK_SECS = 1` and which has no retry at all. The supervisor spawns nic-driver and net-stack back to back (`services/supervisor/src/main.rs:175`, `:536`, `:548`), and nic-driver does not reach `serve()` until `bring_up` has finished MDIO probing, the PHY clock delay, an arena clear, two ring inits and two `DMA_START_TIMEOUT_US` waits. A `None` from `nic_req` therefore means "the driver is not serving yet" at least as often as it means "no cable" - and the code prints `no link at boot (cable unplugged?)`, a statement it has no evidence for, then **skips the entire boot configuration**. A cabled machine comes up with no IP, no gateway, no DNS and no SNTP wall clock. It is recovered by the first `net`/`ping` (the request-path auto-configure at `:1008`), so it is not permanent - but nothing recovers it on an idle machine (A10-4), and the check that would have caught the unset clock now skips itself (A10-9). CONFIRMED. |
+| A10-4 | MED | III, §26.4 | **The tick announces a cable it never configures, and two comments say otherwise.** The timeout arm (`:979-988`) reads the link, prints `ethernet cable connected`, and `continue`s. Auto-configure lives only in the request path (`:1008`), gated on `badge.is_none() && !have_mac && matches!(pl.first(), ..)` - i.e. it needs a **client request**. So on an idle machine the console reports that the network arrived and the stack stays unconfigured indefinitely. The comment at `:975-976` claims the tick "is what makes connect INFO, disconnect INFO and **auto-config-on-plug-in** possible at all", and `:935-938` justifies skipping the boot dance with "a machine booted unplugged configures itself on plug-in rather than needing `net renew`". Neither is true as written: what the tick delivers is the announcement, not the configuration. A derived view that contradicts its source. CONFIRMED. |
+| A10-5 | MED | IX, III, §14.3 | **A9-3's `revoke_all_open` was applied at one of the five sites that replace or drop the mount.** `services/fs/src/main.rs:2714` is correct and `:519` calls it. The other four do not: `:906` (`serve`'s retry-after-I/O-error re-mount, `*vol = Some(nf)` - **the second site A9-3 named by line**), `:1007` (the `drives` handler dropping the mount on an authoritative `Some(0)` capacity), `:1066` (`OP_FLASH` success - the disk was just **wiped**, so every open file is physically gone), `:1113` (`OP_RESET`). At each, the client's file cap stays valid at the kernel, its `rid` no longer resolves, and `serve_filecap` answers `FS_NOTFOUND` - "your file was deleted" instead of the truthful `CapRevoked` - while the resource is never revoked and leaks in fs's 2048-entry delegated band. The `:1066` case is the sharpest: fs knows with certainty that every open handle is void, and says nothing. CONFIRMED. |
+| A10-6 | MED | V, §26.7 | **xhci's "block request had NO reply cap" warning is gated on the wrong counter and is therefore unreachable in practice.** `services/xhci/src/main.rs:1421` computes `n` from `SEEN`, which counts **every** block-path message; `:1434` then logs the refusal only `if n == 1`. `block-driver` always sends its block requests through `request_with_reply` (`xhciblk.rs`), so message #1 carries a reply cap and spends the latch before any cap-less message can arrive. The refusal only ever prints if the very first block-path message of the instance is the malformed one. `f67f5c15`'s own commit message says "The refusal is worth keeping - a request with no reply cap leaves its caller waiting - but once per instance says everything a hundred repeats do"; what the code implements is "only if it happens first". The file already has the right pattern three times over (`NO_DISK_LOGGED`, `READ_FAIL_LOGGED`, `hub_none_logged`): a latch on the *event*, not a counter of *arrivals*. Sixth instance in this repo of a guard whose condition cannot hold in the failing case, and the commit that introduced it is in this range. CONFIRMED. |
+| A10-7 | MED | II, IX | **A9-2's fix does not cover the configuration A9-2 was about.** `services/xhci/src/main.rs:3441` now reads `if hub_due && (ndev < MAX_HID \|\| disk.is_some())`, which rescues the disk-removal watch. But the same block is the **only** site that increments `PROBE_FAILS` (`:3666`), which is the only trigger for the Reset Endpoint + Set TR Dequeue repair of a halted hub EP0 - the state the code's own comment calls one that "never recovers on its own". With `ndev == MAX_HID` (a keyboard **and** a mouse) and no disk bound, neither this gate nor the `ndev == 0` fallback (`:3719`) fires, so the repair is still dead in exactly the two-HID case A9-2 raised. The comment at `:3439-3440` states the correct rule - "a guard belongs on the ACTION it protects, not on the observation that feeds it" - and then leaves a second observation (the halted-EP0 probe) behind an action guard (`disk.is_some()`). CONFIRMED by reading the nesting end to end. Carried from a fix that landed just before this range; recorded here because it is live. |
+| A10-8 | LOW | III, §26.7 | **`learn_our_mac(&ctx).unwrap_or([0; 6])`** (`net-stack/src/main.rs:948`) turns "nic-driver did not answer" into an all-zero MAC presented as our hardware identity, which `net` then prints as `00:00:00:00:00:00`. The comment two lines above asserts the opposite - "The MAC is still learned - it is our hardware identity and true with or without a cable" - which holds when the cable is out and the driver is up, and fails in precisely the case A10-3 makes common (the driver is not serving yet). A silent fallback where a `None` was available. CONFIRMED. |
+| A10-9 | LOW | III | **The selfcheck clock probe skips silently when `date epoch` is BROKEN, not only when the clock is unset.** `scripts/selfcheck.gsh`: `let mut clockset = 0` / `for line in (date epoch) { if $line > 0 { clockset = 1 } }`. If `date epoch` errors or prints nothing the loop body never runs, `clockset` stays 0, and the suite prints `SKIP date - the clock is not set on this machine`. A regression in `date epoch` is therefore reported as a missing RTC. The block's own comment sets the bar it misses ("a silent skip is a test that has quietly stopped testing"); the probe needs `assert ok date epoch` beside it so a broken producer fails rather than excuses itself. Compounds A10-3: the boot dance being skipped is exactly what leaves the clock unset, and this is the check that would have shown it. CONFIRMED. |
+| A10-10 | LOW | VIII | **nic-driver's link re-apply is reachable only through net-stack's op-3 request.** `genet.rs:1294-1319` sits inside the status arm, so the driver's own recovery from an unclocked MAC depends on another service polling it. Kill net-stack (`chaos kill-storm net-stack` does, and it is in the restartable set) and no cable event is ever acted on until it comes back. Deliberate and documented ("Done HERE because this is the one place the link is already read live... with no polling added anywhere"), and net-stack's tick does drive it in the normal case - recorded because it makes a hardware recovery contingent on a peer's liveness, which is the coupling §14.3 asks to be stated rather than assumed. CONFIRMED. |
+
+**Clean results (verified, not assumed):**
+
+- **The four reverts are byte-clean.** `git diff 5426c6db..HEAD` touches **no** shell file and **no**
+  kernel file at all: the console-write-counter/prompt-redraw chain nets exactly to zero
+  (`9a233ad7` +24 and `6231e21c` +45 in `dispatch.rs` against `a7be98da` -69; SDK +21/-21; shell
+  +22-1+7-3 against -26). No orphan survives - `console_write_count`, `prompt_redraw`, the query-23
+  helper and the "press Enter" hint are absent from `services/`, `sdk/`, `kernel/` and `osdev/` (the
+  two surviving `press Enter` hits are prose: an unrelated `chaos` comment and the net-stack comment
+  that explains why the hint was removed). The PHY settle and the DHCP frame instrumentation likewise
+  leave no constant, no counter and no dead helper behind, and `link_notify` has exactly one caller.
+- **`link_notify` grants itself nothing.** It uses `console_write` (gated on the `LOG_WRITE` this
+  service already holds) and puts the newline **inside** the written string, rather than `console_push`,
+  which injects into the shell's input ring and would put net-stack inside the shell's trust perimeter
+  (§6.4, SEC-2 - keystrokes are commands). Checked against `xhci`'s `notify` (`main.rs:484-491`), which
+  does push. The visible cost is that a net-stack announcement does not redraw the prompt the way a USB
+  one does; that is the accepted residual the reverted redraw work was chasing, and it is documented
+  in place.
+- **`last_link`'s seeding is correct on every path except through A10-1's misread.**
+  `d.have_mac \|\| link_is_up(&ctx)` short-circuits, so a successful boot dance never re-probes; a
+  failed dance and a no-cable boot both re-probe and get the truth. A net-stack restart with the cable
+  in seeds `true` and does not announce a phantom plug-in; a restart with it out seeds `false`.
+  nic-driver's own `link_was_up` seed is sound *as a seed* - the defect in A10-2 is what the edge does,
+  not where it starts.
+- **The xhci heartbeat hoist is correct, and is the fix `a2647c5b` claims.** `last_beat` and `passes`
+  are declared above `'reenum` (`main.rs:2638-2639`), so they survive both `continue 'reenum` sites
+  (`:3257`, `:3310`) and every `break 'poll` - which is the whole content of the bug, a timer reset by
+  each re-enumeration under chaos. Nothing between the top of `'poll` and the beat at `:3353` can
+  `continue 'poll`, so the beat is reached on every completed pass. It is bounded by a clock
+  (`duration_cycles(HEARTBEAT_MS)`), not a count, and the pass counter it carries genuinely
+  distinguishes "entered but not progressing" from "silent".
+- **No new count-as-duration, and no new unbounded wait.** Every wait added in this range is
+  clock-bounded: `recv_timeout(ctx.duration_cycles(LINK_TICK_MS))`, the heartbeat interval, and
+  `nic_req`'s `LINK_SECS` wall-clock deadline. The one timing regression is the opposite error -
+  A10-3 replaced a *retrying* wait with a single-shot one.
+- **The idle tick's cost is bounded and degrades free.** One op-3 IPC per second, carrying two MDIO
+  reads inside nic-driver (`link_is_up`'s deliberate double read of the latching-low BMSR bit); with
+  no nic-driver at all, `find_send_slot` misses, `reacquire_by_name` fails, and `nic_req` returns
+  immediately with no wait. Nothing accumulates.
+- **The `selfcheck.gsh` rewrite is grammatically sound** (setting A10-9 aside). `Vars`' scope stack is
+  per-**function** (`services/shell/src/main.rs:1802-1805` - `scope_count`/`scope_alen`/`sp`), so a
+  `for` body pushes no scope and `clockset = 1` assigns the outer `let mut` rather than shadowing it.
+  `compare` (`:2237-2242`) is numeric when both operands parse, and `date epoch` prints a bare integer
+  and nothing else (`cmd_date`, `:4853-4856`), so `$line > 0` is a genuine numeric test. The probe
+  READS rather than repairs, which was the point of `8bf5b0f9`.
+- **Audit 9's fixes are genuinely delivered, re-checked at HEAD rather than taken on trust.** A9-1:
+  `serve_if_block` replies with `try_send_by_handle` and **consults** the verdict, logging a
+  non-delivery (`xhci/main.rs:1455-1460`) - the §8.9 mutual-block is gone. A9-4: `fs_raw`
+  (`shell/main.rs:8072-8092`) now drains, tags, and uses `request_with_reply_abortable`, so `drives`
+  and its siblings are q-abortable and reacquiring like every other fs helper.
+- **Zero `unsafe` in `services/` (§18.2)**, mechanically confirmed: `scripts/unsafe_check.py` passes -
+  72 audited files, 1096 total unsafe lines, no unaccounted additions. Nothing in this range adds one.
+- **Builds:** `cargo build -p net-stack -p nic-driver -p xhci -p fs -p shell -p block-driver --target
+  aarch64-unknown-none --release` is clean; the only warnings are the pre-existing
+  `improper_ctypes_definitions` on each `service_main`.
+
+---
+
 ## Audit 9 - the USB stack after it left the kernel (2026-08-09, `feat/pi4-aarch64` @ 34bc8233)
 
 **Scope:** the code the aarch64 port moved and rewrote in the last two days - `services/xhci` (`main.rs`
