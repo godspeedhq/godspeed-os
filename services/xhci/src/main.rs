@@ -809,6 +809,22 @@ fn hub_port_status(
                 if sid < 32 {
                     *eaten |= 1 << sid;
                 }
+                // ABANDON THE PROBE and let the caller deliver the keystroke NOW.
+                //
+                // This used to keep waiting for its own event, so a key pressed during a probe sat
+                // undelivered until the probe finished - up to PROBE_ANSWER_MS (50 ms) later. That is
+                // the stutter felt while typing continuously: a 13 ms poll cadence with occasional
+                // 50 ms hitches on top.
+                //
+                // The report is not lost either way (the caller delivers every `eaten` slot before
+                // re-arming, 6ab4a926); the difference is WHEN. Returning immediately puts it on
+                // screen this pass instead of after the wait.
+                //
+                // Cost: the probe is abandoned, so a hub port is not checked this cycle. That is
+                // cheap - probes run every HUB_POLL_MS and a `None` concludes NOTHING (a failed
+                // question is not an answer, 9af9ab4b), so the next cycle simply asks again. Input
+                // is the interactive path; a removal noticed 500 ms later is not felt.
+                return None;
             }
             Some(_) => {} // a non-transfer event (port change, command) - ignore; keep waiting
             None => {
@@ -3557,6 +3573,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 // Still LOUD, once, so a persistent inability to ask is visible
                                 // rather than silently ignored (§26.7) - it just no longer invents a
                                 // removal to explain itself.
+                                // An abandoned probe (we returned early to deliver a keystroke) is
+                                // NOT a failed one - counting it would let fast typing walk the
+                                // counter toward the wedge threshold and reset a healthy endpoint.
+                                None if eaten != 0 => false,
                                 None => {
                                     disk_absent_seen = disk_absent_seen.saturating_add(1);
                                     if disk_absent_seen == 20 {
@@ -3677,7 +3697,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // Counting consecutive failures ACROSS ports of this hub, because the halt is a
                         // property of the shared EP0 endpoint, not of one port: every port's probe
                         // rides the same ring, so they all fail together and any of them is evidence.
-                        if st.is_none() {
+                        // `eaten != 0` means the probe was ABANDONED to deliver a keystroke, not that
+                        // it failed. Counting it would let fast typing walk this counter to 200 and
+                        // reset a perfectly healthy endpoint - a wedge repair firing because the user
+                        // typed. The wedge case is unmistakable: nothing arrives at all, so `eaten`
+                        // stays 0 and the count climbs as it should.
+                        if st.is_none() && eaten == 0 {
                             let n = PROBE_FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
                             if n >= 200 {
                                 ctx.log_fmt(format_args!(
