@@ -3296,8 +3296,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // The 10 ms floor itself is the kernel's tick granularity, not a constant here; going
             // below it needs a sub-tick timed wake or a genuinely core-local interrupt (the aarch64
             // GIC currently targets every SPI at core 0 while this service is pinned to core 2).
-            let deadline = if polling {
+            // Fast ONLY while a key is actually held. At rest, the hub-poll cadence.
+            //
+            // The 10 ms pace existed to catch HID reports that interrupts were not delivering - and
+            // they were not, because the interrupter was never acked (EHB, fixed this commit's
+            // parent). With interrupts genuinely arriving (218 MSI in the first 61 s on hardware),
+            // a report WAKES us; nothing has to be caught by polling.
+            //
+            // Three things still need a timed wake, which is why this is not simply removed:
+            //   - auto-repeat is SYNTHESISED locally, so a held key produces no further USB traffic
+            //     and no interrupt can drive the repeat;
+            //   - root-port hot-plug is read from PORTSC rather than from Port Status Change Events;
+            //   - hub downstream status is polled every HUB_POLL_MS.
+            // Only the first needs to be fast, and only while a key is down.
+            //
+            // So: `base` (one tick) while any keyboard has a repeat armed, `HUB_POLL_MS` otherwise.
+            // At rest that is ~2 passes/sec instead of ~85, which is where the service's ~23% CPU
+            // goes. Moving the other two onto events would let the timed wake go entirely.
+            let repeat_armed = (0..ndev).any(|d| !devs[d].is_mouse && kb_rep[d].armed());
+            let deadline = if repeat_armed {
                 base
+            } else if polling {
+                ctx.duration_cycles(HUB_POLL_MS)
             } else {
                 base.saturating_mul(25)
             };

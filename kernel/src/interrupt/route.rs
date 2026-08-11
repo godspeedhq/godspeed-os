@@ -81,14 +81,29 @@ pub unsafe fn deliver(irq: u8) {
 
     let endpoint = IRQ_TABLE.lock()[irq as usize];
     if let Some(ep) = endpoint {
-        // COALESCE interrupt notifications. A busy-poll driver (xhci/ehci) reads its device's event
-        // ring directly every pass, so it needs at most ONE pending "IRQ fired" IPC; extra ones just
-        // pile up in its queue (which then reads as full / "can't accept work" in `observe`, even
-        // though the driver is fine - the symptom seen after a max-carnage interrupt storm). If a
-        // notification is already queued, skip this one: the driver polls the device anyway, and the
-        // kernel re-notifies once the queue drains. A driver BLOCKED on recv always has an empty
-        // queue, so it never loses a wakeup. (The EOI below still fires unconditionally.)
-        if crate::ipc::routing::endpoint_queue_depth(ep) == 0 {
+        // COALESCE interrupt notifications, but only against QUEUE PRESSURE - never against the mere
+        // presence of unrelated work.
+        //
+        // This read `endpoint_queue_depth(ep) == 0`, so ANY queued message suppressed the interrupt.
+        // A driver whose endpoint carries more than interrupts - `xhci` receives block requests from
+        // `block-driver` on the same endpoint - therefore lost IRQ notifications whenever it happened
+        // to have a request pending. The comment claimed "the kernel re-notifies once the queue
+        // drains"; there is NO such path. This is the only enqueue site, and nothing re-triggers it
+        // but the next hardware interrupt.
+        //
+        // It is currently masked by those drivers ALSO polling their event ring every pass, which is
+        // why it has never been seen. It becomes a lost keystroke - or a lost disk completion - the
+        // moment a driver stops polling, which is exactly the direction xhci is moving.
+        //
+        // Half the queue is the reserve. Below it, always notify: a pending block request must never
+        // cost an interrupt. At or above it, skip: that is a genuine storm, the queue is the thing
+        // under pressure, and the driver reads its ring on the next pass regardless. So the
+        // pathology this was written for (notifications piling up until `observe` shows a full queue
+        // after a max-carnage interrupt storm) is still bounded, and the correctness hole is closed.
+        //
+        // (The EOI below still fires unconditionally, on every path.)
+        const IRQ_NOTIFY_RESERVE: u8 = (crate::ipc::queue::QUEUE_DEPTH / 2) as u8;
+        if crate::ipc::routing::endpoint_queue_depth(ep) < IRQ_NOTIFY_RESERVE {
             let msg = crate::ipc::message::Message::interrupt_event(irq);
             if let Some(receiver_slot) = crate::ipc::routing::enqueue_from_interrupt(ep, msg) {
                 // wake_by_slot marks the receiver Ready and sends a WAKE_RECEIVER IPI
