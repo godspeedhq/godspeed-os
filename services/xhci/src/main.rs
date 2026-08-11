@@ -796,8 +796,23 @@ fn hub_port_status(
             if ev.is_some() || ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
                 break;
             }
-            // YIELD between polls. This loop was a pure busy-wait, and it was the whole cost of this
-            // service.
+            // SLEEP between polls - not yield, and not spin.
+            //
+            // Three versions of this loop, and the middle one was mine and the worst:
+            //   spin        -> 50 ms of this task burning a core          (~15%)
+            //   yield_cpu   -> 50 ms of SCHEDULER THRASH                  (~70%)
+            //   sleep       -> the task is not runnable at all            (this)
+            //
+            // `yield_cpu` hands the core back but leaves the task READY, so the scheduler picks it
+            // straight back up and it yields again - same wall time, now with a scheduler round trip
+            // per iteration, and the task charged for every tick it is scheduled. It measured WORSE
+            // than the busy-wait it replaced, which is the honest reason this comment exists.
+            //
+            // `sleep` blocks on the timed wake until the deadline, so the core is genuinely free.
+            // The floor is one 10 ms tick (`cycles_to_ticks` clamps sub-quantum requests), which
+            // against a 50 ms budget is about five polls - ample, because a probe that is going to
+            // answer answers in about a millisecond, and one that is not was going to burn the whole
+            // budget either way.
             //
             // Measured, after four measurements that each refuted something else: of 10064 ms of work
             // in 60 s, the hub segment held 10061 - 99.97% - at ~60 ms per pass, which is
@@ -810,7 +825,7 @@ fn hub_port_status(
             // and still returns the same answers (Commandment VIII) - while letting the core run
             // something else, or idle. The same fix this driver already received once, on the Wyse,
             // where a busy-spin held a core at 100%.
-            ctx.yield_cpu();
+            ctx.sleep(ctx.duration_cycles(1));
         }
         match ev {
             Some((TRB_TRANSFER_EVENT, cc, sid)) if sid == hub_slot => {
