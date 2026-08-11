@@ -411,9 +411,27 @@ const HUB_RESCAN_MS: u64 = 1_500;
 /// A hub answers GET_STATUS in about a millisecond. This is the bound for one that does not, and it
 /// is deliberately small: the probe runs per port per pass, so this is a direct input-latency cost
 /// whenever a hub is unresponsive.
-const PROBE_ANSWER_MS: u64 = 50;
+const PROBE_ANSWER_MS: u64 = 10;
 
-// 50, not 5, and the reason is scheduling rather than the device.
+// 10, cut from 50, because the budget is spent WAITING FOR AN ANSWER THAT DOES NOT COME.
+//
+// Measured: the hub segment burns ~10 s of wall time per minute, i.e. the probes time out almost
+// every time. They do not get their completion because the poll loop's drain consumes it first (one
+// event ring, several consumers, no correlation) - so the budget is not "how long the hub may take",
+// it is "how long we wait before admitting we were not going to hear back".
+//
+// That wait BLOCKS THE INPUT LOOP. Auto-repeat is synthesised by this loop, so a held key stutters
+// every time a probe runs: a gap of the whole budget, every HUB_POLL_MS. Cutting 50 to 10 shrinks
+// that gap fivefold and loses nothing, because a probe that WILL answer answers in about a
+// millisecond and one that will not was never going to.
+//
+// This is mitigation, not the fix. The fix is to correlate a completion with its requester so the
+// probe gets its answer at all - the same problem docs/net-tags-design.md describes for net-stack,
+// one layer down. Then the budget stops mattering.
+//
+// (Was 50 for a reason that no longer applies: a service runs on a 10 ms quantum, so a 5 ms deadline
+// could expire while descheduled. 10 ms is one quantum, and the probe now SLEEPS rather than spins,
+// so being descheduled is the normal case rather than a hazard.)
 //
 // 5 ms was chosen while this driver was IN THE KERNEL, where the only thing between posting a
 // transfer and seeing its completion was the controller. As a userspace SERVICE it runs on a 10 ms
