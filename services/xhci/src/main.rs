@@ -2678,6 +2678,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // "are we using interrupts?" is answered by a number instead of by a log line that could not tell.
     let mut msi_count: u64 = 0;
     let mut msg_count: u64 = 0;
+    let mut work_cycles: u64 = 0;
+    let mut work_t0: u64 = 0;
     let mut fast_waits: u64 = 0;
     let mut idle_waits: u64 = 0;
     // The vector the KERNEL programmed this controller's MSI to deliver on; an interrupt notification
@@ -3335,7 +3337,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // right when every message was an interrupt wakeup carrying no information. A block
             // request is not that: it carries a reply cap, and dropping it would hang the caller
             // forever on a disk that was working. `serve_if_block` tells them apart by that cap.
+            // Close out the PREVIOUS pass's work before waiting again - this is the whole body,
+            // wait excluded, which is the quantity `observe` charges us for and the one number this
+            // investigation never had.
+            if work_t0 != 0 {
+                work_cycles = work_cycles.wrapping_add(ctx.read_tsc().wrapping_sub(work_t0));
+            }
             let woke = ctx.recv_timeout(deadline);
+            work_t0 = ctx.read_tsc();
             // Delivered event = something is waking us. Timeout = it is not.
             // An IRQ notification is a ONE-BYTE payload equal to the vector; a block request is not.
             //
@@ -3498,6 +3507,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // GET_STATUSing the hub's downstream port, throttled (a control transfer, not free). Either
             // way: notify and break to fully re-initialize, re-binding whatever remains next pass.
             passes = passes.wrapping_add(1);
+            // TIME the work half of the pass, not just count passes.
+            //
+            // Every measurement in this investigation has counted EVENTS - wakes, MSI, messages,
+            // branches - and none has measured DURATION. That gap is why the two instruments cannot
+            // be reconciled: `observe` charges xhci ~15% while it sits in BlockRecv, and the
+            // heartbeat says it wakes 2.85 times a second. Both are consistent only if a wake costs
+            // ~50 ms, which is exactly `PROBE_ANSWER_MS` - the hub probe budget, which this driver
+            // SPINS on rather than blocking. If that is where the time goes, the fix is to stop
+            // busy-waiting, and no amount of adjusting wake rates would ever have found it.
             if ctx.read_tsc().wrapping_sub(last_beat) > ctx.duration_cycles(HEARTBEAT_MS) {
                 last_beat = ctx.read_tsc();
                 // Carries the DEVICE's own elapsed seconds, so the beat can be checked against
@@ -3515,8 +3533,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // next step is comparing CNTPCT deltas against BSP tick counts - two independent
                 // clocks. Either way the log answers it without a rebuild.
                 ctx.log_fmt(format_args!(
-                    "xhci: alive - t={}s, {} passes ({} fast/{} idle), {} MSI, {} msg, {} HID, disk {}",
-                    ctx.epoch_secs_monotonic(), passes, fast_waits, idle_waits, msi_count, msg_count, ndev,
+                    "xhci: alive - t={}s, {} passes ({} fast/{} idle), {}ms work, {} MSI, {} msg, {} HID, disk {}",
+                    ctx.epoch_secs_monotonic(), passes, fast_waits, idle_waits,
+                    work_cycles / ctx.duration_cycles(1).max(1),
+                    msi_count, msg_count, ndev,
                     if disk.is_some() { "yes" } else { "no" }));
             }
             let hub_due =
