@@ -3,6 +3,10 @@
 > **Status:** Root cause **proven by measurement** (2026-08-11), fix **not built**. This is the
 > driver-layer twin of `docs/net-tags-design.md`: several consumers, one queue, no correlation.
 >
+> **OUTCOME (2026-08-11, hardware): fixed.** Hub probes went from **151/328 (46%) to 312/313 (99.7%)**
+> and hot-plug works in both directions for both devices, with console INFO every time. The residual
+> and its correct handling are in §8.
+>
 > **Symptom it explains:** USB hot-plug does nothing on the Pi 4. Unplug the keyboard or the stick
 > and no INFO appears, until unrelated IPC (typing `ls` over serial) drives a re-enumeration that
 > rediscovers everything.
@@ -152,3 +156,56 @@ On hardware (QEMU emulates no PCIe on raspi4b, so none of this reproduces there)
   above is real regardless, but that traffic is what makes it fire constantly.
 - `services/fs/src/main.rs` (the `tag` handling) is the in-tree reference for correlation, and
   `docs/net-tags-design.md` is the same problem one layer up. Read both first.
+
+
+---
+
+## 8. Residual: the endpoint reaches EP State 4 (Error), and re-enumeration is the right answer
+
+Occasionally - roughly once a minute under deliberate hot-plug hammering, never in quiet running - a
+probe's completion comes back `cc 5` (TRB Error) and the hub's EP0 lands in **EP State 4 (Error)**.
+
+Getting to that sentence took three wrong guesses, each costing a hardware round-trip:
+
+1. "The endpoint is halted" -> Reset Endpoint -> `cc 19` Context State Error. Reset Endpoint is legal
+   only from Halted, so it was not halted. The log had been *asserting* "endpoint stays halted".
+2. "Then it is running" -> Stop Endpoint -> `cc 19` again. Not running either.
+3. Stop guessing. The state is a FIELD - three bits at the bottom of the endpoint context's first
+   dword (xHCI 6.2.3), in memory the driver already owns. One load: **state 4, Error**.
+
+**No endpoint command repairs the Error state.** Reset Endpoint and Stop Endpoint both refuse it by
+design; the defined recovery is to rebuild the endpoint, which for this driver means re-enumeration.
+So the fallback that had been running all along - and which was being logged as
+`endpoint reset FAILED - falling back to a full re-enumeration` - **was the correct repair**, reported
+as a failure. It recovers cleanly every time; hot-plug kept working across all four occurrences in one
+run. The messages now say what is actually happening (§26.7 cuts both ways: a recovery that works must
+not be reported as a failure).
+
+The repair is now state-driven rather than hypothesis-driven:
+
+| EP state | Repair |
+|---|---|
+| 2 Halted | Reset Endpoint, then Set TR Dequeue |
+| 1 Running | Stop Endpoint, then Set TR Dequeue |
+| 3 Stopped | nothing first - this is already what Set TR Dequeue requires |
+| 0 Disabled / 4 Error | not repairable in place; re-enumerate (the defined recovery) |
+
+**What is still open** is why `cc 5` happens at all - a TRB the controller judges malformed, so ours.
+The prime suspect remains the hub's EP0 ring being shared between two producers with different
+disciplines: enumeration's `hoff` sweeps 176..0xF00 writing a hardcoded cycle bit of 1, while the poll
+loop's probe walks its own cursor with a `pcs` that toggles on wrap. Seeding the probe cursor from
+`hub_off` (both paths now do this) removed the common case; the rare one likely needs the two
+producers separated outright - a dedicated probe region the enumeration path never touches.
+
+Worth doing, but it is a latent-fault hunt with a working recovery underneath it, not an outage.
+
+## 9. Method note
+
+Three times in this investigation, measuring beat reasoning in a single step, after reasoning had
+already failed: the probe counter (which mechanism), the segment timing (where the time went), and the
+endpoint-state read (what state it was actually in). Each followed a wrong hypothesis that had sounded
+convincing.
+
+The rule earned here: **when a hypothesis about hardware state turns out wrong, do not form a second
+one - find where the hardware records the answer and read it.** The controller knows its own endpoint
+state; there was never a need to infer it from which commands it rejected.

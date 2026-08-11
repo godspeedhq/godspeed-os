@@ -343,9 +343,10 @@ fn reset_endpoint(
         // back to a full re-enumeration rather than pretending a repair happened (§26.7).
         _ => {
             ctx.log_fmt(format_args!(
-                "xhci: endpoint slot {} dci {} is in state {} (0=disabled 4=error) - not repairable \
-                 by an endpoint command",
-                slot, dci, ep_state));
+                "xhci: endpoint slot {} dci {} is in state {} ({}) - no endpoint command repairs \
+                 this; re-enumerating, which IS the defined recovery",
+                slot, dci, ep_state,
+                match ep_state { 0 => "disabled", 4 => "error", _ => "unknown" }));
             return false;
         }
     };
