@@ -985,10 +985,22 @@ fn hub_port_status(
                 // report a fault, not become one.
                 if !*cc_logged {
                     *cc_logged = true;
+                    // Carry the RING POSITION, because that is what distinguishes the two live
+                    // theories about why the controller calls our TRB malformed, and no amount of
+                    // re-reading the TRB construction separates them:
+                    //
+                    //   - `cur` just past a wrap (small, with pcs 0) points at the Link TRB / cycle
+                    //     handover - the probe and the enumeration path share this ring and write
+                    //     the cycle bit by different rules;
+                    //   - `cur` anywhere, pcs 1, points at the TRB fields themselves or the data
+                    //     buffer, and the wrap is innocent.
+                    //
+                    // Two numbers already in hand, on a line that already prints. This is the fourth
+                    // time here that a measurement settled in one boot what argument could not.
                     ctx.log_fmt(format_args!(
-                        "xhci: hub slot {} port {} status transfer FAILED (cc {}) - not a timeout; \
-                         repairing the endpoint now rather than waiting for the failure count",
-                        hub_slot, hub_port, cc
+                        "xhci: hub slot {} port {} status transfer FAILED (cc {}) at ring cur={:#x} \
+                         pcs={} - not a timeout; repairing the endpoint now",
+                        hub_slot, hub_port, cc, *cur, *pcs
                     ));
                 }
                 // REPAIR NOW. A failed completion halts EP0, and a halted endpoint retires nothing
