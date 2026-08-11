@@ -1420,14 +1420,20 @@ fn serve_if_block(
     // refuse. A relaxed atomic costs nothing and needs no exemption.
     static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let n = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-    if n <= 8 {
-        ctx.log_fmt(format_args!(
-            "xhci: block-path message #{} arrived, {} bytes",
-            n, msg.payload_bytes().len()));
-    }
+    // The "block-path message #N arrived" trace is GONE, and the refusal below now speaks ONCE.
+    //
+    // Both were bounded per instance (`n <= 8`), which looked fine and was not: a 10-hour soak logged
+    // 477 of them in a seven-minute window, because chaos restarted services 501 times there and every
+    // fresh instance gets its own first-8. A per-instance bound is no bound at all on a machine whose
+    // whole purpose is restarting services.
+    //
+    // The arrival trace existed to prove the block path worked at all; it does, and has for a day of
+    // hardware testing. The refusal is worth keeping - a request with no reply cap leaves its caller
+    // waiting - but once per instance says everything a hundred repeats do, and this is the loop that
+    // also polls the keyboard.
     let Some(reply) = ctx.take_pending_cap() else {
-        if n <= 8 {
-            ctx.log("xhci: block request had NO reply cap - dropping it (the caller will block)");
+        if n == 1 {
+            ctx.log("xhci: block request had NO reply cap - dropping it (the caller will block; further occurrences silent)");
         }
         return true;
     };
