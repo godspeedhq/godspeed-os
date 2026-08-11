@@ -308,11 +308,41 @@ fn reset_endpoint(
         ev_idx, ev_cycle,
     );
     // `run_command` yields (completion_code, slot); 1 = Success.
+    //
+    // COMPLETION CODE 19 IS CONTEXT STATE ERROR, AND IT MEANS THE ENDPOINT IS NOT HALTED.
+    //
+    // Reset Endpoint is legal only from the Halted state (xHCI 4.6.8). Every repair attempt on this
+    // board came back `cc Some((19, 1))` and gave up here, logging "endpoint stays halted" - which
+    // was not merely a failed repair but the wrong diagnosis printed as fact: the endpoint was
+    // RUNNING the whole time. The probes were not failing because of a halt at all.
+    //
+    // A running endpoint whose ring we cannot reach needs the dequeue pointer resynchronised, and
+    // Set TR Dequeue is legal only from Stopped - so the correct move is Stop Endpoint, not a reset.
+    // Bailing out here skipped the one command that would have fixed it.
+    //
+    // So: try the reset (right when the endpoint really is halted), and on Context State Error fall
+    // through to Stop Endpoint instead. Either way we arrive at Set TR Dequeue below, which is the
+    // step that actually makes the ring coherent again.
     if !matches!(cc, Some((1, _))) {
-        ctx.log_fmt(format_args!(
-            "xhci: Reset Endpoint slot {} dci {} FAILED (cc {:?}) - endpoint stays halted",
-            slot, dci, cc));
-        return false;
+        if !matches!(cc, Some((19, _))) {
+            ctx.log_fmt(format_args!(
+                "xhci: Reset Endpoint slot {} dci {} FAILED (cc {:?}) - cannot recover this endpoint",
+                slot, dci, cc));
+            return false;
+        }
+        let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+        *cmd_idx += 1;
+        let cc = run_command(
+            ctx, dma, mmio, dboff, ir0, cmd_off, 0, 0, 0,
+            (TRB_STOP_ENDPOINT << 10) | (slot << 24) | (dci << 16) | 1,
+            ev_idx, ev_cycle,
+        );
+        if !matches!(cc, Some((1, _))) {
+            ctx.log_fmt(format_args!(
+                "xhci: Stop Endpoint slot {} dci {} FAILED (cc {:?}) - ring cannot be resynchronised",
+                slot, dci, cc));
+            return false;
+        }
     }
     // Resume at the ring BASE with Dequeue Cycle State = 1, the state a fresh ring is in. The caller
     // resets its producer cursor to the same place, so both sides agree again.
@@ -334,7 +364,7 @@ fn reset_endpoint(
         return false;
     }
     ctx.log_fmt(format_args!(
-        "xhci: endpoint slot {} dci {} RESET and dequeue re-pointed to the ring base - recovered",
+        "xhci: endpoint slot {} dci {} quiesced and dequeue re-pointed to the ring base - recovered",
         slot, dci));
     true
 }
@@ -389,6 +419,10 @@ const TRB_DISABLE_SLOT: u32 = 10;
 static PROBE_FAILS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 const TRB_RESET_ENDPOINT: u32 = 14;
 /// Set TR Dequeue Pointer (xHCI 4.6.10) - tells the controller where to resume on that endpoint.
+/// Stop Endpoint (xHCI 4.6.9) - moves a RUNNING endpoint to Stopped, which is the state Set TR
+/// Dequeue requires. The counterpart to Reset Endpoint: reset repairs a Halted endpoint, stop
+/// quiesces a running one. Confusing the two costs a Context State Error and no repair at all.
+const TRB_STOP_ENDPOINT: u32 = 15;
 const TRB_SET_TR_DEQUEUE: u32 = 16;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
