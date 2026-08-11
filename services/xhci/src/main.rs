@@ -2920,6 +2920,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //
     // One line in the heartbeat decides it. Every previous round here counted events and could not
     // separate these two, which is exactly why it took four attempts to find the last one.
+    // Ports already tried and not bound. MUST outlive a re-enumeration.
+    //
+    // This lived INSIDE the 'reenum loop, so the re-enumeration it triggers reset it to zero - the
+    // guard erasing its own memory with the very action it fires. A port holding a device that does
+    // not bind was therefore rediscovered as "new" on the next pass, forever: 110 controller resets
+    // in one run, roughly every 1.7 seconds, each tearing down the keyboard and the disk to rebind
+    // them. The comment at the declaration described exactly this failure and the bit was supposed
+    // to be the cure.
+    //
+    // It was invisible until now because the cc 5 churn was re-enumerating at a similar rate anyway.
+    // Fixing that (16243569) did not cause this loop; it uncovered it.
+    //
+    // Third instance of one class in this driver: state whose lifetime is shorter than the events it
+    // must remember (`eaten` re-zeroed per pass, PROBE_FAILS reset per re-enumeration, now this).
+    // A latch that resets when the thing it latches happens is not a latch.
+    let mut hub_tried: u64 = 0;
     let mut hub_posted: u64 = 0;
     let mut hub_ok: u64 = 0;
     let mut hub_late: u64 = 0;
@@ -3320,7 +3336,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         //
         // Root ports already had this concept (`poisoned`); hub ports did not. A bit is cleared when
         // its port reports DISCONNECTED, so a genuine unplug-replug is still seen as new.
-        let mut hub_tried: u64 = 0;
         // SEED the disk-hub cursor from where enumeration actually left that hub's EP0 ring, exactly
         // as `hub_cur[d]` is seeded from `devs[d].hub_off` below.
         //
