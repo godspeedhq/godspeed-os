@@ -483,12 +483,20 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // rather than a missing capability.
         net_device: cfg!(any(target_arch = "arm", target_arch = "aarch64"))
             && matches!(name, "nic-driver"),
-        // USB_DISK: on BOTH ARM ports the USB stack is in-kernel, so `block-driver` reaches a USB stick
-        // through syscalls 46-48 rather than MMIO. Whole-device read/write reach, granted to that one
-        // service. The Pi 4 needs it for the same reason the Pi 2 does, and needed it here: without the
-        // grant the kernel found a 15 GB stick, the service asked for its capacity, and the syscall
-        // refused with `CapNotHeld` - which surfaced as `drives` reporting a 0 MiB unformatted disk,
-        // three layers from the missing line.
+        // USB_DISK: `block-driver` reaches a USB stick through syscalls 46-48 rather than MMIO, on
+        // the port where the USB stack is IN THE KERNEL - which is now ARM32 (Pi 2) ONLY. On aarch64
+        // the in-kernel driver was deleted (CLAUDE.md §6.4, 2026-08-09) and block-driver goes through
+        // the `xhci` SERVICE over IPC, so the grant buys it nothing there.
+        //
+        // KEPT for aarch64 all the same, deliberately, and this is the honest reason: the syscalls
+        // still EXIST on that port as stubs, and a grant that matches where the mechanism lives is
+        // easier to reason about than one that does not. It is also a vestigial authority (audit
+        // SEC-37) - whole-device read/write reach handed to a service that no longer uses it - so the
+        // right end state is to delete the aarch64 stubs and narrow this to `target_arch = "arm"`.
+        // Recorded rather than done, because removing syscalls is a separate change with its own test.
+        //
+        // (The original note here claimed the stack is in-kernel on BOTH ARM ports. That was true when
+        // it was written and stopped being true when the aarch64 driver was deleted.)
         usb_disk: cfg!(any(target_arch = "arm", target_arch = "aarch64"))
             && matches!(name, "block-driver"),
         //   the shell's `gpio` command drives the SoC pins (the gated `Gpio` syscall, 45).

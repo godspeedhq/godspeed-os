@@ -1704,7 +1704,7 @@ fn bind_msc(
 /// caller must poison the offending port and re-initialise the controller rather than issue more doomed
 /// Write a 64-bit xHCI register as TWO 32-BIT WRITES, low half first.
 ///
-/// The SDK's `Mmio::write64` emits a single 64-bit store. Our in-kernel driver - the one that has
+/// The SDK's `Mmio::write64` emits a single 64-bit store. The in-kernel driver this replaced (deleted 2026-08-09; read it in git history) - the one that had
 /// always driven this exact VL805 on the Pi 4 - has never done that: its `wr64` is two 32-bit writes,
 /// and the difference had never been tested because QEMU accepts either.
 ///
@@ -2188,7 +2188,7 @@ fn enumerate_one(
     }
     // Let power settle before touching any port.
     //
-    // The in-kernel driver waits 200 ms here and mine waited none. A port is powered, not ready: a
+    // The in-kernel driver waited 200 ms here and mine waited none. A port is powered, not ready: a
     // device has to see VBUS, pull its speed-signalling resistor up, and be DETECTED by the hub
     // before a reset can enable it. Reset it too early and the port answers "connected, powered, not
     // enabled" - status 0x0301, exactly what the Pi 4 reported seven times over sixteen seconds
@@ -2243,7 +2243,7 @@ fn enumerate_one(
         hoff += 32;
         // POLL the port until it reports ENABLED, rather than holding for a fixed time and hoping.
         //
-        // Taken from the in-kernel driver still in this tree (`arch/aarch64/xhci.rs`), which has
+        // Taken from the in-kernel driver, since deleted (`arch/aarch64/xhci.rs`, in git history), which had
         // driven this exact hub for weeks. I had been re-deriving this sequence from the spec and
         // getting it subtly wrong; the working version was sitting in the repo the whole time.
         //
@@ -2294,7 +2294,7 @@ fn enumerate_one(
         // why retrying immediately could not help: three attempts 15 ms apart all land inside the
         // recovery window, which is exactly what the Pi 4 showed (completion=4 three times in 45 ms,
         // the code never changing).
-        // Acknowledge C_PORT_CONNECTION too. The in-kernel driver clears BOTH change bits with the
+        // Acknowledge C_PORT_CONNECTION too. The in-kernel driver cleared BOTH change bits with the
         // comment "or the hub keeps reporting the same event forever" - and mine cleared only
         // C_PORT_RESET. An unacknowledged connection-change is a hub that keeps announcing the same
         // arrival, which is exactly the re-enumeration behaviour seen on this board.
@@ -2489,7 +2489,7 @@ fn enumerate_one(
     // the hub goes; plug something in afterwards and nothing sees it - no INFO, `drives` stale, a
     // keyboard that never rebinds. That is the entire session's report, from this one branch.
     //
-    // The in-kernel driver reached the same conclusion and says so at the equivalent point: "Keep the
+    // The in-kernel driver reached the same conclusion and said so at the equivalent point: "Keep the
     // hub. Everything on this board is behind it, so a keyboard unplugged once would stay dead until
     // reboot without something still holding its control endpoint." I released it anyway.
     //
@@ -2569,7 +2569,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // value = (Hi << 5) | Lo.
     //
     // These two were SWAPPED here, and the Pi 4 caught it: the VL805 reported `max_scratch=992` to
-    // this service while the in-kernel driver - which has the fields the right way round - refuses
+    // this service while the in-kernel driver - which had the fields the right way round - refused
     // loudly above 512 and has always driven this board fine. Decoding 992 backwards (31<<5 | 0)
     // gives Hi=0, Lo=31: the controller wants **31** buffers, not 992.
     //
@@ -3292,7 +3292,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // Not another tuning step - this is the split's GUARANTEE reached by serialisation
             // instead of preemption. The input drain runs immediately after this block, so a budget
             // of one means the gap between keystroke polls is bounded by a SINGLE BOT command rather
-            // than by however many `fs` had queued. The kernel driver got that bound from the timer
+            // than by however many `fs` had queued. The in-kernel driver got that bound from the timer
             // interrupt; here it comes from refusing to batch.
             //
             // Throughput cost is real and accepted: a multi-sector read now takes one pass per

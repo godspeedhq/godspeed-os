@@ -2331,7 +2331,6 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/genet.rs | 1 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
 | arch/aarch64/smp_boot.rs | 9 | permitted |
-| arch/aarch64/xhci.rs | 42 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |

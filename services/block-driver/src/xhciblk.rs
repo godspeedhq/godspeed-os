@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Reach the USB disk through the **`xhci` SERVICE** instead of the in-kernel USB stack.
 //!
-//! `usbdisk.rs` reaches its device through four syscalls - `usb_disk_sectors/read/write/flush`.
-//! Those syscalls exist for exactly one reason: to expose a USB stack that lives IN THE KERNEL. As
-//! long as they are the only route to a disk, `kernel/src/arch/aarch64/xhci.rs` - 2742 lines of ring
-//! 0 parsing descriptors and frames supplied by whatever was plugged in - cannot be deleted, and
-//! Commandment I stays broken on this port (§4.4: the kernel contains no drivers).
+//! `usbdisk.rs` reaches its device through four syscalls - `usb_disk_sectors/read/write/flush` -
+//! which exist to expose a USB stack that lives IN THE KERNEL. That was true on aarch64 when this
+//! module was written; it is not now. `kernel/src/arch/aarch64/xhci.rs` (2742 lines of ring-0 code
+//! parsing descriptors supplied by whatever was plugged in) was DELETED, along with the feature flags
+//! that used to select between the two drivers, so on this port the service below is the only route
+//! and Commandment I is closed (CLAUDE.md §6.4, amendment 2026-08-09).
+//!
+//! The syscall route survives for ARM32 (Pi 2), which has no PCIe and no device-IRQ routing to
+//! userspace, so its DWC2 stack remains in the kernel. `usbdisk.rs` picks between the two on
+//! `cfg(target_arch)` - it used to be a build FEATURE, which was a footgun: the switch had to reach
+//! three crates and setting only some gave two drivers on one controller, or none.
 //!
 //! This module is the other route. Same four operations, addressed to the `xhci` service by name
 //! over IPC, using the block protocol that service already serves (`services/xhci/src/msc.rs`).
