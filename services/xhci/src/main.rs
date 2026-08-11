@@ -721,6 +721,9 @@ fn hub_port_status(
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
     eaten: &mut u32,
+    // Set when the probe gave up its own transfer to deliver someone else's completion. NOT a
+    // failure: it is evidence of nothing, and must never feed an absence or wedge counter.
+    abandoned: &mut bool,
 ) -> Option<bool> {
     const RING: usize = 0x1000;
     let base = ep0_tr_off(hub_dev);
@@ -824,6 +827,15 @@ fn hub_port_status(
                 // cheap - probes run every HUB_POLL_MS and a `None` concludes NOTHING (a failed
                 // question is not an answer, 9af9ab4b), so the next cycle simply asks again. Input
                 // is the interactive path; a removal noticed 500 ms later is not felt.
+                //
+                // FLAGGED as abandoned, because the caller cannot tell otherwise and the guard I
+                // first wrote (`None if eaten != 0`) did not work: `eaten` is re-zeroed every pass
+                // (see its declaration), so a probe abandoned on pass N looked like a genuine failure
+                // on pass N+1. The counters then walked to 200, declared a HALTED endpoint that was
+                // running perfectly well, and the Reset Endpoint came back Context State Error - the
+                // controller telling us the endpoint was never halted. The disk was dropped and the
+                // whole controller re-initialised, every ~195 s. That was this change's doing.
+                *abandoned = true;
                 return None;
             }
             Some(_) => {} // a non-transfer event (port change, command) - ignore; keep waiting
@@ -2662,6 +2674,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Heartbeat state - ABOVE `'reenum` so a re-enumeration cannot reset it (see its comment below).
     let mut last_beat = ctx.read_tsc();
     let mut passes: u64 = 0;
+    // Interrupts actually delivered, as distinct from messages received. Reported in the heartbeat so
+    // "are we using interrupts?" is answered by a number instead of by a log line that could not tell.
+    let mut msi_count: u64 = 0;
+    // The vector the KERNEL programmed this controller's MSI to deliver on; an interrupt notification
+    // arrives as exactly this one byte (kernel/src/ipc/message.rs), which is what makes a real IRQ
+    // distinguishable from a block request on the same endpoint.
+    const MSI_VECTOR: u8 = 0x28;
     'reenum: loop {
         // Stop + reset the controller. The Wyse `chaos max-carnage` all-core freeze lands
         // DETERMINISTICALLY in this sequence (the log dies right after the "v..." line above), so bracket
@@ -3289,7 +3308,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // forever on a disk that was working. `serve_if_block` tells them apart by that cap.
             let woke = ctx.recv_timeout(deadline);
             // Delivered event = something is waking us. Timeout = it is not.
-            if woke.is_some() { quiet_waits = 0; irq_seen = true; } else { quiet_waits = quiet_waits.saturating_add(1); }
+            // An IRQ notification is a ONE-BYTE payload equal to the vector; a block request is not.
+            //
+            // `irq_seen` used to be set by ANY message, and this service receives block requests from
+            // `block-driver` on the same endpoint - so with a disk attached it was set by disk I/O and
+            // the "waking on interrupts (MSI)" line proved only that something had arrived. I read
+            // that line off a hardware log and told the user interrupts were working. It was never
+            // evidence. Now it means what it says.
+            let is_irq = woke.as_ref().is_some_and(|m| m.payload_bytes() == [MSI_VECTOR]);
+            if is_irq { msi_count = msi_count.saturating_add(1); }
+            if woke.is_some() { quiet_waits = 0; } else { quiet_waits = quiet_waits.saturating_add(1); }
+            if is_irq { irq_seen = true; }
             if let Some(m) = woke {
                 if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten) {
                     ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
@@ -3388,6 +3417,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
 
+            // ACK THE INTERRUPTER UNCONDITIONALLY - including when the drain consumed NOTHING.
+            //
+            // This is why interrupts "did not reliably" fire, and why this driver polls at all.
+            //
+            // The xHC sets EHB (Event Handler Busy, ERDP bit 3) at the same moment it sets IP and
+            // asserts the interrupt, and it will NOT assert again for this interrupter until software
+            // clears EHB by writing 1 to that bit. The only ERDP write was inside `next_event`, on the
+            // path where a TRB was actually consumed - so a zero-event drain left EHB set forever.
+            //
+            // And a zero-event drain is the NORMAL case here, not an exotic one: enumeration consumes
+            // its events through `run_command`, `control`, `msc::*` and `hub_port_status`, none of
+            // which ack the interrupter. The controller asserts during those ~600 ms, nobody clears
+            // EHB, and the first poll pass then finds an already-drained ring. From that point the
+            // interrupter is wedged until the next full HCRST - exactly "one interrupt, then never
+            // again".
+            //
+            // Linux ends its handler with this same unconditional write, on every path, including the
+            // one where it processed no events. IP is cleared BEFORE the drain (above) and EHB AFTER
+            // it, which is the required order: ack the assertion, service the ring, then release the
+            // handler-busy interlock.
+            wr64(&mmio, ir0 + 0x18,
+                 dma.phys_at(EVENT_RING_OFF + ev_idx * TRB_SIZE) | (1 << 3));
+
             // Unplug detection. A device DIRECTLY on a root port is gone when its root-port CCS drops
             // (cheap MMIO read, every pass). A device BEHIND a hub changes no root PORTSC when it
             // leaves - its root port is the hub's, and the hub stays put - so it is instead detected by
@@ -3411,8 +3463,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // next step is comparing CNTPCT deltas against BSP tick counts - two independent
                 // clocks. Either way the log answers it without a rebuild.
                 ctx.log_fmt(format_args!(
-                    "xhci: alive - t={}s, {} poll passes, {} HID bound, disk {}",
-                    ctx.epoch_secs_monotonic(), passes, ndev,
+                    "xhci: alive - t={}s, {} poll passes, {} MSI, {} HID bound, disk {}",
+                    ctx.epoch_secs_monotonic(), passes, msi_count, ndev,
                     if disk.is_some() { "yes" } else { "no" }));
             }
             let hub_due =
@@ -3428,6 +3480,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // or an inconclusive read (do not false-notify on a transient control failure).
                     let owner = cursor_owner[d];
                     let (mut cur, mut pcs) = (hub_cur[owner], hub_pcs[owner]);
+                    let mut abandoned = false;
                     let st = hub_port_status(
                         &ctx,
                         &dma,
@@ -3442,6 +3495,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         &mut ev_idx,
                         &mut ev_cycle,
                         &mut eaten,
+                        &mut abandoned,
                     );
                     topo.note(&ctx, devs[d].hub_slot, devs[d].hub_port, st);
                     hub_cur[owner] = cur;
@@ -3542,10 +3596,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             // a hot path is a feature with a cost, and "only while things are going
                             // wrong" has to be a condition that is actually FALSE when they are not.
                             let (mut c2, mut p2) = (hub_cur[owner], hub_pcs[owner]);
+                            let mut abandoned = false;
                             let st = hub_port_status(
                                 &ctx,
                                 &dma, &mmio, dboff, ir0, hub_slot, hub_dev, hp,
-                                &mut c2, &mut p2, &mut ev_idx, &mut ev_cycle, &mut eaten,
+                                &mut c2, &mut p2, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut abandoned,
                             );
                             topo.note(&ctx, hub_slot, hp, st);
                             hub_cur[owner] = c2;
@@ -3611,7 +3666,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 // An abandoned probe (we returned early to deliver a keystroke) is
                                 // NOT a failed one - counting it would let fast typing walk the
                                 // counter toward the wedge threshold and reset a healthy endpoint.
-                                None if eaten != 0 => false,
+                                // Abandoned, not failed. `eaten` alone could not express this - it is
+                                // re-zeroed every pass, so a probe abandoned on one pass looked like a
+                                // genuine failure on the next, and that is what walked this counter to
+                                // 200 and re-initialised the controller every ~195 s.
+                                None if abandoned || eaten != 0 => false,
                                 None => {
                                     disk_absent_seen = disk_absent_seen.saturating_add(1);
                                     if disk_absent_seen == 20 {
@@ -3703,6 +3762,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             continue;
                         }
                         let (mut cur, mut pcs) = (hub_cur[owner], hub_pcs[owner]);
+                        // Only the `Some(..)` arms below act, so an abandoned probe (which yields
+                        // `None`) is already ignored here.
+                        let mut abandoned = false;
+                        let _ = &mut abandoned;
                         let st = hub_port_status(
                             &ctx,
                             &dma,
@@ -3717,6 +3780,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             &mut ev_idx,
                             &mut ev_cycle,
                             &mut eaten,
+                            &mut abandoned,
                         );
                         topo.note(&ctx, hub_slot, hp, st);
                         hub_cur[owner] = cur;
@@ -3737,7 +3801,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // reset a perfectly healthy endpoint - a wedge repair firing because the user
                         // typed. The wedge case is unmistakable: nothing arrives at all, so `eaten`
                         // stays 0 and the count climbs as it should.
-                        if st.is_none() && eaten == 0 {
+                        // Same rule for the wedge counter: an abandoned probe is evidence of
+                        // nothing, so it must not push this toward the endpoint reset.
+                        if st.is_none() && !abandoned && eaten == 0 {
                             let n = PROBE_FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
                             if n >= 200 {
                                 ctx.log_fmt(format_args!(
@@ -3813,10 +3879,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // present disk would re-trigger "device arrived" every pass. So the port is
                         // probed, and only the DISCONNECT arm acts on it - handled below.
                         let is_disk_port = disk.as_ref().is_some_and(|dk| dk.hub_port == hp);
+                        // Only the `Some(..)` arms below act, so an abandoned probe (which yields
+                        // `None`) is already ignored here.
+                        let mut abandoned = false;
+                        let _ = &mut abandoned;
                         let st = hub_port_status(
                             &ctx,
                             &dma, &mmio, dboff, ir0, hs, hd, hp,
-                            &mut cur, &mut pcs, &mut ev_idx, &mut ev_cycle, &mut eaten,
+                            &mut cur, &mut pcs, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut abandoned,
                         );
                         topo.note(&ctx, hs, hp, st);
                         match st {
