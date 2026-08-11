@@ -2680,6 +2680,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut msg_count: u64 = 0;
     let mut work_cycles: u64 = 0;
     let mut work_t0: u64 = 0;
+    // Where the per-pass time actually goes, split three ways: serving (block requests + HID
+    // re-arm), draining the event ring, and the hub/PORTSC scan. 4.7 ms per pass is far more than a
+    // loop that usually finds nothing should cost, and counting passes cannot say which part owns it.
+    let mut seg_serve: u64 = 0;
+    let mut seg_drain: u64 = 0;
+    let mut seg_hub:   u64 = 0;
+    let mut seg_mark:  u64 = 0;
     let mut fast_waits: u64 = 0;
     let mut idle_waits: u64 = 0;
     // The vector the KERNEL programmed this controller's MSI to deliver on; an interrupt notification
@@ -3341,7 +3348,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // wait excluded, which is the quantity `observe` charges us for and the one number this
             // investigation never had.
             if work_t0 != 0 {
-                work_cycles = work_cycles.wrapping_add(ctx.read_tsc().wrapping_sub(work_t0));
+                let now = ctx.read_tsc();
+                work_cycles = work_cycles.wrapping_add(now.wrapping_sub(work_t0));
+                // Whatever is left after the ack: the PORTSC sweep and the hub scan, which is where
+                // the probe spin lives and therefore the first place to look for the 4.7 ms.
+                seg_hub = seg_hub.wrapping_add(now.wrapping_sub(seg_mark));
             }
             let woke = ctx.recv_timeout(deadline);
             work_t0 = ctx.read_tsc();
@@ -3458,6 +3469,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             //
             // 4096 is far above any real burst - a full event ring is 256 TRBs - so reaching it means
             // a storm, not a busy moment. The next pass drains the rest; nothing is lost.
+            let seg_a = ctx.read_tsc();          // block serving + HID re-arm, before the drain
+            seg_serve = seg_serve.wrapping_add(seg_a.wrapping_sub(work_t0));
             let mut drained = 0u32;
             loop {
                 drained += 1;
@@ -3477,6 +3490,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     None => break,
                 }
             }
+
+            let seg_b = ctx.read_tsc();
+            seg_drain = seg_drain.wrapping_add(seg_b.wrapping_sub(seg_a));
+            seg_mark = seg_b;
 
             // ACK THE INTERRUPTER UNCONDITIONALLY - including when the drain consumed NOTHING.
             //
@@ -3533,9 +3550,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // next step is comparing CNTPCT deltas against BSP tick counts - two independent
                 // clocks. Either way the log answers it without a rebuild.
                 ctx.log_fmt(format_args!(
-                    "xhci: alive - t={}s, {} passes ({} fast/{} idle), {}ms work, {} MSI, {} msg, {} HID, disk {}",
+                    "xhci: alive - t={}s, {} passes ({} fast/{} idle), work {}ms (serve {} drain {} hub {}), {} MSI, {} msg, {} HID, disk {}",
                     ctx.epoch_secs_monotonic(), passes, fast_waits, idle_waits,
                     work_cycles / ctx.duration_cycles(1).max(1),
+                    seg_serve / ctx.duration_cycles(1).max(1),
+                    seg_drain / ctx.duration_cycles(1).max(1),
+                    seg_hub   / ctx.duration_cycles(1).max(1),
                     msi_count, msg_count, ndev,
                     if disk.is_some() { "yes" } else { "no" }));
             }
