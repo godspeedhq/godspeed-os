@@ -938,10 +938,25 @@ fn hub_port_status(
                     *cc_logged = true;
                     ctx.log_fmt(format_args!(
                         "xhci: hub slot {} port {} status transfer FAILED (cc {}) - not a timeout; \
-                         a halt here stops every later probe on this hub",
+                         repairing the endpoint now rather than waiting for the failure count",
                         hub_slot, hub_port, cc
                     ));
                 }
+                // REPAIR NOW. A failed completion halts EP0, and a halted endpoint retires nothing
+                // afterwards - so every later probe on this hub times out and hot-plug is dead until
+                // something else resets it.
+                //
+                // The caller already has that repair (reset_endpoint + Set TR Dequeue + reseed the
+                // cursor); it just fires on 200 consecutive silent failures, which at this probe rate
+                // is ~35 seconds of dead detection. That threshold is right for INFERRING a halt from
+                // silence, and it must stay: an abandoned or merely slow probe is evidence of
+                // nothing, and a low threshold would reset a healthy endpoint because someone typed.
+                //
+                // But this is not an inference. The controller has just told us the transfer failed,
+                // which is positive evidence, so the wait buys nothing. Arming the counter one short
+                // of its threshold makes the caller's existing check fire on this very probe -
+                // reusing the proven repair rather than adding a second path to the same place.
+                PROBE_FAILS.store(199, core::sync::atomic::Ordering::Relaxed);
                 return None;
             }
             // A stray HID transfer event (a keystroke landing in this check window) - record its slot
@@ -3245,7 +3260,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Root ports already had this concept (`poisoned`); hub ports did not. A bit is cleared when
         // its port reports DISCONNECTED, so a genuine unplug-replug is still seen as new.
         let mut hub_tried: u64 = 0;
-        let mut disk_hub_cur = 0usize;
+        // SEED the disk-hub cursor from where enumeration actually left that hub's EP0 ring, exactly
+        // as `hub_cur[d]` is seeded from `devs[d].hub_off` below.
+        //
+        // It started at 0. Enumeration ends with the controller's dequeue pointer at `hub_off`, so a
+        // probe written at offset 0 lands BEHIND the dequeue: the controller never reaches it, the
+        // probe waits for a completion that cannot come, and whatever stale TRBs sit at the dequeue
+        // may be executed instead - which is a completion code 5 (TRB Error), the halt seen on
+        // hardware. The value was already recorded at enumeration (`dk.hub_off = hoff`); nothing read
+        // it.
+        //
+        // The HID path was given this seeding and the disk path was not, which is why the disk hub
+        // was the one that halted. Same ring, same rule, and now the same code shape.
+        let mut disk_hub_cur = disk.as_ref().map(|d| d.hub_off).unwrap_or(0);
         let mut disk_hub_pcs = 1u32;
         let mut quiet_waits: u32 = 0;
         // One-shot latches so the mode is stated once each way, not on every pass.
@@ -3947,7 +3974,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 // re-zeroed every pass, so a probe abandoned on one pass looked like a
                                 // genuine failure on the next, and that is what walked this counter to
                                 // 200 and re-initialised the controller every ~195 s.
-                                None if abandoned || eaten.have != 0 => false,
+                                None if abandoned => false,
                                 None => {
                                     disk_absent_seen = disk_absent_seen.saturating_add(1);
                                     if disk_absent_seen == 20 {
@@ -4078,14 +4105,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // Counting consecutive failures ACROSS ports of this hub, because the halt is a
                         // property of the shared EP0 endpoint, not of one port: every port's probe
                         // rides the same ring, so they all fail together and any of them is evidence.
-                        // `eaten.have != 0` means the probe was ABANDONED to deliver a keystroke, not that
-                        // it failed. Counting it would let fast typing walk this counter to 200 and
-                        // reset a perfectly healthy endpoint - a wedge repair firing because the user
-                        // typed. The wedge case is unmistakable: nothing arrives at all, so `eaten`
-                        // stays 0 and the count climbs as it should.
-                        // Same rule for the wedge counter: an abandoned probe is evidence of
-                        // nothing, so it must not push this toward the endpoint reset.
-                        if st.is_none() && !abandoned && eaten.have == 0 {
+                        // An abandoned probe is evidence of NOTHING and must not push this toward
+                        // the endpoint reset - a repair that fires because the user typed fast is a
+                        // bug, not a safeguard. `abandoned` says exactly that, about exactly this
+                        // probe.
+                        //
+                        // This also used to require `eaten == 0`, an older and cruder stand-in for
+                        // the same idea from before `abandoned` existed. That has to GO now that
+                        // `eaten` is a mailbox: it is set whenever ANY consumer files a completion
+                        // for someone else, which with disk traffic is most passes and has nothing to
+                        // do with this probe. Leaving it in would hold the counter at zero and
+                        // silently disable the repair - the guard suppressing the fix it guards.
+                        if st.is_none() && !abandoned {
                             let n = PROBE_FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
                             if n >= 200 {
                                 ctx.log_fmt(format_args!(
