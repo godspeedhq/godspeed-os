@@ -3242,7 +3242,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // that "MSI not reaching us" and made normal idle read as a broken feature.
                 // What matters is whether the interrupt line ever worked, which the companion
                 // message states from an observed delivery.
-                ctx.log("xhci: polling at ~10ms alongside interrupts (input latency floor)");
+                ctx.log("xhci: polling at ~2.5ms alongside interrupts (input latency floor)");
                 poll_noted = true;
             }
             // Announced only from an OBSERVED delivery (`irq_seen`), never from the initial state.
@@ -3258,7 +3258,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let deadline = if any_held {
                 base.saturating_mul(2)
             } else if polling {
-                base // ~10 ms, the bound keyboard's own bInterval - no report waits on us
+                // ~2.5 ms, a QUARTER of the keyboard's 10 ms bInterval.
+                //
+                // Matching bInterval exactly looked right and felt wrong: it means a report can sit
+                // for a whole interval before we look, so the floor was the interval, not half of it.
+                // Measured from the heartbeat's own counter - 78 passes/sec, ~12.8 ms each - which is
+                // the stutter under continuous typing.
+                //
+                // Sampling four times per interval puts the floor near 3 ms, below what a person
+                // notices, and it is the standard reason to oversample a periodic source: you cannot
+                // phase-align with a device that is free-running relative to you.
+                //
+                // The cost is wakeups - roughly 312/sec instead of 78 - and it is paid ONLY while a
+                // HID is bound (`polling`), on a mains-powered board. An idle machine with no keyboard
+                // still gets the 25x branch below and stays asleep. `.max(1)` because `recv_timeout(0)`
+                // blocks FOREVER, which would be the worst possible outcome of a latency fix.
+                (base / 4).max(1)
             } else {
                 base.saturating_mul(25)
             };
