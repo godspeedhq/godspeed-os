@@ -796,6 +796,21 @@ fn hub_port_status(
             if ev.is_some() || ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
                 break;
             }
+            // YIELD between polls. This loop was a pure busy-wait, and it was the whole cost of this
+            // service.
+            //
+            // Measured, after four measurements that each refuted something else: of 10064 ms of work
+            // in 60 s, the hub segment held 10061 - 99.97% - at ~60 ms per pass, which is
+            // PROBE_ANSWER_MS plus overhead. So a probe that does not get an immediate answer spins
+            // its ENTIRE 50 ms budget at full tilt, on nearly every pass. That is the 13-16% CPU, and
+            // it is why adjusting wake rates never moved it: the cost was never how OFTEN the loop
+            // ran, it was one busy-wait inside it.
+            //
+            // Yielding keeps the deadline exactly as it was - the wait is still bounded by the clock
+            // and still returns the same answers (Commandment VIII) - while letting the core run
+            // something else, or idle. The same fix this driver already received once, on the Wyse,
+            // where a busy-spin held a core at 100%.
+            ctx.yield_cpu();
         }
         match ev {
             Some((TRB_TRANSFER_EVENT, cc, sid)) if sid == hub_slot => {
