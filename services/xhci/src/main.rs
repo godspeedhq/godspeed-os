@@ -296,53 +296,67 @@ fn reset_endpoint(
     slot: u32,
     dci: u32,
     ring_off: usize,
+    dev_ctx_off: usize,
+    ctx_size: usize,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
     cmd_idx: &mut usize,
 ) -> bool {
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-    *cmd_idx += 1;
-    let cc = run_command(
-        ctx, dma, mmio, dboff, ir0, cmd_off, 0, 0, 0,
-        (TRB_RESET_ENDPOINT << 10) | (slot << 24) | (dci << 16) | 1,
-        ev_idx, ev_cycle,
-    );
-    // `run_command` yields (completion_code, slot); 1 = Success.
+    // READ the endpoint's state instead of assuming it.
     //
-    // COMPLETION CODE 19 IS CONTEXT STATE ERROR, AND IT MEANS THE ENDPOINT IS NOT HALTED.
+    // This repair guessed twice and was wrong twice. It first issued Reset Endpoint, legal only from
+    // Halted, and got Context State Error - so the endpoint was not halted, despite a log line that
+    // announced "endpoint stays halted" as fact. It then issued Stop Endpoint, legal only from
+    // Running, and got Context State Error again. Two guesses, two commands the hardware refused,
+    // and no repair either time.
     //
-    // Reset Endpoint is legal only from the Halted state (xHCI 4.6.8). Every repair attempt on this
-    // board came back `cc Some((19, 1))` and gave up here, logging "endpoint stays halted" - which
-    // was not merely a failed repair but the wrong diagnosis printed as fact: the endpoint was
-    // RUNNING the whole time. The probes were not failing because of a halt at all.
-    //
-    // A running endpoint whose ring we cannot reach needs the dequeue pointer resynchronised, and
-    // Set TR Dequeue is legal only from Stopped - so the correct move is Stop Endpoint, not a reset.
-    // Bailing out here skipped the one command that would have fixed it.
-    //
-    // So: try the reset (right when the endpoint really is halted), and on Context State Error fall
-    // through to Stop Endpoint instead. Either way we arrive at Set TR Dequeue below, which is the
-    // step that actually makes the ring coherent again.
+    // The state is a FIELD, three bits at the bottom of the endpoint context's first dword (xHCI
+    // 6.2.3), sitting in memory we already own. Reading it costs one load and ends the guessing:
+    // 0 Disabled, 1 Running, 2 Halted, 3 Stopped, 4 Error. The endpoint context for DCI n lives at
+    // index n of the device context (the slot context is index 0).
+    let ep_state = dma.read32(dev_ctx_off + dci as usize * ctx_size) & 0x7;
+    let cc = match ep_state {
+        // Halted: Reset Endpoint is the command that clears it.
+        2 => {
+            let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+            *cmd_idx += 1;
+            run_command(
+                ctx, dma, mmio, dboff, ir0, cmd_off, 0, 0, 0,
+                (TRB_RESET_ENDPOINT << 10) | (slot << 24) | (dci << 16) | 1,
+                ev_idx, ev_cycle,
+            )
+        }
+        // Running: quiesce it, because Set TR Dequeue is legal only from Stopped.
+        1 => {
+            let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+            *cmd_idx += 1;
+            run_command(
+                ctx, dma, mmio, dboff, ir0, cmd_off, 0, 0, 0,
+                (TRB_STOP_ENDPOINT << 10) | (slot << 24) | (dci << 16) | 1,
+                ev_idx, ev_cycle,
+            )
+        }
+        // Already Stopped - which is precisely the state Set TR Dequeue wants. Nothing to do first,
+        // and issuing either command here is what earned the Context State Errors above.
+        3 => Some((1, slot)),
+        // Disabled or Error: no endpoint command can rescue this. Say which, and let the caller fall
+        // back to a full re-enumeration rather than pretending a repair happened (§26.7).
+        _ => {
+            ctx.log_fmt(format_args!(
+                "xhci: endpoint slot {} dci {} is in state {} (0=disabled 4=error) - not repairable \
+                 by an endpoint command",
+                slot, dci, ep_state));
+            return false;
+        }
+    };
+    // `run_command` yields (completion_code, slot); 1 = Success. The state read above chose the
+    // right command, so a failure here is a real one rather than the Context State Error that a
+    // guessed command earns.
     if !matches!(cc, Some((1, _))) {
-        if !matches!(cc, Some((19, _))) {
-            ctx.log_fmt(format_args!(
-                "xhci: Reset Endpoint slot {} dci {} FAILED (cc {:?}) - cannot recover this endpoint",
-                slot, dci, cc));
-            return false;
-        }
-        let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-        *cmd_idx += 1;
-        let cc = run_command(
-            ctx, dma, mmio, dboff, ir0, cmd_off, 0, 0, 0,
-            (TRB_STOP_ENDPOINT << 10) | (slot << 24) | (dci << 16) | 1,
-            ev_idx, ev_cycle,
-        );
-        if !matches!(cc, Some((1, _))) {
-            ctx.log_fmt(format_args!(
-                "xhci: Stop Endpoint slot {} dci {} FAILED (cc {:?}) - ring cannot be resynchronised",
-                slot, dci, cc));
-            return false;
-        }
+        ctx.log_fmt(format_args!(
+            "xhci: endpoint slot {} dci {} repair command FAILED (cc {:?}, state was {})",
+            slot, dci, cc, ep_state));
+        return false;
     }
     // Resume at the ring BASE with Dequeue Cycle State = 1, the state a fresh ring is in. The caller
     // resets its producer cursor to the same place, so both sides agree again.
@@ -4052,8 +4066,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                         disk_absent_seen = 0;
                                         let ok = reset_endpoint(
                                             &ctx, &dma, &mmio, dboff, ir0, hub_slot, 1,
-                                            ep0_tr_off(hub_dev), &mut ev_idx, &mut ev_cycle,
-                                            &mut cmd_idx,
+                                            ep0_tr_off(hub_dev), device_ctx_off(hub_dev), ctx_size,
+                                            &mut ev_idx, &mut ev_cycle, &mut cmd_idx,
                                         );
                                         // Our producer cursor MUST match the dequeue we just set, or
                                         // the two disagree about where the ring begins and it wedges
@@ -4159,7 +4173,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 PROBE_FAILS.store(0, core::sync::atomic::Ordering::Relaxed);
                                 let ok = reset_endpoint(
                                     &ctx, &dma, &mmio, dboff, ir0, hub_slot, 1,
-                                    ep0_tr_off(hub_dev), &mut ev_idx, &mut ev_cycle, &mut cmd_idx,
+                                    ep0_tr_off(hub_dev), device_ctx_off(hub_dev), ctx_size, &mut ev_idx, &mut ev_cycle, &mut cmd_idx,
                                 );
                                 // The producer cursor must match the dequeue just set, or the two
                                 // disagree about where the ring starts and it wedges again at once.
