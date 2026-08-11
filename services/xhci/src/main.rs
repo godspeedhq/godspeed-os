@@ -3416,6 +3416,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 continue;
             }
             let hd = devs[d].hub_dev as usize;
+            // CLEAR the ring before re-pointing the dequeue at its base.
+            //
+            // Re-pointing alone made it worse, and the counter said so at once: probes fell to
+            // 15/219 with 36 late answers, from 102/102. Enumeration leaves its own TRBs all over
+            // this ring with the cycle bit hardcoded to 1, and the probe also produces with pcs=1 -
+            // so after the controller finishes our 3-TRB TD at the base it walks straight into
+            // enumeration's leftovers, which still look VALID to it, and executes them. The probe's
+            // answer then arrives late or not at all, which is exactly the 36.
+            //
+            // A ring of zeroes has cycle 0 in every TRB, so with pcs=1 the controller stops at the
+            // first TRB past our TD, which is what "the ring is empty" is supposed to mean. Writing
+            // the dequeue pointer says where to start; only clearing says where to STOP.
+            //
+            // Once per hub per session, and bounded by the ring size (§26.6).
+            for off in (0..0x1000).step_by(4) {
+                dma.write32(ep0_tr_off(hd) + off, 0);
+            }
             if reset_endpoint(
                 &ctx, &dma, &mmio, dboff, ir0, devs[d].hub_slot, 1,
                 ep0_tr_off(hd), device_ctx_off(hd), ctx_size,
