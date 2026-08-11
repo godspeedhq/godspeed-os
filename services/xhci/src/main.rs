@@ -4062,7 +4062,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                         // hardware actually defines for this state (xHCI 4.6.8 /
                                         // 4.6.10): clear the halt, then re-point the dequeue.
                                         ctx.log_fmt(format_args!(
-                                            "xhci: port {} unreachable 200x - endpoint looks HALTED (cursor advancing, no completions); resetting it",
+                                            "xhci: port {} unreachable 200x - the ring is not being consumed; repairing (the endpoint state decides how)",
                                             hp));
                                         disk_absent_seen = 0;
                                         let ok = reset_endpoint(
@@ -4169,7 +4169,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             let n = PROBE_FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
                             if n >= 200 {
                                 ctx.log_fmt(format_args!(
-                                    "xhci: hub slot {} unreachable {}x - endpoint looks HALTED (cursor advancing, no completions); resetting it",
+                                    "xhci: hub slot {} unreachable {}x - the ring is not being consumed; repairing (the endpoint state decides how)",
                                     hub_slot, n));
                                 PROBE_FAILS.store(0, core::sync::atomic::Ordering::Relaxed);
                                 let ok = reset_endpoint(
@@ -4181,7 +4181,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 hub_cur[owner] = 0;
                                 hub_pcs[owner] = 1;
                                 if !ok {
-                                    ctx.log("xhci: endpoint reset FAILED - falling back to a full re-enumeration");
+                                    ctx.log("xhci: not repairable in place - re-enumerating to rebuild the endpoint");
                                     announce = false;
                                     continue 'reenum;
                                 }
