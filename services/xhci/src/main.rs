@@ -3396,9 +3396,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             passes = passes.wrapping_add(1);
             if ctx.read_tsc().wrapping_sub(last_beat) > ctx.duration_cycles(HEARTBEAT_MS) {
                 last_beat = ctx.read_tsc();
+                // Carries the DEVICE's own elapsed seconds, so the beat can be checked against
+                // itself rather than against host timestamps.
+                //
+                // I read a swing of 35.8 / 55.1 / 91.3 s between beats off the serial log and
+                // concluded the time base was broken. It is not: the beat goes out through a BLOCKING
+                // UART, so a host timestamp records when a line ARRIVED, not when it was produced,
+                // and backpressure or host-side buffering can defer it by tens of seconds. The
+                // aggregate was accurate to ~1% the whole time, which a wrong frequency could not be.
+                //
+                // With `t` on the line the reader never has to trust the host again: consecutive
+                // beats must differ by 60 +/- 1. If they do, any swing in the timestamps is in the
+                // OUTPUT path. If they do not, the counter genuinely is not tracking time, and the
+                // next step is comparing CNTPCT deltas against BSP tick counts - two independent
+                // clocks. Either way the log answers it without a rebuild.
                 ctx.log_fmt(format_args!(
-                    "xhci: alive - {} poll passes, {} HID bound, disk {}",
-                    passes, ndev, if disk.is_some() { "yes" } else { "no" }));
+                    "xhci: alive - t={}s, {} poll passes, {} HID bound, disk {}",
+                    ctx.epoch_secs_monotonic(), passes, ndev,
+                    if disk.is_some() { "yes" } else { "no" }));
             }
             let hub_due =
                 ctx.read_tsc().wrapping_sub(last_hub_poll) > ctx.duration_cycles(HUB_POLL_MS);
