@@ -3373,6 +3373,45 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
         }
+        // MAKE THE RING COHERENT instead of hoping `hub_off` was recorded.
+        //
+        // Hardware named this precisely: eight cc 5 failures, every one at `cur=0x30 pcs=1`. The
+        // cursor is advanced BEFORE the doorbell, so 0x30 means the TD sat at offset 0 - the ring
+        // base - and it was always the FIRST probe after a re-enumeration. Never a wrap (pcs was 1
+        // every time), which is what the two numbers were added to decide.
+        //
+        // A TD at offset 0 is behind the controller's dequeue, because enumeration leaves that
+        // pointer wherever it finished. The seeding above exists for exactly this and reads
+        // `devs[d].hub_off` - but that field is only written on the paths that record it, and it is
+        // still 0 for a device bound another way (the port-4 keyboard here). So the seed was 0, the
+        // TD landed behind the dequeue, the controller ran whatever stale TRB it was actually
+        // pointing at, and called it a TRB Error. Then the recovery re-enumerated and set the same
+        // trap again, every ~27 seconds.
+        //
+        // Rather than chase every path that should set `hub_off`, STATE the position: point the
+        // controller's dequeue at the ring base and start the cursor there, so the two agree by
+        // construction rather than by bookkeeping. One command per hub per session, using the same
+        // state-driven repair as the recovery path (it reads EP state and stops the endpoint first,
+        // because Set TR Dequeue is legal only from Stopped).
+        //
+        // Commandment III: one truth. The controller's dequeue pointer is the truth about where the
+        // ring is; `hub_off` was a second copy of it that could silently disagree.
+        for d in 0..ndev {
+            if devs[d].hub_slot == 0 || cursor_owner[d] != d {
+                continue;
+            }
+            let hd = devs[d].hub_dev as usize;
+            if reset_endpoint(
+                &ctx, &dma, &mmio, dboff, ir0, devs[d].hub_slot, 1,
+                ep0_tr_off(hd), device_ctx_off(hd), ctx_size,
+                &mut ev_idx, &mut ev_cycle, &mut cmd_idx,
+            ) {
+                hub_cur[d] = 0;
+                hub_pcs[d] = 1;
+            }
+            // On failure the seeded `hub_off` value stands - no worse than before, and the probe
+            // failure path still repairs. Never silently assume the re-point happened (§26.7).
+        }
         let mut last_hub_poll = ctx.read_tsc();
         // LIVENESS HEARTBEAT. The driver must be able to say "I am still running".
         //
