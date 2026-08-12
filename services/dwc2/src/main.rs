@@ -242,7 +242,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.log_fmt(format_args!("dwc2-svc: serving block I/O; keyboard poll every {} ms", period_ms));
         let mut capless = false;
         let mut served: u64 = 0;
+        // WHERE THE TIME GOES, split by segment - and how many PASSES it took.
+        //
+        // The per-stage busy counters came back all zero, so the stall is not in BOT: transfers are
+        // not retrying, not failing, and not recovering. Yet throughput collapses from 19 requests a
+        // second to one in forty-four, which is something ACCUMULATING rather than a slow device.
+        //
+        // Counting passes as well as requests is the part that matters. "1 request in 44 seconds"
+        // could be ONE pass taking 44 s or 4400 passes each serving nothing, and those are completely
+        // different faults - the current log cannot tell them apart, and every guess at the cause
+        // implicitly assumes one of them.
+        //
+        // `read_tsc` measures WALL time, so a segment that blocks reads the same as one that spins.
+        // That is the right unit here: the question is where the pass goes, not who is burning CPU.
+        let mut passes: u64 = 0;
+        let mut seg_serve: u64 = 0;
+        let mut seg_kbd: u64 = 0;
+        let mut seg_sleep: u64 = 0;
         loop {
+            passes = passes.wrapping_add(1);
+            let t_pass = ctx.read_tsc();
             // Drain block requests, BOUNDED - the endpoint queue is 16 deep, so this is a storm
             // detector rather than a throttle (the same bound the xhci service needed after an
             // unbounded drain was found there).
@@ -259,6 +278,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                 }
             }
+            let t_kbd = ctx.read_tsc();
+            seg_serve = seg_serve.wrapping_add(t_kbd.wrapping_sub(t_pass));
             if let Some((k, kt, ksplt)) = kbd.as_ref() {
             if hid::poll(&ctx, &m, &d, kt, *ksplt, k, &mut state) {
                 reports = reports.wrapping_add(1);
@@ -267,6 +288,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
             }
+            let t_rest = ctx.read_tsc();
+            seg_kbd = seg_kbd.wrapping_add(t_rest.wrapping_sub(t_kbd));
             if ctx.read_tsc().wrapping_sub(last_beat) > ctx.duration_cycles(HEARTBEAT_MS) {
                 last_beat = ctx.read_tsc();
                 // Report the busy counts as a RATIO against completed commands. A total says the
@@ -276,11 +299,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     .as_ref()
                     .map(|(d, _, _)| (d.busy_cbw, d.busy_data, d.busy_csw, d.commands))
                     .unwrap_or((0, 0, 0, 0));
+                let ms = ctx.duration_cycles(1).max(1);
                 ctx.log_fmt(format_args!(
-                    "dwc2-svc: alive - {} key report(s), {} block request(s); {} cmds, busy retries CBW {} DATA {} CSW {}",
-                    reports, served, cmds, bc, bd, bs));
+                    "dwc2-svc: alive - {} key, {} blocks, {} cmds; busy CBW {} DATA {} CSW {};                      {} passes, serve {}ms kbd {}ms sleep {}ms",
+                    reports, served, cmds, bc, bd, bs,
+                    passes, seg_serve / ms, seg_kbd / ms, seg_sleep / ms));
             }
+            let t_sleep = ctx.read_tsc();
             ctx.sleep(ctx.duration_cycles(period_ms));
+            seg_sleep = seg_sleep.wrapping_add(ctx.read_tsc().wrapping_sub(t_sleep));
         }
     }
 
