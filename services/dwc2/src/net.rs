@@ -41,6 +41,8 @@ pub struct Stats {
     /// ever being SEEN at the moment frames should have been arriving. A device that NAKs every IN
     /// while promiscuous and enabled has received nothing, and the link is the only thing left.
     pub bmsr: u32,
+    pub rx_fifo: u32,
+    pub int_sts: u32,
 }
 
 pub struct Nic {
@@ -208,6 +210,11 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
 
 const SMSC_TX_CFG: u16 = 0x10;
 const SMSC_TX_CFG_ON: u32 = 0x0000_0004;
+const SMSC_INT_STS:     u16 = 0x08;
+/// RX FIFO information: bits [15:0] are the bytes the MAC has PUT IN the receive FIFO. This separates
+/// the two halves of "the device NAKs": a MAC that never saw a frame (link/PHY/receive engine) from a
+/// MAC holding frames it will not hand to the bulk endpoint (a USB-side problem). Nothing else can.
+const SMSC_RX_FIFO_INF: u16 = 0x18;
 const SMSC_HW_CFG: u16 = 0x14;
 const SMSC_HW_CFG_LRST: u32 = 0x0000_0008;
 const SMSC_HW_CFG_BCE:  u32 = 0x0000_0002;
@@ -676,6 +683,8 @@ pub fn serve(
             // a yes.
             let up = link_up(ctx, mmio, dma, t);
             nic.stats.bmsr = mii_read(ctx, mmio, dma, t, SMSC_MII_BMSR).map_or(0xFFFF, u32::from);
+            nic.stats.rx_fifo = smsc_read_or0(ctx, mmio, dma, t, SMSC_RX_FIFO_INF);
+            nic.stats.int_sts = smsc_read_or0(ctx, mmio, dma, t, SMSC_INT_STS);
             out[7] = u8::from(up);
             8
         }
