@@ -149,7 +149,8 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 | **1a** | Core bring-up: soft reset, host mode, FIFO sizing, root-port power + reset | ✅ **hardware-verified 2026-08-12** - `core bring-up OK`, `HPRT=0x0000100f connected=true enabled=true speed=high` |
 | **1b** | Channels + control transfers (`chan_program`, `chan_dma`, `ctrl_xfer`) | ✅ **hardware-verified 2026-08-12** - `DEVICE DESCRIPTOR len=18 type=0x01 usb=0x0200 mps0=64` |
 | **1c-i** | Address + identify the root device, hub descriptor | ✅ **hardware-verified 2026-08-12** - `0424:9514 class=0x09 ports=5` (the LAN9514's integrated hub) |
-| **1c-ii** | Downstream port walk + SPLIT TRANSACTIONS | the same VID/PIDs the kernel driver reports for the devices BEHIND the hub |
+| **1c-ii** | Hub port survey (power, status, speed) | ✅ **hardware-verified 2026-08-12** - 4 attached, status words byte-for-byte identical to the kernel driver's |
+| **1c-iii** | SPLIT TRANSACTIONS: address a device behind the hub | the same VID/PIDs the kernel driver reports for the downstream devices |
 | **2** | Keyboard: HID + `CONSOLE_PUSH` | Typing works from userspace. Second ON PURPOSE - it makes the machine usable for testing the rest |
 | **3** | Mass storage: BOT/SCSI; `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | `drives`, `ls`, `selfcheck` |
 | **4** | Networking: CDC-ECM + smsc95xx; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | DHCP, `ping` |
@@ -226,6 +227,36 @@ its own ethernet function.
 SMSC95xx ETHERNET function, which hangs off one of this hub's ports. Worth recording because the
 acceptance test was stated as "must match what the kernel driver reports", and a baseline taken from
 the wrong line would have condemned working code. Check WHICH device a reference value describes.
+
+## Slice 1c-ii result
+
+```
+hub port 1 CONNECTED speed=full enabled=false (status=0x0101)
+hub port 2 CONNECTED speed=full enabled=false (status=0x0101)
+hub port 3 CONNECTED speed=full enabled=false (status=0x0101)
+hub port 4 CONNECTED speed=low  enabled=false (status=0x0301)
+hub port 5 empty
+hub survey complete - 4 device(s) attached, 4 need split transactions
+```
+
+Status words byte-for-byte identical to the in-kernel driver's on the same hardware. `enabled=false`
+is correct rather than a fault: a port enables only after a RESET, and the survey reports rather than
+binds.
+
+**Confirmed: every device on this board needs split transactions.** Three full-speed, one low-speed,
+none high-speed. There is no shortcut available - splits are not an optional extra for this port,
+they are the only way to reach anything, and 1c-iii cannot be deferred or worked around.
+
+### The bug this slice found, and why it was cheap
+
+The first attempt reported all five ports EMPTY. The reads had not failed - they returned ZEROS,
+because the hub had been addressed but never CONFIGURED, and USB 2.0 chapter 9 only permits class
+requests in the CONFIGURED state. No STALL, no error, just an empty topology.
+
+It was findable in one boot only because slice 1b zeroes the IN scratch before every read. Without
+that, the survey would have reported whatever the previous transfer left in the buffer: a plausible
+topology assembled from stale bytes, which is worse than an obviously wrong one because it would have
+been believed. That defence was written three slices earlier for exactly this shape of bug.
 
 ## What makes arm32 harder than the AArch64 port
 
