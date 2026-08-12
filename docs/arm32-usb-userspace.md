@@ -155,7 +155,7 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 | **2b** | POLL the interrupt endpoint via a PERIODIC split, push to `CONSOLE_PUSH` | ✅ **COMPLETE 2026-08-12** - `gsh> hello` typed on the USB keyboard |
 | **3a** | Find + bind the Bulk-Only mass-storage interface and its endpoints | ✅ **hardware-verified 2026-08-12** - `bulk IN 1 OUT 2 mps 512`, matching the kernel driver |
 | **3b** | BOT/SCSI: READ CAPACITY + READ(10) over the bulk endpoints | ✅ **hardware-verified 2026-08-12** - `31266816 sectors`, sector 0 reads `47 53 46 53` (GSFS) |
-| **3c** | `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | `drives`, `ls`, `selfcheck` |
+| **3c** | `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | ✅ **hardware-verified 2026-08-12** - `drives` shows the GSFS volume, served over IPC |
 | **4** | Networking: CDC-ECM + smsc95xx; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | DHCP, `ping` |
 | **5** | Delete `arch/arm/dwc2.rs`, the six syscalls, the tick hooks | `chaos max-carnage` + `selfcheck`. THEN amend §6.4 |
 
@@ -260,6 +260,35 @@ It was findable in one boot only because slice 1b zeroes the IN scratch before e
 that, the survey would have reported whatever the previous transfer left in the buffer: a plausible
 topology assembled from stale bytes, which is worse than an obviously wrong one because it would have
 been believed. That defence was written three slices earlier for exactly this shape of bug.
+
+## SLICE 3 COMPLETE - storage is served from userspace
+
+```
+fs: storage recovered - re-mounted GSFS0008 (31266816 blocks, 31259112 free)
+fs: drives-info - capacity 31266816 sectors, mounted true
+  0  data         GSFS     15267 MiB (15263 MiB free)
+dwc2-svc: alive - 20 key report(s), 20 block request(s)
+```
+
+The whole chain: `fs` -> `block-driver` -> IPC -> `dwc2` -> the physical stick. The keyboard is being
+polled in the same loop, on the same controller, at the same time.
+
+`fs: storage recovered` is the self-heal working as designed rather than a fault: the service is
+spawned by hand well after boot, so `fs` came up storage-unavailable and RE-MOUNTED on the first
+request instead of staying degraded.
+
+### What remains before this is safe under load
+
+**Recovery is not ported.** `bot_recover`, `note_busy`, `recover_or_revive`. The happy path is proven;
+what is missing is the distinction between "busy, ask again" and "failed", and on this board that is
+not a refinement:
+
+- the stick goes BUSY for tens of seconds under load (a 45-second stall was seen on this branch);
+- without the distinction, a healthy device gets reset repeatedly - the kernel driver logged 564
+  spurious recoveries in ONE `selfcheck` before the distinction existed.
+
+So `selfcheck` is expected to fail until that lands, and failing it is not evidence of a new bug.
+That is the next piece of work, and it should come before any load testing rather than after.
 
 ## Slice 3b result
 
