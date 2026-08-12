@@ -55,6 +55,23 @@ pub fn registered_endpoint(irq: u8) -> Option<EndpointId> {
 /// id. Safe no-op if nothing was registered; the respawned driver re-registers.
 pub fn unregister(irq: u8) {
     IRQ_TABLE.lock()[irq as usize] = None;
+    // UNMASK on release, or a dead driver leaves the line off FOREVER.
+    //
+    // `deliver` masks a level-triggered source so it cannot re-enter while the driver works, and the
+    // driver unmasks through `IrqUnmask` once it has serviced the device. A driver that dies between
+    // those two points - a fault, a `kill`, a chaos round - never reaches its unmask, and nothing else
+    // was ever going to do it. The line then stays masked across the respawn, so the fresh instance
+    // registers correctly, waits for an interrupt that is switched off at the controller, and looks
+    // like a driver that cannot see its hardware.
+    //
+    // On arm32 it is worse than a stuck driver: the USB route falls back to the IN-KERNEL stack when
+    // nobody is registered, so `kill dwc2` would hand USB back to a driver whose interrupt line had
+    // been silently disabled - keyboard and storage dead, with the undo apparently applied.
+    //
+    // Releasing the route and releasing the mask are the same act: whoever holds the route owes the
+    // unmask, and if they are gone the debt falls here. Harmless for edge/MSI vectors, where masking
+    // was a no-op to begin with.
+    crate::arch::imp::ioapic::unmask_vector(irq);
 }
 
 /// Deliver IRQ `irq` to the registered driver as an IPC message.

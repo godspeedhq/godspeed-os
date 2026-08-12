@@ -88,12 +88,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // THE LINE THIS SERVICE EXISTS TO PRINT.
                     ctx.log("dwc2-svc: *** USB INTERRUPT DELIVERED TO USERSPACE *** - arm32 device IRQ routing works");
                 }
-                // Unmask so the line can fire again. The kernel masked it on delivery because DWC2's
-                // interrupt is LEVEL-triggered and stays asserted until the device is serviced; a
-                // real driver would clear the device condition first. This skeleton clears nothing,
-                // so unmasking here re-raises immediately - which is why the count is expected to
-                // climb fast and is a measure of delivery, not of throughput.
-                ctx.irq_unmask(USB_VECTOR);
+                // DO NOT UNMASK. This is the whole difference between a proof and a livelock.
+                //
+                // The first version unmasked here, reasoning that the count would then "climb fast".
+                // It does not climb - it livelocks. DWC2's interrupt is LEVEL-triggered: it stays
+                // asserted until the DEVICE condition is cleared, and a skeleton that drives nothing
+                // clears nothing. So unmask re-asserts instantly, the core re-enters the handler, and
+                // core 0 makes no forward progress at all:
+                //
+                //   KERNEL PANIC: LIVENESS WEDGE: core 0 made NO progress for 10007781 ticks;
+                //                 last running task slot 8; detected by core 3.
+                //
+                // The watchdog was right and the design was wrong. A real driver earns its unmask by
+                // servicing the device first; this one has not earned it.
+                //
+                // Leaving the line masked costs nothing HERE, because one delivered interrupt is the
+                // entire question: it proves the arm32 route reaches userspace. Counting to a hundred
+                // would prove nothing further and cost the machine.
             }
         }
 
