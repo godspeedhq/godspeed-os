@@ -262,6 +262,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         loop {
             passes = passes.wrapping_add(1);
             let t_pass = ctx.read_tsc();
+            let mut served_this_pass = 0u32;
             // Drain block requests, BOUNDED - the endpoint queue is 16 deep, so this is a storm
             // detector rather than a throttle (the same bound the xhci service needed after an
             // unbounded drain was found there).
@@ -275,6 +276,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                     if msc::serve(&ctx, &m, &d, dt, dk, &msg, *sectors, &mut capless) {
                         served = served.wrapping_add(1);
+                        served_this_pass += 1;
                     }
                 }
             }
@@ -305,9 +307,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     reports, served, cmds, bc, bd, bs,
                     passes, seg_serve / ms, seg_kbd / ms, seg_sleep / ms));
             }
-            let t_sleep = ctx.read_tsc();
-            ctx.sleep(ctx.duration_cycles(period_ms));
-            seg_sleep = seg_sleep.wrapping_add(ctx.read_tsc().wrapping_sub(t_sleep));
+            // DO NOT SLEEP WHEN THERE WAS WORK. This is the whole of the throughput problem.
+            //
+            // The segment timing was unambiguous: five passes in nineteen seconds, of which 18.9 s
+            // was SLEEP and 12 ms was serving. A `sleep(10ms)` was taking 3.8 SECONDS, and the
+            // average grew across the run - 28 ms, then 33, then 44. The work was never slow; the
+            // pass was.
+            //
+            // A sleep asks the scheduler for a MINIMUM, not a maximum. Under `selfcheck` this service
+            // shares a core with everything driving it, so the wait to be rescheduled dwarfs the 10 ms
+            // requested - and because `fs` sends one request and waits for the reply, every request
+            // costs a whole pass and therefore a whole one of those waits. That is a throughput
+            // ceiling of one request per reschedule, and it degrades exactly as the load that causes
+            // it grows.
+            //
+            // So: if this pass served anything, go straight round again. A client is blocked waiting
+            // for the next answer, and there is no reason to yield the core before giving it. Sleep
+            // only when the pass found nothing to do, which is when the sleep is doing its actual job
+            // of not busy-spinning an idle driver.
+            if served_this_pass == 0 {
+                let t_sleep = ctx.read_tsc();
+                ctx.sleep(ctx.duration_cycles(period_ms));
+                seg_sleep = seg_sleep.wrapping_add(ctx.read_tsc().wrapping_sub(t_sleep));
+            }
         }
     }
 
