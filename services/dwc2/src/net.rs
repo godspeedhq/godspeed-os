@@ -487,6 +487,15 @@ pub fn rx(
         chan::program(mmio, &Target { addr: t.addr, mps: nic.mps, low_speed: false }, CH_NET_RX,
                       true, nic.pid_in, RX_BURST as u32, dma.phys_at(RX_OFF) as u32,
                       nic.ep_in as u32, 2, 0);
+        // Unmask this channel's terminal halt, exactly as the working kernel driver does before it arms
+        // its background IN. `chan::program` zeroes HCINTMSK for every channel, which is invisible for
+        // a channel programmed and polled in the same breath - and this is the only channel left
+        // RUNNING UNATTENDED, so it is the one place the assumption carries weight. Diffing against the
+        // working driver is what surfaced it; it should have been the first thing I did.
+        mmio.write32(chan::hcintmsk_at(CH_NET_RX),
+                     crate::regs::HCINT_CHHLTD | crate::regs::HCINT_XFERCOMPL);
+        mmio.write32(crate::regs::HAINTMSK,
+                     mmio.read32(crate::regs::HAINTMSK) | (1 << CH_NET_RX));
         nic.in_armed = true;
         return 0;   // nothing yet - the device answers when it has something
     }
