@@ -147,7 +147,7 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 |---|---|---|
 | **0** | One owner: gate the in-kernel driver's tick hooks on `route::registered_endpoint(USB_VECTOR).is_none()` - the same predicate the IRQ dispatch already uses | ✅ selfcheck 351/0, no panics, invisible on a normal boot. **Handover is ONE-WAY - see below** |
 | **1a** | Core bring-up: soft reset, host mode, FIFO sizing, root-port power + reset | ✅ **hardware-verified 2026-08-12** - `core bring-up OK`, `HPRT=0x0000100f connected=true enabled=true speed=high` |
-| **1b** | Channels + control transfers (`chan_program`, `chan_dma`, `ctrl_xfer`) | a device descriptor read back from the hub |
+| **1b** | Channels + control transfers (`chan_program`, `chan_dma`, `ctrl_xfer`) | ✅ **hardware-verified 2026-08-12** - `DEVICE DESCRIPTOR len=18 type=0x01 usb=0x0200 mps0=64` |
 | **1c** | Enumeration + hub walk + split transactions | the same VID/PIDs the kernel driver reports |
 | **2** | Keyboard: HID + `CONSOLE_PUSH` | Typing works from userspace. Second ON PURPOSE - it makes the machine usable for testing the rest |
 | **3** | Mass storage: BOT/SCSI; `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | `drives`, `ls`, `selfcheck` |
@@ -186,6 +186,27 @@ lifted with their comments, and three of the steps they carry (UTMI+ 8-bit selec
 FIFO layout, the post-resize FIFO flush) are HW-diagnosed facts that pass in QEMU and fail on the
 board. The one thing the mechanical lift dropped - the `cfg` gate on `DMA_BUS_ALIAS` - was caught by
 the compiler, and would otherwise have failed on exactly one of the two targets.
+
+## Slice 1b result
+
+```
+dwc2-svc: DEVICE DESCRIPTOR len=18 type=0x01 usb=0x0200 mps0=64
+```
+
+Every field is right: 18 is the standard device-descriptor length, `0x01` is DEVICE, `0x0200` is USB
+2.0, and `mps0=64` is a high-speed device's EP0. A real descriptor, read from the Pi's internal hub by
+a USERSPACE driver.
+
+That one line exercises the entire transfer path: channel programming, a DMA the controller performs
+against the service's own granted arena, the `DMA_BUS_ALIAS` translation **on real silicon**, and all
+three control stages. It also confirms the no-cache-maintenance reasoning empirically rather than by
+argument - the arena is Device/uncached, so the `flush_dcache` calls the kernel driver needs for its
+cached buffers have no counterpart here.
+
+**Two slices, two first-try passes on hardware.** Both because the code was LIFTED with its comments
+rather than re-derived: the sequence, the register order, the odd-frame rule and the short-packet
+scratch-zeroing are all facts the board taught someone, and none of them is visible in a datasheet or
+detectable in QEMU.
 
 ## What makes arm32 harder than the AArch64 port
 
