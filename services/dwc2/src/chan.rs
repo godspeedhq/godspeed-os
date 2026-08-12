@@ -167,6 +167,98 @@ fn stage(
     }
 }
 
+/// Build the HCSPLT descriptor for a device behind a hub.
+///
+/// `PrtAddr` = the hub's downstream port, `HubAddr` = the hub's device address, `XactPos = ALL`
+/// (0b11) because a control/bulk split moves a whole packet rather than a begin/mid/end chunk, and
+/// `SplEna` to arm it. Zero means "direct device" and takes the non-split path.
+pub fn hcsplt(hub_addr: u8, hub_port: u8) -> u32 {
+    if hub_port == 0 {
+        return 0;
+    }
+    (hub_port as u32 & 0x7F) | ((hub_addr as u32 & 0x7F) << 7) | (0b11 << 14) | (1 << 31)
+}
+
+/// Wait until the controller reports the given microframe. Bounded: one full frame is 8 microframes
+/// at 125 us, so a whole sweep cannot take more than a millisecond even if the target never appears.
+fn wait_for_uframe(ctx: &ServiceContext, mmio: &Mmio, target: u32) {
+    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(2));
+    while (mmio.read32(HFNUM) & 7) != target {
+        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+            return;
+        }
+    }
+}
+
+/// One SPLIT transaction stage: start-split, then poll the complete-split.
+///
+/// **This is the non-periodic (control/bulk) path, and it is deliberately the one this slice uses.**
+/// It brute-forces a landing microframe by SWEEPING 0..7 across retries rather than scheduling one
+/// precisely, because a non-periodic split has no fixed schedule. That makes it tolerant of being
+/// preempted: a badly-timed attempt simply retries at a different microframe. The PERIODIC path
+/// (`split_txn_periodic` in the kernel driver) does need microframe-accurate scheduling and is the
+/// genuinely risky part of moving this driver out of ring 0 - it is needed only for the keyboard's
+/// interrupt endpoint, so it belongs to Slice 2, faced on its own.
+#[allow(clippy::too_many_arguments)]
+fn stage_split(
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, splt: u32, what: &str,
+) -> bool {
+    const SS_TRIES: u32 = 24;
+    for attempt in 0..SS_TRIES {
+        wait_for_uframe(ctx, mmio, attempt % 8);
+
+        // STATE 1 - the Start-Split (CompleteSplit = 0). The hub's transaction translator legitimately
+        // NAKs or transaction-errors while busy, and USB 2.0 11.17.5 says the host re-issues the whole
+        // start-split rather than treating it as a failure.
+        program(mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, splt);
+        let ss = match wait_halt(ctx, mmio, ch, 50) {
+            Some(v) => v,
+            None => continue,
+        };
+        if ss & HCINT_STALL != 0 {
+            ctx.log_fmt(format_args!("dwc2-svc: {} start-split STALLed", what));
+            return false;
+        }
+        if ss & HCINT_XFERCOMPL != 0 {
+            return true; // rare, but a split can complete outright
+        }
+        if ss & HCINT_ACK == 0 {
+            continue; // no ACK: the TT did not take it - retry at the next microframe
+        }
+
+        // STATE 2 - poll the Complete-Split for the low/full-speed device's answer.
+        let mut nyet = 0u32;
+        loop {
+            program(mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, splt | (1 << 16));
+            let cs = match wait_halt(ctx, mmio, ch, 50) {
+                Some(v) => v,
+                None => break,
+            };
+            if cs & HCINT_XFERCOMPL != 0 {
+                return true;
+            }
+            if cs & HCINT_STALL != 0 {
+                ctx.log_fmt(format_args!("dwc2-svc: {} complete-split STALLed", what));
+                return false;
+            }
+            if cs & HCINT_NYET != 0 {
+                // The TT has not finished with the device yet. Keep polling, BOUNDED - then fall out
+                // to a fresh start-split rather than spinning here forever.
+                nyet += 1;
+                if nyet > 500 {
+                    break;
+                }
+                ctx.sleep(ctx.duration_cycles(1));
+                continue;
+            }
+            break; // NAK or XactErr: re-issue the start-split
+        }
+    }
+    ctx.log_fmt(format_args!("dwc2-svc: {} split gave up after {} start-splits", what, SS_TRIES));
+    false
+}
+
 /// A full USB control transfer: SETUP, optional DATA, STATUS.
 ///
 /// `data` is filled on an IN transfer and sent on an OUT one. Returns false if any stage failed, with
@@ -175,6 +267,18 @@ pub fn control(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target,
     setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize,
 ) -> bool {
+    control_split(ctx, mmio, dma, t, setup, data, data_in, dlen, 0)
+}
+
+/// A control transfer, optionally through a hub's transaction translator.
+///
+/// `splt` of 0 is a direct device and behaves exactly as before - the direct path is untouched, so a
+/// regression here cannot break what slices 1a-1c-ii proved.
+#[allow(clippy::too_many_arguments)]
+pub fn control_split(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target,
+    setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize, splt: u32,
+) -> bool {
     let ch = CH_BULK;
     let setup_phys = dma.phys_at(SETUP_OFF) as u32;
     let data_phys = dma.phys_at(DATA_OFF) as u32;
@@ -182,7 +286,14 @@ pub fn control(
     for (i, b) in setup.iter().enumerate() {
         dma.write8(SETUP_OFF + i, *b);
     }
-    if !stage(ctx, mmio, t, ch, false, PID_SETUP, setup_phys, 8, "SETUP") {
+    let run = |ctx: &ServiceContext, dir_in, pid, phys, len, what| {
+        if splt == 0 {
+            stage(ctx, mmio, t, ch, dir_in, pid, phys, len, what)
+        } else {
+            stage_split(ctx, mmio, t, ch, dir_in, pid, phys, len, splt, what)
+        }
+    };
+    if !run(ctx, false, PID_SETUP, setup_phys, 8, "SETUP") {
         return false;
     }
 
@@ -199,7 +310,7 @@ pub fn control(
             for i in 0..want {
                 dma.write8(DATA_OFF + i, 0);
             }
-            if !stage(ctx, mmio, t, ch, true, PID_DATA1, data_phys, want as u32, "DATA-IN") {
+            if !run(ctx, true, PID_DATA1, data_phys, want as u32, "DATA-IN") {
                 return false;
             }
             let n = want.min(data.len());
@@ -212,7 +323,7 @@ pub fn control(
             for i in 0..n {
                 dma.write8(DATA_OFF + i, data[i]);
             }
-            if !stage(ctx, mmio, t, ch, false, PID_DATA1, data_phys, n as u32, "DATA-OUT") {
+            if !run(ctx, false, PID_DATA1, data_phys, n as u32, "DATA-OUT") {
                 return false;
             }
         }
@@ -220,9 +331,9 @@ pub fn control(
 
     // STATUS: opposite direction, zero length, DATA1. The setup buffer doubles as a dummy DMA target.
     let ok = if data_in {
-        stage(ctx, mmio, t, ch, false, PID_DATA1, setup_phys, 0, "STATUS")
+        run(ctx, false, PID_DATA1, setup_phys, 0, "STATUS")
     } else {
-        stage(ctx, mmio, t, ch, true, PID_DATA1, data_phys, 0, "STATUS")
+        run(ctx, true, PID_DATA1, data_phys, 0, "STATUS")
     };
     if ok {
         release(mmio, ch);

@@ -120,6 +120,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // WHERE splits will be needed, which is the last piece of Slice 1.
                         if let Some(n) = dev.hub_ports {
                             hub::survey(&ctx, &m, &d, &dev.target, n);
+                            // SLICE 1c-iii: reach a device BEHIND the hub, through a split.
+                            //
+                            // The first port reporting a device is enough to prove the path. Doing
+                            // all four would prove the same thing four times and take four times as
+                            // long to read when it fails.
+                            for p in 1..=n {
+                                if let Some(st) = hub::port_status(&ctx, &m, &d, &dev.target, p) {
+                                    if st.connected() {
+                                        let _ = hub::enumerate_downstream(&ctx, &m, &d, &dev.target, p);
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                     None => ctx.log("dwc2-svc: enumeration FAILED - see the step above"),

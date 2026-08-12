@@ -96,3 +96,6 @@ pub(crate) const HCINT_XACTERR:   u32 = 1 << 7;   // a real transaction error (C
 /// How many genuine TRANSACTION errors a transfer tolerates before it fails. Matches Linux, which
 /// fails a QTD at `error_count >= 3` in `dwc2_release_channel`.
 pub(crate) const XACT_ERR_MAX: u32 = 3;
+
+/// Split start-split accepted by the hub's transaction translator.
+pub(crate) const HCINT_ACK: u32 = 1 << 5;

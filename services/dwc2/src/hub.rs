@@ -181,3 +181,33 @@ pub fn survey(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, ports: u
         "dwc2-svc: hub survey complete - {} device(s) attached, {} need split transactions",
         found, split_needed));
 }
+
+/// Reset a port, then address and identify the device behind it - THROUGH a split transaction.
+///
+/// This is the first transfer in the port that reaches past the hub, and every device on this board
+/// needs it (the survey says all four are full or low speed). A downstream device is addressed at 0
+/// with MPS 8 exactly as a root device is; what differs is that every stage rides the hub's
+/// transaction translator.
+pub fn enumerate_downstream(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, hub: &Target, port: u8,
+) -> Option<(u16, u16, u8)> {
+    let st = reset_port(ctx, mmio, dma, hub, port)?;
+    let splt = chan::hcsplt(hub.addr, port);
+
+    // The device answers at address 0 until it is given one. `low_speed` matters to the controller's
+    // channel programming, and the hub is the authority on it - the port status just told us.
+    let t = Target { addr: 0, mps: 8, low_speed: st.status & PORT_LOW_SPEED != 0 };
+    let mut first = [0u8; 18];
+    let setup = [0x80, 0x06, 0, 0x01, 0, 0, 8, 0];
+    if !chan::control_split(ctx, mmio, dma, &t, &setup, &mut first, true, 8, splt) {
+        ctx.log_fmt(format_args!("dwc2-svc: port {} first descriptor read FAILED (split)", port));
+        return None;
+    }
+    let vid = u16::from_le_bytes([first[8], first[9]]);
+    let pid = u16::from_le_bytes([first[10], first[11]]);
+    let class = first[4];
+    ctx.log_fmt(format_args!(
+        "dwc2-svc: port {} DEVICE via split - VID:PID={:04x}:{:04x} class={:#04x} speed={}",
+        port, vid, pid, class, st.speed()));
+    Some((vid, pid, class))
+}
