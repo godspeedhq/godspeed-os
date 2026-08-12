@@ -69,6 +69,20 @@ pub fn route_usb_irq_to_core0() {
 /// full/high-speed host controller.
 pub const USB_VECTOR: u8 = 0x29;
 
+/// Does a USERSPACE service own the USB controller?
+///
+/// THE one predicate for that question, so ownership cannot be decided two different ways.
+/// Registration for `USB_VECTOR` is the fact; everything else follows from it - the IRQ dispatch
+/// routes to whoever registered, and the in-kernel driver's periodic hooks stand down when someone
+/// has. There is no separate flag, because a second copy of a fact is a second chance to disagree
+/// with it (Commandment III).
+///
+/// It is also what makes the transition reversible from the prompt: `spawn dwc2` quiets the kernel
+/// driver, `kill dwc2` (which calls `route::unregister`) hands the hardware straight back.
+pub fn usb_owned_by_userspace() -> bool {
+    crate::interrupt::route::registered_endpoint(USB_VECTOR).is_some()
+}
+
 /// Mask the USB line at the legacy controller.
 ///
 /// Required before handing this interrupt to userspace. The DWC2 line is LEVEL-triggered - it stays
@@ -266,7 +280,7 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
         // instead. That makes the transition testable in one step, and it means there is never a
         // build in which both drivers believe they own the hardware - the failure mode the AArch64
         // feature flag actually produced before it was deleted.
-        if crate::interrupt::route::registered_endpoint(USB_VECTOR).is_some() {
+        if usb_owned_by_userspace() {
             // MASK FIRST. The line is level-triggered and the userspace driver has not run yet, so
             // without this it re-asserts immediately and the core never leaves the handler. The
             // driver unmasks through `IrqUnmask` once it has cleared the device.

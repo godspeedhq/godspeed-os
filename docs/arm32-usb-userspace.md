@@ -92,6 +92,60 @@ Still unconfirmed and harmless: `observe` showed core 0 at 97% while the skeleto
 most likely the in-kernel driver polling a controller whose interrupt has been taken away. Worth a
 glance during Phase 3, when that driver stops existing.
 
+## Phase 3 slicing
+
+### What the code actually looks like
+
+The external surface is small - eight entry points in three groups:
+
+| Called from | Entry points |
+|---|---|
+| Boot + IRQ | `init`, `on_usb_irq` |
+| Timer tick | `hotplug_poll`, `link_poll`, `net_rx_drain_tick`, `async_bulk_watchdog` |
+| Syscalls | `msc_*` (block-driver), `net_frame_tx`/`net_frame_rx`/`net_info` (nic-driver) |
+
+Internally it layers cleanly, and the layers are a dependency chain rather than a tangle:
+
+```
+registers + channels (~900)  ->  control transfers (~150)  ->  enumeration + hub + hot-plug (~600)
+                                                                    |
+                                            +-----------------------+-----------------------+
+                                            |                       |                       |
+                                     keyboard (~150)      mass storage (~800)      networking (~900)
+```
+
+The three device classes are **independent leaves**. That is what makes slicing possible at all.
+
+### The constraint that shapes the slices
+
+**The controller has exactly one owner.** It cannot be half-moved - whoever holds the IRQ drives the
+hardware. So a slice cannot be "some transfers in userspace"; it has to be *"the service does
+everything up to X, and past X nothing works yet."*
+
+Each rung is therefore a working machine with FEWER DEVICES, which is testable at every step.
+
+### The slices
+
+| # | Work | Test |
+|---|---|---|
+| **0** | One owner: gate the in-kernel driver's tick hooks on `route::registered_endpoint(USB_VECTOR).is_none()` - the same predicate the IRQ dispatch already uses | `spawn dwc2` quiets the kernel driver; `kill dwc2` hands it back. Unchanged when no service runs |
+| **1** | Port + enumerate: reset, port bring-up, control transfers, hub walk. Logs the device tree and stops | Reports the same VID/PIDs the kernel driver found. USB devices do not work; serial carries the session |
+| **2** | Keyboard: HID + `CONSOLE_PUSH` | Typing works from userspace. Second ON PURPOSE - it makes the machine usable for testing the rest |
+| **3** | Mass storage: BOT/SCSI; `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | `drives`, `ls`, `selfcheck` |
+| **4** | Networking: CDC-ECM + smsc95xx; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | DHCP, `ping` |
+| **5** | Delete `arch/arm/dwc2.rs`, the six syscalls, the tick hooks | `chaos max-carnage` + `selfcheck`. THEN amend §6.4 |
+
+### Two things to decide deliberately rather than inherit
+
+- **The tick hooks are not all equal.** `hotplug_poll` and `link_poll` are genuine periodic work.
+  `net_rx_drain_tick` and `async_bulk_watchdog` exist partly because a kernel driver had a tick
+  conveniently to hand. In a service those become its own loop, and that is a design choice worth
+  making rather than porting across unexamined.
+- **Split transactions are the risk.** `split_txn_periodic` does microframe-accurate scheduling
+  (`wait_for_uframe`, `write_hfnum`). It is the most timing-sensitive code in the file, and it moves
+  from ring 0 with interrupts masked to a PREEMPTIBLE userspace task. Expect this to be the slice that
+  bites. It sits inside Slice 1, because the hub needs it - worth knowing before rather than during.
+
 ## What makes arm32 harder than the AArch64 port
 
 DWC2 is far more software-driven than xHCI: split transactions, NAK retries, and a stack currently

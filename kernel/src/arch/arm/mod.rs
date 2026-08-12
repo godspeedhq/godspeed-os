@@ -1372,7 +1372,17 @@ pub fn uart_rx_poll() {
         let mpidr: u32;
         // SAFETY: reading MPIDR (`c0, c0, 5`) is a side-effect-free PL1 register read.
         unsafe { core::arch::asm!("mrc p15, 0, {m}, c0, c0, 5", m = out(reg) mpidr, options(nomem, nostack)); }
-        if mpidr & 3 == 0 { dwc2::async_bulk_watchdog(); dwc2::poll(); dwc2::net_rx_drain_tick(); }
+        // STAND DOWN when a userspace service owns the controller (Phase 3, Slice 0).
+        //
+        // These are the in-kernel driver's periodic hooks. The controller has exactly ONE owner: two
+        // drivers programming the same channels would corrupt each other's transfers, and the failure
+        // would look like flaky hardware rather than two owners. Gating them on the same predicate the
+        // IRQ dispatch uses means ownership is decided in one place from one fact.
+        if mpidr & 3 == 0 && !irq::usb_owned_by_userspace() {
+            dwc2::async_bulk_watchdog();
+            dwc2::poll();
+            dwc2::net_rx_drain_tick();
+        }
     }
     if RX_HEAD.load(Ordering::Acquire) != RX_TAIL.load(Ordering::Acquire) {
         let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
@@ -1640,6 +1650,10 @@ pub mod interrupts {
         // exclusion is a PROTOCOL instead - `dwc2::hotplug_poll` takes `UsbExclusive` and every other
         // shared-selection path stands aside for the duration (storage answers BUSY and re-asks, which it
         // already knows how to do). Interrupts stay on, the tick keeps running, and nothing races.
+        // Both of these stand down for a userspace owner, for the reason above: one controller, one
+        // driver. `hotplug_poll` in particular takes the exclusive bulk claim and rewrites the shared
+        // device selection, which is precisely what must not happen underneath another driver.
+        if !super::irq::usb_owned_by_userspace() {
         super::dwc2::hotplug_poll();
         // Watch the ethernet cable for the same reason, on the same terms. The PHY read was already
         // written and already correct - but nothing CALLED it unless a service asked (`net`, `ping`), so
@@ -1649,6 +1663,7 @@ pub mod interrupts {
         // section: it takes the same bulk claim, and nesting would make it stand aside from itself. Both
         // are individually rate-limited to ~1 s and both yield to storage, so idle stays cheap.
         super::dwc2::link_poll();
+        }
         // SAFETY: unmasking IRQs is always valid (vectors + handlers installed); WFI then waits for one.
         unsafe { core::arch::asm!("cpsie i", "wfi", options(nomem, nostack)) }
     }
