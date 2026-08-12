@@ -325,9 +325,33 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // for the next answer, and there is no reason to yield the core before giving it. Sleep
             // only when the pass found nothing to do, which is when the sleep is doing its actual job
             // of not busy-spinning an idle driver.
+            // BLOCK ON THE ENDPOINT, do not sleep. An arriving request cannot wake a sleeping task.
+            //
+            // The previous fix - skip the sleep when the pass did work - was right and insufficient,
+            // and the numbers said so: 25 passes, 13 served, 18.7 s of sleep across the 12 IDLE ones.
+            // Roughly 1.5 s per `sleep(10ms)`.
+            //
+            // Those idle passes are the gap while `fs` is thinking between requests, and that is the
+            // flaw: a task in `sleep` sleeps out its full duration no matter what arrives, so every
+            // gap costs a whole scheduler-stretched sleep before the next request is even LOOKED at.
+            // The sleep was not conserving CPU during a quiet moment - it was inserting one.
+            //
+            // `recv_timeout` blocks on the ENDPOINT: an arriving message wakes it immediately because
+            // that wake is event-driven, and the deadline still provides the keyboard's poll cadence
+            // when nothing arrives. Same idle behaviour, none of the latency.
+            //
+            // The message it returns must be SERVED, not dropped - `recv_timeout` consumes. That is
+            // the exact bug that made the keyboard report `0 USB IRQ(s)` on a boot where the kernel
+            // had delivered the interrupt, and it is one `let _ =` away from happening again.
             if served_this_pass == 0 {
                 let t_sleep = ctx.read_tsc();
-                ctx.sleep(ctx.duration_cycles(period_ms));
+                if let Some(msg) = ctx.recv_timeout(ctx.duration_cycles(period_ms)) {
+                    if let Some((dk, dt, sectors)) = disk.as_mut() {
+                        if msc::serve(&ctx, &m, &d, dt, dk, &msg, *sectors, &mut capless) {
+                            served = served.wrapping_add(1);
+                        }
+                    }
+                }
                 seg_sleep = seg_sleep.wrapping_add(ctx.read_tsc().wrapping_sub(t_sleep));
             }
         }
