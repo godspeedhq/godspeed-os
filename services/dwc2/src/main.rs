@@ -191,6 +191,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // moment costs one attempt, not correctness.
     if let (Some((k, kt, ksplt)), Some(m), Some(d)) = (kbd.as_ref(), ctx.mmio(), ctx.dma_region()) {
         let mut state = hid::KeyState::new(&ctx);
+        let mut dumped = 0u32;
         let mut reports: u64 = 0;
         let mut last_beat = ctx.read_tsc();
         // The interval the DEVICE asked for, floored to something a service can actually schedule.
@@ -200,7 +201,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.log_fmt(format_args!(
             "dwc2-svc: polling the keyboard every {} ms (device asked for {})", period_ms, k.interval));
         loop {
-            if hid::poll(&ctx, &m, &d, kt, *ksplt, k, &mut state) {
+            if hid::poll(&ctx, &m, &d, kt, *ksplt, k, &mut state, &mut dumped) {
                 reports = reports.wrapping_add(1);
                 if reports == 1 {
                     ctx.log("dwc2-svc: *** FIRST KEY REPORT FROM USERSPACE *** - type and it reaches the console");

@@ -165,7 +165,7 @@ pub fn bind(
 /// happened" rather than a failure - so a false here is the normal case and must not be logged.
 pub fn poll(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, splt: u32, kbd: &Keyboard,
-    state: &mut KeyState,
+    state: &mut KeyState, dumped: &mut u32,
 ) -> bool {
     let len = (kbd.mps as u32).min(8);
     let phys = dma.phys_at(REPORT_OFF) as u32;
@@ -213,6 +213,25 @@ pub fn poll(
     let mut rep = [0u8; 8];
     for i in 0..8 {
         rep[i] = dma.read8(REPORT_OFF + i);
+    }
+    // DUMP THE FIRST FEW REPORTS VERBATIM, and the HCINT that delivered them.
+    //
+    // Four single-line fixes in a row have each cost a boot, so this one measures instead. Eight
+    // bytes separate every remaining candidate at once, without needing another hypothesis first:
+    //
+    //   modifier/0/keycodes    a VALID boot report -> transfers are right, decoding is wrong
+    //   the same bytes repeatedly -> the buffer is not being refreshed, or the toggle is stuck
+    //   arbitrary bytes        -> something else still writes this arena slice
+    //   0x01 0x01 0x01 ...     -> the classic DWC2 "all ones" of a transfer that moved nothing
+    //
+    // Bounded to 8 so a burst cannot flood the console: the question is what a report CONTAINS, and
+    // eight samples answer it as well as eight hundred. `dumped` is per-service-lifetime, so a
+    // respawn gives a fresh look rather than staying silent forever.
+    if *dumped < 8 {
+        *dumped += 1;
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: report #{} hcint={:#010x} bytes {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+            *dumped, hcint, rep[0], rep[1], rep[2], rep[3], rep[4], rep[5], rep[6], rep[7]));
     }
     godspeed_sdk::hid::decode_keyboard(
         &rep,
