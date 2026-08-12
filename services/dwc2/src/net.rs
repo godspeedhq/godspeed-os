@@ -499,18 +499,33 @@ pub fn rx(
         nic.in_armed = true;
         return 0;   // nothing yet - the device answers when it has something
     }
-    let hcint = mmio.read32(chan::hcint_at(CH_NET_RX));
-    if hcint & crate::regs::HCINT_XFERCOMPL == 0 {
-        if hcint & (crate::regs::HCINT_STALL | crate::regs::HCINT_CHHLTD) != 0 {
-            // Halted for a reason that is NOT completion: the transfer is over and dead, so re-arm on
-            // the next pass rather than waiting forever on a channel that will never complete.
-            nic.stats.rx_hcint = hcint;
-            nic.in_armed = false;
-        } else {
-            nic.stats.rx_nohalt = nic.stats.rx_nohalt.wrapping_add(1);
-        }
+    // COMPLETION IS ChEna GOING CLEAR, not an HCINT bit.
+    //
+    // This is the kernel driver's own tick watchdog, ported as-is: it does not consult HCINT to decide
+    // whether the background IN finished - it tests HCCHAR.ChEna, and harvests when the channel is no
+    // longer enabled ("ChEna clear - the IN is not outstanding"). Its ISR path reaches the same place
+    // via CHHLTD, but the ISR is a route this polled service does not have.
+    //
+    // Waiting on HCINT.XFERCOMPL instead is what produced nohalt climbing past 21000 with HCINT stuck
+    // at 0x00000000 across three boots. Reading the working code for its DESIGN rather than porting its
+    // comments would have got here first; that is the whole lesson of this slice.
+    let hcchar = mmio.read32(chan::hcchar_at(CH_NET_RX));
+    let hcint  = mmio.read32(chan::hcint_at(CH_NET_RX));
+    if hcchar & (1 << 31) != 0 {
+        // Still enabled: the IN is outstanding and the device simply has nothing yet. With BIR set the
+        // core NAK-retries in hardware without halting, so this is the ordinary quiet case.
+        nic.stats.rx_nohalt = nic.stats.rx_nohalt.wrapping_add(1);
+        nic.stats.rx_hcint = hcint;
         return 0;
     }
+    if hcint & crate::regs::HCINT_STALL != 0 {
+        // A halted endpoint is a hard failure, never retried by re-arming into the same condition.
+        nic.stats.rx_hcint = hcint;
+        nic.in_armed = false;
+        return 0;
+    }
+    // W1C the channel's interrupts so the next armed transfer starts from a clean slate.
+    mmio.write32(chan::hcint_at(CH_NET_RX), hcint);
     let left = mmio.read32(chan::hctsiz_at(CH_NET_RX)) & 0x7_FFFF;
     nic.pid_in = chan::pid_from_hctsiz(mmio, CH_NET_RX);
     nic.stats.rx_hcint = hcint;
