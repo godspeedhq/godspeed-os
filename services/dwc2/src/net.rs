@@ -364,14 +364,25 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
     // full-duplex link drops frames to late collisions. The receive filter is our-unicast + broadcast
     // ONLY: promiscuous, all-multicast and the hash filter are CLEARED so the mDNS/SSDP/IPv6-ND flood is
     // dropped at the chip instead of drowning our replies. Some of those bits come out of reset SET.
+    //
+    // DIAGNOSTIC, and temporary: PRMS (promiscuous) is set below instead of cleared. With the filter
+    // narrowed to our-unicast + broadcast, the only traffic this chip accepts is addressed to
+    // 02:00:00:12:34:56 - a locally-administered address nobody on the LAN sends to - so a quiet
+    // network is indistinguishable from a broken receive path. Both read as "rx 0 bursts". Opening the
+    // filter separates them with one bit: if bursts appear, RX works and the fault is that our
+    // transmitted frames never reach the wire; if it stays at zero, RX itself is broken.
+    //
+    // This MUST come back out once that is known - dropping the multicast flood at the chip rather
+    // than in our ring is why the filter was narrowed in the first place.
     let cr = (smsc_read_or0(ctx, m, d, t, SMSC_MAC_CR)
-              & !(SMSC_MAC_CR_PRMS | SMSC_MAC_CR_MCPAS | SMSC_MAC_CR_HPFILT))
-             | SMSC_MAC_CR_TXEN | SMSC_MAC_CR_RXEN | SMSC_MAC_CR_FDPX;
+              & !(SMSC_MAC_CR_MCPAS | SMSC_MAC_CR_HPFILT))
+             | SMSC_MAC_CR_PRMS | SMSC_MAC_CR_TXEN | SMSC_MAC_CR_RXEN | SMSC_MAC_CR_FDPX;
     if !smsc_write(ctx, m, d, t, SMSC_MAC_CR, cr) {
         ctx.log("dwc2-svc: smsc MAC_CR enable FAILED - NIC stays down");
         return None;
     }
     smsc_write(ctx, m, d, t, SMSC_TX_CFG, SMSC_TX_CFG_ON);
+    ctx.log("dwc2-svc: NIC filter is PROMISCUOUS (diagnostic - splits a quiet network from a dead receive path; revert once known)");
 
     // Read the state back OFF THE CHIP rather than assuming the writes took. Every register here was
     // just written by us, so a value that disagrees says the vendor control path is not landing - and
