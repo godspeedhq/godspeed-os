@@ -565,8 +565,62 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     // service's own state, threaded through the loop) - not a file-scope static.
     let mut tx_fail: u32 = 0;
 
+    // On arm32 the USB stack is a SERVICE now, so the NET_DEVICE syscalls are replaced by IPC to
+    // `dwc2` - the same move `block-driver` made in slice 3c, and the same reason: the driver left the
+    // kernel, so the syscalls that existed only to reach it have nothing behind them.
+    //
+    // Opcodes start at 0x10 because `dwc2` serves the BLOCK protocol on the same endpoint and block
+    // uses 1..5. One endpoint, two protocols, one opcode space - a collision here would route a frame
+    // to the disk.
+    #[cfg(target_arch = "arm")]
+    let dev_info = |ctx: &ServiceContext, out: &mut [u8; 7]| -> bool {
+        match ctx.request_with_reply("dwc2", &Message::from_bytes(&[0x10])) {
+            Some(r) => {
+                let p = r.payload_bytes();
+                if p.len() < 8 || p[0] == 0 { return false; }
+                out[0..6].copy_from_slice(&p[1..7]);
+                out[6] = p[7];
+                true
+            }
+            None => false,
+        }
+    };
+    #[cfg(target_arch = "arm")]
+    let dev_tx = |ctx: &ServiceContext, frame: &[u8]| -> bool {
+        let mut req = [0u8; 1 + 1514];
+        let n = frame.len().min(1514);
+        req[0] = 0x11;
+        req[1..1 + n].copy_from_slice(&frame[..n]);
+        match ctx.request_with_reply("dwc2", &Message::from_bytes(&req[..1 + n])) {
+            Some(r) => { let p = r.payload_bytes(); !p.is_empty() && p[0] != 0 }
+            None => false,
+        }
+    };
+    #[cfg(target_arch = "arm")]
+    let dev_rx = |ctx: &ServiceContext, buf: &mut [u8]| -> usize {
+        match ctx.request_with_reply("dwc2", &Message::from_bytes(&[0x12])) {
+            Some(r) => {
+                let p = r.payload_bytes();
+                if p.len() < 2 { return 0; }
+                let n = (p[0] as usize) | ((p[1] as usize) << 8);
+                // A length the reply cannot back is a malformed answer, not a short frame - taking it
+                // would hand the stack whatever followed in the message buffer.
+                if n == 0 || p.len() < 2 + n || n > buf.len() { return 0; }
+                buf[..n].copy_from_slice(&p[2..2 + n]);
+                n
+            }
+            None => 0,
+        }
+    };
+    #[cfg(not(target_arch = "arm"))]
+    let dev_info = |ctx: &ServiceContext, out: &mut [u8; 7]| -> bool { ctx.net_info(out) };
+    #[cfg(not(target_arch = "arm"))]
+    let dev_tx = |ctx: &ServiceContext, frame: &[u8]| -> bool { ctx.net_frame_tx(frame) };
+    #[cfg(not(target_arch = "arm"))]
+    let dev_rx = |ctx: &ServiceContext, buf: &mut [u8]| -> usize { ctx.net_frame_rx(buf) };
+
     let mut info = [0u8; 7];
-    if ctx.net_info(&mut info) {
+    if dev_info(&ctx, &mut info) {
         ctx.log_fmt(format_args!(
             "nic-driver: kernel NIC up  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  link {}",
             info[0], info[1], info[2], info[3], info[4], info[5], if info[6] != 0 { "UP" } else { "down" }));
@@ -578,7 +632,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     // Poll the bulk IN endpoint up to RX_TRIES times for one received frame; returns its length (0 = none).
     let rx_one = |ctx: &ServiceContext, buf: &mut [u8]| -> usize {
         for _ in 0..RX_TRIES {
-            let n = ctx.net_frame_rx(buf);
+            let n = dev_rx(ctx, buf);
             if n > 0 { return n; }
             ctx.yield_cpu();                      // give the device / QEMU a moment to queue a frame
         }
@@ -594,7 +648,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             // STATUS: [ok, mac(6), link] - net-stack reads MAC at [1..7] and link at [7].
             let mut out = [0u8; 8];
             let mut ni = [0u8; 7];
-            if ctx.net_info(&mut ni) {
+            if dev_info(&ctx, &mut ni) {
                 out[0] = 1;
                 out[1..7].copy_from_slice(&ni[0..6]);
                 out[7] = ni[6];
@@ -616,7 +670,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
                 // re-polls (op 4/9) for whatever we stop short of.
                 if opos + 2 + FRAME_MAX > out.len() { break; }
                 let mut rx = [0u8; FRAME_MAX];
-                let n = ctx.net_frame_rx(&mut rx);
+                let n = dev_rx(&ctx, &mut rx);
                 if n == 0 { break; }
                 out[opos] = (n & 0xff) as u8;
                 out[opos + 1] = ((n >> 8) & 0xff) as u8;
@@ -646,7 +700,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             // net-stack waited out its whole deadline for an answer to a frame that never left the host -
             // a send that did not happen, reported as one that did (§26.7). Rate-limited so a persistently
             // broken device cannot flood the console.
-            if !ctx.net_frame_tx(p) {
+            if !dev_tx(&ctx, p) {
                 tx_fail = tx_fail.saturating_add(1);
                 if tx_fail == 1 || tx_fail % 64 == 0 {
                     ctx.log_fmt(format_args!("nic-driver: usb-net TX FAILED x{} (frame not sent)", tx_fail));

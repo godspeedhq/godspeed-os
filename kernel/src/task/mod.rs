@@ -516,8 +516,10 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // in-kernel USB-net bridge does, so `nic-driver` needs the same grant to reach it. Without it
         // the service loads and runs and every frame call is denied, which looks like a dead network
         // rather than a missing capability.
-        net_device: cfg!(any(target_arch = "arm", target_arch = "aarch64"))
-            && matches!(name, "nic-driver"),
+        // ARM32 has LEFT this set: its USB-net device moved into the `dwc2` SERVICE (slice 4b), so
+        // nic-driver reaches frames over IPC and the syscalls have nothing behind them. Keeping the
+        // grant would be authority it cannot use - the exact over-grant the audits keep finding.
+        net_device: cfg!(target_arch = "aarch64") && matches!(name, "nic-driver"),
         // USB_DISK: `block-driver` reaches a USB stick through syscalls 46-48 rather than MMIO, on
         // the port where the USB stack is IN THE KERNEL - which is now ARM32 (Pi 2) ONLY. On aarch64
         // the in-kernel driver was deleted (CLAUDE.md §6.4, 2026-08-09) and block-driver goes through
@@ -814,10 +816,17 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "nic-driver" => Some(("nic-driver", ServiceConfig {
             elf:               include_bytes!(env!("SVC_NIC_DRIVER_ELF")),
             has_recv_endpoint: true, // will serve the frame interface to net-stack (§12)
+            // ARM32: the USB-net device is behind the `dwc2` SERVICE, so nic-driver needs a send cap
+            // to it - the same edge `block-driver` got in slice 3c. Without it `request_with_reply`
+            // finds no send slot and returns None INSTANTLY, which looks like a dead cable rather
+            // than a missing grant: every layer healthy in isolation, the edge between them absent.
+            #[cfg(target_arch = "arm")]
+            send_peers:        &["dwc2"],
+            #[cfg(not(target_arch = "arm"))]
             send_peers:        &[],
             send_peers_grant:  false,
-            // ARM (Pi 2): the NIC is the in-kernel DWC2 USB device, driven only from core 0 - the ARM
-            // backend's NET_DEVICE syscalls guard on that core. x86 and aarch64 (Pi 4): core 1,
+            // ARM (Pi 2): core 0 - the `dwc2` service it now talks to runs there, and the USB
+            // controller is serviced from that core's tick. x86 and aarch64 (Pi 4): core 1,
             // co-located with net-stack + fs. The Pi 4 has no core-0 constraint because GENET is
             // reached by MMIO from whichever core makes the syscall, not from a timer tick.
             preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },

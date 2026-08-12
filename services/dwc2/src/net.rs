@@ -21,10 +21,52 @@ pub struct Nic {
     pub ep_in: u8,
     pub ep_out: u8,
     pub mps: u16,
+    /// The station MAC, read from the device's serial-number STRING descriptor.
+    ///
+    /// Not a register read: the LAN9514 publishes its MAC as twelve ASCII hex characters in a UTF-16
+    /// string descriptor, which is why the parse below steps FOUR bytes per output byte - two UTF-16
+    /// code units, each two bytes, per pair of hex digits.
+    pub mac: [u8; 6],
     /// Endpoint data toggles, per DIRECTION, for the device's lifetime - the level USB defines them
     /// at, learned three times over on the disk path.
     pub pid_in: u32,
     pub pid_out: u32,
+}
+
+fn hex_val(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
+        _ => 0,
+    }
+}
+
+/// Read the station MAC from string descriptor `idx`, as twelve ASCII hex characters.
+fn read_mac(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, idx: u8) -> [u8; 6] {
+    let mut mac = [0u8; 6];
+    if idx == 0 {
+        return mac;
+    }
+    // Length first: a string descriptor's length is its first byte, and asking for a fixed guess
+    // either truncates it or overruns the device's answer - the same rule the config descriptor needs.
+    let mut sd = [0u8; 40];
+    let head = [0x80, 0x06, idx, 0x03, 0x09, 0x04, 2, 0]; // wIndex = langid 0x0409 (en-US)
+    if !chan::control(ctx, mmio, dma, t, &head, &mut sd, true, 2) {
+        return mac;
+    }
+    let len = (sd[0] as usize).min(sd.len());
+    if len < 26 {
+        return mac; // too short to hold twelve hex characters as UTF-16
+    }
+    let full = [0x80, 0x06, idx, 0x03, 0x09, 0x04, len as u8, 0];
+    if !chan::control(ctx, mmio, dma, t, &full, &mut sd, true, len) {
+        return mac;
+    }
+    for b in 0..6 {
+        mac[b] = (hex_val(sd[2 + b * 4]) << 4) | hex_val(sd[2 + b * 4 + 2]);
+    }
+    mac
 }
 
 /// Find the bulk IN/OUT pair. No class filter: this device is vendor-specific.
@@ -112,9 +154,19 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
         return None;
     }
 
+    // iSerialNumber is byte 16 of the device descriptor, and on this part it carries the MAC.
+    let mut dev = [0u8; 18];
+    let getdev = [0x80, 0x06, 0, 0x01, 0, 0, 18, 0];
+    let mac = if chan::control(ctx, mmio, dma, t, &getdev, &mut dev, true, 18) {
+        read_mac(ctx, mmio, dma, t, dev[16])
+    } else {
+        [0u8; 6]
+    };
+
     ctx.log_fmt(format_args!(
-        "dwc2-svc: USB ETHERNET bound - bulk IN {} OUT {} mps {}", ep_in, ep_out, mps));
-    Some(Nic { ep_in, ep_out, mps, pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0 })
+        "dwc2-svc: USB ETHERNET bound - bulk IN {} OUT {} mps {} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        ep_in, ep_out, mps, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
+    Some(Nic { ep_in, ep_out, mps, mac, pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0 })
 }
 
 /// Where frames live in the DMA arena, clear of everything else.
@@ -234,3 +286,61 @@ fn bulk(
 /// are separate from each other: an abandoned transfer must not leave its state on a channel another
 /// stream inherits.
 pub const CH_NET: u32 = 2;
+
+// --- The frame IPC protocol -------------------------------------------------------------------
+//
+// **These opcodes must not collide with the BLOCK ones.** `dwc2` serves `block-driver` and
+// `nic-driver` on the SAME endpoint, and a shared opcode space with two independent protocols in it
+// is a bug waiting for the first person to add an op to either. Block uses 1..5; net starts at 0x10.
+pub const OP_NET_INFO: u8 = 0x10;
+pub const OP_NET_TX: u8 = 0x11;
+pub const OP_NET_RX: u8 = 0x12;
+
+/// Serve one frame request. Returns false if the message was not one.
+pub fn serve(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Nic,
+    msg: &godspeed_sdk::Message, reply: godspeed_sdk::CapHandle,
+) -> bool {
+    let p = msg.payload_bytes();
+    if p.is_empty() {
+        return false;
+    }
+    let mut out = [0u8; FRAME_MAX + 4];
+    let n = match p[0] {
+        OP_NET_INFO => {
+            // [ok, mac(6), link]. The link bit is reported as UP: this driver does not yet read the
+            // PHY, and saying so here rather than inventing a "down" keeps net-stack from concluding
+            // the cable is out. Reading it properly is the remaining piece of this slice.
+            out[0] = 1;
+            out[1..7].copy_from_slice(&nic.mac);
+            out[7] = 1;
+            8
+        }
+        OP_NET_TX if p.len() > 1 => {
+            out[0] = u8::from(tx(ctx, mmio, dma, t, nic, &p[1..]));
+            1
+        }
+        OP_NET_RX => {
+            // [n_lo, n_hi, frame...]. Zero length is "nothing received", which on a quiet network is
+            // the ordinary answer and not a failure.
+            let mut got = 0usize;
+            rx(ctx, mmio, dma, t, nic, |f| {
+                // ONE frame per reply: the protocol has no framing of its own, so a second frame in
+                // the same message would be indistinguishable from the first one's payload. The rest
+                // of the burst is dropped rather than mis-delivered, and the client polls again.
+                if got == 0 {
+                    let take = f.len().min(FRAME_MAX);
+                    out[2..2 + take].copy_from_slice(&f[..take]);
+                    got = take;
+                }
+            });
+            out[0] = (got & 0xFF) as u8;
+            out[1] = ((got >> 8) & 0xFF) as u8;
+            got + 2
+        }
+        _ => return false, // not a net op - the block server gets a look at it
+    };
+    let _ = ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n]));
+    ctx.remove_cap(reply);
+    true
+}

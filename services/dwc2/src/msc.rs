@@ -528,22 +528,13 @@ fn with_busy_retry(
 /// audit found in the GENET backend and fixed for the same reason.
 pub fn serve(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk,
-    msg: &godspeed_sdk::Message, sectors: u64, capless_logged: &mut bool,
+    msg: &godspeed_sdk::Message, sectors: u64, reply: godspeed_sdk::CapHandle,
+    capless_logged: &mut bool,
 ) -> bool {
     let p = msg.payload_bytes();
     if p.is_empty() {
         return false;
     }
-    let reply = match ctx.take_pending_cap() {
-        Some(c) => c,
-        None => {
-            if !*capless_logged {
-                *capless_logged = true;
-                ctx.log("dwc2-svc: block request had no reply cap - dropping (cannot answer without one)");
-            }
-            return true;
-        }
-    };
 
     let mut out = [0u8; 520];
     let n = match p[0] {

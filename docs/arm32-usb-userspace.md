@@ -739,3 +739,35 @@ Small, real, and deliberately not being chased mid-port. Collected here so they 
 - **`boot/pi4/config.txt` is not in the repo.** The Pi 2's is (`boot/pi2/config.txt`), so the v0.10.0
   release could ship a complete Pi 2 bundle and only a bare kernel image for the Pi 4. Capture the
   real file from a working card - do not reconstruct it from memory.
+
+## Slice 4b: the frame IPC protocol (nic-driver off the syscalls)
+
+`nic-driver` no longer calls the `NET_DEVICE` syscalls on arm32. It reaches the USB-Ethernet device
+through the same endpoint `block-driver` uses, with opcodes that start at `0x10` because ONE endpoint
+carries both protocols and block already owns `1..5`:
+
+| Op | Request | Reply |
+|----|---------|-------|
+| `0x10` OP_NET_INFO | `[0x10]` | `[ok, mac(6), link]` |
+| `0x11` OP_NET_TX | `[0x11, frame...]` | `[ok]` |
+| `0x12` OP_NET_RX | `[0x12]` | `[len_lo, len_hi, frame...]` (one frame per reply) |
+
+`dispatch()` in the dwc2 service takes the reply cap ONCE and routes by opcode, so neither server can
+take it twice or forget to, and a request that arrives without one is dropped loudly rather than
+leaving a blocked client to time out against a clean log. A net request with no NIC bound is ANSWERED
+with an empty reply, not ignored: the client is blocked waiting, and degrading it is the rule, hanging
+it is the violation.
+
+The `net_device` grant left arm32 in the same commit. The syscalls have nothing behind them there now,
+so keeping the capability would be authority the service cannot use.
+
+Known costs, recorded rather than hidden:
+
+- `nic-driver`'s `rx_one` polls up to `RX_TRIES` (8) times, and each poll is now a full IPC round trip
+  rather than a syscall. Bounded, but 8x the crossings per empty read. If this shows up in throughput
+  the answer is the same one slice 3c reached for the disk: let the SERVICE wait, and reply once.
+- `OP_NET_INFO` reports link UP unconditionally; the PHY is not read yet.
+
+QEMU (release, `--usbnet`): boots to `gsh>`, supervisor ready, `fs` serving, and with no `dwc2` service
+spawned `nic-driver` logs `no usb-net device - serving empty replies (net degrades, not hangs)` and
+keeps serving. The degraded path is therefore proven; the live path needs the service spawned.

@@ -51,6 +51,44 @@ const MSG_DRAIN_MAX: u32 = 256;
 /// between them.
 const REARM_MS: u64 = 1_000;
 
+/// Route one request to the block server or the frame server.
+///
+/// ONE endpoint carries both protocols, so the opcode decides. The reply cap is taken HERE, once, so
+/// neither server can take it twice or forget to - and a request with none is dropped loudly, because
+/// it cannot be answered and silence would leave the client to time out against a clean log.
+#[allow(clippy::too_many_arguments)]
+fn dispatch(
+    ctx: &ServiceContext, m: &godspeed_sdk::Mmio, d: &godspeed_sdk::Dma,
+    dt: &chan::Target, dk: &mut msc::Disk, nic: Option<&mut (net::Nic, chan::Target)>,
+    msg: &godspeed_sdk::Message, sectors: u64, capless: &mut bool,
+) -> bool {
+    let p = msg.payload_bytes();
+    if p.is_empty() {
+        return false;
+    }
+    let reply = match ctx.take_pending_cap() {
+        Some(c) => c,
+        None => {
+            if !*capless {
+                *capless = true;
+                ctx.log("dwc2-svc: request had no reply cap - dropping (cannot answer without one)");
+            }
+            return true;
+        }
+    };
+    if p[0] >= net::OP_NET_INFO {
+        if let Some((n, nt)) = nic {
+            return net::serve(ctx, m, d, nt, n, msg, reply);
+        }
+        // A net request with no NIC bound is answered, not ignored: the client is blocked waiting,
+        // and an empty reply degrades it where silence would hang it.
+        let _ = ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&[0u8]));
+        ctx.remove_cap(reply);
+        return true;
+    }
+    msc::serve(ctx, m, d, dt, dk, msg, sectors, reply, capless)
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // PREFIX `dwc2-svc:`, not `dwc2:`.
@@ -85,6 +123,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // keyboard it finds has to outlive that borrow.
     let mut kbd: Option<(hid::Keyboard, chan::Target, u32)> = None;
     let mut disk: Option<(msc::Disk, chan::Target, u64)> = None;
+    let mut nic: Option<(net::Nic, chan::Target)> = None;
     if let Some(m) = ctx.mmio() {
         if core::identify(&ctx, &m).is_some() {
             let ok = core::reset_and_host_mode(&ctx, &m);
@@ -173,7 +212,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                 // and guessing from "has two bulk endpoints" would
                                                 // also match the disk.
                                                 if let Some(n) = net::bind(&ctx, &m, &d, &dt) {
-                                                    let _ = n;
+                                                    nic = Some((n, dt));
                                                 }
                                             } else if let Some(mut dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 // Prove the bulk path the way the kernel driver does:
@@ -284,7 +323,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         ctx.log("dwc2-svc: block drain hit its bound - a sender is enqueuing as fast as we retire");
                         break;
                     }
-                    if msc::serve(&ctx, &m, &d, dt, dk, &msg, *sectors, &mut capless) {
+                    if dispatch(&ctx, &m, &d, dt, dk, nic.as_mut(), &msg, *sectors, &mut capless) {
                         served = served.wrapping_add(1);
                         served_this_pass += 1;
                     }
@@ -357,7 +396,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let t_sleep = ctx.read_tsc();
                 if let Some(msg) = ctx.recv_timeout(ctx.duration_cycles(period_ms)) {
                     if let Some((dk, dt, sectors)) = disk.as_mut() {
-                        if msc::serve(&ctx, &m, &d, dt, dk, &msg, *sectors, &mut capless) {
+                        if dispatch(&ctx, &m, &d, dt, dk, nic.as_mut(), &msg, *sectors, &mut capless) {
                             served = served.wrapping_add(1);
                         }
                     }
