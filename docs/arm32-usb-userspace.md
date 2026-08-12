@@ -148,7 +148,8 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 | **0** | One owner: gate the in-kernel driver's tick hooks on `route::registered_endpoint(USB_VECTOR).is_none()` - the same predicate the IRQ dispatch already uses | ✅ selfcheck 351/0, no panics, invisible on a normal boot. **Handover is ONE-WAY - see below** |
 | **1a** | Core bring-up: soft reset, host mode, FIFO sizing, root-port power + reset | ✅ **hardware-verified 2026-08-12** - `core bring-up OK`, `HPRT=0x0000100f connected=true enabled=true speed=high` |
 | **1b** | Channels + control transfers (`chan_program`, `chan_dma`, `ctrl_xfer`) | ✅ **hardware-verified 2026-08-12** - `DEVICE DESCRIPTOR len=18 type=0x01 usb=0x0200 mps0=64` |
-| **1c** | Enumeration + hub walk + split transactions | the same VID/PIDs the kernel driver reports |
+| **1c-i** | Address + identify the root device, hub descriptor | ✅ **hardware-verified 2026-08-12** - `0424:9514 class=0x09 ports=5` (the LAN9514's integrated hub) |
+| **1c-ii** | Downstream port walk + SPLIT TRANSACTIONS | the same VID/PIDs the kernel driver reports for the devices BEHIND the hub |
 | **2** | Keyboard: HID + `CONSOLE_PUSH` | Typing works from userspace. Second ON PURPOSE - it makes the machine usable for testing the rest |
 | **3** | Mass storage: BOT/SCSI; `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | `drives`, `ls`, `selfcheck` |
 | **4** | Networking: CDC-ECM + smsc95xx; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | DHCP, `ping` |
@@ -207,6 +208,24 @@ cached buffers have no counterpart here.
 rather than re-derived: the sequence, the register order, the odd-frame rule and the short-packet
 scratch-zeroing are all facts the board taught someone, and none of them is visible in a datasheet or
 detectable in QEMU.
+
+## Slice 1c (first half) result
+
+```
+dwc2-svc: root device addressed - VID:PID=0424:9514 class=0x09 mps0=64
+dwc2-svc: USB2 hub with 5 downstream ports
+dwc2-svc: ENUMERATION OK - 0424:9514 class=0x09 ports=5
+```
+
+Correct on every field. `0424:9514` is the LAN9514's integrated hub, `0x09` is the hub class, `mps0=64`
+is high speed, and 5 ports is right for this part - four external sockets plus one internal port for
+its own ethernet function.
+
+**The predicted value in the previous commit was wrong, and the code was right.** I had grepped a
+`downstream VID:PID` line out of a kernel log and read it as the root device: `0424:ec00` is the
+SMSC95xx ETHERNET function, which hangs off one of this hub's ports. Worth recording because the
+acceptance test was stated as "must match what the kernel driver reports", and a baseline taken from
+the wrong line would have condemned working code. Check WHICH device a reference value describes.
 
 ## What makes arm32 harder than the AArch64 port
 
