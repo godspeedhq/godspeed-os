@@ -92,6 +92,23 @@ Still unconfirmed and harmless: `observe` showed core 0 at 97% while the skeleto
 most likely the in-kernel driver polling a controller whose interrupt has been taken away. Worth a
 glance during Phase 3, when that driver stops existing.
 
+## `spawn dwc2` is one-way: reboot to get USB back
+
+`kill dwc2` releases the route and unmasks the line, and the keyboard still does not come back.
+Handing back the INTERRUPT does not hand back DEVICE STATE: while the service held the vector, the
+keyboard's transfer completions were delivered to a driver that ignores them, so the in-kernel
+driver's channel sits mid-transfer waiting on an event it never saw resolve, and the periodic hooks
+resume polling a channel that is already stuck.
+
+Calling the driver's own `init()` on the ownership edge was tried and **removed**. It never fired -
+it sat in `wait_for_interrupt`, and core 0 does not reach idle in that window. Making it fire needs
+somewhere that reliably runs plus a ~600 ms bring-up that cannot happen in a tick handler: real work,
+on a recovery path for a driver Slice 5 deletes.
+
+**So: reboot between experiments.** Twenty seconds, no code, and the serial console keeps the machine
+usable throughout - the shell, `selfcheck` and the logs all work with USB down, which is what makes
+Slices 1 to 4 testable at all.
+
 ## Phase 3 slicing
 
 ### What the code actually looks like
@@ -128,7 +145,7 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 
 | # | Work | Test |
 |---|---|---|
-| **0** | One owner: gate the in-kernel driver's tick hooks on `route::registered_endpoint(USB_VECTOR).is_none()` - the same predicate the IRQ dispatch already uses | `spawn dwc2` quiets the kernel driver; `kill dwc2` hands it back. Unchanged when no service runs |
+| **0** | One owner: gate the in-kernel driver's tick hooks on `route::registered_endpoint(USB_VECTOR).is_none()` - the same predicate the IRQ dispatch already uses | ✅ selfcheck 351/0, no panics, invisible on a normal boot. **Handover is ONE-WAY - see below** |
 | **1** | Port + enumerate: reset, port bring-up, control transfers, hub walk. Logs the device tree and stops | Reports the same VID/PIDs the kernel driver found. USB devices do not work; serial carries the session |
 | **2** | Keyboard: HID + `CONSOLE_PUSH` | Typing works from userspace. Second ON PURPOSE - it makes the machine usable for testing the rest |
 | **3** | Mass storage: BOT/SCSI; `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | `drives`, `ls`, `selfcheck` |
