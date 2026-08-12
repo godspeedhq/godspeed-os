@@ -697,6 +697,13 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
         return complete_from_list(ctx, line, seg_start, TARGETS);
     }
 
+    // `chaos max-carnage <target> <rounds> <tab>`: complete the optional confirm-skip word. Per
+    // utilities/0_conventions.md 5, a subcommand that does not complete is one the operator has to
+    // already know about - which is what makes typing words as cheap as flags.
+    if "chaos".as_bytes() == cmd && prior == 3 && words.clone().next() == Some("max-carnage".as_bytes()) {
+        return complete_from_list(ctx, line, tok_start, &["yes"]);
+    }
+
     // `kill <svc>[,svc,...]`: complete a service name plus the `all-services` keyword. kill takes a
     // comma-separated list, so complete the segment after the LAST comma (like chaos max-carnage) - so
     // `ehci,xh<tab>` finishes `ehci,xhci` while the earlier listed targets are preserved verbatim.
@@ -4029,7 +4036,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("chaos flood-storm <svc> [rounds]", "saturate a service's IPC queue with try_send; verify it drains + stays alive (the other axis: 'overwhelmed', not 'gone')", "chaos flood-storm fs 5"),
             ("chaos mem-pressure [rounds]", "spawn a mem-pressure that allocs to its limit, kill it, confirm the memory is reclaimed (alloc-to-limit + no leak, S7)", "chaos mem-pressure 5"),
             ("chaos spawn-storm [count]", "spawn mem-pressure tasks until the task-pool/memory ceiling REFUSES one (loud Err, no panic), then kill all + confirm full reclaim", "chaos spawn-storm"),
-            ("chaos max-carnage <all-services|svc|svc,svc> <n>", "the chaos monkey: 'all-services' = RANDOM carnage over the whole restartable set each round (supervisor a normal victim, nothing protected-last); or aim at one / a comma-list. A TARGET AND A ROUNDS COUNT ARE REQUIRED - there is no uncapped default (a firehose is a big N; q aborts early). Under system-wide mem-pressure + spawn-storm; proves the system RECOVERS from any kill order. 'q' aborts (via SERIAL if it storms the USB keyboard drivers)", "chaos max-carnage all-services 5000"),
+            ("chaos max-carnage <all-services|svc|svc,svc> <n> [yes]", "the chaos monkey: 'all-services' = RANDOM carnage over the whole restartable set each round (supervisor a normal victim, nothing protected-last); or aim at one / a comma-list. A TARGET AND A ROUNDS COUNT ARE REQUIRED - there is no uncapped default (a firehose is a big N; q aborts early). Under system-wide mem-pressure + spawn-storm; proves the system RECOVERS from any kill order. 'q' aborts (via SERIAL if it storms the USB keyboard drivers)", "chaos max-carnage all-services 5000"),
             ("chaos link-flap [n]", "networking-specific: simulate a cable unplug/replug n times (a report override, no hardware touch); net-stack notices the loss and self-configures on the up edge. tests LINK recovery, not process death. 'q' aborts", "chaos link-flap 3"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
@@ -7264,6 +7271,7 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
                 ctx.console_writeln("  <service>      aim every round at one service (e.g. fs, logger)");
                 ctx.console_writeln("  svc,svc,...    a comma-separated list: kill EVERY listed service each round (cascade stress)");
                 ctx.console_writeln("  <rounds>       REQUIRED for every form - the run is bounded (a firehose is a big N; q aborts early)");
+                ctx.console_writeln("  yes            optional 4th word: skip the [y/N] confirm (the warning still prints)");
                 ctx.console_writeln("  all run system-wide mem-pressure + spawn-storm. 'q' aborts (SERIAL if the run kills the kbd).");
                 ctx.console_writeln("  e.g. chaos max-carnage all-services 5000 | chaos max-carnage fs 50 | chaos max-carnage fs,logger 100");
                 Ok(())
@@ -7278,6 +7286,8 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
                     ctx.console_writeln("  e.g. chaos max-carnage all-services 5000   (the firehose - a big N; q aborts early)");
                     ctx.console_writeln("       chaos max-carnage fs 50");
                     ctx.console_writeln("       chaos max-carnage fs,logger 100");
+                    ctx.console_writeln("  add 'yes' as a 4th word to skip the confirm (unattended runs):");
+                    ctx.console_writeln("       chaos max-carnage all-services 100 yes");
                     return Ok(());
                 }
                 // Validate the target(s) before launching (a bad name would storm nothing), loudly (invariant 12).
@@ -7300,7 +7310,11 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
                     ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
                     return Ok(());
                 }
-                chaos_launch(ctx, target, rounds)
+                // An optional 4th word skips the confirm: `chaos max-carnage all-services 100 yes`.
+                // A WORD, not `-y` - utilities/0_conventions.md 4: "Subcommands are words, never
+                // single-letter flags", so that a word means the same thing across every utility.
+                let preconfirmed = ntok >= 4 && tok[3] == "yes";
+                chaos_launch(ctx, target, rounds, preconfirmed)
             }
         }
         "link-flap"    => chaos_link_flap(ctx, &tok, ntok),
@@ -7408,7 +7422,15 @@ recovery for real.");
 /// primitive, syscall 40), runs the storm with the SHELL itself a target now, and on `q` hands the
 /// keyboard back + self-terminates. The shell goes "muted" (see the main loop) for the duration. Kill
 /// any prior instance first - one-shot, no graceful self-exit race - exactly like `observe now`.
-fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), ShellError> {
+fn chaos_launch(
+    ctx: &ServiceContext,
+    target: &str,
+    rounds: u32,
+    // `yes` given on the command line: the operator has already made the decision, so ASK nothing.
+    // The warning still prints in full - it is the reason the confirm existed, and an unattended run
+    // is exactly when the log needs to say what was about to happen.
+    preconfirmed: bool,
+) -> Result<(), ShellError> {
     // Loud pre-flight warning + confirm, TAILORED to the target in three cases. all-services storms EVERY
     // driver, so the keyboard dies for sure (serial only). A single USB host driver (xhci/ehci) kills the
     // keyboard ONLY if it is the controller yours is on - we cannot know which, so we state the proviso.
@@ -7439,12 +7461,19 @@ fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), S
     }
     ctx.console_writeln("");
     ctx.console_writeln("=====================================================");
-    ctx.console_write(" Start maximum carnage? [y/N]: ");
-    // Line-edited confirm (read_confirm): the operator can BACKSPACE a typo before Enter, and the
-    // decision is the FINAL line - a mistyped `y` corrected to `n` cancels, not proceeds.
-    if !read_confirm(ctx) {
-        ctx.console_writeln("max-carnage: cancelled.");
-        return Ok(());
+    if preconfirmed {
+        // Say that the confirm was WAIVED rather than silently skipping it. A log that looks like a
+        // prompt was answered when nobody was there is the kind of quiet ambiguity invariant 12 is
+        // about - and this is the line that explains, later, why a destructive run started unattended.
+        ctx.console_writeln(" Start maximum carnage? [y/N]: yes (given on the command line)");
+    } else {
+        ctx.console_write(" Start maximum carnage? [y/N]: ");
+        // Line-edited confirm (read_confirm): the operator can BACKSPACE a typo before Enter, and the
+        // decision is the FINAL line - a mistyped `y` corrected to `n` cancels, not proceeds.
+        if !read_confirm(ctx) {
+            ctx.console_writeln("max-carnage: cancelled.");
+            return Ok(());
+        }
     }
     let _ = ctx.kill("chaos");
     if ctx.spawn("chaos").is_err() {

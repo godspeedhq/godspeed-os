@@ -25,7 +25,7 @@ identity tests; `chaos` lets an operator reproduce the *between* cases live on r
 | `chaos kill-storm <svc> [rounds]` | Kill one `<svc>` `rounds` times; verify it recovers each round (default 20). |
 | `chaos kill-storm <svc> [n] save <path>` | Same, and also write the report to a file at the end. |
 | `chaos flood-storm <svc> [rounds]` | **Saturate** `<svc>`'s IPC queue with a `try_send` burst until `QueueFull`, then verify it drains and stays alive. The *other* axis: "overwhelmed", not "gone". |
-| `chaos max-carnage [rounds]` | **The chaos monkey:** each round, kill **OR flood** a *random* live service (everything but the shell), rolling a creative mix (kill / flood / flood-then-kill / kill-then-flood). Runs exactly the count you type; a live progress line ticks `%`/ETA; `q` aborts. |
+| `chaos max-carnage <target> <rounds> [yes]` | **The chaos monkey:** each round, kill **OR flood** a *random* live service (everything but the shell), rolling a creative mix (kill / flood / flood-then-kill / kill-then-flood). Runs exactly the count you type; a live progress line ticks `%`/ETA; `q` aborts. A `[y/N]` confirm precedes the run; a 4th word **`yes`** skips it for unattended runs, and the warning still prints in full. |
 | `chaos help` / `chaos version` | Self-documentation (`0_conventions.md`). |
 
 `kill-storm` clamps `rounds` to `1..=100` (`CHAOS_MAX_ROUNDS`, §26.6) - it stores per-round generation
