@@ -150,7 +150,7 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 | **1b** | Channels + control transfers (`chan_program`, `chan_dma`, `ctrl_xfer`) | ✅ **hardware-verified 2026-08-12** - `DEVICE DESCRIPTOR len=18 type=0x01 usb=0x0200 mps0=64` |
 | **1c-i** | Address + identify the root device, hub descriptor | ✅ **hardware-verified 2026-08-12** - `0424:9514 class=0x09 ports=5` (the LAN9514's integrated hub) |
 | **1c-ii** | Hub port survey (power, status, speed) | ✅ **hardware-verified 2026-08-12** - 4 attached, status words byte-for-byte identical to the kernel driver's |
-| **1c-iii** | Address devices behind the hub | ✅ **DIRECT devices 3/3 exact** (`0424:ec00`, `0781:5567`, `0bda:8176`). Split single-packet works; MULTI-PACKET split IN returns zeros - see below |
+| **1c-iii** | Address devices behind the hub, direct and via split | ✅ **COMPLETE 2026-08-12 - 4/4 exact match with the in-kernel driver** |
 | **2** | Keyboard: HID + `CONSOLE_PUSH` | Typing works from userspace. Second ON PURPOSE - it makes the machine usable for testing the rest |
 | **3** | Mass storage: BOT/SCSI; `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | `drives`, `ls`, `selfcheck` |
 | **4** | Networking: CDC-ECM + smsc95xx; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | DHCP, `ping` |
@@ -258,7 +258,37 @@ that, the survey would have reported whatever the previous transfer left in the 
 topology assembled from stale bytes, which is worse than an obviously wrong one because it would have
 been believed. That defence was written three slices earlier for exactly this shape of bug.
 
-## Slice 1c-iii result
+## SLICE 1 COMPLETE
+
+```
+port 1 DEVICE direct    - VID:PID=0424:ec00 class=0xff speed=high addr=2   SMSC ethernet
+port 2 DEVICE direct    - VID:PID=0781:5567 class=0x00 speed=high addr=3   SanDisk stick
+port 3 DEVICE direct    - VID:PID=0bda:8176 class=0x00 speed=high addr=4   Realtek
+port 4 DEVICE via split - VID:PID=046d:c30a class=0x00 speed=low  addr=5   Logitech keyboard
+```
+
+**Four of four, matching the in-kernel driver exactly.** A userspace service now resets the DWC2,
+brings up the root port, runs control transfers, enumerates and configures the hub, surveys and
+resets its ports, assigns addresses, and reads full device descriptors - three devices directly and
+one through a transaction translator. Zero `unsafe` in `services/dwc2/`, and no cache maintenance,
+both because of what the grant is rather than by working around anything.
+
+### The four bugs, and what found each
+
+| Bug | Found by |
+|---|---|
+| Splits sent to HIGH-speed devices (speed bits are invalid until a port RESET) | trying all four ports instead of stopping at the first failure - four devices do not fail identically |
+| No `SET_CONFIGURATION` - hub answered class requests with zeros | zeroed IN scratch: an obviously-empty topology instead of a plausible one |
+| Only 8 bytes read, VID lives at 8..11 | zeroed IN scratch again, plus a CORRECT class byte at offset 4 proving the transfer worked |
+| No addresses assigned - two devices answering at address 0 | the ORDERING: ports 2-3 failed only AFTER port 1 succeeded |
+| Multi-packet split not sequenced per packet | reading the kernel driver, whose comment describes this exact symptom on this exact board |
+
+Three of those were caught by one decision made three slices earlier - zeroing the IN scratch before
+every read - which turned "plausible data assembled from stale bytes" into "obvious zeros" every
+time. The defence was written for a hub port-status short read; it paid for itself on three unrelated
+bugs.
+
+## Superseded: slice 1c-iii in progress
 
 ```
 port 1 DEVICE direct    - VID:PID=0424:ec00 class=0xff speed=high addr=2
