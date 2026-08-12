@@ -25,6 +25,8 @@ pub const CLASS_HUB: u8 = 0x09;
 
 /// What enumeration found on the root port.
 pub struct RootDevice {
+    /// The addressed device, so the caller can keep talking to it (the hub port survey does).
+    pub target: Target,
     pub vid: u16,
     pub pid: u16,
     pub class: u8,
@@ -121,5 +123,5 @@ pub fn root_device(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> Option<RootD
         None
     };
 
-    Some(RootDevice { vid, pid, class, mps0, hub_ports })
+    Some(RootDevice { target: t, vid, pid, class, mps0, hub_ports })
 }

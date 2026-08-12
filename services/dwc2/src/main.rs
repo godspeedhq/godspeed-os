@@ -23,6 +23,7 @@
 mod chan;
 mod core;
 mod enumerate;
+mod hub;
 mod regs;
 
 use godspeed_sdk::ServiceContext;
@@ -107,10 +108,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // hub" would hide.
             if let Some(d) = ctx.dma_region() {
                 match enumerate::root_device(&ctx, &m, &d) {
-                    Some(dev) => ctx.log_fmt(format_args!(
-                        "dwc2-svc: ENUMERATION OK - {:04x}:{:04x} class={:#04x} ports={}",
-                        dev.vid, dev.pid, dev.class,
-                        match dev.hub_ports { Some(n) => n, None => 0 })),
+                    Some(dev) => {
+                        ctx.log_fmt(format_args!(
+                            "dwc2-svc: ENUMERATION OK - {:04x}:{:04x} class={:#04x} ports={}",
+                            dev.vid, dev.pid, dev.class,
+                            match dev.hub_ports { Some(n) => n, None => 0 }));
+                        // SLICE 1c-ii: survey the hub's downstream ports.
+                        //
+                        // Every request here is addressed to the HUB, which is direct - so this
+                        // still needs no split transactions. What it produces is the map that says
+                        // WHERE splits will be needed, which is the last piece of Slice 1.
+                        if let Some(n) = dev.hub_ports {
+                            hub::survey(&ctx, &m, &d, &dev.target, n);
+                        }
+                    }
                     None => ctx.log("dwc2-svc: enumeration FAILED - see the step above"),
                 }
             }
