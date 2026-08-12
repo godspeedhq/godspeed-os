@@ -450,6 +450,33 @@ pub fn write_block(
     bot(ctx, mmio, dma, t, disk, &cdb, false, block as usize).is_some()
 }
 
+/// Retry a BOT command that handed back BUSY, bounded by the CLOCK.
+///
+/// **The service must absorb busy, because the protocol has no way to report it.** `block-driver`'s
+/// `dev_write` can only answer 0 or -1, so a busy hand-back arrives at `fs` as a hard I/O error and
+/// its own `with_busy_retry` never fires - the syscall path could signal busy, the IPC path cannot.
+/// Writes are exactly where this stick is slow, which is why all four `selfcheck` failures were
+/// writes while every read passed.
+///
+/// A REAL failure recovers in between (`stage_failed` runs the reset), so retrying costs nothing when
+/// the device is genuinely wedged and buys everything when it is merely occupied. Bounded by time
+/// rather than attempts, because an attempt count measures loop speed and this board has already
+/// taught that lesson seven times.
+fn with_busy_retry(
+    ctx: &ServiceContext, budget_ms: u64, mut attempt: impl FnMut() -> bool,
+) -> bool {
+    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(budget_ms));
+    loop {
+        if attempt() {
+            return true;
+        }
+        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+            return false;
+        }
+        ctx.sleep(ctx.duration_cycles(5));
+    }
+}
+
 /// Serve one block request. Returns false if the message was not one.
 ///
 /// The reply cap is the ONLY authority to answer (§8.5), and a request without one cannot be
@@ -483,7 +510,10 @@ pub fn serve(
         }
         OP_READ_BLOCK if p.len() >= 9 => {
             let lba = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]) as u32;
-            if read_block(ctx, mmio, dma, t, disk, lba, 512) {
+            // 30 s, matching what `fs` already waits for a block: this stick has been seen BUSY for
+            // 45 s under load, and giving up sooner than the client does turns a slow device into a
+            // reported I/O error.
+            if with_busy_retry(ctx, 30_000, || read_block(ctx, mmio, dma, t, disk, lba, 512)) {
                 out[0] = STATUS_OK;
                 for i in 0..512 {
                     out[1 + i] = dma.read8(DATA_OFF + i);
@@ -503,7 +533,11 @@ pub fn serve(
                 dma.write8(DATA_OFF + i, p[9 + i]);
             }
             let lba = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]) as u32;
-            out[0] = if write_block(ctx, mmio, dma, t, disk, lba, 512) { STATUS_OK } else { STATUS_ERR };
+            out[0] = if with_busy_retry(ctx, 30_000, || write_block(ctx, mmio, dma, t, disk, lba, 512)) {
+                STATUS_OK
+            } else {
+                STATUS_ERR
+            };
             1
         }
         OP_FLUSH => {
