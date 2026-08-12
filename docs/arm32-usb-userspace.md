@@ -151,7 +151,8 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 | **1c-i** | Address + identify the root device, hub descriptor | ✅ **hardware-verified 2026-08-12** - `0424:9514 class=0x09 ports=5` (the LAN9514's integrated hub) |
 | **1c-ii** | Hub port survey (power, status, speed) | ✅ **hardware-verified 2026-08-12** - 4 attached, status words byte-for-byte identical to the kernel driver's |
 | **1c-iii** | Address devices behind the hub, direct and via split | ✅ **COMPLETE 2026-08-12 - 4/4 exact match with the in-kernel driver** |
-| **2** | Keyboard: HID + `CONSOLE_PUSH` | Typing works from userspace. Second ON PURPOSE - it makes the machine usable for testing the rest |
+| **2a** | Find + bind a boot keyboard (config walk, SET_CONFIGURATION, SET_PROTOCOL) | ✅ **hardware-verified 2026-08-12** - `interface 0 endpoint 1 mps 8 interval 10`, matching the kernel driver |
+| **2b** | POLL the interrupt endpoint via a PERIODIC split, push to `CONSOLE_PUSH` | typing works from userspace |
 | **3** | Mass storage: BOT/SCSI; `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | `drives`, `ls`, `selfcheck` |
 | **4** | Networking: CDC-ECM + smsc95xx; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | DHCP, `ping` |
 | **5** | Delete `arch/arm/dwc2.rs`, the six syscalls, the tick hooks | `chaos max-carnage` + `selfcheck`. THEN amend §6.4 |
@@ -257,6 +258,34 @@ It was findable in one boot only because slice 1b zeroes the IN scratch before e
 that, the survey would have reported whatever the previous transfer left in the buffer: a plausible
 topology assembled from stale bytes, which is worse than an obviously wrong one because it would have
 been believed. That defence was written three slices earlier for exactly this shape of bug.
+
+## Slice 2a result
+
+```
+dwc2-svc: BOOT KEYBOARD bound - interface 0 endpoint 1 mps 8 interval 10
+```
+
+Matches the in-kernel driver's own binding (`mps=8 interval=10`). Ports 1-3 are silent, correctly -
+they are not keyboards, which is an ordinary outcome and not a failure.
+
+### What 2b has to face, and what is now known about it
+
+`interval 10` is the number the periodic scheduling needs, and it is now measured rather than
+assumed. What remains is the ONE risk this port has carried from the start:
+
+- a PERIODIC split is microframe-scheduled - `split_txn_periodic`, `wait_for_uframe`, `write_hfnum` -
+  where the non-periodic split used for enumeration merely SWEEPS microframes across retries and is
+  therefore tolerant of bad timing;
+- that code moves from ring 0 with interrupts masked into a PREEMPTIBLE userspace task, and a
+  preemption in the wrong microframe does not fail cleanly. It transfers nothing.
+
+Everything underneath it is now proven: the controller, the channels, control transfers direct and
+split, enumeration, addressing, the hub, and the keyboard's own binding. So when 2b misbehaves it
+will misbehave for one reason, which is the whole point of having got here in slices.
+
+**Read `split_txn_periodic` before writing it.** That has been the cheapest move five times in this
+port - most recently the multi-packet split, where the answer was in a comment written by someone who
+had already paid for the same symptom on the same board.
 
 ## SLICE 1 COMPLETE
 
