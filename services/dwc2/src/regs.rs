@@ -80,3 +80,19 @@ pub(crate) const HPRT_PRTSPD_SHIFT: u32 = 17;    // port speed (0=HS, 1=FS, 2=LS
 pub(crate) const HPRT_PRTSPD_MASK:  u32 = 0b11 << HPRT_PRTSPD_SHIFT;
 pub(crate) const HPRT_WC_BITS: u32 = HPRT_PRTCONNDET | HPRT_PRTENCHNG | HPRT_PRTOVRCHNG;
 pub(crate) const HPRT_RMW_CLEAR: u32 = HPRT_WC_BITS | HPRT_PRTENA;
+
+// --- Per-channel interrupt status (HCINT) ---
+// HCTSIZ PIDs
+pub(crate) const PID_DATA0: u32 = 0;
+pub(crate) const PID_DATA1: u32 = 2;
+pub(crate) const PID_SETUP: u32 = 3;
+// HCINT bits
+pub(crate) const HCINT_XFERCOMPL: u32 = 1 << 0;
+pub(crate) const HCINT_NAK: u32 = 1 << 4;   // the device positively answered "nothing new"
+pub(crate) const HCINT_CHHLTD:    u32 = 1 << 1;
+pub(crate) const HCINT_STALL:     u32 = 1 << 3;   // the endpoint is halted - a HARD failure, never retried
+pub(crate) const HCINT_NYET:      u32 = 1 << 6;   // split: the TT has not finished yet - retry the CSPLIT
+pub(crate) const HCINT_XACTERR:   u32 = 1 << 7;   // a real transaction error (CRC, timeout, bit-stuff, toggle)
+/// How many genuine TRANSACTION errors a transfer tolerates before it fails. Matches Linux, which
+/// fails a QTD at `error_count >= 3` in `dwc2_release_channel`.
+pub(crate) const XACT_ERR_MAX: u32 = 3;

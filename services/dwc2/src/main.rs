@@ -20,6 +20,7 @@
 #![no_std]
 #![no_main]
 
+mod chan;
 mod core;
 mod regs;
 
@@ -86,6 +87,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     hprt & regs::HPRT_PRTENA != 0,
                     core::speed_name(hprt))),
                 None => ctx.log("dwc2-svc: root port bring-up FAILED - no device will enumerate"),
+            }
+            // SLICE 1b: ask the attached device who it is.
+            //
+            // A device descriptor read is the smallest thing that exercises the whole transfer path -
+            // channel programming, a DMA the controller performs against OUR granted arena, the bus
+            // alias translation, and all three control stages. If the VID/PID come back matching what
+            // the kernel driver reports, every one of those is right; if they do not, the failing
+            // stage has already named itself.
+            //
+            // Address 0, MPS 8: the mandatory state of a just-reset device before SET_ADDRESS. 8 is
+            // the safe minimum every device must accept for its first descriptor read.
+            if let Some(d) = ctx.dma_region() {
+                let t = chan::Target { addr: 0, mps: 8, low_speed: false };
+                let mut buf = [0u8; 18];
+                if chan::get_descriptor(&ctx, &m, &d, &t, 0x01, 0, &mut buf, 8) {
+                    ctx.log_fmt(format_args!(
+                        "dwc2-svc: DEVICE DESCRIPTOR len={} type={:#04x} usb={:#06x} mps0={}",
+                        buf[0], buf[1], u16::from_le_bytes([buf[2], buf[3]]), buf[7]));
+                } else {
+                    ctx.log("dwc2-svc: device descriptor read FAILED - see the stage above");
+                }
             }
         }
     }
