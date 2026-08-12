@@ -51,6 +51,8 @@ pub struct Nic {
     /// Endpoint data toggles, per DIRECTION, for the device's lifetime - the level USB defines them
     /// at, learned three times over on the disk path.
     pub stats: Stats,
+    /// Is a bulk-IN currently armed on CH_NET, waiting for the device to have a frame?
+    pub in_armed: bool,
     pub pid_in: u32,
     pub pid_out: u32,
 }
@@ -181,7 +183,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
     ctx.log_fmt(format_args!(
         "dwc2-svc: smsc95xx (LAN9514) UP - bulk IN {} OUT {} mps {} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         ep_in, ep_out, mps, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
-    Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(),
+    Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(), in_armed: false,
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0 })
 }
 
@@ -463,20 +465,47 @@ pub fn rx(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Nic,
     mut deliver: impl FnMut(&[u8]),
 ) -> u32 {
-    let mut why = (0u32, 0u32);
-    let got = match bulk(ctx, mmio, t, nic.mps, true, nic.ep_in, dma.phys_at(RX_OFF) as u32,
-                         RX_BURST as u32, 50, &mut nic.pid_in, Some(&mut why)) {
-        Some(n) => n as usize,
-        None => {
-            nic.stats.rx_hcint = why.0;
-            nic.stats.rx_nohalt = nic.stats.rx_nohalt.wrapping_add(why.1);
-            return 0; // NAK on a quiet network is the normal case, not an error
-        }
-    };
-    if got > 0 {
-        nic.stats.rx_bursts += 1;
-        nic.stats.rx_bytes = nic.stats.rx_bytes.wrapping_add(got as u32);
+    // ARM THE IN AND LEAVE IT ARMED.
+    //
+    // This is the whole bug, and the comment on SMSC_HW_CFG_BIR describes it exactly: with BIR set an
+    // empty bulk-IN is NAKed, the DWC2 core retries the NAK IN HARDWARE, and the channel does not halt.
+    // An idle device is therefore SILENT by design - not broken, not erroring, just waiting.
+    //
+    // The previous shape programmed the channel, waited 50 ms for a halt that only comes when a frame
+    // actually arrives, gave up, and reprogrammed from scratch on the next call. It restarted the wait
+    // 650 times and never once left an IN armed across the moment a frame turned up. The counters said
+    // it plainly: HCINT 0x00000000, nohalt 650, rx 0.
+    //
+    // So arm once and CHECK, never re-arm a transfer that is still legitimately pending. This is the
+    // kernel driver's background-armed IN, in the shape this service can use: a non-blocking poll per
+    // pass instead of an interrupt, because the frame path here is driven by the serve loop.
+    if !nic.in_armed {
+        chan::program(mmio, &Target { addr: t.addr, mps: nic.mps, low_speed: false }, CH_NET,
+                      true, nic.pid_in, RX_BURST as u32, dma.phys_at(RX_OFF) as u32,
+                      nic.ep_in as u32, 2, 0);
+        nic.in_armed = true;
+        return 0;   // nothing yet - the device answers when it has something
     }
+    let hcint = mmio.read32(chan::hcint_at(CH_NET));
+    if hcint & crate::regs::HCINT_XFERCOMPL == 0 {
+        if hcint & (crate::regs::HCINT_STALL | crate::regs::HCINT_CHHLTD) != 0 {
+            // Halted for a reason that is NOT completion: the transfer is over and dead, so re-arm on
+            // the next pass rather than waiting forever on a channel that will never complete.
+            nic.stats.rx_hcint = hcint;
+            nic.in_armed = false;
+        } else {
+            nic.stats.rx_nohalt = nic.stats.rx_nohalt.wrapping_add(1);
+        }
+        return 0;
+    }
+    let left = mmio.read32(chan::hctsiz_at(CH_NET)) & 0x7_FFFF;
+    nic.pid_in = chan::pid_from_hctsiz(mmio, CH_NET);
+    nic.stats.rx_hcint = hcint;
+    nic.in_armed = false;                 // consumed - the next pass arms a fresh one
+    let got = (RX_BURST as u32).saturating_sub(left) as usize;
+    if got == 0 { return 0; }
+    nic.stats.rx_bursts += 1;
+    nic.stats.rx_bytes = nic.stats.rx_bytes.wrapping_add(got as u32);
 
     // A burst is [4-byte RX status][frame incl FCS][DWORD pad], REPEATED - one transfer can carry
     // several frames, so this is a parse rather than a copy.
