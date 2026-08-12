@@ -200,7 +200,7 @@ fn wait_for_uframe(ctx: &ServiceContext, mmio: &Mmio, target: u32) {
 /// genuinely risky part of moving this driver out of ring 0 - it is needed only for the keyboard's
 /// interrupt endpoint, so it belongs to Slice 2, faced on its own.
 #[allow(clippy::too_many_arguments)]
-fn stage_split(
+fn stage_split_one(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target,
     ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, splt: u32, what: &str,
 ) -> bool {
@@ -273,6 +273,46 @@ fn stage_split(
     }
     ctx.log_fmt(format_args!("dwc2-svc: {} split gave up after {} start-splits", what, SS_TRIES));
     false
+}
+
+/// A split transfer of any length: ONE low/full-speed packet per split transaction.
+///
+/// **The DWC2 does not auto-continue a multi-packet split in buffer-DMA mode.** It halts with
+/// XferCompl after the FIRST packet, so software must sequence each mps-sized packet itself,
+/// advancing the buffer and toggling the data PID. The kernel driver says so in a comment that
+/// describes this exact failure, already diagnosed on this board:
+///
+///   "HW-proven (Pi 2 / LAN9514): an 18-byte device descriptor read whole came back as 8 correct
+///    bytes + 10 stale, because only packet 1 was ever retrieved."
+///
+/// Which is precisely what happened here - `VID:PID=0000:0000` from an 18-byte read at MPS 8, with
+/// the first packet correct. It read as ZEROS rather than stale bytes only because the IN scratch is
+/// zeroed before every transfer, and VID lives at bytes 8..11, in the part that was never fetched.
+///
+/// A single-packet transfer is one iteration; a zero-length STATUS stage is one iteration with a
+/// chunk of 0, which is why the loop tests `off >= len` AFTER advancing rather than before.
+#[allow(clippy::too_many_arguments)]
+fn stage_split(
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, splt: u32, what: &str,
+) -> bool {
+    let mps = (t.mps as u32).max(1);
+    let mut off = 0u32;
+    let mut cur_pid = pid;
+    loop {
+        let chunk = (len - off).min(mps);
+        if !stage_split_one(ctx, mmio, t, ch, dir_in, cur_pid, buf_phys + off, chunk, splt, what) {
+            return false;
+        }
+        off += chunk;
+        // Done when the whole length is moved, or when a SHORT packet ended the transfer early - a
+        // device answering with less than it was asked for is a complete answer, not a truncated one.
+        if off >= len || chunk < mps {
+            return true;
+        }
+        // Control/bulk data toggle: every packet after the first flips DATA1 <-> DATA0.
+        cur_pid = if cur_pid == PID_DATA1 { PID_DATA0 } else { PID_DATA1 };
+    }
 }
 
 /// A full USB control transfer: SETUP, optional DATA, STATUS.
