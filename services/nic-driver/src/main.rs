@@ -572,9 +572,20 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     // Opcodes start at 0x10 because `dwc2` serves the BLOCK protocol on the same endpoint and block
     // uses 1..5. One endpoint, two protocols, one opcode space - a collision here would route a frame
     // to the disk.
+    // ONE request to `dwc2`, with a single reacquire-and-retry. `find_send_slot` does NOT resolve a
+    // name - it reads the spawn-time wiring and a cache - so a peer spawned AFTER us is unreachable
+    // forever unless we reacquire. `dwc2` is exactly that peer (it is spawned by hand today), and the
+    // failure is silent from here: `request_with_reply` returns None INSTANTLY, which reads as a dead
+    // cable rather than a missing cap. block-driver learned this in slice 3c; this is the same edge.
+    #[cfg(target_arch = "arm")]
+    let dwc2_rpc = |ctx: &ServiceContext, msg: &Message| -> Option<Message> {
+        if let Some(r) = ctx.request_with_reply("dwc2", msg) { return Some(r); }
+        let _ = ctx.reacquire_by_name("dwc2");
+        ctx.request_with_reply("dwc2", msg)
+    };
     #[cfg(target_arch = "arm")]
     let dev_info = |ctx: &ServiceContext, out: &mut [u8; 7]| -> bool {
-        match ctx.request_with_reply("dwc2", &Message::from_bytes(&[0x10])) {
+        match dwc2_rpc(ctx, &Message::from_bytes(&[0x10])) {
             Some(r) => {
                 let p = r.payload_bytes();
                 if p.len() < 8 || p[0] == 0 { return false; }
@@ -591,14 +602,14 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         let n = frame.len().min(1514);
         req[0] = 0x11;
         req[1..1 + n].copy_from_slice(&frame[..n]);
-        match ctx.request_with_reply("dwc2", &Message::from_bytes(&req[..1 + n])) {
+        match dwc2_rpc(ctx, &Message::from_bytes(&req[..1 + n])) {
             Some(r) => { let p = r.payload_bytes(); !p.is_empty() && p[0] != 0 }
             None => false,
         }
     };
     #[cfg(target_arch = "arm")]
     let dev_rx = |ctx: &ServiceContext, buf: &mut [u8]| -> usize {
-        match ctx.request_with_reply("dwc2", &Message::from_bytes(&[0x12])) {
+        match dwc2_rpc(ctx, &Message::from_bytes(&[0x12])) {
             Some(r) => {
                 let p = r.payload_bytes();
                 if p.len() < 2 { return 0; }
