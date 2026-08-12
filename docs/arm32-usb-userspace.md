@@ -25,7 +25,7 @@ A port should check whether the branch exists before conceding that the hardware
 |---|---|---|
 | **1** | Route the USB IRQ to userspace *when a service has registered for it*; real mask/unmask on the BCM2835 legacy controller | ✅ `58eb4610` - hardware-verified inert (selfcheck 350/0 + 351/0, chaos 50 rounds, no panics) |
 | **2** | A skeleton `dwc2` service holding MMIO + DMA + `hw_irqs = [0x29]`, which does nothing but prove the interrupt ARRIVES in userspace | ✅ **PROVEN on hardware 2026-08-12** - see below |
-| **3** | Port the driver: `dwc2.rs` -> the service, through the SDK's safe `Mmio`/`Dma` wrappers so the service carries no `unsafe` (§18.2) | not started |
+| **3** | Port the driver: `dwc2.rs` -> the service, through the SDK's safe `Mmio`/`Dma` wrappers so the service carries no `unsafe` (§18.2) | **unblocked** - its premise is now measured |
 | **4** | Retire `NET_DEVICE` (syscalls 42-44) and the `usb_disk_*` syscalls - they exist only because the driver is in-kernel. `nic-driver` and `block-driver` then talk to `dwc2` over IPC, exactly as on the Pi 4 | not started |
 
 **Phase 2 is deliberately a skeleton.** It is the point where the fallback stops being taken, so the
@@ -63,14 +63,34 @@ The lesson worth keeping: **(1) cost one boot and (2) cost three, and they are t
 64-bit constant on a 32-bit machine. The only difference was that one path checked and the other
 truncated. Both `XHCI_MMIO_VA` and `XHCI_DMA_VA` were x86_64 values wearing arch-neutral names.
 
-## Open, from the same boot
+## Repeat delivery: settled (2026-08-12)
 
-- **A second `spawn dwc2` reported 0 IRQs.** `route::unregister` unmasks on death, so the line should
-  be live again - but the interrupt fires on USB EVENTS, and a quiet bus raises none. Not yet
-  distinguished: no events versus the unmask not taking effect. Worth settling before Phase 3, since
-  Phase 3 depends on interrupts arriving repeatedly rather than once.
-- **`observe` showed core 0 at 97%** while the skeleton held the vector. Expected to be the in-kernel
-  driver polling a controller whose interrupt has been taken away, but unconfirmed.
+The skeleton was given a throttled re-arm - sleep 1 s, then unmask - because delivering ONCE proves
+nothing Phase 3 can build on. `ctx.sleep` blocks the task, so the core is free between interrupts and
+the rate is bounded by construction rather than by hope, which is exactly what an immediate unmask
+failed to be.
+
+```
+12:27:25   59 USB IRQ(s),  59 message(s)  (REPEAT DELIVERY WORKS)
+12:28:51  145 USB IRQ(s), 145 message(s)
+12:29:13  167 USB IRQ(s), 167 message(s)
+12:29:45  199 USB IRQ(s), 199 message(s)
+```
+
+**86 interrupts in 86 seconds** - exactly one per second, matching `REARM_MS` to the tick. A
+metronome, not a drift. No wedge, and `messages == IRQs` at every sample, so nothing is lost and
+nothing spurious arrives on that endpoint.
+
+That also settles the other open item for free: the unmask path demonstrably works 199 times, so the
+earlier second-spawn `0 IRQs` was a quiet bus, not a broken unmask. Both hypotheses were live and the
+throttle distinguished them without a separate experiment.
+
+**Phase 3 is unblocked.** Its assumption - that a userspace driver can receive its controller's
+interrupt repeatedly - is now measured rather than hoped.
+
+Still unconfirmed and harmless: `observe` showed core 0 at 97% while the skeleton held the vector,
+most likely the in-kernel driver polling a controller whose interrupt has been taken away. Worth a
+glance during Phase 3, when that driver stops existing.
 
 ## What makes arm32 harder than the AArch64 port
 
