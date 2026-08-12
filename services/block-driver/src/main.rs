@@ -28,7 +28,8 @@ use godspeed_sdk::ServiceContext;
 mod ahci;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 mod usbdisk;
-#[cfg(not(target_arch = "arm"))]
+// Now on BOTH ARM targets: arm32 reaches the `dwc2` service and aarch64 the `xhci` service, through
+// this one client. The wire format is identical, so only the service name differs.
 mod xhciblk;
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
@@ -77,8 +78,9 @@ fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { ahci::run(ct
 fn backend_run(ctx: &ServiceContext) -> ! {
     // Where the sector count comes from is the same build-time choice usbdisk.rs documents: the
     // in-kernel stack by syscall, or the `xhci` service by IPC. No probe, no fallback.
-    #[cfg(target_arch = "arm")]
-    let sectors = ctx.usb_disk_sectors();
+    // arm32 now asks the `dwc2` SERVICE over IPC, exactly as aarch64 asks `xhci` - the in-kernel
+    // stack's `usb_disk_*` syscalls are no longer the path. Same client, same wire format, different
+    // service name (`xhciblk::XHCI`), which is why this is a cfg flip rather than a port.
     // ONE quick question at startup, not a 20 s wait for an answer we no longer use.
     //
     // This called `sectors()`, which blocks up to 20 s for a capacity. That made every boot with no
@@ -94,7 +96,6 @@ fn backend_run(ctx: &ServiceContext) -> ! {
     // first request, through the same self-heal that already recovers a stick plugged in after boot -
     // hardware-proven across several plug/unplug cycles. Trading a guaranteed 20 s stall for a
     // recovery path that is exercised constantly is the right way round.
-    #[cfg(not(target_arch = "arm"))]
     let sectors = xhciblk::sectors_now(&ctx);
     if sectors == 0 {
         ctx.log("block-driver: no USB storage stick - NO disk (the SD card is the boot medium and is never written)");

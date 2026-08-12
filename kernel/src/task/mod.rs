@@ -776,12 +776,21 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // message, while block-driver burned its whole 20 s wait failing to address it. Every
             // layer looked healthy in isolation, because the missing piece was the EDGE between them.
             //
-            // block-driver reaches the disk THROUGH the xhci service on aarch64, so it needs a SEND
-            // cap to it. On arm32 the USB stack is still in the kernel (no PCIe, no device-IRQ
-            // routing to userspace yet), so there is no such peer there - see `arch/arm/CLAUDE.md`.
+            // block-driver reaches the disk THROUGH a USB host-controller SERVICE on both ARM
+            // targets now: `xhci` on aarch64, `dwc2` on arm32. The arm32 arm used to be empty, with a
+            // comment saying "the USB stack is still in the kernel... so there is no such peer" -
+            // true when it was written and false since the driver moved out.
+            //
+            // The paragraph above is the reason this edge cannot be left to be noticed later: without
+            // the SEND cap, `request_with_reply` finds no send slot and returns None INSTANTLY, so
+            // the driver sits in its poll loop with the disk bound and never receives a message while
+            // block-driver reports no storage. Every layer healthy in isolation, and the missing
+            // piece the edge between them.
             #[cfg(target_arch = "aarch64")]
             send_peers:        &["xhci"],
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_arch = "arm")]
+            send_peers:        &["dwc2"],
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
             send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
             send_peers_grant:  false,
             // ARM pins this to core 0, and it is NOT a preference there - it is a requirement. The

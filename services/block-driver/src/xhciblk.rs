@@ -39,6 +39,14 @@ use godspeed_sdk::{Message, ServiceContext};
 use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, STATUS_OK};
 
 /// The service that owns the host controller, addressed by name so a restart is transparent (§3.11).
+/// The USB host-controller SERVICE that owns the disk, by name.
+///
+/// Different service, identical protocol. On AArch64 that is `xhci` driving the Pi 4's VL805; on
+/// arm32 it is `dwc2` driving the Pi 2's DesignWare core. The wire format is byte-for-byte the same,
+/// which is the whole reason this client needed no porting - only the name it asks for.
+#[cfg(target_arch = "arm")]
+const XHCI: &str = "dwc2";
+#[cfg(not(target_arch = "arm"))]
 const XHCI: &str = "xhci";
 
 /// One request/reply to `xhci`, with a single reacquire-and-retry.
