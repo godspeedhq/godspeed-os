@@ -261,7 +261,39 @@ that, the survey would have reported whatever the previous transfer left in the 
 topology assembled from stale bytes, which is worse than an obviously wrong one because it would have
 been believed. That defence was written three slices earlier for exactly this shape of bug.
 
-## Slice 3: recovery ported, and the guard that was rejecting good transfers
+## Slice 3: selfcheck RUNS - 351 tests, 3 failures, ~500x faster
+
+```
+20:11:00 -> 20:11:15   1826 -> 7434 blocks = 374/sec   (was 0.7/sec)
+run: ran 351, failed 3
+```
+
+The full `selfcheck` completes for the first time on the userspace driver. `serve` totals 434 ms
+across 10,097 commands - the transfers were never the bottleneck, and never had been.
+
+### The throughput bug, which was mine and took three readings
+
+Nothing to do with USB. Three measurements, and each eliminated the fix I was about to make:
+
+| Measurement | Ruled out | Left |
+|---|---|---|
+| per-stage busy counters (all zero) | the retry shape, the budgets | not BOT at all |
+| pass count + segment timing | "one pass taking 44 s" | 5 passes, 18.9 s of SLEEP |
+| idle-pass split after the first fix | "skip the sleep when busy" was enough | the idle passes were the cost |
+
+The fault: **a task in `sleep` sleeps out its full duration no matter what arrives.** `fs` sends one
+request and waits for the reply, so every gap between requests cost a whole scheduler-stretched sleep
+before the next request was even LOOKED at - about 1.5 s per `sleep(10ms)` under load. The sleep was
+not conserving CPU during a quiet moment, it was INSERTING one.
+
+`recv_timeout` blocks on the ENDPOINT, so an arriving message wakes it immediately - an event-driven
+wake rather than a timer-driven one - while the deadline still supplies the keyboard's poll cadence.
+
+**The shape of the mistake is worth more than the fix:** I twice corrected WHEN the loop sleeps
+without asking whether a sleep can serve this loop's purpose at all. The measurement pointed at the
+sleep both times; only the second reading made me ask what a sleep does to an arriving message.
+
+## Superseded: recovery ported, and the guard that was rejecting good transfers
 
 `1477 block request(s)`, zero failures - the same workload that produced **2175 error lines** one
 build earlier now runs silently.
