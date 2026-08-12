@@ -337,6 +337,10 @@ const E_IO: &str = "storage unreadable (I/O error)";
 const MOUNT_MAX_ATTEMPTS: u32 = 1000;
 /// How long mount waits for a device to answer - a REAL duration, the same on any board.
 const MOUNT_MAX_MS: u64 = 20_000;
+/// Pause between capacity attempts, so the attempt budget spans the clock budget rather than
+/// racing it. 1000 attempts * 20 ms > MOUNT_MAX_MS on every board, which is what keeps the CLOCK
+/// the binding bound and the attempt count a backstop that never fires.
+const MOUNT_RETRY_MS: u64 = 20;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
@@ -367,10 +371,35 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     let _ = ctx.reacquire_by_name("block-driver");
                     let out_of_time = ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63);
                     if out_of_time || attempt == MOUNT_MAX_ATTEMPTS {
-                        ctx.log("fs: block-driver did not report capacity within 20s - coming up storage-unavailable (data intact; do NOT run 'drives flash')");
+                        // SAY WHICH BOUND ENDED THE WAIT. They are not the same fact.
+                        //
+                        // This printed "within 20s" for both exits, and on the Pi 2 that was a false
+                        // statement by three orders of magnitude: `fs: starting` at 10:00:57.063 and
+                        // "did not report capacity within 20s" at 10:00:57.110 - FORTY-SEVEN
+                        // MILLISECONDS. An operator reads that line, believes the device was given 20
+                        // seconds, and concludes the disk is dead.
+                        if out_of_time {
+                            ctx.log("fs: block-driver did not report capacity within 20s - coming up storage-unavailable (data intact; do NOT run 'drives flash')");
+                        } else {
+                            ctx.log_fmt(format_args!(
+                                "fs: gave up after {} attempts WELL INSIDE the 20s budget - the attempt backstop bound this wait, not the clock (data intact; do NOT run 'drives flash')",
+                                attempt));
+                        }
                         break;
                     }
-                    ctx.yield_cpu();
+                    // SLEEP, do not yield.
+                    //
+                    // `yield_cpu` does not wait - it hands the core back and leaves this task READY,
+                    // so the scheduler returns immediately and the next attempt follows at loop speed.
+                    // That is how 1000 attempts finished in 47 ms on ARM: the "backstop" became the
+                    // binding constraint and the 20 s clock never got a say, which is the exact
+                    // count-is-not-a-duration failure the comment above this loop warns about.
+                    //
+                    // A real sleep makes the attempt budget TRACK the clock instead of racing it:
+                    // 1000 attempts * 20 ms exceeds the 20 s deadline on any board, so the clock binds
+                    // everywhere and the count goes back to being what it claims to be - a runaway
+                    // backstop that should never fire.
+                    ctx.sleep(ctx.duration_cycles(MOUNT_RETRY_MS));
                 }
             }
         }
