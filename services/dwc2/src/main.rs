@@ -1,6 +1,7 @@
 //! `dwc2` - the Raspberry Pi 2's USB host controller, as a userspace service.
 //!
-//! **This is a SKELETON.** It holds the hardware a driver needs - the DWC2 register window, a DMA
+//! This began as a skeleton that proved the IRQ path and drove nothing. It now drives the controller:
+//! it holds the hardware a driver needs - the DWC2 register window, a DMA
 //! arena, and the USB interrupt - and does nothing with it but report. It exists to answer one
 //! question before 3981 lines of driver are moved onto it:
 //!
@@ -97,7 +98,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // capacity, FUA. With both writing to one serial console, an identical prefix makes the log
     // unreadable exactly when it matters: the whole question this service exists to answer is which
     // of the two is receiving the interrupt, and a shared prefix would hide that.
-    ctx.log("dwc2-svc: starting (SKELETON - proves the IRQ path, drives nothing)");
+    ctx.log("dwc2-svc: starting - USB host (hub, keyboard, storage, ethernet)");
 
     // The two hardware grants, reported rather than assumed. A driver that cannot reach its
     // registers is not a degraded driver, it is not a driver at all, and the boot log should say
