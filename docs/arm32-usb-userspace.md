@@ -274,6 +274,26 @@ All three devices bound from userspace, endpoints matching the kernel driver exa
 `SET_CONFIGURATION` retry did not fire on this boot - kept regardless, since the kernel driver only
 added it after seeing the failure.
 
+### 4b: the frame formats, read out of the kernel driver
+
+**The LAN9514 is NOT plain CDC-ECM.** It carries a proprietary 8-byte TX command header, and a driver
+written on the assumption that this is raw-frames-over-bulk will send garbage the device silently
+drops. From `net_frame_tx`:
+
+```
+smsc95xx TX:  TX_CMD_A = len | FIRST_SEG(0x2000) | LAST_SEG(0x1000)   (4 bytes LE)
+              TX_CMD_B = len                                          (4 bytes LE)
+              then the frame
+CDC-ECM  TX:  the raw frame, and a trailing ZERO-LENGTH PACKET when the length is an
+              exact multiple of the bulk max packet size - the short packet is what
+              delimits a datagram, so an exact multiple has no boundary without it.
+              (smsc95xx carries an explicit length, so it needs no ZLP.)
+```
+
+The RX side has its own status header and has NOT been read yet - do that before writing the receive
+path, not after. The TX format above was one read; guessing it would have been silently wrong, which
+on a NIC means frames that vanish rather than an error.
+
 ### What 4b needs
 
 - **Frame TX/RX** over the bulk pair. CDC-ECM carries raw ethernet frames with no per-packet framing,
@@ -393,6 +413,26 @@ port 4  BOOT KEYBOARD bound - interface 0 endpoint 1 mps 8 interval 10
 All three devices bound from userspace, endpoints matching the kernel driver exactly. The
 `SET_CONFIGURATION` retry did not fire on this boot - kept regardless, since the kernel driver only
 added it after seeing the failure.
+
+### 4b: the frame formats, read out of the kernel driver
+
+**The LAN9514 is NOT plain CDC-ECM.** It carries a proprietary 8-byte TX command header, and a driver
+written on the assumption that this is raw-frames-over-bulk will send garbage the device silently
+drops. From `net_frame_tx`:
+
+```
+smsc95xx TX:  TX_CMD_A = len | FIRST_SEG(0x2000) | LAST_SEG(0x1000)   (4 bytes LE)
+              TX_CMD_B = len                                          (4 bytes LE)
+              then the frame
+CDC-ECM  TX:  the raw frame, and a trailing ZERO-LENGTH PACKET when the length is an
+              exact multiple of the bulk max packet size - the short packet is what
+              delimits a datagram, so an exact multiple has no boundary without it.
+              (smsc95xx carries an explicit length, so it needs no ZLP.)
+```
+
+The RX side has its own status header and has NOT been read yet - do that before writing the receive
+path, not after. The TX format above was one read; guessing it would have been silently wrong, which
+on a NIC means frames that vanish rather than an error.
 
 ### What 4b needs
 
