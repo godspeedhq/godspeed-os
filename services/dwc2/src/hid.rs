@@ -169,9 +169,16 @@ pub fn poll(
     if hcint & crate::regs::HCINT_XFERCOMPL == 0 {
         return false; // NAK (idle), NYET, or a rescheduled attempt - all ordinary
     }
-    // Interrupt endpoints carry their own DATA0/DATA1 toggle, and a report received with the wrong
-    // one is a RETRANSMISSION of the last: delivering it would double a keystroke.
-    state.pid = if state.pid == chan::PID_DATA0 { chan::PID_DATA1 } else { chan::PID_DATA0 };
+    // READ THE TOGGLE BACK FROM THE HARDWARE. Do not flip it in software.
+    //
+    // The DWC2 advances HCTSIZ.PID [30:29] itself, and the kernel driver reads it back for exactly
+    // this reason. Flipping it in software makes the two disagree the moment they ever differ, and a
+    // toggle mismatch does not error - the device RETRANSMITS its last report, which is delivered
+    // again as a fresh keystroke.
+    //
+    // Hardware said so: one Enter press arrived six times, redrawing the prompt six times, on 59
+    // reports. The transfers were right and the bookkeeping was mine.
+    state.pid = chan::pid_from_hctsiz(mmio, chan::CH_KBD);
 
     let mut rep = [0u8; 8];
     for i in 0..8 {

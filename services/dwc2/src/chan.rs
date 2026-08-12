@@ -126,6 +126,15 @@ pub fn program(
     mmio.write32(hcchar_at(ch), chan);
 }
 
+/// The data PID the controller has advanced to, read back from HCTSIZ [30:29].
+///
+/// The hardware owns this toggle. Tracking it in software works only until the two disagree, and
+/// when they do the failure is silent: the device retransmits its previous packet rather than
+/// erroring, so a keystroke is delivered twice.
+pub fn pid_from_hctsiz(mmio: &Mmio, ch: u32) -> u32 {
+    (mmio.read32(hctsiz_at(ch)) >> 29) & 0x3
+}
+
 /// Wait for a channel to halt, bounded by the CLOCK. Returns the latched HCINT, or `None` on timeout.
 pub fn wait_halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32, ms: u64) -> Option<u32> {
     let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(ms));
