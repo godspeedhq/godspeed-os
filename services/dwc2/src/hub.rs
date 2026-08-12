@@ -171,15 +171,19 @@ pub fn survey(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, ports: u
                 if st.needs_split() {
                     split_needed += 1;
                 }
+                // NO SPEED HERE. The bits are not valid until the port has been RESET - an idle
+                // port has not seen the device chirp - and reporting them anyway is what produced a
+                // confident, wrong "4 need split transactions" that cost three boots. What this
+                // survey legitimately knows is that something is attached.
                 ctx.log_fmt(format_args!(
-                    "dwc2-svc: hub port {} CONNECTED speed={} enabled={} (status={:#06x})",
-                    p, st.speed(), st.enabled(), st.status));
+                    "dwc2-svc: hub port {} CONNECTED (status={:#06x}; speed unknown until reset)",
+                    p, st.status));
             }
         }
     }
+    let _ = split_needed;
     ctx.log_fmt(format_args!(
-        "dwc2-svc: hub survey complete - {} device(s) attached, {} need split transactions",
-        found, split_needed));
+        "dwc2-svc: hub survey complete - {} device(s) attached (each one's speed, and whether it          needs a split, is known only after its port reset)", found));
 }
 
 /// Reset a port, then address and identify the device behind it - THROUGH a split transaction.
@@ -191,6 +195,20 @@ pub fn survey(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, ports: u
 pub fn enumerate_downstream(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, hub: &Target, port: u8,
 ) -> Option<(u16, u16, u8)> {
+    // THE SPEED IS ONLY VALID AFTER THE RESET, and it decides whether a split is needed at all.
+    //
+    // `reset_port` returns the POST-reset status, and that is the one to believe. Before a reset the
+    // hub reports an idle port whose speed bits mean nothing - the device has not chirped yet - and
+    // reading them there is what produced the survey's confident and wrong "4 devices, 4 need split
+    // transactions". Three of them are HIGH speed:
+    //
+    //   survey (pre-reset)   0x0101 -> looked full speed
+    //   after reset          0x0503 -> HIGH speed
+    //
+    // A high-speed device behind a high-speed hub is addressed DIRECTLY: there is no transaction
+    // translator in the path, and sending it a split is exactly what a hub STALLs. That was the
+    // `SETUP complete-split STALLed` on ports 1-3, and it was never a fault in the split code - port
+    // 4, the one genuinely low-speed device, enumerated through a split on the same boot.
     let st = reset_port(ctx, mmio, dma, hub, port)?;
     // TRSTRCY: the device gets 10 ms of RECOVERY after its reset before it is required to respond.
     //
@@ -201,7 +219,8 @@ pub fn enumerate_downstream(
     // then, since the complete-split is only ever issued after the transaction translator ACKed the
     // start-split.
     ctx.sleep(ctx.duration_cycles(15));
-    let splt = chan::hcsplt(hub.addr, port);
+    // Split ONLY when the device actually needs one.
+    let splt = if st.needs_split() { chan::hcsplt(hub.addr, port) } else { 0 };
 
     // The device answers at address 0 until it is given one. `low_speed` matters to the controller's
     // channel programming, and the hub is the authority on it - the port status just told us.
@@ -236,7 +255,7 @@ pub fn enumerate_downstream(
     let pid = u16::from_le_bytes([first[10], first[11]]);
     let class = first[4];
     ctx.log_fmt(format_args!(
-        "dwc2-svc: port {} DEVICE via split - VID:PID={:04x}:{:04x} class={:#04x} speed={}",
-        port, vid, pid, class, st.speed()));
+        "dwc2-svc: port {} DEVICE {} - VID:PID={:04x}:{:04x} class={:#04x} speed={}",
+        port, if splt != 0 { "via split" } else { "direct" }, vid, pid, class, st.speed()));
     Some((vid, pid, class))
 }
