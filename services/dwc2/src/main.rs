@@ -32,6 +32,14 @@ const REPORT_MS: u64 = 5_000;
 /// fast as we dequeue would otherwise keep this loop running forever.
 const MSG_DRAIN_MAX: u32 = 256;
 
+/// How long to wait before re-arming the USB line after an interrupt.
+///
+/// The skeleton cannot clear the device condition, so the line is still asserted when it unmasks and
+/// the next interrupt is immediate. One second turns that into a metronome instead of a livelock:
+/// enough to watch the count climb over a fifteen-second boot, slow enough that the core is idle
+/// between them.
+const REARM_MS: u64 = 1_000;
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // PREFIX `dwc2-svc:`, not `dwc2:`.
@@ -94,7 +102,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // THE LINE THIS SERVICE EXISTS TO PRINT.
                     ctx.log("dwc2-svc: *** USB INTERRUPT DELIVERED TO USERSPACE *** - arm32 device IRQ routing works");
                 }
-                // DO NOT UNMASK. This is the whole difference between a proof and a livelock.
+                // THROTTLED RE-ARM: sleep, THEN unmask.
+                //
+                // Not unmasking at all proved DELIVERY (one interrupt, `*** DELIVERED ***`). It could
+                // not prove REPEAT delivery, and Phase 3 rests on repeat: a driver that receives one
+                // interrupt and never another is no driver. So the count has to climb.
+                //
+                // Unmasking IMMEDIATELY is what wedged core 0 three boots ago. DWC2's line is
+                // level-triggered and stays asserted until the DEVICE condition is cleared; a skeleton
+                // clears nothing, so an instant unmask re-asserts inside the handler and the core never
+                // leaves it. The sleep is what makes the difference - the task is BLOCKED, not
+                // spinning, so the core is free and the rate is bounded to one interrupt per
+                // REARM_MS by construction rather than by hope.
+                //
+                // A real driver will not need this: it earns its unmask by servicing the device, which
+                // deasserts the line. This is the cheapest way to ask "can it happen twice?" without
+                // writing the driver first.
+                ctx.sleep(ctx.duration_cycles(REARM_MS));
+                ctx.irq_unmask(USB_VECTOR);
+
+                // (Retained for the record - the reasoning that made the previous build a proof of
+                // delivery rather than a livelock.)
+                // DO NOT UNMASK IMMEDIATELY. This is the whole difference between a proof and a livelock.
                 //
                 // The first version unmasked here, reasoning that the count would then "climb fast".
                 // It does not climb - it livelocks. DWC2's interrupt is LEVEL-triggered: it stays
@@ -120,8 +149,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // works, `msgs` says whether anything else is arriving on this endpoint. Zero irqs with
             // nonzero msgs would mean the endpoint is live and the ROUTE is not - a different fault
             // from silence, and one that silence alone could not distinguish.
+            // Say what the number MEANS, not just what it is. The question this build exists to
+            // answer is whether interrupts arrive more than once, and a reader should not have to
+            // diff two log lines to find out.
+            let verdict = if irqs >= 2 {
+                "REPEAT DELIVERY WORKS"
+            } else if irqs == 1 {
+                "one only so far - not yet repeat"
+            } else {
+                "none yet"
+            };
             ctx.log_fmt(format_args!(
-                "dwc2-svc: alive - {} USB IRQ(s), {} message(s) total", irqs, msgs));
+                "dwc2-svc: alive - {} USB IRQ(s), {} message(s) total ({})", irqs, msgs, verdict));
         }
     }
 }
