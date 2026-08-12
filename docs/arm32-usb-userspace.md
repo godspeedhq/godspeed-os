@@ -154,7 +154,7 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 | **2a** | Find + bind a boot keyboard (config walk, SET_CONFIGURATION, SET_PROTOCOL) | ✅ **hardware-verified 2026-08-12** - `interface 0 endpoint 1 mps 8 interval 10`, matching the kernel driver |
 | **2b** | POLL the interrupt endpoint via a PERIODIC split, push to `CONSOLE_PUSH` | ✅ **COMPLETE 2026-08-12** - `gsh> hello` typed on the USB keyboard |
 | **3a** | Find + bind the Bulk-Only mass-storage interface and its endpoints | ✅ **hardware-verified 2026-08-12** - `bulk IN 1 OUT 2 mps 512`, matching the kernel driver |
-| **3b** | BOT/SCSI: INQUIRY, READ CAPACITY, READ(10)/WRITE(10) over the bulk endpoints | sector 0 reads back `47 53 46 53` (GSFS) |
+| **3b** | BOT/SCSI: READ CAPACITY + READ(10) over the bulk endpoints | ✅ **hardware-verified 2026-08-12** - `31266816 sectors`, sector 0 reads `47 53 46 53` (GSFS) |
 | **3c** | `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | `drives`, `ls`, `selfcheck` |
 | **4** | Networking: CDC-ECM + smsc95xx; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | DHCP, `ping` |
 | **5** | Delete `arch/arm/dwc2.rs`, the six syscalls, the tick hooks | `chaos max-carnage` + `selfcheck`. THEN amend §6.4 |
@@ -260,6 +260,45 @@ It was findable in one boot only because slice 1b zeroes the IN scratch before e
 that, the survey would have reported whatever the previous transfer left in the buffer: a plausible
 topology assembled from stale bytes, which is worse than an obviously wrong one because it would have
 been believed. That defence was written three slices earlier for exactly this shape of bug.
+
+## Slice 3b result
+
+```
+dwc2-svc: USB DISK - 31266816 sectors of 512 B (15267 MiB)
+dwc2-svc: sector 0 first bytes 47 53 46 53
+```
+
+`47 53 46 53` is `GSFS` - the filesystem's own magic, read off the physical disk by a userspace
+driver. Sector count matches the kernel driver exactly. This is a comparison rather than a
+plausibility check: those are the bytes actually on that sector, and a short transfer cannot fake
+them.
+
+### The data toggle, three times
+
+The whole of 3b was one bug at three scopes, each refuted by the next transfer that crossed the
+previous one:
+
+| Scope | Fixed | Broke on |
+|---|---|---|
+| per-transfer (always DATA0) | - | the CSW within a command |
+| per-command | the CSW | the second command's data stage |
+| **per-device** | both | (where USB actually defines it) |
+
+A wider scope was not "more correct in general". It is the level the HARDWARE keeps the state at, and
+every level below it works right up until something crosses it. Same root as the keyboard's doubled
+keystroke in slice 2: software believing it owns state the hardware is keeping. Read the toggle back
+from HCTSIZ; do not track it.
+
+### Still to port for 3c
+
+- **Recovery**: `bot_recover`, `note_busy`, `recover_or_revive`. NOT optional on this board - the
+  stick refuses SYNCHRONIZE CACHE, and goes BUSY for tens of seconds under load (a 45-second stall
+  was seen on this branch). A bulk timeout must distinguish "busy, ask again" from "failed", or a
+  healthy device gets reset repeatedly: the kernel driver logged 564 spurious recoveries in ONE
+  selfcheck before that distinction was made.
+- **WRITE(10)**, and the `USE_FUA` durability caveat that comes with it.
+- **The block IPC protocol**, so `block-driver` moves off the `usb_disk_*` syscalls to what it
+  already speaks on the Pi 4.
 
 ## Slice 3a result
 
