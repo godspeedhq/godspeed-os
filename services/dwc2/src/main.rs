@@ -269,8 +269,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             if ctx.read_tsc().wrapping_sub(last_beat) > ctx.duration_cycles(HEARTBEAT_MS) {
                 last_beat = ctx.read_tsc();
+                // Report the busy counts as a RATIO against completed commands. A total says the
+                // device is slow; a ratio says which stage is making it slow, which is the thing
+                // that can be acted on.
+                let (bc, bd, bs, cmds) = disk
+                    .as_ref()
+                    .map(|(d, _, _)| (d.busy_cbw, d.busy_data, d.busy_csw, d.commands))
+                    .unwrap_or((0, 0, 0, 0));
                 ctx.log_fmt(format_args!(
-                    "dwc2-svc: alive - {} key report(s), {} block request(s)", reports, served));
+                    "dwc2-svc: alive - {} key report(s), {} block request(s); {} cmds, busy retries CBW {} DATA {} CSW {}",
+                    reports, served, cmds, bc, bd, bs));
             }
             ctx.sleep(ctx.duration_cycles(period_ms));
         }

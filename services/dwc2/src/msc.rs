@@ -53,6 +53,22 @@ pub struct Disk {
     pub iface: u8,
     /// Consecutive REAL failures (not busy hand-backs). Only a command that actually worked clears it.
     pub fail_streak: u32,
+    /// BUSY hand-backs, counted PER STAGE.
+    ///
+    /// Storage is correct and crawling - 27 block requests in 76 seconds - and the busy path is
+    /// deliberately silent, so nothing in the log says WHICH phase is stalling. These are counters
+    /// rather than log lines on purpose: logging a busy hand-back is what printed 564 lines in one
+    /// selfcheck, and the question here is a RATIO, which a periodic report answers and a flood does
+    /// not.
+    ///
+    /// The three distinguish causes that want different fixes. A retry re-runs the WHOLE command, so
+    /// a stall in the CBW or the CSW costs three transfers to redo one - and if the data phase is
+    /// the one stalling, the budgets are the problem instead.
+    pub busy_cbw: u32,
+    pub busy_data: u32,
+    pub busy_csw: u32,
+    /// Commands that completed, so the counts above can be read as a rate rather than a total.
+    pub commands: u32,
 }
 
 /// Walk a configuration descriptor for a Bulk-Only mass-storage interface and its endpoints.
@@ -144,7 +160,8 @@ pub fn bind(
     ctx.log_fmt(format_args!(
         "dwc2-svc: MASS STORAGE bound - bulk IN {} OUT {} mps {} (ep0 mps {})",
         ep_in, ep_out, mps, t.mps));
-    Some(Disk { ep_in, ep_out, mps, ep0_mps: t.mps, pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0, iface, fail_streak: 0 })
+    Some(Disk { ep_in, ep_out, mps, ep0_mps: t.mps, pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0, iface, fail_streak: 0,
+        busy_cbw: 0, busy_data: 0, busy_csw: 0, commands: 0 })
 }
 
 /// Where a BOT command's buffers live in the DMA arena. Past the keyboard report, which is past the
@@ -340,6 +357,7 @@ pub fn bot(
     // evidence the device is healthy rather than pausing between requests.
     if sig == 0x5342_5355 && tag == TAG && csw[12] == 0 && !short {
         disk.fail_streak = 0;
+        disk.commands = disk.commands.saturating_add(1);
     }
     if sig != 0x5342_5355 || tag != TAG || csw[12] != 0 || short {
         ctx.log_fmt(format_args!(
@@ -361,7 +379,15 @@ fn stage_failed(
     e: XferErr, what: &str, cdb0: u8,
 ) -> Option<usize> {
     match e {
-        XferErr::Busy => {}
+        XferErr::Busy => {
+            // Counted, not logged. Which stage stalls is the whole question, and a per-stage count
+            // answers it in one periodic line instead of thousands.
+            match what {
+                "CBW-out" => disk.busy_cbw = disk.busy_cbw.saturating_add(1),
+                "data-stage" => disk.busy_data = disk.busy_data.saturating_add(1),
+                _ => disk.busy_csw = disk.busy_csw.saturating_add(1),
+            }
+        }
         XferErr::Failed => {
             disk.fail_streak = disk.fail_streak.saturating_add(1);
             ctx.log_fmt(format_args!(
