@@ -206,7 +206,19 @@ const SMSC_MII_DATA: u16 = 0x118;
 const SMSC_PHY_ID: u32 = 1;
 const SMSC_MII_BMCR: u32 = 0;
 const SMSC_MII_ADVERTISE: u32 = 4;
-const SMSC_MII_BMSR: u32 = 1;   // basic mode STATUS; bit 2 = link up
+const SMSC_MII_BMSR: u32 = 1;   // basic mode STATUS; bit 2 = link up, bit 5 = auto-negotiation done
+
+/// Is the ethernet link up, per the PHY itself?
+///
+/// BMSR's link bit is **latch-low**: once the link has been down, the bit reads 0 on the NEXT read even
+/// if the link has since come back, and only the read AFTER that shows the truth. A single read
+/// therefore reports a freshly-connected cable as down, forever, until something happens to read twice.
+/// This is standard 802.3 clause-22 behaviour, not a quirk of this part, and it is why every driver
+/// reads this register twice.
+fn link_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> bool {
+    let _latched = mii_read(ctx, m, d, t, SMSC_MII_BMSR);
+    matches!(mii_read(ctx, m, d, t, SMSC_MII_BMSR), Some(v) if v & 0x0004 != 0)
+}
 /// RX burst size in 512-byte high-speed packets. Must stay within `RX_BURST` in the arena layout.
 const SMSC_BURST_PKTS: u32 = 4;
 
@@ -357,7 +369,12 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
         "dwc2-svc: smsc readback MAC_CR=0x{:08x} (TXEN {} RXEN {}) TX_CFG=0x{:08x} HW_CFG=0x{:08x} BMSR={} link {}",
         cr, cr & SMSC_MAC_CR_TXEN != 0, cr & SMSC_MAC_CR_RXEN != 0, txc, hwc,
         match bmsr { Some(v) => v, None => 0xFFFF },
-        match bmsr { Some(v) => if v & 0x0004 != 0 { "UP" } else { "DOWN" }, None => "UNREADABLE" }));
+        match bmsr {
+            Some(v) if v & 0x0020 == 0 => "NEGOTIATING (this instant, not a verdict - autonegotiation                                            was restarted microseconds ago and takes seconds; ask again                                            with `net`)",
+            Some(v) if v & 0x0004 != 0 => "UP",
+            Some(_) => "DOWN",
+            None => "UNREADABLE",
+        }));
     Some(mac)
 }
 
@@ -510,7 +527,7 @@ pub fn serve(
             // "link up but silent" indistinguishable from the outside - the two things a diagnosis
             // most needs to tell apart. Unreadable counts as DOWN: an unanswerable question is not
             // a yes.
-            out[7] = u8::from(matches!(mii_read(ctx, mmio, dma, t, SMSC_MII_BMSR), Some(v) if v & 0x0004 != 0));
+            out[7] = u8::from(link_up(ctx, mmio, dma, t));
             8
         }
         OP_NET_TX if p.len() > 1 => {
