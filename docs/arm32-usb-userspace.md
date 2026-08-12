@@ -152,7 +152,7 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 | **1c-ii** | Hub port survey (power, status, speed) | ✅ **hardware-verified 2026-08-12** - 4 attached, status words byte-for-byte identical to the kernel driver's |
 | **1c-iii** | Address devices behind the hub, direct and via split | ✅ **COMPLETE 2026-08-12 - 4/4 exact match with the in-kernel driver** |
 | **2a** | Find + bind a boot keyboard (config walk, SET_CONFIGURATION, SET_PROTOCOL) | ✅ **hardware-verified 2026-08-12** - `interface 0 endpoint 1 mps 8 interval 10`, matching the kernel driver |
-| **2b** | POLL the interrupt endpoint via a PERIODIC split, push to `CONSOLE_PUSH` | typing works from userspace |
+| **2b** | POLL the interrupt endpoint via a PERIODIC split, push to `CONSOLE_PUSH` | ✅ **COMPLETE 2026-08-12** - `gsh> hello` typed on the USB keyboard |
 | **3** | Mass storage: BOT/SCSI; `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | `drives`, `ls`, `selfcheck` |
 | **4** | Networking: CDC-ECM + smsc95xx; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | DHCP, `ping` |
 | **5** | Delete `arch/arm/dwc2.rs`, the six syscalls, the tick hooks | `chaos max-carnage` + `selfcheck`. THEN amend §6.4 |
@@ -258,6 +258,42 @@ It was findable in one boot only because slice 1b zeroes the IN scratch before e
 that, the survey would have reported whatever the previous transfer left in the buffer: a plausible
 topology assembled from stale bytes, which is worse than an obviously wrong one because it would have
 been believed. That defence was written three slices earlier for exactly this shape of bug.
+
+## SLICE 2 COMPLETE - the keyboard is driven from userspace
+
+```
+gsh> hello
+unknown: hello
+```
+
+Typed on the USB keyboard, delivered once each, in order. The shell rejecting `hello` as a command is
+the proof it received it. No doubling, so the toggle handling holds.
+
+**The periodic split works in a preemptible task**, which was the one risk this port carried from
+slice 0. It works because the algorithm is structured for it: ONE attempt per poll, any failure
+reschedules on the next, every wait bounded by real time rather than spin count. Being descheduled at
+the wrong microframe costs one attempt, not correctness. That was readable in the kernel driver
+before a line was written, which is why 2b took fewer boots than 1c did.
+
+### The five things that went wrong, and the one that found them
+
+| Attempt | Change | Result |
+|---|---|---|
+| 1 | software data toggle | wrong - the hardware owns it (`HCTSIZ.PID`) |
+| 2 | count NAKs as reports | wrong - made the counter meaningless |
+| 3 | report buffer at 0x100 | wrong - INSIDE the control scratch (0x40..0x140) |
+| 4 | (still nothing) | four guesses, four boots, none the problem |
+| 5 | **dump the report bytes** | answered it immediately |
+
+The dump showed `00 00 0d 0c 12 ...` with `hcint=0x23` - VALID HID boot reports on a clean
+completion. So the driver had been correct for several builds and the fault was elsewhere entirely:
+`console_push: matches!(name, "xhci" | "ehci")` did not include `dwc2`, so every keystroke was
+rejected for want of a capability.
+
+**Four single-line guesses cost four boots and found nothing. The fifth thing tried was a
+measurement, and it found the answer at once.** Five for five now on the rule: when a hypothesis
+about hardware state is wrong, do not form another - find where the hardware records the answer and
+read it.
 
 ## Slice 2a result
 
