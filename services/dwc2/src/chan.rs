@@ -217,7 +217,9 @@ fn stage_split(
             None => continue,
         };
         if ss & HCINT_STALL != 0 {
-            ctx.log_fmt(format_args!("dwc2-svc: {} start-split STALLed", what));
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: {} start-split STALLed - HCINT={:#010x} HCSPLT={:#010x} HCCHAR={:#010x}",
+                what, ss, mmio.read32(hcsplt_at(ch)), mmio.read32(hcchar_at(ch))));
             return false;
         }
         if ss & HCINT_XFERCOMPL != 0 {
@@ -239,7 +241,21 @@ fn stage_split(
                 return true;
             }
             if cs & HCINT_STALL != 0 {
-                ctx.log_fmt(format_args!("dwc2-svc: {} complete-split STALLed", what));
+                // DUMP THE REGISTERS, do not guess again.
+                //
+                // A compliant device may not STALL a SETUP (USB 2.0 8.5.3), so this is a
+                // contradiction and one hypothesis for it - a missing TRSTRCY recovery delay - has
+                // already been tried and refuted on hardware. The rule this port has followed
+                // throughout applies: when a hypothesis about hardware state is wrong, do not form a
+                // second one, find where the hardware RECORDS the answer and read it.
+                //
+                // HCSPLT is the field most likely to be wrong (hub address placement, XactPos) and it
+                // is right here in a register. HCCHAR carries the device address, endpoint and speed
+                // the controller actually used, which is the other half of "who did we just talk to".
+                ctx.log_fmt(format_args!(
+                    "dwc2-svc: {} complete-split STALLed - HCINT={:#010x} HCSPLT={:#010x} HCCHAR={:#010x} HFNUM={:#06x}",
+                    what, cs, mmio.read32(hcsplt_at(ch)), mmio.read32(hcchar_at(ch)),
+                    mmio.read32(HFNUM) & 0xFFFF));
                 return false;
             }
             if cs & HCINT_NYET != 0 {
