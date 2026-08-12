@@ -59,6 +59,7 @@ pub const DATA_OFF: usize = 0x0040;  // scratch for descriptors
 pub const DATA_LEN: usize = 256;
 
 /// The device this driver is currently talking to. Control transfers address whoever is selected.
+#[derive(Clone, Copy)]
 pub struct Target {
     pub addr: u8,
     pub mps: u16,

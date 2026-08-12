@@ -83,6 +83,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Declared out here so the poll loop below can see it: the bring-up borrows `mmio`, and the
     // keyboard it finds has to outlive that borrow.
     let mut kbd: Option<(hid::Keyboard, chan::Target, u32)> = None;
+    let mut disk: Option<(msc::Disk, chan::Target, u64)> = None;
     if let Some(m) = ctx.mmio() {
         if core::identify(&ctx, &m).is_some() {
             let ok = core::reset_and_host_mode(&ctx, &m);
@@ -176,7 +177,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                             "dwc2-svc: USB DISK - {} sectors of {} B ({} MiB)",
                                                             sectors, block,
                                                             sectors.saturating_mul(block as u64) / (1024 * 1024)));
-                                                        if msc::read_block(&ctx, &m, &d, &dt, &mut dk, 0, block) {
+                                                        disk = Some((dk, dt, sectors));
+                                                        let dk = &mut disk.as_mut().unwrap().0;
+                                                        if msc::read_block(&ctx, &m, &d, &dt, dk, 0, block) {
                                                             let b0 = d.read8(msc::DATA_OFF);
                                                             let b1 = d.read8(msc::DATA_OFF + 1);
                                                             let b2 = d.read8(msc::DATA_OFF + 2);
@@ -220,26 +223,54 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // positive "nothing happened" rather than an error. That structure is what makes a
     // microframe-scheduled transfer safe in a PREEMPTIBLE task - being descheduled at the wrong
     // moment costs one attempt, not correctness.
-    if let (Some((k, kt, ksplt)), Some(m), Some(d)) = (kbd.as_ref(), ctx.mmio(), ctx.dma_region()) {
+    // ONE LOOP, BOTH JOBS. The keyboard is polled and block requests are served from the same pass,
+    // because they share one controller and one set of channels - two loops would have to exclude
+    // each other anyway, and the exclusion would be the bug.
+    //
+    // Serving comes FIRST in the pass. A block request is a client blocked waiting on an answer,
+    // where a keyboard poll that slips a period costs nothing a human can perceive.
+    if let (Some(m), Some(d)) = (ctx.mmio(), ctx.dma_region()) {
         let mut state = hid::KeyState::new(&ctx);
         let mut reports: u64 = 0;
         let mut last_beat = ctx.read_tsc();
         // The interval the DEVICE asked for, floored to something a service can actually schedule.
         // `cycles_to_ticks` clamps sub-quantum sleeps to one 10 ms tick, so anything finer is
         // fiction here - and saying so beats pretending to honour a 1 ms interval.
-        let period_ms = (k.interval as u64).max(10);
-        ctx.log_fmt(format_args!(
-            "dwc2-svc: polling the keyboard every {} ms (device asked for {})", period_ms, k.interval));
+        // The interval the DEVICE asked for, floored to what a service can actually schedule, and 10
+        // when there is no keyboard - the loop still has block requests to serve.
+        let period_ms = kbd.as_ref().map(|(k, _, _)| (k.interval as u64).max(10)).unwrap_or(10);
+        ctx.log_fmt(format_args!("dwc2-svc: serving block I/O; keyboard poll every {} ms", period_ms));
+        let mut capless = false;
+        let mut served: u64 = 0;
         loop {
+            // Drain block requests, BOUNDED - the endpoint queue is 16 deep, so this is a storm
+            // detector rather than a throttle (the same bound the xhci service needed after an
+            // unbounded drain was found there).
+            if let Some((dk, dt, sectors)) = disk.as_mut() {
+                let mut drained = 0u32;
+                while let Some(msg) = ctx.try_recv() {
+                    drained += 1;
+                    if drained >= MSG_DRAIN_MAX {
+                        ctx.log("dwc2-svc: block drain hit its bound - a sender is enqueuing as fast as we retire");
+                        break;
+                    }
+                    if msc::serve(&ctx, &m, &d, dt, dk, &msg, *sectors, &mut capless) {
+                        served = served.wrapping_add(1);
+                    }
+                }
+            }
+            if let Some((k, kt, ksplt)) = kbd.as_ref() {
             if hid::poll(&ctx, &m, &d, kt, *ksplt, k, &mut state) {
                 reports = reports.wrapping_add(1);
                 if reports == 1 {
                     ctx.log("dwc2-svc: *** FIRST KEY REPORT FROM USERSPACE *** - type and it reaches the console");
                 }
             }
+            }
             if ctx.read_tsc().wrapping_sub(last_beat) > ctx.duration_cycles(HEARTBEAT_MS) {
                 last_beat = ctx.read_tsc();
-                ctx.log_fmt(format_args!("dwc2-svc: alive - {} key report(s)", reports));
+                ctx.log_fmt(format_args!(
+                    "dwc2-svc: alive - {} key report(s), {} block request(s)", reports, served));
             }
             ctx.sleep(ctx.duration_cycles(period_ms));
         }

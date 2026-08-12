@@ -339,3 +339,112 @@ pub fn read_block(
     ];
     bot(ctx, mmio, dma, t, disk, &cdb, true, block as usize).is_some()
 }
+
+
+// --- The block IPC protocol (what `block-driver` already speaks on the Pi 4) -------------------
+//
+// Identical wire format, deliberately: `block-driver`'s `xhciblk` client is reused unchanged, so
+// this port adds one hop and changes nothing `fs` sees.
+pub const OP_READ_BLOCK: u8 = 1;
+pub const OP_WRITE_BLOCK: u8 = 2;
+pub const OP_CAPACITY: u8 = 3;
+pub const OP_WRITE_ZEROS: u8 = 4;
+pub const OP_FLUSH: u8 = 5;
+pub const STATUS_OK: u8 = 0;
+pub const STATUS_ERR: u8 = 1;
+
+/// WRITE(10): one block from the arena's data buffer.
+pub fn write_block(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk, lba: u32, block: u32,
+) -> bool {
+    let cdb = [
+        0x2Au8, 0,
+        (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
+        0, 0, 1, 0,
+    ];
+    bot(ctx, mmio, dma, t, disk, &cdb, false, block as usize).is_some()
+}
+
+/// Serve one block request. Returns false if the message was not one.
+///
+/// The reply cap is the ONLY authority to answer (§8.5), and a request without one cannot be
+/// answered at all - so it is dropped LOUDLY rather than silently, which is the fault the userspace
+/// audit found in the GENET backend and fixed for the same reason.
+pub fn serve(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk,
+    msg: &godspeed_sdk::Message, sectors: u64, capless_logged: &mut bool,
+) -> bool {
+    let p = msg.payload_bytes();
+    if p.is_empty() {
+        return false;
+    }
+    let reply = match ctx.take_pending_cap() {
+        Some(c) => c,
+        None => {
+            if !*capless_logged {
+                *capless_logged = true;
+                ctx.log("dwc2-svc: block request had no reply cap - dropping (cannot answer without one)");
+            }
+            return true;
+        }
+    };
+
+    let mut out = [0u8; 520];
+    let n = match p[0] {
+        OP_CAPACITY => {
+            out[0] = STATUS_OK;
+            out[1..9].copy_from_slice(&sectors.to_le_bytes());
+            9
+        }
+        OP_READ_BLOCK if p.len() >= 9 => {
+            let lba = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]) as u32;
+            if read_block(ctx, mmio, dma, t, disk, lba, 512) {
+                out[0] = STATUS_OK;
+                for i in 0..512 {
+                    out[1 + i] = dma.read8(DATA_OFF + i);
+                }
+                513
+            } else {
+                // STATUS_ERR and NOTHING else. A short reply carrying STATUS_OK would have the
+                // client copy whatever its message buffer held into a sector `fs` then trusts -
+                // which is the corruption the client's own length check exists to catch, and it
+                // should never have to.
+                out[0] = STATUS_ERR;
+                1
+            }
+        }
+        OP_WRITE_BLOCK if p.len() >= 521 => {
+            for i in 0..512 {
+                dma.write8(DATA_OFF + i, p[9 + i]);
+            }
+            let lba = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]) as u32;
+            out[0] = if write_block(ctx, mmio, dma, t, disk, lba, 512) { STATUS_OK } else { STATUS_ERR };
+            1
+        }
+        OP_FLUSH => {
+            // SYNCHRONIZE CACHE(10). This board's stick REFUSES it outright (CLAUDE.md §6.1,
+            // amendment 2026-07-25), and that refusal is a FACT ABOUT THE DEVICE rather than an
+            // error: reporting it as failure would make `fs` treat every flush as a fault. It is
+            // answered honestly - the constitution's crash-recovery guarantee is backend-conditional
+            // precisely because of this device.
+            let cdb = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            out[0] = if bot(ctx, mmio, dma, t, disk, &cdb, false, 0).is_some() { STATUS_OK } else { STATUS_ERR };
+            1
+        }
+        _ => {
+            out[0] = STATUS_ERR;
+            1
+        }
+    };
+
+    // The outcome is CHECKED, not discarded. A failed reply means the client waits out its deadline
+    // and calls this driver unresponsive while our log shows a clean run (userspace audit A8-3).
+    if ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n])).is_err()
+        && !*capless_logged
+    {
+        *capless_logged = true;
+        ctx.log("dwc2-svc: block reply send FAILED - the requester will time out");
+    }
+    ctx.remove_cap(reply);
+    true
+}
