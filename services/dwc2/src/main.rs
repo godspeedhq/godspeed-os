@@ -25,6 +25,7 @@ mod core;
 mod enumerate;
 mod hid;
 mod hub;
+mod msc;
 mod regs;
 
 use godspeed_sdk::ServiceContext;
@@ -157,8 +158,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                         if let Some((_, _, _, dt, dsplt)) =
                                             hub::enumerate_downstream(&ctx, &m, &d, &dev.target, p)
                                         {
+                                            // A device is one thing or the other, so try the
+                                            // keyboard binding first and the disk only if that
+                                            // declined. Both return None for "not mine", which is
+                                            // the ordinary answer on most ports and is not logged.
                                             if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 kbd = Some((k, dt, dsplt));
+                                            } else if let Some(dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
+                                                let _ = dk;
                                             }
                                         }
                                     }
