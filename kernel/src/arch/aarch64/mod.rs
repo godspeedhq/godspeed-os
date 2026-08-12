@@ -2466,3 +2466,10 @@ pub mod ap_boot {
 /// and needed explicit `dma_sync` on every buffer; a service has no such primitive, so the mapping
 /// must remove the need rather than rely on the driver author remembering.
 pub const DMA_ARENA_UNCACHED: bool = true;
+
+/// Where a driver's DMA arena is mapped in ITS address space.
+///
+/// Per-arch because it is an ADDRESS, and an address is only meaningful in an address space that can
+/// hold it. The shared constant was `0x2_0000_0000`, an x86_64 value: on ARMv7 that is above the 32-bit
+/// ceiling, and the mapper truncated it to 0, laying the arena over the kernel's low megabyte.
+pub const DRIVER_DMA_VA: u64 = 0x2_0000_0000;

@@ -3899,13 +3899,13 @@ fn spawn_service_with_config(
                 for i in 0..dma_pages {
                     let off = i * PAGE_SIZE as u64;
                     page_table
-                        .map(VirtAddr(XHCI_DMA_VA + off), PhysAddr(phys + off), flags)
+                        .map(VirtAddr(crate::arch::imp::DRIVER_DMA_VA + off), PhysAddr(phys + off), flags)
                         .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::MapFailed })?;
                 }
                 let len = dma_pages * PAGE_SIZE as u64;
                 crate::kprintln!(
                     "spawn[dma]: '{}' arena phys {:#x} -> VA {:#x} ({} KiB)",
-                    name, phys, XHCI_DMA_VA, len / 1024
+                    name, phys, crate::arch::imp::DRIVER_DMA_VA, len / 1024
                 );
                 // H1 Phase 1d: confine this DMA-capable driver to its arena via
                 // the IOMMU, so a compromised driver cannot DMA outside it. No-op
@@ -3949,7 +3949,7 @@ fn spawn_service_with_config(
                     pci::set_power_d0(bdf);  // bring the device to D0 first - firmware may park a non-boot NIC in D3
                     pci::set_bus_master(bdf);
                 }
-                (XHCI_DMA_VA, phys, len)
+                (crate::arch::imp::DRIVER_DMA_VA, phys, len)
             }
             None => {
                 crate::kprintln!("spawn[dma]: '{}' WARN: no contiguous DMA arena", name);

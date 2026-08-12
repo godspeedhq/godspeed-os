@@ -50,7 +50,7 @@ bitflags::bitflags! {
 }
 
 #[derive(Debug)]
-pub enum MapError { FrameAllocFailed, AlreadyMapped, NotMapped }
+pub enum MapError { FrameAllocFailed, AlreadyMapped, NotMapped, VirtOutOfRange }
 
 // ---- Descriptor encoding ----
 
@@ -332,6 +332,27 @@ impl PageTable {
     /// needed and writes the small-page descriptor - the same encoders `map_in_active_tables` uses
     /// and the selftest proves.
     pub fn map(&mut self, virt: VirtAddr, phys: PhysAddr, flags: PageFlags) -> Result<(), MapError> {
+        // REJECT a virtual address this architecture cannot express. Do not truncate it.
+        //
+        // `virt.0` is a u64 because the page-table API is arch-neutral; ARMv7 short descriptors
+        // address 32 bits. `virt.0 as u32` silently discards the high half, and a discarded high half
+        // does not fail - it MAPS SOMEWHERE ELSE. A 64-bit constant carried over from x86 is the
+        // realistic source, and this is what one did:
+        //
+        //   spawn[dma]: 'dwc2' arena phys 0x2f41000 -> VA 0x200000000 (64 KiB)
+        //
+        // 0x2_0000_0000 truncates to 0x0, so the arena was mapped over L1 entry 0 - the identity
+        // mapping of the low megabyte, which on this board holds the kernel image and the exception
+        // vectors. The task then made no progress and printed nothing, and the liveness watchdog
+        // panicked ten seconds later pointing at the task rather than at the mapping that had
+        // destroyed its address space.
+        //
+        // The MMIO grant one commit earlier failed LOUDLY with `MapFailed` for the same root cause
+        // and cost one boot to find. This path silently corrupted memory instead and cost three.
+        // Same bug, and the only difference in what it cost was whether anything checked.
+        if virt.0 > u32::MAX as u64 || phys.0 > u32::MAX as u64 {
+            return Err(MapError::VirtOutOfRange);
+        }
         let va = virt.0 as u32;
         let pa = phys.0 as u32;
         let l1_index = (va >> 20) as usize;
