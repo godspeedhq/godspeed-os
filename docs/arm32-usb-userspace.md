@@ -146,7 +146,9 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 | # | Work | Test |
 |---|---|---|
 | **0** | One owner: gate the in-kernel driver's tick hooks on `route::registered_endpoint(USB_VECTOR).is_none()` - the same predicate the IRQ dispatch already uses | ✅ selfcheck 351/0, no panics, invisible on a normal boot. **Handover is ONE-WAY - see below** |
-| **1** | Port + enumerate: reset, port bring-up, control transfers, hub walk. Logs the device tree and stops | Reports the same VID/PIDs the kernel driver found. USB devices do not work; serial carries the session |
+| **1a** | Core bring-up: soft reset, host mode, FIFO sizing, root-port power + reset | ✅ **hardware-verified 2026-08-12** - `core bring-up OK`, `HPRT=0x0000100f connected=true enabled=true speed=high` |
+| **1b** | Channels + control transfers (`chan_program`, `chan_dma`, `ctrl_xfer`) | a device descriptor read back from the hub |
+| **1c** | Enumeration + hub walk + split transactions | the same VID/PIDs the kernel driver reports |
 | **2** | Keyboard: HID + `CONSOLE_PUSH` | Typing works from userspace. Second ON PURPOSE - it makes the machine usable for testing the rest |
 | **3** | Mass storage: BOT/SCSI; `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | `drives`, `ls`, `selfcheck` |
 | **4** | Networking: CDC-ECM + smsc95xx; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | DHCP, `ping` |
@@ -162,6 +164,28 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
   (`wait_for_uframe`, `write_hfnum`). It is the most timing-sensitive code in the file, and it moves
   from ring 0 with interrupts masked to a PREEMPTIBLE userspace task. Expect this to be the slice that
   bites. It sits inside Slice 1, because the hub needs it - worth knowing before rather than during.
+
+## Slice 1a result
+
+```
+dwc2-svc: DesignWare USB 2.0 OTG core, GSNPSID=0x4f54280a
+dwc2-svc: DFIFO depth 4080 words; sizing RX/NPTX/PTX 774/256/512 (Linux bcm2835)
+dwc2-svc: core bring-up OK
+dwc2-svc: root port HPRT=0x0000100f connected=true enabled=true speed=high
+```
+
+Connected, enabled, powered, high speed - the Pi's internal hub, brought up from USERSPACE with zero
+`unsafe` in the service. First try on hardware.
+
+`0 USB IRQ(s)` afterwards is correct and not a regression: bring-up step 1 masks global interrupts
+(`GINTMSK = 0`) and nothing re-enables them yet, because there is nothing to service until channels
+exist. Slice 1b re-enables them with the first transfer.
+
+**What made it work first time was refusing to re-derive it.** The register map and sequence were
+lifted with their comments, and three of the steps they carry (UTMI+ 8-bit selection, the bcm2835
+FIFO layout, the post-resize FIFO flush) are HW-diagnosed facts that pass in QEMU and fail on the
+board. The one thing the mechanical lift dropped - the `cfg` gate on `DMA_BUS_ALIAS` - was caught by
+the compiler, and would otherwise have failed on exactly one of the two targets.
 
 ## What makes arm32 harder than the AArch64 port
 
