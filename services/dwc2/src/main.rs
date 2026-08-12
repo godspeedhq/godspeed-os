@@ -34,20 +34,26 @@ const MSG_DRAIN_MAX: u32 = 256;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    ctx.log("dwc2: starting (SKELETON - proves the IRQ path, drives nothing)");
+    // PREFIX `dwc2-svc:`, not `dwc2:`.
+    //
+    // The IN-KERNEL driver already owns the `dwc2:` prefix and prints heavily - hub ports, MSC
+    // capacity, FUA. With both writing to one serial console, an identical prefix makes the log
+    // unreadable exactly when it matters: the whole question this service exists to answer is which
+    // of the two is receiving the interrupt, and a shared prefix would hide that.
+    ctx.log("dwc2-svc: starting (SKELETON - proves the IRQ path, drives nothing)");
 
     // The two hardware grants, reported rather than assumed. A driver that cannot reach its
     // registers is not a degraded driver, it is not a driver at all, and the boot log should say
     // which of the two is missing rather than leaving the reader to infer it from silence.
     match ctx.mmio() {
         Some(m) => ctx.log_fmt(format_args!(
-            "dwc2: MMIO window granted - {} bytes (DWC2 core registers)", m.len())),
-        None => ctx.log("dwc2: NO MMIO window - the kernel granted none (hw_device mismatch?)"),
+            "dwc2-svc: MMIO window granted - {} bytes (DWC2 core registers)", m.len())),
+        None => ctx.log("dwc2-svc: NO MMIO window - the kernel granted none (hw_device mismatch?)"),
     }
     match ctx.dma_region() {
         Some(d) => ctx.log_fmt(format_args!(
-            "dwc2: DMA arena granted - {} bytes at phys {:#x}", d.len(), d.phys_at(0))),
-        None => ctx.log("dwc2: NO DMA arena - the kernel granted none"),
+            "dwc2-svc: DMA arena granted - {} bytes at phys {:#x}", d.len(), d.phys_at(0))),
+        None => ctx.log("dwc2-svc: NO DMA arena - the kernel granted none"),
     }
 
     // Interrupts arrive as ordinary IPC on this service's receive endpoint: the kernel's neutral
@@ -70,7 +76,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         while let Some(m) = ctx.try_recv() {
             drained += 1;
             if drained >= MSG_DRAIN_MAX {
-                ctx.log("dwc2: message drain hit its bound - a sender is enqueuing as fast as we retire (storm?)");
+                ctx.log("dwc2-svc: message drain hit its bound - a sender is enqueuing as fast as we retire (storm?)");
                 break;
             }
             msgs = msgs.wrapping_add(1);
@@ -80,7 +86,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if !first_logged {
                     first_logged = true;
                     // THE LINE THIS SERVICE EXISTS TO PRINT.
-                    ctx.log("dwc2: *** USB INTERRUPT DELIVERED TO USERSPACE *** - arm32 device IRQ routing works");
+                    ctx.log("dwc2-svc: *** USB INTERRUPT DELIVERED TO USERSPACE *** - arm32 device IRQ routing works");
                 }
                 // Unmask so the line can fire again. The kernel masked it on delivery because DWC2's
                 // interrupt is LEVEL-triggered and stays asserted until the device is serviced; a
@@ -98,7 +104,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // nonzero msgs would mean the endpoint is live and the ROUTE is not - a different fault
             // from silence, and one that silence alone could not distinguish.
             ctx.log_fmt(format_args!(
-                "dwc2: alive - {} USB IRQ(s), {} message(s) total", irqs, msgs));
+                "dwc2-svc: alive - {} USB IRQ(s), {} message(s) total", irqs, msgs));
         }
     }
 }
