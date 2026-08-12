@@ -166,8 +166,26 @@ pub fn poll(
     let hcint = chan::periodic_split_in(
         ctx, mmio, t, chan::CH_KBD, state.pid, phys, len, kbd.ep as u32, splt);
 
-    if hcint & crate::regs::HCINT_XFERCOMPL == 0 {
+    // A NAK is not a report, even when XFERCOMPL rides along with it.
+    //
+    // HCINT can latch BOTH, and testing only XFERCOMPL counted every idle poll as a keystroke: the
+    // counter climbed at ~2/second with nothing typed, which made it useless for the one question it
+    // exists to answer - are keystrokes reaching us, or reaching us and failing to decode?
+    if hcint & crate::regs::HCINT_XFERCOMPL == 0 || hcint & crate::regs::HCINT_NAK != 0 {
         return false; // NAK (idle), NYET, or a rescheduled attempt - all ordinary
+    }
+    // An all-zero report is the keyboard saying every key is RELEASED. It is a real report and must
+    // still be decoded (that is how a key-up is seen), but it is worth separating in the count from
+    // reports that carry a keypress, so "keys are arriving" and "keys are being released" do not look
+    // the same from the log.
+    let any = (0..8).any(|i| dma.read8(REPORT_OFF + i) != 0);
+    if !any {
+        state.pid = chan::pid_from_hctsiz(mmio, chan::CH_KBD);
+        let mut rel = [0u8; 8];
+        godspeed_sdk::hid::decode_keyboard(
+            &rel, &mut state.last, &mut state.repeat, &mut state.caps,
+            ctx.read_tsc(), |ch| ctx.console_push(ch), |_| {});
+        return false;
     }
     // READ THE TOGGLE BACK FROM THE HARDWARE. Do not flip it in software.
     //
