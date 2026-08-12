@@ -261,7 +261,33 @@ that, the survey would have reported whatever the previous transfer left in the 
 topology assembled from stale bytes, which is worse than an obviously wrong one because it would have
 been believed. That defence was written three slices earlier for exactly this shape of bug.
 
-## Slice 3: selfcheck RUNS - 351 tests, 3 failures, ~500x faster
+## SLICE 3 COMPLETE - `selfcheck 350, failed 0` on the userspace driver
+
+```
+20:14:12  ran  48, failed 4    <- BEFORE `spawn dwc2`: block-driver now talks only to the
+                                  service, so storage is dead until it runs. Expected.
+20:15:35  ran 350, failed 0    <- with the service running. CLEAN.
+20:16:50  ran 350, failed 2    <- repeat run: `drives check` + `drives scrub`
+```
+
+A full clean `selfcheck` on a userspace USB driver: keyboard, filesystem and every shell utility,
+with the disk served over IPC by a service holding zero `unsafe`.
+
+The first run's 4 failures are the one-way transition showing itself, not a fault - they are the same
+4 writes, and they disappear the moment the service owns the controller.
+
+### Known intermittent, and the next thing to chase
+
+`drives check` and `drives scrub` failed on the THIRD run having passed on the second. They are the
+heaviest read workloads in the suite (whole-tree fsck passes), so this is intermittent under sustained
+load rather than broken.
+
+Worth chasing before slice 4, and the instruments to answer it already exist: the per-stage busy
+counters and the segment timing are both still in. If a scrub failure comes with busy counts climbing,
+it is the device pacing under sustained read; if the counters stay zero, it is something else again -
+and the last three times that question was asked, the answer was not where it looked.
+
+## Superseded: 351 tests, 3 failures, ~500x faster
 
 ```
 20:11:00 -> 20:11:15   1826 -> 7434 blocks = 374/sec   (was 0.7/sec)
