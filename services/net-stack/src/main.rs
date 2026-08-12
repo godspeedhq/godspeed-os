@@ -957,6 +957,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut sockets = [Socket { rid: 0, port: 0 }; MAX_SOCKETS];
     let mut ping_seq: u16 = 0;                    // unique ICMP seq per ping - see ping() (RTT accuracy)
     let tsc_hz = calibrate_tsc_hz(&ctx);          // RTC-calibrated TSC Hz for RTT (kernel calib is 0 on T630)
+    // Outside the loop deliberately: a once-only latch declared inside the loop it guards resets every
+    // iteration and reports every time, which is the flood it exists to prevent.
+    let mut capless_logged = false;
     loop {
         // A BARE BLOCK, deliberately - the idle tick that was here is REVERTED (audit A10-1/A5-2).
         //
@@ -982,7 +985,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let badge = ctx.last_recv_badge();
         let reply_cap = match ctx.take_pending_cap() {
             Some(c) => c,
-            None => continue,                   // a request with no reply cap - drop it
+            // A request with no reply cap cannot be answered - but dropping it SILENTLY means the
+            // client waits out its deadline and calls net-stack unresponsive while our log shows a
+            // clean run. Say it once (the condition repeats per request, and the report must not
+            // become the flood), then drop it.
+            None => {
+                if !capless_logged {
+                    capless_logged = true;
+                    ctx.log("net-stack: request had no reply cap - dropping (cannot answer without one)");
+                }
+                continue;
+            }
         };
         let pl = req.payload_bytes();
         // AUTO-CONFIGURE: while UNCONFIGURED (no gateway - booted with no cable, or a boot dance that met a

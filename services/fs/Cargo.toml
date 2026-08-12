@@ -8,11 +8,8 @@ name = "fs"
 path = "src/main.rs"
 
 [features]
-# Diagnostic only, OFF by default: the `[fcapr]` capability-identity lines on the file-cap path.
 # A feature rather than a promise to remove it, because §7.10 means real file I/O will eventually run
 # through `serve_filecap`, and this would then be per-request logging on every read and write.
-# Set for all three crates at once by `scripts/pi4_build.py --fcap-diag`, never by hand in one.
-fcap-diag = []
 
 # Run the mount-time self-test (writes /greeting + /etc/motd to verify the hierarchy
 # and reboot survival). TEST BUILDS ONLY - it writes to the disk, so it must never be

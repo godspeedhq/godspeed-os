@@ -1282,10 +1282,29 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
     let mut link_was_up = g.link_is_up();
     let mut rxbuf = [0u8; FRAME_MAX];
 
+    // Outside the loop deliberately: a once-only latch declared inside the loop it guards resets on
+    // every iteration and reports every time, which is the flood it exists to prevent.
+    let mut capless_logged = false;
+    let mut reply_failed_logged = false;
     loop {
         let req = ctx.recv();
         // The reply cap is the ONLY authority to answer net-stack (§8.5).
-        let Some(reply_cap) = ctx.take_pending_cap() else { continue };
+        //
+        // A request that carries none cannot be answered, and dropping it SILENTLY leaves no evidence
+        // anywhere: net-stack waits out its deadline and reports the driver unresponsive, while the
+        // driver's log shows a clean run. The sibling backend (`main.rs`) already logs this; GENET is
+        // the backend that actually runs on the Pi 4 and was the one that forgot (Commandment III -
+        // two implementations of one rule).
+        //
+        // Rate-limited to once, because the condition repeats per request and the report must not
+        // become the flood it is reporting.
+        let Some(reply_cap) = ctx.take_pending_cap() else {
+            if !capless_logged {
+                capless_logged = true;
+                ctx.log("nic-driver: request had no reply cap - dropping (cannot answer without one)");
+            }
+            continue;
+        };
         let p = req.payload_bytes();
 
         if p.len() == 1 && p[0] == 3 {
@@ -1331,11 +1350,17 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
                 link_was_up = up_now;
             }
             out[7] = up_now as u8;
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out));
+            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)).is_err() && !reply_failed_logged {
+            reply_failed_logged = true;
+            ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
+        }
         } else if p.len() == 1 && p[0] == 4 {
             // RX-only: one frame, no TX.
             let n = g.receive(&mut rxbuf);
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
+            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])).is_err() && !reply_failed_logged {
+            reply_failed_logged = true;
+            ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
+        }
         } else if p.len() == 1 && p[0] == 9 {
             // BATCH RX drain: [count:u8] then per frame [len:u16 LE][bytes]. Bounded three ways - by
             // BATCH_MAX, by the reply buffer, and by the ring emptying - so it always terminates.
@@ -1361,14 +1386,20 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
                 count += 1;
             }
             out[0] = count;
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos]));
+            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])).is_err() && !reply_failed_logged {
+            reply_failed_logged = true;
+            ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
+        }
         } else if p.len() == 1 && matches!(p[0], 5 | 6 | 7 | 8) {
             // UNSUPPORTED on this backend - answered `[0]`, not `[1]`. Ops 6/7/8 are the chaos
             // force-link override and op 5 is a Realtek/e1000-shaped register dump; acking any of them
             // with success would make `chaos link-flap` print that it had exercised link recovery
             // having exercised nothing. A test that cannot fail is worse than absent when it reads as
             // passing. The caller needs an ANSWER, and "not supported here" is one.
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8]));
+            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])).is_err() && !reply_failed_logged {
+            reply_failed_logged = true;
+            ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
+        }
         } else {
             // TX FRAME (any multi-byte payload) + coupled RX: transmit, then hand back one frame.
             if !g.transmit(p, &mut tx_next) {
@@ -1385,7 +1416,10 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
                 g.report_counters();
             }
             let n = g.receive(&mut rxbuf);
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
+            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])).is_err() && !reply_failed_logged {
+            reply_failed_logged = true;
+            ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
+        }
         }
         ctx.remove_cap(reply_cap);
     }

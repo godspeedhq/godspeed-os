@@ -24,10 +24,15 @@ log_write = true
 [placement]
 core = 1
 
-# Reach the `xhci` SERVICE by IPC. Present only when the USB stack runs in userspace
-# (`pi4_build.py --xhci-userspace`, which sets the kernel's `xhci-userspace` and this service's
-# `usb-via-xhci`); on every other build block-driver talks to its disk through AHCI (x86) or the
-# in-kernel USB syscalls (Pi 2), and this peer goes unused.
+# Reach the `xhci` SERVICE by IPC. This is how block-driver gets its sectors on AArch64 (Pi 4),
+# where the USB stack is a userspace service and the in-kernel driver no longer exists in ANY build
+# (CLAUDE.md, amendment 2026-08-09). On every other target block-driver talks to its disk through
+# AHCI (x86) or the in-kernel USB syscalls (Pi 2), and this peer goes unused.
+#
+# The build flags this comment used to cite (`pi4_build.py --xhci-userspace`, the kernel's
+# `xhci-userspace`, this service's `usb-via-xhci`) were deleted with that driver: a flag selecting
+# between a compliant and a non-compliant kernel leaves the violation one build away. A contract is
+# a spec artifact, so citing a flag that cannot be set sends a reader hunting for it.
 #
 # It is declared UNCONDITIONALLY here while the kernel declares it under `cfg(feature)`, because a
 # TOML contract has no notion of a build feature and `contract_check.py` compares one text against

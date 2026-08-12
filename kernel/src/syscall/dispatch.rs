@@ -1182,14 +1182,6 @@ fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
     };
-    // FCAP-RESTART INSTRUMENTATION (temporary - remove when the post-restart escalation is closed).
-    // The IDENTITY the kernel validated, which is the thing in question: a "read-only" cap that wrote
-    // means this line reports rights containing WRITE for the slot the shell believed was read-only.
-    #[cfg(feature = "fcap-diag")]
-    crate::log::write_fmt(format_args!(
-        "[fcapr] kernel: slot={} declared={:#x} -> resource={} cap_rights={:#x} gen={}
-",
-        file_slot, right_bits, file_cap.resource_id.0, file_cap.rights.0, file_cap.generation.0));
     if !delegated::is_delegated(file_cap.resource_id) {
         return cap_err_to_i64(CapError::CapWrongScope); // not a delegated/file cap
     }

@@ -1315,11 +1315,6 @@ fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8
     }
 
     // Resolve the resource id → path (copied out, so `fs` can be borrowed mutably below).
-    // FCAP-RESTART INSTRUMENTATION (temporary). The badge as fs receives it, and whether this rid is
-    // one THIS instance opened - a rid minted by a dead instance resolving here is suspect 2.
-    #[cfg(feature = "fcap-diag")]
-    ctx.log_fmt(format_args!("[fcapr] fs: badge rid={} right={:#x} fop={} known={}",
-                             rid, right, fop, fs.open_path(rid).is_some()));
     let (path_buf, plen) = match fs.open_path(rid) {
         Some(x) => x,
         None    => { send(&[FS_NOTFOUND]); return; } // unknown/closed resource

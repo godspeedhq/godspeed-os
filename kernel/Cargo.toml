@@ -42,12 +42,9 @@ panic = "abort"
 
 [features]
 # Diagnostic only, OFF by default. Prints capability IDENTITY across the file-cap invoke path
-# (`[fcapr]` lines) while the post-chaos escalation is being hunted. It sits on the file-capability
 # path alone, so it costs nothing on any other work today - but §7.10 means real file I/O will run
 # through that path eventually, at which point this would become per-request logging on every read
 # and write. Hence a feature rather than a comment promising to remove it.
-# Turned on for every crate at once by `scripts/pi4_build.py --fcap-diag`; never set it by hand in
-fcap-diag = []
 # Target the Raspberry Pi 4 Model B (BCM2711) rather than QEMU's `virt` machine, for the aarch64 build.
 # Selects the 0x80000 flat-load linker script and the BCM2711 peripheral base (PL011 at 0xFE201000);
 # without it the aarch64 build stays the QEMU `virt` boundary-demarcation target it has been.

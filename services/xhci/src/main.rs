@@ -519,6 +519,15 @@ const HUB_RESCAN_MS: u64 = 1_500;
 /// whenever a hub is unresponsive.
 const PROBE_ANSWER_MS: u64 = 10;
 
+/// Cap on how many messages one drain retires before it gives up the pass.
+///
+/// The endpoint queue is 16 deep (CLAUDE.md 8.5), so any bound well above that is not a throttle -
+/// it is a storm detector. A sender enqueuing as fast as we dequeue would otherwise keep an
+/// unbounded drain running forever, and while it runs the USB poll loop is NOT polling: the keyboard
+/// stops. The event drain in this file already carries this exact bound and this exact reasoning;
+/// the message drain is the same shape with a different producer, and was missing it.
+const MSG_DRAIN_MAX: u32 = 256;
+
 // 10, cut from 50, because the budget is spent WAITING FOR AN ANSWER THAT DOES NOT COME.
 //
 // Measured: the hub segment burns ~10 s of wall time per minute, i.e. the probes time out almost
@@ -594,7 +603,17 @@ fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
         // with no HID attached lives, and 'poll is the only other place we drain. Without this, a chaos
         // flood-storm (or any stray send) fills our 16-deep queue and it sits at 16/16 FOREVER, exactly
         // the logger stub bug in another guise. try_recv is non-blocking, so the port poll is unaffected.
-        while ctx.try_recv().is_some() {}
+        {
+            // BOUNDED: see MSG_DRAIN_MAX. "it stops when the sender stops" is not a bound.
+            let mut drained = 0u32;
+            while ctx.try_recv().is_some() {
+                drained += 1;
+                if drained >= MSG_DRAIN_MAX {
+                    ctx.log("xhci: message drain hit its bound - a sender is enqueuing as fast as we retire (storm?)");
+                    break;
+                }
+            }
+        }
         ctx.sleep(ctx.duration_cycles(IDLE_WAIT_MS));
     }
 }
@@ -627,7 +646,17 @@ fn idle(ctx: &ServiceContext) -> ! {
     // drains every quantum with no wake needed (mirrors wait_for_port above + ehci idle_draining). Pinned by
     // the shell-test `chaos flood-storm xhci` step (xhci has no controller in QEMU, so it sits in this path).
     loop {
-        while ctx.try_recv().is_some() {}
+        {
+            // BOUNDED: see MSG_DRAIN_MAX. "it stops when the sender stops" is not a bound.
+            let mut drained = 0u32;
+            while ctx.try_recv().is_some() {
+                drained += 1;
+                if drained >= MSG_DRAIN_MAX {
+                    ctx.log("xhci: message drain hit its bound - a sender is enqueuing as fast as we retire (storm?)");
+                    break;
+                }
+            }
+        }
         ctx.sleep(ctx.duration_cycles(IDLE_WAIT_MS));
     }
 }
@@ -3246,7 +3275,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
                 let t0 = ctx.read_tsc();
                 loop {
-                    while ctx.try_recv().is_some() {}
+                    {
+                        // BOUNDED: see MSG_DRAIN_MAX. "it stops when the sender stops" is not a bound.
+                        let mut drained = 0u32;
+                        while ctx.try_recv().is_some() {
+                            drained += 1;
+                            if drained >= MSG_DRAIN_MAX {
+                                ctx.log("xhci: message drain hit its bound - a sender is enqueuing as fast as we retire (storm?)");
+                                break;
+                            }
+                        }
+                    }
                     let mut new_root = false;
                     for p in 1..=max_ports {
                         let c = mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10)
