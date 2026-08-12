@@ -18,6 +18,7 @@ use crate::chan::{self, Target};
 
 /// Standard descriptor types.
 const DESC_DEVICE: u8 = 0x01;
+const DESC_CONFIG: u8 = 0x02;
 const DESC_HUB: u8 = 0x29;
 
 /// USB device class 0x09 = hub.
@@ -112,6 +113,33 @@ pub fn root_device(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> Option<RootD
     ctx.log_fmt(format_args!(
         "dwc2-svc: root device addressed - VID:PID={:04x}:{:04x} class={:#04x} mps0={}",
         vid, pid, class, mps0));
+
+    // SET_CONFIGURATION, without which the hub answers class requests with NOTHING.
+    //
+    // A device that has been addressed is in the ADDRESS state, and USB 2.0 chapter 9 only permits
+    // class requests in the CONFIGURED state. Skipping this does not produce an error: the hub
+    // accepted every port-power and port-status request and returned zeros, so all five ports read as
+    // empty on a board with four devices attached.
+    //
+    // It was VISIBLE only because slice 1b zeroes the IN scratch before every read. Without that, the
+    // survey would have reported whatever the previous transfer left in the buffer - a plausible
+    // topology assembled from stale bytes, which is far worse than an obviously wrong one. That
+    // defence was written for exactly this shape of bug and earned itself here.
+    let mut cfg = [0u8; 9];
+    if !chan::get_descriptor(ctx, mmio, dma, &t, DESC_CONFIG, 0, &mut cfg, 9) {
+        ctx.log("dwc2-svc: config descriptor read FAILED");
+        return None;
+    }
+    // bConfigurationValue is byte 5. Use the value the DEVICE reports rather than assuming 1: it is
+    // usually 1, and a device for which it is not would silently stay unconfigured.
+    let cfg_val = cfg[5];
+    let setup = [0x00, 0x09, cfg_val, 0, 0, 0, 0, 0];
+    let mut none: [u8; 0] = [];
+    if !chan::control(ctx, mmio, dma, &t, &setup, &mut none, false, 0) {
+        ctx.log_fmt(format_args!("dwc2-svc: SET_CONFIGURATION {} FAILED", cfg_val));
+        return None;
+    }
+    ctx.log_fmt(format_args!("dwc2-svc: configured (bConfigurationValue={})", cfg_val));
 
     let hub_ports = if class == CLASS_HUB {
         let n = hub_port_count(ctx, mmio, dma, &t);
