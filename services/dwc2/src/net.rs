@@ -30,6 +30,12 @@ pub struct Stats {
     pub rx_bytes:   u32,   // total bytes those bursts carried
     pub rx_frames:  u32,   // complete frames the parse handed up
     pub rx_bad:     u32,   // bursts whose first status word did not parse
+    /// HCINT from the LAST bulk-IN that did not complete, plus how many times the channel never
+    /// halted at all. The controller writes down why every transfer ended; discarding that and
+    /// guessing is what turns a five-minute diagnosis into an afternoon. 0 with a non-zero
+    /// `rx_nohalt` means the channel never halted - a different fault from any error bit.
+    pub rx_hcint:   u32,
+    pub rx_nohalt:  u32,
 }
 
 pub struct Nic {
@@ -444,7 +450,7 @@ pub fn tx(
     // No ZLP needed: the smsc95xx carries an explicit length in its TX command, so it does not rely on
     // a short packet to find the frame boundary the way CDC-ECM does.
     let ok = bulk(ctx, mmio, t, nic.mps, false, nic.ep_out, dma.phys_at(TX_OFF) as u32,
-                  (n + 8) as u32, 2_000, &mut nic.pid_out).is_some();
+                  (n + 8) as u32, 2_000, &mut nic.pid_out, None).is_some();
     if ok { nic.stats.tx_ok += 1; } else { nic.stats.tx_fail += 1; }
     ok
 }
@@ -457,10 +463,15 @@ pub fn rx(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Nic,
     mut deliver: impl FnMut(&[u8]),
 ) -> u32 {
+    let mut why = (0u32, 0u32);
     let got = match bulk(ctx, mmio, t, nic.mps, true, nic.ep_in, dma.phys_at(RX_OFF) as u32,
-                         RX_BURST as u32, 50, &mut nic.pid_in) {
+                         RX_BURST as u32, 50, &mut nic.pid_in, Some(&mut why)) {
         Some(n) => n as usize,
-        None => return 0, // NAK on a quiet network is the normal case, not an error
+        None => {
+            nic.stats.rx_hcint = why.0;
+            nic.stats.rx_nohalt = nic.stats.rx_nohalt.wrapping_add(why.1);
+            return 0; // NAK on a quiet network is the normal case, not an error
+        }
     };
     if got > 0 {
         nic.stats.rx_bursts += 1;
@@ -510,24 +521,31 @@ pub fn rx(
 fn bulk(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target, mps: u16,
     dir_in: bool, ep: u8, buf_phys: u32, len: u32, budget_ms: u64, pid: &mut u32,
+    why: Option<&mut (u32, u32)>,
 ) -> Option<u32> {
     let bt = Target { addr: t.addr, mps, low_speed: false };
     let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(budget_ms));
+    let mut last = 0u32;
+    let mut halted = 0u32;
     loop {
         chan::program(mmio, &bt, CH_NET, dir_in, *pid, len, buf_phys, ep as u32, 2, 0);
         match chan::wait_halt(ctx, mmio, CH_NET, 50) {
             Some(hcint) if hcint & crate::regs::HCINT_XFERCOMPL != 0 => {
                 let left = mmio.read32(chan::hctsiz_at(CH_NET)) & 0x7_FFFF;
                 *pid = chan::pid_from_hctsiz(mmio, CH_NET);
+                if let Some(w) = why { *w = (hcint, 0); }
                 return Some(len.saturating_sub(left));
             }
-            Some(hcint) if hcint & crate::regs::HCINT_STALL != 0 => return None,
-            _ => {}
+            Some(hcint) if hcint & crate::regs::HCINT_STALL != 0 => { last = hcint; halted += 1; break; }
+            Some(hcint) => { last = hcint; halted += 1; }
+            None => {}
         }
         if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
-            return None;
+            break;
         }
     }
+    if let Some(w) = why { *w = (last, if halted == 0 { 1 } else { 0 }); }
+    None
 }
 
 /// The NIC's own channel. Separate from CH_BULK (disk/control) and CH_KBD for the same reason those
