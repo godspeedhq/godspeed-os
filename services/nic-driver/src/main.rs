@@ -557,6 +557,20 @@ fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
 fn kernel_net_main(ctx: ServiceContext) -> ! {
     // How many bulk-IN polls to try when a request wants a received frame (net-stack also re-polls via
     // ops 4/9 under its own deadline, so this is a bounded best-effort, not a spin).
+    // ONE check per request on arm32, eight elsewhere.
+    //
+    // Off arm a poll is a cheap syscall, so re-asking gives the device a moment at no real cost. On
+    // arm32 the device now lives behind IPC, and eight round trips is eight times the latency of the
+    // answer net-stack is BLOCKED waiting for - which is why the shell kept reporting "net-stack not
+    // responding" while ping ran. A service blocking its own caller past their patience is the failure
+    // this system exists to avoid, and the poll loop was mine.
+    //
+    // It is also pointless work now: the bulk-IN is armed CONTINUOUSLY in the background, so asking
+    // eight times in one request cannot make a frame arrive sooner. It either has one or it does not,
+    // and net-stack polls again immediately.
+    #[cfg(target_arch = "arm")]
+    const RX_TRIES: usize = 1;
+    #[cfg(not(target_arch = "arm"))]
     const RX_TRIES: usize = 8;
     const FRAME_MAX: usize = 1600;
     const BATCH_MAX: u8 = 8;
