@@ -48,16 +48,21 @@ pub struct Disk {
     /// Reset only by a clear-halt or a SET_CONFIGURATION, which is why they live with the binding.
     pub pid_in: u32,
     pub pid_out: u32,
+    /// The mass-storage INTERFACE number. Needed by the Bulk-Only Mass Storage Reset, whose wIndex is
+    /// an interface rather than an endpoint or a device.
+    pub iface: u8,
+    /// Consecutive REAL failures (not busy hand-backs). Only a command that actually worked clears it.
+    pub fail_streak: u32,
 }
 
 /// Walk a configuration descriptor for a Bulk-Only mass-storage interface and its endpoints.
 ///
 /// Bounded by the buffer, and a zero-length descriptor ends the walk rather than freezing the cursor
 /// - device-supplied lengths drive this loop, so the classic parser hang is one malformed byte away.
-fn find_bulk_only(buf: &[u8], total: usize) -> Option<(u8, u8, u16)> {
+fn find_bulk_only(buf: &[u8], total: usize) -> Option<(u8, u8, u16, u8)> {
     let mut i = 0usize;
     let mut in_ms = false;
-    let (mut ep_in, mut ep_out, mut mps) = (0u8, 0u8, 64u16);
+    let (mut ep_in, mut ep_out, mut mps, mut iface) = (0u8, 0u8, 64u16, 0u8);
     while i + 2 <= total {
         let len = buf[i] as usize;
         let ty = buf[i + 1];
@@ -68,6 +73,9 @@ fn find_bulk_only(buf: &[u8], total: usize) -> Option<(u8, u8, u16)> {
             // Recomputed per interface, not latched: a composite device's later non-storage
             // interface must not have its endpoints claimed by an earlier match.
             in_ms = buf[i + 5] == CLASS_MASS_STORAGE && buf[i + 7] == PROTOCOL_BULK_ONLY;
+            if in_ms {
+                iface = buf[i + 2];
+            }
         } else if ty == DESC_ENDPOINT && len >= 7 && in_ms && buf[i + 3] & 0x03 == EP_TYPE_BULK {
             let addr = buf[i + 2];
             // wMaxPacketSize: bits [10:0] are the size, [12:11] a high-speed multiplier that does not
@@ -90,7 +98,7 @@ fn find_bulk_only(buf: &[u8], total: usize) -> Option<(u8, u8, u16)> {
     // BOTH endpoints are required. A Bulk-Only device with one of them is not usable, and returning a
     // half-bound disk would fail later at a transfer, far from the cause.
     if ep_in != 0 && ep_out != 0 {
-        Some((ep_in, ep_out, mps))
+        Some((ep_in, ep_out, mps, iface))
     } else {
         None
     }
@@ -122,7 +130,7 @@ pub fn bind(
         return None;
     }
 
-    let (ep_in, ep_out, mps) = find_bulk_only(&full, want)?;
+    let (ep_in, ep_out, mps, iface) = find_bulk_only(&full, want)?;
 
     // SET_CONFIGURATION: the same requirement the hub and the keyboard had. An addressed but
     // unconfigured device has no usable endpoints, and its bulk transfers simply do not work.
@@ -136,7 +144,7 @@ pub fn bind(
     ctx.log_fmt(format_args!(
         "dwc2-svc: MASS STORAGE bound - bulk IN {} OUT {} mps {} (ep0 mps {})",
         ep_in, ep_out, mps, t.mps));
-    Some(Disk { ep_in, ep_out, mps, ep0_mps: t.mps, pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0 })
+    Some(Disk { ep_in, ep_out, mps, ep0_mps: t.mps, pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0, iface, fail_streak: 0 })
 }
 
 /// Where a BOT command's buffers live in the DMA arena. Past the keyboard report, which is past the
@@ -150,7 +158,21 @@ const _: () = assert!(CBW_OFF >= crate::hid::REPORT_OFF + 8);
 const _: () = assert!(CSW_OFF >= CBW_OFF + 31);
 const _: () = assert!(DATA_OFF >= CSW_OFF + 13);
 
-/// One bulk transfer. Returns bytes moved, or `None` on failure.
+/// Why a bulk transfer did not complete.
+///
+/// **BUSY and FAILED are different facts and must not be merged.** A device that NAKs is working and
+/// occupied; the caller re-asks. A device that STALLs or transaction-errors is wedged; the caller
+/// recovers. Treating the first as the second is not a cosmetic error on this board: the kernel
+/// driver issued a Mass Storage Reset plus two clear-halts for every busy hand-back and logged 564
+/// spurious recoveries in ONE selfcheck, resetting a stick that was never broken.
+pub enum XferErr {
+    /// Out of time with no transport error - the device is pacing us.
+    Busy,
+    /// STALL, repeated transaction errors, or a channel that never halted.
+    Failed,
+}
+
+/// One bulk transfer. Returns bytes moved, or why it stopped.
 ///
 /// NAK is FLOW CONTROL, not an error - the device saying "busy, ask again" - so it is retried inside
 /// the time budget and never counted against the error allowance. That distinction is the whole
@@ -160,7 +182,7 @@ const _: () = assert!(DATA_OFF >= CSW_OFF + 13);
 fn bulk_xfer(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target, mps: u16,
     dir_in: bool, ep: u8, buf_phys: u32, len: u32, budget_ms: u64, pid: &mut u32,
-) -> Option<u32> {
+) -> Result<u32, XferErr> {
     let bt = Target { addr: t.addr, mps, low_speed: false };
     let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(budget_ms));
     let mut xact_errs = 0u32;
@@ -181,11 +203,11 @@ fn bulk_xfer(
                 // other direction: there a stale toggle made the device RETRANSMIT, here it makes the
                 // device IGNORE.
                 *pid = chan::pid_from_hctsiz(mmio, chan::CH_BULK);
-                return Some(len.saturating_sub(left));
+                return Ok(len.saturating_sub(left));
             }
             Some(hcint) if hcint & crate::regs::HCINT_STALL != 0 => {
                 ctx.log_fmt(format_args!("dwc2-svc: bulk ep {} STALLed", ep));
-                return None;
+                return Err(XferErr::Failed);
             }
             Some(hcint) => {
                 // Only a real TRANSACTION error spends the budget. NAK and NYET are the device
@@ -193,19 +215,21 @@ fn bulk_xfer(
                 if hcint & crate::regs::HCINT_XACTERR != 0 {
                     xact_errs += 1;
                     if xact_errs >= 3 {
-                        return None;
+                        return Err(XferErr::Failed);
                     }
                 }
             }
             None => {
                 ctx.log_fmt(format_args!("dwc2-svc: bulk ep {} channel never halted", ep));
-                return None;
+                return Err(XferErr::Failed);
             }
         }
         if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
-            ctx.log_fmt(format_args!(
-                "dwc2-svc: bulk ep {} out of time after {} ms ({} xact errors)", ep, budget_ms, xact_errs));
-            return None; // the caller decides whether that is "busy" or "broken"
+            // Out of time with NO transport error is the device pacing us, not failing. It is
+            // returned as BUSY and deliberately NOT logged: logging it printed 564 lines in one
+            // selfcheck for entirely normal flow control, and loud is a budget - spending it on the
+            // expected case is how a real line gets ignored.
+            return Err(if xact_errs == 0 { XferErr::Busy } else { XferErr::Failed });
         }
         ctx.sleep(ctx.duration_cycles(1));
     }
@@ -246,10 +270,8 @@ pub fn bot(
     // port a boot every time it has appeared. CBW-out failing means the device is not accepting
     // commands at all; a data-stage failure means it accepted the command and would not answer; a
     // CSW failure means it did the work and would not report. Three different faults.
-    if bulk_xfer(ctx, mmio, t, mps, false, ep_out, dma.phys_at(CBW_OFF) as u32, 31, 2_000, &mut disk.pid_out).is_none() {
-        ctx.log_fmt(format_args!(
-            "dwc2-svc: BOT CBW-out FAILED (cdb {:#04x}, ep_out {}, mps {})", cdb[0], disk.ep_out, disk.mps));
-        return None;
+    if let Err(e) = bulk_xfer(ctx, mmio, t, mps, false, ep_out, dma.phys_at(CBW_OFF) as u32, 31, 2_000, &mut disk.pid_out) {
+        return stage_failed(ctx, mmio, dma, t, disk, e, "CBW-out", cdb[0]);
     }
 
     let mut moved = 0usize;
@@ -266,13 +288,8 @@ pub fn bot(
             dma.phys_at(DATA_OFF) as u32, want as u32, 5_000,
             if data_in { &mut disk.pid_in } else { &mut disk.pid_out })
         {
-            Some(n) => n as usize,
-            None => {
-                ctx.log_fmt(format_args!(
-                    "dwc2-svc: BOT data-stage FAILED (cdb {:#04x}, {} bytes {})",
-                    cdb[0], want, if data_in { "IN" } else { "OUT" }));
-                return None;
-            }
+            Ok(n) => n as usize,
+            Err(e) => return stage_failed(ctx, mmio, dma, t, disk, e, "data-stage", cdb[0]),
         };
     }
 
@@ -280,9 +297,8 @@ pub fn bot(
     for i in 0..13 {
         dma.write8(CSW_OFF + i, 0);
     }
-    if bulk_xfer(ctx, mmio, t, mps, true, ep_in, dma.phys_at(CSW_OFF) as u32, 13, 2_000, &mut disk.pid_in).is_none() {
-        ctx.log_fmt(format_args!("dwc2-svc: BOT CSW-in FAILED (cdb {:#04x})", cdb[0]));
-        return None;
+    if let Err(e) = bulk_xfer(ctx, mmio, t, mps, true, ep_in, dma.phys_at(CSW_OFF) as u32, 13, 2_000, &mut disk.pid_in) {
+        return stage_failed(ctx, mmio, dma, t, disk, e, "CSW-in", cdb[0]);
     }
 
     let mut csw = [0u8; 13];
@@ -302,6 +318,11 @@ pub fn bot(
     // buffer - the one thing a block driver must never do. So the residue is CHECKED, and what the
     // data stage actually moved is compared against what was asked for.
     let short = residue != 0 || moved != dlen.min(DATA_MAX);
+    // A command that ACTUALLY WORKED is the only thing that clears the streak - it is the only
+    // evidence the device is healthy rather than pausing between requests.
+    if sig == 0x5342_5355 && tag == TAG && csw[12] == 0 && !short {
+        disk.fail_streak = 0;
+    }
     if sig != 0x5342_5355 || tag != TAG || csw[12] != 0 || short {
         ctx.log_fmt(format_args!(
             "dwc2-svc: BOT failed - sig={:#010x} tag={:#010x} residue={} status={} moved={}/{}",
@@ -309,6 +330,70 @@ pub fn bot(
         return None;
     }
     Some(moved)
+}
+
+/// What to do when a BOT stage did not complete.
+///
+/// BUSY hands back quietly - the device is working and occupied, the caller re-asks, and neither the
+/// log nor the failure streak is touched. Only a real fault is reported and recovered from. That
+/// split is the entire difference between a driver that survives this stick and one that resets it
+/// 564 times in a selfcheck.
+fn stage_failed(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk,
+    e: XferErr, what: &str, cdb0: u8,
+) -> Option<usize> {
+    match e {
+        XferErr::Busy => {}
+        XferErr::Failed => {
+            disk.fail_streak = disk.fail_streak.saturating_add(1);
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: BOT {} FAILED (cdb {:#04x}, streak {})", what, cdb0, disk.fail_streak));
+            recover(ctx, mmio, dma, t, disk);
+        }
+    }
+    None
+}
+
+/// Bulk-Only Transport reset recovery: Mass Storage Reset, then clear both halts.
+///
+/// **Order matters and the first step is the one that is easy to omit.** The class-specific
+/// Bulk-Only Mass Storage Reset comes FIRST because it resynchronises the device's own CBW/CSW state
+/// machine; clear-halt only unsticks the pipes. Without it a device that lost framing stays lost -
+/// both halts clear, it is still waiting for the rest of a transfer we abandoned, and every following
+/// command fails.
+pub fn recover(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk) {
+    // FRAME THESE WITH EP0'S PACKET SIZE, not the bulk endpoint's.
+    //
+    // A control transfer framed with 512 instead of EP0's 64 is malformed, so the clear-halt fails
+    // and disturbs the device further - turning a recovery into a second fault. Measured in the
+    // kernel driver: getting this wrong took a selfcheck from 16 failures to 70.
+    let ep0 = Target { addr: t.addr, mps: disk.ep0_mps, low_speed: t.low_speed };
+    let mut none: [u8; 0] = [];
+
+    // bmRequestType 0x21 = host-to-device, CLASS, INTERFACE. wIndex is the INTERFACE number.
+    let msreset = [0x21, 0xFF, 0, 0, disk.iface, 0, 0, 0];
+    let reset_ok = chan::control(ctx, mmio, dma, &ep0, &msreset, &mut none, false, 0);
+    // CLEAR_FEATURE(ENDPOINT_HALT): bmRequestType 0x02 = host-to-device, STANDARD, ENDPOINT.
+    let clr_in = [0x02, 0x01, 0, 0, disk.ep_in | 0x80, 0, 0, 0];
+    let in_ok = chan::control(ctx, mmio, dma, &ep0, &clr_in, &mut none, false, 0);
+    let clr_out = [0x02, 0x01, 0, 0, disk.ep_out, 0, 0, 0];
+    let out_ok = chan::control(ctx, mmio, dma, &ep0, &clr_out, &mut none, false, 0);
+
+    // A clear-halt resets the endpoint's data toggle to DATA0 at BOTH ends, so ours must follow or
+    // the very next transfer is out of step - the failure this port has now made three times.
+    disk.pid_in = chan::PID_DATA0;
+    disk.pid_out = chan::PID_DATA0;
+
+    // A RECOVERY THAT ITSELF FAILED IS STILL A FAILURE (§26.7). Naming which of the three transfers
+    // failed matters because they are different faults: the reset not landing means the device is not
+    // answering EP0 at all, while a clear-halt failing means it answers but will not unstick a pipe.
+    if !(reset_ok && in_ok && out_ok) {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: BOT recovery FAILED - MSReset {}, clr-IN {}, clr-OUT {}",
+            if reset_ok { "ok" } else { "FAILED" },
+            if in_ok { "ok" } else { "FAILED" },
+            if out_ok { "ok" } else { "FAILED" }));
+    }
 }
 
 /// READ CAPACITY(10): the device's last LBA and block size.
