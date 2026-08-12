@@ -366,9 +366,22 @@ impl HwClass {
         use core::sync::atomic::Ordering::Relaxed;
         if !self.found() { return 0; }
         match self {
-            // Fixed address, from the BCM2835 peripheral map: the DWC2 OTG core sits at
-            // peripheral + 0x98_0000. Not discovered, because nothing discovers it.
-            HwClass::Dwc2 => 0x3F98_0000,
+            // ZERO, deliberately - and this is not "no MMIO".
+            //
+            // A non-zero BAR sends the spawn path down the PCI route, which maps at `XHCI_MMIO_VA`
+            // (0x1_0000_0000). That address does not EXIST on a 32-bit machine, and the failure is
+            // exactly as blunt as it sounds:
+            //
+            //   spawn[mmio]: 'dwc2' BAR 0x3f980000 -> VA 0x100000000
+            //   task: spawn 'dwc2' failed: MapFailed
+            //
+            // ARM's fixed-address peripherals have their own path - `map_fixed_driver_mmio`, which
+            // the spawn logic calls precisely WHEN THE BAR IS 0, and which maps at a 32-bit VA with
+            // Device/uncached + USER so the service reaches the registers through the SDK's safe
+            // `Mmio` wrapper. The DWC2's address therefore belongs there, not here. Returning 0 is
+            // how this class says "not on a bus" rather than "not present" - `found()` above is the
+            // one that answers presence.
+            HwClass::Dwc2 => 0,
             HwClass::Xhci => pci::XHCI_MMIO_BASE.load(Relaxed),
             HwClass::Ehci => pci::EHCI_MMIO_BASE.load(Relaxed),
             HwClass::Ahci => pci::AHCI_ABAR.load(Relaxed),

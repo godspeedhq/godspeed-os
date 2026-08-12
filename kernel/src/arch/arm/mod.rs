@@ -752,6 +752,12 @@ pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Opt
     // `block-driver` on the Pi drives the Arasan EMMC (SD/EMMC) at peripheral + 0x30_0000.
     let (phys, pages): (u32, u32) = match name {
         "block-driver" => (PERIPHERAL_BASE as u32 + 0x30_0000, 1),
+        // The DWC2 OTG core at peripheral + 0x98_0000. ONE page covers every register the driver
+        // touches: the global block starts at 0, and the highest is host channel 15 at
+        // 0x500 + 15*0x20 = 0x6E0. The data FIFOs live at 0x1000 and beyond and are NOT mapped,
+        // because this controller is driven in DMA mode - the CPU never reads or writes a FIFO, so
+        // granting that window would hand the driver reach it has no use for.
+        "dwc2" => (PERIPHERAL_BASE as u32 + 0x98_0000, 1),
         _ => return None,
     };
     let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE
