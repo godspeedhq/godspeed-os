@@ -26,6 +26,7 @@ mod enumerate;
 mod hid;
 mod hub;
 mod msc;
+mod net;
 mod regs;
 
 use godspeed_sdk::ServiceContext;
@@ -156,7 +157,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                         // `bind` returns None for a device that is not a keyboard,
                                         // which is an ordinary outcome on three of these four ports
                                         // and must not be reported as a failure.
-                                        if let Some((_, _, _, dt, dsplt)) =
+                                        if let Some((dvid, dpid, _, dt, dsplt)) =
                                             hub::enumerate_downstream(&ctx, &m, &d, &dev.target, p)
                                         {
                                             // A device is one thing or the other, so try the
@@ -165,6 +166,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                             // the ordinary answer on most ports and is not logged.
                                             if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 kbd = Some((k, dt, dsplt));
+                                            } else if dvid == 0x0424 && dpid == 0xec00 {
+                                                // The LAN9514's ethernet function. Matched by VID:PID
+                                                // rather than by class, because it reports 0xff
+                                                // (vendor-specific) - there is no class to match on,
+                                                // and guessing from "has two bulk endpoints" would
+                                                // also match the disk.
+                                                if let Some(n) = net::bind(&ctx, &m, &d, &dt) {
+                                                    let _ = n;
+                                                }
                                             } else if let Some(mut dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 // Prove the bulk path the way the kernel driver does:
                                                 // ask the device its size, then read block 0. Capacity
