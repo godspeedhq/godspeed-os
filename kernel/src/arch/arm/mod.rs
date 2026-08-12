@@ -1650,6 +1650,31 @@ pub mod interrupts {
         // exclusion is a PROTOCOL instead - `dwc2::hotplug_poll` takes `UsbExclusive` and every other
         // shared-selection path stands aside for the duration (storage answers BUSY and re-asks, which it
         // already knows how to do). Interrupts stay on, the tick keeps running, and nothing races.
+        // RE-INITIALISE when ownership comes BACK. Releasing the vector is not enough.
+        //
+        // Hardware said so: `kill dwc2` unregistered the route and unmasked the line, and the keyboard
+        // stayed dead. Handing the interrupt back does not hand back the DEVICE STATE. While the
+        // service held the vector, the keyboard's transfer completions were delivered to a driver that
+        // ignores them, so the in-kernel driver's channel is left mid-transfer waiting on an event it
+        // never saw resolve. Nothing in the periodic hooks recovers that - they resume polling a
+        // channel that is already stuck.
+        //
+        // `init()` is the recovery, and it is not throwaway code written for a transition: it is the
+        // driver's own bring-up, already correct, already exercised on every boot. Calling it on the
+        // userspace -> kernel edge costs ~600 ms on a transition that happens when a human types
+        // `kill`, and it makes the experiment REVERSIBLE - which is what keeps Slices 1 to 4 cheap to
+        // iterate, since otherwise every trial costs a reboot.
+        //
+        // Edge-triggered, not level: `init()` must run once per handover, not once per idle pass.
+        {
+            use core::sync::atomic::{AtomicBool, Ordering};
+            static WAS_USERSPACE: AtomicBool = AtomicBool::new(false);
+            let now_userspace = super::irq::usb_owned_by_userspace();
+            if WAS_USERSPACE.swap(now_userspace, Ordering::Relaxed) && !now_userspace {
+                crate::kprintln!("dwc2: userspace released the controller - re-initialising in-kernel driver");
+                super::dwc2::init();
+            }
+        }
         // Both of these stand down for a userspace owner, for the reason above: one controller, one
         // driver. `hotplug_poll` in particular takes the exclusive bulk claim and rewrites the shared
         // device selection, which is precisely what must not happen underneath another driver.
