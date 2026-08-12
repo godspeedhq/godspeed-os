@@ -192,6 +192,15 @@ pub fn enumerate_downstream(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, hub: &Target, port: u8,
 ) -> Option<(u16, u16, u8)> {
     let st = reset_port(ctx, mmio, dma, hub, port)?;
+    // TRSTRCY: the device gets 10 ms of RECOVERY after its reset before it is required to respond.
+    //
+    // USB 2.0 7.1.7.5. Omitting it produced `SETUP complete-split STALLed` on the very first
+    // transfer, and that error was the clue rather than the problem: a compliant device may NOT STALL
+    // a SETUP packet - it must always ACK one - so a STALL there says the device was not yet
+    // answering, not that it rejected the request. The split machinery had already done its job by
+    // then, since the complete-split is only ever issued after the transaction translator ACKed the
+    // start-split.
+    ctx.sleep(ctx.duration_cycles(15));
     let splt = chan::hcsplt(hub.addr, port);
 
     // The device answers at address 0 until it is given one. `low_speed` matters to the controller's
