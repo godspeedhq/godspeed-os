@@ -65,8 +65,14 @@ fn main() {
     let placeholder = workspace.join("kernel").join("svc-placeholder.bin");
 
     // (env-var suffix, binary name in target dir)
+/// Services that exist only on one architecture, so their absence from another target's build is a
+/// FACT rather than an omission. `dwc2` drives the BCM283x USB controller: there is no such device on
+/// x86, and no reason to carry the driver there.
+const ARM_ONLY: &[&str] = &["dwc2"];
+
     let services: &[(&str, &str)] = &[
         ("SUPERVISOR", "supervisor"),
+        ("DWC2",       "dwc2"),
         ("LOGGER",     "logger"),
         ("MEM_PRESSURE",    "mem-pressure"),
         ("CHAOS",      "chaos"),
@@ -103,6 +109,10 @@ fn main() {
         "observe", "chaos", "mem-pressure",
         "counter", "greet", "upper", "roster",
         "reply-server", "asker", "resource-server", "holder",
+        // The userspace USB host driver (arm32 Phase 2). A SKELETON today: it holds the DWC2 MMIO
+        // window, a DMA arena and the USB vector, and reports whether the interrupt arrives. Built
+        // and embedded unconditionally; whether it SPAWNS is the supervisor's decision.
+        "dwc2",
         // Persistence on the Pi 2: block-driver's ARM backend is the BCM2835 EMMC (SDHCI, PIO); fs is
         // arch-neutral and rides on it. The kernel grants block-driver the EMMC MMIO window at spawn
         // (arch::arm::map_fixed_driver_mmio).
@@ -166,6 +176,14 @@ fn main() {
             let a64_bin = aarch64_dir.join(bin_name);
             if aarch64_built.contains(bin_name) && a64_bin.exists() { a64_bin } else { placeholder.clone() }
         } else if use_placeholder {
+            placeholder.clone()
+        } else if ARM_ONLY.contains(bin_name) {
+            // An ARM-ONLY driver on an x86 build. The placeholder is the right answer and this branch
+            // is explicit rather than a fallback-if-missing, because "the binary is not there" has two
+            // causes with opposite fixes: a service that does not APPLY to this target (fine, embed
+            // the placeholder) and a service that was left out of the build list (a bug, and one that
+            // surfaces as `LoadFailed(TooSmall)` - which reads like a broken binary, exactly the trap
+            // the comment above warns about). Silently accepting a missing file would merge the two.
             placeholder.clone()
         } else {
             target_dir.join(bin_name)

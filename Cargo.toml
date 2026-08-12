@@ -29,6 +29,7 @@ members = [
     "services/probe",
     "services/observe",
     "services/shell",
+    "services/dwc2",
     "services/xhci",
     "services/ehci",
 ]

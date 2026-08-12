@@ -181,6 +181,8 @@ pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
 /// device DMA (if the kill-path bus-master quiesce ever fails) always lands in DMA-reserved memory,
 /// never a PTE or kernel struct. 0 = not yet allocated. (xhci/ehci/block-driver; a future NIC = 4th.)
 pub static XHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+/// The arm32 DWC2's permanent DMA reservation, reused across respawns like every other class.
+pub static DWC2_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 pub static EHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 pub static AHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 pub static NIC_DMA_PHYS:  portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
@@ -338,7 +340,7 @@ struct ServiceConfig {
 /// spawn path. The BAR *address* is still runtime-discovered by the PCI scan (a hardware location is a
 /// different irreducible fact from the authorization); only the driver's *class* is declared here.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum HwClass { None, Ahci, Nic, Xhci, Ehci }
+enum HwClass { None, Ahci, Nic, Xhci, Ehci, Dwc2 }
 
 impl HwClass {
     /// Did the PCI scan find this class of controller?
@@ -346,6 +348,10 @@ impl HwClass {
         use crate::arch::imp::pci;
         use core::sync::atomic::Ordering::Relaxed;
         match self {
+            // The DWC2 is SOLDERED to the BCM283x - there is no bus to discover it on, and no PCI
+            // at all on this board. Its presence is a property of the SoC, so it is `true` on arm32
+            // and `false` everywhere else. This is the one HwClass whose answer is not a scan result.
+            HwClass::Dwc2 => cfg!(target_arch = "arm"),
             HwClass::Xhci => pci::XHCI_FOUND.load(Relaxed),
             HwClass::Ehci => pci::EHCI_FOUND.load(Relaxed),
             HwClass::Ahci => pci::AHCI_FOUND.load(Relaxed),
@@ -360,6 +366,9 @@ impl HwClass {
         use core::sync::atomic::Ordering::Relaxed;
         if !self.found() { return 0; }
         match self {
+            // Fixed address, from the BCM2835 peripheral map: the DWC2 OTG core sits at
+            // peripheral + 0x98_0000. Not discovered, because nothing discovers it.
+            HwClass::Dwc2 => 0x3F98_0000,
             HwClass::Xhci => pci::XHCI_MMIO_BASE.load(Relaxed),
             HwClass::Ehci => pci::EHCI_MMIO_BASE.load(Relaxed),
             HwClass::Ahci => pci::AHCI_ABAR.load(Relaxed),
@@ -375,6 +384,7 @@ impl HwClass {
     /// The permanent per-class DMA phys reservation, reused across respawns (§12 DMA permanent-reserve).
     fn dma_phys_slot(self) -> &'static portable_atomic::AtomicU64 {
         match self {
+            HwClass::Dwc2 => &DWC2_DMA_PHYS,
             HwClass::Xhci => &XHCI_DMA_PHYS,
             HwClass::Ehci => &EHCI_DMA_PHYS,
             HwClass::Ahci => &AHCI_DMA_PHYS,
@@ -390,6 +400,7 @@ impl HwClass {
         use crate::arch::imp::pci;
         use core::sync::atomic::Ordering::Relaxed;
         match self {
+            HwClass::Dwc2 => 0xFFFF, // no PCI on this board, so no bus-master enable to perform
             HwClass::Xhci => pci::XHCI_BDF.load(Relaxed),
             HwClass::Ehci => pci::EHCI_BDF.load(Relaxed),
             HwClass::Ahci => pci::AHCI_BDF.load(Relaxed),
@@ -417,6 +428,7 @@ pub const EHCI_CORE: u32 = 3;
 /// (Commandment III). `xhci` / `ehci` / `resource-server` have no contract and are declared here only.
 fn service_hw(name: &str) -> (HwClass, bool) {
     match name {
+        "dwc2"                                 => (HwClass::Dwc2, false),
         "xhci"                                 => (HwClass::Xhci, false),
         "ehci"                                 => (HwClass::Ehci, false),
         "block-driver"                         => (HwClass::Ahci, false),
@@ -663,6 +675,30 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // xhci - USB host-controller driver (§12). Receives its controller's
         // MMIO BAR (mapped by name in the spawn path) + later its IRQ. Trusted
         // userspace driver. has_recv_endpoint for future interrupt delivery.
+        // `dwc2` - the arm32 userspace USB host driver (Phase 2 skeleton).
+        //
+        // Granting `hw_irqs = [0x29]` is what makes `arm_irq_dispatch` route the USB interrupt HERE
+        // instead of to the in-kernel stack: the dispatcher picks by registration, so spawning this
+        // service is what takes the controller away from the kernel. Deliberate, and the whole point
+        // of the phase - but it means USB is expected to be degraded while a skeleton holds the
+        // vector. See docs/arm32-usb-userspace.md.
+        //
+        // Core 0: the DWC2 interrupt is routed to core 0 by `route_usb_irq_to_core0`, and a driver
+        // that receives its interrupt on one core while running on another pays a cross-core wake for
+        // every single one. The Pi 4 learned this the expensive way - `xhci`'s MSI destination had
+        // drifted to a core the driver did not run on, and co-locating them was what took it from
+        // 100% CPU to 0%.
+        "dwc2" => Some(("dwc2", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_DWC2_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[0x29],
+            has_console_read:  false,
+        })),
         "xhci" => Some(("xhci", ServiceConfig {
             elf:               include_bytes!(env!("SVC_XHCI_ELF")),
             has_recv_endpoint: true,

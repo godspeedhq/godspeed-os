@@ -32,6 +32,8 @@ ARM_SERVICES = [
     "block-driver", "fs",
     # Networking on the Pi 2: nic-driver (USB-net bridge backend) + arch-neutral net-stack.
     "nic-driver", "net-stack",
+    # The userspace USB host driver (Phase 2 skeleton) - docs/arm32-usb-userspace.md.
+    "dwc2",
 ]
 
 
