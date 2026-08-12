@@ -317,7 +317,25 @@ pub fn bot(
     // AS DATA. Silent corruption arriving through the device's verdict rather than through the DMA
     // buffer - the one thing a block driver must never do. So the residue is CHECKED, and what the
     // data stage actually moved is compared against what was asked for.
-    let short = residue != 0 || moved != dlen.min(DATA_MAX);
+    // THE DEVICE'S RESIDUE IS THE AUTHORITY ON A SHORT TRANSFER, not a byte count derived from
+    // HCTSIZ.
+    //
+    // `moved` came from `len - (HCTSIZ.XferSize)`, on the assumption that the field counts down as
+    // bytes move. In buffer-DMA mode it does not - the controller performs the transfer itself and
+    // does not leave that field usable as a byte counter. Hardware was unambiguous: 2165 commands
+    // reported
+    //
+    //     sig=0x53425355 tag=0x12345678 residue=0 status=0 moved=0/512
+    //
+    // - correct signature, correct tag, ZERO residue, status PASSED - and `moved` alone said nothing
+    // had moved, for transfers whose data was demonstrably right (this same path read `47 53 46 53`
+    // off sector 0 at boot). An instrument reporting confidently while measuring the wrong thing,
+    // which is this port's most expensive recurring mistake, now for the third time.
+    //
+    // `dCSWDataResidue` is the device stating how many bytes it did NOT deliver. That is the check
+    // the short-transfer guard actually needs, and it is the one the kernel driver's comment is
+    // emphatic about; the byte count was my addition and it was the wrong half.
+    let short = residue != 0;
     // A command that ACTUALLY WORKED is the only thing that clears the streak - it is the only
     // evidence the device is healthy rather than pausing between requests.
     if sig == 0x5342_5355 && tag == TAG && csw[12] == 0 && !short {
