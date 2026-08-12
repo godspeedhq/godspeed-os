@@ -33,6 +33,7 @@ const LOCAL_BASE: usize = 0x4000_0000;
 const PERIPH_BASE: usize = 0x3F00_0000;
 const IC_PENDING_1:     usize = PERIPH_BASE + 0xB204; // IRQ pending, lines 0-31
 const IC_ENABLE_IRQS_1: usize = PERIPH_BASE + 0xB210; // enable IRQ lines 0-31 (write 1 to enable)
+const IC_DISABLE_IRQS_1: usize = PERIPH_BASE + 0xB21C; // disable IRQ lines 0-31 (write 1 to disable)
 /// The DWC2 OTG controller is peripheral IRQ line 9 on the BCM283x.
 const USB_IRQ_LINE: u32 = 9;
 /// BCM2836 core-local: route the GPU IRQ (the OR of all legacy peripheral IRQs) and FIQ to a core.
@@ -56,6 +57,36 @@ pub fn route_usb_irq_to_core0() {
     // Enable peripheral line 9 (USB) in the legacy controller's bank-1 enable register.
     // SAFETY: the legacy IC is in the Device-mapped peripheral window; a volatile write that sets one
     // enable bit. Writing 1s enables; 0s are ignored (the register is not read-modify-write).
+    unsafe { (IC_ENABLE_IRQS_1 as *mut u32).write_volatile(1 << USB_IRQ_LINE); }
+}
+
+/// The NEUTRAL vector a userspace USB driver is granted for this controller.
+///
+/// The number began life as an x86 MSI vector and is deliberately reused here, exactly as the
+/// AArch64 port reuses `0x28` for its xHCI: the arch layer maps its own interrupt onto a shared
+/// name, so a driver's CONTRACT says the same thing on every architecture. That is what the neutral
+/// routing seam is for. 0x29 is the vector the x86 EHCI uses, and DWC2 is this board's equivalent
+/// full/high-speed host controller.
+pub const USB_VECTOR: u8 = 0x29;
+
+/// Mask the USB line at the legacy controller.
+///
+/// Required before handing this interrupt to userspace. The DWC2 line is LEVEL-triggered - it stays
+/// asserted until the driver clears the underlying HPRT change bit or channel HCINT - so an
+/// unmasked line re-fires the instant the handler returns and the core makes no further progress,
+/// which the liveness watchdog turns into a panic. The in-kernel driver got away with never masking
+/// because it cleared the condition inline, before returning; a userspace driver cannot, because it
+/// has not run yet.
+pub fn mask_usb_irq() {
+    // SAFETY: volatile write of one bit to the Device-mapped legacy IC disable register. Writing 1
+    // disables that line; 0s are ignored (not read-modify-write), so this cannot disturb other lines.
+    unsafe { (IC_DISABLE_IRQS_1 as *mut u32).write_volatile(1 << USB_IRQ_LINE); }
+}
+
+/// Unmask the USB line. The counterpart to `mask_usb_irq`, reached from the `IrqUnmask` syscall once
+/// the userspace driver has acknowledged the device.
+pub fn unmask_usb_irq() {
+    // SAFETY: as above, against the enable register.
     unsafe { (IC_ENABLE_IRQS_1 as *mut u32).write_volatile(1 << USB_IRQ_LINE); }
 }
 
@@ -216,7 +247,35 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
     // timer check (both can be pending at once). Confirm the line is USB before acting, so an
     // unexpected peripheral IRQ is left asserted and obvious rather than silently swallowed.
     let handled_gpu = if this_core() == 0 && source & CORE_IRQ_GPU != 0 && usb_irq_pending() {
-        super::dwc2::on_usb_irq();
+        // DEVICE INTERRUPTS CAN GO TO USERSPACE ON ARM32. They always could.
+        //
+        // CLAUDE.md 6.4 (SEC-29/30) justifies the in-kernel DWC2 stack on the grounds that "ARM does
+        // not yet route device IRQs to userspace", and treats that as the reason a Commandment I
+        // violation has to be accepted on this port. The hardware was never the obstacle: this line
+        // is already being received, confirmed and dispatched right here. It was handed to the
+        // kernel's own driver because nothing else had ever asked for it.
+        //
+        // The AArch64 port found the identical claim about the GIC and it was equally untrue - see
+        // the comment in `arch/aarch64/exceptions.rs`. Twice now an unimplemented branch has been
+        // read as an architectural constraint. Worth stating plainly so it is not read that way a
+        // third time.
+        //
+        // The route is chosen by who has REGISTERED for the vector, not by a build flag. With no
+        // userspace driver the in-kernel stack still owns the controller and behaviour is bit-for-bit
+        // what it was; the moment a service is granted `hw_irqs = [0x29]` the interrupt goes there
+        // instead. That makes the transition testable in one step, and it means there is never a
+        // build in which both drivers believe they own the hardware - the failure mode the AArch64
+        // feature flag actually produced before it was deleted.
+        if crate::interrupt::route::registered_endpoint(USB_VECTOR).is_some() {
+            // MASK FIRST. The line is level-triggered and the userspace driver has not run yet, so
+            // without this it re-asserts immediately and the core never leaves the handler. The
+            // driver unmasks through `IrqUnmask` once it has cleared the device.
+            mask_usb_irq();
+            // SAFETY: in the IRQ handler with interrupts masked - `deliver`'s documented contract.
+            unsafe { crate::interrupt::route::deliver(USB_VECTOR) };
+        } else {
+            super::dwc2::on_usb_irq();
+        }
         true
     } else {
         false

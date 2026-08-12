@@ -2335,7 +2335,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
 | arch/arm/dtb.rs | 6 | permitted |
-| arch/arm/irq.rs | 13 | permitted |
+| arch/arm/irq.rs | 16 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
@@ -3015,3 +3015,26 @@ no neutral file gained any `unsafe`. `arch/arm/mod.rs` and `arch/riscv32/mod.rs`
 (ARMv7 LDREXD), `riscv32` uses `portable-atomic` (RV32A has no 64-bit atomic). Counts are
 the current stub sizes; they may grow as a real port fills the arch surface, each increase
 carrying its own `// SAFETY:` and an audit bump.
+
+
+## `arch/arm/irq.rs` 13 -> 16 (+3): routing the USB interrupt to userspace (arm32 Phase 1)
+
+`arch/` is a permitted layer (§18.1), so this is an inventory update rather than an amendment.
+
+The three lines are the mechanism that lets a device interrupt reach a userspace driver on arm32:
+
+| Line | Purpose | SAFETY argument |
+|---|---|---|
+| `mask_usb_irq` | write bit 9 to `IC_DISABLE_IRQS_1` | volatile write of ONE bit to the Device-mapped legacy IC. Writing 1 disables that line; 0s are ignored (the register is not read-modify-write), so it cannot disturb another line. |
+| `unmask_usb_irq` | write bit 9 to `IC_ENABLE_IRQS_1` | as above, against the enable register. Reached from the `IrqUnmask` syscall. |
+| `route::deliver(USB_VECTOR)` | hand the IRQ to the registered endpoint | called from inside the IRQ handler with interrupts masked, which is `deliver`'s documented contract. |
+
+The mask pair is **load-bearing, not defensive**. The DWC2 line is level-triggered: it stays asserted
+until the driver clears an HPRT change bit or a channel HCINT. The in-kernel driver never needed to
+mask it because it cleared the condition inline, before returning. A userspace driver has not run
+yet when the handler returns, so an unmasked line re-asserts immediately and the core makes no
+further progress - which the liveness watchdog correctly turns into a panic.
+
+This is also why `arch/arm/mod.rs`'s `ioapic::mask_vector` / `unmask_vector` stopped being no-op
+stubs. They were harmless while every device interrupt was serviced inside the kernel; routing one
+outward makes them the thing that holds the line off.

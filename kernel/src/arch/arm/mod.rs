@@ -1734,10 +1734,31 @@ pub mod iommu {
 
 
 // ---------------------------------------------------------------------------
+/// The neutral "mask/unmask an interrupt source by vector" seam.
+///
+/// Named `ioapic` because x86 named it that; on this board it is the BCM2835 legacy interrupt
+/// controller. These were no-op stubs, which was harmless while every device interrupt was serviced
+/// inside the kernel - nothing ever needed a line held off. Routing an interrupt to USERSPACE makes
+/// them load-bearing: a level-triggered line that is not masked on delivery re-asserts the instant
+/// the handler returns, and the core makes no further progress.
 pub mod ioapic {
     pub fn init() {}
-    pub fn mask_vector(vector: u8) {}
-    pub fn unmask_vector(vector: u8) {}
+    /// Hold off the source behind `vector` until the userspace driver acknowledges its device.
+    pub fn mask_vector(vector: u8) {
+        if vector == super::irq::USB_VECTOR {
+            super::irq::mask_usb_irq();
+        }
+        // Any other vector has no arm32 source behind it yet. Silently ignoring an unknown vector is
+        // right HERE - this is the generic router asking about a line this board may simply not have
+        // - and it is not a silent failure, because a device whose IRQ is never routed never reaches
+        // this call at all.
+    }
+    /// Let the source behind `vector` fire again. Reached from the `IrqUnmask` syscall.
+    pub fn unmask_vector(vector: u8) {
+        if vector == super::irq::USB_VECTOR {
+            super::irq::unmask_usb_irq();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
