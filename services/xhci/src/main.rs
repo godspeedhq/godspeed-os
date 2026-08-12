@@ -2964,6 +2964,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Third instance of one class in this driver: state whose lifetime is shorter than the events it
     // must remember (`eaten` re-zeroed per pass, PROBE_FAILS reset per re-enumeration, now this).
     // A latch that resets when the thing it latches happens is not a latch.
+    // Consecutive CONNECTED reads per hub port, so an arrival needs CONFIRMING.
+    //
+    // Removal already works this way and the comment on that rule states why: "This probe is a
+    // control transfer on a ring shared with the HID status checks, so a read can come back wrong
+    // without the device having moved... confirming it costs one poll interval and buys immunity to a
+    // single bad read." Every word of that applies to ARRIVAL and it was never applied there.
+    //
+    // The asymmetry had teeth. A completion carries the SLOT, not the PORT, so two probes to
+    // different ports on one hub are indistinguishable to the code that reads them: a timed-out probe
+    // on port 3 leaves an unretired TD whose late answer the next probe - port 2 - accepts as its
+    // own. Port 2 is EMPTY, so it read "connected", which is an arrival, which re-enumerates the whole
+    // controller and tears down the keyboard and the disk. Once a minute, on hardware, for as long as
+    // the machine was left alone.
+    //
+    // Outside 'reenum deliberately: a counter reset by the re-enumeration a phantom triggers can never
+    // reach two, which is the exact fault `hub_tried` had.
+    let mut hub_seen: [u8; 64] = [0; 64];
     let mut hub_tried: u64 = 0;
     let mut hub_posted: u64 = 0;
     let mut hub_ok: u64 = 0;
@@ -4317,7 +4334,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         match st {
                             // The bind guard lives HERE now (see the scan gate above): only a free
                             // HID slice makes an arrival actionable. A full table still watches.
-                            Some(true) if hp < 64 && ndev < MAX_HID && hub_tried & (1u64 << hp) == 0 => {
+                            // CONFIRM the arrival: one connected read is a reading, two is an event.
+                            Some(true) if hp < 64 && ndev < MAX_HID && hub_tried & (1u64 << hp) == 0
+                                && { hub_seen[hp as usize] = hub_seen[hp as usize].saturating_add(1);
+                                     hub_seen[hp as usize] >= 2 } => {
                                 hub_tried |= 1u64 << hp;
                                 ctx.log_fmt(format_args!(
                                     "xhci: new device on hub slot {} port {} - re-enumerating",
@@ -4326,7 +4346,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 announce = true;
                                 break 'poll;
                             }
-                            Some(false) if hp < 64 => hub_tried &= !(1u64 << hp),
+                            Some(false) if hp < 64 => {
+                                // Empty resets the confirmation run: two connected reads must be
+                                // CONSECUTIVE, or an empty port that glitches once a minute still
+                                // accumulates its way to a phantom arrival, just more slowly.
+                                hub_seen[hp as usize] = 0;
+                                hub_tried &= !(1u64 << hp);
+                            }
+                            // A FAILED probe resets the confirmation run.
+                            //
+                            // Not because a failure is evidence of absence - it is evidence of
+                            // nothing, and this code says so everywhere else. It resets because a
+                            // timed-out probe leaves an unretired TD on the shared EP0 ring, so the
+                            // NEXT reading on this hub may be that TD's late answer arriving under a
+                            // different port's question. Counting a reading taken while the ring is
+                            // known-desynced toward "confirmed" is precisely the phantom this guard
+                            // exists to stop: it would just need three glitches instead of one.
+                            None if hp < 64 => hub_seen[hp as usize] = 0,
                             _ => {}
                         }
                     }
@@ -4412,7 +4448,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 break 'poll;
                             }
                             // Gone: forget that we tried, so a replug counts as new again.
-                            Some(false) if hp < 64 => hub_tried &= !(1u64 << hp),
+                            Some(false) if hp < 64 => {
+                                // Empty resets the confirmation run: two connected reads must be
+                                // CONSECUTIVE, or an empty port that glitches once a minute still
+                                // accumulates its way to a phantom arrival, just more slowly.
+                                hub_seen[hp as usize] = 0;
+                                hub_tried &= !(1u64 << hp);
+                            }
                             _ => {}
                         }
                     }
