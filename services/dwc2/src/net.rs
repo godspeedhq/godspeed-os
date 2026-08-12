@@ -154,19 +154,195 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
         return None;
     }
 
-    // iSerialNumber is byte 16 of the device descriptor, and on this part it carries the MAC.
-    let mut dev = [0u8; 18];
-    let getdev = [0x80, 0x06, 0, 0x01, 0, 0, 18, 0];
-    let mac = if chan::control(ctx, mmio, dma, t, &getdev, &mut dev, true, 18) {
-        read_mac(ctx, mmio, dma, t, dev[16])
-    } else {
-        [0u8; 6]
-    };
+    let mac = smsc_bring_up(ctx, mmio, dma, t)?;
 
     ctx.log_fmt(format_args!(
-        "dwc2-svc: USB ETHERNET bound - bulk IN {} OUT {} mps {} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        "dwc2-svc: smsc95xx (LAN9514) UP - bulk IN {} OUT {} mps {} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         ep_in, ep_out, mps, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
     Some(Nic { ep_in, ep_out, mps, mac, pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0 })
+}
+
+// --- smsc95xx (LAN9514) bring-up -------------------------------------------------------------------
+//
+// The Pi 2's onboard NIC is NOT CDC-ECM. It is a vendor-specific part (class 0xFF, VID 0x0424 SMSC)
+// whose entire configuration happens through VENDOR control requests: bRequest 0xA0 writes a 4-byte
+// register, 0xA1 reads one, with the register offset in wIndex. Until that configuration runs the chip
+// has no MAC programmed, no receive filter, and TX/RX disabled - it will not move a single frame.
+//
+// Slice 4b ported this device's FRAMING (the 8-byte TX command, the 4-byte RX status word) without its
+// bring-up, which is why the framing was correct and unreachable. QEMU hid it: QEMU's `usb-net` is
+// CDC-ECM, a device that needs none of this.
+//
+// Reimplemented from the working kernel driver in `arch/arm/dwc2.rs`, which was itself written from the
+// u-boot/Linux `smsc95xx` reference (driver doctrine: behaviour cited, code reimplemented).
+
+const SMSC_TX_CFG: u16 = 0x10;
+const SMSC_TX_CFG_ON: u32 = 0x0000_0004;
+const SMSC_HW_CFG: u16 = 0x14;
+const SMSC_HW_CFG_LRST: u32 = 0x0000_0008;
+const SMSC_HW_CFG_BCE:  u32 = 0x0000_0002;
+const SMSC_HW_CFG_MEF:  u32 = 0x0000_0020;
+/// HW_CFG.BIR = answer an empty bulk-IN with a NAK rather than a zero-length packet. Keep it set: a NAK
+/// is retried by the DWC2 core in hardware, so an idle device stays quiet. Clear it and every idle poll
+/// completes instantly with 0 bytes, which turns polling into a max-rate spin. Do not "fix" it away.
+const SMSC_HW_CFG_BIR:  u32 = 0x0000_1000;
+const SMSC_HW_CFG_RXDOFF: u32 = 0x0000_0600;
+const SMSC_PM_CTRL: u16 = 0x20;
+const SMSC_PM_CTRL_PHY_RST: u32 = 0x0000_0010;
+const SMSC_AFC_CFG: u16 = 0x2C;
+const SMSC_BURST_CAP: u16 = 0x38;
+const SMSC_BULK_IN_DLY: u16 = 0x6C;
+const SMSC_MAC_CR: u16 = 0x100;
+const SMSC_MAC_CR_RXEN: u32 = 0x0000_0004;
+const SMSC_MAC_CR_TXEN: u32 = 0x0000_0008;
+const SMSC_MAC_CR_HPFILT: u32 = 0x0000_2000;
+const SMSC_MAC_CR_PRMS:  u32 = 0x0004_0000;
+const SMSC_MAC_CR_MCPAS: u32 = 0x0008_0000;
+const SMSC_MAC_CR_FDPX:  u32 = 0x0010_0000;
+const SMSC_ADDRH: u16 = 0x104;
+const SMSC_ADDRL: u16 = 0x108;
+const SMSC_MII_ADDR: u16 = 0x114;
+const SMSC_MII_DATA: u16 = 0x118;
+const SMSC_PHY_ID: u32 = 1;
+const SMSC_MII_BMCR: u32 = 0;
+const SMSC_MII_ADVERTISE: u32 = 4;
+/// RX burst size in 512-byte high-speed packets. Must stay within `RX_BURST` in the arena layout.
+const SMSC_BURST_PKTS: u32 = 4;
+
+/// Every register poll below is bounded by this many attempts. A count is not a duration - but each
+/// attempt here is one CONTROL TRANSFER, which carries its own hardware timeout, so the product is
+/// bounded in time as well as in iterations. A healthy part clears in one or two.
+const SMSC_POLLS: u32 = 64;
+
+fn smsc_write(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, index: u16, value: u32) -> bool {
+    let setup = [0x40, 0xA0, 0x00, 0x00, index as u8, (index >> 8) as u8, 4, 0x00];
+    let mut data = value.to_le_bytes();
+    chan::control(ctx, m, d, t, &setup, &mut data, false, 4)
+}
+
+/// `None` if the control transfer itself failed - deliberately distinct from a register that genuinely
+/// reads zero. Fabricating a 0 there is what lets a dead USB link masquerade as a real reading.
+fn smsc_read(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, index: u16) -> Option<u32> {
+    let setup = [0xC0, 0xA1, 0x00, 0x00, index as u8, (index >> 8) as u8, 4, 0x00];
+    let mut data = [0u8; 4];
+    if !chan::control(ctx, m, d, t, &setup, &mut data, true, 4) { return None; }
+    Some(u32::from_le_bytes(data))
+}
+
+fn smsc_read_or0(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, index: u16) -> u32 {
+    smsc_read(ctx, m, d, t, index).unwrap_or(0)
+}
+
+/// Wait for the MDIO engine to drop BUSY. Bounded: a stuck engine leaves the PHY unconfigured (net
+/// degrades) rather than holding this service forever.
+fn mii_idle(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> bool {
+    for _ in 0..SMSC_POLLS {
+        match smsc_read(ctx, m, d, t, SMSC_MII_ADDR) {
+            Some(v) if v & 1 == 0 => return true,
+            Some(_) => {}
+            None => return false,
+        }
+    }
+    false
+}
+
+fn mii_write(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, reg: u32, val: u16) -> bool {
+    if !mii_idle(ctx, m, d, t) { return false; }
+    if !smsc_write(ctx, m, d, t, SMSC_MII_DATA, val as u32) { return false; }
+    smsc_write(ctx, m, d, t, SMSC_MII_ADDR, (SMSC_PHY_ID << 11) | (reg << 6) | (1 << 1) | 1)
+}
+
+fn mii_read(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, reg: u32) -> Option<u16> {
+    if !mii_idle(ctx, m, d, t) { return None; }
+    if !smsc_write(ctx, m, d, t, SMSC_MII_ADDR, (SMSC_PHY_ID << 11) | (reg << 6) | 1) { return None; }
+    if !mii_idle(ctx, m, d, t) { return None; }
+    smsc_read(ctx, m, d, t, SMSC_MII_DATA).map(|v| (v & 0xFFFF) as u16)
+}
+
+/// Reset the chip and its PHY, program the station MAC, enable turbo RX, start auto-negotiation, and
+/// turn TX + RX on. Returns the MAC the chip is now filtering on.
+///
+/// The MAC is the one place this service is WEAKER than the in-kernel driver, and the log says so
+/// rather than hiding it. The kernel reads the real board MAC (b8:27:eb:..) from the VideoCore mailbox,
+/// which lives outside the DWC2 register window this service was granted. Reaching it would mean
+/// granting a second, much wider MMIO window for one identity fact - authority out of proportion to the
+/// need. So this asks the CHIP (which the Pi's firmware may have programmed) and, failing that, uses a
+/// locally-administered address. Networking works either way: an LAA is a valid unicast MAC and DHCP
+/// serves it normally. What is lost is the address matching the sticker, and the log names which case
+/// happened so nobody has to guess later.
+fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<[u8; 6]> {
+    // Lite reset the chip.
+    let hw = smsc_read(ctx, m, d, t, SMSC_HW_CFG)?;
+    if !smsc_write(ctx, m, d, t, SMSC_HW_CFG, hw | SMSC_HW_CFG_LRST) {
+        ctx.log("dwc2-svc: smsc lite-reset write FAILED - NIC stays down");
+        return None;
+    }
+    let mut cleared = false;
+    for _ in 0..SMSC_POLLS {
+        if smsc_read_or0(ctx, m, d, t, SMSC_HW_CFG) & SMSC_HW_CFG_LRST == 0 { cleared = true; break; }
+    }
+    if !cleared {
+        ctx.log("dwc2-svc: smsc lite-reset never cleared - NIC stays down (loud, not silently degraded)");
+        return None;
+    }
+
+    // Reset the PHY.
+    let pm = smsc_read_or0(ctx, m, d, t, SMSC_PM_CTRL);
+    smsc_write(ctx, m, d, t, SMSC_PM_CTRL, pm | SMSC_PM_CTRL_PHY_RST);
+    for _ in 0..SMSC_POLLS {
+        if smsc_read_or0(ctx, m, d, t, SMSC_PM_CTRL) & SMSC_PM_CTRL_PHY_RST == 0 { break; }
+    }
+
+    // MAC: ask the chip, else a locally-administered address (bit 1 of byte 0 set).
+    let lo = smsc_read_or0(ctx, m, d, t, SMSC_ADDRL);
+    let hi = smsc_read_or0(ctx, m, d, t, SMSC_ADDRH);
+    let from_chip = [lo as u8, (lo >> 8) as u8, (lo >> 16) as u8, (lo >> 24) as u8, hi as u8, (hi >> 8) as u8];
+    let mac = if from_chip == [0u8; 6] || from_chip == [0xFFu8; 6] {
+        ctx.log("dwc2-svc: NIC has no MAC programmed - using a locally-administered address (the board MAC lives in the VideoCore mailbox, outside this service's window)");
+        [0x02, 0x00, 0x00, 0x12, 0x34, 0x56]
+    } else {
+        from_chip
+    };
+    smsc_write(ctx, m, d, t, SMSC_ADDRL,
+               (mac[0] as u32) | ((mac[1] as u32) << 8) | ((mac[2] as u32) << 16) | ((mac[3] as u32) << 24));
+    smsc_write(ctx, m, d, t, SMSC_ADDRH, (mac[4] as u32) | ((mac[5] as u32) << 8));
+
+    // Turbo RX: the chip aggregates MANY frames into one bulk-IN burst, each with its 4-byte status word
+    // and DWORD-aligned - which is exactly what `rx` already parses. Read-modify-write, because a bare
+    // write clears the power-on defaults; clear RXDOFF so the frame sits immediately after its status.
+    let hw = (smsc_read_or0(ctx, m, d, t, SMSC_HW_CFG) | SMSC_HW_CFG_BIR | SMSC_HW_CFG_MEF | SMSC_HW_CFG_BCE)
+             & !SMSC_HW_CFG_RXDOFF;
+    smsc_write(ctx, m, d, t, SMSC_HW_CFG, hw);
+    smsc_write(ctx, m, d, t, SMSC_BURST_CAP, SMSC_BURST_PKTS);
+    smsc_write(ctx, m, d, t, SMSC_BULK_IN_DLY, 0x2000);
+    smsc_write(ctx, m, d, t, SMSC_AFC_CFG, 0x00F8_30A1);
+
+    // PHY: reset, advertise 10/100, restart auto-negotiation. Do NOT block on link - net-stack retries
+    // and self-configures when the link comes up, so waiting here would only delay the boot.
+    mii_write(ctx, m, d, t, SMSC_MII_BMCR, 0x8000);
+    for _ in 0..SMSC_POLLS {
+        match mii_read(ctx, m, d, t, SMSC_MII_BMCR) {
+            Some(v) if v & 0x8000 == 0 => break,
+            Some(_) => {}
+            None => break,
+        }
+    }
+    mii_write(ctx, m, d, t, SMSC_MII_ADVERTISE, 0x01E1);
+    mii_write(ctx, m, d, t, SMSC_MII_BMCR, 0x1200);
+
+    // Enable TX + RX. FDPX because the internal PHY negotiates full duplex and a half-duplex MAC on a
+    // full-duplex link drops frames to late collisions. The receive filter is our-unicast + broadcast
+    // ONLY: promiscuous, all-multicast and the hash filter are CLEARED so the mDNS/SSDP/IPv6-ND flood is
+    // dropped at the chip instead of drowning our replies. Some of those bits come out of reset SET.
+    let cr = (smsc_read_or0(ctx, m, d, t, SMSC_MAC_CR)
+              & !(SMSC_MAC_CR_PRMS | SMSC_MAC_CR_MCPAS | SMSC_MAC_CR_HPFILT))
+             | SMSC_MAC_CR_TXEN | SMSC_MAC_CR_RXEN | SMSC_MAC_CR_FDPX;
+    if !smsc_write(ctx, m, d, t, SMSC_MAC_CR, cr) {
+        ctx.log("dwc2-svc: smsc MAC_CR enable FAILED - NIC stays down");
+        return None;
+    }
+    smsc_write(ctx, m, d, t, SMSC_TX_CFG, SMSC_TX_CFG_ON);
+    Some(mac)
 }
 
 /// Where frames live in the DMA arena, clear of everything else.
