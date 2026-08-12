@@ -156,7 +156,8 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 | **3a** | Find + bind the Bulk-Only mass-storage interface and its endpoints | ✅ **hardware-verified 2026-08-12** - `bulk IN 1 OUT 2 mps 512`, matching the kernel driver |
 | **3b** | BOT/SCSI: READ CAPACITY + READ(10) over the bulk endpoints | ✅ **hardware-verified 2026-08-12** - `31266816 sectors`, sector 0 reads `47 53 46 53` (GSFS) |
 | **3c** | `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | ✅ **hardware-verified 2026-08-12** - `drives` shows the GSFS volume, served over IPC |
-| **4** | Networking: CDC-ECM + smsc95xx; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | DHCP, `ping` |
+| **4a** | Find + configure the USB ethernet (LAN9514) | ✅ **hardware-verified 2026-08-12** - `bulk IN 1 OUT 2 mps 512`, matching the kernel driver |
+| **4b** | Frame TX/RX over the bulk endpoints; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | DHCP, `ping` |
 | **5** | Delete `arch/arm/dwc2.rs`, the six syscalls, the tick hooks | `chaos max-carnage` + `selfcheck`. THEN amend §6.4 |
 
 ### Two things to decide deliberately rather than inherit
@@ -261,6 +262,31 @@ that, the survey would have reported whatever the previous transfer left in the 
 topology assembled from stale bytes, which is worse than an obviously wrong one because it would have
 been believed. That defence was written three slices earlier for exactly this shape of bug.
 
+## Slice 4a result
+
+```
+port 1  USB ETHERNET bound  - bulk IN 1 OUT 2 mps 512
+port 2  MASS STORAGE bound  - bulk IN 1 OUT 2 mps 512
+port 4  BOOT KEYBOARD bound - interface 0 endpoint 1 mps 8 interval 10
+```
+
+All three devices bound from userspace, endpoints matching the kernel driver exactly. The
+`SET_CONFIGURATION` retry did not fire on this boot - kept regardless, since the kernel driver only
+added it after seeing the failure.
+
+### What 4b needs
+
+- **Frame TX/RX** over the bulk pair. CDC-ECM carries raw ethernet frames with no per-packet framing,
+  which makes this simpler than BOT - no CBW/CSW, just bulk in and out.
+- **`nic-driver` moves off `NET_DEVICE` (syscalls 42-44)** to frame IPC, the same shape as
+  `block-driver`'s move in 3c. It will need a `send_peers` grant to `dwc2`, which is the edge whose
+  absence cost the Pi 4 a day and cost this port nothing because the comment recording it was read.
+- **The RX path is where the design choice is.** The kernel driver keeps a background-armed bulk-IN on
+  a dedicated channel so the device is listened to continuously; a poll model dropped replies its
+  small RX FIFO could not hold. That decision should be made deliberately rather than inherited -
+  and note the loop now blocks on `recv_timeout`, so an always-armed IN needs somewhere to live that
+  is not "every pass".
+
 ## SLICE 3 COMPLETE - `selfcheck 350, failed 0` on the userspace driver
 
 ```
@@ -355,6 +381,31 @@ downstream believes it:
 | port speed bits | read BEFORE the port reset | 3 boots hunting correct split code |
 | keystroke counter | counted NAKs as reports | hid a real bug for 2 boots |
 | `moved` from HCTSIZ | field is not a byte counter in DMA mode | 2175 log lines |
+
+## Slice 4a result
+
+```
+port 1  USB ETHERNET bound  - bulk IN 1 OUT 2 mps 512
+port 2  MASS STORAGE bound  - bulk IN 1 OUT 2 mps 512
+port 4  BOOT KEYBOARD bound - interface 0 endpoint 1 mps 8 interval 10
+```
+
+All three devices bound from userspace, endpoints matching the kernel driver exactly. The
+`SET_CONFIGURATION` retry did not fire on this boot - kept regardless, since the kernel driver only
+added it after seeing the failure.
+
+### What 4b needs
+
+- **Frame TX/RX** over the bulk pair. CDC-ECM carries raw ethernet frames with no per-packet framing,
+  which makes this simpler than BOT - no CBW/CSW, just bulk in and out.
+- **`nic-driver` moves off `NET_DEVICE` (syscalls 42-44)** to frame IPC, the same shape as
+  `block-driver`'s move in 3c. It will need a `send_peers` grant to `dwc2`, which is the edge whose
+  absence cost the Pi 4 a day and cost this port nothing because the comment recording it was read.
+- **The RX path is where the design choice is.** The kernel driver keeps a background-armed bulk-IN on
+  a dedicated channel so the device is listened to continuously; a poll model dropped replies its
+  small RX FIFO could not hold. That decision should be made deliberately rather than inherited -
+  and note the loop now blocks on `recv_timeout`, so an always-armed IN needs somewhere to live that
+  is not "every pass".
 
 ## SLICE 3 COMPLETE - storage is served from userspace
 
