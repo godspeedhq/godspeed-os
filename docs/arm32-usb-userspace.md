@@ -150,7 +150,7 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 | **1b** | Channels + control transfers (`chan_program`, `chan_dma`, `ctrl_xfer`) | ✅ **hardware-verified 2026-08-12** - `DEVICE DESCRIPTOR len=18 type=0x01 usb=0x0200 mps0=64` |
 | **1c-i** | Address + identify the root device, hub descriptor | ✅ **hardware-verified 2026-08-12** - `0424:9514 class=0x09 ports=5` (the LAN9514's integrated hub) |
 | **1c-ii** | Hub port survey (power, status, speed) | ✅ **hardware-verified 2026-08-12** - 4 attached, status words byte-for-byte identical to the kernel driver's |
-| **1c-iii** | SPLIT TRANSACTIONS: address a device behind the hub | the same VID/PIDs the kernel driver reports for the downstream devices |
+| **1c-iii** | SPLIT TRANSACTIONS: address a device behind the hub | **IN PROGRESS** - split sequencing works, SETUP STALLs. See below |
 | **2** | Keyboard: HID + `CONSOLE_PUSH` | Typing works from userspace. Second ON PURPOSE - it makes the machine usable for testing the rest |
 | **3** | Mass storage: BOT/SCSI; `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | `drives`, `ls`, `selfcheck` |
 | **4** | Networking: CDC-ECM + smsc95xx; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | DHCP, `ping` |
@@ -257,6 +257,46 @@ It was findable in one boot only because slice 1b zeroes the IN scratch before e
 that, the survey would have reported whatever the previous transfer left in the buffer: a plausible
 topology assembled from stale bytes, which is worse than an obviously wrong one because it would have
 been believed. That defence was written three slices earlier for exactly this shape of bug.
+
+## Slice 1c-iii: open, with the field narrowed
+
+The split machinery WORKS. The transaction translator ACKs the start-split - a complete-split is only
+ever issued after it does - so `hcsplt` encoding, SSPLIT/CSPLIT sequencing and the microframe sweep
+are all doing their jobs. The failure is one layer further out:
+
+```
+SETUP complete-split STALLed - HCINT=0x0000000a HCSPLT=0x8001c081 HCCHAR=0x00100008 HFNUM=0x0671
+```
+
+**Both register encodings are CORRECT**, which is what the dump was for:
+
+| | Decoded | Verdict |
+|---|---|---|
+| `HCSPLT 0x8001c081` | port 1, hub addr 1, XactPos=0b11 (ALL), CompSplt=1, SplEna=1 | right |
+| `HCCHAR 0x00100008` | MPS 8, EP 0, dir OUT, LSpdDev=0 (full speed, matches the port), EPType 0 (control), MC 1, DevAddr 0 | right |
+| `HCINT 0x0a` | CHHLTD + STALL | a device really did answer, and STALLed |
+
+That eliminates the two most likely suspects. It also sharpens the contradiction rather than
+resolving it: **a compliant device may not STALL a SETUP** (USB 2.0 8.5.3), yet something is
+answering at address 0 and doing exactly that.
+
+Refuted so far, on hardware: the split encoding, the channel programming, and a missing TRSTRCY
+recovery delay (added, 15 ms, did not change the result - keep it, it is required regardless).
+
+**Where to look next, in order:**
+
+1. **Is the STALL from the DEVICE or the HUB?** A hub returns STALL for a request it cannot forward.
+   The TT ACKed the start-split, but that only says it accepted the token, not that the downstream
+   transaction succeeded. Reading the hub's port status and its TT state after the failure would
+   separate them, and they want completely different fixes.
+2. **Do the downstream devices still hold addresses from the IN-KERNEL driver's enumeration?** It
+   enumerates everything at boot; the service then reset the CONTROLLER and the hub, but a device
+   only returns to address 0 on its own PORT reset. `reset_port` does that - verify it actually took
+   effect by reading the port status immediately before the transfer, rather than trusting the reset
+   path's own report.
+3. **`ctx.sleep` granularity.** Sub-quantum sleeps floor to a 10 ms tick on this port, so the 15 ms
+   recovery is really 10-20 ms and the reset poll may be coarser than USB's timings assume. Measure
+   before assuming it is fine.
 
 ## What makes arm32 harder than the AArch64 port
 
