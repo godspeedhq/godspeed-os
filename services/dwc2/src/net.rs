@@ -480,13 +480,17 @@ pub fn rx(
     // kernel driver's background-armed IN, in the shape this service can use: a non-blocking poll per
     // pass instead of an interrupt, because the frame path here is driven by the serve loop.
     if !nic.in_armed {
-        chan::program(mmio, &Target { addr: t.addr, mps: nic.mps, low_speed: false }, CH_NET,
+        // Clear HCINT before arming: it is write-1-to-clear and holds whatever the LAST transfer on
+        // this channel left behind. Arming without clearing means the first check reads a stale
+        // completion and harvests a buffer the device has not written yet.
+        mmio.write32(chan::hcint_at(CH_NET_RX), 0xFFFF_FFFF);
+        chan::program(mmio, &Target { addr: t.addr, mps: nic.mps, low_speed: false }, CH_NET_RX,
                       true, nic.pid_in, RX_BURST as u32, dma.phys_at(RX_OFF) as u32,
                       nic.ep_in as u32, 2, 0);
         nic.in_armed = true;
         return 0;   // nothing yet - the device answers when it has something
     }
-    let hcint = mmio.read32(chan::hcint_at(CH_NET));
+    let hcint = mmio.read32(chan::hcint_at(CH_NET_RX));
     if hcint & crate::regs::HCINT_XFERCOMPL == 0 {
         if hcint & (crate::regs::HCINT_STALL | crate::regs::HCINT_CHHLTD) != 0 {
             // Halted for a reason that is NOT completion: the transfer is over and dead, so re-arm on
@@ -498,8 +502,8 @@ pub fn rx(
         }
         return 0;
     }
-    let left = mmio.read32(chan::hctsiz_at(CH_NET)) & 0x7_FFFF;
-    nic.pid_in = chan::pid_from_hctsiz(mmio, CH_NET);
+    let left = mmio.read32(chan::hctsiz_at(CH_NET_RX)) & 0x7_FFFF;
+    nic.pid_in = chan::pid_from_hctsiz(mmio, CH_NET_RX);
     nic.stats.rx_hcint = hcint;
     nic.in_armed = false;                 // consumed - the next pass arms a fresh one
     let got = (RX_BURST as u32).saturating_sub(left) as usize;
@@ -596,6 +600,19 @@ fn bulk(
 /// are separate from each other: an abandoned transfer must not leave its state on a channel another
 /// stream inherits.
 pub const CH_NET: u32 = 2;
+
+/// The armed bulk-IN's OWN channel, separate from CH_NET which carries TX.
+///
+/// Sharing one channel is what made the receive path harvest fill bytes with a confident length. An
+/// armed IN waits across many serve passes by design, and every `tx()` in that window reprogrammed the
+/// same channel - destroying the armed transfer and leaving its own XFERCOMPL|ACK in HCINT, which the
+/// next receive check then read as ITS completion and harvested from a buffer nothing had written. The
+/// giveaway was in the counters all along: bursts tracked TX almost one for one (12/13, 25/26, 38/39).
+///
+/// A channel can hold exactly one transfer. A transfer that outlives a single call therefore needs a
+/// channel nothing else touches - the same rule that already keeps the disk, the keyboard and the NIC
+/// apart, applied one level down to the two directions of the NIC itself.
+pub const CH_NET_RX: u32 = 3;
 
 // --- The frame IPC protocol -------------------------------------------------------------------
 //
