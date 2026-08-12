@@ -165,7 +165,31 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                             if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 kbd = Some((k, dt, dsplt));
                                             } else if let Some(dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
-                                                let _ = dk;
+                                                // Prove the bulk path the way the kernel driver does:
+                                                // ask the device its size, then read block 0. Capacity
+                                                // alone would prove the command path; reading a block
+                                                // proves the DATA path, which is where a short
+                                                // transfer would silently corrupt.
+                                                match msc::read_capacity(&ctx, &m, &d, &dt, &dk) {
+                                                    Some((sectors, block)) => {
+                                                        ctx.log_fmt(format_args!(
+                                                            "dwc2-svc: USB DISK - {} sectors of {} B ({} MiB)",
+                                                            sectors, block,
+                                                            sectors.saturating_mul(block as u64) / (1024 * 1024)));
+                                                        if msc::read_block(&ctx, &m, &d, &dt, &dk, 0, block) {
+                                                            let b0 = d.read8(msc::DATA_OFF);
+                                                            let b1 = d.read8(msc::DATA_OFF + 1);
+                                                            let b2 = d.read8(msc::DATA_OFF + 2);
+                                                            let b3 = d.read8(msc::DATA_OFF + 3);
+                                                            ctx.log_fmt(format_args!(
+                                                                "dwc2-svc: sector 0 first bytes {:02x} {:02x} {:02x} {:02x}",
+                                                                b0, b1, b2, b3));
+                                                        } else {
+                                                            ctx.log("dwc2-svc: sector 0 read FAILED");
+                                                        }
+                                                    }
+                                                    None => ctx.log("dwc2-svc: READ CAPACITY FAILED"),
+                                                }
                                             }
                                         }
                                     }

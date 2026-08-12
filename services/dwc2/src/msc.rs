@@ -127,3 +127,162 @@ pub fn bind(
         ep_in, ep_out, mps, t.mps));
     Some(Disk { ep_in, ep_out, mps, ep0_mps: t.mps })
 }
+
+/// Where a BOT command's buffers live in the DMA arena. Past the keyboard report, which is past the
+/// control scratch - the assertions below derive that rather than asserting it in prose, after a
+/// buffer overlap cost a boot in slice 2.
+pub const CBW_OFF: usize = 0x0300;
+pub const CSW_OFF: usize = 0x0340;
+pub const DATA_OFF: usize = 0x0400;
+pub const DATA_MAX: usize = 4096;
+const _: () = assert!(CBW_OFF >= crate::hid::REPORT_OFF + 8);
+const _: () = assert!(CSW_OFF >= CBW_OFF + 31);
+const _: () = assert!(DATA_OFF >= CSW_OFF + 13);
+
+/// One bulk transfer. Returns bytes moved, or `None` on failure.
+///
+/// NAK is FLOW CONTROL, not an error - the device saying "busy, ask again" - so it is retried inside
+/// the time budget and never counted against the error allowance. That distinction is the whole
+/// difference between a driver that survives this board's stick and one that declares it broken: it
+/// goes BUSY for tens of seconds under load, and a 45-second stall was observed on this branch.
+#[allow(clippy::too_many_arguments)]
+fn bulk_xfer(
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target, disk: &Disk,
+    dir_in: bool, ep: u8, buf_phys: u32, len: u32, budget_ms: u64,
+) -> Option<u32> {
+    let bt = Target { addr: t.addr, mps: disk.mps, low_speed: false };
+    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(budget_ms));
+    let mut xact_errs = 0u32;
+    loop {
+        chan::program(mmio, &bt, chan::CH_BULK, dir_in, chan::PID_DATA0, len, buf_phys, ep as u32, 2, 0);
+        match chan::wait_halt(ctx, mmio, chan::CH_BULK, 100) {
+            Some(hcint) if hcint & crate::regs::HCINT_XFERCOMPL != 0 => {
+                // HCTSIZ counts DOWN the bytes still outstanding, so what moved is the difference.
+                // Reading it is what makes a SHORT transfer detectable at all.
+                let left = mmio.read32(chan::hctsiz_at(chan::CH_BULK)) & 0x7_FFFF;
+                return Some(len.saturating_sub(left));
+            }
+            Some(hcint) if hcint & crate::regs::HCINT_STALL != 0 => return None,
+            Some(hcint) => {
+                // Only a real TRANSACTION error spends the budget. NAK and NYET are the device
+                // pacing us and cost nothing, which is why they are not counted here.
+                if hcint & crate::regs::HCINT_XACTERR != 0 {
+                    xact_errs += 1;
+                    if xact_errs >= 3 {
+                        return None;
+                    }
+                }
+            }
+            None => return None,
+        }
+        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+            return None; // out of time: the caller decides whether that is "busy" or "broken"
+        }
+        ctx.sleep(ctx.duration_cycles(1));
+    }
+}
+
+/// One Bulk-Only Transport command: CBW out, optional data, CSW in.
+///
+/// Returns the bytes moved by the data stage, or `None`.
+pub fn bot(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &Disk,
+    cdb: &[u8], data_in: bool, dlen: usize,
+) -> Option<usize> {
+    const TAG: u32 = 0x1234_5678;
+    // CBW: 31 bytes, "USBC".
+    for i in 0..31 {
+        dma.write8(CBW_OFF + i, 0);
+    }
+    for (i, b) in 0x4342_5355u32.to_le_bytes().iter().enumerate() {
+        dma.write8(CBW_OFF + i, *b);
+    }
+    for (i, b) in TAG.to_le_bytes().iter().enumerate() {
+        dma.write8(CBW_OFF + 4 + i, *b);
+    }
+    for (i, b) in (dlen as u32).to_le_bytes().iter().enumerate() {
+        dma.write8(CBW_OFF + 8 + i, *b);
+    }
+    dma.write8(CBW_OFF + 12, if data_in { 0x80 } else { 0x00 });
+    dma.write8(CBW_OFF + 13, 0); // LUN
+    dma.write8(CBW_OFF + 14, cdb.len().min(16) as u8);
+    for (i, b) in cdb.iter().take(16).enumerate() {
+        dma.write8(CBW_OFF + 15 + i, *b);
+    }
+
+    bulk_xfer(ctx, mmio, t, disk, false, disk.ep_out, dma.phys_at(CBW_OFF) as u32, 31, 2_000)?;
+
+    let mut moved = 0usize;
+    if dlen > 0 {
+        let want = dlen.min(DATA_MAX);
+        if data_in {
+            for i in 0..want {
+                dma.write8(DATA_OFF + i, 0);
+            }
+        }
+        moved = bulk_xfer(
+            ctx, mmio, t, disk, data_in,
+            if data_in { disk.ep_in } else { disk.ep_out },
+            dma.phys_at(DATA_OFF) as u32, want as u32, 5_000)? as usize;
+    }
+
+    // CSW: 13 bytes, "USBS".
+    for i in 0..13 {
+        dma.write8(CSW_OFF + i, 0);
+    }
+    bulk_xfer(ctx, mmio, t, disk, true, disk.ep_in, dma.phys_at(CSW_OFF) as u32, 13, 2_000)?;
+
+    let mut csw = [0u8; 13];
+    for i in 0..13 {
+        csw[i] = dma.read8(CSW_OFF + i);
+    }
+    let sig = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
+    let tag = u32::from_le_bytes([csw[4], csw[5], csw[6], csw[7]]);
+    let residue = u32::from_le_bytes([csw[8], csw[9], csw[10], csw[11]]);
+
+    // A SHORT DATA PHASE IS A FAILED TRANSFER, even when the device says it passed.
+    //
+    // This is the invariant the kernel driver is most emphatic about, and it earned that: a device is
+    // entitled to return a short data phase with status 0, so 100 bytes of a 512-byte read with
+    // residue 412 was accepted as a good block, and `fs` received 412 bytes of stale zeros PRESENTED
+    // AS DATA. Silent corruption arriving through the device's verdict rather than through the DMA
+    // buffer - the one thing a block driver must never do. So the residue is CHECKED, and what the
+    // data stage actually moved is compared against what was asked for.
+    let short = residue != 0 || moved != dlen.min(DATA_MAX);
+    if sig != 0x5342_5355 || tag != TAG || csw[12] != 0 || short {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: BOT failed - sig={:#010x} tag={:#010x} residue={} status={} moved={}/{}",
+            sig, tag, residue, csw[12], moved, dlen));
+        return None;
+    }
+    Some(moved)
+}
+
+/// READ CAPACITY(10): the device's last LBA and block size.
+pub fn read_capacity(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &Disk,
+) -> Option<(u64, u32)> {
+    let cdb = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    bot(ctx, mmio, dma, t, disk, &cdb, true, 8)?;
+    let mut b = [0u8; 8];
+    for i in 0..8 {
+        b[i] = dma.read8(DATA_OFF + i);
+    }
+    // Both fields are BIG endian - SCSI, not USB. Reading them little-endian gives a plausible but
+    // wildly wrong capacity, which is the sort of error that surfaces as corruption much later.
+    let last_lba = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64;
+    let block = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+    Some((last_lba + 1, block))
+}
+
+/// READ(10): one block into the arena's data buffer.
+pub fn read_block(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &Disk, lba: u32, block: u32,
+) -> bool {
+    let cdb = [
+        0x28u8, 0,
+        (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
+        0, 0, 1, 0,
+    ];
+    bot(ctx, mmio, dma, t, disk, &cdb, true, block as usize).is_some()
+}
