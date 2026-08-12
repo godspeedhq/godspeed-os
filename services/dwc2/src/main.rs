@@ -23,6 +23,7 @@
 mod chan;
 mod core;
 mod enumerate;
+mod hid;
 mod hub;
 mod regs;
 
@@ -143,7 +144,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             for p in 1..=n {
                                 if let Some(st) = hub::port_status(&ctx, &m, &d, &dev.target, p) {
                                     if st.connected() {
-                                        let _ = hub::enumerate_downstream(&ctx, &m, &d, &dev.target, p);
+                                        // SLICE 2: bind a boot keyboard if this is one.
+                                        //
+                                        // `bind` returns None for a device that is not a keyboard,
+                                        // which is an ordinary outcome on three of these four ports
+                                        // and must not be reported as a failure.
+                                        if let Some((_, _, _, dt, dsplt)) =
+                                            hub::enumerate_downstream(&ctx, &m, &d, &dev.target, p)
+                                        {
+                                            if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {
+                                                let _ = k;
+                                            }
+                                        }
                                     }
                                 }
                             }

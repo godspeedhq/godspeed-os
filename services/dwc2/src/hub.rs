@@ -205,7 +205,7 @@ pub fn survey(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, ports: u
 /// transaction translator.
 pub fn enumerate_downstream(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, hub: &Target, port: u8,
-) -> Option<(u16, u16, u8)> {
+) -> Option<(u16, u16, u8, Target, u32)> {
     // THE SPEED IS ONLY VALID AFTER THE RESET, and it decides whether a split is needed at all.
     //
     // `reset_port` returns the POST-reset status, and that is the one to believe. Before a reset the
@@ -305,5 +305,5 @@ pub fn enumerate_downstream(
     ctx.log_fmt(format_args!(
         "dwc2-svc: port {} DEVICE {} - VID:PID={:04x}:{:04x} class={:#04x} speed={} addr={}",
         port, if splt != 0 { "via split" } else { "direct" }, vid, pid, class, st.speed(), addr));
-    Some((vid, pid, class))
+    Some((vid, pid, class, t, splt))
 }
