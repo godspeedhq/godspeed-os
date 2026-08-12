@@ -150,7 +150,7 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 | **1b** | Channels + control transfers (`chan_program`, `chan_dma`, `ctrl_xfer`) | ✅ **hardware-verified 2026-08-12** - `DEVICE DESCRIPTOR len=18 type=0x01 usb=0x0200 mps0=64` |
 | **1c-i** | Address + identify the root device, hub descriptor | ✅ **hardware-verified 2026-08-12** - `0424:9514 class=0x09 ports=5` (the LAN9514's integrated hub) |
 | **1c-ii** | Hub port survey (power, status, speed) | ✅ **hardware-verified 2026-08-12** - 4 attached, status words byte-for-byte identical to the kernel driver's |
-| **1c-iii** | SPLIT TRANSACTIONS: address a device behind the hub | **IN PROGRESS** - split sequencing works, SETUP STALLs. See below |
+| **1c-iii** | Address devices behind the hub | ✅ **DIRECT devices 3/3 exact** (`0424:ec00`, `0781:5567`, `0bda:8176`). Split single-packet works; MULTI-PACKET split IN returns zeros - see below |
 | **2** | Keyboard: HID + `CONSOLE_PUSH` | Typing works from userspace. Second ON PURPOSE - it makes the machine usable for testing the rest |
 | **3** | Mass storage: BOT/SCSI; `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | `drives`, `ls`, `selfcheck` |
 | **4** | Networking: CDC-ECM + smsc95xx; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | DHCP, `ping` |
@@ -258,7 +258,47 @@ that, the survey would have reported whatever the previous transfer left in the 
 topology assembled from stale bytes, which is worse than an obviously wrong one because it would have
 been believed. That defence was written three slices earlier for exactly this shape of bug.
 
-## Slice 1c-iii: open, with the field narrowed
+## Slice 1c-iii result
+
+```
+port 1 DEVICE direct    - VID:PID=0424:ec00 class=0xff speed=high addr=2
+port 2 DEVICE direct    - VID:PID=0781:5567 class=0x00 speed=high addr=3
+port 3 DEVICE direct    - VID:PID=0bda:8176 class=0x00 speed=high addr=4
+port 4 DEVICE via split - VID:PID=0000:0000 class=0x00 speed=low  addr=5
+```
+
+Three of four match the in-kernel driver EXACTLY. Enumeration of directly-attached devices is done.
+
+**What remains is narrow and precisely bounded.** Port 4 (low speed, behind the transaction
+translator):
+
+- its **8-byte** descriptor read SUCCEEDED - the code bails on `mps0 == 0` and did not;
+- `SET_ADDRESS` through the split SUCCEEDED;
+- `class=0x00` is genuinely correct for a HID keyboard (its class lives at interface level);
+- only the **18-byte** read came back zeros.
+
+At MPS 8 an 18-byte transfer is THREE packets where the 8-byte one was one. So single-packet split
+transfers work in both directions, and the failure is specific to a MULTI-PACKET split IN. That is a
+known-harder case: each packet needs its own start-split/complete-split pair, and `stage_split`
+currently issues one pair for the whole transfer.
+
+Next step, and it is a comparison rather than a guess: the kernel driver reads full descriptors from
+this same low-speed keyboard successfully, so the working answer is in `split_txn` /
+`chan_dma` - specifically how the packet count in HCTSIZ interacts with a split, and whether the
+controller re-issues the split per packet or the driver must. Read that before changing anything.
+
+### How the earlier STALL was resolved
+
+The STALL was neither the hub nor the device: it was a split sent to a device that did not need one.
+A port's SPEED BITS ARE NOT VALID UNTIL THE PORT HAS BEEN RESET, and the survey read them from an
+idle port, announcing "4 devices, 4 need split transactions" - confidently and wrongly. Three are
+high speed and are addressed directly; a hub STALLs a split aimed at a high-speed device. Port 4, the
+one genuinely low-speed device, enumerated through a split on the very boot that STALLed the others.
+
+A measurement taken at the wrong moment is worse than none, because it gets believed - it was the
+input to three boots of hunting a bug in split code that was correct throughout.
+
+## Superseded: the field-narrowing that got there
 
 The split machinery WORKS. The transaction translator ACKs the start-split - a complete-split is only
 ever issued after it does - so `hcsplt` encoding, SSPLIT/CSPLIT sequencing and the microframe sweep
