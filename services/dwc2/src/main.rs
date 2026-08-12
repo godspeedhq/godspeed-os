@@ -22,6 +22,7 @@
 
 mod chan;
 mod core;
+mod enumerate;
 mod regs;
 
 use godspeed_sdk::ServiceContext;
@@ -98,15 +99,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             //
             // Address 0, MPS 8: the mandatory state of a just-reset device before SET_ADDRESS. 8 is
             // the safe minimum every device must accept for its first descriptor read.
+            // SLICE 1c: address the root device and identify it.
+            //
+            // The acceptance test is a COMPARISON, not a plausible-looking line: the VID/PID and port
+            // count must match what the in-kernel driver reports for the same hardware. Anything
+            // else means the transfers worked and the parsing did not, which a lone "looks like a
+            // hub" would hide.
             if let Some(d) = ctx.dma_region() {
-                let t = chan::Target { addr: 0, mps: 8, low_speed: false };
-                let mut buf = [0u8; 18];
-                if chan::get_descriptor(&ctx, &m, &d, &t, 0x01, 0, &mut buf, 8) {
-                    ctx.log_fmt(format_args!(
-                        "dwc2-svc: DEVICE DESCRIPTOR len={} type={:#04x} usb={:#06x} mps0={}",
-                        buf[0], buf[1], u16::from_le_bytes([buf[2], buf[3]]), buf[7]));
-                } else {
-                    ctx.log("dwc2-svc: device descriptor read FAILED - see the stage above");
+                match enumerate::root_device(&ctx, &m, &d) {
+                    Some(dev) => ctx.log_fmt(format_args!(
+                        "dwc2-svc: ENUMERATION OK - {:04x}:{:04x} class={:#04x} ports={}",
+                        dev.vid, dev.pid, dev.class,
+                        match dev.hub_ports { Some(n) => n, None => 0 })),
+                    None => ctx.log("dwc2-svc: enumeration FAILED - see the step above"),
                 }
             }
         }
