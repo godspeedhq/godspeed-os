@@ -20,6 +20,9 @@
 #![no_std]
 #![no_main]
 
+mod core;
+mod regs;
+
 use godspeed_sdk::ServiceContext;
 
 /// How often to report, in ms. Long enough not to be noise, short enough that a boot answers the
@@ -62,6 +65,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         Some(d) => ctx.log_fmt(format_args!(
             "dwc2-svc: DMA arena granted - {} bytes at phys {:#x}", d.len(), d.phys_at(0))),
         None => ctx.log("dwc2-svc: NO DMA arena - the kernel granted none"),
+    }
+
+    // SLICE 1a: bring the controller up ourselves.
+    //
+    // The kernel driver has stood down (it gates on who holds the vector), so from here the service
+    // owns this controller. Everything below is reported rather than assumed: a driver that cannot
+    // reach or reset its hardware must say which step failed, not present as a driver that found no
+    // devices.
+    if let Some(m) = ctx.mmio() {
+        if core::identify(&ctx, &m).is_some() {
+            let ok = core::reset_and_host_mode(&ctx, &m);
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: core bring-up {}", if ok { "OK" } else { "COMPLETED WITH WARNINGS (see above)" }));
+            match core::port_bring_up(&ctx, &m) {
+                Some(hprt) => ctx.log_fmt(format_args!(
+                    "dwc2-svc: root port HPRT={:#010x} connected={} enabled={} speed={}",
+                    hprt,
+                    hprt & regs::HPRT_PRTCONNSTS != 0,
+                    hprt & regs::HPRT_PRTENA != 0,
+                    core::speed_name(hprt))),
+                None => ctx.log("dwc2-svc: root port bring-up FAILED - no device will enumerate"),
+            }
+        }
     }
 
     // Interrupts arrive as ordinary IPC on this service's receive endpoint: the kernel's neutral

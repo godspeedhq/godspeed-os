@@ -7,5 +7,10 @@ edition = "2021"
 name = "dwc2"
 path = "src/main.rs"
 
+[features]
+# Mirrors the kernel driver's gate: QEMU's DWC2 wants a plain physical DMA address, real BCM2836
+# silicon wants the VideoCore bus alias. Same source, both targets.
+qemu = []
+
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
