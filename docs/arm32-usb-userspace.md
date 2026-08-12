@@ -153,7 +153,9 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 | **1c-iii** | Address devices behind the hub, direct and via split | ✅ **COMPLETE 2026-08-12 - 4/4 exact match with the in-kernel driver** |
 | **2a** | Find + bind a boot keyboard (config walk, SET_CONFIGURATION, SET_PROTOCOL) | ✅ **hardware-verified 2026-08-12** - `interface 0 endpoint 1 mps 8 interval 10`, matching the kernel driver |
 | **2b** | POLL the interrupt endpoint via a PERIODIC split, push to `CONSOLE_PUSH` | ✅ **COMPLETE 2026-08-12** - `gsh> hello` typed on the USB keyboard |
-| **3** | Mass storage: BOT/SCSI; `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | `drives`, `ls`, `selfcheck` |
+| **3a** | Find + bind the Bulk-Only mass-storage interface and its endpoints | ✅ **hardware-verified 2026-08-12** - `bulk IN 1 OUT 2 mps 512`, matching the kernel driver |
+| **3b** | BOT/SCSI: INQUIRY, READ CAPACITY, READ(10)/WRITE(10) over the bulk endpoints | sector 0 reads back `47 53 46 53` (GSFS) |
+| **3c** | `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | `drives`, `ls`, `selfcheck` |
 | **4** | Networking: CDC-ECM + smsc95xx; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | DHCP, `ping` |
 | **5** | Delete `arch/arm/dwc2.rs`, the six syscalls, the tick hooks | `chaos max-carnage` + `selfcheck`. THEN amend §6.4 |
 
@@ -258,6 +260,35 @@ It was findable in one boot only because slice 1b zeroes the IN scratch before e
 that, the survey would have reported whatever the previous transfer left in the buffer: a plausible
 topology assembled from stale bytes, which is worse than an obviously wrong one because it would have
 been believed. That defence was written three slices earlier for exactly this shape of bug.
+
+## Slice 3a result
+
+```
+dwc2-svc: MASS STORAGE bound - bulk IN 1 OUT 2 mps 512 (ep0 mps 64)
+dwc2-svc: BOOT KEYBOARD bound - interface 0 endpoint 1 mps 8 interval 10
+```
+
+Matches the kernel driver exactly (`bulk in ep=0x01 out ep=0x02 mps=0x200`). Both bindings landed on
+the right ports first try, and each device correctly declined the other's binding.
+
+`mps 512` confirms high speed, so the disk path needs no splits - the stick is directly attached on
+port 2.
+
+### What 3b needs, and where to read it
+
+BOT is three bulk transfers per command: a 31-byte CBW out, an optional data stage, and a 13-byte CSW
+in. The kernel driver's `bot_command` is the reference, and its surrounding recovery machinery
+(`bot_recover`, `note_busy`, `recover_or_revive`) is worth reading BEFORE writing the happy path,
+because on this board it is not optional:
+
+- the Pi 2's stick REFUSES `SYNCHRONIZE CACHE` outright, and FUA costs more per write than the
+  driver's command budget allows (`USE_FUA`, CLAUDE.md §6.1 amendment 2026-07-25);
+- it goes BUSY for tens of seconds under load - a 45-second stall was observed on this very branch -
+  so a bulk timeout must distinguish "busy, ask again" from "failed", which is exactly what
+  `note_busy` exists for.
+
+A happy-path BOT implementation will appear to work and then fail under `selfcheck`, which is the
+worst order to discover it in.
 
 ## SLICE 2 COMPLETE - the keyboard is driven from userspace
 
