@@ -352,10 +352,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     .map(|(d, _, _)| (d.busy_cbw, d.busy_data, d.busy_csw, d.commands))
                     .unwrap_or((0, 0, 0, 0));
                 let ms = ctx.duration_cycles(1).max(1);
+                let ns = nic.as_ref().map(|(n, _)| {
+                    let s = &n.stats;
+                    (s.tx_ok, s.tx_fail, s.rx_bursts, s.rx_bytes, s.rx_frames, s.rx_bad)
+                }).unwrap_or((0, 0, 0, 0, 0, 0));
                 ctx.log_fmt(format_args!(
-                    "dwc2-svc: alive - {} key, {} blocks, {} cmds; busy CBW {} DATA {} CSW {};                      {} passes, serve {}ms kbd {}ms sleep {}ms",
+                    "dwc2-svc: alive - {} key, {} blocks, {} cmds; busy CBW {} DATA {} CSW {};                      {} passes, serve {}ms kbd {}ms sleep {}ms; net tx {}/{} fail, rx {} bursts {} bytes {} frames {} unparsed",
                     reports, served, cmds, bc, bd, bs,
-                    passes, seg_serve / ms, seg_kbd / ms, seg_sleep / ms));
+                    passes, seg_serve / ms, seg_kbd / ms, seg_sleep / ms,
+                    ns.0, ns.1, ns.2, ns.3, ns.4, ns.5));
             }
             // DO NOT SLEEP WHEN THERE WAS WORK. This is the whole of the throughput problem.
             //

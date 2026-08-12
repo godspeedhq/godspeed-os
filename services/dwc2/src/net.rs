@@ -17,6 +17,21 @@ const DESC_ENDPOINT: u8 = 0x05;
 const EP_TYPE_BULK: u8 = 0x02;
 
 /// A bound USB ethernet device.
+/// What the frame path has actually moved, as opposed to what it was asked to move.
+///
+/// These separate the three failures that look identical from outside ("no network"): a TX the device
+/// refuses, a bulk-IN that never returns bytes, and bytes that arrive and are then thrown away by the
+/// status-word parse. Each needs a different fix and the log cannot tell them apart without counting.
+#[derive(Default)]
+pub struct Stats {
+    pub tx_ok:      u32,
+    pub tx_fail:    u32,
+    pub rx_bursts:  u32,   // bulk-IN returned >0 bytes
+    pub rx_bytes:   u32,   // total bytes those bursts carried
+    pub rx_frames:  u32,   // complete frames the parse handed up
+    pub rx_bad:     u32,   // bursts whose first status word did not parse
+}
+
 pub struct Nic {
     pub ep_in: u8,
     pub ep_out: u8,
@@ -29,6 +44,7 @@ pub struct Nic {
     pub mac: [u8; 6],
     /// Endpoint data toggles, per DIRECTION, for the device's lifetime - the level USB defines them
     /// at, learned three times over on the disk path.
+    pub stats: Stats,
     pub pid_in: u32,
     pub pid_out: u32,
 }
@@ -159,7 +175,8 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
     ctx.log_fmt(format_args!(
         "dwc2-svc: smsc95xx (LAN9514) UP - bulk IN {} OUT {} mps {} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         ep_in, ep_out, mps, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
-    Some(Nic { ep_in, ep_out, mps, mac, pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0 })
+    Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(),
+               pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0 })
 }
 
 // --- smsc95xx (LAN9514) bring-up -------------------------------------------------------------------
@@ -415,8 +432,10 @@ pub fn tx(
     }
     // No ZLP needed: the smsc95xx carries an explicit length in its TX command, so it does not rely on
     // a short packet to find the frame boundary the way CDC-ECM does.
-    bulk(ctx, mmio, t, nic.mps, false, nic.ep_out, dma.phys_at(TX_OFF) as u32,
-         (n + 8) as u32, 2_000, &mut nic.pid_out).is_some()
+    let ok = bulk(ctx, mmio, t, nic.mps, false, nic.ep_out, dma.phys_at(TX_OFF) as u32,
+                  (n + 8) as u32, 2_000, &mut nic.pid_out).is_some();
+    if ok { nic.stats.tx_ok += 1; } else { nic.stats.tx_fail += 1; }
+    ok
 }
 
 /// Receive one burst and hand each complete frame to `deliver`.
@@ -432,6 +451,10 @@ pub fn rx(
         Some(n) => n as usize,
         None => return 0, // NAK on a quiet network is the normal case, not an error
     };
+    if got > 0 {
+        nic.stats.rx_bursts += 1;
+        nic.stats.rx_bytes = nic.stats.rx_bytes.wrapping_add(got as u32);
+    }
 
     // A burst is [4-byte RX status][frame incl FCS][DWORD pad], REPEATED - one transfer can carry
     // several frames, so this is a parse rather than a copy.
@@ -450,6 +473,10 @@ pub fn rx(
         // would deliver a ZERO-length frame, and zero is the "nothing received" sentinel everywhere
         // above - so one malformed length would look like an empty network rather than a bad frame.
         if flen < 4 + 14 || flen > FRAME_MAX + 4 || pos + flen > got {
+            // Count ONLY a burst whose FIRST status word is unparseable. A break after some frames
+            // were delivered is the ordinary end of a burst, not a fault, and counting it would bury
+            // the signal this is here to find.
+            if frames == 0 { nic.stats.rx_bad += 1; }
             break; // invalid, or a frame split across the burst boundary - give up on this burst
         }
         let n = flen - 4; // strip the FCS; the stack does not want it
@@ -458,6 +485,7 @@ pub fn rx(
         }
         deliver(&buf[..n.min(FRAME_MAX)]);
         frames += 1;
+        nic.stats.rx_frames += 1;
         pos += flen;
         pos += (4 - (flen % 4)) % 4; // each frame is followed by DWORD padding
     }
