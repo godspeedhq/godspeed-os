@@ -193,7 +193,7 @@ pub fn poll(
     let any = (0..8).any(|i| dma.read8(REPORT_OFF + i) != 0);
     if !any {
         state.pid = chan::pid_from_hctsiz(mmio, chan::CH_KBD);
-        let mut rel = [0u8; 8];
+        let rel = [0u8; 8];
         godspeed_sdk::hid::decode_keyboard(
             &rel, &mut state.last, &mut state.repeat, &mut state.caps,
             ctx.read_tsc(), |ch| ctx.console_push(ch), |_| {});
