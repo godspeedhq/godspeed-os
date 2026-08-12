@@ -209,7 +209,27 @@ pub fn enumerate_downstream(
     let mut first = [0u8; 18];
     let setup = [0x80, 0x06, 0, 0x01, 0, 0, 8, 0];
     if !chan::control_split(ctx, mmio, dma, &t, &setup, &mut first, true, 8, splt) {
-        ctx.log_fmt(format_args!("dwc2-svc: port {} first descriptor read FAILED (split)", port));
+        // WAS THAT THE HUB OR THE DEVICE? Re-read the port, from the HUB, over a DIRECT transfer.
+        //
+        // The two answers want opposite fixes and nothing in the failure itself separates them. This
+        // read does, three ways at once:
+        //
+        //   - it ANSWERS at all -> the hub is alive and its own control endpoint is fine, so whatever
+        //     STALLed was produced inside the split path rather than by a sick hub;
+        //   - the port is still ENABLED -> the hub did not react to the transaction by disabling it,
+        //     which a hub does when it decides a device is misbehaving;
+        //   - the speed still reads the same -> the port did not silently drop and re-detect.
+        //
+        // A hub that has stopped answering entirely is a completely different fault from a device
+        // that STALLed, and a failure that cannot tell them apart is worth one extra transfer.
+        match port_status(ctx, mmio, dma, hub, port) {
+            Some(after) => ctx.log_fmt(format_args!(
+                "dwc2-svc: port {} FAILED (split) - hub still answers, port now connected={} enabled={} speed={} (status={:#06x})",
+                port, after.connected(), after.enabled(), after.speed(), after.status)),
+            None => ctx.log_fmt(format_args!(
+                "dwc2-svc: port {} FAILED (split) - and the HUB has stopped answering too (its own control endpoint is broken, not the device's)",
+                port)),
+        }
         return None;
     }
     let vid = u16::from_le_bytes([first[8], first[9]]);

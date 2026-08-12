@@ -125,11 +125,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             // The first port reporting a device is enough to prove the path. Doing
                             // all four would prove the same thing four times and take four times as
                             // long to read when it fails.
+                            // TRY EVERY CONNECTED PORT, not just the first.
+                            //
+                            // This is the discriminator for "hub or device?". There are four devices
+                            // down there from four different vendors at two different speeds, and
+                            // four different devices do not fail identically. So:
+                            //
+                            //   all four STALL the same way  -> not the device. The fault is ours or
+                            //                                   the hub's, and it is systematic.
+                            //   some work, some do not       -> device- or speed-specific, and the
+                            //                                   ones that differ say which property
+                            //                                   matters (port 4 is the only LOW-speed
+                            //                                   device on this board).
+                            //
+                            // Costs three extra transfers on a path that runs once. Stopping at the
+                            // first failure throws away the comparison that answers the question.
                             for p in 1..=n {
                                 if let Some(st) = hub::port_status(&ctx, &m, &d, &dev.target, p) {
                                     if st.connected() {
                                         let _ = hub::enumerate_downstream(&ctx, &m, &d, &dev.target, p);
-                                        break;
                                     }
                                 }
                             }
