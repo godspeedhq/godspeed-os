@@ -148,18 +148,28 @@ const _: () = assert!(DATA_OFF >= CSW_OFF + 13);
 #[allow(clippy::too_many_arguments)]
 fn bulk_xfer(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target, disk: &Disk,
-    dir_in: bool, ep: u8, buf_phys: u32, len: u32, budget_ms: u64,
+    dir_in: bool, ep: u8, buf_phys: u32, len: u32, budget_ms: u64, pid: &mut u32,
 ) -> Option<u32> {
     let bt = Target { addr: t.addr, mps: disk.mps, low_speed: false };
     let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(budget_ms));
     let mut xact_errs = 0u32;
     loop {
-        chan::program(mmio, &bt, chan::CH_BULK, dir_in, chan::PID_DATA0, len, buf_phys, ep as u32, 2, 0);
+        chan::program(mmio, &bt, chan::CH_BULK, dir_in, *pid, len, buf_phys, ep as u32, 2, 0);
         match chan::wait_halt(ctx, mmio, chan::CH_BULK, 100) {
             Some(hcint) if hcint & crate::regs::HCINT_XFERCOMPL != 0 => {
                 // HCTSIZ counts DOWN the bytes still outstanding, so what moved is the difference.
                 // Reading it is what makes a SHORT transfer detectable at all.
                 let left = mmio.read32(chan::hctsiz_at(chan::CH_BULK)) & 0x7_FFFF;
+                // CARRY THE TOGGLE FORWARD, read back from the hardware.
+                //
+                // A bulk endpoint's DATA0/DATA1 toggle alternates across transfers, and the device
+                // IGNORES a packet with the wrong one. Programming DATA0 every time worked for the
+                // CBW and the data stage - both happened to land on DATA0 - and then the CSW was sent
+                // with a toggle the device had already consumed, so it never answered and the channel
+                // never halted. Exactly the same fault as the keyboard's doubled keystroke, in the
+                // other direction: there a stale toggle made the device RETRANSMIT, here it makes the
+                // device IGNORE.
+                *pid = chan::pid_from_hctsiz(mmio, chan::CH_BULK);
                 return Some(len.saturating_sub(left));
             }
             Some(hcint) if hcint & crate::regs::HCINT_STALL != 0 => {
@@ -198,6 +208,10 @@ pub fn bot(
     cdb: &[u8], data_in: bool, dlen: usize,
 ) -> Option<usize> {
     const TAG: u32 = 0x1234_5678;
+    // ONE toggle for the whole command. BOT is three transfers on the same endpoint pair, and the
+    // toggle belongs to the ENDPOINT, not to the transfer - so it must be carried across all three.
+    let mut pid_out = chan::PID_DATA0;
+    let mut pid_in = chan::PID_DATA0;
     // CBW: 31 bytes, "USBC".
     for i in 0..31 {
         dma.write8(CBW_OFF + i, 0);
@@ -223,7 +237,7 @@ pub fn bot(
     // port a boot every time it has appeared. CBW-out failing means the device is not accepting
     // commands at all; a data-stage failure means it accepted the command and would not answer; a
     // CSW failure means it did the work and would not report. Three different faults.
-    if bulk_xfer(ctx, mmio, t, disk, false, disk.ep_out, dma.phys_at(CBW_OFF) as u32, 31, 2_000).is_none() {
+    if bulk_xfer(ctx, mmio, t, disk, false, disk.ep_out, dma.phys_at(CBW_OFF) as u32, 31, 2_000, &mut pid_out).is_none() {
         ctx.log_fmt(format_args!(
             "dwc2-svc: BOT CBW-out FAILED (cdb {:#04x}, ep_out {}, mps {})", cdb[0], disk.ep_out, disk.mps));
         return None;
@@ -240,7 +254,8 @@ pub fn bot(
         moved = match bulk_xfer(
             ctx, mmio, t, disk, data_in,
             if data_in { disk.ep_in } else { disk.ep_out },
-            dma.phys_at(DATA_OFF) as u32, want as u32, 5_000)
+            dma.phys_at(DATA_OFF) as u32, want as u32, 5_000,
+            if data_in { &mut pid_in } else { &mut pid_out })
         {
             Some(n) => n as usize,
             None => {
@@ -256,7 +271,7 @@ pub fn bot(
     for i in 0..13 {
         dma.write8(CSW_OFF + i, 0);
     }
-    if bulk_xfer(ctx, mmio, t, disk, true, disk.ep_in, dma.phys_at(CSW_OFF) as u32, 13, 2_000).is_none() {
+    if bulk_xfer(ctx, mmio, t, disk, true, disk.ep_in, dma.phys_at(CSW_OFF) as u32, 13, 2_000, &mut pid_in).is_none() {
         ctx.log_fmt(format_args!("dwc2-svc: BOT CSW-in FAILED (cdb {:#04x})", cdb[0]));
         return None;
     }
