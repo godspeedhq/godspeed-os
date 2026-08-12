@@ -206,6 +206,7 @@ const SMSC_MII_DATA: u16 = 0x118;
 const SMSC_PHY_ID: u32 = 1;
 const SMSC_MII_BMCR: u32 = 0;
 const SMSC_MII_ADVERTISE: u32 = 4;
+const SMSC_MII_BMSR: u32 = 1;   // basic mode STATUS; bit 2 = link up
 /// RX burst size in 512-byte high-speed packets. Must stay within `RX_BURST` in the arena layout.
 const SMSC_BURST_PKTS: u32 = 4;
 
@@ -342,6 +343,21 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
         return None;
     }
     smsc_write(ctx, m, d, t, SMSC_TX_CFG, SMSC_TX_CFG_ON);
+
+    // Read the state back OFF THE CHIP rather than assuming the writes took. Every register here was
+    // just written by us, so a value that disagrees says the vendor control path is not landing - and
+    // that is a completely different bug from "frames do not flow". BMSR bit 2 is the PHY's own link
+    // bit: the only honest answer to "is the cable up", as against the UP this driver currently
+    // reports to net-stack unconditionally.
+    let cr  = smsc_read_or0(ctx, m, d, t, SMSC_MAC_CR);
+    let txc = smsc_read_or0(ctx, m, d, t, SMSC_TX_CFG);
+    let hwc = smsc_read_or0(ctx, m, d, t, SMSC_HW_CFG);
+    let bmsr = mii_read(ctx, m, d, t, SMSC_MII_BMSR);
+    ctx.log_fmt(format_args!(
+        "dwc2-svc: smsc readback MAC_CR=0x{:08x} (TXEN {} RXEN {}) TX_CFG=0x{:08x} HW_CFG=0x{:08x} BMSR={} link {}",
+        cr, cr & SMSC_MAC_CR_TXEN != 0, cr & SMSC_MAC_CR_RXEN != 0, txc, hwc,
+        match bmsr { Some(v) => v, None => 0xFFFF },
+        match bmsr { Some(v) => if v & 0x0004 != 0 { "UP" } else { "DOWN" }, None => "UNREADABLE" }));
     Some(mac)
 }
 
@@ -489,7 +505,12 @@ pub fn serve(
             // the cable is out. Reading it properly is the remaining piece of this slice.
             out[0] = 1;
             out[1..7].copy_from_slice(&nic.mac);
-            out[7] = 1;
+            // The PHY's own link bit, not an assumption. Reporting a hardcoded UP made net-stack
+            // spend its DHCP budget against a cable that may not be there, and made "no link" and
+            // "link up but silent" indistinguishable from the outside - the two things a diagnosis
+            // most needs to tell apart. Unreadable counts as DOWN: an unanswerable question is not
+            // a yes.
+            out[7] = u8::from(matches!(mii_read(ctx, mmio, dma, t, SMSC_MII_BMSR), Some(v) if v & 0x0004 != 0));
             8
         }
         OP_NET_TX if p.len() > 1 => {
