@@ -478,7 +478,17 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // mem-pressure tasks for max-carnage's spawn-burst dimension; probes spawn victims.
         spawn: is_probe || matches!(name, "supervisor" | "shell" | "chaos"),
         // Both USB host drivers push decoded keystrokes: xhci (front ports), ehci (USB 2.0 back ports).
-        console_push: matches!(name, "xhci" | "ehci"),
+        // `dwc2` is the arm32 USB keyboard driver, so it needs this for the same reason `xhci` and
+        // `ehci` do. Its absence was the whole of "the keyboard does not work": the transfers were
+        // right, the reports were valid HID boot reports (`00 00 0d 0c 12 ...` - real keycodes), and
+        // every `console_push` was rejected because the service had never been granted the authority.
+        //
+        // Deliberate and not merely mechanical (§6.4, SEC-2): a CONSOLE_PUSH holder is inside the
+        // SHELL'S TRUST PERIMETER, because keystrokes are commands and the kernel cannot distinguish a
+        // faithfully-decoded key-press from a synthesized one. That is inherent to being a keyboard
+        // driver and is why the grant is enumerated here by name rather than implied by holding a
+        // USB controller.
+        console_push: matches!(name, "xhci" | "ehci" | "dwc2"),
         // shell + observe use TaskStat/InspectKernel; supervisor's reconcile loop scans real liveness;
         // chaos does victim selection; the prop-/stress- probes query victim generations.
         introspect: matches!(name, "shell" | "supervisor" | "chaos")
