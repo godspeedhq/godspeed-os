@@ -27,6 +27,11 @@ const PROTOCOL_KEYBOARD: u8 = 0x01;
 /// Endpoint attribute bits: transfer type is the low two, 3 = interrupt.
 const EP_TYPE_INTERRUPT: u8 = 0x03;
 
+/// Where the keyboard's 8-byte boot report is DMA'd. Its own slice of the arena, clear of the
+/// control-transfer scratch: the poll and a control transfer can be in flight in the same pass, and
+/// sharing a buffer between them is how one transfer reads another's bytes.
+pub const REPORT_OFF: usize = 0x0100;
+
 /// A bound boot keyboard.
 pub struct Keyboard {
     /// Endpoint number (not the full address - the direction bit is stripped).
@@ -140,4 +145,69 @@ pub fn bind(
         "dwc2-svc: BOOT KEYBOARD bound - interface {} endpoint {} mps {} interval {}",
         iface, kbd.ep, kbd.mps, kbd.interval));
     Some(kbd)
+}
+
+/// Poll the keyboard once and push any keystrokes to the console.
+///
+/// Returns true if a report arrived. An idle keyboard NAKs, which is a positive answer of "nothing
+/// happened" rather than a failure - so a false here is the normal case and must not be logged.
+pub fn poll(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, splt: u32, kbd: &Keyboard,
+    state: &mut KeyState,
+) -> bool {
+    let len = (kbd.mps as u32).min(8);
+    let phys = dma.phys_at(REPORT_OFF) as u32;
+    // Zero first, for the same reason every IN transfer here does: a short report would otherwise
+    // leave the PREVIOUS keystroke in the buffer and it would be delivered a second time.
+    for i in 0..8 {
+        dma.write8(REPORT_OFF + i, 0);
+    }
+
+    let hcint = chan::periodic_split_in(
+        ctx, mmio, t, chan::CH_KBD, state.pid, phys, len, kbd.ep as u32, splt);
+
+    if hcint & crate::regs::HCINT_XFERCOMPL == 0 {
+        return false; // NAK (idle), NYET, or a rescheduled attempt - all ordinary
+    }
+    // Interrupt endpoints carry their own DATA0/DATA1 toggle, and a report received with the wrong
+    // one is a RETRANSMISSION of the last: delivering it would double a keystroke.
+    state.pid = if state.pid == chan::PID_DATA0 { chan::PID_DATA1 } else { chan::PID_DATA0 };
+
+    let mut rep = [0u8; 8];
+    for i in 0..8 {
+        rep[i] = dma.read8(REPORT_OFF + i);
+    }
+    godspeed_sdk::hid::decode_keyboard(
+        &rep,
+        &mut state.last,
+        &mut state.repeat,
+        &mut state.caps,
+        ctx.read_tsc(),
+        |ch| ctx.console_push(ch),
+        |code| ctx.log_fmt(format_args!("dwc2-svc: unmapped HID key usage {:#04x}", code)),
+    );
+    true
+}
+
+/// Decode state carried between polls: the rollover buffer, auto-repeat timing, caps lock, and the
+/// endpoint's data toggle.
+pub struct KeyState {
+    pub last: [u8; 6],
+    pub repeat: godspeed_sdk::hid::KeyRepeat,
+    pub caps: bool,
+    pub pid: u32,
+}
+
+impl KeyState {
+    pub fn new(ctx: &ServiceContext) -> Self {
+        Self {
+            last: [0u8; 6],
+            // Auto-repeat delays calibrated from THIS machine's timer rate, not assumed - the same
+            // assumption cost the Wyse a keypress that repeated into `qqqqq`.
+            repeat: godspeed_sdk::hid::KeyRepeat::new_calibrated(ctx.tsc_ticks_per_10ms()),
+            caps: false,
+            // An interrupt endpoint starts at DATA0 after configuration.
+            pid: chan::PID_DATA0,
+        }
+    }
 }

@@ -34,6 +34,12 @@ use crate::regs::*;
 /// speculative generality (§26.2) and one channel per stream buys the isolation it exists to provide.
 pub const CH_BULK: u32 = 0;
 
+/// The keyboard's periodic poll. A SEPARATE channel from control/bulk on purpose - it is the one
+/// transfer deliberately abandoned when its budget expires, so it must not share channel state with
+/// anything. This is the channel-per-stream rule the kernel driver learned by corrupting block
+/// transfers with an abandoned interrupt split.
+pub const CH_KBD: u32 = 1;
+
 /// Channel-enable / disable bits in HCCHAR.
 const HCCHAR_CHENA: u32 = 1 << 31;
 const HCCHAR_CHDIS: u32 = 1 << 30;
@@ -273,6 +279,83 @@ fn stage_split_one(
     }
     ctx.log_fmt(format_args!("dwc2-svc: {} split gave up after {} start-splits", what, SS_TRIES));
     false
+}
+
+/// Wait until the controller reaches a given microframe, bounded by REAL TIME.
+///
+/// 1.5 ms, because reaching any target microframe takes at most one ~1 ms frame. Time and not a spin
+/// count: the kernel driver's comment records that a spin-count bound here "was the cause of the
+/// scheduler-starving hang", since spin latency depends on MMIO speed rather than on the clock the
+/// microframes actually advance on.
+fn wait_uframe(ctx: &ServiceContext, mmio: &Mmio, target: u32) {
+    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(2));
+    while (mmio.read32(HFNUM) & 0x7) != (target & 0x7) {
+        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+            return;
+        }
+    }
+}
+
+/// A PERIODIC (interrupt) IN split, frame-scheduled. Returns the latched HCINT.
+///
+/// Unlike a non-periodic split - which sweeps microframes across retries and tolerates bad timing -
+/// a periodic split must be SCHEDULED, and the schedule is the thing that makes it work:
+///
+///   1. START-SPLIT in microframe (current+1)&7, SKIPPING microframe 6: too little of the frame is
+///      left after it for the complete-split at +2. ODDFRM must match that microframe's parity, which
+///      `program` derives from HFNUM - correct only because the channel is enabled AFTER `wait_uframe`
+///      has reached the scheduled microframe.
+///   2. COMPLETE-SPLIT at +2, retrying NYET in the following microframes (3 tries).
+///
+/// **ONE attempt per call, and that is what makes this safe in a preemptible task.** Any failure -
+/// including being descheduled at the wrong moment - simply reschedules a fresh start-split on the
+/// next poll. Combined with every wait being time-bounded, the whole poll is a few milliseconds and
+/// cannot wedge the service. The risk this port carried from the start turns out to be answered by
+/// the algorithm's own structure rather than by holding the CPU.
+#[allow(clippy::too_many_arguments)]
+pub fn periodic_split_in(
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ch: u32, pid: u32, buf_phys: u32, len: u32, ep: u32, splt: u32,
+) -> u32 {
+    let mut ssf = (mmio.read32(HFNUM).wrapping_add(1)) & 0x7;
+    if ssf == 6 {
+        ssf = 7; // skip microframe 6
+    }
+    wait_uframe(ctx, mmio, ssf);
+    program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt); // ep_type 3 = interrupt
+    let ss = match wait_halt(ctx, mmio, ch, 5) {
+        Some(v) => v,
+        None => return 0,
+    };
+    if ss & (HCINT_STALL | HCINT_XFERCOMPL) != 0 {
+        return ss;
+    }
+    if ss & HCINT_ACK == 0 {
+        return ss; // the TT refused the start-split - try again next poll
+    }
+
+    let mut csf = (ssf + 2) & 0x7;
+    let mut last = ss;
+    for _ in 0..3 {
+        wait_uframe(ctx, mmio, csf);
+        program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt | (1 << 16));
+        let cs = match wait_halt(ctx, mmio, ch, 5) {
+            Some(v) => v,
+            None => return last,
+        };
+        last = cs;
+        if cs & (HCINT_XFERCOMPL | HCINT_STALL | HCINT_NAK) != 0 {
+            // NAK is NOT an error here: it is the keyboard positively answering "no key activity this
+            // period", which is what an idle keyboard says most of the time.
+            return cs;
+        }
+        if cs & HCINT_NYET != 0 {
+            csf = (csf + 1) & 0x7; // the TT is not done - retry the complete-split a microframe later
+            continue;
+        }
+        return cs;
+    }
+    last
 }
 
 /// A split transfer of any length: ONE low/full-speed packet per split transaction.

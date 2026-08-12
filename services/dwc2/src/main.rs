@@ -32,6 +32,8 @@ use godspeed_sdk::ServiceContext;
 /// How often to report, in ms. Long enough not to be noise, short enough that a boot answers the
 /// question without waiting around.
 const REPORT_MS: u64 = 5_000;
+/// How often the keyboard poll reports it is alive.
+const HEARTBEAT_MS: u64 = 15_000;
 
 /// Bound on messages retired per drain. The endpoint queue is 16 deep, so this is a storm detector
 /// rather than a throttle - the same bound, for the same reason, as the one the `xhci` service
@@ -77,6 +79,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // owns this controller. Everything below is reported rather than assumed: a driver that cannot
     // reach or reset its hardware must say which step failed, not present as a driver that found no
     // devices.
+    // Declared out here so the poll loop below can see it: the bring-up borrows `mmio`, and the
+    // keyboard it finds has to outlive that borrow.
+    let mut kbd: Option<(hid::Keyboard, chan::Target, u32)> = None;
     if let Some(m) = ctx.mmio() {
         if core::identify(&ctx, &m).is_some() {
             let ok = core::reset_and_host_mode(&ctx, &m);
@@ -153,7 +158,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                             hub::enumerate_downstream(&ctx, &m, &d, &dev.target, p)
                                         {
                                             if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {
-                                                let _ = k;
+                                                kbd = Some((k, dt, dsplt));
                                             }
                                         }
                                     }
@@ -176,6 +181,38 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut msgs: u64 = 0;
     let mut last_report = ctx.read_tsc();
     let mut first_logged = false;
+
+    // SLICE 2b: poll the keyboard, if one was bound.
+    //
+    // A periodic split is ONE attempt per poll and reschedules on any failure, so this loop is the
+    // schedule: at the keyboard's requested interval it asks once, and an idle keyboard's NAK is a
+    // positive "nothing happened" rather than an error. That structure is what makes a
+    // microframe-scheduled transfer safe in a PREEMPTIBLE task - being descheduled at the wrong
+    // moment costs one attempt, not correctness.
+    if let (Some((k, kt, ksplt)), Some(m), Some(d)) = (kbd.as_ref(), ctx.mmio(), ctx.dma_region()) {
+        let mut state = hid::KeyState::new(&ctx);
+        let mut reports: u64 = 0;
+        let mut last_beat = ctx.read_tsc();
+        // The interval the DEVICE asked for, floored to something a service can actually schedule.
+        // `cycles_to_ticks` clamps sub-quantum sleeps to one 10 ms tick, so anything finer is
+        // fiction here - and saying so beats pretending to honour a 1 ms interval.
+        let period_ms = (k.interval as u64).max(10);
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: polling the keyboard every {} ms (device asked for {})", period_ms, k.interval));
+        loop {
+            if hid::poll(&ctx, &m, &d, kt, *ksplt, k, &mut state) {
+                reports = reports.wrapping_add(1);
+                if reports == 1 {
+                    ctx.log("dwc2-svc: *** FIRST KEY REPORT FROM USERSPACE *** - type and it reaches the console");
+                }
+            }
+            if ctx.read_tsc().wrapping_sub(last_beat) > ctx.duration_cycles(HEARTBEAT_MS) {
+                last_beat = ctx.read_tsc();
+                ctx.log_fmt(format_args!("dwc2-svc: alive - {} key report(s)", reports));
+            }
+            ctx.sleep(ctx.duration_cycles(period_ms));
+        }
+    }
 
     loop {
         // Block until something arrives, with a deadline so the report still lands on a quiet
