@@ -37,6 +37,17 @@ pub struct Disk {
     /// endpoint's. The kernel driver captures this for exactly that reason, before the bulk size
     /// replaces it in its target state.
     pub ep0_mps: u16,
+    /// The endpoint data toggles, one per DIRECTION, for the DEVICE'S LIFETIME.
+    ///
+    /// A toggle belongs to the ENDPOINT, not to a transfer and not to a command. Making it
+    /// per-command fixed READ CAPACITY and then broke READ(10): the second command restarted at
+    /// DATA0 while the device had already advanced past it, so the data stage was ignored and the
+    /// channel never halted. That is the same error as the per-transfer version, one level up, and
+    /// this is the level the USB spec actually defines it at.
+    ///
+    /// Reset only by a clear-halt or a SET_CONFIGURATION, which is why they live with the binding.
+    pub pid_in: u32,
+    pub pid_out: u32,
 }
 
 /// Walk a configuration descriptor for a Bulk-Only mass-storage interface and its endpoints.
@@ -125,7 +136,7 @@ pub fn bind(
     ctx.log_fmt(format_args!(
         "dwc2-svc: MASS STORAGE bound - bulk IN {} OUT {} mps {} (ep0 mps {})",
         ep_in, ep_out, mps, t.mps));
-    Some(Disk { ep_in, ep_out, mps, ep0_mps: t.mps })
+    Some(Disk { ep_in, ep_out, mps, ep0_mps: t.mps, pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0 })
 }
 
 /// Where a BOT command's buffers live in the DMA arena. Past the keyboard report, which is past the
@@ -147,10 +158,10 @@ const _: () = assert!(DATA_OFF >= CSW_OFF + 13);
 /// goes BUSY for tens of seconds under load, and a 45-second stall was observed on this branch.
 #[allow(clippy::too_many_arguments)]
 fn bulk_xfer(
-    ctx: &ServiceContext, mmio: &Mmio, t: &Target, disk: &Disk,
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target, mps: u16,
     dir_in: bool, ep: u8, buf_phys: u32, len: u32, budget_ms: u64, pid: &mut u32,
 ) -> Option<u32> {
-    let bt = Target { addr: t.addr, mps: disk.mps, low_speed: false };
+    let bt = Target { addr: t.addr, mps, low_speed: false };
     let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(budget_ms));
     let mut xact_errs = 0u32;
     loop {
@@ -204,14 +215,12 @@ fn bulk_xfer(
 ///
 /// Returns the bytes moved by the data stage, or `None`.
 pub fn bot(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &Disk,
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk,
     cdb: &[u8], data_in: bool, dlen: usize,
 ) -> Option<usize> {
     const TAG: u32 = 0x1234_5678;
-    // ONE toggle for the whole command. BOT is three transfers on the same endpoint pair, and the
-    // toggle belongs to the ENDPOINT, not to the transfer - so it must be carried across all three.
-    let mut pid_out = chan::PID_DATA0;
-    let mut pid_in = chan::PID_DATA0;
+    // Read the immutable fields out first: the transfers below borrow the toggles mutably.
+    let (ep_in, ep_out, mps) = (disk.ep_in, disk.ep_out, disk.mps);
     // CBW: 31 bytes, "USBC".
     for i in 0..31 {
         dma.write8(CBW_OFF + i, 0);
@@ -237,7 +246,7 @@ pub fn bot(
     // port a boot every time it has appeared. CBW-out failing means the device is not accepting
     // commands at all; a data-stage failure means it accepted the command and would not answer; a
     // CSW failure means it did the work and would not report. Three different faults.
-    if bulk_xfer(ctx, mmio, t, disk, false, disk.ep_out, dma.phys_at(CBW_OFF) as u32, 31, 2_000, &mut pid_out).is_none() {
+    if bulk_xfer(ctx, mmio, t, mps, false, ep_out, dma.phys_at(CBW_OFF) as u32, 31, 2_000, &mut disk.pid_out).is_none() {
         ctx.log_fmt(format_args!(
             "dwc2-svc: BOT CBW-out FAILED (cdb {:#04x}, ep_out {}, mps {})", cdb[0], disk.ep_out, disk.mps));
         return None;
@@ -252,10 +261,10 @@ pub fn bot(
             }
         }
         moved = match bulk_xfer(
-            ctx, mmio, t, disk, data_in,
-            if data_in { disk.ep_in } else { disk.ep_out },
+            ctx, mmio, t, mps, data_in,
+            if data_in { ep_in } else { ep_out },
             dma.phys_at(DATA_OFF) as u32, want as u32, 5_000,
-            if data_in { &mut pid_in } else { &mut pid_out })
+            if data_in { &mut disk.pid_in } else { &mut disk.pid_out })
         {
             Some(n) => n as usize,
             None => {
@@ -271,7 +280,7 @@ pub fn bot(
     for i in 0..13 {
         dma.write8(CSW_OFF + i, 0);
     }
-    if bulk_xfer(ctx, mmio, t, disk, true, disk.ep_in, dma.phys_at(CSW_OFF) as u32, 13, 2_000, &mut pid_in).is_none() {
+    if bulk_xfer(ctx, mmio, t, mps, true, ep_in, dma.phys_at(CSW_OFF) as u32, 13, 2_000, &mut disk.pid_in).is_none() {
         ctx.log_fmt(format_args!("dwc2-svc: BOT CSW-in FAILED (cdb {:#04x})", cdb[0]));
         return None;
     }
@@ -304,7 +313,7 @@ pub fn bot(
 
 /// READ CAPACITY(10): the device's last LBA and block size.
 pub fn read_capacity(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &Disk,
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk,
 ) -> Option<(u64, u32)> {
     let cdb = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     bot(ctx, mmio, dma, t, disk, &cdb, true, 8)?;
@@ -321,7 +330,7 @@ pub fn read_capacity(
 
 /// READ(10): one block into the arena's data buffer.
 pub fn read_block(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &Disk, lba: u32, block: u32,
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk, lba: u32, block: u32,
 ) -> bool {
     let cdb = [
         0x28u8, 0,

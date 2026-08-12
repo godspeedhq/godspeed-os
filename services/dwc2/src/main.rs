@@ -164,19 +164,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                             // the ordinary answer on most ports and is not logged.
                                             if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 kbd = Some((k, dt, dsplt));
-                                            } else if let Some(dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
+                                            } else if let Some(mut dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 // Prove the bulk path the way the kernel driver does:
                                                 // ask the device its size, then read block 0. Capacity
                                                 // alone would prove the command path; reading a block
                                                 // proves the DATA path, which is where a short
                                                 // transfer would silently corrupt.
-                                                match msc::read_capacity(&ctx, &m, &d, &dt, &dk) {
+                                                match msc::read_capacity(&ctx, &m, &d, &dt, &mut dk) {
                                                     Some((sectors, block)) => {
                                                         ctx.log_fmt(format_args!(
                                                             "dwc2-svc: USB DISK - {} sectors of {} B ({} MiB)",
                                                             sectors, block,
                                                             sectors.saturating_mul(block as u64) / (1024 * 1024)));
-                                                        if msc::read_block(&ctx, &m, &d, &dt, &dk, 0, block) {
+                                                        if msc::read_block(&ctx, &m, &d, &dt, &mut dk, 0, block) {
                                                             let b0 = d.read8(msc::DATA_OFF);
                                                             let b1 = d.read8(msc::DATA_OFF + 1);
                                                             let b2 = d.read8(msc::DATA_OFF + 2);
