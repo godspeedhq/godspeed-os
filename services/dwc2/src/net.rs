@@ -36,6 +36,11 @@ pub struct Stats {
     /// `rx_nohalt` means the channel never halted - a different fault from any error bit.
     pub rx_hcint:   u32,
     pub rx_nohalt:  u32,
+    /// The PHY's BMSR as of the last link question, and whether it said UP. Reported to net-stack but
+    /// never to the log until now - so "link UP" was inferred from net-stack's behaviour rather than
+    /// ever being SEEN at the moment frames should have been arriving. A device that NAKs every IN
+    /// while promiscuous and enabled has received nothing, and the link is the only thing left.
+    pub bmsr: u32,
 }
 
 pub struct Nic {
@@ -669,7 +674,9 @@ pub fn serve(
             // "link up but silent" indistinguishable from the outside - the two things a diagnosis
             // most needs to tell apart. Unreadable counts as DOWN: an unanswerable question is not
             // a yes.
-            out[7] = u8::from(link_up(ctx, mmio, dma, t));
+            let up = link_up(ctx, mmio, dma, t);
+            nic.stats.bmsr = mii_read(ctx, mmio, dma, t, SMSC_MII_BMSR).map_or(0xFFFF, u32::from);
+            out[7] = u8::from(up);
             8
         }
         OP_NET_TX if p.len() > 1 => {
