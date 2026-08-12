@@ -70,10 +70,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Block until something arrives, with a deadline so the report still lands on a quiet
         // machine. A service that only speaks when the hardware speaks cannot report that the
         // hardware is silent - which is the single most interesting outcome here.
-        let _ = ctx.recv_timeout(ctx.duration_cycles(REPORT_MS));
+        //
+        // COUNT WHAT THIS RETURNS. It was `let _ = ...`, and `recv_timeout` does not peek - it
+        // CONSUMES the message. So the one interrupt that arrived was received here and thrown away,
+        // `try_recv` below then found an empty queue, and the service reported `0 USB IRQ(s)` on a
+        // boot where the kernel's own `deliver() vector=0x29` line proves the interrupt had been
+        // delivered. A discarded return value, reporting the opposite of what happened.
+        let mut first = ctx.recv_timeout(ctx.duration_cycles(REPORT_MS));
 
         let mut drained = 0u32;
-        while let Some(m) = ctx.try_recv() {
+        while let Some(m) = first.take().or_else(|| ctx.try_recv()) {
             drained += 1;
             if drained >= MSG_DRAIN_MAX {
                 ctx.log("dwc2-svc: message drain hit its bound - a sender is enqueuing as fast as we retire (storm?)");
