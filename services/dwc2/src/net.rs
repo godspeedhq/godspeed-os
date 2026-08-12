@@ -527,7 +527,22 @@ pub fn rx(
             // Count ONLY a burst whose FIRST status word is unparseable. A break after some frames
             // were delivered is the ordinary end of a burst, not a fault, and counting it would bury
             // the signal this is here to find.
-            if frames == 0 { nic.stats.rx_bad += 1; }
+            if frames == 0 {
+                nic.stats.rx_bad += 1;
+                // Show the bytes for the FIRST few rejects only. A burst arrived and completed cleanly,
+                // so the device and the transfer are fine and the disagreement is about LAYOUT - which
+                // is settled by looking at what actually landed, not by re-reading the parse. Bounded to
+                // three so a persistent mismatch cannot flood the console.
+                if nic.stats.rx_bad <= 3 {
+                    ctx.log_fmt(format_args!(
+                        "dwc2-svc: RX burst {} bytes, unparsed at {}: status=0x{:08x} flen={} |                          first 12 bytes {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                        got, pos - 4, status, flen,
+                        dma.read8(RX_OFF), dma.read8(RX_OFF + 1), dma.read8(RX_OFF + 2),
+                        dma.read8(RX_OFF + 3), dma.read8(RX_OFF + 4), dma.read8(RX_OFF + 5),
+                        dma.read8(RX_OFF + 6), dma.read8(RX_OFF + 7), dma.read8(RX_OFF + 8),
+                        dma.read8(RX_OFF + 9), dma.read8(RX_OFF + 10), dma.read8(RX_OFF + 11)));
+                }
+            }
             break; // invalid, or a frame split across the burst boundary - give up on this burst
         }
         let n = flen - 4; // strip the FCS; the stack does not want it
