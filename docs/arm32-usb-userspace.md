@@ -261,6 +261,43 @@ that, the survey would have reported whatever the previous transfer left in the 
 topology assembled from stale bytes, which is worse than an obviously wrong one because it would have
 been believed. That defence was written three slices earlier for exactly this shape of bug.
 
+## Slice 3: recovery ported, and the guard that was rejecting good transfers
+
+`1477 block request(s)`, zero failures - the same workload that produced **2175 error lines** one
+build earlier now runs silently.
+
+### The three things that got it there
+
+1. **BUSY is not FAILED.** `bulk_xfer` returned the same `None` for a device pacing us and a device
+   wedged. On this board that is not cosmetic: the stick goes BUSY for tens of seconds, and the kernel
+   driver issued a Mass Storage Reset plus two clear-halts for every busy hand-back until it learned
+   the difference - 564 spurious recoveries in ONE selfcheck, resetting a stick that was never broken.
+   A timeout with ZERO transaction errors is now `Busy`: quiet, unlogged, streak untouched.
+
+2. **The SERVICE must absorb busy, because the protocol cannot report it.** `block-driver`'s
+   `dev_write` answers only 0 or -1, so a busy hand-back reached `fs` as a hard I/O error and
+   `block-driver`'s own `with_busy_retry` never fired - the syscall path could signal busy, the IPC
+   path cannot. All four selfcheck failures were WRITES while every read passed, which is what named
+   it. The retry now lives on the side that knows, bounded at 30 s to match what `fs` already waits.
+
+3. **The device's residue is the short-transfer authority, not a byte count from HCTSIZ.** `moved`
+   came from `len - HCTSIZ.XferSize`, assuming that field counts down as bytes move. In buffer-DMA
+   mode it does not: the controller performs the transfer itself. So the guard meant to catch silent
+   corruption rejected every good transfer instead, 2175 times, each reporting
+   `residue=0 status=0 moved=0/512` - the device stating it delivered everything while my arithmetic
+   said nothing had moved.
+
+### The pattern, third occurrence and the loudest
+
+A measurement taken the wrong way does not fail quietly. It fails ASSERTIVELY, and everything
+downstream believes it:
+
+| Instrument | Wrong because | Cost |
+|---|---|---|
+| port speed bits | read BEFORE the port reset | 3 boots hunting correct split code |
+| keystroke counter | counted NAKs as reports | hid a real bug for 2 boots |
+| `moved` from HCTSIZ | field is not a byte counter in DMA mode | 2175 log lines |
+
 ## SLICE 3 COMPLETE - storage is served from userspace
 
 ```
