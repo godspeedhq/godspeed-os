@@ -11,7 +11,18 @@
 
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use crate::chan::{self, Target};
+
+/// The next USB device address to hand out.
+///
+/// The hub took 1 at enumeration, so downstream devices start at 2. A counter rather than a
+/// per-port formula because address is a property of the BUS, not of where a device happens to sit.
+static NEXT_ADDR: AtomicU8 = AtomicU8::new(2);
+fn next_address() -> u8 {
+    NEXT_ADDR.fetch_add(1, Ordering::Relaxed)
+}
 
 // --- Hub class requests (USB 2.0 chapter 11) ---------------------------------------------------
 //
@@ -224,7 +235,7 @@ pub fn enumerate_downstream(
 
     // The device answers at address 0 until it is given one. `low_speed` matters to the controller's
     // channel programming, and the hub is the authority on it - the port status just told us.
-    let t = Target { addr: 0, mps: 8, low_speed: st.status & PORT_LOW_SPEED != 0 };
+    let mut t = Target { addr: 0, mps: 8, low_speed: st.status & PORT_LOW_SPEED != 0 };
     let mut first = [0u8; 18];
     let setup = [0x80, 0x06, 0, 0x01, 0, 0, 8, 0];
     if !chan::control_split(ctx, mmio, dma, &t, &setup, &mut first, true, 8, splt) {
@@ -251,11 +262,48 @@ pub fn enumerate_downstream(
         }
         return None;
     }
-    let vid = u16::from_le_bytes([first[8], first[9]]);
-    let pid = u16::from_le_bytes([first[10], first[11]]);
-    let class = first[4];
+    // GIVE IT AN ADDRESS, then read the WHOLE descriptor.
+    //
+    // Two bugs the last boot exposed, both here:
+    //
+    // 1. VID:PID read as 0000:0000 because only EIGHT bytes were requested and VID lives at bytes
+    //    8..11. The class byte (offset 4) came through correctly - `class=0xff` on port 1 is the real
+    //    vendor-specific class of the SMSC ethernet - which is what proved the transfer itself was
+    //    fine. The zeros were the scratch-zeroing doing its job again rather than handing back stale
+    //    bytes that would have looked like a plausible device.
+    //
+    // 2. Ports 2 and 3 failed AFTER port 1 succeeded, and that ordering is the clue: nothing was ever
+    //    given an address, so port 1's device stayed at address 0 and port 2's device answered at
+    //    address 0 as well. Two devices replying to the same token garbles both. Enumeration assigns
+    //    a unique address precisely so only one device is ever listening at 0.
+    let mps0 = first[7] as u16;
+    if mps0 == 0 {
+        ctx.log_fmt(format_args!("dwc2-svc: port {} reports EP0 max packet size 0", port));
+        return None;
+    }
+    t.mps = mps0;
+    let addr = next_address();
+    let sa = [0x00, 0x05, addr, 0, 0, 0, 0, 0];
+    let mut none: [u8; 0] = [];
+    if !chan::control_split(ctx, mmio, dma, &t, &sa, &mut none, false, 0, splt) {
+        ctx.log_fmt(format_args!("dwc2-svc: port {} SET_ADDRESS {} FAILED", port, addr));
+        return None;
+    }
+    ctx.sleep(ctx.duration_cycles(5)); // USB 2.0 9.2.6.3: 2 ms to commit the new address
+    t.addr = addr;
+
+    let mut full = [0u8; 18];
+    let getall = [0x80, 0x06, 0, 0x01, 0, 0, 18, 0];
+    if !chan::control_split(ctx, mmio, dma, &t, &getall, &mut full, true, 18, splt) {
+        ctx.log_fmt(format_args!("dwc2-svc: port {} full descriptor read FAILED at address {}", port, addr));
+        return None;
+    }
+
+    let vid = u16::from_le_bytes([full[8], full[9]]);
+    let pid = u16::from_le_bytes([full[10], full[11]]);
+    let class = full[4];
     ctx.log_fmt(format_args!(
-        "dwc2-svc: port {} DEVICE {} - VID:PID={:04x}:{:04x} class={:#04x} speed={}",
-        port, if splt != 0 { "via split" } else { "direct" }, vid, pid, class, st.speed()));
+        "dwc2-svc: port {} DEVICE {} - VID:PID={:04x}:{:04x} class={:#04x} speed={} addr={}",
+        port, if splt != 0 { "via split" } else { "direct" }, vid, pid, class, st.speed(), addr));
     Some((vid, pid, class))
 }
