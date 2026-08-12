@@ -978,3 +978,86 @@ relative path away from a phantom failure - consider `cd /` beside the cleanup.
 - **U7-15 (LOW).** `if ls /sc` prints `ls: not a directory: /sc` on every clean run (conditions run with
   console output), so the transcript still carries two lines that read like failures - the tally is
   correct, the appearance is not.
+
+
+## Audit 8 - the AArch64 branch at merge readiness (2026-08-12, `feat/pi4-aarch64` @ `94711fd2`)
+
+Scope: ~9,300 changed userspace lines since Audit 7 - the `xhci` service (main + msc + topo, the USB
+stack moved out of the kernel), the GENET backend (`nic-driver/src/genet.rs`, 1392 lines), and changes
+to `shell`, `fs`, `net-stack`, `block-driver`, `supervisor`, `chaos`.
+
+**Mechanical gate: PASS.** No `unsafe` in any service (§18.2).
+
+### A8-1 (MED) - three unbounded message drains, in the file that already learned this lesson
+
+`services/xhci/src/main.rs:597`, `:630`, `:3249` - all `while ctx.try_recv().is_some() {}`.
+
+Nothing bounds these. A sender that enqueues as fast as the driver dequeues keeps the loop running,
+and while it runs the USB poll loop is not polling: the keyboard stops. That failure mode is the one
+this driver has been chased for repeatedly.
+
+What makes it a finding rather than a theoretical: **the same file bounds its EVENT drain for exactly
+this reason**, with the comment *"a device posting events as fast as we retire them never lets it run
+dry, and then this loop never returns... 'it stops when the hardware stops' is not a bound, because the
+hardware is the thing that might not stop."* The message drain is the same shape with a different
+producer, left unbounded - and the comment above `:630` notes the path is *deliberately* exercised by
+`chaos flood-storm xhci`, so the flood is not hypothetical.
+
+Fix: the same treatment - a generous cap (the queue is 16 deep, so any bound well above it is only a
+storm detector), and log once when it trips.
+
+### A8-2 (MED) - a request with no reply cap is dropped silently by the ACTIVE Pi 4 backend
+
+`services/nic-driver/src/genet.rs:1288` - `let Some(reply_cap) = ctx.take_pending_cap() else { continue };`
+
+The sibling backend does this correctly: `services/nic-driver/src/main.rs:756` logs
+*"frame request had no reply cap - dropping"* before continuing. GENET - the backend that actually runs
+on the Pi 4 - drops it with no trace. A malformed or mis-sequenced request from net-stack therefore
+leaves no evidence anywhere, on the exact protocol boundary whose correlation weakness is already
+documented in `docs/net-tags-design.md`.
+
+Two implementations of one rule, one of which forgot it (Commandment III). The log must be
+rate-limited, as the existing "NO reply cap" logging elsewhere already is.
+
+### A8-3 (LOW/MED) - every GENET reply discards its send result
+
+`genet.rs:1334`, `:1338`, `:1364`, `:1371`, `:1388` - all `let _ = ctx.try_send_by_handle(reply_cap, ..)`.
+
+A `try_send` that fails means the requester was never answered. It will time out and retry, so there
+IS a recovery - but the driver believes it replied and says nothing, so the failure is only ever
+visible from the far side as latency (§26.7). At minimum a rate-limited log; the outcome must not be
+discarded.
+
+**Not a cap leak:** `remove_cap(reply_cap)` at `:1390` runs on the loop's exit path, so the slot is
+reclaimed whether or not the send succeeded. Checked because §8.5 makes this the usual companion
+fault; it is genuinely absent here.
+
+### A8-4 (LOW) - net-stack drops a capless request silently too
+
+`services/net-stack/src/main.rs:985` - `None => continue,` with only an inline comment. Same rule as
+A8-2, same fix, lower exposure (net-stack is not the hot path a driver is).
+
+### The class this branch produced three of, worth grepping for
+
+**State whose lifetime is shorter than the events it must remember.** All three were found on hardware
+during this session's xhci work, each masking the next:
+
+- `eaten` re-zeroed every pass, so a probe abandoned on one pass looked like a genuine failure on the
+  next - and walked a wedge counter to its threshold;
+- `PROBE_FAILS` reset per re-enumeration;
+- `hub_tried` declared INSIDE the `'reenum` loop, so the re-enumeration it triggers wiped it. The
+  guard erased its own memory with the very action it fired: 110 controller resets in one run.
+
+A latch that resets when the thing it latches happens is not a latch. Worth a deliberate pass over
+every `let mut` inside a restart/retry loop that is read as history.
+
+### Verified sound
+
+- **`genet.rs` `wait_mask`** is bounded BOTH ways - on the clock when the TSC is calibrated, and on an
+  iteration count (`UNCALIBRATED_POLLS`) when it is not. That is the correct reading of "a count is not
+  a duration": use the clock when you have one, and still refuse to spin forever when you do not.
+- **`msc.rs:602` descriptor walk** is bounded and explicitly breaks on a zero-length descriptor, with
+  the comment naming why. Device-supplied data driving a loop is the classic parser hang; this one was
+  thought about.
+- **Reply-cap discipline** is otherwise correct throughout the new code: one `take_pending_cap` per
+  request, replies addressed by handle, no reuse across iterations.

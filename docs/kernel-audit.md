@@ -1468,3 +1468,33 @@ guard-page block splitting and four capability grants. Bugs then chased over mul
 were audit-shaped: a discarded verdict, a bound that was not a bound, a diagnostic that could not fail
 loudly. A7-5 had already been recorded as HIGH on arm32, on a different device, and was written again.
 
+
+
+## Audit 8 - the AArch64 branch at merge readiness (2026-08-12, `feat/pi4-aarch64` @ `94711fd2`)
+
+Scope: everything on this branch since kernel Audit 7 (`f6e51efc`) - ~850 changed kernel lines
+(aarch64 `pcie.rs`, `exceptions.rs`, `gic.rs`, `mod.rs`, `interrupt/route.rs`, `task/`,
+`syscall/dispatch.rs`) plus the deletion of `arch/aarch64/xhci.rs` (-2476).
+
+**Mechanical gates: PASS.** `scripts/unsafe_check.py` - 71 audited files, 1055 unsafe lines, no
+unaccounted additions. The deleted in-kernel xhci driver is gone from the inventory (the stale row
+that once passed silently is now a hard failure, `e2810e00`).
+
+### K8-1 (LOW) - `fcap-diag` instrumentation outlived the investigation it was for
+
+`kernel/src/syscall/dispatch.rs`, the `#[cfg(feature = "fcap-diag")]` block, is introduced by its own
+comment as *"FCAP-RESTART INSTRUMENTATION (temporary - remove when the post-restart escalation is
+closed)"*. That escalation was closed (SEC-35). The code is feature-gated so it does not ship, but a
+block that documents its own removal condition and then outlives it is how dead scaffolding becomes
+permanent - and it prints capability rights, which is exactly the kind of diagnostic that should not
+be one `--features` away in a shipped kernel.
+
+### Verified sound
+
+- **EL1 fault -> halt** (`exceptions.rs:689`) is the correct end of that path, not a missing recovery:
+  a fault at EL1 IS the kernel's, and there is nothing above it to recover into (§26.7). The comment
+  says so explicitly.
+- **`pcie.rs` link-up wait** is bounded (`while ms < 100 && !link_up()`), and its delay helper is
+  bounded on the cycle counter rather than an iteration count - the "a count is not a duration"
+  lesson applied correctly.
+- **No new syscall** was added on this branch, so the cap-gate surface is unchanged.

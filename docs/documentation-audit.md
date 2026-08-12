@@ -409,3 +409,32 @@ bottom of long files), addressed by DA7's pointers.
 ABI + driver rules + hazards a porter/service-author needs, where they look), and writing the driver
 doctrine into the repo (DA3) so the method is followable, not tribal. Re-probing would clear the two
 below-bar scores: the ABI, add-a-service, and driver method are now stated, discoverable, and legible.
+
+
+## Audit 4 - the AArch64 branch at merge readiness (2026-08-12, `feat/pi4-aarch64` @ `94711fd2`)
+
+### D4-1 (LOW) - a contract documents build flags that no longer exist
+
+`services/block-driver/contracts/block-driver.toml:27-31` explains when its `xhci` peer is present:
+*"(`pi4_build.py --xhci-userspace`, which sets the kernel's `xhci-userspace` and this service's
+`usb-via-xhci`)"*. All three are gone - deleted along with the in-kernel USB driver, and
+`scripts/pi4_build.py:29` says so itself: *"The former `--xhci-userspace` flag is gone."*
+
+A contract is a spec artifact, not a comment: a reader following it goes looking for a flag that
+cannot be set, on the one file that is supposed to state a service's requirements authoritatively.
+CLAUDE.md's 2026-08-09 amendment already records the deletion correctly, so this is the last copy of
+the old story (Commandment III - and the amendment is the truth).
+
+### Verified sound
+
+- **CLAUDE.md's AArch64 amendment is honest about what the port did NOT buy.** It states plainly that
+  the kernel-scope violation is closed while the TRUST posture is unchanged (SEC-33, no SMMU), and
+  that the §6.4 boot-time reporting requirement is unmet (SEC-34). Both are the kind of thing a
+  milestone write-up is tempted to omit, and the distinction it draws - a buggy USB driver is now
+  bounded, a compromised one is still kernel-equivalent - is exactly right.
+- **`docs/xhci-completion-correlation.md`** (added this session) records the residual and the method,
+  including the two wrong hypotheses, rather than only the fix. A reader arriving cold learns why
+  `late = 0` was misleading, which is the part that cost real hardware rounds.
+- **`docs/unsafe-audit.md`** no longer lists the deleted `arch/aarch64/xhci.rs`, and the checker now
+  FAILS on a row whose file is missing instead of passing silently (`e2810e00`) - the enforcement gap
+  that let the stale row survive is closed, not just the row.
