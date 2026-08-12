@@ -162,7 +162,10 @@ fn bulk_xfer(
                 let left = mmio.read32(chan::hctsiz_at(chan::CH_BULK)) & 0x7_FFFF;
                 return Some(len.saturating_sub(left));
             }
-            Some(hcint) if hcint & crate::regs::HCINT_STALL != 0 => return None,
+            Some(hcint) if hcint & crate::regs::HCINT_STALL != 0 => {
+                ctx.log_fmt(format_args!("dwc2-svc: bulk ep {} STALLed", ep));
+                return None;
+            }
             Some(hcint) => {
                 // Only a real TRANSACTION error spends the budget. NAK and NYET are the device
                 // pacing us and cost nothing, which is why they are not counted here.
@@ -173,10 +176,15 @@ fn bulk_xfer(
                     }
                 }
             }
-            None => return None,
+            None => {
+                ctx.log_fmt(format_args!("dwc2-svc: bulk ep {} channel never halted", ep));
+                return None;
+            }
         }
         if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
-            return None; // out of time: the caller decides whether that is "busy" or "broken"
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: bulk ep {} out of time after {} ms ({} xact errors)", ep, budget_ms, xact_errs));
+            return None; // the caller decides whether that is "busy" or "broken"
         }
         ctx.sleep(ctx.duration_cycles(1));
     }
@@ -210,7 +218,16 @@ pub fn bot(
         dma.write8(CBW_OFF + 15 + i, *b);
     }
 
-    bulk_xfer(ctx, mmio, t, disk, false, disk.ep_out, dma.phys_at(CBW_OFF) as u32, 31, 2_000)?;
+    // NAME THE STAGE THAT FAILED. `?` here discarded which of the three transfers died, and "READ
+    // CAPACITY FAILED" with nothing else is exactly the un-diagnosable failure that has cost this
+    // port a boot every time it has appeared. CBW-out failing means the device is not accepting
+    // commands at all; a data-stage failure means it accepted the command and would not answer; a
+    // CSW failure means it did the work and would not report. Three different faults.
+    if bulk_xfer(ctx, mmio, t, disk, false, disk.ep_out, dma.phys_at(CBW_OFF) as u32, 31, 2_000).is_none() {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: BOT CBW-out FAILED (cdb {:#04x}, ep_out {}, mps {})", cdb[0], disk.ep_out, disk.mps));
+        return None;
+    }
 
     let mut moved = 0usize;
     if dlen > 0 {
@@ -220,17 +237,29 @@ pub fn bot(
                 dma.write8(DATA_OFF + i, 0);
             }
         }
-        moved = bulk_xfer(
+        moved = match bulk_xfer(
             ctx, mmio, t, disk, data_in,
             if data_in { disk.ep_in } else { disk.ep_out },
-            dma.phys_at(DATA_OFF) as u32, want as u32, 5_000)? as usize;
+            dma.phys_at(DATA_OFF) as u32, want as u32, 5_000)
+        {
+            Some(n) => n as usize,
+            None => {
+                ctx.log_fmt(format_args!(
+                    "dwc2-svc: BOT data-stage FAILED (cdb {:#04x}, {} bytes {})",
+                    cdb[0], want, if data_in { "IN" } else { "OUT" }));
+                return None;
+            }
+        };
     }
 
     // CSW: 13 bytes, "USBS".
     for i in 0..13 {
         dma.write8(CSW_OFF + i, 0);
     }
-    bulk_xfer(ctx, mmio, t, disk, true, disk.ep_in, dma.phys_at(CSW_OFF) as u32, 13, 2_000)?;
+    if bulk_xfer(ctx, mmio, t, disk, true, disk.ep_in, dma.phys_at(CSW_OFF) as u32, 13, 2_000).is_none() {
+        ctx.log_fmt(format_args!("dwc2-svc: BOT CSW-in FAILED (cdb {:#04x})", cdb[0]));
+        return None;
+    }
 
     let mut csw = [0u8; 13];
     for i in 0..13 {
