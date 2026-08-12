@@ -27,10 +27,22 @@ const PROTOCOL_KEYBOARD: u8 = 0x01;
 /// Endpoint attribute bits: transfer type is the low two, 3 = interrupt.
 const EP_TYPE_INTERRUPT: u8 = 0x03;
 
-/// Where the keyboard's 8-byte boot report is DMA'd. Its own slice of the arena, clear of the
-/// control-transfer scratch: the poll and a control transfer can be in flight in the same pass, and
-/// sharing a buffer between them is how one transfer reads another's bytes.
-pub const REPORT_OFF: usize = 0x0100;
+/// Where the keyboard's 8-byte boot report is DMA'd.
+///
+/// **Clear of the control-transfer scratch, which the first version was not.** `DATA_OFF` is 0x0040
+/// and `DATA_LEN` is 256, so that scratch spans 0x0040..0x0140 - and this was 0x0100, inside it. The
+/// 256-byte config-descriptor read landed directly on the report buffer, so the poll then read back
+/// leftover descriptor bytes: non-zero, so they passed the "is there a keypress" filter, and garbage,
+/// so they decoded to nothing. 88 reports in 15 seconds with nothing typed and nothing printed.
+///
+/// The previous comment on this line asserted it was clear of the scratch. It was not, and asserting
+/// it is what stopped me checking - a comment that states a layout invariant without deriving it is
+/// worth less than the arithmetic it replaced.
+///
+/// 0x0200 is past `DATA_OFF + DATA_LEN` (0x0140) with room to spare, and the assertion below now
+/// derives the property instead of claiming it.
+pub const REPORT_OFF: usize = 0x0200;
+const _: () = assert!(REPORT_OFF >= chan::DATA_OFF + chan::DATA_LEN);
 
 /// A bound boot keyboard.
 pub struct Keyboard {
