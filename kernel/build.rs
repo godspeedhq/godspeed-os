@@ -16,10 +16,19 @@ fn main() {
     if target == "x86_64-unknown-none" {
         println!("cargo:rustc-link-arg=-T{}", kernel_ld.display());
     }
+    // Two aarch64 layouts: QEMU `virt` loads at 0x4008_0000, the Pi 4's VideoCore firmware loads a
+    // flat kernel8.img at 0x80000. The `pi4` feature selects the board.
     let kernel_ld_aarch64 = workspace.join("kernel").join("kernel-aarch64.ld");
+    let kernel_ld_aarch64_pi4 = workspace.join("kernel").join("kernel-aarch64-pi4.ld");
     println!("cargo:rerun-if-changed={}", kernel_ld_aarch64.display());
+    println!("cargo:rerun-if-changed={}", kernel_ld_aarch64_pi4.display());
     if target == "aarch64-unknown-none" {
-        println!("cargo:rustc-link-arg=-T{}", kernel_ld_aarch64.display());
+        let script = if std::env::var("CARGO_FEATURE_PI4").is_ok() {
+            &kernel_ld_aarch64_pi4
+        } else {
+            &kernel_ld_aarch64
+        };
+        println!("cargo:rustc-link-arg=-T{}", script.display());
     }
     let kernel_ld_riscv64 = workspace.join("kernel").join("kernel-riscv64.ld");
     println!("cargo:rerun-if-changed={}", kernel_ld_riscv64.display());
@@ -52,7 +61,7 @@ fn main() {
     let is_s390x = target == "s390x-unknown-none-softfloat";
     let is_riscv32 = target == "riscv32imac-unknown-none-elf";
     let is_arm = target == "armv7a-none-eabi";
-    let use_placeholder = is_aarch64 || is_riscv64 || is_loongarch64 || is_s390x || is_riscv32 || is_arm;
+    let use_placeholder = is_riscv64 || is_loongarch64 || is_s390x || is_riscv32 || is_arm || is_aarch64;
     let placeholder = workspace.join("kernel").join("svc-placeholder.bin");
 
     // (env-var suffix, binary name in target dir)
@@ -107,11 +116,55 @@ fn main() {
         .join("armv7a-none-eabi")
         .join(&profile);
 
+    // AArch64 (Raspberry Pi 4) userspace is being brought up the same way, service by service, for the
+    // same reason: a service is embedded for real only once it is built for aarch64-unknown-none. Any
+    // not yet ported keep the empty placeholder so the kernel still links. The hardware drivers stay
+    // placeholders until real Pi 4 drivers exist (SD/EMMC, GENET, VL805 xHCI over PCIe) - they compile,
+    // but hunt for x86 hardware that is not there.
+    // `ping`/`pong` are DEMO services: they send as fast as the scheduler runs them (they pace with
+    // `yield_cpu`, not a sleep), which is ~500 log lines a second. That is fine when the point is to
+    // prove IPC, and unusable when the point is to type at a prompt - the shell's output scrolls past
+    // faster than a human can read it. Cross-service IPC is already hardware-proven (63,579 messages),
+    // so they are opt-in via `pi4-demo-services` rather than always present.
+    let aarch64_demo = std::env::var("CARGO_FEATURE_PI4_DEMO_SERVICES").is_ok();
+    // Networking on the Pi 4: nic-driver reaches the hardware through the NET_DEVICE syscalls, which
+    // the aarch64 arch layer now backs with the GENET driver (receive and transmit both hardware
+    // proven); net-stack is arch-neutral and rides on nic-driver without touching hardware at all.
+    // Neither needed porting - they needed BUILDING and then listing HERE. Being built is not enough:
+    // a service missing from this list embeds the empty placeholder however well it compiled, and the
+    // boot reports `LoadFailed(TooSmall)` - which reads like a broken binary rather than an absent one.
+    // `xhci` is the userspace USB host-controller driver for the Pi 4's VL805. It is embedded
+    // unconditionally rather than behind `xhci-userspace`, and that is deliberate: an ELF the kernel
+    // carries but never spawns costs image bytes and nothing else, whereas a service the supervisor
+    // spawns and the kernel embedded as a PLACEHOLDER fails with `LoadFailed(TooSmall)` - which reads
+    // like a broken binary rather than a build-list omission, and is exactly the trap this comment
+    // block warns about two paragraphs up. Cheap insurance against the failure mode with the worst
+    // diagnostic. The spawn is what the feature gates (`services/supervisor`), not the embedding.
+    let aarch64_built: &[&str] = if aarch64_demo {
+        &["logger", "ping", "pong", "supervisor", "shell", "chaos", "observe", "mem-pressure",
+          "block-driver", "fs", "nic-driver", "net-stack", "xhci",
+          "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
+    } else {
+        // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
+        // carnage, and observe is how it is watched while it does. Both are arch-neutral.
+        &["logger", "supervisor", "shell", "chaos", "observe", "mem-pressure",
+          "block-driver", "fs", "nic-driver", "net-stack", "xhci",
+          "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
+    };
+    let aarch64_dir = workspace
+        .join("target")
+        .join("aarch64-unknown-none")
+        .join(&profile);
+
     for (env_name, bin_name) in services {
         let elf = if is_arm {
             // A ported ARM service if its binary exists; otherwise the placeholder.
             let arm_bin = arm_dir.join(bin_name);
             if arm_built.contains(bin_name) && arm_bin.exists() { arm_bin } else { placeholder.clone() }
+        } else if is_aarch64 {
+            // A ported AArch64 service if its binary exists; otherwise the placeholder.
+            let a64_bin = aarch64_dir.join(bin_name);
+            if aarch64_built.contains(bin_name) && a64_bin.exists() { a64_bin } else { placeholder.clone() }
         } else if use_placeholder {
             placeholder.clone()
         } else {

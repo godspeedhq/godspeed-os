@@ -609,6 +609,12 @@ fn clean_invalidate_dcache_range(addr: u32, len: u32) {
 /// ARM runs identity-mapped (VA == PA), so hhdm=0 is the correct value, not "unset".
 pub const PHYS_IS_IDENTITY: bool = true;
 
+/// No bootloader placed page tables for this port - the kernel builds its own, in `.bss` inside the
+/// kernel image, which the memory map already excludes from usable RAM. So there is nothing for
+/// `protect_kernel_page_table_frames` to protect, and its x86-format walk must not run here.
+pub const BOOTLOADER_PLACED_TABLES: bool = false;
+
+
 pub fn get_hhdm_offset() -> u64 { 0 }
 pub unsafe fn set_hhdm_offset(_offset: u64) {}
 pub fn entry_for_va(_virt: u64) -> Option<u64> { None }

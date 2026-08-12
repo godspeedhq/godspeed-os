@@ -73,6 +73,20 @@ pub fn mark_ready(core_id: u32) {
     crate::kprintln!("smp: core {} ready", core_id);
 }
 
+/// Announce how many cores reached the scheduler, in one canonical sentence.
+///
+/// **The wording lives here so every architecture cannot help but agree.** It used to be printed by
+/// each arch's own bring-up: x86 said `kernel: N cores ready`, the Pi 2 said `smp: N cores ready`, and
+/// the Pi 4 grew a third phrasing of its own. Three ports, three vocabularies, one fact - and a reader
+/// comparing boot logs across boards had to translate before they could compare.
+///
+/// GodspeedOS should read the same whatever it is running on. Anything genuinely arch-specific (which
+/// core stopped where, on a machine that came up short) belongs in a separate line the arch adds, not
+/// in a different spelling of the shared one.
+pub fn report_cores_ready() {
+    crate::kprintln!("smp: {} cores ready", ready_count());
+}
+
 pub fn ready_count() -> u32 {
     READY_COUNT.load(Ordering::Acquire)
 }

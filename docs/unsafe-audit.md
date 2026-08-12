@@ -13,6 +13,1215 @@ comment.
 
 ---
 
+## 2026-08-04 - Pi 4 milestone 22: the display (feat/pi4-aarch64)
+
+The Pi has no bootloader-supplied framebuffer descriptor the way x86 does with Limine, so the ARM asks
+the VideoCore for one through the same property mailbox that reported the board revision and the RAM
+size at milestone 7 - and in the same caches-off window, for the same reason: the GPU reads the request
+straight out of RAM, so asking before the caches are on removes the coherency question instead of
+answering it.
+
+**The console itself is arch-neutral and stays `unsafe`-free.** `crate::fbcon` - the ANSI parser, the
+UTF-8 decoder, the character grid, glyph rendering, scrolling - is shared with x86 and the 32-bit ARM
+port. This arch owes it exactly three things (`fb_commit`, `FB_READBACK_CHEAP`, and the framebuffer as a
+`&'static mut [u8]`) and gets a full terminal for them. Handing over a **slice** rather than a base
+address is what keeps every pixel write in the neutral console bounds-checked: the one `unsafe` that
+buys the display lives here in `arch/`, where the mapping's validity is actually known.
+
+Three checks stand between the GPU's reply and that slice, because a mailbox reply is firmware-supplied
+input and a plausible-looking wrong answer is the failure mode: the bus-address alias is masked back to
+an ARM physical address (skipping that yields an address that points nowhere and a display that stays
+dark with no error); the geometry is range-checked before it drives a fill loop and a slice length; and
+the framebuffer must lie inside the kernel's direct map AND below `mmu::DEVICE_BASE`, since everything
+above that is mapped Device-nGnRnE, which forbids the unaligned accesses the glyph renderer makes. Each
+failure keeps the machine on serial and says so, rather than mapping something and faulting later
+somewhere that names neither the GPU nor the map (§26.7).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/video.rs` | new, 2 | `fb_commit`'s cache clean over the written rectangle (`dc cvac` by VA - the framebuffer is cacheable and the GPU reads RAM directly, not through the CPU's caches, so it would otherwise scan out stale pixels); and the one slice construction in `start_console`, over a framebuffer the GPU allocated and owns nothing else in, whose length is its own bounds-checked `pitch * height`, at a direct-map address checked to be inside the map. |
+| `arch/aarch64/mailbox.rs` | 3 -> 4 (+1) | `property_call`: copies an arbitrary tag request into this module's 16-byte-aligned static and the reply back out, length-checked against the buffer at both ends. The static rather than the caller's array because the mailbox packs the channel into the low 4 bits of the address it is handed - an arbitrarily-aligned caller buffer would send the message to the wrong channel, so the alignment guarantee stays in one place. |
+| `arch/aarch64/mod.rs` | 53 -> 55 (+2) | The write and the read of `FB_INFO`, the static that carries the geometry across the jump to the high half. A static rather than a local because the jump abandons the low stack along with every local on it - the same reason `memmap::current_map` exists. Single-threaded boot: written once before the jump, read once after. |
+
+## 2026-08-04 - Pi 4: the serial lock made the machine crawl, and is now try-once (feat/pi4-aarch64)
+
+The console lock below fixed the shredding and broke the machine. Boot went from seconds to **104
+seconds**, characters trickled out one at a time, and `chaos` ended in a liveness-watchdog panic.
+
+Two mistakes compounded. The claim **spun** up to two million times, and it was **held across the
+framebuffer render** - glyph drawing plus cache maintenance over a rectangle, far more expensive than
+the UART write it was protecting. So every core queued behind every other core's rendering, and a core
+that had spent ten seconds spinning was correctly declared wedged.
+
+Now: **one attempt, never a spin.** A contended writer emits its bytes anyway and skips only the display
+mirror - the expensive part, and the part nobody reads during contention. Lines can interleave under
+load, which is exactly the trade the 32-bit port makes and for exactly this reason. A log line must
+never make a core wait.
+
+Boot is back to 8 seconds with four cores on every run, and a carnage run survives.
+
+No new `unsafe`.
+
+## 2026-08-04 - Pi 4: the serial console had no lock, and four cores made that matter (feat/pi4-aarch64)
+
+Removing PSCI got the board past the release: all three secondaries check in, the machine boots, reboots
+and reads files back. But it reported **three** cores where QEMU reported four, and printed **no**
+"core N online" lines at all - while QEMU printed every one.
+
+The cores were running. The evidence was not surviving. Four cores wrote a byte at a time into one
+UART with no serialisation, so lines were shredded into each other at character granularity. Debugging
+SMP through that means drawing conclusions from an instrument that destroys the measurement, which is
+worse than having none - it looks like a result.
+
+Three fixes, each of which was necessary and none of which was sufficient alone:
+
+1. **A claim on the log path.** Bounded and never fatal: a core that cannot get it writes anyway rather
+   than spinning forever, because this path is reachable from panics and ISRs and a core deadlocked
+   while reporting why is worse than a garbled line.
+2. **The same claim on `put_str`.** Locking one writer and not the other leaves exactly the hole it was
+   meant to close - the boot core's own lines were still being shredded by an AP's `kprintln`.
+3. **The line has to BE one write.** `kprintln!` flushes as it formats, so a line assembled from
+   fragments is several writes with gaps between them. The lock was never the missing piece. The report
+   is now rendered into a fixed buffer and emitted once.
+
+Five consecutive boots now report `cores in the scheduler: 4 (mask 0xf)` intact.
+
+No new `unsafe`.
+
+## 2026-08-04 - Pi 4 GENET milestone 3: the receive ring (feat/pi4-aarch64)
+
+Allocates 32 receive buffers of 2 KiB, writes their PHYSICAL addresses into the descriptor area,
+programs the ring geometry on queue 16, and reads it back. **Receive is deliberately left DISABLED.**
+
+The split is the point. Every address handed over here is one the MAC will eventually write into, on a
+board with no IOMMU behind it - so "the values reached the hardware" and "the hardware is running" are
+separated, and only the first is claimed. The readback is what distinguishes them.
+
+Two details that would each corrupt memory rather than return a wrong value:
+
+- The descriptor address words are **physical**. The kernel's own view of that memory is the direct-map
+  alias, and handing a virtual address to a bus master is a device writing to an address that means
+  nothing to it.
+- `DMA_RING_BUF_SIZE` packs the descriptor COUNT in the upper half and the buffer LENGTH in the lower -
+  two different units in one register, and a swap reads back plausibly.
+
+Ring size is 32 rather than Linux's 256: 64 KiB of pinned memory, a bound visible in the source rather
+than inferred (§26.6.1).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/genet.rs` | 3 -> 4 (+1) | Recording each buffer's physical address in this module's own array, indexed inside its length during single-threaded boot, so the descriptors and the eventual drain path agree on one answer. |
+
+## 2026-08-04 - Pi 4 GENET milestone 4: transmit ring and the receive drain (feat/pi4-aarch64)
+
+Frames now arrive (the RGMII block had never been enabled, so the MAC could negotiate with the PHY
+over MDIO and hear nothing from it). This adds the transmit half and the drain that recycles receive
+descriptors, so the whole path is exercised in a single boot rather than one hypothesis per card swap.
+
+The five new blocks are all the same two shapes, and both are the shapes this file already had:
+
+- **This module's own `static mut` arrays and cursor** (`TX_BUFS`, `TX_NEXT`, `RX_BUFS`), indexed
+  inside their length during single-threaded boot. Identical to the `RX_BUFS` entry above.
+- **One copy through the direct map** in `transmit`: the frame is written to a physical frame handed
+  back by the frame allocator, addressed through `KERNEL_VA_BASE + phys`, bounded by an explicit
+  length check against `RX_BUF_LENGTH` before the copy.
+
+Worth recording because it is a portability trap rather than a soundness one: both directions need
+`dma_sync` (`dc civac`). AArch64 DMA is **not** cache coherent (SEC-28), so a transmitted frame that
+exists only in this core's cache is sent as stale bytes, and a received frame read without an
+invalidate is read as whatever was cached before. x86 needs neither and would hide both.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/genet.rs` | 4 -> 9 (+5) | Transmit buffer table and cursor, the receive buffer lookup in the drain, and one bounded copy through the direct map into a DMA frame. Same two shapes as the existing entries; each block carries its own SAFETY comment. |
+
+## 2026-08-05 - Pi 4: BOT reset recovery for a wedged bulk endpoint
+
+A bulk transfer that times out leaves the endpoint HALTED and its transfer ring desynchronised, and
+re-issuing the command can never clear that: 32 seconds of retries produced 106 identical timeouts,
+every one asking a stopped endpoint to run. Recovery repairs both layers - xHCI `Reset Endpoint` +
+`Set TR Dequeue Pointer` (the controller half, which the Pi 2's DWC2 driver has no equivalent of), then
+the Bulk-Only class reset and Clear-Feature HALT on both endpoints (the device half, for the uncollected
+CSW the device waits on before accepting any new CBW). Keyed on a RUN of timeouts, reset by any success,
+so a merely-slow device never triggers it.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | 37 -> 38 (+1) | Zeroing the two bulk transfer rings before republishing their dequeue pointers - this driver's own DMA pages, 4 KiB each, while it holds the USB claim. |
+
+## 2026-08-05 - Pi 4: kernel-stack guard pages (block splitting)
+
+`install_kstack_guards` was inert on this arch twice over: the neutral `main.rs` call site is not on the
+Pi 4 boot path, and both arch primitives were stubs. So 224 kernel stacks sat end to end with nothing
+between them, and an overflow corrupted the neighbouring task's stack instead of faulting - the exact
+failure guard pages exist to make loud.
+
+The high half is mapped with 2 MiB BLOCKS, so a 4 KiB hole cannot simply be cleared: the containing
+block is SPLIT into an L3 table whose 512 page descriptors reproduce it verbatim (address, memory type,
+shareability, AP, AF and the execute-never bits all carried across), the L2 entry is repointed, and then
+the single guard entry is cleared. About thirty guards share each block, so the split happens once per
+block rather than per guard.
+
+Tables come from a fixed 12-entry arena in `.bss`, not a heap (§26.6.1) - the pool spans at most nine
+2 MiB blocks - and exhaustion is REPORTED, because a guard page that failed to install is indistinguishable
+from one that worked until something overflows.
+
+Two long-descriptor details worth their comments, both of which read wrong at a glance: `0b11` means
+TABLE at L1/L2 and PAGE at L3, and the address field is bits [47:21] for a block but [47:12] for a page.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mmu.rs` | 17 -> 23 (+6) | High-half L2 lookup, split-table arena hand-out, the block split and page clear, the verify read, and TLB maintenance. All page-table work, in the layer where it belongs (§18.1); the neutral caller stays a safe `fn`. |
+
+## 2026-08-05 - Pi 4: route device IRQs to userspace (Commandment I remediation, step 1)
+
+The Pi 4 kernel contains a USB stack and an Ethernet driver, which expands kernel responsibility and
+breaks Commandment I. The justification on record - "the arch does not yet route device IRQs to
+userspace" - turned out to be an UNIMPLEMENTED BRANCH, not a hardware limit: the GIC-400 delivers SPIs
+perfectly well, the neutral `interrupt::route` is arch-agnostic and complete, and both ARM arches already
+carry the stubs it needs. Nobody had connected the two.
+
+One branch in the GIC dispatcher now hands SPIs (ID 32+) to the neutral router, which is the mechanism a
+userspace driver blocks on. IDs above 255 are retired with a one-shot loud line rather than truncated
+into the wrong routing slot, because the neutral table is keyed by a `u8` vector.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/exceptions.rs` | 12 -> 13 (+1) | `interrupt::route::deliver(id)` from the IRQ handler, called with interrupts masked - the same contract the x86 caller documents. |
+
+## 2026-08-05 - Pi 4 AUDIT 8 follow-up: reclaim a departed device's DMA pages
+
+`dma_page` never had a counterpart, so this driver freed nothing. Every unplug/replug cycle leaked the
+departing device's pages - the keyboard's interrupt ring, EP0 ring and report buffer; the disk's two
+bulk rings, EP0 ring, data page and command page. Four to six pages per cycle, forever, from an
+ordinary operator action and precisely the one `stand_down` exists to handle.
+
+`free_dma_page` returns one, and `stand_down` now takes the device by value before dropping it, so
+nothing can still name the pages when they go back to the allocator.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | 38 -> 42 (+4) | One `free_frame` wrapper, and its use on the disk and keyboard teardown paths - each guarded by the device being taken out of its option first, so no descriptor, ring pointer or endpoint context reaches the page. |
+
+## 2026-08-05 - Pi 4 AUDIT 8: RX buffers cleaned and zeroed before the device owns them
+
+Audit 8 (four parallel auditors) found that GENET hands the controller RX buffers with no cache
+maintenance at all. `alloc_frame` neither zeroes nor cleans, and `allocator_selftest` writes read-back
+patterns into frames and frees them immediately before this driver probes - so a buffer can arrive
+carrying DIRTY lines. The device DMAs into that physical memory behind the cache, and the read side's
+`dma_sync` is `dc civac`: clean THEN invalidate. The clean writes the stale line back OVER the frame the
+controller just delivered. The operation intended to make the DMA visible is the one that corrupts it -
+intermittently, and invisibly under QEMU.
+
+Zeroing the buffer at ring build closes a second issue in the same line: `receive_one` trusts the
+controller's length for how many bytes are MEANINGFUL, so a device reporting more than it wrote would
+hand a `NET_DEVICE` holder whatever kernel data previously occupied the frame (the SEC-21 class).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/genet.rs` | 13 -> 14 (+1) | `write_bytes` zeroing each RX buffer before it is handed to the controller, paired with a `dma_sync` clean so no dirty line can be written back over delivered data. |
+
+## 2026-08-05 - Pi 4 AUDIT: the barrier class, swept (SEC-25/26/27)
+
+Auditing by DEFECT CLASS rather than by file, after the respawn fault turned out to be one missing
+barrier. The question asked of every site: where aarch64 writes a page-table descriptor, is it published
+before something can walk it, and where one is REMOVED, is the translation invalidated before the frame
+is reused?
+
+Barrier coverage was already correct in `mmu::enable`, `enable_secondary`, `drop_low_map`,
+`invalidate_tlb_page`, `switch_context`, `free_page_table_root` and the guard-page unmap. The gap was
+`ptables.rs` - the file the neutral kernel actually maps and unmaps through - which had **no barriers at
+all**. Three findings, all one class:
+
+1. `finalize_service_address_space` (previous entry) - a new address space installed before its
+   descriptors were visible. The supervisor-respawn fault.
+2. `map_in_root` - called by `map_in_active_tables` against THIS CORE'S LIVE TABLES, so the walker can
+   reach a descriptor that has not become visible. Same defect, tighter window.
+3. `unmap` - cleared the descriptor and handed the `Frame` back to the allocator with no barrier and no
+   TLB invalidate. The previous owner can then read and write a frame that belongs to another address
+   space: a use-after-free the MMU actively enables, reported by nothing. x86 does not need it here
+   because its neutral kill path shoots down; that is exactly why the omission reads as complete.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/ptables.rs` | 20 -> 21 (+1) | `dsb ishst` publishing descriptors in `map_in_root`, and `dsb ishst` + `tlbi vaae1is` + `dsb ish` + `isb` in `unmap` before the frame is released. |
+
+## 2026-08-05 - Pi 4 AUDIT: publish page tables before the walker can reach them (SEC-25/27)
+
+First finding of the aarch64 kernel audit, and the cause of the supervisor-respawn fault that the
+earlier TLB fix reduced but did not cure.
+
+`ptables.rs` builds a task's address space with ordinary stores and contains **zero barriers** - grep
+finds not one `dsb` in the file. On x86 that is free, because page-table walks are strongly ordered. On
+AArch64 the entries are plain memory writes with nothing ordering them against the TTBR0 install that
+follows, so the hardware walker can observe a descriptor this core has already written as absent, and
+raise a translation fault for a page that is mapped.
+
+That is the fault signature exactly: ESR `0x82000007`, instruction abort on the first fetch of a
+freshly-spawned supervisor whose 69 pages were all mapped correctly. Boot spawns survive because other
+work (and its incidental barriers) separates building a space from entering it; a respawn does both back
+to back, which is why the respawn is the one that dies and why it is intermittent.
+
+## 2026-08-11 - Pi 2: a panic must halt every core there too (kernel audit A11-2)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/mod.rs` | 44 -> 45 (+1) | `park_core_forever`: `cpsid if` then a `wfi` loop. `halt_all_cores` was `loop { spin_loop() }` - masking nothing and signalling nobody - on a port running four cores on real hardware, so a panic left the other three scheduling and the panicking core taking timer IRQs. Masking IRQ+FIQ and halting is always valid in a privileged mode, and the function never returns, so nothing is left inconsistent. Touches no memory. |
+
+## 2026-08-09 - Pi 4: a panic must halt every core (kernel audit A10-1)
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 67 -> 68 (+1) | `park_core_forever`: `msr daifset, #0xf` then a `wfi` loop. `halt_all_cores` was `loop { spin_loop() }`, which masked nothing and stopped nobody - the panicking core kept taking the timer IRQ and was scheduled away, and the other cores never learned. Masking DAIF and halting at EL1 is always valid, and the function never returns, so no state is left inconsistent by the mask. Touches no memory. |
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 66 -> 67 (+1) | `dsb ishst` in `finalize_service_address_space`, publishing a new address space's descriptors inner-shareable before it can be installed or walked. A barrier; touches no memory. |
+
+## 2026-08-05 - Pi 4: invalidate a dead address space's TLB before its frames are recycled
+
+`chaos kill-storm supervisor` killed the machine on this port: the RESPAWNED supervisor took an
+instruction abort on its first fetch (ESR `0x82000007`, translation fault level 3) and wedged core 0
+hard enough that the other three raised the liveness panic. Seven boot spawns were fine; the first
+respawn died.
+
+`switch_context` skips installing TTBR0 when the incoming base equals the outgoing one. That is sound
+only while a TTBR value identifies an address space, and it stops identifying one as soon as root
+frames are recycled - the allocator hands a just-freed frame straight back, so a service that dies and
+respawns can get the SAME root physical address with entirely different contents. The switch is elided
+as a no-op and the new task runs on the dead task's mappings, whose frames have already been reclaimed.
+
+One `tlbi vmalle1is` in `free_page_table_root`, before the frames are handed back. Inner-shareable on
+purpose: the dying task's entries may live in a core other than the one running the kill, and a local
+`vmalle1` would leave them there. This is the SEC-26/SEC-27 obligation in `arch/CLAUDE.md` - an
+AArch64 address-space change does not implicitly flush - met at the point where the invariant actually
+breaks rather than by flushing on every context switch.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 65 -> 66 (+1) | TLB maintenance (`tlbi vmalle1is`) at address-space teardown, so a recycled root frame cannot inherit the dead space's translations. |
+
+## 2026-08-05 - Pi 4 GENET milestone 5: the NET_DEVICE bridge (feat/pi4-aarch64)
+
+Wires the working driver to the arch-neutral `net_frame_tx` / `net_frame_rx` / `net_info` seam, so the
+unchanged userspace `nic-driver` and net-stack can drive it. Four new blocks, same shapes again: the
+station-address store, and one bounded copy OUT of a DMA buffer in `receive_one`.
+
+One is worth stating explicitly because it is the only place device-supplied data sizes a copy. The
+frame length in `receive_one` comes out of a descriptor **the controller wrote**, so it is untrusted
+input on a path reachable from userspace via a syscall. It is clamped to BOTH the caller's slice length
+and `RX_BUF_LENGTH` before the copy, so a controller reporting a nonsense length can overrun neither
+the destination nor the source buffer. `GENET_READY` gates every one of these entry points, so a board
+where the controller was absent or a ring refused to program cannot be driven into uninitialised
+registers from userspace at all.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/genet.rs` | 9 -> 13 (+4) | Station-address store (written once before the Release that publishes readiness), the receive buffer lookup, and one copy out of a DMA buffer whose length is device-supplied and clamped to both source and destination before use. |
+
+## 2026-08-04 - Pi 4 GENET milestone 2: the MAC and the MDIO bus (feat/pi4-aarch64)
+
+Resets the UniMAC, programs the station address and frame limit, selects the external gigabit PHY mode,
+and reads the PHY's identity over MDIO. The data path stays OFF: this brings up the MAC, not the rings,
+and a receiver enabled with no ring behind it fills a FIFO nobody drains.
+
+The PHY id is the milestone worth reaching. A real id means three separate things are true at once -
+the MAC is alive, the MDIO bus is clocking, and the PHY is answering - and a later DMA failure would
+otherwise be blamed for any of them.
+
+Three details that would each produce a plausible-looking wrong result:
+
+- **`UMAC_CMD` and friends are not in `bcmgenet.h`.** Modern Linux moved the UniMAC registers to a
+  shared `unimac.h`. Searching the obvious header finds nothing, and the obvious conclusion - that this
+  part has no such register - is wrong.
+- **MDIO `READ_FAIL` must be checked.** A read of an absent PHY returns a perfectly plausible `0xFFFF`
+  with that bit set; a driver that checks only the data concludes the PHY answered with every
+  capability enabled.
+- **The link bit latches low.** A single read of the basic status register reports a link that has been
+  up all along as DOWN, so it is read twice.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/genet.rs` | 1 -> 3 (+2) | The register read and write helpers - volatile accesses inside the kernel's Device mapping, to a controller whose presence the milestone-1 probe already established. |
+
+## 2026-08-04 - Pi 4 GENET milestone 1: find the controller and identify it (feat/pi4-aarch64)
+
+The Pi 2 has no Ethernet MAC - its port hangs off a LAN9514 behind the USB hub, which is why that
+port's networking rides the in-kernel DWC2 stack. The Pi 4 has a real MAC on the SoC (GENET v5 at
+`0xFD58_0000`) with its own DMA rings and an external RGMII PHY over MDIO. None of the Pi 2's network
+path transfers; only the seam above it does.
+
+This milestone reads `SYS_REV_CTRL` and reports the revision, and stops there deliberately. It proves
+the MMIO window decodes **before** any driver above it can blame its own logic for a dead read - the
+PCIe bring-up on this board spent four hardware rounds on a window that was silently not forwarding,
+and every one of them was spent looking at the driver. The revision also selects the register layout:
+v1..v5 move the DMA rings, so a driver written against v5 offsets on a v3 part reads plausible values
+from the wrong places.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/genet.rs` | new, 1 | The revision read, through `probe_read32` so an absent controller is reported rather than taken as an external abort that surfaces later blaming something unrelated. |
+
+## 2026-08-07 - GENET's interrupt routed to userspace (feat/pi4-aarch64)
+
+The third `route::deliver` call in this file, one per interrupt this port hands to a userspace
+driver, all under the same contract: called from the IRQ handler with interrupts masked. GENET's is
+registered LEVEL-triggered, so `deliver` masks the source before handing it over - the driver clears
+`INTRL2_0` and unmasks with the `IrqUnmask` syscall.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/exceptions.rs` | 14 -> 15 (+1) | `route::deliver` for GENET's macirq (SPI 157), translated to the neutral vector `nic-driver` is granted. Same contract as the MSI and generic SPI arms beside it. |
+
+## 2026-08-07 - GIC disable: masking a level-triggered device IRQ for a userspace driver (feat/pi4-aarch64)
+
+A LEVEL-triggered device interrupt keeps its line asserted until the DEVICE's own status register is
+cleared - and on this port that register lives in MMIO only the userspace driver maps. So the kernel
+cannot acknowledge it; it can only stop listening until the driver says it has (the `IrqUnmask`
+syscall). Without `disable`, `route::deliver` returns with the line still high and the interrupt
+re-enters immediately, which the liveness watchdog turns into a panic.
+
+`GICD_ICENABLER` is write-1-to-clear, so the write touches only the named interrupt - a
+read-modify-write would race another core enabling a different one.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/gic.rs` | 6 -> 7 (+1) | `disable(id)`: one volatile write to `GICD_ICENABLER`, the counterpart of the existing `enable`. Same Device mapping, same bounds argument. |
+
+## 2026-08-07 - MSI: the USB driver waits on an interrupt instead of a timer (feat/pi4-aarch64)
+
+The Pi 4's xHCI service could only find an event by waking on a timer and looking - the controller's
+MSIs were masked at PCIe bring-up ("interrupts are not routed yet - the event ring is polled"). That
+is a floor on input latency no tuning removes, because the wait is not waiting FOR anything.
+
+The BCM2711 raises ONE SPI for all 32 of its MSIs, so the handler is a demultiplexer: read
+`MSI_INTR2_STATUS`, clear it, deliver. The one added `unsafe` is the existing `route::deliver` call
+shape, in the arm that handles that SPI - the same call, under the same documented contract (IRQ
+handler, interrupts masked), as the generic SPI arm two lines below it.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/exceptions.rs` | 13 -> 14 (+1) | `route::deliver` for the demultiplexed PCIe MSI. Identical contract to the generic SPI delivery beside it: called from the IRQ handler with interrupts masked. |
+
+## 2026-08-06 - the in-kernel GENET driver is DELETED: 14 unsafe lines to 1 (feat/pi4-aarch64)
+
+The largest single reduction in this audit's history, and it is a reduction because the code did not
+move to a safer place in the kernel - it left the kernel entirely. `arch/aarch64/genet.rs` was a
+~1500-line Ethernet driver (MDIO, UMAC bring-up, PHY clock delays, RX/TX descriptor rings, the address
+filter, the frame data path) holding 14 audited unsafe lines. It is now 113 lines that read one
+revision register and write none.
+
+The driver lives in `services/nic-driver/src/genet.rs`, a restartable userspace service with **zero**
+unsafe. That is not a coincidence of style: a service reaches its controller through an MMIO capability
+and a DMA arena, both handed to it by name at spawn, and the SDK's `Mmio`/`Dma` wrappers are the only
+things that touch a raw address. The unsafe did not get rewritten more carefully - the *need* for it
+was removed by putting the driver on the other side of the capability boundary (§18.1, §18.2).
+
+Worth stating plainly because it is the point of the whole exercise: those 14 lines parsed frames that
+arrive unbidden from anywhere on the network, in ring 0. The new driver parses the same frames in a
+task that chaos killed 46 times during a carnage run while the machine stayed up.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/genet.rs` | 14 -> 1 (-13) | The driver is deleted. The one line left is the milestone-1 revision read through `probe_read32` - discovery, which the kernel owes (it gates the register-window grant), not driving, which it does not. |
+
+## 2026-08-04 - Pi 4 SMP: the PSCI attempt hung the board, and is removed (feat/pi4-aarch64)
+
+Four cores came up on six consecutive QEMU boots and the board hung on the release line. The cause was
+the PSCI attempt, and the guard around it was the wrong claim.
+
+**An `smc` with no EL3 handler does not return an error - it traps to a vector nobody populated and the
+machine stops dead**, before it can report anything. There is also no way to ask first: a PSCI version
+query is itself an `smc`, so probing has exactly the failure it is probing for.
+
+The guard was "we booted at EL2, so something must own EL3". That is not the same claim. The stock Pi 4
+armstub passes control at EL2 and implements **no PSCI handler at all**. QEMU, which hands over at EL3,
+was the only environment where the guard did the right thing - so the bug was invisible in the one place
+it was tested, and the fix that made QEMU pass is what made hardware hang.
+
+The spin table is what this firmware implements, what the board's own device tree describes, and it
+needs no `smc` to find out. It is now the only mechanism.
+
+No new `unsafe` (the PSCI `smc` block is gone; the count is unchanged because the spin-table write and
+the cache clean it needs were already there).
+
+## 2026-08-04 - Pi 4 SMP: four cores, on by default (feat/pi4-aarch64)
+
+The last piece was a **single missing line**, and the 32-bit port had it all along
+(`arch/arm/mod.rs`: `set_core_lapic_id(core_id, core_id)`).
+
+`lapic_to_core_id` resolves a core by searching the id table and, finding nothing, **returns 0**. So a
+core that never registers itself does not fail - it silently answers "I am core 0" and starts using core
+0's run queue, scheduler context and per-core state. The fallback is correct for exactly one core, which
+is why nothing showed until the other three arrived, and why the symptom was an intermittent hang rather
+than an error.
+
+Six consecutive QEMU boots now reach a shell on four cores, and `chaos max-carnage` survives 6 rounds /
+18 kills with the kernel alive. Enabled by default; the feature remains separate so a single-core image
+is one flag away if a hardware fault ever needs bisecting against it.
+
+No new `unsafe`.
+
+## 2026-08-04 - Pi 4 SMP: two real bugs found by reading the 32-bit port (feat/pi4-aarch64)
+
+Still gated off and still not reliable (one boot in five reaches a shell), but two genuine defects were
+found, and the second only because the working port was compared against rather than reasoned from.
+
+**The flag the secondaries poll was never cleaned to memory.** The boot core stores it through a
+cacheable mapping; a parked core reads it with translation and caches OFF, straight out of physical
+memory. Nothing forces the line out, so whether the cores ever started depended on when the cache
+happened to evict it. The spin-table write two lines away already did this - the same lesson applied to
+one of the two places it applies to. With the clean, three of three check in on every boot.
+
+**`get_lapic_id` returned a hardcoded 0.** The neutral `scheduler::current_core_id` is built on it, so
+the moment the other cores came up, every one of them believed it was core 0 - four cores sharing one
+run queue, one scheduler context, one set of per-core state. With a single core it was indistinguishable
+from correct, which is why it survived twenty-odd milestones. The 32-bit port has always returned
+`mpidr & 3` there.
+
+Also learned by comparison and worth recording: the 32-bit port runs four cores with **both IPI senders
+still empty stubs**. Cross-core IPIs are a latency improvement, not a correctness requirement - every
+core ticks on its own timer and picks up work then. The SGI path added here is therefore a nicety, and
+the remaining flakiness is somewhere else.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/gic.rs` | 5 -> 6 (+1) | `send_sgi`: the distributor's SGI register. Writing it raises an interrupt on the targeted cores and does nothing else. |
+| `arch/aarch64/mod.rs` | 64 -> 65 (+1) | `get_lapic_id`: an `MPIDR_EL1` read, side-effect free. |
+
+## 2026-08-04 - Pi 4: secondary cores, behind a feature and NOT working yet (feat/pi4-aarch64)
+
+`pi4-smp` releases the other three cores. It is **gated off and it is not finished**: one QEMU boot
+reaches all four cores and a shell, the next hangs at the release. An intermittent race is worse than a
+missing feature, so the default image is unchanged.
+
+Two findings are worth keeping regardless, because both are traps rather than bugs:
+
+- **An `smc` is only safe if something still owns EL3.** When the firmware hands this kernel control AT
+  EL3 - which is what QEMU does - the kernel performs its own drop and leaves no handler behind, so a
+  PSCI call traps to a vector nobody installed and the machine stops dead with nothing to report it.
+  The entry exception level is now captured in `_start` (x20, alongside the DTB in x19) because it is
+  the only way to know afterwards, and PSCI is skipped when we were the highest level.
+- **A secondary arrives by one of two completely different routes**, and which one is not a choice:
+  firmware that parks its cores releases them when the spin table is written, while QEMU delivers every
+  core to `_start` immediately. Parking them at `_start` makes them unreachable by the release; both now
+  funnel into one entry that waits for the page tables, so one path gets exercised instead of two that
+  each only work somewhere.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/smp_boot.rs` | new, 9 | The secondary entry stub (its own exception-level ladder, FP enable, per-core stack selection and the wait for the boot core's tables), the PSCI `smc`, the spin-table write with the cache clean a core polling with its caches off requires, and the `sev` pair that wakes them. |
+| `arch/aarch64/mmu.rs` | 15 -> 17 (+2) | `enable_secondary`: installs the tables the boot core already built rather than rebuilding them, because a second core writing shared tables while the first runs under them is a race with no upside. |
+| `arch/aarch64/mod.rs` | 62 -> 64 (+2) | Recording and reading the entry exception level. |
+| `arch/aarch64/gic.rs` | 4 -> 5 (+1) | `init_secondary`: a core's GIC CPU interface and priority mask are BANKED per core, so each must enable its own or it never receives its own timer. The distributor is shared and deliberately untouched. |
+
+## 2026-08-04 - Pi 4: auditing the new USB code (feat/pi4-aarch64)
+
+~2,500 lines of new ring-0 driver code that parses untrusted device input had been reviewed only
+ad-hoc. Two real defects, both of the "works on the device in hand" kind:
+
+**A silently truncated block address.** The block protocol carries a u64 LBA on purpose, and
+`READ(10)`/`WRITE(10)` name only 32 bits, so `lba as u32` WRAPS. Block `0x1_0000_0000` becomes block 0
+- for a write, the superblock overwritten by data meant for the far end of the disk, with every layer
+reporting success. The stick in hand is 31M sectors and cannot reach it, which is exactly why it had to
+be refused here rather than left for a larger device to find.
+
+**Leaked pages on every failed enumeration.** Twelve DMA allocations, ~40 failure paths, and no
+`free_frame` anywhere. Hot-plug retries an arrival three times, so a device that refuses to come up
+leaked steadily as it was replugged - the unbounded-resource shape of §26.6, arrived at by omission
+rather than design. The three transient pages (input context, control ring, descriptor buffer) now come
+from a fixed arena allocated once and reused; enumeration is serialised under `USB_CLAIM`, so there is
+never a second user. The residual - one device-context page per failed attempt, bounded by the
+three-attempt cap - is recorded in the code rather than claimed fixed (§26.3).
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | 35 -> 37 (+2) | The scratch arena's borrow (serialised by `USB_CLAIM`, so the only live one) and the zeroing of its three pages between devices - a ring left holding the previous device's TRBs would have the controller execute entries it has already run. |
+
+## 2026-08-04 - Pi 4: reboot actually reboots (feat/pi4-aarch64)
+
+`hardware_reset` was `loop { spin_loop() }`. The shell printed "rebooting...", the kernel never asked
+the hardware, and the board had to be power-cycled by hand - which is indistinguishable from a reset
+that failed.
+
+Ported from the 32-bit implementation, including the part that was learned the hard way there: the boot
+partition in `PM_RSTS` must be cleared. The firmware reads that field back after the watchdog fires;
+left at whatever it held, the SoC resets and then sits dark, producing the *same* "reboot does nothing"
+symptom one layer further on. The poke is re-issued rather than spun on, and it is bounded and loud,
+because "this never returns" is an assumption about hardware.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 61 -> 62 (+1) | The BCM2711 power-management registers, reached through the kernel's Device mapping. Volatile 32-bit writes gated by the 0x5A password - the documented reset poke, and the only thing these writes can do. |
+
+## 2026-08-04 - Pi 4: the four hot-plug bugs the hardware found (feat/pi4-aarch64)
+
+Storage and hot-plug both worked at boot and then interacted badly. Four faults, one of them shared:
+
+1. **Unplugging the stick froze the machine.** Enumeration was running in the TIMER TICK, and enumerating
+   a device costs ~100 ms of port resets, descriptor fetches and SCSI retries - all with interrupts
+   masked. It moved to the idle loop, which is interruptible.
+2. **The keyboard died after a disk transfer.** One event ring serves the whole controller, so a disk
+   transfer waiting for its own completion also RECEIVES the keyboard's, and discarded it. `pending`
+   then stayed set forever and no further report was ever queued.
+3. **A disk brought up on one port relabelled the keyboard as being on that port**, so unplugging the
+   stick stood the keyboard down and unplugging the keyboard did nothing.
+4. **`drives` reported 0 MiB** while the kernel had found a 15 GB stick: `block-driver` was never
+   granted `USB_DISK` on aarch64, so the capacity syscall refused with `CapNotHeld`.
+
+Exclusion is now one claim (`USB_CLAIM`) across all three drivers of this hardware - tick, syscall,
+idle - rather than a one-way flag, and holders run with interrupts enabled while everyone else stands
+aside. The disk answers BUSY, which the block driver already retries.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | 34 -> 35 (+1) | `hotplug_poll` borrowing the controller from the idle loop, under the claim that makes it the only context touching it. |
+
+## 2026-08-04 - Pi 4: USB mass storage (feat/pi4-aarch64)
+
+Storage on the Pi 4 is the **USB stick, never the SD card**. The board has one SD slot and boots from
+it - firmware, kernel image, FAT partition - and GSFS puts its superblock at LBA 0, exactly where that
+card's partition table is. The 32-bit port established this by corrupting two boot cards to RAW before
+its SD backend was withdrawn; the Pi 4 has the same topology and inherits the rule rather than
+rediscovering it.
+
+Bulk-Only Transport over the two bulk endpoints, with SCSI `TEST UNIT READY` / `READ CAPACITY(10)` /
+`READ(10)` / `WRITE(10)` / `SYNCHRONIZE CACHE(10)`. Above the driver nothing changed: the existing
+`arch::imp::usb_disk_*` seam, `usbdisk.rs` and `fs` are all arch-neutral and were already waiting for a
+backend.
+
+The one genuinely new hazard is that the disk is driven from a **syscall** while the keyboard is driven
+from the **timer tick**, and both consume the same event ring. An ISR that pops the disk's completion
+leaves the block driver waiting forever for an event that has been thrown away. `DISK_IO` makes the ISR
+yield for the duration - it costs one keyboard sample. A future SMP port needs a real lock there, and
+the comment says so.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | 26 -> 34 (+8) | Building the 31-byte Command Block Wrapper and reading the 13-byte Command Status Wrapper back (the CSW is placed 64 bytes clear of the CBW so a device that writes status early cannot land it on the command still being read); the `READ CAPACITY` reply; the block copies in and out of the DMA page, both length-checked against 512 by their callers; the input context for a two-endpoint Configure Endpoint; and the borrow of the controller in `with_disk`. |
+
+## 2026-08-04 - Pi 4: USB hot-plug (feat/pi4-aarch64)
+
+Everything on this board is behind the internal hub, so a driver that enumerates once at boot leaves a
+keyboard unplugged mid-session dead until reboot - and, worse, means the keyboard only ever works if the
+cable happened to be in at power-on. The watcher visits the hub's ports once a second and announces every
+transition, the same way the x86 and Pi 2 ports do.
+
+Two bounds it is built around. It does **not act on a change it could not acknowledge**: an event whose
+latch will not clear is re-reported on every visit, which would tear down a working device once a second
+forever. And an arrival gets **three attempts**, not unbounded retries (§26.6) - a device that will not
+enumerate is left alone until the port changes again. Standing a device down also **releases its slot**,
+because a slot is a bounded resource and a leak would run the controller out after thirty cable pulls.
+
+The watcher runs inside the timer tick with interrupts masked, so its transfers use a short deadline
+(50 ms) while enumeration keeps the generous one (500 ms). A transfer that hangs there does not merely
+delay the watcher; it stops the scheduler.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | 24 -> 26 (+2) | Reading the port status and change words in the watcher, and the keyboard-state static it disarms when a device is stood down. Both are the module's own memory, read immediately after the transfer that filled it. |
+
+## 2026-08-04 - Pi 4: hub enumeration (feat/pi4-aarch64)
+
+The Pi 4's USB-A sockets do not hang off the VL805's root ports. They hang off an **internal VIA hub**,
+which the root port reports as a single high-speed device - so a keyboard plugged into the machine is
+one tier further out than the driver could see, and the bring-up ended at "device is not a HID boot
+keyboard" while pointing at a hub.
+
+Walking a hub adds three things the root-port path never needed, and leaving any of them out produces
+an `Address Device` failure whose completion code points somewhere else: the **route string** (which
+downstream port to take at each tier), the **transaction translator** that a high-speed hub provides so
+a low or full speed device can be reached across a fast link, and the fact that the device's speed comes
+from the **hub's** port status rather than from `PORTSC`, which sees only the hub.
+
+Only one tier is walked. That covers this board and a keyboard plugged into it; a hub plugged into a hub
+says so rather than recursing into an unbounded walk of someone's docking station.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | 18 -> 24 (+6) | Reading the hub descriptor's port count, the 4-byte port-status replies (one per port, and again while polling a reset), the configuration descriptor's `bConfigurationValue`, and the device descriptor slice that identifies what was found. Every one is a read of the module's own descriptor buffer immediately after a control transfer filled and synced it; the two that index it do so at fixed offsets inside a 16-byte or 18-byte reply whose length was checked. |
+
+## 2026-08-04 - Pi 4 milestone 23: PCIe and the USB keyboard (feat/pi4-aarch64)
+
+The Pi 2's USB host controller sits on the SoC's peripheral bus at a fixed address. The Pi 4's does
+not: its USB-A ports are behind a **VIA VL805**, an off-SoC xHCI controller on the far side of a PCIe
+Gen2 link. Before one USB register can be read, the root complex has to leave reset, the link has to
+train, an address window has to be opened onto the bus, config space reached through it, and a BAR
+assigned inside it. `pcie.rs` does that and stops - it knows nothing about USB. `xhci.rs` starts at the
+BAR and ends where `crate::arch::hid` begins.
+
+**A probe read that tolerates an external abort (`uaccess::probe_read32`) is what keeps QEMU usable.**
+The root complex is at a fixed address on a real Pi 4 and at *nothing* under `raspi4b`, and the
+difference does not present as a translation fault - the mapping is perfectly valid - but as an
+external abort from the interconnect, which at EL1 is indistinguishable from a kernel bug and halts the
+machine. That is the right default and the wrong answer for a probe, whose entire question is "is
+anything there?". It reuses the user-copy seam's fixup for exactly one load, so a fault anywhere else
+still halts loudly.
+
+**The driver runs in ring 0 and this is a TCB expansion**, the same one §6.4's 2026-07-23 amendment
+already records for ARM: neither ARM port routes device IRQs to userspace, so an in-kernel driver parses
+untrusted device-supplied descriptors, on a board with no IOMMU to confine its DMA. Recorded rather than
+papered over (§26.3). Every descriptor walk here is bounded by the length byte and refuses a zero-length
+entry, because a malformed descriptor from an untrusted device must end the walk, not spin it forever.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/xhci.rs` | new, 18 | Ring and context construction, and the report buffer. Every one is a write to a page this module allocated from the frame allocator and named through the direct map, whose layout is the xHCI 1.2 structure the controller reads. The two `read_volatile`/`write_volatile` register helpers are the controller's BAR, which `pcie` mapped and assigned. `parse_config` builds a slice over the descriptor buffer so the walk itself is bounds-checked. The scratchpad pointer-array writes are bounded by an explicit refusal above 512 entries, so a controller asking for more than one page can index is turned away rather than allowed to overrun it. |
+| `arch/aarch64/pcie.rs` | new, 4 | The root-complex register read and write helpers (volatile accesses inside the kernel's Device mapping), the presence probe, and the probe read of the first dword through the outbound window - which distinguishes "the CPU address is not decoded to PCIe" (abort) from "it reaches the root complex, which will not forward it" (poison) from "it arrived". Those want three different fixes, and guessing between them cost two hardware iterations. |
+| `arch/aarch64/uaccess.rs` | 5 -> 7 (+2) | `probe_read32`: the fixup pointer, and the one-instruction `asm!` block that arms it, does the load, and clears it on both exit paths. |
+| `arch/aarch64/mmu.rs` | 12 -> 15 (+3) | `dma_sync` (`dc civac` over a range shared with a bus master - the BCM2711's PCIe is not I/O-coherent, SEC-28), and the two `fill_device_window` writes that build the sparse PCIe outbound-window table. |
+| `arch/aarch64/mod.rs` | 59 -> 61 (+2) | The write and the read of `PCIE_XHCI`, the static carrying the discovered controller from the boot probe to the driver. |
+| `arch/aarch64/exceptions.rs` | 11 -> 12 (+1) | `end_probe`: `dsb sy` to complete outstanding accesses, then briefly unmask `PSTATE.A` so a pending SError is delivered INSIDE the probe window rather than at the next entry to EL0 - which is where the first bring-up's abort actually surfaced, blaming an EL0 selftest 180 ms and one subsystem away from the write that caused it. |
+| `arch/aarch64/uart_rx.rs` | 2 -> 3 (+1) | `push`: a keyboard delivering a byte into the ring the console reader already drains. The ring is shared with serial deliberately - the console has one input stream, and a blocked reader should not have to know which device a byte came from. |
+
+## 2026-08-04 - Pi 4: the page-table primitives the chaos run needed (feat/pi4-aarch64)
+
+Four `page_tables` primitives were still stubs, and the difference between them mattered. Three were
+*quiet* stubs (`read_page_table_base` returning 0, `write_page_table_base` and `invalidate_tlb_page`
+doing nothing); one, `map_in_active_tables`, was an `unimplemented!()` - which is not a stub that fails
+at its caller, it is a **kernel panic**. The first thing to reach it was a chaos run's memory pressure:
+a service asking for heap took the whole machine down. Nothing had reached it in twenty-one milestones
+because no service had grown its heap.
+
+`map_in_active_tables` maps into whatever `TTBR0_EL1` holds, which is the *running* task's table. That
+cannot go through a `PageTable`, whose `Drop` frees the tree - wrapping the live root in one and letting
+it fall out of scope would free the address space of the task currently executing. `ptables::map_in_root`
+says the intended thing instead: borrow the root, do not own it.
+
+`write_page_table_base` deliberately performs **no** TLB maintenance, and the reason is recorded at the
+primitive rather than left to be rediscovered (SEC-27, `arch/CLAUDE.md`: every `arch::imp` primitive owes
+a documented semantic, not just a signature). On AArch64 a `TTBR0_EL1` write flushes nothing, so an
+address-space *change* must invalidate - and `context::switch_context` does, which is the only path that
+switches between two task spaces. This primitive exists for the shootdown path, which rewrites the value
+already installed; a flush here would be a second, redundant one on every context switch.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 55 -> 59 (+4) | `read_page_table_base` (an `mrs`, side-effect-free); `write_page_table_base` (`msr ttbr0_el1` + `isb`, so the next access is translated by the new table); `invalidate_tlb_page` (`dsb ishst` / `tlbi vaae1is` / `dsb ish` / `isb` - by VA, all ASIDs, inner-shareable, because the neutral shootdown path needs it visible machine-wide); and `map_in_active_tables` forwarding to `ptables::map_in_root`. |
+| `arch/aarch64/ptables.rs` | 19 -> 20 (+1) | `map_in_root`: maps one page into a live root the caller does not own, via `ManuallyDrop` so the borrow cannot free the running task's address space. Uses the same `map` path already audited. |
+
+
+## 2026-08-04 - Pi 4: real services + the diagnostics that found the next bug (feat/pi4-aarch64)
+
+`ping` and `pong` are now built and embedded for aarch64, and spawned by name through
+`spawn_service_by_name` - the same path the supervisor's spawn syscall takes.
+
+**Two real bugs, one in the port and one still open:**
+
+`pong` would not spawn at all: `PlacementInvalid`. It contracts core 1 and this port has one core, so it
+needs an explicit override (§14.4) - but the override checks `smp::core::is_ready(0)`, and **this port
+never told the neutral SMP layer that core 0 exists**. Nothing else noticed, because every other
+placement path falls back with `.max(1)` and lands on core 0 regardless; the STRICT contracted-placement
+rule is the one path that asks properly, and it correctly refused. `mark_ready(0)` at boot.
+
+Still open: `pong` faults at EL0 inside `memcpy`, storing 8 bytes at exactly `0x8000_0000` - one word
+past `USER_STACK_TOP`. The top stack page IS mapped (`[0x7FFFF000, 0x80000000)`), so this is a genuine
+overrun rather than a mapping gap.
+
+**The trap report gained `SP_EL0` and the faulting task's NAME**, and both earned their place
+immediately. Without the name I spent several rounds disassembling `ping` - the wrong binary - because I
+had assumed which service faulted. A user-mode fault reported without the task's name makes the reader
+guess, and a guess about which service faulted is the wrong place to start.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/exceptions.rs` | 10 -> 11 (+1) | Reading `SP_EL0` in the trap report - a side-effect-free system-register read. A userspace fault is very often the stack rather than the code, and `FAR` alone cannot distinguish "wrote past its frame" from "SP was never set correctly". |
+
+## 2026-08-04 - Pi 4 milestone 19: serial input (feat/pi4-aarch64)
+
+Nothing on this port had read input before; output has been one-way since milestone 1, which is why
+there is still no prompt. The PL011 receive FIFO now drains into a ring the neutral `ConsoleRead` path
+pops from, driven both by the timer tick and directly by a blocked reader (a starved ISR would
+otherwise leave a byte stranded in the FIFO with a reader asleep waiting for it).
+
+**The 32-bit port's hard-won lesson is inherited rather than rediscovered:** the PL011 reports receive
+errors in the SAME read as the data, in `DR` bits 11:8. Masking them off - the obvious thing to write -
+silently promotes line noise to input. On the Pi 2 a GPIO HAT held RX low, which the PL011 reports as a
+continuous break; each one enqueued a spurious `0x00`, the ring filled with nulls, and a full-screen
+editor blocked on `ConsoleRead` repainted 966 times while the document changed twice. Flagged bytes are
+discarded here from the outset.
+
+A persistently overflowing line is switched off (`RXE` cleared, output untouched, latching until
+reboot) after a **duration** of unbroken overflow rather than a byte count - a count is not a measure of
+how long a condition has persisted, and choosing one is how you get a threshold that either fires on a
+fast typist or never fires at all.
+
+Proven by feeding characters in: `gsh test 123` echoed back, 12 of 12, in order, with the logger service
+still running alongside.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/uart_rx.rs` | new, 2 | The bounded FIFO drain (volatile PL011 reads plus the error-clear write) and the ring `pop`, whose slot the producer published with a Release store. |
+| `arch/aarch64/sched_spawn.rs` | 0 -> 2 (+2) | The echo task's stack and context - the only way to prove serial input end to end short of a shell, which cannot exist until this does. |
+
+## 2026-08-04 - Pi 4: the SAME cache bug, in the loader this time (feat/pi4-aarch64)
+
+The fix below was applied to the two hand-written payload copies and **not to the ELF loader** - even
+though its own commit message said the loader would need it. Fixing the instances rather than the class
+left it open where it mattered most.
+
+On hardware, the logger's text landed in frames the one-shot EL0 demo had just executed from and freed.
+The I-cache still held the old blob, so the "logger" ran the DEMO's code, hit the demo's exit syscall,
+switched to a `CTX_KERNEL` saved during boot, and resumed execution in the middle of `boot_high` - which
+re-ran the rest of the boot. It looped until the endpoint table filled, 95 task slots later.
+
+Two fixes, because the bug had a cause and an amplifier:
+
+- **Cause:** `finalize_service_address_space` - the arch hook the neutral loader already calls for every
+  service - now syncs the I-cache over every page of the new address space. Applying it at the hook
+  covers every service the loader will ever produce, rather than the ones someone remembered.
+- **Amplifier:** `CTX_KERNEL` was a resurrection point. The exit syscall now refuses when the demo is
+  not running, so the same class of mistake costs one loud refusal instead of a boot loop.
+
+The hook reports how many pages it synced, because QEMU models no separate I-cache and cannot
+demonstrate the fix - the only evidence available in emulation is that the hook ran and did work. A
+silent hook is exactly how this shipped once already.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/ptables.rs` | 19 -> 21 (+2) | `sync_all_pages` walks the new address space and syncs each leaf through the kernel's direct map (cache maintenance is by physical line, so the task's own VAs need not be mapped). |
+| `arch/aarch64/mod.rs` | 51 -> 53 (+2) | `finalize_service_address_space` calling it, and the count it reports. |
+| `arch/aarch64/usermode.rs` | 14 -> 16 (+2) | The `DEMO_ACTIVE` guard around the exit switch, and setting/clearing it around the demo. |
+
+## 2026-08-04 - Pi 4: writing code needs cache maintenance (feat/pi4-aarch64)
+
+Found on hardware, on the first boot of milestone 17, and **structurally invisible under emulation**.
+
+The instruction and data caches are not coherent on ARM. A store lands in the D-cache while the I-cache
+may still hold whatever was previously at that physical address. The kernel writes code every time it
+loads a program, so this is not a demo concern - the ELF loader will hit it the moment it loads a
+service's text.
+
+What happened: a task payload was copied into a frame the previous EL0 task had just executed from and
+freed. The allocator handed the same frame straight back, the I-cache still held the old blob, and the
+core executed the **previous task's instructions** until it ran off the end into an Illegal Execution
+State (`ESR` EC `0b001110`, `PSTATE.IL` set). The give-away in the log was the scheduled task printing
+the one-shot demo's messages. QEMU models no separate I-cache, so it had passed there a dozen times.
+
+`sync_instruction_cache` cleans the range out of the D-cache to the point of unification and
+invalidates the I-cache over it. Line sizes come from `CTR_EL0` rather than being assumed - `DminLine`
+and `IminLine` differ between implementations, and a hardcoded 64 either does needless work or, if too
+large, skips lines.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mmu.rs` | 11 -> 12 (+1) | `sync_instruction_cache`: reads `CTR_EL0` for the line sizes, then `dc cvau` / `ic ivau` over the range with the `dsb`/`isb` that order them against the fetch which follows. Cache maintenance by VA alters no architectural state beyond the caches. |
+
+## 2026-08-03 - Pi 4 milestone 17: an EL0 task under the neutral scheduler (feat/pi4-aarch64)
+
+Every earlier EL0 excursion was a one-shot: the boot dropped to EL0, the task ran, control came back.
+This is an EL0 task the **scheduler** enters, the timer preempts, and other tasks share a core with.
+
+`TaskContext::new_user` bridges a real mismatch: `switch_context` ends in `ret` and stays at EL1, while
+entering EL0 needs an `eret`. So the context points at a trampoline that performs the `eret`, carrying
+the user entry and stack in `x19`/`x20`. x86 solves the same mismatch the same way, differing only in
+where the values ride. The context's `sp` is the task's KERNEL stack, and that is load-bearing beyond
+first entry: after the `eret` it stays in `SP_EL1`, so it is the stack every later trap from this task
+lands on.
+
+**The bug this found had been sitting there for four milestones.** `syscall_slot` returned
+`core::ptr::null_mut()`, and `prepare_ring3_switch` - which runs *only* for tasks marked `is_user` -
+writes through it. Nothing had ever been marked user, so the stub was unreachable and invisible; the
+first scheduled EL0 task turned it into a null write on the context-switch path. A stub reachable down
+exactly one path stays silent until something takes that path, which is why the crash arrived a whole
+milestone after the stub was written. It is now a fixed array (not the per-core arena, for the same
+reason `uaccess` uses one: the context-switch path must not depend on an allocation having happened),
+with a comment saying plainly that AArch64 does not consult these fields - the hardware selects
+`SP_EL1` architecturally - but the neutral scheduler maintains them, so they need real storage.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/sched_user.rs` | new, 4 | Copying the position-independent EL0 payload into its frame, and building + committing the task (its kernel stack is a module-owned static; the slot is freshly reserved; the user pages are mapped with EL0 access in the table the switch installs). |
+| `arch/aarch64/mod.rs` | 50 -> 51 (+1) | `syscall_slot` handing out a pointer into its fixed per-core array. |
+
+## 2026-08-03 - Pi 4 milestone 16: real syscall dispatch (feat/pi4-aarch64)
+
+`svc` now reaches the **neutral** `syscall::dispatch::syscall_handler` - the same function x86 and
+arm32 call, with the same numbering. Bring-up numbers live above every real one (`>= 0x1000`) so the
+two ranges cannot collide while both exist, and the whole bring-up range disappears with the demo.
+
+The neutral subsystems (per-core arenas, scheduler slots, capability table) moved into the main boot
+rather than only the scheduler demo, because a real syscall reaches `current_task_lookup_cap`, which
+indexes per-core state - and reaching that before it exists is exactly how the user-copy seam went
+silent in milestone 15.
+
+What the EL0 task now proves, from real userspace through the real ABI:
+
+- **`Log` with no capability is REFUSED** (`-2`, `CapNotHeld`). §3.1 enforced end to end on AArch64:
+  authority comes from holding a capability, never from being the caller.
+- **An unknown syscall number returns a defined error** (`-1`), not a fault (§22 Fuzz F2).
+
+The unknown-number test needed fixing after it appeared to pass: `0xBEEF` is *above* the bring-up base,
+so the call went to the demo handler and proved nothing about the neutral path. `0x0FFF` reaches the
+dispatcher. The log's `WARN unknown svc #48879` is what gave it away.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/exceptions.rs` | 9 -> 10 (+1) | Calling the neutral `syscall_handler` - the ring-3 to ring-0 transition it is written for; it treats every argument as untrusted and validates pointers through the user-copy seam. |
+| `arch/aarch64/usermode.rs` | 13 -> 14 (+1) | Recording the dispatcher's verdicts in a module-owned static so `run` can check both. |
+
+## 2026-08-03 - Pi 4 milestone 15: the user-pointer copy seam (feat/pi4-aarch64)
+
+Where the kernel touches memory a task chose the address of. Three defences, because each catches what
+the others cannot:
+
+1. **A range check** - pointer and length inside the user half, addition checked for overflow.
+2. **`ldtrb` / `sttrb`, not `ldrb` / `strb`** - the UNPRIVILEGED load and store. Executed at EL1 they
+   apply **EL0 permissions**, so the hardware refuses a kernel address even if the range check were
+   wrong. Defence in depth at no cost: same instruction count, same speed, and a bug in check (1) stops
+   being exploitable.
+3. **A fault fixup** - a range-valid pointer can still be unmapped, and the abort lands at EL1 looking
+   exactly like a kernel bug. Unguarded, that halts the machine: a denial of service any service could
+   trigger by passing a bad pointer. Vector 4 (same-EL synchronous) became recoverable, and the copy
+   helpers register a recovery address around *only* the faulting instruction - so a kernel bug faulting
+   anywhere else still halts loudly, which is what makes this safe rather than a blanket "ignore kernel
+   faults".
+
+Reads are **copied** into a per-core staging buffer rather than borrowed: handing the kernel a pointer
+into user memory leaves every later read racing the task, which can change the bytes between validation
+and use.
+
+**The bug this cost is the one worth keeping.** The per-core state was first indexed via
+`current_core_id()`, which needs tables that are not up when the first copy runs - and, far worse, the
+FAULT HANDLER calls into this module. Indexing an unallocated arena from a fault handler faults again,
+and the second fault happens while reporting the first, so the machine went completely silent with
+nothing printed. A fault handler must not depend on initialisation order. It now indexes a fixed array
+by `MPIDR_EL1.Aff0`, which needs no setup and cannot fail.
+
+The selftest drives all four outcomes including the two that only fire on bad input, and counts
+recovered faults so "the unmapped pointer survived" is backed by evidence the fixup FIRED rather than by
+something upstream having quietly rejected the pointer.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/uaccess.rs` | new, 5 | `core_index` (an `MPIDR_EL1` read), the two `asm!` copy loops (unprivileged accesses plus fixup arm/disarm), the staging-buffer pointer, and the slice built over the copied bytes. |
+| `arch/aarch64/exceptions.rs` | 7 -> 9 (+2) | `aarch64_sync_current_dispatch`: reading `ESR_EL1` and rewriting the trap frame's `elr` to the recovery address. |
+| `arch/aarch64/usermode.rs` | 11 -> 13 (+2) | Installing the task's `TTBR0` around the seam selftest, so it runs against a REAL user page - the only way to test checks that are all about an address the kernel does not own. |
+
+## 2026-08-03 - Pi 4 milestone 14: `ptables` becomes the real `page_tables::PageTable` (feat/pi4-aarch64)
+
+`loader.rs` calls `arch::imp::page_tables::PageTable::new()`, which was still the `unimplemented!()`
+stub - so no service ELF could be loaded no matter what else worked. The hardware-proven implementation
+is now wired in behind the neutral signature (`map(VirtAddr, PhysAddr, PageFlags)`), and the arch-native
+form is kept as `map_raw` for the EL0 bring-up path.
+
+The flag translation has one decision worth naming: **`PCD | PWT`**. On x86 those disable caching for an
+MMIO mapping; the faithful AArch64 equivalent is not "uncached Normal" but the **Device** attribute,
+which additionally forbids the reordering, merging and speculative repetition that make a wrongly-typed
+MMIO mapping misbehave in ways no fault points at.
+
+Two hooks that were empty stubs now have bodies, and one is deliberately still empty:
+`free_page_table_root` frees the table tree; `reclaim_user_frames` frees the leaf pages (an empty stub
+there would not fail loudly - it would leak every page of every task that ever died, surfacing only as
+the machine slowly running out of memory); and `finalize_service_address_space` is genuinely a no-op,
+because unlike the 32-bit port there is no kernel map to clone into a new space.
+
+Reclaim is **proven, not assumed**: the selftest now maps extra pages, hands the space to
+`reclaim_user_frames`, and checks both the count returned and the allocator's free total - `4 pages
+reclaimed, all frames returned`.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 45 -> 50 (+5) | `free_page_table_root` and `reclaim_user_frames` forwarding to `ptables`, plus the selftest's reclaim exercise (mapping extra pages and calling reclaim on the space). |
+| `arch/aarch64/ptables.rs` | 19 (net 0) | `reclaim_pages` walks the tree and frees each leaf, using the same `get`/`set` accessors already audited; the kernel-copy loop it replaces was the same count. |
+
+## 2026-08-03 - Pi 4 milestone 12: an EL0 task in its own address space (feat/pi4-aarch64)
+
+The payoff of the TTBR1 split, and the first place the separation is enforced by hardware rather than
+by leaving the right bits clear. `PageTable::new` now allocates **one** frame and copies nothing: a task
+table holds the task and nothing else, because the kernel is in `TTBR1` where no `TTBR0` switch can
+disturb it and no EL0 access can reach it. That deleted the 20 KiB kernel-copy per address space AND
+the collision class it carried.
+
+The task is frames, not linker sections: a code page and a stack page from the allocator, with a
+position-independent payload copied in. Position-independent because it is linked into the kernel at a
+high address and executed at a low one - trivially so, being register operations and `svc` with no
+memory reference.
+
+Net unsafe is unchanged: what `usermode.rs` gained (building the space, copying the payload, installing
+`TTBR0` before the `eret`) is offset by what `ptables.rs` lost with the kernel-copy loop.
+
+**Page 0 is now reserved.** The allocator handed out physical frame 0 as a page-table root, which
+printed `TTBR0=0x0` - working, but by coincidence, and colliding with the `cr3 == 0` sentinel
+`switch_context` uses for "no address space". A null physical address must never be a valid allocation.
+
+## 2026-08-03 - Pi 4 milestone 11b: the kernel moves to the high half (feat/pi4-aarch64)
+
+The kernel is now LINKED high and LOADED low (VMA `KERNEL_VA + 0x80000`, LMA `0x80000`), relocates
+itself into `TTBR1` early in boot, and then **retires the low identity map**. `TTBR0_EL1` is empty from
+that point on, which removes the collision milestone 10 documented: a task page below 4 GiB can no
+longer shadow the kernel, because the kernel is not there.
+
+Three things make the transition safe, and they are all in the code rather than in anyone's head:
+
+- `_start` reaches symbols only through `adrp`/`add`, which is purely PC-relative, so the same
+  instruction yields the right LOW address while the MMU is off and the right HIGH one afterwards.
+- Between `enable` and the jump, BOTH halves translate. There is no instant at which the core executes
+  from an address that does not resolve.
+- Peripherals move first (`mmio_go_high`), because a device register is still named by its physical
+  address and the UART must survive the step or the next failure reports nothing.
+
+**Two mistakes here are worth keeping.** The relocation asm used a hardcoded `x9` as scratch while
+letting the compiler allocate `{base}` - and it chose `x9` too, so `mov x9, sp` destroyed the base and
+`orr x9, x9, x9` left SP unchanged. The kernel then ran on happily from its still-mapped low stack and
+only died when the low map was retired, whereupon the handler faulted on its own push and recursed,
+walking `FAR` down by one 272-byte frame per iteration. Nothing pointed at the asm; reading SP back and
+printing it settled it in one run, and the boot now reports SP permanently for that reason. Separately,
+the high-half selftest initially compared an address against itself (it took the symbol's address as
+the "high" side, but pre-jump codegen yields a LOW address) - it passed while testing nothing.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mmu.rs` | 5 -> 11 (+6) | `virt_to_phys` (linker symbols are high; anything the HARDWARE consumes must be physical); the high-half table build; `jump_high` (reads SP, then relocates SP and PC together); `running_high` (reads the PC rather than assuming); `drop_low_map` (`msr ttbr0_el1, xzr` + invalidate); and the corrected selftest. |
+| `arch/aarch64/mod.rs` | 42 -> 45 (+3) | The `mmio()` indirection now used by every PL011/GPIO access, and the SP read-back that reports the stack relocated. |
+| `arch/aarch64/memmap.rs` | 7 -> 8 (+1) | `current_map`, which re-derives the map after the jump abandons the low stack along with every local on it. |
+
+## 2026-08-03 - Pi 4 milestone 11a: the TTBR1 high half goes live (feat/pi4-aarch64)
+
+Stage one of moving the kernel out of `TTBR0`. The high half (`TTBR1_EL1`) now maps physical `P` at
+`KERNEL_VA_BASE + P` - a direct map, the same thing Limine's HHDM is on x86 - alongside the existing
+low identity map. Nothing has moved yet; this proves the mapping works before anything is built on it.
+
+`KERNEL_VA_BASE` is chosen so `>> 30 & 511 == 0`, which makes the high L1's entry *i* cover the same
+GiB as the low L1's entry *i*, so both maps are built by the same loop rather than by two subtly
+different ones.
+
+**`TG1` does not share `TG0`'s encoding.** TG0 spells 4 KiB as `0b00`; TG1 spells it `0b10`. Copying
+the TG0 value across selects a 16 KiB granule, every high walk fails, and the fault points at whatever
+first touched a high address rather than at the register. The selftest exists to catch exactly that
+class at the point of the mistake.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mmu.rs` | 4 -> 5 (+1) | `selftest_high_half` writes through the physical (identity) address and reads back through the high alias, then reverses the direction so it cannot pass on a stale line that happened to match. The high tables themselves are built inside the existing `enable` block, so they add no new `unsafe`. |
+| `arch/aarch64/mod.rs` | 41 -> 42 (+1) | Freeing the scratch frame the selftest borrowed from the allocator. |
+
+## 2026-08-03 - Pi 4 milestone 10: per-task page tables (feat/pi4-aarch64)
+
+An address space is a private L1 plus **its own copies** of the four kernel L2 tables. The alternative
+- pointing each task's L1 at the shared kernel L2s, as the 32-bit port does - saves 20 KiB and buys an
+aliasing hazard: a table split in one address space is seen by all of them, and reclaim then has to
+distinguish a table the task owns from one it merely points at. Copying means **nothing is aliased**,
+so reclaim frees everything the root reaches without a single ownership test.
+
+**This milestone also surfaced a real architectural limit, and the code says so rather than working
+around it.** A task page below 4 GiB would land inside a 2 MiB block of the kernel's identity map, and
+mapping it would shadow the kernel's own view of that physical range - `USER_STACK_TOP` (0x8000_0000)
+sits directly above the frame allocator's bitmap. `map` refuses that case loudly instead of splitting
+the block, because the honest fix is to stop putting the kernel in TTBR0 at all: the kernel belongs in
+TTBR1 (high VA), leaving TTBR0 entirely to the task. The speculative block-splitting code that would
+have papered over it was written and then **deleted** (§26.2 - features are pulled into existence, not
+kept in case).
+
+The selftest exercises the `TTBR0_EL1` swap that milestone 9 shipped unexercised: build a space, map a
+page above the kernel map, install the new TTBR0, read the value back through the new mapping, confirm
+kernel memory is still reachable under the task's table, switch back, and check every frame returned.
+Proven to fail by inverting the value comparison (`mapped=false`, every other counter clean), and the
+`map failed` path fired on its own during development.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/ptables.rs` | new, 19 | Page-table walking and construction: `get`/`set` on identity-mapped table frames, zeroing a freshly allocated table (garbage would have VALID bits set at random and the walker follows them), copying the kernel L2s, and `free_all` reclaiming the tree. Every one is a raw access to a frame this module allocated or to the kernel's own boot L1. |
+| `arch/aarch64/mmu.rs` | 3 -> 4 (+1) | `kernel_l1_root` takes the address of this module's static L1 - no dereference. Per-task spaces copy from THIS, never from the live `TTBR0_EL1`, which belongs to whichever task is running; the 32-bit port copied the live root and gave a child its spawner's user entries, which the child's reclaim later freed out from under the still-running spawner. |
+| `arch/aarch64/mod.rs` | 33 -> 41 (+8) | The page-table selftest: writing and reading the test frame and the kernel canary through identity addresses, reading `TTBR0_EL1`, the two `msr ttbr0_el1` + `tlbi vmalle1` switches, and freeing the two frames. The switch is safe because the new space maps the kernel (copied from the boot L1), so the instruction stream, stack and UART stay translated across it. |
+
+## 2026-08-03 - Pi 4 milestone 9: the neutral scheduler preempts (feat/pi4-aarch64)
+
+Three kernel tasks that deliberately never yield, round-robined by the neutral `scheduler::run` under
+the 100 Hz generic timer. The scheduling decision is the same neutral code x86 runs; what this commit
+adds is the arch side it stands on.
+
+**The trampoline is the load-bearing piece.** The scheduler masks IRQs before its initial
+`switch_context`, so a task whose `lr` pointed straight at its entry begins running with `DAIF.I` set
+and - never yielding - never has it cleared. Observed exactly: task A ran correctly and forever while
+B and C starved, which reads as a broken scheduler when in fact it was never given a tick. x86 solves
+it the same way (`task_entry_trampoline` does `sti` then `ret`); this port carries the entry in x19
+rather than on the stack, because `ret` here jumps to `lr` rather than popping.
+
+**The GIC EOI had to move before the switch, not after.** The neutral tick performs a preemptive
+`switch_context` internally and may not return on this task's stack at all. The GIC CPU interface keeps
+a priority active until the interrupt is retired, so an EOI deferred past the switch leaves the timer
+interrupt permanently active and blocks every later interrupt of equal or lower priority - one tick,
+then silence, with the scheduler looking like the culprit.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/context.rs` | 2 -> 9 (+7) | The `TTBR0_EL1` read/write/invalidate in `switch_context` (SEC-26: writing TTBR0 flushes nothing on AArch64, so the switch must invalidate on an address-space change - route (a) from `arch/CLAUDE.md`); the entry-trampoline `global_asm!` and its extern; and `new_user`, which is a loud `unimplemented!` rather than a context that would `ret` into a user address at EL1. Note the TTBR0 branch is NOT yet exercised - every task shares the kernel identity map - and that is stated in the code rather than assumed. |
+| `arch/aarch64/mod.rs` | 28 -> 33 (+5) | Real bodies for primitives the neutral scheduler depends on, previously no-op stubs: `enable`/`disable_interrupts` (`msr daifclr/daifset, #2` - note DAIF is a MASK, so the polarity is inverted from x86's `IF`), `local_irq_save` (reads DAIF), `wait_for_interrupt` (`wfi`), and `read_cycle_counter` (`CNTPCT_EL0`, with an `isb` first so the read is not speculated earlier and a measured duration does not come out short). |
+| `arch/aarch64/sched_demo.rs` | new, 5 | Demo-only: three 64 KiB `.bss` stacks this module owns, built into task contexts and committed to freshly reserved scheduler slots during single-threaded boot. |
+
+## 2026-08-03 - Pi 4 milestone 8: the neutral frame allocator (feat/pi4-aarch64)
+
+The first arch-neutral kernel code to run on this board. `crate::memory::init` is the same code the
+x86 build has used since v1, reached through the `BootInfo` the seam defines - the demarcation claim
+tested on a second ISA in the place it is easiest to get wrong.
+
+The `unsafe` added is a **selftest**, not plumbing. `memory::init` printing a free count shows the map
+parsed; it does not show that a returned frame is real, distinct, writable, or reusable. The selftest
+writes every frame with a value derived from its own physical address, then verifies every frame in a
+SECOND pass. The two passes are the point: write-then-read each frame in turn cannot detect ALIASING,
+because two distinct physical addresses backed by the same RAM would each read back correctly the
+instant after being written. A memory map claiming RAM the board does not have shows up as address
+wrap or aliasing on real silicon far more often than as a fault, so this is the failure the port is
+actually exposed to. Proven to fire by corrupting one frame: `1 bad read-back`, correct index counted,
+every other counter clean.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 27 -> 28 (+1) | The allocator selftest's frame writes and read-backs, plus the `free_frame` calls that return them. The frames come from `alloc_frame` and the low 4 GiB is identity mapped as Normal writable memory, so a physical address is a valid pointer and nothing else holds these frames. Also in this commit, at no cost to the count: `serial_write_byte` now routes through `put_byte` (which polls TXFF) instead of writing the data register directly - it previously dropped bytes the moment the 32-entry FIFO filled, which nothing had noticed because nothing called it until neutral code began logging. |
+
+## 2026-08-03 - Pi 4 milestone 7: the memory map (feat/pi4-aarch64)
+
+The board does not tell the ARM how much RAM it has unless asked. Two sources are read, both before the
+MMU and caches come on: the **device tree** the firmware passes in `x0` (authoritative), and the
+**mailbox** `GET ARM MEMORY` tag (a fallback that cannot describe RAM above 4 GiB and, on the usual
+firmware configuration, under-reports a board with more than 1 GiB).
+
+Both are **untrusted firmware input**, and the `unsafe` here is dominated by that fact rather than by
+the hardware access. Every device-tree offset is bounds-checked against the header's own `totalsize`
+before it is read, the structure walk is iteration-bounded, and anything that fails to parse yields
+`None` rather than a partially-believed map. That asymmetry is deliberate: a map that is wrong in the
+safe direction costs capacity, while one that is wrong in the unsafe direction hands the allocator RAM
+that does not exist and surfaces much later as corruption.
+
+`_start` also gained one instruction, and it closes a real hole: the firmware hands over the device-tree
+pointer in `x0`, and the first instruction of the EL2 check clobbered `x0`. The pointer was being thrown
+away before anything could read it. It is now stashed in `x19` (which survives the `eret`) and stored
+after `.bss` is zeroed.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mailbox.rs` | new, 3 | (1) The mailbox handshake: volatile reads of `MBOX_STATUS`/`MBOX_READ` and a write to `MBOX_WRITE`, all identity-mapped Device memory, both waits bounded so a silent GPU cannot hang the boot (invariant 12). (2)+(3) Staging the request in a module-owned 16-byte-aligned static and reading the reply back, during single-threaded boot with caches off - which is the point: the GPU reads the buffer out of RAM directly, so running before `mmu::enable` removes the cache-maintenance question rather than answering it. |
+| `arch/aarch64/memmap.rs` | new, 7 | (1) Reading the linker's `__kernel_end` - taking a symbol's address does not dereference it. (2)-(4) The three bounds-checked device-tree accessors (`u32_at`, `u8_at`, and the header/magic read in `open`); each refuses any offset outside `totalsize` BEFORE reading, so a malformed blob produces `None` rather than a wild read. (5)+(6) Building the region array in a module-owned `.bss` static during single-threaded boot. (7) Handing that array out as a `&'static [MemoryRegion]` - the storage is static and the slice is read-only and never rebuilt. |
+| `arch/aarch64/mod.rs` | 27 -> 27 (net 0) | The `_start` change is inside the existing `naked_asm!` block, so the count is unchanged: `mov x19, x0` before the EL2 check preserves the device-tree pointer, and `mov x0, x19` hands it to Rust. |
+
+## 2026-08-03 - Pi 4: EL0 gets its own 2 MiB region (feat/pi4-aarch64)
+
+Follow-up to milestone 6, after two hardware failures traced to one cause.
+
+**In the EL1&0 translation regime, a region accessible from EL0 is forced PXN** - the kernel may not
+execute what userspace can reach (ARM's equivalent of x86 SMEP). Granting EL0 access to the block
+holding the kernel's `.text` therefore made the kernel non-executable at EL1, and the core died on its
+next instruction fetch with no way to report it: the exception handler could not fetch its vector
+either. It presented first as `tlbi vmalle1` hanging and then as the MMU enable hanging - the same
+permission fault landing wherever the new mapping took effect. The `tlbi` was never at fault, and the
+earlier "suspect CPUECTLR_EL1.SMPEN" note was wrong.
+
+EL0 code and stack now live in a linker-placed, 2 MiB-aligned `.el0` region, and only that region is
+granted EL0 access. The EL0 task consequently cannot call kernel print functions at all, so it reports
+its verdict through a syscall argument - the first place the EL0/EL1 boundary is real rather than
+notional.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mmu.rs` | 2 -> 3 (+1) | `el0_region` reads the linker's `__el0_start`/`__el0_end`; taking a linker symbol's address does not dereference it. |
+| `arch/aarch64/usermode.rs` | 9 -> 11 (+2) | The `svc #2` verdict call from EL0, and the EL0 stack now living in `.el0.data`. |
+
+## 2026-08-03 - Pi 4 milestone 6: EL0 and the svc path (feat/pi4-aarch64)
+
+Dropping to EL0, taking `svc` back to EL1, returning a value, and exiting cleanly.
+
+The syscall number is read from `ESR_EL1`'s `imm16`, **not from a register**, so userspace cannot claim
+a different call by clobbering a register on the way in. Arguments still arrive in registers and are
+untrusted exactly as §18 requires. The demo checks the round trip in both directions rather than only
+that it did not crash.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/usermode.rs` | new, 9 | The EL0 entry (`msr sp_el0` / `elr_el1` / `spsr_el1` then `eret` - all three must be set before the eret; an unset `SP_EL0` faults on the first push and points at the user code rather than the entry), the demo task's `svc` calls, the exit path's context switch back to the saved kernel context, module-owned static setup, and one unreachable `wfe` park. |
+| `arch/aarch64/exceptions.rs` | 5 -> 7 (+2) | The synchronous-lower-EL dispatcher: `mrs esr_el1` to read the exception class and `imm16`, and dereferencing the trap frame the vector assembly built on the current stack. |
+| `arch/aarch64/mmu.rs` | 2 -> 3 -> **2** (net 0) | `allow_el0` was added here and then REMOVED: it patched `AP` on the live map and invalidated the TLB, and on hardware the `tlbi` never returned. EL0 access is now decided when the tables are built, before translation is on, so there is no live mutation and no maintenance. Net effect on the count is nil. |
+
+## 2026-08-03 - Pi 4 milestone 5: context switch (feat/pi4-aarch64)
+
+Saving and restoring the AAPCS64 callee-saved set, proven by two kernel tasks ping-ponging.
+
+The context switch is the first piece here that can corrupt state **silently**: a wrong byte offset or
+a dropped register does not fault, it resumes a task holding someone else's value and the damage
+surfaces later somewhere unrelated. So it is proven on its own, and the demo *checks* rather than
+merely runs - each task holds witnesses in callee-saved integer and FP registers across the switch and
+reports a mismatch. A test that cannot fail is worth nothing (A9-1).
+
+`d8`-`d15` are saved even though skipping them would look harmless: the kernel is built for a target
+with FP/SIMD, LLVM emits NEON for bulk copies without being asked (the Pi 2 hit this with `memcpy`),
+and omitting them yields corruption only when a switch lands between a NEON spill and its reload.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/context.rs` | new, 2 | (1) `global_asm!` for the switch itself - a context switch cannot be expressed in Rust. (2) The `switch` wrapper is `unsafe fn` and calls the extern; its contract names what the caller owes (valid non-aliasing contexts, `next` either previously saved or prepared by `init`). |
+| `arch/aarch64/ctxdemo.rs` | new, 7 | Demo-only. Six are `switch` calls plus context/stack setup on statics this module owns during single-threaded boot; one is the `wfe` park on an unreachable path. The statics are `TaskContext`s and two 16 KiB `.bss` stacks, sized once and visible (§26.6.1). |
+
+## 2026-08-03 - Pi 4 milestone 4: GIC-400 + generic timer (feat/pi4-aarch64)
+
+A periodic tick: the standard GICv2 the Pi 4 has (unlike the Pi 2's bespoke Broadcom controller, this
+is spec-driven and transfers to any GICv2 board) plus the architectural generic timer. The IRQ vectors
+gained a RETURN path - previously every vector reported and halted, which for a tick is not a tick.
+
+Two disciplines carried over from the 32-bit port's scars: the counter frequency is **read from
+`CNTFRQ_EL0`, never assumed** (a hardcoded guess made every sleep on that board wrong by orders of
+magnitude and hid for months), and the wait for the first ticks is **bounded** so a timer that never
+fires reports instead of hanging the boot looking busy.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/gic.rs` | new, 4 | Four Device-mapped MMIO accessors: `init` (quiesce, priority mask, enable distributor + CPU interface), `enable` (priority, target, set-enable bit), `acknowledge` (GICC_IAR - a read WITH the architectural side effect of acknowledging), `eoi` (GICC_EOIR). Each is a single volatile access to a register the GICv2 spec defines. |
+| `arch/aarch64/timer.rs` | new, 5 | System-register access only: `CNTFRQ_EL0` and `CNTPCT_EL0` reads (side-effect-free), `CNTP_TVAL_EL0`/`CNTP_CTL_EL0` writes to arm and disable, and `msr daifclr, #2` to unmask IRQs at EL1. EL2 granted EL1 access to the physical timer during the boot drop (CNTHCTL_EL2), so none of these trap. |
+
+## 2026-08-03 - Pi 4 milestone 3: exception vectors (feat/pi4-aarch64)
+
+`VBAR_EL1` and a 16-entry vector table. This comes before the timer or the GIC because until it exists
+a fault is a silent lockup: the core takes the exception and branches into whatever sits at the reset
+vector. Every milestone after this adds code that can fault, so this is what makes the rest debuggable
+(invariant 12 applied to the port itself).
+
+The table is proven by **raising a real `brk #0`**, not by asserting the register took. A self-test that
+cannot fail is worth nothing - the lesson from A9-1, where an odd sentinel let a test pass without the
+fix it was meant to prove.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/exceptions.rs` | new, 5 | (1) `global_asm!` for the 2 KiB-aligned table and the shared save-and-report tail - assembly is the only way to express a vector table. (2) `msr vbar_el1` in `init`, which only changes where exceptions are taken to. (3) `mrs vbar_el1` in `installed`, side-effect-free. (4) `mrs esr_el1`/`far_el1` in the reporter, likewise. (5) dereferencing the trap frame the vector assembly just built on the current stack - valid for the call, unaliased. |
+| `arch/aarch64/mod.rs` | 27 -> 28 (+1) | The deliberate `brk #0` that proves the vectors fire. It never returns: with the table installed it is taken to the synchronous handler, which reports and halts. |
+
+## 2026-08-03 - Pi 4 milestone 2: the MMU (feat/pi4-aarch64)
+
+Identity-mapping the low 4 GiB and turning translation on. 4 KiB granule, 39-bit VA (so the walk starts
+at L1 and there is no L0 to carry), 2 MiB blocks at L2 - one L1 plus four L2 tables, exactly 20 KiB of
+`.bss`, a fixed and visible footprint (§26.6.1).
+
+The RAM/device split is the part that matters for correctness. Device memory is mapped
+**Device-nGnRnE** and never-execute; RAM is Normal write-back, inner-shareable. Mapping MMIO as Normal
+does not fail cleanly - the core may reorder, merge or speculatively repeat accesses to a peripheral
+register, and the symptom is a device behaving erratically rather than a fault that names the mapping.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mmu.rs` | new, 2 | (1) One block builds the tables and installs them: plain stores to two `.bss` statics this function owns exclusively while the MMU is still off and no other core runs, then `msr` of MAIR/TCR/TTBR0, a `tlbi vmalle1` (the TLB is architecturally UNKNOWN out of reset, so entering with whatever it holds is a real hazard), and finally `SCTLR_EL1.M|C|I`. Because the map is identity, the instruction after the `isb` executes translated at the same address. (2) `is_enabled` reads `SCTLR_EL1` back - a side-effect-free system-register read - so the boot reports what actually happened rather than asserting the write took. |
+| `arch/aarch64/mod.rs` | 25 -> 27 (+2) | `pl011_init` (UART disable/drain/line-control/enable) and `gpio_init_uart` (mux GPIO14/15 to ALT0, pull-up on RX). Both are identity-mapped MMIO writes during single-threaded boot; the BUSY drain is bounded so a wedged UART cannot hang the boot (invariant 12). |
+
+## 2026-08-03 - Raspberry Pi 4 (aarch64) bring-up + the stale arch stubs
+
+Milestone 1 of the Pi 4 port, plus the arch stubs it exposed as out of date.
+
+**The stubs had drifted.** The neutral kernel gained `arch::imp` items over time (`note_user_task`,
+`page_tables::finalize_service_address_space`, `page_tables::free_page_table_root`, and from the v0.9.0
+console work `fb_commit` + `FB_READBACK_CHEAP`) without every arch stub being updated, so the
+demarcation builds `docs/multi-arch.md` claims had quietly stopped compiling. The Pi 4 build surfaced
+it: the compiler names the surface a port still owes, which is the workflow `arch/CLAUDE.md` describes.
+All five arch stubs are current again and compile clean.
+
+Each stub's `+2` is the two `unsafe fn` DECLARATIONS (the keyword is what the scanner counts) - both are
+empty no-ops, since a stub has no address spaces to finalize or free. They carry `# Safety` contracts
+matching the x86/ARM implementations so a real port inherits the obligation rather than discovering it.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/aarch64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. The boot path was also reworked for the Pi 4 (EL2 -> EL1 drop, BCM2711 PL011 at 0xFE201000, a bounded TXFF wait) but that is net-neutral on the count: `CurrentEL` read and the UART poll replace the old unguarded byte writes. |
+| `arch/loongarch64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. |
+| `arch/riscv64/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. |
+| `arch/riscv32/mod.rs` | 23 -> 25 (+2) | The two `unsafe fn` page-table stubs. |
+| `arch/s390x/mod.rs` | 18 -> 20 (+2) | The two `unsafe fn` page-table stubs. |
+
 ## 2026-08-03 - the A9-1 large-page guard selftest (test/large-page-guard)
 
 Kernel-audit A9-1 fixed a walk that could write into a mapped data frame, but the trigger (a large page
@@ -1102,7 +2311,26 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 23 | permitted |
+| arch/aarch64/mod.rs | 68 | permitted |
+| arch/aarch64/sched_user.rs | 4 | permitted |
+| arch/aarch64/sched_spawn.rs | 2 | permitted |
+| arch/aarch64/uart_rx.rs | 3 | permitted |
+| arch/aarch64/exceptions.rs | 15 | permitted |
+| arch/aarch64/uaccess.rs | 7 | permitted |
+| arch/aarch64/context.rs | 9 | permitted |
+| arch/aarch64/sched_demo.rs | 5 | permitted |
+| arch/aarch64/ctxdemo.rs | 7 | permitted |
+| arch/aarch64/gic.rs | 7 | permitted |
+| arch/aarch64/timer.rs | 5 | permitted |
+| arch/aarch64/mmu.rs | 23 | permitted |
+| arch/aarch64/ptables.rs | 21 | permitted |
+| arch/aarch64/usermode.rs | 16 | permitted |
+| arch/aarch64/mailbox.rs | 4 | permitted |
+| arch/aarch64/memmap.rs | 8 | permitted |
+| arch/aarch64/video.rs | 2 | permitted |
+| arch/aarch64/genet.rs | 1 | permitted |
+| arch/aarch64/pcie.rs | 4 | permitted |
+| arch/aarch64/smp_boot.rs | 9 | permitted |
 | arch/arm/exceptions.rs | 24 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
@@ -1121,11 +2349,11 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 44 | permitted |
-| arch/loongarch64/mod.rs | 23 | permitted |
-| arch/riscv32/mod.rs | 23 | permitted |
-| arch/riscv64/mod.rs | 23 | permitted |
-| arch/s390x/mod.rs | 18 | permitted |
+| arch/arm/mod.rs | 45 | permitted |
+| arch/loongarch64/mod.rs | 25 | permitted |
+| arch/riscv32/mod.rs | 25 | permitted |
+| arch/riscv64/mod.rs | 25 | permitted |
+| arch/s390x/mod.rs | 20 | permitted |
 | arch/x86_64/ap_boot.rs | 2 | permitted |
 | arch/x86_64/boot.rs | 107 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |

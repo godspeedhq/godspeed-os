@@ -7,5 +7,14 @@ edition = "2021"
 name = "mem-pressure"
 path = "src/main.rs"
 
+[features]
+# Deliberately take an EL0 page fault shortly after starting, to PROVE the kernel kills this task and
+# keeps running rather than halting the core. TEST BUILDS ONLY - it kills this service every boot.
+#
+# It exists because the AArch64 fault handler parked the core on any userspace fault, and that hole
+# was invisible for the whole port: a recovery path nobody has ever seen run is indistinguishable
+# from one that does not exist. Forcing the condition is the only evidence that counts.
+el0-fault-test = []
+
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }

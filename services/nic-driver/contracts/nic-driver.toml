@@ -12,15 +12,31 @@ limit   = "16MiB"
 # Reach the BAR via ctx.mmio().
 hw_device = "nic"
 log_write = true
-# ARM (Pi 2) NOTE (userspace-audit Audit 5, A5-U1): on ARM there is no PCIe NIC, so `hw_device = "nic"`
-# resolves to nothing; instead the kernel grants this service the NET_DEVICE capability BY NAME (the
-# in-kernel USB-net frame bridge, syscalls 42-44 - `service_privileges` in kernel `task/mod.rs`, arch-gated
-# to ARM). NET_DEVICE is a kernel-only by-name grant (like the SEC-audit U15 privileges) and is
-# deliberately NOT a contract capability - `contract_check.py` does not reconcile it. So on ARM the real
-# authority of this service is: NET_DEVICE (move ethernet frames) + log_write. Stated here so a contract
-# reader is not misled by the x86-shaped `hw_device` line above.
+# ARM NOTE (userspace-audit Audit 5, A5-U1) - applies to BOTH ARM ports: on neither is there a PCIe NIC,
+# so `hw_device = "nic"` resolves to nothing; instead the kernel grants this service the NET_DEVICE
+# capability BY NAME (frame syscalls 42-44 - `service_privileges` in kernel `task/mod.rs`, arch-gated to
+# `arm` and `aarch64`). The device behind those syscalls differs per board - Pi 2: an in-kernel DWC2
+# CDC-ECM USB adapter; Pi 4: the on-board GENET Ethernet MAC - but the authority granted is identical.
+# NET_DEVICE is a kernel-only by-name grant (like the SEC-audit U15 privileges) and is deliberately NOT a
+# contract capability - `contract_check.py` does not reconcile it. So on either ARM port the real authority
+# of this service is: NET_DEVICE (move ethernet frames) + log_write. Stated here so a contract reader is
+# not misled by the x86-shaped `hw_device` line above.
+#
+# PI 4: none of the paragraph above applies - it describes the Pi 2 only. The GENET driver lives in THIS
+# service (`src/genet.rs`), not in the kernel, so the authority takes the x86 shape after all: a fixed
+# MMIO window (physical 0xFD58_0000, 64 KiB, reached via `ctx.mmio()`) plus a 64 KiB DMA arena, both
+# granted by name at spawn and only when the kernel's boot probe found a controller. The kernel's own
+# GENET code is now discovery ONLY (`arch/aarch64/genet.rs` reads one revision register and writes none);
+# there is no in-kernel driver left to fall back to, which is deliberate - a second path that is not
+# exercised does not stay working, and the unexercised one here was the one that obeyed Commandment I.
+# NET_DEVICE is still granted on aarch64 and simply goes unused; the service never calls those syscalls
+# on this board. The grant is unconditional because the kernel cannot see which board's backend the
+# embedded binary selected, and an unused capability is a smaller problem than a driver that cannot
+# reach its device.
 
 [placement]
 core = 1   # a driver pins to the core its IRQ will route to (interrupt locality, §12.2)
 # ARM (Pi 2): the kernel overrides this to core 0 - the in-kernel DWC2 USB-net device is driven only from
 # core 0, and the NET_DEVICE syscalls guard on that core (userspace-audit Audit 5). This x86 value stands.
+# AArch64 (Pi 4): NOT overridden - core 1 as written. GENET is reached by MMIO from whichever core makes
+# the syscall, so there is no core-0 constraint to honour, and core 1 keeps it beside net-stack and fs.

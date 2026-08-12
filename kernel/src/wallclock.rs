@@ -17,7 +17,12 @@
 //! floor is for is REFUSING a time that cannot be right: a dead RTC reading 2000, or a stale/hostile
 //! network reply from before we last ran.
 
-use core::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+// `AtomicI64` comes from `portable_atomic`, NOT `core` - 32-bit RISC-V (RV32A) has no 64-bit atomic,
+// so `core::sync::atomic::AtomicI64` does not exist there and this file would not compile. That is the
+// word-size portability rule in `arch/CLAUDE.md`, and the RV32 target exists precisely to catch its
+// violation, which it did. `AtomicU8` is fine from `core` - every ISA has an 8-bit atomic.
+use core::sync::atomic::{AtomicU8, Ordering};
+use portable_atomic::AtomicI64;
 use crate::clock::{epoch_secs, CLOCK_MIN_PLAUSIBLE, CLOCK_MAX_PLAUSIBLE};
 
 pub const CLOCK_SRC_UNSET: u8 = 0;

@@ -79,6 +79,23 @@ def main() -> int:
     failures: list[str] = []
     infos: list[str] = []
 
+    # An inventory row whose FILE NO LONGER EXISTS is a failure too.
+    #
+    # This loop walks files on disk, so a row for a deleted file was never visited and the check passed
+    # while the inventory described a tree that was gone. Deleting `arch/aarch64/xhci.rs` left its
+    # 42-line row behind for two audit rounds: the audit claimed 42 unsafe lines that no longer existed
+    # anywhere, and this script reported success. §18.4 requires the audit to MATCH the source, and a
+    # check that only ever looks one way cannot enforce that.
+    #
+    # Checked first, so the report leads with "the audit describes a file that is not here" rather than
+    # burying it under the per-file results.
+    for rel in sorted(audit):
+        if not (KERNEL_SRC / rel).exists() and not (SERVICES / rel).exists():
+            failures.append(
+                f"  FAIL  {rel}: in docs/unsafe-audit.md but the file does not exist - "
+                f"remove its inventory row (the audit must match the source, §18.4)"
+            )
+
     for rs_file in sorted(KERNEL_SRC.rglob("*.rs")):
         rel    = rs_file.relative_to(KERNEL_SRC).as_posix()
         actual = count_unsafe(rs_file)

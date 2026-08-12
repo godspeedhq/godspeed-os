@@ -768,7 +768,22 @@ impl ServiceContext {
             // truth, doing nothing (the same busy-wait the `observe` and muted loops were already fixed
             // for - see MUTED_POLL_SLEEP_CYCLES). Blocking parks the task, the core halts, idle work runs.
             if let Some(r) = self.try_recv() {
-                self.remove_cap(reply_cap);
+                // DO NOT remove the reply cap on a REPLY. The send already removed it.
+                //
+                // §8.5: a cap embedded in a message "is transferred and REMOVED from sender's table".
+                // The instant the request went out this slot stopped being ours, and by the time the
+                // reply lands the kernel has REUSED it - `CapTable::insert` hands out the first EMPTY
+                // slot, and this one is empty. When the reply carries an embedded cap (a file cap from
+                // `fs`), that cap lands in exactly this slot, so removing "the reply cap" DELETES IT.
+                //
+                // Measured on the Pi 4: `fcap` printed `file=12 reply=12` - the file handle and the
+                // next derived cap were the same slot, which is only possible if the slot was empty.
+                // Every file-cap read/write then failed before reaching `fs`, and two negative
+                // sub-checks "passed" vacuously because no invoke could get that far.
+                //
+                // A remove-by-stale-index can bite ANY request whose reply carries a cap, not just
+                // fcap. The abort and timeout paths below still remove it: there the send never
+                // delivered, so the cap IS still ours.
                 return ReqOutcome::Reply(r);
             }
             while let Some(b) = self.try_console_read() {
@@ -819,7 +834,22 @@ impl ServiceContext {
             // actually use (the "press q to abort" hint), so it is the one that kept core 0 permanently
             // busy during a continuous ping and starved the idle-path USB hot-plug watch.
             if let Some(r) = self.try_recv() {
-                self.remove_cap(reply_cap);
+                // DO NOT remove the reply cap on a REPLY. The send already removed it.
+                //
+                // §8.5: a cap embedded in a message "is transferred and REMOVED from sender's table".
+                // The instant the request went out this slot stopped being ours, and by the time the
+                // reply lands the kernel has REUSED it - `CapTable::insert` hands out the first EMPTY
+                // slot, and this one is empty. When the reply carries an embedded cap (a file cap from
+                // `fs`), that cap lands in exactly this slot, so removing "the reply cap" DELETES IT.
+                //
+                // Measured on the Pi 4: `fcap` printed `file=12 reply=12` - the file handle and the
+                // next derived cap were the same slot, which is only possible if the slot was empty.
+                // Every file-cap read/write then failed before reaching `fs`, and two negative
+                // sub-checks "passed" vacuously because no invoke could get that far.
+                //
+                // A remove-by-stale-index can bite ANY request whose reply carries a cap, not just
+                // fcap. The abort and timeout paths below still remove it: there the send never
+                // delivered, so the cap IS still ours.
                 return ReqOutcome::Reply(r);
             }
             while let Some(b) = self.try_console_read() {
@@ -1519,7 +1549,23 @@ impl ServiceContext {
         // `right` is a u8, so the whole thing lands in 24 bits with 8 to spare. This is the A-U1
         // rule from arch/arm/CLAUDE.md: on a 32-bit ABI, a syscall argument that does not fit in one
         // register must be narrowed at the wrapper, never assumed to survive.
+        // REJECT a handle that does not fit its field instead of letting it corrupt the next one.
+        //
+        // Each slot gets 12 bits. A handle above 4095 does not simply get truncated - its high bits
+        // land in the NEXT field. The `fcap` forged-handle check passes 60000 (0xEA60) and the kernel
+        // logged `file_slot=2656 reply_slot=14`: the 0xE spilled out of `file` and rewrote `reply`, so
+        // a bad file handle silently redirected the REPLY to whatever cap happened to sit in slot 14.
+        // The invocation was rejected for the right reason by luck, not by design.
+        //
+        // A slot above 4095 cannot be valid anyway (MAX_CAPS_PER_TASK is 64), so this rejects with the
+        // same error the kernel gives for a slot it does not hold - the caller sees no difference,
+        // and no neighbouring field is ever silently rewritten.
+        const SLOT_MAX: u32 = 0xFFF;
+        if file.0 > SLOT_MAX || reply.0 > SLOT_MAX {
+            return Err(crate::ipc::i64_to_ipc_error(-2)); // -2 = capability not held
+        }
         let packed = ((right as u64) << 24) | ((reply.0 as u64) << 12) | (file.0 as u64);
+
         let payload = msg.payload_bytes();
         // SAFETY: syscall(31) = ResourceInvoke; packed + payload are user values the kernel
         // validates (cap slots, rights, generation, and the message bounds) before acting.

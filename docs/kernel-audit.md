@@ -5,6 +5,611 @@
 
 
 
+## Audit 11 - the Audit 10 fixes, and two syscalls added then reverted (2026-08-11, `feat/pi4-aarch64` @ `f67f5c15`)
+
+**Why now.** Audit 10 (2026-08-09 @ `f718e5a1`) recorded 4 HIGH / 9 MED / 7 LOW and fixed none of them
+by design. Two were then fixed - A10-1 (the panic that halted nothing) in `ff3004cc`, and the SEC-35
+half of A10-4 (the pending-cap FIFO) in `755218a5` - and a third change, the console-write counter and
+`ConsoleReadTimeout` syscall, was **added and then reverted** (`9a233ad7` + `6231e21c`, reverted by
+`a7be98da`). A fix is exactly where a fresh defect hides, and a partially reverted syscall is a live
+hazard, so both classes are re-audited against source rather than against their commit messages.
+
+**Scope.** Everything committed to `kernel/` since Audit 10's base, which is `f718e5a1..f67f5c15` (note:
+the task named `5426c6db`, which is the *docs* commit recording Audit 10; the kernel commits under audit
+sit between the two). That is six commits touching two files: `arch/aarch64/mod.rs` (+37/-3) and
+`task/scheduler.rs` (+13). Everything else in the range is `services/` and `scripts/`, which a kernel
+audit does not cover. The blast radius of each change was followed outside the diff (the tick path, the
+slot-claim paths, all four cap-delivery sites, and the other arches' `halt_all_cores`).
+
+**Method.** Read each change against the mechanism it claims, then trace the claim to its call sites.
+For every finding: "what makes this fire, and can that condition occur in the failing case?" Two
+candidate findings were discarded for failing that test and are recorded under "checked and rejected".
+
+**North star unchanged:** nothing above the kernel may panic or wedge it.
+
+**Verdict: 2 HIGH, 3 MED, 3 LOW. The reverts are CLEAN.** Both HIGH are the same defect: A10-1 is
+**still open**, because the fix reaches exactly one core on one arch.
+
+### Findings
+
+| ID | Sev | Commandment / section | Finding |
+|----|-----|----------------------|---------|
+| A11-1 | **HIGH** | V, §19, §6.2 | The A10-1 panic fix parks only **core 0**. `PANIC_HALT` is checked inside `uart_rx_poll`, which `timer_tick_from_irq` calls under `if cid == 0`. Every AP keeps scheduling for ~10 s, then self-panics with a misleading `LIVENESS WEDGE`. |
+| A11-2 | **HIGH** | V, §19, §6.2 | The fix did not travel to **arm32**, where `halt_all_cores` is still `loop { spin_loop() }` - unmasked and unsignalled - on a port that runs 4-core SMP on real hardware. |
+| A11-3 | MED | Inv 12, §26.7 | The EL1-fault park (`exceptions.rs:689`) does not publish `PANIC_HALT`. A10-1 named it as the same class; it was not covered. |
+| A11-4 | MED | VII, §26.4 | SEC-35 closed only the **cross-life** half of A10-4. The within-life FIFO desync is unfixed in the kernel, and the kernel still offers no way for a receiver to resynchronise. |
+| A11-5 | MED | VII, Inv 12, §8.5 | All four cap-delivery sites install the embedded cap and push its FIFO slot **before** the user copy, then `return -1` if the copy faults. The receiver never sees the message, keeps the cap, and is one FIFO entry ahead - a desync no userspace discipline can avoid. |
+| A11-6 | LOW | §26.4 | `PANIC_HALT` is unread on the non-`pi4` aarch64 build: `uart_rx_poll` is an empty stub there and `liveness_deadline_cycles()` is 0, so nothing ever observes the flag and nothing says so. |
+| A11-7 | LOW | III | `scheduler::enqueue` is a second slot-claim path that sets `TASK_VALID = true` without the SEC-35 reset. Dead today (zero callers, `#[allow(dead_code)]`); reviving it silently reopens SEC-35. |
+| A11-8 | LOW | III | `TASK_LAST_BADGE` is the other per-slot leftover A10-18 named. SEC-35 reset the FIFO count beside it and left the badge. Latent, not currently reachable. |
+
+### The two HIGH, in full
+
+**A11-1. The panic fix parks core 0 and nothing else.** `arch/aarch64/mod.rs:1409` now sets
+`PANIC_HALT` and parks the panicking core with `msr daifset, #0xf` - both correct, and the panicking
+core genuinely stops. The other half does not work. The check is at `mod.rs:1765`, inside
+`uart_rx_poll`, and `uart_rx_poll` has exactly one caller in the tree: `scheduler.rs:1172`, which sits
+inside `if cid == 0`. The function's own doc line one line above says so ("Called from the core-0 timer
+tick"). So on a 4-core Pi 4 a panic stops the panicking core immediately and core 0 at its next tick;
+**the remaining two or three cores never load the flag** and carry on scheduling user tasks over the
+state the kernel just declared corrupt. The idle path does not help: `wait_for_interrupt`
+(`mod.rs:2215`) is a bare `wfi` with no check. The fix's own doc comment (`mod.rs:1393`) asserts the
+mechanism that does not exist - "`PANIC_HALT` is published for every other core; the timer tick checks
+it and parks the core" - which is the §18.3 / §26.4 drift class in its most dangerous form: a comment
+that would stop the next reader from looking.
+
+The machine does eventually stop, and the way it stops is itself a finding. Core 0 parks *inside*
+`uart_rx_poll`, which runs **before** `CORE_LAST_TICK_TSC` is stamped (`scheduler.rs:1195`) and before
+the watchdog loop (`:1214`), so core 0 stops stamping too. `liveness_deadline_cycles()` on `pi4` is
+`timer::frequency() * 10`, so roughly **10 seconds** later each surviving core notices the two dark
+cores and panics with `LIVENESS WEDGE: core N made NO progress`, which names a *victim* of the original
+panic rather than the panic. Only then does that core call `halt_all_cores` and park. Two consequences
+in the meantime: services keep running (including storage writes) for ten seconds past a panic, which is
+precisely the silent-corruption window §6.2 panics to prevent; and because core 0 is gone,
+`control::process_pending()` and `scan_timed_wakes()` stop, so every task blocked in `recv_timeout` or
+`sleep` on the surviving cores never wakes. **CONFIRMED** by reading `mod.rs:1760-1774`,
+`scheduler.rs:1170-1177` and `:1194-1230`; the ten-second cascade is CONFIRMED as code, not observed on
+hardware. The fix is to move the check into `timer_tick_from_irq` itself (or into the idle path), where
+every core passes, not into a core-0-only helper. Note the residual either way, since the user asked:
+a core spinning with IRQs masked - inside `smp::without_interrupts` on a lock the panicked core still
+holds - takes no tick and parks never; it spins at full power forever. A flag checked on the tick cannot
+reach it, which is the cost the fix's own comment names when it chose a flag over an SGI.
+
+**A11-2. arm32 still has A10-1 verbatim, and it is the port that ships on hardware today.**
+`arch/arm/mod.rs:793` is `pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }` - the
+exact body A10-1 was raised against. The neutral `#[panic_handler]` (`main.rs:360-363`) is shared, so
+an arm32 panic prints `KERNEL PANIC` and enters that loop with **DAIF untouched**. A panic taken with
+interrupts live (the boot path after `enable_interrupts`, or any kernel code resumed by
+`block_and_reschedule`, which ends `switch_context(...); enable_interrupts();`) is therefore
+preemptible: `irq.rs:271` calls `timer_tick_from_irq`, the scheduler switches that core to another
+task, and the machine runs on past its own panic. Nothing signals the other cores, and `mod.rs:416`
+puts them all in `scheduler::run`. Worse than the aarch64 case in one specific way: because no core ever
+stops stamping, arm32's liveness watchdog (`mod.rs:879`, `timer_hz() * 10`) **never fires**, so there is
+no ten-second backstop - the panic is simply absorbed. This is pre-existing rather than introduced by
+the range under audit, and it is recorded here because the range is precisely where it should have been
+closed: the fix was written for one arch when the defect was known to be shared, and the other five
+`halt_all_cores` stubs (riscv32/64, loongarch64, s390x) carry the same body. Those four are
+demarcation targets that do not run an OS; arm32 is not. **CONFIRMED** code state; the preemption is
+CONFIRMED as reachable by construction, not reproduced.
+
+### The MED findings, in brief
+
+- **A11-3.** `exceptions.rs:685-692` is the EL1-fault park: `put_str("halting.")` then
+  `loop { wfe }`. Verified that this core *does* stop - AArch64 masks DAIF on exception entry and
+  nothing in the handler unmasks it (`exceptions.rs` has one `daifset, #3` and one `daifclr, #4` for
+  the SError probe window, no general unmask) - so unlike A10-1's original claim this park holds. What
+  it does not do is set `PANIC_HALT`, so a kernel data abort at EL1 leaves every other core scheduling
+  with no signal at all, and the machine relies entirely on the ten-second watchdog cascade of A11-1. A
+  one-line `PANIC_HALT.store(true, Release)` before the loop puts it on the same footing as `panic!`.
+  A10-1 called this out by file and line; the fix did not include it.
+- **A11-4.** `reserve_task_slot` (`scheduler.rs:485`) is the right place and is **sufficient for the
+  case it claims**: verified that it is the only *live* slot-claim path (`task/mod.rs:3492` is the
+  neutral spawn; the six arch bring-up spawners all call it; the only other `TASK_VALID = true` is dead,
+  see A11-7), the write precedes the `Release` publish so it cannot race a reader, and no other core can
+  be pushing into a slot whose `TASK_VALID` is false. But A10-4's mechanism had two halves, and this is
+  the cross-life one. The within-life half - a receiver that *discards* a cap-bearing message leaves the
+  cap installed and the FIFO one entry ahead, forever - is untouched in the kernel. It is now closed
+  only by each service's own discipline (`shell` drains at three sites, `755218a5`), and A10-4's second
+  point still stands unanswered: `try_recv` does not report that a cap rode along, and `RemoveCap`
+  clears the table entry but not the FIFO, so a service that gets it wrong has **no primitive to
+  resynchronise with**. Every consumer of `take_pending_cap` in the tree (`fs`, `net-stack`,
+  `block-driver` x3, `nic-driver` x4, `xhci`, `shell`, `probe`) is one forgotten `continue` away from
+  the SEC-35 shape. Whether that is a kernel API defect or a service obligation is a real design call;
+  what it cannot be is unrecorded, because SEC-35's commit reads as though the class is closed.
+- **A11-5.** A kernel-only instance of the same desync, which no service discipline can avoid.
+  `dispatch.rs:333-346` (`handle_recv`), `:386-398` (`handle_try_recv`), `:446-457`
+  (`handle_recv_timeout`) and `:1093-1104` (`handle_call`) all run the same sequence: install every
+  embedded cap into the receiver's table, push its slot onto the FIFO, **then** `write_user_bytes` the
+  payload, and on failure `return -1` / `break -1`. The copy can fail: `validate_user_ptr` is a range
+  check, so a buffer that is in range but unmapped passes it and faults in the copy (that is the whole
+  reason the user-copy fixup exists). The receiver then gets `-1`, has no message, and has silently
+  gained a capability at a table slot it was never told about plus a FIFO head that is not its next
+  reply cap. It is self-inflicted and bounded (the receiver's own 64-slot table), so it is not an
+  escalation across principals on its own - but it produces exactly the SEC-35 state *within one task
+  life*, on the kernel's side of the boundary, and it is reachable deliberately. Note the sender's view
+  too: the cap was already removed from the sender's table and the sender was told `Ok` (§8.5), so this
+  is the A10-5 silent-transfer class as well. The ordering is trivially fixable: copy first, install
+  after.
+
+### The LOW findings
+
+- **A11-6.** `mod.rs:1758-1785`: the `PANIC_HALT` check lives in the `#[cfg(feature = "pi4")]`
+  `uart_rx_poll`; the `#[cfg(not(feature = "pi4"))]` body is `pub fn uart_rx_poll() {}`. The QEMU `virt`
+  aarch64 build (the arch-demarcation target, `docs/multi-arch.md`) therefore sets a flag nothing reads,
+  and its `liveness_deadline_cycles()` is 0 so there is no watchdog backstop either. That target does
+  not run a full OS today, which is why this is LOW and not part of A11-1 - but it is the "silent stub"
+  shape this port has already been bitten by twice (A10-9), and a reader of `halt_all_cores` gets no
+  hint that its second half is feature-gated away.
+- **A11-7.** `scheduler.rs:574-602`, `enqueue`, sets `TASK_CTX`/`TASK_CAP`/`TASK_STATE = Ready` and
+  `TASK_VALID[i] = true` for a free slot, with no `TASK_PENDING_RECV_CAP_COUNT` reset. Verified to have
+  **zero callers** in the kernel, and it is marked `#[allow(dead_code)]`, so SEC-35 is not open through
+  it today. Recorded because the fix's own comment says "that is the one point every task life begins
+  at" - true of the live path, false of this one - and because this function also publishes `TASK_VALID`
+  *before* writing `TASK_CORE`/`TASK_IS_USER`/`TASK_KERNEL_STACK_TOP`, which is the SEC-25 ordering
+  inverted. Delete it, or fix it to match; leaving a dead constructor that violates two invariants the
+  live one upholds is a trap for whoever revives it.
+- **A11-8.** `TASK_LAST_BADGE` (`scheduler.rs:235`) is per-task-slot and is not cleared at slot claim,
+  so a reused slot inherits the dead occupant's badge. Verified **not currently reachable**: every
+  delivery site calls `set_last_recv_badge` (which writes 0 for an unbadged message) before the
+  receiver can act, `take_last_recv_badge` swaps to 0 on read, and all three in-tree consumers
+  (`fs:568`, `net-stack:992`, `examples/resource-server:102`) read it immediately after a `recv`. It
+  becomes live the moment a service reads the badge before its first receive. A10-18 asked for these two
+  to be fixed together; one was.
+
+### Verified CLEAN
+
+- **Both reverts are byte-clean.** `git diff f718e5a1..HEAD -- kernel/` contains no trace of either
+  reverted feature, and `git diff 5426c6db..HEAD -- kernel/` is **empty** - the add and the revert
+  cancel exactly. Checked positively as well as by diff: `SyscallNumber` (`dispatch.rs:22-76`) ends at
+  `SetClock = 50` with no 51 and no gap, the dispatch match has no orphan arm, `InspectKernel`'s query
+  match tops out at 22 with no 23, and a repo-wide grep for `ConsoleReadTimeout`, `console_read_timeout`,
+  `console_write_seq`, `CONSOLE_WRITE_SEQ` and "query 23" returns nothing in kernel, SDK, services or
+  docs. No half-removed static, no dangling enum variant, no stale comment describing the removed
+  mechanism. The SDK and shell halves came out with it. This is the class the audit was asked to watch
+  for and it is genuinely absent.
+- **`park_core_forever`'s SAFETY comment is accurate as written.** "Masking DAIF and halting is always
+  valid at EL1" holds (`msr daifset` is unprivileged-at-EL1 and `wfi` needs no trap consideration here);
+  "this never returns, so no state is left inconsistent by the mask" is true of the *mask* specifically,
+  which is what the comment claims. The state that IS abandoned - the unstamped liveness counter, any
+  lock the core held - is a consequence of parking, not of the mask, and is recorded under A11-1 rather
+  than as a false SAFETY claim. The `-> !` and the infinite `wfi` loop are correct; `wfi` waking
+  spuriously with DAIF set simply re-enters the loop.
+- **The SEC-35 reset is correctly ordered and race-free.** It is inside the `TASK_SLOT_LOCKED` critical
+  section, inside `smp::without_interrupts`, and precedes the `Release` store of `TASK_VALID`; the slot
+  it writes has `TASK_VALID == false`, so no core can be running that task and no `push_pending_recv_cap`
+  can target it (both index by `CORE_CURRENT`). Leaving `TASK_PENDING_RECV_CAPS` itself stale is fine -
+  a count of 0 makes the entries unreachable and the next push overwrites index 0.
+- **No new syscall, no new capability, no new unbounded loop, no count-where-a-duration-belongs.** The
+  range adds one `AtomicBool`, one `-> !` helper and one array store. The only new loop is
+  `park_core_forever`'s, which is deliberately infinite. Nothing in the range validates less than it
+  did.
+- **Mechanical guards all PASS.** `unsafe_check.py` (72 audited files, 1096 unsafe lines, no unaccounted
+  additions - one line up from Audit 10's 1095, which is the `park_core_forever` block and is accounted
+  for). `arch_boundary_check.py` passes. Kernel builds clean on
+  `aarch64-unknown-none --features pi4,pi4-smp --release` (87 warnings) and `x86_64-unknown-none
+  --release` (75 warnings). The six `unused import` warnings of A10-16 are unchanged in identity - the
+  dead-import commit `34bc8233` removed arch-local ones, and the six that remain are the five neutral
+  ones plus the deliberate `epoch_secs` seam re-export A10-16 said to KEEP.
+
+### Checked and rejected (stated so nobody re-finds them)
+
+- **"`handle_call` writes up to 4 KiB into a caller buffer whose length it never checks."** It reads
+  `copy_len = payload.len().min(MAX_MESSAGE_SIZE)` and ignores `recv_len` - which looks like a missing
+  bound until you read `dispatch.rs:1047`, where the buffer is validated for the **full**
+  `MAX_MESSAGE_SIZE` precisely because it is in/out. The comment above it says so. Not a bug.
+- **"The SEC-35 reset can be skipped by a slot reused without `reserve_task_slot`."** Traced every
+  `TASK_VALID[..].store(true, ..)` (two sites) and every caller of `reserve_task_slot` (eight). The
+  only bypass is dead code, recorded as A11-7 rather than as a live hole.
+
+### NOT audited (honest coverage)
+
+- **No hardware run, and no panic was induced.** A11-1 and A11-2 are read from source and from the call
+  graph. Forcing a panic on an AP and watching whether the machine stops is one boot and is the cheapest
+  way to convert A11-1 from confirmed-by-reading to confirmed-by-observation - and it is exactly the
+  repo's own standing lesson that an unfired guard is not evidence.
+- **The eighteen open Audit 10 findings were not re-verified**, only the two that were fixed. A10-2
+  (the per-core user-copy fixup), A10-3 (the break-before-make block split) and A10-4's remaining half
+  are all still open as recorded there; A11-4 and A11-5 extend A10-4 rather than replacing it.
+- **`services/` and `scripts/` changes in this range are out of scope** by construction. The shell half
+  of SEC-35, the xhci heartbeat, the net-stack link work and the selfcheck clock probe are
+  userspace-audit material and this pass gives them no coverage.
+
+### Process note
+
+Both HIGH findings are the same shape, and it is worth naming because it recurs: **a fix verified
+against the function it edits rather than against the call site that runs it.** A10-1's fix is correct
+code in the wrong place - one grep for `uart_rx_poll`'s callers (there is one, under `if cid == 0`)
+would have caught it before the commit message claimed "every core". A11-2 is the same omission one
+level up: the defect was described as a class in Audit 10 and fixed as an instance. The cheap
+mechanical habit that catches both is the one this repo already knows - after writing a fix, grep the
+thing it depends on and read every caller, then ask which cores, which arches, and which build
+configurations actually reach it.
+
+## Audit 10 - the AArch64 port, second pass: after the USB driver left the kernel (2026-08-09, `feat/pi4-aarch64` @ `f718e5a1`)
+
+**Why now.** Two things changed since the aarch64 Audit 7 (2026-08-05, five findings, all fixed).
+`kernel/src/arch/aarch64/xhci.rs` was **deleted** - 2742 lines of ring-0 USB moved to
+`services/xhci` (`e71e64a6`), closing Commandment I on this port - and the in-kernel GENET driver
+went the same way (`0ae2cb71`). Deleting ring-0 code removes findings; it also moves the
+*boundaries*, and a boundary that moved without being re-examined is where the next defect lives.
+Audit 7 additionally recorded four things it had **not** covered; three of them are answered below.
+
+**Scope.** The whole of `kernel/src/arch/aarch64/` (8544 lines across 21 files), `syscall/dispatch.rs`
+in full, `capability/`, `ipc/`, and this branch's changes to `task/` + `memory/` + `smp/`.
+
+**Method.** Four independent auditors, one per surface (fault + user-copy seam; MMU + page tables;
+the arch surface and its devices; the neutral syscall/cap/ipc layer), then a lead pass that
+**re-verified every finding against source before recording it**. Findings that could not be given a
+concrete trigger were discarded; two were downgraded, and one auditor claim was corrected outright
+(see the note under A10-13). The default verdict was not-a-bug.
+
+**North star unchanged:** nothing above the kernel may panic or wedge it.
+
+**Verdict: 4 HIGH, 9 MED, 7 LOW. None fixed here - this is a report, not a change.** The four HIGH
+are each userspace-reachable or architecturally unsound, and two of them (A10-1, A10-2) mean the
+kernel's *last-resort* behaviour - the loud stop - does not work on this port.
+
+### Findings
+
+| ID | Sev | Commandment / section | Finding |
+|----|-----|----------------------|---------|
+| A10-1 | **HIGH** | V, §19, §6.2 | `halt_all_cores()` on aarch64 halts nothing. A kernel panic leaves the other three cores scheduling, and does not even mask the panicking core's interrupts. |
+| A10-2 | **HIGH** | Inv 12, §18.3 | The user-copy fault fixup is per-CORE, but a user copy **is preemptible**: a syscall resumed after blocking runs with IRQs live. A second task's copy clears the fixup out from under the first. |
+| A10-3 | **HIGH** | §26.6, X | A live 2 MiB block is converted to a table **with the MMU on and no break-before-make**, and the TLBI is deferred to the end of 224 iterations. The fix for this was written, reverted, reapplied, and reverted again, with no rationale in either revert. |
+| A10-4 | **HIGH** | VII, §7.3, §26.4 | The pending-received-cap FIFO is uncorrelated with the message that delivered the cap and is never reset - a capability **identity** confusion the kernel's API makes unavoidable. This is the likely root cause of the open `fcap` post-restart escalation. |
+| A10-5 | MED | Inv 12, §26.7 | A transferred capability is **silently destroyed** when the receiver's table is full - the sender was told `Ok` and has already lost it. Its twin drops the *slot number* and leaks the slot. |
+| A10-6 | MED | VII | `nic-driver` gained `hw_irqs: &[0x2A]` on this branch; the death path's `dead_irq` is a hardcoded name match on `xhci`/`ehci`, so the GENET route outlives the driver and is inherited by whichever service next takes the recycled endpoint id. |
+| A10-7 | MED | IX, §26.3 | Audit 7's A10-4 TLB-invalidate guard sits on `PageTable::unmap`, whose **only caller is the boot selftest**. The runtime frame-return paths do not invalidate. |
+| A10-8 | MED | I, III | `reclaim_pages` frees device-MMIO and DMA-arena leaves into the RAM frame allocator; x86's counterpart explicitly skips them, with a comment naming the bug it fixed. Contained today only by the allocator's phantom-frame rejects. |
+| A10-9 | MED | §18.1 (H4) | aarch64 never calls `kernel_main`, so `harden_hhdm_nx` and `audit_wx` never run - and the high-half direct map is built EL1-RW with **no PXN**. Kernel W^X does not exist on this port, and nothing says so. |
+| A10-10 | MED | VII, §18.3 | The **bring-up demo syscall range is live in the production build**: any EL0 task can `svc` with `x16 >= 0x1000` and reach handlers whose SAFETY comments assert "the demo is the only caller". |
+| A10-11 | MED | VI, §18.3 | The console input ring has **three producers on three different cores** under a comment that says it has one. Non-atomic RMW of `RX_TAIL`. |
+| A10-12 | MED | VIII, §26.6 | `mailbox::call()`'s reply loop **cannot reach its own bound** on one path - `spins` advances only inside an inner wait the path skips. |
+| A10-13 | MED | VIII ("a count is not a duration") | Five hardware waits bounded by an iteration count, one of them on the **runtime** log path - `put_byte`, on every `kprintln` and on the panic path. |
+| A10-14 | LOW | X, §26.4 | Doc-drift and dead references left by the `xhci.rs` deletion - six distinct stale claims, two of them mutually contradictory twenty lines apart. |
+| A10-15 | LOW | §26.6 | `AllocMem` leaks the data frame when the mapping fails: neither freed nor in any page table, so death-time reclaim cannot find it. Ungated syscall; worst exactly under memory pressure. |
+| A10-16 | LOW | X | Six `unused import` warnings, judged individually - five neutral and pre-existing, one a deliberate seam item. See the verdict below. |
+| A10-17 | LOW | §26.4 | Three exception-vector doc blocks assert the **opposite** of the EL0-kill path added this cycle ("Deliberately does not return. Nothing here can handle a fault yet"). |
+| A10-18 | LOW | III | `TASK_LAST_BADGE` and the pending-cap FIFO are per-task-**slot** state that survives the task. Same class as A10-4; fix together. |
+| A10-19 | LOW | §26.4 | `kernel/src/syscall/CLAUDE.md` lists the ungated `InspectKernel` queries as 0, 3, 9-13; the code ungates 0, 3, 9-22. A doc that says "there are no exceptions" must enumerate the real set. |
+| A10-20 | LOW (PLAUSIBLE) | Inv 12 | `gic::init()` never clears `GICD_ICENABLERn`, so an SPI the armstub left enabled fires into a generic arm that cannot mask what it has no route for - a level source would then re-enter forever. |
+
+### The four HIGH, in full
+
+**A10-1. A kernel panic on aarch64 does not stop the machine.** `arch/aarch64/mod.rs:1383` is
+`pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }`. The neutral `#[panic_handler]`
+prints `KERNEL PANIC` and calls it. Nothing is sent to the other three cores, so they keep scheduling
+tasks over the state that just panicked; and because the loop does not `msr daifset`, a panic taken
+with interrupts live - the boot path after `enable_interrupts`, or any kernel code resumed by
+`block_and_reschedule`, which re-enables them - is **preemptible**: the timer PPI fires 10 ms later,
+`timer_tick_from_irq` switches that core to another task, and the machine simply carries on past its
+own panic. §19 requires the opposite in as many words ("the panic path broadcasts an NMI so **every**
+core halts"), and §6.2 makes a panic the response to already-corrupted shared state. This is exactly
+SEC-18, which was found HIGH on x86, fixed, and hardware-verified on the T630; x86's version is
+`broadcast_nmi_all_but_self()` + `cli` + `hlt`. `exceptions.rs:689` (the EL1-fault park) is the same
+class: one core stops, the rest run on. GICv2 has no NMI, so the fix is a halt SGI plus the DAIF mask.
+**CONFIRMED** by reading both arches. Trigger: any `panic!` - the liveness watchdog, an allocator
+invariant, a neutral assert - all runtime-reachable.
+
+**A10-2. The user-copy fixup is per-core; the copy it protects is not.** `uaccess.rs` arms
+`FIXUP[core_index()]` with a recovery label, runs a byte-at-a-time loop of up to 4096 iterations, and
+disarms on exit. Its SAFETY comment (`uaccess.rs:127`) justifies the per-core slot with "interrupts do
+not re-enter a user copy on the same core (a syscall runs with the caller's core to itself until it
+returns)". **That claim is false.** Exception entry masks `DAIF.I`, but `block_and_reschedule` ends
+`switch_context(...); enable_interrupts();` (`scheduler.rs:1620-1621`), so a syscall that blocked and
+was woken runs the rest of itself with IRQs live - and the rest is where the copy is:
+`handle_recv` reaches `write_user_bytes` at `dispatch.rs:344` *after* its
+`block_and_reschedule(BlockedOnRecv)`, and `handle_call` the same at `:1103`. The interrupted ring is
+not consulted: `timer_tick_from_irq`'s `_interrupted_cs` is unused on every arch, and aarch64 passes
+`(0, 0, 0)` anyway. So the timer preempts mid-copy, the interposing task performs any user copy of its
+own and stores `xzr` to the same per-core slot, and when the first task resumes and faults on a later
+byte, `take_fixup()` returns `None`, `from_el0` is false, and the core parks in the `wfe` loop -
+which the liveness watchdog then turns into a panic that (A10-1) does not halt anything.
+Trigger: a service passes a `recv` buffer whose tail crosses into an unmapped page, blocks, is woken
+with a full 4 KiB payload, and retries until a tick lands in the window - tens of microseconds out of
+a 10 ms quantum, so a few thousand attempts. The mirror-image leak is live too: a task switched away
+with the fixup still armed redirects the *next* genuine EL1 abort on that core into a recovery label
+with unrelated register state, which is the opposite of the "a later kernel bug still halts loudly"
+property the comment claims. **CONFIRMED** (race-dependent, attacker-repeatable). **Not purely
+aarch64:** x86's `USER_COPY_ACTIVE` is per-core with the same assumption and the same post-block
+window, and there the lost flag lands in `pf_handler`'s `KERNEL PF` arm and `halt_all_cores()` - which
+on x86 really does halt the machine. The comment must go either way; the fix is to mask IRQs across
+the copy, or key the fixup to the task rather than the core.
+
+**A10-3. The block split is the unsound version, and the fix has been reverted twice.**
+`unmap_high_4k` (`mmu.rs:676`) meets a live `DESC_BLOCK` in the high half, builds an L3 table
+reproducing it, and at `:701` overwrites the **live** L2 block descriptor with a table descriptor.
+The only TLB maintenance is a single `tlbi vmalle1is` at `:732`, after all 224 guard pages are done.
+Between the store and that invalidate the TLB may hold the 2 MiB block entry and a freshly walked
+4 KiB entry for the same VA. AArch64 requires break-before-make for a change of block size, and the
+Cortex-A72 is Armv8.0 - no FEAT_BBM level 2 to excuse it - so the outcome is CONSTRAINED
+UNPREDICTABLE: a TLB conflict abort at EL1 (which A10-1 turns into a machine that limps on past a
+panic), or an amalgamated translation. There is a second consequence worth naming on its own: a stale
+block entry keeps **translating the guard page**, so the guard is silently absent - and the check that
+verifies it (`entry_for_va`) is a software walk of the tables, not of the TLB, so it reports
+`guard_unmapped=true` either way. The trigger is every boot: `install_kstack_guards` runs at
+`mod.rs:832`, after `mmu::enable()` and after `jump_high`, so the core is executing from the high
+half, standing on a high-half stack, and repointing the blocks that describe its own `.bss`. `9e74cd46`
+fixed this properly - pre-split the pool's blocks in `enable()` while the MMU is off, then refuse and
+report a live block at guard time - and was reverted (`ee50f6cb`), reapplied (`b15a1277`), and
+reverted again (`40d4a4a4`). **Both reverts are bare `git revert` messages with no rationale**, so
+nothing in the history says whether the fix broke a boot or was undone by accident. That is the part
+to fix first: a correctness fix removed without a recorded reason is indistinguishable from one nobody
+decided about. Note the naive repair is also wrong (a break-before-make on the block you are standing
+on is fatal), which is why the pre-split shape is the one that works. **CONFIRMED** code state and
+architectural violation; the abort itself is **PLAUSIBLE**, not observed.
+
+**A10-4. The pending-received-cap FIFO cannot say which message a cap came from - and this is very
+likely the open `fcap` escalation.** `TASK_PENDING_RECV_CAPS` / `..._COUNT` (`scheduler.rs:228-231`)
+are per-task-slot statics with exactly two writers: `push_pending_recv_cap` and
+`pop_pending_recv_cap`. Nothing clears them - not `reserve_task_slot`, not `commit_task`, not the kill
+path - and no recv path drains them. Meanwhile all four delivery sites (`handle_recv`,
+`handle_try_recv`, `handle_recv_timeout`, `handle_call`) install **every** embedded cap of **every**
+delivered message into the receiver's table and push its slot, whether or not the receiver wanted the
+message. So a receiver that *discards* a message keeps the cap and leaves a slot number at the head of
+the FIFO forever, and `TakePendingCap` has no way to ask for "the cap from *this* message".
+
+The concrete trigger is the one the branch's own `fcap-diag` instrumentation was added to chase.
+`services/shell/src/main.rs` opens both `fc_invoke` and `sock_invoke` with
+`while ctx.try_recv().is_some() {}` - "clear any stale late-reply a prior aborted invoke left behind".
+An `fs` `Open` reply **embeds the file capability** (`fs/src/main.rs:2650`). After `chaos max-carnage`
+restarts `fs`, an aborted or timed-out open leaves its reply in flight; the next command's drain loop
+discards that message - but the kernel has already installed its file cap in the shell's table and
+pushed the slot. The next `fc_open` (`shell:8447`) then pops that **stale head** instead of the cap
+from its own reply, so an `open(path, READ)` hands back the handle of an earlier `open(path,
+READ|WRITE)`. The kernel then does exactly the right thing and reports WRITE for a cap the shell
+believes is read-only, and the write succeeds. That is precisely the reported symptom - `fcap` printing
+"ro cap wrote (escalation!)" only after a restart - and it matches the `[fcapr]` predicate written into
+`e4118dc3` for suspect 1 ("shell `holds` disagrees with kernel `cap_rights` for the same handle").
+
+Two things make this the kernel's finding rather than the shell's. First, **nothing above the kernel
+can resynchronise**: `try_recv` does not report that a cap rode along, and `RemoveCap` clears the table
+entry but not the FIFO, so no userspace discipline fully closes it. Second, the enforcement path is
+sound and was verified end to end - `handle_resource_invoke` validates the requested right against the
+held cap first, `is_delegated` is a pure band range check, the badge is set in exactly one place after
+validation, `narrow_embedded_for_receiver` strips GRANT from delegated caps, and `allocate`
+re-registers a reused band id at `prev_gen.bump()`. There is no rights bug to find; the defect is that
+a *handle* stopped naming the cap its holder thinks it names. **CONFIRMED mechanism; root cause
+STRONGLY INDICATED but not executed** - the audit did not run the `fcap` -> `kill fs` -> `fcap` repro.
+That repro, with `fcap-diag` on, is the cheap way to convert this from indicated to proven.
+
+### The MED findings, in brief
+
+- **A10-5.** All four delivery sites use `if let Ok(new_slot) = current_task_insert_cap(..)`, so a
+  receiver whose 64-slot table is full loses the cap entirely - while the sender has already had it
+  removed (§8.5) and was told `Ok`. Authority vanishes with neither side informed, which is the silent
+  fallback §26.7 forbids and the setup adversarial test A6 describes. One layer down,
+  `push_pending_recv_cap` (`scheduler.rs:743-747`) drops the slot **number** when its 4-entry buffer is
+  full while the cap stays installed, leaving an untakeable, unreclaimable table slot. Reachability is
+  bounded rather than open: `AcquireSendCap` hands `GRANT` only to `ACQUIRE_ANY` holders (shell,
+  supervisor, probes, chaos), so an ordinary service cannot mint a grantable cap to spray at a victim -
+  and `fs` drains one cap per message, so it does not overflow in ordinary use. Constructible from a
+  privileged instrument against a non-draining receiver (`logger`, `supervisor`); graded MED for that
+  reason, not downgraded, because the failure is silent either way.
+- **A10-6.** `spawn_service_with_config` registers a route for every `hw_irqs` entry;
+  `scheduler.rs:1910-1914` unregisters by `match task_name { "xhci" => 0x28, "ehci" => 0x29, _ => 0xFF }`,
+  and the comment directly above it - "block-driver + nic-driver currently declare no hw_irq" - was made
+  false by this branch (`task/mod.rs:750-754`). `free_endpoint_id` then recycles the id immediately.
+  `interrupt/route.rs:49-55` documents this exact hazard as the reason `unregister` exists. Not a wedge
+  (delivery masks the level line first, and only the registered endpoint may `IrqUnmask`), but GENET
+  interrupt messages land in a service holding no `hw_interrupt` capability. Found independently by two
+  auditors. Fix: drive `dead_irq` off the service's own `hw_irqs`, not a name match.
+- **A10-7.** `ptables::unmap` carries the correct A7-4 sequence (`dsb ishst`, `tlbi vaae1is`, `dsb ish`,
+  `isb`, then construct the `Frame`) and the operand form is right for `pi4-smp`. It has exactly one
+  caller in the kernel: `mod.rs:709`, inside `ptable_selftest`. The runtime paths are `reclaim_pages`
+  and `free_all`, neither of which invalidates. The guard is real, correct, and **not on the road** -
+  the trap this audit was told to watch for. What actually closes the hazard is
+  `free_page_table_root`'s broadcast `vmalle1is` before `free_all` (added for the respawn fault, and
+  correct), so this is a MED gap rather than a live UAF - except on the **self-kill** path, where
+  `reclaim_user_frames` frees every leaf inline while `free_page_table_root` (and therefore the
+  broadcast) is deferred to `drain_pending_pml4`. Related and worth fixing in the same pass:
+  `reclaim_user_frames`'s `# Safety` says "with `TTBR0_EL1` switched away and invalidated", which the
+  self-kill caller does not satisfy - §18.3 requires the comment to be true.
+- **A10-8.** `mod.rs:1202-1234` maps `nic-driver`'s GENET window with `PageFlags::PCD`, and
+  `DMA_ARENA_UNCACHED = true` gives the DMA arena the same. `ptables::reclaim_pages` frees every valid
+  L3 leaf unconditionally; `x86_64/page_tables.rs:598-627` explicitly skips `PWT|PCD` leaves, with a
+  comment naming the chaos double-free it fixed. Traced and **contained today** - `allocator::free`
+  rejects the 0xFD58_0000 pages as phantom frames and the arena pages via the permanent DMA reserve -
+  so this is defence in depth doing load-bearing work, an over-reported `freed` count, and 16
+  `IGNORED phantom frame` lines per `nic-driver` kill that read like corruption during a chaos run.
+  arm32 had the identical gap and it was Audit 8's A8-2 HIGH; the difference here is that the SoC's
+  device window sits above top-of-RAM, which is luck, not construction.
+- **A10-9.** `kernel_main` has exactly one caller in the tree, `arch/x86_64/mod.rs:107`. So on aarch64
+  the neutral boot body never runs, and with it neither `harden_hhdm_nx` nor `audit_wx`. Independently,
+  `mmu.rs:317-318` builds every high-half RAM block `DESC_AP_RW_EL1 | DESC_UXN` - UXN but **no PXN** -
+  so all of physical RAM, including every user data frame and the kernel's own `.text`, is readable,
+  writable and executable at EL1 through the direct map. The `harden_hhdm_nx` stub is the established
+  shape on all six non-x86 arches, so it is not an aarch64 regression; the missing PXN is. The low map
+  carries a "W^X is a later refinement" note and the high map - now the only map - carries none, which
+  is the silent-stub class this port has already been bitten by twice.
+- **A10-10.** `usermode` is compiled under plain `feature = "pi4"` (unlike `sched_user` / `sched_demo` /
+  `sched_spawn`, which are demo-gated), and `aarch64_sync_lower_dispatch:575-578` routes every
+  `nr >= BRINGUP_SYSCALL_BASE` (0x1000) to `usermode::syscall` with no gate. Any EL0 task can therefore
+  reach handlers whose SAFETY comments read "single-threaded bring-up; the demo is the only caller"
+  (`usermode.rs:150,162,175,189`). In the shipping build the callers are arbitrary tasks on four cores,
+  so `CALLS`, `ECHO_OK`, `VERDICT_OK`, `REAL_DISPATCH_OK` are non-atomic `static mut` writes racing
+  across cores, and every call - including the unknown arm - drives a `put_str` line out of the PL011
+  with interrupts masked, where the neutral dispatcher would have returned `-1` silently. The one arm
+  that would be dangerous, `SYS_EXIT` (it resumes `CTX_KERNEL`), **is** correctly `DEMO_ACTIVE`-gated
+  and `run()` clears the flag on exit - verified, so the guard holds. The residual is the reachability
+  and the false safety claims.
+- **A10-11.** `uart_rx::drain` masks interrupts and states it "runs on the core that owns the ring, so
+  there is nothing to contend with". There are three producers: `uart_rx_poll` on core 0's tick,
+  `uart_rx_drain_now` from the ConsoleRead syscall on the *calling task's* core, and `push` from the
+  `xhci` service's core via `CONSOLE_PUSH` - with no masking at all. `without_interrupts` excludes only
+  the local core. All three do a non-atomic read-modify-write of `RX_TAIL`, so two producers can write
+  different bytes to the same slot and store the same `next`, and the tail can move backwards. Every
+  index is `% RX_BUF_SIZE`, so this is bounded corruption (a lost keystroke), not a wedge - but it is a
+  real `static mut` race whose justification comment is false, and **the exposure was increased by the
+  work under audit**: the keyboard producer used to be the same core-0 tick as the drain, and is now a
+  syscall from a userspace service on another core.
+- **A10-12.** `mailbox.rs:102-115` increments `spins` only inside the inner
+  `while status & MBOX_EMPTY != 0` wait. If the status register reads with EMPTY clear, that inner loop
+  is skipped entirely, `MBOX_READ` is read, the channel does not match, and the outer loop repeats -
+  forever, with `spins` never advancing and `MBOX_SPINS` structurally unable to fire. A mailbox absent,
+  held in reset, or reading back zero presents exactly this (status 0 = not empty, read 0 = channel 0).
+  The machine hangs inside `mailbox::query()` before the memory map, the framebuffer, or one further
+  log line. Boot-only and not reachable on a healthy Pi 4 - but it is a device-supplied register value
+  deciding when kernel code stops, with the bound unable to reach it.
+- **A10-13.** The repo's standing lesson is that a count is not a duration, and there are five here.
+  The one that matters is **runtime**: `put_byte` (`mod.rs:483-494`) spins up to 1,000,000 times per
+  byte waiting for TXFF - on every `kprintln`, every console write, and the panic path - so a UART that
+  stops draining turns each ~200-byte line into a stall of a length that differs on every machine, and
+  the liveness deadline is measured in real time. The other four are boot-only and less severe:
+  `pl011_init`'s 1,000,000-iteration BUSY wait, the 500,000,000-iteration timer proof, `MBOX_SPINS`,
+  and `hardware_reset`'s `n == 2_000_000` diagnostic threshold (which decides when the operator is told
+  the SoC did not reset). `pcie::delay_us` is the in-tree model that does it right: microseconds
+  through `timer::frequency()`, compared against `read_cycle_counter()`.
+  *(An auditor also reported `smp_boot`'s waits as count-bounded; re-verified and rejected -
+  `start_secondaries` and `report_cores_up` both bound on `read_cycle_counter()` against
+  `timer::frequency()`. They are clocks, and they are the pattern the five above should copy.)*
+
+### The LOW findings
+
+- **A10-14 (doc-drift from the deletion).** `mod.rs:1711-1714` and `sched_supervisor.rs:16-19` both say
+  "`xhci` is a placeholder that never spawns" - the supervisor now spawns it on every arch but arm32
+  (`e71e64a6`), so a reader is told the input-ready flag exists for a service that does not run.
+  `docs/aarch64.md:568` repeats it. `arch/mod.rs:9` says `hid` is shared with `arch/aarch64/xhci.rs`,
+  which no longer exists (and `hid` is now imported only by `arch/arm`). `wait_for_interrupt`'s doc
+  (`mod.rs:2184-2196`) still describes watching USB hub ports "from HERE" with 100 ms enumerations and
+  one-visit-per-second rate limiting; the body is a bare `wfi`. `mod.rs:1272` says the service is
+  "HID-only" while `mod.rs:950`, in the same file, prints that it drives HID *and* mass storage.
+  `mod.rs:2349-2353` says the only interrupt routed to userspace is an edge-triggered MSI needing no
+  masking, contradicted by `mod.rs:904` registering GENET level-triggered. And `mod.rs:470` / `:1075`
+  still carry "arch/aarch64 stubs pending real bodies. halting." as unreachable statements (the
+  compiler says so - two `unreachable statement` warnings).
+- **A10-15.** `dispatch.rs:1305-1321`: `alloc_frame()` succeeds, `zero_frame` runs, `map_in_active_tables`
+  fails and the handler returns -1 - the verdict *is* checked, but the frame is never returned to the
+  allocator and never entered a page table, so `reclaim_pages` cannot find it at task death. `AllocMem`
+  needs no capability by design, and the failure that reaches this is allocator exhaustion, so a service
+  retrying under pressure ratchets the pool down one frame per attempt. Neutral code; x86 identical.
+- **A10-16 (the six `unused import` warnings - judged, one by one).** Measured at HEAD: there are
+  **six**, and **only one is in `arch/aarch64/mod.rs`**. The note in `f718e5a1` ("8 pre-existing
+  unused-import warnings in `arch/aarch64/mod.rs`, most likely fallout from deleting the in-kernel
+  driver") is wrong on the count, the location, and the cause: the other five are in neutral files and
+  appear **identically on the x86 build**, verified by building both. Verdicts:
+  - `task/mod.rs:18` `use crate::capability::generation::Generation` - a **private** import with no
+    API-surface argument at all. **Delete.**
+  - `ipc/mod.rs:13` `Endpoint` and `task/mod.rs:8` `Task` / `TaskId` - not merely unused re-exports;
+    the build also reports `struct Endpoint is never constructed` and `struct Task is never
+    constructed`. These are **dead types**, and that is the finding worth acting on: a reader looking
+    for "the task struct" finds one nothing builds, because the live task state is the parallel arrays
+    in `scheduler.rs`. **Delete the types or say in `task/CLAUDE.md` why they are kept**; deleting the
+    re-export alone hides the more interesting fact.
+  - `ipc/mod.rs:14` `IpcError` - the type is alive but every consumer names
+    `crate::ipc::message::IpcError`. The kernel is a **bin** crate, so `pub use` has no external
+    consumer and this is a facade nobody walks through. **Delete**, or switch one call site to it.
+  - `capability/mod.rs:17` `CapTable` - same shape; `main.rs` names `capability::table::CapTable`
+    directly. **Delete from the re-export list**; the type stays public in `table`.
+  - `arch/aarch64/mod.rs:2254` `pub use crate::clock::epoch_secs` - **KEEP.** This is the only
+    arch-local one and it is **deliberate seam surface**: `arch/x86_64/rtc.rs:225` carries the identical
+    re-export and *uses* it, and all six other arches carry it in their `rtc` stub. Deleting it would
+    make aarch64 the one arch whose rtc surface differs, which is the opposite of what the seam is for.
+    Silence it with `#[allow(unused_imports)]` and a one-line note saying it is the shared surface.
+
+  The point of the exercise: five of these are noise that trains readers to ignore warnings, and one is
+  load-bearing. `cargo fix` would have gotten the last one wrong.
+- **A10-17.** `exceptions.rs:28-31`, `:557-559` and `:588-592` all state that a fault reports and halts
+  and that there is no task to kill - false since the EL0-kill path at `:655-684` (which is a genuinely
+  good change: §10.4 kills the service, not the machine). An auditor reading the fault model from the
+  doc comments would conclude an EL0 fault is fatal. Same class as A8-22.
+- **A10-18.** `TASK_LAST_BADGE` (`scheduler.rs:235`) and the A10-4 FIFO are per-task-slot statics that
+  no spawn or kill path clears, so a slot's next occupant inherits them. The badge is self-healing in
+  practice (every recv overwrites it, an unbadged message writes 0); the FIFO is not. Fix together.
+- **A10-19.** `dispatch.rs:1345` ungates `InspectKernel` queries 0, 3 and 9-22; the doc lists 0, 3,
+  9-13. Each addition is individually argued in a comment and none confers authority - but the doc is
+  the one that says "there are no exceptions to this rule".
+- **A10-20 (PLAUSIBLE).** `gic.rs:81-95` writes `GICD_CTLR`, `GICC_CTLR` and `GICC_PMR` and nothing
+  else - no `GICD_ICENABLERn` clearing, which is what Linux's `gic_dist_init` does and why. The Pi 4's
+  armstub configures the GIC before handover (this file's own comment says so). An SPI it left enabled
+  fires at `timer::unmask_irqs()`, lands in the generic `id >= 32` arm, and reaches
+  `route::deliver` -> `mask_vector` -> `lookup()` returns `None` -> nothing is masked -> EOI -> a level
+  source re-enters immediately. That is an IRQ-storm livelock which the watchdog converts into A10-1.
+  Eighteen milestones have booted without it, so PLAUSIBLE, not confirmed.
+
+### Classes swept CLEAN (stated because they are the point of auditing)
+
+- **The delegated-resource (file-capability) enforcement path is sound, end to end.** Right validated
+  before anything else; `is_delegated` a pure band range check; the badge written in exactly one place
+  after validation and zeroed by `Message::new`/`interrupt_event`, so it cannot be forged over an
+  ordinary send; `narrow_embedded_for_receiver` strips GRANT from delegated caps; `allocate`
+  re-registers a reused band id at `prev_gen.bump()`, closing ABA. **The owner-recycling hazard is
+  closed by construction**: `release_owner` runs on endpoint death *before* `free_endpoint_id`
+  (`scheduler.rs:1881` then `:1928`), and `mark_dead_resource` bumps the generation, so a stale file
+  cap fails its next use. The only residual is the TOCTOU between `owner_of` and `enqueue` (recorded,
+  needs a concurrent death plus a spawn inside a few instructions - not graded).
+- **Capability validation: 49 handlers, 39 validate a cap first** (23 by slot, 16 by holdings), 2 by
+  kernel-recorded ownership (`ResourceRevoke`, `IrqUnmask` - both justified), and 8 require none,
+  each touching only the caller's own state. In every one of the 39 the validation is the first thing
+  the body does. `handle_console_foreground` was checked specifically because this branch made it push
+  a console byte: it is gated on `CONSOLE_READ` **and** scope-checked against `CONSOLE_READ_RESOURCE`,
+  so the injected `\n` stays inside the console trust perimeter SEC-2 already defines.
+- **User pointers.** aarch64's seam is stronger than x86's, not weaker: a range check that rejects 0,
+  wraps and anything at or above `USER_END`; `ldtrb`/`sttrb`, the *unprivileged* load and store, so
+  the MMU applies EL0 permissions even though the code runs at EL1; and a fault fixup whose selftest
+  proves it **fired** (a `recovered_count` delta) rather than that the pointer was refused upstream.
+  A bad pointer returns a defined error instead of killing the caller. A10-2 is the one crack in it.
+- **Arithmetic and indexing in the syscall layer.** Every cap slot goes through `CapTable::get`/`remove`
+  (`slots.get(slot)`); `task_stat`, `for_each_cap_of`, the per-core counters and `set_wake_deadline`
+  all bound against `MAX_TASKS`/`num_cores()`; `handle_spawn_with_caps`'s descriptor parser
+  bounds-checks at each of five steps (the `p + label_len + 2 > len` guard was walked against the two
+  reads that follow); `current_task_claim_alloc` uses `checked_add`.
+- **Frame-bitmap OOB from a corrupt or device-influenced PTE.** `free()` double-bounds on
+  `max_valid_frame` **and** `max_ram_frame`; `memmap::build` clamps every bank to `IDENTITY_MAP_LIMIT`,
+  so the two numbers genuinely agree. A leaf naming GENET or the PCIe window is rejected as a phantom
+  frame rather than corrupting the bitmap.
+- **Device-supplied values.** `video::init` range-checks GPU-reported `w`/`h`/`pitch` before they
+  become a slice length, and every framebuffer write goes through `render::put_run` (`checked_add` +
+  `get_mut`), so an inconsistent geometry drops pixels rather than panicking. `pcie`'s capability walk
+  masks every device-derived offset to 0xFFF and is bounded at 48 hops. The DTB walk is
+  `MAX_TOKENS`-bounded with every read range-checked against the header's `totalsize`.
+- **The A7-5 class (an unbounded drain in an ISR) is gone with the driver.** The timer tick's only
+  drain is `uart_rx::drain`, capped at 64 for a 32-entry FIFO. Both routed sources are storm-proof:
+  `msi_take_pending` clears whatever is pending whether or not a service is listening, and GENET is
+  masked at the distributor before delivery because it is registered level-triggered.
+- **Block-attribute carry in the split** (the mechanism A10-3 is about is *correct*, only its ordering
+  is not): `ATTR_LOW | ATTR_HIGH` reproduces every bit `enable()` sets, `ADDR_MASK_2M` is bits [47:21],
+  and the `0b01`-at-L2 vs `0b11`-at-L3 encoding difference is handled correctly in both
+  `unmap_high_4k` and `entry_for_va`. The replacement pages are byte-for-byte the same translation.
+- **TLBI operand and shareability** are right everywhere they appear: `vaae1is` with `VA >> 12` for a
+  page, `vmalle1is` for whole-map, each with `dsb ishst` before and `dsb ish` + `isb` after. Audit 7's
+  A7-2/A7-3 publication barriers are present and correctly placed.
+- **`smp_boot.rs` and `genet.rs` came back clean.** Every wait in `smp_boot` is bounded by the cycle
+  counter against `timer::frequency()`; the coherency (`SMPEN`) and cache-maintenance reasoning is
+  correct and the "boot core only, before the APs" precondition it relies on is **established**
+  (`install_kstack_guards` at `mod.rs:832`, `start_secondaries` at `:843`), not assumed. `genet.rs`
+  after the driver deletion is one `unsafe`, a `probe_read32` that survives an external abort, correct
+  Release/Acquire on `GENET_PRESENT`, and no dead code.
+- **Mechanical guards all PASS:** `unsafe_check` (72 files, 1095 lines, no unaccounted additions),
+  `arch_boundary_check`, `contract_check`, `dash_check`. Kernel builds clean on
+  `aarch64-unknown-none --features pi4,pi4-smp --release` and `x86_64-unknown-none --release`, both
+  with and without `fcap-diag`.
+
+### NOT audited (honest coverage)
+
+- **The `fcap` repro was not run.** A10-4 names a root cause from source; it is not proven until
+  `fcap` -> `kill fs` -> `fcap` is executed with `fcap-diag` on and the shell/kernel lines are compared.
+  That is one boot, and it is the single highest-value thing to do next.
+- **No hardware run.** Everything here is source verification and two clean builds. A10-3's abort and
+  A10-2's race are both timing-dependent and neither was reproduced.
+- **`services/xhci` was not audited.** 2742 lines left the kernel and became ~3600 lines of service;
+  they are out of a *kernel* audit's scope by construction, but nobody should read this audit as
+  coverage of them. That is a userspace-audit task, and the code is new.
+- **Audit 7's fourth open item is still open**: the suspicion that the BOT class reset and clear-halts
+  are refused over EP0 because the scratch control ring is shared with enumeration. It moved to
+  userspace with the driver rather than being resolved.
+
+### Process note
+
+Audit 7 closed with the observation that all five of its findings were in code written the same day,
+and that the standing rule is to audit before presenting for a hardware test. This pass supports the
+same conclusion from the other direction: **A10-6 was created by this branch** (a new `hw_irqs` grant
+whose teardown is a name match nobody updated, with the now-false comment sitting directly above the
+code), **A10-11 was made worse by it** (moving the keyboard to userspace added a third producer to a
+ring documented as single-producer), and **A10-3 is a fix that was written correctly and then reverted
+twice with no recorded reason**. None of the three needed new insight to catch - each is visible in a
+diff read against the comment immediately above it.
+
 ## Audit 9 - the shared framebuffer console + a full-kernel sweep (2026-08-03, `main` @ v0.9.0)
 
 Scope: the ~1400 lines of `kernel/src/fbcon/` and the ARM input path shipped in v0.9.0 with no audit
@@ -796,3 +1401,100 @@ check fixed for the bulk path in this range):
 - **A8-22 (LOW).** Two stale comments this range's own changes falsified: `dispatch.rs:1301` SAFETY says
   "task heap range (0x1_0000_0000+)", false on 32-bit since the split; and `map_in_active_tables(virt: u64)`
   silently narrows to `u32` with no assert - the primitive behind the bug `f886d6b` worked around.
+
+## Audit 7 - the AArch64 (Raspberry Pi 4) port (2026-08-05, `feat/pi4-aarch64` @ f6e51efc)
+
+**Scope.** All aarch64 kernel code written during the Pi 4 bring-up: `genet.rs` (GENET ethernet),
+`xhci.rs` (USB over PCIe, incl. the new BOT recovery), `mmu.rs` (kernel-stack guard pages),
+`ptables.rs`, the `mod.rs` arch surface, and the aarch64 capability grants in `task/mod.rs`.
+
+**Method.** By DEFECT CLASS, not by file. The port's own standing lesson is "fix the class, not the
+instances", and the first finding arrived by accident while chasing a bug - which is the argument for
+sweeping deliberately.
+
+**North star unchanged:** nothing above the kernel may panic or wedge it.
+
+### Findings (5 CONFIRMED, all fixed)
+
+| # | Finding | Class | Where |
+|---|---------|-------|-------|
+| A7-1 | `drain_rx` looped `while cons != prod` with `prod` read from a HARDWARE REGISTER - a device-supplied value deciding when kernel code stops | unbounded (§26.6) | `genet.rs` |
+| A7-2 | A new address space was installed before its descriptors were visible. **The supervisor-respawn fault** (ESR `0x82000007`) | weak-memory publication (SEC-25/27) | `mod.rs::finalize_service_address_space` |
+| A7-3 | `map_in_root` published nothing while mapping into the tables THIS CORE EXECUTES UNDER | weak-memory publication | `ptables.rs` |
+| A7-4 | `unmap` released a `Frame` to the allocator with no barrier and **no TLB invalidate** - a use-after-free the MMU actively enables, reported by nothing | stale translation (SEC-26) | `ptables.rs` |
+| A7-5 | Event drain unbounded in the TIMER TICK - an IRQ-storm livelock. Same class arm32 Audit 6 already recorded HIGH (`net_rx_isr`) | unbounded (§26.6) | `xhci.rs` |
+
+`ptables.rs` - the file the neutral kernel maps and unmaps THROUGH - contained **zero barriers**.
+A7-2/3/4 are one class; fixing only A7-2 (the one causing the visible bug) would have left the
+use-after-free live.
+
+### Classes swept clean
+
+- **USB descriptor parsers** - all three guard `len < 2` and break, so a zero-length descriptor ends
+  the walk rather than spinning it (the classic USB parse bug, already handled).
+- **Device-supplied lengths** - every copy is fixed-size or `.min()`-clamped against BOTH source and
+  destination. No device value sizes a copy unchecked.
+- **Capability grants** - every aarch64 grant is arch-gated AND name-scoped to exactly one service;
+  the `SetClock` rights split is correct least-privilege (WRITE to `net-stack`, READ-only floor to
+  `shell`).
+- **Bounded waits** - `command()` and the transfer waits carry explicit iteration bounds.
+- **Userspace reply sends** - the discarded `send_by_handle(reply, ..)` result is the established
+  convention across all three block backends (ahci 8, sdhci 7, usbdisk 6): a failed reply means the
+  caller is gone and there is nothing to retry. Reviewed and accepted, not a finding.
+
+### Verification
+
+`chaos max-carnage`: 23 rounds, 77 kills, 53 flooded, 23 mem-pressure, 23 spawns. Kernel ALIVE,
+**0 panics, 0 exceptions, 10 supervisor respawns all reconciled**, shell back at a prompt. Before
+A7-2/3/4 the supervisor faulted on the first or second respawn.
+
+### NOT audited (honest coverage)
+
+- `mmu.rs` block splitting, line by line. Written the same day, page-table surgery, and verified only
+  by the `guard_unmapped=true usable_mapped=true` line - which proves ONE page, not the general case.
+- `bot_recover` against the xHCI specification. Built, and **never exercised**: no timeout has occurred
+  since it landed, so `stop -> reset -> set-dequeue` has not run once.
+- **Open suspicion, unresolved:** the BOT class reset and both clear-halts are refused over EP0. The
+  scratch control ring is shared with enumeration, so the disk's EP0 context may no longer point at the
+  ring this code rings a doorbell for. That is a design question, not a tuning one.
+- Userspace beyond the block backends: the shell's clock-floor path and `net-stack` were not read.
+
+### Process finding
+
+Every one of A7-1..A7-5 is in code written the same day it was audited, and three sat on the path a
+hardware test was about to exercise. The standing rule is to audit new code against the Commandments
+BEFORE presenting it for a hardware test; that did not happen once across a driver, a recovery path,
+guard-page block splitting and four capability grants. Bugs then chased over multiple hardware rounds
+were audit-shaped: a discarded verdict, a bound that was not a bound, a diagnostic that could not fail
+loudly. A7-5 had already been recorded as HIGH on arm32, on a different device, and was written again.
+
+
+
+## Audit 8 - the AArch64 branch at merge readiness (2026-08-12, `feat/pi4-aarch64` @ `94711fd2`)
+
+Scope: everything on this branch since kernel Audit 7 (`f6e51efc`) - ~850 changed kernel lines
+(aarch64 `pcie.rs`, `exceptions.rs`, `gic.rs`, `mod.rs`, `interrupt/route.rs`, `task/`,
+`syscall/dispatch.rs`) plus the deletion of `arch/aarch64/xhci.rs` (-2476).
+
+**Mechanical gates: PASS.** `scripts/unsafe_check.py` - 71 audited files, 1055 unsafe lines, no
+unaccounted additions. The deleted in-kernel xhci driver is gone from the inventory (the stale row
+that once passed silently is now a hard failure, `e2810e00`).
+
+### K8-1 (LOW) - `fcap-diag` instrumentation outlived the investigation it was for
+
+`kernel/src/syscall/dispatch.rs`, the `#[cfg(feature = "fcap-diag")]` block, is introduced by its own
+comment as *"FCAP-RESTART INSTRUMENTATION (temporary - remove when the post-restart escalation is
+closed)"*. That escalation was closed (SEC-35). The code is feature-gated so it does not ship, but a
+block that documents its own removal condition and then outlives it is how dead scaffolding becomes
+permanent - and it prints capability rights, which is exactly the kind of diagnostic that should not
+be one `--features` away in a shipped kernel.
+
+### Verified sound
+
+- **EL1 fault -> halt** (`exceptions.rs:689`) is the correct end of that path, not a missing recovery:
+  a fault at EL1 IS the kernel's, and there is nothing above it to recover into (§26.7). The comment
+  says so explicitly.
+- **`pcie.rs` link-up wait** is bounded (`while ms < 100 && !link_up()`), and its delay helper is
+  bounded on the cycle counter rather than an iteration count - the "a count is not a duration"
+  lesson applied correctly.
+- **No new syscall** was added on this branch, so the cap-gate surface is unchanged.

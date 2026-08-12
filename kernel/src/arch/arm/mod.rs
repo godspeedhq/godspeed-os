@@ -31,7 +31,9 @@ pub mod fbcon;
 /// See `crate::fbcon`'s module header for the contract each one owes.
 pub use fbcon::{fb_commit, FB_READBACK_CHEAP};
 pub mod dwc2;
-pub mod hid;
+/// The shared in-kernel HID decoder, re-exported under its old name so this port's call sites are
+/// unchanged. It moved to `arch/hid.rs` when the Pi 4's xHCI became its second caller.
+pub use crate::arch::hid;
 // USB-net bridge (the mechanism the userspace ARM `nic-driver` calls): move ethernet frames to/from the
 // in-kernel CDC-ECM device. On ARM these are the real DWC2 functions; other arches stub them (net there is
 // a userspace PCIe driver, not this in-kernel USB path).
@@ -462,7 +464,8 @@ pub fn smp_bringup() {
             crate::kprintln!("smp: WARNING - core {} did NOT come up; continuing without it", core);
         }
     }
-    crate::kprintln!("smp: {} cores ready", AP_ONLINE.load(core::sync::atomic::Ordering::Relaxed) + 1);
+    // The shared sentence, so this port and every other say it identically (`smp::core`).
+    crate::smp::core::report_cores_ready();
 }
 
 /// Write one byte to the PL011, waiting for room in the transmit FIFO.
@@ -787,7 +790,39 @@ pub unsafe fn switch_to_boot_stack(top: u64) {
 pub const ELF_MACHINE: u16 = 40;
 pub const ELF_CLASS: u8 = 1; // 1 = ELFCLASS32, 2 = ELFCLASS64
 
-pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
+/// A11-2: a panic must stop this machine too. The Pi 2 runs four cores on real hardware.
+///
+/// `halt_all_cores` was `loop { spin_loop() }` - it masked nothing, so the panicking core kept taking
+/// the timer IRQ and was scheduled away, and the other three never learned a panic had happened. Same
+/// defect A10-1 found on aarch64 and SEC-18 fixed on x86; this port was simply never revisited. It is
+/// worse here than on aarch64, because the arm liveness watchdog is armed off a measured timer and
+/// there is no second backstop if this fails.
+///
+/// Same two halves as aarch64: the panicking core masks interrupts immediately, and `PANIC_HALT` is
+/// published for the others, which check it on the tick every core takes.
+pub static PANIC_HALT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Park THIS core forever with IRQ+FIQ masked.
+pub fn park_core_forever() -> ! {
+    // SAFETY: `cpsid if` masks IRQ and FIQ in CPSR, and `wfi` halts until an unmasked event; both are
+    // always valid in a privileged mode, and this never returns, so nothing is left inconsistent.
+    unsafe {
+        core::arch::asm!("cpsid if", options(nomem, nostack));
+        loop { core::arch::asm!("wfi", options(nomem, nostack)); }
+    }
+}
+
+/// Called from the timer tick on EVERY core - see `PANIC_HALT`.
+pub fn panic_halt_check() {
+    if PANIC_HALT.load(core::sync::atomic::Ordering::Acquire) {
+        park_core_forever();
+    }
+}
+
+pub fn halt_all_cores() -> ! {
+    PANIC_HALT.store(true, core::sync::atomic::Ordering::Release);
+    park_core_forever()
+}
 
 /// Reset the machine via the BCM2835 power-management watchdog (the shell `reboot` command + Ctrl+Alt+Del).
 /// Arm a short watchdog timeout and request a FULL reset in `PM_RSTC`; the SoC resets when the watchdog
@@ -1709,3 +1744,8 @@ pub mod ioapic {
 pub mod ap_boot {
     pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 { 0 }
 }
+
+/// Must a driver's DMA arena be mapped UNCACHED on this architecture?
+///
+/// ARMv7 DMA is not coherent either - same reasoning as the 64-bit port.
+pub const DMA_ARENA_UNCACHED: bool = true;

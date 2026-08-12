@@ -141,6 +141,11 @@ pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("aarch64::switch_t
 pub const ELF_MACHINE: u16 = 243;
 pub const ELF_CLASS: u8 = 1; // 1 = ELFCLASS32, 2 = ELFCLASS64
 
+/// A11-1 hook: called from the timer tick on every core so a panic can stop the machine, not just the
+/// panicking core. A no-op on this port until its `halt_all_cores` actually signals the other cores -
+/// see the aarch64 implementation for the shape (a published flag, checked here).
+pub fn panic_halt_check() {}
+
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 
@@ -187,7 +192,39 @@ pub mod boot {
 }
 
 // ---------------------------------------------------------------------------
+/// Hook called when the scheduler commits a **user** task. x86 ignores it; ARM records the slot so the
+/// timer runs its syscalls atomically. Nothing to do on this stub yet.
+pub fn note_user_task(_slot: usize) {}
+
+// --- Framebuffer console backend (`crate::fbcon`) ---
+// The neutral console owes each arch two items (see `crate::fbcon`'s module header). No framebuffer is
+// mapped on this stub, so the console never initialises and every entry point no-ops.
+
+/// `false` selects the repaint-from-shadow-grid scroll, which never reads the framebuffer back - the
+/// conservative choice while no framebuffer exists.
+pub const FB_READBACK_CHEAP: bool = false;
+
+/// Publish a written rectangle. Nothing to publish yet.
+pub fn fb_commit(
+    _base: usize, _pitch: usize, _bpp: usize,
+    _x: usize, _y: usize, _w: usize, _h: usize,
+) {}
+
 pub mod page_tables {
+
+    /// Arch hook run once a service's address space is built. x86 needs nothing; ARM clones the kernel
+    /// identity mapping into it.
+    ///
+    /// # Safety
+    /// `_root` must be a page-table root this task owns.
+    pub unsafe fn finalize_service_address_space(_root: u64) {}
+
+    /// Free a task's page-table root and the structure below it, at task death.
+    ///
+    /// # Safety
+    /// `_root` must belong to a task already marked Dead, after a TLB shootdown.
+    pub unsafe fn free_page_table_root(_root: u64) {}
+
     use crate::memory::frame::{Frame, PhysAddr};
 
     pub const PAGE_SIZE: usize = 4096;
@@ -220,6 +257,11 @@ pub mod page_tables {
     }
 
     pub const PHYS_IS_IDENTITY: bool = false;
+
+    /// No bootloader placed page tables for this port - the kernel builds its own, in `.bss` inside the
+    /// kernel image, which the memory map already excludes from usable RAM. So there is nothing for
+    /// `protect_kernel_page_table_frames` to protect, and its x86-format walk must not run here.
+    pub const BOOTLOADER_PLACED_TABLES: bool = false;
     pub fn get_hhdm_offset() -> u64 { 0 }
     pub unsafe fn set_hhdm_offset(offset: u64) {}
     pub fn read_page_table_base() -> u64 { 0 }               // TTBR0_EL1

@@ -24,10 +24,12 @@ use godspeed_sdk::ServiceContext;
 // cards). There is no safe way to use a single-slot Pi's boot card as storage, so the backend is a
 // hazard, not a fallback. The file is kept for reference (a future board with a SEPARATE storage medium
 // could use it), but it is not a module here so it cannot be reached - see `backend_run`.
-#[cfg(not(target_arch = "arm"))]
+#[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
 mod ahci;
-#[cfg(target_arch = "arm")]
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 mod usbdisk;
+#[cfg(not(target_arch = "arm"))]
+mod xhciblk;
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
 //   Request : [op:u8, lba:u64 LE, (WriteBlock only: 512 data bytes)]
@@ -53,9 +55,13 @@ const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
 
 /// Run the arch-appropriate backend against the kernel-granted MMIO window.
-#[cfg(not(target_arch = "arm"))]
+#[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
 fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { ahci::run(ctx, m) }
 /// ARM storage is the USB stick, and ONLY the USB stick. Never the SD/EMMC card.
+///
+/// **Both ARM ports, for the same reason.** The Pi 4 has the same single-slot topology as the Pi 2:
+/// one SD card, which is the boot medium. The rule below was established on the Pi 2 and applies
+/// unchanged there.
 ///
 /// The Pi 2 has one SD slot and boots from it: that card carries the firmware, the kernel image, and a
 /// FAT boot partition. It is the boot medium, full stop - there is no safe way to also hand it to GSFS,
@@ -67,10 +73,29 @@ fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { ahci::run(ct
 /// removed. With no USB stick, there is simply NO storage - exactly what x86 reports with no disk
 /// attached - and `fs` comes up storage-unavailable. `usbdisk::run` with a 0 sector count serves that
 /// no-disk state (capacity 0, every read/write refused) WITHOUT touching the card.
-#[cfg(target_arch = "arm")]
-fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! {
-    let _ = m; // the SD/EMMC MMIO window is deliberately never used - see above.
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+fn backend_run(ctx: &ServiceContext) -> ! {
+    // Where the sector count comes from is the same build-time choice usbdisk.rs documents: the
+    // in-kernel stack by syscall, or the `xhci` service by IPC. No probe, no fallback.
+    #[cfg(target_arch = "arm")]
     let sectors = ctx.usb_disk_sectors();
+    // ONE quick question at startup, not a 20 s wait for an answer we no longer use.
+    //
+    // This called `sectors()`, which blocks up to 20 s for a capacity. That made every boot with no
+    // stick in it stall for 20 s before the first `drives` could answer - the reported "substantial
+    // delay on startup, subsequent ones are quick".
+    //
+    // The wait existed to capture a boot-time sector count. Since `serve()` re-derives capacity on
+    // every request, that number no longer answers anything: it is used for the startup log line and
+    // then shadowed. So the wait buys nothing and costs 20 s on exactly the machine that has the
+    // least to wait for.
+    //
+    // A stick present but still enumerating now reports 0 here and mounts slightly later, on the
+    // first request, through the same self-heal that already recovers a stick plugged in after boot -
+    // hardware-proven across several plug/unplug cycles. Trading a guaranteed 20 s stall for a
+    // recovery path that is exercised constantly is the right way round.
+    #[cfg(not(target_arch = "arm"))]
+    let sectors = xhciblk::sectors_now(&ctx);
     if sectors == 0 {
         ctx.log("block-driver: no USB storage stick - NO disk (the SD card is the boot medium and is never written)");
     }
@@ -79,6 +104,13 @@ fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! {
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // On the ARM ports the backend needs NO MMIO: the USB stack is in the kernel and the disk is
+    // reached through syscalls. Going through the `ctx.mmio()` gate would refuse a perfectly good USB
+    // stick on any board that does not also hand the service a peripheral window it never reads - which
+    // is the Pi 4 exactly. So those ports do not ask.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    backend_run(&ctx);
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     match ctx.mmio() {
         Some(m) => backend_run(&ctx, &m),
         None => {

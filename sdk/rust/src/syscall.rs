@@ -52,6 +52,66 @@ pub(crate) unsafe fn raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     ((hi as u64) << 32 | lo as u64) as i64
 }
 
+/// AArch64: `svc #0`, with the syscall number in `x16` and arguments in `x0`-`x2`.
+///
+/// The number has to live in a **register**, not in the instruction: `svc #N` encodes `N` as an
+/// immediate, so it must be a compile-time constant - fine for a fixed handful of calls, impossible for
+/// a `raw_syscall` whose caller picks the number at runtime.
+///
+/// **`x16`, deliberately NOT `x8`.** Linux uses `x8`, and copying that cost a long debugging session.
+/// AAPCS64 makes `x8` the **indirect result register**: a function returning a large struct receives
+/// the destination pointer there. `raw_syscall` is `#[inline]`, so the `svc` lands *inside* functions
+/// that do exactly that - `recv()` returns a `Message` of about 4 KiB by value - and the syscall number
+/// then sits where the return-value destination should be. The symptom was a service `memcpy`ing 4 KiB
+/// to an address past the top of its stack, with `x8` holding a stale syscall number.
+///
+/// Linux gets away with `x8` because its syscalls sit behind a non-inlined wrapper, so `x8` is dead at
+/// the boundary. `x16` (IP0) is an ordinary intra-procedure scratch register with no ABI role that can
+/// be live across a call, which is what makes it safe here.
+///
+/// Unlike the 32-bit ARM path above, **nothing is truncated**: the registers are 64-bit, so a `u64`
+/// argument passes whole and the `i64` result comes back in a single register. The whole class of
+/// bugs that path has to guard against (an LBA or a tick count aliasing when it exceeds 32 bits) does
+/// not arise here.
+///
+/// # Safety
+/// Caller must pass valid arguments for the given syscall number.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) unsafe fn raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+    let ret: i64;
+    // SAFETY: `svc #0` traps to EL1's synchronous-lower-EL vector, which saves the full register set
+    // on the kernel stack (SP_EL1, selected by the exception - the user stack is untouched, so
+    // `nostack` is correct), services the call, and returns with x0 holding the result. The handler
+    // may clobber any caller-saved register, so x0-x3 and the rest of the caller-saved set are
+    // declared clobbered rather than assumed to survive.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x16") nr,
+            inout("x0") a0 => ret,
+            inout("x1") a1 => _,
+            inout("x2") a2 => _,
+            lateout("x3") _,
+            lateout("x4") _,
+            lateout("x5") _,
+            lateout("x6") _,
+            lateout("x7") _,
+            lateout("x9") _,
+            lateout("x10") _,
+            lateout("x11") _,
+            lateout("x12") _,
+            lateout("x13") _,
+            lateout("x14") _,
+            lateout("x15") _,
+            lateout("x17") _,
+            lateout("x18") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) unsafe fn raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {

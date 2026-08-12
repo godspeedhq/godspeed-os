@@ -1,4 +1,4 @@
-# ARM NOTE (userspace-audit A6, same class as A5-U1): on the arm32 port this service is ALSO granted
+# ARM NOTE (userspace-audit A6, same class as A5-U1): on BOTH ARM ports (arm32 Pi 2 and aarch64 Pi 4) this service is ALSO granted
 # USB_DISK - whole-device read/write reach over the in-kernel USB mass-storage stack (syscalls 46-49) -
 # by kernel name-match, because the ARM USB stack lives in the kernel and there is no `hw_device` name
 # that resolves to it. It is therefore NOT visible in the capability list below, and `contract_check.py`
@@ -23,3 +23,21 @@ log_write = true
 
 [placement]
 core = 1
+
+# Reach the `xhci` SERVICE by IPC. This is how block-driver gets its sectors on AArch64 (Pi 4),
+# where the USB stack is a userspace service and the in-kernel driver no longer exists in ANY build
+# (CLAUDE.md, amendment 2026-08-09). On every other target block-driver talks to its disk through
+# AHCI (x86) or the in-kernel USB syscalls (Pi 2), and this peer goes unused.
+#
+# The build flags this comment used to cite (`pi4_build.py --xhci-userspace`, the kernel's
+# `xhci-userspace`, this service's `usb-via-xhci`) were deleted with that driver: a flag selecting
+# between a compliant and a non-compliant kernel leaves the violation one build away. A contract is
+# a spec artifact, so citing a flag that cannot be set sends a reader hunting for it.
+#
+# It is declared UNCONDITIONALLY here while the kernel declares it under `cfg(feature)`, because a
+# TOML contract has no notion of a build feature and `contract_check.py` compares one text against
+# the other. The honest reading is "block-driver MAY send to xhci"; an unused send peer grants
+# authority that is never exercised, which is a smaller problem than the alternative - the missing
+# edge cost a full debugging round on the Pi 4, where every service looked healthy in isolation and
+# the disk was simply unaddressable.
+ipc_send = ["xhci"]

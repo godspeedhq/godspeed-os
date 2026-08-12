@@ -41,16 +41,69 @@ proptest = "1"
 panic = "abort"
 
 [features]
+# Diagnostic only, OFF by default. Prints capability IDENTITY across the file-cap invoke path
+# path alone, so it costs nothing on any other work today - but §7.10 means real file I/O will run
+# through that path eventually, at which point this would become per-request logging on every read
+# and write. Hence a feature rather than a comment promising to remove it.
+# Target the Raspberry Pi 4 Model B (BCM2711) rather than QEMU's `virt` machine, for the aarch64 build.
+# Selects the 0x80000 flat-load linker script and the BCM2711 peripheral base (PL011 at 0xFE201000);
+# without it the aarch64 build stays the QEMU `virt` boundary-demarcation target it has been.
+pi4 = []
 # Force `map_in_active_tables` to fail at the MMIO call sites (ioapic, pci MSI-X), so the error paths
 # added for kernel-audit A9-2 are actually EXERCISED rather than merely reasoned about. Those paths are
 # otherwise unreachable without exhausting the frame allocator, which cannot be arranged at boot.
 # Commandment IX: "If recovery cannot be tested, it does not exist." Off by default; test builds only.
 # See `arch/x86_64/pci.rs::msi_ordering` and `docs/kernel-audit.md` Audit 9.
 mmio-map-fault-test = []
-# Run the minimal ARM logger spawn at boot (arch/arm/spawn.rs). Off by default: the spawn currently
-# reaches PL0 and issues real syscalls, but the kernel's cap-table spinlock (LDREX/STREX) does not yet
-# work under the service's dual-mapped address space, so the boot would block. Gated so the default
-# image boots clean while the spawn is exercised + iterated on with this feature.
+# Inject synthetic memory banks that extend past the identity-map limit, so `memmap`'s clamp is
+# EXERCISED rather than merely reasoned about. The clamp matters on an 8 GiB Pi 4, whose firmware
+# reports banks above 4 GiB that the low-4-GiB identity map does not reach - recording those as usable
+# would hand the allocator RAM with no translation. QEMU's `raspi4b` is fixed at 2 GiB, so the
+# condition cannot be reached by configuration. Commandment IX: "If recovery cannot be tested, it does
+# not exist." Off by default; test builds only. See `arch/aarch64/memmap.rs`.
+memmap-clamp-test = []
+# Run the NEUTRAL scheduler over 3 spinning kernel tasks on the Pi 4 (arch/aarch64/sched_demo.rs),
+# preempted by the 100 Hz generic timer. The aarch64 twin of `arm-sched-demo`. Gated because it does
+# not return - scheduler::run IS the idle loop - so it replaces the rest of the boot.
+pi4-sched-demo = []
+# Spawn a REAL service (the logger) through the neutral spawn path on the Pi 4
+# (arch/aarch64/sched_spawn.rs) and run it under the scheduler. The aarch64 twin of
+# `arm-sched-spawn`. Exercises the ELF loader, per-task page tables, the instruction-cache
+# maintenance a loader needs, the kstack pool, cap wiring, and the SDK ABI - in one call.
+pi4-sched-spawn = []
+# The real OS bootstrap on the Pi 4: the kernel makes its ONE direct spawn (the supervisor), which then
+# spawns the services - including the shell, with a CONSOLE_READ cap wired to the PL011 receiver. The
+# aarch64 twin of `arm-supervisor`. This is the build that gives a `gsh>` prompt.
+#
+# **This is what `--features pi4` does by default** - it is the OS, not an option. The feature is kept
+# so the intent can still be named explicitly, but it does not have to be passed: the boot runs the
+# supervisor unless a demo feature above claims the machine instead. Defaulting the other way (a build
+# that boots and halts) meant the deployable image and the tested image were different builds, which is
+# exactly the gap a `--features` flag is good at hiding.
+pi4-supervisor = []
+# Embed the ping/pong DEMO services in the Pi 4 image. They pace with `yield_cpu`, not a sleep, so they
+# emit ~500 log lines a second - proof of IPC, but it buries the shell prompt. Off by default so the
+# shell is usable; on when the point is to watch IPC.
+pi4-demo-services = []
+# Bring up the Pi 4's other three cores. ON by default in `scripts/pi4_build.py`: six consecutive QEMU
+# boots reach a shell on four cores and a carnage run survives it. Still a separate feature so a
+# single-core image remains one flag away if a hardware fault ever needs bisecting against it.
+pi4-smp = []
+# Hand the Pi 4's GENET ethernet MAC to the `nic-driver` SERVICE, and take it out of the kernel.
+#
+# `kernel/src/arch/aarch64/genet.rs` is a ~1500-line ethernet driver living in ring 0, which is a
+# direct breach of Commandment I ("thou shalt not expand the responsibilities of the kernel - use a
+# service") and of §4.4's kernel anti-scope. x86 has never had this problem: its NIC driver is a
+# restartable, IOMMU-confinable userspace service, and this feature is aarch64 catching up.
+#
+# With it on, the kernel's whole involvement with ethernet is the boot probe: it establishes that the
+# controller answers, sets `NIC_FOUND` so the spawn path grants the arena, and stops. The service gets
+# the register window (`map_fixed_driver_mmio`) and the DMA arena, and drives the MAC itself through
+# the SDK's `Mmio`/`Dma` wrappers with no `unsafe` of its own.
+#
+# It is a feature rather than the default for one reason: the in-kernel driver is HARDWARE-VERIFIED on
+# a real Pi 4 and the service one is not yet, and a working machine does not get replaced by an
+# unproven one on the strength of an argument. Build both sides with it (`pi4_build.py
 arm-spawn-logger = []
 # Run the neutral scheduler over 3 cooperative kernel tasks on ARM (arch/arm/sched_demo.rs).
 arm-sched-demo = []
@@ -97,10 +150,6 @@ test-bad-elf = []
 # random single-byte + 50 multi-byte mutations).  Only used by `osdev test fuzz-brutal`.
 test-bad-elf-brutal = []
 
-# Confine the first DMA-capable driver (xhci) to an EMPTY IOMMU domain instead of
-# its arena, so its normal init DMA faults - a deterministic live proof that the
-# IOMMU blocks + logs out-of-arena DMA (§22 Test 12, H1 §6.4). Only used by
-# `osdev test iommu` (boots with -device amd-iommu); off in every normal build.
 iommu-fault-test = []
 
 [profile.release]

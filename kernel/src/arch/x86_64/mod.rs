@@ -354,6 +354,12 @@ pub unsafe fn switch_to_boot_stack(top: u64) {
 pub const ELF_MACHINE: u16 = 62;
 pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
 
+/// A11-1 hook: parity with the aarch64 port, where a panic is published as a flag every core checks
+/// on its tick. x86 does not need it - `halt_all_cores` broadcasts an NMI (SEC-18, hardware-verified
+/// on the T630), so every core is already stopped by the time a tick could run. Kept as a no-op so
+/// the neutral scheduler has one call, not a cfg.
+pub fn panic_halt_check() {}
+
 pub fn halt_all_cores() -> ! {
     // SAFETY: panic path - stop all execution permanently. The APIC is mapped by boot; a bare ICR write
     // is sound. If we panicked before the APIC came up the broadcast is a best-effort no-op and this
@@ -966,3 +972,7 @@ unsafe fn inb(port: u16) -> u8 {
     val
 }
 
+/// Must a driver's DMA arena be mapped UNCACHED on this architecture?
+///
+/// x86 DMA is cache-coherent: the arena stays cacheable and needs no maintenance.
+pub const DMA_ARENA_UNCACHED: bool = false;

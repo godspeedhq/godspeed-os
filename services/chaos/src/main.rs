@@ -55,7 +55,20 @@ const ARGWAIT_MAX_YIELDS: u32 = 50_000;   // the startup wait for the shell's ar
 /// The harness was measuring itself in units whose cost it does not control (Commandment VIII: a proxy
 /// is not the truth). The beat is now bounded by the CLOCK, so it is the same beat on every arch, with
 /// `PACE_YIELDS` kept only as the hard cap that stops a stuck clock spinning forever (§26.6).
-const PACE_SECS: i64 = 1;
+/// The beat between rounds, in MILLISECONDS.
+///
+/// This was one SECOND, which made a 100-round run take 100 seconds of almost pure waiting. Seconds
+/// were never the intended granularity - they were the granularity `epoch_secs_monotonic` offered, and
+/// the beat inherited it when the pace was moved off a yield count onto the clock. Fixing "a count is
+/// not a duration" made the beat correct on every arch and, on this one, four times slower than the
+/// count it replaced.
+///
+/// 250 ms is still a beat a person can read a log at, and turns 100 rounds of carnage from ~100 s into
+/// ~25 s. The point of the pause is to keep the serial log legible and let a killed service actually
+/// get restarted before the next round - neither needs a whole second.
+const PACE_MS: u64 = 250;
+/// Slept in chunks so `q` still lands promptly - the abort must not wait out a whole beat.
+const PACE_CHUNK_MS: u64 = 25;
 const PACE_YIELDS: u32 = 200_000;   // hard cap on the beat if the clock never advances
 const MEMP_CHUNK: usize = 64 * 1024; // one mem-pressure round allocs this (held; chaos's limit bounds it)
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]; // matches the `date` utility
@@ -407,9 +420,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Wall-clock status line: when it began, how long it has run, and a linear ETA (no outside truth -
         // a pure extrapolation of elapsed over round progress). until-q has no total, so remains is n/a.
         let elapsed = (ctx.epoch_secs_monotonic() - start_mono).max(0) as u64;
-        let _ = write!(f, "  started {} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  |  elapsed ",
-            WEEKDAYS[(start_dt.weekday() as usize) % 7], start_dt.year, start_dt.month, start_dt.day,
-            start_dt.hour, start_dt.minute, start_dt.second);
+        // Say "clock not set" rather than render a zero date as if it were a time.
+        //
+        // This board has no RTC, so before SNTP lands the wall clock is epoch 0 and this printed
+        // "Thu 1970-01-01 00:00:00" - a fiction with the shape of a fact. `elapsed` is unaffected: it
+        // comes from the MONOTONIC counter, which is real from boot, so the run's own timing stays
+        // honest either way. Report what is known, and say so when something is not (§26.7).
+        if start_dt.year >= 2000 {
+            let _ = write!(f, "  started {} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  |  elapsed ",
+                WEEKDAYS[(start_dt.weekday() as usize) % 7], start_dt.year, start_dt.month,
+                start_dt.day, start_dt.hour, start_dt.minute, start_dt.second);
+        } else {
+            let _ = write!(f, "  started (clock not set - `date sync`)  |  elapsed ");
+        }
         write_dur(&mut f, elapsed);
         if rounds > 0 && round > 0 {
             let _ = write!(f, "  |  remains ~");
@@ -453,11 +476,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // SERIAL console - the keyboard is a chaos target) so an abort lands promptly.
         // Bounded by the clock, capped by the yield count - the same shape as the handoff wait above.
         // The clock read is a syscall, so it is sampled every POLL_EVERY yields rather than every one.
-        let pace_t0 = ctx.epoch_secs_monotonic();
-        for k in 0..PACE_YIELDS {
+        // SLEEP the beat, do not spin it. The old loop yielded up to 200 000 times to burn one second,
+        // which pegs a core for the whole run and inflates CORE_TOTAL_TICKS - the observer distorting
+        // what it observes, the same trap the shell's muted branch documents. Sleeping in short chunks
+        // keeps `q` responsive (worst case one chunk, not one beat) and leaves the CPU to the services
+        // being tortured, which is the thing under test.
+        let mut waited = 0u64;
+        while waited < PACE_MS {
             if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { ack_quit(&ctx); break 'carnage; } }
-            ctx.yield_cpu();
-            if k % POLL_EVERY == 0 && ctx.epoch_secs_monotonic() - pace_t0 >= PACE_SECS { break; }
+            ctx.sleep_ms(PACE_CHUNK_MS);
+            waited += PACE_CHUNK_MS;
         }
     }
 

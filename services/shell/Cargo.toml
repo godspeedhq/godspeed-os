@@ -7,5 +7,12 @@ edition = "2021"
 name = "shell"
 path = "src/main.rs"
 
+[features]
+# Diagnostic only, OFF by default. Prints capability IDENTITY across the file-cap invoke path
+# alone, so it costs nothing on other work TODAY - but §7.10 means real file I/O will run through that
+# path eventually, at which point it would become per-request logging on every read and write. Hence a
+# feature rather than a comment promising to remove it.
+# crate, for the same reason the old xhci-userspace split was a footgun.
+
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }

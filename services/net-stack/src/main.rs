@@ -607,7 +607,20 @@ fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
     // forward jump of up to a day, so a CMOS misread that cuts the measurement window short yields a few
     // MHz on a GHz TSC - which the old floor rejected and a 0.5 MHz floor would accept, poisoning every
     // RTT and deadline for the life of the process. Each arch keeps the floor that fits its clock.
-    let floor: u64 = if cfg!(target_arch = "arm") { 500_000 } else { 100_000_000 };
+    // AArch64 belongs with arm, not with x86. The Pi 4's generic timer runs at ~54 MHz, which is BELOW
+    // the 100 MHz x86 floor - so calibration returned 0 on every boot, and the paragraph above then
+    // describes exactly what was observed on the board: RTT reported as 0 (rendered `time<1us`, which
+    // is impossible for a round trip to 8.8.8.8) AND the poll window `tsc_hz/3` collapsing to ~0 cycles,
+    // so a reply was only caught if it landed inside the initial drain. That is the 33% "packet loss" -
+    // one broken constant presenting as two unrelated faults, a measurement bug and a throughput bug.
+    //
+    // The per-arch floor is right and stays; aarch64 was simply never added to it when the port arrived.
+    // 500 kHz clears a 54 MHz timer comfortably while still rejecting a clock that is merely creeping.
+    let floor: u64 = if cfg!(any(target_arch = "arm", target_arch = "aarch64")) {
+        500_000
+    } else {
+        100_000_000
+    };
     if (floor..=10_000_000_000).contains(&hz) { hz } else { 0 }
 }
 
@@ -848,6 +861,34 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
 /// Read the NIC link state from nic-driver's `[3]` status. RTL8168: byte 7 = link up. On the QEMU e1000
 /// path the reply is short (no link byte) - a non-empty reply means "up" (slirp's virtual link is always
 /// up). Cheap; lets net-stack notice a cable plugged in after boot and self-configure without `net renew`.
+
+
+/// Announce a cable coming or going on the CONSOLE, the way the USB drivers announce a keyboard or a
+/// stick. Same idea, same place on screen, so "something was plugged in" reads the same whatever it was.
+///
+/// Uses `console_write` only, NOT `console_push`. That distinction is the whole security story here:
+/// `console_write` is gated on LOG_WRITE, which this service already holds, while `console_push`
+/// injects into the shell's INPUT ring and puts its holder inside the shell's trust perimeter (§6.4,
+/// SEC-2 - keystrokes are commands). A network service has no business holding that, so the newline
+/// goes inside the written string instead of being pushed. No new authority for a cosmetic feature.
+fn link_notify(ctx: &ServiceContext, msg: &str) {
+    ctx.console_write("
+ NET: ");
+    ctx.console_write(msg);
+    // Just the fact, and NOTHING about what to do next.
+    //
+    // This printed "(press Enter to return to the prompt)" for one build. It is wrong whenever the
+    // shell is not sitting at a prompt - during a continuous `ping`, for instance, which is exactly
+    // when somebody is most likely to be pulling a cable. net-stack cannot know: it has no idea
+    // whether the shell is idle, running a command, or muted behind a full-screen app.
+    //
+    // That is the SAME mistake as the redraw it replaced, in cheaper clothing. Both assume knowledge
+    // of another service's state that this one does not have. The only honest thing to print is what
+    // we actually know - the cable moved - so that is all we print.
+    ctx.console_write("
+");
+}
+
 fn link_is_up(ctx: &ServiceContext) -> bool {
     match nic_req(ctx, &Message::from_bytes(&[3u8]), LINK_SECS) {
         Some(r) => { let p = r.payload_bytes(); if p.len() > 7 { p[7] != 0 } else { !p.is_empty() } }
@@ -857,6 +898,15 @@ fn link_is_up(ctx: &ServiceContext) -> bool {
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // Force the EL0 fault the kernel's recovery path must survive (this crate's `el0-fault-test`
+    // feature). The kernel must KILL this task and keep running, and the supervisor must restart it.
+    // If the machine stops here instead, the recovery is broken and the last log line names the task.
+    #[cfg(feature = "el0-fault-test")]
+    {
+        ctx.log("net-stack: el0-fault-test - deliberate null read; the kernel must kill ME, not the machine");
+        godspeed_sdk::adversarial::fault_null_read();
+        ctx.log("net-stack: STILL ALIVE after a null read - the kernel did NOT fault-kill this task");
+    }
     ctx.log("net-stack: starting");
     // Announce the API BEFORE the configuration dance. The dance can take seconds (DHCP and ARP each
     // wait out their budget when there is no link), and logging after it meant this line landed on the
@@ -867,7 +917,37 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Configure the stack (DHCP -> ARP -> ICMP). These are `mut` because `net renew` (op 8) re-runs the
     // dance in place - a link that comes up after boot recovers without a reboot.
-    let d = run_dance(&ctx);
+    //
+    // SKIPPED ENTIRELY WHEN THERE IS NO LINK. The dance is ~25 s of DHCP and ARP budgets, and it runs
+    // on this thread - net-stack's serve loop is single-threaded, so for that whole time it cannot
+    // answer a client. Boot with the cable out and every `ping` reported "net-stack not responding",
+    // which is both useless and untrue: the service was alive, the cable was not. Hardware showed the
+    // two facts side by side - `nic-driver: genet up ... link down (no cable?)` at 10:33:53, then the
+    // dance grinding through its budgets from 10:34:05.
+    //
+    // The REQUEST path already checks the link before dancing; only this boot call did not, so the
+    // guard existed and this one site went around it.
+    //
+    // Nothing is lost by skipping: `link up while unconfigured - auto-configuring` already re-runs the
+    // dance the moment a cable appears, so a machine booted unplugged configures itself on plug-in
+    // rather than needing `net renew` or a reboot. Cheap too - one status query to the NIC, seconds
+    // saved on every diskless-network boot.
+    let d = if link_is_up(&ctx) {
+        run_dance(&ctx)
+    } else {
+        ctx.log("net-stack: no link at boot (cable unplugged?) - staying unconfigured and RESPONSIVE; will configure when the link comes up");
+        // The unconfigured state, spelled out rather than defaulted: no IP, no gateway, no DNS. The
+        // MAC is still learned - it is our hardware identity and true with or without a cable
+        // (Commandment III / audit U9) - so `net` can report who we are while saying we are offline.
+        NetState {
+            our_ip: [0; 4],
+            our_mac: learn_our_mac(&ctx).unwrap_or([0; 6]),
+            gw_mac: [0; 6],
+            have_mac: false,
+            dns_server: [0; 4],
+            status: *b"link down (no cable",
+        }
+    };
     let mut our_ip = d.our_ip;
     let mut our_mac = d.our_mac;                   // learned from the NIC (audit U9), re-learned on each dance
     let mut gw_mac = d.gw_mac;
@@ -877,14 +957,45 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut sockets = [Socket { rid: 0, port: 0 }; MAX_SOCKETS];
     let mut ping_seq: u16 = 0;                    // unique ICMP seq per ping - see ping() (RTT accuracy)
     let tsc_hz = calibrate_tsc_hz(&ctx);          // RTC-calibrated TSC Hz for RTT (kernel calib is 0 on T630)
+    // Outside the loop deliberately: a once-only latch declared inside the loop it guards resets every
+    // iteration and reports every time, which is the flood it exists to prevent.
+    let mut capless_logged = false;
     loop {
-        let req = ctx.recv();                   // block for a client request
+        // A BARE BLOCK, deliberately - the idle tick that was here is REVERTED (audit A10-1/A5-2).
+        //
+        // The tick called `link_is_up()` every second to announce a cable, and that goes through
+        // `nic_req` -> a wait loop that `try_recv`s THIS SAME serve endpoint and returns whatever
+        // lands. So once a second it opened a window where a CLIENT request was read as the NIC's
+        // status reply: never served, its reply cap left on the kernel's pending FIFO (so the next
+        // reply went to the wrong client), and the real NIC reply then parsed as a different op.
+        //
+        // Two independent audits found it. It is a correctness bug bought with a cosmetic feature -
+        // announcing an unplug without being asked - so the feature goes. `NET: ethernet cable
+        // connected` still appears on the request path, where net-stack is answering anyway.
+        //
+        // The lesson for whoever restores it: net-stack serves clients and receives nic-driver replies
+        // on ONE untagged endpoint. Anything that talks to the NIC outside of serving a request will
+        // steal messages. Fix the correlation BEFORE adding a tick, not after - the design is written
+        // up in `docs/net-tags-design.md` (three phases, each independently testable). A second
+        // endpoint was considered and is NOT available: there is no CreateEndpoint syscall and the SDK
+        // carries one recv_slot.
+        let req = ctx.recv();
         // A nonzero badge = a SOCKET-CAPABILITY invocation the kernel validated (§7.10). A plain
         // name-addressed request (status / DNS / open-socket) carries no badge.
         let badge = ctx.last_recv_badge();
         let reply_cap = match ctx.take_pending_cap() {
             Some(c) => c,
-            None => continue,                   // a request with no reply cap - drop it
+            // A request with no reply cap cannot be answered - but dropping it SILENTLY means the
+            // client waits out its deadline and calls net-stack unresponsive while our log shows a
+            // clean run. Say it once (the condition repeats per request, and the report must not
+            // become the flood), then drop it.
+            None => {
+                if !capless_logged {
+                    capless_logged = true;
+                    ctx.log("net-stack: request had no reply cap - dropping (cannot answer without one)");
+                }
+                continue;
+            }
         };
         let pl = req.payload_bytes();
         // AUTO-CONFIGURE: while UNCONFIGURED (no gateway - booted with no cable, or a boot dance that met a
@@ -901,6 +1012,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&10))
             && link_is_up(&ctx)
         {
+            // No settle here. One was added on the theory that a hot-plugged PHY needed time to
+            // negotiate before DHCP, and the measurement disproved it: the failure was ZERO frames
+            // arriving, because nic-driver only programmed MAC speed and DMA burst during `bring_up`
+            // (fixed in 27c719bd - it now re-applies on the link-up transition). The delay was solving
+            // a problem that did not exist, so it only postponed every hot-plug configure.
             ctx.log("net-stack: link up while unconfigured - auto-configuring");
             let d = run_dance(&ctx);
             our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; have_mac = d.have_mac; dns_server = d.dns_server; status = d.status;

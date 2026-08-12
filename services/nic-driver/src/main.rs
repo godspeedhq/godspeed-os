@@ -24,6 +24,15 @@
 
 use godspeed_sdk::{ServiceContext, Message, Mmio, Dma};
 
+/// The Pi 4's on-board GENET MAC, driven from HERE instead of from the kernel (Commandment I).
+///
+/// Compiled on every aarch64 build so it is type-checked by the same command that builds the shipping
+/// image - a backend that only compiles under its own feature is a backend that quietly rots. Which
+/// one actually runs is decided in `service_main` by the target architecture: on aarch64 this backend
+/// is the ONLY path - the kernel drives no ethernet at all (Commandment I).
+#[cfg(target_arch = "aarch64")]
+mod genet;
+
 // Intel 82540EM register offsets (byte offsets into the BAR0 MMIO window).
 const REG_CTRL:   usize = 0x0000; // Device Control
 const REG_STATUS: usize = 0x0008; // Device Status; bit 1 (LU) = Link Up
@@ -531,13 +540,21 @@ fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
     }
 }
 
-/// ARM USB-net backend: bridge the frame IPC (the request/reply contract net-stack speaks) to the
-/// in-kernel DWC2 CDC-ECM device via the NET_DEVICE syscalls. Pure mechanism, mirroring the e1000/rtl
-/// serve loops - the frame IS the message; net-stack owns all protocol. Pinned to core 0 (its contract),
-/// where the single-channel DWC2 lives. A request payload of exactly 1 byte 3/4/5/6/7/8/9 is an opcode;
-/// any other payload is a raw ethernet frame to transmit.
-#[cfg(target_arch = "arm")]
-fn usb_net_main(ctx: ServiceContext) -> ! {
+/// Kernel-NIC backend: bridge the frame IPC (the request/reply contract net-stack speaks) to whatever
+/// network device the kernel drives, via the NET_DEVICE syscalls. Pure mechanism, mirroring the
+/// e1000/rtl serve loops - the frame IS the message; net-stack owns all protocol. A request payload of
+/// exactly 1 byte 3/4/5/6/7/8/9 is an opcode; any other payload is a raw ethernet frame to transmit.
+///
+/// Used by both ARM ports, and deliberately named for the SEAM rather than the device behind it:
+/// - **Pi 2 (arm)**: an in-kernel DWC2 CDC-ECM USB-net device, pinned to core 0 by its contract
+///   because that is where the single-channel DWC2 is driven from.
+/// - **Pi 4 (aarch64)**: the on-board GENET Ethernet MAC, with no core constraint - GENET is reached
+///   by MMIO from whichever core makes the syscall, so it sits on core 1 with net-stack and fs.
+///
+/// This function knows about neither. It was `usb_net_main` while USB was the only thing behind the
+/// syscalls; on the Pi 4 that name would have described the transport of a different board.
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+fn kernel_net_main(ctx: ServiceContext) -> ! {
     // How many bulk-IN polls to try when a request wants a received frame (net-stack also re-polls via
     // ops 4/9 under its own deadline, so this is a bounded best-effort, not a spin).
     const RX_TRIES: usize = 8;
@@ -551,7 +568,7 @@ fn usb_net_main(ctx: ServiceContext) -> ! {
     let mut info = [0u8; 7];
     if ctx.net_info(&mut info) {
         ctx.log_fmt(format_args!(
-            "nic-driver: usb-net up  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  link {}",
+            "nic-driver: kernel NIC up  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  link {}",
             info[0], info[1], info[2], info[3], info[4], info[5], if info[6] != 0 { "UP" } else { "down" }));
     } else {
         ctx.log("nic-driver: no usb-net device - serving empty replies (net degrades, not hangs)");
@@ -611,8 +628,18 @@ fn usb_net_main(ctx: ServiceContext) -> ! {
             out[0] = count;
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos]));
         } else if p.len() == 1 && matches!(p[0], 5 | 6 | 7 | 8) {
-            // Diagnostics / chaos force-link: not applicable to usb-net; ack so callers don't hang.
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[1u8]));
+            // UNSUPPORTED on this backend - answered `[0]`, not `[1]`.
+            //
+            // Ops 6/7/8 are the chaos force-link override. Acking them with `1` (success) meant
+            // `chaos link-flap` printed "forcing link DOWN ... net-stack should self-configure ... done"
+            // while nothing had been overridden: a chaos trial reporting it had exercised link recovery
+            // having exercised nothing. A test that cannot fail is not a test (Commandment II), and this
+            // one was worse than absent because it read as passing.
+            //
+            // Op 5 is a register dump; answering 1 byte to a caller expecting 25 is the same lie in
+            // miniature. The original comment was right that a caller must not hang and wrong that an
+            // ack was the remedy: the caller needs an ANSWER, and "not supported here" is one.
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8]));
         } else {
             // TX FRAME (any multi-byte payload) + coupled RX: transmit, then hand back one received frame.
             // A failed transmit used to be dropped on the floor: the reply still came back normally, so
@@ -637,15 +664,22 @@ fn usb_net_main(ctx: ServiceContext) -> ! {
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("nic-driver: starting");
 
-    // ARM (Raspberry Pi 2): there is no PCIe NIC. The NIC is a USB device driven in-kernel (DWC2 CDC-ECM);
-    // this backend bridges the same frame IPC net-stack speaks to the kernel USB-net syscalls. Same
-    // request/reply contract, different transport - exactly the block-driver x86/ARM split.
+    // Pi 4, with the driver where it belongs: the GENET MAC is ours, reached through the register
+    // window and DMA arena the kernel granted this service by name. No NET_DEVICE syscall is involved
+    // and the kernel drives no ethernet at all - which is the whole point (Commandment I, §4.4).
+    #[cfg(target_arch = "aarch64")]
+    genet::genet_main(ctx);
+
+    // Both ARM ports, otherwise: there is no PCIe NIC to scan for. The device is driven in-kernel
+    // (Pi 2: a DWC2 CDC-ECM USB adapter; Pi 4: the on-board GENET MAC) and this backend bridges the
+    // same frame IPC net-stack speaks to the NET_DEVICE syscalls. Same request/reply contract,
+    // different transport - exactly the block-driver x86/ARM split.
     #[cfg(target_arch = "arm")]
-    usb_net_main(ctx);
+    kernel_net_main(ctx);
 
     // Which NIC did the kernel find? nic-driver drives an Intel e1000 (the QEMU dev NIC) or a Realtek
     // RTL8168 (the T630); the kernel maps whichever one's BAR. Dispatch on the PCI identity (Phase 4).
-    #[cfg(not(target_arch = "arm"))]
+    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     if ctx.nic_vendor_device() == 0x8168_10EC {
         realtek_main(ctx); // RTL8168 - a separate path that never returns
     }

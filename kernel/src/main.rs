@@ -331,7 +331,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
         arch::imp::page_tables::harden_hhdm_nx();
         arch::imp::boot::audit_wx();
 
-        kprintln!("kernel: {} cores ready", smp::core::ready_count());
+        smp::core::report_cores_ready();
         kprintln!(
             "idle: cores may halt = {} (cool when idle if true)",
             arch::imp::interrupts::idle_can_halt()

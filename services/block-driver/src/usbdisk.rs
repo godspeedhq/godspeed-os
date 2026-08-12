@@ -52,6 +52,32 @@ use godspeed_sdk::{Message, ServiceContext, USB_DISK_BUSY, USB_DISK_ABSENT};
 /// Cost when it does happen: this task yields between attempts, so the wait costs nothing but its own
 /// latency - interrupts stay on, the timer runs, every other service runs.
 const BUSY_RETRIES: u32 = 6_000;
+
+/// How long a busy device may hold us off before we call it a failure - **the budget that actually
+/// means what it says**.
+///
+/// `BUSY_RETRIES` above is a COUNT, and a count is not a duration. It bounded the wait to ~30 s only
+/// because of an accident of the arm32 backend: DWC2 polls inside the syscall for about 5 ms per
+/// attempt, so 6000 of them happened to add up to the intended half-minute. The aarch64 backend
+/// returns BUSY immediately - correctly, it has nothing to wait on there - and the identical loop then
+/// burned its whole budget in **173 ms**, measured on the board. The device was never given time to
+/// finish, and a stick doing a block remap was declared broken a fifth of a second in.
+///
+/// That is the same trap as the chaos harness's `PACE_YIELDS`, where a yield count was read as a
+/// duration: a proxy for time that holds on one arch and silently means something else on the next.
+/// The tell is a bound whose real value depends on how fast the loop happens to run.
+///
+/// So the wait is bounded by the CLOCK, and the attempt count stays only as a runaway backstop.
+const BUSY_BUDGET_SECS: i64 = 30;
+
+/// Attempts to spend spinning before switching to a paced poll.
+///
+/// A device that is momentarily busy answers within a handful of attempts, and for that case a yield
+/// is exactly right - no sleep latency on the common path. Past this, the device is genuinely working
+/// (a remap, or garbage collection) and asking again 34,000 times a second neither helps it nor leaves
+/// this core free. One millisecond between attempts is still far finer than the device's own timescale.
+const SPIN_ATTEMPTS: u32 = 64;
+const BUSY_POLL_MS: u64 = 1;
 /// Seconds a single request may be re-asked before the operator is told it is still going.
 ///
 /// A healthy request is sub-millisecond, so crossing this means the device really is holding us off.
@@ -115,7 +141,22 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
                         _ => {}
                     }
                 }
-                ctx.yield_cpu();   // hand the CPU on, ask again
+                // Pace the retry, then check the wait against the CLOCK rather than the attempt count.
+                //
+                // Yielding alone is not a wait: it returns immediately when nothing else is runnable,
+                // which is how the whole budget went by in 173 ms on aarch64. Spin briefly for the
+                // momentarily-busy case, then poll at 1 kHz so the device gets real time and this core
+                // is genuinely free in between.
+                if n < SPIN_ATTEMPTS {
+                    ctx.yield_cpu();
+                } else {
+                    ctx.sleep_ms(BUSY_POLL_MS);
+                    if let Some(start) = t0 {
+                        if ctx.epoch_secs_monotonic() - start >= BUSY_BUDGET_SECS {
+                            break; // the budget is a duration, and it is spent
+                        }
+                    }
+                }
             }
             // NOTHING THERE. Not the same as busy, and the difference is the whole point of the code:
             // waiting is only ever right when the device is present and asking for time. Against an
@@ -140,7 +181,14 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
             // was only true of transport failures.
             code => {
                 ctx.log_fmt(format_args!(
-                    "block-driver: {} lba {} refused by kernel, status {}", what, lba, code));
+                    // WHO refused matters: under `usb-via-xhci` this failure came from the xhci
+                    // SERVICE, not the kernel, and naming the wrong one sends an operator to read
+                    // the wrong log. It said "refused by kernel" on the Pi 4's first userspace-USB
+                    // boot, where the kernel was not in the path at all.
+                    "block-driver: {} lba {} refused by {}, status {}",
+                    what, lba,
+                    if cfg!(target_arch = "arm") { "the kernel" } else { "the xhci service" },
+                    code));
                 return false;
             }
         }
@@ -152,11 +200,57 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
     // explaining why, which is precisely the unexplained failure §26.7 exists to prevent. The count
     // is the useful fact: it says the device was ALIVE and asking us to wait, for this long, and we
     // stopped - which is a different problem from a device that is broken, and has a different fix.
+    // Report the ELAPSED TIME, not the attempt count. The count was the misleading number all along:
+    // "gave up after 6000 busy retries" reads like half a minute of patience and was a sixth of a
+    // second, and nothing in the line said which. Seconds are the fact an operator can act on.
+    let waited = t0.map(|s| ctx.epoch_secs_monotonic() - s).unwrap_or(0);
     ctx.log_fmt(format_args!(
-        "block-driver: {} lba {} gave up after {} busy retries - the device stayed busy, it did not fail",
-        what, lba, BUSY_RETRIES));
+        "block-driver: {} lba {} gave up after {}s busy - the device stayed busy, it did not fail",
+        what, lba, waited));
     false
 }
+
+
+// --- Which USB stack backs this disk -----------------------------------------------------------
+//
+// Two routes to the same device, chosen at BUILD time and never at runtime. The in-kernel stack is
+// reached by syscall; the `xhci` SERVICE is reached by IPC. They are never mixed and there is no
+// fallback between them: a silent switch from the userspace driver to the kernel one would hide
+// exactly the failure this port exists to eliminate (§26.7), and would keep alive the in-kernel
+// stack that Commandment I says must go.
+//
+// The choice is a build flag rather than a probe because only the BUILD knows the answer: the
+// kernel's `xhci-userspace` feature is what stops it driving the controller, and a service cannot
+// ask the kernel whether it did. `scripts/pi4_build.py --xhci-userspace` sets both, which is why it
+// is one switch reaching several crates rather than a feature to remember per crate.
+
+// The return is the syscall's TRI-STATE i64 (0 = done, USB_DISK_BUSY, USB_DISK_ABSENT, other =
+// error), not a bool, because `with_busy_retry` acts differently on each and flattening them would
+// turn "the stick is thinking" into "the read failed".
+//
+// The service path never reports BUSY, and that is correct rather than a gap: the BOT layer inside
+// `xhci` already waits a slow device out (its transfer budget is generous precisely because the old
+// 2 s one aborted healthy commands). By the time it answers, the waiting has happened - so a failure
+// here is a real I/O error, and returning BUSY would send this loop off to wait another 30 s for a
+// device that already gave its answer.
+#[cfg(target_arch = "arm")]
+fn dev_read(ctx: &ServiceContext, lba: u64, buf: &mut [u8; 512]) -> i64 { ctx.usb_disk_read_status(lba, buf) }
+#[cfg(not(target_arch = "arm"))]
+fn dev_read(ctx: &ServiceContext, lba: u64, buf: &mut [u8; 512]) -> i64 {
+    if super::xhciblk::read(ctx, lba, buf) { 0 } else { -1 }
+}
+
+#[cfg(target_arch = "arm")]
+fn dev_write(ctx: &ServiceContext, lba: u64, buf: &[u8; 512]) -> i64 { ctx.usb_disk_write_status(lba, buf) }
+#[cfg(not(target_arch = "arm"))]
+fn dev_write(ctx: &ServiceContext, lba: u64, buf: &[u8; 512]) -> i64 {
+    if super::xhciblk::write(ctx, lba, buf) { 0 } else { -1 }
+}
+
+#[cfg(target_arch = "arm")]
+fn dev_flush(ctx: &ServiceContext) -> bool { ctx.usb_disk_flush() }
+#[cfg(not(target_arch = "arm"))]
+fn dev_flush(ctx: &ServiceContext) -> bool { super::xhciblk::flush(ctx) }
 
 /// Serve one block-IPC request. Same wire protocol as the AHCI and EMMC backends - `fs` is unaware of
 /// which one it is talking to.
@@ -167,11 +261,37 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
     if p[0] == OP_FLUSH {
         // The one backend that genuinely needs this: a stick acknowledges a WRITE(10) into its own
         // buffer, so without SYNCHRONIZE CACHE a reset loses the tail of everything just written.
-        let status = if ctx.usb_disk_flush() { STATUS_OK } else { STATUS_ERR };
+        let status = if dev_flush(ctx) { STATUS_OK } else { STATUS_ERR };
         let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
         return;
     }
     if p[0] == OP_CAPACITY {
+        // Ask the DEVICE. `sectors` (the startup count) is deliberately NOT used here.
+        //
+        // It was the second copy of one fact: `xhci` knows what is attached, and this held a snapshot
+        // of what it said at boot. Commandment III allows a derived view only while it is reconciled
+        // with its source, and nothing ever reconciled this one - so `drives` reported a size for a
+        // stick that had been unplugged.
+        //
+        // Reconciled AT THE CALL SITE, which is the only repair path guaranteed to run: a repair path
+        // invoked somewhere else may never be invoked at all. An earlier attempt at this was reverted
+        // because it appeared to cost input latency - that turned out to be logging and a pessimistic
+        // probe timeout, both since fixed, and a capacity query is not a hot path (mount, and `drives`).
+        #[cfg(not(target_arch = "arm"))]
+        let sectors = super::xhciblk::sectors_now(ctx);
+        // The SYSCALL path needs re-deriving every bit as much, and only the other one had it.
+        //
+        // The re-derive above is cfg-gated to `usb-via-xhci`, so a build without that feature served
+        // the BOOT-TIME snapshot forever. On a Pi 4 booted with no stick that snapshot is 0, so
+        // plugging a stick in changed nothing that anything above could see: xhci enumerated it and
+        // said "USB disk ready - 31266816 sectors" while `drives` reported no drive, for as long as
+        // the service lived. Killing block-driver fixed it because a fresh instance re-runs the
+        // startup query - which is the whole shape of the report, and the user diagnosed it from that.
+        //
+        // A snapshot of another component's truth has to be reconciled wherever it is served, not
+        // only on the backend that happened to get the fix first (§26.4, Commandment III).
+        #[cfg(target_arch = "arm")]
+        let sectors = ctx.usb_disk_sectors();
         let mut out = [0u8; 9];
         out[0] = STATUS_OK;
         out[1..9].copy_from_slice(&sectors.to_le_bytes());
@@ -183,7 +303,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
     match p[0] {
         OP_READ_BLOCK => {
             let mut buf = [0u8; 512];
-            if with_busy_retry(ctx, "read", lba, || ctx.usb_disk_read_status(lba, &mut buf)) {
+            if with_busy_retry(ctx, "read", lba, || dev_read(ctx, lba, &mut buf)) {
                 let mut out = [0u8; 513];
                 out[0] = STATUS_OK;
                 out[1..].copy_from_slice(&buf);
@@ -194,7 +314,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
             if p.len() < 521 { return err(ctx); }
             let mut buf = [0u8; 512];
             buf.copy_from_slice(&p[9..521]);
-            let status = if with_busy_retry(ctx, "write", lba, || ctx.usb_disk_write_status(lba, &buf)) { STATUS_OK } else { STATUS_ERR };
+            let status = if with_busy_retry(ctx, "write", lba, || dev_write(ctx, lba, &buf)) { STATUS_OK } else { STATUS_ERR };
             let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
         }
         OP_WRITE_ZEROS => {
@@ -203,7 +323,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
             let zero = [0u8; 512];
             let mut ok = true;
             for i in 0..count {
-                if !with_busy_retry(ctx, "write-zeros", lba + i, || ctx.usb_disk_write_status(lba + i, &zero)) { ok = false; break; }
+                if !with_busy_retry(ctx, "write-zeros", lba + i, || dev_write(ctx, lba + i, &zero)) { ok = false; break; }
             }
             let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[if ok { STATUS_OK } else { STATUS_ERR }]));
         }

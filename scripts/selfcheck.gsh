@@ -231,7 +231,37 @@ about | assert contains GodspeedOS
 version | assert contains GodspeedOS
 cores | assert contains cores
 mem | assert contains used
-date | assert contains :
+# The clock: PASS if it can be set, SKIP if this machine has no way to know the time.
+#
+# This board has no RTC, so `date` prints a time only once SNTP has set the clock. Three states,
+# confirmed on hardware: boot WITH ethernet -> set at boot+5s, passes; unplug afterwards -> stays set,
+# passes; boot WITHOUT ethernet -> never set, and the old assertion failed for a missing cable rather
+# than for anything wrong with GodspeedOS.
+#
+# The probe READS, it does not repair. An earlier version ran `date sync` here, and the user was right
+# to reject it: a check must not perform a network operation or set the machine's clock as a side
+# effect. That is a repair wearing a probe's face, it costs time on every run, and a test that changes
+# the system has stopped measuring it.
+#
+# `date epoch` yields 0 when the clock is unset, so iterating its output (`for line in (producer)`,
+# section 6 above) gives a testable value without touching anything. `assert contains` cannot serve as
+# the probe because it FAILS the suite rather than returning a boolean, and there is no bare
+# `contains` - that dead end is what made an earlier attempt invent syntax.
+#
+# When the clock IS set the format is still asserted properly, so a broken `date` still fails. Only
+# "this machine cannot know the time" is skipped, and it is skipped OUT LOUD, because a silent skip is
+# a test that has quietly stopped testing.
+#
+# (An earlier version of this hung the whole suite: it used `$var = ...`, which is not an assignment,
+# so a counter never incremented and a `wait 1` loop ran forever. Real grammar is in section 7 above:
+# `let mut` to declare, `name = $name + 1` to assign. Test script changes on hardware before shipping.)
+let mut clockset = 0
+for line in (date epoch) { if $line > 0 { clockset = 1 } }
+if $clockset > 0 {
+    date | assert contains :
+} else {
+    echo 'SKIP  date - the clock is not set on this machine (no RTC, no network); not a failure'
+}
 help | assert contains status
 # uptime - a record producer (wall-clock RTC delta): bare grid + json + column projection.
 assert ok uptime

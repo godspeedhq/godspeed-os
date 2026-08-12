@@ -192,7 +192,13 @@ pub static NIC_DMA_PHYS:  portable_atomic::AtomicU64 = portable_atomic::AtomicU6
 /// them). Six slices (up from two) so hub enumeration can address the hub AND its
 /// downstream devices at once (docs/usb-hub.md). Confined identity-mapped, so the
 /// device reaches all of it (§12, H1).
-const XHCI_DMA_PAGES:      u64 = 32 + 256;
+/// Plus 4 pages at the tail for the USB MASS-STORAGE region (`services/xhci/src/msc.rs`
+/// `DISK_BASE`): the two bulk transfer rings, the CBW/CSW page, and one data page. They sit past the
+/// scratchpad rather than sharing any earlier page ON PURPOSE - the Pi 4 port lost days to one DMA
+/// page owned by a keyboard report, a hub's port status AND the disk's CBW at once, where an armed
+/// interrupt endpoint overwrote a command mid-flight on every keypress. Four pages of arena buys
+/// that class of bug being unrepresentable.
+const XHCI_DMA_PAGES:      u64 = 32 + 256 + 4;
 /// Pages of contiguous DMA memory for the **EHCI** driver - 64 KiB, as on main.
 /// EHCI has no scratchpad concept, and its driver zeroes the whole arena on every
 /// control transfer; giving it the xHCI-sized 1 MiB arena (a leftover of sharing
@@ -471,10 +477,28 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // nic-driver (which DOES ship a contract) carries an ARM note in nic-driver.toml so a contract
         // reader is not misled; the shell ships no contract, so the kernel is trivially its only record.
         //   nic-driver bridges ethernet frames to/from the in-kernel USB-net device (NetFrame*, 42-44).
-        net_device: cfg!(target_arch = "arm") && matches!(name, "nic-driver"),
-        // USB_DISK: on ARM the USB stack is in-kernel, so `block-driver` reaches a USB stick through
-        // syscalls 46-48 rather than MMIO. Whole-device read/write reach, granted to that one service.
-        usb_disk: cfg!(target_arch = "arm") && matches!(name, "block-driver"),
+        // aarch64 joins arm here: the Pi 4's GENET driver backs the same NET_DEVICE syscalls the Pi 2's
+        // in-kernel USB-net bridge does, so `nic-driver` needs the same grant to reach it. Without it
+        // the service loads and runs and every frame call is denied, which looks like a dead network
+        // rather than a missing capability.
+        net_device: cfg!(any(target_arch = "arm", target_arch = "aarch64"))
+            && matches!(name, "nic-driver"),
+        // USB_DISK: `block-driver` reaches a USB stick through syscalls 46-48 rather than MMIO, on
+        // the port where the USB stack is IN THE KERNEL - which is now ARM32 (Pi 2) ONLY. On aarch64
+        // the in-kernel driver was deleted (CLAUDE.md §6.4, 2026-08-09) and block-driver goes through
+        // the `xhci` SERVICE over IPC, so the grant buys it nothing there.
+        //
+        // KEPT for aarch64 all the same, deliberately, and this is the honest reason: the syscalls
+        // still EXIST on that port as stubs, and a grant that matches where the mechanism lives is
+        // easier to reason about than one that does not. It is also a vestigial authority (audit
+        // SEC-37) - whole-device read/write reach handed to a service that no longer uses it - so the
+        // right end state is to delete the aarch64 stubs and narrow this to `target_arch = "arm"`.
+        // Recorded rather than done, because removing syscalls is a separate change with its own test.
+        //
+        // (The original note here claimed the stack is in-kernel on BOTH ARM ports. That was true when
+        // it was written and stopped being true when the aarch64 driver was deleted.)
+        usb_disk: cfg!(any(target_arch = "arm", target_arch = "aarch64"))
+            && matches!(name, "block-driver"),
         //   the shell's `gpio` command drives the SoC pins (the gated `Gpio` syscall, 45).
         gpio: cfg!(target_arch = "arm") && matches!(name, "shell"),
         //   SET_CLOCK, in two strengths (rights narrow, §7.4). WRITE = set the wall clock itself, held only
@@ -483,8 +507,20 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         //   off the disk at startup and records it before a reboot. The shell needs the bound, not the
         //   clock, so it does not get the power to step every task's time of day. A kernel-only by-name
         //   grant like NET_DEVICE (not a contract cap). ARM-gated: x86's CMOS RTC is the authority there.
-        set_clock:       cfg!(target_arch = "arm") && matches!(name, "net-stack"),
-        set_clock_floor: cfg!(target_arch = "arm") && matches!(name, "shell"),
+        // aarch64 joins arm for the same reason arm has it: the Pi 4 has no RTC either, so SNTP is the
+        // only source of a wall clock. Without the grant net-stack does the whole query, gets a real
+        // answer, and is refused at the last step - the clock stays at the boot epoch while the log
+        // says the time was fetched.
+        set_clock:       cfg!(any(target_arch = "arm", target_arch = "aarch64"))
+            && matches!(name, "net-stack"),
+        // aarch64 joins arm: the Pi 4 has no RTC either, so the floor the shell persists to
+        // /clock.last is what carries a network sync across a power cycle. READ, not WRITE - raising
+        // the floor only constrains which clock values are acceptable, where WRITE would let the shell
+        // step every task's view of the time of day. The narrower right already existed here; granting
+        // the shell plain `set_clock` instead would have handed it exactly the authority this split was
+        // built to withhold, and would have failed anyway - a WRITE cap does not satisfy a READ check.
+        set_clock_floor: cfg!(any(target_arch = "arm", target_arch = "aarch64"))
+            && matches!(name, "shell"),
     }
 }
 
@@ -674,6 +710,19 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "block-driver" => Some(("block-driver", ServiceConfig {
             elf:               include_bytes!(env!("SVC_BLOCK_DRIVER_ELF")),
             has_recv_endpoint: true, // serves block read/write requests from fs (§4)
+            // With the USB stack in userspace, block-driver reaches the disk by IPC to the `xhci`
+            // SERVICE - so it needs a SEND cap to that name. Without one, `request_with_reply("xhci",
+            // ..)` finds no send slot and returns None INSTANTLY. That is exactly what the Pi 4
+            // showed: the service sat in its poll loop with the disk bound, never receiving a single
+            // message, while block-driver burned its whole 20 s wait failing to address it. Every
+            // layer looked healthy in isolation, because the missing piece was the EDGE between them.
+            //
+            // block-driver reaches the disk THROUGH the xhci service on aarch64, so it needs a SEND
+            // cap to it. On arm32 the USB stack is still in the kernel (no PCIe, no device-IRQ
+            // routing to userspace yet), so there is no such peer there - see `arch/arm/CLAUDE.md`.
+            #[cfg(target_arch = "aarch64")]
+            send_peers:        &["xhci"],
+            #[cfg(not(target_arch = "aarch64"))]
             send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
             send_peers_grant:  false,
             // ARM pins this to core 0, and it is NOT a preference there - it is a requirement. The
@@ -699,12 +748,19 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true, // will serve the frame interface to net-stack (§12)
             send_peers:        &[],
             send_peers_grant:  false,
-            // ARM: the NIC is the in-kernel DWC2 USB device, driven only from core 0 - the ARM backend's
-            // NET_DEVICE syscalls guard on that core. x86: core 1 (co-located with net-stack + fs).
+            // ARM (Pi 2): the NIC is the in-kernel DWC2 USB device, driven only from core 0 - the ARM
+            // backend's NET_DEVICE syscalls guard on that core. x86 and aarch64 (Pi 4): core 1,
+            // co-located with net-stack + fs. The Pi 4 has no core-0 constraint because GENET is
+            // reached by MMIO from whichever core makes the syscall, not from a timer tick.
             preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
-            hw_irqs:           &[], // Phase 1 step 2: reset + MAC only; RX IRQ wired later
+            // GENET's macirq on aarch64 (SPI 157 -> neutral vector 0x2A). x86's nic-driver is a
+            // PCIe NIC with no such route, so the grant is arch-gated rather than unconditional.
+            #[cfg(target_arch = "aarch64")]
+            hw_irqs:           &[0x2A],
+            #[cfg(not(target_arch = "aarch64"))]
+            hw_irqs:           &[],
             has_console_read:  false,
         })),
         // net-stack (services/net-stack): the model-AGNOSTIC half of networking (docs/networking.md).
@@ -3187,7 +3243,16 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // sink's endpoint at runtime via the kernel directory (`acquire_send_grant_cap`) -
             // no contracted peer.
             has_recv_endpoint: true,
-            send_peers:        &["fs"],
+            // `block-driver` as well as `fs`, so `drives` can ask the DEVICE about the device.
+            //
+            // "Is there a disk and how big" is block-driver's fact; "is it mounted, what label, how
+            // free" is fs's. Routing both through `fs` made it answer a hardware question from its
+            // own mount state - which is how `drives` reported 15 GB for an unplugged stick. Each
+            // fact now comes from its owner (Commandment III).
+            //
+            // It also gives a useful answer when `fs` is dead: "disk present, filesystem
+            // unavailable" instead of nothing at all (§26.7).
+            send_peers:        &["fs", "block-driver"],
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,
@@ -3766,10 +3831,22 @@ fn spawn_service_with_config(
         };
         match arena {
             Some(phys) => {
-                let flags = PageFlags::PRESENT
+                // Cacheable or not is the ARCH's call, not this function's.
+                //
+                // The SDK's `Dma` wrapper does no cache maintenance, and says so: it assumes x86 DMA
+                // coherence and warns that a non-coherent arch "must add cache maintenance here ... or
+                // map the arena non-cacheable" (SEC-28). AArch64 and ARMv7 are non-coherent, so a
+                // userspace driver there would exchange stale data with its device and never be told -
+                // the same fault the in-kernel GENET driver had until every buffer got an explicit
+                // `dma_sync`. A service has no such primitive, so the MAPPING removes the need rather
+                // than resting on the driver author remembering.
+                let mut flags = PageFlags::PRESENT
                     | PageFlags::WRITABLE
                     | PageFlags::USER
                     | PageFlags::NO_EXEC;
+                if crate::arch::imp::DMA_ARENA_UNCACHED {
+                    flags |= PageFlags::PCD;
+                }
                 for i in 0..dma_pages {
                     let off = i * PAGE_SIZE as u64;
                     page_table
@@ -3937,7 +4014,10 @@ pub fn spawn_supervisor() {
 /// (page tables + kstack pool + cap wiring + ctx page + the ARM `finalize_service_address_space` hook).
 /// The full-OS build spawns via the supervisor instead; this is the direct probe. Requires the neutral
 /// bootstrap (percpu / scheduler arenas / capability) to have run first.
-#[cfg(target_arch = "arm")]
+/// Also used by the AArch64 (Pi 4) bring-up, which reaches the same milestone by the same route. The
+/// name keeps its `arm_` prefix because it is the ARM family's bring-up probe and renaming it would
+/// churn the 32-bit port for nothing; both ports delete it once the supervisor spawns their services.
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 pub fn arm_spawn_logger_neutral() {
     static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
     match spawn_service_with_config(

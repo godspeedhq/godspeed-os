@@ -15,9 +15,6 @@ path = "src/main.rs"
 # (bare-metal USB) so core 0 is not loaded with harness-driven probes that
 # require the QEMU control port to complete (e.g. probe-4b, probe-hog).
 bare-metal = []
-# Additionally spawn `block-driver` (persistence smoke test, docs/persistence.md
-# Phase 1). Combined with `bare-metal` by `osdev test blockdev`, which attaches a
-# disk on the ATA secondary channel; block-driver reads sector 0 and logs it.
 blockdev = []
 # Additionally spawn `counter` (examples/counter) on top of the bare-metal set (shell + block-driver
 # + fs). `counter` persists a running count to `fs` and recovers it across its OWN restart (§14/§15);

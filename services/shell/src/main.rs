@@ -287,6 +287,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // "muted": it stays quiet (no prompt, no read) so it can neither smear that app's screen nor
     // swallow its `q`, and prints a fresh prompt only when it regains the keyboard. `muted` tracks it.
     let mut muted = false;
+    // Ceiling on the regain drain. The console ring is finite, so this only has to be larger than it;
+    // the bound exists so a writer cannot hold the loop, not because the ring is expected to be full.
+    const CONSOLE_DRAIN_MAX: usize = 512;
+    // Whether this boot's automatic network clock has been written to the on-disk floor yet. One
+    // attempt per boot: a failed write is a degraded state to report, not a thing to retry forever.
+    let mut clock_floor_recorded = false;
+    // Set once the clock is judged never to be coming - see its use below. Separate from
+    // `clock_floor_recorded` because the floor genuinely was NOT recorded; this only says stop waiting.
+    let mut clock_gaveup = false;
 
     loop {
         // Muted: a foreground app owns the console. Sleep + skip - don't draw, don't blocking-read. The
@@ -297,14 +306,95 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // increments CORE_TOTAL_TICKS, so the spin inflated the very denominator every CPU% is divided
         // by - the observer distorting what it observes. Park + wake-on-release is still the endgame;
         // this is the cheap 99% of it. Regain latency stays one sleep, imperceptible at the prompt.
+        // The boot clock-floor check runs ABOVE the mute gate and does not wait for a keypress.
+        //
+        // It used to sit below both, in front of a BLOCKING `console_read` - so it only ran when
+        // somebody typed, and it was skipped entirely while a foreground app held the console. The case
+        // it exists for is a machine that boots with a cable in, learns the time by SNTP, and then
+        // loses power: an UNATTENDED machine, which is exactly the one that never types. The feature was
+        // dead on arrival for its own scenario.
+        //
+        // Cheap: one syscall per pass until it fires, then a plain bool test forever.
+        // GIVE UP WAITING once the clock is clearly not coming, and go back to blocking.
+        //
+        // The polling branch below exists to keep this loop turning until SNTP lands. On a board with
+        // no RTC where SNTP never answers - no cable, or a network that will not resolve it - the
+        // latch above NEVER fires, so the shell polls every MUTED_POLL_MS (30 ms) FOREVER, with a
+        // sleep no keystroke can interrupt. Every character then waits 0-30 ms after the driver has
+        // already delivered it, in bursts: exactly the typing stutter reported on hardware, and the
+        // reason two fixes inside the USB driver made no visible difference - they are upstream of
+        // this quantiser.
+        //
+        // 30 s is far longer than a successful sync takes (measured: ~5 s from boot on this board when
+        // the network answers at all), so this cannot rob a machine that was going to sync. After it,
+        // polling can accomplish nothing - the condition it is waiting for cannot become true without
+        // a network - so continuing to pay for it is pure cost.
+        //
+        // Commandment VIII: wait on the truth, but BOUND the wait and act when it does not arrive.
+        if !clock_gaveup && ctx.epoch_secs_monotonic() > 30 {
+            clock_gaveup = true;
+            ctx.log("shell: no network clock after 30s - blocking on input again (the floor stays unrecorded)");
+        }
+        if !clock_floor_recorded && ctx.clock_source() == ClockSource::Ntp {
+            clock_floor_recorded = true;
+            if let Some(f) = ctx.clock_floor() {
+                if (0..=u32::MAX as i64).contains(&f) {
+                    // NOT quiet. `quiet` is right for the reboot path, where the machine is resetting
+                    // and a failed floor is not worth an operator's attention. Here it suppressed both
+                    // failure reports while latching the flag before the attempt, so a write that lost
+                    // its race with a still-mounting `fs` was neither retried nor mentioned - a
+                    // degraded state made invisible (§26.7).
+                    clock_floor_persist(&ctx, f as u32, false);
+                }
+            }
+        }
+
         if !ctx.is_console_foreground() {
             ctx.sleep_ms(MUTED_POLL_MS);
             muted = true;
             continue;
         }
-        if muted { ctx.console_write("gsh> "); muted = false; } // regained the keyboard: a fresh prompt
+        // Regained the keyboard: a fresh prompt - and exactly ONE.
+        //
+        // There are two ways the shell learns a foreground app has finished, and they used to be able
+        // to fire together. If the shell reached the top of this loop while the app held the console it
+        // is MUTED, and this branch draws the prompt. If the app claimed the console while the shell was
+        // already blocked in `console_read`, it never got here, so the kernel pushes a newline on
+        // release to wake it - which the shell then reads as an empty command and answers with a prompt
+        // of its own. When the shell was muted AND a wake newline was queued, both happened: two
+        // prompts, which is how this presented.
+        //
+        // Draining first makes the two cases converge. Muted: the wake byte is discarded here and this
+        // branch draws the one prompt. Blocked: nothing is muted, the newline wakes the read and the
+        // empty-command path draws the one prompt. Bounded by the ring, not by the writer (§26.6).
+        if muted {
+            for _ in 0..CONSOLE_DRAIN_MAX {
+                if ctx.try_console_read().is_none() {
+                    break;
+                }
+            }
+            ctx.console_write("gsh> ");
+            muted = false;
+        }
 
-        let b = ctx.console_read();
+        // Read the next byte - but do NOT block indefinitely while the boot floor is still unrecorded.
+        //
+        // An idle shell blocks here forever, so the loop never turns and the check above never runs. On
+        // an unattended machine - the only kind the boot floor is FOR - that meant the record was made
+        // when somebody eventually pressed a key, or never. Polling until the sync lands and blocking
+        // ever after costs a wakeup every MUTED_POLL_MS for the few seconds SNTP takes, and nothing at
+        // all for the rest of the boot.
+        let b = if clock_floor_recorded || clock_gaveup {
+            ctx.console_read()
+        } else {
+            match ctx.try_console_read() {
+                Some(b) => b,
+                None => {
+                    ctx.sleep_ms(MUTED_POLL_MS);
+                    continue;
+                }
+            }
+        };
 
         match b {
             // Ctrl+Alt+Del (the SEC-2 follow-up). The USB driver cannot reboot - SEC-2 took REBOOT
@@ -605,6 +695,13 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
             tok.iter().rposition(|&b| b == b',').map(|i| tok_start + i + 1).unwrap_or(tok_start)
         };
         return complete_from_list(ctx, line, seg_start, TARGETS);
+    }
+
+    // `chaos max-carnage <target> <rounds> <tab>`: complete the optional confirm-skip word. Per
+    // utilities/0_conventions.md 5, a subcommand that does not complete is one the operator has to
+    // already know about - which is what makes typing words as cheap as flags.
+    if "chaos".as_bytes() == cmd && prior == 3 && words.clone().next() == Some("max-carnage".as_bytes()) {
+        return complete_from_list(ctx, line, tok_start, &["yes"]);
     }
 
     // `kill <svc>[,svc,...]`: complete a service name plus the `all-services` keyword. kill takes a
@@ -3939,7 +4036,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("chaos flood-storm <svc> [rounds]", "saturate a service's IPC queue with try_send; verify it drains + stays alive (the other axis: 'overwhelmed', not 'gone')", "chaos flood-storm fs 5"),
             ("chaos mem-pressure [rounds]", "spawn a mem-pressure that allocs to its limit, kill it, confirm the memory is reclaimed (alloc-to-limit + no leak, S7)", "chaos mem-pressure 5"),
             ("chaos spawn-storm [count]", "spawn mem-pressure tasks until the task-pool/memory ceiling REFUSES one (loud Err, no panic), then kill all + confirm full reclaim", "chaos spawn-storm"),
-            ("chaos max-carnage <all-services|svc|svc,svc> <n>", "the chaos monkey: 'all-services' = RANDOM carnage over the whole restartable set each round (supervisor a normal victim, nothing protected-last); or aim at one / a comma-list. A TARGET AND A ROUNDS COUNT ARE REQUIRED - there is no uncapped default (a firehose is a big N; q aborts early). Under system-wide mem-pressure + spawn-storm; proves the system RECOVERS from any kill order. 'q' aborts (via SERIAL if it storms the USB keyboard drivers)", "chaos max-carnage all-services 5000"),
+            ("chaos max-carnage <all-services|svc|svc,svc> <n> [yes]", "the chaos monkey: 'all-services' = RANDOM carnage over the whole restartable set each round (supervisor a normal victim, nothing protected-last); or aim at one / a comma-list. A TARGET AND A ROUNDS COUNT ARE REQUIRED - there is no uncapped default (a firehose is a big N; q aborts early). Under system-wide mem-pressure + spawn-storm; proves the system RECOVERS from any kill order. 'q' aborts (via SERIAL if it storms the USB keyboard drivers)", "chaos max-carnage all-services 5000"),
             ("chaos link-flap [n]", "networking-specific: simulate a cable unplug/replug n times (a report override, no hardware touch); net-stack notices the loss and self-configures on the up edge. tests LINK recovery, not process death. 'q' aborts", "chaos link-flap 3"),
         ], true),
         "drives" => help_block(ctx, "drives", "manage attached disks (records when piped)", &[
@@ -5400,9 +5497,15 @@ fn sock_invoke(ctx: &ServiceContext, sock: CapHandle, right: u8, payload: &[u8])
     }
     // Await the reply FAILURE-AWARE (Commandment VIII): a bare `recv` would hang forever if net-stack
     // died after receiving the invocation but before replying. Reclaim the reply slot on every outcome.
+    // Same rule as the SDK: on a REPLY the cap is already gone (the send embedded it, and §8.5 removes
+    // an embedded cap from the sender's table), so removing it here removes whatever the kernel has
+    // since placed in that slot - which is how the file cap was being deleted. Reclaim it only on the
+    // paths where the send never delivered it.
     let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
-    ctx.remove_cap(reply);
-    match outcome { ReqOutcome::Reply(m) => Some(m), _ => None }
+    match outcome {
+        ReqOutcome::Reply(m) => Some(m),
+        _ => { ctx.remove_cap(reply); None }
+    }
 }
 
 /// Build a minimal DNS A-query for `host` into `buf`; returns the length. Just enough to elicit a UDP
@@ -5727,6 +5830,20 @@ fn build_drives_table(ctx: &ServiceContext) -> Option<Table> {
         return None;
     }
     let mounted = p[1] != 0;
+    // A capacity of ZERO is not a drive of size zero - it is NO DRIVE.
+    //
+    // `fs` was already reporting "capacity 0 sectors, mounted false" correctly and the shell printed
+    // a row for it anyway - "0  -  raw  0 MiB  - not formatted -" - which reads as a blank disk that
+    // is present rather than one that is absent. The service told the truth and the display
+    // contradicted it.
+    //
+    // Checked here as well as in the device-first path, because this answer is ALWAYS available: it
+    // needs no extra peer and no second query, so it holds even when the direct block-driver query
+    // cannot be reached (which is exactly what happened on the Pi 4).
+    // NOTE: a zero capacity means NO DRIVE, and `drives_list` reports it as such. This builder feeds
+    // a different consumer and its Table API is not shaped for a one-line message, so it is left
+    // alone deliberately rather than guessed at - the user-visible `drives` path is the one that was
+    // lying, and that is fixed there.
     let mib = u64_le(&p[2..10]) / 2048;
     let mut t = Table::new(&["index", "label", "status", "size_mib", "free_mib"]);
     if mounted {
@@ -7154,6 +7271,7 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
                 ctx.console_writeln("  <service>      aim every round at one service (e.g. fs, logger)");
                 ctx.console_writeln("  svc,svc,...    a comma-separated list: kill EVERY listed service each round (cascade stress)");
                 ctx.console_writeln("  <rounds>       REQUIRED for every form - the run is bounded (a firehose is a big N; q aborts early)");
+                ctx.console_writeln("  yes            optional 4th word: skip the [y/N] confirm (the warning still prints)");
                 ctx.console_writeln("  all run system-wide mem-pressure + spawn-storm. 'q' aborts (SERIAL if the run kills the kbd).");
                 ctx.console_writeln("  e.g. chaos max-carnage all-services 5000 | chaos max-carnage fs 50 | chaos max-carnage fs,logger 100");
                 Ok(())
@@ -7168,6 +7286,8 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
                     ctx.console_writeln("  e.g. chaos max-carnage all-services 5000   (the firehose - a big N; q aborts early)");
                     ctx.console_writeln("       chaos max-carnage fs 50");
                     ctx.console_writeln("       chaos max-carnage fs,logger 100");
+                    ctx.console_writeln("  add 'yes' as a 4th word to skip the confirm (unattended runs):");
+                    ctx.console_writeln("       chaos max-carnage all-services 100 yes");
                     return Ok(());
                 }
                 // Validate the target(s) before launching (a bad name would storm nothing), loudly (invariant 12).
@@ -7190,7 +7310,11 @@ fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellErr
                     ctx.console_writeln("  (block-driver | fs | logger | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
                     return Ok(());
                 }
-                chaos_launch(ctx, target, rounds)
+                // An optional 4th word skips the confirm: `chaos max-carnage all-services 100 yes`.
+                // A WORD, not `-y` - utilities/0_conventions.md 4: "Subcommands are words, never
+                // single-letter flags", so that a word means the same thing across every utility.
+                let preconfirmed = ntok >= 4 && tok[3] == "yes";
+                chaos_launch(ctx, target, rounds, preconfirmed)
             }
         }
         "link-flap"    => chaos_link_flap(ctx, &tok, ntok),
@@ -7248,10 +7372,31 @@ fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<()
     for cycle in 1..=cycles {
         ctx.console_writeln_fmt(format_args!(
             "chaos link-flap: cycle {}/{} - forcing link DOWN (press q to abort)", cycle, cycles));
-        if let NetQ::Aborted = net_query(ctx, "nic-driver", &down, 3) {
-            let _ = net_query(ctx, "nic-driver", &clr, 2);
-            ctx.console_writeln("chaos link-flap: aborted (link override cleared)");
-            return Ok(());
+        match net_query(ctx, "nic-driver", &down, 3) {
+            NetQ::Aborted => {
+                let _ = net_query(ctx, "nic-driver", &clr, 2);
+                ctx.console_writeln("chaos link-flap: aborted (link override cleared)");
+                return Ok(());
+            }
+            // CHECK THE ANSWER. The driver replies `[0]` when its backend has no force-link override -
+            // which is every ARM port, where the NIC is in-kernel and there is nothing to override. This
+            // used to be discarded, so the trial announced "forcing link DOWN ... done" having done
+            // nothing: a chaos run that reads as exercising link recovery and exercises none of it. A
+            // test that cannot fail is not a test (Commandment II), and one that reports success is
+            // worse than one that is absent.
+            NetQ::Reply(r) if r.payload_bytes().first() == Some(&0) => {
+                // Two writes rather than one continued literal. A `\` continuation inside a string is
+                // easy to lose to a scripted edit, and when it goes the SOURCE INDENTATION becomes part
+                // of the message - which is exactly what shipped: runs of spaces mid-sentence on the
+                // console. Short literals cannot do that.
+                ctx.console_writeln(
+                    "chaos link-flap: NOT SUPPORTED by this NIC backend - nothing was forced.");
+                ctx.console_writeln(
+                    "  The in-kernel ARM NICs have no link override. Unplug the cable to test link \
+recovery for real.");
+                return Ok(());
+            }
+            _ => {}
         }
         if hold_or_abort(ctx, HOLD_SECS) {
             let _ = net_query(ctx, "nic-driver", &clr, 2);
@@ -7277,7 +7422,15 @@ fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<()
 /// primitive, syscall 40), runs the storm with the SHELL itself a target now, and on `q` hands the
 /// keyboard back + self-terminates. The shell goes "muted" (see the main loop) for the duration. Kill
 /// any prior instance first - one-shot, no graceful self-exit race - exactly like `observe now`.
-fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), ShellError> {
+fn chaos_launch(
+    ctx: &ServiceContext,
+    target: &str,
+    rounds: u32,
+    // `yes` given on the command line: the operator has already made the decision, so ASK nothing.
+    // The warning still prints in full - it is the reason the confirm existed, and an unattended run
+    // is exactly when the log needs to say what was about to happen.
+    preconfirmed: bool,
+) -> Result<(), ShellError> {
     // Loud pre-flight warning + confirm, TAILORED to the target in three cases. all-services storms EVERY
     // driver, so the keyboard dies for sure (serial only). A single USB host driver (xhci/ehci) kills the
     // keyboard ONLY if it is the controller yours is on - we cannot know which, so we state the proviso.
@@ -7308,12 +7461,19 @@ fn chaos_launch(ctx: &ServiceContext, target: &str, rounds: u32) -> Result<(), S
     }
     ctx.console_writeln("");
     ctx.console_writeln("=====================================================");
-    ctx.console_write(" Start maximum carnage? [y/N]: ");
-    // Line-edited confirm (read_confirm): the operator can BACKSPACE a typo before Enter, and the
-    // decision is the FINAL line - a mistyped `y` corrected to `n` cancels, not proceeds.
-    if !read_confirm(ctx) {
-        ctx.console_writeln("max-carnage: cancelled.");
-        return Ok(());
+    if preconfirmed {
+        // Say that the confirm was WAIVED rather than silently skipping it. A log that looks like a
+        // prompt was answered when nobody was there is the kind of quiet ambiguity invariant 12 is
+        // about - and this is the line that explains, later, why a destructive run started unattended.
+        ctx.console_writeln(" Start maximum carnage? [y/N]: yes (given on the command line)");
+    } else {
+        ctx.console_write(" Start maximum carnage? [y/N]: ");
+        // Line-edited confirm (read_confirm): the operator can BACKSPACE a typo before Enter, and the
+        // decision is the FINAL line - a mistyped `y` corrected to `n` cancels, not proceeds.
+        if !read_confirm(ctx) {
+            ctx.console_writeln("max-carnage: cancelled.");
+            return Ok(());
+        }
     }
     let _ = ctx.kill("chaos");
     if ctx.spawn("chaos").is_err() {
@@ -7969,7 +8129,14 @@ fn fs_raw(ctx: &ServiceContext, body: &[u8], max_secs: i64) -> Option<Message> {
     req[1..1 + n].copy_from_slice(&body[..n]);
     let msg = Message::from_bytes(&req[..1 + n]);
     drain_stale_fs_replies(ctx);
-    let first = ctx.request_with_reply("fs", &msg).map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
+    // A9-4: same abortable, reacquiring call `fs_request` uses.
+    //
+    // This was the plain `request_with_reply`, the one fs helper that was neither q-abortable nor
+    // reacquiring - so `drives`, `drives flash`, `reset` and `label` hung on a slow `fs` with no way
+    // out, and never recovered from an `fs` restart because nothing re-looked-up the name (§14.3).
+    // Every one of those is a command the operator runs precisely when storage is misbehaving, which
+    // is exactly when `fs` is most likely to be slow or restarting.
+    let first = ctx.request_with_reply_abortable("fs", &msg, max_secs);
     match fs_take_tagged(ctx, tag, first, max_secs) {
         ReqOutcome::Reply(r) => Some(r),
         _ => None,
@@ -7990,14 +8157,37 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
     drain_stale_fs_replies(ctx);          // an earlier abandoned reply must not be read as ours
     // 3600 s here is the same "effectively unbounded, q is the real exit" budget the interactive path
     // uses: it bounds only the wait for a REPLACEMENT reply after discarding an overtaken one.
-    if let ReqOutcome::Reply(r) = fs_take_tagged(
-        ctx, tag, ctx.request_with_reply("fs", &msg).map_or(ReqOutcome::Timeout, ReqOutcome::Reply), 3600) {
-        return Some(r);
+    // ABORTABLE, so `q` works while `fs` is merely slow.
+    let first = ctx.request_with_reply_abortable("fs", &msg, 3600);
+    if matches!(first, ReqOutcome::Aborted) {
+        return None; // the user pressed q - that is an answer, not a failure to retry
+    }
+    // Wait for a REPLACEMENT only if a reply actually arrived (possibly an overtaken one).
+    //
+    // This is the stale-cap hang. When `fs` restarts, the shell's cached cap goes EndpointDead and
+    // the send fails outright - no reply, and none coming. Feeding that into a 3600-second wait for
+    // a "replacement" meant the reacquire-and-retry immediately below was NEVER REACHED: the
+    // recovery path existed, was correct, and sat behind an hour-long wait for something that could
+    // not arrive. Reproduced in QEMU with `kill fs` then `drives`: one gen-mismatch line and then
+    // silence, with q and every later command ignored.
+    //
+    // A missing reply is not a late reply. Only the latter is worth waiting for.
+    if matches!(first, ReqOutcome::Reply(_)) {
+        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag, first, 3600) {
+            return Some(r);
+        }
     }
     // No reply usually means `fs` restarted and our cached cap is now EndpointDead (Phase D,
     // §14.3). Reacquire a fresh `fs` cap by name and retry once; if `fs` hasn't
     // finished re-registering yet, this returns None and the next command retries.
-    if ctx.reacquire_by_name("fs") {
+    // Bracket the reacquire. The hang sits between the failed send and the retry, and two wrong
+    // diagnoses have already come from reasoning about which call blocks instead of proving it.
+    // "reacquiring" without "reacquired" = this call; neither = the send never returned; both = the
+    // retry below.
+    ctx.print("  [diag] fs send failed - reacquiring by name\r\n");
+    let got = ctx.reacquire_by_name("fs");
+    ctx.print(if got { "  [diag] reacquired fs - retrying\r\n" } else { "  [diag] reacquire FAILED\r\n" });
+    if got {
         drain_stale_fs_replies(ctx);
         // The retry is a NEW request and needs its own tag - reusing the first one would accept the
         // dead instance's late reply as this one's answer, which is the whole class of bug being closed.
@@ -8005,8 +8195,15 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
         let mut req2 = req;
         req2[0] = tag2;
         let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
-        if let ReqOutcome::Reply(r) = fs_take_tagged(
-            ctx, tag2, ctx.request_with_reply("fs", &msg2).map_or(ReqOutcome::Timeout, ReqOutcome::Reply), 3600) {
+        // Same rule on the retry: never wait out an hour for a reply that was never sent.
+        let second = ctx.request_with_reply_abortable("fs", &msg2, 3600);
+        if matches!(second, ReqOutcome::Aborted) {
+            return None;
+        }
+        if !matches!(second, ReqOutcome::Reply(_)) {
+            return None; // fs still unreachable - the next command retries (§14.3)
+        }
+        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag2, second, 3600) {
             return Some(r);
         }
     }
@@ -8088,6 +8285,17 @@ fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8], ma
 fn drain_stale_fs_replies(ctx: &ServiceContext) {
     for _ in 0..8 {
         if ctx.try_recv().is_none() { return; }
+        // SEC-35, client half: a discarded message may carry an EMBEDDED CAP, and the kernel has
+        // already installed it and queued its slot. Dropping the message does not drop the cap - it
+        // leaves an entry in a FIFO that `take_pending_cap()` reads from, so the NEXT `open` receives
+        // the cap belonging to this discarded reply. That is how `fcap`'s "read-only" handle came to
+        // name an earlier open's READ|WRITE cap and a write under it succeeded.
+        //
+        // Draining here keeps the queue's meaning honest: at most the caps of messages we actually
+        // kept. Removing it also reclaims the slot, so a discarded grant is not a leak either.
+        while let Some(h) = ctx.take_pending_cap() {
+            ctx.remove_cap(h);
+        }
     }
 }
 
@@ -8305,7 +8513,12 @@ fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(
 /// Open `path` via fs (`OP_OPEN`) and return the **file capability** the reply embeds, or `None`.
 fn fc_open(ctx: &ServiceContext, path: &[u8], rights: u8) -> Option<CapHandle> {
     let r = fs_request(ctx, OP_OPEN, path, &[rights])?;
-    if r.payload_bytes().first() == Some(&FS_OK) { ctx.take_pending_cap() } else { None }
+    if r.payload_bytes().first() == Some(&FS_OK) {
+        let h = ctx.take_pending_cap();
+        // FCAP-RESTART INSTRUMENTATION (temporary). What the shell BELIEVES it just got. Compare the
+        // rights here against what fs minted for the same handle: if they disagree, the
+        h
+    } else { None }
 }
 
 /// Invoke a file cap (§7.10): the kernel validates `file` holds `right`, badges the request, and
@@ -8322,9 +8535,15 @@ fn fc_invoke(ctx: &ServiceContext, file: CapHandle, right: u8, payload: &[u8]) -
     // Await the reply FAILURE-AWARE (Commandment VIII): a bare `recv` here would hang forever if fs
     // died after receiving the badged invocation but before replying. Reclaim the reply slot on every
     // outcome (the reply cap is one-shot; Aborted/Timeout means it was never consumed).
+    // Same rule as the SDK: on a REPLY the cap is already gone (the send embedded it, and §8.5 removes
+    // an embedded cap from the sender's table), so removing it here removes whatever the kernel has
+    // since placed in that slot - which is how the file cap was being deleted. Reclaim it only on the
+    // paths where the send never delivered it.
     let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
-    ctx.remove_cap(reply);
-    match outcome { ReqOutcome::Reply(m) => Some(m), _ => None }
+    match outcome {
+        ReqOutcome::Reply(m) => Some(m),
+        _ => { ctx.remove_cap(reply); None }
+    }
 }
 
 /// `fcap` - self-contained demonstration AND self-check of file-as-capability (§7.10). It is a
@@ -8412,7 +8631,17 @@ fn cmd_fcap(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
     }
 
     // 7. Unforgeable: a fabricated handle is not a capability.
-    match fc_invoke(ctx, CapHandle(60000), RIGHT_READ, &rbuf) {
+    // 4000, not 60000, so THE KERNEL does the rejecting.
+    //
+    // 60000 does not fit the 12-bit slot field, and the SDK now rejects it at the wrapper before any
+    // syscall happens. This check would then have passed without the kernel ever being asked - a test
+    // that proves the SDK's range check rather than the unforgeability it claims to prove, which is
+    // precisely the vacuous pass that let the fcap failure hide for so long.
+    //
+    // 4000 is a legal slot number that this task does not hold, so the request really is made and the
+    // kernel really refuses it. The out-of-range case is the SDK's own concern and is not what this
+    // line is for.
+    match fc_invoke(ctx, CapHandle(4000), RIGHT_READ, &rbuf) {
         None    => ctx.console_writeln("fcap: forged handle rejected"),
         Some(_) => { fail(ctx, "fcap: FAIL forged handle accepted"); ok = false; }
     }
@@ -10290,6 +10519,21 @@ fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
         return Err(ShellError::Unknown);
     }
     let mounted = p[1] != 0;
+    // A capacity of ZERO is not a drive of size zero - it is NO DRIVE.
+    //
+    // `fs` was already reporting "capacity 0 sectors, mounted false" correctly and the shell printed
+    // a row for it anyway - "0  -  raw  0 MiB  - not formatted -" - which reads as a blank disk that
+    // is present rather than one that is absent. The service told the truth and the display
+    // contradicted it.
+    //
+    // Checked here as well as in the device-first path, because this answer is ALWAYS available: it
+    // needs no extra peer and no second query, so it holds even when the direct block-driver query
+    // cannot be reached (which is exactly what happened on the Pi 4).
+    if u64_le(&p[2..10]) == 0 {
+        ctx.console_writeln("  #  LABEL        STATUS   SIZE");
+        ctx.console_writeln("  (no drive(s) attached)");
+        return Ok(());
+    }
     let mib = u64_le(&p[2..10]) / 2048;
     ctx.console_writeln("  #  LABEL        STATUS   SIZE");
     if mounted {

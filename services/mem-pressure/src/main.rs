@@ -16,6 +16,15 @@ use godspeed_sdk::{ServiceContext, service_context::AllocError};
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // Force the EL0 fault the kernel's recovery path is supposed to survive (see this crate's
+    // `el0-fault-test` feature). The kernel must KILL this task and keep running; if the machine
+    // stops here, the recovery is broken and the log's last line says which task it stopped on.
+    #[cfg(feature = "el0-fault-test")]
+    {
+        ctx.log("mem-pressure: el0-fault-test - taking a deliberate null read; the kernel must kill ME, not the machine");
+        godspeed_sdk::adversarial::fault_null_read();
+        ctx.log("mem-pressure: STILL ALIVE after a null read - the kernel did NOT fault-kill this task");
+    }
     const CHUNK: usize = 4 * 1024 * 1024; // 4 MiB - same chunk the S7 probe uses
 
     let mut at_limit = false;

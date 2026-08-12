@@ -470,6 +470,19 @@ pub fn reserve_task_slot(core_id: u32) -> Option<usize> {
                     // x86 (TSO) an Acquire load / Release store is identical codegen to Relaxed (a plain
                     // mov), so this is behaviour-neutral there.
                     TASK_CORE[i]  = core_id;
+                    // SEC-35: a task slot must not inherit the previous occupant's pending caps.
+                    //
+                    // `TASK_PENDING_RECV_CAP_COUNT` was never reset across task lives, so a respawned
+                    // task started with entries queued by the DEAD one. `pop_pending_recv_cap` is
+                    // FIFO, so the next `take_pending_cap()` returned a cap the new instance never
+                    // asked for - and `fc_open` trusts what it is handed. That is the file-capability
+                    // escalation seen once after a chaos run: `fcap`'s "read-only" handle named an
+                    // earlier open's READ|WRITE cap, so a write under it succeeded.
+                    //
+                    // Reset HERE, where a slot is claimed, because that is the one point every task
+                    // life begins at - a reset on the death path would be missed by any death that
+                    // does not run it (a kill from another core, a panic-adjacent teardown).
+                    TASK_PENDING_RECV_CAP_COUNT[i] = 0;
                     TASK_VALID[i].store(true, Ordering::Release);
                     found = Some(i);
                     break;
@@ -535,7 +548,7 @@ pub unsafe fn commit_task(
     unsafe {
         TASK_CTX[slot].write(ctx);
         TASK_NAME[slot]             = name;
-        TASK_SPAWN_DT[slot].store(crate::arch::imp::rtc::now_epoch_monotonic().max(0) as u64, Ordering::Relaxed);
+        TASK_SPAWN_DT[slot].store(crate::arch::imp::rtc::now_epoch_monotonic().max(1).max(0) as u64, Ordering::Relaxed);
         TASK_IS_USER[slot]          = is_user;
         // Arch hook: on ARM a user task's syscalls must run atomically (the timer skips preempting it
         // in SVC), which needs the slot recorded arch-locally. No-op on x86 (it reads TASK_IS_USER).
@@ -575,7 +588,7 @@ pub fn enqueue(
                 TASK_CAP[i].write(caps);
                 TASK_STATE[i].store(TaskState::Ready as u8, Ordering::Relaxed);
                 TASK_NAME[i]             = name;
-                TASK_SPAWN_DT[i].store(crate::arch::imp::rtc::now_epoch_monotonic().max(0) as u64, Ordering::Relaxed);
+                TASK_SPAWN_DT[i].store(crate::arch::imp::rtc::now_epoch_monotonic().max(1).max(0) as u64, Ordering::Relaxed);
                 TASK_VALID[i].store(true, Ordering::Release);
                 TASK_CORE[i]             = core_id;
                 TASK_IS_USER[i]          = is_user;
@@ -885,6 +898,15 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
                 // and the deglitched RTC epoch on x86, so `now - spawn` is correct on both. saturating_sub
                 // floors a backwards read; the monotonic timeline caps it at the system uptime intrinsically
                 // (a task can't spawn before boot). 0 if never stamped (empty slot / spawned at second 0).
+                // 0 means UNSTAMPED (an empty slot), and only that.
+                //
+                // It used to also mean "spawned during the first second of boot", because the stamp
+                // is seconds-since-boot and every boot service spawns inside that window. On a board
+                // with no RTC that is every service, every boot: they all read a spawn of 0, hit this
+                // guard, and reported an uptime of 0 FOREVER - which is what `observe` shows. The
+                // stamp is now floored to 1 at the two sites that write it, so a real spawn is never
+                // confused with an empty slot, at a cost of at most one second on a task that started
+                // in the first second of the machine's life.
                 let spawn = TASK_SPAWN_DT[slot].load(Ordering::Relaxed);
                 if spawn == 0 { 0 } else {
                     (crate::arch::imp::rtc::now_epoch_monotonic().max(0) as u64).saturating_sub(spawn)
@@ -1135,6 +1157,19 @@ pub fn run(core_id: u32) -> ! {
 #[no_mangle]
 pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u64, _interrupted_rsp: u64) {
     let cid = current_core_id();
+    // A11-1: EVERY core checks the panic flag, on the tick every core takes.
+    //
+    // The A10-1 fix put this check in `uart_rx_poll`, whose only caller is the `cid == 0` branch
+    // below - so a panic parked the panicking core and core 0, and the remaining APs kept scheduling
+    // until the liveness watchdog fired ~10 s later and reported a WEDGE, which is not what happened.
+    // The doc comment on `halt_all_cores` asserted a mechanism that did not exist.
+    //
+    // Seventh instance this cycle of a guard whose trigger cannot occur in the failing case, and the
+    // worst placed: §19 and §6.2 require a panic to stop the MACHINE, and a kernel that keeps
+    // scheduling after one is the silent-corruption case those sections exist to forbid.
+    //
+    // Cheap: one relaxed load per core per tick, on a path that already runs.
+    crate::arch::imp::panic_halt_check();
     // Free any deferred kstack from a prior self-kill on this core.
     // RSP is now on the current task's kstack, not the dead task's, so
     // freeing the pending kstack is safe.  IF=0 (interrupt gate).

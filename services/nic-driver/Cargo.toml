@@ -9,3 +9,12 @@ path = "src/main.rs"
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
+
+[features]
+# NOTE: there is no `genet-userspace` feature any more, and no in-kernel GENET driver for it to select
+# against. On aarch64 this service ALWAYS drives the Pi 4's ethernet MAC itself (src/genet.rs); the
+# kernel's remaining GENET code only probes for the controller so the spawn path knows whether to grant
+# the register window. The feature existed while the in-kernel driver was the hardware-verified default
+# and this one was unproven; once this one was proven the other was deleted rather than kept as a
+# fallback, because an unexercised second path does not stay working - and the unexercised one would
+# have been the path that obeys Commandment I.
