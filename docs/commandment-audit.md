@@ -286,9 +286,18 @@ automatically and there is nothing to drift. All the risk is at the other end, i
 three lines inside the chaos service naming who never faces Maximum Carnage. That is pinned now, so a
 service cannot be quietly removed from the storm's reach while every suite still reports green.
 
-The target is declared as a scalar - `chaos_exclusions_target = "none"`, nothing escapes Chaos - and the
-current exclusions are DEBT against it that may only shrink. There is deliberately no "add it to the pin"
-path, unlike the surfaces where admitting something new is a legitimate option.
+**The rule is encoded by there being nowhere to say otherwise.** There is no list of services allowed to
+escape, and no scalar declaring the policy either - both were removed deliberately. A place to record an
+escape is a place to add one, and a stated target sitting beside its own exceptions teaches a reader to
+treat every target in this file as a wish. The only list is chaos's own APPARATUS (`chaos`,
+`mem-pressure`), which is the instrument, not a set of exceptions.
+
+A genuinely necessary exception is not impossible - it goes through the same door as every other
+violation: a CLAUDE.md amendment plus an `[[exemption]]` citing it. The light path is gone; the heavy,
+arguable one remains.
+
+**This makes the build RED today**, on C2-1 below. That is the intended consequence rather than an
+oversight: the alternative was a debt list, and a debt list is a place to add a second entry.
 
 **C2-1 (Medium). `observe` is a real service and never faces the storm.** Of the three exclusions, two
 are chaos's own apparatus rather than services escaping it: killing `chaos` mid-run stops the storm

@@ -454,29 +454,25 @@ def check_chaos_exclusions(check, pins):
                           "verified, and an unverifiable exclusion set is a failure, never a pass")]
     found = set(re.findall(r'name == "([a-z0-9-]+)"', body.group(0)))
     found |= {m + "*" for m in re.findall(r'starts_with\("([a-z0-9-]+)"\)', body.group(0))}
-    # TWO CATEGORIES, NAMED SEPARATELY, because they are not the same thing and one list holding both
-    # reads as a contradiction ("they said none, but look at what is excluded").
+    # ONE list, and it is not a list of permitted escapees - it is chaos's OWN APPARATUS. Killing
+    # `chaos` mid-run stops the storm measuring anything at all, and `mem-pressure` tasks are the
+    # ammunition it spawns. Excluding the instrument from its own measurement is not a service escaping.
     #
-    #   apparatus  - chaos's OWN machinery. Not a service under test at all: killing `chaos` mid-run
-    #                stops the storm measuring anything, and `mem-pressure` tasks are the ammunition it
-    #                spawns. Excluding the instrument from its own measurement is not an escape.
-    #   escaping   - real SERVICES that never face the storm. The target here is EMPTY, and the list is
-    #                debt that may only shrink.
-    target = pins.get("services_escaping_chaos_target")
-    if target != "none":
-        return [Violation("COMMANDMENTS.baseline.toml", 0,
-                          "services_escaping_chaos_target must read \"none\". No SERVICE escapes Chaos. "
-                          "It is a single string on purpose: a list of permitted escapees has room for "
-                          "one more.")]
-    apparatus = set(pins.get("chaos_apparatus", []))
-    escaping = set(pins.get("services_escaping_chaos", []))
-    pinned = apparatus | escaping
+    # There is deliberately NO list of services allowed to escape, and no target scalar declaring the
+    # policy either. Both were removed: a place to record an escape is a place to add one, and a target
+    # sitting next to its own exceptions invites the reader to treat it as a wish. NO SERVICE ESCAPES
+    # CHAOS is now expressed by there being nowhere to say otherwise.
+    #
+    # A genuinely necessary exception is not impossible - it goes through the SAME door as every other
+    # violation: a CLAUDE.md amendment plus an [[exemption]] citing it. The light path is gone; the
+    # heavy, arguable one remains.
+    pinned = set(pins.get("chaos_apparatus", []))
     out = [Violation("services/chaos/src/main.rs", 0,
-                     f"'{f}' is excluded from Maximum Carnage and is declared neither as chaos's own "
-                     f"apparatus nor as a service escaping. No SERVICE escapes Chaos: the target is "
-                     f"empty and the escaping list is debt that may only SHRINK, with no 'add it to "
-                     f"the pin' path. A service chaos never reaches is a service that is special "
-                     f"(Commandment V) while every suite still reports green.")
+                     f"'{f}' is excluded from Maximum Carnage and is not chaos's own apparatus. NO "
+                     f"SERVICE ESCAPES CHAOS, and there is nowhere to record that one does - a place "
+                     f"to write an escape is a place to add one. A service chaos never reaches is a "
+                     f"service that is special (Commandment V) while every suite still reports green. "
+                     f"Stop excluding it, or amend CLAUDE.md and cite the amendment in an exemption.")
            for f in sorted(found - pinned)]
     out += [Violation("services/chaos/src/main.rs", 0,
                       f"'{f}' is pinned as chaos-excluded but no longer is - delete the pin. Every "
@@ -534,7 +530,6 @@ def check_kernel_responsibilities(check, pins):
 REQUIRED_PLAIN_KEYS = [
     "modules", "dependencies", "features", "service_configs", "arch_permitted_roles",
     "introspect_queries", "kernel_spawned_service", "kernel_responsibilities", "chaos_apparatus",
-    "services_escaping_chaos", "services_escaping_chaos_target",
 ]
 
 
@@ -709,22 +704,18 @@ CHECKS = [
          title="who is excluded from Maximum Carnage is pinned",
          kind="custom", fn=check_chaos_exclusions,
          scope="services/chaos/src/main.rs, is_transient()",
-         proves="no service was quietly removed from the storm's reach, and the declared target is "
-                "still that NOTHING escapes it",
+         proves="nothing is excluded from the storm except chaos's own apparatus",
          does_not_prove="that chaos was ever RUN, or passed. That is the runtime half of this "
                         "Commandment and it is not built: `chaos max-carnage` is still an operator's "
                         "good intentions rather than a gate with a threshold",
          probes=[
              dict(why="a newly excluded service must be caught",
-                  pins={"services_escaping_chaos_target": "none"}, expect=True),
-             dict(why="softening the TARGET away from none must be refused",
-                  pins={"services_escaping_chaos_target": "some"}, expect=True),
-             dict(why="a pin for a service no longer excluded must be caught",
-                  pins={"services_escaping_chaos_target": "none",
-                        "chaos_apparatus": ["chaos", "mem-pressure"],
-                        "services_escaping_chaos": ["observe*", "ghost"]},
+                  pins={"chaos_apparatus": []}, expect=True),
+             dict(why="a service excluded alongside the apparatus must still be caught",
+                  pins={"chaos_apparatus": ["chaos", "mem-pressure"]}, expect=True),
+             dict(why="pinning apparatus that chaos does not exclude must be caught",
+                  pins={"chaos_apparatus": ["chaos", "mem-pressure", "observe*", "ghost"]},
                   expect=True),
-             dict(why="the real, fully pinned exclusion set must pass", pins=None, expect=False),
          ]),
     dict(id="V-no-panic", commandment="V", title="no service may halt the machine",
          kind="source", dirs=["services"],

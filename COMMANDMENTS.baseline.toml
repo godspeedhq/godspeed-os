@@ -325,23 +325,22 @@ service_configs = [
 #   mem-pressure  chaos spawns these itself as ammunition; they are its instrument, not a service
 #   observe*      transient viewer tasks - BUT `observe` is also a REAL service, and the prefix rule
 #                 means it never faces the storm. Recorded here precisely so that is visible.
-# Commandment II. Two DIFFERENT things live in chaos's `is_transient()`, and they are named separately
-# here on purpose: one list holding both would read as a contradiction to anyone who checked.
+# Commandment II - NO SERVICE ESCAPES CHAOS.
 #
-# chaos's OWN APPARATUS - not services under test, so not escapes. Excluding the instrument from its own
-# measurement is not the same as a service dodging the storm.
+# There is no list of services allowed to escape, and no scalar declaring that policy either. That is
+# the encoding: the rule is expressed by there being NOWHERE TO SAY OTHERWISE. A place to record an
+# escape is a place to add one, and a stated target sitting beside its own exceptions teaches a reader
+# to treat every target in this file as a wish.
+#
+# The one list below is not exceptions - it is chaos's OWN APPARATUS. Excluding the instrument from its
+# own measurement is not a service dodging the storm:
 #   chaos         killing it mid-run stops the storm measuring anything at all
-#   mem-pressure  the ammunition chaos spawns to create memory pressure; its instrument, not its subject
+#   mem-pressure  the ammunition chaos spawns to create memory pressure; instrument, not subject
+#
+# Anything else chaos excludes fails the build. A genuinely necessary exception is not impossible - it
+# goes through the same door as every other violation: a CLAUDE.md amendment plus an [[exemption]]
+# citing it. The light path is gone; the heavy, arguable one remains.
 chaos_apparatus = ["chaos", "mem-pressure"]
-
-# NO SERVICE ESCAPES CHAOS. A single string, not a list, for the same reason as kernel_spawned_service:
-# a list of permitted escapees has room for one more and appending reads like configuration.
-services_escaping_chaos_target = "none"
-
-# DEBT against that target - may only ever SHRINK, and there is no "add it deliberately" path.
-# It should be empty. It is not, and that gap is finding C2-1 rather than an accepted arrangement:
-#   observe*   a PREFIX rule, and `observe` is a genuine service, so it never faces Maximum Carnage
-services_escaping_chaos = ["observe*"]
 
 # THE COUNT. §4.3 names exactly six kernel responsibilities and §4.4 says "nothing else". Every other
 # Commandment I pin watches a surface; this one pins the NUMBER, which is what the commandment is
