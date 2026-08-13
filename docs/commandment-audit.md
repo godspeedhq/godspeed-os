@@ -67,9 +67,72 @@ Two rules that came out of doing it, and cost something each time:
 
 ---
 
+## Patterns that keep recurring
+
+These came out of doing the work, not from planning it, and every one of them cost something. They
+apply to every Commandment, so they belong here rather than under any single one. When this document is
+deleted, these are the part that must survive into the checker's docstring.
+
+**1. Scope narrowing expressed as CODE instead of data.** Three times, in three unrelated places: my own
+checker skipping `build.rs`; the `arch/` role vocabulary; and `is_transient()` in the chaos service
+deciding who never faces Maximum Carnage. Each was a small, defensible, invisible edit that shrank what
+was examined while everything still reported green. Exclusions belong in data, with a reason each,
+printed beside the result. **A pass that does not say what it looked at is the most convincing kind of
+lie.**
+
+**2. A pin that vanishes passes vacuously.** Appending a plain key below a `[kernel.sub-table]` header
+makes TOML swallow it, so the lookup returns nothing, which reads as an EMPTY pin - and an empty pin
+permits everything. This landed four times while writing these checks. The failure is not a wrong
+answer; it is a confident answer over a surface nobody is watching any more. Now caught by
+`integrity-baseline`.
+
+**3. A badly written probe does not fail loudly - it agrees with you.** Two of three ratchet probes were
+wrong on first attempt: they asserted nothing and passed. Writing them properly exposed a real hole (a
+role pinned for a deleted file was ignored). The corpus needs the same suspicion as the code.
+
+**4. Measuring changes the design, every single time.** Anti-scope vocabulary scanning, a kernel
+line-count ceiling, and "every service must be a chaos target" were all sound-sounding checks that
+measurement killed - the third because chaos keeps no target list at all, so there was nothing to check
+and the entire risk was at the other end. Every check written AFTER measuring has held; none written
+from intuition survived contact.
+
+**5. Pins catch addition at the surface they pin, and miss growth inside it.** `InspectKernel` was one
+pinned syscall with 23 unpinned sub-queries behind it. A 24th would have been a new kernel
+responsibility that changed no visible surface at all. Any surface that dispatches on an id needs its
+id space pinned too.
+
+**6. The shape of the pin is part of the policy.** `kernel_spawned_service = "supervisor"` is a scalar,
+not a list, because a list has room for a second entry and appending one reads like configuration.
+Where a rule permits exactly one of something, express one, so that a second requires changing the
+schema rather than adding a line.
+
+**7. Illegitimate things survive because something legitimate is parked next to them.** `control.rs` is
+developer tooling that §4.4 forbids by name, and it cannot simply be stripped from production builds
+because the supervisor respawn runs inside `control::process_pending`. It has survived not because
+anyone defended it but because removing it would take a real responsibility with it. Worth actively
+looking for elsewhere.
+
+**8. Things that look like one finding often need different answers.** `control.rs`, `clock.rs`,
+`wallclock.rs` and `fbcon/` all failed the same check for the same stated reason, and the right answers
+are *separate then gate*, *move to a planned service*, and *amend the constitution*. Do not batch a
+finding's remedy just because the check batched its detection.
+
+## What a Commandment costs, roughly
+
+Consistent enough after two to be worth stating. Each one produces: a handful of pins; one or two
+sound-sounding checks that measurement kills; and **at least one finding nobody knew about**. Commandment
+I yielded four responsibilities the kernel does not admit to having, a kernel spawn set of three where
+the law says one, and a policy catalogue of 218 services. None of that was visible before counting.
+
+That last part is the argument for the slow pass. The checks are the deliverable, but the findings are
+what the checks are FOR, and they only appear when something is counted for the first time.
+
+
+---
+
 ## Commandment I - thou shalt not expand the responsibilities of the kernel
 
-**Encoded: 11 checks. Findings: 6. C1-4 closed, five open.**
+**Encoded: 11 checks, 44 self-test probes. Findings: 6 - C1-4 closed, five open, two of them High.**
 
 ### Why these surfaces
 
