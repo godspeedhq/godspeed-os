@@ -432,55 +432,56 @@ def check_kernel_service_table(check, pins):
 # --------------------------------------------------------------------------------------------------
 
 def check_chaos_exclusions(check, pins):
-    """Commandment II: pin who does NOT face Maximum Carnage.
+    """Commandment II: nothing escapes Chaos, and there is nothing to configure.
 
-    Chaos has no hardcoded target list - it scans the live task table, so a new service is a candidate
-    automatically and there is no list to drift. Good design, and it moves the whole risk to the other
-    end: the EXCLUSIONS.
+    Chaos keeps no target list - it scans the live task table - so a new service is a candidate
+    automatically. All the risk is in `is_transient()`, three lines naming who never faces the storm.
 
-    `is_transient()` is three lines inside the chaos service, and every name in it is a service that
-    never faces Maximum Carnage. Adding a fourth is how a service becomes special (Commandment V) while
-    every suite still reports green - the storm simply never reaches it, and nothing says so.
+    WHAT MAY LEGITIMATELY BE THERE IS DERIVED, NOT DECLARED. Any declaration is a knob: a list can be
+    appended to, a boolean can be flipped, and a config entry is a second copy of a fact the code
+    already states (Commandment III), free to drift in whichever direction someone wants. So:
 
-    This is the same shape as a check narrowing its own scan: exclusions belong in DATA, with a reason
-    each, printed and reviewed. It is pinned here rather than in the chaos service so that widening it
-    is a baseline diff, not a one-word edit to a predicate nobody re-reads.
+      * chaos excluding ITSELF is not an exclusion. It is the definition of the instrument - a storm
+        that storms itself stops measuring anything. Taken from the crate path, not from a setting.
+      * anything chaos SPAWNS is its ammunition, derived by reading its own spawn calls. If chaos ever
+        stops spawning something, permission to exclude it evaporates on its own - which no config
+        entry could ever do.
+
+    Result: nothing to append, nothing to flip, nothing to add. To widen the blind spot someone must
+    make chaos genuinely spawn the thing they want excluded - a visible behaviour change, and a spawn
+    whose only effect is a blind spot, which is hard to defend in review.
+
+    If the derivation cannot be performed, that is a FAILURE, never a pass. An apparatus set that came
+    back empty because the source was refactored would silently permit everything.
     """
-    src = read(os.path.join(ROOT, "services/chaos/src/main.rs"))
+    # `_src` is a TEST SEAM for the probe corpus only, and `integrity-baseline` refuses any key
+    # beginning with "_" in the real baseline - so it cannot become the knob this check exists without.
+    src = pins.get("_src")
+    if src is None:
+        src = read(os.path.join(ROOT, "services/chaos/src/main.rs"))
+
     body = re.search(r"fn is_transient\(.*?^\}", src, re.S | re.M)
     if not body:
         return [Violation("services/chaos/src/main.rs", 0,
                           "cannot find `is_transient`: who is excluded from Maximum Carnage cannot be "
                           "verified, and an unverifiable exclusion set is a failure, never a pass")]
-    found = set(re.findall(r'name == "([a-z0-9-]+)"', body.group(0)))
-    found |= {m + "*" for m in re.findall(r'starts_with\("([a-z0-9-]+)"\)', body.group(0))}
-    # ONE list, and it is not a list of permitted escapees - it is chaos's OWN APPARATUS. Killing
-    # `chaos` mid-run stops the storm measuring anything at all, and `mem-pressure` tasks are the
-    # ammunition it spawns. Excluding the instrument from its own measurement is not a service escaping.
-    #
-    # There is deliberately NO list of services allowed to escape, and no target scalar declaring the
-    # policy either. Both were removed: a place to record an escape is a place to add one, and a target
-    # sitting next to its own exceptions invites the reader to treat it as a wish. NO SERVICE ESCAPES
-    # CHAOS is now expressed by there being nowhere to say otherwise.
-    #
-    # A genuinely necessary exception is not impossible - it goes through the SAME door as every other
-    # violation: a CLAUDE.md amendment plus an [[exemption]] citing it. The light path is gone; the
-    # heavy, arguable one remains.
-    pinned = set(pins.get("chaos_apparatus", []))
-    out = [Violation("services/chaos/src/main.rs", 0,
-                     f"'{f}' is excluded from Maximum Carnage and is not chaos's own apparatus. NO "
-                     f"SERVICE ESCAPES CHAOS, and there is nowhere to record that one does - a place "
-                     f"to write an escape is a place to add one. A service chaos never reaches is a "
-                     f"service that is special (Commandment V) while every suite still reports green. "
-                     f"Stop excluding it, or amend CLAUDE.md and cite the amendment in an exemption.")
-           for f in sorted(found - pinned)]
-    out += [Violation("services/chaos/src/main.rs", 0,
-                      f"'{f}' is pinned as chaos-excluded but no longer is - delete the pin. Every "
-                      f"service it stops excluding is one more that now faces the storm, which is the "
-                      f"direction this should always move.")
-            for f in sorted(pinned - found)]
-    return out
+    excluded = set(re.findall(r'name == "([a-z0-9-]+)"', body.group(0)))
+    excluded |= {m + "*" for m in re.findall(r'starts_with\("([a-z0-9-]+)"\)', body.group(0))}
 
+    spawned = set(re.findall(r'\.spawn\(\s*"([a-z0-9-]+)"', src))
+    if not spawned:
+        return [Violation("services/chaos/src/main.rs", 0,
+                          "chaos appears to spawn nothing, so its ammunition cannot be derived. That is "
+                          "a failure, not a pass: an empty apparatus set would permit every exclusion.")]
+    apparatus = {"chaos"} | spawned          # itself, plus whatever it demonstrably spawns
+
+    return [Violation("services/chaos/src/main.rs", 0,
+                      f"'{f}' is excluded from Maximum Carnage. It is not chaos itself, and chaos does "
+                      f"not spawn it, so it is a SERVICE escaping the storm - special, while every "
+                      f"suite still reports green (Commandment V). There is nothing to configure here "
+                      f"and nowhere to record an exception: stop excluding it, or amend CLAUDE.md and "
+                      f"cite the amendment in an [[exemption]].")
+            for f in sorted(excluded - apparatus)]
 
 
 def check_kernel_responsibilities(check, pins):
@@ -529,7 +530,7 @@ def check_kernel_responsibilities(check, pins):
 
 REQUIRED_PLAIN_KEYS = [
     "modules", "dependencies", "features", "service_configs", "arch_permitted_roles",
-    "introspect_queries", "kernel_spawned_service", "kernel_responsibilities", "chaos_apparatus",
+    "introspect_queries", "kernel_spawned_service", "kernel_responsibilities",
 ]
 
 
@@ -548,7 +549,12 @@ def check_baseline_shape(check, pins):
                       f"[kernel.sub-table] header and TOML swallowed it into that table - in which case "
                       f"the check that reads it is silently passing everything. Plain keys must come "
                       f"BEFORE any sub-table.")
-            for k in REQUIRED_PLAIN_KEYS if k not in pins]
+            for k in REQUIRED_PLAIN_KEYS if k not in pins] + [
+        Violation("COMMANDMENTS.baseline.toml", 0,
+                  f"[kernel] key '{k}' begins with '_'. Those are TEST SEAMS used by the probe corpus "
+                  f"to feed a check synthetic source. A real baseline must never define one: it would "
+                  f"let a check be fed something other than the code it is meant to read.")
+        for k in pins if k.startswith("_")]
 
 
 CHECKS = [
@@ -701,21 +707,29 @@ CHECKS = [
                   pins=None, expect=True),
          ]),
     dict(id="II-chaos-exclusions", commandment="II",
-         title="who is excluded from Maximum Carnage is pinned",
+         title="nothing escapes Maximum Carnage but chaos's own apparatus",
          kind="custom", fn=check_chaos_exclusions,
-         scope="services/chaos/src/main.rs, is_transient()",
-         proves="nothing is excluded from the storm except chaos's own apparatus",
+         scope="services/chaos/src/main.rs - is_transient() against chaos's own spawn calls",
+         proves="nothing is excluded from the storm except chaos itself and what chaos spawns, with "
+                "no setting anywhere that could widen it",
          does_not_prove="that chaos was ever RUN, or passed. That is the runtime half of this "
                         "Commandment and it is not built: `chaos max-carnage` is still an operator's "
                         "good intentions rather than a gate with a threshold",
          probes=[
-             dict(why="a newly excluded service must be caught",
-                  pins={"chaos_apparatus": []}, expect=True),
-             dict(why="a service excluded alongside the apparatus must still be caught",
-                  pins={"chaos_apparatus": ["chaos", "mem-pressure"]}, expect=True),
-             dict(why="pinning apparatus that chaos does not exclude must be caught",
-                  pins={"chaos_apparatus": ["chaos", "mem-pressure", "observe*", "ghost"]},
-                  expect=True),
+             dict(why="a service chaos neither is nor spawns must be caught",
+                  pins={"_src": 'fn is_transient(name: &str) -> bool {\n    name == "observe"\n}\nfn go() { ctx.spawn("mem-pressure"); }\n'}, expect=True),
+             dict(why="chaos excluding itself is the instrument, not an escape",
+                  pins={"_src": 'fn is_transient(name: &str) -> bool {\n    name == "chaos"\n}\nfn go() { ctx.spawn("mem-pressure"); }\n'}, expect=False),
+             dict(why="what chaos SPAWNS is its ammunition, derived not declared",
+                  pins={"_src": 'fn is_transient(name: &str) -> bool {\n    name == "mem-pressure"\n}\nfn go() { ctx.spawn("mem-pressure"); }\n'}, expect=False),
+             dict(why="excluding something it no longer spawns must be caught - the permission "
+                      "evaporates on its own",
+                  pins={"_src": 'fn is_transient(name: &str) -> bool {\n    name == "mem-pressure"\n}\nfn go() { ctx.spawn("something-else"); }\n'}, expect=True),
+             dict(why="a chaos that spawns nothing cannot have its apparatus derived - a failure, "
+                      "never a pass",
+                  pins={"_src": 'fn is_transient(name: &str) -> bool {\n    name == "chaos"\n}\n'}, expect=True),
+             dict(why="an unfindable is_transient must fail, not pass vacuously",
+                  pins={"_src": 'fn go() { ctx.spawn("mem-pressure"); }\n'}, expect=True),
          ]),
     dict(id="V-no-panic", commandment="V", title="no service may halt the machine",
          kind="source", dirs=["services"],

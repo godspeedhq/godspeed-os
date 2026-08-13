@@ -327,20 +327,17 @@ service_configs = [
 #                 means it never faces the storm. Recorded here precisely so that is visible.
 # Commandment II - NO SERVICE ESCAPES CHAOS.
 #
-# There is no list of services allowed to escape, and no scalar declaring that policy either. That is
-# the encoding: the rule is expressed by there being NOWHERE TO SAY OTHERWISE. A place to record an
-# escape is a place to add one, and a stated target sitting beside its own exceptions teaches a reader
-# to treat every target in this file as a wish.
+# There is deliberately NOTHING HERE. No list, no target, no boolean.
 #
-# The one list below is not exceptions - it is chaos's OWN APPARATUS. Excluding the instrument from its
-# own measurement is not a service dodging the storm:
-#   chaos         killing it mid-run stops the storm measuring anything at all
-#   mem-pressure  the ammunition chaos spawns to create memory pressure; instrument, not subject
+# What chaos may legitimately exclude is DERIVED from its own source, not declared: chaos itself (a
+# storm that storms itself stops measuring anything) and whatever chaos SPAWNS (its ammunition). Any
+# declaration would be a knob - a list can be appended to, a boolean flipped - and would also be a
+# second copy of a fact the code already states, free to drift (Commandment III).
 #
-# Anything else chaos excludes fails the build. A genuinely necessary exception is not impossible - it
-# goes through the same door as every other violation: a CLAUDE.md amendment plus an [[exemption]]
-# citing it. The light path is gone; the heavy, arguable one remains.
-chaos_apparatus = ["chaos", "mem-pressure"]
+# So there is nothing to append, nothing to flip, and nothing to turn off. Widening the blind spot
+# requires making chaos genuinely spawn the thing you want excluded: a visible behaviour change whose
+# only effect is a blind spot. A necessary exception still has a door - a CLAUDE.md amendment plus an
+# [[exemption]] citing it - but no light one.
 
 # THE COUNT. §4.3 names exactly six kernel responsibilities and §4.4 says "nothing else". Every other
 # Commandment I pin watches a surface; this one pins the NUMBER, which is what the commandment is
