@@ -25,6 +25,18 @@ def edit(path, old, new):
     assert old in s, "anchor not found in %s" % path
     io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 
+def strand_pin(key):
+    """Move a plain [kernel] key below every sub-table, where TOML silently swallows it."""
+    import re as _re
+    p = os.path.join(ROOT, "COMMANDMENTS.baseline.toml")
+    s = io.open(p, encoding="utf-8").read()
+    m = _re.search(r"(?m)^" + key + r" = \[[^\]]*\]" + chr(10), s)
+    assert m, "pin %s not found" % key
+    s = s.replace(m.group(0), "")
+    i = s.index(chr(10) + "# ---")
+    io.open(p, "w", encoding="utf-8").write(s[:i] + chr(10) + m.group(0) + s[i:])
+
+
 def create(path, text):
     io.open(os.path.join(ROOT, path), "w", encoding="utf-8").write(text)
 
@@ -82,9 +94,13 @@ CASES = [
                   '        "nic-driver" => Some(("nic-driver"'),
      ["kernel/src/task/mod.rs"], []),
 
-    ("integrity-baseline", "a pin stranded under a sub-table (the bug that hit 4x)",
-     lambda: edit("COMMANDMENTS.baseline.toml", "introspect_queries = [",
-                  "[kernel.syscalls]\nintrospect_queries = ["),
+    ("integrity-baseline", "a pin stranded below a sub-table (the bug that hit 4x)",
+     # REALISTIC stranding: the key is appended at the END of [kernel], after every sub-table, which is
+     # what actually happened four times. An earlier version of this case injected a DUPLICATE
+     # [kernel.syscalls] header instead - TOML rejects that outright, so it exercised the malformed-file
+     # path rather than the swallow, and reported MISSED for a check that works. The injection has to be
+     # the thing that really goes wrong, or the test measures something nobody would ever do.
+     lambda: strand_pin("introspect_queries"),
      ["COMMANDMENTS.baseline.toml"], []),
 
     ("V-no-panic", "a service that can halt the machine",
