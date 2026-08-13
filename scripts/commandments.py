@@ -499,7 +499,28 @@ def check_kernel_responsibilities(check, pins):
     The claims are data in the baseline, so they are reviewable in a diff. A module can still claim
     dishonestly; the check moves that lie somewhere it can be argued with.
     """
-    six = set(pins.get("kernel_responsibilities", []))
+    # DERIVED FROM THE CONSTITUTION, not copied into config. §4.3 lists the six; a baseline entry would
+    # be a second copy of that fact (Commandment III), free to drift - and a knob, since raising the
+    # number would be one line in a config file rather than an amendment. Read the law itself, so
+    # changing the count means editing CLAUDE.md §4.3, which IS amending the constitution.
+    # `_law` is a TEST SEAM for the probe corpus, guarded like `_src`: integrity-baseline refuses any
+    # [kernel] key starting with "_", so it cannot become a way to feed the checker a fake constitution.
+    law = pins.get("_law")
+    if law is None:
+        law = read(os.path.join(ROOT, "CLAUDE.md"))
+    try:
+        scope = law[law.index("### 4.3 Kernel Scope"):law.index("### 4.4 Kernel Anti-Scope")]
+    except ValueError:
+        return [Violation("CLAUDE.md", 0,
+                          "cannot find §4.3 Kernel Scope: the six responsibilities cannot be read from "
+                          "the constitution, and an unverifiable law is a failure, never a pass")]
+    six = set()
+    for ln in scope.split(chr(10)):
+        ln = ln.strip()
+        if ln.startswith("- "):
+            name = ln[2:].split("(")[0].strip().lower().replace(" ", "-")
+            if name:
+                six.add(name)
     support = pins.get("kernel_support_roles", {})
     claims = pins.get("module_responsibility", {})
     out = []
@@ -530,7 +551,7 @@ def check_kernel_responsibilities(check, pins):
 
 REQUIRED_PLAIN_KEYS = [
     "modules", "dependencies", "features", "service_configs", "arch_permitted_roles",
-    "introspect_queries", "kernel_spawned_service", "kernel_responsibilities",
+    "introspect_queries", "kernel_spawned_service",
 ]
 
 
@@ -675,13 +696,15 @@ CHECKS = [
                         "has not grown a second job inside itself",
          probes=[
              dict(why="a module claiming nothing must be caught",
-                  pins={"kernel_responsibilities": ["a", "b", "c", "d", "e", "f"],
-                        "module_responsibility": {}}, expect=True),
+                  pins={"module_responsibility": {}}, expect=True),
+             dict(why="a SEVENTH responsibility appearing in the constitution must be caught",
+                  pins={"_law": "### 4.3 Kernel Scope" + chr(10) + "".join(
+                      "- R%d (x)" % i + chr(10) for i in range(7)) + "### 4.4 Kernel Anti-Scope"},
+                  expect=True),
+             dict(why="an unreadable section 4.3 must fail, not pass vacuously",
+                  pins={"_law": "no scope section here"}, expect=True),
              dict(why="a module claiming something outside the six must be caught",
-                  pins={"kernel_responsibilities": ["a", "b", "c", "d", "e", "f"],
-                        "module_responsibility": {"memory": "filesystem"}}, expect=True),
-             dict(why="changing the NUMBER of responsibilities must be caught",
-                  pins={"kernel_responsibilities": ["a"], "module_responsibility": {}}, expect=True),
+                  pins={"module_responsibility": {"memory": "filesystem"}}, expect=True),
              # Reality: four modules claim nothing today (C1-6). This probe asserts that, so closing
              # those findings BREAKS it deliberately and forces the expectation to be flipped - the
              # same ratchet the baseline uses, applied to the corpus.

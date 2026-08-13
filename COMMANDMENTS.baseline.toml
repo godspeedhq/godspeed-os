@@ -339,17 +339,10 @@ service_configs = [
 # only effect is a blind spot. A necessary exception still has a door - a CLAUDE.md amendment plus an
 # [[exemption]] citing it - but no light one.
 
-# THE COUNT. §4.3 names exactly six kernel responsibilities and §4.4 says "nothing else". Every other
-# Commandment I pin watches a surface; this one pins the NUMBER, which is what the commandment is
-# actually about. Changing it is amending the constitution, not editing a config.
-kernel_responsibilities = [
-    "memory-isolation",       # §10
-    "scheduling",             # §9, §14 - includes spawning/loading a task
-    "ipc",                    # §8
-    "capability-enforcement", # §7
-    "interrupt-routing",      # §12
-    "smp-routing",            # §9, §11.1
-]
+# THE COUNT is deliberately NOT here. §4.3 of CLAUDE.md lists the six responsibilities, and the checker
+# reads that list directly. A copy here would be a second truth free to drift (Commandment III), and a
+# knob: raising the number would be one line in a config file instead of an amendment. Changing the
+# count now means editing the constitution, which is the correct bar.
 
 # Support roles that are NOT responsibilities but are sanctioned elsewhere in the constitution. Each
 # must cite where, or it is a seventh responsibility wearing a helpful name.
