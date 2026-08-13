@@ -357,10 +357,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     (s.tx_ok, s.tx_fail, s.rx_bursts, s.rx_bytes, s.rx_frames, s.rx_bad, s.rx_hcint, s.rx_nohalt, s.bmsr, s.rx_fifo, s.int_sts)
                 }).unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
                 ctx.log_fmt(format_args!(
-                    "dwc2-svc: alive - {} key, {} blocks, {} cmds; busy CBW {} DATA {} CSW {};                      {} passes, serve {}ms kbd {}ms sleep {}ms; net tx {}/{} fail, rx {} bursts {} bytes {} frames {} unparsed, last IN HCINT=0x{:08x} nohalt {}, BMSR=0x{:04x} RX_FIFO_INF=0x{:08x} INT_STS=0x{:08x}",
+                    "dwc2-svc: alive - {} key, {} blocks, {} cmds; busy CBW {} DATA {} CSW {}; {} passes, serve {}ms kbd {}ms sleep {}ms",
                     reports, served, cmds, bc, bd, bs,
-                    passes, seg_serve / ms, seg_kbd / ms, seg_sleep / ms,
-                    ns.0, ns.1, ns.2, ns.3, ns.4, ns.5, ns.6, ns.7, ns.8, ns.9, ns.10));
+                    passes, seg_serve / ms, seg_kbd / ms, seg_sleep / ms));
+                // The net counters get their OWN line. Appending them to the line above pushed it past
+                // the SDK's fixed 256-byte format buffer, so the tail - the value being measured - was
+                // silently truncated away. An instrument that does not fit in the log is not an
+                // instrument; this cost a boot.
+                ctx.log_fmt(format_args!(
+                    "dwc2-svc: net tx {}/{} fail, rx {} bursts {} bytes {} frames {} unparsed",
+                    ns.0, ns.1, ns.2, ns.3, ns.4, ns.5));
+                ctx.log_fmt(format_args!(
+                    "dwc2-svc: net IN HCINT=0x{:08x} nohalt {} BMSR=0x{:04x} RX_FIFO=0x{:08x} INT_STS=0x{:08x}",
+                    ns.6, ns.7, ns.8, ns.9, ns.10));
             }
             // DO NOT SLEEP WHEN THERE WAS WORK. This is the whole of the throughput problem.
             //
