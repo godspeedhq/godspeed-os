@@ -327,13 +327,40 @@ service_configs = [
 #                 means it never faces the storm. Recorded here precisely so that is visible.
 chaos_exclusions = ["chaos", "mem-pressure", "observe*"]
 
+# THE COUNT. §4.3 names exactly six kernel responsibilities and §4.4 says "nothing else". Every other
+# Commandment I pin watches a surface; this one pins the NUMBER, which is what the commandment is
+# actually about. Changing it is amending the constitution, not editing a config.
+kernel_responsibilities = [
+    "memory-isolation",       # §10
+    "scheduling",             # §9, §14 - includes spawning/loading a task
+    "ipc",                    # §8
+    "capability-enforcement", # §7
+    "interrupt-routing",      # §12
+    "smp-routing",            # §9, §11.1
+]
+
+# Support roles that are NOT responsibilities but are sanctioned elsewhere in the constitution. Each
+# must cite where, or it is a seventh responsibility wearing a helpful name.
+
 # A syscall that dispatches on an id carries a SECOND surface inside it. InspectKernel is one
 # pinned syscall with these queries behind it - allocator counts, scheduler ticks, RTC time,
 # framebuffer dimensions, PCI ids, a hardware random number - and adding one is a new kernel
 # responsibility that changes nothing visible: the syscall count stays exactly where it was.
 # Pins catch addition at the surface they pin, and miss growth inside it.
 introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
-
+# Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
+# legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
+# before it builds, and classifying one honestly as a device driver fails the build - which is the
+# point. Sneaking one past now requires writing a lie into this file, in a diff, rather than choosing
+# an innocuous filename nobody re-reads.
+#
+# A kernel may legitimately bring up its own CPU, memory, interrupts, timer, console and buses. It may
+# not drive a peripheral: a USB host stack, a NIC, a disk. Those are services. The Pi 4 port proved it
+# by deleting 2742 lines of ring-0 xhci (CLAUDE.md §6.4, 2026-08-09).
+arch_permitted_roles = [
+    "arch-entry", "boot", "mmu", "interrupts", "timer", "context-switch", "scheduler-entry",
+    "syscall-entry", "usermode", "uaccess", "console", "discovery", "iommu", "clock", "test-scaffold",
+]
 # Commandment I's ONE sanctioned exception. The kernel restarts exactly one service - the supervisor -
 # and it must, because of Commandment V: no service is special, so the supervisor has to be restartable
 # too, and only the kernel is beneath it to do the restarting. CLAUDE.md §11.1 calls it "the kernel's ONE
@@ -350,19 +377,35 @@ introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 
 # the affordance cannot leak back in.
 kernel_spawned_service = "supervisor"
 
-# Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
-# legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
-# before it builds, and classifying one honestly as a device driver fails the build - which is the
-# point. Sneaking one past now requires writing a lie into this file, in a diff, rather than choosing
-# an innocuous filename nobody re-reads.
-#
-# A kernel may legitimately bring up its own CPU, memory, interrupts, timer, console and buses. It may
-# not drive a peripheral: a USB host stack, a NIC, a disk. Those are services. The Pi 4 port proved it
-# by deleting 2742 lines of ring-0 xhci (CLAUDE.md §6.4, 2026-08-09).
-arch_permitted_roles = [
-    "arch-entry", "boot", "mmu", "interrupts", "timer", "context-switch", "scheduler-entry",
-    "syscall-entry", "usermode", "uaccess", "console", "discovery", "iommu", "clock", "test-scaffold",
-]
+[kernel.kernel_support_roles]
+arch-layer       = "§4.1 architecture layer; §18.1 (the unsafe boundary)"
+syscall-entry    = "§8.2 - the entry to the six, not a seventh"
+boot-entry       = "§11 bootstrap"
+kernel-log-floor = "§11.4 - the 16 KiB ring buffer + serial console, explicitly sanctioned"
+invariants       = "§3, §22 - the kernel checking its own invariants"
+
+# Which of the above each top-level module serves. A module that can claim NEITHER a responsibility nor
+# a sanctioned support role is a seventh responsibility, whatever its size - which is exactly how one
+# gets added without any pinned surface changing.
+
+[kernel.module_responsibility]
+"arch"          = "arch-layer"
+"capability"    = "capability-enforcement"
+"elf_flags.rs"  = "scheduling"
+"interrupt"     = "interrupt-routing"
+"invariants"    = "invariants"
+"ipc"           = "ipc"
+"lib.rs"        = "boot-entry"
+"loader.rs"     = "scheduling"
+"log.rs"        = "kernel-log-floor"
+"main.rs"       = "boot-entry"
+"memory"        = "memory-isolation"
+"smp"           = "smp-routing"
+"syscall"       = "syscall-entry"
+"task"          = "scheduling"
+
+
+
 
 [kernel.authorities]
 LOG_WRITE          = 1

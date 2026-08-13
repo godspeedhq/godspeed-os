@@ -69,7 +69,7 @@ Two rules that came out of doing it, and cost something each time:
 
 ## Commandment I - thou shalt not expand the responsibilities of the kernel
 
-**Encoded: 9 checks. Findings: 5. C1-4 closed, four open.**
+**Encoded: 11 checks. Findings: 6. C1-4 closed, five open.**
 
 ### Why these surfaces
 
@@ -134,6 +134,7 @@ and a proxy that fires on sanctioned work only trains people to raise it.
 | C1-3 | Font crate linked for a framebuffer console, unjustified in writing | Low | amendment or make it a service |
 | C1-4 | `InspectKernel` carries 23 unpinned sub-queries | Medium | CLOSED by the I-introspect pin |
 | C1-5 | The kernel holds a catalogue of userspace policy for 218 services | **High** | open |
+| C1-6 | Four kernel modules serve none of the six responsibilities | **High** | open |
 
 **C1-1.** `arm_spawn_logger_neutral()` and `arm_spawn_shell_neutral()` in `task/mod.rs` are ARM/AArch64
 bring-up scaffolding from before the supervisor path worked, called from `sched_spawn.rs` and
@@ -164,6 +165,25 @@ service, `supervisor`, because nothing is beneath it to bootstrap it. Every othe
 belongs to the supervisor, with its image handed to the `Spawn` syscall rather than compiled into ring
 0. The pin is therefore recorded as DEBT that may only shrink - there is no "add it deliberately" path -
 and 218 is the distance from where this should be.
+
+**C1-6. The count is six; four modules serve something else.** §4.3 names exactly six kernel
+responsibilities and §4.4 says "nothing else". Every top-level module now claims one of the six, or a
+support role sanctioned elsewhere in the constitution and citing where (`arch-layer` §4.1, `syscall-entry`
+§8.2, `boot-entry` §11, `kernel-log-floor` §11.4, `invariants` §3/§22). Four can claim neither:
+
+| Module | What it is | Why it is not one of the six |
+|--------|-----------|------------------------------|
+| `fbcon/` | framebuffer text console, 1,172 lines | §11.4 sanctions a 16 KiB ring buffer plus a SERIAL console; a rendered text console with a font dependency is more. Same subject as C1-3 |
+| `control.rs` | "receives `osdev restart` commands via COM2" | This is **developer tooling**, which §4.4 forbids in the kernel by name |
+| `clock.rs` | clock deglitch logic | Timekeeping is not among the six |
+| `wallclock.rs` | "the wall clock's PROVENANCE and its FLOOR" | Timekeeping, and stateful policy at that |
+
+`control.rs` is the sharpest: §4.4's anti-scope list says "developer tooling" outright, and this is a
+serial channel in ring 0 for accepting developer commands.
+
+This check is also the one that answers "how many responsibilities does the kernel have" mechanically.
+The number is pinned at six, and changing it fails the build - amending the constitution rather than
+editing a config.
 
 **C1-2.** `arch/` is 28,755 of ~44,000 kernel lines. Legitimate (hardware support is welcome), noted
 because the majority of the kernel lives in the layer these checks scrutinise least - the role pin says

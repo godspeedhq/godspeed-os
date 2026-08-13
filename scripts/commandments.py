@@ -469,7 +469,87 @@ def check_chaos_exclusions(check, pins):
     return out
 
 
+
+def check_kernel_responsibilities(check, pins):
+    """Commandment I, stated as a NUMBER: the kernel has six responsibilities and no more.
+
+    4.3 names them - memory isolation, scheduling, IPC, capability enforcement, interrupt routing,
+    cross-core routing - and 4.4 says "nothing else". Every other Commandment I check pins a surface;
+    this one pins the COUNT, which is the thing the commandment is actually about.
+
+    Every top-level module must claim one of the six, or a support role that is sanctioned SOMEWHERE
+    ELSE in the constitution and cites where. A module that can claim neither IS a seventh
+    responsibility, whatever its size - which is how a responsibility gets added without any surface
+    changing at all.
+
+    The claims are data in the baseline, so they are reviewable in a diff. A module can still claim
+    dishonestly; the check moves that lie somewhere it can be argued with.
+    """
+    six = set(pins.get("kernel_responsibilities", []))
+    support = pins.get("kernel_support_roles", {})
+    claims = pins.get("module_responsibility", {})
+    out = []
+    if len(six) != 6:
+        out.append(Violation("COMMANDMENTS.baseline.toml", 0,
+                             f"kernel_responsibilities lists {len(six)}, not 6. 4.3 names exactly six "
+                             f"and 4.4 says 'nothing else'. Changing this number is amending the "
+                             f"constitution, not editing a config."))
+    found = {n for n in os.listdir(os.path.join(ROOT, "kernel/src")) if not n.startswith(".")}
+    for m in sorted(found):
+        c = claims.get(m)
+        if c is None:
+            out.append(Violation("kernel/src/" + m, 0,
+                                 "this module claims no kernel responsibility. Name which of the six "
+                                 "(4.3) it serves, or which sanctioned support role and where the "
+                                 "constitution sanctions it."))
+        elif c not in six and c not in support:
+            out.append(Violation("kernel/src/" + m, 0,
+                                 f"claims '{c}', which is neither one of the six responsibilities "
+                                 f"(4.3) nor a sanctioned support role. If the kernel genuinely does "
+                                 f"this, it is a SEVENTH responsibility and needs an amendment."))
+    for m in sorted(set(claims) - found):
+        out.append(Violation("kernel/src/" + m, 0,
+                             "a responsibility is claimed for a module that no longer exists - delete "
+                             "the claim so the record stays true."))
+    return out
+
+
+REQUIRED_PLAIN_KEYS = [
+    "modules", "dependencies", "features", "service_configs", "arch_permitted_roles",
+    "introspect_queries", "kernel_spawned_service", "kernel_responsibilities", "chaos_exclusions",
+]
+
+
+def check_baseline_shape(check, pins):
+    """The baseline's own shape, because TOML will swallow a key without saying so.
+
+    Every key after a `[kernel.sub]` header belongs to that sub-table, so a plain key appended below one
+    silently joins it and `pins.get("thing")` quietly returns nothing - which reads as an EMPTY pin, and
+    an empty pin passes everything. This happened four times while writing these checks; the self-test
+    caught it each time, but only because a probe happened to cover it.
+
+    A pin that vanishes must fail loudly rather than pass vacuously.
+    """
+    return [Violation("COMMANDMENTS.baseline.toml", 0,
+                      f"[kernel] has no '{k}' key. Either it was deleted, or it was appended below a "
+                      f"[kernel.sub-table] header and TOML swallowed it into that table - in which case "
+                      f"the check that reads it is silently passing everything. Plain keys must come "
+                      f"BEFORE any sub-table.")
+            for k in REQUIRED_PLAIN_KEYS if k not in pins]
+
+
 CHECKS = [
+    dict(id="integrity-baseline", commandment="-",
+         title="the baseline's own pins are readable",
+         kind="custom", fn=check_baseline_shape,
+         scope="COMMANDMENTS.baseline.toml, [kernel] plain keys",
+         proves="no pin has silently vanished into a sub-table, where it would read as empty and "
+                "therefore pass everything",
+         does_not_prove="that the pins CONTAIN the right things - only that they exist to be read",
+         probes=[
+             dict(why="a vanished pin must be caught", pins={}, expect=True),
+             dict(why="the real baseline must be readable", pins=None, expect=False),
+         ]),
     dict(id="I-syscalls", commandment="I", title="the syscall surface is pinned",
          kind="custom", fn=check_syscall_surface,
          scope="kernel/src/syscall/dispatch.rs, enum SyscallNumber",
@@ -566,6 +646,28 @@ CHECKS = [
              dict(why="a new kernel service config must be caught",
                   pins={"service_configs": []}, expect=True),
              dict(why="the real, fully pinned service set must pass", pins=None, expect=False),
+         ]),
+    dict(id="I-responsibilities", commandment="I",
+         title="the kernel has six responsibilities, and every module claims one",
+         kind="custom", fn=check_kernel_responsibilities,
+         scope="kernel/src/* against the six of 4.3 plus sanctioned support roles",
+         proves="no top-level module serves something outside the six without saying so",
+         does_not_prove="that a module's CLAIM is honest, or that a module serving one of the six "
+                        "has not grown a second job inside itself",
+         probes=[
+             dict(why="a module claiming nothing must be caught",
+                  pins={"kernel_responsibilities": ["a", "b", "c", "d", "e", "f"],
+                        "module_responsibility": {}}, expect=True),
+             dict(why="a module claiming something outside the six must be caught",
+                  pins={"kernel_responsibilities": ["a", "b", "c", "d", "e", "f"],
+                        "module_responsibility": {"memory": "filesystem"}}, expect=True),
+             dict(why="changing the NUMBER of responsibilities must be caught",
+                  pins={"kernel_responsibilities": ["a"], "module_responsibility": {}}, expect=True),
+             # Reality: four modules claim nothing today (C1-6). This probe asserts that, so closing
+             # those findings BREAKS it deliberately and forces the expectation to be flipped - the
+             # same ratchet the baseline uses, applied to the corpus.
+             dict(why="the real module set still has unclaimed modules (C1-6 open)",
+                  pins=None, expect=True),
          ]),
     dict(id="I-arch-drivers", commandment="I", title="no peripheral device driver lives in the kernel",
          kind="custom", fn=check_arch_device_drivers,
