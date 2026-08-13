@@ -554,6 +554,35 @@ the largest file in the repository, and nothing at the top orients a reader. §2
 whiteboard rule bears on it. `kernel/src/main.rs` at 363 lines is the boot entry and self-evident;
 noted for completeness, not as a finding.
 
+## Commandment VIII - wait for truth, not time
+
+**Measured. One shape viable, one rejected. 1 finding.**
+
+The commandment that cost most in this session: `nohalt 21825` waiting on the wrong signal, eight IPC
+round trips outlasting net-stack's patience, an `XFER_TRIES` bound counted in iterations. Two mechanical
+shapes measured.
+
+**VIABLE - a bound expressed in ITERATIONS rather than a clock. 16 sites.** A count is not a duration:
+it means a different wall-clock wait on every machine, and this repo has already been bitten three
+times by it (the chaos `PACE_YIELDS`, the storage `BUSY_RETRIES`, and `XFER_TRIES` at 300M which was
+really ~19 billion register reads). The worst here are `for _ in 0..2_000_000u32` in `ahci` and
+`0..10_000_000u32` in `ehci`, both polling hardware. 16 is small enough to review site by site, so a
+check plus a per-site justified allowlist is workable.
+
+**REJECTED - a sleep inside a loop. 25 sites, not judgeable mechanically.** The commandment explicitly
+permits this: "Time may conserve CPU. It must never determine correctness." Telling an allowed idle
+sleep from timing-for-correctness requires reading the loop's exit condition and deciding whether it
+observes the thing awaited. That is review, not pattern matching - the fourth intuition measurement has
+killed, after vocabulary scanning, the line-count ceiling, and constant-duplication.
+
+**C8-1 (Medium). 16 hardware/peer polls bounded by an iteration count rather than a clock.** The fix
+shape is known and already applied elsewhere in this repo: bound by the monotonic clock and report in
+seconds. Not fixed.
+
+**The third clause is the one no static check reaches**: "the truth must include failure ... a wait that
+cannot observe failure has quietly become an infinite wait on time." Whether a wait wakes on a peer's
+death is a runtime property - the same dependency matrix that V and IX need.
+
 ---
 
 ## All ten walked - where this stands
@@ -567,11 +596,11 @@ noted for completeness, not as a finding.
 | V | half encoded + red-teamed, half measured | 1 (High) |
 | VI | encoded, then found WEAK and widened | 2 |
 | VII | measured CLEAN | 0 |
-| VIII | not walked | - |
+| VIII | measured; 1 shape viable, 1 rejected | 1 |
 | IX | static half measured clean, runtime half not built | 0 today, 1 this morning |
 | X | judgment confirmed; one proxy measured | 1 |
 
-**14 findings, 4 High, none fixed** - which was the instruction, and is also the point: an audit that
+**15 findings, 4 High, none fixed** - which was the instruction, and is also the point: an audit that
 fixes as it goes cannot tell you how bad things were.
 
 Three of those findings are violations introduced during THIS session, by someone who had read the
