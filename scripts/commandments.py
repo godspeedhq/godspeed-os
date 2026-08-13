@@ -799,8 +799,17 @@ def load_baseline():
     import tomllib
     if not os.path.exists(BASELINE):
         return {}, []
-    with open(BASELINE, "rb") as f:
-        data = tomllib.load(f)
+    try:
+        with open(BASELINE, "rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        # Malformed baseline. It already fails safe - a crash exits non-zero and the build stops - but a
+        # Python traceback is not a designed message, and this file is read under pressure by someone
+        # trying to get a build through. Say what is wrong and where.
+        print(f"{RED}{BOLD}COMMANDMENTS.baseline.toml is not valid TOML{OFF}: {e}")
+        print("  Every check reads this file. Until it parses, nothing can be verified - which is a "
+              "failure, never a pass.")
+        sys.exit(1)
     return data.get("kernel", {}), data.get("exemption", [])
 
 
