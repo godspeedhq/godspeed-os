@@ -125,6 +125,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut kbd: Option<(hid::Keyboard, chan::Target, u32)> = None;
     let mut disk: Option<(msc::Disk, chan::Target, u64)> = None;
     let mut nic: Option<(net::Nic, chan::Target)> = None;
+    // Owned by the enumeration loop, not a static (C6-1). The bus hands out addresses in sequence and
+    // this is the thing that runs the bus, so this is where the counter belongs.
+    let mut next_addr: u8 = hub::FIRST_DOWNSTREAM_ADDR;
     if let Some(m) = ctx.mmio() {
         if core::identify(&ctx, &m).is_some() {
             let ok = core::reset_and_host_mode(&ctx, &m);
@@ -198,7 +201,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                         // which is an ordinary outcome on three of these four ports
                                         // and must not be reported as a failure.
                                         if let Some((dvid, dpid, _, dt, dsplt)) =
-                                            hub::enumerate_downstream(&ctx, &m, &d, &dev.target, p)
+                                            hub::enumerate_downstream(&ctx, &m, &d, &dev.target, p, &mut next_addr)
                                         {
                                             // A device is one thing or the other, so try the
                                             // keyboard binding first and the disk only if that

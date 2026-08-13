@@ -11,18 +11,19 @@
 
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
-use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::chan::{self, Target};
 
-/// The next USB device address to hand out.
+/// The first USB address handed to a downstream device.
 ///
-/// The hub took 1 at enumeration, so downstream devices start at 2. A counter rather than a
-/// per-port formula because address is a property of the BUS, not of where a device happens to sit.
-static NEXT_ADDR: AtomicU8 = AtomicU8::new(2);
-fn next_address() -> u8 {
-    NEXT_ADDR.fetch_add(1, Ordering::Relaxed)
-}
+/// The hub took 1 at its own enumeration, so downstream devices start at 2. A counter rather than a
+/// per-port formula because an address is a property of the BUS, not of where a device happens to sit.
+///
+/// C6-1: this used to be `static NEXT_ADDR: AtomicU8`, which is unowned global mutable state
+/// (Invariant 9) wearing a thread-safe type. Nothing about it was shared or concurrent - one caller,
+/// on one core - it was simply easier to reach for a static than to thread the counter through. The
+/// owner is the enumeration loop, so the counter now lives there and is passed in.
+pub const FIRST_DOWNSTREAM_ADDR: u8 = 2;
 
 // --- Hub class requests (USB 2.0 chapter 11) ---------------------------------------------------
 //
@@ -204,7 +205,7 @@ pub fn survey(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, ports: u
 /// with MPS 8 exactly as a root device is; what differs is that every stage rides the hub's
 /// transaction translator.
 pub fn enumerate_downstream(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, hub: &Target, port: u8,
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, hub: &Target, port: u8, next_addr: &mut u8,
 ) -> Option<(u16, u16, u8, Target, u32)> {
     // THE SPEED IS ONLY VALID AFTER THE RESET, and it decides whether a split is needed at all.
     //
@@ -282,7 +283,8 @@ pub fn enumerate_downstream(
         return None;
     }
     t.mps = mps0;
-    let addr = next_address();
+    let addr = *next_addr;
+    *next_addr += 1;
     let sa = [0x00, 0x05, addr, 0, 0, 0, 0, 0];
     let mut none: [u8; 0] = [];
     if !chan::control_split(ctx, mmio, dma, &t, &sa, &mut none, false, 0, splt) {
