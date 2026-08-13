@@ -38,6 +38,84 @@ modules = [
 # service?" first. The numbers are the ABI every built service binary depends on, so they are pinned by
 # VALUE, not merely by name. (9 is absent by history, not by accident.)
 
+# Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
+# legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
+# before it builds, and classifying one honestly as a device driver fails the build - which is the
+# point. Sneaking one past now requires writing a lie into this file, in a diff, rather than choosing
+# an innocuous filename nobody re-reads.
+#
+# A kernel may legitimately bring up its own CPU, memory, interrupts, timer, console and buses. It may
+# not drive a peripheral: a USB host stack, a NIC, a disk. Those are services. The Pi 4 port proved it
+# by deleting 2742 lines of ring-0 xhci (CLAUDE.md §6.4, 2026-08-09).
+arch_permitted_roles = [
+    "arch-entry", "boot", "mmu", "interrupts", "timer", "context-switch", "scheduler-entry",
+    "syscall-entry", "usermode", "uaccess", "console", "discovery", "iommu", "clock", "test-scaffold",
+]
+
+[kernel.arch_roles]
+"hid.rs"                      = "usb-hid-decode"
+"mod.rs"                      = "arch-entry"
+"aarch64/context.rs"          = "context-switch"
+"aarch64/ctxdemo.rs"          = "test-scaffold"
+"aarch64/exceptions.rs"       = "interrupts"
+"aarch64/genet.rs"            = "discovery"
+"aarch64/gic.rs"              = "interrupts"
+"aarch64/mailbox.rs"          = "discovery"
+"aarch64/memmap.rs"           = "mmu"
+"aarch64/mmu.rs"              = "mmu"
+"aarch64/mod.rs"              = "arch-entry"
+"aarch64/pcie.rs"             = "discovery"
+"aarch64/ptables.rs"          = "mmu"
+"aarch64/sched_demo.rs"       = "scheduler-entry"
+"aarch64/sched_spawn.rs"      = "scheduler-entry"
+"aarch64/sched_supervisor.rs" = "scheduler-entry"
+"aarch64/sched_user.rs"       = "scheduler-entry"
+"aarch64/smp_boot.rs"         = "boot"
+"aarch64/timer.rs"            = "timer"
+"aarch64/uaccess.rs"          = "uaccess"
+"aarch64/uart_rx.rs"          = "console"
+"aarch64/usermode.rs"         = "usermode"
+"aarch64/video.rs"            = "console"
+"arm/context.rs"              = "context-switch"
+"arm/context_switch.rs"       = "context-switch"
+"arm/dtb.rs"                  = "discovery"
+"arm/dwc2.rs"                 = "usb-host-stack"
+"arm/exceptions.rs"           = "interrupts"
+"arm/fbcon.rs"                = "console"
+"arm/irq.rs"                  = "interrupts"
+"arm/loadtest.rs"             = "test-scaffold"
+"arm/meminit.rs"              = "boot"
+"arm/mmu.rs"                  = "mmu"
+"arm/mod.rs"                  = "arch-entry"
+"arm/page_tables.rs"          = "mmu"
+"arm/sched_demo.rs"           = "scheduler-entry"
+"arm/sched_ipc.rs"            = "scheduler-entry"
+"arm/sched_shell.rs"          = "scheduler-entry"
+"arm/sched_spawn.rs"          = "scheduler-entry"
+"arm/sched_supervisor.rs"     = "scheduler-entry"
+"arm/sched_user.rs"           = "scheduler-entry"
+"arm/spawn.rs"                = "scheduler-entry"
+"arm/syscall.rs"              = "syscall-entry"
+"arm/timer.rs"                = "timer"
+"arm/usermode.rs"             = "usermode"
+"arm/video.rs"                = "console"
+"loongarch64/mod.rs"          = "arch-entry"
+"riscv32/mod.rs"              = "arch-entry"
+"riscv64/mod.rs"              = "arch-entry"
+"s390x/mod.rs"                = "arch-entry"
+"x86_64/ap_boot.rs"           = "boot"
+"x86_64/boot.rs"              = "boot"
+"x86_64/context_switch.rs"    = "context-switch"
+"x86_64/fb.rs"                = "console"
+"x86_64/interrupts.rs"        = "interrupts"
+"x86_64/ioapic.rs"            = "interrupts"
+"x86_64/iommu.rs"             = "mmu"
+"x86_64/mod.rs"               = "arch-entry"
+"x86_64/page_tables.rs"       = "mmu"
+"x86_64/pci.rs"               = "discovery"
+"x86_64/rtc.rs"               = "clock"
+"x86_64/syscall_entry.rs"     = "syscall-entry"
+
 [kernel.syscalls]
 Send                     = 1
 Recv                     = 2
@@ -103,3 +181,34 @@ SetClock                 = 50
 # count     = 3
 # amendment = "CLAUDE.md §6.4 amendment 2026-07-23 (SEC-29/30)"
 # reason    = "why the constitution already accepts this, and what closes it"
+
+# ------------------------------------------------------------------------------------------------
+# RECORDED EXEMPTIONS
+#
+# Two, both the same violation with the same cause, both already accepted by the constitution, and both
+# closed by the same piece of work. They are written here rather than fixed because the hardware cannot
+# yet support the fix - which is exactly the case CLAUDE.md §26.3 says to RECORD rather than pretend to
+# close.
+
+[[exemption]]
+check     = "I-arch-drivers"
+path      = "kernel/src/arch/arm/dwc2.rs"
+count     = 1
+amendment = "CLAUDE.md §6.4 amendment 2026-07-23 (SEC-29/30)"
+reason    = """
+The Pi 2 routes no device IRQs to userspace, so the DWC2 USB host stack cannot yet be a service and \
+runs in the kernel. The amendment states this plainly and calls it strictly worse than the no-IOMMU \
+x86 case: there the driver is untrusted-but-userspace with only its DMA unconfined; here the driver \
+IS the kernel. Recorded, not resolved."""
+closed_by = "feat/pi2-arm32-hardening slice 5 deletes this file once the dwc2 SERVICE drives the controller"
+
+[[exemption]]
+check     = "I-arch-drivers"
+path      = "kernel/src/arch/hid.rs"
+count     = 1
+amendment = "CLAUDE.md §6.4 amendment 2026-07-23 (SEC-29/30)"
+reason    = """
+USB HID boot-protocol keyboard decoding, in the kernel for the same reason and by the same amendment: \
+it is shared by the in-kernel USB drivers, and the kernel cannot link the SDK copy that the userspace \
+x86 drivers use. It is a consequence of the entry above, not a separate decision."""
+closed_by = "feat/pi2-arm32-hardening slice 5; the dwc2 SERVICE already carries its own hid.rs"

@@ -174,6 +174,56 @@ def check_kernel_modules(check, pins):
 # `probes` is the self-test corpus: what this check MUST catch, and what it must NOT.
 # --------------------------------------------------------------------------------------------------
 
+def check_arch_device_drivers(check, pins):
+    """Commandment I, where it actually bites: a DEVICE driver in the kernel.
+
+    "New hardware support, new CPU architectures, and bug fixes are welcome. New RESPONSIBILITIES are
+    not." So `arch/` is legitimate - a kernel must bring up its own CPU, MMU, timer, interrupt
+    controller and console. What is not legitimate is a driver for a PERIPHERAL: a USB host stack, a
+    NIC, a disk. Those are services, and the Pi 4 port proved it by deleting 2742 lines of ring-0 xhci.
+
+    Pinning module NAMES cannot see this, because a USB stack added under `arch/` hides behind a
+    legitimate module. So every file under `arch/` declares its ROLE, and roles come from a fixed
+    vocabulary of things a kernel is allowed to be. A new file must be classified before it builds, and
+    classifying it honestly as a device driver fails - which is the point. The lie required to sneak one
+    past is now explicit and in the diff, rather than a filename nobody re-reads.
+    """
+    roles = pins.get("arch_roles", {})
+    permitted = set(pins.get("arch_permitted_roles", []))
+    out = []
+    for base, _, names in os.walk(os.path.join(ROOT, "kernel/src/arch")):
+        for n in sorted(names):
+            if not n.endswith(".rs"):
+                continue
+            f = os.path.relpath(os.path.join(base, n), os.path.join(ROOT, "kernel/src/arch"))
+            f = f.replace("\\", "/")
+            path = "kernel/src/arch/" + f
+            role = roles.get(f)
+            if role is None:
+                out.append(Violation(path, 0,
+                                     "this arch file has no declared role. Every file under arch/ must "
+                                     "say what it IS, from the permitted vocabulary: "
+                                     + ", ".join(sorted(permitted))))
+            elif role not in permitted:
+                out.append(Violation(path, 0,
+                                     f"role '{role}' is a PERIPHERAL DEVICE DRIVER, which is a service, "
+                                     f"not a kernel responsibility (Commandment I). Ask why it is not a "
+                                     f"service; if the hardware genuinely cannot support one yet, that "
+                                     f"needs a CLAUDE.md amendment and an exemption citing it."))
+    # A role for a file that no longer exists is rot, and rot in the pin is the same failure as a
+    # stale exemption: the record stops describing the system while still looking authoritative.
+    # (Found by writing this check's own probe badly - the wrong test asserted nothing, and the
+    # nothing it asserted turned out to be a real hole.)
+    on_disk = {os.path.relpath(os.path.join(b, n), os.path.join(ROOT, "kernel/src/arch")).replace("\\", "/")
+               for b, _, ns in os.walk(os.path.join(ROOT, "kernel/src/arch")) for n in ns
+               if n.endswith(".rs")}
+    for f in sorted(set(roles) - on_disk):
+        out.append(Violation("kernel/src/arch/" + f, 0,
+                             "a role is pinned for a file that no longer exists. Removing kernel code "
+                             "is welcome - delete the entry so the record stays true."))
+    return out
+
+
 CHECKS = [
     dict(id="I-syscalls", commandment="I", title="the syscall surface is pinned",
          kind="custom", fn=check_syscall_surface,
@@ -195,6 +245,24 @@ CHECKS = [
          probes=[
              dict(why="a new kernel module must be caught", pins={"modules": []}, expect=True),
              dict(why="the real module set, fully pinned, must pass", pins=None, expect=False),
+         ]),
+    dict(id="I-arch-drivers", commandment="I", title="no peripheral device driver lives in the kernel",
+         kind="custom", fn=check_arch_device_drivers,
+         scope="every .rs under kernel/src/arch, by declared role",
+         proves="no file under arch/ is an undeclared or peripheral-driver responsibility",
+         does_not_prove="that a file's DECLARED role is its true one. A USB stack labelled 'timer' "
+                        "passes this check and fails review - the role is a claim, made in a diff",
+         probes=[
+             dict(why="an unclassified arch file must be caught",
+                  pins={"arch_roles": {}, "arch_permitted_roles": ["mmu"]}, expect=True),
+             dict(why="a device-driver role must be caught",
+                  pins={"arch_roles": {"arm/dwc2.rs": "usb-host-stack"},
+                        "arch_permitted_roles": ["mmu"]}, expect=True),
+             dict(why="a role pinned for a file that no longer exists must be caught",
+                  pins={"arch_roles": {"x86_64/deleted.rs": "mmu"},
+                        "arch_permitted_roles": ["mmu"]}, expect=True),
+             dict(why="the real, fully classified arch layer must reach only its known drivers",
+                  pins=None, expect=True),
          ]),
     dict(id="V-no-panic", commandment="V", title="no service may halt the machine",
          kind="source", dirs=["services"],
