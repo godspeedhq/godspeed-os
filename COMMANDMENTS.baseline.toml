@@ -53,6 +53,16 @@ dependencies = [
 # authority, so pinning syscalls without pinning these would leave half the surface unwatched. Pinned by
 # value: these ids are baked into every service's capability table.
 
+# Commandment I's ONE sanctioned exception. The kernel restarts exactly one service - the supervisor -
+# and it must, because of Commandment V: no service is special, so the supervisor has to be restartable
+# too, and only the kernel is beneath it to do the restarting. CLAUDE.md §11.1 calls it "the kernel's ONE
+# direct spawn"; §6.2 makes the respawn unconditional and unbounded (a bound would re-introduce the
+# reboot and hand an attacker a DoS); docs/naming-design.md §3.7 records the trade openly - a sliver of
+# §26.10 exchanged for maximum fault tolerance.
+#
+# It is pinned because an exception that is not counted stops being an exception.
+kernel_spawned_services = ["supervisor"]
+
 # Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
 # legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
 # before it builds, and classifying one honestly as a device driver fails the build - which is the

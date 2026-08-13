@@ -291,6 +291,40 @@ def check_kernel_dependencies(check, pins):
     return out
 
 
+
+def check_kernel_spawns(check, pins):
+    """Commandment I's ONE sanctioned exception, pinned so it stays one.
+
+    The kernel restarts exactly one service - the supervisor - and it must, because of Commandment V:
+    no service is special, so the supervisor has to be restartable too, and only the kernel is beneath
+    it to do the restarting. CLAUDE.md 11.1 calls it "the kernel's ONE direct spawn", 6.2 makes the
+    respawn unconditional and unbounded, and naming-design.md 3.7 records the trade openly: a sliver of
+    26.10 (mechanism, not policy) exchanged for maximum fault tolerance.
+
+    An exception that is not counted stops being an exception. This pins the set of service names the
+    kernel spawns on its OWN initiative - not via the Spawn syscall, which is mechanism a service asked
+    for - so a second one has to be argued for rather than merely added.
+    """
+    pinned = set(pins.get("kernel_spawned_services", []))
+    found = {}
+    for base, _, names in os.walk(os.path.join(ROOT, "kernel/src")):
+        for n in sorted(names):
+            if not n.endswith(".rs"):
+                continue
+            f = os.path.join(base, n)
+            for m in re.finditer(r'spawn_service_with_config\(\s*"([a-z0-9-]+)"', read(f)):
+                found.setdefault(m.group(1), os.path.relpath(f, ROOT).replace("\\", "/"))
+    out = [Violation(path, 0,
+                     f"the kernel spawns '{svc}' on its own initiative. The kernel restarts exactly ONE "
+                     f"service - the supervisor - and only because Commandment V leaves nothing else "
+                     f"beneath it to do so. A second one is a new kernel responsibility.")
+           for svc, path in sorted(found.items()) if svc not in pinned]
+    out += [Violation("kernel/src", 0,
+                      f"'{svc}' is pinned as kernel-spawned but nothing spawns it - update the pin.")
+            for svc in sorted(pinned - set(found))]
+    return out
+
+
 CHECKS = [
     dict(id="I-syscalls", commandment="I", title="the syscall surface is pinned",
          kind="custom", fn=check_syscall_surface,
@@ -332,6 +366,20 @@ CHECKS = [
          probes=[
              dict(why="a new kernel dependency must be caught", pins={"dependencies": []}, expect=True),
              dict(why="the real, fully pinned dependency set must pass", pins=None, expect=False),
+         ]),
+    dict(id="I-kernel-spawns", commandment="I",
+         title="the kernel spawns exactly one service, and it is the supervisor",
+         kind="custom", fn=check_kernel_spawns,
+         scope="every spawn_service_with_config(\"name\") in kernel/src",
+         proves="the kernel initiates a spawn for no service but the pinned one",
+         does_not_prove="that the exception is still WARRANTED. It is warranted by Commandment V "
+                        "having nothing beneath the supervisor to restart it; if that ever changes, "
+                        "this pin should shrink to nothing",
+         probes=[
+             dict(why="a second kernel-spawned service must be caught",
+                  pins={"kernel_spawned_services": []}, expect=True),
+             dict(why="a pin for a service nothing spawns must be caught",
+                  pins={"kernel_spawned_services": ["supervisor", "logger", "ghost"]}, expect=True),
          ]),
     dict(id="I-arch-drivers", commandment="I", title="no peripheral device driver lives in the kernel",
          kind="custom", fn=check_arch_device_drivers,
