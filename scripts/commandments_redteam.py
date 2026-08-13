@@ -1,4 +1,12 @@
-"""Inject a real violation for each currently-GREEN check, run the real checker, restore.
+"""DO NOT RUN THIS IN PARALLEL WITH ANYTHING, INCLUDING ITSELF.
+
+It MUTATES the working tree: inject a violation, run the checker, restore. A concurrent reader sees the
+injected state and reports a violation that is not really there; two concurrent copies corrupt each
+other's restore and can leave the tree dirty. `scripts/commandments.py` itself is read-only and
+deterministic - repeated runs are byte-identical - so parallelise THAT freely. This is the one that
+cannot be.
+
+Inject a real violation for each currently-GREEN check, run the real checker, restore.
 
 The self-test corpus proves the check FUNCTIONS fire on synthetic input. This proves they fire against
 the real tree, through the real file-reading path - a different claim, and the gap between them has
