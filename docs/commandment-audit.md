@@ -69,7 +69,7 @@ Two rules that came out of doing it, and cost something each time:
 
 ## Commandment I - thou shalt not expand the responsibilities of the kernel
 
-**Encoded: 7 checks. Findings: 4, all open.**
+**Encoded: 9 checks. Findings: 5. C1-4 closed, four open.**
 
 ### Why these surfaces
 
@@ -104,10 +104,14 @@ visible surface at all - the syscall count stays 49.
 Pinned now (C1-4). The general rule this yields: **any syscall that dispatches on an id needs its id
 space pinned too**, or the pin above it is watching the door while the room extends out the back.
 
-Still unpinned, and named here so the gap is not implied away: kernel **feature flags** (which gate
-behaviour - the C1-1 scaffolding lives behind two of them), the kernel's **per-service config table**
-(the kernel holds memory limits, placement and grants for every service, which is policy sitting in the
-kernel), and which **IRQs the kernel services itself** rather than routing to a driver (§12).
+Two of the three gaps named here are now pinned: kernel **feature flags** (22 - a feature is a switch on
+what the kernel IS, and the C1-1 scaffolding lives behind two of them) and the kernel's **per-service
+config table** (218 - memory limit, placement, capabilities and embedded ELF for every service).
+
+The third is NOT encoded, deliberately. Which **IRQs the kernel services itself** rather than routing to
+a driver (§12) is scattered per-arch in different shapes, and "handled in-kernel" versus "routed" is not
+expressed as one table anywhere. A partial version would look like coverage without being it, which is
+worse than the honest gap.
 
 ### Considered and REJECTED
 
@@ -129,6 +133,7 @@ and a proxy that fires on sanctioned work only trains people to raise it.
 | C1-2 | `arch/` is 65% of the kernel | Observation | no action expected |
 | C1-3 | Font crate linked for a framebuffer console, unjustified in writing | Low | amendment or make it a service |
 | C1-4 | `InspectKernel` carries 23 unpinned sub-queries | Medium | CLOSED by the I-introspect pin |
+| C1-5 | The kernel holds per-service policy for 218 services, ~190 of them test probes | Medium | open |
 
 **C1-1.** `arm_spawn_logger_neutral()` and `arm_spawn_shell_neutral()` in `task/mod.rs` are ARM/AArch64
 bring-up scaffolding from before the supervisor path worked, called from `sched_spawn.rs` and
@@ -144,6 +149,13 @@ checked.
 **C1-4 (closed).** `InspectKernel` was one pinned syscall with an unpinned query space behind it. Now
 pinned. Kept in the table rather than deleted because it is the finding that produced the general rule
 above, and the rule is worth more than the fix.
+
+**C1-5.** The kernel's `service_config` table holds memory limit, placement core, capabilities, send
+peers and the embedded ELF for **218** services - and roughly 190 are test probes (`prop-*`, `fuzz-*`,
+`stress-*`, `perf-*`, `adv-*`, `chaos-*`, `brutal-*`). Two questions fall out, and they are different.
+First, this is policy in the kernel (§26.10) rather than in the supervisor, whatever its convenience.
+Second, §4.4 forbids "developer tooling" in the kernel, and ~190 test-harness configurations plus their
+embedded ELFs are hard to call anything else. The pin freezes the set; it does not justify it.
 
 **C1-2.** `arch/` is 28,755 of ~44,000 kernel lines. Legitimate (hardware support is welcome), noted
 because the majority of the kernel lives in the layer these checks scrutinise least - the role pin says

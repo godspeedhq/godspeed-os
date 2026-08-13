@@ -375,6 +375,56 @@ def check_introspect_queries(check, pins):
     return out
 
 
+
+def check_kernel_features(check, pins):
+    """Commandment I: a feature flag is a switch on what the kernel IS.
+
+    Features gate whole behaviours, so an unpinned one can add a responsibility that no other pin sees -
+    a different scheduler entry, a different boot path, a service the kernel spawns itself. The C1-1
+    finding lives behind exactly two of them.
+
+    Test-only features count too. A build the kernel can be put into is a build someone can ship.
+    """
+    src = read(os.path.join(ROOT, "kernel/Cargo.toml"))
+    block = re.search(r"^\[features\](.*?)(?=^\[|\Z)", src, re.S | re.M)
+    found = set(re.findall(r"^([a-z0-9-]+)\s*=", block.group(1), re.M)) if block else set()
+    pinned = set(pins.get("features", []))
+    out = [Violation("kernel/Cargo.toml", 0,
+                     f"new kernel feature '{f}': a switch on what the kernel IS, which can add a "
+                     f"responsibility no other pin sees. Add it to [kernel] features deliberately.")
+           for f in sorted(found - pinned)]
+    out += [Violation("kernel/Cargo.toml", 0,
+                      f"pinned feature '{f}' is gone - update the pin so the record stays true.")
+            for f in sorted(pinned - found)]
+    return out
+
+
+def check_kernel_service_table(check, pins):
+    """Commandment I / 26.10: the kernel holds per-service POLICY, so pin whose.
+
+    `service_config` gives the kernel a table of every service it can start - memory limit, placement
+    core, capabilities, send peers, embedded ELF. That is policy, and policy belongs in services (26.10);
+    the kernel keeps it because it is also the loader. Whatever the merits, the SET is a fact about how
+    much of userspace the kernel knows, and it should not grow unnoticed.
+
+    Pinned by name, all of them, deliberately without trying to separate "real" services from test
+    probes. Any rule for that split would be a judgment encoded as a pattern, and the next service named
+    outside the pattern would slip through.
+    """
+    src = read(os.path.join(ROOT, "kernel/src/task/mod.rs"))
+    found = set(re.findall(r'"([a-z0-9-]+)" => Some\(\(', src))
+    pinned = set(pins.get("service_configs", []))
+    out = [Violation("kernel/src/task/mod.rs", 0,
+                     f"the kernel holds a service config for '{f}' that is not pinned. The kernel now "
+                     f"knows one more thing about userspace: ask whether that policy belongs to the "
+                     f"supervisor instead, then add it to [kernel] service_configs deliberately.")
+           for f in sorted(found - pinned)]
+    out += [Violation("kernel/src/task/mod.rs", 0,
+                      f"pinned service config '{f}' is gone - update the pin.")
+            for f in sorted(pinned - found)]
+    return out
+
+
 CHECKS = [
     dict(id="I-syscalls", commandment="I", title="the syscall surface is pinned",
          kind="custom", fn=check_syscall_surface,
@@ -448,6 +498,29 @@ CHECKS = [
              dict(why="a pinned query that no longer exists must be caught",
                   pins={"introspect_queries": list(range(0, 40))}, expect=True),
              dict(why="the real, fully pinned query space must pass", pins=None, expect=False),
+         ]),
+    dict(id="I-features", commandment="I", title="kernel feature flags are pinned",
+         kind="custom", fn=check_kernel_features,
+         scope="kernel/Cargo.toml [features]",
+         proves="no build configuration of the kernel exists that was not deliberately admitted",
+         does_not_prove="what a feature DOES. A pinned feature can still gate a new responsibility - "
+                        "that is what the other checks are for",
+         probes=[
+             dict(why="a new kernel feature must be caught", pins={"features": []}, expect=True),
+             dict(why="the real, fully pinned feature set must pass", pins=None, expect=False),
+         ]),
+    dict(id="I-service-table", commandment="I",
+         title="the kernel's per-service policy table is pinned",
+         kind="custom", fn=check_kernel_service_table,
+         scope="kernel/src/task/mod.rs, service_config entries",
+         proves="the kernel knows about no service that was not deliberately admitted",
+         does_not_prove="that the kernel SHOULD hold this policy at all. It holds memory limits, "
+                        "placement and grants for every service, which is policy in the kernel "
+                        "(26.10). The pin freezes the set; it does not justify it",
+         probes=[
+             dict(why="a new kernel service config must be caught",
+                  pins={"service_configs": []}, expect=True),
+             dict(why="the real, fully pinned service set must pass", pins=None, expect=False),
          ]),
     dict(id="I-arch-drivers", commandment="I", title="no peripheral device driver lives in the kernel",
          kind="custom", fn=check_arch_device_drivers,
