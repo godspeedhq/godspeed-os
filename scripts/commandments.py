@@ -305,7 +305,23 @@ def check_kernel_spawns(check, pins):
     kernel spawns on its OWN initiative - not via the Spawn syscall, which is mechanism a service asked
     for - so a second one has to be argued for rather than merely added.
     """
-    pinned = set(pins.get("kernel_spawned_services", []))
+    # THE SHAPE IS THE POLICY. This is a single string, deliberately not a list, because a list is an
+    # invitation: it has room for a second entry and appending one looks like configuration rather than
+    # a constitutional change. A scalar cannot be appended to. Adding a second kernel-spawned service
+    # would mean changing the SCHEMA - visible, arguable, and impossible to do absent-mindedly.
+    #
+    # Both wrong shapes are refused rather than tolerated, or the affordance leaks straight back in.
+    if "kernel_spawned_services" in pins:
+        return [Violation("COMMANDMENTS.baseline.toml", 0,
+                          "`kernel_spawned_services` is a LIST. It is deliberately singular - "
+                          "`kernel_spawned_service = \"supervisor\"` - because the kernel spawns exactly "
+                          "one service and a list has room for a second. Restore the scalar.")]
+    one = pins.get("kernel_spawned_service")
+    if one is not None and not isinstance(one, str):
+        return [Violation("COMMANDMENTS.baseline.toml", 0,
+                          "`kernel_spawned_service` must be a single string. The shape carries the rule: "
+                          "exactly one service, named, not a collection that can grow.")]
+    pinned = {one} if one else set()
     found = {}
     for base, _, names in os.walk(os.path.join(ROOT, "kernel/src")):
         for n in sorted(names):
@@ -377,9 +393,13 @@ CHECKS = [
                         "this pin should shrink to nothing",
          probes=[
              dict(why="a second kernel-spawned service must be caught",
-                  pins={"kernel_spawned_services": []}, expect=True),
+                  pins={"kernel_spawned_service": "supervisor"}, expect=True),
              dict(why="a pin for a service nothing spawns must be caught",
-                  pins={"kernel_spawned_services": ["supervisor", "logger", "ghost"]}, expect=True),
+                  pins={"kernel_spawned_service": "ghost"}, expect=True),
+             dict(why="turning the pin back into a LIST must be refused - the shape is the policy",
+                  pins={"kernel_spawned_services": ["supervisor"]}, expect=True),
+             dict(why="any non-string shape must be refused for the same reason",
+                  pins={"kernel_spawned_service": ["supervisor"]}, expect=True),
          ]),
     dict(id="I-arch-drivers", commandment="I", title="no peripheral device driver lives in the kernel",
          kind="custom", fn=check_arch_device_drivers,

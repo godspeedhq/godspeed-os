@@ -61,7 +61,13 @@ dependencies = [
 # §26.10 exchanged for maximum fault tolerance.
 #
 # It is pinned because an exception that is not counted stops being an exception.
-kernel_spawned_services = ["supervisor"]
+#
+# SINGULAR ON PURPOSE. This is one string, not a list, because the SHAPE carries the rule. A list has
+# room for a second entry, and appending one reads like configuration; a scalar cannot be appended to,
+# so a second kernel-spawned service would mean changing this schema - visible in a diff, arguable, and
+# impossible to do absent-mindedly. The checker refuses a list here, and refuses the old plural key, so
+# the affordance cannot leak back in.
+kernel_spawned_service = "supervisor"
 
 # Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
 # legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
