@@ -499,7 +499,39 @@ without being it.
 
 ---
 
-## Commandments VIII - X
+## Commandment IX - thou shalt always plan for recovery
+
+**Static half measured CLEAN (5/5). Runtime half not built. 0 findings today - but one this morning.**
+
+The directly checkable clause is "a client whose dependency restarts must reacquire and retry, not
+crash". That is DERIVABLE rather than declared: if a service names a send peer, it must have a
+reacquire path, or it cannot survive that peer's restart.
+
+| service | peers | reacquire path |
+|---------|-------|----------------|
+| `block-driver` | `dwc2`, `xhci` | yes |
+| `fs` | `block-driver` | yes |
+| `net-stack` | `nic-driver` | yes |
+| `nic-driver` | `dwc2` | yes |
+| `shell` | `block-driver`, `fs` | yes |
+
+**`nic-driver` only passes because it was fixed this morning.** Before that it had no reacquire path,
+and the symptom was indistinguishable from a dead cable: `request_with_reply` returns `None` instantly
+when the send slot was never wired, so every layer looked healthy in isolation while the network was
+simply absent. This check would have caught it before the boot that found it.
+
+That makes IX the clearest case in the audit for encoding a commandment: not a hypothetical, but a rule
+violated in code written hours earlier by someone who had read it - the third such instance today,
+after `FRAME_MAX` (III) and the unwatched `dwc2` (V).
+
+**Runtime half not built: "if recovery cannot be tested, it does not exist."** The dependency matrix -
+kill each dependency, assert every caller still answers within a bound - is the same machinery as V's
+must-not-hang, and remains the highest-value unbuilt item in the whole audit. It is the only thing that
+would have caught the hangs this session, and no static check ever will.
+
+---
+
+## Commandments VIII and X
 
 Not yet walked. `--report` lists each and why it is not mechanised, so the gap shows on every build
 rather than only here.
