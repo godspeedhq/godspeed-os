@@ -531,9 +531,58 @@ would have caught the hangs this session, and no static check ever will.
 
 ---
 
-## Commandments VIII and X
+## Commandment X - thou shalt place complexity where it belongs
 
-Not yet walked. `--report` lists each and why it is not mechanised, so the gap shows on every build
+**Largely judgment, as expected - but one clause has a mechanical proxy. 1 finding.**
+
+*Where* complexity belongs is judgment and will stay judgment: no machine decides whether the wall
+clock is the kernel's business. But the text has a second clause that is checkable - "Complexity is
+sometimes necessary. HIDDEN complexity never is" (and §26.4, complexity must remain visible).
+
+The proxy: a file carrying real complexity with nothing at the top saying what it is. Measured across
+`kernel/src` and `services`, files over 300 lines with no module doc header:
+
+    10,812  services/shell/src/main.rs
+       363  kernel/src/main.rs
+
+**Two.** The codebase is otherwise thoroughly documented, which is a result worth recording rather than
+passing over - the doc-header discipline is being kept almost everywhere.
+
+**C10-1 (Low). `services/shell/src/main.rs` is 10,812 lines with no module header.** It is in the right
+LAYER - a service, correctly - so this is not misplaced complexity. It is undocumented concentration:
+the largest file in the repository, and nothing at the top orients a reader. §26.11's 30-minute
+whiteboard rule bears on it. `kernel/src/main.rs` at 363 lines is the boot entry and self-evident;
+noted for completeness, not as a finding.
+
+---
+
+## All ten walked - where this stands
+
+| | Result | Findings |
+|---|--------|----------|
+| I | 9 checks, red-teamed 11/11 | 6 (1 closed, 2 High) |
+| II | 1 check, red-teamed 5/5 both directions | 1 |
+| III | measured, REJECTED as a gate (~90% false positives) | 1 |
+| IV | measured, check designed not built | 2 (1 High) |
+| V | half encoded + red-teamed, half measured | 1 (High) |
+| VI | encoded, then found WEAK and widened | 2 |
+| VII | measured CLEAN | 0 |
+| VIII | not walked | - |
+| IX | static half measured clean, runtime half not built | 0 today, 1 this morning |
+| X | judgment confirmed; one proxy measured | 1 |
+
+**14 findings, 4 High, none fixed** - which was the instruction, and is also the point: an audit that
+fixes as it goes cannot tell you how bad things were.
+
+Three of those findings are violations introduced during THIS session, by someone who had read the
+commandment that morning: `FRAME_MAX` duplicated with a real truncation window (III), `dwc2` spawned but
+never watched (V), and `NEXT_ADDR` as unowned global state (VI). That is the argument for mechanising
+these rules, made better than any reasoning could: **the commandments describe failures that do not feel
+like failures while you are committing them.**
+
+The single highest-value item outstanding is the **runtime dependency matrix** (V's second half and IX's
+second half - one piece of machinery). It is the only thing that would have caught this session's hangs,
+and no static check will ever reach them. `--report` lists each and why it is not mechanised, so the gap shows on every build
 rather than only here.
 
 Order and reasoning: **IV** next (fold in the existing `contract_check.py` - nearly free, and it has
