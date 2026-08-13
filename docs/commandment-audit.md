@@ -469,7 +469,37 @@ its service already threads through its own loop. The `dwc2` one is from this se
 
 ---
 
-## Commandments VII - X
+## Commandment VII - thou shalt not introduce ambient authority
+
+**Measured CLEAN. Check shape settled, not built. 0 findings.**
+
+The mechanical core is in §21's own rejection list: "adds a syscall that does not validate a
+capability". Measured across every handler in `dispatch.rs`:
+
+**46 syscall handlers. 4 consult no capability - and all four are defensible.**
+
+| Handler | Why no capability |
+|---------|-------------------|
+| `handle_sleep` | sleeping is not a privileged action |
+| `handle_take_pending_cap` | takes a cap the kernel already placed there for you |
+| `handle_alloc_mem` | bounded by the task's OWN contract limit, per-task rather than ambient |
+| `handle_remove_cap` | dropping authority from your own table; you may always give up power |
+
+This is the first commandment to measure clean - I, II, V and VI each had live violations, and IV had
+two. Worth stating plainly rather than hunting for something to report: **the capability discipline in
+the syscall layer is genuinely being kept.**
+
+The check composes with `I-syscalls`: adding a syscall already requires a pin, and would additionally
+require either a capability check or an entry in the no-cap list. That list is judgment, so it must be
+DECLARED rather than derived - but four entries is a size where each carries its own reason and can be
+argued with, which is the condition under which a declaration stays honest.
+
+Not built. Same reason as IV: a check that cannot be red-teamed in the same sitting looks like coverage
+without being it.
+
+---
+
+## Commandments VIII - X
 
 Not yet walked. `--report` lists each and why it is not mechanised, so the gap shows on every build
 rather than only here.
