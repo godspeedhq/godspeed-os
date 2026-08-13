@@ -412,9 +412,40 @@ coverage without being it.
 
 ---
 
-## Commandments V - X
+## Commandment V - thou shalt not assume thy service is special
 
-Not yet walked. `--report` lists each and why it is not mechanised, so the gap shows on every build
+**Half encoded (`V-no-panic`, red-teamed). Second half measured, not built. 1 finding, and it is live.**
+
+The panic half is done: no service may halt the machine. The text carries two more obligations, and
+measuring the first found a real hole.
+
+**C5-1 (High, live). `dwc2` is spawned but never watched, so it dies permanently.**
+
+The supervisor watches nine services - `block-driver`, `counter`, `ehci`, `fs`, `logger`, `net-stack`,
+`nic-driver`, `shell`, `xhci`. `dwc2` is not among them. On the Pi 2 that service IS the USB stack:
+storage, keyboard and networking all ride on it. If it dies it stays dead, and all three go with it
+until reboot - which is precisely the "special service" the commandment forbids, arrived at by
+omission rather than by decision. Introduced during the arm32 USB work in this same session.
+
+The check shape is DERIVABLE rather than declared, which is the preferred form: **any service named as
+a `send_peer` by another service must be watched for restart.** If A depends on B and B dies
+permanently, A is broken forever. `block-driver` and `nic-driver` both declare `dwc2` as a peer, so the
+rule catches it with no list to maintain and nothing to append.
+
+**Still unmeasured: recovery whose own failure is discarded.** "A recovery whose own failure is
+discarded becomes a silent success, and the service then proceeds on a state it never actually
+reached." This is the failure that bit hardest this session - the slice-3c blocker was a discarded
+`None`, and the receive path spent three boots on a discarded `HCINT`. A `let _ =` on a retry or
+reacquire is the mechanical shape, and its false-positive rate is unmeasured.
+
+**Runtime half, not built: a service must not HANG.** No static check reaches it. The dependency
+matrix - kill each dependency, assert every caller still answers - is shared machinery with IX.
+
+---
+
+## Commandments VI - X
+
+Not yet walked. VI is partly encoded (`VI-static-mut`, red-teamed). `--report` lists each and why it is not mechanised, so the gap shows on every build
 rather than only here.
 
 Order and reasoning: **IV** next (fold in the existing `contract_check.py` - nearly free, and it has
