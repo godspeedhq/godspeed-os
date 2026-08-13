@@ -454,20 +454,29 @@ def check_chaos_exclusions(check, pins):
                           "verified, and an unverifiable exclusion set is a failure, never a pass")]
     found = set(re.findall(r'name == "([a-z0-9-]+)"', body.group(0)))
     found |= {m + "*" for m in re.findall(r'starts_with\("([a-z0-9-]+)"\)', body.group(0))}
-    # The TARGET is a scalar and must read "none": nothing escapes chaos. It is not a list, because a
-    # list of permitted escapees is an invitation to add one. What follows is DEBT against that target.
-    target = pins.get("chaos_exclusions_target")
+    # TWO CATEGORIES, NAMED SEPARATELY, because they are not the same thing and one list holding both
+    # reads as a contradiction ("they said none, but look at what is excluded").
+    #
+    #   apparatus  - chaos's OWN machinery. Not a service under test at all: killing `chaos` mid-run
+    #                stops the storm measuring anything, and `mem-pressure` tasks are the ammunition it
+    #                spawns. Excluding the instrument from its own measurement is not an escape.
+    #   escaping   - real SERVICES that never face the storm. The target here is EMPTY, and the list is
+    #                debt that may only shrink.
+    target = pins.get("services_escaping_chaos_target")
     if target != "none":
         return [Violation("COMMANDMENTS.baseline.toml", 0,
-                          "chaos_exclusions_target must read \"none\" - nothing escapes Chaos. It is a "
-                          "single string on purpose: a list of permitted escapees is an invitation to "
-                          "add one.")]
-    pinned = set(pins.get("chaos_exclusions", []))
+                          "services_escaping_chaos_target must read \"none\". No SERVICE escapes Chaos. "
+                          "It is a single string on purpose: a list of permitted escapees has room for "
+                          "one more.")]
+    apparatus = set(pins.get("chaos_apparatus", []))
+    escaping = set(pins.get("services_escaping_chaos", []))
+    pinned = apparatus | escaping
     out = [Violation("services/chaos/src/main.rs", 0,
-                     f"'{f}' is excluded from Maximum Carnage. The target is NONE - nothing escapes "
-                     f"Chaos - and the existing list is debt that may only SHRINK. There is no 'add it "
-                     f"to the pin' path here: a service chaos never reaches is a service that is "
-                     f"special (Commandment V) while every suite still reports green.")
+                     f"'{f}' is excluded from Maximum Carnage and is declared neither as chaos's own "
+                     f"apparatus nor as a service escaping. No SERVICE escapes Chaos: the target is "
+                     f"empty and the escaping list is debt that may only SHRINK, with no 'add it to "
+                     f"the pin' path. A service chaos never reaches is a service that is special "
+                     f"(Commandment V) while every suite still reports green.")
            for f in sorted(found - pinned)]
     out += [Violation("services/chaos/src/main.rs", 0,
                       f"'{f}' is pinned as chaos-excluded but no longer is - delete the pin. Every "
@@ -524,8 +533,8 @@ def check_kernel_responsibilities(check, pins):
 
 REQUIRED_PLAIN_KEYS = [
     "modules", "dependencies", "features", "service_configs", "arch_permitted_roles",
-    "introspect_queries", "kernel_spawned_service", "kernel_responsibilities", "chaos_exclusions",
-    "chaos_exclusions_target",
+    "introspect_queries", "kernel_spawned_service", "kernel_responsibilities", "chaos_apparatus",
+    "services_escaping_chaos", "services_escaping_chaos_target",
 ]
 
 
@@ -707,12 +716,13 @@ CHECKS = [
                         "good intentions rather than a gate with a threshold",
          probes=[
              dict(why="a newly excluded service must be caught",
-                  pins={"chaos_exclusions_target": "none", "chaos_exclusions": []}, expect=True),
+                  pins={"services_escaping_chaos_target": "none"}, expect=True),
              dict(why="softening the TARGET away from none must be refused",
-                  pins={"chaos_exclusions_target": "some", "chaos_exclusions": []}, expect=True),
+                  pins={"services_escaping_chaos_target": "some"}, expect=True),
              dict(why="a pin for a service no longer excluded must be caught",
-                  pins={"chaos_exclusions_target": "none",
-                        "chaos_exclusions": ["chaos", "mem-pressure", "observe*", "ghost"]},
+                  pins={"services_escaping_chaos_target": "none",
+                        "chaos_apparatus": ["chaos", "mem-pressure"],
+                        "services_escaping_chaos": ["observe*", "ghost"]},
                   expect=True),
              dict(why="the real, fully pinned exclusion set must pass", pins=None, expect=False),
          ]),
