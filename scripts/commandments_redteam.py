@@ -48,6 +48,14 @@ def restore(paths, created=()):
     if paths:
         subprocess.run(["git", "checkout", "--"] + list(paths), capture_output=True)
 
+
+def violations(out):
+    """The SET of violation detail lines. Counting alone misses a SWAP - one violation replaced by
+    another leaves the count unchanged, and that is precisely what an unreadable exclusion set does:
+    the escape it could no longer see disappears, and a 'cannot verify' takes its place."""
+    return set(l.strip() for l in out.split(chr(10))
+               if l.startswith("    ") and l.strip() and not l.strip().startswith("Commandment"))
+
 CASES = [
     ("I-syscalls", "a 50th syscall",
      lambda: edit("kernel/src/syscall/dispatch.rs",
@@ -117,6 +125,7 @@ CASES = [
 base = run()
 n_base = base.count('  Commandment')
 base_lines = set(l.strip() for l in base.split(chr(10)))
+base_v = violations(base)
 print("BASELINE (before any injection): %d violations reported\n" % base.count("  Commandment"))
 
 rows = []
@@ -131,7 +140,7 @@ for name, what, inject, paths, created in CASES:
     # Detect by COUNT, not message text: the enforce output prints the commandment TITLE and never the
     # check id, so matching on the id could never have fired. (Fourth time this session a test agreed
     # with me instead of failing.) A count is text-independent and cannot flatter itself.
-    caught = out.count("  Commandment") > n_base
+    caught = violations(out) - base_v != set()
     new = [l.strip() for l in out.split(chr(10)) if l.strip() and l.strip() not in base_lines]
     msg = new[0] if new else ""
     rows.append((name, what, "CAUGHT" if caught else "MISSED", msg))
@@ -147,3 +156,57 @@ print("\nRESTORED: %d violations reported (must equal the baseline above)\n"
 for name, what, verdict, msg in rows:
     if verdict != "CAUGHT":
         print("!!! %s -> %s\n%s\n" % (name, verdict, msg))
+
+# ---------------------------------------------------------------------------------------------------
+# Commandment II. One check, DERIVED rather than configured - so the test has to cover both directions:
+# that it catches a service escaping, AND that it stays silent for the apparatus it must permit. A check
+# that flags everything is as useless as one that flags nothing, and only the negative cases show which.
+CH = "services/chaos/src/main.rs"
+
+CASES_II = [
+    ("II escape", "a real service quietly added to is_transient()",
+     lambda: edit(CH, 'name == "chaos" || name == "mem-pressure"',
+                      'name == "chaos" || name == "shell" || name == "mem-pressure"'),
+     [CH], [], True),
+
+    ("II permission lapses", "chaos stops spawning mem-pressure but still excludes it",
+     lambda: edit(CH, 'ctx.spawn("mem-pressure")', 'ctx.spawn("something-else")'),
+     [CH], [], True),
+
+    ("II unfindable", "is_transient renamed - the exclusion set cannot be read",
+     lambda: edit(CH, "fn is_transient(", "fn is_transient_renamed("),
+     [CH], [], True),
+
+    ("II NEGATIVE apparatus", "chaos + mem-pressure alone must NOT be flagged",
+     lambda: edit(CH, 'name == "chaos" || name == "mem-pressure" || name.starts_with("observe")',
+                      'name == "chaos" || name == "mem-pressure"'),
+     [CH], [], False),
+
+    ("II NEGATIVE extra spawn", "chaos spawning MORE must not create a violation",
+     lambda: edit(CH, 'ctx.spawn("mem-pressure")',
+                      'ctx.spawn("mem-pressure"); let _ = ctx.spawn("probe-recv")'),
+     [CH], [], False),
+]
+
+print()
+print("=" * 100)
+print("COMMANDMENT II - the derived check, both directions")
+print("=" * 100)
+for name, what, inject, paths, created, should_catch in CASES_II:
+    try:
+        inject()
+    except AssertionError as e:
+        print("%-24s %-52s ANCHOR? %s" % (name, what, e)); restore(paths, created); continue
+    out = run()
+    n = out.count("  Commandment")
+    changed = violations(out) - base_v
+    # baseline already carries ONE Commandment II violation (observe* escaping), so a catch shows as an
+    # increase, and a correct NEGATIVE case shows as a DECREASE (the escape removed) or no change.
+    caught = changed != set()
+    ok = caught if should_catch else not caught
+    print("%-24s %-52s %-6s %s" % (name, what, "CAUGHT" if caught else "silent",
+                                   "OK" if ok else "*** WRONG ***"))
+    restore(paths, created)
+
+print()
+print("RESTORED: %d violations (baseline %d)" % (run().count("  Commandment"), n_base))
