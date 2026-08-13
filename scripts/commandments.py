@@ -415,9 +415,10 @@ def check_kernel_service_table(check, pins):
     found = set(re.findall(r'"([a-z0-9-]+)" => Some\(\(', src))
     pinned = set(pins.get("service_configs", []))
     out = [Violation("kernel/src/task/mod.rs", 0,
-                     f"the kernel holds a service config for '{f}' that is not pinned. The kernel now "
-                     f"knows one more thing about userspace: ask whether that policy belongs to the "
-                     f"supervisor instead, then add it to [kernel] service_configs deliberately.")
+                     f"the kernel holds a service config for '{f}'. This list is DEBT, not an allowance: "
+                     f"kernel responsibility does not expand, so it may only ever shrink. A service's "
+                     f"memory limit, placement, capabilities and peers are the SUPERVISOR's policy. "
+                     f"Do not add a line here.")
            for f in sorted(found - pinned)]
     out += [Violation("kernel/src/task/mod.rs", 0,
                       f"pinned service config '{f}' is gone - update the pin.")
@@ -556,10 +557,11 @@ CHECKS = [
          title="the kernel's per-service policy table is pinned",
          kind="custom", fn=check_kernel_service_table,
          scope="kernel/src/task/mod.rs, service_config entries",
-         proves="the kernel knows about no service that was not deliberately admitted",
-         does_not_prove="that the kernel SHOULD hold this policy at all. It holds memory limits, "
-                        "placement and grants for every service, which is policy in the kernel "
-                        "(26.10). The pin freezes the set; it does not justify it",
+         proves="the kernel's catalogue of userspace policy has not grown",
+         does_not_prove="that ANY of it belongs there. This is recorded debt, not an allowance: the "
+                        "target is one entry - the supervisor, which the kernel must bootstrap - with "
+                        "every other service's policy owned by the supervisor and its image handed to "
+                        "the Spawn syscall. 218 is the distance from that",
          probes=[
              dict(why="a new kernel service config must be caught",
                   pins={"service_configs": []}, expect=True),

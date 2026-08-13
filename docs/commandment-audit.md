@@ -133,7 +133,7 @@ and a proxy that fires on sanctioned work only trains people to raise it.
 | C1-2 | `arch/` is 65% of the kernel | Observation | no action expected |
 | C1-3 | Font crate linked for a framebuffer console, unjustified in writing | Low | amendment or make it a service |
 | C1-4 | `InspectKernel` carries 23 unpinned sub-queries | Medium | CLOSED by the I-introspect pin |
-| C1-5 | The kernel holds per-service policy for 218 services, ~190 of them test probes | Medium | open |
+| C1-5 | The kernel holds a catalogue of userspace policy for 218 services | **High** | open |
 
 **C1-1.** `arm_spawn_logger_neutral()` and `arm_spawn_shell_neutral()` in `task/mod.rs` are ARM/AArch64
 bring-up scaffolding from before the supervisor path worked, called from `sched_spawn.rs` and
@@ -151,11 +151,19 @@ pinned. Kept in the table rather than deleted because it is the finding that pro
 above, and the rule is worth more than the fix.
 
 **C1-5.** The kernel's `service_config` table holds memory limit, placement core, capabilities, send
-peers and the embedded ELF for **218** services - and roughly 190 are test probes (`prop-*`, `fuzz-*`,
-`stress-*`, `perf-*`, `adv-*`, `chaos-*`, `brutal-*`). Two questions fall out, and they are different.
-First, this is policy in the kernel (§26.10) rather than in the supervisor, whatever its convenience.
-Second, §4.4 forbids "developer tooling" in the kernel, and ~190 test-harness configurations plus their
-embedded ELFs are hard to call anything else. The pin freezes the set; it does not justify it.
+peers and the embedded ELF for **218** services, roughly 190 of them test probes.
+
+Raised to High after a correction that sharpened it: the finding is not "too many probes", it is that
+**the catalogue should not be in the kernel at all**. Loading a task is mechanism and belongs to the
+kernel. A catalogue of what every service is allowed is policy, and policy belongs to the supervisor
+(§26.10). The probes are the most visible symptom, and §4.4's ban on "developer tooling" in the kernel
+covers them, but removing only the probes would leave the architecture unchanged.
+
+The target follows from the rule already established for spawning: the kernel knows about **one**
+service, `supervisor`, because nothing is beneath it to bootstrap it. Every other service's policy
+belongs to the supervisor, with its image handed to the `Spawn` syscall rather than compiled into ring
+0. The pin is therefore recorded as DEBT that may only shrink - there is no "add it deliberately" path -
+and 218 is the distance from where this should be.
 
 **C1-2.** `arch/` is 28,755 of ~44,000 kernel lines. Legitimate (hardware support is welcome), noted
 because the majority of the kernel lives in the layer these checks scrutinise least - the role pin says

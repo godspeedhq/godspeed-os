@@ -81,13 +81,20 @@ features = [
     "test-bad-supervisor"
 ]
 
-# The kernel holds a `service_config` for each of these: memory limit, placement core, capabilities,
-# send peers, embedded ELF. That is POLICY, and policy belongs in services (§26.10) - the kernel keeps
-# it because it is also the loader. Pinning does not justify that; it only stops the set growing
-# unnoticed. Note how many are test probes: §4.4 forbids "developer tooling" in the kernel.
+# DEBT, NOT AN ALLOWANCE. This list may only ever SHRINK. Kernel responsibility does not expand, so
+# there is no "add it deliberately" path here: do not add a line.
 #
-# All of them, without splitting "real" services from test ones. Any rule for that split would be a
-# judgment encoded as a pattern, and the next service named outside the pattern would slip through.
+# The kernel holds a `service_config` for each of these - memory limit, placement core, capabilities,
+# send peers, embedded ELF. Loading a task is mechanism and belongs to the kernel; a CATALOGUE of what
+# every service is allowed is policy, and policy belongs to the supervisor (§26.10). §4.4 also forbids
+# "developer tooling" in the kernel, and roughly 190 of these are test probes.
+#
+# The target is ONE entry - `supervisor`, which the kernel must bootstrap because nothing is beneath it,
+# exactly as with `kernel_spawned_service`. Every other service's policy belongs to the supervisor, with
+# its image handed to the Spawn syscall rather than compiled into ring 0. 218 is the distance from that.
+#
+# Listed in full, without splitting "real" services from test ones: any rule for that split is a
+# judgment encoded as a pattern, and the next service named outside the pattern slips through.
 service_configs = [
     "adv-a1",
     "adv-a10",
