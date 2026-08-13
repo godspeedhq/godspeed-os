@@ -38,6 +38,21 @@ modules = [
 # service?" first. The numbers are the ABI every built service binary depends on, so they are pinned by
 # VALUE, not merely by name. (9 is absent by history, not by accident.)
 
+# A crate the kernel links is code running in ring 0 with the kernel's full authority, having passed
+# none of these checks. "Why isn't this a service?" applies to a dependency more sharply than to a
+# subsystem, because a service could link it under isolation instead.
+dependencies = [
+    "bitflags",
+    "limine",
+    "noto-sans-mono-bitmap",
+    "portable-atomic"
+]
+
+# The syscall pin catches new kernel VERBS; this catches new kernel NOUNS - the well-known resources the
+# kernel itself mints authority over. Several exist because a syscall alone could not express the
+# authority, so pinning syscalls without pinning these would leave half the surface unwatched. Pinned by
+# value: these ids are baked into every service's capability table.
+
 # Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
 # legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
 # before it builds, and classifying one honestly as a device driver fails the build - which is the
@@ -51,6 +66,22 @@ arch_permitted_roles = [
     "arch-entry", "boot", "mmu", "interrupts", "timer", "context-switch", "scheduler-entry",
     "syscall-entry", "usermode", "uaccess", "console", "discovery", "iommu", "clock", "test-scaffold",
 ]
+
+[kernel.authorities]
+LOG_WRITE          = 1
+SPAWN              = 2
+CONSOLE_READ       = 3
+CONSOLE_PUSH       = 4
+INTROSPECT         = 5
+SERVICE_CONTROL    = 6
+RESOURCE_MINT      = 7
+REBOOT             = 8
+ACQUIRE_ANY        = 9
+NET_DEVICE         = 10
+GPIO_DEVICE        = 11
+USB_DISK           = 12
+SET_CLOCK          = 13
+
 
 [kernel.arch_roles]
 "hid.rs"                      = "usb-hid-decode"

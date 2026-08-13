@@ -224,6 +224,73 @@ def check_arch_device_drivers(check, pins):
     return out
 
 
+
+def check_kernel_authorities(check, pins):
+    """Commandment I: a new KERNEL AUTHORITY is a new kernel responsibility.
+
+    The syscall pin catches new kernel VERBS. This catches new kernel NOUNS: the well-known resources
+    the kernel itself mints authority over (LOG_WRITE, SPAWN, REBOOT, NET_DEVICE ...). Adding one means
+    the kernel has taken responsibility for something new, whether or not a syscall was added with it -
+    and several of these exist precisely because a syscall alone could not express the authority.
+
+    Same instrument as the syscall pin, and pinned by VALUE for the same reason: the numbers are
+    baked into every service's capability table.
+    """
+    src = read(os.path.join(ROOT, "kernel/src/capability/mod.rs"))
+    found = dict((m[0], m[1]) for m in re.findall(
+        r"pub const ([A-Z_]+)_RESOURCE: ResourceId = ResourceId\((\d+)\)", src))
+    if not found:
+        return [Violation("kernel/src/capability/mod.rs", 0,
+                          "cannot find any well-known ResourceId: the pin cannot be verified, and an "
+                          "unverifiable pin is a failure, never a pass")]
+    pinned = {k: str(v) for k, v in pins.get("authorities", {}).items()}
+    out = []
+    for name, num in sorted(found.items(), key=lambda kv: int(kv[1])):
+        if name not in pinned:
+            out.append(Violation("kernel/src/capability/mod.rs", 0,
+                                 f"kernel authority {name} = {num} is NOT pinned. The kernel has taken "
+                                 f"responsibility for something new: ask 'why isn't this a service?'. "
+                                 f"If it must exist, add it to [kernel.authorities] deliberately."))
+        elif pinned[name] != num:
+            out.append(Violation("kernel/src/capability/mod.rs", 0,
+                                 f"authority {name} moved {pinned[name]} -> {num}. These ids are baked "
+                                 f"into every service's capability table."))
+    for name in sorted(set(pinned) - set(found)):
+        out.append(Violation("kernel/src/capability/mod.rs", 0,
+                             f"pinned authority {name} is gone. Removing one is welcome - update the "
+                             f"pin so the recorded surface stays true."))
+    return out
+
+
+def check_kernel_dependencies(check, pins):
+    """Commandment I: a crate the kernel links is a responsibility it did not write and must trust.
+
+    Every dependency is code running in ring 0 with the kernel's full authority, and it arrives without
+    passing any of these checks. "Why isn't this a service?" applies to a crate exactly as it applies to
+    a subsystem - more sharply, because a service could link it under isolation instead.
+    """
+    src = read(os.path.join(ROOT, "kernel/Cargo.toml"))
+    found = set()
+    for block in re.findall(r"^\[(?:target\.[^\]]*\.)?dependencies\](.*?)(?=^\[|\Z)", src, re.S | re.M):
+        for ln in block.split(chr(10)):
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            m = re.match(r"([A-Za-z0-9_-]+)\s*=", ln)
+            if m:
+                found.add(m.group(1))
+    pinned = set(pins.get("dependencies", []))
+    out = [Violation("kernel/Cargo.toml", 0,
+                     f"new kernel dependency '{d}': code that will run in ring 0 with the kernel's full "
+                     f"authority, having passed none of these checks. Could a SERVICE link it instead? "
+                     f"If the kernel genuinely needs it, add it to [kernel] dependencies deliberately.")
+           for d in sorted(found - pinned)]
+    out += [Violation("kernel/Cargo.toml", 0,
+                      f"pinned dependency '{d}' is gone - update the pin so the record stays true.")
+            for d in sorted(pinned - found)]
+    return out
+
+
 CHECKS = [
     dict(id="I-syscalls", commandment="I", title="the syscall surface is pinned",
          kind="custom", fn=check_syscall_surface,
@@ -245,6 +312,26 @@ CHECKS = [
          probes=[
              dict(why="a new kernel module must be caught", pins={"modules": []}, expect=True),
              dict(why="the real module set, fully pinned, must pass", pins=None, expect=False),
+         ]),
+    dict(id="I-authorities", commandment="I", title="the kernel's own authorities are pinned",
+         kind="custom", fn=check_kernel_authorities,
+         scope="kernel/src/capability/mod.rs, well-known ResourceIds",
+         proves="the kernel mints authority over nothing that was not deliberately admitted",
+         does_not_prove="that an admitted authority is granted to the right services - that is "
+                        "Commandment VII, and it is not built yet",
+         probes=[
+             dict(why="a new kernel authority must be caught", pins={"authorities": {}}, expect=True),
+             dict(why="the real, fully pinned authority set must pass", pins=None, expect=False),
+         ]),
+    dict(id="I-kernel-deps", commandment="I", title="what the kernel links is pinned",
+         kind="custom", fn=check_kernel_dependencies,
+         scope="kernel/Cargo.toml, all [dependencies] blocks including target-gated ones",
+         proves="no crate runs in ring 0 that was not deliberately admitted",
+         does_not_prove="anything about what those crates DO. A pinned dependency is trusted code "
+                        "inside the TCB that none of these checks read",
+         probes=[
+             dict(why="a new kernel dependency must be caught", pins={"dependencies": []}, expect=True),
+             dict(why="the real, fully pinned dependency set must pass", pins=None, expect=False),
          ]),
     dict(id="I-arch-drivers", commandment="I", title="no peripheral device driver lives in the kernel",
          kind="custom", fn=check_arch_device_drivers,
