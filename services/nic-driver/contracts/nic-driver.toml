@@ -12,6 +12,13 @@ limit   = "16MiB"
 # Reach the BAR via ctx.mmio().
 hw_device = "nic"
 log_write = true
+# ARM32 (Pi 2) ONLY, and declared here because a communication path that exists in the kernel but not
+# in the contract is exactly what Commandment IV forbids. The USB stack moved out of the kernel into the
+# `dwc2` SERVICE, so this driver reaches its ethernet device by IPC (ops 0x10 INFO / 0x11 TX / 0x12 RX)
+# instead of the NET_DEVICE syscalls described below. The kernel grants the send cap only on arm; on x86
+# and aarch64 there is no such service and the grant is absent. That asymmetry is correct rather than
+# sloppy: a contract states what the service NEEDS, and the OS decides whether to grant it (§13.3).
+ipc_send  = ["dwc2"]
 # ARM NOTE (userspace-audit Audit 5, A5-U1) - applies to BOTH ARM ports: on neither is there a PCIe NIC,
 # so `hw_device = "nic"` resolves to nothing; instead the kernel grants this service the NET_DEVICE
 # capability BY NAME (frame syscalls 42-44 - `service_privileges` in kernel `task/mod.rs`, arch-gated to

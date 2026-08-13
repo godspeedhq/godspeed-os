@@ -227,9 +227,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                             "dwc2-svc: USB DISK - {} sectors of {} B ({} MiB)",
                                                             sectors, block,
                                                             sectors.saturating_mul(block as u64) / (1024 * 1024)));
-                                                        disk = Some((dk, dt, sectors));
-                                                        let dk = &mut disk.as_mut().unwrap().0;
-                                                        if msc::read_block(&ctx, &m, &d, &dt, dk, 0, block) {
+                                                        // Read BEFORE handing `dk` to `disk`. The
+                                                        // previous order moved it in and then borrowed
+                                                        // it straight back out with `unwrap()` - an
+                                                        // unwrap that existed only because of the
+                                                        // ordering, in the one service the Pi 2's
+                                                        // storage, keyboard and network all depend on.
+                                                        // Provably safe today; a machine-halt the first
+                                                        // time someone moves the assignment.
+                                                        if msc::read_block(&ctx, &m, &d, &dt, &mut dk, 0, block) {
                                                             let b0 = d.read8(msc::DATA_OFF);
                                                             let b1 = d.read8(msc::DATA_OFF + 1);
                                                             let b2 = d.read8(msc::DATA_OFF + 2);
@@ -240,6 +246,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                         } else {
                                                             ctx.log("dwc2-svc: sector 0 read FAILED");
                                                         }
+                                                        disk = Some((dk, dt, sectors));
                                                     }
                                                     None => ctx.log("dwc2-svc: READ CAPACITY FAILED"),
                                                 }
