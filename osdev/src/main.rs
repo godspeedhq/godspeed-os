@@ -359,7 +359,35 @@ fn clean_supervisor() {
         .status();
 }
 
+/// Fail the build on any mechanically-checkable Commandment violation, BEFORE compiling anything.
+///
+/// Before, not after: a violation caught at write time costs 227 ms, and the same violation caught at
+/// merge time costs a review cycle and a rebase. Running first also means the loud output is the last
+/// thing on screen when it fails, instead of being buried under cargo.
+///
+/// `--selftest` runs alongside the checks and is not optional. A check can be silently weakened -
+/// narrow a regex, shrink a scan - and the ordinary run will still print PASS over code it stopped
+/// looking at. Only the probe corpus notices, so the corpus runs every time the checks do.
+fn commandment_check() {
+    for args in [["scripts/commandments.py", "--selftest"], ["scripts/commandments.py", ""]] {
+        let mut cmd = std::process::Command::new("python");
+        cmd.arg(args[0]);
+        if !args[1].is_empty() { cmd.arg(args[1]); }
+        match cmd.status() {
+            Ok(st) if st.success() => {}
+            Ok(_) => std::process::exit(1),
+            // A checker that cannot RUN is not a checker that passed. Refusing to build is the only
+            // honest response: the alternative is a green build whose guarantees were never tested.
+            Err(e) => {
+                eprintln!("osdev: cannot run the Commandment checks ({e}). Refusing to build - an                            unverifiable build is not a passing one.");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 pub fn cmd_build() {
+    commandment_check();
     clean_supervisor();
     // Services must be compiled before the kernel - kernel/build.rs embeds
     // the service ELF bytes via include_bytes!(env!("SVC_*_ELF")).
