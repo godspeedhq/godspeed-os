@@ -286,7 +286,11 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
         };
         if matched {
             *got_reply = true;   // a matching DNS reply arrived (whatever it contains)
-            let f = reply.as_ref().unwrap().payload_bytes();
+            // `matched` was computed from this same reply, so it is Some here - but "is" is not
+            // "will remain": one refactor of how `matched` is derived and this unwrap halts the
+            // network stack. Bind what we already know rather than assert it.
+            let Some(r) = reply.as_ref() else { return None };
+            let f = r.payload_bytes();
             let ancount = ((f[D + 6] as usize) << 8) | (f[D + 7] as usize);
             if ancount != 0 {
                 // Skip the echoed question (QNAME + QTYPE + QCLASS), then walk answers for an A record.

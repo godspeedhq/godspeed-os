@@ -1,0 +1,105 @@
+# The pinned kernel surface, and the recorded exemptions to the mechanical Commandment checks.
+#
+# THIS FILE MAY ONLY EVER SHRINK. It is the same instrument as the grandfathered `unsafe` floors of
+# CLAUDE.md §18.5: counts may DECREASE freely, and may increase only by amending the constitution with
+# a written rationale. `scripts/commandments.py` enforces the ratchet in both directions - too many
+# violations fails, and so does an entry that is looser than reality or matches nothing at all.
+#
+# An exemption is legitimate ONLY if it cites a CLAUDE.md amendment that already accepts the violation.
+# If nothing in the constitution accepts it, there is no exemption to write: fix it, or amend the
+# constitution deliberately. That is what stops this file becoming where violations go to be forgotten.
+
+[kernel]
+# Commandment I: one name per kernel responsibility. A new directory here is a new thing the
+# kernel claims to be, and that claim should be impossible to make by accident.
+modules = [
+    "arch",
+    "capability",
+    "clock.rs",
+    "control.rs",
+    "elf_flags.rs",
+    "fbcon",
+    "interrupt",
+    "invariants",
+    "ipc",
+    "lib.rs",
+    "loader.rs",
+    "log.rs",
+    "main.rs",
+    "memory",
+    "smp",
+    "syscall",
+    "task",
+    "wallclock.rs"
+]
+
+# Every expansion of what the kernel does for userspace arrives as a syscall, so this list IS the
+# kernel's authority surface. Adding a line is adding a kernel responsibility: answer "why isn't this a
+# service?" first. The numbers are the ABI every built service binary depends on, so they are pinned by
+# VALUE, not merely by name. (9 is absent by history, not by accident.)
+
+[kernel.syscalls]
+Send                     = 1
+Recv                     = 2
+TrySend                  = 3
+Yield                    = 4
+Log                      = 5
+AllocMem                 = 6
+Spawn                    = 7
+Kill                     = 8
+AcquireSendCap           = 10
+SendWithCap              = 11
+TakePendingCap           = 12
+InspectKernel            = 13
+QueryCapRights           = 14
+RemoveCap                = 15
+TaskStat                 = 16
+ConsoleRead              = 17
+Reboot                   = 18
+SpawnPipe                = 19
+ConsolePush              = 20
+Park                     = 21
+Print                    = 22
+ConsoleWrite             = 23
+TryConsoleRead           = 24
+ConsoleEcho              = 25
+ConsoleBootComplete      = 26
+SignalInputReady         = 27
+TaskCaps                 = 28
+DeriveCap                = 29
+ResourceMint             = 30
+ResourceInvoke           = 31
+ResourceRevoke           = 32
+LastRecvBadge            = 33
+TryRecv                  = 34
+RecvTimeout              = 35
+IrqUnmask                = 36
+Sleep                    = 37
+SpawnReturningEndpoint   = 38
+SpawnWithCaps            = 39
+ConsoleForeground        = 40
+Call                     = 41
+NetFrameTx               = 42
+NetFrameRx               = 43
+NetInfo                  = 44
+Gpio                     = 45
+UsbDiskInfo              = 46
+UsbDiskRead              = 47
+UsbDiskWrite             = 48
+UsbDiskFlush             = 49
+SetClock                 = 50
+
+# ------------------------------------------------------------------------------------------------
+# Recorded exemptions.
+#
+# There are NONE. That is deliberate and worth stating: the tree carries 12 panicking sites in
+# services, and not one of them can be written down here, because no CLAUDE.md amendment permits a
+# service to halt the machine. The rule that an exemption must cite an amendment is what forces them
+# to be FIXED rather than recorded - which is the entire point of the instrument.
+#
+# [[exemption]]
+# check     = "V-no-panic"
+# path      = "services/example/src/main.rs"
+# count     = 3
+# amendment = "CLAUDE.md §6.4 amendment 2026-07-23 (SEC-29/30)"
+# reason    = "why the constitution already accepts this, and what closes it"

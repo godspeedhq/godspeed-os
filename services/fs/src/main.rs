@@ -2040,7 +2040,7 @@ impl Fs {
                     if run_start.is_none() { run_start = Some(idx); run_len = 0; }
                     run_len += 1;
                     if run_len == n {
-                        let start = run_start.unwrap();
+                        let Some(start) = run_start else { continue };
                         self.bm_set_range(ctx, start, n, true)?;
                         self.free_blocks = self.free_blocks.saturating_sub(n);
                         self.persist_super(ctx)?;
@@ -2144,7 +2144,7 @@ impl Fs {
                     && idx < self.root_first_block.saturating_add(self.root_block_count);
                 let used = is_root || (blk[(within / 8) as usize] >> (within % 8)) & 1 != 0;
                 if used {
-                    if start.is_some() { return Some((start.unwrap(), len)); }
+                    if let Some(s) = start { return Some((s, len)); }
                 } else {
                     if start.is_none() { start = Some(idx); len = 0; }
                     len += 1;
