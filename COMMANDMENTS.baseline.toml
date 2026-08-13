@@ -10,28 +10,22 @@
 # constitution deliberately. That is what stops this file becoming where violations go to be forgotten.
 
 [kernel]
-# Commandment I: one name per kernel responsibility. A new directory here is a new thing the
-# kernel claims to be, and that claim should be impossible to make by accident.
-modules = [
-    "arch",
-    "capability",
-    "clock.rs",
-    "control.rs",
-    "elf_flags.rs",
-    "fbcon",
-    "interrupt",
-    "invariants",
-    "ipc",
-    "lib.rs",
-    "loader.rs",
-    "log.rs",
-    "main.rs",
-    "memory",
-    "smp",
-    "syscall",
-    "task",
-    "wallclock.rs"
-]
+#
+# TWO KINDS OF ENTRY LIVE HERE, and they are not the same claim. `--report` labels every check with
+# which it is, because a green build means something different for each.
+#
+#   RULE    a fixed truth; any deviation is a FAILURE. The value IS the law. There are few of these,
+#           and where the law is written down elsewhere they are DERIVED rather than copied - the six
+#           responsibilities come from CLAUDE.md §4.3, chaos's apparatus from chaos's own spawn calls,
+#           so neither appears below at all.
+#
+#   RECORD  a snapshot, NOT an endorsement. 49 syscalls is not a claim that 49 is right - only that a
+#           fiftieth must be deliberate, because Commandment I says to ask "why isn't this a service?"
+#           BEFORE proposing a kernel change, and this is what forces the question to be asked. These
+#           legitimately change: supporting a new CPU adds arch files, and that is welcome.
+#
+#   DEBT    a distance from where it should be, which may only shrink.
+#
 
 # A crate the kernel links is code running in ring 0 with the kernel's full authority, having passed
 # none of these checks. "Why isn't this a service?" applies to a dependency more sharply than to a

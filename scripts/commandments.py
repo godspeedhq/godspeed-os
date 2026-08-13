@@ -155,25 +155,6 @@ def check_syscall_surface(check, pins):
     return out
 
 
-def check_kernel_modules(check, pins):
-    """One name per kernel responsibility. A new directory under `kernel/src` is a new thing the
-    kernel claims to be, and that claim should be impossible to make by accident."""
-    pinned = set(pins.get("modules", []))
-    found = {n for n in os.listdir(os.path.join(ROOT, "kernel/src")) if not n.startswith(".")}
-    out = [Violation("kernel/src/" + n, 0,
-                     "new top-level kernel module, which is a new kernel responsibility. If it is "
-                     "genuinely mechanism and not policy, add it to [kernel.modules].")
-           for n in sorted(found - pinned)]
-    out += [Violation("kernel/src/" + n, 0, "pinned kernel module is gone - update [kernel.modules].")
-            for n in sorted(pinned - found)]
-    return out
-
-
-# --------------------------------------------------------------------------------------------------
-# The checks. `scope`, `exclude`, `proves` and `does_not_prove` are all printed with the result.
-# `probes` is the self-test corpus: what this check MUST catch, and what it must NOT.
-# --------------------------------------------------------------------------------------------------
-
 def check_arch_device_drivers(check, pins):
     """Commandment I, where it actually bites: a DEVICE driver in the kernel.
 
@@ -550,7 +531,7 @@ def check_kernel_responsibilities(check, pins):
 
 
 REQUIRED_PLAIN_KEYS = [
-    "modules", "dependencies", "features", "service_configs", "arch_permitted_roles",
+    "dependencies", "features", "service_configs", "arch_permitted_roles",
     "introspect_queries", "kernel_spawned_service",
 ]
 
@@ -600,16 +581,6 @@ CHECKS = [
                   pins={"syscalls": {}}, expect=True),
              dict(why="the real surface, fully pinned, must pass",
                   pins=None, expect=False),
-         ]),
-    dict(nature="record", id="I-modules", commandment="I", title="kernel top-level modules are pinned",
-         kind="custom", fn=check_kernel_modules,
-         scope="kernel/src/* (top level only)",
-         proves="no new top-level kernel responsibility appeared without being named",
-         does_not_prove="that an EXISTING module has not grown new responsibilities inside itself. "
-                        "A device driver added under arch/ is invisible to this check",
-         probes=[
-             dict(why="a new kernel module must be caught", pins={"modules": []}, expect=True),
-             dict(why="the real module set, fully pinned, must pass", pins=None, expect=False),
          ]),
     dict(nature="record", id="I-authorities", commandment="I", title="the kernel's own authorities are pinned",
          kind="custom", fn=check_kernel_authorities,
