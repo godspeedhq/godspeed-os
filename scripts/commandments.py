@@ -755,14 +755,28 @@ CHECKS = [
     dict(nature="rule", id="VI-static-mut", commandment="VI", title="no unowned global mutable state in services",
          kind="source", dirs=["services"],
          exclude=[dict(glob="build.rs", reason="host build scripts, as above")],
-         pattern=r"\bstatic\s+mut\b",
+         # `static mut` is the OBSOLETE spelling. The modern idiom for global mutable state carries no
+         # `mut` keyword at all - `static X: AtomicU8`, a static lock, a static UnsafeCell - and
+         # Invariant 9 forbids UNOWNED GLOBAL MUTABLE STATE, not a keyword. Matching only `static mut`
+         # caught the form nobody writes any more and missed the one everybody does: a check
+         # satisfiable without the property being true, which is the failure the honesty rule names.
+         pattern=r"\bstatic\s+mut\b|^\s*(?:pub\s+)?static\s+[A-Z_][A-Z0-9_]*\s*:\s*"
+                 r"(?:Atomic|SpinLock|Mutex|RwLock|UnsafeCell|Cell|RefCell|OnceCell)",
          fix="unowned global mutable state: give it an owner, or pass it explicitly",
-         proves="no service holds `static mut`",
+         proves="no service holds unowned global mutable state in any of its spellings - "
+                "`static mut`, an atomic static, a static lock, a static cell",
          does_not_prove="that state is owned by the RIGHT service, or that two services hold two "
                         "irreducible copies of one truth (Commandment III)",
          probes=[
              dict(why="static mut must be caught", code="static mut COUNT: u32 = 0;", expect=True),
+             dict(why="an ATOMIC static is global mutable state too - no `mut` keyword in sight",
+                  code="static FS_TAG: AtomicU8 = AtomicU8::new(0);", expect=True),
+             dict(why="a static lock is the same thing wearing a different type",
+                  code="static T: SpinLock<u32> = SpinLock::new(0);", expect=True),
+             dict(why="a static UnsafeCell likewise",
+                  code="static C: UnsafeCell<u32> = UnsafeCell::new(0);", expect=True),
              dict(why="an immutable static is fine", code="static COUNT: u32 = 0;", expect=False),
+             dict(why="a const is fine", code="const COUNT: u32 = 0;", expect=False),
          ]),
 ]
 

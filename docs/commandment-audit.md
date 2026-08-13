@@ -443,9 +443,35 @@ matrix - kill each dependency, assert every caller still answers - is shared mac
 
 ---
 
-## Commandments VI - X
+## Commandment VI - thou shalt not introduce shared mutable state
 
-Not yet walked. VI is partly encoded (`VI-static-mut`, red-teamed). `--report` lists each and why it is not mechanised, so the gap shows on every build
+**Encoded and red-teamed. The check was found WEAKER than it looked, and widened. 2 findings.**
+
+`VI-static-mut` matched `static mut` - which is the OBSOLETE spelling. The modern idiom for global
+mutable state carries no `mut` keyword anywhere: `static X: AtomicU8`, a static lock, a static
+`UnsafeCell`. Invariant 9 forbids *unowned global mutable state*, not a keyword, so the check caught the
+form nobody writes any more and missed the one everybody does.
+
+That is precisely the failure the honesty rule names - a check satisfiable without the property being
+true - and it had been passing, and had been red-teamed, in that state. The red team missed it because
+the injection used `static mut`: **a red team only tests the shapes you think of.** Widened to atomics,
+locks and cells, with probes for each.
+
+**C6-1 (Medium). Two services hold unowned global mutable state.**
+
+| Where | What |
+|-------|------|
+| `services/shell/src/main.rs` | `static FS_TAG: AtomicU8` - the fs request correlation tag |
+| `services/dwc2/src/hub.rs` | `static NEXT_ADDR: AtomicU8` - the USB address allocator |
+
+Both are single-threaded and thread-safety is not the issue; ownership is. Each belongs in the state
+its service already threads through its own loop. The `dwc2` one is from this session.
+
+---
+
+## Commandments VII - X
+
+Not yet walked. `--report` lists each and why it is not mechanised, so the gap shows on every build
 rather than only here.
 
 Order and reasoning: **IV** next (fold in the existing `contract_check.py` - nearly free, and it has
