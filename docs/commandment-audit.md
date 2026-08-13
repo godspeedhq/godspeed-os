@@ -600,8 +600,12 @@ death is a runtime property - the same dependency matrix that V and IX need.
 | IX | static half measured clean, runtime half not built | 0 today, 1 this morning |
 | X | judgment confirmed; one proxy measured | 1 |
 
-**15 findings, 4 High, none fixed** - which was the instruction, and is also the point: an audit that
+**14 findings recorded, 1 closed (C1-4), 13 open, 4 of them High - none fixed** - which was the instruction, and is also the point: an audit that
 fixes as it goes cannot tell you how bad things were.
+
+Nine of the open findings are enforced by a check and appear on every build; the rest were measured but
+have no check yet, and exist only here. Every violation the checker reports maps to a recorded ID -
+verified by cross-check, not assumed.
 
 Three of those findings are violations introduced during THIS session, by someone who had read the
 commandment that morning: `FRAME_MAX` duplicated with a real truncation window (III), `dwc2` spawned but
