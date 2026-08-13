@@ -309,6 +309,17 @@ service_configs = [
     "xsend-recv"
 ]
 
+# Commandment II. Chaos has no target list - it scans the live task table, so a new service is a
+# candidate automatically. All the risk is therefore in the EXCLUSIONS, and these are they. Each name
+# is a service that never faces Maximum Carnage; adding a fourth is how a service becomes special
+# while every suite still reports green.
+#
+#   chaos         killing itself ends the storm mid-run, so the storm would stop measuring anything
+#   mem-pressure  chaos spawns these itself as ammunition; they are its instrument, not a service
+#   observe*      transient viewer tasks - BUT `observe` is also a REAL service, and the prefix rule
+#                 means it never faces the storm. Recorded here precisely so that is visible.
+chaos_exclusions = ["chaos", "mem-pressure", "observe*"]
+
 # A syscall that dispatches on an id carries a SECOND surface inside it. InspectKernel is one
 # pinned syscall with these queries behind it - allocator counts, scheduler ticks, RTC time,
 # framebuffer dimensions, PCI ids, a hardware random number - and adding one is a new kernel

@@ -425,6 +425,49 @@ def check_kernel_service_table(check, pins):
     return out
 
 
+
+# --------------------------------------------------------------------------------------------------
+# Commandment II - thou shalt love Chaos and trust in it
+# --------------------------------------------------------------------------------------------------
+
+def check_chaos_exclusions(check, pins):
+    """Commandment II: pin who does NOT face Maximum Carnage.
+
+    Chaos has no hardcoded target list - it scans the live task table, so a new service is a candidate
+    automatically and there is no list to drift. Good design, and it moves the whole risk to the other
+    end: the EXCLUSIONS.
+
+    `is_transient()` is three lines inside the chaos service, and every name in it is a service that
+    never faces Maximum Carnage. Adding a fourth is how a service becomes special (Commandment V) while
+    every suite still reports green - the storm simply never reaches it, and nothing says so.
+
+    This is the same shape as a check narrowing its own scan: exclusions belong in DATA, with a reason
+    each, printed and reviewed. It is pinned here rather than in the chaos service so that widening it
+    is a baseline diff, not a one-word edit to a predicate nobody re-reads.
+    """
+    src = read(os.path.join(ROOT, "services/chaos/src/main.rs"))
+    body = re.search(r"fn is_transient\(.*?^\}", src, re.S | re.M)
+    if not body:
+        return [Violation("services/chaos/src/main.rs", 0,
+                          "cannot find `is_transient`: who is excluded from Maximum Carnage cannot be "
+                          "verified, and an unverifiable exclusion set is a failure, never a pass")]
+    found = set(re.findall(r'name == "([a-z0-9-]+)"', body.group(0)))
+    found |= {m + "*" for m in re.findall(r'starts_with\("([a-z0-9-]+)"\)', body.group(0))}
+    pinned = set(pins.get("chaos_exclusions", []))
+    out = [Violation("services/chaos/src/main.rs", 0,
+                     f"'{f}' is excluded from Maximum Carnage and is NOT pinned. A service that chaos "
+                     f"never reaches is a service that is special (Commandment V), while every suite "
+                     f"still reports green. If it must be excluded, add it to [kernel] "
+                     f"chaos_exclusions with the reason.")
+           for f in sorted(found - pinned)]
+    out += [Violation("services/chaos/src/main.rs", 0,
+                      f"'{f}' is pinned as chaos-excluded but no longer is - delete the pin. Every "
+                      f"service it stops excluding is one more that now faces the storm, which is the "
+                      f"direction this should always move.")
+            for f in sorted(pinned - found)]
+    return out
+
+
 CHECKS = [
     dict(id="I-syscalls", commandment="I", title="the syscall surface is pinned",
          kind="custom", fn=check_syscall_surface,
@@ -540,6 +583,22 @@ CHECKS = [
              dict(why="the real, fully classified arch layer must reach only its known drivers",
                   pins=None, expect=True),
          ]),
+    dict(id="II-chaos-exclusions", commandment="II",
+         title="who is excluded from Maximum Carnage is pinned",
+         kind="custom", fn=check_chaos_exclusions,
+         scope="services/chaos/src/main.rs, is_transient()",
+         proves="no service was quietly removed from the storm's reach",
+         does_not_prove="that chaos was ever RUN, or passed. That is the runtime half of this "
+                        "Commandment and it is not built: `chaos max-carnage` is still an operator's "
+                        "good intentions rather than a gate with a threshold",
+         probes=[
+             dict(why="a newly excluded service must be caught",
+                  pins={"chaos_exclusions": []}, expect=True),
+             dict(why="a pin for a service no longer excluded must be caught",
+                  pins={"chaos_exclusions": ["chaos", "mem-pressure", "observe*", "ghost"]},
+                  expect=True),
+             dict(why="the real, fully pinned exclusion set must pass", pins=None, expect=False),
+         ]),
     dict(id="V-no-panic", commandment="V", title="no service may halt the machine",
          kind="source", dirs=["services"],
          exclude=[dict(glob="build.rs",
@@ -583,8 +642,10 @@ CHECKS = [
 
 # Commandments with no mechanical check yet. Printed on EVERY report so the gap cannot be forgotten.
 UNMECHANISED = [
-    ("II", "runtime", "Chaos. `chaos max-carnage` IS the check; encoding it means making it a merge "
-                      "gate with a pass threshold, not an operator's good intentions."),
+    ("II", "runtime - HALF built", "Chaos. Who is EXCLUDED from the storm is pinned; whether the "
+                                   "storm was ever run and passed is not. `chaos max-carnage` needs "
+                                   "to become a gate with a threshold, not an operator's good "
+                                   "intentions."),
     ("III", "judgment", "One irreducible truth. Whether a stored value is a derived view or a second "
                         "truth is a design question: does it reduce to one source, and does that "
                         "source win?"),
