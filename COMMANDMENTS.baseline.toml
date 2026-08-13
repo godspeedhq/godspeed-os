@@ -33,11 +33,6 @@ modules = [
     "wallclock.rs"
 ]
 
-# Every expansion of what the kernel does for userspace arrives as a syscall, so this list IS the
-# kernel's authority surface. Adding a line is adding a kernel responsibility: answer "why isn't this a
-# service?" first. The numbers are the ABI every built service binary depends on, so they are pinned by
-# VALUE, not merely by name. (9 is absent by history, not by accident.)
-
 # A crate the kernel links is code running in ring 0 with the kernel's full authority, having passed
 # none of these checks. "Why isn't this a service?" applies to a dependency more sharply than to a
 # subsystem, because a service could link it under isolation instead.
@@ -47,11 +42,6 @@ dependencies = [
     "noto-sans-mono-bitmap",
     "portable-atomic"
 ]
-
-# The syscall pin catches new kernel VERBS; this catches new kernel NOUNS - the well-known resources the
-# kernel itself mints authority over. Several exist because a syscall alone could not express the
-# authority, so pinning syscalls without pinning these would leave half the surface unwatched. Pinned by
-# value: these ids are baked into every service's capability table.
 
 # A feature flag is a switch on what the kernel IS: a different scheduler entry, a different boot
 # path, a service the kernel spawns itself. Test-only features count - a build the kernel can be put
@@ -316,15 +306,6 @@ service_configs = [
     "xsend-recv"
 ]
 
-# Commandment II. Chaos has no target list - it scans the live task table, so a new service is a
-# candidate automatically. All the risk is therefore in the EXCLUSIONS, and these are they. Each name
-# is a service that never faces Maximum Carnage; adding a fourth is how a service becomes special
-# while every suite still reports green.
-#
-#   chaos         killing itself ends the storm mid-run, so the storm would stop measuring anything
-#   mem-pressure  chaos spawns these itself as ammunition; they are its instrument, not a service
-#   observe*      transient viewer tasks - BUT `observe` is also a REAL service, and the prefix rule
-#                 means it never faces the storm. Recorded here precisely so that is visible.
 # Commandment II - NO SERVICE ESCAPES CHAOS.
 #
 # There is deliberately NOTHING HERE. No list, no target, no boolean.
@@ -412,6 +393,10 @@ invariants       = "§3, §22 - the kernel checking its own invariants"
 
 
 
+# The syscall pin catches new kernel VERBS; this catches new kernel NOUNS - the well-known resources the
+# kernel itself mints authority over. Several exist because a syscall alone could not express the
+# authority, so pinning syscalls without pinning these would leave half the surface unwatched. Pinned by
+# value: these ids are baked into every service's capability table.
 [kernel.authorities]
 LOG_WRITE          = 1
 SPAWN              = 2
@@ -492,6 +477,10 @@ SET_CLOCK          = 13
 "x86_64/rtc.rs"               = "clock"
 "x86_64/syscall_entry.rs"     = "syscall-entry"
 
+# Every expansion of what the kernel does for userspace arrives as a syscall, so this list IS the
+# kernel's authority surface. Adding a line is adding a kernel responsibility: answer "why isn't this a
+# service?" first. The numbers are the ABI every built service binary depends on, so they are pinned by
+# VALUE, not merely by name. (9 is absent by history, not by accident.)
 [kernel.syscalls]
 Send                     = 1
 Recv                     = 2
