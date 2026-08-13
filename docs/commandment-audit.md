@@ -277,7 +277,62 @@ earns a sentence in the constitution or it is a service.
 
 ---
 
-## Commandments II - X
+## Commandment II - thou shalt love Chaos and trust in it
+
+**Encoded: 1 check (the static half). Runtime half deferred, NOT declared impossible.**
+
+Chaos keeps no target list - it scans the live task table, so a new service is a candidate
+automatically and there is nothing to drift. All the risk is at the other end, in `is_transient()`:
+three lines inside the chaos service naming who never faces Maximum Carnage. That is pinned now, so a
+service cannot be quietly removed from the storm's reach while every suite still reports green.
+
+The runtime half - was chaos RUN, did it PASS - cannot be a lint, but it can be a GATE: evidence of a
+passing run, bound to a commit id. Deferred rather than impossible, for two reasons. It only has value
+once findings are being fixed (a gate that always fails is noise), and it needs a stale-evidence guard
+or it rubber-stamps a run from three commits ago. Recorded as **not-yet-built**, which is a different
+category from **un-encodable**; III and X are expected to be the latter.
+
+---
+
+## Commandment III - thou shalt not duplicate truth
+
+**In progress. One finding already, and it is a live bug.**
+
+More encodable than expected. The commandment is careful - derived views are allowed if reconstructible,
+reconciled and subordinate - and judging that is review. But a **second irreducible truth** has a
+mechanical signature when it takes the commonest form: one fact, defined independently in several
+places, under the same name.
+
+**C3-1 (High, live). "The largest ethernet frame" is defined six times and the copies disagree.**
+
+| Location | Value |
+|----------|-------|
+| `kernel/src/arch/arm/dwc2.rs` | 1600 |
+| `kernel/src/syscall/dispatch.rs` | 1600 |
+| `services/nic-driver/src/genet.rs` | 1600 |
+| `services/nic-driver/src/main.rs` (module level) | 1600 |
+| `services/nic-driver/src/main.rs:575` (shadowing local) | 1600 |
+| `services/dwc2/src/net.rs` | **1514** |
+
+Plus a seventh copy as a bare literal in nic-driver's arm backend (`[0u8; 1 + 1514]`).
+
+A frame between 1515 and 1600 bytes is therefore accepted by `nic-driver` and silently TRUNCATED by the
+dwc2 IPC path. Not a style complaint: this is precisely what the commandment predicts, since with no
+single source the copies drift, and the drift stays invisible until a 1520-byte frame arrives. Both the
+1514 and the literal were written during the arm32 USB work in this same session, by someone who had
+just read this commandment.
+
+Two of the copies even carry comments ADMITTING the duplication ("matches nic-driver's FRAME_MAX"),
+which is the tell worth generalising: a comment asserting that two values agree is a second truth with a
+note attached, not a solution.
+
+Candidate check: identically-named constants defined in multiple places with DIFFERENT values. Nearly
+false-positive-free - when two files independently define `FRAME_MAX` and disagree, it is always worth
+looking at.
+
+---
+
+## Commandments IV - X
 
 Not yet walked. `--report` lists each and why it is not mechanised, so the gap shows on every build
 rather than only here.
