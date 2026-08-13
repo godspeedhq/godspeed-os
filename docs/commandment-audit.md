@@ -173,13 +173,31 @@ support role sanctioned elsewhere in the constitution and citing where (`arch-la
 
 | Module | What it is | Why it is not one of the six |
 |--------|-----------|------------------------------|
-| `fbcon/` | framebuffer text console, 1,172 lines | §11.4 sanctions a 16 KiB ring buffer plus a SERIAL console; a rendered text console with a font dependency is more. Same subject as C1-3 |
-| `control.rs` | "receives `osdev restart` commands via COM2" | This is **developer tooling**, which §4.4 forbids in the kernel by name |
+| `control.rs` | COM2 developer command channel **and** the core-0 tick that runs the supervisor respawn | §4.4 forbids "developer tooling" by name |
 | `clock.rs` | clock deglitch logic | Timekeeping is not among the six |
-| `wallclock.rs` | "the wall clock's PROVENANCE and its FLOOR" | Timekeeping, and stateful policy at that |
+| `wallclock.rs` | wall-clock provenance and floor | Timekeeping, and stateful policy at that |
+| `fbcon/` | framebuffer text console, 1,172 lines | §11.4 sanctions a ring buffer plus a SERIAL console |
 
-`control.rs` is the sharpest: §4.4's anti-scope list says "developer tooling" outright, and this is a
-serial channel in ring 0 for accepting developer commands.
+They look alike and their answers are three different things.
+
+**`control.rs` - separate it, then gate it.** It is `mod control;` in `main.rs`, unconditional, in every
+kernel. But it is no longer only a dev channel: `control::process_pending` is where the **supervisor
+respawn** runs (Path C / Phase 6) plus other core-0 periodic work. So it cannot simply be stripped from
+production builds - that would remove the respawn. The respawn tick belongs to `task/` (scheduling, one
+of the six); the COM2 command channel is tooling and should be feature-gated out. Welding them together
+is *why* the tooling has survived in ring 0.
+
+**`clock.rs` + `wallclock.rs` - a time SERVICE, planned.** Not open questions: they close when that
+service exists. `wallclock.rs` is the one that most wants to leave, holding provenance and floor policy.
+
+**`fbcon/` - probably an amendment, not a removal.** It is the kernel's console output path on every
+arch (`put_byte`, `mirror`, `clear_and_home` from each `arch/*/mod.rs`). On a Pi with an HDMI TV and no
+serial cable the framebuffer IS the console; without it the kernel is mute. And a console cannot be a
+service for the same chicken-and-egg reason the ring buffer cannot: it must exist before any service
+does, to report a boot that fails before services exist. §11.4 is simply **x86-shaped** - it says
+"serial console" because on a PC serial is always there. The narrower questionable part is the slice
+serving USERSPACE (console dimensions via `InspectKernel` query 9, and the rendering the shell drives);
+the boot console is not the problem.
 
 This check is also the one that answers "how many responsibilities does the kernel have" mechanically.
 The number is pinned at six, and changing it fails the build - amending the constitution rather than
