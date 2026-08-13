@@ -454,12 +454,20 @@ def check_chaos_exclusions(check, pins):
                           "verified, and an unverifiable exclusion set is a failure, never a pass")]
     found = set(re.findall(r'name == "([a-z0-9-]+)"', body.group(0)))
     found |= {m + "*" for m in re.findall(r'starts_with\("([a-z0-9-]+)"\)', body.group(0))}
+    # The TARGET is a scalar and must read "none": nothing escapes chaos. It is not a list, because a
+    # list of permitted escapees is an invitation to add one. What follows is DEBT against that target.
+    target = pins.get("chaos_exclusions_target")
+    if target != "none":
+        return [Violation("COMMANDMENTS.baseline.toml", 0,
+                          "chaos_exclusions_target must read \"none\" - nothing escapes Chaos. It is a "
+                          "single string on purpose: a list of permitted escapees is an invitation to "
+                          "add one.")]
     pinned = set(pins.get("chaos_exclusions", []))
     out = [Violation("services/chaos/src/main.rs", 0,
-                     f"'{f}' is excluded from Maximum Carnage and is NOT pinned. A service that chaos "
-                     f"never reaches is a service that is special (Commandment V), while every suite "
-                     f"still reports green. If it must be excluded, add it to [kernel] "
-                     f"chaos_exclusions with the reason.")
+                     f"'{f}' is excluded from Maximum Carnage. The target is NONE - nothing escapes "
+                     f"Chaos - and the existing list is debt that may only SHRINK. There is no 'add it "
+                     f"to the pin' path here: a service chaos never reaches is a service that is "
+                     f"special (Commandment V) while every suite still reports green.")
            for f in sorted(found - pinned)]
     out += [Violation("services/chaos/src/main.rs", 0,
                       f"'{f}' is pinned as chaos-excluded but no longer is - delete the pin. Every "
@@ -517,6 +525,7 @@ def check_kernel_responsibilities(check, pins):
 REQUIRED_PLAIN_KEYS = [
     "modules", "dependencies", "features", "service_configs", "arch_permitted_roles",
     "introspect_queries", "kernel_spawned_service", "kernel_responsibilities", "chaos_exclusions",
+    "chaos_exclusions_target",
 ]
 
 
@@ -691,15 +700,19 @@ CHECKS = [
          title="who is excluded from Maximum Carnage is pinned",
          kind="custom", fn=check_chaos_exclusions,
          scope="services/chaos/src/main.rs, is_transient()",
-         proves="no service was quietly removed from the storm's reach",
+         proves="no service was quietly removed from the storm's reach, and the declared target is "
+                "still that NOTHING escapes it",
          does_not_prove="that chaos was ever RUN, or passed. That is the runtime half of this "
                         "Commandment and it is not built: `chaos max-carnage` is still an operator's "
                         "good intentions rather than a gate with a threshold",
          probes=[
              dict(why="a newly excluded service must be caught",
-                  pins={"chaos_exclusions": []}, expect=True),
+                  pins={"chaos_exclusions_target": "none", "chaos_exclusions": []}, expect=True),
+             dict(why="softening the TARGET away from none must be refused",
+                  pins={"chaos_exclusions_target": "some", "chaos_exclusions": []}, expect=True),
              dict(why="a pin for a service no longer excluded must be caught",
-                  pins={"chaos_exclusions": ["chaos", "mem-pressure", "observe*", "ghost"]},
+                  pins={"chaos_exclusions_target": "none",
+                        "chaos_exclusions": ["chaos", "mem-pressure", "observe*", "ghost"]},
                   expect=True),
              dict(why="the real, fully pinned exclusion set must pass", pins=None, expect=False),
          ]),

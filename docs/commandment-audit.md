@@ -279,12 +279,22 @@ earns a sentence in the constitution or it is a service.
 
 ## Commandment II - thou shalt love Chaos and trust in it
 
-**Encoded: 1 check (the static half). Runtime half deferred, NOT declared impossible.**
+**Encoded: 1 check (the static half). Runtime half deferred, NOT declared impossible. 1 finding.**
 
 Chaos keeps no target list - it scans the live task table, so a new service is a candidate
 automatically and there is nothing to drift. All the risk is at the other end, in `is_transient()`:
 three lines inside the chaos service naming who never faces Maximum Carnage. That is pinned now, so a
 service cannot be quietly removed from the storm's reach while every suite still reports green.
+
+The target is declared as a scalar - `chaos_exclusions_target = "none"`, nothing escapes Chaos - and the
+current exclusions are DEBT against it that may only shrink. There is deliberately no "add it to the pin"
+path, unlike the surfaces where admitting something new is a legitimate option.
+
+**C2-1 (Medium). `observe` is a real service and never faces the storm.** Of the three exclusions, two
+are chaos's own apparatus rather than services escaping it: killing `chaos` mid-run stops the storm
+measuring anything, and `mem-pressure` tasks are the ammunition it spawns. `observe*` is different - it
+is a prefix rule, and `observe` is a genuine service. It is the one real distance from the target, and
+the reason the target is written down rather than assumed.
 
 The runtime half - was chaos RUN, did it PASS - cannot be a lint, but it can be a GATE: evidence of a
 passing run, bound to a commit id. Deferred rather than impossible, for two reasons. It only has value

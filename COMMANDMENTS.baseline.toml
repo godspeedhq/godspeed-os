@@ -325,6 +325,12 @@ service_configs = [
 #   mem-pressure  chaos spawns these itself as ammunition; they are its instrument, not a service
 #   observe*      transient viewer tasks - BUT `observe` is also a REAL service, and the prefix rule
 #                 means it never faces the storm. Recorded here precisely so that is visible.
+# NOTHING ESCAPES CHAOS. A single string, not a list, for the same reason as kernel_spawned_service: a
+# list of permitted escapees has room for one more, and appending reads like configuration.
+chaos_exclusions_target = "none"
+
+# DEBT against that target. May only ever SHRINK - there is no "add it deliberately" path here.
+# Two of these are chaos's own apparatus rather than services escaping it; the third is a real service.
 chaos_exclusions = ["chaos", "mem-pressure", "observe*"]
 
 # THE COUNT. §4.3 names exactly six kernel responsibilities and §4.4 says "nothing else". Every other
