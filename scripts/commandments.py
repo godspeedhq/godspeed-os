@@ -341,6 +341,40 @@ def check_kernel_spawns(check, pins):
     return out
 
 
+
+def check_introspect_queries(check, pins):
+    """Commandment I: a syscall that carries a QUERY SPACE is a second dispatch table.
+
+    `InspectKernel` is one pinned syscall with 23 sub-queries behind it, and each query is a distinct
+    thing the kernel will answer: allocator counts, scheduler ticks, RTC time, framebuffer dimensions,
+    PCI ids, a hardware random number. Adding a 24th is a new kernel responsibility with NO visible
+    surface change - the syscall count stays exactly where it was.
+
+    This is the general lesson of Commandment I, not a quirk of one syscall: pins catch ADDITION at the
+    surface they pin, and miss growth INSIDE it. Any syscall that dispatches on an id needs its id space
+    pinned too, or the pin above it is only watching the door while the room extends out the back.
+    """
+    src = read(os.path.join(ROOT, "kernel/src/syscall/dispatch.rs"))
+    body = re.search(r"fn handle_inspect_kernel\(.*?^\}", src, re.S | re.M)
+    if not body:
+        return [Violation("kernel/src/syscall/dispatch.rs", 0,
+                          "cannot find handle_inspect_kernel: the query pin cannot be verified, and an "
+                          "unverifiable pin is a failure, never a pass")]
+    found = {int(m) for m in re.findall(r"^\s+(\d+) =>", body.group(0), re.M)}
+    pinned = {int(q) for q in pins.get("introspect_queries", [])}
+    out = [Violation("kernel/src/syscall/dispatch.rs", 0,
+                     f"InspectKernel query {q} is NOT pinned. A new query is a new kernel "
+                     f"responsibility that changes no visible surface - the syscall count stays the "
+                     f"same. Ask 'why isn't this a service?', then add it to [kernel] "
+                     f"introspect_queries deliberately.")
+           for q in sorted(found - pinned)]
+    out += [Violation("kernel/src/syscall/dispatch.rs", 0,
+                      f"pinned InspectKernel query {q} is gone - update the pin so the record stays "
+                      f"true.")
+            for q in sorted(pinned - found)]
+    return out
+
+
 CHECKS = [
     dict(id="I-syscalls", commandment="I", title="the syscall surface is pinned",
          kind="custom", fn=check_syscall_surface,
@@ -400,6 +434,20 @@ CHECKS = [
                   pins={"kernel_spawned_services": ["supervisor"]}, expect=True),
              dict(why="any non-string shape must be refused for the same reason",
                   pins={"kernel_spawned_service": ["supervisor"]}, expect=True),
+         ]),
+    dict(id="I-introspect", commandment="I", title="the InspectKernel query space is pinned",
+         kind="custom", fn=check_introspect_queries,
+         scope="kernel/src/syscall/dispatch.rs, handle_inspect_kernel query ids",
+         proves="the kernel answers no introspection query that was not deliberately admitted",
+         does_not_prove="that OTHER id-dispatching surfaces are pinned. Pins catch addition at the "
+                        "surface they pin and miss growth inside it - this check exists because "
+                        "InspectKernel grew a second dispatch table behind an already-pinned syscall",
+         probes=[
+             dict(why="a new introspection query must be caught",
+                  pins={"introspect_queries": []}, expect=True),
+             dict(why="a pinned query that no longer exists must be caught",
+                  pins={"introspect_queries": list(range(0, 40))}, expect=True),
+             dict(why="the real, fully pinned query space must pass", pins=None, expect=False),
          ]),
     dict(id="I-arch-drivers", commandment="I", title="no peripheral device driver lives in the kernel",
          kind="custom", fn=check_arch_device_drivers,

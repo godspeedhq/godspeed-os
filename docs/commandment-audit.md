@@ -69,7 +69,7 @@ Two rules that came out of doing it, and cost something each time:
 
 ## Commandment I - thou shalt not expand the responsibilities of the kernel
 
-**Encoded: 6 checks. Findings: 3, all open.**
+**Encoded: 7 checks. Findings: 4, all open.**
 
 ### Why these surfaces
 
@@ -93,6 +93,22 @@ special, so the supervisor must be restartable too, and only the kernel is benea
 restarting (§11.1, §6.2, `naming-design.md` §3.7 - a sliver of §26.10 traded for maximum fault
 tolerance). Pinned as a single string for the reason in the process notes above.
 
+### The gap that pins do not close
+
+All of these checks are **pins**, and a pin catches ADDITION at the surface it pins while missing growth
+INSIDE it. `InspectKernel` proved the point: one pinned syscall carrying 23 sub-queries, each a distinct
+thing the kernel will answer (allocator counts, scheduler ticks, RTC time, framebuffer dimensions, PCI
+ids, a hardware random number). A 24th would have been a new kernel responsibility that changed no
+visible surface at all - the syscall count stays 49.
+
+Pinned now (C1-4). The general rule this yields: **any syscall that dispatches on an id needs its id
+space pinned too**, or the pin above it is watching the door while the room extends out the back.
+
+Still unpinned, and named here so the gap is not implied away: kernel **feature flags** (which gate
+behaviour - the C1-1 scaffolding lives behind two of them), the kernel's **per-service config table**
+(the kernel holds memory limits, placement and grants for every service, which is policy sitting in the
+kernel), and which **IRQs the kernel services itself** rather than routing to a driver (§12).
+
 ### Considered and REJECTED
 
 **Anti-scope vocabulary scanning** (`inode`, `tcp_`, `work_steal`, ...). Measured first: almost every
@@ -112,6 +128,7 @@ and a proxy that fires on sanctioned work only trains people to raise it.
 | C1-1 | The kernel can spawn three services by name, not one | Medium | fix (remove) or amendment |
 | C1-2 | `arch/` is 65% of the kernel | Observation | no action expected |
 | C1-3 | Font crate linked for a framebuffer console, unjustified in writing | Low | amendment or make it a service |
+| C1-4 | `InspectKernel` carries 23 unpinned sub-queries | Medium | CLOSED by the I-introspect pin |
 
 **C1-1.** `arm_spawn_logger_neutral()` and `arm_spawn_shell_neutral()` in `task/mod.rs` are ARM/AArch64
 bring-up scaffolding from before the supervisor path worked, called from `sched_spawn.rs` and
@@ -123,6 +140,10 @@ What raises it above dead code: both are gated on **architecture, not on the fea
 AArch64 kernel regardless of scheduler feature, including the Pi 4 mainline. No amendment covers
 either, so neither is exemptible. Found only because the exception was written down and the count
 checked.
+
+**C1-4 (closed).** `InspectKernel` was one pinned syscall with an unpinned query space behind it. Now
+pinned. Kept in the table rather than deleted because it is the finding that produced the general rule
+above, and the rule is worth more than the fix.
 
 **C1-2.** `arch/` is 28,755 of ~44,000 kernel lines. Legitimate (hardware support is welcome), noted
 because the majority of the kernel lives in the layer these checks scrutinise least - the role pin says
