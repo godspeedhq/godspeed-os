@@ -37,6 +37,14 @@ jobs:
       - name: Validate service contracts
         run: cargo run -p osdev -- validate
 
+      # The self-test runs FIRST and separately: it proves the checks still fire. A weakened check
+      # reports PASS over code it stopped looking at, and only the probe corpus can tell.
+      - name: Commandment checks - self-test (is the enforcement layer intact?)
+        run: python3 scripts/commandments.py --selftest
+
+      - name: Commandment checks
+        run: python3 scripts/commandments.py
+
       - name: Unsafe audit check
         run: python3 scripts/unsafe_check.py
 

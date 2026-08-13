@@ -768,12 +768,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // with empty replies - so net-stack degrades instead of hanging on a reply (§26.7).
     let mmio  = ctx.mmio();
     let arena = ctx.dma_region();
-    let active = mmio.is_some() && arena.is_some();
+    // NOTE: there is deliberately no `active` boolean here any more. It was a second copy of a fact
+    // the two Options already hold (Commandment III), and every site that consulted it then re-asserted
+    // that fact with `unwrap()` - a service declaring that its own failure should halt the machine
+    // (Commandment V, and the Rule Above The Rules). `if let` binds and proves in the same step, so the
+    // fact is checked exactly where it is used and there is no second truth to keep in sync.
     let mut e1000_mac = [0u8; 6];
 
-    if active {
-        let m = mmio.as_ref().unwrap();
-        let a = arena.as_ref().unwrap();
+    if let (Some(m), Some(a)) = (mmio.as_ref(), arena.as_ref()) {
 
         // Reset to a known state (bring-up on EVERY spawn - Commandments V + IX), wait on the bit.
         m.write32(REG_CTRL, m.read32(REG_CTRL) | CTRL_RST);
@@ -851,9 +853,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // no stray frames, so net-stack's first request already matches and this stays a safe no-op).
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 4 } {
             let mut n = 0usize;
-            if active {
-                let m = mmio.as_ref().unwrap();
-                let a = arena.as_ref().unwrap();
+            if let (Some(m), Some(a)) = (mmio.as_ref(), arena.as_ref()) {
                 for i in 0..RX_RING_COUNT { a.write8(RX_RING_OFF + i * 16 + 12, 0); }
                 m.write32(REG_RDH, 0);
                 m.write32(REG_RDT, (RX_RING_COUNT - 1) as u32);
@@ -884,9 +884,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let mut out = [0u8; BATCH_MSG_MAX];
             let mut opos = 1usize;   // out[0] = frame count
             let mut nfr = 0u8;
-            if active {
-                let m = mmio.as_ref().unwrap();
-                let a = arena.as_ref().unwrap();
+            if let (Some(m), Some(a)) = (mmio.as_ref(), arena.as_ref()) {
                 for i in 0..RX_RING_COUNT { a.write8(RX_RING_OFF + i * 16 + 12, 0); }
                 m.write32(REG_RDH, 0);
                 m.write32(REG_RDT, (RX_RING_COUNT - 1) as u32);
@@ -917,8 +915,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 5 } {
             let mut s = [0u8; 25];
             s[0] = 1;                                     // chip: e1000
-            if active {
-                let m = mmio.as_ref().unwrap();
+            if let Some(m) = mmio.as_ref() {
                 s[1..5].copy_from_slice(&m.read32(REG_CTRL).to_le_bytes());
                 s[5..9].copy_from_slice(&m.read32(REG_STATUS).to_le_bytes());
                 s[9..13].copy_from_slice(&m.read32(REG_RCTL).to_le_bytes());
@@ -932,9 +929,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
 
         let mut n = 0usize;
-        if active {
-            let m = mmio.as_ref().unwrap();
-            let a = arena.as_ref().unwrap();
+        if let (Some(m), Some(a)) = (mmio.as_ref(), arena.as_ref()) {
             let frame = req.payload_bytes();
             let flen = frame.len().min(FRAME_MAX);
 
