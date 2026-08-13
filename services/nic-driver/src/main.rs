@@ -612,8 +612,10 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     };
     #[cfg(target_arch = "arm")]
     let dev_tx = |ctx: &ServiceContext, frame: &[u8]| -> bool {
-        let mut req = [0u8; 1 + 1514];
-        let n = frame.len().min(1514);
+        // C3-1: these were bare 1514 literals - a SEVENTH copy of the frame size, and the one the
+        // compiler could not even see disagreeing. Use the module's FRAME_MAX so there is one fewer.
+        let mut req = [0u8; 1 + FRAME_MAX];
+        let n = frame.len().min(FRAME_MAX);
         req[0] = 0x11;
         req[1..1 + n].copy_from_slice(&frame[..n]);
         match dwc2_rpc(ctx, &Message::from_bytes(&req[..1 + n])) {

@@ -435,7 +435,16 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
 /// The assertion is why this one cost a compile instead.
 pub const TX_OFF: usize = 0x2000;
 pub const RX_OFF: usize = 0x3000;
-pub const FRAME_MAX: usize = 1514;
+// C3-1. This said 1514 while the kernel, nic-driver and genet all said 1600 - six definitions of one
+// fact, and mine was the one that disagreed. 1514 is a correct number (an ethernet frame without its
+// FCS) which is exactly why it looked right when written; but nic-driver ACCEPTS up to 1600, so a frame
+// between 1515 and 1600 bytes was accepted upstream and silently TRUNCATED here. Nothing reports a
+// truncated frame - it just becomes a corrupt packet somebody else has to explain.
+//
+// Raised to 1600 to agree with every other definition. That removes the truncation window; it does NOT
+// remove the duplication, which is the actual Commandment III violation and needs one shared source
+// these crates can both name. Recorded rather than pretended away.
+pub const FRAME_MAX: usize = 1600;
 /// One IN transfer can carry SEVERAL frames, so the receive burst is larger than one frame.
 pub const RX_BURST: usize = 2048;
 const _: () = assert!(TX_OFF >= crate::msc::DATA_OFF + crate::msc::DATA_MAX);

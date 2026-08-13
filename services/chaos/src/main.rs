@@ -78,12 +78,24 @@ const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]; /
 // `ehci` on a box with no EHCI controller; or a newly added service), producing phantom "kills" of a
 // service that was never alive. The only names the scan skips are chaos's OWN untouchables: `chaos`
 // itself (a self-kill would end the run) and the transient tasks it spawns as attacks (`mem-pressure`,
-// including the spawn-storm) or that are ephemeral (`observe-*`). Everything else that is live is fair
+// including the spawn-storm). Everything else that is live is fair
 // game - and NOTHING is protected-last: the supervisor is a normal victim at any point, because the
 // fixed-point robustness must recover from ANY kill order (Test 15 / Cmd II - let Chaos try its
 // hardest); random destruction is the honest stress.
+// C2-1: `observe*` USED TO BE EXCLUDED HERE, and it was the one real service escaping Maximum Carnage.
+// The prefix caught the transient viewer tasks (`observe-now`, `observe-live`) and, with them, the
+// `observe` SERVICE itself - so a whole service never faced the storm while every suite reported green.
+// Naming the two transients explicitly would not have fixed it either: chaos does not spawn those, so
+// they are not its apparatus, and "no service escapes" admits no third category. Killing a task that is
+// already exiting is harmless - the scan skips Dead and invalid slots a few lines above - so the
+// exclusion was buying nothing that the liveness check does not already buy.
+//
+// What remains is chaos's OWN apparatus, and the commandment check DERIVES both rather than reading
+// them here: `chaos` itself (a self-kill ends the run, so the storm would stop measuring anything) and
+// whatever chaos spawns (`mem-pressure`, its ammunition). Add a name to this function that chaos
+// neither is nor spawns and the build fails.
 fn is_transient(name: &str) -> bool {
-    name == "chaos" || name == "mem-pressure" || name.starts_with("observe")
+    name == "chaos" || name == "mem-pressure"
 }
 
 // A tiny xorshift64 PRNG - there is no std rng in no_std. Seeded from the RTC start time (varies run to
