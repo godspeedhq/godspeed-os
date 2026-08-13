@@ -579,7 +579,7 @@ def check_baseline_shape(check, pins):
 
 
 CHECKS = [
-    dict(id="integrity-baseline", commandment="-",
+    dict(nature="rule", id="integrity-baseline", commandment="-",
          title="the baseline's own pins are readable",
          kind="custom", fn=check_baseline_shape,
          scope="COMMANDMENTS.baseline.toml, [kernel] plain keys",
@@ -590,7 +590,7 @@ CHECKS = [
              dict(why="a vanished pin must be caught", pins={}, expect=True),
              dict(why="the real baseline must be readable", pins=None, expect=False),
          ]),
-    dict(id="I-syscalls", commandment="I", title="the syscall surface is pinned",
+    dict(nature="record", id="I-syscalls", commandment="I", title="the syscall surface is pinned",
          kind="custom", fn=check_syscall_surface,
          scope="kernel/src/syscall/dispatch.rs, enum SyscallNumber",
          proves="no syscall exists that was not deliberately admitted to the kernel's surface",
@@ -601,7 +601,7 @@ CHECKS = [
              dict(why="the real surface, fully pinned, must pass",
                   pins=None, expect=False),
          ]),
-    dict(id="I-modules", commandment="I", title="kernel top-level modules are pinned",
+    dict(nature="record", id="I-modules", commandment="I", title="kernel top-level modules are pinned",
          kind="custom", fn=check_kernel_modules,
          scope="kernel/src/* (top level only)",
          proves="no new top-level kernel responsibility appeared without being named",
@@ -611,7 +611,7 @@ CHECKS = [
              dict(why="a new kernel module must be caught", pins={"modules": []}, expect=True),
              dict(why="the real module set, fully pinned, must pass", pins=None, expect=False),
          ]),
-    dict(id="I-authorities", commandment="I", title="the kernel's own authorities are pinned",
+    dict(nature="record", id="I-authorities", commandment="I", title="the kernel's own authorities are pinned",
          kind="custom", fn=check_kernel_authorities,
          scope="kernel/src/capability/mod.rs, well-known ResourceIds",
          proves="the kernel mints authority over nothing that was not deliberately admitted",
@@ -621,7 +621,7 @@ CHECKS = [
              dict(why="a new kernel authority must be caught", pins={"authorities": {}}, expect=True),
              dict(why="the real, fully pinned authority set must pass", pins=None, expect=False),
          ]),
-    dict(id="I-kernel-deps", commandment="I", title="what the kernel links is pinned",
+    dict(nature="record", id="I-kernel-deps", commandment="I", title="what the kernel links is pinned",
          kind="custom", fn=check_kernel_dependencies,
          scope="kernel/Cargo.toml, all [dependencies] blocks including target-gated ones",
          proves="no crate runs in ring 0 that was not deliberately admitted",
@@ -631,7 +631,7 @@ CHECKS = [
              dict(why="a new kernel dependency must be caught", pins={"dependencies": []}, expect=True),
              dict(why="the real, fully pinned dependency set must pass", pins=None, expect=False),
          ]),
-    dict(id="I-kernel-spawns", commandment="I",
+    dict(nature="rule", id="I-kernel-spawns", commandment="I",
          title="the kernel spawns exactly one service, and it is the supervisor",
          kind="custom", fn=check_kernel_spawns,
          scope="every spawn_service_with_config(\"name\") in kernel/src",
@@ -649,7 +649,7 @@ CHECKS = [
              dict(why="any non-string shape must be refused for the same reason",
                   pins={"kernel_spawned_service": ["supervisor"]}, expect=True),
          ]),
-    dict(id="I-introspect", commandment="I", title="the InspectKernel query space is pinned",
+    dict(nature="record", id="I-introspect", commandment="I", title="the InspectKernel query space is pinned",
          kind="custom", fn=check_introspect_queries,
          scope="kernel/src/syscall/dispatch.rs, handle_inspect_kernel query ids",
          proves="the kernel answers no introspection query that was not deliberately admitted",
@@ -663,7 +663,7 @@ CHECKS = [
                   pins={"introspect_queries": list(range(0, 40))}, expect=True),
              dict(why="the real, fully pinned query space must pass", pins=None, expect=False),
          ]),
-    dict(id="I-features", commandment="I", title="kernel feature flags are pinned",
+    dict(nature="record", id="I-features", commandment="I", title="kernel feature flags are pinned",
          kind="custom", fn=check_kernel_features,
          scope="kernel/Cargo.toml [features]",
          proves="no build configuration of the kernel exists that was not deliberately admitted",
@@ -673,7 +673,7 @@ CHECKS = [
              dict(why="a new kernel feature must be caught", pins={"features": []}, expect=True),
              dict(why="the real, fully pinned feature set must pass", pins=None, expect=False),
          ]),
-    dict(id="I-service-table", commandment="I",
+    dict(nature="debt", id="I-service-table", commandment="I",
          title="the kernel's per-service policy table is pinned",
          kind="custom", fn=check_kernel_service_table,
          scope="kernel/src/task/mod.rs, service_config entries",
@@ -687,7 +687,7 @@ CHECKS = [
                   pins={"service_configs": []}, expect=True),
              dict(why="the real, fully pinned service set must pass", pins=None, expect=False),
          ]),
-    dict(id="I-responsibilities", commandment="I",
+    dict(nature="rule", id="I-responsibilities", commandment="I",
          title="the kernel has six responsibilities, and every module claims one",
          kind="custom", fn=check_kernel_responsibilities,
          scope="kernel/src/* against the six of 4.3 plus sanctioned support roles",
@@ -711,7 +711,7 @@ CHECKS = [
              dict(why="the real module set still has unclaimed modules (C1-6 open)",
                   pins=None, expect=True),
          ]),
-    dict(id="I-arch-drivers", commandment="I", title="no peripheral device driver lives in the kernel",
+    dict(nature="record", id="I-arch-drivers", commandment="I", title="no peripheral device driver lives in the kernel",
          kind="custom", fn=check_arch_device_drivers,
          scope="every .rs under kernel/src/arch, by declared role",
          proves="no file under arch/ is an undeclared or peripheral-driver responsibility",
@@ -729,7 +729,7 @@ CHECKS = [
              dict(why="the real, fully classified arch layer must reach only its known drivers",
                   pins=None, expect=True),
          ]),
-    dict(id="II-chaos-exclusions", commandment="II",
+    dict(nature="rule", id="II-chaos-exclusions", commandment="II",
          title="nothing escapes Maximum Carnage but chaos's own apparatus",
          kind="custom", fn=check_chaos_exclusions,
          scope="services/chaos/src/main.rs - is_transient() against chaos's own spawn calls",
@@ -754,7 +754,7 @@ CHECKS = [
              dict(why="an unfindable is_transient must fail, not pass vacuously",
                   pins={"_src": 'fn go() { ctx.spawn("mem-pressure"); }\n'}, expect=True),
          ]),
-    dict(id="V-no-panic", commandment="V", title="no service may halt the machine",
+    dict(nature="rule", id="V-no-panic", commandment="V", title="no service may halt the machine",
          kind="source", dirs=["services"],
          exclude=[dict(glob="build.rs",
                        reason="host build scripts: they run on the developer's machine at build time, "
@@ -781,7 +781,7 @@ CHECKS = [
              dict(why="a comment explaining the rule is not a violation of it",
                   code="// never call .unwrap() in a service", expect=False),
          ]),
-    dict(id="VI-static-mut", commandment="VI", title="no unowned global mutable state in services",
+    dict(nature="rule", id="VI-static-mut", commandment="VI", title="no unowned global mutable state in services",
          kind="source", dirs=["services"],
          exclude=[dict(glob="build.rs", reason="host build scripts, as above")],
          pattern=r"\bstatic\s+mut\b",
@@ -901,7 +901,7 @@ def report(pins, exemptions):
         unexcused, ratchet = apply_baseline(c["id"], run_check(c, pins), exemptions)
         n = len(unexcused) + len(ratchet)
         mark = f"{GREEN}PASS{OFF}" if n == 0 else f"{RED}FAIL ({n}){OFF}"
-        print(f"  {c['commandment']:>4}  {c['id']:<14} {mark}  {c['title']}")
+        print(f"  {c['commandment']:>4}  {c['id']:<20} [{c['nature']:<6}] {mark}  {c['title']}")
         if c["kind"] == "source":
             inc, exc = files_in_scope(c)
             print(f"        scanned:     {len(inc)} files in {', '.join(c['dirs'])}")
@@ -912,6 +912,17 @@ def report(pins, exemptions):
         print(f"        proves:      {c['proves']}")
         print(f"        DOES NOT:    {c['does_not_prove']}")
         print()
+    kinds = {}
+    for c in CHECKS:
+        kinds[c["nature"]] = kinds.get(c["nature"], 0) + 1
+    print(f"  {BOLD}What the numbers in these checks MEAN - they are not all the same claim:{OFF}")
+    print(f"    {BOLD}rule{OFF}    ({kinds.get('rule', 0)})  a fixed truth. Any deviation is a FAILURE. "
+          f"§4.3 says six responsibilities; the kernel spawns exactly one service; nothing escapes Chaos.")
+    print(f"    {BOLD}record{OFF}  ({kinds.get('record', 0)})  a snapshot, NOT an endorsement. 49 syscalls "
+          f"is not a claim that 49 is right - only that a 50th must be deliberate. A pass here means "
+          f"UNCHANGED, never correctly-sized.")
+    print(f"    {BOLD}debt{OFF}    ({kinds.get('debt', 0)})  a distance from where it should be, which may "
+          f"only shrink. 218 kernel service configs against a target of one." + chr(10))
     print(f"  {BOLD}Not mechanised - human review, every time:{OFF}")
     for num, bucket, why in UNMECHANISED:
         print(f"  {num:>4}  {DIM}[{bucket}]{OFF} {why}")
