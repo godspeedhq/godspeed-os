@@ -376,7 +376,43 @@ and one live finding. That is a different category from II's runtime half, which
 
 ---
 
-## Commandments IV - X
+## Commandment IV - thou shalt honor service contracts
+
+**Measured, not yet encoded. The largest gap of the first four.**
+
+| | |
+|---|---|
+| Services shipping a contract | **6 of 14** |
+| What `scripts/contract_check.py` reconciles | memory limit, placement core, `ipc_send` |
+| Authority granted BY NAME in the kernel, outside any contract | **10 kinds** |
+
+The ten: `acquire_any`, `console_push`, `has_console_read`, `introspect`, `net_device`, `reboot`,
+`send_peers_grant`, `service_control`, `set_clock`, `usb_disk`.
+
+So most authority in this system is granted through a path the commandment says should not exist - "do
+not invent hidden communication paths ... if a service cannot express its needs through its declared
+contract, redesign the contract - not the architecture". There IS a doctrine sanctioning it
+(`docs/userspace-audit.md` U15, and `task/mod.rs` calls them "deliberately NOT contract capabilities"),
+but that is a doc rather than a constitutional amendment, while §13.3 says the developer declares what
+the service needs and the OS decides whether to grant it.
+
+**C4-1 (High, provisional). Two thirds of the authority mechanism bypasses the contract mechanism.**
+Provisional because the right answer may be an amendment rather than a fix - if by-name grants are the
+correct design, §13 should say so. What is not defensible is the current state, where the constitution
+describes one mechanism and the kernel uses another, with the reconciliation living in an audit doc.
+
+**C4-2 (Medium). Eight of fourteen service crates ship no contract at all.**
+
+The check shape follows from the measurement, and is mechanical: every service crate ships a contract;
+every by-name grant is declared in that service's contract, or listed in a pinned exception set citing
+an amendment. `contract_check.py` folds in as the third leg.
+
+Not built. A check that cannot be red-teamed in the same sitting is exactly the thing that looks like
+coverage without being it.
+
+---
+
+## Commandments V - X
 
 Not yet walked. `--report` lists each and why it is not mechanised, so the gap shows on every build
 rather than only here.
