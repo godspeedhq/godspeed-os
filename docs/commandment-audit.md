@@ -345,9 +345,34 @@ Two of the copies even carry comments ADMITTING the duplication ("matches nic-dr
 which is the tell worth generalising: a comment asserting that two values agree is a second truth with a
 note attached, not a solution.
 
-Candidate check: identically-named constants defined in multiple places with DIFFERENT values. Nearly
-false-positive-free - when two files independently define `FRAME_MAX` and disagree, it is always worth
-looking at.
+### The check was measured and REJECTED
+
+"Identically-named constants with different values" sounded nearly false-positive-free. Measuring it
+says otherwise: **45 hits tree-wide, 41 across crate boundaries, and nearly all are correct.**
+
+Three legitimate patterns swamp the signal:
+
+* **Per-arch values, which MUST differ.** `ELF_MACHINE` has six distinct values because it names six
+  ISAs. `PL011_BASE`, `USER_END`, `PM_RSTC`, `GPIO_BASE`, `DMA_ARENA_UNCACHED`, `ZERO` - all correct.
+* **The same name meaning different things in unrelated modules.** `DATA_OFF` is a local buffer offset
+  in both `ahci` and `dwc2`; `CLASS_MASS_STORAGE` is a PCI class in one file and a USB class in another;
+  `STATUS` is an IOMMU register and an SDHCI register.
+* **The same word for different concepts.** `NAME_MAX` is 32 in the kernel (SERVICE names in the name
+  directory) and 38 in `fs` (FILE names). Checked by hand - not a disagreement at all.
+
+A build-failing rule here would be roughly 90% false positives, and a check people learn to ignore is
+worse than no check. **Rejected as a gate.** The scan is worth keeping as a REPORT a human reads
+occasionally, which is how `FRAME_MAX` was found in the first place.
+
+### Why III mostly resists mechanisation
+
+The commandment is deliberately careful: a derived view is ALLOWED if it is reconstructible, reconciled
+and subordinate. Deciding whether a stored value satisfies those three is design review, not pattern
+matching - `fs`'s free bitmap is legitimate precisely because `fsck` rebuilds it from the file tree, and
+nothing in the source distinguishes that from a second truth except intent.
+
+So III is recorded as **largely un-encodable**, with one narrow mechanical residue (the scan-as-report)
+and one live finding. That is a different category from II's runtime half, which is *not-yet-built*.
 
 ---
 
