@@ -272,6 +272,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let (mut round, mut killed, mut flooded, mut mempr, mut spawns) = (0u64, 0u64, 0u64, 0u64, 0u64);
     // Wall-clock start (RTC, year-guarded): the datetime for the "started HH:MM:SS" readout, and its epoch
     // for elapsed + the linear ETA (a pure extrapolation of elapsed over round progress, no outside truth).
+    // `datetime()` is the kernel's RAW RTC. Machines without one (the Pi) read zero here, and since
+    // clock slice 3 the wall clock lives in the `time` service, which chaos deliberately does not
+    // depend on - it may have just killed it. So an unset clock is REPORTED as unset below rather than
+    // rendered as 1970. Elapsed and the ETA ride the monotonic clock and are unaffected either way.
     let start_dt = ctx.datetime();
     let start_epoch = start_dt.epoch_secs();
     // ELAPSED is measured on the MONOTONIC clock, not this wall-clock stamp: the wall clock is settable
@@ -279,10 +283,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // whole correction and report an absurd elapsed/ETA. The datetime above is kept for the "started ..."
     // readout, which is exactly what a wall clock IS for.
     let start_mono = ctx.epoch_secs_monotonic();
-    // Seed the random-storm PRNG from the RTC start time (varies per run); advanced each round so the
-    // subset differs round-to-round. Only read in the `target_random` branch.
+    // Seed the random-storm PRNG. Advanced each round so the subset differs round-to-round; only read
+    // in the `target_random` branch.
+    //
+    // The seed must not rest on the wall clock alone. On a machine with no RTC the clock reads ZERO at
+    // boot, so every term above was zero and every run drew the SAME "random" sequence - a chaos gate
+    // that replays one scripted order while reporting that it randomised. Failure to vary is invisible
+    // by construction here: the output looks equally random each time, and only comparing two runs
+    // shows it. So mix three independent sources and require none of them:
+    //   - the hardware RNG where the SoC has one (the Pi's BCM2835; ungated, entropy grants nothing),
+    //   - the monotonic counter, which is real from boot even with no clock at all,
+    //   - the wall clock, when it happens to be set.
     let mut rng = Rng::new((start_epoch as u64)
-        ^ ((start_dt.minute as u64) << 24) ^ ((start_dt.second as u64) << 40));
+        ^ ((start_dt.minute as u64) << 24) ^ ((start_dt.second as u64) << 40)
+        ^ ((ctx.hw_random().unwrap_or(0) as u64) << 8)
+        ^ ((start_mono as u64) << 17));
 
     // Reap ORPHANED mem-pressure tasks left by a PRIOR chaos run that was itself killed mid-run before
     // its end-of-run cleanup (below) could reap them (audit L5). chaos cannot clean up after its own

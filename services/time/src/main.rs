@@ -26,7 +26,7 @@ use godspeed_sdk::{ServiceContext, Message};
 
 /// The protocol. One byte of opcode, because the reply shape differs per op and a shared opcode space
 /// is how two protocols on one endpoint collide (the lesson from `dwc2` serving block and frames).
-pub const OP_NOW: u8 = 1; // -> [ok, epoch(8, le), source]
+pub const OP_NOW: u8 = 1; // -> [ok, epoch(8, le), source, age(8, le)]  age = -1 when never synced
 pub const OP_SET: u8 = 2; // [epoch(8, le)] -> [ok]      network time (SNTP)
 pub const OP_FLOOR_GET: u8 = 3; // -> [ok, floor(8, le)]
 pub const OP_FLOOR_SET: u8 = 4; // [floor(8, le)] -> [ok]
@@ -145,10 +145,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         match p[0] {
             OP_NOW => {
                 let now = clock.now(&ctx);
-                let mut out = [0u8; 10];
+                // The age is APPENDED, not squeezed in: every existing reader checks `len >= 10` and
+                // indexes 0..10, so a longer reply is compatible by construction. The alternative -
+                // a second opcode - would make "when was this set" a separate round trip from "what
+                // is it", and the two can then disagree.
+                //
+                // -1 means NEVER SYNCED, which is not the same as "synced 0 seconds ago". Collapsing
+                // the two would let a clock that was never set read as freshly authoritative.
+                let age = if clock.source == SRC_NTP { ctx.epoch_secs_monotonic() - clock.synced_at }
+                          else { -1 };
+                let mut out = [0u8; 18];
                 out[0] = 1;
                 out[1..9].copy_from_slice(&now.to_le_bytes());
                 out[9] = clock.source;
+                out[10..18].copy_from_slice(&age.to_le_bytes());
                 reply(&ctx, cap, &out);
             }
             OP_SET if p.len() >= 9 => {

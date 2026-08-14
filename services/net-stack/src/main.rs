@@ -411,7 +411,18 @@ const SNTP_TRIES: u32 = 3;
 /// the BOOT sync is needed at all. This is a TRUTH test, not an arch test - a machine whose clock already
 /// knows the date (an x86 with a CMOS RTC) needs no network time; the RTC-less Pi 2 reads 0 and does.
 fn clock_epoch_if_set(ctx: &ServiceContext) -> Option<u32> {
-    let e = ctx.datetime().epoch_secs();
+    // Ask the OWNER. This used to read `datetime()` - the kernel's raw RTC - which the Pi does not
+    // have, so a clock this service had just set successfully still read as unset, and `date sync`
+    // answered "no time from the network (is the cable in?)" with the cable plainly in.
+    let e = match ctx.request_with_reply("time", &Message::from_bytes(&[1])) {
+        Some(r) if r.payload_bytes().len() >= 10 && r.payload_bytes()[0] == 1 => {
+            let p = r.payload_bytes();
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&p[1..9]);
+            i64::from_le_bytes(b)
+        }
+        _ => 0,
+    };
     if e >= SNTP_MIN_PLAUSIBLE as i64 && e <= SNTP_MAX_PLAUSIBLE as i64 { Some(e as u32) } else { None }
 }
 

@@ -4817,8 +4817,8 @@ impl core::fmt::Write for EpochBuf {
 /// "no filesystem". Treating "a reply arrived" as "it worked" is how a refused privileged operation gets
 /// reported to the operator as done (§26.7, invariant 12).
 fn clock_floor_persist(ctx: &ShellCtx, epoch: u32, quiet: bool) -> bool {
-    if !ctx.set_clock_floor(epoch) {
-        if !quiet { ctx.console_writeln("date: the kernel refused the clock floor - not recorded"); }
+    if !time_floor_set(ctx, epoch as i64) {
+        if !quiet { ctx.console_writeln("date: the time service refused the clock floor - not recorded"); }
         return false;
     }
     let mut b = EpochBuf { buf: [0u8; 24], len: 0 };
@@ -4865,8 +4865,8 @@ fn clock_floor_seed(ctx: &ShellCtx) {
     };
     if let Ok(s) = core::str::from_utf8(&buf[..n]) {
         if let Some(v) = parse_u32(s.trim()) {
-            if !ctx.set_clock_floor(v) {
-                ctx.console_writeln("shell: the kernel refused the recorded clock floor - ignoring it");
+            if !time_floor_set(ctx, v as i64) {
+                ctx.console_writeln("shell: the time service refused the recorded clock floor - ignoring it");
             }
         }
     }
@@ -4925,7 +4925,7 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         clock_floor_persist(ctx, epoch, false);
         // fall through to display the freshly-set time
     }
-    let dt = ctx.datetime();
+    let dt = Datetime::from_epoch_secs(time_now(ctx).unwrap_or(0));
     let source = time_source(ctx);
     if arg == "epoch" {
         // Raw fact, pipeable (conventions rule 7): the number only, no provenance decoration.
@@ -4959,7 +4959,7 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     // hardware RTC carries NO such guarantee (firmware may keep it in local time or in UTC, and
     // nothing here can tell which), so it gets no scale label rather than a guessed one - the same
     // rule as the rest of this command: say what is known, never invent the rest.
-    match ctx.clock_synced_secs_ago() {
+    match time_synced_secs_ago(ctx) {
         Some(ago) => out.line_fmt(ctx, format_args!(
             "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC  (ntp, synced {} ago)",
             wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, HumanSecs(ago))),
@@ -8155,6 +8155,40 @@ fn time_floor(ctx: &ShellCtx) -> Option<i64> {
     let mut b = [0u8; 8];
     b.copy_from_slice(&p[1..9]);
     Some(i64::from_le_bytes(b))
+}
+
+/// Raise the clock floor, via the `time` service. Returns false if it refused (the floor only rises)
+/// or could not be reached - both are real failures and the caller reports them.
+fn time_floor_set(ctx: &ShellCtx, epoch: i64) -> bool {
+    let mut body = [0u8; 9];
+    body[0] = 4;                                     // OP_FLOOR_SET
+    body[1..9].copy_from_slice(&epoch.to_le_bytes());
+    match time_rpc(ctx, &body) {
+        Some(r) => r.payload_bytes().first() == Some(&1),
+        None => false,
+    }
+}
+
+/// The wall clock's current reading, per the `time` service. `None` when it could not be asked - the
+/// caller must not substitute a guess, because a rendered date is indistinguishable from a known one.
+fn time_now(ctx: &ShellCtx) -> Option<i64> {
+    let r = time_rpc(ctx, &[1])?;                    // OP_NOW -> [ok, epoch(8), source, age(8)]
+    let p = r.payload_bytes();
+    if p.len() < 10 || p[0] == 0 { return None; }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&p[1..9]);
+    Some(i64::from_le_bytes(b))
+}
+
+/// Seconds since the network last set the clock, or `None` if it never did this boot. Rides on OP_NOW
+/// so the age cannot disagree with the reading it describes.
+fn time_synced_secs_ago(ctx: &ShellCtx) -> Option<i64> {
+    let r = time_rpc(ctx, &[1])?;
+    let p = r.payload_bytes();
+    if p.len() < 18 || p[0] == 0 { return None; }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&p[10..18]);
+    match i64::from_le_bytes(b) { a if a < 0 => None, a => Some(a) }
 }
 
 fn next_fs_tag(ctx: &ShellCtx) -> u8 {
