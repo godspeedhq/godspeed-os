@@ -72,7 +72,6 @@ pub enum SyscallNumber {
     UsbDiskRead            = 47,
     UsbDiskWrite           = 48,
     UsbDiskFlush           = 49,
-    SetClock               = 50,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -106,7 +105,6 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::UsbDiskRead    as u64 => handle_usb_disk_read(arg0, arg1),
         n if n == SyscallNumber::UsbDiskWrite   as u64 => handle_usb_disk_write(arg0, arg1),
         n if n == SyscallNumber::UsbDiskFlush   as u64 => handle_usb_disk_flush(),
-        n if n == SyscallNumber::SetClock       as u64 => handle_set_clock(arg0, arg1),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
             0
@@ -1409,13 +1407,12 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // the network last set it (0 if never). Ungated task-neutral timing info like the RTC (11) itself.
         // `date` reports this so a displayed time says where it came from - a fallback chain is only
         // mechanism, not magic, while its choice is visible (§26.4/§26.9).
-        21 => {
-            let ago = crate::wallclock::synced_secs_ago().max(0);
-            (crate::wallclock::source() as i64) | (ago << 8)
-        }
+        // 21 and 22 REMOVED (clock slice 3): the wall clock's provenance, sync age and floor belong to
+        // the `time` service now. The kernel still answers 11 (the raw RTC register read, which no
+        // service can perform) and 17 (monotonic seconds, which paces deadlines) - transport and
+        // scheduling. What it no longer answers is what the reading MEANS.
         // The persisted clock FLOOR in epoch seconds (0 = none known). A "we ran at least this late" bound,
         // never a reading - `date` shows it only when the time is unknown, explicitly labelled.
-        22 => crate::wallclock::floor(),
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,
@@ -1812,31 +1809,6 @@ fn handle_reboot() -> i64 {
     crate::arch::imp::hardware_reset();
 }
 
-/// SetClock (50): set the wall clock to `epoch` Unix seconds (SNTP-fed). Gated by SET_CLOCK (validated by
-/// holdings - `arg0` spends the one argument register on the epoch, leaving no slot to pass). `epoch` is a
-/// u32 of seconds (single register - so it survives the 32-bit ARM ABI, valid past year 2106), widened
-/// here. A no-op on arches with a real hardware RTC (x86). Returns 0, or CapNotHeld without the cap.
-fn handle_set_clock(epoch: u64, kind: u64) -> i64 {
-    // `kind` 1 = raise the persisted FLOOR ("we ran at least this late"); 0 = set the wall clock; 2 = clear
-    // the floor. These are NOT the same authority, so they do not share a right: raising a floor only
-    // CONSTRAINS which clock values are acceptable, while setting the clock (or clearing the bound that
-    // guards it) changes every task's view of the time of day. Rights narrow (§7.4), so the floor-raiser
-    // holds READ and the clock-setter holds WRITE - which lets the shell record a floor off disk without
-    // also being able to step the clock.
-    let need = if kind == 1 { Rights::READ } else { Rights::WRITE };
-    if !scheduler::current_task_holds_resource(crate::capability::SET_CLOCK_RESOURCE, need) {
-        return cap_err_to_i64(CapError::CapNotHeld);
-    }
-    let v = (epoch & 0xFFFF_FFFF) as i64;
-    let ok = match kind {
-        1 => crate::wallclock::set_floor(v),
-        2 => crate::wallclock::clear_floor(),
-        _ => crate::wallclock::set_wall_clock(v),
-    };
-    // Every path announces itself inside `wallclock` (what changed, or the reason for a refusal): a change
-    // to every task's view of the time of day must be answerable afterwards (§26.4, §26.7).
-    if ok { 0 } else { -1 }
-}
 
 /// Largest ethernet frame the USB-net bridge moves (matches nic-driver's FRAME_MAX).
 const NET_FRAME_MAX: usize = 1600;

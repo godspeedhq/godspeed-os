@@ -1332,10 +1332,6 @@ impl ServiceContext {
     /// register, so it survives the 32-bit ARM syscall ABI and is valid past year 2106). Returns true on
     /// success. After this, `datetime()` reports the real time on the RTC-less ARM port.
     #[must_use = "the kernel can refuse this - the clock is unchanged if false"]
-    pub fn set_wall_clock(&self, epoch_secs: u32) -> bool {
-        // SAFETY: syscall(50) = SetClock, kind 0 = set the clock; the kernel validates SET_CLOCK by holdings.
-        unsafe { raw_syscall(50, epoch_secs as u64, 0, 0) >= 0 }
-    }
 
     /// Raise the persisted clock FLOOR - a "the machine was demonstrably running at least this late" bound,
     /// seeded from disk at startup. It is never displayed as the time (a bound is true; an estimate of the
@@ -1348,17 +1344,6 @@ impl ServiceContext {
         unsafe { raw_syscall(50, epoch_secs as u64, 1, 0) >= 0 }
     }
 
-    /// Where the current wall-clock reading came from: `ClockSource::Ntp` if the network set it this boot,
-    /// `Rtc` if a hardware clock reads a plausible date, `Unset` if the machine has no idea what time it is.
-    pub fn clock_source(&self) -> ClockSource {
-        // SAFETY: syscall(13) = InspectKernel; query 21 = packed clock provenance.
-        let p = unsafe { raw_syscall(13, 21, 0, 0) };
-        match p & 0xFF {
-            2 => ClockSource::Ntp,
-            1 => ClockSource::Rtc,
-            _ => ClockSource::Unset,
-        }
-    }
 
     /// Seconds since the network last set the clock, or `None` if it never did this boot.
     pub fn clock_synced_secs_ago(&self) -> Option<i64> {
@@ -1367,12 +1352,6 @@ impl ServiceContext {
         if p & 0xFF == 2 { Some(p >> 8) } else { None }
     }
 
-    /// The persisted clock floor in epoch seconds, or `None` if none is known. A LOWER BOUND, not a time.
-    pub fn clock_floor(&self) -> Option<i64> {
-        // SAFETY: syscall(13) = InspectKernel; query 22 = the clock floor.
-        let f = unsafe { raw_syscall(13, 22, 0, 0) };
-        if f > 0 { Some(f) } else { None }
-    }
 
     /// A hardware-random u32 from the SoC RNG (the BCM2835 RNG on the Pi 2), or None if this build exposes
     /// no hardware RNG. Ungated (entropy confers no authority). The `random` shell utility consumes it.

@@ -313,7 +313,7 @@ The split is the same one control.rs and fbcon need, a third time: **the kernel 
 the service owns the meaning.** x86's CMOS RTC is port I/O at 0x70/0x71 and cannot leave ring 0; the
 epoch conversion, plausibility bounds, source (RTC vs NTP), sync age and the floor are all policy.
 
-USB-sized, so sliced like the arm32 work, with the tree building at every step:
+**DONE - all three slices.** USB-sized, so sliced like the arm32 work, with the tree building at every step:
 
 1. **The service exists and owns the policy.** Reads raw RTC through the EXISTING `InspectKernel`
    queries, serves epoch / source / floor over IPC. Kernel untouched.
@@ -322,8 +322,19 @@ USB-sized, so sliced like the arm32 work, with the tree building at every step:
 3. **The kernel shrinks.** Delete `clock.rs`, `wallclock.rs`, the `SetClock` syscall and the wall-clock
    queries.
 
-Slice 3 is the first time in this audit that a pinned surface gets SMALLER: one fewer syscall, at least
-one fewer introspection query, 327 fewer kernel lines, two fewer modules.
+Slice 3 delivered the first SHRINK of a pinned kernel surface in this audit: **`SetClock` (syscall 50)
+deleted, introspection queries 21 and 22 deleted, `wallclock.rs` deleted (116 lines), and the SDK
+wrappers that fronted them removed.** The pins got smaller rather than larger for the first time.
+
+**`clock.rs` STAYS, and earns a role rather than an exemption.** Its epoch/deglitch math backs
+`now_epoch_monotonic`, which every arch uses to pace deadlines and retries - and on hardware whose cycle
+counter cannot be trusted (the T630's broken TSC, the Pi's RTC-less boot) the kernel derives its
+monotonic seconds from the RTC. That is scheduling infrastructure, one of the six, and deleting it would
+have taken timeouts with it. The CALENDAR half is what left.
+
+The boundary that resulted is the one worth remembering: the kernel answers query 11 (the raw RTC
+register read, which no service can perform) and query 17 (monotonic seconds, which paces deadlines). It
+no longer answers what the reading MEANS.
 
 Honest cost: a service needs a `service_config` entry, so this grows C1-5's debt from 218 to 219. It is
 the debt moving in the right direction - one table row replacing two kernel modules and a syscall - but
