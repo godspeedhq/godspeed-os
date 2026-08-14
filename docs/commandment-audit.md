@@ -256,7 +256,24 @@ ISOLATION reporting - it surfaces a confined device's DMA escaping its arena (H1
 business sharing a lifetime with a debug channel; it now runs on its own in the scheduler's core-0 tick,
 so gating the channel cannot silently take fault reporting with it. **Done.**
 
-What remains is the channel itself, and it needs a decision rather than a patch. Feature-gating does not
+**RESOLVED by amendment (2026-08-14), and the analysis reversed my own recommendation.** I proposed
+making the channel a SERVICE, the same move that took USB out of the kernel. Measuring it says it cannot
+be one, and Commandment II is the reason: nothing escapes Chaos, so `chaos max-carnage` would kill a
+control service mid-storm and the harness would lose the channel it was driving the test through - §22
+Test 15 kills the *supervisor* through this channel and then watches the kernel respawn it. Excluding it
+from Chaos would violate II instead.
+
+The channel's whole value is being OUT-OF-BAND: it must work precisely when every service is dead, so it
+can only live in the one thing that cannot die. That is the same argument that makes the kernel the
+recovery anchor for the supervisor, applied to the operator's channel - which is why the amendment reads
+as a consequence of the existing law rather than an exception to it.
+
+`control.rs` now declares the sanctioned support role `operator-control`, citing that amendment, and the
+check passes. Left as-is deliberately: `FIRE_IRQ` is not gated behind a test feature, because anyone who
+can reach COM2 can already `KILL` any service - the channel IS the authority, and hardening one of three
+commands against the other two would be theatre. Said plainly in the amendment instead.
+
+Superseded, kept for the record - the original framing was: Feature-gating does not
 close the finding, because the check reads SOURCE and not `cfg` - the same lesson C1-1 taught. Deleting
 it breaks the identity suite, which drives the OS through that channel (§22.3). So the options are an
 AMENDMENT sanctioning a kernel-side test-control channel (§4.4 forbids "developer tooling" by name,
