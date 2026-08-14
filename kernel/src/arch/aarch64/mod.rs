@@ -30,7 +30,6 @@ pub mod ptables;
 #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
 pub mod sched_demo;
 #[cfg(all(feature = "pi4", feature = "pi4-sched-spawn"))]
-pub mod sched_spawn;
 #[cfg(feature = "pi4")]
 pub mod sched_supervisor;
 #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
@@ -1057,8 +1056,6 @@ extern "C" fn boot_high() -> ! {
     // A REAL service through the neutral spawn path. Checked first: if both features are on, running a
     // compiled service is the more informative of the two, and neither returns.
     // A demo, if one was asked for. Explicit request wins: the point of building with one is to watch it.
-    #[cfg(all(feature = "pi4", feature = "pi4-sched-spawn"))]
-    sched_spawn::run();
 
     #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
     sched_demo::run(&boot_info);

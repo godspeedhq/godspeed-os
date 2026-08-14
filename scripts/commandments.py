@@ -303,7 +303,23 @@ def check_kernel_spawns(check, pins):
                           "`kernel_spawned_service` must be a single string. The shape carries the rule: "
                           "exactly one service, named, not a collection that can grow.")]
     pinned = {one} if one else set()
+    # `_spawn_src` is a TEST SEAM, guarded like `_src` and `_law`: integrity-baseline refuses any
+    # [kernel] key beginning with "_". Needed because the tree is now CLEAN - the probe used to assert
+    # that a second spawn existed, which encoded reality rather than the rule, and went red the moment
+    # the reality was fixed. A probe must test the rule, or fixing the code breaks the guard.
     found = {}
+    if pins.get("_spawn_src") is not None:
+        for m in re.finditer(r'spawn_service_with_config\(\s*"([a-z0-9-]+)"', pins["_spawn_src"]):
+            found.setdefault(m.group(1), "kernel/src/<probe>")
+        out = [Violation(path, 0,
+                         f"the kernel spawns '{svc}' on its own initiative. The kernel restarts exactly "
+                         f"ONE service - the supervisor - and only because Commandment V leaves nothing "
+                         f"else beneath it to do so. A second one is a new kernel responsibility.")
+               for svc, path in sorted(found.items()) if svc not in pinned]
+        out += [Violation("kernel/src", 0,
+                          f"'{svc}' is pinned as kernel-spawned but nothing spawns it - update the pin.")
+                for svc in sorted(pinned - set(found))]
+        return out
     for base, _, names in os.walk(os.path.join(ROOT, "kernel/src")):
         for n in sorted(names):
             if not n.endswith(".rs"):
@@ -612,7 +628,14 @@ CHECKS = [
                         "this pin should shrink to nothing",
          probes=[
              dict(why="a second kernel-spawned service must be caught",
-                  pins={"kernel_spawned_service": "supervisor"}, expect=True),
+                  pins={"kernel_spawned_service": "supervisor",
+                        "_spawn_src": 'spawn_service_with_config("supervisor", X); '
+                                      'spawn_service_with_config("logger", Y);'},
+                  expect=True),
+             dict(why="the supervisor alone must pass - the tree is clean since C1-1",
+                  pins={"kernel_spawned_service": "supervisor",
+                        "_spawn_src": 'spawn_service_with_config("supervisor", X);'},
+                  expect=False),
              dict(why="a pin for a service nothing spawns must be caught",
                   pins={"kernel_spawned_service": "ghost"}, expect=True),
              dict(why="turning the pin back into a LIST must be refused - the shape is the policy",

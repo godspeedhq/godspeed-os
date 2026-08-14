@@ -9,10 +9,11 @@ objcopies it to a flat kernel7.img the Pi firmware / QEMU raspi2b can boot.
 `osdev` is x86-only; this is the ARM equivalent of `osdev build` until ARM is a
 first-class osdev target. Usage:
 
-    python scripts/arm_build.py [--feature arm-shell|arm-supervisor] [--release]
+    python scripts/arm_build.py [--feature arm-supervisor] [--release]
 
 The default feature is arm-supervisor (the full stack: supervisor -> logger +
-ping/pong). Pass --feature arm-shell for the logger+shell-only prompt build.
+ping/pong). The kernel spawns only the supervisor (C1-1), so there is no kernel-spawned
+bring-up build any more - the supervisor path IS the bring-up path.
 """
 import argparse, subprocess, sys, os, shutil
 
@@ -48,7 +49,7 @@ def run(cmd):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--feature", default="arm-supervisor",
-                    help="kernel boot-path feature (arm-supervisor | arm-shell | ...)")
+                    help="kernel boot-path feature (arm-supervisor)")
     ap.add_argument("--release", action="store_true")
     ap.add_argument("--qemu", action="store_true",
                     help="target QEMU emulation (identity DWC2 DMA); default is real-Pi hardware")

@@ -4079,6 +4079,15 @@ fn spawn_service_with_config(
 /// (garbage under `test-bad-supervisor` → §22 Test 1B). `has_recv_endpoint = true` (the supervisor
 /// owns the death-notification endpoint). A *boot-time* spawn failure is fatal (§6.2, §11.3); a later
 /// *runtime* death is recovered by the kernel respawning it (Phase 6 - see below).
+// C1-1: `arm_spawn_logger_neutral` and `arm_spawn_shell_neutral` USED TO LIVE HERE, and with them the
+// `arm-sched-spawn` / `arm-shell` / `arm-spawn-logger` / `pi4-sched-spawn` bring-up builds in which the
+// kernel started a service directly. They were scaffolding from before the supervisor path worked, and
+// they were gated on ARCHITECTURE rather than on the features that called them, so every ARM and
+// AArch64 kernel carried the ability whether or not anything reached it.
+//
+// The kernel spawns the supervisor and NOTHING ELSE. Bringing up a new ISA now means getting the
+// supervisor up, which is the thing that has to work anyway. If that ever proves too large a first
+// step, the answer is a smaller supervisor - not a second spawn path in the kernel.
 pub fn spawn_supervisor() {
     match spawn_service_with_config("supervisor", SUPERVISOR_ELF, 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
@@ -4086,42 +4095,7 @@ pub fn spawn_supervisor() {
     }
 }
 
-/// ARM bring-up (increment 4a): spawn the logger through the **neutral** `spawn_service_with_config` -
-/// the exact machinery the supervisor's spawn syscall uses - to prove the real spawn path works on ARM
-/// (page tables + kstack pool + cap wiring + ctx page + the ARM `finalize_service_address_space` hook).
-/// The full-OS build spawns via the supervisor instead; this is the direct probe. Requires the neutral
-/// bootstrap (percpu / scheduler arenas / capability) to have run first.
-/// Also used by the AArch64 (Pi 4) bring-up, which reaches the same milestone by the same route. The
-/// name keeps its `arm_` prefix because it is the ARM family's bring-up probe and renaming it would
-/// churn the 32-bit port for nothing; both ports delete it once the supervisor spawns their services.
-#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-pub fn arm_spawn_logger_neutral() {
-    static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
-    match spawn_service_with_config(
-        "logger", LOGGER_ELF, 0, /*has_recv_endpoint=*/true, &[], 0, false,
-        8 * 1024 * 1024, &[], false, None,
-    ) {
-        Ok(_)  => crate::kprintln!("arm: logger spawned via the neutral spawn path"),
-        Err(e) => crate::kprintln!("arm: logger neutral spawn FAILED: {:?}", e),
-    }
-}
 
-/// ARM bring-up (increment 5): spawn the shell through the neutral spawn path with a CONSOLE_READ cap,
-/// so it reads serial input from the PL011 RX ring. `send_peers=&[]` (not `["fs"]` as on x86) because
-/// there is no `fs` on the Pi 2 yet - file/history commands degrade, but the prompt comes up and every
-/// non-fs command (`help`, `version`, ...) works. The shell's other authorities (spawn/kill/reboot)
-/// come from `service_privileges("shell")` automatically.
-#[cfg(target_arch = "arm")]
-pub fn arm_spawn_shell_neutral() {
-    static SHELL_ELF: &[u8] = include_bytes!(env!("SVC_SHELL_ELF"));
-    match spawn_service_with_config(
-        "shell", SHELL_ELF, 0, /*has_recv_endpoint=*/true, &[], 0, false,
-        8 * 1024 * 1024, &[], /*has_console_read=*/true, None,
-    ) {
-        Ok(_)  => crate::kprintln!("arm: shell spawned (console-read wired)"),
-        Err(e) => crate::kprintln!("arm: shell spawn FAILED: {:?}", e),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Supervisor respawn (Path C / Phase 6 - the supervisor is restartable; §6.2).

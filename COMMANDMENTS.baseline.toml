@@ -45,10 +45,6 @@ features = [
     "arm-fault-test",
     "arm-sched-demo",
     "arm-sched-ipc",
-    "arm-sched-spawn",
-    "arm-sched-user",
-    "arm-shell",
-    "arm-spawn-logger",
     "arm-supervisor",
     "iommu-fault-test",
     "memmap-clamp-test",
@@ -56,7 +52,6 @@ features = [
     "pi4",
     "pi4-demo-services",
     "pi4-sched-demo",
-    "pi4-sched-spawn",
     "pi4-smp",
     "pi4-supervisor",
     "qemu",
@@ -422,7 +417,6 @@ SET_CLOCK          = 13
 "aarch64/pcie.rs"             = "discovery"
 "aarch64/ptables.rs"          = "mmu"
 "aarch64/sched_demo.rs"       = "scheduler-entry"
-"aarch64/sched_spawn.rs"      = "scheduler-entry"
 "aarch64/sched_supervisor.rs" = "scheduler-entry"
 "aarch64/sched_user.rs"       = "scheduler-entry"
 "aarch64/smp_boot.rs"         = "boot"
@@ -445,10 +439,7 @@ SET_CLOCK          = 13
 "arm/page_tables.rs"          = "mmu"
 "arm/sched_demo.rs"           = "scheduler-entry"
 "arm/sched_ipc.rs"            = "scheduler-entry"
-"arm/sched_shell.rs"          = "scheduler-entry"
-"arm/sched_spawn.rs"          = "scheduler-entry"
 "arm/sched_supervisor.rs"     = "scheduler-entry"
-"arm/sched_user.rs"           = "scheduler-entry"
 "arm/spawn.rs"                = "scheduler-entry"
 "arm/syscall.rs"              = "syscall-entry"
 "arm/timer.rs"                = "timer"

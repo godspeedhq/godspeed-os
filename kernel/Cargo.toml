@@ -66,11 +66,10 @@ memmap-clamp-test = []
 # preempted by the 100 Hz generic timer. The aarch64 twin of `arm-sched-demo`. Gated because it does
 # not return - scheduler::run IS the idle loop - so it replaces the rest of the boot.
 pi4-sched-demo = []
-# Spawn a REAL service (the logger) through the neutral spawn path on the Pi 4
-# (arch/aarch64/sched_spawn.rs) and run it under the scheduler. The aarch64 twin of
-# `arm-sched-spawn`. Exercises the ELF loader, per-task page tables, the instruction-cache
-# maintenance a loader needs, the kstack pool, cap wiring, and the SDK ABI - in one call.
-pi4-sched-spawn = []
+# NOTE (C1-1): the bring-up features that had the KERNEL spawn a service directly - `arm-sched-spawn`,
+# `arm-shell`, `arm-spawn-logger`, `pi4-sched-spawn` - are gone. The kernel spawns the supervisor and
+# nothing else, so a new port is brought up by getting the supervisor running, which is the thing that
+# has to work anyway.
 # The real OS bootstrap on the Pi 4: the kernel makes its ONE direct spawn (the supervisor), which then
 # spawns the services - including the shell, with a CONSOLE_READ cap wired to the PL011 receiver. The
 # aarch64 twin of `arm-supervisor`. This is the build that gives a `gsh>` prompt.
@@ -104,22 +103,18 @@ pi4-smp = []
 # It is a feature rather than the default for one reason: the in-kernel driver is HARDWARE-VERIFIED on
 # a real Pi 4 and the service one is not yet, and a working machine does not get replaced by an
 # unproven one on the strength of an argument. Build both sides with it (`pi4_build.py
-arm-spawn-logger = []
 # Run the neutral scheduler over 3 cooperative kernel tasks on ARM (arch/arm/sched_demo.rs).
 arm-sched-demo = []
 # Run a real USER service (the logger) THROUGH the neutral scheduler on ARM, preemptively, alongside
 # spinning kernel tasks (arch/arm/sched_user.rs). Proves per-task address spaces + user-mode preemption.
-arm-sched-user = []
 # Run TWO USER services under the scheduler at once (arch/arm/sched_ipc.rs). Proves the banked-register
 # trap frame (SP_usr/LR_usr per task) and is the base the real IPC send/recv proof grows on.
 arm-sched-ipc = []
 # Spawn a service (logger) through the NEUTRAL spawn path on ARM (arch/arm/sched_spawn.rs). Proves
 # task::spawn_service_with_config - the machinery the supervisor's spawn syscall uses - works on ARM.
-arm-sched-spawn = []
 # The real OS bootstrap: kernel spawns the SUPERVISOR, which spawns the services (arch/arm/sched_supervisor.rs).
 arm-supervisor = []
 # The interactive shell on ARM: gsh> prompt reading serial input (arch/arm/sched_shell.rs).
-arm-shell = []
 # Hands-off chaos demo: a few seconds after boot the kernel INJECTS `chaos max-carnage all-services 10`
 # (+ confirm) into the input ring, so a serial-output-only setup (no keyboard) still runs + shows the
 # storm. Build with `arm-supervisor,arm-autochaos`.
