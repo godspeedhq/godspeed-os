@@ -787,6 +787,15 @@ a slot that changes MEANING while keeping its number is invisible to it. The che
 `introspect_queries` as name-to-number rather than a bare number list, so reuse reads as a rename in the
 diff and has to be argued for.
 
+**F4 - the `lba 7700` CRC-zero block was PRE-EXISTING damage on the stick, not a live defect.** A
+`drives flash` (format), then selfcheck, then 50 rounds of chaos, then selfcheck twice: 0 failures each
+time, and ping clean. So the block whose stored CRC was zero predated this session's code and survived
+on the media; a storm did not reproduce it in 100 rounds. The mechanism reasoned about (an acknowledged
+write lost with a killed driver, leaving a committed file pointing at an unstamped block) remains the
+only explanation consistent with `stored 0x00000000`, but it is NOT attributable to current code and
+the finding is closed as media damage. Kept because the reasoning stands if it ever returns: `fs`
+refused the block loudly and fsck found it, which is the design working.
+
 **F2 - `fs` stack-overflows in a restart storm when storage is absent (QEMU, not hardware).** With no
 USB stick, `block-driver` serves 0 sectors and `fs` dies repeatedly.
 

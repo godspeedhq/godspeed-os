@@ -104,13 +104,76 @@ fn find_boot_keyboard(buf: &[u8], total: usize) -> Option<(u8, Keyboard)> {
 pub fn bind(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, splt: u32,
 ) -> Option<Keyboard> {
+    // TWO ATTEMPTS, because one dropped control transfer used to cost the keyboard entirely.
+    //
+    // Measured on hardware across 23 dwc2 restarts: 7 bound the keyboard, and 3 more enumerated port 4
+    // (`046d:c30a`, low speed, via split) and then bound NOTHING, with no failure logged anywhere. The
+    // other 13 were killed mid-bring-up by the storm, which is honest. So of the restarts that actually
+    // reached the keyboard, 30% lost it - and the operator sees that as "the keyboard works, then
+    // doesn't, then does".
+    //
+    // A low-speed device reached through a hub's transaction translator is the flakiest path in this
+    // driver, and the descriptor read is three control transfers deep. Retrying is what every other
+    // device here effectively gets from its own init path; the keyboard had one shot.
+    for attempt in 0..2u32 {
+        match try_bind(ctx, mmio, dma, t, splt) {
+            BindOutcome::Bound(k) => return Some(k),
+            // Ordinary and common: three of the four ports on this board are not keyboards. Never
+            // logged, and never retried - retrying "this is a disk" would just slow every enumeration.
+            BindOutcome::NotAKeyboard => return None,
+            BindOutcome::Failed(why) => {
+                if attempt == 0 {
+                    ctx.log_fmt(format_args!("dwc2-svc: keyboard bind failed ({}) - retrying once", why));
+                } else {
+                    // Loud on the way out. This path used to return None in silence, so a keyboard that
+                    // failed to bind was indistinguishable from a port with no keyboard on it - which is
+                    // why the intermittency went unexplained for as long as it did.
+                    ctx.log_fmt(format_args!(
+                        "dwc2-svc: KEYBOARD NOT BOUND after 2 attempts ({}) - this device looks like a \
+                         keyboard but did not bind; input will be dead until the next enumeration", why));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// What one bind attempt concluded. The three outcomes need different handling and used to be
+/// collapsed into `Option`: "not a keyboard" and "a keyboard that failed" both returned `None`, so the
+/// second could not be reported without also reporting the first on every non-keyboard port.
+enum BindOutcome {
+    Bound(Keyboard),
+    NotAKeyboard,
+    Failed(&'static str),
+}
+
+/// True if the config descriptor declares ANY HID interface. It is what separates "this port has a
+/// disk on it" from "this really is a keyboard and something went wrong", and therefore what makes the
+/// failure reportable without drowning every enumeration in noise about the ports that are not.
+fn has_hid_interface(buf: &[u8], total: usize) -> bool {
+    let mut i = 0usize;
+    while i + 2 <= total {
+        let len = buf[i] as usize;
+        if len < 2 || i + len > total {
+            break;
+        }
+        if buf[i + 1] == DESC_INTERFACE && len >= 9 && buf[i + 5] == CLASS_HID {
+            return true;
+        }
+        i += len;
+    }
+    false
+}
+
+fn try_bind(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, splt: u32,
+) -> BindOutcome {
     // The 9-byte header first, for wTotalLength - the full descriptor's length is not knowable in
     // advance and asking for a fixed guess either truncates it or overruns the device's answer.
     let mut head = [0u8; 9];
     let get9 = [0x80, 0x06, 0, DESC_CONFIG, 0, 0, 9, 0];
     if !chan::control_split(ctx, mmio, dma, t, &get9, &mut head, true, 9, splt) {
-        ctx.log("dwc2-svc: config descriptor header read FAILED");
-        return None;
+        return BindOutcome::Failed("config descriptor header read");
     }
     let total = u16::from_le_bytes([head[2], head[3]]) as usize;
     let cfg_val = head[5];
@@ -125,13 +188,17 @@ pub fn bind(
         (want & 0xFF) as u8, ((want >> 8) & 0xFF) as u8,
     ];
     if !chan::control_split(ctx, mmio, dma, t, &getall, &mut full, true, want, splt) {
-        ctx.log("dwc2-svc: full config descriptor read FAILED");
-        return None;
+        return BindOutcome::Failed("full config descriptor read");
     }
 
     let (iface, kbd) = match find_boot_keyboard(&full, want) {
         Some(x) => x,
-        None => return None, // not a keyboard: a normal outcome, not a failure to report
+        // A HID interface with no usable boot-keyboard endpoint is NOT the ordinary "this is a disk"
+        // answer - the descriptor either arrived short or arrived wrong, and that is worth retrying
+        // and worth saying. Without this split the two were the same silent `None`.
+        None if has_hid_interface(&full, want) =>
+            return BindOutcome::Failed("HID interface present but no boot-keyboard endpoint in it"),
+        None => return BindOutcome::NotAKeyboard,
     };
 
     // SET_CONFIGURATION, for the same reason the hub needed it: class and interface requests are only
@@ -139,8 +206,7 @@ pub fn bind(
     let setcfg = [0x00, 0x09, cfg_val, 0, 0, 0, 0, 0];
     let mut none: [u8; 0] = [];
     if !chan::control_split(ctx, mmio, dma, t, &setcfg, &mut none, false, 0, splt) {
-        ctx.log_fmt(format_args!("dwc2-svc: SET_CONFIGURATION {} FAILED", cfg_val));
-        return None;
+        return BindOutcome::Failed("SET_CONFIGURATION");
     }
 
     // SET_PROTOCOL(boot). bmRequestType 0x21 = host-to-device, CLASS, INTERFACE recipient - so wIndex
@@ -156,7 +222,7 @@ pub fn bind(
     ctx.log_fmt(format_args!(
         "dwc2-svc: BOOT KEYBOARD bound - interface {} endpoint {} mps {} interval {}",
         iface, kbd.ep, kbd.mps, kbd.interval));
-    Some(kbd)
+    BindOutcome::Bound(kbd)
 }
 
 /// Poll the keyboard once and push any keystrokes to the console.
