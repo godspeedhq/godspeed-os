@@ -57,6 +57,36 @@ const REARM_MS: u64 = 1_000;
 /// ONE endpoint carries both protocols, so the opcode decides. The reply cap is taken HERE, once, so
 /// neither server can take it twice or forget to - and a request with none is dropped loudly, because
 /// it cannot be answered and silence would leave the client to time out against a clean log.
+
+/// Answer a block request when there is NO DISK, instead of consuming the message and going quiet.
+///
+/// `recv_timeout` CONSUMES. The two call sites below used to take a message and then drop it whenever
+/// `disk` was None, so a client blocked in request/reply waited forever for an answer that was never
+/// coming. `block-driver` asks for capacity as the very first thing it does, so with no stick in the
+/// machine it hung before printing a single line - and `fs` hung behind it - which reads as a dead
+/// service rather than an empty drive bay.
+///
+/// The net path in `dispatch` already got this right ("a net request with no NIC bound is answered,
+/// not ignored"). This is the same rule for storage: a missing dependency must RETURN, loudly, never
+/// hang. A short/failed reply is exactly what `sectors_now` treats as "no disk", which is the truth.
+fn answer_no_disk(ctx: &ServiceContext, capless: &mut bool) {
+    match ctx.take_pending_cap() {
+        Some(reply) => {
+            // STATUS_ERR, and one byte only: shorter than any real reply, so a reader that checks
+            // the status and a reader that checks the length both take their error path.
+            let _ = ctx.try_send_by_handle(
+                reply, &godspeed_sdk::Message::from_bytes(&[crate::msc::STATUS_ERR]));
+            ctx.remove_cap(reply);
+        }
+        None => {
+            if !*capless {
+                *capless = true;
+                ctx.log("dwc2-svc: request had no reply cap - dropping (cannot answer without one)");
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch(
     ctx: &ServiceContext, m: &godspeed_sdk::Mmio, d: &godspeed_sdk::Dma,
@@ -332,6 +362,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // Drain block requests, BOUNDED - the endpoint queue is 16 deep, so this is a storm
             // detector rather than a throttle (the same bound the xhci service needed after an
             // unbounded drain was found there).
+            // With NO DISK this used to skip the drain entirely, which is its own failure: requests
+            // then sat in the 16-deep endpoint queue until it filled, and every later sender blocked
+            // on a full queue instead of being told there is no disk. Drain either way, and answer
+            // either way.
+            if disk.is_none() {
+                let mut drained = 0u32;
+                while ctx.try_recv().is_some() {
+                    drained += 1;
+                    answer_no_disk(&ctx, &mut capless);
+                    if drained >= MSG_DRAIN_MAX {
+                        ctx.log("dwc2-svc: no-disk drain hit its bound - a sender is enqueuing as fast as we retire");
+                        break;
+                    }
+                }
+            }
             if let Some((dk, dt, sectors)) = disk.as_mut() {
                 let mut drained = 0u32;
                 while let Some(msg) = ctx.try_recv() {
@@ -437,10 +482,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if served_this_pass == 0 {
                 let t_sleep = ctx.read_tsc();
                 if let Some(msg) = ctx.recv_timeout(ctx.duration_cycles(period_ms)) {
-                    if let Some((dk, dt, sectors)) = disk.as_mut() {
-                        if dispatch(&ctx, &m, &d, dt, dk, nic.as_mut(), &msg, *sectors, &mut capless) {
-                            served = served.wrapping_add(1);
+                    match disk.as_mut() {
+                        Some((dk, dt, sectors)) => {
+                            if dispatch(&ctx, &m, &d, dt, dk, nic.as_mut(), &msg, *sectors, &mut capless) {
+                                served = served.wrapping_add(1);
+                            }
                         }
+                        // No disk: ANSWER anyway. Dropping it here is what hung `block-driver` before
+                        // its first log line, and `fs` behind it.
+                        None => answer_no_disk(&ctx, &mut capless),
                     }
                 }
                 seg_sleep = seg_sleep.wrapping_add(ctx.read_tsc().wrapping_sub(t_sleep));
