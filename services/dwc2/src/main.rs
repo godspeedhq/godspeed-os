@@ -394,6 +394,45 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let t_kbd = ctx.read_tsc();
             seg_serve = seg_serve.wrapping_add(t_kbd.wrapping_sub(t_pass));
             if let Some((k, kt, ksplt)) = kbd.as_ref() {
+            // AN ENDPOINT STUCK IN XACTERR IS RE-ENUMERATED, not polled forever.
+            //
+            // Measured at the moment the keyboard died: 1512 consecutive XACTERR, zero data, zero
+            // NAK. Clear_TT_Buffer had already fired and been accepted, so the transaction translator
+            // was not the thing stuck this time - the DEVICE's endpoint was, and no number of further
+            // transfers changes that. Enumeration ran once at startup and there was no path back, so
+            // the keyboard stayed dead for the life of the service. That is the actual gap.
+            //
+            // Recovery is the same sequence that bound it in the first place: reset its hub port
+            // (which returns the device to address 0 and clears its endpoint state, toggles
+            // included), re-address it, and re-bind. It touches ONLY that port, so storage and the
+            // NIC on their own ports are undisturbed.
+            //
+            // Bounded and loud: ~3 s of solid errors triggers one attempt, and the attempt reports
+            // its own outcome. If it fails the run restarts, so a permanently absent keyboard costs
+            // one recovery attempt every few seconds and says so, rather than a silent error storm.
+            const XACTERR_STUCK: u32 = 300;
+            if state.xacterr_run >= XACTERR_STUCK {
+                state.xacterr_run = 0;
+                let hub_port = (*ksplt & 0x7F) as u8;
+                let hub_addr = ((*ksplt >> 7) & 0x7F) as u8;
+                let hub_t = chan::Target { addr: hub_addr, mps: 64, low_speed: false };
+                ctx.log_fmt(format_args!(
+                    "dwc2-svc: keyboard endpoint stuck - {} consecutive XACTERR, no data; re-enumerating hub port {}",
+                    XACTERR_STUCK, hub_port));
+                let mut addr = kt.addr; // re-assign the address it already had
+                match hub::enumerate_downstream(&ctx, &m, &d, &hub_t, hub_port, &mut addr) {
+                    Some((_, _, _, ndt, nsplt)) => match hid::bind(&ctx, &m, &d, &ndt, nsplt) {
+                        Some(nk) => {
+                            ctx.log("dwc2-svc: keyboard RECOVERED by re-enumeration");
+                            state = hid::KeyState::new(&ctx); // toggles and repeat start clean
+                            kbd = Some((nk, ndt, nsplt));
+                        }
+                        None => ctx.log("dwc2-svc: keyboard re-enumerated but did NOT re-bind - input stays dead"),
+                    },
+                    None => ctx.log("dwc2-svc: keyboard port re-enumeration FAILED - input stays dead"),
+                }
+                continue;
+            }
             if hid::poll(&ctx, &m, &d, kt, *ksplt, k, &mut state) {
                 reports = reports.wrapping_add(1);
                 if reports == 1 {

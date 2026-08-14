@@ -254,12 +254,16 @@ pub fn poll(
         if hcint & HCINT_NYET == 0 {
             state.nyet_run = 0; // anything else is the TT answering, so it is not wedged
         }
+        if hcint & HCINT_XACTERR == 0 {
+            state.xacterr_run = 0; // any non-error outcome means the endpoint is still transacting
+        }
         if hcint == 0 {
             state.n_silent = state.n_silent.wrapping_add(1);
         } else if hcint & HCINT_STALL != 0 {
             state.n_stall = state.n_stall.wrapping_add(1);
         } else if hcint & HCINT_XACTERR != 0 {
             state.n_xacterr = state.n_xacterr.wrapping_add(1);
+            state.xacterr_run = state.xacterr_run.wrapping_add(1);
         } else if hcint & HCINT_NAK != 0 {
             state.n_nak = state.n_nak.wrapping_add(1);
         } else if hcint & HCINT_XFERCOMPL != 0 {
@@ -458,6 +462,10 @@ pub struct KeyState {
     /// answers NYET to every complete-split forever, so this is the counter that distinguishes "the
     /// TT is briefly busy", which is ordinary, from "the TT will never answer again", which is not.
     pub nyet_run: u32,
+    /// Consecutive transaction errors with no data in between. XACTERR is CRC, timeout, bit-stuff or
+    /// a data-toggle mismatch; one is ordinary noise, an unbroken run means the endpoint is in a
+    /// state no further transfers will leave.
+    pub xacterr_run: u32,
 }
 
 impl KeyState {
@@ -475,7 +483,7 @@ impl KeyState {
             emitted_report: 0,
             last_data: 0,
             n_data: 0, n_nak: 0, n_nyet: 0, n_stall: 0, n_xacterr: 0, n_silent: 0,
-            n_other: 0, last_other: 0, nyet_run: 0,
+            n_other: 0, last_other: 0, nyet_run: 0, xacterr_run: 0,
             // ~1.5 s. Long enough that a deliberate hold keeps repeating through the initial 600 ms
             // delay and well beyond, short enough that a broken poll path stops within a couple of
             // characters instead of running to the next keypress.
