@@ -406,6 +406,7 @@ NET_DEVICE         = 10
 GPIO_DEVICE        = 11
 USB_DISK           = 12
 SET_CLOCK          = 13
+FIRE_IRQ           = 14
 
 
 [kernel.arch_roles]
@@ -516,6 +517,7 @@ Call                     = 41
 NetFrameTx               = 42
 NetFrameRx               = 43
 NetInfo                  = 44
+FireIrq                  = 51
 Gpio                     = 45
 UsbDiskInfo              = 46
 UsbDiskRead              = 47

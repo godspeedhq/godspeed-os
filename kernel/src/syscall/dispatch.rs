@@ -67,6 +67,7 @@ pub enum SyscallNumber {
     NetFrameTx             = 42,
     NetFrameRx             = 43,
     NetInfo                = 44,
+    FireIrq                = 51,
     Gpio                   = 45,
     UsbDiskInfo            = 46,
     UsbDiskRead            = 47,
@@ -100,6 +101,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::NetFrameTx     as u64 => handle_net_frame_tx(arg0, arg1),
         n if n == SyscallNumber::NetFrameRx     as u64 => handle_net_frame_rx(arg0, arg1),
         n if n == SyscallNumber::NetInfo        as u64 => handle_net_info(arg0),
+        n if n == SyscallNumber::FireIrq        as u64 => handle_fire_irq(arg0),
         n if n == SyscallNumber::Gpio           as u64 => handle_gpio(arg0, arg1),
         n if n == SyscallNumber::UsbDiskInfo    as u64 => handle_usb_disk_info(),
         n if n == SyscallNumber::UsbDiskRead    as u64 => handle_usb_disk_read(arg0, arg1),
@@ -1801,6 +1803,22 @@ fn handle_console_push(cap_slot: u64, byte: u64) -> i64 {
 /// closing the ambient-authority gap this syscall used to have. Validated by holdings (no arguments →
 /// no slot to pass, same form as `kill`/8). Logs to serial before resetting so the operator sees
 /// confirmation before the line goes silent.
+/// FireIrq (51): inject a test interrupt on `irq`. Gated by FIRE_IRQ, held only by the control service.
+///
+/// Exists so the COM2 command interpreter can leave the kernel (C1-6): `KILL` and `RESTART` were always
+/// expressible as SERVICE_CONTROL + SPAWN, but this one had no capability, so the module could not move.
+/// Naming the authority is more honest than leaving it unnamed inside ring 0.
+fn handle_fire_irq(irq: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::FIRE_IRQ_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    if irq > u8::MAX as u64 {
+        return -1;
+    }
+    crate::arch::imp::interrupts::fire_test_irq(irq as u8);
+    0
+}
+
 fn handle_reboot() -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::REBOOT_RESOURCE, Rights::WRITE) {
         return cap_err_to_i64(CapError::CapNotHeld);
