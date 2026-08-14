@@ -869,7 +869,9 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "net-stack" => Some(("net-stack", ServiceConfig {
             elf:               include_bytes!(env!("SVC_NET_STACK_ELF")),
             has_recv_endpoint: true,               // nic-driver replies frames here (per-request reply cap)
-            send_peers:        &["nic-driver"],    // the frame interface; reacquired by name on death
+            // `time` (clock slice 2): SNTP is a network fact this service fetches; whether to BELIEVE it
+            // is the clock's policy, so the reading is handed over rather than written to a syscall.
+            send_peers:        &["nic-driver", "time"],    // the frame interface; reacquired by name on death
             send_peers_grant:  false,
             // ARM: co-locate with nic-driver on core 0 (avoids QEMU-TCG cross-core IPC latency). x86: core 1.
             preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
@@ -3351,7 +3353,8 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             //
             // It also gives a useful answer when `fs` is dead: "disk present, filesystem
             // unavailable" instead of nothing at all (§26.7).
-            send_peers:        &["fs", "block-driver"],
+            // `time` (clock slice 2): the wall clock is a service, so `date` and the boot floor ask it.
+            send_peers:        &["fs", "block-driver", "time"],
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,

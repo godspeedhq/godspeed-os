@@ -382,9 +382,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             clock_gaveup = true;
             ctx.log("shell: no network clock after 30s - blocking on input again (the floor stays unrecorded)");
         }
-        if !clock_floor_recorded && ctx.clock_source() == ClockSource::Ntp {
+        if !clock_floor_recorded && time_source(ctx) == ClockSource::Ntp {
             clock_floor_recorded = true;
-            if let Some(f) = ctx.clock_floor() {
+            if let Some(f) = time_floor(ctx) {
                 if (0..=u32::MAX as i64).contains(&f) {
                     // NOT quiet. `quiet` is right for the reboot path, where the machine is resetting
                     // and a failed floor is not worth an operator's attention. Here it suppressed both
@@ -4709,7 +4709,7 @@ fn cmd_reboot(ctx: &ShellCtx) -> ! {
     // power cycle: net-stack sets the clock but holds no filesystem authority, and the shell does - so a
     // deliberate reboot is the natural explicit moment to write it. Quiet + bounded: the machine is about
     // to reset, so a missing filesystem must not delay or clutter the shutdown.
-    if let Some(f) = ctx.clock_floor() {
+    if let Some(f) = time_floor(ctx) {
         if (0..=u32::MAX as i64).contains(&f) { clock_floor_persist(ctx, f as u32, true); }
     }
     ctx.console_writeln("rebooting...");
@@ -4926,7 +4926,7 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         // fall through to display the freshly-set time
     }
     let dt = ctx.datetime();
-    let source = ctx.clock_source();
+    let source = time_source(ctx);
     if arg == "epoch" {
         // Raw fact, pipeable (conventions rule 7): the number only, no provenance decoration.
         out.line_fmt(ctx, format_args!("{}", dt.epoch_secs()));
@@ -4935,7 +4935,7 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     if source == ClockSource::Unset {
         // Say we do not know, rather than printing a number we cannot stand behind. If a floor was
         // recorded, report it AS A FLOOR - "we ran at least this late" is true; "it is now that" is not.
-        match ctx.clock_floor() {
+        match time_floor(ctx) {
             Some(f) => {
                 let fd = Datetime::from_epoch_secs(f);
                 out.line_fmt(ctx, format_args!(
@@ -8122,6 +8122,41 @@ fn resolve_or_err<'a>(ctx: &ServiceContext, cwd: &Cwd, input: &str, out: &'a mut
 /// a zero byte can only be an untagged sender - a mismatch that fails loudly rather than aliasing a real
 /// tag. Wrapping is harmless: correlation only needs to distinguish requests that can be in flight at the
 /// same time, and there are at most a handful.
+/// Ask the `time` service a question. One reacquire-and-retry, for the reason `block-driver` learned
+/// in arm32 slice 3c: `find_send_slot` does not resolve a name, so a peer that restarted - or that
+/// started after us - is unreachable until we ask again, and `request_with_reply` returns None
+/// INSTANTLY when the slot was never wired. That reads as "the clock is broken" rather than "we never
+/// looked it up", which is the kind of silence this system forbids.
+fn time_rpc(ctx: &ShellCtx, body: &[u8]) -> Option<Message> {
+    if let Some(r) = ctx.request_with_reply("time", &Message::from_bytes(body)) { return Some(r); }
+    let _ = ctx.reacquire_by_name("time");
+    ctx.request_with_reply("time", &Message::from_bytes(body))
+}
+
+/// Where the current wall-clock reading came from, per the `time` service (clock slice 2).
+fn time_source(ctx: &ShellCtx) -> ClockSource {
+    match time_rpc(ctx, &[1]) {   // OP_NOW -> [ok, epoch(8), source]
+        Some(r) => {
+            let p = r.payload_bytes();
+            if p.len() < 10 || p[0] == 0 { return ClockSource::Unset; }
+            match p[9] { 1 => ClockSource::Rtc, 2 => ClockSource::Ntp, _ => ClockSource::Unset }
+        }
+        None => ClockSource::Unset,
+    }
+}
+
+/// The clock's floor, per the `time` service (clock slice 2). `None` if it could not be asked - an
+/// unanswered question is not the same as a floor of zero, and conflating them would let a failed
+/// lookup silently authorise a time before the last boot.
+fn time_floor(ctx: &ShellCtx) -> Option<i64> {
+    let r = time_rpc(ctx, &[3])?;   // OP_FLOOR_GET -> [ok, floor(8)]
+    let p = r.payload_bytes();
+    if p.len() < 9 || p[0] == 0 { return None; }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&p[1..9]);
+    Some(i64::from_le_bytes(b))
+}
+
 fn next_fs_tag(ctx: &ShellCtx) -> u8 {
     // C6-1: this counter used to be `static FS_TAG: AtomicU8` - unowned global mutable state
     // (Invariant 9) wearing a thread-safe type. Nothing here is concurrent; the shell is one task on

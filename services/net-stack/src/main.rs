@@ -504,7 +504,25 @@ fn sntp_sync(ctx: &ServiceContext, st: &NetState) -> Option<u32> {
     // The kernel can REFUSE this (no SET_CLOCK cap - e.g. on x86, where the CMOS RTC is the authority and
     // nothing is granted the cap). Reporting "wall clock set" after a refusal would be a privileged
     // operation the kernel denied, announced to the operator as done (§26.7, invariant 12).
-    if !ctx.set_wall_clock(u) {
+    // Clock slice 2: the wall clock belongs to the `time` service now, not to a kernel syscall.
+    // SNTP is a NETWORK fact, so net-stack fetches it; deciding whether to believe it - plausibility,
+    // the floor, provenance - is the clock's own policy, and it says no by replying 0.
+    let mut req = [0u8; 9];
+    req[0] = 2; // OP_SET
+    req[1..9].copy_from_slice(&(u as i64).to_le_bytes());
+    let accepted = match ctx.request_with_reply("time", &Message::from_bytes(&req)) {
+        Some(r) => { let p = r.payload_bytes(); !p.is_empty() && p[0] != 0 }
+        None => {
+            // Reacquire once: `find_send_slot` does not resolve a name, so a peer that restarted (or
+            // started after us) is unreachable until we ask again. Learned the hard way in arm32 3c.
+            let _ = ctx.reacquire_by_name("time");
+            match ctx.request_with_reply("time", &Message::from_bytes(&req)) {
+                Some(r) => { let p = r.payload_bytes(); !p.is_empty() && p[0] != 0 }
+                None => false,
+            }
+        }
+    };
+    if !accepted {
         ctx.log("net-stack: SNTP - clock set REFUSED by the kernel (no SET_CLOCK cap) - clock unchanged");
         return None;
     }
