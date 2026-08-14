@@ -121,6 +121,90 @@ def matches_line(ln, rx, sk):
 # Commandment I - thou shalt not expand the responsibilities of the kernel
 # --------------------------------------------------------------------------------------------------
 
+def check_managed_watched(check, pins):
+    """Every service the supervisor MANAGES must be watched for death AND counted when it restarts.
+
+    THREE lists describe one fact - "these services must recover from their own death, visibly":
+    the supervisor's MANAGED list (the slow reconcile sweep), the kernel's death-notification set
+    (immediate respawn), and the kernel's restart-COUNTER set (what `observe` reports). When they
+    disagree, the loser still comes back on the next sweep, so nothing is dead forever and nothing
+    looks broken - and if it is missing from the counter too, the only view an operator has of recovery
+    reports that nothing ever happened.
+
+    Hardware showed both halves at once. A 100-round storm killed `time` 41 times and `control` 47,
+    emitted not one "died, restarting", and `observe` showed ZERO restarts for both.
+
+    Derived from all three sources: nothing to declare, nothing to keep in step by hand. The reverse
+    direction is deliberately NOT an error - the kernel sets may name services that exist in only one
+    build (`counter`, `dwc2`, `supervisor`), and naming an absent service costs nothing.
+    """
+    sup = pins.get("_managed_src")
+    if sup is None:
+        sup = read(os.path.join(ROOT, "services/supervisor/src/main.rs"))
+    ker = pins.get("_notify_src")
+    if ker is None:
+        ker = read(os.path.join(ROOT, "kernel/src/task/scheduler.rs"))
+
+    # Strip line comments FIRST. A prose semicolon inside the MANAGED array truncated this parse and
+    # returned a plausible short list rather than failing - the exact shape this check exists to catch.
+    decomment = lambda s: re.sub(r"//[^\n]*", "", s)
+    sup_code, ker_code = decomment(sup), decomment(ker)
+
+    m = re.search(r"const MANAGED:\s*\[&str;[^\]]*\]\s*=\s*\[(.*?)\]\s*;", sup_code, re.S)
+    if not m:
+        return [Violation("services/supervisor/src/main.rs", 0,
+                          "cannot find `const MANAGED`: the managed set cannot be derived, and a "
+                          "derivation that cannot be performed is a FAILURE, never a pass")]
+    managed = re.findall(r'"([a-z0-9-]+)"', m.group(1))
+    if not managed:
+        return [Violation("services/supervisor/src/main.rs", 0,
+                          "`const MANAGED` parsed EMPTY - an empty managed set would permit every "
+                          "service to go unwatched, so it fails rather than passing vacuously")]
+
+    # There is more than one `matches!(task_name, ...)` in this file, so identify each by the code it
+    # guards rather than by position. `[^)]*` cannot run past its own block, unlike a lazy `.*?`.
+    spans = list(re.finditer(r"matches!\(task_name,([^)]*)\)", ker_code, re.S))
+    blocks = []
+    for i, mm in enumerate(spans):
+        names = set(re.findall(r'"([a-z0-9-]+)"', mm.group(1)))
+        # The window ENDS at the next block, never runs into it. Reading a fixed 400 chars ahead let
+        # one block claim the marker belonging to the next one whenever the two sat close together -
+        # true in the probe corpus, false in the real file, so the check passed while broken.
+        stop = spans[i + 1].start() if i + 1 < len(spans) else len(ker_code)
+        blocks.append((names, ker_code[mm.end():min(stop, mm.end() + 400)]))
+
+    def find(marker, human):
+        for names, after in blocks:
+            if marker in after:
+                return names, None
+        return None, Violation("kernel/src/task/scheduler.rs", 0,
+                               f"cannot find the {human} set (no `matches!(task_name, ...)` guarding "
+                               f"`{marker}`): it cannot be derived, and that is a FAILURE, never a pass")
+
+    notified, e1 = find("ipc::names::lookup", "death-notification")
+    counted, e2 = find("bump_name_restart", "restart-counter")
+    if e1 or e2:
+        return [e for e in (e1, e2) if e]
+    if not notified or not counted:
+        return [Violation("kernel/src/task/scheduler.rs", 0,
+                          "a kernel service set parsed EMPTY - that would mean nothing is watched or "
+                          "nothing is counted, so it fails rather than passing vacuously")]
+
+    out = []
+    for name in managed:
+        if name not in notified:
+            out.append(Violation("kernel/src/task/scheduler.rs", 0,
+                                 f"'{name}' is MANAGED by the supervisor but is NOT in the kernel's "
+                                 f"death-notification set, so its own death never reaches the "
+                                 f"supervisor. It still returns on the next reconcile sweep, which is "
+                                 f"why this hides: not dead forever, just dead for a while."))
+        if name not in counted:
+            out.append(Violation("kernel/src/task/scheduler.rs", 0,
+                                 f"'{name}' is MANAGED but is NOT in the restart-counter set, so a "
+                                 f"restart is never recorded and `observe` reports 0 for a service "
+                                 f"that died. Recovery that is not counted cannot be observed."))
+    return out
+
 def check_syscall_surface(check, pins):
     """The syscall table is the kernel's authority surface, so pin it by name AND number.
 
@@ -751,6 +835,59 @@ CHECKS = [
                   pins={"_src": 'fn is_transient(name: &str) -> bool {\n    name == "chaos"\n}\n'}, expect=True),
              dict(why="an unfindable is_transient must fail, not pass vacuously",
                   pins={"_src": 'fn go() { ctx.spawn("mem-pressure"); }\n'}, expect=True),
+         ]),
+    dict(nature="rule", id="V-managed-watched", commandment="V",
+         title="a managed service must be watched for its own death",
+         kind="custom", fn=check_managed_watched,
+         scope="supervisor MANAGED vs the kernel's death-notification matches!",
+         proves="no service the supervisor manages depends on a slow reconcile sweep to come back "
+                "from its own death",
+         does_not_prove="that the supervisor MANAGES everything it should - a service in neither list "
+                        "is invisible to this check, which is how `dwc2` hid (C5-1)",
+         probes=[
+             dict(why="a managed service missing from the notify set must be caught",
+                  pins={"_managed_src": 'const MANAGED: [&str; 2] = ["fs", "time"];',
+                        "_notify_src": 'matches!(task_name, "fs") { ipc::names::lookup(x) } '
+                                       'matches!(task_name, "fs" | "time") { bump_name_restart(n) }'},
+                  expect=True),
+             dict(why="a managed service missing from the restart COUNTER must be caught too",
+                  pins={"_managed_src": 'const MANAGED: [&str; 2] = ["fs", "time"];',
+                        "_notify_src": 'matches!(task_name, "fs" | "time") { ipc::names::lookup(x) } '
+                                       'matches!(task_name, "fs") { bump_name_restart(n) }'},
+                  expect=True),
+             dict(why="a SEMICOLON inside a comment in the array must not truncate the parse - it did, "
+                      "and the two names it dropped were the two under test",
+                  pins={"_managed_src": 'const MANAGED: [&str; 2] =\n    ["fs",\n     // owns the clock; '
+                                        'and the channel\n     "time"];',
+                        "_notify_src": 'matches!(task_name, "fs") { ipc::names::lookup(x) } '
+                                       'matches!(task_name, "fs") { bump_name_restart(n) }'},
+                  expect=True),
+             dict(why="the FIRST matches! in the file is a different gate - picking it by position "
+                      "reads the wrong set, which is how this check first passed while broken",
+                  pins={"_managed_src": 'const MANAGED: [&str; 1] = ["time"];',
+                        "_notify_src": 'matches!(task_name, "time") { bump_name_restart(n) } '
+                                       'matches!(task_name, "fs") { ipc::names::lookup(x) }'},
+                  expect=True),
+             dict(why="a fully-watched, fully-counted managed set must pass",
+                  pins={"_managed_src": 'const MANAGED: [&str; 2] = ["fs", "time"];',
+                        "_notify_src": 'matches!(task_name, "fs" | "time") { ipc::names::lookup(x) } '
+                                       'matches!(task_name, "fs" | "time") { bump_name_restart(n) }'},
+                  expect=False),
+             dict(why="an extra name in a kernel set is NOT an error (build-specific services)",
+                  pins={"_managed_src": 'const MANAGED: [&str; 1] = ["fs"];',
+                        "_notify_src": 'matches!(task_name, "fs" | "counter") { ipc::names::lookup(x) } '
+                                       'matches!(task_name, "fs" | "dwc2") { bump_name_restart(n) }'},
+                  expect=False),
+             dict(why="an unfindable MANAGED must fail, not pass vacuously",
+                  pins={"_managed_src": 'fn main() {}',
+                        "_notify_src": 'matches!(task_name, "fs") { ipc::names::lookup(x) } '
+                                       'matches!(task_name, "fs") { bump_name_restart(n) }'},
+                  expect=True),
+             dict(why="an unfindable notify set must fail, not pass vacuously",
+                  pins={"_managed_src": 'const MANAGED: [&str; 1] = ["fs"];',
+                        "_notify_src": 'fn schedule() {}'}, expect=True),
+             dict(why="the real tree must pass",
+                  pins={}, expect=False),
          ]),
     dict(nature="rule", id="V-no-panic", commandment="V", title="no service may halt the machine",
          kind="source", dirs=["services"],

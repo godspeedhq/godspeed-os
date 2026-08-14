@@ -1967,9 +1967,13 @@ pub fn kill_task_by_slot(slot: usize) {
         // restart when it dies + gets respawned. A transient utility the shell re-invokes (observe-*,
         // greet, ...) is never bumped, so it never shows a restart - RESTARTS means "blew up and was
         // recovered", not "legitimately closed". The respawn reads the new count via next_restart_count.
+        // `time` and `control` were missing here too, which is the SECOND half of the same hardware
+        // symptom: even once their deaths notify the supervisor, a name absent from THIS set never
+        // accrues a restart, so `observe` reports 0 for a service that died 41 times. The operator's
+        // only view of recovery said nothing happened.
         if matches!(task_name,
             "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "supervisor" | "counter"
-            | "nic-driver" | "net-stack" | "dwc2")
+            | "nic-driver" | "net-stack" | "dwc2" | "time" | "control")
         {
             bump_name_restart(task_name);
         }
@@ -1994,8 +1998,20 @@ pub fn kill_task_by_slot(slot: usize) {
         // until reboot: a service made special by omission rather than by decision, which is the version
         // of that violation nobody argues for and everybody ships. It is arm-only, so on other ports the
         // name simply never appears here (the same shape as `counter`, which exists in one build).
+        // `time` and `control` were MISSING here for exactly as long as they existed - the same
+        // omission as `dwc2` above, committed in the same session that wrote the comment warning about
+        // it. Hardware showed it plainly: a 100-round storm killed `time` 41 times and `control` 47,
+        // and not one line said "died, restarting". They came back only when the supervisor's periodic
+        // reconcile noticed ("missed death notification"), so between the kill and that sweep the wall
+        // clock and the operator channel were simply gone - and `observe` reported ZERO restarts for
+        // both, because the counter tracks the notification path. A service that recovers by luck reads
+        // as a service that never fell over.
+        //
+        // The rule is now DERIVED and enforced (`V-managed-watched`): every name the supervisor manages
+        // must appear here. Two lists describing one fact is the shape that caused this, and it is the
+        // third time this session (ARM_SERVICES vs arm_built was the second).
         if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "counter"
-            | "nic-driver" | "net-stack" | "dwc2") {
+            | "nic-driver" | "net-stack" | "dwc2" | "time" | "control") {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),
