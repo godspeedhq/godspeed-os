@@ -337,9 +337,26 @@ emulation the shell drives.
 The evidence that the boundary is already misplaced: `dims_packed` is exposed through `InspectKernel`
 query 9, so the shell asks the KERNEL for its console geometry. That is a service's question.
 
-Sliced the same way `time` was: (1) a `console` service owning the emulator, rendering through the
-kernel's existing byte path; (2) the shell talks to it instead of to console syscalls; (3) the kernel
-keeps a minimal panic blit and the rest is deleted, including query 9.
+**Measured boundary (2026-08-14).** 1,172 lines: `mod.rs` 806, `render.rs` 366. The kernel's OWN use is
+narrow - `init`, `ready`, `put_byte`, `put_bytes`, `clear_and_home`, `mirror`, `FbParams`, `fb_commit`.
+Everything else is emulation reached THROUGH `put_byte`: `process_byte` -> `handle_csi` / `execute_csi`,
+attributes, `erase_line_*`, `blank_block`, the shadow grid, scroll.
+
+That internal coupling is why there is no cheap first slice. Stripping CSI handling out of the kernel
+leaves the shell's colours and cursor moves going nowhere, so the service must take over rendering
+ENTIRELY: it needs the framebuffer as an MMIO grant, and the kernel keeps a SEPARATE minimal blit for
+its own boot and panic output. That separation is the point rather than an inconvenience - a panic must
+print without asking anyone, and the emulator must not be in the panic path.
+
+Sliced the same way `time` and `control` were:
+
+1. A `console` service holding the framebuffer MMIO, owning the emulator and the grid.
+2. The shell renders through it instead of the kernel console syscalls.
+3. The kernel keeps a minimal panic/boot blit; `fbcon/`'s emulator, the shadow grid and query 9
+   (`dims_packed` - the shell asking the KERNEL for console geometry) are deleted.
+
+Expect this to shrink the pinned surfaces again, as `time` did: one fewer introspection query, and most
+of 1,172 lines out of ring 0.
 
 **`clock.rs` + `wallclock.rs` - the `clock` SERVICE. Sliced, in progress.**
 
