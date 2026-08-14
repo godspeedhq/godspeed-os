@@ -256,30 +256,52 @@ ISOLATION reporting - it surfaces a confined device's DMA escaping its arena (H1
 business sharing a lifetime with a debug channel; it now runs on its own in the scheduler's core-0 tick,
 so gating the channel cannot silently take fault reporting with it. **Done.**
 
-**RESOLVED by amendment (2026-08-14), and the analysis reversed my own recommendation.** I proposed
-making the channel a SERVICE, the same move that took USB out of the kernel. Measuring it says it cannot
-be one, and Commandment II is the reason: nothing escapes Chaos, so `chaos max-carnage` would kill a
-control service mid-storm and the harness would lose the channel it was driving the test through - §22
-Test 15 kills the *supervisor* through this channel and then watches the kernel respawn it. Excluding it
-from Chaos would violate II instead.
+**AMENDMENT WRITTEN, THEN REVERTED THE SAME DAY. The revert is the finding.**
 
-The channel's whole value is being OUT-OF-BAND: it must work precisely when every service is dead, so it
-can only live in the one thing that cannot die. That is the same argument that makes the kernel the
-recovery anchor for the supervisor, applied to the operator's channel - which is why the amendment reads
-as a consequence of the existing law rather than an exception to it.
+I amended §4.4 to sanction the channel in the kernel, arguing it must be there because Chaos would kill
+a control SERVICE mid-test. The user's response - "fbcon is not special, only the kernel is special; I
+really don't want to continue adding exceptions to the kernel" - applied the same standard to my own
+amendment, and it did not survive:
 
-`control.rs` now declares the sanctioned support role `operator-control`, citing that amendment, and the
-check passes. Left as-is deliberately: `FIRE_IRQ` is not gated behind a test feature, because anyone who
-can reach COM2 can already `KILL` any service - the channel IS the authority, and hardening one of three
-commands against the other two would be theatre. Said plainly in the amendment instead.
+* A control service would be in the supervisor's WATCHED SET, so Chaos killing it means it comes back
+  like every other service. The recovery chain still terminates at the kernel, which is the actual
+  anchor. My argument assumed a service dies permanently, which C5-1 had just finished making untrue.
+* The genuine chicken-and-egg is far narrower than the module: **reading bytes off COM2**. That is a
+  UART, and §11.4 already sanctions the kernel owning a serial console. Reading bytes is not developer
+  tooling.
+* **Interpreting** those bytes as `KILL` / `RESTART` is policy, and is precisely what `SERVICE_CONTROL`
+  and `SPAWN` exist for. There is no chicken-and-egg there at all.
+* `FIRE_IRQ` is the only genuinely kernel-bound piece, and it is a test hook - the weakest possible
+  justification for ring-0 residency.
 
-Superseded, kept for the record - the original framing was: Feature-gating does not
-close the finding, because the check reads SOURCE and not `cfg` - the same lesson C1-1 taught. Deleting
-it breaks the identity suite, which drives the OS through that channel (§22.3). So the options are an
-AMENDMENT sanctioning a kernel-side test-control channel (§4.4 forbids "developer tooling" by name,
-while §17 and §22 both assume the harness can drive a running system), or making the control channel a
-SERVICE holding COM2 and SERVICE_CONTROL - the same move that took USB out of the kernel, and
-architecturally the right one.
+I reached for an amendment because it was cheaper than the refactor, and then presented it as a
+principle. The tell, in hindsight: the amendment argued from what would be INCONVENIENT (a flaky test
+channel) rather than from what is IMPOSSIBLE. Only impossibility earns kernel residency - that is what
+makes the supervisor spawn legitimate, and the bar the control channel did not clear.
+
+**The kernel spawns the supervisor. That is the exception, and it should stay the only one.**
+
+### The corrected shape, for BOTH control.rs and fbcon
+
+They are the same finding twice, and the same answer twice: **the kernel keeps the transport it already
+owns; the interpreter becomes a service.**
+
+| Module | Kernel keeps | Service takes |
+|--------|--------------|---------------|
+| `control.rs` | COM2 byte transport (§11.4 serial console) | `KILL` / `RESTART` interpretation, via SERVICE_CONTROL + SPAWN |
+| `fbcon/` | a minimal panic/boot byte-blit - a panic cannot ask a service for help | the ANSI/CSI terminal emulator: `handle_csi`, attributes, erase-line, scroll, the shadow grid |
+
+`fbcon` earns nothing more than that: it is 1,172 lines of TERMINAL EMULATION, and the shell drives all
+of it. The evidence that the boundary is already in the wrong place is that `dims_packed` is exposed to
+userspace through `InspectKernel` query 9 - the shell asks the KERNEL for its console geometry, which is
+a service's question.
+
+The dependants must be fault-tolerant rather than protected: a control service that dies is respawned,
+and the harness retries. That is the same discipline demanded of every other client (§14.3), and
+exempting the test harness from it would be assuming the harness is special.
+
+Both are real work, the same shape as taking USB out of the kernel - and the third instance of that
+shape in this audit, with C1-5's 218 service configs and C4-1's by-name grants.
 
 **`clock.rs` + `wallclock.rs` - a time SERVICE, planned.** Not open questions: they close when that
 service exists. `wallclock.rs` is the one that most wants to leave, holding provenance and floor policy.

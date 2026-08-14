@@ -195,37 +195,6 @@ These are the laws that bound every design choice. Any change that violates an i
 
 The kernel does **not** contain filesystem logic, network stack, drivers (beyond minimal arch boot), logging infrastructure, application logic, developer tooling, work-stealing scheduler, service migration, or load balancing.
 
-> **Amendment 2026-08-14 (C1-6): the OPERATOR CONTROL CHANNEL is in the kernel, and must be.**
-> "Developer tooling" above is unqualified, and a 123-line COM2 command channel (`kernel/src/control.rs`)
-> has always sat inside the kernel against it, while §17 defines `osdev restart <service>` as a supported
-> workflow and §22.3 builds the whole test suite on a harness that drives a *running* system. The
-> constitution described one thing and the kernel did another; this amendment settles which is right.
->
-> **It cannot be a service, and the reason is Commandment II.** Nothing escapes Chaos: `chaos
-> max-carnage` sweeps the live task table and kills everything that is not chaos's own apparatus. A
-> control *service* would therefore be killed by the very storms it exists to drive, and the harness
-> would lose its channel mid-test - §22 Test 15 kills the *supervisor* through this channel and then
-> watches the kernel respawn it. Excluding a control service from Chaos would violate Commandment II
-> instead. The channel's whole value is being **out-of-band**: it must work precisely when every service
-> is dead, so it can only live in the one thing that cannot die. This is the same argument that makes
-> the kernel the recovery anchor for the supervisor (§6.2), applied to the operator's channel.
->
-> **Bounded, and the bound is the point.** It accepts exactly three commands - `KILL`, `RESTART`,
-> `FIRE_IRQ` - and does no interpretation beyond dispatching them to `task::kill_by_name` /
-> `task::spawn_service_by_name`. It is mechanism, not policy (§26.10): it decides nothing about *which*
-> service should be restarted or when, and holds no state beyond one line buffer. It is not a shell, it
-> gains no commands as a convenience, and any addition needs this amendment revisited.
->
-> **The channel IS an authority, and physical access is the whole of its access control.** Anyone who can
-> reach COM2 can kill any service, so there is no point hardening one of the three commands against the
-> other two - `FIRE_IRQ` is not a larger hole than `KILL`, and gating it alone would be theatre. The
-> honest statement is that this is an operator channel guarded by the machine's physical boundary, the
-> same way a serial console always has been. A deployment that cannot accept that should not expose
-> COM2.
->
-> What it does NOT sanction: logging infrastructure, a second console, or any other "developer tooling"
-> in the kernel. The exception is this channel, at this size, for this reason.
-
 > **Amendment 2026-06-18 (P2, file-as-capability): delegated resource capabilities do not add
 > file logic to the kernel.** The kernel gains the ability to mint, route, and revoke capabilities
 > for resources whose *meaning is defined by a service* (§7.10). It still contains **no filesystem

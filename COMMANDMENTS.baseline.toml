@@ -358,11 +358,6 @@ syscall-entry    = "§8.2 - the entry to the six, not a seventh"
 boot-entry       = "§11 bootstrap"
 kernel-log-floor = "§11.4 - the 16 KiB ring buffer + serial console, explicitly sanctioned"
 invariants       = "§3, §22 - the kernel checking its own invariants"
-# The out-of-band operator/test channel. NOT general developer tooling: it must survive every service
-# dying, which is why it cannot be a service (Commandment II would have Chaos kill it mid-test), and it
-# is bounded to three commands that dispatch and interpret nothing. See the amendment for the full
-# reasoning and for what it explicitly does not sanction.
-operator-control = "§4.4 amendment 2026-08-14 (C1-6) - the channel that must work when every service is dead"
 
 # Which of the above each top-level module serves. A module that can claim NEITHER a responsibility nor
 # a sanctioned support role is a seventh responsibility, whatever its size - which is exactly how one
@@ -371,7 +366,6 @@ operator-control = "§4.4 amendment 2026-08-14 (C1-6) - the channel that must wo
 [kernel.module_responsibility]
 "arch"          = "arch-layer"
 "capability"    = "capability-enforcement"
-"control.rs"    = "operator-control"
 "elf_flags.rs"  = "scheduling"
 "interrupt"     = "interrupt-routing"
 "invariants"    = "invariants"
