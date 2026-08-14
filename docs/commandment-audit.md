@@ -773,6 +773,32 @@ second half - one piece of machinery). It is the only thing that would have caug
 and no static check will ever reach them. `--report` lists each and why it is not mechanised, so the gap shows on every build
 rather than only here.
 
+## Open, found on hardware after the fact
+
+**F1 - a freed introspection slot was REUSED while stale readers survived.** Clock slice 3 deleted
+syscall 50 and queries 21/22; slot 21 was then reused for `com2_byte`. Three readers were not
+converted, and none of them failed loudly: `set_clock_floor` called the deleted syscall and reported
+"the kernel refused" (it did not - nothing was there), net-stack read the raw RTC and told the operator
+to check the cable while the clock sat correctly set, and `clock_synced_secs_ago` read slot 21 and so
+POPPED A BYTE off the operator channel - from inside the `date` display path. That one did not fail, it
+corrupted, and it corrupted the channel the identity harness drives `control` through. Fixed
+(`3c805398`); recorded because the CLASS is not mechanised. `integrity-baseline` pins query NUMBERS, so
+a slot that changes MEANING while keeping its number is invisible to it. The cheap fix is to pin
+`introspect_queries` as name-to-number rather than a bare number list, so reuse reads as a rename in the
+diff and has to be argued for.
+
+**F2 - `fs` stack-overflows in a restart storm when storage is absent (QEMU, not hardware).** With no
+USB stick, `block-driver` serves 0 sectors and `fs` dies repeatedly. Measured A/B: pre-slice-5
+(`f06d5853`) 0 data aborts and 112 restarts; post-slice-5 1000+ data aborts. The faults are below
+`USER_STACK_TOP - 64 pages` with a pc past the image's `_end`, which is a blown user stack and a
+clobbered return address, not a wild pointer. `struct Fs` is small scalars, so it is not the obvious
+by-value culprit; NOT root-caused. Hardware is unaffected because the stick is present (`fs: storage
+recovered - re-mounted GSFS0008`), which is exactly why it went unseen. Two things are wrong here and
+only one is new: slice 5 changed the death SHAPE (clean death to memory fault), but `fs` storming rather
+than coming up degraded predates it - and it has a degraded path it is not reaching. This is the Rule
+Above The Rules in miniature: a missing dependency must return a loud "unavailable", not fault in a
+loop.
+
 Order and reasoning: **IV** next (fold in the existing `contract_check.py` - nearly free, and it has
 already caught a real violation). Then **V's second half with IX**, because they are one machine: the
 runtime dependency matrix, kill each dependency and assert every caller still answers. Highest value
