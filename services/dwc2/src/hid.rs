@@ -277,14 +277,32 @@ pub fn poll(
         // recent. If we have been away longer than that, a release may have come and gone unseen, so
         // the hold is unproven and the right move is to stop rather than to assume. "Wait on truth,
         // not on time" - and the truth here is a fresh answer from the device.
+        // A NAK IS NOT PROOF THAT THE KEY IS STILL DOWN, and treating it as proof is what typed
+        // `daaaaaaaaaaaaaaaaaaaaaaat`. Measured: 391 characters from auto-repeat against 101 from
+        // real reports, so the runaway was this code, not the device retransmitting.
+        //
+        // The device NAKs when nothing changed - and it also NAKs when the split transaction failed.
+        // Those are indistinguishable here, and on this board the second happens constantly: a
+        // requested 125 us sleep returns after 54 ms on average, so the microframe schedule this poll
+        // depends on is missed most of the time. When that happens the RELEASE report is never
+        // fetched, and a repeat anchored on NAK alone runs until the next key is pressed.
+        //
+        // So anchor it on something the device must actually do: TALK TO US. Any decoded report -
+        // press or release - proves the poll path is working right now. While reports keep arriving,
+        // a NAK genuinely means "nothing changed" and repeating is correct. Once they stop, we have
+        // lost the ability to observe a release, so the hold is unprovable and repeating is guessing.
+        //
+        // The cost is honest and bounded: holding a key for longer than this window stops repeating.
+        // That is a small annoyance. Spraying 391 characters is a bug.
         let now = ctx.read_tsc();
         if hcint & crate::regs::HCINT_NAK != 0 {
-            let gap = now.wrapping_sub(state.last_ok);
-            if state.last_ok != 0 && gap > state.stale_after {
-                state.repeat.cancel();
-            } else {
+            let proven = state.last_data != 0
+                && now.wrapping_sub(state.last_data) < state.repeat_window;
+            if proven {
                 let n = &mut state.emitted_repeat;
                 state.repeat.poll(now, |ch| { *n = n.wrapping_add(1); ctx.console_push(ch) });
+            } else if state.repeat.armed() {
+                state.repeat.cancel();
             }
             state.last_ok = now;
         }
@@ -297,6 +315,7 @@ pub fn poll(
     let any = (0..8).any(|i| dma.read8(REPORT_OFF + i) != 0);
     if !any {
         state.pid = chan::pid_from_hctsiz(mmio, chan::CH_KBD);
+        state.last_data = ctx.read_tsc(); // a release report is proof the path works
         let rel = [0u8; 8];
         godspeed_sdk::hid::decode_keyboard(
             &rel, &mut state.last, &mut state.repeat, &mut state.caps,
@@ -320,6 +339,7 @@ pub fn poll(
         rep[i] = dma.read8(REPORT_OFF + i);
     }
     let mut state_emitted = 0u32;
+    state.last_data = ctx.read_tsc(); // a data report is proof the path works
     godspeed_sdk::hid::decode_keyboard(
         &rep,
         &mut state.last,
@@ -353,6 +373,12 @@ pub struct KeyState {
     /// log say which one is running away instead of reasoning about which one probably is.
     pub emitted_repeat: u32,
     pub emitted_report: u32,
+    /// When the endpoint last DELIVERED a report (press or release). Auto-repeat rides on this, not
+    /// on NAKs: a NAK cannot tell "nothing changed" apart from "the transfer failed", and only one of
+    /// those means the key is still down.
+    pub last_data: u64,
+    /// How long a delivered report vouches for the poll path. Derived from this board's timer rate.
+    pub repeat_window: u64,
 }
 
 impl KeyState {
@@ -368,6 +394,11 @@ impl KeyState {
             last_ok: 0,
             emitted_repeat: 0,
             emitted_report: 0,
+            last_data: 0,
+            // ~1.5 s. Long enough that a deliberate hold keeps repeating through the initial 600 ms
+            // delay and well beyond, short enough that a broken poll path stops within a couple of
+            // characters instead of running to the next keypress.
+            repeat_window: (ctx.tsc_ticks_per_10ms() * 150).max(1),
             // ~150 ms: comfortably more than the 10 ms poll period (so ordinary jitter and a busy
             // core do not cancel a legitimate hold) and far less than the 2 s deschedule that loses
             // a release report.
