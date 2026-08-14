@@ -140,6 +140,7 @@ service_configs = [
     "chaos-c6-monitor",
     "chaos-c7",
     "chaos-c7-victim",
+    "control",
     "counter",
     "dwc2",
     "ehci",
@@ -323,7 +324,7 @@ service_configs = [
 # framebuffer dimensions, PCI ids, a hardware random number - and adding one is a new kernel
 # responsibility that changes nothing visible: the syscall count stays exactly where it was.
 # Pins catch addition at the surface they pin, and miss growth inside it.
-introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
 # Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
 # legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
 # before it builds, and classifying one honestly as a device driver fails the build - which is the

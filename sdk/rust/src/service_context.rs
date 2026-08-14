@@ -1014,6 +1014,24 @@ impl ServiceContext {
     /// Return the bytes dynamically allocated by this task so far.
     ///
     /// Wraps InspectKernel query 0. Used by property test P4 (§10.3).
+    /// One byte from the COM2 operator channel, or `None` when the port is empty (kernel query 21).
+    ///
+    /// The kernel owns the UART - hardware, and §11.4 already sanctions it owning a serial console -
+    /// and hands bytes out; the `control` service owns what they MEAN. Transport in the kernel,
+    /// interpretation in a service (C1-6).
+    pub fn com2_byte(&self) -> Option<u8> {
+        // SAFETY: syscall(13) = InspectKernel; query 21 = pop one COM2 byte, -1 when empty.
+        let v = unsafe { raw_syscall(13, 21, 0, 0) };
+        if v < 0 { None } else { Some(v as u8) }
+    }
+
+    /// Inject a test interrupt. Requires the FIRE_IRQ capability, held only by `control`; a non-holder
+    /// gets `false` rather than a silent no-op.
+    pub fn fire_irq(&self, irq: u8) -> bool {
+        // SAFETY: syscall(51) = FireIrq; the kernel validates FIRE_IRQ by holdings.
+        unsafe { raw_syscall(51, irq as u64, 0, 0) == 0 }
+    }
+
     pub fn inspect_kernel_alloc_bytes(&self) -> u64 {
         // SAFETY: syscall(13) = InspectKernel; query_id=0 = task alloc bytes.
         let ret = unsafe { raw_syscall(13, 0, 0, 0) };

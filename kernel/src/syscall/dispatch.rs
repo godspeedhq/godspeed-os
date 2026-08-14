@@ -1409,7 +1409,12 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // the network last set it (0 if never). Ungated task-neutral timing info like the RTC (11) itself.
         // `date` reports this so a displayed time says where it came from - a fallback chain is only
         // mechanism, not magic, while its choice is visible (§26.4/§26.9).
-        // 21 and 22 REMOVED (clock slice 3): the wall clock's provenance, sync age and floor belong to
+        // 21: pop one byte from the COM2 operator channel, -1 when empty. TRANSPORT ONLY - the kernel
+        // owns the UART (§11.4 sanctions it owning a serial console) and hands bytes out; the `control`
+        // SERVICE decides what they mean (C1-6). This is the whole of what replaced a 123-line command
+        // interpreter in ring 0.
+        21 => match crate::arch::imp::com2_try_read_byte() { Some(b) => b as i64, None => -1 },
+        // 22 REMOVED (clock slice 3): the wall clock's provenance, sync age and floor belong to
         // the `time` service now. The kernel still answers 11 (the raw RTC register read, which no
         // service can perform) and 17 (monotonic seconds, which paces deadlines) - transport and
         // scheduling. What it no longer answers is what the reading MEANS.

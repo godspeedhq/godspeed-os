@@ -13,7 +13,7 @@ use crate::arch::imp::context_switch::TaskContext;
 use crate::arch::imp::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE, FIRE_IRQ_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -463,6 +463,7 @@ struct Privileges {
     console_push:    bool, // CONSOLE_PUSH: inject keystrokes into the input ring (USB keyboard drivers)
     introspect:      bool, // INTROSPECT: read another task's / system-wide kernel state (§3.1)
     service_control: bool, // SERVICE_CONTROL: kill/restart other services (§14.4)
+    fire_irq:        bool, // FIRE_IRQ: inject a test interrupt (`control` only - C1-6)
     reboot:          bool, // REBOOT: hardware-reset the machine (shell `reboot` only - SEC-2)
     acquire_any:     bool, // ACQUIRE_ANY: reach ARBITRARY services by name via AcquireSendCap (§3.1)
     net_device:      bool, // NET_DEVICE: move ethernet frames via the in-kernel USB-net bridge (ARM nic-driver)
@@ -476,7 +477,7 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
     Privileges {
         // supervisor is the spawner (init removed, Phase 5); the shell brokers spawns; chaos spawns
         // mem-pressure tasks for max-carnage's spawn-burst dimension; probes spawn victims.
-        spawn: is_probe || matches!(name, "supervisor" | "shell" | "chaos"),
+        spawn: is_probe || matches!(name, "supervisor" | "shell" | "chaos" | "control"),
         // Both USB host drivers push decoded keystrokes: xhci (front ports), ehci (USB 2.0 back ports).
         // `dwc2` is the arm32 USB keyboard driver, so it needs this for the same reason `xhci` and
         // `ehci` do. Its absence was the whole of "the keyboard does not work": the transfers were
@@ -491,14 +492,17 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         console_push: matches!(name, "xhci" | "ehci" | "dwc2"),
         // shell + observe use TaskStat/InspectKernel; supervisor's reconcile loop scans real liveness;
         // chaos does victim selection; the prop-/stress- probes query victim generations.
-        introspect: matches!(name, "shell" | "supervisor" | "chaos")
+        introspect: matches!(name, "shell" | "supervisor" | "chaos" | "control")
             || name.starts_with("observe") || name.starts_with("prop-") || name.starts_with("stress-"),
         // shell (interactive broker), supervisor (restart authority), chaos (the point of max-carnage),
         // and every probe (they kill victims to exercise kill/revocation).
-        service_control: is_probe || matches!(name, "shell" | "supervisor" | "chaos"),
+        service_control: is_probe || matches!(name, "shell" | "supervisor" | "chaos" | "control"),
         // SEC-2: REBOOT lives ONLY with the shell (its `reboot` command); the USB drivers no longer
         // hold it. A keyboard driver can synthesize any keystroke (the console's inherent trust, §6.4),
         // but it must not ALSO be able to hard-reset the machine directly from any context.
+        // FIRE_IRQ: only the control service. It exists so the COM2 command interpreter could leave
+        // the kernel; naming the authority is what made that possible (C1-6).
+        fire_irq: matches!(name, "control"),
         reboot: matches!(name, "shell"),
         // Operator/test instruments that legitimately reach arbitrary services by name: shell (chaos
         // flooding, pipe sinks), supervisor (reconcile-by-name), probes. `adv-a13` is the §22 Test A13
@@ -606,6 +610,19 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         //
         // It needs no hardware grant: it reads the RTC through the introspection query that already
         // exists and serves the result over IPC.
+        // control (services/control): the COM2 operator channel, moved out of the kernel (C1-6). The
+        // kernel keeps the byte read (query 21, transport); this owns the interpretation.
+        "control" => Some(("control", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_CONTROL_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,
+            memory_limit:      8 * 1024 * 1024,   // matches control.toml
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         "time" => Some(("time", ServiceConfig {
             elf:               include_bytes!(env!("SVC_TIME_ELF")),
             has_recv_endpoint: true,
@@ -3736,6 +3753,13 @@ fn spawn_service_with_config(
 
     // REBOOT (§3.1): hardware-reset the machine (`Reboot`/18). WHO holds it is in `service_privileges`;
     // here we only mint it. No other service can hardware-reset the machine.
+    // FIRE_IRQ (C1-6): inject a test interrupt. Held only by `control`, which needs it because the
+    // interrupt-routing identity tests drive IRQ injection over the operator channel.
+    if privs.fire_irq {
+        let fi_cap = mint_cap(FIRE_IRQ_RESOURCE, Rights::WRITE);
+        caps.insert(fi_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
     if privs.reboot {
         let rb_cap = mint_cap(REBOOT_RESOURCE, Rights::WRITE);
         caps.insert(rb_cap)

@@ -1095,10 +1095,6 @@ pub fn run(core_id: u32) -> ! {
                 }
             }
             None => {
-                // Core 0 drains the COM2 control channel when idle (§17).
-                if cid == 0 {
-                    crate::control::process_pending();
-                }
                 // Phase 2a - SLOW THE IDLE TICK (docs/power.md §14). With no ready tasks this core
                 // has nothing to preempt, yet its timer still fires ~100x/s purely to re-arm
                 // itself. Re-arm at ~1 s instead, so it wakes ~1x/s and sleeps deep in between.
@@ -1195,7 +1191,6 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             // reporting, so it runs on its own here rather than inside the COM2 control channel it
             // used to share a function with (C1-6).
             crate::arch::imp::iommu::drain_event_log();
-            crate::control::process_pending();
             crate::arch::imp::uart_rx_poll();
             // Advance the BSP tick clock + wake any task whose recv_timeout deadline elapsed
             // (§12 timed-wait). BSP-driven because the BSP ticks reliably while APs idle; the
@@ -1362,7 +1357,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // (run()'s loop) instead of switching to `next`, so the heavy ~22 ms spawn runs from run()'s
         // loop top with IF=1 - NEVER here in the IF=0 ISR, where it can't ACK other cores' TLB-shootdown
         // / WAKE_RECEIVER IPIs and wedges the box under a storm (the architectural proof; see
-        // scheduler::run + control::process_pending). `next` is left untouched (still Ready), so
+        // scheduler::run). `next` is left untouched (still Ready), so
         // pick_next re-picks it after the respawn. `prev` was set Ready by the CAS above, so it too is
         // rescheduled. This mirrors the is_dead switch above, but saves `prev` (it is live) so it resumes.
         if cid == 0 && crate::task::supervisor_respawn_pending() {
