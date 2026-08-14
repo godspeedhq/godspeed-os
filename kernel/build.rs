@@ -115,6 +115,13 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         // window, a DMA arena and the USB vector, and reports whether the interrupt arrives. Built
         // and embedded unconditionally; whether it SPAWNS is the supervisor's decision.
         "dwc2",
+        // The wall clock (C1-6). REQUIRED on the Pi 2 rather than optional: the board has no
+        // battery-backed RTC, so SNTP is the only way it learns the time, and the `SetClock` syscall
+        // net-stack used to call is deleted. Without this embedded, `date sync` fails silently.
+        "time",
+        // The COM2 operator channel (C1-6). Inert on the Pi, which is driven from its own console, but
+        // embedded so the service set does not differ per arch without a reason.
+        "control",
         // Persistence on the Pi 2: block-driver's ARM backend is the BCM2835 EMMC (SDHCI, PIO); fs is
         // arch-neutral and rides on it. The kernel grants block-driver the EMMC MMIO window at spawn
         // (arch::arm::map_fixed_driver_mmio).

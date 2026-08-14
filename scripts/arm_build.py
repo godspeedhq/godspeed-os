@@ -35,6 +35,14 @@ ARM_SERVICES = [
     "nic-driver", "net-stack",
     # The userspace USB host driver (Phase 2 skeleton) - docs/arm32-usb-userspace.md.
     "dwc2",
+    # The wall clock, moved out of the kernel (C1-6). REQUIRED on the Pi 2, not optional: the board has
+    # no battery-backed RTC, so SNTP is the only way it ever learns the time - and `SetClock` (the
+    # syscall net-stack used to call) is deleted, so without this service `date sync` fails silently.
+    "time",
+    # The COM2 operator channel, moved out of the kernel (C1-6). The Pi is driven from its own console
+    # rather than COM2, so this is inert here - but the kernel embeds a placeholder if it is not built,
+    # and a service that exists on one arch and is a stub on another is exactly the drift worth avoiding.
+    "control",
 ]
 
 
