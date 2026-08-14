@@ -373,8 +373,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     (s.tx_ok, s.tx_fail, s.rx_bursts, s.rx_bytes, s.rx_frames, s.rx_bad, s.rx_hcint, s.rx_nohalt, s.bmsr, s.rx_fifo, s.int_sts)
                 }).unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
                 ctx.log_fmt(format_args!(
-                    "dwc2-svc: alive - {} key, {} blocks, {} cmds; busy CBW {} DATA {} CSW {}; {} passes, serve {}ms kbd {}ms sleep {}ms",
-                    reports, served, cmds, bc, bd, bs,
+                    "dwc2-svc: alive - {} key ({} chars from reports, {} from auto-repeat), {} blocks, {} cmds; busy CBW {} DATA {} CSW {}; {} passes, serve {}ms kbd {}ms sleep {}ms",
+                    reports, state.emitted_report, state.emitted_repeat, served, cmds, bc, bd, bs,
                     passes, seg_serve / ms, seg_kbd / ms, seg_sleep / ms));
                 // The net counters get their OWN line. Appending them to the line above pushed it past
                 // the SDK's fixed 256-byte format buffer, so the tail - the value being measured - was

@@ -283,7 +283,8 @@ pub fn poll(
             if state.last_ok != 0 && gap > state.stale_after {
                 state.repeat.cancel();
             } else {
-                state.repeat.poll(now, |ch| ctx.console_push(ch));
+                let n = &mut state.emitted_repeat;
+                state.repeat.poll(now, |ch| { *n = n.wrapping_add(1); ctx.console_push(ch) });
             }
             state.last_ok = now;
         }
@@ -300,6 +301,7 @@ pub fn poll(
         godspeed_sdk::hid::decode_keyboard(
             &rel, &mut state.last, &mut state.repeat, &mut state.caps,
             ctx.read_tsc(), |ch| ctx.console_push(ch), |_| {});
+        // (a release report emits nothing; counted for symmetry only if it ever does)
         return false;
     }
     // READ THE TOGGLE BACK FROM THE HARDWARE. Do not flip it in software.
@@ -317,15 +319,17 @@ pub fn poll(
     for i in 0..8 {
         rep[i] = dma.read8(REPORT_OFF + i);
     }
+    let mut state_emitted = 0u32;
     godspeed_sdk::hid::decode_keyboard(
         &rep,
         &mut state.last,
         &mut state.repeat,
         &mut state.caps,
         ctx.read_tsc(),
-        |ch| ctx.console_push(ch),
+        |ch| { state_emitted += 1; ctx.console_push(ch) },
         |code| ctx.log_fmt(format_args!("dwc2-svc: unmapped HID key usage {:#04x}", code)),
     );
+    state.emitted_report = state.emitted_report.wrapping_add(state_emitted);
     true
 }
 
@@ -342,6 +346,13 @@ pub struct KeyState {
     /// How stale that answer may be before a held key is treated as unproven. Derived from the
     /// board's own timer rate, never a constant - a cycle count is not a duration.
     pub stale_after: u64,
+    /// Characters emitted by AUTO-REPEAT, and characters emitted by decoding a real report. Two
+    /// mechanisms can produce a stream of one character - a repeat that will not stop, or the device
+    /// retransmitting its last report because the data toggle disagrees - and they are indistinguishable
+    /// in the output. They are not indistinguishable in a counter, so count them separately and let the
+    /// log say which one is running away instead of reasoning about which one probably is.
+    pub emitted_repeat: u32,
+    pub emitted_report: u32,
 }
 
 impl KeyState {
@@ -355,6 +366,8 @@ impl KeyState {
             // An interrupt endpoint starts at DATA0 after configuration.
             pid: chan::PID_DATA0,
             last_ok: 0,
+            emitted_repeat: 0,
+            emitted_report: 0,
             // ~150 ms: comfortably more than the 10 ms poll period (so ordinary jitter and a busy
             // core do not cancel a legitimate hold) and far less than the 2 s deschedule that loses
             // a release report.
