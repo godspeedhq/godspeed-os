@@ -6430,13 +6430,33 @@ fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
     // Bounded against a child that never parks. (The console service will make
     // output ordering automatic; this is the interim fix.)
     if let Some(slot) = find_running_slot(ctx, "observe-now") {
+        let mut parked = false;
         for _ in 0..1_000_000u32 {
             ctx.yield_cpu();
             let st = ctx.task_stat(slot);
             // state 2 = BlockedOnRecv → finished printing; invalid → gone.
             if !st.valid || st.state == 2 {
+                parked = true;
                 break;
             }
+        }
+        // REAP IT HERE, not on the next `observe now`. A parked one-shot is still a LIVE task: it
+        // holds its slot and its frames, and anything scanning the task table sees a service. Chaos
+        // does exactly that (deliberately - it keeps no hardcoded victim list, because one goes stale
+        // the moment the running set changes), so a parked `observe-now` was being killed as though it
+        // were a service, spending a victim slot that a real service should have had and reporting a
+        // kill that measured nothing.
+        //
+        // The old comment called this "at most one lingers", which is true and was never the point:
+        // one lingering task is enough to corrupt what the storm is measuring. The right owner of the
+        // cleanup is the shell, which spawned it and already holds the kill authority - it was simply
+        // doing it one invocation too late.
+        //
+        // Only when the park was actually OBSERVED. If the wait timed out, the child is still printing
+        // and killing it would truncate the frame the user asked for - so leave it, and the defensive
+        // kill at the top of this function reaps it next time. That is the case the old code was for.
+        if parked {
+            let _ = ctx.kill("observe-now");
         }
     }
     Ok(())
