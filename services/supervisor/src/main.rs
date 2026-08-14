@@ -170,14 +170,18 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 /// The restartable services the supervisor is responsible for (§6.1). Hoisted so the scan, `reconcile`,
 /// and `converge` share ONE roster. Order matters: block-driver before fs before shell (each wires to
 /// the previous); nic-driver before net-stack.
-const MANAGED_N: usize = 10;
+const MANAGED_N: usize = 11;
 const MANAGED: [&str; MANAGED_N] =
     ["block-driver", "fs", "shell", "xhci", "ehci", "logger", "nic-driver", "net-stack",
      // C1-6: both moved OUT of the kernel and so must be started BY someone. `time` owns the wall
      // clock the shell and net-stack now ask for; `control` owns the COM2 operator channel the test
      // harness drives. A service that is embedded and configured but never spawned is the C5-1 shape
      // one step earlier - not "unwatched", but never started at all.
-     "time", "control"];
+     // dwc2 is arm32-only and absent elsewhere; reconcile skips any name absent from the map, so
+     // listing it costs other ports nothing. It was in the kernel's death-notification set but in no
+     // reconcile list at all - so a DROPPED notification left the Pi's storage, keyboard and network
+     // down with no backstop to notice.
+     "time", "control", "dwc2"];
 
 /// Scan REAL liveness via `task_stat` (NOT a cap-acquire, which the kernel directory keeps succeeding
 /// for a dead name - the `ensure_*` stale-cap-adopt race, line ~149): which MANAGED services have a live
@@ -412,10 +416,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (QEMU has no -drive there: "no controller"), giving §22 Test 11 a restartable victim to kill.
     // `ensure_*` (Phase 6): spawn on a fresh boot, ADOPT the running instance on a supervisor respawn.
     #[cfg(any(feature = "bare-metal", feature = "blockdev", feature = "identity-only"))]
-    // block-driver: core 0 on ARM, unpinned elsewhere. On ARM it may serve a USB stick through the
-    // in-kernel DWC2 stack, and those syscalls are core-0-only: the single USB host channel and its DMA
-    // buffer are shared with the keyboard poll in core 0's timer ISR, kept mutually exclusive by an ARM
-    // syscall running with interrupts masked. A request from another core would simply be refused.
+    // block-driver: core 0 on ARM, unpinned elsewhere. On ARM it reaches a USB stick through the
+    // `dwc2` SERVICE (spawned just above), not through kernel syscalls - the in-kernel DWC2 stack was
+    // deleted in slice 5. The core-0 preference survives that change because the placement decision
+    // lives in the kernel's `ServiceConfig.preferred_core`, which both the boot and restart paths read.
     // No override: the kernel's `ServiceConfig.preferred_core` decides, and it is arch-conditional
     // (0 on ARM for the reason above). Overriding here pinned only the BOOT spawn - the restart path
     // passes no override, so a respawned block-driver silently landed on a different core than the
@@ -425,6 +429,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // neither can delay the prompt the way a driver bring-up would.
     ensure_mapped(&ctx, &mut name_map, "time", 0xFFFF);
     ensure_mapped(&ctx, &mut name_map, "control", 0xFFFF);
+    // dwc2 (arm32): the Pi 2's ENTIRE USB stack - storage, keyboard and networking all ride on this
+    // one service. Spawned BEFORE block-driver and nic-driver because both name it as a send_peer: a
+    // peer that does not exist yet costs them their direct cap and forces a name-wire later.
+    //
+    // This was MISSING from arm32 slice 5, which deleted the in-kernel DWC2 driver without starting
+    // its replacement. The board booted with no USB at all and was rescued only by a human typing
+    // `spawn dwc2`. The log said so five different ways and none of them said "nobody started it".
+    //
+    // `ensure_mapped` adopts a running instance rather than spawning a second: the supervisor is
+    // restartable (Phase 6), so this line runs again on every respawn, and two drivers on one
+    // controller is a worse failure than the one being fixed.
+    // Gated on the ARCHITECTURE only, deliberately. The test-build feature list that guards `xhci`
+    // below buys nothing here: on this board `dwc2` is not one driver among several, it is the only
+    // path to storage, keyboard and network, so every arm32 build that boots at all wants it. Fewer
+    // conditions also means fewer ways for this spawn to silently not happen - which is the exact
+    // failure being fixed.
+    #[cfg(target_arch = "arm")]
+    ensure_mapped(&ctx, &mut name_map, "dwc2", 0xFFFF);
+
     ensure_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
     // fs needs a disk → bare-metal / blockdev only.
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]
@@ -510,8 +533,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Kept as a supervisor feature rather than an unconditional aarch64 spawn because the KERNEL side
     // is a feature too. Spawn the service without it and two drivers own one controller.
     // aarch64 spawns it unconditionally now: the in-kernel driver is DELETED, so this service is the
-    // only thing that can drive the controller. arm32 (Pi 2) is still excluded - it has no PCIe and
-    // no device-IRQ routing to userspace, so its USB stack remains in the kernel (arch/arm/CLAUDE.md).
+    // only thing that can drive the controller. arm32 is excluded because its controller is a DWC2,
+    // not an xHCI - a different driver, spawned above. Its in-kernel stack is deleted too (slice 5);
+    // this comment used to say otherwise, and that stale sentence is exactly why nothing filled the
+    // gap when the kernel driver went away.
     #[cfg(not(target_arch = "arm"))]
     spawn_mapped(&ctx, &mut name_map, "xhci", 0xFFFF);
 

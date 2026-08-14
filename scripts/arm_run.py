@@ -25,6 +25,38 @@ def find_kernel(profile):
     return p if os.path.exists(p) else None
 
 
+def announce_kernel(path, profile):
+    """Say WHICH kernel is booting, and shout if the other profile is newer.
+
+    This default (`debug`) silently booted a stale kernel through several "verified in QEMU" runs whose
+    builds had all been `--release`. Every result was wrong in the same believable direction: the fix
+    under test appeared not to work, because the image under test predated it. Nothing was broken - the
+    runner answered a question about a different binary and said nothing about which.
+
+    A test harness that can run the wrong artifact must say which artifact it ran. Printing the profile
+    and its age costs one line; the mismatch warning costs one more and is the one that matters, because
+    the failure mode is not "no kernel" (that already errors) but "a kernel, just not yours".
+    """
+    age = time.time() - os.path.getmtime(path)
+    print("booting %s kernel (built %s ago): %s" % (profile, _ago(age), path))
+    other = "release" if profile == "debug" else "debug"
+    op = find_kernel(other)
+    if op and os.path.getmtime(op) > os.path.getmtime(path) + 1:
+        print("WARNING: the %s kernel is NEWER than the %s one you are booting (by %s)."
+              % (other, profile, _ago(os.path.getmtime(op) - os.path.getmtime(path))))
+        print("WARNING: if you just built with --%s, pass --%s here or you are testing an old binary."
+              % (other, other))
+
+
+def _ago(secs):
+    secs = int(secs)
+    if secs < 60:
+        return "%ds" % secs
+    if secs < 3600:
+        return "%dm%02ds" % (secs // 60, secs % 60)
+    return "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--secs", type=float, default=20.0)
@@ -45,6 +77,7 @@ def main():
     if not krn:
         print("no kernel ELF - run scripts/arm_build.py first", file=sys.stderr)
         sys.exit(1)
+    announce_kernel(krn, profile)
 
     machine = "raspi2b,usb=on" if (args.usb or args.usbnet or args.usbdisk) else "raspi2b"
     cmd = [QEMU, "-M", machine, "-kernel", krn, "-serial", "stdio", "-display", "none"]

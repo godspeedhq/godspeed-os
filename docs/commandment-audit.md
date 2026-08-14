@@ -788,7 +788,17 @@ a slot that changes MEANING while keeping its number is invisible to it. The che
 diff and has to be argued for.
 
 **F2 - `fs` stack-overflows in a restart storm when storage is absent (QEMU, not hardware).** With no
-USB stick, `block-driver` serves 0 sectors and `fs` dies repeatedly. Measured A/B: pre-slice-5
+USB stick, `block-driver` serves 0 sectors and `fs` dies repeatedly.
+
+> **CORRECTION: the A/B below is VOID and the attribution to slice 5 is withdrawn.** `arm_run.py`
+> defaults to the `debug` profile while both builds were `--release`, so both arms of the comparison
+> booted the same stale debug kernel - the numbers differ only by run-to-run variance, and neither
+> measured the commit it was labelled with. The `fs` fault itself is real (it was observed), but WHEN it
+> started is unknown, and the same defect explains F3 below. Re-measure with `--release` on both arms
+> before believing any attribution. Recorded rather than quietly deleted: a wrong measurement that gets
+> erased teaches nothing, and this one was confidently reported.
+
+Measured A/B (VOID, see above): pre-slice-5
 (`f06d5853`) 0 data aborts and 112 restarts; post-slice-5 1000+ data aborts. The faults are below
 `USER_STACK_TOP - 64 pages` with a pc past the image's `_end`, which is a blown user stack and a
 clobbered return address, not a wild pointer. `struct Fs` is small scalars, so it is not the obvious
@@ -798,6 +808,28 @@ only one is new: slice 5 changed the death SHAPE (clean death to memory fault), 
 than coming up degraded predates it - and it has a degraded path it is not reaching. This is the Rule
 Above The Rules in miniature: a missing dependency must return a loud "unavailable", not fault in a
 loop.
+
+**F3 - arm32 booted with NO USB AT ALL from slice 5 until now, and five log lines said so without any
+of them saying it.** Slice 5 deleted the in-kernel DWC2 driver and never added a boot spawn for the
+`dwc2` SERVICE that replaced it. `xhci` is `#[cfg(not(target_arch = "arm"))]`, and its comment explained
+why: "arm32 is still excluded - its USB stack remains in the kernel". Slice 5 made that sentence false
+and nothing filled the empty slot, so the Pi came up with no storage, no keyboard and no network, and
+was rescued only when a human typed `spawn dwc2`.
+
+The symptoms were all present and each read as a different problem: `peer 'dwc2' not yet registered`
+twice, `block-driver` serving 0 sectors, `fs` mounting an empty disk, `nic-driver` reporting "no usb-net
+device", a dead keyboard. None of them says "nobody started the driver". Worse, the manual `spawn dwc2`
+in my own test instructions produced a log line I then read back as PROOF of auto-spawn.
+
+Two lessons, both mechanical rather than moral. **A deletion must be verified by what still has to
+WORK, not by what it removed** - slice 5 was checked for a smaller kernel, no in-kernel driver, and a
+prompt, all of which were true and none of which needed USB. And **a harness that can run the wrong
+artifact must say which one it ran**: `arm_run.py` defaulted to `debug` while every build was
+`--release`, so several "verified in QEMU" runs booted an hour-old binary and reported that the fix
+under test did not work. It now prints the profile and its age, and shouts when the other profile is
+newer. Fixed: `dwc2` is spawned on arm32 before the services that name it as a peer, and added to
+MANAGED (it was in the kernel's notify set but in no reconcile list, so a dropped notification left the
+whole USB stack down with no backstop).
 
 Order and reasoning: **IV** next (fold in the existing `contract_check.py` - nearly free, and it has
 already caught a real violation). Then **V's second half with IX**, because they are one machine: the
