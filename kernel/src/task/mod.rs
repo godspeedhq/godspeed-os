@@ -599,6 +599,28 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // time (services/time): the wall clock, moved out of the kernel (finding C1-6). §4.3 names six
+        // kernel responsibilities and timekeeping is not among them. The kernel keeps only the register
+        // read - x86's CMOS RTC answers on port I/O, which no service can reach - and this service owns
+        // what the read MEANS: conversion, the plausibility window, provenance and the floor.
+        //
+        // It needs no hardware grant: it reads the RTC through the introspection query that already
+        // exists and serves the result over IPC.
+        "time" => Some(("time", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_TIME_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            probe_mode:        0,
+            // UNPINNED (§9.2: name a core only with a real reason). The clock has no interrupt to be
+            // local to and no peer to be co-resident with, so round-robin places it. Contracted
+            // placement is deployment-coupled by design; inventing one here would be noise the
+            // supervisor is then obliged to honour.
+            preferred_core:    u32::MAX,
+            memory_limit:      8 * 1024 * 1024,   // matches time.toml
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         // mem-pressure: a spawn-on-demand memory-pressure victim for `chaos mem-pressure` (allocs 4 MiB
         // chunks up to this limit, then AllocDenied; killed to reclaim). Not in any auto-spawn set.
         "mem-pressure" => Some(("mem-pressure", ServiceConfig {

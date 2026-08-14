@@ -286,6 +286,7 @@ service_configs = [
     "stress-s9-send-a",
     "stress-s9-send-b",
     "supervisor",
+    "time",
     "upper",
     "xhci",
     "xlife",

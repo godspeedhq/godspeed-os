@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# The wall clock, as a service rather than a kernel responsibility (finding C1-6).
+#
+# §4.3 names six kernel responsibilities and timekeeping is not among them. The kernel keeps only the
+# REGISTER READ - x86's CMOS RTC answers on port I/O, which no service can reach - and this service owns
+# what the read means: conversion, the plausibility window, provenance (RTC or network) and the floor.
+#
+# It needs no hardware capability of its own: it reads the RTC through the kernel introspection query
+# that already exists, and serves the result over IPC. Its authority is therefore just its endpoint and
+# a log.
+name    = "time"
+version = "0.1.0"
+
+[resources.memory]
+request = "4MiB"
+limit   = "8MiB"
+
+[capabilities]
+ipc_receive = ["time"]
+log_write   = true

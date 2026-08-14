@@ -815,7 +815,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "time",
+ "time 0.3.47",
  "url",
  "uuid",
 ]
@@ -1521,6 +1521,13 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "time"
+version = "0.1.0"
+dependencies = [
+ "godspeed-sdk",
 ]
 
 [[package]]

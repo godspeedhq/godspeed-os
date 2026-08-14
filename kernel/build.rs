@@ -74,6 +74,7 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         ("SUPERVISOR", "supervisor"),
         ("DWC2",       "dwc2"),
         ("LOGGER",     "logger"),
+        ("TIME",       "time"),
         ("MEM_PRESSURE",    "mem-pressure"),
         ("CHAOS",      "chaos"),
         ("PING",       "ping"),
