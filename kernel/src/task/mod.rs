@@ -834,15 +834,25 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
             send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
             send_peers_grant:  false,
-            // ARM pins this to core 0, and it is NOT a preference there - it is a requirement. The
-            // USB mass-storage syscalls run against the in-kernel DWC2 stack, whose single host
-            // channel and DMA buffer are shared with the keyboard poll in core 0's timer ISR; every
-            // `msc_*` entry point refuses outright when `!on_core0()`. Placement lives HERE, in the
-            // one place both boot and RESTART consult. It used to be an unconditional 1 with the
-            // supervisor overriding it to 0 at boot only, so a restarted block-driver came back on
-            // core 1 and every block operation failed forever - storage dead until reboot, and
-            // restartability (invariant 6) broken on ARM by a value that disagreed with itself.
-            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
+            // ARM KEEPS THIS ON CORE 0, and the reason is NOT the one that used to be written here.
+            //
+            // The old reason - the in-kernel DWC2 stack's `msc_*` entry points refused when
+            // `!on_core0()` - died with slice 5, and is verifiably gone (no `on_core0` reference
+            // remains in `arch/arm`; `usb_disk_*` are inert stubs). Unpinning on that basis was tried
+            // and it BROKE STORAGE: block-driver spawned on core 2 and logged nothing at all - not
+            // even its own "no disk" line - while `fs` on core 1 never reached "serving file API"
+            // behind it, and `nic-driver` on core 3 stopped after "starting". Everything left on core
+            // 0 was fine.
+            //
+            // The real constraint is underneath: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB,
+            // so a task blocked in `recv` on another core is never woken by its sender (§8.3 relies on
+            // that IPI). Cross-core request/reply therefore does not complete on this port, and every
+            // service that uses it has been co-located on core 0 - which is why three cores sit idle.
+            //
+            // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
+            // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
+            // unpins these three, and it unpins them everywhere at once.
+            preferred_core:    if cfg!(target_arch = "arm") { u32::MAX } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[],
@@ -864,11 +874,25 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             #[cfg(not(target_arch = "arm"))]
             send_peers:        &[],
             send_peers_grant:  false,
-            // ARM (Pi 2): core 0 - the `dwc2` service it now talks to runs there, and the USB
-            // controller is serviced from that core's tick. x86 and aarch64 (Pi 4): core 1,
-            // co-located with net-stack + fs. The Pi 4 has no core-0 constraint because GENET is
-            // reached by MMIO from whichever core makes the syscall, not from a timer tick.
-            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
+            // ARM KEEPS THIS ON CORE 0, and the reason is NOT the one that used to be written here.
+            //
+            // The old reason - the in-kernel DWC2 stack's `msc_*` entry points refused when
+            // `!on_core0()` - died with slice 5, and is verifiably gone (no `on_core0` reference
+            // remains in `arch/arm`; `usb_disk_*` are inert stubs). Unpinning on that basis was tried
+            // and it BROKE STORAGE: block-driver spawned on core 2 and logged nothing at all - not
+            // even its own "no disk" line - while `fs` on core 1 never reached "serving file API"
+            // behind it, and `nic-driver` on core 3 stopped after "starting". Everything left on core
+            // 0 was fine.
+            //
+            // The real constraint is underneath: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB,
+            // so a task blocked in `recv` on another core is never woken by its sender (§8.3 relies on
+            // that IPI). Cross-core request/reply therefore does not complete on this port, and every
+            // service that uses it has been co-located on core 0 - which is why three cores sit idle.
+            //
+            // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
+            // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
+            // unpins these three, and it unpins them everywhere at once.
+            preferred_core:    if cfg!(target_arch = "arm") { u32::MAX } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             // GENET's macirq on aarch64 (SPI 157 -> neutral vector 0x2A). x86's nic-driver is a
@@ -890,8 +914,25 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // is the clock's policy, so the reading is handed over rather than written to a syscall.
             send_peers:        &["nic-driver", "time"],    // the frame interface; reacquired by name on death
             send_peers_grant:  false,
-            // ARM: co-locate with nic-driver on core 0 (avoids QEMU-TCG cross-core IPC latency). x86: core 1.
-            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
+            // ARM KEEPS THIS ON CORE 0, and the reason is NOT the one that used to be written here.
+            //
+            // The old reason - the in-kernel DWC2 stack's `msc_*` entry points refused when
+            // `!on_core0()` - died with slice 5, and is verifiably gone (no `on_core0` reference
+            // remains in `arch/arm`; `usb_disk_*` are inert stubs). Unpinning on that basis was tried
+            // and it BROKE STORAGE: block-driver spawned on core 2 and logged nothing at all - not
+            // even its own "no disk" line - while `fs` on core 1 never reached "serving file API"
+            // behind it, and `nic-driver` on core 3 stopped after "starting". Everything left on core
+            // 0 was fine.
+            //
+            // The real constraint is underneath: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB,
+            // so a task blocked in `recv` on another core is never woken by its sender (§8.3 relies on
+            // that IPI). Cross-core request/reply therefore does not complete on this port, and every
+            // service that uses it has been co-located on core 0 - which is why three cores sit idle.
+            //
+            // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
+            // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
+            // unpins these three, and it unpins them everywhere at once.
+            preferred_core:    if cfg!(target_arch = "arm") { u32::MAX } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[],
