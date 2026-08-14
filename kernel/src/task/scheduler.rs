@@ -1190,6 +1190,11 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // tick (§17).  The idle branch can't be relied on when core 0 always
         // has ready tasks.  COM1 polling replaces IRQ 4 (fully masked by PIC).
         if cid == 0 {
+            // H1: surface any IOMMU translation fault - a confined device's DMA blocked outside its
+            // granted arena (§6.4). Cheap when quiet (a head/tail compare). This is ISOLATION
+            // reporting, so it runs on its own here rather than inside the COM2 control channel it
+            // used to share a function with (C1-6).
+            crate::arch::imp::iommu::drain_event_log();
             crate::control::process_pending();
             crate::arch::imp::uart_rx_poll();
             // Advance the BSP tick clock + wake any task whose recv_timeout deadline elapsed

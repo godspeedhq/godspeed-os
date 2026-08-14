@@ -4146,8 +4146,13 @@ pub fn supervisor_respawn_pending() -> bool {
     SUPERVISOR_RESPAWN_PENDING.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// If the supervisor died, respawn it (Path C / Phase 6). Called from `control::process_pending`
-/// (Core 0) - a spawn-safe deferred point. Always respawns; never gives up (see the note above).
+/// If the supervisor died, respawn it (Path C / Phase 6). Called from `scheduler::run` (Core 0) at an
+/// IF=1 point - a spawn-safe deferred point. It is NOT called from `control::process_pending`, which
+/// runs at IF=0 from the timer ISR: a ~22 ms spawn issuing all-core TLB shootdowns wedged the box
+/// there, because core 0 could not ACK other cores' IPIs while stuck in it. This comment said
+/// otherwise until 2026-08-14 and cost a wrong finding - a doc comment naming the wrong caller is not
+/// a cosmetic error, it is a false statement about control flow that a reader will act on.
+/// Always respawns; never gives up (see the note above).
 /// The count is observability only (§26.4), not a bound.
 pub fn poll_supervisor_respawn() {
     use core::sync::atomic::Ordering;

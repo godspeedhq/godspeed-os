@@ -36,6 +36,10 @@ static LINE: SpinLock<LineBuf> = SpinLock::new(LineBuf::new());
 /// on the BSP stalls forever. The budget (256) far exceeds any real command
 /// line (BUF_SIZE = 128); a stuck LSR just drains 256 junk bytes and returns.
 pub fn process_pending() {
+    // C1-6: the IOMMU fault drain USED TO RUN HERE and has moved to the scheduler's core-0 tick. It
+    // surfaces a confined driver's DMA escaping its arena (H1, §6.4) - an isolation diagnostic, not
+    // developer tooling - and it had no business sharing a lifetime with a debug command channel. If
+    // this module is ever gated out of a build, the fault reporting must not go with it.
     // NOTE: the supervisor respawn (Path C / Phase 6) is deliberately NOT done here. process_pending
     // runs from the Core-0 timer ISR with IF=0 (see the doc comment above), and `spawn_supervisor` is
     // a ~22 ms service spawn that issues all-core TLB shootdowns - running it IF=0 wedged the box under
@@ -43,11 +47,6 @@ pub fn process_pending() {
     // spawn (the exact hazard this comment warns about - the COM2 drain below is bounded for it). The
     // respawn now runs from the scheduler loop at an IF=1 point (`scheduler::run`, gated to Core 0).
     // Only bounded, ISR-safe work belongs in process_pending.
-
-    // H1 diagnostic: surface any IOMMU translation faults (device DMA blocked
-    // outside its confined arena). Cheap when quiet (a head/tail compare); prints
-    // the faulting device + address when a confined driver oversteps its arena.
-    crate::arch::imp::iommu::drain_event_log();
 
     let mut state = match LINE.try_lock() {
         Some(g) => g,

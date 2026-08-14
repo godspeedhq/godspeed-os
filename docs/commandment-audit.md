@@ -243,12 +243,26 @@ support role sanctioned elsewhere in the constitution and citing where (`arch-la
 
 They look alike and their answers are three different things.
 
-**`control.rs` - separate it, then gate it.** It is `mod control;` in `main.rs`, unconditional, in every
-kernel. But it is no longer only a dev channel: `control::process_pending` is where the **supervisor
-respawn** runs (Path C / Phase 6) plus other core-0 periodic work. So it cannot simply be stripped from
-production builds - that would remove the respawn. The respawn tick belongs to `task/` (scheduling, one
-of the six); the COM2 command channel is tooling and should be feature-gated out. Welding them together
-is *why* the tooling has survived in ring 0.
+**`control.rs` - CORRECTION, and it changes the fix.** I wrote here that the supervisor respawn runs
+inside `control::process_pending`, and that this was why the module could not be stripped. **That was
+wrong.** `poll_supervisor_respawn()` is called from `scheduler::run`, not from control - it was moved
+there deliberately, because a ~22 ms spawn issuing all-core TLB shootdowns at IF=0 wedged the box. I
+believed a STALE DOC COMMENT on the function, which named the wrong caller. That comment is now fixed;
+a doc comment naming the wrong caller is not cosmetic, it is a false statement about control flow that a
+reader acts on, and it produced a wrong finding within a day.
+
+So `control.rs` had two jobs, not three: an IOMMU fault drain and the COM2 command channel. The drain is
+ISOLATION reporting - it surfaces a confined device's DMA escaping its arena (H1, §6.4) - and had no
+business sharing a lifetime with a debug channel; it now runs on its own in the scheduler's core-0 tick,
+so gating the channel cannot silently take fault reporting with it. **Done.**
+
+What remains is the channel itself, and it needs a decision rather than a patch. Feature-gating does not
+close the finding, because the check reads SOURCE and not `cfg` - the same lesson C1-1 taught. Deleting
+it breaks the identity suite, which drives the OS through that channel (§22.3). So the options are an
+AMENDMENT sanctioning a kernel-side test-control channel (§4.4 forbids "developer tooling" by name,
+while §17 and §22 both assume the harness can drive a running system), or making the control channel a
+SERVICE holding COM2 and SERVICE_CONTROL - the same move that took USB out of the kernel, and
+architecturally the right one.
 
 **`clock.rs` + `wallclock.rs` - a time SERVICE, planned.** Not open questions: they close when that
 service exists. `wallclock.rs` is the one that most wants to leave, holding provenance and floor policy.
