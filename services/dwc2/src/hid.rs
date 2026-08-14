@@ -261,7 +261,32 @@ pub fn poll(
         // `KeyRepeat::poll` is documented "call once per poll iteration" and was called zero times per
         // poll iteration. The repeat machinery was complete, calibrated, and unreachable - which is
         // why this reads as a missing feature rather than a broken one.
-        state.repeat.poll(ctx.read_tsc(), |ch| ctx.console_push(ch));
+        // REPEAT ONLY ON POSITIVE EVIDENCE, AND ONLY WHILE WE ARE STILL POLLING HEALTHILY.
+        //
+        // A NAK is the keyboard answering "nothing changed", which corroborates that the key is still
+        // down. No completion at all (`hcint == 0`: a timed-out or failed transfer) is not evidence of
+        // anything - and repeating on it meant repeating while OUT OF CONTACT with the device.
+        //
+        // That is how `date` became `daaaaaaaaaaaaaaaaaaaaaaat`. Measured on this board, a 125 us sleep
+        // can return 2 SECONDS late, so this task gets descheduled for far longer than the 10 ms poll
+        // period. A release report landing in that gap is discarded by the transaction translator and
+        // NEVER RESENT - a boot keyboard reports only on change - so nothing would ever have arrived to
+        // disarm the repeat.
+        //
+        // Hence the second condition: a repeat is only credible if the PREVIOUS successful poll was
+        // recent. If we have been away longer than that, a release may have come and gone unseen, so
+        // the hold is unproven and the right move is to stop rather than to assume. "Wait on truth,
+        // not on time" - and the truth here is a fresh answer from the device.
+        let now = ctx.read_tsc();
+        if hcint & crate::regs::HCINT_NAK != 0 {
+            let gap = now.wrapping_sub(state.last_ok);
+            if state.last_ok != 0 && gap > state.stale_after {
+                state.repeat.cancel();
+            } else {
+                state.repeat.poll(now, |ch| ctx.console_push(ch));
+            }
+            state.last_ok = now;
+        }
         return false; // NAK (idle), NYET, or a rescheduled attempt - all ordinary
     }
     // An all-zero report is the keyboard saying every key is RELEASED. It is a real report and must
@@ -311,6 +336,12 @@ pub struct KeyState {
     pub repeat: godspeed_sdk::hid::KeyRepeat,
     pub caps: bool,
     pub pid: u32,
+    /// Timestamp of the last poll the device actually ANSWERED (data or NAK). Auto-repeat is only
+    /// credible while these keep arriving; a long gap means a release may have been lost unseen.
+    pub last_ok: u64,
+    /// How stale that answer may be before a held key is treated as unproven. Derived from the
+    /// board's own timer rate, never a constant - a cycle count is not a duration.
+    pub stale_after: u64,
 }
 
 impl KeyState {
@@ -323,6 +354,11 @@ impl KeyState {
             caps: false,
             // An interrupt endpoint starts at DATA0 after configuration.
             pid: chan::PID_DATA0,
+            last_ok: 0,
+            // ~150 ms: comfortably more than the 10 ms poll period (so ordinary jitter and a busy
+            // core do not cancel a legitimate hold) and far less than the 2 s deschedule that loses
+            // a release report.
+            stale_after: (ctx.tsc_ticks_per_10ms() * 15).max(1),
         }
     }
 }
