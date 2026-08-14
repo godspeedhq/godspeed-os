@@ -246,8 +246,35 @@ impl core::fmt::Write for FnCapBuf {
 // display (arch::console_push_byte), so we don't echo here - just accumulate
 // bytes until \r or \n. (On a serial terminal, turn local echo OFF to avoid
 // doubled characters.)
+/// The shell's own context: the SDK's `ServiceContext` plus the state the shell owns.
+///
+/// C6-1. `ServiceContext` is a zero-sized marker that reads the task's context page, so wrapping it
+/// costs nothing and `Deref` keeps every existing `ctx.log(...)` working unchanged. Deref coercion also
+/// means a `&ShellCtx` still passes to anything expecting a `&ServiceContext`, so adding owned state
+/// here did not touch a single call site - only the signatures of the functions that need it.
+///
+/// `Cell` rather than a lock or an atomic: this is one task on one core, so the cost of thread-safety
+/// would buy nothing, and an atomic here is what made the old version look acceptable while still being
+/// unowned. Interior mutability inside an owned struct is not global mutable state.
+pub struct ShellCtx {
+    inner: ServiceContext,
+    /// The fs request correlation tag (see `next_fs_tag`).
+    fs_tag: core::cell::Cell<u8>,
+}
+
+impl core::ops::Deref for ShellCtx {
+    type Target = ServiceContext;
+    fn deref(&self) -> &ServiceContext { &self.inner }
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // C6-1: wrap the SDK context in the shell's own, which owns the fs correlation tag. Everything
+    // below still calls `ctx.log(...)` unchanged - `ShellCtx` derefs to `ServiceContext` - and deref
+    // coercion lets it pass to anything expecting the SDK type. The tag now has an owner with the same
+    // lifetime as the shell, instead of being a `static` that outlives nothing and belongs to no one.
+    let ctx = ShellCtx { inner: ctx, fs_tag: core::cell::Cell::new(0) };
+    let ctx = &ctx;
     // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
     // shown on the TV during startup - the user wants to see it come up. We log our
     // "ready" line into that stream, then wait for the input driver to report in
@@ -490,7 +517,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 /// screen and clears it on exit, so afterwards we reprint the prompt + the in-progress
 /// line and park the cursor at its end. Runs at depth 0 (interactive) so help pages.
 fn run_help_key(
-    ctx: &ServiceContext,
+    ctx: &ShellCtx,
     cwd: &mut Cwd,
     last_result: &mut Result<(), ShellError>,
     line: &mut Line,
@@ -542,7 +569,7 @@ fn read_escape_byte(ctx: &ServiceContext) -> Option<u8> {
 /// PageUp/PageDown) and function keys an extended keyboard sends. Unknown sequences are
 /// consumed and ignored - never smeared onto the line. Bounded: a final byte must arrive
 /// within `CSI_MAX` bytes or we stop (defensive against a malformed serial stream).
-fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &mut History, nav: &mut usize) {
+fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usize) {
     const CSI_MAX: usize = 8;
     let mut param: u16 = 0;
     let mut have_param = false;
@@ -609,7 +636,7 @@ fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &mut History, nav: &m
 /// `sort reverse`, the trailing `mkdir … parents`) and otherwise as a **file path**. One match fills
 /// it; several show the numbered menu (1-9 selects, Tab cycles). Operates from end-of-line so the menu
 /// reprint lines up with the cursor (§26.6: bounded).
-fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
+fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
     if line.len == 0 { return; }
     line.end(ctx);
     // Current token starts after the last space (or line start); its pipe segment starts after the
@@ -892,7 +919,7 @@ struct PathHit { off: usize, len: usize, is_dir: bool }
 /// dir, ` ` for a file); several → fill the common prefix, print a numbered menu, then **digit**
 /// selects or **Tab** cycles to the next candidate (any other key keeps the line). No new authority
 /// - the shell already holds the `fs` LIST_DIR cap (the same `ls` uses).
-fn complete_path(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd, tok_start: usize) {
+fn complete_path(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd, tok_start: usize) {
     let bytes = line.bytes();
     let token = &bytes[tok_start..];
     // dir part (everything up to and including the last '/') and the leaf being typed.
@@ -981,7 +1008,7 @@ fn fill_path(ctx: &ServiceContext, line: &mut Line, base_len: usize, name: &[u8]
 /// Print the numbered candidate menu, then run the selection loop: a **digit** (1-9) commits that
 /// entry; **Tab** cycles to the next candidate (filling it, no separator); any other key keeps the
 /// current line and returns (that key is not consumed as input - minor: re-press to use it).
-fn path_menu(ctx: &ServiceContext, line: &mut Line, base_len: usize, rbuf: &[u8; 512], hits: &[PathHit]) {
+fn path_menu(ctx: &ShellCtx, line: &mut Line, base_len: usize, rbuf: &[u8; 512], hits: &[PathHit]) {
     let n = hits.len();
     let shown = n.min(9);
     ctx.console_write("\r\n");
@@ -1068,7 +1095,7 @@ impl History {
     /// the oldest - a file line - if the merge exceeds HIST_MAX. `#[inline(never)]` keeps its ~4 KiB frame
     /// off the interactive key path (the shell's user stack is tight).
     #[inline(never)]
-    fn load(&mut self, ctx: &ServiceContext) {
+    fn load(&mut self, ctx: &ShellCtx) {
         if self.loaded { return; }
         self.loaded = true;
         let path = b"/.gsh_history";
@@ -1099,7 +1126,7 @@ impl History {
     /// one - best-effort either way, never an error surfaced to the user (§26.7). `#[inline(never)]` keeps
     /// its buffer off the Enter path (tight user stack).
     #[inline(never)]
-    fn save(&self, ctx: &ServiceContext) {
+    fn save(&self, ctx: &ShellCtx) {
         let path: &[u8] = b"/.gsh_history";
         let mut buf = [0u8; HIST_MAX * (MAX_LINE + 1)];
         let mut pos = 0usize;
@@ -1317,7 +1344,7 @@ impl ShellError {
 /// path's 64 KiB `Stream`) into `cmd_run`'s, blowing the bounded user stack on the nested
 /// `run → cmd_run → execute` path (the same inlining-inflates-frame trap as the record builders).
 #[inline(never)]
-fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellError>, depth: u8, out: &mut Out) -> Result<(), ShellError> {
+fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellError>, depth: u8, out: &mut Out) -> Result<(), ShellError> {
     let Ok(s) = core::str::from_utf8(line) else {
         ctx.console_writeln("shell: invalid input");
         return Err(ShellError::Unknown);
@@ -1623,7 +1650,7 @@ fn compact_step(buf: &mut [u8], start: usize, dataend: usize, eof: bool) -> (usi
 /// the script buffer off the hot pipe frame, and the `fs` reply is dropped before any command
 /// runs - both bound the user stack (see the pipe stack-overflow lesson).
 #[inline(never)]
-fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&str>, params: &Params) -> Result<(), ShellError> {
+fn cmd_run(ctx: &ShellCtx, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&str>, params: &Params) -> Result<(), ShellError> {
     let mut pbuf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     // Stream + MINIFY the script into the buffer (comments / blank lines / indentation stripped and
@@ -1648,7 +1675,7 @@ const IMPORT_MAX: usize = 16; // max names in one `from … import a b c …`
 /// Stream a file into `dst`, MINIFYING on the fly (`compact_step`): comments / blank lines /
 /// indentation stripped as it loads. Returns `(code_len, truncated)`. Used for both the main script
 /// and each imported lib; `dst` is a sub-slice of the resident buffer, so no second big buffer.
-fn stream_minify(ctx: &ServiceContext, path: &[u8], dst: &mut [u8]) -> (usize, bool) {
+fn stream_minify(ctx: &ShellCtx, path: &[u8], dst: &mut [u8]) -> (usize, bool) {
     let cap = dst.len();
     if cap < IO_CHUNK { return (0, true); } // no room even for one chunk
     let mut code = 0usize;
@@ -1697,7 +1724,7 @@ fn build_fn_def(scratch: &mut [u8], alias: &[u8], script: &[u8], base: usize, ft
 /// the requested functions (renamed on `as`) after it, then moves them down to `*code` - so only the
 /// requested (renamed) functions remain, indexed by the run's pre-scan. Loud + no-op on any error.
 #[inline(never)]
-fn resolve_one_import(ctx: &ServiceContext, stmt: &[u8], is_from: bool, script: &mut [u8], code: &mut usize) {
+fn resolve_one_import(ctx: &ShellCtx, stmt: &[u8], is_from: bool, script: &mut [u8], code: &mut usize) {
     let s = str_of(stmt);
     let mut toks = [""; 40];
     let mut nt = 0usize;
@@ -1776,7 +1803,7 @@ fn resolve_one_import(ctx: &ServiceContext, stmt: &[u8], is_from: bool, script: 
 /// statements and, for each, append the requested (optionally `as`-renamed) library functions to the
 /// buffer so the run's pre-scan indexes them. Explicit paths, flat namespace, loud on error. Runs
 /// BEFORE any pipe/report buffers exist, so the small parse scratch is well inside the stack.
-fn resolve_imports(ctx: &ServiceContext, script: &mut [u8], code: &mut usize) {
+fn resolve_imports(ctx: &ShellCtx, script: &mut [u8], code: &mut usize) {
     let scan_end = *code; // only the MAIN script is scanned (a lib importing a lib is not resolved)
     let mut pos = 0usize;
     while pos < scan_end {
@@ -2170,7 +2197,7 @@ fn valid_var_name(name: &str) -> bool {
 }
 
 /// `let [mut] <name> = <value>` - declare a binding.
-fn stmt_let(ctx: &ServiceContext, cwd: &Cwd, rest: &str, vars: &mut Vars, params: &Params) -> Result<(), ShellError> {
+fn stmt_let(ctx: &ShellCtx, cwd: &Cwd, rest: &str, vars: &mut Vars, params: &Params) -> Result<(), ShellError> {
     let (mutable, rest) = match rest.strip_prefix("mut ") { Some(r) => (true, r.trim_start()), None => (false, rest) };
     let (name, after) = split_first(rest);
     let after = after.trim_start();
@@ -2193,7 +2220,7 @@ fn stmt_let(ctx: &ServiceContext, cwd: &Cwd, rest: &str, vars: &mut Vars, params
 }
 
 /// `<name> = <value>` - reassign a mutable binding.
-fn stmt_reassign(ctx: &ServiceContext, cwd: &Cwd, name: &str, value: &str, vars: &mut Vars, params: &Params) -> Result<(), ShellError> {
+fn stmt_reassign(ctx: &ShellCtx, cwd: &Cwd, name: &str, value: &str, vars: &mut Vars, params: &Params) -> Result<(), ShellError> {
     // `x = $( cmd )` - capture command output as the new value.
     if let Some(inner) = capture_form(value) {
         return capture_reassign(ctx, cwd, name, inner, vars);
@@ -2212,7 +2239,7 @@ enum StmtOutcome { Cont(Result<(), ShellError>), Stop(Result<(), ShellError>) }
 
 /// Run one gsh statement: a `let`/reassignment/`fail`, or - after `$`-expansion - a plain command
 /// handed to the existing `execute`. `vars` is the run's variable table; `params` its parameters.
-fn run_stmt(ctx: &ServiceContext, cwd: &mut Cwd, stmt: &str, prev: Result<(), ShellError>, depth: u8, vars: &mut Vars, params: &Params, out: &mut Out) -> StmtOutcome {
+fn run_stmt(ctx: &ShellCtx, cwd: &mut Cwd, stmt: &str, prev: Result<(), ShellError>, depth: u8, vars: &mut Vars, params: &Params, out: &mut Out) -> StmtOutcome {
     let (head, rest) = split_first(stmt);
     // `fail <msg>` - print loudly and stop the run with Err.
     if head == "fail" {
@@ -2445,7 +2472,7 @@ fn eval_arith(ctx: &ServiceContext, expr: &str, vars: &Vars, params: &Params) ->
 /// Evaluate a condition to a bool. A condition is: `!<cond>` (negated), `<lhs> in <words...>`
 /// (membership), `<lhs> <op> <rhs>` (comparison; `result` compares by kind), or a command (true iff
 /// it returns `Ok`). A command condition does NOT update `result` - only real statements do.
-fn eval_cond(ctx: &ServiceContext, cwd: &mut Cwd, cond: &str, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8) -> bool {
+fn eval_cond(ctx: &ShellCtx, cwd: &mut Cwd, cond: &str, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8) -> bool {
     // Strip leading `!` ITERATIVELY (a parity flag), never by native recursion: a long `!!!...` run
     // would otherwise recurse once per `!` and overflow the bounded user stack (§26.6.1 - the
     // no-native-recursion rule every other gsh construct obeys). Then evaluate the bare condition once.
@@ -2456,7 +2483,7 @@ fn eval_cond(ctx: &ServiceContext, cwd: &mut Cwd, cond: &str, vars: &Vars, param
 }
 
 /// Evaluate a condition that has had any leading `!` already stripped (see `eval_cond`). `cond` is trimmed.
-fn eval_cond_bare(ctx: &ServiceContext, cwd: &mut Cwd, cond: &str, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8) -> bool {
+fn eval_cond_bare(ctx: &ShellCtx, cwd: &mut Cwd, cond: &str, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8) -> bool {
     if cond.is_empty() { ctx.console_writeln("gsh: empty condition"); return false; }
     // Scan tokens for `in` (membership) or a comparison operator, so either side may be a multi-token
     // arithmetic expression (`$i + 1 > $max`), not just a single token (docs/scripting.md §3-§4).
@@ -2630,7 +2657,7 @@ enum Step {
 /// each condition in turn: on the first true one, returns `Enter(body, If)` (the executor runs that
 /// block, then its `}` skips the rest of the chain); if none is true, takes a trailing `else` if
 /// present, else returns `Done(next)`.
-fn handle_if(b: &[u8], mut pos: usize, ctx: &ServiceContext, cwd: &mut Cwd, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8, ft: &FnTable) -> Step {
+fn handle_if(b: &[u8], mut pos: usize, ctx: &ShellCtx, cwd: &mut Cwd, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8, ft: &FnTable) -> Step {
     loop {
         let open = match find_open_brace(b, pos) { Some(o) => o, None => { ctx.console_writeln("gsh: if: missing '{'"); return Step::Malformed(b.len()); } };
         let end = match find_matching_brace(b, open) { Some(e) => e, None => { ctx.console_writeln("gsh: if: unbalanced braces"); return Step::Malformed(b.len()); } };
@@ -2940,7 +2967,7 @@ fn fmt_walk_window(win: &[u8], eof: bool, depth: &mut usize, first: &mut bool,
 /// Stream `path` through the formatter, calling `emit` for each formatted run - constant memory (reads
 /// in chunks, holds only ONE partial statement). `UnitTooLong` if a single statement exceeds the hold;
 /// `Unparseable` if a block is left unclosed. No file-size limit.
-fn fmt_stream_pass(ctx: &ServiceContext, path: &[u8], emit: &mut dyn FnMut(&[u8]) -> bool) -> Result<(), FmtErr> {
+fn fmt_stream_pass(ctx: &ShellCtx, path: &[u8], emit: &mut dyn FnMut(&[u8]) -> bool) -> Result<(), FmtErr> {
     let mut work = [0u8; FMT_HOLD + FMT_RCHUNK];
     let mut hold = 0usize;
     let mut depth = 0usize;
@@ -2994,7 +3021,7 @@ fn parse_for_iter(b: &[u8], rest_start: usize, rest_end: usize) -> ForIter {
 
 /// Advance a `for` iterator by one: if a next item exists, set the loop var (`var`) to it and return
 /// the advanced iterator; else `None` (loop done). Words are `$`-expanded in the current scope.
-fn for_step(ctx: &ServiceContext, b: &[u8], vars: &mut Vars, var: usize, it: ForIter, params: &Params) -> Option<ForIter> {
+fn for_step(ctx: &ShellCtx, b: &[u8], vars: &mut Vars, var: usize, it: ForIter, params: &Params) -> Option<ForIter> {
     match it {
         ForIter::Range { cur, end } => {
             if cur >= end { return None; }
@@ -3044,7 +3071,7 @@ fn forlines_temp(id: u32, buf: &mut [u8; 24]) -> &[u8] {
 /// and the loop ends. A line is bytes up to `\n`; a final line without a trailing `\n` still counts;
 /// a trailing `\n` does not yield an extra empty line.
 #[inline(never)]
-fn forlines_step(ctx: &ServiceContext, vars: &mut Vars, var: usize, off: u32, id: u32) -> Option<ForIter> {
+fn forlines_step(ctx: &ShellCtx, vars: &mut Vars, var: usize, off: u32, id: u32) -> Option<ForIter> {
     let mut tb = [0u8; 24];
     let temp = forlines_temp(id, &mut tb);
     let mut rbuf = [0u8; IO_CHUNK];
@@ -3065,7 +3092,7 @@ fn forlines_step(ctx: &ServiceContext, vars: &mut Vars, var: usize, off: u32, id
 /// leaked by an errored prior run). Empty output -> no file (an empty loop). Loud + `Err` on a refused
 /// producer (run_captured said why), an over-16-KiB output, or a write failure.
 #[inline(never)]
-fn forlines_capture(ctx: &ServiceContext, cwd: &Cwd, inner: &str, temp: &[u8]) -> Result<(), ()> {
+fn forlines_capture(ctx: &ShellCtx, cwd: &Cwd, inner: &str, temp: &[u8]) -> Result<(), ()> {
     let _ = fs_request(ctx, OP_DELETE, temp, &[]);
     let mut rb = ReportBuf::new();
     let ok = { let mut o = Out::File(&mut rb); run_captured(ctx, cwd, inner, &mut o) };
@@ -3091,7 +3118,7 @@ fn forlines_capture(ctx: &ServiceContext, cwd: &Cwd, inner: &str, temp: &[u8]) -
 /// function's return (`min_depth` = that function's scope) and at script end / `fail` (`min_depth` =
 /// 0 = all). A deferred command runs like any statement; its result does NOT affect the script's
 /// control flow - defers are cleanup, run even on `fail`.
-fn run_defers(ctx: &ServiceContext, cwd: &mut Cwd, b: &[u8], defers: &mut [(usize, usize, usize)], ndefer: &mut usize, min_depth: usize, vars: &mut Vars, params: &Params, out: &mut Out, sdepth: u8) {
+fn run_defers(ctx: &ShellCtx, cwd: &mut Cwd, b: &[u8], defers: &mut [(usize, usize, usize)], ndefer: &mut usize, min_depth: usize, vars: &mut Vars, params: &Params, out: &mut Out, sdepth: u8) {
     loop {
         let mut idx = None;
         let mut i = *ndefer;
@@ -3267,7 +3294,7 @@ fn let_capture_form(s: &str) -> Option<(&str, bool, &str)> {
 /// a LIBRARY command (`health`), whose user asked for a dashboard, not a test report. Errors still
 /// print (each failing statement reports itself) and the Result still carries failure (§26.7 loud).
 /// `run`/`selfcheck` pass `false`: an orchestrated script run IS a report.
-fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool) -> Result<(), ShellError> {
+fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool) -> Result<(), ShellError> {
     // Per-run interpreter state: a bounded variable table, allocated once HERE (above `execute`) and
     // threaded by &mut into `run_stmt` - it never reaches `execute`/`pipe_run`'s frame. No heap (§26.6).
     let mut vars = Vars::new();
@@ -3701,7 +3728,7 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
 /// dispatcher is tiny on purpose: the 32 KiB `ReportBuf` lives ONLY in `run_and_save`, called only
 /// on the save path - so a bare run/selfcheck does NOT carry 32 KiB of unused frame (which would
 /// tip its already-heavy `| assert` sub-pipelines over the user-stack ceiling).
-fn run_with_optional_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, save: Option<&str>, params: &Params)
+fn run_with_optional_save(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, save: Option<&str>, params: &Params)
     -> Result<(), ShellError>
 {
     match save {
@@ -3714,7 +3741,7 @@ fn run_with_optional_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth
 /// (direct file write, no pipe). `#[inline(never)]` so the 32 KiB buffer exists only while a save
 /// is actually running, not in the frame of every bare run.
 #[inline(never)]
-fn run_and_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, spath: &str, params: &Params)
+fn run_and_save(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, spath: &str, params: &Params)
     -> Result<(), ShellError>
 {
     let mut pbuf = [0u8; PATH_MAX];
@@ -3744,7 +3771,7 @@ fn run_and_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, spat
 /// Write a report buffer to `path`, streaming to a multi-block file (the report exceeds one
 /// message). Quiet (the caller prints the human message); returns success. Reuses the same
 /// `WriteFile` / `WriteNew`+`WriteAt` shape as the pipe `write` sink, with no intermediate copy.
-fn save_report(ctx: &ServiceContext, path: &[u8], data: &[u8]) -> bool {
+fn save_report(ctx: &ShellCtx, path: &[u8], data: &[u8]) -> bool {
     // Bounded fs request (wall-clock): a chaos report is saved right after the storm may have hammered
     // fs, so the write must time out gracefully rather than hang the shell (the max-carnage aggregate
     // report is small → this single-message path).
@@ -3807,7 +3834,7 @@ fn library_script(name: &str) -> Option<&'static str> {
 /// tests have somewhere to write), then `selfcheck`. Re-runnable (the suite creates and deletes
 /// its own files). Refused inside a script (it runs one - no nesting).
 #[inline(never)]
-fn cmd_selfcheck(ctx: &ServiceContext, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<(), ShellError> {
+fn cmd_selfcheck(ctx: &ShellCtx, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<(), ShellError> {
     if depth > 0 {
         ctx.console_writeln("selfcheck: not available inside a script (it runs one)");
         return Err(ShellError::Unknown);
@@ -3836,7 +3863,7 @@ fn cmd_selfcheck(ctx: &ServiceContext, cwd: &mut Cwd, depth: u8, arg: &str) -> R
 /// `Err(AssertFailed)` + a `FAILED` line. This is the negative-test surface (§22's negative cases
 /// on hardware): `assert fails read /nope` verifies the guardrail refuses. The *content* form
 /// (`… | assert contains X`) is the pipe sink `assert_stream`.
-fn cmd_assert(ctx: &ServiceContext, cwd: &mut Cwd, rest: &str, depth: u8) -> Result<(), ShellError> {
+fn cmd_assert(ctx: &ShellCtx, cwd: &mut Cwd, rest: &str, depth: u8) -> Result<(), ShellError> {
     let (verb, cmd) = split_first(rest);
     match verb {
         "ok" | "fails" => {
@@ -4677,7 +4704,7 @@ fn cmd_mem(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     Ok(())
 }
 
-fn cmd_reboot(ctx: &ServiceContext) -> ! {
+fn cmd_reboot(ctx: &ShellCtx) -> ! {
     // Record the clock floor on the way down. This is what carries a BOOT-time network sync across the
     // power cycle: net-stack sets the clock but holds no filesystem authority, and the shell does - so a
     // deliberate reboot is the natural explicit moment to write it. Quiet + bounded: the machine is about
@@ -4789,7 +4816,7 @@ impl core::fmt::Write for EpochBuf {
 /// the shell is never granted it), and `fs` answers a write with a status byte that can say FS_ERR or
 /// "no filesystem". Treating "a reply arrived" as "it worked" is how a refused privileged operation gets
 /// reported to the operator as done (§26.7, invariant 12).
-fn clock_floor_persist(ctx: &ServiceContext, epoch: u32, quiet: bool) -> bool {
+fn clock_floor_persist(ctx: &ShellCtx, epoch: u32, quiet: bool) -> bool {
     if !ctx.set_clock_floor(epoch) {
         if !quiet { ctx.console_writeln("date: the kernel refused the clock floor - not recorded"); }
         return false;
@@ -4815,7 +4842,7 @@ fn clock_floor_persist(ctx: &ServiceContext, epoch: u32, quiet: bool) -> bool {
 /// SUCCESS (FS_OK is 0; 1 is FS_ERR), and skipping only one byte splices the length prefix into the data.
 /// That bug made a feature silently inert on every boot. Parsing it once, here, removes the failure mode
 /// for the next caller instead of leaving it lying around (§26.4 - one visible mechanism, not N copies).
-fn fs_read_file(ctx: &ServiceContext, path: &[u8], dst: &mut [u8], max_secs: i64) -> Option<usize> {
+fn fs_read_file(ctx: &ShellCtx, path: &[u8], dst: &mut [u8], max_secs: i64) -> Option<usize> {
     let r = fs_request_bounded(ctx, OP_READ_FILE, path, &[], max_secs)?;
     let p = r.payload_bytes();
     if p.first() != Some(&FS_OK) || p.len() < 5 { return None; }   // FS_NOTFOUND / FS_ERR / no filesystem
@@ -4830,7 +4857,7 @@ fn fs_read_file(ctx: &ServiceContext, path: &[u8], dst: &mut [u8], max_secs: i64
 /// a reading: it is not shown as the time and no "estimate" is derived from it (a machine powered off for
 /// six months would otherwise display a six-month-old timestamp indistinguishable from a measured one).
 /// Its whole job is to let the kernel REFUSE a clock value from before we last ran.
-fn clock_floor_seed(ctx: &ServiceContext) {
+fn clock_floor_seed(ctx: &ShellCtx) {
     let mut buf = [0u8; 24];
     let n = match fs_read_file(ctx, CLOCK_FLOOR_PATH, &mut buf, CLOCK_FS_SECS) {
         Some(n) if n > 0 => n,
@@ -4851,7 +4878,7 @@ fn clock_floor_seed(ctx: &ServiceContext) {
 /// no format strings or timezones (§26.2: minimal surface). The subcommand is `epoch`, not `unix`: this is
 /// not POSIX, so the vocabulary doesn't borrow its name. Displaying the time NEVER writes to disk - the
 /// floor is recorded at explicit moments only (`date sync`, and before `reboot`).
-fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     // `date sync` - fetch the time from the network (SNTP) via net-stack and set the wall clock. The Pi 2
     // has no battery-backed RTC, so `date` reads zeros until this runs (also done automatically at boot).
@@ -5736,7 +5763,7 @@ fn is_record_producer(name: &str) -> bool {
 /// build a record - and overflow the bounded user stack. Out-of-line, the big frame exists only
 /// while the builder actually runs.
 #[inline(never)]
-fn build_ls_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table> {
+fn build_ls_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut buf = [0u8; PATH_MAX];
     let path = resolve_or_err(ctx, cwd, arg, &mut buf)?;
     let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &[]) {
@@ -5831,7 +5858,7 @@ fn cap_rights_str(r: u8, buf: &mut [u8]) -> usize {
 /// drive in step 3; mirrors `drives_list`. Sizes are in MiB (so the column name carries the
 /// unit - a bare number cell can't).
 #[inline(never)]
-fn build_drives_table(ctx: &ServiceContext) -> Option<Table> {
+fn build_drives_table(ctx: &ShellCtx) -> Option<Table> {
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
     let reply = match fs_raw(ctx, &[OP_DRIVES_INFO], 3600) {
         Some(r) => r,
@@ -5887,7 +5914,7 @@ fn build_drives_table(ctx: &ServiceContext) -> Option<Table> {
 /// full `path`. Same bounded depth-first walk as `cmd_find`, emitting rows instead of printing
 /// the path. `arg` is the producer tail (`<pattern> [start]`).
 #[inline(never)]
-fn build_find_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table> {
+fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     let (target, start) = split_first(arg);
     if target.is_empty() { ctx.console_writeln("usage: find <name> [path]"); return None; }
     let start = if start.is_empty() { "/" } else { start };
@@ -5961,7 +5988,7 @@ enum Stream {
 /// `execute` (which would carry that 64 KiB into every command's frame, and via a nested
 /// `run → execute` chain overflow the user stack).
 #[inline(never)]
-fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), ShellError> {
+fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut stages = [""; MAX_STAGES];
     let mut n = 0usize;
     for part in line.split('|') {
@@ -6773,7 +6800,7 @@ fn is_record_producer_service(name: &str) -> bool {
 }
 
 /// Run a producer built-in (`cmd args`) with its output going to `out`.
-fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
+fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) {
     let (cmd, arg) = split_first(cmdline);
     match cmd {
         "echo"         => { let _ = cmd_echo(ctx, arg, out); }
@@ -6803,7 +6830,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
 /// is refused loudly. `out` is a small (16 KiB `ReportBuf`-backed) sink so it does NOT stack up
 /// against `pipe_run`'s own 64 KiB buffers on the pipeline path - the nested-capture overflow trap
 /// ([[project-shell-stack-pipe]]). Returns true on success.
-fn run_captured(ctx: &ServiceContext, cwd: &Cwd, inner: &str, out: &mut Out) -> bool {
+fn run_captured(ctx: &ShellCtx, cwd: &Cwd, inner: &str, out: &mut Out) -> bool {
     let inner = inner.trim();
     if inner.is_empty() { ctx.console_writeln("gsh: $( ) needs a command"); return false; }
     // A PIPELINE capture would stack its 128 KiB of pipe buffers on top of the interpreter's live
@@ -6851,7 +6878,7 @@ fn capture_form(v: &str) -> Option<&str> {
 /// A ReportBuf (16 KiB), not a Cap (64 KiB), so on the `$(pipe)` path it does not overflow the stack
 /// against pipe_run's own 64 KiB buffers. A value larger than the var arena is refused by `define`.
 #[inline(never)]
-fn capture_define(ctx: &ServiceContext, cwd: &Cwd, name: &str, inner: &str, mutable: bool, vars: &mut Vars) -> Result<(), ShellError> {
+fn capture_define(ctx: &ShellCtx, cwd: &Cwd, name: &str, inner: &str, mutable: bool, vars: &mut Vars) -> Result<(), ShellError> {
     let mut rb = ReportBuf::new();
     let ok = { let mut o = Out::File(&mut rb); run_captured(ctx, cwd, inner, &mut o) };
     if !ok { return Err(ShellError::Unknown); }
@@ -6863,7 +6890,7 @@ fn capture_define(ctx: &ServiceContext, cwd: &Cwd, name: &str, inner: &str, muta
 
 /// `name = $( cmd )` - reassign a mutable binding from captured command output.
 #[inline(never)]
-fn capture_reassign(ctx: &ServiceContext, cwd: &Cwd, name: &str, inner: &str, vars: &mut Vars) -> Result<(), ShellError> {
+fn capture_reassign(ctx: &ShellCtx, cwd: &Cwd, name: &str, inner: &str, vars: &mut Vars) -> Result<(), ShellError> {
     let mut rb = ReportBuf::new();
     let ok = { let mut o = Out::File(&mut rb); run_captured(ctx, cwd, inner, &mut o) };
     if !ok { return Err(ShellError::Unknown); }
@@ -6893,7 +6920,7 @@ fn parse_write_mode(arg: &str) -> (WriteMode, &str) {
 const WRITE_TMP: &[u8] = b"/.write.tmp"; // append/prepend staging file (root → no dirname math)
 
 /// Read exactly `out.len()` bytes from `path` at byte `off`, looping `read_at`. False on short read.
-fn read_file_exact(ctx: &ServiceContext, path: &[u8], off: usize, out: &mut [u8]) -> bool {
+fn read_file_exact(ctx: &ShellCtx, path: &[u8], off: usize, out: &mut [u8]) -> bool {
     let mut done = 0usize;
     let mut tmp = [0u8; IO_CHUNK];
     while done < out.len() {
@@ -6913,7 +6940,7 @@ fn read_file_exact(ctx: &ServiceContext, path: &[u8], off: usize, out: &mut [u8]
 /// `max_secs` (RTC) via `fs_read_at_bounded`, so a wedged/slow fs times out per chunk instead of blocking
 /// the shell before its input loop. False on short read, timeout, or any miss - the caller treats that as
 /// "no history" (§26.7). Only the startup load uses this; ordinary file commands keep the unbounded path.
-fn read_file_exact_bounded(ctx: &ServiceContext, path: &[u8], off: usize, out: &mut [u8], max_secs: i64) -> bool {
+fn read_file_exact_bounded(ctx: &ShellCtx, path: &[u8], off: usize, out: &mut [u8], max_secs: i64) -> bool {
     let mut done = 0usize;
     let mut tmp = [0u8; IO_CHUNK];
     while done < out.len() {
@@ -6931,7 +6958,7 @@ fn read_file_exact_bounded(ctx: &ServiceContext, path: &[u8], off: usize, out: &
 
 /// Overwrite `p` (resolved path) with `data`. Small payload → one WriteFile; larger → write_new +
 /// streamed write_at chunks (so a piped payload up to the capture buffer reaches the file).
-fn stream_overwrite(ctx: &ServiceContext, p: &[u8], data: &[u8]) {
+fn stream_overwrite(ctx: &ShellCtx, p: &[u8], data: &[u8]) {
     if data.len() <= IO_CHUNK {
         match fs_request(ctx, OP_WRITE_FILE, p, data) {
             Some(r) if r.payload_bytes().first() == Some(&FS_OK) =>
@@ -6964,7 +6991,7 @@ fn stream_overwrite(ctx: &ServiceContext, p: &[u8], data: &[u8]) {
 /// scratch), any file size. `prepend` is a **full-file rewrite** - there is no insert-at-front in
 /// the filesystem - so it costs the same as rewriting the file (honest, §26.7). True on success.
 #[inline(never)]
-fn fs_stream_combine(ctx: &ServiceContext, p: &[u8], new: &[u8], prepend: bool) -> bool {
+fn fs_stream_combine(ctx: &ShellCtx, p: &[u8], new: &[u8], prepend: bool) -> bool {
     let old_size = fs_stat(ctx, p).map(|(sz, _)| sz as usize).unwrap_or(0);
     let total = old_size + new.len();
     if total == 0 {
@@ -7007,7 +7034,7 @@ fn fs_stream_combine(ctx: &ServiceContext, p: &[u8], new: &[u8], prepend: bool) 
 
 /// The `write` pipe sink: `… | write [append|prepend] <path>`. Parses the mode (plain overwrites),
 /// resolves the path, and writes the captured/rendered `data`.
-fn pipe_write(ctx: &ServiceContext, cwd: &Cwd, arg: &str, data: &[u8]) {
+fn pipe_write(ctx: &ShellCtx, cwd: &Cwd, arg: &str, data: &[u8]) {
     let (mode, parg) = parse_write_mode(arg);
     let (pstr, _) = split_first(parg);
     if pstr.is_empty() { ctx.console_writeln("pipe: write needs a file path"); return; }
@@ -7216,7 +7243,7 @@ const CHAOS_SAVE_TOTAL_SECS: i64 = 30;
 /// `CHAOS_SAVE_TOTAL_SECS` of WALL-CLOCK time while `fs` finishes re-mounting after a chaos storm -
 /// reacquiring a fresh `fs` cap each round (it may have just respawned). Bounded: `save_report` is
 /// itself wall-clock-bounded, so this never hangs; it gives up gracefully when fs won't stabilise.
-fn chaos_save_retry(ctx: &ServiceContext, ppath: &[u8], data: &[u8]) -> bool {
+fn chaos_save_retry(ctx: &ShellCtx, ppath: &[u8], data: &[u8]) -> bool {
     let t0 = ctx.epoch_secs_monotonic();
     loop {
         let _ = ctx.reacquire_by_name("fs");
@@ -7254,7 +7281,7 @@ fn chaos_wait_recovery(ctx: &ServiceContext, name: &str, og: u32) -> bool {
     }
 }
 
-fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
+fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
     // Tokenize the raw line ourselves - `chaos kill-storm <svc> [rounds] [save <path>]` runs past
     // the shell's MAX_ARGS=4 tokenizer (6 tokens), so we can't rely on the shared `args` array.
     let mut tok: [&str; 8] = [""; 8];
@@ -7540,7 +7567,7 @@ fn chaos_launch(
 /// captured by the serial log); an optional `save <path>` then materialises it to a file once the
 /// target has recovered (best-effort - if fs was the target and is down, it falls back to the console).
 #[inline(never)]
-fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
+fn chaos_kill_storm(ctx: &ShellCtx, cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     if ntok < 2 {
         ctx.console_writeln("usage: chaos kill-storm <service> [rounds] [save <path>]   (service: supervisor | block-driver | fs)");
         return Err(ShellError::Unknown);
@@ -8095,11 +8122,17 @@ fn resolve_or_err<'a>(ctx: &ServiceContext, cwd: &Cwd, input: &str, out: &'a mut
 /// a zero byte can only be an untagged sender - a mismatch that fails loudly rather than aliasing a real
 /// tag. Wrapping is harmless: correlation only needs to distinguish requests that can be in flight at the
 /// same time, and there are at most a handful.
-fn next_fs_tag() -> u8 {
-    use core::sync::atomic::{AtomicU8, Ordering};
-    static FS_TAG: AtomicU8 = AtomicU8::new(0);
-    let t = FS_TAG.fetch_add(1, Ordering::Relaxed);
-    if t == 0 { FS_TAG.fetch_add(1, Ordering::Relaxed); 1 } else { t }
+fn next_fs_tag(ctx: &ShellCtx) -> u8 {
+    // C6-1: this counter used to be `static FS_TAG: AtomicU8` - unowned global mutable state
+    // (Invariant 9) wearing a thread-safe type. Nothing here is concurrent; the shell is one task on
+    // one core. It was a static because that was easier than giving it a home, which is how this
+    // violation always arrives.
+    //
+    // Its home is the fs channel, and the fs channel belongs to the shell, so it lives in `ShellCtx`.
+    let t = ctx.fs_tag.get().wrapping_add(1);
+    let t = if t == 0 { 1 } else { t };   // never 0: a zero tag can only be an untagged sender
+    ctx.fs_tag.set(t);
+    t
 }
 
 /// How many overtaken replies to discard before giving up. A desync is at most a few requests deep (the
@@ -8112,7 +8145,7 @@ const FS_STALE_MAX: u32 = 16;
 /// Discarding is safe precisely because the sender has moved on: a reply whose tag we are no longer
 /// waiting for belongs to a request whose caller has already returned. Keeping it would only let it be
 /// mistaken for a later answer, which is the failure this exists to end.
-fn fs_take_tagged(ctx: &ServiceContext, tag: u8, first: ReqOutcome, max_secs: i64) -> ReqOutcome {
+fn fs_take_tagged(ctx: &ShellCtx, tag: u8, first: ReqOutcome, max_secs: i64) -> ReqOutcome {
     let mut outcome = first;
     for _ in 0..FS_STALE_MAX {
         match outcome {
@@ -8141,8 +8174,8 @@ fn fs_take_tagged(ctx: &ServiceContext, tag: u8, first: ReqOutcome, max_secs: i6
 /// which fs would read as `tag = <opcode>` and dispatch on the byte after it - a silent misparse. Routing
 /// them through one helper is what makes "every name-addressed request carries a tag" true rather than
 /// mostly true (Commandment III: one path, not two).
-fn fs_raw(ctx: &ServiceContext, body: &[u8], max_secs: i64) -> Option<Message> {
-    let tag = next_fs_tag();
+fn fs_raw(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
+    let tag = next_fs_tag(ctx);
     let mut req = [0u8; 4096];
     req[0] = tag;
     let n = body.len().min(req.len() - 1);
@@ -8163,10 +8196,10 @@ fn fs_raw(ctx: &ServiceContext, body: &[u8], max_secs: i64) -> Option<Message> {
     }
 }
 
-fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
+fn fs_request(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
-    let tag = next_fs_tag();
+    let tag = next_fs_tag(ctx);
     req[0] = tag;
     req[1] = op;
     req[2] = pl as u8;
@@ -8211,7 +8244,7 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
         drain_stale_fs_replies(ctx);
         // The retry is a NEW request and needs its own tag - reusing the first one would accept the
         // dead instance's late reply as this one's answer, which is the whole class of bug being closed.
-        let tag2 = next_fs_tag();
+        let tag2 = next_fs_tag(ctx);
         let mut req2 = req;
         req2[0] = tag2;
         let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
@@ -8246,10 +8279,10 @@ const HIST_LOAD_SECS: i64 = 2;
 /// `fs_request` for the report save: the reply wait is bounded by `SAVE_FS_MAX_SECS` of wall-clock
 /// time (RTC), so a still-restarting `fs` can't block the shell forever (the bug behind `chaos
 /// max-carnage … save` hanging). Reacquire + retry once on a miss, then give up.
-fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8], max_secs: i64) -> Option<Message> {
+fn fs_request_bounded(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8], max_secs: i64) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
-    let tag = next_fs_tag();
+    let tag = next_fs_tag(ctx);
     req[0] = tag;
     req[1] = op;
     req[2] = pl as u8;
@@ -8275,7 +8308,7 @@ fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8], ma
     // `drain_stale_fs_replies`. The next request drains it instead, which is decisive.
     if ctx.reacquire_by_name("fs") {
         drain_stale_fs_replies(ctx);
-        let tag2 = next_fs_tag();
+        let tag2 = next_fs_tag(ctx);
         let mut req2 = req;
         req2[0] = tag2;
         let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
@@ -8326,12 +8359,12 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
 /// shown), `Timeout` = fs unreachable. On a Timeout (send failed - `fs` restarted, cached cap went
 /// EndpointDead, Phase D §14.3) it reacquires `fs` by name and retries once. The plain blocking
 /// `fs_request` stays for internal/cleanup ops (deletes, tests) the user never waits on interactively.
-fn fs_request_q(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome {
+fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome {
     const HINT_SECS: i64 = 2;    // print "(q to quit)" only if the wait lingers past this
     const MAX_SECS:  i64 = 3600; // effectively unbounded - fs replies fast now; q is the real exit
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
-    let tag = next_fs_tag();
+    let tag = next_fs_tag(ctx);
     req[0] = tag;
     req[1] = op;
     req[2] = pl as u8;
@@ -8344,7 +8377,7 @@ fn fs_request_q(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> ReqOu
         // Send failed (stale cap after an fs restart): reacquire by name and retry once, still hinted.
         // A fresh tag for the fresh request - see `fs_request`.
         ReqOutcome::Timeout if ctx.reacquire_by_name("fs") => {
-            let tag2 = next_fs_tag();
+            let tag2 = next_fs_tag(ctx);
             let mut req2 = req;
             req2[0] = tag2;
             let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
@@ -8364,16 +8397,16 @@ fn fs_request_q(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> ReqOu
 /// Conventions rule 9 (a blocking command stays q-abortable) is not optional for the longest commands in
 /// the system; those are the ones that need it most. Sends exactly `[op]`, matching what fs expects here
 /// (`fs_request_q` would append a path-length byte).
-fn fs_op_q(ctx: &ServiceContext, op: u8) -> ReqOutcome {
+fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
     const HINT_SECS: i64 = 2;    // print "(q to quit)" only once the wait lingers
     const MAX_SECS:  i64 = 3600; // effectively unbounded: q is the real exit, not a deadline
-    let tag = next_fs_tag();
+    let tag = next_fs_tag(ctx);
     let msg = Message::from_bytes(&[tag, op]);
     drain_stale_fs_replies(ctx);
     let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
     match fs_take_tagged(ctx, tag, first, MAX_SECS) {
         ReqOutcome::Timeout if ctx.reacquire_by_name("fs") => {
-            let tag2 = next_fs_tag();
+            let tag2 = next_fs_tag(ctx);
             let msg2 = Message::from_bytes(&[tag2, op]);
             let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
             fs_take_tagged(ctx, tag2, again, MAX_SECS)
@@ -8384,7 +8417,7 @@ fn fs_op_q(ctx: &ServiceContext, op: u8) -> ReqOutcome {
 
 /// Stat a path: `Some((size, is_dir))` if it exists, `None` otherwise. Used by the streaming
 /// read/copy paths to learn a file's size before chunking through it.
-fn fs_stat(ctx: &ServiceContext, path: &[u8]) -> Option<(u64, bool)> {
+fn fs_stat(ctx: &ShellCtx, path: &[u8]) -> Option<(u64, bool)> {
     let reply = fs_request(ctx, OP_STAT_FILE, path, &[])?;
     let p = reply.payload_bytes();
     if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
@@ -8396,7 +8429,7 @@ fn fs_stat(ctx: &ServiceContext, path: &[u8]) -> Option<(u64, bool)> {
 
 /// Read up to `IO_CHUNK` bytes from `path` at byte `offset` into `out`; returns bytes read
 /// (0 at EOF). One message - the building block for streaming a large file.
-fn fs_read_at(ctx: &ServiceContext, path: &[u8], offset: u64, out: &mut [u8]) -> Option<usize> {
+fn fs_read_at(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8]) -> Option<usize> {
     let mut tail = [0u8; 12];
     tail[..8].copy_from_slice(&offset.to_le_bytes());
     tail[8..12].copy_from_slice(&(IO_CHUNK as u32).to_le_bytes());
@@ -8416,7 +8449,7 @@ fn fs_read_at(ctx: &ServiceContext, path: &[u8], offset: u64, out: &mut [u8]) ->
 /// Deadline-bounded twin of `fs_stat` for the startup history load: the reply wait is capped at
 /// `max_secs` (RTC) via `fs_request_bounded`, so an alive-but-not-serving fs (respawned, still
 /// re-mounting) cannot hang the prompt. `None` on timeout/miss/absent, treated as "no file".
-fn fs_stat_bounded(ctx: &ServiceContext, path: &[u8], max_secs: i64) -> Option<(u64, bool)> {
+fn fs_stat_bounded(ctx: &ShellCtx, path: &[u8], max_secs: i64) -> Option<(u64, bool)> {
     let reply = fs_request_bounded(ctx, OP_STAT_FILE, path, &[], max_secs)?;
     let p = reply.payload_bytes();
     if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
@@ -8428,7 +8461,7 @@ fn fs_stat_bounded(ctx: &ServiceContext, path: &[u8], max_secs: i64) -> Option<(
 
 /// Deadline-bounded twin of `fs_read_at` for the startup history load - same per-chunk deadline
 /// discipline as `fs_stat_bounded`, so a stalled fs times out instead of blocking the shell.
-fn fs_read_at_bounded(ctx: &ServiceContext, path: &[u8], offset: u64, out: &mut [u8], max_secs: i64) -> Option<usize> {
+fn fs_read_at_bounded(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8], max_secs: i64) -> Option<usize> {
     let mut tail = [0u8; 12];
     tail[..8].copy_from_slice(&offset.to_le_bytes());
     tail[8..12].copy_from_slice(&(IO_CHUNK as u32).to_le_bytes());
@@ -8447,13 +8480,13 @@ fn fs_read_at_bounded(ctx: &ServiceContext, path: &[u8], offset: u64, out: &mut 
 
 /// Create/truncate `path` to hold `total` bytes (allocates the whole extent). Pairs with
 /// `fs_write_at` to stream a large file.
-fn fs_write_new(ctx: &ServiceContext, path: &[u8], total: u64) -> bool {
+fn fs_write_new(ctx: &ShellCtx, path: &[u8], total: u64) -> bool {
     matches!(fs_request(ctx, OP_WRITE_NEW, path, &total.to_le_bytes()),
              Some(r) if r.payload_bytes().first() == Some(&FS_OK))
 }
 
 /// Write `chunk` into `path` at block-aligned byte `offset`.
-fn fs_write_at(ctx: &ServiceContext, path: &[u8], offset: u64, chunk: &[u8]) -> bool {
+fn fs_write_at(ctx: &ShellCtx, path: &[u8], offset: u64, chunk: &[u8]) -> bool {
     let mut tail = [0u8; 8 + IO_CHUNK];
     tail[..8].copy_from_slice(&offset.to_le_bytes());
     let n = chunk.len().min(IO_CHUNK);
@@ -8480,7 +8513,7 @@ fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
 }
 
 /// `ls [path]` - list a directory.
-fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &[]) {
@@ -8531,7 +8564,7 @@ fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(
 /// for other failures (bad path, storage unavailable) until those get their own variants. The
 /// human-readable detail is still printed; the `Result` is the category.
 /// Open `path` via fs (`OP_OPEN`) and return the **file capability** the reply embeds, or `None`.
-fn fc_open(ctx: &ServiceContext, path: &[u8], rights: u8) -> Option<CapHandle> {
+fn fc_open(ctx: &ShellCtx, path: &[u8], rights: u8) -> Option<CapHandle> {
     let r = fs_request(ctx, OP_OPEN, path, &[rights])?;
     if r.payload_bytes().first() == Some(&FS_OK) {
         let h = ctx.take_pending_cap();
@@ -8586,7 +8619,7 @@ fn cmd_fcap_help(ctx: &ServiceContext) {
     ctx.console_writeln("  - revocable: the cap goes stale on close and on rename (no silent rebind)");
     ctx.console_writeln("It takes no path and never touches your files. See CLAUDE.md 7.10 / Test 14.");
 }
-fn cmd_fcap(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     if arg.trim() == "help" { cmd_fcap_help(ctx); return Ok(()); }
     if !arg.trim().is_empty() {
         ctx.console_writeln("fcap: takes no argument (it uses its own throwaway file). Try `fcap help`.");
@@ -8784,7 +8817,7 @@ impl Editor {
 
     /// Refill the window cache with the IO_CHUNK-aligned window of the original file containing
     /// original-file offset `abs`. On a read failure leaves `cache_len = 0`.
-    fn refill(&mut self, ctx: &ServiceContext, abs: usize) {
+    fn refill(&mut self, ctx: &ShellCtx, abs: usize) {
         let win = (abs / IO_CHUNK) * IO_CHUNK;
         let mut pbuf = [0u8; PATH_MAX];
         let pl = self.path_len;
@@ -8798,7 +8831,7 @@ impl Editor {
     /// Copy up to `n` logical bytes starting at document offset `logical` into `out`; returns the
     /// number actually copied (fewer than `n` only at end-of-document or on a read failure).
     /// Add-piece bytes come from memory; original-piece bytes come through the window cache.
-    fn read_span(&mut self, ctx: &ServiceContext, logical: usize, n: usize, out: &mut [u8]) -> usize {
+    fn read_span(&mut self, ctx: &ShellCtx, logical: usize, n: usize, out: &mut [u8]) -> usize {
         let want = n.min(out.len());
         let mut produced = 0usize;
         let (mut pi, mut off) = self.locate(logical);
@@ -8833,7 +8866,7 @@ impl Editor {
         produced
     }
 
-    fn byte_at(&mut self, ctx: &ServiceContext, pos: usize) -> Option<u8> {
+    fn byte_at(&mut self, ctx: &ShellCtx, pos: usize) -> Option<u8> {
         if pos >= self.total { return None; }
         let mut b = [0u8; 1];
         if self.read_span(ctx, pos, 1, &mut b) == 1 { Some(b[0]) } else { None }
@@ -8926,7 +8959,7 @@ impl Editor {
 
     /// Logical offset of the start of the line containing `pos` (just after the previous '\n', or
     /// 0). Bounded by EDIT_LINE_MAX - a longer line falls back to that many bytes back.
-    fn line_start(&mut self, ctx: &ServiceContext, pos: usize) -> usize {
+    fn line_start(&mut self, ctx: &ShellCtx, pos: usize) -> usize {
         let mut i = pos;
         let mut steps = 0;
         while i > 0 && steps < EDIT_LINE_MAX {
@@ -8936,7 +8969,7 @@ impl Editor {
         i
     }
     /// Logical offset of the '\n' ending the line containing `pos`, or `total` for the last line.
-    fn line_end(&mut self, ctx: &ServiceContext, pos: usize) -> usize {
+    fn line_end(&mut self, ctx: &ShellCtx, pos: usize) -> usize {
         let mut i = pos;
         let mut steps = 0;
         while i < self.total && steps < EDIT_LINE_MAX {
@@ -8946,13 +8979,13 @@ impl Editor {
         i
     }
     /// Count of '\n' bytes in `[from, to)` - the number of line breaks between two offsets.
-    fn lines_between(&mut self, ctx: &ServiceContext, from: usize, to: usize) -> usize {
+    fn lines_between(&mut self, ctx: &ShellCtx, from: usize, to: usize) -> usize {
         let mut n = 0; let mut i = from;
         while i < to { if self.byte_at(ctx, i) == Some(b'\n') { n += 1; } i += 1; }
         n
     }
     /// Advance `pos` forward by `k` line starts (stops at end-of-document).
-    fn advance_lines(&mut self, ctx: &ServiceContext, mut pos: usize, k: usize) -> usize {
+    fn advance_lines(&mut self, ctx: &ShellCtx, mut pos: usize, k: usize) -> usize {
         for _ in 0..k {
             let le = self.line_end(ctx, pos);
             if le >= self.total { return pos; }
@@ -8961,9 +8994,9 @@ impl Editor {
         pos
     }
 
-    fn move_home(&mut self, ctx: &ServiceContext) { let c = self.cur; self.cur = self.line_start(ctx, c); }
-    fn move_end(&mut self, ctx: &ServiceContext)  { let c = self.cur; self.cur = self.line_end(ctx, c); }
-    fn move_up(&mut self, ctx: &ServiceContext) {
+    fn move_home(&mut self, ctx: &ShellCtx) { let c = self.cur; self.cur = self.line_start(ctx, c); }
+    fn move_end(&mut self, ctx: &ShellCtx)  { let c = self.cur; self.cur = self.line_end(ctx, c); }
+    fn move_up(&mut self, ctx: &ShellCtx) {
         let c = self.cur;
         let ls = self.line_start(ctx, c);
         if ls == 0 { self.cur = 0; return; }
@@ -8972,7 +9005,7 @@ impl Editor {
         let plen = (ls - 1) - pls;              // previous line length (excluding its '\n')
         self.cur = pls + col.min(plen);
     }
-    fn move_down(&mut self, ctx: &ServiceContext) {
+    fn move_down(&mut self, ctx: &ShellCtx) {
         let c = self.cur;
         let le = self.line_end(ctx, c);
         if le >= self.total { self.cur = self.total; return; }
@@ -8982,7 +9015,7 @@ impl Editor {
         let nlen = self.line_end(ctx, nls) - nls;
         self.cur = nls + col.min(nlen);
     }
-    fn page(&mut self, ctx: &ServiceContext, down: bool) {
+    fn page(&mut self, ctx: &ShellCtx, down: bool) {
         for _ in 0..self.rows.saturating_sub(3).max(1) {
             if down { self.move_down(ctx) } else { self.move_up(ctx) }
         }
@@ -9022,7 +9055,7 @@ fn edit_bar(ctx: &ServiceContext, text: &[u8], width: usize) {
 /// time, scanning only across the viewport - never the whole file), draws the title bar, the
 /// visible text rows materialised from the piece table through the window cache, the status bar,
 /// then parks the terminal cursor. Only the visible window is ever read - the iOS-scroll property.
-fn edit_render(ctx: &ServiceContext, ed: &mut Editor, name: &[u8]) {
+fn edit_render(ctx: &ShellCtx, ed: &mut Editor, name: &[u8]) {
     use core::fmt::Write as _;
     let textrows = ed.rows.saturating_sub(2).max(1); // rows between the title and status bars
     let cols = ed.cols;
@@ -9102,7 +9135,7 @@ fn edit_render(ctx: &ServiceContext, ed: &mut Editor, name: &[u8]) {
 /// Save the document by streaming the piece spans to a temp file and atomically replacing the
 /// target, then RESET the add buffer + span list (the per-session edit budget). Returns false on
 /// any I/O failure, leaving `modified` set so the quit prompt still protects unsaved work.
-fn edit_save(ctx: &ServiceContext, ed: &mut Editor) -> bool {
+fn edit_save(ctx: &ShellCtx, ed: &mut Editor) -> bool {
     let mut pbuf = [0u8; PATH_MAX];
     let pl = ed.path_len;
     pbuf[..pl].copy_from_slice(&ed.path[..pl]);
@@ -9148,7 +9181,7 @@ fn edit_save(ctx: &ServiceContext, ed: &mut Editor) -> bool {
 
 /// Decode a CSI sequence (after `ESC [`) into an editor cursor/edit action. Mirrors the shell's
 /// line-editor `handle_csi`, but the actions move the document cursor instead of the prompt.
-fn edit_csi(ctx: &ServiceContext, ed: &mut Editor) {
+fn edit_csi(ctx: &ShellCtx, ed: &mut Editor) {
     let mut param: u16 = 0;
     let mut fb = 0u8;
     for _ in 0..8 {
@@ -9179,7 +9212,7 @@ fn edit_csi(ctx: &ServiceContext, ed: &mut Editor) {
 /// Quit handler: clean if unsaved changes are handled. Returns `true` if the editor should exit.
 /// With no unsaved changes, quits immediately; otherwise prompts on the status row (y = save then
 /// quit, n = discard and quit, anything else = cancel and keep editing).
-fn edit_try_quit(ctx: &ServiceContext, ed: &mut Editor) -> bool {
+fn edit_try_quit(ctx: &ShellCtx, ed: &mut Editor) -> bool {
     if !ed.modified { return true; }
     edit_goto(ctx, ed.rows, 1);
     edit_bar(ctx, b" unsaved changes  -  y = save & quit,  n = discard & quit,  any other key = keep editing",
@@ -9194,7 +9227,7 @@ fn edit_try_quit(ctx: &ServiceContext, ed: &mut Editor) -> bool {
 }
 
 #[inline(never)] // big stack frame (the piece table + add buffer) - keep it off hot call paths
-fn cmd_edit(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
+fn cmd_edit(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
     let arg = arg.trim();
     if arg.is_empty() {
         ctx.console_writeln("usage: edit <path>     e.g. edit /notes.txt");
@@ -9261,7 +9294,7 @@ fn cmd_edit(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError
     Ok(())
 }
 
-fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_read(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     // Stat first (one message) to learn the size, then STREAM the content in IO_CHUNK pieces
@@ -9302,7 +9335,7 @@ fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result
 /// content is free-form - they can't trail the way `mkdir … parents` does (it would be swallowed as
 /// content). Append/prepend stream through a temp file (`fs_stream_combine`), so they are not bound
 /// by a small buffer; `prepend` is a full-file rewrite (no insert-at-front - honest, §26.7).
-fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
+fn cmd_write(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
     let (mode, rest) = parse_write_mode(rest);
     if rest.is_empty() {
         ctx.console_writeln("usage: write [append|prepend] <path> [content]");
@@ -9356,7 +9389,7 @@ const FMT_IOBUF: usize = 3556;
 /// Stream-format `src` into a fresh temp `tmp` (2-pass: count the size for `OP_WRITE_NEW`, then
 /// stream-write). Reads `src` and writes `tmp` - DIFFERENT files, never `src` twice at once. Returns
 /// the formatted byte count. On failure deletes the temp; the caller leaves `src` untouched.
-fn fmt_to_temp(ctx: &ServiceContext, src: &[u8], tmp: &[u8]) -> Result<u64, FmtErr> {
+fn fmt_to_temp(ctx: &ShellCtx, src: &[u8], tmp: &[u8]) -> Result<u64, FmtErr> {
     let mut total = 0u64;
     {
         let mut count = |bytes: &[u8]| -> bool { total += bytes.len() as u64; true };
@@ -9393,7 +9426,7 @@ fn fmt_to_temp(ctx: &ServiceContext, src: &[u8], tmp: &[u8]) -> Result<u64, FmtE
 
 /// Stream-compare two files; true iff byte-identical. Reads them SEQUENTIALLY (one then the other),
 /// so it is safe even when one path is the source (no two concurrent reads of the same file).
-fn fmt_compare_files(ctx: &ServiceContext, a: &[u8], b: &[u8]) -> bool {
+fn fmt_compare_files(ctx: &ShellCtx, a: &[u8], b: &[u8]) -> bool {
     let mut off = 0u64;
     let mut ba = [0u8; FMT_IOBUF];
     let mut bb = [0u8; FMT_IOBUF];
@@ -9411,7 +9444,7 @@ fn fmt_compare_files(ctx: &ServiceContext, a: &[u8], b: &[u8]) -> bool {
 /// cap). `fmt check <path>` - report (loud + `Err`) whether it is already canonical, without writing.
 /// Guardrails (loud, file UNTOUCHED): won't-parse (unbalanced braces), or a single statement too long
 /// to hold. The format write streams into a temp then renames, so a failure never damages the original.
-fn cmd_fmt(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
+fn cmd_fmt(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
     let rest = rest.trim();
     let (check, pathstr) = match rest.split_once(char::is_whitespace) {
         Some(("check", p)) => (true, p.trim()),
@@ -9436,7 +9469,7 @@ fn cmd_fmt(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError
 }
 
 /// Format or check ONE file. Bare `fmt [check] <path>`, and per-file (sequentially) for a comma-list.
-fn fmt_one(ctx: &ServiceContext, cwd: &Cwd, check: bool, pathstr: &str) -> Result<(), ShellError> {
+fn fmt_one(ctx: &ShellCtx, cwd: &Cwd, check: bool, pathstr: &str) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, pathstr, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut pcopy = [0u8; PATH_MAX];
@@ -9481,7 +9514,7 @@ fn fmt_one(ctx: &ServiceContext, cwd: &Cwd, check: bool, pathstr: &str) -> Resul
 }
 
 /// `mkdir <path> [parents]` - create a directory (with `parents`, create missing parents).
-fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
+fn cmd_mkdir(ctx: &ShellCtx, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
     // `mkdir a,b,c` creates each; `parents` applies to every segment. Report each, continue past a failure.
     if arg.contains(',') {
         let mut n = 0usize;
@@ -9496,7 +9529,7 @@ fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) -> Resul
 }
 
 /// Create ONE directory. Bare `mkdir <path> [parents]`, and per-segment for a comma-list.
-fn mkdir_one(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
+fn mkdir_one(ctx: &ShellCtx, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let op = if parents { OP_MKDIR_P } else { OP_MKDIR };
@@ -9519,7 +9552,7 @@ fn mkdir_one(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) -> Resul
 }
 
 /// `cd [path]` - change the current directory (validates it exists + is a directory).
-fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) -> Result<(), ShellError> {
+fn cmd_cd(ctx: &ShellCtx, cwd: &mut Cwd, arg: &str) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     // `cd -` toggles to the previous directory (already an absolute, normalized path - use it
     // directly, then run the same stat-validated switch so a since-deleted dir errors loudly).
@@ -9562,7 +9595,7 @@ fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) -> Result<(), ShellErr
 /// `copy <src> <dst>` - copy a file by STREAMING it through fixed chunks (read_at/write_at),
 /// so it copies files far larger than one IPC message with no whole-file buffer. File-only in
 /// this cut (no recursive dirs - that's `copy … recursive`).
-fn cmd_copy(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
+fn cmd_copy(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
     let mut sbuf = [0u8; PATH_MAX];
     let spath = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut sp = [0u8; PATH_MAX];
@@ -9605,7 +9638,7 @@ fn cmd_copy(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(),
 /// each child either copy the file (read+write, existing ops) or push the subdir. No new fs
 /// surface - copy already lives in the shell. Loud if the tree is wider than the walk's cap
 /// (§3.12), and refuses to copy a directory into its own subtree (would never terminate).
-fn cmd_copy_tree(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
+fn cmd_copy_tree(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
     let mut sbuf = [0u8; PATH_MAX];
     let src_abs = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut sp = [0u8; PATH_MAX];
@@ -9679,21 +9712,21 @@ fn cmd_copy_tree(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Resul
 }
 
 /// Stat a path: `Some(is_dir)` if it exists, `None` if not (or storage is down).
-fn stat_kind(ctx: &ServiceContext, path: &[u8]) -> Option<bool> {
+fn stat_kind(ctx: &ShellCtx, path: &[u8]) -> Option<bool> {
     let reply = fs_request(ctx, OP_STAT_FILE, path, &[])?;
     let p = reply.payload_bytes();
     if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 { Some(p[10] != 0) } else { None }
 }
 
 /// `mkdir <path>` via fs, treating success as true. Used by recursive copy to recreate dirs.
-fn mkdir_at(ctx: &ServiceContext, path: &[u8]) -> bool {
+fn mkdir_at(ctx: &ShellCtx, path: &[u8]) -> bool {
     matches!(fs_request(ctx, OP_MKDIR, path, &[]), Some(r) if r.payload_bytes().first() == Some(&FS_OK))
 }
 
 /// Stream-copy a file `src`→`dst` of any size: stat the size, allocate `dst`, then chunk
 /// through with `read_at`/`write_at` (one IO_CHUNK buffer, no whole-file buffer). Returns
 /// `Some(bytes)` on success. The building block under both `copy` and recursive `copy`.
-fn copy_file_streaming(ctx: &ServiceContext, src: &[u8], dst: &[u8]) -> Option<u64> {
+fn copy_file_streaming(ctx: &ShellCtx, src: &[u8], dst: &[u8]) -> Option<u64> {
     let (size, is_dir) = fs_stat(ctx, src)?;
     if is_dir { return None; }
     if !fs_write_new(ctx, dst, size) { return None; }
@@ -9710,7 +9743,7 @@ fn copy_file_streaming(ctx: &ServiceContext, src: &[u8], dst: &[u8]) -> Option<u
 
 /// Copy one file `src`→`dst` by streaming. Returns true on success; logs on failure so a
 /// single bad file in a subtree copy is visible but does not abort the whole walk (§3.12).
-fn copy_one(ctx: &ServiceContext, src: &[u8], dst: &[u8]) -> bool {
+fn copy_one(ctx: &ShellCtx, src: &[u8], dst: &[u8]) -> bool {
     match copy_file_streaming(ctx, src, dst) {
         Some(_) => true,
         None => { ctx.console_writeln_fmt(format_args!("copy: skipped (copy failed): {}", str_of(src))); false }
@@ -9729,7 +9762,7 @@ fn remap(dst_root: &[u8], src_root: &[u8], s: &[u8], out: &mut [u8; PATH_MAX]) -
 
 /// `rename <path> <newname>` - rename an entry in place (not a move; newname is one
 /// component). fs edits the directory entry; no blocks are read or freed.
-fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) -> Result<(), ShellError> {
+fn cmd_rename(ctx: &ShellCtx, cwd: &Cwd, path: &str, newname: &str) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut pp = [0u8; PATH_MAX];
@@ -9750,7 +9783,7 @@ fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) -> Res
 /// `delete <path>` - remove a file or empty directory; `delete <path> recursive` removes a
 /// whole subtree. fs does the work either way (plain = `OP_DELETE`, recursive =
 /// `OP_DELETE_TREE`, a depth-bounded subtree free); it frees the blocks and reclaims them.
-fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(), ShellError> {
+fn cmd_delete(ctx: &ShellCtx, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(), ShellError> {
     // `delete /a,/b` deletes each; `recursive` applies to every segment. Report each, continue past one
     // that is missing / fails.
     if arg.contains(',') {
@@ -9766,7 +9799,7 @@ fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) -> Re
 }
 
 /// Delete ONE path. Bare `delete <path> [recursive]`, and per-segment for a comma-list.
-fn delete_one(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(), ShellError> {
+fn delete_one(ctx: &ShellCtx, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     if path == b"/" {
@@ -9791,7 +9824,7 @@ fn delete_one(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) -> Re
 }
 
 /// `move <src> <dst>` - relocate an entry (same data; only the directory entries change).
-fn cmd_move(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
+fn cmd_move(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
     let mut sbuf = [0u8; PATH_MAX];
     let spath = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut sp = [0u8; PATH_MAX];
@@ -9826,7 +9859,7 @@ fn cmd_move(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(),
 /// is bounded (a fixed pending-directory stack) and **loud on truncation** (§26.6/§3.12);
 /// the `fs_index` accelerator (persistence.md §6.5) is what we'd build if this walk ever
 /// gets too slow on a huge tree - not before.
-fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_find(ctx: &ShellCtx, cwd: &Cwd, target: &str, start: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut sbuf = [0u8; PATH_MAX];
     let start_abs = match resolve_or_err(ctx, cwd, start, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut stack = PathStack::new();
@@ -9894,7 +9927,7 @@ const TREE_PREFIX_MAX: usize = TREE_MAX_DEPTH * 6;
 /// `#[inline(never)]`: holds the ~12 KiB `TreeStack` + prefix scratch off the hot pipe frame
 /// (it's a pipe producer; see [[project-shell-stack-pipe]]).
 #[inline(never)]
-fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let start = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     match stat_kind(ctx, start) {
@@ -10118,7 +10151,7 @@ fn parse_match<'a>(args: &[&'a str], argc: usize, start: usize) -> Option<(bool,
 /// `match [except] <pattern> <path>` - print the lines of `<path>` that match (or, with
 /// `except`, that do not). The pipe form filters piped input instead; either way `match` is a
 /// FILTER, never a pipe producer (use `read <path> | match …` to feed a pipeline from a file).
-fn cmd_match(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
+fn cmd_match(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
     let (invert, pattern, path) = match parse_match(args, argc, 1) {
         Some(t) => t,
         None => { ctx.console_writeln("usage: match [except] <pattern> <path>"); return Err(ShellError::Unknown); }
@@ -10210,7 +10243,7 @@ fn write_count(ctx: &ServiceContext, input: &[u8], out: &mut Out) {
 
 /// `count <path>` - count the lines / words / bytes of a file. The pipe form `<producer> |
 /// count` counts piped input instead; either way `count` consumes input (never a producer).
-fn cmd_count(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
+fn cmd_count(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
     let path = if argc >= 2 { args[1] } else { "" };
     if path.is_empty() {
         ctx.console_writeln("count: a path is required (or pipe input: <producer> | count)");
@@ -10290,7 +10323,7 @@ fn write_sorted(ctx: &ServiceContext, input: &[u8], reverse: bool, out: &mut Out
 
 /// `sort [reverse] <path>` - print a file's lines in order. The pipe form `<producer> | sort`
 /// sorts piped input instead; either way `sort` consumes input (never a producer).
-fn cmd_sort(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
+fn cmd_sort(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
     let (reverse, path) = parse_sort(args, argc, 1);
     if path.is_empty() {
         ctx.console_writeln("sort: a path is required (or pipe input: <producer> | sort)");
@@ -10376,7 +10409,7 @@ fn write_last(ctx: &ServiceContext, input: &[u8], n: usize, out: &mut Out) {
 
 /// `first [N] <path>` / `last [N] <path>` - print a file's first/last N lines (default 10). The
 /// pipe form `<producer> | first [N]` takes from piped input; either way it consumes input.
-fn cmd_take(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize, last: bool) -> Result<(), ShellError> {
+fn cmd_take(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize, last: bool) -> Result<(), ShellError> {
     let name = if last { "last" } else { "first" };
     let (n, path) = parse_take(args, argc, 1);
     if path.is_empty() {
@@ -10442,7 +10475,7 @@ impl PathStack {
 // Step 3: the data primitives `flash` / `label` / list (boot layer + multi-drive later).
 // ---------------------------------------------------------------------------
 
-fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) -> Result<(), ShellError> {
+fn cmd_drives(ctx: &ShellCtx, args: &[&str], argc: usize) -> Result<(), ShellError> {
     let sub = if argc >= 2 { args[1] } else { "" };
     match sub {
         ""        => drives_list(ctx),
@@ -10524,7 +10557,7 @@ fn drive_sel_ok(ctx: &ServiceContext, sel: &str) -> bool {
 
 
 /// `drives` - list the attached drive (single-drive in step 3; index 0).
-fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
+fn drives_list(ctx: &ShellCtx) -> Result<(), ShellError> {
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
     let reply = match fs_raw(ctx, &[OP_DRIVES_INFO], 3600) {
         Some(r) => r,
@@ -10581,7 +10614,7 @@ fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
 /// be the GSFS target), and a confirmation prompt cannot convey that - `drives` shows it as an
 /// unformatted raw disk either way. So the danger is named explicitly and the override is a word the
 /// operator has to type.
-fn drives_flash(ctx: &ServiceContext, label: &str, force: bool) -> Result<(), ShellError> {
+fn drives_flash(ctx: &ShellCtx, label: &str, force: bool) -> Result<(), ShellError> {
     if label.len() > LABEL_MAX {
         ctx.console_writeln_fmt(format_args!("drives: label too long (max {})", LABEL_MAX));
         return Err(ShellError::Unknown);
@@ -10622,7 +10655,7 @@ fn drives_flash(ctx: &ServiceContext, label: &str, force: bool) -> Result<(), Sh
 
 /// `drives reset` - un-format the drive back to raw (zero the superblock). Destructive;
 /// a quick clean slate for re-testing the raw→flash path. NOT a secure wipe.
-fn drives_reset(ctx: &ServiceContext, force: bool) -> Result<(), ShellError> {
+fn drives_reset(ctx: &ShellCtx, force: bool) -> Result<(), ShellError> {
     ctx.console_write("This un-formats the drive back to raw (ERASES). Continue? [y/N] ");
     if !read_confirm(ctx) {
         ctx.console_writeln("drives: aborted");
@@ -10651,7 +10684,7 @@ fn drives_reset(ctx: &ServiceContext, force: bool) -> Result<(), ShellError> {
 /// count from it, and verify every block's CRC. Repairs allocation drift non-destructively;
 /// reports (does not delete) files/dirs whose blocks fail their CRC. No confirmation needed -
 /// it never erases data. Reply: [FS_OK, files:u32, dirs:u32, bad:u32, used:u64, free:u64].
-fn drives_check(ctx: &ServiceContext) -> Result<(), ShellError> {
+fn drives_check(ctx: &ShellCtx) -> Result<(), ShellError> {
     // q-abortable: a whole-disk pass can run for minutes on a slow stick, and a shell parked in an
     // unbounded request cannot see the keystroke that asks it to stop (conventions rule 9).
     match fs_op_q(ctx, OP_CHECK) {
@@ -10689,7 +10722,7 @@ fn drives_check(ctx: &ServiceContext) -> Result<(), ShellError> {
 /// CRC, report, change NOTHING on disk (distinct from `check`, which repairs the bitmap). Run it
 /// on a schedule to catch latent bit-rot early; without redundancy it detects but cannot repair.
 /// Reply: [FS_OK, files:u32, dirs:u32, bad:u32, scanned:u64].
-fn drives_scrub(ctx: &ServiceContext) -> Result<(), ShellError> {
+fn drives_scrub(ctx: &ShellCtx) -> Result<(), ShellError> {
     // q-abortable: a whole-disk pass can run for minutes on a slow stick, and a shell parked in an
     // unbounded request cannot see the keystroke that asks it to stop (conventions rule 9).
     match fs_op_q(ctx, OP_SCRUB) {
@@ -10724,7 +10757,7 @@ fn drives_scrub(ctx: &ServiceContext) -> Result<(), ShellError> {
 }
 
 /// `drives label <name>` - name / rename the drive (rewrites the superblock).
-fn drives_label(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
+fn drives_label(ctx: &ShellCtx, name: &str) -> Result<(), ShellError> {
     let nb = name.as_bytes();
     if nb.is_empty() || nb.len() > LABEL_MAX {
         ctx.console_writeln_fmt(format_args!("drives: label must be 1..{} chars", LABEL_MAX));
