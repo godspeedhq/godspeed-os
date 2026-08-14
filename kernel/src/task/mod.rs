@@ -834,7 +834,31 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
             send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
             send_peers_grant:  false,
-            // ARM KEEPS THIS ON CORE 0, and the reason is NOT the one that used to be written here.
+            // ARM KEEPS THIS ON CORE 0 - and the reason is neither of the two written here before.
+            // Both were wrong, and hardware refuted each in turn.
+            //
+            //   1. "The `msc_*` syscalls refuse when `!on_core0()`." True until slice 5 deleted the
+            //      in-kernel DWC2 stack; now provably false (no `on_core0` reference remains in
+            //      `arch/arm`, and `usb_disk_*` are inert stubs).
+            //   2. "Cross-core request/reply does not complete." False. Unpinned services stalled
+            //      because `dwc2` DROPPED block requests when it had no disk (fixed separately), not
+            //      because of cores; with that fixed they came up correctly on all four.
+            //
+            // The real reason is LATENCY, and it was found by an operator noticing `ls` and `read`
+            // had gone sluggish: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB, so the
+            // scheduler's cross-core wake does nothing and the target core does not notice a message
+            // until its next 10 ms timer tick. Cross-core IPC costs up to a full quantum PER HOP, and
+            // a file read is shell -> fs -> block-driver -> dwc2. Unpinning turned a same-core chain
+            // into three cross-core hops and made every command visibly slow. The giveaway was that a
+            // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
+            // chain again.
+            //
+            // So these stay together until the IPI exists (BCM2836 core mailboxes). That is the fix
+            // that unpins all three at once, and it is what would make SMP mean anything on this
+            // port. Until then this is a WORKAROUND FOR A KERNEL GAP, recorded as one rather than
+            // dressed up as a property of the driver.
+            //
+            // (Superseded rationale kept below so the next reader sees what was believed and why.)
             //
             // The old reason - the in-kernel DWC2 stack's `msc_*` entry points refused when
             // `!on_core0()` - died with slice 5, and is verifiably gone (no `on_core0` reference
@@ -852,7 +876,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
             // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
             // unpins these three, and it unpins them everywhere at once.
-            preferred_core:    if cfg!(target_arch = "arm") { u32::MAX } else { 1 },
+            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[],
@@ -874,7 +898,31 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             #[cfg(not(target_arch = "arm"))]
             send_peers:        &[],
             send_peers_grant:  false,
-            // ARM KEEPS THIS ON CORE 0, and the reason is NOT the one that used to be written here.
+            // ARM KEEPS THIS ON CORE 0 - and the reason is neither of the two written here before.
+            // Both were wrong, and hardware refuted each in turn.
+            //
+            //   1. "The `msc_*` syscalls refuse when `!on_core0()`." True until slice 5 deleted the
+            //      in-kernel DWC2 stack; now provably false (no `on_core0` reference remains in
+            //      `arch/arm`, and `usb_disk_*` are inert stubs).
+            //   2. "Cross-core request/reply does not complete." False. Unpinned services stalled
+            //      because `dwc2` DROPPED block requests when it had no disk (fixed separately), not
+            //      because of cores; with that fixed they came up correctly on all four.
+            //
+            // The real reason is LATENCY, and it was found by an operator noticing `ls` and `read`
+            // had gone sluggish: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB, so the
+            // scheduler's cross-core wake does nothing and the target core does not notice a message
+            // until its next 10 ms timer tick. Cross-core IPC costs up to a full quantum PER HOP, and
+            // a file read is shell -> fs -> block-driver -> dwc2. Unpinning turned a same-core chain
+            // into three cross-core hops and made every command visibly slow. The giveaway was that a
+            // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
+            // chain again.
+            //
+            // So these stay together until the IPI exists (BCM2836 core mailboxes). That is the fix
+            // that unpins all three at once, and it is what would make SMP mean anything on this
+            // port. Until then this is a WORKAROUND FOR A KERNEL GAP, recorded as one rather than
+            // dressed up as a property of the driver.
+            //
+            // (Superseded rationale kept below so the next reader sees what was believed and why.)
             //
             // The old reason - the in-kernel DWC2 stack's `msc_*` entry points refused when
             // `!on_core0()` - died with slice 5, and is verifiably gone (no `on_core0` reference
@@ -892,7 +940,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
             // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
             // unpins these three, and it unpins them everywhere at once.
-            preferred_core:    if cfg!(target_arch = "arm") { u32::MAX } else { 1 },
+            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             // GENET's macirq on aarch64 (SPI 157 -> neutral vector 0x2A). x86's nic-driver is a
@@ -914,7 +962,31 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // is the clock's policy, so the reading is handed over rather than written to a syscall.
             send_peers:        &["nic-driver", "time"],    // the frame interface; reacquired by name on death
             send_peers_grant:  false,
-            // ARM KEEPS THIS ON CORE 0, and the reason is NOT the one that used to be written here.
+            // ARM KEEPS THIS ON CORE 0 - and the reason is neither of the two written here before.
+            // Both were wrong, and hardware refuted each in turn.
+            //
+            //   1. "The `msc_*` syscalls refuse when `!on_core0()`." True until slice 5 deleted the
+            //      in-kernel DWC2 stack; now provably false (no `on_core0` reference remains in
+            //      `arch/arm`, and `usb_disk_*` are inert stubs).
+            //   2. "Cross-core request/reply does not complete." False. Unpinned services stalled
+            //      because `dwc2` DROPPED block requests when it had no disk (fixed separately), not
+            //      because of cores; with that fixed they came up correctly on all four.
+            //
+            // The real reason is LATENCY, and it was found by an operator noticing `ls` and `read`
+            // had gone sluggish: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB, so the
+            // scheduler's cross-core wake does nothing and the target core does not notice a message
+            // until its next 10 ms timer tick. Cross-core IPC costs up to a full quantum PER HOP, and
+            // a file read is shell -> fs -> block-driver -> dwc2. Unpinning turned a same-core chain
+            // into three cross-core hops and made every command visibly slow. The giveaway was that a
+            // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
+            // chain again.
+            //
+            // So these stay together until the IPI exists (BCM2836 core mailboxes). That is the fix
+            // that unpins all three at once, and it is what would make SMP mean anything on this
+            // port. Until then this is a WORKAROUND FOR A KERNEL GAP, recorded as one rather than
+            // dressed up as a property of the driver.
+            //
+            // (Superseded rationale kept below so the next reader sees what was believed and why.)
             //
             // The old reason - the in-kernel DWC2 stack's `msc_*` entry points refused when
             // `!on_core0()` - died with slice 5, and is verifiably gone (no `on_core0` reference
@@ -932,7 +1004,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
             // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
             // unpins these three, and it unpins them everywhere at once.
-            preferred_core:    if cfg!(target_arch = "arm") { u32::MAX } else { 1 },
+            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[],
