@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# The xHCI USB host driver, a SERVICE rather than kernel code - the move that closed Commandment I on
+# the AArch64 port by deleting 2742 lines of ring-0 driver (CLAUDE.md §6.4, 2026-08-09). Pinned to core
+# 2 so its MSI lands on the core that runs it (docs/power.md: co-locating the interrupt with the driver
+# is what took it from 100% CPU to idle).
+#
+# IOMMU-confined to its DMA arena where an IOMMU exists; on a machine without one it is trust-critical
+# by necessity, and the boot log says which case holds (§6.4).
+name    = "xhci"
+version = "0.1.0"
+
+[resources.memory]
+request = "32MiB"
+limit   = "64MiB"
+
+[capabilities]
+ipc_receive = ["xhci"]
+hw_device   = "xhci"
+hw_interrupt = [40]   # 0x28
+log_write   = true
+
+[placement]
+core = 2

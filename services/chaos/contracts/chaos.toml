@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# `chaos` is the fault injector: it kills services, storms spawns, and floods queues to prove the system
+# recovers (Commandment II). It needs SERVICE_CONTROL to kill and SPAWN to storm - both granted by name
+# in the kernel rather than through this contract, so what is written here is not the whole of its
+# authority. That gap is finding C4-1 and is recorded, not hidden.
+name    = "chaos"
+version = "0.1.0"
+
+[resources.memory]
+request = "4MiB"
+limit   = "8MiB"
+
+[capabilities]
+ipc_receive = ["chaos"]
+log_write   = true
+
+[placement]
+core = 0

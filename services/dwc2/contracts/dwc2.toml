@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# ARM32 (Raspberry Pi 2) ONLY. The DWC2 USB host, moved out of the kernel into a service. It drives the
+# hub, the keyboard, mass storage and USB-Ethernet, so `block-driver` and `nic-driver` both name it as a
+# peer and it is watched for restart (C5-1) - its permanent death would take storage, input and the
+# network with it.
+#
+# Its real authority is wider than this file can express: a fixed MMIO window and DMA arena granted at
+# spawn by hardware class, CONSOLE_PUSH to deliver keystrokes, and USB_DISK. Those are kernel by-name
+# grants (C4-1), not contract capabilities.
+name    = "dwc2"
+version = "0.1.0"
+
+[resources.memory]
+request = "32MiB"
+limit   = "64MiB"
+
+[capabilities]
+ipc_receive = ["dwc2"]
+hw_device   = "dwc2"
+hw_interrupt = [41]   # 0x29, the BCM2836 USB line
+log_write   = true
+
+[placement]
+core = 0

@@ -70,7 +70,10 @@ def parse_service_hw(source: str) -> dict:
     if not m:
         return {}
     body = m.group(1)
-    cls = {"Ahci": "ahci", "Nic": "nic", "Xhci": "xhci", "Ehci": "ehci", "None": None}
+    # Every HwClass the kernel can return must appear here. A missing entry silently maps to None and
+    # then reports "contract says X, kernel says None" - blaming the contract for the parser's gap.
+    # `Dwc2` was missing, which is how a service written this session looked like a contract error.
+    cls = {"Ahci": "ahci", "Nic": "nic", "Xhci": "xhci", "Ehci": "ehci", "Dwc2": "dwc2", "None": None}
     out: dict = {}
     for arm in re.finditer(r'((?:"[^"]+"\s*\|?\s*)+)=>\s*\(\s*HwClass::(\w+)\s*,\s*(true|false)\s*\)', body):
         names = re.findall(r'"([^"]+)"', arm.group(1))
@@ -79,6 +82,17 @@ def parse_service_hw(source: str) -> dict:
         for nm in names:
             out[nm] = (hw, mint)
     return out
+
+
+def kernel_core_consts(source: str) -> dict:
+    """`pub const XHCI_CORE: u32 = 2;` -> {"XHCI_CORE": 2}.
+
+    `preferred_core` is often a NAMED constant rather than a literal, and a parser that reads only
+    digits reports `None` for it - which then looks like the contract disagreeing with the kernel when
+    in fact the two agree and the reader cannot see it. Resolve the names instead of blaming the file.
+    """
+    return {m.group(1): int(m.group(2))
+            for m in re.finditer(r"pub const ([A-Z_]+_CORE): u32 = (\d+);", source)}
 
 
 def parse_kernel(name: str, source: str) -> dict | None:
@@ -108,6 +122,13 @@ def parse_kernel(name: str, source: str) -> dict | None:
         cm = re.search(r'preferred_core:\s*(\d+)', body)
         if cm:
             core = int(cm.group(1))
+        else:
+            # A NAMED constant (`preferred_core: XHCI_CORE`). Reading only digits reported None here,
+            # which then looks like the contract disagreeing with the kernel when the two actually
+            # agree - the parser's gap, presented as the file's fault.
+            cn = re.search(r'preferred_core:\s*([A-Z_]+_CORE)', body)
+            if cn:
+                core = kernel_core_consts(source).get(cn.group(1))
 
     send = []
     sm = re.search(r'send_peers:\s*&\[([^\]]*)\]', body)

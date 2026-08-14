@@ -752,7 +752,6 @@ still running alongside.
 | File | Change | Why |
 |------|--------|-----|
 | `arch/aarch64/uart_rx.rs` | new, 2 | The bounded FIFO drain (volatile PL011 reads plus the error-clear write) and the ring `pop`, whose slot the producer published with a Release store. |
-| `arch/aarch64/sched_spawn.rs` | 0 -> 2 (+2) | The echo task's stack and context - the only way to prove serial input end to end short of a shell, which cannot exist until this does. |
 
 ## 2026-08-04 - Pi 4: the SAME cache bug, in the loader this time (feat/pi4-aarch64)
 
@@ -1738,7 +1737,6 @@ QEMU (`raspi2b`); the default image is unregressed (`preempt selftest PASS 9/9/9
 |------|--------|-----|
 | `arch/arm/context_switch.rs` | 14 -> 13 (-1) | `new_user` is now **real**: it builds a context whose first `switch_context` drops to PL0 via a new `user_entry_trampoline` (installs the user stack, fabricates a USR-mode SPSR with IRQs on, `movs pc`). The loud `user_mode_unimplemented` stub it replaced is deleted - net one fewer `unsafe`. `switch_context` also gained a `TLBIALL` on the TTBR0-change branch (SEC-26/27: an ARM address-space switch does not implicitly flush), inside the existing naked block (no new `unsafe`). |
 | `arch/arm/page_tables.rs` | 21 -> 23 (+2) | `clean_invalidate_dcache_all` (set/way `DCCISW`) moved here from `spawn.rs` as the shared home for cache maintenance: it makes a service's page-table descriptors visible to the non-cacheable walker once at spawn, so `switch_context` needs no per-switch cache work. The `unsafe fn` + its asm block are the +2. |
-| `arch/arm/sched_user.rs` | 0 -> 6 (new file) | Loads the logger as a scheduled **USER** task (its own TTBR0), commits it plus two spinning kernel tasks to the neutral `scheduler::run(0)`, cleans the D-cache once, and arms `NEUTRAL_SCHED`. The `unsafe` is the static-stack setup and the `new_user`/`new_kernel`/`commit_task` calls. Gated behind `arm-sched-user`. |
 | `arch/arm/spawn.rs` | unchanged count | Refactored to expose `neutral_bootstrap` + `load_logger_into_slot` (shared with `sched_user`) and to call `page_tables::clean_invalidate_dcache_all` rather than a private copy. No net `unsafe` change. |
 
 **What this proves.** A real GodspeedOS service (`logger`) runs *through* the neutral scheduler on ARM,
@@ -2313,7 +2311,6 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 |---|---|---|
 | arch/aarch64/mod.rs | 68 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
-| arch/aarch64/sched_spawn.rs | 2 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
 | arch/aarch64/exceptions.rs | 15 | permitted |
 | arch/aarch64/uaccess.rs | 7 | permitted |
@@ -2343,9 +2340,8 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/dwc2.rs | 34 | permitted |
 | arch/arm/page_tables.rs | 31 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
-| arch/arm/sched_user.rs | 6 | permitted |
 | arch/arm/sched_ipc.rs | 9 | permitted |
-| arch/arm/spawn.rs | 8 | permitted |
+| arch/arm/spawn.rs | 4 | permitted |
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 4 | permitted |
@@ -2363,7 +2359,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/iommu.rs | 74 | permitted |
 | arch/x86_64/mod.rs | 36 | permitted |
 | arch/x86_64/page_tables.rs | 51 | permitted |
-| arch/x86_64/pci.rs | 19 | permitted |
+| arch/x86_64/pci.rs | 20 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 15 | permitted |
 | capability/table.rs | 7 | permitted |
@@ -2390,7 +2386,11 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 
 > **2026-06-28** (branch `hardening/dma-reserve-pool`). **Audit reconciliation** - three permitted-layer
 > files drifted (each line already carrying a `// SAFETY:` comment; the counts just weren't bumped as the
-> work landed). `arch/x86_64/pci.rs` 17 → 19: `clear_bus_master` + `set_bus_master`, the PCI bus-master
+> `arch/x86_64/pci.rs` 19 → 20 (C8-1, 2026-08-14): one `rdtsc()` helper, added when the two BIOS-handoff
+> waits stopped counting register reads and started bounding themselves by a clock (Commandment VIII).
+> A helper rather than four inline blocks: the same idea is tested twice in each of two places, and
+> repeating `unsafe` would have grown the audited surface fourfold for one read of a CPU counter.
+> `arch/x86_64/pci.rs` 17 → 19: `clear_bus_master` + `set_bus_master`, the PCI bus-master
 > quiesce on DMA-driver kill/spawn that cures the max-carnage DMA-after-free (commit `ffe1a0f`).
 > `memory/allocator.rs` 32 → 37: one from the page-table reclaim guard (`phys_in_ram`, commit `b9dbc4c`)
 > and four from the DMA permanent-reserve net (§12) added on this branch - `alloc_dma_arena` (the reserving
