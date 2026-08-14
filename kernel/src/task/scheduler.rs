@@ -1969,7 +1969,7 @@ pub fn kill_task_by_slot(slot: usize) {
         // recovered", not "legitimately closed". The respawn reads the new count via next_restart_count.
         if matches!(task_name,
             "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "supervisor" | "counter"
-            | "nic-driver" | "net-stack")
+            | "nic-driver" | "net-stack" | "dwc2")
         {
             bump_name_restart(task_name);
         }
@@ -1989,8 +1989,13 @@ pub fn kill_task_by_slot(slot: usize) {
         // `counter` (examples/counter) is restartable too: it persists its state to `fs` and
         // reconstructs it on respawn (§14/§15), so its own death notifies the supervisor, which
         // respawns it (counter-test build only - it is absent elsewhere, so this never fires there).
+        // C5-1: `dwc2` was MISSING from this set, and it is the ARM32 USB host - storage, keyboard and
+        // networking all ride on it. It was spawned and never watched, so its death took all three down
+        // until reboot: a service made special by omission rather than by decision, which is the version
+        // of that violation nobody argues for and everybody ships. It is arm-only, so on other ports the
+        // name simply never appears here (the same shape as `counter`, which exists in one build).
         if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "counter"
-            | "nic-driver" | "net-stack") {
+            | "nic-driver" | "net-stack" | "dwc2") {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),

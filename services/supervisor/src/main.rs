@@ -629,6 +629,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if respawn_retry(&ctx, &mut name_map, "ehci") { ctx.log("supervisor: ehci restarted"); }
                 else { ctx.log("supervisor: ehci restart FAILED"); }
             }
+            // dwc2 (ARM32 only): the Pi 2's USB host. block-driver and nic-driver both name it as a
+            // peer, so its permanent death takes storage, the keyboard and networking with it - which
+            // is exactly why nothing may be exempt from restart (C5-1). Its respawn re-grants the
+            // DWC2 MMIO window, DMA arena and IRQ, re-initialises the controller and re-enumerates;
+            // clients reacquire it by name and retry (§14.3).
+            "dwc2" => {
+                ctx.log("supervisor: dwc2 died, restarting");
+                if respawn_retry(&ctx, &mut name_map, "dwc2") { ctx.log("supervisor: dwc2 restarted"); }
+                else { ctx.log("supervisor: dwc2 restart FAILED"); }
+            }
             "logger" => {
                 ctx.log("supervisor: logger died, restarting");
                 if respawn_retry(&ctx, &mut name_map, "logger") { ctx.log("supervisor: logger restarted"); }
