@@ -35,6 +35,8 @@ const REQ_TYPE_PORT_IN: u8 = 0xA3;
 const REQ_SET_FEATURE: u8 = 0x03;
 const REQ_CLEAR_FEATURE: u8 = 0x01;
 const REQ_GET_STATUS: u8 = 0x00;
+/// USB 2.0 §11.24.2.3 - flush one TT buffer. The only way out of a permanent NYET.
+const REQ_CLEAR_TT_BUFFER: u8 = 0x08;
 
 // Port features.
 const FEAT_PORT_RESET: u16 = 4;
@@ -98,6 +100,48 @@ fn port_feature(
     ];
     let mut none: [u8; 0] = [];
     chan::control(ctx, mmio, dma, t, &setup, &mut none, false, 0)
+}
+
+/// Flush a wedged transaction-translator buffer (USB 2.0 §11.24.2.3, `Clear_TT_Buffer`).
+///
+/// **This is the recovery for a keyboard that goes silent and stays silent.** A low-speed device
+/// behind a high-speed hub is reached through the hub's TT, which buffers the low-speed transaction
+/// and hands the result back when the host asks with a complete-split. If the host never successfully
+/// collects it, that buffer stays occupied and the TT answers NYET to every complete-split from then
+/// on - forever, because nothing in the transfer path clears it.
+///
+/// Measured on this board, in the window where the keyboard was dead: **1497 polls, 1497 NYET**, zero
+/// data, zero NAK, zero errors. Not a scheduling problem and not a lost report - one stuck buffer,
+/// and the driver had no way to say so because it had no way to clear it. The spec's answer is this
+/// request; Linux issues it from `usb_hub_clear_tt_buffer` for exactly this case.
+///
+/// `wValue` packs the pipe the TT should forget: endpoint number, device address, endpoint type and
+/// direction. `wIndex` is the hub port the TT serves. The request goes to the HUB (direct, high
+/// speed), never to the stuck device - which is the point, since the device is unreachable.
+pub fn clear_tt_buffer(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, hub: &Target,
+    dev_addr: u8, ep: u8, ep_type: u8, dir_in: bool, port: u8,
+) -> bool {
+    let wvalue: u16 = ((ep as u16) & 0xF)
+        | (((dev_addr as u16) & 0x7F) << 4)
+        | (((ep_type as u16) & 0x3) << 11)
+        | if dir_in { 1 << 15 } else { 0 };
+    let setup = [
+        REQ_TYPE_PORT_OUT,          // 0x23: host-to-device, class, OTHER (a port)
+        REQ_CLEAR_TT_BUFFER,
+        (wvalue & 0xFF) as u8,
+        (wvalue >> 8) as u8,
+        port,
+        0,
+        0,
+        0,
+    ];
+    let mut none: [u8; 0] = [];
+    let ok = chan::control(ctx, mmio, dma, hub, &setup, &mut none, false, 0);
+    ctx.log_fmt(format_args!(
+        "dwc2-svc: Clear_TT_Buffer for addr {} ep {} on hub port {} - {}",
+        dev_addr, ep, port, if ok { "accepted" } else { "REFUSED (the TT stays wedged)" }));
+    ok
 }
 
 /// Read one downstream port's status. `None` if the request failed.

@@ -251,6 +251,9 @@ pub fn poll(
         use crate::regs::*;
         let known = HCINT_XFERCOMPL | HCINT_NAK | HCINT_CHHLTD | HCINT_STALL | HCINT_NYET
             | HCINT_XACTERR | HCINT_ACK;
+        if hcint & HCINT_NYET == 0 {
+            state.nyet_run = 0; // anything else is the TT answering, so it is not wedged
+        }
         if hcint == 0 {
             state.n_silent = state.n_silent.wrapping_add(1);
         } else if hcint & HCINT_STALL != 0 {
@@ -263,6 +266,7 @@ pub fn poll(
             state.n_data = state.n_data.wrapping_add(1);
         } else if hcint & HCINT_NYET != 0 {
             state.n_nyet = state.n_nyet.wrapping_add(1);
+            state.nyet_run = state.nyet_run.wrapping_add(1);
         } else {
             state.n_other = state.n_other.wrapping_add(1);
             state.last_other = hcint;
@@ -320,6 +324,32 @@ pub fn poll(
         //
         // The cost is honest and bounded: holding a key for longer than this window stops repeating.
         // That is a small annoyance. Spraying 391 characters is a bug.
+        // A WEDGED TT NEVER RECOVERS ON ITS OWN, so stop asking and clear it.
+        //
+        // Ordinary NYET means "the TT is not done yet, ask again" and resolves within a few
+        // microframes. A run of them means its buffer is stuck holding a transaction we never
+        // collected, and no number of further complete-splits will change that - measured here as
+        // 1497 consecutive polls, all NYET, across a keyboard that was dead the whole time.
+        //
+        // The threshold is generous on purpose: at a 10 ms poll period this is ~1 s of solid NYET,
+        // far beyond any legitimate busy TT, so a healthy device is never disturbed. And the recovery
+        // is bounded - clear it, reset the run, and if it wedges again the next second clears it
+        // again, which is a loud repeating log line rather than a silently dead keyboard.
+        const NYET_WEDGED: u32 = 100;
+        if state.nyet_run >= NYET_WEDGED {
+            state.nyet_run = 0;
+            let hub_port = (splt & 0x7F) as u8;
+            let hub_addr = ((splt >> 7) & 0x7F) as u8;
+            let hub = Target { addr: hub_addr, mps: 64, low_speed: false };
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: keyboard TT wedged - {} consecutive NYET, no data; clearing the hub's TT buffer",
+                NYET_WEDGED));
+            let _ = crate::hub::clear_tt_buffer(
+                ctx, mmio, dma, &hub, t.addr, kbd.ep, 3 /* interrupt */, true /* IN */, hub_port);
+            // The next poll starts a fresh start-split; the toggle is read back from hardware, so
+            // there is no software state to reset here.
+        }
+
         let now = ctx.read_tsc();
         if hcint & crate::regs::HCINT_NAK != 0 {
             let proven = state.last_data != 0
@@ -424,6 +454,10 @@ pub struct KeyState {
     /// an unexpected combination names itself instead of being filed under "other".
     pub n_other: u32,
     pub last_other: u32,
+    /// Consecutive polls that ended in NYET with no data in between. A wedged transaction translator
+    /// answers NYET to every complete-split forever, so this is the counter that distinguishes "the
+    /// TT is briefly busy", which is ordinary, from "the TT will never answer again", which is not.
+    pub nyet_run: u32,
 }
 
 impl KeyState {
@@ -441,7 +475,7 @@ impl KeyState {
             emitted_report: 0,
             last_data: 0,
             n_data: 0, n_nak: 0, n_nyet: 0, n_stall: 0, n_xacterr: 0, n_silent: 0,
-            n_other: 0, last_other: 0,
+            n_other: 0, last_other: 0, nyet_run: 0,
             // ~1.5 s. Long enough that a deliberate hold keeps repeating through the initial 600 ms
             // delay and well beyond, short enough that a broken poll path stops within a couple of
             // characters instead of running to the next keypress.
