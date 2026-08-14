@@ -170,9 +170,14 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 /// The restartable services the supervisor is responsible for (§6.1). Hoisted so the scan, `reconcile`,
 /// and `converge` share ONE roster. Order matters: block-driver before fs before shell (each wires to
 /// the previous); nic-driver before net-stack.
-const MANAGED_N: usize = 8;
+const MANAGED_N: usize = 10;
 const MANAGED: [&str; MANAGED_N] =
-    ["block-driver", "fs", "shell", "xhci", "ehci", "logger", "nic-driver", "net-stack"];
+    ["block-driver", "fs", "shell", "xhci", "ehci", "logger", "nic-driver", "net-stack",
+     // C1-6: both moved OUT of the kernel and so must be started BY someone. `time` owns the wall
+     // clock the shell and net-stack now ask for; `control` owns the COM2 operator channel the test
+     // harness drives. A service that is embedded and configured but never spawned is the C5-1 shape
+     // one step earlier - not "unwatched", but never started at all.
+     "time", "control"];
 
 /// Scan REAL liveness via `task_stat` (NOT a cap-acquire, which the kernel directory keeps succeeding
 /// for a dead name - the `ensure_*` stale-cap-adopt race, line ~149): which MANAGED services have a live
@@ -415,6 +420,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (0 on ARM for the reason above). Overriding here pinned only the BOOT spawn - the restart path
     // passes no override, so a respawned block-driver silently landed on a different core than the
     // one it requires. One source of placement, consulted by both paths.
+    // time + control: started BEFORE the shell, because the shell asks `time` for the clock source on
+    // its first prompt and net-stack asks it to accept an SNTP reading. Neither holds hardware, so
+    // neither can delay the prompt the way a driver bring-up would.
+    ensure_mapped(&ctx, &mut name_map, "time", 0xFFFF);
+    ensure_mapped(&ctx, &mut name_map, "control", 0xFFFF);
     ensure_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
     // fs needs a disk → bare-metal / blockdev only.
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]
