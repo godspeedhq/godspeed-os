@@ -301,7 +301,45 @@ and the harness retries. That is the same discipline demanded of every other cli
 exempting the test harness from it would be assuming the harness is special.
 
 Both are real work, the same shape as taking USB out of the kernel - and the third instance of that
-shape in this audit, with C1-5's 218 service configs and C4-1's by-name grants.
+shape in this audit, with C1-5's 218 service configs and C4-1's by-name grants. `time` proved the shape
+works: three slices, tree building throughout, and the kernel surface SHRANK.
+
+### control.rs - blocked on one decision, not on effort
+
+`KILL` and `RESTART` map cleanly onto `SERVICE_CONTROL` + `SPAWN`, so a service can do them. **`FIRE_IRQ`
+cannot move**: it injects an interrupt through `arch::interrupts::fire_test_irq`, no capability exists
+for that, and inventing one would mean ADDING a kernel authority in order to remove a kernel module.
+
+If `control.rs` keeps even one command it still exists with no legitimate role, so C1-6 stays open on it
+regardless of how much moves. The decision is what happens to `FIRE_IRQ`:
+
+1. **Delete it.** Identity tests IR1A/IR1B lose interrupt-routing verification - they inject IRQ 33/34
+   and assert delivery to a userspace driver, and a real device interrupt is not deterministic enough to
+   replace that.
+2. **A capability-gated syscall.** Honest, but grows the syscall pin to shrink a module, and hands a test
+   hook real authority.
+3. **Accept a smaller control.rs.** One command, still roleless, finding stays open.
+
+The rest of the design, once that is settled: the kernel keeps `com2_try_read_byte` (transport, already
+sanctioned as the serial console) and exposes a byte to userspace; a `control` service reads it, buffers
+a line, parses, and acts through the capabilities it holds. Note the irony to weigh: that transport
+needs a query, so the introspection pin grows by one to delete ~45 lines of parsing and three kernel
+actions. Probably worth it - the pin counts SURFACES, and a byte read is mechanism while command
+interpretation is policy - but it should be a deliberate trade, not a surprise.
+
+### fbcon - a console service, and the shell already asks the wrong party
+
+1,172 lines, of which the kernel needs almost none: a panic must be visible on a machine whose only
+output is a framebuffer, and that is a font blit and a cursor. Everything else - `handle_csi`,
+`execute_csi`, attributes, `erase_line_to_eol`, `blank_block`, the shadow grid, scroll - is terminal
+emulation the shell drives.
+
+The evidence that the boundary is already misplaced: `dims_packed` is exposed through `InspectKernel`
+query 9, so the shell asks the KERNEL for its console geometry. That is a service's question.
+
+Sliced the same way `time` was: (1) a `console` service owning the emulator, rendering through the
+kernel's existing byte path; (2) the shell talks to it instead of to console syscalls; (3) the kernel
+keeps a minimal panic blit and the rest is deleted, including query 9.
 
 **`clock.rs` + `wallclock.rs` - the `clock` SERVICE. Sliced, in progress.**
 
