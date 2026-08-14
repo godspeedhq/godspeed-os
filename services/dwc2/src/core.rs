@@ -135,6 +135,43 @@ pub fn reset_and_host_mode(ctx: &ServiceContext, mmio: &Mmio) -> bool {
     // with an FIQ state machine (`dwc_otg.fiq_fsm_enable`), which is what you build when the core
     // cannot schedule splits by itself. If that is what this reports, an interrupt-driven periodic
     // path is not a matter of programming the controller differently - it needs a different mechanism.
+    // How long does it take this task to WAKE?
+    //
+    // This is the number that decides whether the keyboard can be driven the way Linux drives it.
+    // Linux does not spin on microframes - it takes the SOF interrupt every 125 us and starts whatever
+    // periodic transfer is due. Its handler is in-kernel, where an interrupt is cheap. Ours would cross
+    // into a userspace service, so the same design costs 8000 wakes per second, and whether that is
+    // cheaper or far more expensive than the 4.6% of a core the spin costs today is a fact about THIS
+    // board that nobody has measured.
+    //
+    // The variant worth measuring is the cleaner one: rather than SOF (which would need the kernel to
+    // read USB registers, undoing slice 5), the service sleeps until the microframe boundary using the
+    // 1 MHz system timer. That works if, and only if, a short sleep lands with less than ~125 us of
+    // jitter - one microframe. Overshoot the window and the transaction translator has already
+    // discarded the response, so a laggy wake does not cost time, it costs the keystroke.
+    //
+    // So: request a 1-microframe sleep repeatedly and report what actually elapsed. Min, mean and MAX,
+    // because the max is the one that decides it - a schedule is only as good as its worst wake.
+    {
+        const UFRAME_US: u64 = 125;
+        const N: u64 = 64;
+        // `duration_cycles` takes whole ms and floors to 1, so derive the sub-ms count directly from
+        // the calibration instead: ticks_per_10ms / 80 = ticks per 125 us.
+        let per_uframe = (ctx.tsc_ticks_per_10ms() / 80).max(1);
+        let (mut lo, mut hi, mut sum) = (u64::MAX, 0u64, 0u64);
+        for _ in 0..N {
+            let t0 = ctx.read_tsc();
+            ctx.sleep(per_uframe);
+            let d = ctx.read_tsc().wrapping_sub(t0);
+            lo = lo.min(d); hi = hi.max(d); sum += d;
+        }
+        // Report in microseconds against the 125 us target, so the answer needs no arithmetic to read.
+        let per_us = (ctx.tsc_ticks_per_10ms() / 10_000).max(1);
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: wake latency for a {} us sleep - min {} us, mean {} us, MAX {} us (target {} us;              a wake later than that loses the microframe, and with it the keystroke)",
+            UFRAME_US, lo / per_us, (sum / N) / per_us, hi / per_us, UFRAME_US));
+    }
+
     let hwcfg4 = mmio.read32(GHWCFG4);
     let arch = (mmio.read32(GHWCFG2) >> GHWCFG2_ARCH_SHIFT) & GHWCFG2_ARCH_MASK;
     ctx.log_fmt(format_args!(
