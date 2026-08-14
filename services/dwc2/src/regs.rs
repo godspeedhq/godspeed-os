@@ -21,6 +21,19 @@ pub(crate) const GNPTXFSIZ:usize = 0x028; // non-periodic transmit FIFO size
 pub(crate) const GSNPSID:  usize = 0x040; // Synopsys core ID ("OT2" + release, e.g. 0x4F54_294A)
 pub(crate) const GHWCFG2:  usize = 0x048; // hardware config 2 (architecture, HS PHY type)
 pub(crate) const GHWCFG3:  usize = 0x04C; // hardware config 3 (bits 31:16 = total DFIFO depth in 32-bit words)
+pub(crate) const GHWCFG4:  usize = 0x050; // hardware config 4 (bit 30 = descriptor/scatter-gather DMA)
+
+/// GHWCFG2 bits 2:3 - OTG architecture. 2 = internal DMA (what buffer-DMA mode requires).
+pub(crate) const GHWCFG2_ARCH_SHIFT: u32 = 3;
+pub(crate) const GHWCFG2_ARCH_MASK: u32 = 0x3;
+/// GHWCFG4 bit 30 - the core implements DESCRIPTOR (scatter/gather) DMA.
+///
+/// This one bit decides whether the controller can walk a periodic schedule on its own and interrupt
+/// only on completion, or whether software must sequence every start-split and complete-split against
+/// 125 us microframe deadlines. It is the difference between an interrupt-driven keyboard and a
+/// busy-waiting one, so it is READ and REPORTED rather than assumed either way.
+pub(crate) const GHWCFG4_DESC_DMA: u32 = 1 << 30;
+pub(crate) const GHWCFG4_DESC_DMA_DYN: u32 = 1 << 31;
 pub(crate) const HPTXFSIZ: usize = 0x100; // host periodic transmit FIFO size
 // --- Host-mode registers ---
 pub(crate) const HCFG:     usize = 0x400; // host config (PHY clock select)

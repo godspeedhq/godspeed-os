@@ -121,6 +121,28 @@ pub fn reset_and_host_mode(ctx: &ServiceContext, mmio: &Mmio) -> bool {
     let dfifo_depth = mmio.read32(GHWCFG3) >> 16;
     ctx.log_fmt(format_args!(
         "dwc2-svc: DFIFO depth {} words; sizing RX/NPTX/PTX 774/256/512 (Linux bcm2835)", dfifo_depth));
+
+    // What can this core SCHEDULE for itself?
+    //
+    // The keyboard costs real CPU because software sequences every split transaction by hand: spin to
+    // a microframe boundary, arm the channel, spin until it halts, repeat for the complete-split. The
+    // only way the controller can do that itself - and interrupt once, on completion - is DESCRIPTOR
+    // (scatter/gather) DMA, where it walks a per-microframe descriptor list without software in the
+    // loop. Whether this silicon has it is one bit, and the whole design of an interrupt-driven
+    // periodic path rests on it, so read it and say so rather than assuming in either direction.
+    //
+    // The precedent says expect NO: the Raspberry Pi's own dwc_otg driver solves this exact problem
+    // with an FIQ state machine (`dwc_otg.fiq_fsm_enable`), which is what you build when the core
+    // cannot schedule splits by itself. If that is what this reports, an interrupt-driven periodic
+    // path is not a matter of programming the controller differently - it needs a different mechanism.
+    let hwcfg4 = mmio.read32(GHWCFG4);
+    let arch = (mmio.read32(GHWCFG2) >> GHWCFG2_ARCH_SHIFT) & GHWCFG2_ARCH_MASK;
+    ctx.log_fmt(format_args!(
+        "dwc2-svc: GHWCFG2={:#010x} GHWCFG4={:#010x} - arch {} ({}), descriptor DMA {}{}",
+        mmio.read32(GHWCFG2), hwcfg4, arch,
+        match arch { 0 => "slave-only", 1 => "external DMA", 2 => "internal DMA", _ => "reserved" },
+        if hwcfg4 & GHWCFG4_DESC_DMA != 0 { "SUPPORTED" } else { "NOT supported" },
+        if hwcfg4 & GHWCFG4_DESC_DMA_DYN != 0 { " (dynamic)" } else { "" }));
     if dfifo_depth != 0 && dfifo_depth < RX_WORDS + NPTX_WORDS + PTX_WORDS {
         ctx.log("dwc2-svc: WARN DFIFO too small for the bcm2835 layout - USB may be unstable under load");
         ok = false;
