@@ -250,6 +250,18 @@ pub fn poll(
     // counter climbed at ~2/second with nothing typed, which made it useless for the one question it
     // exists to answer - are keystrokes reaching us, or reaching us and failing to decode?
     if hcint & crate::regs::HCINT_XFERCOMPL == 0 || hcint & crate::regs::HCINT_NAK != 0 {
+        // AUTO-REPEAT IS DRIVEN FROM HERE, and this is the only place it can be driven from.
+        //
+        // A USB boot keyboard reports on CHANGE only: press "d" and it sends one report, then
+        // NOTHING until something changes. So while a key is held, every poll lands on exactly this
+        // NAK path - and the repeat timer was only ever advanced by `decode_keyboard`, which needs a
+        // report. The timer therefore could not tick during the one condition it exists to serve, and
+        // holding a key produced a single "d" forever.
+        //
+        // `KeyRepeat::poll` is documented "call once per poll iteration" and was called zero times per
+        // poll iteration. The repeat machinery was complete, calibrated, and unreachable - which is
+        // why this reads as a missing feature rather than a broken one.
+        state.repeat.poll(ctx.read_tsc(), |ch| ctx.console_push(ch));
         return false; // NAK (idle), NYET, or a rescheduled attempt - all ordinary
     }
     // An all-zero report is the keyboard saying every key is RELEASED. It is a real report and must

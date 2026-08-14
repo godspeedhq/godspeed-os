@@ -168,11 +168,18 @@ pub fn reset_port(
 /// Reports rather than binds: this slice establishes the topology, and Slice 2 onward is what
 /// actually drives a device. Separating them means a wrong topology is visible as a wrong topology
 /// instead of as a device that will not work.
-pub fn survey(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, ports: u8) {
+pub fn survey(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, ports: u8,
+) -> ([u16; 8], usize) {
     power_all(ctx, mmio, dma, t, ports);
     let mut found = 0u8;
     let mut split_needed = 0u8;
-    for p in 1..=ports {
+    // Keep what we read. Every status here cost a control transfer, and re-reading them to decide
+    // enumeration order made the survey's work a throwaway - about half a second of the window a
+    // storm leaves before it kills this service again.
+    let mut st_by_port = [0u16; 8];
+    let n_status = (ports as usize).min(8);
+    for p in 1..=ports.min(8) {
         match port_status(ctx, mmio, dma, t, p) {
             None => ctx.log_fmt(format_args!("dwc2-svc: hub port {} status read FAILED", p)),
             Some(st) if !st.connected() => {
@@ -180,6 +187,7 @@ pub fn survey(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, ports: u
             }
             Some(st) => {
                 found += 1;
+                st_by_port[p as usize - 1] = st.status;
                 if st.needs_split() {
                     split_needed += 1;
                 }
@@ -196,6 +204,7 @@ pub fn survey(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, ports: u
     let _ = split_needed;
     ctx.log_fmt(format_args!(
         "dwc2-svc: hub survey complete - {} device(s) attached (each one's speed, and whether it          needs a split, is known only after its port reset)", found));
+    (st_by_port, n_status)
 }
 
 /// The order to enumerate downstream ports in: LOW-SPEED FIRST, then the rest in port order.
@@ -220,26 +229,23 @@ pub fn survey(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, ports: u
 /// And the consequence of being wrong here is bounded to nothing: this decides only the ORDER of
 /// visits. Every connected port is still enumerated exactly once, by the same code, whatever the bit
 /// said. A speed bit that lied would cost a slightly different order, never a device.
-pub fn visit_order(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, ports: u8,
-) -> ([u8; 8], usize) {
+pub fn visit_order(status: &[u16; 8], n_status: usize) -> ([u8; 8], usize) {
     let mut order = [0u8; 8];
     let mut n = 0usize;
-    // Two passes over the same statuses rather than a sort: with at most 8 ports it is the same work,
-    // and "low speed first, otherwise port order" is the whole policy stated in the shape of the code.
+    // Two passes over the statuses rather than a sort: at this size it is the same work, and
+    // "low speed first, otherwise port order" is the whole policy stated in the shape of the code.
+    // Pure - it performs no I/O, so ordering costs nothing on a path a storm is racing.
     for low_first in [true, false] {
-        for p in 1..=ports.min(8) {
+        for p in 1..=n_status.min(8) {
             if n >= order.len() {
                 break;
             }
-            let is_low = match port_status(ctx, mmio, dma, t, p) {
-                Some(st) if st.connected() => st.status & PORT_LOW_SPEED != 0,
-                // Not connected, or a status read that failed. Either way it is not the input device,
-                // so it goes in the second pass and the enumeration below reports its own outcome.
-                _ => false,
-            };
+            let st = status[p - 1];
+            // A port that reported nothing connected has status 0, so it is not low speed and lands
+            // in the second pass; the enumeration below reports its own outcome for it either way.
+            let is_low = st & PORT_CONNECTED != 0 && st & PORT_LOW_SPEED != 0;
             if is_low == low_first {
-                order[n] = p;
+                order[n] = p as u8;
                 n += 1;
             }
         }

@@ -171,7 +171,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // still needs no split transactions. What it produces is the map that says
                         // WHERE splits will be needed, which is the last piece of Slice 1.
                         if let Some(n) = dev.hub_ports {
-                            hub::survey(&ctx, &m, &d, &dev.target, n);
+                            let (port_status, n_status) = hub::survey(&ctx, &m, &d, &dev.target, n);
                             // SLICE 1c-iii: reach a device BEHIND the hub, through a split.
                             //
                             // The first port reporting a device is enough to prove the path. Doing
@@ -197,7 +197,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             // partial enumeration is the normal case during chaos, and whatever is
                             // last is what the operator loses. Storage and network reacquire and
                             // retry; a keyboard has nobody to type its retry.
-                            let (order, n_order) = hub::visit_order(&ctx, &m, &d, &dev.target, n);
+                            let (order, n_order) = hub::visit_order(&port_status, n_status);
                             for &p in order[..n_order].iter() {
                                 if let Some(st) = hub::port_status(&ctx, &m, &d, &dev.target, p) {
                                     if st.connected() {
