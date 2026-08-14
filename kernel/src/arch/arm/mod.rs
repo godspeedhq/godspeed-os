@@ -30,14 +30,18 @@ pub mod fbcon;
 /// The framebuffer-console backend primitives the neutral `crate::fbcon` calls through `arch::imp`.
 /// See `crate::fbcon`'s module header for the contract each one owes.
 pub use fbcon::{fb_commit, FB_READBACK_CHEAP};
-pub mod dwc2;
-/// The shared in-kernel HID decoder, re-exported under its old name so this port's call sites are
-/// unchanged. It moved to `arch/hid.rs` when the Pi 4's xHCI became its second caller.
-pub use crate::arch::hid;
-// USB-net bridge (the mechanism the userspace ARM `nic-driver` calls): move ethernet frames to/from the
-// in-kernel CDC-ECM device. On ARM these are the real DWC2 functions; other arches stub them (net there is
-// a userspace PCIe driver, not this in-kernel USB path).
-pub use dwc2::{net_frame_tx, net_frame_rx, net_info};
+// arm32 slice 5: the in-kernel HID decoder is gone with the rest of the USB stack. Keystroke decoding
+// belongs to whoever owns the keyboard, and that is the `dwc2` SERVICE now (services/dwc2/src/hid.rs).
+
+/// USB-net bridge backends, kept as STUBS that say no.
+///
+/// The syscalls above them (42-44) are shared with aarch64, whose GENET driver still uses them, so the
+/// syscalls stay and only ARM's implementation leaves. On this port the kernel no longer has a network
+/// device: `nic-driver` talks to the `dwc2` service over IPC instead (slice 4b). Answering "no device"
+/// is the truth, and a caller that ignores the answer fails loudly rather than reading stale bytes.
+pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
+pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }
+pub fn net_info() -> Option<([u8; 6], bool)> { None }
 pub mod usermode;
 pub mod loadtest;
 pub mod spawn;
@@ -660,7 +664,6 @@ extern "C" fn arm_boot_main() -> ! {
     loadtest::selftest();
     // USB host bring-up (DWC2): detect the controller + the attached device. Increment 1 - no transfers
     // yet. Runs before the scheduler dispatch (which never returns).
-    dwc2::init();
     #[cfg(feature = "arm-sched-demo")]
     sched_demo::run(ram_end, reserve_end);
     #[cfg(feature = "arm-sched-ipc")]
@@ -879,11 +882,24 @@ pub fn emmc_base_clock_hz() -> u32 { video::emmc_clock_hz() }
 /// USB mass-storage block device, served by the in-kernel DWC2 Bulk-Only stack (`dwc2`). Exposed to the
 /// userspace `block-driver` through the USB_DISK-gated syscalls 46-48, the same shape as the USB-net
 /// bridge: the kernel owns the controller and the transport, the driver owns the block protocol above it.
-pub fn usb_disk_sectors() -> u64 { dwc2::msc_sectors() }
-pub fn usb_disk_read(lba: u64, dst: &mut [u8]) -> bool { dwc2::msc_read_block(lba, dst) }
-pub fn usb_disk_write(lba: u64, src: &[u8]) -> bool { dwc2::msc_write_block(lba, src) }
+
+// --- The in-kernel USB stack is GONE (arm32 slice 5) ------------------------------------------------
+//
+// `arch/arm/dwc2.rs` (3,981 lines) and `arch/hid.rs` (241) are deleted. They were ring-0 code parsing
+// descriptors supplied by whatever was plugged in, and a TCB member by construction (§6.4 amendment
+// 2026-07-23). The `dwc2` SERVICE owns the controller now - hub, keyboard, mass storage and networking,
+// each verified on hardware - and reaches it through an MMIO window, a DMA arena and the USB vector
+// granted at spawn.
+//
+// These backends remain as stubs that say NO rather than vanishing, because the syscalls above them are
+// shared with other ports: `net_frame_*` still serves aarch64's GENET. On arm they now answer "no
+// device", which is the truth - the kernel no longer has one - and a client that ignores the answer
+// fails loudly rather than reading stale bytes.
+pub fn usb_disk_sectors() -> u64 { 0 }
+pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
+pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
 /// Make prior writes durable (SCSI SYNCHRONIZE CACHE) - see `dwc2::msc_sync_cache`.
-pub fn usb_disk_flush() -> bool { dwc2::msc_sync_cache() }
+pub fn usb_disk_flush() -> bool { false }
 /// Did the last USB-disk transfer fail only because the device was BUSY (NAK)? Then it is not a
 /// failure at all - the caller should re-ask, with interrupts enabled in between.
 /// Counter ticks a core may make NO forward progress before the liveness watchdog panics. Same units as
@@ -908,11 +924,11 @@ pub fn liveness_deadline_cycles() -> u64 {
     (timer::timer_hz() as u64).saturating_mul(LIVENESS_SECS)
 }
 
-pub fn usb_disk_busy() -> bool { dwc2::msc_last_was_busy() }
+pub fn usb_disk_busy() -> bool { false }
 /// Is there no USB disk attached at all? Answered from PRESENT state (`MSC_READY`), not from the last
 /// transfer's outcome - which is exactly why it is a separate question. See `USB_DISK_ABSENT` in the
 /// syscall dispatch for what conflating the two cost.
-pub fn usb_disk_absent() -> bool { !dwc2::msc_ready() }
+pub fn usb_disk_absent() -> bool { true }
 
 /// A hardware-random u32 from the BCM2835 SoC RNG, or None if it never produced (absent/wedged - loud, not
 /// a fallback). Ungated (InspectKernel query 19); the `random` shell utility consumes it. Best-effort under
@@ -1368,9 +1384,6 @@ pub fn uart_rx_poll() {
         // would look like flaky hardware rather than two owners. Gating them on the same predicate the
         // IRQ dispatch uses means ownership is decided in one place from one fact.
         if mpidr & 3 == 0 && !irq::usb_owned_by_userspace() {
-            dwc2::async_bulk_watchdog();
-            dwc2::poll();
-            dwc2::net_rx_drain_tick();
         }
     }
     if RX_HEAD.load(Ordering::Acquire) != RX_TAIL.load(Ordering::Acquire) {
@@ -1656,7 +1669,6 @@ pub mod interrupts {
         // driver. `hotplug_poll` in particular takes the exclusive bulk claim and rewrites the shared
         // device selection, which is precisely what must not happen underneath another driver.
         if !super::irq::usb_owned_by_userspace() {
-        super::dwc2::hotplug_poll();
         // Watch the ethernet cable for the same reason, on the same terms. The PHY read was already
         // written and already correct - but nothing CALLED it unless a service asked (`net`, `ping`), so
         // unplugging the cable on an idle machine was silent while unplugging the keyboard was not.
@@ -1664,7 +1676,6 @@ pub mod interrupts {
         // rather than folded into `hotplug_poll` because it must run OUTSIDE that function's exclusive
         // section: it takes the same bulk claim, and nesting would make it stand aside from itself. Both
         // are individually rate-limited to ~1 s and both yield to storage, so idle stays cheap.
-        super::dwc2::link_poll();
         }
         // SAFETY: unmasking IRQs is always valid (vectors + handlers installed); WFI then waits for one.
         unsafe { core::arch::asm!("cpsie i", "wfi", options(nomem, nostack)) }

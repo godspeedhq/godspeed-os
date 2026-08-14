@@ -720,8 +720,12 @@ CHECKS = [
              dict(why="a role pinned for a file that no longer exists must be caught",
                   pins={"arch_roles": {"x86_64/deleted.rs": "mmu"},
                         "arch_permitted_roles": ["mmu"]}, expect=True),
-             dict(why="the real, fully classified arch layer must reach only its known drivers",
-                  pins=None, expect=True),
+             # Flipped to False in arm32 slice 5, when arch/arm/dwc2.rs and arch/hid.rs were DELETED.
+             # The probe used to assert those drivers existed; asserting reality means a probe goes red
+             # when the code is FIXED, which is the right kind of red - it forces the expectation to be
+             # updated in the same commit rather than the fix being invisible.
+             dict(why="no peripheral driver remains in arch/ - both were deleted in arm32 slice 5",
+                  pins=None, expect=False),
          ]),
     dict(nature="rule", id="II-chaos-exclusions", commandment="II",
          title="nothing escapes Maximum Carnage but chaos's own apparatus",

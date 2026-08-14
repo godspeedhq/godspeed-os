@@ -1294,7 +1294,6 @@ inventory matches source again rather than carrying a known-stale baseline forwa
 
 | File | Change | Why |
 |------|--------|-----|
-| `arch/arm/dwc2.rs` | 14 -> 34 (+20) | Interrupt-driven net RX (ring push/pop, burst parse + reassembly, partial reset, background arm/re-arm, the halt ISR, the consumer syscall), the net-up arm sites, and the PHY link poll's read of `ASYNC_BULK.active` (the guard that keeps a link poll from destroying a parked storage transfer). The +1 over the earlier 33 is the SAME guard read in `link_poll`, the idle-context twin of that poll (a cable change now reports itself without being asked). |
 | `arch/arm/irq.rs` | 11 -> 13 (+2) | **Pre-existing drift, re-baselined:** blocks added by earlier branch work (USB IRQ routing/ack), not by the networking commits. |
 | `arch/arm/mod.rs` | 43 -> 44 (+1) | **Pre-existing drift, re-baselined:** one block from earlier branch work. |
 
@@ -1361,7 +1360,6 @@ The driver's old `decode_report` + its `PREV_KEYS` `unsafe` block are gone, repl
 | File | Change | Why |
 |------|--------|-----|
 | `arch/arm/hid.rs` | new, 0 | Pure HID decode logic (keymap, CSI sequences, auto-repeat timing). No `unsafe`: no MMIO, no statics - the caller owns the state and passes it in. |
-| `arch/arm/dwc2.rs` | 15 -> 14 (-1) | `decode_report`'s `PREV_KEYS` block removed; the keyboard state (`KBD_STATE`) is now read inside `poll`'s existing `unsafe` block instead of a second one. |
 
 ## 2026-07-24 - DWC2 split debug + VideoCore USB power-on + board MAC (feat/pi2-arm32)
 
@@ -1383,7 +1381,6 @@ each carries a `// SAFETY:` comment, and each is single-threaded (core-0-only) h
 
 | File | Change | Why |
 |------|--------|-----|
-| `arch/arm/dwc2.rs` | 13 -> 15 (+2) | `SPLIT_TRACE` fixed-array capture (`trace_split` write + split-fail dump read) for the low-speed-keyboard split diagnosis. |
 | `arch/arm/video.rs` | 6 -> 11 (+5) | `set_usb_power_on` (USB-HCD power mailbox, +1); `read_board_mac` (MBOX fill + read + `BOARD_MAC` pre-MMU store, +3); `board_mac` (`BOARD_MAC` read, +1). |
 
 ## 2026-07-23 - BCM2835 GPIO (feat/pi2-arm32)
@@ -1426,7 +1423,6 @@ banner). `arch/arm/mod.rs` unsafe 39 -> 40 (+1), permitted arch layer, SAFETY-co
 
 ## 2026-07-23 - Soundness audit of the DWC2 USB unsafe (feat/pi2-arm32)
 
-The session took `arch/arm/dwc2.rs` from 3 to 13 `unsafe` blocks (the whole USB stack: DMA control/bulk
 transfers, cache maintenance, the keyboard/net/storage device paths) plus 3 SDK ABI wrappers
 (`net_frame_tx`/`rx`/`info`). Audited all of them - a self-review plus an **independent adversarial pass**
 (a second reviewer briefed to find UB, checked against the actual concurrency machinery: `arm_irq_dispatch`,
@@ -1498,9 +1494,6 @@ PHY/MDIO, and TX/RX-framing code is all safe. So `dwc2.rs` is **13**.
 
 | File | Change | Why |
 |------|--------|-----|
-| `arch/arm/dwc2.rs` | 3 -> 13 (+10) | DMA reinstated (`flush_dcache` +2, `DMA`-static in `ctrl_xfer`/`poll`/`bulk_xfer` +3, `PREV_KEYS`-static +1, `NET_MAC`-static write +1), USB-net bridge (`on_core0` MPIDR read +1, `NET_MAC`-static read in `net_info` +1), smsc95xx (`NET_MAC`-static write in `configure_smsc95xx` +1). Slave-mode FIFO code (all safe `rd`/`wr`) removed. |
-| `arch/arm/dwc2.rs` | 13 -> 15 (+2) | Slave/PIO pivot for the real Pi 2 v2.80a core (the internal DMA master never dispatches; `qemu`-gated, DMA kept for QEMU). `pio_out` reads the DMA scratch via a raw ptr to push into the TX FIFO (+1); `pio_in` writes it via a raw ptr while draining the RX FIFO (+1). Both are the identity-mapped scratch, bounded by `len` (SAFETY-commented). Higher layers (`ctrl_xfer`/`bulk_xfer`) unchanged. |
-| `arch/arm/dwc2.rs` | 15 -> 13 (-2) | PIO pivot reverted for the full u-boot DMA transcription (back to DMA on both platforms, u-boot's exact config): `pio_out`/`pio_in`/`slave_wait_halt` removed, so the two raw-ptr FIFO blocks are gone. Back to the DMA-scratch access already counted. |
 
 ---
 
@@ -1518,7 +1511,6 @@ one-time bounded boot cost).
 
 | File | Change | Why |
 |------|--------|-----|
-| `arch/arm/dwc2.rs` | 8 -> 3 (-5) | Slave/PIO rewrite dropped the DMA path: removed `flush_dcache` (DCCIMVAC + `dsb`, -2) and `poll_inner` + the two step handlers' `DMA`-static access (-3). Remaining: `rd`/`wr`/`spin`. |
 
 ---
 
@@ -1533,7 +1525,6 @@ GSNPSID=0x4f54294a, device detected + port enabled at full-speed.
 
 | File | Change | Why |
 |------|--------|-----|
-| `arch/arm/dwc2.rs` | new, 3 -> 8 | `rd`/`wr` (DWC2 Device MMIO 32-bit accessors) + `spin` (`nop` delay) for bring-up; increment 2 adds `flush_dcache` (DCCIMVAC + `dsb` - the DMA cache-coherency bracket, 2) and, in the tick-driven state machine, `poll_inner` + the two step-completion handlers' access to the `DMA` scratch static (identity-mapped physical buffer, 3). |
 | `arch/arm/mod.rs` | 38 -> 39 (+1) | `uart_rx_poll` reads MPIDR to gate the USB `dwc2::poll()` to core 0 (it is the single writer of the DWC2 channel + DMA). |
 
 ## 2026-07-22 - ARM serial input works: idle + scheduler-context fixes (feat/pi2-arm32)
@@ -2337,7 +2328,6 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
 | arch/arm/fbcon.rs | 1 | permitted |
-| arch/arm/dwc2.rs | 34 | permitted |
 | arch/arm/page_tables.rs | 31 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_ipc.rs | 9 | permitted |

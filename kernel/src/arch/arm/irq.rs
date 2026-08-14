@@ -288,7 +288,11 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
             // SAFETY: in the IRQ handler with interrupts masked - `deliver`'s documented contract.
             unsafe { crate::interrupt::route::deliver(USB_VECTOR) };
         } else {
-            super::dwc2::on_usb_irq();
+            // arm32 slice 5: there is no in-kernel USB driver to fall back to. The vector is
+            // routed to the `dwc2` service or it is masked; an unclaimed level-triggered line that
+            // nothing can clear would storm this core, so say so rather than silently re-enabling it.
+            crate::kprintln!("arm: USB IRQ with no userspace driver registered - masking the line");
+            mask_usb_irq();
         }
         true
     } else {

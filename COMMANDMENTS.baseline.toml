@@ -411,7 +411,6 @@ FIRE_IRQ           = 14
 
 
 [kernel.arch_roles]
-"hid.rs"                      = "usb-hid-decode"
 "mod.rs"                      = "arch-entry"
 "aarch64/context.rs"          = "context-switch"
 "aarch64/ctxdemo.rs"          = "test-scaffold"
@@ -436,7 +435,6 @@ FIRE_IRQ           = 14
 "arm/context.rs"              = "context-switch"
 "arm/context_switch.rs"       = "context-switch"
 "arm/dtb.rs"                  = "discovery"
-"arm/dwc2.rs"                 = "usb-host-stack"
 "arm/exceptions.rs"           = "interrupts"
 "arm/fbcon.rs"                = "console"
 "arm/irq.rs"                  = "interrupts"
@@ -547,26 +545,3 @@ UsbDiskFlush             = 49
 # closed by the same piece of work. They are written here rather than fixed because the hardware cannot
 # yet support the fix - which is exactly the case CLAUDE.md §26.3 says to RECORD rather than pretend to
 # close.
-
-[[exemption]]
-check     = "I-arch-drivers"
-path      = "kernel/src/arch/arm/dwc2.rs"
-count     = 1
-amendment = "CLAUDE.md §6.4 amendment 2026-07-23 (SEC-29/30)"
-reason    = """
-The Pi 2 routes no device IRQs to userspace, so the DWC2 USB host stack cannot yet be a service and \
-runs in the kernel. The amendment states this plainly and calls it strictly worse than the no-IOMMU \
-x86 case: there the driver is untrusted-but-userspace with only its DMA unconfined; here the driver \
-IS the kernel. Recorded, not resolved."""
-closed_by = "feat/pi2-arm32-hardening slice 5 deletes this file once the dwc2 SERVICE drives the controller"
-
-[[exemption]]
-check     = "I-arch-drivers"
-path      = "kernel/src/arch/hid.rs"
-count     = 1
-amendment = "CLAUDE.md §6.4 amendment 2026-07-23 (SEC-29/30)"
-reason    = """
-USB HID boot-protocol keyboard decoding, in the kernel for the same reason and by the same amendment: \
-it is shared by the in-kernel USB drivers, and the kernel cannot link the SDK copy that the userspace \
-x86 drivers use. It is a consequence of the entry above, not a separate decision."""
-closed_by = "feat/pi2-arm32-hardening slice 5; the dwc2 SERVICE already carries its own hid.rs"
