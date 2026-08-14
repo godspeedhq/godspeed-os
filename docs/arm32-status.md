@@ -247,6 +247,48 @@ the cause was never identified. Recording it so the next attempt does not repeat
    generic timer - so a bare-ESC wait is **~200 SECONDS** here. Same class of bug (an x86-calibrated
    cycle count), independent of the quantum.
 
+## CLOSED: the keyboard cannot be made interrupt-driven on this silicon (2026-08-14)
+
+**Asked:** program the DWC2's periodic scheduler so the controller runs the keyboard's interrupt
+endpoint itself and raises an IRQ on completion, instead of software sequencing it.
+
+**Answer: the hardware cannot.** Measured on the Pi 2, not inferred:
+
+```
+dwc2-svc: GHWCFG2=0x228ddd50 GHWCFG4=0x1ff00020 - arch 2 (internal DMA), descriptor DMA NOT supported
+```
+
+`GHWCFG4` bit 30 is clear. Descriptor (scatter/gather) DMA is the only mode in which this core walks a
+per-microframe schedule on its own; without it, software must sequence every split transaction. (QEMU
+reports `GHWCFG4=0x00000000`, which is an unimplemented register rather than an answer - it cannot
+settle this question, and the probe exists because the register was never read at all.)
+
+**Why `HCCHAR.ODDFRM` is not a way around it.** The core will defer a periodic transfer to a frame of
+the right parity, but ODDFRM selects odd/even FRAME only. The schedule needs MICROFRAME precision -
+start-split at `(current+1)&7` skipping microframe 6, complete-split at +2, retrying NYET in the
+following microframes - and 125 us resolution is below anything the controller will time for us. So
+`wait_uframe` is not sloppiness; it is supplying timing the hardware has no mechanism to supply.
+
+**What it costs, measured:** `kbd 2063ms` against `sleep 42862ms` = **4.6% of one core**, about 1.1% of
+the machine, for a working keyboard. The outer loop is already interrupt-driven (`recv_timeout` on the
+endpoint, woken by the kernel's IRQ delivery, `irq_unmask` for the level-triggered line); this cost is
+entirely inside the split sequencing.
+
+**The precedent agrees.** The Raspberry Pi's own `dwc_otg` driver solves this with an FIQ state machine
+(`dwc_otg.fiq_fsm_enable`) - which is what you build when the core cannot schedule splits itself.
+
+**The remaining options, and why the recommendation is to leave it:**
+
+| Option | Verdict |
+|---|---|
+| Descriptor DMA | Impossible - the bit is clear on this silicon |
+| FIQ/IRQ state machine in the kernel (the Pi's answer) | Works, and puts USB split scheduling back in RING 0 - re-adding a TCB member and undoing slice 5 for 4.6% of one core |
+| Block on the channel IRQ per split step | The complete-split window is ~125 us; an IPC wake cannot hit it, and a missed window loses the keystroke (the TT discards after the frame). Trades CPU for a worse keyboard |
+| Longer `bInterval` | Halves the cost, doubles keystroke latency. Available if the CPU ever matters more than the feel |
+
+Recorded rather than closed-by-fixing (§26.3): the constraint is the hardware's, and the cheapest
+correct answer is to keep paying 4.6% of one core.
+
 ## HARDWARE GOTCHA: a GPIO HAT can kill serial INPUT while output still works
 
 **Symptom.** The Pi keeps printing to the serial console perfectly - boot log, service logs, command
