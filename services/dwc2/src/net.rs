@@ -256,8 +256,16 @@ fn link_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> bool {
     let _latched = mii_read(ctx, m, d, t, SMSC_MII_BMSR);
     matches!(mii_read(ctx, m, d, t, SMSC_MII_BMSR), Some(v) if v & 0x0004 != 0)
 }
-/// RX burst size in 512-byte high-speed packets. Must stay within `RX_BURST` in the arena layout.
-const SMSC_BURST_PKTS: u32 = 4;
+/// RX burst size in 512-byte high-speed packets, and the IN transfer length that must match it.
+///
+/// 8 packets / 4096 bytes, copied VERBATIM from the in-kernel driver that works on this exact board.
+/// I had chosen 4 / 2048 - self-consistent, and wrong. With the chip configured to accumulate a burst
+/// it evidently never considered complete, it NAKed every IN while its receive FIFO filled to 20,464
+/// bytes (`RX_FIFO=0x4ff0`, near the LAN9514's entire FIFO). Data in, nothing out, forever.
+///
+/// This is the "read the working code" lesson again: the values were sitting in `arch/arm/dwc2.rs`,
+/// proven on this hardware, and I picked my own instead.
+const SMSC_BURST_PKTS: u32 = 8;
 
 /// Every register poll below is bounded by this many attempts. A count is not a duration - but each
 /// attempt here is one CONTROL TRANSFER, which carries its own hardware timeout, so the product is
@@ -384,25 +392,19 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
     // full-duplex link drops frames to late collisions. The receive filter is our-unicast + broadcast
     // ONLY: promiscuous, all-multicast and the hash filter are CLEARED so the mDNS/SSDP/IPv6-ND flood is
     // dropped at the chip instead of drowning our replies. Some of those bits come out of reset SET.
-    //
-    // DIAGNOSTIC, and temporary: PRMS (promiscuous) is set below instead of cleared. With the filter
-    // narrowed to our-unicast + broadcast, the only traffic this chip accepts is addressed to
-    // 02:00:00:12:34:56 - a locally-administered address nobody on the LAN sends to - so a quiet
-    // network is indistinguishable from a broken receive path. Both read as "rx 0 bursts". Opening the
-    // filter separates them with one bit: if bursts appear, RX works and the fault is that our
-    // transmitted frames never reach the wire; if it stays at zero, RX itself is broken.
-    //
-    // This MUST come back out once that is known - dropping the multicast flood at the chip rather
-    // than in our ring is why the filter was narrowed in the first place.
+    // The promiscuous DIAGNOSTIC is gone (it did its job: bursts stayed at zero with the filter open,
+    // which is what proved the receive path was broken rather than the network quiet). Back to
+    // our-unicast + broadcast, which is why the filter was narrowed in the first place: the
+    // mDNS/SSDP/IPv6-ND flood gets dropped at the CHIP instead of filling a 20 KB FIFO we then have to
+    // drain. Some of these bits come out of reset SET, so they are cleared explicitly.
     let cr = (smsc_read_or0(ctx, m, d, t, SMSC_MAC_CR)
-              & !(SMSC_MAC_CR_MCPAS | SMSC_MAC_CR_HPFILT))
-             | SMSC_MAC_CR_PRMS | SMSC_MAC_CR_TXEN | SMSC_MAC_CR_RXEN | SMSC_MAC_CR_FDPX;
+              & !(SMSC_MAC_CR_PRMS | SMSC_MAC_CR_MCPAS | SMSC_MAC_CR_HPFILT))
+             | SMSC_MAC_CR_TXEN | SMSC_MAC_CR_RXEN | SMSC_MAC_CR_FDPX;
     if !smsc_write(ctx, m, d, t, SMSC_MAC_CR, cr) {
         ctx.log("dwc2-svc: smsc MAC_CR enable FAILED - NIC stays down");
         return None;
     }
     smsc_write(ctx, m, d, t, SMSC_TX_CFG, SMSC_TX_CFG_ON);
-    ctx.log("dwc2-svc: NIC filter is PROMISCUOUS (diagnostic - splits a quiet network from a dead receive path; revert once known)");
 
     // Read the state back OFF THE CHIP rather than assuming the writes took. Every register here was
     // just written by us, so a value that disagrees says the vendor control path is not landing - and
@@ -446,9 +448,14 @@ pub const RX_OFF: usize = 0x3000;
 // these crates can both name. Recorded rather than pretended away.
 pub const FRAME_MAX: usize = 1600;
 /// One IN transfer can carry SEVERAL frames, so the receive burst is larger than one frame.
-pub const RX_BURST: usize = 2048;
+pub const RX_BURST: usize = 4096;   // 8 x 512, matching SMSC_BURST_PKTS and the kernel driver
 const _: () = assert!(TX_OFF >= crate::msc::DATA_OFF + crate::msc::DATA_MAX);
 const _: () = assert!(RX_OFF >= TX_OFF + FRAME_MAX + 8);
+/// The RX burst must FIT the granted arena (64 KiB). Added when the burst doubled to 4096 to match the
+/// kernel driver: a buffer that runs off the end of the arena is a DMA write into whatever follows, and
+/// the device would do it silently. The sibling assertions above already caught one real overlap at
+/// build time, which is the argument for spending three lines on the next one.
+const _: () = assert!(RX_OFF + RX_BURST <= 64 * 1024);
 
 /// Send one ethernet frame.
 ///
