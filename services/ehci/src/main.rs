@@ -193,6 +193,8 @@ const SETUP_PKT:  usize = 0x100; // 8-byte USB setup packet
 const DATA_BUF:   usize = 0x200; // control-transfer data buffer
 
 // qTD token bits.
+/// C8-1: how long a control transfer may take before we stop waiting. A DURATION, not a read count.
+const CTRL_XFER_CYCLES: u64 = 2_000_000_000;
 const QTD_ACTIVE: u32 = 1 << 7;
 const QTD_HALTED: u32 = 1 << 6;
 const QTD_ERRMASK: u32 = (1 << 3) | (1 << 4) | (1 << 5); // XactErr | Babble | BufErr
@@ -316,8 +318,13 @@ fn control(
     mmio.write32(op + OP_USBSTS, STS_IAA); // RW1C: acknowledge the advance
 
     // Wait for the STATUS qTD to retire.
+    // C8-1: this was `for _ in 0..10_000_000u32`. Ten million DMA reads is not a duration - it is a
+    // different wall-clock wait on every machine, and nobody picked it against the device's timing.
+    // The truth is still the ACTIVE bit going clear; the clock only bounds how long we keep believing
+    // it might.
     let mut done = false;
-    for _ in 0..10_000_000u32 {
+    let start = _ctx.read_tsc();
+    while _ctx.read_tsc().wrapping_sub(start) < CTRL_XFER_CYCLES {
         if dma.read32(QTD_STATUS + 0x08) & QTD_ACTIVE == 0 { done = true; break; }
     }
     let t_setup  = dma.read32(QTD_SETUP + 0x08);

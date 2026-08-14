@@ -72,6 +72,16 @@ const MAX_IO_ATTEMPTS: u32 = 3;
 /// guest TSC races ahead so the wall-clock hold is shorter, which is fine - QEMU's emulated COMRESET
 /// is instant, it needs no real hold. read_tsc is hardware-proven to advance (perf §22).
 const COMRESET_HOLD_CYCLES: u64 = 4_000_000;
+/// C8-1: how long to wait for the SATA PHY to report a live link, and for the task file to go ready.
+///
+/// A DURATION, not a read count. These were `for _ in 0..2_000_000u32` loops over an MMIO register,
+/// and a count is not a duration - two million reads is a different wall-clock wait on every machine,
+/// so the same code waits milliseconds on one board and seconds on another. Neither number was chosen
+/// against the hardware's actual timing; both were chosen to "feel long enough" on the machine in
+/// front of someone. Commandment VIII: wait on truth, bounded by a clock.
+///
+/// The truth is the register; the clock only bounds how long we will believe it might still arrive.
+const LINK_WAIT_CYCLES: u64 = 400_000_000;
 
 struct Ahci<'a> {
     hba: &'a Mmio,
@@ -512,7 +522,8 @@ impl<'a> Ahci<'a> {
 fn wait_port_ready(ctx: &ServiceContext, hba: &Mmio, base: usize) -> bool {
     // 1. Fast path + slow-establish: a healthy, already-up link returns on the first read (zero added
     //    latency); a slow one gets a bounded window (read-count poll, the port_comreset DET idiom).
-    for _ in 0..2_000_000u32 {
+    let start = ctx.read_tsc();
+    while ctx.read_tsc().wrapping_sub(start) < LINK_WAIT_CYCLES {
         if hba.read32(base + PX_SSTS) & 0xF == 3 {
             return true;
         }
@@ -525,7 +536,8 @@ fn wait_port_ready(ctx: &ServiceContext, hba: &Mmio, base: usize) -> bool {
     let sctl = hba.read32(base + PX_SCTL);
     hba.write32(base + PX_SCTL, sctl & !0xF);
     // 3. Wait (bounded) for the PHY to (re)establish, then clear the error bits the reset latched.
-    for _ in 0..2_000_000u32 {
+    let start = ctx.read_tsc();
+    while ctx.read_tsc().wrapping_sub(start) < LINK_WAIT_CYCLES {
         if hba.read32(base + PX_SSTS) & 0xF == 3 {
             hba.write32(base + PX_SERR, 0xFFFF_FFFF); // W1C - init_port's COMRESET clears again
             return true;
@@ -600,7 +612,8 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
         // Wait (bounded) for the task file to go ready, THEN read the signature. A healthy port has
         // BSY already clear so this returns on the first read (zero added latency); an empty port never
         // reaches here (wait_port_ready fails DET first), so no empty-port waste.
-        for _ in 0..2_000_000u32 {
+        let start = ctx.read_tsc();
+        while ctx.read_tsc().wrapping_sub(start) < LINK_WAIT_CYCLES {
             if hba.read32(base + PX_TFD) & (TFD_BSY | TFD_DRQ) == 0 { break; }
         }
         let sig = hba.read32(base + PX_SIG);
