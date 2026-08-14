@@ -1,6 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #![no_std]
 #![no_main]
+//! The shell - the user's interface to GodspeedOS, and a capability broker (Appendix B.3).
+//!
+//! This is the largest file in the repository, so read this before scrolling. It is one file because
+//! the shell is one task with one input loop; splitting it by command would scatter that loop across
+//! modules without making any command easier to find.
+//!
+//! **What it is.** Not a Unix shell: there is no fork, no exec, no inherited descriptors, no ambient
+//! stdin. It reads the console, parses a line, and either answers from its own state or asks a SERVICE
+//! over IPC - `fs` for files, `block-driver` for disks, the supervisor for spawning. Every authority it
+//! passes to a child is one it holds and grants explicitly.
+//!
+//! **How it is laid out.** A prompt/input loop, a command table dispatching to `cmd_*` functions (one
+//! per built-in), the gsh scripting language (`docs/`-documented: vars, if, for, fn, pipes), and the
+//! pipe machinery that composes built-ins with `|`.
+//!
+//! **What to know before editing.** The user stack is 64 KiB and `pipe_run`'s frame already sits near
+//! it, so a large local in a command function can overflow it - mark record-builders `#[inline(never)]`
+//! (see the shell-stack note in `docs/`). There is no heap (§26.6.1): fixed arrays, bounded arenas, and
+//! streaming in `IO_CHUNK` pieces. And the shell is restartable like everything else - a crash gives a
+//! fresh prompt, losing the in-flight command but not the session (§6.2).
 
 use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError, ReqOutcome, ClockSource, Datetime};
 use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, AggErr, REC_MAX_ROWS, REC_ARENA};
