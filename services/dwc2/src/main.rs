@@ -192,7 +192,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             //
                             // Costs three extra transfers on a path that runs once. Stopping at the
                             // first failure throws away the comparison that answers the question.
-                            for p in 1..=n {
+                            // LOW-SPEED (the keyboard) FIRST - see `hub::visit_order`. A storm
+                            // restarts this service faster than a full bring-up completes, so a
+                            // partial enumeration is the normal case during chaos, and whatever is
+                            // last is what the operator loses. Storage and network reacquire and
+                            // retry; a keyboard has nobody to type its retry.
+                            let (order, n_order) = hub::visit_order(&ctx, &m, &d, &dev.target, n);
+                            for &p in order[..n_order].iter() {
                                 if let Some(st) = hub::port_status(&ctx, &m, &d, &dev.target, p) {
                                     if st.connected() {
                                         // SLICE 2: bind a boot keyboard if this is one.

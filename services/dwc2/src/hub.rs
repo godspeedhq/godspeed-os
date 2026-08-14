@@ -198,6 +198,55 @@ pub fn survey(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, ports: u
         "dwc2-svc: hub survey complete - {} device(s) attached (each one's speed, and whether it          needs a split, is known only after its port reset)", found));
 }
 
+/// The order to enumerate downstream ports in: LOW-SPEED FIRST, then the rest in port order.
+///
+/// **Why this is not cosmetic.** A full bring-up of this hub takes ~2.75 s (four devices, each reset,
+/// addressed and configured), and the keyboard is on the last port. During a kill storm `dwc2` is
+/// restarted faster than that, so it dies partway through EVERY time - and "partway" always means the
+/// tail, which is always the keyboard. Measured over 12 restarts: every restart that reached port 4
+/// bound the keyboard, and the nine that did not never got there. The console was not failing to bind,
+/// it was never being reached.
+///
+/// Enumerating the input device first inverts what a partial bring-up costs. Storage and network
+/// tolerate arriving late - `fs` and `net-stack` reacquire and retry by design - whereas a missing
+/// keyboard is the operator losing their hands, with no retry path because there is nobody to type it.
+///
+/// **On using the speed bit before a port reset.** The survey above deliberately refuses to report
+/// speed, and that refusal is right for `PORT_HIGH_SPEED` (bit 10), which is only meaningful after the
+/// reset chirp - trusting it early is what once produced a confident, wrong "4 need split
+/// transactions". `PORT_LOW_SPEED` (bit 9) is different in kind: it comes from which data line the
+/// device pulls up at attach, so it is valid as soon as the port reports connected.
+///
+/// And the consequence of being wrong here is bounded to nothing: this decides only the ORDER of
+/// visits. Every connected port is still enumerated exactly once, by the same code, whatever the bit
+/// said. A speed bit that lied would cost a slightly different order, never a device.
+pub fn visit_order(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, ports: u8,
+) -> ([u8; 8], usize) {
+    let mut order = [0u8; 8];
+    let mut n = 0usize;
+    // Two passes over the same statuses rather than a sort: with at most 8 ports it is the same work,
+    // and "low speed first, otherwise port order" is the whole policy stated in the shape of the code.
+    for low_first in [true, false] {
+        for p in 1..=ports.min(8) {
+            if n >= order.len() {
+                break;
+            }
+            let is_low = match port_status(ctx, mmio, dma, t, p) {
+                Some(st) if st.connected() => st.status & PORT_LOW_SPEED != 0,
+                // Not connected, or a status read that failed. Either way it is not the input device,
+                // so it goes in the second pass and the enumeration below reports its own outcome.
+                _ => false,
+            };
+            if is_low == low_first {
+                order[n] = p;
+                n += 1;
+            }
+        }
+    }
+    (order, n)
+}
+
 /// Reset a port, then address and identify the device behind it - THROUGH a split transaction.
 ///
 /// This is the first transfer in the port that reaches past the hub, and every device on this board
