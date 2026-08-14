@@ -303,8 +303,31 @@ exempting the test harness from it would be assuming the harness is special.
 Both are real work, the same shape as taking USB out of the kernel - and the third instance of that
 shape in this audit, with C1-5's 218 service configs and C4-1's by-name grants.
 
-**`clock.rs` + `wallclock.rs` - a time SERVICE, planned.** Not open questions: they close when that
-service exists. `wallclock.rs` is the one that most wants to leave, holding provenance and floor policy.
+**`clock.rs` + `wallclock.rs` - the `clock` SERVICE. Sliced, in progress.**
+
+Named `clock` because the system already uses that word for this domain - `clock.rs`, `wallclock.rs`,
+`ClockSource` in the SDK, `/clock.last` on disk. One word for one concept, which is Commandment III
+applied to vocabulary.
+
+The split is the same one control.rs and fbcon need, a third time: **the kernel keeps the register read,
+the service owns the meaning.** x86's CMOS RTC is port I/O at 0x70/0x71 and cannot leave ring 0; the
+epoch conversion, plausibility bounds, source (RTC vs NTP), sync age and the floor are all policy.
+
+USB-sized, so sliced like the arm32 work, with the tree building at every step:
+
+1. **The service exists and owns the policy.** Reads raw RTC through the EXISTING `InspectKernel`
+   queries, serves epoch / source / floor over IPC. Kernel untouched.
+2. **Consumers move.** `net-stack` (SNTP sets the clock) and the shell (18 references) ask the service
+   by name instead of the kernel.
+3. **The kernel shrinks.** Delete `clock.rs`, `wallclock.rs`, the `SetClock` syscall and the wall-clock
+   queries.
+
+Slice 3 is the first time in this audit that a pinned surface gets SMALLER: one fewer syscall, at least
+one fewer introspection query, 327 fewer kernel lines, two fewer modules.
+
+Honest cost: a service needs a `service_config` entry, so this grows C1-5's debt from 218 to 219. It is
+the debt moving in the right direction - one table row replacing two kernel modules and a syscall - but
+worth stating rather than leaving to be discovered.
 
 **`fbcon/` - probably an amendment, not a removal.** It is the kernel's console output path on every
 arch (`put_byte`, `mirror`, `clear_and_home` from each `arch/*/mod.rs`). On a Pi with an HDMI TV and no
