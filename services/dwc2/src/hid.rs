@@ -244,6 +244,32 @@ pub fn poll(
     let hcint = chan::periodic_split_in(
         ctx, mmio, t, chan::CH_KBD, state.pid, phys, len, kbd.ep as u32, splt);
 
+    // Classify this poll BEFORE acting on it. Every return path below consumes `hcint` for a
+    // decision and then discards it; counting first is what makes a silent endpoint explicable
+    // afterwards instead of only observable as "the keyboard stopped".
+    {
+        use crate::regs::*;
+        let known = HCINT_XFERCOMPL | HCINT_NAK | HCINT_CHHLTD | HCINT_STALL | HCINT_NYET
+            | HCINT_XACTERR | HCINT_ACK;
+        if hcint == 0 {
+            state.n_silent = state.n_silent.wrapping_add(1);
+        } else if hcint & HCINT_STALL != 0 {
+            state.n_stall = state.n_stall.wrapping_add(1);
+        } else if hcint & HCINT_XACTERR != 0 {
+            state.n_xacterr = state.n_xacterr.wrapping_add(1);
+        } else if hcint & HCINT_NAK != 0 {
+            state.n_nak = state.n_nak.wrapping_add(1);
+        } else if hcint & HCINT_XFERCOMPL != 0 {
+            state.n_data = state.n_data.wrapping_add(1);
+        } else if hcint & HCINT_NYET != 0 {
+            state.n_nyet = state.n_nyet.wrapping_add(1);
+        } else {
+            state.n_other = state.n_other.wrapping_add(1);
+            state.last_other = hcint;
+        }
+        let _ = known;
+    }
+
     // A NAK is not a report, even when XFERCOMPL rides along with it.
     //
     // HCINT can latch BOTH, and testing only XFERCOMPL counted every idle poll as a keystroke: the
@@ -379,6 +405,25 @@ pub struct KeyState {
     pub last_data: u64,
     /// How long a delivered report vouches for the poll path. Derived from this board's timer rate.
     pub repeat_window: u64,
+    /// WHAT EVERY POLL ACTUALLY RETURNED, since the last report line.
+    ///
+    /// The keyboard goes silent for tens of seconds and then comes back. Across that window the
+    /// service is provably healthy - the pass count per interval is unchanged, and it is still
+    /// spending its time in this poll - so it is not descheduled and not starved: the endpoint stops
+    /// answering while we keep asking. WHY it stops is not in any log, because the poll's outcome was
+    /// never recorded, only acted on. These count it: one bucket per way a transfer can end.
+    pub n_data: u32,
+    pub n_nak: u32,
+    pub n_nyet: u32,
+    pub n_stall: u32,
+    pub n_xacterr: u32,
+    /// The transfer never halted at all - `periodic_split_in` timed out and returned 0. Distinct from
+    /// every bucket above, because those are the controller REPORTING something and this is silence.
+    pub n_silent: u32,
+    /// Anything with bits set that none of the above explain, plus the raw value of the last one, so
+    /// an unexpected combination names itself instead of being filed under "other".
+    pub n_other: u32,
+    pub last_other: u32,
 }
 
 impl KeyState {
@@ -395,6 +440,8 @@ impl KeyState {
             emitted_repeat: 0,
             emitted_report: 0,
             last_data: 0,
+            n_data: 0, n_nak: 0, n_nyet: 0, n_stall: 0, n_xacterr: 0, n_silent: 0,
+            n_other: 0, last_other: 0,
             // ~1.5 s. Long enough that a deliberate hold keeps repeating through the initial 600 ms
             // delay and well beyond, short enough that a broken poll path stops within a couple of
             // characters instead of running to the next keypress.

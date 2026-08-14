@@ -376,6 +376,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     "dwc2-svc: alive - {} key ({} chars from reports, {} from auto-repeat), {} blocks, {} cmds; busy CBW {} DATA {} CSW {}; {} passes, serve {}ms kbd {}ms sleep {}ms",
                     reports, state.emitted_report, state.emitted_repeat, served, cmds, bc, bd, bs,
                     passes, seg_serve / ms, seg_kbd / ms, seg_sleep / ms));
+                // The keyboard's poll outcomes get their own line too, for the same 256-byte reason.
+                // This is the line that explains a silent keyboard: the service can be provably
+                // healthy (pass count unchanged, still spending time in the poll) while the endpoint
+                // answers nothing, and only the breakdown says which of "nothing" it is.
+                ctx.log_fmt(format_args!(
+                    "dwc2-svc: kbd polls - {} data, {} nak, {} nyet, {} stall, {} xacterr, {} SILENT (no halt), {} other (last {:#010x})",
+                    state.n_data, state.n_nak, state.n_nyet, state.n_stall, state.n_xacterr,
+                    state.n_silent, state.n_other, state.last_other));
+                state.n_data = 0; state.n_nak = 0; state.n_nyet = 0; state.n_stall = 0;
+                state.n_xacterr = 0; state.n_silent = 0; state.n_other = 0;
+
                 // The net counters get their OWN line. Appending them to the line above pushed it past
                 // the SDK's fixed 256-byte format buffer, so the tail - the value being measured - was
                 // silently truncated away. An instrument that does not fit in the log is not an
