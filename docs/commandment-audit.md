@@ -462,10 +462,23 @@ locks and cells, with probes for each.
 | Where | What |
 |-------|------|
 | `services/shell/src/main.rs` | `static FS_TAG: AtomicU8` - the fs request correlation tag |
-| `services/dwc2/src/hub.rs` | `static NEXT_ADDR: AtomicU8` - the USB address allocator |
+| `services/dwc2/src/hub.rs` | `static NEXT_ADDR: AtomicU8` - the USB address allocator - **FIXED**, the enumeration loop owns it |
 
-Both are single-threaded and thread-safety is not the issue; ownership is. Each belongs in the state
-its service already threads through its own loop. The `dwc2` one is from this session.
+Both are single-threaded and thread-safety is not the issue; ownership is.
+
+`dwc2` is fixed: the enumeration loop owns the counter and passes it down.
+
+**`shell` is QUEUED, not skipped, and the measurement is why.** Giving the fs correlation tag an owner
+means threading `&mut FsChannel` through the TRANSITIVE CLOSURE of everything that reaches it - **98
+functions**, including 26 of the 54 `cmd_*` - in the file with the tightest stack in the system, against
+the machinery whose last failure was the "run `ls` twice" desync. My first estimate was 53 call sites;
+measuring said 98, which is the kind of doubling worth surfacing before spending it.
+
+It is scheduled as the LAST change before returning to the Pi 2, so its verification (`osdev test` plus
+the 349-case shell selfcheck) doubles as the pre-Pi regression run rather than needing its own. The
+change is mechanical and compile-checked, but compiling proves it BUILDS, not that correlation still
+behaves - and the failure mode is a subtle reply-desync rather than a crash, which is exactly the class
+that needs a boot to see.
 
 ---
 
