@@ -41,6 +41,13 @@ dependencies = [
 # path, a service the kernel spawns itself. Test-only features count - a build the kernel can be put
 # into is a build someone can ship.
 features = [
+# §22 Tests 2 and 3 (capability enforcement, IPC routing), pre-scheduler. Pinned because this
+# feature REMOVES code from a shipping kernel rather than adding any: the tests used to run in every
+# boot, where they could panic the machine on an assertion and left ResourceId(0xDEAD/0xDEAF/0xABCD)
+# and EndpointId(999)/(998) registered in the LIVE tables, 999 holding 16 messages forever. They are
+# now off by default and turned on only by `osdev test identity`, which is the build that asserts on
+# their output.
+"kernel-selftest",
     "arm-autochaos",
     "arm-fault-test",
     "arm-sched-demo",

@@ -442,6 +442,24 @@ fn kernel_feature_args() -> Vec<String> {
     }
 }
 
+/// Kernel features for the IDENTITY build: the same as a normal build, plus `kernel-selftest`.
+///
+/// §22 Tests 2 and 3 are pre-scheduler kernel scaffolding, and the harness greps their output
+/// (`cap-test: 2A pass ...`). They used to run in EVERY kernel, which meant a shipping boot could
+/// panic on a test assertion and left `EndpointId(999)` holding 16 messages in the live routing
+/// table forever. They are now off by default and turned on HERE - by the one build that actually
+/// asserts on them - so the tests keep working and a production kernel stops carrying them.
+fn identity_kernel_feature_args() -> Vec<String> {
+    let mut a = kernel_feature_args();
+    match a.iter().position(|x| x == "--features") {
+        // Merge, do not overwrite: KERNEL_FEATURES is how a developer adds a feature for one run,
+        // and silently dropping it would make that flag look broken.
+        Some(i) => { a[i + 1] = format!("{},kernel-selftest", a[i + 1]); }
+        None => { a.push("--features".to_string()); a.push("kernel-selftest".to_string()); }
+    }
+    a
+}
+
 /// Build for bare-metal USB: supervisor with `--features bare-metal` (pong + ping only,
 /// no probe services that require the QEMU harness control port to complete).
 pub fn cmd_build_bare_metal() {
@@ -697,10 +715,12 @@ pub fn cmd_build_identity() {
     }
     println!("build: supervisor (identity-only) OK");
 
+    // `identity_kernel_feature_args`, not `kernel_feature_args`: this build is the one that asserts
+    // on §22 Tests 2 and 3, so it is the one that turns them on.
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
               .iter().map(|s| s.to_string())
-              .chain(kernel_feature_args()))
+              .chain(identity_kernel_feature_args()))
         .status()
         .expect("failed to run cargo build for kernel");
     if !status.success() {

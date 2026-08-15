@@ -23,6 +23,7 @@ use core::panic::PanicInfo;
 // Capability enforcement tests - Milestone 4 (synchronous, pre-scheduler).
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "kernel-selftest")]
 fn test_cap_enforcement() {
     use capability::{
         CapError, Rights, LOG_WRITE_RESOURCE,
@@ -110,6 +111,7 @@ fn test_cap_enforcement() {
 // IPC routing tests - Milestone 5 (synchronous, pre-scheduler).
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "kernel-selftest")]
 fn test_ipc_routing() {
     use ipc::endpoint::EndpointId;
     use ipc::message::IpcError;
@@ -297,9 +299,29 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
     capability::init();
     ipc::init();
 
-    // Synchronous correctness tests (§22 Tests 2 and 3).
-    test_cap_enforcement();
-    test_ipc_routing();
+    // Synchronous correctness tests (§22 Tests 2 and 3), BEHIND A FEATURE.
+    //
+    // These ran unconditionally, in every shipping kernel, and did three things a test in ring 0
+    // must never do:
+    //
+    //   - they can HALT THE MACHINE. Every branch is `panic!("cap-test: 2A FAIL ...")`, so a test
+    //     assertion takes down a production boot - the kernel panicking over its own scaffolding.
+    //   - they PERMANENTLY POLLUTE LIVE KERNEL STATE. `ResourceId(0xDEAD/0xDEAF/0xABCD)` go into the
+    //     real resource table and `EndpointId(999)`/`(998)` into the real routing table, with 999
+    //     left holding 16 queued messages forever. `NEXT_ENDPOINT_ID` starts at 100 and climbs, so a
+    //     long-lived system that allocates that far collides with a stale boot-test registration -
+    //     the reused-id hazard the scheduler has code to prevent.
+    //   - they have ALREADY COST A BUG: the `#[inline(never)]` on `log_idle_tick_config` is
+    //     load-bearing because these tests pass 4 KiB `Message`s by value in `kernel_main`'s frame,
+    //     against a 512 KiB boot stack, and the overflow was a page-fault loop at boot.
+    //
+    // §4.4 forbids developer tooling in the kernel by name. They stay available - `osdev test
+    // identity` still needs them - but a shipping boot no longer runs them.
+    #[cfg(feature = "kernel-selftest")]
+    {
+        test_cap_enforcement();
+        test_ipc_routing();
+    }
 
     // ELF-loader fuzz mode (§22 Fuzz F3): run 77 malformed-ELF inputs and halt.
     // Never reaches the normal boot path when this feature is enabled.

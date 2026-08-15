@@ -118,6 +118,10 @@ arm-supervisor = []
 # Hands-off chaos demo: a few seconds after boot the kernel INJECTS `chaos max-carnage all-services 10`
 # (+ confirm) into the input ring, so a serial-output-only setup (no keyboard) still runs + shows the
 # storm. Build with `arm-supervisor,arm-autochaos`.
+# The 22 Tests 2 and 3 scaffolding (capability enforcement, IPC routing), run pre-scheduler.
+# OFF by default: they panic on failure and they register test resources and endpoints in the LIVE
+# tables, so a shipping boot must not run them. `osdev test identity` turns them on.
+kernel-selftest = []
 arm-autochaos = []
 # Target QEMU's raspi2b emulation rather than real Pi 2 hardware. Currently only changes the DWC2 USB
 # DMA bus-address translation: QEMU's emulated DWC2 addresses ARM system RAM directly (identity), while
