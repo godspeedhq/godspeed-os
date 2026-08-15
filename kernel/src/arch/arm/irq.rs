@@ -180,7 +180,7 @@ pub fn hires_release(slot: u32) {
 }
 
 /// Wake everything now due, then re-arm for the next. Called from the IRQ handler.
-fn hires_fire() {
+fn hires_fire() -> bool {
     let mut woken = [u32::MAX; HIRES_MAX];
     {
         let mut q = HIRES.lock();
@@ -195,11 +195,14 @@ fn hires_fire() {
     }
     // Wake OUTSIDE the lock: the scheduler takes its own locks, and holding two at once is how a
     // deadlock is built. The entries are already removed, so a concurrent arm cannot collide.
+    let mut any = false;
     for w in woken.iter() {
         if *w != u32::MAX {
             crate::task::scheduler::wake_by_slot(*w as usize, 0);
+            any = true;
         }
     }
+    any
 }
 
 /// Doorbells received, per core./// Doorbells received, per core. Exists so the boot selftest can prove the path end to end on the
@@ -403,12 +406,17 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
     // unexpected peripheral IRQ is left asserted and obvious rather than silently swallowed.
     // The microsecond one-shot arrives through the same GPU funnel as USB, so check it here and
     // let the USB test below still run - both can be pending in one interrupt.
-    if this_core() == 0 && source & CORE_IRQ_GPU != 0 && super::timer::take_oneshot_match() {
-        // Wake everything now due and re-arm for the next deadline. The scheduling pass at the bottom
-        // of this handler then runs them, so a 125 us sleep costs an interrupt and a context switch
-        // instead of 125 us of spinning.
-        hires_fire();
-    }
+    // WAKING IS NOT RUNNING, and forgetting that cost the whole feature.
+    //
+    // The one-shot arrives through the GPU funnel, not as a timer or mailbox interrupt - so marking a
+    // task runnable here did nothing until the core's NEXT 10 ms tick came round to schedule it.
+    // Hardware showed it exactly: min 147 us when a tick happened to be imminent, mean 8213 us
+    // otherwise, which is half a quantum. The timer was perfect and the wake was on time; the task
+    // just sat there Ready. So record that we woke someone and take the scheduling path below.
+    let woke_hires = this_core() == 0
+        && source & CORE_IRQ_GPU != 0
+        && super::timer::take_oneshot_match()
+        && hires_fire();
 
     let handled_gpu = if this_core() == 0 && source & CORE_IRQ_GPU != 0 && usb_irq_pending() {
         // DEVICE INTERRUPTS CAN GO TO USERSPACE ON ARM32. They always could.
@@ -464,7 +472,7 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
         DOORBELLS[this_core() & 3].fetch_add(1, Ordering::Relaxed);
     }
 
-    if source & (IRQ_PHYS_TIMER | CORE_IRQ_MBOX0) != 0 {
+    if source & (IRQ_PHYS_TIMER | CORE_IRQ_MBOX0) != 0 || woke_hires {
         // Re-arm first: writing TVAL both sets the next deadline and deasserts the current interrupt.
         // Doing it before the bookkeeping keeps the period honest - the next interval starts counting
         // from here, not from whenever the handler happens to finish. (This is the ARM timer's "EOI";
