@@ -276,10 +276,18 @@ assert ok status
 status | assert contains shell
 status | where name=shell | assert contains shell
 status | where name!=shell | assert lacks shell
-status | where core=0 | assert contains shell
+# These two exercise the NUMERIC where-operators (= and <), and they used the shell's core as a
+# convenient value. That stopped being a fact: the shell moved to core 1 so the serial writer is not
+# sharing a core with the microframe-timed USB driver, and both lines failed - a test asserting a
+# placement DECISION while claiming to test an operator.
+#
+# The supervisor's core IS fixed, by the constitution rather than by choice: the kernel spawns it on
+# core 0 and that is its one direct spawn (§11). So the operators are now tested against the one
+# value in the system that cannot be re-placed.
+status | where core=0 | assert contains supervisor
 status | where state=Running | assert contains shell
 status | where slot>=0 | assert contains shell
-status | where core<1 | assert contains shell
+status | where core<1 | assert contains supervisor
 status | where name~super | assert contains supervisor
 status | select name state | assert contains shell
 status | sort name | assert contains supervisor
