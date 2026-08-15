@@ -254,6 +254,27 @@ pub fn poll(
         if hcint & HCINT_NYET == 0 {
             state.nyet_run = 0; // anything else is the TT answering, so it is not wedged
         }
+        // RESET ON ANY NON-ERROR OUTCOME, including a NAK. This is deliberately the LENIENT form,
+        // and it was briefly changed to the strict one - errors since the last delivered REPORT, so a
+        // NAK no longer cleared it - on the reasoning that a NAK is not evidence of health.
+        //
+        // The reasoning was right and the change was wrong. Escalation then fired in ~300 ms instead
+        // of ~5 s, so the driver re-enumerated the port roughly once a second, and each re-enumeration
+        // RESETS THE PORT before the device can settle. The keyboard delivered zero reports for an
+        // entire boot: 0 data, 1497 xacterr, four recoveries, then the backoff. The recovery became
+        // the fault. The build before it finished a 43-round storm with the keyboard completely
+        // healthy - 30 data, 0 xacterr.
+        //
+        // So the cost of leniency is a ~5 s outage when a degraded endpoint alternates NAK and error.
+        // The cost of strictness is a keyboard that never works. Measured, not argued, and this is the
+        // second time an eager recovery threshold has been worse than the fault it chases.
+        if hcint & HCINT_XACTERR == 0 {
+            state.xacterr_run = 0;
+        }
+
+        if hcint & HCINT_NYET == 0 {
+            state.nyet_run = 0; // anything else is the TT answering, so it is not wedged
+        }
         // ERRORS SINCE THE LAST REPORT, not consecutive errors.
         //
         // This used to reset on ANY non-error outcome, including a NAK - and a degraded endpoint
@@ -262,24 +283,6 @@ pub fn poll(
         // resetting, so a threshold worth 300 ms of polling took 5.2 SECONDS to trip. That gap is
         // the keyboard outage an operator feels.
         //
-        // A NAK means "nothing changed", which is not evidence the endpoint is HEALTHY - only a
-        // delivered report is. So the counter now clears on data and survives NAKs, and it is a RATE:
-        // the window restarts if the errors are spread thinly enough not to matter, so ordinary
-        // XACTERR noise on a low-speed split device still never triggers a port reset.
-        if hcint & HCINT_XFERCOMPL != 0 && hcint & HCINT_NAK == 0 {
-            state.xacterr_run = 0;      // a real report: the endpoint is transacting
-            state.xacterr_since = 0;
-        } else if hcint & HCINT_XACTERR != 0 {
-            let now = ctx.read_tsc();
-            // Restart the window if the last error is stale - errors that far apart are noise, not a
-            // broken endpoint.
-            if state.xacterr_since == 0
-                || now.wrapping_sub(state.xacterr_since) > ctx.duration_cycles(2000)
-            {
-                state.xacterr_since = now;
-                state.xacterr_run = 1;
-            }
-        }
         if hcint == 0 {
             state.n_silent = state.n_silent.wrapping_add(1);
         } else if hcint & HCINT_STALL != 0 {
@@ -511,9 +514,6 @@ pub struct KeyState {
     /// a data-toggle mismatch; one is ordinary noise, an unbroken run means the endpoint is in a
     /// state no further transfers will leave.
     pub xacterr_run: u32,
-    /// When the current error window opened. Errors spread wider than the window are noise; errors
-    /// packed inside it with no delivered report in between are a broken endpoint.
-    pub xacterr_since: u64,
     /// When the TT buffer was last cleared. A clear that does not restore data tells us the endpoint
     /// itself is in trouble, and waiting out the full cold-start error budget after that is three
     /// seconds spent proving something already known.
@@ -537,7 +537,7 @@ impl KeyState {
             emitted_report: 0,
             last_data: 0,
             n_data: 0, n_nak: 0, n_nyet: 0, n_stall: 0, n_xacterr: 0, n_silent: 0,
-            n_other: 0, last_other: 0, nyet_run: 0, xacterr_run: 0, xacterr_since: 0, cleared_at: 0, clears: 0,
+            n_other: 0, last_other: 0, nyet_run: 0, xacterr_run: 0, cleared_at: 0, clears: 0,
             // ~1.5 s. Long enough that a deliberate hold keeps repeating through the initial 600 ms
             // delay and well beyond, short enough that a broken poll path stops within a couple of
             // characters instead of running to the next keypress.
