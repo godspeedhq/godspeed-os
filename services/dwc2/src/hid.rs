@@ -350,6 +350,7 @@ pub fn poll(
                 NYET_WEDGED));
             let _ = crate::hub::clear_tt_buffer(
                 ctx, mmio, dma, &hub, t.addr, kbd.ep, 3 /* interrupt */, true /* IN */, hub_port);
+            state.cleared_at = ctx.read_tsc();
             // The next poll starts a fresh start-split; the toggle is read back from hardware, so
             // there is no software state to reset here.
         }
@@ -466,6 +467,10 @@ pub struct KeyState {
     /// a data-toggle mismatch; one is ordinary noise, an unbroken run means the endpoint is in a
     /// state no further transfers will leave.
     pub xacterr_run: u32,
+    /// When the TT buffer was last cleared. A clear that does not restore data tells us the endpoint
+    /// itself is in trouble, and waiting out the full cold-start error budget after that is three
+    /// seconds spent proving something already known.
+    pub cleared_at: u64,
 }
 
 impl KeyState {
@@ -483,7 +488,7 @@ impl KeyState {
             emitted_report: 0,
             last_data: 0,
             n_data: 0, n_nak: 0, n_nyet: 0, n_stall: 0, n_xacterr: 0, n_silent: 0,
-            n_other: 0, last_other: 0, nyet_run: 0, xacterr_run: 0,
+            n_other: 0, last_other: 0, nyet_run: 0, xacterr_run: 0, cleared_at: 0,
             // ~1.5 s. Long enough that a deliberate hold keeps repeating through the initial 600 ms
             // delay and well beyond, short enough that a broken poll path stops within a couple of
             // characters instead of running to the next keypress.

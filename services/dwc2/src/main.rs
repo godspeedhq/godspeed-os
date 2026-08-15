@@ -410,15 +410,30 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // Bounded and loud: ~3 s of solid errors triggers one attempt, and the attempt reports
             // its own outcome. If it fails the run restarts, so a permanently absent keyboard costs
             // one recovery attempt every few seconds and says so, rather than a silent error storm.
-            const XACTERR_STUCK: u32 = 300;
-            if state.xacterr_run >= XACTERR_STUCK {
+            // TWO THRESHOLDS, because a cold error storm and one that follows a failed TT clear are
+            // not the same evidence.
+            //
+            // Measured across three wedges on hardware, every one of them ran: TT wedged -> clear
+            // accepted -> STILL broken -> re-enumerate -> recovered. The clear has never once fixed
+            // it on its own. So after a clear we already know the endpoint - not the translator - is
+            // the thing stuck, and spending the full cold budget re-proving that was three of the
+            // roughly four seconds the operator sees as a pause. The repair itself takes 0.31 s.
+            //
+            // Cold, with no clear behind it, the generous budget stays: ordinary XACTERR noise on a
+            // low-speed device behind a translator must never trigger a port reset.
+            let recently_cleared = state.cleared_at != 0
+                && ctx.read_tsc().wrapping_sub(state.cleared_at) < ctx.duration_cycles(2000);
+            let stuck_at = if recently_cleared { 30 } else { 300 };
+            if state.xacterr_run >= stuck_at {
                 state.xacterr_run = 0;
                 let hub_port = (*ksplt & 0x7F) as u8;
                 let hub_addr = ((*ksplt >> 7) & 0x7F) as u8;
                 let hub_t = chan::Target { addr: hub_addr, mps: 64, low_speed: false };
                 ctx.log_fmt(format_args!(
-                    "dwc2-svc: keyboard endpoint stuck - {} consecutive XACTERR, no data; re-enumerating hub port {}",
-                    XACTERR_STUCK, hub_port));
+                    "dwc2-svc: keyboard endpoint stuck - {} consecutive XACTERR{}, no data; re-enumerating hub port {}",
+                    stuck_at, if recently_cleared { " after a TT clear that did not help" } else { "" },
+                    hub_port));
+                state.cleared_at = 0;
                 let mut addr = kt.addr; // re-assign the address it already had
                 match hub::enumerate_downstream(&ctx, &m, &d, &hub_t, hub_port, &mut addr) {
                     Some((_, _, _, ndt, nsplt)) => match hid::bind(&ctx, &m, &d, &ndt, nsplt) {
