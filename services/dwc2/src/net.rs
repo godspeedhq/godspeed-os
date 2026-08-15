@@ -62,7 +62,25 @@ pub struct Nic {
     pub in_armed: bool,
     pub pid_in: u32,
     pub pid_out: u32,
+    /// Cached PHY link state, and when it was read.
+    ///
+    /// A transmit into a cable that is not plugged in cannot succeed, and it is not cheap to fail: it
+    /// burns the full 2 s bulk budget before giving up, on the ONE thread that also polls the
+    /// keyboard. Hardware showed exactly what that costs - `net-stack` queued roughly a hundred
+    /// doomed frames a second during a DHCP attempt, and this service stopped answering anything else
+    /// for a minute and a half. The keyboard went dead, `q` never reached the shell, and the driver
+    /// printed no heartbeat because it never had an idle pass to print one from, so it read as
+    /// crashed when it was merely drowning.
+    ///
+    /// Reading BMSR per transmit would just move the cost (it is two control transfers), so the
+    /// answer is cached and refreshed at a bounded rate. Stale by at most `LINK_TTL_MS`, which is far
+    /// shorter than any human notices a cable going in and far longer than a frame burst.
+    pub link_up: bool,
+    pub link_at: u64,
 }
+
+/// How long a cached link answer is trusted before it is read again.
+const LINK_TTL_MS: u64 = 500;
 
 fn hex_val(c: u8) -> u8 {
     match c {
@@ -190,8 +208,11 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
     ctx.log_fmt(format_args!(
         "dwc2-svc: smsc95xx (LAN9514) UP - bulk IN {} OUT {} mps {} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         ep_in, ep_out, mps, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
+    // Link starts DOWN and unstamped: the first transmit reads the PHY instead of assuming a
+    // cable is there. Assuming UP is how a driver spends a full budget per frame proving otherwise.
     Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(), in_armed: false,
-               pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0 })
+               pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
+               link_up: false, link_at: 0 })
 }
 
 // --- smsc95xx (LAN9514) bring-up -------------------------------------------------------------------
@@ -255,6 +276,24 @@ const SMSC_MII_BMSR: u32 = 1;   // basic mode STATUS; bit 2 = link up, bit 5 = a
 fn link_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> bool {
     let _latched = mii_read(ctx, m, d, t, SMSC_MII_BMSR);
     matches!(mii_read(ctx, m, d, t, SMSC_MII_BMSR), Some(v) if v & 0x0004 != 0)
+}
+
+/// The link state, re-read at most every `LINK_TTL_MS`.
+///
+/// `link_up` costs two control transfers, so asking it per frame would replace one expensive answer
+/// with another. Caching makes the common case - a burst of frames while the cable state has not
+/// changed - free, and bounds how stale the answer can be to half a second.
+///
+/// The cache starts DOWN and un-stamped, so the very first transmit reads the PHY rather than
+/// trusting a default. An unreadable PHY counts as down, for the same reason `OP_NET_INFO` says so:
+/// an unanswerable question is not a yes.
+fn link_fresh(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic) -> bool {
+    let now = ctx.read_tsc();
+    if nic.link_at == 0 || now.wrapping_sub(nic.link_at) >= ctx.duration_cycles(LINK_TTL_MS) {
+        nic.link_up = link_up(ctx, m, d, t);
+        nic.link_at = now;
+    }
+    nic.link_up
 }
 /// RX burst size in 512-byte high-speed packets, and the IN transfer length that must match it.
 ///
@@ -465,6 +504,22 @@ const _: () = assert!(RX_OFF + RX_BURST <= 64 * 1024);
 pub fn tx(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Nic, frame: &[u8],
 ) -> bool {
+    // REFUSE, CHEAPLY, WITH NO LINK.
+    //
+    // The frame cannot go anywhere, and the expensive part is not the failure - it is HOW LONG the
+    // failure takes. `bulk` below is given 2 s, so a client retrying a doomed transmit does not merely
+    // waste its own time, it takes this service off the air: the keyboard poll shares this thread, and
+    // a pass that spends seconds in a transmit polls the keyboard seconds apart. That is what a user
+    // experiences as "the keyboard stopped working", and the driver looked crashed rather than busy
+    // because a heartbeat is only printed from an idle pass.
+    //
+    // The answer returned is the same `false` the timeout would have produced after 2 s. Nothing
+    // downstream learns anything new; it just learns it immediately (§26.7 - fail loudly and fast,
+    // rather than slowly and identically).
+    if !link_fresh(ctx, mmio, dma, t, nic) {
+        nic.stats.tx_fail += 1;
+        return false;
+    }
     let n = frame.len().min(FRAME_MAX);
     // TX_CMD_A = len | FIRST_SEG | LAST_SEG, TX_CMD_B = len. Both little-endian.
     let a = (n as u32) | 0x0000_2000 | 0x0000_1000;
@@ -697,7 +752,11 @@ pub fn serve(
             // "link up but silent" indistinguishable from the outside - the two things a diagnosis
             // most needs to tell apart. Unreadable counts as DOWN: an unanswerable question is not
             // a yes.
+            // This is a fresh read of the PHY, so let the transmit cache learn from it too - the
+            // link question and the transmit guard must never disagree about the same cable.
             let up = link_up(ctx, mmio, dma, t);
+            nic.link_up = up;
+            nic.link_at = ctx.read_tsc();
             nic.stats.bmsr = mii_read(ctx, mmio, dma, t, SMSC_MII_BMSR).map_or(0xFFFF, u32::from);
             nic.stats.rx_fifo = smsc_read_or0(ctx, mmio, dma, t, SMSC_RX_FIFO_INF);
             nic.stats.int_sts = smsc_read_or0(ctx, mmio, dma, t, SMSC_INT_STS);
