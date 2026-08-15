@@ -499,44 +499,23 @@ fn handle_sleep(cycles: u64) -> i64 {
     if cycles == 0 { return 0; }
     let my_slot = scheduler::current_task_slot();
 
-    // SUB-TICK SLEEPS GO TO THE MICROSECOND ONE-SHOT, where the hardware has one.
+    // SUB-TICK SLEEPS ARE NOT ROUTED TO THE MICROSECOND ONE-SHOT - WITHDRAWN, NOT ABANDONED.
     //
-    // The loop below resolves in 10 ms scheduler TICKS, so every sleep shorter than a quantum
-    // returned after a whole one - measured on the Pi 2 as a 125 us request taking 9.9 ms at best.
-    // That is why the USB driver spins on a hardware counter instead of sleeping: a microframe is
-    // 125 us and the kernel could not name it. The BCM2835 system timer can (1 MHz, and its compare
-    // registers were never wired up), so a short sleep now costs an interrupt instead of a spin.
+    // The mechanism works and is measured: a 125 us sleep returned in 144 us through syscall, block,
+    // compare interrupt, wake and resume, and a 2000 us sleep landed within 28 us of its deadline.
+    // The hardware and the wake path are both good.
     //
-    // No new syscall: this is the same `sleep`, answering accurately for a duration it used to round
-    // away. A caller that asks for less than a tick and gets a tick is not served, it is placated.
-    #[cfg(target_arch = "arm")]
-    {
-        let us = scheduler::cycles_to_us(cycles);
-        if us > 0 && us < 10_000 {
-            match crate::arch::imp::irq::hires_arm(my_slot as u32, us as u32) {
-                // The delay passed while we were arming it - the wait is already served, so return
-                // rather than block. Blocking here is what made a 125 us sleep take 8 ms: the compare
-                // had nothing left to match, so only the tick backstop could end it.
-                crate::arch::imp::irq::Armed::Elapsed => return 0,
-                crate::arch::imp::irq::Armed::Full => {}   // fall through to the tick path
-                crate::arch::imp::irq::Armed::Pending => {
-            // TICK BACKSTOP, always. If the compare interrupt never arrives - unimplemented in an
-            // emulator, masked, a match lost to a race - the task must still wake. Blocking with no
-            // second path out would turn a timing optimisation into a hang, and a hang in `sleep` is
-            // a hang in every service that paces itself. The backstop costs nothing when the one-shot
-            // works: the hi-res wake fires first and the deadline is cleared on the way out.
-                    let deadline = scheduler::monotonic_ticks()
-                        .wrapping_add(scheduler::cycles_to_ticks(cycles).max(1));
-                    scheduler::set_wake_deadline(my_slot, deadline);
-                    let _ = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
-                    scheduler::clear_wake_deadline(my_slot);
-                    crate::arch::imp::irq::hires_release(my_slot as u32);
-                    return 0;
-                }
-            }
-        }
-    }
-
+    // It is unwired because under heavy typing it produced a KERNEL PANIC on real hardware: core 0
+    // made no progress for 10 s (liveness watchdog), followed by a SpinLock wedge reporting a holder
+    // that never released. The timer queue's lock is taken from BOTH a syscall path and an interrupt
+    // handler, which is the classic shape of that deadlock, and this sleep is the only new thing core
+    // 0 was doing. A kernel that wedges under typing is worse than one that sleeps coarsely, and
+    // shipping an unproven mechanism because its best case is attractive is exactly the trade this
+    // project refuses (§26.12: correctness before performance).
+    //
+    // What was learned stands and is written down in the commit history: the timer is exact, the wake
+    // path is sound, and the thing that actually blocks a core for ~9 ms is a serial write inside an
+    // un-preemptible syscall. That is the fix worth building next, and it needs no new locks.
     let deadline = scheduler::monotonic_ticks().wrapping_add(scheduler::cycles_to_ticks(cycles));
     loop {
         if scheduler::monotonic_ticks() >= deadline { break; }

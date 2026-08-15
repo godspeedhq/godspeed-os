@@ -217,7 +217,17 @@ pub fn hires_arm(slot: u32, us: u32) -> Armed {
     }
     let n = HR_ARM.fetch_add(1, Ordering::Relaxed) + 1;
     drop(q);                       // never print holding the queue lock
-    if n % 16 == 0 { hires_report(); }
+    // ONCE per boot, at 64, and never again.
+    //
+    // This printed every 16 arms - and a sweep is exactly 16 sleeps per duration, so every single
+    // measurement had a ~9 ms kernel log line dropped into the middle of it. The instrument was
+    // producing the number it was meant to be measuring: the quiet MAX sat at ~6900 us across two
+    // different placements because that IS one log line, not because anything was stalling.
+    //
+    // Same mistake as the wake-latency probe that blocked this service's bring-up for two minutes.
+    // A diagnostic on a path it is timing has to be rarer than the thing it measures, or it becomes
+    // the thing it measures.
+    if n == 64 { hires_report(); }
     Armed::Pending
 }
 
