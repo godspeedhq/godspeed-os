@@ -499,23 +499,46 @@ fn handle_sleep(cycles: u64) -> i64 {
     if cycles == 0 { return 0; }
     let my_slot = scheduler::current_task_slot();
 
-    // SUB-TICK SLEEPS ARE NOT ROUTED TO THE MICROSECOND ONE-SHOT - WITHDRAWN, NOT ABANDONED.
+    // SUB-TICK SLEEPS GO TO THE MICROSECOND ONE-SHOT - RE-ENABLED, with the reason it was pulled now
+    // understood and fixed elsewhere.
     //
-    // The mechanism works and is measured: a 125 us sleep returned in 144 us through syscall, block,
-    // compare interrupt, wake and resume, and a 2000 us sleep landed within 28 us of its deadline.
-    // The hardware and the wake path are both good.
+    // This was withdrawn after a kernel panic: core 0 wedged under typing, and a queue lock shared
+    // between this syscall path and an interrupt handler was the obvious suspect. It was the wrong
+    // suspect twice over. The instrumented panic named the real one - `last source 0x10`, the mailbox
+    // doorbell, frozen mid-handler - which was re-entering the scheduler from an asynchronous
+    // interrupt; that is fixed, and three minutes of real typing plus 2m39s of synthetic storm now
+    // pass with no panic. And `SpinLock::lock` calls `irq_save`, so interrupts are masked while the
+    // queue lock is held: the self-deadlock I withdrew this for could not have happened.
     //
-    // It is unwired because under heavy typing it produced a KERNEL PANIC on real hardware: core 0
-    // made no progress for 10 s (liveness watchdog), followed by a SpinLock wedge reporting a holder
-    // that never released. The timer queue's lock is taken from BOTH a syscall path and an interrupt
-    // handler, which is the classic shape of that deadlock, and this sleep is the only new thing core
-    // 0 was doing. A kernel that wedges under typing is worse than one that sleeps coarsely, and
-    // shipping an unproven mechanism because its best case is attractive is exactly the trade this
-    // project refuses (§26.12: correctness before performance).
-    //
-    // What was learned stands and is written down in the commit history: the timer is exact, the wake
-    // path is sound, and the thing that actually blocks a core for ~9 ms is a serial write inside an
-    // un-preemptible syscall. That is the fix worth building next, and it needs no new locks.
+    // Withdrawing it was still right at the time. The evidence then pointed here, and shipping an
+    // unproven mechanism into a machine that was panicking would have made the next measurement
+    // unreadable. What changed is not confidence, it is evidence.
+    #[cfg(target_arch = "arm")]
+    {
+        let us = scheduler::cycles_to_us(cycles);
+        if us > 0 && us < 10_000 {
+            match crate::arch::imp::irq::hires_arm(my_slot as u32, us as u32) {
+                // The delay passed while we were arming it: the wait is already served, so return
+                // rather than block. Blocking here made a 125 us sleep take 8 ms, because the compare
+                // fires on EQUALITY and had nothing left to match.
+                crate::arch::imp::irq::Armed::Elapsed => return 0,
+                crate::arch::imp::irq::Armed::Full => {}   // fall through to the tick path
+                crate::arch::imp::irq::Armed::Pending => {
+                    // Tick backstop, always: if the compare interrupt never arrives the task must
+                    // still wake. A timing optimisation that can hang `sleep` would hang every service
+                    // that paces itself.
+                    let deadline = scheduler::monotonic_ticks()
+                        .wrapping_add(scheduler::cycles_to_ticks(cycles).max(1));
+                    scheduler::set_wake_deadline(my_slot, deadline);
+                    let _ = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
+                    scheduler::clear_wake_deadline(my_slot);
+                    crate::arch::imp::irq::hires_release(my_slot as u32);
+                    return 0;
+                }
+            }
+        }
+    }
+
     let deadline = scheduler::monotonic_ticks().wrapping_add(scheduler::cycles_to_ticks(cycles));
     loop {
         if scheduler::monotonic_ticks() >= deadline { break; }
