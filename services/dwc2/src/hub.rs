@@ -37,6 +37,26 @@ const REQ_CLEAR_FEATURE: u8 = 0x01;
 const REQ_GET_STATUS: u8 = 0x00;
 /// USB 2.0 §11.24.2.3 - flush one TT buffer. The only way out of a permanent NYET.
 const REQ_CLEAR_TT_BUFFER: u8 = 0x08;
+/// USB 2.0 §11.24.2.9. Returns the WHOLE transaction translator to its power-on state, as opposed to
+/// `Clear_TT_Buffer`, which flushes the buffer belonging to one endpoint.
+///
+/// This rung was missing entirely, and its absence is why a wedged keyboard never came back. A TT
+/// keeps its periodic and non-periodic traffic in separate buffers, so a hub whose PERIODIC pipeline
+/// is stuck still services control transfers perfectly - which is exactly what hardware showed:
+/// re-enumeration succeeded twelve times in a row (all control), and the interrupt endpoint was dead
+/// again 18 ms later every time. Re-enumerating the DEVICE cannot repair a translator that lives in
+/// the HUB, so the driver's most expensive remedy was aimed at the wrong box.
+const REQ_RESET_TT: u8 = 0x09;
+
+/// The `wIndex` that names a TT.
+///
+/// On a multi-TT hub each port has its own translator, so the port number names it. On a single-TT
+/// hub there is exactly one, and USB 2.0 requires it to be addressed as port 1 - passing the device's
+/// real port asks the hub to operate on a translator it does not have. The hub answers that request
+/// successfully, which is the trap: the remedy is reported as accepted and does nothing at all.
+fn tt_windex(port: u8, multi_tt: bool) -> u8 {
+    if multi_tt { port } else { 1 }
+}
 
 // Port features.
 const FEAT_PORT_RESET: u16 = 4;
@@ -120,7 +140,7 @@ fn port_feature(
 /// speed), never to the stuck device - which is the point, since the device is unreachable.
 pub fn clear_tt_buffer(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, hub: &Target,
-    dev_addr: u8, ep: u8, ep_type: u8, dir_in: bool, port: u8,
+    dev_addr: u8, ep: u8, ep_type: u8, dir_in: bool, port: u8, multi_tt: bool,
 ) -> bool {
     let wvalue: u16 = ((ep as u16) & 0xF)
         | (((dev_addr as u16) & 0x7F) << 4)
@@ -131,7 +151,7 @@ pub fn clear_tt_buffer(
         REQ_CLEAR_TT_BUFFER,
         (wvalue & 0xFF) as u8,
         (wvalue >> 8) as u8,
-        port,
+        tt_windex(port, multi_tt),
         0,
         0,
         0,
@@ -145,6 +165,30 @@ pub fn clear_tt_buffer(
             "dwc2-svc: Clear_TT_Buffer for addr {} ep {} on hub port {} REFUSED - the TT stays wedged",
             dev_addr, ep, port));
     }
+    ok
+}
+
+/// Reset the hub's transaction translator (USB 2.0 §11.24.2.9).
+///
+/// The rung between "flush one endpoint's buffer" and "re-enumerate the device", and the one that
+/// was missing. A TT services periodic and non-periodic traffic from separate buffers, so when its
+/// periodic side wedges the device stays perfectly reachable by control transfers and completely
+/// unreachable by interrupt ones. Every remedy the driver had either flushed a single endpoint's
+/// entry or reset the DEVICE; neither touches a translator in that state.
+///
+/// It is heavier than a buffer clear - it disturbs every device behind this TT, briefly - so it sits
+/// where it belongs in the ladder: after a clear has been tried and demonstrably not helped, and
+/// before the port reset that costs 0.31 s and cannot fix this fault at all.
+pub fn reset_tt(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, hub: &Target, port: u8, multi_tt: bool,
+) -> bool {
+    let setup = [REQ_TYPE_PORT_OUT, REQ_RESET_TT, 0, 0, tt_windex(port, multi_tt), 0, 0, 0];
+    let mut none: [u8; 0] = [];
+    let ok = chan::control(ctx, mmio, dma, hub, &setup, &mut none, false, 0);
+    ctx.log_fmt(format_args!(
+        "dwc2-svc: Reset_TT on hub TT {} - {}",
+        tt_windex(port, multi_tt),
+        if ok { "accepted" } else { "REFUSED" }));
     ok
 }
 

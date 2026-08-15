@@ -158,6 +158,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Owned by the enumeration loop, not a static (C6-1). The bus hands out addresses in sequence and
     // this is the thing that runs the bus, so this is where the counter belongs.
     let mut next_addr: u8 = hub::FIRST_DOWNSTREAM_ADDR;
+    // Whether the root hub has a TT per port or one shared translator - it decides where a TT remedy
+    // must be addressed (see `hub::tt_windex`). Defaults to the single-TT reading, which is the
+    // conservative one: a request aimed at TT 1 on a multi-TT hub is at worst the wrong translator,
+    // whereas assuming per-port translators on a single-TT hub sends every remedy into a void.
+    let mut hub_multi_tt = false;
     if let Some(m) = ctx.mmio() {
         if core::identify(&ctx, &m).is_some() {
             let ok = core::reset_and_host_mode(&ctx, &m);
@@ -191,6 +196,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if let Some(d) = ctx.dma_region() {
                 match enumerate::root_device(&ctx, &m, &d) {
                     Some(dev) => {
+                        hub_multi_tt = dev.hub_multi_tt;
                         ctx.log_fmt(format_args!(
                             "dwc2-svc: ENUMERATION OK - {:04x}:{:04x} class={:#04x} ports={}",
                             dev.vid, dev.pid, dev.class,
@@ -361,6 +367,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut recoveries_in_a_row = 0u32;
         let mut recovery_gave_up = false;
         let mut gave_up_at = 0u64;
+        // When the hub's transaction translator was last reset. Rate-limits the rung so a fault it
+        // cannot fix falls through to the port reset instead of looping on it.
+        let mut tt_reset_at = 0u64;
+        // Set when the keyboard has been re-bound but has not yet delivered a report.
+        //
+        // The driver used to announce "RECOVERED by re-enumeration" the instant the device re-bound.
+        // Twelve of those lines were printed in one minute while not a single keystroke arrived: the
+        // bind proves the control path works, which was never the broken part. Recovery is claimed
+        // on EVIDENCE now - a delivered report - so the log cannot say the repair worked while the
+        // operator is looking at a dead keyboard.
+        let mut awaiting_report = false;
         /// How long to leave a hopeless keyboard alone before trying once more. Long enough that a
         /// dead device costs nothing, short enough that a transient storm is not a permanent loss.
         const RECOVERY_BACKOFF_MS: u64 = 10_000;
@@ -478,6 +495,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let hub_port = (*ksplt & 0x7F) as u8;
                 let hub_addr = ((*ksplt >> 7) & 0x7F) as u8;
                 let hub_t = chan::Target { addr: hub_addr, mps: 64, low_speed: false };
+                // RUNG 2: RESET THE TRANSLATOR, before resetting the device.
+                //
+                // A buffer clear has just been tried and did not help, and the next rung down has
+                // always been a port re-enumeration - which hardware proved cannot fix this fault,
+                // twelve times in one minute: every re-enumeration SUCCEEDED (control transfers are
+                // non-periodic and were never broken) and the interrupt endpoint was dead again 18 ms
+                // later. The device was never the stuck thing. The TT's periodic side was, and
+                // nothing in the ladder addressed it.
+                //
+                // Bounded, so it cannot become the thrash the port reset once was: one Reset_TT per
+                // 3 s window. If the fault survives that, the run climbs again and the port reset
+                // below still happens - this rung delays the expensive one by ~300 ms, never replaces
+                // it.
+                let now_tsc = ctx.read_tsc();
+                let recently_reset_tt = tt_reset_at != 0
+                    && now_tsc.wrapping_sub(tt_reset_at) < ctx.duration_cycles(3000);
+                if recently_cleared && !recently_reset_tt {
+                    tt_reset_at = now_tsc;
+                    state.cleared_at = 0;
+                    let _ = hub::reset_tt(&ctx, &m, &d, &hub_t, hub_port, hub_multi_tt);
+                    continue;
+                }
                 ctx.log_fmt(format_args!(
                     "dwc2-svc: keyboard endpoint stuck - {} consecutive XACTERR{}, no data; re-enumerating hub port {}",
                     stuck_at, if recently_cleared { " after a TT clear that did not help" } else { "" },
@@ -527,7 +566,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 match hub::enumerate_downstream(&ctx, &m, &d, &hub_t, hub_port, &mut addr) {
                     Some((_, _, _, ndt, nsplt)) => match hid::bind(&ctx, &m, &d, &ndt, nsplt) {
                         Some(nk) => {
-                            ctx.log("dwc2-svc: keyboard RECOVERED by re-enumeration");
+                            // "re-bound", not "RECOVERED". The bind exercises the control path,
+                            // which was never what broke; only a delivered report proves the
+                            // interrupt endpoint is alive again, and that is where the recovery is
+                            // announced below.
+                            ctx.log("dwc2-svc: keyboard re-bound after re-enumeration - awaiting a report to confirm");
+                            awaiting_report = true;
                             state = hid::KeyState::new(&ctx); // toggles and repeat start clean
                             kbd = Some((nk, ndt, nsplt));
                         }
@@ -537,10 +581,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
                 continue;
             }
-            if hid::poll(&ctx, &m, &d, kt, *ksplt, k, &mut state) {
+            if hid::poll(&ctx, &m, &d, kt, *ksplt, k, &mut state, hub_multi_tt) {
                 // A real report is proof the endpoint is healthy: the streak starts over.
                 recoveries_in_a_row = 0;
                 recovery_gave_up = false;
+                tt_reset_at = 0;
+                if awaiting_report {
+                    awaiting_report = false;
+                    ctx.log("dwc2-svc: keyboard RECOVERED - reports are flowing again");
+                }
                 reports = reports.wrapping_add(1);
                 if reports == 1 {
                     ctx.log("dwc2-svc: *** FIRST KEY REPORT FROM USERSPACE *** - type and it reaches the console");

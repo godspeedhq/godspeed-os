@@ -34,6 +34,15 @@ pub struct RootDevice {
     pub mps0: u16,
     /// Downstream port count, if this is a hub.
     pub hub_ports: Option<u8>,
+    /// Does this hub have one transaction translator PER PORT, or a single TT shared by all of them?
+    ///
+    /// `bDeviceProtocol` in the device descriptor: 1 = single TT, 2 = TT per port. It matters for
+    /// exactly one thing, and that thing was silently wrong: USB 2.0 §11.24.2.3 requires the port
+    /// field of `Clear_TT_Buffer` (and `Reset_TT`) to name the TT, and on a SINGLE-TT hub there is
+    /// only one, addressed as port 1 - not the port the device happens to sit on. Sending the
+    /// device's port to a single-TT hub is a well-formed request the hub accepts and acts on for a
+    /// TT that does not exist, so the remedy reports success and clears nothing.
+    pub hub_multi_tt: bool,
 }
 
 /// SET_ADDRESS. No data stage.
@@ -110,6 +119,10 @@ pub fn root_device(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> Option<RootD
     let vid = u16::from_le_bytes([full[8], full[9]]);
     let pid = u16::from_le_bytes([full[10], full[11]]);
     let class = full[4];
+    // bDeviceProtocol. Read and REPORTED rather than assumed: it decides where a TT remedy is
+    // addressed, and a remedy sent to the wrong TT succeeds while fixing nothing - the most
+    // expensive kind of wrong, because the log then says the repair worked.
+    let protocol = full[6];
     ctx.log_fmt(format_args!(
         "dwc2-svc: root device addressed - VID:PID={:04x}:{:04x} class={:#04x} mps0={}",
         vid, pid, class, mps0));
@@ -141,15 +154,20 @@ pub fn root_device(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> Option<RootD
     }
     ctx.log_fmt(format_args!("dwc2-svc: configured (bConfigurationValue={})", cfg_val));
 
+    let hub_multi_tt = class == CLASS_HUB && protocol == 2;
     let hub_ports = if class == CLASS_HUB {
         let n = hub_port_count(ctx, mmio, dma, &t);
         if let Some(n) = n {
-            ctx.log_fmt(format_args!("dwc2-svc: USB2 hub with {} downstream ports", n));
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: USB2 hub with {} downstream ports, {} (bDeviceProtocol {})",
+                n,
+                if hub_multi_tt { "one TT per port" } else { "a SINGLE shared TT" },
+                protocol));
         }
         n
     } else {
         None
     };
 
-    Some(RootDevice { target: t, vid, pid, class, mps0, hub_ports })
+    Some(RootDevice { target: t, vid, pid, class, mps0, hub_ports, hub_multi_tt })
 }

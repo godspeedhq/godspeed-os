@@ -231,7 +231,7 @@ fn try_bind(
 /// happened" rather than a failure - so a false here is the normal case and must not be logged.
 pub fn poll(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, splt: u32, kbd: &Keyboard,
-    state: &mut KeyState,
+    state: &mut KeyState, multi_tt: bool,
 ) -> bool {
     let len = (kbd.mps as u32).min(8);
     let phys = dma.phys_at(REPORT_OFF) as u32;
@@ -396,7 +396,8 @@ pub fn poll(
                     NYET_WEDGED, state.clears));
             }
             let _ = crate::hub::clear_tt_buffer(
-                ctx, mmio, dma, &hub, t.addr, kbd.ep, 3 /* interrupt */, true /* IN */, hub_port);
+                ctx, mmio, dma, &hub, t.addr, kbd.ep, 3 /* interrupt */, true /* IN */, hub_port,
+                multi_tt);
             state.cleared_at = ctx.read_tsc();
             // The next poll starts a fresh start-split; the toggle is read back from hardware, so
             // there is no software state to reset here.
