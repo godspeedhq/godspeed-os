@@ -503,6 +503,33 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     let s = &n.stats;
                     (s.tx_ok, s.tx_fail, s.rx_bursts, s.rx_bytes, s.rx_frames, s.rx_bad, s.rx_hcint, s.rx_nohalt, s.bmsr, s.rx_fifo, s.int_sts)
                 }).unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+                // RE-MEASURE ONCE, QUIET. The boot-time sweep runs while the console is saturated,
+                // and a serial write is an un-preemptible syscall of ~9 ms per log line - which is
+                // the mean it reported. One repeat on a settled system separates "the timer is slow"
+                // from "the boot is loud".
+                //
+                // It lives HERE, beside the alive report, because that is code known to run: the
+                // first attempt put it in the service's OTHER loop, which is only reached when there
+                // is no keyboard and no disk - so on real hardware it was unreachable and printed
+                // nothing, twice. The same mistake as putting an IRQ enable in a function with no
+                // callers, and it cost two boots to notice.
+                if !quiet_swept {
+                    quiet_swept = true;
+                    let per_us = (ctx.tsc_ticks_per_10ms() / 10_000).max(1);
+                    for want_us in [125u64, 2000] {
+                        let want = per_us.saturating_mul(want_us).max(1);
+                        let (mut lo, mut hi, mut sum) = (u64::MAX, 0u64, 0u64);
+                        for _ in 0..16 {
+                            let t0 = ctx.read_tsc();
+                            ctx.sleep(want);
+                            let d = ctx.read_tsc().wrapping_sub(t0);
+                            lo = lo.min(d); hi = hi.max(d); sum += d;
+                        }
+                        ctx.log_fmt(format_args!(
+                            "dwc2-svc: QUIET sleep {} us -> min {} us, mean {} us, MAX {} us",
+                            want_us, lo / per_us, (sum / 16) / per_us, hi / per_us));
+                    }
+                }
                 ctx.log_fmt(format_args!(
                     "dwc2-svc: alive - {} key ({} chars from reports, {} from auto-repeat), {} blocks, {} cmds; busy CBW {} DATA {} CSW {}; {} passes, serve {}ms kbd {}ms sleep {}ms",
                     reports, state.emitted_report, state.emitted_repeat, served, cmds, bc, bd, bs,
@@ -650,28 +677,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // Leaving the line masked costs nothing HERE, because one delivered interrupt is the
                 // entire question: it proves the arm32 route reaches userspace. Counting to a hundred
                 // would prove nothing further and cost the machine.
-            }
-        }
-
-        // RE-MEASURE ONCE, QUIET. The boot-time sweep runs while the console is saturated, and a
-        // serial write is an un-preemptible syscall of about 9 ms per log line - which is the mean it
-        // reported. One repeat on a settled system separates "the timer is slow" from "the boot is
-        // loud", and no amount of re-reading the first number could.
-        if !quiet_swept && ctx.read_tsc().wrapping_sub(boot_tsc) > ctx.duration_cycles(12_000) {
-            quiet_swept = true;
-            let per_us = (ctx.tsc_ticks_per_10ms() / 10_000).max(1);
-            for want_us in [125u64, 2000] {
-                let want = per_us.saturating_mul(want_us).max(1);
-                let (mut lo, mut hi, mut sum) = (u64::MAX, 0u64, 0u64);
-                for _ in 0..16 {
-                    let t0 = ctx.read_tsc();
-                    ctx.sleep(want);
-                    let d = ctx.read_tsc().wrapping_sub(t0);
-                    lo = lo.min(d); hi = hi.max(d); sum += d;
-                }
-                ctx.log_fmt(format_args!(
-                    "dwc2-svc: QUIET sleep {} us -> min {} us, mean {} us, MAX {} us",
-                    want_us, lo / per_us, (sum / 16) / per_us, hi / per_us));
             }
         }
 
