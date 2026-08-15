@@ -1816,7 +1816,43 @@ impl ServiceContext {
 
         let bytes = msg.as_bytes();
         let len   = bytes.len();
-        if len == 0 || len > 256 { return; }
+        if len == 0 { return; }
+
+        // TOO LONG IS TRUNCATED, NEVER DROPPED.
+        //
+        // This used to be `if len == 0 || len > 256 { return; }` - a message over the limit was
+        // discarded whole, with no truncation, no marker and no error. The reporting channel itself
+        // failed silently, which makes every carefully-worded warning in the system conditional on
+        // its own length.
+        //
+        // It was not hypothetical. The two longest literal log lines in the tree are both in `fs`,
+        // and both are messages the constitution leans on: the durability-not-attested warning (280
+        // bytes), which CLAUDE.md 6.1's backend-conditional TCB claim describes as "`fs` says so once
+        // per mount", and the journal-recovery refusal (356 bytes), whose own comment argues it must
+        // stay as visible as the fault it reports. Neither has ever been printed on this board, and
+        // the durability one is latched before the call, so it never would be.
+        //
+        // Truncating loses the tail of a sentence. Dropping loses the fact. The marker says which
+        // happened, so a reader is never left believing they saw the whole message.
+        const LOG_MAX: usize = 256;
+        if len > LOG_MAX {
+            const MARK: &str = " [TRUNCATED]";
+            let keep = LOG_MAX - MARK.len();
+            // Cut on a CHARACTER boundary: `as_bytes` is UTF-8 and slicing mid-codepoint would hand
+            // the kernel an invalid string. Walk back at most 3 bytes to the start of a codepoint.
+            let mut end = keep;
+            while end > 0 && (bytes[end] & 0xC0) == 0x80 {
+                end -= 1;
+            }
+            // SAFETY: syscall(5) = Log; both slices are valid, in-bounds and within user space. Sent
+            // as two calls rather than staged through a buffer, because a fixed staging buffer here
+            // is exactly the kind of hidden limit this change exists to remove.
+            unsafe {
+                raw_syscall(5, slot as u64, bytes.as_ptr() as u64, end as u64);
+                raw_syscall(5, slot as u64, MARK.as_ptr() as u64, MARK.len() as u64);
+            }
+            return;
+        }
 
         // SAFETY: syscall(5) = Log; bytes is a valid slice within user space.
         unsafe {
