@@ -465,8 +465,59 @@ pub fn smp_bringup() {
             crate::kprintln!("smp: WARNING - core {} did NOT come up; continuing without it", core);
         }
     }
+    ipi_selftest();
     // The shared sentence, so this port and every other say it identically (`smp::core`).
     crate::smp::core::report_cores_ready();
+}
+
+/// Prove the cross-core doorbell actually reaches the other core.
+///
+/// `send_ipi_to_lapic` was an empty stub on this port, and nothing noticed for the port's entire
+/// life, because every service that talks to another service was pinned to core 0. A wake that goes
+/// nowhere is invisible until something depends on it, and then it presents as sluggishness rather
+/// than as a missing feature - which is how it was eventually found: an operator reporting that `ls`
+/// felt slow after services were spread across cores.
+///
+/// So this rings each AP and waits for that core's OWN handler to count it. It exercises the whole
+/// path - write-set, the target's IRQ, its dispatch, the write-high-to-clear - on the machine
+/// actually running, and reports either way.
+fn ipi_selftest() {
+    let (mut tested, mut ok) = (0u32, 0u32);
+    for core in 1..4u32 {
+        if !crate::smp::core::is_ready(core) {
+            continue;
+        }
+        tested += 1;
+        let before = irq::doorbells_received(core);
+        // SAFETY: ringing a ready core's mailbox. The write-set register is Device-mapped and the
+        // target's handler clears it; idempotent, since a doorbell already pending stays pending.
+        unsafe { boot::send_ipi_to_lapic(core, 0) };
+        // Bounded wait. A doorbell is an interrupt, so it lands in microseconds on a healthy core:
+        // generous enough that a slow core is not called broken, short enough that three dead cores
+        // cannot add a visible pause to boot.
+        let mut landed = false;
+        for _ in 0..2_000_000u32 {
+            if irq::doorbells_received(core) != before {
+                landed = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if landed {
+            ok += 1;
+        }
+    }
+    if tested == 0 {
+        crate::kprintln!("arm32: IPI selftest SKIPPED - no APs came up (nothing to wake across cores)");
+    } else if ok == tested {
+        crate::kprintln!(
+            "arm32: IPI selftest PASS ({}/{} cores took a doorbell - cross-core wakes are immediate, not tick-delayed)",
+            ok, tested);
+    } else {
+        crate::kprintln!(
+            "arm32: IPI selftest FAIL - only {}/{} cores took a doorbell; cross-core IPC waits for a 10 ms tick",
+            ok, tested);
+    }
 }
 
 /// Write one byte to the PL011, waiting for room in the transmit FIFO.
@@ -1487,7 +1538,20 @@ pub mod boot {
         unsafe { core::arch::asm!("mrc p15, 0, {m}, c0, c0, 5", m = out(reg) mpidr, options(nomem, nostack)); }
         mpidr & 3
     }
-    pub unsafe fn send_ipi_to_lapic(lapic_id: u32, vector: u8) {}
+    /// Ring another core's doorbell (BCM2836 mailbox 0).
+    ///
+    /// This was an empty stub, and the cost stayed invisible while every service sharing an IPC path
+    /// lived on core 0. The scheduler calls this to wake a task blocked on another core, so with
+    /// nothing here the target did not notice until its next 10 ms timer tick: a file read is
+    /// shell -> fs -> block-driver -> dwc2, which spread across cores is three quanta of pure latency
+    /// per operation.
+    ///
+    /// `lapic_id` IS the core index on this SoC (the neutral layer resolves it from MPIDR). The
+    /// vector is deliberately not encoded: every IPI this port sends means "there is work for you
+    /// now", and the receiver reschedules.
+    pub unsafe fn send_ipi_to_lapic(lapic_id: u32, _vector: u8) {
+        super::irq::ring_doorbell(lapic_id);
+    }
     pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {}
     pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {}
 }

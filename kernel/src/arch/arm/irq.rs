@@ -104,6 +104,31 @@ pub fn unmask_usb_irq() {
     unsafe { (IC_ENABLE_IRQS_1 as *mut u32).write_volatile(1 << USB_IRQ_LINE); }
 }
 
+/// Doorbells received, per core. Exists so the boot selftest can prove the path end to end on the
+/// machine actually running, rather than trusting that a register write meant something.
+static DOORBELLS: [core::sync::atomic::AtomicU32; 4] = [
+    core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
+];
+
+/// How many doorbells `core` has taken and cleared.
+pub fn doorbells_received(core: u32) -> u32 {
+    DOORBELLS[(core & 3) as usize].load(Ordering::Relaxed)
+}
+
+/// Ring one core's mailbox-0 doorbell, asserting its IRQ so it reschedules NOW.
+///
+/// Bounded and idempotent: the mailbox is a bitmap, so ringing a core that has not yet drained its
+/// doorbell leaves the same bit set rather than queueing anything.
+pub fn ring_doorbell(core: u32) {
+    if core >= 4 {
+        return; // four cores on this SoC; a bad index would write into another block's registers
+    }
+    // SAFETY: volatile write of one bit to a Device-mapped mailbox WRITE-SET register. Write-set
+    // semantics ignore 0s, so this cannot disturb a bit another sender has set.
+    local_write(CORE_MBOX_WRITE_SET + 16 * core as usize, MBOX_WAKE_BIT);
+}
+
 /// True if the legacy controller currently shows the USB line pending (used by the dispatcher to
 /// confirm the GPU funnel is USB and not some other peripheral before handing it to the USB stack).
 fn usb_irq_pending() -> bool {
@@ -116,6 +141,24 @@ fn usb_irq_pending() -> bool {
 /// Bits 0-3 route the four generic timers to IRQ, bits 4-7 route the same to FIQ:
 /// 0 = CNTPS (secure physical), **1 = CNTPNS (non-secure physical)**, 2 = CNTHP (hypervisor),
 /// 3 = CNTV (virtual).
+/// Per-core MAILBOX interrupt control, at `+0x50 + 4*core`. Bits 0-3 enable an IRQ for mailboxes
+/// 0-3. This is the BCM2836 inter-processor doorbell, and it is what makes a cross-core wake
+/// immediate instead of "whenever that core next takes a timer tick".
+const CORE_MBOX_IRQCNTL: usize = LOCAL_BASE + 0x50;
+/// Mailbox WRITE-SET, at `+0x80 + 16*core + 4*mbox`. Writing sets bits; the target core's IRQ stays
+/// asserted while any bit is set.
+const CORE_MBOX_WRITE_SET: usize = LOCAL_BASE + 0x80;
+/// Mailbox READ / WRITE-HIGH-TO-CLEAR, at `+0xC0 + 16*core + 4*mbox`. Reading shows the pending bits;
+/// writing those same bits back clears them. Clearing is what deasserts the line, so a handler that
+/// reads without writing back storms its own core.
+const CORE_MBOX_RDCLR: usize = LOCAL_BASE + 0xC0;
+/// `CORE_IRQ_SOURCE` bit 4: mailbox 0 has something in it on this core.
+const CORE_IRQ_MBOX0: u32 = 1 << 4;
+/// One doorbell bit is all a wake needs. The mailbox word is a bitmap, so 31 bits remain for any
+/// future signal that must be told apart from "reschedule"; today every IPI vector this port sends
+/// means exactly that, so encoding the vector number would store a fact nobody reads.
+const MBOX_WAKE_BIT: u32 = 1 << 0;
+
 const CORE_TIMER_IRQCNTL: usize = LOCAL_BASE + 0x40;
 
 /// Per-core IRQ source (read to discover what fired), at `+0x60 + 4*core`. Same bit assignment as
@@ -299,13 +342,34 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
         false
     };
 
-    if source & IRQ_PHYS_TIMER != 0 {
+    // A DOORBELL FROM ANOTHER CORE. Clear it first, then fall into the scheduler below.
+    //
+    // This is what the empty `send_ipi_to_lapic` had been throwing away. The scheduler rings it
+    // whenever a send makes a task on ANOTHER core runnable; with no doorbell that core carried on
+    // until its next 10 ms tick, so every cross-core IPC hop cost up to a whole quantum.
+    //
+    // Clear BEFORE the work: the line asserts while any mailbox bit is set, so a handler that
+    // reschedules first and clears afterwards can be re-entered by its own uncleared doorbell.
+    if source & CORE_IRQ_MBOX0 != 0 {
+        let mb = CORE_MBOX_RDCLR + 16 * this_core();
+        let pending = local_read(mb);
+        local_write(mb, pending); // write-high-to-clear: exactly the bits just observed
+        DOORBELLS[this_core() & 3].fetch_add(1, Ordering::Relaxed);
+    }
+
+    if source & (IRQ_PHYS_TIMER | CORE_IRQ_MBOX0) != 0 {
         // Re-arm first: writing TVAL both sets the next deadline and deasserts the current interrupt.
         // Doing it before the bookkeeping keeps the period honest - the next interval starts counting
         // from here, not from whenever the handler happens to finish. (This is the ARM timer's "EOI";
         // the neutral `apic_send_eoi` is a no-op here.)
-        set_tval(RELOAD.load(Ordering::Relaxed));
-        TICKS.fetch_add(1, Ordering::Relaxed);
+        // Only for a real TIMER interrupt. A doorbell shares the scheduling path below but is not a
+        // tick: re-arming on it would shorten the quantum, and counting it would make
+        // `monotonic_ticks` - which paces every sleep and timeout in the system - run fast in
+        // proportion to how much cross-core IPC the machine happens to be doing.
+        if source & IRQ_PHYS_TIMER != 0 {
+            set_tval(RELOAD.load(Ordering::Relaxed));
+            TICKS.fetch_add(1, Ordering::Relaxed);
+        }
 
         // Hands-off chaos demo: Core 0 counts ticks and, once boot has settled, injects the storm
         // command into the input ring (no keyboard needed). One-shot, latched inside.
@@ -391,6 +455,10 @@ pub fn start_tick(hz: u32) -> bool {
 
     // Route the generic timer to THIS core's IRQ line (per-core register at +0x40 + 4*core).
     local_write(CORE_TIMER_IRQCNTL + 4 * this_core(), IRQ_PHYS_TIMER);
+    // Take mailbox 0 as well: this core must be wakeable by ANOTHER core, not only by its own timer.
+    // Enabled here, beside the timer routing, because both answer "what may interrupt this core" and
+    // splitting them is how one of them ends up forgotten.
+    local_write(CORE_MBOX_IRQCNTL + 4 * this_core(), 1);
 
     set_tval(reload);
     enable_timer();
@@ -409,6 +477,10 @@ pub fn start_tick_ap(_core: u32) -> bool {
         return false;
     }
     local_write(CORE_TIMER_IRQCNTL + 4 * this_core(), IRQ_PHYS_TIMER);
+    // Take mailbox 0 as well: this core must be wakeable by ANOTHER core, not only by its own timer.
+    // Enabled here, beside the timer routing, because both answer "what may interrupt this core" and
+    // splitting them is how one of them ends up forgotten.
+    local_write(CORE_MBOX_IRQCNTL + 4 * this_core(), 1);
     set_tval(reload);
     enable_timer();
     enable_interrupts();

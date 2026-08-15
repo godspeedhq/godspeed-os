@@ -853,10 +853,16 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
             // chain again.
             //
-            // So these stay together until the IPI exists (BCM2836 core mailboxes). That is the fix
-            // that unpins all three at once, and it is what would make SMP mean anything on this
-            // port. Until then this is a WORKAROUND FOR A KERNEL GAP, recorded as one rather than
-            // dressed up as a property of the driver.
+            // THE IPI NOW EXISTS (BCM2836 core mailboxes; `arch::arm::irq::ring_doorbell`, proven at
+            // every boot by `arm32: IPI selftest PASS`), so the gap this worked around is closed and
+            // these three can be unpinned. Left pinned for one more step deliberately: the IPI changes
+            // how every cross-core wake in the system behaves, so it goes to hardware ALONE and is
+            // judged on its own before placement moves on top of it. Two changes at once is how a
+            // regression becomes hard to attribute, and this thread has already cost several boots to
+            // exactly that mistake.
+            //
+            // The IPI helps even while these stay pinned: `fs` sits on core 1 and the shell on core 0,
+            // so `ls` and `read` already cross cores once per operation.
             //
             // (Superseded rationale kept below so the next reader sees what was believed and why.)
             //
@@ -917,10 +923,16 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
             // chain again.
             //
-            // So these stay together until the IPI exists (BCM2836 core mailboxes). That is the fix
-            // that unpins all three at once, and it is what would make SMP mean anything on this
-            // port. Until then this is a WORKAROUND FOR A KERNEL GAP, recorded as one rather than
-            // dressed up as a property of the driver.
+            // THE IPI NOW EXISTS (BCM2836 core mailboxes; `arch::arm::irq::ring_doorbell`, proven at
+            // every boot by `arm32: IPI selftest PASS`), so the gap this worked around is closed and
+            // these three can be unpinned. Left pinned for one more step deliberately: the IPI changes
+            // how every cross-core wake in the system behaves, so it goes to hardware ALONE and is
+            // judged on its own before placement moves on top of it. Two changes at once is how a
+            // regression becomes hard to attribute, and this thread has already cost several boots to
+            // exactly that mistake.
+            //
+            // The IPI helps even while these stay pinned: `fs` sits on core 1 and the shell on core 0,
+            // so `ls` and `read` already cross cores once per operation.
             //
             // (Superseded rationale kept below so the next reader sees what was believed and why.)
             //
@@ -981,10 +993,16 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
             // chain again.
             //
-            // So these stay together until the IPI exists (BCM2836 core mailboxes). That is the fix
-            // that unpins all three at once, and it is what would make SMP mean anything on this
-            // port. Until then this is a WORKAROUND FOR A KERNEL GAP, recorded as one rather than
-            // dressed up as a property of the driver.
+            // THE IPI NOW EXISTS (BCM2836 core mailboxes; `arch::arm::irq::ring_doorbell`, proven at
+            // every boot by `arm32: IPI selftest PASS`), so the gap this worked around is closed and
+            // these three can be unpinned. Left pinned for one more step deliberately: the IPI changes
+            // how every cross-core wake in the system behaves, so it goes to hardware ALONE and is
+            // judged on its own before placement moves on top of it. Two changes at once is how a
+            // regression becomes hard to attribute, and this thread has already cost several boots to
+            // exactly that mistake.
+            //
+            // The IPI helps even while these stay pinned: `fs` sits on core 1 and the shell on core 0,
+            // so `ls` and `read` already cross cores once per operation.
             //
             // (Superseded rationale kept below so the next reader sees what was believed and why.)
             //
