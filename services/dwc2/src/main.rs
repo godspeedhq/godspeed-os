@@ -423,7 +423,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // low-speed device behind a translator must never trigger a port reset.
             let recently_cleared = state.cleared_at != 0
                 && ctx.read_tsc().wrapping_sub(state.cleared_at) < ctx.duration_cycles(2000);
-            let stuck_at = if recently_cleared { 30 } else { 300 };
+            // 10 after a failed clear (~100 ms), not 30. Once a clear has been issued and data has
+            // still not resumed, every further poll is only re-confirming a conclusion already
+            // reached, and the repair that follows takes 0.31 s. Cold, the budget stays generous.
+            let stuck_at = if recently_cleared { 10 } else { 300 };
             if state.xacterr_run >= stuck_at {
                 state.xacterr_run = 0;
                 let hub_port = (*ksplt & 0x7F) as u8;

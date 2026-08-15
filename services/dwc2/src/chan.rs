@@ -346,7 +346,18 @@ pub fn periodic_split_in(
 
     let mut csf = (ssf + 2) & 0x7;
     let mut last = ss;
-    for _ in 0..3 {
+    // SIX complete-split attempts, not three.
+    //
+    // Giving up here does not merely lose one keystroke: the transaction translator is left holding
+    // a transaction nobody collected, and that is what wedges it - after which the keyboard needs a
+    // TT clear and, in practice on this board, a port re-enumeration, which the operator experiences
+    // as a a stutter of over a second. Each extra attempt is one microframe of waiting, so the whole
+    // retry budget costs well under a millisecond and buys a large reduction in stranding.
+    //
+    // Not unbounded: a translator that never finishes must still be given up on, or this poll would
+    // hold the core. Six is chosen to cover the NYET runs actually seen in the logs while staying far
+    // inside the ~1 ms the whole poll is allowed.
+    for _ in 0..6 {
         wait_uframe(ctx, mmio, csf);
         program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt | (1 << 16));
         let cs = match wait_halt(ctx, mmio, ch, 5) {

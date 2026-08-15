@@ -339,7 +339,18 @@ pub fn poll(
         // far beyond any legitimate busy TT, so a healthy device is never disturbed. And the recovery
         // is bounded - clear it, reset the run, and if it wedges again the next second clears it
         // again, which is a loud repeating log line rather than a silently dead keyboard.
-        const NYET_WEDGED: u32 = 100;
+        // EIGHT, not a hundred.
+        //
+        // A hundred consecutive NYETs is ~1 s at the 10 ms poll period, and that second was the bulk
+        // of a stutter the user could feel. The threshold was set generously because a NYET is
+        // ordinary - the translator saying "not finished yet" - but that ordinary case is retried
+        // INSIDE `periodic_split_in` and never reaches here. What reaches here is a poll that already
+        // exhausted its complete-split budget, so a short run of them is not impatience, it is the
+        // translator having failed to finish six times running across eight separate polls.
+        //
+        // The clear itself is one control transfer to the hub, a few milliseconds, and it cannot harm
+        // a healthy device: it flushes a buffer that, by then, is holding nothing anyone wants.
+        const NYET_WEDGED: u32 = 8;
         if state.nyet_run >= NYET_WEDGED {
             state.nyet_run = 0;
             let hub_port = (splt & 0x7F) as u8;
