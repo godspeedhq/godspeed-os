@@ -853,16 +853,21 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
             // chain again.
             //
-            // THE IPI NOW EXISTS (BCM2836 core mailboxes; `arch::arm::irq::ring_doorbell`, proven at
-            // every boot by `arm32: IPI selftest PASS`), so the gap this worked around is closed and
-            // these three can be unpinned. Left pinned for one more step deliberately: the IPI changes
-            // how every cross-core wake in the system behaves, so it goes to hardware ALONE and is
-            // judged on its own before placement moves on top of it. Two changes at once is how a
-            // regression becomes hard to attribute, and this thread has already cost several boots to
-            // exactly that mistake.
+            // UNPINNED, now that the IPI exists (BCM2836 core mailboxes; proven every boot by
+            // `arm32: IPI selftest PASS`). Cross-core wakes are immediate, so spreading these no
+            // longer costs a 10 ms tick per hop - the reason they were pinned in the first place.
             //
-            // The IPI helps even while these stay pinned: `fs` sits on core 1 and the shell on core 0,
-            // so `ls` and `read` already cross cores once per operation.
+            // The stronger reason is what the IPI exposed. With wakes now actually preempting, `dwc2`
+            // shares core 0 with everything that gets woken, and its split-transaction sequencing is
+            // microframe-timed: a start-split and its complete-split must land in specific 125 us
+            // windows. Preempted between them, the transaction translator is left holding a
+            // transaction nobody collects - it wedges, gets cleared, and wedges again. Hardware showed
+            // that loop plainly: eight Clear_TT_Buffer calls and eight port re-enumerations in a
+            // couple of minutes, which the operator experiences as the keyboard pausing.
+            //
+            // So moving storage and the network OFF core 0 is not load-balancing here, it is giving
+            // the one timing-critical service on this board room to hit its deadlines. `dwc2` stays on
+            // core 0 because that is where its interrupt is routed.
             //
             // (Superseded rationale kept below so the next reader sees what was believed and why.)
             //
@@ -882,7 +887,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
             // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
             // unpins these three, and it unpins them everywhere at once.
-            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
+            preferred_core:    if cfg!(target_arch = "arm") { u32::MAX } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[],
@@ -923,16 +928,21 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
             // chain again.
             //
-            // THE IPI NOW EXISTS (BCM2836 core mailboxes; `arch::arm::irq::ring_doorbell`, proven at
-            // every boot by `arm32: IPI selftest PASS`), so the gap this worked around is closed and
-            // these three can be unpinned. Left pinned for one more step deliberately: the IPI changes
-            // how every cross-core wake in the system behaves, so it goes to hardware ALONE and is
-            // judged on its own before placement moves on top of it. Two changes at once is how a
-            // regression becomes hard to attribute, and this thread has already cost several boots to
-            // exactly that mistake.
+            // UNPINNED, now that the IPI exists (BCM2836 core mailboxes; proven every boot by
+            // `arm32: IPI selftest PASS`). Cross-core wakes are immediate, so spreading these no
+            // longer costs a 10 ms tick per hop - the reason they were pinned in the first place.
             //
-            // The IPI helps even while these stay pinned: `fs` sits on core 1 and the shell on core 0,
-            // so `ls` and `read` already cross cores once per operation.
+            // The stronger reason is what the IPI exposed. With wakes now actually preempting, `dwc2`
+            // shares core 0 with everything that gets woken, and its split-transaction sequencing is
+            // microframe-timed: a start-split and its complete-split must land in specific 125 us
+            // windows. Preempted between them, the transaction translator is left holding a
+            // transaction nobody collects - it wedges, gets cleared, and wedges again. Hardware showed
+            // that loop plainly: eight Clear_TT_Buffer calls and eight port re-enumerations in a
+            // couple of minutes, which the operator experiences as the keyboard pausing.
+            //
+            // So moving storage and the network OFF core 0 is not load-balancing here, it is giving
+            // the one timing-critical service on this board room to hit its deadlines. `dwc2` stays on
+            // core 0 because that is where its interrupt is routed.
             //
             // (Superseded rationale kept below so the next reader sees what was believed and why.)
             //
@@ -952,7 +962,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
             // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
             // unpins these three, and it unpins them everywhere at once.
-            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
+            preferred_core:    if cfg!(target_arch = "arm") { u32::MAX } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             // GENET's macirq on aarch64 (SPI 157 -> neutral vector 0x2A). x86's nic-driver is a
@@ -993,16 +1003,21 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
             // chain again.
             //
-            // THE IPI NOW EXISTS (BCM2836 core mailboxes; `arch::arm::irq::ring_doorbell`, proven at
-            // every boot by `arm32: IPI selftest PASS`), so the gap this worked around is closed and
-            // these three can be unpinned. Left pinned for one more step deliberately: the IPI changes
-            // how every cross-core wake in the system behaves, so it goes to hardware ALONE and is
-            // judged on its own before placement moves on top of it. Two changes at once is how a
-            // regression becomes hard to attribute, and this thread has already cost several boots to
-            // exactly that mistake.
+            // UNPINNED, now that the IPI exists (BCM2836 core mailboxes; proven every boot by
+            // `arm32: IPI selftest PASS`). Cross-core wakes are immediate, so spreading these no
+            // longer costs a 10 ms tick per hop - the reason they were pinned in the first place.
             //
-            // The IPI helps even while these stay pinned: `fs` sits on core 1 and the shell on core 0,
-            // so `ls` and `read` already cross cores once per operation.
+            // The stronger reason is what the IPI exposed. With wakes now actually preempting, `dwc2`
+            // shares core 0 with everything that gets woken, and its split-transaction sequencing is
+            // microframe-timed: a start-split and its complete-split must land in specific 125 us
+            // windows. Preempted between them, the transaction translator is left holding a
+            // transaction nobody collects - it wedges, gets cleared, and wedges again. Hardware showed
+            // that loop plainly: eight Clear_TT_Buffer calls and eight port re-enumerations in a
+            // couple of minutes, which the operator experiences as the keyboard pausing.
+            //
+            // So moving storage and the network OFF core 0 is not load-balancing here, it is giving
+            // the one timing-critical service on this board room to hit its deadlines. `dwc2` stays on
+            // core 0 because that is where its interrupt is routed.
             //
             // (Superseded rationale kept below so the next reader sees what was believed and why.)
             //
@@ -1022,7 +1037,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
             // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
             // unpins these three, and it unpins them everywhere at once.
-            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
+            preferred_core:    if cfg!(target_arch = "arm") { u32::MAX } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[],
