@@ -382,7 +382,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             clock_gaveup = true;
             ctx.log("shell: no network clock after 30s - blocking on input again (the floor stays unrecorded)");
         }
-        if !clock_floor_recorded && time_source(ctx) == ClockSource::Ntp {
+        // `clock_gaveup` GATES THIS TOO. It was set three lines above and then not used here, so the
+        // shell kept asking `time` for the clock source on EVERY loop iteration, forever, on any
+        // machine that never syncs - which is the normal case with no cable. That is an RPC on the
+        // INPUT PATH, ahead of `console_read`.
+        //
+        // Under a chaos storm it is worse than wasteful: the log shows `time: request had no reply cap
+        // - dropping`, so the request cannot be answered at all, and the shell waits out its deadline
+        // once per iteration. That is the multi-second pause an operator sees mid-storm, and it sits
+        // in front of the keyboard read, so the prompt looks dead while it happens.
+        //
+        // Once we have given up on the clock there is nothing left to learn, so stop asking.
+        if !clock_gaveup && !clock_floor_recorded && time_source(ctx) == ClockSource::Ntp {
             clock_floor_recorded = true;
             if let Some(f) = time_floor(ctx) {
                 if (0..=u32::MAX as i64).contains(&f) {

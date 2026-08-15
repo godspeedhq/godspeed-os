@@ -153,6 +153,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Declared out here so the poll loop below can see it: the bring-up borrows `mmio`, and the
     // keyboard it finds has to outlive that borrow.
     let mut kbd: Option<(hid::Keyboard, chan::Target, u32)> = None;
+    /// Has the "input is live" prompt already been sent for THIS dwc2 instance? A restart re-announces
+    /// (the keyboard genuinely was dead across it); a second bind within one bring-up does not.
+    let mut announced_input = false;
     let mut disk: Option<(msc::Disk, chan::Target, u64)> = None;
     let mut nic: Option<(net::Nic, chan::Target)> = None;
     // Owned by the enumeration loop, not a static (C6-1). The bus hands out addresses in sequence and
@@ -255,7 +258,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                 // re-enumeration printed another prompt: four binds in
                                                 // one boot gave four `gsh>` lines. A re-bind is not
                                                 // news to someone already typing; the first one is.
-                                                ctx.console_push(10);
+                                                // ONCE PER SERVICE LIFETIME, not once per bind.
+                                                // The port walk can bind the keyboard more than once
+                                                // during a single bring-up (three times on this
+                                                // board), and moving the push out of `bind` fixed the
+                                                // recovery case but not this one - so the boot still
+                                                // printed a prompt per bind.
+                                                if !announced_input {
+                                                    announced_input = true;
+                                                    ctx.console_push(10);
+                                                }
                                                 kbd = Some((k, dt, dsplt));
                                             } else if dvid == 0x0424 && dpid == 0xec00 {
                                                 // The LAN9514's ethernet function. Matched by VID:PID
