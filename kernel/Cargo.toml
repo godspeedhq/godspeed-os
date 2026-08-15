@@ -119,6 +119,9 @@ arm-supervisor = []
 # (+ confirm) into the input ring, so a serial-output-only setup (no keyboard) still runs + shows the
 # storm. Build with `arm-supervisor,arm-autochaos`.
 arm-autochaos = []
+# Types into the console ring at ~800 chars/s from the timer tick, to reproduce the
+# sustained-typing wedge by booting instead of by hand. Diagnostic builds only.
+arm-keystorm = []
 # Target QEMU's raspi2b emulation rather than real Pi 2 hardware. Currently only changes the DWC2 USB
 # DMA bus-address translation: QEMU's emulated DWC2 addresses ARM system RAM directly (identity), while
 # real BCM2836 silicon sees RAM through the VideoCore uncached alias 0xC000_0000 (arch/arm/dwc2.rs).

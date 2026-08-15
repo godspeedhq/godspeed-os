@@ -1569,6 +1569,44 @@ pub fn autochaos_tick() {
     pl011_write(b"\r\nautochaos: injected 'chaos max-carnage all-services 10' + confirm (hands-off demo)\r\n");
 }
 
+/// Hands-off KEY STORM (`arm-keystorm`): type faster than a human, forever, so a wedge that only
+/// appears under sustained input can be reproduced by booting rather than by hammering a keyboard.
+///
+/// It pushes into the SAME ring a real keystroke lands in, so everything downstream is the real path:
+/// the shell's console read, the cross-core wake to whichever core the shell is on, the echo back out
+/// through the console. What it deliberately does NOT exercise is the USB side - a real key also
+/// drives dwc2's split transactions, and those are absent here. So this reproduces the SCHEDULING and
+/// CONSOLE load of typing, not the USB load, and a wedge it fails to provoke is not proof of a wedge
+/// that typing cannot provoke.
+///
+/// Printable characters and newlines only, so the shell parses them as ordinary (mostly unknown)
+/// commands and the machine does real work per line rather than sitting in an editor buffer.
+#[cfg(feature = "arm-keystorm")]
+pub fn keystorm_tick() {
+    use core::sync::atomic::AtomicU32;
+    static TICKS: AtomicU32 = AtomicU32::new(0);
+    static N: AtomicU32 = AtomicU32::new(0);
+    let t = TICKS.fetch_add(1, Ordering::Relaxed);
+    // ~100 Hz tick. Wait ~8 s for boot to settle, or the storm competes with service spawns and the
+    // failure it produces is a boot failure, not the one being hunted.
+    if t < 800 {
+        return;
+    }
+    // Eight characters per tick is ~800/s - roughly a hundred times a fast typist, and enough to keep
+    // the console, the shell and the cross-core wake path saturated between ticks.
+    let n = N.fetch_add(8, Ordering::Relaxed);
+    for i in 0..8u32 {
+        let k = n.wrapping_add(i);
+        // A line every 24 characters: long enough that the shell does real parsing work, short enough
+        // that lines keep coming rather than one enormous buffer.
+        let b = if k % 24 == 23 { b'\r' } else { b'a' + ((k % 23) as u8) };
+        console_push_byte(b);
+    }
+    if n % 8000 == 0 {
+        pl011_write(b"keystorm: still typing\r\n");
+    }
+}
+
 /// Timer-tick hook: drain the RX FIFO and wake any task blocked in ConsoleRead. Runs from
 /// `timer_tick_from_irq` (core 0).
 pub fn uart_rx_poll() {

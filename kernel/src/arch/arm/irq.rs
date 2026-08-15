@@ -600,6 +600,10 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
         #[cfg(feature = "arm-autochaos")]
         if this_core() == 0 { super::autochaos_tick(); }
 
+        // Hands-off key storm: reproduce the typing wedge without a human at the keyboard.
+        #[cfg(feature = "arm-keystorm")]
+        if this_core() == 0 { super::keystorm_tick(); }
+
         if NEUTRAL_SCHED.load(Ordering::Relaxed) {
             // **Atomic syscalls: do not preempt a USER task that is in a syscall (SVC mode).** Unlike
             // x86, preempting ARM kernel/SVC code mid-syscall corrupts - SPSR_svc and the SVC-banked sp
