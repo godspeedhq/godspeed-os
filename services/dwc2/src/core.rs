@@ -146,19 +146,30 @@ pub fn reset_and_host_mode(ctx: &ServiceContext, mmio: &Mmio) -> bool {
     // The MAX is the number that matters: a split transaction must land inside its microframe, so a
     // wake that is usually fast and occasionally late is no use.
     {
+        // Measure THREE durations, not one.
+        //
+        // A 125 us sleep returns in 136 us at best and ~8 ms on average, and three separate
+        // explanations for that have now been wrong. One measurement cannot distinguish them; a
+        // sweep can. The compare fires on EQUALITY, so if programming it takes longer than the
+        // requested delay - plausible at 125 us, since every System Timer access is an uncached
+        // Device read - the deadline is already past when it lands, the match never happens, and the
+        // tick backstop answers instead. That predicts short sleeps failing while long ones work,
+        // which no single number can show.
         const N: u64 = 16;
         let per_us = (ctx.tsc_ticks_per_10ms() / 10_000).max(1);
-        let want = per_us.saturating_mul(125).max(1);
-        let (mut lo, mut hi, mut sum) = (u64::MAX, 0u64, 0u64);
-        for _ in 0..N {
-            let t0 = ctx.read_tsc();
-            ctx.sleep(want);
-            let d = ctx.read_tsc().wrapping_sub(t0);
-            lo = lo.min(d); hi = hi.max(d); sum += d;
+        for want_us in [125u64, 500, 2000] {
+            let want = per_us.saturating_mul(want_us).max(1);
+            let (mut lo, mut hi, mut sum) = (u64::MAX, 0u64, 0u64);
+            for _ in 0..N {
+                let t0 = ctx.read_tsc();
+                ctx.sleep(want);
+                let d = ctx.read_tsc().wrapping_sub(t0);
+                lo = lo.min(d); hi = hi.max(d); sum += d;
+            }
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: sleep {} us -> min {} us, mean {} us, MAX {} us",
+                want_us, lo / per_us, (sum / N) / per_us, hi / per_us));
         }
-        ctx.log_fmt(format_args!(
-            "dwc2-svc: 125 us sleep - min {} us, mean {} us, MAX {} us (a microframe is 125 us;              above ~250 us and a split cannot be scheduled by sleeping)",
-            lo / per_us, (sum / N) / per_us, hi / per_us));
     }
 
     // (The original probe note: It measured what it needed to -
