@@ -3127,13 +3127,27 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 /// restarted, leaving our cached cap EndpointDead), reacquire a fresh cap by name (via the kernel
 /// directory) and retry once (Phase D, §14.3). All block I/O goes through here.
 fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
+    // BOUNDED. This used the undeadlined `request_with_reply`, whose only failure-wake is the peer's
+    // DEATH (§8.6). A block-driver that is alive but silent - one that consumed a request and never
+    // answered, which this audit found in several places - hung `fs` permanently, and every shell
+    // command behind it. A hang is the one outcome this system does not tolerate; a slow disk is not.
+    //
+    // 30 s is chosen against the WORK, not plucked: `block-driver` retries a busy device for up to
+    // 30 s per block (`with_busy_retry`), so anything shorter would abandon a request the driver is
+    // still legitimately servicing. Being wrong in that direction turns a slow write into a false
+    // I/O error, which callers here treat as a device fault and act on.
+    const BLOCK_RPC_SECS: i64 = 30;
     let msg = Message::from_bytes(req);
-    if let Some(r) = ctx.request_with_reply("block-driver", &msg) {
+    if let Some(r) = ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS) {
         return Some(r);
     }
     if ctx.reacquire_by_name("block-driver") {
-        return ctx.request_with_reply("block-driver", &msg);
+        return ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS);
     }
+    // Say so. The caller reports "device I/O error", which is a mis-attribution when the truth is
+    // that the driver never answered - and the same mis-attribution was already fixed one level down
+    // for malformed replies.
+    ctx.log("fs: block-driver did not answer within 30 s (and could not be reacquired) - failing the request");
     None
 }
 

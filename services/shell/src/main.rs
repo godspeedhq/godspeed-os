@@ -7012,7 +7012,23 @@ fn stream_overwrite(ctx: &ShellCtx, p: &[u8], data: &[u8]) {
 /// the filesystem - so it costs the same as rewriting the file (honest, §26.7). True on success.
 #[inline(never)]
 fn fs_stream_combine(ctx: &ShellCtx, p: &[u8], new: &[u8], prepend: bool) -> bool {
-    let old_size = fs_stat(ctx, p).map(|(sz, _)| sz as usize).unwrap_or(0);
+    // A FAILED STAT IS NOT AN EMPTY FILE. `fs_stat` returns `None` for BOTH "absent" and "fs error",
+    // so `.unwrap_or(0)` made an errored stat on an existing file read as size 0: the combine loop
+    // below then copied only the NEW bytes, never entered the old-content branch, and the caller
+    // deleted the original and moved the temp in. An `append` that silently became an overwrite, and
+    // returned true.
+    //
+    // Absent is legitimate (appending to a file that does not exist creates it). Unreachable is not,
+    // so the two are now told apart by asking once more: a reply that arrives says the file is
+    // genuinely absent, no reply at all says `fs` could not answer.
+    let old_size = match fs_stat(ctx, p) {
+        Some((sz, _)) => sz as usize,
+        None if fs_request(ctx, OP_STAT_FILE, p, &[]).is_some() => 0,
+        None => {
+            ctx.console_writeln("write: cannot stat the target - ABORTING, nothing was changed");
+            return false;
+        }
+    };
     let total = old_size + new.len();
     if total == 0 {
         return matches!(fs_request(ctx, OP_WRITE_FILE, p, &[]).as_ref()
@@ -8167,9 +8183,16 @@ fn resolve_or_err<'a>(ctx: &ServiceContext, cwd: &Cwd, input: &str, out: &'a mut
 /// INSTANTLY when the slot was never wired. That reads as "the clock is broken" rather than "we never
 /// looked it up", which is the kind of silence this system forbids.
 fn time_rpc(ctx: &ShellCtx, body: &[u8]) -> Option<Message> {
-    if let Some(r) = ctx.request_with_reply("time", &Message::from_bytes(body)) { return Some(r); }
+    // Bounded, and this one is on the INPUT PATH: `time_source` is called from the shell's main loop
+    // before `console_read`, so an unbounded wait here is a dead prompt with no `q` and no hint -
+    // indistinguishable from a dead machine. The same call sits in front of `reboot`, which would put
+    // the escape hatch behind the hang. 2 s is generous for a service that only reads a counter.
+    const TIME_SECS: i64 = 2;
+    if let Some(r) = ctx.request_with_reply_deadline("time", &Message::from_bytes(body), TIME_SECS) {
+        return Some(r);
+    }
     let _ = ctx.reacquire_by_name("time");
-    ctx.request_with_reply("time", &Message::from_bytes(body))
+    ctx.request_with_reply_deadline("time", &Message::from_bytes(body), TIME_SECS)
 }
 
 /// Where the current wall-clock reading came from, per the `time` service (clock slice 2).

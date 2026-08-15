@@ -593,9 +593,13 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     // cable rather than a missing cap. block-driver learned this in slice 3c; this is the same edge.
     #[cfg(target_arch = "arm")]
     let dwc2_rpc = |ctx: &ServiceContext, msg: &Message| -> Option<Message> {
-        if let Some(r) = ctx.request_with_reply("dwc2", msg) { return Some(r); }
+        // Bounded: the undeadlined form wakes only on the peer's death, so a dwc2 that is alive and
+        // silent hung this driver, `net-stack` behind it, and the shell behind that. 10 s is far
+        // beyond any healthy USB frame round-trip and well inside a user's patience.
+        const DWC2_SECS: i64 = 10;
+        if let Some(r) = ctx.request_with_reply_deadline("dwc2", msg, DWC2_SECS) { return Some(r); }
         let _ = ctx.reacquire_by_name("dwc2");
-        ctx.request_with_reply("dwc2", msg)
+        ctx.request_with_reply_deadline("dwc2", msg, DWC2_SECS)
     };
     #[cfg(target_arch = "arm")]
     let dev_info = |ctx: &ServiceContext, out: &mut [u8; 7]| -> bool {
