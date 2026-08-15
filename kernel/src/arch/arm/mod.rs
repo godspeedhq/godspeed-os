@@ -133,8 +133,12 @@ pub fn tx_ring_drain() {
             TX_TAIL.store(tail.wrapping_add(1), Ordering::Release);
             // A bound on work per tick, so a service logging in a tight loop cannot turn the tick
             // itself into the stall this exists to remove.
+            // The bound is on WORK PER CALL, not throughput, so it has to sit above what the
+            // hardware can absorb in that time or it becomes the throttle. The FIFO is 16 bytes and
+            // drains at ~11.5 KB/s, so a few hundred is comfortably past any real burst while still
+            // being a hard stop against a service logging in a tight loop.
             n += 1;
-            if n >= 64 {
+            if n >= 512 {
                 return;
             }
         }
@@ -669,6 +673,20 @@ pub(super) fn pl011_write_byte(b: u8) {
     // vanishes silently is worse than output that is slow, and the counter says when it happens.
     if TX_RING_LIVE.load(Ordering::Acquire) {
         if tx_push(b) {
+            // MOVE BYTES NOW, don't wait for the tick.
+            //
+            // Draining only from the timer tick throttled the console to about 1.6 KB/s: the drain
+            // stops the moment the TX FIFO is full, the FIFO is 16 bytes, and the tick is 100 Hz -
+            // so one FIFO-load per tick, against a line that carries 11.5 KB/s. Under storm-volume
+            // logging the ring filled, every writer fell back to the blocking path, and the machine
+            // went silent for ~15 s while the backlog trickled out. The ring made sustained output
+            // SEVEN TIMES SLOWER than the blocking writes it replaced.
+            //
+            // This still never waits: it pushes only while the FIFO reports room and returns the
+            // instant it does not. The writer therefore keeps the hardware fed at its own pace
+            // without ever blocking on it, and the tick drain remains as the path that empties the
+            // ring when nobody is writing.
+            tx_ring_drain();
             return;
         }
         TX_DROPPED.fetch_add(1, Ordering::Relaxed);
