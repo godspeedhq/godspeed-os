@@ -123,7 +123,44 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // WAKE a deeply-blocked recv on an AP is unreliable under QEMU TCG (the drain flaked in the
             // flood-storm pin); the self-driven poll drains every quantum with no wake needed. Pinned by the
             // shell-test `chaos flood-storm block-driver` step (QEMU's pc machine has no AHCI, so it sits here).
-            loop { while ctx.try_recv().is_some() {} ctx.yield_cpu(); }
+            // ANSWER while draining. The loop here used to be
+            //     loop { while ctx.try_recv().is_some() {} ctx.yield_cpu(); }
+            // which retired every request and replied to none - so `fs` blocked forever in its first
+            // `block_capacity()`, never reached its own storage-unavailable degraded path, and never
+            // printed `fs: serving file API`; every file command in the shell hung behind it. On any
+            // machine with no AHCI (an NVMe-only box, QEMU's default `pc`) that is the whole storage
+            // stack silently dead, on a branch whose comment says the two services "come up and idle
+            // gracefully".
+            //
+            // The correct version was already in this crate: `ahci::serve_no_disk` answers CAPACITY
+            // with a truthful zero and everything else with STATUS_ERR. The drain reasoning below it
+            // still holds - what was missing was the reply.
+            //
+            // It keeps polling rather than blocking on `recv` for the reason the original comment
+            // gives (a cross-core flood must not depend on waking a deeply-blocked recv), so the
+            // answer path is inlined here rather than delegating to the blocking version.
+            loop {
+                while let Some(msg) = ctx.try_recv() {
+                    let reply = match ctx.take_pending_cap() {
+                        Some(c) => c,
+                        None => continue,   // nothing to answer on; dropping is all that is left
+                    };
+                    let p = msg.payload_bytes();
+                    let mut out = [0u8; 9];
+                    let n = if !p.is_empty() && p[0] == OP_CAPACITY {
+                        // Capacity is [STATUS_OK, sectors u64 LE]; zero sectors is the truth here and
+                        // is exactly what `fs` reads as "genuinely no disk".
+                        out[0] = STATUS_OK;
+                        9
+                    } else {
+                        out[0] = STATUS_ERR;
+                        1
+                    };
+                    let _ = ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n]));
+                    ctx.remove_cap(reply);
+                }
+                ctx.yield_cpu();
+            }
         }
     }
 }

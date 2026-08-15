@@ -7238,7 +7238,17 @@ fn restart_one(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 // round + labels them "recovered"; kill-storm may target them. The only unkillable thing is the
 // kernel; the shell is excluded only because chaos runs *inside* it. (xhci/ehci/logger are
 // directly-restartable so max-carnage can't leave them dead.)
-const CHAOS_RESTARTABLE: [&str; 8] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "logger", "nic-driver", "net-stack"];
+// `time`, `control` and `dwc2` were MISSING here, and this list is not cosmetic: it is the expansion
+// of `kill all-services` and a hard refusal gate for `chaos kill-storm`. So the storm skipped them
+// and `chaos kill-storm time` was refused outright - Commandment II ("nothing escapes") silently
+// false for the three services whose omission from a DIFFERENT list was the C5-1 finding.
+//
+// This is the same fact as the supervisor's MANAGED and the kernel's two by-name sets, stated a
+// fourth time. It stays a literal for now because the shell cannot see the supervisor's list, but
+// the honest fix is to derive it from live tasks the way `chaos` derives its own exclusions - which
+// is exactly why chaos has no roster to drift.
+const CHAOS_RESTARTABLE: [&str; 11] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "logger",
+                                       "nic-driver", "net-stack", "time", "control", "dwc2"];
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
 const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) - a deliberate cap, not a firehose
 // Per-round recovery wait is bounded by REAL wall-clock time (RTC seconds), not a yield count. A
@@ -7589,7 +7599,16 @@ fn chaos_launch(
 #[inline(never)]
 fn chaos_kill_storm(ctx: &ShellCtx, cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     if ntok < 2 {
-        ctx.console_writeln("usage: chaos kill-storm <service> [rounds] [save <path>]   (service: supervisor | block-driver | fs)");
+        // The service list is PRINTED FROM THE ARRAY, not retyped. This line used to read
+        // "(service: supervisor | block-driver | fs)" - three names against the eight the gate
+        // actually held, so the usage text was wrong the day it was written and drifted further
+        // every time the array grew.
+        ctx.console_write("usage: chaos kill-storm <service> [rounds] [save <path>]   (service:");
+        for (i, s) in CHAOS_RESTARTABLE.iter().enumerate() {
+            ctx.console_write(if i == 0 { " " } else { " | " });
+            ctx.console_write(s);
+        }
+        ctx.console_writeln(")");
         return Err(ShellError::Unknown);
     }
     let svc = tok[1];

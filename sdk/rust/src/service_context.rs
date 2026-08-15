@@ -469,14 +469,29 @@ impl ServiceContext {
     }
 
     /// Block until a message arrives on this service's primary recv endpoint.
+    ///
+    /// **Every failure here now PANICS rather than spinning.** All three exits used to be `loop {}`:
+    /// a silent, logless, non-yielding tight spin that pegged the core. That is the worst possible
+    /// response to `EndpointDead`, which is not corruption but an ordinary runtime truth (§8.6) - the
+    /// service was told its endpoint died and answered by burning a core forever, telling nobody.
+    ///
+    /// Panicking is now the RIGHT answer because the panic handler was fixed in the same pass: it
+    /// logs and faults, so the kernel kills the task, bumps its endpoint generation, wakes any peer
+    /// blocked in `call` with `ReplyDead`, and the supervisor restarts it. Loud, and recovered.
+    ///
+    /// A service that wants to HANDLE the error instead of dying should call `recv_result`.
     pub fn recv(&self) -> Message {
         let data = Self::ctx();
-        if data.magic != SERVICE_CTX_MAGIC { loop {} }
+        if data.magic != SERVICE_CTX_MAGIC {
+            panic!("recv: corrupt ServiceContext (bad magic) - the kernel handed us an unusable context");
+        }
         let slot = data.recv_slot;
-        if slot == u32::MAX { loop {} }
+        if slot == u32::MAX {
+            panic!("recv: no receive endpoint - this service has no ipc_receive in its contract");
+        }
         match crate::ipc::recv(CapHandle(slot)) {
             Ok(msg) => msg,
-            Err(_)  => loop {},
+            Err(e)  => panic!("recv failed: {:?} - endpoint is gone; dying so the supervisor restarts us", e),
         }
     }
 

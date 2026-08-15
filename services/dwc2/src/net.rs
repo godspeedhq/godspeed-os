@@ -726,7 +726,22 @@ pub fn serve(
             out[1] = ((got >> 8) & 0xFF) as u8;
             got + 2
         }
-        _ => return false, // not a net op - the block server gets a look at it
+        // ANSWER, do not return. The comment here used to read "not a net op - the block server gets a
+        // look at it", and that was false: `dispatch` takes the reply cap BEFORE calling this, so
+        // returning false meant the message was consumed, no reply was sent, and the cap was leaked -
+        // one table entry per hit. The caller (`nic-driver`, in an undeadlined request_with_reply)
+        // then waited forever, `net-stack` behind it, and the shell behind that.
+        //
+        // Reachable two ways: any first byte >= OP_NET_INFO that is not a known op, and OP_NET_TX
+        // with a one-byte payload - which is exactly what `nic-driver` sends for a zero-length frame,
+        // because the `p.len() > 1` guard above falls through to here.
+        //
+        // A one-byte error reply is the same answer the no-NIC path gives fifteen lines away in
+        // `dispatch`, and for the same stated reason: silence would hang the client.
+        _ => {
+            out[0] = 0;
+            1
+        }
     };
     let _ = ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n]));
     ctx.remove_cap(reply);
