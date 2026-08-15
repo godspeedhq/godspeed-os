@@ -199,9 +199,38 @@ pub fn hcsplt(hub_addr: u8, hub_port: u8) -> u32 {
 /// at 125 us, so a whole sweep cannot take more than a millisecond even if the target never appears.
 fn wait_for_uframe(ctx: &ServiceContext, mmio: &Mmio, target: u32) {
     let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(2));
-    while (mmio.read32(HFNUM) & 7) != target {
+    loop {
+        let cur = mmio.read32(HFNUM) & 7;
+        if cur == target {
+            return;
+        }
         if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
             return;
+        }
+        // SLEEP THE BULK OF THE WAIT, SPIN ONLY THE LAST MICROFRAME.
+        //
+        // This loop was a pure spin, and it is where the keyboard's CPU went: roughly 375 us of every
+        // 450 us poll, about 4.6% of a core, burned waiting for a microframe boundary. It spun because
+        // the kernel had no clock that could name 125 us - the finest thing available was the 10 ms
+        // scheduler tick.
+        //
+        // It has one now, and it is exact: a 125 us sleep returns in 146 us on average and 155 us at
+        // worst, measured on this board with the console TX ring in place. About 30 us of jitter,
+        // against a 125 us microframe.
+        //
+        // 30 us of jitter is small but it is not nothing, and landing in the WRONG microframe is the
+        // failure this whole path exists to avoid - a missed complete-split strands a transaction and
+        // wedges the transaction translator, which is exactly how the keyboard dies. So sleep only
+        // while there is more than one microframe to go, and spin the last one, where precision
+        // matters and the cost is bounded to a single 125 us window.
+        let togo = (target.wrapping_sub(cur)) & 7;
+        if togo >= 2 {
+            // Wake one microframe SHORT of the target and spin in from there. `duration_cycles` takes
+            // whole milliseconds, so the sub-millisecond figure is derived from the board's own
+            // calibration instead - a cycle count is not a portable duration.
+            let per_us = (ctx.tsc_ticks_per_10ms() / 10_000).max(1);
+            let sleep_us = (togo as u64 - 1) * 125;
+            ctx.sleep(per_us.saturating_mul(sleep_us).max(1));
         }
     }
 }
