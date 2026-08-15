@@ -435,6 +435,17 @@ pub const USB_DISK_ABSENT: i64 = -21;
 fn lba_fits_syscall_abi(lba: u64) -> bool { lba <= u32::MAX as u64 }
 
 impl ServiceContext {
+    /// A handle for the PANIC HANDLER, which has no `ctx` to borrow.
+    ///
+    /// This type is a zero-sized token - every method reads the kernel-written context block rather
+    /// than any field - so making one costs nothing and grants nothing that was not already granted.
+    /// It is `pub(crate)` because the panic path is the only caller that legitimately lacks a context:
+    /// a service is handed one and must thread it, and an escape hatch for anyone else would let a
+    /// caller pretend to authority it was never given.
+    pub(crate) fn for_panic() -> Self {
+        ServiceContext { _private: () }
+    }
+
     #[inline]
     fn ctx() -> &'static ServiceContextData {
         // SAFETY: kernel maps a valid ServiceContextData at SERVICE_CTX_ADDR
