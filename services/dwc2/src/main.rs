@@ -564,6 +564,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // This is the line that explains a silent keyboard: the service can be provably
                 // healthy (pass count unchanged, still spending time in the poll) while the endpoint
                 // answers nothing, and only the breakdown says which of "nothing" it is.
+                // WHERE THE KEYBOARD'S CPU ACTUALLY GOES. Phase 2 optimised the microframe wait on an
+                // ESTIMATE that it was ~375 us of every 450 us, and hardware showed no change at all
+                // (4.4% of a core before, 4.3% after). One of these two numbers is the real cost, and
+                // guessing which cost a boot and a wrong optimisation (§20: perf claims need
+                // benchmarks).
+                {
+                    let per_ms = (ctx.tsc_ticks_per_10ms() / 10).max(1);
+                    let uf = crate::chan::UF_CYCLES.swap(0, ::core::sync::atomic::Ordering::Relaxed);
+                    let ht = crate::chan::HALT_CYCLES.swap(0, ::core::sync::atomic::Ordering::Relaxed);
+                    let sl = crate::chan::UF_SLEEPS.swap(0, ::core::sync::atomic::Ordering::Relaxed);
+                    ctx.log_fmt(format_args!(
+                        "dwc2-svc: kbd time split - microframe wait {} ms ({} slept), channel-halt wait {} ms",
+                        uf / per_ms, sl, ht / per_ms));
+                }
                 ctx.log_fmt(format_args!(
                     "dwc2-svc: kbd polls - {} data, {} nak, {} nyet, {} stall, {} xacterr, {} SILENT (no halt), {} other (last {:#010x})",
                     state.n_data, state.n_nak, state.n_nyet, state.n_stall, state.n_xacterr,

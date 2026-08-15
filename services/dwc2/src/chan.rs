@@ -138,13 +138,16 @@ pub fn pid_from_hctsiz(mmio: &Mmio, ch: u32) -> u32 {
 
 /// Wait for a channel to halt, bounded by the CLOCK. Returns the latched HCINT, or `None` on timeout.
 pub fn wait_halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32, ms: u64) -> Option<u32> {
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(ms));
+    let t0 = ctx.read_tsc();
+    let deadline = t0.wrapping_add(ctx.duration_cycles(ms));
     loop {
         let hcint = mmio.read32(hcint_at(ch));
         if hcint & HCINT_CHHLTD != 0 {
+            HALT_CYCLES.fetch_add(ctx.read_tsc().wrapping_sub(t0), core::sync::atomic::Ordering::Relaxed);
             return Some(hcint);
         }
         if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+            HALT_CYCLES.fetch_add(ctx.read_tsc().wrapping_sub(t0), core::sync::atomic::Ordering::Relaxed);
             // Leave the channel clean for the next user rather than abandoning it enabled - the
             // failure this driver's channel-per-stream split exists to prevent.
             mmio.write32(hcchar_at(ch), (mmio.read32(hcchar_at(ch)) & !HCCHAR_CHENA) | HCCHAR_CHDIS);
@@ -197,14 +200,28 @@ pub fn hcsplt(hub_addr: u8, hub_port: u8) -> u32 {
 
 /// Wait until the controller reports the given microframe. Bounded: one full frame is 8 microframes
 /// at 125 us, so a whole sweep cannot take more than a millisecond even if the target never appears.
+/// Cycles spent waiting for a microframe boundary, and waiting for a channel to halt.
+///
+/// SEPARATE COUNTERS, because a Phase-2 optimisation was aimed at the first of these on the strength
+/// of an ESTIMATE - "roughly 375 us of every 450 us" - that was never measured. It made no difference
+/// on hardware (keyboard CPU 4.4% before, 4.3% after), which means the time is in the other one. §20
+/// says perf claims need benchmarks; this is the benchmark that should have come first.
+pub static UF_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static HALT_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static UF_SLEEPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 fn wait_for_uframe(ctx: &ServiceContext, mmio: &Mmio, target: u32) {
+    let _t0 = ctx.read_tsc();
+    let _guard = ();
     let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(2));
     loop {
         let cur = mmio.read32(HFNUM) & 7;
         if cur == target {
+            UF_CYCLES.fetch_add(ctx.read_tsc().wrapping_sub(_t0), core::sync::atomic::Ordering::Relaxed);
             return;
         }
         if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+            UF_CYCLES.fetch_add(ctx.read_tsc().wrapping_sub(_t0), core::sync::atomic::Ordering::Relaxed);
             return;
         }
         // SLEEP THE BULK OF THE WAIT, SPIN ONLY THE LAST MICROFRAME.
@@ -225,6 +242,7 @@ fn wait_for_uframe(ctx: &ServiceContext, mmio: &Mmio, target: u32) {
         // matters and the cost is bounded to a single 125 us window.
         let togo = (target.wrapping_sub(cur)) & 7;
         if togo >= 2 {
+            UF_SLEEPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             // Wake one microframe SHORT of the target and spin in from there. `duration_cycles` takes
             // whole milliseconds, so the sub-millisecond figure is derived from the board's own
             // calibration instead - a cycle count is not a portable duration.
