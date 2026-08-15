@@ -63,6 +63,45 @@ pub fn timer_hz() -> u32 {
 const SYSTIMER_BASE: usize = super::PERIPHERAL_BASE + 0x3000;
 const SYSTIMER_CLO: *const u32 = (SYSTIMER_BASE + 0x04) as *const u32;
 const SYSTIMER_HZ: u64 = 1_000_000;
+/// Match/status register: bits 0-3 latch when compare 0-3 fire. Write the bit back to clear it - an
+/// unc leared match leaves the IRQ asserted and the core re-enters the handler forever.
+const SYSTIMER_CS: *mut u32 = SYSTIMER_BASE as *mut u32;
+/// Compare 3. C0 and C2 belong to the VideoCore firmware; C1 and C3 are free for the ARM, and taking
+/// the last one leaves C1 for whatever needs a second one-shot later.
+const SYSTIMER_C3: *mut u32 = (SYSTIMER_BASE + 0x18) as *mut u32;
+/// Legacy IRQ line for system timer compare 3.
+pub const SYSTIMER_C3_IRQ: u32 = 3;
+/// The match bit for C3 in `SYSTIMER_CS`.
+const SYSTIMER_C3_MATCH: u32 = 1 << 3;
+
+/// Arm compare 3 to fire in `us` microseconds. 1 MHz, so one tick IS one microsecond - this is the
+/// resolution the 10 ms scheduler tick cannot express, and the whole reason the USB driver spins.
+///
+/// Bounded: the compare is 32-bit and wraps every ~71 minutes, which the hardware handles because it
+/// compares equality against the low word - a deadline computed by wrapping addition is correct
+/// across the wrap.
+pub fn arm_oneshot_us(us: u32) {
+    // SAFETY: Device-mapped System Timer registers. Clear any stale match FIRST so an old fire cannot
+    // be mistaken for this one, then program the deadline.
+    unsafe {
+        SYSTIMER_CS.write_volatile(SYSTIMER_C3_MATCH);
+        let now = SYSTIMER_CLO.read_volatile();
+        SYSTIMER_C3.write_volatile(now.wrapping_add(us.max(1)));
+    }
+}
+
+/// Did compare 3 fire? Clears the match if so, so the IRQ deasserts.
+pub fn take_oneshot_match() -> bool {
+    // SAFETY: as above; write-1-to-clear on the status register.
+    unsafe {
+        let cs = SYSTIMER_CS.read_volatile();
+        if cs & SYSTIMER_C3_MATCH == 0 {
+            return false;
+        }
+        SYSTIMER_CS.write_volatile(SYSTIMER_C3_MATCH);
+        true
+    }
+}
 
 /// Read the ARM generic timer frequency (`CNTFRQ`), in Hz.
 pub fn cntfrq() -> u32 {
@@ -100,7 +139,7 @@ pub fn cntpct() -> u64 {
 /// Only the low word is used: every interval measured here is far below the wrap period, and reading
 /// the 64-bit pair correctly needs a hi/lo/hi re-read dance that buys nothing at this granularity.
 /// Wrap is handled by `wrapping_sub` at the call sites.
-fn systimer_lo() -> u32 {
+pub fn systimer_lo() -> u32 {
     // SAFETY: SYSTIMER_CLO is the BCM2835 System Timer counter-low register, inside the peripheral
     // range the MMU maps as Device memory (see `mmu.rs`). A volatile read of a free-running counter.
     unsafe { SYSTIMER_CLO.read_volatile() }

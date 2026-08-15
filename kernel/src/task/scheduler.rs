@@ -173,6 +173,18 @@ pub fn cycles_to_ticks(cycles: u64) -> u64 {
     if q == 0 { 1 } else { (cycles / q).max(1) }
 }
 
+/// Convert a cycle count to MICROSECONDS, for the sub-tick sleep path.
+///
+/// `cycles_to_ticks` above floors everything shorter than a quantum to one whole tick, which is the
+/// right answer for a tick-based wake and the wrong answer for a caller that asked for 125 us. This
+/// keeps the resolution the caller actually requested; the arch decides whether it has hardware that
+/// can honour it.
+pub fn cycles_to_us(cycles: u64) -> u64 {
+    let q = crate::arch::imp::boot::tsc_ticks_per_quantum(); // cycles per 10 ms
+    if q == 0 { return 0; }                                  // uncalibrated: no honest conversion
+    cycles.saturating_mul(10_000) / q
+}
+
 /// Arm a timed wake for `slot` at absolute BSP-tick `deadline` (0 disarms).
 pub fn set_wake_deadline(slot: usize, deadline: u64) {
     if slot < MAX_TASKS {

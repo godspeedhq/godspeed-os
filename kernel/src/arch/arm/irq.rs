@@ -58,6 +58,11 @@ pub fn route_usb_irq_to_core0() {
     // SAFETY: the legacy IC is in the Device-mapped peripheral window; a volatile write that sets one
     // enable bit. Writing 1s enables; 0s are ignored (the register is not read-modify-write).
     unsafe { (IC_ENABLE_IRQS_1 as *mut u32).write_volatile(1 << USB_IRQ_LINE); }
+    // NOTE: this whole function has NO CALLERS. USB is enabled through `unmask_usb_irq` from the
+    // IrqUnmask syscall instead, and the GPU funnel reaches core 0 by the routing register's reset
+    // default rather than by the write above. Discovered while wiring the system timer, whose enable
+    // was put here and therefore never ran. Left in place because it documents the intended routing,
+    // but nothing may be added here expecting it to execute.
 }
 
 /// The NEUTRAL vector a userspace USB driver is granted for this controller.
@@ -102,6 +107,32 @@ pub fn mask_usb_irq() {
 pub fn unmask_usb_irq() {
     // SAFETY: as above, against the enable register.
     unsafe { (IC_ENABLE_IRQS_1 as *mut u32).write_volatile(1 << USB_IRQ_LINE); }
+}
+
+/// The task waiting on the microsecond one-shot, or `u32::MAX` for none.
+///
+/// ONE slot, deliberately. The only caller that needs sub-tick precision is the USB driver's split
+/// sequencing, and a second concurrent sub-tick sleeper would need a sorted deadline queue - real
+/// machinery to serve a user that does not exist (§26.2). A second requester simply falls back to
+/// the tick-based sleep, which is what it would have got anyway, so the limit degrades rather than
+/// fails.
+static HIRES_SLEEPER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Claim the one-shot for `slot` and arm it. False if someone else holds it.
+pub fn hires_arm(slot: u32, us: u32) -> bool {
+    if HIRES_SLEEPER
+        .compare_exchange(u32::MAX, slot, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    super::timer::arm_oneshot_us(us);
+    true
+}
+
+/// Release the one-shot if `slot` holds it (on wake, or on any early exit).
+pub fn hires_release(slot: u32) {
+    let _ = HIRES_SLEEPER.compare_exchange(slot, u32::MAX, Ordering::AcqRel, Ordering::Relaxed);
 }
 
 /// Doorbells received, per core. Exists so the boot selftest can prove the path end to end on the
@@ -303,6 +334,18 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
     // peripheral IRQ we enable, and it is routed to core 0, so service it here and fall through to the
     // timer check (both can be pending at once). Confirm the line is USB before acting, so an
     // unexpected peripheral IRQ is left asserted and obvious rather than silently swallowed.
+    // The microsecond one-shot arrives through the same GPU funnel as USB, so check it here and
+    // let the USB test below still run - both can be pending in one interrupt.
+    if this_core() == 0 && source & CORE_IRQ_GPU != 0 && super::timer::take_oneshot_match() {
+        let slot = HIRES_SLEEPER.swap(u32::MAX, Ordering::AcqRel);
+        if slot != u32::MAX {
+            // Wake it the same way any other blocked task is woken. The scheduling pass at the bottom
+            // of this handler then picks it up, so a 125 us sleep costs an interrupt and a context
+            // switch instead of 125 us of spinning.
+            crate::task::scheduler::wake_by_slot(slot as usize, 0);
+        }
+    }
+
     let handled_gpu = if this_core() == 0 && source & CORE_IRQ_GPU != 0 && usb_irq_pending() {
         // DEVICE INTERRUPTS CAN GO TO USERSPACE ON ARM32. They always could.
         //
@@ -459,6 +502,13 @@ pub fn start_tick(hz: u32) -> bool {
     // Enabled here, beside the timer routing, because both answer "what may interrupt this core" and
     // splitting them is how one of them ends up forgotten.
     local_write(CORE_MBOX_IRQCNTL + 4 * this_core(), 1);
+    // And the system timer's compare-3 line, which carries the microsecond one-shot through the GPU
+    // funnel to core 0. Enabled HERE, in the path that actually runs at boot - it was first put in
+    // `route_usb_irq_to_core0`, which turns out to have no callers, so it silently never happened and
+    // every sub-tick sleep quietly fell back to the 10 ms tick.
+    // SAFETY: volatile write of one enable bit to the Device-mapped legacy IC; 0s are ignored, so
+    // other lines are undisturbed.
+    unsafe { (IC_ENABLE_IRQS_1 as *mut u32).write_volatile(1 << super::timer::SYSTIMER_C3_IRQ); }
 
     set_tval(reload);
     enable_timer();
@@ -481,6 +531,13 @@ pub fn start_tick_ap(_core: u32) -> bool {
     // Enabled here, beside the timer routing, because both answer "what may interrupt this core" and
     // splitting them is how one of them ends up forgotten.
     local_write(CORE_MBOX_IRQCNTL + 4 * this_core(), 1);
+    // And the system timer's compare-3 line, which carries the microsecond one-shot through the GPU
+    // funnel to core 0. Enabled HERE, in the path that actually runs at boot - it was first put in
+    // `route_usb_irq_to_core0`, which turns out to have no callers, so it silently never happened and
+    // every sub-tick sleep quietly fell back to the 10 ms tick.
+    // SAFETY: volatile write of one enable bit to the Device-mapped legacy IC; 0s are ignored, so
+    // other lines are undisturbed.
+    unsafe { (IC_ENABLE_IRQS_1 as *mut u32).write_volatile(1 << super::timer::SYSTIMER_C3_IRQ); }
     set_tval(reload);
     enable_timer();
     enable_interrupts();

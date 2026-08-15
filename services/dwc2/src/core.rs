@@ -135,7 +135,33 @@ pub fn reset_and_host_mode(ctx: &ServiceContext, mmio: &Mmio) -> bool {
     // with an FIQ state machine (`dwc_otg.fiq_fsm_enable`), which is what you build when the core
     // cannot schedule splits by itself. If that is what this reports, an interrupt-driven periodic
     // path is not a matter of programming the controller differently - it needs a different mechanism.
-    // (The wake-latency probe that lived here has been REMOVED. It measured what it needed to -
+    // The wake-latency probe is BACK, and it is now the proof of the fix rather than a hazard.
+    //
+    // It measured a 125 us sleep returning after 9.9 ms at best and 2 s at worst, which is why the
+    // USB driver spins instead of sleeping. It was then removed because 64 sequential multi-second
+    // sleeps blocked this service's bring-up for two minutes. With the kernel's microsecond one-shot
+    // in place a 125 us sleep should cost 125 us, so sixteen of them cost ~2 ms - and if the hi-res
+    // path is NOT working, sixteen tick-sleeps cost 160 ms, which is a delay, not an outage.
+    //
+    // The MAX is the number that matters: a split transaction must land inside its microframe, so a
+    // wake that is usually fast and occasionally late is no use.
+    {
+        const N: u64 = 16;
+        let per_us = (ctx.tsc_ticks_per_10ms() / 10_000).max(1);
+        let want = per_us.saturating_mul(125).max(1);
+        let (mut lo, mut hi, mut sum) = (u64::MAX, 0u64, 0u64);
+        for _ in 0..N {
+            let t0 = ctx.read_tsc();
+            ctx.sleep(want);
+            let d = ctx.read_tsc().wrapping_sub(t0);
+            lo = lo.min(d); hi = hi.max(d); sum += d;
+        }
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: 125 us sleep - min {} us, mean {} us, MAX {} us (a microframe is 125 us;              above ~250 us and a split cannot be scheduled by sleeping)",
+            lo / per_us, (sum / N) / per_us, hi / per_us));
+    }
+
+    // (The original probe note: It measured what it needed to -
     // a 125 us sleep returns after 9.9 ms at best and 2 s at worst, recorded in docs/arm32-status.md -
     // and then it cost far more than it was worth: 64 sequential sleeps of up to 2 s each blocked this
     // service's bring-up for up to two minutes, so dwc2 never began serving, and `block-driver` and

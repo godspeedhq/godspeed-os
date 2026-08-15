@@ -465,9 +465,45 @@ pub fn smp_bringup() {
             crate::kprintln!("smp: WARNING - core {} did NOT come up; continuing without it", core);
         }
     }
+    hires_timer_selftest();
     ipi_selftest();
     // The shared sentence, so this port and every other say it identically (`smp::core`).
     crate::smp::core::report_cores_ready();
+}
+
+/// Does the microsecond one-shot fire AT ALL, and does its interrupt reach us?
+///
+/// Two different failures wear the same symptom - a sleep that returns late - and they need
+/// different fixes, so they are separated here rather than guessed at afterwards:
+///   - the COMPARE never matches: the timer hardware is not doing its job (or the emulator does not
+///     model it), and no amount of interrupt plumbing will help.
+///   - the compare matches but no INTERRUPT arrives: the hardware is fine and the routing is wrong,
+///     which is ours to fix.
+///
+/// So: arm it, poll the match bit directly, and report which of the two happened.
+fn hires_timer_selftest() {
+    const WANT_US: u32 = 1000;
+    timer::arm_oneshot_us(WANT_US);
+    let t0 = timer::systimer_lo();
+    let mut matched = false;
+    // Bounded by the COUNTER, not by a spin count - a spin count means a different duration on every
+    // machine, which is exactly the mistake this timer exists to stop making.
+    while timer::systimer_lo().wrapping_sub(t0) < WANT_US * 20 {
+        if timer::take_oneshot_match() {
+            matched = true;
+            break;
+        }
+    }
+    let elapsed = timer::systimer_lo().wrapping_sub(t0);
+    if matched {
+        crate::kprintln!(
+            "arm32: hi-res timer selftest PASS - compare 3 matched after {} us (asked {})",
+            elapsed, WANT_US);
+    } else {
+        crate::kprintln!(
+            "arm32: hi-res timer selftest FAIL - compare 3 never matched in {} us; sub-tick sleeps              will fall back to the 10 ms tick (correct, just coarse)",
+            elapsed);
+    }
 }
 
 /// Prove the cross-core doorbell actually reaches the other core.
