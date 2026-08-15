@@ -81,12 +81,23 @@ const SYSTIMER_C3_MATCH: u32 = 1 << 3;
 /// compares equality against the low word - a deadline computed by wrapping addition is correct
 /// across the wrap.
 pub fn arm_oneshot_us(us: u32) {
-    // SAFETY: Device-mapped System Timer registers. Clear any stale match FIRST so an old fire cannot
-    // be mistaken for this one, then program the deadline.
+    // SAFETY: Device-mapped System Timer registers.
     unsafe {
         SYSTIMER_CS.write_volatile(SYSTIMER_C3_MATCH);
         let now = SYSTIMER_CLO.read_volatile();
         SYSTIMER_C3.write_volatile(now.wrapping_add(us.max(1)));
+    }
+}
+
+/// Arm compare 3 for an ABSOLUTE System Timer value.
+///
+/// The deadline arithmetic belongs to the caller holding the queue, not here: with several sleepers
+/// the compare must track the EARLIEST outstanding deadline, which only the queue knows.
+pub fn arm_oneshot_at(at: u32) {
+    // SAFETY: as above. The stale match is cleared first so a previous fire cannot be read as this one.
+    unsafe {
+        SYSTIMER_CS.write_volatile(SYSTIMER_C3_MATCH);
+        SYSTIMER_C3.write_volatile(at);
     }
 }
 

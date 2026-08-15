@@ -109,33 +109,100 @@ pub fn unmask_usb_irq() {
     unsafe { (IC_ENABLE_IRQS_1 as *mut u32).write_volatile(1 << USB_IRQ_LINE); }
 }
 
-/// The task waiting on the microsecond one-shot, or `u32::MAX` for none.
+/// Tasks waiting on the microsecond one-shot, and when each is due (absolute System Timer counts).
 ///
-/// ONE slot, deliberately. The only caller that needs sub-tick precision is the USB driver's split
-/// sequencing, and a second concurrent sub-tick sleeper would need a sorted deadline queue - real
-/// machinery to serve a user that does not exist (§26.2). A second requester simply falls back to
-/// the tick-based sleep, which is what it would have got anyway, so the limit degrades rather than
-/// fails.
-static HIRES_SLEEPER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+/// EIGHT, fixed. The first version had ONE slot and hardware showed what that costs: a 125 us sleep
+/// returned in 144 us when it got the slot and 8197 us on average when it did not, because any other
+/// sub-tick sleeper in the system took it and everyone else fell back to the 10 ms tick. One slot is
+/// not a timer, it is a lottery.
+///
+/// A fixed array rather than a heap queue keeps the bound readable straight off the source (§26.6.1),
+/// and a full table degrades to the tick - which is exactly the behaviour that was there before, so
+/// the failure mode is "coarse", never "wrong".
+struct HiRes {
+    slot: [u32; HIRES_MAX],
+    due: [u32; HIRES_MAX],
+}
+const HIRES_MAX: usize = 8;
+static HIRES: crate::smp::spinlock::SpinLock<HiRes> =
+    crate::smp::spinlock::SpinLock::new(HiRes { slot: [u32::MAX; HIRES_MAX], due: [0; HIRES_MAX] });
 
-/// Claim the one-shot for `slot` and arm it. False if someone else holds it.
-pub fn hires_arm(slot: u32, us: u32) -> bool {
-    if HIRES_SLEEPER
-        .compare_exchange(u32::MAX, slot, Ordering::AcqRel, Ordering::Relaxed)
-        .is_err()
-    {
-        return false;
+/// Has `now` reached `due`? Wrapping-safe: the System Timer is 32-bit at 1 MHz, so it wraps about
+/// every 71 minutes, and a plain `>=` would sleep through the wrap for the better part of an hour.
+fn reached(now: u32, due: u32) -> bool {
+    now.wrapping_sub(due) < 0x8000_0000
+}
+
+/// Re-arm the compare for the EARLIEST outstanding deadline. Called with the lock held.
+fn hires_rearm(q: &HiRes) {
+    let now = super::timer::systimer_lo();
+    let mut best: Option<u32> = None;
+    for i in 0..HIRES_MAX {
+        if q.slot[i] == u32::MAX {
+            continue;
+        }
+        let d = q.due[i];
+        if best.map_or(true, |b| d.wrapping_sub(now) < b.wrapping_sub(now)) {
+            best = Some(d);
+        }
     }
-    super::timer::arm_oneshot_us(us);
+    if let Some(d) = best {
+        // At least 1 us out: programming a deadline already past would rely on the compare firing on
+        // an equality it has already gone by, and the entry would never be woken by the timer at all.
+        let delta = d.wrapping_sub(now);
+        super::timer::arm_oneshot_at(now.wrapping_add(if delta == 0 || delta >= 0x8000_0000 { 1 } else { delta }));
+    }
+}
+
+/// Register `slot` to wake in `us` microseconds. False if the table is full (caller uses the tick).
+pub fn hires_arm(slot: u32, us: u32) -> bool {
+    let mut q = HIRES.lock();
+    let free = (0..HIRES_MAX).find(|&i| q.slot[i] == u32::MAX);
+    let i = match free {
+        Some(i) => i,
+        None => return false,
+    };
+    q.slot[i] = slot;
+    q.due[i] = super::timer::systimer_lo().wrapping_add(us.max(1));
+    hires_rearm(&q);
     true
 }
 
-/// Release the one-shot if `slot` holds it (on wake, or on any early exit).
+/// Drop `slot` from the table (on wake, or on any early exit).
 pub fn hires_release(slot: u32) {
-    let _ = HIRES_SLEEPER.compare_exchange(slot, u32::MAX, Ordering::AcqRel, Ordering::Relaxed);
+    let mut q = HIRES.lock();
+    for i in 0..HIRES_MAX {
+        if q.slot[i] == slot {
+            q.slot[i] = u32::MAX;
+        }
+    }
+    hires_rearm(&q);
 }
 
-/// Doorbells received, per core. Exists so the boot selftest can prove the path end to end on the
+/// Wake everything now due, then re-arm for the next. Called from the IRQ handler.
+fn hires_fire() {
+    let mut woken = [u32::MAX; HIRES_MAX];
+    {
+        let mut q = HIRES.lock();
+        let now = super::timer::systimer_lo();
+        for i in 0..HIRES_MAX {
+            if q.slot[i] != u32::MAX && reached(now, q.due[i]) {
+                woken[i] = q.slot[i];
+                q.slot[i] = u32::MAX;
+            }
+        }
+        hires_rearm(&q);
+    }
+    // Wake OUTSIDE the lock: the scheduler takes its own locks, and holding two at once is how a
+    // deadlock is built. The entries are already removed, so a concurrent arm cannot collide.
+    for w in woken.iter() {
+        if *w != u32::MAX {
+            crate::task::scheduler::wake_by_slot(*w as usize, 0);
+        }
+    }
+}
+
+/// Doorbells received, per core./// Doorbells received, per core. Exists so the boot selftest can prove the path end to end on the
 /// machine actually running, rather than trusting that a register write meant something.
 static DOORBELLS: [core::sync::atomic::AtomicU32; 4] = [
     core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
@@ -337,13 +404,10 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
     // The microsecond one-shot arrives through the same GPU funnel as USB, so check it here and
     // let the USB test below still run - both can be pending in one interrupt.
     if this_core() == 0 && source & CORE_IRQ_GPU != 0 && super::timer::take_oneshot_match() {
-        let slot = HIRES_SLEEPER.swap(u32::MAX, Ordering::AcqRel);
-        if slot != u32::MAX {
-            // Wake it the same way any other blocked task is woken. The scheduling pass at the bottom
-            // of this handler then picks it up, so a 125 us sleep costs an interrupt and a context
-            // switch instead of 125 us of spinning.
-            crate::task::scheduler::wake_by_slot(slot as usize, 0);
-        }
+        // Wake everything now due and re-arm for the next deadline. The scheduling pass at the bottom
+        // of this handler then runs them, so a 125 us sleep costs an interrupt and a context switch
+        // instead of 125 us of spinning.
+        hires_fire();
     }
 
     let handled_gpu = if this_core() == 0 && source & CORE_IRQ_GPU != 0 && usb_irq_pending() {
