@@ -155,6 +155,14 @@ pub fn reset_and_host_mode(ctx: &ServiceContext, mmio: &Mmio) -> bool {
         // Device read - the deadline is already past when it lands, the match never happens, and the
         // tick backstop answers instead. That predicts short sleeps failing while long ones work,
         // which no single number can show.
+        // NOTE ON WHEN THIS RUNS: during bring-up, which is the NOISIEST logging window of the whole
+        // boot. That matters more than it looks. A serial write is a syscall, 115200 baud is ~87 us
+        // per byte, and the ARM dispatch deliberately refuses to preempt a user task that is mid-
+        // syscall - so one 100-character log line holds this core, un-preemptible, for about 9 ms.
+        // The measured mean for a 125 us sleep is 9395 us, which is one log line almost exactly.
+        //
+        // So this measurement may be reporting the console, not the timer. `sweep()` is called again
+        // later from the serve loop, on a quiet system, and the two together say which.
         const N: u64 = 16;
         let per_us = (ctx.tsc_ticks_per_10ms() / 10_000).max(1);
         for want_us in [125u64, 500, 2000] {
