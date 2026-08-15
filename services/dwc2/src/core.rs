@@ -120,7 +120,7 @@ pub fn reset_and_host_mode(ctx: &ServiceContext, mmio: &Mmio) -> bool {
     const PTX_WORDS: u32 = 512;
     let dfifo_depth = mmio.read32(GHWCFG3) >> 16;
     ctx.log_fmt(format_args!(
-        "dwc2-svc: DFIFO depth {} words; sizing RX/NPTX/PTX 774/256/512 (Linux bcm2835)", dfifo_depth));
+        "dwc2-svc: DFIFO depth {} words; sizing RX/NPTX/PTX 774/256/512", dfifo_depth));
 
     // What can this core SCHEDULE for itself?
     //

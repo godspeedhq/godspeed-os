@@ -460,10 +460,34 @@ pub fn mark_task_user(slot: usize) {
     if slot < ARM_MAX_TASKS { ARM_TASK_IS_USER[slot].store(true, Ordering::Relaxed); }
 }
 
+/// Interrupts dispatched per core, and the last `CORE_IRQ_SOURCE` each saw.
+///
+/// Exists for one question the liveness panic could not answer: when a core stops making progress,
+/// is it still taking interrupts? A frozen count and a climbing count are opposite faults with
+/// opposite fixes, and without this the message named the victim but never the mechanism.
+static IRQ_COUNT: [core::sync::atomic::AtomicU32; 4] = [
+    core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
+];
+static IRQ_LAST_SRC: [core::sync::atomic::AtomicU32; 4] = [
+    core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
+];
+
+/// (dispatches, last source) for `core`. Read by the liveness panic.
+pub fn core_irq_debug(core: u32) -> (u32, u32) {
+    let i = (core & 3) as usize;
+    (IRQ_COUNT[i].load(Ordering::Relaxed), IRQ_LAST_SRC[i].load(Ordering::Relaxed))
+}
+
 #[no_mangle]
 pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
     // Per-core source register: the timer fired on THIS core, so read this core's `+0x60 + 4*core`.
     let source = local_read(CORE_IRQ_SOURCE + 4 * this_core());
+    // Stamp BEFORE any handling: the count must prove the interrupt was TAKEN, not that it completed.
+    // A handler that hangs is exactly the case this is meant to distinguish.
+    IRQ_COUNT[this_core() & 3].fetch_add(1, Ordering::Relaxed);
+    IRQ_LAST_SRC[this_core() & 3].store(source, Ordering::Relaxed);
 
     // A GPU-funnel interrupt (bit 8) is a legacy-controller peripheral IRQ. The USB stack is the only
     // peripheral IRQ we enable, and it is routed to core 0, so service it here and fall through to the

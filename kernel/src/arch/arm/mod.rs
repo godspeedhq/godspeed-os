@@ -1117,6 +1117,11 @@ pub fn usb_disk_flush() -> bool { false }
 /// the 20-30 s wedges a chaos run produced. A watchdog that panics a healthy machine is worse than none,
 /// so the margin is deliberately generous; it can tighten once the ARM worst case is measured rather
 /// than reasoned about.
+/// (interrupts dispatched, last IRQ source) for `core` - what the liveness panic reports.
+pub fn core_irq_debug(core: u32) -> (u32, u32) {
+    irq::core_irq_debug(core)
+}
+
 pub fn liveness_deadline_cycles() -> u64 {
     const LIVENESS_SECS: u64 = 10;
     (timer::timer_hz() as u64).saturating_mul(LIVENESS_SECS)

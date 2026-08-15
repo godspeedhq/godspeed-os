@@ -1257,11 +1257,15 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     // Report the overrun as a MULTIPLE of the deadline rather than in quanta: the
                     // quantum figure is precisely what is unavailable on some arches, and a panic message
                     // must not depend on the thing whose absence disabled this check in the first place.
+                    // The IRQ tally is what tells a reader WHICH wedge this is: a frozen count
+                    // means the core is not taking interrupts at all, a climbing one means it is and
+                    // the tick inside the handler is being skipped. Same symptom, opposite causes.
+                    let (irqs, last_src) = crate::arch::imp::core_irq_debug(other as u32);
                     panic!(
                         "LIVENESS WEDGE: core {} made NO progress for {} counter ticks ({}x the {} \
-                         allowed); last running task slot {}; detected by core {}. No forward progress \
-                         = loud stop.",
-                        other, dark, dark / deadline, deadline, stuck_task, cid
+                         allowed); last running task slot {}; it has taken {} interrupts, last source \
+                         {:#010x}; detected by core {}. No forward progress = loud stop.",
+                        other, dark, dark / deadline, deadline, stuck_task, irqs, last_src, cid
                     );
                 }
             }

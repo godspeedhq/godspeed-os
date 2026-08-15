@@ -312,6 +312,12 @@ pub fn usb_disk_flush() -> bool { false }
 /// x86: unchanged from when this lived in the scheduler - 300 quanta of ~10 ms is ~3 s, and it is `0`
 /// until the TSC quantum is calibrated (QEMU's periodic tick never calibrates, so it stays off there).
 /// A normal shootdown or critical section is milliseconds, so ~3 s cannot false-fire.
+/// (interrupts dispatched, last IRQ source) for `core`. Not tracked on this port, so the liveness
+/// panic prints zeros rather than a wrong number - it was added to diagnose an arm32 wedge.
+pub fn core_irq_debug(_core: u32) -> (u32, u32) {
+    (0, 0)
+}
+
 pub fn liveness_deadline_cycles() -> u64 {
     boot::tsc_ticks_per_quantum().saturating_mul(300)
 }
