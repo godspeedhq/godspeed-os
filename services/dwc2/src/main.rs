@@ -657,7 +657,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // serial write is an un-preemptible syscall of about 9 ms per log line - which is the mean it
         // reported. One repeat on a settled system separates "the timer is slow" from "the boot is
         // loud", and no amount of re-reading the first number could.
-        if !quiet_swept && ctx.read_tsc().wrapping_sub(boot_tsc) > ctx.duration_cycles(30_000) {
+        if !quiet_swept && ctx.read_tsc().wrapping_sub(boot_tsc) > ctx.duration_cycles(12_000) {
             quiet_swept = true;
             let per_us = (ctx.tsc_ticks_per_10ms() / 10_000).max(1);
             for want_us in [125u64, 2000] {
