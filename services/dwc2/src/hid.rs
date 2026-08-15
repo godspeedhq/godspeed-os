@@ -222,18 +222,6 @@ fn try_bind(
     ctx.log_fmt(format_args!(
         "dwc2-svc: BOOT KEYBOARD bound - interface {} endpoint {} mps {} interval {}",
         iface, kbd.ep, kbd.mps, kbd.interval));
-    // TELL THE USER INPUT IS LIVE, by making the shell re-print its prompt.
-    //
-    // The prompt appears about 2.5 s before this point, and that ordering is deliberate: the shell is
-    // spawned early precisely so it never waits on hardware bring-up (reordering it once cost a 45 s
-    // wait for the prompt). But a prompt you cannot type at looks like a broken machine, and nothing
-    // marked the moment that changed.
-    //
-    // Pushing a newline into the console ring is the smallest honest signal: the shell consumes it as
-    // an empty line and reprints `gsh>`, so a fresh prompt appears exactly when input starts working.
-    // No new mechanism, no message to keep in step with the truth - the prompt IS the signal, and it
-    // can only appear once the path that carries keystrokes is live end to end.
-    ctx.console_push(10); // newline: the shell reprints `gsh>` the moment input works
     BindOutcome::Bound(kbd)
 }
 

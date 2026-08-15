@@ -244,6 +244,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                             // declined. Both return None for "not mine", which is
                                             // the ordinary answer on most ports and is not logged.
                                             if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {
+                                                // TELL THE USER INPUT IS LIVE, once, by making the
+                                                // shell reprint its prompt. The prompt appears about
+                                                // 2.5 s before this - deliberately, so it never waits
+                                                // on hardware bring-up - and a prompt you cannot type
+                                                // at looks like a broken machine.
+                                                //
+                                                // Only on the FIRST bind. This lived inside `bind`,
+                                                // which the recovery path also calls, so every
+                                                // re-enumeration printed another prompt: four binds in
+                                                // one boot gave four `gsh>` lines. A re-bind is not
+                                                // news to someone already typing; the first one is.
+                                                ctx.console_push(10);
                                                 kbd = Some((k, dt, dsplt));
                                             } else if dvid == 0x0424 && dpid == 0xec00 {
                                                 // The LAN9514's ethernet function. Matched by VID:PID
