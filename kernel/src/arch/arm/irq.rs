@@ -561,7 +561,21 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
         DOORBELLS[this_core() & 3].fetch_add(1, Ordering::Relaxed);
     }
 
-    if source & (IRQ_PHYS_TIMER | CORE_IRQ_MBOX0) != 0 || woke_hires {
+    // A DOORBELL DOES NOT RE-ENTER THE SCHEDULER. It only has to break `wfi`.
+    //
+    // It used to join the condition below and run `timer_tick_from_irq` - a full context switch -
+    // from an arbitrary asynchronous interrupt. Hardware showed where that ends: core 0 wedged with
+    // its interrupt count FROZEN at 11167 and its last source `0x10`, which is mailbox 0. Stuck
+    // inside this handler, not storming - the shape of re-entering scheduler state from a context
+    // that may already be inside it.
+    //
+    // And re-entering was never needed. The wake it delivers has already marked the task Ready; what
+    // the doorbell must do is stop the target core WAITING. An idle core is in `wfi`, and taking any
+    // interrupt breaks that - it returns to the scheduler loop and picks the task up immediately,
+    // which is the case that matters and the one the IPI was added for. A core that is running a task
+    // picks it up at its next tick, no worse than before the IPI existed and without re-entering the
+    // scheduler from an interrupt that can arrive anywhere.
+    if source & IRQ_PHYS_TIMER != 0 || woke_hires {
         // Re-arm first: writing TVAL both sets the next deadline and deasserts the current interrupt.
         // Doing it before the bookkeeping keeps the period honest - the next interval starts counting
         // from here, not from whenever the handler happens to finish. (This is the ARM timer's "EOI";
