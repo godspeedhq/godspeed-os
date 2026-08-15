@@ -41,9 +41,14 @@ ipc_send  = ["dwc2"]
 # embedded binary selected, and an unused capability is a smaller problem than a driver that cannot
 # reach its device.
 
-[placement]
-core = 1   # a driver pins to the core its IRQ will route to (interrupt locality, §12.2)
-# ARM (Pi 2): the kernel overrides this to core 0 - the in-kernel DWC2 USB-net device is driven only from
-# core 0, and the NET_DEVICE syscalls guard on that core (userspace-audit Audit 5). This x86 value stands.
-# AArch64 (Pi 4): NOT overridden - core 1 as written. GENET is reached by MMIO from whichever core makes
-# the syscall, so there is no core-0 constraint to honour, and core 1 keeps it beside net-stack and fs.
+# PLACEMENT IS ARCH-CONDITIONAL, so it is NOT declared here.
+#
+# On x86 and aarch64 this service sits on core 1. On arm32 it is unpinned: cross-core wakes are
+# immediate there now (the BCM2836 mailbox doorbell), and core 0 is kept clear for `dwc2`, whose
+# split transactions must hit 125 us windows.
+#
+# A `[placement] core` line here would be a SECOND copy of that decision, and it would be wrong on
+# one of the two arches whatever value it carried - the drift Commandment III forbids. The single
+# source is `ServiceConfig.preferred_core` in kernel/src/task/mod.rs, which both the boot and the
+# RESTART paths consult. The comments that used to sit here saying "the kernel overrides this to
+# core 0" were describing exactly that duplication, and are now unnecessary as well as stale.

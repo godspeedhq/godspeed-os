@@ -21,8 +21,17 @@ limit   = "16MiB"
 hw_device = "ahci"
 log_write = true
 
-[placement]
-core = 1
+# PLACEMENT IS ARCH-CONDITIONAL, so it is NOT declared here.
+#
+# On x86 and aarch64 this service sits on core 1. On arm32 it is unpinned: cross-core wakes are
+# immediate there now (the BCM2836 mailbox doorbell), and core 0 is kept clear for `dwc2`, whose
+# split transactions must hit 125 us windows and which shares that core with nothing else that logs.
+#
+# A `[placement] core` line here would be a SECOND copy of that decision, and it would be wrong on
+# one of the two arches whatever value it carried - which is precisely the drift Commandment III
+# forbids. The single source is `ServiceConfig.preferred_core` in kernel/src/task/mod.rs, which both
+# the boot and the RESTART paths consult; a value that lived only here was once overridden at boot
+# and not on restart, and a restarted service came back on a core where every operation failed.
 
 # Reach the `xhci` SERVICE by IPC. This is how block-driver gets its sectors on AArch64 (Pi 4),
 # where the USB stack is a userspace service and the in-kernel driver no longer exists in ANY build

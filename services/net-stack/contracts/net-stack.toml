@@ -28,7 +28,14 @@ resource_mint = true
 # So on ARM the real authority of this service is the four capabilities above PLUS SET_CLOCK (set the
 # machine's time of day). Stated here so a contract reader is not misled about what net-stack can reach.
 
-[placement]
-core = 1   # co-located with nic-driver (the two exchange frames constantly)
-# ARM (Pi 2): the kernel overrides this to core 0, co-located with nic-driver there (which must be core 0
-# for the DWC2 USB-net device), avoiding QEMU-TCG cross-core IPC latency. This x86 value stands.
+# PLACEMENT IS ARCH-CONDITIONAL, so it is NOT declared here.
+#
+# On x86 and aarch64 this service sits on core 1. On arm32 it is unpinned: cross-core wakes are
+# immediate there now (the BCM2836 mailbox doorbell), and core 0 is kept clear for `dwc2`, whose
+# split transactions must hit 125 us windows.
+#
+# A `[placement] core` line here would be a SECOND copy of that decision, and it would be wrong on
+# one of the two arches whatever value it carried - the drift Commandment III forbids. The single
+# source is `ServiceConfig.preferred_core` in kernel/src/task/mod.rs, which both the boot and the
+# RESTART paths consult. The comments that used to sit here saying "the kernel overrides this to
+# core 0" were describing exactly that duplication, and are now unnecessary as well as stale.
