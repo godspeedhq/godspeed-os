@@ -333,6 +333,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // announced giving up. Both reset the moment the keyboard actually works again.
         let mut recoveries_in_a_row = 0u32;
         let mut recovery_gave_up = false;
+        let mut gave_up_at = 0u64;
+        /// How long to leave a hopeless keyboard alone before trying once more. Long enough that a
+        /// dead device costs nothing, short enough that a transient storm is not a permanent loss.
+        const RECOVERY_BACKOFF_MS: u64 = 10_000;
         let mut reports: u64 = 0;
         let mut last_beat = ctx.read_tsc();
         // The interval the DEVICE asked for, floored to something a service can actually schedule.
@@ -456,12 +460,34 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // genuinely recovering is never cut off.
                 const RECOVERY_BURST_MAX: u32 = 4;
                 if recoveries_in_a_row >= RECOVERY_BURST_MAX {
+                    // BACK OFF, do not give up forever.
+                    //
+                    // The bound is right - four resets in a row without a single healthy poll means
+                    // the fault is not the kind a reset repairs, and thrashing helps nobody. But
+                    // "input is dead until you replug" is not an acceptable resting state on a
+                    // machine whose whole design is that things recover. Hardware showed exactly that
+                    // after heavy typing: 20 re-enumerations, then a permanently dead keyboard while
+                    // the rest of the system carried on perfectly.
+                    //
+                    // So the burst stops and a SLOW retry takes over. The condition that provokes
+                    // this is transient (a storm of errors under load), so the thing to do is wait
+                    // out the storm rather than declare the device gone. Still bounded: one attempt
+                    // per backoff window, not a loop.
                     if !recovery_gave_up {
                         recovery_gave_up = true;
+                        gave_up_at = ctx.read_tsc();
                         ctx.log_fmt(format_args!(
-                            "dwc2-svc: keyboard re-enumerated {} times without settling - GIVING UP on it.                              Input is dead until the device is replugged or this service restarts;                              storage and networking are unaffected.", recoveries_in_a_row));
+                            "dwc2-svc: keyboard re-enumerated {} times without settling - backing off for                              {} s. Input is dead meanwhile; storage and networking are unaffected.",
+                            recoveries_in_a_row, RECOVERY_BACKOFF_MS / 1000));
                     }
-                    continue;
+                    if ctx.read_tsc().wrapping_sub(gave_up_at) < ctx.duration_cycles(RECOVERY_BACKOFF_MS) {
+                        continue;
+                    }
+                    // Window elapsed: allow ONE fresh attempt, and say so, so a keyboard that keeps
+                    // failing produces a slow visible heartbeat rather than either silence or a flood.
+                    ctx.log("dwc2-svc: keyboard backoff elapsed - trying the port once more");
+                    recoveries_in_a_row = 0;
+                    recovery_gave_up = false;
                 }
                 recoveries_in_a_row += 1;
                 match hub::enumerate_downstream(&ctx, &m, &d, &hub_t, hub_port, &mut addr) {
