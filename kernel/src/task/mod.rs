@@ -596,7 +596,18 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    0,
+            // ARM: OFF CORE 0, to keep the serial writer away from the microframe-timed USB driver.
+            //
+            // Measured: a 125 us sleep averages 9398 us during boot and 608 us on a quiet system - a
+            // 15x difference made entirely of console traffic. A serial write is a syscall, 115200
+            // baud is ~87 us per byte, and this port deliberately refuses to preempt a user task
+            // mid-syscall (preempting SVC corrupts the banked SPSR/sp). So one ~100-character log
+            // line holds its core, un-preemptible, for about 9 ms.
+            //
+            // That blocks only the core it runs on - and this service was sharing core 0 with `dwc2`,
+            // whose split transactions must hit 125 us windows. Moving the writer is the cheap half
+            // of the fix; it needs no console rework and it uses the cores this board has.
+            preferred_core:    if cfg!(target_arch = "arm") { 2 } else { 0 },
             probe_mode:        0,
             memory_limit:      8 * 1024 * 1024,   // matches logger.toml (a stub sink needs ~none); the
                                                  // contract is the source of truth (audit T1 reconcile)
@@ -3519,7 +3530,18 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // `time` (clock slice 2): the wall clock is a service, so `date` and the boot floor ask it.
             send_peers:        &["fs", "block-driver", "time"],
             send_peers_grant:  false,
-            preferred_core:    0,
+            // ARM: OFF CORE 0, to keep the serial writer away from the microframe-timed USB driver.
+            //
+            // Measured: a 125 us sleep averages 9398 us during boot and 608 us on a quiet system - a
+            // 15x difference made entirely of console traffic. A serial write is a syscall, 115200
+            // baud is ~87 us per byte, and this port deliberately refuses to preempt a user task
+            // mid-syscall (preempting SVC corrupts the banked SPSR/sp). So one ~100-character log
+            // line holds its core, un-preemptible, for about 9 ms.
+            //
+            // That blocks only the core it runs on - and this service was sharing core 0 with `dwc2`,
+            // whose split transactions must hit 125 us windows. Moving the writer is the cheap half
+            // of the fix; it needs no console rework and it uses the cores this board has.
+            preferred_core:    if cfg!(target_arch = "arm") { 1 } else { 0 },
             probe_mode:        0,
             memory_limit:      8 * 1024 * 1024,
             hw_irqs:           &[],
