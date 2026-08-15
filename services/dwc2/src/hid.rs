@@ -254,8 +254,31 @@ pub fn poll(
         if hcint & HCINT_NYET == 0 {
             state.nyet_run = 0; // anything else is the TT answering, so it is not wedged
         }
-        if hcint & HCINT_XACTERR == 0 {
-            state.xacterr_run = 0; // any non-error outcome means the endpoint is still transacting
+        // ERRORS SINCE THE LAST REPORT, not consecutive errors.
+        //
+        // This used to reset on ANY non-error outcome, including a NAK - and a degraded endpoint
+        // does not fail cleanly, it alternates. Measured after a storm: the translator was cleared,
+        // the endpoint kept erroring in a mixed NAK/XACTERR state, and the consecutive counter kept
+        // resetting, so a threshold worth 300 ms of polling took 5.2 SECONDS to trip. That gap is
+        // the keyboard outage an operator feels.
+        //
+        // A NAK means "nothing changed", which is not evidence the endpoint is HEALTHY - only a
+        // delivered report is. So the counter now clears on data and survives NAKs, and it is a RATE:
+        // the window restarts if the errors are spread thinly enough not to matter, so ordinary
+        // XACTERR noise on a low-speed split device still never triggers a port reset.
+        if hcint & HCINT_XFERCOMPL != 0 && hcint & HCINT_NAK == 0 {
+            state.xacterr_run = 0;      // a real report: the endpoint is transacting
+            state.xacterr_since = 0;
+        } else if hcint & HCINT_XACTERR != 0 {
+            let now = ctx.read_tsc();
+            // Restart the window if the last error is stale - errors that far apart are noise, not a
+            // broken endpoint.
+            if state.xacterr_since == 0
+                || now.wrapping_sub(state.xacterr_since) > ctx.duration_cycles(2000)
+            {
+                state.xacterr_since = now;
+                state.xacterr_run = 1;
+            }
         }
         if hcint == 0 {
             state.n_silent = state.n_silent.wrapping_add(1);
@@ -488,6 +511,9 @@ pub struct KeyState {
     /// a data-toggle mismatch; one is ordinary noise, an unbroken run means the endpoint is in a
     /// state no further transfers will leave.
     pub xacterr_run: u32,
+    /// When the current error window opened. Errors spread wider than the window are noise; errors
+    /// packed inside it with no delivered report in between are a broken endpoint.
+    pub xacterr_since: u64,
     /// When the TT buffer was last cleared. A clear that does not restore data tells us the endpoint
     /// itself is in trouble, and waiting out the full cold-start error budget after that is three
     /// seconds spent proving something already known.
@@ -511,7 +537,7 @@ impl KeyState {
             emitted_report: 0,
             last_data: 0,
             n_data: 0, n_nak: 0, n_nyet: 0, n_stall: 0, n_xacterr: 0, n_silent: 0,
-            n_other: 0, last_other: 0, nyet_run: 0, xacterr_run: 0, cleared_at: 0, clears: 0,
+            n_other: 0, last_other: 0, nyet_run: 0, xacterr_run: 0, xacterr_since: 0, cleared_at: 0, clears: 0,
             // ~1.5 s. Long enough that a deliberate hold keeps repeating through the initial 600 ms
             // delay and well beyond, short enough that a broken poll path stops within a couple of
             // characters instead of running to the next keypress.
