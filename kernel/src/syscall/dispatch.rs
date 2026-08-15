@@ -512,19 +512,28 @@ fn handle_sleep(cycles: u64) -> i64 {
     #[cfg(target_arch = "arm")]
     {
         let us = scheduler::cycles_to_us(cycles);
-        if us > 0 && us < 10_000 && crate::arch::imp::irq::hires_arm(my_slot as u32, us as u32) {
+        if us > 0 && us < 10_000 {
+            match crate::arch::imp::irq::hires_arm(my_slot as u32, us as u32) {
+                // The delay passed while we were arming it - the wait is already served, so return
+                // rather than block. Blocking here is what made a 125 us sleep take 8 ms: the compare
+                // had nothing left to match, so only the tick backstop could end it.
+                crate::arch::imp::irq::Armed::Elapsed => return 0,
+                crate::arch::imp::irq::Armed::Full => {}   // fall through to the tick path
+                crate::arch::imp::irq::Armed::Pending => {
             // TICK BACKSTOP, always. If the compare interrupt never arrives - unimplemented in an
             // emulator, masked, a match lost to a race - the task must still wake. Blocking with no
             // second path out would turn a timing optimisation into a hang, and a hang in `sleep` is
             // a hang in every service that paces itself. The backstop costs nothing when the one-shot
             // works: the hi-res wake fires first and the deadline is cleared on the way out.
-            let deadline = scheduler::monotonic_ticks()
-                .wrapping_add(scheduler::cycles_to_ticks(cycles).max(1));
-            scheduler::set_wake_deadline(my_slot, deadline);
-            let _ = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
-            scheduler::clear_wake_deadline(my_slot);
-            crate::arch::imp::irq::hires_release(my_slot as u32);
-            return 0;
+                    let deadline = scheduler::monotonic_ticks()
+                        .wrapping_add(scheduler::cycles_to_ticks(cycles).max(1));
+                    scheduler::set_wake_deadline(my_slot, deadline);
+                    let _ = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
+                    scheduler::clear_wake_deadline(my_slot);
+                    crate::arch::imp::irq::hires_release(my_slot as u32);
+                    return 0;
+                }
+            }
         }
     }
 

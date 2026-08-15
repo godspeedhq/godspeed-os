@@ -154,18 +154,46 @@ fn hires_rearm(q: &HiRes) {
     }
 }
 
-/// Register `slot` to wake in `us` microseconds. False if the table is full (caller uses the tick).
-pub fn hires_arm(slot: u32, us: u32) -> bool {
+/// What arming a short sleep concluded.
+pub enum Armed {
+    /// Registered; the caller should block and will be woken by the compare interrupt.
+    Pending,
+    /// The requested time ELAPSED while we were arming it. The caller must NOT block.
+    ///
+    /// This is the whole short-sleep bug. The compare fires on EQUALITY, and every System Timer
+    /// access is an uncached Device read, so programming a 125 us deadline can itself take longer
+    /// than 125 us. The counter is then already past the value written, the match never happens, and
+    /// the task waits out the 10 ms tick backstop instead. Measured on hardware exactly as that
+    /// predicts - 2000 us sleeps land within 28 us, 125 us sleeps average 8160 us.
+    ///
+    /// Returning immediately is not an approximation, it is the correct answer: the caller asked to
+    /// wait 125 us and 125 us has passed.
+    Elapsed,
+    /// No free entry; the caller falls back to the tick, as it did before this existed.
+    Full,
+}
+
+/// Register `slot` to wake in `us` microseconds.
+pub fn hires_arm(slot: u32, us: u32) -> Armed {
     let mut q = HIRES.lock();
     let free = (0..HIRES_MAX).find(|&i| q.slot[i] == u32::MAX);
     let i = match free {
         Some(i) => i,
-        None => return false,
+        None => return Armed::Full,
     };
+    let due = super::timer::systimer_lo().wrapping_add(us.max(1));
     q.slot[i] = slot;
-    q.due[i] = super::timer::systimer_lo().wrapping_add(us.max(1));
+    q.due[i] = due;
     hires_rearm(&q);
-    true
+    // RE-READ AFTER ARMING. Everything above - the lock, the counter read, the compare write - takes
+    // time, and for a short deadline that time can be the whole delay. Checking afterwards catches
+    // precisely the case the hardware cannot: a deadline that went by while we were setting it.
+    if reached(super::timer::systimer_lo(), due) {
+        q.slot[i] = u32::MAX;
+        hires_rearm(&q);
+        return Armed::Elapsed;
+    }
+    Armed::Pending
 }
 
 /// Drop `slot` from the table (on wake, or on any early exit).
