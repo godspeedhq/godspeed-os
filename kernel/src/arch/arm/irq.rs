@@ -154,6 +154,27 @@ fn hires_rearm(q: &HiRes) {
     }
 }
 
+/// Where short sleeps actually GO.
+///
+/// Four hypotheses about one userspace number have now each been wrong, because that number cannot
+/// tell "never took the hi-res path" from "took it and the interrupt never came" from "was woken and
+/// not run". Those are three different bugs with three different fixes and one symptom. These count
+/// them, and the tally prints itself every 16 arms - so the next boot answers the question instead of
+/// narrowing it.
+static HR_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static HR_ELAPSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static HR_FULL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static HR_IRQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static HR_WOKE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn hires_report() {
+    crate::kprintln!(
+        "arm32: hi-res tally - {} armed, {} elapsed-while-arming, {} table-full, {} compare IRQs, {} woken",
+        HR_ARM.load(Ordering::Relaxed), HR_ELAPSED.load(Ordering::Relaxed),
+        HR_FULL.load(Ordering::Relaxed), HR_IRQ.load(Ordering::Relaxed),
+        HR_WOKE.load(Ordering::Relaxed));
+}
+
 /// What arming a short sleep concluded.
 pub enum Armed {
     /// Registered; the caller should block and will be woken by the compare interrupt.
@@ -179,7 +200,7 @@ pub fn hires_arm(slot: u32, us: u32) -> Armed {
     let free = (0..HIRES_MAX).find(|&i| q.slot[i] == u32::MAX);
     let i = match free {
         Some(i) => i,
-        None => return Armed::Full,
+        None => { HR_FULL.fetch_add(1, Ordering::Relaxed); return Armed::Full; }
     };
     let due = super::timer::systimer_lo().wrapping_add(us.max(1));
     q.slot[i] = slot;
@@ -191,8 +212,12 @@ pub fn hires_arm(slot: u32, us: u32) -> Armed {
     if reached(super::timer::systimer_lo(), due) {
         q.slot[i] = u32::MAX;
         hires_rearm(&q);
+        HR_ELAPSED.fetch_add(1, Ordering::Relaxed);
         return Armed::Elapsed;
     }
+    let n = HR_ARM.fetch_add(1, Ordering::Relaxed) + 1;
+    drop(q);                       // never print holding the queue lock
+    if n % 16 == 0 { hires_report(); }
     Armed::Pending
 }
 
@@ -209,6 +234,7 @@ pub fn hires_release(slot: u32) {
 
 /// Wake everything now due, then re-arm for the next. Called from the IRQ handler.
 fn hires_fire() -> bool {
+    HR_IRQ.fetch_add(1, Ordering::Relaxed);
     let mut woken = [u32::MAX; HIRES_MAX];
     {
         let mut q = HIRES.lock();
@@ -227,6 +253,7 @@ fn hires_fire() -> bool {
     for w in woken.iter() {
         if *w != u32::MAX {
             crate::task::scheduler::wake_by_slot(*w as usize, 0);
+            HR_WOKE.fetch_add(1, Ordering::Relaxed);
             any = true;
         }
     }
