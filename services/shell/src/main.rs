@@ -8183,10 +8183,9 @@ fn resolve_or_err<'a>(ctx: &ServiceContext, cwd: &Cwd, input: &str, out: &'a mut
 /// INSTANTLY when the slot was never wired. That reads as "the clock is broken" rather than "we never
 /// looked it up", which is the kind of silence this system forbids.
 fn time_rpc(ctx: &ShellCtx, body: &[u8]) -> Option<Message> {
-    // Bounded, and this one is on the INPUT PATH: `time_source` is called from the shell's main loop
-    // before `console_read`, so an unbounded wait here is a dead prompt with no `q` and no hint -
-    // indistinguishable from a dead machine. The same call sits in front of `reboot`, which would put
-    // the escape hatch behind the hang. 2 s is generous for a service that only reads a counter.
+    // Bounded, and on the INPUT PATH: `time_source` runs in the shell's main loop before
+    // `console_read`, so an unbounded wait here is a dead prompt with no `q` and no hint - and the
+    // same call sits in front of `reboot`, putting the escape hatch behind the hang.
     const TIME_SECS: i64 = 2;
     if let Some(r) = ctx.request_with_reply_deadline("time", &Message::from_bytes(body), TIME_SECS) {
         return Some(r);

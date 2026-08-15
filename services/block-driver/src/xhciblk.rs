@@ -55,18 +55,13 @@ const XHCI: &str = "xhci";
 /// stale. Reacquiring by name re-establishes the same path (§14.3). It is ONE retry, not a loop -
 /// a service that is genuinely gone must surface as a failure rather than as an operation that
 /// never returns.
-/// How long to wait for the USB host service. Bounded because the undeadlined form only wakes on the
-/// peer's DEATH: a host driver that is alive but silent hung this driver forever, and `fs` behind it.
-/// 20 s matches the enumeration budget `sectors()` already allows a stick that is still coming up.
-const RPC_SECS: i64 = 20;
-
 fn rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     let msg = Message::from_bytes(req);
-    if let Some(r) = ctx.request_with_reply_deadline(XHCI, &msg, RPC_SECS) {
+    if let Some(r) = ctx.request_with_reply(XHCI, &msg) {
         return Some(r);
     }
     let _ = ctx.reacquire_by_name(XHCI);
-    ctx.request_with_reply_deadline(XHCI, &msg, RPC_SECS)
+    ctx.request_with_reply(XHCI, &msg)
 }
 
 /// How long to wait for `xhci` to report a capacity - a REAL DURATION, in milliseconds.

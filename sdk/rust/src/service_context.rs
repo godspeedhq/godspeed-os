@@ -705,15 +705,52 @@ impl ServiceContext {
     /// Uses the RTC (not a TSC-cycle deadline) deliberately: a cycle bound is not portable - under
     /// QEMU's TCG the guest TSC races ahead and expires the deadline before the reply arrives, while
     /// the RTC is real wall-clock on both TCG and hardware. Polls `try_recv`, yielding cooperatively.
+    /// **Costs one message-sized stack frame, not two.**
+    ///
+    /// This used to be a thin wrapper over `request_with_reply_deadline_outcome`, and that made it
+    /// unusable on a tight stack: `DeadlineOutcome` CARRIES a `Message`, so the enum is a second
+    /// 4 KiB temporary on top of the `Option<Message>` returned. `fs` already sits near its 256 KiB
+    /// user stack, and switching its block RPC to this wrapper produced an instant data abort at
+    /// startup and an 826-deep restart loop on real hardware - the machine unusable, from a change
+    /// whose whole purpose was to make a hang impossible.
+    ///
+    /// So the wait is written out here instead of borrowed. It is the same loop, minus the enum: a
+    /// caller that does not need to distinguish "the send never left" from "the peer was silent"
+    /// should not pay a message-sized frame for the distinction. Callers that DO need it still have
+    /// `..._outcome`, and should keep an eye on their own stack.
+    #[inline(never)]
     pub fn request_with_reply_deadline(
         &self,
         peer: &str,
         msg:  &crate::ipc::Message,
         max_secs: i64,
     ) -> Option<crate::ipc::Message> {
-        match self.request_with_reply_deadline_outcome(peer, msg, max_secs) {
-            DeadlineOutcome::Reply(m) => Some(m),
-            _ => None,
+        let target = CapHandle(self.find_send_slot(peer)?);
+        let self_grant = self.self_grant_handle()?;
+        let reply_cap = self.derive_cap(self_grant)?;
+        let recv = self.recv_handle()?;
+        if self.send_with_cap_by_handle(target, reply_cap, msg).is_err() {
+            // The send never left, so the embedded cap was not transferred - reclaim it or a storm of
+            // failures leaks the table (§8.5).
+            self.remove_cap(reply_cap);
+            return None;
+        }
+        let t0 = self.epoch_secs_monotonic();
+        loop {
+            if let Some(r) = self.try_recv() {
+                return Some(r);
+            }
+            let now = self.epoch_secs_monotonic();
+            // Guard the clock going BACKWARDS as well as forwards: on hardware whose counter is
+            // unreliable, `now - t0` can read huge and expire the deadline on the first pass.
+            if now >= t0 && now - t0 >= max_secs {
+                // Abandoned: the reply may still arrive later and sit in our queue, which is the
+                // hazard `..._outcome` documents. Reclaim the cap; the caller reports the failure.
+                self.remove_cap(reply_cap);
+                let _ = recv;
+                return None;
+            }
+            self.yield_cpu();
         }
     }
 
