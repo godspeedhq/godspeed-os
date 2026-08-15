@@ -2323,7 +2323,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
 | arch/arm/dtb.rs | 6 | permitted |
-| arch/arm/irq.rs | 16 | permitted |
+| arch/arm/irq.rs | 18 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
@@ -2334,8 +2334,8 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/spawn.rs | 4 | permitted |
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
-| arch/arm/timer.rs | 4 | permitted |
-| arch/arm/mod.rs | 45 | permitted |
+| arch/arm/timer.rs | 7 | permitted |
+| arch/arm/mod.rs | 49 | permitted |
 | arch/loongarch64/mod.rs | 25 | permitted |
 | arch/riscv32/mod.rs | 25 | permitted |
 | arch/riscv64/mod.rs | 25 | permitted |
@@ -3028,3 +3028,30 @@ further progress - which the liveness watchdog correctly turns into a panic.
 This is also why `arch/arm/mod.rs`'s `ioapic::mask_vector` / `unmask_vector` stopped being no-op
 stubs. They were harmless while every device interrupt was serviced inside the kernel; routing one
 outward makes them the thing that holds the line off.
+
+
+## `arch/arm/timer.rs` 4 -> 7, `arch/arm/irq.rs` 16 -> 18, `arch/arm/mod.rs` 45 -> 49: microsecond timer, cross-core doorbell, console TX ring
+
+Three mechanisms, all in `arch/` (a permitted layer, §18.1), every block SAFETY-commented.
+
+**`timer.rs` +3 - the BCM2835 System Timer's compare registers.** `arm_oneshot_us` and
+`arm_oneshot_at` clear the stale match then program compare 3; `take_oneshot_match` reads the status
+register and writes the bit back to clear it. All are volatile MMIO to the Device-mapped System Timer
+block, the same window the existing counter read already uses. Clearing before arming matters and is
+commented: an uncleared match makes a previous fire look like this one.
+
+**`irq.rs` +2 - the cross-core doorbell.** `ring_doorbell` writes one bit to another core's mailbox
+WRITE-SET register, and the dispatcher reads the mailbox and writes the observed bits back to clear
+it. Write-set semantics ignore zeroes, so neither can disturb a bit another sender has set. The core
+index is bounds-checked against the four this SoC has before it becomes an offset.
+
+**`mod.rs` +4 - the console TX ring.** Writers append to a fixed 8 KiB buffer and the timer tick
+pushes bytes into the PL011 FIFO. The unsafe is the ring access (an index masked into a fixed array,
+so always in bounds) and the volatile FIFO reads/writes. The drain stops the moment the FIFO reports
+full, so it cannot spin on a wedged UART, and the panic path's blocking flush keeps the same bounded
+TXFF poll the byte writer already had.
+
+Why these exist: a serial write inside an un-preemptible syscall stalled its core for ~9 ms, the
+cross-core wake did nothing at all (so every IPC hop cost up to a 10 ms tick), and the kernel had no
+clock able to name the 125 us microframe the USB driver must hit. Each is measured in the commit
+history rather than asserted.
