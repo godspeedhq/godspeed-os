@@ -339,26 +339,36 @@ pub fn poll(
         // far beyond any legitimate busy TT, so a healthy device is never disturbed. And the recovery
         // is bounded - clear it, reset the run, and if it wedges again the next second clears it
         // again, which is a loud repeating log line rather than a silently dead keyboard.
-        // EIGHT, not a hundred.
+        // EIGHT, deliberately eager - because THIS rung is cheap and it is what the operator feels.
         //
-        // A hundred consecutive NYETs is ~1 s at the 10 ms poll period, and that second was the bulk
-        // of a stutter the user could feel. The threshold was set generously because a NYET is
-        // ordinary - the translator saying "not finished yet" - but that ordinary case is retried
-        // INSIDE `periodic_split_in` and never reaches here. What reaches here is a poll that already
-        // exhausted its complete-split budget, so a short run of them is not impatience, it is the
-        // translator having failed to finish six times running across eight separate polls.
+        // The two remedies have very different costs and deserve opposite postures, which the first
+        // attempt got wrong by treating them the same:
+        //   - a TT clear is ONE control transfer to the hub, a few milliseconds, and it cannot harm a
+        //     healthy device (it flushes a buffer holding something nobody wants). Firing it early is
+        //     what turns a wedge into a hiccup the user barely notices - measured on hardware as "a
+        //     few ms, noticeable but recovered".
+        //   - a port RE-ENUMERATION costs 0.31 s and resets the device. Firing that early made 394
+        //     recovery cycles in one idle session, each reset stranding the transaction that caused
+        //     the next - a loop the driver drove itself.
+        // So: eager here, conservative there, and the expensive rung is bounded separately.
         //
-        // The clear itself is one control transfer to the hub, a few milliseconds, and it cannot harm
-        // a healthy device: it flushes a buffer that, by then, is holding nothing anyone wants.
+        // The log for this is rate-limited rather than the action: an operator needs to know it is
+        // happening and how often, not to receive a line every time.
         const NYET_WEDGED: u32 = 8;
         if state.nyet_run >= NYET_WEDGED {
             state.nyet_run = 0;
             let hub_port = (splt & 0x7F) as u8;
             let hub_addr = ((splt >> 7) & 0x7F) as u8;
             let hub = Target { addr: hub_addr, mps: 64, low_speed: false };
-            ctx.log_fmt(format_args!(
-                "dwc2-svc: keyboard TT wedged - {} consecutive NYET, no data; clearing the hub's TT buffer",
-                NYET_WEDGED));
+            // Say it the first time and then every 50th. Silencing it would hide a device degrading;
+            // printing all 388 of them buried every other line in the console, which is its own kind
+            // of blindness.
+            state.clears = state.clears.wrapping_add(1);
+            if state.clears == 1 || state.clears % 50 == 0 {
+                ctx.log_fmt(format_args!(
+                    "dwc2-svc: keyboard TT wedged ({} consecutive NYET) - cleared the hub's TT buffer [{} so far]",
+                    NYET_WEDGED, state.clears));
+            }
             let _ = crate::hub::clear_tt_buffer(
                 ctx, mmio, dma, &hub, t.addr, kbd.ep, 3 /* interrupt */, true /* IN */, hub_port);
             state.cleared_at = ctx.read_tsc();
@@ -482,6 +492,8 @@ pub struct KeyState {
     /// itself is in trouble, and waiting out the full cold-start error budget after that is three
     /// seconds spent proving something already known.
     pub cleared_at: u64,
+    /// How many TT clears this binding has needed. Rate-limits the log without muting the remedy.
+    pub clears: u32,
 }
 
 impl KeyState {
@@ -499,7 +511,7 @@ impl KeyState {
             emitted_report: 0,
             last_data: 0,
             n_data: 0, n_nak: 0, n_nyet: 0, n_stall: 0, n_xacterr: 0, n_silent: 0,
-            n_other: 0, last_other: 0, nyet_run: 0, xacterr_run: 0, cleared_at: 0,
+            n_other: 0, last_other: 0, nyet_run: 0, xacterr_run: 0, cleared_at: 0, clears: 0,
             // ~1.5 s. Long enough that a deliberate hold keeps repeating through the initial 600 ms
             // delay and well beyond, short enough that a broken poll path stops within a couple of
             // characters instead of running to the next keypress.

@@ -138,9 +138,13 @@ pub fn clear_tt_buffer(
     ];
     let mut none: [u8; 0] = [];
     let ok = chan::control(ctx, mmio, dma, hub, &setup, &mut none, false, 0);
-    ctx.log_fmt(format_args!(
-        "dwc2-svc: Clear_TT_Buffer for addr {} ep {} on hub port {} - {}",
-        dev_addr, ep, port, if ok { "accepted" } else { "REFUSED (the TT stays wedged)" }));
+    // Only a REFUSAL is worth a line every time. An accepted clear is the normal, healthy outcome
+    // of an eager remedy that may fire often; its caller already reports a running count.
+    if !ok {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: Clear_TT_Buffer for addr {} ep {} on hub port {} REFUSED - the TT stays wedged",
+            dev_addr, ep, port));
+    }
     ok
 }
 

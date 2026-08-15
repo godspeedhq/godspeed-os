@@ -327,6 +327,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // where a keyboard poll that slips a period costs nothing a human can perceive.
     if let (Some(m), Some(d)) = (ctx.mmio(), ctx.dma_region()) {
         let mut state = hid::KeyState::new(&ctx);
+        // Consecutive recoveries with no healthy polling in between, and whether we have already
+        // announced giving up. Both reset the moment the keyboard actually works again.
+        let mut recoveries_in_a_row = 0u32;
+        let mut recovery_gave_up = false;
         let mut reports: u64 = 0;
         let mut last_beat = ctx.read_tsc();
         // The interval the DEVICE asked for, floored to something a service can actually schedule.
@@ -423,10 +427,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // low-speed device behind a translator must never trigger a port reset.
             let recently_cleared = state.cleared_at != 0
                 && ctx.read_tsc().wrapping_sub(state.cleared_at) < ctx.duration_cycles(2000);
-            // 10 after a failed clear (~100 ms), not 30. Once a clear has been issued and data has
-            // still not resumed, every further poll is only re-confirming a conclusion already
-            // reached, and the repair that follows takes 0.31 s. Cold, the budget stays generous.
-            let stuck_at = if recently_cleared { 10 } else { 300 };
+            // 30 after a failed clear, not 10. Ten was part of the same regression: paired with a
+            // NYET threshold below the noise floor it turned every ordinary error run into a port
+            // reset, 394 times over. Thirty (~300 ms) still shortens the pause materially against the
+            // cold 300, without treating routine XACTERR noise on a low-speed device behind a
+            // translator as a stuck endpoint.
+            let stuck_at = if recently_cleared { 30 } else { 300 };
             if state.xacterr_run >= stuck_at {
                 state.xacterr_run = 0;
                 let hub_port = (*ksplt & 0x7F) as u8;
@@ -438,6 +444,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     hub_port));
                 state.cleared_at = 0;
                 let mut addr = kt.addr; // re-assign the address it already had
+                // A RECOVERY THAT RUNS IN A LOOP IS NOT A RECOVERY.
+                //
+                // 394 re-enumerations in one session, with nobody typing, flooded the console and
+                // never let the device settle - each port reset stranding the transaction that
+                // triggered the next cycle. Bound it (§26.6): a few attempts close together means the
+                // fault is not the kind this repairs, so stop, say so ONCE, and leave the keyboard
+                // dead rather than thrash. Any successful poll clears the streak, so a device that is
+                // genuinely recovering is never cut off.
+                const RECOVERY_BURST_MAX: u32 = 4;
+                if recoveries_in_a_row >= RECOVERY_BURST_MAX {
+                    if !recovery_gave_up {
+                        recovery_gave_up = true;
+                        ctx.log_fmt(format_args!(
+                            "dwc2-svc: keyboard re-enumerated {} times without settling - GIVING UP on it.                              Input is dead until the device is replugged or this service restarts;                              storage and networking are unaffected.", recoveries_in_a_row));
+                    }
+                    continue;
+                }
+                recoveries_in_a_row += 1;
                 match hub::enumerate_downstream(&ctx, &m, &d, &hub_t, hub_port, &mut addr) {
                     Some((_, _, _, ndt, nsplt)) => match hid::bind(&ctx, &m, &d, &ndt, nsplt) {
                         Some(nk) => {
@@ -452,6 +476,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 continue;
             }
             if hid::poll(&ctx, &m, &d, kt, *ksplt, k, &mut state) {
+                // A real report is proof the endpoint is healthy: the streak starts over.
+                recoveries_in_a_row = 0;
+                recovery_gave_up = false;
                 reports = reports.wrapping_add(1);
                 if reports == 1 {
                     ctx.log("dwc2-svc: *** FIRST KEY REPORT FROM USERSPACE *** - type and it reaches the console");
