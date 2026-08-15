@@ -357,5 +357,12 @@ pub extern "C" fn ap_main(core_id: u32) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     kprintln!("KERNEL PANIC: {}", info);
+    // FLUSH THE CONSOLE RING BEFORE HALTING. Console writes are queued and drained by the timer tick
+    // (arm32), and after this function no tick will ever run again - so without an explicit flush the
+    // panic message, the single most important output the kernel ever produces, would sit in a buffer
+    // and never reach the wire. Blocking is correct here and nowhere else: there is nothing left to
+    // starve.
+    #[cfg(target_arch = "arm")]
+    arch::imp::tx_ring_flush_blocking();
     arch::imp::halt_all_cores();
 }

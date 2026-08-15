@@ -64,6 +64,106 @@ const PL011_LCRH:      *mut u32 = (PL011_BASE + 0x2C) as *mut u32;     // +0x2C 
 const PL011_CR:        *mut u32 = (PL011_BASE + 0x30) as *mut u32;     // +0x30 control
 const PL011_ECR:       *mut u32 = (PL011_BASE + 0x04) as *mut u32;     // +0x04 error clear
 const PL011_FR_TXFF:   u32 = 1 << 5;                                   // transmit FIFO full
+
+// ---- Console TX ring ------------------------------------------------------------------------------
+//
+// Writing to the UART inside a syscall is what stalls a core for ~9 ms per log line, and this port
+// cannot preempt that syscall (preempting SVC corrupts the banked SPSR/sp). So writers APPEND here and
+// return; the timer tick drains whatever the FIFO will take without waiting.
+//
+// 8 KiB, fixed: about 0.7 s of output at 115200, which covers any realistic burst, and a hard ceiling
+// readable straight off the source (§26.6.1). No allocation, no growth.
+const TX_RING_LEN: usize = 8192;
+static mut TX_RING: [u8; TX_RING_LEN] = [0; TX_RING_LEN];
+/// Producer index (bytes ever queued) and consumer index (bytes ever sent). Both free-running; the
+/// occupancy is their difference, so neither needs clamping and the wrap is arithmetic, not a branch.
+static TX_HEAD: AtomicU32 = AtomicU32::new(0);
+static TX_TAIL: AtomicU32 = AtomicU32::new(0);
+/// Bytes dropped because the ring was full. Reported rather than silently swallowed (invariant 12) -
+/// losing console output is exactly the kind of thing that must not happen quietly.
+static TX_DROPPED: AtomicU32 = AtomicU32::new(0);
+/// Until the tick is running there is nobody to drain the ring, so writes must go out synchronously.
+/// Boot output therefore behaves exactly as it always has, which also keeps a panic before the first
+/// tick readable.
+static TX_RING_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Start using the ring. Called once the timer tick is running and can drain it.
+pub fn tx_ring_enable() {
+    TX_RING_LIVE.store(true, Ordering::Release);
+}
+
+/// Queue one byte. False if the ring is full (the caller then blocks, so output is never lost
+/// silently - a dropped byte is counted and reported instead).
+fn tx_push(b: u8) -> bool {
+    let head = TX_HEAD.load(Ordering::Relaxed);
+    let tail = TX_TAIL.load(Ordering::Acquire);
+    if head.wrapping_sub(tail) as usize >= TX_RING_LEN {
+        return false;
+    }
+    // SAFETY: single logical producer region, serialised by the same best-effort serial flag that
+    // already orders every write to this UART. The index is masked into the array, so the write is
+    // always in bounds.
+    unsafe {
+        let p = core::ptr::addr_of_mut!(TX_RING) as *mut u8;
+        p.add((head as usize) & (TX_RING_LEN - 1)).write_volatile(b);
+    }
+    TX_HEAD.store(head.wrapping_add(1), Ordering::Release);
+    true
+}
+
+/// Push as many queued bytes into the TX FIFO as it will take WITHOUT WAITING. Called from the timer
+/// tick; returns having done a bounded amount of work, never blocking on the UART.
+pub fn tx_ring_drain() {
+    // SAFETY: PL011 flag and data registers, Device-mapped. Reads/writes are volatile MMIO, and the
+    // loop stops the moment the FIFO reports full - so this can never spin on a wedged UART.
+    unsafe {
+        let mut n = 0u32;
+        loop {
+            let head = TX_HEAD.load(Ordering::Acquire);
+            let tail = TX_TAIL.load(Ordering::Relaxed);
+            if head == tail {
+                return;                        // nothing queued
+            }
+            if PL011_FR.read_volatile() & PL011_FR_TXFF != 0 {
+                return;                        // FIFO full - leave the rest for the next tick
+            }
+            let p = core::ptr::addr_of!(TX_RING) as *const u8;
+            let b = p.add((tail as usize) & (TX_RING_LEN - 1)).read_volatile();
+            PL011_DR.write_volatile(b as u32);
+            TX_TAIL.store(tail.wrapping_add(1), Ordering::Release);
+            // A bound on work per tick, so a service logging in a tight loop cannot turn the tick
+            // itself into the stall this exists to remove.
+            n += 1;
+            if n >= 64 {
+                return;
+            }
+        }
+    }
+}
+
+/// Drain everything, BLOCKING. For the panic path only: a panic message must reach the wire even
+/// though no tick will ever run again.
+pub fn tx_ring_flush_blocking() {
+    // SAFETY: as above, plus the bounded TXFF poll `pl011_write_byte` already uses.
+    unsafe {
+        while TX_HEAD.load(Ordering::Acquire) != TX_TAIL.load(Ordering::Relaxed) {
+            let tail = TX_TAIL.load(Ordering::Relaxed);
+            let mut t: u32 = 0;
+            while PL011_FR.read_volatile() & PL011_FR_TXFF != 0 {
+                t += 1;
+                if t > 1_000_000 { return; }   // wedged UART: give up rather than hang the panic
+            }
+            let p = core::ptr::addr_of!(TX_RING) as *const u8;
+            PL011_DR.write_volatile(p.add((tail as usize) & (TX_RING_LEN - 1)).read_volatile() as u32);
+            TX_TAIL.store(tail.wrapping_add(1), Ordering::Release);
+        }
+    }
+}
+
+/// Bytes lost to a full ring, for reporting.
+pub fn tx_dropped() -> u32 {
+    TX_DROPPED.load(Ordering::Relaxed)
+}
 const PL011_FR_BUSY:   u32 = 1 << 3;                                   // transmitting
 /// Error flags the PL011 returns **in the data register itself**, alongside the byte: framing (8),
 /// parity (9), break (10), overrun (11). A byte arriving with any of these is line noise, not data.
@@ -562,6 +662,17 @@ fn ipi_selftest() {
 /// baud/line setup is needed for this milestone. We poll TXFF rather than writing blind, or a burst
 /// longer than the 16-byte FIFO would silently drop characters.
 pub(super) fn pl011_write_byte(b: u8) {
+    // QUEUE IT, once there is a tick to drain it. This is the change that stops a log line holding
+    // its core: the writer returns immediately instead of waiting ~87 us per byte for the FIFO.
+    //
+    // A full ring falls through to the blocking path below rather than dropping the line. Output that
+    // vanishes silently is worse than output that is slow, and the counter says when it happens.
+    if TX_RING_LIVE.load(Ordering::Acquire) {
+        if tx_push(b) {
+            return;
+        }
+        TX_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
     // SAFETY: PL011_FR/PL011_DR are the BCM2836 UART0 flag and data registers, identity-mapped with
     // the MMU off. Volatile MMIO: poll until the TX FIFO has room, then write one byte to transmit.
     unsafe {

@@ -549,6 +549,12 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
         if source & IRQ_PHYS_TIMER != 0 {
             set_tval(RELOAD.load(Ordering::Relaxed));
             TICKS.fetch_add(1, Ordering::Relaxed);
+            // DRAIN THE CONSOLE HERE. Bounded and non-blocking: it pushes what the TX FIFO will take
+            // and returns, so the tick never becomes the stall it exists to remove. Core 0 only -
+            // one UART, one drainer, no coordination needed.
+            if this_core() == 0 {
+                super::tx_ring_drain();
+            }
         }
 
         // Hands-off chaos demo: Core 0 counts ticks and, once boot has settled, injects the storm
@@ -639,6 +645,10 @@ pub fn start_tick(hz: u32) -> bool {
     // Enabled here, beside the timer routing, because both answer "what may interrupt this core" and
     // splitting them is how one of them ends up forgotten.
     local_write(CORE_MBOX_IRQCNTL + 4 * this_core(), 1);
+    // From here the tick can drain the console ring, so writers may stop blocking on the UART.
+    if this_core() == 0 {
+        super::tx_ring_enable();
+    }
     // And the system timer's compare-3 line, which carries the microsecond one-shot through the GPU
     // funnel to core 0. Enabled HERE, in the path that actually runs at boot - it was first put in
     // `route_usb_irq_to_core0`, which turns out to have no callers, so it silently never happened and
@@ -668,6 +678,10 @@ pub fn start_tick_ap(_core: u32) -> bool {
     // Enabled here, beside the timer routing, because both answer "what may interrupt this core" and
     // splitting them is how one of them ends up forgotten.
     local_write(CORE_MBOX_IRQCNTL + 4 * this_core(), 1);
+    // From here the tick can drain the console ring, so writers may stop blocking on the UART.
+    if this_core() == 0 {
+        super::tx_ring_enable();
+    }
     // And the system timer's compare-3 line, which carries the microsecond one-shot through the GPU
     // funnel to core 0. Enabled HERE, in the path that actually runs at boot - it was first put in
     // `route_usb_irq_to_core0`, which turns out to have no callers, so it silently never happened and
