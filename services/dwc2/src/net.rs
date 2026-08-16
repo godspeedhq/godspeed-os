@@ -654,16 +654,54 @@ pub fn tx(
     for i in 0..n {
         dma.write8(TX_OFF + 8 + i, frame[i]);
     }
-    // No ZLP needed: the smsc95xx carries an explicit length in its TX command, so it does not rely on
-    // a short packet to find the frame boundary the way CDC-ECM does.
+    // A ZLP IS NEEDED. The comment here used to say it was not - "the smsc95xx carries an explicit
+    // length in its TX command, so it does not rely on a short packet to find the frame boundary the
+    // way CDC-ECM does" - and Linux says otherwise in one line:
+    //
+    //     .flags = FLAG_ETHER | FLAG_SEND_ZLP | FLAG_LINK_INTR,     (smsc95xx.c)
+    //
+    // which usbnet acts on:
+    //
+    //     if (length % dev->maxpacket == 0) {
+    //         if (!(info->flags & FLAG_SEND_ZLP)) { length++; }     // pad instead
+    //         else urb->transfer_flags |= URB_ZERO_PACKET;          // <- this device
+    //     }
+    //
+    // A bulk transfer whose length is an exact multiple of the endpoint's max packet size ends on a
+    // FULL packet, and a full packet means "more to come". Without a terminating zero-length packet
+    // the device keeps its receive buffer open for the rest of a frame that never arrives, and every
+    // subsequent OUT is NAKed because that buffer is full. Permanently.
+    //
+    // That is the whole fault: transmit worked for hundreds of frames and then died forever, at a
+    // different count each boot, because it takes one frame whose total length happens to land on a
+    // 512-byte boundary. With 8 bytes of TX command that is a payload of 504, 1016, ... - ordinary
+    // sizes that ordinary traffic reaches sooner or later. It also explains why every host-side
+    // remedy failed: the full buffer is the DEVICE's, so flushing our FIFO, resetting our channel and
+    // pinging all correctly reported a device with no room.
     // ASK WHY. This was `None`, so a failing transmit was counted and never explained - and "the
     // device NAKs every frame" and "the transfer never halted" are different faults needing different
     // fixes. The receive path has recorded this from the start; the transmit path guessed.
     let mut why = (0u32, 0u32);
     let mut ping = nic.ping_out;
+    let total = (n + 8) as u32;
     let ok = bulk(ctx, mmio, t, nic.mps, false, nic.ep_out, dma.phys_at(TX_OFF) as u32,
-                  (n + 8) as u32, TX_BUDGET_MS, &mut nic.pid_out, Some(&mut why),
+                  total, TX_BUDGET_MS, &mut nic.pid_out, Some(&mut why),
                   Some(&mut ping)).is_some();
+    // Terminate an exact-multiple transfer with a zero-length packet, per FLAG_SEND_ZLP above. It is
+    // a normal OUT of length 0 on the same endpoint, so it advances the data toggle like any other
+    // packet - which the toggle readback in `bulk` already handles.
+    let ok = if ok && nic.mps != 0 && total % (nic.mps as u32) == 0 {
+        let zlp = bulk(ctx, mmio, t, nic.mps, false, nic.ep_out, dma.phys_at(TX_OFF) as u32,
+                       0, TX_BUDGET_MS, &mut nic.pid_out, Some(&mut why), Some(&mut ping));
+        if zlp.is_none() {
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: ZLP after a {}-byte transfer FAILED - the device may hold its buffer open",
+                total));
+        }
+        zlp.is_some()
+    } else {
+        ok
+    };
     nic.ping_out = ping;
     if ok {
         nic.stats.tx_ok += 1;
