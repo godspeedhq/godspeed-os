@@ -3171,7 +3171,16 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
         }
         if t == 0 { 1 } else { t }   // never 0: a zero tag can only be an untagged sender
     };
-    let mut tagged = [0u8; 4096];
+    // 528, NOT 4096. The largest block request is OP_WRITE_BLOCK - [op, lba(8), data(512)] = 521
+    // bytes - so a full message frame here is 3.5 KiB of stack for nothing.
+    //
+    // That "for nothing" cost a boot: `fs` runs near its 256 KiB stack, and a 4 KiB temporary here
+    // took it over. Instant data abort at startup (addr just above SP_usr) and a restart loop, which
+    // is precisely the failure the comment ten lines above this one already describes from the last
+    // time a 4 KiB temporary was added to this function. I read that comment, edited the code under
+    // it, and made the same mistake anyway.
+    const MAX_BLOCK_REQ: usize = 528;
+    let mut tagged = [0u8; MAX_BLOCK_REQ];
     tagged[0] = tag;
     let n = req.len().min(tagged.len() - 1);
     tagged[1..1 + n].copy_from_slice(&req[..n]);
