@@ -469,20 +469,27 @@ pub fn periodic_split_in(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target,
     ch: u32, pid: u32, buf_phys: u32, len: u32, ep: u32, splt: u32,
 ) -> u32 {
-    // START WHERE WE ARE, rather than spinning to reach a chosen microframe.
+    // SYNCHRONISE TO A MICROFRAME BOUNDARY before the start-split.
     //
-    // The old code waited for the next microframe before every start-split - up to 125 us of spinning
-    // per poll, every 10 ms, for no benefit: the core schedules a periodic channel itself, and the only
-    // position that actually matters is microframe 6, where the complete-splits would straddle the
-    // frame boundary and the translator's per-frame pipeline. So skip only that one, and only by the
-    // single microframe needed to leave it.
-    let mut f0 = uframe_now(mmio);
+    // I removed this wait once, calling it 125 us of pointless spinning, and the keyboard then failed
+    // on EVERY boot instead of only under load. The wait is not waste: a start-split has to occupy a
+    // microframe, and programming one partway through leaves the core to defer or truncate it. This
+    // is the synchronisation that makes the transaction well-formed, and it was the one part of the
+    // original scheduling that was right.
+    //
+    // What WAS wrong is how it was expressed: a 3-bit microframe number recurs every millisecond, so a
+    // preempted task could not tell "the microframe I wanted" from "the same number, a frame later",
+    // and the old helper returned silently on timeout so lateness looked like success. The target is
+    // absolute now, and failing to reach it skips this poll rather than proceeding as if it had.
+    //
+    // Microframe 6 is skipped because its complete-splits would straddle the frame boundary and the
+    // translator's per-frame pipeline.
+    let mut f0 = (uframe_now(mmio) + 1) & 0x3FFF;
     if f0 & 0x7 == 6 {
-        // One microframe, bounded. Polls land on the same position each time (10 ms is exactly 80
-        // microframes), so simply returning here would mean never polling at all - the aliasing has to
-        // be broken rather than avoided.
-        let _ = wait_uframe_abs(ctx, mmio, (f0 + 1) & 0x3FFF);
-        f0 = uframe_now(mmio);
+        f0 = (f0 + 1) & 0x3FFF;
+    }
+    if let Uframe::Missed = wait_uframe_abs(ctx, mmio, f0) {
+        return 0;   // could not reach the boundary - skip this poll rather than send a malformed split
     }
     program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt); // ep_type 3 = interrupt
     let ss = match wait_halt(ctx, mmio, ch, 5) {
