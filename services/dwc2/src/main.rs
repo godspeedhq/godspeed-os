@@ -81,6 +81,26 @@ const REARM_MS: u64 = 1_000;
 /// The net path in `dispatch` already got this right ("a net request with no NIC bound is answered,
 /// not ignored"). This is the same rule for storage: a missing dependency must RETURN, loudly, never
 /// hang. A short/failed reply is exactly what `sectors_now` treats as "no disk", which is the truth.
+/// Tell the OPERATOR, not just the log.
+///
+/// Plugging something in is a physical act with an expectation attached: the person did it, and is
+/// looking at the screen. `ctx.log` reaches the kernel log and the serial line - which is where every
+/// hot-plug event went on the first attempt, so the driver detected and rebound the device perfectly
+/// and the user saw nothing at all.
+///
+/// This writes OUTPUT to the console, which is not the mechanism that caused trouble before: that was
+/// `console_push`, which injects into the INPUT ring and made the shell reprint its prompt on every
+/// keyboard re-bind. Writing a line does not disturb the shell's input at all.
+///
+/// Leading newline so the line starts clean rather than merging into a half-typed command, and short
+/// enough to stay inside the 256-byte console write limit. Still logged as well - the serial capture
+/// is the record, the console is the notification.
+fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
+    ctx.log_fmt(args);
+    ctx.console_write("\r\n");
+    ctx.console_writeln_fmt(args);
+}
+
 fn answer_no_disk(ctx: &ServiceContext, capless: &mut bool) {
     match ctx.take_pending_cap() {
         Some(reply) => {
@@ -543,7 +563,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 hub::enumerate_downstream(&ctx, &m, &d, &ht, port, &mut next_addr)
                             {
                                 if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {
-                                    ctx.log_fmt(format_args!("dwc2-svc: port {} - keyboard ready", port));
+                                    notify(&ctx, format_args!("usb: keyboard connected (port {}) - ready", port));
                                     kbd_port = port;
                                     state = hid::KeyState::new(&ctx);
                                     kbd = Some((k, dt, dsplt));
@@ -554,12 +574,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                     let sectors = msc::read_capacity(&ctx, &m, &d, &dt, &mut dk)
                                         .map(|(s, _)| s)
                                         .unwrap_or(0);
-                                    ctx.log_fmt(format_args!(
-                                        "dwc2-svc: port {} - disk ready ({} sectors)", port, sectors));
+                                    notify(&ctx, format_args!(
+                                        "usb: storage connected (port {}) - {} MiB",
+                                        port, sectors.saturating_mul(512) / (1024 * 1024)));
                                     disk_port = port;
                                     disk = Some((dk, dt, sectors));
                                 } else if let Some(n) = net::bind(&ctx, &m, &d, &dt) {
-                                    ctx.log_fmt(format_args!("dwc2-svc: port {} - NIC ready", port));
+                                    notify(&ctx, format_args!("usb: network adapter connected (port {})", port));
                                     nic_port = port;
                                     nic = Some((n, dt));
                                 } else {
@@ -577,15 +598,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             ctx.log_fmt(format_args!("dwc2-svc: port {} - device REMOVED", port));
                             if kbd.is_some() && kbd_port == port {
                                 kbd = None;
-                                ctx.log("dwc2-svc: keyboard unplugged - input is dead until one is plugged back in");
+                                notify(&ctx, format_args!(
+                                    "usb: keyboard removed (port {}) - use serial until one is plugged in", port));
                             }
                             if disk.is_some() && disk_port == port {
                                 disk = None;
-                                ctx.log("dwc2-svc: disk unplugged - block requests will be answered 'no disk'");
+                                notify(&ctx, format_args!(
+                                    "usb: storage removed (port {}) - drives will report no disk", port));
                             }
                             if nic.is_some() && nic_port == port {
                                 nic = None;
-                                ctx.log("dwc2-svc: NIC unplugged - frame requests will be answered empty");
+                                notify(&ctx, format_args!(
+                                    "usb: network adapter removed (port {})", port));
                             }
                         }
                     }
