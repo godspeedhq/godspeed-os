@@ -82,6 +82,22 @@ pub struct Nic {
 /// How long a cached link answer is trusted before it is read again.
 const LINK_TTL_MS: u64 = 500;
 
+/// How long one frame is given to leave the host.
+///
+/// This was 2000 ms, chosen by nobody for no recorded reason, and it is what takes this service off
+/// the air. Do the arithmetic the number never had: a 1522-byte frame is three 512-byte packets on a
+/// 480 Mbit bus, about 25 us of wire time. A high-speed microframe is 125 us. Fifty milliseconds is
+/// four hundred microframes - if the device has not accepted the frame by then it is not going to,
+/// and the previous budget spent a further 1.95 SECONDS establishing that, per frame, on the one
+/// thread that also polls the keyboard.
+///
+/// The failure this produces is identical to the failure at 2 s; it simply arrives 40x sooner. That
+/// distinction is the entire fix: nothing downstream learns less, and the driver stays answerable.
+/// Guarding only the link-down case was too narrow - hardware then showed the same storm with the
+/// link genuinely UP (BMSR 0x782d), because a transmit can fail for reasons that have nothing to do
+/// with the cable. What must be bounded is the COST of failing, not one of its causes.
+const TX_BUDGET_MS: u64 = 50;
+
 fn hex_val(c: u8) -> u8 {
     match c {
         b'0'..=b'9' => c - b'0',
@@ -535,7 +551,7 @@ pub fn tx(
     // No ZLP needed: the smsc95xx carries an explicit length in its TX command, so it does not rely on
     // a short packet to find the frame boundary the way CDC-ECM does.
     let ok = bulk(ctx, mmio, t, nic.mps, false, nic.ep_out, dma.phys_at(TX_OFF) as u32,
-                  (n + 8) as u32, 2_000, &mut nic.pid_out, None).is_some();
+                  (n + 8) as u32, TX_BUDGET_MS, &mut nic.pid_out, None).is_some();
     if ok { nic.stats.tx_ok += 1; } else { nic.stats.tx_fail += 1; }
     ok
 }

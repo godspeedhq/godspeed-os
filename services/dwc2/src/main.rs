@@ -44,6 +44,18 @@ const HEARTBEAT_MS: u64 = 15_000;
 /// fast as we dequeue would otherwise keep this loop running forever.
 const MSG_DRAIN_MAX: u32 = 256;
 
+/// How long one serve pass may hold the thread before the keyboard is polled again.
+///
+/// This service is single-threaded: it serves block and frame IPC, and it polls the keyboard's
+/// interrupt endpoint, on the same pass. Whatever the serving half spends, the keyboard waits.
+/// Hardware showed the extreme of that - a storm of slowly-failing transmits held the thread for
+/// ninety seconds, the keyboard went dead, `q` never reached the shell, and no heartbeat was printed
+/// because a heartbeat only happens on an idle pass, so the busiest service looked like the deadest.
+///
+/// 20 ms is two keyboard poll intervals: late enough to be worth serving a batch, short enough that
+/// a missed report is the worst case rather than a dead input path.
+const PASS_BUDGET_MS: u64 = 20;
+
 /// How long to wait before re-arming the USB line after an interrupt.
 ///
 /// The skeleton cannot clear the device condition, so the line is still asserted when it unmasks and
@@ -433,7 +445,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             if let Some((dk, dt, sectors)) = disk.as_mut() {
                 let mut drained = 0u32;
-                while let Some(msg) = ctx.try_recv() {
+                // TIME-BOUND THE DRAIN, not just its length - and test it BEFORE taking a message.
+                //
+                // The keyboard is polled once per pass, after this loop, and its endpoint has a 10 ms
+                // interval, so however long this loop runs is how late the next keystroke is
+                // collected. A COUNT cannot bound that: sixteen queued requests are trivial when each
+                // is a sector read and catastrophic when each is a transmit that fails slowly, which
+                // is exactly what a NIC with a stuck receive path produces.
+                //
+                // The check sits here, not after `try_recv`, and the difference matters. `try_recv`
+                // CONSUMES: a budget tested after it would leave a taken request that must be answered
+                // with an error, which would report "this failed" about a request that was merely
+                // unlucky in its timing - and for a NET request it is not even the right shape of
+                // reply. Declining to TAKE work leaves it in the endpoint queue for the next pass,
+                // which is the only version of "pick it up later" that is true.
+                //
+                // What this cannot bound alone is a SINGLE slow operation, which is why the transmit
+                // budget was cut to match. The two together bound the pass.
+                while ctx.read_tsc().wrapping_sub(t_pass) <= ctx.duration_cycles(PASS_BUDGET_MS) {
+                    let msg = match ctx.try_recv() {
+                        Some(m) => m,
+                        None => break,
+                    };
                     drained += 1;
                     if drained >= MSG_DRAIN_MAX {
                         // ANSWER THIS ONE BEFORE BREAKING. `try_recv` above already CONSUMED it, so
