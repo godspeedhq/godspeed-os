@@ -1055,6 +1055,9 @@ pub fn hardware_reset() -> ! {
     // as "reboot does nothing". Every bare-metal Pi reset does this; Linux gets away without it only
     // because its own power-off path is what would have set the field.
     const PM_RSTS_PARTITION: u32 = 0xffff_faaa;
+    /// Watchdog countdown in PM ticks (~15 us each). Ten is what every bare-metal Pi reset uses; the
+    /// value never mattered here, because the old loop restarted the count before it could elapse.
+    const WDOG_TICKS: u32 = 10;
     // SAFETY: PM_RSTS/PM_WDOG/PM_RSTC are the BCM2835 power-management registers, in the already
     // Device-mapped peripheral window; volatile 32-bit writes gated by the 0x5A password - the documented
     // reset poke.
@@ -1066,22 +1069,47 @@ pub fn hardware_reset() -> ! {
         let rsts_val = PM_PASSWORD | (rsts.read_volatile() & !PM_RSTS_PARTITION);
         rsts.write_volatile(rsts_val);
         let rstc_val = PM_PASSWORD | (rstc.read_volatile() & PM_RSTC_WRCFG_CLR) | PM_RSTC_WRCFG_FULL_RESET;
-        // The watchdog resets the SoC in ~10 ticks. RE-ISSUE the poke every iteration so a write that did
-        // not take (a briefly-unready PM block) is retried, rather than a bare spin waiting forever on one
-        // failed poke (kernel-audit Audit 6, N1).
+        // POKE ONCE, THEN LET THE WATCHDOG RUN OUT.
         //
-        // BOUNDED, because "this never returns" is an assumption about hardware and assumptions are what
-        // invariant 12 exists for. If the SoC has not reset after a generous window, the reset did NOT
-        // work, and the operator staring at `rebooting...` deserves to be told that rather than left to
-        // guess whether to wait or pull the plug. Then keep poking - a late reset is still a reset.
+        // This re-issued the poke on EVERY loop iteration, to retry a write that might not have taken
+        // (kernel-audit Audit 6, N1). The intent was sound and the effect was its opposite: PM_WDOG is a
+        // COUNTDOWN, and writing it RESTARTS it. Ten ticks is about 150 us; a tight spin makes millions
+        // of passes in that time, so the counter was slammed back to 10 long before it could reach 0.
+        // The hardening kept petting the dog it was waiting on to bite - so the board never reset and
+        // `reboot` had to be finished by pulling the power. Hardware said so exactly:
+        //
+        //   rebooting...
+        //   reboot: hardware reset
+        //   reset: the SoC did NOT reset - the watchdog poke had no effect.
+        //
+        // Arm it once and wait. The retry the audit asked for is still here, but at a cadence LONGER
+        // than the timeout it drives - a retry that outruns its own mechanism is not a retry.
+        wdog.write_volatile(PM_PASSWORD | WDOG_TICKS);
+        rstc.write_volatile(rstc_val);
+
+        // BOUNDED, because "this never returns" is an assumption about hardware, and assumptions are
+        // what invariant 12 exists for. If the SoC has not reset after a generous window, say so rather
+        // than leaving the operator to guess whether to wait or pull the plug.
         let mut n: u32 = 0;
+        let mut said = false;
         loop {
-            wdog.write_volatile(PM_PASSWORD | 10);
-            rstc.write_volatile(rstc_val);
             n = n.saturating_add(1);
-            if n == 2_000_000 {
-                serial_write_bytes_lockfree(b"\r\nreset: the SoC did NOT reset - the watchdog poke had no effect.\r\n");
-                serial_write_bytes_lockfree(b"reset: power-cycle the board. (still poking in case it takes late)\r\n");
+            if n % 20_000_000 == 0 {
+                if !said {
+                    said = true;
+                    serial_write_bytes_lockfree(b"
+
+reset: the SoC did NOT reset - the watchdog poke had no effect.
+
+");
+                    serial_write_bytes_lockfree(b"reset: power-cycle the board. (re-arming slowly in case it takes late)
+
+");
+                }
+                // A write that genuinely did not land gets another chance; one that did has fired long
+                // before this point.
+                wdog.write_volatile(PM_PASSWORD | WDOG_TICKS);
+                rstc.write_volatile(rstc_val);
             }
             core::hint::spin_loop();
         }
