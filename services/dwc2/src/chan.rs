@@ -406,6 +406,31 @@ fn uframe_now(mmio: &Mmio) -> u32 {
     mmio.read32(HFNUM) & 0x3FFF
 }
 
+/// Wait until the microframe counter has REACHED OR PASSED `target`.
+///
+/// The complete-split must not be issued before start+2. The trace showed why in one boot: a
+/// complete-split at start+1 returns NYET and then every later retry returns NYET too - the
+/// transaction is poisoned and never completes, which is the eight-consecutive-NYET run that strands
+/// the translator. At start+2 it succeeds on the first attempt.
+///
+/// "Reached or passed", not "equals", because being a microframe late is recoverable (the translator
+/// still holds the result for a few) while waiting for an exact value we have already gone by would
+/// cost a whole frame. False means too far past to be worth asking.
+fn wait_until_at_least(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> bool {
+    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(2));
+    loop {
+        let ahead = target.wrapping_sub(uframe_now(mmio)) & 0x3FFF;
+        if ahead == 0 || ahead > 0x2000 {
+            // At it, or past it. Past is only useful while the TT still holds the result.
+            return ahead == 0 || (0x4000 - ahead) <= 6;
+        }
+        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Outcome of waiting for an absolute microframe.
 enum Uframe {
     /// The target microframe is current - go.
@@ -519,19 +544,21 @@ pub fn periodic_split_in(
         return ss; // the TT refused the start-split - try again next poll
     }
 
-    // ASK THE DEVICE WHETHER IT IS READY, rather than calculating when it should be.
+    // NOT BEFORE START+2. Measured, not reasoned about.
     //
-    // The previous attempt targeted `f0 + 2` - the USB schedule's start+2 - but `f0` is read BEFORE the
-    // start-split is programmed, and the core schedules a periodic channel ITSELF. We never learn which
-    // microframe it actually used, so the whole calculation is anchored to the wrong instant. Absolute
-    // microframes fixed the ambiguity and left the anchor wrong; 249 XACTERR in one boot said so.
+    // The trace settled three commits of argument in one boot. A complete-split issued at start+1
+    // returns NYET, and so does every retry after it - the transaction is poisoned and never completes,
+    // which is the eight-consecutive-NYET run that strands the translator and brings down the whole
+    // recovery ladder. Issued at start+2 it succeeds on the first attempt, usually with NAK: an idle
+    // keyboard saying "no key activity", which is exactly right.
     //
-    // The device already answers this question. NYET means "the translator is not finished" - the exact
-    // truth being waited on - so a complete-split issued too early is not an error, it is a request to
-    // ask again. Issue it immediately and let NYET pace the retries. Being early is free; only being
-    // LATE costs an XACTERR and a stranded translator, and lateness is measured against the moment the
-    // start-split actually completed, which the counter does tell us.
-    let ss_done = uframe_now(mmio);
+    // I had `f0 + 2` two commits ago and abandoned it, believing `f0` was the wrong anchor. It is the
+    // right one: `f0` is the microframe the start-split was SYNCHRONISED to, not merely observed near.
+    // Replacing it with "issue as soon as the start-split halts" is what produced the start+1 case.
+    //
+    // Being early is NOT free after all - that assumption is what the last commit rested on, and the
+    // hardware disagreed.
+    let cs_first = (f0 + 2) & 0x3FFF;
     let mut last = ss;
     // SIX complete-split attempts, not three.
     //
@@ -544,11 +571,15 @@ pub fn periodic_split_in(
     // Not unbounded: a translator that never finishes must still be given up on, or this poll would
     // hold the core. Six is chosen to cover the NYET runs actually seen in the logs while staying far
     // inside the ~1 ms the whole poll is allowed.
+    // Wait out the gap to start+2 once; the retries below then follow the microframes as they come.
+    if !wait_until_at_least(ctx, mmio, cs_first) {
+        return last;   // too far past to be worth asking - the next poll starts a fresh transaction
+    }
     for _ in 0..6 {
         // A translator holds a completed periodic transaction for a few microframes, not indefinitely.
         // Past that, asking for it returns XACTERR and strands the TT - so abandon instead. One
         // keystroke period is the cost; a wedge and the recovery ladder is the alternative.
-        if uframe_now(mmio).wrapping_sub(ss_done) & 0x3FFF > 6 {
+        if uframe_now(mmio).wrapping_sub(cs_first) & 0x3FFF > 6 {
             return last;
         }
         let cs_uf = uframe_now(mmio) & 7;
