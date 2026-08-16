@@ -719,6 +719,33 @@ impl ServiceContext {
     /// should not pay a message-sized frame for the distinction. Callers that DO need it still have
     /// `..._outcome`, and should keep an eye on their own stack.
     #[inline(never)]
+    /// How long one blocking wait slice lasts.
+    ///
+    /// 20 ms: two scheduler quanta, so a waiter never holds its core, and short enough that a caller
+    /// checking for a keypress between slices still feels instant to a human. Nothing depends on the
+    /// value for correctness - a message arriving mid-slice wakes the task immediately; the slice only
+    /// bounds how often a caller gets to look at anything OTHER than its endpoint.
+    const AWAIT_SLICE_MS: u64 = 20;
+
+    /// Wait for a message on our own endpoint, BLOCKING, for at most one slice.
+    ///
+    /// The whole point of this helper, and the reason it exists rather than a `try_recv` loop: a task
+    /// that spins while waiting is not idle, it is COMPETING with whatever it is waiting for. On this
+    /// system that is not an abstract cost - `net-stack` waiting for a DHCP reply spun through the SDK
+    /// and through its own `drain_scan`, two nested loops, and saturated `nic-driver` and the USB
+    /// driver that had to fetch the very reply it was waiting for. The waiting starved the answering.
+    ///
+    /// Pinning the services to different cores hid it and fixed nothing: on a single-core machine the
+    /// spinner simply consumes the whole system. A blocked task consumes nothing and is woken the
+    /// instant a message lands (`RecvTimeout`, §12), so this is correct at any core count - which is
+    /// the only kind of correct worth having.
+    ///
+    /// Sliced rather than one long block so callers that must also watch something else - a keypress,
+    /// an abort flag - get the chance, without any of them going back to spinning.
+    fn await_slice(&self, ms: u64) -> Option<crate::ipc::Message> {
+        self.recv_timeout(self.duration_cycles(ms))
+    }
+
     pub fn request_with_reply_deadline(
         &self,
         peer: &str,
@@ -737,7 +764,8 @@ impl ServiceContext {
         }
         let t0 = self.epoch_secs_monotonic();
         loop {
-            if let Some(r) = self.try_recv() {
+            // BLOCK, do not spin. See `await_slice`.
+            if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS) {
                 return Some(r);
             }
             let now = self.epoch_secs_monotonic();
@@ -750,7 +778,6 @@ impl ServiceContext {
                 let _ = recv;
                 return None;
             }
-            self.yield_cpu();
         }
     }
 
@@ -776,9 +803,9 @@ impl ServiceContext {
         // T630) would otherwise make `now - t0` read huge and expire the deadline instantly.
         let t0 = self.epoch_secs_monotonic();
         loop {
-            // Block, do not spin - see `request_with_reply_abortable` for why this matters beyond power.
-            if let Some(r) = self.try_recv() { return DeadlineOutcome::Reply(r); }
-            self.yield_cpu();   // Poll, do not block
+            // Block, do not spin - and now it actually does. This comment said so while the line
+            // beneath it polled, which is how the claim survived so long unexamined.
+            if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS) { return DeadlineOutcome::Reply(r); }
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 self.remove_cap(reply_cap);   // reply never consumed - reclaim its slot
                 // CALLER BEWARE: the request was already SENT, so the peer will reply into our endpoint
@@ -830,7 +857,7 @@ impl ServiceContext {
             // up and all arrived at the prompt. It also pegged the core at 100% for a task that is, in
             // truth, doing nothing (the same busy-wait the `observe` and muted loops were already fixed
             // for - see MUTED_POLL_SLEEP_CYCLES). Blocking parks the task, the core halts, idle work runs.
-            if let Some(r) = self.try_recv() {
+            if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS) {
                 // DO NOT remove the reply cap on a REPLY. The send already removed it.
                 //
                 // §8.5: a cap embedded in a message "is transferred and REMOVED from sender's table".
@@ -858,7 +885,6 @@ impl ServiceContext {
                 // the threshold at which a person can tell, and the same trade the observe loop makes.
                 if b == b'q' || b == b'Q' || b == 0x1b { self.remove_cap(reply_cap); return ReqOutcome::Aborted; }
             }
-            self.yield_cpu();   // Poll, do not block
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 self.remove_cap(reply_cap);
                 return ReqOutcome::Timeout;
@@ -896,7 +922,7 @@ impl ServiceContext {
             // Block, do not spin - see `request_with_reply_abortable`. This is the variant `net`/`ping`
             // actually use (the "press q to abort" hint), so it is the one that kept core 0 permanently
             // busy during a continuous ping and starved the idle-path USB hot-plug watch.
-            if let Some(r) = self.try_recv() {
+            if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS) {
                 // DO NOT remove the reply cap on a REPLY. The send already removed it.
                 //
                 // §8.5: a cap embedded in a message "is transferred and REMOVED from sender's table".
@@ -922,7 +948,6 @@ impl ServiceContext {
             if elapsed >= hint_after_secs {
                 if let Some(f) = on_linger.take() { f(); }
             }
-            self.yield_cpu();   // Poll, do not block
             if elapsed >= max_secs {
                 self.remove_cap(reply_cap);
                 return ReqOutcome::Timeout;
@@ -947,12 +972,11 @@ impl ServiceContext {
     pub fn recv_abortable_deadline(&self, max_secs: i64) -> ReqOutcome {
         let t0 = self.epoch_secs_monotonic();
         loop {
-            // Block, do not spin - see `request_with_reply_abortable`.
-            if let Some(r) = self.try_recv() { return ReqOutcome::Reply(r); }
+            // Block, do not spin - see `await_slice`.
+            if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS) { return ReqOutcome::Reply(r); }
             while let Some(b) = self.try_console_read() {
                 if b == b'q' || b == b'Q' || b == 0x1b { return ReqOutcome::Aborted; }
             }
-            self.yield_cpu();   // Poll, do not block
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 return ReqOutcome::Timeout;
             }

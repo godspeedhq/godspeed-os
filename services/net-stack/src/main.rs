@@ -132,8 +132,22 @@ fn drain_scan_hit(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8
             }
         }
         if ctx.epoch_secs_monotonic() - t0 >= secs { return false; }
+        ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));   // see RX_POLL_PACE_MS
     }
 }
+
+/// How long to wait between RX polls of the NIC while waiting for a reply.
+///
+/// `drain_scan` used to re-ask with no pacing at all: `loop { nic_req(..) }` for up to two seconds,
+/// which is thousands of requests a second at `nic-driver` and, behind it, at the USB driver. The
+/// service waiting for a DHCP offer was saturating the two services that had to fetch it.
+///
+/// The SDK's wait now blocks rather than spins, which fixes the inner half. This fixes the outer half:
+/// a poll is a QUESTION, and asking it ten thousand times a second does not make the answer arrive
+/// sooner - it makes it arrive later, because the machinery that would produce it is busy answering.
+/// 10 ms is one scheduler quantum: fast enough that a frame is picked up promptly, slow enough that
+/// the driver is left alone to receive it.
+const RX_POLL_PACE_MS: u64 = 10;
 
 fn drain_scan(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8]) -> bool) {
     let t0 = ctx.epoch_secs_monotonic();
@@ -152,6 +166,9 @@ fn drain_scan(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8]) -
             }
         }
         if ctx.epoch_secs_monotonic() - t0 >= secs { return; }
+        // Wait before asking again - see RX_POLL_PACE_MS. `sleep` parks the task, so the core is free
+        // for the driver that is trying to hand us the very frame we are waiting for.
+        ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
     }
 }
 
