@@ -496,8 +496,19 @@ pub fn periodic_split_in(
         return ss; // the TT refused the start-split - try again next poll
     }
 
-    // The complete-split window, as an ABSOLUTE microframe: start + 2, per USB 2.0's split schedule.
-    let mut csf = (f0 + 2) & 0x3FFF;
+    // ASK THE DEVICE WHETHER IT IS READY, rather than calculating when it should be.
+    //
+    // The previous attempt targeted `f0 + 2` - the USB schedule's start+2 - but `f0` is read BEFORE the
+    // start-split is programmed, and the core schedules a periodic channel ITSELF. We never learn which
+    // microframe it actually used, so the whole calculation is anchored to the wrong instant. Absolute
+    // microframes fixed the ambiguity and left the anchor wrong; 249 XACTERR in one boot said so.
+    //
+    // The device already answers this question. NYET means "the translator is not finished" - the exact
+    // truth being waited on - so a complete-split issued too early is not an error, it is a request to
+    // ask again. Issue it immediately and let NYET pace the retries. Being early is free; only being
+    // LATE costs an XACTERR and a stranded translator, and lateness is measured against the moment the
+    // start-split actually completed, which the counter does tell us.
+    let ss_done = uframe_now(mmio);
     let mut last = ss;
     // SIX complete-split attempts, not three.
     //
@@ -511,13 +522,10 @@ pub fn periodic_split_in(
     // hold the core. Six is chosen to cover the NYET runs actually seen in the logs while staying far
     // inside the ~1 ms the whole poll is allowed.
     for _ in 0..6 {
-        if let Uframe::Missed = wait_uframe_abs(ctx, mmio, csf) {
-            // LATE: do not issue the complete-split.
-            //
-            // The translator has already discarded this transaction, so asking for it returns XACTERR
-            // and - worse - a complete-split for a transaction the TT no longer holds is what strands
-            // it. Abandoning costs one keystroke period; issuing it costs a wedge and the recovery
-            // ladder that follows. The next poll starts a fresh transaction, which is the recovery.
+        // A translator holds a completed periodic transaction for a few microframes, not indefinitely.
+        // Past that, asking for it returns XACTERR and strands the TT - so abandon instead. One
+        // keystroke period is the cost; a wedge and the recovery ladder is the alternative.
+        if uframe_now(mmio).wrapping_sub(ss_done) & 0x3FFF > 6 {
             return last;
         }
         program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt | (1 << 16));
@@ -532,7 +540,10 @@ pub fn periodic_split_in(
             return cs;
         }
         if cs & HCINT_NYET != 0 {
-            csf = (csf + 1) & 0x3FFF; // the TT is not done - retry the complete-split a microframe later
+            // The device itself said "not yet". Wait exactly one microframe and ask again - no
+            // calculation, no assumption about when it ought to have been ready.
+            let next = (uframe_now(mmio) + 1) & 0x3FFF;
+            let _ = wait_uframe_abs(ctx, mmio, next);
             continue;
         }
         return cs;
