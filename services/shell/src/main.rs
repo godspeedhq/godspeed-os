@@ -4744,13 +4744,20 @@ fn cmd_mem(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
 }
 
 fn cmd_reboot(ctx: &ShellCtx) -> ! {
-    // Record the clock floor on the way down. This is what carries a BOOT-time network sync across the
-    // power cycle: net-stack sets the clock but holds no filesystem authority, and the shell does - so a
-    // deliberate reboot is the natural explicit moment to write it. Quiet + bounded: the machine is about
-    // to reset, so a missing filesystem must not delay or clutter the shutdown.
-    if let Some(f) = time_floor(ctx) {
-        if (0..=u32::MAX as i64).contains(&f) { clock_floor_persist(ctx, f as u32, true); }
-    }
+    // SAY IT FIRST, THEN DO IT. Nothing goes between the command and the action.
+    //
+    // This used to make two round trips before printing anything - `time_floor` to the clock service,
+    // then `clock_floor_persist`, which talks to `time` AND `fs` - so a slow or busy dependency turned
+    // `reboot` into a command that sat there silently. Right after a chaos storm, when those services
+    // are restarting, that is exactly when someone wants to reboot and exactly when it looks dead.
+    //
+    // The work is also redundant now: `time` owns the clock floor and persists it at the moment the
+    // clock is SET, so there is nothing for the shell to write on the way down. Two owners for one
+    // piece of state was the older bug; this is the second half of removing it.
+    //
+    // What remains is what the user asked for: a line, then the reset. If the SoC fails to reset, the
+    // kernel's reset path says so on the console - it is bounded and reports rather than hanging
+    // silently.
     ctx.console_writeln("rebooting...");
     ctx.reboot()
 }

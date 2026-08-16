@@ -1862,8 +1862,22 @@ impl ServiceContext {
     /// confirmation in PuTTY before the line goes silent.
     pub fn reboot(&self) -> ! {
         // SAFETY: syscall(18) = Reboot; no arguments.
-        unsafe { raw_syscall(18, 0, 0, 0) };
-        loop {} // unreachable
+        let rc = unsafe { raw_syscall(18, 0, 0, 0) };
+        // A REFUSED reboot must not look like a successful one.
+        //
+        // The kernel gates this on the REBOOT capability (§3.1) and returns `CapNotHeld` to anyone
+        // without it. This used to fall into a bare `loop {}`, so a caller that lacked the cap simply
+        // stopped - no message, no reset, a frozen prompt. "Reboot does nothing" is exactly how that
+        // reads from the outside, and it is indistinguishable from a reset that failed in hardware.
+        //
+        // Say which it was. The kernel's own reset path is bounded and reports if the SoC does not come
+        // down; this covers the other half, where the syscall never got that far. Invariant 12: failures
+        // are loud, never silent.
+        self.log_fmt(format_args!(
+            "reboot REFUSED by the kernel (rc {}) - this service does not hold the REBOOT capability", rc));
+        loop {
+            self.yield_cpu();
+        }
     }
 
     /// Attempt a reboot but RETURN the syscall result instead of assuming it never comes back.
