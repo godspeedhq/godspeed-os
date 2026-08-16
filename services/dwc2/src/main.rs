@@ -628,6 +628,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 match hub::enumerate_downstream(&ctx, &m, &d, &hub_t, hub_port, &mut addr) {
                     Some((_, _, _, ndt, nsplt)) => match hid::bind(&ctx, &m, &d, &ndt, nsplt) {
                         Some(nk) => {
+                            // CARRY THE RATE LIMITS ACROSS THE RE-BIND.
+                            //
+                            // `KeyState::new` starts a fresh binding, which is right for toggles and
+                            // counters and WRONG for the cooldowns: re-enumeration is the action being
+                            // limited, so resetting its timestamp as part of doing it erased the limit
+                            // every time. Hardware showed a 10 s floor firing at ~1 s intervals, which
+                            // is the limit deleting itself.
+                            //
+                            // These belong to the PORT, not to a binding of it, and the binding is
+                            // exactly what the remedy replaces.
+                            let (keep_tt, keep_re) = (state.tt_reset_at, state.reenum_at);
                             // "re-bound", not "RECOVERED". The bind exercises the control path,
                             // which was never what broke; only a delivered report proves the
                             // interrupt endpoint is alive again, and that is where the recovery is
@@ -635,6 +646,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             ctx.log("dwc2-svc: keyboard re-bound after re-enumeration - awaiting a report to confirm");
                             awaiting_report = true;
                             state = hid::KeyState::new(&ctx); // toggles and repeat start clean
+                            state.tt_reset_at = keep_tt;
+                            state.reenum_at = keep_re;
                             kbd = Some((nk, ndt, nsplt));
                         }
                         None => ctx.log("dwc2-svc: keyboard re-enumerated but did NOT re-bind - input stays dead"),
