@@ -96,9 +96,22 @@ const REARM_MS: u64 = 1_000;
 /// enough to stay inside the 256-byte console write limit. Still logged as well - the serial capture
 /// is the record, the console is the notification.
 fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
-    ctx.log_fmt(args);
+    // CONSOLE ONLY. The port-level detail is already logged beside every call site, and
+    // logging here as well printed each notice TWICE in the serial capture - once from the
+    // logger and once from the console, which shares the same line.
     ctx.console_write("\r\n");
     ctx.console_writeln_fmt(args);
+    // GIVE THE PROMPT BACK. The shell reads byte 10 as Enter, so this makes it redraw `gsh>`
+    // under the notice - otherwise the cursor is left below a line the user did not type and
+    // the machine looks like it is waiting for something.
+    //
+    // This exact call was reverted once ("the cure was worse than the complaint"): it fired on
+    // every keyboard RE-BIND, and re-binds were happening constantly during the wedge storms,
+    // so a boot could collect four prompts and later far more. What changed is not the
+    // mechanism but its trigger - this is reachable only from a hot-plug event, which is a
+    // person physically plugging something in. That cannot storm, and it is bounded by the
+    // one thing no software defect can accelerate.
+    ctx.console_push(10);
 }
 
 fn answer_no_disk(ctx: &ServiceContext, capless: &mut bool) {
