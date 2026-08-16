@@ -356,6 +356,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                 // and guessing from "has two bulk endpoints" would
                                                 // also match the disk.
                                                 if let Some(n) = net::bind(&ctx, &m, &d, &dt) {
+                                                    nic_port = p;   // the port this came from - see the removal handler
                                                     nic = Some((n, dt));
                                                 }
                                             } else if let Some(mut dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
@@ -389,6 +390,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                         } else {
                                                             ctx.log("dwc2-svc: sector 0 read FAILED");
                                                         }
+                                                        disk_port = p;  // the port this came from - see the removal handler
                                                         disk = Some((dk, dt, sectors));
                                                     }
                                                     None => ctx.log("dwc2-svc: READ CAPACITY FAILED"),
