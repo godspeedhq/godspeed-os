@@ -309,6 +309,21 @@ const SMSC_HW_CFG_RXDOFF: u32 = 0x0000_0600;
 const SMSC_PM_CTRL: u16 = 0x20;
 const SMSC_PM_CTRL_PHY_RST: u32 = 0x0000_0010;
 const SMSC_AFC_CFG: u16 = 0x2C;
+/// Flow control (Linux `FLOW`, 0x11C). Bit 1 FCEN enables it, bit 0 FCBSY says it is busy, the top
+/// half is the pause time.
+///
+/// This driver never wrote it, and Linux writes it TWICE: once at reset under its own `/* Init Tx */`
+/// heading, and again on EVERY link change from `smsc95xx_phy_update_flowcontrol`. A register the
+/// vendor driver initialises as part of starting the transmitter, left at whatever reset leaves it,
+/// on a port that was otherwise followed closely.
+const SMSC_FLOW: u16 = 0x11C;
+/// MAC_CR bit 23. Linux sets it in HALF duplex and clears it in full (`smsc95xx_mac_update_fullduplex`).
+const SMSC_MAC_CR_RCVOWN: u32 = 0x0080_0000;
+/// PHY auto-negotiation link-partner ability (MII register 5), and our advertisement (register 4).
+/// Their intersection is the negotiated mode - the same thing Linux gets from `phydev->duplex`.
+const SMSC_MII_LPA: u32 = 5;
+/// 100BASE-TX full duplex, 10BASE-T full duplex, in both ADVERTISE and LPA.
+const MII_FULL_DUPLEX: u16 = 0x0100 | 0x0040;
 const SMSC_BURST_CAP: u16 = 0x38;
 const SMSC_BULK_IN_DLY: u16 = 0x6C;
 const SMSC_MAC_CR: u16 = 0x100;
@@ -339,6 +354,48 @@ fn link_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> bool {
     matches!(mii_read(ctx, m, d, t, SMSC_MII_BMSR), Some(v) if v & 0x0004 != 0)
 }
 
+/// Reconfigure the MAC for the duplex the PHY actually negotiated, and set flow control to match.
+///
+/// Ported from `smsc95xx_mac_update_fullduplex` + `smsc95xx_phy_update_flowcontrol`, which Linux runs
+/// on EVERY link change. This driver ran neither: MAC_CR was written once at bring-up, while the PHY
+/// was still auto-negotiating, and then never revisited. So the MAC kept whatever duplex we guessed
+/// before the link existed, and FLOW kept whatever reset left.
+///
+/// Linux's rules, exactly:
+///   full duplex -> MAC_CR |= FDPX, MAC_CR &= ~RCVOWN, AFC_CFG &= ~0xF   (no pause negotiated)
+///   half duplex -> MAC_CR &= ~FDPX, MAC_CR |= RCVOWN, AFC_CFG |= 0xF
+///   FLOW = 0 unless pause was negotiated, which we do not advertise.
+///
+/// Whether this is the transmit fault is NOT established - it is a missing step in the port, found by
+/// diffing against the vendor driver, and it happens at exactly the moment transmit dies. The device
+/// registers logged beside it are what will settle that, rather than another argument.
+fn link_reconfigure(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) {
+    // Negotiated duplex = what both ends advertised. Linux reads it from the PHY layer; the raw form
+    // is the intersection of our ADVERTISE (4) and the partner's LPA (5).
+    let adv = mii_read(ctx, m, d, t, SMSC_MII_ADVERTISE).unwrap_or(0);
+    let lpa = mii_read(ctx, m, d, t, SMSC_MII_LPA).unwrap_or(0);
+    let full = adv & lpa & MII_FULL_DUPLEX != 0;
+
+    let mut mac_cr = smsc_read_or0(ctx, m, d, t, SMSC_MAC_CR);
+    let mut afc = smsc_read_or0(ctx, m, d, t, SMSC_AFC_CFG);
+    if full {
+        mac_cr |= SMSC_MAC_CR_FDPX;
+        mac_cr &= !SMSC_MAC_CR_RCVOWN;
+        afc &= !0xF;
+    } else {
+        mac_cr &= !SMSC_MAC_CR_FDPX;
+        mac_cr |= SMSC_MAC_CR_RCVOWN;
+        afc |= 0xF;
+    }
+    smsc_write(ctx, m, d, t, SMSC_MAC_CR, mac_cr);
+    // No pause is advertised, so FLOW stays 0 - the branch Linux takes when neither side asked for it.
+    smsc_write(ctx, m, d, t, SMSC_FLOW, 0);
+    smsc_write(ctx, m, d, t, SMSC_AFC_CFG, afc);
+    ctx.log_fmt(format_args!(
+        "dwc2-svc: link up - {} duplex (adv {:#06x} lpa {:#06x}); MAC_CR={:#010x} AFC_CFG={:#010x} FLOW=0",
+        if full { "FULL" } else { "HALF" }, adv, lpa, mac_cr, afc));
+}
+
 /// The link state, re-read at most every `LINK_TTL_MS`.
 ///
 /// `link_up` costs two control transfers, so asking it per frame would replace one expensive answer
@@ -351,8 +408,13 @@ fn link_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> bool {
 fn link_fresh(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic) -> bool {
     let now = ctx.read_tsc();
     if nic.link_at == 0 || now.wrapping_sub(nic.link_at) >= ctx.duration_cycles(LINK_TTL_MS) {
+        let was = nic.link_up;
         nic.link_up = link_up(ctx, m, d, t);
         nic.link_at = now;
+        // The DOWN -> UP edge is where Linux reconfigures the MAC, and where this driver did nothing.
+        if nic.link_up && !was {
+            link_reconfigure(ctx, m, d, t);
+        }
     }
     nic.link_up
 }
@@ -473,6 +535,8 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
     smsc_write(ctx, m, d, t, SMSC_HW_CFG, hw);
     smsc_write(ctx, m, d, t, SMSC_BURST_CAP, SMSC_BURST_PKTS);
     smsc_write(ctx, m, d, t, SMSC_BULK_IN_DLY, 0x2000);
+    // Linux's `/* Init Tx */` is two writes and we only ever did one of them.
+    smsc_write(ctx, m, d, t, SMSC_FLOW, 0);
     smsc_write(ctx, m, d, t, SMSC_AFC_CFG, 0x00F8_30A1);
 
     // PHY: reset, advertise 10/100, restart auto-negotiation. Do NOT block on link - net-stack retries
@@ -720,6 +784,21 @@ pub fn tx(
         nic.tx_fail_run = nic.tx_fail_run.saturating_add(1);
         if nic.tx_fail_run == TX_FAIL_RUN {
             nic.tx_backoff_at = now;
+            // ASK THE DEVICE, do not infer it. The USB endpoint NAKing means the chip has no room for
+            // the frame - but "no room" has several causes on this part and they are distinguishable
+            // from its own registers, which nothing has ever read at the moment of failure:
+            //   TX_CFG  bit 2 ON, bit 1 STOP, bit 0 FIFO_FLUSH - is the transmitter even running?
+            //   INT_STS bit 17 TX_STOP          - did the chip stop it and tell us?
+            //   MAC_CR  TXEN / FDPX / RCVOWN    - is the MAC configured for the link it got?
+            //   FLOW / AFC_CFG                  - is it holding itself off with flow control?
+            // Four theories died for want of these five words.
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: device TX state at refusal - TX_CFG={:#010x} INT_STS={:#010x} MAC_CR={:#010x} FLOW={:#010x} AFC_CFG={:#010x}",
+                smsc_read_or0(ctx, mmio, dma, t, SMSC_TX_CFG),
+                smsc_read_or0(ctx, mmio, dma, t, SMSC_INT_STS),
+                smsc_read_or0(ctx, mmio, dma, t, SMSC_MAC_CR),
+                smsc_read_or0(ctx, mmio, dma, t, SMSC_FLOW),
+                smsc_read_or0(ctx, mmio, dma, t, SMSC_AFC_CFG)));
             ctx.log_fmt(format_args!(
                 "dwc2-svc: NIC refused {} frames in a row (HCINT={:#010x}{}) - backing off to one probe                  every {} ms. Frames are dropped meanwhile; input and storage stay responsive.",
                 TX_FAIL_RUN, why.0, if why.1 != 0 { ", channel never halted" } else { "" },
