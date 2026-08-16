@@ -77,7 +77,34 @@ pub struct Nic {
     /// shorter than any human notices a cable going in and far longer than a frame burst.
     pub link_up: bool,
     pub link_at: u64,
+    /// Consecutive failed transmits, and when the backoff they triggered began.
+    ///
+    /// A device that refuses one frame refuses the next, and hardware showed how expensive believing
+    /// otherwise is: 1481 failures against 637 successes, ~18 doomed transmits a second, each holding
+    /// the thread for its full budget. That is ~90% of this service spent proving the same thing over
+    /// and over, and it is felt as the shell going slow, because storage and the keyboard are served
+    /// by the very same thread.
+    ///
+    /// This is a BACKOFF, not a recovery - it does not reset the device, it declines to ask. That
+    /// distinction matters, because eager RECOVERY thresholds have twice been worse than the fault
+    /// they chased (a re-enumeration resets the port and stops the device settling). Declining to
+    /// attempt is free and reversible: one probe per window finds the moment the device is willing
+    /// again, and a single success clears it.
+    pub tx_fail_run: u32,
+    pub tx_backoff_at: u64,
+    /// HCINT from the last failed transmit, and whether the channel simply never halted.
+    ///
+    /// TX passed `None` for this while RX recorded it, so the log could say a transmit failed but
+    /// never WHY - and "the device refuses frames" and "the transfer never completed" are different
+    /// faults with different fixes. Recording it costs a field and removes a guess.
+    pub tx_hcint: u32,
+    pub tx_nohalt: u32,
 }
+
+/// Consecutive failures before this endpoint is presumed unwilling.
+const TX_FAIL_RUN: u32 = 8;
+/// How long to decline transmits before letting one probe through.
+const TX_BACKOFF_MS: u64 = 500;
 
 /// How long a cached link answer is trusted before it is read again.
 const LINK_TTL_MS: u64 = 500;
@@ -228,7 +255,8 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
     // cable is there. Assuming UP is how a driver spends a full budget per frame proving otherwise.
     Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(), in_armed: false,
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
-               link_up: false, link_at: 0 })
+               link_up: false, link_at: 0,
+               tx_fail_run: 0, tx_backoff_at: 0, tx_hcint: 0, tx_nohalt: 0 })
 }
 
 // --- smsc95xx (LAN9514) bring-up -------------------------------------------------------------------
@@ -536,6 +564,26 @@ pub fn tx(
         nic.stats.tx_fail += 1;
         return false;
     }
+    // A DEVICE THAT HAS REFUSED EIGHT FRAMES IN A ROW IS NOT ASKED AGAIN FOR HALF A SECOND.
+    //
+    // The link guard above covers a missing cable; this covers everything else, and hardware showed
+    // that everything else is the common case: 1481 failures to 637 successes with the link UP, at
+    // ~18 attempts a second. Even at the reduced 50 ms budget that is ~90% of this service's thread
+    // spent re-proving one fact, and the thread is shared with storage and the keyboard, so the whole
+    // machine feels slow.
+    //
+    // A probe is still let through every window, so nothing is latched: the moment the device accepts
+    // a frame the run clears and full rate resumes. Costs at most one budget per window rather than
+    // one per request.
+    let now = ctx.read_tsc();
+    if nic.tx_fail_run >= TX_FAIL_RUN {
+        if now.wrapping_sub(nic.tx_backoff_at) < ctx.duration_cycles(TX_BACKOFF_MS) {
+            nic.stats.tx_fail += 1;
+            return false;
+        }
+        // Window elapsed: let ONE frame through to ask whether the device is willing yet.
+        nic.tx_backoff_at = now;
+    }
     let n = frame.len().min(FRAME_MAX);
     // TX_CMD_A = len | FIRST_SEG | LAST_SEG, TX_CMD_B = len. Both little-endian.
     let a = (n as u32) | 0x0000_2000 | 0x0000_1000;
@@ -550,9 +598,34 @@ pub fn tx(
     }
     // No ZLP needed: the smsc95xx carries an explicit length in its TX command, so it does not rely on
     // a short packet to find the frame boundary the way CDC-ECM does.
+    // ASK WHY. This was `None`, so a failing transmit was counted and never explained - and "the
+    // device NAKs every frame" and "the transfer never halted" are different faults needing different
+    // fixes. The receive path has recorded this from the start; the transmit path guessed.
+    let mut why = (0u32, 0u32);
     let ok = bulk(ctx, mmio, t, nic.mps, false, nic.ep_out, dma.phys_at(TX_OFF) as u32,
-                  (n + 8) as u32, TX_BUDGET_MS, &mut nic.pid_out, None).is_some();
-    if ok { nic.stats.tx_ok += 1; } else { nic.stats.tx_fail += 1; }
+                  (n + 8) as u32, TX_BUDGET_MS, &mut nic.pid_out, Some(&mut why)).is_some();
+    if ok {
+        nic.stats.tx_ok += 1;
+        // One success is proof the device is willing: drop the backoff entirely rather than decaying
+        // it, so a transient refusal costs one window and not a slow climb back to full rate.
+        if nic.tx_fail_run >= TX_FAIL_RUN {
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: NIC accepting frames again after {} refusals", nic.tx_fail_run));
+        }
+        nic.tx_fail_run = 0;
+    } else {
+        nic.stats.tx_fail += 1;
+        nic.tx_hcint = why.0;
+        nic.tx_nohalt = why.1;
+        nic.tx_fail_run = nic.tx_fail_run.saturating_add(1);
+        if nic.tx_fail_run == TX_FAIL_RUN {
+            nic.tx_backoff_at = now;
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: NIC refused {} frames in a row (HCINT={:#010x}{}) - backing off to one probe                  every {} ms. Frames are dropped meanwhile; input and storage stay responsive.",
+                TX_FAIL_RUN, why.0, if why.1 != 0 { ", channel never halted" } else { "" },
+                TX_BACKOFF_MS));
+        }
+    }
     ok
 }
 
@@ -715,6 +788,19 @@ fn bulk(
             break;
         }
     }
+    // READ THE TOGGLE BACK ON THE FAILURE PATH TOO.
+    //
+    // The success path above already does this, and the reason is written up on the keyboard poll:
+    // the DWC2 core advances HCTSIZ.PID itself, and flipping or freezing it in software makes the two
+    // disagree the moment they ever differ. A toggle mismatch does not raise an error - the transfer
+    // is simply ignored or retransmitted forever - which is precisely the shape of "tx_ok froze at
+    // 637 while failures climbed to 1481 and never recovered".
+    //
+    // A transmit that timed out is exactly the ambiguous case: the device may have taken the data and
+    // advanced its toggle while the host never saw the ACK. Reading back what the CORE believes keeps
+    // software in step with the only party that watched the wire, instead of preserving a stale guess
+    // for the rest of the device's life.
+    *pid = chan::pid_from_hctsiz(mmio, CH_NET);
     if let Some(w) = why { *w = (last, if halted == 0 { 1 } else { 0 }); }
     None
 }

@@ -643,8 +643,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let ms = ctx.duration_cycles(1).max(1);
                 let ns = nic.as_ref().map(|(n, _)| {
                     let s = &n.stats;
-                    (s.tx_ok, s.tx_fail, s.rx_bursts, s.rx_bytes, s.rx_frames, s.rx_bad, s.rx_hcint, s.rx_nohalt, s.bmsr, s.rx_fifo, s.int_sts)
-                }).unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+                    (s.tx_ok, s.tx_fail, s.rx_bursts, s.rx_bytes, s.rx_frames, s.rx_bad, s.rx_hcint, s.rx_nohalt, s.bmsr, s.rx_fifo, s.int_sts,
+                     n.tx_hcint, n.tx_nohalt, n.tx_fail_run)
+                }).unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
                 // RE-MEASURE ONCE, QUIET. The boot-time sweep runs while the console is saturated,
                 // and a serial write is an un-preemptible syscall of ~9 ms per log line - which is
                 // the mean it reported. One repeat on a settled system separates "the timer is slow"
@@ -691,9 +692,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // the SDK's fixed 256-byte format buffer, so the tail - the value being measured - was
                 // silently truncated away. An instrument that does not fit in the log is not an
                 // instrument; this cost a boot.
+                // The TX failure REASON, alongside the count. A count says a transmit failed; only
+                // HCINT says whether the device refused it (NAK), the wire broke (XACTERR), or the
+                // channel never halted - three faults with three different fixes, previously
+                // indistinguishable from this log.
                 ctx.log_fmt(format_args!(
-                    "dwc2-svc: net tx {}/{} fail, rx {} bursts {} bytes {} frames {} unparsed",
-                    ns.0, ns.1, ns.2, ns.3, ns.4, ns.5));
+                    "dwc2-svc: net tx {}/{} fail (last HCINT=0x{:08x} nohalt {}, run {}), rx {} bursts {} bytes {} frames {} unparsed",
+                    ns.0, ns.1, ns.11, ns.12, ns.13, ns.2, ns.3, ns.4, ns.5));
                 ctx.log_fmt(format_args!(
                     "dwc2-svc: net IN HCINT=0x{:08x} nohalt {} BMSR=0x{:04x} RX_FIFO=0x{:08x} INT_STS=0x{:08x}",
                     ns.6, ns.7, ns.8, ns.9, ns.10));
