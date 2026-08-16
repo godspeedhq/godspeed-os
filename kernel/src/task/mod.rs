@@ -898,7 +898,10 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
             // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
             // unpins these three, and it unpins them everywhere at once.
-            preferred_core:    if cfg!(target_arch = "arm") { u32::MAX } else { 1 },
+            // arm32: core 2. Off core 0 for the same reason as the networking pair (see nic-driver),
+            // and off core 1 so a burst of disk I/O and a burst of frames do not queue behind
+            // each other on one core.
+            preferred_core:    if cfg!(target_arch = "arm") { 2 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[],
@@ -973,7 +976,24 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
             // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
             // unpins these three, and it unpins them everywhere at once.
-            preferred_core:    if cfg!(target_arch = "arm") { u32::MAX } else { 1 },
+            // arm32: core 1, and NOT unpinned.
+            //
+            // Unpinning these three was meant to "give the timing-critical USB driver a quieter core
+            // 0" (75c18457). It did the opposite: unpinned means ROUND-ROBIN, and round-robin put
+            // `net-stack` straight back onto core 0 alongside `dwc2` - observed on hardware as
+            // "'dwc2' spawned OK on core 0 / 'net-stack' spawned OK on core 0".
+            //
+            // That is the worst possible pairing. `net-stack` waits for replies by POLLING
+            // (`drain_scan` -> try_recv + yield_cpu), and the scheduler quantum is 10 ms, so it can
+            // hold core 0 for 10 ms at a stretch. `dwc2`'s split transactions have to hit 125 us
+            // windows - eighty times finer. So the service waiting for a DHCP or ARP reply was
+            // starving the driver that had to deliver it: a spin that defeats itself.
+            //
+            // Pinned, and pinned TOGETHER with net-stack, which is what the contract used to say
+            // before the audit deleted it ("co-located with nic-driver - the two exchange frames
+            // constantly"). Same-core request/reply is safe now that the SDK waits poll rather than
+            // block. Core 0 is left to `dwc2` alone, which is what the unpin was for.
+            preferred_core:    if cfg!(target_arch = "arm") { 1 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             // GENET's macirq on aarch64 (SPI 157 -> neutral vector 0x2A). x86's nic-driver is a
@@ -1048,7 +1068,8 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
             // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
             // unpins these three, and it unpins them everywhere at once.
-            preferred_core:    if cfg!(target_arch = "arm") { u32::MAX } else { 1 },
+            // arm32: core 1, co-located with nic-driver and OFF core 0 - see the note there.
+            preferred_core:    if cfg!(target_arch = "arm") { 1 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[],
