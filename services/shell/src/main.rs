@@ -4966,9 +4966,11 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
                 return Ok(());
             }
         };
-        // Record the new time as the floor: we are demonstrably running now, so nothing earlier can be
-        // right later. Survives the power cycle that the (absent) RTC would otherwise have covered.
-        clock_floor_persist(ctx, epoch, false);
+        // The floor is NOT recorded here. `net-stack` hands the epoch to `time`, and `time` persists
+        // its own floor at the moment the clock is set - it owns the clock, so it owns the clock's
+        // state (§3.8). The shell writing it as well was a second owner for one piece of state, and a
+        // second owner is how the two drift.
+        let _ = epoch;
         // fall through to display the freshly-set time
     }
     let dt = Datetime::from_epoch_secs(time_now(ctx).unwrap_or(0));
@@ -4985,14 +4987,14 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
             Some(f) => {
                 let fd = Datetime::from_epoch_secs(f);
                 out.line_fmt(ctx, format_args!(
-                    "unset - no clock on this machine; `date sync` fetches it over the network"));
+                    "unset - no RTC on this board; the time service is reconciling in the background"));
                 out.line_fmt(ctx, format_args!(
                     "        (last known {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC from {} - a floor, not a reading)",
                     fd.year, fd.month, fd.day, fd.hour, fd.minute, fd.second,
                     core::str::from_utf8(CLOCK_FLOOR_PATH).unwrap_or("disk")));
             }
             None => out.line_fmt(ctx, format_args!(
-                "unset - no clock on this machine; `date sync` fetches it over the network")),
+                "unset - no RTC on this board; the time service is reconciling in the background")),
         }
         return Ok(());
     }
@@ -8321,7 +8323,21 @@ const FS_STALE_MAX: u32 = 16;
 /// Discarding is safe precisely because the sender has moved on: a reply whose tag we are no longer
 /// waiting for belongs to a request whose caller has already returned. Keeping it would only let it be
 /// mistaken for a later answer, which is the failure this exists to end.
+/// Wait for the reply carrying `tag`, discarding replies belonging to requests already abandoned.
+///
+/// THE DEADLINE IS FOR THE WHOLE WAIT, not for each attempt. Every discarded reply used to start a
+/// fresh full-length wait, so the real bound was FS_STALE_MAX x max_secs - sixteen times what the
+/// caller asked for, and on an interactive command that is indistinguishable from a hang.
+///
+/// Hardware showed it: after a 98-round chaos storm the block protocol came back out of step
+/// ("fs: block read at lba 7702 got a MALFORMED reply ... protocol desync"), the shell discarded one
+/// stale reply, waited for a tag that was never coming, and the operator pulled the power at about
+/// seventy seconds. The guard detected the desync correctly and then had nowhere to go.
+///
+/// A bound that multiplies is not a bound (§26.6), and the Rule Above The Rules is that a dependency
+/// which cannot answer must produce a loud failure rather than silence.
 fn fs_take_tagged(ctx: &ShellCtx, tag: u8, first: ReqOutcome, max_secs: i64) -> ReqOutcome {
+    let t0 = ctx.epoch_secs_monotonic();
     let mut outcome = first;
     for _ in 0..FS_STALE_MAX {
         match outcome {
@@ -8334,12 +8350,21 @@ fn fs_take_tagged(ctx: &ShellCtx, tag: u8, first: ReqOutcome, max_secs: i64) -> 
                     "shell: discarded an fs reply for tag {} while awaiting {} (an earlier request was overtaken)",
                     p.first().copied().unwrap_or(0), tag));
                 // Wait again WITHOUT re-sending: the request is already with fs, and sending it twice
-                // would ask for the work twice.
-                outcome = ctx.recv_abortable_deadline(max_secs);
+                // would ask for the work twice. But only for the time the caller has LEFT.
+                let spent = ctx.epoch_secs_monotonic().saturating_sub(t0);
+                let left = max_secs.saturating_sub(spent);
+                if left <= 0 {
+                    ctx.console_writeln("fs: no reply for this request - the storage protocol is out of step");
+                    return ReqOutcome::Timeout;
+                }
+                outcome = ctx.recv_abortable_deadline(left);
             }
             other => return other,
         }
     }
+    // Sixteen stale replies in one wait is not a slow disk, it is a protocol that has lost its place.
+    // Say so: the caller reports a failed operation either way, but only this knows WHY.
+    ctx.console_writeln("fs: too many out-of-order replies - the storage protocol is out of step");
     ReqOutcome::Timeout
 }
 
