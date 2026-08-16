@@ -395,12 +395,56 @@ fn stage_split_one(
 /// count: the kernel driver's comment records that a spin-count bound here "was the cause of the
 /// scheduler-starving hang", since spin latency depends on MMIO speed rather than on the clock the
 /// microframes actually advance on.
-fn wait_uframe(ctx: &ServiceContext, mmio: &Mmio, target: u32) {
+/// The controller's microframe counter - all 14 bits of it.
+///
+/// `HFNUM.FrmNum` increments every microframe (125 us) and wraps about every two seconds, so it is an
+/// ABSOLUTE clock for split scheduling. The old code masked it to `& 0x7` - the microframe's position
+/// within its frame - and that is the whole defect: a 3-bit target RECURS EVERY MILLISECOND, so
+/// "microframe 3" names eight different instants a second and there is no way to tell which one you
+/// are looking at.
+fn uframe_now(mmio: &Mmio) -> u32 {
+    mmio.read32(HFNUM) & 0x3FFF
+}
+
+/// Outcome of waiting for an absolute microframe.
+enum Uframe {
+    /// The target microframe is current - go.
+    Reached,
+    /// It has already passed. The transaction it was for is stale.
+    Missed,
+}
+
+/// Wait until the absolute microframe `target`, or report that it has gone.
+///
+/// This is the fix for the fault that wedged the keyboard. The previous version compared only the low
+/// three bits, so a task preempted between the start-split and the complete-split did not learn it was
+/// late - it waited for that microframe NUMBER to come round again, up to a frame later, and issued the
+/// complete-split anyway. By then the translator had discarded the result, which is an XACTERR, and a
+/// complete-split for a transaction the TT no longer holds is also what strands it. Hence the
+/// 300-XACTERR runs and the NYET storms, both appearing only under load - load is what causes the
+/// preemption.
+///
+/// It also returned silently on its own timeout and the caller proceeded regardless, so being late was
+/// indistinguishable from being on time. Now lateness is a value the caller must handle (§26.7).
+///
+/// Wrapping-safe: the counter is 14 bits, so a distance of more than half the range is read as the past
+/// rather than an eight-second wait.
+fn wait_uframe_abs(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> Uframe {
+    // Bounded: a few microframes is all a legitimate wait ever needs; anything longer means the target
+    // is gone and spinning cannot bring it back.
     let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(2));
-    while (mmio.read32(HFNUM) & 0x7) != (target & 0x7) {
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
-            return;
+    loop {
+        let delta = target.wrapping_sub(uframe_now(mmio)) & 0x3FFF;
+        if delta == 0 {
+            return Uframe::Reached;
         }
+        if delta > 0x2000 {
+            return Uframe::Missed;      // target is behind us
+        }
+        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+            return Uframe::Missed;      // could not get there in time - say so
+        }
+        core::hint::spin_loop();
     }
 }
 
@@ -425,11 +469,21 @@ pub fn periodic_split_in(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target,
     ch: u32, pid: u32, buf_phys: u32, len: u32, ep: u32, splt: u32,
 ) -> u32 {
-    let mut ssf = (mmio.read32(HFNUM).wrapping_add(1)) & 0x7;
-    if ssf == 6 {
-        ssf = 7; // skip microframe 6
+    // START WHERE WE ARE, rather than spinning to reach a chosen microframe.
+    //
+    // The old code waited for the next microframe before every start-split - up to 125 us of spinning
+    // per poll, every 10 ms, for no benefit: the core schedules a periodic channel itself, and the only
+    // position that actually matters is microframe 6, where the complete-splits would straddle the
+    // frame boundary and the translator's per-frame pipeline. So skip only that one, and only by the
+    // single microframe needed to leave it.
+    let mut f0 = uframe_now(mmio);
+    if f0 & 0x7 == 6 {
+        // One microframe, bounded. Polls land on the same position each time (10 ms is exactly 80
+        // microframes), so simply returning here would mean never polling at all - the aliasing has to
+        // be broken rather than avoided.
+        let _ = wait_uframe_abs(ctx, mmio, (f0 + 1) & 0x3FFF);
+        f0 = uframe_now(mmio);
     }
-    wait_uframe(ctx, mmio, ssf);
     program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt); // ep_type 3 = interrupt
     let ss = match wait_halt(ctx, mmio, ch, 5) {
         Some(v) => v,
@@ -442,7 +496,8 @@ pub fn periodic_split_in(
         return ss; // the TT refused the start-split - try again next poll
     }
 
-    let mut csf = (ssf + 2) & 0x7;
+    // The complete-split window, as an ABSOLUTE microframe: start + 2, per USB 2.0's split schedule.
+    let mut csf = (f0 + 2) & 0x3FFF;
     let mut last = ss;
     // SIX complete-split attempts, not three.
     //
@@ -456,7 +511,15 @@ pub fn periodic_split_in(
     // hold the core. Six is chosen to cover the NYET runs actually seen in the logs while staying far
     // inside the ~1 ms the whole poll is allowed.
     for _ in 0..6 {
-        wait_uframe(ctx, mmio, csf);
+        if let Uframe::Missed = wait_uframe_abs(ctx, mmio, csf) {
+            // LATE: do not issue the complete-split.
+            //
+            // The translator has already discarded this transaction, so asking for it returns XACTERR
+            // and - worse - a complete-split for a transaction the TT no longer holds is what strands
+            // it. Abandoning costs one keystroke period; issuing it costs a wedge and the recovery
+            // ladder that follows. The next poll starts a fresh transaction, which is the recovery.
+            return last;
+        }
         program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt | (1 << 16));
         let cs = match wait_halt(ctx, mmio, ch, 5) {
             Some(v) => v,
@@ -469,7 +532,7 @@ pub fn periodic_split_in(
             return cs;
         }
         if cs & HCINT_NYET != 0 {
-            csf = (csf + 1) & 0x7; // the TT is not done - retry the complete-split a microframe later
+            csf = (csf + 1) & 0x3FFF; // the TT is not done - retry the complete-split a microframe later
             continue;
         }
         return cs;
