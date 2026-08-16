@@ -154,14 +154,43 @@ pub fn root_device(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> Option<RootD
     }
     ctx.log_fmt(format_args!("dwc2-svc: configured (bConfigurationValue={})", cfg_val));
 
-    let hub_multi_tt = class == CLASS_HUB && protocol == 2;
+    // MAKE THE MODE TRUE, do not infer it.
+    //
+    // `bDeviceProtocol == 2` says the hub CAN do one TT per port. It does not say it IS: USB 2.0
+    // §11.14 gives such a hub two interface settings - alternate 0 is SINGLE-TT mode and is the
+    // default, alternate 1 is multi-TT - and a hub stays in single-TT mode until the host selects
+    // alternate 1. We never sent that, so the hub was running single-TT while this code believed the
+    // descriptor and addressed TT remedies to the device's port.
+    //
+    // In single-TT mode there is exactly one translator and it is addressed as port 1, so every
+    // Clear_TT_Buffer went to a TT that does not exist. Hardware counted the result: 650 clears in
+    // ninety seconds, the wedge never lifting, and a keyboard that stopped after the first `ls`.
+    // Reading a capability as a configuration is how a repair gets aimed at nothing - the same
+    // mistake, one layer up, as re-enumerating a device to fix a hub.
+    //
+    // So SELECT the mode and believe the answer. If the hub accepts alternate 1 it really is
+    // per-port and the port number names the TT; if it refuses, it is single-TT and TT 1 is the only
+    // one there is. Either way the value below is established rather than assumed.
+    let hub_multi_tt = if class == CLASS_HUB && protocol == 2 {
+        // bmRequestType 0x01 = host-to-device, standard, INTERFACE. wValue = alternate setting 1,
+        // wIndex = interface 0 (a hub has exactly one).
+        let set_alt = [0x01, 0x0B, 1, 0, 0, 0, 0, 0];
+        let mut none: [u8; 0] = [];
+        let ok = chan::control(ctx, mmio, dma, &t, &set_alt, &mut none, false, 0);
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: hub advertises multi-TT - SET_INTERFACE(alt 1) {}",
+            if ok { "accepted: one TT per port" } else { "REFUSED: staying single-TT (TT 1)" }));
+        ok
+    } else {
+        false
+    };
     let hub_ports = if class == CLASS_HUB {
         let n = hub_port_count(ctx, mmio, dma, &t);
         if let Some(n) = n {
             ctx.log_fmt(format_args!(
-                "dwc2-svc: USB2 hub with {} downstream ports, {} (bDeviceProtocol {})",
+                "dwc2-svc: USB2 hub with {} downstream ports, running {} (bDeviceProtocol {})",
                 n,
-                if hub_multi_tt { "one TT per port" } else { "a SINGLE shared TT" },
+                if hub_multi_tt { "one TT per port" } else { "a SINGLE shared TT, addressed as TT 1" },
                 protocol));
         }
         n
