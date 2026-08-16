@@ -613,6 +613,27 @@ pub fn tx(
                 if flushed { "done, retrying" } else { "FAILED - transmit stays wedged" }));
         }
     }
+    // RELEASE THE ARMED RECEIVE BEFORE TRANSMITTING.
+    //
+    // This is what actually starves transmit, and it took a corrected register read to see. The
+    // receive path arms a bulk-IN and deliberately LEAVES it armed, because with BIR set the core
+    // NAK-retries in hardware and an idle device is silent by design. What that comment does not say
+    // is where those retries go: every one takes an entry in the core's NON-PERIODIC REQUEST QUEUE,
+    // the same queue a transmit needs. A quiet network therefore fills it with retried INs, and the
+    // OUT is never scheduled at all - which is exactly the observed fault, a channel that arms and
+    // transacts nothing with HCINT reading 0x00000000.
+    //
+    // GNPTXSTS said so plainly once read correctly: 0x18000100 is 256 FIFO words free and ZERO queue
+    // entries free. Space for the data, nowhere to put the request.
+    //
+    // So the IN stands aside for the duration of one frame. `rx` re-arms on its next pass because
+    // `in_armed` is what it tests, so this costs one round of receive latency; frames are not lost,
+    // the device holds them in its own FIFO, which is the whole reason RX_FIFO_INF is non-zero while
+    // this happens. Receive latency is a fair price for transmit existing at all.
+    if nic.in_armed {
+        chan::halt(mmio, CH_NET_RX);
+        nic.in_armed = false;
+    }
     let n = frame.len().min(FRAME_MAX);
     // TX_CMD_A = len | FIRST_SEG | LAST_SEG, TX_CMD_B = len. Both little-endian.
     let a = (n as u32) | 0x0000_2000 | 0x0000_1000;

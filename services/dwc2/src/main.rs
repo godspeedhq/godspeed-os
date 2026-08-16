@@ -697,8 +697,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // channel never halted - three faults with three different fixes, previously
                 // indistinguishable from this log.
                 ctx.log_fmt(format_args!(
-                    "dwc2-svc: net tx {}/{} fail (last HCINT=0x{:08x} nohalt {}, run {}, NPTXSTS=0x{:08x} qfree {}), rx {} bursts {} bytes {} frames {} unparsed",
-                    ns.0, ns.1, ns.11, ns.12, ns.13, ns.14, (ns.14 >> 24) & 0xFF,
+                    // GNPTXSTS field order, because getting it wrong inverted a diagnosis: [15:0]
+                    // is FIFO words free, [23:16] is REQUEST QUEUE entries free, [30:24] is the queue
+                    // TOP. This printed bits 24+ labelled "qfree" and so reported 24 free entries when
+                    // the true figure in [23:16] was ZERO - the register said the queue was exhausted
+                    // and the log said it was healthy, which killed a correct hypothesis for a boot.
+                    "dwc2-svc: net tx {}/{} fail (last HCINT=0x{:08x} nohalt {}, run {}, NPTXSTS=0x{:08x} qfree {} fifofree {}), rx {} bursts {} bytes {} frames {} unparsed",
+                    ns.0, ns.1, ns.11, ns.12, ns.13, ns.14,
+                    (ns.14 >> 16) & 0xFF, ns.14 & 0xFFFF,
                     ns.2, ns.3, ns.4, ns.5));
                 ctx.log_fmt(format_args!(
                     "dwc2-svc: net IN HCINT=0x{:08x} nohalt {} BMSR=0x{:04x} RX_FIFO=0x{:08x} INT_STS=0x{:08x}",
