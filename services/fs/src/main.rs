@@ -3139,12 +3139,75 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     // 30 s is chosen against the WORK: `block-driver` retries a busy device for up to 30 s per block,
     // so anything shorter abandons a request still being legitimately serviced.
     const BLOCK_RPC_SECS: i64 = 30;
-    let msg = Message::from_bytes(req);
+    // CORRELATION TAG at byte 0 of the request; `block-driver` echoes it at byte 0 of the reply and
+    // interprets it no further.
+    //
+    // Without it, a reply is matched to a request by ARRIVAL ORDER, and after a chaos storm that order
+    // is not reliable: 98 rounds of killing and restarting these services left the protocol out of
+    // step, `fs` read LBA 7702 and got a 17-byte reply where a 513-byte block belonged. That one was
+    // caught only because the SHAPE was wrong - and two reads of DIFFERENT blocks are both 513 bytes,
+    // so shape cannot separate them at all. The next such reply would have been believed, which is
+    // silent data corruption: the worst failure this system can have, and the one Commandment I is
+    // written against.
+    //
+    // Per-instance counter, incremented per request, wrapping. Wrapping is safe because only ONE
+    // request is outstanding at a time, so only the current tag is ever compared. Tag 0 is reserved
+    // for "untagged" and never issued, so a reply carrying 0 is from something that is not answering
+    // this request.
+    // The tag is DERIVED FROM THE REQUEST, not counted.
+    //
+    // A counter would need a home, and every home available here means threading mutable state through
+    // six functions and their callers - or a `static`, which is the unowned global state Invariant 9
+    // forbids and which the shell's own tag counter was moved out of for exactly that reason.
+    //
+    // A fold of the request bytes needs no state at all. Two requests that differ in op or in LBA fold
+    // differently, so a reply meant for another request is detected; two IDENTICAL requests fold the
+    // same, and their replies are genuinely interchangeable, so that collision is harmless by
+    // construction. One byte matches the tag width the shell already uses on its own fs channel.
+    let tag = {
+        let mut t: u8 = 0x5A;
+        for (i, b) in req.iter().enumerate() {
+            t = t.rotate_left(1) ^ b.wrapping_add(i as u8);
+        }
+        if t == 0 { 1 } else { t }   // never 0: a zero tag can only be an untagged sender
+    };
+    let mut tagged = [0u8; 4096];
+    tagged[0] = tag;
+    let n = req.len().min(tagged.len() - 1);
+    tagged[1..1 + n].copy_from_slice(&req[..n]);
+    let msg = Message::from_bytes(&tagged[..1 + n]);
+
+    // Check the tag and hand back the body WITHOUT it, so every caller parses exactly as before.
+    let take = |ctx: &ServiceContext, r: Message| -> Option<Message> {
+        let p = r.payload_bytes();
+        match p.split_first() {
+            Some((t, body)) if *t == tag => Some(Message::from_bytes(body)),
+            Some((t, _)) => {
+                // Loud: a discarded reply is proof the correlation is load-bearing, and a silent guard
+                // cannot tell us whether it ever fires (§26.4).
+                ctx.log_fmt(format_args!(
+                    "fs: discarded a block reply for tag {} while awaiting {} - the protocol is out of step",
+                    t, tag));
+                None
+            }
+            None => None,
+        }
+    };
+
     if let Some(r) = ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS) {
-        return Some(r);
+        if let Some(body) = take(ctx, r) {
+            return Some(body);
+        }
+        // Wrong tag: do NOT re-send. The request is already with the driver, and asking twice would
+        // ask for the WORK twice - a second write, or a second read that also arrives late. Fail this
+        // operation; the caller retries at its own level, by which time the queue has drained.
+        return None;
     }
     if ctx.reacquire_by_name("block-driver") {
-        return ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS);
+        if let Some(r) = ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS) {
+            return take(ctx, r);
+        }
+        return None;
     }
     ctx.log("fs: block-driver did not answer within 30 s (and could not be reacquired) - failing");
     None
