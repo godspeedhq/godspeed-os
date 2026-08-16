@@ -17,4 +17,8 @@ limit   = "8MiB"
 
 [capabilities]
 ipc_receive = ["time"]
+# `fs`, so the clock owns its own floor: read /clock.last at start-up, persist it when the clock is
+# set. One direction only - `time` asks `fs`, and NEVER `net-stack` (which calls `time` after SNTP;
+# two single-threaded services calling each other deadlock).
+ipc_send    = ["fs"]
 log_write   = true

@@ -116,6 +116,81 @@ fn reply(ctx: &ServiceContext, cap: godspeed_sdk::CapHandle, body: &[u8]) {
     ctx.remove_cap(cap);
 }
 
+/// Where the clock floor lives on disk.
+const FLOOR_PATH: &[u8] = b"/clock.last";
+/// fs opcodes this service uses. The wire format is [tag, op, path_len, path.., data..].
+const FS_OP_WRITE: u8 = 10;
+const FS_OP_READ: u8 = 11;
+const FS_OK: u8 = 0;
+/// How long an fs request may take before this service gives up on it for now.
+const FS_SECS: i64 = 2;
+/// How often to retry loading the floor while it has not been loaded yet.
+const FLOOR_RETRY_MS: u64 = 2_000;
+
+/// Ask `fs` for the persisted floor and adopt it.
+///
+/// Returns false while `fs` is not answering yet - this service starts before it, so the first
+/// attempts are expected to fail and are not an error.
+fn floor_load(ctx: &ServiceContext, clock: &mut Clock) -> bool {
+    let mut req = [0u8; 64];
+    req[0] = 0;                                   // tag: this service has one request outstanding
+    req[1] = FS_OP_READ;
+    req[2] = FLOOR_PATH.len() as u8;
+    req[3..3 + FLOOR_PATH.len()].copy_from_slice(FLOOR_PATH);
+    let n = 3 + FLOOR_PATH.len();
+    let reply = match ctx.request_with_reply_deadline("fs", &Message::from_bytes(&req[..n]), FS_SECS) {
+        Some(r) => r,
+        None => return false,                     // fs not up yet, or busy: try again later
+    };
+    let p = reply.payload_bytes();
+    if p.first() != Some(&FS_OK) || p.len() < 2 {
+        return false;                             // no file yet: nothing to adopt, and not a failure
+    }
+    // The file is the epoch in ASCII, as the shell wrote it.
+    let mut v: i64 = 0;
+    let mut any = false;
+    for &b in &p[1..] {
+        if !b.is_ascii_digit() { break; }
+        v = v.saturating_mul(10).saturating_add((b - b'0') as i64);
+        any = true;
+    }
+    if !any {
+        return false;
+    }
+    if v > clock.floor {
+        clock.floor = v;
+        ctx.log_fmt(format_args!("time: adopted clock floor {} from {}", v,
+                                 core::str::from_utf8(FLOOR_PATH).unwrap_or("?")));
+    }
+    true
+}
+
+/// Persist the floor, so the next boot starts no earlier than this moment.
+fn floor_store(ctx: &ServiceContext, epoch: i64) {
+    let mut num = [0u8; 24];
+    let mut i = num.len();
+    let mut v = if epoch < 0 { 0u64 } else { epoch as u64 };
+    if v == 0 { i -= 1; num[i] = b'0'; }
+    while v > 0 { i -= 1; num[i] = b'0' + (v % 10) as u8; v /= 10; }
+    let digits = &num[i..];
+
+    let mut req = [0u8; 64];
+    req[0] = 0;
+    req[1] = FS_OP_WRITE;
+    req[2] = FLOOR_PATH.len() as u8;
+    req[3..3 + FLOOR_PATH.len()].copy_from_slice(FLOOR_PATH);
+    let off = 3 + FLOOR_PATH.len();
+    req[off..off + digits.len()].copy_from_slice(digits);
+    let n = off + digits.len();
+    match ctx.request_with_reply_deadline("fs", &Message::from_bytes(&req[..n]), FS_SECS) {
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) =>
+            ctx.log_fmt(format_args!("time: clock floor {} recorded", epoch)),
+        // Loud, not silent: the floor will not survive this power cycle, and the next boot will know
+        // nothing. A degraded state to report (§26.7), not a thing to retry forever.
+        _ => ctx.log("time: could not record the clock floor (no filesystem?)"),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("time: starting - the wall clock is a service now (C1-6)");
@@ -125,8 +200,36 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let first = clock.now(&ctx);
     ctx.log_fmt(format_args!("time: serving; first reading {} (source {})", first, clock.source));
 
+    // RECONCILE IN THE BACKGROUND, AFTER THE SYSTEM IS UP.
+    //
+    // The Pi 2 has no RTC, so the only sources of truth are the persisted floor and the network - and
+    // neither may hold up a boot. Nothing waits for this: services start, the prompt answers, and the
+    // clock resolves itself afterwards if it can.
+    //
+    // While the floor is still unread this loop waits with a TIMEOUT so it wakes to retry; `fs` starts
+    // after this service, so the first attempts are expected to fail and are not errors. Once the floor
+    // is adopted (or the retries are spent) it reverts to a plain blocking `recv` and costs nothing at
+    // all. Bounded, self-terminating, and confined to the service that owns the clock - as opposed to
+    // the shell polling for it in front of the keyboard, which is what this replaces.
+    let mut floor_loaded = false;
+    let mut tries_left = 15u32;                   // ~30 s of retries, then stop asking
     loop {
-        let req = ctx.recv();
+        let req = if floor_loaded || tries_left == 0 {
+            ctx.recv()
+        } else {
+            match ctx.recv_timeout(ctx.duration_cycles(FLOOR_RETRY_MS)) {
+                Some(m) => m,
+                None => {
+                    tries_left -= 1;
+                    if floor_load(&ctx, &mut clock) {
+                        floor_loaded = true;
+                    } else if tries_left == 0 {
+                        ctx.log("time: no persisted clock floor after 30s - the clock stays unset until the network sets it");
+                    }
+                    continue;
+                }
+            }
+        };
         // The reply cap is taken ONCE, here, so no arm can take it twice or forget to. A request with
         // none is dropped LOUDLY: the caller is blocked waiting, and silence would leave it to time out
         // against a clean log.
@@ -161,11 +264,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 out[10..18].copy_from_slice(&age.to_le_bytes());
                 reply(&ctx, cap, &out);
             }
+            // Persisting here, not in a client, is the whole point: the clock's owner records the
+            // clock's floor at the moment it learns the time. `net-stack` PUSHES the SNTP result to
+            // this op - the direction that avoids a call cycle between two single-threaded services.
             OP_SET if p.len() >= 9 => {
                 let mut b = [0u8; 8];
                 b.copy_from_slice(&p[1..9]);
                 let ok = clock.set_network(&ctx, i64::from_le_bytes(b));
                 reply(&ctx, cap, &[u8::from(ok)]);
+                // The clock just became known: record the floor so the next boot starts no earlier
+                // than now. Answer the caller FIRST - `net-stack` is blocked on that reply, and it
+                // must not wait on a disk write to learn its own result.
+                if ok {
+                    floor_store(&ctx, clock.last);
+                    floor_loaded = true;         // the floor is now ours; stop retrying the read
+                }
             }
             OP_FLOOR_GET => {
                 let mut out = [0u8; 9];

@@ -637,7 +637,16 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "time" => Some(("time", ServiceConfig {
             elf:               include_bytes!(env!("SVC_TIME_ELF")),
             has_recv_endpoint: true,
-            send_peers:        &[],
+            // `fs`, so the clock can own its own FLOOR - read /clock.last at start-up and persist
+            // it when the clock is set. That duty used to sit in the SHELL, which polled `time` on the
+            // INPUT PATH waiting for a network clock, so on a machine that never syncs the prompt was
+            // unresponsive for the first thirty seconds of every boot. The clock's owner is the right
+            // place for the clock's state (§3.8: state belongs to the service that owns it).
+            //
+            // One direction only: `time` may ask `fs`. It must never call `net-stack`, which calls
+            // `time` to set the clock after SNTP - two single-threaded services calling each other is a
+            // deadlock, so the network stays a PUSH toward this service and never a pull from it.
+            send_peers:        &["fs"],
             send_peers_grant:  false,
             probe_mode:        0,
             // UNPINNED (§9.2: name a core only with a real reason). The clock has no interrupt to be

@@ -296,7 +296,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // seeds it before validating a fetched time (see cmd_date), which is a user-initiated moment when fs
     // has long settled and a slow answer is visible rather than silent.
 
-    wait_for_input_ready(&ctx);
+    // Do not wait: note it and carry on. A keystroke arriving later wakes the blocking read.
+    if !input_driver_announced(&ctx) {
+        ctx.log("shell: input driver not announced yet - prompting anyway (a later keystroke still wakes us)");
+    }
 
     // Boot is done: dismiss the boot screen on the TV (clear + stop mirroring logs
     // to it) and present a clean prompt. Serial keeps the full stream. This is also
@@ -442,17 +445,30 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // when somebody eventually pressed a key, or never. Polling until the sync lands and blocking
         // ever after costs a wakeup every MUTED_POLL_MS for the few seconds SNTP takes, and nothing at
         // all for the rest of the boot.
-        let b = if clock_floor_recorded || clock_gaveup {
-            ctx.console_read()
-        } else {
-            match ctx.try_console_read() {
-                Some(b) => b,
-                None => {
-                    ctx.sleep_ms(MUTED_POLL_MS);
-                    continue;
-                }
-            }
-        };
+        // ALWAYS BLOCK ON INPUT. The prompt waits for a keystroke and nothing else.
+        //
+        // This used to poll every 30 ms until a network clock arrived, so that an unattended machine
+        // would record its clock floor without anybody typing. The reasoning assumed "the few seconds
+        // SNTP takes" - but with no cable SNTP never lands, the give-up latch is 30 SECONDS, and the
+        // sleep it polls with is one no keystroke can interrupt. So on every boot of a machine with no
+        // network, the keyboard was dead-to-stuttering for the first thirty seconds. Reported from
+        // hardware as "keyboard doesn't work, I had to type in serial", and the shell's own comment
+        // predicted the symptom exactly ("bursts... the typing stutter reported on hardware") without
+        // anyone noticing it described the normal case rather than an edge one.
+        //
+        // The rule it breaks is the one this system is built on: wait on the TRUTH you need. What the
+        // prompt needs is a keystroke, and `console_read` blocks until exactly that - the kernel parks
+        // the task and the RX interrupt wakes it, with a lost-wakeup guard already in place. A clock
+        // has nothing to do with typing, and putting it in front of the read makes the user's primary
+        // interface hostage to a dependency that may never answer. That is the same fault as the
+        // network path spinning against the driver it was waiting for, one layer up and far more
+        // visible.
+        //
+        // The unattended clock-floor duty is NOT re-implemented here by other means, because the shell
+        // is the wrong owner for it: `time` owns the clock, so `time` should own its floor - reading
+        // it at start-up and persisting it when the clock is set. Removing it from the input path is
+        // the fix; putting it where it belongs is separate work, recorded rather than faked.
+        let b = ctx.console_read();
 
         match b {
             // Ctrl+Alt+Del (the SEC-2 follow-up). The USB driver cannot reboot - SEC-2 took REBOOT
@@ -1262,14 +1278,26 @@ impl Line {
 /// clear the boot screen without ever cutting it off mid-stream. The loop is just
 /// polling that flag; `MAX_SPINS` is a pure safety net for the impossible case
 /// where the driver never reports (it would mean xHCI hard-crashed at boot).
-fn wait_for_input_ready(ctx: &ServiceContext) {
-    const MAX_SPINS: u32 = 50_000_000;
-    for _ in 0..MAX_SPINS {
-        if ctx.input_ready() {
-            return;
-        }
-        ctx.yield_cpu();
-    }
+/// Report whether the input driver has announced itself - and do NOT wait for it.
+///
+/// This used to spin up to fifty million times before the shell printed its first prompt, waiting for
+/// the USB driver to report in. Three things wrong with that, and the third is the one that matters:
+///
+///   - it is a wait on a COUNT, which is not a duration: the same loop is a different length of time
+///     on every machine and every boot;
+///   - it is a spin, so it burns the core that `dwc2` needs to finish bringing the keyboard UP - the
+///     shell starving the very driver it was waiting for, the same self-defeating shape as the network
+///     path waiting on frames while saturating the service that fetches them;
+///   - and it is pointless. `console_read` blocks in the kernel on the input ring and is woken when a
+///     byte arrives, whether that byte comes from serial now or from a USB keyboard that finished
+///     enumerating a second later. Waiting for the driver to "be ready" buys nothing that blocking on
+///     the input itself does not already give.
+///
+/// The prompt is the user's interface and must exist from the moment the shell runs. Everything else -
+/// USB enumeration, the disk, the clock - comes up behind it, and the prompt simply works when it
+/// does.
+fn input_driver_announced(ctx: &ServiceContext) -> bool {
+    ctx.input_ready()
 }
 
 /// Split `s` into args with **minimal quoting**: a token wrapped in a matching pair of `'…'`
