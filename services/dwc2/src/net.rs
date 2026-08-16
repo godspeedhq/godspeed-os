@@ -292,6 +292,13 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
 
 const SMSC_TX_CFG: u16 = 0x10;
 const SMSC_TX_CFG_ON: u32 = 0x0000_0004;
+/// TX_CFG bit 0: flush the DEVICE's transmit FIFO. Self-clearing.
+///
+/// The way out of a partial frame stuck at the head of that FIFO. Note WHICH FIFO: an earlier fix
+/// flushed the HOST controller's non-periodic FIFO for this same symptom, which is the wrong box - the
+/// same error as re-enumerating a device to repair a hub's transaction translator. Linux never needs
+/// this because usbnet never leaves a short transfer behind; we did, so we need the way back.
+const SMSC_TX_CFG_FIFO_FLUSH: u32 = 0x0000_0001;
 const SMSC_INT_STS:     u16 = 0x08;
 /// RX FIFO information: bits [15:0] are the bytes the MAC has PUT IN the receive FIFO. This separates
 /// the two halves of "the device NAKs": a MAC that never saw a frame (link/PHY/receive engine) from a
@@ -774,9 +781,26 @@ pub fn tx(
     let mut why = (0u32, 0u32);
     let mut ping = nic.ping_out;
     let total = (n + 8) as u32;
-    let ok = bulk(ctx, mmio, t, nic.mps, false, nic.ep_out, dma.phys_at(TX_OFF) as u32,
-                  total, TX_BUDGET_MS, &mut nic.pid_out, Some(&mut why),
-                  Some(&mut ping)).is_some();
+    // COUNT THE BYTES. `.is_some()` treated a SHORT transfer as a complete one, and that is how the
+    // device ends up wedged: the 8-byte command tells it a frame of `n` bytes is coming, we deliver
+    // fewer, and it holds the incomplete frame at the head of its transmit FIFO waiting for a
+    // remainder that never arrives. Nothing behind it can go out, so the MAC has nothing complete to
+    // send while its FIFO stays nearly full - exactly what the device reported at the refusal:
+    // TX_FIFO_FREE=508, TX_ON set, INT_STS clear, MAC_CR healthy, link full duplex.
+    //
+    // One short transfer therefore kills transmit permanently, which is why it always died abruptly
+    // after a few hundred good frames and never came back.
+    let ok = match bulk(ctx, mmio, t, nic.mps, false, nic.ep_out, dma.phys_at(TX_OFF) as u32,
+                        total, TX_BUDGET_MS, &mut nic.pid_out, Some(&mut why), Some(&mut ping)) {
+        Some(got) if got == total => true,
+        Some(got) => {
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: SHORT transmit - {} of {} bytes went; the device now holds a partial frame",
+                got, total));
+            false
+        }
+        None => false,
+    };
     // Terminate an exact-multiple transfer with a zero-length packet, per FLAG_SEND_ZLP above. It is
     // a normal OUT of length 0 on the same endpoint, so it advances the data toggle like any other
     // packet - which the toggle readback in `bulk` already handles.
@@ -818,6 +842,12 @@ pub fn tx(
             //   MAC_CR  TXEN / FDPX / RCVOWN    - is the MAC configured for the link it got?
             //   FLOW / AFC_CFG                  - is it holding itself off with flow control?
             // Four theories died for want of these five words.
+            // FLUSH THE DEVICE'S TRANSMIT FIFO. A partial frame at its head blocks everything
+            // behind it forever and only the device can drop it. Frames queued behind are discarded,
+            // which costs nothing when not one of them was going out anyway.
+            smsc_write(ctx, mmio, dma, t, SMSC_TX_CFG, SMSC_TX_CFG_FIFO_FLUSH);
+            smsc_write(ctx, mmio, dma, t, SMSC_TX_CFG, SMSC_TX_CFG_ON);
+            ctx.log("dwc2-svc: flushed the DEVICE's TX FIFO - a partial frame blocks every frame behind it");
             ctx.log_fmt(format_args!(
                 "dwc2-svc: device TX state at refusal - TX_FIFO_FREE={} RX_FIFO_USED={} TX_CFG={:#010x} INT_STS={:#010x} MAC_CR={:#010x} FLOW={:#010x} AFC_CFG={:#010x}",
                 smsc_read_or0(ctx, mmio, dma, t, SMSC_TX_FIFO_INF) & 0xFFFF,
