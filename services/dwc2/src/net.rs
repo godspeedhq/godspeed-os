@@ -565,6 +565,21 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
     smsc_write(ctx, m, d, t, SMSC_ADDRL,
                (mac[0] as u32) | ((mac[1] as u32) << 8) | ((mac[2] as u32) << 16) | ((mac[3] as u32) << 24));
     smsc_write(ctx, m, d, t, SMSC_ADDRH, (mac[4] as u32) | ((mac[5] as u32) << 8));
+    // READ THE FILTER BACK. This is the address the chip matches UNICAST frames against, and nothing
+    // has ever confirmed it took.
+    //
+    // It matters because of an asymmetry visible on hardware: DHCP works and ARP does not. A DHCP
+    // offer reaches a client with no IP as a BROADCAST, which this chip accepts regardless of its
+    // address filter, while an ARP reply is UNICAST to our MAC and only arrives if the filter holds
+    // the right one. So "DHCP round-trips but ARP never answers" is exactly what a wrong or unwritten
+    // unicast filter looks like, and exactly what these two registers settle.
+    let rl = smsc_read_or0(ctx, m, d, t, SMSC_ADDRL);
+    let rh = smsc_read_or0(ctx, m, d, t, SMSC_ADDRH);
+    let back = [rl as u8, (rl >> 8) as u8, (rl >> 16) as u8, (rl >> 24) as u8, rh as u8, (rh >> 8) as u8];
+    ctx.log_fmt(format_args!(
+        "dwc2-svc: unicast filter reads back {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} - {}",
+        back[0], back[1], back[2], back[3], back[4], back[5],
+        if back == mac { "matches the station MAC" } else { "DOES NOT MATCH - unicast will be dropped" }));
 
     // Turbo RX: the chip aggregates MANY frames into one bulk-IN burst, each with its 4-byte status word
     // and DWORD-aligned - which is exactly what `rx` already parses. Read-modify-write, because a bare
