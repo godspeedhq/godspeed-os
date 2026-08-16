@@ -583,6 +583,26 @@ pub fn tx(
         }
         // Window elapsed: let ONE frame through to ask whether the device is willing yet.
         nic.tx_backoff_at = now;
+        // FLUSH THE FIFO BEFORE THE PROBE, when the signature says the core stalled rather than the
+        // device refusing.
+        //
+        // HCINT reading literally zero with the channel never halting is not a device declining a
+        // frame - a refusal is a NAK, and a NAK sets a bit. Zero means no transaction happened at
+        // all, which is the fault this driver's own bring-up comment describes: a stale non-periodic
+        // TX FIFO pointer, where "the channel arms but never transacts (ChEna set, HCINT=0, zero
+        // bytes moved)". That was diagnosed here during bring-up and the remedy was only ever applied
+        // AT bring-up, so the same wedge hours later had no path back - transmit froze at 590 frames
+        // and stayed frozen for the life of the service.
+        //
+        // Retrying the probe without this just re-asks a stalled FIFO. Gated on the signature so a
+        // genuinely refusing device (which needs patience, not a flush) is left alone, and it runs at
+        // most once per backoff window.
+        if nic.tx_hcint == 0 && nic.tx_nohalt != 0 {
+            let flushed = crate::core::flush_np_tx_fifo(ctx, mmio);
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: TX stalled with no transaction (HCINT=0) - non-periodic FIFO flush {}",
+                if flushed { "done, retrying" } else { "FAILED - transmit stays wedged" }));
+        }
     }
     let n = frame.len().min(FRAME_MAX);
     // TX_CMD_A = len | FIRST_SEG | LAST_SEG, TX_CMD_B = len. Both little-endian.

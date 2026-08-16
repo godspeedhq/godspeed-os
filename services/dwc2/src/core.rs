@@ -277,3 +277,28 @@ pub fn speed_name(hprt: u32) -> &'static str {
         _ => "unknown",
     }
 }
+
+/// Flush the NON-PERIODIC TX FIFO, at runtime.
+///
+/// The bring-up sequence above flushes every FIFO once, and its comment describes the exact fault
+/// this recovers from: a stale FIFO pointer makes the core's own write silently stall, so "the
+/// channel arms but never transacts (ChEna set, HCINT=0, zero bytes moved)". That was diagnosed on
+/// the Pi 2 during bring-up and then only ever remedied at bring-up - so when the same wedge appeared
+/// on the bulk-OUT endpoint hours into a session, nothing could clear it. Transmit froze permanently
+/// at 590 frames with HCINT reading literally zero: not a NAK, not an error, no transaction at all.
+///
+/// TxFNum 0 is the non-periodic FIFO, which is the one bulk OUT uses. Flushing ALL of them would also
+/// take the periodic FIFO the keyboard depends on, to fix a fault that is not there.
+///
+/// Safe to call from here because this service is SINGLE-THREADED: no other transfer can be mid-flight
+/// while a transmit is executing, and the receive path uses the RX FIFO, not this one. The AHB-idle
+/// wait is required by the programming guide and is the one precondition that is not structural.
+pub fn flush_np_tx_fifo(ctx: &ServiceContext, mmio: &Mmio) -> bool {
+    if !wait_until(ctx, mmio, GRSTCTL, GRSTCTL_AHBIDLE, true, 100) {
+        ctx.log("dwc2-svc: WARN AHB not idle - skipping TX FIFO flush rather than flushing mid-burst");
+        return false;
+    }
+    // TxFNum 0 = the non-periodic TX FIFO. (`GRSTCTL_TXFNUM_ALL` is 0x10, every FIFO.)
+    mmio.write32(GRSTCTL, GRSTCTL_TXFFLSH);
+    wait_until(ctx, mmio, GRSTCTL, GRSTCTL_TXFFLSH, false, 100)
+}
