@@ -39,6 +39,10 @@ pub const CH_BULK: u32 = 0;
 /// anything. This is the channel-per-stream rule the kernel driver learned by corrupting block
 /// transfers with an abandoned interrupt split.
 pub const CH_KBD: u32 = 1;
+/// The hub's status-change endpoint. Its own channel, like every other stream here: sharing one with
+/// the keyboard would mean a hot-plug check could destroy a split mid-flight, which is the class of
+/// bug the channel-per-stream split was introduced to prevent.
+pub const CH_HUB: u32 = 4;
 
 /// Channel-enable / disable bits in HCCHAR.
 const HCCHAR_CHENA: u32 = 1 << 31;
@@ -498,6 +502,19 @@ fn wait_uframe_abs(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> Uframe {
 /// OUGHT to do; this is what it DOES. Bounded to a handful of polls after each bind so it cannot
 /// flood, and silent thereafter.
 #[allow(clippy::too_many_arguments)]
+/// A plain interrupt IN - no split.
+///
+/// For a device attached DIRECTLY at high speed, which is what the hub itself is. None of the
+/// microframe scheduling the keyboard needs applies: there is no transaction translator in the path,
+/// so the transfer is programmed and waited on like any other.
+pub fn interrupt_in(
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ch: u32, pid: u32, buf_phys: u32, len: u32, ep: u32,
+) -> u32 {
+    program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, 0); // ep_type 3 = interrupt, no HCSPLT
+    wait_halt(ctx, mmio, ch, 5).unwrap_or(0)
+}
+
 pub fn periodic_split_in(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target,
     ch: u32, pid: u32, buf_phys: u32, len: u32, ep: u32, splt: u32, diag: bool,

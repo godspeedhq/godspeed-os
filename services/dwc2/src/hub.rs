@@ -193,6 +193,49 @@ pub fn reset_tt(
 }
 
 /// Read one downstream port's status. `None` if the request failed.
+/// Ask the hub which ports have changed - without asking about the ports.
+///
+/// The hub reports changes on an interrupt IN endpoint as a bitmap: bit N set means port N changed,
+/// and bit 0 means the hub itself. This is the truth being waited on (Commandment VIII); the
+/// alternative - reading every port's status on a timer - is a poll that costs the same whether
+/// anything happened or not, and reports it late by up to one interval.
+///
+/// The endpoint NAKs when nothing has changed, which is the ordinary answer and costs one transfer.
+/// `Some(0)` therefore means "asked, nothing to report"; `None` means the transfer did not complete
+/// and the caller should simply ask again next pass rather than infer anything.
+///
+/// The hub is directly attached at high speed, so this needs no split transaction - it is the plain
+/// interrupt IN that the keyboard cannot have.
+pub fn status_change(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, hub: &Target, ep: u8, mps: u16, pid: &mut u32,
+) -> Option<u32> {
+    const STATUS_OFF: usize = 0x0300;          // clear of the control scratch and the HID report
+    let len = (mps as u32).min(4);
+    for i in 0..len as usize {
+        dma.write8(STATUS_OFF + i, 0);
+    }
+    let hcint = chan::interrupt_in(
+        ctx, mmio, hub, chan::CH_HUB, *pid, dma.phys_at(STATUS_OFF) as u32, len, ep as u32);
+    if hcint & crate::regs::HCINT_XFERCOMPL == 0 {
+        // NAK is the ordinary "nothing changed"; anything else is a transfer that did not land and is
+        // not evidence of anything either way.
+        return if hcint & crate::regs::HCINT_NAK != 0 { Some(0) } else { None };
+    }
+    *pid = chan::pid_from_hctsiz(mmio, chan::CH_HUB);
+    let mut bits = 0u32;
+    for i in 0..len as usize {
+        bits |= (dma.read8(STATUS_OFF + i) as u32) << (i * 8);
+    }
+    Some(bits)
+}
+
+/// Clear a port's CONNECTION-CHANGE flag, so the hub stops reporting the same event forever.
+pub fn clear_connect_change(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, hub: &Target, port: u8,
+) {
+    let _ = port_feature(ctx, mmio, dma, hub, false, FEAT_C_PORT_CONNECTION, port);
+}
+
 pub fn port_status(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, port: u8,
 ) -> Option<PortStatus> {

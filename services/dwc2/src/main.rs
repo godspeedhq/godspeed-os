@@ -175,6 +175,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // conservative one: a request aimed at TT 1 on a multi-TT hub is at worst the wrong translator,
     // whereas assuming per-port translators on a single-TT hub sends every remedy into a void.
     let mut hub_multi_tt = false;
+    // The hub itself, its status-change endpoint, and the toggle for that endpoint - everything the
+    // hot-plug watch needs, learned once at enumeration.
+    let mut hub_target: Option<chan::Target> = None;
+    let mut hub_status_ep: Option<(u8, u16)> = None;
+    let mut hub_status_pid: u32 = chan::PID_DATA0;
+    // How many downstream ports the hub has - the bound on the change bitmap walk.
+    let mut hub_ports_total: u8 = 0;
+    // Which hub port each binding came from, so a disconnect knows what to drop.
+    //
+    // The bindings themselves do not record it: the keyboard's port is recoverable from its split
+    // descriptor, but the disk and NIC are direct and carry no port at all. Without this, "port 2 went
+    // away" cannot be turned into "the disk is gone".
+    let mut kbd_port: u8 = 0;
+    let mut disk_port: u8 = 0;
+    let mut nic_port: u8 = 0;
     if let Some(m) = ctx.mmio() {
         if core::identify(&ctx, &m).is_some() {
             let ok = core::reset_and_host_mode(&ctx, &m);
@@ -209,6 +224,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 match enumerate::root_device(&ctx, &m, &d) {
                     Some(dev) => {
                         hub_multi_tt = dev.hub_multi_tt;
+                        hub_target = Some(dev.target);
+                        hub_ports_total = dev.hub_ports.unwrap_or(0);
+                        hub_status_ep = dev.hub_status_ep;
+                        match dev.hub_status_ep {
+                            Some((ep, mps)) => ctx.log_fmt(format_args!(
+                                "dwc2-svc: hub status-change endpoint {} mps {} - hot-plug is watched",
+                                ep, mps)),
+                            None => ctx.log(
+                                "dwc2-svc: hub reports NO status-change endpoint - hot-plug cannot be detected"),
+                        }
                         ctx.log_fmt(format_args!(
                             "dwc2-svc: ENUMERATION OK - {:04x}:{:04x} class={:#04x} ports={}",
                             dev.vid, dev.pid, dev.class,
@@ -262,6 +287,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                             // declined. Both return None for "not mine", which is
                                             // the ordinary answer on most ports and is not logged.
                                             if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {
+                                                kbd_port = p;
                                                 // TELL THE USER INPUT IS LIVE, once, by making the
                                                 // shell reprint its prompt. The prompt appears about
                                                 // 2.5 s before this - deliberately, so it never waits
@@ -485,6 +511,87 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                 }
             }
+            // --- HOT-PLUG: the hub tells us what changed -------------------------------------
+            //
+            // One interrupt transfer per pass. The hub NAKs when nothing has happened, so the quiet
+            // case - which is nearly all of them - costs a single transfer and no port is interrogated
+            // at all. When something DOES change, the hub hands back a bitmap of which ports, and only
+            // those are looked at.
+            //
+            // This is the whole reason the driver was blind: `hub::survey` ran once during boot
+            // enumeration and nothing ever asked again, so a device plugged in afterwards did not
+            // exist and one unplugged was still being driven.
+            if let (Some(ht), Some((sep, smps))) = (hub_target, hub_status_ep) {
+                if let Some(bits) = hub::status_change(&ctx, &m, &d, &ht, sep, smps, &mut hub_status_pid) {
+                    // Bit 0 is the hub itself (over-current and the like); ports start at bit 1.
+                    // Bounded to the ports this hub actually has, so a garbled bitmap cannot send us
+                    // walking ports that do not exist.
+                    let nports = hub_ports_total.min(8);
+                    for port in 1..=nports {
+                        if bits & (1 << port) == 0 {
+                            continue;
+                        }
+                        // Acknowledge FIRST. An unacknowledged change is re-reported forever, and a
+                        // handler that fails partway would then spin on the same event.
+                        hub::clear_connect_change(&ctx, &m, &d, &ht, port);
+                        let connected = hub::port_status(&ctx, &m, &d, &ht, port)
+                            .map(|st| st.connected())
+                            .unwrap_or(false);
+                        if connected {
+                            ctx.log_fmt(format_args!("dwc2-svc: port {} - device CONNECTED", port));
+                            if let Some((_, _, _, dt, dsplt)) =
+                                hub::enumerate_downstream(&ctx, &m, &d, &ht, port, &mut next_addr)
+                            {
+                                if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {
+                                    ctx.log_fmt(format_args!("dwc2-svc: port {} - keyboard ready", port));
+                                    kbd_port = port;
+                                    state = hid::KeyState::new(&ctx);
+                                    kbd = Some((k, dt, dsplt));
+                                } else if let Some(mut dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
+                                    // Capacity is asked for the same way the boot path asks: it is what
+                                    // `block-driver` reads first, so binding without it would serve a
+                                    // disk of size zero.
+                                    let sectors = msc::read_capacity(&ctx, &m, &d, &dt, &mut dk)
+                                        .map(|(s, _)| s)
+                                        .unwrap_or(0);
+                                    ctx.log_fmt(format_args!(
+                                        "dwc2-svc: port {} - disk ready ({} sectors)", port, sectors));
+                                    disk_port = port;
+                                    disk = Some((dk, dt, sectors));
+                                } else if let Some(n) = net::bind(&ctx, &m, &d, &dt) {
+                                    ctx.log_fmt(format_args!("dwc2-svc: port {} - NIC ready", port));
+                                    nic_port = port;
+                                    nic = Some((n, dt));
+                                } else {
+                                    ctx.log_fmt(format_args!(
+                                        "dwc2-svc: port {} - device is none of keyboard, disk or NIC", port));
+                                }
+                            } else {
+                                ctx.log_fmt(format_args!(
+                                    "dwc2-svc: port {} - enumeration FAILED; nothing bound", port));
+                            }
+                        } else {
+                            // REMOVED. Drop the binding so requests are ANSWERED rather than sent to a
+                            // device that is not there: `answer_no_disk` and the net path both already
+                            // reply "unavailable", which is what a client needs to hear (§26.7).
+                            ctx.log_fmt(format_args!("dwc2-svc: port {} - device REMOVED", port));
+                            if kbd.is_some() && kbd_port == port {
+                                kbd = None;
+                                ctx.log("dwc2-svc: keyboard unplugged - input is dead until one is plugged back in");
+                            }
+                            if disk.is_some() && disk_port == port {
+                                disk = None;
+                                ctx.log("dwc2-svc: disk unplugged - block requests will be answered 'no disk'");
+                            }
+                            if nic.is_some() && nic_port == port {
+                                nic = None;
+                                ctx.log("dwc2-svc: NIC unplugged - frame requests will be answered empty");
+                            }
+                        }
+                    }
+                }
+            }
+
             let t_kbd = ctx.read_tsc();
             seg_serve = seg_serve.wrapping_add(t_kbd.wrapping_sub(t_pass));
             if let Some((k, kt, ksplt)) = kbd.as_ref() {

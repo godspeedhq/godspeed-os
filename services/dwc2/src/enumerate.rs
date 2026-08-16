@@ -34,6 +34,16 @@ pub struct RootDevice {
     pub mps0: u16,
     /// Downstream port count, if this is a hub.
     pub hub_ports: Option<u8>,
+    /// The hub's STATUS-CHANGE endpoint: (endpoint number, max packet size).
+    ///
+    /// A hub does not have to be asked whether anything was plugged in - it TELLS you, on an interrupt
+    /// IN endpoint, as a bitmap of the ports that changed (bit N = port N, bit 0 = the hub itself).
+    /// That is how Linux learns about hot-plug (`hub_irq`), and it is the difference between waiting on
+    /// the truth and interrogating every port on a timer.
+    ///
+    /// We never parsed it, which is why the userspace driver enumerated once at boot and was blind to
+    /// every plug and unplug afterwards.
+    pub hub_status_ep: Option<(u8, u16)>,
     /// Does this hub have one transaction translator PER PORT, or a single TT shared by all of them?
     ///
     /// `bDeviceProtocol` in the device descriptor: 1 = single TT, 2 = TT per port. It matters for
@@ -43,6 +53,36 @@ pub struct RootDevice {
     /// device's port to a single-TT hub is a well-formed request the hub accepts and acts on for a
     /// TT that does not exist, so the remedy reports success and clears nothing.
     pub hub_multi_tt: bool,
+}
+
+/// Find the first interrupt IN endpoint in a configuration descriptor.
+///
+/// For a hub this is the status-change endpoint - the one that reports which ports changed. The walk
+/// is bounded by the buffer and refuses a zero-length descriptor, because a device-supplied length of
+/// 0 would leave the cursor fixed and spin forever, and device-supplied data is exactly where that
+/// comes from.
+fn find_interrupt_in(buf: &[u8], total: usize) -> Option<(u8, u16)> {
+    const DESC_ENDPOINT: u8 = 0x05;
+    const EP_TYPE_INTERRUPT: u8 = 0x03;
+    let mut i = 0usize;
+    while i + 2 <= total {
+        let len = buf[i] as usize;
+        if len < 2 || i + len > total {
+            break;
+        }
+        if buf[i + 1] == DESC_ENDPOINT && len >= 7
+            && buf[i + 2] & 0x80 != 0
+            && buf[i + 3] & 0x03 == EP_TYPE_INTERRUPT
+        {
+            let mps = match u16::from_le_bytes([buf[i + 4], buf[i + 5]]) & 0x07FF {
+                0 => 1,
+                v => v,
+            };
+            return Some((buf[i + 2] & 0x0F, mps));
+        }
+        i += len;
+    }
+    None
 }
 
 /// SET_ADDRESS. No data stage.
@@ -146,6 +186,20 @@ pub fn root_device(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> Option<RootD
     // bConfigurationValue is byte 5. Use the value the DEVICE reports rather than assuming 1: it is
     // usually 1, and a device for which it is not would silently stay unconfigured.
     let cfg_val = cfg[5];
+    // Read the WHOLE configuration, not just its header, so the hub's status-change endpoint can be
+    // found. Only the 9-byte header was ever read here, which is all SET_CONFIGURATION needs - and it
+    // is why the endpoint that reports hot-plug has never been looked at.
+    let total = u16::from_le_bytes([cfg[2], cfg[3]]) as usize;
+    let want = total.min(chan::DATA_LEN);
+    let mut full_cfg = [0u8; chan::DATA_LEN];
+    let hub_status_ep = if class == CLASS_HUB
+        && want >= 9
+        && chan::get_descriptor(ctx, mmio, dma, &t, DESC_CONFIG, 0, &mut full_cfg, want)
+    {
+        find_interrupt_in(&full_cfg, want)
+    } else {
+        None
+    };
     let setup = [0x00, 0x09, cfg_val, 0, 0, 0, 0, 0];
     let mut none: [u8; 0] = [];
     if !chan::control(ctx, mmio, dma, &t, &setup, &mut none, false, 0) {
@@ -198,5 +252,5 @@ pub fn root_device(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> Option<RootD
         None
     };
 
-    Some(RootDevice { target: t, vid, pid, class, mps0, hub_ports, hub_multi_tt })
+    Some(RootDevice { target: t, vid, pid, class, mps0, hub_ports, hub_multi_tt, hub_status_ep })
 }
