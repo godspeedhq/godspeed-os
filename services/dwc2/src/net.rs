@@ -297,6 +297,15 @@ const SMSC_INT_STS:     u16 = 0x08;
 /// the two halves of "the device NAKs": a MAC that never saw a frame (link/PHY/receive engine) from a
 /// MAC holding frames it will not hand to the bulk endpoint (a USB-side problem). Nothing else can.
 const SMSC_RX_FIFO_INF: u16 = 0x18;
+/// TX Data FIFO FREE space (Linux `TX_FIFO_INF`, 0x1C, low 16 bits).
+///
+/// The register that answers the only question that ever mattered here: does the device have room for
+/// this frame? A NAK on a bulk OUT means "no buffer space" and nothing else, so this separates the two
+/// remaining explanations outright - zero free means frames really are not draining to the wire, while
+/// plenty free means the chip has room and the refusal is not about space at all.
+///
+/// We have been reading its RECEIVE twin since bring-up and never this one.
+const SMSC_TX_FIFO_INF: u16 = 0x1C;
 const SMSC_HW_CFG: u16 = 0x14;
 const SMSC_HW_CFG_LRST: u32 = 0x0000_0008;
 const SMSC_HW_CFG_BCE:  u32 = 0x0000_0002;
@@ -408,15 +417,32 @@ fn link_reconfigure(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) {
 fn link_fresh(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic) -> bool {
     let now = ctx.read_tsc();
     if nic.link_at == 0 || now.wrapping_sub(nic.link_at) >= ctx.duration_cycles(LINK_TTL_MS) {
-        let was = nic.link_up;
-        nic.link_up = link_up(ctx, m, d, t);
-        nic.link_at = now;
-        // The DOWN -> UP edge is where Linux reconfigures the MAC, and where this driver did nothing.
-        if nic.link_up && !was {
-            link_reconfigure(ctx, m, d, t);
-        }
+        let up = link_up(ctx, m, d, t);
+        link_observed(ctx, m, d, t, nic, up, now);
     }
     nic.link_up
+}
+
+/// Record an observation of the link, from WHEREVER it was made, and act on a down->up edge.
+///
+/// Every path that learns the link state must come through here. The first version let `OP_NET_INFO`
+/// write `link_up`/`link_at` directly - to share its fresh read with the cache, which was the right
+/// instinct - and that quietly consumed the edge: by the time `link_fresh` looked, the state was
+/// already UP and there was no transition left to see. `link_reconfigure` then ran exactly zero times
+/// on hardware while appearing, in the source, to be wired up.
+///
+/// One writer, one place the edge is decided. Two callers updating the same cached state is how a
+/// transition goes missing.
+fn link_observed(
+    ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic, up: bool, now: u64,
+) {
+    let was = nic.link_up;
+    let first = nic.link_at == 0;
+    nic.link_up = up;
+    nic.link_at = now;
+    if up && (!was || first) {
+        link_reconfigure(ctx, m, d, t);
+    }
 }
 /// RX burst size in 512-byte high-speed packets, and the IN transfer length that must match it.
 ///
@@ -793,7 +819,9 @@ pub fn tx(
             //   FLOW / AFC_CFG                  - is it holding itself off with flow control?
             // Four theories died for want of these five words.
             ctx.log_fmt(format_args!(
-                "dwc2-svc: device TX state at refusal - TX_CFG={:#010x} INT_STS={:#010x} MAC_CR={:#010x} FLOW={:#010x} AFC_CFG={:#010x}",
+                "dwc2-svc: device TX state at refusal - TX_FIFO_FREE={} RX_FIFO_USED={} TX_CFG={:#010x} INT_STS={:#010x} MAC_CR={:#010x} FLOW={:#010x} AFC_CFG={:#010x}",
+                smsc_read_or0(ctx, mmio, dma, t, SMSC_TX_FIFO_INF) & 0xFFFF,
+                smsc_read_or0(ctx, mmio, dma, t, SMSC_RX_FIFO_INF) & 0xFFFF,
                 smsc_read_or0(ctx, mmio, dma, t, SMSC_TX_CFG),
                 smsc_read_or0(ctx, mmio, dma, t, SMSC_INT_STS),
                 smsc_read_or0(ctx, mmio, dma, t, SMSC_MAC_CR),
@@ -1064,8 +1092,8 @@ pub fn serve(
             // This is a fresh read of the PHY, so let the transmit cache learn from it too - the
             // link question and the transmit guard must never disagree about the same cable.
             let up = link_up(ctx, mmio, dma, t);
-            nic.link_up = up;
-            nic.link_at = ctx.read_tsc();
+            let now = ctx.read_tsc();
+            link_observed(ctx, mmio, dma, t, nic, up, now);
             nic.stats.bmsr = mii_read(ctx, mmio, dma, t, SMSC_MII_BMSR).map_or(0xFFFF, u32::from);
             nic.stats.rx_fifo = smsc_read_or0(ctx, mmio, dma, t, SMSC_RX_FIFO_INF);
             nic.stats.int_sts = smsc_read_or0(ctx, mmio, dma, t, SMSC_INT_STS);
