@@ -307,6 +307,26 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u
                     o += 2 + len;
                 }
                 if !have_dns { dns = gw; }            // no DNS option: the gateway usually forwards DNS
+                // WHAT DID WE ACTUALLY GET? Placed in THIS closure deliberately: it is the one that
+                // demonstrably survives optimisation, where the same logging inside `dhcp_request`
+                // does not reach the binary at all.
+                //
+                // Three unknowns, one line: the frame LENGTH (the option walk starts at offset 282, so
+                // anything shorter than 284 means options are unreachable and every option-derived
+                // value is really the fallback), the message TYPE seen (2 = OFFER, 5 = ACK), and
+                // whether a server identifier was found (option 54 is what a REQUEST must name, and
+                // 0.0.0.0 means we never read one).
+                let mut mtype = 0u8;
+                let mut oo = 282usize;
+                while oo + 1 < f.len() {
+                    if f[oo] == 255 { break; }
+                    if f[oo] == 0 { oo += 1; continue; }
+                    if f[oo] == 53 && oo + 2 < f.len() { mtype = f[oo + 2]; }
+                    oo += 2 + f[oo + 1] as usize;
+                }
+                ctx.log_fmt(format_args!(
+                    "net-stack: DHCP reply - {} bytes, type {} (2=OFFER 5=ACK), server {}.{}.{}.{}",
+                    f.len(), mtype, srv[0], srv[1], srv[2], srv[3]));
                 found = Some((ip, gw, dns, srv));
                 true
             } else { false }
