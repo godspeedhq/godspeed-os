@@ -182,12 +182,28 @@ fn drain_scan(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8]) -
 /// address, so we cannot yet source packets from it, and the other DHCP servers on the segment need
 /// to see that their offers were declined.
 fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8; 4]) -> bool {
-    let mut frame = [0u8; 286];
+    // SIZED FOR ITS OWN OPTIONS. The DISCOVER's frame is 286 bytes because its option block is four
+    // bytes (type + end). A REQUEST carries three options - message type (3), requested address (6),
+    // server identifier (6) - plus the end byte: sixteen. Reusing 286 here wrote past the array on the
+    // FIRST call, every call.
+    //
+    // That panic is the whole reason this never worked, and it hid behind two symptoms I misread. The
+    // service died and was restarted six times a boot, so no REQUEST ever left the host - and because
+    // the compiler can PROVE the index is out of bounds, it correctly deleted everything after it: the
+    // ACK branch, its log, and the caller's failure log. I spent an hour treating that as an
+    // inscrutable optimiser quirk. It was the compiler telling me the code was wrong.
+    //
+    // 42 header bytes + 236 BOOTP + 4 magic cookie + 16 options = 298.
+    const REQ_LEN: usize = 298;
+    const DHCP_LEN: usize = REQ_LEN - 42;          // BOOTP + cookie + options, as UDP carries it
+    let mut frame = [0u8; REQ_LEN];
     for b in frame[0..6].iter_mut() { *b = 0xff; }
     frame[6..12].copy_from_slice(our_mac);
     frame[12] = 0x08; frame[13] = 0x00;
     frame[14] = 0x45; frame[15] = 0x00;
-    let total: u16 = 20 + 8 + 244;
+    // Lengths follow the ACTUAL frame, not the DISCOVER's constants. A REQUEST is longer, and a header
+    // that understates its payload is a packet a router is entitled to drop without comment.
+    let total: u16 = (20 + 8 + DHCP_LEN) as u16;
     frame[16] = (total >> 8) as u8; frame[17] = total as u8;
     frame[22] = 64;
     frame[23] = 17;
@@ -196,7 +212,7 @@ fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8
     frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
     frame[34] = 0; frame[35] = 68;
     frame[36] = 0; frame[37] = 67;
-    let udp_len: u16 = 8 + 244;
+    let udp_len: u16 = (8 + DHCP_LEN) as u16;
     frame[38] = (udp_len >> 8) as u8; frame[39] = udp_len as u8;
     frame[42] = 1; frame[43] = 1; frame[44] = 6;
     // The SAME xid as the DISCOVER: a REQUEST continues that transaction, and a server matches it by
