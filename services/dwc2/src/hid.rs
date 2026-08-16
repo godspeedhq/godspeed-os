@@ -395,10 +395,25 @@ pub fn poll(
                     "dwc2-svc: keyboard TT wedged ({} consecutive NYET) - cleared the hub's TT buffer [{} so far]",
                     NYET_WEDGED, state.clears));
             }
+            state.clears_since_data = state.clears_since_data.saturating_add(1);
             let _ = crate::hub::clear_tt_buffer(
                 ctx, mmio, dma, &hub, t.addr, kbd.ep, 3 /* interrupt */, true /* IN */, hub_port,
                 multi_tt);
             state.cleared_at = ctx.read_tsc();
+            // ESCALATE WHEN CLEARING IS NOT WORKING.
+            //
+            // Three clears with no report in between means the buffer flush is not the remedy for
+            // whatever this is, so reset the whole translator (USB 2.0 §11.24.2.9) rather than flushing
+            // one endpoint's entry a fourth time. Beyond that the caller re-enumerates the port - it
+            // watches `clears_since_data` for exactly this, because a NYET storm produces no XACTERR
+            // and would otherwise never reach that rung at all.
+            const CLEARS_BEFORE_RESET: u32 = 3;
+            if state.clears_since_data == CLEARS_BEFORE_RESET {
+                ctx.log_fmt(format_args!(
+                    "dwc2-svc: {} TT clears with no report - resetting the translator",
+                    CLEARS_BEFORE_RESET));
+                let _ = crate::hub::reset_tt(ctx, mmio, dma, &hub, hub_port, multi_tt);
+            }
             // The next poll starts a fresh start-split; the toggle is read back from hardware, so
             // there is no software state to reset here.
         }
@@ -421,6 +436,9 @@ pub fn poll(
     // still be decoded (that is how a key-up is seen), but it is worth separating in the count from
     // reports that carry a keypress, so "keys are arriving" and "keys are being released" do not look
     // the same from the log.
+    // A report of any kind - keypress or release - is proof the path works: the remedies are working
+    // or were never needed, so the escalation streak starts over.
+    state.clears_since_data = 0;
     let any = (0..8).any(|i| dma.read8(REPORT_OFF + i) != 0);
     if !any {
         state.pid = chan::pid_from_hctsiz(mmio, chan::CH_KBD);
@@ -521,6 +539,17 @@ pub struct KeyState {
     pub cleared_at: u64,
     /// How many TT clears this binding has needed. Rate-limits the log without muting the remedy.
     pub clears: u32,
+    /// Clears since the last DELIVERED report - the counter the escalation should have been using.
+    ///
+    /// A pure NYET storm never produces an XACTERR, and the ladder above escalated only on XACTERR, so
+    /// it could clear the TT three hundred times and never move to the next rung. Hardware showed
+    /// exactly that: `[300 so far]` and then `0 data, 0 nak, 1497 nyet` - fully wedged, remedy running
+    /// continuously, none of it helping.
+    ///
+    /// The evidence that matters is not WHICH error arrives, it is that NO DATA does. A remedy applied
+    /// repeatedly without the symptom changing is a remedy that is not working, whatever the error code
+    /// says, and the ladder must move on.
+    pub clears_since_data: u32,
 }
 
 impl KeyState {
@@ -539,6 +568,7 @@ impl KeyState {
             last_data: 0,
             n_data: 0, n_nak: 0, n_nyet: 0, n_stall: 0, n_xacterr: 0, n_silent: 0,
             n_other: 0, last_other: 0, nyet_run: 0, xacterr_run: 0, cleared_at: 0, clears: 0,
+            clears_since_data: 0,
             // ~1.5 s. Long enough that a deliberate hold keeps repeating through the initial 600 ms
             // delay and well beyond, short enough that a broken poll path stops within a couple of
             // characters instead of running to the next keypress.

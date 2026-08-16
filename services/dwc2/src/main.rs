@@ -523,7 +523,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // cold 300, without treating routine XACTERR noise on a low-speed device behind a
             // translator as a stuck endpoint.
             let stuck_at = if recently_cleared { 30 } else { 300 };
-            if state.xacterr_run >= stuck_at {
+            // A NYET STORM REACHES THIS RUNG TOO.
+            //
+            // The condition below is an XACTERR count, so a wedge that produces only NYET could never
+            // get here: it looped on the TT clear instead, three hundred times, while the keyboard sat
+            // at "0 data, 0 nak, 1497 nyet" - the remedy running continuously and none of it working.
+            //
+            // Six clears with no report in between is the same evidence an XACTERR run is: the device
+            // is not delivering and the cheaper rungs have had their turn. `hid` resets the translator
+            // at three; if six go by, the translator was not it either, and the port gets reset.
+            const CLEARS_STUCK: u32 = 6;
+            let clears_stuck = state.clears_since_data >= CLEARS_STUCK;
+            if state.xacterr_run >= stuck_at || clears_stuck {
                 state.xacterr_run = 0;
                 let hub_port = (*ksplt & 0x7F) as u8;
                 let hub_addr = ((*ksplt >> 7) & 0x7F) as u8;
@@ -550,10 +561,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     let _ = hub::reset_tt(&ctx, &m, &d, &hub_t, hub_port, hub_multi_tt);
                     continue;
                 }
-                ctx.log_fmt(format_args!(
-                    "dwc2-svc: keyboard endpoint stuck - {} consecutive XACTERR{}, no data; re-enumerating hub port {}",
-                    stuck_at, if recently_cleared { " after a TT clear that did not help" } else { "" },
-                    hub_port));
+                if clears_stuck {
+                    ctx.log_fmt(format_args!(
+                        "dwc2-svc: keyboard endpoint stuck - {} TT clears and a translator reset with no report; re-enumerating hub port {}",
+                        state.clears_since_data, hub_port));
+                } else {
+                    ctx.log_fmt(format_args!(
+                        "dwc2-svc: keyboard endpoint stuck - {} consecutive XACTERR{}, no data; re-enumerating hub port {}",
+                        stuck_at, if recently_cleared { " after a TT clear that did not help" } else { "" },
+                        hub_port));
+                }
+                state.clears_since_data = 0;
                 state.cleared_at = 0;
                 let mut addr = kt.addr; // re-assign the address it already had
                 // A RECOVERY THAT RUNS IN A LOOP IS NOT A RECOVERY.
