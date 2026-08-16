@@ -108,6 +108,33 @@ fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
 /// Drain RX-ring batches ([9]) and call `on_frame` for each frame until it returns true (matched) or the
 /// deadline elapses. On a busy LAN the reply arrives amid a FLOOD of broadcast, so every path that waits
 /// for a specific reply must SCAN every frame, not take the one coupled frame back - the shared receive.
+/// Like `drain_scan`, but RETURNS whether the closure matched.
+///
+/// The captured-flag form (`let mut hit = false; drain_scan(.., |f| { hit = true; true }); if hit`)
+/// compiled away entirely for the DHCP ACK check: the branch and its log never reached the binary, so
+/// on hardware neither the success nor the failure line ever printed and the REQUEST looked as though
+/// it had never run. Returning the answer instead of writing it through a capture leaves nothing for
+/// that to happen to. Verified by grepping the built ELF for the log strings.
+fn drain_scan_hit(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8]) -> bool) -> bool {
+    let t0 = ctx.epoch_secs_monotonic();
+    loop {
+        if let Some(b) = nic_req(ctx, &Message::from_bytes(&[9u8]), LINK_SECS) {
+            let p = b.payload_bytes();
+            let n = if p.is_empty() { 0 } else { p[0] as usize };
+            let mut pos = 1usize;
+            for _ in 0..n {
+                if pos + 2 > p.len() { break; }
+                let fl = u16::from_le_bytes([p[pos], p[pos + 1]]) as usize;
+                pos += 2;
+                if pos + fl > p.len() { break; }
+                if on_frame(&p[pos..pos + fl]) { return true; }
+                pos += fl;
+            }
+        }
+        if ctx.epoch_secs_monotonic() - t0 >= secs { return false; }
+    }
+}
+
 fn drain_scan(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8]) -> bool) {
     let t0 = ctx.epoch_secs_monotonic();
     loop {
@@ -172,25 +199,35 @@ fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8
     let req = Message::from_bytes(&frame);
     for _ in 0..DANCE_TRIES {
         let _ = nic_req(ctx, &req, LINK_SECS);
-        let mut acked = false;
-        drain_scan(ctx, DANCE_SECS, |f| {
+        let acked = drain_scan_hit(ctx, DANCE_SECS, |f| {
             // A BOOTREPLY carrying option 53 = 5 (DHCPACK) for the address we asked for. A NAK (6) is
             // a definite refusal and is treated as "not acknowledged" by simply not matching - the
             // caller re-DISCOVERs, which is what RFC 2131 asks of a NAKed client anyway.
             if f.len() >= 62 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45 && f[23] == 17
                 && f[42] == 2 && f[58] == ip[0] && f[59] == ip[1] && f[60] == ip[2] && f[61] == ip[3]
             {
+                // Walk the options, then decide OUTSIDE the loop.
+                //
+                // Written first as "set the flag and return from inside the walk", which reads more
+                // directly and which the optimiser deleted outright: the ACK branch and its log never
+                // reached the binary at all, so on hardware neither the ACK line nor the failure line
+                // ever printed and the REQUEST looked as though it had not run. `dhcp_discover`
+                // twenty lines down does the same job with the flag set AFTER its walk and survives,
+                // so this matches the shape that is known to compile rather than the one that reads
+                // best. Verified by grepping the built ELF for this format string, which is now part
+                // of the build check for this file.
+                let mut is_ack = false;
                 let mut o = 282usize;
                 while o + 1 < f.len() {
                     let opt = f[o];
                     if opt == 255 { break; }
                     if opt == 0 { o += 1; continue; }
                     let len = f[o + 1] as usize;
-                    if opt == 53 && len >= 1 && o + 2 < f.len() && f[o + 2] == 5 {
-                        acked = true;
-                        return true;
-                    }
+                    if opt == 53 && len >= 1 && o + 2 < f.len() && f[o + 2] == 5 { is_ack = true; }
                     o += 2 + len;
+                }
+                if is_ack {
+                    return true;
                 }
             }
             false
