@@ -533,8 +533,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // is not delivering and the cheaper rungs have had their turn. `hid` resets the translator
             // at three; if six go by, the translator was not it either, and the port gets reset.
             const CLEARS_STUCK: u32 = 6;
-            let clears_stuck = state.clears_since_data >= CLEARS_STUCK;
-            if state.xacterr_run >= stuck_at || clears_stuck {
+            // A PORT RESET RUNS AT MOST ONCE EVERY REENUM_MIN_MS, whatever any counter says.
+            //
+            // The reset itself takes ~310 ms and the device needs time afterwards to settle, so a
+            // remedy driven faster than that cannot work by construction - it interrupts its own
+            // recovery. Hardware showed the loop precisely: re-enumerate, wedge, re-enumerate, every
+            // 500 ms without end. Three attempts at tuning the THRESHOLD produced this same shape
+            // three times; the floor is what none of them had.
+            const REENUM_MIN_MS: u64 = 10_000;
+            let reenum_ready = state.reenum_at == 0
+                || ctx.read_tsc().wrapping_sub(state.reenum_at) >= ctx.duration_cycles(REENUM_MIN_MS);
+            let clears_stuck = state.clears_since_data >= CLEARS_STUCK && reenum_ready;
+            if (state.xacterr_run >= stuck_at && reenum_ready) || clears_stuck {
                 state.xacterr_run = 0;
                 let hub_port = (*ksplt & 0x7F) as u8;
                 let hub_addr = ((*ksplt >> 7) & 0x7F) as u8;
@@ -572,6 +582,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         hub_port));
                 }
                 state.clears_since_data = 0;
+                state.reenum_at = ctx.read_tsc();
                 state.cleared_at = 0;
                 let mut addr = kt.addr; // re-assign the address it already had
                 // A RECOVERY THAT RUNS IN A LOOP IS NOT A RECOVERY.

@@ -408,10 +408,17 @@ pub fn poll(
             // watches `clears_since_data` for exactly this, because a NYET storm produces no XACTERR
             // and would otherwise never reach that rung at all.
             const CLEARS_BEFORE_RESET: u32 = 3;
-            if state.clears_since_data == CLEARS_BEFORE_RESET {
+            // ...but no more than once every TT_RESET_MIN_MS, whatever the counter says.
+            const TT_RESET_MIN_MS: u64 = 2_000;
+            let now = ctx.read_tsc();
+            if state.clears_since_data >= CLEARS_BEFORE_RESET
+                && (state.tt_reset_at == 0
+                    || now.wrapping_sub(state.tt_reset_at) >= ctx.duration_cycles(TT_RESET_MIN_MS))
+            {
+                state.tt_reset_at = now;
                 ctx.log_fmt(format_args!(
                     "dwc2-svc: {} TT clears with no report - resetting the translator",
-                    CLEARS_BEFORE_RESET));
+                    state.clears_since_data));
                 let _ = crate::hub::reset_tt(ctx, mmio, dma, &hub, hub_port, multi_tt);
             }
             // The next poll starts a fresh start-split; the toggle is read back from hardware, so
@@ -539,6 +546,20 @@ pub struct KeyState {
     pub cleared_at: u64,
     /// How many TT clears this binding has needed. Rate-limits the log without muting the remedy.
     pub clears: u32,
+    /// When the translator was last reset, and when the port was last re-enumerated.
+    ///
+    /// RATE LIMITS, not thresholds - and the distinction is the whole lesson. Three separate attempts
+    /// today tuned WHEN to escalate (NYET_WEDGED at 8, an XACTERR rate, then 3 clears) and every one
+    /// made things worse in the same way: the remedy RESETS the device, so firing it sooner does not
+    /// detect the fault earlier, it stops the device ever settling. The third attempt re-enumerated
+    /// the port every 500 ms indefinitely.
+    ///
+    /// None of those attempts bounded how OFTEN the expensive remedy may run, which is the constraint
+    /// that was actually missing. A port reset takes ~310 ms and the device needs time afterwards, so
+    /// the floor below is a hard one: no threshold, however badly chosen, can drive the remedy faster
+    /// than the device can recover from it.
+    pub tt_reset_at: u64,
+    pub reenum_at: u64,
     /// Clears since the last DELIVERED report - the counter the escalation should have been using.
     ///
     /// A pure NYET storm never produces an XACTERR, and the ladder above escalated only on XACTERR, so
@@ -568,7 +589,7 @@ impl KeyState {
             last_data: 0,
             n_data: 0, n_nak: 0, n_nyet: 0, n_stall: 0, n_xacterr: 0, n_silent: 0,
             n_other: 0, last_other: 0, nyet_run: 0, xacterr_run: 0, cleared_at: 0, clears: 0,
-            clears_since_data: 0,
+            clears_since_data: 0, tt_reset_at: 0, reenum_at: 0,
             // ~1.5 s. Long enough that a deliberate hold keeps repeating through the initial 600 ms
             // delay and well beyond, short enough that a broken poll path stops within a couple of
             // characters instead of running to the next keypress.
