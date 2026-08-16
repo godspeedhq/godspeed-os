@@ -510,6 +510,9 @@ impl ServiceContext {
     /// (TSC cycles) elapse: `Some(msg)` = message, `None` = timed out. `timeout_cycles == 0`
     /// blocks forever. A driver uses this to idle on its hardware interrupt while still
     /// waking on a timer for auto-repeat (§12 timed-wait).
+    /// `#[inline(always)]` for the same reason as `await_slice`: it returns a 4 KiB `Message` by
+    /// value, so as a separate frame it costs 4 KiB of stack on every caller.
+    #[inline(always)]
     pub fn recv_timeout(&self, timeout_cycles: u64) -> Option<Message> {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return None; }
@@ -742,6 +745,18 @@ impl ServiceContext {
     ///
     /// Sliced rather than one long block so callers that must also watch something else - a keypress,
     /// an abort flag - get the chance, without any of them going back to spinning.
+    ///
+    /// `#[inline(always)]`, and that attribute is load-bearing rather than an optimisation hint. A
+    /// `Message` is 4096 bytes BY VALUE, so a wrapper that returns one is not free: it is a whole
+    /// extra 4 KiB stack frame on every request in every service. Introducing this helper cost `fs`
+    /// exactly that, and `fs` was already the service closest to its 256 KiB limit - it began taking a
+    /// data abort at `mount`, with SP below the bottom of its stack region.
+    ///
+    /// It only showed on hardware. QEMU's raspi2b has no disk, so `fs` never mounts and never makes
+    /// the deep block calls, and thirty-second QEMU boots kept coming back clean while the board
+    /// restart-looped. A one-line wrapper around a large return value has to be inlined or it must not
+    /// exist.
+    #[inline(always)]
     fn await_slice(&self, ms: u64) -> Option<crate::ipc::Message> {
         self.recv_timeout(self.duration_cycles(ms))
     }
