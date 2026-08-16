@@ -3171,63 +3171,54 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
         }
         if t == 0 { 1 } else { t }   // never 0: a zero tag can only be an untagged sender
     };
-    // 528, NOT 4096. The largest block request is OP_WRITE_BLOCK - [op, lba(8), data(512)] = 521
-    // bytes - so a full message frame here is 3.5 KiB of stack for nothing.
+    // NO EXTRA BUFFERS, AND NO HELPER THAT TAKES A `Message`.
     //
-    // That "for nothing" cost a boot: `fs` runs near its 256 KiB stack, and a 4 KiB temporary here
-    // took it over. Instant data abort at startup (addr just above SP_usr) and a restart loop, which
-    // is precisely the failure the comment ten lines above this one already describes from the last
-    // time a 4 KiB temporary was added to this function. I read that comment, edited the code under
-    // it, and made the same mistake anyway.
-    const MAX_BLOCK_REQ: usize = 528;
-    let mut tagged = [0u8; MAX_BLOCK_REQ];
-    tagged[0] = tag;
-    let n = req.len().min(tagged.len() - 1);
-    tagged[1..1 + n].copy_from_slice(&req[..n]);
-    let msg = Message::from_bytes(&tagged[..1 + n]);
+    // In `fs` a `Message` is not a handle - it carries a 4096-byte payload BY VALUE - so every
+    // expression that produces or moves one costs four kilobytes of stack, and this service runs near
+    // its 256 KiB limit. I overflowed it twice in a row here: first with a 4 KiB request buffer, then
+    // with `Message::from_bytes(body)` to return a trimmed copy, then again by passing the reply
+    // through a closure that moves it in and out. Same data abort each time, the address always just
+    // above SP_usr.
+    //
+    // So the tag is written into the message that ALREADY EXISTS, and checked in place on the reply
+    // that already exists. No temporary of any size, and the frame is what it was before tagging.
+    let mut msg = Message::from_bytes(req);
+    let rn = msg.payload_len.min(godspeed_sdk::ipc::MAX_PAYLOAD - 1);
+    msg.payload.copy_within(0..rn, 1);
+    msg.payload[0] = tag;
+    msg.payload_len = rn + 1;
 
-    // Check the tag and strip it IN PLACE, so every caller parses exactly as before.
-    //
-    // `Message::from_bytes(body)` would build a SECOND message, and a `Message` carries a 4096-byte
-    // payload array by value - so returning a trimmed copy puts 4 KiB of stack on top of the 4 KiB
-    // already holding the reply. `fs` runs near its 256 KiB stack and that is an instant data abort at
-    // startup with a restart loop behind it; the comment above this function describes the same
-    // failure from the last time a second message frame was added here, and I reproduced it twice in
-    // one evening - first with a 4 KiB request buffer, then with this.
-    //
-    // Shifting the bytes down by one costs no frame at all: the reply is already ours, and dropping
-    // its first byte is a move within the array it is already in.
-    let take = |ctx: &ServiceContext, mut r: Message| -> Option<Message> {
+    if let Some(mut r) = ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS) {
         let n = r.payload_len;
         if n == 0 {
             return None;
         }
-        let t = r.payload[0];
-        if t != tag {
+        if r.payload[0] != tag {
             // Loud: a discarded reply is proof the correlation is load-bearing, and a silent guard
             // cannot tell us whether it ever fires (§26.4).
             ctx.log_fmt(format_args!(
                 "fs: discarded a block reply for tag {} while awaiting {} - the protocol is out of step",
-                t, tag));
+                r.payload[0], tag));
+            // Do NOT re-send: the request is already with the driver, and asking twice would ask for
+            // the WORK twice - a second write, or a second read that also arrives late. The caller
+            // retries at its own level, by which point the queue has drained.
             return None;
         }
         r.payload.copy_within(1..n, 0);
         r.payload_len = n - 1;
-        Some(r)
-    };
-
-    if let Some(r) = ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS) {
-        if let Some(body) = take(ctx, r) {
-            return Some(body);
-        }
-        // Wrong tag: do NOT re-send. The request is already with the driver, and asking twice would
-        // ask for the WORK twice - a second write, or a second read that also arrives late. Fail this
-        // operation; the caller retries at its own level, by which time the queue has drained.
-        return None;
+        return Some(r);
     }
     if ctx.reacquire_by_name("block-driver") {
-        if let Some(r) = ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS) {
-            return take(ctx, r);
+        // Written out rather than shared with the arm above: factoring it into a helper would move a
+        // `Message` across a call boundary, which is the four kilobytes this whole comment is about.
+        if let Some(mut r) = ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS) {
+            let n = r.payload_len;
+            if n == 0 || r.payload[0] != tag {
+                return None;
+            }
+            r.payload.copy_within(1..n, 0);
+            r.payload_len = n - 1;
+            return Some(r);
         }
         return None;
     }
