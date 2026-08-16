@@ -3126,6 +3126,15 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 /// One block-driver RPC with restart recovery: if the reply is missing (block-driver may have
 /// restarted, leaving our cached cap EndpointDead), reacquire a fresh cap by name (via the kernel
 /// directory) and retry once (Phase D, §14.3). All block I/O goes through here.
+/// The reply body, past the correlation tag at byte 0.
+///
+/// A borrow, not a copy: in `fs` a `Message` is 4 KiB by value, so anything that produces one costs
+/// that much stack. Every block reply is read through here.
+fn block_body(reply: &Message) -> &[u8] {
+    let p = reply.payload_bytes();
+    if p.is_empty() { p } else { &p[1..] }
+}
+
 fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     // BOUNDED, on the LEAN await. The undeadlined form wakes only on the peer's DEATH, so a
     // block-driver that is alive but silent hung `fs` permanently and every shell command behind it.
@@ -3189,8 +3198,7 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     msg.payload_len = rn + 1;
 
     if let Some(mut r) = ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS) {
-        let n = r.payload_len;
-        if n == 0 {
+        if r.payload_len == 0 {
             return None;
         }
         if r.payload[0] != tag {
@@ -3204,20 +3212,19 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
             // retries at its own level, by which point the queue has drained.
             return None;
         }
-        r.payload.copy_within(1..n, 0);
-        r.payload_len = n - 1;
+        // RETURN IT UNTOUCHED. Mutating the reply here (shifting the tag off) makes it a real local
+        // that must then be COPIED into the return slot - another four kilobytes on a stack that had
+        // none to spare, which is the third form this same overflow took. Callers skip byte 0 with
+        // `block_body`, which costs nothing.
         return Some(r);
     }
     if ctx.reacquire_by_name("block-driver") {
         // Written out rather than shared with the arm above: factoring it into a helper would move a
         // `Message` across a call boundary, which is the four kilobytes this whole comment is about.
         if let Some(mut r) = ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS) {
-            let n = r.payload_len;
-            if n == 0 || r.payload[0] != tag {
+            if r.payload_len == 0 || r.payload[0] != tag {
                 return None;
             }
-            r.payload.copy_within(1..n, 0);
-            r.payload_len = n - 1;
             return Some(r);
         }
         return None;
@@ -3242,7 +3249,7 @@ const MAX_SANE_SECTORS: u64 = 1 << 48;
 /// reason: an absurd count is a mis-read, not a disk.
 fn block_capacity(ctx: &ServiceContext) -> Option<u64> {
     let reply = block_rpc(ctx, &[OP_CAPACITY])?;
-    let p = reply.payload_bytes();
+    let p = block_body(&reply);
     if p.first() != Some(&BLK_OK) || p.len() != 9 { return None; }
     let sectors = u64_at(p, 1);
     if sectors > MAX_SANE_SECTORS { return None; }
@@ -3255,7 +3262,7 @@ fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
     req[0] = OP_READ_BLOCK;
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     let reply = block_rpc(ctx, &req)?;
-    let p = reply.payload_bytes();
+    let p = block_body(&reply);
     if p.first() == Some(&BLK_OK) && p.len() >= 1 + BLOCK {
         let mut out = [0u8; BLOCK];
         out.copy_from_slice(&p[1..1 + BLOCK]);
@@ -3285,7 +3292,7 @@ fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     req[9..17].copy_from_slice(&count.to_le_bytes());
     match block_rpc(ctx, &req) {
-        Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
+        Some(reply) => block_body(&reply).first() == Some(&BLK_OK),
         None => false,
     }
 }
@@ -3304,7 +3311,7 @@ fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
 /// `false` means the data is NOT known to be on the medium and the caller must say so (§26.5, §26.7).
 fn block_flush(ctx: &ServiceContext) -> bool {
     match block_rpc(ctx, &[OP_FLUSH]) {
-        Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
+        Some(reply) => block_body(&reply).first() == Some(&BLK_OK),
         None => false,
     }
 }
@@ -3325,7 +3332,7 @@ fn block_write(ctx: &ServiceContext, lba: u64, data: &[u8; BLOCK]) -> bool {
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     req[9..].copy_from_slice(data);
     match block_rpc(ctx, &req) {
-        Some(reply) if reply.payload_bytes().first() == Some(&BLK_OK) => true,
+        Some(reply) if block_body(&reply).first() == Some(&BLK_OK) => true,
         _ => {
             ctx.log_fmt(format_args!("fs: block write failed at lba {} (device I/O error)", lba));
             false
