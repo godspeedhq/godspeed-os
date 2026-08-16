@@ -3186,21 +3186,34 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     tagged[1..1 + n].copy_from_slice(&req[..n]);
     let msg = Message::from_bytes(&tagged[..1 + n]);
 
-    // Check the tag and hand back the body WITHOUT it, so every caller parses exactly as before.
-    let take = |ctx: &ServiceContext, r: Message| -> Option<Message> {
-        let p = r.payload_bytes();
-        match p.split_first() {
-            Some((t, body)) if *t == tag => Some(Message::from_bytes(body)),
-            Some((t, _)) => {
-                // Loud: a discarded reply is proof the correlation is load-bearing, and a silent guard
-                // cannot tell us whether it ever fires (§26.4).
-                ctx.log_fmt(format_args!(
-                    "fs: discarded a block reply for tag {} while awaiting {} - the protocol is out of step",
-                    t, tag));
-                None
-            }
-            None => None,
+    // Check the tag and strip it IN PLACE, so every caller parses exactly as before.
+    //
+    // `Message::from_bytes(body)` would build a SECOND message, and a `Message` carries a 4096-byte
+    // payload array by value - so returning a trimmed copy puts 4 KiB of stack on top of the 4 KiB
+    // already holding the reply. `fs` runs near its 256 KiB stack and that is an instant data abort at
+    // startup with a restart loop behind it; the comment above this function describes the same
+    // failure from the last time a second message frame was added here, and I reproduced it twice in
+    // one evening - first with a 4 KiB request buffer, then with this.
+    //
+    // Shifting the bytes down by one costs no frame at all: the reply is already ours, and dropping
+    // its first byte is a move within the array it is already in.
+    let take = |ctx: &ServiceContext, mut r: Message| -> Option<Message> {
+        let n = r.payload_len;
+        if n == 0 {
+            return None;
         }
+        let t = r.payload[0];
+        if t != tag {
+            // Loud: a discarded reply is proof the correlation is load-bearing, and a silent guard
+            // cannot tell us whether it ever fires (§26.4).
+            ctx.log_fmt(format_args!(
+                "fs: discarded a block reply for tag {} while awaiting {} - the protocol is out of step",
+                t, tag));
+            return None;
+        }
+        r.payload.copy_within(1..n, 0);
+        r.payload_len = n - 1;
+        Some(r)
     };
 
     if let Some(r) = ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS) {
