@@ -99,6 +99,15 @@ pub struct Nic {
     /// faults with different fixes. Recording it costs a field and removes a guess.
     pub tx_hcint: u32,
     pub tx_nohalt: u32,
+    /// GNPTXSTS at the last failed transmit: bits [31:24] are request-queue entries FREE, [15:0] are
+    /// FIFO words free.
+    ///
+    /// This is the register that separates the two remaining explanations for a transaction that
+    /// never happens. FIFO space with NO queue space means the core has nowhere to put the request -
+    /// the signature of aborted channels whose entries were never retired. Both non-zero means the
+    /// core could have scheduled it and chose not to, which is a different bug entirely. Guessing
+    /// between those cost a boot on the FIFO-flush theory; reading it costs a word.
+    pub tx_nptxsts: u32,
 }
 
 /// Consecutive failures before this endpoint is presumed unwilling.
@@ -256,7 +265,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
     Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(), in_armed: false,
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
                link_up: false, link_at: 0,
-               tx_fail_run: 0, tx_backoff_at: 0, tx_hcint: 0, tx_nohalt: 0 })
+               tx_fail_run: 0, tx_backoff_at: 0, tx_hcint: 0, tx_nohalt: 0, tx_nptxsts: 0 })
 }
 
 // --- smsc95xx (LAN9514) bring-up -------------------------------------------------------------------
@@ -637,6 +646,7 @@ pub fn tx(
         nic.stats.tx_fail += 1;
         nic.tx_hcint = why.0;
         nic.tx_nohalt = why.1;
+        nic.tx_nptxsts = mmio.read32(crate::regs::GNPTXSTS);
         nic.tx_fail_run = nic.tx_fail_run.saturating_add(1);
         if nic.tx_fail_run == TX_FAIL_RUN {
             nic.tx_backoff_at = now;

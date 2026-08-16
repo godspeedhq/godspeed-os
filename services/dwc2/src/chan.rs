@@ -87,15 +87,7 @@ pub fn program(
     // Channel-reuse hygiene: if a prior transaction left the channel ENABLED - a timeout that never
     // truly halted, or a split phase re-arm - disable it cleanly before reprogramming. Never reuse a
     // half-live channel.
-    if mmio.read32(hcchar_at(ch)) & HCCHAR_CHENA != 0 {
-        mmio.write32(hcchar_at(ch), (mmio.read32(hcchar_at(ch)) & !HCCHAR_CHENA) | HCCHAR_CHDIS);
-        // Bounded: this is a register handshake, not a device transaction, so a small spin is right.
-        let mut t = 0u32;
-        while mmio.read32(hcchar_at(ch)) & HCCHAR_CHENA != 0 {
-            t += 1;
-            if t > 100_000 { break; }
-        }
-    }
+    halt(mmio, ch);
 
     mmio.write32(hcint_at(ch), 0xFFFF_FFFF);
     mmio.write32(hctsiz_at(ch), (len & 0x7_FFFF) | ((pkts & 0x3ff) << 19) | (pid << 29));
@@ -137,6 +129,42 @@ pub fn pid_from_hctsiz(mmio: &Mmio, ch: u32) -> u32 {
 }
 
 /// Wait for a channel to halt, bounded by the CLOCK. Returns the latched HCINT, or `None` on timeout.
+/// Abort a running channel, the way the core requires.
+///
+/// **Both ChEna AND ChDis must be set.** This read as "clear ChEna, set ChDis" in two places, which
+/// looks like the obvious way to stop a channel and is the documented-wrong one: the DWC2 programming
+/// guide, and Linux's `dwc2_hc_halt`, both write ChEna|ChDis together, because the core needs ChEna
+/// set to PROCESS the halt - that is how it dequeues the channel's outstanding request from the
+/// non-periodic request queue.
+///
+/// Clearing ChEna instead stops the software's view and leaves the core's. The request is never
+/// retired, and that queue is only a handful of entries deep, so every abandoned transfer
+/// permanently consumes one. Hardware showed the end state exactly: transmit worked 584 times, then
+/// degraded, then stopped forever with HCINT reading 0x00000000 and the channel never halting - not
+/// a device refusing frames (that is a NAK, and a NAK sets a bit) but transactions that were never
+/// scheduled at all, because there was no room left to schedule them. Flushing the FIFO did not
+/// touch it, which is what ruled the FIFO out.
+///
+/// Bounded, and it waits for the halt to actually land: an abort that returns before the core has
+/// finished is the same abandoned-channel bug in a smaller window.
+pub fn halt(mmio: &Mmio, ch: u32) {
+    let hcchar = mmio.read32(hcchar_at(ch));
+    if hcchar & HCCHAR_CHENA == 0 {
+        return;                       // already idle - nothing queued to retire
+    }
+    mmio.write32(hcchar_at(ch), hcchar | HCCHAR_CHENA | HCCHAR_CHDIS);
+    // Spin for the core to retire it. This is a register handshake with the controller, not a wait on
+    // a device, so a bounded spin is the right shape - and if it ever expires the channel is left
+    // exactly as an unbounded wait would leave it, minus the hang.
+    let mut t = 0u32;
+    while mmio.read32(hcchar_at(ch)) & HCCHAR_CHENA != 0 {
+        t += 1;
+        if t > 100_000 {
+            break;
+        }
+    }
+}
+
 pub fn wait_halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32, ms: u64) -> Option<u32> {
     let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(ms));
     loop {
@@ -146,8 +174,10 @@ pub fn wait_halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32, ms: u64) -> Option<
         }
         if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
             // Leave the channel clean for the next user rather than abandoning it enabled - the
-            // failure this driver's channel-per-stream split exists to prevent.
-            mmio.write32(hcchar_at(ch), (mmio.read32(hcchar_at(ch)) & !HCCHAR_CHENA) | HCCHAR_CHDIS);
+            // failure this driver's channel-per-stream split exists to prevent. `halt` is what makes
+            // that true: it retires the core's outstanding request, which the old open-coded disable
+            // did not.
+            halt(mmio, ch);
             return None;
         }
     }

@@ -644,8 +644,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let ns = nic.as_ref().map(|(n, _)| {
                     let s = &n.stats;
                     (s.tx_ok, s.tx_fail, s.rx_bursts, s.rx_bytes, s.rx_frames, s.rx_bad, s.rx_hcint, s.rx_nohalt, s.bmsr, s.rx_fifo, s.int_sts,
-                     n.tx_hcint, n.tx_nohalt, n.tx_fail_run)
-                }).unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+                     n.tx_hcint, n.tx_nohalt, n.tx_fail_run, n.tx_nptxsts)
+                }).unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
                 // RE-MEASURE ONCE, QUIET. The boot-time sweep runs while the console is saturated,
                 // and a serial write is an un-preemptible syscall of ~9 ms per log line - which is
                 // the mean it reported. One repeat on a settled system separates "the timer is slow"
@@ -697,8 +697,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // channel never halted - three faults with three different fixes, previously
                 // indistinguishable from this log.
                 ctx.log_fmt(format_args!(
-                    "dwc2-svc: net tx {}/{} fail (last HCINT=0x{:08x} nohalt {}, run {}), rx {} bursts {} bytes {} frames {} unparsed",
-                    ns.0, ns.1, ns.11, ns.12, ns.13, ns.2, ns.3, ns.4, ns.5));
+                    "dwc2-svc: net tx {}/{} fail (last HCINT=0x{:08x} nohalt {}, run {}, NPTXSTS=0x{:08x} qfree {}), rx {} bursts {} bytes {} frames {} unparsed",
+                    ns.0, ns.1, ns.11, ns.12, ns.13, ns.14, (ns.14 >> 24) & 0xFF,
+                    ns.2, ns.3, ns.4, ns.5));
                 ctx.log_fmt(format_args!(
                     "dwc2-svc: net IN HCINT=0x{:08x} nohalt {} BMSR=0x{:04x} RX_FIFO=0x{:08x} INT_STS=0x{:08x}",
                     ns.6, ns.7, ns.8, ns.9, ns.10));
