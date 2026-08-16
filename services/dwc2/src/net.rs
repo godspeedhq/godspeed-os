@@ -108,6 +108,13 @@ pub struct Nic {
     /// core could have scheduled it and chose not to, which is a different bug entirely. Guessing
     /// between those cost a boot on the FIFO-flush theory; reading it costs a word.
     pub tx_nptxsts: u32,
+    /// USB 2.0 PING state for the bulk OUT endpoint (§8.5.1, Linux `qh->ping_state`).
+    ///
+    /// Set when the endpoint answers NAK or NYET, cleared when it ACKs. While set, the next transfer
+    /// carries HCTSIZ.DOPNG so the core pings until the device has room instead of re-sending data at
+    /// a device that is refusing it. Per-ENDPOINT, like the data toggle, because that is the level
+    /// USB defines it at.
+    pub ping_out: bool,
 }
 
 /// Consecutive failures before this endpoint is presumed unwilling.
@@ -265,7 +272,8 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
     Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(), in_armed: false,
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
                link_up: false, link_at: 0,
-               tx_fail_run: 0, tx_backoff_at: 0, tx_hcint: 0, tx_nohalt: 0, tx_nptxsts: 0 })
+               tx_fail_run: 0, tx_backoff_at: 0, tx_hcint: 0, tx_nohalt: 0, tx_nptxsts: 0,
+               ping_out: false })
 }
 
 // --- smsc95xx (LAN9514) bring-up -------------------------------------------------------------------
@@ -652,8 +660,11 @@ pub fn tx(
     // device NAKs every frame" and "the transfer never halted" are different faults needing different
     // fixes. The receive path has recorded this from the start; the transmit path guessed.
     let mut why = (0u32, 0u32);
+    let mut ping = nic.ping_out;
     let ok = bulk(ctx, mmio, t, nic.mps, false, nic.ep_out, dma.phys_at(TX_OFF) as u32,
-                  (n + 8) as u32, TX_BUDGET_MS, &mut nic.pid_out, Some(&mut why)).is_some();
+                  (n + 8) as u32, TX_BUDGET_MS, &mut nic.pid_out, Some(&mut why),
+                  Some(&mut ping)).is_some();
+    nic.ping_out = ping;
     if ok {
         nic.stats.tx_ok += 1;
         // One success is proof the device is willing: drop the backoff entirely rather than decaying
@@ -813,32 +824,60 @@ pub fn rx(
 /// cannot leave state on the channel a block transfer inherits - the rule the kernel driver learned
 /// by corrupting block transfers with an abandoned interrupt split.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn bulk(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target, mps: u16,
     dir_in: bool, ep: u8, buf_phys: u32, len: u32, budget_ms: u64, pid: &mut u32,
-    why: Option<&mut (u32, u32)>,
+    why: Option<&mut (u32, u32)>, ping: Option<&mut bool>,
 ) -> Option<u32> {
     let bt = Target { addr: t.addr, mps, low_speed: false };
     let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(budget_ms));
     let mut last = 0u32;
     let mut halted = 0u32;
+    // PING applies to an OUT endpoint only; an IN never pings (Linux: `ep_is_in` => do_ping = 0).
+    let mut do_ping = !dir_in && ping.as_ref().map_or(false, |p| **p);
     loop {
-        chan::program(mmio, &bt, CH_NET, dir_in, *pid, len, buf_phys, ep as u32, 2, 0);
+        chan::program_ping(mmio, &bt, CH_NET, dir_in, *pid, len, buf_phys, ep as u32, 2, 0, do_ping);
         match chan::wait_halt(ctx, mmio, CH_NET, 50) {
             Some(hcint) if hcint & crate::regs::HCINT_XFERCOMPL != 0 => {
                 let left = mmio.read32(chan::hctsiz_at(CH_NET)) & 0x7_FFFF;
                 *pid = chan::pid_from_hctsiz(mmio, CH_NET);
+                // ACK clears the ping state: the device has taken data, so the next transfer may go
+                // straight out (Linux clears `ping_state` on ACK, hcd_intr.c).
+                if let Some(p) = ping { *p = false; }
                 if let Some(w) = why { *w = (hcint, 0); }
                 return Some(len.saturating_sub(left));
             }
             Some(hcint) if hcint & crate::regs::HCINT_STALL != 0 => { last = hcint; halted += 1; break; }
-            Some(hcint) => { last = hcint; halted += 1; }
+            Some(hcint) => {
+                last = hcint;
+                halted += 1;
+                // NAK or NYET on a HIGH-SPEED OUT means "ping me before sending data again" - USB 2.0
+                // §8.5.1, and the exact transition Linux makes in `dwc2_hc_nak_intr` /
+                // `dwc2_hc_nyet_intr`. Re-sending the data instead is what left transmit dead: the
+                // endpoint was asking for a PING and got another data packet, every time, forever.
+                if !dir_in
+                    && hcint & (crate::regs::HCINT_NAK | crate::regs::HCINT_NYET) != 0
+                {
+                    do_ping = true;
+                }
+            }
             None => {}
         }
         if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
             break;
         }
     }
+    // READ HCINT ON THE WAY OUT, do not report the initial value as a measurement.
+    //
+    // `last` starts at 0 and was only ever assigned when `wait_halt` returned - so a transfer that
+    // TIMED OUT reported "HCINT=0x00000000", which is a default masquerading as a reading. I drew
+    // conclusions from that zero for two boots. If nothing was captured, capture it now.
+    if last == 0 {
+        last = mmio.read32(chan::hcint_at(CH_NET));
+    }
+    // Carry the ping requirement out to the caller so the NEXT attempt starts with it set.
+    if let Some(p) = ping { *p = do_ping; }
     // READ THE TOGGLE BACK ON THE FAILURE PATH TOO.
     //
     // The success path above already does this, and the reason is written up on the keyboard poll:

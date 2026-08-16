@@ -77,9 +77,25 @@ pub fn release(mmio: &Mmio, ch: u32) {
 
 /// Program a host channel and enable it.
 #[allow(clippy::too_many_arguments)]
-pub fn program(
+/// HCTSIZ bit 31, "Do Ping": run the USB 2.0 PING protocol before sending data.
+///
+/// USB 2.0 §8.5.1 makes PING flow control MANDATORY for high-speed bulk and control OUT endpoints.
+/// Once such an endpoint answers NAK or NYET, the host may not simply re-send the data - it must send
+/// PING tokens until the device answers ACK, and only then transmit. In DMA mode the core performs
+/// that whole sequence itself; all software owes it is this bit.
+///
+/// This driver never set it, and never tracked the state that decides when to. A high-speed OUT
+/// endpoint whose buffer filled therefore got data re-sent at it forever while it was asking to be
+/// pinged - which is why transmit to the NIC worked until the device got busy and then never recovered
+/// for the life of the service.
+pub const HCTSIZ_DOPNG: u32 = 1 << 31;
+
+/// Program a channel. `ping` sets HCTSIZ.DOPNG (see `HCTSIZ_DOPNG`); it is meaningful only for a
+/// high-speed OUT endpoint and must be false for everything else.
+#[allow(clippy::too_many_arguments)]
+pub fn program_ping(
     mmio: &Mmio, t: &Target, ch: u32, dir_in: bool, pid: u32,
-    len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32,
+    len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32, ping: bool,
 ) {
     let mps = t.mps as u32;
     let pkts = if len == 0 { 1 } else { (len + mps - 1) / mps };
@@ -90,7 +106,8 @@ pub fn program(
     halt(mmio, ch);
 
     mmio.write32(hcint_at(ch), 0xFFFF_FFFF);
-    mmio.write32(hctsiz_at(ch), (len & 0x7_FFFF) | ((pkts & 0x3ff) << 19) | (pid << 29));
+    let dopng = if ping { HCTSIZ_DOPNG } else { 0 };
+    mmio.write32(hctsiz_at(ch), (len & 0x7_FFFF) | ((pkts & 0x3ff) << 19) | (pid << 29) | dopng);
     // The HCDMA address is a BUS address as the DWC2 master sees memory, not a CPU physical address.
     // On real BCM2836 silicon that means the VideoCore alias; in QEMU it is identity. Getting this
     // wrong does not fault - it transfers nothing, or STALLs the DATA stage.
@@ -117,6 +134,15 @@ pub fn program(
         | oddfrm
         | HCCHAR_CHENA;
     mmio.write32(hcchar_at(ch), chan);
+}
+
+/// Program a channel with no PING. The shape every caller but a high-speed bulk OUT wants.
+#[allow(clippy::too_many_arguments)]
+pub fn program(
+    mmio: &Mmio, t: &Target, ch: u32, dir_in: bool, pid: u32,
+    len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32,
+) {
+    program_ping(mmio, t, ch, dir_in, pid, len, buf_phys, ep, ep_type, hcsplt, false);
 }
 
 /// The data PID the controller has advanced to, read back from HCTSIZ [30:29].
