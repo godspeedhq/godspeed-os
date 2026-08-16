@@ -1009,35 +1009,29 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
     arp[16] = 0x08; arp[17] = 0x00;                  // ptype = IPv4
     arp[18] = 0x06; arp[19] = 0x04;                  // hlen 6, plen 4
     arp[20] = 0x00; arp[21] = 0x01;                  // oper = request
-    arp[22..28].copy_from_slice(&our_mac);           // sender hw
-    arp[28..32].copy_from_slice(&our_ip);           // sender ip (learned via DHCP)
-    arp[38..42].copy_from_slice(&gateway);           // target ip = DHCP-learned gateway (0 hw = the question)
-
-    // Send it THROUGH nic-driver's frame interface, waiting on the TRUTH of the reply (Commandment
-    // VIII): request_with_reply is a synchronous Call, so a dead/absent nic-driver wakes us with None
-    // (ReplyDead) rather than hanging - we reacquire by name and retry (Commandment IX).
-    let arp_req = Message::from_bytes(&arp);
-    let mut gw_mac = [0u8; 6];
-    let mut have_mac = false;
-    for _ in 0..DANCE_TRIES {
-        match ctx.request_with_reply_deadline("nic-driver", &arp_req, DANCE_SECS) {
-            Some(reply) => {
-                let f = reply.payload_bytes();
-                // An ARP REPLY (oper = 2). On a live network the first frame back may be a background
-                // broadcast; keep trying (skip it) rather than giving up on one stray frame.
-                if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 && f[20] == 0x00 && f[21] == 0x02 {
-                    gw_mac.copy_from_slice(&f[22..28]);
-                    have_mac = true;
-                    ctx.log_fmt(format_args!(
-                        "net-stack: ARP - {}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                        gateway[0], gateway[1], gateway[2], gateway[3],
-                        gw_mac[0], gw_mac[1], gw_mac[2], gw_mac[3], gw_mac[4], gw_mac[5]));
-                    break;
-                }
-            }
-            None => { let _ = ctx.reacquire_by_name("nic-driver"); }
+    // RESOLVE THE GATEWAY WITH THE FUNCTION THAT WAITS FOR THE ANSWER.
+    //
+    // What stood here sent the ARP request and then inspected the ONE frame coupled to that transmit -
+    // whatever happened to be in the receive ring at that instant, which is nothing, because the reply
+    // has not come back yet. Six attempts, no waiting, and the whole loop finished in 31 ms on
+    // hardware: "DHCP - ACK" at 16:54:20.200 and "ARP - no reply within the budget" at 16:54:20.231.
+    // It never gave the gateway a chance to answer, so it had nothing to do with filters, MACs or the
+    // network - the question was asked and the answer was not waited for.
+    //
+    // `arp_resolve` is the correct one and already existed: it sends the request, then DRAINS AND SCANS
+    // the receive path for a reply whose sender IP is the host we asked about, answering anyone who
+    // ARPs for us along the way, retrying the request each round. One implementation, used everywhere,
+    // rather than two that disagree about whether waiting is part of asking.
+    let (gw_mac, have_mac) = match arp_resolve(ctx, &our_ip, &our_mac, &gateway) {
+        Some(m) => {
+            ctx.log_fmt(format_args!(
+                "net-stack: ARP - {}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                gateway[0], gateway[1], gateway[2], gateway[3],
+                m[0], m[1], m[2], m[3], m[4], m[5]));
+            (m, true)
         }
-    }
+        None => ([0u8; 6], false),
+    };
     if !have_mac {
         ctx.log("net-stack: ARP - no reply for the gateway within the budget - degrading");
     }
