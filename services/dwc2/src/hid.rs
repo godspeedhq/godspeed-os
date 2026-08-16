@@ -241,8 +241,14 @@ pub fn poll(
         dma.write8(REPORT_OFF + i, 0);
     }
 
+    // Trace the first few polls of each binding. Three attempts at this scheduling were made by
+    // reasoning about what the hardware ought to do; this reports what it does, then goes quiet.
+    let diag = state.diag_left > 0;
+    if diag {
+        state.diag_left -= 1;
+    }
     let hcint = chan::periodic_split_in(
-        ctx, mmio, t, chan::CH_KBD, state.pid, phys, len, kbd.ep as u32, splt);
+        ctx, mmio, t, chan::CH_KBD, state.pid, phys, len, kbd.ep as u32, splt, diag);
 
     // Classify this poll BEFORE acting on it. Every return path below consumes `hcint` for a
     // decision and then discards it; counting first is what makes a silent endpoint explicable
@@ -560,6 +566,8 @@ pub struct KeyState {
     /// than the device can recover from it.
     pub tt_reset_at: u64,
     pub reenum_at: u64,
+    /// Polls still to be traced. Bounded so the trace cannot flood a wedged keyboard's log.
+    pub diag_left: u32,
     /// Clears since the last DELIVERED report - the counter the escalation should have been using.
     ///
     /// A pure NYET storm never produces an XACTERR, and the ladder above escalated only on XACTERR, so
@@ -589,7 +597,7 @@ impl KeyState {
             last_data: 0,
             n_data: 0, n_nak: 0, n_nyet: 0, n_stall: 0, n_xacterr: 0, n_silent: 0,
             n_other: 0, last_other: 0, nyet_run: 0, xacterr_run: 0, cleared_at: 0, clears: 0,
-            clears_since_data: 0, tt_reset_at: 0, reenum_at: 0,
+            clears_since_data: 0, tt_reset_at: 0, reenum_at: 0, diag_left: 6,
             // ~1.5 s. Long enough that a deliberate hold keeps repeating through the initial 600 ms
             // delay and well beyond, short enough that a broken poll path stops within a couple of
             // characters instead of running to the next keypress.

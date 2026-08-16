@@ -465,9 +465,17 @@ fn wait_uframe_abs(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> Uframe {
 /// cannot wedge the service. The risk this port carried from the start turns out to be answered by
 /// the algorithm's own structure rather than by holding the CPU.
 #[allow(clippy::too_many_arguments)]
+/// One periodic split IN, with an optional trace of what the hardware actually did.
+///
+/// `diag` prints one compact line per poll: the microframe the start-split was synchronised to, the
+/// HCINT it returned, and the HCINT of every complete-split attempt with the microframe it was issued
+/// in. Three attempts at this scheduling have now been made by reasoning about what the hardware
+/// OUGHT to do; this is what it DOES. Bounded to a handful of polls after each bind so it cannot
+/// flood, and silent thereafter.
+#[allow(clippy::too_many_arguments)]
 pub fn periodic_split_in(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target,
-    ch: u32, pid: u32, buf_phys: u32, len: u32, ep: u32, splt: u32,
+    ch: u32, pid: u32, buf_phys: u32, len: u32, ep: u32, splt: u32, diag: bool,
 ) -> u32 {
     // SYNCHRONISE TO A MICROFRAME BOUNDARY before the start-split.
     //
@@ -489,6 +497,9 @@ pub fn periodic_split_in(
         f0 = (f0 + 1) & 0x3FFF;
     }
     if let Uframe::Missed = wait_uframe_abs(ctx, mmio, f0) {
+        if diag {
+            ctx.log_fmt(format_args!("dwc2-svc: split - MISSED the start boundary (wanted uf {})", f0 & 7));
+        }
         return 0;   // could not reach the boundary - skip this poll rather than send a malformed split
     }
     program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt); // ep_type 3 = interrupt
@@ -496,6 +507,11 @@ pub fn periodic_split_in(
         Some(v) => v,
         None => return 0,
     };
+    if diag {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: split - SSPLIT at uf {} -> HCINT {:#06x} (now uf {})",
+            f0 & 7, ss, uframe_now(mmio) & 7));
+    }
     if ss & (HCINT_STALL | HCINT_XFERCOMPL) != 0 {
         return ss;
     }
@@ -535,11 +551,21 @@ pub fn periodic_split_in(
         if uframe_now(mmio).wrapping_sub(ss_done) & 0x3FFF > 6 {
             return last;
         }
+        let cs_uf = uframe_now(mmio) & 7;
         program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt | (1 << 16));
         let cs = match wait_halt(ctx, mmio, ch, 5) {
             Some(v) => v,
-            None => return last,
+            None => {
+                if diag {
+                    ctx.log_fmt(format_args!("dwc2-svc: split - CSPLIT at uf {} NEVER HALTED", cs_uf));
+                }
+                return last;
+            }
         };
+        if diag {
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: split - CSPLIT at uf {} -> HCINT {:#06x}", cs_uf, cs));
+        }
         last = cs;
         if cs & (HCINT_XFERCOMPL | HCINT_STALL | HCINT_NAK) != 0 {
             // NAK is NOT an error here: it is the keyboard positively answering "no key activity this
