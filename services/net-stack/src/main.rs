@@ -128,6 +128,83 @@ fn drain_scan(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8]) -
     }
 }
 
+/// DHCPREQUEST + DHCPACK - the half of the exchange that actually claims the address.
+///
+/// RFC 2131 §3.1: DISCOVER and OFFER only propose an address. The client must broadcast a REQUEST
+/// naming both the address (option 50) and the server whose offer it accepts (option 54), and the
+/// server must reply DHCPACK (option 53 = 5). Until that ACK, the address belongs to nobody.
+///
+/// Broadcast, not unicast to the server, and deliberately: at this point we still do not own the
+/// address, so we cannot yet source packets from it, and the other DHCP servers on the segment need
+/// to see that their offers were declined.
+fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8; 4]) -> bool {
+    let mut frame = [0u8; 286];
+    for b in frame[0..6].iter_mut() { *b = 0xff; }
+    frame[6..12].copy_from_slice(our_mac);
+    frame[12] = 0x08; frame[13] = 0x00;
+    frame[14] = 0x45; frame[15] = 0x00;
+    let total: u16 = 20 + 8 + 244;
+    frame[16] = (total >> 8) as u8; frame[17] = total as u8;
+    frame[22] = 64;
+    frame[23] = 17;
+    for b in frame[30..34].iter_mut() { *b = 0xff; }
+    let ip_ck = checksum(&frame[14..34]);
+    frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
+    frame[34] = 0; frame[35] = 68;
+    frame[36] = 0; frame[37] = 67;
+    let udp_len: u16 = 8 + 244;
+    frame[38] = (udp_len >> 8) as u8; frame[39] = udp_len as u8;
+    frame[42] = 1; frame[43] = 1; frame[44] = 6;
+    // The SAME xid as the DISCOVER: a REQUEST continues that transaction, and a server matches it by
+    // this field. A fresh xid here reads as an unrelated client and is ignored.
+    frame[46] = 0x39; frame[47] = 0x03; frame[48] = 0xf3; frame[49] = 0x26;
+    frame[52] = 0x80;                                    // broadcast: we still have no address
+    frame[70..76].copy_from_slice(our_mac);
+    frame[278] = 0x63; frame[279] = 0x82; frame[280] = 0x53; frame[281] = 0x63;
+    let mut o = 282usize;
+    frame[o] = 53; frame[o + 1] = 1; frame[o + 2] = 3; o += 3;            // message type = REQUEST
+    frame[o] = 50; frame[o + 1] = 4;                                      // requested IP address
+    frame[o + 2..o + 6].copy_from_slice(ip); o += 6;
+    frame[o] = 54; frame[o + 1] = 4;                                      // server identifier
+    frame[o + 2..o + 6].copy_from_slice(srv); o += 6;
+    frame[o] = 255;                                                       // end
+
+    let req = Message::from_bytes(&frame);
+    for _ in 0..DANCE_TRIES {
+        let _ = nic_req(ctx, &req, LINK_SECS);
+        let mut acked = false;
+        drain_scan(ctx, DANCE_SECS, |f| {
+            // A BOOTREPLY carrying option 53 = 5 (DHCPACK) for the address we asked for. A NAK (6) is
+            // a definite refusal and is treated as "not acknowledged" by simply not matching - the
+            // caller re-DISCOVERs, which is what RFC 2131 asks of a NAKed client anyway.
+            if f.len() >= 62 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45 && f[23] == 17
+                && f[42] == 2 && f[58] == ip[0] && f[59] == ip[1] && f[60] == ip[2] && f[61] == ip[3]
+            {
+                let mut o = 282usize;
+                while o + 1 < f.len() {
+                    let opt = f[o];
+                    if opt == 255 { break; }
+                    if opt == 0 { o += 1; continue; }
+                    let len = f[o + 1] as usize;
+                    if opt == 53 && len >= 1 && o + 2 < f.len() && f[o + 2] == 5 {
+                        acked = true;
+                        return true;
+                    }
+                    o += 2 + len;
+                }
+            }
+            false
+        });
+        if acked {
+            ctx.log_fmt(format_args!(
+                "net-stack: DHCP - ACK, {}.{}.{}.{} is ours (server {}.{}.{}.{})",
+                ip[0], ip[1], ip[2], ip[3], srv[0], srv[1], srv[2], srv[3]));
+            return true;
+        }
+    }
+    false
+}
+
 fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
     // Ethernet(14) + IPv4(20) + UDP(8) + DHCP/BOOTP(244) = 286 bytes.
     let mut frame = [0u8; 286];
@@ -164,7 +241,7 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u
         // Send the DISCOVER, then DRAIN + SCAN the RX ring for the OFFER: on a busy LAN the offer arrives
         // amid a flood of broadcast, so we scan every frame within the budget, not just the coupled one.
         let _ = nic_req(ctx, &req, LINK_SECS);
-        let mut found: Option<([u8; 4], [u8; 4], [u8; 4])> = None;
+        let mut found: Option<([u8; 4], [u8; 4], [u8; 4], [u8; 4])> = None;
         drain_scan(ctx, DANCE_SECS, |f| {
             // A DHCP reply: IPv4 (0x0800, IHL 5), UDP (proto 17), BOOTP op = 2 (BOOTREPLY). yiaddr (our
             // offered IP) sits at BOOTP offset 16 = frame offset 58.
@@ -176,6 +253,7 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u
                 let mut gw = [ip[0], ip[1], ip[2], 1];
                 let mut dns = [0u8; 4];
                 let mut have_dns = false;
+                let mut srv = [0u8; 4];
                 let mut o = 282usize;
                 while o + 1 < f.len() {
                     let opt = f[o];
@@ -184,18 +262,37 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u
                     let len = f[o + 1] as usize;
                     if opt == 3 && len >= 4 && o + 6 <= f.len() { gw = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]]; }
                     if opt == 6 && len >= 4 && o + 6 <= f.len() { dns = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]]; have_dns = true; }
+                    // Option 54, the SERVER IDENTIFIER. A REQUEST must name the server whose offer it
+                    // is accepting, or every DHCP server on the segment has to guess whether it was
+                    // chosen. We never sent a REQUEST at all, so this was never needed - and never
+                    // read.
+                    if opt == 54 && len >= 4 && o + 6 <= f.len() { srv = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]]; }
                     o += 2 + len;
                 }
                 if !have_dns { dns = gw; }            // no DNS option: the gateway usually forwards DNS
-                found = Some((ip, gw, dns));
+                found = Some((ip, gw, dns, srv));
                 true
             } else { false }
         });
-        if let Some((ip, gw, dns)) = found {
+        if let Some((ip, gw, dns, srv)) = found {
             ctx.log_fmt(format_args!(
                 "net-stack: DHCP - offered {}.{}.{}.{}, gw {}.{}.{}.{}, dns {}.{}.{}.{}",
                 ip[0], ip[1], ip[2], ip[3], gw[0], gw[1], gw[2], gw[3], dns[0], dns[1], dns[2], dns[3]));
-            return Some((ip, gw, dns));
+            // ACCEPT THE OFFER. An offer is not a lease (RFC 2131 §3.1): the client must REQUEST the
+            // address and the server must ACK it, and only then is the address the client's.
+            //
+            // This half never existed - the code took the offered address and started using it. QEMU's
+            // slirp is permissive enough not to care, which is why it passed there for so long, but a
+            // real router hands out an address it has never assigned to us: it will not answer ARP from
+            // it, will not route for it, and re-offers a FRESH address on the next DISCOVER. That is
+            // exactly what the Pi 2 shows - .66, then .67, then .70, each one used briefly and never
+            // owned, with the gateway silent to every ARP.
+            if dhcp_request(ctx, our_mac, &ip, &srv) {
+                return Some((ip, gw, dns));
+            }
+            // No ACK: the address is NOT ours, and using it anyway is what produced the silent
+            // gateway. Fall through and re-DISCOVER rather than pretend.
+            ctx.log("net-stack: DHCP - REQUEST not acknowledged; the address is not ours, retrying");
         }
         let _ = ctx.reacquire_by_name("nic-driver");   // best-effort: we retry either way
     }
