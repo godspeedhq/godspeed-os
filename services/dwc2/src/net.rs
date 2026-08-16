@@ -115,6 +115,12 @@ pub struct Nic {
     /// a device that is refusing it. Per-ENDPOINT, like the data toggle, because that is the level
     /// USB defines it at.
     pub ping_out: bool,
+    /// The device's TX FIFO free space as of the last heartbeat.
+    ///
+    /// Sampled periodically rather than only at a refusal, because the question that is left is
+    /// whether the FIFO DRAINS: a figure that falls steadily and never recovers says frames are not
+    /// reaching the wire, while one that moves up and down says they are.
+    pub tx_fifo_free: u32,
 }
 
 /// Consecutive failures before this endpoint is presumed unwilling.
@@ -273,7 +279,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
                link_up: false, link_at: 0,
                tx_fail_run: 0, tx_backoff_at: 0, tx_hcint: 0, tx_nohalt: 0, tx_nptxsts: 0,
-               ping_out: false })
+               ping_out: false, tx_fifo_free: 0 })
 }
 
 // --- smsc95xx (LAN9514) bring-up -------------------------------------------------------------------
@@ -1015,7 +1021,22 @@ fn bulk(
         chan::program_ping(mmio, &bt, CH_NET, dir_in, *pid, len, buf_phys, ep as u32, 2, 0, do_ping);
         match chan::wait_halt(ctx, mmio, CH_NET, 50) {
             Some(hcint) if hcint & crate::regs::HCINT_XFERCOMPL != 0 => {
-                let left = mmio.read32(chan::hctsiz_at(CH_NET)) & 0x7_FFFF;
+                // HOW MANY BYTES WENT - and for an OUT the answer is NOT in HCTSIZ.
+                //
+                // Linux `dwc2_get_actual_xfer_length`: on completion it uses `xfer_len - count` for
+                // an IN and plain `chan->xfer_len` for a non-split OUT, and the comment beside it
+                // says why - "hctsiz.xfersize reflects the number of bytes transferred via the AHB,
+                // not the USB". Reading it for an OUT reports a residue that never had the meaning
+                // being asked of it.
+                //
+                // I did read it, called every transmit short, and drove tx_ok to zero while the
+                // device was ACKing every frame (HCINT 0x23 = XFERCOMPL|CHHLTD|ACK). Sixty-nine
+                // phantom "SHORT transmit" lines in one boot, all of them mine.
+                let left = if dir_in {
+                    mmio.read32(chan::hctsiz_at(CH_NET)) & 0x7_FFFF
+                } else {
+                    0
+                };
                 *pid = chan::pid_from_hctsiz(mmio, CH_NET);
                 // ACK clears the ping state: the device has taken data, so the next transfer may go
                 // straight out (Linux clears `ping_state` on ACK, hcd_intr.c).
@@ -1126,6 +1147,7 @@ pub fn serve(
             link_observed(ctx, mmio, dma, t, nic, up, now);
             nic.stats.bmsr = mii_read(ctx, mmio, dma, t, SMSC_MII_BMSR).map_or(0xFFFF, u32::from);
             nic.stats.rx_fifo = smsc_read_or0(ctx, mmio, dma, t, SMSC_RX_FIFO_INF);
+            nic.tx_fifo_free = smsc_read_or0(ctx, mmio, dma, t, SMSC_TX_FIFO_INF) & 0xFFFF;
             nic.stats.int_sts = smsc_read_or0(ctx, mmio, dma, t, SMSC_INT_STS);
             out[7] = u8::from(up);
             8

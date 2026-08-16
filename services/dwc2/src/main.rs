@@ -644,8 +644,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let ns = nic.as_ref().map(|(n, _)| {
                     let s = &n.stats;
                     (s.tx_ok, s.tx_fail, s.rx_bursts, s.rx_bytes, s.rx_frames, s.rx_bad, s.rx_hcint, s.rx_nohalt, s.bmsr, s.rx_fifo, s.int_sts,
-                     n.tx_hcint, n.tx_nohalt, n.tx_fail_run, n.tx_nptxsts)
-                }).unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+                     n.tx_hcint, n.tx_nohalt, n.tx_fail_run, n.tx_nptxsts, n.tx_fifo_free)
+                }).unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
                 // RE-MEASURE ONCE, QUIET. The boot-time sweep runs while the console is saturated,
                 // and a serial write is an un-preemptible syscall of ~9 ms per log line - which is
                 // the mean it reported. One repeat on a settled system separates "the timer is slow"
@@ -702,8 +702,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // TOP. This printed bits 24+ labelled "qfree" and so reported 24 free entries when
                     // the true figure in [23:16] was ZERO - the register said the queue was exhausted
                     // and the log said it was healthy, which killed a correct hypothesis for a boot.
-                    "dwc2-svc: net tx {}/{} fail (last HCINT=0x{:08x} nohalt {}, run {}, NPTXSTS=0x{:08x} qfree {} fifofree {}), rx {} bursts {} bytes {} frames {} unparsed",
-                    ns.0, ns.1, ns.11, ns.12, ns.13, ns.14,
+                    "dwc2-svc: net tx {}/{} fail (last HCINT=0x{:08x} nohalt {}, run {}, dev TX_FIFO_FREE {}, NPTXSTS=0x{:08x} qfree {} fifofree {}), rx {} bursts {} bytes {} frames {} unparsed",
+                    ns.0, ns.1, ns.11, ns.12, ns.13, ns.15, ns.14,
                     (ns.14 >> 16) & 0xFF, ns.14 & 0xFFFF,
                     ns.2, ns.3, ns.4, ns.5));
                 ctx.log_fmt(format_args!(
