@@ -48,9 +48,8 @@ A PR adding an unsafe block without a SAFETY comment is rejected without review.
 
 ## Boot/panic console floor (`bootcon/`)
 
-**Not a terminal.** It draws printable ASCII, honours `
-` / `` / `	` / ``, and DISCARDS escape
-sequences. No character grid, no cursor, no reverse video, no UTF-8, no scrollback; reaching the bottom
+**Not a terminal.** It draws printable ASCII, honours newline, carriage return, tab and backspace,
+and DISCARDS escape sequences. No character grid, no cursor, no reverse video, no UTF-8, no scrollback; reaching the bottom
 of the screen clears it and starts at the top.
 
 The terminal - the ANSI/CSI state machine, the UTF-8 decoder, the shadow grid, the cursor, scrolling,
