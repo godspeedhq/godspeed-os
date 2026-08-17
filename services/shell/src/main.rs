@@ -4990,8 +4990,12 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         out.line_fmt(ctx, format_args!(
             "the clock is not set: this board has no RTC, so the time can only come from the network"));
         if linked {
+            // Precise about WHEN, because the retry is request-driven: net-stack re-asks at most once a
+            // minute, and only while it is handling a network request. On a machine nobody is using it
+            // does not fire on its own - net-stack deliberately has no idle tick (an earlier one stole
+            // client messages; see the note at its serve loop). So `date sync` is the reliable "now".
             out.line_fmt(ctx, format_args!(
-                "        the network is up and the time service is asking it (retried about once a minute)"));
+                "        the network is up; it re-tries on network activity, or 'date sync' asks now"));
         } else {
             out.line_fmt(ctx, format_args!(
                 "        no network link - plug the cable in and it will set itself, or run 'date sync'"));

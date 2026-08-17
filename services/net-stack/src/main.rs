@@ -1194,6 +1194,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut capless_logged = false;
     // When the last automatic SNTP retry ran (monotonic seconds). See RESYNC_SECS.
     let mut last_resync_at: i64 = 0;
+    /// Latched once the wall clock is known. A clock never becomes unset, so this is asked at most once.
+    let mut clock_known = false;
     loop {
         // A BARE BLOCK, deliberately - the idle tick that was here is REVERTED (audit A10-1/A5-2).
         //
@@ -1253,17 +1255,32 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // one exchange a minute rather than one per request, and skipped entirely the moment the clock
         // is known (the common case pays a cheap `clock_epoch_if_set`). `time` owns the result; this
         // only fetches it.
+        // ORDER MATTERS, cheapest first, because this sits on every network request.
+        //
+        // `clock_known` is a local latch: once the clock is set it can never become unset again (there
+        // is no path in `time` back to SRC_NONE), so after the first success this whole block costs one
+        // bool test forever. It used to ask `time` over IPC on every request to find that out - a round
+        // trip per request, permanently, to re-learn something that cannot change.
+        //
+        // Then the elapsed-time test (local, free), and only then the two IPCs.
         if badge.is_none()
+            && !clock_known
             && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6))
-            && clock_epoch_if_set(&ctx).is_none()
             && ctx.epoch_secs_monotonic() - last_resync_at >= RESYNC_SECS
-            && link_is_up(&ctx)
         {
-            last_resync_at = ctx.epoch_secs_monotonic();
-            let st = NetState { our_ip, our_mac, gw_mac, have_mac, dns_server, status };
-            if let Some(unix) = sntp_sync(&ctx, &st) {
-                ctx.log_fmt(format_args!("net-stack: SNTP retry - wall clock set (epoch {})", unix));
-                synced_by_dance = true;
+            if clock_epoch_if_set(&ctx).is_some() {
+                clock_known = true;              // latched: never ask again
+            } else if link_is_up(&ctx) {
+                last_resync_at = ctx.epoch_secs_monotonic();
+                let st = NetState { our_ip, our_mac, gw_mac, have_mac, dns_server, status };
+                if let Some(unix) = sntp_sync(&ctx, &st) {
+                    ctx.log_fmt(format_args!("net-stack: SNTP retry - wall clock set (epoch {})", unix));
+                    clock_known = true;
+                    synced_by_dance = true;
+                }
+            } else {
+                // No link: do not burn a minute of the retry budget waiting for a cable. Leave
+                // `last_resync_at` alone so the next request after a plug-in tries at once.
             }
         }
         if badge.is_none() && !have_mac
