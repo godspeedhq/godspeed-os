@@ -253,10 +253,10 @@ fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 /// already written, synchronously - still has every one of them. The display is a mirror; serial is the
 /// truth. That is the same trade the ARM serial mirror already documents.
 ///
-/// Delivering is also what **transfers ownership of the framebuffer**: the first bytes this service
-/// accepts prove a renderer exists and is consuming, so the kernel's boot floor stops drawing from that
-/// moment. No syscall, no handshake, and no window in which nobody owns the screen - the service has
-/// mapped and cleared the framebuffer before it can possibly have received anything.
+/// Ownership of the framebuffer is NOT transferred here - it moves when the grant is made, at spawn
+/// (`bootcon::release`). Doing it on first delivery looked equivalent and was not: the service clears
+/// the screen as it starts, but the first CONSOLE byte can be seconds later, and the floor kept
+/// mirroring log lines over the terminal in between.
 fn deliver_to_console_service(bytes: &[u8]) {
     // Never feed the console's own output back to it. Nothing does this today (the service logs through
     // the serial log path, not the console path), but the loop it would make is unbounded and silent,
@@ -270,7 +270,6 @@ fn deliver_to_console_service(bytes: &[u8]) {
     // holding a cap - the same path a device interrupt takes to reach its driver. Try-send semantics: a
     // full queue discards the message rather than blocking, and a dead endpoint returns without one.
     let woke = crate::ipc::routing::enqueue_from_interrupt(ep, msg);
-    crate::bootcon::release();
     if let Some(slot) = woke {
         scheduler::wake_by_slot(slot, 0);
     }

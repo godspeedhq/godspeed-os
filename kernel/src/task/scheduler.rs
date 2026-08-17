@@ -2026,6 +2026,12 @@ pub fn kill_task_by_slot(slot: usize) {
         // The rule is now DERIVED and enforced (`V-managed-watched`): every name the supervisor manages
         // must appear here. Two lists describing one fact is the shape that caused this, and it is the
         // third time this session (ARM_SERVICES vs arm_built was the second).
+        // The terminal died, so nothing is rendering the display any more. Hand the screen back to the
+        // kernel's boot floor until the respawned instance takes it, or the machine goes dark with no
+        // way to say why (invariant 12).
+        if task_name == "console" {
+            crate::bootcon::reclaim_on_death();
+        }
         if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "console"
             | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control") {
             if let (Some(sup_ep), Ok(msg)) = (

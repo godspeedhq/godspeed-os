@@ -123,6 +123,10 @@ struct Boot {
     width: usize,
     height: usize,
     scale: usize, // integer font upscale, so a 4K panel is not a wall of unreadable text
+    // Channel shifts, exactly as the arch reported them. STORED, not derived: see `grant`.
+    r_shift: u32,
+    g_shift: u32,
+    b_shift: u32,
     org_x: usize, // left edge of the text area (safe-area inset)
     org_y: usize, // top edge of the text area
     cols: usize,  // columns that fit - PRIVATE to this blit, never published (see FbGrant)
@@ -155,6 +159,9 @@ static FB: SpinLock<Boot> = SpinLock::new(Boot {
     width: 0,
     height: 0,
     scale: 1,
+    r_shift: 0,
+    g_shift: 0,
+    b_shift: 0,
     org_x: 0,
     org_y: 0,
     cols: 0,
@@ -202,6 +209,9 @@ pub fn init(p: FbParams) {
     s.width = p.width;
     s.height = p.height;
     s.mem = Some(p.mem);
+    s.r_shift = rs;
+    s.g_shift = gs;
+    s.b_shift = bs;
     // A plain `height / 600` puts the first upscale step at 1200 px, which is the honest boundary: below
     // it a 20 px cell is perfectly legible and should stay pixel-exact, and upscaling coarsens an
     // antialiased raster into visible chunks. The T630 (768) stays 1x, a 1824x984 TV stays 1x, and the
@@ -236,7 +246,6 @@ pub fn grant() -> Option<FbGrant> {
         return None;
     }
     let s = FB.lock();
-    let (rs, gs, bs) = shifts_of(&s);
     Some(FbGrant {
         phys: s.phys,
         len: (s.pitch * s.height) as u64,
@@ -244,32 +253,41 @@ pub fn grant() -> Option<FbGrant> {
         width: s.width as u32,
         height: s.height as u32,
         bpp: s.bpp as u32,
-        shifts: rs | (gs << 8) | (bs << 16),
+        shifts: s.r_shift | (s.g_shift << 8) | (s.b_shift << 16),
     })
 }
 
-/// Recover the channel shifts from the blend LUT rather than storing them twice: `blend_lut[255]` is the
-/// full-intensity foreground, and each channel's component of `FG_RGB` is distinct and non-zero, so the
-/// position of each is the shift the arch reported. One stored fact, read two ways (Commandment III).
-fn shifts_of(s: &Boot) -> (u32, u32, u32) {
-    let full = s.blend_lut[255];
-    let find = |component: u32| -> u32 {
-        for sh in (0..32u32).step_by(8) {
-            if (full >> sh) & 0xFF == component {
-                return sh;
-            }
-        }
-        0
-    };
-    (find(FG_RGB.0), find(FG_RGB.1), find(FG_RGB.2))
-}
-
-/// Hand the screen to the `console` service. Every subsequent write here is a no-op until a panic.
+/// Hand the screen to the `console` service. Every subsequent write here is a no-op until the service
+/// dies or the machine panics.
 ///
-/// The service calls this once it has mapped the framebuffer and cleared it, so there is no window in
-/// which neither party is drawing: the kernel stops only after the service is able to start.
+/// **Called when the framebuffer is GRANTED, at spawn - not when the first byte is rendered.** Those are
+/// not the same moment, and the difference was visible on the TV: the service clears the screen as it
+/// starts, but the first byte only arrives when something writes to the CONSOLE path, which on a quiet
+/// boot is the shell prompt, seconds later. In between, the kernel was still mirroring every serial log
+/// line onto a screen the service had just cleared and begun drawing on - two writers, two cursors, and
+/// exactly the overlapping text that showed up on the first hardware boot.
+///
+/// Handing over at the grant closes that: the kernel gives the framebuffer away and stops writing to it
+/// in the same breath. The window it opens instead is harmless - between the grant and the service's
+/// first paint nobody draws, so the screen simply keeps what is already on it.
 pub fn release() {
     OWNED_BY_KERNEL.store(false, Ordering::Release);
+}
+
+/// Take the screen back because the `console` service died.
+///
+/// Its shadow grid died with it, so what is on the display no longer corresponds to anything; the
+/// respawned instance will clear and start again. Until then the floor owns the screen, which is what
+/// keeps a dead terminal from leaving the machine with no output at all (invariant 12). Clearing is
+/// deliberate: stale text that no longer updates is worse than a blank screen, because it looks live.
+pub fn reclaim_on_death() {
+    if !READY.load(Ordering::Acquire) {
+        return;
+    }
+    OWNED_BY_KERNEL.store(true, Ordering::Release);
+    let mut s = FB.lock();
+    clear(&mut s);
+    commit(&mut s);
 }
 
 /// Take the screen back for a panic, and clear it so the reason is not printed over a half-drawn shell.

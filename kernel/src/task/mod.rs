@@ -4198,6 +4198,11 @@ fn spawn_service_with_config(
                             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::MapFailed })?;
                     }
                     fb_grant = Some(g);
+                    // The grant IS the handover: the kernel has just given this framebuffer away, so it
+                    // stops writing to it now rather than when the first console byte arrives. Those
+                    // moments are seconds apart on a quiet boot, and drawing in the gap put the floor's
+                    // text on top of the terminal's.
+                    crate::bootcon::release();
                     crate::kprintln!(
                         "spawn[fb]: '{}' {}x{} at phys {:#x} -> VA {:#x} ({} KiB)",
                         name, g.width, g.height, g.phys, FB_VA, g.len / 1024

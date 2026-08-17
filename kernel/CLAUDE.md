@@ -36,7 +36,7 @@ The kernel requires a custom target spec. The binary is a flat ELF loaded by Lim
 | `syscall/`       | §8.2        | 2 grandfathered lines (syscall entry - see audit) |
 | `interrupt/`     | §12         | 1 grandfathered line (IDT delivery - see audit) |
 | `invariants/`    | §22         | No  |
-| `fbcon/`         | §11.4       | No - see below |
+| `bootcon/`       | §11.4       | No - see below |
 | `log.rs`         | §11.4       | No  |
 | `control.rs`     | §17         | No  |
 
@@ -46,21 +46,32 @@ The kernel requires a custom target spec. The binary is a flat ELF loaded by Lim
 
 A PR adding an unsafe block without a SAFETY comment is rejected without review.
 
-## Framebuffer console (`fbcon/`)
+## Boot/panic console floor (`bootcon/`)
 
-The text console every architecture shares: the ANSI escape parser, the UTF-8 decoder, the character
-grid, glyph rendering and scrolling. It replaced two independent copies (`arch/x86_64/fb.rs` and
-`arch/arm/fbcon.rs`) that had drifted apart, each having fixed terminal bugs the other still had.
+**Not a terminal.** It draws printable ASCII, honours `
+` / `` / `	` / ``, and DISCARDS escape
+sequences. No character grid, no cursor, no reverse video, no UTF-8, no scrollback; reaching the bottom
+of the screen clears it and starts at the top.
 
-`fbcon/` is **not** one of the four unsafe-permitted layers, and it does not need to be. The arch hands
-the console its framebuffer as a `&'static mut [u8]` slice (`FbParams::mem`), so every pixel write here
-is a bounds-checked slice write, the scroll is `slice::copy_within` and the clear is `slice::fill`. The
-one `unsafe` per arch - turning a mapped address into that slice - lives in the arch backend, which is
-the only place that knows the mapping is valid and permanent.
+The terminal - the ANSI/CSI state machine, the UTF-8 decoder, the shadow grid, the cursor, scrolling,
+reverse video - is the **`console` service** (`docs/console-service.md` §9). It drives this same
+framebuffer through an MMIO grant. What is left in the kernel earns ring-0 residency by impossibility:
+a panic halts every core, including that service, so it cannot ask anyone to report it, and boot output
+precedes every service including the one that would render it. Both are §11.4's ring-buffer argument on
+a machine with no serial port, which is what the §11.4 amendment records.
 
-Each arch owes two primitives through `arch::imp`, documented in `fbcon/mod.rs`: `fb_commit` (publish a
-written rectangle - a D-cache clean on ARM, a store fence on x86) and `FB_READBACK_CHEAP` (whether
-reading the framebuffer back is as cheap as writing it, which picks the scroll strategy).
+`bootcon/` is **not** one of the four unsafe-permitted layers and does not need to be: the arch hands it
+the framebuffer as a `&'static mut [u8]`, so every pixel write is a bounds-checked slice write. The one
+`unsafe` per arch - turning a mapped address into that slice - lives in the arch backend.
+
+Each arch owes ONE primitive through `arch::imp`: `fb_commit` (publish a written rectangle - a cache
+clean where the mapping is cacheable, a store fence where it is write-combining, a drain where it is
+non-cacheable). `FB_READBACK_CHEAP` is gone with the scroll it selected.
+
+**Ownership of the framebuffer is a state, not a convention.** The kernel draws until the framebuffer is
+GRANTED to the `console` service at spawn (`release`), and stops from that moment - not from the first
+byte the service renders, which can be seconds later and let the floor paint over a live terminal. It
+takes the screen back if that service dies (`reclaim_on_death`) or on a panic (`reclaim_for_panic`).
 
 ## Control channel (`control.rs`)
 
