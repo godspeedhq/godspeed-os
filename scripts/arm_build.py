@@ -64,6 +64,41 @@ def run(cmd):
         sys.exit(r.returncode)
 
 
+# `orr rX, rX, #0xC0000000` - the VideoCore bus alias `services/dwc2` applies to every DMA address on
+# real silicon, and must NOT be present in a `--qemu` build (QEMU addresses RAM directly). The encoded
+# word is 0x_3822103 with the condition nibble varying, so match the low three bytes as stored
+# little-endian: 03 21 82 <cond|8>.
+_ALIAS_SIG = bytes([0x03, 0x21, 0x82])
+
+
+def verify_image(img_path, want_qemu):
+    """Assert the built image embeds the DWC2 variant that was actually asked for.
+
+    This exists because the failure it catches is SILENT and reaches hardware: the kernel embeds each
+    service ELF at compile time, so a stale embed produces an image that builds, boots, and is wrong -
+    diagnosed an hour later as a driver fault. `--qemu` on a Pi means USB DMA to the wrong physical
+    addresses (no keyboard); no `--qemu` under emulation means a DATA-stage STALL.
+
+    Checking the ARTIFACT rather than the build steps is the point: it is the only thing that cannot be
+    fooled by a caching or ordering mistake in the steps above.
+    """
+    img = io.open(img_path, "rb").read()
+    found = _ALIAS_SIG in img
+    if want_qemu and found:
+        raise SystemExit(
+            "BUILD VERIFY FAILED: --qemu was requested but the image embeds the HARDWARE DWC2 "
+            "(VideoCore bus alias present). Under emulation this STALLs in the DATA stage. "
+            "The embedded service ELF is stale."
+        )
+    if not want_qemu and not found:
+        raise SystemExit(
+            "BUILD VERIFY FAILED: a hardware build must embed the VideoCore bus alias and this image "
+            "does not - it has the --qemu DWC2 in it. On a real Pi that DMAs to the wrong physical "
+            "addresses and USB does not work (no keyboard). The embedded service ELF is stale."
+        )
+    print("verify: DWC2 DMA target is %s, as requested" % ("QEMU (identity)" if want_qemu else "hardware (VideoCore alias)"))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--feature", default="arm-supervisor",
@@ -97,6 +132,19 @@ def main():
         run(["cargo", "build", "-p", svc, "--target", TARGET] + feats + rel)
 
     # 2. Build the kernel (embeds the service ELFs) with the chosen boot path.
+    #
+    #    TOUCH build.rs FIRST, unconditionally. The kernel embeds each service with
+    #    `include_bytes!(env!("SVC_*_ELF"))` and its build script emits `cargo:rerun-if-changed` for
+    #    every one - which SHOULD be enough, and twice in one session it was not: a service was rebuilt
+    #    and the kernel kept the previous copy, producing an image that built cleanly and was wrong.
+    #    Once it embedded a placeholder (the `console` service failed to spawn); once it embedded the
+    #    `--qemu` DWC2 on a hardware build (DMA at the wrong physical addresses, so no keyboard).
+    #
+    #    Both times the symptom appeared on HARDWARE, minutes later, looking like a driver bug. The
+    #    cost of being wrong is that; the cost of always re-running build.rs is a kernel recompile.
+    #    That is not a close trade.
+    kernel_build_rs = os.path.join(ROOT, "kernel", "build.rs")
+    os.utime(kernel_build_rs, None)
     run(["cargo", "build", "-p", "kernel", "--target", TARGET,
          "--features", kfeatures] + rel)
 
@@ -114,6 +162,9 @@ def main():
     cfg_src = os.path.join(ROOT, "boot", "pi2", "config.txt")
     if os.path.exists(cfg_src):
         shutil.copyfile(cfg_src, os.path.join(out_dir, "config.txt"))
+
+    # Verify the ARTIFACT, not the steps: a stale embed is silent and reaches hardware (verify_image).
+    verify_image(img, args.qemu)
 
     size = os.path.getsize(img)
     print(f"\nOK  build/kernel7.img  ({size} bytes, feature={kfeatures}, profile={profile})")
