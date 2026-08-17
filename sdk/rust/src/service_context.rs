@@ -1109,6 +1109,18 @@ impl ServiceContext {
     ///
     /// Used by property-test probes (P9) to access multiple cap slots wired to
     /// the same endpoint, verifying all are invalidated on endpoint death (§7.5).
+    /// The send cap for a named peer, or `None` if this service has no such peer.
+    ///
+    /// The public form of what `request_with_reply` resolves internally. Exposed for the case that
+    /// helper cannot serve: a request whose reply must NOT be waited for. A single-threaded service that
+    /// owns an in-memory answer (the `time` service and its wall clock) has to be able to send a
+    /// best-effort request to a slow peer without becoming unable to answer its own clients meanwhile -
+    /// so it pairs this with `derive_cap` + `send_with_cap_by_handle` and picks the reply up later, out
+    /// of its ordinary receive loop, matched by the protocol's correlation tag.
+    pub fn send_peer_handle(&self, peer: &str) -> Option<crate::capability::CapHandle> {
+        self.find_send_slot(peer).map(crate::capability::CapHandle)
+    }
+
     pub fn send_peer_at(&self, idx: usize) -> Option<crate::capability::CapHandle> {
         let data  = Self::ctx();
         let count = (data.send_peer_count as usize).min(MAX_SEND_PEERS);

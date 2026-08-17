@@ -4059,7 +4059,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "date" => help_block(ctx, "date", "date + time (from the hardware clock, or the network on the RTC-less Pi)", &[
             ("date", "full timestamp (weekday date time)", "date"),
             ("date epoch", "seconds since 1970-01-01", "date epoch"),
-            ("date sync", "fetch the time from the internet (SNTP) and set the clock", "date sync"),
+            ("date sync", "sync the clock from the internet NOW (it also syncs itself)", "date sync"),
         ], true),
         "net" => help_block(ctx, "net", "network status, DNS, and ARP host discovery", &[
             ("net", "IP, gateway (+MAC), and whether the gateway pings", "net"),
@@ -4240,8 +4240,8 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ("date", "epoch") => help_block(ctx, "date epoch", "seconds since 1970-01-01", &[
             ("date epoch", "print epoch seconds (not POSIX 'unix')", "date epoch"),
         ], false),
-        ("date", "sync") => help_block(ctx, "date sync", "set the clock from the internet (SNTP)", &[
-            ("date sync", "fetch the time over the network and set the wall clock, then print it (q aborts)", "date sync"),
+        ("date", "sync") => help_block(ctx, "date sync", "sync the clock from the internet NOW", &[
+            ("date sync", "the clock already syncs itself once the network is up, and re-tries about once a minute while it is unset; this asks for it immediately instead of waiting (q aborts)", "date sync"),
         ], false),
         ("net", "dns") => help_block(ctx, "net dns", "resolve a hostname to an IPv4 address", &[
             ("net dns <host>", "DNS A-record lookup via net-stack (slirp resolver)", "net dns example.com"),
@@ -4934,7 +4934,7 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         // Reading it at boot instead put fs I/O on the startup path at fs's slowest moment - see the note
         // in service_main for what that cost.
         clock_floor_seed(ctx);
-        out.line_fmt(ctx, format_args!("Syncing the clock from the network (SNTP)... (q aborts)"));
+        out.line_fmt(ctx, format_args!("Asking the network for the time now (SNTP)... (q aborts)"));
         let msg = Message::from_bytes(&[10u8]);
         // The budget must cover net-stack's WORST case, not a guess: op 10 can run SNTP_TRIES rounds of a
         // DANCE_SECS drain (plus a DNS attempt) before it can honestly answer "no time". Timing out early
