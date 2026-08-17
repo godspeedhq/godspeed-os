@@ -79,12 +79,14 @@ what the silicon wants, throw away the OS integration.
 - **SEC-26/27 (TLB flush on address-space switch): DONE** - `switch_context` writes TTBR0 then
   `TLBIALL`+`dsb`+`isb`. Note `invalidate_tlb_page` is **local** (`TLBIMVA`), correct for pinned per-task
   address spaces; a future cross-core unmap would need the inner-shareable variant.
-- **SEC-28 (DMA cache coherence): a live blocker for any DMA driver.** The A7's DMA is **not** cache-
-  coherent. A driver that DMAs must either map its arena **non-cacheable** or bracket every transfer with
-  cache maintenance (clean-to-PoC before a device read of a CPU-written buffer, invalidate before a CPU
-  read of a device-written buffer). The SDK's `Dma` wrapper (`sdk/rust/src/dma.rs`) assumes coherent x86
-  DMA and does none of this, so it is **not yet reusable on ARM** as-is. (`services/dwc2` sidesteps it
-  by using PIO, not DMA.)
+- **SEC-28 (DMA cache coherence): ANSWERED, by mapping.** The A7's DMA is **not** cache-coherent, so a
+  driver that DMAs must either map its arena **non-cacheable** or bracket every transfer with cache
+  maintenance. This port took the first option: `DMA_ARENA_UNCACHED = true` on ARM, so the kernel maps a
+  service's DMA arena non-cacheable at spawn and the SDK's `Dma` wrapper (`sdk/rust/src/dma.rs`) needs no
+  cache maintenance to be correct here. `services/dwc2` DMAs through it today.
+
+  (This bullet used to say the wrapper was "not yet reusable on ARM" and that `dwc2` "sidesteps it by
+  using PIO" - both true when written, both false now.)
 
 ## Gotchas (found by booting - see `docs/arm32-status.md` for the full list)
 

@@ -174,10 +174,19 @@ pub const CONFINE_USB_DRIVERS: bool = true;
 /// VA where the display's framebuffer is mapped into the `console` service's address space.
 ///
 /// A plain 32-bit address, unlike `XHCI_MMIO_VA` (4 GiB) and `XHCI_DMA_VA` (8 GiB), because it has to
-/// exist on a 32-bit machine too - the Pi 2 is the first board to use it. Sits below `DRIVER_MMIO_VA`
-/// (0x6000_0000) and well clear of the user stack (0x8000_0000 down), with room for a framebuffer of
-/// any size a display we can drive will have.
-pub const FB_VA: u64 = 0x5000_0000;
+/// exist on a 32-bit machine too - the Pi 2 is the first board to use it.
+///
+/// **0x5800_0000, not 0x5000_0000, and the difference is a real collision I nearly shipped.** On 32-bit
+/// `scheduler::TASK_HEAP_VA_START` is 0x5000_0000 - the base every task's dynamic `AllocMem` grows from.
+/// A 1824x984 framebuffer is ~7 MiB, so the console service's first few allocations would have been
+/// mapped straight on top of the display it was rendering into. It survived only because that service
+/// allocates nothing today; the first `AllocMem` in it would have corrupted the screen, or worse, in a
+/// way that looked like a rendering bug.
+///
+/// This address sits between the heap base and `DRIVER_MMIO_VA` (0x6000_0000), leaving 128 MiB of heap
+/// room below it and clear of the user stack (0x8000_0000 down) above - room for any framebuffer a
+/// display we can drive will have.
+pub const FB_VA: u64 = 0x5800_0000;
 
 /// VA where the driver's physically-contiguous DMA arena is mapped (8 GiB).
 pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
