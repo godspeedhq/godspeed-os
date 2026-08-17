@@ -27,10 +27,25 @@ def run():
     p = subprocess.run([sys.executable, "scripts/commandments.py"], capture_output=True, text=True)
     return ANSI.sub('', p.stdout + p.stderr)
 
+# Exact bytes of every file this run has touched, captured the FIRST time it is written.
+#
+# Restore used to be `git checkout -- <paths>`, which reverts to HEAD - and therefore silently DESTROYS
+# any uncommitted work in a file an injection happens to touch. It did exactly that: a run mid-session
+# threw away the console-service changes to `task/mod.rs` and `syscall/dispatch.rs` along with four
+# `COMMANDMENTS.baseline.toml` edits, and the only symptom was the summary line disagreeing with the
+# baseline. A tool that mutates the tree to measure it must put back what WAS there, not what git thinks
+# should be there.
+_ORIGINAL = {}
+
+def _snapshot(p):
+    if p not in _ORIGINAL:
+        _ORIGINAL[p] = io.open(p, encoding="utf-8", newline="").read()
+
 def edit(path, old, new):
     p = os.path.join(ROOT, path)
     s = io.open(p, encoding="utf-8").read()
     assert old in s, "anchor not found in %s" % path
+    _snapshot(p)
     io.open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 
 def strand_pin(key):
@@ -40,6 +55,7 @@ def strand_pin(key):
     s = io.open(p, encoding="utf-8").read()
     m = _re.search(r"(?m)^" + key + r" = \[[^\]]*\]" + chr(10), s)
     assert m, "pin %s not found" % key
+    _snapshot(p)
     s = s.replace(m.group(0), "")
     i = s.index(chr(10) + "# ---")
     io.open(p, "w", encoding="utf-8").write(s[:i] + chr(10) + m.group(0) + s[i:])
@@ -53,8 +69,12 @@ def restore(paths, created=()):
         f = os.path.join(ROOT, c)
         if os.path.exists(f):
             os.remove(f)
-    if paths:
-        subprocess.run(["git", "checkout", "--"] + list(paths), capture_output=True)
+    # Restore from the SNAPSHOT, never from git - see `_ORIGINAL`. Anything this run did not touch is
+    # left exactly alone, so a dirty working tree survives a red-team run intact.
+    for path in paths:
+        p = os.path.join(ROOT, path)
+        if p in _ORIGINAL:
+            io.open(p, "w", encoding="utf-8", newline="").write(_ORIGINAL.pop(p))
 
 
 def violations(out):
