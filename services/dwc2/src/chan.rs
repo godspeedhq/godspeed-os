@@ -621,10 +621,22 @@ pub fn periodic_split_in(
             return cs;
         }
         if cs & HCINT_NYET != 0 {
-            // The device itself said "not yet". Wait exactly one microframe and ask again - no
-            // calculation, no assumption about when it ought to have been ready.
-            let next = (uframe_now(mmio) + 1) & 0x3FFF;
-            let _ = wait_uframe_abs(ctx, mmio, next);
+            // RETRY IMMEDIATELY. The overhead is already a microframe; waiting adds a second.
+            //
+            // USB 2.0 puts the complete-splits at start+2, +3, +4 - CONSECUTIVE microframes. The trace
+            // shows what waiting one more produced: retries landing on uf 7, 1, 3, 5 - two apart - so
+            // every other microframe was never sampled, including the ones where the translator had
+            // the data. It then times out and discards, which is the XACTERR that follows every NYET
+            // run:
+            //
+            //   CSPLIT at uf 7 -> 0x0042 (NYET)   CSPLIT at uf 1 -> 0x0042
+            //   CSPLIT at uf 3 -> 0x0042          CSPLIT at uf 5 -> 0x0042
+            //   SSPLIT at uf 5 -> 0x0022 (ACK)    CSPLIT at uf 7 -> 0x0082 (XACTERR)
+            //
+            // The start-split is ACKed and the first complete-split lands exactly at start+2, so the
+            // placement proved correct earlier is still correct - what was wrong is the CADENCE of the
+            // retries after it. Programming the channel and waiting for it to halt already costs about
+            // a microframe, so the next attempt goes out as soon as this one is known to have failed.
             continue;
         }
         return cs;
