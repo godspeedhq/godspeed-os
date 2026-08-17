@@ -65,16 +65,16 @@ def violations(out):
                if l.startswith("    ") and l.strip() and not l.strip().startswith("Commandment"))
 
 CASES = [
-    ("I-syscalls", "a 50th syscall",
+    ("I-syscalls", "a 52nd syscall",
      lambda: edit("kernel/src/syscall/dispatch.rs",
-                  "    SetClock               = 50,",
-                  "    SetClock               = 50,\n    SecretBackdoor         = 51,"),
+                  "    FireIrq                = 51,",
+                  "    FireIrq                = 51,\n    SecretBackdoor         = 52,"),
      ["kernel/src/syscall/dispatch.rs"], []),
 
-    ("I-introspect", "a 24th InspectKernel query",
+    ("I-introspect", "a 23rd InspectKernel query",
      lambda: edit("kernel/src/syscall/dispatch.rs",
-                  "        22 => crate::wallclock::floor(),",
-                  "        22 => crate::wallclock::floor(),\n        23 => 0xdead,"),
+                  "        21 => match crate::arch::imp::com2_try_read_byte() { Some(b) => b as i64, None => -1 },",
+                  "        21 => match crate::arch::imp::com2_try_read_byte() { Some(b) => b as i64, None => -1 },\n        22 => 0xdead,"),
      ["kernel/src/syscall/dispatch.rs"], []),
 
     ("I-authorities", "a 14th kernel authority",
@@ -186,8 +186,13 @@ CASES_II = [
      [CH], [], True),
 
     ("II NEGATIVE apparatus", "chaos + mem-pressure alone must NOT be flagged",
-     lambda: edit(CH, 'name == "chaos" || name == "mem-pressure" || name.starts_with("observe")',
-                      'name == "chaos" || name == "mem-pressure"'),
+     # The predicate no longer carries an `observe` clause, so the old edit matched nothing and this
+     # NEGATIVE probe silently stopped running - a check that cannot fail is not a check (Commandment
+     # II), and one that cannot even APPLY is worse, because it still prints a line. Rewritten as an
+     # equivalent reordering of the predicate as it stands, so it exercises the same claim: this set,
+     # alone, must not be flagged.
+     lambda: edit(CH, 'name == "chaos" || name == "mem-pressure"',
+                      'name == "mem-pressure" || name == "chaos"'),
      [CH], [], False),
 
     ("II NEGATIVE extra spawn", "chaos spawning MORE must not create a violation",
