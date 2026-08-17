@@ -274,7 +274,7 @@ the system is busy recovering.
 
 ## 9. Stage 4 - the console service is real, and `fbcon` leaves the kernel (2026-08-17)
 
-> **Status:** IN PROGRESS on `feat/pi2-arm32-hardening`. This section supersedes decision **(2)(a)**
+> **Status:** BUILT and HARDWARE-VERIFIED on `feat/pi2-arm32-hardening` (Pi 2, 2026-08-17: chaos 50 rounds, 0 kernel panics, 0 liveness wedges, selfcheck 350/0, 0 console writes lost). This section supersedes decision **(2)(a)**
 > of §5 ("kernel render path") and decision **(4)** of §5a ("input stays shell-brokered" - still true;
 > only OUTPUT moves). Driven by `scripts/commandments.py`, for which `kernel/src/fbcon` was the last
 > standing Commandment I violation: 1,172 lines of terminal emulation that can claim none of the
@@ -378,3 +378,29 @@ safe-area inset, the cell size and the font-scale rule live. The kernel's `bootc
 its own blit and **never publishes them** - a private working value is not a second source of truth, but a
 published one would be (Commandment III). A shell that cannot reach the console service reports the
 console unavailable rather than guessing a size.
+
+
+### 9.8 What the hardware found that review did not
+
+Five defects, none of which a checker or a build could have caught, listed because each is a different
+KIND of miss:
+
+1. **A placeholder ELF.** `arm_build.py` kept its own copy of the ARM service list, so the console
+   shipped as a stub and failed to spawn. The second list is now DERIVED from `kernel/build.rs`, not
+   reconciled against it - the third time that shape has bitten this repo.
+2. **The wrong green.** `grant()` reconstructed the framebuffer's channel shifts from `blend_lut[255]`
+   rather than storing them, and the foreground `(0x80, 0xFF, 0x80)` has red equal to blue - so blue
+   always resolved to red's shift. Ambiguous by construction, for any palette with a repeated component.
+   §26.13: discipline over cleverness.
+3. **A handover window.** Ownership moved on the first byte DELIVERED, which on a quiet boot is seconds
+   after the service clears the screen. Both parties drew in between. The GRANT is the handover.
+4. **Drops that no amount of speed could fix.** A 16-deep queue cannot absorb a thirty-write burst
+   however fast the renderer is, so `observe now` lost its tail every time. The writer now blocks
+   (§8.5/§8.6 back-pressure); the kernel still never waits.
+5. **`reclaim_for_panic` had zero callers.** The amendment in §9.3 argues this module earns ring-0
+   residency because a panic cannot ask a service to report it - and the panic handler did not call it,
+   so the first real panic showed a black screen and said nothing. **A guarantee asserted in the
+   constitution and absent from the code is worse than an unimplemented feature: the document says it is
+   covered, so nobody looks.** There is no test for it (§22 explains why - it is a negative property on
+   a machine that cannot be failed on demand in QEMU), which is exactly why it needed reading rather
+   than assuming.
