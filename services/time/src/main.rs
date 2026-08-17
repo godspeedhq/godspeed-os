@@ -124,11 +124,18 @@ const FS_OP_READ: u8 = 11;
 const FS_OK: u8 = 0;
 /// How long an fs request may take before this service gives up on it for now.
 ///
-/// **Eight seconds, not two.** The floor lives on a USB stick reached through `dwc2`, which
-/// time-shares one host channel with the keyboard - a write there is nothing like a local disk. At two
-/// seconds every attempt timed out while the write was very likely landing anyway, so the retry below
-/// wrote the same file over and over and blocked this service for two seconds each time.
-const FS_SECS: i64 = 8;
+/// **One second, and the ceiling is set by the CLIENT, not by the disk.**
+///
+/// This service is single-threaded: while it waits on `fs`, a `date` sitting in its queue waits too.
+/// The shell gives `time` two seconds before it gives up (`time_rpc`), so any wait here longer than
+/// that turns background housekeeping into a visibly broken `date` - which is exactly what happened
+/// when this was eight seconds: the clock was known, the answer was instant, and the user still had to
+/// type `date` several times because the service was busy writing a file.
+///
+/// So the floor gets one second, and if a slow USB stick cannot finish in that, the floor does not get
+/// written and we say so once. That is the right way round: the clock reading is the product, the floor
+/// is an optimisation for the NEXT boot, and an optimisation must never make the product unavailable.
+const FS_SECS: i64 = 1;
 /// How often to retry loading the floor while it has not been loaded yet.
 const FLOOR_RETRY_MS: u64 = 2_000;
 /// How many times to retry PERSISTING the floor before giving up until the clock is set again.

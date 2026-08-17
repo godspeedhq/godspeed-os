@@ -933,7 +933,18 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
     //    is bounded by read_tsc (tsc_hz-calibrated), a real sub-second wait, so a fast reply returns at
     //    once and a lost one gives up quickly - not the 1 s-granular epoch clock. Batch = [count:u8]
     //    then [len:u16 LE, bytes] per frame; nic-driver stays pure mechanism, the ICMP match lives here.
-    let deadline_cycles = if tsc_hz > 0 { tsc_hz / 3 } else { 0 };   // ~330 ms
+    // ~900 ms, NOT ~330 ms. The window must cover the worst case of the DELIVERY path, not of the
+    // network: a reply that has arrived at the device still has to cross `dwc2` (which time-shares one
+    // USB host channel with the keyboard and mass storage) and `nic-driver` before this loop can see it.
+    // Measured RTTs here are 14-20 ms, so a 330 ms window looks generous - and the intermittent
+    // "Request timed out" on a permanently plugged cable was this window closing on replies that were
+    // still in the pipe. The code already knew: `SEQ_MATCH_WINDOW` exists precisely because "a reply is
+    // delivered a ping or two behind the one that requested it", which is only true if the window can
+    // expire before delivery. That was a compensation for the symptom; this is the cause.
+    //
+    // Still comfortably inside the shell's ~1 s ping cadence, so a genuinely dead host is still declared
+    // dead within the same second and the pace does not change.
+    let deadline_cycles = if tsc_hz > 0 { (tsc_hz * 9) / 10 } else { 0 };   // ~900 ms
     loop {
         if let Some(b) = nic_req(ctx, &Message::from_bytes(&[9u8]), LINK_SECS) {
             let p = b.payload_bytes();
