@@ -241,9 +241,18 @@ pub fn poll(
         dma.write8(REPORT_OFF + i, 0);
     }
 
-    // Trace the first few polls of each binding. Three attempts at this scheduling were made by
-    // reasoning about what the hardware ought to do; this reports what it does, then goes quiet.
-    let diag = state.diag_left > 0;
+    // TRACE THE FAILING POLLS, not the first ones.
+    //
+    // The first version traced the first six polls after each binding, and they were all HEALTHY -
+    // start-split ACKed, complete-split at start+2 returning data or NAK - so the log showed the
+    // mechanism working right up to the moment the budget ran out, and the wedge that followed was
+    // never observed. An instrument aimed at the easy case reports the easy case.
+    //
+    // A poll is worth tracing when the endpoint is already in trouble: a NYET or XACTERR run in
+    // progress means the next poll is one of the ones that matters. Bounded by the same budget so a
+    // wedged keyboard cannot flood the log.
+    let in_trouble = state.nyet_run > 0 || state.xacterr_run > 0;
+    let diag = state.diag_left > 0 && in_trouble;
     if diag {
         state.diag_left -= 1;
     }
@@ -597,7 +606,7 @@ impl KeyState {
             last_data: 0,
             n_data: 0, n_nak: 0, n_nyet: 0, n_stall: 0, n_xacterr: 0, n_silent: 0,
             n_other: 0, last_other: 0, nyet_run: 0, xacterr_run: 0, cleared_at: 0, clears: 0,
-            clears_since_data: 0, tt_reset_at: 0, reenum_at: 0, diag_left: 6,
+            clears_since_data: 0, tt_reset_at: 0, reenum_at: 0, diag_left: 12,
             // ~1.5 s. Long enough that a deliberate hold keeps repeating through the initial 600 ms
             // delay and well beyond, short enough that a broken poll path stops within a couple of
             // characters instead of running to the next keypress.

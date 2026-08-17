@@ -736,6 +736,24 @@ impl ServiceContext {
         &probe as *const u8 as usize
     }
 
+    /// Bytes of stack used at this point, without needing a reference mark.
+    ///
+    /// A mark taken at service start only works if the report is taken at the DEEPEST point, and the
+    /// first attempt took it after `mount` had returned - so it measured a popped frame and printed
+    /// zero. Absolute is harder to misuse: it can be called from anywhere and still means the same
+    /// thing.
+    ///
+    /// The stack is one region, 256 KiB, and top-aligned, so rounding the current pointer UP to the
+    /// next 256 KiB boundary lands on its top and the difference is what has been used. That derives
+    /// the top from the alignment the kernel already guarantees rather than restating the address here,
+    /// which would be a second copy of a layout decision (Commandment III).
+    pub fn stack_used(&self) -> usize {
+        const REGION: usize = 256 * 1024;
+        let sp = self.stack_mark();
+        let top = (sp + (REGION - 1)) & !(REGION - 1);
+        top - sp
+    }
+
     /// Send `req` to `peer` and receive the reply into `buf`, returning its length.
     ///
     /// The by-value path costs 4 KiB for the request `Message`, 4 KiB for the reply `Message`, and

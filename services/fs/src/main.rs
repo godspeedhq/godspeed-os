@@ -344,10 +344,6 @@ const MOUNT_RETRY_MS: u64 = 20;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    // Stack mark at entry - the reference for `report_stack_depth`, which prints the depth
-    // reached at mount. See that function for why this session needed it.
-    let stack_base = ctx.stack_mark();
-    let mut stack_reported = false;
     ctx.log("fs: starting");
 
     // Wait on block-driver's TRUTH, never on a clock (Commandment VIII). `block_capacity` returns
@@ -445,7 +441,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         "fs: mounted GSFS0008 ({} blocks, bitmap {}..{}, root@{}, {} free)",
                         f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
                     ));
-                    report_stack_depth(&ctx, stack_base, &mut stack_reported);
                     // Establish durability AT MOUNT, so the warning (if any) sits in the boot log
                     // beside the mount line. It was previously emitted by the first transaction to
                     // ask, which on a fresh prompt is the shell recording its history - so an
@@ -3192,6 +3187,15 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     treq[1..1 + rn].copy_from_slice(&req[..rn]);
     let treq = &treq[..1 + rn];
 
+    // MEASURED HERE, at the deepest point of the request path, and only on the superblock read -
+    // OP_READ_BLOCK of LBA 0, which happens once per mount. No state to own, no flood, and it is the
+    // frame that actually matters: this is where the stack ran out five times.
+    if req.len() >= 9 && req[0] == OP_READ_BLOCK && req[1..9].iter().all(|b| *b == 0) {
+        ctx.log_fmt(format_args!(
+            "fs: stack used at the deepest block call = {} of {} bytes",
+            ctx.stack_used(), 256 * 1024));
+    }
+
     for attempt in 0..2 {
         if attempt == 1 && !ctx.reacquire_by_name("block-driver") {
             break;
@@ -3221,24 +3225,6 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     None
 }
 
-/// Report how deep the stack got, ONCE, from the deepest point of the mount path.
-///
-/// The number this session lacked. Five attempts were made to fit correlation tags into `fs` with no
-/// measurement of the frame they had to fit in, and QEMU - which has no disk, so `fs` never mounts and
-/// never reaches this depth - called every one of them clean. A change to stack usage that cannot be
-/// measured can only be guessed at.
-///
-/// Relative to a mark taken at service start, so it needs no knowledge of where the stack lives, and
-/// printed once so it cannot become noise.
-fn report_stack_depth(ctx: &ServiceContext, base: usize, reported: &mut bool) {
-    if *reported {
-        return;
-    }
-    *reported = true;
-    let used = base.saturating_sub(ctx.stack_mark());
-    ctx.log_fmt(format_args!(
-        "fs: stack depth at mount = {} bytes of {} KiB", used, 256));
-}
 
 /// Largest sector count any real disk can report: the ATA LBA48 ceiling (2^48 sectors, ~128 PiB).
 /// A reported capacity above this is not a disk - it is a mis-correlated/garbage reply. The Bug-2
