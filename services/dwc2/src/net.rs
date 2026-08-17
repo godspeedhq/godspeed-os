@@ -688,11 +688,18 @@ pub const FRAME_MAX: usize = 1600;
 
 /// How many received frames may wait for the client to collect them.
 ///
-/// Four, because the loss this exists to stop comes from one burst carrying more than one frame, and
-/// bursts on this device carry two or three; four covers that with margin at 6.4 KiB of a 256 KiB
-/// stack. Deliberately NOT a buffer for a slow client - one that stops collecting should see loss,
-/// loudly counted, rather than have the driver grow to hide it.
-pub const RXQ_DEPTH: usize = 4;
+/// **Sixteen, measured rather than guessed.** The first version was four, on the reasoning that a burst
+/// carries "two or three" frames. Hardware disagreed immediately: 62 frames arrived in 24 bursts and the
+/// counter this queue reports showed **32 frames dropped** - a third of everything received, thrown away
+/// for want of somewhere to put it, and indistinguishable from network loss at the ping prompt.
+///
+/// These are small frames (ICMP replies and ARP, ~100 bytes each), so a single burst can hold a lot of
+/// them. Sixteen covers what has been seen with room to spare, at 25 KiB of a 256 KiB stack.
+///
+/// Still deliberately NOT a buffer for a slow client: it is sized to one BURST, not to a backlog. A
+/// client that stops collecting should see loss, loudly counted in `rx_dropped`, rather than have the
+/// driver grow without limit to hide it (26.6).
+pub const RXQ_DEPTH: usize = 16;
 /// One IN transfer can carry SEVERAL frames, so the receive burst is larger than one frame.
 pub const RX_BURST: usize = 4096;   // 8 x 512, matching SMSC_BURST_PKTS and the kernel driver
 const _: () = assert!(TX_OFF >= crate::msc::DATA_OFF + crate::msc::DATA_MAX);
@@ -949,7 +956,6 @@ impl Nic {
 
 pub fn rx(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Nic,
-    mut deliver: impl FnMut(&[u8]),
 ) -> u32 {
     // ARM THE IN AND LEAVE IT ARMED.
     //
@@ -1063,7 +1069,10 @@ pub fn rx(
         for i in 0..n.min(FRAME_MAX) {
             buf[i] = dma.read8(RX_OFF + pos + i);
         }
-        deliver(&buf[..n.min(FRAME_MAX)]);
+        // Straight into the receive queue. `rx` already holds `&mut Nic`, so there is no reason to
+        // hand the frame out through a closure and copy it into a staging array first - and the
+        // staging array had to be bounded separately, which is where frames were being lost.
+        nic.rxq_push(&buf[..n.min(FRAME_MAX)]);
         frames += 1;
         nic.stats.rx_frames += 1;
         pos += flen;
@@ -1233,26 +1242,7 @@ pub fn serve(
             // Only touch the wire when nothing is already waiting: a burst can carry several frames
             // and the client collects them one reply at a time.
             if nic.rxq_count == 0 {
-                // Stage the burst here, because the callback cannot borrow `nic` (it is already
-                // borrowed mutably by `rx`). Bounded by RXQ_DEPTH, the same limit the queue enforces.
-                let mut stage = [[0u8; FRAME_MAX]; RXQ_DEPTH];
-                let mut lens = [0usize; RXQ_DEPTH];
-                let mut n_st = 0usize;
-                let mut over = 0u32;
-                rx(ctx, mmio, dma, t, nic, |f| {
-                    if n_st < RXQ_DEPTH {
-                        let take = f.len().min(FRAME_MAX);
-                        stage[n_st][..take].copy_from_slice(&f[..take]);
-                        lens[n_st] = take;
-                        n_st += 1;
-                    } else {
-                        over += 1;
-                    }
-                });
-                for i in 0..n_st {
-                    nic.rxq_push(&stage[i][..lens[i]]);
-                }
-                nic.stats.rx_dropped = nic.stats.rx_dropped.saturating_add(over);
+                rx(ctx, mmio, dma, t, nic);
             }
             let mut frame = [0u8; FRAME_MAX];
             let got = nic.rxq_pop(&mut frame);

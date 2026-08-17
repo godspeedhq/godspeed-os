@@ -171,7 +171,23 @@ const R_READ_DATA: usize = 6;
 /// and is handled there. If `fs` is absent, slow, or never answers at all, the only consequence is that
 /// the floor is not written - the clock keeps answering instantly throughout.
 fn fs_send_noblock(ctx: &ServiceContext, req: &[u8]) -> bool {
-    let Some(target) = ctx.send_peer_handle("fs") else { return false };
+    // ACQUIRE `fs` BY NAME, do not expect it to have been wired at spawn.
+    //
+    // This service starts BEFORE `fs` does (the supervisor spawns the clock early, because everything
+    // else wants to timestamp), so at spawn there was no `fs` endpoint to wire a send-peer cap to and
+    // the contract's peer entry resolves to nothing - permanently. That is why the floor had never once
+    // been written on any boot: not a protocol fault, not a slow disk, simply no cap to send on.
+    //
+    // The kernel name directory is the answer to exactly this (§14.3): ask for the peer when you need
+    // it, not when you started. Cached by the SDK after the first success, and re-acquired for free if
+    // `fs` is restarted under us.
+    let target = match ctx.send_peer_handle("fs") {
+        Some(t) => t,
+        None => {
+            if !ctx.reacquire_by_name("fs") { return false; }
+            match ctx.send_peer_handle("fs") { Some(t) => t, None => return false }
+        }
+    };
     let Some(self_grant) = ctx.self_grant_handle() else { return false };
     let Some(reply_cap) = ctx.derive_cap(self_grant) else { return false };
     // The reply cap is CONSUMED by `fs` when it answers. If the send itself fails, reclaim it here so a
