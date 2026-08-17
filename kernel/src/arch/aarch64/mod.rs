@@ -2369,11 +2369,6 @@ pub mod iommu {
 }
 
 // ---------------------------------------------------------------------------
-pub mod fb {
-    pub fn dims_packed() -> u64 { 0 }
-}
-
-// ---------------------------------------------------------------------------
 /// Masking a device interrupt while a userspace driver handles it.
 ///
 /// Named `ioapic` because that is the x86 mechanism the neutral layer calls through; here it is the

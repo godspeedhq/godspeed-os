@@ -26,6 +26,7 @@ is the kernel itself** (`{kernel}`). Pinned by §22 Test 15.
 | `shell/`     | The user's interface - a crash or `kill shell` respawns a fresh prompt (in-flight command lost - a re-init, not a resume). "Nothing escapes" |
 | `xhci/` `ehci/` | USB host drivers - own-death respawn re-grants MMIO/DMA/IRQ caps + re-inits the controller + re-enumerates devices. Without this, a `chaos max-carnage` that kills them in its last rounds left the keyboard dead until a lucky supervisor respawn |
 | `logger/`    | Stateless; respawn drains the kernel ring buffer afresh |
+| `console/`   | The terminal - owns the display (`docs/console-service.md` §9). A respawn re-maps the framebuffer grant, clears it, and renders from the next byte on; scrollback is lost because it lived in the dead instance's grid (a re-init, not a resume). While it is dead the kernel's `bootcon` floor takes the screen back, so the machine is never mute |
 
 `block-driver` must respawn before `fs` (fs's send-peer cap to it wires at spawn). The kernel notifies
 the supervisor only for this **named set** (not probes), so ordinary probe/app churn never floods it.
@@ -41,6 +42,8 @@ not individually watched; a supervisor respawn re-runs its boot sequence and re-
 ## Supervisor spawn order
 
 The supervisor spawns services in this order:
+0. **logger**, then **console** - console before anything that produces console output, so the display
+   changes hands once, early, rather than mid-boot
 1. **pong** (core 1) - must be first so ping's SEND cap is wired at ping's spawn time
 2. **ping** (core 0)
 3. 178 probe services (§22 test infrastructure)

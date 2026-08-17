@@ -9,17 +9,25 @@
 //!
 //! ## How bytes get here
 //!
-//! Ordinary IPC, deliberately. `ConsoleWrite` (syscall 23) still writes serial synchronously - serial
-//! remains the source of truth and a captured log is unchanged - and then `try_send`s the same bytes to
-//! this service's endpoint. So there is no new syscall, no new capability, no polling loop and no second
-//! ring buffer in the kernel: the transport is the bounded queue and the blocking `recv` that already
-//! exist, and this service simply blocks on its endpoint like every other one.
+//! Ordinary IPC, deliberately. `ConsoleWrite` (syscall 23) writes serial synchronously - serial remains
+//! the source of truth and a captured log is unchanged - and then enqueues the same bytes to this
+//! service's endpoint. So there is no new syscall, no new capability, no polling loop and no second ring
+//! buffer in the kernel: the transport is the bounded queue and the blocking `recv` that already exist,
+//! and this service simply blocks on its endpoint like every other one.
 //!
-//! The kernel `try_send`s rather than `send`s, which is the important half: **the kernel never blocks on
-//! this service and never depends on it.** If this service is dead, slow, or its queue is full, console
-//! bytes are dropped from the *display* and serial still has all of them. That is the same trade the ARM
-//! serial mirror already made ("serial is the source of truth; dropping a contended write costs nothing
-//! visible"), and it is why the display can be a service at all.
+//! **A full queue blocks the WRITER, not the kernel.** The writing task is recorded as a blocked sender
+//! and parked until this service drains - ordinary bounded-queue back-pressure (§8.5, §8.6), the same
+//! thing any userspace `send` to a full endpoint does. The kernel itself never waits on this service and
+//! never depends on it.
+//!
+//! It dropped instead, at first, on the argument that the kernel must not block - which is true and is
+//! preserved above, but the conclusion did not follow. A 16-deep queue cannot hold a thirty-write burst
+//! however fast this service renders, so a full-screen `observe now` lost its tail EVERY time, and no
+//! amount of rendering speed could have fixed it. A producer has no business running ahead of the
+//! display it is writing to.
+//!
+//! If this service is dead rather than merely behind, the write is not shown and the kernel says so
+//! periodically; serial still has every byte.
 //!
 //! ## Restartability
 //!

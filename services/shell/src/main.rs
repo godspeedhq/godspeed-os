@@ -8938,9 +8938,9 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
 // spans out to a temp file and atomically replaces the original, then RESETS the add buffer + span
 // list - so the only bound is how much you edit *between saves*, not the file size. When the add
 // buffer or span list fills, the edit is refused loudly (the status bar says to save), never
-// silently dropped (§26.7). Rendering uses only the CSI subset the serial terminal AND the fbcon
-// support (`arch/x86_64/fb.rs`): cursor position, erase-to-EOL, show/hide; reverse-video bars are
-// SGR (pretty on serial, plain on the fbcon - it ignores the unsupported escape, no garbage).
+// silently dropped (§26.7). Rendering uses only the CSI subset the serial terminal AND the `console`
+// service support: cursor position, erase-to-EOL, show/hide; reverse-video bars are SGR (pretty on
+// serial, plain on a terminal that lacks it - the unsupported escape is ignored, never left as garbage).
 const EDIT_COLS_MAX: usize = 256;          // bar-render scratch width cap; also caps render cols
 const EDIT_TAB: usize = 4;                 // Tab inserts this many spaces
 const EDIT_ADD_MAX: usize = 32 * 1024;     // add-buffer: new typed bytes between saves (save resets)
@@ -9239,9 +9239,9 @@ fn edit_goto(ctx: &ServiceContext, row: usize, col: usize) {
 
 /// Draw a full-width reverse-video bar: `text` (already formatted) left-justified, space-padded
 /// to `width`. The caller positions the cursor first. `\x1b[7m`/`\x1b[0m` are reverse-video on a
-/// serial terminal AND on the framebuffer console - the shared `kernel/src/fbcon` renders SGR 7 by
-/// inverting the glyph blend ramp, so the bar looks the same on the TV as in a terminal. (It used to
-/// be dropped on x86's fbcon and rendered only on ARM's; the two consoles are one module now.)
+/// serial terminal AND on the framebuffer console - the `console` SERVICE renders SGR 7 by inverting
+/// the glyph blend ramp, so the bar looks the same on the TV as in a terminal. (It used to be dropped
+/// on x86 and rendered only on ARM; there is one terminal now, and it is a service.)
 fn edit_bar(ctx: &ServiceContext, text: &[u8], width: usize) {
     let mut line = [b' '; EDIT_COLS_MAX];
     let w = width.min(EDIT_COLS_MAX);
@@ -10123,7 +10123,7 @@ const TREE_PREFIX_MAX: usize = TREE_MAX_DEPTH * 6;
 /// capacity explicit stack, depth-first, no recursion, loud on overflow (§3.12). A directory's
 /// whole subtree drains before its next sibling (LIFO + reverse-push), and each node records
 /// whether it is its parent's *last* child so the prefix draws `├──`/`└──` and `│`/blank
-/// continuation correctly. UTF-8: the fbcon decodes `├ └ │ ─` and renders light box glyphs;
+/// continuation correctly. UTF-8: the `console` service decodes `├ └ │ ─` and renders light box glyphs;
 /// a trailing `/` still marks directories (the console is monochrome - no colour to lean on).
 /// `#[inline(never)]`: holds the ~12 KiB `TreeStack` + prefix scratch off the hot pipe frame
 /// (it's a pipe producer; see [[project-shell-stack-pipe]]).

@@ -2746,7 +2746,7 @@ pub fn run_edit(image_path: &Path, persist_path: &str, smp: u32) {
 
     // ── Large file (piece-table windowed load + streaming save) ─────────────────────────────────
     // The editor is DRIVEN over serial; the result is verified on the DISK afterwards (a 16 KiB
-    // file dumped back over the console renders ~400 lines on the fbcon - far too slow under TCG -
+    // file dumped back over the console renders ~400 lines on the framebuffer - far too slow under TCG -
     // and the file commands that emit small output, `match`/`count`, read via one ≤4 KiB message so
     // they can't read it either). The disk is the actual deliverable, so we assert on it directly.
     //

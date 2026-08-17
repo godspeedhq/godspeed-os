@@ -305,8 +305,13 @@ font renderer and is serial-blind") is answered below.
 
 **Not serial-blind.** `ConsoleWrite` (syscall 23) still writes serial synchronously, exactly as today, so
 a captured `build/serial_output.log` is unchanged and the interactive session still appears in it. What
-the syscall stops doing is *rendering*; it appends the same bytes to a bounded console ring the service
-drains. Serial is truth, the display is a mirror - which is already the stated ARM policy (`mirror()`).
+the syscall stops doing is *rendering*; it enqueues the same bytes to the service's ordinary IPC endpoint
+(no new ring - the bounded queue every service already has). Serial is truth, the display is a mirror -
+which is already the stated ARM policy (`mirror()`).
+
+**A full queue blocks the WRITER.** The writing task is parked as a blocked sender until the terminal
+drains (§8.5, §8.6) - the kernel itself never waits. This is a correction to the first draft of §9.2,
+which dropped instead: see §9.8, item 4, for why dropping could not work at any rendering speed.
 
 **Not a duplicated font renderer.** The kernel's blit is deliberately cruder than the terminal's: no box
 glyphs, no reverse video, no shadow grid, and a "scroll" that clears and starts at the top. It is a floor,

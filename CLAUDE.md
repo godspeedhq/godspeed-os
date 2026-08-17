@@ -225,11 +225,13 @@ os/
       interrupt/route.rs
       invariants/assertions.rs
       log.rs               # kernel ring buffer
+      bootcon/             # boot + panic framebuffer blit (11.4) - NOT a terminal; see console/
 
   services/
     supervisor/            # restart authority + name authority (TCB); spawned directly by the kernel
                            #   (init removed, Phase 5; registry service retired, Phase 4 - Path C §3.7)
     logger/
+    console/               # the terminal: ANSI/CSI, grid, cursor, scroll (docs/console-service.md 9)
     block-driver/          # v1: trusted
     fs/                    # v1: trusted, depends on block-driver
 
@@ -1011,7 +1013,7 @@ Because Limine supplies APIC IDs directly, the kernel does not need to probe ACP
 
 The kernel maintains a 16 KiB ring buffer (per-core view, single shared sink). Anything logged before the logger is up writes to the ring buffer and the serial console. When the logger starts, it drains the buffer.
 
-Where the machine's only output device is a display, the floor also includes a **minimal framebuffer blit** (`kernel/src/bootcon`): plain ASCII, escape sequences discarded, no character grid, no cursor, no scrollback. It is not a terminal - the terminal is the `console` service (§12, `docs/console-service.md` §9).
+Where the machine's only output device is a display, the floor also includes a **minimal framebuffer blit** (`kernel/src/bootcon`): plain ASCII, escape sequences discarded, no character grid, no cursor, no scrollback. It is not a terminal - the terminal is the `console` service (`docs/console-service.md` §9).
 
 > **Amendment 2026-08-17 (console service): the log floor covers a minimal framebuffer blit, because §11.4 was x86-shaped.** This section said "serial console" because on a PC serial is always there. On a Raspberry Pi wired to a TV it may not be, and a kernel that can only speak to a serial port it does not have is **mute** - a boot that fails before any service exists, or a panic, produces a frozen screen and no reason on it, which is exactly the silent failure invariant 12 forbids.
 >
@@ -2386,6 +2388,15 @@ A "shell" in this system is a capability-broker service. It:
 - Reads commands and constructs spawn requests, including the explicit caps each child should receive.
 
 This means there is no `stdin`, only an IPC endpoint to a console service. There is no `fork`, only an authenticated request to the supervisor. There is no inherited environment, only the caps the parent explicitly granted.
+
+> **Note (2026-08-17): a `console` service now exists, and it owns OUTPUT only.** This appendix
+> anticipated one service holding "keyboard input + display output"; what was built holds the display -
+> the terminal model, the grid, the cursor and the rendering (`docs/console-service.md` §9). Keyboard
+> INPUT is still brokered by the shell through the kernel's single-reader console ring, for the reason
+> recorded in `docs/console-service.md` §5a: there is one input ring and one reader slot, so a service
+> that owned the keyboard would block in `ConsoleRead` and could not also field take/release messages.
+> The split is deliberate, not partial. This appendix stays non-normative; it is the intent, and the
+> difference is recorded here rather than left to read as a description of what shipped.
 
 The full mechanics of how Unix-style scripting maps onto this model - pipes as capability-mediated endpoints, redirection as cap minting, etc. - are explored in Appendix D.
 

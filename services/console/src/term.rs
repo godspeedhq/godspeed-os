@@ -12,10 +12,11 @@
 //!
 //! ## Ownership
 //!
-//! The kernel writes the framebuffer until this service has mapped and cleared it, at which point the
-//! service calls `release_kernel_console()` and the kernel stops. Two writers to one framebuffer would
-//! leave the shadow grid below silently wrong about what is on screen, so ownership is a state rather
-//! than a convention. A panic takes it back unconditionally.
+//! The kernel stops writing the framebuffer the moment it GRANTS it to this service, at spawn - there
+//! is no call back the other way (an earlier draft of this comment named a `release_kernel_console()`
+//! that was never built). Two writers to one framebuffer would leave the shadow grid below silently
+//! wrong about what is on screen, so ownership is a state rather than a convention. The kernel takes it
+//! back if this service dies, and unconditionally on a panic.
 //!
 //! ## Framebuffer semantics
 //!
