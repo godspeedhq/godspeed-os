@@ -713,15 +713,26 @@ pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
                     // someone's heap, and then a double-free on the next kill.
                     //
                     // The mapping already says what it is, so ask it rather than infer from the address:
-                    // Device memory is encoded TEX=0b000 + C=0 by `l2_small_page`, normal service RAM as
-                    // TEX=0b001 + C=1. x86's reclaim has skipped its equivalent (PCD|PWT) since the
-                    // chaos double-free was found there; this is the same rule, which the ARM port
-                    // simply never carried over.
-                    let is_device = (e >> 6) & 0b111 == 0 && e & (1 << 3) == 0;
-                    if is_device {
+                    // normal service RAM is the ONLY thing `l2_small_page` encodes as TEX=0b001 + C=1.
+                    // x86's reclaim has skipped its equivalent (PCD|PWT) since the chaos double-free was
+                    // found there; this is the same rule, which the ARM port simply never carried over.
+                    //
+                    // Phrased as "is this allocator RAM", NOT as "is this Device". It used to test for
+                    // Device specifically (TEX=0b000 + C=0), which silently stopped covering everything
+                    // the moment a third memory type appeared: the `console` service's framebuffer grant
+                    // is Normal NON-cacheable (TEX=0b001 + C=0), so it failed the Device test, passed as
+                    // ordinary RAM, and was handed to `free_frame` - 1,755 pages of GPU memory on every
+                    // console death. Contained only by the same downstream bounds check this comment
+                    // already calls luck (the Pi's framebuffer sits above usable RAM). A board whose
+                    // framebuffer sat below the top of RAM would have freed it into the general pool.
+                    //
+                    // An allowlist cannot rot this way. A new memory type is now skipped by default, and
+                    // wrongly freeing a page requires deliberately encoding it as cacheable service RAM.
+                    let is_service_ram = (e >> 6) & 0b111 == 0b001 && e & (1 << 3) != 0;
+                    if !is_service_ram {
                         if !RECLAIM_DEVICE_LOGGED.swap(true, Ordering::Relaxed) {
                             crate::kprintln!(
-                                "reclaim: skipped device MMIO pa={:#010x} (not allocator RAM; further skips silent)",
+                                "reclaim: skipped granted page pa={:#010x} (not allocator RAM; further skips silent)",
                                 e & 0xFFFF_F000);
                         }
                         continue;
