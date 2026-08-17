@@ -657,10 +657,53 @@ fn scroll(s: &mut Fb) {
         attr_set(s, c, rows - 1, false);
     }
 
-    // Repaint every cell from the shadow - no framebuffer read-back.
+    // Repaint from the shadow - no framebuffer read-back - but only as far as each row HAS content,
+    // and blank the rest of that row in one fill.
+    //
+    // The naive version repainted every cell: 182 x 44 = 8,008 glyph draws, each writing a 9x20 cell,
+    // which is 5.7 MB of non-cacheable stores for one scrolled line. Console lines are mostly trailing
+    // blanks - a prompt or a selfcheck line uses perhaps 40 of 182 columns - and a run of blanks is by
+    // definition one flat rectangle, so painting them one space-glyph at a time is the same pixels at a
+    // fraction of the throughput. That difference is what "the scroll was a bit slow" is made of.
+    //
+    // The tail is only bulk-filled where it is genuinely uniform: a blank cell under REVERSE VIDEO is
+    // painted in the foreground colour, so a row whose tail is highlighted is not one rectangle. Those
+    // cells fall back to the per-cell path rather than being flattened into the wrong colour, which is
+    // the sort of shortcut that would show up as a highlight silently vanishing after a scroll.
     for r in 0..rows {
-        for c in 0..cols {
-            redraw_cell(s, c, r);
-        }
+        let painted = paint_row_content(s, r, cols);
+        blank_row_tail(s, r, painted, cols);
     }
+}
+
+/// Repaint row `r` up to the end of its content, and return the column where the uniform blank tail
+/// begins. A cell counts as tail only if it is a space AND carries no attribute.
+fn paint_row_content(s: &mut Fb, r: usize, cols: usize) -> usize {
+    let mut tail = cols;
+    while tail > 0 {
+        let c = tail - 1;
+        let blank = (if r < MAX_ROWS && c < MAX_COLS { s.grid[r][c] } else { b' ' }) == b' ';
+        if !blank || attr_get(s, c, r) {
+            break;
+        }
+        tail -= 1;
+    }
+    for c in 0..tail {
+        redraw_cell(s, c, r);
+    }
+    tail
+}
+
+/// Blank columns `from..cols` of row `r` as a single rectangle. The shadow grid already says these are
+/// blank (the caller established it), so this paints pixels only and does not touch the grid.
+fn blank_row_tail(s: &mut Fb, r: usize, from: usize, cols: usize) {
+    if from >= cols {
+        return;
+    }
+    let sc = render::cell_scale(s);
+    let (cw, ch) = (CELL_W * sc, CELL_H * sc);
+    let x0 = s.org_x + from * cw;
+    let y0 = s.org_y + r * ch;
+    let bg = s.bg;
+    render::fill_rect(s, x0, y0, (cols - from) * cw, ch, bg);
 }
