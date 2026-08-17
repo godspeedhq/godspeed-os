@@ -123,9 +123,32 @@ const FS_OP_WRITE: u8 = 10;
 const FS_OP_READ: u8 = 11;
 const FS_OK: u8 = 0;
 /// How long an fs request may take before this service gives up on it for now.
-const FS_SECS: i64 = 2;
+///
+/// **Eight seconds, not two.** The floor lives on a USB stick reached through `dwc2`, which
+/// time-shares one host channel with the keyboard - a write there is nothing like a local disk. At two
+/// seconds every attempt timed out while the write was very likely landing anyway, so the retry below
+/// wrote the same file over and over and blocked this service for two seconds each time.
+const FS_SECS: i64 = 8;
 /// How often to retry loading the floor while it has not been loaded yet.
 const FLOOR_RETRY_MS: u64 = 2_000;
+/// How many times to retry PERSISTING the floor before giving up until the clock is set again.
+///
+/// Bounded, and the bound is the point. The first version of this retried forever: with `fs` answering
+/// slower than the deadline it produced an fs write every two seconds for the life of the machine, a log
+/// line for each, and - because this service is single-threaded - a `date` that waited behind it. That
+/// is not persistence, it is a storm (26.6: bounded behaviour, and a retry that never stops is not
+/// bounded). Three attempts covers `fs` still mounting; past that the honest answer is to say so once.
+const FLOOR_STORE_TRIES: u32 = 3;
+
+/// `fs` replies `[tag, status, ...]`: the correlation tag it was given, THEN the status byte.
+///
+/// Both indices matter and getting them wrong is silent, because the tag this service sends is 0 and
+/// `FS_OK` is also 0 - so reading the tag as the status "succeeds" no matter what actually happened.
+/// That is exactly what the first version did, in both directions.
+const R_TAG: usize = 0;
+const R_STATUS: usize = 1;
+/// A READ reply is `[tag, status, len:u32 LE, bytes..]`, so the file's bytes start here.
+const R_READ_DATA: usize = 6;
 
 /// Ask `fs` for the persisted floor and adopt it.
 ///
@@ -143,13 +166,16 @@ fn floor_load(ctx: &ServiceContext, clock: &mut Clock) -> bool {
         None => return false,                     // fs not up yet, or busy: try again later
     };
     let p = reply.payload_bytes();
-    if p.first() != Some(&FS_OK) || p.len() < 2 {
+    // Check the STATUS byte, not the tag. `p[R_TAG]` is the tag we sent (0) and `FS_OK` is also 0, so
+    // testing the first byte passes unconditionally and reports success for a missing file.
+    if p.len() <= R_READ_DATA || p[R_STATUS] != FS_OK {
         return false;                             // no file yet: nothing to adopt, and not a failure
     }
-    // The file is the epoch in ASCII, as the shell wrote it.
+    // The file is the epoch in ASCII, as it was written. It starts AFTER the 4-byte length that the
+    // read reply carries - parsing from index 1 read a length byte as a digit and always failed.
     let mut v: i64 = 0;
     let mut any = false;
-    for &b in &p[1..] {
+    for &b in &p[R_READ_DATA..] {
         if !b.is_ascii_digit() { break; }
         v = v.saturating_mul(10).saturating_add((b - b'0') as i64);
         any = true;
@@ -183,20 +209,32 @@ fn floor_store(ctx: &ServiceContext, epoch: i64) -> bool {
     req[off..off + digits.len()].copy_from_slice(digits);
     let n = off + digits.len();
     match ctx.request_with_reply_deadline("fs", &Message::from_bytes(&req[..n]), FS_SECS) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+        Some(r) if { let b = r.payload_bytes(); b.len() > R_STATUS && b[R_STATUS] == FS_OK } => {
             ctx.log_fmt(format_args!("time: clock floor {} recorded", epoch));
             true
         }
-        // Loud, not silent: until this succeeds the next boot will know nothing. It IS retried now -
-        // the first attempt lands moments after the network sets the clock, which is exactly when `fs`
-        // may still be mounting, and the old code gave up there permanently. A floor that is never
-        // written is a `/clock.last` that never exists, which is the source this service is supposed
-        // to fall back on.
-        _ => {
-            ctx.log("time: could not record the clock floor yet (fs busy or absent) - will retry");
-            false
-        }
+        // Silent HERE on purpose: the caller reports once when the bounded attempts are spent. Logging
+        // per attempt is what turned a retry into a storm on hardware.
+        _ => false,   // the CALLER reports, once, when the attempts are spent - see the loop
     }
+}
+
+/// Try to persist the floor, at most `FLOOR_STORE_TRIES` times, and say what happened exactly once.
+///
+/// Returns true when it is settled - written, or given up on - so the caller stops waking for it.
+fn floor_store_bounded(ctx: &ServiceContext, epoch: i64, tries: &mut u32) -> bool {
+    if floor_store(ctx, epoch) {
+        return true;
+    }
+    *tries -= 1;
+    if *tries == 0 {
+        // One line, at the end, naming the consequence rather than the attempt. The clock is CORRECT
+        // right now; what is lost is only the head start on the next boot.
+        ctx.log("time: could not persist the clock floor - the next boot will start with no floor \
+                 (the clock itself is set and unaffected)");
+        return true;                              // settled: stop retrying
+    }
+    false
 }
 
 #[no_mangle]
@@ -221,6 +259,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // the shell polling for it in front of the keyboard, which is what this replaces.
     let mut floor_loaded = false;
     let mut floor_stored = true;                  // nothing to write until the clock is actually set
+    let mut store_tries = FLOOR_STORE_TRIES;
     let mut tries_left = 15u32;                   // ~30 s of retries, then stop asking
     loop {
         let req = if (floor_loaded || tries_left == 0) && floor_stored {
@@ -232,7 +271,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // A pending floor WRITE takes priority: the clock is already known, and what is
                     // missing is only its record on disk for the next boot.
                     if !floor_stored {
-                        floor_stored = floor_store(&ctx, clock.last);
+                        floor_stored = floor_store_bounded(&ctx, clock.last, &mut store_tries);
                         continue;
                     }
                     if tries_left > 0 {
@@ -293,7 +332,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // than now. Answer the caller FIRST - `net-stack` is blocked on that reply, and it
                 // must not wait on a disk write to learn its own result.
                 if ok {
-                    floor_stored = floor_store(&ctx, clock.last);
+                    store_tries = FLOOR_STORE_TRIES;
+                    floor_stored = floor_store_bounded(&ctx, clock.last, &mut store_tries);
                     floor_loaded = true;         // the floor is now ours; stop retrying the read
                 }
             }
