@@ -422,9 +422,9 @@ impl<'a> Ahci<'a> {
 
     /// Serve one block-IPC request (same protocol as the ATA PIO backend),
     /// replying through the client's `reply` cap.
-    fn serve(&self, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
+    fn serve(&self, ctx: &ServiceContext, p: &[u8], reply: CapHandle) {
         use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
-        let err = |ctx: &ServiceContext| { reply.send(ctx, &[STATUS_ERR]); };
+        let err = |ctx: &ServiceContext| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); };
         if p.is_empty() {
             err(ctx);
             return;
@@ -444,14 +444,14 @@ impl<'a> Ahci<'a> {
                 Ok(()) => STATUS_OK,
                 Err(_) => STATUS_ERR,
             };
-            reply.send(ctx, &[st]);
+            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[st]));
             return;
         }
         if p[0] == OP_CAPACITY {
             let mut out = [0u8; 9];
             out[0] = STATUS_OK;
             out[1..9].copy_from_slice(&self.sectors.get().to_le_bytes());
-            reply.send(ctx, &out);
+            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
             return;
         }
         if p.len() < 9 {
@@ -467,7 +467,7 @@ impl<'a> Ahci<'a> {
                     Ok(()) => {
                         out[0] = STATUS_OK;
                         out[1..].copy_from_slice(&sec);
-                        reply.send(ctx, &out);
+                        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
                     }
                     Err(_) => err(ctx),
                 }
@@ -483,7 +483,7 @@ impl<'a> Ahci<'a> {
                     Ok(()) => STATUS_OK,
                     Err(_) => STATUS_ERR,
                 };
-                reply.send(ctx, &[status]);
+                let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
             }
             OP_WRITE_ZEROS => {
                 // [op, lba:u64, count:u64] - zero `count` blocks from `lba`.
@@ -496,7 +496,7 @@ impl<'a> Ahci<'a> {
                     Ok(()) => STATUS_OK,
                     Err(_) => STATUS_ERR,
                 };
-                reply.send(ctx, &[status]);
+                let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
             }
             _ => err(ctx),
         }
@@ -565,21 +565,16 @@ fn serve_no_disk(ctx: &ServiceContext) -> ! {
             Some(c) => c,
             None => continue,
         };
-        let raw = msg.payload_bytes();
-        let (tag, p) = match raw.split_first() {
-            Some((t, rest)) => (*t, rest),
-            None => (0, &raw[..0]),
-        };
-        let reply = crate::Reply { cap: reply, tag };
+        let p = msg.payload_bytes();
         if !p.is_empty() && p[0] == OP_CAPACITY {
             // Capacity reply is [STATUS_OK, sectors:u64 LE]; sectors = 0 = "genuinely no disk".
             let mut out = [0u8; 9];
             out[0] = STATUS_OK;
-            reply.send(ctx, &out);
+            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
         } else {
-            reply.send(ctx, &[STATUS_ERR]);
+            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR]));
         }
-        ctx.remove_cap(reply.cap);
+        ctx.remove_cap(reply);
     }
 }
 
@@ -698,13 +693,7 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
             Some(c) => c,
             None => continue,
         };
-        // Split the correlation tag off here, once - see `crate::Reply`.
-        let p = msg.payload_bytes();
-        let (tag, body) = match p.split_first() {
-            Some((t, rest)) => (*t, rest),
-            None => (0, &p[..0]),
-        };
-        ahci.serve(ctx, body, crate::Reply { cap: reply, tag });
+        ahci.serve(ctx, msg.payload_bytes(), reply);
         ctx.remove_cap(reply);
     }
 }

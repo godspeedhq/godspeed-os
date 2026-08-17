@@ -512,7 +512,6 @@ impl ServiceContext {
     /// waking on a timer for auto-repeat (§12 timed-wait).
     /// `#[inline(always)]` for the same reason as `await_slice`: it returns a 4 KiB `Message` by
     /// value, so as a separate frame it costs 4 KiB of stack on every caller.
-    #[inline(always)]
     pub fn recv_timeout(&self, timeout_cycles: u64) -> Option<Message> {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return None; }
@@ -756,7 +755,6 @@ impl ServiceContext {
     /// the deep block calls, and thirty-second QEMU boots kept coming back clean while the board
     /// restart-looped. A one-line wrapper around a large return value has to be inlined or it must not
     /// exist.
-    #[inline(always)]
     fn await_slice(&self, ms: u64) -> Option<crate::ipc::Message> {
         self.recv_timeout(self.duration_cycles(ms))
     }

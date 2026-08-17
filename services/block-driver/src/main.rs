@@ -24,36 +24,6 @@ use godspeed_sdk::ServiceContext;
 // cards). There is no safe way to use a single-slot Pi's boot card as storage, so the backend is a
 // hazard, not a fallback. The file is kept for reference (a future board with a SEPARATE storage medium
 // could use it), but it is not a module here so it cannot be reached - see `backend_run`.
-/// A reply cap plus the CORRELATION TAG of the request it answers.
-///
-/// Every reply to `fs` carries the tag of the request that asked for it, so a reply that arrives out
-/// of order is DETECTABLE rather than silently believed. Chaos proved the need: after 98 rounds of
-/// killing and restarting these services the block protocol came back out of step, `fs` read LBA 7702
-/// and got a 17-byte reply where a 513-byte block belonged, and the only reason it noticed was that
-/// the SHAPE happened to be wrong. Two reads of different blocks are both 513 bytes and shape cannot
-/// separate them at all - one would simply be believed, which is silent data corruption.
-///
-/// The tag lives in the reply HANDLE rather than being remembered separately, so it cannot be
-/// forgotten: there is no way to answer a request without it, and the compiler says so.
-#[derive(Clone, Copy)]
-pub struct Reply {
-    pub cap: godspeed_sdk::CapHandle,
-    pub tag: u8,
-}
-
-impl Reply {
-    /// Answer, with the tag in front. `body` is the reply exactly as it was before tagging.
-    pub fn send(&self, ctx: &godspeed_sdk::ServiceContext, body: &[u8]) {
-        // 513 is the largest body (status + one block); one more for the tag. Fixed, on the stack,
-        // no allocation (§26.6.1).
-        let mut out = [0u8; 514];
-        out[0] = self.tag;
-        let n = body.len().min(out.len() - 1);
-        out[1..1 + n].copy_from_slice(&body[..n]);
-        let _ = ctx.send_by_handle(self.cap, &godspeed_sdk::Message::from_bytes(&out[..1 + n]));
-    }
-}
-
 #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
 mod ahci;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
@@ -175,12 +145,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         Some(c) => c,
                         None => continue,   // nothing to answer on; dropping is all that is left
                     };
-                    let raw = msg.payload_bytes();
-                    let (tag, p) = match raw.split_first() {
-                        Some((t, rest)) => (*t, rest),
-                        None => (0, &raw[..0]),
-                    };
-                    let reply = Reply { cap: reply, tag };
+                    let p = msg.payload_bytes();
                     let mut out = [0u8; 9];
                     let n = if !p.is_empty() && p[0] == OP_CAPACITY {
                         // Capacity is [STATUS_OK, sectors u64 LE]; zero sectors is the truth here and
@@ -191,8 +156,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         out[0] = STATUS_ERR;
                         1
                     };
-                    reply.send(ctx, &out[..n]);
-                    ctx.remove_cap(reply.cap);
+                    let _ = ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n]));
+                    ctx.remove_cap(reply);
                 }
                 ctx.yield_cpu();
             }

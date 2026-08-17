@@ -3126,15 +3126,6 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 /// One block-driver RPC with restart recovery: if the reply is missing (block-driver may have
 /// restarted, leaving our cached cap EndpointDead), reacquire a fresh cap by name (via the kernel
 /// directory) and retry once (Phase D, §14.3). All block I/O goes through here.
-/// The reply body, past the correlation tag at byte 0.
-///
-/// A borrow, not a copy: in `fs` a `Message` is 4 KiB by value, so anything that produces one costs
-/// that much stack. Every block reply is read through here.
-fn block_body(reply: &Message) -> &[u8] {
-    let p = reply.payload_bytes();
-    if p.is_empty() { p } else { &p[1..] }
-}
-
 fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     // BOUNDED, on the LEAN await. The undeadlined form wakes only on the peer's DEATH, so a
     // block-driver that is alive but silent hung `fs` permanently and every shell command behind it.
@@ -3148,86 +3139,12 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     // 30 s is chosen against the WORK: `block-driver` retries a busy device for up to 30 s per block,
     // so anything shorter abandons a request still being legitimately serviced.
     const BLOCK_RPC_SECS: i64 = 30;
-    // CORRELATION TAG at byte 0 of the request; `block-driver` echoes it at byte 0 of the reply and
-    // interprets it no further.
-    //
-    // Without it, a reply is matched to a request by ARRIVAL ORDER, and after a chaos storm that order
-    // is not reliable: 98 rounds of killing and restarting these services left the protocol out of
-    // step, `fs` read LBA 7702 and got a 17-byte reply where a 513-byte block belonged. That one was
-    // caught only because the SHAPE was wrong - and two reads of DIFFERENT blocks are both 513 bytes,
-    // so shape cannot separate them at all. The next such reply would have been believed, which is
-    // silent data corruption: the worst failure this system can have, and the one Commandment I is
-    // written against.
-    //
-    // Per-instance counter, incremented per request, wrapping. Wrapping is safe because only ONE
-    // request is outstanding at a time, so only the current tag is ever compared. Tag 0 is reserved
-    // for "untagged" and never issued, so a reply carrying 0 is from something that is not answering
-    // this request.
-    // The tag is DERIVED FROM THE REQUEST, not counted.
-    //
-    // A counter would need a home, and every home available here means threading mutable state through
-    // six functions and their callers - or a `static`, which is the unowned global state Invariant 9
-    // forbids and which the shell's own tag counter was moved out of for exactly that reason.
-    //
-    // A fold of the request bytes needs no state at all. Two requests that differ in op or in LBA fold
-    // differently, so a reply meant for another request is detected; two IDENTICAL requests fold the
-    // same, and their replies are genuinely interchangeable, so that collision is harmless by
-    // construction. One byte matches the tag width the shell already uses on its own fs channel.
-    let tag = {
-        let mut t: u8 = 0x5A;
-        for (i, b) in req.iter().enumerate() {
-            t = t.rotate_left(1) ^ b.wrapping_add(i as u8);
-        }
-        if t == 0 { 1 } else { t }   // never 0: a zero tag can only be an untagged sender
-    };
-    // NO EXTRA BUFFERS, AND NO HELPER THAT TAKES A `Message`.
-    //
-    // In `fs` a `Message` is not a handle - it carries a 4096-byte payload BY VALUE - so every
-    // expression that produces or moves one costs four kilobytes of stack, and this service runs near
-    // its 256 KiB limit. I overflowed it twice in a row here: first with a 4 KiB request buffer, then
-    // with `Message::from_bytes(body)` to return a trimmed copy, then again by passing the reply
-    // through a closure that moves it in and out. Same data abort each time, the address always just
-    // above SP_usr.
-    //
-    // So the tag is written into the message that ALREADY EXISTS, and checked in place on the reply
-    // that already exists. No temporary of any size, and the frame is what it was before tagging.
-    let mut msg = Message::from_bytes(req);
-    let rn = msg.payload_len.min(godspeed_sdk::ipc::MAX_PAYLOAD - 1);
-    msg.payload.copy_within(0..rn, 1);
-    msg.payload[0] = tag;
-    msg.payload_len = rn + 1;
-
-    if let Some(mut r) = ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS) {
-        if r.payload_len == 0 {
-            return None;
-        }
-        if r.payload[0] != tag {
-            // Loud: a discarded reply is proof the correlation is load-bearing, and a silent guard
-            // cannot tell us whether it ever fires (§26.4).
-            ctx.log_fmt(format_args!(
-                "fs: discarded a block reply for tag {} while awaiting {} - the protocol is out of step",
-                r.payload[0], tag));
-            // Do NOT re-send: the request is already with the driver, and asking twice would ask for
-            // the WORK twice - a second write, or a second read that also arrives late. The caller
-            // retries at its own level, by which point the queue has drained.
-            return None;
-        }
-        // RETURN IT UNTOUCHED. Mutating the reply here (shifting the tag off) makes it a real local
-        // that must then be COPIED into the return slot - another four kilobytes on a stack that had
-        // none to spare, which is the third form this same overflow took. Callers skip byte 0 with
-        // `block_body`, which costs nothing.
+    let msg = Message::from_bytes(req);
+    if let Some(r) = ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS) {
         return Some(r);
     }
     if ctx.reacquire_by_name("block-driver") {
-        // Written out rather than shared with the arm above: factoring it into a helper would move a
-        // `Message` across a call boundary, which is the four kilobytes this whole comment is about.
-        if let Some(mut r) = ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS) {
-            if r.payload_len == 0 || r.payload[0] != tag {
-                return None;
-            }
-            return Some(r);
-        }
-        return None;
+        return ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS);
     }
     ctx.log("fs: block-driver did not answer within 30 s (and could not be reacquired) - failing");
     None
@@ -3249,7 +3166,7 @@ const MAX_SANE_SECTORS: u64 = 1 << 48;
 /// reason: an absurd count is a mis-read, not a disk.
 fn block_capacity(ctx: &ServiceContext) -> Option<u64> {
     let reply = block_rpc(ctx, &[OP_CAPACITY])?;
-    let p = block_body(&reply);
+    let p = reply.payload_bytes();
     if p.first() != Some(&BLK_OK) || p.len() != 9 { return None; }
     let sectors = u64_at(p, 1);
     if sectors > MAX_SANE_SECTORS { return None; }
@@ -3262,7 +3179,7 @@ fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
     req[0] = OP_READ_BLOCK;
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     let reply = block_rpc(ctx, &req)?;
-    let p = block_body(&reply);
+    let p = reply.payload_bytes();
     if p.first() == Some(&BLK_OK) && p.len() >= 1 + BLOCK {
         let mut out = [0u8; BLOCK];
         out.copy_from_slice(&p[1..1 + BLOCK]);
@@ -3292,7 +3209,7 @@ fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     req[9..17].copy_from_slice(&count.to_le_bytes());
     match block_rpc(ctx, &req) {
-        Some(reply) => block_body(&reply).first() == Some(&BLK_OK),
+        Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
         None => false,
     }
 }
@@ -3311,7 +3228,7 @@ fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
 /// `false` means the data is NOT known to be on the medium and the caller must say so (§26.5, §26.7).
 fn block_flush(ctx: &ServiceContext) -> bool {
     match block_rpc(ctx, &[OP_FLUSH]) {
-        Some(reply) => block_body(&reply).first() == Some(&BLK_OK),
+        Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
         None => false,
     }
 }
@@ -3332,7 +3249,7 @@ fn block_write(ctx: &ServiceContext, lba: u64, data: &[u8; BLOCK]) -> bool {
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     req[9..].copy_from_slice(data);
     match block_rpc(ctx, &req) {
-        Some(reply) if block_body(&reply).first() == Some(&BLK_OK) => true,
+        Some(reply) if reply.payload_bytes().first() == Some(&BLK_OK) => true,
         _ => {
             ctx.log_fmt(format_args!("fs: block write failed at lba {} (device I/O error)", lba));
             false
