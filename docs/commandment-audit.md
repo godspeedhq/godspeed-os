@@ -329,6 +329,13 @@ interpretation is policy - but it should be a deliberate trade, not a surprise.
 
 ### fbcon - a console service, and the shell already asks the wrong party
 
+> **CLOSED 2026-08-17.** Done exactly as sliced below: the terminal is `services/console`, the kernel
+> keeps the `bootcon` boot/panic blit, and query 9 is deleted. `scripts/commandments.py` reports 14/14 -
+> this was the last standing violation. Hardware-verified on the Pi 2 (chaos 50 rounds, 0 kernel panics,
+> selfcheck 350/0). The present-tense text below is the finding as WRITTEN, kept as the record of what
+> motivated the work; `docs/console-service.md` §9 is the as-built account, and its §9.8 lists the five
+> defects that only hardware found.
+
 1,172 lines, of which the kernel needs almost none: a panic must be visible on a machine whose only
 output is a framebuffer, and that is a font blit and a cursor. Everything else - `handle_csi`,
 `execute_csi`, attributes, `erase_line_to_eol`, `blank_block`, the shadow grid, scroll - is terminal

@@ -675,7 +675,10 @@ genuine simplification the survey surfaced (§26.13).
   **the Pi has no battery-backed RTC.** These degrade to "no wall clock" (date/uptime lose their RTC
   source; uptime can move to the generic timer, wall-clock date needs NTP or a DS3231 add-on later).
   A real, board-level gap to design for - not a blocker for the identity suite.
-- `fb::dims_packed` -> Limine framebuffer vs the Pi VideoCore mailbox framebuffer.
+- `fb_commit` + a `bootcon::init(FbParams{..})` (the framebuffer slice, its PHYSICAL base for the
+  `console` service's grant, geometry, channel shifts) -> Limine framebuffer vs the Pi VideoCore mailbox
+  framebuffer. (`fb::dims_packed` is gone: terminal geometry belongs to the `console` service, not the
+  kernel - `docs/console-service.md` 9.7.)
 
 **Scoping takeaway:** the true per-arch reimplementation (bucket A) is ~40 symbols in the well-known
 categories above; ~15 (bucket B) are a one-time neutral relocation that helps every arch; and bucket C

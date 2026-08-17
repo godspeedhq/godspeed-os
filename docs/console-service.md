@@ -351,8 +351,9 @@ for one physical page UNPREDICTABLE, so both mappings must agree. They agree on 
 - The service cannot do cache maintenance - `unsafe` is forbidden in services (§18.2) and `DCCMVAC` is
   PL1-only on ARMv7 anyway. So a cacheable mapping is not available to it at any price.
 - Therefore the kernel's mapping becomes non-cacheable too (`section_fb`), and `fb_commit` (a
-  clean-to-PoC on ARM, an `sfence` on x86) collapses to `fb_barrier` - store ordering only, nothing to
-  clean. `FB_READBACK_CHEAP` disappears with it: reading back a non-cacheable framebuffer is never cheap,
+  clean-to-PoC on ARM, an `sfence` on x86) collapses on ARM to a store barrier - a `DSB`, ordering only,
+  nothing to clean - while KEEPING its name and its rectangle argument, because an arch that maps its
+  framebuffer cacheable (the Pi 4) still needs both. `FB_READBACK_CHEAP` disappears with it: reading back a non-cacheable framebuffer is never cheap,
   so the terminal always repaints from its shadow grid and `scroll_by_copy` is deleted.
 
 Non-cacheable here means **Normal** non-cacheable, not **Device**. The distinction matters and the
@@ -371,7 +372,7 @@ already repaint-from-shadow on x86 for the same reason.
 | | |
 |---|---|
 | **Added** | `ConsoleDrain` syscall (the service reads the console byte stream); a `CONSOLE_RENDER` authority gating it; a framebuffer grant in the spawn path; one `service_config` row |
-| **Removed** | `InspectKernel` query 9 (`dims_packed`) - the shell asked the KERNEL for terminal geometry, which is a service's question; `fb_commit` / `FB_READBACK_CHEAP` from the arch contract; ~840 lines of ring-0 code |
+| **Removed** | `InspectKernel` query 9 (`dims_packed`) - the shell asked the KERNEL for terminal geometry, which is a service's question; `FB_READBACK_CHEAP` from the arch contract, halving the framebuffer surface an arch owes to `fb_commit` alone; ~840 lines of ring-0 code |
 
 The syscall pin grows by one and the introspection pin shrinks by one. That is the trade the audit
 predicted and it is deliberate: a byte read is mechanism, terminal geometry is policy.

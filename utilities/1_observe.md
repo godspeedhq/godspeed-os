@@ -166,9 +166,10 @@ average. This requires the utility to remember the previous frame's tick counts.
 
 ### 5.4 Console prerequisite (kernel/console work - gates the live view)
 
-A live in-place repaint needs the framebuffer console to support **clear-screen +
-cursor-home**. Today the fbcon only streams glyphs and scrolls; it has no
-clear/home. The first concrete piece of the live view is therefore a console
+**(Resolved.)** The terminal - now the `console` service (`docs/console-service.md` 9) - honours
+`ESC[2J` (erase display) and `ESC[H` (cursor home), which is exactly what makes the live view and
+`clear` work today. What follows is the original reasoning, kept because it explains the shape of the
+live loop. The first concrete piece of the live view was therefore a console
 control (e.g. interpret `0x0C` form-feed as clear+home, or an explicit escape),
 not the metrics. `observe` then: clear+home → paint frame → poll the console
 input ring for `q` for ~1 s → repeat. The `q` keypress rides the same console

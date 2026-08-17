@@ -28,7 +28,7 @@ GodspeedOS: a capability-based microkernel
 ```
 
 ASCII only - the framebuffer console's font is ASCII, so no em-dashes or other
-non-ASCII glyphs (they render blank on the TV).
+non-ASCII glyphs (an unsupported codepoint renders as `?` on the TV - visible, never silently dropped).
 
 ## 4. Data source
 

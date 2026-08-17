@@ -22,6 +22,11 @@ the word inside a doc comment: `services/xhci/src/main.rs:12`, `services/ehci/sr
 ## Achievements
 
 ### Framebuffer console (fbcon)
+
+> **Superseded 2026-08-17.** The terminal left the kernel for the `console` SERVICE
+> (`docs/console-service.md` 9, CLAUDE.md 11.4 amendment). What follows records what shipped in THIS
+> milestone and is kept as a record; today the kernel keeps only the `bootcon` boot/panic blit, and it
+> stops drawing the moment the framebuffer is granted at spawn.
 - ✅ Renders an 8×16 text console to a real TV/monitor over the **Limine framebuffer**, mirroring
   every serial line - `kernel/src/arch/x86_64/fb.rs`. Write-combining stores are flushed with an
   `SFENCE` so glyphs actually reach the panel.
@@ -53,7 +58,7 @@ the word inside a doc comment: `services/xhci/src/main.rs:12`, `services/ehci/sr
 
 | Area | Path / commit |
 |------|---------------|
-| Framebuffer console | `kernel/src/arch/x86_64/fb.rs`; cursor fixes `97d9e48`, `f70be68` |
+| Framebuffer console (as shipped then; the terminal is `services/console/` now) | `kernel/src/arch/x86_64/fb.rs` at the time; cursor fixes `97d9e48`, `f70be68` |
 | xHCI driver | `services/xhci/src/main.rs` (no `unsafe`) |
 | EHCI driver | `services/ehci/src/main.rs` (no `unsafe`) |
 | Shared HID decode | `sdk/rust/src/hid.rs` |

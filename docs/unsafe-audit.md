@@ -23,7 +23,10 @@ answering it.
 
 **The console itself is arch-neutral and stays `unsafe`-free.** `crate::fbcon` - the ANSI parser, the
 UTF-8 decoder, the character grid, glyph rendering, scrolling - is shared with x86 and the 32-bit ARM
-port. This arch owes it exactly three things (`fb_commit`, `FB_READBACK_CHEAP`, and the framebuffer as a
+port. (**Superseded 2026-08-17** - see that entry: the module is `crate::bootcon` and is a boot/panic
+blit, not a terminal; `FB_READBACK_CHEAP` is deleted; the terminal is the `console` service. The
+description below is what was true when this entry was written.) This arch owes it exactly three things
+(`fb_commit`, `FB_READBACK_CHEAP`, and the framebuffer as a
 `&'static mut [u8]`) and gets a full terminal for them. Handing over a **slice** rather than a base
 address is what keeps every pixel write in the neutral console bounds-checked: the one `unsafe` that
 buys the display lives here in `arch/`, where the mapping's validity is actually known.

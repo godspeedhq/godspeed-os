@@ -35,12 +35,20 @@ documented in `arch/x86_64/CLAUDE.md` (`BootInfo`, `init()`, `ap_init()`, `seria
 `halt_all_cores()`, the safe user-pointer and cycle-counter wrappers, and so on). Match those
 signatures when you bring a real port up.
 
-If the platform has a framebuffer you want text on, the arch owes exactly two more things and gets a
-full ANSI terminal for free: `fb_commit` (publish a written rectangle) and `FB_READBACK_CHEAP` (does
-reading the framebuffer back cost what writing it does), plus an init that hands `crate::fbcon` the
-framebuffer as a `&'static mut [u8]`. That slice is deliberate: it keeps the whole console
-`unsafe`-free, so the one `unsafe` stays here in `arch/`, where the mapping's validity is known.
-`arch/x86_64/fb.rs` and `arch/arm/fbcon.rs` are both about 50 lines and are the templates.
+If the platform has a framebuffer you want text on, the arch owes exactly ONE more thing and gets the
+kernel's boot/panic blit for free: `fb_commit` (publish a written rectangle - a cache clean where the
+mapping is cacheable, a store fence where it is write-combining, a drain where it is non-cacheable),
+plus an init that hands `crate::bootcon` an `FbParams`: the framebuffer as a `&'static mut [u8]`, its
+PHYSICAL base (what the `console` service's grant is built from), geometry, and channel shifts. That
+slice is deliberate: it keeps the whole floor `unsafe`-free, so the one `unsafe` stays here in `arch/`,
+where the mapping's validity is known. `arch/x86_64/fb.rs` and `arch/arm/bootcon.rs` are the templates.
+
+**You do NOT get a terminal for that.** The ANSI/CSI parser, the UTF-8 decoder, the character grid, the
+cursor and scrolling are the userspace `console` SERVICE (`docs/console-service.md` 9); the kernel keeps
+only a minimal blit that draws plain ASCII and discards escapes. Where the framebuffer is ALSO granted
+to that service, the arch must map it Normal **non-cacheable** to match the service's own mapping - ARM
+leaves mismatched memory attributes for one physical page UNPREDICTABLE (`arch/arm/mmu.rs::section_fb`).
+An arch that maps it cacheable simply does not grant it, and renders through the floor (the Pi 4 today).
 
 For the **first milestone** of a new arch - boot the neutral kernel and print to a UART - the surface
 is far smaller: a `_start`, minimal CPU/stack setup, and a byte-out to the platform's serial device.
