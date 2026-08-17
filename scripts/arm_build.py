@@ -16,34 +16,44 @@ ping/pong). The kernel spawns only the supervisor (C1-1), so there is no kernel-
 bring-up build any more - the supervisor path IS the bring-up path.
 """
 import argparse, subprocess, sys, os, shutil
+import io
+import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TARGET = "armv7a-none-eabi"
 
 # Services that build for ARM (arch-neutral: SDK + syscalls only, no x86 hardware
 # probe). Must stay in sync with `arm_built` in kernel/build.rs. Hardware drivers
-# (block-driver, fs, nic-driver, net-stack, xhci, ehci) are omitted - they hunt for
-# x86 hardware absent on the Pi 2 and stay placeholders until real Pi drivers exist.
-ARM_SERVICES = [
-    "logger", "ping", "pong", "supervisor", "shell",
-    "observe", "chaos", "mem-pressure",
-    "counter", "greet", "upper", "roster",
-    "reply-server", "asker", "resource-server", "holder",
-    # Persistence on the Pi 2: block-driver (BCM2835 EMMC/SDHCI PIO backend) + arch-neutral fs.
-    "block-driver", "fs",
-    # Networking on the Pi 2: nic-driver (USB-net bridge backend) + arch-neutral net-stack.
-    "nic-driver", "net-stack",
-    # The userspace USB host driver (Phase 2 skeleton) - docs/arm32-usb-userspace.md.
-    "dwc2",
-    # The wall clock, moved out of the kernel (C1-6). REQUIRED on the Pi 2, not optional: the board has
-    # no battery-backed RTC, so SNTP is the only way it ever learns the time - and `SetClock` (the
-    # syscall net-stack used to call) is deleted, so without this service `date sync` fails silently.
-    "time",
-    # The COM2 operator channel, moved out of the kernel (C1-6). The Pi is driven from its own console
-    # rather than COM2, so this is inert here - but the kernel embeds a placeholder if it is not built,
-    # and a service that exists on one arch and is a stub on another is exactly the drift worth avoiding.
-    "control",
-]
+# DERIVED from `kernel/build.rs`, not declared here. Two lists of one fact is the shape that keeps
+# biting: `kernel/build.rs` decides which services are embedded as REAL ELFs on ARM (`arm_built`), and
+# this script decides which are CROSS-COMPILED - and you cannot embed what was never built. They are the
+# same set, and keeping a second copy here means a service added to one and not the other silently
+# becomes a PLACEHOLDER: the kernel builds, the image builds, and the failure is a runtime
+# `LoadFailed(TooSmall)` at spawn.
+#
+# That is not hypothetical. It is the THIRD time this exact drift has landed (the scheduler's
+# death-notification set vs the supervisor's watched set was the second, and is now derived too), and it
+# cost the `console` service its first boot on hardware: everything reported success, the display just
+# quietly stayed on the kernel's boot floor.
+#
+# So parse the kernel's list and use it. `kernel/build.rs` is the single source of truth because it is
+# the one that must be right for the IMAGE to be right - this script only feeds it.
+def _arm_services():
+    kb = os.path.join(ROOT, "kernel", "build.rs")
+    src = io.open(kb, encoding="utf-8").read()
+    m = re.search(r"let arm_built: &\[&str\] = &\[(.*?)\n    \];", src, re.S)
+    if not m:
+        raise SystemExit(
+            "arm_build: cannot find `arm_built` in kernel/build.rs. It is the source of truth for which\n"
+            "services are built + embedded on ARM; refusing to guess, because guessing wrong produces a\n"
+            "placeholder ELF and a service that fails to spawn at runtime with LoadFailed(TooSmall)."
+        )
+    # Strip comments, then take every quoted name.
+    body = re.sub(r"//[^\n]*", "", m.group(1))
+    return re.findall(r'"([a-z0-9-]+)"', body)
+
+
+ARM_SERVICES = _arm_services()
 
 
 def run(cmd):
