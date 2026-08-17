@@ -3135,7 +3135,7 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 ///
 /// 513 bytes, not the 4096 a `Message` carries. That difference is the whole reason the tag fits now.
 pub struct BlockReply {
-    buf: [u8; 1 + BLOCK],
+    buf: [u8; 2 + BLOCK],
     len: usize,
 }
 
@@ -3162,7 +3162,10 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     // The reply lands in a buffer THIS function owns, sized to the protocol (status + one block), and
     // the caller reads it as a slice. No `Message` is returned, forwarded or mutated anywhere on this
     // path - which is what makes room for the correlation tag that would not previously fit.
-    const BLK_REPLY_MAX: usize = 1 + BLOCK;
+    // TAG + STATUS + BLOCK. Sized 1 + BLOCK first, which truncated every read by one byte: `fs` then
+    // saw a 512-byte body where 513 belongs and rejected it as a desync - "block read at lba 0 got a
+    // MALFORMED reply (512 bytes)". The shape check did its job; the buffer was simply a byte short.
+    const BLK_REPLY_MAX: usize = 2 + BLOCK;
     let mut rbuf = [0u8; BLK_REPLY_MAX];
 
     // CORRELATION TAG at byte 0, echoed by `block-driver` and interpreted no further.
