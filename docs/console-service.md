@@ -269,3 +269,104 @@ on the **first up-arrow**, not at spawn. A fresh prompt never blocks on `fs` com
 re-init path touches no disk. In-memory history stays bounded (a fixed ring); saving remains best-effort
 (§15). Two small changes, one theme: the interactive path must stay responsive precisely when the rest of
 the system is busy recovering.
+
+---
+
+## 9. Stage 4 - the console service is real, and `fbcon` leaves the kernel (2026-08-17)
+
+> **Status:** IN PROGRESS on `feat/pi2-arm32-hardening`. This section supersedes decision **(2)(a)**
+> of §5 ("kernel render path") and decision **(4)** of §5a ("input stays shell-brokered" - still true;
+> only OUTPUT moves). Driven by `scripts/commandments.py`, for which `kernel/src/fbcon` was the last
+> standing Commandment I violation: 1,172 lines of terminal emulation that can claim none of the
+> kernel's six responsibilities (§4.3) and no sanctioned support role.
+
+### 9.1 Why (2)(a) was wrong
+
+§5 chose "the kernel keeps glyph rendering = mechanism, the service controls layout", reasoning from
+§26.10. That reading does not survive contact with §4.4: a font rasteriser, an ANSI/CSI state machine, a
+UTF-8 decoder, a shadow grid and a scroll strategy are a **display driver**, and §4.4 forbids drivers in
+the kernel by name. The measured boundary (`docs/commandment-audit.md`, 2026-08-14) also showed there is
+no cheap partial slice - the emulator is reached THROUGH `put_byte`, so removing CSI handling alone
+leaves the shell's cursor moves and colours going nowhere. The service must take rendering **entirely**.
+
+The recorded user position settled it: *"fbcon is not special, only the kernel is special; I really don't
+want to continue adding exceptions to the kernel."* So option **(b)** of §5b - map the framebuffer to the
+service, as the xHCI BAR is mapped to `xhci` - is what gets built. Its stated drawback ("duplicates the
+font renderer and is serial-blind") is answered below.
+
+### 9.2 The split
+
+| | Kernel (`bootcon/`, ~330 lines) | `console` service (~1,100 lines) |
+|---|---|---|
+| Serial | owns it, unchanged - **still the source of truth** | never touches it |
+| Framebuffer | a minimal boot/panic blit | the whole terminal |
+| Text model | none (no grid, no cursor, no scrollback) | ANSI/CSI, UTF-8, shadow grid, cursor, scroll, reverse video |
+| Geometry | private to its own blit, never published | the single source of truth for rows/cols |
+
+**Not serial-blind.** `ConsoleWrite` (syscall 23) still writes serial synchronously, exactly as today, so
+a captured `build/serial_output.log` is unchanged and the interactive session still appears in it. What
+the syscall stops doing is *rendering*; it appends the same bytes to a bounded console ring the service
+drains. Serial is truth, the display is a mirror - which is already the stated ARM policy (`mirror()`).
+
+**Not a duplicated font renderer.** The kernel's blit is deliberately cruder than the terminal's: no box
+glyphs, no reverse video, no shadow grid, and a "scroll" that clears and starts at the top. It is a floor,
+not a small terminal, and the two are not two copies of one thing.
+
+### 9.3 What earns the kernel's remaining blit
+
+**Impossibility, which is the only thing that does** (`docs/commandment-audit.md`: the bar the control
+channel failed and the supervisor spawn clears). A panic halts every core, including the console service,
+so **a panic cannot ask a service to report it**. On a Pi wired to a TV with no serial cable, a kernel
+with no blit dies with a frozen screen and no reason on it - the silent failure invariant 12 exists to
+forbid. Boot output has the same shape: it precedes every service, including the one that would render it.
+
+Both are the §11.4 ring-buffer argument applied to a machine with no serial port, so `bootcon` claims the
+same `kernel-log-floor` role and nothing wider. §11.4 is amended to say so, because it currently reads
+"serial console", which is **x86-shaped** - on a PC serial is always there.
+
+### 9.4 Ownership of the framebuffer is explicit and one-way
+
+Two writers to one framebuffer is not a race the service can defend against: its shadow grid would be
+silently wrong about what is on screen. So ownership is a state, not a convention:
+
+```
+kernel owns it  --(service has mapped + cleared: bootcon::release)-->  service owns it
+       ^                                                                      |
+       +-------------------- bootcon::reclaim_for_panic ----------------------+
+```
+
+The service calls `release` only *after* it can draw, so there is no window with no writer. The panic path
+reclaims unconditionally and clears, because by then the service is halted and its grid describes nothing.
+
+### 9.5 Memory attributes - the constraint that shapes the mapping
+
+The service maps the *same physical pages* the kernel mapped. ARM leaves **mismatched memory attributes**
+for one physical page UNPREDICTABLE, so both mappings must agree. They agree on **Normal non-cacheable**:
+
+- The service cannot do cache maintenance - `unsafe` is forbidden in services (§18.2) and `DCCMVAC` is
+  PL1-only on ARMv7 anyway. So a cacheable mapping is not available to it at any price.
+- Therefore the kernel's mapping becomes non-cacheable too (`section_fb`), and `fb_commit` (a
+  clean-to-PoC on ARM, an `sfence` on x86) collapses to `fb_barrier` - store ordering only, nothing to
+  clean. `FB_READBACK_CHEAP` disappears with it: reading back a non-cacheable framebuffer is never cheap,
+  so the terminal always repaints from its shadow grid and `scroll_by_copy` is deleted.
+
+Cost: the kernel's boot text is slower to paint. It is boot text, and the terminal's own scroll was
+already repaint-from-shadow on x86 for the same reason.
+
+### 9.6 Surfaces added and removed
+
+| | |
+|---|---|
+| **Added** | `ConsoleDrain` syscall (the service reads the console byte stream); a `CONSOLE_RENDER` authority gating it; a framebuffer grant in the spawn path; one `service_config` row |
+| **Removed** | `InspectKernel` query 9 (`dims_packed`) - the shell asked the KERNEL for terminal geometry, which is a service's question; `fb_commit` / `FB_READBACK_CHEAP` from the arch contract; ~840 lines of ring-0 code |
+
+The syscall pin grows by one and the introspection pin shrinks by one. That is the trade the audit
+predicted and it is deliberate: a byte read is mechanism, terminal geometry is policy.
+
+### 9.7 Geometry has ONE owner
+
+`ctx.console_dims()` no longer reads query 9. The shell asks the `console` service, which is where the
+safe-area inset, the cell size and the font-scale rule live. The kernel's `bootcon` computes rows/cols for
+its own blit and **never publishes them** - a private working value is not a second source of truth, but a
+published one would be (Commandment III). A shell that cannot reach the console service reports the
+console unavailable rather than guessing a size.
