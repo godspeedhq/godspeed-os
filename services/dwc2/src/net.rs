@@ -30,6 +30,9 @@ pub struct Stats {
     pub rx_bytes:   u32,   // total bytes those bursts carried
     pub rx_frames:  u32,   // complete frames the parse handed up
     pub rx_bad:     u32,   // bursts whose first status word did not parse
+    /// Frames parsed out of a burst but never delivered because the receive queue was full. The honest
+    /// name for packet loss inside this driver, and the reason the queue below is not a silent buffer.
+    pub rx_dropped: u32,
     /// HCINT from the LAST bulk-IN that did not complete, plus how many times the channel never
     /// halted at all. The controller writes down why every transfer ended; discarding that and
     /// guessing is what turns a five-minute diagnosis into an afternoon. 0 with a non-zero
@@ -58,6 +61,21 @@ pub struct Nic {
     /// Endpoint data toggles, per DIRECTION, for the device's lifetime - the level USB defines them
     /// at, learned three times over on the disk path.
     pub stats: Stats,
+    /// Frames parsed from a burst but not yet collected by the client, oldest first.
+    ///
+    /// A bulk-IN burst from this device can carry SEVERAL ethernet frames, and the serve protocol hands
+    /// back one frame per reply - it has no framing of its own, so two frames in one message would be
+    /// indistinguishable from one frame's payload. That is a wire-format constraint, and the old code
+    /// treated it as licence to DROP the rest of the burst, reasoning that "the client polls again". A
+    /// client polling again cannot recover frames already consumed from the burst and thrown away; on
+    /// hardware this lost a steady few percent of everything received, and it looked like network loss.
+    ///
+    /// Bounded and stack-resident (no heap, 26.6.1); a full queue counts `stats.rx_dropped` rather than
+    /// losing frames quietly.
+    pub rxq: [[u8; FRAME_MAX]; RXQ_DEPTH],
+    pub rxq_len: [u16; RXQ_DEPTH],
+    pub rxq_head: usize,
+    pub rxq_count: usize,
     /// Is a bulk-IN currently armed on CH_NET, waiting for the device to have a frame?
     pub in_armed: bool,
     pub pid_in: u32,
@@ -275,7 +293,9 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
         ep_in, ep_out, mps, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
     // Link starts DOWN and unstamped: the first transmit reads the PHY instead of assuming a
     // cable is there. Assuming UP is how a driver spends a full budget per frame proving otherwise.
-    Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(), in_armed: false,
+    Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(),
+               rxq: [[0u8; FRAME_MAX]; RXQ_DEPTH], rxq_len: [0; RXQ_DEPTH], rxq_head: 0, rxq_count: 0,
+               in_armed: false,
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
                link_up: false, link_at: 0,
                tx_fail_run: 0, tx_backoff_at: 0, tx_hcint: 0, tx_nohalt: 0, tx_nptxsts: 0,
@@ -665,6 +685,14 @@ pub const RX_OFF: usize = 0x3000;
 // remove the duplication, which is the actual Commandment III violation and needs one shared source
 // these crates can both name. Recorded rather than pretended away.
 pub const FRAME_MAX: usize = 1600;
+
+/// How many received frames may wait for the client to collect them.
+///
+/// Four, because the loss this exists to stop comes from one burst carrying more than one frame, and
+/// bursts on this device carry two or three; four covers that with margin at 6.4 KiB of a 256 KiB
+/// stack. Deliberately NOT a buffer for a slow client - one that stops collecting should see loss,
+/// loudly counted, rather than have the driver grow to hide it.
+pub const RXQ_DEPTH: usize = 4;
 /// One IN transfer can carry SEVERAL frames, so the receive burst is larger than one frame.
 pub const RX_BURST: usize = 4096;   // 8 x 512, matching SMSC_BURST_PKTS and the kernel driver
 const _: () = assert!(TX_OFF >= crate::msc::DATA_OFF + crate::msc::DATA_MAX);
@@ -891,6 +919,34 @@ pub fn tx(
 ///
 /// Returns the number of frames delivered. Zero is the ordinary answer on a quiet network and is not
 /// a failure.
+impl Nic {
+    /// Append a frame to the receive queue. A full queue counts the loss instead of hiding it.
+    pub fn rxq_push(&mut self, f: &[u8]) {
+        if self.rxq_count >= RXQ_DEPTH {
+            self.stats.rx_dropped = self.stats.rx_dropped.saturating_add(1);
+            return;
+        }
+        let slot = (self.rxq_head + self.rxq_count) % RXQ_DEPTH;
+        let n = f.len().min(FRAME_MAX);
+        self.rxq[slot][..n].copy_from_slice(&f[..n]);
+        self.rxq_len[slot] = n as u16;
+        self.rxq_count += 1;
+    }
+
+    /// Copy the oldest queued frame into `out` and remove it. Returns its length, 0 if empty.
+    pub fn rxq_pop(&mut self, out: &mut [u8]) -> usize {
+        if self.rxq_count == 0 {
+            return 0;
+        }
+        let slot = self.rxq_head;
+        let n = (self.rxq_len[slot] as usize).min(out.len());
+        out[..n].copy_from_slice(&self.rxq[slot][..n]);
+        self.rxq_head = (self.rxq_head + 1) % RXQ_DEPTH;
+        self.rxq_count -= 1;
+        n
+    }
+}
+
 pub fn rx(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Nic,
     mut deliver: impl FnMut(&[u8]),
@@ -1174,17 +1230,33 @@ pub fn serve(
         OP_NET_RX => {
             // [n_lo, n_hi, frame...]. Zero length is "nothing received", which on a quiet network is
             // the ordinary answer and not a failure.
-            let mut got = 0usize;
-            rx(ctx, mmio, dma, t, nic, |f| {
-                // ONE frame per reply: the protocol has no framing of its own, so a second frame in
-                // the same message would be indistinguishable from the first one's payload. The rest
-                // of the burst is dropped rather than mis-delivered, and the client polls again.
-                if got == 0 {
-                    let take = f.len().min(FRAME_MAX);
-                    out[2..2 + take].copy_from_slice(&f[..take]);
-                    got = take;
+            // Only touch the wire when nothing is already waiting: a burst can carry several frames
+            // and the client collects them one reply at a time.
+            if nic.rxq_count == 0 {
+                // Stage the burst here, because the callback cannot borrow `nic` (it is already
+                // borrowed mutably by `rx`). Bounded by RXQ_DEPTH, the same limit the queue enforces.
+                let mut stage = [[0u8; FRAME_MAX]; RXQ_DEPTH];
+                let mut lens = [0usize; RXQ_DEPTH];
+                let mut n_st = 0usize;
+                let mut over = 0u32;
+                rx(ctx, mmio, dma, t, nic, |f| {
+                    if n_st < RXQ_DEPTH {
+                        let take = f.len().min(FRAME_MAX);
+                        stage[n_st][..take].copy_from_slice(&f[..take]);
+                        lens[n_st] = take;
+                        n_st += 1;
+                    } else {
+                        over += 1;
+                    }
+                });
+                for i in 0..n_st {
+                    nic.rxq_push(&stage[i][..lens[i]]);
                 }
-            });
+                nic.stats.rx_dropped = nic.stats.rx_dropped.saturating_add(over);
+            }
+            let mut frame = [0u8; FRAME_MAX];
+            let got = nic.rxq_pop(&mut frame);
+            out[2..2 + got].copy_from_slice(&frame[..got]);
             out[0] = (got & 0xFF) as u8;
             out[1] = ((got >> 8) & 0xFF) as u8;
             got + 2

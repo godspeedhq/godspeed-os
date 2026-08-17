@@ -166,7 +166,7 @@ fn floor_load(ctx: &ServiceContext, clock: &mut Clock) -> bool {
 }
 
 /// Persist the floor, so the next boot starts no earlier than this moment.
-fn floor_store(ctx: &ServiceContext, epoch: i64) {
+fn floor_store(ctx: &ServiceContext, epoch: i64) -> bool {
     let mut num = [0u8; 24];
     let mut i = num.len();
     let mut v = if epoch < 0 { 0u64 } else { epoch as u64 };
@@ -183,11 +183,19 @@ fn floor_store(ctx: &ServiceContext, epoch: i64) {
     req[off..off + digits.len()].copy_from_slice(digits);
     let n = off + digits.len();
     match ctx.request_with_reply_deadline("fs", &Message::from_bytes(&req[..n]), FS_SECS) {
-        Some(r) if r.payload_bytes().first() == Some(&FS_OK) =>
-            ctx.log_fmt(format_args!("time: clock floor {} recorded", epoch)),
-        // Loud, not silent: the floor will not survive this power cycle, and the next boot will know
-        // nothing. A degraded state to report (§26.7), not a thing to retry forever.
-        _ => ctx.log("time: could not record the clock floor (no filesystem?)"),
+        Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
+            ctx.log_fmt(format_args!("time: clock floor {} recorded", epoch));
+            true
+        }
+        // Loud, not silent: until this succeeds the next boot will know nothing. It IS retried now -
+        // the first attempt lands moments after the network sets the clock, which is exactly when `fs`
+        // may still be mounting, and the old code gave up there permanently. A floor that is never
+        // written is a `/clock.last` that never exists, which is the source this service is supposed
+        // to fall back on.
+        _ => {
+            ctx.log("time: could not record the clock floor yet (fs busy or absent) - will retry");
+            false
+        }
     }
 }
 
@@ -212,19 +220,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // all. Bounded, self-terminating, and confined to the service that owns the clock - as opposed to
     // the shell polling for it in front of the keyboard, which is what this replaces.
     let mut floor_loaded = false;
+    let mut floor_stored = true;                  // nothing to write until the clock is actually set
     let mut tries_left = 15u32;                   // ~30 s of retries, then stop asking
     loop {
-        let req = if floor_loaded || tries_left == 0 {
+        let req = if (floor_loaded || tries_left == 0) && floor_stored {
             ctx.recv()
         } else {
             match ctx.recv_timeout(ctx.duration_cycles(FLOOR_RETRY_MS)) {
                 Some(m) => m,
                 None => {
-                    tries_left -= 1;
+                    // A pending floor WRITE takes priority: the clock is already known, and what is
+                    // missing is only its record on disk for the next boot.
+                    if !floor_stored {
+                        floor_stored = floor_store(&ctx, clock.last);
+                        continue;
+                    }
+                    if tries_left > 0 {
+                        tries_left -= 1;
+                    }
                     if floor_load(&ctx, &mut clock) {
                         floor_loaded = true;
                     } else if tries_left == 0 {
-                        ctx.log("time: no persisted clock floor after 30s - the clock stays unset until the network sets it");
+                        ctx.log("time: no persisted clock floor on disk - the clock stays unset until the network sets it");
                     }
                     continue;
                 }
@@ -276,7 +293,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // than now. Answer the caller FIRST - `net-stack` is blocked on that reply, and it
                 // must not wait on a disk write to learn its own result.
                 if ok {
-                    floor_store(&ctx, clock.last);
+                    floor_stored = floor_store(&ctx, clock.last);
                     floor_loaded = true;         // the floor is now ours; stop retrying the read
                 }
             }

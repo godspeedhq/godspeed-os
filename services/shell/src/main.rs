@@ -4983,18 +4983,25 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     if source == ClockSource::Unset {
         // Say we do not know, rather than printing a number we cannot stand behind. If a floor was
         // recorded, report it AS A FLOOR - "we ran at least this late" is true; "it is now that" is not.
-        match time_floor(ctx) {
-            Some(f) => {
-                let fd = Datetime::from_epoch_secs(f);
-                out.line_fmt(ctx, format_args!(
-                    "unset - no RTC on this board; the time service is reconciling in the background"));
-                out.line_fmt(ctx, format_args!(
-                    "        (last known {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC from {} - a floor, not a reading)",
-                    fd.year, fd.month, fd.day, fd.hour, fd.minute, fd.second,
-                    core::str::from_utf8(CLOCK_FLOOR_PATH).unwrap_or("disk")));
-            }
-            None => out.line_fmt(ctx, format_args!(
-                "unset - no RTC on this board; the time service is reconciling in the background")),
+        // SAY WHY, not just "unknown". The three sources are tried in order - a hardware clock, the
+        // network, then the floor on disk - so naming the one that is missing is the difference between
+        // a user waiting for something that will happen and a user waiting for something that will not.
+        let linked = net_link_up(ctx);
+        out.line_fmt(ctx, format_args!(
+            "the clock is not set: this board has no RTC, so the time can only come from the network"));
+        if linked {
+            out.line_fmt(ctx, format_args!(
+                "        the network is up and the time service is asking it (retried about once a minute)"));
+        } else {
+            out.line_fmt(ctx, format_args!(
+                "        no network link - plug the cable in and it will set itself, or run 'date sync'"));
+        }
+        if let Some(f) = time_floor(ctx) {
+            let fd = Datetime::from_epoch_secs(f);
+            out.line_fmt(ctx, format_args!(
+                "        (last known {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC from {} - a floor, not a reading)",
+                fd.year, fd.month, fd.day, fd.hour, fd.minute, fd.second,
+                core::str::from_utf8(CLOCK_FLOOR_PATH).unwrap_or("disk")));
         }
         return Ok(());
     }
@@ -5459,6 +5466,20 @@ fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> 
         let _ = ctx.reacquire_by_name(peer);   // best-effort: the caller retries regardless
     }
     NetQ::Timeout
+}
+
+/// Is the ethernet link up right now? Asked of `nic-driver` (byte 7 of its `[3]` status), which reads
+/// the PHY rather than a cached boot-time flag.
+///
+/// Used only to explain an UNSET clock: "the network is up and being asked" and "there is no cable" are
+/// different situations for the user, and one of them is not going to resolve itself. A short deadline
+/// and a pessimistic default - if nic-driver does not answer we do not claim a link.
+fn net_link_up(ctx: &ServiceContext) -> bool {
+    let req = Message::from_bytes(&[3u8]);
+    match ctx.request_with_reply_deadline("nic-driver", &req, 2) {
+        Some(r) => { let p = r.payload_bytes(); p.len() >= 8 && p[7] != 0 }
+        None => false,
+    }
 }
 
 fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {

@@ -587,6 +587,13 @@ const SNTP_MAX_PLAUSIBLE: u32 = 4_102_444_800;
 /// other client op (net/ping/dns) behind it for the full 6-try budget.
 const SNTP_TRIES: u32 = 3;
 
+/// How long to leave between automatic SNTP retries while the clock is still unset.
+///
+/// A minute: long enough that a silent NTP server costs one exchange a minute rather than one per
+/// request, short enough that plugging a cable in gets a clock within a minute without anyone asking.
+/// Only paid while the clock is UNSET - once it is known this costs a single cheap read.
+const RESYNC_SECS: i64 = 60;
+
 /// SNTP: fetch the current time from an NTP server and set the wall clock. The RTC-less Pi 2 has no other
 /// time source, so `date` reads zero until this runs (auto on boot after the DHCP dance, and on `date
 /// sync`). Resolve pool.ntp.org (fall back to a fixed anycast NTP IP if DNS is down), send a mode-3 client
@@ -1174,6 +1181,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Outside the loop deliberately: a once-only latch declared inside the loop it guards resets every
     // iteration and reports every time, which is the flood it exists to prevent.
     let mut capless_logged = false;
+    // When the last automatic SNTP retry ran (monotonic seconds). See RESYNC_SECS.
+    let mut last_resync_at: i64 = 0;
     loop {
         // A BARE BLOCK, deliberately - the idle tick that was here is REVERTED (audit A10-1/A5-2).
         //
@@ -1222,6 +1231,30 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // few-second post-cable auto-negotiation eventually catches. Once configured the gateway MAC
         // persists, so a later unplug/replug just resumes (the ICMP flows again) without re-dancing.
         let mut synced_by_dance = false;
+        // RE-SYNC THE CLOCK WHILE IT IS STILL UNSET.
+        //
+        // The boot dance ends in one SNTP attempt, and that used to be the ONLY automatic one: if it
+        // failed (DNS not up yet, the server silent, the cable in a second later) the clock stayed unset
+        // until somebody typed `date sync`. A machine with a working network and a permanently plugged
+        // cable would sit at 1970 indefinitely, which is exactly what a wall clock must not do.
+        //
+        // So: while the clock is unset and the link is up, retry - spaced by RESYNC_SECS so the cost is
+        // one exchange a minute rather than one per request, and skipped entirely the moment the clock
+        // is known (the common case pays a cheap `clock_epoch_if_set`). `time` owns the result; this
+        // only fetches it.
+        if badge.is_none()
+            && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6))
+            && clock_epoch_if_set(&ctx).is_none()
+            && ctx.epoch_secs_monotonic() - last_resync_at >= RESYNC_SECS
+            && link_is_up(&ctx)
+        {
+            last_resync_at = ctx.epoch_secs_monotonic();
+            let st = NetState { our_ip, our_mac, gw_mac, have_mac, dns_server, status };
+            if let Some(unix) = sntp_sync(&ctx, &st) {
+                ctx.log_fmt(format_args!("net-stack: SNTP retry - wall clock set (epoch {})", unix));
+                synced_by_dance = true;
+            }
+        }
         if badge.is_none() && !have_mac
             && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&10))
             && link_is_up(&ctx)
