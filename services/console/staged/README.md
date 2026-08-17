@@ -20,8 +20,13 @@ change that wires it - not before.
 
 ## What is left to do
 
-See `docs/console-service.md` §9 and the "Still to do" list in the session memory. The open question
-that stopped work is recorded in §9.5: which memory type the shared framebuffer mapping uses. The
-neutral `PageFlags::PCD` is **Device** memory on ARM (non-gathering - every 32-bit pixel store is its
-own bus transaction), which is correct but slow for bulk blits; Normal non-cacheable would gather.
-Resolving that is a measurement, not a guess.
+See `docs/console-service.md` §9 and the "Still to do" list in the session memory.
+
+The first thing to do is the memory type, and it is **Normal non-cacheable, not Device**. The neutral
+`PageFlags::PCD` encodes Device on ARM, which is right for a peripheral's registers and wrong here:
+Device semantics (no gathering, no reordering, no speculation) exist to protect stores that have side
+effects, and a framebuffer store has none - it is just memory the display happens to scan. The cost of
+using it anyway is real (non-gathering means every 32-bit pixel store is its own bus transaction, about
+1.4M of them for a full-screen repaint on a Pi 2, and `edit` already crawled on that TV once). So the
+ARM encoder needs a Normal-non-cacheable case, and `mmu::section_fb` needs to match it on the kernel
+side. Measurement then confirms it on hardware; it does not choose it.

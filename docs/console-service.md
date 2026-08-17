@@ -350,6 +350,14 @@ for one physical page UNPREDICTABLE, so both mappings must agree. They agree on 
   clean. `FB_READBACK_CHEAP` disappears with it: reading back a non-cacheable framebuffer is never cheap,
   so the terminal always repaints from its shadow grid and `scroll_by_copy` is deleted.
 
+Non-cacheable here means **Normal** non-cacheable, not **Device**. The distinction matters and the
+neutral `PageFlags::PCD` currently encodes the wrong one on ARM: Device semantics (no gathering, no
+reordering, no speculation) exist to protect stores with side effects, and a framebuffer store has none
+- it is memory the display happens to scan. Non-gathering would make every 32-bit pixel store its own
+bus transaction, roughly 1.4M of them per full-screen repaint on a Pi 2. So the ARM page-table encoder
+gains a Normal-non-cacheable case and `mmu::section_fb` matches it; `PCD` keeps meaning Device for the
+driver MMIO grants that genuinely need it.
+
 Cost: the kernel's boot text is slower to paint. It is boot text, and the terminal's own scroll was
 already repaint-from-shadow on x86 for the same reason.
 
