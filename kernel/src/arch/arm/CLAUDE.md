@@ -49,17 +49,22 @@ directly). The shipping build is `arm-supervisor` with the supervisor's `bare-me
 > seeds its TTBR0 leaves that context with TTBR0=0, and the first task to block wedges the core. All
 > `sched_*.rs` paths do this (kernel-audit Audit 5).
 
-## Drivers on ARM: userspace is the rule, in-kernel is the current exception
+## Drivers on ARM: userspace services, like every other port
 
-The constitution (§12, §4.4) says drivers are **userspace services** reached through interrupt routing.
-The ARM port does **not yet route device IRQs to userspace**, so a driver here currently runs
-**in-kernel** and polls its device from the timer tick (the PL011-console model), pushing results into
-the same input ring the shell reads. `arch/arm/dwc2.rs` (the USB host driver) is the worked example.
-This is a temporary port limitation, not a new policy: when ARM routes device IRQs to userspace, drivers
-move out to services like x86's. Until then a new Pi driver (SD/EMMC, etc.) follows the `dwc2.rs`
-pattern: `arch/arm/` module, safe MMIO via `read_volatile`/`write_volatile` on the Device-mapped
-peripheral window, **every hardware wait bounded** (a dead/absent device must never hang the boot -
-invariant 12; `dwc2.rs`/`video.rs`/`timer.rs` are the models after kernel-audit Audit 5).
+The constitution (§12, §4.4) says drivers are **userspace services** reached through interrupt routing,
+and this port now does that. **This section used to say the opposite** - that ARM could not route device
+IRQs to userspace, so drivers ran in-kernel and polled from the timer tick, with `arch/arm/dwc2.rs` as
+the worked example a new driver should copy. That file no longer exists: the USB stack moved out to
+`services/dwc2`, which registers for `USB_VECTOR` (`irq.rs`) and is driven by the interrupt, not the
+tick. A porting guide that teaches a deleted file as the model is worse than no guide, because it is
+followed.
+
+A new Pi driver (SD/EMMC, etc.) is therefore a **service**: an `arch::imp::map_fixed_driver_mmio` entry
+granting its register window at spawn, safe MMIO through the SDK's `Mmio` wrapper (no `unsafe` in a
+service, §18.2), a DMA arena if it needs one, and **every hardware wait bounded** - a dead or absent
+device must never hang the caller (invariant 12). `services/dwc2` and `services/console` are the two
+worked examples; `video.rs` and `timer.rs` remain the models for the bring-up code that genuinely
+belongs in the kernel.
 
 **How to turn a datasheet into a GodspeedOS driver:** see the ratified method in `arch/CLAUDE.md`
 ("Porting a driver: the method") - grok a *working* reference (u-boot / Linux / bare-metal), reimplement
@@ -78,8 +83,8 @@ what the silicon wants, throw away the OS integration.
   coherent. A driver that DMAs must either map its arena **non-cacheable** or bracket every transfer with
   cache maintenance (clean-to-PoC before a device read of a CPU-written buffer, invalidate before a CPU
   read of a device-written buffer). The SDK's `Dma` wrapper (`sdk/rust/src/dma.rs`) assumes coherent x86
-  DMA and does none of this, so it is **not yet reusable on ARM** as-is. (`dwc2.rs` sidesteps it by using
-  PIO, not DMA.)
+  DMA and does none of this, so it is **not yet reusable on ARM** as-is. (`services/dwc2` sidesteps it
+  by using PIO, not DMA.)
 
 ## Gotchas (found by booting - see `docs/arm32-status.md` for the full list)
 
@@ -88,7 +93,7 @@ what the silicon wants, throw away the OS integration.
 - **No RTC on the Pi 2** (QEMU raspi2b emulates none) - `date`/`uptime` read zeros. Not a bug.
 - **Serial console: 115200 8N1** on the Pi's PL011 (GPIO14/15), same as x86.
 - **DWC2 register lessons** (halt-all-channels at init, `FSLSPClkSel=0` for the HS PHY, HPRT write-1-to-
-  disable trap) are in the `dwc2.rs` comments + git log - the kind of hard-won quirk the doctrine says to
+  disable trap) are in the `services/dwc2` comments + git log - the kind of hard-won quirk the doctrine says to
   mine from a working reference.
 
 ## What was audited here

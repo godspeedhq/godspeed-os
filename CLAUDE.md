@@ -274,7 +274,7 @@ os/
 > - **init** - **removed** entirely; the kernel spawns the supervisor directly (Path C / Phase 5).
 > - **registry** - left the TCB, then the *service* was **retired**; naming is now a minimal kernel directory (naming Phase 4 / Path C).
 > - **block-driver, fs** - **restartable** storage services, made safe by `fs`'s crash-consistent recovery (Phase D); their death is a supervisor restart, not a reboot.
-> - **DMA drivers (`xhci`/`ehci`)** - in the TCB **only on a machine with no IOMMU**; where an IOMMU confines them they are least-privilege and drop out (§6.4).
+> - **DMA drivers (`xhci`/`ehci` on x86, `dwc2` on ARM)** - all userspace services; in the TCB **only on a machine with no IOMMU**, where unconfined DMA is kernel-equivalent reach. Where an IOMMU confines them they are least-privilege and drop out (§6.4).
 >
 > The dated amendments in §6.1-§6.3 record how this floor was reached and why. They are ratified history, not proposals; this box is the settled result they add up to.
 
@@ -286,7 +286,7 @@ os/
 | `arch/x86_64`     | Direct hardware access                              |
 | `kernel/smp`      | Concurrent-correctness primitives                   |
 | `supervisor`      | Holds restart + name authority; **spawned directly by the kernel** (init removed, Phase 5); trusted but **restartable** - the kernel respawns it on death (Phase 6, §6.2), so the only non-restartable thing is the kernel itself |
-| `xhci`, `ehci` (DMA drivers) | **Machine-dependent (H1, §6.4):** in the TCB only on a machine with no IOMMU to confine them (DMA-anywhere = kernel-equivalent reach); **dropped** from it - least-privilege and restartable - wherever an IOMMU confines them to their arena. The case is reported loudly at boot (invariant 12). |
+| `xhci`, `ehci`, `dwc2` (DMA drivers) | **Machine-dependent (H1, §6.4):** in the TCB only on a machine with no IOMMU to confine them (DMA-anywhere = kernel-equivalent reach); **dropped** from it - least-privilege and restartable - wherever an IOMMU confines them to their arena. The case is reported loudly at boot (invariant 12). |
 
 > **Amendment 2026-06-12 (H1): DMA-capable drivers are no longer an unconditional TCB
 > member.** Before H1 they were an *implicit, unstated* member: with no IOMMU a driver
@@ -498,11 +498,32 @@ official, not the runtime behaviour.
 > is unchanged until an SMMU confines the device. Also unmet on this port: §6.4 requires the confinement
 > case to be "reported loudly at boot", and nothing is printed either way (SEC-34).
 >
-> **ARM32 (Pi 2) is unchanged and the amendment below still governs it**: no PCIe and no
-> device-IRQ-to-userspace routing, so its DWC2 stack remains in the kernel and remains a TCB member.
-> The two ports now differ in exactly this, and the difference is recorded rather than blurred.
+> **ARM32 (Pi 2) has since followed** - see the 2026-08-17 amendment below. When this was written its
+> DWC2 stack was still in the kernel and still a TCB member; that is no longer true, and the sentence
+> that said the two ports "differ in exactly this" is superseded.
 > Verified: chaos max-carnage 100 rounds, selfcheck 349, hot-plug of keyboard and mass storage in both
 > directions, all on the userspace driver.
+
+> **Amendment 2026-08-17 (ARM32 / Pi 2): the DWC2 stack is OUT of the kernel too, and
+> `arch/arm/dwc2.rs` is DELETED.** The amendment below (SEC-29/SEC-30) records the in-kernel ARM USB
+> stack as a machine-dependent posture that could not be fixed on this hardware, because ARM did not
+> route device IRQs to userspace. **It does now**: `services/dwc2` registers for `USB_VECTOR`
+> (`arch/arm/irq.rs`) and is driven by the interrupt rather than the core-0 timer tick. So the two
+> consequences that amendment draws no longer hold as stated: the memory-safety of `arch/arm/dwc2.rs`
+> is not TCB-critical because that file does not exist, and **SEC-2's win DOES now travel to ARM** - the
+> ARM USB driver is a service holding only the capabilities its contract grants, so it cannot call
+> `hardware_reset` and does not sit inside the kernel trust perimeter.
+>
+> What does NOT change, and is the same caveat the Pi 4 carries: the Pi 2 has no IOMMU/SMMU, so the
+> driver's DMA is unconfined and a COMPROMISED driver is still kernel-equivalent by §6.4's own rule. A
+> buggy one is now bounded and restartable; a malicious one is not. The ACCIDENT surface is what closed
+> here, exactly as on aarch64. The residual that is inherent everywhere also stands: a keyboard's
+> keystrokes are commands (SEC-2).
+>
+> The same is now true of the DISPLAY on this port: `kernel/src/fbcon` (1,172 lines of terminal
+> emulation) left the kernel for `services/console`, leaving only the §11.4 boot/panic blit
+> (`docs/console-service.md` §9). Verified on hardware: chaos 50 rounds, 0 kernel panics, 0 liveness
+> wedges, selfcheck 350/0.
 
 > **Amendment 2026-07-23 (SEC-29/SEC-30): on the ARM32 (Raspberry Pi 2) port the USB drivers are
 > in-kernel TCB members - a machine/arch-dependent posture, the ARM analog of the no-IOMMU case above,
@@ -2257,7 +2278,7 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 - **Reply cap** - A one-shot capability to the caller's own endpoint, sent inside a `Call` request so the replier can reply to it. The kernel tracks, per blocked caller, the target endpoint it awaits; if that endpoint dies, the caller is woken with `ReplyDead`. The reply-side twin of the blocked-sender record (§8.2, §8.6).
 - **ReplyDead** - Error returned when the replier's endpoint dies while the caller is blocked in a `Call` awaiting its reply (value -12; §7.7, §8.6). The reply-side twin of `EndpointDead`, on the same generation/liveness mechanism.
 - **Routing table** - Kernel structure mapping `EndpointId → (CoreId, Generation, Liveness)`.
-- **TCB** - Trusted Computing Base. Kernel + arch + smp + init + supervisor. `registry` left the TCB via H11 (and the **registry service was then retired entirely** - naming Phase 4 / Path C, `docs/naming-design.md` §3.7); `block-driver` + `fs` left via the Phase D amendment (§6.1, once `fs` gained crash-consistent recovery). DMA drivers (`xhci`/`ehci`) are in the TCB only on a machine without an IOMMU (§6.4).
+- **TCB** - Trusted Computing Base. Kernel + arch + smp + supervisor. (**Not `init`** - it was removed in Path C / Phase 5; the kernel spawns the supervisor directly. And the supervisor is trusted but RESTARTABLE, Phase 6, so the only unkillable component is the kernel.) `registry` left the TCB via H11 (and the **registry service was then retired entirely** - naming Phase 4 / Path C, `docs/naming-design.md` §3.7); `block-driver` + `fs` left via the Phase D amendment (§6.1, once `fs` gained crash-consistent recovery). DMA drivers (`xhci`/`ehci`, and ARM's `dwc2`) are in the TCB only on a machine without an IOMMU to confine them (§6.4); all three are userspace services now.
 - **Trusted root** - `supervisor` (sole; `init` was removed in Path C / Phase 5 - the kernel spawns the supervisor directly). It is **trusted but restartable** (Path C / Phase 6, §6.2): the kernel respawns it on death - unconditionally, forever - so its failure is recovered, not a reboot. The **only unkillable component is the kernel itself**. (`block-driver` + `fs` are restartable storage services.)
 - **Name directory** - the kernel's minimal `name → EndpointId` map (`ipc::names`) + a gated "mint a SEND cap by name" (`AcquireSendCap`). The bounded recovery anchor that **replaced the registry service** (naming Phase 4 / Path C, §3.7): the supervisor wires services from a `name → cap` map and clients reacquire names through the directory. *(The retired `registry` userspace name service is `docs/registry.md` - historical.)*
 - **Service** - Userspace component with a contract, capability table, and isolated address space.
