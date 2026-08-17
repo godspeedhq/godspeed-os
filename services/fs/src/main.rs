@@ -344,6 +344,10 @@ const MOUNT_RETRY_MS: u64 = 20;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // Stack mark at entry - the reference for `report_stack_depth`, which prints the depth
+    // reached at mount. See that function for why this session needed it.
+    let stack_base = ctx.stack_mark();
+    let mut stack_reported = false;
     ctx.log("fs: starting");
 
     // Wait on block-driver's TRUTH, never on a clock (Commandment VIII). `block_capacity` returns
@@ -441,6 +445,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         "fs: mounted GSFS0008 ({} blocks, bitmap {}..{}, root@{}, {} free)",
                         f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
                     ));
+                    report_stack_depth(&ctx, stack_base, &mut stack_reported);
                     // Establish durability AT MOUNT, so the warning (if any) sits in the boot log
                     // beside the mount line. It was previously emitted by the first transaction to
                     // ask, which on a fresh prompt is the shell recording its history - so an
@@ -3126,7 +3131,22 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 /// One block-driver RPC with restart recovery: if the reply is missing (block-driver may have
 /// restarted, leaving our cached cap EndpointDead), reacquire a fresh cap by name (via the kernel
 /// directory) and retry once (Phase D, §14.3). All block I/O goes through here.
-fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
+/// A block reply: the driver's bytes, past the correlation tag, in a buffer sized to the protocol.
+///
+/// 513 bytes, not the 4096 a `Message` carries. That difference is the whole reason the tag fits now.
+pub struct BlockReply {
+    buf: [u8; 1 + BLOCK],
+    len: usize,
+}
+
+impl BlockReply {
+    /// The reply body, past the tag. A borrow - nothing is copied.
+    pub fn body(&self) -> &[u8] {
+        &self.buf[1..1 + self.len]
+    }
+}
+
+fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     // BOUNDED, on the LEAN await. The undeadlined form wakes only on the peer's DEATH, so a
     // block-driver that is alive but silent hung `fs` permanently and every shell command behind it.
     //
@@ -3139,15 +3159,82 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     // 30 s is chosen against the WORK: `block-driver` retries a busy device for up to 30 s per block,
     // so anything shorter abandons a request still being legitimately serviced.
     const BLOCK_RPC_SECS: i64 = 30;
-    let msg = Message::from_bytes(req);
-    if let Some(r) = ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS) {
-        return Some(r);
-    }
-    if ctx.reacquire_by_name("block-driver") {
-        return ctx.request_with_reply_deadline("block-driver", &msg, BLOCK_RPC_SECS);
+    // The reply lands in a buffer THIS function owns, sized to the protocol (status + one block), and
+    // the caller reads it as a slice. No `Message` is returned, forwarded or mutated anywhere on this
+    // path - which is what makes room for the correlation tag that would not previously fit.
+    const BLK_REPLY_MAX: usize = 1 + BLOCK;
+    let mut rbuf = [0u8; BLK_REPLY_MAX];
+
+    // CORRELATION TAG at byte 0, echoed by `block-driver` and interpreted no further.
+    //
+    // Without it a reply is matched to a request by ARRIVAL ORDER, and after a chaos storm that order
+    // is not reliable: `fs` read LBA 7702 and got a 17-byte reply where a 513-byte block belonged. That
+    // one was caught only because the SHAPE was wrong, and two reads of DIFFERENT blocks are both 513
+    // bytes - so the next such reply would have been believed, which is silent data corruption.
+    //
+    // Derived from the request, not counted: a counter needs a home, and the only homes here are
+    // threading mutable state through six functions or a `static`, which is the unowned global state
+    // Invariant 9 forbids. Requests differing in op or LBA fold differently; two identical requests
+    // fold alike and their replies are genuinely interchangeable, so that collision is harmless.
+    let tag = {
+        let mut t: u8 = 0x5A;
+        for (i, b) in req.iter().enumerate() {
+            t = t.rotate_left(1) ^ b.wrapping_add(i as u8);
+        }
+        if t == 0 { 1 } else { t }
+    };
+    let mut treq = [0u8; 1 + 9 + BLOCK];
+    let rn = req.len().min(treq.len() - 1);
+    treq[0] = tag;
+    treq[1..1 + rn].copy_from_slice(&req[..rn]);
+    let treq = &treq[..1 + rn];
+
+    for attempt in 0..2 {
+        if attempt == 1 && !ctx.reacquire_by_name("block-driver") {
+            break;
+        }
+        if let Some(n) =
+            ctx.request_with_reply_deadline_into("block-driver", treq, &mut rbuf, BLOCK_RPC_SECS)
+        {
+            if n == 0 {
+                return None;
+            }
+            if rbuf[0] != tag {
+                ctx.log_fmt(format_args!(
+                    "fs: discarded a block reply for tag {} while awaiting {} - the protocol is out of step",
+                    rbuf[0], tag));
+                // Do NOT re-send: the request is already with the driver, and asking twice would ask
+                // for the WORK twice. The caller retries at its own level, by which point the queue
+                // has drained.
+                return None;
+            }
+            return Some(BlockReply { buf: rbuf, len: n - 1 });
+        }
+        if attempt == 1 {
+            break;
+        }
     }
     ctx.log("fs: block-driver did not answer within 30 s (and could not be reacquired) - failing");
     None
+}
+
+/// Report how deep the stack got, ONCE, from the deepest point of the mount path.
+///
+/// The number this session lacked. Five attempts were made to fit correlation tags into `fs` with no
+/// measurement of the frame they had to fit in, and QEMU - which has no disk, so `fs` never mounts and
+/// never reaches this depth - called every one of them clean. A change to stack usage that cannot be
+/// measured can only be guessed at.
+///
+/// Relative to a mark taken at service start, so it needs no knowledge of where the stack lives, and
+/// printed once so it cannot become noise.
+fn report_stack_depth(ctx: &ServiceContext, base: usize, reported: &mut bool) {
+    if *reported {
+        return;
+    }
+    *reported = true;
+    let used = base.saturating_sub(ctx.stack_mark());
+    ctx.log_fmt(format_args!(
+        "fs: stack depth at mount = {} bytes of {} KiB", used, 256));
 }
 
 /// Largest sector count any real disk can report: the ATA LBA48 ceiling (2^48 sectors, ~128 PiB).
@@ -3166,7 +3253,7 @@ const MAX_SANE_SECTORS: u64 = 1 << 48;
 /// reason: an absurd count is a mis-read, not a disk.
 fn block_capacity(ctx: &ServiceContext) -> Option<u64> {
     let reply = block_rpc(ctx, &[OP_CAPACITY])?;
-    let p = reply.payload_bytes();
+    let p = reply.body();
     if p.first() != Some(&BLK_OK) || p.len() != 9 { return None; }
     let sectors = u64_at(p, 1);
     if sectors > MAX_SANE_SECTORS { return None; }
@@ -3179,7 +3266,7 @@ fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
     req[0] = OP_READ_BLOCK;
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     let reply = block_rpc(ctx, &req)?;
-    let p = reply.payload_bytes();
+    let p = reply.body();
     if p.first() == Some(&BLK_OK) && p.len() >= 1 + BLOCK {
         let mut out = [0u8; BLOCK];
         out.copy_from_slice(&p[1..1 + BLOCK]);
@@ -3209,7 +3296,7 @@ fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     req[9..17].copy_from_slice(&count.to_le_bytes());
     match block_rpc(ctx, &req) {
-        Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
+        Some(reply) => reply.body().first() == Some(&BLK_OK),
         None => false,
     }
 }
@@ -3228,7 +3315,7 @@ fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
 /// `false` means the data is NOT known to be on the medium and the caller must say so (§26.5, §26.7).
 fn block_flush(ctx: &ServiceContext) -> bool {
     match block_rpc(ctx, &[OP_FLUSH]) {
-        Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
+        Some(reply) => reply.body().first() == Some(&BLK_OK),
         None => false,
     }
 }
@@ -3249,7 +3336,7 @@ fn block_write(ctx: &ServiceContext, lba: u64, data: &[u8; BLOCK]) -> bool {
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     req[9..].copy_from_slice(data);
     match block_rpc(ctx, &req) {
-        Some(reply) if reply.payload_bytes().first() == Some(&BLK_OK) => true,
+        Some(reply) if reply.body().first() == Some(&BLK_OK) => true,
         _ => {
             ctx.log_fmt(format_args!("fs: block write failed at lba {} (device I/O error)", lba));
             false

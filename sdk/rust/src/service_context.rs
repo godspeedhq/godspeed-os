@@ -721,6 +721,63 @@ impl ServiceContext {
     /// should not pay a message-sized frame for the distinction. Callers that DO need it still have
     /// `..._outcome`, and should keep an eye on their own stack.
     #[inline(never)]
+    /// A mark of how deep the stack currently is, in bytes below the first mark taken.
+    ///
+    /// THE INSTRUMENT THAT WAS MISSING. Five attempts were made to fit correlation tags into `fs`
+    /// without ever measuring the frame they had to fit in; each removed one 4 KiB item, the overflow
+    /// returned at a different pc, and QEMU - which has no disk, so `fs` never mounts and never makes
+    /// the deep calls - reported every build clean. A change to stack usage that cannot be measured
+    /// can only be guessed at, and five guesses is the evidence.
+    ///
+    /// Safe Rust and no kernel involvement: the address of a local IS the stack pointer, near enough.
+    /// Relative to a mark taken at service start, so it needs no knowledge of where the stack lives.
+    pub fn stack_mark(&self) -> usize {
+        let probe = 0u8;
+        &probe as *const u8 as usize
+    }
+
+    /// Send `req` to `peer` and receive the reply into `buf`, returning its length.
+    ///
+    /// The by-value path costs 4 KiB for the request `Message`, 4 KiB for the reply `Message`, and
+    /// 4 KiB again at every wrapper that forwards it. This costs none of that: the caller owns both
+    /// buffers, and only a length is returned.
+    ///
+    /// Same deadline discipline as `request_with_reply_deadline` - block on the endpoint in slices,
+    /// give up when the caller's time is spent, and reclaim the reply cap either way (§8.5).
+    pub fn request_with_reply_deadline_into(
+        &self, peer: &str, req: &[u8], buf: &mut [u8], max_secs: i64,
+    ) -> Option<usize> {
+        let target = CapHandle(self.find_send_slot(peer)?);
+        let self_grant = self.self_grant_handle()?;
+        let reply_cap = self.derive_cap(self_grant)?;
+        let recv = self.recv_handle()?;
+        // The request still needs a `Message` to carry an embedded cap, and that one frame is
+        // unavoidable while the send ABI takes one. It is ONE, not four.
+        if self.send_with_cap_by_handle(target, reply_cap, &crate::ipc::Message::from_bytes(req)).is_err() {
+            self.remove_cap(reply_cap);
+            return None;
+        }
+        let t0 = self.epoch_secs_monotonic();
+        loop {
+            match crate::ipc::recv_timeout_into(recv, buf, self.duration_cycles(Self::AWAIT_SLICE_MS)) {
+                Ok(Some(n)) => {
+                    self.remove_cap(reply_cap);
+                    return Some(n);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    self.remove_cap(reply_cap);
+                    return None;
+                }
+            }
+            let now = self.epoch_secs_monotonic();
+            if now >= t0 && now - t0 >= max_secs {
+                self.remove_cap(reply_cap);
+                return None;
+            }
+        }
+    }
+
     /// How long one blocking wait slice lasts.
     ///
     /// 20 ms: two scheduler quanta, so a waiter never holds its core, and short enough that a caller

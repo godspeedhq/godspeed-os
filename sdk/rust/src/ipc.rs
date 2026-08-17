@@ -103,6 +103,43 @@ pub fn try_recv(endpoint: CapHandle) -> Result<Option<Message>, IpcError> {
 /// on timeout, `Err` on a real error. `timeout_cycles == 0` blocks forever (like `recv`).
 /// (syscall 35 - `recv_timeout`) Lets a driver idle on its interrupt yet still wake on a
 /// timer (e.g. for keyboard auto-repeat while a key is held - §12).
+/// Receive into a buffer the CALLER owns, returning the byte count.
+///
+/// A `Message` carries a 4096-byte payload BY VALUE, so `recv_timeout` below costs EIGHT kilobytes of
+/// stack per call: one 4 KiB array to receive into, and another inside the `Message` it builds and
+/// returns. Every wrapper that forwards that `Message` pays 4 KiB again.
+///
+/// On `fs` that arithmetic is fatal rather than untidy. Its request path is several such calls deep,
+/// it runs on a 256 KiB stack, and adding one more level made it overflow at mount - a fault that took
+/// five wrong attempts to place because each one removed a single 4 KiB item without measuring the
+/// whole frame.
+///
+/// This is the shape the operation actually has, and the shape every real IPC API uses: the kernel
+/// copies into memory the caller already owns, and hands back a length. Nothing large is created and
+/// nothing large is moved. `Ok(None)` is the timeout, exactly as above.
+///
+/// Caps are NOT delivered here - the block and frame paths carry none, and a caller that needs one
+/// takes it with `take_pending_cap` regardless. A buffer API that silently dropped a capability would
+/// be a leak, so this one simply does not carry them.
+pub fn recv_timeout_into(
+    endpoint: CapHandle, buf: &mut [u8], timeout_cycles: u64,
+) -> Result<Option<usize>, IpcError> {
+    const RECV_TIMED_OUT: i64 = -1001;
+    let packed = ((buf.len() as u64) << 16) | (endpoint.0 as u64 & 0xFFFF);
+    #[cfg(target_arch = "arm")]
+    let timeout_cycles = if timeout_cycles == 0 { 0 } else { timeout_cycles.min(u32::MAX as u64).max(1) };
+    // SAFETY: raw_syscall(35) = RecvTimeout; `buf` is a valid caller-owned slice in user space and its
+    // true length is what is passed, so the kernel cannot write past it.
+    let ret = unsafe { raw_syscall(35, packed, buf.as_mut_ptr() as u64, timeout_cycles) };
+    if ret == RECV_TIMED_OUT {
+        Ok(None)
+    } else if ret < 0 {
+        Err(i64_to_ipc_error(ret))
+    } else {
+        Ok(Some((ret as usize).min(buf.len())))
+    }
+}
+
 pub fn recv_timeout(endpoint: CapHandle, timeout_cycles: u64) -> Result<Option<Message>, IpcError> {
     const RECV_TIMED_OUT: i64 = -1001; // kernel sentinel for "timed out, no message"
     let mut payload = [0u8; MAX_PAYLOAD];

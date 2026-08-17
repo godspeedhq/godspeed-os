@@ -245,15 +245,15 @@ fn dev_flush(ctx: &ServiceContext) -> bool { super::xhciblk::flush(ctx) }
 
 /// Serve one block-IPC request. Same wire protocol as the AHCI and EMMC backends - `fs` is unaware of
 /// which one it is talking to.
-fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapHandle) {
+fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
     use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
-    let err = |ctx: &ServiceContext| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); };
+    let err = |ctx: &ServiceContext| { reply.send(ctx, &[STATUS_ERR]); };
     if p.is_empty() { return err(ctx); }
     if p[0] == OP_FLUSH {
         // The one backend that genuinely needs this: a stick acknowledges a WRITE(10) into its own
         // buffer, so without SYNCHRONIZE CACHE a reset loses the tail of everything just written.
         let status = if dev_flush(ctx) { STATUS_OK } else { STATUS_ERR };
-        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
+        reply.send(ctx, &[status]);
         return;
     }
     if p[0] == OP_CAPACITY {
@@ -272,7 +272,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
         let mut out = [0u8; 9];
         out[0] = STATUS_OK;
         out[1..9].copy_from_slice(&sectors.to_le_bytes());
-        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
+        reply.send(ctx, &out);
         return;
     }
     if p.len() < 9 { return err(ctx); }
@@ -284,7 +284,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
                 let mut out = [0u8; 513];
                 out[0] = STATUS_OK;
                 out[1..].copy_from_slice(&buf);
-                let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
+                reply.send(ctx, &out);
             } else { err(ctx); }
         }
         OP_WRITE_BLOCK => {
@@ -292,7 +292,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
             let mut buf = [0u8; 512];
             buf.copy_from_slice(&p[9..521]);
             let status = if with_busy_retry(ctx, "write", lba, || dev_write(ctx, lba, &buf)) { STATUS_OK } else { STATUS_ERR };
-            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
+            reply.send(ctx, &[status]);
         }
         OP_WRITE_ZEROS => {
             if p.len() < 17 { return err(ctx); }
@@ -302,7 +302,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
             for i in 0..count {
                 if !with_busy_retry(ctx, "write-zeros", lba + i, || dev_write(ctx, lba + i, &zero)) { ok = false; break; }
             }
-            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[if ok { STATUS_OK } else { STATUS_ERR }]));
+            reply.send(ctx, &[if ok { STATUS_OK } else { STATUS_ERR }]);
         }
         _ => err(ctx),
     }
@@ -314,8 +314,16 @@ pub fn run(ctx: &ServiceContext, sectors: u64) -> ! {
                              sectors, sectors / 2048));
     loop {
         let msg = ctx.recv();
-        let reply = match ctx.take_pending_cap() { Some(c) => c, None => continue };
-        serve(sectors, ctx, msg.payload_bytes(), reply);
-        ctx.remove_cap(reply);
+        let cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
+        // The correlation tag is byte 0 of every request; the backend below never sees it and parses
+        // exactly as it always did. Splitting it off HERE, once, is why fourteen reply sites did not
+        // each have to learn about it.
+        let p = msg.payload_bytes();
+        let (tag, body) = match p.split_first() {
+            Some((t, rest)) => (*t, rest),
+            None => (0, &p[..0]),
+        };
+        serve(sectors, ctx, body, crate::Reply { cap, tag });
+        ctx.remove_cap(cap);
     }
 }
