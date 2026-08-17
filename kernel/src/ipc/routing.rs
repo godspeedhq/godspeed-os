@@ -422,6 +422,43 @@ pub fn enqueue_from_interrupt(endpoint: EndpointId, msg: Message) -> Option<usiz
     None
 }
 
+/// Kernel-originated delivery that applies BACK-PRESSURE instead of dropping.
+///
+/// Same shape as [`enqueue_from_interrupt`] - no capability, no generation check, because the caller is
+/// the kernel rather than a task holding a cap - but on a full queue it records `sender_slot` as a
+/// blocked sender and returns `QueueFull`, exactly as a userspace `send` does. The caller must then
+/// immediately `block_and_reschedule(BlockedOnSend)`.
+///
+/// This exists for the console path. Dropping on a full queue is right for an INTERRUPT (the event has
+/// already happened and the driver is behind), and wrong for console output: a queue 16 deep cannot hold
+/// a burst of thirty writes no matter how fast the renderer is, so the excess was lost every time
+/// regardless of speed. Blocking the WRITER is the bounded-queue contract working as designed (§8.5,
+/// §8.6) - the kernel itself never waits, the task that produced the output does, and it wakes with
+/// `EndpointDead` if the terminal dies rather than hanging.
+pub fn enqueue_from_kernel_blocking(
+    endpoint: EndpointId,
+    msg: Message,
+    sender_slot: usize,
+) -> Result<Option<usize>, IpcError> {
+    let mut table = TABLE.lock_irq();
+    let idx = find_index(&*table, endpoint).ok_or(IpcError::EndpointDead)?;
+    if table[idx].liveness == EndpointLiveness::Dead {
+        return Err(IpcError::EndpointDead);
+    }
+    if let Some(slot) = table[idx].blocked_receiver.take() {
+        table[idx].queue.enqueue(msg).ok();
+        return Ok(Some(slot));
+    }
+    match table[idx].queue.enqueue(msg) {
+        Ok(()) => Ok(None),
+        Err(_) => {
+            table[idx].blocked_sender = Some(sender_slot);
+            table[idx].pending_send = Some(msg);
+            Err(IpcError::QueueFull)
+        }
+    }
+}
+
 /// Returns `true` if `endpoint` is registered and alive in the routing table.
 ///
 /// Used by `invariants::assertions::assert_tcb_alive` (§6.2).

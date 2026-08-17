@@ -238,62 +238,55 @@ fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     // owner (or unclaimed = the normal case) writes to both.
     let to_fb = crate::arch::imp::console_foreground_allows(scheduler::current_task_slot() as u32);
     crate::arch::imp::console_write_bytes_gated(bytes, to_fb);
+    // Serial is written FIRST and unconditionally above, so the log is complete and never duplicated
+    // even though the call below can park this task. What the return value carries is the outcome of the
+    // wait, not of the write: 0, or a negative code if the terminal died while we were blocked on it.
     if to_fb {
-        deliver_to_console_service(bytes);
+        return deliver_to_console_service(bytes);
     }
     0
 }
 
-/// Endpoint queue depth at which a console write is dropped rather than queued (§8.5 fixes it at 16).
-const CONSOLE_QUEUE_MAX: u8 = 16;
-/// Report every Nth drop, so a struggling terminal is visible without the report itself becoming the
-/// flood. Deliberately not every drop: the report goes to serial, and serial is the thing under load.
-const CONSOLE_DROP_REPORT: u64 = 500;
-/// Console writes that never reached the display because the terminal was behind.
-static CONSOLE_DROPS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+/// Console writes that could not be shown because the terminal was gone, not merely behind.
+static CONSOLE_LOST: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+/// Report every Nth loss. The report goes to serial, and serial is the thing under load.
+const CONSOLE_LOSS_REPORT: u64 = 100;
 
-/// Hand a console write to the `console` service, which renders it (`docs/console-service.md` 9).
-///
-/// **Try-send, never a blocking send** - and that is the whole reason the display can be a service at
-/// all. Blocking here would make every writer in the system wait on the terminal: a slow, busy or dead
-/// console would wedge the shell, the logger and the kernel's own console path with it. Instead a full
-/// queue drops the bytes from the DISPLAY, and serial - which `console_write_bytes_gated` above has
-/// already written, synchronously - still has every one of them. The display is a mirror; serial is the
-/// truth. That is the same trade the ARM serial mirror already documents.
-///
-/// Ownership of the framebuffer is NOT transferred here - it moves when the grant is made, at spawn
-/// (`bootcon::release`). Doing it on first delivery looked equivalent and was not: the service clears
-/// the screen as it starts, but the first CONSOLE byte can be seconds later, and the floor kept
-/// mirroring log lines over the terminal in between.
-fn deliver_to_console_service(bytes: &[u8]) {
+fn deliver_to_console_service(bytes: &[u8]) -> i64 {
     // Never feed the console's own output back to it. Nothing does this today (the service logs through
-    // the serial log path, not the console path), but the loop it would make is unbounded and silent,
-    // and one check here is cheaper than the day someone reaches for `console_write` inside the terminal.
+    // the serial log path, not the console path), but the loop it would make is unbounded and silent.
     if scheduler::task_stat(scheduler::current_task_slot()).name == "console" {
-        return;
+        return 0;
     }
-    let Some(ep) = crate::ipc::names::lookup("console") else { return };
-    let Ok(msg) = crate::ipc::message::Message::new(bytes) else { return };
-    // A full queue means this write will NOT reach the display. That is by design (the kernel must not
-    // block on a service), but a drop nobody counts is a silent failure - the screen just quietly misses
-    // text and every log line still says success. Count it, and say so periodically: an operator seeing
-    // partial output on the TV needs to be able to tell "the terminal is behind" from "the terminal is
-    // broken", and these two numbers are the difference.
-    if crate::ipc::routing::endpoint_queue_depth(ep) >= CONSOLE_QUEUE_MAX {
-        let n = CONSOLE_DROPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-        if n % CONSOLE_DROP_REPORT == 0 {
-            crate::kprintln!(
-                "console: {} write(s) dropped - the terminal is not keeping up (serial has them all)", n
-            );
+    // No terminal on this machine (or not up yet): serial already has the bytes, which is the whole
+    // guarantee. Return without blocking - there is nothing to wait for.
+    let Some(ep) = crate::ipc::names::lookup("console") else { return 0 };
+    let Ok(msg) = crate::ipc::message::Message::new(bytes) else { return 0 };
+
+    let my_slot = scheduler::current_task_slot();
+    match crate::ipc::routing::enqueue_from_kernel_blocking(ep, msg, my_slot) {
+        Ok(Some(receiver_slot)) => {
+            scheduler::wake_by_slot(receiver_slot, 0);
+            0
         }
-        return;
-    }
-    // Kernel-internal delivery: no capability check, because the caller is the kernel, not a task
-    // holding a cap - the same path a device interrupt takes to reach its driver. Try-send semantics: a
-    // full queue discards the message rather than blocking, and a dead endpoint returns without one.
-    let woke = crate::ipc::routing::enqueue_from_interrupt(ep, msg);
-    if let Some(slot) = woke {
-        scheduler::wake_by_slot(slot, 0);
+        Ok(None) => 0,
+        // The terminal is behind. We are now recorded as a blocked sender, so park until it drains -
+        // ordinary bounded-queue back-pressure (§8.5/§8.6), the same thing any `send` to a full endpoint
+        // does. The KERNEL is not waiting; the task that produced the output is, which is correct: it
+        // should not run ahead of the display it is writing to. It wakes with a negative code if the
+        // terminal dies instead, so this can never hang.
+        Err(crate::ipc::IpcError::QueueFull) => {
+            scheduler::block_and_reschedule(TaskState::BlockedOnSend)
+        }
+        // The terminal died between the name lookup and the enqueue. Serial has the bytes; say so
+        // periodically rather than silently painting nothing (invariant 12).
+        Err(_) => {
+            let n = CONSOLE_LOST.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            if n % CONSOLE_LOSS_REPORT == 0 {
+                crate::kprintln!("console: {} write(s) not displayed - no terminal (serial has them)", n);
+            }
+            0
+        }
     }
 }
 
