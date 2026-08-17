@@ -61,7 +61,6 @@ features = [
     "pi4-sched-demo",
     "pi4-smp",
     "pi4-supervisor",
-    "qemu",
     "test-bad-elf",
     "test-bad-elf-brutal",
     "test-bad-supervisor"

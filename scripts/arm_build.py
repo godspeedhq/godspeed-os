@@ -70,18 +70,30 @@ def main():
                     help="kernel boot-path feature (arm-supervisor)")
     ap.add_argument("--release", action="store_true")
     ap.add_argument("--qemu", action="store_true",
-                    help="target QEMU emulation (identity DWC2 DMA); default is real-Pi hardware")
+                    help="target QEMU emulation (identity DWC2 DMA in services/dwc2); "
+                         "default is real-Pi hardware (VideoCore bus alias)")
     args = ap.parse_args()
     profile = "release" if args.release else "debug"
     rel = ["--release"] if args.release else []
-    kfeatures = args.feature + (",qemu" if args.qemu else "")
+    kfeatures = args.feature
 
     # 1. Cross-compile every ARM-ported service to armv7 so build.rs can embed them.
     #    The Pi 2 is a bare-metal target (no QEMU control port), so the supervisor is built with its
     #    `bare-metal` feature - the designated "usable OS, quiet gsh> prompt" spawn set (logger + shell,
     #    no 178 harness probes, no ping/pong flood). ping/pong are spawnable on demand from the shell.
+    #
+    #    `--qemu` goes to `dwc2` and NOWHERE ELSE, because `dwc2` is the only crate that reads it:
+    #    `DMA_BUS_ALIAS` in `services/dwc2/src/regs.rs` is 0 under emulation and the VideoCore alias
+    #    0xC000_0000 on silicon. It used to be passed to the KERNEL instead, where the feature existed
+    #    but nothing read it - so `--qemu` was a silent no-op and USB under emulation ran with the
+    #    hardware alias, which STALLs in the DATA stage. A flag that selects nothing is worse than an
+    #    absent one: it reports success and you debug the wrong layer.
     for svc in ARM_SERVICES:
-        feats = ["--features", "bare-metal"] if svc == "supervisor" else []
+        feats = []
+        if svc == "supervisor":
+            feats = ["--features", "bare-metal"]
+        elif svc == "dwc2" and args.qemu:
+            feats = ["--features", "qemu"]
         run(["cargo", "build", "-p", svc, "--target", TARGET] + feats + rel)
 
     # 2. Build the kernel (embeds the service ELFs) with the chosen boot path.

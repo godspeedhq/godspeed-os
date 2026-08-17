@@ -86,10 +86,13 @@ python scripts/arm_run.py --release --usb          # boot in QEMU with an emulat
 > silicon sees RAM through the VideoCore alias `0xC000_0000`. The default build is **hardware-correct**;
 > pass `--qemu` only to test USB under emulation. Everything else (shell, storage, ping/pong) is identical.
 >
-> **KNOWN BUG in the flag, not in the code it selects.** The `qemu` feature now lives on the `dwc2`
-> SERVICE, but `arm_build.py` still passes `--features qemu` only to the KERNEL, where it is now dead. So
-> `--qemu` is currently a no-op and USB under emulation uses the hardware bus alias. Fix: pass the feature
-> to the `dwc2` service build. (The kernel's own `qemu` feature in `kernel/Cargo.toml` should go with it.)
+> **This flag was a silent no-op until 2026-08-17, and the fix is worth knowing about.** The `qemu`
+> feature had moved to the `dwc2` SERVICE when the USB stack left the kernel, but `arm_build.py` kept
+> passing it to the KERNEL, where the feature still existed and nothing read it. So the build reported
+> success, produced a hardware-alias binary, and USB under emulation STALLed in the DATA stage. The flag
+> now goes to `dwc2` and the dead kernel feature is deleted, so there is exactly one place it can mean
+> something. Verified by disassembling both builds: the hardware one contains
+> `orr r2, r2, #0xC0000000` and the `--qemu` one does not.
 
 `arm_build.py` cross-compiles the SDK + every arm-ported service to `armv7a-none-eabi`, builds the
 kernel (which embeds them via `kernel/build.rs`'s `arm_built` allowlist), and objcopies to a flat

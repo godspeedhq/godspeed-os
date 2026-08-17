@@ -123,11 +123,12 @@ arm-supervisor = []
 # tables, so a shipping boot must not run them. `osdev test identity` turns them on.
 kernel-selftest = []
 arm-autochaos = []
-# Target QEMU's raspi2b emulation rather than real Pi 2 hardware. Currently only changes the DWC2 USB
-# DMA bus-address translation: QEMU's emulated DWC2 addresses ARM system RAM directly (identity), while
-# real BCM2836 silicon sees RAM through the VideoCore uncached alias 0xC000_0000 (arch/arm/dwc2.rs).
-# OFF by default so the shipped image is hardware-correct; scripts/arm_run.py passes it for emulation.
-qemu = []
+# (The `qemu` feature was DELETED here. It selected the DWC2 USB DMA bus-address translation back when
+# the USB stack was `arch/arm/dwc2.rs`; that stack is now the `dwc2` SERVICE, which carries its own
+# `qemu` feature for `DMA_BUS_ALIAS`. The kernel copy outlived its only reader and became a flag that
+# built cleanly and changed nothing - which is exactly how `scripts/arm_build.py --qemu` came to be a
+# silent no-op. If the kernel ever needs to know it is emulated, add it back with a reader in the same
+# commit.)
 
 # Deliberately take a data abort during arm32 boot, to PROVE the exception vectors
 # fire (a fault path never observed firing is not evidence). The ARM twin of the x86
