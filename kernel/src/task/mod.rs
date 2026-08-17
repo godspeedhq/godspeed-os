@@ -629,15 +629,27 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             has_console_read:  false,
         })),
         // The terminal (docs/console-service.md 9). Holds the framebuffer grant (`service_hw`) and
-        // renders every console byte the kernel `try_send`s to its endpoint. Core 0 on ARM, unlike the
-        // logger next door: a console write is what the USER is waiting to see, so it belongs on the
-        // core the shell runs on rather than behind a cross-core hop.
+        // renders every console byte the kernel `try_send`s to its endpoint.
+        //
+        // ARM: core 3, and NOT core 0. I put it on core 0 first, reasoning that a console write is what
+        // the user is waiting to see so it should sit with the shell - and that was wrong twice over.
+        // The shell is on core 1, and core 0 is deliberately left to `dwc2` ALONE (see the note on
+        // net-stack below, and the logger's, which was moved off core 0 for exactly this).
+        //
+        // It matters more here than it did for the logger. A full-screen repaint is millions of
+        // non-cacheable pixel stores in one un-preemptible stretch, and dwc2's split transactions have
+        // to hit 125 us microframe windows. Sharing a core with it produced NYET storms and two
+        // "keyboard TT wedged" stalls, one of them six seconds long, on the first boot that had a
+        // terminal to starve it.
+        //
+        // Core 3 rather than 2 because the logger and block-driver are on 2; the terminal is the one
+        // service whose latency the user watches directly, so it gets the idle core.
         "console" => Some(("console", ServiceConfig {
             elf:               include_bytes!(env!("SVC_CONSOLE_ELF")),
             has_recv_endpoint: true, // the console byte stream AND geometry requests arrive here
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    0,
+            preferred_core:    if cfg!(target_arch = "arm") { 3 } else { 0 },
             probe_mode:        0,
             memory_limit:      8 * 1024 * 1024, // matches console.toml
             hw_irqs:           &[],

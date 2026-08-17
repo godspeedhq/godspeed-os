@@ -244,6 +244,14 @@ fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     0
 }
 
+/// Endpoint queue depth at which a console write is dropped rather than queued (§8.5 fixes it at 16).
+const CONSOLE_QUEUE_MAX: u8 = 16;
+/// Report every Nth drop, so a struggling terminal is visible without the report itself becoming the
+/// flood. Deliberately not every drop: the report goes to serial, and serial is the thing under load.
+const CONSOLE_DROP_REPORT: u64 = 500;
+/// Console writes that never reached the display because the terminal was behind.
+static CONSOLE_DROPS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
 /// Hand a console write to the `console` service, which renders it (`docs/console-service.md` 9).
 ///
 /// **Try-send, never a blocking send** - and that is the whole reason the display can be a service at
@@ -266,6 +274,20 @@ fn deliver_to_console_service(bytes: &[u8]) {
     }
     let Some(ep) = crate::ipc::names::lookup("console") else { return };
     let Ok(msg) = crate::ipc::message::Message::new(bytes) else { return };
+    // A full queue means this write will NOT reach the display. That is by design (the kernel must not
+    // block on a service), but a drop nobody counts is a silent failure - the screen just quietly misses
+    // text and every log line still says success. Count it, and say so periodically: an operator seeing
+    // partial output on the TV needs to be able to tell "the terminal is behind" from "the terminal is
+    // broken", and these two numbers are the difference.
+    if crate::ipc::routing::endpoint_queue_depth(ep) >= CONSOLE_QUEUE_MAX {
+        let n = CONSOLE_DROPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        if n % CONSOLE_DROP_REPORT == 0 {
+            crate::kprintln!(
+                "console: {} write(s) dropped - the terminal is not keeping up (serial has them all)", n
+            );
+        }
+        return;
+    }
     // Kernel-internal delivery: no capability check, because the caller is the kernel, not a task
     // holding a cap - the same path a device interrupt takes to reach its driver. Try-send semantics: a
     // full queue discards the message rather than blocking, and a dead endpoint returns without one.

@@ -44,6 +44,14 @@ use term::Term;
 /// live here - so this is the only party that can answer, and there is one source of truth for it.
 const REQ_DIMS: u8 = 1;
 
+/// Report progress every this many rendered messages.
+///
+/// Present because the first hardware boot left a question plain observation could not settle: the
+/// terminal's queue sat full at 16/16 while it reported ~0% CPU, which is the signature of BOTH "too
+/// slow to keep up" and "not running at all", and those need opposite fixes. A count that climbs says
+/// the first; a count that stops says the second (§26.7 - measure, do not guess).
+const RENDER_REPORT: u64 = 500;
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The framebuffer grant. Without one there is no display to own - which is the normal case on a
@@ -72,6 +80,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log_fmt(format_args!("console: terminal {} cols x {} rows", cols, rows));
     ctx.log("console: serving the display");
 
+    let mut rendered: u64 = 0;
+    let mut bytes: u64 = 0;
     loop {
         let msg = ctx.recv();
         // A request carries a REPLY CAP; console output never does. That, not the payload, is what
@@ -79,7 +89,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // content would mean a console write of the wrong single byte silently became a request.
         match ctx.take_pending_cap() {
             Some(reply_cap) => reply_dims(&ctx, reply_cap, &term, msg.payload_bytes()),
-            None => term.put_bytes(msg.payload_bytes()),
+            None => {
+                let body = msg.payload_bytes();
+                term.put_bytes(body);
+                rendered += 1;
+                bytes += body.len() as u64;
+                if rendered % RENDER_REPORT == 0 {
+                    ctx.log_fmt(format_args!(
+                        "console: rendered {} messages, {} bytes", rendered, bytes
+                    ));
+                }
+            }
         }
     }
 }
