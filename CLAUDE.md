@@ -1011,6 +1011,16 @@ Because Limine supplies APIC IDs directly, the kernel does not need to probe ACP
 
 The kernel maintains a 16 KiB ring buffer (per-core view, single shared sink). Anything logged before the logger is up writes to the ring buffer and the serial console. When the logger starts, it drains the buffer.
 
+Where the machine's only output device is a display, the floor also includes a **minimal framebuffer blit** (`kernel/src/bootcon`): plain ASCII, escape sequences discarded, no character grid, no cursor, no scrollback. It is not a terminal - the terminal is the `console` service (§12, `docs/console-service.md` §9).
+
+> **Amendment 2026-08-17 (console service): the log floor covers a minimal framebuffer blit, because §11.4 was x86-shaped.** This section said "serial console" because on a PC serial is always there. On a Raspberry Pi wired to a TV it may not be, and a kernel that can only speak to a serial port it does not have is **mute** - a boot that fails before any service exists, or a panic, produces a frozen screen and no reason on it, which is exactly the silent failure invariant 12 forbids.
+>
+> The blit earns ring-0 residency by **impossibility**, which is the only thing that does (the bar the control channel failed to clear and the supervisor spawn clears): **a panic halts every core, including the `console` service, so it cannot ask a service to report it.** Boot output has the same shape - it precedes every service, including the one that would render it. Both are this section's existing ring-buffer argument applied to a machine with no serial port, which is why the answer is the same one: a bounded floor the kernel owns.
+>
+> The amendment is deliberately **narrow**, and the narrowness is the point. What left the kernel in the same change was 1,172 lines of terminal emulation - the ANSI/CSI state machine, the UTF-8 decoder, the shadow grid, the cursor, scrolling, reverse video - because rendering a shell prompt is policy (§26.10) and a display driver is §4.4 anti-scope by name. What the floor keeps cannot format, cannot position, and cannot scroll: reaching the bottom of the screen clears it and starts again at the top, since serial holds the full history either way. Ownership of the framebuffer transfers to the service the moment it is demonstrably rendering, and returns only on a panic.
+>
+> §22 has no new test: the property this pins is a *negative* one on a machine we cannot fail on demand in QEMU. It is pinned instead by `scripts/commandments.py`, which counts the kernel's modules against §4.3 and for which `fbcon` was the last standing violation.
+
 ---
 
 ## 12. Drivers and Interrupts

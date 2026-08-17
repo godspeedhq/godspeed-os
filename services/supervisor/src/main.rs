@@ -170,9 +170,9 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 /// The restartable services the supervisor is responsible for (§6.1). Hoisted so the scan, `reconcile`,
 /// and `converge` share ONE roster. Order matters: block-driver before fs before shell (each wires to
 /// the previous); nic-driver before net-stack.
-const MANAGED_N: usize = 11;
+const MANAGED_N: usize = 12;
 const MANAGED: [&str; MANAGED_N] =
-    ["block-driver", "fs", "shell", "xhci", "ehci", "logger", "nic-driver", "net-stack",
+    ["block-driver", "fs", "shell", "xhci", "ehci", "logger", "console", "nic-driver", "net-stack",
      // C1-6: both moved OUT of the kernel and so must be started BY someone. `time` owns the wall
      // clock the shell and net-stack now ask for; `control` owns the COM2 operator channel the test
      // harness drives. A service that is embedded and configured but never spawned is the C5-1 shape
@@ -325,6 +325,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     } else if ctx.spawn("logger").is_err() {
         ctx.log("supervisor: logger spawn failed, retrying");
         let _ = ctx.spawn("logger");
+    }
+
+    // The terminal (docs/console-service.md §9). Spawned right after the logger and before anything
+    // that produces console output, so the display changes hands once, early, rather than mid-boot.
+    // Like the logger it is not TCB: if it fails to spawn, console output still reaches serial (which
+    // is the source of truth) and the kernel's boot floor keeps the display - degraded, never silent.
+    ctx.log("supervisor: spawning console...");
+    if let Some(cap) = ctx.acquire_send_grant_cap("console") {
+        let _ = name_map.record("console", cap.0);
+        ctx.log("supervisor: adopted running console");
+    } else if ctx.spawn("console").is_err() {
+        ctx.log("supervisor: console spawn failed - display stays on the kernel boot floor");
     }
 
     // Spawn pong and ping first so IPC between them is established well before

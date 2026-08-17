@@ -1315,22 +1315,22 @@ pub fn liveness_deadline_cycles() -> u64 { 0 }
 /// timer runs its syscalls atomically. Nothing to do here yet.
 pub fn note_user_task(_slot: usize) {}
 
-// --- Framebuffer console backend (`crate::fbcon`) ---
+// --- Boot/panic console floor backend (`crate::bootcon`) ---
 //
-// The neutral console owes each arch two things (see `crate::fbcon`'s module header): publish a written
-// rectangle, and say whether reading the framebuffer back is cheap. On the Pi 4 both live in `video`,
-// next to the mailbox call that obtained the framebuffer in the first place.
-
-/// On the Pi 4 the framebuffer is ordinary RAM the GPU scans out of, covered by the kernel's direct map
-/// as Normal cacheable memory - so reading it back costs what writing it does, and the console can
-/// scroll by copying within the framebuffer instead of repainting from its shadow grid.
+// The floor owes each arch ONE thing (see `crate::bootcon`'s module header): publish a written
+// rectangle. On the Pi 4 it lives in `video`, next to the mailbox call that obtained the framebuffer in
+// the first place - the framebuffer is ordinary RAM the GPU scans out of, covered by the kernel's direct
+// map as Normal CACHEABLE memory, so a written rectangle genuinely has to be cleaned to the point of
+// coherency before the GPU can see it.
+//
+// That cacheable mapping is also why this port does not yet hand the framebuffer to the `console`
+// service: the service would map the same physical pages non-cacheable, and ARM leaves mismatched
+// memory attributes UNPREDICTABLE. Carving the framebuffer out of a blanket block mapping is real
+// page-table work and needs Pi 4 hardware to verify, so it is deliberately not bundled here. Until
+// then the Pi 4 renders through the floor exactly as it does today.
 #[cfg(feature = "pi4")]
-pub use video::{fb_commit, FB_READBACK_CHEAP};
+pub use video::fb_commit;
 
-/// No framebuffer on the QEMU `virt` demarcation target. `false` selects the repaint-from-shadow-grid
-/// path, which never reads the framebuffer back.
-#[cfg(not(feature = "pi4"))]
-pub const FB_READBACK_CHEAP: bool = false;
 #[cfg(not(feature = "pi4"))]
 pub fn fb_commit(
     _base: usize, _pitch: usize, _bpp: usize,

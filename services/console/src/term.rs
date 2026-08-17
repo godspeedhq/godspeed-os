@@ -34,6 +34,8 @@
 //! static because several cores could log at once; a service is one task, so the lock is not merely
 //! unnecessary, it would be an unowned global (invariant 9).
 
+use godspeed_sdk::Framebuffer;
+
 use crate::render;
 use crate::render::{CELL_H, CELL_W};
 
@@ -73,73 +75,50 @@ const FG_RGB: (u32, u32, u32) = (0x80, 0xFF, 0x80);
 /// Height of the underline cursor, in raster pixels before `cell_scale`.
 const CURSOR_TH: usize = 2;
 
-/// What the kernel's grant tells this service about its framebuffer. Plain linear-framebuffer geometry;
-/// the kernel deliberately says nothing about *text* (no rows, no columns, no cell size) because
-/// character geometry is the terminal's own business and the terminal is here.
-pub struct FbParams {
-    /// The framebuffer itself, as a slice over the granted mapping - which is what keeps every pixel
-    /// write in this module bounds-checked and `unsafe`-free (§18.2 forbids `unsafe` in a service at
-    /// all). The single `unsafe` that turns the granted VA into this slice lives in the SDK's audited
-    /// MMIO layer (§18.1), the only place that knows the kernel mapped it and for how long.
-    pub mem: &'static mut [u8],
-    /// Bytes per scanline.
-    pub pitch: usize,
-    /// Bytes per pixel (4 on every framebuffer we have met; the slow path handles others).
-    pub bpp: usize,
-    /// Visible width in pixels.
-    pub width: usize,
-    /// Visible height in pixels.
-    pub height: usize,
-    /// Bit position of the red channel within a pixel.
-    pub r_shift: u32,
-    /// Bit position of the green channel within a pixel.
-    pub g_shift: u32,
-    /// Bit position of the blue channel within a pixel.
-    pub b_shift: u32,
-}
-
 /// The terminal. One owned value, held by `service_main` for the life of the service.
 ///
 /// Named `Term` at the type level and still `Fb` inside this module's helpers, because every function
 /// below took `&mut Fb` in the kernel and renaming them all would obscure a move that is otherwise
 /// line-for-line the code that ran in ring 0.
 pub(crate) struct Fb {
-    // The mapped framebuffer, or None before `init`. Held as a slice so every write below is
-    // bounds-checked; the one `unsafe` that produces it lives in the arch backend.
-    mem: Option<&'static mut [u8]>,
-    pitch: usize,  // bytes per scanline
-    bpp: usize,    // bytes per pixel
-    width: usize,  // visible width in pixels
-    height: usize, // visible height in pixels
-    org_x: usize,  // left edge of the text area (safe-area inset for TV overscan)
-    org_y: usize,  // top edge of the text area
-    cols: usize,   // text columns within the safe area
-    rows: usize,   // text rows within the safe area
-    col: usize,    // cursor column
-    row: usize,    // cursor row
-    fg: u32,       // foreground pixel value (already in the device's channel layout)
-    bg: u32,       // background pixel value (always black - see FbParams)
+    // The kernel's framebuffer grant, or None before `init`. An OWNED handle rather than a
+    // borrowed-forever slice field: that spelling is an unowned mutable global in everything but name,
+    // and this way there is exactly one route to the pixels and it is a `&mut self` borrow. The
+    // single `unsafe` that produces the slice lives in the SDK's audited MMIO layer (§18.1).
+    pub(crate) mem: Option<Framebuffer>,
+    pub(crate) pitch: usize,  // bytes per scanline
+    pub(crate) bpp: usize,    // bytes per pixel
+    pub(crate) width: usize,  // visible width in pixels
+    pub(crate) height: usize, // visible height in pixels
+    pub(crate) org_x: usize,  // left edge of the text area (safe-area inset for TV overscan)
+    pub(crate) org_y: usize,  // top edge of the text area
+    pub(crate) cols: usize,   // text columns within the safe area
+    pub(crate) rows: usize,   // text rows within the safe area
+    pub(crate) col: usize,    // cursor column
+    pub(crate) row: usize,    // cursor row
+    pub(crate) fg: u32,       // foreground pixel value (already in the device's channel layout)
+    pub(crate) bg: u32,       // background pixel value (always black - see FbParams)
 
     // --- ANSI escape parser ---
     // The shell and the full-screen apps drive the terminal with a small ANSI subset (clear, cursor
     // position and movement, erase line, reverse video, hide/show cursor). The same escapes work on a
     // serial terminal for free. State persists across put_byte calls because a sequence spans bytes.
-    esc: u8,              // 0 = normal, 1 = saw ESC, 2 = inside CSI (after '[')
-    csi_priv: bool,       // saw '?' immediately after '[' (private-mode sequence)
-    csi_params: [u16; 4], // numeric parameters (e.g. row;col)
-    csi_nparam: usize,    // count of parameters accumulated
-    reverse: bool,        // SGR reverse video (ESC[7m), reset by ESC[0m
+    pub(crate) esc: u8,              // 0 = normal, 1 = saw ESC, 2 = inside CSI (after '[')
+    pub(crate) csi_priv: bool,       // saw '?' immediately after '[' (private-mode sequence)
+    pub(crate) csi_params: [u16; 4], // numeric parameters (e.g. row;col)
+    pub(crate) csi_nparam: usize,    // count of parameters accumulated
+    pub(crate) reverse: bool,        // SGR reverse video (ESC[7m), reset by ESC[0m
 
     // --- UTF-8 decode ---
     // Accumulate a multi-byte sequence into a codepoint so the box-drawing UI renders as frames rather
     // than mojibake. `utf8_remaining` is how many continuation bytes are still expected (0 = idle).
-    utf8_cp: u32,
-    utf8_remaining: u8,
+    pub(crate) utf8_cp: u32,
+    pub(crate) utf8_remaining: u8,
 
     // --- Cursor ---
-    cursor_visible: bool, // draw the underline cursor (off for full-screen apps)
-    cur_col: usize,       // column where the cursor underline was last drawn
-    cur_row: usize,       // row where the cursor underline was last drawn
+    pub(crate) cursor_visible: bool, // draw the underline cursor (off for full-screen apps)
+    pub(crate) cur_col: usize,       // column where the cursor underline was last drawn
+    pub(crate) cur_row: usize,       // row where the cursor underline was last drawn
 
     // --- Shadow grid ---
     // The printable content of each text cell (the transient cursor overlay is excluded - it is always
@@ -148,13 +127,13 @@ pub(crate) struct Fb {
     // under the cursor instead of blanking it. Storing the attribute alongside the character is what
     // keeps a reverse-video row correct after a repaint - without it a redraw would silently lose the
     // highlight. One bit per cell, so the whole attribute plane is ATTR_STRIDE * MAX_ROWS bytes.
-    grid: [[u8; MAX_COLS]; MAX_ROWS],
-    attr: [[u8; ATTR_STRIDE]; MAX_ROWS],
+    pub(crate) grid: [[u8; MAX_COLS]; MAX_ROWS],
+    pub(crate) attr: [[u8; ATTR_STRIDE]; MAX_ROWS],
 
     // Precomputed foreground-blend LUT: blend_lut[intensity] = the glyph-pixel colour for that
     // antialiasing intensity, composed in the device layout. Lets an antialiased glyph edge blit as a
     // table read instead of a per-pixel multiply/divide.
-    blend_lut: [u32; 256],
+    pub(crate) blend_lut: [u32; 256],
 }
 
 /// The terminal, as the rest of the service sees it.
@@ -169,7 +148,7 @@ impl Term {
     /// shadow grid and its attribute plane, about 15 KiB, and returning it by value would put a second
     /// copy on a 256 KiB service stack during the move (§26.6.1 - the same by-value trap that cost five
     /// `fs` stack overflows). `service_main` therefore zero-initialises one and hands out a reference.
-    pub fn new(p: FbParams) -> Self {
+    pub fn new(fb: Framebuffer) -> Self {
         let mut t = Term {
             s: Fb {
                 mem: None,
@@ -200,7 +179,7 @@ impl Term {
                 blend_lut: [0; 256],
             },
         };
-        init(&mut t.s, p);
+        init(&mut t.s, fb);
         t
     }
 
@@ -219,33 +198,19 @@ impl Term {
         render::present();
     }
 
-    /// Clear the screen and home the cursor.
-    pub fn clear_and_home(&mut self) {
-        clear(&mut self.s);
-        self.s.col = 0;
-        self.s.row = 0;
-        self.s.cur_col = 0;
-        self.s.cur_row = 0;
-        self.s.esc = 0;
-        self.s.reverse = false;
-        if self.s.cursor_visible {
-            draw_cursor(&mut self.s);
-        }
-        render::present();
-    }
 }
 
 /// Initialise the terminal from the kernel's framebuffer grant and clear the screen.
-fn init(s: &mut Fb, p: FbParams) {
+fn init(s: &mut Fb, fb: Framebuffer) {
     // Compose pixel values in the framebuffer's own channel layout via the reported mask shifts, so we
     // render correct colours on an RGB or a BGR device.
-    let (rs, gs, bs) = (p.r_shift, p.g_shift, p.b_shift);
+    let (rs, gs, bs) = (fb.r_shift, fb.g_shift, fb.b_shift);
 
-    s.pitch = p.pitch;
-    s.bpp = p.bpp;
-    s.width = p.width;
-    s.height = p.height;
-    s.mem = Some(p.mem);
+    s.pitch = fb.pitch;
+    s.bpp = fb.bpp;
+    s.width = fb.width;
+    s.height = fb.height;
+    s.mem = Some(fb);
     // Inset the text area by SAFE_PCT on each edge.
     s.org_x = s.width * SAFE_PCT / 100;
     s.org_y = s.height * SAFE_PCT / 100;

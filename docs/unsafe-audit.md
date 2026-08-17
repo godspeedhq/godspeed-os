@@ -1237,6 +1237,26 @@ image never prints `pt-selftest`, and identity is 24/24).
 |------|--------|-----|
 | `arch/x86_64/page_tables.rs` | 48 -> 51 (+3) | (1) `asm!` reading CR3 to find the active PML4 - a register read with no memory effect. (2) One block covering the test body: filling the frame with a sentinel, building PML4/PDPT/PD, installing the large-page entry, running the walk, checking the sentinel, tearing the entry down and `invlpg`-ing it. The VA is confirmed unmapped by `entry_for_va` before anything is written, so no live mapping is touched, and the frame comes exclusively from the allocator. (3) `free_phys_frame` after the entry is cleared and flushed, so no page-walker can still reach it. Permitted layer (§18.1), each block SAFETY-commented. |
 
+## 2026-08-17 - the terminal leaves the kernel: `arch/arm/bootcon.rs` 1 -> 2 (console service)
+
+`kernel/src/fbcon/` (1,172 lines of terminal emulation) moved to the `console` SERVICE and the kernel
+kept a minimal boot/panic blit, `kernel/src/bootcon/` (`docs/console-service.md` §9, CLAUDE.md §11.4
+amendment). `arch/arm/fbcon.rs` is renamed `arch/arm/bootcon.rs` to match what it now backs.
+
+**Neither the kernel's floor nor the service has any `unsafe`,** which is the same property the neutral
+console had and for the same reason: both are handed the framebuffer as a bounds-checked byte slice.
+What changed is where the one `unsafe` that produces that slice lives for the SERVICE - it is now
+`Framebuffer::bytes_mut` in `sdk/rust/src/mmio.rs`, the SDK's audited hardware layer (§18.1), rather
+than an arch backend. §18.2 forbids `unsafe` in a service outright, so there was no other option, and
+the argument is the same one the arch backends make: only that layer knows the kernel mapped the region
+and for how long.
+
+| File | Change | Why |
+|------|--------|-----|
+| `arch/arm/fbcon.rs` -> `arch/arm/bootcon.rs` | 1 -> 2 (+1) | The renamed file gains a `dsb` in `fb_commit`. It REPLACED a `clean_dcache` walk over the written rectangle, which is no longer possible: the framebuffer is now mapped Normal **non-cacheable** (`mmu::section_fb`), because the `console` service maps the same physical pages and ARM leaves mismatched memory attributes UNPREDICTABLE. Nothing to clean, but a non-cacheable store may still sit in the write buffer and the GPU scans RAM, so the drain is still owed. Permitted arch layer, SAFETY-commented. |
+| `sdk/rust/src/mmio.rs` | +1 | `Framebuffer::bytes_mut` - `from_raw_parts_mut` over the VA and length the kernel wrote into this service's context page at spawn. The mapping lives as long as the address space does; `&mut self` plus a non-`Copy`, non-`Clone` handle means no second live slice can exist. Audited SDK hardware layer (§18.1). |
+| `kernel/src/bootcon/`, `services/console/src/` | 0 | Unsafe-free by construction, both of them. |
+
 ## 2026-08-01 - one framebuffer console for every arch: unsafe 11 -> 3 (refactor/fbcon-neutral)
 
 `arch/x86_64/fb.rs` (790 lines) and `arch/arm/fbcon.rs` (512 lines) were two independent
@@ -2327,7 +2347,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
-| arch/arm/fbcon.rs | 1 | permitted |
+| arch/arm/bootcon.rs | 2 | permitted |
 | arch/arm/page_tables.rs | 31 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_ipc.rs | 9 | permitted |

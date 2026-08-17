@@ -155,13 +155,9 @@ pub mod boot {
 /// timer runs its syscalls atomically. Nothing to do on this stub yet.
 pub fn note_user_task(_slot: usize) {}
 
-// --- Framebuffer console backend (`crate::fbcon`) ---
-// The neutral console owes each arch two items (see `crate::fbcon`'s module header). No framebuffer is
+// --- Boot/panic console floor backend (`crate::bootcon`) ---
+// The kernel's boot/panic floor owes each arch one item (see `crate::bootcon`). No framebuffer is
 // mapped on this stub, so the console never initialises and every entry point no-ops.
-
-/// `false` selects the repaint-from-shadow-grid scroll, which never reads the framebuffer back - the
-/// conservative choice while no framebuffer exists.
-pub const FB_READBACK_CHEAP: bool = false;
 
 /// Publish a written rectangle. Nothing to publish yet.
 pub fn fb_commit(

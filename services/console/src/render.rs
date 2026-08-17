@@ -2,7 +2,7 @@
 //! Pixel and glyph rendering for the framebuffer console.
 //!
 //! Everything here writes into a **linear framebuffer** the architecture hands over as a plain
-//! `&'static mut [u8]` (`FbParams::mem`), described by `(pitch, bpp, channel shifts)` - which is
+//! byte slice borrowed from the kernel's grant, described by `(pitch, bpp, channel shifts)` - which is
 //! arch-neutral data, so this file is too. The architecture does not participate in the drawing; it
 //! supplies the slice; ordering the writes is [`present`], once per batch.
 //!
@@ -176,7 +176,7 @@ pub(crate) fn put_pixel(s: &mut Fb, x: usize, y: usize, color: u32) {
         return;
     }
     let (off, bpp) = (y * s.pitch + x * s.bpp, s.bpp);
-    let Some(mem) = s.mem.as_deref_mut() else { return };
+    let Some(mem) = s.mem.as_mut().map(|f| f.bytes_mut()) else { return };
     put_run(mem, off, 1, bpp, color);
 }
 
@@ -189,7 +189,7 @@ pub(crate) fn fill_rect(s: &mut Fb, x: usize, y: usize, w: usize, h: usize, colo
     let yh = (y + h).min(s.height);
     let (pitch, bpp) = (s.pitch, s.bpp);
     let count = xw - x;
-    if let Some(mem) = s.mem.as_deref_mut() {
+    if let Some(mem) = s.mem.as_mut().map(|f| f.bytes_mut()) {
         for yy in y..yh {
             put_run(mem, yy * pitch + x * bpp, count, bpp, color);
         }
@@ -199,7 +199,7 @@ pub(crate) fn fill_rect(s: &mut Fb, x: usize, y: usize, w: usize, h: usize, colo
 /// Clear the whole framebuffer to the background colour. `bg` is black (all channels zero, so all bytes
 /// zero), which makes a flat byte-zero fill correct regardless of the device's channel layout.
 pub(crate) fn clear_all(s: &mut Fb) {
-    if let Some(mem) = s.mem.as_deref_mut() {
+    if let Some(mem) = s.mem.as_mut().map(|f| f.bytes_mut()) {
         mem.fill(0);
     }
     for r in 0..crate::term::MAX_ROWS {
@@ -215,7 +215,7 @@ pub(crate) fn clear_all(s: &mut Fb) {
 fn put_glyph_row(s: &mut Fb, off: usize, rowpix: &[u8], sc: usize) {
     let count = rowpix.len() * sc;
     let (lut, rev) = (&s.blend_lut, s.reverse);
-    let Some(mem) = s.mem.as_deref_mut() else { return };
+    let Some(mem) = s.mem.as_mut().map(|f| f.bytes_mut()) else { return };
     let Some(run) = off.checked_add(count * 4).and_then(|e| mem.get_mut(off..e)) else {
         return;
     };

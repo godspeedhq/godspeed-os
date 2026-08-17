@@ -14,7 +14,7 @@ limit   = "8MiB"
 
 [capabilities]
 # `time` (clock slice 2): the wall clock is a service, so `date` and the boot floor ask it.
-ipc_send    = ["block-driver", "fs", "time"]
+ipc_send    = ["block-driver", "fs", "time", "console"]
 ipc_receive = ["shell"]
 log_write   = true
 

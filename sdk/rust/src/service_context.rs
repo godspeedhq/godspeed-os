@@ -241,6 +241,18 @@ struct ServiceContextData {
     xhci_dma_len:       u64, // length of the DMA arena in bytes
     console_push_slot:  u32, // u32::MAX = none; else CONSOLE_PUSH cap slot
     self_grant_slot:    u32, // u32::MAX = none; else SEND|GRANT cap to own endpoint (H11)
+    // --- Framebuffer grant (the `console` service only) ---
+    // The kernel maps the display's framebuffer into this service's address space Normal NON-cacheable
+    // + USER, as a driver's MMIO BAR is mapped, and describes it here. Deliberately PIXEL geometry only:
+    // no rows, no columns, no cell size. Character geometry belongs to the terminal, and the terminal is
+    // the service (`docs/console-service.md` §9.7).
+    fb_va:              u64, // 0 = no framebuffer grant; else VA of the mapped framebuffer
+    fb_len:             u64, // length of the mapping in bytes (pitch * height)
+    fb_pitch:           u32, // bytes per scanline
+    fb_width:           u32, // visible width in pixels
+    fb_height:          u32, // visible height in pixels
+    fb_bpp:             u32, // bytes per pixel
+    fb_shifts:          u32, // r_shift | g_shift << 8 | b_shift << 16
     send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
 }
 
@@ -1416,19 +1428,29 @@ impl ServiceContext {
         if ret <= 0 { 1 } else { ret as u32 }
     }
 
-    /// Framebuffer console geometry as `(rows, cols)` text cells, or `(0, 0)` if
-    /// there is no framebuffer. The console service uses this to lay out its
-    /// terminal (pin the input line to the bottom row).
+    /// Terminal geometry as `(rows, cols)` text cells, or `(0, 0)` if it cannot be determined.
     ///
-    /// Wraps InspectKernel query 9 (ambient - screen geometry is task-neutral).
+    /// **Asked of the `console` service, not the kernel.** It used to be `InspectKernel` query 9, which
+    /// is now deleted: rows and columns are derived from the safe-area inset, the cell size and the
+    /// font-scale rule, all of which live in the terminal - so the terminal is the only party that can
+    /// answer, and asking anyone else would be a second source of truth (Commandment III).
+    ///
+    /// `(0, 0)` means **unknown**, and callers already treat it that way explicitly rather than
+    /// substituting a size behind the user's back (the pager prints unpaged; `edit` falls back to 24x80
+    /// and says so). It is returned when there is no console service, when it is mid-restart, or when it
+    /// holds no framebuffer - all cases where a guessed geometry would be a silent fallback.
+    ///
+    /// Costs one IPC round trip, so callers that lay out a screen should ask once and keep the answer
+    /// for that screen rather than per line.
     pub fn console_dims(&self) -> (u16, u16) {
-        // SAFETY: syscall(13) = InspectKernel; query_id=9 = packed (rows<<16)|cols.
-        let ret = unsafe { raw_syscall(13, 9, 0, 0) };
-        if ret <= 0 {
-            (0, 0)
-        } else {
-            let packed = ret as u64;
-            (((packed >> 16) & 0xFFFF) as u16, (packed & 0xFFFF) as u16)
+        let mut buf = [0u8; 8];
+        // Opcode 1 = REQ_DIMS (`services/console/src/main.rs`). The reply is rows then cols, u16 LE.
+        match self.request_with_reply_deadline_into("console", &[1u8], &mut buf, 2) {
+            Some(n) if n >= 4 => (
+                u16::from_le_bytes([buf[0], buf[1]]),
+                u16::from_le_bytes([buf[2], buf[3]]),
+            ),
+            _ => (0, 0),
         }
     }
 
@@ -1895,6 +1917,30 @@ impl ServiceContext {
     /// Safe MMIO handle to this service's device register window, if one was
     /// granted (§12) - the neutrally-named accessor for non-USB drivers (e.g. the
     /// AHCI `block-driver`, which maps its HBA ABAR here). Same kernel-mapped
+    /// The framebuffer the kernel granted this service, or `None` if it holds no grant.
+    ///
+    /// Held only by `console`, which renders the terminal into it (`docs/console-service.md` §9). The
+    /// grant carries PIXEL geometry only - character rows and columns are the terminal's own business,
+    /// and the kernel deliberately does not compute or publish them (Commandment III).
+    pub fn framebuffer(&self) -> Option<crate::mmio::Framebuffer> {
+        let d = Self::ctx();
+        if d.fb_va == 0 || d.fb_len == 0 {
+            return None;
+        }
+        let sh = d.fb_shifts;
+        Some(crate::mmio::Framebuffer::new(
+            d.fb_va as *mut u8,
+            d.fb_len as usize,
+            d.fb_pitch as usize,
+            d.fb_bpp as usize,
+            d.fb_width as usize,
+            d.fb_height as usize,
+            sh & 0xFF,
+            (sh >> 8) & 0xFF,
+            (sh >> 16) & 0xFF,
+        ))
+    }
+
     /// window as [`xhci_mmio`](Self::xhci_mmio). `None` for non-driver services.
     pub fn mmio(&self) -> Option<crate::mmio::Mmio> {
         let va = Self::ctx().xhci_mmio_va;

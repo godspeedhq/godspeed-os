@@ -171,6 +171,14 @@ const XHCI_MMIO_PAGES:     u64 = 16;
 /// run while the IOMMU is on, by current evidence.
 pub const CONFINE_USB_DRIVERS: bool = true;
 
+/// VA where the display's framebuffer is mapped into the `console` service's address space.
+///
+/// A plain 32-bit address, unlike `XHCI_MMIO_VA` (4 GiB) and `XHCI_DMA_VA` (8 GiB), because it has to
+/// exist on a 32-bit machine too - the Pi 2 is the first board to use it. Sits below `DRIVER_MMIO_VA`
+/// (0x6000_0000) and well clear of the user stack (0x8000_0000 down), with room for a framebuffer of
+/// any size a display we can drive will have.
+pub const FB_VA: u64 = 0x5000_0000;
+
 /// VA where the driver's physically-contiguous DMA arena is mapped (8 GiB).
 pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
 
@@ -252,6 +260,18 @@ struct ServiceContextData {
     console_push_slot:  u32, // u32::MAX = none; else CONSOLE_PUSH cap slot (input driver)
     self_grant_slot:    u32, // u32::MAX = none; else SEND|GRANT cap to this service's OWN
                              // endpoint, so it can register its name in the kernel directory.
+    // --- Framebuffer grant (the `console` service only) ---
+    // The kernel maps the display's framebuffer into this service's address space Normal NON-cacheable
+    // + USER, as a driver's MMIO BAR is mapped, and describes it here. Deliberately PIXEL geometry only:
+    // no rows, no columns, no cell size. Character geometry belongs to the terminal, and the terminal is
+    // the service (`docs/console-service.md` 9.7).
+    fb_va:              u64, // 0 = no framebuffer grant; else VA of the mapped framebuffer
+    fb_len:             u64, // length of the mapping in bytes (pitch * height)
+    fb_pitch:           u32, // bytes per scanline
+    fb_width:           u32, // visible width in pixels
+    fb_height:          u32, // visible height in pixels
+    fb_bpp:             u32, // bytes per pixel
+    fb_shifts:          u32, // r_shift | g_shift << 8 | b_shift << 16
     send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
 }
 
@@ -340,7 +360,7 @@ struct ServiceConfig {
 /// spawn path. The BAR *address* is still runtime-discovered by the PCI scan (a hardware location is a
 /// different irreducible fact from the authorization); only the driver's *class* is declared here.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum HwClass { None, Ahci, Nic, Xhci, Ehci, Dwc2 }
+enum HwClass { None, Ahci, Nic, Xhci, Ehci, Dwc2, Framebuffer }
 
 impl HwClass {
     /// Did the PCI scan find this class of controller?
@@ -352,6 +372,9 @@ impl HwClass {
             // at all on this board. Its presence is a property of the SoC, so it is `true` on arm32
             // and `false` everywhere else. This is the one HwClass whose answer is not a scan result.
             HwClass::Dwc2 => cfg!(target_arch = "arm"),
+            // Not a bus device at all: the display is found at boot (a Limine descriptor on x86, a GPU
+            // mailbox call on the Pi) and the floor that brought it up is the one that knows.
+            HwClass::Framebuffer => crate::bootcon::grant().is_some(),
             HwClass::Xhci => pci::XHCI_FOUND.load(Relaxed),
             HwClass::Ehci => pci::EHCI_FOUND.load(Relaxed),
             HwClass::Ahci => pci::AHCI_FOUND.load(Relaxed),
@@ -382,6 +405,11 @@ impl HwClass {
             // how this class says "not on a bus" rather than "not present" - `found()` above is the
             // one that answers presence.
             HwClass::Dwc2 => 0,
+            // ZERO for the same reason as the DWC2: not on a bus, so not a BAR. The framebuffer has its
+            // own grant path (the `HwClass::Framebuffer` branch in the spawn MMIO block) because it
+            // needs geometry as well as a window, and because its size is whatever the display turned
+            // out to be.
+            HwClass::Framebuffer => 0,
             HwClass::Xhci => pci::XHCI_MMIO_BASE.load(Relaxed),
             HwClass::Ehci => pci::EHCI_MMIO_BASE.load(Relaxed),
             HwClass::Ahci => pci::AHCI_ABAR.load(Relaxed),
@@ -391,7 +419,11 @@ impl HwClass {
         }
     }
     /// A discovered DMA-capable controller needs a physically-contiguous DMA arena.
-    fn needs_dma(self) -> bool { self != HwClass::None && self.found() }
+    fn needs_dma(self) -> bool {
+        // The framebuffer is not a DMA master - the display scans it, this service only writes it - so
+        // it gets a window and no arena. Everything else that is `found()` DMAs.
+        self != HwClass::None && self != HwClass::Framebuffer && self.found()
+    }
     /// Arena size: xHCI needs room for its 256-buffer scratchpad; every other driver gets 64 KiB.
     fn dma_pages(self) -> u64 { if self == HwClass::Xhci { XHCI_DMA_PAGES } else { EHCI_DMA_PAGES } }
     /// The permanent per-class DMA phys reservation, reused across respawns (§12 DMA permanent-reserve).
@@ -402,7 +434,10 @@ impl HwClass {
             HwClass::Ehci => &EHCI_DMA_PHYS,
             HwClass::Ahci => &AHCI_DMA_PHYS,
             HwClass::Nic  => &NIC_DMA_PHYS,
-            HwClass::None => &XHCI_DMA_PHYS, // unreachable: needs_dma() gates callers
+            // Neither DMAs, so neither ever reaches here - `needs_dma()` gates every caller. They
+            // return a real slot rather than panicking because an unreachable arm that aborts is a
+            // crash waiting for a refactor, and a wrong-but-unused reservation is not.
+            HwClass::None | HwClass::Framebuffer => &XHCI_DMA_PHYS,
         }
     }
     /// Confine this DMA-capable driver via the IOMMU? Only xHCI qualifies today (§6.4; ehci + block-driver
@@ -414,6 +449,7 @@ impl HwClass {
         use core::sync::atomic::Ordering::Relaxed;
         match self {
             HwClass::Dwc2 => 0xFFFF, // no PCI on this board, so no bus-master enable to perform
+            HwClass::Framebuffer => 0xFFFF, // not a PCI device
             HwClass::Xhci => pci::XHCI_BDF.load(Relaxed),
             HwClass::Ehci => pci::EHCI_BDF.load(Relaxed),
             HwClass::Ahci => pci::AHCI_BDF.load(Relaxed),
@@ -442,6 +478,7 @@ pub const EHCI_CORE: u32 = 3;
 fn service_hw(name: &str) -> (HwClass, bool) {
     match name {
         "dwc2"                                 => (HwClass::Dwc2, false),
+        "console"                              => (HwClass::Framebuffer, false),
         "xhci"                                 => (HwClass::Xhci, false),
         "ehci"                                 => (HwClass::Ehci, false),
         "block-driver"                         => (HwClass::Ahci, false),
@@ -588,6 +625,21 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             preferred_core:    0,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        // The terminal (docs/console-service.md 9). Holds the framebuffer grant (`service_hw`) and
+        // renders every console byte the kernel `try_send`s to its endpoint. Core 0 on ARM, unlike the
+        // logger next door: a console write is what the USER is waiting to see, so it belongs on the
+        // core the shell runs on rather than behind a cross-core hop.
+        "console" => Some(("console", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_CONSOLE_ELF")),
+            has_recv_endpoint: true, // the console byte stream AND geometry requests arrive here
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        0,
+            memory_limit:      8 * 1024 * 1024, // matches console.toml
             hw_irqs:           &[],
             has_console_read:  false,
         })),
@@ -3558,7 +3610,10 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // It also gives a useful answer when `fs` is dead: "disk present, filesystem
             // unavailable" instead of nothing at all (§26.7).
             // `time` (clock slice 2): the wall clock is a service, so `date` and the boot floor ask it.
-            send_peers:        &["fs", "block-driver", "time"],
+            // `console`: terminal geometry, for the pager and `edit`. It used to come from the KERNEL
+            // (`InspectKernel` query 9, now deleted) - the shell was asking the wrong party for a fact
+            // the terminal owns (docs/console-service.md 9.7).
+            send_peers:        &["fs", "block-driver", "time", "console"],
             send_peers_grant:  false,
             // ARM: OFF CORE 0, to keep the serial writer away from the microframe-timed USB driver.
             //
@@ -4096,6 +4151,8 @@ fn spawn_service_with_config(
     // `ctx.ehci_mmio()`) is unambiguous (§12).
     // The mapped MMIO window's VA + byte length; the length lets the SDK's `Mmio` wrapper bounds-check
     // accesses (SEC-4). (0, 0) = this service gets no MMIO.
+    // Set by the framebuffer branch below; carried out so the context page can describe the grant.
+    let mut fb_grant: Option<crate::bootcon::FbGrant> = None;
     let (xhci_mmio_va, xhci_mmio_len) = {
         // The controller BAR for this driver's declared class (audit M7): xHCI/EHCI/AHCI use their
         // register base; a NIC only when it is a model we drive (e1000 / RTL8168) - otherwise 0, so the
@@ -4116,6 +4173,42 @@ fn spawn_service_with_config(
             }
             crate::kprintln!("spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}", name, bar, XHCI_MMIO_VA);
             (XHCI_MMIO_VA, XHCI_MMIO_PAGES * PAGE_SIZE as u64)
+        } else if hw == HwClass::Framebuffer {
+            // The display's framebuffer, for the `console` service (docs/console-service.md 9).
+            //
+            // `PCD | PWT` = Normal NON-cacheable: uncached, but the write buffer may still gather a run
+            // of pixel stores into a burst. A framebuffer store has no side effect - it is memory the
+            // display happens to scan - so the Device attribute the driver MMIO grants use would forbid
+            // that merging for nothing, at a bus transaction per pixel. It also has to MATCH the
+            // kernel's own mapping of these same physical pages (`mmu::section_fb` on ARM): mismatched
+            // memory attributes for one physical page are UNPREDICTABLE on ARM.
+            match crate::bootcon::grant() {
+                Some(g) => {
+                    let flags = PageFlags::PRESENT
+                        | PageFlags::WRITABLE
+                        | PageFlags::USER
+                        | PageFlags::NO_EXEC
+                        | PageFlags::PCD
+                        | PageFlags::PWT;
+                    let pages = g.len.div_ceil(PAGE_SIZE as u64);
+                    for i in 0..pages {
+                        let off = i * PAGE_SIZE as u64;
+                        page_table
+                            .map(VirtAddr(FB_VA + off), PhysAddr(g.phys + off), flags)
+                            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::MapFailed })?;
+                    }
+                    fb_grant = Some(g);
+                    crate::kprintln!(
+                        "spawn[fb]: '{}' {}x{} at phys {:#x} -> VA {:#x} ({} KiB)",
+                        name, g.width, g.height, g.phys, FB_VA, g.len / 1024
+                    );
+                    (FB_VA, g.len)
+                }
+                // `found()` said there was a framebuffer and `grant()` now says there is not. Nothing
+                // maps, the service is told it has no display and says so (invariant 12); it does not
+                // get a window it cannot use.
+                None => (0, 0),
+            }
         } else if let Some((va, len)) = crate::arch::imp::map_fixed_driver_mmio(&mut page_table, name) {
             // Non-PCI fixed-physical peripheral MMIO grant (§12.3 for a bus with no PCI scan - the Pi's
             // peripherals are at fixed addresses). The arch layer maps the window Device+USER and returns
@@ -4264,6 +4357,13 @@ fn spawn_service_with_config(
             data.xhci_dma_va        = xhci_dma_va;
             data.xhci_dma_phys      = xhci_dma_phys;
             data.xhci_dma_len       = xhci_dma_len;
+            data.fb_va              = fb_grant.map_or(0, |_| FB_VA);
+            data.fb_len             = fb_grant.map_or(0, |g| g.len);
+            data.fb_pitch           = fb_grant.map_or(0, |g| g.pitch);
+            data.fb_width           = fb_grant.map_or(0, |g| g.width);
+            data.fb_height          = fb_grant.map_or(0, |g| g.height);
+            data.fb_bpp             = fb_grant.map_or(0, |g| g.bpp);
+            data.fb_shifts          = fb_grant.map_or(0, |g| g.shifts);
             for i in 0..peer_count {
                 data.send_peers[i].slot     = peer_data[i].0;
                 data.send_peers[i].name_len = peer_data[i].1;

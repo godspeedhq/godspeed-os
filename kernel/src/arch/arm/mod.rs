@@ -26,10 +26,10 @@ pub mod page_tables;
 pub mod meminit;
 pub mod syscall;
 pub mod video;
-pub mod fbcon;
-/// The framebuffer-console backend primitives the neutral `crate::fbcon` calls through `arch::imp`.
-/// See `crate::fbcon`'s module header for the contract each one owes.
-pub use fbcon::{fb_commit, FB_READBACK_CHEAP};
+pub mod bootcon;
+/// The one primitive the kernel's boot/panic console floor (`crate::bootcon`) calls through
+/// `arch::imp`: publish a written rectangle. See `crate::bootcon`'s module header for its contract.
+pub use bootcon::fb_commit;
 // arm32 slice 5: the in-kernel HID decoder is gone with the rest of the USB stack. Keystroke decoding
 // belongs to whoever owns the keyboard, and that is the `dwc2` SERVICE now (services/dwc2/src/hid.rs).
 
@@ -739,7 +739,7 @@ const SERIAL_ACQUIRE_US: u32 = 40_000;
 /// of truth and where a captured log comes from, but they do not paint over the app's screen.
 ///
 /// Deliberately lock-free with respect to `SERIAL_BUSY`: it takes no lock and renders nothing, so it
-/// cannot corrupt fbcon's shared cursor state - the hazard the lock exists to prevent. Interleaving on
+/// cannot corrupt the floor's shared cursor state - the hazard the lock exists to prevent. Interleaving on
 /// the serial line itself is the same risk any contended writer already has.
 pub(super) fn pl011_write_no_fb(s: &[u8]) {
     for &b in s { pl011_write_byte(b); }
@@ -756,7 +756,7 @@ pub(super) fn pl011_write(s: &[u8]) {
         // messages run with the MMU off, where LDREX/STREX is UNPREDICTABLE on real silicon (see the
         // note just above). A `mirror` that locked or CAS'd here hangs the Pi on the firmware's rainbow
         // splash with no serial output at all - and QEMU, being permissive, does not reproduce it.
-        fbcon::mirror(s);
+        bootcon::mirror(s);
         return;
     }
     // Clear any stale exclusive-monitor reservation before the compare-exchange below. ARMv7 does NOT
@@ -782,14 +782,14 @@ pub(super) fn pl011_write(s: &[u8]) {
     for &b in s {
         pl011_write_byte(b);
     }
-    // Mirror to the TV ONLY as the lock HOLDER. fbcon has shared cursor/scroll state (FBCON.col/row) and
+    // Mirror to the TV ONLY as the lock HOLDER. The floor has shared cursor/scroll state and
     // assumes a single writer at a time; a contended writer that could NOT claim SERIAL_BUSY (another core
     // logging, or an ISR preempting the holder mid-render) must not also render, or two writers corrupt
-    // fbcon's position and the TV shows garbled/overlapping text. The contended write's bytes still went to
+    // its position and the TV shows garbled/overlapping text. The contended write's bytes still went to
     // serial above (the source of truth); only its TV mirror is dropped, which is invisible in practice
     // because the dominant console writer (the shell) holds the lock for its own output.
     if held {
-        fbcon::mirror(s);
+        bootcon::mirror(s);
         SERIAL_BUSY.store(false, Ordering::Release);
     }
 }
@@ -858,7 +858,7 @@ extern "C" fn arm_boot_main() -> ! {
     // on the TV (mirrored from serial). Everything logged from here on shows on the display.
     if let Some(fb) = fb {
         video::map(&fb);
-        fbcon::init(fb.base, fb.pitch, fb.width, fb.height);
+        bootcon::init(fb.base, fb.pitch, fb.width, fb.height);
         pl011_write(b"arm32: framebuffer console up - this line should appear on the TV\r\n");
     }
     // Route the SD-card pins to the Arasan EMMC (and report what the firmware left them as). After
@@ -1249,7 +1249,7 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
 /// owns the display, so this text belongs on the serial console only and must NOT reach the TV.
 ///
 /// It used to be ignored, with the comment "no framebuffer on this port" - true when it was written,
-/// false since fbcon landed. So every log line from a dying or restarting service painted itself over
+/// false since the framebuffer console landed. So every log line from a dying or restarting service painted itself over
 /// whatever full-screen app was running, which is why `chaos max-carnage` never held the screen: the
 /// carnage it creates is precisely a flood of service log traffic, all of it un-gated.
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
@@ -1363,7 +1363,7 @@ static BOOT_DISMISSED: AtomicBool = AtomicBool::new(false);
 pub fn console_boot_complete() {
     if BOOT_DISMISSED.swap(true, Ordering::AcqRel) { return; }
     BOOT_LOG_TO_FB.store(false, Ordering::Release);
-    fbcon::clear_and_home();
+    bootcon::clear_and_home();
 }
 
 // PL011 receive FIFO -> a single-producer/single-consumer input ring. The producer is `pl011_rx_drain`

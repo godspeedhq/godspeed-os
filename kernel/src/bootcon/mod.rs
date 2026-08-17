@@ -42,11 +42,15 @@
 //!   `unsafe` that turns a mapped address into a slice lives in the arch backend, which is the only
 //!   place that knows the mapping is valid and permanent.
 //! - `bg` is always black, so [`clear`] is a byte-zero fill on any channel layout.
-//! - The framebuffer must be mapped **non-cacheable**, because the `console` service maps the same
-//!   physical pages non-cacheable into its own address space and ARM leaves mismatched memory
-//!   attributes for one physical page UNPREDICTABLE. That is also why there is no `fb_commit` any more:
-//!   with no cacheable mapping there is nothing to clean to the Point of Coherency, and the arch's
-//!   store ordering is handled by [`barrier`] at the end of a batch.
+//! - `arch::imp::fb_commit(base, pitch, bpp, x, y, w, h)` publishes a written rectangle, once per
+//!   locked batch, with the bounding box of everything drawn in it. What that means is arch-defined: a
+//!   clean to the Point of Coherency where the framebuffer is cacheable (the Pi 4), a store fence where
+//!   it is write-combining (x86), a drain where it is non-cacheable (the Pi 2).
+//! - **Where the framebuffer is also granted to the `console` service, it must be mapped
+//!   non-cacheable**, because the service maps the same physical pages and ARM leaves mismatched memory
+//!   attributes for one physical page UNPREDICTABLE - and a service cannot do cache maintenance at all
+//!   (§18.2). The Pi 2 does this (`mmu::section_fb`); the Pi 4 does not yet, which is exactly why it
+//!   does not yet grant the framebuffer.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -131,6 +135,13 @@ struct Boot {
     /// boot screen. Discarding is the honest floor behaviour: the terminal that understands these lives
     /// in the console service.
     esc: u8,
+    /// Bounding box of everything drawn since the last commit, in device pixels. Tracking a box rather
+    /// than each rectangle keeps this to four comparisons per draw, and over-covering is always
+    /// correct - publishing an unchanged line costs a little time and changes nothing.
+    dirty_x: usize,
+    dirty_y: usize,
+    dirty_w: usize,
+    dirty_h: usize,
     /// `blend_lut[intensity]` = the glyph-pixel colour for that antialiasing intensity, composed in the
     /// device's channel layout, so an antialiased edge costs one table read per pixel.
     blend_lut: [u32; 256],
@@ -152,6 +163,10 @@ static FB: SpinLock<Boot> = SpinLock::new(Boot {
     row: 0,
     fg: 0,
     esc: 0,
+    dirty_x: 0,
+    dirty_y: 0,
+    dirty_w: 0,
+    dirty_h: 0,
     blend_lut: [0; 256],
 });
 
@@ -270,6 +285,7 @@ pub fn reclaim_for_panic() {
     OWNED_BY_KERNEL.store(true, Ordering::Release);
     let mut s = FB.lock();
     clear(&mut s);
+    commit(&mut s);
 }
 
 /// Write a byte sequence to the floor under a single lock.
@@ -281,7 +297,7 @@ pub fn put_bytes(bytes: &[u8]) {
     for &b in bytes {
         put(&mut s, b);
     }
-    barrier();
+    commit(&mut s);
 }
 
 /// Clear the screen and home the cursor.
@@ -291,17 +307,47 @@ pub fn clear_and_home() {
     }
     let mut s = FB.lock();
     clear(&mut s);
-    barrier();
+    commit(&mut s);
 }
 
-/// Order the framebuffer stores before the console lock is released.
-///
-/// The mapping is non-cacheable on every arch that has one (see the module header), so there is nothing
-/// to clean - but a non-cacheable store may still sit in a write buffer, and the lock's atomic release
-/// orders normal memory, not that buffer. One barrier per batch, not per glyph.
+/// Publish everything drawn since the last commit and reset the dirty rectangle. One call per locked
+/// batch, so the arch primitive sees one bounding box rather than one call per glyph.
+fn commit(s: &mut Boot) {
+    let base = match s.mem.as_deref() {
+        Some(m) => m.as_ptr() as usize,
+        None => return,
+    };
+    let (x, y, w, h) = (s.dirty_x, s.dirty_y, s.dirty_w, s.dirty_h);
+    // Even with nothing drawn, still call: an arch may have pending stores from an earlier batch that a
+    // caller is entitled to see ordered here, and ordering nothing is free.
+    crate::arch::imp::fb_commit(base, s.pitch, s.bpp, x, y, w, h);
+    s.dirty_x = 0;
+    s.dirty_y = 0;
+    s.dirty_w = 0;
+    s.dirty_h = 0;
+}
+
+/// Extend the pending dirty rectangle to cover `(x, y, w, h)` in device pixels.
 #[inline]
-fn barrier() {
-    crate::arch::imp::fb_barrier();
+fn dirty(s: &mut Boot, x: usize, y: usize, w: usize, h: usize) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    if s.dirty_w == 0 || s.dirty_h == 0 {
+        s.dirty_x = x;
+        s.dirty_y = y;
+        s.dirty_w = w;
+        s.dirty_h = h;
+        return;
+    }
+    let x0 = s.dirty_x.min(x);
+    let y0 = s.dirty_y.min(y);
+    let x1 = (s.dirty_x + s.dirty_w).max(x + w);
+    let y1 = (s.dirty_y + s.dirty_h).max(y + h);
+    s.dirty_x = x0;
+    s.dirty_y = y0;
+    s.dirty_w = x1 - x0;
+    s.dirty_h = y1 - y0;
 }
 
 /// Clear the whole framebuffer and home the cursor. `bg` is black - all channels zero, so all bytes zero
@@ -312,6 +358,8 @@ fn clear(s: &mut Boot) {
     }
     s.col = 0;
     s.row = 0;
+    let (w, h) = (s.width, s.height);
+    dirty(s, 0, 0, w, h);
 }
 
 /// Process one output byte.
@@ -405,6 +453,7 @@ fn fill_rect(s: &mut Boot, x: usize, y: usize, w: usize, h: usize, color: u32) {
             put_run(mem, yy * pitch + x * bpp, count, bpp, color);
         }
     }
+    dirty(s, x, y, count, yh - y);
 }
 
 /// Render one glyph at text cell (col, row). Every cell pixel is written - intensity 0 paints the
@@ -441,6 +490,7 @@ fn draw_glyph(s: &mut Boot, ch: u8, col: usize, row: usize) {
             put_glyph_row(s, off, rowpix, sc);
         }
     }
+    dirty(s, x0, y0, cw, chh);
 }
 
 /// Paint one output row of a glyph: each raster intensity looked up once and replicated `sc` times

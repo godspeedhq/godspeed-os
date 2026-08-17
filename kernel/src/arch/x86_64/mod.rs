@@ -8,9 +8,9 @@ pub mod ap_boot;
 pub mod boot;
 pub mod context_switch;
 pub mod fb;
-/// The framebuffer-console backend primitives the neutral `crate::fbcon` calls through `arch::imp`.
-/// See `crate::fbcon`'s module header for the contract each one owes.
-pub use fb::{fb_commit, FB_READBACK_CHEAP};
+/// The one primitive the kernel's boot/panic console floor (`crate::bootcon`) calls through
+/// `arch::imp`: publish a written rectangle. See `crate::bootcon`'s module header for its contract.
+pub use fb::fb_commit;
 pub mod iommu;
 pub mod ioapic;
 pub mod interrupts;
@@ -519,7 +519,7 @@ pub fn serial_write_byte(b: u8) {
     // settles (console_boot_complete). After that, logs are serial-only and only
     // the console path reaches the TV (Stage 1; docs/console-service.md).
     if boot_log_to_fb() {
-        crate::fbcon::put_byte(b);
+        crate::bootcon::put_bytes(&[b]);
     }
 }
 
@@ -585,7 +585,7 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
     // `serial_write_byte`.
     if boot_log_to_fb() {
         for &b in s {
-            crate::fbcon::put_byte(b);
+            crate::bootcon::put_bytes(&[b]);
         }
     }
 }
@@ -601,7 +601,7 @@ pub fn console_write_byte(b: u8) {
     // the log mirror is off, so the console path is what puts console output on the
     // TV.
     if !boot_log_to_fb() {
-        crate::fbcon::put_byte(b);
+        crate::bootcon::put_bytes(&[b]);
     }
 }
 
@@ -619,7 +619,7 @@ pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
     if to_fb && !boot_log_to_fb() {
         // One lock + one WC flush for the whole string, so it is atomic against
         // another core's console output (no interleaving mid-string).
-        crate::fbcon::put_bytes(s);
+        crate::bootcon::put_bytes(s);
     }
 }
 
@@ -780,7 +780,7 @@ static BOOT_DISMISSED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 pub fn console_boot_complete() {
     if BOOT_DISMISSED.swap(true, core::sync::atomic::Ordering::AcqRel) { return; }
     BOOT_LOG_TO_FB.store(false, core::sync::atomic::Ordering::Release);
-    crate::fbcon::clear_and_home();
+    crate::bootcon::clear_and_home();
 }
 
 /// Set true by the USB keyboard driver (xHCI) once it has finished its setup -

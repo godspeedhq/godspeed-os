@@ -13,9 +13,9 @@
 //!
 //! ## What the arch owes the shared console, and what it does not
 //!
-//! `crate::fbcon` is arch-neutral: the ANSI parser, the UTF-8 decoder, the character grid, glyph
+//! `crate::bootcon` is arch-neutral: the boot/panic glyph blit -
 //! rendering and scrolling are shared with x86 and the 32-bit ARM port. This file owes exactly three
-//! things - a framebuffer as a `&'static mut [u8]`, [`FB_READBACK_CHEAP`], and [`fb_commit`] - and gets
+//! things - a framebuffer as a `&'static mut [u8]` and [`fb_commit`] - and gets
 //! a full terminal for them.
 //!
 //! Handing it a **slice** rather than a base address is what keeps every pixel write in the neutral
@@ -78,7 +78,7 @@ pub fn boot_complete() {
     }
     BOOT_LOG_TO_FB.store(false, Ordering::Release);
     if CONSOLE_UP.load(Ordering::Relaxed) {
-        crate::fbcon::clear_and_home();
+        crate::bootcon::clear_and_home();
     }
 }
 
@@ -100,7 +100,7 @@ pub fn mirror(s: &[u8]) {
     // forever, and every later write would be silently dropped: a television that goes dead and stays
     // dead, with serial still perfectly healthy and nothing in the log. Masked interrupts cannot latch,
     // because a task that cannot be preempted cannot be killed part-way through.
-    crate::smp::without_interrupts(|| crate::fbcon::put_bytes(s));
+    crate::smp::without_interrupts(|| crate::bootcon::put_bytes(s));
 }
 
 /// Framebuffer geometry as the GPU reported it.
@@ -112,11 +112,6 @@ pub struct FbInfo {
     pub width: u32,
     pub height: u32,
 }
-
-/// Reading this framebuffer back is **cheap**: it lives in ordinary RAM the GPU scans out of, and the
-/// kernel's direct map covers it as Normal cacheable memory. The neutral console uses this to pick its
-/// scroll strategy - copying within the framebuffer rather than re-rendering.
-pub const FB_READBACK_CHEAP: bool = true;
 
 /// Publish a written rectangle to the GPU.
 ///
@@ -303,8 +298,11 @@ pub fn start_console(fb: FbInfo) {
     put_dec(len as u64);
     put_str(if probe_ok { b" readback OK\r\n" } else { b" READBACK FAILED\r\n" });
 
-    crate::fbcon::init(crate::fbcon::FbParams {
+    crate::bootcon::init(crate::bootcon::FbParams {
         mem,
+        // Physical base, for the `console` service's grant. Not granted on this port yet - see the
+        // mismatched-attributes note beside `fb_commit` in `mod.rs`.
+        phys: fb.base,
         pitch: fb.pitch as usize,
         bpp: 4,
         width: fb.width as usize,
@@ -316,7 +314,7 @@ pub fn start_console(fb: FbInfo) {
         b_shift: 16,
     });
 
-    crate::fbcon::clear_and_home();
+    crate::bootcon::clear_and_home();
     // Armed LAST: until this is true every `mirror` is a no-op, so nothing can render through a console
     // that is not yet initialised.
     CONSOLE_UP.store(true, Ordering::Release);

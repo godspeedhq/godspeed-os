@@ -147,6 +147,7 @@ service_configs = [
     "chaos-c6-monitor",
     "chaos-c7",
     "chaos-c7-victim",
+    "console",
     "control",
     "counter",
     "dwc2",
@@ -331,7 +332,7 @@ service_configs = [
 # framebuffer dimensions, PCI ids, a hardware random number - and adding one is a new kernel
 # responsibility that changes nothing visible: the syscall count stays exactly where it was.
 # Pins catch addition at the surface they pin, and miss growth inside it.
-introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
 # Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
 # legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
 # before it builds, and classifying one honestly as a device driver fails the build - which is the
@@ -374,6 +375,12 @@ invariants       = "§3, §22 - the kernel checking its own invariants"
 
 [kernel.module_responsibility]
 "arch"          = "arch-layer"
+# The boot/panic console FLOOR - a minimal glyph blit, escapes discarded, no grid or cursor. Not a
+# terminal: the terminal is the `console` SERVICE (docs/console-service.md §9). This claims the same
+# role as the ring buffer because it is the same argument - §11.4's log floor for a machine whose only
+# output is a display - and it earns ring-0 residency by IMPOSSIBILITY, the bar the control channel
+# failed: a panic halts every core, so it cannot ask a service to report it.
+"bootcon"       = "kernel-log-floor"
 "capability"    = "capability-enforcement"
 # Pure epoch/deglitch math backing `now_epoch_monotonic`, which every arch uses to pace deadlines and
 # retries. On hardware whose cycle counter cannot be trusted (the T630 broken TSC, the Pi RTC-less
@@ -443,7 +450,7 @@ FIRE_IRQ           = 14
 "arm/context_switch.rs"       = "context-switch"
 "arm/dtb.rs"                  = "discovery"
 "arm/exceptions.rs"           = "interrupts"
-"arm/fbcon.rs"                = "console"
+"arm/bootcon.rs"              = "console"
 "arm/irq.rs"                  = "interrupts"
 "arm/loadtest.rs"             = "test-scaffold"
 "arm/meminit.rs"              = "boot"

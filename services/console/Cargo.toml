@@ -1,0 +1,12 @@
+[package]
+name = "console"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "console"
+path = "src/main.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }
+noto-sans-mono-bitmap = { version = "0.3", default-features = false, features = ["regular", "size_20", "unicode-basic-latin"] }

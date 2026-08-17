@@ -6,7 +6,7 @@ mod arch;
 mod capability;
 mod clock;
 mod elf_flags;
-mod fbcon;
+mod bootcon;
 mod interrupt;
 mod invariants;
 mod ipc;

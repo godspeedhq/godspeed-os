@@ -59,14 +59,27 @@ const L2_TYPE_SMALL: u32 = 0b10; // small page; bit 0 (XN) is ORed in separately
 
 /// Encode an L2 small-page descriptor for `pa` with the given flags.
 ///
-/// Small-page descriptor. Normal cacheable write-back by default (TEX=0b001, C=1, B=1 - kernel/service
-/// RAM); **Device** memory (TEX=0b000, C=0, B=1 - uncached, no reorder/gather) when `PCD` is set, so a
-/// driver service can map a peripheral's MMIO into its own address space (the same `PCD` the x86 encoder
-/// treats as uncached). AP/APX come from `WRITABLE`; XN from `NO_EXEC`. `S` (shareable) matches the
-/// section mappings `mmu.rs` made, so a page and a section covering the same memory agree on shareability.
+/// Small-page descriptor. Three memory types, selected by the two cache-control flags:
+///
+/// - **Normal cacheable write-back** by default (TEX=0b001, C=1, B=1) - kernel and service RAM.
+/// - **Device** (TEX=0b000, C=0, B=1) when `PCD` alone is set - uncached, no reordering, no gathering.
+///   This is what a driver service's peripheral MMIO wants: every store is a register write with side
+///   effects, so none of them may be merged or moved. (The same `PCD` the x86 encoder treats as uncached.)
+/// - **Normal NON-cacheable** (TEX=0b001, C=0, B=0) when `PCD | PWT` are both set - uncached, but
+///   gathering and reordering are allowed. This is what a **framebuffer** wants: a pixel store has no
+///   side effect, it is just memory the display happens to scan, so forbidding the write buffer from
+///   merging a run of them costs a bus transaction per pixel and buys nothing. It is also the attribute
+///   `mmu::section_fb` gives the kernel's own mapping of those same physical pages, and they MUST agree -
+///   ARM leaves mismatched memory attributes for one physical page UNPREDICTABLE.
+///
+/// AP/APX come from `WRITABLE`; XN from `NO_EXEC`. `S` (shareable) matches the section mappings `mmu.rs`
+/// made, so a page and a section covering the same memory agree on shareability.
 fn l2_small_page(pa: u32, flags: PageFlags) -> u32 {
     let mut d = (pa & 0xFFFF_F000) | L2_TYPE_SMALL;
-    if flags.contains(PageFlags::PCD) {
+    if flags.contains(PageFlags::PCD) && flags.contains(PageFlags::PWT) {
+        // Normal non-cacheable: TEX=0b001, C=0, B=0. Uncached but gathering - see the note above.
+        d |= 0b001 << 6;
+    } else if flags.contains(PageFlags::PCD) {
         // Device: TEX=0b000, C=0, B=1 (Shareable Device) - correct for MMIO, never cached or reordered.
         d |= 1 << 2; // B
     } else {

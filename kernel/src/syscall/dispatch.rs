@@ -238,7 +238,42 @@ fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     // owner (or unclaimed = the normal case) writes to both.
     let to_fb = crate::arch::imp::console_foreground_allows(scheduler::current_task_slot() as u32);
     crate::arch::imp::console_write_bytes_gated(bytes, to_fb);
+    if to_fb {
+        deliver_to_console_service(bytes);
+    }
     0
+}
+
+/// Hand a console write to the `console` service, which renders it (`docs/console-service.md` 9).
+///
+/// **Try-send, never a blocking send** - and that is the whole reason the display can be a service at
+/// all. Blocking here would make every writer in the system wait on the terminal: a slow, busy or dead
+/// console would wedge the shell, the logger and the kernel's own console path with it. Instead a full
+/// queue drops the bytes from the DISPLAY, and serial - which `console_write_bytes_gated` above has
+/// already written, synchronously - still has every one of them. The display is a mirror; serial is the
+/// truth. That is the same trade the ARM serial mirror already documents.
+///
+/// Delivering is also what **transfers ownership of the framebuffer**: the first bytes this service
+/// accepts prove a renderer exists and is consuming, so the kernel's boot floor stops drawing from that
+/// moment. No syscall, no handshake, and no window in which nobody owns the screen - the service has
+/// mapped and cleared the framebuffer before it can possibly have received anything.
+fn deliver_to_console_service(bytes: &[u8]) {
+    // Never feed the console's own output back to it. Nothing does this today (the service logs through
+    // the serial log path, not the console path), but the loop it would make is unbounded and silent,
+    // and one check here is cheaper than the day someone reaches for `console_write` inside the terminal.
+    if scheduler::task_stat(scheduler::current_task_slot()).name == "console" {
+        return;
+    }
+    let Some(ep) = crate::ipc::names::lookup("console") else { return };
+    let Ok(msg) = crate::ipc::message::Message::new(bytes) else { return };
+    // Kernel-internal delivery: no capability check, because the caller is the kernel, not a task
+    // holding a cap - the same path a device interrupt takes to reach its driver. Try-send semantics: a
+    // full queue discards the message rather than blocking, and a dead endpoint returns without one.
+    let woke = crate::ipc::routing::enqueue_from_interrupt(ep, msg);
+    crate::bootcon::release();
+    if let Some(slot) = woke {
+        scheduler::wake_by_slot(slot, 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1371,7 +1406,7 @@ fn handle_alloc_mem(size: u64) -> i64 {
 ///   i64, or -1 if the name is not registered.
 fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // Self-state (0 = own alloc bytes), the clock (3 = TSC), and console geometry
-    // (9 = fbcon rows/cols - task-neutral hardware info) are ungated, as are the
+    // are ungated, as are the
     // boot/RTC reads (10, 11). Every other query discloses another task's or
     // system-wide state and requires the INTROSPECT capability with READ (§3.1;
     // docs/introspection-capability.md).
@@ -1385,10 +1420,10 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         0 => scheduler::current_task_alloc_bytes() as i64,
         1 => crate::ipc::routing::count_live_endpoints() as i64,
         3 => read_cycle_counter() as i64,
-        // Console (fbcon) geometry packed as (rows << 16) | cols. The console
-        // service needs this to lay out its terminal (pin the input line to the
-        // bottom row). 0 if the framebuffer never initialised.
-        9 => crate::fbcon::dims_packed() as i64,
+        // (9 was the framebuffer console's rows/cols. DELETED: terminal geometry is derived from the
+        // safe-area inset, the cell size and the font-scale rule, which now live in the `console`
+        // SERVICE - so the kernel cannot answer it without keeping a second copy of facts it does not
+        // own. The shell asks the service. docs/console-service.md 9.7.)
         // Input-ready flag - set by the xHCI driver when it finishes setup (the
         // last boot step). The shell watches it to auto-clear the boot screen.
         10 => crate::arch::imp::input_ready() as i64,

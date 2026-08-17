@@ -1988,8 +1988,8 @@ pub fn kill_task_by_slot(slot: usize) {
         // accrues a restart, so `observe` reports 0 for a service that died 41 times. The operator's
         // only view of recovery said nothing happened.
         if matches!(task_name,
-            "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "supervisor" | "counter"
-            | "nic-driver" | "net-stack" | "dwc2" | "time" | "control")
+            "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "console" | "supervisor"
+            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control")
         {
             bump_name_restart(task_name);
         }
@@ -2026,8 +2026,8 @@ pub fn kill_task_by_slot(slot: usize) {
         // The rule is now DERIVED and enforced (`V-managed-watched`): every name the supervisor manages
         // must appear here. Two lists describing one fact is the shape that caused this, and it is the
         // third time this session (ARM_SERVICES vs arm_built was the second).
-        if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "counter"
-            | "nic-driver" | "net-stack" | "dwc2" | "time" | "control") {
+        if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "console"
+            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control") {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),

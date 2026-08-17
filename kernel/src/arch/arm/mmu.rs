@@ -102,21 +102,30 @@ fn section(pa: u32, device: bool, execute: bool) -> u32 {
     d
 }
 
-/// A 1 MB section for the framebuffer: Normal write-back CACHEABLE (TEX=0b001, C=1, B=1), PL1 RW,
-/// non-exec, NON-shareable. Cacheable is what makes the console fast: glyph writes and the scroll
-/// memmove hit the cache instead of crawling through uncached RAM, so scrolling is smooth. The GPU scans
-/// RAM through its own bus and does not snoop the CPU cache, so `fbcon` publishes each write to the Point
-/// of Coherency with an explicit `clean_dcache` (DCCMVAC) - the same primitive `map_framebuffer` already
-/// uses for the page tables. Non-shareable keeps it off the SMP coherency fabric (only this core writes
-/// it; the GPU sees it via the clean), which also avoids the QEMU TCG slow-path that a non-cacheable or
-/// shareable mapping dragged the whole system onto under -smp.
+/// A 1 MB section for the framebuffer: Normal **NON-CACHEABLE** (TEX=0b001, C=0, B=0), PL1 RW,
+/// non-exec, non-shareable.
+///
+/// **It used to be write-back cacheable**, with `fbcon` cleaning each written rectangle to the Point of
+/// Coherency so the GPU (which scans RAM through its own bus and does not snoop the CPU cache) saw it.
+/// That is no longer available: the `console` SERVICE maps these same physical pages into its own
+/// address space to render the terminal (`docs/console-service.md` §9), and ARM leaves **mismatched
+/// memory attributes** for one physical page UNPREDICTABLE. The service cannot map them cacheable
+/// either - `unsafe` is forbidden in a service (§18.2) and `DCCMVAC` is PL1-only - so both mappings
+/// agree here, on non-cacheable.
+///
+/// **Normal** non-cacheable, not Device. Device semantics (no gathering, no reordering, no speculation)
+/// exist to protect stores that have side effects; a framebuffer store has none - it is memory the
+/// display happens to scan. Normal NC lets the write buffer gather, which for a blit is the difference
+/// between one burst and one bus transaction per pixel. `fb_barrier` (a `DSB`) drains it.
+///
+/// Non-shareable keeps it off the SMP coherency fabric (only the CPU side writes it; the GPU sees it via
+/// the drain), which also avoids the QEMU TCG slow-path that a shareable mapping dragged the whole
+/// system onto under -smp.
 fn section_fb(pa: u32) -> u32 {
     (pa & 0xFFF0_0000)
         | 0b10          // section descriptor
         | (0b01 << 10)  // AP = PL1 RW, PL0 none
-        | (0b001 << 12) // TEX = Normal
-        | (1 << 3)      // C = 1  (write-back)
-        | (1 << 2)      // B = 1  (write-back write-allocate with TEX)
+        | (0b001 << 12) // TEX = 0b001 with C=0,B=0: Normal, outer+inner NON-cacheable
         | (1 << 4)      // XN
 }
 
@@ -195,9 +204,9 @@ fn translate(va: u32) -> Option<u32> {
 ///
 /// Identity mapping is what makes this survivable - PC, SP and VBAR all mean the same thing on both
 /// sides of the switch.
-/// Map the GPU framebuffer region `[base, base+size)` as Normal cacheable memory in the LIVE kernel L1
-/// (see `section_fb`), so console rendering is fast; `fbcon` publishes each write to the GPU with an
-/// explicit clean. The framebuffer sits in the gap between usable RAM and the peripherals, which
+/// Map the GPU framebuffer region `[base, base+size)` into the LIVE kernel L1 as **Normal
+/// non-cacheable** (see `section_fb` for why it is not cacheable); `fb_barrier` drains each batch out to
+/// the GPU with a `DSB`. The framebuffer sits in the gap between usable RAM and the peripherals, which
 /// `build_tables` leaves unmapped, so it must be added after the fact. Rounds to the enclosing 1 MiB
 /// sections. Runs after the MMU + caches are on, so the new descriptors are cleaned to RAM (the walker
 /// reads the table non-cacheable) and the TLB is flushed.
@@ -209,7 +218,7 @@ pub fn map_framebuffer(base: u32, size: u32) {
     let end   = base.saturating_add(size).saturating_add(SECTION_SIZE - 1) & !(SECTION_SIZE - 1);
     let mut pa = start;
     while pa < end {
-        l1.0[(pa / SECTION_SIZE) as usize] = section_fb(pa); // Normal non-cacheable, GPU-coherent
+        l1.0[(pa / SECTION_SIZE) as usize] = section_fb(pa); // Normal non-cacheable (see section_fb)
         pa = pa.wrapping_add(SECTION_SIZE);
         if pa == 0 { break; } // wrapped past 4 GiB
     }

@@ -73,7 +73,8 @@ def parse_service_hw(source: str) -> dict:
     # Every HwClass the kernel can return must appear here. A missing entry silently maps to None and
     # then reports "contract says X, kernel says None" - blaming the contract for the parser's gap.
     # `Dwc2` was missing, which is how a service written this session looked like a contract error.
-    cls = {"Ahci": "ahci", "Nic": "nic", "Xhci": "xhci", "Ehci": "ehci", "Dwc2": "dwc2", "None": None}
+    cls = {"Ahci": "ahci", "Nic": "nic", "Xhci": "xhci", "Ehci": "ehci", "Dwc2": "dwc2",
+           "Framebuffer": "framebuffer", "None": None}
     out: dict = {}
     for arm in re.finditer(r'((?:"[^"]+"\s*\|?\s*)+)=>\s*\(\s*HwClass::(\w+)\s*,\s*(true|false)\s*\)', body):
         names = re.findall(r'"([^"]+)"', arm.group(1))
