@@ -608,7 +608,13 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
              & !SMSC_HW_CFG_RXDOFF;
     smsc_write(ctx, m, d, t, SMSC_HW_CFG, hw);
     smsc_write(ctx, m, d, t, SMSC_BURST_CAP, SMSC_BURST_PKTS);
-    smsc_write(ctx, m, d, t, SMSC_BULK_IN_DLY, 0x2000);
+    // 0x800, the value Linux's `smsc95xx` uses (`DEFAULT_BULK_IN_DELAY`). This was 0x2000 - four times
+    // the reference - which makes the device hold a received frame longer while it waits to batch more
+    // behind it. That is invisible on bulk traffic and costly on sparse traffic, which is exactly the
+    // shape of a ping: one small frame, nothing behind it. The doctrine for this port is that the
+    // working driver tells us what the silicon wants; departing from it needs a reason, and there was
+    // none recorded for this one.
+    smsc_write(ctx, m, d, t, SMSC_BULK_IN_DLY, 0x800);
     // Linux's `/* Init Tx */` is two writes and we only ever did one of them.
     smsc_write(ctx, m, d, t, SMSC_FLOW, 0);
     smsc_write(ctx, m, d, t, SMSC_AFC_CFG, 0x00F8_30A1);
@@ -925,6 +931,24 @@ pub fn tx(
                 TX_BACKOFF_MS));
         }
     }
+    // RE-ARM THE RECEIVE CHANNEL NOW, not on the next poll.
+
+    // The stand-down above is necessary - a NAK-retrying IN fills the core's non-periodic request
+    // queue and the transmit cannot be scheduled at all until it stands aside. Leaving the re-arm to
+    // the next `rx` call is what was not: that is up to a poll interval away, and the poll that gets
+    // there only ARMS (it returns 0 and harvests on the call after), so the channel was unarmed for
+    // tens of milliseconds after every transmit.
+    //
+    // A ping reply arrives about 16 ms after its request. That lands squarely in the gap, and the
+    // device then holds the frame in its own FIFO - which is what the counters showed: 91 polls over
+    // a 905 ms window seeing one to four frames and never the reply, `nohalt` climbing, and
+    // `RX_FIFO_INF` non-zero with data waiting. The frame was never lost; we simply were not
+    // listening when it came, and then asked a device that had already decided to batch it.
+    //
+    // Arming here closes the gap to the length of the transmit itself.
+    if !nic.in_armed {
+        arm_in(mmio, dma, t, nic);
+    }
     ok
 }
 
@@ -972,6 +996,29 @@ impl Nic {
     }
 }
 
+/// Arm the background bulk-IN so the device has somewhere to put the next frame.
+///
+/// Extracted so `tx` can call it the moment it finishes, rather than leaving the channel unarmed until
+/// the next receive poll - see the call there for what that gap cost.
+fn arm_in(mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Nic) {
+    // Clear HCINT before arming: it is write-1-to-clear and holds whatever the LAST transfer on this
+    // channel left behind. Arming without clearing means the first check reads a stale completion and
+    // harvests a buffer the device has not written yet.
+    mmio.write32(chan::hcint_at(CH_NET_RX), 0xFFFF_FFFF);
+    chan::program(mmio, &Target { addr: t.addr, mps: nic.mps, low_speed: false }, CH_NET_RX,
+                  true, nic.pid_in, RX_BURST as u32, dma.phys_at(RX_OFF) as u32,
+                  nic.ep_in as u32, 2, 0);
+    // Unmask this channel's terminal halt, exactly as the working kernel driver does before it arms its
+    // background IN. `chan::program` zeroes HCINTMSK for every channel, which is invisible for a channel
+    // programmed and polled in the same breath - and this is the only channel left RUNNING UNATTENDED,
+    // so it is the one place the assumption carries weight.
+    mmio.write32(chan::hcintmsk_at(CH_NET_RX),
+                 crate::regs::HCINT_CHHLTD | crate::regs::HCINT_XFERCOMPL);
+    mmio.write32(crate::regs::HAINTMSK,
+                 mmio.read32(crate::regs::HAINTMSK) | (1 << CH_NET_RX));
+    nic.in_armed = true;
+}
+
 pub fn rx(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Nic,
 ) -> u32 {
@@ -990,23 +1037,7 @@ pub fn rx(
     // kernel driver's background-armed IN, in the shape this service can use: a non-blocking poll per
     // pass instead of an interrupt, because the frame path here is driven by the serve loop.
     if !nic.in_armed {
-        // Clear HCINT before arming: it is write-1-to-clear and holds whatever the LAST transfer on
-        // this channel left behind. Arming without clearing means the first check reads a stale
-        // completion and harvests a buffer the device has not written yet.
-        mmio.write32(chan::hcint_at(CH_NET_RX), 0xFFFF_FFFF);
-        chan::program(mmio, &Target { addr: t.addr, mps: nic.mps, low_speed: false }, CH_NET_RX,
-                      true, nic.pid_in, RX_BURST as u32, dma.phys_at(RX_OFF) as u32,
-                      nic.ep_in as u32, 2, 0);
-        // Unmask this channel's terminal halt, exactly as the working kernel driver does before it arms
-        // its background IN. `chan::program` zeroes HCINTMSK for every channel, which is invisible for
-        // a channel programmed and polled in the same breath - and this is the only channel left
-        // RUNNING UNATTENDED, so it is the one place the assumption carries weight. Diffing against the
-        // working driver is what surfaced it; it should have been the first thing I did.
-        mmio.write32(chan::hcintmsk_at(CH_NET_RX),
-                     crate::regs::HCINT_CHHLTD | crate::regs::HCINT_XFERCOMPL);
-        mmio.write32(crate::regs::HAINTMSK,
-                     mmio.read32(crate::regs::HAINTMSK) | (1 << CH_NET_RX));
-        nic.in_armed = true;
+        arm_in(mmio, dma, t, nic);
         return 0;   // nothing yet - the device answers when it has something
     }
     // COMPLETION IS ChEna GOING CLEAR, not an HCINT bit.
