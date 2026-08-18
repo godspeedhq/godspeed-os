@@ -802,20 +802,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
                 continue;
             }
-            // GIVE THE KEYBOARD THE BUS FOR ITS SPLIT.
+            // NOTE: this poll deliberately does NOT stand the bulk IN down.
             //
-            // A keyboard poll is a periodic split transaction with a hard deadline - the CSPLIT has to
-            // reach the wire two to four microframes after the SSPLIT or the hub's translator has
-            // already dropped the result. A bulk IN left armed NAK-retries in hardware and fills the
-            // core's request queue with real transactions; `tx` documents measuring exactly that, and
-            // stands the IN down for the same reason before every transmit.
+            // It did for two commits, on the theory that a NAK-retrying bulk IN starved the keyboard's
+            // split of bus time. That theory was refuted by its own test - the keyboard storms XACTERR
+            // with the network completely idle - and the real cause was the start-split's MICROFRAME
+            // PLACEMENT (see `chan::periodic_split_in`).
             //
-            // The evidence that this is the keyboard's problem too: it storms XACTERR (a transaction
-            // that reached the wire and failed) rather than NAK (a device with nothing to say), and it
-            // does so DURING network traffic and not otherwise.
-            if let Some((n, _)) = nic.as_mut() {
-                net::stand_down_in(&m, n);
-            }
+            // Worse, the stand-down actively broke receive. This poll runs every 10 ms and `rx` re-arms
+            // only when the client next asks, so halting here left the bulk IN unarmed nearly all the
+            // time: the device's RX FIFO read empty, DHCP got no offer and ARP no reply, while transmit
+            // carried on working and made it look like a network fault. A remedy for a cause that was
+            // not there, with a cost that was.
             if hid::poll(&ctx, &m, &d, kt, *ksplt, k, &mut state, hub_multi_tt) {
                 // A real report is proof the endpoint is healthy: the streak starts over.
                 recoveries_in_a_row = 0;

@@ -652,7 +652,10 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     let mut info = [0u8; 7];
     if dev_info(&ctx, &mut info) {
         ctx.log_fmt(format_args!(
-            "nic-driver: kernel NIC up  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  link {}",
+            // "NIC up", not "kernel NIC up": on ARM the device is reached through the `dwc2`
+            // SERVICE, not through the kernel, and the old wording sent me looking for an in-kernel
+            // backend that this port does not have while diagnosing a receive fault.
+            "nic-driver: NIC up  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  link {}",
             info[0], info[1], info[2], info[3], info[4], info[5], if info[6] != 0 { "UP" } else { "down" }));
     } else {
         ctx.log("nic-driver: no usb-net device - serving empty replies (net degrades, not hangs)");
