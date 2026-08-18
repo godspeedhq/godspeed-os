@@ -16,6 +16,12 @@ use crate::smp::SpinLock;
 const MAX_IRQ: usize = 256;
 
 /// Registered driver endpoint for each IRQ line.
+/// **Every hold masks interrupts (`lock_irq`), because this table is read from the ISR.**
+///
+/// `deliver` runs in an interrupt handler and `register`/`unregister` run in a syscall. A spinlock is
+/// not reentrant, so an unmasked hold in task context lets the interrupt fire on that same core and spin
+/// on a lock its own core already owns - the exact deadlock that stopped a 1754-round soak in
+/// `arch/arm/irq.rs::HIRES`. Same shape, same fix, found by the check that shape produced.
 static IRQ_TABLE: SpinLock<[Option<EndpointId>; MAX_IRQ]> = SpinLock::new([None; MAX_IRQ]);
 
 /// One-shot guard for the EHCI deliver() diagnostic (logs the first EHCI IRQ + its core).
@@ -25,7 +31,7 @@ static EHCI_DELIVER_LOGGED: core::sync::atomic::AtomicBool =
 /// Register a driver endpoint to receive interrupts for `irq`.
 /// Called at spawn time when the kernel processes a `hw_interrupt` capability.
 pub fn register(irq: u8, endpoint: EndpointId) {
-    let mut table = IRQ_TABLE.lock();
+    let mut table = IRQ_TABLE.lock_irq();
     // SEC-16: never SILENTLY steal an IRQ line. On a clean driver restart the death path calls
     // `unregister` first, so the slot is None here; a Some for a DIFFERENT endpoint means either a
     // second driver claiming an already-owned line or a missed unregister - surface it loudly
@@ -43,7 +49,7 @@ pub fn register(irq: u8, endpoint: EndpointId) {
 /// The driver endpoint registered for `irq`, if any. Used to gate the `IrqUnmask` syscall:
 /// only the driver that owns the route may re-open its IOAPIC gate (§12).
 pub fn registered_endpoint(irq: u8) -> Option<EndpointId> {
-    IRQ_TABLE.lock()[irq as usize]
+    IRQ_TABLE.lock_irq()[irq as usize]
 }
 
 /// Remove the driver endpoint registered for `irq` (driver-death quiesce, §12).
@@ -54,7 +60,7 @@ pub fn registered_endpoint(irq: u8) -> Option<EndpointId> {
 /// `enqueue_from_interrupt`'s liveness check only covers the still-Dead window, not a reused
 /// id. Safe no-op if nothing was registered; the respawned driver re-registers.
 pub fn unregister(irq: u8) {
-    IRQ_TABLE.lock()[irq as usize] = None;
+    IRQ_TABLE.lock_irq()[irq as usize] = None;
     // UNMASK on release, or a dead driver leaves the line off FOREVER.
     //
     // `deliver` masks a level-triggered source so it cannot re-enter while the driver works, and the
@@ -96,7 +102,7 @@ pub unsafe fn deliver(irq: u8) {
     // syscall after acking. No-op for edge/MSI vectors (the xHCI), which need no masking.
     crate::arch::imp::ioapic::mask_vector(irq);
 
-    let endpoint = IRQ_TABLE.lock()[irq as usize];
+    let endpoint = IRQ_TABLE.lock_irq()[irq as usize];
     if let Some(ep) = endpoint {
         // COALESCE interrupt notifications, but only against QUEUE PRESSURE - never against the mere
         // presence of unrelated work.

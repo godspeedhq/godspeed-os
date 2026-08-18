@@ -942,6 +942,37 @@ CHECKS = [
              dict(why="an immutable static is fine", code="static COUNT: u32 = 0;", expect=False),
              dict(why="a const is fine", code="const COUNT: u32 = 0;", expect=False),
          ]),
+
+    dict(nature="rule", id="I-irq-lock", commandment="I",
+         title="a lock held in interrupt code masks interrupts",
+         kind="source",
+         dirs=["kernel/src/interrupt", "kernel/src/arch/arm/irq.rs",
+               "kernel/src/arch/aarch64/exceptions.rs", "kernel/src/arch/x86_64/interrupts.rs"],
+         # A spinlock is NOT reentrant. A hold taken with a plain `lock()` stays preemptible, so the
+         # interrupt can fire on the SAME core mid-hold and spin forever on a lock that core already
+         # owns. The core keeps taking interrupts and makes no progress - which is precisely what the
+         # liveness watchdog reports, and precisely how it reads: like a scheduler fault, nowhere near
+         # the lock that caused it.
+         #
+         # This is scoped to the files that ARE interrupt handling, so it needs no call graph and has
+         # no false positives: everything here runs in, or is called from, an ISR. Elsewhere a plain
+         # `lock()` is fine and this says nothing about it.
+         #
+         # Written because it happened twice. `arch/arm/irq.rs::HIRES` deadlocked a 1754-round soak,
+         # and `interrupt/route.rs::IRQ_TABLE` was found carrying the identical bug the moment this
+         # check was drafted - read from the ISR, written from a syscall, unmasked on both sides.
+         # `log.rs` has stated the rule in a comment since long before either.
+         pattern=r"\.lock\(\)",
+         fix="a lock held in interrupt code must mask interrupts: use `lock_irq()`, or wrap the hold "
+             "in `smp::without_interrupts`. A plain `lock()` here is a same-core self-deadlock.",
+         proves="no lock is held unmasked in the kernel's interrupt-handling files",
+         does_not_prove="that a lock held elsewhere is safe from an ISR that reaches it through a "
+                        "call chain this check cannot see - the scope is the files, not the graph",
+         probes=[
+             dict(why="a plain lock in interrupt code is the deadlock", code="let g = T.lock();", expect=True),
+             dict(why="lock_irq is the fix", code="let g = T.lock_irq();", expect=False),
+             dict(why="an unrelated call is not a lock", code="let g = t.locked();", expect=False),
+         ]),
 ]
 
 # Commandments with no mechanical check yet. Printed on EVERY report so the gap cannot be forgotten.

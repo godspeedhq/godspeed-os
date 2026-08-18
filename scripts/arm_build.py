@@ -112,6 +112,27 @@ def main():
     rel = ["--release"] if args.release else []
     kfeatures = args.feature
 
+    # 0. THE COMMANDMENTS GATE.
+    #
+    # `osdev build` has run these since the enforcement layer was written. This script never did - and
+    # this script is what builds every ARM image, so for the whole arm32 effort the checks existed and
+    # were not consulted. That is not a discipline problem, it is a missing gate: a rule enforced on one
+    # path and not the other is enforced on neither, because work flows down the ungated path.
+    #
+    # Failing the BUILD rather than warning is deliberate. A warning scrolls past above a successful
+    # image; a build that refuses to produce one cannot be ignored, and cannot ship.
+    for check in ("commandments.py", "dash_check.py", "unsafe_check.py",
+                  "arch_boundary_check.py", "contract_check.py"):
+        r = subprocess.run([sys.executable, os.path.join("scripts", check)],
+                           cwd=ROOT, capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.stdout.write(r.stdout)
+            sys.stderr.write(r.stderr)
+            raise SystemExit(
+                "\nBUILD REFUSED: %s failed. Fix the violation, or amend CLAUDE.md and cite\n"
+                "the amendment - those are the only two ways past this, by design." % check)
+    print("commandments + dash + unsafe + arch-boundary + contracts: pass")
+
     # 1. Cross-compile every ARM-ported service to armv7 so build.rs can embed them.
     #    The Pi 2 is a bare-metal target (no QEMU control port), so the supervisor is built with its
     #    `bare-metal` feature - the designated "usable OS, quiet gsh> prompt" spawn set (logger + shell,
