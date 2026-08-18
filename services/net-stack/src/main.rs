@@ -815,10 +815,28 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target
     // RETRY like DHCP: re-send the request each attempt (a busy LAN, or a burst the device split across
     // bulk-INs, can lose one reply), then DRAIN + SCAN the ring for OUR reply, answering any gateway that
     // ARPs for US along the way so it can reach us.
+    // SAY WHAT ARRIVED WHEN THIS FAILS.
+    //
+    // "no reply for the gateway" is the same message whether nothing came back, or plenty came back and
+    // none of it was an ARP reply, or an ARP reply came from a host we did not ask about. Those have
+    // different causes and this call has been the blocker for several runs, so count them apart: DHCP
+    // completes on this link (OFFER then ACK, a real lease) while ARP does not, and the difference
+    // between a broadcast exchange working and a unicast one failing is exactly what these numbers
+    // separate.
+    let mut seen = 0u32;      // frames scanned
+    let mut arps = 0u32;      // ethertype 0x0806, any operation
+    let mut replies = 0u32;   // ARP replies, from anyone
+    let mut unicast = 0u32;   // frames addressed to OUR mac (not broadcast/multicast)
     for _ in 0..DANCE_TRIES {
         let _ = nic_req(ctx, &req, LINK_SECS);
         let mut result: Option<[u8; 6]> = None;
         drain_scan(ctx, DANCE_SECS, |f| {
+            seen += 1;
+            if f.len() >= 6 && f[0..6] == our_mac[..] { unicast += 1; }
+            if f.len() >= 22 && f[12] == 0x08 && f[13] == 0x06 {
+                arps += 1;
+                if f[20] == 0x00 && f[21] == 0x02 { replies += 1; }
+            }
             // An ARP REPLY (oper 2) whose SENDER IP is the target we asked for (not some other host's).
             if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 && f[20] == 0x00 && f[21] == 0x02
                 && f[28] == target[0] && f[29] == target[1] && f[30] == target[2] && f[31] == target[3] {
@@ -834,6 +852,13 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target
         });
         if let Some(m) = result { return Some(m); }
     }
+    ctx.log_fmt(format_args!(
+        "net-stack: ARP for {}.{}.{}.{} found nothing - {} frames scanned, {} to our MAC, {} ARP, \
+         {} ARP replies (asking as {}.{}.{}.{} / {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
+        target[0], target[1], target[2], target[3],
+        seen, unicast, arps, replies,
+        our_ip[0], our_ip[1], our_ip[2], our_ip[3],
+        our_mac[0], our_mac[1], our_mac[2], our_mac[3], our_mac[4], our_mac[5]));
     None
 }
 
