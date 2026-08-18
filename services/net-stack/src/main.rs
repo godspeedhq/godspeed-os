@@ -945,6 +945,7 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
     // Still comfortably inside the shell's ~1 s ping cadence, so a genuinely dead host is still declared
     // dead within the same second and the pace does not change.
     let deadline_cycles = if tsc_hz > 0 { (tsc_hz * 9) / 10 } else { 0 };   // ~900 ms
+    let mut drains: u32 = 0;
     loop {
         if let Some(b) = nic_req(ctx, &Message::from_bytes(&[9u8]), LINK_SECS) {
             let p = b.payload_bytes();
@@ -966,8 +967,22 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
         }
         // Give up once the reply window closes (or immediately if the clock is uncalibrated - one drain).
         if deadline_cycles == 0 || ctx.read_tsc().wrapping_sub(t1) >= deadline_cycles {
+            // SAY HOW THE WINDOW WAS SPENT. A timeout here is indistinguishable, from the outside, from
+            // a network that dropped the packet - and the arithmetic says it is not that: consecutive
+            // timeouts arrive 1.007 s apart when a 900 ms window plus the shell's 1 s pace should give
+            // ~1.9 s, so the window is not lasting 900 ms. Guessing why has been wrong three times; this
+            // prints the three numbers that settle it - how long we actually waited, how many times we
+            // asked, and how many frames we saw while asking.
+            let spent = ctx.read_tsc().wrapping_sub(t1);
+            let us = if tsc_hz > 0 { spent.saturating_mul(1_000_000) / tsc_hz } else { 0 };
+            ctx.log_fmt(format_args!(
+                "net-stack: ping window closed after {} us ({} drains, {} frames seen, {} nic timeouts)                  [budget {} us, deadline {} cycles, tsc_hz {}]",
+                us, drains, *frames, *timeouts,
+                if tsc_hz > 0 { deadline_cycles.saturating_mul(1_000_000) / tsc_hz } else { 0 },
+                deadline_cycles, tsc_hz));
             return None;
         }
+        drains += 1;
         // PACE THE POLL - the same fix `drain_scan` already carries, which this loop never got.
         //
         // Without it this is `loop { nic_req(..) }` for up to 900 ms: thousands of requests a second at
