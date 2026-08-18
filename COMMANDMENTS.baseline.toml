@@ -331,7 +331,18 @@ service_configs = [
 # framebuffer dimensions, PCI ids, a hardware random number - and adding one is a new kernel
 # responsibility that changes nothing visible: the syscall count stays exactly where it was.
 # Pins catch addition at the surface they pin, and miss growth inside it.
-introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+#
+# 23 (the board's own MAC) is pinned against the test this file demands - "why isn't this a service?" -
+# and passes it on impossibility, the only thing that earns kernel residency (§11.4 uses the same bar
+# for the boot console). The address lives in the VideoCore mailbox, and a mailbox call MUST run with
+# the MMU and caches OFF, on the boot path, before `mmu::enable` - so no service can ever make it. The
+# kernel is the only thing that can read this, and it already does, once, at boot.
+#
+# What it buys: the NIC driver is a userspace service granted its controller's register window and
+# nothing else, so without this it invents an address - and the invented one is hardcoded, hence
+# identical on every board running this system. The alternative is granting that service a second,
+# far wider MMIO window for one identity fact, which is more authority for less honesty.
+introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23]
 # Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
 # legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
 # before it builds, and classifying one honestly as a device driver fails the build - which is the

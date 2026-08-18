@@ -591,10 +591,33 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
     let lo = smsc_read_or0(ctx, m, d, t, SMSC_ADDRL);
     let hi = smsc_read_or0(ctx, m, d, t, SMSC_ADDRH);
     let from_chip = [lo as u8, (lo >> 8) as u8, (lo >> 16) as u8, (lo >> 24) as u8, hi as u8, (hi >> 8) as u8];
-    let mac = if from_chip == [0u8; 6] || from_chip == [0xFFu8; 6] {
-        ctx.log("dwc2-svc: NIC has no MAC programmed - using a locally-administered address (the board MAC lives in the VideoCore mailbox, outside this service's window)");
+    // THREE SOURCES, BEST FIRST - and say which one answered.
+    //
+    // 1. The BOARD's own MAC, via kernel query 23. This is the address on the sticker and the one the
+    //    network already knows. The in-kernel driver this service replaced used it (it could read the
+    //    VideoCore mailbox directly) and networking worked; the port lost it, because a userspace driver
+    //    is granted the controller's register window and nothing else. The query hands over the fact
+    //    without the window.
+    // 2. Whatever the firmware left in the chip's own filter registers.
+    // 3. A locally-administered address, invented here.
+    //
+    // Case 3 is a genuine last resort and was until now the case this board always took. The address is
+    // HARDCODED, so every machine running this system claims the same one: fine on a bench with a single
+    // board, wrong the moment there are two on a network, and impossible to reconcile with a router that
+    // has been told about the real one. It stays as the fallback because a NIC with no address at all is
+    // worse, and it is logged as the compromise it is rather than passed off as normal.
+    let mac = if let Some(board) = ctx.board_mac() {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: NIC using the board MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            board[0], board[1], board[2], board[3], board[4], board[5]));
+        board
+    } else if from_chip == [0u8; 6] || from_chip == [0xFFu8; 6] {
+        ctx.log("dwc2-svc: NIC has no MAC - not from the board, not from the chip - so it is using a                  hardcoded locally-administered address, which every board running this system shares");
         [0x02, 0x00, 0x00, 0x12, 0x34, 0x56]
     } else {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: NIC using the MAC the firmware left in the chip {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            from_chip[0], from_chip[1], from_chip[2], from_chip[3], from_chip[4], from_chip[5]));
         from_chip
     };
     smsc_write(ctx, m, d, t, SMSC_ADDRL,

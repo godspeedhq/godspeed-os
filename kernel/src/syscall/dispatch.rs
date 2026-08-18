@@ -1424,7 +1424,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // boot/RTC reads (10, 11). Every other query discloses another task's or
     // system-wide state and requires the INTROSPECT capability with READ (§3.1;
     // docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22)
+    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -1495,6 +1495,20 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // speed - which fails silently on hardware and not at all under emulation. 0 = unknown, and the
         // driver then reports rather than guessing.
         20 => crate::arch::imp::emmc_base_clock_hz() as i64,
+        // 23 = THE BOARD'S OWN MAC ADDRESS, packed little-endian (byte 0 in bits 7:0), or -1.
+        //
+        // Ungated with the other board-identity reads (20 = the EMMC base clock): it discloses no
+        // task's state and no system-wide state, only a number etched on the hardware and printed
+        // on the sticker - which is on the wire in the source field of every frame the machine
+        // sends, so it is not a secret being handed out.
+        //
+        // It exists because the NIC driver is a userspace service and this address lives in the
+        // VideoCore mailbox, outside the DWC2 register window the service is granted. The driver
+        // was therefore falling back to a locally-administered address that is HARDCODED and so
+        // identical on every board running this system - two Pis on one network would claim the
+        // same MAC. The alternative to this query is granting the driver a second, much wider MMIO
+        // window for one identity fact, which is authority out of all proportion to the need.
+        23 => match crate::arch::imp::board_mac_packed() { Some(v) => v as i64, None => -1 },
         // Clock PROVENANCE, packed: bits 0-7 = source (0 unset / 1 rtc / 2 ntp), bits 8.. = seconds since
         // the network last set it (0 if never). Ungated task-neutral timing info like the RTC (11) itself.
         // `date` reports this so a displayed time says where it came from - a fallback chain is only

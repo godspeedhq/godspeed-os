@@ -346,6 +346,8 @@ pub mod ap_boot {
 // the gap went unnoticed (CI builds x86_64 only, and the arch-boundary check tests for named-arch
 // references, not surface completeness).
 pub fn emmc_base_clock_hz() -> u32 { 0 }
+/// No board mailbox on this architecture: the driver uses whatever the chip holds. See query 23.
+pub fn board_mac_packed() -> Option<u64> { None }
 pub fn usb_disk_sectors() -> u64 { 0 }
 pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
 pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }

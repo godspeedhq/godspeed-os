@@ -1122,6 +1122,13 @@ reset: the SoC did NOT reset - the watchdog poke had no effect.
 /// own capability register reports this wrongly on the BCM283x, and the driver is granted only its
 /// controller's registers - it cannot ask the mailbox itself (§12.3).
 pub fn emmc_base_clock_hz() -> u32 { video::emmc_clock_hz() }
+/// The board's own MAC address, read from the VideoCore mailbox at boot. See query 23.
+pub fn board_mac_packed() -> Option<u64> {
+    video::board_mac().map(|m| {
+        (m[0] as u64) | ((m[1] as u64) << 8) | ((m[2] as u64) << 16)
+            | ((m[3] as u64) << 24) | ((m[4] as u64) << 32) | ((m[5] as u64) << 40)
+    })
+}
 
 /// USB mass-storage block device, served by the in-kernel DWC2 Bulk-Only stack (`dwc2`). Exposed to the
 /// userspace `block-driver` through the USB_DISK-gated syscalls 46-48, the same shape as the USB-net

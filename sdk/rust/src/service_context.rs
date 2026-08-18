@@ -1224,6 +1224,21 @@ impl ServiceContext {
         if v < 0 { None } else { Some(v as u8) }
     }
 
+    /// The board's own MAC address (kernel query 23), or `None` where the board cannot say.
+    ///
+    /// A NIC driver runs in userspace and cannot reach the board identity: on the Pi this address lives
+    /// in the VideoCore mailbox, nowhere near the controller's register window. Without it a driver has
+    /// to invent an address, and an invented address that is hardcoded is the same on every board -
+    /// which stops being harmless the moment two of them share a network.
+    pub fn board_mac(&self) -> Option<[u8; 6]> {
+        // SAFETY: syscall(13) = InspectKernel; query 23 = the board MAC packed little-endian, -1 if none.
+        let v = unsafe { raw_syscall(13, 23, 0, 0) };
+        if v < 0 { return None; }
+        let v = v as u64;
+        Some([v as u8, (v >> 8) as u8, (v >> 16) as u8,
+              (v >> 24) as u8, (v >> 32) as u8, (v >> 40) as u8])
+    }
+
     /// Inject a test interrupt. Requires the FIRE_IRQ capability, held only by `control`; a non-holder
     /// gets `false` rather than a silent no-op.
     pub fn fire_irq(&self, irq: u8) -> bool {

@@ -1251,6 +1251,8 @@ pub fn hw_random() -> Option<u32> { None }
 /// (the block driver then refuses to guess a divider). Only the Pi's ARM port learns this,
 /// from the VideoCore mailbox at boot.
 pub fn emmc_base_clock_hz() -> u32 { 0 }
+/// No board mailbox on this architecture: the driver uses whatever the chip holds. See query 23.
+pub fn board_mac_packed() -> Option<u64> { None }
 
 /// USB mass-storage block device (the ARM DWC2 Bulk-Only bridge). Only the Pi's ARM port has an
 /// in-kernel USB stack; elsewhere disks are userspace drivers, so there is no device here.
