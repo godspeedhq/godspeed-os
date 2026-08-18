@@ -152,6 +152,60 @@ def main():
             feats = ["--features", "qemu"]
         run(["cargo", "build", "-p", svc, "--target", TARGET] + feats + rel)
 
+    # 1b. EVERY SERVICE MUST FIT ITS OWN STACK.
+    #
+    #     The kernel gives each service a 256 KiB user stack (`USER_STACK_PAGES = 64`, task/mod.rs).
+    #     A service whose `service_main` frame is larger than that faults on the FIRST STORE of its own
+    #     prologue - before a line of its code runs, and before it can say anything about why.
+    #
+    #     This is checkable here and nowhere else useful: it is a fixed number, sitting in the binary,
+    #     readable in a second. Left unchecked it presents on HARDWARE as a service that spawns and
+    #     instantly dies, forever, with the supervisor faithfully restarting it - `fs` crash-looped at
+    #     roughly 30 restarts a second, and the restart storm interleaved the serial log badly enough to
+    #     corrupt the network lines being debugged. The fault address said "stack"; the first reading of
+    #     it was a memory bug in the filesystem.
+    #
+    #     A DEBUG build is the case that bites. With no optimisation every by-value move of a large
+    #     struct is a separate copy, so `fs`'s 36 KiB mount record becomes a 503 KiB frame - twice the
+    #     stack it is given. The same service built release is 155 KiB and fits. So a debug image is not
+    #     "the same image, slower": for some services it is an image that cannot run at all, and until
+    #     now the only signal was on hardware. It is a build refusal with the number in it instead.
+    stack_limit = 64 * 4096   # USER_STACK_PAGES * PAGE_SIZE, kernel/src/task/mod.rs
+    objdump = shutil.which("rust-objdump") or "rust-objdump"
+    too_big = []
+    for svc in ARM_SERVICES:
+        elf = os.path.join(ROOT, "target", TARGET, profile, svc)
+        if not os.path.exists(elf):
+            continue
+        r = subprocess.run([objdump, "-d", "--disassemble-symbols=service_main", elf],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            continue
+        frame = 0
+        for line in r.stdout.splitlines():
+            # The prologue emits one `sub sp, sp, #N` per immediate the ARM encoding can hold, so a big
+            # frame is SEVERAL instructions and only their sum is the real depth. Reading the first one
+            # alone reports 824 bytes for a 503 KiB frame, which is how this stayed invisible.
+            hit = re.search(r"sub\s+sp, sp, #(\d+)", line)
+            if hit:
+                frame += int(hit.group(1))
+            elif frame:
+                break   # the run of stack adjustments has ended; the prologue is over
+        if frame > stack_limit:
+            too_big.append((svc, frame))
+    if too_big:
+        print()
+        for svc, frame in too_big:
+            print("  %-14s service_main frame %d bytes > %d byte stack (over by %d)"
+                  % (svc, frame, stack_limit, frame - stack_limit))
+        raise SystemExit(
+            "\nBUILD REFUSED: the service(s) above cannot fit their own stack frame. Each would fault\n"
+            "on the first store of its prologue and crash-loop forever under the supervisor.\n"
+            "Build with --release, or shrink the frame (CLAUDE.md 26.6.1: change the data shape -\n"
+            "stream it, refer to it by span, or give it a bounded arena - do not reach for a heap).")
+    print("stack fit: every service's service_main frame is within the %d KiB user stack"
+          % (stack_limit // 1024))
+
     # 2. Build the kernel (embeds the service ELFs) with the chosen boot path.
     #
     #    TOUCH build.rs FIRST, unconditionally. The kernel embeds each service with
