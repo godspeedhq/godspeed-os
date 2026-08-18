@@ -518,22 +518,30 @@ assert fails ls /sc
 
 # ---- network: RECEIVE must work, checked without sending anything ----------------------------
 #
-# A pure READ of state, so this honours the rule above that a check performs no network operation and
-# has no side effect: it asks `net` what already happened, it does not make anything happen.
+# A pure READ of state: it asks what already happened, it does not make anything happen.
 #
-# What it catches, and why it is here: a driver change stopped the receive channel being armed, so the
-# host transmitted normally and received nothing. DHCP got no offer, net-stack fell back to an address
-# the network does not route - and every other test in this suite still passed, all 351 of them,
-# because none of them touched the network. It was found by a human reading a log, twice, days apart.
-# A stack that cannot receive cannot get a lease. That is the whole check.
+# What it catches: a driver change stopped the receive channel being armed, so the host transmitted
+# normally and received nothing. DHCP got no offer, net-stack fell back to an address the network does
+# not route - and all 351 other tests still passed, because none of them touched the network. A stack
+# that cannot receive cannot get a lease. That is the whole check.
 #
-# ONE assertion, no conditional, and stated POSITIVELY - which matters more than it looks. The first
-# version asserted `lacks 'lease    no'`, and on hardware it passed while the network was in exactly the
-# state it was meant to catch: `net` had not replied yet, printed nothing but "waiting for a reply", and
-# an absence assertion is satisfied by absence. A check that passes when nothing happened is not a check.
+# WAITS ON THE ANSWER, NOT ON A MOMENT. The first version asked once and failed on a machine whose PHY
+# negotiated link 50 seconds into the boot: net-stack was mid-DHCP (it blocks its serve loop for the
+# length of a dance), `net` timed out, and the suite reported a network fault that did not exist. So it
+# retries while there is no answer, bounded, and fails only if none ever comes - which is Commandment
+# VIII's distinction exactly: wait for the truth, with a bound, never for a fixed interval.
 #
-# So both ACCEPTABLE outcomes print the same token - `lease    ok (DHCP)` and
-# `lease    ok (no link - nothing to lease)` - and the failing one prints `lease    NONE`. Requiring the
-# token to be PRESENT fails on a live link with no lease AND on a net-stack that does not answer, which
-# are both real faults, and cannot pass on silence.
-net | assert contains 'lease    ok'
+# `net lease` prints ONE word so the retry can test it with the grammar this language has, and prints
+# NOTHING while net-stack is busy - so silence retries rather than counting as a verdict.
+let mut leaseok = 0
+for i in range 20 {
+    if $leaseok < 1 {
+        for line in (net lease) { if $line in ok { leaseok = 1 } }
+        if $leaseok < 1 { wait 1 }
+    }
+}
+if $leaseok > 0 {
+    echo 'PASS  net - the stack holds a lease (or has no link to need one)'
+} else {
+    fail 'net: no lease after 20s - the receive path or DHCP is broken'
+}

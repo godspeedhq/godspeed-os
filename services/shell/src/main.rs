@@ -715,7 +715,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("busiest", &["mem", "restarts", "queue"]),
     ("date",    &["epoch", "sync"]),
-    ("net",     &["dns", "stats", "arp", "scan", "renew"]),
+    ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage", "link-flap"]),
     ("write",   &["append", "prepend"]),
@@ -5291,6 +5291,9 @@ fn cmd_net(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellEr
     if arg == "renew" {
         return net_renew(ctx, out);
     }
+    if arg == "lease" {
+        return net_lease(ctx, out);
+    }
     if !arg.is_empty() {
         ctx.console_writeln("net: unknown subcommand - try net, net dns <host>, net stats, net arp <ip>, net scan, net renew, or net help");
         return Err(ShellError::Unknown);
@@ -5483,6 +5486,37 @@ fn net_link_up(ctx: &ServiceContext) -> bool {
     match ctx.request_with_reply_deadline("nic-driver", &req, 2) {
         Some(r) => { let p = r.payload_bytes(); p.len() >= 8 && p[7] != 0 }
         None => false,
+    }
+}
+
+/// `net lease` - ONE WORD: `ok`, `none`, or nothing at all if net-stack does not answer.
+///
+/// Exists for `selfcheck`. The suite can compare a whole line against a word list (`if $line in ok`)
+/// but has no substring test, so a status block full of formatted prose is not something it can assert
+/// on without inventing grammar - which is what the first version of that check did.
+///
+/// Three outcomes, deliberately distinct:
+/// - `ok`   - DHCP granted the address, OR there is no link so there is nothing to lease
+/// - `none` - the link is up and we are on the fallback address, which routes nowhere
+/// - (silence) - net-stack did not reply, so the caller can retry rather than conclude anything
+fn net_lease(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    if !net_link_up(ctx) {
+        out.line(ctx, "ok");            // no cable: nothing to lease, and not a fault
+        return Ok(());
+    }
+    let req = Message::from_bytes(&[0u8]);
+    match ctx.request_with_reply_deadline("net-stack", &req, 3) {
+        Some(r) => {
+            let p = r.payload_bytes();
+            // bit 2 of the flag byte = DHCP granted this address (net-stack publishes it).
+            out.line(ctx, if p.len() >= 15 && p[14] & 4 != 0 { "ok" } else { "none" });
+            Ok(())
+        }
+        // SILENT on no reply, on purpose. net-stack blocks its serve loop for the length of a DHCP
+        // dance, and a machine whose link has just come up is legitimately in one - saying `none`
+        // there would report a fault that is not there. The caller retries; if it never answers, the
+        // caller's own bound is what fails, and that failure is real.
+        None => Ok(()),
     }
 }
 
