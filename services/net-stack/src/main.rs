@@ -1081,7 +1081,10 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
     status[0..4].copy_from_slice(&our_ip);
     status[4..8].copy_from_slice(&gateway);
     status[8..14].copy_from_slice(&gw_mac);
-    status[14] = (have_mac as u8) | ((ping_ok as u8) << 1);
+    // bit 2 = DHCP granted this address (as opposed to the fallback guess). Published because it is
+    // the difference between configured and merely reachable, and because `selfcheck` asserts on
+    // it - a receive path that has stopped working shows up here as a stack that never got a lease.
+    status[14] = (have_mac as u8) | ((ping_ok as u8) << 1) | ((leased as u8) << 2);
     status[15..19].copy_from_slice(&dns_server);
     let state = NetState { our_ip, our_mac, gw_mac, have_mac, leased, dns_server, status };
 

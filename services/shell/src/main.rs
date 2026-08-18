@@ -5578,6 +5578,10 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
             out.line(ctx, "gateway  unresolved");
         }
         out.line(ctx, if flags & 2 != 0 { "ping     ok" } else { "ping     no" });
+        // Whether the address was GRANTED or guessed. A stack that cannot receive gets no offer and
+        // falls back, so this line is where a broken receive path becomes visible without sending
+        // anything - which is what lets `selfcheck` gate on it.
+        out.line(ctx, if flags & 4 != 0 { "lease    yes (DHCP)" } else { "lease    no (fallback address)" });
         if p.len() >= 19 {
             out.line_fmt(ctx, format_args!("dns      {}.{}.{}.{}", p[15], p[16], p[17], p[18]));
         }
@@ -5585,6 +5589,12 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
         out.line(ctx, "ip       unassigned (link down - cable unplugged?)");
         out.line(ctx, "gateway  unresolved");
         out.line(ctx, "ping     no");
+        // Printed in BOTH branches, and "n/a" rather than "no" with the cable out. That wording is what
+        // lets `selfcheck` gate on a single assertion - `lacks 'lease    no'` - with no conditional:
+        // it passes when a lease is held AND when there is no link to get one on, and fails only in the
+        // case that is genuinely wrong, a live link with no lease. A machine without a cable is not a
+        // failing machine.
+        out.line(ctx, "lease    n/a (no link)");
         out.line(ctx, "dns      unresolved");
     }
     Ok(())

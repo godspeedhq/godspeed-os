@@ -515,3 +515,19 @@ delete /sc/a.txt
 assert fails read /sc/a.txt
 delete /sc recursive
 assert fails ls /sc
+
+# ---- network: RECEIVE must work, checked without sending anything ----------------------------
+#
+# A pure READ of state, so this honours the rule above that a check performs no network operation and
+# has no side effect: it asks `net` what already happened, it does not make anything happen.
+#
+# What it catches, and why it is here: a driver change stopped the receive channel being armed, so the
+# host transmitted normally and received nothing. DHCP got no offer, net-stack fell back to an address
+# the network does not route - and every other test in this suite still passed, all 351 of them,
+# because none of them touched the network. It was found by a human reading a log, twice, days apart.
+# A stack that cannot receive cannot get a lease. That is the whole check.
+#
+# ONE assertion, no conditional: `net` prints `lease n/a (no link)` with the cable out and
+# `lease yes (DHCP)` when configured, so `lacks 'lease    no'` passes both and fails only on a live
+# link with no lease - which is exactly the fault and nothing else.
+net | assert lacks 'lease    no'
