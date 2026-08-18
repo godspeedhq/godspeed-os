@@ -968,6 +968,20 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
         if deadline_cycles == 0 || ctx.read_tsc().wrapping_sub(t1) >= deadline_cycles {
             return None;
         }
+        // PACE THE POLL - the same fix `drain_scan` already carries, which this loop never got.
+        //
+        // Without it this is `loop { nic_req(..) }` for up to 900 ms: thousands of requests a second at
+        // `nic-driver` and, behind it, at the USB driver - the two services that have to FETCH the reply
+        // we are waiting for. Asking ten thousand times a second does not make the answer arrive sooner;
+        // it makes it arrive later, because the machinery that would produce it is busy answering us.
+        //
+        // The hardware said so plainly: successful replies come back in 13-30 ms, but a failing ping
+        // times out at 900 ms and its reply then lands ~110 ms later - about a second of delivery for a
+        // 15 ms round trip. Delivery was being starved by the polling that was waiting for it.
+        //
+        // `sleep` parks the task, so the core is free for the driver mid-fetch. 10 ms is one quantum:
+        // fast enough that a reply is picked up promptly, slow enough to leave the driver alone.
+        ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
     }
 }
 
