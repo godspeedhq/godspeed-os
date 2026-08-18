@@ -532,11 +532,30 @@ pub fn periodic_split_in(
     // and the old helper returned silently on timeout so lateness looked like success. The target is
     // absolute now, and failing to reach it skips this poll rather than proceeding as if it had.
     //
-    // Microframe 6 is skipped because its complete-splits would straddle the frame boundary and the
-    // translator's per-frame pipeline.
+    // THE START-SPLIT MUST LEAVE ROOM FOR ITS COMPLETE-SPLITS INSIDE THE SAME FRAME.
+    //
+    // A transaction translator runs the low-speed transaction in the frame the start-split scheduled it
+    // for, and holds the result in that frame's pipeline slot (USB 2.0 §11.18). The complete-splits at
+    // X+2, X+3, X+4 must therefore land in the same frame - a microframe number is 3 bits, so crossing
+    // from uf 7 to uf 0 is a new frame and a different slot, and the result that was waiting is gone.
+    //
+    // That leaves start microframes 0..3 and no others:
+    //
+    //   uf 0 -> complete at 2,3,4      uf 4 -> 6,7,0   crosses
+    //   uf 1 -> 3,4,5                  uf 5 -> 7,0,1   crosses
+    //   uf 2 -> 4,5,6                  uf 6 -> 0,1,2   crosses
+    //   uf 3 -> 5,6,7                  uf 7 -> 1,2,3   crosses
+    //
+    // The previous rule skipped only microframe 6, which is why the hardware traces show EVERY start
+    // split at uf 5: complete-splits at 7, then 0,1,2,3,4 in the next frame, all NYET, and finally
+    // XACTERR when the translator gave up on a transaction nobody collected from the right frame. 168
+    // start-splits, all ACKed, and not one completed - the placement was wrong, not the cadence.
     let mut f0 = (uframe_now(mmio) + 1) & 0x3FFF;
-    if f0 & 0x7 == 6 {
+    // Advance to the next microframe in 0..3. At most four steps (500 us), well inside the 10 ms poll.
+    let mut steps = 0;
+    while f0 & 0x7 > 3 && steps < 8 {
         f0 = (f0 + 1) & 0x3FFF;
+        steps += 1;
     }
     if let Uframe::Missed = wait_uframe_abs(ctx, mmio, f0) {
         if diag {
@@ -596,7 +615,11 @@ pub fn periodic_split_in(
         // A translator holds a completed periodic transaction for a few microframes, not indefinitely.
         // Past that, asking for it returns XACTERR and strands the TT - so abandon instead. One
         // keystroke period is the cost; a wedge and the recovery ladder is the alternative.
-        if uframe_now(mmio).wrapping_sub(cs_first) & 0x3FFF > 6 {
+        // STOP AT THE FRAME BOUNDARY, not after a fixed count. Past uf 7 the translator's slot for
+        // this frame is gone, so a further complete-split cannot find the data and only strands the
+        // TT - which is the XACTERR that used to end every one of these runs. `f0 & 7 <= 3` above
+        // guarantees at least three attempts before the boundary, which is what the spec allots.
+        if uframe_now(mmio) & 0x7 < f0 & 0x7 || uframe_now(mmio).wrapping_sub(cs_first) & 0x3FFF > 6 {
             return last;
         }
         let cs_uf = uframe_now(mmio) & 7;
