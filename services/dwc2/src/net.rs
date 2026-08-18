@@ -954,6 +954,31 @@ impl Nic {
     }
 }
 
+/// Stand the background bulk-IN down for a moment, so a PERIODIC transfer can have the bus.
+///
+/// The receive path arms a bulk IN and deliberately leaves it armed, because with BIR set the DWC2 core
+/// NAK-retries in hardware and an idle device produces no interrupts. What that costs is documented in
+/// `tx` and was measured there: those retries are real transactions, they fill the core's non-periodic
+/// request queue (`GNPTXSTS` read 0x18000100 - 256 FIFO words free and ZERO queue entries), and a
+/// transmit could not be scheduled at all until the IN stood aside.
+///
+/// The keyboard has the same problem and less tolerance for it. It is a low-speed device behind the
+/// LAN9514's transaction translator, so each poll is a SPLIT: an SSPLIT in one microframe and a CSPLIT
+/// two to four microframes later, and the CSPLIT must actually reach the wire inside that window or the
+/// TT has already discarded the result - which is reported as XACTERR, not as a NAK. A bus saturated
+/// with retried bulk INs is exactly how a CSPLIT misses its window.
+///
+/// So the keyboard poll gets the bus to itself for the ~500 us its split sequence takes. `rx` re-arms on
+/// its next pass, because `in_armed` is what it tests, and the device holds frames in its own FIFO
+/// meanwhile (which is why `RX_FIFO_INF` is non-zero while this happens). One round of receive latency
+/// for a keyboard that keeps working is the same trade `tx` already makes, and it is a good one.
+pub fn stand_down_in(mmio: &Mmio, nic: &mut Nic) {
+    if nic.in_armed {
+        chan::halt(mmio, CH_NET_RX);
+        nic.in_armed = false;
+    }
+}
+
 pub fn rx(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Nic,
 ) -> u32 {
