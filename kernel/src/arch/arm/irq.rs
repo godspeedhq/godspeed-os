@@ -124,6 +124,18 @@ struct HiRes {
     due: [u32; HIRES_MAX],
 }
 const HIRES_MAX: usize = 8;
+/// **Every hold of this lock MUST mask interrupts (`lock_irq`), because it is taken from BOTH task
+/// context and the IRQ handler.**
+///
+/// `hires_arm` / `hires_release` run in a syscall; `hires_fire` runs in the hi-res timer's own IRQ
+/// handler. With a plain `lock()` the hold is preemptible, so the timer could fire on the SAME core
+/// while that core held the lock - and a spinlock is not reentrant, so the handler spun on a lock its
+/// own core owned, forever. The core kept taking interrupts (the count climbed) and made no progress,
+/// which is exactly what the liveness watchdog reported before the lock watchdog named the address.
+///
+/// It survived 1754 rounds of chaos before the window was hit; a race this narrow is found by soak or
+/// not at all. `log.rs` states the same contract for the kernel ring buffer, and `ipc/routing.rs`
+/// follows it - this table simply never did.
 static HIRES: crate::smp::spinlock::SpinLock<HiRes> =
     crate::smp::spinlock::SpinLock::new(HiRes { slot: [u32::MAX; HIRES_MAX], due: [0; HIRES_MAX] });
 
@@ -196,7 +208,7 @@ pub enum Armed {
 
 /// Register `slot` to wake in `us` microseconds.
 pub fn hires_arm(slot: u32, us: u32) -> Armed {
-    let mut q = HIRES.lock();
+    let mut q = HIRES.lock_irq();
     let free = (0..HIRES_MAX).find(|&i| q.slot[i] == u32::MAX);
     let i = match free {
         Some(i) => i,
@@ -233,7 +245,7 @@ pub fn hires_arm(slot: u32, us: u32) -> Armed {
 
 /// Drop `slot` from the table (on wake, or on any early exit).
 pub fn hires_release(slot: u32) {
-    let mut q = HIRES.lock();
+    let mut q = HIRES.lock_irq();
     for i in 0..HIRES_MAX {
         if q.slot[i] == slot {
             q.slot[i] = u32::MAX;
@@ -247,7 +259,9 @@ fn hires_fire() -> bool {
     HR_IRQ.fetch_add(1, Ordering::Relaxed);
     let mut woken = [u32::MAX; HIRES_MAX];
     {
-        let mut q = HIRES.lock();
+        // `lock_irq` in the handler too: interrupts are already masked here, so this costs nothing,
+        // and it keeps every hold of this lock uniform rather than relying on where it is called from.
+        let mut q = HIRES.lock_irq();
         let now = super::timer::systimer_lo();
         for i in 0..HIRES_MAX {
             if q.slot[i] != u32::MAX && reached(now, q.due[i]) {

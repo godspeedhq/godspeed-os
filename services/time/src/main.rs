@@ -283,6 +283,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut store_left = 0u32;                    // writes still owed (0 = nothing to persist)
     let mut store_epoch = 0i64;                   // the value those writes are for
     let mut tries_left = 15u32;                   // ~30 s of asking, then stop
+    let mut no_cap: u32 = 0;                      // capless messages seen (a flood, usually)
     loop {
         // Wake on a timer only while there is still housekeeping OUTSTANDING - a floor to read, or a
         // floor to write that has not been acknowledged. Once both are settled this is a plain blocking
@@ -350,7 +351,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             }
                         }
                     }
-                    _ => ctx.log("time: request had no reply cap - dropping (cannot answer without one)"),
+                    _ => {
+                        // RATE-LIMITED, because the sender chooses how often this happens.
+                        //
+                        // A message with no reply cap is what a flood looks like (`chaos flood-storm`
+                        // sends exactly that), and this logged one line per message: 839 of them in a
+                        // single overnight run. On this port a serial write is an un-preemptible
+                        // syscall of roughly 9 ms per line, so that is ~7 s of the core spent
+                        // announcing that someone is shouting at us - the report becoming a bigger
+                        // problem than the thing reported.
+                        //
+                        // Still LOUD (invariant 12), just not once per event: the first few say it is
+                        // happening, then a running count at widening intervals says it still is.
+                        no_cap = no_cap.saturating_add(1);
+                        if no_cap <= 3 || no_cap % 1000 == 0 {
+                            ctx.log_fmt(format_args!(
+                                "time: {} request(s) with no reply cap - dropping (cannot answer without one)",
+                                no_cap));
+                        }
+                    }
                 }
                 continue;
             }
