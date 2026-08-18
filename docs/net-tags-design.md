@@ -1,6 +1,9 @@
 # Design Spec: Correlation Tags Between net-stack and nic-driver
 
-> **Status:** Direction agreed (2026-08-11), **not built**. Written after the idle-link tick was
+> **Status:** Direction agreed (2026-08-11). **Partly addressed 2026-08-18 WITHOUT the wire change;
+> the tag itself is still not built.** See §6 for exactly what was done and what that leaves.
+>
+> Original status: not built. Written after the idle-link tick was
 > reverted (`aa569bcc`) for the bug this fixes. Three phases, each independently testable; do them in
 > order and verify on hardware between each.
 >
@@ -158,3 +161,41 @@ Per phase, on hardware (QEMU cannot reproduce the Pi 4's NIC):
   Read `services/fs/src/main.rs` and the shell's `drain_stale_fs_replies` before designing the stash.
 - The tag proves a reply is *for this request*. It does not prove the reply is *correct* - keep the
   existing length and shape checks on every parse.
+
+---
+
+## 6. What was done on 2026-08-18, and what it does not cover
+
+**The failure that forced it.** `learn_our_mac` read a link-status reply, found zeros where a MAC should
+be, and net-stack reported "no NIC MAC yet (driver absent/not ready)" for two minutes while the driver
+was up and had logged the MAC at boot. Every request after the first timeout was being answered with the
+PREVIOUS request's answer - the same one-out-of-step desync `fs` had, arriving here exactly as §1
+predicted.
+
+**What was implemented.** `nic_req` now DRAINS the receive queue before it sends. net-stack has at most
+one driver request outstanding, so clearing the channel first makes the next capless message
+unambiguously the answer to the question just asked. Messages found during the drain are separated by a
+distinction the protocol already makes rather than a new one: a **client request carries a reply cap, a
+driver reply does not**. A stale driver reply is discarded; a client request is dropped WITH ITS CAP
+RECLAIMED, which is this spec's own phase-2 behaviour ("a mis-served client with a corrupt reply becomes
+a client that times out and retries").
+
+**Why not the tag, given the spec says to build it.** The tag is 40 edit points across
+`nic-driver/src/main.rs` (3 receive loops, 14 payload reads, 18 reply sends) and `genet.rs` (5 more).
+This spec says a wrong shift "shows up as a plausible-looking wrong value, not a crash - the exact
+failure that is cheap to find one op at a time and expensive to find after six", and says to verify on
+hardware between each. Doing all 40 in one pass, on a branch under active hardware test, is the thing
+this document warns against. The drain fixes the observed defect with no wire change and no off-by-one
+surface.
+
+**What the drain does NOT cover, and why the tag is still owed:**
+- It assumes ONE outstanding driver request. That is true today and nothing enforces it - the tag would.
+- A reply that arrives DURING our await, belonging to a request whose deadline has already passed, is
+  still taken as ours. The drain closes the window between requests, not inside one.
+- It cannot support net-stack doing background work while a client is active (§4), because a client
+  request met during a driver await is dropped rather than stashed. That is phase 3 and it needs the
+  stash to be owned by the serve loop, which means threading it through the sixteen `nic_req` call
+  sites - the reason it is not done here.
+
+So §4's list is still blocked, and the phases below are still the plan. This is a narrowing of the bug,
+not its removal.

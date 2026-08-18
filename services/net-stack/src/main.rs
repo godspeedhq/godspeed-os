@@ -88,6 +88,34 @@ const PING_MAX_PAYLOAD: usize = 1024;
 /// reply is `request_with_reply` under the hood, a driver that dies mid-request wakes us with
 /// `ReplyDead` (never a hang), and the reacquire fixes a *stale* cap the fast-fail send exposes.
 fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
+    // DISCARD ANY STALE DRIVER REPLY BEFORE ASKING AGAIN.
+    //
+    // This is the fix for a failure that reads as a hardware fault and is not one. When a previous
+    // `nic_req` times out, its reply is not cancelled - the driver still answers, and that answer
+    // arrives later, unread. The next request then takes it as ITS reply, one question out of step,
+    // forever. On hardware that appeared as `learn_our_mac` reading a link-status reply, finding zeros
+    // where a MAC should be, and net-stack declaring "no NIC MAC yet (driver absent/not ready)" while
+    // the driver was up and had reported the MAC minutes earlier. Every request after it was answered
+    // with the previous request's answer.
+    //
+    // `fs` had exactly this desync and fixed it with a correlation byte (`project_fs_reply_correlation`);
+    // the same design for this path is `docs/net-tags-design.md`, and it remains the durable answer.
+    // What this does is narrower and needs no wire change: net-stack has at most ONE driver request
+    // outstanding, so clearing the channel first makes the next capless message unambiguously ours.
+    //
+    // A driver reply carries NO reply cap; a client request does. That is what tells them apart here,
+    // and it is a distinction the protocol already makes rather than one being invented.
+    while let Some(stale) = ctx.try_recv() {
+        match ctx.take_pending_cap() {
+            // A CLIENT request, not a stale reply. Dropping it is deliberate and is the documented
+            // phase-2 behaviour: the client times out and retries, which is defined, loud and
+            // recoverable - where consuming it as a driver reply corrupts BOTH sides silently. Its cap
+            // is reclaimed so a dropped request cannot leak a table slot (§8.5).
+            Some(cap) => ctx.remove_cap(cap),
+            None => {}   // a stale driver reply: exactly what we came to clear
+        }
+        let _ = stale;
+    }
     match ctx.request_with_reply_deadline_outcome("nic-driver", msg, secs) {
         DeadlineOutcome::Reply(r) => Some(r),
         // The send never left - nic-driver's cap is stale (it was killed + respawned). Reacquire it by
