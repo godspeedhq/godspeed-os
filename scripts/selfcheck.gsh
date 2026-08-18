@@ -527,7 +527,13 @@ assert fails ls /sc
 # because none of them touched the network. It was found by a human reading a log, twice, days apart.
 # A stack that cannot receive cannot get a lease. That is the whole check.
 #
-# ONE assertion, no conditional: `net` prints `lease n/a (no link)` with the cable out and
-# `lease yes (DHCP)` when configured, so `lacks 'lease    no'` passes both and fails only on a live
-# link with no lease - which is exactly the fault and nothing else.
-net | assert lacks 'lease    no'
+# ONE assertion, no conditional, and stated POSITIVELY - which matters more than it looks. The first
+# version asserted `lacks 'lease    no'`, and on hardware it passed while the network was in exactly the
+# state it was meant to catch: `net` had not replied yet, printed nothing but "waiting for a reply", and
+# an absence assertion is satisfied by absence. A check that passes when nothing happened is not a check.
+#
+# So both ACCEPTABLE outcomes print the same token - `lease    ok (DHCP)` and
+# `lease    ok (no link - nothing to lease)` - and the failing one prints `lease    NONE`. Requiring the
+# token to be PRESENT fails on a live link with no lease AND on a net-stack that does not answer, which
+# are both real faults, and cannot pass on silence.
+net | assert contains 'lease    ok'

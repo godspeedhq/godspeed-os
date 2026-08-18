@@ -72,10 +72,10 @@ pub struct Nic {
     ///
     /// Bounded and stack-resident (no heap, 26.6.1); a full queue counts `stats.rx_dropped` rather than
     /// losing frames quietly.
-    pub rxq: [[u8; FRAME_MAX]; RXQ_DEPTH],
-    pub rxq_len: [u16; RXQ_DEPTH],
-    pub rxq_head: usize,
-    pub rxq_count: usize,
+    pub rxbuf: [u8; RXQ_BYTES],
+    pub rxbuf_fill: usize,   // bytes written by the current burst
+    pub rxbuf_pos: usize,    // read cursor into those bytes
+    pub rxq_count: usize,    // frames still waiting to be collected
     /// Is a bulk-IN currently armed on CH_NET, waiting for the device to have a frame?
     pub in_armed: bool,
     pub pid_in: u32,
@@ -294,7 +294,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
     // Link starts DOWN and unstamped: the first transmit reads the PHY instead of assuming a
     // cable is there. Assuming UP is how a driver spends a full budget per frame proving otherwise.
     Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(),
-               rxq: [[0u8; FRAME_MAX]; RXQ_DEPTH], rxq_len: [0; RXQ_DEPTH], rxq_head: 0, rxq_count: 0,
+               rxbuf: [0u8; RXQ_BYTES], rxbuf_fill: 0, rxbuf_pos: 0, rxq_count: 0,
                in_armed: false,
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
                link_up: false, link_at: 0,
@@ -686,20 +686,26 @@ pub const RX_OFF: usize = 0x3000;
 // these crates can both name. Recorded rather than pretended away.
 pub const FRAME_MAX: usize = 1600;
 
-/// How many received frames may wait for the client to collect them.
+/// Bytes held for the client to collect, sized to ONE BURST so it cannot overflow.
 ///
-/// **Sixteen, measured rather than guessed.** The first version was four, on the reasoning that a burst
-/// carries "two or three" frames. Hardware disagreed immediately: 62 frames arrived in 24 bursts and the
-/// counter this queue reports showed **32 frames dropped** - a third of everything received, thrown away
-/// for want of somewhere to put it, and indistinguishable from network loss at the ping prompt.
+/// **Twice I sized this as a COUNT of frames and twice hardware disproved the count.** Four, on the
+/// reasoning that a burst carries "two or three": 62 frames arrived in 24 bursts and 32 were dropped.
+/// Sixteen, "with room to spare": 43 frames arrived in 7 bursts - six per burst - and 9 were dropped,
+/// which came out as ping loss again. The mistake was not the number. It was storing frames in a fixed
+/// number of MAX-SIZED slots when what actually arrives is a fixed number of BYTES.
 ///
-/// These are small frames (ICMP replies and ARP, ~100 bytes each), so a single burst can hold a lot of
-/// them. Sixteen covers what has been seen with room to spare, at 25 KiB of a 256 KiB stack.
+/// A burst is `RX_BURST` bytes, so frames back-to-back with a two-byte length each cannot exceed
+/// `RX_BURST` plus that overhead - and the smallest possible frame bounds the overhead at 2 bytes per
+/// ~60, so 256 is generous. Sized this way the buffer holds ANY burst by construction: no count to get
+/// wrong, and `rx_dropped` becomes a counter that should now never move.
 ///
-/// Still deliberately NOT a buffer for a slow client: it is sized to one BURST, not to a backlog. A
-/// client that stops collecting should see loss, loudly counted in `rx_dropped`, rather than have the
-/// driver grow without limit to hide it (26.6).
-pub const RXQ_DEPTH: usize = 16;
+/// It is also SMALLER: about 4 KiB, where a slot array covering the same worst case (a burst of minimum
+/// frames, ~60 of them) would be 93 KiB of a 256 KiB stack. This is 26.6.1 exactly - the fix for a
+/// working set that will not fit is to change its shape, not to grow the allocation.
+///
+/// Still sized to one BURST, not to a backlog: a client that stops collecting must see loss, counted,
+/// rather than have the driver grow to hide it.
+pub const RXQ_BYTES: usize = RX_BURST + 256;
 /// One IN transfer can carry SEVERAL frames, so the receive burst is larger than one frame.
 pub const RX_BURST: usize = 4096;   // 8 x 512, matching SMSC_BURST_PKTS and the kernel driver
 const _: () = assert!(TX_OFF >= crate::msc::DATA_OFF + crate::msc::DATA_MAX);
@@ -927,29 +933,41 @@ pub fn tx(
 /// Returns the number of frames delivered. Zero is the ordinary answer on a quiet network and is not
 /// a failure.
 impl Nic {
-    /// Append a frame to the receive queue. A full queue counts the loss instead of hiding it.
+    /// Append a frame, stored as `[len:u16 LE][bytes]`. Sized to a whole burst, so the overflow arm
+    /// should never run - it counts rather than hides if it ever does.
     pub fn rxq_push(&mut self, f: &[u8]) {
-        if self.rxq_count >= RXQ_DEPTH {
+        let n = f.len().min(FRAME_MAX);
+        if self.rxbuf_fill + 2 + n > RXQ_BYTES {
             self.stats.rx_dropped = self.stats.rx_dropped.saturating_add(1);
             return;
         }
-        let slot = (self.rxq_head + self.rxq_count) % RXQ_DEPTH;
-        let n = f.len().min(FRAME_MAX);
-        self.rxq[slot][..n].copy_from_slice(&f[..n]);
-        self.rxq_len[slot] = n as u16;
+        let at = self.rxbuf_fill;
+        self.rxbuf[at] = (n & 0xFF) as u8;
+        self.rxbuf[at + 1] = ((n >> 8) & 0xFF) as u8;
+        self.rxbuf[at + 2..at + 2 + n].copy_from_slice(&f[..n]);
+        self.rxbuf_fill = at + 2 + n;
         self.rxq_count += 1;
     }
 
     /// Copy the oldest queued frame into `out` and remove it. Returns its length, 0 if empty.
+    ///
+    /// Emptying resets the cursor, which is what lets the next burst reuse the whole buffer - `rx` is
+    /// only called when nothing is queued, so exactly one burst is ever resident.
     pub fn rxq_pop(&mut self, out: &mut [u8]) -> usize {
         if self.rxq_count == 0 {
+            self.rxbuf_pos = 0;
+            self.rxbuf_fill = 0;
             return 0;
         }
-        let slot = self.rxq_head;
-        let n = (self.rxq_len[slot] as usize).min(out.len());
-        out[..n].copy_from_slice(&self.rxq[slot][..n]);
-        self.rxq_head = (self.rxq_head + 1) % RXQ_DEPTH;
+        let at = self.rxbuf_pos;
+        let n = ((self.rxbuf[at] as usize) | ((self.rxbuf[at + 1] as usize) << 8)).min(out.len());
+        out[..n].copy_from_slice(&self.rxbuf[at + 2..at + 2 + n]);
+        self.rxbuf_pos = at + 2 + n;
         self.rxq_count -= 1;
+        if self.rxq_count == 0 {
+            self.rxbuf_pos = 0;
+            self.rxbuf_fill = 0;
+        }
         n
     }
 }
