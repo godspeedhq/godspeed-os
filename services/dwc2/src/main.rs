@@ -845,8 +845,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     let s = &n.stats;
                     (s.tx_ok, s.tx_fail, s.rx_bursts, s.rx_bytes, s.rx_frames, s.rx_bad, s.rx_hcint, s.rx_nohalt, s.bmsr, s.rx_fifo, s.int_sts,
                      n.tx_hcint, n.tx_nohalt, n.tx_fail_run, n.tx_nptxsts, n.tx_fifo_free,
-                     s.rx_dropped, n.rxq_count as u32)
-                }).unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+                     s.rx_dropped, n.rxq_count as u32, s.rx_unicast, s.rx_bcast, s.rx_other)
+                }).unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
                 // RE-MEASURE ONCE, QUIET. The boot-time sweep runs while the console is saturated,
                 // and a serial write is an un-preemptible syscall of ~9 ms per log line - which is
                 // the mean it reported. One repeat on a settled system separates "the timer is slow"
@@ -910,6 +910,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.log_fmt(format_args!(
                     "dwc2-svc: net IN HCINT=0x{:08x} nohalt {} BMSR=0x{:04x} RX_FIFO=0x{:08x} INT_STS=0x{:08x}",
                     ns.6, ns.7, ns.8, ns.9, ns.10));
+                // HOW THE RECEIVED FRAMES WERE ADDRESSED. A count of zero in the first column, with the
+                // second climbing, is a port that receives broadcast and nothing else - which is a
+                // device-filter fault, and reads identically to a network where no host answers.
+                ctx.log_fmt(format_args!(
+                    "dwc2-svc: net RX addressing - {} to us, {} broadcast, {} other (multicast)",
+                    ns.18, ns.19, ns.20));
             }
             // DO NOT SLEEP WHEN THERE WAS WORK. This is the whole of the throughput problem.
             //

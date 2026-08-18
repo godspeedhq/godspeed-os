@@ -210,7 +210,7 @@ fn drain_scan(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8]) -
 /// Broadcast, not unicast to the server, and deliberately: at this point we still do not own the
 /// address, so we cannot yet source packets from it, and the other DHCP servers on the segment need
 /// to see that their offers were declined.
-fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8; 4]) -> bool {
+fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8; 4], bcast: bool) -> bool {
     // SIZED FOR ITS OWN OPTIONS. The DISCOVER's frame is 286 bytes because its option block is four
     // bytes (type + end). A REQUEST carries three options - message type (3), requested address (6),
     // server identifier (6) - plus the end byte: sixteen. Reusing 286 here wrote past the array on the
@@ -247,7 +247,7 @@ fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8
     // The SAME xid as the DISCOVER: a REQUEST continues that transaction, and a server matches it by
     // this field. A fresh xid here reads as an unrelated client and is ignored.
     frame[46] = 0x39; frame[47] = 0x03; frame[48] = 0xf3; frame[49] = 0x26;
-    frame[52] = 0x80;                                    // broadcast: we still have no address
+    frame[52] = if bcast { 0x80 } else { 0x00 };         // see `dhcp_lease`
     frame[70..76].copy_from_slice(our_mac);
     frame[278] = 0x63; frame[279] = 0x82; frame[280] = 0x53; frame[281] = 0x63;
     let mut o = 282usize;
@@ -304,7 +304,40 @@ fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8
     false
 }
 
-fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
+/// Get a lease, asking for a UNICAST reply first and falling back to broadcast only if that fails.
+///
+/// The BOOTP flags word has one meaningful bit: set it and the server must answer by broadcast, clear it
+/// and the server answers by unicast to our MAC. This client set it unconditionally, on both the DISCOVER
+/// and the REQUEST, and that turned out to be hiding a fault rather than avoiding one.
+///
+/// RFC 2131 4.4.1 says to set the bit only when the client cannot receive a unicast datagram before its
+/// address is configured. Ours can: the reply is matched on the BOOTP reply opcode, not on the
+/// destination IP, so the frame is usable whatever address it was sent to. So the normal client
+/// behaviour - and the one that tells us something - is to leave it clear.
+///
+/// WHY IT MATTERS HERE. DHCP is the first exchange the machine completes and the only one it needs to
+/// reach the network at all, so it is where a broken receive path should show first. Asking for a
+/// broadcast reply made it the one exchange that could NOT show it: on this board DHCP succeeded while
+/// every unicast exchange failed - ARP never resolved, ping always timed out - because every frame the
+/// port had ever received was broadcast. The lease made the network look present and left the actual
+/// failure to surface three layers up as "request timed out". A test that cannot fail is not a test.
+///
+/// So: unicast first. If that gets no offer and broadcast does, the difference is not a network problem,
+/// it is this port refusing frames addressed to itself, and the fallback SAYS SO rather than quietly
+/// restoring service and leaving the fault to be rediscovered. The fallback exists because losing the
+/// network is not an acceptable price for the diagnosis - but a fallback nobody is told about is the
+/// silent kind this system does not allow.
+fn dhcp_lease(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
+    if let Some(cfg) = dhcp_discover(ctx, our_mac, false) {
+        return Some(cfg);
+    }
+    ctx.log("net-stack: DHCP got no reply addressed to us - retrying and asking the server to broadcast");
+    let cfg = dhcp_discover(ctx, our_mac, true)?;
+    ctx.log("net-stack: DHCP succeeded ONLY with a broadcast reply - this port is not receiving frames              addressed to its own MAC, so ARP and ping cannot work until that is fixed");
+    Some(cfg)
+}
+
+fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6], bcast: bool) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
     // Ethernet(14) + IPv4(20) + UDP(8) + DHCP/BOOTP(244) = 286 bytes.
     let mut frame = [0u8; 286];
     for b in frame[0..6].iter_mut() { *b = 0xff; }       // eth dest = broadcast
@@ -329,7 +362,7 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u
     frame[43] = 1;                                       // htype = Ethernet
     frame[44] = 6;                                       // hlen
     frame[46] = 0x39; frame[47] = 0x03; frame[48] = 0xf3; frame[49] = 0x26; // xid (arbitrary)
-    frame[52] = 0x80;                                    // flags = broadcast (OFFER comes back broadcast)
+    frame[52] = if bcast { 0x80 } else { 0x00 };         // see `dhcp_lease`
     frame[70..76].copy_from_slice(our_mac);              // chaddr (client hardware address)
     frame[278] = 0x63; frame[279] = 0x82; frame[280] = 0x53; frame[281] = 0x63; // DHCP magic cookie
     frame[282] = 53; frame[283] = 1; frame[284] = 1;     // option 53 (message type) = DISCOVER
@@ -406,7 +439,7 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u
             // it, will not route for it, and re-offers a FRESH address on the next DISCOVER. That is
             // exactly what the Pi 2 shows - .66, then .67, then .70, each one used briefly and never
             // owned, with the gateway silent to every ARP.
-            if dhcp_request(ctx, our_mac, &ip, &srv) {
+            if dhcp_request(ctx, our_mac, &ip, &srv, bcast) {
                 return Some((ip, gw, dns));
             }
             // No ACK: the address is NOT ours, and using it anyway is what produced the silent
@@ -1107,7 +1140,7 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
     // ---- Phase 3: DHCP FIRST, so net-stack LEARNS its own IP (self-configuring). Falls back to a default
     // only if there is no NIC / no offer (nic-driver serves empty replies). The IP it returns is the one
     // ARP + ICMP use below.
-    let leased_cfg = dhcp_discover(ctx, &our_mac);
+    let leased_cfg = dhcp_lease(ctx, &our_mac);
     let leased = leased_cfg.is_some();
     let (our_ip, gateway, dns_server) = leased_cfg.unwrap_or((FALLBACK_IP, GATEWAY_IP, GATEWAY_IP));
 

@@ -33,6 +33,21 @@ pub struct Stats {
     /// Frames parsed out of a burst but never delivered because the receive queue was full. The honest
     /// name for packet loss inside this driver, and the reason the queue below is not a silent buffer.
     pub rx_dropped: u32,
+    /// HOW EACH FRAME WAS ADDRESSED: to this station, to broadcast, or to neither (multicast).
+    ///
+    /// These exist because "no network" hid a question nobody could answer: has this port EVER received
+    /// a frame addressed to it? Everything that worked on this board - DHCP, and other hosts' ARP
+    /// requests - is broadcast, and everything that did not - ARP replies, ICMP echo replies - is
+    /// unicast. Those are two different capabilities and the logs could not tell them apart, so a
+    /// receive path that accepts only broadcast looks exactly like a network where nothing answers.
+    ///
+    /// Counted HERE, in the driver, and not in the stack above it: this is where the frame comes off
+    /// the wire, before anything interprets it, and `mac` below is the same value written into the
+    /// device's unicast filter - so the classification is made against the address the hardware is
+    /// actually matching on, not against a copy of it learned over IPC.
+    pub rx_unicast: u32,
+    pub rx_bcast:   u32,
+    pub rx_other:   u32,
     /// HCINT from the LAST bulk-IN that did not complete, plus how many times the channel never
     /// halted at all. The controller writes down why every transfer ended; discarding that and
     /// guessing is what turns a five-minute diagnosis into an afternoon. 0 with a non-zero
@@ -1117,6 +1132,16 @@ pub fn rx(
         let n = flen - 4; // strip the FCS; the stack does not want it
         for i in 0..n.min(FRAME_MAX) {
             buf[i] = dma.read8(RX_OFF + pos + i);
+        }
+        // Classify by destination address before the frame goes anywhere. See `Stats::rx_unicast`.
+        if n >= 6 {
+            if buf[..6] == nic.mac[..] {
+                nic.stats.rx_unicast += 1;
+            } else if buf[..6] == [0xFF; 6] {
+                nic.stats.rx_bcast += 1;
+            } else {
+                nic.stats.rx_other += 1;
+            }
         }
         // Straight into the receive queue. `rx` already holds `&mut Nic`, so there is no reason to
         // hand the frame out through a closure and copy it into a staging array first - and the
