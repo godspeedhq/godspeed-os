@@ -87,35 +87,36 @@ const PING_MAX_PAYLOAD: usize = 1024;
 /// after a driver restart on the ping/net/dns/arp surface - it needs a manual `net renew`. Because the
 /// reply is `request_with_reply` under the hood, a driver that dies mid-request wakes us with
 /// `ReplyDead` (never a hang), and the reacquire fixes a *stale* cap the fast-fail send exposes.
-fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
-    // DISCARD ANY STALE DRIVER REPLY BEFORE ASKING AGAIN.
-    //
-    // This is the fix for a failure that reads as a hardware fault and is not one. When a previous
-    // `nic_req` times out, its reply is not cancelled - the driver still answers, and that answer
-    // arrives later, unread. The next request then takes it as ITS reply, one question out of step,
-    // forever. On hardware that appeared as `learn_our_mac` reading a link-status reply, finding zeros
-    // where a MAC should be, and net-stack declaring "no NIC MAC yet (driver absent/not ready)" while
-    // the driver was up and had reported the MAC minutes earlier. Every request after it was answered
-    // with the previous request's answer.
-    //
-    // `fs` had exactly this desync and fixed it with a correlation byte (`project_fs_reply_correlation`);
-    // the same design for this path is `docs/net-tags-design.md`, and it remains the durable answer.
-    // What this does is narrower and needs no wire change: net-stack has at most ONE driver request
-    // outstanding, so clearing the channel first makes the next capless message unambiguously ours.
-    //
-    // A driver reply carries NO reply cap; a client request does. That is what tells them apart here,
-    // and it is a distinction the protocol already makes rather than one being invented.
-    while let Some(stale) = ctx.try_recv() {
-        match ctx.take_pending_cap() {
-            // A CLIENT request, not a stale reply. Dropping it is deliberate and is the documented
-            // phase-2 behaviour: the client times out and retries, which is defined, loud and
-            // recoverable - where consuming it as a driver reply corrupts BOTH sides silently. Its cap
-            // is reclaimed so a dropped request cannot leak a table slot (§8.5).
-            Some(cap) => ctx.remove_cap(cap),
-            None => {}   // a stale driver reply: exactly what we came to clear
+/// A STATUS query (op 3: MAC + link), with the receive channel cleared first.
+///
+/// Only status queries do this, and the distinction matters. When a `nic_req` times out its reply is
+/// not cancelled - the driver still answers, and that answer arrives later, unread, so the NEXT request
+/// takes it as its own and every request after that is one question out of step. On hardware that
+/// showed as `learn_our_mac` reading a link-status reply, finding zeros where a MAC should be, and
+/// net-stack reporting "no NIC MAC yet (driver absent/not ready)" while the driver was up and had
+/// logged the MAC at boot.
+///
+/// **Why not on every request.** A driver reply to op 9 CARRIES RECEIVED FRAMES. Discarding one to
+/// clear the channel throws away packets - which is what happened when this drain sat in the shared
+/// `nic_req`: DHCP completed (OFFER, then ACK, the lease is ours) and the very next step, ARP for the
+/// gateway, got no reply, because the batch holding it had been drained as "stale". The desync is worth
+/// clearing; the frames are not worth losing. So the clear is confined to the query whose answer is
+/// pure state and whose loss costs nothing.
+///
+/// A client request carries a reply cap; a driver reply does not. That is what separates them here -
+/// a distinction the protocol already makes. A client request met during the clear is dropped with its
+/// cap reclaimed (§8.5), which is `docs/net-tags-design.md` phase-2 behaviour: it times out and retries,
+/// which is defined and recoverable, where consuming it corrupts both sides silently.
+fn nic_status_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
+    while ctx.try_recv().is_some() {
+        if let Some(cap) = ctx.take_pending_cap() {
+            ctx.remove_cap(cap);
         }
-        let _ = stale;
     }
+    nic_req(ctx, msg, secs)
+}
+
+fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
     match ctx.request_with_reply_deadline_outcome("nic-driver", msg, secs) {
         DeadlineOutcome::Reply(r) => Some(r),
         // The send never left - nic-driver's cap is stale (it was killed + respawned). Reacquire it by
@@ -1053,7 +1054,7 @@ struct NetState {
 /// it, and every frame we build advertises it. `None` on a short/zero reply = no NIC (or driver not up
 /// yet) -> the caller stays unconfigured and retries via the auto-config-on-link path.
 fn learn_our_mac(ctx: &ServiceContext) -> Option<[u8; 6]> {
-    let r = nic_req(ctx, &Message::from_bytes(&[3u8]), LINK_SECS)?;
+    let r = nic_status_req(ctx, &Message::from_bytes(&[3u8]), LINK_SECS)?;
     let p = r.payload_bytes();
     if p.len() < 7 { return None; }
     let mut mac = [0u8; 6];
@@ -1192,7 +1193,7 @@ fn link_notify(ctx: &ServiceContext, msg: &str) {
 }
 
 fn link_is_up(ctx: &ServiceContext) -> bool {
-    match nic_req(ctx, &Message::from_bytes(&[3u8]), LINK_SECS) {
+    match nic_status_req(ctx, &Message::from_bytes(&[3u8]), LINK_SECS) {
         Some(r) => { let p = r.payload_bytes(); if p.len() > 7 { p[7] != 0 } else { !p.is_empty() } }
         None    => false,
     }
