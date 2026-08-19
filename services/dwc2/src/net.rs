@@ -1224,18 +1224,17 @@ pub fn rx(
         nic.in_stuck = nic.in_stuck.saturating_add(1);
         if nic.in_stuck == 40 && nic.in_stuck_logs < 4 {
             nic.in_stuck_logs += 1;
-            // `smsc_read_or0` FABRICATES ZERO on a failed transfer, so it cannot be used here: the
-            // whole question is whether the device holds data, and "empty" and "the read did not
-            // happen" would both print as 0. That is the same silent fallback that once made a dead
-            // MDIO read as a confident "link down". Ask the fallible reader and say which it was.
-            let fifo = smsc_read(ctx, mmio, dma, t, SMSC_RX_FIFO_INF);
+            // MMIO ONLY, DELIBERATELY. This used to also read the device's RX_FIFO_INF, which was the
+            // measurement that identified the toggle error - but that is a USB CONTROL TRANSFER issued
+            // from inside the receive path, and a control transfer here can disturb a parked storage
+            // transfer that owns the shared channel. It was worth the risk while it was answering a
+            // question; it is not worth carrying now that the answer is in. These reads touch only the
+            // controller's own registers and cannot perturb anything.
+            let nptxsts = mmio.read32(crate::regs::GNPTXSTS);
             ctx.log_fmt(format_args!(
-                "dwc2-svc: IN outstanding for {} polls - HCCHAR={:#010x} HCINT={:#010x} HCTSIZ={:#010x} GNPTXSTS={:#010x} (qfree {}) RX_FIFO_INF={}",
+                "dwc2-svc: IN outstanding for {} polls - HCCHAR={:#010x} HCINT={:#010x} HCTSIZ={:#010x} GNPTXSTS={:#010x} (qfree {})",
                 nic.in_stuck, hcchar, hcint,
-                mmio.read32(chan::hctsiz_at(CH_NET_RX)),
-                mmio.read32(crate::regs::GNPTXSTS),
-                (mmio.read32(crate::regs::GNPTXSTS) >> 16) & 0xFF,
-                match fifo { Some(v) => v as i64, None => -1 }));
+                mmio.read32(chan::hctsiz_at(CH_NET_RX)), nptxsts, (nptxsts >> 16) & 0xFF));
         }
         return 0;
     }
