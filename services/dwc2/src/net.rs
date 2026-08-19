@@ -69,6 +69,8 @@ pub struct Stats {
     /// popped ~= parsed means this driver did its job and the loss is above it; popped << parsed means
     /// the loss is here, in the one-frame-per-request drain.
     pub rx_popped: u32,
+    /// Times the armed bulk-IN was found wedged and re-armed. See `RX_STUCK_POLLS`.
+    pub rx_rearms: u32,
     /// HCINT from the LAST bulk-IN that did not complete, plus how many times the channel never
     /// halted at all. The controller writes down why every transfer ended; discarding that and
     /// guessing is what turns a five-minute diagnosis into an afternoon. 0 with a non-zero
@@ -114,6 +116,8 @@ pub struct Nic {
     pub rxq_count: usize,    // frames still waiting to be collected
     /// Is a bulk-IN currently armed on CH_NET, waiting for the device to have a frame?
     pub in_armed: bool,
+    /// Consecutive polls that found the armed IN still enabled and not complete. See `RX_STUCK_POLLS`.
+    pub in_stuck: u32,
     pub pid_in: u32,
     pub pid_out: u32,
     /// Cached PHY link state, and when it was read.
@@ -332,6 +336,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
     Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(),
                rxbuf: [0u8; RXQ_BYTES], rxbuf_fill: 0, rxbuf_pos: 0, rxq_count: 0,
                in_armed: false,
+               in_stuck: 0,
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
                link_up: false, link_at: 0,
                tx_fail_run: 0, tx_backoff_at: 0, tx_hcint: 0, tx_nohalt: 0, tx_nptxsts: 0,
@@ -806,6 +811,14 @@ pub const FRAME_MAX: usize = 1600;
 /// rather than have the driver grow to hide it.
 pub const RXQ_BYTES: usize = RX_BURST + 256;
 /// One IN transfer can carry SEVERAL frames, so the receive burst is larger than one frame.
+/// Consecutive "still enabled, not complete" polls before the armed IN is treated as wedged.
+///
+/// A real completion arrives within a poll or two: a ping reply that works is delivered in 15-25 ms and
+/// these polls run about 10 ms apart. A wedged channel sat for 309 of them. Eight is far outside the
+/// working range and far inside the broken one, so a quiet link is never disturbed and a stuck one is
+/// freed in under a tenth of a second instead of waiting for the next transmit to do it by accident.
+pub const RX_STUCK_POLLS: u32 = 8;
+
 pub const RX_BURST: usize = 4096;   // 8 x 512, matching SMSC_BURST_PKTS and the kernel driver
 const _: () = assert!(TX_OFF >= crate::msc::DATA_OFF + crate::msc::DATA_MAX);
 const _: () = assert!(RX_OFF >= TX_OFF + FRAME_MAX + 8);
@@ -1177,8 +1190,34 @@ pub fn rx(
         // core NAK-retries in hardware without halting, so this is the ordinary quiet case.
         nic.stats.rx_nohalt = nic.stats.rx_nohalt.wrapping_add(1);
         nic.stats.rx_hcint = hcint;
+        // ...OR THE CHANNEL IS WEDGED, WHICH LOOKS EXACTLY THE SAME FROM HERE.
+        //
+        // "Enabled and not complete" is the quiet case for a millisecond and a fault after a hundred.
+        // The fault is the non-periodic REQUEST QUEUE running dry: an IN token needs an entry in it to
+        // reach the wire, and `GNPTXSTS` was reading zero entries free while the frame sat in the
+        // device. The transfer stays enabled forever because it can never be issued.
+        //
+        // `tx` already documents this exhaustion from the other side, and what it does about it is the
+        // reason this was invisible: it HALTS this channel before transmitting, which frees the entry -
+        // so every transmit silently repaired the receive path. That is why a ping timed out for 904 ms
+        // across 91 fruitless drains and its reply appeared 32 ms into the NEXT ping, the moment that
+        // ping's transmit halted and re-armed the channel. The reply had been at the device the whole
+        // time. Recovery must not depend on unrelated traffic happening to occur.
+        //
+        // So do it here, on our own account. A completion normally takes one or two polls; this waits
+        // far longer than that before acting, so an ordinary quiet link never trips it, and it is
+        // COUNTED (`rx_rearms`) rather than silent - a repair nobody can see is indistinguishable from
+        // a fault nobody noticed.
+        nic.in_stuck = nic.in_stuck.saturating_add(1);
+        if nic.in_stuck >= RX_STUCK_POLLS {
+            chan::halt(mmio, CH_NET_RX);
+            nic.in_armed = false;         // the next pass arms a fresh one
+            nic.in_stuck = 0;
+            nic.stats.rx_rearms = nic.stats.rx_rearms.saturating_add(1);
+        }
         return 0;
     }
+    nic.in_stuck = 0;
     if hcint & crate::regs::HCINT_STALL != 0 {
         // A halted endpoint is a hard failure, never retried by re-arming into the same condition.
         nic.stats.rx_hcint = hcint;
