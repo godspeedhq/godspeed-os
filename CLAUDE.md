@@ -2311,7 +2311,7 @@ this document.
 
 This is not a preference for failure. It is a statement about what a fix is: making the system work
 WITHIN the model, and never widening the model to admit what is easier. Where the two genuinely cannot
-be reconciled, the honest move is to record the gap loudly and leave it open (§26.3) rather than close
+be reconciled, the honest move is to record the gap loudly and leave it open (§26.7) rather than close
 it with a violation.
 
 ---

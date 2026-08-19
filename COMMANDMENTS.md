@@ -224,6 +224,50 @@ to real bugs, real wedges, real failures, and real lessons learned while buildin
 
 Treat them very seriously.
 
+And when a compromise offers itself because the system does not yet work, know which way the trade goes:
+
+> **A failing Godspeed that preserves its invariants is preferable to a working Godspeed that violates
+> them.**
+
+This is not a love of failure. It is what a fix IS. A system that fails with its model intact is still
+Godspeed, and can be repaired. A system that works by breaking its model is another system wearing the
+name, and it has spent the only thing that made the rest of this document worth obeying.
+
+So make it work WITHIN the model. Never widen the model to admit what is easier. And where the two truly
+cannot be reconciled, say so plainly and leave the gap open, for a recorded failure can be fixed by
+whoever comes next, and a quiet violation cannot even be found.
+
+> *Grounded in:* `CLAUDE.md` §25 (the principle that ranks the others) and §26.7 (a failure is
+> reported, never swallowed - so a limitation that cannot be closed today is RECORDED, not papered over).
+
+## Of Borrowed Wisdom
+
+Thou shalt read the works of others, for they have met this silicon before thee. Linux, BSD and u-boot
+are read here as executable datasheets, and that reading has many times been the difference between a
+working driver and a week of guessing.
+
+But take from them the requirement of the DEVICE, and never the shape of THEIR HOUSE.
+
+Both arrive in the same file, and only one of them is a fact:
+
+* **Take** the order of writes, the timing, the magic values, the error semantics, the meaning of a bit.
+  These are properties of the hardware and are true wherever they are read.
+* **Leave** the ambient global, the unbounded buffer, the allocation on the hot path, the driver that
+  lives in the kernel because that is where they put it. These are their answers to their constraints,
+  and they are facts about nothing.
+
+When in doubt, ask one question:
+
+> *Is this a property of the device, or a property of their design?*
+
+To copy their design because they are respected is how a model rots while every single change looks
+justified. Where thou dost diverge from them, do not apologise - RECORD it, at the point of difference,
+with the reason. Silent divergence breeds bugs no one can explain; unexplained convergence breeds
+violations no one noticed.
+
+> *Grounded in:* `CLAUDE.md` §26.14. See also §26.6.1 - when their answer is a heap and thine cannot
+> be, change the representation rather than the rule.
+
 ## Tried by Fire
 
 A contribution is not considered proven until it has passed through the fire.
