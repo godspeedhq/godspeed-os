@@ -222,7 +222,32 @@ fn stage(
     program(mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, 0);
     match wait_halt(ctx, mmio, ch, 100) {
         None => {
-            ctx.log_fmt(format_args!("dwc2-svc: {} stage timed out (channel never halted)", what));
+            // SAY WHAT THE CORE LOOKED LIKE, not just that we gave up.
+            //
+            // "channel never halted" names the symptom and nothing else, and the symptom is shared by
+            // every possible cause. On hardware this line repeated for a minute while the keyboard was
+            // dead, and it could not distinguish a controller that had lost its port from one that had
+            // simply run out of room to issue a request - which are opposite faults with opposite
+            // fixes, and the driver already knows that the non-periodic request queue runs dry here.
+            //
+            // These are the four registers that separate them, and they cost nothing extra: this line
+            // was already printing once per failure, so it may as well carry the state.
+            //   HPRT      - is the port still connected, enabled and powered? (a lost port stops all)
+            //   GNPTXSTS  - bits 23:16 are request-queue entries FREE; zero means nothing can be
+            //               issued at all, which looks exactly like a device that never answers
+            //   GINTSTS   - is the core even still in host mode?
+            //   HCCHAR    - is our channel still enabled, i.e. waiting rather than never started?
+            let hprt = mmio.read32(crate::regs::HPRT);
+            let nptx = mmio.read32(crate::regs::GNPTXSTS);
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: {} stage timed out (channel never halted) - HPRT={:#010x} (conn {} ena {} pwr {}),                  GNPTXSTS={:#010x} qfree {}, GINTSTS={:#010x}, HCCHAR={:#010x}",
+                what, hprt,
+                hprt & crate::regs::HPRT_PRTCONNSTS != 0,
+                hprt & crate::regs::HPRT_PRTENA != 0,
+                hprt & crate::regs::HPRT_PRTPWR != 0,
+                nptx, (nptx >> 16) & 0xFF,
+                mmio.read32(crate::regs::GINTSTS),
+                mmio.read32(hcchar_at(ch))));
             false
         }
         Some(hcint) => {
