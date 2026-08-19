@@ -860,8 +860,15 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target
     let mut arps = 0u32;      // ethertype 0x0806, any operation
     let mut replies = 0u32;   // ARP replies, from anyone
     let mut unicast = 0u32;   // frames addressed to OUR mac (not broadcast/multicast)
+    // DID THE REQUEST ACTUALLY GO OUT? This was `let _ = nic_req(...)`, and discarding the outcome of a
+    // send is the silent-failure this system forbids (CLAUDE.md 26.7): the driver can refuse a transmit
+    // and the only trace was a reply that never came, which reads as "the network did not answer" and is
+    // not the same thing at all. Three runs were spent asking whether these frames reached the wire when
+    // the call site already knew and threw the answer away.
+    let mut sent = 0u32;
+    let mut send_fail = 0u32;
     for _ in 0..DANCE_TRIES {
-        let _ = nic_req(ctx, &req, LINK_SECS);
+        if nic_req(ctx, &req, LINK_SECS).is_some() { sent += 1; } else { send_fail += 1; }
         let mut result: Option<[u8; 6]> = None;
         drain_scan(ctx, DANCE_SECS, |f| {
             seen += 1;
@@ -886,10 +893,11 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target
         if let Some(m) = result { return Some(m); }
     }
     ctx.log_fmt(format_args!(
-        "net-stack: ARP for {}.{}.{}.{} found nothing - {} frames scanned, {} to our MAC, {} ARP, \
-         {} ARP replies (asking as {}.{}.{}.{} / {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
+        "net-stack: ARP for {}.{}.{}.{} found nothing - {} sent {} SEND-FAILED, {} frames scanned, \
+         {} to our MAC, {} ARP, {} ARP replies \
+         (asking as {}.{}.{}.{} / {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
         target[0], target[1], target[2], target[3],
-        seen, unicast, arps, replies,
+        sent, send_fail, seen, unicast, arps, replies,
         our_ip[0], our_ip[1], our_ip[2], our_ip[3],
         our_mac[0], our_mac[1], our_mac[2], our_mac[3], our_mac[4], our_mac[5]));
     None
@@ -1332,6 +1340,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // machine that boots in fifteen is a minute of no network for no reason - and it would now delay the
     // auto-configure below too, which must answer a cable being plugged in promptly.
     let mut last_redhcp_at: i64 = -RESYNC_SECS;
+    // Same, for the gateway-only ARP retry below - separate from the DHCP one so a re-dance and a
+    // gateway retry cannot consume each other's budget.
+    let mut last_gw_arp_at: i64 = -RESYNC_SECS;
     /// Latched once the wall clock is known. A clock never becomes unset, so this is asked at most once.
     let mut clock_known = false;
     loop {
@@ -1491,6 +1502,41 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let d = run_dance(&ctx);
             our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server; status = d.status;
             synced_by_dance = true;   // run_dance ends in its own SNTP sync - op 10 must not repeat it
+        }
+        // RETRY THE GATEWAY ALONE WHEN WE HOLD A LEASE BUT ARP NEVER ANSWERED.
+        //
+        // This exists because of the block above. That block used to be the per-request ARP retry: it
+        // was gated on the gateway being unknown, so an unresolved gateway re-ran the whole dance and
+        // ARP came round again as a side effect. Correcting it to stop discarding a valid lease removed
+        // that side effect, and with it the only thing that ever retried - a stack that leased an
+        // address and missed the gateway would answer "Request timed out" forever without ever asking
+        // again. Fixing one silent failure must not install another (26.7).
+        //
+        // So the retry is kept and narrowed to what actually needs retrying. It re-resolves the GATEWAY
+        // and touches nothing else: the lease, the address and the DNS server are all still valid, and
+        // re-running DHCP to recover an ARP entry was always the wrong instrument.
+        //
+        // Spaced by RESYNC_SECS because `arp_resolve` blocks this loop for its whole budget, and an
+        // unreachable gateway is a steady state - retrying it per request would block every caller for
+        // twelve seconds each, which is the starvation the log showed as `net-stack not responding`.
+        if badge.is_none() && leased && !gw_known
+            && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&10))
+            && ctx.epoch_secs_monotonic() - last_gw_arp_at >= RESYNC_SECS
+            && link_is_up(&ctx)
+        {
+            last_gw_arp_at = ctx.epoch_secs_monotonic();
+            let gateway = [status[4], status[5], status[6], status[7]];
+            ctx.log("net-stack: leased but the gateway never answered ARP - retrying the gateway only");
+            if let Some(m) = arp_resolve(&ctx, &our_ip, &our_mac, &gateway) {
+                gw_mac = m;
+                gw_known = true;
+                status[8..14].copy_from_slice(&gw_mac);
+                status[14] |= 1;                       // bit 0 = gateway resolved
+                ctx.log_fmt(format_args!(
+                    "net-stack: gateway {}.{}.{}.{} resolved on retry - {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    gateway[0], gateway[1], gateway[2], gateway[3],
+                    m[0], m[1], m[2], m[3], m[4], m[5]));
+            }
         }
         if let Some((rid, right)) = badge {
             // Socket-cap invocation - SOP_SEND: transmit a UDP datagram through this socket. Payload =

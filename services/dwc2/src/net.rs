@@ -384,6 +384,28 @@ const MII_FULL_DUPLEX: u16 = 0x0100 | 0x0040;
 const SMSC_BURST_CAP: u16 = 0x38;
 const SMSC_BULK_IN_DLY: u16 = 0x6C;
 const SMSC_MAC_CR: u16 = 0x100;
+/// Registers `smsc95xx_reset` writes and this driver did not, found by listing the reference driver's
+/// write sequence against ours rather than by reasoning about which ones "should" matter.
+///
+/// `VLAN1` is the one with teeth. It holds the ethertype the MAC treats as a **VLAN tag**, and Linux
+/// sets it to `ETH_P_8021Q` (0x8100) explicitly. Left unwritten it keeps whatever the reset left, and a
+/// MAC that thinks some other ethertype is a VLAN tag will parse those frames as tagged - reading the
+/// two bytes after it as tag control information and the two after that as the real ethertype. That is
+/// silent misparsing of one protocol while every other protocol on the wire is unaffected, which is the
+/// shape of the fault here: DHCP (0x0800) is answered and ARP (0x0806) never is, both unicast to the
+/// same address, on a receive path that reports losing nothing.
+///
+/// `INT_STS` clears whatever interrupt status survived the reset, and `HASHH`/`HASHL` are the multicast
+/// hash table, which `smsc95xx_set_multicast` zeroes for an interface with no multicast groups. Ours has
+/// none, and leaving the table holding reset garbage is a filter configured by accident.
+///
+/// Deliberately NOT ported: `LED_GPIO_CFG` (LED pin assignment - cosmetic, and writing a value guessed
+/// from memory into a pin-mux register is worse than leaving it) and `INT_EP_CTL`'s PHY-interrupt enable
+/// (that arms link-change notification on the USB interrupt endpoint, which this driver does not read -
+/// it polls BMSR instead, see `link_update` - so enabling it would queue notifications nothing collects).
+const SMSC_HASHH: u16 = 0x10C;
+const SMSC_HASHL: u16 = 0x110;
+const SMSC_VLAN1: u16 = 0x120;
 const SMSC_MAC_CR_RXEN: u32 = 0x0000_0004;
 const SMSC_MAC_CR_TXEN: u32 = 0x0000_0008;
 const SMSC_MAC_CR_HPFILT: u32 = 0x0000_2000;
@@ -653,9 +675,21 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
     // working driver tells us what the silicon wants; departing from it needs a reason, and there was
     // none recorded for this one.
     smsc_write(ctx, m, d, t, SMSC_BULK_IN_DLY, 0x800);
+    // Clear whatever interrupt status survived the reset, as `smsc95xx_reset` does before going on.
+    smsc_write(ctx, m, d, t, SMSC_INT_STS, 0xFFFF_FFFF);
     // Linux's `/* Init Tx */` is two writes and we only ever did one of them.
     smsc_write(ctx, m, d, t, SMSC_FLOW, 0);
     smsc_write(ctx, m, d, t, SMSC_AFC_CFG, 0x00F8_30A1);
+    // THE VLAN TAG ETHERTYPE. See `SMSC_VLAN1`: this tells the MAC which ethertype means "this frame is
+    // VLAN-tagged". Linux sets it to ETH_P_8021Q; we never set it at all, leaving the MAC to decide from
+    // whatever the reset left - and a MAC that mistakes a protocol's ethertype for a VLAN tag misparses
+    // exactly that protocol and nothing else.
+    smsc_write(ctx, m, d, t, SMSC_VLAN1, 0x0000_8100);
+    // The multicast hash table, zeroed. `smsc95xx_set_multicast` writes both halves on every filter
+    // change; for an interface that has joined no multicast groups - which is this one - the correct
+    // contents are zero, and reset garbage here is a receive filter configured by accident.
+    smsc_write(ctx, m, d, t, SMSC_HASHH, 0);
+    smsc_write(ctx, m, d, t, SMSC_HASHL, 0);
 
     // PHY: reset, advertise 10/100, restart auto-negotiation. Do NOT block on link - net-stack retries
     // and self-configures when the link comes up, so waiting here would only delay the boot.
