@@ -298,6 +298,27 @@ struct Fs {
     open_files: [OpenFile; MAX_OPEN],
 }
 
+/// `Fs` IS A STACK-RESIDENT VALUE, so its size is a stack budget and not an implementation detail.
+///
+/// It lives in `service_main`'s frame for the life of the service, and the kernel gives each service a
+/// 256 KiB user stack (`USER_STACK_PAGES`, kernel/src/task/mod.rs). A field added here is paid for out
+/// of the depth available to every call beneath it - and the bill arrives on hardware, as a service
+/// that dies at a fixed pc before its first line runs.
+///
+/// It has been close: under chaos the deepest call reached 233,641 of 262,144 bytes, 89% of the stack
+/// with 28 KiB spare, because this structure was being COPIED four times in one frame. The copies are
+/// gone (`mount_into` / `format_into`), and this assertion is here so the size itself cannot quietly
+/// take the space back. The build-time stack-fit gate in `scripts/arm_build.py` cannot catch it -
+/// that bounds `service_main`'s own frame, not the depth of the calls below it.
+///
+/// Raising this number is a decision about the stack budget, so make it deliberately and with the
+/// deepest-call figure in hand (`fs` prints it). The alternative CLAUDE.md 26.6.1 asks for first is to
+/// change the representation - stream it, refer to it by span, give it a bounded arena.
+const _: () = assert!(
+    core::mem::size_of::<Fs>() <= 40 * 1024,
+    "Fs exceeds its stack budget - see the note above this assertion before raising it"
+);
+
 /// A decoded `file_record` plus where it lives, so it can be written back. `loc == None`
 /// means the root directory (its extent lives in the superblock, it has no parent entry).
 #[derive(Clone, Copy)]
@@ -421,7 +442,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // disk (I/O error - data may be intact, do NOT flash) vs a blank/raw disk (flash to format). Set on
     // the I/O-failure break paths below; left false for a genuinely blank disk (the FS_NOFS case).
     let mut storage_unreadable = false;
-    let mut fs: Option<Fs> = if capacity == 0 {
+    // ONE `Fs`, DECLARED FIRST AND FILLED IN PLACE.
+    //
+    // This was an `if/else` EXPRESSION whose else-branch built the volume in a local called `mounted`
+    // and yielded it. That is a second 36 KiB `Fs` alive at the same time as this one, for the length
+    // of the function - the block's value has to be materialised somewhere before it can become `fs`.
+    // Declaring the destination up front and mounting straight into it leaves exactly one.
+    let mut fs: Option<Fs> = None;
+    if capacity == 0 {
         // No usable disk: block-driver reported 0 capacity after the bounded probe above (a genuinely
         // cardless boot - e.g. the Pi 2 before the SD/EMMC driver can read the card). There is nothing
         // to mount, and the loop below would probe LBA 0 up to MOUNT_MAX_ATTEMPTS times - each a
@@ -430,13 +458,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // storage-unavailable at once. Marked unreadable so the serve loop stays armed to re-mount if a
         // disk later appears - and that path re-checks capacity first, so it never re-probes an absent disk.
         storage_unreadable = true;
-        None
     } else {
-        let mut mounted: Option<Fs> = None;
         let mut io_attempts = 0u32;
         loop {
-            match Fs::mount(&ctx) {
-                Ok(f) => {
+            match Fs::mount_into(&ctx, &mut fs) {
+                Ok(()) => {
+                    // Borrowed, not moved: the mount wrote straight into `fs`, and reading it
+                    // through a reference is what keeps this path free of 36 KiB copies.
+                    let Some(f) = fs.as_ref() else { break };
                     ctx.log_fmt(format_args!(
                         "fs: mounted GSFS0008 ({} blocks, bitmap {}..{}, root@{}, {} free)",
                         f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
@@ -447,7 +476,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // operator's first `ls` answered with two lines about journal ordering before it
                     // answered with the directory. The fact is about the medium, not the command.
                     let _ = f.durable_or_warn(&ctx);
-                    mounted = Some(f);
                     break;
                 }
                 Err(e) if e == E_IO => {
@@ -483,8 +511,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
         }
-        mounted
-    };
+    }
 
     // TEST builds only (`--features selftest`): exercises the tree + reboot survival by
     // WRITING to the disk. Never enabled in production (it would pollute a user's disk).
@@ -546,8 +573,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // A9-3: the caps this state handed out do not survive the state. Revoke before
                 // replacing it, so holders get CapRevoked (recoverable) rather than FS_NOTFOUND.
                 if let Some(old) = fs.as_mut() { old.revoke_all_open(&ctx); }
-                match Fs::mount(&ctx) {
-                    Ok(nf) => { fs = Some(nf); }
+                match Fs::mount_into(&ctx, &mut fs) {
+                    Ok(()) => {}
                     Err(e) => {
                         // Loud, and DEGRADE rather than serve from state we have just declared stale.
                         ctx.log_fmt(format_args!("fs: re-mount after I/O error FAILED ({}) - degrading", e));
@@ -583,14 +610,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // driver that answered "no disk" - the comment below meant `None` and the code accepted
             // `Some(0)`, so a diskless machine attempted a mount on every request after all.
             if block_capacity(&ctx).unwrap_or(0) > 0 {
-                if let Ok(f) = Fs::mount(&ctx) {
+                if Fs::mount_into(&ctx, &mut fs).is_ok() {
+                    // `mount_into` has already stored it; read the facts back through a reference.
+                    let total = fs.as_ref().map_or(0, |f| f.total_blocks);
                     ctx.log_fmt(format_args!(
                         "fs: storage recovered - re-mounted GSFS0008 ({} blocks, {} free)",
-                        f.total_blocks, f.free_blocks
+                        total, fs.as_ref().map_or(0, |f| f.free_blocks)
                     ));
-                    capacity = f.total_blocks;
-                    storage_unreadable = false;
-                    fs = Some(f);
+                    capacity = total;
+                    storage_unreadable = false;   // `mount_into` already stored the volume
                 }
             }
         }
@@ -933,9 +961,8 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
     let errored = vol.as_ref().map_or(false, |f| f.io_error_seen.get());
     if errored && len != REPLY_SENT_DIRECTLY && p.first().map_or(false, |&op| op_is_read_only(op)) {
         ctx.log("fs: device I/O error while serving - re-mounting and retrying this request once");
-        match Fs::mount(ctx) {
-            Ok(nf) => {
-                *vol = Some(nf);
+        match Fs::mount_into(ctx, vol) {
+            Ok(()) => {
                 len = 0;
                 serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
             }
@@ -1098,8 +1125,8 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             }
             let ll = if p.len() >= 2 { (p[1] as usize).min(LABEL_MAX) } else { 0 };
             let label = if p.len() >= 2 + ll { &p[2..2 + ll] } else { &[][..] };
-            match Fs::format(ctx, capacity, label) {
-                Ok(f) => { *vol = Some(f); send(&[FS_OK]); }
+            match Fs::format_into(ctx, capacity, label, vol) {
+                Ok(()) => { send(&[FS_OK]); }
                 Err(why) => {
                     // `format` names the exact step that failed ("backup superblock write failed",
                     // "bitmap init failed", ...). Discarding it left the operator with the shell's
@@ -1452,7 +1479,21 @@ impl Fs {
         }
     }
 
-    fn mount(ctx: &ServiceContext) -> Result<Fs, &'static str> {
+    /// Mount, CONSTRUCTING THE `Fs` DIRECTLY INTO `out` rather than returning it.
+    ///
+    /// `Fs` is 36,424 bytes, and it used to be returned by value: the caller received it in a stack
+    /// temporary, wrapped it in `Some(..)`, and moved that into its destination. Each hop is a 36 KiB
+    /// memcpy that the optimiser did not elide, and `service_main`'s frame held FOUR of them - 145 KiB
+    /// of a 256 KiB user stack spent on copies of one structure.
+    ///
+    /// That is what made the deepest call reach 89% of the stack under chaos, with 28 KiB spare. It is
+    /// also why the request path had no room for anything new: the correlation tags took five attempts
+    /// to fit and only fit by being shaved, when the space they needed was being spent here.
+    ///
+    /// Writing through `&mut` gives the struct literal one destination and one existence. Nothing about
+    /// the filesystem changed - this is CLAUDE.md 26.6.1's rule applied to a working set that was small
+    /// all along and merely duplicated.
+    fn mount_into(ctx: &ServiceContext, out: &mut Option<Fs>) -> Result<(), &'static str> {
         let sb = Self::read_superblock(ctx)?;
         // Feature policy (GSFS0008, §6.15). The masks are valid because `sb_valid` (above) covers
         // them under the superblock CRC. An `incompat` bit this build doesn't know means the
@@ -1483,7 +1524,7 @@ impl Fs {
         let mut label = [0u8; LABEL_MAX];
         let ll = (sb[76] as usize).min(LABEL_MAX);
         label[..ll].copy_from_slice(&sb[77..77 + ll]);
-        Ok(Fs {
+        *out = Some(Fs {
             total_blocks: u64_at(&sb, 16),
             bitmap_start: u64_at(&sb, 24),
             data_start: u64_at(&sb, 40),
@@ -1509,7 +1550,8 @@ impl Fs {
             txn_blk: [[0u8; BLOCK]; TXN_CAP],
             crash_after_commit: false,
             open_files: [OpenFile { rid: 0, plen: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
-        })
+        });
+        Ok(())
     }
 
     // ── crash-consistency journal (Phase C) ──────────────────────────────────
@@ -1869,7 +1911,10 @@ impl Fs {
 
     /// Format the disk as an empty GSFS0008 sized to `capacity`, then mount. Same layout
     /// `osdev format_superblock` writes. `drives flash`; only ever user-initiated (§3.12).
-    fn format(ctx: &ServiceContext, capacity: u64, label: &[u8]) -> Result<Fs, &'static str> {
+    /// Format, constructing into `out` for the reason `mount_into` documents: `Fs` is 36 KiB and a
+    /// by-value return costs a copy of it in every caller that stores the result.
+    fn format_into(ctx: &ServiceContext, capacity: u64, label: &[u8], out: &mut Option<Fs>)
+        -> Result<(), &'static str> {
         let total_blocks = capacity;
         let bitmap_start: u64 = 1;
         let bitmap_blocks = (total_blocks + BITS_PER_BMBLOCK - 1) / BITS_PER_BMBLOCK;
@@ -1972,7 +2017,7 @@ impl Fs {
         // single flaky read of the medium.)
         let mut lbl = [0u8; LABEL_MAX];
         lbl[..ll].copy_from_slice(&label[..ll]);
-        Ok(Fs {
+        *out = Some(Fs {
             total_blocks,
             bitmap_start,
             data_start,
@@ -1998,7 +2043,8 @@ impl Fs {
             txn_blk: [[0u8; BLOCK]; TXN_CAP],
             crash_after_commit: false,
             open_files: [OpenFile { rid: 0, plen: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
-        })
+        });
+        Ok(())
     }
 
     fn relabel(&mut self, ctx: &ServiceContext, label: &[u8]) -> Result<(), &'static str> {
