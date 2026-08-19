@@ -845,7 +845,28 @@ pub fn tx(
         chan::halt(mmio, CH_NET_RX);
         nic.in_armed = false;
     }
-    let n = frame.len().min(FRAME_MAX);
+    let given = frame.len().min(FRAME_MAX);
+    // PAD TO THE ETHERNET MINIMUM. IEEE 802.3 sets the smallest legal frame at 64 bytes including the
+    // 4-byte FCS, so 60 bytes of frame. Anything shorter is a RUNT, and a runt is not a small frame -
+    // it is an error, discarded by the first switch that sees it.
+    //
+    // This matters because of exactly one caller: an ARP request is 42 bytes (14 ethernet + 28 ARP) and
+    // is the ONLY thing this stack transmits that is under the minimum. Everything else clears it
+    // comfortably - a DHCP DISCOVER is 286, an ICMP echo 74 - and everything else gets answered. On this
+    // board DHCP completed on a unicast reply while ARP for the gateway never drew one, through repeated
+    // runs, which is the same split.
+    //
+    // It is fixed HERE rather than in the callers because it is a link-layer property, not something
+    // ARP should know about: every frame leaving this driver must be a legal frame, whoever built it.
+    // Higher layers hand over an ARP request or an ICMP echo; the minimum length on the wire is the
+    // driver's business, and putting it here means a future short frame cannot reintroduce this.
+    //
+    // Most MACs pad automatically and Linux relies on it (`smsc95xx_tx_fixup` does not pad, and neither
+    // does usbnet). Relying on it is the part worth dropping: padding costs 18 zero bytes on the one
+    // frame type that needs it, and removes a dependency on undocumented silicon behaviour that cannot
+    // be confirmed from here.
+    const ETH_MIN: usize = 60;
+    let n = given.max(ETH_MIN);
     // TX_CMD_A = len | FIRST_SEG | LAST_SEG, TX_CMD_B = len. Both little-endian.
     let a = (n as u32) | 0x0000_2000 | 0x0000_1000;
     for (i, b) in a.to_le_bytes().iter().enumerate() {
@@ -854,8 +875,14 @@ pub fn tx(
     for (i, b) in (n as u32).to_le_bytes().iter().enumerate() {
         dma.write8(TX_OFF + 4 + i, *b);
     }
-    for i in 0..n {
+    for i in 0..given {
         dma.write8(TX_OFF + 8 + i, frame[i]);
+    }
+    // The pad itself must be written, not merely counted. The DMA arena is reused between transmits, so
+    // whatever the previous frame left in these bytes would otherwise go out on the wire as the tail of
+    // this one - a leak of the last frame's contents, and not the zeros the padding is supposed to be.
+    for i in given..n {
+        dma.write8(TX_OFF + 8 + i, 0);
     }
     // A ZLP IS NEEDED. The comment here used to say it was not - "the smsc95xx carries an explicit
     // length in its TX command, so it does not rely on a short packet to find the frame boundary the

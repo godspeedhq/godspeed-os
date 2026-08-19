@@ -683,7 +683,7 @@ fn clock_epoch_if_set(ctx: &ServiceContext) -> Option<u32> {
 }
 
 fn sntp_sync(ctx: &ServiceContext, st: &NetState) -> Option<u32> {
-    if !st.have_mac { return None; }                     // no gateway MAC - nothing to send through
+    if !st.gw_known { return None; }                     // no gateway MAC - nothing to send through
     // Resolve an NTP server by name; fall back to the fixed anycast IP if DNS is down - but say so. A
     // recovery that hides the failure it recovered from is a silent fallback (§26.7): without this line an
     // operator cannot tell a resolved pool address from a broken resolver.
@@ -1095,11 +1095,11 @@ struct NetState {
     our_ip: [u8; 4],
     our_mac: [u8; 6],   // learned from the NIC (audit U9); [0;6] while unconfigured
     gw_mac: [u8; 6],
-    have_mac: bool,
+    gw_known: bool,
     /// Did DHCP actually grant this address, or is it the fallback guess?
     ///
     /// The distinction is the difference between recovering and not. `FALLBACK_IP` is a QEMU-slirp
-    /// address that means nothing on a real network: with it we can ARP the gateway and set `have_mac`,
+    /// address that means nothing on a real network: with it we can ARP the gateway and set `gw_known`,
     /// look configured, and route nothing. The retry below is gated on being unconfigured, so a stack
     /// that fell back once stayed there for good - which is exactly what a restart under chaos produced.
     leased: bool,
@@ -1132,7 +1132,7 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
         None => {
             ctx.log("net-stack: no NIC MAC yet (driver absent/not ready) - staying unconfigured");
             return NetState { our_ip: FALLBACK_IP, our_mac: [0u8; 6], gw_mac: [0u8; 6],
-                              have_mac: false, leased: false, dns_server: GATEWAY_IP,
+                              gw_known: false, leased: false, dns_server: GATEWAY_IP,
                               status: [0u8; 19] };
         }
     };
@@ -1166,7 +1166,7 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
     // the receive path for a reply whose sender IP is the host we asked about, answering anyone who
     // ARPs for us along the way, retrying the request each round. One implementation, used everywhere,
     // rather than two that disagree about whether waiting is part of asking.
-    let (gw_mac, have_mac) = match arp_resolve(ctx, &our_ip, &our_mac, &gateway) {
+    let (gw_mac, gw_known) = match arp_resolve(ctx, &our_ip, &our_mac, &gateway) {
         Some(m) => {
             ctx.log_fmt(format_args!(
                 "net-stack: ARP - {}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -1176,17 +1176,17 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
         }
         None => ([0u8; 6], false),
     };
-    if !have_mac {
+    if !gw_known {
         ctx.log("net-stack: ARP - no reply for the gateway within the budget - degrading");
     }
 
     // ---- Phase 2 step 2: ICMP - ping the gateway to confirm it answers. Only once ARP gave us its MAC.
     let (mut _pf, mut _pt) = (0u16, 0u16);
-    let ping_ok = have_mac && ping(ctx, &gw_mac, &our_ip, &our_mac, &gateway, 32, 0, 0, &mut _pf, &mut _pt).is_some();
+    let ping_ok = gw_known && ping(ctx, &gw_mac, &our_ip, &our_mac, &gateway, 32, 0, 0, &mut _pf, &mut _pt).is_some();
     if ping_ok {
         ctx.log_fmt(format_args!("net-stack: ICMP - {}.{}.{}.{} echo reply (ping OK)",
             gateway[0], gateway[1], gateway[2], gateway[3]));
-    } else if have_mac {
+    } else if gw_known {
         ctx.log("net-stack: ICMP - no echo reply from the gateway");
     }
 
@@ -1200,9 +1200,9 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
     // bit 2 = DHCP granted this address (as opposed to the fallback guess). Published because it is
     // the difference between configured and merely reachable, and because `selfcheck` asserts on
     // it - a receive path that has stopped working shows up here as a stack that never got a lease.
-    status[14] = (have_mac as u8) | ((ping_ok as u8) << 1) | ((leased as u8) << 2);
+    status[14] = (gw_known as u8) | ((ping_ok as u8) << 1) | ((leased as u8) << 2);
     status[15..19].copy_from_slice(&dns_server);
-    let state = NetState { our_ip, our_mac, gw_mac, have_mac, leased, dns_server, status };
+    let state = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
 
     // ---- Set the wall clock from the network (SNTP): the RTC-less Pi 2 has no other time source, so
     // `date` reads zero until this runs. Best-effort - a failure just leaves the clock unset (a re-sync is
@@ -1213,7 +1213,7 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
         // nothing to do - the hardware clock is the authority here
     } else if let Some(unix) = sntp_sync(ctx, &state) {
         ctx.log_fmt(format_args!("net-stack: SNTP - wall clock set (epoch {})", unix));
-    } else if have_mac {
+    } else if gw_known {
         ctx.log("net-stack: SNTP - no time reply within the budget - clock stays unset");
     }
     state
@@ -1304,7 +1304,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             our_ip: [0; 4],
             our_mac: learn_our_mac(&ctx).unwrap_or([0; 6]),
             gw_mac: [0; 6],
-            have_mac: false,
+            gw_known: false,
             leased: false,     // no cable, so certainly no lease
             dns_server: [0; 4],
             status: *b"link down (no cable",
@@ -1313,7 +1313,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut our_ip = d.our_ip;
     let mut our_mac = d.our_mac;                   // learned from the NIC (audit U9), re-learned on each dance
     let mut gw_mac = d.gw_mac;
-    let mut have_mac = d.have_mac;
+    let mut gw_known = d.gw_known;
     let mut dns_server = d.dns_server;
     let mut status = d.status;
     let mut sockets = [Socket { rid: 0, port: 0 }; MAX_SOCKETS];
@@ -1327,7 +1327,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Did DHCP grant `our_ip`, or is it the fallback guess? See `NetState::leased`.
     let mut leased = d.leased;
     // When the last automatic re-DHCP ran, so an unleased stack retries without dancing per request.
-    let mut last_redhcp_at: i64 = 0;
+    // One RESYNC_SECS in the past, so the FIRST time a retry is wanted it happens at once and only the
+    // repeats are spaced. Zero meant "sixty seconds of uptime before the first attempt", which on a
+    // machine that boots in fifteen is a minute of no network for no reason - and it would now delay the
+    // auto-configure below too, which must answer a cable being plugged in promptly.
+    let mut last_redhcp_at: i64 = -RESYNC_SECS;
     /// Latched once the wall clock is known. A clock never becomes unset, so this is asked at most once.
     let mut clock_known = false;
     loop {
@@ -1372,9 +1376,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // dead link), a request that needs the network first checks the NIC link; if it has come up
         // (cable plugged in), re-run the dance IN PLACE so the network self-configures - no `net renew`.
         // That is EVERY network-using op, not just `net`/`ping` (audit U12): DNS (op 1) and ARP (op 6)
-        // equally need `our_ip`/`have_mac`, so a `net dns`/`net arp` on a freshly-plugged cable must
+        // equally need `our_ip`/`gw_known`, so a `net dns`/`net arp` on a freshly-plugged cable must
         // trigger the same self-configure. (op 8 `renew` forces a dance already; op 2 `open` only mints.)
-        // Gated on !have_mac so a configured stack pays nothing, and retried per request so the PHY's
+        // Gated on !gw_known so a configured stack pays nothing, and retried per request so the PHY's
         // few-second post-cable auto-negotiation eventually catches. Once configured the gateway MAC
         // persists, so a later unplug/replug just resumes (the ICMP flows again) without re-dancing.
         let mut synced_by_dance = false;
@@ -1406,7 +1410,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 clock_known = true;              // latched: never ask again
             } else if link_is_up(&ctx) {
                 last_resync_at = ctx.epoch_secs_monotonic();
-                let st = NetState { our_ip, our_mac, gw_mac, have_mac, leased, dns_server, status };
+                let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
                 if let Some(unix) = sntp_sync(&ctx, &st) {
                     ctx.log_fmt(format_args!("net-stack: SNTP retry - wall clock set (epoch {})", unix));
                     clock_known = true;
@@ -1419,20 +1423,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
         // RE-DHCP WHILE RUNNING ON THE FALLBACK ADDRESS.
         //
-        // `have_mac` alone is the wrong test for "configured". DHCP can fail, leaving `our_ip` as
-        // `FALLBACK_IP` - a QEMU-slirp address that routes nothing on a real network - and the ARP for
-        // the gateway can still succeed, setting `have_mac`. The stack then LOOKS configured, the
-        // auto-configure below never fires again because it is gated on `!have_mac`, and the machine
-        // sits on a useless address for good. A chaos restart that happened to miss its DHCP window
-        // ended exactly there, which is why a run could finish with the network down and nothing
-        // retrying.
+        // `gw_known` alone is the wrong test for "configured", in BOTH directions - which is why the
+        // flag is no longer called `have_mac` and why neither block below tests it alone.
+        //
+        // One way: DHCP can fail, leaving `our_ip` as `FALLBACK_IP` - a QEMU-slirp address that routes
+        // nothing on a real network - while the ARP for the gateway still succeeds and sets `gw_known`.
+        // The stack then LOOKS configured, nothing re-dances, and the machine sits on a useless address
+        // for good. A chaos restart that missed its DHCP window ended exactly there, which is why a run
+        // could finish with the network down and nothing retrying.
+        //
+        // The other way, and the one that bit on hardware: DHCP SUCCEEDS and ARP finds no gateway, so
+        // `gw_known` is false on a stack holding a real lease. Read as "unconfigured", that discarded
+        // the lease and re-ran the dance forever. See the auto-configure block below.
         //
         // So: while there is no lease and the link is up, re-run the dance - spaced by RESYNC_SECS so
         // the cost is one attempt a minute rather than one per request, and skipped entirely once a
         // lease is held (the common case pays one bool test).
         if badge.is_none()
             && !leased
-            && have_mac
+            && gw_known
             && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6))
             && ctx.epoch_secs_monotonic() - last_redhcp_at >= RESYNC_SECS
             && link_is_up(&ctx)
@@ -1440,17 +1449,39 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             last_redhcp_at = ctx.epoch_secs_monotonic();
             ctx.log("net-stack: running on the fallback address without a lease - retrying DHCP");
             let d = run_dance(&ctx);
-            our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; have_mac = d.have_mac; leased = d.leased; dns_server = d.dns_server; status = d.status;
+            our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server; status = d.status;
             if leased {
                 ctx.log_fmt(format_args!("net-stack: DHCP recovered - address {}.{}.{}.{}",
                                          our_ip[0], our_ip[1], our_ip[2], our_ip[3]));
             }
             synced_by_dance = true;   // run_dance ends in its own SNTP sync
         }
-        if badge.is_none() && !have_mac
+        // AUTO-CONFIGURE WHEN THERE IS NOTHING TO WORK WITH - which is NOT the same as "the gateway did
+        // not answer", and conflating the two cost a working network.
+        //
+        // This was gated on `!gw_known` while that flag was called `have_mac`, and under that name it
+        // read like "we do not know our own MAC, so we are unconfigured". It means the opposite kind of
+        // thing: the GATEWAY's MAC, resolved by ARP, which is a fact about the network answering us and
+        // not about whether this stack is configured.
+        //
+        // The consequence on hardware: DHCP granted 192.168.4.66 and ARP for the gateway then found
+        // nothing, so `gw_known` went false, so this block declared the stack "unconfigured" and threw a
+        // perfectly good lease away to re-run the whole dance - which blocked the serve loop for twelve
+        // seconds, answered no requests while it ran (`No reply from 8.8.8.8: net-stack not responding`),
+        // failed, degraded to the fallback address, and was set up to do it again forever. An
+        // unreachable gateway is a reason to retry ARP; it is never a reason to discard an address the
+        // server assigned.
+        //
+        // `leased` is the honest test and it already exists: it is true when DHCP granted this address
+        // and false when we are guessing with the fallback. So re-dance only when we hold no lease - and
+        // space it like the block above, because "no DHCP server on this link" is a steady state, and an
+        // unspaced re-dance in a steady state is a blocking storm that starves every other request.
+        if badge.is_none() && !leased && !gw_known
             && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&10))
+            && ctx.epoch_secs_monotonic() - last_redhcp_at >= RESYNC_SECS
             && link_is_up(&ctx)
         {
+            last_redhcp_at = ctx.epoch_secs_monotonic();
             // No settle here. One was added on the theory that a hot-plugged PHY needed time to
             // negotiate before DHCP, and the measurement disproved it: the failure was ZERO frames
             // arriving, because nic-driver only programmed MAC speed and DMA burst during `bring_up`
@@ -1458,7 +1489,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // a problem that did not exist, so it only postponed every hot-plug configure.
             ctx.log("net-stack: link up while unconfigured - auto-configuring");
             let d = run_dance(&ctx);
-            our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; have_mac = d.have_mac; leased = d.leased; dns_server = d.dns_server; status = d.status;
+            our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server; status = d.status;
             synced_by_dance = true;   // run_dance ends in its own SNTP sync - op 10 must not repeat it
         }
         if let Some((rid, right)) = badge {
@@ -1466,7 +1497,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // [dest_ip(4), dest_port(2), data...]. Reply = the response's UDP payload (empty on none).
             // Sending needs WRITE; the kernel already checked the cap holds `right`, we enforce op<=right.
             let mut resp = [0u8; 1500];
-            let n = if right & RIGHT_WRITE != 0 && pl.len() >= 6 && have_mac {
+            let n = if right & RIGHT_WRITE != 0 && pl.len() >= 6 && gw_known {
                 if let Some(s) = sockets.iter().find(|s| s.rid == rid && s.rid != 0) {
                     let dip = [pl[0], pl[1], pl[2], pl[3]];
                     let dport = ((pl[4] as u16) << 8) | pl[5] as u16;
@@ -1511,7 +1542,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let mut frames = 0u16;    // DIAGNOSTIC: non-empty frames collected across both servers
             let mut udp = 0u16;       //   ... how many were UDP
             let mut timeouts = 0u16;  //   ... how many nic-driver requests timed out (deadline vs poll)
-            if have_mac {
+            if gw_known {
                 for server in [dns_server, [8, 8, 8, 8]] {
                     let mut got = false;
                     ip = dns_resolve(&ctx, &pl[1..], &gw_mac, &our_ip, &our_mac, &server, &mut got,
@@ -1544,7 +1575,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let mut frames = 0u16;
                 let mut timeouts = 0u16;
                 ping_seq = ping_seq.wrapping_add(1);   // distinct per echo so a stale reply can't match
-                match if have_mac { ping(&ctx, &gw_mac, &our_ip, &our_mac, &dip, bytes, ping_seq, tsc_hz, &mut frames, &mut timeouts) } else { None } {
+                match if gw_known { ping(&ctx, &gw_mac, &our_ip, &our_mac, &dip, bytes, ping_seq, tsc_hz, &mut frames, &mut timeouts) } else { None } {
                     Some((rtt, ttl)) => { let r = rtt.to_le_bytes(); [1u8, r[0], r[1], ttl] }
                     // No reply: re-check the link. If it dropped DURING the poll it is "no link" (fast
                     // recovery to the 1s cadence), not a real "Request timed out" on a live link.
@@ -1570,7 +1601,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             our_ip = d.our_ip;
             our_mac = d.our_mac;
             gw_mac = d.gw_mac;
-            have_mac = d.have_mac;
+            gw_known = d.gw_known;
             dns_server = d.dns_server;
             status = d.status;
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&status));
@@ -1580,7 +1611,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // If the auto-configure above just ran the dance (which ends in its own sync), do NOT sync
             // again: that would put two full SNTP exchanges inside one request while every other client op
             // waits behind this single-threaded serve loop.
-            let st = NetState { our_ip, our_mac, gw_mac, have_mac, leased, dns_server, status };
+            let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
             match if synced_by_dance { clock_epoch_if_set(&ctx) } else { sntp_sync(&ctx, &st) } {
                 Some(unix) => {
                     let mut r = [0u8; 5];
@@ -1594,7 +1625,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         } else {
             // Status request (default): reply the CURRENT state, not just the frozen record. Read the link
             // and, if it is down (cable out), clear the "gateway resolved / ping OK" flags so `net` reflects
-            // reality instead of stale boot-time info - as adaptable as `ping`. have_mac is NOT cleared (the
+            // reality instead of stale boot-time info - as adaptable as `ping`. gw_known is NOT cleared (the
             // gateway MAC persists, so `net`/`ping` resume on replug without re-dancing).
             let mut s = status;
             if !link_is_up(&ctx) { s[14] = 0; }
