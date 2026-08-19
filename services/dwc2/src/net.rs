@@ -48,6 +48,18 @@ pub struct Stats {
     pub rx_unicast: u32,
     pub rx_bcast:   u32,
     pub rx_other:   u32,
+    /// Of the frames addressed to this station, how many were ARP and how many IPv4.
+    ///
+    /// This settles a question two runs have turned on and neither answered: frames addressed to us DO
+    /// arrive - the count climbs during an ARP dance - while net-stack, scanning the same stream, reports
+    /// zero ARP replies. Either those frames are ARP replies and something between here and there is
+    /// losing them, or they are not ARP at all and the gateway is genuinely not answering. Those need
+    /// opposite fixes and the addressing counters alone cannot tell them apart, so this splits them.
+    ///
+    /// Counted at the same point and for the same reason as the addressing counts: this is where the
+    /// frame exists before anything else has had a chance to drop it.
+    pub rx_uni_arp:  u32,
+    pub rx_uni_ipv4: u32,
     /// HCINT from the LAST bulk-IN that did not complete, plus how many times the channel never
     /// halted at all. The controller writes down why every transfer ended; discarding that and
     /// guessing is what turns a five-minute diagnosis into an afternoon. 0 with a non-zero
@@ -1221,6 +1233,13 @@ pub fn rx(
         if n >= 6 {
             if buf[..6] == nic.mac[..] {
                 nic.stats.rx_unicast += 1;
+                if n >= 14 {
+                    match (buf[12], buf[13]) {
+                        (0x08, 0x06) => nic.stats.rx_uni_arp += 1,
+                        (0x08, 0x00) => nic.stats.rx_uni_ipv4 += 1,
+                        _ => {}
+                    }
+                }
             } else if buf[..6] == [0xFF; 6] {
                 nic.stats.rx_bcast += 1;
             } else {
