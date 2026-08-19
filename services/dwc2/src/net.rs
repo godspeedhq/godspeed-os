@@ -69,6 +69,10 @@ pub struct Stats {
     /// popped ~= parsed means this driver did its job and the loss is above it; popped << parsed means
     /// the loss is here, in the one-frame-per-request drain.
     pub rx_popped: u32,
+    /// Transfers that ended with a DATA TOGGLE ERROR: the device's packet was rejected by the core and
+    /// the frame destroyed. Counted so the fix for it is checkable rather than believed - this should
+    /// read 0, and any other number is receive loss with a name on it.
+    pub rx_tglerr: u32,
     /// HCINT from the LAST bulk-IN that did not complete, plus how many times the channel never
     /// halted at all. The controller writes down why every transfer ended; discarding that and
     /// guessing is what turns a five-minute diagnosis into an afternoon. 0 with a non-zero
@@ -903,6 +907,24 @@ pub fn tx(
     // this happens. Receive latency is a fair price for transmit existing at all.
     if nic.in_armed {
         chan::halt(mmio, CH_NET_RX);
+        // CARRY THE DATA TOGGLE ACROSS THE HALT.
+        //
+        // A bulk endpoint's toggle alternates per packet and BOTH ends track it; if they disagree the
+        // device's next packet is rejected as a DATATGLERR and the frame is destroyed. The completion
+        // path below reads the toggle back out of HCTSIZ for exactly this reason. This path did not,
+        // and it is the one that runs most: every transmit stands the armed IN down, so every transmit
+        // re-armed the receive channel with whatever toggle was current BEFORE the halt.
+        //
+        // On hardware that showed as `HCINT=0x00000410` - DATATGLERR|NAK - on a channel that had been
+        // outstanding for forty polls, with the device's own RX FIFO reading EMPTY. It was not that the
+        // reply had not arrived; the device sent it, the core rejected it on the toggle, and the frame
+        // was gone. Intermittent, because the toggle only disagrees on half the sequences.
+        //
+        // The in-kernel driver this service replaced never hit it: it transmitted on its own channel and
+        // never stood the receive channel down at all. The halt is this port's addition - it is needed,
+        // because an armed IN occupies the request-queue entry a transmit needs - so the toggle has to
+        // be carried across it rather than the halt being removed.
+        nic.pid_in = chan::pid_from_hctsiz(mmio, CH_NET_RX);
         nic.in_armed = false;
     }
     let given = frame.len().min(FRAME_MAX);
@@ -1223,6 +1245,9 @@ pub fn rx(
         nic.stats.rx_hcint = hcint;
         nic.in_armed = false;
         return 0;
+    }
+    if hcint & crate::regs::HCINT_DATATGLERR != 0 {
+        nic.stats.rx_tglerr = nic.stats.rx_tglerr.saturating_add(1);
     }
     // W1C the channel's interrupts so the next armed transfer starts from a clean slate.
     mmio.write32(chan::hcint_at(CH_NET_RX), hcint);

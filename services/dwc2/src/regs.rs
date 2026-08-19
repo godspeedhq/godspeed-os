@@ -112,3 +112,8 @@ pub(crate) const XACT_ERR_MAX: u32 = 3;
 
 /// Split start-split accepted by the hub's transaction translator.
 pub(crate) const HCINT_ACK: u32 = 1 << 5;
+/// The device sent a packet with the OPPOSITE data PID to the one the host was expecting. The core
+/// discards that packet - the frame is gone, and the device's FIFO reads empty afterwards because it
+/// did send it. Named here because an unnamed bit 10 in a hex dump is how this went unread for a while:
+/// `HCINT=0x00000410` is this plus a NAK, and it is the whole explanation for intermittent receive loss.
+pub(crate) const HCINT_DATATGLERR: u32 = 1 << 10;
