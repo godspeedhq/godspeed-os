@@ -199,3 +199,25 @@ surface.
 
 So §4's list is still blocked, and the phases below are still the plan. This is a narrowing of the bug,
 not its removal.
+
+### 6.1 The same desync, one hop lower - found and fixed with exactly this design (2026-08-19)
+
+This document is about the **net-stack <-> nic-driver** hop. The identical fault was then found on the
+**nic-driver <-> dwc2** hop and fixed there (`7f678e00`), which is worth recording because it is
+evidence about this design rather than a separate story.
+
+That hop carried three ops (INFO, TX, RX) on one channel with untagged replies. `nic-driver` bounds its
+wait, so a reply arriving after its deadline was still queued when the next request went out, and every
+answer afterwards was one behind - permanently. Being one behind there is not a late answer, it is
+destruction: an RX reply read as an INFO reply is a FRAME consumed as a status word. Worse, the retry
+re-sent on timeout, and dwc2 POPS a frame to build each RX reply, so a resend cost a frame every time.
+
+The fix is phase 1 of this document applied to that hop: one byte of op tag on every reply, and a reply
+whose tag does not match is consumed and reported as "nothing this time" rather than believed.
+Deliberately NOT re-asked on mismatch - re-asking is the destructive move above. Consuming the stale
+reply shortens the queue by one, so alignment repairs itself.
+
+Two things follow for THIS hop:
+- the approach is validated on hardware, at a cost of one byte per reply
+- the argument that "one outstanding request makes a tag unnecessary" is now known to be wrong in
+  practice, because that is exactly the assumption the lower hop was making when it lost frames

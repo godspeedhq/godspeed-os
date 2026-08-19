@@ -259,8 +259,10 @@ fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8
     frame[o] = 255;                                                       // end
 
     let req = Message::from_bytes(&frame);
+    let mut send_fail = 0u32;
     for _ in 0..DANCE_TRIES {
-        let _ = nic_req(ctx, &req, LINK_SECS);
+        // A REQUEST that never left is not a server that did not ACK - see `dhcp_discover`.
+        if nic_req(ctx, &req, LINK_SECS).is_none() { send_fail += 1; }
         let acked = drain_scan_hit(ctx, DANCE_SECS, |f| {
             // A BOOTREPLY carrying option 53 = 5 (DHCPACK) for the address we asked for. A NAK (6) is
             // a definite refusal and is treated as "not acknowledged" by simply not matching - the
@@ -301,6 +303,11 @@ fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8
             return true;
         }
     }
+    if send_fail > 0 {
+        ctx.log_fmt(format_args!(
+            "net-stack: DHCP - no ACK, and {} of {} REQUESTs never left the host - the driver refused              them, so this is not a silent server",
+            send_fail, DANCE_TRIES));
+    }
     false
 }
 
@@ -338,6 +345,7 @@ fn dhcp_lease(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u8; 
 }
 
 fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6], bcast: bool) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
+    let mut send_fail = 0u32;
     // Ethernet(14) + IPv4(20) + UDP(8) + DHCP/BOOTP(244) = 286 bytes.
     let mut frame = [0u8; 286];
     for b in frame[0..6].iter_mut() { *b = 0xff; }       // eth dest = broadcast
@@ -372,7 +380,9 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6], bcast: bool) -> Option
     for _ in 0..DANCE_TRIES {
         // Send the DISCOVER, then DRAIN + SCAN the RX ring for the OFFER: on a busy LAN the offer arrives
         // amid a flood of broadcast, so we scan every frame within the budget, not just the coupled one.
-        let _ = nic_req(ctx, &req, LINK_SECS);
+        // COUNT A SEND THAT NEVER LEFT. Discarding this outcome makes "no offer" mean two different
+        // things - the server was silent, or we never asked - and they need opposite fixes (§26.7).
+        if nic_req(ctx, &req, LINK_SECS).is_none() { send_fail += 1; }
         let mut found: Option<([u8; 4], [u8; 4], [u8; 4], [u8; 4])> = None;
         drain_scan(ctx, DANCE_SECS, |f| {
             // A DHCP reply: IPv4 (0x0800, IHL 5), UDP (proto 17), BOOTP op = 2 (BOOTREPLY). yiaddr (our
@@ -448,7 +458,13 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6], bcast: bool) -> Option
         }
         let _ = ctx.reacquire_by_name("nic-driver");   // best-effort: we retry either way
     }
-    ctx.log("net-stack: DHCP - no offer within the budget - degrading to the fallback IP");
+    if send_fail > 0 {
+        ctx.log_fmt(format_args!(
+            "net-stack: DHCP - no offer within the budget, and {} of {} DISCOVERs never left the host -              the driver refused them, so this is not a silent server",
+            send_fail, DANCE_TRIES));
+    } else {
+        ctx.log("net-stack: DHCP - no offer within the budget - degrading to the fallback IP");
+    }
     None
 }
 
@@ -743,8 +759,10 @@ fn sntp_sync(ctx: &ServiceContext, st: &NetState) -> Option<u32> {
     // rx would have raced and lost) is caught. Retry past stray frames.
     let mut unix: Option<u32> = None;
     let mut arp_out = [0u8; 42];
+    let mut send_fail = 0u32;
     for _ in 0..SNTP_TRIES {
-        let _ = nic_req(ctx, &req, LINK_SECS);
+        // A query that never left is not a silent time server - see `dhcp_discover`.
+        if nic_req(ctx, &req, LINK_SECS).is_none() { send_fail += 1; }
         drain_scan(ctx, DANCE_SECS, |f| {
             // A UDP reply FROM ntp_ip:123 TO our source port, ECHOING our nonce. `f[14] == 0x45` pins a
             // 20-byte IP header, without which every offset below (ports at 34/36, SNTP at 42+) would be
@@ -767,11 +785,21 @@ fn sntp_sync(ctx: &ServiceContext, st: &NetState) -> Option<u32> {
             }
             // Answer an ARP for us in the meantime so the gateway can keep addressing our unicast replies.
             if build_arp_reply(f, &st.our_ip, &st.our_mac, &mut arp_out) {
+                // DECIDED, not overlooked: this is a courtesy reply to somebody else's ARP, sent
+                // while we are draining for our own answer. If it fails, that host re-ARPs a moment
+                // later and gets another chance - so the outcome carries no information we would act
+                // on, and logging it from inside a scan loop would flood the console the moment
+                // `nic-driver` is being restarted. Named here so it reads as a decision (§26.7).
                 let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
             }
             false
         });
         if unix.is_some() { break; }
+    }
+    if unix.is_none() && send_fail > 0 {
+        ctx.log_fmt(format_args!(
+            "net-stack: SNTP got no timestamp, and {} of {} queries never left the host - the driver              refused them, so this is not a silent time server",
+            send_fail, SNTP_TRIES));
     }
     let u = unix?;
     // The kernel can REFUSE this (no SET_CLOCK cap - e.g. on x86, where the CMOS RTC is the authority and
@@ -903,7 +931,12 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target
                 true
             } else {
                 if build_arp_reply(f, our_ip, our_mac, &mut arp_out) {
-                    let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
+                    // DECIDED, not overlooked: this is a courtesy reply to somebody else's ARP, sent
+                // while we are draining for our own answer. If it fails, that host re-ARPs a moment
+                // later and gets another chance - so the outcome carries no information we would act
+                // on, and logging it from inside a scan loop would flood the console the moment
+                // `nic-driver` is being restarted. Named here so it reads as a decision (§26.7).
+                let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
                 }
                 false
             }
@@ -1068,7 +1101,12 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
                 *frames += 1;
                 if is_echo(f) { return Some((rtt_us(), f[22])); }
                 if build_arp_reply(f, our_ip, our_mac, &mut arp_out) {
-                    let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
+                    // DECIDED, not overlooked: this is a courtesy reply to somebody else's ARP, sent
+                // while we are draining for our own answer. If it fails, that host re-ARPs a moment
+                // later and gets another chance - so the outcome carries no information we would act
+                // on, and logging it from inside a scan loop would flood the console the moment
+                // `nic-driver` is being restarted. Named here so it reads as a decision (§26.7).
+                let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
                 }
             }
         }

@@ -69,6 +69,12 @@ pub struct Stats {
     /// popped ~= parsed means this driver did its job and the loss is above it; popped << parsed means
     /// the loss is here, in the one-frame-per-request drain.
     pub rx_popped: u32,
+    /// Register reads that FAILED and were reported as zero.
+    ///
+    /// Without this a dead control path and a genuinely idle chip print the same line. Non-zero means
+    /// the register values beside it are partly fiction, which is a different problem from whatever
+    /// they appear to say.
+    pub reg_read_fails: u32,
     /// Transfers that ended with a DATA TOGGLE ERROR: the device's packet was rejected by the core and
     /// the frame destroyed. Counted so the fix for it is checkable rather than believed - this should
     /// read 0, and any other number is receive loss with a name on it.
@@ -355,7 +361,8 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
 // bring-up, which is why the framing was correct and unreachable. QEMU hid it: QEMU's `usb-net` is
 // CDC-ECM, a device that needs none of this.
 //
-// Reimplemented from the working kernel driver in `arch/arm/dwc2.rs`, which was itself written from the
+// Reimplemented from the working kernel driver in `arch/arm/dwc2.rs` (since DELETED - this service
+// replaced it; `git show 8c6a42ab~1:kernel/src/arch/arm/dwc2.rs`), which was itself written from the
 // u-boot/Linux `smsc95xx` reference (driver doctrine: behaviour cited, code reimplemented).
 
 const SMSC_TX_CFG: u16 = 0x10;
@@ -482,8 +489,21 @@ fn link_reconfigure(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) {
     let lpa = mii_read(ctx, m, d, t, SMSC_MII_LPA).unwrap_or(0);
     let full = adv & lpa & MII_FULL_DUPLEX != 0;
 
-    let mut mac_cr = smsc_read_or0(ctx, m, d, t, SMSC_MAC_CR);
-    let mut afc = smsc_read_or0(ctx, m, d, t, SMSC_AFC_CFG);
+    // A READ-MODIFY-WRITE MUST NOT PROCEED ON A READ THAT DID NOT HAPPEN.
+    //
+    // These were `smsc_read_or0`, which fabricates 0 when the control transfer fails. The next lines
+    // OR bits into that value and write it back, so a failed read did not merely mislead - it wrote
+    // ZERO over every other bit in MAC_CR, silently turning off receive, transmit and duplex while
+    // reporting that it had configured the link. A fabricated value is bad in a log and destructive in
+    // a register.
+    //
+    // If either read fails there is nothing safe to write, so write nothing and say so. The link stays
+    // as it was, which is a state the rest of the driver already copes with.
+    let (Some(mut mac_cr), Some(mut afc)) =
+        (smsc_read(ctx, m, d, t, SMSC_MAC_CR), smsc_read(ctx, m, d, t, SMSC_AFC_CFG)) else {
+        ctx.log("dwc2-svc: link update SKIPPED - could not read MAC_CR/AFC_CFG, refusing to write a                  config built on a fabricated value (link left as it was)");
+        return;
+    };
     if full {
         mac_cr |= SMSC_MAC_CR_FDPX;
         mac_cr &= !SMSC_MAC_CR_RCVOWN;
@@ -572,7 +592,23 @@ fn smsc_read(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, index: u16) ->
     Some(u32::from_le_bytes(data))
 }
 
-fn smsc_read_or0(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, index: u16) -> u32 {
+/// Read a register FOR DISPLAY, fabricating 0 if the transfer fails.
+///
+/// **Zero from this function may mean "the register is zero" OR "the read did not happen", and nothing
+/// distinguishes them.** That is why the name says what it is for. Use it only where the value is
+/// printed and a human is reading it. NEVER use it for:
+///
+///   - a **decision** - a failed read then looks like whichever answer zero happens to mean. A poll
+///     here read `HW_CFG & LRST == 0` as "the reset completed", the one conclusion it must not reach by
+///     accident, and everything after it assumed a reset chip.
+///   - a **read-modify-write** - the fabricated zero is written BACK. A failed MAC_CR read wrote zero
+///     over receive, transmit and duplex while reporting that it had configured the link. A fabricated
+///     value is misleading in a log and destructive in a register.
+///
+/// Both of those call sites are gone; they use `smsc_read` and handle `None` (§26.7 - a failure is
+/// reported, never swallowed). What remains is the honest residual: a register dump prints 0 for a
+/// register it could not read, and `reg_read_fails` in the periodic report is how you know.
+fn smsc_read_for_log(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, index: u16) -> u32 {
     smsc_read(ctx, m, d, t, index).unwrap_or(0)
 }
 
@@ -620,9 +656,16 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
         ctx.log("dwc2-svc: smsc lite-reset write FAILED - NIC stays down");
         return None;
     }
+    // A READ THAT FAILED IS NOT A BIT THAT CLEARED. This polled `smsc_read_or0`, so a failed control
+    // transfer returned 0, the LRST bit read as clear, and the driver concluded the reset had completed
+    // - the one conclusion it must not reach by accident, since everything after it assumes a reset
+    // chip. `None` now means "no answer yet", which is what it is, and the loop keeps waiting until the
+    // bound decides.
     let mut cleared = false;
     for _ in 0..SMSC_POLLS {
-        if smsc_read_or0(ctx, m, d, t, SMSC_HW_CFG) & SMSC_HW_CFG_LRST == 0 { cleared = true; break; }
+        if let Some(v) = smsc_read(ctx, m, d, t, SMSC_HW_CFG) {
+            if v & SMSC_HW_CFG_LRST == 0 { cleared = true; break; }
+        }
     }
     if !cleared {
         ctx.log("dwc2-svc: smsc lite-reset never cleared - NIC stays down (loud, not silently degraded)");
@@ -630,15 +673,22 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
     }
 
     // Reset the PHY.
-    let pm = smsc_read_or0(ctx, m, d, t, SMSC_PM_CTRL);
+    // Same read-modify-write hazard as MAC_CR above, and the same rule: no read, no write.
+    let Some(pm) = smsc_read(ctx, m, d, t, SMSC_PM_CTRL) else {
+        ctx.log("dwc2-svc: smsc PM_CTRL unreadable - cannot reset the PHY without overwriting it blind");
+        return None;
+    };
     smsc_write(ctx, m, d, t, SMSC_PM_CTRL, pm | SMSC_PM_CTRL_PHY_RST);
     for _ in 0..SMSC_POLLS {
-        if smsc_read_or0(ctx, m, d, t, SMSC_PM_CTRL) & SMSC_PM_CTRL_PHY_RST == 0 { break; }
+        // A failed read is "not yet", never "done" - see the lite-reset loop above.
+        if matches!(smsc_read(ctx, m, d, t, SMSC_PM_CTRL), Some(v) if v & SMSC_PM_CTRL_PHY_RST == 0) {
+            break;
+        }
     }
 
     // MAC: ask the chip, else a locally-administered address (bit 1 of byte 0 set).
-    let lo = smsc_read_or0(ctx, m, d, t, SMSC_ADDRL);
-    let hi = smsc_read_or0(ctx, m, d, t, SMSC_ADDRH);
+    let lo = smsc_read_for_log(ctx, m, d, t, SMSC_ADDRL);
+    let hi = smsc_read_for_log(ctx, m, d, t, SMSC_ADDRH);
     let from_chip = [lo as u8, (lo >> 8) as u8, (lo >> 16) as u8, (lo >> 24) as u8, hi as u8, (hi >> 8) as u8];
     // THREE SOURCES, BEST FIRST - and say which one answered.
     //
@@ -680,8 +730,8 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
     // address filter, while an ARP reply is UNICAST to our MAC and only arrives if the filter holds
     // the right one. So "DHCP round-trips but ARP never answers" is exactly what a wrong or unwritten
     // unicast filter looks like, and exactly what these two registers settle.
-    let rl = smsc_read_or0(ctx, m, d, t, SMSC_ADDRL);
-    let rh = smsc_read_or0(ctx, m, d, t, SMSC_ADDRH);
+    let rl = smsc_read_for_log(ctx, m, d, t, SMSC_ADDRL);
+    let rh = smsc_read_for_log(ctx, m, d, t, SMSC_ADDRH);
     let back = [rl as u8, (rl >> 8) as u8, (rl >> 16) as u8, (rl >> 24) as u8, rh as u8, (rh >> 8) as u8];
     ctx.log_fmt(format_args!(
         "dwc2-svc: unicast filter reads back {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} - {}",
@@ -691,7 +741,7 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
     // Turbo RX: the chip aggregates MANY frames into one bulk-IN burst, each with its 4-byte status word
     // and DWORD-aligned - which is exactly what `rx` already parses. Read-modify-write, because a bare
     // write clears the power-on defaults; clear RXDOFF so the frame sits immediately after its status.
-    let hw = (smsc_read_or0(ctx, m, d, t, SMSC_HW_CFG) | SMSC_HW_CFG_BIR | SMSC_HW_CFG_MEF | SMSC_HW_CFG_BCE)
+    let hw = (smsc_read_for_log(ctx, m, d, t, SMSC_HW_CFG) | SMSC_HW_CFG_BIR | SMSC_HW_CFG_MEF | SMSC_HW_CFG_BCE)
              & !SMSC_HW_CFG_RXDOFF;
     smsc_write(ctx, m, d, t, SMSC_HW_CFG, hw);
     smsc_write(ctx, m, d, t, SMSC_BURST_CAP, SMSC_BURST_PKTS);
@@ -740,7 +790,7 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
     // our-unicast + broadcast, which is why the filter was narrowed in the first place: the
     // mDNS/SSDP/IPv6-ND flood gets dropped at the CHIP instead of filling a 20 KB FIFO we then have to
     // drain. Some of these bits come out of reset SET, so they are cleared explicitly.
-    let cr = (smsc_read_or0(ctx, m, d, t, SMSC_MAC_CR)
+    let cr = (smsc_read_for_log(ctx, m, d, t, SMSC_MAC_CR)
               & !(SMSC_MAC_CR_PRMS | SMSC_MAC_CR_MCPAS | SMSC_MAC_CR_HPFILT))
              | SMSC_MAC_CR_TXEN | SMSC_MAC_CR_RXEN | SMSC_MAC_CR_FDPX;
     if !smsc_write(ctx, m, d, t, SMSC_MAC_CR, cr) {
@@ -754,9 +804,9 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
     // that is a completely different bug from "frames do not flow". BMSR bit 2 is the PHY's own link
     // bit: the only honest answer to "is the cable up", as against the UP this driver currently
     // reports to net-stack unconditionally.
-    let cr  = smsc_read_or0(ctx, m, d, t, SMSC_MAC_CR);
-    let txc = smsc_read_or0(ctx, m, d, t, SMSC_TX_CFG);
-    let hwc = smsc_read_or0(ctx, m, d, t, SMSC_HW_CFG);
+    let cr  = smsc_read_for_log(ctx, m, d, t, SMSC_MAC_CR);
+    let txc = smsc_read_for_log(ctx, m, d, t, SMSC_TX_CFG);
+    let hwc = smsc_read_for_log(ctx, m, d, t, SMSC_HW_CFG);
     let bmsr = mii_read(ctx, m, d, t, SMSC_MII_BMSR);
     ctx.log_fmt(format_args!(
         "dwc2-svc: smsc readback MAC_CR=0x{:08x} (TXEN {} RXEN {}) TX_CFG=0x{:08x} HW_CFG=0x{:08x} BMSR={} link {}",
@@ -1062,13 +1112,13 @@ pub fn tx(
             ctx.log("dwc2-svc: flushed the DEVICE's TX FIFO - a partial frame blocks every frame behind it");
             ctx.log_fmt(format_args!(
                 "dwc2-svc: device TX state at refusal - TX_FIFO_FREE={} RX_FIFO_USED={} TX_CFG={:#010x} INT_STS={:#010x} MAC_CR={:#010x} FLOW={:#010x} AFC_CFG={:#010x}",
-                smsc_read_or0(ctx, mmio, dma, t, SMSC_TX_FIFO_INF) & 0xFFFF,
-                smsc_read_or0(ctx, mmio, dma, t, SMSC_RX_FIFO_INF) & 0xFFFF,
-                smsc_read_or0(ctx, mmio, dma, t, SMSC_TX_CFG),
-                smsc_read_or0(ctx, mmio, dma, t, SMSC_INT_STS),
-                smsc_read_or0(ctx, mmio, dma, t, SMSC_MAC_CR),
-                smsc_read_or0(ctx, mmio, dma, t, SMSC_FLOW),
-                smsc_read_or0(ctx, mmio, dma, t, SMSC_AFC_CFG)));
+                smsc_read_for_log(ctx, mmio, dma, t, SMSC_TX_FIFO_INF) & 0xFFFF,
+                smsc_read_for_log(ctx, mmio, dma, t, SMSC_RX_FIFO_INF) & 0xFFFF,
+                smsc_read_for_log(ctx, mmio, dma, t, SMSC_TX_CFG),
+                smsc_read_for_log(ctx, mmio, dma, t, SMSC_INT_STS),
+                smsc_read_for_log(ctx, mmio, dma, t, SMSC_MAC_CR),
+                smsc_read_for_log(ctx, mmio, dma, t, SMSC_FLOW),
+                smsc_read_for_log(ctx, mmio, dma, t, SMSC_AFC_CFG)));
             ctx.log_fmt(format_args!(
                 "dwc2-svc: NIC refused {} frames in a row (HCINT={:#010x}{}) - backing off to one probe                  every {} ms. Frames are dropped meanwhile; input and storage stay responsive.",
                 TX_FAIL_RUN, why.0, if why.1 != 0 { ", channel never halted" } else { "" },
@@ -1470,9 +1520,20 @@ pub fn serve(
             let now = ctx.read_tsc();
             link_observed(ctx, mmio, dma, t, nic, up, now);
             nic.stats.bmsr = mii_read(ctx, mmio, dma, t, SMSC_MII_BMSR).map_or(0xFFFF, u32::from);
-            nic.stats.rx_fifo = smsc_read_or0(ctx, mmio, dma, t, SMSC_RX_FIFO_INF);
-            nic.tx_fifo_free = smsc_read_or0(ctx, mmio, dma, t, SMSC_TX_FIFO_INF) & 0xFFFF;
-            nic.stats.int_sts = smsc_read_or0(ctx, mmio, dma, t, SMSC_INT_STS);
+            // Fallible here: these three feed the periodic report, where a fabricated zero reads as a
+            // fact about the device. Counting the failures makes a zero attributable.
+            match smsc_read(ctx, mmio, dma, t, SMSC_RX_FIFO_INF) {
+                Some(v) => nic.stats.rx_fifo = v,
+                None => nic.stats.reg_read_fails = nic.stats.reg_read_fails.saturating_add(1),
+            }
+            match smsc_read(ctx, mmio, dma, t, SMSC_TX_FIFO_INF) {
+                Some(v) => nic.tx_fifo_free = v & 0xFFFF,
+                None => nic.stats.reg_read_fails = nic.stats.reg_read_fails.saturating_add(1),
+            }
+            match smsc_read(ctx, mmio, dma, t, SMSC_INT_STS) {
+                Some(v) => nic.stats.int_sts = v,
+                None => nic.stats.reg_read_fails = nic.stats.reg_read_fails.saturating_add(1),
+            }
             body[7] = u8::from(up);
             8
         }

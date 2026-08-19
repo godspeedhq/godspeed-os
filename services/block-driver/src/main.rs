@@ -191,7 +191,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         out[0] = STATUS_ERR;
                         1
                     };
-                    reply.send(ctx, &out[..n]);
+                    reply.send(&ctx, &out[..n]);
                     ctx.remove_cap(reply.cap);
                 }
                 ctx.yield_cpu();

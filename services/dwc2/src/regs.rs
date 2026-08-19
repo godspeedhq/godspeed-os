@@ -1,6 +1,7 @@
 //! DWC2 register offsets and bit definitions, for the Raspberry Pi 2's USB host controller.
 //!
-//! Lifted VERBATIM from `kernel/src/arch/arm/dwc2.rs`, comments included. The comments are not
+//! Lifted VERBATIM from `kernel/src/arch/arm/dwc2.rs` (since DELETED - this service replaced it; read
+//! it at `git show 8c6a42ab~1:kernel/src/arch/arm/dwc2.rs`), comments included. The comments are not
 //! decoration: several of them record facts diagnosed on real silicon that no datasheet states
 //! (which PHY bits the BCM2836 needs, why the FIFO layout is the Linux `bcm2835` one, which bits
 //! QEMU ignores). Retyping these from a datasheet would lose exactly the knowledge that took the

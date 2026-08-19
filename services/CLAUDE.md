@@ -24,6 +24,7 @@ is the kernel itself** (`{kernel}`). Pinned by §22 Test 15.
 | `block-driver/` | Restartable (Phase D); holds no persistent state; re-inits the controller on respawn |
 | `fs/`        | Restartable (Phase D); re-mounts to a consistent state via its crash-consistency journal (§6.8) |
 | `shell/`     | The user's interface - a crash or `kill shell` respawns a fresh prompt (in-flight command lost - a re-init, not a resume). "Nothing escapes" |
+| `dwc2/` | The ARM (Pi 2) USB host driver - controller, enumeration, HID, mass storage and the smsc95xx NIC. Was `kernel/src/arch/arm/dwc2.rs` until ARM routed device IRQs to userspace (`USB_VECTOR`); that file is deleted. Restartable: a respawn re-runs core bring-up and re-enumerates, which chaos exercises thousands of times per run |
 | `xhci/` `ehci/` | USB host drivers - own-death respawn re-grants MMIO/DMA/IRQ caps + re-inits the controller + re-enumerates devices. Without this, a `chaos max-carnage` that kills them in its last rounds left the keyboard dead until a lucky supervisor respawn |
 | `logger/`    | Stateless; respawn drains the kernel ring buffer afresh |
 | `console/`   | The terminal - owns the display (`docs/console-service.md` §9). A respawn re-maps the framebuffer grant, clears it, and renders from the next byte on; scrollback is lost because it lived in the dead instance's grid (a re-init, not a resume). While it is dead the kernel's `bootcon` floor takes the screen back, so the machine is never mute |

@@ -209,6 +209,29 @@ fn realtek_main(ctx: ServiceContext) -> ! {
 
 /// Arm RX descriptor `i`: point it at its 2 KiB buffer and hand ownership to the NIC (OWN set), with
 /// EOR on the last descriptor so the NIC wraps the ring. Written OWN-last (the addr is valid first).
+/// Note a reply that could not be delivered, instead of discarding the outcome.
+///
+/// Every reply here is `try_send` and not `send`, which is right: this is a server, and §8.9 requires
+/// the reply direction to be non-blocking or one slow caller wedges the driver for everyone. But
+/// `let _ =` on the result made a reply that never arrived indistinguishable from one that did.
+///
+/// The caller does recover - it is blocked on this reply and its deadline fires - so this is not a
+/// wedge. It is still a failure, and §26.7 says a failure is reported and never swallowed: without
+/// this, a caller timing out looks like a slow device rather than a reply the queue had no room for.
+///
+/// Rate-limited on the same pattern as `tx_fail` above: the first, then every 64th. A reply fails when
+/// the caller's queue is full, which under a chaos storm is a burst rather than a one-off, and an
+/// unbounded log there would bury the thing it is reporting.
+fn note_reply<E>(r: Result<(), E>, ctx: &ServiceContext, fails: &mut u32) {
+    if r.is_err() {
+        *fails = fails.saturating_add(1);
+        if *fails == 1 || *fails % 64 == 0 {
+            ctx.log_fmt(format_args!(
+                "nic-driver: reply send FAILED x{} (caller's queue full - it will time out)", fails));
+        }
+    }
+}
+
 fn rtl_arm_rx(arena: &Dma, i: usize) {
     let d = RX_RING_OFF + i * 16;
     let buf = arena.phys_at(RX_BUF_OFF + i * RX_BUF_SIZE);
@@ -266,6 +289,8 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     let mut force_link: Option<bool> = None;
     let mut tally_wedged_logged = false;   // one-shot loud note if the DMA counter dump ever times out
     let mut tx_fail_logged = 0u32;         // diagnose the first few TX timeouts to guide the root-cause fix
+    // Counts replies that could not be delivered; see `note_reply`.
+    let mut reply_fails = 0u32;
     loop {
         let req = ctx.recv();
         let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
@@ -332,7 +357,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             s[24..28].copy_from_slice(&rx_brd.to_le_bytes());
             s[28..30].copy_from_slice(&rx_er.to_le_bytes());
             s[30..32].copy_from_slice(&miss.to_le_bytes());
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s)), &ctx, &mut reply_fails);
             ctx.remove_cap(reply_cap);
             continue;
         }
@@ -357,7 +382,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                 rs += 1;
             }
             if n > 0 { last_rx_len = n as u16; rx_count = rx_count.saturating_add(1); }
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])), &ctx, &mut reply_fails);
             ctx.remove_cap(reply_cap);
             continue;
         }
@@ -392,7 +417,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             }
             out[0] = nfr;
             if nfr > 0 { rx_count = rx_count.saturating_add(nfr as u16); }
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos]));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])), &ctx, &mut reply_fails);
             ctx.remove_cap(reply_cap);
             continue;
         }
@@ -419,7 +444,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                 let o = 27 + i * 4;
                 s[o..o + 4].copy_from_slice(&opts1.to_le_bytes());
             }
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s)), &ctx, &mut reply_fails);
             ctx.remove_cap(reply_cap);
             continue;
         }
@@ -433,7 +458,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             force_link = match req.payload_bytes()[0] { 6 => Some(false), 7 => Some(true), _ => None };
             ctx.log_fmt(format_args!("nic-driver: force-link {} (chaos link-flap)",
                 match force_link { Some(false) => "DOWN", Some(true) => "UP", None => "CLEAR (live)" }));
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[1]));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[1])), &ctx, &mut reply_fails);
             ctx.remove_cap(reply_cap);
             continue;
         }
@@ -514,7 +539,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
 
         // Empty, not a status byte: callers already guard on `is_empty()` for "no frame", so this needs
         // no consumer change and cannot be miscounted as a received frame.
-        let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[]));
+        note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[])), &ctx, &mut reply_fails);
         ctx.remove_cap(reply_cap);
     }
 }
@@ -523,14 +548,16 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
 /// `net` nic-mac diagnostic. Every other request (a frame from net-stack) gets an EMPTY reply, so
 /// net-stack degrades rather than hangs (§26.7). Never returns.
 fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
+    // Counts replies that could not be delivered; see `note_reply`.
+    let mut reply_fails = 0u32;
     loop {
         let req = ctx.recv();
         let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
         let p = req.payload_bytes();
         if p.len() == 1 && p[0] == 3 {
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(sreply));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(sreply)), &ctx, &mut reply_fails);
         } else {
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[]));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[])), &ctx, &mut reply_fails);
         }
         ctx.remove_cap(reply_cap);
     }
@@ -697,6 +724,8 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         0
     };
 
+    // Counts replies that could not be delivered; see `note_reply`.
+    let mut reply_fails = 0u32;
     loop {
         let _req = ctx.recv();
         let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
@@ -711,12 +740,12 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
                 out[1..7].copy_from_slice(&ni[0..6]);
                 out[7] = ni[6];
             }
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)), &ctx, &mut reply_fails);
         } else if p.len() == 1 && p[0] == 4 {
             // RX-only: one frame, no TX.
             let mut rx = [0u8; FRAME_MAX];
             let n = rx_one(&ctx, &mut rx);
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rx[..n]));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rx[..n])), &ctx, &mut reply_fails);
         } else if p.len() == 1 && p[0] == 9 {
             // BATCH RX drain: [count:u8] then per frame [len:u16 LE][bytes].
             let mut out = [0u8; BATCH_MSG_MAX];
@@ -738,7 +767,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
                 count += 1;
             }
             out[0] = count;
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos]));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])), &ctx, &mut reply_fails);
         } else if p.len() == 1 && matches!(p[0], 5 | 6 | 7 | 8) {
             // UNSUPPORTED on this backend - answered `[0]`, not `[1]`.
             //
@@ -751,7 +780,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             // Op 5 is a register dump; answering 1 byte to a caller expecting 25 is the same lie in
             // miniature. The original comment was right that a caller must not hang and wrong that an
             // ack was the remedy: the caller needs an ANSWER, and "not supported here" is one.
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8]));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), &ctx, &mut reply_fails);
         } else {
             // TX FRAME (any multi-byte payload). TRANSMIT ONLY - the reply carries NO received frame.
             //
@@ -782,7 +811,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             // EMPTY, not a status byte: every caller already guards on `is_empty()` for "no frame", so an
             // empty reply needs no consumer to change and cannot be miscounted as a frame - `udp_roundtrip`
             // increments its frame counter on any non-empty reply and would have counted a status byte.
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[]));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[])), &ctx, &mut reply_fails);
         }
         ctx.remove_cap(reply_cap);
     }
@@ -878,6 +907,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // payload is a frame to transmit; we reply with the frame that came back (empty if none / no NIC).
     let mut rxbuf = [0u8; FRAME_MAX];
     let mut tx_idx = 0usize;
+    // Counts replies that could not be delivered; see `note_reply`.
+    let mut reply_fails = 0u32;
     loop {
         let req = ctx.recv();
         // The reply cap is the ONLY authority to answer net-stack (Commandment VII, §8.5).
@@ -892,7 +923,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let mut sreply = [0u8; 7];
             sreply[0] = 1; // e1000 is up
             sreply[1..7].copy_from_slice(&e1000_mac);
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&sreply));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&sreply)), &ctx, &mut reply_fails);
             ctx.remove_cap(reply_cap);
             continue;
         }
@@ -920,7 +951,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
                 m.write32(REG_RCTL, 0);
             }
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])), &ctx, &mut reply_fails);
             ctx.remove_cap(reply_cap);
             continue;
         }
@@ -955,7 +986,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 m.write32(REG_RCTL, 0);
             }
             out[0] = nfr;
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos]));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])), &ctx, &mut reply_fails);
             ctx.remove_cap(reply_cap);
             continue;
         }
@@ -972,7 +1003,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 s[17..21].copy_from_slice(&m.read32(REG_RDH).to_le_bytes());
                 s[21..25].copy_from_slice(&m.read32(REG_RDT).to_le_bytes());
             }
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s));
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s)), &ctx, &mut reply_fails);
             ctx.remove_cap(reply_cap);
             continue;
         }
@@ -1017,7 +1048,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // slot so a long-running server stays bounded (§26.6). EMPTY, not a status byte - callers
         // already guard on `is_empty()` for "no frame", so nothing downstream changes and a status
         // byte would be miscounted as a received frame by `udp_roundtrip`.
-        let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[]));
+        note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[])), &ctx, &mut reply_fails);
         ctx.remove_cap(reply_cap);
     }
 }
