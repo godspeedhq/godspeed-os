@@ -846,8 +846,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     (s.tx_ok, s.tx_fail, s.rx_bursts, s.rx_bytes, s.rx_frames, s.rx_bad, s.rx_hcint, s.rx_nohalt, s.bmsr, s.rx_fifo, s.int_sts,
                      n.tx_hcint, n.tx_nohalt, n.tx_fail_run, n.tx_nptxsts, n.tx_fifo_free,
                      s.rx_dropped, n.rxq_count as u32, s.rx_unicast, s.rx_bcast, s.rx_other,
-                     s.rx_uni_arp, s.rx_uni_ipv4)
-                }).unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+                     s.rx_uni_arp, s.rx_uni_ipv4, s.rx_popped)
+                }).unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
                 // RE-MEASURE ONCE, QUIET. The boot-time sweep runs while the console is saturated,
                 // and a serial write is an un-preemptible syscall of ~9 ms per log line - which is
                 // the mean it reported. One repeat on a settled system separates "the timer is slow"
@@ -915,8 +915,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // second climbing, is a port that receives broadcast and nothing else - which is a
                 // device-filter fault, and reads identically to a network where no host answers.
                 ctx.log_fmt(format_args!(
-                    "dwc2-svc: net RX addressing - {} to us ({} ARP, {} IPv4), {} broadcast, {} other (multicast)",
-                    ns.18, ns.21, ns.22, ns.19, ns.20));
+                    "dwc2-svc: net RX addressing - {} to us ({} ARP, {} IPv4), {} broadcast, {} other; {} frames PARSED, {} HANDED OUT",
+                    ns.18, ns.21, ns.22, ns.19, ns.20, ns.4, ns.23));
             }
             // DO NOT SLEEP WHEN THERE WAS WORK. This is the whole of the throughput problem.
             //

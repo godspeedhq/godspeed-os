@@ -60,6 +60,15 @@ pub struct Stats {
     /// frame exists before anything else has had a chance to drop it.
     pub rx_uni_arp:  u32,
     pub rx_uni_ipv4: u32,
+    /// Frames actually HANDED OUT in an OP_NET_RX reply.
+    ///
+    /// The gap this exists to locate: the parse counters say 26 frames arrived; net-stack says it
+    /// scanned 10. Somewhere between the two, two thirds of the traffic disappears, and every stage in
+    /// between reports success - `rx_dropped` is 0, the queue is empty, no send fails. Counting parses
+    /// and counting deliveries at the same boundary turns "somewhere" into "this side or that side":
+    /// popped ~= parsed means this driver did its job and the loss is above it; popped << parsed means
+    /// the loss is here, in the one-frame-per-request drain.
+    pub rx_popped: u32,
     /// HCINT from the LAST bulk-IN that did not complete, plus how many times the channel never
     /// halted at all. The controller writes down why every transfer ended; discarding that and
     /// guessing is what turns a five-minute diagnosis into an afternoon. 0 with a non-zero
@@ -1444,6 +1453,7 @@ pub fn serve(
             }
             let mut frame = [0u8; FRAME_MAX];
             let got = nic.rxq_pop(&mut frame);
+            if got > 0 { nic.stats.rx_popped = nic.stats.rx_popped.saturating_add(1); }
             body[2..2 + got].copy_from_slice(&frame[..got]);
             body[0] = (got & 0xFF) as u8;
             body[1] = ((got >> 8) & 0xFF) as u8;
