@@ -518,7 +518,12 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
     let req     = Message::from_bytes(&frame[..frame_len]);
     let rx_only = Message::from_bytes(&[4u8]);
     let mut arp_out = [0u8; 42];
-    let mut reply = nic_req(ctx, &req, DANCE_SECS);
+    // Send the query, then COLLECT with an explicit RX poll. The first frame used to ride back on the
+    // send itself; `nic-driver` no longer couples a receive to a transmit, so asking for it is now the
+    // only way to get it - and a send that fails is reported rather than discarded, which is what a
+    // caller waiting on a reply needs to know.
+    if nic_req(ctx, &req, DANCE_SECS).is_none() { *timeouts += 1; }
+    let mut reply = nic_req(ctx, &rx_only, DANCE_SECS);
     for _ in 0..DNS_RX_TRIES {
         let (matched, answer_arp) = {
             let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => { *timeouts += 1; &[] } };
@@ -569,13 +574,14 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
             }
             return None;   // a matching DNS reply but no A record (got_reply=true -> NoRecord)
         }
-        // Not our reply. If we owe an ARP reply (the gateway asked for us), send it - its request also
-        // returns the next frame; otherwise collect the NEXT frame WITHOUT re-TX.
-        reply = if answer_arp {
-            ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), DANCE_SECS)
-        } else {
-            ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS)
-        };
+        // Not our reply. If we owe an ARP reply (the gateway asked for us), send it - and then collect
+        // the next frame the same way regardless. The ARP reply's own send used to double as the next
+        // receive, which is the coupling this change removed: answering somebody else's ARP is not a
+        // reason to consume a frame, and when the caller ignored it that frame was destroyed.
+        if answer_arp {
+            let _ = ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), DANCE_SECS);
+        }
+        reply = ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS);
     }
     None
 }
@@ -870,21 +876,16 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target
     // ONE MATCHER, TWO FEEDS. The frames reach this function by two different routes and both must be
     // examined the same way; two copies of a protocol matcher is how one of them drifts.
     //
-    // Route one is the drain below. Route two is the TRANSMIT REPLY, and missing it is what has made
-    // this function fail every time it has ever run on this board.
+    // Both routes are the drain now. There used to be a second one, and it is why this function failed
+    // every time it ran on this board: `nic-driver` coupled a receive to every transmit and returned the
+    // frame it caught as the answer to the SEND, which this call site discarded. A gateway answers an
+    // ARP request in about a millisecond - squarely inside that poll - so the coupled receive caught our
+    // ARP reply essentially every time and we threw it away. DHCP was unaffected only because an offer
+    // takes tens of milliseconds and lands after the poll gives up, arriving through the drain.
     //
-    // `nic-driver` couples a receive to every transmit: it sends the frame, then does one bounded poll
-    // for an incoming frame and returns it as the transmit's reply ("TX FRAME + coupled RX" there). This
-    // call site discarded that reply. For most traffic that is invisible, because the poll usually finds
-    // nothing - but an ARP reply comes back from a gateway on the same LAN in about a millisecond, which
-    // is squarely inside that poll's window. So the coupled receive caught our ARP reply, handed it back
-    // as the answer to the send, and we threw it away. Every time, all six tries.
-    //
-    // That is the whole asymmetry the last several runs turned on: DHCP works because an offer takes
-    // tens of milliseconds and lands after the coupled poll has given up, so it arrives through the
-    // drain where somebody is looking. Nothing was ever wrong with the wire, the gateway, the filter or
-    // the frame - the reply was being delivered to a caller that dropped it. The driver's own counters
-    // said so all along: every frame it parsed, it handed out.
+    // Scanning that reply fixed it; removing the coupling removed the shape that caused it, so a send
+    // now answers nothing and there is one place a frame can arrive. The matcher stays factored anyway -
+    // it is the protocol's definition of "is this our reply", and one copy of that is the right number.
     let mut result: Option<[u8; 6]> = None;
     for _ in 0..DANCE_TRIES {
         let mut scan = |f: &[u8], result: &mut Option<[u8; 6]>| -> bool {
@@ -907,15 +908,7 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target
                 false
             }
         };
-        // Send, and READ WHAT THE SEND HANDED BACK before draining.
-        match nic_req(ctx, &req, LINK_SECS) {
-            Some(r) => {
-                sent += 1;
-                let f = r.payload_bytes();
-                if !f.is_empty() && scan(f, &mut result) { return result; }
-            }
-            None => send_fail += 1,
-        }
+        if nic_req(ctx, &req, LINK_SECS).is_some() { sent += 1; } else { send_fail += 1; }
         drain_scan(ctx, DANCE_SECS, |f| scan(f, &mut result));
         if result.is_some() { return result; }
     }
@@ -1035,18 +1028,10 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
         if tsc_hz > 0 { (dt.saturating_mul(1_000_000) / tsc_hz).min(65535) as u16 } else { 0 }
     };
 
-    // 1. Send the echo; the frame that returns with it is the first candidate.
-    match nic_req(ctx, &req, LINK_SECS) {
-        Some(r) => {
-            let f = r.payload_bytes();
-            *frames += 1;
-            if is_echo(f) { return Some((rtt_us(), f[22])); }
-            if build_arp_reply(f, our_ip, our_mac, &mut arp_out) {   // gateway ARPing for us - answer it
-                let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
-            }
-        }
-        None => *timeouts += 1,
-    }
+    // 1. Send the echo. The reply to a SEND carries nothing now - `nic-driver` no longer couples a
+    //    receive to a transmit, because that made every transmit a place a frame could be destroyed by
+    //    a caller who did not want an answer. Frames arrive in step 2, which is the part whose job it is.
+    if nic_req(ctx, &req, LINK_SECS).is_none() { *timeouts += 1; }
 
     // 2. Poll for OUR reply until it arrives or a ~330 ms window closes, draining a BATCH of frames
     //    ([9]) each round and scanning it. The reply for a WAN host arrives tens of ms AFTER the echo -

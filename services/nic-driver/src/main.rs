@@ -500,27 +500,21 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE);  // TE back on - re-reads TNPDS
         }
 
-        // --- Receive a reply: poll the current RX descriptor's OWN bit (bounded), copy it out, re-arm. ---
-        let mut n = 0usize;
-        let mut rs = 0u32;
-        while rs < RX_POLL_MAX {
-            let rd = RX_RING_OFF + rx_idx * 16;
-            let o1 = arena.read32(rd);
-            if o1 & RTL_DESC_OWN == 0 {
-                n = ((o1 & 0x3FFF) as usize).min(FRAME_MAX);
-                for i in 0..n { rxbuf[i] = arena.read8(RX_BUF_OFF + rx_idx * RX_BUF_SIZE + i); }
-                rtl_arm_rx(arena, rx_idx);       // give the descriptor back to the NIC
-                rx_idx = (rx_idx + 1) % RX_RING_COUNT;
-                break;
-            }
-            ctx.yield_cpu();
-            rs += 1;
-        }
+        // TRANSMIT ONLY - no coupled receive. This used to poll an RX descriptor here and return the
+        // frame it found as the answer to the SEND, which is a frame sink attached to an operation that
+        // has nothing to do with receiving: any caller that ignored the reply to its own transmit
+        // destroyed a frame. On the ARM port that destroyed essentially every ARP reply, because a
+        // gateway answers within a millisecond and lands inside exactly that poll.
+        //
+        // Frames now arrive only through the ops whose job is receiving ([4] and [9]). Nothing is
+        // stranded: the descriptor is simply left owned by us for the next drain, which reads and
+        // re-arms it identically, and every caller that transmits already drains afterwards.
         last_tx_done = tx_done;
         tx_count = tx_count.saturating_add(1);
-        if n > 0 { last_rx_len = n as u16; rx_count = rx_count.saturating_add(1); }
 
-        let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
+        // Empty, not a status byte: callers already guard on `is_empty()` for "no frame", so this needs
+        // no consumer change and cannot be miscounted as a received frame.
+        let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[]));
         ctx.remove_cap(reply_cap);
     }
 }
@@ -759,20 +753,36 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             // ack was the remedy: the caller needs an ANSWER, and "not supported here" is one.
             let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8]));
         } else {
-            // TX FRAME (any multi-byte payload) + coupled RX: transmit, then hand back one received frame.
-            // A failed transmit used to be dropped on the floor: the reply still came back normally, so
-            // net-stack waited out its whole deadline for an answer to a frame that never left the host -
-            // a send that did not happen, reported as one that did (§26.7). Rate-limited so a persistently
-            // broken device cannot flood the console.
+            // TX FRAME (any multi-byte payload). TRANSMIT ONLY - the reply carries NO received frame.
+            //
+            // It used to: "transmit, then hand back one received frame". That coupling put a frame sink
+            // on an operation that has nothing to do with receiving, and it cost days. A caller that did
+            // not care about the reply to its send - which is most of them, reasonably - destroyed
+            // whatever frame the coupled poll had just pulled off the device.
+            //
+            // It was not a rare loss either. A gateway answers an ARP request in about a millisecond,
+            // squarely inside that poll, so the coupled receive caught the ARP reply essentially every
+            // time and `arp_resolve` dropped it. ARP never resolved on this board while DHCP worked
+            // perfectly, because a DHCP offer takes tens of milliseconds and lands after the poll gives
+            // up, arriving through the drain where somebody is looking.
+            //
+            // Scanning the send's reply fixed the symptom; this removes the shape that caused it. Now a
+            // frame can only arrive through an operation whose job is receiving ([4] and [9]), so no
+            // caller can lose one by ignoring an answer it never asked for.
+            //
+            // Nothing is stranded by the change: not fetching the frame leaves it queued for the next
+            // drain, and every caller that transmits already drains afterwards. What is lost is at most
+            // one poll interval of latency on the first frame after a send.
             if !dev_tx(&ctx, p) {
                 tx_fail = tx_fail.saturating_add(1);
                 if tx_fail == 1 || tx_fail % 64 == 0 {
                     ctx.log_fmt(format_args!("nic-driver: usb-net TX FAILED x{} (frame not sent)", tx_fail));
                 }
             }
-            let mut rx = [0u8; FRAME_MAX];
-            let n = rx_one(&ctx, &mut rx);
-            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rx[..n]));
+            // EMPTY, not a status byte: every caller already guards on `is_empty()` for "no frame", so an
+            // empty reply needs no consumer to change and cannot be miscounted as a frame - `udp_roundtrip`
+            // increments its frame counter on any non-empty reply and would have counted a status byte.
+            let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[]));
         }
         ctx.remove_cap(reply_cap);
     }
@@ -967,7 +977,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             continue;
         }
 
-        let mut n = 0usize;
         if let (Some(m), Some(a)) = (mmio.as_ref(), arena.as_ref()) {
             let frame = req.payload_bytes();
             let flen = frame.len().min(FRAME_MAX);
@@ -996,25 +1005,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             while s < TX_POLL_MAX && a.read8(td + 12) & TXD_STA_DD == 0 { ctx.yield_cpu(); s += 1; }
             tx_idx = (tx_idx + 1) % TX_RING_COUNT;
 
-            // --- Receive: the receiver is already armed, so wait on the TRUTH of a frame landing in
-            // descriptor 0 (bounded), copy it out, then QUIESCE (the step-4 TCG-overhead lesson).
-            let mut s = 0u32;
-            while s < RX_POLL_MAX {
-                if a.read8(RX_RING_OFF + 12) & RXD_STA_DD != 0 {
-                    let len = a.read16(RX_RING_OFF + 8) as usize;
-                    n = len.min(FRAME_MAX);
-                    for i in 0..n { rxbuf[i] = a.read8(RX_BUF_OFF + i); }
-                    break;
-                }
-                ctx.yield_cpu();
-                s += 1;
-            }
+            // TRANSMIT ONLY - no coupled receive. There used to be a bounded wait here for a frame to
+            // land in descriptor 0, returned as the answer to the SEND. That is a frame sink attached
+            // to an operation with nothing to do with receiving, and any caller that ignored the reply
+            // to its own transmit destroyed whatever had just been picked up. Receiving is [4] and [9];
+            // the receiver stays armed and the frame waits for one of them.
             m.write32(REG_RCTL, 0); // quiesce
         }
 
         // Reply NON-BLOCKING (§8.9): a slow/dead net-stack can never wedge us. Then reclaim the cap
-        // slot so a long-running server stays bounded (§26.6).
-        let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n]));
+        // slot so a long-running server stays bounded (§26.6). EMPTY, not a status byte - callers
+        // already guard on `is_empty()` for "no frame", so nothing downstream changes and a status
+        // byte would be miscounted as a received frame by `udp_roundtrip`.
+        let _ = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[]));
         ctx.remove_cap(reply_cap);
     }
 }
