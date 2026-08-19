@@ -867,10 +867,27 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target
     // the call site already knew and threw the answer away.
     let mut sent = 0u32;
     let mut send_fail = 0u32;
+    // ONE MATCHER, TWO FEEDS. The frames reach this function by two different routes and both must be
+    // examined the same way; two copies of a protocol matcher is how one of them drifts.
+    //
+    // Route one is the drain below. Route two is the TRANSMIT REPLY, and missing it is what has made
+    // this function fail every time it has ever run on this board.
+    //
+    // `nic-driver` couples a receive to every transmit: it sends the frame, then does one bounded poll
+    // for an incoming frame and returns it as the transmit's reply ("TX FRAME + coupled RX" there). This
+    // call site discarded that reply. For most traffic that is invisible, because the poll usually finds
+    // nothing - but an ARP reply comes back from a gateway on the same LAN in about a millisecond, which
+    // is squarely inside that poll's window. So the coupled receive caught our ARP reply, handed it back
+    // as the answer to the send, and we threw it away. Every time, all six tries.
+    //
+    // That is the whole asymmetry the last several runs turned on: DHCP works because an offer takes
+    // tens of milliseconds and lands after the coupled poll has given up, so it arrives through the
+    // drain where somebody is looking. Nothing was ever wrong with the wire, the gateway, the filter or
+    // the frame - the reply was being delivered to a caller that dropped it. The driver's own counters
+    // said so all along: every frame it parsed, it handed out.
+    let mut result: Option<[u8; 6]> = None;
     for _ in 0..DANCE_TRIES {
-        if nic_req(ctx, &req, LINK_SECS).is_some() { sent += 1; } else { send_fail += 1; }
-        let mut result: Option<[u8; 6]> = None;
-        drain_scan(ctx, DANCE_SECS, |f| {
+        let mut scan = |f: &[u8], result: &mut Option<[u8; 6]>| -> bool {
             seen += 1;
             if f.len() >= 6 && f[0..6] == our_mac[..] { unicast += 1; }
             if f.len() >= 22 && f[12] == 0x08 && f[13] == 0x06 {
@@ -881,7 +898,7 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target
             if f.len() >= 42 && f[12] == 0x08 && f[13] == 0x06 && f[20] == 0x00 && f[21] == 0x02
                 && f[28] == target[0] && f[29] == target[1] && f[30] == target[2] && f[31] == target[3] {
                 let mut m = [0u8; 6]; m.copy_from_slice(&f[22..28]);
-                result = Some(m);
+                *result = Some(m);
                 true
             } else {
                 if build_arp_reply(f, our_ip, our_mac, &mut arp_out) {
@@ -889,8 +906,18 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target
                 }
                 false
             }
-        });
-        if let Some(m) = result { return Some(m); }
+        };
+        // Send, and READ WHAT THE SEND HANDED BACK before draining.
+        match nic_req(ctx, &req, LINK_SECS) {
+            Some(r) => {
+                sent += 1;
+                let f = r.payload_bytes();
+                if !f.is_empty() && scan(f, &mut result) { return result; }
+            }
+            None => send_fail += 1,
+        }
+        drain_scan(ctx, DANCE_SECS, |f| scan(f, &mut result));
+        if result.is_some() { return result; }
     }
     ctx.log_fmt(format_args!(
         "net-stack: ARP for {}.{}.{}.{} found nothing - {} sent {} SEND-FAILED, {} frames scanned, \
