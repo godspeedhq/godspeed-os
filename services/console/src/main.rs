@@ -91,24 +91,53 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut rendered: u64 = 0;
     let mut bytes: u64 = 0;
     loop {
-        let msg = ctx.recv();
-        // A request carries a REPLY CAP; console output never does. That, not the payload, is what
-        // tells the two apart - a byte stream can contain any bytes at all, so discriminating on
-        // content would mean a console write of the wrong single byte silently became a request.
-        match ctx.take_pending_cap() {
-            Some(reply_cap) => reply_dims(&ctx, reply_cap, &term, msg.payload_bytes()),
-            None => {
-                let body = msg.payload_bytes();
-                term.put_bytes(body);
-                rendered += 1;
-                bytes += body.len() as u64;
-                if rendered % RENDER_REPORT == 0 {
-                    ctx.log_fmt(format_args!(
-                        "console: rendered {} messages, {} bytes", rendered, bytes
-                    ));
+        // TAKE THE WHOLE QUEUE, THEN PAINT ONCE.
+        //
+        // Scrolling repaints the screen from the shadow grid, and this loop used to do that per
+        // message. Under load that is the entire cost of the terminal: sixteen queued lines meant
+        // sixteen full repaints where one shows the same result, and on hardware the service sat at
+        // 100% CPU with its queue jammed at 16/16 while every other service idled at 0/16.
+        //
+        // The damage was not slowness, it was the queue. A full queue has no room for the shell's echo
+        // of a keystroke, so typing produced no cursor and no feedback - it reads as a dead keyboard and
+        // is not one - and a full-screen `observe` repainting into the same queue tore, showing half a
+        // frame and then another. Draining the backlog first and painting once ends all three, because
+        // the queue empties at the speed of the copy into the shadow rather than the speed of the pixels.
+        //
+        // Blocking `recv` for the first message (idle costs nothing), then `try_recv` for whatever else
+        // has already arrived. This drains only what is ALREADY queued - a bounded 16 - so a producer
+        // that keeps writing cannot hold this loop here.
+        let mut msg = ctx.recv();
+        loop {
+            // A request carries a REPLY CAP; console output never does. That, not the payload, is what
+            // tells the two apart - a byte stream can contain any bytes at all, so discriminating on
+            // content would mean a console write of the wrong single byte silently became a request.
+            match ctx.take_pending_cap() {
+                // Answered immediately and NOT batched: the caller is blocked on this reply, and a
+                // dimensions query is cheap. Deferring it behind a paint would make every client wait
+                // for pixels it is not asking about.
+                Some(reply_cap) => {
+                    term.flush();
+                    reply_dims(&ctx, reply_cap, &term, msg.payload_bytes());
+                }
+                None => {
+                    let body = msg.payload_bytes();
+                    term.put_bytes(body);
+                    rendered += 1;
+                    bytes += body.len() as u64;
+                    if rendered % RENDER_REPORT == 0 {
+                        ctx.log_fmt(format_args!(
+                            "console: rendered {} messages, {} bytes", rendered, bytes
+                        ));
+                    }
                 }
             }
+            match ctx.try_recv() {
+                Some(next) => msg = next,
+                None => break,
+            }
         }
+        term.flush();
     }
 }
 

@@ -86,6 +86,19 @@ pub(crate) struct Fb {
     // borrowed-forever slice field: that spelling is an unowned mutable global in everything but name,
     // and this way there is exactly one route to the pixels and it is a `&mut self` borrow. The
     // single `unsafe` that produces the slice lives in the SDK's audited MMIO layer (§18.1).
+    /// A scroll has shifted the shadow grid and the screen has NOT been repainted for it yet.
+    ///
+    /// Scrolling repaints the whole screen from the shadow - about 8,000 glyph cells, several megabytes
+    /// of writes - and the terminal used to do that once per message. Under a flood that is the entire
+    /// cost: sixteen queued lines meant sixteen full repaints where one would have shown the same
+    /// result, and the service sat at 100% CPU with its queue jammed at 16/16 while every other service
+    /// idled. Interactive echo was stuck behind that queue, so typing produced no cursor and no
+    /// feedback, which reads as a dead keyboard and is not one.
+    ///
+    /// Deferring the paint makes a batch of lines cost ONE repaint. Nothing is dropped and nothing is
+    /// approximated - the shadow is updated for every byte exactly as before, and the screen is painted
+    /// from it once the batch is in. The flag is what remembers that the two have diverged.
+    pub(crate) repaint_pending: bool,
     pub(crate) mem: Option<Framebuffer>,
     pub(crate) pitch: usize,  // bytes per scanline
     pub(crate) bpp: usize,    // bytes per pixel
@@ -152,6 +165,7 @@ impl Term {
     pub fn new(fb: Framebuffer) -> Self {
         let mut t = Term {
             s: Fb {
+                repaint_pending: false,
                 mem: None,
                 pitch: 0,
                 bpp: 0,
@@ -195,6 +209,20 @@ impl Term {
     pub fn put_bytes(&mut self, bytes: &[u8]) {
         for &b in bytes {
             process_byte(&mut self.s, b);
+        }
+    }
+
+    /// Show everything written since the last flush.
+    ///
+    /// Separate from `put_bytes` so a caller that has several messages in hand can apply them all and
+    /// pay for ONE repaint. Calling it once per message is still correct - it is just the expensive way,
+    /// and it is what jammed the console under load.
+    pub fn flush(&mut self) {
+        if self.s.repaint_pending {
+            // Cleared FIRST: the repaint draws cells, and the cell painter skips drawing while a
+            // repaint is outstanding (there is no point painting what is about to be overpainted).
+            self.s.repaint_pending = false;
+            repaint_all(&mut self.s);
         }
         render::present();
     }
@@ -406,7 +434,12 @@ fn process_byte(s: &mut Fb, b: u8) {
 fn put_printable_cell(s: &mut Fb, cell: u8) {
     cursor_off(s);
     let (c, r) = (s.col, s.row);
-    render::draw_glyph(s, cell, c, r);
+    // The shadow is always updated; the PIXELS are skipped when a full repaint is already owed, because
+    // that repaint paints this cell from the shadow moments later. This is what makes a batch cheap:
+    // the lines that scroll off cost nothing to draw twice.
+    if !s.repaint_pending {
+        render::draw_glyph(s, cell, c, r);
+    }
     grid_set(s, c, r, cell);
     s.col += 1;
     if s.col >= s.cols {
@@ -671,6 +704,14 @@ fn scroll(s: &mut Fb) {
     // painted in the foreground colour, so a row whose tail is highlighted is not one rectangle. Those
     // cells fall back to the per-cell path rather than being flattened into the wrong colour, which is
     // the sort of shortcut that would show up as a highlight silently vanishing after a scroll.
+    // Deferred, not skipped: `flush` paints this before anything is shown. See `Fb::repaint_pending`.
+    s.repaint_pending = true;
+    let _ = cols;
+}
+
+/// Paint the whole screen from the shadow grid. The deferred half of `scroll`.
+fn repaint_all(s: &mut Fb) {
+    let (rows, cols) = (s.rows, s.cols);
     for r in 0..rows {
         let painted = paint_row_content(s, r, cols);
         blank_row_tail(s, r, painted, cols);
