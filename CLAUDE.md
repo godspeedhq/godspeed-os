@@ -2300,6 +2300,20 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 
 > **Failures are loud, never silent.**
 
+> **A failing Godspeed that preserves its invariants is preferable to a working Godspeed that violates
+> them.**
+
+The last one ranks the others. Every principle above can be traded against a deadline, a benchmark or a
+stubborn bug, and this says which way that trade goes: a system that fails while keeping its model
+intact is still this system, and can be fixed. A system that works by breaking its model is a different
+system that happens to run today, and what it has really lost is the reason to trust any of the rest of
+this document.
+
+This is not a preference for failure. It is a statement about what a fix is: making the system work
+WITHIN the model, and never widening the model to admit what is easier. Where the two genuinely cannot
+be reconciled, the honest move is to record the gap loudly and leave it open (§26.3) rather than close
+it with a violation.
+
 ---
 ---
 
@@ -2969,7 +2983,32 @@ A smaller coherent system is preferred over a larger impressive one.
 
 ---
 
-## 26.14 Preserve The Invariants
+## 26.14 Borrow The Mechanism, Never The Model
+
+Reference implementations are how this project learns hardware. Linux, BSD and u-boot are read as
+executable datasheets: which register the silicon needs written, in what order, with what value, and
+what the device does when you get it wrong. That reading is encouraged and has repeatedly been the
+difference between a working driver and a week of guessing.
+
+What is borrowed is the SILICON'S requirement. What is not borrowed is the other system's model.
+
+Those two are easy to confuse, because they arrive in the same file. A register write sequence is a
+fact about the hardware and belongs here unchanged. An ambient global, an unbounded buffer, a heap
+allocation on a hot path, a driver living in the kernel because that is where the reference put it -
+those are that system's answers to that system's constraints, and they are not facts about anything.
+Importing them because "Linux does it" is how a model rots while every individual change looks
+justified.
+
+The test is one question: **is this a property of the device, or a property of their design?** Ordering,
+timing, magic values, error semantics, what a bit means - the device. Where the state lives, who owns
+it, how it is allocated, what happens when it fails - ours to decide, under the constitution.
+
+Divergence from a reference is therefore normal and does not need apologising for; it needs recording.
+When this system deliberately does something differently, say so at the point of difference and say
+why, so the next reader knows it was a decision and not an oversight. Silent divergence is how a port
+acquires bugs nobody can explain; unexplained convergence is how it acquires violations nobody noticed.
+
+## 26.15 Preserve The Invariants
 
 Every contributor is responsible for preserving:
 - identity over location;
@@ -2990,7 +3029,7 @@ The default answer to architectural uncertainty is:
 
 ---
 
-## 26.15 Final Reminder
+## 26.16 Final Reminder
 
 The system is allowed to evolve.
 
