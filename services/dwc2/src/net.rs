@@ -120,8 +120,6 @@ pub struct Nic {
     pub in_armed: bool,
     /// Consecutive polls that found the armed IN still enabled and not complete, and how many times we
     /// have reported a long run of them. Diagnostic only - nothing acts on these.
-    pub in_stuck: u32,
-    pub in_stuck_logs: u32,
     pub pid_in: u32,
     pub pid_out: u32,
     /// Cached PHY link state, and when it was read.
@@ -340,7 +338,6 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
     Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(),
                rxbuf: [0u8; RXQ_BYTES], rxbuf_fill: 0, rxbuf_pos: 0, rxq_count: 0,
                in_armed: false,
-               in_stuck: 0, in_stuck_logs: 0,
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
                link_up: false, link_at: 0,
                tx_fail_run: 0, tx_backoff_at: 0, tx_hcint: 0, tx_nohalt: 0, tx_nptxsts: 0,
@@ -1204,41 +1201,18 @@ pub fn rx(
         // core NAK-retries in hardware without halting, so this is the ordinary quiet case.
         nic.stats.rx_nohalt = nic.stats.rx_nohalt.wrapping_add(1);
         nic.stats.rx_hcint = hcint;
-        // REPORT A LONG RUN OF THIS, AND DO NOTHING ABOUT IT.
+        // A long run of this used to be logged here, on the way to finding the data toggle error.
+        // It is gone, and the reason is worth keeping: the line fired on the ORDINARY quiet case, so it
+        // read as an alarm when nothing was wrong. Everything it printed is already in the periodic
+        // report (`net IN HCINT=... nohalt N`, which carries the same interrupt state and the same
+        // outstanding-poll count as a plain fact rather than a warning), and the fault it was built to
+        // find now has `rx_tglerr` - silent when healthy, non-zero only when frames are actually being
+        // destroyed, and always on rather than capped at four reports.
         //
-        // A previous attempt halted and re-armed the channel here, on the theory that it was wedged.
-        // That made loss WORSE - 23% to 36% - because this state is also the ORDINARY one: with BIR set
-        // the core NAK-retries in hardware without halting, so an armed IN on a quiet link sits here by
-        // design, and tearing it down every eighty milliseconds destroyed healthy transfers. The theory
-        // was wrong and the measurement said so; it is reverted.
-        //
-        // What is still unexplained is real: a ping window of 904 ms saw 91 fruitless polls, and the
-        // reply appeared 32 ms into the next ping - immediately after that ping's transmit halted and
-        // re-armed this channel. So a transmit does something a bare re-arm does not.
-        //
-        // This logs the state that distinguishes the two remaining possibilities, and the deciding
-        // number is RX_FIFO_INF: whether the DEVICE is holding data we are failing to fetch, or whether
-        // it has nothing because the frame never reached it. Those are opposite faults - one is ours,
-        // one is the device's aggregation - and no counter so far separates them. Bounded to four
-        // reports so a persistently quiet link cannot flood the console.
-        nic.in_stuck = nic.in_stuck.saturating_add(1);
-        if nic.in_stuck == 40 && nic.in_stuck_logs < 4 {
-            nic.in_stuck_logs += 1;
-            // MMIO ONLY, DELIBERATELY. This used to also read the device's RX_FIFO_INF, which was the
-            // measurement that identified the toggle error - but that is a USB CONTROL TRANSFER issued
-            // from inside the receive path, and a control transfer here can disturb a parked storage
-            // transfer that owns the shared channel. It was worth the risk while it was answering a
-            // question; it is not worth carrying now that the answer is in. These reads touch only the
-            // controller's own registers and cannot perturb anything.
-            let nptxsts = mmio.read32(crate::regs::GNPTXSTS);
-            ctx.log_fmt(format_args!(
-                "dwc2-svc: IN outstanding for {} polls - HCCHAR={:#010x} HCINT={:#010x} HCTSIZ={:#010x} GNPTXSTS={:#010x} (qfree {})",
-                nic.in_stuck, hcchar, hcint,
-                mmio.read32(chan::hctsiz_at(CH_NET_RX)), nptxsts, (nptxsts >> 16) & 0xFF));
-        }
+        // A warning that fires when nothing is wrong is worse than no warning: it teaches the reader to
+        // skip the line, which is how a real one gets skipped later.
         return 0;
     }
-    nic.in_stuck = 0;
     if hcint & crate::regs::HCINT_STALL != 0 {
         // A halted endpoint is a hard failure, never retried by re-arming into the same condition.
         nic.stats.rx_hcint = hcint;
