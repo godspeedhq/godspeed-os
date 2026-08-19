@@ -5441,7 +5441,15 @@ fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellE
         // us "no reply arrived" (0 UDP) from "a reply arrived but did not match our port" (UDP > 0).
         let (fr, ud) = if p.len() >= 7 { (p[5], p[6]) } else { (0, 0) };
         let to = if p.len() >= 8 { p[7] } else { 0 };
-        out.line_fmt(ctx, format_args!("{}: no reply from the DNS server ({} frames, {} UDP, {} timeouts)", host, fr, ud, to));
+        // NAME THE LAYER THAT IS MISSING, not the one that stayed quiet. A lookup made with no lease
+        // has no gateway to send through, so nothing was ever put on the wire - and blaming the DNS
+        // server for not answering a question it never received points the reader at the network when
+        // the answer is on this machine. Only when there is no such reason do we report what we saw.
+        match net_unconfigured_reason(ctx) {
+            Some(why) => out.line_fmt(ctx, format_args!("{}: not resolved - {}", host, why)),
+            None => out.line_fmt(ctx, format_args!(
+                "{}: no reply from the DNS server ({} frames, {} UDP, {} timeouts)", host, fr, ud, to)),
+        }
         Err(ShellError::Unknown)
     }
 }
@@ -5481,6 +5489,39 @@ fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> 
 /// Used only to explain an UNSET clock: "the network is up and being asked" and "there is no cable" are
 /// different situations for the user, and one of them is not going to resolve itself. A short deadline
 /// and a pessimistic default - if nic-driver does not answer we do not claim a link.
+/// Why a network request could not possibly have worked, or `None` if no such reason is known.
+///
+/// This exists because "no reply from the DNS server" was being printed for lookups the DNS server
+/// never heard. On a stack with no lease there is no gateway and no route, so the query goes nowhere -
+/// and the honest counters said so plainly, `0 frames, 0 UDP, 0 timeouts`, which is what "we never
+/// sent anything anybody could answer" looks like. Reporting that as a silent remote host accuses the
+/// wrong party and sends the reader looking at the network instead of at their own configuration.
+///
+/// `None` means "no better explanation available", NOT "everything is fine": if net-stack does not
+/// answer the status query, or answers something too short to read, we do not know why the lookup
+/// failed and must not invent a reason. The caller falls back to reporting exactly what it observed.
+///
+/// The order is the order the layers come up in, so the FIRST missing one is named rather than the
+/// last: a machine with no cable is told about the cable, not about its gateway.
+fn net_unconfigured_reason(ctx: &ServiceContext) -> Option<&'static str> {
+    if !net_link_up(ctx) {
+        return Some("no link (cable unplugged?)");
+    }
+    let r = ctx.request_with_reply_deadline("net-stack", &Message::from_bytes(&[0u8]), 3)?;
+    let p = r.payload_bytes();
+    if p.len() < 15 {
+        return None;                      // cannot read the status - say nothing rather than guess
+    }
+    // Flag byte: bit 0 = gateway resolved by ARP, bit 2 = DHCP granted this address.
+    if p[14] & 4 == 0 {
+        return Some("no address yet - DHCP has not completed");
+    }
+    if p[14] & 1 == 0 {
+        return Some("no route - the gateway has not answered ARP");
+    }
+    None
+}
+
 fn net_link_up(ctx: &ServiceContext) -> bool {
     let req = Message::from_bytes(&[3u8]);
     match ctx.request_with_reply_deadline("nic-driver", &req, 2) {
