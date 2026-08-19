@@ -1202,12 +1202,18 @@ pub fn rx(
         nic.in_stuck = nic.in_stuck.saturating_add(1);
         if nic.in_stuck == 40 && nic.in_stuck_logs < 4 {
             nic.in_stuck_logs += 1;
-            let fifo = smsc_read_or0(ctx, mmio, dma, t, SMSC_RX_FIFO_INF);
+            // `smsc_read_or0` FABRICATES ZERO on a failed transfer, so it cannot be used here: the
+            // whole question is whether the device holds data, and "empty" and "the read did not
+            // happen" would both print as 0. That is the same silent fallback that once made a dead
+            // MDIO read as a confident "link down". Ask the fallible reader and say which it was.
+            let fifo = smsc_read(ctx, mmio, dma, t, SMSC_RX_FIFO_INF);
             ctx.log_fmt(format_args!(
-                "dwc2-svc: IN outstanding for {} polls - HCCHAR={:#010x} HCINT={:#010x} HCTSIZ={:#010x} GNPTXSTS={:#010x} RX_FIFO_INF={:#010x}",
+                "dwc2-svc: IN outstanding for {} polls - HCCHAR={:#010x} HCINT={:#010x} HCTSIZ={:#010x} GNPTXSTS={:#010x} (qfree {}) RX_FIFO_INF={}",
                 nic.in_stuck, hcchar, hcint,
                 mmio.read32(chan::hctsiz_at(CH_NET_RX)),
-                mmio.read32(crate::regs::GNPTXSTS), fifo));
+                mmio.read32(crate::regs::GNPTXSTS),
+                (mmio.read32(crate::regs::GNPTXSTS) >> 16) & 0xFF,
+                match fifo { Some(v) => v as i64, None => -1 }));
         }
         return 0;
     }
