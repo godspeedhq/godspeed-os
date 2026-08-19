@@ -545,3 +545,37 @@ if $leaseok > 0 {
 } else {
     fail 'net: no lease after 20s - the receive path or DHCP is broken'
 }
+
+# ---- network: NAME RESOLUTION, asserted only where it can be OUR fault -----------------------
+#
+# What it catches: DNS is a different code path from everything above it. ICMP can be perfect while
+# UDP request/reply is broken - and it was, twice in one session. `nic-driver` used to hand a received
+# frame back as the answer to a TRANSMIT, and `udp_roundtrip` collected its first frame from that
+# reply and its next from an ARP-reply's; decoupling that touched DNS and nothing else. Ping stayed
+# green throughout. The suite would not have noticed either way, because nothing here resolved a name.
+#
+# GATED ON THE INTERNET BEING DEMONSTRABLY REACHABLE, and that is the whole design. A machine with no
+# cable, no DHCP server, no route, or no WAN cannot resolve a name, and none of that is a defect in
+# this system - failing there would be a suite that cries wolf on a laptop at a coffee shop. So the
+# assertion runs ONLY after ICMP to the internet has just succeeded. Once that holds, the network is
+# proven end to end, and a name that will not resolve is ours: same cable, same lease, same gateway,
+# same driver, different code path. The skip is not a weakened check, it is the check declining to
+# make a claim it cannot support.
+#
+# ONE RETRY, bounded, for the same reason the lease gate retries: a single lost UDP datagram is not a
+# broken resolver, and DNS has no retransmit of its own here.
+let mut dnsok = 0
+if ping count 2 8.8.8.8 {
+    for i in range 2 {
+        if $dnsok < 1 {
+            if net dns example.com { dnsok = 1 } else { wait 1 }
+        }
+    }
+    if $dnsok > 0 {
+        echo 'PASS  dns - names resolve over a network that is proven reachable'
+    } else {
+        fail 'dns: ICMP to 8.8.8.8 works but no name resolves - the UDP request/reply path is broken'
+    }
+} else {
+    echo 'PASS  dns - skipped, no internet to resolve through (not a fault of this system)'
+}
