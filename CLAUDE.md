@@ -525,6 +525,15 @@ official, not the runtime behaviour.
 > (`docs/console-service.md` §9). Verified on hardware: chaos 50 rounds, 0 kernel panics, 0 liveness
 > wedges, selfcheck 350/0.
 
+> **[SUPERSEDED IN PART by the 2026-08-17 amendment above - read that first.] The in-kernel ARM USB
+> stack this describes NO LONGER EXISTS: `arch/arm/dwc2.rs` is deleted and `services/dwc2` drives the
+> controller from userspace on `USB_VECTOR`. Kept because §1 makes an amendment ratified history - this
+> records why ARM USB was ever a TCB member, which is what the later amendment is a reply to. What
+> still holds is the DMA half: the Pi 2 has no IOMMU/SMMU (`iommu::confine_device` returns `false` on
+> this arch), so a COMPROMISED driver remains kernel-equivalent by §6.4's rule. A buggy one is now
+> bounded and restartable. This block is placed out of date order, after the amendment that supersedes
+> it, so it is marked rather than left to be read as current.]**
+>
 > **Amendment 2026-07-23 (SEC-29/SEC-30): on the ARM32 (Raspberry Pi 2) port the USB drivers are
 > in-kernel TCB members - a machine/arch-dependent posture, the ARM analog of the no-IOMMU case above,
 > and larger.** The amendments above concern *userspace* USB drivers (`xhci`/`ehci`) confined - or not -
