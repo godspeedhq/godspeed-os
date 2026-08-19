@@ -333,7 +333,7 @@ os/
 > So the honest form of the Phase D claim is: **`fs` is restartable everywhere; it is crash-recoverable
 > on a backend that can be ordered.** Where it cannot be, `fs` remains restartable (its death is still a
 > supervisor restart, never a reboot - §6.2 is untouched) and a *power loss* may require a reformat.
-> Recorded rather than closed, per §26.3: the fix is a block path that can wait out a busy device
+> Recorded rather than closed, per §26.7: the fix is a block path that can wait out a busy device
 > without holding the core, which is real work and not a constant.
 
 > **Amendment 2026-06-09 (H11): `registry` is no longer a TCB member.** It became a
@@ -544,7 +544,7 @@ official, not the runtime behaviour.
 > frames**, and it is a TCB member by construction. This is **strictly more** than the no-IOMMU x86 case:
 > there the driver is untrusted-but-userspace with only its *DMA* unconfined; here the driver *is* the
 > kernel. It is not fixable on this hardware - the Pi 2 has no IOMMU/SMMU to confine USB DMA regardless,
-> and the userspace-driver split awaits device-IRQ-to-userspace routing - so, per §26.3, it is **recorded**
+> and the userspace-driver split awaits device-IRQ-to-userspace routing - so, per §26.7, it is **recorded**
 > rather than closed. Two consequences follow: (a) the memory-safety of `arch/arm/dwc2.rs` is TCB-critical
 > (audited: `docs/unsafe-audit.md`, `docs/security-audit.md` Audit 2, no UB/OOB/race); (b) **SEC-2's win
 > does not travel to ARM** - "REBOOT lives only with the shell, not the USB driver" is an x86 property; an
@@ -2854,6 +2854,19 @@ result and continuing - converts a loud failure into a silent one and hides exac
 operator needs to see. Every failure path, including a retry that ultimately fails, is reported, never
 swallowed. This holds in any language: an ignored error return is the same silent fallback as a
 suppressed exception.
+
+**A limitation that cannot be closed is RECORDED, never papered over.** The rule above governs what the
+system does at runtime; this governs what the project says about itself, and it is the same refusal to
+hide. Some gaps cannot be closed today - the hardware has no such unit, the fix is real work and not a
+constant, the honest guarantee is narrower than the one already claimed. The temptation is to leave the
+broader claim standing because it is nearly true. Write the gap down instead: state plainly what does
+NOT hold, where, and why, at the place a reader would otherwise rely on the claim.
+
+A recorded limitation is a thing the next person can fix and can plan around. An unrecorded one is
+discovered by whoever trusts the document, usually at the worst moment, and it costs them the right to
+trust the rest of it. This is why a narrowed guarantee is amended into the text rather than quietly
+left; §6.1's backend-conditional crash-recovery claim and its ARM DMA posture are both here for exactly
+this reason.
 
 ---
 
