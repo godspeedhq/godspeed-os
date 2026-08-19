@@ -23,6 +23,8 @@
 #![no_main]
 
 use godspeed_sdk::{ServiceContext, Message, Mmio, Dma};
+#[cfg(target_arch = "arm")]
+use godspeed_sdk::DeadlineOutcome;
 
 /// The Pi 4's on-board GENET MAC, driven from HERE instead of from the kernel (Commandment I).
 ///
@@ -596,18 +598,47 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         // Bounded on the lean await: a dwc2 that is alive but silent hung this driver, net-stack
         // behind it, and the shell behind that.
         const DWC2_SECS: i64 = 10;
-        if let Some(r) = ctx.request_with_reply_deadline("dwc2", msg, DWC2_SECS) { return Some(r); }
-        let _ = ctx.reacquire_by_name("dwc2");
-        ctx.request_with_reply_deadline("dwc2", msg, DWC2_SECS)
+        // The op we asked about. Every reply is tagged with it (see `net_dispatch` in dwc2), which is
+        // what lets a stale answer be recognised instead of believed.
+        let want = msg.payload_bytes().first().copied().unwrap_or(0);
+        // NEVER RE-SEND AFTER A TIMEOUT. This used to retry unconditionally, and for the RX op that is
+        // actively destructive: dwc2 POPS a frame to build each reply, so re-asking after a timeout pops
+        // a SECOND frame while the first reply is still queued unread. The retry exists for one real
+        // case - `find_send_slot` reads spawn-time wiring, so a peer spawned after us is unreachable
+        // until reacquired - and that case is a SEND failure, which is distinguishable from a timeout.
+        let got = match ctx.request_with_reply_deadline_outcome("dwc2", msg, DWC2_SECS) {
+            DeadlineOutcome::Reply(r) => r,
+            DeadlineOutcome::SendFailed if ctx.reacquire_by_name("dwc2") =>
+                ctx.request_with_reply_deadline("dwc2", msg, DWC2_SECS)?,
+            _ => return None,
+        };
+        // RE-SYNC ON THE TAG, BY DROPPING THE STALE ANSWER AND NOT ASKING AGAIN.
+        //
+        // A reply that answers a different op is a previous request's answer arriving after we stopped
+        // waiting for it. Believing it is what destroyed frames: an RX reply read as an INFO reply is a
+        // frame consumed as a status word, and every reply afterwards is one behind, permanently.
+        //
+        // The repair is to CONSUME it and report failure - not to re-ask. Re-asking is the destructive
+        // move this function was just fixed to stop doing: each RX request pops a frame off the device
+        // to build its reply, so a resend costs a frame every time round. Consuming the stale one has
+        // already shortened the queue by one, so the alignment improves with each occurrence and repairs
+        // itself. The caller sees "nothing this time" - `dev_rx` returns 0, the batch loop stops, and
+        // net-stack polls again a few milliseconds later - which is a normal quiet-network answer and
+        // costs only the frame that was already late.
+        if got.payload_bytes().first().copied() != Some(want) {
+            return None;
+        }
+        Some(got)
     };
     #[cfg(target_arch = "arm")]
     let dev_info = |ctx: &ServiceContext, out: &mut [u8; 7]| -> bool {
+        // Replies are [op, body...]; `dwc2_rpc` has already checked the op, so the body starts at 1.
         match dwc2_rpc(ctx, &Message::from_bytes(&[0x10])) {
             Some(r) => {
                 let p = r.payload_bytes();
-                if p.len() < 8 || p[0] == 0 { return false; }
-                out[0..6].copy_from_slice(&p[1..7]);
-                out[6] = p[7];
+                if p.len() < 9 || p[1] == 0 { return false; }
+                out[0..6].copy_from_slice(&p[2..8]);
+                out[6] = p[8];
                 true
             }
             None => false,
@@ -622,7 +653,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         req[0] = 0x11;
         req[1..1 + n].copy_from_slice(&frame[..n]);
         match dwc2_rpc(ctx, &Message::from_bytes(&req[..1 + n])) {
-            Some(r) => { let p = r.payload_bytes(); !p.is_empty() && p[0] != 0 }
+            Some(r) => { let p = r.payload_bytes(); p.len() > 1 && p[1] != 0 }
             None => false,
         }
     };
@@ -631,12 +662,12 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         match dwc2_rpc(ctx, &Message::from_bytes(&[0x12])) {
             Some(r) => {
                 let p = r.payload_bytes();
-                if p.len() < 2 { return 0; }
-                let n = (p[0] as usize) | ((p[1] as usize) << 8);
+                if p.len() < 3 { return 0; }
+                let n = (p[1] as usize) | ((p[2] as usize) << 8);
                 // A length the reply cannot back is a malformed answer, not a short frame - taking it
                 // would hand the stack whatever followed in the message buffer.
-                if n == 0 || p.len() < 2 + n || n > buf.len() { return 0; }
-                buf[..n].copy_from_slice(&p[2..2 + n]);
+                if n == 0 || p.len() < 3 + n || n > buf.len() { return 0; }
+                buf[..n].copy_from_slice(&p[3..3 + n]);
                 n
             }
             None => 0,

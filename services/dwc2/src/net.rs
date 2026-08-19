@@ -1384,14 +1384,35 @@ pub fn serve(
     if p.is_empty() {
         return false;
     }
-    let mut out = [0u8; FRAME_MAX + 4];
+    // EVERY REPLY IS TAGGED WITH THE OP IT ANSWERS.
+    //
+    // This endpoint carries three net ops - INFO, TX, RX - on one channel, and until now a reply said
+    // nothing about which one it was answering. That is safe only while request and reply stay in
+    // lockstep, and they do not: `nic-driver` bounds its wait, so a reply that arrives after its
+    // deadline is still queued when the NEXT request goes out. From then on every answer is one behind,
+    // permanently, and the damage is not merely a late answer - an RX reply read as an INFO reply is a
+    // FRAME consumed as a status word. The frame is destroyed and the status is garbage.
+    //
+    // That is what the counters were showing: six unicast ARP frames arrived and were parsed here,
+    // `0 DROPPED, 0 queued`, and net-stack reported no ARP replies at all. The gateway was answering
+    // the whole time.
+    //
+    // It is also why this worked before the driver left the kernel. `nic-driver` used to reach the
+    // device through the `net_frame_rx` SYSCALL - one call, one frame, no reply stream to misalign.
+    // The IPC hop that replaced it introduced the failure, so the hop is where the fix belongs.
+    //
+    // `fs` has had exactly this and exactly this fix since the "run ls twice" desync
+    // (`docs/net-tags-design.md` is the design for this path). The tag costs one byte per reply.
+    let mut out = [0u8; FRAME_MAX + 5];
+    out[0] = p[0];
+    let body = &mut out[1..];
     let n = match p[0] {
         OP_NET_INFO => {
             // [ok, mac(6), link]. The link bit is reported as UP: this driver does not yet read the
             // PHY, and saying so here rather than inventing a "down" keeps net-stack from concluding
             // the cable is out. Reading it properly is the remaining piece of this slice.
-            out[0] = 1;
-            out[1..7].copy_from_slice(&nic.mac);
+            body[0] = 1;
+            body[1..7].copy_from_slice(&nic.mac);
             // The PHY's own link bit, not an assumption. Reporting a hardcoded UP made net-stack
             // spend its DHCP budget against a cable that may not be there, and made "no link" and
             // "link up but silent" indistinguishable from the outside - the two things a diagnosis
@@ -1406,11 +1427,11 @@ pub fn serve(
             nic.stats.rx_fifo = smsc_read_or0(ctx, mmio, dma, t, SMSC_RX_FIFO_INF);
             nic.tx_fifo_free = smsc_read_or0(ctx, mmio, dma, t, SMSC_TX_FIFO_INF) & 0xFFFF;
             nic.stats.int_sts = smsc_read_or0(ctx, mmio, dma, t, SMSC_INT_STS);
-            out[7] = u8::from(up);
+            body[7] = u8::from(up);
             8
         }
         OP_NET_TX if p.len() > 1 => {
-            out[0] = u8::from(tx(ctx, mmio, dma, t, nic, &p[1..]));
+            body[0] = u8::from(tx(ctx, mmio, dma, t, nic, &p[1..]));
             1
         }
         OP_NET_RX => {
@@ -1423,9 +1444,9 @@ pub fn serve(
             }
             let mut frame = [0u8; FRAME_MAX];
             let got = nic.rxq_pop(&mut frame);
-            out[2..2 + got].copy_from_slice(&frame[..got]);
-            out[0] = (got & 0xFF) as u8;
-            out[1] = ((got >> 8) & 0xFF) as u8;
+            body[2..2 + got].copy_from_slice(&frame[..got]);
+            body[0] = (got & 0xFF) as u8;
+            body[1] = ((got >> 8) & 0xFF) as u8;
             got + 2
         }
         // ANSWER, do not return. The comment here used to read "not a net op - the block server gets a
@@ -1441,11 +1462,12 @@ pub fn serve(
         // A one-byte error reply is the same answer the no-NIC path gives fifteen lines away in
         // `dispatch`, and for the same stated reason: silence would hang the client.
         _ => {
-            out[0] = 0;
+            body[0] = 0;
             1
         }
     };
-    let _ = ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n]));
+    // `n` is the BODY length; the tag at byte 0 rides in front of it.
+    let _ = ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n + 1]));
     ctx.remove_cap(reply);
     true
 }
