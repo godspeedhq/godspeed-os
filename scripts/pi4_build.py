@@ -33,7 +33,7 @@ the `xhci` service that drives it instead). See where it is handled below.
 
 usage:  python scripts/pi4_build.py [--debug] [--features a,b]
 """
-import subprocess, sys, os, pathlib, re
+import subprocess, sys, os, pathlib, re, shutil
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROFILE = "debug" if "--debug" in sys.argv else "release"
@@ -157,4 +157,18 @@ addr = lma
 run([tool("rust-objcopy"), "-O", "binary", str(elf), str(img)])
 print(f"OK  {img.relative_to(ROOT)}  ({img.stat().st_size} bytes, "
       f".text VMA {vma:#x} / LMA {addr:#x}, feature={FEATURES}, profile={PROFILE})")
-print("Deploy: copy build/kernel8.img to the SD card as the name config.txt's `kernel=` line points at.")
+# Stage the canonical Pi 4 boot config next to the kernel, so deploying is copying TWO files
+# from build/ - the config the boot depends on is versioned in the repo (boot/pi4/config.txt),
+# never re-typed onto a card by hand. Same rule as the Pi 2 (scripts/arm_build.py).
+cfg_src = ROOT / "boot" / "pi4" / "config.txt"
+if cfg_src.exists():
+    shutil.copyfile(cfg_src, img.parent / "config.txt")
+    print("OK  build/config.txt   (canonical copy of boot/pi4/config.txt)")
+else:
+    # Loud, not silent: a missing config means the card would keep whatever `kernel=` line it
+    # already had, and boot SOMEONE ELSE'S kernel while reporting a successful build.
+    print(f"WARNING: {cfg_src} is missing - build/config.txt NOT staged")
+
+print("Deploy to Pi 4: copy build/kernel8.img to the card's FAT boot partition AS godspeed8.img,")
+print("                and build/config.txt as config.txt. The name differs on purpose: it leaves")
+print("                a stock Raspberry Pi OS kernel8.img in place as a known-good fallback.")
