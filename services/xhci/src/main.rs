@@ -190,6 +190,14 @@ impl SliceAlloc {
 
 /// Free a slot back to the controller (Disable Slot) for a probed device we do not keep - a non-HID
 /// downstream device - so controller slots do not leak across a hot-plug re-scan.
+///
+/// The completion is CHECKED, because this is the release half of a bounded resource. The controller
+/// has `max_slots` of them (`HCSPARAMS1`, typically 32 or 64) and a hot-plug re-scan runs this on
+/// every downstream device it probes and declines. A Disable Slot that silently failed would leak one
+/// slot per pass until Enable Slot started refusing - and the refusal surfaces far away, as "Address
+/// Device FAILED (route/TT)", which blames the topology for what is actually an exhausted pool. So a
+/// failure is named HERE, at the leak, rather than left to be misread THERE, at the symptom (§26.7:
+/// a recovery that itself fails is still a failure, and must stay as visible as the original).
 #[allow(clippy::too_many_arguments)]
 fn disable_slot(
     ctx: &ServiceContext,
@@ -204,7 +212,7 @@ fn disable_slot(
 ) {
     let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
     *cmd_idx += 1;
-    let _ = run_command(
+    let done = run_command(
         ctx,
         dma,
         mmio,
@@ -218,6 +226,17 @@ fn disable_slot(
         ev_idx,
         ev_cycle,
     );
+    match done {
+        Some((1, _)) => {}
+        Some((cc, _)) => ctx.log_fmt(format_args!(
+            "xhci: Disable Slot {} REFUSED (completion={}) - that controller slot is now leaked",
+            slot, cc
+        )),
+        None => ctx.log_fmt(format_args!(
+            "xhci: Disable Slot {} never completed - that controller slot is now leaked",
+            slot
+        )),
+    }
 }
 
 /// Decode ONE completed HID report for device `d` and push it to the console.
@@ -1215,6 +1234,22 @@ fn address_downstream(
         ev_cycle,
     )?;
     if comp != 1 {
+        // Name the RESOURCE failure here. The caller's only report is "Address Device FAILED
+        // (route/TT)", which points at the route string and the transaction translator - the two
+        // genuinely hard things to get right, and so the two a reader will go and re-derive. But
+        // Enable Slot runs BEFORE either is used: completion 9 is No Slots Available, and the honest
+        // reading of it is "the controller has no slot left", usually because a Disable Slot failed
+        // and leaked them. Report the layer that actually refused, not the one that looks guilty.
+        ctx.log_fmt(format_args!(
+            "xhci: Enable Slot REFUSED (completion={}) for the device on hub port {} - {}",
+            comp,
+            parent_port,
+            if comp == 9 {
+                "controller has NO SLOTS LEFT (see any leaked-slot lines above); NOT a route/TT fault"
+            } else {
+                "the controller rejected the request; NOT a route/TT fault"
+            }
+        ));
         return None;
     }
     // Input context: Add slot + EP0.
