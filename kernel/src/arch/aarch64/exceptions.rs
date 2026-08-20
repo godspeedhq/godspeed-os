@@ -714,6 +714,56 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     // userspace fault and silently kill a task over a KERNEL bug, which would hide the far more
     // serious problem behind a restart.
     let from_el0 = (8..=11).contains(&vector) && (f.spsr & 0x1F) == 0;
+
+    // THE FRAME ITSELF, when the fault came from EL0.
+    //
+    // The registers above say WHAT was in flight; they cannot say whether the frame under it is
+    // intact. That distinction is the whole question in the class of fault this was added for: the
+    // Pi 4 shell died repeatedly with `ELR_EL1 = 0`, `x29 = 0` and `x30 = 0` at a stack only 27% deep,
+    // which is a branch to address zero from a frame that looks ZEROED rather than one that ran out of
+    // room. Registers alone cannot separate "something wrote zeros over the saved LR" from "a null
+    // function pointer was called with a legitimately empty frame" - and those are different bugs with
+    // different fixes. The words at SP say which.
+    //
+    // Read through the USER-COPY SEAM, never a raw dereference. The stack we are asked to print
+    // belongs to a task that just faulted, so assuming any of it is mapped is exactly the assumption
+    // that is already known to be false here. `read_user_bytes` validates the range is user-space and
+    // copies under the fault fixup: an unmapped window returns `None` and prints a line saying so,
+    // rather than taking a fault INSIDE the fault handler and turning a dead service into a dead
+    // machine. A diagnostic that can panic the kernel is not worth the diagnosis.
+    //
+    // Gated on `from_el0`, the binding computed just above, rather than a second copy of the
+    // vector/SPSR test. Two spellings of one condition drift, and the drift here would be silent:
+    // the dump would print for a case the kill path does not treat as userspace, or stay quiet for
+    // one it does.
+    //
+    // Bounded at 16 words: enough to cover a small frame's saved-register area, small enough that a
+    // fault storm cannot flood the console with a service's stack.
+    if from_el0 {
+        const WORDS: usize = 16;
+        super::put_str(b"\r\n    stack at SP_EL0 (");
+        super::put_dec(WORDS as u64);
+        super::put_str(b" words, low to high):");
+        match crate::arch::imp::uaccess::read_user_bytes(sp_el0, WORDS * 8) {
+            Some(bytes) => {
+                for i in 0..WORDS {
+                    if i % 2 == 0 {
+                        super::put_str(b"\r\n      ");
+                        super::put_hex(sp_el0 + (i as u64) * 8);
+                        super::put_str(b": ");
+                    }
+                    let mut w = [0u8; 8];
+                    w.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+                    super::put_hex(u64::from_le_bytes(w));
+                    super::put_str(b" ");
+                }
+            }
+            // Not a failure of the dump - a FACT about the task, and one worth as much as the words
+            // would have been: a stack pointer whose own frame is unreadable is itself the answer.
+            None => super::put_str(b"\r\n      unreadable (SP is outside the task's mapped stack)"),
+        }
+    }
+
     if from_el0 && slot < crate::task::scheduler::MAX_TASKS {
         super::put_str(b"\r\n    EL0 fault - killing the task; the kernel and every other service continue.\r\n");
         crate::task::kill_current();
