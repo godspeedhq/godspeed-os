@@ -106,22 +106,31 @@ const PATH_MAX: usize = 120; // fits in MAX_LINE; path_len is u8
 // End-of-stream marker a producer service sends to a built-in sink (the shell draining a
 // `service | write` pipe). A non-empty sentinel - the IPC path doesn't deliver an empty body.
 const PIPE_EOT: u8 = 0x04; // ASCII EOT
-// One pipe stage's buffer. 64 KiB so a producer (`tree /`, `find …`) can capture a large
-// listing without being clipped at the buffer.
+// One pipe stage's buffer.
 //
-// **REVERTED to 64 KiB, deliberately.** It was cut to 16 KiB to fix a Pi 4 shell crash, and that
-// was not evidence-led: the fault happened at 27% of the stack with 190 KiB free, which contradicts
-// stack exhaustion outright, and I changed this anyway on a story about corruption happening deep
-// and surfacing shallow. Worse, the change was tested on the same boot as a `drives flash`, so a
-// filesystem that had carried a bad block for an hour was wiped in the same step - two variables,
-// one result, no isolation. The crash may well have been the damaged tree all along.
+// 16 KiB, and this number is now MEASURED rather than argued. It was 64 KiB; it was cut to 16 on a
+// theory, reverted when the user rightly pointed out the theory had no evidence behind it, and is
+// back because the kernel's EL0 stack dump finally caught the fault in the act:
 //
-// What IS measured and still true: `pipe_run`'s frame is ~143 KiB here, 55% of the 256 KiB user
-// stack, on BOTH boards (Pi 2: 143,884, Pi 4: 143,360). That is a real latent bound and the
-// stack-fit gate now reports it on every build - but a latent risk is not the bug in front of us,
-// and treating it as one cost the Pi 2 a capability it never needed to lose. If the crash returns
-// on a clean disk with this at 64 KiB, the reduction earns its place; until then it has not.
-const CAP_MAX: usize = 64 * 1024;
+//     > roster | select name seat | to json | assert contains Luke
+//     *** aarch64 EXCEPTION  ELR_EL1 = 0x0  x30 = 0x0
+//         SP_EL0 = 0x7ffd2a90   x29 = 0x7fffb150
+//         stack at SP_EL0: 16 words, ALL ZERO
+//
+// Read off those registers: the stack is 185,200 bytes deep (71% of 256 KiB), the caller's frame
+// sits at 20,144, so the frame being entered is ~165 KiB BY ITSELF, and the zeros at SP are its own
+// stack-probe region. That is `pipe_run` (143,360 at 64 KiB) plus a stage, in the one pipeline that
+// combines the two largest frames in this file - pipe_run and cmd_roster (90,112). Their sum is
+// 233,472 of a 262,144 stack before a single caller is counted.
+//
+// At 16 KiB the same two are 45,056 and 40,960. That is the whole fix: the frames were never
+// survivable together, and the margin was thin enough that it tipped on what happened to be on the
+// stack already - which is why it looked intermittent and boot-dependent for days.
+//
+// Cost, unchanged from when this was 64 KiB: a producer whose output exceeds the buffer is TRUNCATED
+// and says so. Only the console can accept more than PIPE_MSG_MAX anyway; every other sink clips at
+// 4 KiB regardless of this number. Lifting it for real is the streaming work (docs/pipes.md).
+const CAP_MAX: usize = 16 * 1024;
 // The pipe buffer must stay wider than a single IPC message, or a stage crossing a service boundary
 // truncates a message it was handed whole - a bound that would look like a service bug rather than a
 // buffer that was shrunk past its floor. Pinned so the next person to tune CAP_MAX for stack cannot
