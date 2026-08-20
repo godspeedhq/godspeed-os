@@ -329,7 +329,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let start_dt = ctx.datetime();
     let start_epoch = start_dt.epoch_secs();
     // When this run began, in wall-clock terms, ONCE ANYBODY KNOWS. See `learn_start_wall`.
-    let mut start_wall: Option<i64> = if start_dt.year >= 2000 { Some(start_epoch) } else { None };
+    // ASK BEFORE THE STORM, WHILE THE SYSTEM IS STILL CALM.
+    //
+    // This only ever asked from inside the report loop, which runs while chaos is killing `time` several
+    // times a second - so it kept meeting a freshly respawned instance that had not synced yet, got "no
+    // clock" every time, and printed "clock not set yet" for a six minute run whose clock was correct
+    // throughout. The one moment `time` is reliably healthy is right now, before the first round.
+    //
+    // Elapsed is zero here, so "now minus elapsed" is simply now.
+    let mut start_wall: Option<i64> = if start_dt.year >= 2000 {
+        Some(start_epoch)
+    } else {
+        learn_start_wall(&ctx, 0)
+    };
     // ELAPSED is measured on the MONOTONIC clock, not this wall-clock stamp: the wall clock is settable
     // (SNTP sets it on the RTC-less Pi), so a sync landing mid-run would make `now - start` jump by the
     // whole correction and report an absurd elapsed/ETA. The datetime above is kept for the "started ..."
