@@ -280,6 +280,13 @@ struct Fs {
     // the next request rather than trusting them (§14.3 - reacquiring is necessary but not sufficient;
     // everything derived from the previous incarnation must be re-established too).
     io_error_seen: core::cell::Cell<bool>,
+    /// Consecutive failed block reads during a tree WALK (check / scrub). Reset by any success.
+    ///
+    /// A walk that keeps going after a read fails re-asks a device that has stopped answering once
+    /// per block, and each of those costs `BLOCK_RPC_SECS` (30 s). Thirty-four blocks is seventeen
+    /// minutes of a prompt that looks dead. Bounding the STREAK turns "the device is not answering"
+    /// into one answer instead of one answer per block.
+    io_fail_streak: core::cell::Cell<u32>,
     // Crash-consistency journal (Phase C). While `txn_active`, structural writes (directory,
     // bitmap, superblock) are STAGED here - with read-your-writes - instead of going to disk,
     // then committed atomically through the on-disk journal region (`commit_txn`). Data-block
@@ -1578,6 +1585,7 @@ impl Fs {
             last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
             flush_warned: core::cell::Cell::new(false),
             io_error_seen: core::cell::Cell::new(false),
+            io_fail_streak: core::cell::Cell::new(0),
             txn_active: false,
             txn_n: 0,
             txn_overflow: false,
@@ -2071,6 +2079,7 @@ impl Fs {
             last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
             flush_warned: core::cell::Cell::new(false),
             io_error_seen: core::cell::Cell::new(false),
+            io_fail_streak: core::cell::Cell::new(0),
             txn_active: false,
             txn_n: 0,
             txn_overflow: false,
@@ -3029,7 +3038,9 @@ impl Fs {
                             self.bm_set_range(ctx, s, l, true)?; // data runs are referenced → used
                             st.3 += l;
                             for j in 0..l {
-                                if data_read(ctx, s + j).is_none() {
+                                let got = data_read(ctx, s + j);
+                                self.note_walk_read(got.is_some())?;
+                                if got.is_none() {
                                     ctx.log_fmt(format_args!(
                                         "fs: check - block {} of run {} (lba {}, len {}) failed verification{}",
                                         j + 1, i + 1, s, l,
@@ -3046,7 +3057,9 @@ impl Fs {
             } else {
                 let mut ok = true;
                 for bi in 0..count {
-                    if data_read(ctx, first + bi).is_none() {
+                    let got = data_read(ctx, first + bi);
+                    self.note_walk_read(got.is_some())?;
+                    if got.is_none() {
                         // WHICH block of the extent, not just which LBA. `data_read` already names the
                         // lba and the two CRCs; what it cannot know is whether this is the middle of a
                         // file or its LAST block - and that distinction decides what the report MEANS.
@@ -3081,6 +3094,24 @@ impl Fs {
 
     /// Walk the filesystem from root verifying every block's CRC; change nothing. Returns
     /// `(files, dirs, bad, scanned)`.
+    /// Record the outcome of one walk read. `Err` once the device has failed `WALK_FAIL_MAX` reads in
+    /// a row - not because that many bad blocks is impossible, but because a bad BLOCK fails its CRC
+    /// instantly while a device that has stopped answering costs 30 s every time it is asked. The two
+    /// are indistinguishable from here; the streak is what tells them apart.
+    fn note_walk_read(&self, ok: bool) -> Result<(), &'static str> {
+        const WALK_FAIL_MAX: u32 = 4;
+        if ok {
+            self.io_fail_streak.set(0);
+            return Ok(());
+        }
+        let n = self.io_fail_streak.get() + 1;
+        self.io_fail_streak.set(n);
+        if n >= WALK_FAIL_MAX {
+            return Err("storage stopped answering - walk abandoned");
+        }
+        Ok(())
+    }
+
     fn scrub(&self, ctx: &ServiceContext) -> Result<(u32, u32, u32, u64), &'static str> {
         let mut st = (0u32, 0u32, 0u32, 0u64); // (files, dirs, bad, scanned)
         let root = self.root_entry();
@@ -3129,7 +3160,11 @@ impl Fs {
                         for i in 0..ne {
                             let (s, l) = exts[i];
                             st.3 += l;
-                            for j in 0..l { if data_read(ctx, s + j).is_none() { ok = false; } }
+                            for j in 0..l {
+                                let got = data_read(ctx, s + j);
+                                self.note_walk_read(got.is_some())?;
+                                if got.is_none() { ok = false; }
+                            }
                         }
                         if !ok { st.2 += 1; }
                     }
@@ -3139,7 +3174,9 @@ impl Fs {
                 st.3 += count;
                 let mut ok = true;
                 for bi in 0..count {
-                    if data_read(ctx, first + bi).is_none() { ok = false; }
+                    let got = data_read(ctx, first + bi);
+                    self.note_walk_read(got.is_some())?;
+                    if got.is_none() { ok = false; }
                 }
                 if !ok { st.2 += 1; }
             }
