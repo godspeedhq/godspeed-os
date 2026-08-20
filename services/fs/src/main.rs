@@ -442,6 +442,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // disk (I/O error - data may be intact, do NOT flash) vs a blank/raw disk (flash to format). Set on
     // the I/O-failure break paths below; left false for a genuinely blank disk (the FS_NOFS case).
     let mut storage_unreadable = false;
+    // Replies that could not be delivered; owned here so no global state is needed (Commandment VI).
+    let mut reply_fails = 0u32;
     // ONE `Fs`, DECLARED FIRST AND FILLED IN PLACE.
     //
     // This was an `if/else` EXPRESSION whose else-branch built the volume in a local called `mounted`
@@ -632,8 +634,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             None => continue,
         };
         match badge {
-            Some((rid, right)) => serve_filecap(&ctx, &mut fs, rid, right, storage_unreadable, msg.payload_bytes(), reply),
-            None => serve(&ctx, &mut fs, capacity, storage_unreadable, msg.payload_bytes(), reply),
+            Some((rid, right)) => serve_filecap(&ctx, &mut fs, rid, right, storage_unreadable,
+                                                msg.payload_bytes(), reply, &mut reply_fails),
+            None => serve(&ctx, &mut fs, capacity, storage_unreadable, msg.payload_bytes(), reply,
+                          &mut reply_fails),
         }
         ctx.remove_cap(reply);
     }
@@ -944,7 +948,34 @@ fn op_is_read_only(op: u8) -> bool {
 /// device is the source and this is a derived view (Commandment III - the source wins).
 ///
 /// If a future query wants a size, it re-derives. It does not read this.
-fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8], reply: CapHandle) {
+/// Reply to a caller, NON-BLOCKING, and report a reply that could not be delivered.
+///
+/// **`try_send`, never `send` - §8.9, and it is a deadlock rather than a style preference.** This
+/// service sends a request to `block-driver` and then waits for the answer ON ITS OWN ENDPOINT, while
+/// that same endpoint keeps receiving client requests. Sixteen of those arrive - a busy shell, or chaos
+/// flood-storming a service several thousand times a run - and the queue is full. A reply can then
+/// never be enqueued, and with a BLOCKING send neither side can break it: the replier waits for room,
+/// this service waits for the reply, and the shell waits behind this service.
+///
+/// Dropping the reply is recoverable instead: the caller's deadline fires and it retries. That is why
+/// every other service in the tree already replies with `try_send`; `fs` and `block-driver` were the
+/// two exceptions, and they are the persistence path.
+///
+/// The drop is REPORTED, not swallowed (§26.7): without this a caller timing out looks like a slow disk
+/// rather than an answer its queue had no room for. Rate-limited on the first and every 64th, because a
+/// full queue is a burst - a dead caller would otherwise log once per request.
+fn reply_nonblocking<E>(r: Result<(), E>, ctx: &ServiceContext, fails: &mut u32) {
+    if r.is_err() {
+        *fails = fails.saturating_add(1);
+        if *fails == 1 || *fails % 64 == 0 {
+            ctx.log_fmt(format_args!(
+                "fs: reply send FAILED x{} (caller's queue full - it will time out and retry)", fails));
+        }
+    }
+}
+
+fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8], reply: CapHandle,
+         reply_fails: &mut u32) {
     // Split the CORRELATION TAG off the front. A name-addressed request carries one byte the client
     // chose, and its reply carries the same byte back, so the client can tell an answer to ITS question
     // from an answer to an earlier one. Everything after it is the request exactly as every opcode arm
@@ -992,7 +1023,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         // malformed one and reports something misleading. Never send one - say ERR properly.
         if len == 0 { out[1] = FS_ERR; len = 1; }
         // +1 for the tag at out[0]
-        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out[..1 + len]));
+        reply_nonblocking(ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..1 + len])), ctx, reply_fails);
     }
 }
 
@@ -1355,8 +1386,12 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
 /// after the cap check), so reaching here means the caller holds a real, live cap. We resolve the
 /// resource id → the open file's path, enforce that the operation needs **≤ the validated right**
 /// (the load-bearing non-escalation check, §7.3 - a READ cap can never write), and act.
-fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8, unreadable: bool, p: &[u8], reply: CapHandle) {
-    let send = |bytes: &[u8]| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(bytes)); };
+fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8, unreadable: bool, p: &[u8], reply: CapHandle,
+                 reply_fails: &mut u32) {
+    let mut send = |bytes: &[u8]| {
+        let r = ctx.try_send_by_handle(reply, &Message::from_bytes(bytes));
+        reply_nonblocking(r, ctx, reply_fails);
+    };
     let nofs: u8 = if unreadable { FS_UNAVAIL } else { FS_NOFS };
     let fs = match vol { Some(f) => f, None => { send(&[nofs]); return; } };
     if p.is_empty() { send(&[FS_ERR]); return; }

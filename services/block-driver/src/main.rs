@@ -50,7 +50,23 @@ impl Reply {
         out[0] = self.tag;
         let n = body.len().min(out.len() - 1);
         out[1..1 + n].copy_from_slice(&body[..n]);
-        let _ = ctx.send_by_handle(self.cap, &godspeed_sdk::Message::from_bytes(&out[..1 + n]));
+        // TRY_SEND, NEVER SEND - §8.9, and a deadlock rather than a style preference.
+        //
+        // A blocking reply can be held forever by a caller whose queue is full, and the chain is real:
+        // `fs` sends a request and then waits for the answer ON ITS OWN ENDPOINT, which keeps receiving
+        // client requests meanwhile. Sixteen arrive - a busy shell, or chaos flood-storming it - and the
+        // queue is full. With a blocking send nothing breaks it: this driver waits for room, `fs` waits
+        // for the reply, the shell waits behind `fs`. Dropping it instead is recoverable, because the
+        // caller's deadline fires and it retries. Every other service in the tree already does this;
+        // `block-driver` and `fs` were the two exceptions, and they are the persistence path.
+        //
+        // Logged on EVERY failure, deliberately un-rate-limited, and the protocol is why that is
+        // bounded: this driver's caller is `fs`, which has at most one request outstanding, so a repeat
+        // means its queue is persistently full - abnormal, and worth saying every time. A caller that
+        // has DIED yields at most the requests already in flight. Neither can flood (§26.7, §26.6).
+        if ctx.try_send_by_handle(self.cap, &godspeed_sdk::Message::from_bytes(&out[..1 + n])).is_err() {
+            ctx.log("block-driver: reply undelivered (caller's queue full) - it will time out and retry");
+        }
     }
 }
 

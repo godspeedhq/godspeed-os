@@ -674,7 +674,7 @@ fn advance_line(s: &mut Fb) {
 /// The x86 measurement that motivated it still stands as the reason: an 8 MB read-back cost about 130 ms
 /// per scrolled line on the T630 and dominated every kill/respawn-heavy workload.
 fn scroll(s: &mut Fb) {
-    let (rows, cols) = (s.rows, s.cols);
+    let (rows, cols) = (s.rows, s.cols);   // `cols` is used by the shadow shift below
     if rows == 0 {
         return;
     }
@@ -706,7 +706,6 @@ fn scroll(s: &mut Fb) {
     // the sort of shortcut that would show up as a highlight silently vanishing after a scroll.
     // Deferred, not skipped: `flush` paints this before anything is shown. See `Fb::repaint_pending`.
     s.repaint_pending = true;
-    let _ = cols;
 }
 
 /// Paint the whole screen from the shadow grid. The deferred half of `scroll`.

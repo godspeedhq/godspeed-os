@@ -320,7 +320,16 @@ impl<'a> Sd<'a> {
         if self.cmd(CMD_SEND_CSD, self.rca).is_none() { ctx.log("block-driver: CMD9 (SEND_CSD) failed"); return false; }
         self.sectors = self.read_capacity();
         // Identification done - step up to the normal-speed clock (25 MHz, SD spec) for data transfer.
-        let _ = self.set_clock(self.divider_for(25_000_000), ctx);
+        //
+        // A FAILED STEP-UP IS NOT FATAL, AND MUST NOT BE SILENT. The card keeps working at the
+        // identification clock (400 kHz), so refusing to mount would throw away a usable disk. But that
+        // is roughly sixty times slower for every block that follows, and the result used to be
+        // discarded - so the whole storage path would be inexplicably glacial with nothing anywhere
+        // saying why. That is the silent degradation §26.7 forbids: the operator is left to guess
+        // whether the system quietly did something less than it claimed.
+        if !self.set_clock(self.divider_for(25_000_000), ctx) {
+            ctx.log("block-driver: SD clock step-up to 25 MHz FAILED - the card works but stays at the                      400 kHz identification clock, so all storage will be very slow");
+        }
         if self.cmd(CMD_CARD_SELECT, self.rca).is_none() { return false; }
         ctx.log_fmt(format_args!(
             "block-driver: SD card ready ({}, {} sectors = {} MiB)",
@@ -397,24 +406,33 @@ impl<'a> Sd<'a> {
     }
 }
 
+/// Reply non-blocking, and say so if it could not be delivered. See `Reply::send` in main.rs for why a
+/// blocking reply here is a deadlock and not a style preference (§8.9), and why logging every failure
+/// is bounded by the protocol rather than needing a rate limit.
+fn reply_send(ctx: &ServiceContext, reply: godspeed_sdk::CapHandle, msg: &Message) {
+    if ctx.try_send_by_handle(reply, msg).is_err() {
+        ctx.log("block-driver: reply undelivered (caller's queue full) - it will time out and retry");
+    }
+}
+
 /// Decode one block-IPC request and reply. Mirrors the AHCI backend's `serve` (same wire protocol).
 fn serve(sd: &Sd, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapHandle) {
     use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
-    let err = |ctx: &ServiceContext| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); };
+    let err = |ctx: &ServiceContext| { reply_send(ctx, reply, &Message::from_bytes(&[STATUS_ERR])); };
     if p.is_empty() { return err(ctx); }
     if p[0] == OP_FLUSH {
         // An SD/EMMC single-block write is already durable when it completes: the card holds DAT0 low
         // while it programs the flash, and this driver waits for that busy period to end before
         // reporting success. There is no separate volatile cache to flush in this access mode, so the
         // guarantee the caller wants is one the write path already provides.
-        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_OK]));
+        reply_send(ctx, reply, &Message::from_bytes(&[STATUS_OK]));
         return;
     }
     if p[0] == OP_CAPACITY {
         let mut out = [0u8; 9];
         out[0] = STATUS_OK;
         out[1..9].copy_from_slice(&sd.sectors.to_le_bytes());
-        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
+        reply_send(ctx, reply, &Message::from_bytes(&out));
         return;
     }
     if p.len() < 9 { return err(ctx); }
@@ -426,7 +444,7 @@ fn serve(sd: &Sd, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapHandle
                 let mut out = [0u8; 513];
                 out[0] = STATUS_OK;
                 out[1..].copy_from_slice(&buf);
-                let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
+                reply_send(ctx, reply, &Message::from_bytes(&out));
             } else { err(ctx); }
         }
         OP_WRITE_BLOCK => {
@@ -434,7 +452,7 @@ fn serve(sd: &Sd, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapHandle
             let mut buf = [0u8; 512];
             buf.copy_from_slice(&p[9..521]);
             let status = if sd.write_block(lba, &buf) { STATUS_OK } else { STATUS_ERR };
-            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
+            reply_send(ctx, reply, &Message::from_bytes(&[status]));
         }
         OP_WRITE_ZEROS => {
             if p.len() < 17 { return err(ctx); }
@@ -444,7 +462,7 @@ fn serve(sd: &Sd, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapHandle
             for i in 0..count {
                 if !sd.write_block(lba + i, &zero) { ok = false; break; }
             }
-            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[if ok { STATUS_OK } else { STATUS_ERR }]));
+            reply_send(ctx, reply, &Message::from_bytes(&[if ok { STATUS_OK } else { STATUS_ERR }]));
         }
         _ => err(ctx),
     }
@@ -459,7 +477,7 @@ pub fn run(ctx: &ServiceContext, mmio: &Mmio) -> ! {
         loop {
             let _msg = ctx.recv();
             if let Some(reply) = ctx.take_pending_cap() {
-                let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[super::STATUS_ERR]));
+                reply_send(ctx, reply, &Message::from_bytes(&[super::STATUS_ERR]));
                 ctx.remove_cap(reply);
             }
         }

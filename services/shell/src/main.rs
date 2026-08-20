@@ -7742,7 +7742,14 @@ fn chaos_launch(
         buf[..4].copy_from_slice(&rounds.to_le_bytes());
         let tb = target.as_bytes(); let n = tb.len().min(128);
         buf[4..4 + n].copy_from_slice(&tb[..n]);
-        let _ = ctx.send_by_handle(cap, &Message::from_bytes(&buf[..4 + n]));
+        // TRY_SEND from the SHELL, because the shell is the user's only way back in. A blocking send
+        // here hands `chaos` the power to hang the prompt just by having a full queue, which is the one
+        // thing nothing above the kernel may do. A refused send is reported and the bounded wait below
+        // then reports the real symptom - chaos never took the foreground - instead of the shell simply
+        // never returning (§8.9, §26.7).
+        if ctx.try_send_by_handle(cap, &Message::from_bytes(&buf[..4 + n])).is_err() {
+            ctx.console_writeln("chaos: could not be reached (its queue is full or it is restarting)");
+        }
         ctx.remove_cap(cap);
     }
     // Wait (bounded) for chaos to TAKE the console foreground before returning. Otherwise the shell loops
