@@ -719,7 +719,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // One direction only: `time` may ask `fs`. It must never call `net-stack`, which calls
             // `time` to set the clock after SNTP - two single-threaded services calling each other is a
             // deadlock, so the network stays a PUSH toward this service and never a pull from it.
-            send_peers:        &["fs"],
+            send_peers:        &["fs", "net-stack"],   // fs = the clock floor; net-stack = the one-way "sync now" nudge
             send_peers_grant:  false,
             probe_mode:        0,
             // UNPINNED (§9.2: name a core only with a real reason). The clock has no interrupt to be

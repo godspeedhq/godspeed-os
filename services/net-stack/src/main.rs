@@ -1425,6 +1425,31 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // clean run. Say it once (the condition repeats per request, and the report must not
             // become the flood), then drop it.
             None => {
+                // OP_SYNC_NOW (11): a ONE-WAY nudge from `time`, deliberately carrying no reply cap.
+                //
+                // `time` owns the wall clock and must be the thing that pursues it, but it cannot ASK
+                // for a sync in the ordinary way: this service calls `time` after SNTP, so a request in
+                // the other direction would have two single-threaded services blocked on each other -
+                // which is why `time`'s contract says it may never send here. A message with nothing to
+                // answer breaks that: `time` sends and forgets, this service does the work and pushes
+                // the result back exactly as it already does, and neither ever waits on the other
+                // (§8.9 - one direction non-blocking is the whole requirement).
+                //
+                // It sits in the capless arm because that is precisely what identifies it. There is no
+                // reply to send, so there is no cap, and no legitimate request can be confused with it.
+                if req.payload_bytes().first() == Some(&11) {
+                    // Only worth attempting with a resolved gateway - SNTP needs somewhere to send.
+                    // `time` asks repeatedly while unsynced, so a refusal here costs nothing and the
+                    // next nudge finds the network ready.
+                    if gw_known && link_is_up(&ctx) {
+                        let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
+                        if let Some(u) = sntp_sync(&ctx, &st) {
+                            ctx.log_fmt(format_args!(
+                                "net-stack: clock resolved at `time`'s request ({})", u));
+                        }
+                    }
+                    continue;
+                }
                 if !capless_logged {
                     capless_logged = true;
                     ctx.log("net-stack: request had no reply cap - dropping (cannot answer without one)");

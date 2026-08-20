@@ -178,6 +178,19 @@ impl core::fmt::Write for FrameBuf {
 /// in that order. Reading the raw RTC here would be a second, worse answer to a question somebody else
 /// already owns (Commandment III).
 fn learn_start_wall(ctx: &ServiceContext, elapsed: i64) -> Option<i64> {
+    // ACQUIRE BY NAME FIRST. Chaos declares NO `ipc_send` peers at all - it reaches every service
+    // through the kernel's name directory, which is how it can kill things it was never wired to. So a
+    // name-addressed request finds nothing until the cap is acquired, and the first version of this
+    // silently failed on every call: the report kept saying the clock was not set while `date` was
+    // showing the time perfectly, because chaos had no way to ask. `reacquire_by_name` fills the cache
+    // the name-addressed call reads.
+    //
+    // It is re-acquired rather than cached across calls on purpose: chaos kills `time` constantly, so a
+    // handle held from a previous round is usually stale, and this runs at most a handful of times
+    // before the answer is known and it stops asking altogether.
+    if !ctx.reacquire_by_name("time") {
+        return None;
+    }
     // OP_NOW = 1 -> [ok, epoch(8 LE), source, age(8 LE)]
     let r = ctx.request_with_reply_deadline("time", &Message::from_bytes(&[1u8]), 1)?;
     let p = r.payload_bytes();

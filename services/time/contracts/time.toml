@@ -17,8 +17,17 @@ limit   = "8MiB"
 
 [capabilities]
 ipc_receive = ["time"]
-# `fs`, so the clock owns its own floor: read /clock.last at start-up, persist it when the clock is
-# set. One direction only - `time` asks `fs`, and NEVER `net-stack` (which calls `time` after SNTP;
-# two single-threaded services calling each other deadlock).
-ipc_send    = ["fs"]
+# `fs`, so the clock owns its own floor: read /clock.last at start-up, persist it when the clock is set.
+#
+# `net-stack` is here for ONE message and one only: a one-way "sync now" nudge carrying no reply cap.
+# The old note said `time` must NEVER send here, and the reason it gave is still true - `net-stack`
+# calls `time` after SNTP, so two single-threaded services making REQUESTS of each other deadlock. What
+# changed is that pursuing the time is this service's job, and it could not do it: the clock sat unset
+# on an idle machine until an operator typed `date sync`, which put resolution in the shell's hands.
+#
+# A message with nothing to answer breaks the cycle rather than joining it. `time` sends and forgets;
+# `net-stack` does the work and pushes the result back exactly as it already did. Neither ever waits on
+# the other, which is all §8.9 requires. The nudge is `try_send` at the call site, so even a full or
+# dead `net-stack` cannot stall the clock.
+ipc_send    = ["fs", "net-stack"]
 log_write   = true

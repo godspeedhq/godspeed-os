@@ -166,6 +166,19 @@ const TAG_FLOOR_READ: u8 = 0xF1;
 const TAG_FLOOR_WRITE: u8 = 0xF2;
 /// How often to retry loading the floor while it has not been loaded yet.
 const FLOOR_RETRY_MS: u64 = 2_000;
+/// How long between asking `net-stack` to fetch the network time, while we still have none.
+///
+/// PURSUING THE TIME IS THIS SERVICE'S JOB. It did not do it: `net-stack` pushed a result in when its
+/// own dance happened to run, and otherwise the clock sat unset until an operator typed `date sync`.
+/// That put resolution in the shell's hands and made the answer depend on somebody asking twice.
+///
+/// The nudge carries NO reply cap, which is what keeps it legal: `net-stack` calls this service after
+/// SNTP, so a request in this direction would be two single-threaded services blocked on each other.
+/// One-way, `try_send`, nothing awaited - so a full or dead `net-stack` cannot stall the clock (§8.9).
+///
+/// Bounded by its own success: the nudging stops the moment the clock is network-set, so a machine that
+/// syncs at boot sends one or two and never another.
+const SYNC_NUDGE_SECS: i64 = 20;
 /// How many times to retry PERSISTING the floor before giving up until the clock is set again.
 ///
 /// Bounded, and the bound is the point. The first version of this retried forever: with `fs` answering
@@ -328,12 +341,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut store_left = 0u32;                    // writes still owed (0 = nothing to persist)
     let mut store_epoch = 0i64;                   // the value those writes are for
     let mut tries_left = 15u32;                   // ~30 s of asking, then stop
+    let mut last_nudge = i64::MIN / 2;            // monotonic second of the last sync nudge
     let mut no_cap: u32 = 0;                      // capless messages seen (a flood, usually)
     loop {
         // Wake on a timer only while there is still housekeeping OUTSTANDING - a floor to read, or a
         // floor to write that has not been acknowledged. Once both are settled this is a plain blocking
         // `recv` and the service costs nothing at all.
-        let housekeeping = (!floor_settled && tries_left > 0) || store_left > 0;
+        // Keep waking while the clock is still unresolved, so the nudge below can go out. This is
+        // bounded by success - once the network sets the clock, `unsynced` is false and this service
+        // goes back to blocking on `recv` with no timer at all.
+        let unsynced = clock.source != SRC_NTP;
+        let housekeeping = (!floor_settled && tries_left > 0) || store_left > 0 || unsynced;
         let req = if !housekeeping {
             ctx.recv()
         } else {
@@ -348,6 +366,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // whose SEND failed - `fs` not spawned yet, or dead and not yet respawned - has no
                     // reply coming at all, so without this it would be attempted once and silently
                     // never again. That is the difference between "we tried" and "it gets written".
+                    // ASK FOR THE TIME, since nobody else will. See `SYNC_NUDGE_SECS`.
+                    if unsynced {
+                        let mono = ctx.epoch_secs_monotonic();
+                        if mono - last_nudge >= SYNC_NUDGE_SECS {
+                            last_nudge = mono;
+                            // One way, and the outcome is deliberately not awaited - there is nothing
+                            // to await. `net-stack` pushes the answer back through OP_SET when it has
+                            // one, which is the path that already works.
+                            let _ = ctx.try_send("net-stack", &Message::from_bytes(&[11u8]));
+                        }
+                    }
                     if store_left > 0 && !floor_store(&ctx, store_epoch) {
                         store_left -= 1;
                         if store_left == 0 {
