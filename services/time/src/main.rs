@@ -342,6 +342,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut store_epoch = 0i64;                   // the value those writes are for
     let mut tries_left = 15u32;                   // ~30 s of asking, then stop
     let mut last_nudge = i64::MIN / 2;            // monotonic second of the last sync nudge
+    let mut nudge_ok = false;                     // did the last nudge reach net-stack?
     let mut no_cap: u32 = 0;                      // capless messages seen (a flood, usually)
     loop {
         // Wake on a timer only while there is still housekeeping OUTSTANDING - a floor to read, or a
@@ -371,10 +372,33 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         let mono = ctx.epoch_secs_monotonic();
                         if mono - last_nudge >= SYNC_NUDGE_SECS {
                             last_nudge = mono;
-                            // One way, and the outcome is deliberately not awaited - there is nothing
-                            // to await. `net-stack` pushes the answer back through OP_SET when it has
+                            // ACQUIRE BY NAME FIRST, and SAY whether it worked.
+                            //
+                            // `net-stack` is spawned AFTER this service, so at spawn time there was no
+                            // endpoint to wire and `find_send_slot` finds nothing - forever. The first
+                            // version of this sent into that hole every twenty seconds and reported
+                            // nothing, so a clock that never resolved looked identical to a network
+                            // that never answered. `nic-driver` documents this exact trap and I did not
+                            // apply it here.
+                            //
+                            // The outcome is logged ONCE per state change rather than per attempt: a
+                            // nudge every twenty seconds must not become a log every twenty seconds,
+                            // but a send that never leaves must not be invisible either (§26.7).
+                            let ok = ctx.try_send("net-stack", &Message::from_bytes(&[11u8])).is_ok()
+                                || (ctx.reacquire_by_name("net-stack")
+                                    && ctx.try_send("net-stack", &Message::from_bytes(&[11u8])).is_ok());
+                            if ok != nudge_ok {
+                                nudge_ok = ok;
+                                ctx.log(if ok {
+                                    "time: asking net-stack for the network clock"
+                                } else {
+                                    "time: cannot reach net-stack to ask for the clock - retrying"
+                                });
+                            }
+                            // One way, and the outcome is not awaited - there is nothing to await.
+                            // `net-stack` pushes the answer back through OP_SET when it has
                             // one, which is the path that already works.
-                            let _ = ctx.try_send("net-stack", &Message::from_bytes(&[11u8]));
+
                         }
                     }
                     if store_left > 0 && !floor_store(&ctx, store_epoch) {

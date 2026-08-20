@@ -1443,10 +1443,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // next nudge finds the network ready.
                     if gw_known && link_is_up(&ctx) {
                         let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
-                        if let Some(u) = sntp_sync(&ctx, &st) {
-                            ctx.log_fmt(format_args!(
-                                "net-stack: clock resolved at `time`'s request ({})", u));
+                        match sntp_sync(&ctx, &st) {
+                            Some(u) => ctx.log_fmt(format_args!(
+                                "net-stack: clock resolved at `time`'s request ({})", u)),
+                            // SAY SO. A nudge that arrived and got nowhere is a different fault from a
+                            // nudge that never arrived, and with both silent the two are one mystery.
+                            None => ctx.log("net-stack: `time` asked for the clock - no SNTP answer"),
                         }
+                    } else {
+                        ctx.log("net-stack: `time` asked for the clock - no route yet, will retry");
                     }
                     continue;
                 }
