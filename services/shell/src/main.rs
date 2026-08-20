@@ -5028,7 +5028,7 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
             "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC  (ntp, synced {} ago)",
             wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, HumanSecs(ago))),
         (ClockSource::Floor, None) => out.line_fmt(ctx, format_args!(
-            "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC  (carried over from the last boot - AT LEAST              this late; 'date sync' for the true time)",
+            "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC  (carried over from the last boot - AT LEAST this late; 'date sync' for the true time)",
             wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)),
         (_, None) => out.line_fmt(ctx, format_args!(
             "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  (rtc, scale unknown)",

@@ -240,7 +240,7 @@ fn stage(
             let hprt = mmio.read32(crate::regs::HPRT);
             let nptx = mmio.read32(crate::regs::GNPTXSTS);
             ctx.log_fmt(format_args!(
-                "dwc2-svc: {} stage timed out (channel never halted) - HPRT={:#010x} (conn {} ena {} pwr {}),                  GNPTXSTS={:#010x} qfree {}, GINTSTS={:#010x}, HCCHAR={:#010x}",
+                "dwc2-svc: {} stage timed out (channel never halted) - HPRT={:#010x} (conn {} ena {} pwr {}), GNPTXSTS={:#010x} qfree {}, GINTSTS={:#010x}, HCCHAR={:#010x}",
                 what, hprt,
                 hprt & crate::regs::HPRT_PRTCONNSTS != 0,
                 hprt & crate::regs::HPRT_PRTENA != 0,

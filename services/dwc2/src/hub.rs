@@ -338,7 +338,7 @@ pub fn survey(
     }
     let _ = split_needed;
     ctx.log_fmt(format_args!(
-        "dwc2-svc: hub survey complete - {} device(s) attached (each one's speed, and whether it          needs a split, is known only after its port reset)", found));
+        "dwc2-svc: hub survey complete - {} device(s) attached (each one's speed, and whether it needs a split, is known only after its port reset)", found));
     (st_by_port, n_status)
 }
 

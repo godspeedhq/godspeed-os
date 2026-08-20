@@ -501,7 +501,7 @@ fn link_reconfigure(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) {
     // as it was, which is a state the rest of the driver already copes with.
     let (Some(mut mac_cr), Some(mut afc)) =
         (smsc_read(ctx, m, d, t, SMSC_MAC_CR), smsc_read(ctx, m, d, t, SMSC_AFC_CFG)) else {
-        ctx.log("dwc2-svc: link update SKIPPED - could not read MAC_CR/AFC_CFG, refusing to write a                  config built on a fabricated value (link left as it was)");
+        ctx.log("dwc2-svc: link update SKIPPED - could not read MAC_CR/AFC_CFG, refusing to write a config built on a fabricated value (link left as it was)");
         return;
     };
     if full {
@@ -711,7 +711,7 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
             board[0], board[1], board[2], board[3], board[4], board[5]));
         board
     } else if from_chip == [0u8; 6] || from_chip == [0xFFu8; 6] {
-        ctx.log("dwc2-svc: NIC has no MAC - not from the board, not from the chip - so it is using a                  hardcoded locally-administered address, which every board running this system shares");
+        ctx.log("dwc2-svc: NIC has no MAC - not from the board, not from the chip - so it is using a hardcoded locally-administered address, which every board running this system shares");
         [0x02, 0x00, 0x00, 0x12, 0x34, 0x56]
     } else {
         ctx.log_fmt(format_args!(
@@ -813,7 +813,7 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
         cr, cr & SMSC_MAC_CR_TXEN != 0, cr & SMSC_MAC_CR_RXEN != 0, txc, hwc,
         match bmsr { Some(v) => v, None => 0xFFFF },
         match bmsr {
-            Some(v) if v & 0x0020 == 0 => "NEGOTIATING (this instant, not a verdict - autonegotiation                                            was restarted microseconds ago and takes seconds; ask again                                            with `net`)",
+            Some(v) if v & 0x0020 == 0 => "NEGOTIATING (this instant, not a verdict - autonegotiation was restarted microseconds ago and takes seconds; ask again with `net`)",
             Some(v) if v & 0x0004 != 0 => "UP",
             Some(_) => "DOWN",
             None => "UNREADABLE",
@@ -1120,7 +1120,7 @@ pub fn tx(
                 smsc_read_for_log(ctx, mmio, dma, t, SMSC_FLOW),
                 smsc_read_for_log(ctx, mmio, dma, t, SMSC_AFC_CFG)));
             ctx.log_fmt(format_args!(
-                "dwc2-svc: NIC refused {} frames in a row (HCINT={:#010x}{}) - backing off to one probe                  every {} ms. Frames are dropped meanwhile; input and storage stay responsive.",
+                "dwc2-svc: NIC refused {} frames in a row (HCINT={:#010x}{}) - backing off to one probe every {} ms. Frames are dropped meanwhile; input and storage stay responsive.",
                 TX_FAIL_RUN, why.0, if why.1 != 0 { ", channel never halted" } else { "" },
                 TX_BACKOFF_MS));
         }

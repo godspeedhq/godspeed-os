@@ -305,7 +305,7 @@ fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8
     }
     if send_fail > 0 {
         ctx.log_fmt(format_args!(
-            "net-stack: DHCP - no ACK, and {} of {} REQUESTs never left the host - the driver refused              them, so this is not a silent server",
+            "net-stack: DHCP - no ACK, and {} of {} REQUESTs never left the host - the driver refused them, so this is not a silent server",
             send_fail, DANCE_TRIES));
     }
     false
@@ -340,7 +340,7 @@ fn dhcp_lease(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u8; 
     }
     ctx.log("net-stack: DHCP got no reply addressed to us - retrying and asking the server to broadcast");
     let cfg = dhcp_discover(ctx, our_mac, true)?;
-    ctx.log("net-stack: DHCP succeeded ONLY with a broadcast reply - this port is not receiving frames              addressed to its own MAC, so ARP and ping cannot work until that is fixed");
+    ctx.log("net-stack: DHCP succeeded ONLY with a broadcast reply - this port is not receiving frames addressed to its own MAC, so ARP and ping cannot work until that is fixed");
     Some(cfg)
 }
 
@@ -798,7 +798,7 @@ fn sntp_sync(ctx: &ServiceContext, st: &NetState) -> Option<u32> {
     }
     if unix.is_none() && send_fail > 0 {
         ctx.log_fmt(format_args!(
-            "net-stack: SNTP got no timestamp, and {} of {} queries never left the host - the driver              refused them, so this is not a silent time server",
+            "net-stack: SNTP got no timestamp, and {} of {} queries never left the host - the driver refused them, so this is not a silent time server",
             send_fail, SNTP_TRIES));
     }
     let u = unix?;
