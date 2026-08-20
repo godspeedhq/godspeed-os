@@ -3028,7 +3028,16 @@ impl Fs {
                             let (s, l) = exts[i];
                             self.bm_set_range(ctx, s, l, true)?; // data runs are referenced → used
                             st.3 += l;
-                            for j in 0..l { if data_read(ctx, s + j).is_none() { ok = false; } }
+                            for j in 0..l {
+                                if data_read(ctx, s + j).is_none() {
+                                    ctx.log_fmt(format_args!(
+                                        "fs: check - block {} of run {} (lba {}, len {}) failed verification{}",
+                                        j + 1, i + 1, s, l,
+                                        if j + 1 == l { " (LAST block of this run)" } else { "" }
+                                    ));
+                                    ok = false;
+                                }
+                            }
                         }
                         if !ok { st.2 += 1; }
                     }
@@ -3037,7 +3046,22 @@ impl Fs {
             } else {
                 let mut ok = true;
                 for bi in 0..count {
-                    if data_read(ctx, first + bi).is_none() { ok = false; }
+                    if data_read(ctx, first + bi).is_none() {
+                        // WHICH block of the extent, not just which LBA. `data_read` already names the
+                        // lba and the two CRCs; what it cannot know is whether this is the middle of a
+                        // file or its LAST block - and that distinction decides what the report MEANS.
+                        // A tail block is allocated when the extent is sized and only written when data
+                        // reaches it, so an unwritten tail carries no CRC stamp and reads as
+                        // `stored 0x00000000` on a filesystem that is perfectly healthy. Everything
+                        // else here is real damage. Reporting "1 bad" without saying which case it was
+                        // is what makes `drives check` fail with no way to tell a bug from bit-rot.
+                        ctx.log_fmt(format_args!(
+                            "fs: check - block {} of {} in the extent at lba {} failed verification{}",
+                            bi + 1, count, first,
+                            if bi + 1 == count { " (this is the LAST block of the extent)" } else { "" }
+                        ));
+                        ok = false;
+                    }
                 }
                 if !ok { st.2 += 1; }
             }
