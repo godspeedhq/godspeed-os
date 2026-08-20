@@ -256,10 +256,19 @@ impl core::fmt::Write for FnCapBuf {
 /// `Cell` rather than a lock or an atomic: this is one task on one core, so the cost of thread-safety
 /// would buy nothing, and an atomic here is what made the old version look acceptable while still being
 /// unowned. Interior mutability inside an owned struct is not global mutable state.
+/// The service's user stack, in bytes - the number this file's header cites when it says `pipe_run`'s
+/// frame "already sits near" the ceiling. Named here so the high-water report is a PERCENTAGE of a
+/// stated limit rather than a raw number the reader has to know the budget to interpret.
+const USER_STACK_BYTES: usize = 64 * 1024;
+
 pub struct ShellCtx {
     inner: ServiceContext,
     /// The fs request correlation tag (see `next_fs_tag`).
     fs_tag: core::cell::Cell<u8>,
+    /// Deepest `pipe_run` frame seen so far, in bytes. OWNED here rather than kept in a module-level
+    /// `static`, which is the anonymous singleton Invariant 9 forbids - the same mistake that had to be
+    /// undone in `xhci` an hour ago, and one this file already avoids for `fs_tag`.
+    pipe_stack_hwm: core::cell::Cell<usize>,
 }
 
 impl core::ops::Deref for ShellCtx {
@@ -273,7 +282,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // below still calls `ctx.log(...)` unchanged - `ShellCtx` derefs to `ServiceContext` - and deref
     // coercion lets it pass to anything expecting the SDK type. The tag now has an owner with the same
     // lifetime as the shell, instead of being a `static` that outlives nothing and belongs to no one.
-    let ctx = ShellCtx { inner: ctx, fs_tag: core::cell::Cell::new(0) };
+    let ctx = ShellCtx {
+        inner: ctx,
+        fs_tag: core::cell::Cell::new(0),
+        pipe_stack_hwm: core::cell::Cell::new(0),
+    };
     let ctx = &ctx;
     // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
     // shown on the TV during startup - the user wants to see it come up. We log our
@@ -6156,6 +6169,25 @@ enum Stream {
 /// `run → execute` chain overflow the user stack).
 #[inline(never)]
 fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), ShellError> {
+    // HIGH-WATER MARK, reported only when it moves. This file's own header says the user stack is
+    // 64 KiB and that this frame already sits near it, and the Pi 4 twice killed the shell inside a
+    // pipe with `ELR_EL1 = 0x0` - a branch to address zero, which is what a smashed frame's saved LR
+    // looks like. That is a HYPOTHESIS, and the shell was the one service with no way to confirm or
+    // kill it: `fs` prints its deepest block call, this printed nothing.
+    //
+    // Reported on a new maximum rather than every pipe, so a `selfcheck` of 357 cases does not become
+    // 357 log lines, and the number that matters - the worst frame reached - is still never missed.
+    {
+        let used = ctx.stack_used();
+        let prev = ctx.pipe_stack_hwm.get();
+        if used > prev {
+            ctx.pipe_stack_hwm.set(used);
+            ctx.log_fmt(format_args!(
+                "shell: pipe stack high-water {} of {} bytes ({}% of the user stack)",
+                used, USER_STACK_BYTES, used * 100 / USER_STACK_BYTES.max(1)
+            ));
+        }
+    }
     let mut stages = [""; MAX_STAGES];
     let mut n = 0usize;
     for part in line.split('|') {
