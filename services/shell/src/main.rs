@@ -8579,7 +8579,17 @@ fn fs_take_tagged(ctx: &ShellCtx, tag: u8, first: ReqOutcome, max_secs: i64) -> 
 /// forty callers, which is why `write` still hung after `tree` was fixed.
 const FS_ANSWER_SECS: i64 = 20;   // a round trip: milliseconds healthy, ~1 s across an fs respawn
 const FS_TREE_SECS:   i64 = 120;  // recursive delete - bounded by how much there is to remove
-const FS_SCAN_SECS:   i64 = 600;  // fsck / scrub / format - reads or writes the whole volume
+/// fsck and scrub walk the FILE TREE from the root (`check_subtree` / `scrub_subtree` in `fs`), not
+/// every block of the volume - the measured run reported "verified 34 blocks across 17 files, 8
+/// dirs", and the slowest observed `check` was ~14 s. 60 s is four times that.
+///
+/// This was 600, on my assumption that they swept the whole disk. I did not check, and the cost was
+/// the user sitting in front of a `drives scrub` that would not answer for ten minutes - a bound so
+/// loose it is indistinguishable from the hang it replaced.
+const FS_FSCK_SECS:   i64 = 60;
+/// Format and reset DO rewrite the volume, and are the one thing here that legitimately takes
+/// minutes on a 15 GiB stick.
+const FS_FORMAT_SECS: i64 = 600;
 
 fn fs_raw(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
     let tag = next_fs_tag(ctx);
@@ -8826,7 +8836,7 @@ fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome 
 /// (`fs_request_q` would append a path-length byte).
 fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
     const HINT_SECS: i64 = 2;    // print "(q to quit)" only once the wait lingers
-    const MAX_SECS:  i64 = FS_SCAN_SECS; // effectively unbounded: q is the real exit, not a deadline
+    const MAX_SECS:  i64 = FS_FORMAT_SECS; // effectively unbounded: q is the real exit, not a deadline
     let tag = next_fs_tag(ctx);
     let msg = Message::from_bytes(&[tag, op]);
     drain_stale_fs_replies(ctx);
@@ -11063,7 +11073,7 @@ fn drives_flash(ctx: &ShellCtx, label: &str, force: bool) -> Result<(), ShellErr
     // "flash FAILED" while fs is still formatting. Observed exactly that on hardware: fs logged
     // `flash requested`, never logged a failure, and the shell had already declared one.
     drain_stale_fs_replies(ctx);
-    match fs_raw(ctx, &req[..2 + ll], FS_SCAN_SECS) {
+    match fs_raw(ctx, &req[..2 + ll], FS_FORMAT_SECS) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: formatted as GSFS - mounted, ready to use now (no reboot)");
             Ok(())
@@ -11091,7 +11101,7 @@ fn drives_reset(ctx: &ShellCtx, force: bool) -> Result<(), ShellError> {
     // Reset zeroes block 0, which on a foreign disk is its partition table - same danger as flash.
     let op = if force { OP_RESET | 0x80 } else { OP_RESET };
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
-    match fs_raw(ctx, &[op], FS_SCAN_SECS) {
+    match fs_raw(ctx, &[op], FS_FORMAT_SECS) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: reset to raw - 'drives flash' to use again");
             Ok(())
