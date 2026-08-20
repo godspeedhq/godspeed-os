@@ -179,6 +179,20 @@ const FLOOR_RETRY_MS: u64 = 2_000;
 /// Bounded by its own success: the nudging stops the moment the clock is network-set, so a machine that
 /// syncs at boot sends one or two and never another.
 const SYNC_NUDGE_SECS: i64 = 20;
+/// How long between network syncs once we already HAVE one.
+///
+/// Owning the clock does not stop at getting it once. A reading fetched at boot drifts, and a service
+/// that fetched it once and never looked again is trusting a number that ages - so it re-checks, just
+/// far less often than when it has nothing. Twenty seconds is the rhythm of a service with no answer;
+/// an hour is the rhythm of one keeping a good answer good.
+const RESYNC_SECS: i64 = 3_600;
+/// How long to sleep between wake-ups once the clock is settled.
+///
+/// While there is no clock this service wakes every `FLOOR_RETRY_MS` because it has work to do. Once it
+/// has one there is almost nothing to do, and waking every two seconds for an hour to notice that
+/// nothing changed is exactly the noise the operator asked to avoid. A minute is far below the resync
+/// interval, so nothing is late, and it costs sixty times less.
+const SETTLED_WAKE_MS: u64 = 60_000;
 /// How many times to retry PERSISTING the floor before giving up until the clock is set again.
 ///
 /// Bounded, and the bound is the point. The first version of this retried forever: with `fs` answering
@@ -352,11 +366,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // bounded by success - once the network sets the clock, `unsynced` is false and this service
         // goes back to blocking on `recv` with no timer at all.
         let unsynced = clock.source != SRC_NTP;
-        let housekeeping = (!floor_settled && tries_left > 0) || store_left > 0 || unsynced;
-        let req = if !housekeeping {
-            ctx.recv()
+        // WHEN IS THE NEXT NETWORK CHECK DUE? Two rhythms, because two situations: with no clock at all
+        // this service asks often, and with a good one it asks rarely to keep it good. It never stops
+        // asking - a clock fetched once at boot drifts, and never looking again is trusting a number
+        // that ages.
+        let mono_top = ctx.epoch_secs_monotonic();
+        let interval = if unsynced { SYNC_NUDGE_SECS } else { RESYNC_SECS };
+        let sync_due = mono_top - last_nudge >= interval;
+        // ALWAYS a timed wait, never an indefinite block. The clock is never "settled" in the sense of
+        // finished - it settles into a slower rhythm.
+        //
+        // Gating the timer on outstanding work was right when this service only reacted; it is wrong
+        // now that it maintains something. The moment a sync succeeded every condition went false, the
+        // loop blocked on `recv`, and the next re-sync could only happen if somebody happened to ask
+        // the time - which on an idle machine is never. A clock that maintains itself has to wake up.
+        let wake_ms = if unsynced || !floor_settled || store_left > 0 {
+            FLOOR_RETRY_MS
         } else {
-            match ctx.recv_timeout(ctx.duration_cycles(FLOOR_RETRY_MS)) {
+            SETTLED_WAKE_MS
+        };
+        let req = {
+            match ctx.recv_timeout(ctx.duration_cycles(wake_ms)) {
                 Some(m) => m,
                 None => {
                     // A pending WRITE first: the clock is already known, and this is the copy that
@@ -367,11 +397,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // whose SEND failed - `fs` not spawned yet, or dead and not yet respawned - has no
                     // reply coming at all, so without this it would be attempted once and silently
                     // never again. That is the difference between "we tried" and "it gets written".
+                    // KEEP THE PERSISTED FLOOR FRESH, on this service's own heartbeat.
+                    //
+                    // The refresh used to ride on `OP_NOW`, which meant it only happened if somebody
+                    // asked the time. A machine left alone therefore persisted nothing, and a reboot
+                    // resumed from however old the last question was. Owning the clock includes owning
+                    // the copy that survives a power cut, and that cannot depend on being asked.
+                    //
+                    // Only a clock worth persisting: a floor-derived reading re-persisting itself would
+                    // just rewrite what it was handed, and an unset one has nothing to write.
+                    if store_left == 0 && clock.source != SRC_UNSET && clock.source != SRC_FLOOR {
+                        let reading = clock.now(&ctx);
+                        if reading > 0 && reading - store_epoch >= FLOOR_REFRESH_SECS {
+                            store_epoch = reading;
+                            store_left = FLOOR_STORE_TRIES;
+                            let _ = floor_store(&ctx, store_epoch);
+                        }
+                    }
                     // ASK FOR THE TIME, since nobody else will. See `SYNC_NUDGE_SECS`.
-                    if unsynced {
-                        let mono = ctx.epoch_secs_monotonic();
-                        if mono - last_nudge >= SYNC_NUDGE_SECS {
-                            last_nudge = mono;
+                    if sync_due {
+                        {
+                            last_nudge = ctx.epoch_secs_monotonic();
                             // ACQUIRE BY NAME FIRST, and SAY whether it worked.
                             //
                             // `net-stack` is spawned AFTER this service, so at spawn time there was no
