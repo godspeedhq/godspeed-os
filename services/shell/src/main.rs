@@ -8763,7 +8763,24 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
 /// `fs_request` stays for internal/cleanup ops (deletes, tests) the user never waits on interactively.
 fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome {
     const HINT_SECS: i64 = 2;    // print "(q to quit)" only if the wait lingers past this
-    const MAX_SECS:  i64 = 3600; // effectively unbounded - fs replies fast now; q is the real exit
+    // How long `fs` gets to answer before the shell declares storage unavailable.
+    //
+    // **This was 3600, with the comment "effectively unbounded - fs replies fast now; q is the real
+    // exit".** That is not a bound, and "q is the real exit" makes the USER the timeout: a `tree`
+    // whose LIST_DIR never came back sat for an hour looking hung, and the reacquire-and-retry path
+    // below gives it a second hour. It is the rule above the rules - nothing above the kernel may
+    // hang; a missing, dead or slow dependency must RETURN with a loud "unavailable". Every caller
+    // already handles that outcome properly ("tree: storage unavailable"); they were simply never
+    // reached.
+    //
+    // 20 s is generous for what this helper actually carries. Its ONLY callers are READ_FILE,
+    // STAT_FILE and LIST_DIR - operations that complete in milliseconds on a healthy mount, and
+    // whose worst legitimate case is an `fs` that died and is being respawned (~1 s). The whole-disk
+    // work that genuinely takes minutes - check, scrub, flash - does not come through here.
+    //
+    // The retry doubles it, so a truly dead `fs` costs 40 s and then says so, instead of costing an
+    // afternoon and saying nothing.
+    const MAX_SECS:  i64 = 20;
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
     let tag = next_fs_tag(ctx);
