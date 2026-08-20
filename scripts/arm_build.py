@@ -56,6 +56,13 @@ def _arm_services():
 ARM_SERVICES = _arm_services()
 
 
+def _check_embed():
+    """Same gate the Pi 4 build runs: every service the supervisor spawns must be embedded for real."""
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import service_embed_check
+    service_embed_check.enforce(ROOT, "arm")
+
+
 def run(cmd):
     print(">", " ".join(cmd), flush=True)
     r = subprocess.run(cmd, cwd=ROOT)
@@ -144,6 +151,7 @@ def main():
     #    but nothing read it - so `--qemu` was a silent no-op and USB under emulation ran with the
     #    hardware alias, which STALLs in the DATA stage. A flag that selects nothing is worse than an
     #    absent one: it reports success and you debug the wrong layer.
+    _check_embed()
     for svc in ARM_SERVICES:
         feats = []
         if svc == "supervisor":

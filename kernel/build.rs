@@ -160,14 +160,23 @@ const ARM_ONLY: &[&str] = &["dwc2"];
     // like a broken binary rather than a build-list omission, and is exactly the trap this comment
     // block warns about two paragraphs up. Cheap insurance against the failure mode with the worst
     // diagnostic. The spawn is what the feature gates (`services/supervisor`), not the embedding.
+    // `time` and `control` are here for the same reason they are in `arm_built`, and their absence was
+    // the Pi 4's first boot failure after the arm32 work: the supervisor SPAWNS both on every port, so
+    // leaving them out of this list embedded placeholders and the boot reported two `LoadFailed(TooSmall)`
+    // lines - the exact "reads like a broken binary rather than an absent one" trap the paragraph above
+    // warns about. `time` is REQUIRED, not optional: the Pi 4 has no battery-backed RTC either, so SNTP
+    // is the only way it learns the wall clock. `control` is inert on a board driven from its own
+    // console, and is embedded so the service set does not differ per arch without a reason.
     let aarch64_built: &[&str] = if aarch64_demo {
-        &["logger", "console", "ping", "pong", "supervisor", "shell", "chaos", "observe", "mem-pressure",
+        &["logger", "console", "time", "control", "ping", "pong", "supervisor", "shell",
+          "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     } else {
         // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
         // carnage, and observe is how it is watched while it does. Both are arch-neutral.
-        &["logger", "console", "supervisor", "shell", "chaos", "observe", "mem-pressure",
+        &["logger", "console", "time", "control", "supervisor", "shell",
+          "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     };
