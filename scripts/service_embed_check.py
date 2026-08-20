@@ -26,12 +26,25 @@ import io
 import os
 import re
 
-# Services the supervisor manages that are legitimately absent on some arch, and why. Anything else
-# missing is a build-list omission, not a design decision.
+# Services the supervisor manages that are legitimately absent on a GIVEN arch, and why.
+#
+# Keyed BY ARCH, deliberately. The first version of this was one flat set, and it made the check blind
+# in exactly the place it was most needed: `xhci` was exempted because the Pi 2 has no xHCI controller,
+# which then also excused it from the aarch64 list - where it is the Pi 4's only USB driver and the
+# service being edited all day. Deleting it from `aarch64_built` still passed. An exemption is a claim
+# about ONE machine; letting it span every machine is how a guard stops guarding.
+#
+# Anything not listed here must be embedded for that arch. A new exemption is a sentence someone
+# writes, not a silence.
 ARCH_EXEMPT = {
-    "ehci": "x86-only USB2 controller driver; no EHCI on either Pi",
-    "dwc2": "arm32-only (Pi 2) USB host driver; the Pi 4 uses xhci over PCIe, x86 uses xhci/ehci",
-    "xhci": "absent on the Pi 2, which has no PCIe and no xHCI controller",
+    "arm": {
+        "ehci": "x86-only USB2 controller driver; the Pi 2 has no EHCI",
+        "xhci": "the Pi 2 has no PCIe and no xHCI controller; its USB host is dwc2",
+    },
+    "aarch64": {
+        "ehci": "x86-only USB2 controller driver; the Pi 4's USB host is the VL805 xHCI",
+        "dwc2": "arm32-only (Pi 2) USB host driver; the Pi 4 drives xhci over PCIe",
+    },
 }
 
 NAME = chr(34) + "([a-z0-9" + chr(45) + "]+)" + chr(34)
@@ -114,8 +127,9 @@ def check(root, arch):
     bad = []
     for label, have in embedded_arms(root, arch):
         have = set(have)
+        exempt = ARCH_EXEMPT.get(arch, {})
         for name in names:
-            if name in have or name in ARCH_EXEMPT:
+            if name in have or name in exempt:
                 continue
             bad.append(
                 "  " + name + " [" + label + "]: the supervisor SPAWNS it, but it is not in that "
