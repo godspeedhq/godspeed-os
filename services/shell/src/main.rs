@@ -106,13 +106,40 @@ const PATH_MAX: usize = 120; // fits in MAX_LINE; path_len is u8
 // End-of-stream marker a producer service sends to a built-in sink (the shell draining a
 // `service | write` pipe). A non-empty sentinel - the IPC path doesn't deliver an empty body.
 const PIPE_EOT: u8 = 0x04; // ASCII EOT
-// One pipe stage's buffer. 64 KiB so a producer (`tree /`, `find …`) can capture a large
-// listing without being clipped at the buffer. NOTE this is no longer the *binding* limit:
-// an IPC message is 4 KiB (PIPE_MSG_MAX) and a file is ~3.5 KiB, so a buffer wider than those
-// can only flow to a sink that can take it (today: none beyond 4 KiB). Lifting those is the
-// streaming/multi-block work (docs/pipes.md). The buffer lives on the user stack; two coexist
-// for a middle filter (input + output ≈ 128 KiB), which fits the 256 KiB user stack.
-const CAP_MAX: usize = 64 * 1024;
+// One pipe stage's buffer.
+//
+// **This was 64 KiB, and the sum did not work.** The claim above it - "two coexist for a middle
+// filter (input + output ~128 KiB), which fits the 256 KiB user stack" - is true only if a pipe is
+// the DEEPEST thing on the stack, and it never is. Measured on hardware: `pipe_run`'s frame is
+// 143,360 bytes, 55% of the whole stack, and the runtime high-water on ENTRY to it was 177,297 -
+// its own frame plus ~34 KiB of callers. `assert_stream` then adds another 65,536. That is 80%
+// before the producer runs, and a further stage does not fit. The Pi 4 shell died there repeatedly
+// with a branch to address zero; the Pi 2 carries the SAME frames (143,884) and has simply not
+// tripped yet. It was never a Pi 4 bug.
+//
+// 16 KiB, chosen against the two things that actually bound the pipe rather than against a guess:
+//   - it is 4x `PIPE_MSG_MAX`, so a stage crossing a service boundary still has room to spare;
+//   - it drops a middle filter from ~128 KiB to ~32 KiB per level, which is what lets a pipe nest
+//     inside `if`/`for`/a function body at all. That nesting is why the buffer could not simply be
+//     moved off the stack into an arena: `execute` recurses, so each level needs its OWN buffers,
+//     and 2 levels x 2 x 64 KiB is the entire stack no matter where the bytes live.
+//
+// The cost is honest and already handled: a producer whose output exceeds this is TRUNCATED and
+// says so ("producer output exceeded the pipe buffer"), which is the behaviour that was already
+// there for 64 KiB - the bound moved, the loudness did not. Only the console can accept more than
+// `PIPE_MSG_MAX` anyway; every other sink clips at 4 KiB regardless of this number.
+//
+// Lifting it for real is the streaming/multi-block work (docs/pipes.md): stream the producer to the
+// sink in chunks instead of materialising the whole stage, at which point this constant bounds only
+// the stages that must genuinely see everything at once (sort, count).
+const CAP_MAX: usize = 16 * 1024;
+// The pipe buffer must stay wider than a single IPC message, or a stage crossing a service boundary
+// truncates a message it was handed whole - a bound that would look like a service bug rather than a
+// buffer that was shrunk past its floor. Pinned so the next person to tune CAP_MAX for stack cannot
+// take it below the one value it genuinely cannot go below.
+const _: () = assert!(CAP_MAX >= 4 * PIPE_MSG_MAX,
+    "CAP_MAX must leave room for several IPC messages; see the note above it");
+
 // A single IPC message body (= sdk MAX_PAYLOAD). A stage that must cross a service boundary is
 // bounded by this until pipe streaming chunks across messages.
 const PIPE_MSG_MAX: usize = 4096;
