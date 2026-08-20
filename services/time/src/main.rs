@@ -375,7 +375,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut store_epoch = 0i64;                   // the value those writes are for
     let mut tries_left = 15u32;                   // ~30 s of asking, then stop
     let mut last_nudge = i64::MIN / 2;            // monotonic second of the last sync nudge
-    let mut nudge_ok = false;                     // did the last nudge reach net-stack?
+    let mut nudge_ok: Option<bool> = None;        // did the last nudge reach net-stack? None = never tried
     let mut no_cap: u32 = 0;                      // capless messages seen (a flood, usually)
     loop {
         // Wake on a timer only while there is still housekeeping OUTSTANDING - a floor to read, or a
@@ -436,7 +436,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // ASK FOR THE TIME, since nobody else will. See `SYNC_NUDGE_SECS`.
                     if sync_due {
                         {
-                            last_nudge = ctx.epoch_secs_monotonic();
                             // ACQUIRE BY NAME FIRST, and SAY whether it worked.
                             //
                             // `net-stack` is spawned AFTER this service, so at spawn time there was no
@@ -452,8 +451,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             let ok = ctx.try_send("net-stack", &Message::from_bytes(&[11u8])).is_ok()
                                 || (ctx.reacquire_by_name("net-stack")
                                     && ctx.try_send("net-stack", &Message::from_bytes(&[11u8])).is_ok());
-                            if ok != nudge_ok {
-                                nudge_ok = ok;
+                            // ONLY A SENT NUDGE COUNTS AGAINST THE INTERVAL. This used to stamp
+                            // `last_nudge` before the attempt, so a nudge that never left still bought
+                            // twenty seconds of silence - and after a respawn the first attempt always
+                            // fails (the peer's cap is stale), so a fresh `time` sat on a stale floor
+                            // for twenty seconds before trying again. A failure should be retried at
+                            // the heartbeat, not rewarded with the full interval.
+                            if ok {
+                                last_nudge = ctx.epoch_secs_monotonic();
+                            }
+                            // `Option`, so the FIRST outcome always speaks. A plain bool starting at
+                            // `false` made a nudge that failed from the very first attempt log nothing
+                            // at all - no transition - which is precisely the silence this line exists
+                            // to break, and it hid this bug for a boot.
+                            if nudge_ok != Some(ok) {
+                                nudge_ok = Some(ok);
                                 ctx.log(if ok {
                                     "time: asking net-stack for the network clock"
                                 } else {
