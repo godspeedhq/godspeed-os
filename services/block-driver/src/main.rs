@@ -64,8 +64,15 @@ impl Reply {
         // bounded: this driver's caller is `fs`, which has at most one request outstanding, so a repeat
         // means its queue is persistently full - abnormal, and worth saying every time. A caller that
         // has DIED yields at most the requests already in flight. Neither can flood (§26.7, §26.6).
+        // Measured: 55 in a 1,000-round chaos soak, every one beside a `kill_task` of the caller.
+        //
+        // The message names BOTH causes because they are different faults and this cannot tell them
+        // apart from here. Under chaos it is almost always the caller being killed mid-request
+        // (`liveness=Dead` sits beside each one), which is ordinary. A full queue on a LIVE caller is
+        // genuine backpressure and is the one worth chasing - so the line must not assert the second
+        // when it is seeing the first, which the earlier wording did.
         if ctx.try_send_by_handle(self.cap, &godspeed_sdk::Message::from_bytes(&out[..1 + n])).is_err() {
-            ctx.log("block-driver: reply undelivered (caller's queue full) - it will time out and retry");
+            ctx.log("block-driver: reply undelivered (caller is gone, or its queue is full) - it will time out and retry");
         }
     }
 }

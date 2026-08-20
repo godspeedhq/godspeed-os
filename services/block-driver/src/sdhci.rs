@@ -411,7 +411,7 @@ impl<'a> Sd<'a> {
 /// is bounded by the protocol rather than needing a rate limit.
 fn reply_send(ctx: &ServiceContext, reply: godspeed_sdk::CapHandle, msg: &Message) {
     if ctx.try_send_by_handle(reply, msg).is_err() {
-        ctx.log("block-driver: reply undelivered (caller's queue full) - it will time out and retry");
+        ctx.log("block-driver: reply undelivered (caller is gone, or its queue is full) - it will time out and retry");
     }
 }
 

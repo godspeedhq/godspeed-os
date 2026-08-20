@@ -227,7 +227,7 @@ fn note_reply<E>(r: Result<(), E>, ctx: &ServiceContext, fails: &mut u32) {
         *fails = fails.saturating_add(1);
         if *fails == 1 || *fails % 64 == 0 {
             ctx.log_fmt(format_args!(
-                "nic-driver: reply send FAILED x{} (caller's queue full - it will time out)", fails));
+                "nic-driver: reply send FAILED x{} (caller is gone, or its queue is full - it will time out)", fails));
         }
     }
 }

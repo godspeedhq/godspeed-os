@@ -969,7 +969,7 @@ fn reply_nonblocking<E>(r: Result<(), E>, ctx: &ServiceContext, fails: &mut u32)
         *fails = fails.saturating_add(1);
         if *fails == 1 || *fails % 64 == 0 {
             ctx.log_fmt(format_args!(
-                "fs: reply send FAILED x{} (caller's queue full - it will time out and retry)", fails));
+                "fs: reply send FAILED x{} (caller is gone, or its queue is full - it will time out)", fails));
         }
     }
 }
