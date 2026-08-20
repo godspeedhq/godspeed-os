@@ -34,6 +34,9 @@ pub const OP_FLOOR_SET: u8 = 4; // [floor(8, le)] -> [ok]
 pub const SRC_UNSET: u8 = 0;
 pub const SRC_RTC: u8 = 1;
 pub const SRC_NTP: u8 = 2;
+/// The clock started from the persisted floor (`/clock.last`) - no RTC and no network yet. It is a real
+/// reading, and knowing it came from the floor is what stops it being mistaken for a synced one.
+pub const SRC_FLOOR: u8 = 3;
 
 /// The plausible-epoch window: 2020-01-01 .. 2100-01-01.
 ///
@@ -50,13 +53,23 @@ struct Clock {
     source: u8,
     /// Monotonic seconds at the last network sync, for reporting sync age.
     synced_at: i64,
+    /// Monotonic seconds at the moment `last` was established. THE CLOCK ADVANCES FROM HERE.
+    ///
+    /// Without this the clock did not tick. `now` took the hardware reading, and on a board with no RTC
+    /// that reading is implausible, so it fell back to `last` - which it then only ever replaced with
+    /// something LARGER. Nothing produced anything larger, so `last` stayed exactly where it was set.
+    /// `date sync` fetched the true time, stored it, reported success, and `date` returned that same
+    /// second for the rest of the boot. The clock was correct once and frozen thereafter.
+    ///
+    /// A wall clock with no RTC is a base plus elapsed time, and this is the base's other half.
+    base_mono: i64,
     /// The clock never reads below this. Persisted by whoever holds storage, handed back on boot.
     floor: i64,
 }
 
 impl Clock {
     const fn new() -> Self {
-        Self { last: 0, source: SRC_UNSET, synced_at: 0, floor: 0 }
+        Self { last: 0, source: SRC_UNSET, synced_at: 0, base_mono: 0, floor: 0 }
     }
 
     /// Reject a reading that moved BACKWARDS or jumped more than a day forward.
@@ -76,23 +89,37 @@ impl Clock {
     }
 
     /// The current wall clock: the RTC, deglitched, floored, and remembered.
+    /// The current epoch, in the order the operator asked for: hardware RTC, then whatever we were
+    /// told (network), then the persisted floor, then nothing.
     fn now(&mut self, ctx: &ServiceContext) -> i64 {
+        let mono = ctx.epoch_secs_monotonic();
         let raw = ctx.datetime().epoch_secs();
-        // Implausible readings are not clocks. Fall back to what we last believed rather than
-        // publishing a number that will be wrong in a way nobody notices until a file is dated 1970.
-        let candidate = if (MIN_PLAUSIBLE..MAX_PLAUSIBLE).contains(&raw) {
-            self.deglitch(raw)
-        } else {
-            self.last
-        };
-        let v = if candidate < self.floor { self.floor } else { candidate };
-        if v > self.last {
+
+        // 1. A HARDWARE RTC, where there is one. It is battery-backed and authoritative, so it wins and
+        //    re-bases everything else. An implausible reading is not a clock, it is a misread.
+        if (MIN_PLAUSIBLE..MAX_PLAUSIBLE).contains(&raw) {
+            let v = self.deglitch(raw).max(self.floor);
             self.last = v;
+            self.base_mono = mono;
             if self.source == SRC_UNSET {
                 self.source = SRC_RTC;
             }
+            return self.last;
         }
-        self.last
+
+        // 2/3. NO RTC, so the clock is a base plus the time elapsed since it was set - from the network
+        //      if we have been told, otherwise from the persisted floor. This is the half that was
+        //      missing: without it the reading never moved off whatever set it.
+        if self.last == 0 && self.floor > 0 {
+            self.last = self.floor;
+            self.base_mono = mono;
+            self.source = SRC_FLOOR;
+        }
+        if self.last == 0 {
+            return 0;                       // 4. nothing to believe yet, and saying 0 says exactly that
+        }
+        let elapsed = (mono - self.base_mono).max(0);
+        (self.last + elapsed).max(self.floor)
     }
 
     /// Accept a network reading (SNTP). Refused if implausible - a bad server does not get to move the
@@ -106,6 +133,9 @@ impl Clock {
         self.last = epoch;
         self.source = SRC_NTP;
         self.synced_at = ctx.epoch_secs_monotonic();
+        // RE-BASE. `now` advances from (`last`, `base_mono`), so a new reading without a new base would
+        // be instantly re-aged by however long the service had been up.
+        self.base_mono = self.synced_at;
         ctx.log_fmt(format_args!("time: wall clock set from the network ({})", epoch));
         true
     }
@@ -144,6 +174,21 @@ const FLOOR_RETRY_MS: u64 = 2_000;
 /// is not persistence, it is a storm (26.6: bounded behaviour, and a retry that never stops is not
 /// bounded). Three attempts covers `fs` still mounting; past that the honest answer is to say so once.
 const FLOOR_STORE_TRIES: u32 = 3;
+/// How stale the persisted floor may get before it is rewritten, in seconds.
+///
+/// The floor used to be written ONLY on a network sync, which made it as stale as the uptime since that
+/// sync. A board that synced at boot, ran six hours and rebooted with no network came back six hours
+/// behind - on top of however long it was powered off, which nothing can measure. The bound was correct
+/// and needlessly loose.
+///
+/// Refreshing caps the avoidable half at this interval: a reboot then resumes within ten minutes of the
+/// last known time, plus the unknowable off-period. It cannot do better than that and does not pretend
+/// to - see `SRC_FLOOR`, this is a lower bound, not a clock.
+///
+/// REQUEST-DRIVEN, not a timer. The check rides on `OP_NOW`, which `date`, `observe` and every file
+/// timestamp already ask for, so an idle machine writes nothing and this service keeps its property of
+/// having no periodic wake-up. Ten minutes is one flash write an hour under any normal use.
+const FLOOR_REFRESH_SECS: i64 = 600;
 
 /// `fs` replies `[tag, status, ...]`: the correlation tag it was given, THEN the status byte.
 ///
@@ -382,6 +427,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         match p[0] {
             OP_NOW => {
                 let now = clock.now(&ctx);
+                // KEEP THE FLOOR FRESH, on the back of a question somebody was already asking. See
+                // `FLOOR_REFRESH_SECS`. Only when the clock is worth persisting (a floor-derived
+                // reading re-persisting itself would just rewrite what it was given) and only when
+                // nothing is already owed, so this never competes with the retry machinery.
+                if store_left == 0 && clock.source != SRC_UNSET && clock.source != SRC_FLOOR
+                    && now > 0 && now - store_epoch >= FLOOR_REFRESH_SECS {
+                    store_epoch = now;
+                    store_left = FLOOR_STORE_TRIES;
+                    let _ = floor_store(&ctx, store_epoch);
+                }
                 // The age is APPENDED, not squeezed in: every existing reader checks `len >= 10` and
                 // indexes 0..10, so a longer reply is compatible by construction. The alternative -
                 // a second opcode - would make "when was this set" a separate round trip from "what
@@ -414,7 +469,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // its answer already and must not wait behind a disk, and neither must the next
                     // `date`. The loop sends it, watches for the acknowledgement, and retries on the
                     // timer if `fs` is not reachable yet - reliable, but never blocking.
-                    store_epoch = clock.last;
+                    // `now()`, not `last`: `last` is the BASE the clock advances from, not the current
+                    // reading. They are equal at this instant because the sync just re-based, and
+                    // writing the one that means "the time" keeps it correct if that ever changes.
+                    store_epoch = clock.now(&ctx);
                     store_left = FLOOR_STORE_TRIES;
                     let _ = floor_store(&ctx, store_epoch);
                     floor_settled = true;        // the clock is set; the stored floor no longer matters

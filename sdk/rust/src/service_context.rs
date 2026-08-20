@@ -41,6 +41,12 @@ pub enum ClockSource {
     Rtc,
     /// Set from the network (SNTP) this boot.
     Ntp,
+    /// Started from the persisted floor (`/clock.last`) - no RTC on this board and no network sync yet.
+    ///
+    /// A real reading and a distinct one: it is a LOWER BOUND carried over from the last boot, advancing
+    /// correctly since, but it cannot know how long the machine was powered off. Reporting it as `Rtc`
+    /// would claim hardware this board does not have, and as `Unset` would deny a time it is displaying.
+    Floor,
 }
 
 /// Wall-clock date/time read from the hardware RTC, fully decoded (binary,

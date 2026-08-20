@@ -5018,11 +5018,19 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     // hardware RTC carries NO such guarantee (firmware may keep it in local time or in UTC, and
     // nothing here can tell which), so it gets no scale label rather than a guessed one - the same
     // rule as the rest of this command: say what is known, never invent the rest.
-    match time_synced_secs_ago(ctx) {
-        Some(ago) => out.line_fmt(ctx, format_args!(
+    // A FLOOR-DERIVED CLOCK IS NOT AN RTC, and used to be labelled as one. On a board with no RTC the
+    // time can be carried over from `/clock.last` and then advanced correctly, which makes it a genuine
+    // reading and a LOWER BOUND: it cannot know how long the machine was powered off, so it is behind by
+    // exactly that unknown amount. Calling it `rtc` claims hardware this board does not have; calling it
+    // unset denies a time being displayed. It gets its own words.
+    match (source, time_synced_secs_ago(ctx)) {
+        (_, Some(ago)) => out.line_fmt(ctx, format_args!(
             "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC  (ntp, synced {} ago)",
             wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, HumanSecs(ago))),
-        None => out.line_fmt(ctx, format_args!(
+        (ClockSource::Floor, None) => out.line_fmt(ctx, format_args!(
+            "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC  (carried over from the last boot - AT LEAST              this late; 'date sync' for the true time)",
+            wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)),
+        (_, None) => out.line_fmt(ctx, format_args!(
             "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  (rtc, scale unknown)",
             wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)),
     }
@@ -8366,7 +8374,12 @@ fn time_source(ctx: &ShellCtx) -> ClockSource {
         Some(r) => {
             let p = r.payload_bytes();
             if p.len() < 10 || p[0] == 0 { return ClockSource::Unset; }
-            match p[9] { 1 => ClockSource::Rtc, 2 => ClockSource::Ntp, _ => ClockSource::Unset }
+            match p[9] {
+                1 => ClockSource::Rtc,
+                2 => ClockSource::Ntp,
+                3 => ClockSource::Floor,
+                _ => ClockSource::Unset,
+            }
         }
         None => ClockSource::Unset,
     }
