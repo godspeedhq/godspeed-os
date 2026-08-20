@@ -188,12 +188,6 @@ impl SliceAlloc {
     }
 }
 
-/// Block requests dropped for arriving with no reply cap - see the drop site for what that costs the
-/// caller. Module-scope rather than function-local so the periodic `alive` line can REPORT the running
-/// total: the first drop is logged loudly and the rest were silent forever, which is a failure counted
-/// and then swallowed (§26.7). Loud once, then visible on every beat, is the honest shape.
-static NO_CAP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
 /// Free a slot back to the controller (Disable Slot) for a probed device we do not keep - a non-HID
 /// downstream device - so controller slots do not leak across a hot-plug re-scan.
 ///
@@ -1716,6 +1710,14 @@ fn serve_if_block(
     // meant the endpoint was never queued again and the keyboard was gone for good - not a lost
     // report, a lost DEVICE.
     eaten: &mut EvMail,
+    // Block requests dropped for arriving with no reply cap. OWNED by the caller's loop and passed in
+    // rather than kept in a module-level `static`, which is the anonymous singleton Invariant 9 and
+    // Commandment VI forbid. The excuse for the static - that the counter it replaced was already a
+    // function-local one - is not an excuse: a `static` in a service is unowned state whichever scope
+    // it hides in. The main loop already owns `passes`, `msi_count` and the rest as plain locals above
+    // `'reenum`; this belongs with them, and now the code that REPORTS it and the code that
+    // INCREMENTS it are looking at one variable rather than two views of a hidden one.
+    no_cap: &mut u64,
     // `false` = the disk stopped answering a DATA operation, so the caller should drop it and
     // re-scan. Returning this rather than swallowing it is what turns an unplugged stick from "the
     // machine hangs" into "the disk went away".
@@ -1725,15 +1727,12 @@ fn serve_if_block(
     // it was never reached, and the two ways that can happen need different fixes: the poll loop is
     // not running (no message ever arrives here), or a message arrives WITHOUT a reply cap and this
     // function returns silently. Guessing between them has already cost two boots.
-    // An ATOMIC, not a `static mut`. The first draft of this counter used `static mut` + `unsafe`,
-    // and `scripts/unsafe_check.py` rejected it on the spot - correctly: §18.2 forbids `unsafe` in a
-    // service outright, and "it is only a diagnostic" is exactly the reasoning the rule exists to
-    // refuse. A relaxed atomic costs nothing and needs no exemption.
-    static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    // Counted but not read: the arrival trace it fed was removed (f67f5c15) and the no-reply-cap
-    // warning now has its own counter. Kept because the count itself is the cheap part and a future
-    // diagnostic will want it; named `_n` so the compiler does not have to warn about our intent.
-    let _n = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    // `SEEN` lived here: an atomic counter incremented into `let _n = ...` and read by nothing, kept
+    // on the grounds that a future diagnostic might want it. Both halves of that are wrong under the
+    // constitution - it is unowned state in a service (Invariant 9 / Commandment VI), and it is a
+    // feature held open for a hypothetical caller, which §26.2 answers with "not implemented; will be
+    // implemented when a test requires it". Deleted. The count is trivially recoverable if something
+    // ever does need it, and `msg_count` in the main loop already owns the arrival tally.
     // The "block-path message #N arrived" trace is GONE, and the refusal below now speaks ONCE.
     //
     // Both were bounded per instance (`n <= 8`), which looked fine and was not: a 10-hour soak logged
@@ -1783,7 +1782,9 @@ fn serve_if_block(
         // could only ever fire if the very FIRST message a fresh instance saw was the malformed one -
         // a guard whose trigger cannot occur in the failing case, which is the eighth instance of that
         // shape this cycle and one I introduced while fixing the log spam an hour earlier.
-        if NO_CAP.fetch_add(1, core::sync::atomic::Ordering::Relaxed) == 0 {
+        let first = *no_cap == 0;
+        *no_cap += 1;
+        if first {
             ctx.log_fmt(format_args!(
                 "xhci: block request (op {}) arrived with NO reply cap - dropping it; its caller died between sending and being served, so there is nobody left to reply to", op))
         }
@@ -2994,6 +2995,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // "are we using interrupts?" is answered by a number instead of by a log line that could not tell.
     let mut msi_count: u64 = 0;
     let mut msg_count: u64 = 0;
+    // Block requests dropped for arriving with no reply cap. Here, with the other heartbeat counters
+    // and ABOVE `'reenum`, for the same reason they are: a re-enumeration must not reset it. Owned by
+    // this loop and lent to `serve_if_block`, which is what a service's state looks like when it is
+    // not a `static` (Invariant 9).
+    let mut no_cap_drops: u64 = 0;
     let mut work_cycles: u64 = 0;
     let mut work_t0: u64 = 0;
     // Where the per-pass time actually goes, split three ways: serving (block requests + HID
@@ -3842,7 +3848,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if woke.is_some() { quiet_waits = 0; } else { quiet_waits = quiet_waits.saturating_add(1); }
             if is_irq { irq_seen = true; }
             if let Some(m) = woke {
-                if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten) {
+                if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops) {
                     ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
                     notify(&ctx, "storage disconnected (xhci)");
                     disk = None;
@@ -3894,7 +3900,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             while served < 1 {
                 let Some(m) = ctx.try_recv() else { break };
                 served += 1;
-                disk_alive &= serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten);
+                disk_alive &= serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops);
             }
             if !disk_alive {
                 ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
@@ -4022,7 +4028,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     hub_ok, hub_posted, hub_late,
                     msi_count, msg_count, ndev,
                     if disk.is_some() { "yes" } else { "no" },
-                    NO_CAP.load(core::sync::atomic::Ordering::Relaxed)));
+                    no_cap_drops));
             }
             let hub_due =
                 ctx.read_tsc().wrapping_sub(last_hub_poll) > ctx.duration_cycles(HUB_POLL_MS);
