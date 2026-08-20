@@ -29,7 +29,6 @@ pub mod mmu;
 pub mod ptables;
 #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
 pub mod sched_demo;
-#[cfg(all(feature = "pi4", feature = "pi4-sched-spawn"))]
 #[cfg(feature = "pi4")]
 pub mod sched_supervisor;
 #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
@@ -1063,10 +1062,7 @@ extern "C" fn boot_high() -> ! {
     // Otherwise the real OS bootstrap: the kernel's ONE direct spawn is the supervisor, which spawns
     // the rest. This is the DEFAULT, so `--features pi4` builds the OS rather than a kernel that boots
     // and halts - the deployed image and the tested image are then the same build.
-    #[cfg(all(
-        feature = "pi4",
-        not(any(feature = "pi4-sched-spawn", feature = "pi4-sched-demo"))
-    ))]
+    #[cfg(all(feature = "pi4", not(feature = "pi4-sched-demo")))]
     sched_supervisor::run();
 
     put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.
@@ -1308,6 +1304,12 @@ pub fn usb_disk_flush() -> bool { false }
 /// ARM port spent its entire bring-up silently undefended that way - the watchdog was inert because it
 /// keyed off an unrelated stubbed constant, so a real wedge produced no diagnostic at all. A safety net
 /// that is absent should at least be absent loudly (§26.4); here it is simply present.
+/// (interrupts dispatched, last GIC interrupt ID) for `core` - what the liveness panic reports.
+/// Tallied at IRQ entry in `exceptions.rs`; the 32-bit port's twin lives in `arch/arm/irq.rs`.
+pub fn core_irq_debug(core: u32) -> (u32, u32) {
+    exceptions::core_irq_debug(core)
+}
+
 #[cfg(feature = "pi4")]
 pub fn liveness_deadline_cycles() -> u64 { timer::frequency().saturating_mul(10) }
 #[cfg(not(feature = "pi4"))]

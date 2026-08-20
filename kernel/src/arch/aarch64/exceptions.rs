@@ -341,12 +341,51 @@ static SPI_TOO_HIGH_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic:
 /// acknowledged interrupt, so skipping it silently blocks all later interrupts of equal or lower
 /// priority. The symptom is "interrupts stopped" with nothing to point at, which is why the retire
 /// happens on every path out of here including the spurious one.
+/// Interrupts dispatched per core, and the last GIC interrupt ID each saw.
+///
+/// Exists for one question the liveness watchdog could not answer on this port: when a core stops
+/// making progress, is it still taking interrupts? A frozen count and a climbing count are opposite
+/// faults with opposite fixes - not taking interrupts at all, versus taking them and losing the tick
+/// inside the handler - and without this the panic named the victim but never the mechanism.
+///
+/// This is the aarch64 twin of the 32-bit port's tally (`arch/arm/irq.rs`). It is not optional here:
+/// `liveness_deadline_cycles` is ANSWERED on the Pi 4, so the watchdog is armed on this port and its
+/// panic message reads these. They were missing, which is why the Pi 4 kernel did not build.
+static IRQ_COUNT: [core::sync::atomic::AtomicU32; MAX_TALLY_CORES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_TALLY_CORES];
+static IRQ_LAST_ID: [core::sync::atomic::AtomicU32; MAX_TALLY_CORES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_TALLY_CORES];
+
+/// Cores this tally covers. The Pi 4 is a quad-core A72; a core beyond this range folds into the last
+/// slot rather than indexing out of bounds, because a DIAGNOSTIC must never be the thing that panics.
+const MAX_TALLY_CORES: usize = 4;
+
+/// (interrupts dispatched, last GIC interrupt ID) for `core` - what the liveness panic reports.
+pub fn core_irq_debug(core: u32) -> (u32, u32) {
+    let i = (core as usize).min(MAX_TALLY_CORES - 1);
+    (
+        IRQ_COUNT[i].load(core::sync::atomic::Ordering::Relaxed),
+        IRQ_LAST_ID[i].load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 #[no_mangle]
 extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
     let id = super::gic::acknowledge();
     if id == super::gic::SPURIOUS {
         return; // nothing pending - do NOT EOI an ID that was never raised
     }
+    // Stamp BEFORE any handling: the count must prove the interrupt was TAKEN, not that it completed.
+    // A handler that hangs is exactly the case this is meant to distinguish, and it would never reach
+    // a stamp placed at the end.
+    // Indexed by LOGICAL core id, which is what the liveness watchdog passes to `core_irq_debug` -
+    // so the tally is read back under the same identity it was written under. (Raw MPIDR would agree
+    // on the Pi 4, where it is 0..3, and quietly disagree on any board where it is not.) The neutral
+    // accessor is safe and cannot panic - it falls back to 0 for a core it does not know - which is
+    // the property that matters in a handler whose whole job is to survive a machine in trouble.
+    let core = crate::task::scheduler::current_core_id().min(MAX_TALLY_CORES - 1);
+    IRQ_COUNT[core].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    IRQ_LAST_ID[core].store(id, core::sync::atomic::Ordering::Relaxed);
     // IDs 0..15 are Software Generated Interrupts - one core waking another. Acknowledging and retiring
     // them is the whole job: the wake's PURPOSE is to make this core leave `wfi` and re-enter the
     // scheduler, which it does on the way out of this handler. There is no per-vector work to do, which
