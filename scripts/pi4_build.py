@@ -153,6 +153,13 @@ for svc in PI4_SERVICES:
         feats = ["--features", "el0-fault-test"]
     run(["cargo", "build", "-p", svc, "--target", TARGET] + feats + rel)
 
+# Every service's frames must fit the 256 KiB user stack (USER_STACK_PAGES in kernel/src/task/mod.rs).
+# The Pi 2 has had this gate since a debug `fs` crash-looped on a 503 KiB frame; the Pi 4 had none, and
+# a rule enforced on one build path is enforced on none.
+import stack_fit_check
+stack_fit_check.enforce(
+    tool("rust-objdump"), str(ROOT), TARGET, PROFILE, PI4_SERVICES, 64 * 4096)
+
 # 2. The kernel.
 args = ["cargo", "build", "-p", "kernel", "--target", TARGET, "--features", FEATURES] + rel
 run(args)

@@ -180,39 +180,13 @@ def main():
     #     now the only signal was on hardware. It is a build refusal with the number in it instead.
     stack_limit = 64 * 4096   # USER_STACK_PAGES * PAGE_SIZE, kernel/src/task/mod.rs
     objdump = shutil.which("rust-objdump") or "rust-objdump"
-    too_big = []
-    for svc in ARM_SERVICES:
-        elf = os.path.join(ROOT, "target", TARGET, profile, svc)
-        if not os.path.exists(elf):
-            continue
-        r = subprocess.run([objdump, "-d", "--disassemble-symbols=service_main", elf],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            continue
-        frame = 0
-        for line in r.stdout.splitlines():
-            # The prologue emits one `sub sp, sp, #N` per immediate the ARM encoding can hold, so a big
-            # frame is SEVERAL instructions and only their sum is the real depth. Reading the first one
-            # alone reports 824 bytes for a 503 KiB frame, which is how this stayed invisible.
-            hit = re.search(r"sub\s+sp, sp, #(\d+)", line)
-            if hit:
-                frame += int(hit.group(1))
-            elif frame:
-                break   # the run of stack adjustments has ended; the prologue is over
-        if frame > stack_limit:
-            too_big.append((svc, frame))
-    if too_big:
-        print()
-        for svc, frame in too_big:
-            print("  %-14s service_main frame %d bytes > %d byte stack (over by %d)"
-                  % (svc, frame, stack_limit, frame - stack_limit))
-        raise SystemExit(
-            "\nBUILD REFUSED: the service(s) above cannot fit their own stack frame. Each would fault\n"
-            "on the first store of its prologue and crash-loop forever under the supervisor.\n"
-            "Build with --release, or shrink the frame (CLAUDE.md 26.6.1: change the data shape -\n"
-            "stream it, refer to it by span, or give it a bounded arena - do not reach for a heap).")
-    print("stack fit: every service's service_main frame is within the %d KiB user stack"
-          % (stack_limit // 1024))
+    # One gate, shared with the Pi 4 build (scripts/stack_fit_check.py). This was an inline copy that
+    # checked `service_main` ALONE; the shared one checks every function, which is what Linux's
+    # `-Wframe-larger-than` does and what this copy could not - `service_main` is rarely the deepest
+    # frame, only the one somebody thought to look at.
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import stack_fit_check
+    stack_fit_check.enforce(objdump, ROOT, TARGET, profile, ARM_SERVICES, stack_limit)
 
     # 2. Build the kernel (embeds the service ELFs) with the chosen boot path.
     #
