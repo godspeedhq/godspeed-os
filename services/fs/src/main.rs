@@ -238,6 +238,21 @@ struct OpenFile {
     path: [u8; OPEN_PATH_MAX],
 }
 
+/// The superblock fields `persist_super` can actually change. Compared before writing so an
+/// operation that alters none of them does no I/O at all - see `persist_super`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SbFields {
+    root_first_block: u64,
+    root_block_count: u64,
+    free_blocks: u64,
+    flags: u32,
+    label_len: u8,
+    label: [u8; LABEL_MAX],
+    feat_compat: u32,
+    feat_ro_compat: u32,
+    feat_incompat: u32,
+}
+
 /// In-memory superblock view. No inode table - the tree lives on disk and is read on
 /// demand; the bitmap likewise (this struct holds only geometry + the maintained free
 /// count + the root's extent + drive label/flags).
@@ -280,6 +295,12 @@ struct Fs {
     // the next request rather than trusting them (§14.3 - reacquiring is necessary but not sufficient;
     // everything derived from the previous incarnation must be re-established too).
     io_error_seen: core::cell::Cell<bool>,
+    /// The mutable superblock fields as last successfully PERSISTED, or `None` if that is unknown
+    /// (before the first persist of this mount). Purely a write-avoidance record: the in-memory
+    /// fields remain the truth and this is derived from them, never consulted as a source (§26.4).
+    /// Set only after a persist that succeeded, so a failed write can never be mistaken for a
+    /// superblock already on disk.
+    sb_persisted: Option<SbFields>,
     // Crash-consistency journal (Phase C). While `txn_active`, structural writes (directory,
     // bitmap, superblock) are STAGED here - with read-your-writes - instead of going to disk,
     // then committed atomically through the on-disk journal region (`commit_txn`). Data-block
@@ -1578,6 +1599,9 @@ impl Fs {
             last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
             flush_warned: core::cell::Cell::new(false),
             io_error_seen: core::cell::Cell::new(false),
+            // `None` = unknown, so the first persist of this mount always writes. One write per
+            // mount is the price of never assuming what is on a disk we have not written to yet.
+            sb_persisted: None,
             txn_active: false,
             txn_n: 0,
             txn_overflow: false,
@@ -2071,6 +2095,9 @@ impl Fs {
             last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
             flush_warned: core::cell::Cell::new(false),
             io_error_seen: core::cell::Cell::new(false),
+            // `None` = unknown, so the first persist of this mount always writes. One write per
+            // mount is the price of never assuming what is on a disk we have not written to yet.
+            sb_persisted: None,
             txn_active: false,
             txn_n: 0,
             txn_overflow: false,
@@ -2093,6 +2120,37 @@ impl Fs {
     /// Re-write the mutable superblock fields (free count, root extent, flags, label) from
     /// current in-memory state. Geometry (total/bitmap/data) is fixed at format.
     fn persist_super(&mut self, ctx: &ServiceContext) -> Result<(), &'static str> {
+        // SKIP THE WRITE WHEN NOTHING IT WRITES HAS CHANGED.
+        //
+        // This runs after every mutation, and it is not free: a superblock read, a CRC, and TWO
+        // staged block writes (primary + backup) inside the transaction. An overwrite that reuses a
+        // file's existing blocks changes no field below - not the free count, not the root extent,
+        // not the label - so all of that was pure cost.
+        //
+        // It is paid on the hot path of the whole system, because the shell write-throughs
+        // `/.gsh_history` after EVERY command: type `date` and the superblock is read, rewritten and
+        // journalled twice before the clock is consulted. That is what the "stack used at the deepest
+        // block call" line - documented as firing "once per mount" - was really reporting when it
+        // appeared before every prompt.
+        //
+        // The comparison is against what was last SUCCESSFULLY persisted, so a failed write leaves
+        // the record unset and the next attempt writes again. And it is a write-avoidance record
+        // only: the in-memory fields stay the single source of truth (§26.4) - this never answers a
+        // question, it only declines to repeat an answer.
+        let want = SbFields {
+            root_first_block: self.root_first_block,
+            root_block_count: self.root_block_count,
+            free_blocks: self.free_blocks,
+            flags: self.flags,
+            label_len: self.label_len,
+            label: self.label,
+            feat_compat: self.feat_compat,
+            feat_ro_compat: self.feat_ro_compat,
+            feat_incompat: self.feat_incompat,
+        };
+        if self.sb_persisted == Some(want) {
+            return Ok(());
+        }
         let mut sb = self.tb_read(ctx, 0).ok_or("superblock read failed")?;
         sb[48..56].copy_from_slice(&self.root_first_block.to_le_bytes());
         sb[56..64].copy_from_slice(&self.root_block_count.to_le_bytes());
@@ -2115,6 +2173,8 @@ impl Fs {
         // transaction, so they commit atomically and the backup never lags the primary.
         if !self.tb_write(ctx, 0, &sb) { return Err("superblock write failed"); }
         if !self.tb_write(ctx, self.total_blocks - 1, &sb) { return Err("backup superblock write failed"); }
+        // Only now, after BOTH copies are staged successfully.
+        self.sb_persisted = Some(want);
         Ok(())
     }
 
