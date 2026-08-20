@@ -177,7 +177,7 @@ impl core::fmt::Write for FrameBuf {
 /// clock slice 3 - it is the one that knows the RTC, the network reading and the persisted floor, and
 /// in that order. Reading the raw RTC here would be a second, worse answer to a question somebody else
 /// already owns (Commandment III).
-fn learn_start_wall(ctx: &ServiceContext, elapsed: i64) -> Option<i64> {
+fn learn_wall_offset(ctx: &ServiceContext) -> Option<i64> {
     // ACQUIRE BY NAME FIRST. Chaos declares NO `ipc_send` peers at all - it reaches every service
     // through the kernel's name directory, which is how it can kill things it was never wired to. So a
     // name-addressed request finds nothing until the cap is acquired, and the first version of this
@@ -201,8 +201,10 @@ fn learn_start_wall(ctx: &ServiceContext, elapsed: i64) -> Option<i64> {
     e.copy_from_slice(&p[1..9]);
     let now = i64::from_le_bytes(e);
     // A clock that is not set answers 0, and 0 minus an elapsed is not a start time.
-    let started = now - elapsed;
-    if started >= 1_577_836_800 { Some(started) } else { None }
+    // The OFFSET, taken at one instant: wall clock minus monotonic. Any past or present moment's wall
+    // time is then that moment's monotonic reading plus this, which is what keeps `started` and
+    // `elapsed` from ever contradicting each other.
+    if now >= 1_577_836_800 { Some(now - ctx.epoch_secs_monotonic()) } else { None }
 }
 
 fn write_dur(f: &mut FrameBuf, secs: u64) {
@@ -328,7 +330,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // rendered as 1970. Elapsed and the ETA ride the monotonic clock and are unaffected either way.
     let start_dt = ctx.datetime();
     let start_epoch = start_dt.epoch_secs();
-    // When this run began, in wall-clock terms, ONCE ANYBODY KNOWS. See `learn_start_wall`.
+    // How the wall clock relates to the monotonic counter, ONCE ANYBODY KNOWS. See `learn_wall_offset`.
     // ASK BEFORE THE STORM, WHILE THE SYSTEM IS STILL CALM.
     //
     // This only ever asked from inside the report loop, which runs while chaos is killing `time` several
@@ -337,10 +339,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // throughout. The one moment `time` is reliably healthy is right now, before the first round.
     //
     // Elapsed is zero here, so "now minus elapsed" is simply now.
-    let mut start_wall: Option<i64> = if start_dt.year >= 2000 {
-        Some(start_epoch)
+    // CACHE THE OFFSET, NOT THE START TIME.
+    //
+    // `started` and `elapsed` must agree - they describe the same instant from two directions - and
+    // storing them as two independent facts let them drift: a report showed `elapsed 3s`, then `elapsed
+    // 0s` with `started` unchanged, which is arithmetically impossible for one run and means the two
+    // were cached from different moments.
+    //
+    // They cannot disagree if only ONE thing is remembered. What is genuinely worth caching is neither
+    // of them: it is the OFFSET between the wall clock and the monotonic counter, which is a property of
+    // the machine and does not change while the clock holds. Both displayed values are then derived from
+    // the same `start_mono`, so they are consistent by construction rather than by care.
+    let mut wall_offset: Option<i64> = if start_dt.year >= 2000 {
+        Some(start_epoch - ctx.epoch_secs_monotonic())
     } else {
-        learn_start_wall(&ctx, 0)
+        learn_wall_offset(&ctx)
     };
     // ELAPSED is measured on the MONOTONIC clock, not this wall-clock stamp: the wall clock is settable
     // (SNTP sets it on the RTC-less Pi), so a sync landing mid-run would make `now - start` jump by the
@@ -517,14 +530,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // "Thu 1970-01-01 00:00:00" - a fiction with the shape of a fact. `elapsed` is unaffected: it
         // comes from the MONOTONIC counter, which is real from boot, so the run's own timing stays
         // honest either way. Report what is known, and say so when something is not (§26.7).
-        // ASK ONCE THE CLOCK EXISTS, then never again. See `learn_start_wall` for why chaos may ask
+        // ASK ONCE THE CLOCK EXISTS, then never again. See `learn_wall_offset` for why chaos may ask
         // the `time` service without depending on it.
-        if start_wall.is_none() {
-            start_wall = learn_start_wall(&ctx, elapsed as i64);
+        if wall_offset.is_none() {
+            wall_offset = learn_wall_offset(&ctx);
         }
-        match start_wall {
-            Some(e) => {
-                let d = godspeed_sdk::Datetime::from_epoch_secs(e);
+        match wall_offset {
+            // Derived from the SAME `start_mono` the elapsed above uses, so the two always agree.
+            Some(off) => {
+                let d = godspeed_sdk::Datetime::from_epoch_secs(start_mono + off);
                 let _ = write!(f, "  started {} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  |  elapsed ",
                     WEEKDAYS[(d.weekday() as usize) % 7], d.year, d.month,
                     d.day, d.hour, d.minute, d.second);
