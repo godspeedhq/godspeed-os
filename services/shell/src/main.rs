@@ -6067,7 +6067,7 @@ fn cap_rights_str(r: u8, buf: &mut [u8]) -> usize {
 #[inline(never)]
 fn build_drives_table(ctx: &ShellCtx) -> Option<Table> {
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
-    let reply = match fs_raw(ctx, &[OP_DRIVES_INFO], 3600) {
+    let reply = match fs_raw(ctx, &[OP_DRIVES_INFO], FS_ANSWER_SECS) {
         Some(r) => r,
         None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); return None; }
     };
@@ -8565,6 +8565,22 @@ fn fs_take_tagged(ctx: &ShellCtx, tag: u8, first: ReqOutcome, max_secs: i64) -> 
 /// which fs would read as `tag = <opcode>` and dispatch on the byte after it - a silent misparse. Routing
 /// them through one helper is what makes "every name-addressed request carries a tag" true rather than
 /// mostly true (Commandment III: one path, not two).
+/// How long `fs` gets to answer, BY WHAT IT WAS ASKED TO DO.
+///
+/// Every wait in this file was `3600`, with comments calling it "effectively unbounded - q is the
+/// real exit". That is not a bound, and making the USER the timeout is the one thing nothing above
+/// the kernel may do: a missing, dead or slow dependency must RETURN with a loud "unavailable". The
+/// callers already handle that outcome correctly - they were simply never reached, because nobody
+/// sits for an hour. It hung `tree` once and `write` once, and both looked like a dead machine.
+///
+/// Split by operation rather than flattened, because one number is wrong at one end or the other:
+/// short enough to bound a round trip aborts a whole-disk scan, and long enough for the scan is an
+/// afternoon for a round trip. The first attempt at this fixed ONE helper and left the one with
+/// forty callers, which is why `write` still hung after `tree` was fixed.
+const FS_ANSWER_SECS: i64 = 20;   // a round trip: milliseconds healthy, ~1 s across an fs respawn
+const FS_TREE_SECS:   i64 = 120;  // recursive delete - bounded by how much there is to remove
+const FS_SCAN_SECS:   i64 = 600;  // fsck / scrub / format - reads or writes the whole volume
+
 fn fs_raw(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
     let tag = next_fs_tag(ctx);
     let mut req = [0u8; 4096];
@@ -8598,18 +8614,21 @@ fn fs_request(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> Option<Messag
     let dn = data.len().min(req.len() - 3 - pl);
     req[3 + pl..3 + pl + dn].copy_from_slice(&data[..dn]);
     let msg = Message::from_bytes(&req[..3 + pl + dn]);
+    // DELETE_TREE is the one genuinely slow operation routed through here; the rest are round trips.
+    let secs = if op == OP_DELETE_TREE { FS_TREE_SECS } else { FS_ANSWER_SECS };
     drain_stale_fs_replies(ctx);          // an earlier abandoned reply must not be read as ours
-    // 3600 s here is the same "effectively unbounded, q is the real exit" budget the interactive path
-    // uses: it bounds only the wait for a REPLACEMENT reply after discarding an overtaken one.
-    // ABORTABLE, so `q` works while `fs` is merely slow.
-    let first = ctx.request_with_reply_abortable("fs", &msg, 3600);
+    // Bounded by `secs` (see FS_ANSWER_SECS): it was the same "effectively unbounded, q is the real
+    // exit" budget the interactive path used, and it bounds the wait for a REPLACEMENT reply after
+    // discarding an overtaken one. Still ABORTABLE, so `q` remains an EARLY exit while `fs` is merely
+    // slow - it is no longer the only exit.
+    let first = ctx.request_with_reply_abortable("fs", &msg, secs);
     if matches!(first, ReqOutcome::Aborted) {
         return None; // the user pressed q - that is an answer, not a failure to retry
     }
     // Wait for a REPLACEMENT only if a reply actually arrived (possibly an overtaken one).
     //
     // This is the stale-cap hang. When `fs` restarts, the shell's cached cap goes EndpointDead and
-    // the send fails outright - no reply, and none coming. Feeding that into a 3600-second wait for
+    // the send fails outright - no reply, and none coming. Feeding that into an hour-long wait for
     // a "replacement" meant the reacquire-and-retry immediately below was NEVER REACHED: the
     // recovery path existed, was correct, and sat behind an hour-long wait for something that could
     // not arrive. Reproduced in QEMU with `kill fs` then `drives`: one gen-mismatch line and then
@@ -8617,7 +8636,7 @@ fn fs_request(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> Option<Messag
     //
     // A missing reply is not a late reply. Only the latter is worth waiting for.
     if matches!(first, ReqOutcome::Reply(_)) {
-        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag, first, 3600) {
+        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag, first, secs) {
             return Some(r);
         }
     }
@@ -8640,14 +8659,14 @@ fn fs_request(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> Option<Messag
         req2[0] = tag2;
         let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
         // Same rule on the retry: never wait out an hour for a reply that was never sent.
-        let second = ctx.request_with_reply_abortable("fs", &msg2, 3600);
+        let second = ctx.request_with_reply_abortable("fs", &msg2, secs);
         if matches!(second, ReqOutcome::Aborted) {
             return None;
         }
         if !matches!(second, ReqOutcome::Reply(_)) {
             return None; // fs still unreachable - the next command retries (§14.3)
         }
-        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag2, second, 3600) {
+        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag2, second, secs) {
             return Some(r);
         }
     }
@@ -8807,7 +8826,7 @@ fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome 
 /// (`fs_request_q` would append a path-length byte).
 fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
     const HINT_SECS: i64 = 2;    // print "(q to quit)" only once the wait lingers
-    const MAX_SECS:  i64 = 3600; // effectively unbounded: q is the real exit, not a deadline
+    const MAX_SECS:  i64 = FS_SCAN_SECS; // effectively unbounded: q is the real exit, not a deadline
     let tag = next_fs_tag(ctx);
     let msg = Message::from_bytes(&[tag, op]);
     drain_stale_fs_replies(ctx);
@@ -10967,7 +10986,7 @@ fn drive_sel_ok(ctx: &ServiceContext, sel: &str) -> bool {
 /// `drives` - list the attached drive (single-drive in step 3; index 0).
 fn drives_list(ctx: &ShellCtx) -> Result<(), ShellError> {
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
-    let reply = match fs_raw(ctx, &[OP_DRIVES_INFO], 3600) {
+    let reply = match fs_raw(ctx, &[OP_DRIVES_INFO], FS_ANSWER_SECS) {
         Some(r) => r,
         None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); return Err(ShellError::Unknown); }
     };
@@ -11044,7 +11063,7 @@ fn drives_flash(ctx: &ShellCtx, label: &str, force: bool) -> Result<(), ShellErr
     // "flash FAILED" while fs is still formatting. Observed exactly that on hardware: fs logged
     // `flash requested`, never logged a failure, and the shell had already declared one.
     drain_stale_fs_replies(ctx);
-    match fs_raw(ctx, &req[..2 + ll], 3600) {
+    match fs_raw(ctx, &req[..2 + ll], FS_SCAN_SECS) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: formatted as GSFS - mounted, ready to use now (no reboot)");
             Ok(())
@@ -11072,7 +11091,7 @@ fn drives_reset(ctx: &ShellCtx, force: bool) -> Result<(), ShellError> {
     // Reset zeroes block 0, which on a foreign disk is its partition table - same danger as flash.
     let op = if force { OP_RESET | 0x80 } else { OP_RESET };
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
-    match fs_raw(ctx, &[op], 3600) {
+    match fs_raw(ctx, &[op], FS_SCAN_SECS) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: reset to raw - 'drives flash' to use again");
             Ok(())
@@ -11177,7 +11196,7 @@ fn drives_label(ctx: &ShellCtx, name: &str) -> Result<(), ShellError> {
     req[1] = ll as u8;
     req[2..2 + ll].copy_from_slice(nb);
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
-    match fs_raw(ctx, &req[..2 + ll], 3600) {
+    match fs_raw(ctx, &req[..2 + ll], FS_ANSWER_SECS) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln_fmt(format_args!("drives: labelled '{}'", name));
             Ok(())
