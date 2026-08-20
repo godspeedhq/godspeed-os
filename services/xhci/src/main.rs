@@ -1745,13 +1745,40 @@ fn serve_if_block(
     // hardware testing. The refusal is worth keeping - a request with no reply cap leaves its caller
     // waiting - but once per instance says everything a hundred repeats do, and this is the loop that
     // also polls the keyboard.
+    // Is this OURS? Every block request carries an opcode in `1..=5` as its first byte, and arrives
+    // through the SDK's `request_with_reply`, which always embeds a reply cap. Anything else that
+    // wakes this service - a `chaos` flood, a stray notification - is a plain `send` with no cap and
+    // no opcode, and is simply not addressed to this path.
+    //
+    // The check used to be absent, and this function ran on EVERY message. So all that unrelated
+    // traffic reached the branch below and was reported as "block request had NO reply cap - dropping
+    // it (the caller will block)": three claims, none of them true of a flood packet. A 50-round
+    // carnage run put the count at 697. That number is not the failure it names - and worse, a REAL
+    // block request that lost its reply cap would be one line among those hundreds, which is the
+    // failure that actually strands a caller in `call` forever.
+    //
+    // So the opcode is checked FIRST, and the loud line below now means only what it says. Same rule
+    // as naming the layer that refused instead of the one that looks guilty: a diagnostic that fires
+    // on the wrong population is not a small inaccuracy, it is the thing that hides the real one.
+    // Listed by NAME rather than as a numeric range: a range over two constants quietly excludes any
+    // opcode added later, and the cost of that is this whole bug back again. A new op has to be added
+    // here, which is a decision someone makes rather than one the ordering makes for them.
+    let op = msg.payload_bytes().first().copied().unwrap_or(0);
+    let is_block_op = matches!(
+        op,
+        msc::OP_READ_BLOCK | msc::OP_WRITE_BLOCK | msc::OP_CAPACITY | msc::OP_WRITE_ZEROS | msc::OP_FLUSH
+    );
+    if !is_block_op {
+        return true; // not a block request; the disk is unaffected
+    }
     let Some(reply) = ctx.take_pending_cap() else {
         // Counted SEPARATELY from `n`, which counts every block-path message. Gating on `n == 1`
         // could only ever fire if the very FIRST message a fresh instance saw was the malformed one -
         // a guard whose trigger cannot occur in the failing case, which is the eighth instance of that
         // shape this cycle and one I introduced while fixing the log spam an hour earlier.
         if NO_CAP.fetch_add(1, core::sync::atomic::Ordering::Relaxed) == 0 {
-            ctx.log("xhci: block request had NO reply cap - dropping it (the caller will block; further occurrences silent)");
+            ctx.log_fmt(format_args!(
+                "xhci: block request (op {}) had NO reply cap - dropping it; its caller is stranded                  in `call` with no reply coming (further occurrences counted on the alive line)", op));
         }
         return true;
     };
