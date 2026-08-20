@@ -188,6 +188,12 @@ impl SliceAlloc {
     }
 }
 
+/// Block requests dropped for arriving with no reply cap - see the drop site for what that costs the
+/// caller. Module-scope rather than function-local so the periodic `alive` line can REPORT the running
+/// total: the first drop is logged loudly and the rest were silent forever, which is a failure counted
+/// and then swallowed (§26.7). Loud once, then visible on every beat, is the honest shape.
+static NO_CAP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Free a slot back to the controller (Disable Slot) for a probed device we do not keep - a non-HID
 /// downstream device - so controller slots do not leak across a hot-plug re-scan.
 ///
@@ -1744,7 +1750,6 @@ fn serve_if_block(
         // could only ever fire if the very FIRST message a fresh instance saw was the malformed one -
         // a guard whose trigger cannot occur in the failing case, which is the eighth instance of that
         // shape this cycle and one I introduced while fixing the log spam an hour earlier.
-        static NO_CAP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         if NO_CAP.fetch_add(1, core::sync::atomic::Ordering::Relaxed) == 0 {
             ctx.log("xhci: block request had NO reply cap - dropping it (the caller will block; further occurrences silent)");
         }
@@ -3974,7 +3979,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // next step is comparing CNTPCT deltas against BSP tick counts - two independent
                 // clocks. Either way the log answers it without a rebuild.
                 ctx.log_fmt(format_args!(
-                    "xhci: alive - t={}s, {} passes ({} fast/{} idle), work {}ms (serve {} drain {} hub {}), probes {}/{} ok {} late, {} MSI, {} msg, {} HID, disk {}",
+                    "xhci: alive - t={}s, {} passes ({} fast/{} idle), work {}ms (serve {} drain {} hub {}), probes {}/{} ok {} late, {} MSI, {} msg, {} HID, disk {}, {} dropped (no reply cap)",
                     ctx.epoch_secs_monotonic(), passes, fast_waits, idle_waits,
                     work_cycles / ctx.duration_cycles(1).max(1),
                     seg_serve / ctx.duration_cycles(1).max(1),
@@ -3982,7 +3987,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     seg_hub   / ctx.duration_cycles(1).max(1),
                     hub_ok, hub_posted, hub_late,
                     msi_count, msg_count, ndev,
-                    if disk.is_some() { "yes" } else { "no" }));
+                    if disk.is_some() { "yes" } else { "no" },
+                    NO_CAP.load(core::sync::atomic::Ordering::Relaxed)));
             }
             let hub_due =
                 ctx.read_tsc().wrapping_sub(last_hub_poll) > ctx.duration_cycles(HUB_POLL_MS);
