@@ -1753,9 +1753,16 @@ fn serve_if_block(
     // The check used to be absent, and this function ran on EVERY message. So all that unrelated
     // traffic reached the branch below and was reported as "block request had NO reply cap - dropping
     // it (the caller will block)": three claims, none of them true of a flood packet. A 50-round
-    // carnage run put the count at 697. That number is not the failure it names - and worse, a REAL
-    // block request that lost its reply cap would be one line among those hundreds, which is the
-    // failure that actually strands a caller in `call` forever.
+    // carnage run put the count at 697. That number is not the failure it names - and worse, a real
+    // one would have been a single line among those hundreds.
+    //
+    // With the guard in place the next run answered what the real ones are: 11 events, every one an
+    // OP_READ_BLOCK, and every one within a millisecond of a `kill_task` line (the outlier landed
+    // inside a supervisor mass-respawn). So the caller DIED between sending and being served, the
+    // kernel reclaimed its caps - the reply cap among them - and this dequeued an orphan. Dropping it
+    // is not damage control, it is the only correct action: there is no longer anybody to reply to.
+    // The line said "its caller is stranded in `call` with no reply coming", which was wrong in the
+    // same way the pre-guard version was, one level down. Nobody is waiting.
     //
     // So the opcode is checked FIRST, and the loud line below now means only what it says. Same rule
     // as naming the layer that refused instead of the one that looks guilty: a diagnostic that fires
@@ -1778,7 +1785,7 @@ fn serve_if_block(
         // shape this cycle and one I introduced while fixing the log spam an hour earlier.
         if NO_CAP.fetch_add(1, core::sync::atomic::Ordering::Relaxed) == 0 {
             ctx.log_fmt(format_args!(
-                "xhci: block request (op {}) had NO reply cap - dropping it; its caller is stranded                  in `call` with no reply coming (further occurrences counted on the alive line)", op));
+                "xhci: block request (op {}) arrived with NO reply cap - dropping it; its caller died between sending and being served, so there is nobody left to reply to", op))
         }
         return true;
     };
