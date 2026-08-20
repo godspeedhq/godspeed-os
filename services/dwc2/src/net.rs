@@ -770,16 +770,45 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
 
     // PHY: reset, advertise 10/100, restart auto-negotiation. Do NOT block on link - net-stack retries
     // and self-configures when the link comes up, so waiting here would only delay the boot.
+    // A PHY STILL IN RESET DROPS THE WRITES THAT FOLLOW, and that is a link that never comes up.
+    //
+    // The poll below used to treat a FAILED read as "the reset finished" (`None => break`) and to fall
+    // through silently when the bound expired. Either way the ADVERTISE and BMCR writes then landed on
+    // a PHY that was still resetting, the hardware discarded them, autonegotiation was never started,
+    // and BMSR sat at 0x7809 - no link, no autoneg-complete - until the next reboot. Intermittent by
+    // nature: it depends on how quickly this particular PHY comes out of reset.
+    //
+    // So a read that did not happen is not a reset that finished, the same rule the lite-reset poll
+    // above now follows, and an expired bound is reported rather than passed over.
     mii_write(ctx, m, d, t, SMSC_MII_BMCR, 0x8000);
+    let mut phy_ready = false;
     for _ in 0..SMSC_POLLS {
-        match mii_read(ctx, m, d, t, SMSC_MII_BMCR) {
-            Some(v) if v & 0x8000 == 0 => break,
-            Some(_) => {}
-            None => break,
+        if matches!(mii_read(ctx, m, d, t, SMSC_MII_BMCR), Some(v) if v & 0x8000 == 0) {
+            phy_ready = true;
+            break;
         }
+    }
+    if !phy_ready {
+        ctx.log("dwc2-svc: PHY reset never cleared - autonegotiation may not start (no link)");
     }
     mii_write(ctx, m, d, t, SMSC_MII_ADVERTISE, 0x01E1);
     mii_write(ctx, m, d, t, SMSC_MII_BMCR, 0x1200);
+    // VERIFY THE WRITE TOOK. This is the one that decides whether there is ever a link, and it was
+    // written blind: if the PHY swallowed it, nothing here noticed and the failure surfaced minutes
+    // later as "the cable must be unplugged". BMCR bit 12 is auto-negotiation ENABLE, which stays set
+    // once accepted (bit 9, RESTART, self-clears as the negotiation runs, so it is not a witness).
+    // Retried once, because the common cause is simply having asked a moment too early.
+    if !matches!(mii_read(ctx, m, d, t, SMSC_MII_BMCR), Some(v) if v & 0x1000 != 0) {
+        mii_write(ctx, m, d, t, SMSC_MII_ADVERTISE, 0x01E1);
+        mii_write(ctx, m, d, t, SMSC_MII_BMCR, 0x1200);
+        match mii_read(ctx, m, d, t, SMSC_MII_BMCR) {
+            Some(v) if v & 0x1000 != 0 =>
+                ctx.log("dwc2-svc: autonegotiation armed on the second attempt"),
+            other => ctx.log_fmt(format_args!(
+                "dwc2-svc: PHY REFUSED autonegotiation (BMCR reads {:#06x}) - there will be no link",
+                other.unwrap_or(0))),
+        }
+    }
 
     // Enable TX + RX. FDPX because the internal PHY negotiates full duplex and a half-duplex MAC on a
     // full-duplex link drops frames to late collisions. The receive filter is our-unicast + broadcast

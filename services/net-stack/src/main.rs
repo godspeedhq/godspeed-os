@@ -1441,6 +1441,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // Only worth attempting with a resolved gateway - SNTP needs somewhere to send.
                     // `time` asks repeatedly while unsynced, so a refusal here costs nothing and the
                     // next nudge finds the network ready.
+                    // CONFIGURE FIRST IF THERE IS A CABLE BUT NO ROUTE. Every other request that
+                    // needs the network gets this treatment further down the loop, and the nudge never
+                    // reached it - it answers here and continues. So a machine booted unplugged, then
+                    // plugged in, would sit unconfigured forever unless somebody typed a network
+                    // command: `time` asked every twenty seconds and was told "no route yet" every
+                    // time, which is true and useless. Asking for the clock IS a request that needs
+                    // the network, so it gets the same self-configure as the rest.
+                    if !gw_known && link_is_up(&ctx) {
+                        ctx.log("net-stack: `time` asked for the clock and the cable is in - configuring");
+                        let d = run_dance(&ctx);
+                        our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac;
+                        gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server;
+                        status = d.status;
+                    }
                     if gw_known && link_is_up(&ctx) {
                         let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
                         match sntp_sync(&ctx, &st) {
