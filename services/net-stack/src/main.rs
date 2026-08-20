@@ -597,6 +597,20 @@ fn dns_resolve(ctx: &ServiceContext, hostname: &[u8], gw_mac: &[u8; 6], our_ip: 
         if answer_arp {
             let _ = ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), DANCE_SECS);
         }
+        // PACE THE POLL, or this loop does not wait at all.
+        //
+        // Op 4 is a BOUNDED poll - the driver checks for a frame a handful of times and answers, in
+        // microseconds, whether or not one arrived. Twelve of those back to back is not a wait for a
+        // reply, it is twelve instant questions: the whole loop finished in 78 ms on hardware and
+        // reported that DNS could not resolve, 78 ms after the DHCP offer that preceded it. No resolver
+        // answers that fast, and the fallback address hid it.
+        //
+        // This loop used to be paced by accident. Its frames came from the reply to a TRANSMIT, and the
+        // driver polled after transmitting; removing that coupling was right, but it took the wait away
+        // with it and left the retry counting rather than waiting. `drain_scan` already carries the same
+        // pacing for the same reason - a poll is a question, and asking it twelve times in a row does
+        // not make the answer arrive sooner.
+        ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
         reply = ctx.request_with_reply_deadline("nic-driver", &rx_only, DANCE_SECS);
     }
     None
@@ -1438,6 +1452,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // It sits in the capless arm because that is precisely what identifies it. There is no
                 // reply to send, so there is no cap, and no legitimate request can be confused with it.
                 if req.payload_bytes().first() == Some(&11) {
+                    let mut configured_now = false;
                     // Only worth attempting with a resolved gateway - SNTP needs somewhere to send.
                     // `time` asks repeatedly while unsynced, so a refusal here costs nothing and the
                     // next nudge finds the network ready.
@@ -1454,8 +1469,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac;
                         gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server;
                         status = d.status;
+                        // THE DANCE ALREADY SYNCED. `run_dance` ends in its own SNTP exchange, so
+                        // falling through to another one queries the server twice in a fifth of a
+                        // second for an answer we have - the duplicate `querying` / `wall clock set`
+                        // pair in the log. Configuring IS resolving here; there is nothing left to ask.
+                        configured_now = true;
                     }
-                    if gw_known && link_is_up(&ctx) {
+                    if !configured_now && gw_known && link_is_up(&ctx) {
                         let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
                         match sntp_sync(&ctx, &st) {
                             Some(u) => ctx.log_fmt(format_args!(

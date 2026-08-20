@@ -267,7 +267,26 @@ fn fs_send_noblock(ctx: &ServiceContext, req: &[u8]) -> bool {
     // with the sender, and it is the sender's job to notice).
     if ctx.send_with_cap_by_handle(target, reply_cap, &Message::from_bytes(req)).is_err() {
         ctx.remove_cap(reply_cap);
-        return false;
+        // A HELD CAP CAN GO STALE, and that is not the same as not having one.
+        //
+        // The reacquire above only runs when there is NO handle. A handle we already hold keeps being
+        // used after `fs` restarts, because the generation bumped underneath it - so every attempt
+        // fails identically and the next one, two seconds later, fails the same way. On hardware that
+        // was `cap::get: ResourceId(102) gen mismatch ... liveness=Alive` repeating every two seconds
+        // for the rest of the boot: `fs` alive and well, and this service posting to its previous life.
+        //
+        // §14.3 is explicit that a client reacquires by name after a restart. Doing it only on absence
+        // covers the peer that never existed and misses the peer that came back, which is the far more
+        // common case under chaos.
+        if !ctx.reacquire_by_name("fs") {
+            return false;
+        }
+        let Some(target) = ctx.send_peer_handle("fs") else { return false };
+        let Some(reply_cap) = ctx.derive_cap(self_grant) else { return false };
+        if ctx.send_with_cap_by_handle(target, reply_cap, &Message::from_bytes(req)).is_err() {
+            ctx.remove_cap(reply_cap);
+            return false;
+        }
     }
     true
 }
