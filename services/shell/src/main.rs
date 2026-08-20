@@ -16,8 +16,11 @@
 //! per built-in), the gsh scripting language (`docs/`-documented: vars, if, for, fn, pipes), and the
 //! pipe machinery that composes built-ins with `|`.
 //!
-//! **What to know before editing.** The user stack is 64 KiB and `pipe_run`'s frame already sits near
-//! it, so a large local in a command function can overflow it - mark record-builders `#[inline(never)]`
+//! **What to know before editing.** The user stack is 256 KiB (`USER_STACK_PAGES` = 64 x 4 KiB, in
+//! `kernel/src/task/mod.rs`) and `pipe_run`'s frame already sits near it - measured at 177,297 bytes,
+//! 68%, on ENTRY, before any stage buffer is added. This line said 64 KiB for a long time and was
+//! simply wrong; it then misled the first instrument written to check it into reporting 270%.
+//! A large local in a command function can overflow the rest - mark record-builders `#[inline(never)]`
 //! (see the shell-stack note in `docs/`). There is no heap (§26.6.1): fixed arrays, bounded arenas, and
 //! streaming in `IO_CHUNK` pieces. And the shell is restartable like everything else - a crash gives a
 //! fresh prompt, losing the in-flight command but not the session (§6.2).
@@ -256,10 +259,18 @@ impl core::fmt::Write for FnCapBuf {
 /// `Cell` rather than a lock or an atomic: this is one task on one core, so the cost of thread-safety
 /// would buy nothing, and an atomic here is what made the old version look acceptable while still being
 /// unowned. Interior mutability inside an owned struct is not global mutable state.
-/// The service's user stack, in bytes - the number this file's header cites when it says `pipe_run`'s
-/// frame "already sits near" the ceiling. Named here so the high-water report is a PERCENTAGE of a
-/// stated limit rather than a raw number the reader has to know the budget to interpret.
-const USER_STACK_BYTES: usize = 64 * 1024;
+/// The service's user stack, in bytes: `USER_STACK_PAGES = 64` x 4 KiB in `kernel/src/task/mod.rs`.
+///
+/// **This said 64 KiB in its first version**, taken from the prose at the top of this file rather
+/// than from the kernel that allocates the stack - and the first measurement it produced read
+/// "177297 of 65536 bytes (270% of the user stack)", a number that is not merely wrong but
+/// impossible. A diagnostic that reports 270% of a limit is worse than no diagnostic: it invites the
+/// reader to disbelieve the instrument instead of the code.
+///
+/// It is a duplicated fact either way (Commandment III) - `fs` hardcodes `256 * 1024` at its own
+/// stack report for the same reason - and the honest fix is one SDK-side accessor both read. Recorded
+/// here rather than quietly spread a third time.
+const USER_STACK_BYTES: usize = 64 * 4096;
 
 pub struct ShellCtx {
     inner: ServiceContext,
