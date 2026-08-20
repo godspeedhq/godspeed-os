@@ -155,6 +155,43 @@ impl core::fmt::Write for FrameBuf {
 /// Write a compact, bounded duration ("45s", "1m23s", "2h05m", "3d04h") into the frame: a chaos run can
 /// span days, so cascade d/h/m/s and show the two most-significant units. Seconds come from the RTC
 /// (year-guarded), so the value is plausible by construction.
+/// When this run STARTED, in wall-clock terms, worked out after the fact.
+///
+/// A chaos run usually begins before the clock is known: this board has no RTC, so the time only
+/// arrives when SNTP lands, which may be after the storm is already going. The report used to say
+/// "clock not set" for the whole run because it sampled the clock ONCE, at the start, and a reading
+/// taken before the answer existed can never improve.
+///
+/// It does not have to. `elapsed` comes from the MONOTONIC counter, which is real from boot and
+/// unaffected by the wall clock being set later, so the moment anybody knows the time the start follows
+/// from it: `started = now - elapsed`. One late answer recovers a fact from before it was knowable.
+///
+/// **Asking `time` is not depending on it.** The existing note here is right that chaos must not depend
+/// on that service - it kills it thousands of times a run, and a blocking request to a service it has
+/// just killed is a wedge. So this is bounded, tolerates every failure by returning `None`, and is only
+/// asked while the answer is still unknown. Once learned it is cached and never asked again, so a
+/// successful run makes at most a handful of requests and a `time` that stays dead costs one bounded
+/// wait per report and changes nothing else.
+///
+/// It asks `time` rather than reading `datetime()` because the wall clock BELONGS to that service since
+/// clock slice 3 - it is the one that knows the RTC, the network reading and the persisted floor, and
+/// in that order. Reading the raw RTC here would be a second, worse answer to a question somebody else
+/// already owns (Commandment III).
+fn learn_start_wall(ctx: &ServiceContext, elapsed: i64) -> Option<i64> {
+    // OP_NOW = 1 -> [ok, epoch(8 LE), source, age(8 LE)]
+    let r = ctx.request_with_reply_deadline("time", &Message::from_bytes(&[1u8]), 1)?;
+    let p = r.payload_bytes();
+    if p.len() < 10 || p[0] == 0 {
+        return None;
+    }
+    let mut e = [0u8; 8];
+    e.copy_from_slice(&p[1..9]);
+    let now = i64::from_le_bytes(e);
+    // A clock that is not set answers 0, and 0 minus an elapsed is not a start time.
+    let started = now - elapsed;
+    if started >= 1_577_836_800 { Some(started) } else { None }
+}
+
 fn write_dur(f: &mut FrameBuf, secs: u64) {
     if secs >= 86400 { let _ = write!(f, "{}d{:02}h", secs / 86400, (secs % 86400) / 3600); }
     else if secs >= 3600 { let _ = write!(f, "{}h{:02}m", secs / 3600, (secs % 3600) / 60); }
@@ -278,6 +315,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // rendered as 1970. Elapsed and the ETA ride the monotonic clock and are unaffected either way.
     let start_dt = ctx.datetime();
     let start_epoch = start_dt.epoch_secs();
+    // When this run began, in wall-clock terms, ONCE ANYBODY KNOWS. See `learn_start_wall`.
+    let mut start_wall: Option<i64> = if start_dt.year >= 2000 { Some(start_epoch) } else { None };
     // ELAPSED is measured on the MONOTONIC clock, not this wall-clock stamp: the wall clock is settable
     // (SNTP sets it on the RTC-less Pi), so a sync landing mid-run would make `now - start` jump by the
     // whole correction and report an absurd elapsed/ETA. The datetime above is kept for the "started ..."
@@ -453,12 +492,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // "Thu 1970-01-01 00:00:00" - a fiction with the shape of a fact. `elapsed` is unaffected: it
         // comes from the MONOTONIC counter, which is real from boot, so the run's own timing stays
         // honest either way. Report what is known, and say so when something is not (§26.7).
-        if start_dt.year >= 2000 {
-            let _ = write!(f, "  started {} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  |  elapsed ",
-                WEEKDAYS[(start_dt.weekday() as usize) % 7], start_dt.year, start_dt.month,
-                start_dt.day, start_dt.hour, start_dt.minute, start_dt.second);
-        } else {
-            let _ = write!(f, "  started (clock not set - `date sync`)  |  elapsed ");
+        // ASK ONCE THE CLOCK EXISTS, then never again. See `learn_start_wall` for why chaos may ask
+        // the `time` service without depending on it.
+        if start_wall.is_none() {
+            start_wall = learn_start_wall(&ctx, elapsed as i64);
+        }
+        match start_wall {
+            Some(e) => {
+                let d = godspeed_sdk::Datetime::from_epoch_secs(e);
+                let _ = write!(f, "  started {} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  |  elapsed ",
+                    WEEKDAYS[(d.weekday() as usize) % 7], d.year, d.month,
+                    d.day, d.hour, d.minute, d.second);
+            }
+            None => { let _ = write!(f, "  started (clock not set yet)  |  elapsed "); }
         }
         write_dur(&mut f, elapsed);
         if rounds > 0 && round > 0 {
