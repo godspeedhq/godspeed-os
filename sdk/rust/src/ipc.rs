@@ -237,6 +237,48 @@ pub fn call(
 // Error conversion.
 // ---------------------------------------------------------------------------
 
+/// `call`, bounded, receiving into a caller-owned buffer.
+///
+/// The reason this exists as a SYSCALL rather than the hand-rolled send + `recv_timeout_into` it
+/// replaces: `recv_timeout_into` takes whatever is next on the endpoint. A service that serves clients
+/// on the same endpoint it awaits replies on would receive an unrelated CLIENT REQUEST, fail to match
+/// it, and drop it - losing the request and leaving the real reply to arrive later as an orphan that
+/// desynced every following exchange. `Call` never had that flaw (it dequeues the reply specifically),
+/// it just could not be bounded. Now it can.
+///
+/// Three cap slots pack into `a0` at 8 bits each - a task holds at most 64 caps, so six bits suffice -
+/// because the ARM 32-bit ABI truncates each argument to one register and the plain `call` layout had
+/// no room left. Length and deadline share `a2`.
+///
+/// `Ok(None)` = the deadline passed with no reply.
+pub fn call_deadline_into(
+    target:      CapHandle,
+    reply_grant: CapHandle,
+    recv:        CapHandle,
+    request:     &[u8],
+    buf:         &mut [u8],
+    max_secs:    u64,
+) -> Result<Option<usize>, IpcError> {
+    const RECV_TIMED_OUT: i64 = -1001;
+    if request.len() > MAX_PAYLOAD { return Err(IpcError::MessageTooLarge); }
+    let n = request.len().min(buf.len());
+    buf[..n].copy_from_slice(&request[..n]);
+    let slots = (target.0 as u64 & 0xFF)
+        | ((reply_grant.0 as u64 & 0xFF) << 8)
+        | ((recv.0 as u64 & 0xFF) << 16);
+    let len_secs = (n as u64 & 0xFFFF) | ((max_secs.min(0xFFFF)) << 16);
+    // SAFETY: raw_syscall(50) = CallDeadline; `buf` is a caller-owned slice in user space and the
+    // kernel writes at most one message into it, which is why the request is staged there too.
+    let ret = unsafe { crate::syscall::raw_syscall(50, slots, buf.as_mut_ptr() as u64, len_secs) };
+    if ret == RECV_TIMED_OUT {
+        Ok(None)
+    } else if ret < 0 {
+        Err(i64_to_ipc_error(ret))
+    } else {
+        Ok(Some(ret as usize))
+    }
+}
+
 pub(crate) fn i64_to_ipc_error(code: i64) -> IpcError {
     match code {
         -2  => IpcError::CapError(crate::capability::CapError::CapNotHeld),

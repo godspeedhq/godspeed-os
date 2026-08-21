@@ -780,6 +780,17 @@ impl ServiceContext {
     ///
     /// Same deadline discipline as `request_with_reply_deadline` - block on the endpoint in slices,
     /// give up when the caller's time is spent, and reclaim the reply cap either way (§8.5).
+    /// Send `req` to `peer` and receive the reply into `buf`, bounded by `max_secs`.
+    ///
+    /// **This used to be send + `recv_timeout_into`, and that was wrong in a way that cost days.**
+    /// `recv_timeout_into` takes whatever is next on the endpoint, and a service that SERVES clients on
+    /// the same endpoint it awaits replies on would receive an unrelated client request, fail to match
+    /// it, and drop it - losing that request outright while its own reply arrived later as an orphan
+    /// that desynced the next exchange. `fs` does exactly that, which is why its clients hung and its
+    /// block protocol "lost step" on both boards.
+    ///
+    /// It now uses `CallDeadline`, which dequeues the REPLY specifically (the kernel matches it to the
+    /// reply cap) and leaves everything else queued. The correct primitive, bounded.
     pub fn request_with_reply_deadline_into(
         &self, peer: &str, req: &[u8], buf: &mut [u8], max_secs: i64,
     ) -> Option<usize> {
@@ -787,30 +798,14 @@ impl ServiceContext {
         let self_grant = self.self_grant_handle()?;
         let reply_cap = self.derive_cap(self_grant)?;
         let recv = self.recv_handle()?;
-        // The request still needs a `Message` to carry an embedded cap, and that one frame is
-        // unavoidable while the send ABI takes one. It is ONE, not four.
-        if self.send_with_cap_by_handle(target, reply_cap, &crate::ipc::Message::from_bytes(req)).is_err() {
-            self.remove_cap(reply_cap);
-            return None;
-        }
-        let t0 = self.epoch_secs_monotonic();
-        loop {
-            match crate::ipc::recv_timeout_into(recv, buf, self.duration_cycles(Self::AWAIT_SLICE_MS)) {
-                Ok(Some(n)) => {
-                    self.remove_cap(reply_cap);
-                    return Some(n);
-                }
-                Ok(None) => {}
-                Err(_) => {
-                    self.remove_cap(reply_cap);
-                    return None;
-                }
-            }
-            let now = self.epoch_secs_monotonic();
-            if now >= t0 && now - t0 >= max_secs {
-                self.remove_cap(reply_cap);
-                return None;
-            }
+        let secs = if max_secs <= 0 { 0 } else { max_secs as u64 };
+        let out = crate::ipc::call_deadline_into(target, reply_cap, recv, req, buf, secs);
+        // The kernel consumes the reply cap on a delivered call; on any other outcome it is ours to
+        // reclaim, or the slot leaks one per failed request (§8.5, the three checks).
+        match out {
+            Ok(Some(n)) => Some(n),
+            Ok(None) => { self.remove_cap(reply_cap); None }
+            Err(_)   => { self.remove_cap(reply_cap); None }
         }
     }
 
@@ -852,6 +847,15 @@ impl ServiceContext {
         self.recv_timeout(self.duration_cycles(ms))
     }
 
+    /// **Shares the flaw `request_with_reply_deadline_into` was just fixed for, and is NOT fixed here.**
+    /// It sends with a reply cap and then receives generically, so a caller that also SERVES on its
+    /// endpoint can consume an unrelated message and drop it. `_into` moved to `CallDeadline`, which
+    /// dequeues the reply specifically; this one has not, because nothing has yet been shown to be
+    /// harmed by it and a blind sweep of four helpers is how a fix becomes a regression.
+    ///
+    /// Note that `_abortable` and `_qhint` below CANNOT simply follow: they interleave on purpose, to
+    /// notice a `q` keypress while waiting. Making them dequeue only the reply would delete that. If
+    /// they need this too, the answer is a bounded stash, not a substitution.
     pub fn request_with_reply_deadline(
         &self,
         peer: &str,

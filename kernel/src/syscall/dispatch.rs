@@ -64,6 +64,15 @@ pub enum SyscallNumber {
     SpawnWithCaps          = 39,
     ConsoleForeground      = 40,
     Call                   = 41,
+    /// `Call` with a DEADLINE. Same reply-cap semantics, bounded wait.
+    ///
+    /// The SDK had a deadline variant already, hand-rolled as send + `RecvTimeout` on the endpoint -
+    /// and `RecvTimeout` takes whatever is next, so a service awaiting its reply would consume an
+    /// unrelated CLIENT REQUEST, discard it for having the wrong tag, and lose it. That is what left
+    /// `fs` clients waiting forever and desynced the block protocol on both boards. `Call` never had
+    /// that flaw because it dequeues the reply specifically (`call_dequeue`); it simply could not be
+    /// bounded. This is `Call` with the bound, so the correct primitive is also the usable one.
+    CallDeadline           = 50,
     NetFrameTx             = 42,
     NetFrameRx             = 43,
     NetInfo                = 44,
@@ -98,6 +107,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Sleep          as u64 => handle_sleep(arg0),
         n if n == SyscallNumber::TrySend        as u64 => handle_try_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Call           as u64 => handle_call(arg0, arg1, arg2),
+        n if n == SyscallNumber::CallDeadline   as u64 => handle_call_deadline(arg0, arg1, arg2),
         n if n == SyscallNumber::NetFrameTx     as u64 => handle_net_frame_tx(arg0, arg1),
         n if n == SyscallNumber::NetFrameRx     as u64 => handle_net_frame_rx(arg0, arg1),
         n if n == SyscallNumber::NetInfo        as u64 => handle_net_info(arg0),
@@ -1108,6 +1118,27 @@ fn handle_call(packed: u64, buf_ptr: u64, recv_len: u64) -> i64 {
     let reply_slot  = ((packed >> 16) & 0xFFFF) as usize;
     let recv_slot   = ((recv_len >> 16) & 0xFFFF) as usize;
     let req_len     = recv_len & 0xFFFF;
+    do_call(target_slot, reply_slot, recv_slot, buf_ptr, req_len, 0)
+}
+
+/// `Call` with a deadline in SECONDS. Three cap slots pack into `a0` (8 bits each - a task holds at
+/// most `MAX_CAPS_PER_TASK` = 64, so six bits suffice and eight leave room), because the ARM 32-bit
+/// ABI truncates every argument to one register and the original three-16-bit-field layout had no
+/// space left for a fourth value. Length and deadline share `a2`.
+fn handle_call_deadline(slots: u64, buf_ptr: u64, len_secs: u64) -> i64 {
+    let target_slot = (slots & 0xFF) as usize;
+    let reply_slot  = ((slots >> 8) & 0xFF) as usize;
+    let recv_slot   = ((slots >> 16) & 0xFF) as usize;
+    let req_len     = len_secs & 0xFFFF;
+    let secs        = (len_secs >> 16) & 0xFFFF;
+    do_call(target_slot, reply_slot, recv_slot, buf_ptr, req_len, secs)
+}
+
+/// The body both share. `deadline_secs` of 0 blocks forever, exactly as `Call` always has.
+fn do_call(
+    target_slot: usize, reply_slot: usize, recv_slot: usize,
+    buf_ptr: u64, req_len: u64, deadline_secs: u64,
+) -> i64 {
 
     // 1. Validate the three caps: SEND to the peer, GRANT on the reply cap, RECV on our own endpoint.
     let target_cap = match scheduler::current_task_lookup_cap(target_slot, Rights::SEND) {
@@ -1173,7 +1204,19 @@ fn handle_call(packed: u64, buf_ptr: u64, recv_len: u64) -> i64 {
     // 5. Await the reply on our own endpoint, waking on the reply OR on the peer's death (ReplyDead).
     //    The loop re-evaluates after every wake, so a reply that arrived just before the peer died
     //    still wins over ReplyDead (call_dequeue returns the queued reply first).
-    loop {
+    // Same shape as `handle_recv_timeout`'s bounded wait, deliberately: a deadline in monotonic
+    // ticks, checked before each block, armed with `set_wake_deadline` so the timer wakes us, and
+    // cleared on every exit. Reusing the proven pattern rather than inventing a second one.
+    //
+    // A tick IS a scheduler quantum and the quantum is 10 ms (§9.1), so a second is 100 of them.
+    const TICKS_PER_SEC: u64 = 100;
+    let deadline = if deadline_secs == 0 {
+        0
+    } else {
+        scheduler::monotonic_ticks().wrapping_add(deadline_secs.saturating_mul(TICKS_PER_SEC))
+    };
+
+    let result = loop {
         match crate::ipc::routing::call_dequeue(recv_ep, recv_cap.generation, target_ep, my_slot) {
             Ok((reply, sender_to_wake)) => {
                 if let Some(slot) = sender_to_wake {
@@ -1190,18 +1233,27 @@ fn handle_call(packed: u64, buf_ptr: u64, recv_len: u64) -> i64 {
                 }
                 let payload  = reply.payload_bytes();
                 let copy_len = payload.len().min(MAX_MESSAGE_SIZE);
-                if !write_user_bytes(buf_ptr, &payload[..copy_len]) { return -1; }
-                return copy_len as i64;
+                if !write_user_bytes(buf_ptr, &payload[..copy_len]) { break -1; }
+                break copy_len as i64;
             }
             Err(IpcError::QueueEmpty) => {
                 // call_dequeue recorded us as blocked-in-call awaiting target_ep; block now. The wake
                 // result is intentionally ignored: we loop and let call_dequeue re-derive the terminal
                 // condition (queued reply -> Ok; target dead -> ReplyDead; our endpoint dead -> EndpointDead).
-                let _ = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
+                if deadline != 0 && scheduler::monotonic_ticks() >= deadline {
+                    break RECV_TIMED_OUT;
+                }
+                if deadline != 0 {
+                    scheduler::set_wake_deadline(my_slot, deadline);
+                }
+                let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
+                if err != 0 { break err; }
             }
-            Err(e) => return ipc_err_to_i64(e),   // ReplyDead (-12) or EndpointDead (-7)
+            Err(e) => break ipc_err_to_i64(e),   // ReplyDead (-12) or EndpointDead (-7)
         }
-    }
+    };
+    scheduler::clear_wake_deadline(my_slot);
+    result
 }
 
 // ---------------------------------------------------------------------------
