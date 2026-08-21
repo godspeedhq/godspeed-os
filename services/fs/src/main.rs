@@ -287,6 +287,12 @@ struct Fs {
     /// minutes of a prompt that looks dead. Bounding the STREAK turns "the device is not answering"
     /// into one answer instead of one answer per block.
     io_fail_streak: core::cell::Cell<u32>,
+    /// Set when a block operation got no usable ANSWER (desync, truncated reply, driver gone) as
+    /// opposed to a refusal from the device. Kept apart from `io_error_seen` because they demand
+    /// opposite responses: a device error re-mounts and degrades, a desync must be reported as itself
+    /// and RETRIED - re-mounting on it acts on a report the hardware never made, and the re-mount
+    /// fails the same way, which is how a healthy volume got degraded mid-write.
+    transport_fail_seen: core::cell::Cell<bool>,
     // Crash-consistency journal (Phase C). While `txn_active`, structural writes (directory,
     // bitmap, superblock) are STAGED here - with read-your-writes - instead of going to disk,
     // then committed atomically through the on-disk journal region (`commit_txn`). Data-block
@@ -993,10 +999,27 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
     let mut out = [0u8; SERVE_REPLY_MAX];
     out[0] = tag;
     let mut len = 0usize;
-    if let Some(f) = vol.as_ref() { f.io_error_seen.set(false); }
+    if let Some(f) = vol.as_ref() {
+        f.io_error_seen.set(false);
+        f.transport_fail_seen.set(false);
+    }
     serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
 
     let errored = vol.as_ref().map_or(false, |f| f.io_error_seen.get());
+    // A DESYNC IS NOT A DYING DISK, and must not reach the re-mount path below.
+    //
+    // The device said nothing - the reply was mis-correlated, truncated or never came. Re-mounting on
+    // that acts on a report the hardware never made, and the re-mount's own reads desync the same way,
+    // so it fails too and the volume is DEGRADED. That is how a stick formatted this morning ended the
+    // session with a CRC-bad block and `drives check` failing on healthy storage.
+    //
+    // Reported, never swallowed (§26.7) - it is a real failure and the request still fails. What it
+    // does not do is convict the disk of it. The caller retries; the next request usually succeeds,
+    // which is precisely why the second run of everything always looked fine.
+    let desynced = vol.as_ref().map_or(false, |f| f.transport_fail_seen.get());
+    if desynced && !errored {
+        ctx.log("fs: the block protocol lost step - the DEVICE reported nothing, so the volume is                  left mounted and this request fails; the caller retries");
+    }
     if errored && len != REPLY_SENT_DIRECTLY && p.first().map_or(false, |&op| op_is_read_only(op)) {
         ctx.log("fs: device I/O error while serving - re-mounting and retrying this request once");
         match Fs::mount_into(ctx, vol) {
@@ -1586,6 +1609,7 @@ impl Fs {
             flush_warned: core::cell::Cell::new(false),
             io_error_seen: core::cell::Cell::new(false),
             io_fail_streak: core::cell::Cell::new(0),
+            transport_fail_seen: core::cell::Cell::new(false),
             txn_active: false,
             txn_n: 0,
             txn_overflow: false,
@@ -1614,9 +1638,16 @@ impl Fs {
                 if self.txn_lba[i] == lba { return Some(self.txn_blk[i]); }
             }
         }
-        match block_read(ctx, lba) {
+        let mut why = None;
+        match block_read_kind(ctx, lba, &mut why) {
             Some(b) => Some(b),
-            None => { self.io_error_seen.set(true); None }
+            None => {
+                match why {
+                    Some(BlockFail::Transport) => self.transport_fail_seen.set(true),
+                    _ => self.io_error_seen.set(true),
+                }
+                None
+            }
         }
     }
 
@@ -1633,8 +1664,14 @@ impl Fs {
             self.txn_n += 1;
             true
         } else {
-            let ok = block_write(ctx, lba, data);
-            if !ok { self.io_error_seen.set(true); }
+            let mut why = None;
+            let ok = block_write_kind(ctx, lba, data, &mut why);
+            if !ok {
+                match why {
+                    Some(BlockFail::Transport) => self.transport_fail_seen.set(true),
+                    _ => self.io_error_seen.set(true),
+                }
+            }
             ok
         }
     }
@@ -1760,11 +1797,16 @@ impl Fs {
     /// a checksummed commit record (the atomic point), then checkpoint them to their home LBAs,
     /// then invalidate the journal. On overflow or any failure the transaction is dropped; if it
     /// failed before the commit record landed, home is untouched (the fs is unchanged).
-    /// Record a block-I/O failure on the JOURNAL path, which uses `block_read`/`block_write` directly
-    /// rather than the `tb_*` funnels and therefore bypassed `io_error_seen` entirely - leaving the one
-    /// failure that most needs a re-mount (a device dying mid-checkpoint, whose transaction is now
-    /// half-applied and awaiting replay) as the one that never triggered one.
-    fn note_io_error(&self) { self.io_error_seen.set(true); }
+    /// The journal path's classified marker. It used to call `note_io_error` for EVERY failure, so a
+    /// protocol desync during a commit convicted the disk and triggered a re-mount - on the one path
+    /// where that is most consequential, because a re-mount mid-checkpoint is what re-reads a
+    /// half-applied transaction. A real device failure here still degrades, exactly as before.
+    fn note_block_fail(&self, why: Option<BlockFail>) {
+        match why {
+            Some(BlockFail::Transport) => self.transport_fail_seen.set(true),
+            _ => self.io_error_seen.set(true),
+        }
+    }
 
     fn commit_txn(&mut self, ctx: &ServiceContext) -> Result<(), &'static str> {
         if self.txn_overflow { self.abort_txn(); return Err("transaction too large to commit atomically"); }
@@ -1774,8 +1816,9 @@ impl Fs {
         self.txn_active = false;
         // 1. Stage the data blocks in the journal (journal_start+1 ..).
         for i in 0..n {
-            if !block_write(ctx, self.journal_start + 1 + i as u64, &self.txn_blk[i]) {
-                self.note_io_error();
+            let mut why = None;
+            if !block_write_kind(ctx, self.journal_start + 1 + i as u64, &self.txn_blk[i], &mut why) {
+                self.note_block_fail(why);
                 return Err("journal data write failed");
             }
         }
@@ -1809,7 +1852,11 @@ impl Fs {
         commit[8 + n * 8..12 + n * 8].copy_from_slice(&data_crc.to_le_bytes());
         let crc = crc32(&commit[..12 + n * 8]);
         commit[COMMIT_CRC_OFF..COMMIT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
-        if !block_write(ctx, self.journal_start, &commit) { self.note_io_error(); return Err("journal commit write failed"); }
+        let mut why = None;
+        if !block_write_kind(ctx, self.journal_start, &commit, &mut why) {
+            self.note_block_fail(why);
+            return Err("journal commit write failed");
+        }
         // BARRIER 2: and the commit record must be on the medium before any home block is
         // overwritten - that ordering IS the atomicity. A device free to reorder these two can land
         // a half-finished checkpoint with no commit record to replay it from.
@@ -1822,10 +1869,11 @@ impl Fs {
         }
         // 3. Checkpoint: write each staged block to its home LBA.
         for i in 0..n {
-            if !block_write(ctx, self.txn_lba[i], &self.txn_blk[i]) {
+            let mut why = None;
+            if !block_write_kind(ctx, self.txn_lba[i], &self.txn_blk[i], &mut why) {
                 // Commit is durable: the next mount will replay this transaction. Report, but
                 // the data is safe - no corruption, only a deferred checkpoint.
-                self.note_io_error();
+                self.note_block_fail(why);
                 return Err("checkpoint write failed (will replay on next mount)");
             }
         }
@@ -2080,6 +2128,7 @@ impl Fs {
             flush_warned: core::cell::Cell::new(false),
             io_error_seen: core::cell::Cell::new(false),
             io_fail_streak: core::cell::Cell::new(0),
+            transport_fail_seen: core::cell::Cell::new(false),
             txn_active: false,
             txn_n: 0,
             txn_overflow: false,
@@ -3392,11 +3441,40 @@ fn block_capacity(ctx: &ServiceContext) -> Option<u64> {
 }
 
 /// Read one 512-byte block at `lba` from `block-driver` over IPC (u64 LBA, §6.3).
+/// WHY a block operation failed. The two need opposite responses, and flattening them into `None`
+/// is what let a protocol desync be treated as a dying disk.
+///
+/// `block_read` has always KNOWN the difference - its own comment says "a device error is
+/// retried/degraded, a protocol desync must be seen and reported as itself" - but it returned
+/// `Option`, so the knowledge reached the log and never the control flow. `fs` then called a desync
+/// a device I/O error, re-mounted, failed the re-mount for the same reason, and degraded a volume
+/// whose disk was fine - which is how a freshly formatted stick acquired a CRC-bad block within a
+/// session and `drives check` started failing on healthy storage.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockFail {
+    /// The driver answered and said no. The device is real and it refused: retry, degrade, report.
+    Media,
+    /// No usable answer came back - a mis-correlated, truncated or absent reply. The device has said
+    /// NOTHING. Re-mounting on this is acting on a report the hardware never made.
+    Transport,
+}
+
 fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
+    let mut ignored = None;
+    block_read_kind(ctx, lba, &mut ignored)
+}
+
+/// `block_read`, reporting WHY it failed. Only the callers that decide whether to re-mount need this;
+/// the rest keep the plain form so this stays a two-call-site change rather than thirty.
+fn block_read_kind(ctx: &ServiceContext, lba: u64, fail: &mut Option<BlockFail>) -> Option<[u8; BLOCK]> {
     let mut req = [0u8; 9];
     req[0] = OP_READ_BLOCK;
     req[1..9].copy_from_slice(&lba.to_le_bytes());
-    let reply = block_rpc(ctx, &req)?;
+    let Some(reply) = block_rpc(ctx, &req) else {
+        // No usable reply at all: a desync `block_rpc` already named, a deadline, or a dead peer.
+        *fail = Some(BlockFail::Transport);
+        return None;
+    };
     let p = reply.body();
     if p.first() == Some(&BLK_OK) && p.len() >= 1 + BLOCK {
         let mut out = [0u8; BLOCK];
@@ -3405,6 +3483,7 @@ fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
     } else if p.first() == Some(&BLK_ERR) && p.len() == 1 {
         // The driver answered and said no: a genuine device-side failure, already named on its side.
         ctx.log_fmt(format_args!("fs: block read failed at lba {} (device I/O error)", lba));
+        *fail = Some(BlockFail::Media);
         None
     } else {
         // The reply is not a read reply at all - a mis-correlated or truncated message (the Bug-2
@@ -3415,6 +3494,7 @@ fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
         ctx.log_fmt(format_args!(
             "fs: block read at lba {} got a MALFORMED reply ({} bytes, first {}) - protocol desync, not a device error",
             lba, p.len(), p.first().copied().unwrap_or(0xFF)));
+        *fail = Some(BlockFail::Transport);
         None
     }
 }
@@ -3462,14 +3542,38 @@ fn dir_write(ctx: &ServiceContext, lba: u64, blk: &mut [u8; BLOCK]) -> bool {
 
 /// Write one 512-byte block at `lba` to `block-driver` over IPC (u64 LBA, §6.3).
 fn block_write(ctx: &ServiceContext, lba: u64, data: &[u8; BLOCK]) -> bool {
+    let mut ignored = None;
+    block_write_kind(ctx, lba, data, &mut ignored)
+}
+
+/// `block_write`, reporting WHY it failed. It used to call every failure "device I/O error" - a
+/// desync, a truncated reply and a genuine refusal alike - which is the same flattening `block_read`
+/// at least logged its way around.
+fn block_write_kind(
+    ctx: &ServiceContext, lba: u64, data: &[u8; BLOCK], fail: &mut Option<BlockFail>,
+) -> bool {
     let mut req = [0u8; 9 + BLOCK];
     req[0] = OP_WRITE_BLOCK;
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     req[9..].copy_from_slice(data);
     match block_rpc(ctx, &req) {
         Some(reply) if reply.body().first() == Some(&BLK_OK) => true,
-        _ => {
+        Some(reply) if reply.body().first() == Some(&BLK_ERR) && reply.body().len() == 1 => {
             ctx.log_fmt(format_args!("fs: block write failed at lba {} (device I/O error)", lba));
+            *fail = Some(BlockFail::Media);
+            false
+        }
+        Some(reply) => {
+            ctx.log_fmt(format_args!(
+                "fs: block write at lba {} got a MALFORMED reply ({} bytes, first {}) - protocol                  desync, not a device error",
+                lba, reply.body().len(), reply.body().first().copied().unwrap_or(0xFF)));
+            *fail = Some(BlockFail::Transport);
+            false
+        }
+        None => {
+            ctx.log_fmt(format_args!(
+                "fs: block write at lba {} got NO usable reply - protocol desync or the driver is                  gone, not a device error", lba));
+            *fail = Some(BlockFail::Transport);
             false
         }
     }
