@@ -260,8 +260,18 @@ pub fn call_deadline_into(
     max_secs:    u64,
 ) -> Result<Option<usize>, IpcError> {
     const RECV_TIMED_OUT: i64 = -1001;
+    // `buf` carries the request OUT and the reply BACK, exactly as plain `call` does with its own
+    // 4 KiB frame. So it must hold the LARGER of the two, and a caller that sized it for replies
+    // alone is a caller whose requests are about to be cut short.
+    //
+    // This said `.min(buf.len())` in its first version, which truncated in silence: `fs` sized its
+    // buffer at 2 + BLOCK = 514 for replies while a block WRITE request is 1 + 9 + BLOCK = 522, so
+    // every write went out eight bytes short and came back a failure with no reason attached. Reads
+    // are ten bytes and fit, which is why reads worked and only writes broke. A silent truncation is
+    // the one thing a message path must never do (§26.7).
     if request.len() > MAX_PAYLOAD { return Err(IpcError::MessageTooLarge); }
-    let n = request.len().min(buf.len());
+    if request.len() > buf.len() { return Err(IpcError::MessageTooLarge); }
+    let n = request.len();
     buf[..n].copy_from_slice(&request[..n]);
     let slots = (target.0 as u64 & 0xFF)
         | ((reply_grant.0 as u64 & 0xFF) << 8)

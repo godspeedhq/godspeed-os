@@ -3320,8 +3320,17 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 /// A block reply: the driver's bytes, past the correlation tag, in a buffer sized to the protocol.
 ///
 /// 513 bytes, not the 4096 a `Message` carries. That difference is the whole reason the tag fits now.
+/// One block-protocol transfer buffer: big enough for the largest REQUEST (write: op + lba + block)
+/// as well as the largest reply (status + block), because the bounded call stages the request and
+/// receives the reply in the SAME buffer.
+///
+/// One constant, used by both the buffer and this struct. They were two separate expressions - 514
+/// here and 514 at the call site, against a 522-byte write request - and sizing them independently is
+/// exactly how a write came to be sent eight bytes short.
+pub const BLK_XFER_MAX: usize = 1 + 9 + BLOCK;
+
 pub struct BlockReply {
-    buf: [u8; 2 + BLOCK],
+    buf: [u8; BLK_XFER_MAX],
     len: usize,
 }
 
@@ -3351,7 +3360,8 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     // TAG + STATUS + BLOCK. Sized 1 + BLOCK first, which truncated every read by one byte: `fs` then
     // saw a 512-byte body where 513 belongs and rejected it as a desync - "block read at lba 0 got a
     // MALFORMED reply (512 bytes)". The shape check did its job; the buffer was simply a byte short.
-    const BLK_REPLY_MAX: usize = 2 + BLOCK;
+    // The shared transfer size - see `BLK_XFER_MAX`.
+    const BLK_REPLY_MAX: usize = BLK_XFER_MAX;
     let mut rbuf = [0u8; BLK_REPLY_MAX];
 
     // CORRELATION TAG at byte 0, echoed by `block-driver` and interpreted no further.
