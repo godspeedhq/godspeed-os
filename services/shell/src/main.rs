@@ -8807,7 +8807,7 @@ fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome 
     //
     // The retry doubles it, so a truly dead `fs` costs 40 s and then says so, instead of costing an
     // afternoon and saying nothing.
-    const MAX_SECS:  i64 = 20;
+    const MAX_SECS:  i64 = FS_ANSWER_SECS; // one source for this bound, not a second copy of 20
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
     let tag = next_fs_tag(ctx);
@@ -8845,7 +8845,7 @@ fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome 
 /// (`fs_request_q` would append a path-length byte).
 fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
     const HINT_SECS: i64 = 2;    // print "(q to quit)" only once the wait lingers
-    const MAX_SECS:  i64 = FS_FORMAT_SECS; // effectively unbounded: q is the real exit, not a deadline
+    const MAX_SECS:  i64 = FS_FSCK_SECS; // check/scrub walk the TREE, not the volume - a real bound
     let tag = next_fs_tag(ctx);
     let msg = Message::from_bytes(&[tag, op]);
     drain_stale_fs_replies(ctx);
