@@ -812,6 +812,48 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
                 super::put_str(b"the whole 8 KiB scan window is zero");
             }
         }
+
+        // A BACKTRACE, the way an oops has one.
+        //
+        // Registers say what was in flight and the window says the frame is flattened; neither
+        // names the function, and that name is the whole question. `x29` is zero here, so the frame
+        // CHAIN is broken and cannot be walked - which is exactly the case Linux `dump_backtrace`
+        // falls back to scanning for. Older frames further up the stack still hold their saved link
+        // registers, and a link register is a code address.
+        //
+        // So: scan upward and print every word that could be one. The service text is mapped at
+        // 0x400000 and the user stack top is 0x8000_0000, so a candidate is a 4-byte-aligned word
+        // inside the text window - a heuristic, and named as one: some of these are stale slots from
+        // calls that already returned. It is a list of suspects, not a call chain, and that is still
+        // the difference between reading a name and guessing one.
+        //
+        // Bounded the same way as the scan above: 8 KiB, 512-byte bites, same user-copy seam, and at
+        // most 12 printed so a deep stack cannot flood the console.
+        const TEXT_LO: u64 = 0x0040_0000;
+        const TEXT_HI: u64 = 0x0080_0000;
+        let mut shown = 0u32;
+        let mut boff: u64 = 0;
+        super::put_str(b"\r\n    return addresses on the stack (newest first, may include stale slots):");
+        while boff < SCAN_MAX && shown < 12 {
+            let Some(b) = crate::arch::imp::uaccess::read_user_bytes(sp_el0 + boff, BITE) else { break };
+            for w in 0..BITE / 8 {
+                if shown >= 12 { break; }
+                let mut t = [0u8; 8];
+                t.copy_from_slice(&b[w * 8..w * 8 + 8]);
+                let v = u64::from_le_bytes(t);
+                if v >= TEXT_LO && v < TEXT_HI && v & 3 == 0 {
+                    super::put_str(b"\r\n      SP+");
+                    super::put_hex(boff + (w as u64) * 8);
+                    super::put_str(b" -> ");
+                    super::put_hex(v);
+                    shown += 1;
+                }
+            }
+            boff += BITE as u64;
+        }
+        if shown == 0 {
+            super::put_str(b"\r\n      none found - the stack above SP holds no text addresses");
+        }
     }
 
     if from_el0 && slot < crate::task::scheduler::MAX_TASKS {
