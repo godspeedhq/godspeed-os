@@ -831,10 +831,20 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
         // most 12 printed so a deep stack cannot flood the console.
         const TEXT_LO: u64 = 0x0040_0000;
         const TEXT_HI: u64 = 0x0080_0000;
+        // Scan the LIVE STACK, not a fixed window. The first version borrowed the 8 KiB cap from the
+        // zero-run scan and reported "none found" - true of those 8 KiB, false of the stack: SP sat
+        // 71,664 bytes below the top with every caller frame above it, and a 6,208-byte
+        // zero-initialised local in the faulting frame alone pushed the nearest saved link register
+        // out of range. A window that cannot reach the answer returns a confident nothing.
+        //
+        // The extent now comes from the stack itself - SP to the user stack top - capped at 64 KiB so
+        // a bogus SP cannot walk forever.
+        const USER_STACK_TOP: u64 = 0x8000_0000;
+        let room = USER_STACK_TOP.saturating_sub(sp_el0).min(64 * 1024);
         let mut shown = 0u32;
         let mut boff: u64 = 0;
         super::put_str(b"\r\n    return addresses on the stack (newest first, may include stale slots):");
-        while boff < SCAN_MAX && shown < 12 {
+        while boff < room && shown < 12 {
             let Some(b) = crate::arch::imp::uaccess::read_user_bytes(sp_el0 + boff, BITE) else { break };
             for w in 0..BITE / 8 {
                 if shown >= 12 { break; }
@@ -852,7 +862,9 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
             boff += BITE as u64;
         }
         if shown == 0 {
-            super::put_str(b"\r\n      none found - the stack above SP holds no text addresses");
+            super::put_str(b"\r\n      none found in ");
+            super::put_dec(room);
+            super::put_str(b" bytes of live stack above SP");
         }
     }
 
