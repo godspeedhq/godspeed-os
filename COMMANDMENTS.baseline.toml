@@ -537,6 +537,7 @@ SpawnReturningEndpoint   = 38
 SpawnWithCaps            = 39
 ConsoleForeground        = 40
 Call                     = 41
+CallDeadline             = 50
 NetFrameTx               = 42
 NetFrameRx               = 43
 NetInfo                  = 44

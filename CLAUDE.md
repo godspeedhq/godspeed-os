@@ -736,6 +736,8 @@ recv(endpoint_cap)              -> Result<Message, IpcError>  // blocks until ms
 try_send(endpoint_cap, message) -> Result<(), IpcError>   // non-blocking
 call(target_cap, reply_cap, recv_cap, message)
                                 -> Result<Message, IpcError>  // send request + block for reply
+call_deadline(target_cap, reply_cap, recv_cap, message, secs)
+                                -> Result<Option<Message>, IpcError>  // `call`, bounded
 ```
 
 `call` is the synchronous request/reply primitive (syscall 41). It sends the request to `target`
@@ -744,6 +746,25 @@ wakes with the reply, or - if the replier dies before replying - with `ReplyDead
 hangs. This is **mechanism, not policy** (§26.10): the kernel learns only about a reply cap and its
 death semantics, never "request/reply" or "RPC". It is the primitive behind the SDK's
 `request_with_reply`; the reply-side twin of the blocked-sender `EndpointDead` wake.
+
+> **Amendment 2026-08-21 (`CallDeadline`, syscall 50): `call` gains a BOUND, because the unbounded one
+> was being worked around in a way that lost messages.** `call` is the only primitive that dequeues the
+> REPLY specifically (matched to the reply cap), leaving every other message queued - but it blocks
+> forever, so the SDK hand-rolled a bounded variant out of `send` + a plain endpoint `recv`. A plain
+> recv takes whatever is next, and a service that SERVES clients on the endpoint it awaits replies on
+> would therefore consume an unrelated client request, fail to match it, and drop it: the request lost
+> outright, and the real reply arriving later as an orphan that desynced every following exchange.
+> Observed on both the Pi 2 and the Pi 4 as `fs` clients hanging and the block protocol "losing step".
+>
+> The fix is not a workaround at the caller. It is the correct primitive made usable: same reply-cap
+> semantics, same `call_dequeue`, plus the deadline machinery `RecvTimeout` already uses. This is
+> **mechanism, not policy** (§26.10) - the kernel learns a deadline, not what the caller is waiting for
+> - and it is what §26.6 asks of every wait in the first place. `Ok(None)` means the deadline passed;
+> the reply cap is the caller's to reclaim, exactly as on any other failure (§8.5).
+>
+> A new syscall is a new kernel responsibility and the surface is pinned (Commandment I), so this is
+> recorded here rather than merely added: it is `call` with a bound, not a new capability, and the
+> enforcement layer refused the change until this amendment existed.
 
 ### 8.3 Routing
 
