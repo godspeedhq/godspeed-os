@@ -830,7 +830,12 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
         // Bounded the same way as the scan above: 8 KiB, 512-byte bites, same user-copy seam, and at
         // most 12 printed so a deep stack cannot flood the console.
         const TEXT_LO: u64 = 0x0040_0000;
-        const TEXT_HI: u64 = 0x0080_0000;
+        // 5 MiB, not 8. The first window ran to 0x0080_0000 and its one and only "hit" was
+        // 0x747874 - the ASCII bytes "txt", the tail of a filename sitting in a buffer. A service's
+        // .text is ~200 KiB (the shell measures 0x34800), so nothing legitimate lives above 5 MiB and
+        // a looser bound only invites string data to impersonate a return address. A backtrace that
+        // reports one false name is worse than one that reports none, because a name gets believed.
+        const TEXT_HI: u64 = 0x0050_0000;
         // Scan the LIVE STACK, not a fixed window. The first version borrowed the 8 KiB cap from the
         // zero-run scan and reported "none found" - true of those 8 KiB, false of the stack: SP sat
         // 71,664 bytes below the top with every caller frame above it, and a 6,208-byte
