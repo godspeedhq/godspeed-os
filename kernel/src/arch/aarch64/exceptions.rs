@@ -762,6 +762,56 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
             // would have been: a stack pointer whose own frame is unreadable is itself the answer.
             None => super::put_str(b"\r\n      unreadable (SP is outside the task's mapped stack)"),
         }
+
+        // HOW FAR THE ZEROS GO.
+        //
+        // The window above shows the frame is flattened; it cannot show how MUCH of it, and that is
+        // the number that identifies the culprit. Three faults on this port shared exact register
+        // geometry - `x0 = SP+5`, `x1 = SP-0x1051` - across three unrelated commands, which is a copy
+        // overrunning a stack buffer rather than corruption arriving from elsewhere. The EXTENT of
+        // the zeroed run is the size of that overrun, and a size is enough to name the buffer.
+        //
+        // Scans upward from SP for the first non-zero word, in 512-byte bites through the same
+        // user-copy seam. Bounded at 8 KiB - twice the 4 KiB request buffers these paths build, so a
+        // full overrun of one is inside the window and a runaway scan is not. An unmapped bite ends
+        // the scan and says where, which is itself the answer if the stack simply stops there.
+        const SCAN_MAX: u64 = 8 * 1024;
+        const BITE: usize = 512;
+        let mut off: u64 = 0;
+        let mut first_nonzero: Option<u64> = None;
+        let mut stopped_at: Option<u64> = None;
+        while off < SCAN_MAX && first_nonzero.is_none() {
+            match crate::arch::imp::uaccess::read_user_bytes(sp_el0 + off, BITE) {
+                Some(b) => {
+                    for w in 0..BITE / 8 {
+                        let mut t = [0u8; 8];
+                        t.copy_from_slice(&b[w * 8..w * 8 + 8]);
+                        if u64::from_le_bytes(t) != 0 {
+                            first_nonzero = Some(off + (w as u64) * 8);
+                            break;
+                        }
+                    }
+                    off += BITE as u64;
+                }
+                None => { stopped_at = Some(off); break; }
+            }
+        }
+        super::put_str(b"\r\n    zeroed run above SP: ");
+        match (first_nonzero, stopped_at) {
+            (Some(n), _) => {
+                super::put_dec(n);
+                super::put_str(b" bytes, then a non-zero word at SP+");
+                super::put_hex(n);
+            }
+            (None, Some(end)) => {
+                super::put_dec(end);
+                super::put_str(b" bytes, then the stack becomes UNREADABLE at SP+");
+                super::put_hex(end);
+            }
+            (None, None) => {
+                super::put_str(b"the whole 8 KiB scan window is zero");
+            }
+        }
     }
 
     if from_el0 && slot < crate::task::scheduler::MAX_TASKS {
