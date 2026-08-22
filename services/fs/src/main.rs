@@ -302,6 +302,11 @@ struct Fs {
     /// minutes of a prompt that looks dead. Bounding the STREAK turns "the device is not answering"
     /// into one answer instead of one answer per block.
     io_fail_streak: core::cell::Cell<u32>,
+    /// Block operations issued while serving ONE client request. Reset at the top of `serve`, reported
+    /// at the bottom. Counts the trips, not the time: the question "is a slow request thousands of
+    /// block ops, or a handful of slow ones?" has completely different answers, and a count settles it
+    /// without depending on a TSC that is not reliably calibrated on every board.
+    blk_ops: core::cell::Cell<u32>,
     /// Set when a block operation got no usable ANSWER (desync, truncated reply, driver gone) as
     /// opposed to a refusal from the device. Kept apart from `io_error_seen` because they demand
     /// opposite responses: a device error re-mounts and degrades, a desync must be reported as itself
@@ -1023,7 +1028,9 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
     if let Some(f) = vol.as_ref() {
         f.io_error_seen.set(false);
         f.transport_fail_seen.set(false);
+        f.blk_ops.set(0);
     }
+    let t_start = ctx.epoch_secs_monotonic();
     serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
 
     let errored = vol.as_ref().map_or(false, |f| f.io_error_seen.get());
@@ -1075,6 +1082,21 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         if len == 0 { out[1] = FS_ERR; len = 1; }
         // +1 for the tag at out[0]
         reply_nonblocking(ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..1 + len])), ctx, reply_fails);
+    }
+
+    // WHERE THE TIME WENT, for the requests that actually cost something.
+    //
+    // Reported only when a request took a second or more, so an idle prompt logs nothing and a slow
+    // one names itself. The op and the block-op count together answer the question that matters: a
+    // request that spent 7 seconds doing FOUR block operations has a slow device or a slow transport,
+    // and one that spent 7 seconds doing four THOUSAND has an algorithm walking the disk. Those need
+    // opposite fixes, and guessing between them has already cost this cycle several wrong turns.
+    let elapsed = ctx.epoch_secs_monotonic().saturating_sub(t_start);
+    if elapsed >= 1 {
+        let ops = vol.as_ref().map_or(0, |f| f.blk_ops.get());
+        ctx.log_fmt(format_args!(
+            "fs: op {} took {}s and {} block ops",
+            p.first().copied().unwrap_or(0), elapsed, ops));
     }
 }
 
@@ -1630,6 +1652,7 @@ impl Fs {
             flush_warned: core::cell::Cell::new(false),
             io_error_seen: core::cell::Cell::new(false),
             io_fail_streak: core::cell::Cell::new(0),
+            blk_ops: core::cell::Cell::new(0),
             transport_fail_seen: core::cell::Cell::new(false),
             // `None` = unknown, so the first persist of this mount always writes. One write per
             // mount is the price of never assuming what is on a disk we have not written to yet.
@@ -1662,6 +1685,7 @@ impl Fs {
                 if self.txn_lba[i] == lba { return Some(self.txn_blk[i]); }
             }
         }
+        self.blk_ops.set(self.blk_ops.get().saturating_add(1));
         let mut why = None;
         match block_read_kind(ctx, lba, &mut why) {
             Some(b) => Some(b),
@@ -1688,6 +1712,7 @@ impl Fs {
             self.txn_n += 1;
             true
         } else {
+            self.blk_ops.set(self.blk_ops.get().saturating_add(1));
             let mut why = None;
             let ok = block_write_kind(ctx, lba, data, &mut why);
             if !ok {
@@ -2152,6 +2177,7 @@ impl Fs {
             flush_warned: core::cell::Cell::new(false),
             io_error_seen: core::cell::Cell::new(false),
             io_fail_streak: core::cell::Cell::new(0),
+            blk_ops: core::cell::Cell::new(0),
             transport_fail_seen: core::cell::Cell::new(false),
             // `None` = unknown, so the first persist of this mount always writes. One write per
             // mount is the price of never assuming what is on a disk we have not written to yet.
