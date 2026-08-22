@@ -296,6 +296,28 @@ pub mod interrupts {
     pub fn local_irq_save() -> bool { false }                // mrs DAIF
     pub fn local_irq_restore(was_enabled: bool) {}
     pub fn wait_for_interrupt() {}                           // wfi
+/// May the idle loop MASK interrupts, re-check for runnable work, and then halt - relying on the
+/// halt to unmask and halt in one indivisible step?
+///
+/// This exists to close a lost-wakeup window, and the answer is a property of the silicon, so each
+/// arch answers for itself rather than inheriting x86's. The window: the idle loop asks `pick_next`
+/// for work, is told there is none, and halts. With interrupts ENABLED across that gap, a wake
+/// landing in it is taken and consumed BEFORE the halt - and the halt then sleeps through the very
+/// event it was told about, until the next timer tick. An idle core's tick is deliberately slowed to
+/// about a second, so the cost of losing one is about a second.
+///
+/// x86 says yes: `sti; hlt` is architecturally atomic, so masking first, re-checking, and then
+/// executing it cannot lose an interrupt raised in between - it is latched while masked and taken
+/// the instant `sti` retires.
+///
+/// ARM says NO, and this is the reason the guard is a question rather than a rule: both ARM ports do
+/// real work inside `wait_for_interrupt` (draining the UART so a keystroke can wake a blocked shell,
+/// watching hub ports so a replug is noticed) and that work REQUIRES interrupts enabled - their own
+/// comments say masking there would freeze the machine for the ~100 ms an enumeration takes. Masking
+/// them to fix an x86 race would be importing our answer into their design (26.14). They keep the
+/// narrower window; it is recorded here rather than silently left (26.7).
+    pub fn idle_mask_before_halt() -> bool { false }
+
     pub fn idle_can_halt() -> bool { false }
     pub fn send_eoi() {}                                     // GIC EOIR
     pub fn fire_test_irq(irq: u8) {}

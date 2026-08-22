@@ -1119,6 +1119,40 @@ pub fn run(core_id: u32) -> ! {
                 //  - It stays a lost-wake safety net: a missed WAKE_RECEIVER IPI is recovered on
                 //    the next ~1 s re-poll of the run queue, instead of parking the core forever.
                 //
+                // CLOSE THE LOST-WAKEUP WINDOW BEFORE HALTING.
+                //
+                // `pick_next` just said there is nothing to run. Between that answer and the halt
+                // below, interrupts were ENABLED - so a wake arriving in the gap (a cross-core
+                // WAKE_RECEIVER IPI, a device IRQ that queues a message) is taken and CONSUMED
+                // here, and the halt then sleeps through the event it was just told about. Nothing
+                // wakes the core until its next timer tick, and an idle core's tick is deliberately
+                // slowed to about a second - so one lost wake costs about a second.
+                //
+                // Not a hypothesis. Instrumenting `Call` printed, repeatedly,
+                //     call: slot 6 waited 1000079 us across 1 blocks
+                // ONE block and a flat ~1.000 s: a timer, not contention. It also explains the
+                // symptom that made no sense - that file operations were FASTER when the machine
+                // was BUSY - because a busy core never reaches this arm, so the race needs an idle
+                // core to happen at all. And `slow_idle` is gated on `cid != 0`, so only the APs
+                // slow their tick, which is why `fs` and `block-driver` (core 1) crawled while the
+                // shell and console (core 0) stayed responsive.
+                //
+                // The fix is the standard one, and closing this window is why `sti; hlt` exists:
+                // mask, RE-CHECK under the mask, and let the halt unmask atomically. An interrupt
+                // raised after the re-check is latched while masked and delivered the instant the
+                // halt unmasks, so it cannot be slept through. Whether that is sound is a property
+                // of the silicon, so the arch is asked rather than assumed - see
+                // `idle_mask_before_halt`, which ARM answers NO because its idle path does real
+                // work that needs interrupts enabled.
+                if crate::arch::imp::interrupts::idle_mask_before_halt() {
+                    crate::arch::imp::disable_interrupts();
+                    if pick_next(cid).is_some() {
+                        // Work arrived in the window. Do not halt - go round and run it.
+                        crate::arch::imp::enable_interrupts();
+                        continue;
+                    }
+                }
+
                 // Excluded: the BSP (it drives MONOTONIC_TICKS, scan_timed_wakes and the COM2/COM1
                 // polling, which must stay ~100 Hz), and any core that cannot halt (a Goldmont+
                 // sti-spin core gains nothing from a slower timer, so its behaviour is untouched).

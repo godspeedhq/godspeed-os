@@ -1267,14 +1267,16 @@ fn do_call(
     scheduler::clear_wake_deadline(my_slot);
 
     // Bounded and quiet: 100 ms is far past any healthy call, so a healthy machine prints nothing,
-    // and past it only every 16th, so a slow system cannot drown itself in reports about being slow
+    // and past it only every 256th, so a slow system cannot drown itself in reports about being
+    // slow - at 16 it did exactly that, adding a serial write inside the IPC path of a machine that
+    // was already a second per round trip, and the keyboard stopped answering entirely
     // (26.6, 26.7). Uses the cycle counter this file already reads safely for InspectKernel, so the
     // grandfathered `unsafe` floor here (18.5) is untouched.
     let call_us = scheduler::cycles_to_us(read_cycle_counter().wrapping_sub(call_c0));
     if call_us >= 100_000 {
         static SLOW_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
         let n = SLOW_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-        if n <= 3 || n % 16 == 0 {
+        if n <= 3 || n % 256 == 0 {
             crate::kprintln!(
                 "call: slot {} waited {} us across {} blocks (slow #{})",
                 my_slot, call_us, call_blocks, n);
