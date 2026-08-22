@@ -238,9 +238,15 @@ const SEC_ENTRIES_LBA: u64  = TOTAL_SECTORS - 1 - GPT_ENTRY_SECTS; // 131039
 const LAST_USABLE_LBA: u64  = SEC_ENTRIES_LBA - 1;          // 131038
 const ESP_END_LBA: u64      = LAST_USABLE_LBA;
 
-/// Build a UEFI-bootable disk image at `build/os.img`. Returns the path.
+/// Build a UEFI-bootable disk image at `build/os-usb.img`. Returns the path.
+///
+/// Named apart from the QEMU image on purpose. `osdev run` writes `build/os.img` (BIOS, for the
+/// emulator) and this writes the UEFI image you flash to a USB stick - two different artifacts that
+/// shared one filename, so neither the operator nor a script could tell which one was on disk. That
+/// is the stale-image trap with an extra step: flash the wrong one and the machine boots something
+/// you did not build, with nothing to say so.
 pub fn create_uefi(kernel_elf: &Path, limine_dir: &Path) -> PathBuf {
-    create_uefi_at(kernel_elf, limine_dir, Path::new("build/os.img"))
+    create_uefi_at(kernel_elf, limine_dir, Path::new("build/os-usb.img"))
 }
 
 pub fn create_uefi_at(kernel_elf: &Path, limine_dir: &Path, image_path: &Path) -> PathBuf {

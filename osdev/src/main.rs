@@ -25,7 +25,7 @@
 //!   osdev test chaos        - run §22 chaos / graceful-degradation test suite (Milestone 14)
 //!   osdev test chaos-brutal - run brutal chaos tests BC1-BC7 (Milestone 21)
 //!   osdev test shell        - scripted shell smoke-test (help, cores, status, unknown)
-//!   osdev image [--mode M]  - build + create bootable disk image (build/os.img); M=bare-metal|perf|perf-brutal|identity|stress|adv|chaos|fuzz|s8
+//!   osdev image [--mode M]  - build + create bootable USB image (build/os-usb.img); M=bare-metal|perf|perf-brutal|identity|stress|adv|chaos|fuzz|s8
 
 mod crc32;
 mod disk_image;
@@ -70,7 +70,8 @@ enum Commands {
     Caps { service: String },
     /// Run the identity test suite (§22).
     Test { suite: String },
-    /// Build + create bootable disk image at build/os.img without launching QEMU.
+    /// Build + create the bootable USB image at build/os-usb.img without launching QEMU.
+    /// (Distinct from `osdev run`, which writes the QEMU/BIOS image at build/os.img.)
     /// Flash to USB with Rufus (DD mode) or `dd`.
     Image {
         /// Supervisor feature baked into the image.
