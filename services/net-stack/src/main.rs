@@ -116,18 +116,38 @@ fn nic_status_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Mess
     nic_req(ctx, msg, secs)
 }
 
+/// How long to pace before re-offering a frame to a FULL nic-driver queue, and how many times.
+///
+/// `nic-driver` and `net-stack` land on the SAME CORE on x86 (round-robin put both on core 1), so a
+/// burst - six DHCP REQUESTs back to back - fills the 16-deep queue faster than the driver is
+/// scheduled to drain it. That is congestion, not a broken peer, and it clears as soon as it runs.
+const NIC_BUSY_MS: u64 = 2;
+const NIC_BUSY_TRIES: u32 = 8;
+
 fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
-    match ctx.request_with_reply_deadline_outcome("nic-driver", msg, secs) {
-        DeadlineOutcome::Reply(r) => Some(r),
-        // The send never left - nic-driver's cap is stale (it was killed + respawned). Reacquire it by
-        // name from the kernel directory and retry once against the fresh instance.
-        DeadlineOutcome::SendFailed if ctx.reacquire_by_name("nic-driver") =>
-            ctx.request_with_reply_deadline("nic-driver", msg, secs),
-        // A genuine timeout (the driver got it but the host was silent), or a reacquire that still
-        // could not resolve the driver: return failure WITHOUT retrying - retrying a silent host would
-        // just double every no-answer wait (net arp/dns to a host that does not answer).
-        _ => None,
+    for _ in 0..NIC_BUSY_TRIES {
+        match ctx.request_with_reply_deadline_outcome("nic-driver", msg, secs) {
+            DeadlineOutcome::Reply(r) => return Some(r),
+            // Alive, just behind. Pace and offer the frame again. Reacquiring here was the bug: it
+            // hunted for a capability that was never stale, retried once, and reported "never left the
+            // host" on a link that was up the whole time - 34 seconds of DHCP backoff for congestion
+            // that clears in microseconds.
+            DeadlineOutcome::QueueFull => {
+                ctx.sleep(ctx.duration_cycles(NIC_BUSY_MS));
+                continue;
+            }
+            // Genuinely unreachable - the cap went stale when the driver restarted. Reacquire (§14.3).
+            DeadlineOutcome::SendFailed if ctx.reacquire_by_name("nic-driver") =>
+                return ctx.request_with_reply_deadline("nic-driver", msg, secs),
+            // A real timeout (the driver had it, the host was silent), or a reacquire that resolved
+            // nothing. Fail without retrying - retrying a silent host only doubles the wait.
+            _ => return None,
+        }
     }
+    // Bounded, and loud: a queue full for 8 tries is congestion we cannot ride out, and the caller
+    // must hear it rather than infer it from a vanished frame (§26.7).
+    ctx.log("net-stack: nic-driver queue stayed full - frame dropped after pacing");
+    None
 }
 
 /// Phase 3: a DHCP DISCOVER over UDP - ask QEMU slirp's built-in DHCP server for our IP and read the

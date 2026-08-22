@@ -27,6 +27,14 @@ pub enum ReqOutcome {
 pub enum DeadlineOutcome {
     Reply(Message),
     SendFailed,
+    /// The peer is ALIVE and its queue is FULL. A different failure entirely, and it was folded into
+    /// `SendFailed` until x86 showed the cost: `net-stack` answered a full queue by reacquiring a
+    /// capability that was never stale, retried once and gave up - "5 of 6 REQUESTs never left the
+    /// host", DHCP backing off for 34 seconds on a link that was up the whole time.
+    ///
+    /// Congestion is transient by definition. The answer is to pace and retry, not to go looking for
+    /// a peer that never went anywhere.
+    QueueFull,
     Timeout,
 }
 
@@ -905,9 +913,12 @@ impl ServiceContext {
         let target = match self.find_send_slot(peer) { Some(s) => CapHandle(s), None => return DeadlineOutcome::SendFailed };
         let self_grant = match self.self_grant_handle() { Some(g) => g, None => return DeadlineOutcome::SendFailed };
         let reply_cap = match self.derive_cap(self_grant) { Some(c) => c, None => return DeadlineOutcome::SendFailed };
-        if self.send_with_cap_by_handle(target, reply_cap, msg).is_err() {
+        if let Err(e) = self.send_with_cap_by_handle(target, reply_cap, msg) {
             self.remove_cap(reply_cap);   // send failed: reclaim the untransferred reply cap (no leak)
-            return DeadlineOutcome::SendFailed;
+            return match e {
+                crate::ipc::IpcError::QueueFull => DeadlineOutcome::QueueFull,
+                _ => DeadlineOutcome::SendFailed,
+            };
         }
         // Deglitched monotonic clock, not the raw RTC: a single CMOS misread (the "4383d" glitch on the
         // T630) would otherwise make `now - t0` read huge and expire the deadline instantly.
