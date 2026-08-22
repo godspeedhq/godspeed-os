@@ -282,7 +282,35 @@ struct ServiceContextData {
     fb_bpp:             u32, // bytes per pixel
     fb_shifts:          u32, // r_shift | g_shift << 8 | b_shift << 16
     send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
+    /// A SECOND endpoint, for REPLIES only. `u32::MAX` = none.
+    ///
+    /// A service that serves clients on the endpoint it also awaits replies on cannot drain that
+    /// endpoint while it is blocked for a reply. Sixteen client requests arrive, the queue is full,
+    /// and the reply it is waiting for is DROPPED by a peer that (correctly) uses `try_send` rather
+    /// than deadlocking. The wait then runs to its full deadline - 30 s per block operation on x86,
+    /// which is what made `write append` take 73 seconds.
+    ///
+    /// Correlation tags cannot reach this: a tag identifies a reply that ARRIVED, and this one never
+    /// did. `docs/net-tags-design.md` rejected a second endpoint for lacking a `CreateEndpoint`
+    /// syscall - true, and not needed: the first endpoint is minted at spawn and so is this one.
+    reply_recv_slot:    u32,
+    /// SEND|GRANT cap to `reply_recv_slot`'s endpoint, for handing out as a reply cap. `u32::MAX` = none.
+    reply_grant_slot:   u32,
 }
+
+// The kernel writes this struct and the SDK reads it, from two crates, with no shared definition -
+// they are kept in step BY HAND. There was no check on that, and adding a field to one and not the
+// other silently misaligns every field after it: a service would read its neighbour's slot numbers.
+//
+// Pinned by SIZE in both crates. It does not prove field ORDER, but it catches the mistake that
+// actually happens - an append on one side only - and it fails at compile time in the crate that
+// drifted rather than at boot in a service that reads garbage.
+const SERVICE_CONTEXT_DATA_SIZE: usize = 256;
+const _: () = assert!(
+    core::mem::size_of::<ServiceContextData>() == SERVICE_CONTEXT_DATA_SIZE,
+    "ServiceContextData changed size: update BOTH kernel/src/task/mod.rs and      sdk/rust/src/service_context.rs, then update SERVICE_CONTEXT_DATA_SIZE in both"
+);
+
 
 // ---------------------------------------------------------------------------
 // User stack layout constants.
@@ -3925,6 +3953,8 @@ fn spawn_service_with_config(
     // 4. Optional recv endpoint.
     let mut recv_slot_u32 = u32::MAX;
     let mut self_grant_slot_u32 = u32::MAX;
+    let mut reply_recv_slot_u32 = u32::MAX;
+    let mut reply_grant_slot_u32 = u32::MAX;
 
     if has_recv_endpoint {
         let ep_id       = crate::ipc::alloc_endpoint_id();
@@ -3965,6 +3995,37 @@ fn spawn_service_with_config(
         // this original and derives copies for re-registration after a restart.
         if let Ok(sg) = caps.insert(mint_cap(resource_id, Rights::SEND | Rights::GRANT)) {
             self_grant_slot_u32 = sg as u32;
+        }
+
+        // A SECOND endpoint, for replies only.
+        //
+        // The first one is where clients send their requests. A service that also AWAITS replies
+        // there cannot drain it while blocked, so client traffic fills the 16-deep queue and the
+        // reply it is waiting for is dropped by a peer that (rightly) uses `try_send` instead of
+        // deadlocking. The wait then runs to its deadline - 30 s per block op on x86.
+        //
+        // Not registered in the name directory: nobody looks this up, it is handed out per-request as
+        // a reply cap. Not gated on a contract either - every service that can receive gets one, so
+        // there is no capability to declare and no way to get it wrong. It costs one endpoint and two
+        // cap slots per task, and it removes an entire class of self-inflicted stall.
+        //
+        // `docs/net-tags-design.md` rejected this for needing a `CreateEndpoint` syscall. It does not:
+        // this is the same mint as above, at the same point in spawn.
+        let reply_ep_id  = crate::ipc::alloc_endpoint_id();
+        let reply_res_id = ResourceId::from(reply_ep_id);
+        let reply_gen    = crate::capability::next_generation();
+        crate::capability::register_resource_at_gen(reply_res_id, reply_gen);
+        crate::ipc::routing::register(reply_ep_id, core_id, reply_gen);
+        if let Ok(rr) = caps.insert(mint_cap(reply_res_id, Rights::RECV)) {
+            reply_recv_slot_u32 = rr as u32;
+            if let Ok(rg) = caps.insert(mint_cap(reply_res_id, Rights::SEND | Rights::GRANT)) {
+                reply_grant_slot_u32 = rg as u32;
+            } else {
+                // Half a reply mailbox is worse than none: a RECV with no way to hand out a reply cap
+                // would have callers wait on an endpoint nothing can answer. Fall back to the shared
+                // endpoint, which is what every service did until now.
+                reply_recv_slot_u32 = u32::MAX;
+            }
         }
 
         // Wire hw_interrupt lines to this endpoint (§12.3).
@@ -4378,6 +4439,8 @@ fn spawn_service_with_config(
             data.console_read_slot  = console_read_slot_u32;
             data.console_push_slot  = console_push_slot_u32;
             data.self_grant_slot    = self_grant_slot_u32;
+            data.reply_recv_slot    = reply_recv_slot_u32;
+            data.reply_grant_slot   = reply_grant_slot_u32;
             data.xhci_mmio_va       = xhci_mmio_va;
             data.xhci_mmio_len      = xhci_mmio_len;
             data.xhci_dma_va        = xhci_dma_va;

@@ -268,7 +268,35 @@ struct ServiceContextData {
     fb_bpp:             u32, // bytes per pixel
     fb_shifts:          u32, // r_shift | g_shift << 8 | b_shift << 16
     send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
+    /// A SECOND endpoint, for REPLIES only. `u32::MAX` = none.
+    ///
+    /// A service that serves clients on the endpoint it also awaits replies on cannot drain that
+    /// endpoint while it is blocked for a reply. Sixteen client requests arrive, the queue is full,
+    /// and the reply it is waiting for is DROPPED by a peer that (correctly) uses `try_send` rather
+    /// than deadlocking. The wait then runs to its full deadline - 30 s per block operation on x86,
+    /// which is what made `write append` take 73 seconds.
+    ///
+    /// Correlation tags cannot reach this: a tag identifies a reply that ARRIVED, and this one never
+    /// did. `docs/net-tags-design.md` rejected a second endpoint for lacking a `CreateEndpoint`
+    /// syscall - true, and not needed: the first endpoint is minted at spawn and so is this one.
+    reply_recv_slot:    u32,
+    /// SEND|GRANT cap to `reply_recv_slot`'s endpoint, for handing out as a reply cap. `u32::MAX` = none.
+    reply_grant_slot:   u32,
 }
+
+// The kernel writes this struct and the SDK reads it, from two crates, with no shared definition -
+// they are kept in step BY HAND. There was no check on that, and adding a field to one and not the
+// other silently misaligns every field after it: a service would read its neighbour's slot numbers.
+//
+// Pinned by SIZE in both crates. It does not prove field ORDER, but it catches the mistake that
+// actually happens - an append on one side only - and it fails at compile time in the crate that
+// drifted rather than at boot in a service that reads garbage.
+const SERVICE_CONTEXT_DATA_SIZE: usize = 256;
+const _: () = assert!(
+    core::mem::size_of::<ServiceContextData>() == SERVICE_CONTEXT_DATA_SIZE,
+    "ServiceContextData changed size: update BOTH kernel/src/task/mod.rs and      sdk/rust/src/service_context.rs, then update SERVICE_CONTEXT_DATA_SIZE in both"
+);
+
 
 // ---------------------------------------------------------------------------
 // Dynamic send-cap cache - updated by `reacquire_cap` after EndpointDead.
@@ -683,6 +711,19 @@ impl ServiceContext {
     pub fn probe_mode(&self) -> u32 { Self::ctx().probe_mode }
 
     /// Return the recv cap handle for direct-handle use (e.g. wrong-right test probing).
+    /// The REPLY mailbox: `(recv, grant)` for the endpoint that exists only to receive replies, or
+    /// `None` on a task that has none (then the caller uses the shared endpoint, as before).
+    ///
+    /// Awaiting a reply on the endpoint you also SERVE means you cannot drain client traffic while
+    /// you wait; the queue fills and your own reply is dropped. Replies come here instead, where
+    /// nothing else is ever sent.
+    fn reply_mailbox(&self) -> Option<(crate::capability::CapHandle, crate::capability::CapHandle)> {
+        let d = Self::ctx();
+        if d.reply_recv_slot == u32::MAX || d.reply_grant_slot == u32::MAX { return None; }
+        Some((crate::capability::CapHandle(d.reply_recv_slot),
+              crate::capability::CapHandle(d.reply_grant_slot)))
+    }
+
     pub fn recv_handle(&self) -> Option<crate::capability::CapHandle> {
         let slot = Self::ctx().recv_slot;
         if slot == u32::MAX { None } else { Some(crate::capability::CapHandle(slot)) }
@@ -803,9 +844,14 @@ impl ServiceContext {
         &self, peer: &str, req: &[u8], buf: &mut [u8], max_secs: i64,
     ) -> Option<usize> {
         let target = CapHandle(self.find_send_slot(peer)?);
-        let self_grant = self.self_grant_handle()?;
-        let reply_cap = self.derive_cap(self_grant)?;
-        let recv = self.recv_handle()?;
+        // Reply mailbox when the task has one, shared endpoint when it does not. The reply cap and the
+        // endpoint waited on must name the SAME endpoint, or the kernel's reply-matched dequeue waits
+        // for something that will never be delivered there.
+        let (recv, grant) = match self.reply_mailbox() {
+            Some((r, g)) => (r, g),
+            None => (self.recv_handle()?, self.self_grant_handle()?),
+        };
+        let reply_cap = self.derive_cap(grant)?;
         let secs = if max_secs <= 0 { 0 } else { max_secs as u64 };
         let out = crate::ipc::call_deadline_into(target, reply_cap, recv, req, buf, secs);
         // The kernel consumes the reply cap on a delivered call; on any other outcome it is ours to

@@ -46,7 +46,24 @@ order, which produced the "run `ls` twice and it is out of step" desync; the fix
 at offset 0 of both request and reply (see `project_fs_reply_correlation`, and the `tag` handling in
 `services/fs/src/main.rs`). This spec is that pattern applied one layer down.
 
-**Rejected alternative - a second endpoint.** Structurally cleaner (client traffic and driver traffic
+> **Amendment 2026-08-22: the second endpoint EXISTS now, and the rejection below was right about the
+> wrong problem.** Tags solve CORRELATION - telling your reply apart from other traffic - and they do
+> that well; the shell's "discarded an fs reply for tag 68 while awaiting 69" is the mechanism working.
+> What they cannot solve is a reply that never ARRIVES: a service blocked awaiting a reply cannot drain
+> the endpoint it also SERVES on, sixteen client requests fill the queue, and the reply is dropped by a
+> peer that correctly uses `try_send` rather than deadlocking. The wait then runs to its full deadline -
+> 30 s per block operation, which on x86 made `write append` take 73 seconds. A tag on an undelivered
+> message does nothing.
+>
+> The stated blocker also turned out not to hold. "There is no `CreateEndpoint` syscall" is true and
+> irrelevant: the FIRST endpoint is minted during spawn, and the second is the same mint a few lines
+> later. No new syscall, no contract change, no way for a service to ask for it wrongly - every service
+> that can receive gets one, costing one endpoint and two cap slots.
+>
+> Tags stay. They are still what separates one reply from another once both are in the mailbox, and the
+> net-stack/nic-driver protocol below is unchanged. The endpoint fixes delivery; the tag fixes identity.
+
+**Rejected alternative - a second endpoint.** [SUPERSEDED - see the amendment above.] Structurally cleaner (client traffic and driver traffic
 in different mailboxes, impossible to confuse) but **not available**: there is no `CreateEndpoint`
 syscall, a service's receive endpoint is minted at spawn from its contract, and `ServiceContext`
 carries a single `recv_slot`. It would take a new kernel primitive, an SDK change to select a mailbox,
