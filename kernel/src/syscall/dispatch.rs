@@ -1216,6 +1216,17 @@ fn do_call(
         scheduler::monotonic_ticks().wrapping_add(deadline_secs.saturating_mul(TICKS_PER_SEC))
     };
 
+    // WHERE A SLOW CALL ACTUALLY SPENDS ITS TIME - blocked, or going round this loop.
+    //
+    // `fs` measures ~870 ms for one 512-byte block round trip while `block-driver` measures under
+    // 5 ms for the same request, so the time is in this path and not in the device. Two shapes
+    // remain and they are opposite bugs: ONE block that nobody woke for 870 ms (a wake that was
+    // never delivered, recovered later by a timer tick - an idle core's tick is deliberately
+    // slowed, which would also explain why this is FASTER when the machine is busy), or MANY
+    // blocks and wakes that each found nothing (a livelock round this loop). The count separates
+    // them, and reading the wake path has not: every link in it is correct.
+    let call_c0 = read_cycle_counter();
+    let mut call_blocks: u32 = 0;
     let result = loop {
         match crate::ipc::routing::call_dequeue(recv_ep, recv_cap.generation, target_ep, my_slot) {
             Ok((reply, sender_to_wake)) => {
@@ -1237,6 +1248,7 @@ fn do_call(
                 break copy_len as i64;
             }
             Err(IpcError::QueueEmpty) => {
+                call_blocks = call_blocks.saturating_add(1);
                 // call_dequeue recorded us as blocked-in-call awaiting target_ep; block now. The wake
                 // result is intentionally ignored: we loop and let call_dequeue re-derive the terminal
                 // condition (queued reply -> Ok; target dead -> ReplyDead; our endpoint dead -> EndpointDead).
@@ -1253,6 +1265,21 @@ fn do_call(
         }
     };
     scheduler::clear_wake_deadline(my_slot);
+
+    // Bounded and quiet: 100 ms is far past any healthy call, so a healthy machine prints nothing,
+    // and past it only every 16th, so a slow system cannot drown itself in reports about being slow
+    // (26.6, 26.7). Uses the cycle counter this file already reads safely for InspectKernel, so the
+    // grandfathered `unsafe` floor here (18.5) is untouched.
+    let call_us = scheduler::cycles_to_us(read_cycle_counter().wrapping_sub(call_c0));
+    if call_us >= 100_000 {
+        static SLOW_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let n = SLOW_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 3 || n % 16 == 0 {
+            crate::kprintln!(
+                "call: slot {} waited {} us across {} blocks (slow #{})",
+                my_slot, call_us, call_blocks, n);
+        }
+    }
     result
 }
 
