@@ -307,6 +307,12 @@ struct Fs {
     /// block ops, or a handful of slow ones?" has completely different answers, and a count settles it
     /// without depending on a TSC that is not reliably calibrated on every board.
     blk_ops: core::cell::Cell<u32>,
+    /// Raw cycles spent INSIDE those block operations. Paired with the whole-request cycle count it
+    /// answers, without needing a calibrated clock, the only question left: is a slow request slow
+    /// because the disk round-trip is slow, or because `fs` itself is doing slow work around it? The
+    /// RATIO of the two is what matters, and a ratio needs no cycles-per-second - which is why it is
+    /// measured this way on a board whose TSC calibration is not trustworthy.
+    blk_cycles: core::cell::Cell<u64>,
     /// Set when a block operation got no usable ANSWER (desync, truncated reply, driver gone) as
     /// opposed to a refusal from the device. Kept apart from `io_error_seen` because they demand
     /// opposite responses: a device error re-mounts and degrades, a desync must be reported as itself
@@ -1029,8 +1035,10 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         f.io_error_seen.set(false);
         f.transport_fail_seen.set(false);
         f.blk_ops.set(0);
+        f.blk_cycles.set(0);
     }
     let t_start = ctx.epoch_secs_monotonic();
+    let c_start = ctx.read_tsc();
     serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
 
     let errored = vol.as_ref().map_or(false, |f| f.io_error_seen.get());
@@ -1094,9 +1102,12 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
     let elapsed = ctx.epoch_secs_monotonic().saturating_sub(t_start);
     if elapsed >= 1 {
         let ops = vol.as_ref().map_or(0, |f| f.blk_ops.get());
+        let blk_c = vol.as_ref().map_or(0, |f| f.blk_cycles.get());
+        let all_c = ctx.read_tsc().saturating_sub(c_start).max(1);
         ctx.log_fmt(format_args!(
-            "fs: op {} took {}s and {} block ops",
-            p.first().copied().unwrap_or(0), elapsed, ops));
+            "fs: op {} took {}s, {} block ops, {}% of it inside them",
+            p.first().copied().unwrap_or(0), elapsed, ops,
+            blk_c.saturating_mul(100) / all_c));
     }
 }
 
@@ -1653,6 +1664,7 @@ impl Fs {
             io_error_seen: core::cell::Cell::new(false),
             io_fail_streak: core::cell::Cell::new(0),
             blk_ops: core::cell::Cell::new(0),
+            blk_cycles: core::cell::Cell::new(0),
             transport_fail_seen: core::cell::Cell::new(false),
             // `None` = unknown, so the first persist of this mount always writes. One write per
             // mount is the price of never assuming what is on a disk we have not written to yet.
@@ -1686,8 +1698,12 @@ impl Fs {
             }
         }
         self.blk_ops.set(self.blk_ops.get().saturating_add(1));
+        let t_blk = ctx.read_tsc();
         let mut why = None;
-        match block_read_kind(ctx, lba, &mut why) {
+        let read_out = block_read_kind(ctx, lba, &mut why);
+        self.blk_cycles.set(self.blk_cycles.get()
+            .saturating_add(ctx.read_tsc().saturating_sub(t_blk)));
+        match read_out {
             Some(b) => Some(b),
             None => {
                 match why {
@@ -1713,8 +1729,11 @@ impl Fs {
             true
         } else {
             self.blk_ops.set(self.blk_ops.get().saturating_add(1));
+            let t_blk = ctx.read_tsc();
             let mut why = None;
             let ok = block_write_kind(ctx, lba, data, &mut why);
+            self.blk_cycles.set(self.blk_cycles.get()
+                .saturating_add(ctx.read_tsc().saturating_sub(t_blk)));
             if !ok {
                 match why {
                     Some(BlockFail::Transport) => self.transport_fail_seen.set(true),
@@ -2178,6 +2197,7 @@ impl Fs {
             io_error_seen: core::cell::Cell::new(false),
             io_fail_streak: core::cell::Cell::new(0),
             blk_ops: core::cell::Cell::new(0),
+            blk_cycles: core::cell::Cell::new(0),
             transport_fail_seen: core::cell::Cell::new(false),
             // `None` = unknown, so the first persist of this mount always writes. One write per
             // mount is the price of never assuming what is on a disk we have not written to yet.
