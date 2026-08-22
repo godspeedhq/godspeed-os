@@ -52,7 +52,13 @@ pub fn fb_init(fb: &Framebuffer) {
         mem,
         // Limine reports the framebuffer at its HHDM address; the grant handed to the `console` service
         // is built from the PHYSICAL base, because the service maps it into its own address space.
-        phys: fb.address() as u64 - crate::arch::x86_64::page_tables::get_hhdm_offset(),
+        // Straight from Limine, NOT `page_tables::get_hhdm_offset()` - that is still 0 here, because
+        // this runs before `memory::init` publishes it, and subtracting 0 stored the higher-half
+        // address as "physical". The console's mapping was then built from an address wider than the
+        // machine's physical address width, so its first write to the screen took a reserved-bit page
+        // fault and the supervisor restarted it, forever. On screen that read as text appearing and
+        // vanishing: each dead console handed the framebuffer back to the kernel's boot floor.
+        phys: fb.address() as u64 - crate::arch::x86_64::hhdm_offset_from_limine(),
         pitch: fb.pitch as usize,
         bpp: (fb.bpp as usize) / 8,
         width: fb.width as usize,

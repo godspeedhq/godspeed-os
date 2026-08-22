@@ -52,6 +52,18 @@ static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
 #[link_section = ".requests"]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
+/// The HHDM offset straight from Limine, for the few callers that run BEFORE `memory::init` has had a
+/// chance to publish it via `set_hhdm_offset`.
+///
+/// `page_tables::get_hhdm_offset()` returns **0** until then - its own doc says so - and a subtraction
+/// against zero is a silent no-op, not an error. `fb_init` ran early and did exactly that: it stored
+/// the framebuffer's HIGHER-HALF address as if it were physical, the console's page tables were built
+/// from it, and the service took a reserved-bit page fault on its first write to the screen. The
+/// response is available from the moment the request is honoured, so there is no reason to wait.
+pub(crate) fn hhdm_offset_from_limine() -> u64 {
+    HHDM_REQUEST.response().map(|r| r.offset).unwrap_or(0)
+}
+
 #[used]
 #[link_section = ".requests"]
 static SMP_REQUEST: MpRequest = MpRequest::new(0);
@@ -137,10 +149,7 @@ fn collect_boot_info() -> BootInfo {
         }
     }
 
-    let hhdm_offset = HHDM_REQUEST
-        .response()
-        .map(|r| r.offset)
-        .unwrap_or(0);
+    let hhdm_offset = hhdm_offset_from_limine();
 
     // ACPI RSDP pointer (0 if firmware/Limine did not supply one). On Limine
     // base revision 6 this is a virtual (HHDM) address; iommu::detect normalises
