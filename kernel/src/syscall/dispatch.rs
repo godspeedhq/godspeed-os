@@ -1226,6 +1226,7 @@ fn do_call(
     // blocks and wakes that each found nothing (a livelock round this loop). The count separates
     // them, and reading the wake path has not: every link in it is correct.
     let call_c0 = read_cycle_counter();
+    let call_h0 = scheduler::core_idle_halts(scheduler::current_core_id());
     let mut call_blocks: u32 = 0;
     let result = loop {
         match crate::ipc::routing::call_dequeue(recv_ep, recv_cap.generation, target_ep, my_slot) {
@@ -1278,8 +1279,11 @@ fn do_call(
         let n = SLOW_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
         if n <= 3 || n % 256 == 0 {
             crate::kprintln!(
-                "call: slot {} waited {} us across {} blocks (slow #{})",
-                my_slot, call_us, call_blocks, n);
+                "call: slot {} waited {} us across {} blocks, {} core halts (slow #{})",
+                my_slot, call_us, call_blocks,
+                scheduler::core_idle_halts(scheduler::current_core_id())
+                    .saturating_sub(call_h0),
+                n);
         }
     }
     result

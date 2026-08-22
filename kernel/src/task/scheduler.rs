@@ -317,6 +317,21 @@ static CORE_TOTAL_TICKS: PerCore<CachePaddedU64> = PerCore::new();
 /// The kernel is the last-resort recovery anchor (§6.3); if IT stalls silently nothing recovers it, so
 /// it must at minimum fail LOUD. `0` = that core has not ticked yet (still booting) - not a stall.
 static CORE_LAST_TICK_TSC: PerCore<CachePaddedU64> = PerCore::new();
+/// How many times this core has HALTED in the idle path.
+///
+/// Diagnostic, and the one fact that separates the two remaining explanations for a slow `Call`. The
+/// idle lost-wakeup fix removed the dominant case, but a few calls still block once and wait almost
+/// exactly a second - the same signature. Either the core halted during that wait and a wake was
+/// still lost (a second hole, in a path the fix does not cover), or it never halted at all and the
+/// second is something else entirely wearing the same clothes. Sampling this across a call answers
+/// it outright instead of by argument.
+static CORE_IDLE_HALTS: PerCore<CachePaddedU64> = PerCore::new();
+
+/// Halts this core has taken in its idle path since boot. See `CORE_IDLE_HALTS`.
+pub fn core_idle_halts(core_id: usize) -> u64 {
+    CORE_IDLE_HALTS.get(core_id).0.load(Ordering::Relaxed)
+}
+
 /// Has the liveness watchdog announced itself? Only so the arming line is printed once, not per tick.
 static LIVENESS_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -410,6 +425,7 @@ pub fn init_arenas(n: usize) {
     CORE_ACTIVE_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_TOTAL_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_LAST_TICK_TSC.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
+    CORE_IDLE_HALTS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_RR_SLOT.init_with(n, |_| AtomicUsize::new(0));
     CORE_WAKE_HINT.init_with(n, |_| AtomicUsize::new(MAX_TASKS));
     CORE_PENDING_KSTACK_LEN.init_with(n, |_| AtomicUsize::new(0));
@@ -1178,6 +1194,7 @@ pub fn run(core_id: u32) -> ! {
                 // ticks and IPIs.  The compiler_fence above forces a fresh reload
                 // of TASK_STATE on every iteration so wakeups from other cores
                 // are always visible.
+                CORE_IDLE_HALTS.get(cid).0.fetch_add(1, Ordering::Relaxed);
                 crate::arch::imp::wait_for_interrupt();
                 // Woke - by the slow idle timer, a WAKE_RECEIVER IPI, or a device IRQ. Restore the
                 // normal preemption quantum so a task picked on the next iteration is preemptible
