@@ -4015,7 +4015,11 @@ fn spawn_service_with_config(
         let reply_res_id = ResourceId::from(reply_ep_id);
         let reply_gen    = crate::capability::next_generation();
         crate::capability::register_resource_at_gen(reply_res_id, reply_gen);
-        crate::ipc::routing::register(reply_ep_id, core_id, reply_gen);
+        // FALLIBLE on purpose. The routing table holds 96 endpoints and the probe builds spawn ~178
+        // services; taking one unconditionally would turn `osdev test identity` into a boot panic.
+        // Without it the task awaits replies on its shared endpoint, exactly as before this existed.
+        let reply_routed = crate::ipc::routing::try_register(reply_ep_id, core_id, reply_gen);
+        if reply_routed {
         if let Ok(rr) = caps.insert(mint_cap(reply_res_id, Rights::RECV)) {
             reply_recv_slot_u32 = rr as u32;
             if let Ok(rg) = caps.insert(mint_cap(reply_res_id, Rights::SEND | Rights::GRANT)) {
@@ -4026,6 +4030,7 @@ fn spawn_service_with_config(
                 // endpoint, which is what every service did until now.
                 reply_recv_slot_u32 = u32::MAX;
             }
+        }
         }
 
         // Wire hw_interrupt lines to this endpoint (§12.3).

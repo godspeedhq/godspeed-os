@@ -159,6 +159,38 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
     }
 }
 
+/// `register`, but returns `false` instead of panicking when the table is full.
+///
+/// For endpoints a task can do WITHOUT. The primary endpoint is not one of those - a service with no
+/// mailbox cannot be talked to, and failing quietly there would produce a service that exists and
+/// answers nothing, so that path still panics. The reply-only endpoint IS optional: without it a task
+/// falls back to awaiting replies on its shared endpoint, which is what every task did until now.
+///
+/// The distinction matters because the table is sized for services and the probe builds spawn ~178 of
+/// them. Handing every task a second endpoint unconditionally would have taken `osdev test identity`
+/// from working to a boot panic - the table holds 96.
+pub fn try_register(id: EndpointId, core_id: u32, generation: Generation) -> bool {
+    let mut table = TABLE.lock_irq();
+    let slot = table.iter().position(|e| e.valid && e.id == id)
+        .or_else(|| table.iter().position(|e| !e.valid || e.liveness == EndpointLiveness::Dead));
+    match slot {
+        Some(idx) => {
+            let entry = &mut table[idx];
+            entry.valid            = true;
+            entry.id               = id;
+            entry.core_id          = core_id;
+            entry.generation       = generation;
+            entry.liveness         = EndpointLiveness::Alive;
+            entry.queue.reset();
+            entry.blocked_receiver = None;
+            entry.blocked_sender   = None;
+            entry.pending_send     = None;
+            true
+        }
+        None => false,
+    }
+}
+
 /// Return the number of endpoints currently alive in the routing table.
 ///
 /// Used by InspectKernel query 1 (P5 property test - §8.3).
