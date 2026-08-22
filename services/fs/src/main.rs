@@ -1037,7 +1037,6 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         f.blk_ops.set(0);
         f.blk_cycles.set(0);
     }
-    let t_start = ctx.epoch_secs_monotonic();
     let c_start = ctx.read_tsc();
     serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
 
@@ -1099,14 +1098,23 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
     // request that spent 7 seconds doing FOUR block operations has a slow device or a slow transport,
     // and one that spent 7 seconds doing four THOUSAND has an algorithm walking the disk. Those need
     // opposite fixes, and guessing between them has already cost this cycle several wrong turns.
-    let elapsed = ctx.epoch_secs_monotonic().saturating_sub(t_start);
-    if elapsed >= 1 {
+    //
+    // MEASURED IN CYCLES, NOT SECONDS - the seconds version of this line was lying. It compared
+    // `epoch_secs_monotonic` at each end, which has one-second resolution, so ANY request that
+    // happened to straddle a second boundary reported "took 1s" even if it took a microsecond. That
+    // made a fast request indistinguishable from a slow one at exactly the point the difference
+    // mattered: after a fix, when the question is whether the remaining "1s" lines are real. The
+    // multi-second readings were always sound (you cannot cross seventeen boundaries by accident) -
+    // it is the 1s ones that carried no information, and I read meaning into them anyway.
+    let all_c = ctx.read_tsc().saturating_sub(c_start).max(1);
+    let per_sec = ctx.duration_cycles(1_000).max(1);
+    let call_us = all_c.saturating_mul(1_000_000) / per_sec;
+    if call_us >= 200_000 {
         let ops = vol.as_ref().map_or(0, |f| f.blk_ops.get());
         let blk_c = vol.as_ref().map_or(0, |f| f.blk_cycles.get());
-        let all_c = ctx.read_tsc().saturating_sub(c_start).max(1);
         ctx.log_fmt(format_args!(
-            "fs: op {} took {}s, {} block ops, {}% of it inside them",
-            p.first().copied().unwrap_or(0), elapsed, ops,
+            "fs: op {} took {} us, {} block ops, {}% of it inside them",
+            p.first().copied().unwrap_or(0), call_us, ops,
             blk_c.saturating_mul(100) / all_c));
     }
 }

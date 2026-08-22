@@ -317,6 +317,29 @@ static CORE_TOTAL_TICKS: PerCore<CachePaddedU64> = PerCore::new();
 /// The kernel is the last-resort recovery anchor (§6.3); if IT stalls silently nothing recovers it, so
 /// it must at minimum fail LOUD. `0` = that core has not ticked yet (still booting) - not a stall.
 static CORE_LAST_TICK_TSC: PerCore<CachePaddedU64> = PerCore::new();
+/// A wake that arrived for a task which was RUNNABLE at the time, and so left no other trace.
+///
+/// The block-then-wake handshake detects a racing wake by CAS: `block_and_reschedule` moves the task
+/// Running -> Blocked, and a wake that got there first has already moved it Running -> Ready, so the
+/// CAS fails and the task does not block. That works only while the task stays Running, and a
+/// PREEMPTION erases it. Concretely, for a synchronous `Call` on one core:
+///
+///   1. `call_dequeue` finds no reply yet and registers the caller as the endpoint's blocked_receiver.
+///      The caller is still RUNNING - it has not reached `block_and_reschedule`.
+///   2. A timer interrupt preempts it: Running -> Ready. Its peer runs and replies. The enqueue TAKES
+///      the blocked_receiver registration and wakes the caller - which is already Ready, so the wake
+///      is a no-op and leaves no record.
+///   3. The caller is rescheduled, Ready -> Running, and resumes exactly where it left off: at
+///      `block_and_reschedule`. The CAS Running -> Blocked now SUCCEEDS, because the state it would
+///      have tripped over was consumed by the ordinary preemption in step 2.
+///
+/// It blocks with its reply already sitting in the queue and its registration already consumed, so
+/// nothing is left to wake it. This flag is the missing record: set on every wake regardless of the
+/// target's state, and consumed by `block_and_reschedule`, which then declines to block and lets the
+/// caller re-check. Same race exists for a plain `recv`, and the same flag covers it.
+static TASK_WAKE_PENDING: [core::sync::atomic::AtomicBool; MAX_TASKS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_TASKS];
+
 /// How many times this core has HALTED in the idle path.
 ///
 /// Diagnostic, and the one fact that separates the two remaining explanations for a slow `Call`. The
@@ -1761,6 +1784,10 @@ pub fn wake_by_slot(slot: usize, result: i64) {
             let first = TASK_STATE[slot].load(Ordering::Acquire);
             if first == TaskState::Dead as u8 { return; }
             TASK_WAKEUP_ERR[slot] = result;
+            // Record the wake BEFORE the state CAS below, and unconditionally - including when the
+            // target is already Ready, which is exactly the case the CAS cannot represent. See
+            // `TASK_WAKE_PENDING`.
+            TASK_WAKE_PENDING[slot].store(true, Ordering::Release);
 
             // CAS retry loop: transition any non-Dead state → Ready.
             //
@@ -2338,6 +2365,26 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         let slot = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         assert!(slot < MAX_TASKS && TASK_VALID[slot].load(Ordering::Acquire),
                 "block_and_reschedule: no running task");
+
+        // A wake already arrived - do not block on top of it. See `TASK_WAKE_PENDING` for the race
+        // this closes (a preemption between registering as blocked_receiver and blocking here
+        // consumes the registration and leaves the CAS below nothing to trip over).
+        //
+        // RECV ONLY, deliberately. A blocked SENDER is woken because the kernel DELIVERED its
+        // `pending_send` from the routing entry; declining to block would skip that delivery and
+        // silently drop the request, turning a latency bug into a lost message. A blocked receiver
+        // has no such side effect - its caller loops and re-checks the queue, which is precisely what
+        // it should do.
+        //
+        // Returns 0, never the stored wake result: a stale error from an earlier wake would abort a
+        // healthy call. Zero means "something changed, look again", and the re-check discovers the
+        // real terminal condition for itself - a dead peer still surfaces as ReplyDead there.
+        if state == TaskState::BlockedOnRecv
+            && TASK_WAKE_PENDING[slot].swap(false, Ordering::AcqRel)
+        {
+            crate::arch::imp::enable_interrupts();
+            return 0;
+        }
 
         // Atomically transition Running → Blocked.
         //
