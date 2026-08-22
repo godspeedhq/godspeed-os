@@ -640,6 +640,41 @@ pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
 
 const COM2: u16 = 0x2F8;
 
+/// Is there actually a UART at COM2 on this machine?
+///
+/// `false` until probed, and on a board with no second serial port it STAYS false - which is the
+/// whole point. An absent ISA port reads back 0xFF on every register, and the receive path checks the
+/// Line Status Register's Data Ready bit. All-ones means that bit is SET, so an absent port reports
+/// "a byte is waiting" forever, and hands out 0xFF forever.
+///
+/// That is not a cosmetic wart. `control` polls this port and only sleeps when it comes up empty, so
+/// on a machine with no COM2 it never sleeps: measured at 93-100% of core 1, which is the core `fs`
+/// and `block-driver` are placed on. The storage path was being starved by a service draining a port
+/// that does not exist. The user spotted it in `observe` before any test did.
+static COM2_PRESENT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Probe for a real UART at COM2 using its scratch register (the standard test, and the one Linux
+/// uses): write a byte, read it back. RAM that remembers is a UART; an absent port returns 0xFF
+/// whatever you wrote. Two different values, so a bus that happens to float to one of them cannot
+/// pass by luck. Restores the register afterwards.
+///
+/// This is a property of the device, borrowed as such (26.14) - the scratch register exists for
+/// exactly this, and nothing about how the answer is stored or reported is imported with it.
+fn com2_probe() -> bool {
+    // SAFETY: COM2 I/O ports; the scratch register (offset 7) is defined by the 16550 as general
+    // storage with no side effects, so writing and restoring it cannot disturb the port.
+    unsafe {
+        let saved = inb(COM2 + 7);
+        outb(COM2 + 7, 0xA5);
+        let a = inb(COM2 + 7);
+        outb(COM2 + 7, 0x5A);
+        let b = inb(COM2 + 7);
+        outb(COM2 + 7, saved);
+        a == 0xA5 && b == 0x5A
+    }
+}
+
 /// Initialise COM2 at 115200 baud, 8N1. Receive-only (no TX interrupts).
 ///
 /// Idempotent: re-initialising reinitialises the port to the same settings.
@@ -654,10 +689,24 @@ pub fn com2_init() {
         outb(COM2 + 2, 0xC7); // FIFO on, clear
         outb(COM2 + 4, 0x0B); // RTS + DTR
     }
+    // Probe AFTER configuring, and say which machine this is - invariant 12: the difference between
+    // "there is an operator channel" and "there is not" is a printed fact, never a silent assumption.
+    let present = com2_probe();
+    COM2_PRESENT.store(present, core::sync::atomic::Ordering::Relaxed);
+    if present {
+        crate::kprintln!("com2: UART present at {:#06x} - operator control channel available", COM2);
+    } else {
+        crate::kprintln!(
+            "com2: NO UART at {:#06x} - operator control channel unavailable (reads suppressed)",
+            COM2);
+    }
 }
 
 /// Read one byte from COM2 if the receive data register is non-empty.
 pub fn com2_try_read_byte() -> Option<u8> {
+    // No port, no bytes. Without this an absent UART's 0xFF Line Status Register reads as
+    // "data ready" on every call and feeds `control` an infinite stream of 0xFF - see `COM2_PRESENT`.
+    if !COM2_PRESENT.load(core::sync::atomic::Ordering::Relaxed) { return None; }
     // SAFETY: COM2 port reads; initialised before first use.
     unsafe {
         if inb(COM2 + 5) & 0x01 != 0 {

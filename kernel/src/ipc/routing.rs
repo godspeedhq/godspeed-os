@@ -155,7 +155,12 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
             entry.blocked_sender   = None;
             entry.pending_send     = None;
         }
-        None => panic!("routing: endpoint table full (MAX_ENDPOINTS={})", MAX_ENDPOINTS),
+        // BOOT-TIME CALLERS ONLY. Spawning a task goes through `try_register` and REFUSES the spawn
+        // when the table is full, because a chaos kill storm reaching this panic took the whole
+        // machine down - and nothing above the kernel may do that. What is left here is the boot
+        // path, where the table is empty by construction and a failure is fatal by §11.3 anyway. If
+        // a new runtime caller ever needs an endpoint, it uses `try_register` and handles `false`.
+        None => panic!("routing: endpoint table full at boot (MAX_ENDPOINTS={})", MAX_ENDPOINTS),
     }
 }
 

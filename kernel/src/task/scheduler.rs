@@ -133,6 +133,30 @@ fn bump_name_restart(name: &'static str) {
 }
 /// The recv endpoint owned by each task (None if the task has no endpoint). `AtomicU64` (0 = None;
 /// endpoint ids start at 100, so 0 is never a real recv endpoint) so the accessors stay unsafe-free.
+/// A task's SECOND endpoint - its reply mailbox - so death can reclaim it.
+///
+/// It leaked, and the leak PANICKED THE KERNEL. The reply endpoint is allocated at spawn, but only
+/// the primary was ever recorded, so `kill_task` reclaimed one of the two and the other stayed
+/// registered forever. Under a chaos storm - twelve supervisor respawns, each respawning the
+/// services beneath it - the 96-entry routing table filled and `register` panicked. Nothing above
+/// the kernel may take the kernel down, so a userspace kill storm must not be able to exhaust this
+/// table at all; that is what this array restores.
+static TASK_REPLY_ENDPOINT: [AtomicU64; MAX_TASKS] =
+    [const { AtomicU64::new(0) }; MAX_TASKS];
+
+/// Read and CLEAR a task's recorded reply endpoint, for a spawn that failed half-way and must give
+/// it back. Read-and-clear so the same endpoint cannot be reclaimed twice.
+pub fn take_task_reply_endpoint(slot: usize) -> Option<crate::ipc::EndpointId> {
+    if slot >= MAX_TASKS { return None; }
+    ep_from_u64(TASK_REPLY_ENDPOINT[slot].swap(0, Ordering::Relaxed))
+}
+
+/// Record a task's reply endpoint so `kill_task` can reclaim it. `None` clears it.
+pub fn set_task_reply_endpoint(slot: usize, endpoint: Option<crate::ipc::EndpointId>) {
+    if slot < MAX_TASKS {
+        TASK_REPLY_ENDPOINT[slot].store(ep_to_u64(endpoint), Ordering::Relaxed);
+    }
+}
 static TASK_ENDPOINT: [AtomicU64; MAX_TASKS] =
     [const { AtomicU64::new(0) }; MAX_TASKS];
 
@@ -2007,6 +2031,18 @@ pub fn kill_task_by_slot(slot: usize) {
         crate::arch::imp::release_console_foreground_if_owner(slot as u32);
 
         // Kill the task's endpoint if it has one.
+        // The reply mailbox dies with its task. Reclaiming only the primary is what filled the
+        // routing table and panicked the kernel - see `TASK_REPLY_ENDPOINT`.
+        let reply_ep = ep_from_u64(TASK_REPLY_ENDPOINT[slot].load(Ordering::Relaxed));
+        if let Some(rep_id) = reply_ep {
+            let (rx, tx) = crate::ipc::routing::kill_endpoint(rep_id);
+            if let Some(s) = rx { if s != slot { wake_by_slot(s, -7); } }
+            if let Some(s) = tx { if s != slot { wake_by_slot(s, -7); } }
+            crate::capability::table::mark_dead_resource(
+                crate::capability::cap::ResourceId::from(rep_id));
+            TASK_REPLY_ENDPOINT[slot].store(0, Ordering::Relaxed);
+        }
+
         if let Some(ep_id) = task_ep {
             // Bump generation in routing table and wake any blocked tasks.
             let (rx_slot, tx_slot) = crate::ipc::routing::kill_endpoint(ep_id);

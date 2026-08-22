@@ -3836,6 +3836,14 @@ const SPAWN_TRACE: bool = false;
 /// `own_endpoint` is `None` for a service with no recv endpoint (and at the pre-endpoint cap
 /// inserts), in which case only the task slot is released - identical to the prior behaviour.
 fn cleanup_partial_spawn(task_slot: usize, name: &str, own_endpoint: Option<EndpointId>) {
+    // A spawn that fails half-way must give back BOTH endpoints, for the same reason death must:
+    // a leaked endpoint is permanent, and enough of them fill the routing table and take the kernel
+    // down. Read-and-clear, so a later kill of this slot cannot reclaim the same one twice.
+    if let Some(rep) = crate::task::scheduler::take_task_reply_endpoint(task_slot) {
+        let _ = crate::ipc::routing::kill_endpoint(rep);
+        crate::capability::table::mark_dead_resource(
+            crate::capability::cap::ResourceId::from(rep));
+    }
     if let Some(ep_id) = own_endpoint {
         // Mark the routing entry Dead (recyclable) + drain its queue + bump generation.
         let _ = crate::ipc::routing::kill_endpoint(ep_id);
@@ -3953,6 +3961,10 @@ fn spawn_service_with_config(
     // 4. Optional recv endpoint.
     let mut recv_slot_u32 = u32::MAX;
     let mut self_grant_slot_u32 = u32::MAX;
+    // Carried to `commit_task` so the scheduler can reclaim it on death. Without this the reply
+    // endpoint outlives its task and the routing table fills - it panicked the kernel under a chaos
+    // kill storm. See `scheduler::TASK_REPLY_ENDPOINT`.
+    let mut reply_ep_for_slot: Option<crate::ipc::EndpointId> = None;
     let mut reply_recv_slot_u32 = u32::MAX;
     let mut reply_grant_slot_u32 = u32::MAX;
 
@@ -3974,7 +3986,18 @@ fn spawn_service_with_config(
         crate::capability::register_resource_at_gen(resource_id, start_gen);
 
         // Register in routing table at the same generation.
-        crate::ipc::routing::register(ep_id, core_id, start_gen);
+        // A FULL ROUTING TABLE FAILS THE SPAWN. It used to panic the kernel, which is the one thing
+        // nothing above the kernel is allowed to cause: a chaos kill storm exhausted the table and
+        // took the machine down with it. A service that cannot get a mailbox genuinely cannot serve,
+        // so the spawn is refused - but refusing a spawn is an ordinary, recoverable outcome the
+        // supervisor already handles by logging and carrying on, and the kernel stays up.
+        if !crate::ipc::routing::try_register(ep_id, core_id, start_gen) {
+            crate::kprintln!(
+                "task: '{}' spawn REFUSED - IPC routing table full, no mailbox available",
+                name);
+            cleanup_partial_spawn(task_slot, name, None);
+            return Err(SpawnError::NoMemory);
+        }
 
         // Publish name → endpoint mapping for peer cap resolution.
         crate::ipc::names::register(name, ep_id);
@@ -4020,6 +4043,10 @@ fn spawn_service_with_config(
         // Without it the task awaits replies on its shared endpoint, exactly as before this existed.
         let reply_routed = crate::ipc::routing::try_register(reply_ep_id, core_id, reply_gen);
         if reply_routed {
+        // Recorded HERE, not at commit: every fallible step after this point runs
+        // `cleanup_partial_spawn`, which can only give the endpoint back if it knows about it.
+        reply_ep_for_slot = Some(reply_ep_id);
+        scheduler::set_task_reply_endpoint(task_slot, reply_ep_for_slot);
         if let Ok(rr) = caps.insert(mint_cap(reply_res_id, Rights::RECV)) {
             reply_recv_slot_u32 = rr as u32;
             if let Ok(rg) = caps.insert(mint_cap(reply_res_id, Rights::SEND | Rights::GRANT)) {

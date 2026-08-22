@@ -167,7 +167,7 @@ fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
 fn drain_scan_hit(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8]) -> bool) -> bool {
     let t0 = ctx.epoch_secs_monotonic();
     loop {
-        if let Some(b) = nic_req(ctx, &Message::from_bytes(&[9u8]), LINK_SECS) {
+        if let Some(b) = nic_drain(ctx) {
             let p = b.payload_bytes();
             let n = if p.is_empty() { 0 } else { p[0] as usize };
             let mut pos = 1usize;
@@ -201,7 +201,7 @@ const RX_POLL_PACE_MS: u64 = 10;
 fn drain_scan(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8]) -> bool) {
     let t0 = ctx.epoch_secs_monotonic();
     loop {
-        if let Some(b) = nic_req(ctx, &Message::from_bytes(&[9u8]), LINK_SECS) {
+        if let Some(b) = nic_drain(ctx) {
             let p = b.payload_bytes();
             let n = if p.is_empty() { 0 } else { p[0] as usize };
             let mut pos = 1usize;
@@ -1121,7 +1121,7 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
     let deadline_cycles = if tsc_hz > 0 { (tsc_hz * 9) / 10 } else { 0 };   // ~900 ms
     let mut drains: u32 = 0;
     loop {
-        if let Some(b) = nic_req(ctx, &Message::from_bytes(&[9u8]), LINK_SECS) {
+        if let Some(b) = nic_drain(ctx) {
             let p = b.payload_bytes();
             let n = if p.is_empty() { 0 } else { p[0] as usize };
             let mut pos = 1usize;
@@ -1342,10 +1342,48 @@ fn link_notify(ctx: &ServiceContext, msg: &str) {
 ");
 }
 
+/// Ask `nic-driver` for waiting frames, and PACE AN EMPTY ANSWER.
+///
+/// Three drain loops asked for frames as fast as the replies came back - one IPC round trip per
+/// iteration, tens of thousands inside a ~900 ms ping window. That fills the driver's 16-deep queue
+/// and costs both services a large slice of the core they share with `fs` and `block-driver`.
+/// Observed on hardware as `nic-driver` at 50% with a full queue, which is what a flood looks like
+/// from the receiving end. The user saw it in `observe` before any test did.
+///
+/// Only the EMPTY case pauses. A drain that returned frames goes straight back for more, so a busy
+/// link is never slowed and a measured RTT is unaffected beyond the last idle millisecond. The
+/// request rate falls from tens of thousands per window to about nine hundred.
+///
+/// RECORDED AS A COMPROMISE, not presented as the answer (26.7, Commandment VIII): a frame arriving
+/// is truth and a millisecond is not. The honest fix is for `nic-driver` to notify on RX so this can
+/// BLOCK instead of ask, which needs a protocol addition and is real work rather than a constant.
+/// Living in one helper means that change lands in one place, and that a fourth drain loop cannot
+/// quietly reintroduce the flood.
+fn nic_drain(ctx: &ServiceContext) -> Option<Message> {
+    let r = nic_req(ctx, &Message::from_bytes(&[9u8]), LINK_SECS);
+    let empty = match r.as_ref() {
+        Some(m) => { let p = m.payload_bytes(); p.is_empty() || p[0] == 0 }
+        None    => true,
+    };
+    if empty { ctx.sleep_ms(1); }
+    r
+}
 fn link_is_up(ctx: &ServiceContext) -> bool {
     match nic_status_req(ctx, &Message::from_bytes(&[3u8]), LINK_SECS) {
         Some(r) => { let p = r.payload_bytes(); if p.len() > 7 { p[7] != 0 } else { !p.is_empty() } }
-        None    => false,
+        None    => {
+            // NOT the same as "the link is down", and saying so cost real time. A timeout means the
+            // NIC DRIVER did not answer; the cable may be perfectly well seated. Reporting that as
+            // "unplugged" is a silent fallback wearing a diagnosis (26.7) - it sends the reader to
+            // check a cable when the fault is that a service was starved of CPU, which is exactly
+            // what happened here: `control` was burning 93% of the core `nic-driver` shares.
+            //
+            // Still returns false, because unconfigured-and-responsive is the right POSTURE when the
+            // link cannot be confirmed either way. What changes is that the reason is now on the
+            // record instead of a guess presented as a fact.
+            ctx.log("net-stack: nic-driver did not answer the link query - treating as no link, but                      this is a TIMEOUT, not a reading (the cable may be fine)");
+            false
+        }
     }
 }
 
