@@ -625,7 +625,7 @@ static CHAOS_TESTS: &[TestSpec] = &[
         id: "C1", name: "degraded_smp_boot", spec_ref: "§22 Chaos C1",
         kind: TestKind::DegradedSmp {
             smp:          2,
-            expect:       &["kernel: 2 cores ready", "supervisor: ready"],
+            expect:       &["smp: 2 cores ready", "supervisor: ready"],
             fail_on:      &["KERNEL PANIC"],
             timeout_secs: 30,
         },
@@ -651,7 +651,7 @@ static CHAOS_TESTS: &[TestSpec] = &[
         kind: TestKind::DegradedEnv {
             smp:          4,
             ram_mib:      192,
-            expect:       &["kernel: 4 cores ready", "supervisor: ready"],
+            expect:       &["smp: 4 cores ready", "supervisor: ready"],
             fail_on:      &["KERNEL PANIC"],
             timeout_secs: 30,
         },
@@ -693,7 +693,7 @@ static BRUTAL_CHAOS_TESTS: &[TestSpec] = &[
         id: "BC1", name: "degraded_smp_1_core", spec_ref: "§22 Brutal Chaos BC1",
         kind: TestKind::DegradedSmp {
             smp:          1,
-            expect:       &["kernel: 1 cores ready", "supervisor: ready"],
+            expect:       &["smp: 1 cores ready", "supervisor: ready"],
             fail_on:      &["KERNEL PANIC"],
             timeout_secs: 30,
         },
@@ -719,7 +719,7 @@ static BRUTAL_CHAOS_TESTS: &[TestSpec] = &[
         kind: TestKind::DegradedEnv {
             smp:          4,
             ram_mib:      96,
-            expect:       &["kernel: 4 cores ready", "supervisor: ready"],
+            expect:       &["smp: 4 cores ready", "supervisor: ready"],
             fail_on:      &["KERNEL PANIC"],
             timeout_secs: 30,
         },
@@ -783,7 +783,7 @@ static BRUTAL_IDENTITY_TESTS: &[TestSpec] = &[
         id: "SMP-2", name: "smp_escalation_2_cores", spec_ref: "§22 Test 1A at smp=2",
         kind: TestKind::DegradedSmp {
             smp:          2,
-            expect:       &["kernel: 2 cores ready", "supervisor: ready"],
+            expect:       &["smp: 2 cores ready", "supervisor: ready"],
             fail_on:      &["KERNEL PANIC"],
             timeout_secs: 30,
         },
@@ -792,7 +792,7 @@ static BRUTAL_IDENTITY_TESTS: &[TestSpec] = &[
         id: "SMP-8", name: "smp_escalation_8_cores", spec_ref: "§22 Test 1A at smp=8",
         kind: TestKind::DegradedSmp {
             smp:          8,
-            expect:       &["kernel: 8 cores ready", "supervisor: ready"],
+            expect:       &["smp: 8 cores ready", "supervisor: ready"],
             fail_on:      &["KERNEL PANIC"],
             timeout_secs: 60,
         },
@@ -801,7 +801,7 @@ static BRUTAL_IDENTITY_TESTS: &[TestSpec] = &[
         id: "SMP-16", name: "smp_escalation_16_cores", spec_ref: "§22 Test 1A at smp=16",
         kind: TestKind::DegradedSmp {
             smp:          16,
-            expect:       &["kernel: 16 cores ready", "supervisor: ready"],
+            expect:       &["smp: 16 cores ready", "supervisor: ready"],
             fail_on:      &["KERNEL PANIC"],
             timeout_secs: 120,
         },
@@ -1231,7 +1231,7 @@ static TESTS: &[TestSpec] = &[
         id: "1A", name: "bootstrap_steady_state_positive", spec_ref: "§22 Test 1A",
         kind: TestKind::WatchSerial {
             expect: &[
-                "kernel: 4 cores ready",
+                "smp: 4 cores ready",
                 // (no "init: ready" - init is removed; the kernel spawns the supervisor directly, Phase 5)
                 "supervisor: ready",
                 "logger: ready",
