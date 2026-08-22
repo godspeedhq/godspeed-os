@@ -1697,12 +1697,10 @@ impl Fs {
                 if self.txn_lba[i] == lba { return Some(self.txn_blk[i]); }
             }
         }
-        self.blk_ops.set(self.blk_ops.get().saturating_add(1));
-        let t_blk = ctx.read_tsc();
+        let t_blk = self.blk_begin(ctx);
         let mut why = None;
         let read_out = block_read_kind(ctx, lba, &mut why);
-        self.blk_cycles.set(self.blk_cycles.get()
-            .saturating_add(ctx.read_tsc().saturating_sub(t_blk)));
+        self.blk_end(ctx, t_blk);
         match read_out {
             Some(b) => Some(b),
             None => {
@@ -1728,12 +1726,10 @@ impl Fs {
             self.txn_n += 1;
             true
         } else {
-            self.blk_ops.set(self.blk_ops.get().saturating_add(1));
-            let t_blk = ctx.read_tsc();
+            let t_blk = self.blk_begin(ctx);
             let mut why = None;
             let ok = block_write_kind(ctx, lba, data, &mut why);
-            self.blk_cycles.set(self.blk_cycles.get()
-                .saturating_add(ctx.read_tsc().saturating_sub(t_blk)));
+            self.blk_end(ctx, t_blk);
             if !ok {
                 match why {
                     Some(BlockFail::Transport) => self.transport_fail_seen.set(true),
@@ -1840,8 +1836,24 @@ impl Fs {
     /// guarantee it was never going to give. Before this existed there was no flush at all, so
     /// continuing is exactly the old behaviour - the difference is that it is now VISIBLE. What is
     /// not acceptable is the third option: proceeding while implying the ordering held (§26.7).
+    /// Open/close a metered disk trip. Every path that reaches `block_rpc` from this volume brackets
+    /// itself with these, so the count is of ALL trips rather than the metadata ones I happened to
+    /// instrument first - that partial count is what made a 19-second request look like 14 seconds of
+    /// `fs` compute, when the journal writes it does not see are the obvious other candidate.
+    fn blk_begin(&self, ctx: &ServiceContext) -> u64 {
+        self.blk_ops.set(self.blk_ops.get().saturating_add(1));
+        ctx.read_tsc()
+    }
+    fn blk_end(&self, ctx: &ServiceContext, t0: u64) {
+        self.blk_cycles.set(self.blk_cycles.get()
+            .saturating_add(ctx.read_tsc().saturating_sub(t0)));
+    }
+
     fn durable_or_warn(&self, ctx: &ServiceContext) -> bool {
-        if block_flush(ctx) { return true; }
+        let t_blk = self.blk_begin(ctx);
+        let flushed = block_flush(ctx);
+        self.blk_end(ctx, t_blk);
+        if flushed { return true; }
         if !self.flush_warned.get() {
             self.flush_warned.set(true);
             ctx.log("fs: durability NOT attested by this drive - it accepts no cache flush, so journal write ordering is unenforced and a power loss may leave metadata torn. Metadata stays CRC-checked, so damage is detected on read; what is missing is automatic repair. See CLAUDE.md 6.1 (2026-07-25).");
@@ -1885,7 +1897,10 @@ impl Fs {
         // 1. Stage the data blocks in the journal (journal_start+1 ..).
         for i in 0..n {
             let mut why = None;
-            if !block_write_kind(ctx, self.journal_start + 1 + i as u64, &self.txn_blk[i], &mut why) {
+            let t_blk = self.blk_begin(ctx);
+            let staged = block_write_kind(ctx, self.journal_start + 1 + i as u64, &self.txn_blk[i], &mut why);
+            self.blk_end(ctx, t_blk);
+            if !staged {
                 self.note_block_fail(why);
                 return Err("journal data write failed");
             }
@@ -1921,7 +1936,10 @@ impl Fs {
         let crc = crc32(&commit[..12 + n * 8]);
         commit[COMMIT_CRC_OFF..COMMIT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
         let mut why = None;
-        if !block_write_kind(ctx, self.journal_start, &commit, &mut why) {
+        let t_blk = self.blk_begin(ctx);
+        let committed = block_write_kind(ctx, self.journal_start, &commit, &mut why);
+        self.blk_end(ctx, t_blk);
+        if !committed {
             self.note_block_fail(why);
             return Err("journal commit write failed");
         }
@@ -1938,7 +1956,10 @@ impl Fs {
         // 3. Checkpoint: write each staged block to its home LBA.
         for i in 0..n {
             let mut why = None;
-            if !block_write_kind(ctx, self.txn_lba[i], &self.txn_blk[i], &mut why) {
+            let t_blk = self.blk_begin(ctx);
+            let homed = block_write_kind(ctx, self.txn_lba[i], &self.txn_blk[i], &mut why);
+            self.blk_end(ctx, t_blk);
+            if !homed {
                 // Commit is durable: the next mount will replay this transaction. Report, but
                 // the data is safe - no corruption, only a deferred checkpoint.
                 self.note_block_fail(why);
