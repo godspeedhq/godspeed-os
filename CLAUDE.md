@@ -321,6 +321,13 @@ os/
 > block moves - and ordering can only be enforced by a device that attests durability. Two cases, and
 > the difference is a printed fact rather than a hidden assumption (exactly the §6.4 posture):
 > - **A backend that attests durability** keeps the guarantee intact. `ahci` issues `FLUSH CACHE EXT`
+>   **when `fs` asks for it, at the journal barriers** (amended 2026-08-22: it used to flush after
+>   every 512-byte sector, which cost a transaction a stack of full device flushes and made a single
+>   file write take tens of seconds on a SATA SSD; the barriers `fs` already declares - staged blocks
+>   before the commit record, commit record before any home block - are what the guarantee rests on,
+>   and a per-sector flush added nothing to them). The consequence is stated plainly: unflushed FILE
+>   DATA can be lost on a power cut, while METADATA stays crash-consistent, which is exactly what this
+>   section claims and no more.
 >   after every write; SD/EMMC completes a write only after the card releases its busy line. Ordering
 >   holds, `fs` recovers to a consistent state on mount, and the Phase D TCB claim stands unchanged.
 > - **A backend that cannot** does not. The Pi 2's USB stick refuses `SYNCHRONIZE CACHE` outright, and

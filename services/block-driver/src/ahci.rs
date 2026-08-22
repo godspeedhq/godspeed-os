@@ -391,8 +391,23 @@ impl<'a> Ahci<'a> {
             self.arena.write32(DATA_OFF + i * 4, w);
         }
         self.issue_io(ctx, "write", ATA_WRITE_DMA_EXT, lba, 1, true, 512)?;
-        // Commit to the medium so writes survive a reboot (no-data command).
-        self.issue_io(ctx, "flush", ATA_FLUSH_EXT, 0, 0, false, 0)?;
+        // NO FLUSH HERE. Ordering is the CALLER's to declare, and `fs` already declares it.
+        //
+        // This issued a full FLUSH CACHE EXT after every 512-byte sector. A journal transaction is
+        // several writes - staged blocks, the commit record, the checkpoint, both superblock copies -
+        // so one `write /sc/a.txt hello` paid a stack of full device flushes. Measured on x86: writes
+        // 40-57 s against reads at 8.8 s, and reads issue no flush. The Pi never showed it because its
+        // USB stick refuses SYNCHRONIZE CACHE outright (§6.1) - there was no per-write flush to be slow.
+        //
+        // The flushes that MATTER are still issued, explicitly, by the layer that knows where the
+        // ordering points are: `fs` flushes at BARRIER 1 (staged blocks durable before the commit
+        // record that authorises replaying them) and BARRIER 2 (commit record durable before any home
+        // block is overwritten), and `format` flushes before it returns. Those two barriers ARE the
+        // atomicity §6.1 claims; a flush after every sector adds nothing to them.
+        //
+        // What changes: a data-block write not followed by a barrier may sit in the drive cache, so a
+        // power cut can lose the tail of freshly written FILE DATA. Metadata stays crash-consistent,
+        // which is exactly what §6.1 claims and no more. OP_FLUSH still issues a real flush.
         Ok(())
     }
 
@@ -416,7 +431,8 @@ impl<'a> Ahci<'a> {
             lba += n;
             left -= n;
         }
-        self.issue_io(ctx, "flush", ATA_FLUSH_EXT, 0, 0, false, 0)?;
+        // No flush, for the reason in `write_block`: the caller declares its barriers, and the one
+        // caller of this - `format` - flushes explicitly before it returns.
         Ok(())
     }
 
@@ -434,9 +450,15 @@ impl<'a> Ahci<'a> {
         if p[0] == OP_FLUSH {
             // Issue the flush and report what the DRIVE said. An earlier version of this branch
             // replied OK unconditionally, with a comment claiming FLUSH CACHE was "not implemented
-            // here" - which was wrong about this very file: `write_block` and `write_zeros` already
-            // issue ATA_FLUSH_EXT (0xEA) after every write, so this backend attests durability
-            // per-write, which is strictly stronger than on demand. Replying OK for a command never
+            // here" - which was wrong about this very file. It IS implemented, right below.
+            //
+            // `write_block` and `write_zeros` used to flush after every write, and this comment used
+            // to cite that as "durability per-write, strictly stronger than on demand". They no
+            // longer do: a flush per 512-byte sector cost a journal transaction a stack of full
+            // device flushes and made every file write on x86 take tens of seconds. Ordering is
+            // declared by `fs` at its journal barriers, and THIS branch is how it declares it - so
+            // this command is now the only flush the drive ever sees, and answering it honestly
+            // matters more than it did before. Replying OK for a command never
             // sent was an ASSERTED guarantee rather than an earned one, and that is the silent
             // fallback §26.7 forbids - the caller cannot tell a flush that happened from one that
             // did not. It costs three lines to answer honestly, so it answers honestly.
