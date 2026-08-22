@@ -714,6 +714,27 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
 
     // Serve block read/write requests from `fs` over IPC (READ/WRITE DMA EXT).
     ctx.log("block-driver: AHCI serving block I/O");
+
+    // THIS DRIVER'S HALF OF A ROUND TRIP, so the other half can be attributed by subtraction.
+    //
+    // `fs` measures a whole block round trip and sees about a second per trip on this machine, for a
+    // single 512-byte read. That second is either spent HERE - the AHCI command, this driver's own
+    // work - or in the kernel and scheduler getting the request here and the reply back. Those are
+    // different bugs with opposite fixes, and no amount of reading the code has settled which it is:
+    // both sides block properly, both wake paths are intact, and both services sit on core 1.
+    //
+    // So measure the half that can be measured alone. Cycles from dequeuing a request to sending its
+    // reply covers everything this driver does, device included. If that is milliseconds while `fs`
+    // sees a second, this driver is innocent and the time is in the kernel path. If it IS the second,
+    // the device or the command loop is, and the search moves in here.
+    //
+    // BOUNDED and QUIET (§26.6, §26.7): the threshold is 5 ms, which no healthy SATA command
+    // approaches, so a healthy system prints nothing at all. Beyond that it prints the first few and
+    // then every 64th, because the point is to learn the magnitude, not to narrate every request -
+    // and a driver that logs per-request under load becomes its own bottleneck. The counter is loop
+    // state, owned here, not a module static (Invariant 9).
+    let slow_threshold = ctx.duration_cycles(5);
+    let mut slow_seen: u64 = 0;
     loop {
         let msg = ctx.recv();
         let reply = match ctx.take_pending_cap() {
@@ -726,7 +747,19 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
             Some((t, rest)) => (*t, rest),
             None => (0, &p[..0]),
         };
+        let op = body.first().copied().unwrap_or(0);
+        let t_serve = ctx.read_tsc();
         ahci.serve(ctx, body, crate::Reply { cap: reply, tag });
+        let spent = ctx.read_tsc().wrapping_sub(t_serve);
+        if slow_threshold > 0 && spent >= slow_threshold {
+            slow_seen += 1;
+            if slow_seen <= 3 || slow_seen % 64 == 0 {
+                ctx.log_fmt(format_args!(
+                    "block-driver: op {} spent {} us in the driver (slow #{})",
+                    op, spent.saturating_mul(1_000_000) / ctx.duration_cycles(1_000).max(1),
+                    slow_seen));
+            }
+        }
         ctx.remove_cap(reply);
     }
 }
