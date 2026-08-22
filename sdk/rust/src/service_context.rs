@@ -864,6 +864,40 @@ impl ServiceContext {
     /// Note that `_abortable` and `_qhint` below CANNOT simply follow: they interleave on purpose, to
     /// notice a `q` keypress while waiting. Making them dequeue only the reply would delete that. If
     /// they need this too, the answer is a bounded stash, not a substitution.
+    /// Offer a request to `target`, riding out a FULL peer queue instead of calling it a failure.
+    ///
+    /// A full queue and an unreachable peer are different things, and reporting them the same way is
+    /// what desynced the shell against `fs` on x86. The caller's answer to "send failed" is to
+    /// reacquire the peer by name and RE-SEND with a fresh tag - correct when a restart made the cap
+    /// stale, and actively harmful when the queue was merely full: the original request is still in
+    /// flight, so its reply arrives as an orphan and every request afterwards collects the PREVIOUS
+    /// one's reply. The log showed exactly that, permanently one behind:
+    ///
+    ///     shell: discarded an fs reply for tag 68 while awaiting 69
+    ///     shell: discarded an fs reply for tag 72 while awaiting 73
+    ///
+    /// Congestion clears as soon as the peer is scheduled, so the fix is to wait a moment and offer
+    /// the SAME request again - never a second one. Bounded, and a queue still full after that is
+    /// reported honestly to the caller.
+    fn offer_request(
+        &self, target: CapHandle, reply_cap: CapHandle, msg: &crate::ipc::Message,
+    ) -> Result<(), crate::ipc::IpcError> {
+        const BUSY_MS: u64 = 2;
+        const BUSY_TRIES: u32 = 8;
+        let mut last = crate::ipc::IpcError::QueueFull;
+        for _ in 0..BUSY_TRIES {
+            match self.send_with_cap_by_handle(target, reply_cap, msg) {
+                Ok(()) => return Ok(()),
+                Err(crate::ipc::IpcError::QueueFull) => {
+                    last = crate::ipc::IpcError::QueueFull;
+                    self.sleep(self.duration_cycles(BUSY_MS));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
+    }
+
     pub fn request_with_reply_deadline(
         &self,
         peer: &str,
@@ -874,7 +908,7 @@ impl ServiceContext {
         let self_grant = self.self_grant_handle()?;
         let reply_cap = self.derive_cap(self_grant)?;
         let recv = self.recv_handle()?;
-        if self.send_with_cap_by_handle(target, reply_cap, msg).is_err() {
+        if self.offer_request(target, reply_cap, msg).is_err() {
             // The send never left, so the embedded cap was not transferred - reclaim it or a storm of
             // failures leaks the table (§8.5).
             self.remove_cap(reply_cap);
@@ -965,7 +999,7 @@ impl ServiceContext {
         let target = match self.find_send_slot(peer) { Some(s) => CapHandle(s), None => return ReqOutcome::Timeout };
         let self_grant = match self.self_grant_handle() { Some(g) => g, None => return ReqOutcome::Timeout };
         let reply_cap = match self.derive_cap(self_grant) { Some(c) => c, None => return ReqOutcome::Timeout };
-        if self.send_with_cap_by_handle(target, reply_cap, msg).is_err() {
+        if self.offer_request(target, reply_cap, msg).is_err() {
             self.remove_cap(reply_cap);
             return ReqOutcome::Timeout;
         }
@@ -1033,7 +1067,7 @@ impl ServiceContext {
         let target = match self.find_send_slot(peer) { Some(s) => CapHandle(s), None => return ReqOutcome::Timeout };
         let self_grant = match self.self_grant_handle() { Some(g) => g, None => return ReqOutcome::Timeout };
         let reply_cap = match self.derive_cap(self_grant) { Some(c) => c, None => return ReqOutcome::Timeout };
-        if self.send_with_cap_by_handle(target, reply_cap, msg).is_err() {
+        if self.offer_request(target, reply_cap, msg).is_err() {
             self.remove_cap(reply_cap);
             return ReqOutcome::Timeout;
         }
