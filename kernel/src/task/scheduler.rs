@@ -1135,6 +1135,8 @@ pub fn run(core_id: u32) -> ! {
                         }
                         let sched    = CORE_SCHED_CTX.as_mut_ptr(cid);
                         let next_ctx = TASK_CTX[next].assume_init_ref() as *const TaskContext;
+                        // Leaving idle: back to the 10 ms quantum before running real work.
+                        crate::arch::imp::boot::rearm_quantum_timer();
                         switch_context(sched, next_ctx);
                         // Execution returns here after the task is preempted and
                         // the scheduler loop is re-entered.
@@ -1555,6 +1557,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             TASK_CTX[next].assume_init_ref() as *const TaskContext
         };
 
+        if !abort_to_sched { leaving_idle_restore_quantum(prev); }
         switch_context(current_ctx, next_ctx);
     }
 }
@@ -1742,6 +1745,7 @@ pub fn yield_current() {
             TASK_CTX[next].assume_init_ref() as *const TaskContext
         };
 
+        if !abort_to_sched { leaving_idle_restore_quantum(prev); }
         switch_context(current_ctx, next_ctx);
         crate::arch::imp::enable_interrupts();
     }
@@ -1750,6 +1754,32 @@ pub fn yield_current() {
 /// Return the slot index of the currently-running task on this core.
 ///
 /// Returns `IDLE` (== MAX_TASKS) if the scheduler loop is active.
+/// Restore this core's preemption timer when it stops being idle.
+///
+/// THE IDLE TIMER LEAKED, and it made the whole machine run at 1 Hz. An idle core slows its tick to
+/// about a second to save power, and the idle loop restores the 10 ms quantum on the line AFTER its
+/// halt returns. But the halt does not always return: the timer interrupt can pick a runnable task
+/// and `switch_context` straight from the scheduler context INTO that task, so the idle loop is
+/// never resumed and the restore is never reached. The core then runs real work with a ONE SECOND
+/// preemption period.
+///
+/// Everything that followed is that one fact. A Ready task waits up to a second for its turn, so an
+/// `fs` write of 17 block round trips took 17 to 19 seconds; the serial log lands on integer-second
+/// boundaries because the whole machine advances on that tick; and it is WORSE WHEN THE MACHINE IS
+/// QUIET because the slow timer can only be armed by going idle in the first place. The instrumented
+/// `Call` reported `0 core halts` across a one-second wait, which is what finally placed it: the core
+/// was not asleep and had not lost a wake - it was awake, and simply not preempting.
+///
+/// So the restore belongs at every point the core leaves idle, not only on the path that happens to
+/// return to the idle loop. Idempotent and cheap (one LAPIC write), and a no-op on every arch whose
+/// `rearm_*` pair is a stub.
+#[inline]
+fn leaving_idle_restore_quantum(prev: usize) {
+    if prev >= MAX_TASKS {
+        crate::arch::imp::boot::rearm_quantum_timer();
+    }
+}
+
 pub fn current_task_slot() -> usize {
     let cid = current_core_id();
     CORE_CURRENT.get(cid).load(Ordering::Relaxed)
