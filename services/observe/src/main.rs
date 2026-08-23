@@ -34,6 +34,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Stack allocation - not global mutable state (§3.9).
     let mut prev_core_active = [0u64; MAX_CORES as usize];
     let mut prev_core_total  = [0u64; MAX_CORES as usize];
+    // Wall-clock baseline for the CPU percentages - see `print_state`.
+    let mut prev_tsc: u64 = 0;
     // Per-TASK run-tick baseline for per-task CPU% - each task's share of its core (not the core's
     // whole busy ratio), so a service sharing a core with a busy-poller (xhci/ehci) is not tarred 100%.
     let mut prev_task_ticks  = [0u64; MAX_SLOTS as usize];
@@ -45,7 +47,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // self-exit in v1; the shell kills any parked instance before the next
         // `observe now`, so at most one lingers. PARK (not yield) so the parked
         // instance does not peg its core until it is killed.
-        print_state(&ctx, &mut prev_core_active, &mut prev_core_total, &mut prev_task_ticks, false);
+        print_state(&ctx, &mut prev_core_active, &mut prev_core_total, &mut prev_task_ticks, &mut prev_tsc, false);
         ctx.park();
     }
 
@@ -54,7 +56,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // hide the cursor, suppress keystroke echo, repaint in place every
         // FRAME_CYCLES, and poll `q` to quit. On exit we restore the console and
         // park; the shell detects the park, cleans up, and reprints its prompt.
-        run_live(&ctx, &mut prev_core_active, &mut prev_core_total, &mut prev_task_ticks);
+        run_live(&ctx, &mut prev_core_active, &mut prev_core_total, &mut prev_task_ticks, &mut prev_tsc);
         ctx.park();
     }
 
@@ -68,7 +70,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         tick += 1;
         if tick < YIELD_INTERVAL { continue; }
         tick = 0;
-        print_state(&ctx, &mut prev_core_active, &mut prev_core_total, &mut prev_task_ticks, false);
+        print_state(&ctx, &mut prev_core_active, &mut prev_core_total, &mut prev_task_ticks, &mut prev_tsc, false);
     }
 }
 
@@ -78,6 +80,7 @@ fn run_live(
     prev_core_active: &mut [u64; MAX_CORES as usize],
     prev_core_total:  &mut [u64; MAX_CORES as usize],
     prev_task_ticks:  &mut [u64; MAX_SLOTS as usize],
+    prev_tsc:         &mut u64,
 ) {
     // Take the screen: stop echoing keystrokes (we paint the display ourselves),
     // hide the underline cursor, and clear once.
@@ -86,7 +89,7 @@ fn run_live(
 
     // Home + paint the first frame immediately.
     ctx.console_write("\x1b[H");
-    print_state(ctx, prev_core_active, prev_core_total, prev_task_ticks, true);
+    print_state(ctx, prev_core_active, prev_core_total, prev_task_ticks, prev_tsc, true);
 
     // Pace repaints by the monotonic WALL CLOCK (~1 s), not a raw TSC-cycle delta. The cycle approach
     // assumed read_tsc() ran at ~2 GHz; on ARM read_tsc() is the generic timer (1 MHz on the Pi 2), so
@@ -105,7 +108,7 @@ fn run_live(
         if now != last {                // a monotonic second elapsed -> repaint
             last = now;
             ctx.console_write("\x1b[H");
-            print_state(ctx, prev_core_active, prev_core_total, prev_task_ticks, true);
+            print_state(ctx, prev_core_active, prev_core_total, prev_task_ticks, prev_tsc, true);
         }
     }
 }
@@ -115,6 +118,7 @@ fn print_state(
     prev_core_active: &mut [u64; MAX_CORES as usize],
     prev_core_total:  &mut [u64; MAX_CORES as usize],
     prev_task_ticks:  &mut [u64; MAX_SLOTS as usize],
+    prev_tsc:         &mut u64,
     live:             bool,
 ) {
     let num_cores = ctx.inspect_core_count().min(MAX_CORES);
@@ -124,13 +128,34 @@ fn print_state(
     // interval denominator that was captured before prev_core_total is updated.
     let mut core_pct         = [0u32; MAX_CORES as usize];
     let mut core_total_delta = [0u64; MAX_CORES as usize];
+    // CPU% IS A SHARE OF WALL CLOCK, MEASURED AGAINST A CLOCK.
+    //
+    // It used to divide by `CORE_TOTAL_TICKS`, which counts TIMER TICKS, not time - and the tick rate
+    // is not constant: an idle core's timer is deliberately slowed 20-100x to save power. So an idle
+    // core accumulated almost no ticks, and a task that ran for a handful of them read as 100% while
+    // its core was 98% idle. That is how `control` and `nic-driver` appeared to flip between 0% and
+    // 100% for no reason, and it sent a reader hunting a busy loop that was not there. An instrument
+    // that lies costs more than no instrument.
+    //
+    // The honest denominator is elapsed CYCLES between samples. The numerator stays in quanta - a
+    // running task is credited one tick per timer tick - so it converts with the calibrated quantum
+    // length. Residual error is sampling, not bias: a task that blocks early still gets the tick it
+    // was running for. The first sample has no baseline and reports 0 rather than a fabricated
+    // number.
+    let now_tsc      = ctx.read_tsc();
+    let elapsed_cyc  = if *prev_tsc == 0 { 0 } else { now_tsc.saturating_sub(*prev_tsc) };
+    *prev_tsc        = now_tsc;
+    let quantum_cyc  = ctx.tsc_ticks_per_10ms();
+    let pct = |ticks: u64| -> u32 {
+        if elapsed_cyc == 0 || quantum_cyc == 0 { return 0; }
+        ((ticks.saturating_mul(quantum_cyc).saturating_mul(100)) / elapsed_cyc).min(100) as u32
+    };
     for c in 0..num_cores as usize {
         let active = ctx.inspect_core_active_ticks(c as u32);
         let total  = ctx.inspect_core_total_ticks(c as u32);
         let da = active.saturating_sub(prev_core_active[c]);
-        let dt = total.saturating_sub(prev_core_total[c]);
-        core_total_delta[c] = dt;
-        core_pct[c] = if dt > 0 { ((da * 100) / dt) as u32 } else { 0 };
+        core_total_delta[c] = total.saturating_sub(prev_core_total[c]);
+        core_pct[c] = pct(da);
         prev_core_active[c] = active;
         prev_core_total[c]  = total;
     }
@@ -245,8 +270,9 @@ fn print_state(
         // boot (the right meaning for a one-shot snapshot).
         let task_delta = stat.run_ticks.saturating_sub(prev_task_ticks[slot as usize]);
         prev_task_ticks[slot as usize] = stat.run_ticks;
-        let cdt = core_total_delta[c];
-        let task_pct = if cdt > 0 { ((task_delta * 100) / cdt).min(100) as u32 } else { 0 };
+        // Same wall-clock basis as the per-core figure above, so the two can be compared.
+        let _ = core_total_delta[c];
+        let task_pct = pct(task_delta);
 
         // Show only the ACTIVE observer (the one rendering this frame, so Running) - a parked
         // `observe now` leftover (BlockRecv) or a dead one not yet reaped is just clutter. The active

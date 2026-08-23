@@ -153,6 +153,22 @@ fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
         });
     if out.is_none() {
         let per_ms = ctx.duration_cycles(1).max(1);
+        // A PEER THAT WAS DELIBERATELY KILLED IS NOT NEWS.
+        //
+        // This printed on every failure and produced 134 lines in one chaos run - and every one of
+        // them was `nic-driver` being killed on purpose, which is the system behaving correctly. Noise
+        // like that is not just untidy: it buries the failures that ARE news, which is the opposite of
+        // what a loud-failure rule is for (§26.7 asks for visible failure, not volume).
+        //
+        // So the two are separated. A dead or restarting peer is EXPECTED - §14.3 says a client sees
+        // this and reacquires - and is reported once per run with a running count, not per occurrence.
+        // Anything else is genuinely unexplained and still prints every time.
+        // EndpointDead / ReplyDead mean the peer died or restarted underneath this request. That is
+        // ordinary (§14.3: the client sees it, reacquires, retries), it is ALREADY reported by the
+        // supervisor's "nic-driver died, restarting" and by this caller's own aggregate, and saying
+        // it a third time per call is what produced 134 lines in a single chaos run. Silent here
+        // is not silent overall - it is the same fact, not repeated.
+        if matches!(why, -3 | -5) { return out; }
         ctx.log_fmt(format_args!(
             "net-stack: nic-driver gave NO ANSWER after {} ms (budget {} s) for op {} [why {}]",
             ctx.read_tsc().wrapping_sub(t0) / per_ms,
