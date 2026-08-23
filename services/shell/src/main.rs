@@ -4496,7 +4496,15 @@ fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
     // is harmless and consistent). rows==0 means geometry is unknown → just print it.
     let (rows, _cols) = ctx.console_dims();
     let rows = rows as usize;
-    if depth > 0 || rows == 0 || total <= rows {
+    // UNKNOWN GEOMETRY IS NOT "NO TERMINAL". A failed `console_dims` returns 0, and this treated that
+    // as a reason to dump sixty lines past the top of the screen - the pager silently disappearing
+    // because a lookup missed. `edit` handles the same zero by assuming 24 rows and carrying on; this
+    // now does the same, so a future failure degrades instead of removing a feature.
+    //
+    // `depth > 0` stays a real reason to skip: nested help is being rendered into someone else's
+    // output (a pipe, `help | write`), where a pager would be wrong rather than merely unhelpful.
+    let rows = if rows == 0 { 24 } else { rows };
+    if depth > 0 || total <= rows {
         for i in 0..total { help_render_line(ctx, i, false); }
         return Ok(());
     }

@@ -1631,8 +1631,24 @@ impl ServiceContext {
     pub fn console_dims(&self) -> (u16, u16) {
         let mut buf = [0u8; 8];
         // Opcode 1 = REQ_DIMS (`services/console/src/main.rs`). The reply is rows then cols, u16 LE.
-        match self.request_with_reply_deadline_into("console", &[1u8], &mut buf, 2) {
-            Some(n) if n >= 4 => (
+        // ACQUIRE THE PEER BY NAME IF WE WERE NEVER WIRED TO IT.
+        //
+        // The shell's contract declares `console` as a send peer, but the supervisor cannot wire it:
+        // the shell is spawned BEFORE the console service exists, so there is nothing to hand it. The
+        // kernel name directory is exactly the answer to that (§14.3 - reacquire by name), and
+        // `time_rpc` in the shell already does this. This did not, so `find_send_slot` missed, the
+        // request returned None, and the caller read (0, 0).
+        //
+        // Zero rows is not a small error here: `cmd_help` takes it to mean "no terminal" and prints
+        // its whole table instead of paging it. A feature disappeared because a lookup missed, which
+        // is the quiet kind of failure §26.7 is about - nothing was reported, it simply stopped
+        // behaving.
+        let mut n = self.request_with_reply_deadline_into("console", &[1u8], &mut buf, 2);
+        if n.is_none() && self.reacquire_by_name("console") {
+            n = self.request_with_reply_deadline_into("console", &[1u8], &mut buf, 2);
+        }
+        match n {
+            Some(k) if k >= 4 => (
                 u16::from_le_bytes([buf[0], buf[1]]),
                 u16::from_le_bytes([buf[2], buf[3]]),
             ),
