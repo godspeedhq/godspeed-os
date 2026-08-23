@@ -155,14 +155,31 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // question: if most of the elapsed second is in here, the paint is the
                         // bottleneck; if little of it is, the cost is upstream (per-message IPC,
                         // scheduling) and making the paint cheaper would buy nothing.
-                        let elapsed = ctx.read_tsc().wrapping_sub(window_start).max(1);
-                        ctx.log_fmt(format_args!(
-                            "console: rendered {} messages, {} bytes, painting {}%, busy {}% of elapsed",
-                            rendered,
-                            bytes,
-                            paint_cycles.saturating_mul(100) / elapsed,
-                            busy_cycles.saturating_mul(100) / elapsed
-                        ));
+                        // AN INSTRUMENT THAT CANNOT MEASURE MUST SAY SO (invariant 12). `read_tsc`
+                        // is a syscall that returns 0 on failure, so a dead clock makes every delta
+                        // 0 and prints a confident "0%" that is indistinguishable from a genuinely
+                        // idle console. This reported 0% while the kernel's own counters showed the
+                        // same core busy, and a silent zero is what made that ambiguous. Report the
+                        // raw cycles too, and refuse to dress a dead clock up as a measurement.
+                        let now = ctx.read_tsc();
+                        let elapsed = now.wrapping_sub(window_start);
+                        if now == 0 || elapsed == 0 {
+                            ctx.log_fmt(format_args!(
+                                "console: rendered {} messages, {} bytes, CLOCK UNAVAILABLE (read_tsc {}) - no timing",
+                                rendered, bytes, now
+                            ));
+                        } else {
+                            ctx.log_fmt(format_args!(
+                                "console: rendered {} messages, {} bytes, painting {}% busy {}% of elapsed ({} paint, {} busy, {} elapsed cycles)",
+                                rendered,
+                                bytes,
+                                paint_cycles.saturating_mul(100) / elapsed,
+                                busy_cycles.saturating_mul(100) / elapsed,
+                                paint_cycles,
+                                busy_cycles,
+                                elapsed
+                            ));
+                        }
                         paint_cycles = 0;
                         busy_cycles = 0;
                         window_start = ctx.read_tsc();
