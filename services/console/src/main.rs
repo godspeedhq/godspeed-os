@@ -90,6 +90,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     let mut rendered: u64 = 0;
     let mut bytes: u64 = 0;
+
+    // CUMULATIVE, so declared HERE - outside the loop - beside the counters that were already
+    // correct. The previous cut declared these INSIDE the loop, next to `slow_paints`, whose own
+    // comment calls it "owned loop state": per-pass storage. Cumulative counters kept in per-pass
+    // storage are re-zeroed on every pass, so the report could only ever print 0 paint, 0 busy, and
+    // `window_start` timed the current pass rather than the window. That zero was read as evidence
+    // the console did no work. It was evidence of nothing.
+    //
+    // Raw CYCLES, converted once at the report; percentages of the elapsed window, so no TSC scale
+    // factor is needed and a miscalibrated clock cannot distort the answer.
+    let mut paint_cycles: u64 = 0;
+    let mut busy_cycles: u64 = 0;
+    let mut passes: u64 = 0;
+    let mut window_start = ctx.read_tsc();
     loop {
         // TAKE THE WHOLE QUEUE, THEN PAINT ONCE.
         //
@@ -124,11 +138,34 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Counting messages instead of trusting the queue to run dry bounds the work per pass, paints
         // at least once every DRAIN_BOUND messages, and returns to a blocking recv so the core goes to
         // whoever is waiting for it. A producer
-    // Messages drained per pass before painting and returning to a blocking `recv`. The endpoint
-    // queue is 16 deep (§8.5), so one pass can still absorb a full backlog in a single paint - which
-    // is the batching this loop exists for - without the drain becoming unbounded when the producer
-    // refills as fast as it is emptied.
+    // PAINT CADENCE. A pass drains for at most this long before painting and returning to a blocking
+    // `recv`. 16 ms is about one frame; a display that repaints that often reads as smooth.
+    //
+    // A DURATION, not a count, and the difference is the whole fix. Painting is the dominant cost
+    // here - a scroll repaints the screen, measured at roughly two thirds of this service's work -
+    // so the only way bulk output is ever cheap is to collapse many scrolls into ONE repaint. That
+    // is what draining the backlog buys. Bounding the drain by a message COUNT destroyed exactly
+    // that: a full repaint every 16 lines, which on hardware was five times slower overall and
+    // rendered line-at-a-time. Leaving it unbounded was the opposite failure - it batched perfectly
+    // and never reached the paint at all, so sustained output froze the screen.
+    //
+    // A deadline gets both: batch everything that has arrived, however much that is, but never defer
+    // the repaint past a frame. Bounded (§26.6) by the clock rather than by a tally, because a count
+    // is not a duration - it means a different amount of time on every machine.
+    const PAINT_DEADLINE_MS: u64 = 16;
+    // Fallback for an uncalibrated clock: `tsc_ticks_per_10ms` reports 0, and a deadline derived
+    // from it would be meaningless. Bound by count then, and say so rather than silently painting
+    // per line.
     const DRAIN_BOUND: usize = 16;
+    let paint_deadline: u64 = {
+        let per_10ms = ctx.tsc_ticks_per_10ms();
+        if per_10ms == 0 {
+            ctx.log("console: TSC uncalibrated - paint cadence bounded by message count, not time");
+            0
+        } else {
+            per_10ms.saturating_mul(PAINT_DEADLINE_MS) / 10
+        }
+    };
 
     // Paints that exceeded the report threshold. Owned loop state, not a static (Invariant 9).
     let mut slow_paints: u32 = 0;
@@ -143,9 +180,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Reported as a PERCENTAGE of the elapsed window, which is the honest form here. A ratio of two
     // cycle counts needs no scale factor, so it survives a TSC whose calibration is wrong - and this
     // family of machine has exactly that problem. An absolute millisecond figure would not.
-    let mut paint_cycles: u64 = 0;
-    let mut busy_cycles: u64 = 0;
-    let mut window_start = ctx.read_tsc();
         // that keeps writing cannot hold this loop here.
         // BUSY vs BLOCKED. Painting measured 0 ms while 500 messages still took seconds, so the cost
         // is either upstream of this service or in the terminal state machine - and `flush()` timing
@@ -195,24 +229,31 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             ));
                         } else {
                             ctx.log_fmt(format_args!(
-                                "console: rendered {} messages, {} bytes, painting {}% busy {}% of elapsed ({} paint, {} busy, {} elapsed cycles)",
+                                "console: rendered {} messages, {} bytes, painting {}% busy {}% of elapsed ({} paint, {} busy, {} elapsed cycles, {} passes)",
                                 rendered,
                                 bytes,
                                 paint_cycles.saturating_mul(100) / elapsed,
                                 busy_cycles.saturating_mul(100) / elapsed,
                                 paint_cycles,
                                 busy_cycles,
-                                elapsed
+                                elapsed,
+                                passes
                             ));
                         }
                         paint_cycles = 0;
                         busy_cycles = 0;
+                        passes = 0;
                         window_start = ctx.read_tsc();
                     }
                 }
             }
             drained += 1;
-            if drained >= DRAIN_BOUND {
+            // Deadline first; the count is only the uncalibrated-clock fallback.
+            if paint_deadline != 0 {
+                if ctx.read_tsc().wrapping_sub(t_busy0) >= paint_deadline {
+                    break;
+                }
+            } else if drained >= DRAIN_BOUND {
                 break;
             }
             match ctx.try_recv() {
@@ -234,6 +275,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         term.flush();
         paint_cycles = paint_cycles.saturating_add(ctx.read_tsc().wrapping_sub(t0));
         busy_cycles = busy_cycles.saturating_add(ctx.read_tsc().wrapping_sub(t_busy0));
+        passes += 1;
         // ACCUMULATE, do not threshold. The first cut of this only reported a paint over 20 ms and so
         // printed NOTHING - while 500 messages still took 8.1 seconds to render. A per-paint peak was
         // the wrong question: at ~62 tiny messages a second, paints just UNDER the threshold can still
