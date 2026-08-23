@@ -451,7 +451,17 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         // bases, and each RX descriptor's OWN/len (are frames waiting, or is the ring armed?). Chip-tagged
         // (byte 0 = 0 realtek). No TX, no RX poll - just reads.
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 5 } {
-            let mut s = [0u8; 43];
+            // SIZED FROM THE RING, not hard-coded. This was `[0u8; 43]` - exactly 27 + 4*4, matching
+            // the OLD four-descriptor ring - and the loop below writes four bytes per descriptor. When
+            // RX_RING_COUNT went to 8 (to make RDLEN a legal length) this ran off the end and PANICKED
+            // the driver on `net stats`: "range end index 47 out of range for slice of length 43".
+            // A coupled constant I changed one half of.
+            //
+            // The supervisor restarted the driver and the machine carried on, which is the system
+            // behaving correctly - but `net stats` was dead until now. Deriving the size means the two
+            // cannot disagree again.
+            const STAT_FIXED: usize = 27;                       // header fields, before the ring dump
+            let mut s = [0u8; STAT_FIXED + RX_RING_COUNT * 4];
             s[0] = 0;                                     // chip: realtek
             s[1] = mmio.read8(RTL_CR);
             s[2] = mmio.read8(RTL_9346CR);
@@ -466,7 +476,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             s[23..27].copy_from_slice(&mmio.read32(RTL_RDSAR).to_le_bytes());
             for i in 0..RX_RING_COUNT {
                 let opts1 = arena.read32(RX_RING_OFF + i * 16);
-                let o = 27 + i * 4;
+                let o = STAT_FIXED + i * 4;
                 s[o..o + 4].copy_from_slice(&opts1.to_le_bytes());
             }
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s)), &ctx, &mut reply_fails);
@@ -564,9 +574,11 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         last_tx_done = tx_done;
         tx_count = tx_count.saturating_add(1);
 
-        // Empty, not a status byte: callers already guard on `is_empty()` for "no frame", so this needs
-        // no consumer change and cannot be miscounted as a received frame.
-        note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[])), &ctx, &mut reply_fails);
+        // ONE BYTE, NOT EMPTY - a zero-length message cannot be delivered at all. The kernel rejects
+        // the send (`validate_user_ptr` fails on `len == 0`), so the caller waits out its full
+        // deadline for a reply that never left. Same defect and same fix as the transmit reply
+        // further down; no caller of a transmit reads its payload.
+        note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), &ctx, &mut reply_fails);
         ctx.remove_cap(reply_cap);
     }
 }
@@ -584,7 +596,10 @@ fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
         if p.len() == 1 && p[0] == 3 {
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(sreply)), &ctx, &mut reply_fails);
         } else {
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[])), &ctx, &mut reply_fails);
+            // Unrecognised op: still ANSWER. An empty reply is undeliverable (the kernel refuses a
+            // zero-length send), so this used to leave the caller waiting out its deadline for a
+            // request the driver had already decided it would not serve. One byte says so.
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[1u8])), &ctx, &mut reply_fails);
         }
         ctx.remove_cap(reply_cap);
     }
@@ -835,10 +850,24 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
                     ctx.log_fmt(format_args!("nic-driver: usb-net TX FAILED x{} (frame not sent)", tx_fail));
                 }
             }
-            // EMPTY, not a status byte: every caller already guards on `is_empty()` for "no frame", so an
-            // empty reply needs no consumer to change and cannot be miscounted as a frame - `udp_roundtrip`
-            // increments its frame counter on any non-empty reply and would have counted a status byte.
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[])), &ctx, &mut reply_fails);
+            // A ONE-BYTE ANSWER, BECAUSE AN EMPTY MESSAGE CANNOT BE DELIVERED AT ALL.
+            //
+            // The kernel rejects a zero-length send outright - `validate_user_ptr` returns false for
+            // `len == 0`, so `build_message` fails and the reply never leaves. The caller then waits
+            // out its whole deadline for an answer that was never on the wire. Measured on hardware:
+            // every ping cost `nic-driver gave NO ANSWER after 2012 ms (budget 1 s) for op 0 [why -1]`
+            // - two attempts timing out - while the ICMP round trip itself took 66 ms. The ping was
+            // not slow; this acknowledgement was undeliverable.
+            //
+            // The comment that used to be here argued an empty reply was SAFER, because a caller
+            // might miscount a status byte as a received frame. That was true of the OLD coupled
+            // behaviour, where this reply carried a frame. It does not carry one any more (see the
+            // TRANSMIT ONLY note above), and every transmit call site now tests only `is_none()` /
+            // `is_some()` - none reads the payload. The comment outlived the code it described.
+            //
+            // 0 = sent. `fs` reached the same conclusion for its own protocol and wrote it down
+            // there: an empty reply is not an answer. It is not even a message.
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), &ctx, &mut reply_fails);
         }
         ctx.remove_cap(reply_cap);
     }

@@ -5328,7 +5328,11 @@ fn net_stats_dump(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError>
         out.line_fmt(ctx, format_args!("  TNPDS.lo  0x{:08x}   TX ring base", tnpds));
         out.line_fmt(ctx, format_args!("  RDSAR.lo  0x{:08x}   RX ring base", rdsar));
         out.line_fmt(ctx, format_args!("  RX ring (rx_idx={}):", rx_idx));
-        for i in 0..4 {
+        // HOW MANY DESCRIPTORS THE DRIVER ACTUALLY SENT, not four. The reply carries one 4-byte word
+        // per RX descriptor after a 27-byte header, and the ring grew from 4 to 8 - so a fixed four
+        // here would silently show half the ring, which is the quiet half of the same bug that
+        // panicked the driver on the sending side.
+        for i in 0..(p.len() - 27) / 4 {
             let o = 27 + i * 4;
             let d = u32::from_le_bytes([p[o], p[o+1], p[o+2], p[o+3]]);
             out.line_fmt(ctx, format_args!("    [{}] opts1=0x{:08x}  OWN={} len={}", i, d, (d>>31)&1, d & 0x3FFF));
