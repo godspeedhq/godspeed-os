@@ -19,7 +19,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message, DeadlineOutcome};
+use godspeed_sdk::{ServiceContext, Message};
 
 // Our MAC is LEARNED from the NIC, never hardcoded (audit U9 / Commandment III). The controller's
 // burned-in MAC is the one source of truth for our hardware identity; nic-driver reads it (RTL8168
@@ -116,38 +116,50 @@ fn nic_status_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Mess
     nic_req(ctx, msg, secs)
 }
 
-/// How long to pace before re-offering a frame to a FULL nic-driver queue, and how many times.
-///
-/// `nic-driver` and `net-stack` land on the SAME CORE on x86 (round-robin put both on core 1), so a
-/// burst - six DHCP REQUESTs back to back - fills the 16-deep queue faster than the driver is
-/// scheduled to drain it. That is congestion, not a broken peer, and it clears as soon as it runs.
-const NIC_BUSY_MS: u64 = 2;
-const NIC_BUSY_TRIES: u32 = 8;
+// (The NIC_BUSY_MS / NIC_BUSY_TRIES pacing that lived here is GONE. It existed because a burst of
+// DHCP REQUESTs filled nic-driver's 16-deep queue faster than the driver was scheduled to drain it,
+// and a full queue meant a DROPPED frame the caller had to re-offer. `nic_req` now goes through the
+// kernel's `CallDeadline`, which BLOCKS the send until the peer has room rather than dropping it, so
+// there is nothing left to pace: congestion is handled by the primitive instead of by a retry loop
+// that could give up and report a frame as refused.)
 
 fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
-    for _ in 0..NIC_BUSY_TRIES {
-        match ctx.request_with_reply_deadline_outcome("nic-driver", msg, secs) {
-            DeadlineOutcome::Reply(r) => return Some(r),
-            // Alive, just behind. Pace and offer the frame again. Reacquiring here was the bug: it
-            // hunted for a capability that was never stale, retried once, and reported "never left the
-            // host" on a link that was up the whole time - 34 seconds of DHCP backoff for congestion
-            // that clears in microseconds.
-            DeadlineOutcome::QueueFull => {
-                ctx.sleep(ctx.duration_cycles(NIC_BUSY_MS));
-                continue;
+    // MEASURE THE FAILURE, DO NOT LABEL IT. Two hypotheses about why this returns None have now been
+    // wrong - the driver spinning past the caller's budget, and replies crowded out of a shared queue
+    // - and the caller turns None into "the driver refused them", a claim the wire flatly
+    // contradicts (14 DISCOVERs sent, 14 OFFERs back, 7 REQUESTs sent, 7 ACKs back). The elapsed time
+    // separates what is left: about 0 ms means the SEND failed outright, about `secs` means the driver
+    // never answered. Bounded by the caller's own retry count (DANCE_TRIES), so this cannot flood.
+    let t0 = ctx.read_tsc();
+    let first = ctx.request_with_reply_call_err("nic-driver", msg, secs);
+    // Keep the REASON before unwrapping the value - `Message` is not Clone, so record it as a code.
+    let why: i32 = match &first {
+        Ok(Some(_)) => 0,
+        Ok(None)    => -1,                                            // the deadline passed
+        Err(godspeed_sdk::ipc::IpcError::QueueFull)       => -2,
+        Err(godspeed_sdk::ipc::IpcError::EndpointDead)    => -3,
+        Err(godspeed_sdk::ipc::IpcError::MessageTooLarge) => -4,
+        Err(godspeed_sdk::ipc::IpcError::ReplyDead)       => -5,
+        Err(_)                                            => -6,      // CapError
+    };
+    let out = first.ok().flatten()
+        .or_else(|| {
+            // One reacquire-and-retry, for a driver that restarted underneath us (§14.3).
+            if ctx.reacquire_by_name("nic-driver") {
+                ctx.request_with_reply_call("nic-driver", msg, secs)
+            } else {
+                None
             }
-            // Genuinely unreachable - the cap went stale when the driver restarted. Reacquire (§14.3).
-            DeadlineOutcome::SendFailed if ctx.reacquire_by_name("nic-driver") =>
-                return ctx.request_with_reply_deadline("nic-driver", msg, secs),
-            // A real timeout (the driver had it, the host was silent), or a reacquire that resolved
-            // nothing. Fail without retrying - retrying a silent host only doubles the wait.
-            _ => return None,
-        }
+        });
+    if out.is_none() {
+        let per_ms = ctx.duration_cycles(1).max(1);
+        ctx.log_fmt(format_args!(
+            "net-stack: nic-driver gave NO ANSWER after {} ms (budget {} s) for op {} [why {}]",
+            ctx.read_tsc().wrapping_sub(t0) / per_ms,
+            secs,
+            msg.payload_bytes().first().copied().unwrap_or(0), why));
     }
-    // Bounded, and loud: a queue full for 8 tries is congestion we cannot ride out, and the caller
-    // must hear it rather than infer it from a vanished frame (§26.7).
-    ctx.log("net-stack: nic-driver queue stayed full - frame dropped after pacing");
-    None
+    out
 }
 
 /// Phase 3: a DHCP DISCOVER over UDP - ask QEMU slirp's built-in DHCP server for our IP and read the
@@ -300,44 +312,51 @@ fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8
     for _ in 0..DANCE_TRIES {
         // A REQUEST that never left is not a server that did not ACK - see `dhcp_discover`.
         if nic_req(ctx, &req, LINK_SECS).is_none() { send_fail += 1; }
+        // SAY WHY A REPLY WAS REJECTED. The server ACKs - the wire capture shows seven - and this scan
+        // finds none, so one of the field tests is refusing a frame that really is there. Counting
+        // what arrives and reporting the first BOOTREPLY's type and yiaddr names the wrong test
+        // instead of inviting a fifth guess at it. Owned locals captured by the closure, no statics.
+        let mut seen = 0u32;
+        let mut replies = 0u32;
+        let mut first_reply: Option<(u8, [u8; 4])> = None;
         let acked = drain_scan_hit(ctx, DANCE_SECS, serve_status, |f| {
+            seen += 1;
             // A BOOTREPLY carrying option 53 = 5 (DHCPACK) for the address we asked for. A NAK (6) is
             // a definite refusal and is treated as "not acknowledged" by simply not matching - the
             // caller re-DISCOVERs, which is what RFC 2131 asks of a NAKed client anyway.
-            if f.len() >= 62 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45 && f[23] == 17
-                && f[42] == 2 && f[58] == ip[0] && f[59] == ip[1] && f[60] == ip[2] && f[61] == ip[3]
-            {
-                // Walk the options, then decide OUTSIDE the loop.
-                //
-                // Written first as "set the flag and return from inside the walk", which reads more
-                // directly and which the optimiser deleted outright: the ACK branch and its log never
-                // reached the binary at all, so on hardware neither the ACK line nor the failure line
-                // ever printed and the REQUEST looked as though it had not run. `dhcp_discover`
-                // twenty lines down does the same job with the flag set AFTER its walk and survives,
-                // so this matches the shape that is known to compile rather than the one that reads
-                // best. Verified by grepping the built ELF for this format string, which is now part
-                // of the build check for this file.
-                let mut is_ack = false;
-                let mut o = 282usize;
-                while o + 1 < f.len() {
-                    let opt = f[o];
-                    if opt == 255 { break; }
-                    if opt == 0 { o += 1; continue; }
-                    let len = f[o + 1] as usize;
-                    if opt == 53 && len >= 1 && o + 2 < f.len() && f[o + 2] == 5 { is_ack = true; }
-                    o += 2 + len;
-                }
-                if is_ack {
-                    return true;
-                }
+            let is_bootp_reply = f.len() >= 62 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45
+                && f[23] == 17 && f[42] == 2;
+            if !is_bootp_reply { return false; }
+            replies += 1;
+            let mut mtype = 0u8;
+            let mut o = 282usize;
+            while o + 1 < f.len() {
+                let opt = f[o];
+                if opt == 255 { break; }
+                if opt == 0 { o += 1; continue; }
+                let len = f[o + 1] as usize;
+                if opt == 53 && len >= 1 && o + 2 < f.len() { mtype = f[o + 2]; }
+                o += 2 + len;
             }
-            false
+            let yi = [f[58], f[59], f[60], f[61]];
+            if first_reply.is_none() { first_reply = Some((mtype, yi)); }
+            mtype == 5 && yi == *ip
         });
         if acked {
             ctx.log_fmt(format_args!(
                 "net-stack: DHCP - ACK, {}.{}.{}.{} is ours (server {}.{}.{}.{})",
                 ip[0], ip[1], ip[2], ip[3], srv[0], srv[1], srv[2], srv[3]));
             return true;
+        }
+        if !acked {
+            ctx.log_fmt(format_args!(
+                "net-stack: DHCP - no ACK matched: {} frames, {} BOOTP replies, first type {} \
+                 yiaddr {}.{}.{}.{} (wanted type 5, yiaddr {}.{}.{}.{})",
+                seen, replies,
+                first_reply.map_or(0, |(t, _)| t),
+                first_reply.map_or(0, |(_, y)| y[0]), first_reply.map_or(0, |(_, y)| y[1]),
+                first_reply.map_or(0, |(_, y)| y[2]), first_reply.map_or(0, |(_, y)| y[3]),
+                ip[0], ip[1], ip[2], ip[3]));
         }
     }
     if send_fail > 0 {

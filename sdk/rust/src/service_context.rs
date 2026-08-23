@@ -840,6 +840,64 @@ impl ServiceContext {
     ///
     /// It now uses `CallDeadline`, which dequeues the REPLY specifically (the kernel matches it to the
     /// reply cap) and leaves everything else queued. The correct primitive, bounded.
+    /// A bounded request/reply through the KERNEL's `CallDeadline`, returning the reply as a message.
+    ///
+    /// The same primitive `request_with_reply_deadline_into` already uses, in the shape the other
+    /// request helpers have, so a caller can move to it without restructuring its buffers.
+    ///
+    /// Use this rather than `request_with_reply_deadline*` when the caller SERVES clients on the same
+    /// endpoint it awaits replies on. Those helpers wait with a plain `recv`, which takes whatever is
+    /// next - so under client load the peer's reply can be crowded out of a 16-deep queue and the
+    /// caller reports a timeout that blames the peer for something it did correctly. `net-stack` hit
+    /// exactly that: the wire showed 7 DHCP REQUESTs sent and 7 ACKs returned while the log said
+    /// "6 of 6 REQUESTs never left the host - the driver refused them".
+    ///
+    /// `CallDeadline` does not have that failure: `call_dequeue` matches the reply BY ITS SENDER and
+    /// leaves every other message queued, which is the entire reason §8.2 added it - hand-rolling the
+    /// bounded wait out of send + recv is what lost messages. No new kernel surface: syscall 50 and
+    /// its semantics are existing, ratified law.
+    pub fn request_with_reply_call(&self, peer: &str, msg: &crate::ipc::Message, max_secs: i64)
+        -> Option<crate::ipc::Message>
+    {
+        self.request_with_reply_call_err(peer, msg, max_secs).ok().flatten()
+    }
+
+    /// `request_with_reply_call`, but saying WHY it failed instead of collapsing everything to None.
+    ///
+    /// Exists because "no answer" is not a diagnosis. A caller that turns every failure into one word
+    /// then reports it as the PEER's fault - `net-stack` blamed the driver for refusing frames the wire
+    /// showed it had sent - and there is no way to tell a send that never left from a reply that never
+    /// came. `Ok(None)` is the deadline passing; `Err(e)` is the send failing, and `e` says how.
+    pub fn request_with_reply_call_err(&self, peer: &str, msg: &crate::ipc::Message, max_secs: i64)
+        -> Result<Option<crate::ipc::Message>, crate::ipc::IpcError>
+    {
+        let target = match self.find_send_slot(peer) {
+            Some(s) => CapHandle(s),
+            None    => return Err(crate::ipc::IpcError::CapError(crate::capability::CapError::CapNotHeld)),
+        };
+        let (recv, grant) = match self.reply_mailbox() {
+            Some((r, g)) => (r, g),
+            None => match (self.recv_handle(), self.self_grant_handle()) {
+                (Some(r), Some(g)) => (r, g),
+                _ => return Err(crate::ipc::IpcError::CapError(crate::capability::CapError::CapNotHeld)),
+            },
+        };
+        let reply_cap = match self.derive_cap(grant) {
+            Some(c) => c,
+            None    => return Err(crate::ipc::IpcError::CapError(crate::capability::CapError::CapNotHeld)),
+        };
+        let secs = if max_secs <= 0 { 0 } else { max_secs as u64 };
+        let mut buf = [0u8; crate::ipc::MAX_PAYLOAD];
+        let n = msg.payload_bytes().len().min(buf.len());
+        buf[..n].copy_from_slice(&msg.payload_bytes()[..n]);
+        match crate::ipc::call_deadline_into(target, reply_cap, recv, &msg.payload_bytes()[..n],
+                                             &mut buf, secs) {
+            Ok(Some(len)) => Ok(Some(crate::ipc::Message::from_bytes(&buf[..len]))),
+            Ok(None)      => { self.remove_cap(reply_cap); Ok(None) }
+            Err(e)        => { self.remove_cap(reply_cap); Err(e) }
+        }
+    }
+
     pub fn request_with_reply_deadline_into(
         &self, peer: &str, req: &[u8], buf: &mut [u8], max_secs: i64,
     ) -> Option<usize> {

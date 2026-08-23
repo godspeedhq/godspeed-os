@@ -98,7 +98,18 @@ const RESET_POLL_MAX: u32 = 1_000_000;
 // 1_000_000-yield bound meant a NIC that FAILED to complete a transmit froze the whole ping for ~1s per
 // send. Bound it TIGHT so a stuck TX fails FAST and is recovered (§26.6 bounded, §26.7 loud), instead of
 // stalling the box. 30_000 is ~30x headroom over a us-scale success but ~ms, not seconds, on failure.
-const TX_POLL_MAX:    u32 = 30_000;
+/// How long to wait for the NIC to confirm a transmit, IN MILLISECONDS.
+///
+/// It used to be a count - 30,000 yields - and a count is not a duration: the same loop is a
+/// different wall-clock wait on every machine, and under QEMU it outlasted the caller's one-second
+/// budget entirely. The frame WAS on the wire; this driver was still spinning for the done bit when
+/// `net-stack` gave up, so a sent frame was reported as "never left the host - the driver refused
+/// them". The wire showed 7 DHCP REQUESTs and 7 ACKs while the log said all six were refused.
+///
+/// A real transmit completes in microseconds. 20 ms is far beyond that and far inside any caller's
+/// budget, so the answer arrives while it is still wanted. Commandment VIII: wait on the truth (the
+/// descriptor's done bit), bounded by a CLOCK.
+const TX_CONFIRM_MS:  u64 = 20;
 const RX_POLL_MAX:    u32 = 8_000;     // a reply arrives in ms (caught in the first hundreds of iterations).
                                        // A MISS must give up FAST: on the T630, 50k iterations took >2s -
                                        // LONGER than net-stack's per-request deadline, so every DNS request
@@ -501,8 +512,10 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         arena.write32(td, o1);
         mmio.write8(RTL_TPPOLL, RTL_TPPOLL_NPQ);
         let mut ts = 0u32;
-        while ts < TX_POLL_MAX && arena.read32(td) & RTL_DESC_OWN != 0 { ctx.yield_cpu(); ts += 1; }
-        let tx_done = ts < TX_POLL_MAX;
+        // Same clock bound as the e1000 path - see TX_CONFIRM_MS for why a yield COUNT was wrong.
+        let t_end = ctx.read_tsc().wrapping_add(ctx.duration_cycles(TX_CONFIRM_MS));
+        while arena.read32(td) & RTL_DESC_OWN != 0 && ctx.read_tsc() < t_end { ctx.yield_cpu(); ts += 1; }
+        let tx_done = arena.read32(td) & RTL_DESC_OWN == 0;
         if !tx_done {
             // With a single descriptor a ring desync is impossible, so a timeout here is a genuine NIC
             // hiccup, not a cascade. Fail FAST (the tight bound above), DIAGNOSE (first few, to confirm
@@ -898,6 +911,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         m.write32(REG_RDH, 0);
         m.write32(REG_RDT, (RX_RING_COUNT - 1) as u32);
 
+        // ENABLE THE RECEIVER ONCE, AND LEAVE IT ON.
+        //
+        // It used to be switched on at the top of every drain request and off again at the bottom, so
+        // the NIC was deaf except during the microseconds a client happened to be asking - and each
+        // drain first wiped every descriptor's status byte, destroying whatever HAD arrived meanwhile.
+        // The wire capture is unambiguous about the cost: 12 DHCP replies and 12 ARP frames came back
+        // from the server and `net-stack` scanned ZERO frames, so DHCP reported "no offer" and blamed
+        // the driver for refusing transmits that had in fact gone out.
+        //
+        // A NIC is not a device you switch on to ask it a question. The receiver runs, frames land in
+        // the ring, and software consumes them at its own pace - that is what the ring is FOR, and it
+        // is the silicon's design rather than a policy choice of ours (26.14). The Realtek path in
+        // this same file already did exactly this; only e1000 was left as the step-4 stub the module
+        // header still describes.
+        m.write32(REG_RCTL, RCTL_VALUE);
         ctx.log("nic-driver: serving the frame interface");
     } else {
         ctx.log("nic-driver: no Intel e1000 mapped (absent, or a different NIC) - serving empty replies");
@@ -907,6 +935,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // payload is a frame to transmit; we reply with the frame that came back (empty if none / no NIC).
     let mut rxbuf = [0u8; FRAME_MAX];
     let mut tx_idx = 0usize;
+    // Next RX descriptor to clean. Persists across requests because the RING does - see the drain.
+    let mut rx_idx = 0usize;
     // Counts replies that could not be delivered; see `note_reply`.
     let mut reply_fails = 0u32;
     loop {
@@ -934,22 +964,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 4 } {
             let mut n = 0usize;
             if let (Some(m), Some(a)) = (mmio.as_ref(), arena.as_ref()) {
-                for i in 0..RX_RING_COUNT { a.write8(RX_RING_OFF + i * 16 + 12, 0); }
-                m.write32(REG_RDH, 0);
-                m.write32(REG_RDT, (RX_RING_COUNT - 1) as u32);
-                m.write32(REG_RCTL, RCTL_VALUE);
-                let mut s = 0u32;
-                while s < RX_POLL_MAX {
-                    if a.read8(RX_RING_OFF + 12) & RXD_STA_DD != 0 {
-                        let len = a.read16(RX_RING_OFF + 8) as usize;
-                        n = len.min(FRAME_MAX);
-                        for i in 0..n { rxbuf[i] = a.read8(RX_BUF_OFF + i); }
-                        break;
-                    }
-                    ctx.yield_cpu();
-                    s += 1;
+                // Same ring discipline as the batch drain: take the next descriptor the NIC has
+                // finished with, hand it straight back, and leave the receiver alone.
+                let d = RX_RING_OFF + rx_idx * 16;
+                if a.read8(d + 12) & RXD_STA_DD != 0 {
+                    n = (a.read16(d + 8) as usize).min(FRAME_MAX);
+                    for i in 0..n { rxbuf[i] = a.read8(RX_BUF_OFF + rx_idx * RX_BUF_SIZE + i); }
+                    a.write8(d + 12, 0);
+                    a.write64(d, a.phys_at(RX_BUF_OFF + rx_idx * RX_BUF_SIZE));
+                    m.write32(REG_RDT, rx_idx as u32);
+                    rx_idx = (rx_idx + 1) % RX_RING_COUNT;
                 }
-                m.write32(REG_RCTL, 0);
             }
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])), &ctx, &mut reply_fails);
             ctx.remove_cap(reply_cap);
@@ -965,25 +990,31 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let mut opos = 1usize;   // out[0] = frame count
             let mut nfr = 0u8;
             if let (Some(m), Some(a)) = (mmio.as_ref(), arena.as_ref()) {
-                for i in 0..RX_RING_COUNT { a.write8(RX_RING_OFF + i * 16 + 12, 0); }
-                m.write32(REG_RDH, 0);
-                m.write32(REG_RDT, (RX_RING_COUNT - 1) as u32);
-                m.write32(REG_RCTL, RCTL_VALUE);
-                let mut s = 0u32;
-                while s < RX_POLL_MAX {
-                    if a.read8(RX_RING_OFF + 12) & RXD_STA_DD != 0 {
-                        let len = (a.read16(RX_RING_OFF + 8) as usize).min(FRAME_MAX);
-                        out[opos..opos + 2].copy_from_slice(&(len as u16).to_le_bytes());
-                        opos += 2;
-                        for i in 0..len { out[opos + i] = a.read8(RX_BUF_OFF + i); }
-                        opos += len;
-                        nfr = 1;
-                        break;
-                    }
-                    ctx.yield_cpu();
-                    s += 1;
+                // Consume every descriptor the NIC has finished with, from where the last drain left
+                // off, and hand each buffer straight back. The ring is shared state between the NIC
+                // and this driver; resetting it (as this used to) discards frames already landed.
+                //
+                // RETURNS WHAT IS THERE, IMMEDIATELY - it does not wait for the network. A driver that
+                // blocks until a frame arrives holds a core on someone else's schedule; the caller
+                // paces its own polling and carries its own budget.
+                while (nfr as usize) < BATCH_MAX {
+                    let d = RX_RING_OFF + rx_idx * 16;
+                    if a.read8(d + 12) & RXD_STA_DD == 0 { break; }   // NIC still owns it
+                    let len = (a.read16(d + 8) as usize).min(FRAME_MAX);
+                    if opos + 2 + len > out.len() { break; }          // reply full - stop cleanly
+                    out[opos..opos + 2].copy_from_slice(&(len as u16).to_le_bytes());
+                    opos += 2;
+                    for i in 0..len { out[opos + i] = a.read8(RX_BUF_OFF + rx_idx * RX_BUF_SIZE + i); }
+                    opos += len;
+                    nfr += 1;
+                    // Return the descriptor: clear status, restore its buffer address, then move the
+                    // tail onto it. RDT is the last descriptor the NIC may write, so advancing it to
+                    // the one just freed is what re-arms the ring.
+                    a.write8(d + 12, 0);
+                    a.write64(d, a.phys_at(RX_BUF_OFF + rx_idx * RX_BUF_SIZE));
+                    m.write32(REG_RDT, rx_idx as u32);
+                    rx_idx = (rx_idx + 1) % RX_RING_COUNT;
                 }
-                m.write32(REG_RCTL, 0);
             }
             out[0] = nfr;
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])), &ctx, &mut reply_fails);
@@ -1008,6 +1039,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             continue;
         }
 
+        // Whether the NIC confirmed the send within TX_CONFIRM_MS - reported in the reply below.
+        let mut tx_confirmed = false;
         if let (Some(m), Some(a)) = (mmio.as_ref(), arena.as_ref()) {
             let frame = req.payload_bytes();
             let flen = frame.len().min(FRAME_MAX);
@@ -1018,10 +1051,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // arrives with the receiver off is DROPPED (this is exactly why the ping's echo reply, on
             // the wire in the pcap, was never seen). Resetting head/tail per request keeps each RX
             // independent; RDH/RDT are written while the receiver is briefly off, which is safe.
-            for i in 0..RX_RING_COUNT { a.write8(RX_RING_OFF + i * 16 + 12, 0); } // clear all DD bits
-            m.write32(REG_RDH, 0);
-            m.write32(REG_RDT, (RX_RING_COUNT - 1) as u32);
-            m.write32(REG_RCTL, RCTL_VALUE);
+            // TRANSMIT TOUCHES NOTHING ON THE RECEIVE SIDE. This used to wipe every RX descriptor's
+            // status, reset RDH/RDT and cycle RCTL around each send - so every frame sent DESTROYED
+            // the receive ring. Send a DISCOVER, the ring is wiped; the OFFER lands; the next send
+            // erases it. That is why 16 replies sat on the wire while `net-stack` scanned zero frames
+            // and then blamed the driver for transmits that had in fact gone out.
+            //
+            // Nothing in the e1000 requires it: TX and RX are separate rings with separate head/tail
+            // registers, and the receiver runs continuously. Cycling RCTL to send was never the
+            // silicon's requirement, only this driver's habit (26.14).
 
             // --- Transmit: copy the frame into the TX buffer, point descriptor tx_idx at it, hand it
             // to the NIC (advance TDT), wait on the DD bit (Commandment VIII, bounded + loud).
@@ -1032,8 +1070,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             a.write8(td + 11, TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS);
             a.write8(td + 12, 0); // clear DD
             m.write32(REG_TDT, ((tx_idx + 1) % TX_RING_COUNT) as u32);
-            let mut s = 0u32;
-            while s < TX_POLL_MAX && a.read8(td + 12) & TXD_STA_DD == 0 { ctx.yield_cpu(); s += 1; }
+            let t_end = ctx.read_tsc().wrapping_add(ctx.duration_cycles(TX_CONFIRM_MS));
+            while a.read8(td + 12) & TXD_STA_DD == 0 && ctx.read_tsc() < t_end { ctx.yield_cpu(); }
+            tx_confirmed = a.read8(td + 12) & TXD_STA_DD != 0;
             tx_idx = (tx_idx + 1) % TX_RING_COUNT;
 
             // TRANSMIT ONLY - no coupled receive. There used to be a bounded wait here for a frame to
@@ -1041,14 +1080,30 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // to an operation with nothing to do with receiving, and any caller that ignored the reply
             // to its own transmit destroyed whatever had just been picked up. Receiving is [4] and [9];
             // the receiver stays armed and the frame waits for one of them.
-            m.write32(REG_RCTL, 0); // quiesce
+            // (no RCTL quiesce: the receiver stays on - see the note above)
         }
 
         // Reply NON-BLOCKING (§8.9): a slow/dead net-stack can never wedge us. Then reclaim the cap
         // slot so a long-running server stays bounded (§26.6). EMPTY, not a status byte - callers
         // already guard on `is_empty()` for "no frame", so nothing downstream changes and a status
         // byte would be miscounted as a received frame by `udp_roundtrip`.
-        note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[])), &ctx, &mut reply_fails);
+        // A ONE-BYTE ANSWER, NEVER AN EMPTY ONE.
+        //
+        // This replied with a zero-length payload, and transmit was the ONLY op in this driver that
+        // did - every other one answers with at least a status or a count. Transmit was also the only
+        // op whose caller reported no answer: measured at 2241 ms against a 1 s budget, which is the
+        // deadline expiring twice (the call, then the reacquire-and-retry). Meanwhile the wire showed
+        // those frames going out and the server answering them, so `net-stack` reported "never left
+        // the host - the driver refused them" about frames it had sent perfectly well.
+        //
+        // `fs` reached the same conclusion in its own serve loop and wrote it down there: an empty
+        // reply is not an answer in this protocol. Say something.
+        //
+        // 0 = handed to the NIC and confirmed done; 1 = handed over but not confirmed within
+        // TX_CONFIRM_MS. No caller needs the distinction today, but a driver that knows and says
+        // nothing is the silent degradation §26.7 forbids.
+        let tx_status: u8 = if tx_confirmed { 0 } else { 1 };
+        note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[tx_status])), &ctx, &mut reply_fails);
         ctx.remove_cap(reply_cap);
     }
 }
