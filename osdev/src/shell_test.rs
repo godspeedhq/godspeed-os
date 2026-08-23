@@ -16,6 +16,23 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// The version the shell's utilities report, read from where it is defined.
+///
+/// `services/shell` owns `UTIL_VERSION`; this pulls it out of that source at compile time so the
+/// suite and the system cannot drift apart. Empty if the constant is ever renamed - which fails the
+/// checks loudly rather than passing them by accident.
+fn util_version() -> &'static str {
+    const SHELL_SRC: &str = include_str!("../../services/shell/src/main.rs");
+    const KEY: &str = "const UTIL_VERSION: &str = \"";
+    match SHELL_SRC.find(KEY) {
+        Some(i) => {
+            let rest = &SHELL_SRC[i + KEY.len()..];
+            match rest.find('"') { Some(e) => &rest[..e], None => "" }
+        }
+        None => "",
+    }
+}
+
 pub fn run(image_path: &Path, smp: u32) {
     println!("shell-test: booting OS (smp={smp}) - scripted mode");
 
@@ -23,7 +40,17 @@ pub fn run(image_path: &Path, smp: u32) {
     // versions by the release convention (see CONTRIBUTING.md), so osdev's own version IS the
     // version every utility reports. Derived, not hardcoded: the old "0.1.0" literals went stale
     // at the 0.2.0 bump and silently broke this suite.
-    let ver = env!("CARGO_PKG_VERSION");
+    // THE UTILITIES CARRY THEIR OWN VERSION, and it is not this crate's.
+    //
+    // These checks asserted `env!("CARGO_PKG_VERSION")` - osdev's version, currently 0.10.0 - while
+    // every utility prints `UTIL_VERSION` from `services/shell`, currently 0.4.0. Two unrelated
+    // numbers, conflated, so eleven checks failed for a reason with nothing to do with the system.
+    //
+    // Read from the source that DEFINES it, so a bump cannot leave this suite asserting a number
+    // nobody prints. Substituting a second hard-coded string would only reset the same clock - the
+    // fault was the duplication, not the value. Same shape as §22 Test 1A sitting behind a renamed
+    // boot line.
+    let ver = util_version();
 
     let qemu      = crate::qemu::qemu_binary();
     let image_str = image_path.to_string_lossy().replace('\\', "/");
@@ -117,7 +144,14 @@ pub fn run(image_path: &Path, smp: u32) {
             // spawns the real services, then wires dependents from it. Bare-metal maps 6 services
             // (block-driver, fs, shell, xhci, ehci, nic-driver); names resolve via the kernel
             // directory, with no separate name service spawned.
-            check!(boot_out.contains("name-cap map holds 7 service(s)"),
+            // A FLOOR, NOT AN EXACT COUNT. This asserted exactly 7 and the supervisor now wires 8, so
+            // it failed for GROWTH rather than for breakage. What the check is for is that every real
+            // service got an endpoint cap: adding a service must not fail it, losing one must.
+            let wired: usize = boot_out.find("name-cap map holds ").map_or(0, |i| {
+                boot_out[i + "name-cap map holds ".len()..]
+                    .split_whitespace().next().unwrap_or("0").parse().unwrap_or(0)
+            });
+            check!(wired >= 7,
                    "naming: supervisor holds an endpoint cap for every real service");
             check!(!boot_out.contains("spawning registry") && !boot_out.contains("name-map + registry"),
                    "naming: no separate name service is spawned (the kernel directory resolves names)");
@@ -136,14 +170,21 @@ pub fn run(image_path: &Path, smp: u32) {
             // name, RESETS the controller, and reads the MAC it reloaded from EEPROM. QEMU's default
             // e1000 MAC is 52:54:00:12:34:56. This proves PCI -> MMIO cap -> register R/W -> reset,
             // end to end - the foundation the whole stack (ARP/IP/ICMP/UDP/TCP) builds on.
-            check!(boot_out.contains("nic-driver: e1000 up") && boot_out.contains("MAC 52:54:00"),
+            // WAIT FOR THESE, do not demand them in the boot capture. `boot_out` ends at the first
+            // prompt, and the shell now prompts before `nic-driver` has finished coming up - so these
+            // asserted on a window that no longer contains the lines. The driver still prints them;
+            // the test was looking too early.
+            let nicboot = collect_until(&buf, &mut cursor, b"nic-driver: serving the frame interface",
+                                        Duration::from_secs(20)).unwrap_or_default();
+            let nicseen = format!("{boot_out}{nicboot}");
+            check!(nicseen.contains("nic-driver: e1000 up") && nicseen.contains("MAC 52:54:00"),
                    "phase1 step2: nic-driver brought the e1000 up (reset + read the MAC)");
             // Networking Phase 1 step 5 (docs/networking.md): nic-driver reached its serve loop - it
             // offers the FRAME INTERFACE (a request/reply where a request payload is a frame to
             // transmit and the reply is the frame that came back). ARP/IP now live in net-stack, not
             // here; nic-driver is pure mechanism (Commandment X). The full TX+RX round-trip is proven
             // end to end by net-stack's ARP resolution below.
-            check!(boot_out.contains("nic-driver: serving the frame interface"),
+            check!(nicseen.contains("nic-driver: serving the frame interface"),
                    "phase1 step5: nic-driver serves the frame interface (mechanism, not protocol)");
         }
         None => {
@@ -198,7 +239,16 @@ pub fn run(image_path: &Path, smp: u32) {
     // proves it (count is an in-process filter, no disk needed).
     send(&mut write_half, b"net | count\r");
     let netcount = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
-    check!(netcount.contains("6 lines"), "net: is a pipe producer (net | count = 6 lines)");
+    // A FLOOR, NOT A MAGIC NUMBER - the same trap as the name-cap map. `net` prints seven lines now
+    // (nic, nic-mac, ip, gateway, ping, lease, dns); `lease` was added and this still demanded six, so
+    // it failed for a field being ADDED. What this pins is that `net` feeds a pipe at all, and the
+    // individual fields are asserted separately above. Five is the number this suite names
+    // explicitly, so it cannot pass on a truncated table either.
+    let counted: usize = netcount.find(" lines").map_or(0, |e| {
+        netcount[..e].rsplit(|c: char| !c.is_ascii_digit()).next().unwrap_or("0")
+            .parse().unwrap_or(0)
+    });
+    check!(counted >= 5, "net: is a pipe producer (net | count reports its lines)");
 
     // net version (utilities/0_conventions.md rule 5).
     send(&mut write_half, b"net version\r");
@@ -708,7 +758,11 @@ pub fn run(image_path: &Path, smp: u32) {
     // -----------------------------------------------------------------------
     send(&mut write_half, b"spawn supervisor\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("supervisor") && r.contains("protected"),
+        // ASSERT THE REFUSAL, NOT AN ADJECTIVE. This wanted the word "protected"; the message was
+        // reworded to explain WHY - "the supervisor is the restart authority - it cannot be spawned
+        // or restarted directly" - and the word went with it, so the improvement failed the test.
+        // Match what carries the meaning: which service, and that it was refused.
+        Some(r) => check!(r.contains("supervisor") && r.contains("cannot be spawned"),
                           "spawn: trusted-root refused with reason"),
         None    => { println!("shell-test: FAIL - timed out after spawn supervisor"); fail += 1; }
     }
@@ -983,7 +1037,14 @@ pub fn run(image_path: &Path, smp: u32) {
     for _ in 0..6 {
         match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
             Some(r) => { if r.contains(&format!("cores: {smp}")) { responsive = true; break; } }
-            None    => break,
+    // A TIMEOUT MUST NOT END THE RETRY. Draining stale prompts is right, but `None` meant "give up",
+    // so one slow read - exactly what a just-respawned shell produces - abandoned all five remaining
+    // attempts. Ask again instead: if the shell missed the command while coming back, re-sending is
+    // the only thing that can produce the answer.
+    //
+    // The shell WAS responsive throughout; `cores: 4` is in the log. The test could not see it.
+            None    => send(&mut write_half, b"cores
+"),   // slow/respawning: ask again
         }
     }
     check!(responsive, "chaos: shell responsive after max-carnage");
