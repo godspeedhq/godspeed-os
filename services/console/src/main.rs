@@ -106,8 +106,33 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         //
         // Blocking `recv` for the first message (idle costs nothing), then `try_recv` for whatever else
         // has already arrived. This drains only what is ALREADY queued - a bounded 16 - so a producer
+    // Paints that exceeded the report threshold. Owned loop state, not a static (Invariant 9).
+    let mut slow_paints: u32 = 0;
+    // Cumulative CYCLES spent inside `flush()`, and cumulative cycles spent WORKING (not waiting).
+    //
+    // RAW CYCLES, converted once at the report - never per sample. The first cut of this divided
+    // each sample down to whole milliseconds and ACCUMULATED THE QUOTIENT, so every paint under
+    // 1 ms contributed exactly 0 and the total stayed 0 no matter how many there were. It reported
+    // "0 ms painting, 0 ms busy" on a machine that visibly crawled, and that reading carried no
+    // information at all: it could not tell free apart from just-under-the-unit.
+    //
+    // Reported as a PERCENTAGE of the elapsed window, which is the honest form here. A ratio of two
+    // cycle counts needs no scale factor, so it survives a TSC whose calibration is wrong - and this
+    // family of machine has exactly that problem. An absolute millisecond figure would not.
+    let mut paint_cycles: u64 = 0;
+    let mut busy_cycles: u64 = 0;
+    let mut window_start = ctx.read_tsc();
         // that keeps writing cannot hold this loop here.
+        // BUSY vs BLOCKED. Painting measured 0 ms while 500 messages still took seconds, so the cost
+        // is either upstream of this service or in the terminal state machine - and `flush()` timing
+        // cannot tell those apart. The clock starts when `recv` RETURNS, so everything this service
+        // does with a message is counted, and everything it spends waiting for one is not.
+        //
+        // busy near the elapsed time -> the console is the bottleneck, and `put_bytes` is where to
+        // look, since the paint is already known to be free. busy near zero -> this service is idle
+        // and waiting, the producer or the IPC path is slow, and no console change would help.
         let mut msg = ctx.recv();
+        let t_busy0 = ctx.read_tsc();
         loop {
             // A request carries a REPLY CAP; console output never does. That, not the payload, is what
             // tells the two apart - a byte stream can contain any bytes at all, so discriminating on
@@ -126,9 +151,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     rendered += 1;
                     bytes += body.len() as u64;
                     if rendered % RENDER_REPORT == 0 {
+                        // Painting time against wall-clock time between these lines is the whole
+                        // question: if most of the elapsed second is in here, the paint is the
+                        // bottleneck; if little of it is, the cost is upstream (per-message IPC,
+                        // scheduling) and making the paint cheaper would buy nothing.
+                        let elapsed = ctx.read_tsc().wrapping_sub(window_start).max(1);
                         ctx.log_fmt(format_args!(
-                            "console: rendered {} messages, {} bytes", rendered, bytes
+                            "console: rendered {} messages, {} bytes, painting {}%, busy {}% of elapsed",
+                            rendered,
+                            bytes,
+                            paint_cycles.saturating_mul(100) / elapsed,
+                            busy_cycles.saturating_mul(100) / elapsed
                         ));
+                        paint_cycles = 0;
+                        busy_cycles = 0;
+                        window_start = ctx.read_tsc();
                     }
                 }
             }
@@ -137,7 +174,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 None => break,
             }
         }
+        // HOW LONG A PAINT ACTUALLY TAKES, because the answer decides the fix and guessing has been
+        // expensive. This display is 3840x2160 at 32bpp - 31.6 MB - and the kernel maps the
+        // framebuffer NON-CACHEABLE, the way a driver's register BAR is mapped. Uncached stores go to
+        // the bus one at a time, so if a full repaint is hundreds of milliseconds the memory TYPE is
+        // the whole story and write-combining is the fix; if it is a handful, the cost is elsewhere
+        // (per-message IPC, or repainting when little changed) and mapping would not help.
+        //
+        // Bounded and quiet: only a paint over 20 ms is reported, and only every 32nd after the first
+        // few, so a fast display prints nothing at all and a slow one cannot flood the log it is
+        // already struggling to render.
+        let t0 = ctx.read_tsc();
         term.flush();
+        paint_cycles = paint_cycles.saturating_add(ctx.read_tsc().wrapping_sub(t0));
+        busy_cycles = busy_cycles.saturating_add(ctx.read_tsc().wrapping_sub(t_busy0));
+        // ACCUMULATE, do not threshold. The first cut of this only reported a paint over 20 ms and so
+        // printed NOTHING - while 500 messages still took 8.1 seconds to render. A per-paint peak was
+        // the wrong question: at ~62 tiny messages a second, paints just UNDER the threshold can still
+        // consume the entire second, and a threshold is blind to exactly that. The total is not.
+        let _ = slow_paints;
     }
 }
 
