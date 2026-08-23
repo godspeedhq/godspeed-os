@@ -105,7 +105,31 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // the queue empties at the speed of the copy into the shadow rather than the speed of the pixels.
         //
         // Blocking `recv` for the first message (idle costs nothing), then `try_recv` for whatever else
-        // has already arrived. This drains only what is ALREADY queued - a bounded 16 - so a producer
+        // has already arrived, TO A HARD BOUND OF `DRAIN_BOUND` (§26.6 - a bound that is stated must
+        // also be enforced).
+        //
+        // This comment used to claim the drain was "bounded 16" because only 16 can be queued. That
+        // was false, and the kernel guarantees it is false: dequeueing a message takes any parked
+        // sender and promotes its pending_send straight into the queue, so while a writer is blocked
+        // EVERY try_recv finds another message waiting. The loop ran for as long as the producer kept
+        // writing - exactly the case the claim said could not happen.
+        //
+        // The cost was not subtle. flush() sits after this loop, so a console that never leaves it
+        // never repaints: sustained output froze the display. It never blocked either, so it stayed
+        // runnable and held its core, and a writer parked on the full queue then waited whole quanta
+        // to be rescheduled (measured: 2.8 timer ticks and ~25 ms per park, with the console charged
+        // 60% of its core while its own accounting - taken at the loop's tail - recorded exactly
+        // zero, because the tail was unreachable).
+        //
+        // Counting messages instead of trusting the queue to run dry bounds the work per pass, paints
+        // at least once every DRAIN_BOUND messages, and returns to a blocking recv so the core goes to
+        // whoever is waiting for it. A producer
+    // Messages drained per pass before painting and returning to a blocking `recv`. The endpoint
+    // queue is 16 deep (§8.5), so one pass can still absorb a full backlog in a single paint - which
+    // is the batching this loop exists for - without the drain becoming unbounded when the producer
+    // refills as fast as it is emptied.
+    const DRAIN_BOUND: usize = 16;
+
     // Paints that exceeded the report threshold. Owned loop state, not a static (Invariant 9).
     let mut slow_paints: u32 = 0;
     // Cumulative CYCLES spent inside `flush()`, and cumulative cycles spent WORKING (not waiting).
@@ -133,6 +157,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // and waiting, the producer or the IPC path is slow, and no console change would help.
         let mut msg = ctx.recv();
         let t_busy0 = ctx.read_tsc();
+        let mut drained: usize = 0;
         loop {
             // A request carries a REPLY CAP; console output never does. That, not the payload, is what
             // tells the two apart - a byte stream can contain any bytes at all, so discriminating on
@@ -185,6 +210,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         window_start = ctx.read_tsc();
                     }
                 }
+            }
+            drained += 1;
+            if drained >= DRAIN_BOUND {
+                break;
             }
             match ctx.try_recv() {
                 Some(next) => msg = next,
