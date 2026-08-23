@@ -7998,7 +7998,23 @@ fn chaos_kill_storm(ctx: &ShellCtx, cwd: &Cwd, tok: &[&str], ntok: usize) -> Res
 #[inline(never)]
 fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     const FLOOD_BURST_MAX:    u32 = 64; // cap per-round sends; > queue depth (16) so saturation shows
-    const FLOOD_DRAIN_YIELDS: u32 = 40; // yields to let the target drain before we re-check
+    /// How long to let the target drain before re-checking, IN MILLISECONDS.
+    ///
+    /// This was 40 YIELDS, and a count is not a duration - the same fault fixed in `nic-driver`'s
+    /// transmit wait tonight. `yield_cpu` returns as soon as the scheduler comes back, so on a quiet
+    /// core forty of them elapse in microseconds, and how much WALL CLOCK they cover depends entirely
+    /// on what else is runnable.
+    ///
+    /// That decided the verdict by accident. A service blocked in `recv` is woken by the send itself
+    /// and drains within a yield or two, so `logger` passed. A service that idles on a TIMER - `xhci`
+    /// with no controller sleeps between drains, and its 5 ms floors to one 10 ms tick - needs real
+    /// time, and the check sampled long before it woke. It was reported as "did NOT drain, CLOGGED
+    /// (still full) - flood-endpoint disease" when it was not clogged at all: the tool measured too
+    /// early and then named a disease after what it saw.
+    ///
+    /// 50 ms is several of those ticks, still imperceptible in a five-round storm, and it is a CLOCK
+    /// (Commandment VIII). A target that has not drained after it is genuinely stuck.
+    const FLOOD_DRAIN_MS: u64 = 50;
 
     if ntok < 2 {
         ctx.console_writeln("usage: chaos flood-storm <service> [rounds]   (any running service with a recv endpoint, e.g. fs | logger | block-driver)");
@@ -8050,7 +8066,7 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         }
         depth[r] = sent;
         // 2. Let the target drain (the flood + any respawn settle).
-        for _ in 0..FLOOD_DRAIN_YIELDS { ctx.yield_cpu(); }
+        ctx.sleep_ms(FLOOD_DRAIN_MS);   // a real settle window - see FLOOD_DRAIN_MS
         if died {
             // The flood killed the service (or it had already died). Record it and reacquire the
             // respawned instance for the next round.
