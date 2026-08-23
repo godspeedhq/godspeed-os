@@ -164,7 +164,20 @@ fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
 /// on hardware neither the success nor the failure line ever printed and the REQUEST looked as though
 /// it had never run. Returning the answer instead of writing it through a capture leaves nothing for
 /// that to happen to. Verified by grepping the built ELF for the log strings.
-fn drain_scan_hit(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8]) -> bool) -> bool {
+fn serve_while_dancing(ctx: &ServiceContext, serve_status: Option<&[u8; 19]>) {
+    // `None` means this wait is NOT a dance - it is the ping or DNS path, reached while already
+    // handling a client request. Serving there would be re-entrant, so it does not.
+    let Some(status) = serve_status else { return };
+    // 16 = the per-endpoint queue depth (§8.5); draining at most that many bounds this pass.
+    for _ in 0..16 {
+        let Some(_req) = ctx.try_recv() else { return };
+        let Some(reply) = ctx.take_pending_cap() else { continue };
+        let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(status));
+        ctx.remove_cap(reply);
+    }
+}
+fn drain_scan_hit(ctx: &ServiceContext, secs: i64, serve_status: Option<&[u8; 19]>,
+                  mut on_frame: impl FnMut(&[u8]) -> bool) -> bool {
     let t0 = ctx.epoch_secs_monotonic();
     loop {
         if let Some(b) = nic_drain(ctx) {
@@ -180,6 +193,7 @@ fn drain_scan_hit(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8
                 pos += fl;
             }
         }
+        serve_while_dancing(ctx, serve_status);   // never let a client wait out a dance - see the fn
         if ctx.epoch_secs_monotonic() - t0 >= secs { return false; }
         ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));   // see RX_POLL_PACE_MS
     }
@@ -198,7 +212,8 @@ fn drain_scan_hit(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8
 /// the driver is left alone to receive it.
 const RX_POLL_PACE_MS: u64 = 10;
 
-fn drain_scan(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8]) -> bool) {
+fn drain_scan(ctx: &ServiceContext, secs: i64, serve_status: Option<&[u8; 19]>,
+              mut on_frame: impl FnMut(&[u8]) -> bool) {
     let t0 = ctx.epoch_secs_monotonic();
     loop {
         if let Some(b) = nic_drain(ctx) {
@@ -214,6 +229,7 @@ fn drain_scan(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8]) -
                 pos += fl;
             }
         }
+        serve_while_dancing(ctx, serve_status);   // never let a client wait out a dance - see the fn
         if ctx.epoch_secs_monotonic() - t0 >= secs { return; }
         // Wait before asking again - see RX_POLL_PACE_MS. `sleep` parks the task, so the core is free
         // for the driver that is trying to hand us the very frame we are waiting for.
@@ -230,7 +246,8 @@ fn drain_scan(ctx: &ServiceContext, secs: i64, mut on_frame: impl FnMut(&[u8]) -
 /// Broadcast, not unicast to the server, and deliberately: at this point we still do not own the
 /// address, so we cannot yet source packets from it, and the other DHCP servers on the segment need
 /// to see that their offers were declined.
-fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8; 4], bcast: bool) -> bool {
+fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8; 4], bcast: bool,
+                serve_status: Option<&[u8; 19]>) -> bool {
     // SIZED FOR ITS OWN OPTIONS. The DISCOVER's frame is 286 bytes because its option block is four
     // bytes (type + end). A REQUEST carries three options - message type (3), requested address (6),
     // server identifier (6) - plus the end byte: sixteen. Reusing 286 here wrote past the array on the
@@ -283,7 +300,7 @@ fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8
     for _ in 0..DANCE_TRIES {
         // A REQUEST that never left is not a server that did not ACK - see `dhcp_discover`.
         if nic_req(ctx, &req, LINK_SECS).is_none() { send_fail += 1; }
-        let acked = drain_scan_hit(ctx, DANCE_SECS, |f| {
+        let acked = drain_scan_hit(ctx, DANCE_SECS, serve_status, |f| {
             // A BOOTREPLY carrying option 53 = 5 (DHCPACK) for the address we asked for. A NAK (6) is
             // a definite refusal and is treated as "not acknowledged" by simply not matching - the
             // caller re-DISCOVERs, which is what RFC 2131 asks of a NAKed client anyway.
@@ -354,17 +371,19 @@ fn dhcp_request(ctx: &ServiceContext, our_mac: &[u8; 6], ip: &[u8; 4], srv: &[u8
 /// restoring service and leaving the fault to be rediscovered. The fallback exists because losing the
 /// network is not an acceptable price for the diagnosis - but a fallback nobody is told about is the
 /// silent kind this system does not allow.
-fn dhcp_lease(ctx: &ServiceContext, our_mac: &[u8; 6]) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
-    if let Some(cfg) = dhcp_discover(ctx, our_mac, false) {
+fn dhcp_lease(ctx: &ServiceContext, our_mac: &[u8; 6],
+              serve_status: Option<&[u8; 19]>) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
+    if let Some(cfg) = dhcp_discover(ctx, our_mac, false, serve_status) {
         return Some(cfg);
     }
     ctx.log("net-stack: DHCP got no reply addressed to us - retrying and asking the server to broadcast");
-    let cfg = dhcp_discover(ctx, our_mac, true)?;
+    let cfg = dhcp_discover(ctx, our_mac, true, serve_status)?;
     ctx.log("net-stack: DHCP succeeded ONLY with a broadcast reply - this port is not receiving frames addressed to its own MAC, so ARP and ping cannot work until that is fixed");
     Some(cfg)
 }
 
-fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6], bcast: bool) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
+fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6], bcast: bool,
+                 serve_status: Option<&[u8; 19]>) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
     let mut send_fail = 0u32;
     // Ethernet(14) + IPv4(20) + UDP(8) + DHCP/BOOTP(244) = 286 bytes.
     let mut frame = [0u8; 286];
@@ -404,7 +423,7 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6], bcast: bool) -> Option
         // things - the server was silent, or we never asked - and they need opposite fixes (§26.7).
         if nic_req(ctx, &req, LINK_SECS).is_none() { send_fail += 1; }
         let mut found: Option<([u8; 4], [u8; 4], [u8; 4], [u8; 4])> = None;
-        drain_scan(ctx, DANCE_SECS, |f| {
+        drain_scan(ctx, DANCE_SECS, serve_status, |f| {
             // A DHCP reply: IPv4 (0x0800, IHL 5), UDP (proto 17), BOOTP op = 2 (BOOTREPLY). yiaddr (our
             // offered IP) sits at BOOTP offset 16 = frame offset 58.
             if f.len() >= 62 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45 && f[23] == 17 && f[42] == 2 {
@@ -469,7 +488,7 @@ fn dhcp_discover(ctx: &ServiceContext, our_mac: &[u8; 6], bcast: bool) -> Option
             // it, will not route for it, and re-offers a FRESH address on the next DISCOVER. That is
             // exactly what the Pi 2 shows - .66, then .67, then .70, each one used briefly and never
             // owned, with the gateway silent to every ARP.
-            if dhcp_request(ctx, our_mac, &ip, &srv, bcast) {
+            if dhcp_request(ctx, our_mac, &ip, &srv, bcast, serve_status) {
                 return Some((ip, gw, dns));
             }
             // No ACK: the address is NOT ours, and using it anyway is what produced the silent
@@ -797,7 +816,7 @@ fn sntp_sync(ctx: &ServiceContext, st: &NetState) -> Option<u32> {
     for _ in 0..SNTP_TRIES {
         // A query that never left is not a silent time server - see `dhcp_discover`.
         if nic_req(ctx, &req, LINK_SECS).is_none() { send_fail += 1; }
-        drain_scan(ctx, DANCE_SECS, |f| {
+        drain_scan(ctx, DANCE_SECS, None, |f| {
             // A UDP reply FROM ntp_ip:123 TO our source port, ECHOING our nonce. `f[14] == 0x45` pins a
             // 20-byte IP header, without which every offset below (ports at 34/36, SNTP at 42+) would be
             // read from the wrong place on a packet carrying IP options.
@@ -899,7 +918,8 @@ fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], our_mac: &[u8; 6], out: &mut [u8;
 /// reply within the budget. Used by `net arp` (any host) and `net scan` (across the subnet). Same frame
 /// path and bound as `ping`/`dns_resolve`, which is why it is reliable now that the receiver no longer
 /// stalls (RTL8168 RDU recovery) and the deadline no longer glitches (deglitched RTC).
-fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target: &[u8; 4]) -> Option<[u8; 6]> {
+fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target: &[u8; 4],
+               serve_status: Option<&[u8; 19]>) -> Option<[u8; 6]> {
     let mut arp = [0u8; 42];
     for b in arp.iter_mut().take(6) { *b = 0xff; }   // eth dst = broadcast
     arp[6..12].copy_from_slice(our_mac);
@@ -976,7 +996,7 @@ fn arp_resolve(ctx: &ServiceContext, our_ip: &[u8; 4], our_mac: &[u8; 6], target
             }
         };
         if nic_req(ctx, &req, LINK_SECS).is_some() { sent += 1; } else { send_fail += 1; }
-        drain_scan(ctx, DANCE_SECS, |f| scan(f, &mut result));
+        drain_scan(ctx, DANCE_SECS, serve_status, |f| scan(f, &mut result));
         if result.is_some() { return result; }
     }
     ctx.log_fmt(format_args!(
@@ -1215,7 +1235,7 @@ fn learn_our_mac(ctx: &ServiceContext) -> Option<[u8; 6]> {
 /// Run the DHCP -> ARP -> ICMP dance once and freeze the 19-byte status. Called at boot, and again by the
 /// `net renew` op so a cable plugged in after boot (or a link that came up late) reconfigures the stack in
 /// place. Bounded (DHCP/ARP each have their own budget) and loud on each degrade, like the boot path.
-fn run_dance(ctx: &ServiceContext) -> NetState {
+fn run_dance(ctx: &ServiceContext, serve_status: Option<&[u8; 19]>) -> NetState {
     // ---- Learn our MAC FIRST (audit U9 / Commandment III): every frame below advertises it as the eth
     // source. Without a NIC identity there is nothing to configure - degrade to unconfigured (same state
     // as no link); the auto-config-on-link path retries run_dance once the driver reports a MAC.
@@ -1232,7 +1252,7 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
     // ---- Phase 3: DHCP FIRST, so net-stack LEARNS its own IP (self-configuring). Falls back to a default
     // only if there is no NIC / no offer (nic-driver serves empty replies). The IP it returns is the one
     // ARP + ICMP use below.
-    let leased_cfg = dhcp_lease(ctx, &our_mac);
+    let leased_cfg = dhcp_lease(ctx, &our_mac, serve_status);
     let leased = leased_cfg.is_some();
     let (our_ip, gateway, dns_server) = leased_cfg.unwrap_or((FALLBACK_IP, GATEWAY_IP, GATEWAY_IP));
 
@@ -1258,7 +1278,7 @@ fn run_dance(ctx: &ServiceContext) -> NetState {
     // the receive path for a reply whose sender IP is the host we asked about, answering anyone who
     // ARPs for us along the way, retrying the request each round. One implementation, used everywhere,
     // rather than two that disagree about whether waiting is part of asking.
-    let (gw_mac, gw_known) = match arp_resolve(ctx, &our_ip, &our_mac, &gateway) {
+    let (gw_mac, gw_known) = match arp_resolve(ctx, &our_ip, &our_mac, &gateway, serve_status) {
         Some(m) => {
             ctx.log_fmt(format_args!(
                 "net-stack: ARP - {}.{}.{}.{} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -1442,8 +1462,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // gets a bounded, reported timeout instead of a service that was never listening. Making the dance
     // incremental so net-stack answers THROUGHOUT it is the real fix, and that is a rework of the
     // state machine rather than a constant.
-    let d = {
-        ctx.log("net-stack: starting unconfigured and RESPONSIVE - configuring on the first demand");
+    // SELF-CONFIGURE AT BOOT, AND ANSWER WHILE DOING IT. Both, now that the dance serves.
+    //
+    // The dance used to run here as one blocking sequence, so a cabled machine configured itself but
+    // was DEAF for the ~45 s its budgets take when nothing answers - `net` said "net-stack
+    // unavailable", `time` said "cannot reach net-stack", ping had no stack. The intermediate fix
+    // was to skip the boot dance and configure on first demand, which only moved the deafness inside
+    // the loop. Neither is needed: `run_dance_serving` answers throughout, so the boot dance is back
+    // and costs no responsiveness. Clients asking during it get the truthful unconfigured status.
+    let d = if link_is_up(&ctx) {
+        run_dance(&ctx, Some(&[0u8; 19]))
+    } else {
+        ctx.log("net-stack: no link at boot (cable unplugged?) - staying unconfigured and RESPONSIVE; will configure when the link comes up");
         // The unconfigured state, spelled out rather than defaulted: no IP, no gateway, no DNS. The
         // MAC is still learned - it is our hardware identity and true with or without a cable
         // (Commandment III / audit U9) - so `net` can report who we are while saying we are offline.
@@ -1545,7 +1575,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // the network, so it gets the same self-configure as the rest.
                     if !gw_known && link_is_up(&ctx) {
                         ctx.log("net-stack: `time` asked for the clock and the cable is in - configuring");
-                        let d = run_dance(&ctx);
+                        let d = run_dance(&ctx, Some(&status));
                         our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac;
                         gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server;
                         status = d.status;
@@ -1653,7 +1683,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         {
             last_redhcp_at = ctx.epoch_secs_monotonic();
             ctx.log("net-stack: running on the fallback address without a lease - retrying DHCP");
-            let d = run_dance(&ctx);
+            let d = run_dance(&ctx, Some(&status));
             our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server; status = d.status;
             if leased {
                 ctx.log_fmt(format_args!("net-stack: DHCP recovered - address {}.{}.{}.{}",
@@ -1693,7 +1723,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // (fixed in 27c719bd - it now re-applies on the link-up transition). The delay was solving
             // a problem that did not exist, so it only postponed every hot-plug configure.
             ctx.log("net-stack: link up while unconfigured - auto-configuring");
-            let d = run_dance(&ctx);
+            let d = run_dance(&ctx, Some(&status));
             our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server; status = d.status;
             synced_by_dance = true;   // run_dance ends in its own SNTP sync - op 10 must not repeat it
         }
@@ -1721,7 +1751,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             last_gw_arp_at = ctx.epoch_secs_monotonic();
             let gateway = [status[4], status[5], status[6], status[7]];
             ctx.log("net-stack: leased but the gateway never answered ARP - retrying the gateway only");
-            if let Some(m) = arp_resolve(&ctx, &our_ip, &our_mac, &gateway) {
+            if let Some(m) = arp_resolve(&ctx, &our_ip, &our_mac, &gateway, None) {
                 gw_mac = m;
                 gw_known = true;
                 status[8..14].copy_from_slice(&gw_mac);
@@ -1828,7 +1858,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // ARP (op 6, then 4 IP bytes): resolve one host's MAC. Reply [found, mac(6)]. `net arp` uses
             // it directly; `net scan` calls it across the subnet.
             let target = [pl[1], pl[2], pl[3], pl[4]];
-            let rb = match arp_resolve(&ctx, &our_ip, &our_mac, &target) {
+            let rb = match arp_resolve(&ctx, &our_ip, &our_mac, &target, None) {
                 Some(m) => [1u8, m[0], m[1], m[2], m[3], m[4], m[5]],
                 None    => [0u8; 7],
             };
@@ -1838,7 +1868,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // plugged in later - reconfigures the stack without a reboot. Nothing is special; the link
             // recovers like any restartable thing. Re-assign the mutable state, reply the FRESH status.
             ctx.log("net-stack: renew - re-running DHCP/ARP/ICMP");
-            let d = run_dance(&ctx);
+            let d = run_dance(&ctx, Some(&status));
             our_ip = d.our_ip;
             our_mac = d.our_mac;
             gw_mac = d.gw_mac;
