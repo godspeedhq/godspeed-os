@@ -626,11 +626,23 @@ fn wait_for_connection(
                 _ => {}                              // unchanged, or unknown (read failed)
             }
         }
-        delay_cycles(ctx, DEBOUNCE_CYCLES); // ~50 ms between polls
+        // SLEEP THE POLL INTERVAL, DO NOT SPIN IT.
+        //
+        // This paced with `delay_cycles(DEBOUNCE_CYCLES)` - a hard `while read_tsc() ...` spin, 50 ms
+        // of it - and then slept one 10 ms quantum below. Fifty spinning against ten sleeping is about
+        // 83% of a core, held for as long as nothing is plugged in. Observed on hardware: move the
+        // keyboard off EHCI and `observe` shows ehci at 100% with the port empty - directly above a
+        // line claiming "park, do not spin".
+        //
+        // The 50 ms is PACING, not hardware timing; the comment said as much ("~50 ms between
+        // polls"). Nothing in the silicon needs the core held while it elapses, so sleeping satisfies
+        // it exactly and costs nothing. `delay_cycles` stays where it IS hardware timing - the reset
+        // hold, the recovery settle, the connect-debounce before a port reset - which are one-shot
+        // steps rather than a loop.
         // Drain our IPC endpoint while we idle here with no HID attached (the active path drains in
         // poll_devices). Without it a flood-storm clogs our 16-deep queue permanently - see xhci.
         while ctx.try_recv().is_some() {}
-        ctx.sleep(POLL_SLEEP_CYCLES); // no HID attached: park, do not spin
+        ctx.sleep_ms(HOTPLUG_POLL_MS); // no HID attached: park - and actually park
     }
 }
 
@@ -919,6 +931,12 @@ const STS_INT_BITS:   u32 = 0x3F;   // the six W1C interrupt-status bits (0..5)
 /// Granularity is one scheduler quantum, so any non-zero value means "one quantum": ~10 ms now that
 /// the APIC timer is PIT-calibrated, which is also the keyboard's own bInterval.
 const POLL_SLEEP_CYCLES: u64 = 1;
+
+/// How often to re-read the hub ports while waiting for something to be plugged in.
+///
+/// The pacing the hot-plug loop always intended ("~50 ms between polls") - the difference is that it
+/// is now SLEPT rather than spun. Hot-plug latency is unchanged; a core is simply not held to get it.
+const HOTPLUG_POLL_MS: u64 = 50;
 
 const EHCI_INT_VECTOR: u8 = 0x29;   // matches kernel interrupts::EHCI_MSI_VECTOR
 
