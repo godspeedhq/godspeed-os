@@ -76,20 +76,34 @@ const TXD_STA_DD:   u8 = 1 << 0; // (TX) descriptor done
 // RX descriptor (16 B): addr@0, length(u16)@8, status(u8)@12, errors(u8)@13.
 const RXD_STA_DD:   u8 = 1 << 0; // (RX) descriptor done - a frame landed in this buffer
 
-// DMA-arena layout (64 KiB): TX ring + one TX frame buffer, then an RX ring + 4 x 2 KiB RX buffers.
+// DMA-arena layout (64 KiB): TX ring + one TX frame buffer, then an RX ring + 8 x 2 KiB RX buffers.
 const TX_RING_OFF:   usize = 0x0000;
 const TX_RING_COUNT: usize = 8;
 const TX_RING_BYTES: u32   = (TX_RING_COUNT * 16) as u32;
 const TX_BUF_OFF:    usize = 0x1000;
 const RX_RING_OFF:   usize = 0x2000;
-const RX_RING_COUNT: usize = 4;
+// EIGHT, BECAUSE THE DEVICE REQUIRES IT - not because eight buffers felt better than four.
+//
+// The e1000 wants a descriptor ring whose LENGTH IN BYTES is a multiple of 128. At four descriptors
+// RDLEN was 64, which is not, and the hardware simply never used the ring: measured with RCTL
+// 0x0400801a (receiver enabled, promiscuous, broadcast accepted), STATUS 0x80080783 (link up, full
+// duplex), RDT=3 so descriptors were available - and RDH frozen at 0 across every drain. Not one
+// descriptor written, while the wire carried thirty frames.
+//
+// The asymmetry is what named it: TX_RING_COUNT is 8, so TDLEN was 128 and legal, and transmit
+// always worked. Receive never did. Four theories about the consuming side (a MAC filter, too few
+// buffers, a stale DD bit, a desync) were all downstream of a ring the device had rejected outright.
+//
+// This is the silicon's requirement, borrowed as such (§26.14) - nothing about our design wanted
+// four. Eight descriptors is 128 bytes exactly, the smallest legal ring.
+const RX_RING_COUNT: usize = 8;
 const RX_RING_BYTES: u32   = (RX_RING_COUNT * 16) as u32;
 const RX_BUF_OFF:    usize = 0x3000;
 const RX_BUF_SIZE:   usize = 2048;
-// After RX_BUF (ends at 0x5000): a 64-byte, 64-byte-aligned buffer the NIC DMAs its hardware tally
-// counters into (DTCCR dump). Layer-1 ground truth - the chip's OWN RX/TX/error counts, read straight
-// off silicon and INDEPENDENT of net-stack.
-const TALLY_OFF:     usize = 0x5000;
+// After RX_BUF (8 x 2 KiB, so it now ends at 0x7000): a 64-byte, 64-byte-aligned buffer the NIC DMAs
+// its hardware tally counters into (DTCCR dump). Layer-1 ground truth - the chip's OWN RX/TX/error
+// counts, read straight off silicon and INDEPENDENT of net-stack.
+const TALLY_OFF:     usize = 0x7000;
 
 // Bounded hardware/protocol-timing polls (the exempt category, like AHCI/USB spins - NOT the
 // correctness-by-time Commandment VIII forbids): wait on the TRUTH of a bit, give up LOUDLY.
@@ -903,6 +917,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         for i in 0..RX_RING_COUNT {
             a.write64(RX_RING_OFF + i * 16, a.phys_at(RX_BUF_OFF + i * RX_BUF_SIZE));
         }
+        // HAND THE NIC DESCRIPTORS IT OWNS: buffer address set, and status CLEAR.
+        //
+        // A descriptor with DD still set reads as "a frame landed here" the moment the receiver is
+        // armed. The arena is not guaranteed zeroed, so the very first drain could consume a phantom,
+        // advance next-to-clean past a descriptor the NIC had not written, and desync from RDH - after
+        // which the ring never recovers. Measured exactly that: ONE frame handed out per driver
+        // lifetime, then nothing, while the wire carried thirty.
+        //
+        // This step was previously done by the per-request ring reset, which also destroyed every
+        // frame that had arrived meanwhile - so removing that reset (the right fix) exposed an init
+        // that had never done its own job. Doing it here is where it always belonged: arming a ring is
+        // an init concern, not something to redo on every request.
+        for i in 0..RX_RING_COUNT {
+            a.write8(RX_RING_OFF + i * 16 + 12, 0);   // status: not done
+            a.write8(RX_RING_OFF + i * 16 + 13, 0);   // errors
+        }
         for i in 0..128usize { m.write32(REG_MTA + i * 4, 0); }
         let rx_ring_phys = a.phys_at(RX_RING_OFF);
         m.write32(REG_RDBAL, (rx_ring_phys & 0xffff_ffff) as u32);
@@ -1015,6 +1045,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     m.write32(REG_RDT, rx_idx as u32);
                     rx_idx = (rx_idx + 1) % RX_RING_COUNT;
                 }
+
             }
             out[0] = nfr;
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])), &ctx, &mut reply_fails);
