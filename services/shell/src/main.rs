@@ -395,6 +395,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Set once the clock is judged never to be coming - see its use below. Separate from
     // `clock_floor_recorded` because the floor genuinely was NOT recorded; this only says stop waiting.
     let mut clock_gaveup = false;
+    // Consecutive probes where `time` did not answer at all. See the backoff below.
+    let mut clock_silent: u32 = 0;
 
     loop {
         // Muted: a foreground app owns the console. Sleep + skip - don't draw, don't blocking-read. The
@@ -445,7 +447,35 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // in front of the keyboard read, so the prompt looks dead while it happens.
         //
         // Once we have given up on the clock there is nothing left to learn, so stop asking.
-        if !clock_gaveup && !clock_floor_recorded && time_source(ctx) == ClockSource::Ntp {
+        // BACK OFF WHEN THE ANSWER IS SILENCE. Asking a service that is not answering costs the full
+        // `time_rpc` budget - 2 s, a reacquire, another 2 s - and this sits in front of the keyboard
+        // read, so the prompt is dead for that long. Doing it every iteration for thirty seconds is
+        // why a machine with no network felt broken at the prompt.
+        //
+        // An answer that simply is not NTP yet is CHEAP and worth repeating - the clock may still
+        // arrive. Silence is expensive and means the service is unreachable, so after three of those
+        // we stop asking and say so once. The floor then stays unrecorded, which is a degraded state
+        // that is already reported rather than hidden (§26.7) - and an unrecorded floor is a far
+        // smaller harm than an interface that stops serving its user while it waits on a dependency.
+        // ONE probe per iteration, and its result decides both things: whether to record the floor,
+        // and whether asking again is worth what it costs.
+        let clock_probe = if !clock_gaveup && !clock_floor_recorded {
+            let r = time_source_probe(ctx);
+            if r.is_none() {
+                clock_silent += 1;
+                if clock_silent >= 3 {
+                    clock_gaveup = true;
+                    ctx.log("shell: `time` is not answering - stopped asking for the clock \
+                             (the floor stays unrecorded; the prompt stays responsive)");
+                }
+            } else {
+                clock_silent = 0;
+            }
+            r
+        } else {
+            None
+        };
+        if !clock_gaveup && !clock_floor_recorded && clock_probe == Some(ClockSource::Ntp) {
             clock_floor_recorded = true;
             if let Some(f) = time_floor(ctx) {
                 if (0..=u32::MAX as i64).contains(&f) {
@@ -8434,6 +8464,27 @@ fn time_rpc(ctx: &ShellCtx, body: &[u8]) -> Option<Message> {
     }
     let _ = ctx.reacquire_by_name("time");
     ctx.request_with_reply_deadline("time", &Message::from_bytes(body), TIME_SECS)
+}
+
+/// `time_source`, but distinguishing NO ANSWER from an answer that simply is not NTP yet.
+///
+/// The difference decides whether asking again is cheap or expensive, and only the expensive case
+/// hurts. An answer costs a round trip; a NON-answer costs the full `time_rpc` budget - two seconds,
+/// then a reacquire and another two - and that bill is paid IN FRONT OF THE KEYBOARD READ, so the
+/// prompt is dead for four seconds at a time. Polling that every iteration for the first thirty
+/// seconds of every boot is what made a networkless machine feel broken at the prompt, and it is what
+/// desynchronised `osdev test shell` badly enough to fail 127 of 132 checks: the harness fired
+/// commands into a 64-byte serial ring that nothing was draining.
+fn time_source_probe(ctx: &ShellCtx) -> Option<ClockSource> {
+    let r = time_rpc(ctx, &[1])?;              // None = `time` did not answer at all
+    let p = r.payload_bytes();
+    if p.len() < 10 || p[0] == 0 { return Some(ClockSource::Unset); }
+    Some(match p[9] {
+        1 => ClockSource::Rtc,
+        2 => ClockSource::Ntp,
+        3 => ClockSource::Floor,
+        _ => ClockSource::Unset,
+    })
 }
 
 /// Where the current wall-clock reading came from, per the `time` service (clock slice 2).

@@ -1423,10 +1423,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // dance the moment a cable appears, so a machine booted unplugged configures itself on plug-in
     // rather than needing `net renew` or a reboot. Cheap too - one status query to the NIC, seconds
     // saved on every diskless-network boot.
-    let d = if link_is_up(&ctx) {
-        run_dance(&ctx)
-    } else {
-        ctx.log("net-stack: no link at boot (cable unplugged?) - staying unconfigured and RESPONSIVE; will configure when the link comes up");
+    // SERVE FIRST, CONFIGURE FROM INSIDE THE LOOP. This used to run the whole DHCP -> ARP -> ICMP
+    // dance HERE, before the serve loop existed - so on a machine whose link is up but whose DHCP
+    // server never answers, net-stack was DEAF for the ~45 s its budgets take. Nothing could reach it:
+    // `net` reported "net-stack unavailable", `time` logged "cannot reach net-stack", ping had no
+    // stack to ping with, and the shell's own clock probe waited on a service that was not listening.
+    // One blocking dependency at startup made the whole machine look broken.
+    //
+    // The no-link branch already had the right instinct and says so in its own message - "staying
+    // unconfigured and RESPONSIVE". The link-up branch never got the same treatment. Now both start
+    // the same way: unconfigured, serving, configuring on the first demand. The loop already dances
+    // on demand in four places, one of which is `time` asking for the clock - and `time` asks within
+    // a second of boot - so a cabled machine still self-configures immediately, with its endpoint
+    // live and requests QUEUING behind the dance instead of finding nobody home.
+    //
+    // RESIDUAL, recorded rather than implied away (§26.7): the in-loop dance still blocks this service
+    // while it runs, so a client whose deadline is shorter than the dance still times out - it just
+    // gets a bounded, reported timeout instead of a service that was never listening. Making the dance
+    // incremental so net-stack answers THROUGHOUT it is the real fix, and that is a rework of the
+    // state machine rather than a constant.
+    let d = {
+        ctx.log("net-stack: starting unconfigured and RESPONSIVE - configuring on the first demand");
         // The unconfigured state, spelled out rather than defaulted: no IP, no gateway, no DNS. The
         // MAC is still learned - it is our hardware identity and true with or without a cable
         // (Commandment III / audit U9) - so `net` can report who we are while saying we are offline.
@@ -1448,7 +1465,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut status = d.status;
     let mut sockets = [Socket { rid: 0, port: 0 }; MAX_SOCKETS];
     let mut ping_seq: u16 = 0;                    // unique ICMP seq per ping - see ping() (RTT accuracy)
-    let tsc_hz = calibrate_tsc_hz(&ctx);          // RTC-calibrated TSC Hz for RTT (kernel calib is 0 on T630)
+    // LAZY, because calibrating costs two full seconds of spinning and only `ping` needs it.
+    // `calibrate_tsc_hz` aligns to a wall-clock second boundary and then waits out another whole
+    // second, yielding the entire time - so as a startup step it was two more seconds during which
+    // this service answered nobody, and two seconds of a permanently-runnable task on the core it
+    // shares with `fs` and `block-driver`. Paid now by whoever actually asks for an RTT, once.
+    let mut tsc_hz: u64 = 0;
     // Outside the loop deliberately: a once-only latch declared inside the loop it guards resets every
     // iteration and reports every time, which is the flood it exists to prevent.
     let mut capless_logged = false;
@@ -1793,6 +1815,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let mut frames = 0u16;
                 let mut timeouts = 0u16;
                 ping_seq = ping_seq.wrapping_add(1);   // distinct per echo so a stale reply can't match
+                if tsc_hz == 0 { tsc_hz = calibrate_tsc_hz(&ctx); }
                 match if gw_known { ping(&ctx, &gw_mac, &our_ip, &our_mac, &dip, bytes, ping_seq, tsc_hz, &mut frames, &mut timeouts) } else { None } {
                     Some((rtt, ttl)) => { let r = rtt.to_le_bytes(); [1u8, r[0], r[1], ttl] }
                     // No reply: re-check the link. If it dropped DURING the poll it is "no link" (fast

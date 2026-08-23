@@ -1033,6 +1033,18 @@ pub fn run(image_path: &Path, smp: u32) {
     // -----------------------------------------------------------------------
     // Done.
     // -----------------------------------------------------------------------
+
+    // ALWAYS dump the serial, exactly as `run_counter` already does. This suite reported a hundred
+    // failures with no way to see why: `check!` prints a label and a verdict, and the captured output
+    // is then dropped on the floor - so every failure looked identical and none could be diagnosed
+    // without editing the harness first. A test that cannot say what it SAW is a test nobody fixes,
+    // which is how it came to be almost entirely red without anyone noticing. A failure has to stay
+    // visible (§26.7), and that includes a test's own.
+    let whole_serial = { String::from_utf8_lossy(&buf.lock().unwrap()).into_owned() };
+    let _ = std::fs::create_dir_all("build/tests");
+    let _ = std::fs::write("build/tests/shell_serial.log", whole_serial.as_bytes());
+    println!("shell-test: serial saved to build/tests/shell_serial.log");
+
     child.kill().ok();
     child.wait().ok();
 
