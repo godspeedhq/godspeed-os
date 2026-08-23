@@ -274,15 +274,26 @@ fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         CW_DELIVER.fetch_add(read_cycle_counter().wrapping_sub(t_cw1), Relaxed);
         let n = CW_CALLS.fetch_add(1, Relaxed) + 1;
         if n % 512 == 0 {
+            // BLOCKS, not just the total. Delivery averaging 6.5 ms a write is the same number
+            // whether every write parks briefly or one in sixteen parks enormously, and those have
+            // opposite fixes: the first is the console failing to drain, the second is ordinary
+            // backpressure against a 16-deep queue. The count separates them, and deliver/blocks is
+            // then the true cost of one park rather than a figure smeared across writes that never
+            // waited at all.
             crate::kprintln!(
-                "console-write: {} calls, {} us serial, {} us deliver",
+                "console-write: {} calls, {} blocked, {} us serial, {} us deliver",
                 n,
+                CW_BLOCKS.load(Relaxed),
                 scheduler::cycles_to_us(CW_SERIAL.load(Relaxed)),
                 scheduler::cycles_to_us(CW_DELIVER.load(Relaxed)));
         }
     }
     out
 }
+
+/// Console writes that PARKED because the terminal's queue was full. Paired with the delivery
+/// total in the `console-write` report: the two together give the cost of one park.
+static CW_BLOCKS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
 /// Console writes that could not be shown because the terminal was gone, not merely behind.
 static CONSOLE_LOST: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
@@ -313,6 +324,7 @@ fn deliver_to_console_service(bytes: &[u8]) -> i64 {
         // should not run ahead of the display it is writing to. It wakes with a negative code if the
         // terminal dies instead, so this can never hang.
         Err(crate::ipc::IpcError::QueueFull) => {
+            CW_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             scheduler::block_and_reschedule(TaskState::BlockedOnSend)
         }
         // The terminal died between the name lookup and the enqueue. Serial has the bytes; say so
