@@ -453,6 +453,8 @@ const SMSC_MII_DATA: u16 = 0x118;
 const SMSC_PHY_ID: u32 = 1;
 const SMSC_MII_BMCR: u32 = 0;
 const SMSC_MII_ADVERTISE: u32 = 4;
+/// Attempts to read BMSR before reporting the link state as unknown. See `link_up`.
+const LINK_READ_TRIES: u8 = 3;
 const SMSC_MII_BMSR: u32 = 1;   // basic mode STATUS; bit 2 = link up, bit 5 = auto-negotiation done
 
 /// Is the ethernet link up, per the PHY itself?
@@ -462,9 +464,23 @@ const SMSC_MII_BMSR: u32 = 1;   // basic mode STATUS; bit 2 = link up, bit 5 = a
 /// therefore reports a freshly-connected cable as down, forever, until something happens to read twice.
 /// This is standard 802.3 clause-22 behaviour, not a quirk of this part, and it is why every driver
 /// reads this register twice.
-fn link_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> bool {
+fn link_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<bool> {
+    // `None` means the PHY could not be READ, which is not the same as the link being down. This
+    // returned `bool` and folded an unreadable register into `false`, and that false travelled the
+    // whole way out: dwc2 answered link=0 while logging "link up - FULL duplex" in the same second,
+    // nic-driver relayed the 0, and ping told the operator the cable was unplugged with the cable
+    // plainly in. These reads DO fail here - this service counts them in `reg_read_fails` - so it
+    // was not a theoretical path.
+    //
+    // Retry a bounded few times before giving up: a read that fails under USB load usually succeeds
+    // on the next attempt, and a transient failure should not cost the caller its answer.
     let _latched = mii_read(ctx, m, d, t, SMSC_MII_BMSR);
-    matches!(mii_read(ctx, m, d, t, SMSC_MII_BMSR), Some(v) if v & 0x0004 != 0)
+    for _ in 0..LINK_READ_TRIES {
+        if let Some(v) = mii_read(ctx, m, d, t, SMSC_MII_BMSR) {
+            return Some(v & 0x0004 != 0);
+        }
+    }
+    None
 }
 
 /// Reconfigure the MAC for the duplex the PHY actually negotiated, and set flow control to match.
@@ -534,8 +550,11 @@ fn link_reconfigure(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) {
 fn link_fresh(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic) -> bool {
     let now = ctx.read_tsc();
     if nic.link_at == 0 || now.wrapping_sub(nic.link_at) >= ctx.duration_cycles(LINK_TTL_MS) {
-        let up = link_up(ctx, m, d, t);
-        link_observed(ctx, m, d, t, nic, up, now);
+        // Only a real reading updates the cache. An unreadable PHY leaves the last known state
+        // standing rather than silently flipping the transmit guard to "down".
+        if let Some(up) = link_up(ctx, m, d, t) {
+            link_observed(ctx, m, d, t, nic, up, now);
+        }
     }
     nic.link_up
 }
@@ -1541,13 +1560,16 @@ pub fn serve(
             // The PHY's own link bit, not an assumption. Reporting a hardcoded UP made net-stack
             // spend its DHCP budget against a cable that may not be there, and made "no link" and
             // "link up but silent" indistinguishable from the outside - the two things a diagnosis
-            // most needs to tell apart. Unreadable counts as DOWN: an unanswerable question is not
-            // a yes.
+            // most needs to tell apart. Unreadable is neither: it clears the OK byte, so the caller
+            // reports the link as unknown rather than as down - an unanswerable question is not a
+            // yes, and it is not a no either.
             // This is a fresh read of the PHY, so let the transmit cache learn from it too - the
             // link question and the transmit guard must never disagree about the same cable.
-            let up = link_up(ctx, mmio, dma, t);
+            let link = link_up(ctx, mmio, dma, t);
             let now = ctx.read_tsc();
-            link_observed(ctx, mmio, dma, t, nic, up, now);
+            if let Some(up) = link {
+                link_observed(ctx, mmio, dma, t, nic, up, now);
+            }
             nic.stats.bmsr = mii_read(ctx, mmio, dma, t, SMSC_MII_BMSR).map_or(0xFFFF, u32::from);
             // Fallible here: these three feed the periodic report, where a fabricated zero reads as a
             // fact about the device. Counting the failures makes a zero attributable.
@@ -1563,7 +1585,11 @@ pub fn serve(
                 Some(v) => nic.stats.int_sts = v,
                 None => nic.stats.reg_read_fails = nic.stats.reg_read_fails.saturating_add(1),
             }
-            body[7] = u8::from(up);
+            match link {
+                Some(up) => body[7] = u8::from(up),
+                // Could not read the PHY: clear OK so this reads as "unknown", never as "down".
+                None => body[0] = 0,
+            }
             8
         }
         OP_NET_TX if p.len() > 1 => {
