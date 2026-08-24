@@ -990,9 +990,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // INTERRUPTS TAKEN vs FRAMES THEY YIELDED. A count of zero means the line is armed
                 // but nothing is arriving, and receive is still whatever a client asks for - which
                 // is the state this driver was in without anyone noticing.
+                let r0 = nic.as_ref().map(|(n, _)| n.rx0).unwrap_or([0; 4]);
                 ctx.log_fmt(format_args!(
-                    "dwc2-svc: net IRQ - {} interrupts, {} frames harvested from them",
-                    irq_count, irq_frames));
+                    "dwc2-svc: net IRQ - {} interrupts, {} frames harvested; empty because: {} not armed,                      {} still in flight, {} stalled, {} zero-length",
+                    irq_count, irq_frames, r0[0], r0[1], r0[2], r0[3]));
             }
             // DO NOT SLEEP WHEN THERE WAS WORK. This is the whole of the throughput problem.
             //

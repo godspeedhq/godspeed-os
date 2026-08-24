@@ -247,23 +247,22 @@ fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     // backgrounded task's output goes to serial only - it must not smear the app's framebuffer. The
     // owner (or unclaimed = the normal case) writes to both.
     let to_fb = crate::arch::imp::console_foreground_allows(scheduler::current_task_slot() as u32);
-    // WHERE A CONSOLE WRITE SPENDS ITS TIME: the SERIAL port, or delivering to the `console` service.
+    // A console write costs on BOTH sides of this boundary: the serial port is synchronous at
+    // 115200 baud (~87 us a byte, so ~9 ms for a 100-byte line), and the delivery below can PARK
+    // this task when the service's 16-deep queue is full.
     //
-    // The console service measures itself at 0 ms painting and 0 ms busy - it does no work, it waits -
-    // yet 500 messages take about five seconds to arrive, roughly 10 ms each. So the cost is on THIS
-    // side of the boundary, and there are only two candidates. Serial is synchronous at 115200 baud
-    // (~87 us a byte, so ~9 ms for a 100-byte line). Delivery is an IPC enqueue that, as the comment
-    // below says outright, CAN PARK THIS TASK when the service's 16-deep queue is full.
-    //
-    // Those need opposite fixes and no log distinguishes them, so count both. Every 512 writes, so a
-    // healthy machine prints rarely and a slow one cannot flood the console it is already struggling
-    // to drive.
+    // Both were measured, and the answer was the queue: writers parked ~25 ms each because the
+    // console's drain loop was not reaching its paint. That is fixed in the service, and the
+    // counters used to find it are gone - a measurement kept after it has answered its question is
+    // just a tax on the hot path (three rdtsc reads per write, here).
     crate::arch::imp::console_write_bytes_gated(bytes, to_fb);
     // Serial is written FIRST and unconditionally above, so the log is complete and never duplicated
     // even though the call below can park this task. What the return value carries is the outcome of
     // the wait, not of the write: 0, or a negative code if the terminal died while we were blocked.
-    let out = if to_fb { deliver_to_console_service(bytes) } else { 0 };
-    out
+    if to_fb {
+        return deliver_to_console_service(bytes);
+    }
+    0
 }
 
 /// Console writes that could not be shown because the terminal was gone, not merely behind.

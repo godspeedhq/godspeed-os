@@ -127,6 +127,10 @@ pub struct Nic {
     /// Whether the controller has been told to RAISE the host-channel interrupt yet. Once-only, and
     /// tied to the channel actually being armed - there is nothing to interrupt about before that.
     pub irq_enabled: bool,
+    /// WHY a receive attempt collected nothing, by exit: [0] channel was not armed (armed it and
+    /// waited), [1] a transfer was still IN FLIGHT, [2] STALL, [3] the burst was empty. An interrupt
+    /// that harvests nothing is not self-explanatory, and these four have different answers.
+    pub rx0: [u32; 4],
     /// Consecutive polls that found the armed IN still enabled and not complete, and how many times we
     /// have reported a long run of them. Diagnostic only - nothing acts on these.
     pub pid_in: u32,
@@ -345,7 +349,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
     // Link starts DOWN and unstamped: the first transmit reads the PHY instead of assuming a
     // cable is there. Assuming UP is how a driver spends a full budget per frame proving otherwise.
     Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(),
-               rxbuf: [0u8; RXQ_BYTES], rxbuf_fill: 0, rxbuf_pos: 0, rxq_count: 0, irq_enabled: false,
+               rxbuf: [0u8; RXQ_BYTES], rxbuf_fill: 0, rxbuf_pos: 0, rxq_count: 0, irq_enabled: false, rx0: [0; 4],
                in_armed: false,
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
                link_up: false, link_at: 0,
@@ -1173,6 +1177,7 @@ pub fn tx(
     //
     // Arming here closes the gap to the length of the transmit itself.
     if !nic.in_armed {
+        nic.rx0[0] = nic.rx0[0].saturating_add(1);
         arm_in(mmio, dma, t, nic);
     }
     ok
@@ -1305,6 +1310,7 @@ pub fn rx(
     let hcchar = mmio.read32(chan::hcchar_at(CH_NET_RX));
     let hcint  = mmio.read32(chan::hcint_at(CH_NET_RX));
     if hcchar & (1 << 31) != 0 {
+        nic.rx0[1] = nic.rx0[1].saturating_add(1);
         // Still enabled: the IN is outstanding and the device simply has nothing yet. With BIR set the
         // core NAK-retries in hardware without halting, so this is the ordinary quiet case.
         nic.stats.rx_nohalt = nic.stats.rx_nohalt.wrapping_add(1);
@@ -1322,6 +1328,7 @@ pub fn rx(
         return 0;
     }
     if hcint & crate::regs::HCINT_STALL != 0 {
+        nic.rx0[2] = nic.rx0[2].saturating_add(1);
         // A halted endpoint is a hard failure, never retried by re-arming into the same condition.
         nic.stats.rx_hcint = hcint;
         nic.in_armed = false;
@@ -1337,7 +1344,10 @@ pub fn rx(
     nic.stats.rx_hcint = hcint;
     nic.in_armed = false;                 // consumed - the next pass arms a fresh one
     let got = (RX_BURST as u32).saturating_sub(left) as usize;
-    if got == 0 { return 0; }
+    if got == 0 {
+        nic.rx0[3] = nic.rx0[3].saturating_add(1);
+        return 0;
+    }
     nic.stats.rx_bursts += 1;
     nic.stats.rx_bytes = nic.stats.rx_bytes.wrapping_add(got as u32);
 
