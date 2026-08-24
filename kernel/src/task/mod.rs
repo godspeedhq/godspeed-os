@@ -4313,11 +4313,27 @@ fn spawn_service_with_config(
                     // cached: nothing here reads back, and stores stay ordered enough for a display
                     // (which has no side effects to order against, unlike a register BAR - that is
                     // why a BAR keeps strong UC and this does not).
-                    let flags = PageFlags::PRESENT
+                    //
+                    // X86 ONLY, because the two architectures read these same two bits in OPPOSITE
+                    // senses and the neutral `PageFlags` name hides it. On arm32, `PCD | PWT` is
+                    // Normal NON-cacheable - which permits exactly the gathering a framebuffer
+                    // wants - while `PCD` ALONE is Device, which forbids it. Dropping PWT there
+                    // would slow the Pi down for the same reason it speeds the PC up, and would
+                    // also MISMATCH the kernel's own mapping of these physical pages
+                    // (`mmu::section_fb`), which is unpredictable on ARM rather than merely slow.
+                    // On aarch64 the attribute is `PCD || PWT`, so this bit makes no difference.
+                    //
+                    // Borrow the silicon's requirement, not the other port's answer (§26.14).
+                    #[allow(unused_mut)]
+                    let mut flags = PageFlags::PRESENT
                         | PageFlags::WRITABLE
                         | PageFlags::USER
                         | PageFlags::NO_EXEC
                         | PageFlags::PCD;
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        flags |= PageFlags::PWT;
+                    }
                     let pages = g.len.div_ceil(PAGE_SIZE as u64);
                     for i in 0..pages {
                         let off = i * PAGE_SIZE as u64;
