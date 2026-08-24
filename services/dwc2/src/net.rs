@@ -98,6 +98,8 @@ pub struct Nic {
     /// Bounded count of "link reads DOWN" diagnostics emitted. Owned by this device's state rather
     /// than a file-scope static (Invariant 9); see `link_up`.
     pub link_down_reports: u32,
+    /// Bounded count of "PHY unreadable after retries" reports. Owned device state (Invariant 9).
+    pub link_unknown_reports: u32,
     pub ep_in: u8,
     pub ep_out: u8,
     pub mps: u16,
@@ -344,7 +346,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
         ep_in, ep_out, mps, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
     // Link starts DOWN and unstamped: the first transmit reads the PHY instead of assuming a
     // cable is there. Assuming UP is how a driver spends a full budget per frame proving otherwise.
-    Some(Nic { link_down_reports: 0, ep_in, ep_out, mps, mac, stats: Stats::default(),
+    Some(Nic { link_down_reports: 0, link_unknown_reports: 0, ep_in, ep_out, mps, mac, stats: Stats::default(),
                rxbuf: [0u8; RXQ_BYTES], rxbuf_fill: 0, rxbuf_pos: 0, rxq_count: 0,
                in_armed: false,
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
@@ -571,10 +573,27 @@ fn link_reconfigure(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) {
 fn link_fresh(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic) -> bool {
     let now = ctx.read_tsc();
     if nic.link_at == 0 || now.wrapping_sub(nic.link_at) >= ctx.duration_cycles(LINK_TTL_MS) {
-        // Only a real reading updates the cache. An unreadable PHY leaves the last known state
-        // standing rather than silently flipping the transmit guard to "down".
-        if let Some(up) = link_up(ctx, m, d, t, nic) {
-            link_observed(ctx, m, d, t, nic, up, now);
+        // An unreadable PHY counts as DOWN here, and is logged when it happens.
+        //
+        // This briefly kept the last known state instead, to stop a failed read being reported as an
+        // unplugged cable. That was the wrong cure and it showed immediately on hardware: the state
+        // became sticky-UP, so pulling the cable went unnoticed. Both directions of this mistake are
+        // now on the record - fabricating "down" from a failed read blames the cable, and fabricating
+        // "up" hides a real unplug.
+        //
+        // What makes DOWN the safe answer again is that `link_up` now RETRIES, so a read only fails
+        // here after several attempts - a genuinely unreadable PHY rather than one transient NAK. For
+        // a transmit guard, refusing to transmit on a link we cannot confirm is the conservative
+        // direction, and the log says which case it was.
+        match link_up(ctx, m, d, t, nic) {
+            Some(up) => link_observed(ctx, m, d, t, nic, up, now),
+            None => {
+                nic.link_unknown_reports = nic.link_unknown_reports.saturating_add(1);
+                if nic.link_unknown_reports <= 3 {
+                    ctx.log("dwc2-svc: PHY unreadable after retries - treating the link as down");
+                }
+                link_observed(ctx, m, d, t, nic, false, now);
+            }
         }
     }
     nic.link_up
