@@ -72,6 +72,9 @@ pub(crate) const GRSTCTL_AHBIDLE: u32 = 1 << 31; // AHB master idle
 pub(crate) const GOTGCTL_HSTSETHNPEN: u32 = 1 << 10;
 pub(crate) const GAHBCFG_GLBLINTRMSK: u32 = 1 << 0; // global interrupt enable
 pub(crate) const GAHBCFG_DMAEN:       u32 = 1 << 5; // DMA mode enable
+/// GINTMSK bit 25 - Host Channel interrupt. The ONLY core interrupt this driver enables: which
+/// channels may raise it is gated by HAINTMSK, and that is set for the net RX channel alone.
+pub(crate) const GINTMSK_HCHINT:      u32 = 1 << 25;
 pub(crate) const GUSBCFG_PHYIF:         u32 = 1 << 3;  // UTMI+ data width: 0 = 8-bit (Pi), 1 = 16-bit
 pub(crate) const GUSBCFG_ULPI_UTMI_SEL: u32 = 1 << 4;  // PHY interface: 0 = UTMI+ (Pi), 1 = ULPI
 pub(crate) const GUSBCFG_PHYSEL:     u32 = 1 << 6;  // 1 = full-speed serial PHY, 0 = USB 2.0 HS PHY (UTMI+)

@@ -124,6 +124,9 @@ pub struct Nic {
     pub rxq_count: usize,    // frames still waiting to be collected
     /// Is a bulk-IN currently armed on CH_NET, waiting for the device to have a frame?
     pub in_armed: bool,
+    /// Whether the controller has been told to RAISE the host-channel interrupt yet. Once-only, and
+    /// tied to the channel actually being armed - there is nothing to interrupt about before that.
+    pub irq_enabled: bool,
     /// Consecutive polls that found the armed IN still enabled and not complete, and how many times we
     /// have reported a long run of them. Diagnostic only - nothing acts on these.
     pub pid_in: u32,
@@ -342,7 +345,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
     // Link starts DOWN and unstamped: the first transmit reads the PHY instead of assuming a
     // cable is there. Assuming UP is how a driver spends a full budget per frame proving otherwise.
     Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(),
-               rxbuf: [0u8; RXQ_BYTES], rxbuf_fill: 0, rxbuf_pos: 0, rxq_count: 0,
+               rxbuf: [0u8; RXQ_BYTES], rxbuf_fill: 0, rxbuf_pos: 0, rxq_count: 0, irq_enabled: false,
                in_armed: false,
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
                link_up: false, link_at: 0,
@@ -1239,6 +1242,32 @@ fn arm_in(mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Nic) {
                  crate::regs::HCINT_CHHLTD | crate::regs::HCINT_XFERCOMPL);
     mmio.write32(crate::regs::HAINTMSK,
                  mmio.read32(crate::regs::HAINTMSK) | (1 << CH_NET_RX));
+
+    // LET THE CONTROLLER RAISE THE LINE. Once, here, because arming the bulk-IN is the first moment
+    // there is anything to be interrupted about.
+    //
+    // `reset_and_host_mode` clears GAHBCFG's global interrupt bit and writes GINTMSK = 0, because
+    // this driver began as a poller. That is why the CPU-side vector, armed in `main`, produced
+    // exactly ZERO interrupts across a run that moved real traffic: the device was never asserting.
+    //
+    // What makes enabling it safe here rather than sweeping:
+    //   - GINTMSK is set to HCHINT ALONE, not to a mask of everything the core can report;
+    //   - which channels may raise HCHINT is gated by HAINTMSK, and the line above is the only
+    //     place that touches it - the net RX channel is the sole contributor;
+    //   - this service is a single task, and the interrupt reaches it as an ordinary message
+    //     handled between other work, so it cannot pre-empt a polled transfer mid-flight;
+    //   - the kernel masks the vector on delivery until the service unmasks, so the rate is bounded
+    //     by our own cadence even if a source were ever left asserted.
+    //
+    // GINTSTS is write-1-to-clear: clear any stale HCHINT before unmasking it, or the first
+    // interrupt reports a completion that already happened.
+    if !nic.irq_enabled {
+        mmio.write32(crate::regs::GINTSTS, crate::regs::GINTMSK_HCHINT);
+        mmio.write32(crate::regs::GINTMSK, crate::regs::GINTMSK_HCHINT);
+        mmio.write32(crate::regs::GAHBCFG,
+                     mmio.read32(crate::regs::GAHBCFG) | crate::regs::GAHBCFG_GLBLINTRMSK);
+        nic.irq_enabled = true;
+    }
     nic.in_armed = true;
 }
 
