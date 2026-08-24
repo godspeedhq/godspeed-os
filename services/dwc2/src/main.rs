@@ -63,6 +63,11 @@ const PASS_BUDGET_MS: u64 = 20;
 /// enough to watch the count climb over a fifteen-second boot, slow enough that the core is idle
 /// between them.
 const REARM_MS: u64 = 1_000;
+/// Re-unmask delay when an interrupt arrived that this driver did NOT service. Short, but still a
+/// BLOCK: the task must not spin, so the core stays free and the rate stays bounded by construction.
+const REARM_SERVICED_MS: u64 = 1;
+/// Receive harvests per interrupt. Bounded so a talkative link cannot hold the serve loop.
+const IRQ_RX_ROUNDS: u32 = 8;
 
 /// Route one request to the block server or the frame server.
 ///
@@ -482,6 +487,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut seg_serve: u64 = 0;
         let mut seg_kbd: u64 = 0;
         let mut seg_sleep: u64 = 0;
+
+        // ARM THE USB LINE, from the loop that can actually service it.
+        //
+        // The only `irq_unmask` used to sit in the fallback loop below, which a board with hardware
+        // never reaches - so the line was never enabled and not one interrupt was ever delivered.
+        // The kernel routes this vector to us because the contract asks for it (`hw_interrupt =
+        // [41]`); until something unmasks, that routing goes nowhere.
+        //
+        // Loud either way, once: whether receive is interrupt-driven or still client-polled is the
+        // difference between a driver and a poller, and it should not have to be inferred from
+        // throughput a month later.
+        ctx.irq_unmask(USB_VECTOR);
+        ctx.log("dwc2-svc: USB vector unmasked - receive is interrupt-driven");
+
         loop {
             passes = passes.wrapping_add(1);
             let t_pass = ctx.read_tsc();
@@ -539,6 +558,43 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         answer_no_disk(&ctx, &mut capless);
                         ctx.log("dwc2-svc: block drain hit its bound - a sender is enqueuing as fast as we retire");
                         break;
+                    }
+                    // THE INTERRUPT, HANDLED WHERE THE HARDWARE IS.
+                    //
+                    // This arm existed only in the fallback loop below - the one entered when there
+                    // is NO mmio/dma - so on a real board, where this loop runs forever, it was
+                    // unreachable. Its `irq_unmask` was unreachable too, so the line was never
+                    // enabled and not one interrupt was ever delivered: the Pi 2 log shows zero
+                    // "USB INTERRUPT DELIVERED". Receive was therefore driven entirely by clients
+                    // asking, and a FIFO holding about one burst drops whatever arrives between asks.
+                    //
+                    // `net::rx` reads the channel's HCINT and writes it back, which clears the device
+                    // condition so the level-triggered line can deassert, then harvests the completed
+                    // burst and re-arms. That is what EARNS the unmask - exactly what the fallback
+                    // arm's own comment anticipated a real driver would do.
+                    //
+                    // Bounded: at most IRQ_RX_ROUNDS harvests, stopping early on an empty round.
+                    {
+                        let p = msg.payload_bytes();
+                        if p.len() == 1 && p[0] == USB_VECTOR {
+                            let mut got = 0u32;
+                            if let Some((n, nt)) = nic.as_mut() {
+                                for _ in 0..IRQ_RX_ROUNDS {
+                                    let f = net::rx(&ctx, &m, &d, nt, n);
+                                    got = got.saturating_add(f);
+                                    if f == 0 { break; }
+                                }
+                            }
+                            // Serviced: the line is deasserted, so re-enable promptly. Serviced
+                            // nothing: this was not ours to clear, so block briefly first rather than
+                            // risk the wedge an immediate unmask on a still-asserted level line
+                            // caused before (see the fallback arm).
+                            if got == 0 {
+                                ctx.sleep(ctx.duration_cycles(REARM_SERVICED_MS));
+                            }
+                            ctx.irq_unmask(USB_VECTOR);
+                            continue;
+                        }
                     }
                     if dispatch(&ctx, &m, &d, dt, dk, nic.as_mut(), &msg, *sectors, &mut capless) {
                         served = served.wrapping_add(1);
