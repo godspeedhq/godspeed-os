@@ -95,6 +95,9 @@ pub struct Stats {
 }
 
 pub struct Nic {
+    /// Bounded count of "link reads DOWN" diagnostics emitted. Owned by this device's state rather
+    /// than a file-scope static (Invariant 9); see `link_up`.
+    pub link_down_reports: u32,
     pub ep_in: u8,
     pub ep_out: u8,
     pub mps: u16,
@@ -341,7 +344,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
         ep_in, ep_out, mps, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
     // Link starts DOWN and unstamped: the first transmit reads the PHY instead of assuming a
     // cable is there. Assuming UP is how a driver spends a full budget per frame proving otherwise.
-    Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(),
+    Some(Nic { link_down_reports: 0, ep_in, ep_out, mps, mac, stats: Stats::default(),
                rxbuf: [0u8; RXQ_BYTES], rxbuf_fill: 0, rxbuf_pos: 0, rxq_count: 0,
                in_armed: false,
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
@@ -464,7 +467,7 @@ const SMSC_MII_BMSR: u32 = 1;   // basic mode STATUS; bit 2 = link up, bit 5 = a
 /// therefore reports a freshly-connected cable as down, forever, until something happens to read twice.
 /// This is standard 802.3 clause-22 behaviour, not a quirk of this part, and it is why every driver
 /// reads this register twice.
-fn link_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<bool> {
+fn link_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic) -> Option<bool> {
     // `None` means the PHY could not be READ, which is not the same as the link being down. This
     // returned `bool` and folded an unreadable register into `false`, and that false travelled the
     // whole way out: dwc2 answered link=0 while logging "link up - FULL duplex" in the same second,
@@ -474,10 +477,28 @@ fn link_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<bool> 
     //
     // Retry a bounded few times before giving up: a read that fails under USB load usually succeeds
     // on the next attempt, and a transient failure should not cost the caller its answer.
-    let _latched = mii_read(ctx, m, d, t, SMSC_MII_BMSR);
+    let latched = mii_read(ctx, m, d, t, SMSC_MII_BMSR);
     for _ in 0..LINK_READ_TRIES {
         if let Some(v) = mii_read(ctx, m, d, t, SMSC_MII_BMSR) {
-            return Some(v & 0x0004 != 0);
+            let up = v & 0x0004 != 0;
+            // WHAT WAS ACTUALLY READ, when the answer is "down". The stats dump showed
+            // BMSR=0x782d - link bit SET, autonegotiation complete - while this function was
+            // answering down for the same cable in the same run, and the two cannot both be right.
+            // Printing the pair of reads says which: whether the latched read differs from the live
+            // one, and whether the value here even resembles the one the dump sees.
+            //
+            // Bounded to the first few `down` answers, so a genuinely unplugged cable does not
+            // stream. Silent whenever the answer is up.
+            if !up {
+                nic.link_down_reports = nic.link_down_reports.saturating_add(1);
+                if nic.link_down_reports <= 5 {
+                    ctx.log_fmt(format_args!(
+                        "dwc2-svc: link reads DOWN - BMSR latched={:#06x} live={:#06x} (bit2 is the                          link bit; report {})",
+                        latched.unwrap_or(0xFFFF), v, nic.link_down_reports
+                    ));
+                }
+            }
+            return Some(up);
         }
     }
     None
@@ -552,7 +573,7 @@ fn link_fresh(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic
     if nic.link_at == 0 || now.wrapping_sub(nic.link_at) >= ctx.duration_cycles(LINK_TTL_MS) {
         // Only a real reading updates the cache. An unreadable PHY leaves the last known state
         // standing rather than silently flipping the transmit guard to "down".
-        if let Some(up) = link_up(ctx, m, d, t) {
+        if let Some(up) = link_up(ctx, m, d, t, nic) {
             link_observed(ctx, m, d, t, nic, up, now);
         }
     }
@@ -1565,7 +1586,7 @@ pub fn serve(
             // yes, and it is not a no either.
             // This is a fresh read of the PHY, so let the transmit cache learn from it too - the
             // link question and the transmit guard must never disagree about the same cable.
-            let link = link_up(ctx, mmio, dma, t);
+            let link = link_up(ctx, mmio, dma, t, nic);
             let now = ctx.read_tsc();
             if let Some(up) = link {
                 link_observed(ctx, mmio, dma, t, nic, up, now);
