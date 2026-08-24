@@ -104,40 +104,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut busy_cycles: u64 = 0;
     let mut passes: u64 = 0;
     let mut window_start = ctx.read_tsc();
-    loop {
-        // TAKE THE WHOLE QUEUE, THEN PAINT ONCE.
-        //
-        // Scrolling repaints the screen from the shadow grid, and this loop used to do that per
-        // message. Under load that is the entire cost of the terminal: sixteen queued lines meant
-        // sixteen full repaints where one shows the same result, and on hardware the service sat at
-        // 100% CPU with its queue jammed at 16/16 while every other service idled at 0/16.
-        //
-        // The damage was not slowness, it was the queue. A full queue has no room for the shell's echo
-        // of a keystroke, so typing produced no cursor and no feedback - it reads as a dead keyboard and
-        // is not one - and a full-screen `observe` repainting into the same queue tore, showing half a
-        // frame and then another. Draining the backlog first and painting once ends all three, because
-        // the queue empties at the speed of the copy into the shadow rather than the speed of the pixels.
-        //
-        // Blocking `recv` for the first message (idle costs nothing), then `try_recv` for whatever else
-        // has already arrived, TO A HARD BOUND OF `DRAIN_BOUND` (§26.6 - a bound that is stated must
-        // also be enforced).
-        //
-        // This comment used to claim the drain was "bounded 16" because only 16 can be queued. That
-        // was false, and the kernel guarantees it is false: dequeueing a message takes any parked
-        // sender and promotes its pending_send straight into the queue, so while a writer is blocked
-        // EVERY try_recv finds another message waiting. The loop ran for as long as the producer kept
-        // writing - exactly the case the claim said could not happen.
-        //
-        // The cost was not subtle. flush() sits after this loop, so a console that never leaves it
-        // never repaints: sustained output froze the display. It never blocked either, so it stayed
-        // runnable and held its core, and a writer parked on the full queue then waited whole quanta
-        // to be rescheduled (measured: 2.8 timer ticks and ~25 ms per park, with the console charged
-        // 60% of its core while its own accounting - taken at the loop's tail - recorded exactly
-        // zero, because the tail was unreachable).
-        //
-        // Counting messages instead of trusting the queue to run dry bounds the work per pass, paints
-        // at least once every DRAIN_BOUND messages, and returns to a blocking recv so the core goes to
-        // whoever is waiting for it. A producer
     // PAINT CADENCE. A pass drains for at most this long before painting and returning to a blocking
     // `recv`. 16 ms is about one frame; a display that repaints that often reads as smooth.
     //
@@ -186,6 +152,40 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     const PEAK_PAINT_REPORTS: u32 = 8;
     let mut max_paint_us: u64 = 0;
     let mut peak_reports: u32 = 0;
+    loop {
+        // TAKE THE WHOLE QUEUE, THEN PAINT ONCE.
+        //
+        // Scrolling repaints the screen from the shadow grid, and this loop used to do that per
+        // message. Under load that is the entire cost of the terminal: sixteen queued lines meant
+        // sixteen full repaints where one shows the same result, and on hardware the service sat at
+        // 100% CPU with its queue jammed at 16/16 while every other service idled at 0/16.
+        //
+        // The damage was not slowness, it was the queue. A full queue has no room for the shell's echo
+        // of a keystroke, so typing produced no cursor and no feedback - it reads as a dead keyboard and
+        // is not one - and a full-screen `observe` repainting into the same queue tore, showing half a
+        // frame and then another. Draining the backlog first and painting once ends all three, because
+        // the queue empties at the speed of the copy into the shadow rather than the speed of the pixels.
+        //
+        // Blocking `recv` for the first message (idle costs nothing), then `try_recv` for whatever else
+        // has already arrived, TO A HARD BOUND OF `DRAIN_BOUND` (§26.6 - a bound that is stated must
+        // also be enforced).
+        //
+        // This comment used to claim the drain was "bounded 16" because only 16 can be queued. That
+        // was false, and the kernel guarantees it is false: dequeueing a message takes any parked
+        // sender and promotes its pending_send straight into the queue, so while a writer is blocked
+        // EVERY try_recv finds another message waiting. The loop ran for as long as the producer kept
+        // writing - exactly the case the claim said could not happen.
+        //
+        // The cost was not subtle. flush() sits after this loop, so a console that never leaves it
+        // never repaints: sustained output froze the display. It never blocked either, so it stayed
+        // runnable and held its core, and a writer parked on the full queue then waited whole quanta
+        // to be rescheduled (measured: 2.8 timer ticks and ~25 ms per park, with the console charged
+        // 60% of its core while its own accounting - taken at the loop's tail - recorded exactly
+        // zero, because the tail was unreachable).
+        //
+        // Counting messages instead of trusting the queue to run dry bounds the work per pass, paints
+        // at least once every DRAIN_BOUND messages, and returns to a blocking recv so the core goes to
+        // whoever is waiting for it. A producer
 
     // Paints that exceeded the report threshold. Owned loop state, not a static (Invariant 9).
     let mut slow_paints: u32 = 0;

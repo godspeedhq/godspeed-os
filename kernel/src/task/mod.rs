@@ -4298,12 +4298,26 @@ fn spawn_service_with_config(
             // memory attributes for one physical page are UNPREDICTABLE on ARM.
             match crate::bootcon::grant() {
                 Some(g) => {
+                    // UC- (PCD alone), NOT strong UC (PCD|PWT). The PAT index is
+                    // (PAT<<2)|(PCD<<1)|PWT, so PCD|PWT selects entry 3 - strong uncacheable, the
+                    // one memory type an MTRR can never upgrade. Every 4-byte pixel write then goes
+                    // to the bus on its own with no combining, and this display measured 596 ms to
+                    // repaint one scroll: 19 MB at about 32 MB/s.
+                    //
+                    // PCD alone selects entry 2, UC-, which is defined to yield WC where the MTRR
+                    // for the range says WC - and firmware routinely marks a framebuffer WC for
+                    // precisely this reason. Strictly no worse than before: if the MTRR says UC the
+                    // effective type stays UC, exactly as it is today.
+                    //
+                    // A framebuffer wants write-combining, not cacheability. It is still not
+                    // cached: nothing here reads back, and stores stay ordered enough for a display
+                    // (which has no side effects to order against, unlike a register BAR - that is
+                    // why a BAR keeps strong UC and this does not).
                     let flags = PageFlags::PRESENT
                         | PageFlags::WRITABLE
                         | PageFlags::USER
                         | PageFlags::NO_EXEC
-                        | PageFlags::PCD
-                        | PageFlags::PWT;
+                        | PageFlags::PCD;
                     let pages = g.len.div_ceil(PAGE_SIZE as u64);
                     for i in 0..pages {
                         let off = i * PAGE_SIZE as u64;
