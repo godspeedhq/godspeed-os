@@ -664,11 +664,30 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         // The op we asked about. Every reply is tagged with it (see `net_dispatch` in dwc2), which is
         // what lets a stale answer be recognised instead of believed.
         let want = msg.payload_bytes().first().copied().unwrap_or(0);
-        // NEVER RE-SEND AFTER A TIMEOUT. This used to retry unconditionally, and for the RX op that is
-        // actively destructive: dwc2 POPS a frame to build each reply, so re-asking after a timeout pops
-        // a SECOND frame while the first reply is still queued unread. The retry exists for one real
-        // case - `find_send_slot` reads spawn-time wiring, so a peer spawned after us is unreachable
-        // until reacquired - and that case is a SEND failure, which is distinguishable from a timeout.
+        // NEVER RE-SEND AFTER A TIMEOUT. THIS APPLIES TO EVERY OP, INCLUDING READ-ONLY ONES.
+        //
+        // Read this before deciding an op is harmless to retry, because that reasoning has already
+        // been tried here and it broke the machine. A timeout does not mean the request was lost: it
+        // means the reply has not arrived YET. Re-send, and the late reply to request N arrives while
+        // request N+1 is outstanding - and since the only thing distinguishing replies is the OP TAG,
+        // which both share, the caller accepts the stale one as the answer to the new question. From
+        // then on every reply is off by one and the whole stream is desynchronised. This is the same
+        // hazard CLAUDE.md 8.2 records for `Call`/`CallDeadline`, at a different layer.
+        //
+        // What that looks like from the outside, measured on a Pi 2 when a "safe" retry was added to
+        // the read-only INFO op: the link value went stale, so unplugging the cable was never
+        // noticed; and the desynchronised stream stopped delivering frames, so DHCP got no offer and
+        // every ping timed out. Nothing about the INFO op is destructive - the DESYNC is the damage,
+        // and it does not care what the op does.
+        //
+        // The RX op makes it worst but is not the only case: dwc2 POPS a frame to build each reply,
+        // so re-asking after a timeout pops a SECOND frame while the first reply is still queued
+        // unread. That is a second, independent reason - not the reason.
+        //
+        // The one legitimate retry is a SEND failure, which is distinguishable from a timeout:
+        // `find_send_slot` reads spawn-time wiring, so a peer spawned after us is unreachable until
+        // reacquired. A send that never left is safe to repeat; a request that may already be
+        // answered is not.
         let got = match ctx.request_with_reply_deadline_outcome("dwc2", msg, DWC2_SECS) {
             DeadlineOutcome::Reply(r) => r,
             DeadlineOutcome::SendFailed if ctx.reacquire_by_name("dwc2") =>
@@ -768,10 +787,6 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
 
     // Counts replies that could not be delivered; see `note_reply`.
     let mut reply_fails = 0u32;
-    // Attempts at the read-only info query before reporting failure. See the STATUS arm below.
-    const INFO_TRIES: u8 = 3;
-    // Info queries the device could not answer. Serve-loop-local, not a file-scope static.
-    let mut info_fails: u32 = 0;
     loop {
         let _req = ctx.recv();
         let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
@@ -781,40 +796,10 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             // STATUS: [ok, mac(6), link] - net-stack reads MAC at [1..7] and link at [7].
             let mut out = [0u8; 8];
             let mut ni = [0u8; 7];
-            // RETRY before giving up. On failure this replies all zeros, and a zero link byte in a
-            // well-formed reply is indistinguishable from a dead cable - so ONE timed-out query to
-            // dwc2 reached the operator as "cable unplugged" with the cable plainly in.
-            //
-            // Why the retry belongs HERE, from the evidence rather than from reasoning about the
-            // code: dwc2's own link read never answered "down" once the link was up, and net-stack
-            // never failed to get a reply. Only this query was failing. It is read-only, so
-            // re-asking costs nothing and pops nothing - unlike the RX op next door, whose comment
-            // rightly forbids a re-send.
-            let mut got = false;
-            for _ in 0..INFO_TRIES {
-                if dev_info(&ctx, &mut ni) { got = true; break; }
-            }
-            if got {
+            if dev_info(&ctx, &mut ni) {
                 out[0] = 1;
                 out[1..7].copy_from_slice(&ni[0..6]);
                 out[7] = ni[6];
-            } else {
-                // SAY SO. On failure this replies all zeros, which means ok=0 AND link=0 - and a
-                // reader that checks only the link byte reads that as "the cable is out". It did:
-                // ping on a Pi 2 blamed an unplugged cable while the cable was in. The ok byte now
-                // carries the distinction to the caller, and this line says which half failed here,
-                // because "the driver could not determine the link" and "dwc2 did not answer" are
-                // different faults and the reply alone cannot tell them apart.
-                //
-                // Rate-limited: the first few, then every 64th, so a persistently silent device is
-                // loud once rather than once per ping.
-                info_fails += 1;
-                if info_fails <= 3 || info_fails % 64 == 0 {
-                    ctx.log_fmt(format_args!(
-                        "nic-driver: dwc2 did not answer the info query after {} tries - reporting link                          down, which may be wrong ({} so far)",
-                        INFO_TRIES, info_fails
-                    ));
-                }
             }
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)), &ctx, &mut reply_fails);
         } else if p.len() == 1 && p[0] == 4 {
