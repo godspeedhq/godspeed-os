@@ -487,6 +487,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut seg_serve: u64 = 0;
         let mut seg_kbd: u64 = 0;
         let mut seg_sleep: u64 = 0;
+        // Interrupts taken, and frames harvested from them. Loop-local, not a static (Invariant 9).
+        // Reported with the other net counters: whether receive is actually interrupt-DRIVEN or just
+        // interrupt-CAPABLE is the difference between a driver and a poller, and only these say so.
+        let mut irq_count: u64 = 0;
+        let mut irq_frames: u64 = 0;
 
         // ARM THE USB LINE, from the loop that can actually service it.
         //
@@ -577,6 +582,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     {
                         let p = msg.payload_bytes();
                         if p.len() == 1 && p[0] == USB_VECTOR {
+                            irq_count = irq_count.saturating_add(1);
                             let mut got = 0u32;
                             if let Some((n, nt)) = nic.as_mut() {
                                 for _ in 0..IRQ_RX_ROUNDS {
@@ -589,6 +595,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             // nothing: this was not ours to clear, so block briefly first rather than
                             // risk the wedge an immediate unmask on a still-asserted level line
                             // caused before (see the fallback arm).
+                            irq_frames = irq_frames.saturating_add(got as u64);
                             if got == 0 {
                                 ctx.sleep(ctx.duration_cycles(REARM_SERVICED_MS));
                             }
@@ -973,6 +980,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.log_fmt(format_args!(
                     "dwc2-svc: net RX addressing - {} to us ({} ARP, {} IPv4), {} broadcast, {} other; {} frames PARSED, {} HANDED OUT, {} TOGGLE ERRORS, {} register reads FAILED",
                     ns.18, ns.21, ns.22, ns.19, ns.20, ns.4, ns.23, ns.24, ns.25));
+                // INTERRUPTS TAKEN vs FRAMES THEY YIELDED. A count of zero means the line is armed
+                // but nothing is arriving, and receive is still whatever a client asks for - which
+                // is the state this driver was in without anyone noticing.
+                ctx.log_fmt(format_args!(
+                    "dwc2-svc: net IRQ - {} interrupts, {} frames harvested from them",
+                    irq_count, irq_frames));
             }
             // DO NOT SLEEP WHEN THERE WAS WORK. This is the whole of the throughput problem.
             //
