@@ -119,6 +119,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // the repaint past a frame. Bounded (§26.6) by the clock rather than by a tally, because a count
     // is not a duration - it means a different amount of time on every machine.
     const PAINT_DEADLINE_MS: u64 = 16;
+    // Ceiling for the adaptive deadline below: even a very slow display must repaint this often.
+    const PAINT_DEADLINE_MAX_MS: u64 = 100;
     // Fallback for an uncalibrated clock: `tsc_ticks_per_10ms` reports 0, and a deadline derived
     // from it would be meaningless. Bound by count then, and say so rather than silently painting
     // per line.
@@ -126,7 +128,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let per_10ms = ctx.tsc_ticks_per_10ms();
     // Cycles per microsecond, for reporting a paint in units a human can compare against a frame.
     let per_us = (per_10ms / 10_000).max(1);
-    let paint_deadline: u64 = if per_10ms == 0 {
+    let mut paint_deadline: u64 = if per_10ms == 0 {
         ctx.log("console: TSC uncalibrated - paint cadence bounded by message count, not time");
         0
     } else {
@@ -154,6 +156,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut peak_reports: u32 = 0;
     // Passes that ended with the escape parser mid-sequence. See the watch in the loop.
     let mut stranded: u64 = 0;
+    // ADAPTIVE PAINT CADENCE, derived from what a paint actually costs on THIS display.
+    //
+    // A full repaint costs the same whether it shows one new line or sixteen, so batching longer is
+    // strictly better for throughput and the only price is update latency. That makes a fixed
+    // deadline wrong in both directions: 16 ms asks 60 fps of a 4K display that cannot repaint
+    // faster than about 40, so it is always late and spends most of its life on pixels, while on a
+    // fast display a larger fixed value would batch more than it needs to.
+    //
+    // Measured on the slow display: a paint costs 20-25 ms against a 16 ms deadline, and the service
+    // reported 63% of its time painting - against P/(D+P) = 25/(16+25) = 61% predicted. Aiming the
+    // deadline at twice the paint cost holds that share near a third, whatever the machine.
+    //
+    // Smoothed, so one unusually expensive repaint cannot lurch the cadence, and clamped at both
+    // ends: never below the 16 ms floor (a fast display stays smooth), never above
+    // PAINT_DEADLINE_MAX_MS (a pathological one still refreshes).
+    let deadline_floor = paint_deadline;
+    let deadline_ceil = if per_10ms == 0 { 0 } else {
+        per_10ms.saturating_mul(PAINT_DEADLINE_MAX_MS) / 10
+    };
+    let mut paint_ewma: u64 = 0;
     loop {
         // TAKE THE WHOLE QUEUE, THEN PAINT ONCE.
         //
@@ -315,7 +337,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
         let t0 = ctx.read_tsc();
         term.flush();
-        paint_cycles = paint_cycles.saturating_add(ctx.read_tsc().wrapping_sub(t0));
+        let this_paint_cycles = ctx.read_tsc().wrapping_sub(t0);
+        paint_cycles = paint_cycles.saturating_add(this_paint_cycles);
+        if per_10ms != 0 {
+            // EWMA over the last few paints, then aim at twice it.
+            paint_ewma = if paint_ewma == 0 {
+                this_paint_cycles
+            } else {
+                (paint_ewma.saturating_mul(3).saturating_add(this_paint_cycles)) / 4
+            };
+            paint_deadline = paint_ewma
+                .saturating_mul(2)
+                .clamp(deadline_floor, deadline_ceil);
+        }
         busy_cycles = busy_cycles.saturating_add(ctx.read_tsc().wrapping_sub(t_busy0));
         passes += 1;
         if per_10ms != 0 {
