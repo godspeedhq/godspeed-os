@@ -157,15 +157,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // from it would be meaningless. Bound by count then, and say so rather than silently painting
     // per line.
     const DRAIN_BOUND: usize = 16;
-    let paint_deadline: u64 = {
-        let per_10ms = ctx.tsc_ticks_per_10ms();
-        if per_10ms == 0 {
-            ctx.log("console: TSC uncalibrated - paint cadence bounded by message count, not time");
-            0
-        } else {
-            per_10ms.saturating_mul(PAINT_DEADLINE_MS) / 10
-        }
+    let per_10ms = ctx.tsc_ticks_per_10ms();
+    // Cycles per microsecond, for reporting a paint in units a human can compare against a frame.
+    let per_us = (per_10ms / 10_000).max(1);
+    let paint_deadline: u64 = if per_10ms == 0 {
+        ctx.log("console: TSC uncalibrated - paint cadence bounded by message count, not time");
+        0
+    } else {
+        per_10ms.saturating_mul(PAINT_DEADLINE_MS) / 10
     };
+    // THE FIRST FEW PAINTS, REPORTED IMMEDIATELY. The percentage report needs 500 rendered messages
+    // before it says anything, and on a slow display that is a long wait for the one number that
+    // decides the next fix: what a single full repaint actually costs. This screen is 3840x2160 and
+    // the framebuffer is mapped uncacheable, so if a repaint is hundreds of milliseconds the memory
+    // TYPE is the story and write-combining is the fix; if it is a handful, the cost is elsewhere.
+    // Three lines at boot, then silence.
+    const FIRST_PAINTS_REPORTED: u64 = 3;
 
     // Paints that exceeded the report threshold. Owned loop state, not a static (Invariant 9).
     let mut slow_paints: u32 = 0;
@@ -276,6 +283,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         paint_cycles = paint_cycles.saturating_add(ctx.read_tsc().wrapping_sub(t0));
         busy_cycles = busy_cycles.saturating_add(ctx.read_tsc().wrapping_sub(t_busy0));
         passes += 1;
+        if passes <= FIRST_PAINTS_REPORTED && per_10ms != 0 {
+            let this_paint = ctx.read_tsc().wrapping_sub(t0) / per_us;
+            ctx.log_fmt(format_args!(
+                "console: paint #{} took {} us ({} messages this pass)",
+                passes, this_paint, drained
+            ));
+        }
         // ACCUMULATE, do not threshold. The first cut of this only reported a paint over 20 ms and so
         // printed NOTHING - while 500 messages still took 8.1 seconds to render. A per-paint peak was
         // the wrong question: at ~62 tiny messages a second, paints just UNDER the threshold can still
