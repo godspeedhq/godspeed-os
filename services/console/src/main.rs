@@ -173,6 +173,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // TYPE is the story and write-combining is the fix; if it is a handful, the cost is elsewhere.
     // Three lines at boot, then silence.
     const FIRST_PAINTS_REPORTED: u64 = 3;
+    // PEAK PAINT, REPORTED WHEN IT HAPPENS. The first three paints turned out to be the three
+    // CHEAPEST that exist: they run at boot, on a screen that has not filled, so nothing has
+    // scrolled yet. They measured 1 us on the machine that is slow, which says only that painting
+    // an unchanged screen is free - not what a SCROLL costs, which is the case in question.
+    //
+    // A peak that announces itself needs no capture window to coincide with it. Report only a new
+    // maximum, only above a floor worth caring about, and at most a handful of times - so an
+    // expensive repaint is loud the first time it occurs and the log stays quiet afterwards, even
+    // though the display it is being written to is the slow thing.
+    const PEAK_PAINT_FLOOR_US: u64 = 1_000;
+    const PEAK_PAINT_REPORTS: u32 = 8;
+    let mut max_paint_us: u64 = 0;
+    let mut peak_reports: u32 = 0;
 
     // Paints that exceeded the report threshold. Owned loop state, not a static (Invariant 9).
     let mut slow_paints: u32 = 0;
@@ -283,12 +296,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         paint_cycles = paint_cycles.saturating_add(ctx.read_tsc().wrapping_sub(t0));
         busy_cycles = busy_cycles.saturating_add(ctx.read_tsc().wrapping_sub(t_busy0));
         passes += 1;
-        if passes <= FIRST_PAINTS_REPORTED && per_10ms != 0 {
+        if per_10ms != 0 {
             let this_paint = ctx.read_tsc().wrapping_sub(t0) / per_us;
-            ctx.log_fmt(format_args!(
-                "console: paint #{} took {} us ({} messages this pass)",
-                passes, this_paint, drained
-            ));
+            if passes <= FIRST_PAINTS_REPORTED {
+                ctx.log_fmt(format_args!(
+                    "console: paint #{} took {} us ({} messages this pass)",
+                    passes, this_paint, drained
+                ));
+            }
+            if this_paint > max_paint_us {
+                max_paint_us = this_paint;
+                if this_paint >= PEAK_PAINT_FLOOR_US && peak_reports < PEAK_PAINT_REPORTS {
+                    peak_reports += 1;
+                    ctx.log_fmt(format_args!(
+                        "console: SLOWEST paint so far {} us ({} messages this pass, pass {})",
+                        this_paint, drained, passes
+                    ));
+                }
+            }
         }
         // ACCUMULATE, do not threshold. The first cut of this only reported a paint over 20 ms and so
         // printed NOTHING - while 500 messages still took 8.1 seconds to render. A per-paint peak was
