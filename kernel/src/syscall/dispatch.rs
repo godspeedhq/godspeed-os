@@ -258,47 +258,13 @@ fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     // Those need opposite fixes and no log distinguishes them, so count both. Every 512 writes, so a
     // healthy machine prints rarely and a slow one cannot flood the console it is already struggling
     // to drive.
-    let t_cw0 = read_cycle_counter();
     crate::arch::imp::console_write_bytes_gated(bytes, to_fb);
-    let t_cw1 = read_cycle_counter();
     // Serial is written FIRST and unconditionally above, so the log is complete and never duplicated
-    // even though the call below can park this task. What the return value carries is the outcome of the
-    // wait, not of the write: 0, or a negative code if the terminal died while we were blocked on it.
+    // even though the call below can park this task. What the return value carries is the outcome of
+    // the wait, not of the write: 0, or a negative code if the terminal died while we were blocked.
     let out = if to_fb { deliver_to_console_service(bytes) } else { 0 };
-    {
-        static CW_CALLS:   portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
-        static CW_SERIAL:  portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
-        static CW_DELIVER: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
-        use portable_atomic::Ordering::Relaxed;
-        CW_SERIAL.fetch_add(t_cw1.wrapping_sub(t_cw0), Relaxed);
-        CW_DELIVER.fetch_add(read_cycle_counter().wrapping_sub(t_cw1), Relaxed);
-        let n = CW_CALLS.fetch_add(1, Relaxed) + 1;
-        if n % 512 == 0 {
-            // BLOCKS, not just the total. Delivery averaging 6.5 ms a write is the same number
-            // whether every write parks briefly or one in sixteen parks enormously, and those have
-            // opposite fixes: the first is the console failing to drain, the second is ordinary
-            // backpressure against a 16-deep queue. The count separates them, and deliver/blocks is
-            // then the true cost of one park rather than a figure smeared across writes that never
-            // waited at all.
-            crate::kprintln!(
-                "console-write: {} calls, {} blocked ({} ticks), {} us serial, {} us deliver",
-                n,
-                CW_BLOCKS.load(Relaxed),
-                CW_BLOCK_TICKS.load(Relaxed),
-                scheduler::cycles_to_us(CW_SERIAL.load(Relaxed)),
-                scheduler::cycles_to_us(CW_DELIVER.load(Relaxed)));
-        }
-    }
     out
 }
-
-/// Console writes that PARKED because the terminal's queue was full. Paired with the delivery
-/// total in the `console-write` report: the two together give the cost of one park.
-static CW_BLOCKS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
-
-/// Timer ticks elapsed on this core while console writes were parked. Against `CW_BLOCKS` this
-/// separates "queued behind other runnable tasks" from "the core stopped ticking".
-static CW_BLOCK_TICKS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
 /// Console writes that could not be shown because the terminal was gone, not merely behind.
 static CONSOLE_LOST: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
@@ -329,24 +295,7 @@ fn deliver_to_console_service(bytes: &[u8]) -> i64 {
         // should not run ahead of the display it is writing to. It wakes with a negative code if the
         // terminal dies instead, so this can never hang.
         Err(crate::ipc::IpcError::QueueFull) => {
-            // TIMER TICKS ACROSS THE PARK, which is what says whether 32 ms of waiting is the
-            // scheduler working or the scheduler broken. A park spanning ~3 ticks means this task
-            // genuinely queued behind three full quanta of other runnable work on its core, and the
-            // fix is upstream of the console entirely. A park spanning ~0 ticks means the core was
-            // not ticking while we waited, and 32 ms is one slowed or lost timer period - a
-            // scheduler bug wearing a console costume, which is exactly the shape of the idle-timer
-            // leak found earlier on this branch.
-            //
-            // Placement is static (§9.2), so the core cannot change under us across the block.
-            let cid = scheduler::current_core_id();
-            let ticks0 = scheduler::core_total_ticks(cid);
-            CW_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let woke = scheduler::block_and_reschedule(TaskState::BlockedOnSend);
-            CW_BLOCK_TICKS.fetch_add(
-                scheduler::core_total_ticks(cid).wrapping_sub(ticks0),
-                core::sync::atomic::Ordering::Relaxed,
-            );
-            woke
+            scheduler::block_and_reschedule(TaskState::BlockedOnSend)
         }
         // The terminal died between the name lookup and the enqueue. Serial has the bytes; say so
         // periodically rather than silently painting nothing (invariant 12).

@@ -52,13 +52,11 @@ use term::Term;
 /// live here - so this is the only party that can answer, and there is one source of truth for it.
 const REQ_DIMS: u8 = 1;
 
-/// Report progress every this many rendered messages.
 ///
 /// Present because the first hardware boot left a question plain observation could not settle: the
 /// terminal's queue sat full at 16/16 while it reported ~0% CPU, which is the signature of BOTH "too
 /// slow to keep up" and "not running at all", and those need opposite fixes. A count that climbs says
 /// the first; a count that stops says the second (§26.7 - measure, do not guess).
-const RENDER_REPORT: u64 = 500;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
@@ -88,22 +86,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log_fmt(format_args!("console: terminal {} cols x {} rows", cols, rows));
     ctx.log("console: serving the display");
 
-    let mut rendered: u64 = 0;
-    let mut bytes: u64 = 0;
 
-    // CUMULATIVE, so declared HERE - outside the loop - beside the counters that were already
-    // correct. The previous cut declared these INSIDE the loop, next to `slow_paints`, whose own
-    // comment calls it "owned loop state": per-pass storage. Cumulative counters kept in per-pass
-    // storage are re-zeroed on every pass, so the report could only ever print 0 paint, 0 busy, and
-    // `window_start` timed the current pass rather than the window. That zero was read as evidence
-    // the console did no work. It was evidence of nothing.
-    //
-    // Raw CYCLES, converted once at the report; percentages of the elapsed window, so no TSC scale
-    // factor is needed and a miscalibrated clock cannot distort the answer.
-    let mut paint_cycles: u64 = 0;
-    let mut busy_cycles: u64 = 0;
+    // Passes completed, for context in the diagnostics below.
     let mut passes: u64 = 0;
-    let mut window_start = ctx.read_tsc();
     // PAINT CADENCE. A pass drains for at most this long before painting and returning to a blocking
     // `recv`. 16 ms is about one frame; a display that repaints that often reads as smooth.
     //
@@ -134,26 +119,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     } else {
         per_10ms.saturating_mul(PAINT_DEADLINE_MS) / 10
     };
-    // THE FIRST FEW PAINTS, REPORTED IMMEDIATELY. The percentage report needs 500 rendered messages
-    // before it says anything, and on a slow display that is a long wait for the one number that
-    // decides the next fix: what a single full repaint actually costs. This screen is 3840x2160 and
-    // the framebuffer is mapped uncacheable, so if a repaint is hundreds of milliseconds the memory
-    // TYPE is the story and write-combining is the fix; if it is a handful, the cost is elsewhere.
-    // Three lines at boot, then silence.
-    const FIRST_PAINTS_REPORTED: u64 = 3;
-    // PEAK PAINT, REPORTED WHEN IT HAPPENS. The first three paints turned out to be the three
-    // CHEAPEST that exist: they run at boot, on a screen that has not filled, so nothing has
-    // scrolled yet. They measured 1 us on the machine that is slow, which says only that painting
-    // an unchanged screen is free - not what a SCROLL costs, which is the case in question.
-    //
-    // A peak that announces itself needs no capture window to coincide with it. Report only a new
-    // maximum, only above a floor worth caring about, and at most a handful of times - so an
-    // expensive repaint is loud the first time it occurs and the log stays quiet afterwards, even
-    // though the display it is being written to is the slow thing.
-    const PEAK_PAINT_FLOOR_US: u64 = 1_000;
-    const PEAK_PAINT_REPORTS: u32 = 8;
+    // How slow a single repaint must be before it is worth reporting, and how many times to say
+    // so. See the regression-guard comment at the report itself.
+    const SLOW_PAINT_FLOOR_US: u64 = 250_000;
+    const SLOW_PAINT_REPORTS: u32 = 3;
     let mut max_paint_us: u64 = 0;
-    let mut peak_reports: u32 = 0;
+    let mut slow_paint_reports: u32 = 0;
     // Passes that ended with the escape parser mid-sequence. See the watch in the loop.
     let mut stranded: u64 = 0;
     // ADAPTIVE PAINT CADENCE, derived from what a paint actually costs on THIS display.
@@ -211,8 +182,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // at least once every DRAIN_BOUND messages, and returns to a blocking recv so the core goes to
         // whoever is waiting for it. A producer
 
-    // Paints that exceeded the report threshold. Owned loop state, not a static (Invariant 9).
-    let mut slow_paints: u32 = 0;
     // Cumulative CYCLES spent inside `flush()`, and cumulative cycles spent WORKING (not waiting).
     //
     // RAW CYCLES, converted once at the report - never per sample. The first cut of this divided
@@ -234,7 +203,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // look, since the paint is already known to be free. busy near zero -> this service is idle
         // and waiting, the producer or the IPC path is slow, and no console change would help.
         let mut msg = ctx.recv();
-        let t_busy0 = ctx.read_tsc();
+        // Pass start, for the paint deadline below. Not diagnostics: this is what bounds the drain.
+        let t_pass0 = ctx.read_tsc();
         let mut drained: usize = 0;
         loop {
             // A request carries a REPLY CAP; console output never does. That, not the payload, is what
@@ -251,50 +221,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 None => {
                     let body = msg.payload_bytes();
                     term.put_bytes(body);
-                    rendered += 1;
-                    bytes += body.len() as u64;
-                    if rendered % RENDER_REPORT == 0 {
-                        // Painting time against wall-clock time between these lines is the whole
-                        // question: if most of the elapsed second is in here, the paint is the
-                        // bottleneck; if little of it is, the cost is upstream (per-message IPC,
-                        // scheduling) and making the paint cheaper would buy nothing.
-                        // AN INSTRUMENT THAT CANNOT MEASURE MUST SAY SO (invariant 12). `read_tsc`
-                        // is a syscall that returns 0 on failure, so a dead clock makes every delta
-                        // 0 and prints a confident "0%" that is indistinguishable from a genuinely
-                        // idle console. This reported 0% while the kernel's own counters showed the
-                        // same core busy, and a silent zero is what made that ambiguous. Report the
-                        // raw cycles too, and refuse to dress a dead clock up as a measurement.
-                        let now = ctx.read_tsc();
-                        let elapsed = now.wrapping_sub(window_start);
-                        if now == 0 || elapsed == 0 {
-                            ctx.log_fmt(format_args!(
-                                "console: rendered {} messages, {} bytes, CLOCK UNAVAILABLE (read_tsc {}) - no timing",
-                                rendered, bytes, now
-                            ));
-                        } else {
-                            ctx.log_fmt(format_args!(
-                                "console: rendered {} messages, {} bytes, painting {}% busy {}% of elapsed ({} paint, {} busy, {} elapsed cycles, {} passes)",
-                                rendered,
-                                bytes,
-                                paint_cycles.saturating_mul(100) / elapsed,
-                                busy_cycles.saturating_mul(100) / elapsed,
-                                paint_cycles,
-                                busy_cycles,
-                                elapsed,
-                                passes
-                            ));
-                        }
-                        paint_cycles = 0;
-                        busy_cycles = 0;
-                        passes = 0;
-                        window_start = ctx.read_tsc();
-                    }
                 }
             }
             drained += 1;
             // Deadline first; the count is only the uncalibrated-clock fallback.
             if paint_deadline != 0 {
-                if ctx.read_tsc().wrapping_sub(t_busy0) >= paint_deadline {
+                if ctx.read_tsc().wrapping_sub(t_pass0) >= paint_deadline {
                     break;
                 }
             } else if drained >= DRAIN_BOUND {
@@ -338,7 +270,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let t0 = ctx.read_tsc();
         term.flush();
         let this_paint_cycles = ctx.read_tsc().wrapping_sub(t0);
-        paint_cycles = paint_cycles.saturating_add(this_paint_cycles);
         if per_10ms != 0 {
             // EWMA over the last few paints, then aim at twice it.
             paint_ewma = if paint_ewma == 0 {
@@ -350,32 +281,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 .saturating_mul(2)
                 .clamp(deadline_floor, deadline_ceil);
         }
-        busy_cycles = busy_cycles.saturating_add(ctx.read_tsc().wrapping_sub(t_busy0));
         passes += 1;
         if per_10ms != 0 {
-            let this_paint = ctx.read_tsc().wrapping_sub(t0) / per_us;
-            if passes <= FIRST_PAINTS_REPORTED {
-                ctx.log_fmt(format_args!(
-                    "console: paint #{} took {} us ({} messages this pass)",
-                    passes, this_paint, drained
-                ));
-            }
+            let this_paint = this_paint_cycles / per_us;
             if this_paint > max_paint_us {
                 max_paint_us = this_paint;
-                if this_paint >= PEAK_PAINT_FLOOR_US && peak_reports < PEAK_PAINT_REPORTS {
-                    peak_reports += 1;
+                // REGRESSION GUARD, not a measurement. A repaint on this display costs tens of
+                // milliseconds; it cost 596 ms when the framebuffer was mapped strong-uncacheable,
+                // because every pixel write went to the bus alone. The floor sits well above healthy
+                // and well below that, so this is SILENT on a working machine and loud the moment
+                // the mapping regresses - which is a one-word change in the kernel and otherwise
+                // shows up only as "the display feels slow" months later.
+                if this_paint >= SLOW_PAINT_FLOOR_US && slow_paint_reports < SLOW_PAINT_REPORTS {
+                    slow_paint_reports += 1;
                     ctx.log_fmt(format_args!(
-                        "console: SLOWEST paint so far {} us ({} messages this pass, pass {})",
-                        this_paint, drained, passes
+                        "console: paint took {} us - far slower than this display should be;                          check the framebuffer memory type (pass {})",
+                        this_paint, passes
                     ));
                 }
             }
         }
-        // ACCUMULATE, do not threshold. The first cut of this only reported a paint over 20 ms and so
-        // printed NOTHING - while 500 messages still took 8.1 seconds to render. A per-paint peak was
-        // the wrong question: at ~62 tiny messages a second, paints just UNDER the threshold can still
-        // consume the entire second, and a threshold is blind to exactly that. The total is not.
-        let _ = slow_paints;
     }
 }
 
