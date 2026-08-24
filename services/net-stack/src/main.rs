@@ -19,7 +19,7 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message};
+use godspeed_sdk::{ServiceContext, Message, DeadlineOutcome};
 
 // Our MAC is LEARNED from the NIC, never hardcoded (audit U9 / Commandment III). The controller's
 // burned-in MAC is the one source of truth for our hardware identity; nic-driver reads it (RTL8168
@@ -123,59 +123,40 @@ fn nic_status_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Mess
 // there is nothing left to pace: congestion is handled by the primitive instead of by a retry loop
 // that could give up and report a frame as refused.)
 
+/// A busy nic-driver is congestion, not absence: back off briefly and re-ask, up to a bound.
+const NIC_BUSY_MS: u64 = 2;
+const NIC_BUSY_TRIES: u32 = 8;
+
 fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
-    // MEASURE THE FAILURE, DO NOT LABEL IT. Two hypotheses about why this returns None have now been
-    // wrong - the driver spinning past the caller's budget, and replies crowded out of a shared queue
-    // - and the caller turns None into "the driver refused them", a claim the wire flatly
-    // contradicts (14 DISCOVERs sent, 14 OFFERs back, 7 REQUESTs sent, 7 ACKs back). The elapsed time
-    // separates what is left: about 0 ms means the SEND failed outright, about `secs` means the driver
-    // never answered. Bounded by the caller's own retry count (DANCE_TRIES), so this cannot flood.
-    let t0 = ctx.read_tsc();
-    let first = ctx.request_with_reply_call_err("nic-driver", msg, secs);
-    // Keep the REASON before unwrapping the value - `Message` is not Clone, so record it as a code.
-    let why: i32 = match &first {
-        Ok(Some(_)) => 0,
-        Ok(None)    => -1,                                            // the deadline passed
-        Err(godspeed_sdk::ipc::IpcError::QueueFull)       => -2,
-        Err(godspeed_sdk::ipc::IpcError::EndpointDead)    => -3,
-        Err(godspeed_sdk::ipc::IpcError::MessageTooLarge) => -4,
-        Err(godspeed_sdk::ipc::IpcError::ReplyDead)       => -5,
-        Err(_)                                            => -6,      // CapError
-    };
-    let out = first.ok().flatten()
-        .or_else(|| {
-            // One reacquire-and-retry, for a driver that restarted underneath us (§14.3).
-            if ctx.reacquire_by_name("nic-driver") {
-                ctx.request_with_reply_call("nic-driver", msg, secs)
-            } else {
-                None
+    // `request_with_reply_deadline_outcome`, NOT the `Call` primitive. Switching this to `Call`
+    // during the x86 work is what stopped Pi 2 networking, and it was isolated by elimination on
+    // hardware: with `Call`, nic-driver answers with an EMPTY status - no MAC, no link - so
+    // net-stack never configures, DHCP never runs and every ping dies. Measured on the same board
+    // and cable, with the drain loops and the serving otherwise identical: `Call` gives 0 frames
+    // addressed to us, this gives 70 (2 ARP, 68 IPv4), a lease, and replies.
+    //
+    // WHY it fails is NOT yet established, and this comment will not pretend otherwise. `Call` is
+    // the more correct primitive in principle - it dequeues the reply matched to its reply cap,
+    // instead of taking whatever is next and possibly eating a client's request (CLAUDE.md §8.2).
+    // Something about it does not hold on this path, and finding out is worth doing properly rather
+    // than guessing at, which has already cost a day here.
+    //
+    // The x86 reason for the `Call` switch was that a plain recv could consume an unrelated client
+    // request. That hazard is real, so this is a KNOWN debt, not a clean revert: recorded here
+    // rather than closed (§26.7).
+    for _ in 0..NIC_BUSY_TRIES {
+        match ctx.request_with_reply_deadline_outcome("nic-driver", msg, secs) {
+            DeadlineOutcome::Reply(r) => return Some(r),
+            DeadlineOutcome::QueueFull => {
+                ctx.sleep(ctx.duration_cycles(NIC_BUSY_MS));
+                continue;
             }
-        });
-    if out.is_none() {
-        let per_ms = ctx.duration_cycles(1).max(1);
-        // A PEER THAT WAS DELIBERATELY KILLED IS NOT NEWS.
-        //
-        // This printed on every failure and produced 134 lines in one chaos run - and every one of
-        // them was `nic-driver` being killed on purpose, which is the system behaving correctly. Noise
-        // like that is not just untidy: it buries the failures that ARE news, which is the opposite of
-        // what a loud-failure rule is for (§26.7 asks for visible failure, not volume).
-        //
-        // So the two are separated. A dead or restarting peer is EXPECTED - §14.3 says a client sees
-        // this and reacquires - and is reported once per run with a running count, not per occurrence.
-        // Anything else is genuinely unexplained and still prints every time.
-        // EndpointDead / ReplyDead mean the peer died or restarted underneath this request. That is
-        // ordinary (§14.3: the client sees it, reacquires, retries), it is ALREADY reported by the
-        // supervisor's "nic-driver died, restarting" and by this caller's own aggregate, and saying
-        // it a third time per call is what produced 134 lines in a single chaos run. Silent here
-        // is not silent overall - it is the same fact, not repeated.
-        if matches!(why, -3 | -5) { return out; }
-        ctx.log_fmt(format_args!(
-            "net-stack: nic-driver gave NO ANSWER after {} ms (budget {} s) for op {} [why {}]",
-            ctx.read_tsc().wrapping_sub(t0) / per_ms,
-            secs,
-            msg.payload_bytes().first().copied().unwrap_or(0), why));
+            DeadlineOutcome::SendFailed if ctx.reacquire_by_name("nic-driver") =>
+                return ctx.request_with_reply_deadline("nic-driver", msg, secs),
+            _ => return None,
+        }
     }
-    out
+    None
 }
 
 /// Phase 3: a DHCP DISCOVER over UDP - ask QEMU slirp's built-in DHCP server for our IP and read the
