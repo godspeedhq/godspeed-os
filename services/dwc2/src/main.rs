@@ -504,7 +504,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // difference between a driver and a poller, and it should not have to be inferred from
         // throughput a month later.
         ctx.irq_unmask(USB_VECTOR);
-        ctx.log("dwc2-svc: USB vector unmasked - receive is interrupt-driven");
+        // NOT a claim that receive IS interrupt-driven - it is not, yet, and the counters below say
+        // so: zero interrupts across a run that moved real traffic. The vector is armed and the
+        // handler is in place, but `core::reset_and_host_mode` deliberately clears GAHBCFG's global
+        // interrupt bit and writes GINTMSK = 0, because this driver was written as a poller. The
+        // controller therefore never asserts the line, and no unmask on our side can change that.
+        //
+        // Enabling it is real device bring-up, not a flag: GINTMSK.HCHINT plus the global enable,
+        // and then reconciling the handler with every polled path that also consumes HCINT - they
+        // would race for the same channel state. Recorded rather than half-done (§26.7).
+        ctx.log("dwc2-svc: USB vector armed (controller interrupts still masked at init - receive is polled)");
 
         loop {
             passes = passes.wrapping_add(1);
