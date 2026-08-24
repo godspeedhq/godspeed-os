@@ -1426,7 +1426,9 @@ fn nic_drain(ctx: &ServiceContext) -> Option<Message> {
         Some(m) => { let p = m.payload_bytes(); p.is_empty() || p[0] == 0 }
         None    => true,
     };
-    if empty { ctx.sleep_ms(1); }
+    // NO SLEEP HERE. The caller already paces an empty poll, so this was a SECOND delay stacked on
+    // the first. Pacing belongs in one place, and on a NIC where the host must keep a bulk-IN
+    // outstanding every millisecond not spent asking is a millisecond of frames its FIFO drops.
     r
 }
 fn link_is_up(ctx: &ServiceContext) -> bool {
