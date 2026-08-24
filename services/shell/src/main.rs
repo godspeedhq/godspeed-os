@@ -5260,9 +5260,19 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
                     if rtt > rmax { rmax = rtt; }
                     rsum += rtt as u64; vcount += 1;
                 } else if p.first() == Some(&2) {
+                    // "LINK NOT CONFIRMED", not "no link". The distinction is the whole difference
+                    // between a hedge and a false statement: "cable unplugged?" is a QUESTION and
+                    // stays, because it is a fair thing to suggest; "no link" was an ASSERTION, and
+                    // it was made on a machine whose cable was plainly in and whose link was up.
+                    //
+                    // What the stack actually establishes to send this code is that it could not
+                    // CONFIRM a link - which a genuinely unplugged cable and a driver that did not
+                    // answer inside its deadline produce identically, and this layer cannot tell
+                    // them apart. So it names both and asserts neither.
+
                     // net-stack reports the NIC link is down - keep pinging at the same cadence so it is
                     // clearly still trying, and it resumes the moment the cable is back.
-                    out.line_fmt(ctx, format_args!("No reply from {}.{}.{}.{}: no link (cable unplugged?)", ip[0], ip[1], ip[2], ip[3]));
+                    out.line_fmt(ctx, format_args!("No reply from {}.{}.{}.{}: link not confirmed - cable unplugged, or the NIC driver did not answer", ip[0], ip[1], ip[2], ip[3]));
                 } else {
                     out.line_fmt(ctx, format_args!("Request timed out."));
                 }
