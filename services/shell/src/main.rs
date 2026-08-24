@@ -5643,16 +5643,29 @@ fn net_link_up(ctx: &ServiceContext) -> Option<bool> {
     // shell lives. That is consistent with what the Pi 2 showed - net-stack saw the link come up and
     // auto-configured while the shell, asking the same driver a second later, got nothing.
     if let Some(r) = ctx.request_with_reply_deadline("nic-driver", &req, 2) {
-        let p = r.payload_bytes();
-        return if p.len() >= 8 { Some(p[7] != 0) } else { None };
+        return read_link(r.payload_bytes());
     }
     if ctx.reacquire_by_name("nic-driver") {
         if let Some(r) = ctx.request_with_reply_deadline("nic-driver", &req, 2) {
-            let p = r.payload_bytes();
-            return if p.len() >= 8 { Some(p[7] != 0) } else { None };
+            return read_link(r.payload_bytes());
         }
     }
     None
+}
+
+/// Read a `[3]` status reply: `[ok, mac(6), link]`.
+///
+/// HONOUR THE OK BYTE. The driver replies with an all-zero buffer when its own query to the device
+/// failed - `ok = 0` AND `link = 0` - and reading only the link byte turns "I could not find out"
+/// into "the cable is out". That is how ping came to report an unplugged cable on a Pi 2 with the
+/// cable plainly in: the shell was faithfully relaying a zero that never meant what it read as.
+///
+/// The protocol already carries the distinction; nothing here needed inventing, only reading.
+fn read_link(p: &[u8]) -> Option<bool> {
+    if p.len() < 8 || p[0] == 0 {
+        return None;                    // driver could not determine it - not the same as "down"
+    }
+    Some(p[7] != 0)
 }
 
 /// `net lease` - ONE WORD: `ok`, `none`, or nothing at all if net-stack does not answer.

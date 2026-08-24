@@ -768,6 +768,8 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
 
     // Counts replies that could not be delivered; see `note_reply`.
     let mut reply_fails = 0u32;
+    // Info queries the device could not answer. Serve-loop-local, not a file-scope static.
+    let mut info_fails: u32 = 0;
     loop {
         let _req = ctx.recv();
         let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
@@ -781,6 +783,23 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
                 out[0] = 1;
                 out[1..7].copy_from_slice(&ni[0..6]);
                 out[7] = ni[6];
+            } else {
+                // SAY SO. On failure this replies all zeros, which means ok=0 AND link=0 - and a
+                // reader that checks only the link byte reads that as "the cable is out". It did:
+                // ping on a Pi 2 blamed an unplugged cable while the cable was in. The ok byte now
+                // carries the distinction to the caller, and this line says which half failed here,
+                // because "the driver could not determine the link" and "dwc2 did not answer" are
+                // different faults and the reply alone cannot tell them apart.
+                //
+                // Rate-limited: the first few, then every 64th, so a persistently silent device is
+                // loud once rather than once per ping.
+                info_fails += 1;
+                if info_fails <= 3 || info_fails % 64 == 0 {
+                    ctx.log_fmt(format_args!(
+                        "nic-driver: dwc2 did not answer the info query - link state UNKNOWN,                          reporting not-ok rather than down ({} so far)",
+                        info_fails
+                    ));
+                }
             }
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)), &ctx, &mut reply_fails);
         } else if p.len() == 1 && p[0] == 4 {
