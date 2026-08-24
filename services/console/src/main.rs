@@ -152,6 +152,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     const PEAK_PAINT_REPORTS: u32 = 8;
     let mut max_paint_us: u64 = 0;
     let mut peak_reports: u32 = 0;
+    // Passes that ended with the escape parser mid-sequence. See the watch in the loop.
+    let mut stranded: u64 = 0;
     loop {
         // TAKE THE WHOLE QUEUE, THEN PAINT ONCE.
         //
@@ -291,6 +293,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Bounded and quiet: only a paint over 20 ms is reported, and only every 32nd after the first
         // few, so a fast display prints nothing at all and a slow one cannot flood the log it is
         // already struggling to render.
+        // STRANDED PARSER WATCH. A writer killed between an ESC and the sequence's final byte
+        // leaves the escape state machine mid-sequence, and every byte after that is swallowed as
+        // sequence body instead of being rendered. Chaos kills writers by design, so this is the
+        // shape to look for behind "the console started rendering funny, and respawning it fixed
+        // it": the damage lives in THIS service's parser state, not on the screen.
+        //
+        // Reported the first few times and then every 64th, so a genuinely stuck parser is loud
+        // without flooding the log through the very console that is misbehaving. A sequence
+        // legitimately spanning a message boundary shows up here once and then clears; a stranded
+        // one never clears.
+        let esc = term.esc_state();
+        if esc != 0 {
+            stranded += 1;
+            if stranded <= 5 || stranded % 64 == 0 {
+                ctx.log_fmt(format_args!(
+                    "console: escape parser mid-sequence (state {}) at end of pass {} - {} passes so far",
+                    esc, passes, stranded
+                ));
+            }
+        }
         let t0 = ctx.read_tsc();
         term.flush();
         paint_cycles = paint_cycles.saturating_add(ctx.read_tsc().wrapping_sub(t0));

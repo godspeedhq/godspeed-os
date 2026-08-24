@@ -217,6 +217,16 @@ impl Term {
     /// Separate from `put_bytes` so a caller that has several messages in hand can apply them all and
     /// pay for ONE repaint. Calling it once per message is still correct - it is just the expensive way,
     /// and it is what jammed the console under load.
+    /// The escape-sequence parser's state: 0 normal, 1 saw ESC, 2 inside CSI.
+    ///
+    /// Exposed so the service loop can notice the parser being STRANDED mid-sequence. A writer
+    /// killed between the ESC and the sequence's final byte leaves this non-zero, and every byte
+    /// after it is then consumed as sequence body rather than rendered - the display appears to
+    /// stop working, and stays that way until this service is respawned.
+    pub fn esc_state(&self) -> u8 {
+        self.s.esc
+    }
+
     pub fn flush(&mut self) {
         if self.s.repaint_pending {
             // Cleared FIRST: the repaint draws cells, and the cell painter skips drawing while a
