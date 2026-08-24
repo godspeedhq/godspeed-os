@@ -80,6 +80,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut buf = [0u8; LINE_MAX];
     let mut len = 0usize;
 
+    // Idle poll period, in milliseconds: fast while an operator is typing, backing off while the port
+    // is silent. See the backoff comment in the loop for why a FIXED period was wrong twice over.
+    const IDLE_MIN_MS: u64 = 10;
+    const IDLE_MAX_MS: u64 = 250;
+    const IDLE_GROWTH: u64 = 3;
+    let mut idle_ms: u64 = IDLE_MIN_MS;
+
     loop {
         // Drain what is waiting, then sleep. BOUNDED per pass so a stuck port cannot monopolise this
         // task, and the bound is a count because it bounds WORK PER PASS, not a duration - the loop
@@ -105,10 +112,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 len += 1;
             }
         }
-        if !got_any {
-            // Nothing waiting: yield the core rather than spin. Time here only conserves CPU, it does
-            // not決 decide correctness - the truth is still "a byte arrived" (Commandment VIII).
-            ctx.sleep(ctx.duration_cycles(10));
+        if got_any {
+            // Something arrived: an operator is talking to us, so answer at full speed.
+            idle_ms = IDLE_MIN_MS;
+        } else {
+            // Nothing waiting: sleep, and BACK OFF the longer nothing comes. Time here only conserves
+            // CPU, it does not decide correctness - the truth is still "a byte arrived"
+            // (Commandment VIII), and the backoff changes only how often we ask.
+            //
+            // A fixed 10 ms poll had two problems. It never stops: on a machine with no COM2 at all -
+            // and this port is absent on plenty of them, the kernel says so at boot and suppresses the
+            // reads - this task woke a hundred times a second, forever, to ask a port that does not
+            // exist whether it had anything to say. And 10 ms is exactly the scheduler quantum, so the
+            // wakeups resonated with the tick that samples per-task CPU: whoever is running when the
+            // tick fires is charged the whole 10 ms, and a task waking on precisely that period gets
+            // charged far more than it uses. It measured 36% of a core for work that is a few
+            // microseconds of port reads.
+            //
+            // Backing off to IDLE_MAX_MS costs latency only on the FIRST byte after a quiet spell,
+            // after which the reset above restores full speed for the rest of the line. The growth
+            // factor keeps the period off any exact multiple of the quantum, so it cannot settle into
+            // that resonance again.
+            ctx.sleep(ctx.duration_cycles(idle_ms));
+            idle_ms = (idle_ms * IDLE_GROWTH).min(IDLE_MAX_MS);
         }
     }
 }
