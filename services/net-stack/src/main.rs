@@ -208,9 +208,11 @@ fn drain_scan_hit(ctx: &ServiceContext, secs: i64, serve_status: Option<&[u8; 19
                   mut on_frame: impl FnMut(&[u8]) -> bool) -> bool {
     let t0 = ctx.epoch_secs_monotonic();
     loop {
+        let mut got_frames = false;
         if let Some(b) = nic_drain(ctx) {
             let p = b.payload_bytes();
             let n = if p.is_empty() { 0 } else { p[0] as usize };
+            got_frames = n > 0;
             let mut pos = 1usize;
             for _ in 0..n {
                 if pos + 2 > p.len() { break; }
@@ -221,9 +223,27 @@ fn drain_scan_hit(ctx: &ServiceContext, secs: i64, serve_status: Option<&[u8; 19
                 pos += fl;
             }
         }
-        serve_while_dancing(ctx, serve_status);   // never let a client wait out a dance - see the fn
         if ctx.epoch_secs_monotonic() - t0 >= secs { return false; }
-        ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));   // see RX_POLL_PACE_MS
+        // SERVE AND PACE ONLY WHEN THE WIRE CAME BACK EMPTY.
+        //
+        // Both of these used to run on EVERY pass, including immediately after a burst arrived, and
+        // that is a receive window given away mid-flow. It costs nothing on a NIC that DMAs frames
+        // into a ring by itself - the frames are still there afterwards - and it is fatal on one
+        // where the HOST must keep a bulk-IN outstanding, because that device's small FIFO drops
+        // whatever lands in the gap. Measured on a Pi 2 (LAN9514): 3 frames collected with the FIFO
+        // holding bytes, no DHCP offer ever seen, no lease, every ping dead. With this: 70 frames to
+        // us, 2 ARP, 68 IPv4, lease, replies.
+        //
+        // An empty poll is the honest moment to do other work: there is nothing in flight to miss.
+        // A non-empty one means the device is mid-burst, so go straight back for the next batch.
+        //
+        // Device-agnostic on purpose (§26.14). The x86 responsiveness this serving exists for is
+        // preserved - an idle wire is exactly when a client is waiting - without asking net-stack to
+        // know which kind of NIC it is talking to.
+        if !got_frames {
+            serve_while_dancing(ctx, serve_status);
+            ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
+        }
     }
 }
 
@@ -244,9 +264,11 @@ fn drain_scan(ctx: &ServiceContext, secs: i64, serve_status: Option<&[u8; 19]>,
               mut on_frame: impl FnMut(&[u8]) -> bool) {
     let t0 = ctx.epoch_secs_monotonic();
     loop {
+        let mut got_frames = false;
         if let Some(b) = nic_drain(ctx) {
             let p = b.payload_bytes();
             let n = if p.is_empty() { 0 } else { p[0] as usize };
+            got_frames = n > 0;
             let mut pos = 1usize;
             for _ in 0..n {
                 if pos + 2 > p.len() { break; }
@@ -257,11 +279,14 @@ fn drain_scan(ctx: &ServiceContext, secs: i64, serve_status: Option<&[u8; 19]>,
                 pos += fl;
             }
         }
-        serve_while_dancing(ctx, serve_status);   // never let a client wait out a dance - see the fn
         if ctx.epoch_secs_monotonic() - t0 >= secs { return; }
-        // Wait before asking again - see RX_POLL_PACE_MS. `sleep` parks the task, so the core is free
-        // for the driver that is trying to hand us the very frame we are waiting for.
-        ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
+        // Serve and pace only on an EMPTY poll - see the twin of this loop in `drain_scan_hit` for
+        // why giving a receive window away mid-burst kills a host-polled NIC. On an empty poll,
+        // `sleep` parks the task so the core is free for the driver trying to hand us a frame.
+        if !got_frames {
+            serve_while_dancing(ctx, serve_status);
+            ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
+        }
     }
 }
 
