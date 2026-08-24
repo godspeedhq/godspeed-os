@@ -188,6 +188,7 @@ fn serve_while_dancing(ctx: &ServiceContext, serve_status: Option<&[u8; 19]>) {
 fn drain_scan_hit(ctx: &ServiceContext, secs: i64, serve_status: Option<&[u8; 19]>,
                   mut on_frame: impl FnMut(&[u8]) -> bool) -> bool {
     let t0 = ctx.epoch_secs_monotonic();
+    let mut empty_polls: u32 = 0;
     loop {
         let mut got_frames = false;
         if let Some(b) = nic_drain(ctx) {
@@ -221,9 +222,28 @@ fn drain_scan_hit(ctx: &ServiceContext, secs: i64, serve_status: Option<&[u8; 19
         // Device-agnostic on purpose (§26.14). The x86 responsiveness this serving exists for is
         // preserved - an idle wire is exactly when a client is waiting - without asking net-stack to
         // know which kind of NIC it is talking to.
-        if !got_frames {
+        if got_frames {
+            empty_polls = 0;
+        } else {
             serve_while_dancing(ctx, serve_status);
-            ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
+            empty_polls += 1;
+            // YIELD FIRST, SLEEP ONLY ONCE THE WIRE IS GENUINELY IDLE.
+            //
+            // `sleep` asks the scheduler for a MINIMUM, not a maximum. dwc2's own main loop records
+            // measuring a 10 ms sleep take 3.8 SECONDS under `selfcheck`, because the service shares
+            // a core with everything driving it - and nothing reads the device while we are gone. A
+            // DHCP OFFER that arrives in that window is dropped by a FIFO that holds about one
+            // burst, which is why the lease missed its 20 s budget and pings vanished.
+            //
+            // A reply usually follows the frame that prompted it, so the moments just after traffic
+            // are the worst possible time to go blind. Yield for the first few empty polls - giving
+            // up the core, but resuming at the next opportunity instead of adding a floor to it -
+            // then fall back to the pace once the wire really has nothing.
+            if empty_polls <= EMPTY_YIELDS {
+                ctx.yield_cpu();
+            } else {
+                ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
+            }
         }
     }
 }
@@ -240,10 +260,15 @@ fn drain_scan_hit(ctx: &ServiceContext, secs: i64, serve_status: Option<&[u8; 19
 /// 10 ms is one scheduler quantum: fast enough that a frame is picked up promptly, slow enough that
 /// the driver is left alone to receive it.
 const RX_POLL_PACE_MS: u64 = 10;
+/// Empty polls to YIELD through before falling back to the pace sleep. See the drain loops: a reply
+/// tends to follow the frame that prompted it, and a sleep here is a blackout of unpredictable
+/// length, not a 10 ms one.
+const EMPTY_YIELDS: u32 = 12;
 
 fn drain_scan(ctx: &ServiceContext, secs: i64, serve_status: Option<&[u8; 19]>,
               mut on_frame: impl FnMut(&[u8]) -> bool) {
     let t0 = ctx.epoch_secs_monotonic();
+    let mut empty_polls: u32 = 0;
     loop {
         let mut got_frames = false;
         if let Some(b) = nic_drain(ctx) {
@@ -264,9 +289,28 @@ fn drain_scan(ctx: &ServiceContext, secs: i64, serve_status: Option<&[u8; 19]>,
         // Serve and pace only on an EMPTY poll - see the twin of this loop in `drain_scan_hit` for
         // why giving a receive window away mid-burst kills a host-polled NIC. On an empty poll,
         // `sleep` parks the task so the core is free for the driver trying to hand us a frame.
-        if !got_frames {
+        if got_frames {
+            empty_polls = 0;
+        } else {
             serve_while_dancing(ctx, serve_status);
-            ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
+            empty_polls += 1;
+            // YIELD FIRST, SLEEP ONLY ONCE THE WIRE IS GENUINELY IDLE.
+            //
+            // `sleep` asks the scheduler for a MINIMUM, not a maximum. dwc2's own main loop records
+            // measuring a 10 ms sleep take 3.8 SECONDS under `selfcheck`, because the service shares
+            // a core with everything driving it - and nothing reads the device while we are gone. A
+            // DHCP OFFER that arrives in that window is dropped by a FIFO that holds about one
+            // burst, which is why the lease missed its 20 s budget and pings vanished.
+            //
+            // A reply usually follows the frame that prompted it, so the moments just after traffic
+            // are the worst possible time to go blind. Yield for the first few empty polls - giving
+            // up the core, but resuming at the next opportunity instead of adding a floor to it -
+            // then fall back to the pace once the wire really has nothing.
+            if empty_polls <= EMPTY_YIELDS {
+                ctx.yield_cpu();
+            } else {
+                ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
+            }
         }
     }
 }
