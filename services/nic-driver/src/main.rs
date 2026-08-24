@@ -768,6 +768,8 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
 
     // Counts replies that could not be delivered; see `note_reply`.
     let mut reply_fails = 0u32;
+    // Attempts at the read-only info query before reporting failure. See the STATUS arm below.
+    const INFO_TRIES: u8 = 3;
     // Info queries the device could not answer. Serve-loop-local, not a file-scope static.
     let mut info_fails: u32 = 0;
     loop {
@@ -779,7 +781,20 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             // STATUS: [ok, mac(6), link] - net-stack reads MAC at [1..7] and link at [7].
             let mut out = [0u8; 8];
             let mut ni = [0u8; 7];
-            if dev_info(&ctx, &mut ni) {
+            // RETRY before giving up. On failure this replies all zeros, and a zero link byte in a
+            // well-formed reply is indistinguishable from a dead cable - so ONE timed-out query to
+            // dwc2 reached the operator as "cable unplugged" with the cable plainly in.
+            //
+            // Why the retry belongs HERE, from the evidence rather than from reasoning about the
+            // code: dwc2's own link read never answered "down" once the link was up, and net-stack
+            // never failed to get a reply. Only this query was failing. It is read-only, so
+            // re-asking costs nothing and pops nothing - unlike the RX op next door, whose comment
+            // rightly forbids a re-send.
+            let mut got = false;
+            for _ in 0..INFO_TRIES {
+                if dev_info(&ctx, &mut ni) { got = true; break; }
+            }
+            if got {
                 out[0] = 1;
                 out[1..7].copy_from_slice(&ni[0..6]);
                 out[7] = ni[6];
@@ -796,8 +811,8 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
                 info_fails += 1;
                 if info_fails <= 3 || info_fails % 64 == 0 {
                     ctx.log_fmt(format_args!(
-                        "nic-driver: dwc2 did not answer the info query - link state UNKNOWN,                          reporting not-ok rather than down ({} so far)",
-                        info_fails
+                        "nic-driver: dwc2 did not answer the info query after {} tries - reporting link                          down, which may be wrong ({} so far)",
+                        INFO_TRIES, info_fails
                     ));
                 }
             }
