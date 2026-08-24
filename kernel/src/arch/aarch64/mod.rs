@@ -2237,8 +2237,6 @@ pub mod interrupts {
         // so every caller must re-check its condition rather than assume a wake means progress.
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
     }
-    /// The idle loop may `wfi`: the generic timer keeps ticking through it, so a halted core is woken
-    /// by its own 100 Hz tick even if nothing else ever targets it.
     #[cfg(feature = "pi4")]
     /// May the idle loop MASK interrupts, re-check for runnable work, and then halt - relying on the
     /// halt to unmask and halt in one indivisible step?
@@ -2262,6 +2260,9 @@ pub mod interrupts {
     /// narrower window; it is recorded here rather than silently left (26.7).
     pub fn idle_mask_before_halt() -> bool { false }
 
+    /// The idle loop may `wfi`: the generic timer keeps ticking through it, so a halted core is woken
+    /// by its own 100 Hz tick even if nothing else ever targets it.
+    #[cfg(feature = "pi4")]
     pub fn idle_can_halt() -> bool { true }
 
     #[cfg(not(feature = "pi4"))]
@@ -2276,6 +2277,8 @@ pub mod interrupts {
     pub fn wait_for_interrupt() {}                           // wfi
     #[cfg(not(feature = "pi4"))]
     pub fn idle_mask_before_halt() -> bool { false }
+    /// The stub arch layer cannot wake a halted core, so its idle loop must not halt.
+    #[cfg(not(feature = "pi4"))]
     pub fn idle_can_halt() -> bool { false }
     pub fn send_eoi() {}                                     // GIC EOIR
     pub fn fire_test_irq(irq: u8) {}

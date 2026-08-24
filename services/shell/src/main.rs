@@ -5073,7 +5073,9 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         // SAY WHY, not just "unknown". The three sources are tried in order - a hardware clock, the
         // network, then the floor on disk - so naming the one that is missing is the difference between
         // a user waiting for something that will happen and a user waiting for something that will not.
-        let linked = net_link_up(ctx);
+        // Unknown counts as NOT linked here: this only decides whether to promise the clock will
+        // arrive, and promising it on a link we could not confirm is the worse error.
+        let linked = net_link_up(ctx) == Some(true);
         out.line_fmt(ctx, format_args!(
             "the clock is not set: this board has no RTC, so the time can only come from the network"));
         if linked {
@@ -5603,8 +5605,12 @@ fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> 
 /// The order is the order the layers come up in, so the FIRST missing one is named rather than the
 /// last: a machine with no cable is told about the cable, not about its gateway.
 fn net_unconfigured_reason(ctx: &ServiceContext) -> Option<&'static str> {
-    if !net_link_up(ctx) {
-        return Some("no link (cable unplugged?)");
+    match net_link_up(ctx) {
+        Some(true) => {}
+        Some(false) => return Some("no link (cable unplugged?)"),
+        // Say what actually happened. Blaming the cable here is how a driver problem spent a whole
+        // session looking like a hardware one.
+        None => return Some("cannot reach nic-driver (no answer) - link state unknown"),
     }
     let r = ctx.request_with_reply_deadline("net-stack", &Message::from_bytes(&[0u8]), 3)?;
     let p = r.payload_bytes();
@@ -5621,12 +5627,32 @@ fn net_unconfigured_reason(ctx: &ServiceContext) -> Option<&'static str> {
     None
 }
 
-fn net_link_up(ctx: &ServiceContext) -> bool {
+/// Link state as the DRIVER reports it, or `None` when the driver could not be reached.
+///
+/// THREE outcomes, not two. This used to return `bool` and fold "the driver did not answer" into
+/// `false`, which the caller then printed as "no link (cable unplugged?)" - a confident diagnosis of
+/// the one thing it had NOT established, with the cable plugged in the whole time. Reported from a
+/// Pi 2, where every ping said the cable was out until a chaos run restarted things.
+///
+/// The two causes need opposite responses (check the cable, versus the driver is unreachable) and
+/// §26.7 forbids a failed query from quietly becoming an answer, so they stay distinguishable here.
+fn net_link_up(ctx: &ServiceContext) -> Option<bool> {
     let req = Message::from_bytes(&[3u8]);
-    match ctx.request_with_reply_deadline("nic-driver", &req, 2) {
-        Some(r) => { let p = r.payload_bytes(); p.len() >= 8 && p[7] != 0 }
-        None => false,
+    // Reacquire and retry ONCE before giving up (§14.3). A cap to a service that has since restarted
+    // is stale, and nothing refreshes it on our behalf: the request just fails, for as long as this
+    // shell lives. That is consistent with what the Pi 2 showed - net-stack saw the link come up and
+    // auto-configured while the shell, asking the same driver a second later, got nothing.
+    if let Some(r) = ctx.request_with_reply_deadline("nic-driver", &req, 2) {
+        let p = r.payload_bytes();
+        return if p.len() >= 8 { Some(p[7] != 0) } else { None };
     }
+    if ctx.reacquire_by_name("nic-driver") {
+        if let Some(r) = ctx.request_with_reply_deadline("nic-driver", &req, 2) {
+            let p = r.payload_bytes();
+            return if p.len() >= 8 { Some(p[7] != 0) } else { None };
+        }
+    }
+    None
 }
 
 /// `net lease` - ONE WORD: `ok`, `none`, or nothing at all if net-stack does not answer.
@@ -5640,9 +5666,18 @@ fn net_link_up(ctx: &ServiceContext) -> bool {
 /// - `none` - the link is up and we are on the fallback address, which routes nowhere
 /// - (silence) - net-stack did not reply, so the caller can retry rather than conclude anything
 fn net_lease(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
-    if !net_link_up(ctx) {
-        out.line(ctx, "ok");            // no cable: nothing to lease, and not a fault
-        return Ok(());
+    match net_link_up(ctx) {
+        Some(true) => {}
+        Some(false) => {
+            out.line(ctx, "ok");        // no cable: nothing to lease, and not a fault
+            return Ok(());
+        }
+        // NOT "ok". We did not establish there is no link, so reporting the healthy no-cable answer
+        // would hide an unreachable driver behind a pass (§26.7).
+        None => {
+            out.line(ctx, "cannot reach nic-driver (no answer) - link state unknown");
+            return Ok(());
+        }
     }
     let req = Message::from_bytes(&[0u8]);
     match ctx.request_with_reply_deadline("net-stack", &req, 3) {
