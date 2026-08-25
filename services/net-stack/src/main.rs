@@ -153,7 +153,22 @@ fn nic_req(ctx: &ServiceContext, msg: &Message, secs: i64) -> Option<Message> {
             }
             DeadlineOutcome::SendFailed if ctx.reacquire_by_name("nic-driver") =>
                 return ctx.request_with_reply_deadline("nic-driver", msg, secs),
-            _ => return None,
+            // A TIMEOUT ALSO DESERVES A REACQUIRE, and this is where nine net-stack restarts went
+            // wrong. Only SendFailed reacquired, so once nic-driver restarted and this cap died in a
+            // way that presents as silence rather than a send error, every later query returned None
+            // - `link_is_up` folds that into "no link", net-stack logged "no link at boot ... staying
+            // unconfigured" seven times, and it then waited for a link-up EDGE that had already
+            // happened while the cable never moved. One DHCP ACK across nine restarts.
+            //
+            // §14.3 puts reacquisition on the client, and the shell needed exactly this for its own
+            // net-stack and nic-driver queries. Once per call, and only after the deadline has
+            // already passed, so a healthy path is untouched: this is recovery, not a retry loop.
+            _ => {
+                if ctx.reacquire_by_name("nic-driver") {
+                    return ctx.request_with_reply_deadline("nic-driver", msg, secs);
+                }
+                return None;
+            }
         }
     }
     None
