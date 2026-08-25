@@ -83,7 +83,8 @@ pub const USB_VECTOR: u8 = 0x29;
 /// with it (Commandment III).
 ///
 /// It is also what makes the transition reversible from the prompt: `spawn dwc2` quiets the kernel
-/// driver, `kill dwc2` (which calls `route::unregister`) hands the hardware straight back.
+/// driver, `kill dwc2` (whose death releases the route via `route::unregister_endpoint`) hands the
+/// hardware straight back.
 pub fn usb_owned_by_userspace() -> bool {
     crate::interrupt::route::registered_endpoint(USB_VECTOR).is_some()
 }

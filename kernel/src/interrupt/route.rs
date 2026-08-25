@@ -48,6 +48,40 @@ pub fn register(irq: u8, endpoint: EndpointId) {
 
 /// The driver endpoint registered for `irq`, if any. Used to gate the `IrqUnmask` syscall:
 /// only the driver that owns the route may re-open its IOAPIC gate (§12).
+/// Release every IRQ routed to `endpoint`, and mask those lines. Returns how many were released.
+///
+/// BY ENDPOINT, NOT BY NAME. The kill path used to work out which line a dying task owned from a
+/// hardcoded table of service names - "xhci" => 0x28, "ehci" => 0x29, anything else => nothing. A
+/// name missing from that list simply kept its route forever: `dwc2` was missing, so every restart
+/// of the ARM USB driver left its old claim behind and the kernel logged "IRQ 41 already routed -
+/// overwriting (second claim or a missed unregister?)" - which was exactly right, and had been
+/// reporting a real leak nobody read. Interrupt delivery to that service was erratic across
+/// restarts as a result.
+///
+/// The kernel already knows which endpoint owns which line, because that is what this table IS.
+/// Asking it directly cannot go stale when a service is added, renamed, or ported to another
+/// architecture with a different vector, and it needs no list to be kept in step with reality.
+pub fn unregister_endpoint(endpoint: EndpointId) -> usize {
+    let mut released = 0usize;
+    let mut irqs = [0u8; MAX_IRQ];
+    {
+        let mut table = IRQ_TABLE.lock_irq();
+        for (irq, slot) in table.iter_mut().enumerate() {
+            if *slot == Some(endpoint) {
+                *slot = None;
+                irqs[released] = irq as u8;
+                released += 1;
+            }
+        }
+    }
+    // Masking touches the interrupt controller, so it happens OUTSIDE the table lock - the same
+    // discipline the rest of this module keeps.
+    for irq in irqs.iter().take(released) {
+        crate::arch::imp::ioapic::mask_vector(*irq);
+    }
+    released
+}
+
 pub fn registered_endpoint(irq: u8) -> Option<EndpointId> {
     IRQ_TABLE.lock_irq()[irq as usize]
 }

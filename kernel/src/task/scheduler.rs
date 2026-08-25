@@ -2102,17 +2102,25 @@ pub fn kill_task_by_slot(slot: usize) {
             // ours); the respawned driver re-registers and re-opens its gate. The vectors mirror the
             // ServiceConfig hw_irqs (task/mod.rs) - the same by-name device coupling the DMA-quiesce block
             // below already uses; block-driver + nic-driver currently declare no hw_irq.
-            let dead_irq: u8 = match task_name {
-                "xhci" => 0x28,
-                "ehci" => 0x29,
-                _ => 0xFF,
-            };
-            if dead_irq != 0xFF {
-                crate::interrupt::route::unregister(dead_irq);
-                // Mask the source: effective for a level/INTx line (the ehci); a no-op for edge/MSI (the
-                // xhci), whose stray MSI is already harmless once the route is None (deliver finds no
-                // endpoint) and stops at the respawned driver's HCRST.
-                crate::arch::imp::ioapic::mask_vector(dead_irq);
+            // RELEASE BY ENDPOINT, not by service NAME. This was a hardcoded list - "xhci" =>
+            // 0x28, "ehci" => 0x29, anything else => release nothing - and `dwc2` was not on it, so
+            // the ARM USB driver kept its IRQ route across every restart. The kernel said so every
+            // time ("IRQ 41 already routed - overwriting (second claim or a missed unregister?)"),
+            // and the answer was: a missed unregister, here. Interrupt delivery to that service was
+            // erratic across restarts because of it.
+            //
+            // The routing table already maps line -> owning endpoint, so ask it. A list of names
+            // cannot help but go stale as services are added, renamed, or ported to an arch with a
+            // different vector; this cannot. Masking still happens - `unregister_endpoint` masks
+            // each line it releases, which is what stops a reused endpoint id inheriting the dead
+            // driver's interrupts.
+            let mut released = crate::interrupt::route::unregister_endpoint(ep_id);
+            if let Some(rep) = reply_ep {
+                released += crate::interrupt::route::unregister_endpoint(rep);
+            }
+            if released > 0 {
+                crate::kprintln!(
+                    "kill_task: slot={} '{}' released {} IRQ route(s)", slot, task_name, released);
             }
 
             // Reclaim the endpoint id itself for reuse (§14.2). Its routing entry is Dead and its

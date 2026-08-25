@@ -1938,7 +1938,7 @@ pub mod interrupts {
         // already knows how to do). Interrupts stay on, the tick keeps running, and nothing races.
         // NOTE: handing the vector back does NOT restore USB. Reboot to get the devices back.
         //
-        // `route::unregister` releases the route and unmasks the line, but it cannot hand back DEVICE
+        // Releasing the route on death unmasks the line, but it cannot hand back DEVICE
         // STATE: while the service held the vector, the keyboard's completions went to a driver that
         // ignores them, so the in-kernel driver's channel sits mid-transfer waiting on an event it
         // never saw resolve, and the periodic hooks resume polling a channel that is already stuck.
