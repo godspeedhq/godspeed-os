@@ -24,7 +24,6 @@
 
 use godspeed_sdk::{ServiceContext, Message, Mmio, Dma};
 #[cfg(target_arch = "arm")]
-use godspeed_sdk::DeadlineOutcome;
 
 /// The Pi 4's on-board GENET MAC, driven from HERE instead of from the kernel (Commandment I).
 ///
@@ -668,6 +667,13 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     let rpc_timeouts = core::cell::Cell::new(0u32);
     #[cfg(target_arch = "arm")]
     let rpc_mismatch = core::cell::Cell::new(0u32);
+    // Sends that never left (dwc2 absent even after a reacquire) and stale caps recovered by one.
+    // Separate from `rpc_timeouts` because they are opposite diagnoses: a timeout means dwc2 heard
+    // us and did not answer, a send failure means it never heard us at all.
+    #[cfg(target_arch = "arm")]
+    let rpc_sendfail = core::cell::Cell::new(0u32);
+    #[cfg(target_arch = "arm")]
+    let rpc_restale = core::cell::Cell::new(0u32);
     #[cfg(target_arch = "arm")]
     let dwc2_rpc = |ctx: &ServiceContext, msg: &Message| -> Option<Message> {
         // Bounded on the lean await: a dwc2 that is alive but silent hung this driver, net-stack
@@ -713,11 +719,57 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         // `Call` carries a one-shot reply cap and dequeues only the reply matched to it, leaving
         // client requests queued where they belong. CLAUDE.md §8.2 records this exact hazard as the
         // reason the primitive exists; this path predates it.
-        let got = match ctx.request_with_reply_call("dwc2", msg, DWC2_SECS) {
-            Some(r) => r,
-            None => {
+        // THE ONE LEGITIMATE RETRY, and the reason this asks for the error instead of an Option.
+        //
+        // `Ok(None)` is the DEADLINE passing: dwc2 is alive and may still answer, so re-sending is
+        // the desync described at length above and must not happen. `Err(_)` is the send FAILING -
+        // our wiring names a dwc2 that no longer exists, so nothing is in flight and nothing can
+        // arrive late. Those are opposite conditions and only the second is safe to repeat, which is
+        // why `request_with_reply_call` (which collapses both to `None`) is the wrong primitive here.
+        //
+        // It matters because it is the ordinary case, not an edge one. `find_send_slot` reads
+        // spawn-time wiring, so a dwc2 respawned AFTER us is unreachable forever unless we reacquire
+        // (§14.3). After `chaos max-carnage` the supervisor restarts everything and the order is
+        // arbitrary: on the run that found this, nic-driver came up at 21:23:08.9 and dwc2 at
+        // 21:23:11.3, so every request failed instantly, `dev_info` reported no device, net-stack
+        // stayed unconfigured, and `ping` said "link not confirmed" while the cable was fine. dwc2
+        // itself showed the other half - 0 register reads even ATTEMPTED, because nothing ever asked.
+        //
+        // ONE retry, not a loop: a dwc2 that is genuinely gone must surface as a failure rather than
+        // as a request that never returns.
+        let got = match ctx.request_with_reply_call_err("dwc2", msg, DWC2_SECS) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
                 rpc_timeouts.set(rpc_timeouts.get().saturating_add(1));
                 return None;
+            }
+            Err(_) => {
+                if !ctx.reacquire_by_name("dwc2") {
+                    rpc_sendfail.set(rpc_sendfail.get().saturating_add(1));
+                    return None;
+                }
+                match ctx.request_with_reply_call_err("dwc2", msg, DWC2_SECS) {
+                    Ok(Some(r)) => {
+                        // Loud ONCE (§26.7): a silent recovery here is how the stale cap went
+                        // unnoticed in the first place. Bounded so a genuinely absent dwc2 cannot
+                        // turn this into a log flood on a service that runs per frame.
+                        let n = rpc_restale.get().saturating_add(1);
+                        rpc_restale.set(n);
+                        if n == 1 || n % 128 == 0 {
+                            ctx.log_fmt(format_args!(
+                                "nic-driver: dwc2 cap was stale - reacquired by name and the request went through ({} so far)", n));
+                        }
+                        r
+                    }
+                    Ok(None) => {
+                        rpc_timeouts.set(rpc_timeouts.get().saturating_add(1));
+                        return None;
+                    }
+                    Err(_) => {
+                        rpc_sendfail.set(rpc_sendfail.get().saturating_add(1));
+                        return None;
+                    }
+                }
             }
         };
         // RE-SYNC ON THE TAG, BY DROPPING THE STALE ANSWER AND NOT ASKING AGAIN.
@@ -738,8 +790,9 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             rpc_mismatch.set(n);
             if n <= 3 || n % 128 == 0 {
                 ctx.log_fmt(format_args!(
-                    "nic-driver: dwc2 answered op {:#04x} while we asked {:#04x} - not our reply ({} mismatched, {} timed out)",
-                    got.payload_bytes().first().copied().unwrap_or(0), want, n, rpc_timeouts.get()));
+                    "nic-driver: dwc2 answered op {:#04x} while we asked {:#04x} - not our reply ({} mismatched, {} timed out, {} never sent, {} stale caps recovered)",
+                    got.payload_bytes().first().copied().unwrap_or(0), want, n,
+                    rpc_timeouts.get(), rpc_sendfail.get(), rpc_restale.get()));
             }
             return None;
         }
@@ -804,7 +857,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             "nic-driver: NIC up  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  link {}",
             info[0], info[1], info[2], info[3], info[4], info[5], if info[6] != 0 { "UP" } else { "down" }));
     } else {
-        ctx.log("nic-driver: no usb-net device - serving empty replies (net degrades, not hangs)");
+        ctx.log("nic-driver: no usb-net device YET - serving empty replies and re-probing every request (net degrades, not hangs; a dwc2 that starts after us is picked up)");
     }
     ctx.log("nic-driver: serving frame interface");
 
