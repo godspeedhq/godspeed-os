@@ -5,7 +5,7 @@ Narrative documentation. These files explain design decisions in prose; they do 
 ## Files
 
 **The audit logs moved to `audits/` (2026-08-25).** `unsafe-audit.md`, `kernel-audit.md`,
-`userspace-audit.md`, `security-audit.md`, `documentation-audit.md` and `commandment-audit.md` are
+`userspace-audit.md`, `security-audit.md` and `documentation-audit.md` are
 append-only EVIDENCE, not documentation: they grow forever by design and are read when investigating,
 not when learning. They were 7,718 lines - 36% of everything under `docs/` - which made this directory
 look four times heavier than the part anyone needs to read.

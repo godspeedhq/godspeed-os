@@ -7,6 +7,40 @@
 
 
 
+## Audit 11 - inherited from `commandment-audit.md`, which is now deleted (2026-08-25)
+
+`audits/commandment-audit.md` was scaffolding, and its own header set the two conditions for deleting
+it: every Commandment through the process, and every finding closed or homed. The first was met - all
+ten have sections, and `scripts/commandments.py` carries 15 checks with 63 red-team probes. The second
+was not, so its four surviving findings move HERE, where open findings belong, and the scaffolding
+goes. Each was re-verified against the tree today rather than copied forward.
+
+| ID | Finding | Then | Now |
+|----|---------|------|-----|
+| **C3-1** | The largest ethernet frame is defined in several places | 6 copies, **disagreeing** | 5 copies, **all agree at 1600** (`dwc2/net.rs`, `nic-driver/genet.rs`, `nic-driver/main.rs` x2, kernel `dispatch.rs`). The dangerous half is gone; the duplication is not. Commandment III. |
+| **C4-2** | Service crates shipping no contract | 8 of 14 | **1 of 17** - only `probe`, the adversarial/fuzz harness, which test builds spawn. `scripts/contract_check.py` reconciles the other 16 against their kernel service_config. Arguably legitimate; recorded rather than assumed so. |
+| **C8-1** | Waits bounded by an ITERATION COUNT rather than a clock | 16 | **9**. Commandment VIII, and the shape this session met twice: a count means a different duration on every machine. |
+| **C10-1** | `services/shell/src/main.rs` has no module header | 10,812 lines | **11,466 lines, still none**. It grew. Commandment X - the file is in the right place, it just does not say what it is. |
+
+**Closed, and not carried forward:**
+
+- **C1-1** the kernel spawning services by name - the two ARM scaffolding functions are gone, and
+  `I-kernel-spawns` now fails the build if a second spawn appears.
+- **C1-4** `InspectKernel`'s unpinned query space - pinned by `I-introspect`.
+- **C1-6** four kernel modules serving none of the six responsibilities - closed when `fbcon` left for
+  the `console` service, and the enforcement probe was ratcheted on 2026-08-25 so that a module going
+  back to claiming nothing breaks the build.
+- **C6-1** unowned global mutable state in two services - `VI-static-mut` passes, and the red-team
+  suite confirms the check catches a planted violation.
+- **C1-2** (arch is 65% of the kernel) was an observation with no action expected; **C1-3** (the font
+  crate) and **C1-5** (218 service configs) are accepted with pins in `COMMANDMENTS.baseline.toml`,
+  which is exactly the "accepted rather than fixed" home the scaffolding named.
+
+**What deleting it cost: nothing that was not already somewhere else.** The checklist became the build,
+the process lives in `scripts/commandments.py`'s module docstring, accepted findings live in the
+baseline, and the four above now live in a living audit instead of a temporary one.
+
+
 ## Audit 10 - the link tick, the cable edge, and four reverts (2026-08-11, `feat/pi4-aarch64` @ f67f5c15)
 
 **Scope:** everything committed since `5426c6db` (20 commits) across `services/`, `sdk/`, and

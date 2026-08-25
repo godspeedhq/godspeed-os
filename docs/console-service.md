@@ -285,7 +285,7 @@ the system is busy recovering.
 §5 chose "the kernel keeps glyph rendering = mechanism, the service controls layout", reasoning from
 §26.10. That reading does not survive contact with §4.4: a font rasteriser, an ANSI/CSI state machine, a
 UTF-8 decoder, a shadow grid and a scroll strategy are a **display driver**, and §4.4 forbids drivers in
-the kernel by name. The measured boundary (`audits/commandment-audit.md`, 2026-08-14) also showed there is
+the kernel by name. The measured boundary (the commandment walk, 2026-08-14; its surviving findings are now in `audits/userspace-audit.md` Audit 11) also showed there is
 no cheap partial slice - the emulator is reached THROUGH `put_byte`, so removing CSI handling alone
 leaves the shell's cursor moves and colours going nowhere. The service must take rendering **entirely**.
 
@@ -319,7 +319,7 @@ not a small terminal, and the two are not two copies of one thing.
 
 ### 9.3 What earns the kernel's remaining blit
 
-**Impossibility, which is the only thing that does** (`audits/commandment-audit.md`: the bar the control
+**Impossibility, which is the only thing that does** (the commandment walk: the bar the control
 channel failed and the supervisor spawn clears). A panic halts every core, including the console service,
 so **a panic cannot ask a service to report it**. On a Pi wired to a TV with no serial cable, a kernel
 with no blit dies with a frozen screen and no reason on it - the silent failure invariant 12 exists to

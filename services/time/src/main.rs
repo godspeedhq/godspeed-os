@@ -17,7 +17,7 @@
 //! **What it owns.** The current epoch, its source (RTC or network), when it was last synced, and the
 //! floor. All of that is state with an owner: this task. None of it is a `static`.
 //!
-//! **Slice 1 of 3** (`audits/commandment-audit.md`): the service exists and owns the policy, reading the
+//! **Slice 1 of 3** (the C1-6 commandment walk; see `audits/userspace-audit.md` Audit 11): the service exists and owns the policy, reading the
 //! raw RTC through the kernel query that already exists. Slice 2 moves the shell and `net-stack` onto
 //! it; slice 3 deletes the kernel's two modules, the `SetClock` syscall and the wall-clock queries -
 //! the first time in this audit a pinned kernel surface gets SMALLER.
