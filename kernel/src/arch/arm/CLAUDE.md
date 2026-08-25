@@ -100,6 +100,6 @@ what the silicon wants, throw away the OS integration.
 
 ## What was audited here
 
-- **Kernel:** `docs/kernel-audit.md` **Audit 5** (2026-07-23) - the arm32 layer; 8 (C) fixed, 2 staged.
-- **Userspace/SDK:** `docs/userspace-audit.md` **Audit 4** - the arm SDK ABI (A-U1 above).
-- **Unsafe inventory:** `docs/unsafe-audit.md` lists every `unsafe` block in `arch/arm/`.
+- **Kernel:** `audits/kernel-audit.md` **Audit 5** (2026-07-23) - the arm32 layer; 8 (C) fixed, 2 staged.
+- **Userspace/SDK:** `audits/userspace-audit.md` **Audit 4** - the arm SDK ABI (A-U1 above).
+- **Unsafe inventory:** `audits/unsafe-audit.md` lists every `unsafe` block in `arch/arm/`.

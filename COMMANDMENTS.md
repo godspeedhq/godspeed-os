@@ -29,7 +29,7 @@ is more convenient," it belongs outside the kernel.
 **Why the kernel stays tiny - and why that boundary is a reward, not a restriction.**
 
 The kernel is audited regularly and exhaustively against these Commandments (the living record is
-`docs/kernel-audit.md`).
+`audits/kernel-audit.md`).
 
 The cost of that audit does not grow linearly with the kernel - it grows with the interactions between
 its responsibilities. A real audit never examines each responsibility in isolation; it cross-checks

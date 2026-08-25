@@ -460,7 +460,7 @@ official, not the runtime behaviour.
 > SEC-2 removed **`REBOOT`** from the USB drivers, so a compromised driver can no longer hard-reset the
 > machine directly from any context - reboot lives only with the shell (its `reboot` command). The
 > residual (a keyboard can type) is inherent to being a keyboard, and is recorded here rather than
-> papered over. `docs/security-audit.md` SEC-2.
+> papered over. `audits/security-audit.md` SEC-2.
 >
 > **Amendment 2026-07-19 (SEC-2 follow-up): Ctrl+Alt+Del is restored, routed through the shell.** The
 > chord initially became ordinary keystrokes, which removed a familiar affordance. It now works again
@@ -553,11 +553,11 @@ official, not the runtime behaviour.
 > kernel. It is not fixable on this hardware - the Pi 2 has no IOMMU/SMMU to confine USB DMA regardless,
 > and the userspace-driver split awaits device-IRQ-to-userspace routing - so, per §26.7, it is **recorded**
 > rather than closed. Two consequences follow: (a) the memory-safety of `arch/arm/dwc2.rs` is TCB-critical
-> (audited: `docs/unsafe-audit.md`, `docs/security-audit.md` Audit 2, no UB/OOB/race); (b) **SEC-2's win
+> (audited: `audits/unsafe-audit.md`, `audits/security-audit.md` Audit 2, no UB/OOB/race); (b) **SEC-2's win
 > does not travel to ARM** - "REBOOT lives only with the shell, not the USB driver" is an x86 property; an
 > in-kernel ARM driver implicitly holds all kernel authority (it could call `hardware_reset` directly), so
 > the ARM keyboard driver sits inside the *kernel* trust perimeter, not merely the shell's. The residual
-> that IS shared with x86 is inherent: a keyboard's keystrokes are commands (SEC-2). `docs/security-audit.md`
+> that IS shared with x86 is inherent: a keyboard's keystrokes are commands (SEC-2). `audits/security-audit.md`
 > Audit 2 (SEC-29/30) is the full treatment.
 
 ---
@@ -1353,13 +1353,13 @@ A PR with an unsafe block lacking a SAFETY comment is rejected without review.
 
 ### 18.4 Audit Trail
 
-`docs/unsafe-audit.md` lists every unsafe block. CI checks the file matches source.
+`audits/unsafe-audit.md` lists every unsafe block. CI checks the file matches source.
 
 ### 18.5 Grandfathered Floors
 
 `unsafe` outside the four permitted layers (§18.1) is tolerated only as
 **grandfathered** lines in `task/`, `syscall/`, and `interrupt/`, frozen at the
-counts in `docs/unsafe-audit.md`. Those counts may **decrease** freely but may
+counts in `audits/unsafe-audit.md`. Those counts may **decrease** freely but may
 **increase** only by an amendment recorded here and in the audit, with a written
 safety + necessity rationale.
 

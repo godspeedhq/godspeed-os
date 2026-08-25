@@ -2,7 +2,7 @@
 
 > **Living document.** Records every audit of the userspace services (everything above the kernel)
 > against the Ten Commandments (`COMMANDMENTS.md`) and the constitution (`CLAUDE.md`). Re-run and
-> append with each audit. The kernel has its own living record in `docs/kernel-audit.md`; this file
+> append with each audit. The kernel has its own living record in `audits/kernel-audit.md`; this file
 > is its userspace counterpart. First audit: 2026-07-12.
 
 
@@ -517,7 +517,7 @@ utility conventions.
 > that needs a privileged cap got it (supervisor spawn, probe kill/introspect for the self-run identity
 > checks), all self-run tests passed, and the negative cap-gating pins (A11/A12/A13) hold in QEMU. No
 > panic/exception; cross-core ping/pong ran clean for minutes. Full on-silicon detail is in
-> `docs/kernel-audit.md` "Hardware sign-off". The shell/net-stack userspace fixes (U4-U14) were verified
+> `audits/kernel-audit.md` "Hardware sign-off". The shell/net-stack userspace fixes (U4-U14) were verified
 > in QEMU (script + selfcheck 4/0); the `--mode identity` hardware image does not run the shell, so their
 > hardware exercise rides the general v0.4.0 selfcheck soak, not this identity boot.
 

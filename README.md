@@ -111,7 +111,7 @@ GodspeedOS treats testing as architecture. The suite is layered - each layer mus
 
 ### Static analysis & unsafe audit
 
-Every `unsafe` block is inventoried in `docs/unsafe-audit.md` and enforced by
+Every `unsafe` block is inventoried in `audits/unsafe-audit.md` and enforced by
 `scripts/unsafe_check.py` - counts may not grow without a written SAFETY argument.
 The inventory grows as the system does - three CPU ports and userspace drivers all need it - so the
 check is that every line is ACCOUNTED for, not that the count stays still. Figures below are from the

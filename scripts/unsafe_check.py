@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify every unsafe usage in kernel/src/ is accounted for in docs/unsafe-audit.md.
+"""Verify every unsafe usage in kernel/src/ is accounted for in audits/unsafe-audit.md.
 
 Rules enforced:
   - A file not in the audit that gains unsafe lines          → FAIL
@@ -20,7 +20,7 @@ from pathlib import Path
 REPO_ROOT   = Path(__file__).parent.parent
 KERNEL_SRC  = REPO_ROOT / "kernel" / "src"
 SERVICES    = REPO_ROOT / "services"
-AUDIT_FILE  = REPO_ROOT / "docs" / "unsafe-audit.md"
+AUDIT_FILE  = REPO_ROOT / "audits" / "unsafe-audit.md"
 
 INVENTORY_START = "<!-- unsafe-inventory-start -->"
 INVENTORY_END   = "<!-- unsafe-inventory-end -->"
@@ -92,7 +92,7 @@ def main() -> int:
     for rel in sorted(audit):
         if not (KERNEL_SRC / rel).exists() and not (SERVICES / rel).exists():
             failures.append(
-                f"  FAIL  {rel}: in docs/unsafe-audit.md but the file does not exist - "
+                f"  FAIL  {rel}: in audits/unsafe-audit.md but the file does not exist - "
                 f"remove its inventory row (the audit must match the source, §18.4)"
             )
 
@@ -106,12 +106,12 @@ def main() -> int:
         if rel not in audit:
             failures.append(
                 f"  FAIL  {rel}: {actual} unsafe line(s) not in audit - "
-                f"add a // SAFETY: comment and an entry to docs/unsafe-audit.md"
+                f"add a // SAFETY: comment and an entry to audits/unsafe-audit.md"
             )
         elif actual > audit[rel]:
             failures.append(
                 f"  FAIL  {rel}: unsafe count grew {audit[rel]} → {actual} - "
-                f"add // SAFETY: comment(s) and update docs/unsafe-audit.md"
+                f"add // SAFETY: comment(s) and update audits/unsafe-audit.md"
             )
         elif actual < audit[rel]:
             infos.append(
@@ -147,7 +147,7 @@ def main() -> int:
         print()
         print(
             f"{len(failures)} violation(s). "
-            "See docs/unsafe-audit.md and §18 of CLAUDE.md for the policy."
+            "See audits/unsafe-audit.md and §18 of CLAUDE.md for the policy."
         )
         return 1
 

@@ -185,7 +185,7 @@ in-kernel `ServiceConfig` table, consistent with how `has_console_read` /
   capability section listing `INTROSPECT_RESOURCE` among the stable resources.)
 - **`kernel/src/syscall/CLAUDE.md`:** add `INTROSPECT_RESOURCE` to the syscall
   table and document the holds-resource form for argument-saturated read syscalls.
-- **`docs/unsafe-audit.md`:** unaffected - no new `unsafe` (the gate is safe Rust).
+- **`audits/unsafe-audit.md`:** unaffected - no new `unsafe` (the gate is safe Rust).
 - **`utilities/1_observe.md` §7/§8:** update from "introspection is currently
   ambient (verify)" to "introspection is gated by `INTROSPECT_RESOURCE`; `observe`'s
   contract declares it," restoring the accuracy of observe's least-authority story.

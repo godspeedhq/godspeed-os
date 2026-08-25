@@ -138,7 +138,7 @@ be done in the same pass.
 | `kernel/src/task/scheduler.rs` | Added `for_each_active_cap` for `assert_cap_table_consistent` |
 | `kernel/src/invariants/assertions.rs` | Implemented `assert_tcb_alive` and `assert_cap_table_consistent` |
 | `kernel/src/task/mod.rs` | Added `hw_irqs: &'static [u8]` to `ServiceConfig`; wired `interrupt::route::register` for each IRQ at spawn |
-| `docs/unsafe-audit.md` | Updated `interrupts.rs` count 8→9 for `send_eoi` wrapper |
+| `audits/unsafe-audit.md` | Updated `interrupts.rs` count 8→9 for `send_eoi` wrapper |
 
 ### Key design decisions
 

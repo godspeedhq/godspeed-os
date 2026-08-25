@@ -131,7 +131,7 @@ x86-64 has a strong memory model (TSO) and cache-coherent DMA, so the neutral ke
 guarantees x86 gives for free but a weaker arch (AArch64, RISC-V) does **not**. On x86 the relevant code
 is correct and generates identical-or-no-op instructions; on a weak-ordered SMP port each becomes a real
 race unless the port meets the obligation below. These are the security audit's **SEC-25..28**
-(`docs/security-audit.md`) - **port blockers**, gathered here so a porter meets them by construction
+(`audits/security-audit.md`) - **port blockers**, gathered here so a porter meets them by construction
 instead of rediscovering them as heisenbugs. (They do not affect x86, so they are not "fixed" in code on
 `feat/hardening`; they are specified here for whoever brings up SMP on a weak arch.)
 

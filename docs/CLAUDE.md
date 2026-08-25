@@ -4,6 +4,15 @@ Narrative documentation. These files explain design decisions in prose; they do 
 
 ## Files
 
+**The audit logs moved to `audits/` (2026-08-25).** `unsafe-audit.md`, `kernel-audit.md`,
+`userspace-audit.md`, `security-audit.md`, `documentation-audit.md` and `commandment-audit.md` are
+append-only EVIDENCE, not documentation: they grow forever by design and are read when investigating,
+not when learning. They were 7,718 lines - 36% of everything under `docs/` - which made this directory
+look four times heavier than the part anyone needs to read.
+
+Three genres, three homes: **`docs/` is what you read, `audits/` is evidence, `CLAUDE.md` is law.**
+Nothing was deleted or rewritten in the move.
+
 **The core architecture is in the constitution, not here.** `CLAUDE.md` §7 (capabilities), §8 (IPC),
 §9 (scheduler and SMP), §11 (bootstrap) and §14 (service lifecycle) are the specification, and they
 are normative where these narrative files are not. This index used to list `ipc.md`, `capability.md`,
@@ -33,13 +42,7 @@ truthful and shorter than writing five files to repeat them.
 | `xhci-completion-correlation.md` | Design spec: completion correlation in the `xhci` driver |
 | `hw-bare-metal-freeze-j5005.md` | Bare-metal boot freeze on the Intel J5005 (Wyse 5070) |
 | `verification-road-map.md` | Post-v1 verification roadmap |
-| `unsafe-audit.md`   | Complete inventory of every `unsafe` block in the kernel (§18.4) |
-| `kernel-audit.md`   | **Living audit** of the ring-0 kernel against the invariants; north-star: nothing above the kernel may panic or wedge it |
-| `userspace-audit.md`| **Living audit** of the userspace services against the Commandments; north-star: identity over location, wait on truth incl. failure, reacquire + retry |
-| `documentation-audit.md` | **Living audit** of the *documentation* for clarity and intent - the least-capable model should not have to guess. Third of the audit family; maintains `anti-patterns.md` |
 | `console-service.md` | The console/terminal design and its as-built record: why the terminal left the kernel for the `console` service, the kernel's remaining `bootcon` boot/panic floor, framebuffer ownership handover, memory attributes, and the five defects hardware found (9.8) |
-| `security-audit.md` | **Living audit** of *authority* against escalation; north-star: no principal gains authority beyond its grant. Fourth of the audit family; the TCB-principal threat model (the "root" analog is reaching a deputy). Framed against the AI-vuln pattern (ksmbd/Big-Sleep style) |
-| `commandment-audit.md` | **TEMPORARY - delete when done.** Scaffolding for the one-time move from "the Commandments are prose a human must remember" to "the Commandments fail the build". Holds the PROCESS being settled and the findings not yet fixed. Not a living audit: its subject is a transition, and a transition document that outlives its transition becomes a staler copy of the checks. Goes when every Commandment has been through the process and every finding is closed; the checklist then lives in `scripts/commandments.py` (run by `osdev build` + CI), the process in that script's docstring, and any accepted finding in `CLAUDE.md` as an amendment |
 | `anti-patterns.md`  | Field Guide to Constitutional Violations: 21 categories, each violation paired with the correct pattern and the Commandment/section it breaks |
 | `introspection-capability.md` | Design note: gating `InspectKernel`/`TaskStat` behind the `INTROSPECT` cap (§3.1) - closes the ambient-introspection exception |
 | `networking.md`     | **Networking (BUILT: net-stack + nic-driver ship; DHCP, ARP, ICMP, DNS work on x86 and Pi 2):** network stack as a userspace service - a socket IS a capability (the same delegated-resource-cap mechanism as file-as-capability, §7.10/P2), so the kernel gains nothing (§4.4); IOMMU-confined NIC driver (e1000 for QEMU/Intel, T630 chipset TBD via a Phase-0 PCI print); ARP/IPv4/ICMP/UDP phased plan with TCP far-future; no ambient network (§3.1, Appendix D.4), §23.4 |

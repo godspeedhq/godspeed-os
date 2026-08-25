@@ -49,5 +49,5 @@ strengthen the kernel per §26 and clear a chunk of the remaining 57 warnings
 ## Tooling state
 
 - Local: `clippy`, `cargo-geiger`, `cargo-miri` available; `cargo-audit` not installed.
-- `scripts/unsafe_check.py` reconciled against `docs/unsafe-audit.md` (passes).
+- `scripts/unsafe_check.py` reconciled against `audits/unsafe-audit.md` (passes).
 - No GitHub Actions workflows were triggered (CI minutes preserved).

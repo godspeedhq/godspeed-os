@@ -541,7 +541,7 @@ The ten: `acquire_any`, `console_push`, `has_console_read`, `introspect`, `net_d
 So most authority in this system is granted through a path the commandment says should not exist - "do
 not invent hidden communication paths ... if a service cannot express its needs through its declared
 contract, redesign the contract - not the architecture". There IS a doctrine sanctioning it
-(`docs/userspace-audit.md` U15, and `task/mod.rs` calls them "deliberately NOT contract capabilities"),
+(`audits/userspace-audit.md` U15, and `task/mod.rs` calls them "deliberately NOT contract capabilities"),
 but that is a doc rather than a constitutional amendment, while §13.3 says the developer declares what
 the service needs and the OS decides whether to grant it.
 

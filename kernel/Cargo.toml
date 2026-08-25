@@ -53,7 +53,7 @@ pi4 = []
 # added for kernel-audit A9-2 are actually EXERCISED rather than merely reasoned about. Those paths are
 # otherwise unreachable without exhausting the frame allocator, which cannot be arranged at boot.
 # Commandment IX: "If recovery cannot be tested, it does not exist." Off by default; test builds only.
-# See `arch/x86_64/pci.rs::msi_ordering` and `docs/kernel-audit.md` Audit 9.
+# See `arch/x86_64/pci.rs::msi_ordering` and `audits/kernel-audit.md` Audit 9.
 mmio-map-fault-test = []
 # Inject synthetic memory banks that extend past the identity-map limit, so `memmap`'s clamp is
 # EXERCISED rather than merely reasoned about. The clamp matters on an 8 GiB Pi 4, whose firmware

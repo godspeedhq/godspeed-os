@@ -268,8 +268,8 @@ GodspeedOS way.
   wider-than-u32 constraint), the boot flow, the userspace-driver rule, and the SMP/DMA hazards.
 - **`kernel/src/arch/CLAUDE.md`** - the arch boundary + "Porting a driver: the method" (the doctrine).
 - **`docs/multi-arch.md`** - the cross-arch proof and per-arch bring-up notes.
-- **Audits of this branch:** `docs/kernel-audit.md` Audit 5 (the arm32 kernel layer) and
-  `docs/userspace-audit.md` Audit 4 (the arm SDK ABI).
+- **Audits of this branch:** `audits/kernel-audit.md` Audit 5 (the arm32 kernel layer) and
+  `audits/userspace-audit.md` Audit 4 (the arm SDK ABI).
 
 ## CLOSED: the ARM quantum stub, and why it could not be fixed alone (2026-07-31; fixed since)
 

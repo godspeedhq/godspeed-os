@@ -4,7 +4,7 @@
 > **Living document.** Records every audit of the *documentation* - `CLAUDE.md`, `COMMANDMENTS.md`,
 > the SDK and per-directory `CLAUDE.md` files, the examples, and `docs/` - for clarity and intent.
 > Re-run and append with each audit. This is the third of the audit trilogy: the kernel has
-> `docs/kernel-audit.md`, userspace has `docs/userspace-audit.md`, and the docs themselves have this.
+> `audits/kernel-audit.md`, userspace has `audits/userspace-audit.md`, and the docs themselves have this.
 > First audit: 2026-07-15.
 
 
@@ -31,7 +31,7 @@ zero interrupts delivered, across months.
 The armed bulk-IN and the burst parsing were real. What was never true is that an interrupt drove
 them - the client poll path did, and still predominantly does even now that both halves are wired.
 
-How it got there matters more than the line itself: `docs/unsafe-audit.md` (2026-07-29) records the
+How it got there matters more than the line itself: `audits/unsafe-audit.md` (2026-07-29) records the
 same claim for the IN-KERNEL dwc2 driver, where it may well have been accurate. When the stack moved
 to a userspace service (2026-08-17), the PROSE was carried across and the MECHANISM was not. Nothing
 re-checked it, because nothing tests a sentence.
@@ -49,7 +49,7 @@ re-checked it, because nothing tests a sentence.
 | **A6-7** | LOW | `README.md` | Property suite listed "Active" (it is 10/10); unsafe-audit row cited 302 lines / 23 files from May against 1024 / 68 today. |
 | **A6-8** | LOW | `CLAUDE.md` §22 | Property row read "Active" while the Performance row already carried its count; both now state one. |
 
-Also corrected in the range: `docs/kernel-audit.md` recorded that driver *death* "already unregisters"
+Also corrected in the range: `audits/kernel-audit.md` recorded that driver *death* "already unregisters"
 its IRQ lines. It did not - the kill path used a hardcoded list of service names and `dwc2` was not on
 it. The same note called the resulting leak "self-correcting" because a respawn overwrites the stale
 route; true for memory safety, and not true for the driver, whose interrupt delivery varied 9, then 7,
@@ -155,7 +155,7 @@ authoritative precisely because it is so specific.
 ### Carried over from Audit 4 - still open, NOT counted against this range
 
 Nothing in this range touched a doc, a manifest or `CLAUDE.md`, so **the entire Audit 4 ledger stands
-unfixed**. Spot-verified this session: `docs/unsafe-audit.md:2328` still carries the phantom
+unfixed**. Spot-verified this session: `audits/unsafe-audit.md:2328` still carries the phantom
 `arch/aarch64/xhci.rs | 42 | permitted` row in the LIVE inventory (A4-4); `kernel/src/task/mod.rs:486`
 still justifies the `USB_DISK` grant with "on BOTH ARM ports the USB stack is in-kernel" (A4-2 /
 SEC-37); `services/block-driver/src/xhciblk.rs:5` still says the in-kernel driver "cannot be deleted"
@@ -217,7 +217,7 @@ index, and the primary onboarding doc for the port still opens with "Status: des
 | **A4-1** | HIGH | `kernel/Cargo.toml:105-141`, `services/block-driver/Cargo.toml:15-20`, `services/supervisor/Cargo.toml:18-21` | **Three orphaned, mid-sentence-truncated feature rationales for flags that no longer exist.** The commit removed the `xhci-userspace = []` / `usb-via-xhci = []` declaration lines and the sentence that named them, leaving ~30, ~6 and ~4 lines of present-tense justification behind. `kernel/Cargo.toml` ends "Build both sides with it" with a dangling open paren and falls straight into the next feature's comment; `block-driver/Cargo.toml`'s `[features]` section trails off at "and both halves build and" with no period before `[dependencies]`; `supervisor/Cargo.toml`'s block runs without a blank line into `blockdev`'s comment, so **`blockdev = []` now reads as the flag that "spawns the `xhci` service on aarch64"** - it is an unrelated persistence smoke-test flag. A reader reasonably concludes `--features xhci-userspace` is a current build option. Verified: zero `#[cfg(feature = "xhci-userspace")]` or `"usb-via-xhci"` remain in any `.rs`, so this is dead prose, not dead code. |
 | **A4-2** | HIGH | `kernel/src/task/mod.rs:486-493` | **A false rationale sitting directly on top of a live capability grant.** The comment reads "on BOTH ARM ports the USB stack is in-kernel, so `block-driver` reaches a USB stick through syscalls 46-48 ... The Pi 4 needs it for the same reason the Pi 2 does." False for aarch64. The code below it is unchanged: `usb_disk: cfg!(any(target_arch = "arm", target_arch = "aarch64")) && matches!(name, "block-driver")`. On aarch64 the four syscalls that grant authorises are permanent stubs returning 0/false (`arch/aarch64/mod.rs:1277-1301`) and `block-driver` reaches the disk by IPC to the `xhci` service instead (`send_peers: &["xhci"]`, `task/mod.rs:716`). This is the worst class in this audit: the comment explains why an authority is needed, and the reason is gone. Filed as a security finding too - `security-audit.md` **SEC-37**. |
 | **A4-3** | HIGH | `services/block-driver/src/xhciblk.rs:1-8` | **The module header states the opposite of the truth.** "As long as they are the only route to a disk, `kernel/src/arch/aarch64/xhci.rs` - 2742 lines of ring 0 ... - **cannot be deleted**, and Commandment I stays broken on this port." It has been deleted and Commandment I is closed on this port. The one module whose whole purpose is the new arrangement documents itself as the reason the old one could not be dismantled. |
-| **A4-4** | HIGH | `docs/unsafe-audit.md:2322` | **A phantom row in the LIVE inventory, invisible to CI.** The `<!-- unsafe-inventory-start -->` .. `<!-- unsafe-inventory-end -->` table (lines 2299-2374) - the current, mechanically-parsed inventory, not a dated changelog - still carries a row reading `arch/aarch64/xhci.rs` / `42` / `permitted` for a file that does not exist, inflating the audited total by 42 lines. `scripts/unsafe_check.py` **passes**: it iterates real `.rs` files and checks each one's count is within its audited figure, and never checks the reverse direction (a row whose file is gone). So the enforcement mechanism `docs/CLAUDE.md` calls "special" has a blind spot exactly where a deletion lands. The dated changelog rows at 150, 204, 527, 566, 589, 610 and 657 are ratified history and are correct as they stand. |
+| **A4-4** | HIGH | `audits/unsafe-audit.md:2322` | **A phantom row in the LIVE inventory, invisible to CI.** The `<!-- unsafe-inventory-start -->` .. `<!-- unsafe-inventory-end -->` table (lines 2299-2374) - the current, mechanically-parsed inventory, not a dated changelog - still carries a row reading `arch/aarch64/xhci.rs` / `42` / `permitted` for a file that does not exist, inflating the audited total by 42 lines. `scripts/unsafe_check.py` **passes**: it iterates real `.rs` files and checks each one's count is within its audited figure, and never checks the reverse direction (a row whose file is gone). So the enforcement mechanism `docs/CLAUDE.md` calls "special" has a blind spot exactly where a deletion lands. The dated changelog rows at 150, 204, 527, 566, 589, 610 and 657 are ratified history and are correct as they stand. |
 | **A4-5** | HIGH | `services/xhci/src/main.rs:2204` (+ 1665, 2149, 2255, 2450, 2530) | **Six present-tense provenance references to the deleted driver, one of which asserts it still exists.** Line 2204: "Taken from the in-kernel driver **still in this tree** (`arch/aarch64/xhci.rs`)". The other five ("has always driven this exact VL805", "waits 200 ms here", "clears BOTH change bits", "reached the same conclusion", "refuses loudly above 512") all describe behaviour of code a maintainer can no longer consult. These read as load-bearing hardware-provenance notes - precisely the kind a reader will go looking for when a USB bug appears. The provenance is real and worth keeping; the tense and the path are not. |
 | **A4-6** | MED | `kernel/src/syscall/CLAUDE.md:49` | **A doc that contradicts a shipped security fix.** The syscall table lists 18 `reboot` as "REBOOT (WRITE) - held by `shell` (its `reboot` cmd) + `xhci`/`ehci` (Ctrl+Alt+Del)". SEC-2 removed REBOOT from the USB drivers; the code is correct (`task/mod.rs:467`, `reboot: matches!(name, "shell")`) and the Ctrl+Alt+Del chord is routed through the shell via `hid::CTRL_ALT_DEL_SIGNAL` (SEC-2 follow-up, §6.4). A stale row in an authority table is worse than a stale prose line: it reads as the design, and a reader reasoning about who can reset the machine gets the pre-SEC-2 answer. Pre-existing (SEC-2 landed 2026-07-16), surfaced by this audit's authority sweep. |
 | **A4-7** | MED | `services/block-driver/src/usbdisk.rs:184, 216-225, 284`; `services/block-driver/contracts/block-driver.toml:1-6, 27-30` | **Five sites describe a build-flag mechanism that has been replaced by an architecture check.** "chosen at BUILD time ... the kernel's `xhci-userspace` feature is what stops it driving the controller ... `scripts/pi4_build.py --xhci-userspace` sets both", and "The re-derive above is cfg-gated to `usb-via-xhci`". The real gate is `#[cfg(target_arch = "arm")]` vs `not(...)`, unconditional on aarch64. The contract additionally claims the service is granted `USB_DISK` "because the ARM USB stack lives in the kernel" (false for aarch64, see A4-2) and calls the `ipc_send = ["xhci"]` peer "present only when the USB stack runs in userspace ... this peer goes unused" - on aarch64 it is the only path to the disk and is exercised on every block request. No dead code results (verified), but a reader will search for a feature flag that is not there and misread the actual mechanism. |
@@ -265,7 +265,7 @@ longer supports after the shared framebuffer console landed.
 
 **Clean results:** `kernel/CLAUDE.md` (module map + the `fbcon/` section), `kernel/src/arch/CLAUDE.md`
 (the porting checklist now names `fb_commit`/`FB_READBACK_CHEAP`), `kernel/src/arch/x86_64/CLAUDE.md`
-(the file table), `docs/CLAUDE.md` (indexes `logging.md`), `docs/unsafe-audit.md` (counts re-baselined
+(the file table), `docs/CLAUDE.md` (indexes `logging.md`), `audits/unsafe-audit.md` (counts re-baselined
 to the 11 -> 3 reduction), and `docs/arm32-status.md` (the HAT section corrected from "it is the HAT" to
 the measured cable evidence) were all updated with the work rather than after it. The shell comment
 asserting reverse video is "a no-op on the fbcon" was corrected in the same commit that made it render.
@@ -290,7 +290,7 @@ Commandment III's "one truth". Cheap to state; this session paid for it three ti
 
 **Also fixed this session (doc-drift found while auditing code):** the retired hot-plug starvation
 diagnostic left no stale claims behind (its removal is recorded in the constant it left in place), and
-`docs/unsafe-audit.md` tracked every `unsafe` delta (dwc2 33 -> 34) with no unaccounted additions.
+`audits/unsafe-audit.md` tracked every `unsafe` delta (dwc2 33 -> 34) with no unaccounted additions.
 
 ## North-star
 
@@ -407,8 +407,8 @@ you can name is a rule you catch) and the seed bank for future review probes.
 
 ## See also
 
-- `docs/kernel-audit.md` - the ring-0 audit (nothing above the kernel may panic/wedge it).
-- `docs/userspace-audit.md` - the services audit (wait on truth incl. failure; reacquire and retry).
+- `audits/kernel-audit.md` - the ring-0 audit (nothing above the kernel may panic/wedge it).
+- `audits/userspace-audit.md` - the services audit (wait on truth incl. failure; reacquire and retry).
 - `docs/anti-patterns.md` - the field guide this audit maintains.
 - `COMMANDMENTS.md`, `CLAUDE.md` - the law the docs must convey clearly.
 
@@ -462,7 +462,7 @@ stale/missing pointers. **9 doc gaps found, all FIXED.**
 
 | ID | Sev | What | Fix |
 |----|-----|------|-----|
-| **DA1** | HIGH | `docs/unsafe-audit.md` claimed "every syscall argument on this arch fits in 32 bits, so the widening is loss-free" - now WRONG: `recv_timeout`'s `timeout_cycles` exceeds u32 (userspace-audit A-U1). Doc contradicted the corrected code. | Corrected to name the one wider-than-u32 arg + its pre-clamp; pointed at `arch/arm/CLAUDE.md`. |
+| **DA1** | HIGH | `audits/unsafe-audit.md` claimed "every syscall argument on this arch fits in 32 bits, so the widening is loss-free" - now WRONG: `recv_timeout`'s `timeout_cycles` exceeds u32 (userspace-audit A-U1). Doc contradicted the corrected code. | Corrected to name the one wider-than-u32 arg + its pre-clamp; pointed at `arch/arm/CLAUDE.md`. |
 | **DA2** | HIGH | `README.md` said "32-bit ARM ... compile clean" - stale/misleading: arm32 boots the full OS to a shell on real Pi 2 hardware. | Rewrote the line: arm32 *runs the OS* (4-core, supervisor, ping/pong IPC), with the build/run commands + a pointer to `arm32-status.md`. |
 | **DA3** | HIGH | The ratified **driver-porting doctrine** ("grok the working driver, reimplement the silicon's wants as a capability service, throw away the OS integration") existed only as a one-line mention + author memory - a contributor could not find "the GodspeedOS way". | Wrote it into `kernel/src/arch/CLAUDE.md` as **"Porting a driver: the method"** (executable-datasheet, reimplement-not-translate, simplest-reference, scope-to-our-chips, license/provenance). |
 | **DA4** | MED | **No `kernel/src/arch/arm/CLAUDE.md`** (x86_64 has one) - the ARM syscall ABI, boot flow, and gotchas had no discoverable home; they were scattered across `unsafe-audit.md`/`multi-arch.md`/`arm32-status.md`. Both cold porters went hunting. | **Created it** - the implementer reference: the `svc #0` register ABI + the wider-than-u32 constraint (A-U1), the boot flow + cr3-seed rule, the in-kernel-driver rule, SEC-25..28 status, gotchas, and pointers. |
@@ -507,6 +507,6 @@ the old story (Commandment III - and the amendment is the truth).
 - **`docs/xhci-completion-correlation.md`** (added this session) records the residual and the method,
   including the two wrong hypotheses, rather than only the fix. A reader arriving cold learns why
   `late = 0` was misleading, which is the part that cost real hardware rounds.
-- **`docs/unsafe-audit.md`** no longer lists the deleted `arch/aarch64/xhci.rs`, and the checker now
+- **`audits/unsafe-audit.md`** no longer lists the deleted `arch/aarch64/xhci.rs`, and the checker now
   FAILS on a row whose file is missing instead of passing silently (`e2810e00`) - the enforcement gap
   that let the stale row survive is closed, not just the row.

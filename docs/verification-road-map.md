@@ -107,7 +107,7 @@ The list is in priority order for a solo developer. Each item compounds with the
 
 **Steps.**
 
-1. Open `docs/unsafe-audit.md`. Confirm it matches every unsafe block currently in the kernel:
+1. Open `audits/unsafe-audit.md`. Confirm it matches every unsafe block currently in the kernel:
    ```
    grep -rn 'unsafe' kernel/src/ | wc -l
    ```
@@ -120,7 +120,7 @@ The list is in priority order for a solo developer. Each item compounds with the
 
 3. Count the total number of unsafe blocks. Track this number commit-to-commit. Every PR that adds an unsafe block needs to justify the increment.
 
-4. Promote `docs/unsafe-audit.md` to a CI-checked artifact: a script verifies the file lists exactly the set of unsafe blocks present in source. Any mismatch fails CI.
+4. Promote `audits/unsafe-audit.md` to a CI-checked artifact: a script verifies the file lists exactly the set of unsafe blocks present in source. Any mismatch fails CI.
 
 **Done when.** Every unsafe block has a SAFETY comment, a corresponding test, and an audit-file entry. The count is tracked. CI rejects PRs that add unsafe without updating the file.
 

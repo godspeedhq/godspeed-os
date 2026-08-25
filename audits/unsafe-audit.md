@@ -2084,7 +2084,7 @@ naming SVC explicitly rather than restoring a saved value.
 
 ## 2026-07-16 - SEC-1 / SEC-18 security fixes (feat/hardening)
 
-Two HIGH findings from the security audit (`docs/security-audit.md`), both fixed with `// SAFETY:`-
+Two HIGH findings from the security audit (`audits/security-audit.md`), both fixed with `// SAFETY:`-
 commented blocks in the permitted `arch/` layer (no §18.5 amendment needed):
 
 | File | Change | Why |

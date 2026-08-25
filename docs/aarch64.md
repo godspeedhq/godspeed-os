@@ -702,7 +702,7 @@ is stub-or-defer. That is the real size of "supporting the architecture."
 >   `main.rs`) moved behind `arch::imp` primitives - `read/write_page_table_base` (CR3), `invalidate_tlb_page`
 >   (invlpg), `local_irq_save/restore` (pushfq;cli/sti), `switch_to_boot_stack` (rsp), plus the existing
 >   `enable/disable_interrupts`. The `unsafe` asm consolidated into the permitted arch layer
->   (docs/unsafe-audit.md); the host lib gets a no-op `arch::imp` stub (lib.rs). Identity 24/0.
+>   (audits/unsafe-audit.md); the host lib gets a no-op `arch::imp` stub (lib.rs). Identity 24/0.
 > - **Enforcement:** `scripts/arch_boundary_check.py` (CI-wired, alongside `unsafe_check`/`contract_check`)
 >   FAILS on any `asm!`/`naked_asm!`, any named-arch reference (`arch::x86_64::` etc.), OR any
 >   `core::arch::<arch>::` intrinsic (e.g. `__cpuid`) outside `kernel/src/arch/`. So the demarcation

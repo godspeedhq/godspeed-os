@@ -19,7 +19,7 @@ v1/v2 established the capability model and the ring-3 boundary. This milestone i
 - ✅ **Kill is a capability - `SERVICE_CONTROL`.** The `kill` syscall is gated by a `SERVICE_CONTROL` capability (`SERVICE_CONTROL_RESOURCE = 6`), minted only for `shell`, `supervisor`, and the test probes - closing the ambient-kill gap (`docs/service-control-cap.md`). Validated by holdings (both args carry the name, no slot to pass).
 - ✅ **Reboot is a capability - `REBOOT`.** Machine reboot is gated by a `REBOOT` capability (`REBOOT_RESOURCE = 8`), held by `shell` (its `reboot` command) and `xhci`/`ehci` (Ctrl+Alt+Del), closing the ambient-reboot gap.
 - ✅ **H9 syscall-surface audit - CLEAN.** A full audit of every handler in `syscall/dispatch.rs` confirmed: each privileged syscall validates its capability (by slot or by holdings) before acting; every user pointer is validated for the *exact* length accessed (`read_user_bytes` / `write_user_bytes` / `validate_user_ptr`); and malformed input degrades safely (a garbage cap slot → `CapNotHeld` via a safe `[T]::get`, an unknown syscall number → `-1`, never a panic or out-of-bounds). No security gap; two stale doc comments fixed (commit `7601b34`).
-- ✅ **Unsafe-audit CI - every `unsafe` line accounted for.** `scripts/unsafe_check.py` enforces §18.4: it counts every non-comment `unsafe` line in `kernel/src/` and fails CI unless it matches the inventory in `docs/unsafe-audit.md`. `unsafe` stays confined to the four permitted layers (`arch/`, `memory/`, `capability/`, `smp/`) plus frozen grandfathered floors in `task/`/`syscall/`/`interrupt/` that may only shrink. Audit currently passes (447 accounted lines / 28 files).
+- ✅ **Unsafe-audit CI - every `unsafe` line accounted for.** `scripts/unsafe_check.py` enforces §18.4: it counts every non-comment `unsafe` line in `kernel/src/` and fails CI unless it matches the inventory in `audits/unsafe-audit.md`. `unsafe` stays confined to the four permitted layers (`arch/`, `memory/`, `capability/`, `smp/`) plus frozen grandfathered floors in `task/`/`syscall/`/`interrupt/` that may only shrink. Audit currently passes (447 accounted lines / 28 files).
 
 ---
 
@@ -33,6 +33,6 @@ v1/v2 established the capability model and the ring-3 boundary. This milestone i
 | Service-control capability | `capability/mod.rs:63` (`SERVICE_CONTROL_RESOURCE`) | `docs/service-control-cap.md` |
 | Reboot capability | `capability/mod.rs:78` (`REBOOT_RESOURCE`) | gated `kill`/`reboot` syscalls |
 | H9 syscall-surface audit | `syscall/dispatch.rs`, `syscall/CLAUDE.md` | verdict CLEAN; doc fixes commit `7601b34` |
-| Unsafe-audit CI | `scripts/unsafe_check.py`, `docs/unsafe-audit.md` | §18.4; passes (447 lines / 28 files) |
+| Unsafe-audit CI | `scripts/unsafe_check.py`, `audits/unsafe-audit.md` | §18.4; passes (447 lines / 28 files) |
 
 > The DMA-after-free safety stack (page-table reclaim guard, BME-quiesce cure, DMA permanent-reserve) and the IOMMU DMA-confinement (H1) are their own milestones - see the sibling milestone `milestones/hardware/iommu-and-dma.md`.
