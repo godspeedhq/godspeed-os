@@ -195,20 +195,44 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
 /// full" refusal, because optional endpoints could still take 72 of the 96.
 const OPTIONAL_RESERVE: usize = MAX_ENDPOINTS * 3 / 4;
 
+/// How many optional registrations have been refused. Diagnostic only - owned here, where the
+/// refusal happens, so the count cannot disagree with the decision.
+static REFUSED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// `try_register` for an endpoint the caller can do WITHOUT.
 ///
 /// Refuses once free slots fall to the reserve, so a convenience can never consume what a mandatory
 /// registration needs. Degraded, not broken - and degraded in the direction that keeps services
 /// spawnable.
 pub fn try_register_optional(id: EndpointId, core_id: u32, generation: Generation) -> bool {
-    {
+    // Count under the lock, decide and REPORT outside it. A serial write is ~9 ms on the ARM ports
+    // and it is not preemptible, so logging while holding the routing table would stall every IPC on
+    // the machine for the duration - the routing table is on the path of every send. The scope here
+    // is deliberate and not stylistic.
+    let free = {
         let table = TABLE.lock_irq();
-        let free = table.iter()
+        table.iter()
             .filter(|e| !e.valid || e.liveness == EndpointLiveness::Dead)
-            .count();
-        if free <= OPTIONAL_RESERVE {
-            return false;
+            .count()
+    };
+    if free <= OPTIONAL_RESERVE {
+        // LOUD, because a silent refusal leaves no trace of a real degradation (invariant 12). The
+        // caller does fall back correctly - it awaits replies on its shared endpoint - but that
+        // fallback is the very hazard the reply mailbox exists to remove (a service cannot drain
+        // client traffic while waiting on the endpoint it also serves), so it is a fact an operator
+        // needs rather than an implementation detail.
+        //
+        // Never observed firing: zero refusals across the shell, identity and property suites on
+        // x86 and a full arm32 boot. That is why the threshold is unchanged - it was suspected of
+        // starving the mailbox at boot and the measurement did not support it. This log exists so
+        // the next person has evidence instead of the same suspicion.
+        let n = REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 3 || n % 64 == 0 {
+            crate::kprintln!(
+                "routing: reply endpoint refused - {} of {} slots free, reserve {} ({} refused so far)",
+                free, MAX_ENDPOINTS, OPTIONAL_RESERVE, n);
         }
+        return false;
     }
     try_register(id, core_id, generation)
 }
