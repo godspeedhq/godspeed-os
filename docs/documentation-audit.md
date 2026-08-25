@@ -8,6 +8,78 @@
 > First audit: 2026-07-15.
 
 
+## Audit 6 - the hardening session: does the prose match what the hardware proved? (2026-08-25)
+
+**Scope:** the 40 commits of `feat/pi2-arm32-hardening` from `28d363eb` to `a028faf7` - the console
+and framebuffer work, the property-suite repairs, the dwc2 interrupt path, and four cap-reacquisition
+fixes. This range is unusual in that most of its findings came from HARDWARE contradicting a claim,
+which makes it the sharpest test of prose this audit has had: a document can survive a rewrite that
+the mechanism it describes does not.
+
+**Verdict: 1 HIGH, 4 MED, 3 LOW. All eight fixed.** No Commandment violations in the range.
+
+### The shape worth naming: prose outlives the mechanism across a rewrite
+
+**A6-1 (HIGH)** is the whole lesson. `docs/arm32-status.md` stated that the Pi 2's LAN9514 ran with
+RX **interrupt-driven** - "a bulk-IN is kept armed and its halt-ISR parses each burst and re-arms".
+None of the interrupt half existed. The handler lived in the fallback loop entered only when there is
+no MMIO/DMA, so a board with hardware never reached it; its `irq_unmask` was in that same dead loop,
+so the vector was never armed; and `reset_and_host_mode` clears GAHBCFG's global interrupt bit and
+writes GINTMSK = 0 at init, so the controller never asserted the line. Every log from this port shows
+zero interrupts delivered, across months.
+
+The armed bulk-IN and the burst parsing were real. What was never true is that an interrupt drove
+them - the client poll path did, and still predominantly does even now that both halves are wired.
+
+How it got there matters more than the line itself: `docs/unsafe-audit.md` (2026-07-29) records the
+same claim for the IN-KERNEL dwc2 driver, where it may well have been accurate. When the stack moved
+to a userspace service (2026-08-17), the PROSE was carried across and the MECHANISM was not. Nothing
+re-checked it, because nothing tests a sentence.
+
+### Findings
+
+| ID | Sev | Where | What |
+|----|-----|-------|------|
+| **A6-1** | HIGH | `docs/arm32-status.md` | Claimed interrupt-driven RX; the interrupt path was unreachable and the vector never armed. Corrected to client-polled, with the reason and the 2026-08-25 wiring both recorded. |
+| **A6-2** | MED | `docs/console-service.md` | Reasoned carefully about the ARM framebuffer memory type and said nothing about x86, where `PCD \| PWT` selected strong-UC and cost **596 ms per scroll** (~32 MB/s). Added the x86 half and the table showing the two ports need OPPOSITE bits for the same intent. |
+| **A6-3** | MED | `docs/aarch64.md` | Still opened "design, not built" for a port that boots, runs services and drives USB and ethernet. **This was Audit 4's A4-9 (2026-08-12), recorded and never closed** - a finding that sat open for thirteen days is itself the finding. |
+| **A6-4** | LOW | `docs/networking.md`, `docs/CLAUDE.md` | Networking indexed and headed as "design, not built" while `net-stack` + `nic-driver` ship and pass DHCP/ARP/ICMP/DNS on two boards. |
+| **A6-5** | MED | `docs/arm32-usb-userspace.md` | Headed "in progress", and described `kernel/src/arch/arm/dwc2.rs` in the present tense. That file does not exist; `services/dwc2` (6061 lines) has replaced it. Header closed; the goal paragraph kept but re-tensed, since its numbers describe the code as it WAS. |
+| **A6-6** | MED | `docs/CLAUDE.md` | The index listed five documents that were never written (`ipc.md`, `capability.md`, `bootstrap.md`, `restart.md`, `smp.md` - confirmed by git having no history for any) and omitted ten that exist. Index and directory now agree exactly. |
+| **A6-7** | LOW | `README.md` | Property suite listed "Active" (it is 10/10); unsafe-audit row cited 302 lines / 23 files from May against 1024 / 68 today. |
+| **A6-8** | LOW | `CLAUDE.md` §22 | Property row read "Active" while the Performance row already carried its count; both now state one. |
+
+Also corrected in the range: `docs/kernel-audit.md` recorded that driver *death* "already unregisters"
+its IRQ lines. It did not - the kill path used a hardcoded list of service names and `dwc2` was not on
+it. The same note called the resulting leak "self-correcting" because a respawn overwrites the stale
+route; true for memory safety, and not true for the driver, whose interrupt delivery varied 9, then 7,
+then 0 across identical runs.
+
+### What came back clean, and how it was checked
+
+- **Zero broken markdown links** across `docs/`, `README.md`, `CLAUDE.md`, `COMMANDMENTS.md`.
+- **Zero unresolved `§N` references** into the constitution (26 top-level sections).
+- **No prose anywhere describes the instrumentation added and removed in this range** - the console
+  paint/busy counters, the kernel `console-write` report, the dwc2 retry that was reverted. Checked by
+  grep for each identifier; the one stale case (a comment in `dispatch.rs` describing counters that had
+  been deleted) was found and fixed during the session.
+- **Four documented source paths do not exist**, and all four are correct: two are deliberate history
+  in amendments and audit logs (`arch/aarch64/xhci.rs`, `arch/arm/dwc2.rs`), and two are design
+  PROPOSALS phrased as requirements (`kernel/src/console.rs`, `sdk/rust/src/pio.rs`).
+- **No instance of Audit 5's drift shape** (comments describing what a change was MEANT to achieve) in
+  this range. The three candidate matches are explicit rationale, one of which states outright that the
+  cause "is NOT yet established, and this comment will not pretend otherwise".
+
+### The recommendation this audit leaves
+
+A4-9 sat open for thirteen days and A6-1 for months, and both are the same failure: **a status line is
+the least-tested sentence in a repository**. Every other claim here is checkable by machine - links,
+section references, file paths, counts - and those all came back clean, because something checks them.
+Status headers are checked by nobody. The cheapest guard would be a checker that fails when a doc says
+"not built" for a component the build system embeds, or "interrupt-driven" for a service whose contract
+declares no `hw_interrupt`; neither is hard, and either would have caught a finding above.
+
+
 ## Audit 5 - the revert range: does the prose still describe machinery that was taken back out? (2026-08-11, `feat/pi4-aarch64`)
 
 **Scope:** everything committed since `5426c6db` - 20 commits, of which five ADDED a mechanism and a

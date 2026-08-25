@@ -367,6 +367,30 @@ driver MMIO grants that genuinely need it.
 Cost: the kernel's boot text is slower to paint. It is boot text, and the terminal's own scroll was
 already repaint-from-shadow on x86 for the same reason.
 
+### The same mistake existed on x86, in the other direction (2026-08-25)
+
+The paragraphs above reason carefully about the ARM encoding and say nothing about x86, where the
+framebuffer grant was mapped `PCD | PWT`. On x86 that is PAT entry 3 - **strong uncacheable**, the one
+memory type an MTRR can never upgrade - so every 4-byte pixel store went to the bus alone. Measured on
+a Wyse 5070 at 3840x2160: **596 ms to repaint one scroll**, about 19 MB at roughly 32 MB/s. The display
+was unusable and it read as "the console is slow" rather than as a mapping bug.
+
+`PCD` alone selects entry 2, **UC-**, which yields write-combining wherever the range's MTRR says WC -
+and firmware routinely marks a framebuffer WC for exactly this reason. One flag: **596 ms -> 29-41 ms**,
+about 650 MB/s. Strictly no worse where the MTRR says UC, because the effective type is then unchanged.
+
+The two ports need OPPOSITE bits for the same intent, which is why this is worth stating in one place:
+
+| | wants gathering | encoding |
+|---|---|---|
+| x86 | `PCD` alone (UC-, upgradable to WC by MTRR) | `PCD \| PWT` is strong UC and is NOT |
+| arm32 | `PCD \| PWT` (Normal non-cacheable) | `PCD` alone is Device and forbids gathering |
+
+So the x86 fix is `#[cfg(target_arch = "x86_64")]`-gated. Applying it everywhere would have slowed the
+Pi for precisely the reason it sped up the PC, and worse, mismatched `mmu::section_fb`'s view of the
+same physical pages - which on ARM is unpredictable rather than merely slow. Borrow the silicon's
+requirement, not the other port's answer (§26.14).
+
 ### 9.6 Surfaces added and removed
 
 | | |

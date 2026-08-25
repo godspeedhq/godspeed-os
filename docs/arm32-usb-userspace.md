@@ -1,9 +1,17 @@
 # Taking the DWC2 USB stack out of the arm32 kernel
 
-> **Status:** in progress on `feat/pi2-arm32-hardening`. Phase 1 landed (`58eb4610`).
+> **Status: DONE.** `kernel/src/arch/arm/dwc2.rs` no longer exists, and `services/dwc2` (6061 lines
+> across its modules) drives the controller from userspace on `USB_VECTOR`. Keyboard, mass storage
+> and LAN9514 networking all run through it on real hardware. The constitution records the move in
+> its 2026-08-17 amendment (§6.4).
 >
-> **Goal:** `kernel/src/arch/arm/dwc2.rs` is **3981 of the arm32 arch layer's 10732 lines - 37% of it
-> is a USB driver**, running in ring 0, parsing descriptors supplied by whatever a user plugs in.
+> This header said "in progress ... Phase 1 landed" until 2026-08-25, and the goal paragraph below
+> still describes the in-kernel file in the present tense. Both are kept as the record of what the
+> work set out to do - the numbers in them describe the code as it was BEFORE the move, not now.
+>
+> **Goal (as it stood at the start):** `kernel/src/arch/arm/dwc2.rs` WAS **3981 of the arm32 arch
+> layer's 10732 lines - 37% of it a USB driver**, running in ring 0, parsing descriptors supplied by
+> whatever a user plugs in.
 > Move it to a userspace service, as the AArch64 port did with `xhci`.
 
 ## Why the stated blocker was not one

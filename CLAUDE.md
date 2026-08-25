@@ -1434,7 +1434,7 @@ The test suite is layered. Each layer answers a different question about kernel 
 | Category    | Purpose                                              | Bar (what failure means)                          | Status |
 |-------------|------------------------------------------------------|---------------------------------------------------|--------|
 | Identity    | Pin constitutional decisions; existence proof        | Constitutional invariant violated                 | §22 (Test 11 added, H11) |
-| Property    | Universal invariants under random inputs             | A claim the spec makes does not hold              | Active |
+| Property    | Universal invariants under random inputs             | A claim the spec makes does not hold              | §22 (P1-P10, 10/10) |
 | Fuzz        | Crash resistance under adversarial inputs            | Kernel panics on user-controllable input          | Active |
 | Stress      | Survival under sustained load                        | Drift, leaks, or corruption appear over time      | Active |
 | Performance | Latency / throughput benchmarks                      | A measured number regressed                       | §22 (10/10) |

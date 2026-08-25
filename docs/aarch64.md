@@ -1,6 +1,13 @@
 # AArch64 Port (Raspberry Pi 4) - Design and Plan
 
-> **Status:** design, not built. Non-normative until the constitution is amended (see
+> **Status: BUILT and running on hardware** (this line said "design, not built" until 2026-08-25).
+> The Pi 4 boots the arch-neutral kernel, the supervisor spawns services, USB is a userspace `xhci`
+> service driving keyboard and mass storage, and GENET ethernet transmits and receives - all recorded
+> in `CLAUDE.md`'s amendments and in `docs/multi-arch.md`. Audit 4 flagged this same line as stale on
+> 2026-08-12 (finding A4-9) and it was recorded rather than closed; closing it now.
+>
+> What is still design rather than built is called out per-section below; the *port* is not.
+> Non-normative until the constitution is amended (see
 > "Constitution amendments needed" below). Target board: **Raspberry Pi 4 Model B, 4 GB, run in
 > AArch64 (64-bit).** This doc captures the bring-up plan and, more importantly, the *measured*
 > arch-boundary punch-list that makes the port bounded work rather than a guess.

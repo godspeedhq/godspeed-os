@@ -53,11 +53,23 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
   `NET_DEVICE` syscalls (42-44) that used to front an in-kernel USB-net device are **stubbed inert** on
   this arch (`arch/arm/mod.rs`), because no frame passes through the kernel any more. Verified in QEMU (`arm_run.py --usbnet`): DHCP, ARP,
   ICMP, DNS, and the shell `net` + `ping` all work over USB. The Pi 2's onboard **LAN9514 (`smsc95xx`) is
-  now driven on real hardware too**: DHCP, ARP and internet ping all work, with RX **interrupt-driven** (a
-  bulk-IN is kept armed and its halt-ISR parses each burst and re-arms; the DWC2 core auto-retries NAKs in
-  hardware, so an idle device costs no interrupts). The poll it replaced listened only ~3% of each 10 ms
-  tick and the device's small RX FIFO dropped the rest - that was ~85% ping loss, now ~4% (ordinary
-  internet loss). Link state is read from the PHY (MII BMSR), so an unplugged cable reports as unplugged.
+  now driven on real hardware too**: DHCP, ARP and internet ping all work, with RX **client-polled**: a bulk-IN
+  is kept armed, and `rx()` harvests the completed burst and re-arms it when a client asks for frames.
+  The DWC2 core auto-retries NAKs in hardware, so an idle device costs nothing.
+
+  **CORRECTED 2026-08-25.** This paragraph used to say RX was "interrupt-driven ... its halt-ISR parses
+  each burst", and that mechanism did not exist. The handler lived in the fallback loop entered only
+  when there is no MMIO/DMA, so a board with hardware never reached it; the `irq_unmask` was in that
+  same dead loop, so the vector was never armed; and `reset_and_host_mode` clears GAHBCFG's global
+  interrupt bit and writes GINTMSK = 0 at init, so the controller never asserted the line. Every log
+  from this port shows zero interrupts delivered. The armed bulk-IN and the burst parsing are real -
+  what was never true is that an interrupt drove them.
+
+  Both halves are wired as of 2026-08-25 (the vector is armed from the loop that owns the hardware, and
+  the host-channel interrupt is enabled at the device), and interrupts now do arrive - but they harvest
+  almost nothing, because the client poll path reaches each completion first. Receive is therefore still
+  poll-driven in practice, and the honest claim is the one above. The `net IRQ` counters report it
+  rather than leaving it to be inferred. Link state is read from the PHY (MII BMSR), so an unplugged cable reports as unplugged.
 - **Multiple USB devices coexist:** `enumerate_downstream` walks *every* hub port, gives each device a
   distinct address, and configures all of them; the single DWC2 host channel is time-shared by having each
   transfer carry a `Target` (address / max-packet / speed). Hot-plug in both directions is watched through
