@@ -131,6 +131,13 @@ pub struct Nic {
     /// waited), [1] a transfer was still IN FLIGHT, [2] STALL, [3] the burst was empty. An interrupt
     /// that harvests nothing is not self-explanatory, and these four have different answers.
     pub rx0: [u32; 4],
+    /// Last BMSR seen by `link_up`, and how many CHANGES have been reported.
+    ///
+    /// A 15-second periodic dump cannot tell "autonegotiation is slow" from "autonegotiation
+    /// completed and then RESTARTED", and those have different causes. Logging every transition
+    /// shows the shape instead of sampling it.
+    pub last_bmsr: u16,
+    pub bmsr_changes: u32,
     /// Consecutive polls that found the armed IN still enabled and not complete, and how many times we
     /// have reported a long run of them. Diagnostic only - nothing acts on these.
     pub pid_in: u32,
@@ -349,7 +356,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
     // Link starts DOWN and unstamped: the first transmit reads the PHY instead of assuming a
     // cable is there. Assuming UP is how a driver spends a full budget per frame proving otherwise.
     Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(),
-               rxbuf: [0u8; RXQ_BYTES], rxbuf_fill: 0, rxbuf_pos: 0, rxq_count: 0, irq_enabled: false, rx0: [0; 4],
+               rxbuf: [0u8; RXQ_BYTES], rxbuf_fill: 0, rxbuf_pos: 0, rxq_count: 0, irq_enabled: false, rx0: [0; 4], last_bmsr: 0, bmsr_changes: 0,
                in_armed: false,
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
                link_up: false, link_at: 0,
@@ -469,9 +476,32 @@ const SMSC_MII_BMSR: u32 = 1;   // basic mode STATUS; bit 2 = link up, bit 5 = a
 /// therefore reports a freshly-connected cable as down, forever, until something happens to read twice.
 /// This is standard 802.3 clause-22 behaviour, not a quirk of this part, and it is why every driver
 /// reads this register twice.
-fn link_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> bool {
+fn link_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic) -> bool {
     let _latched = mii_read(ctx, m, d, t, SMSC_MII_BMSR);
-    matches!(mii_read(ctx, m, d, t, SMSC_MII_BMSR), Some(v) if v & 0x0004 != 0)
+    let read = mii_read(ctx, m, d, t, SMSC_MII_BMSR);
+    // EVERY TRANSITION, not a 15-second sample. Bit 2 is link, bit 5 is autoneg-complete: 0x7809 is
+    // "negotiating, no link", 0x782d is "negotiated, link up". Seeing 0x782d and then 0x7809 again
+    // means negotiation RESTARTED, which is a different fault from negotiation merely being slow -
+    // and the first DHCP lease on this board takes ~30 s, many times what autonegotiation costs.
+    //
+    // Logging only, deliberately: the verdict below is byte-for-byte what it was, because the last
+    // time this function changed shape it desynchronised an RPC stream, and a measurement has no
+    // business altering what it measures.
+    if let Some(v) = read {
+        if v != nic.last_bmsr {
+            nic.last_bmsr = v;
+            nic.bmsr_changes = nic.bmsr_changes.saturating_add(1);
+            if nic.bmsr_changes <= 16 {
+                ctx.log_fmt(format_args!(
+                    "dwc2-svc: BMSR {:#06x} - {} {} (change {})",
+                    v,
+                    if v & 0x0004 != 0 { "LINK" } else { "down" },
+                    if v & 0x0020 != 0 { "autoneg-done" } else { "negotiating" },
+                    nic.bmsr_changes));
+            }
+        }
+    }
+    matches!(read, Some(v) if v & 0x0004 != 0)
 }
 
 /// Reconfigure the MAC for the duplex the PHY actually negotiated, and set flow control to match.
@@ -541,7 +571,7 @@ fn link_reconfigure(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) {
 fn link_fresh(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic) -> bool {
     let now = ctx.read_tsc();
     if nic.link_at == 0 || now.wrapping_sub(nic.link_at) >= ctx.duration_cycles(LINK_TTL_MS) {
-        let up = link_up(ctx, m, d, t);
+        let up = link_up(ctx, m, d, t, nic);
         link_observed(ctx, m, d, t, nic, up, now);
     }
     nic.link_up
@@ -1584,7 +1614,7 @@ pub fn serve(
             // a yes.
             // This is a fresh read of the PHY, so let the transmit cache learn from it too - the
             // link question and the transmit guard must never disagree about the same cable.
-            let up = link_up(ctx, mmio, dma, t);
+            let up = link_up(ctx, mmio, dma, t, nic);
             let now = ctx.read_tsc();
             link_observed(ctx, mmio, dma, t, nic, up, now);
             nic.stats.bmsr = mii_read(ctx, mmio, dma, t, SMSC_MII_BMSR).map_or(0xFFFF, u32::from);
