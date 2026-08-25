@@ -699,12 +699,23 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         // The one legitimate retry is a SEND failure, which is distinguishable from a timeout:
         // `find_send_slot` reads spawn-time wiring, so a peer spawned after us is unreachable until
         // reacquired. A send that never left is safe to repeat; a request that may already be
-        // answered is not.
-        let got = match ctx.request_with_reply_deadline_outcome("dwc2", msg, DWC2_SECS) {
-            DeadlineOutcome::Reply(r) => r,
-            DeadlineOutcome::SendFailed if ctx.reacquire_by_name("dwc2") =>
-                ctx.request_with_reply_deadline("dwc2", msg, DWC2_SECS)?,
-            _ => {
+        // CALL, not send-then-plain-recv. A plain recv takes whatever is next on this endpoint, and
+        // this service SERVES clients on the very endpoint it was awaiting dwc2's reply on - so it
+        // was dequeuing net-stack's requests and dropping them. The log named them outright:
+        // "dwc2 answered op 0x03 while we asked 0x10", "op 0x09 while we asked 0x12" - 0x03 and 0x09
+        // are net-stack's status and batch-drain requests, not dwc2 replies at all.
+        //
+        // Two faults from one mistake. Transmits were reported failed 320 times while dwc2 counted 9
+        // real failures, and - the costly half - every swallowed request was a client's question
+        // lost outright, which is why DHCP stalled for ~30 s and then completed the moment the
+        // traffic thinned.
+        //
+        // `Call` carries a one-shot reply cap and dequeues only the reply matched to it, leaving
+        // client requests queued where they belong. CLAUDE.md §8.2 records this exact hazard as the
+        // reason the primitive exists; this path predates it.
+        let got = match ctx.request_with_reply_call("dwc2", msg, DWC2_SECS) {
+            Some(r) => r,
+            None => {
                 rpc_timeouts.set(rpc_timeouts.get().saturating_add(1));
                 return None;
             }
