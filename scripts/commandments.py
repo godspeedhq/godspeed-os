@@ -783,11 +783,15 @@ CHECKS = [
                   pins={"_law": "no scope section here"}, expect=True),
              dict(why="a module claiming something outside the six must be caught",
                   pins={"module_responsibility": {"memory": "filesystem"}}, expect=True),
-             # Reality: four modules claim nothing today (C1-6). This probe asserts that, so closing
-             # those findings BREAKS it deliberately and forces the expectation to be flipped - the
-             # same ratchet the baseline uses, applied to the corpus.
-             dict(why="the real module set still has unclaimed modules (C1-6 open)",
-                  pins=None, expect=True),
+             # RATCHETED 2026-08-25: C1-6 is CLOSED - every top-level kernel module now claims one
+             # of the six. The probe below used to assert the opposite (four modules claiming
+             # nothing), and it BROKE when the last of them was resolved, which is precisely what it
+             # was built to do: an improvement must not slip past unrecorded any more than a
+             # regression may. Flipping the expectation is what locks the gain in - from here, a
+             # module that goes back to claiming nothing breaks this probe again, in the other
+             # direction.
+             dict(why="the real module set has NO unclaimed modules (C1-6 closed, and must stay closed)",
+                  pins=None, expect=False),
          ]),
     dict(nature="record", id="I-arch-drivers", commandment="I", title="no peripheral device driver lives in the kernel",
          kind="custom", fn=check_arch_device_drivers,
