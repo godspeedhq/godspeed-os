@@ -842,6 +842,7 @@ fn mode_prop_p4(ctx: &ServiceContext) -> ! {
 }
 
 fn mode_prop_p5(ctx: &ServiceContext) -> ! {
+    let mut n = 0u32;
     // P5 - Every live endpoint has exactly one owning task (§8.3).
     // 50 kill/spawn cycles of prop-p5-victim. The routing table has 96 slots and
     // the system holds ~70 alive endpoints at steady state, leaving ~26 free slots.
@@ -855,12 +856,19 @@ fn mode_prop_p5(ctx: &ServiceContext) -> ! {
     for _ in 0..50u32 {
         let _ = ctx.kill("prop-p5-victim");
         match ctx.spawn("prop-p5-victim") {
-            Err(_) => {
-                ctx.log("prop: P5 FAIL - spawn failed (routing table overflow; orphan detected)");
+            // SAY WHAT FAILED, not what we assume failed. This read "routing table overflow;
+            // orphan detected" without ever looking at the error, and that guess has now cost a
+            // bisect: routing DOES reuse dead slots (`try_register` accepts an entry whose liveness
+            // is Dead), so overflow is one candidate among several and naming it crowded the others
+            // out. The error is right there in the Result.
+            Err(e) => {
+                ctx.log_fmt(format_args!(
+                    "prop: P5 FAIL - spawn {} of 50 failed: {:?}", n + 1, e));
                 idle(ctx);
             }
             Ok(()) => {}
         }
+        n += 1;
     }
     ctx.log("prop: P5 pass (50/50)");
     idle(ctx)
