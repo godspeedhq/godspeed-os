@@ -5614,6 +5614,25 @@ fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> 
 ///
 /// The order is the order the layers come up in, so the FIRST missing one is named rather than the
 /// last: a machine with no cable is told about the cable, not about its gateway.
+/// Ask net-stack for its status, reacquiring the peer once if the cached cap has gone stale.
+///
+/// §14.3 puts this obligation on the CLIENT: a service that restarted issues a new endpoint, and the
+/// cap we were holding is dead. `net_link_up` and `console_dims` already do this; the lease query did
+/// not, and the difference was visible - net-stack restarted three times under chaos (adopted at
+/// slots 16, 17, then 18), after which this shell reported "no lease" while net-stack was resolving
+/// DNS and SNTP perfectly well over the lease it still held. The network was fine; the question was
+/// being asked down a dead cap.
+fn net_status_reply(ctx: &ServiceContext) -> Option<Message> {
+    let req = Message::from_bytes(&[0u8]);
+    if let Some(r) = ctx.request_with_reply_deadline("net-stack", &req, 3) {
+        return Some(r);
+    }
+    if ctx.reacquire_by_name("net-stack") {
+        return ctx.request_with_reply_deadline("net-stack", &req, 3);
+    }
+    None
+}
+
 fn net_unconfigured_reason(ctx: &ServiceContext) -> Option<&'static str> {
     match net_link_up(ctx) {
         Some(true) => {}
@@ -5622,7 +5641,7 @@ fn net_unconfigured_reason(ctx: &ServiceContext) -> Option<&'static str> {
         // session looking like a hardware one.
         None => return Some("cannot reach nic-driver (no answer) - link state unknown"),
     }
-    let r = ctx.request_with_reply_deadline("net-stack", &Message::from_bytes(&[0u8]), 3)?;
+    let r = net_status_reply(ctx)?;
     let p = r.payload_bytes();
     if p.len() < 15 {
         return None;                      // cannot read the status - say nothing rather than guess
@@ -5702,8 +5721,7 @@ fn net_lease(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
             return Ok(());
         }
     }
-    let req = Message::from_bytes(&[0u8]);
-    match ctx.request_with_reply_deadline("net-stack", &req, 3) {
+    match net_status_reply(ctx) {
         Some(r) => {
             let p = r.payload_bytes();
             // bit 2 of the flag byte = DHCP granted this address (net-stack publishes it).
