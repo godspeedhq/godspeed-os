@@ -656,6 +656,18 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     // forever unless we reacquire. `dwc2` is exactly that peer (it is spawned by hand today), and the
     // failure is silent from here: `request_with_reply` returns None INSTANTLY, which reads as a dead
     // cable rather than a missing cap. block-driver learned this in slice 3c; this is the same edge.
+    // WHICH KIND of RPC failure, because `None` below means two opposite things. dwc2 reports 9 real
+    // transmit failures out of 364 while this layer reported 320, so the frames ARE going out and
+    // something here calls them failed. A TIMEOUT means dwc2 never answered. An OP MISMATCH means it
+    // answered somebody ELSE's question - what a plain recv does when two clients (block-driver and
+    // this one) share dwc2's single endpoint, which is the hazard CLAUDE.md §8.2 records and the
+    // reason `Call` carries a reply cap.
+    //
+    // Cells, not statics: this is the service's own state (Invariant 9), captured by the closure.
+    #[cfg(target_arch = "arm")]
+    let rpc_timeouts = core::cell::Cell::new(0u32);
+    #[cfg(target_arch = "arm")]
+    let rpc_mismatch = core::cell::Cell::new(0u32);
     #[cfg(target_arch = "arm")]
     let dwc2_rpc = |ctx: &ServiceContext, msg: &Message| -> Option<Message> {
         // Bounded on the lean await: a dwc2 that is alive but silent hung this driver, net-stack
@@ -692,7 +704,10 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             DeadlineOutcome::Reply(r) => r,
             DeadlineOutcome::SendFailed if ctx.reacquire_by_name("dwc2") =>
                 ctx.request_with_reply_deadline("dwc2", msg, DWC2_SECS)?,
-            _ => return None,
+            _ => {
+                rpc_timeouts.set(rpc_timeouts.get().saturating_add(1));
+                return None;
+            }
         };
         // RE-SYNC ON THE TAG, BY DROPPING THE STALE ANSWER AND NOT ASKING AGAIN.
         //
@@ -708,6 +723,13 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         // net-stack polls again a few milliseconds later - which is a normal quiet-network answer and
         // costs only the frame that was already late.
         if got.payload_bytes().first().copied() != Some(want) {
+            let n = rpc_mismatch.get().saturating_add(1);
+            rpc_mismatch.set(n);
+            if n <= 3 || n % 128 == 0 {
+                ctx.log_fmt(format_args!(
+                    "nic-driver: dwc2 answered op {:#04x} while we asked {:#04x} - not our reply ({} mismatched, {} timed out)",
+                    got.payload_bytes().first().copied().unwrap_or(0), want, n, rpc_timeouts.get()));
+            }
             return None;
         }
         Some(got)
