@@ -12,30 +12,52 @@ A capability-based microkernel OS written in Rust. Every privileged action requi
 
 ## Architecture
 
+The whole system, bottom to top. It fits on a whiteboard on purpose - the constitution makes that a
+requirement (§26.11), and a diagram you can redraw from memory is the only proof that it holds.
+
 ```
-  ┌──────────────────────────────────────────────────┐
-  │  Application Services  (replaceable)             │
-  ├──────────────────────────────────────────────────┤
-  │  System Services                                 │
-  │  logger  ·  block-driver  ·  fs                  │
-  ├──────────────────────────────────────────────────┤
-  │  Trusted Root  (restartable; kernel respawns it) │
-  │  supervisor                                      │
-  ├──────────────────────────────────────────────────┤
-  │  Kernel  (mechanism, not policy)                 │
-  │  memory · scheduler · ipc · capability           │
-  │  syscall · interrupts · smp/routing              │
-  ├──────────────────────────────────────────────────┤
-  │  Architecture Layer  (unsafe boundary)           │
-  │  arch/x86_64                                     │
-  ├──────────────────────────────────────────────────┤
-  │  Hardware  (multi-core)                          │
-  └──────────────────────────────────────────────────┘
+               ┌────────────────────────────────────────────────────────┐
+ applications  │ shell  observe  chaos  edit  examples...               │
+               ├────────────────────────────────────────────────────────┤
+ services      │ fs  net-stack  console  logger  time                   │
+               ├────────────────────────────────────────────────────────┤
+ DRIVERS       │ block-driver  nic-driver  xhci  ehci  dwc2             │
+ (userspace)   │ each one a service, with only what it asked for        │
+               └────────────────────────────────────────────────────────┘
+                         ▲
+                         │  spawns each, and RESTARTS it when it dies
+               ┌────────────────────────────────────────────────────────┐
+ trusted root  │ supervisor      (trusted, itself restartable)          │
+               └────────────────────────────────────────────────────────┘
+                         ▲
+                         │  the kernel's ONE spawn. Nothing else.
+ ═══════════════════════════════════════════════════════════════════════  ring 0
+               ┌────────────────────────────────────────────────────────┐
+ kernel        │ 1 memory isolation    4 capabilities                   │
+ (mechanism,   │ 2 scheduling          5 interrupt routing              │
+  not policy)  │ 3 IPC                 6 SMP routing                    │
+               │                                                        │
+               │ Six responsibilities. No filesystem, no network        │
+               │ stack, no drivers, no policy. A module serving         │
+               │ none of the six does not belong - and a checker        │
+               │ refuses the build if one appears.                      │
+               └────────────────────────────────────────────────────────┘
+                         ▲
+                         │  arch::imp - the only seam, and the only unsafe
+               ┌────────────────────────────────────────────────────────┐
+ hardware      │ x86_64      ARM (Pi 2)      AArch64 (Pi 4)             │
+               └────────────────────────────────────────────────────────┘
 ```
 
-The kernel is strictly bounded: memory isolation, scheduling, IPC routing, capability enforcement, interrupt routing, and multi-core coordination. Nothing else. Policy belongs to services.
+Three things to take from it:
 
----
+- **The kernel spawns exactly one service.** Everything else is spawned by the supervisor, which is
+  itself an ordinary restartable service. The kernel is the only thing that cannot be killed.
+- **Drivers live in userspace.** `xhci`, `nic-driver` and the rest are services holding a capability
+  to a memory-mapped region and an interrupt line - nothing more. A crashed driver is a restart, not
+  a reboot.
+- **Authority points downward and is always explicit.** Nothing is ambient: a service can do exactly
+  what its contract was granted and no more, checked on every privileged syscall.
 
 ## Portability
 
@@ -80,7 +102,7 @@ GodspeedOS treats testing as architecture. The suite is layered - each layer mus
 | Suite | Purpose | Status |
 |-------|---------|--------|
 | Identity (15 tests, 24 cases) | Pin constitutional invariants | 24/24 ✅ |
-| Property (P1-P10) | Universal correctness under random inputs | Active |
+| Property (P1-P10) | Universal correctness under random inputs | 10/10 |
 | Fuzz (F1-F8) | Kernel never panics on user-controllable input | Active |
 | Stress (S1-S10) | No drift, leaks, or corruption over time | Active |
 | Performance (B1-B10) | Latency / throughput baselines | Active |
@@ -91,11 +113,14 @@ GodspeedOS treats testing as architecture. The suite is layered - each layer mus
 
 Every `unsafe` block is inventoried in `docs/unsafe-audit.md` and enforced by
 `scripts/unsafe_check.py` - counts may not grow without a written SAFETY argument.
-Latest pass (2026-05-31, boot-verified on AMD T630; `milestones/testing/static-analysis-audit.md`):
+The inventory grows as the system does - three CPU ports and userspace drivers all need it - so the
+check is that every line is ACCOUNTED for, not that the count stays still. Figures below are from the
+current tree; the boot-verified pass they were first taken from is
+`milestones/testing/static-analysis-audit.md` (2026-05-31, AMD T630):
 
 | Check | Result |
 |-------|--------|
-| Unsafe confined to permitted layers (§18.1) | ✅ `ipc/` violation fixed; audit passes (302 lines / 23 files) |
+| Unsafe confined to permitted layers (§18.1) | audit passes: 1024 lines across 68 files, no unaccounted additions |
 | Safety / correctness lints (static-mut refs, fn-casts, redundant `unsafe`) | ✅ 0 |
 | Kernel build warnings | 104 → 57 (remaining are intentional unwired architecture) |
 | Hardware boot regression | ✅ clean - 4 cores, cross-core ping/pong to 83k+ msgs, zero faults |

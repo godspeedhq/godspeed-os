@@ -1096,11 +1096,25 @@ falling through to the breadcrumb write best-effort on timeout - exactly as the 
 
 ### Notes for record (not bugs)
 
-- `cleanup_partial_spawn` does not `interrupt::route::unregister` a *failed driver spawn*'s IRQ lines
-  (only driver spawns register IRQs, only a post-IRQ map failure leaves a stale entry). Bounded and
-  self-correcting: `IRQ_TABLE` is a fixed `[Option; 256]`, a stale route delivers to a now-dead endpoint
-  (harmless `None`), and a respawned driver overwrites it. No trigger to a fault. (Contrast driver
-  *death*, which already unregisters - Audit-1 Item 2.)
+- `cleanup_partial_spawn` does not release a *failed driver spawn*'s IRQ lines (only driver spawns
+  register IRQs, only a post-IRQ map failure leaves a stale entry). `IRQ_TABLE` is a fixed
+  `[Option; 256]`, and a stale route delivers to a now-dead endpoint, so it cannot fault.
+
+  **AMENDED 2026-08-25.** Two claims here did not survive contact with hardware, and both are worth
+  correcting rather than quietly editing away.
+
+  The parenthetical said driver *death* "already unregisters". It did not, in general: the kill path
+  worked the owning line out from a hardcoded list of service NAMES - `"xhci"`, `"ehci"`, and nothing
+  else - so `dwc2` leaked its route on every restart. Death now releases by ENDPOINT
+  (`route::unregister_endpoint`), which is a lookup rather than a list and cannot go stale when a
+  service is added, renamed, or ported to an arch with a different vector. The contrast the note drew
+  is true now; it was not when it was written.
+
+  And "self-correcting, a respawned driver overwrites it" understated the cost. The overwrite is
+  exactly what the kernel had been reporting - "IRQ 41 already routed - overwriting (second claim or a
+  missed unregister?)" - and the consequence was interrupt delivery that varied run to run on
+  identical code: 9 interrupts, then 7, then 0. Harmless to memory safety, yes; not harmless to the
+  driver that stopped receiving interrupts.
 - The B-set of correctly-loud panics (generation overflow, endpoint-id/routing exhaustion, liveness/
   shootdown watchdogs, W^X asserts) is unchanged from Audit 1/2 and re-confirmed as the defense.
 
