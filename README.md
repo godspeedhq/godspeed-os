@@ -59,6 +59,40 @@ Three things to take from it:
 - **Authority points downward and is always explicit.** Nothing is ambient: a service can do exactly
   what its contract was granted and no more, checked on every privileged syscall.
 
+### The six things the kernel does
+
+The kernel box lists six responsibilities and nothing else - every other part of the system is a
+service. Each one is *mechanism*: the kernel enforces the rule and never decides the policy.
+
+1. **Memory isolation.** Each service gets its own virtual address space and page tables, so one
+   service cannot read or write another's memory. Touching anything outside your mapped region is a
+   page fault, and the service is killed rather than left running in an undefined state.
+
+2. **Scheduling.** Every CPU core has its own queue of runnable tasks and takes them in turn. A 10 ms
+   timer forces the switch whether the running task cooperates or not, so no service can hold a core
+   by refusing to yield.
+
+3. **IPC** - *inter-process communication*, how isolated services talk to each other. The kernel
+   copies each message from sender to receiver: at most 4 KiB, into a queue that holds 16 before the
+   sender has to wait. The copy is deliberate - sharing the memory instead would undo the isolation
+   in (1).
+
+4. **Capabilities.** A capability is an unforgeable token naming one resource, the rights held over
+   it, and a generation number. Every privileged syscall is checked against the caller's table, and
+   holding the token is the whole of the authority - nothing is granted on the basis of who you are.
+
+5. **Interrupt routing.** When hardware raises an interrupt, the kernel turns it into a message to
+   whichever driver service registered for that line. It never touches the device itself; delivering
+   the news is all it does, and that is precisely what lets drivers run in userspace.
+
+6. **SMP routing** - *symmetric multiprocessing*, meaning several equal CPU cores. The kernel maps
+   each endpoint to the core its owner runs on, so a message crossing cores reaches the right queue,
+   and the target core is woken with an **IPI** (*inter-processor interrupt*) - the signal one core
+   sends another.
+
+A seventh entry belongs in a service, not here. `scripts/commandments.py` fails the build if a kernel
+module serves none of the six.
+
 ## Portability
 
 One arch-neutral kernel sits behind a single seam, `arch::imp`; everything CPU-specific lives in `arch/<isa>/`. **x86-64 is the full runnable OS** - the `os.img` you flash, with 4 cores, the shell, storage, and networking. **32-bit ARM (Raspberry Pi 2) runs the OS too** - the same neutral kernel boots to an interactive `gsh>` shell on real Pi 2 hardware (4-core SMP, supervisor spawning services, `ping`->`pong` capability IPC); build + run it with `scripts/arm_build.py` / `scripts/arm_run.py` (see `docs/arm32-status.md`), the SD/USB drivers still in progress. The neutral kernel is *also* proven to compile and boot on **AArch64, RISC-V, and LoongArch** (they print to their UART), and **s390x** compiles clean (big-endian); 32-bit RISC-V compiles clean. Adding an ISA is bounded to `arch/<isa>/` and enforced by CI; it does not touch a single arch-neutral file.
