@@ -513,7 +513,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     break;
                 }
             }
-            ctx.console_write("gsh> ");
+            ctx.console_write(PROMPT);
             muted = false;
         }
 
@@ -577,7 +577,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     line.cur = 0;
                 }
                 nav = hist.len();
-                ctx.console_write("gsh> ");
+                ctx.console_write(PROMPT);
             }
             0x1B => {
                 // Escape: either a bare ESC (the Escape key → clear the line) or the start
@@ -611,7 +611,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 line.len = 0;
                 line.cur = 0;
                 nav = hist.len();
-                ctx.console_write("gsh> ");
+                ctx.console_write(PROMPT);
             }
             b if b >= 0x20 && b < 0x7f => line.insert(&ctx, b),
             _ => {}
@@ -630,7 +630,7 @@ fn run_help_key(
 ) {
     ctx.console_write("\r\n");
     *last_result = execute(ctx, b"help", cwd, *last_result, 0, &mut Out::Console);
-    ctx.console_write("gsh> ");
+    ctx.console_write(PROMPT);
     line.cur = line.len; // cursor at end after the reprint
     if line.len > 0 {
         ctx.console_write(core::str::from_utf8(line.bytes()).unwrap_or(""));
@@ -996,7 +996,7 @@ fn keyword_menu(ctx: &ServiceContext, line: &mut Line, tok_start: usize, cands: 
     }
     if n > shown { ctx.console_write("(type more to narrow) "); }
     ctx.console_write("\r\n");
-    ctx.console_write("gsh> ");
+    ctx.console_write(PROMPT);
     ctx.console_write(str_of(line.bytes()));
     let mut idx = usize::MAX;
     loop {
@@ -1131,7 +1131,7 @@ fn path_menu(ctx: &ShellCtx, line: &mut Line, base_len: usize, rbuf: &[u8; 512],
     }
     if n > shown { ctx.console_write("(type more to narrow) "); }
     ctx.console_write("\r\n");
-    ctx.console_write("gsh> ");
+    ctx.console_write(PROMPT);
     ctx.console_write(str_of(line.bytes()));
 
     let mut idx = usize::MAX; // MAX = no candidate filled yet (showing the common-prefix)
@@ -1155,6 +1155,14 @@ fn path_menu(ctx: &ShellCtx, line: &mut Line, base_len: usize, rbuf: &[u8; 512],
 /// A bounded ring of recent command lines for up/down-arrow recall (§26.6: fixed size,
 /// oldest dropped when full). Lives in the shell session; cleared each boot.
 const HIST_MAX: usize = 16;
+/// The prompt. Its WIDTH sets the column the typed line starts at, so the two are defined
+/// together and checked at compile time - a longer prompt with a stale redraw column would
+/// erase from inside the prompt.
+const PROMPT: &str = "gsh> ";
+/// Cursor to the first column of the typed text (CHA, 1-based), then erase to end of line.
+const REDRAW: &str = "\x1b[6G\x1b[K";
+const _: () = assert!(PROMPT.len() + 1 == 6);
+
 struct History {
     lines: [[u8; MAX_LINE]; HIST_MAX],
     lens: [usize; HIST_MAX],
@@ -1336,8 +1344,21 @@ impl Line {
     /// history recall, tab completion, and the bare-ESC clear. Erases from wherever the
     /// cursor is: step to the input start, `ESC[K` to wipe to end of line, then print.
     fn set(&mut self, ctx: &ServiceContext, new: &[u8]) {
-        while self.cur > 0 { self.cur -= 1; ctx.console_write("\x08"); }
-        ctx.console_write("\x1b[K");
+        // ABSOLUTE, not a walk back. This used to emit `cur` backspaces to return to the start of
+        // the typed text, which assumes the cursor is exactly where we last left it - and the
+        // console is a SHARED device the shell does not hold a lock on. Anything else that writes
+        // (a service log during chaos) moves the cursor out from under that count, so the walk back
+        // stops short of the prompt and the erase begins mid-text. What is left is a stale prefix:
+        // recalling history showed "gsh> chaos mselfcheck all-services 50 yes", and backspacing
+        // then emptied the BUFFER while those stale columns stayed on screen - so the line looked
+        // like "chaos m" but Enter submitted nothing. The buffer was right the whole time; only our
+        // belief about the cursor had drifted.
+        //
+        // CHA cannot drift: it names the column outright, so the erase always starts at the true
+        // start of the typed text and the prompt itself is preserved (which is why this is not a
+        // carriage return + reprint - a second prompt is indistinguishable from a real one).
+        ctx.console_write(REDRAW);
+        self.cur = 0;
         let n = new.len().min(MAX_LINE);
         self.buf[..n].copy_from_slice(&new[..n]);
         self.len = n;

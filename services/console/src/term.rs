@@ -520,6 +520,12 @@ fn execute_csi(s: &mut Fb, final_byte: u8) {
             s.row = r.min(s.rows.saturating_sub(1));
             s.col = c.min(s.cols.saturating_sub(1));
         }
+        // CHA - cursor horizontal absolute: ESC[nG puts the cursor at column n of the CURRENT
+        // row (1-based). CUP would also do it, but only by naming a row the caller does not know:
+        // a line editor redrawing its input knows its COLUMN (just past the prompt) and nothing
+        // about which row it has scrolled to. Without this, a redraw can only step relatively and
+        // drifts the moment anything else writes to the console.
+        b'G' => s.col = (n1 - 1).min(s.cols.saturating_sub(1)),
         // Relative cursor movement: CUU / CUD / CUF / CUB.
         b'A' => s.row = s.row.saturating_sub(n1),
         b'B' => s.row = (s.row + n1).min(s.rows.saturating_sub(1)),
