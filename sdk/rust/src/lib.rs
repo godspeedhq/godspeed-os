@@ -1,8 +1,55 @@
 // SPDX-License-Identifier: Apache-2.0
 //! GodspeedOS service SDK.
 //!
-//! All userspace services link against this crate. It provides the typed
-//! wrappers around kernel syscalls so service code never issues raw syscalls.
+//! All userspace services link against this crate. It provides the typed wrappers around kernel
+//! syscalls so service code never issues raw syscalls.
+//!
+//! # A service, whole
+//!
+//! Everything a service is fits in one picture, and it is worth having in your head before reading
+//! any module here.
+//!
+//! ```text
+//!   contracts/ping.toml         what the service ASKS for, in writing
+//!     ipc_send    = ["pong"]
+//!     ipc_receive = ["ping"]
+//!     log_write   = true
+//!            │
+//!            │   the supervisor spawns it, and the KERNEL mints exactly
+//!            │   these capabilities into its table. Not one more.
+//!            ▼
+//!   ┌──────────────────────────────────────────────────────────┐
+//!   │  ServiceContext        the only door to the outside      │
+//!   │                                                          │
+//!   │  ctx.log(..)      ctx.try_send(..)     ctx.recv()        │
+//!   │  ctx.alloc_mem(..)   ctx.spawn(..)     ctx.mmio()        │
+//!   └──────────────────────────────────────────────────────────┘
+//!            │
+//!            ▼
+//!   fn service_main(ctx) -> !      a loop that never returns
+//! ```
+//!
+//! Three consequences, and they are the whole model:
+//!
+//! - **What the contract did not ask for, the service cannot do.** There is no ambient authority to
+//!   fall back on: no root, no inherited handles, no global namespace. A call whose capability was
+//!   never granted returns `CapNotHeld` - it does not fail late or half-succeed.
+//! - **`ServiceContext` is the only way out.** Everything crossing the boundary goes through it, so
+//!   the answer to "what can this service reach?" is its contract plus this type, and nothing else
+//!   needs reading to be sure.
+//! - **Failure is a value, never a surprise.** `EndpointDead`, `CapRevoked`, `AllocDenied` are
+//!   ordinary `Result`s a service is expected to handle: a peer that died is reacquired by name and
+//!   the work retried. Services are killed and restarted routinely, including by the chaos suite, so
+//!   this path is the common one rather than the exception.
+//!
+//! `examples/ping` is the whole of the above in about forty lines, contract included.
+//!
+//! # Where the unsafe lives
+//!
+//! Service code contains none. The syscall ABI and the MMIO/DMA accessors need it, so it is confined
+//! to `syscall.rs`, `mmio.rs` and `dma.rs` behind safe wrappers, each block carrying a SAFETY
+//! argument (CLAUDE.md §18.1). `scripts/unsafe_check.py` fails the build on an `unsafe` in any
+//! service, which is what keeps that true rather than merely intended.
 
 // `no_std` for the real (target) build; under `cargo test` we build for the host with
 // `std` so the pure-logic modules (e.g. `hid`) can have unit tests.

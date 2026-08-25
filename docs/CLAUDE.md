@@ -4,14 +4,17 @@ Narrative documentation. These files explain design decisions in prose; they do 
 
 ## Files
 
+**The core architecture is in the constitution, not here.** `CLAUDE.md` §7 (capabilities), §8 (IPC),
+§9 (scheduler and SMP), §11 (bootstrap) and §14 (service lifecycle) are the specification, and they
+are normative where these narrative files are not. This index used to list `ipc.md`, `capability.md`,
+`bootstrap.md`, `restart.md` and `smp.md` as though they existed; none was ever written, so a reader
+following the index found nothing. Pointing at the sections that do hold that material is both
+truthful and shorter than writing five files to repeat them.
+
+
 | File                | Contents |
 |---------------------|----------|
-| `bootstrap.md`      | Detailed walkthrough of §11: BSP init, AP startup, real-mode trampoline, failure modes |
-| `ipc.md`            | IPC deep-dive: queue discipline, cross-core send flow, deadlock patterns, examples |
-| `capability.md`     | Capability model: generation mechanism, rights model, transfer protocol, lifecycle examples |
-| `restart.md`        | Service restart flow: cap rebinding, core reassignment, client recovery pattern |
 | `pipes.md`          | Composing built-ins and services with `A \| B`: capability-mediated pipes (not POSIX fd inheritance), the four shapes (builtin/service × write/service), directory-resolved sinks, the EOT end-of-stream marker (Appendix D.3) |
-| `smp.md`            | SMP design: per-core run queues, IPI vectors, TLB shootdown protocol, placement algorithm |
 | `iommu.md`          | IOMMU-backed DMA confinement (H1): why DMA-capable drivers are kernel-equivalent without an IOMMU, AMD-Vi detection/setup/confinement/reclaim, Phase 2 TCB-drop proposal (§6, §12, §18.1) |
 | `persistence.md`    | Block driver + filesystem (v2): why our own filesystem not ext4/btrfs, ATA PIO (no-DMA, least-privilege), flat name→blob format, file-as-capability via kernel-delegated resource caps, phased plan + TCB-drop trajectory (§6.3, §15, §23.4) |
 | `ahci.md`           | AHCI (SATA) block-driver backend: why (T630 SSD is AHCI-only), MMIO+DMA shape, command list/FIS/PRDT, IOMMU confinement (H1), incremental build steps A-E |
@@ -20,6 +23,16 @@ Narrative documentation. These files explain design decisions in prose; they do 
 | `prime.md`          | GodspeedOS Prime (design, not built): the minimal self-installing portable core (TCB + run/portability utilities), bootable-drive anatomy (ESP boot region + GSFS), `flash`/`install`/`update`, self-install USB→SSD + self-replication, A/B kernel self-update (§16 generalized), carrying a "world" on a drive |
 | `licensing.md`      | Licensing intent/policy (not yet legal text): GPL copyleft kernel + permissive SDK, the capability/IPC boundary as the license boundary, Limine BSD-2-Clause compatibility, GPLv2-vs-v3 + MIT-vs-Apache open choices |
 | `logging.md`        | **Logging (design, not built):** what the `logger` service is *for* - a stateless **broker, not a store**. Logging is a *pipe* (no ambient stdout, so it is the same primitive as `cmd1 \| cmd2`); reading a service's stream is a **delegated resource capability** (§7.10) rather than a filter over one merged stream, so who-hears-whom is kernel-enforced and revocable; attribution is unforgeable (the kernel already knows the caller). Why stateless is load-bearing (a persisting logger cycles through `fs`, and worse, makes observing a storage failure depend on storage). The serial + ring-buffer floor, the loss-policy and no-heap obligations, and what the 29-line stub actually does today |
+| `records.md`        | Structured records: typed pipes (PowerShell/nushell-style) over the shell |
+| `scripting.md`      | `gsh` - the GodspeedOS shell language |
+| `service-control-cap.md` | Design note: capability-gating kill/restart behind `service_control` |
+| `net-tags-design.md` | Design spec: correlation tags between `net-stack` and `nic-driver` |
+| `arm32-usb-userspace.md` | Taking the DWC2 USB stack out of the arm32 kernel |
+| `xhci-topology.md`  | The topology model the `xhci` service needs |
+| `xhci-split.md`     | Splitting input from storage in the `xhci` service |
+| `xhci-completion-correlation.md` | Design spec: completion correlation in the `xhci` driver |
+| `hw-bare-metal-freeze-j5005.md` | Bare-metal boot freeze on the Intel J5005 (Wyse 5070) |
+| `verification-road-map.md` | Post-v1 verification roadmap |
 | `unsafe-audit.md`   | Complete inventory of every `unsafe` block in the kernel (§18.4) |
 | `kernel-audit.md`   | **Living audit** of the ring-0 kernel against the invariants; north-star: nothing above the kernel may panic or wedge it |
 | `userspace-audit.md`| **Living audit** of the userspace services against the Commandments; north-star: identity over location, wait on truth incl. failure, reacquire + retry |
