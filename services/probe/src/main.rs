@@ -821,19 +821,38 @@ fn mode_prop_p4(ctx: &ServiceContext) -> ! {
     // alloc (1 GiB, always denied) is also attempted. Denied allocs must not
     // affect the kernel's byte counter. Any mismatch between the locally tracked
     // expected total and InspectKernel(0) is a FAIL.
+    // BASELINE FIRST. This counter is the task's TOTAL mapped bytes, and a task already owns its
+    // image, stack and context before it runs a line - measured here as 83 pages, which is why the
+    // very first comparison failed by 339,968 bytes with the kernel accounting perfectly correctly.
+    //
+    // The property is that accounting is EXACT, which is a claim about the DELTA: every page this
+    // task asks for appears, nothing else does, and a denial moves the counter not at all. Comparing
+    // an absolute against zero tested the task's own spawn footprint instead, and called the kernel
+    // wrong for reporting it. The suite carried that as a pre-existing failure on main.
+    let baseline = ctx.inspect_kernel_alloc_bytes();
     let mut expected: u64 = 0;
-    for _ in 0..500u32 {
+    for n in 0..500u32 {
         match ctx.alloc_mem(4096) {
             Ok(_)  => expected += 4096,
             Err(_) => {
-                ctx.log("prop: P4 FAIL - unexpected alloc failure for 4 KiB page");
+                ctx.log_fmt(format_args!(
+                    "prop: P4 FAIL - unexpected alloc failure for 4 KiB page at {} of 500", n + 1));
                 idle(ctx);
             }
         }
-        let _ = ctx.alloc_mem(1 << 30); // 1 GiB - always denied; must not shift counter
-        let actual = ctx.inspect_kernel_alloc_bytes();
+        // 1 GiB - always denied; must not shift the counter. The outcome is checked, not discarded:
+        // a request this size SUCCEEDING would be the finding, and `let _ =` would have hidden it.
+        let huge = ctx.alloc_mem(1 << 30);
+        let actual = ctx.inspect_kernel_alloc_bytes().saturating_sub(baseline);
         if actual != expected {
-            ctx.log("prop: P4 FAIL - alloc_bytes mismatch after alloc sequence");
+            // SHOW THE NUMBERS. This said only "mismatch" and the difference is the whole diagnosis:
+            // a constant offset is a baseline the test never accounted for, a multiple of 4096 is
+            // rounding or a double-count, and a jump of 1 GiB is the denial that was not one.
+            ctx.log_fmt(format_args!(
+                "prop: P4 FAIL - alloc_bytes mismatch at {} of 500: actual {} expected {}                  (diff {}), 1GiB request was {}",
+                n + 1, actual, expected,
+                actual as i64 - expected as i64,
+                if huge.is_ok() { "GRANTED" } else { "denied" }));
             idle(ctx);
         }
     }
@@ -2370,6 +2389,9 @@ fn mode_prop_bp3(ctx: &ServiceContext) -> ! {
 fn mode_prop_bp4(ctx: &ServiceContext) -> ! {
     // BP4 - ∑ alloc_bytes ≡ pages mapped - 2k iterations (§10.3).
     // 2k × 4 KiB = 8 MiB total, well within the 64 MiB limit.
+    // Baseline first, for the same reason as P4: this counter is the task's TOTAL mapped bytes,
+    // and a task owns its image and stack before it runs a line. The property is about the DELTA.
+    let baseline = ctx.inspect_kernel_alloc_bytes();
     let mut expected: u64 = 0;
     for _ in 0..2_000u32 {
         match ctx.alloc_mem(4096) {
@@ -2377,7 +2399,7 @@ fn mode_prop_bp4(ctx: &ServiceContext) -> ! {
             Err(_) => { ctx.log("prop: BP4 FAIL - unexpected alloc failure for 4 KiB page"); idle(ctx); }
         }
         let _ = ctx.alloc_mem(1 << 30); // 1 GiB - always denied; must not shift counter
-        let actual = ctx.inspect_kernel_alloc_bytes();
+        let actual = ctx.inspect_kernel_alloc_bytes().saturating_sub(baseline);
         if actual != expected {
             ctx.log("prop: BP4 FAIL - alloc_bytes mismatch after alloc sequence");
             idle(ctx);
