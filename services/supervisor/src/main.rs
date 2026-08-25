@@ -550,7 +550,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // this comment used to say otherwise, and that stale sentence is exactly why nothing filled the
     // gap when the kernel driver went away.
     #[cfg(not(target_arch = "arm"))]
-    spawn_mapped(&ctx, &mut name_map, "xhci", 0xFFFF);
+    // Adopt if already running - the same omission `nic-driver` and `net-stack` had. Both USB
+    // drivers are in MANAGED, so the supervisor watches them for death; on its own respawn a bare
+    // `spawn_*` is refused with "already running" and the driver is left out of the name-cap map.
+    ensure_mapped(&ctx, &mut name_map, "xhci", 0xFFFF);
 
     // ehci: USB 2.0 host-controller driver (§12) for the back ports. Same builds
     // as xhci; the kernel grants its MMIO/DMA at spawn (E1b+). Skipped if the PCI
@@ -562,7 +565,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
     if ctx.ehci_present() {
-        spawn_mapped(&ctx, &mut name_map, "ehci", 0xFFFF);
+        // Adopt if already running, as above. `ehci_present()` still gates whether it should exist
+        // at all; this only decides spawn-versus-adopt once it should.
+        ensure_mapped(&ctx, &mut name_map, "ehci", 0xFFFF);
     } else {
         ctx.log("supervisor: no EHCI controller (PCI scan) - not starting ehci (frees a core)");
     }
@@ -580,7 +585,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    spawn_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF);
+    // ADOPT if already running, like every other managed service. These two used `spawn_*`
+    // directly, which always tries to SPAWN - so on a supervisor respawn the kernel refused
+    // ("spawn 'net-stack' rejected: already running"), the supervisor got no endpoint cap back, and
+    // the still-running services ended up in neither branch: not adopted, not respawned, and absent
+    // from the name-cap map. Networking was dead from that moment (`net tx 0/0`, `0 to us`) and the
+    // selfcheck lease case failed twenty minutes later, which is how it surfaced.
+    //
+    // They were simply missed when adoption came in with Path C / Phase 6; `fs`, `shell`, `dwc2`,
+    // `block-driver`, `time` and `control` were all converted. Nothing else about them is special.
+    ensure_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF);
 
     // net-stack: the model-agnostic half of networking (docs/networking.md). Speaks ARP/IP over raw
     // frames THROUGH nic-driver's frame interface, so it is spawned right AFTER nic-driver and WIRED
@@ -592,7 +606,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    spawn_wired(&ctx, &mut name_map, "net-stack", &["nic-driver"]);
+    // `ensure_wired` adopts a running net-stack rather than duplicating it. On the adopt path the
+    // peers are deliberately NOT re-installed: the running service still holds the caps its original
+    // spawn gave it - they live in its own table and a supervisor restart does not touch them.
+    ensure_wired(&ctx, &mut name_map, "net-stack", &["nic-driver"]);
 
     // Phase 1 (docs/naming-design.md): report the shadow name→cap map. Proves the supervisor now
     // holds an endpoint cap to every real service it spawned - the future name authority. Nothing
