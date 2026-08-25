@@ -174,6 +174,45 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
 /// The distinction matters because the table is sized for services and the probe builds spawn ~178 of
 /// them. Handing every task a second endpoint unconditionally would have taken `osdev test identity`
 /// from working to a boot panic - the table holds 96.
+/// How many table slots stay reserved for endpoints a service CANNOT do without.
+///
+/// A service's own receive endpoint is mandatory - without one it cannot be spawned at all. The
+/// reply-only endpoint is a convenience: a task that has none simply awaits replies on its shared
+/// endpoint, which is what every task did before reply endpoints existed.
+///
+/// Those two were competing for the same slots on equal terms, and the optional one was winning
+/// because it is taken while slots remain. The result was a MANDATORY registration failing - "spawn
+/// REFUSED - IPC routing table full" - while optional endpoints held slots they could have done
+/// without. That is what broke property P5 (§8.3): under the concurrent spawn load of a probe
+/// build, real services could not be spawned.
+///
+/// Enlarging the table is the wrong answer: each entry carries a 16-deep queue of 4 KiB messages,
+/// so 96 entries is already about 6 MB of static footprint (§26.6 - the bound must stay visible and
+/// affordable). Reserving part of it costs nothing and fixes the priority inversion directly.
+/// Sized from the table's OWN stated peak, one line up: "70 services hold recv endpoints at peak".
+/// A reserve smaller than that peak does not reserve anything - it just moves the failure later,
+/// which a quarter-table reserve did: P5 passed and P7 still failed with the same "routing table
+/// full" refusal, because optional endpoints could still take 72 of the 96.
+const OPTIONAL_RESERVE: usize = MAX_ENDPOINTS * 3 / 4;
+
+/// `try_register` for an endpoint the caller can do WITHOUT.
+///
+/// Refuses once free slots fall to the reserve, so a convenience can never consume what a mandatory
+/// registration needs. Degraded, not broken - and degraded in the direction that keeps services
+/// spawnable.
+pub fn try_register_optional(id: EndpointId, core_id: u32, generation: Generation) -> bool {
+    {
+        let table = TABLE.lock_irq();
+        let free = table.iter()
+            .filter(|e| !e.valid || e.liveness == EndpointLiveness::Dead)
+            .count();
+        if free <= OPTIONAL_RESERVE {
+            return false;
+        }
+    }
+    try_register(id, core_id, generation)
+}
+
 pub fn try_register(id: EndpointId, core_id: u32, generation: Generation) -> bool {
     let mut table = TABLE.lock_irq();
     let slot = table.iter().position(|e| e.valid && e.id == id)

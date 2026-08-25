@@ -4038,10 +4038,18 @@ fn spawn_service_with_config(
         let reply_res_id = ResourceId::from(reply_ep_id);
         let reply_gen    = crate::capability::next_generation();
         crate::capability::register_resource_at_gen(reply_res_id, reply_gen);
-        // FALLIBLE on purpose. The routing table holds 96 endpoints and the probe builds spawn ~178
-        // services; taking one unconditionally would turn `osdev test identity` into a boot panic.
-        // Without it the task awaits replies on its shared endpoint, exactly as before this existed.
-        let reply_routed = crate::ipc::routing::try_register(reply_ep_id, core_id, reply_gen);
+        // FALLIBLE on purpose, and now RESERVED against. The routing table holds 96 endpoints and
+        // the probe builds spawn ~178 services; taking one unconditionally would turn
+        // `osdev test identity` into a boot panic. Without it the task awaits replies on its shared
+        // endpoint, exactly as before this existed.
+        //
+        // `try_register_optional` additionally refuses once the table nears full, because being
+        // merely fallible was not enough: this endpoint is optional but was competing for slots on
+        // equal terms with the MANDATORY receive endpoint above, and winning by getting there
+        // first. Property P5 caught the consequence - a real service refused with "IPC routing
+        // table full" while convenience endpoints held slots they could have done without.
+        let reply_routed =
+            crate::ipc::routing::try_register_optional(reply_ep_id, core_id, reply_gen);
         if reply_routed {
         // Recorded HERE, not at commit: every fallible step after this point runs
         // `cleanup_partial_spawn`, which can only give the endpoint back if it knows about it.
