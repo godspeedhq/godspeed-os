@@ -53,6 +53,13 @@ features = [
     "arm-sched-demo",
     "arm-sched-ipc",
     "arm-supervisor",
+    # Diagnostic ONLY, and deliberately registered here rather than slipped in: it changes what the
+    # kernel PRINTS on a fatal EL0 fault, never what it does. It widens the stack window, measures the
+    # run of whatever fill byte is at SP (the production scan measures ZEROS, so it reported "0 bytes"
+    # for a space-filled smash on the Pi 4 - true and useless), and lists more backtrace candidates for
+    # offline symbolization. It adds no kernel responsibility: no new syscall, no new subsystem, no
+    # behaviour change on any non-faulting path. Off by default; the faulting task dies either way.
+    "fault-dump-wide",
     "iommu-fault-test",
     "memmap-clamp-test",
     "mmio-map-fault-test",

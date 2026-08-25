@@ -740,7 +740,12 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     // Bounded at 16 words: enough to cover a small frame's saved-register area, small enough that a
     // fault storm cannot flood the console with a service's stack.
     if from_el0 {
+        #[cfg(not(feature = "fault-dump-wide"))]
         const WORDS: usize = 16;
+        // Wider under the diagnostic feature: 16 words showed the frame is flattened but not how far
+        // the damage runs, and the extent is what names the buffer that overran.
+        #[cfg(feature = "fault-dump-wide")]
+        const WORDS: usize = 64;
         super::put_str(b"\r\n    stack at SP_EL0 (");
         super::put_dec(WORDS as u64);
         super::put_str(b" words, low to high):");
@@ -813,6 +818,46 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
             }
         }
 
+        // THE SAME MEASUREMENT, FOR A FILL THAT IS NOT ZERO.
+        //
+        // The scan above answers "how far do the ZEROS go", and that is the right question only when
+        // the overrun was written with zeros. Twice on this port it was not: the frame came back full
+        // of 0x20 - ASCII spaces, the padding of a line the shell had just printed - and the report
+        // read "zeroed run above SP: 0 bytes", which is true and useless. An instrument that only
+        // recognises one fill value reports nothing at all for any other, and reports it confidently.
+        //
+        // So: take whatever byte is actually AT SP and measure how far THAT repeats. Zero still works
+        // (it is just one fill value among others), and a space-filled smash now yields the number
+        // that matters - the extent of the run, which is the size of the overrun, which is enough to
+        // name the buffer that produced it.
+        #[cfg(feature = "fault-dump-wide")]
+        {
+            let fill = match crate::arch::imp::uaccess::read_user_bytes(sp_el0, 8) {
+                Some(b) => b[0],
+                None    => 0,
+            };
+            let mut run: u64 = 0;
+            let mut foff: u64 = 0;
+            'outer: while foff < SCAN_MAX {
+                match crate::arch::imp::uaccess::read_user_bytes(sp_el0 + foff, BITE) {
+                    Some(b) => {
+                        for k in 0..BITE {
+                            if b[k] != fill { break 'outer; }
+                            run += 1;
+                        }
+                        foff += BITE as u64;
+                    }
+                    None => break,
+                }
+            }
+            super::put_str(b"
+    fill run above SP: byte 0x");
+            super::put_hex(fill as u64);
+            super::put_str(b" repeats for ");
+            super::put_dec(run);
+            super::put_str(b" bytes");
+        }
+
         // A BACKTRACE, the way an oops has one.
         //
         // Registers say what was in flight and the window says the frame is flattened; neither
@@ -846,13 +891,20 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
         // a bogus SP cannot walk forever.
         const USER_STACK_TOP: u64 = 0x8000_0000;
         let room = USER_STACK_TOP.saturating_sub(sp_el0).min(64 * 1024);
+        #[cfg(not(feature = "fault-dump-wide"))]
+        const BT_MAX: u32 = 12;
+        // More suspects under the diagnostic feature: the production cap of 12 is right for a report a
+        // human reads, but these get symbolized offline against the service ELF, where a longer list of
+        // candidates is strictly more to work with.
+        #[cfg(feature = "fault-dump-wide")]
+        const BT_MAX: u32 = 48;
         let mut shown = 0u32;
         let mut boff: u64 = 0;
         super::put_str(b"\r\n    return addresses on the stack (newest first, may include stale slots):");
-        while boff < room && shown < 12 {
+        while boff < room && shown < BT_MAX {
             let Some(b) = crate::arch::imp::uaccess::read_user_bytes(sp_el0 + boff, BITE) else { break };
             for w in 0..BITE / 8 {
-                if shown >= 12 { break; }
+                if shown >= BT_MAX { break; }
                 let mut t = [0u8; 8];
                 t.copy_from_slice(&b[w * 8..w * 8 + 8]);
                 let v = u64::from_le_bytes(t);

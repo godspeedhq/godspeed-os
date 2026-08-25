@@ -49,6 +49,13 @@ panic = "abort"
 # Selects the 0x80000 flat-load linker script and the BCM2711 peripheral base (PL011 at 0xFE201000);
 # without it the aarch64 build stays the QEMU `virt` boundary-demarcation target it has been.
 pi4 = []
+# Diagnostic only, OFF by default. Widens the EL0 fault dump: a bigger raw stack window, a
+# fill-byte run length (the production one measures a ZERO run, which reports "0 bytes" when the
+# overrun is written with anything else - a space-filled smash on the Pi 4 measured exactly that,
+# twice), and more backtrace candidates. Costs nothing until a task faults fatally, but it is
+# several hundred milliseconds of serial when one does, and the adversarial suite faults tasks
+# DELIBERATELY - so it is a feature rather than always-on.
+fault-dump-wide = []
 # Force `map_in_active_tables` to fail at the MMIO call sites (ioapic, pci MSI-X), so the error paths
 # added for kernel-audit A9-2 are actually EXERCISED rather than merely reasoned about. Those paths are
 # otherwise unreachable without exhausting the frame allocator, which cannot be arranged at boot.
