@@ -23,7 +23,6 @@
 #![no_main]
 
 use godspeed_sdk::{ServiceContext, Message, Mmio, Dma};
-#[cfg(target_arch = "arm")]
 
 /// The Pi 4's on-board GENET MAC, driven from HERE instead of from the kernel (Commandment I).
 ///
