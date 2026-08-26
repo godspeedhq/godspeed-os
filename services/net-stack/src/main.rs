@@ -1241,6 +1241,9 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
     // One drain's share of the window. ~15 fit in 900 ms, so the loop actually LOOPS instead of
     // spending its entire budget inside a single call - which is what `0 drains` meant.
     const DRAIN_SLICE_MS: u64 = 60;
+    /// How long to wait for the driver to acknowledge an ARP reply sent from inside the window. The
+    /// acknowledgement carries nothing, so this only has to be long enough not to be a busy-wait.
+    const ARP_ACK_MS: u64 = 20;
     let deadline_cycles = if tsc_hz > 0 { (tsc_hz * 9) / 10 } else { 0 };   // ~900 ms
     // WITH NO CALIBRATED COUNTER, FALL BACK TO THE COARSE CLOCK - do not give up after one drain.
     //
@@ -1250,8 +1253,15 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
     // than a fine one and far better than none.
     let coarse_t0 = ctx.epoch_secs_monotonic();
     let mut drains: u32 = 0;
+    // MEASURE THE DRAIN ITSELF, because a 60 ms bound on it did not change a 1.0 s window and I have
+    // already been wrong once about why. Reports the FIRST drain only (one line per window, silent on
+    // a healthy one) and prints what the SDK thought its budget was in cycles beside what the call
+    // actually cost - if those disagree, the bound is not the number this code believes it is.
+    let mut drain_reported = false;
     loop {
-        if let Some(b) = nic_drain_ms(ctx, DRAIN_SLICE_MS) {
+        let d_t0 = ctx.read_tsc();
+        let d_msg = nic_drain_ms(ctx, DRAIN_SLICE_MS);
+        if let Some(b) = d_msg {
             let p = b.payload_bytes();
             let n = if p.is_empty() { 0 } else { p[0] as usize };
             let mut pos = 1usize;
@@ -1270,11 +1280,37 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
                 // later and gets another chance - so the outcome carries no information we would act
                 // on, and logging it from inside a scan loop would flood the console the moment
                 // `nic-driver` is being restarted. Named here so it reads as a decision (§26.7).
-                let _ = nic_req(ctx, &Message::from_bytes(&arp_out), LINK_SECS);
+                // BOUNDED, because this sits INSIDE the reply window and was spending all of it.
+                //
+                // A ping window is ~900 ms; this send waited up to LINK_SECS = 1 s for an
+                // acknowledgement, on the whole-second clock, so a single ARP could outlast the entire
+                // window. The Pi 4 showed exactly that: every failing window reported `1 frames seen`
+                // and `0 drains` and ran 1.018 s - one frame arrived, it was the gateway ARPing for
+                // us, and answering it consumed the window the echo reply needed.
+                //
+                // The wait is what is bounded, NOT the send: the frame is handed to the driver either
+                // way, and the comment on step 1 already records that a SEND's reply "carries nothing
+                // now". So this was a full second spent waiting for an acknowledgement with no content,
+                // in the one place that could least afford it.
+                let _ = ctx.request_with_reply_ms("nic-driver", &Message::from_bytes(&arp_out), ARP_ACK_MS);
                 }
             }
         }
         // Give up once the reply window closes (or immediately if the clock is uncalibrated - one drain).
+        // MEASURE THE WHOLE PASS, not one call inside it. The first instrument timed only the drain
+        // and stayed silent - which was the answer (the drain is fast) but not the location. A pass is
+        // drain + scan + any ARP reply, and reporting the pass covers whichever of them is slow next
+        // time. First pass only, and only when it overran, so a healthy window prints nothing.
+        if !drain_reported {
+            drain_reported = true;
+            let pass = ctx.read_tsc().wrapping_sub(d_t0);
+            if tsc_hz > 0 && deadline_cycles > 0 && pass > deadline_cycles / 2 {
+                ctx.log_fmt(format_args!(
+                    "net-stack: ping pass #1 took {} us of a {} us window - the window is being spent before the reply can arrive",
+                    pass.saturating_mul(1_000_000) / tsc_hz,
+                    deadline_cycles.saturating_mul(1_000_000) / tsc_hz));
+            }
+        }
         let window_closed = if deadline_cycles == 0 {
             ctx.epoch_secs_monotonic().saturating_sub(coarse_t0) >= 1
         } else {

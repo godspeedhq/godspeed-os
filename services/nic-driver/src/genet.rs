@@ -1401,7 +1401,7 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
             ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
         }
         } else {
-            // TX FRAME (any multi-byte payload) + coupled RX: transmit, then hand back one frame.
+            // TX FRAME (any multi-byte payload) : transmit and acknowledge. The frame is NOT coupled to a receive - see below.
             if !g.transmit(p, &mut tx_next) {
                 // A failed transmit must not be dropped on the floor: the reply would still come back
                 // normally, so net-stack would wait out its whole deadline for an answer to a frame
@@ -1415,8 +1415,28 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
                 tx_reports += 1;
                 g.report_counters();
             }
-            let n = g.receive(&mut rxbuf);
-            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])).is_err() && !reply_failed_logged {
+            // ACKNOWLEDGE THE TRANSMIT. Do not couple a receive to it.
+            //
+            // This answered a transmit with `&rxbuf[..n]` - a frame it went and RECEIVED first - and
+            // that is two faults at once. When a frame WAS waiting it was handed to a caller that does
+            // not want one (net-stack's send path checks only whether a reply arrived), so the frame
+            // was consumed and destroyed: exactly what "every transmit a place a frame could be
+            // destroyed by a caller who did not want an answer" describes. And when NO frame was
+            // waiting, `n` was 0, so the reply was EMPTY - and an empty reply cannot be delivered
+            // (d2f99b65), so the acknowledgement never arrived and net-stack waited out its whole
+            // one-second deadline.
+            //
+            // That second case is the Pi 4's ping loss. The window is measured from BEFORE the send,
+            // so a stalled acknowledgement spends the window the echo reply needed: the log showed
+            // `0 drains, 1 frames seen` and 1.015 s against a 900 ms budget, while the pings whose
+            // send happened to find a frame waiting returned in 18-40 ms. Hence ~50% loss on a
+            // healthy cable, alternating.
+            //
+            // net-stack decoupled its side and says so ("the reply to a SEND carries nothing now");
+            // the shared path was changed to match and THIS backend was not, so the Pi 4 kept the old
+            // coupled behaviour under the new caller. Frames stay in the ring for the drain (ops 4
+            // and 9), which is the path whose job that is.
+            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])).is_err() && !reply_failed_logged {
             reply_failed_logged = true;
             ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
         }
