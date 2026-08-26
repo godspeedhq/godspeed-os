@@ -1126,7 +1126,9 @@ fn handle_call(packed: u64, buf_ptr: u64, recv_len: u64) -> i64 {
     let reply_slot  = ((packed >> 16) & 0xFFFF) as usize;
     let recv_slot   = ((recv_len >> 16) & 0xFFFF) as usize;
     let req_len     = recv_len & 0xFFFF;
-    do_call(target_slot, reply_slot, recv_slot, buf_ptr, req_len, 0)
+    // `Call` (41): the SDK allocates its own MAX_PAYLOAD buffer internally, so the full message size
+    // is the honest capacity here - this is the assumption `CallDeadline` could not make.
+    do_call(target_slot, reply_slot, recv_slot, buf_ptr, req_len, 0, MAX_MESSAGE_SIZE)
 }
 
 /// `Call` with a deadline in SECONDS. Three cap slots pack into `a0` (8 bits each - a task holds at
@@ -1138,14 +1140,18 @@ fn handle_call_deadline(slots: u64, buf_ptr: u64, len_secs: u64) -> i64 {
     let reply_slot  = ((slots >> 8) & 0xFF) as usize;
     let recv_slot   = ((slots >> 16) & 0xFF) as usize;
     let req_len     = len_secs & 0xFFFF;
+    // How big the caller's reply buffer is, as a power-of-two class the SDK packs into arg0's spare
+    // nibble (see `call_deadline_into`). 0 means an SDK that predates this and could not say - treat
+    // that as the old assumption so an unpatched caller is no worse off than before.
+    let reply_buf_cap = { let c = (slots >> 24) & 0xF; if c == 0 { MAX_MESSAGE_SIZE } else { (1usize << c).min(MAX_MESSAGE_SIZE) } };
     let secs        = (len_secs >> 16) & 0xFFFF;
-    do_call(target_slot, reply_slot, recv_slot, buf_ptr, req_len, secs)
+    do_call(target_slot, reply_slot, recv_slot, buf_ptr, req_len, secs, reply_buf_cap)
 }
 
 /// The body both share. `deadline_secs` of 0 blocks forever, exactly as `Call` always has.
 fn do_call(
     target_slot: usize, reply_slot: usize, recv_slot: usize,
-    buf_ptr: u64, req_len: u64, deadline_secs: u64,
+    buf_ptr: u64, req_len: u64, deadline_secs: u64, reply_buf_cap: usize,
 ) -> i64 {
 
     // 1. Validate the three caps: SEND to the peer, GRANT on the reply cap, RECV on our own endpoint.
@@ -1252,7 +1258,17 @@ fn do_call(
                     }
                 }
                 let payload  = reply.payload_bytes();
-                let copy_len = payload.len().min(MAX_MESSAGE_SIZE);
+                // REFUSE, do not truncate. The caller told us how much room it has; a reply that does
+                // not fit is a protocol error the caller must see, and writing what fits would smash
+                // whatever sits past the end of its buffer. Silent truncation on a message path is
+                // the one thing §26.7 forbids outright.
+                if payload.len() > reply_buf_cap {
+                    crate::kprintln!(
+                        "call: reply of {} bytes exceeds the caller's {}-byte buffer - refused (not truncated)",
+                        payload.len(), reply_buf_cap);
+                    break ipc_err_to_i64(IpcError::MessageTooLarge);
+                }
+                let copy_len = payload.len().min(reply_buf_cap);
                 if !write_user_bytes(buf_ptr, &payload[..copy_len]) { break -1; }
                 break copy_len as i64;
             }

@@ -273,9 +273,27 @@ pub fn call_deadline_into(
     if request.len() > buf.len() { return Err(IpcError::MessageTooLarge); }
     let n = request.len();
     buf[..n].copy_from_slice(&request[..n]);
+    // TELL THE KERNEL HOW BIG THE REPLY BUFFER IS. It writes the reply back into `buf`, and until
+    // now it was never told the size: `handle_call_deadline` validated MAX_MESSAGE_SIZE and its own
+    // comment said "the SDK always passes a MAX_MESSAGE_SIZE buffer". That is true of `call` (41),
+    // which allocates its own 4 KiB internally - and false here, where the buffer is the CALLER'S
+    // slice, of whatever size it chose. `console_dims` passes EIGHT BYTES. Validating 4 KiB only
+    // proves those bytes are mapped, which they are - it is the middle of a stack - so nothing stood
+    // between a larger-than-expected reply and a smashed frame.
+    //
+    // Encoded as a 4-bit power-of-two CLASS rather than a length, because the request length and the
+    // deadline already occupy the length argument, and arg0 has exactly one nibble spare below the
+    // 32-bit line that arm32's one-register-per-arg ABI truncates at. Rounded DOWN, so a 514-byte
+    // buffer declares 512 and the kernel refuses a 514-byte reply rather than writing two bytes past
+    // it. Being wrong in the conservative direction turns a silent smash into a loud refusal (§26.7).
+    // Callers should size this buffer as a POWER OF TWO. A 522-byte buffer declares 512 and its own
+    // 522-byte replies are then refused - correct, conservative, and confusing. `fs` carries the note
+    // and a compile-time assert on its side; this is the reason.
+    let cap_class = (usize::BITS - 1 - buf.len().max(1).leading_zeros()).min(12) as u64;
     let slots = (target.0 as u64 & 0xFF)
         | ((reply_grant.0 as u64 & 0xFF) << 8)
-        | ((recv.0 as u64 & 0xFF) << 16);
+        | ((recv.0 as u64 & 0xFF) << 16)
+        | (cap_class << 24);
     let len_secs = (n as u64 & 0xFFFF) | ((max_secs.min(0xFFFF)) << 16);
     // SAFETY: raw_syscall(50) = CallDeadline; `buf` is a caller-owned slice in user space and the
     // kernel writes at most one message into it, which is why the request is staged there too.

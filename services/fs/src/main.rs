@@ -3464,8 +3464,24 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 /// exactly how a write came to be sent eight bytes short.
 pub const BLK_XFER_MAX: usize = 1 + 9 + BLOCK;
 
+// A POWER OF TWO, deliberately, and larger than the transfer it must hold.
+//
+// `CallDeadline` now tells the kernel how much room this buffer has, so the kernel can refuse a
+// reply that would not fit instead of writing past it. That capacity travels as a power-of-two
+// CLASS (there is one spare nibble in the syscall's argument, not thirteen bits), rounded DOWN so
+// the kernel is never told more room than exists. `BLK_XFER_MAX` is 1 + 9 + 512 = 522, which
+// rounds down to 512 - and a 522-byte reply into a "512-byte" buffer would then be refused, which
+// is every block read on both ARM ports.
+//
+// Rounding up in the SDK would be the wrong fix: it would declare room this buffer does not have,
+// which is the exact smash the capacity was added to prevent. So the buffer moves to the class
+// boundary instead. Costs ~500 bytes of a 256 KiB stack whose deepest measured use is 78 KiB.
+const BLK_REPLY_MAX: usize = 1024;
+const _: () = assert!(BLK_REPLY_MAX >= BLK_XFER_MAX && BLK_REPLY_MAX.is_power_of_two(),
+    "the block buffer must hold a full transfer AND be a power of two - see the note above");
+
 pub struct BlockReply {
-    buf: [u8; BLK_XFER_MAX],
+    buf: [u8; BLK_REPLY_MAX],
     len: usize,
 }
 
@@ -3496,7 +3512,6 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     // saw a 512-byte body where 513 belongs and rejected it as a desync - "block read at lba 0 got a
     // MALFORMED reply (512 bytes)". The shape check did its job; the buffer was simply a byte short.
     // The shared transfer size - see `BLK_XFER_MAX`.
-    const BLK_REPLY_MAX: usize = BLK_XFER_MAX;
     let mut rbuf = [0u8; BLK_REPLY_MAX];
 
     // CORRELATION TAG at byte 0, echoed by `block-driver` and interpreted no further.
