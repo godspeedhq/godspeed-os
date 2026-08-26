@@ -60,7 +60,18 @@ def _ago(secs):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--secs", type=float, default=20.0)
-    ap.add_argument("--release", action="store_true")
+    # RELEASE BY DEFAULT, matching pi4_run.py. This used to default to DEBUG and merely WARN when a
+    # newer release kernel existed, and the warning was not enough: a whole debugging session was run
+    # against a SEVEN-DAY-OLD debug kernel, and the "bug" found in it was the known debug-build stack
+    # overflow (a ~503 KiB service_main frame against a 256 KiB user stack) - a bisect across two
+    # commits that booted the same stale binary both times and compared nothing.
+    #
+    # arm_build.py already refuses to build a debug image for this reason. A runner that quietly boots
+    # one anyway leaves the same trap one flag away, and the flag that avoids it is the one you forget.
+    ap.add_argument("--release", action="store_true",
+                    help="(default) boot the release kernel")
+    ap.add_argument("--debug", action="store_true",
+                    help="boot the DEBUG kernel - crash-loops fs on this port; diagnostics only")
     ap.add_argument("--usb", action="store_true")
     ap.add_argument("--usbnet", action="store_true", help="attach a CDC-ECM USB-Ethernet device (user-net)")
     ap.add_argument("--sd", default=None, help="path to a raw SD-card image to attach (if=sd)")
@@ -72,7 +83,7 @@ def main():
     ap.add_argument("--tail", type=int, default=3000)
     args = ap.parse_args()
 
-    profile = "release" if args.release else "debug"
+    profile = "debug" if args.debug else "release"
     krn = find_kernel(profile)
     if not krn:
         print("no kernel ELF - run scripts/arm_build.py first", file=sys.stderr)
