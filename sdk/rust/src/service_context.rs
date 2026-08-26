@@ -1037,6 +1037,55 @@ impl ServiceContext {
         }
     }
 
+    /// `request_with_reply_deadline`, bounded in MILLISECONDS instead of whole seconds.
+    ///
+    /// Exists because a sub-second window cannot be built out of a whole-second bound, and one was
+    /// being attempted. `net-stack`'s ping window is ~900 ms and cycle-based, but the drain inside it
+    /// was bounded by `LINK_SECS = 1` on `epoch_secs_monotonic`, whose resolution IS one second - so a
+    /// single drain could legitimately outlast the entire window. Measured on a Pi 4: the window
+    /// reported `closed after 1017663 us [budget 900000 us]` with `0 drains`, meaning it completed
+    /// exactly ONE call and that call overran the whole budget. Ping sends once a second, so a window
+    /// that runs 1.018 s misses roughly every third reply - which read as "the network is flaky" and
+    /// was arithmetic.
+    ///
+    /// Bounded by the CYCLE counter, deliberately, because that is the only clock here with sub-second
+    /// resolution and it is the same clock the caller's own window uses - a bound and the budget it
+    /// must fit inside should not be measured by different clocks. `duration_cycles` already floors an
+    /// uncalibrated counter to one quantum, so a board with no calibration degrades to "return almost
+    /// at once" rather than to "wait forever".
+    ///
+    /// No new kernel surface: this is the same userspace poll the seconds variants use, with a
+    /// different clock read in the deadline test.
+    pub fn request_with_reply_ms(
+        &self,
+        peer: &str,
+        msg:  &crate::ipc::Message,
+        max_ms: u64,
+    ) -> Option<crate::ipc::Message> {
+        let target = CapHandle(self.find_send_slot(peer)?);
+        let self_grant = self.self_grant_handle()?;
+        let reply_cap = self.derive_cap(self_grant)?;
+        let recv = self.recv_handle()?;
+        if self.offer_request(target, reply_cap, msg).is_err() {
+            self.remove_cap(reply_cap);
+            return None;
+        }
+        let t0 = self.read_tsc();
+        let budget = self.duration_cycles(max_ms);
+        loop {
+            if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS.min(max_ms.max(1))) {
+                return Some(r);
+            }
+            // wrapping_sub, so a counter that wraps mid-wait reads as a small elapsed rather than as
+            // an enormous one that expires the deadline instantly.
+            if self.read_tsc().wrapping_sub(t0) >= budget {
+                self.remove_cap(reply_cap);
+                let _ = recv;
+                return None;
+            }
+        }
+    }
+
     /// Like [`Self::request_with_reply_deadline`] but returns the DISTINCTION between a send that never
     /// left (stale/unresolvable peer cap) and a peer that received the request but stayed silent past
     /// the deadline (see [`DeadlineOutcome`]). Same bounded, RTC-deadline wait; use this when a caller

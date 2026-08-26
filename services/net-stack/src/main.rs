@@ -1238,10 +1238,20 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
     //
     // Still comfortably inside the shell's ~1 s ping cadence, so a genuinely dead host is still declared
     // dead within the same second and the pace does not change.
+    // One drain's share of the window. ~15 fit in 900 ms, so the loop actually LOOPS instead of
+    // spending its entire budget inside a single call - which is what `0 drains` meant.
+    const DRAIN_SLICE_MS: u64 = 60;
     let deadline_cycles = if tsc_hz > 0 { (tsc_hz * 9) / 10 } else { 0 };   // ~900 ms
+    // WITH NO CALIBRATED COUNTER, FALL BACK TO THE COARSE CLOCK - do not give up after one drain.
+    //
+    // `deadline_cycles == 0` meant "close immediately", so on a board whose counter is not yet
+    // calibrated the FIRST ping of every boot got a one-drain window and declared the host dead. The
+    // Pi 4 shows exactly that: `tsc_hz 0`, `budget 0 us`, closed after 0 us. A coarse bound is worse
+    // than a fine one and far better than none.
+    let coarse_t0 = ctx.epoch_secs_monotonic();
     let mut drains: u32 = 0;
     loop {
-        if let Some(b) = nic_drain(ctx) {
+        if let Some(b) = nic_drain_ms(ctx, DRAIN_SLICE_MS) {
             let p = b.payload_bytes();
             let n = if p.is_empty() { 0 } else { p[0] as usize };
             let mut pos = 1usize;
@@ -1265,7 +1275,12 @@ fn ping(ctx: &ServiceContext, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8;
             }
         }
         // Give up once the reply window closes (or immediately if the clock is uncalibrated - one drain).
-        if deadline_cycles == 0 || ctx.read_tsc().wrapping_sub(t1) >= deadline_cycles {
+        let window_closed = if deadline_cycles == 0 {
+            ctx.epoch_secs_monotonic().saturating_sub(coarse_t0) >= 1
+        } else {
+            ctx.read_tsc().wrapping_sub(t1) >= deadline_cycles
+        };
+        if window_closed {
             // SAY HOW THE WINDOW WAS SPENT. A timeout here is indistinguishable, from the outside, from
             // a network that dropped the packet - and the arithmetic says it is not that: consecutive
             // timeouts arrive 1.007 s apart when a 900 ms window plus the shell's 1 s pace should give
@@ -1479,6 +1494,22 @@ fn link_notify(ctx: &ServiceContext, msg: &str) {
 /// BLOCK instead of ask, which needs a protocol addition and is real work rather than a constant.
 /// Living in one helper means that change lands in one place, and that a fourth drain loop cannot
 /// quietly reintroduce the flood.
+/// `nic_drain`, bounded in MILLISECONDS so it can fit inside a sub-second window.
+///
+/// The ping window is ~900 ms and cycle-based; this call was bounded by `LINK_SECS = 1` on the
+/// WHOLE-SECOND clock, so ONE drain could outlast the entire window. It did: the Pi 4 reported
+/// `closed after 1017663 us [budget 900000 us]` with `0 drains` - that counter increments after the
+/// deadline check, so zero means the loop completed exactly one pass and that pass ate the budget.
+/// Ping paces at 1 s, so a window running 1.018 s misses about every third reply, which reads as a
+/// flaky network and is arithmetic.
+///
+/// A whole-second bound cannot fit inside a 900 ms budget, so the bound and the budget it must fit
+/// inside are now read from the same clock. Abandoning on timeout is NOT new - the seconds variant
+/// this replaces abandoned at 1 s; this only makes the wait shorter and sub-second.
+fn nic_drain_ms(ctx: &ServiceContext, ms: u64) -> Option<Message> {
+    ctx.request_with_reply_ms("nic-driver", &Message::from_bytes(&[9u8]), ms)
+}
+
 fn nic_drain(ctx: &ServiceContext) -> Option<Message> {
     let r = nic_req(ctx, &Message::from_bytes(&[9u8]), LINK_SECS);
     let empty = match r.as_ref() {
