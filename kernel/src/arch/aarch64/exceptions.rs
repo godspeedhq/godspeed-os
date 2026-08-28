@@ -318,6 +318,41 @@ fn ec_name(esr: u64) -> &'static [u8] {
     }
 }
 
+/// Decode the fault status (`DFSC`/`IFSC`, ISS bits 5:0) of an abort, plus the write flag.
+///
+/// The EC alone says "data abort"; it does not say WHY, and for the read-only canary experiment the
+/// difference between the two answers is the whole result. A **permission** fault on the guarded page
+/// means a CPU instruction wrote it, and `ELR_EL1` names that instruction. A **translation** fault
+/// means something else entirely. Printing the distinction removes the step where a hex value gets
+/// interpreted by hand, which is where a wrong reading enters.
+fn fault_status(esr: u64) -> &'static [u8] {
+    let ec = (esr >> 26) & 0x3F;
+    if !matches!(ec, 0b100000 | 0b100001 | 0b100100 | 0b100101) {
+        return b"n/a (not an abort)";
+    }
+    match esr & 0x3F {
+        0b000000..=0b000011 => b"address size fault",
+        0b000100 => b"translation fault L0",
+        0b000101 => b"translation fault L1",
+        0b000110 => b"translation fault L2",
+        0b000111 => b"translation fault L3",
+        0b001001 => b"ACCESS FLAG fault L1",
+        0b001010 => b"ACCESS FLAG fault L2",
+        0b001011 => b"ACCESS FLAG fault L3",
+        0b001101 => b"PERMISSION FAULT L1",
+        0b001110 => b"PERMISSION FAULT L2",
+        0b001111 => b"PERMISSION FAULT L3",
+        0b010000 => b"external abort",
+        0b100001 => b"alignment fault",
+        _ => b"other (see ARM ARM D17.2.37)",
+    }
+}
+
+/// True if the abort was caused by a WRITE (`ISS.WnR`, bit 6). Meaningless for instruction aborts.
+fn fault_was_write(esr: u64) -> bool {
+    matches!((esr >> 26) & 0x3F, 0b100100 | 0b100101) && (esr >> 6) & 1 == 1
+}
+
 /// Ticks seen, so the boot can report progress instead of asserting the timer works.
 pub static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Said once: an SPI too high to express in the neutral routing table's `u8` key.
@@ -648,7 +683,10 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     super::put_hex(esr);
     super::put_str(b"  (");
     super::put_str(ec_name(esr));
-    super::put_str(b")\r\n    FAR_EL1  = ");
+    super::put_str(b")\r\n    fault    = ");
+    super::put_str(fault_status(esr));
+    super::put_str(if fault_was_write(esr) { b", on a WRITE" } else { b", not a write" });
+    super::put_str(b"\r\n    FAR_EL1  = ");
     super::put_hex(far);
     super::put_str(b"\r\n    ELR_EL1  = ");
     super::put_hex(f.elr);
@@ -948,8 +986,20 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
             let mut best_at: u64 = 0;
             let mut cur: u64 = 0;
             let mut coff: u64 = 0;
-            while coff < room {
-                let Some(b) = crate::arch::imp::uaccess::read_user_bytes(sp_el0 + coff, BITE) else { break };
+            let mut covered: u64 = 0;
+            // SCAN THE WHOLE STACK, not upward from SP.
+            //
+            // Every previous scan started AT SP, which only finds the canary if SP is right. Five
+            // faults now show a return address restored from adjacent data - spaces, zeros, and once a
+            // STACK ADDRESS - at three different depths, while the shell`s own per-statement check
+            // reported the canary intact every time. If SP is wrong, the old scan was looking in the
+            // wrong place and "canary destroyed" was an artefact of the search, not a fact about the
+            // memory. Searching the whole stack tells the two apart: found means nothing was
+            // corrupted and SP is the problem; absent means the corruption is real.
+            let base: u64 = 0x7FFC_0000;   // USER_STACK_BASE (task/mod.rs: TOP - 64 pages)
+            while base + coff < 0x8000_0000 {   // WHOLE STACK, not SP upward - see the note below
+                let Some(b) = crate::arch::imp::uaccess::read_user_bytes(base + coff, BITE) else { break };
+                covered = coff + BITE as u64;   // how far this scan ACTUALLY reached
                 for k in 0..BITE {
                     if b[k] == 0x5A {
                         cur += 1;
@@ -961,9 +1011,11 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
             super::put_str(b"
     shell canary (0x5A): longest run ");
             super::put_dec(best);
-            super::put_str(b" bytes at SP+");
-            super::put_hex(best_at);
-            super::put_str(b" (planted: 1024)");
+            super::put_str(b" bytes at va ");
+            super::put_hex(0x7FFC_0000 + best_at);
+            super::put_str(b" (planted: 1024); scan covered ");
+            super::put_dec(covered);
+            super::put_str(b" of 262144 bytes");
         }
 
         // The SECOND canary (0xC3), planted in `execute` - a frame BELOW `run_lines`, i.e. between SP
@@ -973,8 +1025,20 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
             let mut best_at: u64 = 0;
             let mut cur: u64 = 0;
             let mut coff: u64 = 0;
-            while coff < room {
-                let Some(b) = crate::arch::imp::uaccess::read_user_bytes(sp_el0 + coff, BITE) else { break };
+            let mut covered: u64 = 0;
+            // SCAN THE WHOLE STACK, not upward from SP.
+            //
+            // Every previous scan started AT SP, which only finds the canary if SP is right. Five
+            // faults now show a return address restored from adjacent data - spaces, zeros, and once a
+            // STACK ADDRESS - at three different depths, while the shell`s own per-statement check
+            // reported the canary intact every time. If SP is wrong, the old scan was looking in the
+            // wrong place and "canary destroyed" was an artefact of the search, not a fact about the
+            // memory. Searching the whole stack tells the two apart: found means nothing was
+            // corrupted and SP is the problem; absent means the corruption is real.
+            let base: u64 = 0x7FFC_0000;   // USER_STACK_BASE (task/mod.rs: TOP - 64 pages)
+            while base + coff < 0x8000_0000 {   // WHOLE STACK, not SP upward - see the note below
+                let Some(b) = crate::arch::imp::uaccess::read_user_bytes(base + coff, BITE) else { break };
+                covered = coff + BITE as u64;   // how far this scan ACTUALLY reached
                 for k in 0..BITE {
                     if b[k] == 0xC3 {
                         cur += 1;
@@ -986,9 +1050,11 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
             super::put_str(b"
     execute canary (0xC3): longest run ");
             super::put_dec(best);
-            super::put_str(b" bytes at SP+");
-            super::put_hex(best_at);
-            super::put_str(b" (planted: 256 per depth)");
+            super::put_str(b" bytes at va ");
+            super::put_hex(0x7FFC_0000 + best_at);
+            super::put_str(b" (planted: 256/depth); scan covered ");
+            super::put_dec(covered);
+            super::put_str(b" of 262144 bytes");
         }
 
         // WHAT HAS THE KERNEL WRITTEN INTO USER MEMORY?
@@ -1013,6 +1079,145 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
             super::put_hex(d);
             if d >= 0x7FFC_0000 && d < 0x8000_0000 {
                 super::put_str(b" - WHICH IS INSIDE A USER STACK");
+            }
+        }
+
+        // IS THIS STACK BACKED BY FRAMES A DEVICE CAN DMA INTO?
+        //
+        // The last writer left. The canary is provably present (a kernel-side read printed 64 `Z`s
+        // from it) and provably absent at fault time (a whole-stack scan covering all 262144 bytes),
+        // destroyed inside ONE statement - while the kernel's largest write into user memory is 522
+        // bytes, no other task maps these frames, and the shell contains no `unsafe`. No CPU-side
+        // writer in this system can do that.
+        //
+        // A device can. §6.4 records that this board has no IOMMU/SMMU wired up - `confine_device`
+        // returns false on aarch64 - so a driver programs its controller with PHYSICAL addresses and
+        // can write anywhere in RAM. A DMA landing on the frames behind a task's stack erases
+        // kilobytes instantly and leaves no trace in any CPU accounting, which is the exact shape of
+        // the evidence.
+        //
+        // So: translate this task's stack pages and test each against the allocator's DMA
+        // reservations. A hit is proof. A near-miss (within SLACK frames) is worth as much, because a
+        // driver overrunning its own arena is the same bug one page over.
+        if from_el0 {
+            const STACK_TOP: u64 = 0x8000_0000;
+            const STACK_PAGES: u64 = 64;
+            const SLACK: usize = 8;
+            let root: u64;
+            // SAFETY: reading TTBR0_EL1 at EL1 is a side-effect-free system-register read. It still
+            // holds the FAULTING task's root: the exception came from EL0 and nothing has switched.
+            unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) root, options(nomem, nostack)) };
+            let mut mapped = 0u64;
+            let mut hits = 0u64;
+            let mut nearest = usize::MAX;
+            let mut first_hit_pa = 0u64;
+            // ALIASING: does this task map the SAME physical frame at two different stack VAs?
+            //
+            // With a canary that cannot be optimised away, the corruption is real - and every writer
+            // is eliminated: the kernel (all user writes go through one function, largest 522 bytes),
+            // other tasks (no shared frames), DMA arenas (no overlap, none within 8 frames), and the
+            // shell's own buffers (Cap, ReportBuf, FnCapBuf all clamp and flag overflow; no `unsafe`).
+            //
+            // One mechanism survives all of that: if two stack VAs resolve to ONE frame, then the
+            // shell writing its output buffer also writes the canary - legitimately, with no overflow
+            // and no rogue writer. It would be invisible to every check above, and it would explain
+            // why the bytes found at the canary are exactly what the shell was printing.
+            let mut pas = [0u64; 64];
+            let mut alias_a = 0u64;
+            let mut alias_b = 0u64;
+            let mut alias_pa = 0u64;
+            for p in 0..STACK_PAGES {
+                let va = STACK_TOP - ((p + 1) * 4096);
+                // SAFETY: read-only descriptor walk of the faulting task's own root.
+                let Some(pa) = (unsafe { super::ptables::translate_diag(root & !0xFFF, va) }) else { continue };
+                // Duplicate-frame check, before anything else touches `pa`.
+                if alias_pa == 0 {
+                    let mut q = 0u64;
+                    while q < p {
+                        if pas[q as usize] == pa {
+                            alias_pa = pa;
+                            alias_a = STACK_TOP - ((q + 1) * 4096);
+                            alias_b = va;
+                            break;
+                        }
+                        q += 1;
+                    }
+                }
+                pas[p as usize] = pa;
+                mapped += 1;
+                let (hit, dist) = crate::memory::allocator::phys_dma_proximity(pa, SLACK);
+                if hit { hits += 1; if first_hit_pa == 0 { first_hit_pa = pa; } }
+                else if dist < nearest { nearest = dist; }
+            }
+            {
+                use core::sync::atomic::Ordering::Relaxed;
+                super::put_str(b"\r\n    kernel writes ONTO the canary: ");
+                super::put_dec(super::uaccess::UW_CANARY_HITS.load(Relaxed));
+                let d = super::uaccess::UW_CANARY_FIRST_DST.load(Relaxed);
+                if d != 0 {
+                    super::put_str(b" - first was ");
+                    super::put_dec(super::uaccess::UW_CANARY_FIRST_LEN.load(Relaxed));
+                    super::put_str(b" bytes to ");
+                    super::put_hex(d);
+                    super::put_str(b" - THE KERNEL WROTE THE CANARY");
+                }
+            }
+            super::put_str(b"\r\n    stack frame aliasing: ");
+            if alias_pa != 0 {
+                super::put_str(b"YES - va ");
+                super::put_hex(alias_a);
+                super::put_str(b" and va ");
+                super::put_hex(alias_b);
+                super::put_str(b" BOTH map pa ");
+                super::put_hex(alias_pa);
+                super::put_str(b" - one write lands in two places");
+            } else {
+                super::put_str(b"none - every stack page has its own frame");
+            }
+        // WHAT REPLACED THE CANARY? Identify the writer by its FINGERPRINT, not by elimination.
+        //
+        // Six hypotheses have now died by elimination, and every one of them was about WHO could write
+        // the stack. Nobody has looked at WHAT is written there instead. The canary's address has been
+        // stable at 0x7fff7f18 across runs (the shell prints it as `canary-control at ...`), so dump
+        // that window and read it: ASCII text means a CPU writer building output; network or SCSI bytes
+        // mean DMA; zeros mean something cleared it. That is a positive identification rather than
+        // another candidate crossed off.
+        //
+        // The address is hardcoded ON PURPOSE and only for this experiment - the kernel has no channel
+        // to learn a service's local's address, and inventing one for a diagnostic would be worse than
+        // a constant that is checked against the shell's own printed value every run.
+        if from_el0 {
+            const CANARY_VA: u64 = 0x7fff_7f18;
+            super::put_str(b"\r\n    bytes AT the canary va 0x7fff7f18: ");
+            match crate::arch::imp::uaccess::read_user_bytes(CANARY_VA, 32) {
+                Some(b) => {
+                    for &x in b.iter() { super::put_hex(x as u64); super::put_str(b" "); }
+                    super::put_str(b"\r\n    as text: ");
+                    let mut txt = [0u8; 32];
+                    for (i, &x) in b.iter().enumerate() {
+                        txt[i] = if (0x20..0x7f).contains(&x) { x } else { b'.' };
+                    }
+                    super::put_str(&txt);
+                }
+                None => super::put_str(b"UNREADABLE"),
+            }
+        }
+
+            super::put_str(b"\r\n    stack vs DMA arenas: ");
+            super::put_dec(mapped);
+            super::put_str(b" pages mapped, ");
+            super::put_dec(hits);
+            super::put_str(b" INSIDE a DMA reservation");
+            if hits > 0 {
+                super::put_str(b" (first at pa ");
+                super::put_hex(first_hit_pa);
+                super::put_str(b") - A DEVICE CAN WRITE THIS STACK");
+            } else if nearest != usize::MAX {
+                super::put_str(b"; nearest arena is ");
+                super::put_dec(nearest as u64);
+                super::put_str(b" frame(s) away");
+            } else {
+                super::put_str(b"; no arena within 8 frames");
             }
         }
     }

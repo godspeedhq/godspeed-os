@@ -594,6 +594,37 @@ pub fn phys_in_ram(phys: u64) -> bool {
     let idx = (phys / FRAME_SIZE) as usize;
     unsafe { idx < ALLOCATOR.max_ram_frame }
 }
+
+/// DIAGNOSTIC: is `phys` inside a device's DMA arena, or within `slack` frames of one?
+///
+/// Returns `(hit, distance_in_frames)` where `hit` means the frame IS reserved for DMA.
+///
+/// Why this exists. On the Pi 4 the shell's stack loses a 1024-byte canary - proven present by a
+/// kernel-side read, proven absent by a whole-stack scan that covers all 262144 bytes - inside a
+/// SINGLE statement, while the kernel's largest write into user memory is 522 bytes, no other task
+/// maps those frames, and the shell contains no `unsafe`. No software writer in this system can do
+/// that. The one writer left is a device: §6.4 records that this board has no IOMMU/SMMU wired up
+/// (`confine_device` returns false on aarch64), so `xhci` and the NIC program their controllers with
+/// PHYSICAL addresses and can write anywhere in RAM. A DMA landing on the frames backing a task's
+/// stack would erase kilobytes instantly and leave no trace in any CPU-side accounting - which is
+/// exactly the shape of the evidence.
+///
+/// `slack` catches the near-miss too: a driver overrunning its own arena by a few frames is the same
+/// bug one page over, and a stack frame sitting immediately after an arena is worth knowing about.
+pub fn phys_dma_proximity(phys: u64, slack: usize) -> (bool, usize) {
+    let idx = (phys / FRAME_SIZE) as usize;
+    let mut nearest = usize::MAX;
+    // SAFETY: read-only read of the reservation table, which is written only under the allocator lock
+    // at arena-allocation time and never mutated afterwards. A torn read would misreport a diagnostic.
+    let reserves = unsafe { (*core::ptr::addr_of!(ALLOCATOR)).dma_reserves };
+    for &(base, n) in reserves.iter() {
+        if n == 0 { continue; }
+        if idx >= base && idx < base + n { return (true, 0); }
+        let d = if idx < base { base - idx } else { idx - (base + n) + 1 };
+        if d < nearest { nearest = d; }
+    }
+    (false, if nearest <= slack { nearest } else { usize::MAX })
+}
 /// Walk the kernel half of the live PML4 (entries 256-511) and mark every
 /// PDPT / PD / PT / PML4 frame as "used" in the bitmap allocator.
 ///

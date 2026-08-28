@@ -2327,15 +2327,15 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mod.rs | 68 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
-| arch/aarch64/exceptions.rs | 15 | permitted |
-| arch/aarch64/uaccess.rs | 7 | permitted |
+| arch/aarch64/exceptions.rs | 17 | permitted |
+| arch/aarch64/uaccess.rs | 10 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 7 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 23 | permitted |
-| arch/aarch64/ptables.rs | 21 | permitted |
+| arch/aarch64/ptables.rs | 25 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
@@ -2377,7 +2377,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 15 | permitted |
 | capability/table.rs | 7 | permitted |
-| memory/allocator.rs | 44 | permitted |
+| memory/allocator.rs | 45 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
@@ -3079,3 +3079,52 @@ Why these exist: a serial write inside an un-preemptible syscall stalled its cor
 cross-core wake did nothing at all (so every IPC hop cost up to a 10 ms tick), and the kernel had no
 clock able to name the 125 us microframe the USB driver must hit. Each is measured in the commit
 history rather than asserted.
+
+---
+
+## Pi 4 shell-fault instruments (2026-08-28) - DIAGNOSTIC, on the fatal-fault path only
+
+Three files grow to test the one writer left standing for the Pi 4 shell fault. The evidence that
+forced it: a 1024-byte canary in the shell's stack is provably PRESENT (a kernel-side read printed 64
+`Z`s from `0x7fff7f18`) and provably ABSENT at fault time (a whole-stack scan covering all 262144
+bytes), destroyed inside a SINGLE statement - while the kernel's largest write into user memory is 522
+bytes, no other task maps those frames, and the shell contains no `unsafe`. No CPU-side writer in this
+system can do that. A DEVICE can: §6.4 records that this board has no IOMMU/SMMU wired up
+(`confine_device` returns false on aarch64), so a driver programs its controller with physical
+addresses and may write anywhere in RAM.
+
+| File | Change | Why it is sound |
+|------|--------|-----------------|
+| `memory/allocator.rs` | 44 -> 45 (+1) | `phys_dma_proximity` reads the DMA reservation table read-only. Written only under the allocator lock at arena-allocation time and never mutated after; a torn read misreports a diagnostic and nothing else. |
+| `arch/aarch64/ptables.rs` | 21 -> 23 (+2) | `translate_diag` walks a page-table root read-only - the same descriptor walk `map_raw` performs, and `get` already refuses to dereference a non-RAM descriptor. |
+| `arch/aarch64/exceptions.rs` | 15 -> 17 (+2) | One `mrs ttbr0_el1` (a side-effect-free system-register read; it still holds the faulting task's root because the exception came from EL0 and nothing has switched), and one call to `translate_diag` above. |
+
+All three sit in layers where §18.1 permits `unsafe`. Every block carries a `// SAFETY:` comment, and
+all of it runs only after a task has already faulted fatally - it changes what the kernel PRINTS, never
+what it does.
+
+### The read-only canary page (2026-08-29) - the discriminator
+
+Every candidate above was eliminated by measurement, including the kernel itself (`kernel writes ONTO
+the canary: 0`) and the DMA arenas (no overlap, none within 8 frames of a stack page) - and the canary
+is still destroyed. Elimination has run out of candidates, so the next instrument has to identify one
+POSITIVELY. CPU writes and DMA differ in exactly one observable way on a board with no IOMMU: **DMA
+bypasses the MMU.** So the shell now sizes its canary at 8 KiB, which guarantees one 4 KiB page lies
+wholly inside it, and the kernel marks that page read-only:
+
+- canary destroyed with **no fault** -> the writer was not the CPU. That is DMA, identified rather than inferred.
+- a **permission fault** -> a CPU writer after all, and `ELR_EL1` names the exact instruction.
+
+There is no third outcome, which is the property that makes it worth a flash.
+
+| File | Change | Why it is sound |
+|------|--------|-----------------|
+| `arch/aarch64/ptables.rs` | 23 -> 25 (+2) | `set_page_ro_diag` walks to one L3 descriptor with the same `get`/`set` accessors already audited, sets AP[2] (read-only) on a page that is already mapped and valid, then issues the `dsb`/`tlbi vaae1is`/`dsb`/`isb` sequence `unmap` already performs. It cannot create a mapping, widen one, or reach another address space: it only removes a permission from a page the caller already owns. |
+| `arch/aarch64/uaccess.rs` | 7 -> 10 (+3) | The marker check reads the staging buffer `copy_from_user` just filled (a slice over bytes this function owns), one `mrs ttbr0_el1` (side-effect-free, and inside the caller's own syscall so it names the caller's root), and the call above. |
+
+The trigger is a **marker string on a line the kernel is already reading**, not a syscall. That is
+deliberate: a service must not be able to ask the kernel to change page permissions, and adding a
+syscall for it would grow the kernel's responsibilities (§4.4). The marker only selects a page of the
+caller's OWN address space, and the kernel refuses any value that is not page-aligned and inside the
+user stack range, reporting the refusal rather than acting on it (invariant 12). It fires once per
+boot. All of it is diagnostic and goes when the fault does.

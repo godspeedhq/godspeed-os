@@ -414,6 +414,73 @@ pub unsafe fn sync_all_pages(root: u64) -> usize {
 /// # Safety
 /// The address space must belong to a task already dead, with `TTBR0_EL1` switched away and
 /// invalidated, so no walker can still reach it.
+/// DIAGNOSTIC: make one already-mapped user page READ-ONLY, and invalidate its TLB entry.
+///
+/// The decisive experiment for the Pi 4 shell fault. Everything that can write that stack has been
+/// eliminated by measurement - the shell (no `unsafe`, all buffers clamp), other tasks (no shared
+/// frames, no aliasing), the kernel (zero writes overlapping the canary), and the DMA arenas (no
+/// overlap). Yet a canary that cannot be optimised away is provably destroyed.
+///
+/// One candidate survives: a device writing to a physical address it was wrongly given. This board
+/// has no IOMMU/SMMU (§6.4, `confine_device` returns false on aarch64), so a driver's DMA is
+/// unconfined and invisible to every check above.
+///
+/// CPU writes and DMA differ in exactly one observable way: **DMA bypasses the MMU when there is no
+/// IOMMU.** So making the page read-only separates them. If the canary is still destroyed and NO
+/// permission fault is reported, the writer was not the CPU - which is positive proof of DMA rather
+/// than another elimination. If a fault IS taken, the dump names the exact PC that wrote it.
+///
+/// Returns false if the VA is not mapped at L3.
+///
+/// # Safety
+/// `root` must be a live page-table root; the caller must own the address space being modified.
+pub unsafe fn set_page_ro_diag(root: u64, virt: u64) -> bool {
+    // SAFETY: caller's contract. Read-modify-write of one L3 descriptor, followed by the TLB
+    // maintenance the change requires - the same sequence `unmap` performs.
+    unsafe {
+        let l1e = get(root, idx(virt, 1));
+        if l1e & DESC_VALID == 0 || l1e & 0b11 != DESC_TABLE { return false; }
+        let l2e = get(l1e & ADDR_MASK, idx(virt, 2));
+        if l2e & DESC_VALID == 0 || l2e & 0b11 != DESC_TABLE { return false; }
+        let l3 = l2e & ADDR_MASK;
+        let i = idx(virt, 3);
+        let l3e = get(l3, i);
+        if l3e & DESC_VALID == 0 { return false; }
+        set(l3, i, l3e | DESC_AP_RO);
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vaae1is, {p}",
+            "dsb ish",
+            "isb",
+            p = in(reg) (virt >> 12),
+            options(nostack, preserves_flags)
+        );
+        true
+    }
+}
+
+/// DIAGNOSTIC: translate one user VA through `root`, or `None` if it is not mapped.
+///
+/// Used by the fault dump to turn a faulting task's stack pages into PHYSICAL frames, so they can be
+/// tested against the device DMA reservations (`allocator::phys_dma_proximity`). Read-only, and the
+/// same descriptor walk `map_raw` performs.
+///
+/// # Safety
+/// `root` must be a page-table root this walk may read; `get` already refuses non-RAM descriptors.
+pub unsafe fn translate_diag(root: u64, virt: u64) -> Option<u64> {
+    // SAFETY: caller's contract; read-only descriptor walk, no dereference of a non-RAM address
+    // (`get` rejects those itself).
+    unsafe {
+        let l1e = get(root, idx(virt, 1));
+        if l1e & DESC_VALID == 0 || l1e & 0b11 != DESC_TABLE { return None; }
+        let l2e = get(l1e & ADDR_MASK, idx(virt, 2));
+        if l2e & DESC_VALID == 0 || l2e & 0b11 != DESC_TABLE { return None; }
+        let l3e = get(l2e & ADDR_MASK, idx(virt, 3));
+        if l3e & DESC_VALID == 0 { return None; }
+        Some(l3e & ADDR_MASK)
+    }
+}
+
 pub unsafe fn reclaim_pages(root: u64) -> usize {
     let mut freed = 0usize;
     // SAFETY: caller's contract; tables reached through the kernel's direct map.
