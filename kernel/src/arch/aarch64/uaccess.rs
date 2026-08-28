@@ -175,7 +175,21 @@ pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
                         // permission on one already-mapped page of it and performs the TLB
                         // maintenance that change requires.
                         let ok = unsafe { super::ptables::set_page_ro_diag(root & !0xFFF, va) };
-                        crate::kprintln!("canary-ro: page {:#x} write-protected = {}", va, ok);
+                        // Read the descriptor straight back. A guard never observed taking effect is
+                        // not evidence that it took effect, and every conclusion drawn from "no fault"
+                        // depends on this one bit actually being set in the table.
+                        // SAFETY: read-only descriptor walk of the address space just modified.
+                        let desc = unsafe { super::ptables::descriptor_diag(root & !0xFFF, va) };
+                        match desc {
+                            Some(d) => {
+                                CANARY_GUARD_VA.store(va, Relaxed);
+                                CANARY_GUARD_DESC.store(d, Relaxed);
+                                crate::kprintln!(
+                                    "canary-ro: page {:#x} protected={} desc={:#x} pa={:#x} AP2(ro)={}",
+                                    va, ok, d, d & 0x0000_FFFF_FFFF_F000, (d >> 7) & 1);
+                            }
+                            None => crate::kprintln!("canary-ro: page {:#x} protected={} but NO L3 descriptor - experiment is void", va, ok),
+                        }
                     }
                 }
             }
@@ -209,6 +223,11 @@ pub static UW_COUNT:   core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 /// Set once the read-only canary experiment has been armed, so the marker acts exactly once per boot
 /// rather than re-protecting an already-protected page on every statement.
 pub static CANARY_RO_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The guarded page's VA, and the descriptor as it read back at arming time. The fault dump re-reads
+/// the live descriptor and compares: equal means the mapping was read-only for the whole window, which
+/// is what turns "no permission fault" into evidence rather than an assumption.
+pub static CANARY_GUARD_VA:   core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static CANARY_GUARD_DESC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static UW_CANARY_HITS:      core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static UW_CANARY_FIRST_DST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static UW_CANARY_FIRST_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

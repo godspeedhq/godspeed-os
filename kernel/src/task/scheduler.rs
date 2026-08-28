@@ -932,6 +932,9 @@ pub struct TaskStatRaw {
     pub queue_depth: u8,
     pub run_ticks:   u64,
     pub uptime_secs: u64,
+    /// DIAGNOSTIC: the task's page-table root, so the fault dump can ask whether two address
+    /// spaces map one physical frame. Read inside the existing snapshot, so it adds no `unsafe`.
+    pub root:        u64,
 }
 
 /// Return a best-effort snapshot of task state at `slot`.
@@ -941,7 +944,8 @@ pub struct TaskStatRaw {
 pub fn task_stat(slot: usize) -> TaskStatRaw {
     if slot >= MAX_TASKS {
         return TaskStatRaw { valid: false, state: 0, core: 0, mem_used: 0, mem_limit: 0,
-                             name: "", restart_count: 0, queue_depth: 0, run_ticks: 0, uptime_secs: 0 };
+                             name: "", restart_count: 0, queue_depth: 0, run_ticks: 0, uptime_secs: 0,
+                             root: 0 };
     }
     // SAFETY: read-only snapshot of static arrays; all reads are individually
     // naturally-atomic on x86_64 (u64/u32/pointer-width). Best-effort consistency
@@ -987,6 +991,11 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
                     (crate::arch::imp::rtc::now_epoch_monotonic().max(0) as u64).saturating_sub(spawn)
                 }
             },
+            // Only read the context of a slot that is actually live: `TASK_CTX` is `MaybeUninit`, so
+            // reading an empty slot would be reading uninitialised memory rather than a stale value.
+            root: if TASK_VALID[slot].load(Ordering::Acquire) {
+                TASK_CTX[slot].assume_init_ref().cr3
+            } else { 0 },
         }
     }
 }

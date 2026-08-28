@@ -1162,6 +1162,58 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
                     super::put_str(b" - THE KERNEL WROTE THE CANARY");
                 }
             }
+            // THE CONTROL FOR THE READ-ONLY EXPERIMENT.
+            //
+            // "The guarded page holds spaces and no permission fault was taken" only identifies a
+            // non-CPU writer if the page was still read-only when it was written. Re-read the live
+            // descriptor and compare it with the one recorded at arming time, so the conclusion rests
+            // on the table's actual contents rather than on the assumption that nothing disturbed it.
+            {
+                use core::sync::atomic::Ordering::Relaxed;
+                let gva = super::uaccess::CANARY_GUARD_VA.load(Relaxed);
+                if gva != 0 {
+                    let armed = super::uaccess::CANARY_GUARD_DESC.load(Relaxed);
+                    let root: u64;
+                    // SAFETY: side-effect-free system-register read. The fault came from EL0 and
+                    // nothing has switched address space, so this is still the faulting task's root.
+                    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) root, options(nomem, nostack)) };
+                    // SAFETY: read-only descriptor walk of the faulting task's own address space.
+                    let now = unsafe { super::ptables::descriptor_diag(root & !0xFFF, gva) };
+                    super::put_str(b"\r\n    guard page ");
+                    super::put_hex(gva);
+                    super::put_str(b": armed desc ");
+                    super::put_hex(armed);
+                    match now {
+                        Some(d) => {
+                            super::put_str(b" now ");
+                            super::put_hex(d);
+                            super::put_str(if d == armed {
+                                b" - UNCHANGED, still read-only for the whole window"
+                            } else if (d >> 7) & 1 == 0 {
+                                b" - AP2 CLEARED: something rewrote this descriptor"
+                            } else {
+                                b" - CHANGED (remapped, still read-only)"
+                            });
+                        }
+                        None => super::put_str(b" now UNMAPPED - the page went away under the task"),
+                    }
+                    // And what the guarded page actually holds, so "written" is read off the output
+                    // rather than inferred from the canary scan.
+                    super::put_str(b"\r\n    bytes in the guard page: ");
+                    match crate::arch::imp::uaccess::read_user_bytes(gva + 0x800, 16) {
+                        Some(b) => {
+                            for &x in b.iter() { super::put_hex(x as u64); super::put_str(b" "); }
+                            super::put_str(if b.iter().all(|&x| x == 0x5A) {
+                                b" (canary INTACT here - the guarded page was never written)"
+                            } else {
+                                b" (canary DESTROYED here - the guarded page WAS written)"
+                            });
+                        }
+                        None => super::put_str(b"UNREADABLE"),
+                    }
+
+                }
+            }
             super::put_str(b"\r\n    stack frame aliasing: ");
             if alias_pa != 0 {
                 super::put_str(b"YES - va ");
@@ -1218,6 +1270,56 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
                 super::put_str(b" frame(s) away");
             } else {
                 super::put_str(b"; no arena within 8 frames");
+            }
+        }
+    }
+
+    // WHO ELSE MAPS THE GUARDED FRAME?
+    //
+    // Marking the SHELL's mapping read-only does not stop another task writing the same PHYSICAL frame
+    // through its own writable mapping. So "guarded page destroyed, no permission fault" has two
+    // explanations, not one: a device that bypasses the MMU, or one frame handed to two address spaces.
+    // Concluding "therefore DMA" without testing the second would be the third retraction in this
+    // investigation, and the fill byte makes the second worth testing rather than dismissing: 0x20 is
+    // what a screen clear writes, and `console` clears a grid of spaces.
+    //
+    // Deliberately LAST in the dump. `task_stat` takes two spinlocks per slot, and on a fault path a
+    // wedged core holding either one would cost the whole dump. Every cheaper and more certain line has
+    // already printed by here, so the worst case is losing this one answer rather than all of them.
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let gva = super::uaccess::CANARY_GUARD_VA.load(Relaxed);
+        if gva != 0 && from_el0 {
+            let root: u64;
+            // SAFETY: side-effect-free system-register read; the fault came from EL0 and nothing has
+            // switched address space, so this still names the faulting task's root.
+            unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) root, options(nomem, nostack)) };
+            // SAFETY: read-only descriptor walk of the faulting task's own root.
+            if let Some(gpa) = (unsafe { super::ptables::translate_diag(root & !0xFFF, gva) }) {
+                super::put_str(b"\r\n    guard frame pa ");
+                super::put_hex(gpa);
+                super::put_str(b" also mapped by: ");
+                let mut sharers = 0u32;
+                for s in 0..crate::task::scheduler::MAX_TASKS {
+                    let st = crate::task::scheduler::task_stat(s);
+                    if !st.valid || st.root == 0 { continue; }
+                    if st.root & !0xFFF == root & !0xFFF { continue; } // the faulting task itself
+                    // SAFETY: read-only tree walk of a live root taken from the snapshot.
+                    let found = unsafe { super::ptables::find_pa_diag(st.root & !0xFFF, gpa) };
+                    if let Some(va) = found {
+                        sharers += 1;
+                        super::put_str(st.name.as_bytes());
+                        super::put_str(b" @va ");
+                        super::put_hex(va);
+                        super::put_str(b" ");
+                    }
+                }
+                if sharers == 0 {
+                    super::put_str(b"NOBODY - no other address space maps it, so no CPU could have written it");
+                } else {
+                    super::put_str(b"<- FRAME SHARED: one frame reached two address spaces");
+                }
+                super::put_str(b"\r\n");
             }
         }
     }

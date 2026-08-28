@@ -467,6 +467,65 @@ pub unsafe fn set_page_ro_diag(root: u64, virt: u64) -> bool {
 ///
 /// # Safety
 /// `root` must be a page-table root this walk may read; `get` already refuses non-RAM descriptors.
+/// DIAGNOSTIC: find a VA in `root` that maps physical page `pa`, if any.
+///
+/// Walks the TREE rather than probing every VA. Probing the 2 GiB user range one page at a time is
+/// half a million walks per address space, which on a machine with ~180 live tasks turns a fault dump
+/// into a minutes-long hang - and a diagnostic that looks like a lock-up gets read as one. Descending
+/// the tables instead skips whole unmapped subtrees, which is most of the space.
+///
+/// # Safety
+/// `root` must be a live page-table root.
+pub unsafe fn find_pa_diag(root: u64, pa: u64) -> Option<u64> {
+    // SAFETY: caller's contract; read-only walk using the same accessors as `map_raw`.
+    unsafe {
+        for i in 0..ENTRIES {
+            let l1e = get(root, i);
+            if l1e & DESC_VALID == 0 || l1e & 0b11 != DESC_TABLE { continue; }
+            let l2 = l1e & ADDR_MASK;
+            for j in 0..ENTRIES {
+                let l2e = get(l2, j);
+                if l2e & DESC_VALID == 0 || l2e & 0b11 != DESC_TABLE { continue; }
+                let l3 = l2e & ADDR_MASK;
+                for k in 0..ENTRIES {
+                    let l3e = get(l3, k);
+                    if l3e & DESC_VALID == 0 { continue; }
+                    if l3e & ADDR_MASK == pa {
+                        return Some(((i as u64) << 30) | ((j as u64) << 21) | ((k as u64) << 12));
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// DIAGNOSTIC: return the RAW L3 descriptor for `virt`, not just the address it translates to.
+///
+/// The control the read-only canary experiment rests on. "No permission fault" only means the writer
+/// bypassed the MMU if the page was still read-only WHEN it was written. Two things could fake that
+/// result: a stale TLB entry that kept write permission alive, or something having rewritten the
+/// descriptor afterwards. Reading the descriptor back at fault time distinguishes all three:
+///   - AP[2] set, same PA  -> the mapping was read-only throughout. The writer was not the CPU.
+///   - AP[2] clear         -> something rewrote this entry. A different bug, and a CPU-side one.
+///   - a different PA      -> the page was remapped under a live task. Different bug again.
+/// Without this, "no fault" is an assumption; with it, it is evidence.
+///
+/// # Safety
+/// `root` must be a live page-table root.
+pub unsafe fn descriptor_diag(root: u64, virt: u64) -> Option<u64> {
+    // SAFETY: caller's contract; read-only descriptor walk, identical to `translate_diag` below.
+    unsafe {
+        let l1e = get(root, idx(virt, 1));
+        if l1e & DESC_VALID == 0 || l1e & 0b11 != DESC_TABLE { return None; }
+        let l2e = get(l1e & ADDR_MASK, idx(virt, 2));
+        if l2e & DESC_VALID == 0 || l2e & 0b11 != DESC_TABLE { return None; }
+        let l3e = get(l2e & ADDR_MASK, idx(virt, 3));
+        if l3e & DESC_VALID == 0 { return None; }
+        Some(l3e)
+    }
+}
+
 pub unsafe fn translate_diag(root: u64, virt: u64) -> Option<u64> {
     // SAFETY: caller's contract; read-only descriptor walk, no dereference of a non-RAM address
     // (`get` rejects those itself).

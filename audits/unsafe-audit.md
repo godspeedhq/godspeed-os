@@ -2327,15 +2327,15 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mod.rs | 68 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
-| arch/aarch64/exceptions.rs | 17 | permitted |
-| arch/aarch64/uaccess.rs | 10 | permitted |
+| arch/aarch64/exceptions.rs | 22 | permitted |
+| arch/aarch64/uaccess.rs | 11 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 7 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 23 | permitted |
-| arch/aarch64/ptables.rs | 25 | permitted |
+| arch/aarch64/ptables.rs | 29 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
@@ -3121,6 +3121,40 @@ There is no third outcome, which is the property that makes it worth a flash.
 |------|--------|-----------------|
 | `arch/aarch64/ptables.rs` | 23 -> 25 (+2) | `set_page_ro_diag` walks to one L3 descriptor with the same `get`/`set` accessors already audited, sets AP[2] (read-only) on a page that is already mapped and valid, then issues the `dsb`/`tlbi vaae1is`/`dsb`/`isb` sequence `unmap` already performs. It cannot create a mapping, widen one, or reach another address space: it only removes a permission from a page the caller already owns. |
 | `arch/aarch64/uaccess.rs` | 7 -> 10 (+3) | The marker check reads the staging buffer `copy_from_user` just filled (a slice over bytes this function owns), one `mrs ttbr0_el1` (side-effect-free, and inside the caller's own syscall so it names the caller's root), and the call above. |
+
+### The controls that keep the answer honest (2026-08-29)
+
+The first hardware run came back with the guarded page holding `0x20` and **no permission fault**,
+which is the "not the CPU" arm. Two things could fake that, and both are now tested rather than
+assumed:
+
+1. **Was the page still read-only when it was written?** A stale TLB entry, or something rewriting the
+   descriptor, would produce the same silence. The descriptor is now read back at arming time AND at
+   fault time and the two are compared, so the dump states whether the mapping was read-only for the
+   whole window instead of leaving it inferred.
+2. **Could another task have written the same FRAME through its own writable mapping?** Marking the
+   shell's mapping read-only does nothing about that, so "no fault" also fits one frame handed to two
+   address spaces. The fill byte makes this worth testing rather than dismissing: `0x20` is what a
+   screen clear writes, and `console` clears a grid of spaces. The dump now takes the guarded page's
+   PA and asks every other live task whether it maps it, naming the task and VA if so.
+
+Without (2), concluding "therefore DMA" would have been a third retraction in this investigation.
+
+| File | Change | Why it is sound |
+|------|--------|-----------------|
+| `arch/aarch64/ptables.rs` | 25 -> 29 (+4) | `descriptor_diag` returns the raw L3 descriptor via the same read-only walk as `translate_diag`; `find_pa_diag` descends the tree looking for one PA, skipping unmapped subtrees. Both are read-only and use the audited `get` accessor, which itself refuses a non-RAM descriptor. |
+| `arch/aarch64/exceptions.rs` | 17 -> 22 (+5) | One `mrs ttbr0_el1`, and three read-only walks (descriptor readback, guard-page translate, per-task frame search). All on the fatal-fault path. |
+| `arch/aarch64/uaccess.rs` | 10 -> 11 (+1) | The descriptor readback that proves the arm took effect - a guard never observed firing is not evidence that it fires. |
+
+`find_pa_diag` walks the TABLES rather than probing every VA deliberately: probing the 2 GiB user range
+a page at a time is half a million walks per address space, and on a machine with ~180 live tasks that
+turns a fault dump into a minutes-long hang - a diagnostic that looks like a lock-up gets read as one.
+
+**`task/scheduler.rs` does not move.** The cross-task scan needs each task's page-table root, and that
+lives in a private `static mut` there - a grandfathered layer whose count may only fall (§18.5). Rather
+than add an accessor (which would have grown it, as an earlier attempt in this investigation did before
+being reverted), the root is returned as a new field on the existing `task_stat` snapshot, read inside
+the `unsafe` block that function already has. No new `unsafe` keyword, so the floor holds.
 
 The trigger is a **marker string on a line the kernel is already reading**, not a syscall. That is
 deliberate: a service must not be able to ask the kernel to change page permissions, and adding a
