@@ -476,6 +476,47 @@ pub unsafe fn set_page_ro_diag(root: u64, virt: u64) -> bool {
 ///
 /// # Safety
 /// `root` must be a live page-table root.
+/// DIAGNOSTIC: collect EVERY VA in `root` that maps physical page `pa`. Returns how many were found
+/// (which may exceed `out.len()`; only the first `out.len()` are written).
+///
+/// `find_pa_diag` returns the first match, which is the wrong question for the address space the fault
+/// happened in. If ONE address space maps a frame twice, a write through the second VA reaches the
+/// first VA's memory through a different descriptor - so a read-only mapping on one of them stops
+/// nothing, no other task is involved, the allocator is perfectly consistent, and no device is needed.
+/// That is the shape of every observation in this investigation, and the earlier scan could not see it
+/// because it skipped the faulting task. Counting all matches is what turns that from a story into a
+/// number.
+///
+/// # Safety
+/// `root` must be a live page-table root.
+pub unsafe fn find_all_pa_diag(root: u64, pa: u64, out: &mut [u64]) -> usize {
+    let mut n = 0usize;
+    // SAFETY: caller's contract; read-only walk with the audited `get` accessor.
+    unsafe {
+        for i in 0..ENTRIES {
+            let l1e = get(root, i);
+            if l1e & DESC_VALID == 0 || l1e & 0b11 != DESC_TABLE { continue; }
+            let l2 = l1e & ADDR_MASK;
+            for j in 0..ENTRIES {
+                let l2e = get(l2, j);
+                if l2e & DESC_VALID == 0 || l2e & 0b11 != DESC_TABLE { continue; }
+                let l3 = l2e & ADDR_MASK;
+                for k in 0..ENTRIES {
+                    let l3e = get(l3, k);
+                    if l3e & DESC_VALID == 0 { continue; }
+                    if l3e & ADDR_MASK == pa {
+                        if n < out.len() {
+                            out[n] = ((i as u64) << 30) | ((j as u64) << 21) | ((k as u64) << 12);
+                        }
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    n
+}
+
 pub unsafe fn find_pa_diag(root: u64, pa: u64) -> Option<u64> {
     // SAFETY: caller's contract; read-only walk using the same accessors as `map_raw`.
     unsafe {

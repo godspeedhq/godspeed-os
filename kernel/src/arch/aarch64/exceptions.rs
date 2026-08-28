@@ -1296,6 +1296,31 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
             unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) root, options(nomem, nostack)) };
             // SAFETY: read-only descriptor walk of the faulting task's own root.
             if let Some(gpa) = (unsafe { super::ptables::translate_diag(root & !0xFFF, gva) }) {
+                // FIRST: does the FAULTING TASK map this frame more than once?
+                //
+                // The earlier scan skipped the faulting task, which left the likeliest explanation
+                // untested. One address space mapping a frame twice reproduces every observation at
+                // once: a write through the second VA reaches the first VA's memory via a DIFFERENT
+                // descriptor, so read-only on one of them stops nothing and raises nothing, no other
+                // task is involved, the allocator stays consistent, and no device is needed. The
+                // existing "stack frame aliasing" line cannot see it either - it compares the 64 stack
+                // pages against each other, never against the rest of the address space.
+                let mut vas = [0u64; 8];
+                // SAFETY: read-only tree walk of the faulting task's own root.
+                let self_n = unsafe { super::ptables::find_all_pa_diag(root & !0xFFF, gpa, &mut vas) };
+                super::put_str(b"\r\n    THIS task maps the guard frame at ");
+                super::put_dec(self_n as u64);
+                super::put_str(b" VA(s): ");
+                for v in vas.iter().take(self_n.min(vas.len())) {
+                    super::put_hex(*v);
+                    super::put_str(b" ");
+                }
+                if self_n > 1 {
+                    super::put_str(b"<- ALIASED WITHIN ONE ADDRESS SPACE: a write through the other VA lands here, through a WRITABLE descriptor - no fault, no device, no other task needed");
+                } else {
+                    super::put_str(b"(single mapping - not self-aliased)");
+                }
+
                 super::put_str(b"\r\n    guard frame pa ");
                 super::put_hex(gpa);
                 super::put_str(b" also mapped by: ");

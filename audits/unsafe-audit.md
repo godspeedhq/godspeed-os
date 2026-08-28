@@ -2327,7 +2327,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mod.rs | 68 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
-| arch/aarch64/exceptions.rs | 23 | permitted |
+| arch/aarch64/exceptions.rs | 24 | permitted |
 | arch/aarch64/uaccess.rs | 11 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
@@ -2335,7 +2335,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/gic.rs | 7 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 23 | permitted |
-| arch/aarch64/ptables.rs | 29 | permitted |
+| arch/aarch64/ptables.rs | 31 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
@@ -3163,6 +3163,25 @@ at ARM time. "Written while read-only" is only true if the page held the fill pa
 protected, and neither the shell's control print (a different page) nor its first/last check (two bytes
 at the array's ends) says anything about that page. If it is already dirty at arming, the experiment is
 void and says so.
+
+### The hole in my own scan (2026-08-29, third run)
+
+The third run came back valid on every precondition - guard page INTACT at arm time, descriptor
+UNCHANGED, page WRITTEN, allocator consistent (`0 of 64` stack frames lost). And the shell's
+per-statement canary check had fired ZERO times across hundreds of statements, so the destruction is
+sudden and total INSIDE one statement, not a slow drip.
+
+That combination exposed a hole in the cross-task scan: **it skipped the faulting task itself.** If ONE
+address space maps a frame twice, a write through the second VA reaches the first VA's memory through a
+DIFFERENT descriptor - so a read-only mapping on one of them stops nothing and raises nothing, no other
+task is involved, the allocator stays perfectly consistent, and no device is required. That reproduces
+every observation in this investigation at once, and neither existing check could see it: the
+"stack frame aliasing" line compares the 64 stack pages against each other, never against the rest of
+the address space, and the cross-task scan skipped this address space by construction.
+
+`find_all_pa_diag` (ptables 29 -> 31) counts EVERY VA in a root that maps a given frame, and the dump
+now runs it on the faulting task's own root first. `exceptions.rs` 23 -> 24 for the call. Two or more
+VAs is the answer; one rules the hypothesis out.
 
 `find_pa_diag` walks the TABLES rather than probing every VA deliberately: probing the 2 GiB user range
 a page at a time is half a million walks per address space, and on a machine with ~180 live tasks that

@@ -159,7 +159,7 @@ const TAG_GET_PHYS_WH: u32 = 0x0004_0003;
 /// Ask the GPU what the attached display's resolution is, so the console matches the screen instead of
 /// imposing a size on it.
 ///
-/// The fallback is **1280x720**, the same one the Pi 2 port uses. It matters more than a default
+/// The fallback is **1920x1080** (amended 2026-08-29 from 1280x720). It matters more than a default
 /// usually does, because it is what the console's width comes from when the query is unhelpful: the
 /// font scale is `height / 600`, so at 720p and below the cell size is fixed and the column count is
 /// simply the pixel width divided by it. 1024 wide gave 102 columns, which is narrower than the Pi 2's
@@ -168,7 +168,7 @@ const TAG_GET_PHYS_WH: u32 = 0x0004_0003;
 /// Whether the number came from the display or from the fallback is **logged**, because the two look
 /// identical afterwards and only one of them is worth investigating.
 fn query_display_size() -> (u32, u32) {
-    const FALLBACK: (u32, u32) = (1280, 720);
+    const FALLBACK: (u32, u32) = (1920, 1080);
     let mut req = [0u32; 8];
     req[0] = 7 * 4;
     req[1] = 0;
@@ -190,7 +190,7 @@ fn query_display_size() -> (u32, u32) {
         put_str(b" (native)\r\n");
         (req[5], req[6])
     } else {
-        put_str(b"aarch64: display did not report a usable size - asking for 1280x720\r\n");
+        put_str(b"aarch64: display did not report a usable size - asking for 1920x1080\r\n");
         FALLBACK
     }
 }
@@ -205,13 +205,21 @@ fn query_display_size() -> (u32, u32) {
 /// gamble, because the request is not the answer: `SET_PHYS_WH` replies with the mode the GPU actually
 /// applied, and this code uses the reply. If the display really is 1024x768, the GPU clamps and we get
 /// 1024x768 back, exactly as before.
-const MIN_MODE: (u32, u32) = (1280, 720);
+/// Amended 2026-08-29: ask for **1920x1080**, not 1280x720, because a non-native mode is what a TV
+/// makes ugly. Asking for 720p on a 1080p panel does not produce small-but-sharp text - it hands the
+/// TV's own scaler a 1.5x upscale, which is the blur that gets reported as "a pixelated mess". Native
+/// resolution costs nothing here and removes that scaler from the path entirely.
+///
+/// This stays safe for the same reason the original did: the request is not the answer. `SET_PHYS_WH`
+/// replies with the mode the GPU actually applied and this code uses the reply, so a display that
+/// cannot do 1080p gets clamped down exactly as before rather than being driven at a mode it lacks.
+const MIN_MODE: (u32, u32) = (1920, 1080);
 
 /// Allocate a framebuffer. Call once, before the MMU is enabled.
 pub fn init() -> Option<FbInfo> {
     let reported = query_display_size();
     let (width, height) = if reported.0 < MIN_MODE.0 {
-        put_str(b"aarch64: reported mode is narrower than 1280 - asking for 1280x720 instead\r\n");
+        put_str(b"aarch64: reported mode is narrower than 1920 - asking for 1920x1080 instead\r\n");
         MIN_MODE
     } else {
         reported
