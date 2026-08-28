@@ -187,6 +187,22 @@ pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
                                 crate::kprintln!(
                                     "canary-ro: page {:#x} protected={} desc={:#x} pa={:#x} AP2(ro)={}",
                                     va, ok, d, d & 0x0000_FFFF_FFFF_F000, (d >> 7) & 1);
+                                // THE PRECONDITION, stated rather than assumed.
+                                //
+                                // "The guarded page was written while read-only" is only true if it
+                                // held the fill pattern WHEN it was protected. The shell's control
+                                // print reads a different page, and its first/last check samples two
+                                // bytes at the array's ends - neither says anything about this page.
+                                // If it is already 0x20 here, nothing was written under protection and
+                                // the whole conclusion collapses, so it is checked, not assumed.
+                                match read_user_bytes(va + 0x800, 16) {
+                                    Some(b) => crate::kprintln!(
+                                        "canary-ro: guard page at arm time: {:02x} {:02x} {:02x} {:02x} ... ({})",
+                                        b[0], b[1], b[2], b[3],
+                                        if b.iter().all(|&x| x == 0x5A) { "INTACT - the experiment is valid" }
+                                        else { "ALREADY DIRTY - corruption preceded the arm; experiment VOID" }),
+                                    None => crate::kprintln!("canary-ro: guard page unreadable at arm time - experiment void"),
+                                }
                             }
                             None => crate::kprintln!("canary-ro: page {:#x} protected={} but NO L3 descriptor - experiment is void", va, ok),
                         }

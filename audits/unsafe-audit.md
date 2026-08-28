@@ -2327,7 +2327,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mod.rs | 68 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
-| arch/aarch64/exceptions.rs | 22 | permitted |
+| arch/aarch64/exceptions.rs | 23 | permitted |
 | arch/aarch64/uaccess.rs | 11 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
@@ -2377,7 +2377,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 15 | permitted |
 | capability/table.rs | 7 | permitted |
-| memory/allocator.rs | 45 | permitted |
+| memory/allocator.rs | 46 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
@@ -3143,8 +3143,26 @@ Without (2), concluding "therefore DMA" would have been a third retraction in th
 | File | Change | Why it is sound |
 |------|--------|-----------------|
 | `arch/aarch64/ptables.rs` | 25 -> 29 (+4) | `descriptor_diag` returns the raw L3 descriptor via the same read-only walk as `translate_diag`; `find_pa_diag` descends the tree looking for one PA, skipping unmapped subtrees. Both are read-only and use the audited `get` accessor, which itself refuses a non-RAM descriptor. |
-| `arch/aarch64/exceptions.rs` | 17 -> 22 (+5) | One `mrs ttbr0_el1`, and three read-only walks (descriptor readback, guard-page translate, per-task frame search). All on the fatal-fault path. |
+| `arch/aarch64/exceptions.rs` | 17 -> 23 (+6) | One `mrs ttbr0_el1`, and three read-only walks (descriptor readback, guard-page translate, per-task frame search). All on the fatal-fault path. |
 | `arch/aarch64/uaccess.rs` | 10 -> 11 (+1) | The descriptor readback that proves the arm took effect - a guard never observed firing is not evidence that it fires. |
+
+One more instrument, and one correction, from the second hardware run. The correction first: the
+cross-task scan reports "no other USER address space maps it" and no longer says "so no CPU could have
+written it". That claim was wrong - the scan covers user address spaces only, while the kernel's direct
+map covers every physical frame read-write at EL1, so a kernel write through the HHDM reaches the frame
+without touching the read-only user mapping and without passing the `copy_to_user` tracker. Two
+candidates survive, not one, and `frame_is_free` (`memory/allocator.rs` 45 -> 46) tests the second: the
+direct-map path requires the kernel to believe the frame is something other than a live task's stack,
+and that belief lives in the free bitmap, so the dump asks it. A frame that is MAPPED by a running task
+and simultaneously marked FREE has been lost track of, and whatever is handed it next writes through the
+shell's stack with no fault and no tracker entry. The same question is asked of all 64 stack pages,
+because one lost frame is a bug and several is a pattern.
+
+The other addition is a PRECONDITION that was being assumed: the guard page's contents are now printed
+at ARM time. "Written while read-only" is only true if the page held the fill pattern when it was
+protected, and neither the shell's control print (a different page) nor its first/last check (two bytes
+at the array's ends) says anything about that page. If it is already dirty at arming, the experiment is
+void and says so.
 
 `find_pa_diag` walks the TABLES rather than probing every VA deliberately: probing the 2 GiB user range
 a page at a time is half a million walks per address space, and on a machine with ~180 live tasks that

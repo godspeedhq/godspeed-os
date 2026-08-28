@@ -1315,10 +1315,46 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
                     }
                 }
                 if sharers == 0 {
-                    super::put_str(b"NOBODY - no other address space maps it, so no CPU could have written it");
+                    // Deliberately NOT "so no CPU could have written it". This scan covers USER
+                    // address spaces only. The kernel's direct map covers every physical frame,
+                    // read-write at EL1, so a kernel write through the HHDM reaches this frame
+                    // without touching the read-only user mapping and without faulting - and the
+                    // `copy_to_user` tracker above would not see it either. Two candidates survive
+                    // this line, and overstating it to one would be the wrong kind of certainty.
+                    super::put_str(b"NO OTHER USER ADDRESS SPACE (the kernel's direct map still does, as it does for every frame)");
                 } else {
                     super::put_str(b"<- FRAME SHARED: one frame reached two address spaces");
                 }
+                // AND DOES THE ALLOCATOR STILL THINK THIS FRAME IS THE SHELL'S?
+                //
+                // The direct-map candidate above requires the kernel to believe the frame is
+                // something other than a live task's stack. That belief lives in one place - the free
+                // bitmap - so ask it. A frame that is MAPPED by a running task and simultaneously
+                // marked FREE has been lost track of, and whatever is handed it next writes straight
+                // through the shell's stack with no fault and no tracker entry.
+                super::put_str(b"    allocator says the guard frame is: ");
+                match crate::memory::allocator::frame_is_free(gpa) {
+                    Some(true)  => super::put_str(b"FREE, while a running task maps it - THE ALLOCATOR LOST IT"),
+                    Some(false) => super::put_str(b"in use (consistent with the shell owning it)"),
+                    None        => super::put_str(b"outside the bitmap"),
+                }
+                // The same question for every stack page, since one lost frame is a bug and several
+                // is a pattern.
+                const SPAGES: u64 = 64;
+                const STOP: u64 = 0x8000_0000;
+                let mut lost = 0u32;
+                let mut mapped_n = 0u32;
+                for p in 0..SPAGES {
+                    let va = STOP - ((p + 1) * 4096);
+                    // SAFETY: read-only descriptor walk of the faulting task's own root.
+                    let Some(pa) = (unsafe { super::ptables::translate_diag(root & !0xFFF, va) }) else { continue };
+                    mapped_n += 1;
+                    if crate::memory::allocator::frame_is_free(pa) == Some(true) { lost += 1; }
+                }
+                super::put_str(b"\r\n    stack frames marked FREE while mapped: ");
+                super::put_dec(lost as u64);
+                super::put_str(b" of ");
+                super::put_dec(mapped_n as u64);
                 super::put_str(b"\r\n");
             }
         }
