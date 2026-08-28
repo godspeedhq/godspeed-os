@@ -900,9 +900,11 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
         const BT_MAX: u32 = 48;
         let mut shown = 0u32;
         let mut boff: u64 = 0;
+        let mut scanned: u64 = 0;
         super::put_str(b"\r\n    return addresses on the stack (newest first, may include stale slots):");
         while boff < room && shown < BT_MAX {
             let Some(b) = crate::arch::imp::uaccess::read_user_bytes(sp_el0 + boff, BITE) else { break };
+            scanned = boff + BITE as u64;   // how far we ACTUALLY got
             for w in 0..BITE / 8 {
                 if shown >= BT_MAX { break; }
                 let mut t = [0u8; 8];
@@ -919,9 +921,99 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
             boff += BITE as u64;
         }
         if shown == 0 {
-            super::put_str(b"\r\n      none found in ");
+            // REPORT WHAT WAS SCANNED, not what was intended. This printed `room` - the distance from
+            // SP to the stack top, computed BEFORE the loop - so a scan that broke early on an
+            // unreadable page still claimed to have covered all of it, and "no return addresses" read
+            // as a fact about the stack when it might only be a fact about the first 512 bytes.
+            super::put_str(b"
+      none found in ");
+            super::put_dec(scanned);
+            super::put_str(b" bytes ACTUALLY READ (of ");
             super::put_dec(room);
-            super::put_str(b" bytes of live stack above SP");
+            super::put_str(b" above SP)");
+        }
+
+        // IS THE SHELL`S CANARY STILL THERE?
+        //
+        // `run_lines` plants 1024 bytes of 0x5A in its frame and checks them AFTER each statement -
+        // which is useless when the fault kills the task DURING one, because the check never runs. So
+        // "canary not reported" has never meant "canary intact"; it meant nobody looked.
+        //
+        // The kernel can look, and the answer decides the shape of the bug. A surviving 0x5A run means
+        // the damage is LOCAL to a deeper frame. No 0x5A anywhere means the overwrite swallowed
+        // `run_lines` frame as well, which - with no return address left in 35 KB of stack - would say
+        // the whole call chain has been flattened rather than one saved register pair clobbered.
+        {
+            let mut best: u64 = 0;      // longest 0x5A run found
+            let mut best_at: u64 = 0;
+            let mut cur: u64 = 0;
+            let mut coff: u64 = 0;
+            while coff < room {
+                let Some(b) = crate::arch::imp::uaccess::read_user_bytes(sp_el0 + coff, BITE) else { break };
+                for k in 0..BITE {
+                    if b[k] == 0x5A {
+                        cur += 1;
+                        if cur > best { best = cur; best_at = coff + k as u64 + 1 - cur; }
+                    } else { cur = 0; }
+                }
+                coff += BITE as u64;
+            }
+            super::put_str(b"
+    shell canary (0x5A): longest run ");
+            super::put_dec(best);
+            super::put_str(b" bytes at SP+");
+            super::put_hex(best_at);
+            super::put_str(b" (planted: 1024)");
+        }
+
+        // The SECOND canary (0xC3), planted in `execute` - a frame BELOW `run_lines`, i.e. between SP
+        // and the first canary. Which of the two survives brackets where the upward write begins.
+        {
+            let mut best: u64 = 0;
+            let mut best_at: u64 = 0;
+            let mut cur: u64 = 0;
+            let mut coff: u64 = 0;
+            while coff < room {
+                let Some(b) = crate::arch::imp::uaccess::read_user_bytes(sp_el0 + coff, BITE) else { break };
+                for k in 0..BITE {
+                    if b[k] == 0xC3 {
+                        cur += 1;
+                        if cur > best { best = cur; best_at = coff + k as u64 + 1 - cur; }
+                    } else { cur = 0; }
+                }
+                coff += BITE as u64;
+            }
+            super::put_str(b"
+    execute canary (0xC3): longest run ");
+            super::put_dec(best);
+            super::put_str(b" bytes at SP+");
+            super::put_hex(best_at);
+            super::put_str(b" (planted: 256 per depth)");
+        }
+
+        // WHAT HAS THE KERNEL WRITTEN INTO USER MEMORY?
+        //
+        // Everything else is ruled out: the stack is fully mapped, no other task maps its frames, the
+        // shell has no `unsafe`, and safe-Rust writes are bounds-checked. The kernel writing through a
+        // user pointer is the one remaining writer that can cross those guarantees, so this reports the
+        // LARGEST such write and where it landed. A multi-kilobyte write into this stack`s range names
+        // the syscall outright; a small maximum exonerates the kernel and the bug is stranger still.
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            let n = super::uaccess::UW_MAX_LEN.load(Relaxed);
+            let d = super::uaccess::UW_MAX_DST.load(Relaxed);
+            super::put_str(b"
+    kernel->user writes: ");
+            super::put_dec(super::uaccess::UW_COUNT.load(Relaxed));
+            super::put_str(b" totalling ");
+            super::put_dec(super::uaccess::UW_TOTAL.load(Relaxed));
+            super::put_str(b" bytes; largest ");
+            super::put_dec(n);
+            super::put_str(b" bytes to ");
+            super::put_hex(d);
+            if d >= 0x7FFC_0000 && d < 0x8000_0000 {
+                super::put_str(b" - WHICH IS INSIDE A USER STACK");
+            }
         }
     }
 

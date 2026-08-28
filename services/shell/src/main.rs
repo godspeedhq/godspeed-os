@@ -1484,6 +1484,19 @@ impl ShellError {
 /// `run → cmd_run → execute` path (the same inlining-inflates-frame trap as the record builders).
 #[inline(never)]
 fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellError>, depth: u8, out: &mut Out) -> Result<(), ShellError> {
+    // SECOND CANARY - brackets the first. DIAGNOSTIC, not a feature.
+    //
+    // The canary in `run_lines` sits 2808 bytes ABOVE SP and is destroyed; the space fill starts AT
+    // SP and has reached 5344 bytes, i.e. 2536 bytes past it. So the write climbs UPWARD from a deep
+    // frame through its callers. `execute` is called BELOW `run_lines` (via `run_stmt`), so its frame
+    // lies between SP and that first canary: whether THIS one dies, and at what fill length, says how
+    // deep the origin is.
+    //
+    // 256 bytes, not 1024: `execute` recurses to depth 16, so the instrument must not itself push a
+    // stack this tight over. 0xC3 so it cannot be confused with 0x5A, 0x20 or 0x00.
+    const CANARY2_BYTE: u8 = 0xC3;
+    let canary2 = [CANARY2_BYTE; 256];
+    core::hint::black_box(&canary2);
     let Ok(s) = core::str::from_utf8(line) else {
         ctx.console_writeln("shell: invalid input");
         return Err(ShellError::Unknown);
@@ -3436,6 +3449,37 @@ fn let_capture_form(s: &str) -> Option<(&str, bool, &str)> {
 fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool) -> Result<(), ShellError> {
     // Per-run interpreter state: a bounded variable table, allocated once HERE (above `execute`) and
     // threaded by &mut into `run_stmt` - it never reaches `execute`/`pipe_run`'s frame. No heap (§26.6).
+    // STACK CANARY - DIAGNOSTIC, not a feature.
+    //
+    // Five of six Pi 4 shell faults smashed one frame with the SAME 4304-byte run of 0x20 and then
+    // returned into it (`ELR = 0x2020202020202020`). The fault is reported at the RETURN, long after
+    // whatever wrote those bytes finished - so every register dump so far names a victim and never a
+    // culprit. The console grid was ruled out by experiment (the fill did not move when the geometry
+    // did); the shell has no `unsafe`, a safe-Rust overrun would panic rather than corrupt, and there
+    // is no panic.
+    //
+    // This lives in `run_lines`, whose frame outlives every statement the suite runs, and is checked
+    // AFTER EACH STATEMENT. A smash large enough to reach the saved registers has to cross this array
+    // on the way, so the first statement to dirty it is the one that did it - named before the crash
+    // instead of after.
+    //
+    // `black_box` at both ends so it cannot be optimised away as write-only, and a pattern that is
+    // neither 0x00 nor 0x20 - the two fills already seen - so a hit cannot be confused with the
+    // corruption being hunted.
+    const CANARY_BYTE: u8 = 0x5A;
+    let mut canary = [CANARY_BYTE; 1024];
+    core::hint::black_box(&canary);
+    let mut canary_reported = false;
+    // CONTROL: prove the canary EXISTS before trusting any conclusion drawn from its absence.
+    //
+    // The kernel scans the stack for 0x5A at fault time and has twice reported a longest run of ONE
+    // byte, which I read as "destroyed". That reading is only valid if the array is actually there:
+    // an optimiser free to elide it, or to reuse its slot after the last check, produces the same
+    // reading with nothing wrong at all. Printing its address and length once, on a HEALTHY run,
+    // settles which - and it costs one line per selfcheck.
+    ctx.console_writeln_fmt(format_args!(
+        "shell: canary at {:#x} len {} first={:#04x} last={:#04x}",
+        canary.as_ptr() as usize, canary.len(), canary[0], canary[canary.len() - 1]));
     let mut vars = Vars::new();
     let mut ran = 0u32;
     let mut failed = 0u32;
@@ -3837,6 +3881,27 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
                 StmtOutcome::Stop(r) => (r, true),
             }
         };
+        // Did THIS statement dirty the canary? Reported once - the first hit is the one that matters;
+        // everything after it is already running on a corrupt stack.
+        // SILENT per statement, LOUD only on a hit.
+        //
+        // The per-statement print was itself changing the outcome: it roughly doubled console output
+        // and the crash moved from statement ~122 to ~30-66, about a second into the run. On this
+        // board a single console paint has been measured at 355 ms, so an instrument that prints per
+        // statement is not observing the system, it is loading it. The canary is still CHECKED every
+        // statement - only the reporting is now conditional, so the measurement stays and the load
+        // goes.
+        {
+            core::hint::black_box(&canary);
+            if let Some(k) = canary.iter().position(|&b| b != CANARY_BYTE) {
+                if !canary_reported {
+                    canary_reported = true;
+                    ctx.console_writeln_fmt(format_args!(
+                        "canary {:#x} BAD@{} =0x{:02x} - FIRST dirtied by: {}",
+                        canary.as_ptr() as usize, k, canary[k], s));
+                }
+            }
+        }
         last = res;
         if nrec < RUN_MAX_CMDS { verdict[nrec] = last.is_ok(); soff[nrec] = stmt_off as u16; slng[nrec] = stmt.len() as u16; }
         nrec += 1;
