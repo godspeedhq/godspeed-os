@@ -514,11 +514,38 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // Events must actually be RECORDED - the shell has been making fs/console calls all along.
-    send(&mut write_half, b"trace ipc\r");
-    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("REQUEST") || r.contains("REPLY"),
-                          "trace ipc: the ring recorded real request/reply traffic"),
-        None => { println!("shell-test: FAIL - timed out after `trace ipc`"); fail += 1; }
+    send(&mut write_half, b"trace ipc\r          q");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
+        Some(r) => {
+            check!(r.contains("REPLY") || r.contains("TIMEOUT") || r.contains("PEER_LOST"),
+                   "trace ipc: the ring recorded real IPC outcomes");
+            check!(r.contains("outcome") && r.contains("peer") && r.contains("caller"),
+                   "trace ipc: columns are named, not abbreviated");
+            // The CALL GRAPH, not just a list of calls: who called whom.
+            check!(r.contains("shell") && (r.contains("fs") || r.contains("console")),
+                   "trace ipc: the caller is named, so a row is an edge not a fact");
+            check!(r.contains("seconds since the oldest row"),
+                   "trace ipc: a legend explains the columns");
+        }
+        None => { println!("shell-test: FAIL - timed out after `trace ipc`"); fail += 4; }
+    }
+    // A record source, so it PIPES: one producer feeds the grid, the pager and the record verbs.
+    send(&mut write_half, b"trace ipc | to json\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
+        Some(r) => {
+            check!(r.contains("\"peer\":") && r.contains("\"outcome\":") && r.contains("\"caller\":"),
+                   "trace ipc | to json: the ring pipes as records");
+            check!(!r.contains("seconds since the oldest row"),
+                   "trace ipc | to json: the legend stays OFF the pipe (records only)");
+        }
+        None => { println!("shell-test: FAIL - timed out after `trace ipc | to json`"); fail += 2; }
+    }
+    send(&mut write_half, b"trace ipc | count\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
+        // `count` on a record stream prints the bare number, not the word "rows".
+        Some(r) => check!(r.chars().any(|c| c.is_ascii_digit()) && !r.contains("cannot"),
+                          "trace ipc | count: counts rows of the record stream"),
+        None => { println!("shell-test: FAIL - timed out after `trace ipc | count`"); fail += 1; }
     }
 
 

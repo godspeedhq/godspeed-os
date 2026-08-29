@@ -314,6 +314,9 @@ impl core::ops::Deref for ShellCtx {
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // Name this service in the trace ring. It cannot ask what it is called (identity is not ambient),
+    // so a traced service says - see `sdk::trace` for why that costs nothing in trust.
+    ctx.trace_as("shell");
     // C6-1: wrap the SDK context in the shell's own, which owns the fs correlation tag. Everything
     // below still calls `ctx.log(...)` unchanged - `ShellCtx` derefs to `ServiceContext` - and deref
     // coercion lets it pass to anything expecting the SDK type. The tag now has an owner with the same
@@ -4135,8 +4138,8 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("trace blocked", "every task blocked on another task, and who holds what it awaits", "trace blocked"),
             ("trace task <slot>", "the chain rooted at one task, as a tree", "trace task 7"),
             ("trace service <name>", "the same chain, rooted by service name", "trace service fs"),
-            ("trace ipc", "recent IPC events from the ring in `logger` (newest last)", "trace ipc"),
-            ("trace failures", "only the timeouts and lost peers", "trace failures"),
+            ("trace ipc", "IPC events from the ring in `logger` - oldest first, pages, pipes", "trace ipc | where peer=fs"),
+            ("trace failures", "only the timeouts, lost peers and full queues", "trace failures | to json"),
             ("trace status", "ring size, events recorded, events dropped", "trace status"),
             ("trace version", "the utility version", "trace version"),
         ], true),
@@ -4604,6 +4607,17 @@ fn help_to_out(ctx: &ServiceContext, out: &mut Out) {
 /// This is the same write-only repaint the fast boot-time scroll uses, so scrolling is smooth
 /// rather than a black flash + full reprint. Bounded: at most `total` lines, clamped each step.
 fn help_pager(ctx: &ServiceContext, total: usize, rows: usize) {
+    line_pager(ctx, total, rows, &|c, i| help_render_line(c, i, true));
+}
+
+/// The pager, over ANY indexable set of lines.
+///
+/// This was `help`-shaped: it called `help_render_line` directly, so the one screenful-at-a-time
+/// reader in the system could only ever read `help`. `trace ipc` needs exactly the same thing and
+/// there is no reason for a second copy of it, so the caller now supplies how to render line `i`.
+/// Everything else - the in-place repaint, the key handling, the clamping - is unchanged.
+fn line_pager(ctx: &ServiceContext, total: usize, rows: usize,
+              render: &dyn Fn(&ServiceContext, usize)) {
     let page = rows.saturating_sub(1).max(1); // leave one row for the status line
     let max_top = total.saturating_sub(page);
     let mut top = 0usize;
@@ -4611,7 +4625,7 @@ fn help_pager(ctx: &ServiceContext, total: usize, rows: usize) {
     loop {
         ctx.console_write("\x1b[H"); // home - repaint over the old frame, no clear-to-black
         let end = (top + page).min(total);
-        for i in top..end { help_render_line(ctx, i, true); }
+        for i in top..end { render(ctx, i); }
         // Status line (no trailing newline so it parks at the bottom). Scroll keys lead,
         // since holding Up/Down scrolls smoothly (typematic auto-repeat). ESC[J after it
         // wipes any rows left over from a taller previous frame (e.g. the short last page).
@@ -6151,7 +6165,7 @@ fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
 /// roster), `ls` (dir listing), `caps` (held capabilities), `drives` (attached disks), `find`
 /// (search hits) are shell-side, so no wire codec is needed - they pass by value like `status`.
 fn is_record_producer(name: &str) -> bool {
-    matches!(name, "status" | "ls" | "caps" | "drives" | "find" | "observe" | "uptime")
+    matches!(name, "status" | "ls" | "caps" | "drives" | "find" | "observe" | "uptime" | "trace")
 }
 
 /// `ls` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
@@ -6431,6 +6445,18 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), 
             "find"    => match build_find_table(ctx, cwd, arg)  { Some(t) => t, None => return Err(ShellError::Unknown) },
             "observe" => match build_observe_table(ctx, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
             "uptime"  => build_uptime_table(ctx),
+            // `trace ipc` / `trace failures` are record sources; the other subcommands are readers
+            // of live kernel state that print a tree, and a tree is not a table. Piping one of those
+            // is refused loudly rather than quietly yielding the wrong thing.
+            "trace"   => match split_first(arg).0 {
+                "ipc"      => match build_trace_table(ctx, false) { Some(t) => t, None => return Err(ShellError::Unknown) },
+                "failures" => match build_trace_table(ctx, true)  { Some(t) => t, None => return Err(ShellError::Unknown) },
+                other      => {
+                    ctx.console_writeln_fmt(format_args!(
+                        "trace: '{}' is not a record source - pipe 'trace ipc' or 'trace failures'", other));
+                    return Err(ShellError::Unknown);
+                }
+            },
             _         => build_status_table(ctx),
         };
         // Loud on the record bound (§3.12/§26.6): a producer that overran rows/arena is reported,
@@ -6799,27 +6825,52 @@ fn cmd_trace(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
 /// The ring lives in that service, not the kernel - so this is an ordinary request/reply to an
 /// ordinary service, and a logger that is dead or absent is answered with a sentence rather than a
 /// hang (Commandment VIII: a missing dependency RETURNS, loudly).
-fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellError> {
-    let req = [godspeed_sdk::trace::TRACE_OP_DUMP, 40u8];
-    let reply = match ctx.request_with_reply("logger", &Message::from_bytes(&req)) {
+/// Build the trace ring's events as a `Table`.
+///
+/// A TABLE and not printed text, so `trace ipc` is a record source like `status` or `ls`: it renders
+/// as a grid on the console, pages when it is taller than the screen, and pipes into the record verbs
+/// (`trace ipc | where peer=fs`, `| to json`, `| to yaml`, `| count`). One producer, three uses -
+/// the alternative was a printer plus a separate serialiser that would drift apart.
+fn build_trace_table(ctx: &ServiceContext, failures_only: bool) -> Option<Table> {
+    // Ask for exactly what a record `Table` can hold - not a screenful, and not the whole ring.
+    //
+    // The ring keeps 192 events and one reply message could carry ~180 of them, but `REC_MAX_ROWS` is
+    // 64, so asking for more only produced a loud "result exceeded the record bound - truncated" on
+    // every single run. A bound announced once in `trace status` is information; the same bound
+    // announced on every command is noise that trains you to ignore it. So the newest 64 are what a
+    // dump shows, and `trace status` remains the place that says how much history exists.
+    let req = [godspeed_sdk::trace::TRACE_OP_DUMP, REC_MAX_ROWS as u8];
+    let reply = match trace_ask(ctx, &req) {
         Some(r) => r,
         None => {
-            ctx.console_writeln("trace: the logger service is unavailable (it holds the ring)");
-            return Err(ShellError::Unknown);
+            ctx.console_writeln("trace: the logger service did not answer in 3 attempts (it holds the ring)");
+            return None;
         }
     };
     let b = reply.payload_bytes();
     if b.is_empty() {
         ctx.console_writeln("trace: logger returned nothing");
-        return Err(ShellError::Unknown);
+        return None;
     }
     let n = b[0] as usize;
     let ev = godspeed_sdk::trace::EV_LEN;
     let pl = godspeed_sdk::trace::PEER_LEN;
-    let mut t = Table::new(&["seq", "t+s", "peer", "op", "event"]);
-    let mut shown = 0u32;
-    // Time is shown RELATIVE to the oldest event in this dump. The absolute value is an epoch second -
-    // a large number that says nothing on its own; the GAP between events is what a stall looks like.
+    // COLUMN NAMES SAY WHAT THEY HOLD. They were `eseq / t+s / peer / op / event`, which needed the
+    // legend to be readable at all; these need it only for the detail:
+    //   caller  - who made the call, as that service DECLARED itself (`ctx.trace_as`). A service
+    //             cannot ask what it is called (identity is not ambient), and the kernel's unforgeable
+    //             answer - `Message.sender_ep` - is deliberately kernel-internal, so a traced service
+    //             says. That costs nothing in trust: the whole event is already its testimony.
+    //   seq     - the EMITTER'S own event number. Not global, so a mixed dump interleaves several
+    //             sequences and can look unsorted - it is not, rows are in ring order, oldest first.
+    //             A GAP in one service's numbering is that service's dropped events.
+    //   sec     - seconds since the oldest row shown. The stored value is an epoch second, which says
+    //             nothing on its own; the GAP between rows is what a stall looks like.
+    //   peer    - the service that was CALLED, by name (the emitter knew it; see `sdk::trace`).
+    //   op      - byte 0 of the request, that protocol's opcode. The service that owns the protocol
+    //             recorded it; the kernel neither knows nor cares what it means.
+    //   outcome - how the exchange ENDED. One row per exchange, so this is its whole story.
+    let mut t = Table::new(&["seq", "sec", "caller", "peer", "op", "outcome"]);
     let base = if n > 0 && b.len() >= 9 {
         u32::from_le_bytes([b[5], b[6], b[7], b[8]])
     } else {
@@ -6830,20 +6881,26 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
         if o + ev > b.len() { break; }
         let seq = u32::from_le_bytes([b[o], b[o+1], b[o+2], b[o+3]]);
         let at  = u32::from_le_bytes([b[o+4], b[o+5], b[o+6], b[o+7]]);
-        let pname = &b[o+8..o+8+pl];
+        let cname = &b[o+8..o+8+pl];
+        let clen = cname.iter().position(|&c| c == 0).unwrap_or(pl);
+        let pname = &b[o+8+pl..o+8+2*pl];
         let plen = pname.iter().position(|&c| c == 0).unwrap_or(pl);
-        let op  = b[o+8+pl];
-        let kind = b[o+9+pl];
+        let op  = b[o+8+2*pl];
+        let kind = b[o+9+2*pl];
         let kname = match kind {
-            godspeed_sdk::trace::KIND_REQUEST   => "REQUEST",
-            godspeed_sdk::trace::KIND_REPLY     => "REPLY",
-            godspeed_sdk::trace::KIND_TIMEOUT   => "TIMEOUT",
-            godspeed_sdk::trace::KIND_PEER_LOST => "PEER_LOST",
+            godspeed_sdk::trace::KIND_REQUEST    => "REQUEST",
+            godspeed_sdk::trace::KIND_REPLY      => "REPLY",
+            godspeed_sdk::trace::KIND_TIMEOUT    => "TIMEOUT",
+            godspeed_sdk::trace::KIND_PEER_LOST  => "PEER_LOST",
+            godspeed_sdk::trace::KIND_QUEUE_FULL => "QUEUE_FULL",
+            godspeed_sdk::trace::KIND_ABORTED    => "ABORTED",
             _ => "?",
         };
-        // `trace failures` is the same ring, filtered - not a second recording path. The failure
-        // events are the ones a stall investigation starts from (8.6).
-        if failures_only && !matches!(kind, godspeed_sdk::trace::KIND_TIMEOUT | godspeed_sdk::trace::KIND_PEER_LOST) {
+        // `trace failures` is the same ring, FILTERED - not a second recording path. QUEUE_FULL is a
+        // failure to get there, so it belongs; ABORTED is the user changing their mind, so it does not.
+        if failures_only && !matches!(kind, godspeed_sdk::trace::KIND_TIMEOUT
+                                          | godspeed_sdk::trace::KIND_PEER_LOST
+                                          | godspeed_sdk::trace::KIND_QUEUE_FULL) {
             continue;
         }
         // The peer NAME came from the emitter, which knew it: it called `request_with_reply("fs", ..)`.
@@ -6851,17 +6908,57 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
         // (The EMITTER is not named: a service has no ambient identity to assert, which is the
         // capability model working, not a gap. See `sdk::trace`.)
         let peer = t.intern(&pname[..plen]);
+        // A service that never declared itself reads `?`, not a guess (see `sdk::trace`).
+        let caller = if clen == 0 { t.intern(b"?") } else { t.intern(&cname[..clen]) };
         let k = t.intern(kname.as_bytes());
         t.add_row(&[Value::Int(seq as u64), Value::Int(at.saturating_sub(base) as u64),
-                    peer, Value::Int(op as u64), k]);
-        shown += 1;
+                    caller, peer, Value::Int(op as u64), k]);
     }
-    if shown == 0 {
+    Some(t)
+}
+
+/// What the columns mean, printed above the grid on the CONSOLE path only.
+///
+/// Not in the pipe path: `trace ipc | to json` must emit records and nothing else, so a legend there
+/// would be corrupting the stream with prose.
+fn trace_legend(ctx: &ServiceContext) {
+    ctx.console_writeln("  seq = the caller's own event number (a gap = its dropped events)   sec = seconds since the oldest row");
+    ctx.console_writeln("  caller = who called   peer = who was called   op = that protocol's opcode   outcome = how it ended");
+}
+
+fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellError> {
+    let t = match build_trace_table(ctx, failures_only) {
+        Some(t) => t,
+        None    => return Err(ShellError::Unknown),
+    };
+    if t.nrows() == 0 {
         ctx.console_writeln(if failures_only { "trace: no failure events recorded" }
                             else { "trace: no events recorded (is any service granted ipc_send=[\"logger\"]?)" });
         return Ok(());
     }
-    { let mut o = Out::Console; t.to_grid(&mut OutSink { ctx, out: &mut o }); }
+    // PAGE when it does not fit, exactly as `help` does - a ring dump is routinely taller than the
+    // screen, and the framebuffer console has no scrollback, so the top would otherwise be gone
+    // forever. Unknown geometry is not "no terminal": a failed `console_dims` returns 0, and `edit`
+    // already treats that as 24 rows rather than dropping the feature.
+    let (rows, _cols) = ctx.console_dims();
+    let rows = if rows == 0 { 24 } else { rows as usize };
+    let w = t.grid_widths();
+    // 2 legend lines + 1 header + 1 status line.
+    let total = t.nrows() + 1;
+    if total + 3 <= rows {
+        trace_legend(ctx);
+        let mut o = Out::Console;
+        let mut sink = OutSink { ctx, out: &mut o };
+        t.grid_header(&mut sink, &w);
+        for r in 0..t.nrows() { t.grid_row(&mut sink, r, &w); }
+        return Ok(());
+    }
+    trace_legend(ctx);
+    line_pager(ctx, total, rows.saturating_sub(2).max(3), &|c, i| {
+        let mut o = Out::Console;
+        let mut sink = OutSink { ctx: c, out: &mut o };
+        if i == 0 { t.grid_header(&mut sink, &w); } else { t.grid_row(&mut sink, i - 1, &w); }
+    });
     Ok(())
 }
 
@@ -6870,12 +6967,28 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
 /// The drop count is the point. A ring that silently discards is the failure this project just fixed
 /// in the x86 keyboard path; one that reports what it lost is an instrument you can trust the rest of
 /// (invariant 12).
+/// Ask the ring-holding service, RETRYING a busy sink.
+///
+/// A single attempt was reporting a service that is alive and busy as "unavailable". The sink takes
+/// events and control requests on one 16-deep endpoint, so a burst of events can fill it and reject
+/// the reader - which is congestion, not absence, and the two must not be reported the same way
+/// (the same distinction `KIND_QUEUE_FULL` exists for). Bounded: three attempts, then it says so.
+fn trace_ask(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
+    for _ in 0..3 {
+        if let Some(r) = ctx.request_with_reply("logger", &Message::from_bytes(req)) {
+            return Some(r);
+        }
+        ctx.yield_cpu();
+    }
+    None
+}
+
 fn trace_status(ctx: &ServiceContext) -> Result<(), ShellError> {
     let req = [godspeed_sdk::trace::TRACE_OP_STATUS];
-    let reply = match ctx.request_with_reply("logger", &Message::from_bytes(&req)) {
+    let reply = match trace_ask(ctx, &req) {
         Some(r) => r,
         None => {
-            ctx.console_writeln("trace: the logger service is unavailable (it holds the ring)");
+            ctx.console_writeln("trace: the logger service did not answer in 3 attempts (it holds the ring)");
             return Err(ShellError::Unknown);
         }
     };

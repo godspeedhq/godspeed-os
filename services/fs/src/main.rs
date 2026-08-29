@@ -410,6 +410,9 @@ const MOUNT_RETRY_MS: u64 = 20;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // Name this service in the trace ring. It cannot ask what it is called (identity is not ambient),
+    // so a traced service says - see `sdk::trace` for why that costs nothing in trust.
+    ctx.trace_as("fs");
     ctx.log("fs: starting");
 
     // Wait on block-driver's TRUTH, never on a clock (Commandment VIII). `block_capacity` returns

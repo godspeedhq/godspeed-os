@@ -255,6 +255,17 @@ impl Table {
     /// Render as an aligned text grid (the default view). String cells render in full (via the
     /// arena), so a long value is never silently clipped (§3.12).
     pub fn to_grid(&self, out: &mut impl RecordSink) {
+        let w = self.grid_widths();
+        self.grid_header(out, &w);
+        for r in 0..self.nrows { self.grid_row(out, r, &w); }
+    }
+
+    /// Column widths for the grid rendering, computed over EVERY row.
+    ///
+    /// Split out so a caller can render rows one at a time. A pager scrolling a long table needs the
+    /// columns to stay put between frames, which means the widths must come from the whole table and
+    /// not from the slice currently on screen.
+    pub fn grid_widths(&self) -> [usize; REC_MAX_COLS] {
         let mut w = [0usize; REC_MAX_COLS];
         for c in 0..self.ncols { w[c] = self.col_name(c).len(); }
         for r in 0..self.nrows {
@@ -263,22 +274,31 @@ impl Table {
                 if n > w[c] { w[c] = n; }
             }
         }
+        w
+    }
+
+    /// The grid header line, at the widths from [`Table::grid_widths`].
+    pub fn grid_header(&self, out: &mut impl RecordSink, w: &[usize; REC_MAX_COLS]) {
         for c in 0..self.ncols {
             out.put(self.col_name(c));
             pad(out, w[c].saturating_sub(self.col_name(c).len()) + 2);
         }
         out.put(b"\n");
+    }
+
+    /// One row of the grid, at the widths from [`Table::grid_widths`]. An out-of-range `r` writes
+    /// nothing, so a pager asking past the end gets a blank line rather than a panic.
+    pub fn grid_row(&self, out: &mut impl RecordSink, r: usize, w: &[usize; REC_MAX_COLS]) {
+        if r >= self.nrows { return; }
         let mut scratch = [0u8; 24];
-        for r in 0..self.nrows {
-            for c in 0..self.ncols {
-                let n = match self.rows[r][c] {
-                    Value::Str { .. } => { let s = self.cell_str(self.rows[r][c]); out.put(s); s.len() }
-                    v => { let n = fmt_cell(self, v, &mut scratch); out.put(&scratch[..n]); n }
-                };
-                pad(out, w[c].saturating_sub(n) + 2);
-            }
-            out.put(b"\n");
+        for c in 0..self.ncols {
+            let n = match self.rows[r][c] {
+                Value::Str { .. } => { let s = self.cell_str(self.rows[r][c]); out.put(s); s.len() }
+                v => { let n = fmt_cell(self, v, &mut scratch); out.put(&scratch[..n]); n }
+            };
+            pad(out, w[c].saturating_sub(n) + 2);
         }
+        out.put(b"\n");
     }
 
     /// Render as a JSON array of objects (`to json`). Values are plain ASCII today - a real

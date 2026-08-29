@@ -32,14 +32,15 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 /// longest that matters here is `block-driver` (12).
 pub const PEER_LEN: usize = 12;
 
-/// Wire length of one event: seq(4) + at_s(4) + peer[12] + op(1) + kind(1).
+/// Wire length of one event:
+/// seq(4) + at_s(4, STAMPED BY THE SINK) + caller[12] + peer[12] + op(1) + kind(1).
 ///
 /// The peer is carried as a NAME, not an endpoint or a cap slot, and that is the whole point. A cap
 /// slot is local to the emitter and means nothing to a reader; an endpoint id needs a second lookup.
 /// The emitter called `request_with_reply("fs", ...)` - it KNOWS the name, and a name is what a reader
 /// wants. This is the "symbolic" half the requirement asked for, and it is only reachable out here:
 /// the kernel may not interpret a protocol, but the service that owns one may (§4.4, §26.10).
-pub const EV_LEN: usize = 4 + 4 + PEER_LEN + 1 + 1;
+pub const EV_LEN: usize = 4 + 4 + PEER_LEN + PEER_LEN + 1 + 1;
 
 /// The service that holds the ring. A call to THIS peer is never traced: the reader reaches the ring
 /// through it, so recording those calls would fill the ring with the reader's own questions.
@@ -60,6 +61,70 @@ pub const KIND_REPLY: u8 = 2;
 pub const KIND_TIMEOUT: u8 = 3;
 /// The peer's endpoint died while the call was outstanding (`ReplyDead`, §8.6), or the send failed.
 pub const KIND_PEER_LOST: u8 = 4;
+/// The peer is ALIVE and its queue is FULL - congestion, not absence. A distinct kind because
+/// answering it like a lost peer is a real bug this project has already paid for once (`net-stack`
+/// reacquiring a capability that was never stale; see `DeadlineOutcome::QueueFull`).
+pub const KIND_QUEUE_FULL: u8 = 5;
+/// The USER abandoned the wait (`q` at a `ReqOutcome::Aborted` call). Not a failure of anything, and
+/// recorded so a gap in a chain is explained rather than mysterious.
+pub const KIND_ABORTED: u8 = 6;
+
+/// The emitting service's OWN name, as it declared it (`ServiceContext::trace_as`).
+///
+/// # Why the caller is self-declared, and why that costs nothing
+///
+/// A service cannot ask what it is called: there is no name in its context page and no query for it,
+/// because identity is not ambient in this system (3.1). The kernel DOES know - every syscall send
+/// stamps `Message.sender_ep`, the sender's primary endpoint - but that is deliberately
+/// kernel-internal ("never crosses to userspace ... so no ABI change"), and surfacing it would grow
+/// the syscall surface for a diagnostic. It is not worth that.
+///
+/// So the caller says who it is. The objection writes itself - a self-declared name is a claim, not a
+/// fact - and it does not survive contact with what the event already is: a service holding
+/// `ipc_send = ["logger"]` can already write any `peer` and any `outcome` it likes, because the whole
+/// event is its testimony. A `caller` field is exactly as trustworthy as the two fields beside it,
+/// which is to say as trustworthy as the service you granted trace authority to. It opens nothing.
+///
+/// Unset (a service that never called `trace_as`) reads as `?` rather than a guess.
+static CALLER: spin_name::Name = spin_name::Name::new();
+
+/// A fixed 12-byte name cell. No lock: a service is single-threaded, and this is written once at
+/// startup and read on every emit.
+pub mod spin_name {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    /// A `PEER_LEN`-byte name, byte-atomic so a torn read is impossible even in principle.
+    pub struct Name {
+        b: [AtomicU8; super::PEER_LEN],
+    }
+    impl Name {
+        #[allow(clippy::declare_interior_mutable_const)]
+        pub const fn new() -> Self {
+            const Z: AtomicU8 = AtomicU8::new(0);
+            Self { b: [Z; super::PEER_LEN] }
+        }
+        pub fn set(&self, s: &str) {
+            let n = s.len().min(super::PEER_LEN);
+            for i in 0..super::PEER_LEN {
+                let v = if i < n { s.as_bytes()[i] } else { 0 };
+                self.b[i].store(v, Ordering::Relaxed);
+            }
+        }
+        pub fn read_into(&self, out: &mut [u8]) {
+            for i in 0..super::PEER_LEN.min(out.len()) {
+                out[i] = self.b[i].load(Ordering::Relaxed);
+            }
+        }
+        pub fn is_set(&self) -> bool { self.b[0].load(Ordering::Relaxed) != 0 }
+    }
+}
+
+/// Declare the emitting service's own name; see [`CALLER`].
+#[inline]
+pub fn set_caller(name: &str) { CALLER.set(name); }
+
+/// True once this service has declared a name.
+#[inline]
+pub fn caller_set() -> bool { CALLER.is_set() }
 
 /// Whether resolution has been attempted yet. Emission arms itself LAZILY, on the first call, because
 /// a service is handed a context and has no init hook to run in - so there is nowhere to arm it from.
@@ -93,15 +158,19 @@ pub fn sink_slot() -> u32 {
 /// Build one event payload. Split out from the send so the caller owns the buffer and this stays
 /// allocation-free (§26.6.1 - fixed stack, no heap).
 #[inline]
-pub fn encode(at_s: u32, peer: &str, op: u8, kind: u8) -> [u8; 1 + EV_LEN] {
+/// Build one event. **The timestamp field is left ZERO and stamped by the SINK** - reading a clock
+/// here is a CMOS RTC read on the caller's hot path (see `ServiceContext::trace_emit`), and an
+/// observer that costs the observed a millisecond of port I/O per IPC is not an observer, it is a
+/// brake.
+pub fn encode(peer: &str, op: u8, kind: u8) -> [u8; 1 + EV_LEN] {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let mut b = [0u8; 1 + EV_LEN];
     b[0] = TRACE_OP_EVENT;
     b[1..5].copy_from_slice(&seq.to_le_bytes());
-    b[5..9].copy_from_slice(&at_s.to_le_bytes());
+    CALLER.read_into(&mut b[9..9 + PEER_LEN]);
     let n = peer.len().min(PEER_LEN);
-    b[9..9 + n].copy_from_slice(&peer.as_bytes()[..n]);
-    b[9 + PEER_LEN] = op;
-    b[10 + PEER_LEN] = kind;
+    b[9 + PEER_LEN..9 + PEER_LEN + n].copy_from_slice(&peer.as_bytes()[..n]);
+    b[9 + 2 * PEER_LEN] = op;
+    b[10 + 2 * PEER_LEN] = kind;
     b
 }

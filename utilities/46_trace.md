@@ -390,6 +390,138 @@ seq  t+s  peer       op  event
 
 Real traffic, named, with no kernel involvement of any kind.
 
+### What hardware caught that QEMU did not: the ring was empty
+
+The first cut instrumented `request_with_reply`. On the Wyse, after a `selfcheck` and two `ls`
+commands, `trace ipc` still said **no events recorded** - while `fs` was demonstrably answering.
+
+The SDK has **eight** request/reply variants, each an independent implementation, and the shell talks
+to `fs` through `_abortable` and `_deadline` - never the plain one. So nothing was ever emitted for
+the traffic that matters. QEMU had not caught it because the single event it did record came from the
+one `net-stack` call site that happens to use the plain variant, and one green row looked like
+success.
+
+The fix is a **wrapper per variant** rather than an edit inside each body: eight functions with
+several early returns inside a wait loop each, and a wrapper cannot miss an exit because the value
+returned IS the outcome. All eight, not the busy ones - **partial instrumentation is worse than
+none**, because `trace ipc` then shows SOME traffic and silently omits the rest with nothing on screen
+saying which, which is a silent gap in the instrument built to prevent silent gaps (26.4,
+invariant 12).
+
+Two event kinds fell out of doing it completely, because two of the variants already distinguish
+outcomes the original four kinds could not express:
+
+- **`QUEUE_FULL`** - the peer is ALIVE and its queue is full. Congestion, not absence. Recording that
+  as a lost peer is a bug this project has already paid for once (`net-stack` reacquiring a capability
+  that was never stale, backing DHCP off 34 s on a healthy link), so the ring keeps them apart.
+- **`ABORTED`** - the user pressed `q`. Not a failure of anything, and recorded so a gap in a chain is
+  explained rather than mysterious.
+
+`trace failures` shows `QUEUE_FULL` (a request that never arrived) and not `ABORTED` (a change of
+mind).
+
+### What the SUITE caught that neither had: the observer was stealing the shell's core
+
+Instrumenting all eight variants took `osdev test files` from 222/0 to 213/9 - tab completion, `move`
+and `find` timing out, and Enter keystrokes being lost so commands ran together. Four experiments, in
+order, because the first three theories were all wrong:
+
+| Experiment | Result | Ruled out |
+|---|---|---|
+| wrappers + tracing | 213/9 | - |
+| wrappers marked `#[inline]` | 212/10 | the extra frame and the 4 KiB `Message` move |
+| wrappers with the trace calls removed | **222/0** | the wrapper structure itself |
+| the clock read removed from emitter AND sink | 213/9 | the CMOS RTC read |
+| `logger` moved off core 0 | **222/0** | - the answer |
+
+**Every trace event WAKES the sink, and the sink was on core 0 with the shell.** Two events per `fs`
+request preempted the shell twice per round trip; the paths that do many round trips blew their
+window, and the shell was descheduled often enough to stop draining the console.
+
+Three things changed as a result, and each is a rule worth keeping:
+
+1. **The sink does not live on the interactive core.** ARM had already moved `logger` off core 0 for a
+   different reason (keeping the serial writer away from the microframe-timed USB driver); x86 now
+   needs it for this one. An unavailable preferred core falls back to round-robin rather than failing
+   the spawn, so a machine with fewer cores still gets its logger.
+2. **One event per exchange, not two.** A REQUEST plus an outcome doubled the traffic through the
+   sink's single 16-deep endpoint. Every exchange still produces exactly one event carrying its fate,
+   so nothing is lost but the duplicate. A request still IN FLIGHT is therefore not in the ring - and
+   that is the one question the ring was never the right instrument for: `trace blocked` reads it from
+   the kernel, live (mechanism A).
+3. **The sink stamps the time, from a cached clock.** `epoch_secs_monotonic` is a CMOS RTC read on
+   x86 - `wait_update_clear` can spin ~1 ms before seven port-I/O reads - so per-event it would cap
+   the sink near a thousand events a second. `logger` reads the cycle counter per event (one
+   instruction) and refreshes the seconds only when one has actually elapsed.
+
+The reader also **retries** a busy sink three times before reporting it, because a full queue is
+congestion, not absence, and saying "unavailable" about a service that is alive and busy is a lie the
+same size as any other silent fallback.
+
+**`eseq` is the emitter's own counter**, not a global one, so a mixed dump interleaves several
+sequences and looks unsorted. It is not - rows are in ring order, oldest first. The column earns its
+place by making one service's dropped events visible as a gap in its own numbering.
+
+### A row is an EDGE, not a fact: the caller
+
+`peer` alone answers "who was called" and leaves "by whom" to inference - and that inference only
+works while exactly two services hold trace authority. So an event carries the CALLER too, and a dump
+reads as a call graph:
+
+```
+seq  sec  caller  peer          op   outcome
+9    0    shell   fs            4    REPLY
+10   2    shell   net-stack     1    TIMEOUT
+6    2    fs      block-driver  183  REPLY
+```
+
+**The caller is self-declared** (`ctx.trace_as("fs")`, once at startup), and that deserves the
+argument rather than an apology:
+
+- A service **cannot ask** what it is called. There is no name in its context page and no query for
+  one, because identity is not ambient (3.1). This is the capability model being consistent, not a
+  gap.
+- The kernel **does** know, unforgeably: every syscall send stamps `Message.sender_ep`, the sender's
+  primary endpoint. It exists for reply-matching and its comment ends "Kernel-internal: never crosses
+  to userspace ... so no ABI change". Surfacing it would grow the syscall surface for a diagnostic,
+  which is not a trade this project makes.
+- The obvious objection - a self-declared name is a claim, not a fact - **does not survive contact
+  with what the event already is.** A service holding `ipc_send = ["logger"]` can already write any
+  `peer` and any `outcome` it likes, because the whole event is its testimony. `caller` is exactly as
+  trustworthy as the two fields beside it: as trustworthy as the service you granted trace authority
+  to. It opens nothing.
+
+A service that never declares itself reads `?`, which is the honest answer rather than a guess.
+
+### Reading it: pages, pipes, and a legend
+
+`trace ipc` is a **record source**, like `status` or `ls` - one producer feeding three uses, rather
+than a printer plus a serialiser that drift apart:
+
+- **Console**: a grid, with a two-line legend above it.
+- **Taller than the screen**: it pages, with `help`'s keys (up/down, space, `g`/`G`, `q`). The pager
+  was `help`-shaped - it called `help_render_line` directly - and is now given a render closure, so
+  the one screenful-at-a-time reader in the system is shared instead of copied.
+- **Piped**: `trace ipc | to json`, `| to yaml`, `| where caller=fs`, `| where outcome=TIMEOUT`,
+  `| count`, `| sort`. The legend is console-only; a pipe carries records and nothing else.
+
+A dump shows the newest **64** events - what a record `Table` holds - while the ring keeps 192.
+Asking for more only produced "result exceeded the record bound - truncated" on every run, and a bound
+announced every time is noise that trains you to ignore it. `trace status` remains where the true ring
+size and drop count live.
+
+### What the same hardware run says about the ring's limits
+
+`trace failures` came back empty after a 100-round `chaos max-carnage` - 559 kills. That is the design
+working, and worth stating rather than discovering later: **`logger` was itself killed 51 times**, and
+a restarted logger starts with an empty ring. Emission is `try_send`, so events aimed at a dead sink
+are lost too.
+
+For the question this tool exists to answer - *why is this task not progressing, right now* - that is
+correct, and no ring in a restartable service can behave otherwise. For *post-mortem of a storm that
+killed the recorder 51 times*, it cannot help, and only persistence would - which the ring
+deliberately is not (see the `logger` header on why history that survives nothing is the right call).
+
 **Still out of scope, unchanged:** `trace tree <message-id>` needs parent-id propagation through every
 service's request path (§6, and `docs/net-tags-design.md` describes the same problem for
 net-stack <-> nic-driver). It is not made easier or harder by this; it is simply not built.

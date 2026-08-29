@@ -715,7 +715,17 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // That blocks only the core it runs on - and this service was sharing core 0 with `dwc2`,
             // whose split transactions must hit 125 us windows. Moving the writer is the cheap half
             // of the fix; it needs no console rework and it uses the cores this board has.
-            preferred_core:    if cfg!(target_arch = "arm") { 2 } else { 0 },
+            // OFF CORE 0 ON EVERY ARCH. ARM moved it first, for the reason above; x86 has now been
+            // shown to need the same thing for a different one. Every trace event WAKES this service,
+            // and while it sat on core 0 it preempted the shell twice per fs request: `osdev test
+            // files` went 222/0 -> 213/9 with tracing on, tab completion and `find` timing out, and
+            // straight back to 222/0 with nothing changed but this number. A diagnostic sink does not
+            // belong on the interactive core.
+            //
+            // Safe on a machine with fewer cores: an unavailable preferred core falls back to
+            // round-robin (`resolve_placement`), it does NOT fail the spawn - so a 1-core or 2-core
+            // box still gets its logger.
+            preferred_core:    2,
             probe_mode:        0,
             memory_limit:      8 * 1024 * 1024,   // matches logger.toml (a stub sink needs ~none); the
                                                  // contract is the source of truth (audit T1 reconcile)

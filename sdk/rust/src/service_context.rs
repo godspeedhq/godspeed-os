@@ -754,6 +754,14 @@ impl ServiceContext {
     /// Recursion is cut at the source: `logger` itself holds no `logger` send cap, so the sink cannot trace
     /// its own sends, and no event can beget another.
     #[inline]
+    /// Declare this service's own name for the trace ring, once, at startup.
+    ///
+    /// A service cannot ask what it is called - identity is not ambient - so a traced service says.
+    /// Costs nothing in trust: the whole event is already the emitter's testimony (see `crate::trace`).
+    /// A service that never calls this still traces; its events read `?` in the caller column, which
+    /// is the honest answer rather than a guess.
+    pub fn trace_as(&self, name: &str) { crate::trace::set_caller(name); }
+
     fn trace_emit(&self, peer: &str, op: u8, kind: u8) {
         // Arm lazily, ONCE. A service is handed a context with no init hook to run in, so there is
         // nowhere else to resolve from. A service whose contract does not grant `ipc_send =
@@ -774,15 +782,187 @@ impl ServiceContext {
         if peer == crate::trace::SINK_NAME {
             return;
         }
-        // Milliseconds are not available portably; seconds-since-boot is, on every arch (§ the
-        // `observe` clock note). Truncated to u32, which wraps after ~136 years of uptime.
-        let at = self.epoch_secs_monotonic() as u32;
-        let ev = crate::trace::encode(at, peer, op, kind);
+        // NO CLOCK READ HERE. `epoch_secs_monotonic` is a full CMOS RTC read: `wait_update_clear`
+        // spins until the update-in-progress flag clears (up to ~1 ms), then seven port-I/O reads,
+        // repeated until two agree. Two of those per request/reply turned `ls`, `move`, `find` and tab
+        // completion into TIMEOUTS, and cost the shell so much time inside the kernel that it stopped
+        // draining the console and lost Enter keystrokes. Measured, not guessed: `osdev test files`
+        // was 222/0 before, 213/9 with the clock read, 222/0 again without it.
+        //
+        // The SINK stamps the event instead. `logger` has to wake to receive it either way, so the
+        // cost lands on the service whose job this is rather than on every service that talks to
+        // anyone - and the caller already used `try_send` and did not wait. An observer must not be
+        // able to slow the thing it observes, and a millisecond of port I/O per IPC is exactly that.
+        let ev = crate::trace::encode(peer, op, kind);
         let _ = self.try_send_by_handle(CapHandle(slot), &crate::ipc::Message::from_bytes(&ev));
     }
 
+    // ---------------------------------------------------------------------------
+    // The request/reply family: each wraps its `_inner` implementation with one
+    // trace event on the way in and one on the way out.
+    // ---------------------------------------------------------------------------
+    //
+    // THESE ARE WRAPPERS AND NOT EDITS TO EACH BODY, deliberately. There are eight of these, each an
+    // independent implementation with several early returns inside a wait loop; instrumenting the
+    // bodies means finding every exit in eight functions and getting all of them right, forever. A
+    // wrapper cannot miss one - the value returned IS the outcome.
+    //
+    // Instrumenting them ALL is also deliberate. The first cut traced only `request_with_reply`, and
+    // on hardware that produced an EMPTY ring while the shell was busily talking to `fs` - because the
+    // shell uses `_abortable` and `_deadline`, not the plain one. Partial instrumentation is worse
+    // than none: `trace ipc` then shows SOME traffic and silently omits the rest, with nothing on
+    // screen saying which. That is a silent gap in the instrument, which is the exact failure this
+    // ring exists to prevent (26.4, invariant 12).
+    //
+    // `op` is byte 0 of OUR OWN message. A service is entitled to interpret its own protocol; the
+    // kernel is not, and that asymmetry is the whole reason this lives here rather than at the
+    // routing point (4.4, 26.10).
 
-    pub fn request_with_reply(
+    // `#[inline]` on every wrapper below is LOAD-BEARING, not decoration. `Message` is 4 KiB by
+    // value, so an un-inlined wrapper adds a whole extra payload move to each request - and the shell
+    // paths that do many round trips (tab completion listing a directory, `move`, `find` descending)
+    // went from passing to timing out on it. Measured, not assumed: `osdev test files` was 222/0
+    // before the wrappers, 213/9 after, and 213/9 again with tracing DISABLED - so the cost was the
+    // restructuring, never the emission.
+    #[inline]
+    fn trace_out(&self, peer: &str, op: u8, kind: u8) { self.trace_emit(peer, op, kind); }
+
+    /// The op byte of an outgoing request. NO EVENT IS EMITTED HERE.
+    ///
+    /// One event per exchange, recording how it ENDED, not two recording that it started and how it
+    /// ended. Two doubled the traffic through the sink's single 16-deep endpoint, and the sink drains
+    /// on its own core's schedule - so the flood crowded out the READER's own request and `trace
+    /// status` reported a service that was alive and busy as "unavailable". Every exchange still
+    /// produces exactly one event carrying its fate (REPLY / TIMEOUT / PEER_LOST / QUEUE_FULL /
+    /// ABORTED), so nothing is lost but the duplicate.
+    ///
+    /// A request still IN FLIGHT is therefore not in the ring - and that is the one question the ring
+    /// was never the right instrument for: `trace blocked` reads it from the kernel, live, which is
+    /// what a hang needs (`utilities/46_trace.md` mechanism A).
+    #[inline]
+    fn trace_in(&self, _peer: &str, msg: &crate::ipc::Message) -> u8 {
+        msg.payload_bytes().first().copied().unwrap_or(0)
+    }
+
+    /// Synchronous request/reply on the caller own endpoint. Blocks until the reply arrives, or until
+    /// the kernel wakes it with `ReplyDead` because the replier died (8.6) - it never hangs.
+    #[inline]
+    pub fn request_with_reply(&self, peer: &str, msg: &crate::ipc::Message)
+        -> Option<crate::ipc::Message>
+    {
+        let op = self.trace_in(peer, msg);
+        let out = self.request_with_reply_inner(peer, msg);
+        // No deadline on this variant, so `None` is always a lost peer, never a timeout.
+        self.trace_out(peer, op, if out.is_some() { crate::trace::KIND_REPLY }
+                                 else { crate::trace::KIND_PEER_LOST });
+        out
+    }
+
+    /// `request_with_reply_call`, saying WHY it failed instead of collapsing everything to `None`.
+    #[inline]
+    pub fn request_with_reply_call_err(&self, peer: &str, msg: &crate::ipc::Message, max_secs: i64)
+        -> Result<Option<crate::ipc::Message>, crate::ipc::IpcError>
+    {
+        let op = self.trace_in(peer, msg);
+        let out = self.request_with_reply_call_err_inner(peer, msg, max_secs);
+        self.trace_out(peer, op, match &out {
+            Ok(Some(_)) => crate::trace::KIND_REPLY,
+            Ok(None)    => crate::trace::KIND_TIMEOUT,
+            Err(_)      => crate::trace::KIND_PEER_LOST,
+        });
+        out
+    }
+
+    /// Bounded request/reply that decodes straight into the caller buffer.
+    ///
+    /// This variant collapses "the deadline passed" and "the send never left" into one `None`, so the
+    /// ring records both as TIMEOUT. Where that difference matters the caller should be using
+    /// `_call_err` or `_deadline_outcome`, which keep it - and so does the ring.
+    #[inline]
+    pub fn request_with_reply_deadline_into(
+        &self, peer: &str, req: &[u8], buf: &mut [u8], max_secs: i64,
+    ) -> Option<usize> {
+        let op = req.first().copied().unwrap_or(0);
+        let out = self.request_with_reply_deadline_into_inner(peer, req, buf, max_secs);
+        self.trace_out(peer, op, if out.is_some() { crate::trace::KIND_REPLY }
+                                 else { crate::trace::KIND_TIMEOUT });
+        out
+    }
+
+    /// Bounded request/reply. `None` is "no answer within the deadline" (see `_into` on the collapse).
+    #[inline]
+    pub fn request_with_reply_deadline(
+        &self, peer: &str, msg: &crate::ipc::Message, max_secs: i64,
+    ) -> Option<crate::ipc::Message> {
+        let op = self.trace_in(peer, msg);
+        let out = self.request_with_reply_deadline_inner(peer, msg, max_secs);
+        self.trace_out(peer, op, if out.is_some() { crate::trace::KIND_REPLY }
+                                 else { crate::trace::KIND_TIMEOUT });
+        out
+    }
+
+    /// `request_with_reply_deadline` with a millisecond budget.
+    #[inline]
+    pub fn request_with_reply_ms(
+        &self, peer: &str, msg: &crate::ipc::Message, max_ms: u64,
+    ) -> Option<crate::ipc::Message> {
+        let op = self.trace_in(peer, msg);
+        let out = self.request_with_reply_ms_inner(peer, msg, max_ms);
+        self.trace_out(peer, op, if out.is_some() { crate::trace::KIND_REPLY }
+                                 else { crate::trace::KIND_TIMEOUT });
+        out
+    }
+
+    /// Bounded request/reply that distinguishes every way it can fail.
+    #[inline]
+    pub fn request_with_reply_deadline_outcome(
+        &self, peer: &str, msg: &crate::ipc::Message, max_secs: i64,
+    ) -> DeadlineOutcome {
+        let op = self.trace_in(peer, msg);
+        let out = self.request_with_reply_deadline_outcome_inner(peer, msg, max_secs);
+        self.trace_out(peer, op, match &out {
+            DeadlineOutcome::Reply(_)   => crate::trace::KIND_REPLY,
+            DeadlineOutcome::SendFailed => crate::trace::KIND_PEER_LOST,
+            DeadlineOutcome::QueueFull  => crate::trace::KIND_QUEUE_FULL,
+            DeadlineOutcome::Timeout    => crate::trace::KIND_TIMEOUT,
+        });
+        out
+    }
+
+    /// Bounded request/reply the user can abandon with `q`.
+    #[inline]
+    pub fn request_with_reply_abortable(
+        &self, peer: &str, msg: &crate::ipc::Message, max_secs: i64,
+    ) -> ReqOutcome {
+        let op = self.trace_in(peer, msg);
+        let out = self.request_with_reply_abortable_inner(peer, msg, max_secs);
+        self.trace_out(peer, op, match &out {
+            ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
+            ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
+            ReqOutcome::Timeout  => crate::trace::KIND_TIMEOUT,
+        });
+        out
+    }
+
+    /// `request_with_reply_abortable`, plus a callback when the wait starts to linger.
+    #[inline]
+    pub fn request_with_reply_qhint(
+        &self, peer: &str, msg: &crate::ipc::Message, hint_after_secs: i64, max_secs: i64,
+        on_linger: impl FnOnce(),
+    ) -> ReqOutcome {
+        let op = self.trace_in(peer, msg);
+        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, on_linger);
+        self.trace_out(peer, op, match &out {
+            ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
+            ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
+            ReqOutcome::Timeout  => crate::trace::KIND_TIMEOUT,
+        });
+        out
+    }
+
+
+
+    fn request_with_reply_inner(
         &self,
         peer: &str,
         msg:  &crate::ipc::Message,
@@ -791,19 +971,9 @@ impl ServiceContext {
         let self_grant = self.self_grant_handle()?;
         let reply_cap = self.derive_cap(self_grant)?;
         let recv = self.recv_handle()?;
-        // TRACE: the request going out, and below, how it ended. One relaxed load when this service
-        // holds no `logger` send cap (see `crate::trace`). `op` is byte 0 of OUR OWN message - this service
-        // is entitled to interpret its own protocol, and the kernel is not, which is precisely why the
-        // instrumentation lives here rather than at the routing point (§4.4, §26.10).
-        let op0 = msg.payload_bytes().first().copied().unwrap_or(0);
-        self.trace_emit(peer, op0, crate::trace::KIND_REQUEST);
         match crate::ipc::call(target, reply_cap, recv, msg) {
-            Ok(reply) => {
-                self.trace_emit(peer, op0, crate::trace::KIND_REPLY);
-                Some(reply)
-            }
+            Ok(reply) => Some(reply),
             Err(_) => {
-                self.trace_emit(peer, op0, crate::trace::KIND_PEER_LOST);
                 // Send failed (dead endpoint) or the peer died before replying (ReplyDead): the
                 // embedded reply cap may not have been transferred, so reclaim it (remove_cap is
                 // idempotent if the kernel already moved it out on a successful send). Without this, a
@@ -918,7 +1088,7 @@ impl ServiceContext {
     /// then reports it as the PEER's fault - `net-stack` blamed the driver for refusing frames the wire
     /// showed it had sent - and there is no way to tell a send that never left from a reply that never
     /// came. `Ok(None)` is the deadline passing; `Err(e)` is the send failing, and `e` says how.
-    pub fn request_with_reply_call_err(&self, peer: &str, msg: &crate::ipc::Message, max_secs: i64)
+    fn request_with_reply_call_err_inner(&self, peer: &str, msg: &crate::ipc::Message, max_secs: i64)
         -> Result<Option<crate::ipc::Message>, crate::ipc::IpcError>
     {
         let target = match self.find_send_slot(peer) {
@@ -948,7 +1118,7 @@ impl ServiceContext {
         }
     }
 
-    pub fn request_with_reply_deadline_into(
+    fn request_with_reply_deadline_into_inner(
         &self, peer: &str, req: &[u8], buf: &mut [u8], max_secs: i64,
     ) -> Option<usize> {
         let target = CapHandle(self.find_send_slot(peer)?);
@@ -1052,7 +1222,7 @@ impl ServiceContext {
         Err(last)
     }
 
-    pub fn request_with_reply_deadline(
+    fn request_with_reply_deadline_inner(
         &self,
         peer: &str,
         msg:  &crate::ipc::Message,
@@ -1106,7 +1276,7 @@ impl ServiceContext {
     ///
     /// No new kernel surface: this is the same userspace poll the seconds variants use, with a
     /// different clock read in the deadline test.
-    pub fn request_with_reply_ms(
+    fn request_with_reply_ms_inner(
         &self,
         peer: &str,
         msg:  &crate::ipc::Message,
@@ -1141,7 +1311,7 @@ impl ServiceContext {
     /// the deadline (see [`DeadlineOutcome`]). Same bounded, RTC-deadline wait; use this when a caller
     /// must reacquire+retry a *restarted* peer (`SendFailed`) but must NOT double the wait on a merely
     /// *silent* one (`Timeout`).
-    pub fn request_with_reply_deadline_outcome(
+    fn request_with_reply_deadline_outcome_inner(
         &self,
         peer: &str,
         msg:  &crate::ipc::Message,
@@ -1189,7 +1359,7 @@ impl ServiceContext {
     /// `net` "0.0.0.0 / 00:00 MAC" bug that drain closes). Sends the request ONCE (no re-trigger). Use for
     /// any interactive command that blocks on a peer (the "q to quit" rule, `utilities/0_conventions.md`).
     /// A service with no console foreground never sees input, so this degrades to the plain deadline wait.
-    pub fn request_with_reply_abortable(
+    fn request_with_reply_abortable_inner(
         &self,
         peer: &str,
         msg:  &crate::ipc::Message,
@@ -1257,7 +1427,7 @@ impl ServiceContext {
     /// `request_with_reply_abortable` (q/Q/ESC -> `Aborted` immediately; the request is sent once and
     /// a late reply is drained atop the next abortable/qhint request). The hint text lives in the
     /// caller's closure, so this stays mechanism - the SDK provides the *timing*, the caller the UX.
-    pub fn request_with_reply_qhint(
+    fn request_with_reply_qhint_inner(
         &self,
         peer: &str,
         msg:  &crate::ipc::Message,

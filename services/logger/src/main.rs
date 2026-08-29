@@ -46,7 +46,7 @@
 use godspeed_sdk::trace::{EV_LEN, PEER_LEN, TRACE_OP_DUMP, TRACE_OP_EVENT, TRACE_OP_STATUS};
 use godspeed_sdk::{Message, ServiceContext};
 
-/// Events retained. 192 x 22 B is a little over 4 KiB, inside this service's existing footprint.
+/// Events retained. 192 x 34 B is about 6.5 KiB, inside this service's existing footprint.
 ///
 /// Sized for "what just happened", which is the question a stalled chain asks. Deliberately NOT sized
 /// for "what happened a minute ago": under load that needs either a much larger ring or filtering at
@@ -60,6 +60,10 @@ const RING: usize = 192;
 struct Ev {
     seq: u32,
     at_s: u32,
+    /// Who made the call, as that service declared itself (`ServiceContext::trace_as`). A service
+    /// cannot ask what it is called - identity is not ambient - so a traced one says. Exactly as
+    /// trustworthy as the two fields below, because the whole event is the emitter's testimony.
+    caller: [u8; PEER_LEN],
     /// The PEER'S NAME, as the emitter knew it. Not an endpoint and not a cap slot: a slot is local to
     /// the emitter and means nothing here, and a name is what a reader actually wants.
     peer: [u8; PEER_LEN],
@@ -85,6 +89,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut total = 0u64; // events ever accepted
     let mut dropped = 0u64; // events overwritten before being read
 
+    // The event clock, CACHED. `epoch_secs_monotonic` is a CMOS RTC read on x86 - `wait_update_clear`
+    // can spin ~1 ms before seven port-I/O reads - so calling it per event would cap this sink at
+    // roughly a thousand events a second and drop the rest under a storm. The cycle counter is one
+    // instruction, so read THAT every time and refresh the seconds only when a second has actually
+    // passed. Events within the same second share a stamp, which is exactly the resolution the field
+    // has anyway.
+    let per_sec = ctx.duration_cycles(1000);
+    let mut at_s = ctx.epoch_secs_monotonic() as u32;
+    let mut at_tsc = ctx.read_tsc();
+
+    ctx.trace_as("logger");
     ctx.log("logger: ready (drains its endpoint; holds the IPC trace ring)");
 
     loop {
@@ -99,6 +114,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // observability path, and the opposite of the one made on a correctness path.
             TRACE_OP_EVENT if b.len() >= 1 + EV_LEN => {
                 let e = &b[1..1 + EV_LEN];
+                let tsc = ctx.read_tsc();
+                if tsc.wrapping_sub(at_tsc) >= per_sec {
+                    at_s = ctx.epoch_secs_monotonic() as u32;
+                    at_tsc = tsc;
+                }
                 if next == RING {
                     next = 0;
                 }
@@ -106,24 +126,31 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if total >= RING as u64 {
                     dropped += 1;
                 }
+                let mut caller = [0u8; PEER_LEN];
+                caller.copy_from_slice(&e[8..8 + PEER_LEN]);
                 let mut peer = [0u8; PEER_LEN];
-                peer.copy_from_slice(&e[8..8 + PEER_LEN]);
+                peer.copy_from_slice(&e[8 + PEER_LEN..8 + 2 * PEER_LEN]);
                 ring[next] = Ev {
                     seq: u32::from_le_bytes([e[0], e[1], e[2], e[3]]),
-                    at_s: u32::from_le_bytes([e[4], e[5], e[6], e[7]]),
+                    // STAMPED HERE, not by the emitter: putting a clock read on every service's
+                    // request path made the shell drop keystrokes. This service has to wake to
+                    // receive the event anyway, so the cost lands where the job is - and it is the
+                    // cached clock above, not a per-event RTC read.
+                    at_s,
+                    caller,
                     peer,
-                    op: e[8 + PEER_LEN],
-                    kind: e[9 + PEER_LEN],
+                    op: e[8 + 2 * PEER_LEN],
+                    kind: e[9 + 2 * PEER_LEN],
                 };
                 next += 1;
                 total += 1;
             }
             // `trace ipc` / `trace failures` - the most recent events, oldest of the tail first.
             TRACE_OP_DUMP => {
-                let want = if b.len() >= 2 { b[1] as usize } else { 32 };
+                let want = if b.len() >= 2 { b[1] as usize } else { 110 };
                 let have = (total as usize).min(RING);
-                let n = want.min(have).min(32); // 32 x 22 = 704 B, inside one message
-                let mut out = [0u8; 1 + 32 * EV_LEN];
+                let n = want.min(have).min(110); // 110 x 34 = 3740 B, inside one 4 KiB message
+                let mut out = [0u8; 1 + 110 * EV_LEN];
                 out[0] = n as u8;
                 for i in 0..n {
                     let idx = (next + RING - n + i) % RING;
@@ -131,9 +158,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     let o = 1 + i * EV_LEN;
                     out[o..o + 4].copy_from_slice(&e.seq.to_le_bytes());
                     out[o + 4..o + 8].copy_from_slice(&e.at_s.to_le_bytes());
-                    out[o + 8..o + 8 + PEER_LEN].copy_from_slice(&e.peer);
-                    out[o + 8 + PEER_LEN] = e.op;
-                    out[o + 9 + PEER_LEN] = e.kind;
+                    out[o + 8..o + 8 + PEER_LEN].copy_from_slice(&e.caller);
+                    out[o + 8 + PEER_LEN..o + 8 + 2 * PEER_LEN].copy_from_slice(&e.peer);
+                    out[o + 8 + 2 * PEER_LEN] = e.op;
+                    out[o + 9 + 2 * PEER_LEN] = e.kind;
                 }
                 reply(&ctx, &out[..1 + n * EV_LEN]);
             }
