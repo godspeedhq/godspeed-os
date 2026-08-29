@@ -179,8 +179,19 @@ fn print_state(
     // --- RAM ---
     let free_frames  = ctx.inspect_kernel_free_frames();
     let total_frames = ctx.inspect_kernel_total_frames();
-    // saturating_sub: defensive against free_frames ever exceeding total (a kernel accounting
-    // slip would otherwise underflow to a ~2^44 MiB garbage value, as seen after a heavy carnage).
+    // `saturating_sub` alone was a SILENT FALLBACK, and it hid a real fault. It was added to stop an
+    // underflow printing ~2^44 MiB after a heavy carnage - correct as far as it went, but the result
+    // is "0 KiB used / 8 GiB total (0%)", which is not obviously wrong. It is a believable number, so
+    // it gets believed, and the accounting slip behind it stays invisible (invariant 12, 26.7).
+    //
+    // The clamp stays - a garbage number helps nobody either - but the CONDITION it clamps is now
+    // reported. `free > total` is impossible if the allocator is consistent, so saying so, with both
+    // counts, turns a wrong-looking display into the diagnosis.
+    // `>=`, not `>`: EQUAL is just as impossible while a task is running. Every live service holds
+    // mapped frames, so `free == total` means nothing is being accounted as allocated at all - and it
+    // renders as the same believable "0 KiB used". Catching both also says which one this is, which
+    // is the first thing worth knowing about the drift.
+    let inconsistent = free_frames >= total_frames;
     let used_bytes   = total_frames.saturating_sub(free_frames) * FRAME_SIZE;
     let total_mib    = (total_frames * FRAME_SIZE) / (1024 * 1024);
     // Show total in MiB under 1 GiB, GiB otherwise (avoids "0 GiB" for small RAM).
@@ -227,6 +238,21 @@ fn print_state(
     ctx.console_line_fmt(live, format_args!(
         "{}UPTIME: {}d {:02}:{:02}:{:02}", p, up / 86400, (up / 3600) % 24, (up / 60) % 60, up % 60));
 
+    // NO BASELINE = NOT MEASURABLE, and it must say so rather than print zeros.
+    //
+    // CPU% is a share of elapsed cycles between two samples, so the FIRST sample has no denominator.
+    // `observe now` takes exactly one, so every core and every task read "0%" - a whole screen of
+    // zeros that looks like a perfectly idle machine, which is a believable and wrong answer. (The
+    // MODE_NOW comment at the top of this file claims the snapshot shows cumulative-since-boot; it
+    // does not, and this is the honest version of what it actually has.)
+    //
+    // Same rule as the RAM line below: a number that cannot be computed is reported as unavailable,
+    // never as a zero it did not earn (invariant 12).
+    if elapsed_cyc == 0 {
+        ctx.console_line_fmt(live, format_args!(
+            "{}CPU: not measurable from a single snapshot - it is a share of elapsed time, and this is the first sample (run the live view for rates)", p));
+    } else {
+
     // Build CPU summary line: "C0  98%  C1  99%  ...  total (49%)"
     let mut cpu_line = [0u8; 128];
     let mut pos = 0usize;
@@ -247,11 +273,22 @@ fn print_state(
     if let Ok(s) = core::str::from_utf8(&cpu_line[..pos]) {
         ctx.console_line_fmt(live, format_args!("{}CPU: {}", p, s));
     }
+    }
 
-    ctx.console_line_fmt(live, format_args!(
-        "{}RAM: {} {} used / {} {} total ({}%)",
-        p, used_val, used_unit, total_val, total_unit, used_pct,
-    ));
+    if inconsistent {
+        // Say what is wrong and show the raw counts, rather than print a plausible zero. Frames, not
+        // MiB, because the fault is in the counts themselves and converting them hides the size of
+        // the drift (see the note above the clamp).
+        ctx.console_line_fmt(live, format_args!(
+            "{}RAM: ACCOUNTING INCONSISTENT - free {} frames vs total {} (excess {}); used is unknowable, not 0",
+            p, free_frames, total_frames, free_frames - total_frames,
+        ));
+    } else {
+        ctx.console_line_fmt(live, format_args!(
+            "{}RAM: {} {} used / {} {} total ({}%)",
+            p, used_val, used_unit, total_val, total_unit, used_pct,
+        ));
+    }
 
     // --- Task table ---
     ctx.console_line_fmt(live, format_args!(
