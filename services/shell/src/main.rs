@@ -1272,12 +1272,47 @@ impl Line {
 
     /// Reprint from the cursor to end-of-line, erase any stale tail (`ESC[K`), then
     /// step the cursor back to `cur`. Used after an insert/delete shifts the tail.
-    fn redraw_tail(&self, ctx: &ServiceContext) {
-        if self.cur < self.len {
-            ctx.console_write(core::str::from_utf8(&self.buf[self.cur..self.len]).unwrap_or(""));
+    /// Echo one line edit as a SINGLE console message: `lead`, the tail behind the cursor, an
+    /// optional erase, and the backspaces that put the cursor back.
+    ///
+    /// Every `console_write` is an IPC message to the `console` service, whose endpoint queue is 16
+    /// deep (§8.5). This used to cost 2 + n messages per keystroke - the character, an unconditional
+    /// `ESC[K`, and one backspace per tail character - so typing fast filled that queue in a handful
+    /// of keys. A full queue BLOCKS the sender (`BlockedOnSend`), and a blocked shell is not calling
+    /// `ConsoleRead`, so keystrokes piled into the kernel's input ring until it overflowed and dropped
+    /// them. That is the "keyboard trips when you bash it" reported from the Wyse. One message per
+    /// edit removes the pressure at its source rather than absorbing it downstream.
+    ///
+    /// `erase` is passed only when the line SHRANK (backspace, delete), which is the only case that
+    /// leaves a stale cell to the right of the reprinted tail. An insert grows the line, so the erase
+    /// is pure cost there - and it was being paid on every single character typed.
+    fn echo_edit(&self, ctx: &ServiceContext, lead: &[u8], erase: bool) {
+        let t = self.len - self.cur;
+        // `console_write` caps a message at 256 bytes, so a tail too long to batch falls back to the
+        // unbatched path below - correct, just chattier, and only reachable when editing near the
+        // start of a line more than half the maximum length.
+        if lead.len() + 2 * t + 3 <= 256 {
+            let mut b = [0u8; 256];
+            let mut n = 0;
+            b[n..n + lead.len()].copy_from_slice(lead);
+            n += lead.len();
+            b[n..n + t].copy_from_slice(&self.buf[self.cur..self.len]);
+            n += t;
+            if erase {
+                b[n..n + 3].copy_from_slice(b"\x1b[K");
+                n += 3;
+            }
+            for _ in 0..t {
+                b[n] = 0x08;
+                n += 1;
+            }
+            if n > 0 { ctx.console_write(core::str::from_utf8(&b[..n]).unwrap_or("")); }
+            return;
         }
-        ctx.console_write("\x1b[K"); // erase whatever the old (possibly longer) tail left
-        for _ in self.cur..self.len { ctx.console_write("\x08"); }
+        if !lead.is_empty() { ctx.console_write(core::str::from_utf8(lead).unwrap_or("")); }
+        if t > 0 { ctx.console_write(core::str::from_utf8(&self.buf[self.cur..self.len]).unwrap_or("")); }
+        if erase { ctx.console_write("\x1b[K"); }
+        for _ in 0..t { ctx.console_write("\x08"); }
     }
 
     /// Insert a printable byte at the cursor.
@@ -1296,10 +1331,9 @@ impl Line {
         self.buf[self.cur] = b;
         self.len += 1;
         self.cur += 1;
-        // Echo the inserted byte, then redraw the shifted tail behind it.
-        let s = [b];
-        ctx.console_write(core::str::from_utf8(&s).unwrap_or(""));
-        self.redraw_tail(ctx);
+        // Echo the inserted byte and the shifted tail as ONE message. No erase: an insert GROWS the
+        // line, so the reprinted tail is longer than what it replaces and nothing stale can remain.
+        self.echo_edit(ctx, &[b], false);
     }
 
     /// Delete the character before the cursor (Backspace).
@@ -1308,8 +1342,9 @@ impl Line {
         for i in self.cur..self.len { self.buf[i - 1] = self.buf[i]; }
         self.len -= 1;
         self.cur -= 1;
-        ctx.console_write("\x08"); // step left onto the deleted cell
-        self.redraw_tail(ctx);
+        // Step left onto the deleted cell, reprint the tail, erase the cell it no longer covers -
+        // one message. The erase IS needed here: the line shrank, so the tail leaves one stale cell.
+        self.echo_edit(ctx, b"\x08", true);
     }
 
     /// Delete the character at the cursor (the Delete key - forward delete).
@@ -1317,7 +1352,7 @@ impl Line {
         if self.cur >= self.len { return; }
         for i in (self.cur + 1)..self.len { self.buf[i - 1] = self.buf[i]; }
         self.len -= 1;
-        self.redraw_tail(ctx);
+        self.echo_edit(ctx, b"", true);
     }
 
     fn left(&mut self, ctx: &ServiceContext) {

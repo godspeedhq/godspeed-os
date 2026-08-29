@@ -880,7 +880,18 @@ pub fn run(image_path: &Path, smp: u32) {
     esc(&mut write_half, b"\x1b[3~");                                // Delete
     send(&mut write_half, b"\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("ABC") && !r.contains("ZABC"), "home + right + Delete: forward-delete mid-line (echo ABC)"),
+        // Assert on the command's OUTPUT LINE, not on the whole capture.
+        //
+        // The capture includes the raw ECHO of what was typed, which necessarily contains the literal
+        // "ZABC" - the user typed it. This used to pass anyway, by accident: the shell emitted an
+        // `ESC[K` after every keystroke, which fragmented the echo into "Z\x1b[KA\x1b[KB\x1b[KC" so the
+        // substring never appeared. Removing that per-keystroke erase (it was costing an IPC message
+        // per character and overflowing the console queue, which dropped keystrokes) makes the echo
+        // contiguous and the old assertion trips on the echo rather than on the result.
+        //
+        // What the test MEANS is "the shell executed `echo ABC`, not `echo ZABC`", and that is visible
+        // in the output line the command produced, on its own line after the newline Enter emitted.
+        Some(r) => check!(r.contains("\nABC") && !r.contains("\nZABC"), "home + right + Delete: forward-delete mid-line (echo ABC)"),
         None    => { println!("shell-test: FAIL - timed out after home/delete edit"); fail += 1; }
     }
     // Bare ESC clears the line: type "garbage", press ESC (no following byte → bare ESC),

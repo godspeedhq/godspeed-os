@@ -730,6 +730,13 @@ const COM1_RX_BUF_SIZE: usize = 64;
 // only writes to indices [tail, next_tail) and the consumer only reads from [head, head+1).
 // The atomic head/tail ensure visibility across cores via Release/Acquire ordering.
 static mut COM1_RX_BUF: [u8; COM1_RX_BUF_SIZE] = [0u8; COM1_RX_BUF_SIZE];
+
+/// Keystrokes discarded because the ring was full. Counted so a dropped key is a reportable
+/// fact rather than a silence the user has to describe as "it trips sometimes".
+static RX_DROPPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// How many keystrokes the input ring has dropped since boot. 0 is the only good answer.
+pub fn console_input_dropped() -> u32 { RX_DROPPED.load(core::sync::atomic::Ordering::Relaxed) }
 static COM1_RX_HEAD: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static COM1_RX_TAIL: core::sync::atomic::AtomicUsize =
@@ -887,7 +894,22 @@ pub unsafe fn uart_rx_push(b: u8) {
     let head = COM1_RX_HEAD.load(Ordering::Acquire);
     let next_tail = (tail + 1) % COM1_RX_BUF_SIZE;
     if next_tail == head {
-        return; // buffer full - drop byte
+        // A DROPPED KEYSTROKE IS A FAILURE, so say so (invariant 12).
+        //
+        // This used to `return` and nothing more. The byte vanished with no counter and no log, so a
+        // full ring looked exactly like a flaky keyboard - "it trips sometimes when you bash it" -
+        // and left nothing in a 15000-line serial capture to find. AArch64 has counted and reported
+        // this since its ring was written (`arch/aarch64/uart_rx.rs`); x86 was the inconsistent one.
+        //
+        // Reported on the FIRST drop only. This runs in the IRQ handler, so it must not turn a full
+        // ring into a flood of logging that keeps the ring full; the running total is available to
+        // whoever wants the magnitude.
+        if RX_DROPPED.fetch_add(1, Ordering::Relaxed) == 0 {
+            crate::kprintln!(
+                "x86_64: console input ring FULL - a keystroke was dropped (nothing is draining it)"
+            );
+        }
+        return;
     }
     // SAFETY: tail index is within COM1_RX_BUF bounds; only this producer writes to it.
     unsafe { COM1_RX_BUF[tail] = b; }
