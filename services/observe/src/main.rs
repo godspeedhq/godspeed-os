@@ -90,7 +90,6 @@ fn run_live(
     // Home + paint the first frame immediately.
     ctx.console_write("\x1b[H");
     print_state(ctx, prev_core_active, prev_core_total, prev_task_ticks, prev_tsc, true);
-    ctx.console_write("\x1b[J"); // erase below the frame - see the repaint loop below
 
     // Pace repaints by the monotonic WALL CLOCK (~1 s), not a raw TSC-cycle delta. The cycle approach
     // assumed read_tsc() ran at ~2 GHz; on ARM read_tsc() is the generic timer (1 MHz on the Pi 2), so
@@ -110,21 +109,6 @@ fn run_live(
             last = now;
             ctx.console_write("\x1b[H");
             print_state(ctx, prev_core_active, prev_core_total, prev_task_ticks, prev_tsc, true);
-            // ERASE BELOW THE FRAME, so the view HEALS itself.
-            //
-            // Each line already clears to its own end (`console_line_fmt(live=true)` emits `ESC[K`),
-            // which covers a line that got shorter. Nothing cleared BELOW the last line, so anything
-            // that reached the framebuffer while this app owns the screen - another service's console
-            // write, or a shorter frame after a service died - stayed there indefinitely, because a
-            // repaint only overwrites the rows it draws.
-            //
-            // `observe` cannot PREVENT foreign output: claiming the console foreground would mute it,
-            // but that claim is exclusive over INPUT too, and the SHELL must keep reading to honour
-            // `q`. Erasing to end of screen means the view recovers within one repaint - a second -
-            // instead of carrying the damage for the rest of the session. Reported from the Pi 2 as
-            // "the tv rendered a bit weird" after a chaos run, which is exactly when the most other
-            // services are restarting and talking.
-            ctx.console_write("\x1b[J");
         }
     }
 }
