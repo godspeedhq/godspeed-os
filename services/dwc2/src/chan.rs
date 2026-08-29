@@ -1,0 +1,832 @@
+//! Host channels and control transfers.
+//!
+//! Slice 1b of the port (`docs/arm32-usb-userspace.md`): program a host channel, run a DMA transfer,
+//! and compose the three of them into a USB control transfer. Everything here goes through the SDK's
+//! safe `Mmio`/`Dma` wrappers, so the service still carries no `unsafe` (§18.2).
+//!
+//! **No cache maintenance, and that is a property of the grant rather than an omission.** The kernel
+//! driver brackets every transfer with `flush_dcache` (DCCIMVAC) because it DMAs to and from CACHED
+//! kernel buffers on a non-coherent Cortex-A7. This service's DMA arena is mapped **Device/uncached**
+//! (`DMA_ARENA_UNCACHED = true` on arm32 sets `PCD`, which the ARM encoder maps to TEX=0b000, C=0,
+//! B=1), so CPU writes reach memory directly and the device's writes are visible without an
+//! invalidate. Ring-0 cache ops are not available to a service, and this is why they are not needed.
+
+use godspeed_sdk::{Dma, Mmio, ServiceContext};
+
+use crate::regs::*;
+
+// --- Per-channel register bases --------------------------------------------------------------
+//
+// The DWC2 lays its host channels out at 0x500 + ch*0x20, and this board reports 8 of them.
+#[inline] pub fn hcchar_at(ch: u32) -> usize { 0x500 + (ch as usize) * 0x20 }
+#[inline] pub fn hcsplt_at(ch: u32) -> usize { 0x504 + (ch as usize) * 0x20 }
+#[inline] pub fn hcint_at(ch: u32) -> usize { 0x508 + (ch as usize) * 0x20 }
+#[inline] pub fn hcintmsk_at(ch: u32) -> usize { 0x50C + (ch as usize) * 0x20 }
+#[inline] pub fn hctsiz_at(ch: u32) -> usize { 0x510 + (ch as usize) * 0x20 }
+#[inline] pub fn hcdma_at(ch: u32) -> usize { 0x514 + (ch as usize) * 0x20 }
+
+/// Control + enumeration + bulk. One channel PER STREAM, not a pool.
+///
+/// The kernel driver learned this the hard way: every transfer used to go through channel 0, and an
+/// interrupt-split abandoned mid-flight left its state on the channel the next user inherited,
+/// corrupting a block transfer that never ran concurrently with it. Linux keeps a free list because
+/// it juggles arbitrary URBs; there are three statically-known streams here, so a pool would be
+/// speculative generality (§26.2) and one channel per stream buys the isolation it exists to provide.
+pub const CH_BULK: u32 = 0;
+
+/// The keyboard's periodic poll. A SEPARATE channel from control/bulk on purpose - it is the one
+/// transfer deliberately abandoned when its budget expires, so it must not share channel state with
+/// anything. This is the channel-per-stream rule the kernel driver learned by corrupting block
+/// transfers with an abandoned interrupt split.
+pub const CH_KBD: u32 = 1;
+/// The hub's status-change endpoint. Its own channel, like every other stream here: sharing one with
+/// the keyboard would mean a hot-plug check could destroy a split mid-flight, which is the class of
+/// bug the channel-per-stream split was introduced to prevent.
+pub const CH_HUB: u32 = 4;
+
+/// Channel-enable / disable bits in HCCHAR.
+const HCCHAR_CHENA: u32 = 1 << 31;
+const HCCHAR_CHDIS: u32 = 1 << 30;
+
+/// USB PIDs as HCTSIZ encodes them.
+pub const PID_DATA0: u32 = 0;
+pub const PID_DATA1: u32 = 2;
+pub const PID_SETUP: u32 = 3;
+
+/// Where in the DMA arena each control-transfer buffer lives.
+///
+/// Fixed offsets rather than an allocator: the arena is 64 KiB, this slice needs two small buffers,
+/// and a bump allocator would be machinery for a problem that does not exist yet (§26.2). Slice 3
+/// will need real sectors and can carve the rest then.
+pub const SETUP_OFF: usize = 0x0000; // 8 bytes
+pub const DATA_OFF: usize = 0x0040;  // scratch for descriptors
+pub const DATA_LEN: usize = 256;
+
+/// The device this driver is currently talking to. Control transfers address whoever is selected.
+#[derive(Clone, Copy)]
+pub struct Target {
+    pub addr: u8,
+    pub mps: u16,
+    pub low_speed: bool,
+}
+
+/// Bring a channel back to a clean state: mask its interrupts and clear every latched status bit.
+///
+/// An abandoned transfer leaves both set, and the next user of that channel would otherwise read a
+/// previous transfer's completion as its own.
+pub fn release(mmio: &Mmio, ch: u32) {
+    mmio.write32(hcintmsk_at(ch), 0);
+    mmio.write32(hcint_at(ch), 0xFFFF_FFFF);
+}
+
+/// Program a host channel and enable it.
+#[allow(clippy::too_many_arguments)]
+/// HCTSIZ bit 31, "Do Ping": run the USB 2.0 PING protocol before sending data.
+///
+/// USB 2.0 §8.5.1 makes PING flow control MANDATORY for high-speed bulk and control OUT endpoints.
+/// Once such an endpoint answers NAK or NYET, the host may not simply re-send the data - it must send
+/// PING tokens until the device answers ACK, and only then transmit. In DMA mode the core performs
+/// that whole sequence itself; all software owes it is this bit.
+///
+/// This driver never set it, and never tracked the state that decides when to. A high-speed OUT
+/// endpoint whose buffer filled therefore got data re-sent at it forever while it was asking to be
+/// pinged - which is why transmit to the NIC worked until the device got busy and then never recovered
+/// for the life of the service.
+pub const HCTSIZ_DOPNG: u32 = 1 << 31;
+
+/// Program a channel. `ping` sets HCTSIZ.DOPNG (see `HCTSIZ_DOPNG`); it is meaningful only for a
+/// high-speed OUT endpoint and must be false for everything else.
+#[allow(clippy::too_many_arguments)]
+pub fn program_ping(
+    mmio: &Mmio, t: &Target, ch: u32, dir_in: bool, pid: u32,
+    len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32, ping: bool,
+) {
+    let mps = t.mps as u32;
+    let pkts = if len == 0 { 1 } else { (len + mps - 1) / mps };
+
+    // Channel-reuse hygiene: if a prior transaction left the channel ENABLED - a timeout that never
+    // truly halted, or a split phase re-arm - disable it cleanly before reprogramming. Never reuse a
+    // half-live channel.
+    halt(mmio, ch);
+
+    mmio.write32(hcint_at(ch), 0xFFFF_FFFF);
+    let dopng = if ping { HCTSIZ_DOPNG } else { 0 };
+    mmio.write32(hctsiz_at(ch), (len & 0x7_FFFF) | ((pkts & 0x3ff) << 19) | (pid << 29) | dopng);
+    // The HCDMA address is a BUS address as the DWC2 master sees memory, not a CPU physical address.
+    // On real BCM2836 silicon that means the VideoCore alias; in QEMU it is identity. Getting this
+    // wrong does not fault - it transfers nothing, or STALLs the DATA stage.
+    mmio.write32(hcdma_at(ch), buf_phys | DMA_BUS_ALIAS);
+    // HCSPLT LAST before HCCHAR - the Linux order is HCTSIZ -> HCSPLT -> HCCHAR.
+    mmio.write32(hcsplt_at(ch), hcsplt);
+
+    // Odd-frame scheduling applies to PERIODIC transfers AND split transactions (a split's
+    // SSPLIT/CSPLIT are microframe-scheduled by the hub's TT). Target the NEXT microframe: OddFrm set
+    // when the current one is even. A direct non-periodic transfer keeps OddFrm = 0 - setting it
+    // there makes the v2.80a core defer the token and strand the bytes, diagnosed on hardware.
+    let oddfrm = if (ep_type == 3 || hcsplt != 0) && (mmio.read32(HFNUM) & 1) == 0 {
+        HCCHAR_ODDFRM
+    } else {
+        0
+    };
+    let chan = (mps & 0x7FF)
+        | ((ep & 0xF) << 11)
+        | ((dir_in as u32) << 15)
+        | ((t.low_speed as u32) << 17)
+        | ((ep_type & 0x3) << 18)
+        | (1 << 20)                       // multi-count = 1 (Linux ec_mc for control/bulk)
+        | ((t.addr as u32 & 0x7F) << 22)
+        | oddfrm
+        | HCCHAR_CHENA;
+    mmio.write32(hcchar_at(ch), chan);
+}
+
+/// Program a channel with no PING. The shape every caller but a high-speed bulk OUT wants.
+#[allow(clippy::too_many_arguments)]
+pub fn program(
+    mmio: &Mmio, t: &Target, ch: u32, dir_in: bool, pid: u32,
+    len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32,
+) {
+    program_ping(mmio, t, ch, dir_in, pid, len, buf_phys, ep, ep_type, hcsplt, false);
+}
+
+/// The data PID the controller has advanced to, read back from HCTSIZ [30:29].
+///
+/// The hardware owns this toggle. Tracking it in software works only until the two disagree, and
+/// when they do the failure is silent: the device retransmits its previous packet rather than
+/// erroring, so a keystroke is delivered twice.
+pub fn pid_from_hctsiz(mmio: &Mmio, ch: u32) -> u32 {
+    (mmio.read32(hctsiz_at(ch)) >> 29) & 0x3
+}
+
+/// Wait for a channel to halt, bounded by the CLOCK. Returns the latched HCINT, or `None` on timeout.
+/// Abort a running channel, the way the core requires.
+///
+/// **Both ChEna AND ChDis must be set.** This read as "clear ChEna, set ChDis" in two places, which
+/// looks like the obvious way to stop a channel and is the documented-wrong one: the DWC2 programming
+/// guide, and Linux's `dwc2_hc_halt`, both write ChEna|ChDis together, because the core needs ChEna
+/// set to PROCESS the halt - that is how it dequeues the channel's outstanding request from the
+/// non-periodic request queue.
+///
+/// Clearing ChEna instead stops the software's view and leaves the core's. The request is never
+/// retired, and that queue is only a handful of entries deep, so every abandoned transfer
+/// permanently consumes one. Hardware showed the end state exactly: transmit worked 584 times, then
+/// degraded, then stopped forever with HCINT reading 0x00000000 and the channel never halting - not
+/// a device refusing frames (that is a NAK, and a NAK sets a bit) but transactions that were never
+/// scheduled at all, because there was no room left to schedule them. Flushing the FIFO did not
+/// touch it, which is what ruled the FIFO out.
+///
+/// Bounded, and it waits for the halt to actually land: an abort that returns before the core has
+/// finished is the same abandoned-channel bug in a smaller window.
+pub fn halt(mmio: &Mmio, ch: u32) {
+    let hcchar = mmio.read32(hcchar_at(ch));
+    if hcchar & HCCHAR_CHENA == 0 {
+        return;                       // already idle - nothing queued to retire
+    }
+    mmio.write32(hcchar_at(ch), hcchar | HCCHAR_CHENA | HCCHAR_CHDIS);
+    // Spin for the core to retire it. This is a register handshake with the controller, not a wait on
+    // a device, so a bounded spin is the right shape - and if it ever expires the channel is left
+    // exactly as an unbounded wait would leave it, minus the hang.
+    let mut t = 0u32;
+    while mmio.read32(hcchar_at(ch)) & HCCHAR_CHENA != 0 {
+        t += 1;
+        if t > 100_000 {
+            break;
+        }
+    }
+}
+
+pub fn wait_halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32, ms: u64) -> Option<u32> {
+    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(ms));
+    loop {
+        let hcint = mmio.read32(hcint_at(ch));
+        if hcint & HCINT_CHHLTD != 0 {
+            return Some(hcint);
+        }
+        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+            // Leave the channel clean for the next user rather than abandoning it enabled - the
+            // failure this driver's channel-per-stream split exists to prevent. `halt` is what makes
+            // that true: it retires the core's outstanding request, which the old open-coded disable
+            // did not.
+            halt(mmio, ch);
+            return None;
+        }
+    }
+}
+
+/// One stage of a control transfer: program, wait for the halt, decide success from HCINT.
+#[allow(clippy::too_many_arguments)]
+fn stage(
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, what: &str,
+) -> bool {
+    program(mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, 0);
+    match wait_halt(ctx, mmio, ch, 100) {
+        None => {
+            // SAY WHAT THE CORE LOOKED LIKE, not just that we gave up.
+            //
+            // "channel never halted" names the symptom and nothing else, and the symptom is shared by
+            // every possible cause. On hardware this line repeated for a minute while the keyboard was
+            // dead, and it could not distinguish a controller that had lost its port from one that had
+            // simply run out of room to issue a request - which are opposite faults with opposite
+            // fixes, and the driver already knows that the non-periodic request queue runs dry here.
+            //
+            // These are the four registers that separate them, and they cost nothing extra: this line
+            // was already printing once per failure, so it may as well carry the state.
+            //   HPRT      - is the port still connected, enabled and powered? (a lost port stops all)
+            //   GNPTXSTS  - bits 23:16 are request-queue entries FREE; zero means nothing can be
+            //               issued at all, which looks exactly like a device that never answers
+            //   GINTSTS   - is the core even still in host mode?
+            //   HCCHAR    - is our channel still enabled, i.e. waiting rather than never started?
+            let hprt = mmio.read32(crate::regs::HPRT);
+            let nptx = mmio.read32(crate::regs::GNPTXSTS);
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: {} stage timed out (channel never halted) - HPRT={:#010x} (conn {} ena {} pwr {}), GNPTXSTS={:#010x} qfree {}, GINTSTS={:#010x}, HCCHAR={:#010x}",
+                what, hprt,
+                hprt & crate::regs::HPRT_PRTCONNSTS != 0,
+                hprt & crate::regs::HPRT_PRTENA != 0,
+                hprt & crate::regs::HPRT_PRTPWR != 0,
+                nptx, (nptx >> 16) & 0xFF,
+                mmio.read32(crate::regs::GINTSTS),
+                mmio.read32(hcchar_at(ch))));
+            false
+        }
+        Some(hcint) => {
+            // XFERCOMPL is the only success. A halt with anything else latched is a real failure and
+            // is named, because "the transfer did not work" and "the device STALLed" want different
+            // responses and a single false would merge them.
+            if hcint & HCINT_XFERCOMPL != 0 {
+                true
+            } else {
+                ctx.log_fmt(format_args!(
+                    "dwc2-svc: {} stage FAILED (HCINT={:#010x}{}{}{})", what, hcint,
+                    if hcint & HCINT_STALL != 0 { " STALL" } else { "" },
+                    if hcint & HCINT_XACTERR != 0 { " XACTERR" } else { "" },
+                    if hcint & HCINT_NAK != 0 { " NAK" } else { "" }));
+                false
+            }
+        }
+    }
+}
+
+/// Build the HCSPLT descriptor for a device behind a hub.
+///
+/// `PrtAddr` = the hub's downstream port, `HubAddr` = the hub's device address, `XactPos = ALL`
+/// (0b11) because a control/bulk split moves a whole packet rather than a begin/mid/end chunk, and
+/// `SplEna` to arm it. Zero means "direct device" and takes the non-split path.
+pub fn hcsplt(hub_addr: u8, hub_port: u8) -> u32 {
+    if hub_port == 0 {
+        return 0;
+    }
+    (hub_port as u32 & 0x7F) | ((hub_addr as u32 & 0x7F) << 7) | (0b11 << 14) | (1 << 31)
+}
+
+/// Wait until the controller reports the given microframe. Bounded: one full frame is 8 microframes
+/// at 125 us, so a whole sweep cannot take more than a millisecond even if the target never appears.
+// The microframe/halt cycle counters that lived here are REMOVED, along with the three
+// `pub static ...: Atomic*` they used. They answered the question they were added for - the
+// channel-halt wait is ~97% of the keyboard's CPU and the microframe wait ~3%, which is why
+// optimising the microframe wait moved nothing - and the answer is in the commit history where it
+// cannot drift.
+//
+// They also should never have been statics. Nothing here is concurrent (a service is one task on one
+// core), so the atomic was an `unsafe`-free spelling of `static mut`: it passes `unsafe_check.py`
+// while leaving invariant 9 exactly as violated. The owner was visible at the read site - `main.rs`
+// resets the sibling counters on the same log flush and those live on `KeyState`. Threading a
+// keyboard-owned struct through `wait_halt` is wrong too, because every transfer type shares it, so
+// a measurement worth keeping would need its own home rather than a parameter on a shared path.
+
+fn wait_for_uframe(ctx: &ServiceContext, mmio: &Mmio, target: u32) {
+    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(2));
+    loop {
+        let cur = mmio.read32(HFNUM) & 7;
+        if cur == target {
+            return;
+        }
+        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+            return;
+        }
+        // SLEEP THE BULK OF THE WAIT, SPIN ONLY THE LAST MICROFRAME.
+        //
+        // This loop was a pure spin, and it is where the keyboard's CPU went: roughly 375 us of every
+        // 450 us poll, about 4.6% of a core, burned waiting for a microframe boundary. It spun because
+        // the kernel had no clock that could name 125 us - the finest thing available was the 10 ms
+        // scheduler tick.
+        //
+        // It has one now, and it is exact: a 125 us sleep returns in 146 us on average and 155 us at
+        // worst, measured on this board with the console TX ring in place. About 30 us of jitter,
+        // against a 125 us microframe.
+        //
+        // 30 us of jitter is small but it is not nothing, and landing in the WRONG microframe is the
+        // failure this whole path exists to avoid - a missed complete-split strands a transaction and
+        // wedges the transaction translator, which is exactly how the keyboard dies. So sleep only
+        // while there is more than one microframe to go, and spin the last one, where precision
+        // matters and the cost is bounded to a single 125 us window.
+        let togo = (target.wrapping_sub(cur)) & 7;
+        if togo >= 2 {
+            // Wake one microframe SHORT of the target and spin in from there. `duration_cycles` takes
+            // whole milliseconds, so the sub-millisecond figure is derived from the board's own
+            // calibration instead - a cycle count is not a portable duration.
+            let per_us = (ctx.tsc_ticks_per_10ms() / 10_000).max(1);
+            let sleep_us = (togo as u64 - 1) * 125;
+            ctx.sleep(per_us.saturating_mul(sleep_us).max(1));
+        }
+    }
+}
+
+/// One SPLIT transaction stage: start-split, then poll the complete-split.
+///
+/// **This is the non-periodic (control/bulk) path, and it is deliberately the one this slice uses.**
+/// It brute-forces a landing microframe by SWEEPING 0..7 across retries rather than scheduling one
+/// precisely, because a non-periodic split has no fixed schedule. That makes it tolerant of being
+/// preempted: a badly-timed attempt simply retries at a different microframe. The PERIODIC path
+/// (`split_txn_periodic` in the kernel driver) does need microframe-accurate scheduling and is the
+/// genuinely risky part of moving this driver out of ring 0 - it is needed only for the keyboard's
+/// interrupt endpoint, so it belongs to Slice 2, faced on its own.
+#[allow(clippy::too_many_arguments)]
+fn stage_split_one(
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, splt: u32, what: &str,
+) -> bool {
+    const SS_TRIES: u32 = 24;
+    for attempt in 0..SS_TRIES {
+        wait_for_uframe(ctx, mmio, attempt % 8);
+
+        // STATE 1 - the Start-Split (CompleteSplit = 0). The hub's transaction translator legitimately
+        // NAKs or transaction-errors while busy, and USB 2.0 11.17.5 says the host re-issues the whole
+        // start-split rather than treating it as a failure.
+        program(mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, splt);
+        let ss = match wait_halt(ctx, mmio, ch, 50) {
+            Some(v) => v,
+            None => continue,
+        };
+        if ss & HCINT_STALL != 0 {
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: {} start-split STALLed - HCINT={:#010x} HCSPLT={:#010x} HCCHAR={:#010x}",
+                what, ss, mmio.read32(hcsplt_at(ch)), mmio.read32(hcchar_at(ch))));
+            return false;
+        }
+        if ss & HCINT_XFERCOMPL != 0 {
+            return true; // rare, but a split can complete outright
+        }
+        if ss & HCINT_ACK == 0 {
+            continue; // no ACK: the TT did not take it - retry at the next microframe
+        }
+
+        // STATE 2 - poll the Complete-Split for the low/full-speed device's answer.
+        let mut nyet = 0u32;
+        loop {
+            program(mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, splt | (1 << 16));
+            let cs = match wait_halt(ctx, mmio, ch, 50) {
+                Some(v) => v,
+                None => break,
+            };
+            if cs & HCINT_XFERCOMPL != 0 {
+                return true;
+            }
+            if cs & HCINT_STALL != 0 {
+                // DUMP THE REGISTERS, do not guess again.
+                //
+                // A compliant device may not STALL a SETUP (USB 2.0 8.5.3), so this is a
+                // contradiction and one hypothesis for it - a missing TRSTRCY recovery delay - has
+                // already been tried and refuted on hardware. The rule this port has followed
+                // throughout applies: when a hypothesis about hardware state is wrong, do not form a
+                // second one, find where the hardware RECORDS the answer and read it.
+                //
+                // HCSPLT is the field most likely to be wrong (hub address placement, XactPos) and it
+                // is right here in a register. HCCHAR carries the device address, endpoint and speed
+                // the controller actually used, which is the other half of "who did we just talk to".
+                ctx.log_fmt(format_args!(
+                    "dwc2-svc: {} complete-split STALLed - HCINT={:#010x} HCSPLT={:#010x} HCCHAR={:#010x} HFNUM={:#06x}",
+                    what, cs, mmio.read32(hcsplt_at(ch)), mmio.read32(hcchar_at(ch)),
+                    mmio.read32(HFNUM) & 0xFFFF));
+                return false;
+            }
+            if cs & HCINT_NYET != 0 {
+                // The TT has not finished with the device yet. Keep polling, BOUNDED - then fall out
+                // to a fresh start-split rather than spinning here forever.
+                nyet += 1;
+                if nyet > 500 {
+                    break;
+                }
+                ctx.sleep(ctx.duration_cycles(1));
+                continue;
+            }
+            break; // NAK or XactErr: re-issue the start-split
+        }
+    }
+    ctx.log_fmt(format_args!("dwc2-svc: {} split gave up after {} start-splits", what, SS_TRIES));
+    false
+}
+
+/// Wait until the controller reaches a given microframe, bounded by REAL TIME.
+///
+/// 1.5 ms, because reaching any target microframe takes at most one ~1 ms frame. Time and not a spin
+/// count: the kernel driver's comment records that a spin-count bound here "was the cause of the
+/// scheduler-starving hang", since spin latency depends on MMIO speed rather than on the clock the
+/// microframes actually advance on.
+/// The controller's microframe counter - all 14 bits of it.
+///
+/// `HFNUM.FrmNum` increments every microframe (125 us) and wraps about every two seconds, so it is an
+/// ABSOLUTE clock for split scheduling. The old code masked it to `& 0x7` - the microframe's position
+/// within its frame - and that is the whole defect: a 3-bit target RECURS EVERY MILLISECOND, so
+/// "microframe 3" names eight different instants a second and there is no way to tell which one you
+/// are looking at.
+fn uframe_now(mmio: &Mmio) -> u32 {
+    mmio.read32(HFNUM) & 0x3FFF
+}
+
+/// Wait until the microframe counter has REACHED OR PASSED `target`.
+///
+/// The complete-split must not be issued before start+2. The trace showed why in one boot: a
+/// complete-split at start+1 returns NYET and then every later retry returns NYET too - the
+/// transaction is poisoned and never completes, which is the eight-consecutive-NYET run that strands
+/// the translator. At start+2 it succeeds on the first attempt.
+///
+/// "Reached or passed", not "equals", because being a microframe late is recoverable (the translator
+/// still holds the result for a few) while waiting for an exact value we have already gone by would
+/// cost a whole frame. False means too far past to be worth asking.
+fn wait_until_at_least(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> bool {
+    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(2));
+    loop {
+        let ahead = target.wrapping_sub(uframe_now(mmio)) & 0x3FFF;
+        if ahead == 0 || ahead > 0x2000 {
+            // At it, or past it. Past is only useful while the TT still holds the result.
+            return ahead == 0 || (0x4000 - ahead) <= 6;
+        }
+        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Outcome of waiting for an absolute microframe.
+enum Uframe {
+    /// The target microframe is current - go.
+    Reached,
+    /// It has already passed. The transaction it was for is stale.
+    Missed,
+}
+
+/// Wait until the absolute microframe `target`, or report that it has gone.
+///
+/// This is the fix for the fault that wedged the keyboard. The previous version compared only the low
+/// three bits, so a task preempted between the start-split and the complete-split did not learn it was
+/// late - it waited for that microframe NUMBER to come round again, up to a frame later, and issued the
+/// complete-split anyway. By then the translator had discarded the result, which is an XACTERR, and a
+/// complete-split for a transaction the TT no longer holds is also what strands it. Hence the
+/// 300-XACTERR runs and the NYET storms, both appearing only under load - load is what causes the
+/// preemption.
+///
+/// It also returned silently on its own timeout and the caller proceeded regardless, so being late was
+/// indistinguishable from being on time. Now lateness is a value the caller must handle (§26.7).
+///
+/// Wrapping-safe: the counter is 14 bits, so a distance of more than half the range is read as the past
+/// rather than an eight-second wait.
+fn wait_uframe_abs(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> Uframe {
+    // Bounded: a few microframes is all a legitimate wait ever needs; anything longer means the target
+    // is gone and spinning cannot bring it back.
+    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(2));
+    loop {
+        let delta = target.wrapping_sub(uframe_now(mmio)) & 0x3FFF;
+        if delta == 0 {
+            return Uframe::Reached;
+        }
+        if delta > 0x2000 {
+            return Uframe::Missed;      // target is behind us
+        }
+        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+            return Uframe::Missed;      // could not get there in time - say so
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// A PERIODIC (interrupt) IN split, frame-scheduled. Returns the latched HCINT.
+///
+/// Unlike a non-periodic split - which sweeps microframes across retries and tolerates bad timing -
+/// a periodic split must be SCHEDULED, and the schedule is the thing that makes it work:
+///
+///   1. START-SPLIT in microframe (current+1)&7, SKIPPING microframe 6: too little of the frame is
+///      left after it for the complete-split at +2. ODDFRM must match that microframe's parity, which
+///      `program` derives from HFNUM - correct only because the channel is enabled AFTER `wait_uframe`
+///      has reached the scheduled microframe.
+///   2. COMPLETE-SPLIT at +2, retrying NYET in the following microframes (3 tries).
+///
+/// **ONE attempt per call, and that is what makes this safe in a preemptible task.** Any failure -
+/// including being descheduled at the wrong moment - simply reschedules a fresh start-split on the
+/// next poll. Combined with every wait being time-bounded, the whole poll is a few milliseconds and
+/// cannot wedge the service. The risk this port carried from the start turns out to be answered by
+/// the algorithm's own structure rather than by holding the CPU.
+#[allow(clippy::too_many_arguments)]
+/// One periodic split IN, with an optional trace of what the hardware actually did.
+///
+/// `diag` prints one compact line per poll: the microframe the start-split was synchronised to, the
+/// HCINT it returned, and the HCINT of every complete-split attempt with the microframe it was issued
+/// in. Three attempts at this scheduling have now been made by reasoning about what the hardware
+/// OUGHT to do; this is what it DOES. Bounded to a handful of polls after each bind so it cannot
+/// flood, and silent thereafter.
+#[allow(clippy::too_many_arguments)]
+/// A plain interrupt IN - no split.
+///
+/// For a device attached DIRECTLY at high speed, which is what the hub itself is. None of the
+/// microframe scheduling the keyboard needs applies: there is no transaction translator in the path,
+/// so the transfer is programmed and waited on like any other.
+pub fn interrupt_in(
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ch: u32, pid: u32, buf_phys: u32, len: u32, ep: u32,
+) -> u32 {
+    program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, 0); // ep_type 3 = interrupt, no HCSPLT
+    wait_halt(ctx, mmio, ch, 5).unwrap_or(0)
+}
+
+pub fn periodic_split_in(
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ch: u32, pid: u32, buf_phys: u32, len: u32, ep: u32, splt: u32, diag: bool,
+) -> u32 {
+    // SYNCHRONISE TO A MICROFRAME BOUNDARY before the start-split.
+    //
+    // I removed this wait once, calling it 125 us of pointless spinning, and the keyboard then failed
+    // on EVERY boot instead of only under load. The wait is not waste: a start-split has to occupy a
+    // microframe, and programming one partway through leaves the core to defer or truncate it. This
+    // is the synchronisation that makes the transaction well-formed, and it was the one part of the
+    // original scheduling that was right.
+    //
+    // What WAS wrong is how it was expressed: a 3-bit microframe number recurs every millisecond, so a
+    // preempted task could not tell "the microframe I wanted" from "the same number, a frame later",
+    // and the old helper returned silently on timeout so lateness looked like success. The target is
+    // absolute now, and failing to reach it skips this poll rather than proceeding as if it had.
+    //
+    // THE START-SPLIT MUST LEAVE ROOM FOR ITS COMPLETE-SPLITS INSIDE THE SAME FRAME.
+    //
+    // A transaction translator runs the low-speed transaction in the frame the start-split scheduled it
+    // for, and holds the result in that frame's pipeline slot (USB 2.0 §11.18). The complete-splits at
+    // X+2, X+3, X+4 must therefore land in the same frame - a microframe number is 3 bits, so crossing
+    // from uf 7 to uf 0 is a new frame and a different slot, and the result that was waiting is gone.
+    //
+    // That leaves start microframes 0..3 and no others:
+    //
+    //   uf 0 -> complete at 2,3,4      uf 4 -> 6,7,0   crosses
+    //   uf 1 -> 3,4,5                  uf 5 -> 7,0,1   crosses
+    //   uf 2 -> 4,5,6                  uf 6 -> 0,1,2   crosses
+    //   uf 3 -> 5,6,7                  uf 7 -> 1,2,3   crosses
+    //
+    // The previous rule skipped only microframe 6, which is why the hardware traces show EVERY start
+    // split at uf 5: complete-splits at 7, then 0,1,2,3,4 in the next frame, all NYET, and finally
+    // XACTERR when the translator gave up on a transaction nobody collected from the right frame. 168
+    // start-splits, all ACKed, and not one completed - the placement was wrong, not the cadence.
+    let mut f0 = (uframe_now(mmio) + 1) & 0x3FFF;
+    // Advance to the next microframe in 0..3. At most four steps (500 us), well inside the 10 ms poll.
+    let mut steps = 0;
+    while f0 & 0x7 > 3 && steps < 8 {
+        f0 = (f0 + 1) & 0x3FFF;
+        steps += 1;
+    }
+    if let Uframe::Missed = wait_uframe_abs(ctx, mmio, f0) {
+        if diag {
+            ctx.log_fmt(format_args!("dwc2-svc: split - MISSED the start boundary (wanted uf {})", f0 & 7));
+        }
+        return 0;   // could not reach the boundary - skip this poll rather than send a malformed split
+    }
+    program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt); // ep_type 3 = interrupt
+    let ss = match wait_halt(ctx, mmio, ch, 5) {
+        Some(v) => v,
+        None => return 0,
+    };
+    if diag {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: split - SSPLIT at uf {} -> HCINT {:#06x} (now uf {})",
+            f0 & 7, ss, uframe_now(mmio) & 7));
+    }
+    if ss & (HCINT_STALL | HCINT_XFERCOMPL) != 0 {
+        return ss;
+    }
+    if ss & HCINT_ACK == 0 {
+        return ss; // the TT refused the start-split - try again next poll
+    }
+
+    // NOT BEFORE START+2. Measured, not reasoned about.
+    //
+    // The trace settled three commits of argument in one boot. A complete-split issued at start+1
+    // returns NYET, and so does every retry after it - the transaction is poisoned and never completes,
+    // which is the eight-consecutive-NYET run that strands the translator and brings down the whole
+    // recovery ladder. Issued at start+2 it succeeds on the first attempt, usually with NAK: an idle
+    // keyboard saying "no key activity", which is exactly right.
+    //
+    // I had `f0 + 2` two commits ago and abandoned it, believing `f0` was the wrong anchor. It is the
+    // right one: `f0` is the microframe the start-split was SYNCHRONISED to, not merely observed near.
+    // Replacing it with "issue as soon as the start-split halts" is what produced the start+1 case.
+    //
+    // Being early is NOT free after all - that assumption is what the last commit rested on, and the
+    // hardware disagreed.
+    let cs_first = (f0 + 2) & 0x3FFF;
+    let mut last = ss;
+    // SIX complete-split attempts, not three.
+    //
+    // Giving up here does not merely lose one keystroke: the transaction translator is left holding
+    // a transaction nobody collected, and that is what wedges it - after which the keyboard needs a
+    // TT clear and, in practice on this board, a port re-enumeration, which the operator experiences
+    // as a a stutter of over a second. Each extra attempt is one microframe of waiting, so the whole
+    // retry budget costs well under a millisecond and buys a large reduction in stranding.
+    //
+    // Not unbounded: a translator that never finishes must still be given up on, or this poll would
+    // hold the core. Six is chosen to cover the NYET runs actually seen in the logs while staying far
+    // inside the ~1 ms the whole poll is allowed.
+    // Wait out the gap to start+2 once; the retries below then follow the microframes as they come.
+    if !wait_until_at_least(ctx, mmio, cs_first) {
+        return last;   // too far past to be worth asking - the next poll starts a fresh transaction
+    }
+    for _ in 0..6 {
+        // A translator holds a completed periodic transaction for a few microframes, not indefinitely.
+        // Past that, asking for it returns XACTERR and strands the TT - so abandon instead. One
+        // keystroke period is the cost; a wedge and the recovery ladder is the alternative.
+        // STOP AT THE FRAME BOUNDARY, not after a fixed count. Past uf 7 the translator's slot for
+        // this frame is gone, so a further complete-split cannot find the data and only strands the
+        // TT - which is the XACTERR that used to end every one of these runs. `f0 & 7 <= 3` above
+        // guarantees at least three attempts before the boundary, which is what the spec allots.
+        if uframe_now(mmio) & 0x7 < f0 & 0x7 || uframe_now(mmio).wrapping_sub(cs_first) & 0x3FFF > 6 {
+            return last;
+        }
+        let cs_uf = uframe_now(mmio) & 7;
+        program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt | (1 << 16));
+        let cs = match wait_halt(ctx, mmio, ch, 5) {
+            Some(v) => v,
+            None => {
+                if diag {
+                    ctx.log_fmt(format_args!("dwc2-svc: split - CSPLIT at uf {} NEVER HALTED", cs_uf));
+                }
+                return last;
+            }
+        };
+        if diag {
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: split - CSPLIT at uf {} -> HCINT {:#06x}", cs_uf, cs));
+        }
+        last = cs;
+        if cs & (HCINT_XFERCOMPL | HCINT_STALL | HCINT_NAK) != 0 {
+            // NAK is NOT an error here: it is the keyboard positively answering "no key activity this
+            // period", which is what an idle keyboard says most of the time.
+            return cs;
+        }
+        if cs & HCINT_NYET != 0 {
+            // RETRY IMMEDIATELY. The overhead is already a microframe; waiting adds a second.
+            //
+            // USB 2.0 puts the complete-splits at start+2, +3, +4 - CONSECUTIVE microframes. The trace
+            // shows what waiting one more produced: retries landing on uf 7, 1, 3, 5 - two apart - so
+            // every other microframe was never sampled, including the ones where the translator had
+            // the data. It then times out and discards, which is the XACTERR that follows every NYET
+            // run:
+            //
+            //   CSPLIT at uf 7 -> 0x0042 (NYET)   CSPLIT at uf 1 -> 0x0042
+            //   CSPLIT at uf 3 -> 0x0042          CSPLIT at uf 5 -> 0x0042
+            //   SSPLIT at uf 5 -> 0x0022 (ACK)    CSPLIT at uf 7 -> 0x0082 (XACTERR)
+            //
+            // The start-split is ACKed and the first complete-split lands exactly at start+2, so the
+            // placement proved correct earlier is still correct - what was wrong is the CADENCE of the
+            // retries after it. Programming the channel and waiting for it to halt already costs about
+            // a microframe, so the next attempt goes out as soon as this one is known to have failed.
+            continue;
+        }
+        return cs;
+    }
+    last
+}
+
+/// A split transfer of any length: ONE low/full-speed packet per split transaction.
+///
+/// **The DWC2 does not auto-continue a multi-packet split in buffer-DMA mode.** It halts with
+/// XferCompl after the FIRST packet, so software must sequence each mps-sized packet itself,
+/// advancing the buffer and toggling the data PID. The kernel driver says so in a comment that
+/// describes this exact failure, already diagnosed on this board:
+///
+///   "HW-proven (Pi 2 / LAN9514): an 18-byte device descriptor read whole came back as 8 correct
+///    bytes + 10 stale, because only packet 1 was ever retrieved."
+///
+/// Which is precisely what happened here - `VID:PID=0000:0000` from an 18-byte read at MPS 8, with
+/// the first packet correct. It read as ZEROS rather than stale bytes only because the IN scratch is
+/// zeroed before every transfer, and VID lives at bytes 8..11, in the part that was never fetched.
+///
+/// A single-packet transfer is one iteration; a zero-length STATUS stage is one iteration with a
+/// chunk of 0, which is why the loop tests `off >= len` AFTER advancing rather than before.
+#[allow(clippy::too_many_arguments)]
+fn stage_split(
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, splt: u32, what: &str,
+) -> bool {
+    let mps = (t.mps as u32).max(1);
+    let mut off = 0u32;
+    let mut cur_pid = pid;
+    loop {
+        let chunk = (len - off).min(mps);
+        if !stage_split_one(ctx, mmio, t, ch, dir_in, cur_pid, buf_phys + off, chunk, splt, what) {
+            return false;
+        }
+        off += chunk;
+        // Done when the whole length is moved, or when a SHORT packet ended the transfer early - a
+        // device answering with less than it was asked for is a complete answer, not a truncated one.
+        if off >= len || chunk < mps {
+            return true;
+        }
+        // Control/bulk data toggle: every packet after the first flips DATA1 <-> DATA0.
+        cur_pid = if cur_pid == PID_DATA1 { PID_DATA0 } else { PID_DATA1 };
+    }
+}
+
+/// A full USB control transfer: SETUP, optional DATA, STATUS.
+///
+/// `data` is filled on an IN transfer and sent on an OUT one. Returns false if any stage failed, with
+/// the failing stage already reported.
+pub fn control(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target,
+    setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize,
+) -> bool {
+    control_split(ctx, mmio, dma, t, setup, data, data_in, dlen, 0)
+}
+
+/// A control transfer, optionally through a hub's transaction translator.
+///
+/// `splt` of 0 is a direct device and behaves exactly as before - the direct path is untouched, so a
+/// regression here cannot break what slices 1a-1c-ii proved.
+#[allow(clippy::too_many_arguments)]
+pub fn control_split(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target,
+    setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize, splt: u32,
+) -> bool {
+    let ch = CH_BULK;
+    let setup_phys = dma.phys_at(SETUP_OFF) as u32;
+    let data_phys = dma.phys_at(DATA_OFF) as u32;
+
+    for (i, b) in setup.iter().enumerate() {
+        dma.write8(SETUP_OFF + i, *b);
+    }
+    let run = |ctx: &ServiceContext, dir_in, pid, phys, len, what| {
+        if splt == 0 {
+            stage(ctx, mmio, t, ch, dir_in, pid, phys, len, what)
+        } else {
+            stage_split(ctx, mmio, t, ch, dir_in, pid, phys, len, splt, what)
+        }
+    };
+    if !run(ctx, false, PID_SETUP, setup_phys, 8, "SETUP") {
+        return false;
+    }
+
+    if dlen > 0 {
+        if data_in {
+            // Never let the device DMA past the scratch buffer - clamp the PROGRAMMED length, not
+            // just the copy-out.
+            let want = dlen.min(DATA_LEN);
+            // ZERO the scratch first. A control IN completes successfully on a SHORT packet, and this
+            // buffer is shared by every control transfer - so a device returning fewer bytes than
+            // asked would leave the PREVIOUS transfer's tail in place and the caller would read it as
+            // this reply's data. Harmless while a reply is only logged; not harmless once one DECIDES
+            // something, and a hub port-status short read decides connect or disconnect.
+            for i in 0..want {
+                dma.write8(DATA_OFF + i, 0);
+            }
+            if !run(ctx, true, PID_DATA1, data_phys, want as u32, "DATA-IN") {
+                return false;
+            }
+            let n = want.min(data.len());
+            for i in 0..n {
+                data[i] = dma.read8(DATA_OFF + i);
+            }
+        } else {
+            // Send only what fits in BOTH the scratch buffer and the source slice.
+            let n = dlen.min(DATA_LEN).min(data.len());
+            for i in 0..n {
+                dma.write8(DATA_OFF + i, data[i]);
+            }
+            if !run(ctx, false, PID_DATA1, data_phys, n as u32, "DATA-OUT") {
+                return false;
+            }
+        }
+    }
+
+    // STATUS: opposite direction, zero length, DATA1. The setup buffer doubles as a dummy DMA target.
+    let ok = if data_in {
+        run(ctx, false, PID_DATA1, setup_phys, 0, "STATUS")
+    } else {
+        run(ctx, true, PID_DATA1, data_phys, 0, "STATUS")
+    };
+    if ok {
+        release(mmio, ch);
+    }
+    ok
+}
+
+/// GET_DESCRIPTOR, the first thing worth asking a device.
+pub fn get_descriptor(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target,
+    dtype: u8, dindex: u8, buf: &mut [u8], len: usize,
+) -> bool {
+    let setup = [
+        0x80,            // bmRequestType: device-to-host, standard, device
+        0x06,            // bRequest: GET_DESCRIPTOR
+        dindex,
+        dtype,
+        0, 0,            // wIndex
+        (len & 0xFF) as u8,
+        ((len >> 8) & 0xFF) as u8,
+    ];
+    control(ctx, mmio, dma, t, &setup, buf, true, len)
+}

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# The COM2 operator/test channel, as a service rather than kernel code (finding C1-6).
+#
+# §4.4 forbids "developer tooling" in the kernel by name, and a 123-line command interpreter sat there
+# anyway. The kernel keeps the byte read - a UART is hardware, and §11.4 already sanctions it owning a
+# serial console - and this service owns what the bytes MEAN.
+#
+# Its authority is named here rather than implied by ring 0: SERVICE_CONTROL to kill, SPAWN to restart,
+# FIRE_IRQ to inject a test interrupt, INTROSPECT to read the byte. All four are kernel by-name grants
+# (finding C4-1), so this file understates them - stated plainly rather than left to be discovered.
+name    = "control"
+version = "0.1.0"
+
+[resources.memory]
+request = "4MiB"
+limit   = "8MiB"
+
+[capabilities]
+log_write   = true

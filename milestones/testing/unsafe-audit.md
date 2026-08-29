@@ -9,7 +9,7 @@
 
 ## Overview
 
-§18.4 of CLAUDE.md requires that `docs/unsafe-audit.md` lists every `unsafe`
+§18.4 of CLAUDE.md requires that `audits/unsafe-audit.md` lists every `unsafe`
 block in the kernel and that CI verifies the file matches source. This item
 implements that enforcement.
 
@@ -234,7 +234,7 @@ Net: −5 grandfathered lines (task/mod.rs 12 → 7).
 
 `scripts/unsafe_check.py`:
 
-1. Reads the inventory table from `docs/unsafe-audit.md` (between
+1. Reads the inventory table from `audits/unsafe-audit.md` (between
    `<!-- unsafe-inventory-start -->` and `<!-- unsafe-inventory-end -->`).
 2. Walks `kernel/src/**/*.rs`, counts non-comment lines containing `\bunsafe\b`.
 3. For each file with `unsafe`:
@@ -250,7 +250,7 @@ Net: −5 grandfathered lines (task/mod.rs 12 → 7).
 When adding an `unsafe` block anywhere in the kernel:
 
 1. Add `// SAFETY: <argument>` on the line immediately above it.
-2. Increase the count for that file in `docs/unsafe-audit.md`.
+2. Increase the count for that file in `audits/unsafe-audit.md`.
 3. Add a SAFETY argument entry under that file in the Entries section.
 4. All three changes must land in the same commit - CI will catch a mismatch.
 
@@ -262,7 +262,7 @@ both steps 1-4 AND a CLAUDE.md §18 amendment with a written rationale.
 ## Implementation checklist
 
 - ✅ `scripts/unsafe_check.py` - count-based audit script
-- ✅ `docs/unsafe-audit.md` - full inventory (23 files, 267 lines), SAFETY
+- ✅ `audits/unsafe-audit.md` - full inventory (23 files, 267 lines), SAFETY
   arguments for every file, grandfathered list with rationale
 - ✅ `.github/workflows/build.yml` - `Unsafe audit check` step added before
   unit tests; runs on every push and PR

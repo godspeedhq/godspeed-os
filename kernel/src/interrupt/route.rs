@@ -16,6 +16,12 @@ use crate::smp::SpinLock;
 const MAX_IRQ: usize = 256;
 
 /// Registered driver endpoint for each IRQ line.
+/// **Every hold masks interrupts (`lock_irq`), because this table is read from the ISR.**
+///
+/// `deliver` runs in an interrupt handler and `register`/`unregister` run in a syscall. A spinlock is
+/// not reentrant, so an unmasked hold in task context lets the interrupt fire on that same core and spin
+/// on a lock its own core already owns - the exact deadlock that stopped a 1754-round soak in
+/// `arch/arm/irq.rs::HIRES`. Same shape, same fix, found by the check that shape produced.
 static IRQ_TABLE: SpinLock<[Option<EndpointId>; MAX_IRQ]> = SpinLock::new([None; MAX_IRQ]);
 
 /// One-shot guard for the EHCI deliver() diagnostic (logs the first EHCI IRQ + its core).
@@ -25,7 +31,7 @@ static EHCI_DELIVER_LOGGED: core::sync::atomic::AtomicBool =
 /// Register a driver endpoint to receive interrupts for `irq`.
 /// Called at spawn time when the kernel processes a `hw_interrupt` capability.
 pub fn register(irq: u8, endpoint: EndpointId) {
-    let mut table = IRQ_TABLE.lock();
+    let mut table = IRQ_TABLE.lock_irq();
     // SEC-16: never SILENTLY steal an IRQ line. On a clean driver restart the death path calls
     // `unregister` first, so the slot is None here; a Some for a DIFFERENT endpoint means either a
     // second driver claiming an already-owned line or a missed unregister - surface it loudly
@@ -42,8 +48,42 @@ pub fn register(irq: u8, endpoint: EndpointId) {
 
 /// The driver endpoint registered for `irq`, if any. Used to gate the `IrqUnmask` syscall:
 /// only the driver that owns the route may re-open its IOAPIC gate (§12).
+/// Release every IRQ routed to `endpoint`, and mask those lines. Returns how many were released.
+///
+/// BY ENDPOINT, NOT BY NAME. The kill path used to work out which line a dying task owned from a
+/// hardcoded table of service names - "xhci" => 0x28, "ehci" => 0x29, anything else => nothing. A
+/// name missing from that list simply kept its route forever: `dwc2` was missing, so every restart
+/// of the ARM USB driver left its old claim behind and the kernel logged "IRQ 41 already routed -
+/// overwriting (second claim or a missed unregister?)" - which was exactly right, and had been
+/// reporting a real leak nobody read. Interrupt delivery to that service was erratic across
+/// restarts as a result.
+///
+/// The kernel already knows which endpoint owns which line, because that is what this table IS.
+/// Asking it directly cannot go stale when a service is added, renamed, or ported to another
+/// architecture with a different vector, and it needs no list to be kept in step with reality.
+pub fn unregister_endpoint(endpoint: EndpointId) -> usize {
+    let mut released = 0usize;
+    let mut irqs = [0u8; MAX_IRQ];
+    {
+        let mut table = IRQ_TABLE.lock_irq();
+        for (irq, slot) in table.iter_mut().enumerate() {
+            if *slot == Some(endpoint) {
+                *slot = None;
+                irqs[released] = irq as u8;
+                released += 1;
+            }
+        }
+    }
+    // Masking touches the interrupt controller, so it happens OUTSIDE the table lock - the same
+    // discipline the rest of this module keeps.
+    for irq in irqs.iter().take(released) {
+        crate::arch::imp::ioapic::mask_vector(*irq);
+    }
+    released
+}
+
 pub fn registered_endpoint(irq: u8) -> Option<EndpointId> {
-    IRQ_TABLE.lock()[irq as usize]
+    IRQ_TABLE.lock_irq()[irq as usize]
 }
 
 /// Remove the driver endpoint registered for `irq` (driver-death quiesce, §12).
@@ -54,7 +94,24 @@ pub fn registered_endpoint(irq: u8) -> Option<EndpointId> {
 /// `enqueue_from_interrupt`'s liveness check only covers the still-Dead window, not a reused
 /// id. Safe no-op if nothing was registered; the respawned driver re-registers.
 pub fn unregister(irq: u8) {
-    IRQ_TABLE.lock()[irq as usize] = None;
+    IRQ_TABLE.lock_irq()[irq as usize] = None;
+    // UNMASK on release, or a dead driver leaves the line off FOREVER.
+    //
+    // `deliver` masks a level-triggered source so it cannot re-enter while the driver works, and the
+    // driver unmasks through `IrqUnmask` once it has serviced the device. A driver that dies between
+    // those two points - a fault, a `kill`, a chaos round - never reaches its unmask, and nothing else
+    // was ever going to do it. The line then stays masked across the respawn, so the fresh instance
+    // registers correctly, waits for an interrupt that is switched off at the controller, and looks
+    // like a driver that cannot see its hardware.
+    //
+    // On arm32 it is worse than a stuck driver: the USB route falls back to the IN-KERNEL stack when
+    // nobody is registered, so `kill dwc2` would hand USB back to a driver whose interrupt line had
+    // been silently disabled - keyboard and storage dead, with the undo apparently applied.
+    //
+    // Releasing the route and releasing the mask are the same act: whoever holds the route owes the
+    // unmask, and if they are gone the debt falls here. Harmless for edge/MSI vectors, where masking
+    // was a no-op to begin with.
+    crate::arch::imp::ioapic::unmask_vector(irq);
 }
 
 /// Deliver IRQ `irq` to the registered driver as an IPC message.
@@ -79,7 +136,7 @@ pub unsafe fn deliver(irq: u8) {
     // syscall after acking. No-op for edge/MSI vectors (the xHCI), which need no masking.
     crate::arch::imp::ioapic::mask_vector(irq);
 
-    let endpoint = IRQ_TABLE.lock()[irq as usize];
+    let endpoint = IRQ_TABLE.lock_irq()[irq as usize];
     if let Some(ep) = endpoint {
         // COALESCE interrupt notifications, but only against QUEUE PRESSURE - never against the mere
         // presence of unrelated work.

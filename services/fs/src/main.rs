@@ -238,6 +238,21 @@ struct OpenFile {
     path: [u8; OPEN_PATH_MAX],
 }
 
+/// The superblock fields `persist_super` can actually change. Compared before writing so an
+/// operation that alters none of them does no I/O at all - see `persist_super`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SbFields {
+    root_first_block: u64,
+    root_block_count: u64,
+    free_blocks: u64,
+    flags: u32,
+    label_len: u8,
+    label: [u8; LABEL_MAX],
+    feat_compat: u32,
+    feat_ro_compat: u32,
+    feat_incompat: u32,
+}
+
 /// In-memory superblock view. No inode table - the tree lives on disk and is read on
 /// demand; the bitmap likewise (this struct holds only geometry + the maintained free
 /// count + the root's extent + drive label/flags).
@@ -280,6 +295,36 @@ struct Fs {
     // the next request rather than trusting them (§14.3 - reacquiring is necessary but not sufficient;
     // everything derived from the previous incarnation must be re-established too).
     io_error_seen: core::cell::Cell<bool>,
+    /// Consecutive failed block reads during a tree WALK (check / scrub). Reset by any success.
+    ///
+    /// A walk that keeps going after a read fails re-asks a device that has stopped answering once
+    /// per block, and each of those costs `BLOCK_RPC_SECS` (30 s). Thirty-four blocks is seventeen
+    /// minutes of a prompt that looks dead. Bounding the STREAK turns "the device is not answering"
+    /// into one answer instead of one answer per block.
+    io_fail_streak: core::cell::Cell<u32>,
+    /// Block operations issued while serving ONE client request. Reset at the top of `serve`, reported
+    /// at the bottom. Counts the trips, not the time: the question "is a slow request thousands of
+    /// block ops, or a handful of slow ones?" has completely different answers, and a count settles it
+    /// without depending on a TSC that is not reliably calibrated on every board.
+    blk_ops: core::cell::Cell<u32>,
+    /// Raw cycles spent INSIDE those block operations. Paired with the whole-request cycle count it
+    /// answers, without needing a calibrated clock, the only question left: is a slow request slow
+    /// because the disk round-trip is slow, or because `fs` itself is doing slow work around it? The
+    /// RATIO of the two is what matters, and a ratio needs no cycles-per-second - which is why it is
+    /// measured this way on a board whose TSC calibration is not trustworthy.
+    blk_cycles: core::cell::Cell<u64>,
+    /// Set when a block operation got no usable ANSWER (desync, truncated reply, driver gone) as
+    /// opposed to a refusal from the device. Kept apart from `io_error_seen` because they demand
+    /// opposite responses: a device error re-mounts and degrades, a desync must be reported as itself
+    /// and RETRIED - re-mounting on it acts on a report the hardware never made, and the re-mount
+    /// fails the same way, which is how a healthy volume got degraded mid-write.
+    transport_fail_seen: core::cell::Cell<bool>,
+    /// The mutable superblock fields as last successfully PERSISTED, or `None` if that is unknown
+    /// (before the first persist of this mount). Purely a write-avoidance record: the in-memory
+    /// fields remain the truth and this is derived from them, never consulted as a source (§26.4).
+    /// Set only after a persist that succeeded, so a failed write can never be mistaken for a
+    /// superblock already on disk.
+    sb_persisted: Option<SbFields>,
     // Crash-consistency journal (Phase C). While `txn_active`, structural writes (directory,
     // bitmap, superblock) are STAGED here - with read-your-writes - instead of going to disk,
     // then committed atomically through the on-disk journal region (`commit_txn`). Data-block
@@ -297,6 +342,27 @@ struct Fs {
     // is a free slot. Reset on mount (an fs restart invalidates all outstanding file caps).
     open_files: [OpenFile; MAX_OPEN],
 }
+
+/// `Fs` IS A STACK-RESIDENT VALUE, so its size is a stack budget and not an implementation detail.
+///
+/// It lives in `service_main`'s frame for the life of the service, and the kernel gives each service a
+/// 256 KiB user stack (`USER_STACK_PAGES`, kernel/src/task/mod.rs). A field added here is paid for out
+/// of the depth available to every call beneath it - and the bill arrives on hardware, as a service
+/// that dies at a fixed pc before its first line runs.
+///
+/// It has been close: under chaos the deepest call reached 233,641 of 262,144 bytes, 89% of the stack
+/// with 28 KiB spare, because this structure was being COPIED four times in one frame. The copies are
+/// gone (`mount_into` / `format_into`), and this assertion is here so the size itself cannot quietly
+/// take the space back. The build-time stack-fit gate in `scripts/arm_build.py` cannot catch it -
+/// that bounds `service_main`'s own frame, not the depth of the calls below it.
+///
+/// Raising this number is a decision about the stack budget, so make it deliberately and with the
+/// deepest-call figure in hand (`fs` prints it). The alternative CLAUDE.md 26.6.1 asks for first is to
+/// change the representation - stream it, refer to it by span, give it a bounded arena.
+const _: () = assert!(
+    core::mem::size_of::<Fs>() <= 40 * 1024,
+    "Fs exceeds its stack budget - see the note above this assertion before raising it"
+);
 
 /// A decoded `file_record` plus where it lives, so it can be written back. `loc == None`
 /// means the root directory (its extent lives in the superblock, it has no parent entry).
@@ -337,6 +403,10 @@ const E_IO: &str = "storage unreadable (I/O error)";
 const MOUNT_MAX_ATTEMPTS: u32 = 1000;
 /// How long mount waits for a device to answer - a REAL duration, the same on any board.
 const MOUNT_MAX_MS: u64 = 20_000;
+/// Pause between capacity attempts, so the attempt budget spans the clock budget rather than
+/// racing it. 1000 attempts * 20 ms > MOUNT_MAX_MS on every board, which is what keeps the CLOCK
+/// the binding bound and the attempt count a backstop that never fires.
+const MOUNT_RETRY_MS: u64 = 20;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
@@ -367,10 +437,35 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     let _ = ctx.reacquire_by_name("block-driver");
                     let out_of_time = ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63);
                     if out_of_time || attempt == MOUNT_MAX_ATTEMPTS {
-                        ctx.log("fs: block-driver did not report capacity within 20s - coming up storage-unavailable (data intact; do NOT run 'drives flash')");
+                        // SAY WHICH BOUND ENDED THE WAIT. They are not the same fact.
+                        //
+                        // This printed "within 20s" for both exits, and on the Pi 2 that was a false
+                        // statement by three orders of magnitude: `fs: starting` at 10:00:57.063 and
+                        // "did not report capacity within 20s" at 10:00:57.110 - FORTY-SEVEN
+                        // MILLISECONDS. An operator reads that line, believes the device was given 20
+                        // seconds, and concludes the disk is dead.
+                        if out_of_time {
+                            ctx.log("fs: block-driver did not report capacity within 20s - coming up storage-unavailable (data intact; do NOT run 'drives flash')");
+                        } else {
+                            ctx.log_fmt(format_args!(
+                                "fs: gave up after {} attempts WELL INSIDE the 20s budget - the attempt backstop bound this wait, not the clock (data intact; do NOT run 'drives flash')",
+                                attempt));
+                        }
                         break;
                     }
-                    ctx.yield_cpu();
+                    // SLEEP, do not yield.
+                    //
+                    // `yield_cpu` does not wait - it hands the core back and leaves this task READY,
+                    // so the scheduler returns immediately and the next attempt follows at loop speed.
+                    // That is how 1000 attempts finished in 47 ms on ARM: the "backstop" became the
+                    // binding constraint and the 20 s clock never got a say, which is the exact
+                    // count-is-not-a-duration failure the comment above this loop warns about.
+                    //
+                    // A real sleep makes the attempt budget TRACK the clock instead of racing it:
+                    // 1000 attempts * 20 ms exceeds the 20 s deadline on any board, so the clock binds
+                    // everywhere and the count goes back to being what it claims to be - a runaway
+                    // backstop that should never fire.
+                    ctx.sleep(ctx.duration_cycles(MOUNT_RETRY_MS));
                 }
             }
         }
@@ -392,7 +487,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // disk (I/O error - data may be intact, do NOT flash) vs a blank/raw disk (flash to format). Set on
     // the I/O-failure break paths below; left false for a genuinely blank disk (the FS_NOFS case).
     let mut storage_unreadable = false;
-    let mut fs: Option<Fs> = if capacity == 0 {
+    // Replies that could not be delivered; owned here so no global state is needed (Commandment VI).
+    let mut reply_fails = 0u32;
+    // ONE `Fs`, DECLARED FIRST AND FILLED IN PLACE.
+    //
+    // This was an `if/else` EXPRESSION whose else-branch built the volume in a local called `mounted`
+    // and yielded it. That is a second 36 KiB `Fs` alive at the same time as this one, for the length
+    // of the function - the block's value has to be materialised somewhere before it can become `fs`.
+    // Declaring the destination up front and mounting straight into it leaves exactly one.
+    let mut fs: Option<Fs> = None;
+    if capacity == 0 {
         // No usable disk: block-driver reported 0 capacity after the bounded probe above (a genuinely
         // cardless boot - e.g. the Pi 2 before the SD/EMMC driver can read the card). There is nothing
         // to mount, and the loop below would probe LBA 0 up to MOUNT_MAX_ATTEMPTS times - each a
@@ -401,13 +505,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // storage-unavailable at once. Marked unreadable so the serve loop stays armed to re-mount if a
         // disk later appears - and that path re-checks capacity first, so it never re-probes an absent disk.
         storage_unreadable = true;
-        None
     } else {
-        let mut mounted: Option<Fs> = None;
         let mut io_attempts = 0u32;
         loop {
-            match Fs::mount(&ctx) {
-                Ok(f) => {
+            match Fs::mount_into(&ctx, &mut fs) {
+                Ok(()) => {
+                    // Borrowed, not moved: the mount wrote straight into `fs`, and reading it
+                    // through a reference is what keeps this path free of 36 KiB copies.
+                    let Some(f) = fs.as_ref() else { break };
                     ctx.log_fmt(format_args!(
                         "fs: mounted GSFS0008 ({} blocks, bitmap {}..{}, root@{}, {} free)",
                         f.total_blocks, f.bitmap_start, f.data_start, f.root_first_block, f.free_blocks
@@ -418,7 +523,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // operator's first `ls` answered with two lines about journal ordering before it
                     // answered with the directory. The fact is about the medium, not the command.
                     let _ = f.durable_or_warn(&ctx);
-                    mounted = Some(f);
                     break;
                 }
                 Err(e) if e == E_IO => {
@@ -454,8 +558,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
         }
-        mounted
-    };
+    }
 
     // TEST builds only (`--features selftest`): exercises the tree + reboot survival by
     // WRITING to the disk. Never enabled in production (it would pollute a user's disk).
@@ -517,8 +620,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // A9-3: the caps this state handed out do not survive the state. Revoke before
                 // replacing it, so holders get CapRevoked (recoverable) rather than FS_NOTFOUND.
                 if let Some(old) = fs.as_mut() { old.revoke_all_open(&ctx); }
-                match Fs::mount(&ctx) {
-                    Ok(nf) => { fs = Some(nf); }
+                match Fs::mount_into(&ctx, &mut fs) {
+                    Ok(()) => {}
                     Err(e) => {
                         // Loud, and DEGRADE rather than serve from state we have just declared stale.
                         ctx.log_fmt(format_args!("fs: re-mount after I/O error FAILED ({}) - degrading", e));
@@ -554,14 +657,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // driver that answered "no disk" - the comment below meant `None` and the code accepted
             // `Some(0)`, so a diskless machine attempted a mount on every request after all.
             if block_capacity(&ctx).unwrap_or(0) > 0 {
-                if let Ok(f) = Fs::mount(&ctx) {
+                if Fs::mount_into(&ctx, &mut fs).is_ok() {
+                    // `mount_into` has already stored it; read the facts back through a reference.
+                    let total = fs.as_ref().map_or(0, |f| f.total_blocks);
                     ctx.log_fmt(format_args!(
                         "fs: storage recovered - re-mounted GSFS0008 ({} blocks, {} free)",
-                        f.total_blocks, f.free_blocks
+                        total, fs.as_ref().map_or(0, |f| f.free_blocks)
                     ));
-                    capacity = f.total_blocks;
-                    storage_unreadable = false;
-                    fs = Some(f);
+                    capacity = total;
+                    storage_unreadable = false;   // `mount_into` already stored the volume
                 }
             }
         }
@@ -575,8 +679,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             None => continue,
         };
         match badge {
-            Some((rid, right)) => serve_filecap(&ctx, &mut fs, rid, right, storage_unreadable, msg.payload_bytes(), reply),
-            None => serve(&ctx, &mut fs, capacity, storage_unreadable, msg.payload_bytes(), reply),
+            Some((rid, right)) => serve_filecap(&ctx, &mut fs, rid, right, storage_unreadable,
+                                                msg.payload_bytes(), reply, &mut reply_fails),
+            None => serve(&ctx, &mut fs, capacity, storage_unreadable, msg.payload_bytes(), reply,
+                          &mut reply_fails),
         }
         ctx.remove_cap(reply);
     }
@@ -887,7 +993,34 @@ fn op_is_read_only(op: u8) -> bool {
 /// device is the source and this is a derived view (Commandment III - the source wins).
 ///
 /// If a future query wants a size, it re-derives. It does not read this.
-fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8], reply: CapHandle) {
+/// Reply to a caller, NON-BLOCKING, and report a reply that could not be delivered.
+///
+/// **`try_send`, never `send` - §8.9, and it is a deadlock rather than a style preference.** This
+/// service sends a request to `block-driver` and then waits for the answer ON ITS OWN ENDPOINT, while
+/// that same endpoint keeps receiving client requests. Sixteen of those arrive - a busy shell, or chaos
+/// flood-storming a service several thousand times a run - and the queue is full. A reply can then
+/// never be enqueued, and with a BLOCKING send neither side can break it: the replier waits for room,
+/// this service waits for the reply, and the shell waits behind this service.
+///
+/// Dropping the reply is recoverable instead: the caller's deadline fires and it retries. That is why
+/// every other service in the tree already replies with `try_send`; `fs` and `block-driver` were the
+/// two exceptions, and they are the persistence path.
+///
+/// The drop is REPORTED, not swallowed (§26.7): without this a caller timing out looks like a slow disk
+/// rather than an answer its queue had no room for. Rate-limited on the first and every 64th, because a
+/// full queue is a burst - a dead caller would otherwise log once per request.
+fn reply_nonblocking<E>(r: Result<(), E>, ctx: &ServiceContext, fails: &mut u32) {
+    if r.is_err() {
+        *fails = fails.saturating_add(1);
+        if *fails == 1 || *fails % 64 == 0 {
+            ctx.log_fmt(format_args!(
+                "fs: reply send FAILED x{} (caller is gone, or its queue is full - it will time out)", fails));
+        }
+    }
+}
+
+fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8], reply: CapHandle,
+         reply_fails: &mut u32) {
     // Split the CORRELATION TAG off the front. A name-addressed request carries one byte the client
     // chose, and its reply carries the same byte back, so the client can tell an answer to ITS question
     // from an answer to an earlier one. Everything after it is the request exactly as every opcode arm
@@ -898,15 +1031,34 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
     let mut out = [0u8; SERVE_REPLY_MAX];
     out[0] = tag;
     let mut len = 0usize;
-    if let Some(f) = vol.as_ref() { f.io_error_seen.set(false); }
+    if let Some(f) = vol.as_ref() {
+        f.io_error_seen.set(false);
+        f.transport_fail_seen.set(false);
+        f.blk_ops.set(0);
+        f.blk_cycles.set(0);
+    }
+    let c_start = ctx.read_tsc();
     serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
 
     let errored = vol.as_ref().map_or(false, |f| f.io_error_seen.get());
+    // A DESYNC IS NOT A DYING DISK, and must not reach the re-mount path below.
+    //
+    // The device said nothing - the reply was mis-correlated, truncated or never came. Re-mounting on
+    // that acts on a report the hardware never made, and the re-mount's own reads desync the same way,
+    // so it fails too and the volume is DEGRADED. That is how a stick formatted this morning ended the
+    // session with a CRC-bad block and `drives check` failing on healthy storage.
+    //
+    // Reported, never swallowed (§26.7) - it is a real failure and the request still fails. What it
+    // does not do is convict the disk of it. The caller retries; the next request usually succeeds,
+    // which is precisely why the second run of everything always looked fine.
+    let desynced = vol.as_ref().map_or(false, |f| f.transport_fail_seen.get());
+    if desynced && !errored {
+        ctx.log("fs: the block protocol lost step - the DEVICE reported nothing, so the volume is                  left mounted and this request fails; the caller retries");
+    }
     if errored && len != REPLY_SENT_DIRECTLY && p.first().map_or(false, |&op| op_is_read_only(op)) {
         ctx.log("fs: device I/O error while serving - re-mounting and retrying this request once");
-        match Fs::mount(ctx) {
-            Ok(nf) => {
-                *vol = Some(nf);
+        match Fs::mount_into(ctx, vol) {
+            Ok(()) => {
                 len = 0;
                 serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
             }
@@ -936,7 +1088,34 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         // malformed one and reports something misleading. Never send one - say ERR properly.
         if len == 0 { out[1] = FS_ERR; len = 1; }
         // +1 for the tag at out[0]
-        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out[..1 + len]));
+        reply_nonblocking(ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..1 + len])), ctx, reply_fails);
+    }
+
+    // WHERE THE TIME WENT, for the requests that actually cost something.
+    //
+    // Reported only when a request took a second or more, so an idle prompt logs nothing and a slow
+    // one names itself. The op and the block-op count together answer the question that matters: a
+    // request that spent 7 seconds doing FOUR block operations has a slow device or a slow transport,
+    // and one that spent 7 seconds doing four THOUSAND has an algorithm walking the disk. Those need
+    // opposite fixes, and guessing between them has already cost this cycle several wrong turns.
+    //
+    // MEASURED IN CYCLES, NOT SECONDS - the seconds version of this line was lying. It compared
+    // `epoch_secs_monotonic` at each end, which has one-second resolution, so ANY request that
+    // happened to straddle a second boundary reported "took 1s" even if it took a microsecond. That
+    // made a fast request indistinguishable from a slow one at exactly the point the difference
+    // mattered: after a fix, when the question is whether the remaining "1s" lines are real. The
+    // multi-second readings were always sound (you cannot cross seventeen boundaries by accident) -
+    // it is the 1s ones that carried no information, and I read meaning into them anyway.
+    let all_c = ctx.read_tsc().saturating_sub(c_start).max(1);
+    let per_sec = ctx.duration_cycles(1_000).max(1);
+    let call_us = all_c.saturating_mul(1_000_000) / per_sec;
+    if call_us >= 200_000 {
+        let ops = vol.as_ref().map_or(0, |f| f.blk_ops.get());
+        let blk_c = vol.as_ref().map_or(0, |f| f.blk_cycles.get());
+        ctx.log_fmt(format_args!(
+            "fs: op {} took {} us, {} block ops, {}% of it inside them",
+            p.first().copied().unwrap_or(0), call_us, ops,
+            blk_c.saturating_mul(100) / all_c));
     }
 }
 
@@ -1069,8 +1248,8 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             }
             let ll = if p.len() >= 2 { (p[1] as usize).min(LABEL_MAX) } else { 0 };
             let label = if p.len() >= 2 + ll { &p[2..2 + ll] } else { &[][..] };
-            match Fs::format(ctx, capacity, label) {
-                Ok(f) => { *vol = Some(f); send(&[FS_OK]); }
+            match Fs::format_into(ctx, capacity, label, vol) {
+                Ok(()) => { send(&[FS_OK]); }
                 Err(why) => {
                     // `format` names the exact step that failed ("backup superblock write failed",
                     // "bitmap init failed", ...). Discarding it left the operator with the shell's
@@ -1299,8 +1478,12 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
 /// after the cap check), so reaching here means the caller holds a real, live cap. We resolve the
 /// resource id → the open file's path, enforce that the operation needs **≤ the validated right**
 /// (the load-bearing non-escalation check, §7.3 - a READ cap can never write), and act.
-fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8, unreadable: bool, p: &[u8], reply: CapHandle) {
-    let send = |bytes: &[u8]| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(bytes)); };
+fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8, unreadable: bool, p: &[u8], reply: CapHandle,
+                 reply_fails: &mut u32) {
+    let mut send = |bytes: &[u8]| {
+        let r = ctx.try_send_by_handle(reply, &Message::from_bytes(bytes));
+        reply_nonblocking(r, ctx, reply_fails);
+    };
     let nofs: u8 = if unreadable { FS_UNAVAIL } else { FS_NOFS };
     let fs = match vol { Some(f) => f, None => { send(&[nofs]); return; } };
     if p.is_empty() { send(&[FS_ERR]); return; }
@@ -1423,7 +1606,21 @@ impl Fs {
         }
     }
 
-    fn mount(ctx: &ServiceContext) -> Result<Fs, &'static str> {
+    /// Mount, CONSTRUCTING THE `Fs` DIRECTLY INTO `out` rather than returning it.
+    ///
+    /// `Fs` is 36,424 bytes, and it used to be returned by value: the caller received it in a stack
+    /// temporary, wrapped it in `Some(..)`, and moved that into its destination. Each hop is a 36 KiB
+    /// memcpy that the optimiser did not elide, and `service_main`'s frame held FOUR of them - 145 KiB
+    /// of a 256 KiB user stack spent on copies of one structure.
+    ///
+    /// That is what made the deepest call reach 89% of the stack under chaos, with 28 KiB spare. It is
+    /// also why the request path had no room for anything new: the correlation tags took five attempts
+    /// to fit and only fit by being shaved, when the space they needed was being spent here.
+    ///
+    /// Writing through `&mut` gives the struct literal one destination and one existence. Nothing about
+    /// the filesystem changed - this is CLAUDE.md 26.6.1's rule applied to a working set that was small
+    /// all along and merely duplicated.
+    fn mount_into(ctx: &ServiceContext, out: &mut Option<Fs>) -> Result<(), &'static str> {
         let sb = Self::read_superblock(ctx)?;
         // Feature policy (GSFS0008, §6.15). The masks are valid because `sb_valid` (above) covers
         // them under the superblock CRC. An `incompat` bit this build doesn't know means the
@@ -1454,7 +1651,7 @@ impl Fs {
         let mut label = [0u8; LABEL_MAX];
         let ll = (sb[76] as usize).min(LABEL_MAX);
         label[..ll].copy_from_slice(&sb[77..77 + ll]);
-        Ok(Fs {
+        *out = Some(Fs {
             total_blocks: u64_at(&sb, 16),
             bitmap_start: u64_at(&sb, 24),
             data_start: u64_at(&sb, 40),
@@ -1473,6 +1670,13 @@ impl Fs {
             last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
             flush_warned: core::cell::Cell::new(false),
             io_error_seen: core::cell::Cell::new(false),
+            io_fail_streak: core::cell::Cell::new(0),
+            blk_ops: core::cell::Cell::new(0),
+            blk_cycles: core::cell::Cell::new(0),
+            transport_fail_seen: core::cell::Cell::new(false),
+            // `None` = unknown, so the first persist of this mount always writes. One write per
+            // mount is the price of never assuming what is on a disk we have not written to yet.
+            sb_persisted: None,
             txn_active: false,
             txn_n: 0,
             txn_overflow: false,
@@ -1480,7 +1684,8 @@ impl Fs {
             txn_blk: [[0u8; BLOCK]; TXN_CAP],
             crash_after_commit: false,
             open_files: [OpenFile { rid: 0, plen: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
-        })
+        });
+        Ok(())
     }
 
     // ── crash-consistency journal (Phase C) ──────────────────────────────────
@@ -1500,9 +1705,19 @@ impl Fs {
                 if self.txn_lba[i] == lba { return Some(self.txn_blk[i]); }
             }
         }
-        match block_read(ctx, lba) {
+        let t_blk = self.blk_begin(ctx);
+        let mut why = None;
+        let read_out = block_read_kind(ctx, lba, &mut why);
+        self.blk_end(ctx, t_blk);
+        match read_out {
             Some(b) => Some(b),
-            None => { self.io_error_seen.set(true); None }
+            None => {
+                match why {
+                    Some(BlockFail::Transport) => self.transport_fail_seen.set(true),
+                    _ => self.io_error_seen.set(true),
+                }
+                None
+            }
         }
     }
 
@@ -1519,8 +1734,16 @@ impl Fs {
             self.txn_n += 1;
             true
         } else {
-            let ok = block_write(ctx, lba, data);
-            if !ok { self.io_error_seen.set(true); }
+            let t_blk = self.blk_begin(ctx);
+            let mut why = None;
+            let ok = block_write_kind(ctx, lba, data, &mut why);
+            self.blk_end(ctx, t_blk);
+            if !ok {
+                match why {
+                    Some(BlockFail::Transport) => self.transport_fail_seen.set(true),
+                    _ => self.io_error_seen.set(true),
+                }
+            }
             ok
         }
     }
@@ -1621,8 +1844,24 @@ impl Fs {
     /// guarantee it was never going to give. Before this existed there was no flush at all, so
     /// continuing is exactly the old behaviour - the difference is that it is now VISIBLE. What is
     /// not acceptable is the third option: proceeding while implying the ordering held (§26.7).
+    /// Open/close a metered disk trip. Every path that reaches `block_rpc` from this volume brackets
+    /// itself with these, so the count is of ALL trips rather than the metadata ones I happened to
+    /// instrument first - that partial count is what made a 19-second request look like 14 seconds of
+    /// `fs` compute, when the journal writes it does not see are the obvious other candidate.
+    fn blk_begin(&self, ctx: &ServiceContext) -> u64 {
+        self.blk_ops.set(self.blk_ops.get().saturating_add(1));
+        ctx.read_tsc()
+    }
+    fn blk_end(&self, ctx: &ServiceContext, t0: u64) {
+        self.blk_cycles.set(self.blk_cycles.get()
+            .saturating_add(ctx.read_tsc().saturating_sub(t0)));
+    }
+
     fn durable_or_warn(&self, ctx: &ServiceContext) -> bool {
-        if block_flush(ctx) { return true; }
+        let t_blk = self.blk_begin(ctx);
+        let flushed = block_flush(ctx);
+        self.blk_end(ctx, t_blk);
+        if flushed { return true; }
         if !self.flush_warned.get() {
             self.flush_warned.set(true);
             ctx.log("fs: durability NOT attested by this drive - it accepts no cache flush, so journal write ordering is unenforced and a power loss may leave metadata torn. Metadata stays CRC-checked, so damage is detected on read; what is missing is automatic repair. See CLAUDE.md 6.1 (2026-07-25).");
@@ -1646,11 +1885,16 @@ impl Fs {
     /// a checksummed commit record (the atomic point), then checkpoint them to their home LBAs,
     /// then invalidate the journal. On overflow or any failure the transaction is dropped; if it
     /// failed before the commit record landed, home is untouched (the fs is unchanged).
-    /// Record a block-I/O failure on the JOURNAL path, which uses `block_read`/`block_write` directly
-    /// rather than the `tb_*` funnels and therefore bypassed `io_error_seen` entirely - leaving the one
-    /// failure that most needs a re-mount (a device dying mid-checkpoint, whose transaction is now
-    /// half-applied and awaiting replay) as the one that never triggered one.
-    fn note_io_error(&self) { self.io_error_seen.set(true); }
+    /// The journal path's classified marker. It used to call `note_io_error` for EVERY failure, so a
+    /// protocol desync during a commit convicted the disk and triggered a re-mount - on the one path
+    /// where that is most consequential, because a re-mount mid-checkpoint is what re-reads a
+    /// half-applied transaction. A real device failure here still degrades, exactly as before.
+    fn note_block_fail(&self, why: Option<BlockFail>) {
+        match why {
+            Some(BlockFail::Transport) => self.transport_fail_seen.set(true),
+            _ => self.io_error_seen.set(true),
+        }
+    }
 
     fn commit_txn(&mut self, ctx: &ServiceContext) -> Result<(), &'static str> {
         if self.txn_overflow { self.abort_txn(); return Err("transaction too large to commit atomically"); }
@@ -1660,8 +1904,12 @@ impl Fs {
         self.txn_active = false;
         // 1. Stage the data blocks in the journal (journal_start+1 ..).
         for i in 0..n {
-            if !block_write(ctx, self.journal_start + 1 + i as u64, &self.txn_blk[i]) {
-                self.note_io_error();
+            let mut why = None;
+            let t_blk = self.blk_begin(ctx);
+            let staged = block_write_kind(ctx, self.journal_start + 1 + i as u64, &self.txn_blk[i], &mut why);
+            self.blk_end(ctx, t_blk);
+            if !staged {
+                self.note_block_fail(why);
                 return Err("journal data write failed");
             }
         }
@@ -1695,7 +1943,14 @@ impl Fs {
         commit[8 + n * 8..12 + n * 8].copy_from_slice(&data_crc.to_le_bytes());
         let crc = crc32(&commit[..12 + n * 8]);
         commit[COMMIT_CRC_OFF..COMMIT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
-        if !block_write(ctx, self.journal_start, &commit) { self.note_io_error(); return Err("journal commit write failed"); }
+        let mut why = None;
+        let t_blk = self.blk_begin(ctx);
+        let committed = block_write_kind(ctx, self.journal_start, &commit, &mut why);
+        self.blk_end(ctx, t_blk);
+        if !committed {
+            self.note_block_fail(why);
+            return Err("journal commit write failed");
+        }
         // BARRIER 2: and the commit record must be on the medium before any home block is
         // overwritten - that ordering IS the atomicity. A device free to reorder these two can land
         // a half-finished checkpoint with no commit record to replay it from.
@@ -1708,10 +1963,14 @@ impl Fs {
         }
         // 3. Checkpoint: write each staged block to its home LBA.
         for i in 0..n {
-            if !block_write(ctx, self.txn_lba[i], &self.txn_blk[i]) {
+            let mut why = None;
+            let t_blk = self.blk_begin(ctx);
+            let homed = block_write_kind(ctx, self.txn_lba[i], &self.txn_blk[i], &mut why);
+            self.blk_end(ctx, t_blk);
+            if !homed {
                 // Commit is durable: the next mount will replay this transaction. Report, but
                 // the data is safe - no corruption, only a deferred checkpoint.
-                self.note_io_error();
+                self.note_block_fail(why);
                 return Err("checkpoint write failed (will replay on next mount)");
             }
         }
@@ -1840,7 +2099,10 @@ impl Fs {
 
     /// Format the disk as an empty GSFS0008 sized to `capacity`, then mount. Same layout
     /// `osdev format_superblock` writes. `drives flash`; only ever user-initiated (§3.12).
-    fn format(ctx: &ServiceContext, capacity: u64, label: &[u8]) -> Result<Fs, &'static str> {
+    /// Format, constructing into `out` for the reason `mount_into` documents: `Fs` is 36 KiB and a
+    /// by-value return costs a copy of it in every caller that stores the result.
+    fn format_into(ctx: &ServiceContext, capacity: u64, label: &[u8], out: &mut Option<Fs>)
+        -> Result<(), &'static str> {
         let total_blocks = capacity;
         let bitmap_start: u64 = 1;
         let bitmap_blocks = (total_blocks + BITS_PER_BMBLOCK - 1) / BITS_PER_BMBLOCK;
@@ -1943,7 +2205,7 @@ impl Fs {
         // single flaky read of the medium.)
         let mut lbl = [0u8; LABEL_MAX];
         lbl[..ll].copy_from_slice(&label[..ll]);
-        Ok(Fs {
+        *out = Some(Fs {
             total_blocks,
             bitmap_start,
             data_start,
@@ -1962,6 +2224,13 @@ impl Fs {
             last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
             flush_warned: core::cell::Cell::new(false),
             io_error_seen: core::cell::Cell::new(false),
+            io_fail_streak: core::cell::Cell::new(0),
+            blk_ops: core::cell::Cell::new(0),
+            blk_cycles: core::cell::Cell::new(0),
+            transport_fail_seen: core::cell::Cell::new(false),
+            // `None` = unknown, so the first persist of this mount always writes. One write per
+            // mount is the price of never assuming what is on a disk we have not written to yet.
+            sb_persisted: None,
             txn_active: false,
             txn_n: 0,
             txn_overflow: false,
@@ -1969,7 +2238,8 @@ impl Fs {
             txn_blk: [[0u8; BLOCK]; TXN_CAP],
             crash_after_commit: false,
             open_files: [OpenFile { rid: 0, plen: 0, path: [0u8; OPEN_PATH_MAX] }; MAX_OPEN],
-        })
+        });
+        Ok(())
     }
 
     fn relabel(&mut self, ctx: &ServiceContext, label: &[u8]) -> Result<(), &'static str> {
@@ -1983,6 +2253,37 @@ impl Fs {
     /// Re-write the mutable superblock fields (free count, root extent, flags, label) from
     /// current in-memory state. Geometry (total/bitmap/data) is fixed at format.
     fn persist_super(&mut self, ctx: &ServiceContext) -> Result<(), &'static str> {
+        // SKIP THE WRITE WHEN NOTHING IT WRITES HAS CHANGED.
+        //
+        // This runs after every mutation, and it is not free: a superblock read, a CRC, and TWO
+        // staged block writes (primary + backup) inside the transaction. An overwrite that reuses a
+        // file's existing blocks changes no field below - not the free count, not the root extent,
+        // not the label - so all of that was pure cost.
+        //
+        // It is paid on the hot path of the whole system, because the shell write-throughs
+        // `/.gsh_history` after EVERY command: type `date` and the superblock is read, rewritten and
+        // journalled twice before the clock is consulted. That is what the "stack used at the deepest
+        // block call" line - documented as firing "once per mount" - was really reporting when it
+        // appeared before every prompt.
+        //
+        // The comparison is against what was last SUCCESSFULLY persisted, so a failed write leaves
+        // the record unset and the next attempt writes again. And it is a write-avoidance record
+        // only: the in-memory fields stay the single source of truth (§26.4) - this never answers a
+        // question, it only declines to repeat an answer.
+        let want = SbFields {
+            root_first_block: self.root_first_block,
+            root_block_count: self.root_block_count,
+            free_blocks: self.free_blocks,
+            flags: self.flags,
+            label_len: self.label_len,
+            label: self.label,
+            feat_compat: self.feat_compat,
+            feat_ro_compat: self.feat_ro_compat,
+            feat_incompat: self.feat_incompat,
+        };
+        if self.sb_persisted == Some(want) {
+            return Ok(());
+        }
         let mut sb = self.tb_read(ctx, 0).ok_or("superblock read failed")?;
         sb[48..56].copy_from_slice(&self.root_first_block.to_le_bytes());
         sb[56..64].copy_from_slice(&self.root_block_count.to_le_bytes());
@@ -2005,6 +2306,8 @@ impl Fs {
         // transaction, so they commit atomically and the backup never lags the primary.
         if !self.tb_write(ctx, 0, &sb) { return Err("superblock write failed"); }
         if !self.tb_write(ctx, self.total_blocks - 1, &sb) { return Err("backup superblock write failed"); }
+        // Only now, after BOTH copies are staged successfully.
+        self.sb_persisted = Some(want);
         Ok(())
     }
 
@@ -2040,7 +2343,7 @@ impl Fs {
                     if run_start.is_none() { run_start = Some(idx); run_len = 0; }
                     run_len += 1;
                     if run_len == n {
-                        let start = run_start.unwrap();
+                        let Some(start) = run_start else { continue };
                         self.bm_set_range(ctx, start, n, true)?;
                         self.free_blocks = self.free_blocks.saturating_sub(n);
                         self.persist_super(ctx)?;
@@ -2144,7 +2447,7 @@ impl Fs {
                     && idx < self.root_first_block.saturating_add(self.root_block_count);
                 let used = is_root || (blk[(within / 8) as usize] >> (within % 8)) & 1 != 0;
                 if used {
-                    if start.is_some() { return Some((start.unwrap(), len)); }
+                    if let Some(s) = start { return Some((s, len)); }
                 } else {
                     if start.is_none() { start = Some(idx); len = 0; }
                     len += 1;
@@ -2918,7 +3221,18 @@ impl Fs {
                             let (s, l) = exts[i];
                             self.bm_set_range(ctx, s, l, true)?; // data runs are referenced → used
                             st.3 += l;
-                            for j in 0..l { if data_read(ctx, s + j).is_none() { ok = false; } }
+                            for j in 0..l {
+                                let got = data_read(ctx, s + j);
+                                self.note_walk_read(got.is_some())?;
+                                if got.is_none() {
+                                    ctx.log_fmt(format_args!(
+                                        "fs: check - block {} of run {} (lba {}, len {}) failed verification{}",
+                                        j + 1, i + 1, s, l,
+                                        if j + 1 == l { " (LAST block of this run)" } else { "" }
+                                    ));
+                                    ok = false;
+                                }
+                            }
                         }
                         if !ok { st.2 += 1; }
                     }
@@ -2927,7 +3241,24 @@ impl Fs {
             } else {
                 let mut ok = true;
                 for bi in 0..count {
-                    if data_read(ctx, first + bi).is_none() { ok = false; }
+                    let got = data_read(ctx, first + bi);
+                    self.note_walk_read(got.is_some())?;
+                    if got.is_none() {
+                        // WHICH block of the extent, not just which LBA. `data_read` already names the
+                        // lba and the two CRCs; what it cannot know is whether this is the middle of a
+                        // file or its LAST block - and that distinction decides what the report MEANS.
+                        // A tail block is allocated when the extent is sized and only written when data
+                        // reaches it, so an unwritten tail carries no CRC stamp and reads as
+                        // `stored 0x00000000` on a filesystem that is perfectly healthy. Everything
+                        // else here is real damage. Reporting "1 bad" without saying which case it was
+                        // is what makes `drives check` fail with no way to tell a bug from bit-rot.
+                        ctx.log_fmt(format_args!(
+                            "fs: check - block {} of {} in the extent at lba {} failed verification{}",
+                            bi + 1, count, first,
+                            if bi + 1 == count { " (this is the LAST block of the extent)" } else { "" }
+                        ));
+                        ok = false;
+                    }
                 }
                 if !ok { st.2 += 1; }
             }
@@ -2947,6 +3278,24 @@ impl Fs {
 
     /// Walk the filesystem from root verifying every block's CRC; change nothing. Returns
     /// `(files, dirs, bad, scanned)`.
+    /// Record the outcome of one walk read. `Err` once the device has failed `WALK_FAIL_MAX` reads in
+    /// a row - not because that many bad blocks is impossible, but because a bad BLOCK fails its CRC
+    /// instantly while a device that has stopped answering costs 30 s every time it is asked. The two
+    /// are indistinguishable from here; the streak is what tells them apart.
+    fn note_walk_read(&self, ok: bool) -> Result<(), &'static str> {
+        const WALK_FAIL_MAX: u32 = 4;
+        if ok {
+            self.io_fail_streak.set(0);
+            return Ok(());
+        }
+        let n = self.io_fail_streak.get() + 1;
+        self.io_fail_streak.set(n);
+        if n >= WALK_FAIL_MAX {
+            return Err("storage stopped answering - walk abandoned");
+        }
+        Ok(())
+    }
+
     fn scrub(&self, ctx: &ServiceContext) -> Result<(u32, u32, u32, u64), &'static str> {
         let mut st = (0u32, 0u32, 0u32, 0u64); // (files, dirs, bad, scanned)
         let root = self.root_entry();
@@ -2995,7 +3344,11 @@ impl Fs {
                         for i in 0..ne {
                             let (s, l) = exts[i];
                             st.3 += l;
-                            for j in 0..l { if data_read(ctx, s + j).is_none() { ok = false; } }
+                            for j in 0..l {
+                                let got = data_read(ctx, s + j);
+                                self.note_walk_read(got.is_some())?;
+                                if got.is_none() { ok = false; }
+                            }
                         }
                         if !ok { st.2 += 1; }
                     }
@@ -3005,7 +3358,9 @@ impl Fs {
                 st.3 += count;
                 let mut ok = true;
                 for bi in 0..count {
-                    if data_read(ctx, first + bi).is_none() { ok = false; }
+                    let got = data_read(ctx, first + bi);
+                    self.note_walk_read(got.is_some())?;
+                    if got.is_none() { ok = false; }
                 }
                 if !ok { st.2 += 1; }
             }
@@ -3097,16 +3452,146 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 /// One block-driver RPC with restart recovery: if the reply is missing (block-driver may have
 /// restarted, leaving our cached cap EndpointDead), reacquire a fresh cap by name (via the kernel
 /// directory) and retry once (Phase D, §14.3). All block I/O goes through here.
-fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
-    let msg = Message::from_bytes(req);
-    if let Some(r) = ctx.request_with_reply("block-driver", &msg) {
-        return Some(r);
+/// A block reply: the driver's bytes, past the correlation tag, in a buffer sized to the protocol.
+///
+/// 513 bytes, not the 4096 a `Message` carries. That difference is the whole reason the tag fits now.
+/// One block-protocol transfer buffer: big enough for the largest REQUEST (write: op + lba + block)
+/// as well as the largest reply (status + block), because the bounded call stages the request and
+/// receives the reply in the SAME buffer.
+///
+/// One constant, used by both the buffer and this struct. They were two separate expressions - 514
+/// here and 514 at the call site, against a 522-byte write request - and sizing them independently is
+/// exactly how a write came to be sent eight bytes short.
+pub const BLK_XFER_MAX: usize = 1 + 9 + BLOCK;
+
+// A POWER OF TWO, deliberately, and larger than the transfer it must hold.
+//
+// `CallDeadline` now tells the kernel how much room this buffer has, so the kernel can refuse a
+// reply that would not fit instead of writing past it. That capacity travels as a power-of-two
+// CLASS (there is one spare nibble in the syscall's argument, not thirteen bits), rounded DOWN so
+// the kernel is never told more room than exists. `BLK_XFER_MAX` is 1 + 9 + 512 = 522, which
+// rounds down to 512 - and a 522-byte reply into a "512-byte" buffer would then be refused, which
+// is every block read on both ARM ports.
+//
+// Rounding up in the SDK would be the wrong fix: it would declare room this buffer does not have,
+// which is the exact smash the capacity was added to prevent. So the buffer moves to the class
+// boundary instead. Costs ~500 bytes of a 256 KiB stack whose deepest measured use is 78 KiB.
+const BLK_REPLY_MAX: usize = 1024;
+const _: () = assert!(BLK_REPLY_MAX >= BLK_XFER_MAX && BLK_REPLY_MAX.is_power_of_two(),
+    "the block buffer must hold a full transfer AND be a power of two - see the note above");
+
+pub struct BlockReply {
+    buf: [u8; BLK_REPLY_MAX],
+    len: usize,
+}
+
+impl BlockReply {
+    /// The reply body, past the tag. A borrow - nothing is copied.
+    pub fn body(&self) -> &[u8] {
+        &self.buf[1..1 + self.len]
     }
-    if ctx.reacquire_by_name("block-driver") {
-        return ctx.request_with_reply("block-driver", &msg);
+}
+
+/// Latch for the one-shot stack-depth report inside `block_rpc`. Owned by this service and touched
+/// nowhere else, in the same shape `xhci` uses for `PROBE_FAILS`.
+static STACK_DEPTH_REPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
+    // BOUNDED, on the LEAN await. The undeadlined form wakes only on the peer's DEATH, so a
+    // block-driver that is alive but silent hung `fs` permanently and every shell command behind it.
+    //
+    // The first attempt at this bound used `request_with_reply_deadline` while that was a wrapper
+    // over `..._outcome`, whose enum CARRIES a `Message` - a second 4 KiB temporary on a service
+    // already near its 256 KiB stack. On hardware it was an instant data abort at startup and an
+    // 826-deep restart loop: a change meant to prevent a hang produced an unusable machine. The
+    // wrapper now writes the wait out itself and costs one message frame, not two.
+    //
+    // 30 s is chosen against the WORK: `block-driver` retries a busy device for up to 30 s per block,
+    // so anything shorter abandons a request still being legitimately serviced.
+    const BLOCK_RPC_SECS: i64 = 30;
+    // The reply lands in a buffer THIS function owns, sized to the protocol (status + one block), and
+    // the caller reads it as a slice. No `Message` is returned, forwarded or mutated anywhere on this
+    // path - which is what makes room for the correlation tag that would not previously fit.
+    // TAG + STATUS + BLOCK. Sized 1 + BLOCK first, which truncated every read by one byte: `fs` then
+    // saw a 512-byte body where 513 belongs and rejected it as a desync - "block read at lba 0 got a
+    // MALFORMED reply (512 bytes)". The shape check did its job; the buffer was simply a byte short.
+    // The shared transfer size - see `BLK_XFER_MAX`.
+    let mut rbuf = [0u8; BLK_REPLY_MAX];
+
+    // CORRELATION TAG at byte 0, echoed by `block-driver` and interpreted no further.
+    //
+    // Without it a reply is matched to a request by ARRIVAL ORDER, and after a chaos storm that order
+    // is not reliable: `fs` read LBA 7702 and got a 17-byte reply where a 513-byte block belonged. That
+    // one was caught only because the SHAPE was wrong, and two reads of DIFFERENT blocks are both 513
+    // bytes - so the next such reply would have been believed, which is silent data corruption.
+    //
+    // Derived from the request, not counted: a counter needs a home, and the only homes here are
+    // threading mutable state through six functions or a `static`, which is the unowned global state
+    // Invariant 9 forbids. Requests differing in op or LBA fold differently; two identical requests
+    // fold alike and their replies are genuinely interchangeable, so that collision is harmless.
+    let tag = {
+        let mut t: u8 = 0x5A;
+        for (i, b) in req.iter().enumerate() {
+            t = t.rotate_left(1) ^ b.wrapping_add(i as u8);
+        }
+        if t == 0 { 1 } else { t }
+    };
+    let mut treq = [0u8; 1 + 9 + BLOCK];
+    let rn = req.len().min(treq.len() - 1);
+    treq[0] = tag;
+    treq[1..1 + rn].copy_from_slice(&req[..rn]);
+    let treq = &treq[..1 + rn];
+
+    // MEASURED HERE, at the deepest point of the request path, on the superblock read - it is the
+    // frame that actually matters, because this is where the stack ran out five times.
+    //
+    // ONCE PER LIFETIME, and the latch is a correction. This comment used to claim the line fires
+    // "once per mount. No state to own, no flood" - and the hardware log showed 175 of them in one
+    // boot, because LBA 0 is read far more often than a mount. Each is ~60 bytes on a 115200 serial
+    // port, and the keystroke echo does a SYNCHRONOUS polled write to that same port, so the flood
+    // was measurably delaying typing (25% of all serial traffic during an interactive window).
+    //
+    // A claim about frequency is a claim that can be wrong, and this one was. What is wanted is the
+    // deepest frame, which one reading gives; repeating it adds nothing and costs the keyboard.
+    if !STACK_DEPTH_REPORTED.load(core::sync::atomic::Ordering::Relaxed)
+        && req.len() >= 9 && req[0] == OP_READ_BLOCK && req[1..9].iter().all(|b| *b == 0)
+    {
+        STACK_DEPTH_REPORTED.store(true, core::sync::atomic::Ordering::Relaxed);
+        ctx.log_fmt(format_args!(
+            "fs: stack used at the deepest block call = {} of {} bytes",
+            ctx.stack_used(), 256 * 1024));
     }
+
+    for attempt in 0..2 {
+        if attempt == 1 && !ctx.reacquire_by_name("block-driver") {
+            break;
+        }
+        if let Some(n) =
+            ctx.request_with_reply_deadline_into("block-driver", treq, &mut rbuf, BLOCK_RPC_SECS)
+        {
+            if n == 0 {
+                return None;
+            }
+            if rbuf[0] != tag {
+                ctx.log_fmt(format_args!(
+                    "fs: discarded a block reply for tag {} while awaiting {} - the protocol is out of step",
+                    rbuf[0], tag));
+                // Do NOT re-send: the request is already with the driver, and asking twice would ask
+                // for the WORK twice. The caller retries at its own level, by which point the queue
+                // has drained.
+                return None;
+            }
+            return Some(BlockReply { buf: rbuf, len: n - 1 });
+        }
+        if attempt == 1 {
+            break;
+        }
+    }
+    ctx.log("fs: block-driver did not answer within 30 s (and could not be reacquired) - failing");
     None
 }
+
 
 /// Largest sector count any real disk can report: the ATA LBA48 ceiling (2^48 sectors, ~128 PiB).
 /// A reported capacity above this is not a disk - it is a mis-correlated/garbage reply. The Bug-2
@@ -3124,7 +3609,7 @@ const MAX_SANE_SECTORS: u64 = 1 << 48;
 /// reason: an absurd count is a mis-read, not a disk.
 fn block_capacity(ctx: &ServiceContext) -> Option<u64> {
     let reply = block_rpc(ctx, &[OP_CAPACITY])?;
-    let p = reply.payload_bytes();
+    let p = reply.body();
     if p.first() != Some(&BLK_OK) || p.len() != 9 { return None; }
     let sectors = u64_at(p, 1);
     if sectors > MAX_SANE_SECTORS { return None; }
@@ -3132,12 +3617,41 @@ fn block_capacity(ctx: &ServiceContext) -> Option<u64> {
 }
 
 /// Read one 512-byte block at `lba` from `block-driver` over IPC (u64 LBA, §6.3).
+/// WHY a block operation failed. The two need opposite responses, and flattening them into `None`
+/// is what let a protocol desync be treated as a dying disk.
+///
+/// `block_read` has always KNOWN the difference - its own comment says "a device error is
+/// retried/degraded, a protocol desync must be seen and reported as itself" - but it returned
+/// `Option`, so the knowledge reached the log and never the control flow. `fs` then called a desync
+/// a device I/O error, re-mounted, failed the re-mount for the same reason, and degraded a volume
+/// whose disk was fine - which is how a freshly formatted stick acquired a CRC-bad block within a
+/// session and `drives check` started failing on healthy storage.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockFail {
+    /// The driver answered and said no. The device is real and it refused: retry, degrade, report.
+    Media,
+    /// No usable answer came back - a mis-correlated, truncated or absent reply. The device has said
+    /// NOTHING. Re-mounting on this is acting on a report the hardware never made.
+    Transport,
+}
+
 fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
+    let mut ignored = None;
+    block_read_kind(ctx, lba, &mut ignored)
+}
+
+/// `block_read`, reporting WHY it failed. Only the callers that decide whether to re-mount need this;
+/// the rest keep the plain form so this stays a two-call-site change rather than thirty.
+fn block_read_kind(ctx: &ServiceContext, lba: u64, fail: &mut Option<BlockFail>) -> Option<[u8; BLOCK]> {
     let mut req = [0u8; 9];
     req[0] = OP_READ_BLOCK;
     req[1..9].copy_from_slice(&lba.to_le_bytes());
-    let reply = block_rpc(ctx, &req)?;
-    let p = reply.payload_bytes();
+    let Some(reply) = block_rpc(ctx, &req) else {
+        // No usable reply at all: a desync `block_rpc` already named, a deadline, or a dead peer.
+        *fail = Some(BlockFail::Transport);
+        return None;
+    };
+    let p = reply.body();
     if p.first() == Some(&BLK_OK) && p.len() >= 1 + BLOCK {
         let mut out = [0u8; BLOCK];
         out.copy_from_slice(&p[1..1 + BLOCK]);
@@ -3145,6 +3659,7 @@ fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
     } else if p.first() == Some(&BLK_ERR) && p.len() == 1 {
         // The driver answered and said no: a genuine device-side failure, already named on its side.
         ctx.log_fmt(format_args!("fs: block read failed at lba {} (device I/O error)", lba));
+        *fail = Some(BlockFail::Media);
         None
     } else {
         // The reply is not a read reply at all - a mis-correlated or truncated message (the Bug-2
@@ -3155,6 +3670,7 @@ fn block_read(ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
         ctx.log_fmt(format_args!(
             "fs: block read at lba {} got a MALFORMED reply ({} bytes, first {}) - protocol desync, not a device error",
             lba, p.len(), p.first().copied().unwrap_or(0xFF)));
+        *fail = Some(BlockFail::Transport);
         None
     }
 }
@@ -3167,7 +3683,7 @@ fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     req[9..17].copy_from_slice(&count.to_le_bytes());
     match block_rpc(ctx, &req) {
-        Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
+        Some(reply) => reply.body().first() == Some(&BLK_OK),
         None => false,
     }
 }
@@ -3186,7 +3702,7 @@ fn block_write_zeros(ctx: &ServiceContext, lba: u64, count: u64) -> bool {
 /// `false` means the data is NOT known to be on the medium and the caller must say so (§26.5, §26.7).
 fn block_flush(ctx: &ServiceContext) -> bool {
     match block_rpc(ctx, &[OP_FLUSH]) {
-        Some(reply) => reply.payload_bytes().first() == Some(&BLK_OK),
+        Some(reply) => reply.body().first() == Some(&BLK_OK),
         None => false,
     }
 }
@@ -3202,14 +3718,38 @@ fn dir_write(ctx: &ServiceContext, lba: u64, blk: &mut [u8; BLOCK]) -> bool {
 
 /// Write one 512-byte block at `lba` to `block-driver` over IPC (u64 LBA, §6.3).
 fn block_write(ctx: &ServiceContext, lba: u64, data: &[u8; BLOCK]) -> bool {
+    let mut ignored = None;
+    block_write_kind(ctx, lba, data, &mut ignored)
+}
+
+/// `block_write`, reporting WHY it failed. It used to call every failure "device I/O error" - a
+/// desync, a truncated reply and a genuine refusal alike - which is the same flattening `block_read`
+/// at least logged its way around.
+fn block_write_kind(
+    ctx: &ServiceContext, lba: u64, data: &[u8; BLOCK], fail: &mut Option<BlockFail>,
+) -> bool {
     let mut req = [0u8; 9 + BLOCK];
     req[0] = OP_WRITE_BLOCK;
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     req[9..].copy_from_slice(data);
     match block_rpc(ctx, &req) {
-        Some(reply) if reply.payload_bytes().first() == Some(&BLK_OK) => true,
-        _ => {
+        Some(reply) if reply.body().first() == Some(&BLK_OK) => true,
+        Some(reply) if reply.body().first() == Some(&BLK_ERR) && reply.body().len() == 1 => {
             ctx.log_fmt(format_args!("fs: block write failed at lba {} (device I/O error)", lba));
+            *fail = Some(BlockFail::Media);
+            false
+        }
+        Some(reply) => {
+            ctx.log_fmt(format_args!(
+                "fs: block write at lba {} got a MALFORMED reply ({} bytes, first {}) - protocol                  desync, not a device error",
+                lba, reply.body().len(), reply.body().first().copied().unwrap_or(0xFF)));
+            *fail = Some(BlockFail::Transport);
+            false
+        }
+        None => {
+            ctx.log_fmt(format_args!(
+                "fs: block write at lba {} got NO usable reply - protocol desync or the driver is                  gone, not a device error", lba));
+            *fail = Some(BlockFail::Transport);
             false
         }
     }

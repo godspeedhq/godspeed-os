@@ -51,6 +51,15 @@ def main():
     ap.add_argument("--chardelay", type=float, default=0.08)
     ap.add_argument("--shot", default=None, help="write a framebuffer screendump (PPM) here")
     ap.add_argument("--tail", type=int, default=4000)
+    # A USB mass-storage device, so the suite's file tests have something to run against.
+    #
+    # QEMU's raspi4b accepts `-device usb-storage` (there is a usb bus), but it emulates no PCIe
+    # VL805, so the kernel's probe finds no xHCI controller and the `xhci` service comes up with
+    # "no controller MMIO granted - idling". The disk is therefore NOT visible to the OS today and
+    # `fs` comes up storage-unavailable - which it does cleanly, without hanging, so everything that
+    # does not touch the filesystem still runs. The flag is here because attaching the drive is the
+    # half we control; the missing half is emulation, and that is recorded rather than worked around.
+    ap.add_argument("--drive", default=None, help="raw disk image to attach as USB mass storage")
     args = ap.parse_args()
 
     profile = "debug" if args.debug else "release"
@@ -60,6 +69,9 @@ def main():
         sys.exit(1)
 
     cmd = [QEMU, "-M", "raspi4b", "-kernel", krn, "-serial", "stdio", "-display", "none"]
+    if args.drive:
+        cmd += ["-device", "usb-storage,drive=d0",
+                "-drive", f"if=none,id=d0,format=raw,file={args.drive}"]
     if args.shot:
         cmd += ["-monitor", f"tcp:127.0.0.1:{MONITOR_PORT},server,nowait"]
 

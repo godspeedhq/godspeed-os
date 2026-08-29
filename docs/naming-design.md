@@ -411,7 +411,7 @@ No new test *categories* - the existing suite is the safety net, run green at ev
   through the gated kernel directory. `AcquireSendCap` rejects callers without the recovery cap.
 - **Phase 6 (the headline test):** a new identity test - **kill the supervisor, the kernel respawns
   it, it recovers its map + manifest, and the system keeps running with no reboot.** The executable
-  proof that the unkillable set is `{kernel}` only. `docs/unsafe-audit.md` essentially unchanged (the
+  proof that the unkillable set is `{kernel}` only. `audits/unsafe-audit.md` essentially unchanged (the
   kernel additions - gated directory, respawn-supervisor, re-point death notices - are small and in
   permitted layers or safe `fn`s).
 

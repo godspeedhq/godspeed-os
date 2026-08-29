@@ -103,6 +103,43 @@ pub fn try_recv(endpoint: CapHandle) -> Result<Option<Message>, IpcError> {
 /// on timeout, `Err` on a real error. `timeout_cycles == 0` blocks forever (like `recv`).
 /// (syscall 35 - `recv_timeout`) Lets a driver idle on its interrupt yet still wake on a
 /// timer (e.g. for keyboard auto-repeat while a key is held - §12).
+/// Receive into a buffer the CALLER owns, returning the byte count.
+///
+/// A `Message` carries a 4096-byte payload BY VALUE, so `recv_timeout` below costs EIGHT kilobytes of
+/// stack per call: one 4 KiB array to receive into, and another inside the `Message` it builds and
+/// returns. Every wrapper that forwards that `Message` pays 4 KiB again.
+///
+/// On `fs` that arithmetic is fatal rather than untidy. Its request path is several such calls deep,
+/// it runs on a 256 KiB stack, and adding one more level made it overflow at mount - a fault that took
+/// five wrong attempts to place because each one removed a single 4 KiB item without measuring the
+/// whole frame.
+///
+/// This is the shape the operation actually has, and the shape every real IPC API uses: the kernel
+/// copies into memory the caller already owns, and hands back a length. Nothing large is created and
+/// nothing large is moved. `Ok(None)` is the timeout, exactly as above.
+///
+/// Caps are NOT delivered here - the block and frame paths carry none, and a caller that needs one
+/// takes it with `take_pending_cap` regardless. A buffer API that silently dropped a capability would
+/// be a leak, so this one simply does not carry them.
+pub fn recv_timeout_into(
+    endpoint: CapHandle, buf: &mut [u8], timeout_cycles: u64,
+) -> Result<Option<usize>, IpcError> {
+    const RECV_TIMED_OUT: i64 = -1001;
+    let packed = ((buf.len() as u64) << 16) | (endpoint.0 as u64 & 0xFFFF);
+    #[cfg(target_arch = "arm")]
+    let timeout_cycles = if timeout_cycles == 0 { 0 } else { timeout_cycles.min(u32::MAX as u64).max(1) };
+    // SAFETY: raw_syscall(35) = RecvTimeout; `buf` is a valid caller-owned slice in user space and its
+    // true length is what is passed, so the kernel cannot write past it.
+    let ret = unsafe { raw_syscall(35, packed, buf.as_mut_ptr() as u64, timeout_cycles) };
+    if ret == RECV_TIMED_OUT {
+        Ok(None)
+    } else if ret < 0 {
+        Err(i64_to_ipc_error(ret))
+    } else {
+        Ok(Some((ret as usize).min(buf.len())))
+    }
+}
+
 pub fn recv_timeout(endpoint: CapHandle, timeout_cycles: u64) -> Result<Option<Message>, IpcError> {
     const RECV_TIMED_OUT: i64 = -1001; // kernel sentinel for "timed out, no message"
     let mut payload = [0u8; MAX_PAYLOAD];
@@ -199,6 +236,76 @@ pub fn call(
 // ---------------------------------------------------------------------------
 // Error conversion.
 // ---------------------------------------------------------------------------
+
+/// `call`, bounded, receiving into a caller-owned buffer.
+///
+/// The reason this exists as a SYSCALL rather than the hand-rolled send + `recv_timeout_into` it
+/// replaces: `recv_timeout_into` takes whatever is next on the endpoint. A service that serves clients
+/// on the same endpoint it awaits replies on would receive an unrelated CLIENT REQUEST, fail to match
+/// it, and drop it - losing the request and leaving the real reply to arrive later as an orphan that
+/// desynced every following exchange. `Call` never had that flaw (it dequeues the reply specifically),
+/// it just could not be bounded. Now it can.
+///
+/// Three cap slots pack into `a0` at 8 bits each - a task holds at most 64 caps, so six bits suffice -
+/// because the ARM 32-bit ABI truncates each argument to one register and the plain `call` layout had
+/// no room left. Length and deadline share `a2`.
+///
+/// `Ok(None)` = the deadline passed with no reply.
+pub fn call_deadline_into(
+    target:      CapHandle,
+    reply_grant: CapHandle,
+    recv:        CapHandle,
+    request:     &[u8],
+    buf:         &mut [u8],
+    max_secs:    u64,
+) -> Result<Option<usize>, IpcError> {
+    const RECV_TIMED_OUT: i64 = -1001;
+    // `buf` carries the request OUT and the reply BACK, exactly as plain `call` does with its own
+    // 4 KiB frame. So it must hold the LARGER of the two, and a caller that sized it for replies
+    // alone is a caller whose requests are about to be cut short.
+    //
+    // This said `.min(buf.len())` in its first version, which truncated in silence: `fs` sized its
+    // buffer at 2 + BLOCK = 514 for replies while a block WRITE request is 1 + 9 + BLOCK = 522, so
+    // every write went out eight bytes short and came back a failure with no reason attached. Reads
+    // are ten bytes and fit, which is why reads worked and only writes broke. A silent truncation is
+    // the one thing a message path must never do (§26.7).
+    if request.len() > MAX_PAYLOAD { return Err(IpcError::MessageTooLarge); }
+    if request.len() > buf.len() { return Err(IpcError::MessageTooLarge); }
+    let n = request.len();
+    buf[..n].copy_from_slice(&request[..n]);
+    // TELL THE KERNEL HOW BIG THE REPLY BUFFER IS. It writes the reply back into `buf`, and until
+    // now it was never told the size: `handle_call_deadline` validated MAX_MESSAGE_SIZE and its own
+    // comment said "the SDK always passes a MAX_MESSAGE_SIZE buffer". That is true of `call` (41),
+    // which allocates its own 4 KiB internally - and false here, where the buffer is the CALLER'S
+    // slice, of whatever size it chose. `console_dims` passes EIGHT BYTES. Validating 4 KiB only
+    // proves those bytes are mapped, which they are - it is the middle of a stack - so nothing stood
+    // between a larger-than-expected reply and a smashed frame.
+    //
+    // Encoded as a 4-bit power-of-two CLASS rather than a length, because the request length and the
+    // deadline already occupy the length argument, and arg0 has exactly one nibble spare below the
+    // 32-bit line that arm32's one-register-per-arg ABI truncates at. Rounded DOWN, so a 514-byte
+    // buffer declares 512 and the kernel refuses a 514-byte reply rather than writing two bytes past
+    // it. Being wrong in the conservative direction turns a silent smash into a loud refusal (§26.7).
+    // Callers should size this buffer as a POWER OF TWO. A 522-byte buffer declares 512 and its own
+    // 522-byte replies are then refused - correct, conservative, and confusing. `fs` carries the note
+    // and a compile-time assert on its side; this is the reason.
+    let cap_class = (usize::BITS - 1 - buf.len().max(1).leading_zeros()).min(12) as u64;
+    let slots = (target.0 as u64 & 0xFF)
+        | ((reply_grant.0 as u64 & 0xFF) << 8)
+        | ((recv.0 as u64 & 0xFF) << 16)
+        | (cap_class << 24);
+    let len_secs = (n as u64 & 0xFFFF) | ((max_secs.min(0xFFFF)) << 16);
+    // SAFETY: raw_syscall(50) = CallDeadline; `buf` is a caller-owned slice in user space and the
+    // kernel writes at most one message into it, which is why the request is staged there too.
+    let ret = unsafe { crate::syscall::raw_syscall(50, slots, buf.as_mut_ptr() as u64, len_secs) };
+    if ret == RECV_TIMED_OUT {
+        Ok(None)
+    } else if ret < 0 {
+        Err(i64_to_ipc_error(ret))
+    } else {
+        Ok(Some(ret as usize))
+    }
+}
 
 pub(crate) fn i64_to_ipc_error(code: i64) -> IpcError {
     match code {

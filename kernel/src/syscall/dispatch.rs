@@ -64,15 +64,24 @@ pub enum SyscallNumber {
     SpawnWithCaps          = 39,
     ConsoleForeground      = 40,
     Call                   = 41,
+    /// `Call` with a DEADLINE. Same reply-cap semantics, bounded wait.
+    ///
+    /// The SDK had a deadline variant already, hand-rolled as send + `RecvTimeout` on the endpoint -
+    /// and `RecvTimeout` takes whatever is next, so a service awaiting its reply would consume an
+    /// unrelated CLIENT REQUEST, discard it for having the wrong tag, and lose it. That is what left
+    /// `fs` clients waiting forever and desynced the block protocol on both boards. `Call` never had
+    /// that flaw because it dequeues the reply specifically (`call_dequeue`); it simply could not be
+    /// bounded. This is `Call` with the bound, so the correct primitive is also the usable one.
+    CallDeadline           = 50,
     NetFrameTx             = 42,
     NetFrameRx             = 43,
     NetInfo                = 44,
+    FireIrq                = 51,
     Gpio                   = 45,
     UsbDiskInfo            = 46,
     UsbDiskRead            = 47,
     UsbDiskWrite           = 48,
     UsbDiskFlush           = 49,
-    SetClock               = 50,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -98,15 +107,16 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Sleep          as u64 => handle_sleep(arg0),
         n if n == SyscallNumber::TrySend        as u64 => handle_try_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Call           as u64 => handle_call(arg0, arg1, arg2),
+        n if n == SyscallNumber::CallDeadline   as u64 => handle_call_deadline(arg0, arg1, arg2),
         n if n == SyscallNumber::NetFrameTx     as u64 => handle_net_frame_tx(arg0, arg1),
         n if n == SyscallNumber::NetFrameRx     as u64 => handle_net_frame_rx(arg0, arg1),
         n if n == SyscallNumber::NetInfo        as u64 => handle_net_info(arg0),
+        n if n == SyscallNumber::FireIrq        as u64 => handle_fire_irq(arg0),
         n if n == SyscallNumber::Gpio           as u64 => handle_gpio(arg0, arg1),
         n if n == SyscallNumber::UsbDiskInfo    as u64 => handle_usb_disk_info(),
         n if n == SyscallNumber::UsbDiskRead    as u64 => handle_usb_disk_read(arg0, arg1),
         n if n == SyscallNumber::UsbDiskWrite   as u64 => handle_usb_disk_write(arg0, arg1),
         n if n == SyscallNumber::UsbDiskFlush   as u64 => handle_usb_disk_flush(),
-        n if n == SyscallNumber::SetClock       as u64 => handle_set_clock(arg0, arg1),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
             0
@@ -237,8 +247,65 @@ fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     // backgrounded task's output goes to serial only - it must not smear the app's framebuffer. The
     // owner (or unclaimed = the normal case) writes to both.
     let to_fb = crate::arch::imp::console_foreground_allows(scheduler::current_task_slot() as u32);
+    // A console write costs on BOTH sides of this boundary: the serial port is synchronous at
+    // 115200 baud (~87 us a byte, so ~9 ms for a 100-byte line), and the delivery below can PARK
+    // this task when the service's 16-deep queue is full.
+    //
+    // Both were measured, and the answer was the queue: writers parked ~25 ms each because the
+    // console's drain loop was not reaching its paint. That is fixed in the service, and the
+    // counters used to find it are gone - a measurement kept after it has answered its question is
+    // just a tax on the hot path (three rdtsc reads per write, here).
     crate::arch::imp::console_write_bytes_gated(bytes, to_fb);
+    // Serial is written FIRST and unconditionally above, so the log is complete and never duplicated
+    // even though the call below can park this task. What the return value carries is the outcome of
+    // the wait, not of the write: 0, or a negative code if the terminal died while we were blocked.
+    if to_fb {
+        return deliver_to_console_service(bytes);
+    }
     0
+}
+
+/// Console writes that could not be shown because the terminal was gone, not merely behind.
+static CONSOLE_LOST: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+/// Report every Nth loss. The report goes to serial, and serial is the thing under load.
+const CONSOLE_LOSS_REPORT: u64 = 100;
+
+fn deliver_to_console_service(bytes: &[u8]) -> i64 {
+    // Never feed the console's own output back to it. Nothing does this today (the service logs through
+    // the serial log path, not the console path), but the loop it would make is unbounded and silent.
+    if scheduler::task_stat(scheduler::current_task_slot()).name == "console" {
+        return 0;
+    }
+    // No terminal on this machine (or not up yet): serial already has the bytes, which is the whole
+    // guarantee. Return without blocking - there is nothing to wait for.
+    let Some(ep) = crate::ipc::names::lookup("console") else { return 0 };
+    let Ok(msg) = crate::ipc::message::Message::new(bytes) else { return 0 };
+
+    let my_slot = scheduler::current_task_slot();
+    match crate::ipc::routing::enqueue_from_kernel_blocking(ep, msg, my_slot) {
+        Ok(Some(receiver_slot)) => {
+            scheduler::wake_by_slot(receiver_slot, 0);
+            0
+        }
+        Ok(None) => 0,
+        // The terminal is behind. We are now recorded as a blocked sender, so park until it drains -
+        // ordinary bounded-queue back-pressure (§8.5/§8.6), the same thing any `send` to a full endpoint
+        // does. The KERNEL is not waiting; the task that produced the output is, which is correct: it
+        // should not run ahead of the display it is writing to. It wakes with a negative code if the
+        // terminal dies instead, so this can never hang.
+        Err(crate::ipc::IpcError::QueueFull) => {
+            scheduler::block_and_reschedule(TaskState::BlockedOnSend)
+        }
+        // The terminal died between the name lookup and the enqueue. Serial has the bytes; say so
+        // periodically rather than silently painting nothing (invariant 12).
+        Err(_) => {
+            let n = CONSOLE_LOST.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            if n % CONSOLE_LOSS_REPORT == 0 {
+                crate::kprintln!("console: {} write(s) not displayed - no terminal (serial has them)", n);
+            }
+            0
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +565,47 @@ fn handle_irq_unmask(irq: u64) -> i64 {
 fn handle_sleep(cycles: u64) -> i64 {
     if cycles == 0 { return 0; }
     let my_slot = scheduler::current_task_slot();
+
+    // SUB-TICK SLEEPS GO TO THE MICROSECOND ONE-SHOT - RE-ENABLED, with the reason it was pulled now
+    // understood and fixed elsewhere.
+    //
+    // This was withdrawn after a kernel panic: core 0 wedged under typing, and a queue lock shared
+    // between this syscall path and an interrupt handler was the obvious suspect. It was the wrong
+    // suspect twice over. The instrumented panic named the real one - `last source 0x10`, the mailbox
+    // doorbell, frozen mid-handler - which was re-entering the scheduler from an asynchronous
+    // interrupt; that is fixed, and three minutes of real typing plus 2m39s of synthetic storm now
+    // pass with no panic. And `SpinLock::lock` calls `irq_save`, so interrupts are masked while the
+    // queue lock is held: the self-deadlock I withdrew this for could not have happened.
+    //
+    // Withdrawing it was still right at the time. The evidence then pointed here, and shipping an
+    // unproven mechanism into a machine that was panicking would have made the next measurement
+    // unreadable. What changed is not confidence, it is evidence.
+    #[cfg(target_arch = "arm")]
+    {
+        let us = scheduler::cycles_to_us(cycles);
+        if us > 0 && us < 10_000 {
+            match crate::arch::imp::irq::hires_arm(my_slot as u32, us as u32) {
+                // The delay passed while we were arming it: the wait is already served, so return
+                // rather than block. Blocking here made a 125 us sleep take 8 ms, because the compare
+                // fires on EQUALITY and had nothing left to match.
+                crate::arch::imp::irq::Armed::Elapsed => return 0,
+                crate::arch::imp::irq::Armed::Full => {}   // fall through to the tick path
+                crate::arch::imp::irq::Armed::Pending => {
+                    // Tick backstop, always: if the compare interrupt never arrives the task must
+                    // still wake. A timing optimisation that can hang `sleep` would hang every service
+                    // that paces itself.
+                    let deadline = scheduler::monotonic_ticks()
+                        .wrapping_add(scheduler::cycles_to_ticks(cycles).max(1));
+                    scheduler::set_wake_deadline(my_slot, deadline);
+                    let _ = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
+                    scheduler::clear_wake_deadline(my_slot);
+                    crate::arch::imp::irq::hires_release(my_slot as u32);
+                    return 0;
+                }
+            }
+        }
+    }
+
     let deadline = scheduler::monotonic_ticks().wrapping_add(scheduler::cycles_to_ticks(cycles));
     loop {
         if scheduler::monotonic_ticks() >= deadline { break; }
@@ -1018,6 +1126,33 @@ fn handle_call(packed: u64, buf_ptr: u64, recv_len: u64) -> i64 {
     let reply_slot  = ((packed >> 16) & 0xFFFF) as usize;
     let recv_slot   = ((recv_len >> 16) & 0xFFFF) as usize;
     let req_len     = recv_len & 0xFFFF;
+    // `Call` (41): the SDK allocates its own MAX_PAYLOAD buffer internally, so the full message size
+    // is the honest capacity here - this is the assumption `CallDeadline` could not make.
+    do_call(target_slot, reply_slot, recv_slot, buf_ptr, req_len, 0, MAX_MESSAGE_SIZE)
+}
+
+/// `Call` with a deadline in SECONDS. Three cap slots pack into `a0` (8 bits each - a task holds at
+/// most `MAX_CAPS_PER_TASK` = 64, so six bits suffice and eight leave room), because the ARM 32-bit
+/// ABI truncates every argument to one register and the original three-16-bit-field layout had no
+/// space left for a fourth value. Length and deadline share `a2`.
+fn handle_call_deadline(slots: u64, buf_ptr: u64, len_secs: u64) -> i64 {
+    let target_slot = (slots & 0xFF) as usize;
+    let reply_slot  = ((slots >> 8) & 0xFF) as usize;
+    let recv_slot   = ((slots >> 16) & 0xFF) as usize;
+    let req_len     = len_secs & 0xFFFF;
+    // How big the caller's reply buffer is, as a power-of-two class the SDK packs into arg0's spare
+    // nibble (see `call_deadline_into`). 0 means an SDK that predates this and could not say - treat
+    // that as the old assumption so an unpatched caller is no worse off than before.
+    let reply_buf_cap = { let c = (slots >> 24) & 0xF; if c == 0 { MAX_MESSAGE_SIZE } else { (1usize << c).min(MAX_MESSAGE_SIZE) } };
+    let secs        = (len_secs >> 16) & 0xFFFF;
+    do_call(target_slot, reply_slot, recv_slot, buf_ptr, req_len, secs, reply_buf_cap)
+}
+
+/// The body both share. `deadline_secs` of 0 blocks forever, exactly as `Call` always has.
+fn do_call(
+    target_slot: usize, reply_slot: usize, recv_slot: usize,
+    buf_ptr: u64, req_len: u64, deadline_secs: u64, reply_buf_cap: usize,
+) -> i64 {
 
     // 1. Validate the three caps: SEND to the peer, GRANT on the reply cap, RECV on our own endpoint.
     let target_cap = match scheduler::current_task_lookup_cap(target_slot, Rights::SEND) {
@@ -1083,7 +1218,31 @@ fn handle_call(packed: u64, buf_ptr: u64, recv_len: u64) -> i64 {
     // 5. Await the reply on our own endpoint, waking on the reply OR on the peer's death (ReplyDead).
     //    The loop re-evaluates after every wake, so a reply that arrived just before the peer died
     //    still wins over ReplyDead (call_dequeue returns the queued reply first).
-    loop {
+    // Same shape as `handle_recv_timeout`'s bounded wait, deliberately: a deadline in monotonic
+    // ticks, checked before each block, armed with `set_wake_deadline` so the timer wakes us, and
+    // cleared on every exit. Reusing the proven pattern rather than inventing a second one.
+    //
+    // A tick IS a scheduler quantum and the quantum is 10 ms (§9.1), so a second is 100 of them.
+    const TICKS_PER_SEC: u64 = 100;
+    let deadline = if deadline_secs == 0 {
+        0
+    } else {
+        scheduler::monotonic_ticks().wrapping_add(deadline_secs.saturating_mul(TICKS_PER_SEC))
+    };
+
+    // WHERE A SLOW CALL ACTUALLY SPENDS ITS TIME - blocked, or going round this loop.
+    //
+    // `fs` measures ~870 ms for one 512-byte block round trip while `block-driver` measures under
+    // 5 ms for the same request, so the time is in this path and not in the device. Two shapes
+    // remain and they are opposite bugs: ONE block that nobody woke for 870 ms (a wake that was
+    // never delivered, recovered later by a timer tick - an idle core's tick is deliberately
+    // slowed, which would also explain why this is FASTER when the machine is busy), or MANY
+    // blocks and wakes that each found nothing (a livelock round this loop). The count separates
+    // them, and reading the wake path has not: every link in it is correct.
+    let call_c0 = read_cycle_counter();
+    let call_h0 = scheduler::core_idle_halts(scheduler::current_core_id());
+    let mut call_blocks: u32 = 0;
+    let result = loop {
         match crate::ipc::routing::call_dequeue(recv_ep, recv_cap.generation, target_ep, my_slot) {
             Ok((reply, sender_to_wake)) => {
                 if let Some(slot) = sender_to_wake {
@@ -1099,19 +1258,59 @@ fn handle_call(packed: u64, buf_ptr: u64, recv_len: u64) -> i64 {
                     }
                 }
                 let payload  = reply.payload_bytes();
-                let copy_len = payload.len().min(MAX_MESSAGE_SIZE);
-                if !write_user_bytes(buf_ptr, &payload[..copy_len]) { return -1; }
-                return copy_len as i64;
+                // REFUSE, do not truncate. The caller told us how much room it has; a reply that does
+                // not fit is a protocol error the caller must see, and writing what fits would smash
+                // whatever sits past the end of its buffer. Silent truncation on a message path is
+                // the one thing §26.7 forbids outright.
+                if payload.len() > reply_buf_cap {
+                    crate::kprintln!(
+                        "call: reply of {} bytes exceeds the caller's {}-byte buffer - refused (not truncated)",
+                        payload.len(), reply_buf_cap);
+                    break ipc_err_to_i64(IpcError::MessageTooLarge);
+                }
+                let copy_len = payload.len().min(reply_buf_cap);
+                if !write_user_bytes(buf_ptr, &payload[..copy_len]) { break -1; }
+                break copy_len as i64;
             }
             Err(IpcError::QueueEmpty) => {
+                call_blocks = call_blocks.saturating_add(1);
                 // call_dequeue recorded us as blocked-in-call awaiting target_ep; block now. The wake
                 // result is intentionally ignored: we loop and let call_dequeue re-derive the terminal
                 // condition (queued reply -> Ok; target dead -> ReplyDead; our endpoint dead -> EndpointDead).
-                let _ = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
+                if deadline != 0 && scheduler::monotonic_ticks() >= deadline {
+                    break RECV_TIMED_OUT;
+                }
+                if deadline != 0 {
+                    scheduler::set_wake_deadline(my_slot, deadline);
+                }
+                let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
+                if err != 0 { break err; }
             }
-            Err(e) => return ipc_err_to_i64(e),   // ReplyDead (-12) or EndpointDead (-7)
+            Err(e) => break ipc_err_to_i64(e),   // ReplyDead (-12) or EndpointDead (-7)
+        }
+    };
+    scheduler::clear_wake_deadline(my_slot);
+
+    // Bounded and quiet: 100 ms is far past any healthy call, so a healthy machine prints nothing,
+    // and past it only every 256th, so a slow system cannot drown itself in reports about being
+    // slow - at 16 it did exactly that, adding a serial write inside the IPC path of a machine that
+    // was already a second per round trip, and the keyboard stopped answering entirely
+    // (26.6, 26.7). Uses the cycle counter this file already reads safely for InspectKernel, so the
+    // grandfathered `unsafe` floor here (18.5) is untouched.
+    let call_us = scheduler::cycles_to_us(read_cycle_counter().wrapping_sub(call_c0));
+    if call_us >= 100_000 {
+        static SLOW_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let n = SLOW_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 3 || n % 256 == 0 {
+            crate::kprintln!(
+                "call: slot {} waited {} us across {} blocks, {} core halts (slow #{})",
+                my_slot, call_us, call_blocks,
+                scheduler::core_idle_halts(scheduler::current_core_id())
+                    .saturating_sub(call_h0),
+                n);
         }
     }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1330,11 +1529,11 @@ fn handle_alloc_mem(size: u64) -> i64 {
 ///   i64, or -1 if the name is not registered.
 fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // Self-state (0 = own alloc bytes), the clock (3 = TSC), and console geometry
-    // (9 = fbcon rows/cols - task-neutral hardware info) are ungated, as are the
+    // are ungated, as are the
     // boot/RTC reads (10, 11). Every other query discloses another task's or
     // system-wide state and requires the INTROSPECT capability with READ (§3.1;
     // docs/introspection-capability.md).
-    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22)
+    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -1344,10 +1543,10 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         0 => scheduler::current_task_alloc_bytes() as i64,
         1 => crate::ipc::routing::count_live_endpoints() as i64,
         3 => read_cycle_counter() as i64,
-        // Console (fbcon) geometry packed as (rows << 16) | cols. The console
-        // service needs this to lay out its terminal (pin the input line to the
-        // bottom row). 0 if the framebuffer never initialised.
-        9 => crate::fbcon::dims_packed() as i64,
+        // (9 was the framebuffer console's rows/cols. DELETED: terminal geometry is derived from the
+        // safe-area inset, the cell size and the font-scale rule, which now live in the `console`
+        // SERVICE - so the kernel cannot answer it without keeping a second copy of facts it does not
+        // own. The shell asks the service. docs/console-service.md 9.7.)
         // Input-ready flag - set by the xHCI driver when it finishes setup (the
         // last boot step). The shell watches it to auto-clear the boot screen.
         10 => crate::arch::imp::input_ready() as i64,
@@ -1405,17 +1604,35 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // speed - which fails silently on hardware and not at all under emulation. 0 = unknown, and the
         // driver then reports rather than guessing.
         20 => crate::arch::imp::emmc_base_clock_hz() as i64,
+        // 23 = THE BOARD'S OWN MAC ADDRESS, packed little-endian (byte 0 in bits 7:0), or -1.
+        //
+        // Ungated with the other board-identity reads (20 = the EMMC base clock): it discloses no
+        // task's state and no system-wide state, only a number etched on the hardware and printed
+        // on the sticker - which is on the wire in the source field of every frame the machine
+        // sends, so it is not a secret being handed out.
+        //
+        // It exists because the NIC driver is a userspace service and this address lives in the
+        // VideoCore mailbox, outside the DWC2 register window the service is granted. The driver
+        // was therefore falling back to a locally-administered address that is HARDCODED and so
+        // identical on every board running this system - two Pis on one network would claim the
+        // same MAC. The alternative to this query is granting the driver a second, much wider MMIO
+        // window for one identity fact, which is authority out of all proportion to the need.
+        23 => match crate::arch::imp::board_mac_packed() { Some(v) => v as i64, None => -1 },
         // Clock PROVENANCE, packed: bits 0-7 = source (0 unset / 1 rtc / 2 ntp), bits 8.. = seconds since
         // the network last set it (0 if never). Ungated task-neutral timing info like the RTC (11) itself.
         // `date` reports this so a displayed time says where it came from - a fallback chain is only
         // mechanism, not magic, while its choice is visible (§26.4/§26.9).
-        21 => {
-            let ago = crate::wallclock::synced_secs_ago().max(0);
-            (crate::wallclock::source() as i64) | (ago << 8)
-        }
+        // 21: pop one byte from the COM2 operator channel, -1 when empty. TRANSPORT ONLY - the kernel
+        // owns the UART (§11.4 sanctions it owning a serial console) and hands bytes out; the `control`
+        // SERVICE decides what they mean (C1-6). This is the whole of what replaced a 123-line command
+        // interpreter in ring 0.
+        21 => match crate::arch::imp::com2_try_read_byte() { Some(b) => b as i64, None => -1 },
+        // 22 REMOVED (clock slice 3): the wall clock's provenance, sync age and floor belong to
+        // the `time` service now. The kernel still answers 11 (the raw RTC register read, which no
+        // service can perform) and 17 (monotonic seconds, which paces deadlines) - transport and
+        // scheduling. What it no longer answers is what the reading MEANS.
         // The persisted clock FLOOR in epoch seconds (0 = none known). A "we ran at least this late" bound,
         // never a reading - `date` shows it only when the time is unknown, explicitly labelled.
-        22 => crate::wallclock::floor(),
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,
@@ -1804,6 +2021,22 @@ fn handle_console_push(cap_slot: u64, byte: u64) -> i64 {
 /// closing the ambient-authority gap this syscall used to have. Validated by holdings (no arguments →
 /// no slot to pass, same form as `kill`/8). Logs to serial before resetting so the operator sees
 /// confirmation before the line goes silent.
+/// FireIrq (51): inject a test interrupt on `irq`. Gated by FIRE_IRQ, held only by the control service.
+///
+/// Exists so the COM2 command interpreter can leave the kernel (C1-6): `KILL` and `RESTART` were always
+/// expressible as SERVICE_CONTROL + SPAWN, but this one had no capability, so the module could not move.
+/// Naming the authority is more honest than leaving it unnamed inside ring 0.
+fn handle_fire_irq(irq: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::FIRE_IRQ_RESOURCE, Rights::WRITE) {
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    if irq > u8::MAX as u64 {
+        return -1;
+    }
+    crate::arch::imp::interrupts::fire_test_irq(irq as u8);
+    0
+}
+
 fn handle_reboot() -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::REBOOT_RESOURCE, Rights::WRITE) {
         return cap_err_to_i64(CapError::CapNotHeld);
@@ -1812,31 +2045,6 @@ fn handle_reboot() -> i64 {
     crate::arch::imp::hardware_reset();
 }
 
-/// SetClock (50): set the wall clock to `epoch` Unix seconds (SNTP-fed). Gated by SET_CLOCK (validated by
-/// holdings - `arg0` spends the one argument register on the epoch, leaving no slot to pass). `epoch` is a
-/// u32 of seconds (single register - so it survives the 32-bit ARM ABI, valid past year 2106), widened
-/// here. A no-op on arches with a real hardware RTC (x86). Returns 0, or CapNotHeld without the cap.
-fn handle_set_clock(epoch: u64, kind: u64) -> i64 {
-    // `kind` 1 = raise the persisted FLOOR ("we ran at least this late"); 0 = set the wall clock; 2 = clear
-    // the floor. These are NOT the same authority, so they do not share a right: raising a floor only
-    // CONSTRAINS which clock values are acceptable, while setting the clock (or clearing the bound that
-    // guards it) changes every task's view of the time of day. Rights narrow (§7.4), so the floor-raiser
-    // holds READ and the clock-setter holds WRITE - which lets the shell record a floor off disk without
-    // also being able to step the clock.
-    let need = if kind == 1 { Rights::READ } else { Rights::WRITE };
-    if !scheduler::current_task_holds_resource(crate::capability::SET_CLOCK_RESOURCE, need) {
-        return cap_err_to_i64(CapError::CapNotHeld);
-    }
-    let v = (epoch & 0xFFFF_FFFF) as i64;
-    let ok = match kind {
-        1 => crate::wallclock::set_floor(v),
-        2 => crate::wallclock::clear_floor(),
-        _ => crate::wallclock::set_wall_clock(v),
-    };
-    // Every path announces itself inside `wallclock` (what changed, or the reason for a refusal): a change
-    // to every task's view of the time of day must be answerable afterwards (§26.4, §26.7).
-    if ok { 0 } else { -1 }
-}
 
 /// Largest ethernet frame the USB-net bridge moves (matches nic-driver's FRAME_MAX).
 const NET_FRAME_MAX: usize = 1600;

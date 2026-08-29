@@ -45,12 +45,17 @@ bitflags::bitflags! {
         const USER     = 1 << 2;
         const PWT      = 1 << 3;
         const PCD      = 1 << 4;
+        // A framebuffer, not device registers: RAM the display controller scans out. Each arch
+        // picks the weakest type that is still coherent without cache maintenance - on AArch64
+        // Normal Non-cacheable, which gathers and buffers writes where Device-nGnRnE cannot. An
+        // arch that has nothing better may ignore it and keep its uncached-MMIO type.
+        const WRITE_COMBINE = 1 << 5;
         const NO_EXEC  = 1 << 63;
     }
 }
 
 #[derive(Debug)]
-pub enum MapError { FrameAllocFailed, AlreadyMapped, NotMapped }
+pub enum MapError { FrameAllocFailed, AlreadyMapped, NotMapped, VirtOutOfRange }
 
 // ---- Descriptor encoding ----
 
@@ -59,14 +64,27 @@ const L2_TYPE_SMALL: u32 = 0b10; // small page; bit 0 (XN) is ORed in separately
 
 /// Encode an L2 small-page descriptor for `pa` with the given flags.
 ///
-/// Small-page descriptor. Normal cacheable write-back by default (TEX=0b001, C=1, B=1 - kernel/service
-/// RAM); **Device** memory (TEX=0b000, C=0, B=1 - uncached, no reorder/gather) when `PCD` is set, so a
-/// driver service can map a peripheral's MMIO into its own address space (the same `PCD` the x86 encoder
-/// treats as uncached). AP/APX come from `WRITABLE`; XN from `NO_EXEC`. `S` (shareable) matches the
-/// section mappings `mmu.rs` made, so a page and a section covering the same memory agree on shareability.
+/// Small-page descriptor. Three memory types, selected by the two cache-control flags:
+///
+/// - **Normal cacheable write-back** by default (TEX=0b001, C=1, B=1) - kernel and service RAM.
+/// - **Device** (TEX=0b000, C=0, B=1) when `PCD` alone is set - uncached, no reordering, no gathering.
+///   This is what a driver service's peripheral MMIO wants: every store is a register write with side
+///   effects, so none of them may be merged or moved. (The same `PCD` the x86 encoder treats as uncached.)
+/// - **Normal NON-cacheable** (TEX=0b001, C=0, B=0) when `PCD | PWT` are both set - uncached, but
+///   gathering and reordering are allowed. This is what a **framebuffer** wants: a pixel store has no
+///   side effect, it is just memory the display happens to scan, so forbidding the write buffer from
+///   merging a run of them costs a bus transaction per pixel and buys nothing. It is also the attribute
+///   `mmu::section_fb` gives the kernel's own mapping of those same physical pages, and they MUST agree -
+///   ARM leaves mismatched memory attributes for one physical page UNPREDICTABLE.
+///
+/// AP/APX come from `WRITABLE`; XN from `NO_EXEC`. `S` (shareable) matches the section mappings `mmu.rs`
+/// made, so a page and a section covering the same memory agree on shareability.
 fn l2_small_page(pa: u32, flags: PageFlags) -> u32 {
     let mut d = (pa & 0xFFFF_F000) | L2_TYPE_SMALL;
-    if flags.contains(PageFlags::PCD) {
+    if flags.contains(PageFlags::PCD) && flags.contains(PageFlags::PWT) {
+        // Normal non-cacheable: TEX=0b001, C=0, B=0. Uncached but gathering - see the note above.
+        d |= 0b001 << 6;
+    } else if flags.contains(PageFlags::PCD) {
         // Device: TEX=0b000, C=0, B=1 (Shareable Device) - correct for MMIO, never cached or reordered.
         d |= 1 << 2; // B
     } else {
@@ -332,6 +350,27 @@ impl PageTable {
     /// needed and writes the small-page descriptor - the same encoders `map_in_active_tables` uses
     /// and the selftest proves.
     pub fn map(&mut self, virt: VirtAddr, phys: PhysAddr, flags: PageFlags) -> Result<(), MapError> {
+        // REJECT a virtual address this architecture cannot express. Do not truncate it.
+        //
+        // `virt.0` is a u64 because the page-table API is arch-neutral; ARMv7 short descriptors
+        // address 32 bits. `virt.0 as u32` silently discards the high half, and a discarded high half
+        // does not fail - it MAPS SOMEWHERE ELSE. A 64-bit constant carried over from x86 is the
+        // realistic source, and this is what one did:
+        //
+        //   spawn[dma]: 'dwc2' arena phys 0x2f41000 -> VA 0x200000000 (64 KiB)
+        //
+        // 0x2_0000_0000 truncates to 0x0, so the arena was mapped over L1 entry 0 - the identity
+        // mapping of the low megabyte, which on this board holds the kernel image and the exception
+        // vectors. The task then made no progress and printed nothing, and the liveness watchdog
+        // panicked ten seconds later pointing at the task rather than at the mapping that had
+        // destroyed its address space.
+        //
+        // The MMIO grant one commit earlier failed LOUDLY with `MapFailed` for the same root cause
+        // and cost one boot to find. This path silently corrupted memory instead and cost three.
+        // Same bug, and the only difference in what it cost was whether anything checked.
+        if virt.0 > u32::MAX as u64 || phys.0 > u32::MAX as u64 {
+            return Err(MapError::VirtOutOfRange);
+        }
         let va = virt.0 as u32;
         let pa = phys.0 as u32;
         let l1_index = (va >> 20) as usize;
@@ -679,15 +718,26 @@ pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
                     // someone's heap, and then a double-free on the next kill.
                     //
                     // The mapping already says what it is, so ask it rather than infer from the address:
-                    // Device memory is encoded TEX=0b000 + C=0 by `l2_small_page`, normal service RAM as
-                    // TEX=0b001 + C=1. x86's reclaim has skipped its equivalent (PCD|PWT) since the
-                    // chaos double-free was found there; this is the same rule, which the ARM port
-                    // simply never carried over.
-                    let is_device = (e >> 6) & 0b111 == 0 && e & (1 << 3) == 0;
-                    if is_device {
+                    // normal service RAM is the ONLY thing `l2_small_page` encodes as TEX=0b001 + C=1.
+                    // x86's reclaim has skipped its equivalent (PCD|PWT) since the chaos double-free was
+                    // found there; this is the same rule, which the ARM port simply never carried over.
+                    //
+                    // Phrased as "is this allocator RAM", NOT as "is this Device". It used to test for
+                    // Device specifically (TEX=0b000 + C=0), which silently stopped covering everything
+                    // the moment a third memory type appeared: the `console` service's framebuffer grant
+                    // is Normal NON-cacheable (TEX=0b001 + C=0), so it failed the Device test, passed as
+                    // ordinary RAM, and was handed to `free_frame` - 1,755 pages of GPU memory on every
+                    // console death. Contained only by the same downstream bounds check this comment
+                    // already calls luck (the Pi's framebuffer sits above usable RAM). A board whose
+                    // framebuffer sat below the top of RAM would have freed it into the general pool.
+                    //
+                    // An allowlist cannot rot this way. A new memory type is now skipped by default, and
+                    // wrongly freeing a page requires deliberately encoding it as cacheable service RAM.
+                    let is_service_ram = (e >> 6) & 0b111 == 0b001 && e & (1 << 3) != 0;
+                    if !is_service_ram {
                         if !RECLAIM_DEVICE_LOGGED.swap(true, Ordering::Relaxed) {
                             crate::kprintln!(
-                                "reclaim: skipped device MMIO pa={:#010x} (not allocator RAM; further skips silent)",
+                                "reclaim: skipped granted page pa={:#010x} (not allocator RAM; further skips silent)",
                                 e & 0xFFFF_F000);
                         }
                         continue;

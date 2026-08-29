@@ -110,3 +110,81 @@ impl Mmio {
         unsafe { core::ptr::write_volatile(self.base.add(off) as *mut u64, val) }
     }
 }
+
+/// A mapped framebuffer granted to the `console` service (via
+/// [`crate::ServiceContext::framebuffer`]), plus the geometry needed to address a pixel in it.
+///
+/// Unlike [`Mmio`], which exists to read and write device *registers* one at a time, a framebuffer is
+/// addressed in bulk - long contiguous runs, whole-row fills, a full-screen clear - so this hands out a
+/// **slice** rather than word accessors. That is what lets the renderer above it be ordinary
+/// bounds-checked Rust with no `unsafe` at all (§18.2 forbids `unsafe` in a service outright), and it
+/// keeps write-combining and write-buffer gathering available: a pixel run is one `copy_from_slice`,
+/// not N volatile stores.
+///
+/// The handle **owns** the mapping for the service's lifetime and is not `Copy`, so there is exactly one
+/// route to those bytes and it is a `&mut self` borrow. That matters beyond tidiness: the alternative
+/// spelling, a `&'static mut [u8]` field, is an unowned mutable global in everything but name.
+pub struct Framebuffer {
+    base: *mut u8,
+    len: usize,
+    /// Bytes per scanline.
+    pub pitch: usize,
+    /// Bytes per pixel.
+    pub bpp: usize,
+    /// Visible width in pixels.
+    pub width: usize,
+    /// Visible height in pixels.
+    pub height: usize,
+    /// Bit position of the red channel within a pixel.
+    pub r_shift: u32,
+    /// Bit position of the green channel within a pixel.
+    pub g_shift: u32,
+    /// Bit position of the blue channel within a pixel.
+    pub b_shift: u32,
+}
+
+impl Framebuffer {
+    /// Wrap a kernel-granted framebuffer mapping. Crate-internal: only the SDK constructs one, and only
+    /// from the VA and geometry the kernel wrote into this service's context page.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        base: *mut u8,
+        len: usize,
+        pitch: usize,
+        bpp: usize,
+        width: usize,
+        height: usize,
+        r_shift: u32,
+        g_shift: u32,
+        b_shift: u32,
+    ) -> Self {
+        Self { base, len, pitch, bpp, width, height, r_shift, g_shift, b_shift }
+    }
+
+    /// The framebuffer's bytes, for rendering.
+    ///
+    /// The one `unsafe` a display costs. From here up, every pixel write is a bounds-checked slice
+    /// write: a wrong offset paints nothing rather than corrupting memory.
+    #[inline]
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the kernel mapped exactly [base, base + len) into this service's address space as
+        // writable USER memory at spawn (the framebuffer grant), and that mapping lives as long as the
+        // service does - it is torn down only when the address space is, on death. `&mut self` gives
+        // exclusive access, and `Framebuffer` is neither `Copy` nor `Clone`, so no second live slice to
+        // these bytes can exist. `len` is the kernel's own `pitch * height`.
+        unsafe { core::slice::from_raw_parts_mut(self.base, self.len) }
+    }
+
+    /// Length of the mapping in bytes (`pitch * height`).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the mapping is empty. Present because clippy asks for it beside `len`; a granted
+    /// framebuffer is never zero-length.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}

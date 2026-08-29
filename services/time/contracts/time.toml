@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# The wall clock, as a service rather than a kernel responsibility (finding C1-6).
+#
+# §4.3 names six kernel responsibilities and timekeeping is not among them. The kernel keeps only the
+# REGISTER READ - x86's CMOS RTC answers on port I/O, which no service can reach - and this service owns
+# what the read means: conversion, the plausibility window, provenance (RTC or network) and the floor.
+#
+# It needs no hardware capability of its own: it reads the RTC through the kernel introspection query
+# that already exists, and serves the result over IPC. Its authority is therefore just its endpoint and
+# a log.
+name    = "time"
+version = "0.1.0"
+
+[resources.memory]
+request = "4MiB"
+limit   = "8MiB"
+
+[capabilities]
+ipc_receive = ["time"]
+# `fs`, so the clock owns its own floor: read /clock.last at start-up, persist it when the clock is set.
+#
+# `net-stack` is here for ONE message and one only: a one-way "sync now" nudge carrying no reply cap.
+# The old note said `time` must NEVER send here, and the reason it gave is still true - `net-stack`
+# calls `time` after SNTP, so two single-threaded services making REQUESTS of each other deadlock. What
+# changed is that pursuing the time is this service's job, and it could not do it: the clock sat unset
+# on an idle machine until an operator typed `date sync`, which put resolution in the shell's hands.
+#
+# A message with nothing to answer breaks the cycle rather than joining it. `time` sends and forgets;
+# `net-stack` does the work and pushes the result back exactly as it already did. Neither ever waits on
+# the other, which is all §8.9 requires. The nudge is `try_send` at the call site, so even a full or
+# dead `net-stack` cannot stall the clock.
+ipc_send    = ["fs", "net-stack"]
+log_write   = true

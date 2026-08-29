@@ -13,7 +13,7 @@ use crate::arch::imp::context_switch::TaskContext;
 use crate::arch::imp::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE, FIRE_IRQ_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -171,6 +171,23 @@ const XHCI_MMIO_PAGES:     u64 = 16;
 /// run while the IOMMU is on, by current evidence.
 pub const CONFINE_USB_DRIVERS: bool = true;
 
+/// VA where the display's framebuffer is mapped into the `console` service's address space.
+///
+/// A plain 32-bit address, unlike `XHCI_MMIO_VA` (4 GiB) and `XHCI_DMA_VA` (8 GiB), because it has to
+/// exist on a 32-bit machine too - the Pi 2 is the first board to use it.
+///
+/// **0x5800_0000, not 0x5000_0000, and the difference is a real collision I nearly shipped.** On 32-bit
+/// `scheduler::TASK_HEAP_VA_START` is 0x5000_0000 - the base every task's dynamic `AllocMem` grows from.
+/// A 1824x984 framebuffer is ~7 MiB, so the console service's first few allocations would have been
+/// mapped straight on top of the display it was rendering into. It survived only because that service
+/// allocates nothing today; the first `AllocMem` in it would have corrupted the screen, or worse, in a
+/// way that looked like a rendering bug.
+///
+/// This address sits between the heap base and `DRIVER_MMIO_VA` (0x6000_0000), leaving 128 MiB of heap
+/// room below it and clear of the user stack (0x8000_0000 down) above - room for any framebuffer a
+/// display we can drive will have.
+pub const FB_VA: u64 = 0x5800_0000;
+
 /// VA where the driver's physically-contiguous DMA arena is mapped (8 GiB).
 pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
 
@@ -181,6 +198,8 @@ pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
 /// device DMA (if the kill-path bus-master quiesce ever fails) always lands in DMA-reserved memory,
 /// never a PTE or kernel struct. 0 = not yet allocated. (xhci/ehci/block-driver; a future NIC = 4th.)
 pub static XHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+/// The arm32 DWC2's permanent DMA reservation, reused across respawns like every other class.
+pub static DWC2_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 pub static EHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 pub static AHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 pub static NIC_DMA_PHYS:  portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
@@ -250,8 +269,48 @@ struct ServiceContextData {
     console_push_slot:  u32, // u32::MAX = none; else CONSOLE_PUSH cap slot (input driver)
     self_grant_slot:    u32, // u32::MAX = none; else SEND|GRANT cap to this service's OWN
                              // endpoint, so it can register its name in the kernel directory.
+    // --- Framebuffer grant (the `console` service only) ---
+    // The kernel maps the display's framebuffer into this service's address space Normal NON-cacheable
+    // + USER, as a driver's MMIO BAR is mapped, and describes it here. Deliberately PIXEL geometry only:
+    // no rows, no columns, no cell size. Character geometry belongs to the terminal, and the terminal is
+    // the service (`docs/console-service.md` 9.7).
+    fb_va:              u64, // 0 = no framebuffer grant; else VA of the mapped framebuffer
+    fb_len:             u64, // length of the mapping in bytes (pitch * height)
+    fb_pitch:           u32, // bytes per scanline
+    fb_width:           u32, // visible width in pixels
+    fb_height:          u32, // visible height in pixels
+    fb_bpp:             u32, // bytes per pixel
+    fb_shifts:          u32, // r_shift | g_shift << 8 | b_shift << 16
     send_peers:         [SendPeerEntry; MAX_SEND_PEERS],
+    /// A SECOND endpoint, for REPLIES only. `u32::MAX` = none.
+    ///
+    /// A service that serves clients on the endpoint it also awaits replies on cannot drain that
+    /// endpoint while it is blocked for a reply. Sixteen client requests arrive, the queue is full,
+    /// and the reply it is waiting for is DROPPED by a peer that (correctly) uses `try_send` rather
+    /// than deadlocking. The wait then runs to its full deadline - 30 s per block operation on x86,
+    /// which is what made `write append` take 73 seconds.
+    ///
+    /// Correlation tags cannot reach this: a tag identifies a reply that ARRIVED, and this one never
+    /// did. `docs/net-tags-design.md` rejected a second endpoint for lacking a `CreateEndpoint`
+    /// syscall - true, and not needed: the first endpoint is minted at spawn and so is this one.
+    reply_recv_slot:    u32,
+    /// SEND|GRANT cap to `reply_recv_slot`'s endpoint, for handing out as a reply cap. `u32::MAX` = none.
+    reply_grant_slot:   u32,
 }
+
+// The kernel writes this struct and the SDK reads it, from two crates, with no shared definition -
+// they are kept in step BY HAND. There was no check on that, and adding a field to one and not the
+// other silently misaligns every field after it: a service would read its neighbour's slot numbers.
+//
+// Pinned by SIZE in both crates. It does not prove field ORDER, but it catches the mistake that
+// actually happens - an append on one side only - and it fails at compile time in the crate that
+// drifted rather than at boot in a service that reads garbage.
+const SERVICE_CONTEXT_DATA_SIZE: usize = 256;
+const _: () = assert!(
+    core::mem::size_of::<ServiceContextData>() == SERVICE_CONTEXT_DATA_SIZE,
+    "ServiceContextData changed size: update BOTH kernel/src/task/mod.rs and      sdk/rust/src/service_context.rs, then update SERVICE_CONTEXT_DATA_SIZE in both"
+);
+
 
 // ---------------------------------------------------------------------------
 // User stack layout constants.
@@ -338,7 +397,7 @@ struct ServiceConfig {
 /// spawn path. The BAR *address* is still runtime-discovered by the PCI scan (a hardware location is a
 /// different irreducible fact from the authorization); only the driver's *class* is declared here.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum HwClass { None, Ahci, Nic, Xhci, Ehci }
+enum HwClass { None, Ahci, Nic, Xhci, Ehci, Dwc2, Framebuffer }
 
 impl HwClass {
     /// Did the PCI scan find this class of controller?
@@ -346,6 +405,13 @@ impl HwClass {
         use crate::arch::imp::pci;
         use core::sync::atomic::Ordering::Relaxed;
         match self {
+            // The DWC2 is SOLDERED to the BCM283x - there is no bus to discover it on, and no PCI
+            // at all on this board. Its presence is a property of the SoC, so it is `true` on arm32
+            // and `false` everywhere else. This is the one HwClass whose answer is not a scan result.
+            HwClass::Dwc2 => cfg!(target_arch = "arm"),
+            // Not a bus device at all: the display is found at boot (a Limine descriptor on x86, a GPU
+            // mailbox call on the Pi) and the floor that brought it up is the one that knows.
+            HwClass::Framebuffer => crate::bootcon::grant().is_some(),
             HwClass::Xhci => pci::XHCI_FOUND.load(Relaxed),
             HwClass::Ehci => pci::EHCI_FOUND.load(Relaxed),
             HwClass::Ahci => pci::AHCI_FOUND.load(Relaxed),
@@ -360,6 +426,27 @@ impl HwClass {
         use core::sync::atomic::Ordering::Relaxed;
         if !self.found() { return 0; }
         match self {
+            // ZERO, deliberately - and this is not "no MMIO".
+            //
+            // A non-zero BAR sends the spawn path down the PCI route, which maps at `XHCI_MMIO_VA`
+            // (0x1_0000_0000). That address does not EXIST on a 32-bit machine, and the failure is
+            // exactly as blunt as it sounds:
+            //
+            //   spawn[mmio]: 'dwc2' BAR 0x3f980000 -> VA 0x100000000
+            //   task: spawn 'dwc2' failed: MapFailed
+            //
+            // ARM's fixed-address peripherals have their own path - `map_fixed_driver_mmio`, which
+            // the spawn logic calls precisely WHEN THE BAR IS 0, and which maps at a 32-bit VA with
+            // Device/uncached + USER so the service reaches the registers through the SDK's safe
+            // `Mmio` wrapper. The DWC2's address therefore belongs there, not here. Returning 0 is
+            // how this class says "not on a bus" rather than "not present" - `found()` above is the
+            // one that answers presence.
+            HwClass::Dwc2 => 0,
+            // ZERO for the same reason as the DWC2: not on a bus, so not a BAR. The framebuffer has its
+            // own grant path (the `HwClass::Framebuffer` branch in the spawn MMIO block) because it
+            // needs geometry as well as a window, and because its size is whatever the display turned
+            // out to be.
+            HwClass::Framebuffer => 0,
             HwClass::Xhci => pci::XHCI_MMIO_BASE.load(Relaxed),
             HwClass::Ehci => pci::EHCI_MMIO_BASE.load(Relaxed),
             HwClass::Ahci => pci::AHCI_ABAR.load(Relaxed),
@@ -369,17 +456,25 @@ impl HwClass {
         }
     }
     /// A discovered DMA-capable controller needs a physically-contiguous DMA arena.
-    fn needs_dma(self) -> bool { self != HwClass::None && self.found() }
+    fn needs_dma(self) -> bool {
+        // The framebuffer is not a DMA master - the display scans it, this service only writes it - so
+        // it gets a window and no arena. Everything else that is `found()` DMAs.
+        self != HwClass::None && self != HwClass::Framebuffer && self.found()
+    }
     /// Arena size: xHCI needs room for its 256-buffer scratchpad; every other driver gets 64 KiB.
     fn dma_pages(self) -> u64 { if self == HwClass::Xhci { XHCI_DMA_PAGES } else { EHCI_DMA_PAGES } }
     /// The permanent per-class DMA phys reservation, reused across respawns (§12 DMA permanent-reserve).
     fn dma_phys_slot(self) -> &'static portable_atomic::AtomicU64 {
         match self {
+            HwClass::Dwc2 => &DWC2_DMA_PHYS,
             HwClass::Xhci => &XHCI_DMA_PHYS,
             HwClass::Ehci => &EHCI_DMA_PHYS,
             HwClass::Ahci => &AHCI_DMA_PHYS,
             HwClass::Nic  => &NIC_DMA_PHYS,
-            HwClass::None => &XHCI_DMA_PHYS, // unreachable: needs_dma() gates callers
+            // Neither DMAs, so neither ever reaches here - `needs_dma()` gates every caller. They
+            // return a real slot rather than panicking because an unreachable arm that aborts is a
+            // crash waiting for a refactor, and a wrong-but-unused reservation is not.
+            HwClass::None | HwClass::Framebuffer => &XHCI_DMA_PHYS,
         }
     }
     /// Confine this DMA-capable driver via the IOMMU? Only xHCI qualifies today (§6.4; ehci + block-driver
@@ -390,6 +485,8 @@ impl HwClass {
         use crate::arch::imp::pci;
         use core::sync::atomic::Ordering::Relaxed;
         match self {
+            HwClass::Dwc2 => 0xFFFF, // no PCI on this board, so no bus-master enable to perform
+            HwClass::Framebuffer => 0xFFFF, // not a PCI device
             HwClass::Xhci => pci::XHCI_BDF.load(Relaxed),
             HwClass::Ehci => pci::EHCI_BDF.load(Relaxed),
             HwClass::Ahci => pci::AHCI_BDF.load(Relaxed),
@@ -417,6 +514,8 @@ pub const EHCI_CORE: u32 = 3;
 /// (Commandment III). `xhci` / `ehci` / `resource-server` have no contract and are declared here only.
 fn service_hw(name: &str) -> (HwClass, bool) {
     match name {
+        "dwc2"                                 => (HwClass::Dwc2, false),
+        "console"                              => (HwClass::Framebuffer, false),
         "xhci"                                 => (HwClass::Xhci, false),
         "ehci"                                 => (HwClass::Ehci, false),
         "block-driver"                         => (HwClass::Ahci, false),
@@ -438,6 +537,7 @@ struct Privileges {
     console_push:    bool, // CONSOLE_PUSH: inject keystrokes into the input ring (USB keyboard drivers)
     introspect:      bool, // INTROSPECT: read another task's / system-wide kernel state (§3.1)
     service_control: bool, // SERVICE_CONTROL: kill/restart other services (§14.4)
+    fire_irq:        bool, // FIRE_IRQ: inject a test interrupt (`control` only - C1-6)
     reboot:          bool, // REBOOT: hardware-reset the machine (shell `reboot` only - SEC-2)
     acquire_any:     bool, // ACQUIRE_ANY: reach ARBITRARY services by name via AcquireSendCap (§3.1)
     net_device:      bool, // NET_DEVICE: move ethernet frames via the in-kernel USB-net bridge (ARM nic-driver)
@@ -451,19 +551,32 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
     Privileges {
         // supervisor is the spawner (init removed, Phase 5); the shell brokers spawns; chaos spawns
         // mem-pressure tasks for max-carnage's spawn-burst dimension; probes spawn victims.
-        spawn: is_probe || matches!(name, "supervisor" | "shell" | "chaos"),
+        spawn: is_probe || matches!(name, "supervisor" | "shell" | "chaos" | "control"),
         // Both USB host drivers push decoded keystrokes: xhci (front ports), ehci (USB 2.0 back ports).
-        console_push: matches!(name, "xhci" | "ehci"),
+        // `dwc2` is the arm32 USB keyboard driver, so it needs this for the same reason `xhci` and
+        // `ehci` do. Its absence was the whole of "the keyboard does not work": the transfers were
+        // right, the reports were valid HID boot reports (`00 00 0d 0c 12 ...` - real keycodes), and
+        // every `console_push` was rejected because the service had never been granted the authority.
+        //
+        // Deliberate and not merely mechanical (§6.4, SEC-2): a CONSOLE_PUSH holder is inside the
+        // SHELL'S TRUST PERIMETER, because keystrokes are commands and the kernel cannot distinguish a
+        // faithfully-decoded key-press from a synthesized one. That is inherent to being a keyboard
+        // driver and is why the grant is enumerated here by name rather than implied by holding a
+        // USB controller.
+        console_push: matches!(name, "xhci" | "ehci" | "dwc2"),
         // shell + observe use TaskStat/InspectKernel; supervisor's reconcile loop scans real liveness;
         // chaos does victim selection; the prop-/stress- probes query victim generations.
-        introspect: matches!(name, "shell" | "supervisor" | "chaos")
+        introspect: matches!(name, "shell" | "supervisor" | "chaos" | "control")
             || name.starts_with("observe") || name.starts_with("prop-") || name.starts_with("stress-"),
         // shell (interactive broker), supervisor (restart authority), chaos (the point of max-carnage),
         // and every probe (they kill victims to exercise kill/revocation).
-        service_control: is_probe || matches!(name, "shell" | "supervisor" | "chaos"),
+        service_control: is_probe || matches!(name, "shell" | "supervisor" | "chaos" | "control"),
         // SEC-2: REBOOT lives ONLY with the shell (its `reboot` command); the USB drivers no longer
         // hold it. A keyboard driver can synthesize any keystroke (the console's inherent trust, §6.4),
         // but it must not ALSO be able to hard-reset the machine directly from any context.
+        // FIRE_IRQ: only the control service. It exists so the COM2 command interpreter could leave
+        // the kernel; naming the authority is what made that possible (C1-6).
+        fire_irq: matches!(name, "control"),
         reboot: matches!(name, "shell"),
         // Operator/test instruments that legitimately reach arbitrary services by name: shell (chaos
         // flooding, pipe sinks), supervisor (reconcile-by-name), probes. `adv-a13` is the §22 Test A13
@@ -481,8 +594,10 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // in-kernel USB-net bridge does, so `nic-driver` needs the same grant to reach it. Without it
         // the service loads and runs and every frame call is denied, which looks like a dead network
         // rather than a missing capability.
-        net_device: cfg!(any(target_arch = "arm", target_arch = "aarch64"))
-            && matches!(name, "nic-driver"),
+        // ARM32 has LEFT this set: its USB-net device moved into the `dwc2` SERVICE (slice 4b), so
+        // nic-driver reaches frames over IPC and the syscalls have nothing behind them. Keeping the
+        // grant would be authority it cannot use - the exact over-grant the audits keep finding.
+        net_device: cfg!(target_arch = "aarch64") && matches!(name, "nic-driver"),
         // USB_DISK: `block-driver` reaches a USB stick through syscalls 46-48 rather than MMIO, on
         // the port where the USB stack is IN THE KERNEL - which is now ARM32 (Pi 2) ONLY. On aarch64
         // the in-kernel driver was deleted (CLAUDE.md §6.4, 2026-08-09) and block-driver goes through
@@ -550,15 +665,97 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
+        // The terminal (docs/console-service.md 9). Holds the framebuffer grant (`service_hw`) and
+        // renders every console byte the kernel `try_send`s to its endpoint.
+        //
+        // ARM: core 3, and NOT core 0. I put it on core 0 first, reasoning that a console write is what
+        // the user is waiting to see so it should sit with the shell - and that was wrong twice over.
+        // The shell is on core 1, and core 0 is deliberately left to `dwc2` ALONE (see the note on
+        // net-stack below, and the logger's, which was moved off core 0 for exactly this).
+        //
+        // It matters more here than it did for the logger. A full-screen repaint is millions of
+        // non-cacheable pixel stores in one un-preemptible stretch, and dwc2's split transactions have
+        // to hit 125 us microframe windows. Sharing a core with it produced NYET storms and two
+        // "keyboard TT wedged" stalls, one of them six seconds long, on the first boot that had a
+        // terminal to starve it.
+        //
+        // Core 3 rather than 2 because the logger and block-driver are on 2; the terminal is the one
+        // service whose latency the user watches directly, so it gets the idle core.
+        "console" => Some(("console", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_CONSOLE_ELF")),
+            has_recv_endpoint: true, // the console byte stream AND geometry requests arrive here
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    if cfg!(target_arch = "arm") { 3 } else { 0 },
+            probe_mode:        0,
+            memory_limit:      8 * 1024 * 1024, // matches console.toml
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         "logger" => Some(("logger", ServiceConfig {
             elf:               include_bytes!(env!("SVC_LOGGER_ELF")),
             has_recv_endpoint: true,
             send_peers:        &[],
             send_peers_grant:  false,
-            preferred_core:    0,
+            // ARM: OFF CORE 0, to keep the serial writer away from the microframe-timed USB driver.
+            //
+            // Measured: a 125 us sleep averages 9398 us during boot and 608 us on a quiet system - a
+            // 15x difference made entirely of console traffic. A serial write is a syscall, 115200
+            // baud is ~87 us per byte, and this port deliberately refuses to preempt a user task
+            // mid-syscall (preempting SVC corrupts the banked SPSR/sp). So one ~100-character log
+            // line holds its core, un-preemptible, for about 9 ms.
+            //
+            // That blocks only the core it runs on - and this service was sharing core 0 with `dwc2`,
+            // whose split transactions must hit 125 us windows. Moving the writer is the cheap half
+            // of the fix; it needs no console rework and it uses the cores this board has.
+            preferred_core:    if cfg!(target_arch = "arm") { 2 } else { 0 },
             probe_mode:        0,
             memory_limit:      8 * 1024 * 1024,   // matches logger.toml (a stub sink needs ~none); the
                                                  // contract is the source of truth (audit T1 reconcile)
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        // time (services/time): the wall clock, moved out of the kernel (finding C1-6). §4.3 names six
+        // kernel responsibilities and timekeeping is not among them. The kernel keeps only the register
+        // read - x86's CMOS RTC answers on port I/O, which no service can reach - and this service owns
+        // what the read MEANS: conversion, the plausibility window, provenance and the floor.
+        //
+        // It needs no hardware grant: it reads the RTC through the introspection query that already
+        // exists and serves the result over IPC.
+        // control (services/control): the COM2 operator channel, moved out of the kernel (C1-6). The
+        // kernel keeps the byte read (query 21, transport); this owns the interpretation.
+        "control" => Some(("control", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_CONTROL_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    u32::MAX,
+            probe_mode:        0,
+            memory_limit:      8 * 1024 * 1024,   // matches control.toml
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        "time" => Some(("time", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_TIME_ELF")),
+            has_recv_endpoint: true,
+            // `fs`, so the clock can own its own FLOOR - read /clock.last at start-up and persist
+            // it when the clock is set. That duty used to sit in the SHELL, which polled `time` on the
+            // INPUT PATH waiting for a network clock, so on a machine that never syncs the prompt was
+            // unresponsive for the first thirty seconds of every boot. The clock's owner is the right
+            // place for the clock's state (§3.8: state belongs to the service that owns it).
+            //
+            // One direction only: `time` may ask `fs`. It must never call `net-stack`, which calls
+            // `time` to set the clock after SNTP - two single-threaded services calling each other is a
+            // deadlock, so the network stays a PUSH toward this service and never a pull from it.
+            send_peers:        &["fs", "net-stack"],   // fs = the clock floor; net-stack = the one-way "sync now" nudge
+            send_peers_grant:  false,
+            probe_mode:        0,
+            // UNPINNED (§9.2: name a core only with a real reason). The clock has no interrupt to be
+            // local to and no peer to be co-resident with, so round-robin places it. Contracted
+            // placement is deployment-coupled by design; inventing one here would be noise the
+            // supervisor is then obliged to honour.
+            preferred_core:    u32::MAX,
+            memory_limit:      8 * 1024 * 1024,   // matches time.toml
             hw_irqs:           &[],
             has_console_read:  false,
         })),
@@ -663,6 +860,30 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         // xhci - USB host-controller driver (§12). Receives its controller's
         // MMIO BAR (mapped by name in the spawn path) + later its IRQ. Trusted
         // userspace driver. has_recv_endpoint for future interrupt delivery.
+        // `dwc2` - the arm32 userspace USB host driver (Phase 2 skeleton).
+        //
+        // Granting `hw_irqs = [0x29]` is what makes `arm_irq_dispatch` route the USB interrupt HERE
+        // instead of to the in-kernel stack: the dispatcher picks by registration, so spawning this
+        // service is what takes the controller away from the kernel. Deliberate, and the whole point
+        // of the phase - but it means USB is expected to be degraded while a skeleton holds the
+        // vector. See docs/arm32-usb-userspace.md.
+        //
+        // Core 0: the DWC2 interrupt is routed to core 0 by `route_usb_irq_to_core0`, and a driver
+        // that receives its interrupt on one core while running on another pays a cross-core wake for
+        // every single one. The Pi 4 learned this the expensive way - `xhci`'s MSI destination had
+        // drifted to a core the driver did not run on, and co-locating them was what took it from
+        // 100% CPU to 0%.
+        "dwc2" => Some(("dwc2", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_DWC2_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[],
+            send_peers_grant:  false,
+            preferred_core:    0,
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[0x29],
+            has_console_read:  false,
+        })),
         "xhci" => Some(("xhci", ServiceConfig {
             elf:               include_bytes!(env!("SVC_XHCI_ELF")),
             has_recv_endpoint: true,
@@ -717,23 +938,80 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // message, while block-driver burned its whole 20 s wait failing to address it. Every
             // layer looked healthy in isolation, because the missing piece was the EDGE between them.
             //
-            // block-driver reaches the disk THROUGH the xhci service on aarch64, so it needs a SEND
-            // cap to it. On arm32 the USB stack is still in the kernel (no PCIe, no device-IRQ
-            // routing to userspace yet), so there is no such peer there - see `arch/arm/CLAUDE.md`.
+            // block-driver reaches the disk THROUGH a USB host-controller SERVICE on both ARM
+            // targets now: `xhci` on aarch64, `dwc2` on arm32. The arm32 arm used to be empty, with a
+            // comment saying "the USB stack is still in the kernel... so there is no such peer" -
+            // true when it was written and false since the driver moved out.
+            //
+            // The paragraph above is the reason this edge cannot be left to be noticed later: without
+            // the SEND cap, `request_with_reply` finds no send slot and returns None INSTANTLY, so
+            // the driver sits in its poll loop with the disk bound and never receives a message while
+            // block-driver reports no storage. Every layer healthy in isolation, and the missing
+            // piece the edge between them.
             #[cfg(target_arch = "aarch64")]
             send_peers:        &["xhci"],
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_arch = "arm")]
+            send_peers:        &["dwc2"],
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
             send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
             send_peers_grant:  false,
-            // ARM pins this to core 0, and it is NOT a preference there - it is a requirement. The
-            // USB mass-storage syscalls run against the in-kernel DWC2 stack, whose single host
-            // channel and DMA buffer are shared with the keyboard poll in core 0's timer ISR; every
-            // `msc_*` entry point refuses outright when `!on_core0()`. Placement lives HERE, in the
-            // one place both boot and RESTART consult. It used to be an unconditional 1 with the
-            // supervisor overriding it to 0 at boot only, so a restarted block-driver came back on
-            // core 1 and every block operation failed forever - storage dead until reboot, and
-            // restartability (invariant 6) broken on ARM by a value that disagreed with itself.
-            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
+            // ARM KEEPS THIS ON CORE 0 - and the reason is neither of the two written here before.
+            // Both were wrong, and hardware refuted each in turn.
+            //
+            //   1. "The `msc_*` syscalls refuse when `!on_core0()`." True until slice 5 deleted the
+            //      in-kernel DWC2 stack; now provably false (no `on_core0` reference remains in
+            //      `arch/arm`, and `usb_disk_*` are inert stubs).
+            //   2. "Cross-core request/reply does not complete." False. Unpinned services stalled
+            //      because `dwc2` DROPPED block requests when it had no disk (fixed separately), not
+            //      because of cores; with that fixed they came up correctly on all four.
+            //
+            // The real reason is LATENCY, and it was found by an operator noticing `ls` and `read`
+            // had gone sluggish: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB, so the
+            // scheduler's cross-core wake does nothing and the target core does not notice a message
+            // until its next 10 ms timer tick. Cross-core IPC costs up to a full quantum PER HOP, and
+            // a file read is shell -> fs -> block-driver -> dwc2. Unpinning turned a same-core chain
+            // into three cross-core hops and made every command visibly slow. The giveaway was that a
+            // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
+            // chain again.
+            //
+            // UNPINNED, now that the IPI exists (BCM2836 core mailboxes; proven every boot by
+            // `arm32: IPI selftest PASS`). Cross-core wakes are immediate, so spreading these no
+            // longer costs a 10 ms tick per hop - the reason they were pinned in the first place.
+            //
+            // The stronger reason is what the IPI exposed. With wakes now actually preempting, `dwc2`
+            // shares core 0 with everything that gets woken, and its split-transaction sequencing is
+            // microframe-timed: a start-split and its complete-split must land in specific 125 us
+            // windows. Preempted between them, the transaction translator is left holding a
+            // transaction nobody collects - it wedges, gets cleared, and wedges again. Hardware showed
+            // that loop plainly: eight Clear_TT_Buffer calls and eight port re-enumerations in a
+            // couple of minutes, which the operator experiences as the keyboard pausing.
+            //
+            // So moving storage and the network OFF core 0 is not load-balancing here, it is giving
+            // the one timing-critical service on this board room to hit its deadlines. `dwc2` stays on
+            // core 0 because that is where its interrupt is routed.
+            //
+            // (Superseded rationale kept below so the next reader sees what was believed and why.)
+            //
+            // The old reason - the in-kernel DWC2 stack's `msc_*` entry points refused when
+            // `!on_core0()` - died with slice 5, and is verifiably gone (no `on_core0` reference
+            // remains in `arch/arm`; `usb_disk_*` are inert stubs). Unpinning on that basis was tried
+            // and it BROKE STORAGE: block-driver spawned on core 2 and logged nothing at all - not
+            // even its own "no disk" line - while `fs` on core 1 never reached "serving file API"
+            // behind it, and `nic-driver` on core 3 stopped after "starting". Everything left on core
+            // 0 was fine.
+            //
+            // The real constraint is underneath: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB,
+            // so a task blocked in `recv` on another core is never woken by its sender (§8.3 relies on
+            // that IPI). Cross-core request/reply therefore does not complete on this port, and every
+            // service that uses it has been co-located on core 0 - which is why three cores sit idle.
+            //
+            // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
+            // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
+            // unpins these three, and it unpins them everywhere at once.
+            // arm32: core 2. Off core 0 for the same reason as the networking pair (see nic-driver),
+            // and off core 1 so a burst of disk I/O and a burst of frames do not queue behind
+            // each other on one core.
+            preferred_core:    if cfg!(target_arch = "arm") { 2 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[],
@@ -746,13 +1024,86 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "nic-driver" => Some(("nic-driver", ServiceConfig {
             elf:               include_bytes!(env!("SVC_NIC_DRIVER_ELF")),
             has_recv_endpoint: true, // will serve the frame interface to net-stack (§12)
+            // ARM32: the USB-net device is behind the `dwc2` SERVICE, so nic-driver needs a send cap
+            // to it - the same edge `block-driver` got in slice 3c. Without it `request_with_reply`
+            // finds no send slot and returns None INSTANTLY, which looks like a dead cable rather
+            // than a missing grant: every layer healthy in isolation, the edge between them absent.
+            #[cfg(target_arch = "arm")]
+            send_peers:        &["dwc2"],
+            #[cfg(not(target_arch = "arm"))]
             send_peers:        &[],
             send_peers_grant:  false,
-            // ARM (Pi 2): the NIC is the in-kernel DWC2 USB device, driven only from core 0 - the ARM
-            // backend's NET_DEVICE syscalls guard on that core. x86 and aarch64 (Pi 4): core 1,
-            // co-located with net-stack + fs. The Pi 4 has no core-0 constraint because GENET is
-            // reached by MMIO from whichever core makes the syscall, not from a timer tick.
-            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
+            // ARM KEEPS THIS ON CORE 0 - and the reason is neither of the two written here before.
+            // Both were wrong, and hardware refuted each in turn.
+            //
+            //   1. "The `msc_*` syscalls refuse when `!on_core0()`." True until slice 5 deleted the
+            //      in-kernel DWC2 stack; now provably false (no `on_core0` reference remains in
+            //      `arch/arm`, and `usb_disk_*` are inert stubs).
+            //   2. "Cross-core request/reply does not complete." False. Unpinned services stalled
+            //      because `dwc2` DROPPED block requests when it had no disk (fixed separately), not
+            //      because of cores; with that fixed they came up correctly on all four.
+            //
+            // The real reason is LATENCY, and it was found by an operator noticing `ls` and `read`
+            // had gone sluggish: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB, so the
+            // scheduler's cross-core wake does nothing and the target core does not notice a message
+            // until its next 10 ms timer tick. Cross-core IPC costs up to a full quantum PER HOP, and
+            // a file read is shell -> fs -> block-driver -> dwc2. Unpinning turned a same-core chain
+            // into three cross-core hops and made every command visibly slow. The giveaway was that a
+            // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
+            // chain again.
+            //
+            // UNPINNED, now that the IPI exists (BCM2836 core mailboxes; proven every boot by
+            // `arm32: IPI selftest PASS`). Cross-core wakes are immediate, so spreading these no
+            // longer costs a 10 ms tick per hop - the reason they were pinned in the first place.
+            //
+            // The stronger reason is what the IPI exposed. With wakes now actually preempting, `dwc2`
+            // shares core 0 with everything that gets woken, and its split-transaction sequencing is
+            // microframe-timed: a start-split and its complete-split must land in specific 125 us
+            // windows. Preempted between them, the transaction translator is left holding a
+            // transaction nobody collects - it wedges, gets cleared, and wedges again. Hardware showed
+            // that loop plainly: eight Clear_TT_Buffer calls and eight port re-enumerations in a
+            // couple of minutes, which the operator experiences as the keyboard pausing.
+            //
+            // So moving storage and the network OFF core 0 is not load-balancing here, it is giving
+            // the one timing-critical service on this board room to hit its deadlines. `dwc2` stays on
+            // core 0 because that is where its interrupt is routed.
+            //
+            // (Superseded rationale kept below so the next reader sees what was believed and why.)
+            //
+            // The old reason - the in-kernel DWC2 stack's `msc_*` entry points refused when
+            // `!on_core0()` - died with slice 5, and is verifiably gone (no `on_core0` reference
+            // remains in `arch/arm`; `usb_disk_*` are inert stubs). Unpinning on that basis was tried
+            // and it BROKE STORAGE: block-driver spawned on core 2 and logged nothing at all - not
+            // even its own "no disk" line - while `fs` on core 1 never reached "serving file API"
+            // behind it, and `nic-driver` on core 3 stopped after "starting". Everything left on core
+            // 0 was fine.
+            //
+            // The real constraint is underneath: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB,
+            // so a task blocked in `recv` on another core is never woken by its sender (§8.3 relies on
+            // that IPI). Cross-core request/reply therefore does not complete on this port, and every
+            // service that uses it has been co-located on core 0 - which is why three cores sit idle.
+            //
+            // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
+            // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
+            // unpins these three, and it unpins them everywhere at once.
+            // arm32: core 1, and NOT unpinned.
+            //
+            // Unpinning these three was meant to "give the timing-critical USB driver a quieter core
+            // 0" (75c18457). It did the opposite: unpinned means ROUND-ROBIN, and round-robin put
+            // `net-stack` straight back onto core 0 alongside `dwc2` - observed on hardware as
+            // "'dwc2' spawned OK on core 0 / 'net-stack' spawned OK on core 0".
+            //
+            // That is the worst possible pairing. `net-stack` waits for replies by POLLING
+            // (`drain_scan` -> try_recv + yield_cpu), and the scheduler quantum is 10 ms, so it can
+            // hold core 0 for 10 ms at a stretch. `dwc2`'s split transactions have to hit 125 us
+            // windows - eighty times finer. So the service waiting for a DHCP or ARP reply was
+            // starving the driver that had to deliver it: a spin that defeats itself.
+            //
+            // Pinned, and pinned TOGETHER with net-stack, which is what the contract used to say
+            // before the audit deleted it ("co-located with nic-driver - the two exchange frames
+            // constantly"). Same-core request/reply is safe now that the SDK waits poll rather than
+            // block. Core 0 is left to `dwc2` alone, which is what the unpin was for.
+            preferred_core:    if cfg!(target_arch = "arm") { 1 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             // GENET's macirq on aarch64 (SPI 157 -> neutral vector 0x2A). x86's nic-driver is a
@@ -770,10 +1121,65 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "net-stack" => Some(("net-stack", ServiceConfig {
             elf:               include_bytes!(env!("SVC_NET_STACK_ELF")),
             has_recv_endpoint: true,               // nic-driver replies frames here (per-request reply cap)
-            send_peers:        &["nic-driver"],    // the frame interface; reacquired by name on death
+            // `time` (clock slice 2): SNTP is a network fact this service fetches; whether to BELIEVE it
+            // is the clock's policy, so the reading is handed over rather than written to a syscall.
+            send_peers:        &["nic-driver", "time"],    // the frame interface; reacquired by name on death
             send_peers_grant:  false,
-            // ARM: co-locate with nic-driver on core 0 (avoids QEMU-TCG cross-core IPC latency). x86: core 1.
-            preferred_core:    if cfg!(target_arch = "arm") { 0 } else { 1 },
+            // ARM KEEPS THIS ON CORE 0 - and the reason is neither of the two written here before.
+            // Both were wrong, and hardware refuted each in turn.
+            //
+            //   1. "The `msc_*` syscalls refuse when `!on_core0()`." True until slice 5 deleted the
+            //      in-kernel DWC2 stack; now provably false (no `on_core0` reference remains in
+            //      `arch/arm`, and `usb_disk_*` are inert stubs).
+            //   2. "Cross-core request/reply does not complete." False. Unpinned services stalled
+            //      because `dwc2` DROPPED block requests when it had no disk (fixed separately), not
+            //      because of cores; with that fixed they came up correctly on all four.
+            //
+            // The real reason is LATENCY, and it was found by an operator noticing `ls` and `read`
+            // had gone sluggish: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB, so the
+            // scheduler's cross-core wake does nothing and the target core does not notice a message
+            // until its next 10 ms timer tick. Cross-core IPC costs up to a full quantum PER HOP, and
+            // a file read is shell -> fs -> block-driver -> dwc2. Unpinning turned a same-core chain
+            // into three cross-core hops and made every command visibly slow. The giveaway was that a
+            // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
+            // chain again.
+            //
+            // UNPINNED, now that the IPI exists (BCM2836 core mailboxes; proven every boot by
+            // `arm32: IPI selftest PASS`). Cross-core wakes are immediate, so spreading these no
+            // longer costs a 10 ms tick per hop - the reason they were pinned in the first place.
+            //
+            // The stronger reason is what the IPI exposed. With wakes now actually preempting, `dwc2`
+            // shares core 0 with everything that gets woken, and its split-transaction sequencing is
+            // microframe-timed: a start-split and its complete-split must land in specific 125 us
+            // windows. Preempted between them, the transaction translator is left holding a
+            // transaction nobody collects - it wedges, gets cleared, and wedges again. Hardware showed
+            // that loop plainly: eight Clear_TT_Buffer calls and eight port re-enumerations in a
+            // couple of minutes, which the operator experiences as the keyboard pausing.
+            //
+            // So moving storage and the network OFF core 0 is not load-balancing here, it is giving
+            // the one timing-critical service on this board room to hit its deadlines. `dwc2` stays on
+            // core 0 because that is where its interrupt is routed.
+            //
+            // (Superseded rationale kept below so the next reader sees what was believed and why.)
+            //
+            // The old reason - the in-kernel DWC2 stack's `msc_*` entry points refused when
+            // `!on_core0()` - died with slice 5, and is verifiably gone (no `on_core0` reference
+            // remains in `arch/arm`; `usb_disk_*` are inert stubs). Unpinning on that basis was tried
+            // and it BROKE STORAGE: block-driver spawned on core 2 and logged nothing at all - not
+            // even its own "no disk" line - while `fs` on core 1 never reached "serving file API"
+            // behind it, and `nic-driver` on core 3 stopped after "starting". Everything left on core
+            // 0 was fine.
+            //
+            // The real constraint is underneath: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB,
+            // so a task blocked in `recv` on another core is never woken by its sender (§8.3 relies on
+            // that IPI). Cross-core request/reply therefore does not complete on this port, and every
+            // service that uses it has been co-located on core 0 - which is why three cores sit idle.
+            //
+            // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
+            // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
+            // unpins these three, and it unpins them everywhere at once.
+            // arm32: core 1, co-located with nic-driver and OFF core 0 - see the note there.
+            preferred_core:    if cfg!(target_arch = "arm") { 1 } else { 1 },
             probe_mode:        0,
             memory_limit:      16 * 1024 * 1024,
             hw_irqs:           &[],
@@ -3252,9 +3658,24 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             //
             // It also gives a useful answer when `fs` is dead: "disk present, filesystem
             // unavailable" instead of nothing at all (§26.7).
-            send_peers:        &["fs", "block-driver"],
+            // `time` (clock slice 2): the wall clock is a service, so `date` and the boot floor ask it.
+            // `console`: terminal geometry, for the pager and `edit`. It used to come from the KERNEL
+            // (`InspectKernel` query 9, now deleted) - the shell was asking the wrong party for a fact
+            // the terminal owns (docs/console-service.md 9.7).
+            send_peers:        &["fs", "block-driver", "time", "console"],
             send_peers_grant:  false,
-            preferred_core:    0,
+            // ARM: OFF CORE 0, to keep the serial writer away from the microframe-timed USB driver.
+            //
+            // Measured: a 125 us sleep averages 9398 us during boot and 608 us on a quiet system - a
+            // 15x difference made entirely of console traffic. A serial write is a syscall, 115200
+            // baud is ~87 us per byte, and this port deliberately refuses to preempt a user task
+            // mid-syscall (preempting SVC corrupts the banked SPSR/sp). So one ~100-character log
+            // line holds its core, un-preemptible, for about 9 ms.
+            //
+            // That blocks only the core it runs on - and this service was sharing core 0 with `dwc2`,
+            // whose split transactions must hit 125 us windows. Moving the writer is the cheap half
+            // of the fix; it needs no console rework and it uses the cores this board has.
+            preferred_core:    if cfg!(target_arch = "arm") { 1 } else { 0 },
             probe_mode:        0,
             memory_limit:      8 * 1024 * 1024,
             hw_irqs:           &[],
@@ -3415,6 +3836,14 @@ const SPAWN_TRACE: bool = false;
 /// `own_endpoint` is `None` for a service with no recv endpoint (and at the pre-endpoint cap
 /// inserts), in which case only the task slot is released - identical to the prior behaviour.
 fn cleanup_partial_spawn(task_slot: usize, name: &str, own_endpoint: Option<EndpointId>) {
+    // A spawn that fails half-way must give back BOTH endpoints, for the same reason death must:
+    // a leaked endpoint is permanent, and enough of them fill the routing table and take the kernel
+    // down. Read-and-clear, so a later kill of this slot cannot reclaim the same one twice.
+    if let Some(rep) = crate::task::scheduler::take_task_reply_endpoint(task_slot) {
+        let _ = crate::ipc::routing::kill_endpoint(rep);
+        crate::capability::table::mark_dead_resource(
+            crate::capability::cap::ResourceId::from(rep));
+    }
     if let Some(ep_id) = own_endpoint {
         // Mark the routing entry Dead (recyclable) + drain its queue + bump generation.
         let _ = crate::ipc::routing::kill_endpoint(ep_id);
@@ -3532,6 +3961,12 @@ fn spawn_service_with_config(
     // 4. Optional recv endpoint.
     let mut recv_slot_u32 = u32::MAX;
     let mut self_grant_slot_u32 = u32::MAX;
+    // Carried to `commit_task` so the scheduler can reclaim it on death. Without this the reply
+    // endpoint outlives its task and the routing table fills - it panicked the kernel under a chaos
+    // kill storm. See `scheduler::TASK_REPLY_ENDPOINT`.
+    let mut reply_ep_for_slot: Option<crate::ipc::EndpointId> = None;
+    let mut reply_recv_slot_u32 = u32::MAX;
+    let mut reply_grant_slot_u32 = u32::MAX;
 
     if has_recv_endpoint {
         let ep_id       = crate::ipc::alloc_endpoint_id();
@@ -3551,7 +3986,18 @@ fn spawn_service_with_config(
         crate::capability::register_resource_at_gen(resource_id, start_gen);
 
         // Register in routing table at the same generation.
-        crate::ipc::routing::register(ep_id, core_id, start_gen);
+        // A FULL ROUTING TABLE FAILS THE SPAWN. It used to panic the kernel, which is the one thing
+        // nothing above the kernel is allowed to cause: a chaos kill storm exhausted the table and
+        // took the machine down with it. A service that cannot get a mailbox genuinely cannot serve,
+        // so the spawn is refused - but refusing a spawn is an ordinary, recoverable outcome the
+        // supervisor already handles by logging and carrying on, and the kernel stays up.
+        if !crate::ipc::routing::try_register(ep_id, core_id, start_gen) {
+            crate::kprintln!(
+                "task: '{}' spawn REFUSED - IPC routing table full, no mailbox available",
+                name);
+            cleanup_partial_spawn(task_slot, name, None);
+            return Err(SpawnError::NoMemory);
+        }
 
         // Publish name → endpoint mapping for peer cap resolution.
         crate::ipc::names::register(name, ep_id);
@@ -3572,6 +4018,54 @@ fn spawn_service_with_config(
         // this original and derives copies for re-registration after a restart.
         if let Ok(sg) = caps.insert(mint_cap(resource_id, Rights::SEND | Rights::GRANT)) {
             self_grant_slot_u32 = sg as u32;
+        }
+
+        // A SECOND endpoint, for replies only.
+        //
+        // The first one is where clients send their requests. A service that also AWAITS replies
+        // there cannot drain it while blocked, so client traffic fills the 16-deep queue and the
+        // reply it is waiting for is dropped by a peer that (rightly) uses `try_send` instead of
+        // deadlocking. The wait then runs to its deadline - 30 s per block op on x86.
+        //
+        // Not registered in the name directory: nobody looks this up, it is handed out per-request as
+        // a reply cap. Not gated on a contract either - every service that can receive gets one, so
+        // there is no capability to declare and no way to get it wrong. It costs one endpoint and two
+        // cap slots per task, and it removes an entire class of self-inflicted stall.
+        //
+        // `docs/net-tags-design.md` rejected this for needing a `CreateEndpoint` syscall. It does not:
+        // this is the same mint as above, at the same point in spawn.
+        let reply_ep_id  = crate::ipc::alloc_endpoint_id();
+        let reply_res_id = ResourceId::from(reply_ep_id);
+        let reply_gen    = crate::capability::next_generation();
+        crate::capability::register_resource_at_gen(reply_res_id, reply_gen);
+        // FALLIBLE on purpose, and now RESERVED against. The routing table holds 96 endpoints and
+        // the probe builds spawn ~178 services; taking one unconditionally would turn
+        // `osdev test identity` into a boot panic. Without it the task awaits replies on its shared
+        // endpoint, exactly as before this existed.
+        //
+        // `try_register_optional` additionally refuses once the table nears full, because being
+        // merely fallible was not enough: this endpoint is optional but was competing for slots on
+        // equal terms with the MANDATORY receive endpoint above, and winning by getting there
+        // first. Property P5 caught the consequence - a real service refused with "IPC routing
+        // table full" while convenience endpoints held slots they could have done without.
+        let reply_routed =
+            crate::ipc::routing::try_register_optional(reply_ep_id, core_id, reply_gen);
+        if reply_routed {
+        // Recorded HERE, not at commit: every fallible step after this point runs
+        // `cleanup_partial_spawn`, which can only give the endpoint back if it knows about it.
+        reply_ep_for_slot = Some(reply_ep_id);
+        scheduler::set_task_reply_endpoint(task_slot, reply_ep_for_slot);
+        if let Ok(rr) = caps.insert(mint_cap(reply_res_id, Rights::RECV)) {
+            reply_recv_slot_u32 = rr as u32;
+            if let Ok(rg) = caps.insert(mint_cap(reply_res_id, Rights::SEND | Rights::GRANT)) {
+                reply_grant_slot_u32 = rg as u32;
+            } else {
+                // Half a reply mailbox is worse than none: a RECV with no way to hand out a reply cap
+                // would have callers wait on an endpoint nothing can answer. Fall back to the shared
+                // endpoint, which is what every service did until now.
+                reply_recv_slot_u32 = u32::MAX;
+            }
+        }
         }
 
         // Wire hw_interrupt lines to this endpoint (§12.3).
@@ -3634,6 +4128,13 @@ fn spawn_service_with_config(
 
     // REBOOT (§3.1): hardware-reset the machine (`Reboot`/18). WHO holds it is in `service_privileges`;
     // here we only mint it. No other service can hardware-reset the machine.
+    // FIRE_IRQ (C1-6): inject a test interrupt. Held only by `control`, which needs it because the
+    // interrupt-routing identity tests drive IRQ injection over the operator channel.
+    if privs.fire_irq {
+        let fi_cap = mint_cap(FIRE_IRQ_RESOURCE, Rights::WRITE);
+        caps.insert(fi_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
     if privs.reboot {
         let rb_cap = mint_cap(REBOOT_RESOURCE, Rights::WRITE);
         caps.insert(rb_cap)
@@ -3772,6 +4273,8 @@ fn spawn_service_with_config(
     // `ctx.ehci_mmio()`) is unambiguous (§12).
     // The mapped MMIO window's VA + byte length; the length lets the SDK's `Mmio` wrapper bounds-check
     // accesses (SEC-4). (0, 0) = this service gets no MMIO.
+    // Set by the framebuffer branch below; carried out so the context page can describe the grant.
+    let mut fb_grant: Option<crate::bootcon::FbGrant> = None;
     let (xhci_mmio_va, xhci_mmio_len) = {
         // The controller BAR for this driver's declared class (audit M7): xHCI/EHCI/AHCI use their
         // register base; a NIC only when it is a model we drive (e1000 / RTL8168) - otherwise 0, so the
@@ -3792,6 +4295,96 @@ fn spawn_service_with_config(
             }
             crate::kprintln!("spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}", name, bar, XHCI_MMIO_VA);
             (XHCI_MMIO_VA, XHCI_MMIO_PAGES * PAGE_SIZE as u64)
+        } else if hw == HwClass::Framebuffer {
+            // The display's framebuffer, for the `console` service (docs/console-service.md 9).
+            //
+            // `PCD | PWT` = Normal NON-cacheable: uncached, but the write buffer may still gather a run
+            // of pixel stores into a burst. A framebuffer store has no side effect - it is memory the
+            // display happens to scan - so the Device attribute the driver MMIO grants use would forbid
+            // that merging for nothing, at a bus transaction per pixel. It also has to MATCH the
+            // kernel's own mapping of these same physical pages (`mmu::section_fb` on ARM): mismatched
+            // memory attributes for one physical page are UNPREDICTABLE on ARM.
+            match crate::bootcon::grant() {
+                Some(g) => {
+                    // UC- (PCD alone), NOT strong UC (PCD|PWT). The PAT index is
+                    // (PAT<<2)|(PCD<<1)|PWT, so PCD|PWT selects entry 3 - strong uncacheable, the
+                    // one memory type an MTRR can never upgrade. Every 4-byte pixel write then goes
+                    // to the bus on its own with no combining, and this display measured 596 ms to
+                    // repaint one scroll: 19 MB at about 32 MB/s.
+                    //
+                    // PCD alone selects entry 2, UC-, which is defined to yield WC where the MTRR
+                    // for the range says WC - and firmware routinely marks a framebuffer WC for
+                    // precisely this reason. Strictly no worse than before: if the MTRR says UC the
+                    // effective type stays UC, exactly as it is today.
+                    //
+                    // A framebuffer wants write-combining, not cacheability. It is still not
+                    // cached: nothing here reads back, and stores stay ordered enough for a display
+                    // (which has no side effects to order against, unlike a register BAR - that is
+                    // why a BAR keeps strong UC and this does not).
+                    //
+                    // X86 ONLY, because the two architectures read these same two bits in OPPOSITE
+                    // senses and the neutral `PageFlags` name hides it. On arm32, `PCD | PWT` is
+                    // Normal NON-cacheable - which permits exactly the gathering a framebuffer
+                    // wants - while `PCD` ALONE is Device, which forbids it. Dropping PWT there
+                    // would slow the Pi down for the same reason it speeds the PC up, and would
+                    // also MISMATCH the kernel's own mapping of these physical pages
+                    // (`mmu::section_fb`), which is unpredictable on ARM rather than merely slow.
+                    // On aarch64 the attribute is `PCD || PWT`, so this bit makes no difference.
+                    //
+                    // Borrow the silicon's requirement, not the other port's answer (§26.14).
+                    #[allow(unused_mut)]
+                    let mut flags = PageFlags::PRESENT
+                        | PageFlags::WRITABLE
+                        | PageFlags::USER
+                        | PageFlags::NO_EXEC
+                        | PageFlags::PCD
+                        // This is a FRAMEBUFFER - RAM the display controller scans out - not device
+                        // registers, and saying so is what lets an arch pick the right memory type.
+                        // AArch64 was mapping it Device-nGnRnE (the faithful reading of PCD|PWT), which
+                        // forbids the gathering and buffering a bulk pixel write depends on: one
+                        // 1920x1080 repaint measured 582 ms, about 14 MB/s, which is the slow and
+                        // jittery rendering reported from the television. An arch with nothing better
+                        // ignores this bit and keeps its uncached-MMIO type, so x86 is unchanged.
+                        | PageFlags::WRITE_COMBINE;
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        flags |= PageFlags::PWT;
+                    }
+                    let pages = g.len.div_ceil(PAGE_SIZE as u64);
+                    // The framebuffer is DEVICE memory the kernel is about to map into a service.
+                    // The kill-path reclaim walks a dead task's leaves and frees them, so without a
+                    // reservation the display's pages go into the RAM free pool the first time
+                    // `console` dies - inflating the free count past the total AND making the
+                    // framebuffer allocatable, so a later task can be handed the screen as RAM.
+                    //
+                    // The walker has a guard for this, keyed on the mapping being uncached, and it
+                    // was disarmed by a change nowhere near it (see `reserve_no_free`). Reserving the
+                    // range here puts the refusal on the RESOURCE, where how it is mapped cannot
+                    // affect it. Idempotent, so a console respawn does not consume a second slot.
+                    crate::memory::allocator::reserve_no_free(g.phys, pages as usize);
+                    for i in 0..pages {
+                        let off = i * PAGE_SIZE as u64;
+                        page_table
+                            .map(VirtAddr(FB_VA + off), PhysAddr(g.phys + off), flags)
+                            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::MapFailed })?;
+                    }
+                    fb_grant = Some(g);
+                    // The grant IS the handover: the kernel has just given this framebuffer away, so it
+                    // stops writing to it now rather than when the first console byte arrives. Those
+                    // moments are seconds apart on a quiet boot, and drawing in the gap put the floor's
+                    // text on top of the terminal's.
+                    crate::bootcon::release();
+                    crate::kprintln!(
+                        "spawn[fb]: '{}' {}x{} at phys {:#x} -> VA {:#x} ({} KiB)",
+                        name, g.width, g.height, g.phys, FB_VA, g.len / 1024
+                    );
+                    (FB_VA, g.len)
+                }
+                // `found()` said there was a framebuffer and `grant()` now says there is not. Nothing
+                // maps, the service is told it has no display and says so (invariant 12); it does not
+                // get a window it cannot use.
+                None => (0, 0),
+            }
         } else if let Some((va, len)) = crate::arch::imp::map_fixed_driver_mmio(&mut page_table, name) {
             // Non-PCI fixed-physical peripheral MMIO grant (§12.3 for a bus with no PCI scan - the Pi's
             // peripherals are at fixed addresses). The arch layer maps the window Device+USER and returns
@@ -3850,13 +4443,13 @@ fn spawn_service_with_config(
                 for i in 0..dma_pages {
                     let off = i * PAGE_SIZE as u64;
                     page_table
-                        .map(VirtAddr(XHCI_DMA_VA + off), PhysAddr(phys + off), flags)
+                        .map(VirtAddr(crate::arch::imp::DRIVER_DMA_VA + off), PhysAddr(phys + off), flags)
                         .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::MapFailed })?;
                 }
                 let len = dma_pages * PAGE_SIZE as u64;
                 crate::kprintln!(
                     "spawn[dma]: '{}' arena phys {:#x} -> VA {:#x} ({} KiB)",
-                    name, phys, XHCI_DMA_VA, len / 1024
+                    name, phys, crate::arch::imp::DRIVER_DMA_VA, len / 1024
                 );
                 // H1 Phase 1d: confine this DMA-capable driver to its arena via
                 // the IOMMU, so a compromised driver cannot DMA outside it. No-op
@@ -3900,7 +4493,7 @@ fn spawn_service_with_config(
                     pci::set_power_d0(bdf);  // bring the device to D0 first - firmware may park a non-boot NIC in D3
                     pci::set_bus_master(bdf);
                 }
-                (XHCI_DMA_VA, phys, len)
+                (crate::arch::imp::DRIVER_DMA_VA, phys, len)
             }
             None => {
                 crate::kprintln!("spawn[dma]: '{}' WARN: no contiguous DMA arena", name);
@@ -3935,11 +4528,20 @@ fn spawn_service_with_config(
             data.console_read_slot  = console_read_slot_u32;
             data.console_push_slot  = console_push_slot_u32;
             data.self_grant_slot    = self_grant_slot_u32;
+            data.reply_recv_slot    = reply_recv_slot_u32;
+            data.reply_grant_slot   = reply_grant_slot_u32;
             data.xhci_mmio_va       = xhci_mmio_va;
             data.xhci_mmio_len      = xhci_mmio_len;
             data.xhci_dma_va        = xhci_dma_va;
             data.xhci_dma_phys      = xhci_dma_phys;
             data.xhci_dma_len       = xhci_dma_len;
+            data.fb_va              = fb_grant.map_or(0, |_| FB_VA);
+            data.fb_len             = fb_grant.map_or(0, |g| g.len);
+            data.fb_pitch           = fb_grant.map_or(0, |g| g.pitch);
+            data.fb_width           = fb_grant.map_or(0, |g| g.width);
+            data.fb_height          = fb_grant.map_or(0, |g| g.height);
+            data.fb_bpp             = fb_grant.map_or(0, |g| g.bpp);
+            data.fb_shifts          = fb_grant.map_or(0, |g| g.shifts);
             for i in 0..peer_count {
                 data.send_peers[i].slot     = peer_data[i].0;
                 data.send_peers[i].name_len = peer_data[i].1;
@@ -4002,6 +4604,15 @@ fn spawn_service_with_config(
 /// (garbage under `test-bad-supervisor` → §22 Test 1B). `has_recv_endpoint = true` (the supervisor
 /// owns the death-notification endpoint). A *boot-time* spawn failure is fatal (§6.2, §11.3); a later
 /// *runtime* death is recovered by the kernel respawning it (Phase 6 - see below).
+// C1-1: `arm_spawn_logger_neutral` and `arm_spawn_shell_neutral` USED TO LIVE HERE, and with them the
+// `arm-sched-spawn` / `arm-shell` / `arm-spawn-logger` / `pi4-sched-spawn` bring-up builds in which the
+// kernel started a service directly. They were scaffolding from before the supervisor path worked, and
+// they were gated on ARCHITECTURE rather than on the features that called them, so every ARM and
+// AArch64 kernel carried the ability whether or not anything reached it.
+//
+// The kernel spawns the supervisor and NOTHING ELSE. Bringing up a new ISA now means getting the
+// supervisor up, which is the thing that has to work anyway. If that ever proves too large a first
+// step, the answer is a smaller supervisor - not a second spawn path in the kernel.
 pub fn spawn_supervisor() {
     match spawn_service_with_config("supervisor", SUPERVISOR_ELF, 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
@@ -4009,42 +4620,7 @@ pub fn spawn_supervisor() {
     }
 }
 
-/// ARM bring-up (increment 4a): spawn the logger through the **neutral** `spawn_service_with_config` -
-/// the exact machinery the supervisor's spawn syscall uses - to prove the real spawn path works on ARM
-/// (page tables + kstack pool + cap wiring + ctx page + the ARM `finalize_service_address_space` hook).
-/// The full-OS build spawns via the supervisor instead; this is the direct probe. Requires the neutral
-/// bootstrap (percpu / scheduler arenas / capability) to have run first.
-/// Also used by the AArch64 (Pi 4) bring-up, which reaches the same milestone by the same route. The
-/// name keeps its `arm_` prefix because it is the ARM family's bring-up probe and renaming it would
-/// churn the 32-bit port for nothing; both ports delete it once the supervisor spawns their services.
-#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-pub fn arm_spawn_logger_neutral() {
-    static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
-    match spawn_service_with_config(
-        "logger", LOGGER_ELF, 0, /*has_recv_endpoint=*/true, &[], 0, false,
-        8 * 1024 * 1024, &[], false, None,
-    ) {
-        Ok(_)  => crate::kprintln!("arm: logger spawned via the neutral spawn path"),
-        Err(e) => crate::kprintln!("arm: logger neutral spawn FAILED: {:?}", e),
-    }
-}
 
-/// ARM bring-up (increment 5): spawn the shell through the neutral spawn path with a CONSOLE_READ cap,
-/// so it reads serial input from the PL011 RX ring. `send_peers=&[]` (not `["fs"]` as on x86) because
-/// there is no `fs` on the Pi 2 yet - file/history commands degrade, but the prompt comes up and every
-/// non-fs command (`help`, `version`, ...) works. The shell's other authorities (spawn/kill/reboot)
-/// come from `service_privileges("shell")` automatically.
-#[cfg(target_arch = "arm")]
-pub fn arm_spawn_shell_neutral() {
-    static SHELL_ELF: &[u8] = include_bytes!(env!("SVC_SHELL_ELF"));
-    match spawn_service_with_config(
-        "shell", SHELL_ELF, 0, /*has_recv_endpoint=*/true, &[], 0, false,
-        8 * 1024 * 1024, &[], /*has_console_read=*/true, None,
-    ) {
-        Ok(_)  => crate::kprintln!("arm: shell spawned (console-read wired)"),
-        Err(e) => crate::kprintln!("arm: shell spawn FAILED: {:?}", e),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Supervisor respawn (Path C / Phase 6 - the supervisor is restartable; §6.2).
@@ -4095,8 +4671,13 @@ pub fn supervisor_respawn_pending() -> bool {
     SUPERVISOR_RESPAWN_PENDING.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// If the supervisor died, respawn it (Path C / Phase 6). Called from `control::process_pending`
-/// (Core 0) - a spawn-safe deferred point. Always respawns; never gives up (see the note above).
+/// If the supervisor died, respawn it (Path C / Phase 6). Called from `scheduler::run` (Core 0) at an
+/// IF=1 point - a spawn-safe deferred point. It is NOT called from `control::process_pending`, which
+/// runs at IF=0 from the timer ISR: a ~22 ms spawn issuing all-core TLB shootdowns wedged the box
+/// there, because core 0 could not ACK other cores' IPIs while stuck in it. This comment said
+/// otherwise until 2026-08-14 and cost a wrong finding - a doc comment naming the wrong caller is not
+/// a cosmetic error, it is a false statement about control flow that a reader will act on.
+/// Always respawns; never gives up (see the note above).
 /// The count is observability only (§26.4), not a bound.
 pub fn poll_supervisor_respawn() {
     use core::sync::atomic::Ordering;

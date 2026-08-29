@@ -49,11 +49,18 @@ panic = "abort"
 # Selects the 0x80000 flat-load linker script and the BCM2711 peripheral base (PL011 at 0xFE201000);
 # without it the aarch64 build stays the QEMU `virt` boundary-demarcation target it has been.
 pi4 = []
+# Diagnostic only, OFF by default. Widens the EL0 fault dump: a bigger raw stack window, a
+# fill-byte run length (the production one measures a ZERO run, which reports "0 bytes" when the
+# overrun is written with anything else - a space-filled smash on the Pi 4 measured exactly that,
+# twice), and more backtrace candidates. Costs nothing until a task faults fatally, but it is
+# several hundred milliseconds of serial when one does, and the adversarial suite faults tasks
+# DELIBERATELY - so it is a feature rather than always-on.
+fault-dump-wide = []
 # Force `map_in_active_tables` to fail at the MMIO call sites (ioapic, pci MSI-X), so the error paths
 # added for kernel-audit A9-2 are actually EXERCISED rather than merely reasoned about. Those paths are
 # otherwise unreachable without exhausting the frame allocator, which cannot be arranged at boot.
 # Commandment IX: "If recovery cannot be tested, it does not exist." Off by default; test builds only.
-# See `arch/x86_64/pci.rs::msi_ordering` and `docs/kernel-audit.md` Audit 9.
+# See `arch/x86_64/pci.rs::msi_ordering` and `audits/kernel-audit.md` Audit 9.
 mmio-map-fault-test = []
 # Inject synthetic memory banks that extend past the identity-map limit, so `memmap`'s clamp is
 # EXERCISED rather than merely reasoned about. The clamp matters on an 8 GiB Pi 4, whose firmware
@@ -66,11 +73,10 @@ memmap-clamp-test = []
 # preempted by the 100 Hz generic timer. The aarch64 twin of `arm-sched-demo`. Gated because it does
 # not return - scheduler::run IS the idle loop - so it replaces the rest of the boot.
 pi4-sched-demo = []
-# Spawn a REAL service (the logger) through the neutral spawn path on the Pi 4
-# (arch/aarch64/sched_spawn.rs) and run it under the scheduler. The aarch64 twin of
-# `arm-sched-spawn`. Exercises the ELF loader, per-task page tables, the instruction-cache
-# maintenance a loader needs, the kstack pool, cap wiring, and the SDK ABI - in one call.
-pi4-sched-spawn = []
+# NOTE (C1-1): the bring-up features that had the KERNEL spawn a service directly - `arm-sched-spawn`,
+# `arm-shell`, `arm-spawn-logger`, `pi4-sched-spawn` - are gone. The kernel spawns the supervisor and
+# nothing else, so a new port is brought up by getting the supervisor running, which is the thing that
+# has to work anyway.
 # The real OS bootstrap on the Pi 4: the kernel makes its ONE direct spawn (the supervisor), which then
 # spawns the services - including the shell, with a CONSOLE_READ cap wired to the PL011 receiver. The
 # aarch64 twin of `arm-supervisor`. This is the build that gives a `gsh>` prompt.
@@ -104,31 +110,32 @@ pi4-smp = []
 # It is a feature rather than the default for one reason: the in-kernel driver is HARDWARE-VERIFIED on
 # a real Pi 4 and the service one is not yet, and a working machine does not get replaced by an
 # unproven one on the strength of an argument. Build both sides with it (`pi4_build.py
-arm-spawn-logger = []
 # Run the neutral scheduler over 3 cooperative kernel tasks on ARM (arch/arm/sched_demo.rs).
 arm-sched-demo = []
 # Run a real USER service (the logger) THROUGH the neutral scheduler on ARM, preemptively, alongside
 # spinning kernel tasks (arch/arm/sched_user.rs). Proves per-task address spaces + user-mode preemption.
-arm-sched-user = []
 # Run TWO USER services under the scheduler at once (arch/arm/sched_ipc.rs). Proves the banked-register
 # trap frame (SP_usr/LR_usr per task) and is the base the real IPC send/recv proof grows on.
 arm-sched-ipc = []
 # Spawn a service (logger) through the NEUTRAL spawn path on ARM (arch/arm/sched_spawn.rs). Proves
 # task::spawn_service_with_config - the machinery the supervisor's spawn syscall uses - works on ARM.
-arm-sched-spawn = []
 # The real OS bootstrap: kernel spawns the SUPERVISOR, which spawns the services (arch/arm/sched_supervisor.rs).
 arm-supervisor = []
 # The interactive shell on ARM: gsh> prompt reading serial input (arch/arm/sched_shell.rs).
-arm-shell = []
 # Hands-off chaos demo: a few seconds after boot the kernel INJECTS `chaos max-carnage all-services 10`
 # (+ confirm) into the input ring, so a serial-output-only setup (no keyboard) still runs + shows the
 # storm. Build with `arm-supervisor,arm-autochaos`.
+# The 22 Tests 2 and 3 scaffolding (capability enforcement, IPC routing), run pre-scheduler.
+# OFF by default: they panic on failure and they register test resources and endpoints in the LIVE
+# tables, so a shipping boot must not run them. `osdev test identity` turns them on.
+kernel-selftest = []
 arm-autochaos = []
-# Target QEMU's raspi2b emulation rather than real Pi 2 hardware. Currently only changes the DWC2 USB
-# DMA bus-address translation: QEMU's emulated DWC2 addresses ARM system RAM directly (identity), while
-# real BCM2836 silicon sees RAM through the VideoCore uncached alias 0xC000_0000 (arch/arm/dwc2.rs).
-# OFF by default so the shipped image is hardware-correct; scripts/arm_run.py passes it for emulation.
-qemu = []
+# (The `qemu` feature was DELETED here. It selected the DWC2 USB DMA bus-address translation back when
+# the USB stack was `arch/arm/dwc2.rs`; that stack is now the `dwc2` SERVICE, which carries its own
+# `qemu` feature for `DMA_BUS_ALIAS`. The kernel copy outlived its only reader and became a flag that
+# built cleanly and changed nothing - which is exactly how `scripts/arm_build.py --qemu` came to be a
+# silent no-op. If the kernel ever needs to know it is emulated, add it back with a reader in the same
+# commit.)
 
 # Deliberately take a data abort during arm32 boot, to PROVE the exception vectors
 # fire (a fault path never observed firing is not evidence). The ARM twin of the x86

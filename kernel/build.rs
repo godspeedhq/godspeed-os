@@ -65,9 +65,18 @@ fn main() {
     let placeholder = workspace.join("kernel").join("svc-placeholder.bin");
 
     // (env-var suffix, binary name in target dir)
+/// Services that exist only on one architecture, so their absence from another target's build is a
+/// FACT rather than an omission. `dwc2` drives the BCM283x USB controller: there is no such device on
+/// x86, and no reason to carry the driver there.
+const ARM_ONLY: &[&str] = &["dwc2"];
+
     let services: &[(&str, &str)] = &[
         ("SUPERVISOR", "supervisor"),
+        ("DWC2",       "dwc2"),
         ("LOGGER",     "logger"),
+        ("CONSOLE",    "console"),
+        ("TIME",       "time"),
+        ("CONTROL",    "control"),
         ("MEM_PRESSURE",    "mem-pressure"),
         ("CHAOS",      "chaos"),
         ("PING",       "ping"),
@@ -99,10 +108,21 @@ fn main() {
     // for x86 hardware (PCI/AHCI/Realtek/xHCI) absent on the Pi 2, so they stay placeholders until real
     // Pi drivers (SD/EMMC, DWC2, LAN9514) exist. `probe` does not build for ARM (x86-only fault module).
     let arm_built: &[&str] = &[
-        "logger", "ping", "pong", "supervisor", "shell",
+        "logger", "console", "ping", "pong", "supervisor", "shell",
         "observe", "chaos", "mem-pressure",
         "counter", "greet", "upper", "roster",
         "reply-server", "asker", "resource-server", "holder",
+        // The userspace USB host driver (arm32 Phase 2). A SKELETON today: it holds the DWC2 MMIO
+        // window, a DMA arena and the USB vector, and reports whether the interrupt arrives. Built
+        // and embedded unconditionally; whether it SPAWNS is the supervisor's decision.
+        "dwc2",
+        // The wall clock (C1-6). REQUIRED on the Pi 2 rather than optional: the board has no
+        // battery-backed RTC, so SNTP is the only way it learns the time, and the `SetClock` syscall
+        // net-stack used to call is deleted. Without this embedded, `date sync` fails silently.
+        "time",
+        // The COM2 operator channel (C1-6). Inert on the Pi, which is driven from its own console, but
+        // embedded so the service set does not differ per arch without a reason.
+        "control",
         // Persistence on the Pi 2: block-driver's ARM backend is the BCM2835 EMMC (SDHCI, PIO); fs is
         // arch-neutral and rides on it. The kernel grants block-driver the EMMC MMIO window at spawn
         // (arch::arm::map_fixed_driver_mmio).
@@ -140,14 +160,23 @@ fn main() {
     // like a broken binary rather than a build-list omission, and is exactly the trap this comment
     // block warns about two paragraphs up. Cheap insurance against the failure mode with the worst
     // diagnostic. The spawn is what the feature gates (`services/supervisor`), not the embedding.
+    // `time` and `control` are here for the same reason they are in `arm_built`, and their absence was
+    // the Pi 4's first boot failure after the arm32 work: the supervisor SPAWNS both on every port, so
+    // leaving them out of this list embedded placeholders and the boot reported two `LoadFailed(TooSmall)`
+    // lines - the exact "reads like a broken binary rather than an absent one" trap the paragraph above
+    // warns about. `time` is REQUIRED, not optional: the Pi 4 has no battery-backed RTC either, so SNTP
+    // is the only way it learns the wall clock. `control` is inert on a board driven from its own
+    // console, and is embedded so the service set does not differ per arch without a reason.
     let aarch64_built: &[&str] = if aarch64_demo {
-        &["logger", "ping", "pong", "supervisor", "shell", "chaos", "observe", "mem-pressure",
+        &["logger", "console", "time", "control", "ping", "pong", "supervisor", "shell",
+          "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     } else {
         // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
         // carnage, and observe is how it is watched while it does. Both are arch-neutral.
-        &["logger", "supervisor", "shell", "chaos", "observe", "mem-pressure",
+        &["logger", "console", "time", "control", "supervisor", "shell",
+          "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     };
@@ -166,6 +195,14 @@ fn main() {
             let a64_bin = aarch64_dir.join(bin_name);
             if aarch64_built.contains(bin_name) && a64_bin.exists() { a64_bin } else { placeholder.clone() }
         } else if use_placeholder {
+            placeholder.clone()
+        } else if ARM_ONLY.contains(bin_name) {
+            // An ARM-ONLY driver on an x86 build. The placeholder is the right answer and this branch
+            // is explicit rather than a fallback-if-missing, because "the binary is not there" has two
+            // causes with opposite fixes: a service that does not APPLY to this target (fine, embed
+            // the placeholder) and a service that was left out of the build list (a bug, and one that
+            // surfaces as `LoadFailed(TooSmall)` - which reads like a broken binary, exactly the trap
+            // the comment above warns about). Silently accepting a missing file would merge the two.
             placeholder.clone()
         } else {
             target_dir.join(bin_name)

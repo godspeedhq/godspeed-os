@@ -108,7 +108,11 @@ pub fn write_fmt(args: fmt::Arguments) {
 
 /// Drain the ring buffer into the logger service endpoint once it is ready.
 pub fn drain_to_logger(send: impl FnMut(u8)) {
-    RING.lock().drain(send);
+    // Masked, for the reason `write_fmt` above states: `RING` is taken from interrupt context too, and
+    // a spinlock is not reentrant - so an unmasked hold lets the timer ISR spin on a lock its own core
+    // already owns. This one runs once, when the logger starts, which makes the window small rather
+    // than absent; the identical hazard in `arch/arm/irq.rs::HIRES` took 1754 chaos rounds to hit.
+    crate::smp::without_interrupts(|| RING.lock().drain(send));
 }
 
 #[macro_export]

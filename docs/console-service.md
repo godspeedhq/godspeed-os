@@ -269,3 +269,196 @@ on the **first up-arrow**, not at spawn. A fresh prompt never blocks on `fs` com
 re-init path touches no disk. In-memory history stays bounded (a fixed ring); saving remains best-effort
 (§15). Two small changes, one theme: the interactive path must stay responsive precisely when the rest of
 the system is busy recovering.
+
+---
+
+## 9. Stage 4 - the console service is real, and `fbcon` leaves the kernel (2026-08-17)
+
+> **Status:** BUILT and HARDWARE-VERIFIED on `feat/pi2-arm32-hardening` (Pi 2, 2026-08-17: chaos 50 rounds, 0 kernel panics, 0 liveness wedges, selfcheck 350/0, 0 console writes lost). This section supersedes decision **(2)(a)**
+> of §5 ("kernel render path") and decision **(4)** of §5a ("input stays shell-brokered" - still true;
+> only OUTPUT moves). Driven by `scripts/commandments.py`, for which `kernel/src/fbcon` was the last
+> standing Commandment I violation: 1,172 lines of terminal emulation that can claim none of the
+> kernel's six responsibilities (§4.3) and no sanctioned support role.
+
+### 9.1 Why (2)(a) was wrong
+
+§5 chose "the kernel keeps glyph rendering = mechanism, the service controls layout", reasoning from
+§26.10. That reading does not survive contact with §4.4: a font rasteriser, an ANSI/CSI state machine, a
+UTF-8 decoder, a shadow grid and a scroll strategy are a **display driver**, and §4.4 forbids drivers in
+the kernel by name. The measured boundary (the commandment walk, 2026-08-14; its surviving findings are now in `audits/userspace-audit.md` Audit 11) also showed there is
+no cheap partial slice - the emulator is reached THROUGH `put_byte`, so removing CSI handling alone
+leaves the shell's cursor moves and colours going nowhere. The service must take rendering **entirely**.
+
+The recorded user position settled it: *"fbcon is not special, only the kernel is special; I really don't
+want to continue adding exceptions to the kernel."* So option **(b)** of §5b - map the framebuffer to the
+service, as the xHCI BAR is mapped to `xhci` - is what gets built. Its stated drawback ("duplicates the
+font renderer and is serial-blind") is answered below.
+
+### 9.2 The split
+
+| | Kernel (`bootcon/`, ~330 lines) | `console` service (~1,100 lines) |
+|---|---|---|
+| Serial | owns it, unchanged - **still the source of truth** | never touches it |
+| Framebuffer | a minimal boot/panic blit | the whole terminal |
+| Text model | none (no grid, no cursor, no scrollback) | ANSI/CSI, UTF-8, shadow grid, cursor, scroll, reverse video |
+| Geometry | private to its own blit, never published | the single source of truth for rows/cols |
+
+**Not serial-blind.** `ConsoleWrite` (syscall 23) still writes serial synchronously, exactly as today, so
+a captured `build/serial_output.log` is unchanged and the interactive session still appears in it. What
+the syscall stops doing is *rendering*; it enqueues the same bytes to the service's ordinary IPC endpoint
+(no new ring - the bounded queue every service already has). Serial is truth, the display is a mirror -
+which is already the stated ARM policy (`mirror()`).
+
+**A full queue blocks the WRITER.** The writing task is parked as a blocked sender until the terminal
+drains (§8.5, §8.6) - the kernel itself never waits. This is a correction to the first draft of §9.2,
+which dropped instead: see §9.8, item 4, for why dropping could not work at any rendering speed.
+
+**Not a duplicated font renderer.** The kernel's blit is deliberately cruder than the terminal's: no box
+glyphs, no reverse video, no shadow grid, and a "scroll" that clears and starts at the top. It is a floor,
+not a small terminal, and the two are not two copies of one thing.
+
+### 9.3 What earns the kernel's remaining blit
+
+**Impossibility, which is the only thing that does** (the commandment walk: the bar the control
+channel failed and the supervisor spawn clears). A panic halts every core, including the console service,
+so **a panic cannot ask a service to report it**. On a Pi wired to a TV with no serial cable, a kernel
+with no blit dies with a frozen screen and no reason on it - the silent failure invariant 12 exists to
+forbid. Boot output has the same shape: it precedes every service, including the one that would render it.
+
+Both are the §11.4 ring-buffer argument applied to a machine with no serial port, so `bootcon` claims the
+same `kernel-log-floor` role and nothing wider. §11.4 is amended to say so, because it currently reads
+"serial console", which is **x86-shaped** - on a PC serial is always there.
+
+### 9.4 Ownership of the framebuffer is explicit and one-way
+
+Two writers to one framebuffer is not a race the service can defend against: its shadow grid would be
+silently wrong about what is on screen. So ownership is a state, not a convention:
+
+```
+kernel owns it  --(service has mapped + cleared: bootcon::release)-->  service owns it
+       ^                                                                      |
+       +-------------------- bootcon::reclaim_for_panic ----------------------+
+```
+
+The service calls `release` only *after* it can draw, so there is no window with no writer. The panic path
+reclaims unconditionally and clears, because by then the service is halted and its grid describes nothing.
+
+### 9.5 Memory attributes - the constraint that shapes the mapping
+
+The service maps the *same physical pages* the kernel mapped. ARM leaves **mismatched memory attributes**
+for one physical page UNPREDICTABLE, so both mappings must agree. They agree on **Normal non-cacheable**:
+
+- The service cannot do cache maintenance - `unsafe` is forbidden in services (§18.2) and `DCCMVAC` is
+  PL1-only on ARMv7 anyway. So a cacheable mapping is not available to it at any price.
+- Therefore the kernel's mapping becomes non-cacheable too (`section_fb`), and `fb_commit` (a
+  clean-to-PoC on ARM, an `sfence` on x86) collapses on ARM to a store barrier - a `DSB`, ordering only,
+  nothing to clean - while KEEPING its name and its rectangle argument, because an arch that maps its
+  framebuffer cacheable still needs both. (**No arch does today.** That parenthetical used to name the
+  Pi 4; see 9.5.1 - it now maps Normal non-cacheable like the others.) `FB_READBACK_CHEAP` disappears with it: reading back a non-cacheable framebuffer is never cheap,
+  so the terminal always repaints from its shadow grid and `scroll_by_copy` is deleted.
+
+Non-cacheable here means **Normal** non-cacheable, not **Device**. The distinction matters and the
+neutral `PageFlags::PCD` currently encodes the wrong one on ARM: Device semantics (no gathering, no
+reordering, no speculation) exist to protect stores with side effects, and a framebuffer store has none
+- it is memory the display happens to scan. Non-gathering would make every 32-bit pixel store its own
+bus transaction, roughly 1.4M of them per full-screen repaint on a Pi 2. So the ARM page-table encoder
+gains a Normal-non-cacheable case and `mmu::section_fb` matches it; `PCD` keeps meaning Device for the
+driver MMIO grants that genuinely need it.
+
+Cost: the kernel's boot text is slower to paint. It is boot text, and the terminal's own scroll was
+already repaint-from-shadow on x86 for the same reason.
+
+#### 9.5.1 AArch64 had the SAME mistake as ARM, and it cost 582 ms a repaint (2026-08-29)
+
+The paragraph above predicted this exactly - "non-gathering would make every 32-bit pixel store its own
+bus transaction" - and then it happened on the OTHER ARM port. AArch64's `map` collapsed `PCD || PWT` to
+**Device**, so the Pi 4's framebuffer grant was Device-nGnRnE. One 1920x1080 repaint measured **582 ms**
+(~14 MB/s), slow enough that `selfcheck` never reached its end on that board - which for days looked
+like a filesystem or scheduling fault rather than a display one.
+
+Fixed by letting the neutral layer say what the region IS, instead of inferring it from cache bits:
+`PageFlags::WRITE_COMBINE` means "a framebuffer, not device registers", and each arch picks its own type
+- AArch64 Normal non-cacheable via MAIR slot 2, arm32 the encoding it already had, and an arch with
+nothing better ignores the bit (so x86 is unchanged). After: no `paint took` warning on any machine, and
+`selfcheck` completes on the Pi 4.
+
+**A second bug hid behind the same proxy.** The kill-path reclaim skips device MMIO so it is never freed
+into the RAM pool, and it identified "device MMIO" as `PCD && PWT`. The x86 framebuffer is mapped
+PCD-only *deliberately* (strong-UC cost 596 ms per scroll on the Wyse; UC- lets the firmware's
+write-combining MTRR apply), so that guard silently stopped covering it - and every `console` death
+freed the framebuffer into the allocator. Measured after `chaos max-carnage`: 315392 double-frees, all
+inside 0x90000000..0x91f97000 (exactly 3840x2160x4), and `free_frames` 6666 above `total_frames`. Worse
+than the wrong number: the display's pages became allocatable.
+
+The guard is now `PCD` alone, AND the framebuffer range is reserved in the allocator
+(`memory::allocator::reserve_no_free`) - because a check that reads a proxy can be disarmed by someone
+optimising something else, who has no reason to know a safety check depends on how they map a page. The
+resource itself is where the refusal belongs.
+
+### The same mistake existed on x86, in the other direction (2026-08-25)
+
+The paragraphs above reason carefully about the ARM encoding and say nothing about x86, where the
+framebuffer grant was mapped `PCD | PWT`. On x86 that is PAT entry 3 - **strong uncacheable**, the one
+memory type an MTRR can never upgrade - so every 4-byte pixel store went to the bus alone. Measured on
+a Wyse 5070 at 3840x2160: **596 ms to repaint one scroll**, about 19 MB at roughly 32 MB/s. The display
+was unusable and it read as "the console is slow" rather than as a mapping bug.
+
+`PCD` alone selects entry 2, **UC-**, which yields write-combining wherever the range's MTRR says WC -
+and firmware routinely marks a framebuffer WC for exactly this reason. One flag: **596 ms -> 29-41 ms**,
+about 650 MB/s. Strictly no worse where the MTRR says UC, because the effective type is then unchanged.
+
+The two ports need OPPOSITE bits for the same intent, which is why this is worth stating in one place:
+
+| | wants gathering | encoding |
+|---|---|---|
+| x86 | `PCD` alone (UC-, upgradable to WC by MTRR) | `PCD \| PWT` is strong UC and is NOT |
+| arm32 | `PCD \| PWT` (Normal non-cacheable) | `PCD` alone is Device and forbids gathering |
+
+So the x86 fix is `#[cfg(target_arch = "x86_64")]`-gated. Applying it everywhere would have slowed the
+Pi for precisely the reason it sped up the PC, and worse, mismatched `mmu::section_fb`'s view of the
+same physical pages - which on ARM is unpredictable rather than merely slow. Borrow the silicon's
+requirement, not the other port's answer (§26.14).
+
+### 9.6 Surfaces added and removed
+
+| | |
+|---|---|
+| **Added** | `ConsoleDrain` syscall (the service reads the console byte stream); a `CONSOLE_RENDER` authority gating it; a framebuffer grant in the spawn path; one `service_config` row |
+| **Removed** | `InspectKernel` query 9 (`dims_packed`) - the shell asked the KERNEL for terminal geometry, which is a service's question; `FB_READBACK_CHEAP` from the arch contract, halving the framebuffer surface an arch owes to `fb_commit` alone; ~840 lines of ring-0 code |
+
+The syscall pin grows by one and the introspection pin shrinks by one. That is the trade the audit
+predicted and it is deliberate: a byte read is mechanism, terminal geometry is policy.
+
+### 9.7 Geometry has ONE owner
+
+`ctx.console_dims()` no longer reads query 9. The shell asks the `console` service, which is where the
+safe-area inset, the cell size and the font-scale rule live. The kernel's `bootcon` computes rows/cols for
+its own blit and **never publishes them** - a private working value is not a second source of truth, but a
+published one would be (Commandment III). A shell that cannot reach the console service reports the
+console unavailable rather than guessing a size.
+
+
+### 9.8 What the hardware found that review did not
+
+Five defects, none of which a checker or a build could have caught, listed because each is a different
+KIND of miss:
+
+1. **A placeholder ELF.** `arm_build.py` kept its own copy of the ARM service list, so the console
+   shipped as a stub and failed to spawn. The second list is now DERIVED from `kernel/build.rs`, not
+   reconciled against it - the third time that shape has bitten this repo.
+2. **The wrong green.** `grant()` reconstructed the framebuffer's channel shifts from `blend_lut[255]`
+   rather than storing them, and the foreground `(0x80, 0xFF, 0x80)` has red equal to blue - so blue
+   always resolved to red's shift. Ambiguous by construction, for any palette with a repeated component.
+   §26.13: discipline over cleverness.
+3. **A handover window.** Ownership moved on the first byte DELIVERED, which on a quiet boot is seconds
+   after the service clears the screen. Both parties drew in between. The GRANT is the handover.
+4. **Drops that no amount of speed could fix.** A 16-deep queue cannot absorb a thirty-write burst
+   however fast the renderer is, so `observe now` lost its tail every time. The writer now blocks
+   (§8.5/§8.6 back-pressure); the kernel still never waits.
+5. **`reclaim_for_panic` had zero callers.** The amendment in §9.3 argues this module earns ring-0
+   residency because a panic cannot ask a service to report it - and the panic handler did not call it,
+   so the first real panic showed a black screen and said nothing. **A guarantee asserted in the
+   constitution and absent from the code is worse than an unimplemented feature: the document says it is
+   covered, so nobody looks.** There is no test for it (§22 explains why - it is a negative property on
+   a machine that cannot be failed on demand in QEMU), which is exactly why it needed reading rather
+   than assuming.

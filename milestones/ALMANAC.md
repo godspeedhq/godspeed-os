@@ -626,14 +626,14 @@ state.
 ## 2026-07-11 to 2026-07-13 - The days the whole system stood for audit
 
 For the first time the system was read the way a constitution asks to be read - not "does it work?"
-but "does it still *obey*?" A **kernel audit** (2026-07-11, `docs/kernel-audit.md`), run as a parallel
+but "does it still *obey*?" A **kernel audit** (2026-07-11, `audits/kernel-audit.md`), run as a parallel
 sweep of independent readers over every subsystem, checked the code against the Ten Commandments and
 the invariants and surfaced three real things: two paths where a non-page-fault CPU exception - a stray
 `#GP`, a `div0` in a service - halted the *whole machine* instead of killing just the offending ring-3
 task (a single bad instruction in userspace could wedge the kernel), and one where a transient
 allocation failure on the supervisor-respawn path could `panic!` into a reboot, defeating the very
 Phase-6 recovery it lived inside. Then a **userspace audit** (2026-07-12 to 2026-07-13,
-`docs/userspace-audit.md`), the first of its kind, graded every service - the coupled pairs first,
+`audits/userspace-audit.md`), the first of its kind, graded every service - the coupled pairs first,
 `block-driver`/`fs` and `nic-driver`/`net-stack`, then the rest - against the same law: 0 high, 8
 medium, 8 low, each finding logged with a fix or a recorded deferral.
 
@@ -646,7 +646,7 @@ finishes. Tininess is not only what makes the kernel correct or secure - it is w
 *recurring act of checking* correctness and security cheap enough to actually do, release after
 release. The kernel stayed small so that auditing it could stay routine.
 
-**What it produced:** `docs/kernel-audit.md` and `docs/userspace-audit.md` as **living** artifacts - a
+**What it produced:** `audits/kernel-audit.md` and `audits/userspace-audit.md` as **living** artifacts - a
 standing, repeatable practice rather than a one-time pass - and the recognition that the north star of
 an audit is that *nothing above the kernel may panic or wedge it*: a service's worst instruction should
 cost that service its life and no more. The findings became the next increment of work; the discipline

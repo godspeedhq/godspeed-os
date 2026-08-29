@@ -58,7 +58,7 @@ from the trusted base.
 
 The implementation lives in `kernel/src/arch/x86_64/iommu.rs` (the unsafe
 hardware boundary, §18.1). Every raw access carries a `// SAFETY:` argument; the
-file is fully accounted in `docs/unsafe-audit.md`. The rest of the kernel touches
+file is fully accounted in `audits/unsafe-audit.md`. The rest of the kernel touches
 it only through three safe entry points: `bringup`, `confine_device`,
 `release_device`.
 

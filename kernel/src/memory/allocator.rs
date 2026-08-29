@@ -594,6 +594,88 @@ pub fn phys_in_ram(phys: u64) -> bool {
     let idx = (phys / FRAME_SIZE) as usize;
     unsafe { idx < ALLOCATOR.max_ram_frame }
 }
+
+/// Reserve a physical range the allocator must NEVER hand back to the free pool.
+///
+/// The same table and the same refusal as a DMA arena, for a range the allocator did not hand out in
+/// the first place: the FRAMEBUFFER. It is device memory that the kernel MAPS into the `console`
+/// service, so the kill-path reclaim walks it like any other leaf and frees it - which both inflates
+/// `free_frames` past `total_frames` and, far worse, marks the display's pages allocatable, so a later
+/// task can be handed the framebuffer as ordinary RAM.
+///
+/// The walker has a guard for exactly this, and it was disarmed by a change nowhere near it: it tested
+/// PCD **and** PWT, and the framebuffer is mapped PCD-only on x86 so the firmware's write-combining
+/// MTRR applies (the 596 ms -> 29 ms console fix). Measured on the Wyse after `chaos max-carnage`:
+/// 315392 double-frees, all inside 0x90000000..0x91f97000 - exactly 3840x2160x4 - and `free_frames`
+/// 6666 above `total_frames`.
+///
+/// So the guard is repeated HERE, where it cannot be disarmed by how something is mapped. Returns
+/// false if the table is full (reported loudly) and true if the range is reserved or already covered.
+pub fn reserve_no_free(phys: u64, n: usize) -> bool {
+    if n == 0 { return true; }
+    let base = (phys / FRAME_SIZE) as usize;
+    // IRQ-safe, and the same discipline as `alloc_dma_arena`: ALLOC_LOCKED is taken in interrupt
+    // context too, so the lock is held with interrupts masked.
+    let ok = crate::smp::without_interrupts(|| {
+        alloc_lock();
+        // SAFETY: lock held; single writer across all cores.
+        let a = unsafe { &mut *core::ptr::addr_of_mut!(ALLOCATOR) };
+        let mut done = false;
+        for &(b, len) in a.dma_reserves.iter() {
+            if len != 0 && base >= b && base + n <= b + len {
+                done = true; // already covered - idempotent, so a re-grant is not a second slot
+                break;
+            }
+        }
+        if !done {
+            for slot in a.dma_reserves.iter_mut() {
+                if slot.1 == 0 {
+                    *slot = (base, n);
+                    done = true;
+                    break;
+                }
+            }
+        }
+        alloc_unlock();
+        done
+    });
+    if ok { return true; }
+    crate::kprintln!(
+        "reserve_no_free: reservation table full ({}) - {:#x}+{} frames NOT protected; a kill-path          reclaim can free it into the RAM pool",
+        MAX_DMA_RESERVES, phys, n);
+    false
+}
+
+/// DIAGNOSTIC: is `phys` inside a device's DMA arena, or within `slack` frames of one?
+///
+/// Returns `(hit, distance_in_frames)` where `hit` means the frame IS reserved for DMA.
+///
+/// Why this exists. On the Pi 4 the shell's stack loses a 1024-byte canary - proven present by a
+/// kernel-side read, proven absent by a whole-stack scan that covers all 262144 bytes - inside a
+/// SINGLE statement, while the kernel's largest write into user memory is 522 bytes, no other task
+/// maps those frames, and the shell contains no `unsafe`. No software writer in this system can do
+/// that. The one writer left is a device: §6.4 records that this board has no IOMMU/SMMU wired up
+/// (`confine_device` returns false on aarch64), so `xhci` and the NIC program their controllers with
+/// PHYSICAL addresses and can write anywhere in RAM. A DMA landing on the frames backing a task's
+/// stack would erase kilobytes instantly and leave no trace in any CPU-side accounting - which is
+/// exactly the shape of the evidence.
+///
+/// `slack` catches the near-miss too: a driver overrunning its own arena by a few frames is the same
+/// bug one page over, and a stack frame sitting immediately after an arena is worth knowing about.
+pub fn phys_dma_proximity(phys: u64, slack: usize) -> (bool, usize) {
+    let idx = (phys / FRAME_SIZE) as usize;
+    let mut nearest = usize::MAX;
+    // SAFETY: read-only read of the reservation table, which is written only under the allocator lock
+    // at arena-allocation time and never mutated afterwards. A torn read would misreport a diagnostic.
+    let reserves = unsafe { (*core::ptr::addr_of!(ALLOCATOR)).dma_reserves };
+    for &(base, n) in reserves.iter() {
+        if n == 0 { continue; }
+        if idx >= base && idx < base + n { return (true, 0); }
+        let d = if idx < base { base - idx } else { idx - (base + n) + 1 };
+        if d < nearest { nearest = d; }
+    }
+    (false, if nearest <= slack { nearest } else { usize::MAX })
+}
 /// Walk the kernel half of the live PML4 (entries 256-511) and mark every
 /// PDPT / PD / PT / PML4 frame as "used" in the bitmap allocator.
 ///

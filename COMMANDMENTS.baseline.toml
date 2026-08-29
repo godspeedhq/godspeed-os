@@ -1,0 +1,579 @@
+# The pinned kernel surface, and the recorded exemptions to the mechanical Commandment checks.
+#
+# THIS FILE MAY ONLY EVER SHRINK. It is the same instrument as the grandfathered `unsafe` floors of
+# CLAUDE.md §18.5: counts may DECREASE freely, and may increase only by amending the constitution with
+# a written rationale. `scripts/commandments.py` enforces the ratchet in both directions - too many
+# violations fails, and so does an entry that is looser than reality or matches nothing at all.
+#
+# An exemption is legitimate ONLY if it cites a CLAUDE.md amendment that already accepts the violation.
+# If nothing in the constitution accepts it, there is no exemption to write: fix it, or amend the
+# constitution deliberately. That is what stops this file becoming where violations go to be forgotten.
+
+[kernel]
+#
+# TWO KINDS OF ENTRY LIVE HERE, and they are not the same claim. `--report` labels every check with
+# which it is, because a green build means something different for each.
+#
+#   RULE    a fixed truth; any deviation is a FAILURE. The value IS the law. There are few of these,
+#           and where the law is written down elsewhere they are DERIVED rather than copied - the six
+#           responsibilities come from CLAUDE.md §4.3, chaos's apparatus from chaos's own spawn calls,
+#           so neither appears below at all.
+#
+#   RECORD  a snapshot, NOT an endorsement. 49 syscalls is not a claim that 49 is right - only that a
+#           fiftieth must be deliberate, because Commandment I says to ask "why isn't this a service?"
+#           BEFORE proposing a kernel change, and this is what forces the question to be asked. These
+#           legitimately change: supporting a new CPU adds arch files, and that is welcome.
+#
+#   DEBT    a distance from where it should be, which may only shrink.
+#
+
+# A crate the kernel links is code running in ring 0 with the kernel's full authority, having passed
+# none of these checks. "Why isn't this a service?" applies to a dependency more sharply than to a
+# subsystem, because a service could link it under isolation instead.
+dependencies = [
+    "bitflags",
+    "limine",
+    "noto-sans-mono-bitmap",
+    "portable-atomic"
+]
+
+# A feature flag is a switch on what the kernel IS: a different scheduler entry, a different boot
+# path, a service the kernel spawns itself. Test-only features count - a build the kernel can be put
+# into is a build someone can ship.
+features = [
+# §22 Tests 2 and 3 (capability enforcement, IPC routing), pre-scheduler. Pinned because this
+# feature REMOVES code from a shipping kernel rather than adding any: the tests used to run in every
+# boot, where they could panic the machine on an assertion and left ResourceId(0xDEAD/0xDEAF/0xABCD)
+# and EndpointId(999)/(998) registered in the LIVE tables, 999 holding 16 messages forever. They are
+# now off by default and turned on only by `osdev test identity`, which is the build that asserts on
+# their output.
+"kernel-selftest",
+    "arm-autochaos",
+    "arm-fault-test",
+    "arm-sched-demo",
+    "arm-sched-ipc",
+    "arm-supervisor",
+    # Diagnostic ONLY, and deliberately registered here rather than slipped in: it changes what the
+    # kernel PRINTS on a fatal EL0 fault, never what it does. It widens the stack window, measures the
+    # run of whatever fill byte is at SP (the production scan measures ZEROS, so it reported "0 bytes"
+    # for a space-filled smash on the Pi 4 - true and useless), and lists more backtrace candidates for
+    # offline symbolization. It adds no kernel responsibility: no new syscall, no new subsystem, no
+    # behaviour change on any non-faulting path. Off by default; the faulting task dies either way.
+    "fault-dump-wide",
+    "iommu-fault-test",
+    "memmap-clamp-test",
+    "mmio-map-fault-test",
+    "pi4",
+    "pi4-demo-services",
+    "pi4-sched-demo",
+    "pi4-smp",
+    "pi4-supervisor",
+    "test-bad-elf",
+    "test-bad-elf-brutal",
+    "test-bad-supervisor"
+]
+
+# DEBT, NOT AN ALLOWANCE. This list may only ever SHRINK. Kernel responsibility does not expand, so
+# there is no "add it deliberately" path here: do not add a line.
+#
+# The kernel holds a `service_config` for each of these - memory limit, placement core, capabilities,
+# send peers, embedded ELF. Loading a task is mechanism and belongs to the kernel; a CATALOGUE of what
+# every service is allowed is policy, and policy belongs to the supervisor (§26.10). §4.4 also forbids
+# "developer tooling" in the kernel, and roughly 190 of these are test probes.
+#
+# The target is ONE entry - `supervisor`, which the kernel must bootstrap because nothing is beneath it,
+# exactly as with `kernel_spawned_service`. Every other service's policy belongs to the supervisor, with
+# its image handed to the Spawn syscall rather than compiled into ring 0. 218 is the distance from that.
+#
+# Listed in full, without splitting "real" services from test ones: any rule for that split is a
+# judgment encoded as a pattern, and the next service named outside the pattern slips through.
+service_configs = [
+    "adv-a1",
+    "adv-a10",
+    "adv-a11",
+    "adv-a12",
+    "adv-a13",
+    "adv-a2",
+    "adv-a3",
+    "adv-a4",
+    "adv-a5",
+    "adv-a5-victim",
+    "adv-a6",
+    "adv-a7",
+    "adv-a7-recv",
+    "adv-a8",
+    "adv-a8-witness",
+    "adv-a9",
+    "adv-ba1",
+    "adv-ba10",
+    "adv-ba2",
+    "adv-ba3",
+    "adv-ba4",
+    "adv-ba5",
+    "adv-ba5-victim",
+    "adv-ba6",
+    "adv-ba7",
+    "adv-ba7-recv",
+    "adv-ba8",
+    "adv-ba8-witness",
+    "adv-ba9",
+    "adv-fault-de",
+    "adv-fault-gp",
+    "adv-fault-mon",
+    "adv-fault-usercopy",
+    "adv-fault-usercopy-mon",
+    "asker",
+    "block-driver",
+    "brutal-id-11",
+    "brutal-id-12-a",
+    "brutal-id-12-b",
+    "brutal-id-12-c",
+    "brutal-id-13-kill",
+    "brutal-id-13-recv",
+    "brutal-id-13-send",
+    "chaos",
+    "chaos-bc2-a",
+    "chaos-bc2-b",
+    "chaos-bc2-c",
+    "chaos-bc2-d",
+    "chaos-bc2-e",
+    "chaos-bc2-monitor",
+    "chaos-bc3",
+    "chaos-bc5",
+    "chaos-bc6-hog-a",
+    "chaos-bc6-hog-b",
+    "chaos-bc6-monitor",
+    "chaos-bc7",
+    "chaos-bc7-victim",
+    "chaos-c2",
+    "chaos-c2-monitor",
+    "chaos-c3",
+    "chaos-c5",
+    "chaos-c6-hog",
+    "chaos-c6-monitor",
+    "chaos-c7",
+    "chaos-c7-victim",
+    "console",
+    "control",
+    "counter",
+    "dwc2",
+    "ehci",
+    "fs",
+    "fuzz-bf1",
+    "fuzz-bf2",
+    "fuzz-bf5",
+    "fuzz-bf5-recv",
+    "fuzz-bf6",
+    "fuzz-bf6-recv",
+    "fuzz-bf7",
+    "fuzz-bf7-victim",
+    "fuzz-bf8",
+    "fuzz-f1",
+    "fuzz-f2",
+    "fuzz-f5",
+    "fuzz-f5-recv",
+    "fuzz-f6",
+    "fuzz-f6-recv",
+    "fuzz-f7",
+    "fuzz-f7-victim",
+    "fuzz-f8",
+    "greet",
+    "holder",
+    "logger",
+    "mem-pressure",
+    "net-stack",
+    "nic-driver",
+    "observe",
+    "observe-live",
+    "observe-now",
+    "perf-b1",
+    "perf-b1-echo",
+    "perf-b10",
+    "perf-b2",
+    "perf-b2-echo",
+    "perf-b3",
+    "perf-b4",
+    "perf-b5",
+    "perf-b5-victim",
+    "perf-b7",
+    "perf-b8",
+    "perf-b9",
+    "perf-b9-recv",
+    "perf-bp1",
+    "perf-bp1-echo",
+    "perf-bp10",
+    "perf-bp2",
+    "perf-bp2-echo",
+    "perf-bp3",
+    "perf-bp4",
+    "perf-bp5",
+    "perf-bp5-victim",
+    "perf-bp7",
+    "perf-bp8",
+    "perf-bp9",
+    "perf-bp9-recv",
+    "ping",
+    "pong",
+    "probe-11a",
+    "probe-3b",
+    "probe-4a",
+    "probe-4b-recv",
+    "probe-4b-send",
+    "probe-5a-recv",
+    "probe-5a-send",
+    "probe-5b-send",
+    "probe-7a",
+    "probe-7b",
+    "probe-9b",
+    "probe-hog",
+    "probe-recv",
+    "probe-sender",
+    "probe-victim",
+    "probe-yielder",
+    "prop-bp1",
+    "prop-bp10",
+    "prop-bp2",
+    "prop-bp2-victim",
+    "prop-bp3",
+    "prop-bp4",
+    "prop-bp5",
+    "prop-bp5-victim",
+    "prop-bp6",
+    "prop-bp7",
+    "prop-bp7-victim",
+    "prop-bp8",
+    "prop-bp8-victim",
+    "prop-bp9",
+    "prop-bp9-victim",
+    "prop-p1",
+    "prop-p10",
+    "prop-p2",
+    "prop-p2-victim",
+    "prop-p3",
+    "prop-p4",
+    "prop-p5",
+    "prop-p5-victim",
+    "prop-p6",
+    "prop-p7",
+    "prop-p7-victim",
+    "prop-p8",
+    "prop-p8-victim",
+    "prop-p9",
+    "prop-p9-victim",
+    "reply-server",
+    "resource-server",
+    "roster",
+    "shell",
+    "stress-bs1",
+    "stress-bs1-recv",
+    "stress-bs10",
+    "stress-bs10-victim",
+    "stress-bs2",
+    "stress-bs2-victim",
+    "stress-bs3-recv",
+    "stress-bs3-send",
+    "stress-bs4",
+    "stress-bs4-victim",
+    "stress-bs5",
+    "stress-bs5-victim",
+    "stress-bs6",
+    "stress-bs7",
+    "stress-bs8",
+    "stress-bs9-recv",
+    "stress-bs9-send-a",
+    "stress-bs9-send-b",
+    "stress-s1",
+    "stress-s1-recv",
+    "stress-s10",
+    "stress-s10-victim",
+    "stress-s2",
+    "stress-s2-victim",
+    "stress-s3-recv",
+    "stress-s3-send",
+    "stress-s4",
+    "stress-s4-victim",
+    "stress-s5",
+    "stress-s5-victim",
+    "stress-s6",
+    "stress-s7",
+    "stress-s8",
+    "stress-s9-recv",
+    "stress-s9-send-a",
+    "stress-s9-send-b",
+    "supervisor",
+    "time",
+    "upper",
+    "xhci",
+    "xlife",
+    "xlife-far",
+    "xlife-near",
+    "xsend",
+    "xsend-recv"
+]
+
+# Commandment II - NO SERVICE ESCAPES CHAOS.
+#
+# There is deliberately NOTHING HERE. No list, no target, no boolean.
+#
+# What chaos may legitimately exclude is DERIVED from its own source, not declared: chaos itself (a
+# storm that storms itself stops measuring anything) and whatever chaos SPAWNS (its ammunition). Any
+# declaration would be a knob - a list can be appended to, a boolean flipped - and would also be a
+# second copy of a fact the code already states, free to drift (Commandment III).
+#
+# So there is nothing to append, nothing to flip, and nothing to turn off. Widening the blind spot
+# requires making chaos genuinely spawn the thing you want excluded: a visible behaviour change whose
+# only effect is a blind spot. A necessary exception still has a door - a CLAUDE.md amendment plus an
+# [[exemption]] citing it - but no light one.
+
+# THE COUNT is deliberately NOT here. §4.3 of CLAUDE.md lists the six responsibilities, and the checker
+# reads that list directly. A copy here would be a second truth free to drift (Commandment III), and a
+# knob: raising the number would be one line in a config file instead of an amendment. Changing the
+# count now means editing the constitution, which is the correct bar.
+
+# Support roles that are NOT responsibilities but are sanctioned elsewhere in the constitution. Each
+# must cite where, or it is a seventh responsibility wearing a helpful name.
+
+# A syscall that dispatches on an id carries a SECOND surface inside it. InspectKernel is one
+# pinned syscall with these queries behind it - allocator counts, scheduler ticks, RTC time,
+# framebuffer dimensions, PCI ids, a hardware random number - and adding one is a new kernel
+# responsibility that changes nothing visible: the syscall count stays exactly where it was.
+# Pins catch addition at the surface they pin, and miss growth inside it.
+#
+# 23 (the board's own MAC) is pinned against the test this file demands - "why isn't this a service?" -
+# and passes it on impossibility, the only thing that earns kernel residency (§11.4 uses the same bar
+# for the boot console). The address lives in the VideoCore mailbox, and a mailbox call MUST run with
+# the MMU and caches OFF, on the boot path, before `mmu::enable` - so no service can ever make it. The
+# kernel is the only thing that can read this, and it already does, once, at boot.
+#
+# What it buys: the NIC driver is a userspace service granted its controller's register window and
+# nothing else, so without this it invents an address - and the invented one is hardcoded, hence
+# identical on every board running this system. The alternative is granting that service a second,
+# far wider MMIO window for one identity fact, which is more authority for less honesty.
+introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23]
+# Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
+# legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
+# before it builds, and classifying one honestly as a device driver fails the build - which is the
+# point. Sneaking one past now requires writing a lie into this file, in a diff, rather than choosing
+# an innocuous filename nobody re-reads.
+#
+# A kernel may legitimately bring up its own CPU, memory, interrupts, timer, console and buses. It may
+# not drive a peripheral: a USB host stack, a NIC, a disk. Those are services. The Pi 4 port proved it
+# by deleting 2742 lines of ring-0 xhci (CLAUDE.md §6.4, 2026-08-09).
+arch_permitted_roles = [
+    "arch-entry", "boot", "mmu", "interrupts", "timer", "context-switch", "scheduler-entry",
+    "syscall-entry", "usermode", "uaccess", "console", "discovery", "iommu", "clock", "test-scaffold",
+]
+# Commandment I's ONE sanctioned exception. The kernel restarts exactly one service - the supervisor -
+# and it must, because of Commandment V: no service is special, so the supervisor has to be restartable
+# too, and only the kernel is beneath it to do the restarting. CLAUDE.md §11.1 calls it "the kernel's ONE
+# direct spawn"; §6.2 makes the respawn unconditional and unbounded (a bound would re-introduce the
+# reboot and hand an attacker a DoS); docs/naming-design.md §3.7 records the trade openly - a sliver of
+# §26.10 exchanged for maximum fault tolerance.
+#
+# It is pinned because an exception that is not counted stops being an exception.
+#
+# SINGULAR ON PURPOSE. This is one string, not a list, because the SHAPE carries the rule. A list has
+# room for a second entry, and appending one reads like configuration; a scalar cannot be appended to,
+# so a second kernel-spawned service would mean changing this schema - visible in a diff, arguable, and
+# impossible to do absent-mindedly. The checker refuses a list here, and refuses the old plural key, so
+# the affordance cannot leak back in.
+kernel_spawned_service = "supervisor"
+
+[kernel.kernel_support_roles]
+arch-layer       = "§4.1 architecture layer; §18.1 (the unsafe boundary)"
+syscall-entry    = "§8.2 - the entry to the six, not a seventh"
+boot-entry       = "§11 bootstrap"
+kernel-log-floor = "§11.4 - the 16 KiB ring buffer + serial console, explicitly sanctioned"
+invariants       = "§3, §22 - the kernel checking its own invariants"
+
+# Which of the above each top-level module serves. A module that can claim NEITHER a responsibility nor
+# a sanctioned support role is a seventh responsibility, whatever its size - which is exactly how one
+# gets added without any pinned surface changing.
+
+[kernel.module_responsibility]
+"arch"          = "arch-layer"
+# The boot/panic console FLOOR - a minimal glyph blit, escapes discarded, no grid or cursor. Not a
+# terminal: the terminal is the `console` SERVICE (docs/console-service.md §9). This claims the same
+# role as the ring buffer because it is the same argument - §11.4's log floor for a machine whose only
+# output is a display - and it earns ring-0 residency by IMPOSSIBILITY, the bar the control channel
+# failed: a panic halts every core, so it cannot ask a service to report it.
+"bootcon"       = "kernel-log-floor"
+"capability"    = "capability-enforcement"
+# Pure epoch/deglitch math backing `now_epoch_monotonic`, which every arch uses to pace deadlines and
+# retries. On hardware whose cycle counter cannot be trusted (the T630 broken TSC, the Pi RTC-less
+# boot) the kernel derives its monotonic seconds from the RTC, so this is scheduling infrastructure.
+# The CALENDAR half moved to the `time` service in clock slice 3.
+"clock.rs"      = "scheduling"
+"elf_flags.rs"  = "scheduling"
+"interrupt"     = "interrupt-routing"
+"invariants"    = "invariants"
+"ipc"           = "ipc"
+"lib.rs"        = "boot-entry"
+"loader.rs"     = "scheduling"
+"log.rs"        = "kernel-log-floor"
+"main.rs"       = "boot-entry"
+"memory"        = "memory-isolation"
+"smp"           = "smp-routing"
+"syscall"       = "syscall-entry"
+"task"          = "scheduling"
+
+
+
+
+# The syscall pin catches new kernel VERBS; this catches new kernel NOUNS - the well-known resources the
+# kernel itself mints authority over. Several exist because a syscall alone could not express the
+# authority, so pinning syscalls without pinning these would leave half the surface unwatched. Pinned by
+# value: these ids are baked into every service's capability table.
+[kernel.authorities]
+LOG_WRITE          = 1
+SPAWN              = 2
+CONSOLE_READ       = 3
+CONSOLE_PUSH       = 4
+INTROSPECT         = 5
+SERVICE_CONTROL    = 6
+RESOURCE_MINT      = 7
+REBOOT             = 8
+ACQUIRE_ANY        = 9
+NET_DEVICE         = 10
+GPIO_DEVICE        = 11
+USB_DISK           = 12
+SET_CLOCK          = 13
+FIRE_IRQ           = 14
+
+
+[kernel.arch_roles]
+"mod.rs"                      = "arch-entry"
+"aarch64/context.rs"          = "context-switch"
+"aarch64/ctxdemo.rs"          = "test-scaffold"
+"aarch64/exceptions.rs"       = "interrupts"
+"aarch64/genet.rs"            = "discovery"
+"aarch64/gic.rs"              = "interrupts"
+"aarch64/mailbox.rs"          = "discovery"
+"aarch64/memmap.rs"           = "mmu"
+"aarch64/mmu.rs"              = "mmu"
+"aarch64/mod.rs"              = "arch-entry"
+"aarch64/pcie.rs"             = "discovery"
+"aarch64/ptables.rs"          = "mmu"
+"aarch64/sched_demo.rs"       = "scheduler-entry"
+"aarch64/sched_supervisor.rs" = "scheduler-entry"
+"aarch64/sched_user.rs"       = "scheduler-entry"
+"aarch64/smp_boot.rs"         = "boot"
+"aarch64/timer.rs"            = "timer"
+"aarch64/uaccess.rs"          = "uaccess"
+"aarch64/uart_rx.rs"          = "console"
+"aarch64/usermode.rs"         = "usermode"
+"aarch64/video.rs"            = "console"
+"arm/context.rs"              = "context-switch"
+"arm/context_switch.rs"       = "context-switch"
+"arm/dtb.rs"                  = "discovery"
+"arm/exceptions.rs"           = "interrupts"
+"arm/bootcon.rs"              = "console"
+"arm/irq.rs"                  = "interrupts"
+"arm/loadtest.rs"             = "test-scaffold"
+"arm/meminit.rs"              = "boot"
+"arm/mmu.rs"                  = "mmu"
+"arm/mod.rs"                  = "arch-entry"
+"arm/page_tables.rs"          = "mmu"
+"arm/sched_demo.rs"           = "scheduler-entry"
+"arm/sched_ipc.rs"            = "scheduler-entry"
+"arm/sched_supervisor.rs"     = "scheduler-entry"
+"arm/spawn.rs"                = "scheduler-entry"
+"arm/syscall.rs"              = "syscall-entry"
+"arm/timer.rs"                = "timer"
+"arm/usermode.rs"             = "usermode"
+"arm/video.rs"                = "console"
+"loongarch64/mod.rs"          = "arch-entry"
+"riscv32/mod.rs"              = "arch-entry"
+"riscv64/mod.rs"              = "arch-entry"
+"s390x/mod.rs"                = "arch-entry"
+"x86_64/ap_boot.rs"           = "boot"
+"x86_64/boot.rs"              = "boot"
+"x86_64/context_switch.rs"    = "context-switch"
+"x86_64/fb.rs"                = "console"
+"x86_64/interrupts.rs"        = "interrupts"
+"x86_64/ioapic.rs"            = "interrupts"
+"x86_64/iommu.rs"             = "mmu"
+"x86_64/mod.rs"               = "arch-entry"
+"x86_64/page_tables.rs"       = "mmu"
+"x86_64/pci.rs"               = "discovery"
+"x86_64/rtc.rs"               = "clock"
+"x86_64/syscall_entry.rs"     = "syscall-entry"
+
+# Every expansion of what the kernel does for userspace arrives as a syscall, so this list IS the
+# kernel's authority surface. Adding a line is adding a kernel responsibility: answer "why isn't this a
+# service?" first. The numbers are the ABI every built service binary depends on, so they are pinned by
+# VALUE, not merely by name. (9 is absent by history, not by accident.)
+[kernel.syscalls]
+Send                     = 1
+Recv                     = 2
+TrySend                  = 3
+Yield                    = 4
+Log                      = 5
+AllocMem                 = 6
+Spawn                    = 7
+Kill                     = 8
+AcquireSendCap           = 10
+SendWithCap              = 11
+TakePendingCap           = 12
+InspectKernel            = 13
+QueryCapRights           = 14
+RemoveCap                = 15
+TaskStat                 = 16
+ConsoleRead              = 17
+Reboot                   = 18
+SpawnPipe                = 19
+ConsolePush              = 20
+Park                     = 21
+Print                    = 22
+ConsoleWrite             = 23
+TryConsoleRead           = 24
+ConsoleEcho              = 25
+ConsoleBootComplete      = 26
+SignalInputReady         = 27
+TaskCaps                 = 28
+DeriveCap                = 29
+ResourceMint             = 30
+ResourceInvoke           = 31
+ResourceRevoke           = 32
+LastRecvBadge            = 33
+TryRecv                  = 34
+RecvTimeout              = 35
+IrqUnmask                = 36
+Sleep                    = 37
+SpawnReturningEndpoint   = 38
+SpawnWithCaps            = 39
+ConsoleForeground        = 40
+Call                     = 41
+CallDeadline             = 50
+NetFrameTx               = 42
+NetFrameRx               = 43
+NetInfo                  = 44
+FireIrq                  = 51
+Gpio                     = 45
+UsbDiskInfo              = 46
+UsbDiskRead              = 47
+UsbDiskWrite             = 48
+UsbDiskFlush             = 49
+
+# ------------------------------------------------------------------------------------------------
+# Recorded exemptions.
+#
+# There are NONE. That is deliberate and worth stating: the tree carries 12 panicking sites in
+# services, and not one of them can be written down here, because no CLAUDE.md amendment permits a
+# service to halt the machine. The rule that an exemption must cite an amendment is what forces them
+# to be FIXED rather than recorded - which is the entire point of the instrument.
+#
+# [[exemption]]
+# check     = "V-no-panic"
+# path      = "services/example/src/main.rs"
+# count     = 3
+# amendment = "CLAUDE.md §6.4 amendment 2026-07-23 (SEC-29/30)"
+# reason    = "why the constitution already accepts this, and what closes it"
+
+# ------------------------------------------------------------------------------------------------
+# RECORDED EXEMPTIONS
+#
+# Two, both the same violation with the same cause, both already accepted by the constitution, and both
+# closed by the same piece of work. They are written here rather than fixed because the hardware cannot
+# yet support the fix - which is exactly the case CLAUDE.md §26.3 says to RECORD rather than pretend to
+# close.

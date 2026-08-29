@@ -131,7 +131,7 @@ where `/dev/sdb` corresponds to the target `PhysicalDriveN`. Use `diskpart` → 
 
 **Serial console:** Connect at 115200 8N1. On successful boot, expect:
 ```
-kernel: 4 cores ready
+smp: 4 cores ready
 supervisor: ready
 ping: starting
 pong: ready on core 1

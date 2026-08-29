@@ -106,10 +106,24 @@ pub const USB_DISK_RESOURCE: ResourceId = ResourceId(12);
 /// holdings (like `reboot`/8), since `SetClock` spends its one argument register on the epoch.
 pub const SET_CLOCK_RESOURCE: ResourceId = ResourceId(13);
 
+/// Inject a test interrupt (`FireIrq`, syscall 51). Held ONLY by the control service.
+///
+/// This exists so `control.rs` can leave the kernel (C1-6). `KILL` and `RESTART` already map onto
+/// SERVICE_CONTROL + SPAWN, but injecting an interrupt had no capability at all, so the module could
+/// not fully move and the finding could not close. Naming the authority is the honest way to hand it
+/// out: a test hook that pokes the interrupt controller IS real authority, and pretending otherwise by
+/// leaving it un-named in ring 0 was the weaker position.
+///
+/// The trade is deliberate and worth stating: the syscall and authority pins GROW by one each so that a
+/// 123-line module of developer tooling can leave the kernel entirely. The pins count SURFACES, and a
+/// gated syscall is a smaller, more visible surface than an ungated command interpreter.
+pub const FIRE_IRQ_RESOURCE: ResourceId = ResourceId(14);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever - §7.5).
     table::register_resource(LOG_WRITE_RESOURCE);
+    table::register_resource(FIRE_IRQ_RESOURCE);
     table::register_resource(SPAWN_RESOURCE);
     table::register_resource(CONSOLE_READ_RESOURCE);
     table::register_resource(CONSOLE_PUSH_RESOURCE);

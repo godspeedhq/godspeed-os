@@ -130,7 +130,7 @@ confirm the basic path is sound.
 | `services/probe/src/main.rs` | Added `MODE_IRQ_RECV = 160` and `mode_irq_recv` handler |
 | `services/supervisor/src/main.rs` | Added `spawn("probe-11a")` in identity-build spawn list |
 | `osdev/src/validator.rs` | Added IR1A, IR1B to `TESTS` |
-| `docs/unsafe-audit.md` | Updated `interrupts.rs` count 9→10, permitted total 216→217 |
+| `audits/unsafe-audit.md` | Updated `interrupts.rs` count 9→10, permitted total 216→217 |
 | `tests/qemu/identity/CLAUDE.md` | Added IR1A/IR1B to test table |
 
 ### Key design decisions

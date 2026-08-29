@@ -8,9 +8,9 @@ pub mod ap_boot;
 pub mod boot;
 pub mod context_switch;
 pub mod fb;
-/// The framebuffer-console backend primitives the neutral `crate::fbcon` calls through `arch::imp`.
-/// See `crate::fbcon`'s module header for the contract each one owes.
-pub use fb::{fb_commit, FB_READBACK_CHEAP};
+/// The one primitive the kernel's boot/panic console floor (`crate::bootcon`) calls through
+/// `arch::imp`: publish a written rectangle. See `crate::bootcon`'s module header for its contract.
+pub use fb::fb_commit;
 pub mod iommu;
 pub mod ioapic;
 pub mod interrupts;
@@ -51,6 +51,18 @@ static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
 #[used]
 #[link_section = ".requests"]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+/// The HHDM offset straight from Limine, for the few callers that run BEFORE `memory::init` has had a
+/// chance to publish it via `set_hhdm_offset`.
+///
+/// `page_tables::get_hhdm_offset()` returns **0** until then - its own doc says so - and a subtraction
+/// against zero is a silent no-op, not an error. `fb_init` ran early and did exactly that: it stored
+/// the framebuffer's HIGHER-HALF address as if it were physical, the console's page tables were built
+/// from it, and the service took a reserved-bit page fault on its first write to the screen. The
+/// response is available from the moment the request is honoured, so there is no reason to wait.
+pub(crate) fn hhdm_offset_from_limine() -> u64 {
+    HHDM_REQUEST.response().map(|r| r.offset).unwrap_or(0)
+}
 
 #[used]
 #[link_section = ".requests"]
@@ -137,10 +149,7 @@ fn collect_boot_info() -> BootInfo {
         }
     }
 
-    let hhdm_offset = HHDM_REQUEST
-        .response()
-        .map(|r| r.offset)
-        .unwrap_or(0);
+    let hhdm_offset = hhdm_offset_from_limine();
 
     // ACPI RSDP pointer (0 if firmware/Limine did not supply one). On Limine
     // base revision 6 this is a virtual (HHDM) address; iommu::detect normalises
@@ -299,6 +308,8 @@ pub fn hw_random() -> Option<u32> { None }
 /// (the block driver then refuses to guess a divider). Only the Pi's ARM port learns this,
 /// from the VideoCore mailbox at boot.
 pub fn emmc_base_clock_hz() -> u32 { 0 }
+/// No board mailbox on this architecture: the driver uses whatever the chip holds. See query 23.
+pub fn board_mac_packed() -> Option<u64> { None }
 
 /// USB mass-storage block device (the ARM DWC2 Bulk-Only bridge). Only the Pi's ARM port has an
 /// in-kernel USB stack; elsewhere disks are userspace drivers, so there is no device here.
@@ -312,6 +323,12 @@ pub fn usb_disk_flush() -> bool { false }
 /// x86: unchanged from when this lived in the scheduler - 300 quanta of ~10 ms is ~3 s, and it is `0`
 /// until the TSC quantum is calibrated (QEMU's periodic tick never calibrates, so it stays off there).
 /// A normal shootdown or critical section is milliseconds, so ~3 s cannot false-fire.
+/// (interrupts dispatched, last IRQ source) for `core`. Not tracked on this port, so the liveness
+/// panic prints zeros rather than a wrong number - it was added to diagnose an arm32 wedge.
+pub fn core_irq_debug(_core: u32) -> (u32, u32) {
+    (0, 0)
+}
+
 pub fn liveness_deadline_cycles() -> u64 {
     boot::tsc_ticks_per_quantum().saturating_mul(300)
 }
@@ -513,7 +530,7 @@ pub fn serial_write_byte(b: u8) {
     // settles (console_boot_complete). After that, logs are serial-only and only
     // the console path reaches the TV (Stage 1; docs/console-service.md).
     if boot_log_to_fb() {
-        crate::fbcon::put_byte(b);
+        crate::bootcon::put_bytes(&[b]);
     }
 }
 
@@ -579,7 +596,7 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
     // `serial_write_byte`.
     if boot_log_to_fb() {
         for &b in s {
-            crate::fbcon::put_byte(b);
+            crate::bootcon::put_bytes(&[b]);
         }
     }
 }
@@ -595,7 +612,7 @@ pub fn console_write_byte(b: u8) {
     // the log mirror is off, so the console path is what puts console output on the
     // TV.
     if !boot_log_to_fb() {
-        crate::fbcon::put_byte(b);
+        crate::bootcon::put_bytes(&[b]);
     }
 }
 
@@ -613,7 +630,7 @@ pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
     if to_fb && !boot_log_to_fb() {
         // One lock + one WC flush for the whole string, so it is atomic against
         // another core's console output (no interleaving mid-string).
-        crate::fbcon::put_bytes(s);
+        crate::bootcon::put_bytes(s);
     }
 }
 
@@ -622,6 +639,41 @@ pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
 // ---------------------------------------------------------------------------
 
 const COM2: u16 = 0x2F8;
+
+/// Is there actually a UART at COM2 on this machine?
+///
+/// `false` until probed, and on a board with no second serial port it STAYS false - which is the
+/// whole point. An absent ISA port reads back 0xFF on every register, and the receive path checks the
+/// Line Status Register's Data Ready bit. All-ones means that bit is SET, so an absent port reports
+/// "a byte is waiting" forever, and hands out 0xFF forever.
+///
+/// That is not a cosmetic wart. `control` polls this port and only sleeps when it comes up empty, so
+/// on a machine with no COM2 it never sleeps: measured at 93-100% of core 1, which is the core `fs`
+/// and `block-driver` are placed on. The storage path was being starved by a service draining a port
+/// that does not exist. The user spotted it in `observe` before any test did.
+static COM2_PRESENT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Probe for a real UART at COM2 using its scratch register (the standard test, and the one Linux
+/// uses): write a byte, read it back. RAM that remembers is a UART; an absent port returns 0xFF
+/// whatever you wrote. Two different values, so a bus that happens to float to one of them cannot
+/// pass by luck. Restores the register afterwards.
+///
+/// This is a property of the device, borrowed as such (26.14) - the scratch register exists for
+/// exactly this, and nothing about how the answer is stored or reported is imported with it.
+fn com2_probe() -> bool {
+    // SAFETY: COM2 I/O ports; the scratch register (offset 7) is defined by the 16550 as general
+    // storage with no side effects, so writing and restoring it cannot disturb the port.
+    unsafe {
+        let saved = inb(COM2 + 7);
+        outb(COM2 + 7, 0xA5);
+        let a = inb(COM2 + 7);
+        outb(COM2 + 7, 0x5A);
+        let b = inb(COM2 + 7);
+        outb(COM2 + 7, saved);
+        a == 0xA5 && b == 0x5A
+    }
+}
 
 /// Initialise COM2 at 115200 baud, 8N1. Receive-only (no TX interrupts).
 ///
@@ -637,10 +689,24 @@ pub fn com2_init() {
         outb(COM2 + 2, 0xC7); // FIFO on, clear
         outb(COM2 + 4, 0x0B); // RTS + DTR
     }
+    // Probe AFTER configuring, and say which machine this is - invariant 12: the difference between
+    // "there is an operator channel" and "there is not" is a printed fact, never a silent assumption.
+    let present = com2_probe();
+    COM2_PRESENT.store(present, core::sync::atomic::Ordering::Relaxed);
+    if present {
+        crate::kprintln!("com2: UART present at {:#06x} - operator control channel available", COM2);
+    } else {
+        crate::kprintln!(
+            "com2: NO UART at {:#06x} - operator control channel unavailable (reads suppressed)",
+            COM2);
+    }
 }
 
 /// Read one byte from COM2 if the receive data register is non-empty.
 pub fn com2_try_read_byte() -> Option<u8> {
+    // No port, no bytes. Without this an absent UART's 0xFF Line Status Register reads as
+    // "data ready" on every call and feeds `control` an infinite stream of 0xFF - see `COM2_PRESENT`.
+    if !COM2_PRESENT.load(core::sync::atomic::Ordering::Relaxed) { return None; }
     // SAFETY: COM2 port reads; initialised before first use.
     unsafe {
         if inb(COM2 + 5) & 0x01 != 0 {
@@ -664,6 +730,13 @@ const COM1_RX_BUF_SIZE: usize = 64;
 // only writes to indices [tail, next_tail) and the consumer only reads from [head, head+1).
 // The atomic head/tail ensure visibility across cores via Release/Acquire ordering.
 static mut COM1_RX_BUF: [u8; COM1_RX_BUF_SIZE] = [0u8; COM1_RX_BUF_SIZE];
+
+/// Keystrokes discarded because the ring was full. Counted so a dropped key is a reportable
+/// fact rather than a silence the user has to describe as "it trips sometimes".
+static RX_DROPPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// How many keystrokes the input ring has dropped since boot. 0 is the only good answer.
+pub fn console_input_dropped() -> u32 { RX_DROPPED.load(core::sync::atomic::Ordering::Relaxed) }
 static COM1_RX_HEAD: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static COM1_RX_TAIL: core::sync::atomic::AtomicUsize =
@@ -774,7 +847,7 @@ static BOOT_DISMISSED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 pub fn console_boot_complete() {
     if BOOT_DISMISSED.swap(true, core::sync::atomic::Ordering::AcqRel) { return; }
     BOOT_LOG_TO_FB.store(false, core::sync::atomic::Ordering::Release);
-    crate::fbcon::clear_and_home();
+    crate::bootcon::clear_and_home();
 }
 
 /// Set true by the USB keyboard driver (xHCI) once it has finished its setup -
@@ -821,7 +894,22 @@ pub unsafe fn uart_rx_push(b: u8) {
     let head = COM1_RX_HEAD.load(Ordering::Acquire);
     let next_tail = (tail + 1) % COM1_RX_BUF_SIZE;
     if next_tail == head {
-        return; // buffer full - drop byte
+        // A DROPPED KEYSTROKE IS A FAILURE, so say so (invariant 12).
+        //
+        // This used to `return` and nothing more. The byte vanished with no counter and no log, so a
+        // full ring looked exactly like a flaky keyboard - "it trips sometimes when you bash it" -
+        // and left nothing in a 15000-line serial capture to find. AArch64 has counted and reported
+        // this since its ring was written (`arch/aarch64/uart_rx.rs`); x86 was the inconsistent one.
+        //
+        // Reported on the FIRST drop only. This runs in the IRQ handler, so it must not turn a full
+        // ring into a flood of logging that keeps the ring full; the running total is available to
+        // whoever wants the magnitude.
+        if RX_DROPPED.fetch_add(1, Ordering::Relaxed) == 0 {
+            crate::kprintln!(
+                "x86_64: console input ring FULL - a keystroke was dropped (nothing is draining it)"
+            );
+        }
+        return;
     }
     // SAFETY: tail index is within COM1_RX_BUF bounds; only this producer writes to it.
     unsafe { COM1_RX_BUF[tail] = b; }
@@ -976,3 +1064,10 @@ unsafe fn inb(port: u16) -> u8 {
 ///
 /// x86 DMA is cache-coherent: the arena stays cacheable and needs no maintenance.
 pub const DMA_ARENA_UNCACHED: bool = false;
+
+/// Where a driver's DMA arena is mapped in ITS address space.
+///
+/// Per-arch because it is an ADDRESS, and an address is only meaningful in an address space that can
+/// hold it. The shared constant was `0x2_0000_0000`, an x86_64 value: on ARMv7 that is above the 32-bit
+/// ceiling, and the mapper truncated it to 0, laying the arena over the kernel's low megabyte.
+pub const DRIVER_DMA_VA: u64 = 0x2_0000_0000;

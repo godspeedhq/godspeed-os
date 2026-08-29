@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Chaos's ammunition: it allocates until the allocator says no, so that memory pressure can be applied
+# to the rest of the system on demand. Spawned BY chaos, which is why the Commandment II check derives
+# it as apparatus rather than treating it as a service escaping the storm.
+#
+# No placement: it is deliberately unpinned so it can be spawned anywhere the round-robin puts it.
+name    = "mem-pressure"
+version = "0.1.0"
+
+[resources.memory]
+request = "8MiB"
+limit   = "32MiB"
+
+[capabilities]
+ipc_receive = ["mem-pressure"]
+log_write   = true

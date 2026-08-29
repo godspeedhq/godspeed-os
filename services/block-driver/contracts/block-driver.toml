@@ -21,8 +21,17 @@ limit   = "16MiB"
 hw_device = "ahci"
 log_write = true
 
-[placement]
-core = 1
+# PLACEMENT IS ARCH-CONDITIONAL, so it is NOT declared here.
+#
+# On x86 and aarch64 this service sits on core 1. On arm32 it is unpinned: cross-core wakes are
+# immediate there now (the BCM2836 mailbox doorbell), and core 0 is kept clear for `dwc2`, whose
+# split transactions must hit 125 us windows and which shares that core with nothing else that logs.
+#
+# A `[placement] core` line here would be a SECOND copy of that decision, and it would be wrong on
+# one of the two arches whatever value it carried - which is precisely the drift Commandment III
+# forbids. The single source is `ServiceConfig.preferred_core` in kernel/src/task/mod.rs, which both
+# the boot and the RESTART paths consult; a value that lived only here was once overridden at boot
+# and not on restart, and a restarted service came back on a core where every operation failed.
 
 # Reach the `xhci` SERVICE by IPC. This is how block-driver gets its sectors on AArch64 (Pi 4),
 # where the USB stack is a userspace service and the in-kernel driver no longer exists in ANY build
@@ -41,3 +50,16 @@ core = 1
 # edge cost a full debugging round on the Pi 4, where every service looked healthy in isolation and
 # the disk was simply unaddressable.
 ipc_send = ["xhci"]
+
+[placement]
+# DECLARED. The prose above argued that stating a core here would be a second copy of an
+# arch-conditional decision - and it is right that ONE number cannot be correct for both arches. But
+# saying nothing is not neutral: the kernel pins this service, the contract claims no opinion, and
+# `scripts/contract_check.py` reads that as what RUNS differing from what is DECLARED. It failed the
+# audit on exactly these three files.
+#
+# The convention the checker enforces resolves it: this line is the x86 value, which is what the
+# reconcile compares against, and the arch-conditional lives ONCE in `ServiceConfig.preferred_core`
+# (kernel/src/task/mod.rs), where arm32 puts it on core 2, away from both dwc2 and the networking pair. The reasoning for the ARM
+# choice sits beside that code rather than being restated here, so there is still one source per fact.
+core = 1

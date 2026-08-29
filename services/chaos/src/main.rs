@@ -78,12 +78,24 @@ const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]; /
 // `ehci` on a box with no EHCI controller; or a newly added service), producing phantom "kills" of a
 // service that was never alive. The only names the scan skips are chaos's OWN untouchables: `chaos`
 // itself (a self-kill would end the run) and the transient tasks it spawns as attacks (`mem-pressure`,
-// including the spawn-storm) or that are ephemeral (`observe-*`). Everything else that is live is fair
+// including the spawn-storm). Everything else that is live is fair
 // game - and NOTHING is protected-last: the supervisor is a normal victim at any point, because the
 // fixed-point robustness must recover from ANY kill order (Test 15 / Cmd II - let Chaos try its
 // hardest); random destruction is the honest stress.
+// C2-1: `observe*` USED TO BE EXCLUDED HERE, and it was the one real service escaping Maximum Carnage.
+// The prefix caught the transient viewer tasks (`observe-now`, `observe-live`) and, with them, the
+// `observe` SERVICE itself - so a whole service never faced the storm while every suite reported green.
+// Naming the two transients explicitly would not have fixed it either: chaos does not spawn those, so
+// they are not its apparatus, and "no service escapes" admits no third category. Killing a task that is
+// already exiting is harmless - the scan skips Dead and invalid slots a few lines above - so the
+// exclusion was buying nothing that the liveness check does not already buy.
+//
+// What remains is chaos's OWN apparatus, and the commandment check DERIVES both rather than reading
+// them here: `chaos` itself (a self-kill ends the run, so the storm would stop measuring anything) and
+// whatever chaos spawns (`mem-pressure`, its ammunition). Add a name to this function that chaos
+// neither is nor spawns and the build fails.
 fn is_transient(name: &str) -> bool {
-    name == "chaos" || name == "mem-pressure" || name.starts_with("observe")
+    name == "chaos" || name == "mem-pressure"
 }
 
 // A tiny xorshift64 PRNG - there is no std rng in no_std. Seeded from the RTC start time (varies run to
@@ -143,6 +155,58 @@ impl core::fmt::Write for FrameBuf {
 /// Write a compact, bounded duration ("45s", "1m23s", "2h05m", "3d04h") into the frame: a chaos run can
 /// span days, so cascade d/h/m/s and show the two most-significant units. Seconds come from the RTC
 /// (year-guarded), so the value is plausible by construction.
+/// When this run STARTED, in wall-clock terms, worked out after the fact.
+///
+/// A chaos run usually begins before the clock is known: this board has no RTC, so the time only
+/// arrives when SNTP lands, which may be after the storm is already going. The report used to say
+/// "clock not set" for the whole run because it sampled the clock ONCE, at the start, and a reading
+/// taken before the answer existed can never improve.
+///
+/// It does not have to. `elapsed` comes from the MONOTONIC counter, which is real from boot and
+/// unaffected by the wall clock being set later, so the moment anybody knows the time the start follows
+/// from it: `started = now - elapsed`. One late answer recovers a fact from before it was knowable.
+///
+/// **Asking `time` is not depending on it.** The existing note here is right that chaos must not depend
+/// on that service - it kills it thousands of times a run, and a blocking request to a service it has
+/// just killed is a wedge. So this is bounded, tolerates every failure by returning `None`, and is only
+/// asked while the answer is still unknown. Once learned it is cached and never asked again, so a
+/// successful run makes at most a handful of requests and a `time` that stays dead costs one bounded
+/// wait per report and changes nothing else.
+///
+/// It asks `time` rather than reading `datetime()` because the wall clock BELONGS to that service since
+/// clock slice 3 - it is the one that knows the RTC, the network reading and the persisted floor, and
+/// in that order. Reading the raw RTC here would be a second, worse answer to a question somebody else
+/// already owns (Commandment III).
+fn learn_wall_offset(ctx: &ServiceContext) -> Option<i64> {
+    // ACQUIRE BY NAME FIRST. Chaos declares NO `ipc_send` peers at all - it reaches every service
+    // through the kernel's name directory, which is how it can kill things it was never wired to. So a
+    // name-addressed request finds nothing until the cap is acquired, and the first version of this
+    // silently failed on every call: the report kept saying the clock was not set while `date` was
+    // showing the time perfectly, because chaos had no way to ask. `reacquire_by_name` fills the cache
+    // the name-addressed call reads.
+    //
+    // It is re-acquired rather than cached across calls on purpose: chaos kills `time` constantly, so a
+    // handle held from a previous round is usually stale, and this runs at most a handful of times
+    // before the answer is known and it stops asking altogether.
+    if !ctx.reacquire_by_name("time") {
+        return None;
+    }
+    // OP_NOW = 1 -> [ok, epoch(8 LE), source, age(8 LE)]
+    let r = ctx.request_with_reply_deadline("time", &Message::from_bytes(&[1u8]), 1)?;
+    let p = r.payload_bytes();
+    if p.len() < 10 || p[0] == 0 {
+        return None;
+    }
+    let mut e = [0u8; 8];
+    e.copy_from_slice(&p[1..9]);
+    let now = i64::from_le_bytes(e);
+    // A clock that is not set answers 0, and 0 minus an elapsed is not a start time.
+    // The OFFSET, taken at one instant: wall clock minus monotonic. Any past or present moment's wall
+    // time is then that moment's monotonic reading plus this, which is what keeps `started` and
+    // `elapsed` from ever contradicting each other.
+    if now >= 1_577_836_800 { Some(now - ctx.epoch_secs_monotonic()) } else { None }
+}
+
 fn write_dur(f: &mut FrameBuf, secs: u64) {
     if secs >= 86400 { let _ = write!(f, "{}d{:02}h", secs / 86400, (secs % 86400) / 3600); }
     else if secs >= 3600 { let _ = write!(f, "{}h{:02}m", secs / 3600, (secs % 3600) / 60); }
@@ -260,17 +324,57 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let (mut round, mut killed, mut flooded, mut mempr, mut spawns) = (0u64, 0u64, 0u64, 0u64, 0u64);
     // Wall-clock start (RTC, year-guarded): the datetime for the "started HH:MM:SS" readout, and its epoch
     // for elapsed + the linear ETA (a pure extrapolation of elapsed over round progress, no outside truth).
+    // `datetime()` is the kernel's RAW RTC. Machines without one (the Pi) read zero here, and since
+    // clock slice 3 the wall clock lives in the `time` service, which chaos deliberately does not
+    // depend on - it may have just killed it. So an unset clock is REPORTED as unset below rather than
+    // rendered as 1970. Elapsed and the ETA ride the monotonic clock and are unaffected either way.
     let start_dt = ctx.datetime();
     let start_epoch = start_dt.epoch_secs();
+    // How the wall clock relates to the monotonic counter, ONCE ANYBODY KNOWS. See `learn_wall_offset`.
+    // ASK BEFORE THE STORM, WHILE THE SYSTEM IS STILL CALM.
+    //
+    // This only ever asked from inside the report loop, which runs while chaos is killing `time` several
+    // times a second - so it kept meeting a freshly respawned instance that had not synced yet, got "no
+    // clock" every time, and printed "clock not set yet" for a six minute run whose clock was correct
+    // throughout. The one moment `time` is reliably healthy is right now, before the first round.
+    //
+    // Elapsed is zero here, so "now minus elapsed" is simply now.
+    // CACHE THE OFFSET, NOT THE START TIME.
+    //
+    // `started` and `elapsed` must agree - they describe the same instant from two directions - and
+    // storing them as two independent facts let them drift: a report showed `elapsed 3s`, then `elapsed
+    // 0s` with `started` unchanged, which is arithmetically impossible for one run and means the two
+    // were cached from different moments.
+    //
+    // They cannot disagree if only ONE thing is remembered. What is genuinely worth caching is neither
+    // of them: it is the OFFSET between the wall clock and the monotonic counter, which is a property of
+    // the machine and does not change while the clock holds. Both displayed values are then derived from
+    // the same `start_mono`, so they are consistent by construction rather than by care.
+    let mut wall_offset: Option<i64> = if start_dt.year >= 2000 {
+        Some(start_epoch - ctx.epoch_secs_monotonic())
+    } else {
+        learn_wall_offset(&ctx)
+    };
     // ELAPSED is measured on the MONOTONIC clock, not this wall-clock stamp: the wall clock is settable
     // (SNTP sets it on the RTC-less Pi), so a sync landing mid-run would make `now - start` jump by the
     // whole correction and report an absurd elapsed/ETA. The datetime above is kept for the "started ..."
     // readout, which is exactly what a wall clock IS for.
     let start_mono = ctx.epoch_secs_monotonic();
-    // Seed the random-storm PRNG from the RTC start time (varies per run); advanced each round so the
-    // subset differs round-to-round. Only read in the `target_random` branch.
+    // Seed the random-storm PRNG. Advanced each round so the subset differs round-to-round; only read
+    // in the `target_random` branch.
+    //
+    // The seed must not rest on the wall clock alone. On a machine with no RTC the clock reads ZERO at
+    // boot, so every term above was zero and every run drew the SAME "random" sequence - a chaos gate
+    // that replays one scripted order while reporting that it randomised. Failure to vary is invisible
+    // by construction here: the output looks equally random each time, and only comparing two runs
+    // shows it. So mix three independent sources and require none of them:
+    //   - the hardware RNG where the SoC has one (the Pi's BCM2835; ungated, entropy grants nothing),
+    //   - the monotonic counter, which is real from boot even with no clock at all,
+    //   - the wall clock, when it happens to be set.
     let mut rng = Rng::new((start_epoch as u64)
-        ^ ((start_dt.minute as u64) << 24) ^ ((start_dt.second as u64) << 40));
+        ^ ((start_dt.minute as u64) << 24) ^ ((start_dt.second as u64) << 40)
+        ^ ((ctx.hw_random().unwrap_or(0) as u64) << 8)
+        ^ ((start_mono as u64) << 17));
 
     // Reap ORPHANED mem-pressure tasks left by a PRIOR chaos run that was itself killed mid-run before
     // its end-of-run cleanup (below) could reap them (audit L5). chaos cannot clean up after its own
@@ -426,12 +530,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // "Thu 1970-01-01 00:00:00" - a fiction with the shape of a fact. `elapsed` is unaffected: it
         // comes from the MONOTONIC counter, which is real from boot, so the run's own timing stays
         // honest either way. Report what is known, and say so when something is not (§26.7).
-        if start_dt.year >= 2000 {
-            let _ = write!(f, "  started {} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  |  elapsed ",
-                WEEKDAYS[(start_dt.weekday() as usize) % 7], start_dt.year, start_dt.month,
-                start_dt.day, start_dt.hour, start_dt.minute, start_dt.second);
-        } else {
-            let _ = write!(f, "  started (clock not set - `date sync`)  |  elapsed ");
+        // ASK ONCE THE CLOCK EXISTS, then never again. See `learn_wall_offset` for why chaos may ask
+        // the `time` service without depending on it.
+        if wall_offset.is_none() {
+            wall_offset = learn_wall_offset(&ctx);
+        }
+        match wall_offset {
+            // Derived from the SAME `start_mono` the elapsed above uses, so the two always agree.
+            Some(off) => {
+                let d = godspeed_sdk::Datetime::from_epoch_secs(start_mono + off);
+                let _ = write!(f, "  started {} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  |  elapsed ",
+                    WEEKDAYS[(d.weekday() as usize) % 7], d.year, d.month,
+                    d.day, d.hour, d.minute, d.second);
+            }
+            None => { let _ = write!(f, "  started (clock not set yet)  |  elapsed "); }
         }
         write_dur(&mut f, elapsed);
         if rounds > 0 && round > 0 {

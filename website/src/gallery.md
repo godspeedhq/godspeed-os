@@ -10,7 +10,7 @@ mockup.
 
 The kernel comes up on all cores, spawns the supervisor directly, and the supervisor wires each
 service from its name-cap map. Here the USB stack has just enumerated a keyboard end to end, and the
-shell is ready. The framebuffer console mirrors the serial log.
+shell is ready. The display is driven by the `console` service, which renders the interactive console stream; the serial line keeps the full log.
 
 ![GodspeedOS booting to steady state](images/boot.png)
 

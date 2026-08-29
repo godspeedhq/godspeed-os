@@ -33,9 +33,13 @@ the `xhci` service that drives it instead). See where it is handled below.
 
 usage:  python scripts/pi4_build.py [--debug] [--features a,b]
 """
-import subprocess, sys, os, pathlib, re
+import subprocess, sys, os, pathlib, re, shutil, io
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+# Quoted lowercase service name, e.g. "net-stack". Built from chr() so this file stays
+# free of regex backslashes.
+NAME_RE = chr(34) + "([a-z0-9" + chr(45) + "]+)" + chr(34)
 PROFILE = "debug" if "--debug" in sys.argv else "release"
 TARGET = "aarch64-unknown-none"
 # The kernel is LINKED high (TTBR1) and LOADED low. objcopy -O binary emits by LMA,
@@ -65,32 +69,46 @@ def tool(name):
 # Building them HERE rather than by hand is what keeps the two lists honest - a service added to
 # `build.rs` but never built silently stays a placeholder, and the boot log says so in a line that is
 # easy to read past.
-PI4_SERVICES = [
-    "logger", "supervisor", "shell",
-    "ping", "pong",
-    # The chaos service is what the carnage gate runs; `observe` is how the machine is watched while it
-    # runs. Both are arch-neutral - they needed building, not porting.
-    "chaos", "observe", "mem-pressure",
-    # Storage: the USB stick, never the SD card (which is the boot medium - see block-driver's
-    # `backend_run`). `fs` is arch-neutral and rides on whatever block-driver serves.
-    "block-driver", "fs",
-    # Networking. Both are arch-neutral: `nic-driver` reaches the hardware through the NET_DEVICE
-    # syscalls, which the aarch64 arch layer now backs with the GENET driver, and `net-stack` sits on
-    # top of nic-driver and never touches hardware at all. Neither needed porting - they needed
-    # BUILDING, and until they were on this list the kernel embedded an empty placeholder and every
-    # boot reported `LoadFailed(TooSmall)`.
-    "nic-driver", "net-stack",
-    # The userspace USB host-controller driver for the VL805. Built on EVERY invocation, not only
-    # for the reason `kernel/build.rs` gives at its own list: an unspawned ELF
-    # in the image costs bytes, while a spawned service the kernel embedded as a placeholder fails
-    # with `LoadFailed(TooSmall)` - a diagnostic that points at the binary rather than at the list.
-    "xhci",
-    # The pipe/IPC example services the shell composes (`roster | shell`, `greet`, `upper`, ...). All
-    # arch-neutral SDK users - they needed building, not porting - and selfcheck exercises them, so a
-    # missing one is 30 FAIL lines that look like a broken pipe implementation rather than an absent
-    # binary.
-    "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder",
-]
+def _pi4_services():
+    """The services to build, DERIVED from `kernel/build.rs` rather than restated here.
+
+    This was a hand-maintained list, and it drifted exactly the way a second copy of a fact always
+    does: `console`, `time` and `control` were spawned by the supervisor on this port and missing
+    here, so the kernel embedded empty placeholders and the first Pi 4 boot after the arm32 work
+    reported three `LoadFailed(TooSmall)` lines - a diagnostic that points at the binaries rather
+    than at the list. The Pi 2 had already hit this and already fixed it the right way
+    (`_arm_services` in arm_build.py); the Pi 4 kept the duplicate. Commandment III: one truth, and
+    everything else derives from it.
+
+    Both arms of the `aarch64_built` conditional are taken, because the asymmetry of being wrong runs
+    one way. Building a service the kernel does not embed costs a few seconds; NOT building one it
+    does embed costs a placeholder, a failed spawn on the board, and a hunt for a bug in a binary
+    that was simply never compiled.
+    """
+    kb = os.path.join(ROOT, "kernel", "build.rs")
+    src = io.open(kb, encoding="utf-8").read()
+    head = "let aarch64_built: &[&str] = if aarch64_demo {"
+    at = src.find(head)
+    end = src.find(chr(10) + "    };", at) if at >= 0 else -1
+    if at < 0 or end < 0:
+        raise SystemExit(
+            "pi4_build: cannot find `aarch64_built` in kernel/build.rs. It is the source of "
+            "truth for which services are built + embedded on the Pi 4; refusing to guess, "
+            "because guessing wrong produces a placeholder ELF and a service that fails to "
+            "spawn at runtime with LoadFailed(TooSmall)."
+        )
+    # Strip line comments before harvesting names, so a service mentioned only in prose does not
+    # get built and, worse, a name REMOVED from the list but still discussed does not linger.
+    body = chr(10).join(ln.split("//")[0] for ln in src[at:end].split(chr(10)))
+    seen, out = set(), []
+    for n in re.findall(NAME_RE, body):
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+PI4_SERVICES = _pi4_services()
 
 # `pi4` is always present; anything passed is added to it, not substituted for it. `pi4-smp` rides with
 # it now that all four cores come up on every boot and survive a carnage run - a Pi 4 running on one of
@@ -114,6 +132,12 @@ EL0_FAULT_TEST = "--el0-fault-test" in sys.argv
 
 rel = ["--release"] if PROFILE == "release" else []
 
+# Refuse to build an image whose supervisor spawns a service the kernel embeds as a placeholder.
+# This is the gate for the failure that produced `LoadFailed(TooSmall)` on this port twice.
+sys.path.insert(0, str(ROOT / "scripts"))
+import service_embed_check
+service_embed_check.enforce(str(ROOT), "aarch64")
+
 # 1. The services first - the kernel embeds their ELFs, so a stale service is baked into the image.
 for svc in PI4_SERVICES:
     feats = ["--features", "bare-metal"] if svc == "supervisor" else []
@@ -128,6 +152,13 @@ for svc in PI4_SERVICES:
     if svc == "net-stack" and EL0_FAULT_TEST:
         feats = ["--features", "el0-fault-test"]
     run(["cargo", "build", "-p", svc, "--target", TARGET] + feats + rel)
+
+# Every service's frames must fit the 256 KiB user stack (USER_STACK_PAGES in kernel/src/task/mod.rs).
+# The Pi 2 has had this gate since a debug `fs` crash-looped on a 503 KiB frame; the Pi 4 had none, and
+# a rule enforced on one build path is enforced on none.
+import stack_fit_check
+stack_fit_check.enforce(
+    tool("rust-objdump"), str(ROOT), TARGET, PROFILE, PI4_SERVICES, 64 * 4096)
 
 # 2. The kernel.
 args = ["cargo", "build", "-p", "kernel", "--target", TARGET, "--features", FEATURES] + rel
@@ -157,4 +188,18 @@ addr = lma
 run([tool("rust-objcopy"), "-O", "binary", str(elf), str(img)])
 print(f"OK  {img.relative_to(ROOT)}  ({img.stat().st_size} bytes, "
       f".text VMA {vma:#x} / LMA {addr:#x}, feature={FEATURES}, profile={PROFILE})")
-print("Deploy: copy build/kernel8.img to the SD card as the name config.txt's `kernel=` line points at.")
+# Stage the canonical Pi 4 boot config next to the kernel, so deploying is copying TWO files
+# from build/ - the config the boot depends on is versioned in the repo (boot/pi4/config.txt),
+# never re-typed onto a card by hand. Same rule as the Pi 2 (scripts/arm_build.py).
+cfg_src = ROOT / "boot" / "pi4" / "config.txt"
+if cfg_src.exists():
+    shutil.copyfile(cfg_src, img.parent / "config.txt")
+    print("OK  build/config.txt   (canonical copy of boot/pi4/config.txt)")
+else:
+    # Loud, not silent: a missing config means the card would keep whatever `kernel=` line it
+    # already had, and boot SOMEONE ELSE'S kernel while reporting a successful build.
+    print(f"WARNING: {cfg_src} is missing - build/config.txt NOT staged")
+
+print("Deploy to Pi 4: copy build/kernel8.img to the card's FAT boot partition AS godspeed8.img,")
+print("                and build/config.txt as config.txt. The name differs on purpose: it leaves")
+print("                a stock Raspberry Pi OS kernel8.img in place as a known-good fallback.")

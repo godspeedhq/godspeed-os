@@ -318,6 +318,41 @@ fn ec_name(esr: u64) -> &'static [u8] {
     }
 }
 
+/// Decode the fault status (`DFSC`/`IFSC`, ISS bits 5:0) of an abort, plus the write flag.
+///
+/// The EC alone says "data abort"; it does not say WHY, and for the read-only canary experiment the
+/// difference between the two answers is the whole result. A **permission** fault on the guarded page
+/// means a CPU instruction wrote it, and `ELR_EL1` names that instruction. A **translation** fault
+/// means something else entirely. Printing the distinction removes the step where a hex value gets
+/// interpreted by hand, which is where a wrong reading enters.
+fn fault_status(esr: u64) -> &'static [u8] {
+    let ec = (esr >> 26) & 0x3F;
+    if !matches!(ec, 0b100000 | 0b100001 | 0b100100 | 0b100101) {
+        return b"n/a (not an abort)";
+    }
+    match esr & 0x3F {
+        0b000000..=0b000011 => b"address size fault",
+        0b000100 => b"translation fault L0",
+        0b000101 => b"translation fault L1",
+        0b000110 => b"translation fault L2",
+        0b000111 => b"translation fault L3",
+        0b001001 => b"ACCESS FLAG fault L1",
+        0b001010 => b"ACCESS FLAG fault L2",
+        0b001011 => b"ACCESS FLAG fault L3",
+        0b001101 => b"PERMISSION FAULT L1",
+        0b001110 => b"PERMISSION FAULT L2",
+        0b001111 => b"PERMISSION FAULT L3",
+        0b010000 => b"external abort",
+        0b100001 => b"alignment fault",
+        _ => b"other (see ARM ARM D17.2.37)",
+    }
+}
+
+/// True if the abort was caused by a WRITE (`ISS.WnR`, bit 6). Meaningless for instruction aborts.
+fn fault_was_write(esr: u64) -> bool {
+    matches!((esr >> 26) & 0x3F, 0b100100 | 0b100101) && (esr >> 6) & 1 == 1
+}
+
 /// Ticks seen, so the boot can report progress instead of asserting the timer works.
 pub static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Said once: an SPI too high to express in the neutral routing table's `u8` key.
@@ -341,12 +376,51 @@ static SPI_TOO_HIGH_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic:
 /// acknowledged interrupt, so skipping it silently blocks all later interrupts of equal or lower
 /// priority. The symptom is "interrupts stopped" with nothing to point at, which is why the retire
 /// happens on every path out of here including the spurious one.
+/// Interrupts dispatched per core, and the last GIC interrupt ID each saw.
+///
+/// Exists for one question the liveness watchdog could not answer on this port: when a core stops
+/// making progress, is it still taking interrupts? A frozen count and a climbing count are opposite
+/// faults with opposite fixes - not taking interrupts at all, versus taking them and losing the tick
+/// inside the handler - and without this the panic named the victim but never the mechanism.
+///
+/// This is the aarch64 twin of the 32-bit port's tally (`arch/arm/irq.rs`). It is not optional here:
+/// `liveness_deadline_cycles` is ANSWERED on the Pi 4, so the watchdog is armed on this port and its
+/// panic message reads these. They were missing, which is why the Pi 4 kernel did not build.
+static IRQ_COUNT: [core::sync::atomic::AtomicU32; MAX_TALLY_CORES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_TALLY_CORES];
+static IRQ_LAST_ID: [core::sync::atomic::AtomicU32; MAX_TALLY_CORES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_TALLY_CORES];
+
+/// Cores this tally covers. The Pi 4 is a quad-core A72; a core beyond this range folds into the last
+/// slot rather than indexing out of bounds, because a DIAGNOSTIC must never be the thing that panics.
+const MAX_TALLY_CORES: usize = 4;
+
+/// (interrupts dispatched, last GIC interrupt ID) for `core` - what the liveness panic reports.
+pub fn core_irq_debug(core: u32) -> (u32, u32) {
+    let i = (core as usize).min(MAX_TALLY_CORES - 1);
+    (
+        IRQ_COUNT[i].load(core::sync::atomic::Ordering::Relaxed),
+        IRQ_LAST_ID[i].load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 #[no_mangle]
 extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
     let id = super::gic::acknowledge();
     if id == super::gic::SPURIOUS {
         return; // nothing pending - do NOT EOI an ID that was never raised
     }
+    // Stamp BEFORE any handling: the count must prove the interrupt was TAKEN, not that it completed.
+    // A handler that hangs is exactly the case this is meant to distinguish, and it would never reach
+    // a stamp placed at the end.
+    // Indexed by LOGICAL core id, which is what the liveness watchdog passes to `core_irq_debug` -
+    // so the tally is read back under the same identity it was written under. (Raw MPIDR would agree
+    // on the Pi 4, where it is 0..3, and quietly disagree on any board where it is not.) The neutral
+    // accessor is safe and cannot panic - it falls back to 0 for a core it does not know - which is
+    // the property that matters in a handler whose whole job is to survive a machine in trouble.
+    let core = crate::task::scheduler::current_core_id().min(MAX_TALLY_CORES - 1);
+    IRQ_COUNT[core].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    IRQ_LAST_ID[core].store(id, core::sync::atomic::Ordering::Relaxed);
     // IDs 0..15 are Software Generated Interrupts - one core waking another. Acknowledging and retiring
     // them is the whole job: the wake's PURPOSE is to make this core leave `wfi` and re-enter the
     // scheduler, which it does on the way out of this handler. There is no per-vector work to do, which
@@ -609,7 +683,10 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     super::put_hex(esr);
     super::put_str(b"  (");
     super::put_str(ec_name(esr));
-    super::put_str(b")\r\n    FAR_EL1  = ");
+    super::put_str(b")\r\n    fault    = ");
+    super::put_str(fault_status(esr));
+    super::put_str(if fault_was_write(esr) { b", on a WRITE" } else { b", not a write" });
+    super::put_str(b"\r\n    FAR_EL1  = ");
     super::put_hex(far);
     super::put_str(b"\r\n    ELR_EL1  = ");
     super::put_hex(f.elr);
@@ -675,6 +752,463 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     // userspace fault and silently kill a task over a KERNEL bug, which would hide the far more
     // serious problem behind a restart.
     let from_el0 = (8..=11).contains(&vector) && (f.spsr & 0x1F) == 0;
+
+    // THE FRAME ITSELF, when the fault came from EL0.
+    //
+    // The registers above say WHAT was in flight; they cannot say whether the frame under it is
+    // intact. That distinction is the whole question in the class of fault this was added for: the
+    // Pi 4 shell died repeatedly with `ELR_EL1 = 0`, `x29 = 0` and `x30 = 0` at a stack only 27% deep,
+    // which is a branch to address zero from a frame that looks ZEROED rather than one that ran out of
+    // room. Registers alone cannot separate "something wrote zeros over the saved LR" from "a null
+    // function pointer was called with a legitimately empty frame" - and those are different bugs with
+    // different fixes. The words at SP say which.
+    //
+    // Read through the USER-COPY SEAM, never a raw dereference. The stack we are asked to print
+    // belongs to a task that just faulted, so assuming any of it is mapped is exactly the assumption
+    // that is already known to be false here. `read_user_bytes` validates the range is user-space and
+    // copies under the fault fixup: an unmapped window returns `None` and prints a line saying so,
+    // rather than taking a fault INSIDE the fault handler and turning a dead service into a dead
+    // machine. A diagnostic that can panic the kernel is not worth the diagnosis.
+    //
+    // Gated on `from_el0`, the binding computed just above, rather than a second copy of the
+    // vector/SPSR test. Two spellings of one condition drift, and the drift here would be silent:
+    // the dump would print for a case the kill path does not treat as userspace, or stay quiet for
+    // one it does.
+    //
+    // Bounded at 16 words: enough to cover a small frame's saved-register area, small enough that a
+    // fault storm cannot flood the console with a service's stack.
+    if from_el0 {
+        #[cfg(not(feature = "fault-dump-wide"))]
+        const WORDS: usize = 16;
+        // Wider under the diagnostic feature: 16 words showed the frame is flattened but not how far
+        // the damage runs, and the extent is what names the buffer that overran.
+        #[cfg(feature = "fault-dump-wide")]
+        const WORDS: usize = 64;
+        super::put_str(b"\r\n    stack at SP_EL0 (");
+        super::put_dec(WORDS as u64);
+        super::put_str(b" words, low to high):");
+        match crate::arch::imp::uaccess::read_user_bytes(sp_el0, WORDS * 8) {
+            Some(bytes) => {
+                for i in 0..WORDS {
+                    if i % 2 == 0 {
+                        super::put_str(b"\r\n      ");
+                        super::put_hex(sp_el0 + (i as u64) * 8);
+                        super::put_str(b": ");
+                    }
+                    let mut w = [0u8; 8];
+                    w.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+                    super::put_hex(u64::from_le_bytes(w));
+                    super::put_str(b" ");
+                }
+            }
+            // Not a failure of the dump - a FACT about the task, and one worth as much as the words
+            // would have been: a stack pointer whose own frame is unreadable is itself the answer.
+            None => super::put_str(b"\r\n      unreadable (SP is outside the task's mapped stack)"),
+        }
+
+        // HOW FAR THE ZEROS GO.
+        //
+        // The window above shows the frame is flattened; it cannot show how MUCH of it, and that is
+        // the number that identifies the culprit. Three faults on this port shared exact register
+        // geometry - `x0 = SP+5`, `x1 = SP-0x1051` - across three unrelated commands, which is a copy
+        // overrunning a stack buffer rather than corruption arriving from elsewhere. The EXTENT of
+        // the zeroed run is the size of that overrun, and a size is enough to name the buffer.
+        //
+        // Scans upward from SP for the first non-zero word, in 512-byte bites through the same
+        // user-copy seam. Bounded at 8 KiB - twice the 4 KiB request buffers these paths build, so a
+        // full overrun of one is inside the window and a runaway scan is not. An unmapped bite ends
+        // the scan and says where, which is itself the answer if the stack simply stops there.
+        const SCAN_MAX: u64 = 8 * 1024;
+        const BITE: usize = 512;
+        let mut off: u64 = 0;
+        let mut first_nonzero: Option<u64> = None;
+        let mut stopped_at: Option<u64> = None;
+        while off < SCAN_MAX && first_nonzero.is_none() {
+            match crate::arch::imp::uaccess::read_user_bytes(sp_el0 + off, BITE) {
+                Some(b) => {
+                    for w in 0..BITE / 8 {
+                        let mut t = [0u8; 8];
+                        t.copy_from_slice(&b[w * 8..w * 8 + 8]);
+                        if u64::from_le_bytes(t) != 0 {
+                            first_nonzero = Some(off + (w as u64) * 8);
+                            break;
+                        }
+                    }
+                    off += BITE as u64;
+                }
+                None => { stopped_at = Some(off); break; }
+            }
+        }
+        super::put_str(b"\r\n    zeroed run above SP: ");
+        match (first_nonzero, stopped_at) {
+            (Some(n), _) => {
+                super::put_dec(n);
+                super::put_str(b" bytes, then a non-zero word at SP+");
+                super::put_hex(n);
+            }
+            (None, Some(end)) => {
+                super::put_dec(end);
+                super::put_str(b" bytes, then the stack becomes UNREADABLE at SP+");
+                super::put_hex(end);
+            }
+            (None, None) => {
+                super::put_str(b"the whole 8 KiB scan window is zero");
+            }
+        }
+
+        // THE SAME MEASUREMENT, FOR A FILL THAT IS NOT ZERO.
+        //
+        // The scan above answers "how far do the ZEROS go", and that is the right question only when
+        // the overrun was written with zeros. Twice on this port it was not: the frame came back full
+        // of 0x20 - ASCII spaces, the padding of a line the shell had just printed - and the report
+        // read "zeroed run above SP: 0 bytes", which is true and useless. An instrument that only
+        // recognises one fill value reports nothing at all for any other, and reports it confidently.
+        //
+        // So: take whatever byte is actually AT SP and measure how far THAT repeats. Zero still works
+        // (it is just one fill value among others), and a space-filled smash now yields the number
+        // that matters - the extent of the run, which is the size of the overrun, which is enough to
+        // name the buffer that produced it.
+        #[cfg(feature = "fault-dump-wide")]
+        {
+            let fill = match crate::arch::imp::uaccess::read_user_bytes(sp_el0, 8) {
+                Some(b) => b[0],
+                None    => 0,
+            };
+            let mut run: u64 = 0;
+            let mut foff: u64 = 0;
+            'outer: while foff < SCAN_MAX {
+                match crate::arch::imp::uaccess::read_user_bytes(sp_el0 + foff, BITE) {
+                    Some(b) => {
+                        for k in 0..BITE {
+                            if b[k] != fill { break 'outer; }
+                            run += 1;
+                        }
+                        foff += BITE as u64;
+                    }
+                    None => break,
+                }
+            }
+            super::put_str(b"
+    fill run above SP: byte 0x");
+            super::put_hex(fill as u64);
+            super::put_str(b" repeats for ");
+            super::put_dec(run);
+            super::put_str(b" bytes");
+        }
+
+        // A BACKTRACE, the way an oops has one.
+        //
+        // Registers say what was in flight and the window says the frame is flattened; neither
+        // names the function, and that name is the whole question. `x29` is zero here, so the frame
+        // CHAIN is broken and cannot be walked - which is exactly the case Linux `dump_backtrace`
+        // falls back to scanning for. Older frames further up the stack still hold their saved link
+        // registers, and a link register is a code address.
+        //
+        // So: scan upward and print every word that could be one. The service text is mapped at
+        // 0x400000 and the user stack top is 0x8000_0000, so a candidate is a 4-byte-aligned word
+        // inside the text window - a heuristic, and named as one: some of these are stale slots from
+        // calls that already returned. It is a list of suspects, not a call chain, and that is still
+        // the difference between reading a name and guessing one.
+        //
+        // Bounded the same way as the scan above: 8 KiB, 512-byte bites, same user-copy seam, and at
+        // most 12 printed so a deep stack cannot flood the console.
+        const TEXT_LO: u64 = 0x0040_0000;
+        // 5 MiB, not 8. The first window ran to 0x0080_0000 and its one and only "hit" was
+        // 0x747874 - the ASCII bytes "txt", the tail of a filename sitting in a buffer. A service's
+        // .text is ~200 KiB (the shell measures 0x34800), so nothing legitimate lives above 5 MiB and
+        // a looser bound only invites string data to impersonate a return address. A backtrace that
+        // reports one false name is worse than one that reports none, because a name gets believed.
+        const TEXT_HI: u64 = 0x0050_0000;
+        // Scan the LIVE STACK, not a fixed window. The first version borrowed the 8 KiB cap from the
+        // zero-run scan and reported "none found" - true of those 8 KiB, false of the stack: SP sat
+        // 71,664 bytes below the top with every caller frame above it, and a 6,208-byte
+        // zero-initialised local in the faulting frame alone pushed the nearest saved link register
+        // out of range. A window that cannot reach the answer returns a confident nothing.
+        //
+        // The extent now comes from the stack itself - SP to the user stack top - capped at 64 KiB so
+        // a bogus SP cannot walk forever.
+        const USER_STACK_TOP: u64 = 0x8000_0000;
+        let room = USER_STACK_TOP.saturating_sub(sp_el0).min(64 * 1024);
+        #[cfg(not(feature = "fault-dump-wide"))]
+        const BT_MAX: u32 = 12;
+        // More suspects under the diagnostic feature: the production cap of 12 is right for a report a
+        // human reads, but these get symbolized offline against the service ELF, where a longer list of
+        // candidates is strictly more to work with.
+        #[cfg(feature = "fault-dump-wide")]
+        const BT_MAX: u32 = 48;
+        let mut shown = 0u32;
+        let mut boff: u64 = 0;
+        let mut scanned: u64 = 0;
+        super::put_str(b"\r\n    return addresses on the stack (newest first, may include stale slots):");
+        while boff < room && shown < BT_MAX {
+            let Some(b) = crate::arch::imp::uaccess::read_user_bytes(sp_el0 + boff, BITE) else { break };
+            scanned = boff + BITE as u64;   // how far we ACTUALLY got
+            for w in 0..BITE / 8 {
+                if shown >= BT_MAX { break; }
+                let mut t = [0u8; 8];
+                t.copy_from_slice(&b[w * 8..w * 8 + 8]);
+                let v = u64::from_le_bytes(t);
+                if v >= TEXT_LO && v < TEXT_HI && v & 3 == 0 {
+                    super::put_str(b"\r\n      SP+");
+                    super::put_hex(boff + (w as u64) * 8);
+                    super::put_str(b" -> ");
+                    super::put_hex(v);
+                    shown += 1;
+                }
+            }
+            boff += BITE as u64;
+        }
+        if shown == 0 {
+            // REPORT WHAT WAS SCANNED, not what was intended. This printed `room` - the distance from
+            // SP to the stack top, computed BEFORE the loop - so a scan that broke early on an
+            // unreadable page still claimed to have covered all of it, and "no return addresses" read
+            // as a fact about the stack when it might only be a fact about the first 512 bytes.
+            super::put_str(b"
+      none found in ");
+            super::put_dec(scanned);
+            super::put_str(b" bytes ACTUALLY READ (of ");
+            super::put_dec(room);
+            super::put_str(b" above SP)");
+        }
+
+        // IS THE SHELL`S CANARY STILL THERE?
+        //
+        // `run_lines` plants 1024 bytes of 0x5A in its frame and checks them AFTER each statement -
+        // which is useless when the fault kills the task DURING one, because the check never runs. So
+        // "canary not reported" has never meant "canary intact"; it meant nobody looked.
+        //
+        // The kernel can look, and the answer decides the shape of the bug. A surviving 0x5A run means
+        // the damage is LOCAL to a deeper frame. No 0x5A anywhere means the overwrite swallowed
+        // `run_lines` frame as well, which - with no return address left in 35 KB of stack - would say
+        // the whole call chain has been flattened rather than one saved register pair clobbered.
+        {
+            let mut best: u64 = 0;      // longest 0x5A run found
+            let mut best_at: u64 = 0;
+            let mut cur: u64 = 0;
+            let mut coff: u64 = 0;
+            let mut covered: u64 = 0;
+            // SCAN THE WHOLE STACK, not upward from SP.
+            //
+            // Every previous scan started AT SP, which only finds the canary if SP is right. Five
+            // faults now show a return address restored from adjacent data - spaces, zeros, and once a
+            // STACK ADDRESS - at three different depths, while the shell`s own per-statement check
+            // reported the canary intact every time. If SP is wrong, the old scan was looking in the
+            // wrong place and "canary destroyed" was an artefact of the search, not a fact about the
+            // memory. Searching the whole stack tells the two apart: found means nothing was
+            // corrupted and SP is the problem; absent means the corruption is real.
+            let base: u64 = 0x7FFC_0000;   // USER_STACK_BASE (task/mod.rs: TOP - 64 pages)
+            while base + coff < 0x8000_0000 {   // WHOLE STACK, not SP upward - see the note below
+                let Some(b) = crate::arch::imp::uaccess::read_user_bytes(base + coff, BITE) else { break };
+                covered = coff + BITE as u64;   // how far this scan ACTUALLY reached
+                for k in 0..BITE {
+                    if b[k] == 0x5A {
+                        cur += 1;
+                        if cur > best { best = cur; best_at = coff + k as u64 + 1 - cur; }
+                    } else { cur = 0; }
+                }
+                coff += BITE as u64;
+            }
+            super::put_str(b"
+    shell canary (0x5A): longest run ");
+            super::put_dec(best);
+            super::put_str(b" bytes at va ");
+            super::put_hex(0x7FFC_0000 + best_at);
+            super::put_str(b" (planted: 1024); scan covered ");
+            super::put_dec(covered);
+            super::put_str(b" of 262144 bytes");
+        }
+
+        // The SECOND canary (0xC3), planted in `execute` - a frame BELOW `run_lines`, i.e. between SP
+        // and the first canary. Which of the two survives brackets where the upward write begins.
+        {
+            let mut best: u64 = 0;
+            let mut best_at: u64 = 0;
+            let mut cur: u64 = 0;
+            let mut coff: u64 = 0;
+            let mut covered: u64 = 0;
+            // SCAN THE WHOLE STACK, not upward from SP.
+            //
+            // Every previous scan started AT SP, which only finds the canary if SP is right. Five
+            // faults now show a return address restored from adjacent data - spaces, zeros, and once a
+            // STACK ADDRESS - at three different depths, while the shell`s own per-statement check
+            // reported the canary intact every time. If SP is wrong, the old scan was looking in the
+            // wrong place and "canary destroyed" was an artefact of the search, not a fact about the
+            // memory. Searching the whole stack tells the two apart: found means nothing was
+            // corrupted and SP is the problem; absent means the corruption is real.
+            let base: u64 = 0x7FFC_0000;   // USER_STACK_BASE (task/mod.rs: TOP - 64 pages)
+            while base + coff < 0x8000_0000 {   // WHOLE STACK, not SP upward - see the note below
+                let Some(b) = crate::arch::imp::uaccess::read_user_bytes(base + coff, BITE) else { break };
+                covered = coff + BITE as u64;   // how far this scan ACTUALLY reached
+                for k in 0..BITE {
+                    if b[k] == 0xC3 {
+                        cur += 1;
+                        if cur > best { best = cur; best_at = coff + k as u64 + 1 - cur; }
+                    } else { cur = 0; }
+                }
+                coff += BITE as u64;
+            }
+            super::put_str(b"
+    execute canary (0xC3): longest run ");
+            super::put_dec(best);
+            super::put_str(b" bytes at va ");
+            super::put_hex(0x7FFC_0000 + best_at);
+            super::put_str(b" (planted: 256/depth); scan covered ");
+            super::put_dec(covered);
+            super::put_str(b" of 262144 bytes");
+        }
+
+        // WHAT HAS THE KERNEL WRITTEN INTO USER MEMORY?
+        //
+        // Everything else is ruled out: the stack is fully mapped, no other task maps its frames, the
+        // shell has no `unsafe`, and safe-Rust writes are bounds-checked. The kernel writing through a
+        // user pointer is the one remaining writer that can cross those guarantees, so this reports the
+        // LARGEST such write and where it landed. A multi-kilobyte write into this stack`s range names
+        // the syscall outright; a small maximum exonerates the kernel and the bug is stranger still.
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            let n = super::uaccess::UW_MAX_LEN.load(Relaxed);
+            let d = super::uaccess::UW_MAX_DST.load(Relaxed);
+            super::put_str(b"
+    kernel->user writes: ");
+            super::put_dec(super::uaccess::UW_COUNT.load(Relaxed));
+            super::put_str(b" totalling ");
+            super::put_dec(super::uaccess::UW_TOTAL.load(Relaxed));
+            super::put_str(b" bytes; largest ");
+            super::put_dec(n);
+            super::put_str(b" bytes to ");
+            super::put_hex(d);
+            if d >= 0x7FFC_0000 && d < 0x8000_0000 {
+                super::put_str(b" - WHICH IS INSIDE A USER STACK");
+            }
+        }
+
+        // IS THIS STACK BACKED BY FRAMES A DEVICE CAN DMA INTO?
+        //
+        // The last writer left. The canary is provably present (a kernel-side read printed 64 `Z`s
+        // from it) and provably absent at fault time (a whole-stack scan covering all 262144 bytes),
+        // destroyed inside ONE statement - while the kernel's largest write into user memory is 522
+        // bytes, no other task maps these frames, and the shell contains no `unsafe`. No CPU-side
+        // writer in this system can do that.
+        //
+        // A device can. §6.4 records that this board has no IOMMU/SMMU wired up - `confine_device`
+        // returns false on aarch64 - so a driver programs its controller with PHYSICAL addresses and
+        // can write anywhere in RAM. A DMA landing on the frames behind a task's stack erases
+        // kilobytes instantly and leaves no trace in any CPU accounting, which is the exact shape of
+        // the evidence.
+        //
+        // So: translate this task's stack pages and test each against the allocator's DMA
+        // reservations. A hit is proof. A near-miss (within SLACK frames) is worth as much, because a
+        // driver overrunning its own arena is the same bug one page over.
+        if from_el0 {
+            const STACK_TOP: u64 = 0x8000_0000;
+            const STACK_PAGES: u64 = 64;
+            const SLACK: usize = 8;
+            let root: u64;
+            // SAFETY: reading TTBR0_EL1 at EL1 is a side-effect-free system-register read. It still
+            // holds the FAULTING task's root: the exception came from EL0 and nothing has switched.
+            unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) root, options(nomem, nostack)) };
+            let mut mapped = 0u64;
+            let mut hits = 0u64;
+            let mut nearest = usize::MAX;
+            let mut first_hit_pa = 0u64;
+            // ALIASING: does this task map the SAME physical frame at two different stack VAs?
+            //
+            // With a canary that cannot be optimised away, the corruption is real - and every writer
+            // is eliminated: the kernel (all user writes go through one function, largest 522 bytes),
+            // other tasks (no shared frames), DMA arenas (no overlap, none within 8 frames), and the
+            // shell's own buffers (Cap, ReportBuf, FnCapBuf all clamp and flag overflow; no `unsafe`).
+            //
+            // One mechanism survives all of that: if two stack VAs resolve to ONE frame, then the
+            // shell writing its output buffer also writes the canary - legitimately, with no overflow
+            // and no rogue writer. It would be invisible to every check above, and it would explain
+            // why the bytes found at the canary are exactly what the shell was printing.
+            let mut pas = [0u64; 64];
+            let mut alias_a = 0u64;
+            let mut alias_b = 0u64;
+            let mut alias_pa = 0u64;
+            for p in 0..STACK_PAGES {
+                let va = STACK_TOP - ((p + 1) * 4096);
+                // SAFETY: read-only descriptor walk of the faulting task's own root.
+                let Some(pa) = (unsafe { super::ptables::translate_diag(root & !0xFFF, va) }) else { continue };
+                // Duplicate-frame check, before anything else touches `pa`.
+                if alias_pa == 0 {
+                    let mut q = 0u64;
+                    while q < p {
+                        if pas[q as usize] == pa {
+                            alias_pa = pa;
+                            alias_a = STACK_TOP - ((q + 1) * 4096);
+                            alias_b = va;
+                            break;
+                        }
+                        q += 1;
+                    }
+                }
+                pas[p as usize] = pa;
+                mapped += 1;
+                let (hit, dist) = crate::memory::allocator::phys_dma_proximity(pa, SLACK);
+                if hit { hits += 1; if first_hit_pa == 0 { first_hit_pa = pa; } }
+                else if dist < nearest { nearest = dist; }
+            }
+            super::put_str(b"\r\n    stack frame aliasing: ");
+            if alias_pa != 0 {
+                super::put_str(b"YES - va ");
+                super::put_hex(alias_a);
+                super::put_str(b" and va ");
+                super::put_hex(alias_b);
+                super::put_str(b" BOTH map pa ");
+                super::put_hex(alias_pa);
+                super::put_str(b" - one write lands in two places");
+            } else {
+                super::put_str(b"none - every stack page has its own frame");
+            }
+        // WHAT REPLACED THE CANARY? Identify the writer by its FINGERPRINT, not by elimination.
+        //
+        // Six hypotheses have now died by elimination, and every one of them was about WHO could write
+        // the stack. Nobody has looked at WHAT is written there instead. The canary's address has been
+        // stable at 0x7fff7f18 across runs (the shell prints it as `canary-control at ...`), so dump
+        // that window and read it: ASCII text means a CPU writer building output; network or SCSI bytes
+        // mean DMA; zeros mean something cleared it. That is a positive identification rather than
+        // another candidate crossed off.
+        //
+        // The address is hardcoded ON PURPOSE and only for this experiment - the kernel has no channel
+        // to learn a service's local's address, and inventing one for a diagnostic would be worse than
+        // a constant that is checked against the shell's own printed value every run.
+        if from_el0 {
+            const CANARY_VA: u64 = 0x7fff_7f18;
+            super::put_str(b"\r\n    bytes AT the canary va 0x7fff7f18: ");
+            match crate::arch::imp::uaccess::read_user_bytes(CANARY_VA, 32) {
+                Some(b) => {
+                    for &x in b.iter() { super::put_hex(x as u64); super::put_str(b" "); }
+                    super::put_str(b"\r\n    as text: ");
+                    let mut txt = [0u8; 32];
+                    for (i, &x) in b.iter().enumerate() {
+                        txt[i] = if (0x20..0x7f).contains(&x) { x } else { b'.' };
+                    }
+                    super::put_str(&txt);
+                }
+                None => super::put_str(b"UNREADABLE"),
+            }
+        }
+
+            super::put_str(b"\r\n    stack vs DMA arenas: ");
+            super::put_dec(mapped);
+            super::put_str(b" pages mapped, ");
+            super::put_dec(hits);
+            super::put_str(b" INSIDE a DMA reservation");
+            if hits > 0 {
+                super::put_str(b" (first at pa ");
+                super::put_hex(first_hit_pa);
+                super::put_str(b") - A DEVICE CAN WRITE THIS STACK");
+            } else if nearest != usize::MAX {
+                super::put_str(b"; nearest arena is ");
+                super::put_dec(nearest as u64);
+                super::put_str(b" frame(s) away");
+            } else {
+                super::put_str(b"; no arena within 8 frames");
+            }
+        }
+    }
+
     if from_el0 && slot < crate::task::scheduler::MAX_TASKS {
         super::put_str(b"\r\n    EL0 fault - killing the task; the kernel and every other service continue.\r\n");
         crate::task::kill_current();

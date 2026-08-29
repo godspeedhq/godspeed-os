@@ -5,9 +5,8 @@
 mod arch;
 mod capability;
 mod clock;
-mod control;
 mod elf_flags;
-mod fbcon;
+mod bootcon;
 mod interrupt;
 mod invariants;
 mod ipc;
@@ -17,7 +16,6 @@ mod memory;
 mod smp;
 mod syscall;
 mod task;
-mod wallclock;
 
 use core::panic::PanicInfo;
 
@@ -25,6 +23,7 @@ use core::panic::PanicInfo;
 // Capability enforcement tests - Milestone 4 (synchronous, pre-scheduler).
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "kernel-selftest")]
 fn test_cap_enforcement() {
     use capability::{
         CapError, Rights, LOG_WRITE_RESOURCE,
@@ -112,6 +111,7 @@ fn test_cap_enforcement() {
 // IPC routing tests - Milestone 5 (synchronous, pre-scheduler).
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "kernel-selftest")]
 fn test_ipc_routing() {
     use ipc::endpoint::EndpointId;
     use ipc::message::IpcError;
@@ -299,9 +299,29 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
     capability::init();
     ipc::init();
 
-    // Synchronous correctness tests (§22 Tests 2 and 3).
-    test_cap_enforcement();
-    test_ipc_routing();
+    // Synchronous correctness tests (§22 Tests 2 and 3), BEHIND A FEATURE.
+    //
+    // These ran unconditionally, in every shipping kernel, and did three things a test in ring 0
+    // must never do:
+    //
+    //   - they can HALT THE MACHINE. Every branch is `panic!("cap-test: 2A FAIL ...")`, so a test
+    //     assertion takes down a production boot - the kernel panicking over its own scaffolding.
+    //   - they PERMANENTLY POLLUTE LIVE KERNEL STATE. `ResourceId(0xDEAD/0xDEAF/0xABCD)` go into the
+    //     real resource table and `EndpointId(999)`/`(998)` into the real routing table, with 999
+    //     left holding 16 queued messages forever. `NEXT_ENDPOINT_ID` starts at 100 and climbs, so a
+    //     long-lived system that allocates that far collides with a stale boot-test registration -
+    //     the reused-id hazard the scheduler has code to prevent.
+    //   - they have ALREADY COST A BUG: the `#[inline(never)]` on `log_idle_tick_config` is
+    //     load-bearing because these tests pass 4 KiB `Message`s by value in `kernel_main`'s frame,
+    //     against a 512 KiB boot stack, and the overflow was a page-fault loop at boot.
+    //
+    // §4.4 forbids developer tooling in the kernel by name. They stay available - `osdev test
+    // identity` still needs them - but a shipping boot no longer runs them.
+    #[cfg(feature = "kernel-selftest")]
+    {
+        test_cap_enforcement();
+        test_ipc_routing();
+    }
 
     // ELF-loader fuzz mode (§22 Fuzz F3): run 77 malformed-ELF inputs and halt.
     // Never reaches the normal boot path when this feature is enabled.
@@ -358,6 +378,28 @@ pub extern "C" fn ap_main(core_id: u32) -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // TAKE THE SCREEN BACK FIRST, before printing anything.
+    //
+    // If the `console` service was rendering, the framebuffer belongs to it and every kernel write to
+    // the display is a no-op (`bootcon::release`). That service is about to be halted along with every
+    // other core, so it will never draw the reason - and on a machine whose only output is a display,
+    // the panic would be invisible: a frozen screen with no explanation, which is the exact silent
+    // failure invariant 12 exists to forbid.
+    //
+    // This must come BEFORE the `kprintln` below, because that is the line it exists to make visible.
+    //
+    // It is also the whole justification for `bootcon` living in the kernel at all (CLAUDE.md 11.4
+    // amendment): a panic cannot ask a service to report it. The mechanism was written and documented
+    // and then simply never called here - the guarantee was in the constitution and absent from the
+    // code, and the first real panic on hardware showed a black screen and said nothing.
+    bootcon::reclaim_for_panic();
     kprintln!("KERNEL PANIC: {}", info);
+    // FLUSH THE CONSOLE RING BEFORE HALTING. Console writes are queued and drained by the timer tick
+    // (arm32), and after this function no tick will ever run again - so without an explicit flush the
+    // panic message, the single most important output the kernel ever produces, would sit in a buffer
+    // and never reach the wire. Blocking is correct here and nowhere else: there is nothing left to
+    // starve.
+    #[cfg(target_arch = "arm")]
+    arch::imp::tx_ring_flush_blocking();
     arch::imp::halt_all_cores();
 }

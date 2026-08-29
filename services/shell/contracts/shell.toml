@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# The user's interface, and a capability broker (Appendix B.3) - not a Unix shell: no fork, no exec, no
+# inherited descriptors. It reads the console, and either answers itself or asks a service.
+#
+# Restartable like everything else: a crash gives a fresh prompt and loses the in-flight command, not
+# the session (§6.2). Its CONSOLE_READ, SERVICE_CONTROL, REBOOT and SPAWN authority is granted by name
+# in the kernel (C4-1), so this file understates what it can do.
+name    = "shell"
+version = "0.1.0"
+
+[resources.memory]
+request = "4MiB"
+limit   = "8MiB"
+
+[capabilities]
+# `time` (clock slice 2): the wall clock is a service, so `date` and the boot floor ask it.
+ipc_send    = ["block-driver", "fs", "time", "console"]
+ipc_receive = ["shell"]
+log_write   = true
+
+[placement]
+core = 0

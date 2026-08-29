@@ -26,27 +26,28 @@ pub mod page_tables;
 pub mod meminit;
 pub mod syscall;
 pub mod video;
-pub mod fbcon;
-/// The framebuffer-console backend primitives the neutral `crate::fbcon` calls through `arch::imp`.
-/// See `crate::fbcon`'s module header for the contract each one owes.
-pub use fbcon::{fb_commit, FB_READBACK_CHEAP};
-pub mod dwc2;
-/// The shared in-kernel HID decoder, re-exported under its old name so this port's call sites are
-/// unchanged. It moved to `arch/hid.rs` when the Pi 4's xHCI became its second caller.
-pub use crate::arch::hid;
-// USB-net bridge (the mechanism the userspace ARM `nic-driver` calls): move ethernet frames to/from the
-// in-kernel CDC-ECM device. On ARM these are the real DWC2 functions; other arches stub them (net there is
-// a userspace PCIe driver, not this in-kernel USB path).
-pub use dwc2::{net_frame_tx, net_frame_rx, net_info};
+pub mod bootcon;
+/// The one primitive the kernel's boot/panic console floor (`crate::bootcon`) calls through
+/// `arch::imp`: publish a written rectangle. See `crate::bootcon`'s module header for its contract.
+pub use bootcon::fb_commit;
+// arm32 slice 5: the in-kernel HID decoder is gone with the rest of the USB stack. Keystroke decoding
+// belongs to whoever owns the keyboard, and that is the `dwc2` SERVICE now (services/dwc2/src/hid.rs).
+
+/// USB-net bridge backends, kept as STUBS that say no.
+///
+/// The syscalls above them (42-44) are shared with aarch64, whose GENET driver still uses them, so the
+/// syscalls stay and only ARM's implementation leaves. On this port the kernel no longer has a network
+/// device: `nic-driver` talks to the `dwc2` service over IPC instead (slice 4b). Answering "no device"
+/// is the truth, and a caller that ignores the answer fails loudly rather than reading stale bytes.
+pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
+pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }
+pub fn net_info() -> Option<([u8; 6], bool)> { None }
 pub mod usermode;
 pub mod loadtest;
 pub mod spawn;
 pub mod sched_demo;
-pub mod sched_user;
 pub mod sched_ipc;
-pub mod sched_spawn;
 pub mod sched_supervisor;
-pub mod sched_shell;
 
 // ============================ Boot bring-up (Raspberry Pi 2 Model B) ============================
 // BCM2836 peripheral base is 0x3F00_0000 (the BCM2835/Pi 1 was 0x2000_0000; the BCM2711/Pi 4 is
@@ -63,6 +64,110 @@ const PL011_LCRH:      *mut u32 = (PL011_BASE + 0x2C) as *mut u32;     // +0x2C 
 const PL011_CR:        *mut u32 = (PL011_BASE + 0x30) as *mut u32;     // +0x30 control
 const PL011_ECR:       *mut u32 = (PL011_BASE + 0x04) as *mut u32;     // +0x04 error clear
 const PL011_FR_TXFF:   u32 = 1 << 5;                                   // transmit FIFO full
+
+// ---- Console TX ring ------------------------------------------------------------------------------
+//
+// Writing to the UART inside a syscall is what stalls a core for ~9 ms per log line, and this port
+// cannot preempt that syscall (preempting SVC corrupts the banked SPSR/sp). So writers APPEND here and
+// return; the timer tick drains whatever the FIFO will take without waiting.
+//
+// 8 KiB, fixed: about 0.7 s of output at 115200, which covers any realistic burst, and a hard ceiling
+// readable straight off the source (§26.6.1). No allocation, no growth.
+const TX_RING_LEN: usize = 8192;
+static mut TX_RING: [u8; TX_RING_LEN] = [0; TX_RING_LEN];
+/// Producer index (bytes ever queued) and consumer index (bytes ever sent). Both free-running; the
+/// occupancy is their difference, so neither needs clamping and the wrap is arithmetic, not a branch.
+static TX_HEAD: AtomicU32 = AtomicU32::new(0);
+static TX_TAIL: AtomicU32 = AtomicU32::new(0);
+/// Bytes dropped because the ring was full. Reported rather than silently swallowed (invariant 12) -
+/// losing console output is exactly the kind of thing that must not happen quietly.
+static TX_DROPPED: AtomicU32 = AtomicU32::new(0);
+/// Until the tick is running there is nobody to drain the ring, so writes must go out synchronously.
+/// Boot output therefore behaves exactly as it always has, which also keeps a panic before the first
+/// tick readable.
+static TX_RING_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Start using the ring. Called once the timer tick is running and can drain it.
+pub fn tx_ring_enable() {
+    TX_RING_LIVE.store(true, Ordering::Release);
+}
+
+/// Queue one byte. False if the ring is full (the caller then blocks, so output is never lost
+/// silently - a dropped byte is counted and reported instead).
+fn tx_push(b: u8) -> bool {
+    let head = TX_HEAD.load(Ordering::Relaxed);
+    let tail = TX_TAIL.load(Ordering::Acquire);
+    if head.wrapping_sub(tail) as usize >= TX_RING_LEN {
+        return false;
+    }
+    // SAFETY: single logical producer region, serialised by the same best-effort serial flag that
+    // already orders every write to this UART. The index is masked into the array, so the write is
+    // always in bounds.
+    unsafe {
+        let p = core::ptr::addr_of_mut!(TX_RING) as *mut u8;
+        p.add((head as usize) & (TX_RING_LEN - 1)).write_volatile(b);
+    }
+    TX_HEAD.store(head.wrapping_add(1), Ordering::Release);
+    true
+}
+
+/// Push as many queued bytes into the TX FIFO as it will take WITHOUT WAITING. Called from the timer
+/// tick; returns having done a bounded amount of work, never blocking on the UART.
+pub fn tx_ring_drain() {
+    // SAFETY: PL011 flag and data registers, Device-mapped. Reads/writes are volatile MMIO, and the
+    // loop stops the moment the FIFO reports full - so this can never spin on a wedged UART.
+    unsafe {
+        let mut n = 0u32;
+        loop {
+            let head = TX_HEAD.load(Ordering::Acquire);
+            let tail = TX_TAIL.load(Ordering::Relaxed);
+            if head == tail {
+                return;                        // nothing queued
+            }
+            if PL011_FR.read_volatile() & PL011_FR_TXFF != 0 {
+                return;                        // FIFO full - leave the rest for the next tick
+            }
+            let p = core::ptr::addr_of!(TX_RING) as *const u8;
+            let b = p.add((tail as usize) & (TX_RING_LEN - 1)).read_volatile();
+            PL011_DR.write_volatile(b as u32);
+            TX_TAIL.store(tail.wrapping_add(1), Ordering::Release);
+            // A bound on work per tick, so a service logging in a tight loop cannot turn the tick
+            // itself into the stall this exists to remove.
+            // The bound is on WORK PER CALL, not throughput, so it has to sit above what the
+            // hardware can absorb in that time or it becomes the throttle. The FIFO is 16 bytes and
+            // drains at ~11.5 KB/s, so a few hundred is comfortably past any real burst while still
+            // being a hard stop against a service logging in a tight loop.
+            n += 1;
+            if n >= 512 {
+                return;
+            }
+        }
+    }
+}
+
+/// Drain everything, BLOCKING. For the panic path only: a panic message must reach the wire even
+/// though no tick will ever run again.
+pub fn tx_ring_flush_blocking() {
+    // SAFETY: as above, plus the bounded TXFF poll `pl011_write_byte` already uses.
+    unsafe {
+        while TX_HEAD.load(Ordering::Acquire) != TX_TAIL.load(Ordering::Relaxed) {
+            let tail = TX_TAIL.load(Ordering::Relaxed);
+            let mut t: u32 = 0;
+            while PL011_FR.read_volatile() & PL011_FR_TXFF != 0 {
+                t += 1;
+                if t > 1_000_000 { return; }   // wedged UART: give up rather than hang the panic
+            }
+            let p = core::ptr::addr_of!(TX_RING) as *const u8;
+            PL011_DR.write_volatile(p.add((tail as usize) & (TX_RING_LEN - 1)).read_volatile() as u32);
+            TX_TAIL.store(tail.wrapping_add(1), Ordering::Release);
+        }
+    }
+}
+
+/// Bytes lost to a full ring, for reporting.
+pub fn tx_dropped() -> u32 {
+    TX_DROPPED.load(Ordering::Relaxed)
+}
 const PL011_FR_BUSY:   u32 = 1 << 3;                                   // transmitting
 /// Error flags the PL011 returns **in the data register itself**, alongside the byte: framing (8),
 /// parity (9), break (10), overrun (11). A byte arriving with any of these is line noise, not data.
@@ -464,8 +569,95 @@ pub fn smp_bringup() {
             crate::kprintln!("smp: WARNING - core {} did NOT come up; continuing without it", core);
         }
     }
+    hires_timer_selftest();
+    ipi_selftest();
     // The shared sentence, so this port and every other say it identically (`smp::core`).
     crate::smp::core::report_cores_ready();
+}
+
+/// Does the microsecond one-shot fire AT ALL, and does its interrupt reach us?
+///
+/// Two different failures wear the same symptom - a sleep that returns late - and they need
+/// different fixes, so they are separated here rather than guessed at afterwards:
+///   - the COMPARE never matches: the timer hardware is not doing its job (or the emulator does not
+///     model it), and no amount of interrupt plumbing will help.
+///   - the compare matches but no INTERRUPT arrives: the hardware is fine and the routing is wrong,
+///     which is ours to fix.
+///
+/// So: arm it, poll the match bit directly, and report which of the two happened.
+fn hires_timer_selftest() {
+    const WANT_US: u32 = 1000;
+    timer::arm_oneshot_us(WANT_US);
+    let t0 = timer::systimer_lo();
+    let mut matched = false;
+    // Bounded by the COUNTER, not by a spin count - a spin count means a different duration on every
+    // machine, which is exactly the mistake this timer exists to stop making.
+    while timer::systimer_lo().wrapping_sub(t0) < WANT_US * 20 {
+        if timer::take_oneshot_match() {
+            matched = true;
+            break;
+        }
+    }
+    let elapsed = timer::systimer_lo().wrapping_sub(t0);
+    if matched {
+        crate::kprintln!(
+            "arm32: hi-res timer selftest PASS - compare 3 matched after {} us (asked {})",
+            elapsed, WANT_US);
+    } else {
+        crate::kprintln!(
+            "arm32: hi-res timer selftest FAIL - compare 3 never matched in {} us; sub-tick sleeps              will fall back to the 10 ms tick (correct, just coarse)",
+            elapsed);
+    }
+}
+
+/// Prove the cross-core doorbell actually reaches the other core.
+///
+/// `send_ipi_to_lapic` was an empty stub on this port, and nothing noticed for the port's entire
+/// life, because every service that talks to another service was pinned to core 0. A wake that goes
+/// nowhere is invisible until something depends on it, and then it presents as sluggishness rather
+/// than as a missing feature - which is how it was eventually found: an operator reporting that `ls`
+/// felt slow after services were spread across cores.
+///
+/// So this rings each AP and waits for that core's OWN handler to count it. It exercises the whole
+/// path - write-set, the target's IRQ, its dispatch, the write-high-to-clear - on the machine
+/// actually running, and reports either way.
+fn ipi_selftest() {
+    let (mut tested, mut ok) = (0u32, 0u32);
+    for core in 1..4u32 {
+        if !crate::smp::core::is_ready(core) {
+            continue;
+        }
+        tested += 1;
+        let before = irq::doorbells_received(core);
+        // SAFETY: ringing a ready core's mailbox. The write-set register is Device-mapped and the
+        // target's handler clears it; idempotent, since a doorbell already pending stays pending.
+        unsafe { boot::send_ipi_to_lapic(core, 0) };
+        // Bounded wait. A doorbell is an interrupt, so it lands in microseconds on a healthy core:
+        // generous enough that a slow core is not called broken, short enough that three dead cores
+        // cannot add a visible pause to boot.
+        let mut landed = false;
+        for _ in 0..2_000_000u32 {
+            if irq::doorbells_received(core) != before {
+                landed = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if landed {
+            ok += 1;
+        }
+    }
+    if tested == 0 {
+        crate::kprintln!("arm32: IPI selftest SKIPPED - no APs came up (nothing to wake across cores)");
+    } else if ok == tested {
+        crate::kprintln!(
+            "arm32: IPI selftest PASS ({}/{} cores took a doorbell - cross-core wakes are immediate, not tick-delayed)",
+            ok, tested);
+    } else {
+        crate::kprintln!(
+            "arm32: IPI selftest FAIL - only {}/{} cores took a doorbell; cross-core IPC waits for a 10 ms tick",
+            ok, tested);
+    }
 }
 
 /// Write one byte to the PL011, waiting for room in the transmit FIFO.
@@ -474,6 +666,31 @@ pub fn smp_bringup() {
 /// baud/line setup is needed for this milestone. We poll TXFF rather than writing blind, or a burst
 /// longer than the 16-byte FIFO would silently drop characters.
 pub(super) fn pl011_write_byte(b: u8) {
+    // QUEUE IT, once there is a tick to drain it. This is the change that stops a log line holding
+    // its core: the writer returns immediately instead of waiting ~87 us per byte for the FIFO.
+    //
+    // A full ring falls through to the blocking path below rather than dropping the line. Output that
+    // vanishes silently is worse than output that is slow, and the counter says when it happens.
+    if TX_RING_LIVE.load(Ordering::Acquire) {
+        if tx_push(b) {
+            // MOVE BYTES NOW, don't wait for the tick.
+            //
+            // Draining only from the timer tick throttled the console to about 1.6 KB/s: the drain
+            // stops the moment the TX FIFO is full, the FIFO is 16 bytes, and the tick is 100 Hz -
+            // so one FIFO-load per tick, against a line that carries 11.5 KB/s. Under storm-volume
+            // logging the ring filled, every writer fell back to the blocking path, and the machine
+            // went silent for ~15 s while the backlog trickled out. The ring made sustained output
+            // SEVEN TIMES SLOWER than the blocking writes it replaced.
+            //
+            // This still never waits: it pushes only while the FIFO reports room and returns the
+            // instant it does not. The writer therefore keeps the hardware fed at its own pace
+            // without ever blocking on it, and the tick drain remains as the path that empties the
+            // ring when nobody is writing.
+            tx_ring_drain();
+            return;
+        }
+        TX_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
     // SAFETY: PL011_FR/PL011_DR are the BCM2836 UART0 flag and data registers, identity-mapped with
     // the MMU off. Volatile MMIO: poll until the TX FIFO has room, then write one byte to transmit.
     unsafe {
@@ -522,7 +739,7 @@ const SERIAL_ACQUIRE_US: u32 = 40_000;
 /// of truth and where a captured log comes from, but they do not paint over the app's screen.
 ///
 /// Deliberately lock-free with respect to `SERIAL_BUSY`: it takes no lock and renders nothing, so it
-/// cannot corrupt fbcon's shared cursor state - the hazard the lock exists to prevent. Interleaving on
+/// cannot corrupt the floor's shared cursor state - the hazard the lock exists to prevent. Interleaving on
 /// the serial line itself is the same risk any contended writer already has.
 pub(super) fn pl011_write_no_fb(s: &[u8]) {
     for &b in s { pl011_write_byte(b); }
@@ -539,7 +756,7 @@ pub(super) fn pl011_write(s: &[u8]) {
         // messages run with the MMU off, where LDREX/STREX is UNPREDICTABLE on real silicon (see the
         // note just above). A `mirror` that locked or CAS'd here hangs the Pi on the firmware's rainbow
         // splash with no serial output at all - and QEMU, being permissive, does not reproduce it.
-        fbcon::mirror(s);
+        bootcon::mirror(s);
         return;
     }
     // Clear any stale exclusive-monitor reservation before the compare-exchange below. ARMv7 does NOT
@@ -565,14 +782,14 @@ pub(super) fn pl011_write(s: &[u8]) {
     for &b in s {
         pl011_write_byte(b);
     }
-    // Mirror to the TV ONLY as the lock HOLDER. fbcon has shared cursor/scroll state (FBCON.col/row) and
+    // Mirror to the TV ONLY as the lock HOLDER. The floor has shared cursor/scroll state and
     // assumes a single writer at a time; a contended writer that could NOT claim SERIAL_BUSY (another core
     // logging, or an ISR preempting the holder mid-render) must not also render, or two writers corrupt
-    // fbcon's position and the TV shows garbled/overlapping text. The contended write's bytes still went to
+    // its position and the TV shows garbled/overlapping text. The contended write's bytes still went to
     // serial above (the source of truth); only its TV mirror is dropped, which is invisible in practice
     // because the dominant console writer (the shell) holds the lock for its own output.
     if held {
-        fbcon::mirror(s);
+        bootcon::mirror(s);
         SERIAL_BUSY.store(false, Ordering::Release);
     }
 }
@@ -641,7 +858,7 @@ extern "C" fn arm_boot_main() -> ! {
     // on the TV (mirrored from serial). Everything logged from here on shows on the display.
     if let Some(fb) = fb {
         video::map(&fb);
-        fbcon::init(fb.base, fb.pitch, fb.width, fb.height);
+        bootcon::init(fb.base, fb.pitch, fb.width, fb.height);
         pl011_write(b"arm32: framebuffer console up - this line should appear on the TV\r\n");
     }
     // Route the SD-card pins to the Arasan EMMC (and report what the firmware left them as). After
@@ -663,21 +880,12 @@ extern "C" fn arm_boot_main() -> ! {
     loadtest::selftest();
     // USB host bring-up (DWC2): detect the controller + the attached device. Increment 1 - no transfers
     // yet. Runs before the scheduler dispatch (which never returns).
-    dwc2::init();
     #[cfg(feature = "arm-sched-demo")]
     sched_demo::run(ram_end, reserve_end);
-    #[cfg(feature = "arm-sched-user")]
-    sched_user::run(ram_end, reserve_end);
     #[cfg(feature = "arm-sched-ipc")]
     sched_ipc::run(ram_end, reserve_end);
-    #[cfg(feature = "arm-sched-spawn")]
-    sched_spawn::run(ram_end, reserve_end);
     #[cfg(feature = "arm-supervisor")]
     sched_supervisor::run(ram_end, reserve_end);
-    #[cfg(feature = "arm-shell")]
-    sched_shell::run(ram_end, reserve_end);
-    #[cfg(feature = "arm-spawn-logger")]
-    spawn::boot_service(ram_end, reserve_end);
     let _ = (ram_end, reserve_end);
     page_tables::selftest();
     #[cfg(feature = "arm-fault-test")]
@@ -752,6 +960,12 @@ pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Opt
     // `block-driver` on the Pi drives the Arasan EMMC (SD/EMMC) at peripheral + 0x30_0000.
     let (phys, pages): (u32, u32) = match name {
         "block-driver" => (PERIPHERAL_BASE as u32 + 0x30_0000, 1),
+        // The DWC2 OTG core at peripheral + 0x98_0000. ONE page covers every register the driver
+        // touches: the global block starts at 0, and the highest is host channel 15 at
+        // 0x500 + 15*0x20 = 0x6E0. The data FIFOs live at 0x1000 and beyond and are NOT mapped,
+        // because this controller is driven in DMA mode - the CPU never reads or writes a FIFO, so
+        // granting that window would hand the driver reach it has no use for.
+        "dwc2" => (PERIPHERAL_BASE as u32 + 0x98_0000, 1),
         _ => return None,
     };
     let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE
@@ -841,6 +1055,9 @@ pub fn hardware_reset() -> ! {
     // as "reboot does nothing". Every bare-metal Pi reset does this; Linux gets away without it only
     // because its own power-off path is what would have set the field.
     const PM_RSTS_PARTITION: u32 = 0xffff_faaa;
+    /// Watchdog countdown in PM ticks (~15 us each). Ten is what every bare-metal Pi reset uses; the
+    /// value never mattered here, because the old loop restarted the count before it could elapse.
+    const WDOG_TICKS: u32 = 10;
     // SAFETY: PM_RSTS/PM_WDOG/PM_RSTC are the BCM2835 power-management registers, in the already
     // Device-mapped peripheral window; volatile 32-bit writes gated by the 0x5A password - the documented
     // reset poke.
@@ -852,22 +1069,47 @@ pub fn hardware_reset() -> ! {
         let rsts_val = PM_PASSWORD | (rsts.read_volatile() & !PM_RSTS_PARTITION);
         rsts.write_volatile(rsts_val);
         let rstc_val = PM_PASSWORD | (rstc.read_volatile() & PM_RSTC_WRCFG_CLR) | PM_RSTC_WRCFG_FULL_RESET;
-        // The watchdog resets the SoC in ~10 ticks. RE-ISSUE the poke every iteration so a write that did
-        // not take (a briefly-unready PM block) is retried, rather than a bare spin waiting forever on one
-        // failed poke (kernel-audit Audit 6, N1).
+        // POKE ONCE, THEN LET THE WATCHDOG RUN OUT.
         //
-        // BOUNDED, because "this never returns" is an assumption about hardware and assumptions are what
-        // invariant 12 exists for. If the SoC has not reset after a generous window, the reset did NOT
-        // work, and the operator staring at `rebooting...` deserves to be told that rather than left to
-        // guess whether to wait or pull the plug. Then keep poking - a late reset is still a reset.
+        // This re-issued the poke on EVERY loop iteration, to retry a write that might not have taken
+        // (kernel-audit Audit 6, N1). The intent was sound and the effect was its opposite: PM_WDOG is a
+        // COUNTDOWN, and writing it RESTARTS it. Ten ticks is about 150 us; a tight spin makes millions
+        // of passes in that time, so the counter was slammed back to 10 long before it could reach 0.
+        // The hardening kept petting the dog it was waiting on to bite - so the board never reset and
+        // `reboot` had to be finished by pulling the power. Hardware said so exactly:
+        //
+        //   rebooting...
+        //   reboot: hardware reset
+        //   reset: the SoC did NOT reset - the watchdog poke had no effect.
+        //
+        // Arm it once and wait. The retry the audit asked for is still here, but at a cadence LONGER
+        // than the timeout it drives - a retry that outruns its own mechanism is not a retry.
+        wdog.write_volatile(PM_PASSWORD | WDOG_TICKS);
+        rstc.write_volatile(rstc_val);
+
+        // BOUNDED, because "this never returns" is an assumption about hardware, and assumptions are
+        // what invariant 12 exists for. If the SoC has not reset after a generous window, say so rather
+        // than leaving the operator to guess whether to wait or pull the plug.
         let mut n: u32 = 0;
+        let mut said = false;
         loop {
-            wdog.write_volatile(PM_PASSWORD | 10);
-            rstc.write_volatile(rstc_val);
             n = n.saturating_add(1);
-            if n == 2_000_000 {
-                serial_write_bytes_lockfree(b"\r\nreset: the SoC did NOT reset - the watchdog poke had no effect.\r\n");
-                serial_write_bytes_lockfree(b"reset: power-cycle the board. (still poking in case it takes late)\r\n");
+            if n % 20_000_000 == 0 {
+                if !said {
+                    said = true;
+                    serial_write_bytes_lockfree(b"
+
+reset: the SoC did NOT reset - the watchdog poke had no effect.
+
+");
+                    serial_write_bytes_lockfree(b"reset: power-cycle the board. (re-arming slowly in case it takes late)
+
+");
+                }
+                // A write that genuinely did not land gets another chance; one that did has fired long
+                // before this point.
+                wdog.write_volatile(PM_PASSWORD | WDOG_TICKS);
+                rstc.write_volatile(rstc_val);
             }
             core::hint::spin_loop();
         }
@@ -880,15 +1122,35 @@ pub fn hardware_reset() -> ! {
 /// own capability register reports this wrongly on the BCM283x, and the driver is granted only its
 /// controller's registers - it cannot ask the mailbox itself (§12.3).
 pub fn emmc_base_clock_hz() -> u32 { video::emmc_clock_hz() }
+/// The board's own MAC address, read from the VideoCore mailbox at boot. See query 23.
+pub fn board_mac_packed() -> Option<u64> {
+    video::board_mac().map(|m| {
+        (m[0] as u64) | ((m[1] as u64) << 8) | ((m[2] as u64) << 16)
+            | ((m[3] as u64) << 24) | ((m[4] as u64) << 32) | ((m[5] as u64) << 40)
+    })
+}
 
 /// USB mass-storage block device, served by the in-kernel DWC2 Bulk-Only stack (`dwc2`). Exposed to the
 /// userspace `block-driver` through the USB_DISK-gated syscalls 46-48, the same shape as the USB-net
 /// bridge: the kernel owns the controller and the transport, the driver owns the block protocol above it.
-pub fn usb_disk_sectors() -> u64 { dwc2::msc_sectors() }
-pub fn usb_disk_read(lba: u64, dst: &mut [u8]) -> bool { dwc2::msc_read_block(lba, dst) }
-pub fn usb_disk_write(lba: u64, src: &[u8]) -> bool { dwc2::msc_write_block(lba, src) }
+
+// --- The in-kernel USB stack is GONE (arm32 slice 5) ------------------------------------------------
+//
+// `arch/arm/dwc2.rs` (3,981 lines) and `arch/hid.rs` (241) are deleted. They were ring-0 code parsing
+// descriptors supplied by whatever was plugged in, and a TCB member by construction (§6.4 amendment
+// 2026-07-23). The `dwc2` SERVICE owns the controller now - hub, keyboard, mass storage and networking,
+// each verified on hardware - and reaches it through an MMIO window, a DMA arena and the USB vector
+// granted at spawn.
+//
+// These backends remain as stubs that say NO rather than vanishing, because the syscalls above them are
+// shared with other ports: `net_frame_*` still serves aarch64's GENET. On arm they now answer "no
+// device", which is the truth - the kernel no longer has one - and a client that ignores the answer
+// fails loudly rather than reading stale bytes.
+pub fn usb_disk_sectors() -> u64 { 0 }
+pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
+pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
 /// Make prior writes durable (SCSI SYNCHRONIZE CACHE) - see `dwc2::msc_sync_cache`.
-pub fn usb_disk_flush() -> bool { dwc2::msc_sync_cache() }
+pub fn usb_disk_flush() -> bool { false }
 /// Did the last USB-disk transfer fail only because the device was BUSY (NAK)? Then it is not a
 /// failure at all - the caller should re-ask, with interrupts enabled in between.
 /// Counter ticks a core may make NO forward progress before the liveness watchdog panics. Same units as
@@ -908,16 +1170,21 @@ pub fn usb_disk_flush() -> bool { dwc2::msc_sync_cache() }
 /// the 20-30 s wedges a chaos run produced. A watchdog that panics a healthy machine is worse than none,
 /// so the margin is deliberately generous; it can tighten once the ARM worst case is measured rather
 /// than reasoned about.
+/// (interrupts dispatched, last IRQ source) for `core` - what the liveness panic reports.
+pub fn core_irq_debug(core: u32) -> (u32, u32) {
+    irq::core_irq_debug(core)
+}
+
 pub fn liveness_deadline_cycles() -> u64 {
     const LIVENESS_SECS: u64 = 10;
     (timer::timer_hz() as u64).saturating_mul(LIVENESS_SECS)
 }
 
-pub fn usb_disk_busy() -> bool { dwc2::msc_last_was_busy() }
+pub fn usb_disk_busy() -> bool { false }
 /// Is there no USB disk attached at all? Answered from PRESENT state (`MSC_READY`), not from the last
 /// transfer's outcome - which is exactly why it is a separate question. See `USB_DISK_ABSENT` in the
 /// syscall dispatch for what conflating the two cost.
-pub fn usb_disk_absent() -> bool { !dwc2::msc_ready() }
+pub fn usb_disk_absent() -> bool { true }
 
 /// A hardware-random u32 from the BCM2835 SoC RNG, or None if it never produced (absent/wedged - loud, not
 /// a fallback). Ungated (InspectKernel query 19); the `random` shell utility consumes it. Best-effort under
@@ -989,7 +1256,7 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
 /// owns the display, so this text belongs on the serial console only and must NOT reach the TV.
 ///
 /// It used to be ignored, with the comment "no framebuffer on this port" - true when it was written,
-/// false since fbcon landed. So every log line from a dying or restarting service painted itself over
+/// false since the framebuffer console landed. So every log line from a dying or restarting service painted itself over
 /// whatever full-screen app was running, which is why `chaos max-carnage` never held the screen: the
 /// carnage it creates is precisely a flood of service log traffic, all of it un-gated.
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
@@ -1103,7 +1370,7 @@ static BOOT_DISMISSED: AtomicBool = AtomicBool::new(false);
 pub fn console_boot_complete() {
     if BOOT_DISMISSED.swap(true, Ordering::AcqRel) { return; }
     BOOT_LOG_TO_FB.store(false, Ordering::Release);
-    fbcon::clear_and_home();
+    bootcon::clear_and_home();
 }
 
 // PL011 receive FIFO -> a single-producer/single-consumer input ring. The producer is `pl011_rx_drain`
@@ -1355,6 +1622,21 @@ pub fn autochaos_tick() {
     pl011_write(b"\r\nautochaos: injected 'chaos max-carnage all-services 10' + confirm (hands-off demo)\r\n");
 }
 
+// The hands-off KEY STORM lived here and has been REMOVED, not pinned.
+//
+// It typed into the console ring from the timer tick so a wedge could be reproduced by booting
+// instead of by hammering a keyboard, and it did its job: the doorbell fix survived ~38,000 injected
+// characters where manual typing had wedged the machine in under a minute.
+//
+// The commandment checker then flagged it as an unpinned kernel feature, and pinning would have been
+// the wrong answer. §4.4 forbids developer tooling in the kernel by name, and a keystroke injector is
+// exactly that. The right home is userspace: any service holding CONSOLE_PUSH can do the identical
+// thing, which is precisely how `dwc2` delivers real keystrokes - so the kernel gains nothing by
+// hosting it except a responsibility no pin was watching.
+//
+// If it is wanted again it should come back as a SERVICE, which would also cover more of the path
+// than this did (it would exercise the CONSOLE_PUSH syscall, which injecting kernel-side skipped).
+
 /// Timer-tick hook: drain the RX FIFO and wake any task blocked in ConsoleRead. Runs from
 /// `timer_tick_from_irq` (core 0).
 pub fn uart_rx_poll() {
@@ -1366,7 +1648,14 @@ pub fn uart_rx_poll() {
         let mpidr: u32;
         // SAFETY: reading MPIDR (`c0, c0, 5`) is a side-effect-free PL1 register read.
         unsafe { core::arch::asm!("mrc p15, 0, {m}, c0, c0, 5", m = out(reg) mpidr, options(nomem, nostack)); }
-        if mpidr & 3 == 0 { dwc2::async_bulk_watchdog(); dwc2::poll(); dwc2::net_rx_drain_tick(); }
+        // STAND DOWN when a userspace service owns the controller (Phase 3, Slice 0).
+        //
+        // These are the in-kernel driver's periodic hooks. The controller has exactly ONE owner: two
+        // drivers programming the same channels would corrupt each other's transfers, and the failure
+        // would look like flaky hardware rather than two owners. Gating them on the same predicate the
+        // IRQ dispatch uses means ownership is decided in one place from one fact.
+        if mpidr & 3 == 0 && !irq::usb_owned_by_userspace() {
+        }
     }
     if RX_HEAD.load(Ordering::Acquire) != RX_TAIL.load(Ordering::Acquire) {
         let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
@@ -1469,7 +1758,20 @@ pub mod boot {
         unsafe { core::arch::asm!("mrc p15, 0, {m}, c0, c0, 5", m = out(reg) mpidr, options(nomem, nostack)); }
         mpidr & 3
     }
-    pub unsafe fn send_ipi_to_lapic(lapic_id: u32, vector: u8) {}
+    /// Ring another core's doorbell (BCM2836 mailbox 0).
+    ///
+    /// This was an empty stub, and the cost stayed invisible while every service sharing an IPC path
+    /// lived on core 0. The scheduler calls this to wake a task blocked on another core, so with
+    /// nothing here the target did not notice until its next 10 ms timer tick: a file read is
+    /// shell -> fs -> block-driver -> dwc2, which spread across cores is three quanta of pure latency
+    /// per operation.
+    ///
+    /// `lapic_id` IS the core index on this SoC (the neutral layer resolves it from MPIDR). The
+    /// vector is deliberately not encoded: every IPI this port sends means "there is work for you
+    /// now", and the receiver reschedules.
+    pub unsafe fn send_ipi_to_lapic(lapic_id: u32, _vector: u8) {
+        super::irq::ring_doorbell(lapic_id);
+    }
     pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {}
     pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {}
 }
@@ -1634,7 +1936,23 @@ pub mod interrupts {
         // exclusion is a PROTOCOL instead - `dwc2::hotplug_poll` takes `UsbExclusive` and every other
         // shared-selection path stands aside for the duration (storage answers BUSY and re-asks, which it
         // already knows how to do). Interrupts stay on, the tick keeps running, and nothing races.
-        super::dwc2::hotplug_poll();
+        // NOTE: handing the vector back does NOT restore USB. Reboot to get the devices back.
+        //
+        // Releasing the route on death unmasks the line, but it cannot hand back DEVICE
+        // STATE: while the service held the vector, the keyboard's completions went to a driver that
+        // ignores them, so the in-kernel driver's channel sits mid-transfer waiting on an event it
+        // never saw resolve, and the periodic hooks resume polling a channel that is already stuck.
+        //
+        // A re-init on the ownership edge was tried here and REMOVED. It never fired: this is
+        // `wait_for_interrupt`, the idle primitive, and core 0 does not reach idle in that window. The
+        // fix would be real work - somewhere that reliably runs, plus a ~600 ms bring-up that cannot
+        // happen in a tick handler - spent on a recovery path for a driver that Slice 5 deletes.
+        // Rebooting costs twenty seconds and no code. Left as a documented limitation rather than
+        // dead code implying a capability that does not exist.
+        // Both of these stand down for a userspace owner, for the reason above: one controller, one
+        // driver. `hotplug_poll` in particular takes the exclusive bulk claim and rewrites the shared
+        // device selection, which is precisely what must not happen underneath another driver.
+        if !super::irq::usb_owned_by_userspace() {
         // Watch the ethernet cable for the same reason, on the same terms. The PHY read was already
         // written and already correct - but nothing CALLED it unless a service asked (`net`, `ping`), so
         // unplugging the cable on an idle machine was silent while unplugging the keyboard was not.
@@ -1642,10 +1960,32 @@ pub mod interrupts {
         // rather than folded into `hotplug_poll` because it must run OUTSIDE that function's exclusive
         // section: it takes the same bulk claim, and nesting would make it stand aside from itself. Both
         // are individually rate-limited to ~1 s and both yield to storage, so idle stays cheap.
-        super::dwc2::link_poll();
+        }
         // SAFETY: unmasking IRQs is always valid (vectors + handlers installed); WFI then waits for one.
         unsafe { core::arch::asm!("cpsie i", "wfi", options(nomem, nostack)) }
     }
+
+/// May the idle loop MASK interrupts, re-check for runnable work, and then halt - relying on the
+/// halt to unmask and halt in one indivisible step?
+///
+/// This exists to close a lost-wakeup window, and the answer is a property of the silicon, so each
+/// arch answers for itself rather than inheriting x86's. The window: the idle loop asks `pick_next`
+/// for work, is told there is none, and halts. With interrupts ENABLED across that gap, a wake
+/// landing in it is taken and consumed BEFORE the halt - and the halt then sleeps through the very
+/// event it was told about, until the next timer tick. An idle core's tick is deliberately slowed to
+/// about a second, so the cost of losing one is about a second.
+///
+/// x86 says yes: `sti; hlt` is architecturally atomic, so masking first, re-checking, and then
+/// executing it cannot lose an interrupt raised in between - it is latched while masked and taken
+/// the instant `sti` retires.
+///
+/// ARM says NO, and this is the reason the guard is a question rather than a rule: both ARM ports do
+/// real work inside `wait_for_interrupt` (draining the UART so a keystroke can wake a blocked shell,
+/// watching hub ports so a replug is noticed) and that work REQUIRES interrupts enabled - their own
+/// comments say masking there would freeze the machine for the ~100 ms an enumeration takes. Masking
+/// them to fix an x86 race would be importing our answer into their design (26.14). They keep the
+/// narrower window; it is recorded here rather than silently left (26.7).
+    pub fn idle_mask_before_halt() -> bool { false }
 
     pub fn idle_can_halt() -> bool { true } // ARM WFI wakes on the generic-timer IRQ; halting is safe
     pub fn send_eoi() {}                    // BCM2836 timer has no separate EOI (TVAL re-arm clears it)
@@ -1734,10 +2074,31 @@ pub mod iommu {
 
 
 // ---------------------------------------------------------------------------
+/// The neutral "mask/unmask an interrupt source by vector" seam.
+///
+/// Named `ioapic` because x86 named it that; on this board it is the BCM2835 legacy interrupt
+/// controller. These were no-op stubs, which was harmless while every device interrupt was serviced
+/// inside the kernel - nothing ever needed a line held off. Routing an interrupt to USERSPACE makes
+/// them load-bearing: a level-triggered line that is not masked on delivery re-asserts the instant
+/// the handler returns, and the core makes no further progress.
 pub mod ioapic {
     pub fn init() {}
-    pub fn mask_vector(vector: u8) {}
-    pub fn unmask_vector(vector: u8) {}
+    /// Hold off the source behind `vector` until the userspace driver acknowledges its device.
+    pub fn mask_vector(vector: u8) {
+        if vector == super::irq::USB_VECTOR {
+            super::irq::mask_usb_irq();
+        }
+        // Any other vector has no arm32 source behind it yet. Silently ignoring an unknown vector is
+        // right HERE - this is the generic router asking about a line this board may simply not have
+        // - and it is not a silent failure, because a device whose IRQ is never routed never reaches
+        // this call at all.
+    }
+    /// Let the source behind `vector` fire again. Reached from the `IrqUnmask` syscall.
+    pub fn unmask_vector(vector: u8) {
+        if vector == super::irq::USB_VECTOR {
+            super::irq::unmask_usb_irq();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1749,3 +2110,10 @@ pub mod ap_boot {
 ///
 /// ARMv7 DMA is not coherent either - same reasoning as the 64-bit port.
 pub const DMA_ARENA_UNCACHED: bool = true;
+
+/// Where a driver's DMA arena is mapped in ITS address space.
+///
+/// Per-arch because it is an ADDRESS, and an address is only meaningful in an address space that can
+/// hold it. The shared constant was `0x2_0000_0000`, an x86_64 value: on ARMv7 that is above the 32-bit
+/// ceiling, and the mapper truncated it to 0, laying the arena over the kernel's low megabyte.
+pub const DRIVER_DMA_VA: u64 = 0x7000_0000;

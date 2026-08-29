@@ -25,10 +25,53 @@ def find_kernel(profile):
     return p if os.path.exists(p) else None
 
 
+def announce_kernel(path, profile):
+    """Say WHICH kernel is booting, and shout if the other profile is newer.
+
+    This default (`debug`) silently booted a stale kernel through several "verified in QEMU" runs whose
+    builds had all been `--release`. Every result was wrong in the same believable direction: the fix
+    under test appeared not to work, because the image under test predated it. Nothing was broken - the
+    runner answered a question about a different binary and said nothing about which.
+
+    A test harness that can run the wrong artifact must say which artifact it ran. Printing the profile
+    and its age costs one line; the mismatch warning costs one more and is the one that matters, because
+    the failure mode is not "no kernel" (that already errors) but "a kernel, just not yours".
+    """
+    age = time.time() - os.path.getmtime(path)
+    print("booting %s kernel (built %s ago): %s" % (profile, _ago(age), path))
+    other = "release" if profile == "debug" else "debug"
+    op = find_kernel(other)
+    if op and os.path.getmtime(op) > os.path.getmtime(path) + 1:
+        print("WARNING: the %s kernel is NEWER than the %s one you are booting (by %s)."
+              % (other, profile, _ago(os.path.getmtime(op) - os.path.getmtime(path))))
+        print("WARNING: if you just built with --%s, pass --%s here or you are testing an old binary."
+              % (other, other))
+
+
+def _ago(secs):
+    secs = int(secs)
+    if secs < 60:
+        return "%ds" % secs
+    if secs < 3600:
+        return "%dm%02ds" % (secs // 60, secs % 60)
+    return "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--secs", type=float, default=20.0)
-    ap.add_argument("--release", action="store_true")
+    # RELEASE BY DEFAULT, matching pi4_run.py. This used to default to DEBUG and merely WARN when a
+    # newer release kernel existed, and the warning was not enough: a whole debugging session was run
+    # against a SEVEN-DAY-OLD debug kernel, and the "bug" found in it was the known debug-build stack
+    # overflow (a ~503 KiB service_main frame against a 256 KiB user stack) - a bisect across two
+    # commits that booted the same stale binary both times and compared nothing.
+    #
+    # arm_build.py already refuses to build a debug image for this reason. A runner that quietly boots
+    # one anyway leaves the same trap one flag away, and the flag that avoids it is the one you forget.
+    ap.add_argument("--release", action="store_true",
+                    help="(default) boot the release kernel")
+    ap.add_argument("--debug", action="store_true",
+                    help="boot the DEBUG kernel - crash-loops fs on this port; diagnostics only")
     ap.add_argument("--usb", action="store_true")
     ap.add_argument("--usbnet", action="store_true", help="attach a CDC-ECM USB-Ethernet device (user-net)")
     ap.add_argument("--sd", default=None, help="path to a raw SD-card image to attach (if=sd)")
@@ -40,11 +83,12 @@ def main():
     ap.add_argument("--tail", type=int, default=3000)
     args = ap.parse_args()
 
-    profile = "release" if args.release else "debug"
+    profile = "debug" if args.debug else "release"
     krn = find_kernel(profile)
     if not krn:
         print("no kernel ELF - run scripts/arm_build.py first", file=sys.stderr)
         sys.exit(1)
+    announce_kernel(krn, profile)
 
     machine = "raspi2b,usb=on" if (args.usb or args.usbnet or args.usbdisk) else "raspi2b"
     cmd = [QEMU, "-M", machine, "-kernel", krn, "-serial", "stdio", "-display", "none"]

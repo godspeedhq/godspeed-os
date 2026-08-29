@@ -43,8 +43,8 @@ _                                                                   ← the edit
  ^S save   ^Q quit      Col 1   23 bytes   (buf 12/32768)           ← status bar (hints + position)
 ```
 
-The title and status bars are drawn in reverse video on a serial terminal and as plain text on
-the framebuffer console (which has no colour) - readable on both. The status bar shows the two
+The title and status bars are drawn in reverse video on both a serial terminal and the display -
+the `console` service renders `ESC[7m` as inverted cells (there is no colour, only reverse). The status bar shows the two
 essential keys, the live column, the document size, and the **edit-buffer fill** (`buf N/32768`)
 - how much you've typed since the last save (§5). When that buffer fills it flips to a loud
 `edit buffer full - save (^S) to continue` prompt. There is no absolute line number: that would

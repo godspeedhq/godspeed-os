@@ -35,6 +35,18 @@ static NAMES: SpinLock<[NameEntry; MAX_ENTRIES]> = {
     SpinLock::new([E; MAX_ENTRIES])
 };
 
+
+/// Report a stale `name -> endpoint` entry evicted by `register`. Called with the table lock RELEASED,
+/// because logging under it is what the rest of this module already avoids.
+fn report_evicted(evicted: Option<([u8; NAME_MAX], u8)>, new_name: &str, endpoint_id: EndpointId) {
+    let Some((buf, n)) = evicted else { return };
+    let stale = core::str::from_utf8(&buf[..n as usize]).unwrap_or("<invalid utf8>");
+    crate::kprintln!(
+        "ipc::names: endpoint {:?} was still mapped to '{}' when '{}' claimed it - evicted the stale          entry (its owner died without unregistering; a lookup of '{}' would have MISROUTED here)",
+        endpoint_id, stale, new_name, stale
+    );
+}
+
 /// Register or update a `name → endpoint_id` mapping.
 ///
 /// Updates an existing entry if the name is already present.
@@ -47,12 +59,41 @@ pub fn register(name: &str, endpoint_id: EndpointId) {
     let len = bytes.len() as u8;
 
     let mut names = NAMES.lock_irq();
+
+    // ONE ENDPOINT, ONE NAME. An endpoint id belongs to exactly one task (property P5), so at most
+    // one name may map to it. If a DIFFERENT name still points at the id being registered here, that
+    // entry is provably stale: the id has just been handed to `name`, so whoever held it before is
+    // gone and its unregister did not run against this id.
+    //
+    // Leaving it costs a MISROUTE, not merely a stale lookup - and a misroute the generation check
+    // cannot catch, because the cap minted from that name is fresh and its endpoint is genuinely
+    // alive. It just belongs to somebody else. That is how a 1000-round carnage run ended with `fs`
+    // sending block requests to `time`, which answered "unknown op 161"; `fs` saw a reply that did
+    // not match its tag, concluded "device I/O error", failed its re-mount and DEGRADED a filesystem
+    // whose disk was perfectly healthy.
+    //
+    // Evicting here is the fix, not a diagnostic: after this, the id resolves only to its current
+    // owner. It is still reported, because a stale entry means a death path did not complete and
+    // that is worth knowing even once it is survivable (§26.7).
+    let mut evicted: Option<([u8; NAME_MAX], u8)> = None;
+    for entry in names.iter_mut() {
+        if entry.valid
+            && entry.endpoint_id == endpoint_id
+            && !(entry.name_len == len && &entry.name[..len as usize] == bytes)
+        {
+            evicted = Some((entry.name, entry.name_len));
+            entry.valid = false;
+        }
+    }
+
     // Update existing entry.
     for entry in names.iter_mut() {
         if entry.valid && entry.name_len == len
             && &entry.name[..len as usize] == bytes
         {
             entry.endpoint_id = endpoint_id;
+            drop(names);
+            report_evicted(evicted, name, endpoint_id);
             return;
         }
     }
@@ -64,6 +105,8 @@ pub fn register(name: &str, endpoint_id: EndpointId) {
             entry.name        = [0u8; NAME_MAX];
             entry.name[..len as usize].copy_from_slice(bytes);
             entry.endpoint_id = endpoint_id;
+            drop(names);
+            report_evicted(evicted, name, endpoint_id);
             return;
         }
     }

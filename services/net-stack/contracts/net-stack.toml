@@ -11,7 +11,10 @@ limit   = "16MiB"
 # sends frames to nic-driver and reads back what arrived (request/reply, §8.2), so its authority is
 # just: log, a SEND cap to nic-driver, and its own endpoint for the reply.
 log_write   = true
-ipc_send    = ["nic-driver"]
+# `time` (clock slice 2): SNTP is a network fact this service fetches, and the `time` service decides
+# whether to believe it - plausibility, the floor, provenance. Declared here because a communication
+# path that exists in the kernel and not in the contract is what Commandment IV forbids.
+ipc_send    = ["nic-driver", "time"]
 ipc_receive = ["net-stack"]
 # net-stack mints a delegated SOCKET capability per open socket (§7.10, the same mechanism fs uses for
 # files). resource_mint is that authority; the kernel grants it from this declaration (service_hw, T1 B).
@@ -25,7 +28,27 @@ resource_mint = true
 # So on ARM the real authority of this service is the four capabilities above PLUS SET_CLOCK (set the
 # machine's time of day). Stated here so a contract reader is not misled about what net-stack can reach.
 
+# PLACEMENT IS ARCH-CONDITIONAL, so it is NOT declared here.
+#
+# On x86 and aarch64 this service sits on core 1. On arm32 it is unpinned: cross-core wakes are
+# immediate there now (the BCM2836 mailbox doorbell), and core 0 is kept clear for `dwc2`, whose
+# split transactions must hit 125 us windows.
+#
+# A `[placement] core` line here would be a SECOND copy of that decision, and it would be wrong on
+# one of the two arches whatever value it carried - the drift Commandment III forbids. The single
+# source is `ServiceConfig.preferred_core` in kernel/src/task/mod.rs, which both the boot and the
+# RESTART paths consult. The comments that used to sit here saying "the kernel overrides this to
+# core 0" were describing exactly that duplication, and are now unnecessary as well as stale.
+
 [placement]
-core = 1   # co-located with nic-driver (the two exchange frames constantly)
-# ARM (Pi 2): the kernel overrides this to core 0, co-located with nic-driver there (which must be core 0
-# for the DWC2 USB-net device), avoiding QEMU-TCG cross-core IPC latency. This x86 value stands.
+# DECLARED. The prose above argued that stating a core here would be a second copy of an
+# arch-conditional decision - and it is right that ONE number cannot be correct for both arches. But
+# saying nothing is not neutral: the kernel pins this service, the contract claims no opinion, and
+# `scripts/contract_check.py` reads that as what RUNS differing from what is DECLARED. It failed the
+# audit on exactly these three files.
+#
+# The convention the checker enforces resolves it: this line is the x86 value, which is what the
+# reconcile compares against, and the arch-conditional lives ONCE in `ServiceConfig.preferred_core`
+# (kernel/src/task/mod.rs), where arm32 puts it on core 1 beside nic-driver. The reasoning for the ARM
+# choice sits beside that code rather than being restated here, so there is still one source per fact.
+core = 1

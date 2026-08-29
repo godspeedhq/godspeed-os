@@ -44,7 +44,7 @@ resources only (gen 0 forever) - see `docs/introspection-capability.md`,
 | 6      | `alloc_mem` | implicit (own task memory)     |
 | 7      | `spawn`     | SPAWN (WRITE)                  |
 | 8      | `kill`      | SERVICE_CONTROL (WRITE) - held by shell/supervisor/probes; validated by holdings (no slot - both args carry the name). See `docs/service-control-cap.md` |
-| 13     | `inspect_kernel` | INTROSPECT (READ) for system queries 1,2,4,5,6,7,8; **none** for the ungated task-neutral reads: 0 (own alloc), 3 (TSC), 9 (fbcon geometry), 10 (input-ready), 11 (RTC), 12 (boot datetime), 13 (console-foreground-allows for the calling task) |
+| 13     | `inspect_kernel` | INTROSPECT (READ) for the system queries (1, 2, 4-8); **none** for the ungated task-neutral reads: 0 (own alloc), 3 (TSC), 10 (input-ready), 11 (RTC), 12 (boot datetime), 13 (console-foreground-allows for the calling task), and the hardware-identity reads above 13. **Query 9 (framebuffer console geometry) is DELETED** - terminal geometry belongs to the `console` service and is read over IPC via `ctx.console_dims()` (`docs/console-service.md` 9.7) |
 | 16     | `task_stat` | INTROSPECT (READ) - discloses any task's state |
 | 18     | `reboot`    | REBOOT (WRITE) - held by `shell` (its `reboot` cmd) + `xhci`/`ehci` (Ctrl+Alt+Del); validated by holdings (no args). Closes the ambient-reboot gap |
 

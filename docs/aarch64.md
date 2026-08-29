@@ -1,6 +1,13 @@
 # AArch64 Port (Raspberry Pi 4) - Design and Plan
 
-> **Status:** design, not built. Non-normative until the constitution is amended (see
+> **Status: BUILT and running on hardware** (this line said "design, not built" until 2026-08-25).
+> The Pi 4 boots the arch-neutral kernel, the supervisor spawns services, USB is a userspace `xhci`
+> service driving keyboard and mass storage, and GENET ethernet transmits and receives - all recorded
+> in `CLAUDE.md`'s amendments and in `docs/multi-arch.md`. Audit 4 flagged this same line as stale on
+> 2026-08-12 (finding A4-9) and it was recorded rather than closed; closing it now.
+>
+> What is still design rather than built is called out per-section below; the *port* is not.
+> Non-normative until the constitution is amended (see
 > "Constitution amendments needed" below). Target board: **Raspberry Pi 4 Model B, 4 GB, run in
 > AArch64 (64-bit).** This doc captures the bring-up plan and, more importantly, the *measured*
 > arch-boundary punch-list that makes the port bounded work rather than a guess.
@@ -675,7 +682,10 @@ genuine simplification the survey surfaced (§26.13).
   **the Pi has no battery-backed RTC.** These degrade to "no wall clock" (date/uptime lose their RTC
   source; uptime can move to the generic timer, wall-clock date needs NTP or a DS3231 add-on later).
   A real, board-level gap to design for - not a blocker for the identity suite.
-- `fb::dims_packed` -> Limine framebuffer vs the Pi VideoCore mailbox framebuffer.
+- `fb_commit` + a `bootcon::init(FbParams{..})` (the framebuffer slice, its PHYSICAL base for the
+  `console` service's grant, geometry, channel shifts) -> Limine framebuffer vs the Pi VideoCore mailbox
+  framebuffer. (`fb::dims_packed` is gone: terminal geometry belongs to the `console` service, not the
+  kernel - `docs/console-service.md` 9.7.)
 
 **Scoping takeaway:** the true per-arch reimplementation (bucket A) is ~40 symbols in the well-known
 categories above; ~15 (bucket B) are a one-time neutral relocation that helps every arch; and bucket C
@@ -692,7 +702,7 @@ is stub-or-defer. That is the real size of "supporting the architecture."
 >   `main.rs`) moved behind `arch::imp` primitives - `read/write_page_table_base` (CR3), `invalidate_tlb_page`
 >   (invlpg), `local_irq_save/restore` (pushfq;cli/sti), `switch_to_boot_stack` (rsp), plus the existing
 >   `enable/disable_interrupts`. The `unsafe` asm consolidated into the permitted arch layer
->   (docs/unsafe-audit.md); the host lib gets a no-op `arch::imp` stub (lib.rs). Identity 24/0.
+>   (audits/unsafe-audit.md); the host lib gets a no-op `arch::imp` stub (lib.rs). Identity 24/0.
 > - **Enforcement:** `scripts/arch_boundary_check.py` (CI-wired, alongside `unsafe_check`/`contract_check`)
 >   FAILS on any `asm!`/`naked_asm!`, any named-arch reference (`arch::x86_64::` etc.), OR any
 >   `core::arch::<arch>::` intrinsic (e.g. `__cpuid`) outside `kernel/src/arch/`. So the demarcation

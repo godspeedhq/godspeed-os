@@ -190,6 +190,14 @@ impl SliceAlloc {
 
 /// Free a slot back to the controller (Disable Slot) for a probed device we do not keep - a non-HID
 /// downstream device - so controller slots do not leak across a hot-plug re-scan.
+///
+/// The completion is CHECKED, because this is the release half of a bounded resource. The controller
+/// has `max_slots` of them (`HCSPARAMS1`, typically 32 or 64) and a hot-plug re-scan runs this on
+/// every downstream device it probes and declines. A Disable Slot that silently failed would leak one
+/// slot per pass until Enable Slot started refusing - and the refusal surfaces far away, as "Address
+/// Device FAILED (route/TT)", which blames the topology for what is actually an exhausted pool. So a
+/// failure is named HERE, at the leak, rather than left to be misread THERE, at the symptom (§26.7:
+/// a recovery that itself fails is still a failure, and must stay as visible as the original).
 #[allow(clippy::too_many_arguments)]
 fn disable_slot(
     ctx: &ServiceContext,
@@ -204,7 +212,7 @@ fn disable_slot(
 ) {
     let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
     *cmd_idx += 1;
-    let _ = run_command(
+    let done = run_command(
         ctx,
         dma,
         mmio,
@@ -218,6 +226,17 @@ fn disable_slot(
         ev_idx,
         ev_cycle,
     );
+    match done {
+        Some((1, _)) => {}
+        Some((cc, _)) => ctx.log_fmt(format_args!(
+            "xhci: Disable Slot {} REFUSED (completion={}) - that controller slot is now leaked",
+            slot, cc
+        )),
+        None => ctx.log_fmt(format_args!(
+            "xhci: Disable Slot {} never completed - that controller slot is now leaked",
+            slot
+        )),
+    }
 }
 
 /// Decode ONE completed HID report for device `d` and push it to the console.
@@ -432,6 +451,12 @@ const TRB_DISABLE_SLOT: u32 = 10;
 /// endpoint, so every port's probe fails together - which makes any of them evidence, and makes the
 /// count meaningful only when unbroken (a single success resets it).
 static PROBE_FAILS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Whether the fixed explanatory command-failure hint has already been said. See its use in
+/// `hc_wedged_now`: the sentence is the same every time, so repeating it is serial bandwidth the
+/// keystroke echo has to wait behind. Owned by this service, like `PROBE_FAILS` above.
+static DIAG_HINT_SAID: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 const TRB_RESET_ENDPOINT: u32 = 14;
 /// Set TR Dequeue Pointer (xHCI 4.6.10) - tells the controller where to resume on that endpoint.
 /// Stop Endpoint (xHCI 4.6.9) - moves a RUNNING endpoint to Stopped, which is the state Set TR
@@ -1215,6 +1240,22 @@ fn address_downstream(
         ev_cycle,
     )?;
     if comp != 1 {
+        // Name the RESOURCE failure here. The caller's only report is "Address Device FAILED
+        // (route/TT)", which points at the route string and the transaction translator - the two
+        // genuinely hard things to get right, and so the two a reader will go and re-derive. But
+        // Enable Slot runs BEFORE either is used: completion 9 is No Slots Available, and the honest
+        // reading of it is "the controller has no slot left", usually because a Disable Slot failed
+        // and leaked them. Report the layer that actually refused, not the one that looks guilty.
+        ctx.log_fmt(format_args!(
+            "xhci: Enable Slot REFUSED (completion={}) for the device on hub port {} - {}",
+            comp,
+            parent_port,
+            if comp == 9 {
+                "controller has NO SLOTS LEFT (see any leaked-slot lines above); NOT a route/TT fault"
+            } else {
+                "the controller rejected the request; NOT a route/TT fault"
+            }
+        ));
         return None;
     }
     // Input context: Add slot + EP0.
@@ -1675,6 +1716,14 @@ fn serve_if_block(
     // meant the endpoint was never queued again and the keyboard was gone for good - not a lost
     // report, a lost DEVICE.
     eaten: &mut EvMail,
+    // Block requests dropped for arriving with no reply cap. OWNED by the caller's loop and passed in
+    // rather than kept in a module-level `static`, which is the anonymous singleton Invariant 9 and
+    // Commandment VI forbid. The excuse for the static - that the counter it replaced was already a
+    // function-local one - is not an excuse: a `static` in a service is unowned state whichever scope
+    // it hides in. The main loop already owns `passes`, `msi_count` and the rest as plain locals above
+    // `'reenum`; this belongs with them, and now the code that REPORTS it and the code that
+    // INCREMENTS it are looking at one variable rather than two views of a hidden one.
+    no_cap: &mut u64,
     // `false` = the disk stopped answering a DATA operation, so the caller should drop it and
     // re-scan. Returning this rather than swallowing it is what turns an unplugged stick from "the
     // machine hangs" into "the disk went away".
@@ -1684,15 +1733,12 @@ fn serve_if_block(
     // it was never reached, and the two ways that can happen need different fixes: the poll loop is
     // not running (no message ever arrives here), or a message arrives WITHOUT a reply cap and this
     // function returns silently. Guessing between them has already cost two boots.
-    // An ATOMIC, not a `static mut`. The first draft of this counter used `static mut` + `unsafe`,
-    // and `scripts/unsafe_check.py` rejected it on the spot - correctly: §18.2 forbids `unsafe` in a
-    // service outright, and "it is only a diagnostic" is exactly the reasoning the rule exists to
-    // refuse. A relaxed atomic costs nothing and needs no exemption.
-    static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    // Counted but not read: the arrival trace it fed was removed (f67f5c15) and the no-reply-cap
-    // warning now has its own counter. Kept because the count itself is the cheap part and a future
-    // diagnostic will want it; named `_n` so the compiler does not have to warn about our intent.
-    let _n = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    // `SEEN` lived here: an atomic counter incremented into `let _n = ...` and read by nothing, kept
+    // on the grounds that a future diagnostic might want it. Both halves of that are wrong under the
+    // constitution - it is unowned state in a service (Invariant 9 / Commandment VI), and it is a
+    // feature held open for a hypothetical caller, which §26.2 answers with "not implemented; will be
+    // implemented when a test requires it". Deleted. The count is trivially recoverable if something
+    // ever does need it, and `msg_count` in the main loop already owns the arrival tally.
     // The "block-path message #N arrived" trace is GONE, and the refusal below now speaks ONCE.
     //
     // Both were bounded per instance (`n <= 8`), which looked fine and was not: a 10-hour soak logged
@@ -1704,14 +1750,49 @@ fn serve_if_block(
     // hardware testing. The refusal is worth keeping - a request with no reply cap leaves its caller
     // waiting - but once per instance says everything a hundred repeats do, and this is the loop that
     // also polls the keyboard.
+    // Is this OURS? Every block request carries an opcode in `1..=5` as its first byte, and arrives
+    // through the SDK's `request_with_reply`, which always embeds a reply cap. Anything else that
+    // wakes this service - a `chaos` flood, a stray notification - is a plain `send` with no cap and
+    // no opcode, and is simply not addressed to this path.
+    //
+    // The check used to be absent, and this function ran on EVERY message. So all that unrelated
+    // traffic reached the branch below and was reported as "block request had NO reply cap - dropping
+    // it (the caller will block)": three claims, none of them true of a flood packet. A 50-round
+    // carnage run put the count at 697. That number is not the failure it names - and worse, a real
+    // one would have been a single line among those hundreds.
+    //
+    // With the guard in place the next run answered what the real ones are: 11 events, every one an
+    // OP_READ_BLOCK, and every one within a millisecond of a `kill_task` line (the outlier landed
+    // inside a supervisor mass-respawn). So the caller DIED between sending and being served, the
+    // kernel reclaimed its caps - the reply cap among them - and this dequeued an orphan. Dropping it
+    // is not damage control, it is the only correct action: there is no longer anybody to reply to.
+    // The line said "its caller is stranded in `call` with no reply coming", which was wrong in the
+    // same way the pre-guard version was, one level down. Nobody is waiting.
+    //
+    // So the opcode is checked FIRST, and the loud line below now means only what it says. Same rule
+    // as naming the layer that refused instead of the one that looks guilty: a diagnostic that fires
+    // on the wrong population is not a small inaccuracy, it is the thing that hides the real one.
+    // Listed by NAME rather than as a numeric range: a range over two constants quietly excludes any
+    // opcode added later, and the cost of that is this whole bug back again. A new op has to be added
+    // here, which is a decision someone makes rather than one the ordering makes for them.
+    let op = msg.payload_bytes().first().copied().unwrap_or(0);
+    let is_block_op = matches!(
+        op,
+        msc::OP_READ_BLOCK | msc::OP_WRITE_BLOCK | msc::OP_CAPACITY | msc::OP_WRITE_ZEROS | msc::OP_FLUSH
+    );
+    if !is_block_op {
+        return true; // not a block request; the disk is unaffected
+    }
     let Some(reply) = ctx.take_pending_cap() else {
         // Counted SEPARATELY from `n`, which counts every block-path message. Gating on `n == 1`
         // could only ever fire if the very FIRST message a fresh instance saw was the malformed one -
         // a guard whose trigger cannot occur in the failing case, which is the eighth instance of that
         // shape this cycle and one I introduced while fixing the log spam an hour earlier.
-        static NO_CAP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        if NO_CAP.fetch_add(1, core::sync::atomic::Ordering::Relaxed) == 0 {
-            ctx.log("xhci: block request had NO reply cap - dropping it (the caller will block; further occurrences silent)");
+        let first = *no_cap == 0;
+        *no_cap += 1;
+        if first {
+            ctx.log_fmt(format_args!(
+                "xhci: block request (op {}) arrived with NO reply cap - dropping it; its caller died between sending and being served, so there is nobody left to reply to", op))
         }
         return true;
     };
@@ -2042,7 +2123,16 @@ fn dump_ring_state(
 fn hc_wedged_now(ctx: &ServiceContext, mmio: &Mmio, op: usize) -> bool {
     let sts = mmio.read32(op + OP_USBSTS);
     let wedged = sts & STS_WEDGED != 0;
-    ctx.log_fmt(format_args!("xhci: {}", DIAG_HINT));
+    // ONCE. This is 200 characters of FIXED explanatory text - it says what the numbers below mean,
+    // and it means the same thing every time. It was printed on all 42 command failures in one Wyse
+    // boot, roughly 8 KB of serial for one sentence's worth of information. The keystroke echo does a
+    // synchronous polled UART write, so every repetition is time the keyboard spends waiting.
+    //
+    // The USBSTS line below is NOT gated: it carries the actual per-failure state, which differs.
+    // Bounding the explanation is not hiding the failure (26.7) - each failure still reports itself.
+    if !DIAG_HINT_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        ctx.log_fmt(format_args!("xhci: {}", DIAG_HINT));
+    }
     ctx.log_fmt(format_args!(
         "xhci: post-command USBSTS={:#010x} (HCH={} HSE={} HCE={} CNR={}){}",
         sts,
@@ -2125,8 +2215,17 @@ fn enumerate_one(
     ev_cycle: &mut u32,
     cmd_idx: &mut usize,
     hc_wedged: &mut bool,
+    // Whether the one-shot ring-state dump has already been printed. See its declaration, above
+    // `'reenum` - a latch reset by the re-enumeration it reports is not a latch.
+    diag_dumped: &mut bool,
+    // Set when this port could not be enumerated (Enable Slot or Address Device failed) WITHOUT the
+    // host controller wedging. Distinct from `hc_wedged` on purpose: a wedge is catastrophic and
+    // poisons the port at once, while this is a port that simply will not come up - which must still
+    // be BOUNDED, because retrying it forever is what produces the ~1 s re-enumeration every ~12 s.
+    enum_failed: &mut bool,
 ) {
     *hc_wedged = false;
+    *enum_failed = false;
     let portsc_off = op + OP_PORTSC_BASE + (port as usize - 1) * 0x10;
     let psc = mmio.read32(portsc_off);
     if psc & PORT_CCS == 0 {
@@ -2190,15 +2289,20 @@ fn enumerate_one(
         Some(r) => r,
         None => {
             ctx.log("xhci: Enable Slot - no completion");
+            *enum_failed = true;
             // The FIRST command on a fresh controller. If this one gets no completion, nothing about
             // the DMA side has ever been proven, so dump it rather than guess (see `dump_ring_state`).
-            dump_ring_state(ctx, dma, mmio, op, ir0, cmd_off, *ev_idx, *ev_cycle);
+            if !*diag_dumped {
+                *diag_dumped = true;
+                dump_ring_state(ctx, dma, mmio, op, ir0, cmd_off, *ev_idx, *ev_cycle);
+            }
             *hc_wedged = hc_wedged_now(ctx, mmio, op);
             sa.free(dev_idx);
             return;
         }
     };
     if comp != 1 {
+        *enum_failed = true;
         ctx.log_fmt(format_args!(
             "xhci: Enable Slot failed (completion={})",
             comp
@@ -2244,6 +2348,7 @@ fn enumerate_one(
         Some(r) => r,
         None => {
             ctx.log("xhci: Address Device - no completion");
+            *enum_failed = true;
             let wedged = hc_wedged_now(ctx, mmio, op);
             sa.free(dev_idx);
             // Only try to disable the slot if the HC is still executing; on a wedged HC the command
@@ -2256,6 +2361,7 @@ fn enumerate_one(
         }
     };
     if comp != 1 {
+        *enum_failed = true;
         ctx.log_fmt(format_args!(
             "xhci: Address Device failed (completion={})",
             comp
@@ -2898,6 +3004,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // an already-bound keyboard nor livelock the re-init. One bit per root port (max_ports <= 63 on real
     // HW; a port >= 64 simply is not poison-tracked, never poison-halted).
     let mut poisoned: u64 = 0;
+    // Attempts a root port gets to enumerate before it is poisoned, spent WITHIN one pass.
+    //
+    // `poisoned` above only arms when a port WEDGES the host controller. A port that merely refuses
+    // to enumerate - Address Device returning no completion, which is what the Wyse's SuperSpeed
+    // ports 6/10/15 do - was retried on every pass, forever. Measured on hardware: a ~1 s pass every
+    // ~12 s, and the driver does not poll the keyboard during one. That is an unbounded retry (26.6),
+    // felt as a keyboard that stalls about once every twelve seconds.
+    //
+    // Three attempts, not one: a device still settling after a plug can legitimately fail once, and a
+    // port poisoned on a transient would never come up. The poison is cleared when the port goes
+    // empty, so a replug always gets a clean slate.
+    const PORT_FAIL_LIMIT: u8 = 3;
     // Consecutive probes reporting the disk's port absent or unreachable. ABOVE the enumeration loop
     // on purpose: it was declared inside it and therefore reset to zero on EVERY pass, so it could
     // only reach its threshold if twenty probes ran with no re-enumeration in between. Anything that
@@ -2920,6 +3038,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // "are we using interrupts?" is answered by a number instead of by a log line that could not tell.
     let mut msi_count: u64 = 0;
     let mut msg_count: u64 = 0;
+    // Block requests dropped for arriving with no reply cap. Here, with the other heartbeat counters
+    // and ABOVE `'reenum`, for the same reason they are: a re-enumeration must not reset it. Owned by
+    // this loop and lent to `serve_if_block`, which is what a service's state looks like when it is
+    // not a `static` (Invariant 9).
+    let mut no_cap_drops: u64 = 0;
     let mut work_cycles: u64 = 0;
     let mut work_t0: u64 = 0;
     // Where the per-pass time actually goes, split three ways: serving (block requests + HID
@@ -2982,6 +3105,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // reach two, which is the exact fault `hub_tried` had.
     let mut hub_seen: [u8; 64] = [0; 64];
     let mut hub_tried: u64 = 0;
+    // Ring-state dump: ONCE per driver lifetime, and ABOVE `'reenum` for the same reason every
+    // other latch here is - a latch reset by the re-enumeration it reports is not a latch.
+    //
+    // The dump exists to tell three causes of a "no completion" apart on a FRESH controller, and
+    // one dump answers that. It was firing on every failure instead: on the Wyse, ports 6/10/15
+    // report connected at SuperSpeed and never address, so each pass printed the ~200-character
+    // diagnosis several times over. Measured during interactive typing, `xhci` was 61% of ALL
+    // serial traffic - and the keystroke echo does a SYNCHRONOUS polled UART write, so it stalls
+    // behind every one of those lines. The failure itself is still reported loudly every time;
+    // only the fixed explanatory dump is said once (26.7 - visible failure, bounded output).
+    let mut diag_dumped = false;
     let mut hub_posted: u64 = 0;
     let mut hub_ok: u64 = 0;
     let mut hub_late: u64 = 0;
@@ -3136,6 +3270,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // controller no longer has.
         let mut disk: Option<msc::Disk> = None;
         let mut hc_wedged = false;
+        let mut enum_failed = false;
         // TWO SWEEPS: every USB2 root port first, then every USB3 (SuperSpeed) one.
         //
         // USB3 ports used to be skipped outright. That was right while this driver only bound boot
@@ -3187,7 +3322,44 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     &mut ev_cycle,
                     &mut cmd_idx,
                     &mut hc_wedged,
+                    &mut diag_dumped,
+                    &mut enum_failed,
                 );
+                // BOUND THE RETRY, AND SPEND THE ATTEMPTS IN THIS PASS.
+                //
+                // A port that will not enumerate is skipped after three attempts - loudly, and once -
+                // until it is unplugged and replugged, which clears the poison.
+                //
+                // They used to accumulate ACROSS passes, so a port that never comes up took three
+                // re-enumerations to poison - and each re-enumeration is a ~1 s window in which the
+                // keyboard is not polled. On the Wyse that is four stalls in the first forty seconds
+                // of every boot, reported as "the keyboard stops for a split second". The port was
+                // never going to work; the ARMING COST was the bug.
+                //
+                // Retrying here poisons it inside the first pass, so a boot pays one stall instead of
+                // four. The trade is real and worth stating: a cross-pass retry gave a slow device
+                // ~12 s of extra settling and these attempts are back-to-back. Acceptable because the
+                // port reset and its settle delay already happened inside `enumerate_one`, and
+                // because the poison CLEARS on unplug - so the worst case for a device wrongly
+                // skipped is one replug, weighed against three seconds of dead keyboard every boot.
+                if p < 64 && enum_failed {
+                    let mut strikes = 1u8;
+                    while strikes < PORT_FAIL_LIMIT && !hc_wedged {
+                        enumerate_one(
+                            &ctx, &dma, &mmio, dboff, ir0, op, ctx_size, p, &mut sa, &mut devs,
+                            &mut ndev, &mut saw_hub, &mut disk, &mut ev_idx, &mut ev_cycle,
+                            &mut cmd_idx, &mut hc_wedged, &mut diag_dumped, &mut enum_failed,
+                        );
+                        if !enum_failed { break; }
+                        strikes += 1;
+                    }
+                    if enum_failed {
+                        poisoned |= 1u64 << p;
+                        ctx.log_fmt(format_args!(
+                            "xhci: port {} failed to enumerate {} times in one pass - SKIPPING it until it is replugged (each retry costs a ~1 s pass in which the keyboard is not polled)",
+                            p, strikes));
+                    }
+                }
                 if hc_wedged {
                     ctx.log_fmt(format_args!(
                     "xhci: port {} wedged the HC - poisoning it and re-initialising the controller", p
@@ -3768,7 +3940,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if woke.is_some() { quiet_waits = 0; } else { quiet_waits = quiet_waits.saturating_add(1); }
             if is_irq { irq_seen = true; }
             if let Some(m) = woke {
-                if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten) {
+                if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops) {
                     ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
                     notify(&ctx, "storage disconnected (xhci)");
                     disk = None;
@@ -3820,7 +3992,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             while served < 1 {
                 let Some(m) = ctx.try_recv() else { break };
                 served += 1;
-                disk_alive &= serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten);
+                disk_alive &= serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops);
             }
             if !disk_alive {
                 ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
@@ -3939,7 +4111,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // next step is comparing CNTPCT deltas against BSP tick counts - two independent
                 // clocks. Either way the log answers it without a rebuild.
                 ctx.log_fmt(format_args!(
-                    "xhci: alive - t={}s, {} passes ({} fast/{} idle), work {}ms (serve {} drain {} hub {}), probes {}/{} ok {} late, {} MSI, {} msg, {} HID, disk {}",
+                    "xhci: alive - t={}s, {} passes ({} fast/{} idle), work {}ms (serve {} drain {} hub {}), probes {}/{} ok {} late, {} MSI, {} msg, {} HID, disk {}, {} dropped (no reply cap)",
                     ctx.epoch_secs_monotonic(), passes, fast_waits, idle_waits,
                     work_cycles / ctx.duration_cycles(1).max(1),
                     seg_serve / ctx.duration_cycles(1).max(1),
@@ -3947,7 +4119,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     seg_hub   / ctx.duration_cycles(1).max(1),
                     hub_ok, hub_posted, hub_late,
                     msi_count, msg_count, ndev,
-                    if disk.is_some() { "yes" } else { "no" }));
+                    if disk.is_some() { "yes" } else { "no" },
+                    no_cap_drops));
             }
             let hub_due =
                 ctx.read_tsc().wrapping_sub(last_hub_poll) > ctx.duration_cycles(HUB_POLL_MS);
@@ -4506,6 +4679,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                     if !c {
                         present &= !(1 << p);
+                        // The port is empty, so whatever refused to enumerate on it is gone. Clear
+                        // its poison: the bound exists to stop retrying a device that will not come
+                        // up, not to condemn the SOCKET. A replug must always get a clean slate, or
+                        // the bound becomes a permanent dead port.
+                        if p < 64 {
+                            poisoned &= !(1u64 << p);
+                        }
                     }
                 }
             }

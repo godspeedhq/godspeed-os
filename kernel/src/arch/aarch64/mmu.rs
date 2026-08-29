@@ -112,13 +112,19 @@ const DESC_UXN: u64 = 1 << 54; // never execute at EL0
 /// `MAIR_EL1` attribute slots, referenced by a descriptor's `AttrIndx` field.
 const MAIR_IDX_DEVICE: u64 = 0;
 const MAIR_IDX_NORMAL: u64 = 1;
+/// Normal **Non-cacheable**. Distinct from Device: it still gathers, buffers and reorders writes,
+/// which is what a framebuffer wants. Mapping one as Device-nGnRnE makes every 4-byte pixel an
+/// individually-acknowledged bus transaction - measured at 582 ms for a single 1920x1080 repaint
+/// (about 14 MB/s), which is the slow, jittery rendering reported from the television.
+pub(crate) const MAIR_IDX_NORMAL_NC: u64 = 2;
 #[inline]
 const fn attr_idx(i: u64) -> u64 {
     i << 2
 }
 
-/// `MAIR_EL1`: slot 0 = Device-nGnRnE (0x00), slot 1 = Normal write-back read/write-allocate (0xFF).
-const MAIR_VALUE: u64 = 0x00 | (0xFF << 8);
+/// `MAIR_EL1`: slot 0 = Device-nGnRnE (0x00), slot 1 = Normal write-back read/write-allocate (0xFF),
+/// slot 2 = Normal Non-cacheable (0x44) - the framebuffer's type, see [`MAIR_IDX_NORMAL_NC`].
+const MAIR_VALUE: u64 = 0x00 | (0xFF << 8) | (0x44 << 16);
 
 /// Page tables. `.bss`, 4 KiB aligned as the architecture requires for a table base.
 #[repr(C, align(4096))]

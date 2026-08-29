@@ -155,13 +155,9 @@ pub mod boot {
 /// timer runs its syscalls atomically. Nothing to do on this stub yet.
 pub fn note_user_task(_slot: usize) {}
 
-// --- Framebuffer console backend (`crate::fbcon`) ---
-// The neutral console owes each arch two items (see `crate::fbcon`'s module header). No framebuffer is
+// --- Boot/panic console floor backend (`crate::bootcon`) ---
+// The kernel's boot/panic floor owes each arch one item (see `crate::bootcon`). No framebuffer is
 // mapped on this stub, so the console never initialises and every entry point no-ops.
-
-/// `false` selects the repaint-from-shadow-grid scroll, which never reads the framebuffer back - the
-/// conservative choice while no framebuffer exists.
-pub const FB_READBACK_CHEAP: bool = false;
 
 /// Publish a written rectangle. Nothing to publish yet.
 pub fn fb_commit(
@@ -199,6 +195,11 @@ pub mod page_tables {
             const USER     = 1 << 2;
             const PWT      = 1 << 3;
             const PCD      = 1 << 4;
+            // A framebuffer, not device registers: RAM the display controller scans out. Each arch
+            // picks the weakest type that is still coherent without cache maintenance - on AArch64
+            // Normal Non-cacheable, which gathers and buffers writes where Device-nGnRnE cannot. An
+            // arch that has nothing better may ignore it and keep its uncached-MMIO type.
+            const WRITE_COMBINE = 1 << 5;
             const NO_EXEC  = 1 << 63;
         }
     }
@@ -257,6 +258,28 @@ pub mod interrupts {
     pub fn local_irq_save() -> bool { false }                // mrs DAIF
     pub fn local_irq_restore(was_enabled: bool) {}
     pub fn wait_for_interrupt() {}                           // wfi
+/// May the idle loop MASK interrupts, re-check for runnable work, and then halt - relying on the
+/// halt to unmask and halt in one indivisible step?
+///
+/// This exists to close a lost-wakeup window, and the answer is a property of the silicon, so each
+/// arch answers for itself rather than inheriting x86's. The window: the idle loop asks `pick_next`
+/// for work, is told there is none, and halts. With interrupts ENABLED across that gap, a wake
+/// landing in it is taken and consumed BEFORE the halt - and the halt then sleeps through the very
+/// event it was told about, until the next timer tick. An idle core's tick is deliberately slowed to
+/// about a second, so the cost of losing one is about a second.
+///
+/// x86 says yes: `sti; hlt` is architecturally atomic, so masking first, re-checking, and then
+/// executing it cannot lose an interrupt raised in between - it is latched while masked and taken
+/// the instant `sti` retires.
+///
+/// ARM says NO, and this is the reason the guard is a question rather than a rule: both ARM ports do
+/// real work inside `wait_for_interrupt` (draining the UART so a keystroke can wake a blocked shell,
+/// watching hub ports so a replug is noticed) and that work REQUIRES interrupts enabled - their own
+/// comments say masking there would freeze the machine for the ~100 ms an enumeration takes. Masking
+/// them to fix an x86 race would be importing our answer into their design (26.14). They keep the
+/// narrower window; it is recorded here rather than silently left (26.7).
+    pub fn idle_mask_before_halt() -> bool { false }
+
     pub fn idle_can_halt() -> bool { false }
     pub fn send_eoi() {}                                     // GIC EOIR
     pub fn fire_test_irq(irq: u8) {}
@@ -333,11 +356,6 @@ pub mod iommu {
 }
 
 // ---------------------------------------------------------------------------
-pub mod fb {
-    pub fn dims_packed() -> u64 { 0 }
-}
-
-// ---------------------------------------------------------------------------
 pub mod ioapic {
     pub fn init() {}
     pub fn mask_vector(vector: u8) {}
@@ -355,6 +373,8 @@ pub mod ap_boot {
 // the gap went unnoticed (CI builds x86_64 only, and the arch-boundary check tests for named-arch
 // references, not surface completeness).
 pub fn emmc_base_clock_hz() -> u32 { 0 }
+/// No board mailbox on this architecture: the driver uses whatever the chip holds. See query 23.
+pub fn board_mac_packed() -> Option<u64> { None }
 pub fn usb_disk_sectors() -> u64 { 0 }
 pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
 pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }

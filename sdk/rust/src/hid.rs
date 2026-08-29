@@ -205,6 +205,16 @@ impl KeyRepeat {
         self.key != 0
     }
 
+    /// Stop repeating, from OUTSIDE a decode.
+    ///
+    /// A driver needs this when it can no longer vouch for the hold. A boot keyboard reports only on
+    /// CHANGE, so if a release report is lost - the transaction translator discards it once its frame
+    /// is gone, and the device never resends - nothing will ever arrive to disarm the repeat, and the
+    /// key repeats forever. Losing contact is therefore a reason to STOP, not to keep going.
+    pub fn cancel(&mut self) {
+        self.disarm();
+    }
+
     /// Emit a repeat of the held key if one is due at `now`. Call once per poll
     /// iteration; a no-op until `initial` elapses, then fires at most once per `interval`.
     pub fn poll(&mut self, now: u64, mut emit: impl FnMut(u8)) {

@@ -155,7 +155,107 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
             entry.blocked_sender   = None;
             entry.pending_send     = None;
         }
-        None => panic!("routing: endpoint table full (MAX_ENDPOINTS={})", MAX_ENDPOINTS),
+        // BOOT-TIME CALLERS ONLY. Spawning a task goes through `try_register` and REFUSES the spawn
+        // when the table is full, because a chaos kill storm reaching this panic took the whole
+        // machine down - and nothing above the kernel may do that. What is left here is the boot
+        // path, where the table is empty by construction and a failure is fatal by §11.3 anyway. If
+        // a new runtime caller ever needs an endpoint, it uses `try_register` and handles `false`.
+        None => panic!("routing: endpoint table full at boot (MAX_ENDPOINTS={})", MAX_ENDPOINTS),
+    }
+}
+
+/// `register`, but returns `false` instead of panicking when the table is full.
+///
+/// For endpoints a task can do WITHOUT. The primary endpoint is not one of those - a service with no
+/// mailbox cannot be talked to, and failing quietly there would produce a service that exists and
+/// answers nothing, so that path still panics. The reply-only endpoint IS optional: without it a task
+/// falls back to awaiting replies on its shared endpoint, which is what every task did until now.
+///
+/// The distinction matters because the table is sized for services and the probe builds spawn ~178 of
+/// them. Handing every task a second endpoint unconditionally would have taken `osdev test identity`
+/// from working to a boot panic - the table holds 96.
+/// How many table slots stay reserved for endpoints a service CANNOT do without.
+///
+/// A service's own receive endpoint is mandatory - without one it cannot be spawned at all. The
+/// reply-only endpoint is a convenience: a task that has none simply awaits replies on its shared
+/// endpoint, which is what every task did before reply endpoints existed.
+///
+/// Those two were competing for the same slots on equal terms, and the optional one was winning
+/// because it is taken while slots remain. The result was a MANDATORY registration failing - "spawn
+/// REFUSED - IPC routing table full" - while optional endpoints held slots they could have done
+/// without. That is what broke property P5 (§8.3): under the concurrent spawn load of a probe
+/// build, real services could not be spawned.
+///
+/// Enlarging the table is the wrong answer: each entry carries a 16-deep queue of 4 KiB messages,
+/// so 96 entries is already about 6 MB of static footprint (§26.6 - the bound must stay visible and
+/// affordable). Reserving part of it costs nothing and fixes the priority inversion directly.
+/// Sized from the table's OWN stated peak, one line up: "70 services hold recv endpoints at peak".
+/// A reserve smaller than that peak does not reserve anything - it just moves the failure later,
+/// which a quarter-table reserve did: P5 passed and P7 still failed with the same "routing table
+/// full" refusal, because optional endpoints could still take 72 of the 96.
+const OPTIONAL_RESERVE: usize = MAX_ENDPOINTS * 3 / 4;
+
+/// How many optional registrations have been refused. Diagnostic only - owned here, where the
+/// refusal happens, so the count cannot disagree with the decision.
+static REFUSED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// `try_register` for an endpoint the caller can do WITHOUT.
+///
+/// Refuses once free slots fall to the reserve, so a convenience can never consume what a mandatory
+/// registration needs. Degraded, not broken - and degraded in the direction that keeps services
+/// spawnable.
+pub fn try_register_optional(id: EndpointId, core_id: u32, generation: Generation) -> bool {
+    // Count under the lock, decide and REPORT outside it. A serial write is ~9 ms on the ARM ports
+    // and it is not preemptible, so logging while holding the routing table would stall every IPC on
+    // the machine for the duration - the routing table is on the path of every send. The scope here
+    // is deliberate and not stylistic.
+    let free = {
+        let table = TABLE.lock_irq();
+        table.iter()
+            .filter(|e| !e.valid || e.liveness == EndpointLiveness::Dead)
+            .count()
+    };
+    if free <= OPTIONAL_RESERVE {
+        // LOUD, because a silent refusal leaves no trace of a real degradation (invariant 12). The
+        // caller does fall back correctly - it awaits replies on its shared endpoint - but that
+        // fallback is the very hazard the reply mailbox exists to remove (a service cannot drain
+        // client traffic while waiting on the endpoint it also serves), so it is a fact an operator
+        // needs rather than an implementation detail.
+        //
+        // Never observed firing: zero refusals across the shell, identity and property suites on
+        // x86 and a full arm32 boot. That is why the threshold is unchanged - it was suspected of
+        // starving the mailbox at boot and the measurement did not support it. This log exists so
+        // the next person has evidence instead of the same suspicion.
+        let n = REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 3 || n % 64 == 0 {
+            crate::kprintln!(
+                "routing: reply endpoint refused - {} of {} slots free, reserve {} ({} refused so far)",
+                free, MAX_ENDPOINTS, OPTIONAL_RESERVE, n);
+        }
+        return false;
+    }
+    try_register(id, core_id, generation)
+}
+
+pub fn try_register(id: EndpointId, core_id: u32, generation: Generation) -> bool {
+    let mut table = TABLE.lock_irq();
+    let slot = table.iter().position(|e| e.valid && e.id == id)
+        .or_else(|| table.iter().position(|e| !e.valid || e.liveness == EndpointLiveness::Dead));
+    match slot {
+        Some(idx) => {
+            let entry = &mut table[idx];
+            entry.valid            = true;
+            entry.id               = id;
+            entry.core_id          = core_id;
+            entry.generation       = generation;
+            entry.liveness         = EndpointLiveness::Alive;
+            entry.queue.reset();
+            entry.blocked_receiver = None;
+            entry.blocked_sender   = None;
+            entry.pending_send     = None;
+            true
+        }
+        None => false,
     }
 }
 
@@ -420,6 +520,43 @@ pub fn enqueue_from_interrupt(endpoint: EndpointId, msg: Message) -> Option<usiz
 
     table[idx].queue.enqueue(msg).ok();
     None
+}
+
+/// Kernel-originated delivery that applies BACK-PRESSURE instead of dropping.
+///
+/// Same shape as [`enqueue_from_interrupt`] - no capability, no generation check, because the caller is
+/// the kernel rather than a task holding a cap - but on a full queue it records `sender_slot` as a
+/// blocked sender and returns `QueueFull`, exactly as a userspace `send` does. The caller must then
+/// immediately `block_and_reschedule(BlockedOnSend)`.
+///
+/// This exists for the console path. Dropping on a full queue is right for an INTERRUPT (the event has
+/// already happened and the driver is behind), and wrong for console output: a queue 16 deep cannot hold
+/// a burst of thirty writes no matter how fast the renderer is, so the excess was lost every time
+/// regardless of speed. Blocking the WRITER is the bounded-queue contract working as designed (§8.5,
+/// §8.6) - the kernel itself never waits, the task that produced the output does, and it wakes with
+/// `EndpointDead` if the terminal dies rather than hanging.
+pub fn enqueue_from_kernel_blocking(
+    endpoint: EndpointId,
+    msg: Message,
+    sender_slot: usize,
+) -> Result<Option<usize>, IpcError> {
+    let mut table = TABLE.lock_irq();
+    let idx = find_index(&*table, endpoint).ok_or(IpcError::EndpointDead)?;
+    if table[idx].liveness == EndpointLiveness::Dead {
+        return Err(IpcError::EndpointDead);
+    }
+    if let Some(slot) = table[idx].blocked_receiver.take() {
+        table[idx].queue.enqueue(msg).ok();
+        return Ok(Some(slot));
+    }
+    match table[idx].queue.enqueue(msg) {
+        Ok(()) => Ok(None),
+        Err(_) => {
+            table[idx].blocked_sender = Some(sender_slot);
+            table[idx].pending_send = Some(msg);
+            Err(IpcError::QueueFull)
+        }
+    }
 }
 
 /// Returns `true` if `endpoint` is registered and alive in the routing table.

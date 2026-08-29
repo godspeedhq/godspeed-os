@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# The live system view (top/htop equivalent, Appendix C.1). Reads per-task state through INTROSPECT and
+# can kill a service it has a holding for through SERVICE_CONTROL - both kernel by-name grants (C4-1).
+#
+# No placement: a transient the user invokes, wherever there is room.
+name    = "observe"
+version = "0.1.0"
+
+[resources.memory]
+request = "4MiB"
+limit   = "8MiB"
+
+[capabilities]
+ipc_receive = ["observe"]
+log_write   = true

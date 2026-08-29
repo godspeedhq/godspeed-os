@@ -1,6 +1,9 @@
 # Design Spec: Correlation Tags Between net-stack and nic-driver
 
-> **Status:** Direction agreed (2026-08-11), **not built**. Written after the idle-link tick was
+> **Status:** Direction agreed (2026-08-11). **Partly addressed 2026-08-18 WITHOUT the wire change;
+> the tag itself is still not built.** See §6 for exactly what was done and what that leaves.
+>
+> Original status: not built. Written after the idle-link tick was
 > reverted (`aa569bcc`) for the bug this fixes. Three phases, each independently testable; do them in
 > order and verify on hardware between each.
 >
@@ -43,7 +46,24 @@ order, which produced the "run `ls` twice and it is out of step" desync; the fix
 at offset 0 of both request and reply (see `project_fs_reply_correlation`, and the `tag` handling in
 `services/fs/src/main.rs`). This spec is that pattern applied one layer down.
 
-**Rejected alternative - a second endpoint.** Structurally cleaner (client traffic and driver traffic
+> **Amendment 2026-08-22: the second endpoint EXISTS now, and the rejection below was right about the
+> wrong problem.** Tags solve CORRELATION - telling your reply apart from other traffic - and they do
+> that well; the shell's "discarded an fs reply for tag 68 while awaiting 69" is the mechanism working.
+> What they cannot solve is a reply that never ARRIVES: a service blocked awaiting a reply cannot drain
+> the endpoint it also SERVES on, sixteen client requests fill the queue, and the reply is dropped by a
+> peer that correctly uses `try_send` rather than deadlocking. The wait then runs to its full deadline -
+> 30 s per block operation, which on x86 made `write append` take 73 seconds. A tag on an undelivered
+> message does nothing.
+>
+> The stated blocker also turned out not to hold. "There is no `CreateEndpoint` syscall" is true and
+> irrelevant: the FIRST endpoint is minted during spawn, and the second is the same mint a few lines
+> later. No new syscall, no contract change, no way for a service to ask for it wrongly - every service
+> that can receive gets one, costing one endpoint and two cap slots.
+>
+> Tags stay. They are still what separates one reply from another once both are in the mailbox, and the
+> net-stack/nic-driver protocol below is unchanged. The endpoint fixes delivery; the tag fixes identity.
+
+**Rejected alternative - a second endpoint.** [SUPERSEDED - see the amendment above.] Structurally cleaner (client traffic and driver traffic
 in different mailboxes, impossible to confuse) but **not available**: there is no `CreateEndpoint`
 syscall, a service's receive endpoint is minted at spawn from its contract, and `ServiceContext`
 carries a single `recv_slot`. It would take a new kernel primitive, an SDK change to select a mailbox,
@@ -158,3 +178,63 @@ Per phase, on hardware (QEMU cannot reproduce the Pi 4's NIC):
   Read `services/fs/src/main.rs` and the shell's `drain_stale_fs_replies` before designing the stash.
 - The tag proves a reply is *for this request*. It does not prove the reply is *correct* - keep the
   existing length and shape checks on every parse.
+
+---
+
+## 6. What was done on 2026-08-18, and what it does not cover
+
+**The failure that forced it.** `learn_our_mac` read a link-status reply, found zeros where a MAC should
+be, and net-stack reported "no NIC MAC yet (driver absent/not ready)" for two minutes while the driver
+was up and had logged the MAC at boot. Every request after the first timeout was being answered with the
+PREVIOUS request's answer - the same one-out-of-step desync `fs` had, arriving here exactly as §1
+predicted.
+
+**What was implemented.** `nic_req` now DRAINS the receive queue before it sends. net-stack has at most
+one driver request outstanding, so clearing the channel first makes the next capless message
+unambiguously the answer to the question just asked. Messages found during the drain are separated by a
+distinction the protocol already makes rather than a new one: a **client request carries a reply cap, a
+driver reply does not**. A stale driver reply is discarded; a client request is dropped WITH ITS CAP
+RECLAIMED, which is this spec's own phase-2 behaviour ("a mis-served client with a corrupt reply becomes
+a client that times out and retries").
+
+**Why not the tag, given the spec says to build it.** The tag is 40 edit points across
+`nic-driver/src/main.rs` (3 receive loops, 14 payload reads, 18 reply sends) and `genet.rs` (5 more).
+This spec says a wrong shift "shows up as a plausible-looking wrong value, not a crash - the exact
+failure that is cheap to find one op at a time and expensive to find after six", and says to verify on
+hardware between each. Doing all 40 in one pass, on a branch under active hardware test, is the thing
+this document warns against. The drain fixes the observed defect with no wire change and no off-by-one
+surface.
+
+**What the drain does NOT cover, and why the tag is still owed:**
+- It assumes ONE outstanding driver request. That is true today and nothing enforces it - the tag would.
+- A reply that arrives DURING our await, belonging to a request whose deadline has already passed, is
+  still taken as ours. The drain closes the window between requests, not inside one.
+- It cannot support net-stack doing background work while a client is active (§4), because a client
+  request met during a driver await is dropped rather than stashed. That is phase 3 and it needs the
+  stash to be owned by the serve loop, which means threading it through the sixteen `nic_req` call
+  sites - the reason it is not done here.
+
+So §4's list is still blocked, and the phases below are still the plan. This is a narrowing of the bug,
+not its removal.
+
+### 6.1 The same desync, one hop lower - found and fixed with exactly this design (2026-08-19)
+
+This document is about the **net-stack <-> nic-driver** hop. The identical fault was then found on the
+**nic-driver <-> dwc2** hop and fixed there (`7f678e00`), which is worth recording because it is
+evidence about this design rather than a separate story.
+
+That hop carried three ops (INFO, TX, RX) on one channel with untagged replies. `nic-driver` bounds its
+wait, so a reply arriving after its deadline was still queued when the next request went out, and every
+answer afterwards was one behind - permanently. Being one behind there is not a late answer, it is
+destruction: an RX reply read as an INFO reply is a FRAME consumed as a status word. Worse, the retry
+re-sent on timeout, and dwc2 POPS a frame to build each RX reply, so a resend cost a frame every time.
+
+The fix is phase 1 of this document applied to that hop: one byte of op tag on every reply, and a reply
+whose tag does not match is consumed and reported as "nothing this time" rather than believed.
+Deliberately NOT re-asked on mismatch - re-asking is the destructive move above. Consuming the stale
+reply shortens the queue by one, so alignment repairs itself.
+
+Two things follow for THIS hop:
+- the approach is validated on hardware, at a cost of one byte per reply
+- the argument that "one outstanding request makes a tag unnecessary" is now known to be wrong in
+  practice, because that is exactly the assumption the lower hop was making when it lost frames

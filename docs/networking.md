@@ -1,6 +1,8 @@
 # Networking: a Capability-Mediated Userspace Service
 
-> **Status:** Design, being built (branch `feat/networking`). **v2** (networking is out of v1 scope -
+> **Status: BUILT and shipping.** `net-stack` and `nic-driver` are services on x86_64 and Pi 2; DHCP,
+> ARP, ICMP, DNS and the shell's `net`/`ping` all work on real hardware. This header said "design,
+> being built" until 2026-08-25. **v2** (networking is out of v1 scope -
 > §23.4). Non-normative until built and pinned by an identity test, at which point the relevant
 > decisions are amended into `CLAUDE.md`. This doc records the architecture and the phased plan,
 > mirroring `docs/persistence.md`.

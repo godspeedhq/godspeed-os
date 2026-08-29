@@ -17,11 +17,9 @@
 use crate::arch::imp::{BootInfo, MemoryKind, MemoryRegion};
 use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, Capability};
 use super::pl011_write;
-use super::page_tables::{self, PageFlags, PageTable, VirtAddr};
+use super::page_tables::{PageFlags, PageTable, VirtAddr};
 use crate::memory::frame::PhysAddr;
 
-/// The ARM `logger` ELF, embedded by `build.rs`. Empty placeholder on a not-yet-ported arch.
-static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
 
 // Must match the SDK's ServiceContext layout (sdk/rust/src/service_context.rs) - the kernel writes
 // this page, the service reads it. Only the fields the logger touches on startup need real values.
@@ -139,56 +137,7 @@ pub(super) fn load_service_raw(elf: &[u8], extra_caps: &[Capability]) -> Option<
     Some(RawService { entry, pt_root, ctx_frame, slot })
 }
 
-/// Load the embedded `logger` ELF and write its (minimal) `ServiceContext`. Thin wrapper over
-/// `load_service_raw` for the no-endpoint case: the logger needs only `log_write` + a (dead) `recv`.
-pub(super) fn load_logger_into_slot() -> Option<LoadedService> {
-    let raw = load_service_raw(LOGGER_ELF, &[])?;
-    // Write the ServiceContext the SDK reads. Identity-mapped, so writable at the frame's phys addr.
-    // SAFETY: `raw.ctx_frame` is a fresh frame we own; writing the SDK's context struct into it.
-    unsafe {
-        let p = raw.ctx_frame as *mut u32;
-        p.add(0).write_volatile(SERVICE_CTX_MAGIC); // magic
-        p.add(1).write_volatile(0);                 // log_write_slot = 0 (the cap inserted at slot 0)
-        // Every other slot "not present" (u32::MAX); the logger only needs log_write + recv.
-        for i in 2..8 { p.add(i).write_volatile(u32::MAX); }
-        // recv_slot (index 2) MAX is fine - ctx.recv() returns EndpointDead, the logger loops harmlessly.
-    }
-    // Clone the kernel into the service's address space (empty L1 slots get kernel identity, privileged).
-    // SAFETY: pt_root is the freshly-built service L1, not yet in use.
-    unsafe { page_tables::fill_kernel_identity(raw.pt_root); }
-    Some(LoadedService { entry: raw.entry, pt_root: raw.pt_root, slot: raw.slot })
-}
 
-/// Bring up the neutral subsystems, then load the logger and enter it **directly** at PL0 (bypassing
-/// the scheduler). The minimal proof that a real service runs unprivileged on ARM; `sched_user` runs
-/// the same service *through* the scheduler instead.
-pub fn boot_service(ram_end: u32, reserve_end: u32) {
-    neutral_bootstrap(ram_end, reserve_end);
-    let svc = match load_logger_into_slot() {
-        Some(s) => s,
-        None => return,
-    };
-    let (entry, pt_root, slot) = (svc.entry, svc.pt_root, svc.slot);
-
-    // SAFETY: slot just reserved by the loader; make it the current task so the syscall dispatch finds
-    // its cap table. Single-threaded boot.
-    unsafe { crate::task::scheduler::set_current_task(0, slot); }
-
-    pl011_write(b"arm32: spawn - logger loaded + LOG_WRITE cap set up; entering PL0 at service_main.\r\n");
-    pl011_write(b"arm32: ===> below this line is a real GodspeedOS SERVICE running unprivileged <===\r\n");
-
-    // Switch to the service address space (with the TLB flush an address-space change needs), then
-    // drop to PL0 at the service entry. The service runs from here; the kernel (mapped privileged in
-    // this same address space) serves its syscalls. Does not return.
-    // SAFETY: pt_root is the complete service address space; entry is USER-executable, USER_STACK_TOP
-    // maps a writable user stack.
-    unsafe {
-        page_tables::clean_invalidate_dcache_all(); // coherency across the address-space (granule) change
-        page_tables::write_page_table_base(pt_root as u64);
-        core::arch::asm!("mov r0, #0", "mcr p15, 0, r0, c8, c7, 0", "dsb", "isb", out("r0") _, options(nostack));
-        enter_pl0(entry, USER_STACK_TOP);
-    }
-}
 
 /// Drop to PL0 at `entry` with user stack `sp` (the fabricated exception return from `usermode.rs`).
 /// The TTBR0 switch already happened in `boot_service`. Does not return - the service runs.

@@ -1,0 +1,20 @@
+name    = "console"
+version = "0.1.0"
+
+[resources.memory]
+request = "4MiB"
+limit   = "8MiB"
+
+[capabilities]
+# The console's own endpoint. Every console byte in the system arrives here: `ConsoleWrite` (syscall 23)
+# writes serial and then `try_send`s the same bytes to this endpoint, so the transport is ordinary IPC
+# and needs no capability of its own.
+ipc_receive = ["console"]
+# The framebuffer, granted by the kernel at spawn (`service_hw`), Normal non-cacheable + USER. Declared
+# here as the device this service drives, and reconciled against the kernel's own table by
+# `scripts/contract_check.py` so the two cannot diverge.
+hw_device   = "framebuffer"
+log_write   = true
+
+[placement]
+core = 0

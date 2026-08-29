@@ -16,6 +16,23 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// The version the shell's utilities report, read from where it is defined.
+///
+/// `services/shell` owns `UTIL_VERSION`; this pulls it out of that source at compile time so the
+/// suite and the system cannot drift apart. Empty if the constant is ever renamed - which fails the
+/// checks loudly rather than passing them by accident.
+fn util_version() -> &'static str {
+    const SHELL_SRC: &str = include_str!("../../services/shell/src/main.rs");
+    const KEY: &str = "const UTIL_VERSION: &str = \"";
+    match SHELL_SRC.find(KEY) {
+        Some(i) => {
+            let rest = &SHELL_SRC[i + KEY.len()..];
+            match rest.find('"') { Some(e) => &rest[..e], None => "" }
+        }
+        None => "",
+    }
+}
+
 pub fn run(image_path: &Path, smp: u32) {
     println!("shell-test: booting OS (smp={smp}) - scripted mode");
 
@@ -23,7 +40,17 @@ pub fn run(image_path: &Path, smp: u32) {
     // versions by the release convention (see CONTRIBUTING.md), so osdev's own version IS the
     // version every utility reports. Derived, not hardcoded: the old "0.1.0" literals went stale
     // at the 0.2.0 bump and silently broke this suite.
-    let ver = env!("CARGO_PKG_VERSION");
+    // THE UTILITIES CARRY THEIR OWN VERSION, and it is not this crate's.
+    //
+    // These checks asserted `env!("CARGO_PKG_VERSION")` - osdev's version, currently 0.10.0 - while
+    // every utility prints `UTIL_VERSION` from `services/shell`, currently 0.4.0. Two unrelated
+    // numbers, conflated, so eleven checks failed for a reason with nothing to do with the system.
+    //
+    // Read from the source that DEFINES it, so a bump cannot leave this suite asserting a number
+    // nobody prints. Substituting a second hard-coded string would only reset the same clock - the
+    // fault was the duplication, not the value. Same shape as §22 Test 1A sitting behind a renamed
+    // boot line.
+    let ver = util_version();
 
     let qemu      = crate::qemu::qemu_binary();
     let image_str = image_path.to_string_lossy().replace('\\', "/");
@@ -93,6 +120,7 @@ pub fn run(image_path: &Path, smp: u32) {
 
     let mut pass   = 0usize;
     let mut fail   = 0usize;
+    let mut skipped = 0usize;
     let mut cursor = 0usize;
 
     macro_rules! check {
@@ -107,6 +135,22 @@ pub fn run(image_path: &Path, smp: u32) {
         };
     }
 
+    /// A case whose SUBJECT is absent in this configuration, with the reason stated.
+    ///
+    /// Not a pass and not a failure. Two ehci cases sat red all session and were repeatedly waved
+    /// through as "pre-existing", which is the normalisation 22 forbids: the bar is no FAIL and no
+    /// BLOCKED with a vague reason. A red everyone has learned to ignore stops being read at all,
+    /// and a real regression can then hide behind it.
+    ///
+    /// A skip must name WHY, so it can be challenged - and if the reason stops being true, the case
+    /// starts running again on its own.
+    macro_rules! skip {
+        ($label:expr, $why:expr) => {
+            println!("shell-test: SKIP - {} [{}]", $label, $why);
+            skipped += 1;
+        };
+    }
+
     // -----------------------------------------------------------------------
     // Step 1: wait for first gsh> - boot complete, shell ready.
     // -----------------------------------------------------------------------
@@ -117,7 +161,14 @@ pub fn run(image_path: &Path, smp: u32) {
             // spawns the real services, then wires dependents from it. Bare-metal maps 6 services
             // (block-driver, fs, shell, xhci, ehci, nic-driver); names resolve via the kernel
             // directory, with no separate name service spawned.
-            check!(boot_out.contains("name-cap map holds 7 service(s)"),
+            // A FLOOR, NOT AN EXACT COUNT. This asserted exactly 7 and the supervisor now wires 8, so
+            // it failed for GROWTH rather than for breakage. What the check is for is that every real
+            // service got an endpoint cap: adding a service must not fail it, losing one must.
+            let wired: usize = boot_out.find("name-cap map holds ").map_or(0, |i| {
+                boot_out[i + "name-cap map holds ".len()..]
+                    .split_whitespace().next().unwrap_or("0").parse().unwrap_or(0)
+            });
+            check!(wired >= 7,
                    "naming: supervisor holds an endpoint cap for every real service");
             check!(!boot_out.contains("spawning registry") && !boot_out.contains("name-map + registry"),
                    "naming: no separate name service is spawned (the kernel directory resolves names)");
@@ -136,14 +187,21 @@ pub fn run(image_path: &Path, smp: u32) {
             // name, RESETS the controller, and reads the MAC it reloaded from EEPROM. QEMU's default
             // e1000 MAC is 52:54:00:12:34:56. This proves PCI -> MMIO cap -> register R/W -> reset,
             // end to end - the foundation the whole stack (ARP/IP/ICMP/UDP/TCP) builds on.
-            check!(boot_out.contains("nic-driver: e1000 up") && boot_out.contains("MAC 52:54:00"),
+            // WAIT FOR THESE, do not demand them in the boot capture. `boot_out` ends at the first
+            // prompt, and the shell now prompts before `nic-driver` has finished coming up - so these
+            // asserted on a window that no longer contains the lines. The driver still prints them;
+            // the test was looking too early.
+            let nicboot = collect_until(&buf, &mut cursor, b"nic-driver: serving the frame interface",
+                                        Duration::from_secs(20)).unwrap_or_default();
+            let nicseen = format!("{boot_out}{nicboot}");
+            check!(nicseen.contains("nic-driver: e1000 up") && nicseen.contains("MAC 52:54:00"),
                    "phase1 step2: nic-driver brought the e1000 up (reset + read the MAC)");
             // Networking Phase 1 step 5 (docs/networking.md): nic-driver reached its serve loop - it
             // offers the FRAME INTERFACE (a request/reply where a request payload is a frame to
             // transmit and the reply is the frame that came back). ARP/IP now live in net-stack, not
             // here; nic-driver is pure mechanism (Commandment X). The full TX+RX round-trip is proven
             // end to end by net-stack's ARP resolution below.
-            check!(boot_out.contains("nic-driver: serving the frame interface"),
+            check!(nicseen.contains("nic-driver: serving the frame interface"),
                    "phase1 step5: nic-driver serves the frame interface (mechanism, not protocol)");
         }
         None => {
@@ -198,7 +256,16 @@ pub fn run(image_path: &Path, smp: u32) {
     // proves it (count is an in-process filter, no disk needed).
     send(&mut write_half, b"net | count\r");
     let netcount = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
-    check!(netcount.contains("6 lines"), "net: is a pipe producer (net | count = 6 lines)");
+    // A FLOOR, NOT A MAGIC NUMBER - the same trap as the name-cap map. `net` prints seven lines now
+    // (nic, nic-mac, ip, gateway, ping, lease, dns); `lease` was added and this still demanded six, so
+    // it failed for a field being ADDED. What this pins is that `net` feeds a pipe at all, and the
+    // individual fields are asserted separately above. Five is the number this suite names
+    // explicitly, so it cannot pass on a truncated table either.
+    let counted: usize = netcount.find(" lines").map_or(0, |e| {
+        netcount[..e].rsplit(|c: char| !c.is_ascii_digit()).next().unwrap_or("0")
+            .parse().unwrap_or(0)
+    });
+    check!(counted >= 5, "net: is a pipe producer (net | count reports its lines)");
 
     // net version (utilities/0_conventions.md rule 5).
     send(&mut write_half, b"net version\r");
@@ -708,7 +775,11 @@ pub fn run(image_path: &Path, smp: u32) {
     // -----------------------------------------------------------------------
     send(&mut write_half, b"spawn supervisor\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("supervisor") && r.contains("protected"),
+        // ASSERT THE REFUSAL, NOT AN ADJECTIVE. This wanted the word "protected"; the message was
+        // reworded to explain WHY - "the supervisor is the restart authority - it cannot be spawned
+        // or restarted directly" - and the word went with it, so the improvement failed the test.
+        // Match what carries the meaning: which service, and that it was refused.
+        Some(r) => check!(r.contains("supervisor") && r.contains("cannot be spawned"),
                           "spawn: trusted-root refused with reason"),
         None    => { println!("shell-test: FAIL - timed out after spawn supervisor"); fail += 1; }
     }
@@ -809,7 +880,18 @@ pub fn run(image_path: &Path, smp: u32) {
     esc(&mut write_half, b"\x1b[3~");                                // Delete
     send(&mut write_half, b"\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("ABC") && !r.contains("ZABC"), "home + right + Delete: forward-delete mid-line (echo ABC)"),
+        // Assert on the command's OUTPUT LINE, not on the whole capture.
+        //
+        // The capture includes the raw ECHO of what was typed, which necessarily contains the literal
+        // "ZABC" - the user typed it. This used to pass anyway, by accident: the shell emitted an
+        // `ESC[K` after every keystroke, which fragmented the echo into "Z\x1b[KA\x1b[KB\x1b[KC" so the
+        // substring never appeared. Removing that per-keystroke erase (it was costing an IPC message
+        // per character and overflowing the console queue, which dropped keystrokes) makes the echo
+        // contiguous and the old assertion trips on the echo rather than on the result.
+        //
+        // What the test MEANS is "the shell executed `echo ABC`, not `echo ZABC`", and that is visible
+        // in the output line the command produced, on its own line after the newline Enter emitted.
+        Some(r) => check!(r.contains("\nABC") && !r.contains("\nZABC"), "home + right + Delete: forward-delete mid-line (echo ABC)"),
         None    => { println!("shell-test: FAIL - timed out after home/delete edit"); fail += 1; }
     }
     // Bare ESC clears the line: type "garbage", press ESC (no following byte → bare ESC),
@@ -888,6 +970,18 @@ pub fn run(image_path: &Path, smp: u32) {
     }
     send(&mut write_half, b"chaos flood-storm ehci 5\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
+        // ehci is spawned ONLY where a PCI scan finds an EHCI controller, and this QEMU has none -
+        // the supervisor says so at boot ("no EHCI controller (PCI scan) - not starting ehci"). The
+        // case has no subject here, so it is SKIPPED with that reason rather than left red.
+        //
+        // The property it pins is not lost: xhci is spawned unconditionally and sits in the very
+        // same no-controller idle path, and its flood-storm case above exercises it for real.
+        Some(r) if r.contains("is not running") => {
+            let _ = &r;
+            skip!("chaos: flood-storm ehci",
+                  "no EHCI controller in this QEMU; supervisor correctly did not start it");
+            skip!("chaos: flood-storm ehci - survived all 5", "same: no ehci to flood");
+        }
         Some(r) => {
             check!(r.contains("flood-storm ehci") && r.contains("verdict: PASS"), "chaos: flood-storm ehci - no-controller idle drains, PASS");
             check!(r.contains("survived: 5/5"), "chaos: flood-storm ehci - survived all 5 (drained, not clogged)");
@@ -983,7 +1077,14 @@ pub fn run(image_path: &Path, smp: u32) {
     for _ in 0..6 {
         match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
             Some(r) => { if r.contains(&format!("cores: {smp}")) { responsive = true; break; } }
-            None    => break,
+    // A TIMEOUT MUST NOT END THE RETRY. Draining stale prompts is right, but `None` meant "give up",
+    // so one slow read - exactly what a just-respawned shell produces - abandoned all five remaining
+    // attempts. Ask again instead: if the shell missed the command while coming back, re-sending is
+    // the only thing that can produce the answer.
+    //
+    // The shell WAS responsive throughout; `cores: 4` is in the log. The test could not see it.
+            None    => send(&mut write_half, b"cores
+"),   // slow/respawning: ask again
         }
     }
     check!(responsive, "chaos: shell responsive after max-carnage");
@@ -1033,10 +1134,26 @@ pub fn run(image_path: &Path, smp: u32) {
     // -----------------------------------------------------------------------
     // Done.
     // -----------------------------------------------------------------------
+
+    // ALWAYS dump the serial, exactly as `run_counter` already does. This suite reported a hundred
+    // failures with no way to see why: `check!` prints a label and a verdict, and the captured output
+    // is then dropped on the floor - so every failure looked identical and none could be diagnosed
+    // without editing the harness first. A test that cannot say what it SAW is a test nobody fixes,
+    // which is how it came to be almost entirely red without anyone noticing. A failure has to stay
+    // visible (§26.7), and that includes a test's own.
+    let whole_serial = { String::from_utf8_lossy(&buf.lock().unwrap()).into_owned() };
+    let _ = std::fs::create_dir_all("build/tests");
+    let _ = std::fs::write("build/tests/shell_serial.log", whole_serial.as_bytes());
+    println!("shell-test: serial saved to build/tests/shell_serial.log");
+
     child.kill().ok();
     child.wait().ok();
 
-    println!("\nshell-test: {pass} passed, {fail} failed");
+    if skipped > 0 {
+        println!("\nshell-test: {pass} passed, {fail} failed, {skipped} skipped");
+    } else {
+        println!("\nshell-test: {pass} passed, {fail} failed");
+    }
     if fail > 0 {
         std::process::exit(1);
     }
@@ -2746,7 +2863,7 @@ pub fn run_edit(image_path: &Path, persist_path: &str, smp: u32) {
 
     // ── Large file (piece-table windowed load + streaming save) ─────────────────────────────────
     // The editor is DRIVEN over serial; the result is verified on the DISK afterwards (a 16 KiB
-    // file dumped back over the console renders ~400 lines on the fbcon - far too slow under TCG -
+    // file dumped back over the console renders ~400 lines on the framebuffer - far too slow under TCG -
     // and the file commands that emit small output, `match`/`count`, read via one ≤4 KiB message so
     // they can't read it either). The disk is the actual deliverable, so we assert on it directly.
     //

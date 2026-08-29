@@ -13,9 +13,9 @@
 //!
 //! ## What the arch owes the shared console, and what it does not
 //!
-//! `crate::fbcon` is arch-neutral: the ANSI parser, the UTF-8 decoder, the character grid, glyph
+//! `crate::bootcon` is arch-neutral: the boot/panic glyph blit -
 //! rendering and scrolling are shared with x86 and the 32-bit ARM port. This file owes exactly three
-//! things - a framebuffer as a `&'static mut [u8]`, [`FB_READBACK_CHEAP`], and [`fb_commit`] - and gets
+//! things - a framebuffer as a `&'static mut [u8]` and [`fb_commit`] - and gets
 //! a full terminal for them.
 //!
 //! Handing it a **slice** rather than a base address is what keeps every pixel write in the neutral
@@ -78,7 +78,7 @@ pub fn boot_complete() {
     }
     BOOT_LOG_TO_FB.store(false, Ordering::Release);
     if CONSOLE_UP.load(Ordering::Relaxed) {
-        crate::fbcon::clear_and_home();
+        crate::bootcon::clear_and_home();
     }
 }
 
@@ -100,7 +100,7 @@ pub fn mirror(s: &[u8]) {
     // forever, and every later write would be silently dropped: a television that goes dead and stays
     // dead, with serial still perfectly healthy and nothing in the log. Masked interrupts cannot latch,
     // because a task that cannot be preempted cannot be killed part-way through.
-    crate::smp::without_interrupts(|| crate::fbcon::put_bytes(s));
+    crate::smp::without_interrupts(|| crate::bootcon::put_bytes(s));
 }
 
 /// Framebuffer geometry as the GPU reported it.
@@ -112,11 +112,6 @@ pub struct FbInfo {
     pub width: u32,
     pub height: u32,
 }
-
-/// Reading this framebuffer back is **cheap**: it lives in ordinary RAM the GPU scans out of, and the
-/// kernel's direct map covers it as Normal cacheable memory. The neutral console uses this to pick its
-/// scroll strategy - copying within the framebuffer rather than re-rendering.
-pub const FB_READBACK_CHEAP: bool = true;
 
 /// Publish a written rectangle to the GPU.
 ///
@@ -164,7 +159,7 @@ const TAG_GET_PHYS_WH: u32 = 0x0004_0003;
 /// Ask the GPU what the attached display's resolution is, so the console matches the screen instead of
 /// imposing a size on it.
 ///
-/// The fallback is **1280x720**, the same one the Pi 2 port uses. It matters more than a default
+/// The fallback is **1920x1080** (amended 2026-08-29 from 1280x720). It matters more than a default
 /// usually does, because it is what the console's width comes from when the query is unhelpful: the
 /// font scale is `height / 600`, so at 720p and below the cell size is fixed and the column count is
 /// simply the pixel width divided by it. 1024 wide gave 102 columns, which is narrower than the Pi 2's
@@ -173,7 +168,7 @@ const TAG_GET_PHYS_WH: u32 = 0x0004_0003;
 /// Whether the number came from the display or from the fallback is **logged**, because the two look
 /// identical afterwards and only one of them is worth investigating.
 fn query_display_size() -> (u32, u32) {
-    const FALLBACK: (u32, u32) = (1280, 720);
+    const FALLBACK: (u32, u32) = (1920, 1080);
     let mut req = [0u32; 8];
     req[0] = 7 * 4;
     req[1] = 0;
@@ -195,7 +190,7 @@ fn query_display_size() -> (u32, u32) {
         put_str(b" (native)\r\n");
         (req[5], req[6])
     } else {
-        put_str(b"aarch64: display did not report a usable size - asking for 1280x720\r\n");
+        put_str(b"aarch64: display did not report a usable size - asking for 1920x1080\r\n");
         FALLBACK
     }
 }
@@ -210,13 +205,21 @@ fn query_display_size() -> (u32, u32) {
 /// gamble, because the request is not the answer: `SET_PHYS_WH` replies with the mode the GPU actually
 /// applied, and this code uses the reply. If the display really is 1024x768, the GPU clamps and we get
 /// 1024x768 back, exactly as before.
-const MIN_MODE: (u32, u32) = (1280, 720);
+/// Amended 2026-08-29: ask for **1920x1080**, not 1280x720, because a non-native mode is what a TV
+/// makes ugly. Asking for 720p on a 1080p panel does not produce small-but-sharp text - it hands the
+/// TV's own scaler a 1.5x upscale, which is the blur that gets reported as "a pixelated mess". Native
+/// resolution costs nothing here and removes that scaler from the path entirely.
+///
+/// This stays safe for the same reason the original did: the request is not the answer. `SET_PHYS_WH`
+/// replies with the mode the GPU actually applied and this code uses the reply, so a display that
+/// cannot do 1080p gets clamped down exactly as before rather than being driven at a mode it lacks.
+const MIN_MODE: (u32, u32) = (1920, 1080);
 
 /// Allocate a framebuffer. Call once, before the MMU is enabled.
 pub fn init() -> Option<FbInfo> {
     let reported = query_display_size();
     let (width, height) = if reported.0 < MIN_MODE.0 {
-        put_str(b"aarch64: reported mode is narrower than 1280 - asking for 1280x720 instead\r\n");
+        put_str(b"aarch64: reported mode is narrower than 1920 - asking for 1920x1080 instead\r\n");
         MIN_MODE
     } else {
         reported
@@ -303,8 +306,11 @@ pub fn start_console(fb: FbInfo) {
     put_dec(len as u64);
     put_str(if probe_ok { b" readback OK\r\n" } else { b" READBACK FAILED\r\n" });
 
-    crate::fbcon::init(crate::fbcon::FbParams {
+    crate::bootcon::init(crate::bootcon::FbParams {
         mem,
+        // Physical base, for the `console` service's grant. Not granted on this port yet - see the
+        // mismatched-attributes note beside `fb_commit` in `mod.rs`.
+        phys: fb.base,
         pitch: fb.pitch as usize,
         bpp: 4,
         width: fb.width as usize,
@@ -316,7 +322,7 @@ pub fn start_console(fb: FbInfo) {
         b_shift: 16,
     });
 
-    crate::fbcon::clear_and_home();
+    crate::bootcon::clear_and_home();
     // Armed LAST: until this is true every `mirror` is a no-op, so nothing can render through a console
     // that is not yet initialised.
     CONSOLE_UP.store(true, Ordering::Release);

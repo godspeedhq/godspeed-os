@@ -1,0 +1,29 @@
+# GodspeedOS - Raspberry Pi 4 (BCM2711, AArch64) boot config.
+#
+# Canonical copy. `scripts/pi4_build.py` copies this next to the built kernel as
+# build/config.txt; deploy by copying it and build/kernel8.img to the FAT boot
+# partition of a card that already carries the Pi firmware (start4.elf /
+# fixup4.dat - written by the Raspberry Pi Imager, or restored from a backup).
+# This is the Pi 4 twin of boot/pi2/config.txt; the two ports differ in the three
+# lines below and nowhere else.
+
+# Load OUR image under a NAME OF OUR OWN, not `kernel8.img`. The firmware's default
+# name is what a stock Raspberry Pi OS card already uses, so overwriting it destroys
+# the only known-good kernel on the card - and a card that cannot boot Linux is a
+# card that cannot tell you whether a failure is yours or the hardware's. Deploy ours
+# alongside it (Linux's stays put) and select it here by name.
+kernel=godspeed8.img
+
+# Force a 64-bit boot. Our Pi 4 port is AArch64 (Cortex-A72) and the linker script
+# places .text at LMA 0x80000, which is where the firmware drops a 64-bit image.
+arm_64bit=1
+
+# Keep the PL011 UART enabled, so the 115200 8N1 serial console has the right baud.
+enable_uart=1
+
+# Give the PL011 back to the GPIO header. On the Pi 4 the firmware routes PL011 to
+# the on-board Bluetooth and leaves the far cruder mini-UART on the header pins, so
+# WITHOUT this line our serial console is driven by a UART we did not program - the
+# console is silent or garbled and the board looks dead. This is a Pi 4 line with no
+# Pi 2 equivalent: on the Pi 2 there is no Bluetooth to lose the UART to.
+dtoverlay=disable-bt

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# The EHCI USB host driver (legacy controllers; the T630 has one, the Wyse 5070 does not). Pinned to
+# core 3 for interrupt locality (§12.2). Runs in IOMMU passthrough rather than confined, because it
+# legitimately reaches firmware and hub regions - see CLAUDE.md §6.4 and docs/iommu.md.
+name    = "ehci"
+version = "0.1.0"
+
+[resources.memory]
+request = "32MiB"
+limit   = "64MiB"
+
+[capabilities]
+ipc_receive = ["ehci"]
+hw_device   = "ehci"
+hw_interrupt = [41]
+log_write   = true
+
+[placement]
+core = 3

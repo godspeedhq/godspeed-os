@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
 # ARM32 (Raspberry Pi 2) port - status
 
-Branch `feat/pi2-arm32`. This is the living status of the 32-bit ARM (ARMv7-A, BCM2836) port. It
+Branch `feat/pi2-arm32-hardening`. This is the living status of the 32-bit ARM (ARMv7-A, BCM2836) port. It
 records what runs, how to build/run it, and what remains. It trails the spec (`CLAUDE.md` wins on any
 conflict) and complements `docs/multi-arch.md` (the cross-arch proof).
 
@@ -15,37 +15,73 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
 - **The real OS bootstrap:** the kernel makes its one direct spawn (the **supervisor**), which spawns
   services from its manifest through the neutral spawn path (per-task address spaces, PL0 user mode,
   banked-register trap frames, fault-survival: a PL0 fault kills just that task and the kernel continues).
-- **Services:** `supervisor`, `logger`, `shell`, `ping`, `pong`, and the example services
+- **Services:** `supervisor`, `logger`, `console`, `shell`, `ping`, `pong`, the driver services
+  (`dwc2`, `block-driver` + `fs`, `nic-driver` + `net-stack`, `time`, `control`) and the example services
   (`observe`, `chaos`, `mem-pressure`, `counter`, `greet`, `upper`, `roster`, `reply-server`, `asker`,
-  `resource-server`, `holder`) - all cross-compiled to `armv7a-none-eabi` and embedded.
+  `resource-server`, `holder`) - all cross-compiled to `armv7a-none-eabi` and embedded. The embedded set
+  is `arm_built` in `kernel/build.rs`, which is the single source of truth (see "Running a new service").
 - **Cross-core IPC:** `ping` (core 0) -> `pong` (core 1) capability IPC runs under preemptive scheduling.
+- **Display (HDMI/TV):** the **`console` service** owns the framebuffer and renders the terminal - the
+  ANSI/CSI parser, the UTF-8 box glyphs, the shadow grid, the cursor and scrolling. The kernel is granted
+  nothing beyond a minimal boot/panic blit (`kernel/src/bootcon`: plain ASCII, escapes discarded, no grid,
+  no cursor; it clears at the bottom instead of scrolling), which exists because **a panic halts every
+  core and so cannot ask a service to report it** (CLAUDE.md §11.4 amendment).
+
+  Ownership is a state, not a convention: the kernel stops drawing the moment it GRANTS the framebuffer
+  at spawn, and takes it back if `console` dies or on a panic. The mapping is Normal **non-cacheable** on
+  both sides (`mmu::section_fb`), because a service cannot do cache maintenance and ARM leaves mismatched
+  attributes for one physical page UNPREDICTABLE. Hardware-verified 2026-08-17: chaos 50 rounds with 0
+  kernel panics and 0 liveness wedges, `selfcheck` 350/0, 0 console writes lost. Full account:
+  `docs/console-service.md` §9.
 - **Interactive shell:** a supervisor-spawned `gsh>` prompt over serial. Verified utilities in QEMU:
-  `help`, `version` (`GodspeedOS 0.7.0`), `cores` (`4`), `mem`, `status`, `caps`, `roster`, pipes
+  `help`, `version` (`GodspeedOS 0.10.0`), `cores` (`4`), `mem`, `status`, `caps`, `roster`, pipes
   (`status | count` -> `3`), and graceful degradation (`ls` -> `ls: storage unavailable`).
-- **Persistence (SD/EMMC -> fs):** `block-driver` drives the Pi 2's BCM2835 EMMC (Arasan SDHCI) from
-  **userspace** (PIO; the kernel grants it the EMMC MMIO window at spawn, `arch::arm::map_fixed_driver_mmio`),
-  and `fs` mounts on top. Verified in QEMU (`--sd` an image): `drives flash` formats GSFS, files write +
-  read, and **survive a reboot** (re-mount + read-back). This unblocks the file utilities (`ls`, `read`,
-  `write`, `edit`, `drives`, ...). Needs `--release` (see below).
-- **Networking (USB-Ethernet -> net-stack):** a CDC-ECM USB-net device is driven in-kernel (DWC2 bulk
-  frames) and bridged to the **unchanged** userspace `net-stack` via three `NET_DEVICE`-gated syscalls; a
-  per-arch `nic-driver` backend speaks the frame IPC. Verified in QEMU (`arm_run.py --usbnet`): DHCP, ARP,
+- **Persistence (USB stick -> fs):** `block-driver` reaches a **USB mass-storage stick** through the
+  `dwc2` SERVICE over the block IPC protocol, and `fs` mounts on top. `drives flash` formats GSFS, files
+  write + read and **survive a reboot**, which unblocks the file utilities (`ls`, `read`, `write`, `edit`,
+  `drives`, ...). Needs `--release` (see below).
+
+  > **The SD/EMMC card is the boot medium and is NEVER written.** An earlier version of this document
+  > described an Arasan SDHCI backend as the working storage path. It is **withdrawn**: `sdhci.rs` is kept
+  > for reference but is deliberately not compiled in (`services/block-driver/src/main.rs`), because on a
+  > single-slot Pi the EMMC *is* the card the board boots from, and GSFS's superblock at LBA 0 lands on the
+  > partition table. **It corrupted two boot cards to RAW.** There is no safe way to use a single-slot Pi's
+  > boot card as storage, so this is a hazard rather than a fallback.
+- **Networking (USB-Ethernet -> net-stack):** a USB-net device is driven by the userspace **`dwc2`
+  service** (DWC2 bulk frames) and reached by `nic-driver` over IPC (opcodes `0x10+` on `dwc2`'s endpoint -
+  the same endpoint that serves the block protocol), which bridges to the **unchanged** `net-stack`. The
+  `NET_DEVICE` syscalls (42-44) that used to front an in-kernel USB-net device are **stubbed inert** on
+  this arch (`arch/arm/mod.rs`), because no frame passes through the kernel any more. Verified in QEMU (`arm_run.py --usbnet`): DHCP, ARP,
   ICMP, DNS, and the shell `net` + `ping` all work over USB. The Pi 2's onboard **LAN9514 (`smsc95xx`) is
-  now driven on real hardware too**: DHCP, ARP and internet ping all work, with RX **interrupt-driven** (a
-  bulk-IN is kept armed and its halt-ISR parses each burst and re-arms; the DWC2 core auto-retries NAKs in
-  hardware, so an idle device costs no interrupts). The poll it replaced listened only ~3% of each 10 ms
-  tick and the device's small RX FIFO dropped the rest - that was ~85% ping loss, now ~4% (ordinary
-  internet loss). Link state is read from the PHY (MII BMSR), so an unplugged cable reports as unplugged.
+  now driven on real hardware too**: DHCP, ARP and internet ping all work, with RX **client-polled**: a bulk-IN
+  is kept armed, and `rx()` harvests the completed burst and re-arms it when a client asks for frames.
+  The DWC2 core auto-retries NAKs in hardware, so an idle device costs nothing.
+
+  **CORRECTED 2026-08-25.** This paragraph used to say RX was "interrupt-driven ... its halt-ISR parses
+  each burst", and that mechanism did not exist. The handler lived in the fallback loop entered only
+  when there is no MMIO/DMA, so a board with hardware never reached it; the `irq_unmask` was in that
+  same dead loop, so the vector was never armed; and `reset_and_host_mode` clears GAHBCFG's global
+  interrupt bit and writes GINTMSK = 0 at init, so the controller never asserted the line. Every log
+  from this port shows zero interrupts delivered. The armed bulk-IN and the burst parsing are real -
+  what was never true is that an interrupt drove them.
+
+  Both halves are wired as of 2026-08-25 (the vector is armed from the loop that owns the hardware, and
+  the host-channel interrupt is enabled at the device), and interrupts now do arrive - but they harvest
+  almost nothing, because the client poll path reaches each completion first. Receive is therefore still
+  poll-driven in practice, and the honest claim is the one above. The `net IRQ` counters report it
+  rather than leaving it to be inferred. Link state is read from the PHY (MII BMSR), so an unplugged cable reports as unplugged.
 - **Multiple USB devices coexist:** `enumerate_downstream` walks *every* hub port, gives each device a
   distinct address, and configures all of them; the single DWC2 host channel is time-shared by having each
-  transfer path re-select its device (`select_device`: address / max-packet / speed). Verified in QEMU with
+  transfer carry a `Target` (address / max-packet / speed). Hot-plug in both directions is watched through
+  the hub's status-change endpoint. Verified in QEMU with
   a keyboard + usb-net + usb-storage attached together: all three enumerate, networking flows (DHCP/ICMP),
   and the keyboard still types **while** the network is live - the shape the real Pi 2's LAN9514
   (hub + integrated ethernet, plus external keyboard ports) needs.
-- **Graceful degradation (loud, not silent):** `xhci`/`ehci` (front/back USB host on x86) are not ported,
-  so they fail their spawn **loudly** and the system continues to a usable shell - exactly §9.2/§11.3
-  ("continue with the services that started"). Without an attached SD image `block-driver` finds no card
-  and `fs` serves storage-unavailable (loud, not a hang); without a `--usbnet` device net-stack degrades.
+- **Graceful degradation (loud, not silent):** `xhci`/`ehci` (the x86 USB hosts) are not spawned on ARM at
+  all - the supervisor `cfg`-excludes them, because this board's host controller is `dwc2`. Without a USB
+  storage stick `block-driver` reports no disk and `fs` serves storage-unavailable (loud, not a hang);
+  without a `--usbnet` device net-stack degrades - exactly §9.2/§11.3 ("continue with the services that
+  started").
 
 ## Build + run
 
@@ -53,20 +89,28 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
 python scripts/arm_build.py                       # full stack, debug -> build/kernel7.img
 python scripts/arm_build.py --release              # optimized; USE THIS for a usable shell (and the Pi)
 python scripts/arm_build.py --release --qemu       # QEMU-targeted: identity DWC2 DMA (for USB testing)
-python scripts/arm_build.py --feature arm-shell    # logger+shell only (kernel-spawned, no supervisor)
 python scripts/arm_run.py --release --secs 15 --cmd "status | count"   # boot in QEMU + drive the shell
 python scripts/arm_run.py --release --usb          # boot in QEMU with an emulated usb-kbd (DWC2 path)
 ```
 
-> **`--qemu` vs the default.** The only current difference is the DWC2 USB DMA bus-address translation
-> (`arch/arm/dwc2.rs`): QEMU addresses ARM RAM directly (identity), real BCM2836 silicon sees RAM through
-> the VideoCore alias `0xC000_0000`. The default build is **hardware-correct**; pass `--qemu` only to test
-> USB under emulation. Everything else (shell, SD/fs, ping/pong) is identical between the two.
+> **`--qemu` vs the default.** The only difference is the DWC2 USB DMA bus-address translation
+> (`DMA_BUS_ALIAS`, `services/dwc2/src/regs.rs`): QEMU addresses ARM RAM directly (identity), real BCM2836
+> silicon sees RAM through the VideoCore alias `0xC000_0000`. The default build is **hardware-correct**;
+> pass `--qemu` only to test USB under emulation. Everything else (shell, storage, ping/pong) is identical.
+>
+> **This flag was a silent no-op until 2026-08-17, and the fix is worth knowing about.** The `qemu`
+> feature had moved to the `dwc2` SERVICE when the USB stack left the kernel, but `arm_build.py` kept
+> passing it to the KERNEL, where the feature still existed and nothing read it. So the build reported
+> success, produced a hardware-alias binary, and USB under emulation STALLed in the DATA stage. The flag
+> now goes to `dwc2` and the dead kernel feature is deleted, so there is exactly one place it can mean
+> something. Verified by disassembling both builds: the hardware one contains
+> `orr r2, r2, #0xC0000000` and the `--qemu` one does not.
 
 `arm_build.py` cross-compiles the SDK + every arm-ported service to `armv7a-none-eabi`, builds the
 kernel (which embeds them via `kernel/build.rs`'s `arm_built` allowlist), and objcopies to a flat
 `build/kernel7.img`. The supervisor is built with its `bare-metal` feature (the "usable OS, quiet gsh>"
-set: logger + shell, no harness probes; `ping`/`pong` spawnable on demand). Deploy to a Pi by copying
+set: logger, `console` (the terminal), the driver services - `dwc2`, `block-driver` + `fs`,
+`nic-driver` + `net-stack`, `time` - and the shell; no harness probes, `ping`/`pong` spawnable on demand). Deploy to a Pi by copying
 `build/kernel7.img` **and `build/config.txt`** to the SD card's FAT boot partition (a file copy, not a
 flash - `docs/multi-arch.md`); the **full procedure** (preparing the boot card *and* the storage USB
 stick, with the disk-identification safety and the durability caveat) is **`docs/pi2-deploy.md`**.
@@ -77,20 +121,23 @@ Python 3 and `qemu-system-arm`. `osdev` itself is still x86-only; these scripts 
 ### Running a new service on the Pi 2
 
 An arch-neutral service (SDK + syscalls only, no x86 hardware probe) runs on ARM unchanged. To get it
-into the ARM image you add it to **two** allowlists that must stay in sync:
+into the ARM image there is **one** list to edit:
 
 1. Write the service as usual (`GETTING_STARTED.md`; the `service_main(ctx)` + contract pattern is
    arch-neutral).
-2. Add its crate/binary name to **`arm_built`** in `kernel/build.rs` (so the kernel embeds its real ARM
-   ELF instead of the empty placeholder).
-3. Add the same name to **`ARM_SERVICES`** in `scripts/arm_build.py` (so the build cross-compiles it to
-   `armv7a-none-eabi` before the kernel embeds it). The two lists are deliberately identical; keep them
-   so.
+2. Add its crate/binary name to **`arm_built`** in `kernel/build.rs`. That is the single source of truth:
+   `scripts/arm_build.py` DERIVES its cross-compile list from it (`_arm_services()`), so there is no second
+   list to keep in sync.
+
+   > This used to be two allowlists "deliberately identical; keep them so", and they drifted exactly as
+   > you would expect: the `console` service was added to one and not the other, so it shipped as an empty
+   > placeholder. Every log line reported success and the display just quietly stayed on the kernel's boot
+   > floor. The second list is deleted rather than checked.
 4. Rebuild: `python scripts/arm_build.py --release`. If the supervisor should *spawn* it at boot, that is
    a supervisor-manifest change (same as x86), not an ARM-specific step.
 
 A **hardware** driver is different - see `kernel/src/arch/arm/CLAUDE.md` (the ARM syscall ABI, the
-in-kernel-driver rule, DMA cache coherence) and `kernel/src/arch/CLAUDE.md` ("Porting a driver: the
+userspace-driver rule, DMA cache coherence) and `kernel/src/arch/CLAUDE.md` ("Porting a driver: the
 method").
 
 ## Known issues / gotchas
@@ -102,9 +149,10 @@ method").
 - **No RTC on the Pi 2** (and QEMU raspi2b emulates none) - the x86 MC146818 CMOS RTC has no Pi
   equivalent. Both consequences are now **fixed rather than accepted**: `uptime` reads the monotonic
   generic timer (not a wall-clock delta from a frozen stamp), and the wall clock is set from the network
-  by **SNTP** - net-stack syncs once after the boot DHCP dance and on demand via `date sync` (the gated
-  `SetClock` syscall 50 / `SET_CLOCK` capability, granted by name to net-stack on ARM only; x86's CMOS
-  clock remains the authority there and the syscall is refused). With no cable, `date` reads zeros and
+  by **SNTP** - net-stack fetches it and hands it to the **`time` SERVICE** over IPC (`OP_SET`), which
+  owns plausibility, provenance and the floor and can refuse it. (This used to be a gated `SetClock`
+  syscall; that syscall and `kernel/src/clock.rs`/`wallclock.rs` are deleted - the wall clock is not a
+  kernel responsibility.) With no cable, `date` reads zeros and
   says so rather than inventing a time.
 - **The `usermode` selftest** used VAs in the framebuffer region; it now maps at `0x5000_0000` (above
   every identity-mapped region) so it PASSes under QEMU and HW alike.
@@ -115,7 +163,10 @@ These are genuine new driver development, not recompilation. Each reads a workin
 Linux / bare-metal) for the register sequence and reimplements it as a capability service the
 GodspeedOS way.
 
-- **USB keyboard (DWC2)** - **working in QEMU** (kernel-side, `arch/arm/dwc2.rs`); real-Pi verification
+- **USB keyboard (DWC2)** - **DONE + HW-verified.** Driven by the userspace `services/dwc2`
+  (`hid.rs` bind/poll, `hub.rs::enumerate_downstream`, HID boot protocol, keystrokes to the shell via
+  `CONSOLE_PUSH`), interrupt-driven off `USB_VECTOR` - NOT polled from the timer tick. Clean under
+  sustained use on hardware (2026-08-17). The two lessons below are kept because they still bite:
   pending. The full path runs end to end under `qemu-system-arm -M raspi2b,usb=on -device usb-kbd`: DMA
   control transfers, enumerate the **hub** the keyboard sits behind (the Pi 2's LAN9514 topology, and
   QEMU's NEC-hub model), select HID **boot protocol**, and poll the interrupt IN endpoint from the timer
@@ -129,7 +180,11 @@ GodspeedOS way.
   **build for the Pi:** `arm_build.py --release` (default = hardware alias). Real-Pi bring-up may still
   need the hard-won register quirks (halt-all-channels at init, `FSLSPClkSel=0` for the HS PHY) that QEMU
   does not exercise - see the `dwc2.rs` comments + git log.
-- **SD/EMMC block driver -> `fs`** - **DONE** (2026-07-23): userspace `block-driver` SDHCI/PIO backend +
+- **SD/EMMC block driver -> `fs`** - **WITHDRAWN, not done.** `sdhci.rs` is kept for reference but is
+  NOT compiled in: on a single-slot Pi the EMMC *is* the boot card, and pointing GSFS at it (superblock
+  at LBA 0, over the partition table) **corrupted two cards to RAW**. Storage on ARM is the USB stick
+  through `dwc2`. The original entry read DONE with 'remaining: multi-block transfers' - work on a code
+  path that is unreachable and must stay so. Historical detail follows:
   the kernel's fixed-peripheral MMIO grant; `fs` mounts + persists in QEMU. Remaining: real-hardware
   verification on a Pi, and multi-block/faster transfers (PIO single-block today).
 - **USB bulk transfers (DWC2)** - **DONE + QEMU-verified** (2026-07-23). `bulk_xfer` (the third transfer
@@ -164,7 +219,11 @@ GodspeedOS way.
   bug fell out: `now_epoch_monotonic()` was a `0` stub, so `calibrate_tsc_hz` spun ~100M yields and every
   deadline wait never expired, hanging net-stack before its serve loop - now wired to the generic timer
   (`cntpct()/timer_hz()`).
-- **LAN9514 (`smsc95xx`) for the real Pi 2** - **written, HW-UNVERIFIED** (2026-07-23). The Pi 2's onboard
+- **LAN9514 (`smsc95xx`) for the real Pi 2** - **DONE + HW-verified.** Lives in
+  `services/dwc2/src/net.rs` (`smsc_bring_up`, `link_up`, `link_reconfigure`). DHCP, ARP and internet
+  ping all work on real hardware at ~4% loss, with RX interrupt-driven. This entry said
+  'HW-UNVERIFIED' while the same document's 'What runs today' already reported it working - the
+  contradiction is the tell that a status file was updated in one place only. Original notes:
   NIC is a **vendor-specific** `smsc95xx` device (class 0xFF, VID 0x0424), *not* CDC-ECM and not
   QEMU-emulated. `configure_smsc95xx` is a clean reimplementation from the working u-boot/Linux `smsc95xx`
   reference (per the driver doctrine): chip config via **vendor control requests** (bRequest 0xA0 write /
@@ -177,8 +236,11 @@ GodspeedOS way.
   a wrong assumption leaves the NIC unconfigured (net-stack degrades) rather than hanging the boot. QEMU
   never exercises this branch, so it awaits **real-Pi verification** - the MAC-from-VideoCore-mailbox is a
   known refinement for that pass.
-- **SDK DMA cache-coherence (SEC-28)** - `sdk/rust/src/dma.rs` assumes x86 coherent DMA; any real ARM
-  driver needs cache-maintenance hooks (clean-before-device-read, invalidate-before-CPU-read) first.
+- **SDK DMA cache-coherence (SEC-28) - ANSWERED, by mapping rather than by hooks.** The other option
+  `dma.rs` itself named was taken: `DMA_ARENA_UNCACHED = true` on ARM, so the kernel maps a service's DMA
+  arena non-cacheable at spawn and `sdk/rust/src/dma.rs` needs no cache maintenance. `services/dwc2`
+  DMAs through it today. (`kernel/src/arch/arm/CLAUDE.md`'s SEC-28 bullet still says the opposite and
+  needs the same correction.)
 - **Watchdog / PM reset (`hardware_reset`) - DONE + QEMU-verified** (2026-07-23). Was a stub that spun, so
   the shell `reboot` (and the Ctrl+Alt+Del chord that routes through it) hung the Pi 2 instead of resetting
   it. Now does the BCM2835 power-management watchdog reset (`arch/arm/mod.rs`): write `PM_WDOG` (peripheral
@@ -195,25 +257,38 @@ GodspeedOS way.
   on real hardware it drives actual pins (blink an LED, read a button).
 - **Still nice-to-haves (deliberately not built - no consumer yet, §26.2):** USB **mouse** (a console OS
   has no pointer to consume it); **I2C/SPI** (would enable an external RTC module - but NTP over the
-  now-working network is the better wall-clock path); and **DMA-accelerated / multi-block SD** (a real
-  speed win, but a protocol change to `fs` + the block IPC that risks the working persistence path for
-  marginal gain on a shell OS - the block-driver is single-block PIO today, correct just not fast).
+  now-working network is the better wall-clock path); and **faster multi-block transfers on the USB storage
+  path** (a protocol change to `fs` + the block IPC that risks the working persistence path for marginal
+  gain on a shell OS). The SD acceleration once listed here is moot - there is no SD storage path (see
+  "Persistence" above).
 
 ## See also
 
 - **`kernel/src/arch/arm/CLAUDE.md`** - the implementer's reference: the ARM syscall ABI (and its one
-  wider-than-u32 constraint), the boot flow, the in-kernel-driver rule, and the SMP/DMA hazards.
+  wider-than-u32 constraint), the boot flow, the userspace-driver rule, and the SMP/DMA hazards.
 - **`kernel/src/arch/CLAUDE.md`** - the arch boundary + "Porting a driver: the method" (the doctrine).
 - **`docs/multi-arch.md`** - the cross-arch proof and per-arch bring-up notes.
-- **Audits of this branch:** `docs/kernel-audit.md` Audit 5 (the arm32 kernel layer) and
-  `docs/userspace-audit.md` Audit 4 (the arm SDK ABI).
+- **Audits of this branch:** `audits/kernel-audit.md` Audit 5 (the arm32 kernel layer) and
+  `audits/userspace-audit.md` Audit 4 (the arm SDK ABI).
 
-## OPEN: the ARM quantum stub cannot be fixed naively (2026-07-31)
+## CLOSED: the ARM quantum stub, and why it could not be fixed alone (2026-07-31; fixed since)
 
-`arch/arm/mod.rs::tsc_ticks_per_quantum()` returns `0`, and `scheduler::cycles_to_ticks` reads `0` as
-"fall back to exactly 1 tick" - so **every `sleep` and `recv_timeout` on this port collapses to one
-quantum (~10 ms) regardless of what the caller asked for**. A duration the caller chose, silently
-replaced. That is a real defect and it is still open.
+> **FIXED.** `arch/arm/mod.rs::tsc_ticks_per_quantum()` now returns `timer_hz()/100` - the MEASURED
+> timer rate, never `CNTFRQ`, which overstates by 19.2x on this board - and the SDK companions
+> (`sleep_ms` / `duration_cycles`) landed with it. The account below is kept because its LESSON is
+> permanent and was expensive: **a cycle count is not a portable duration**, and fixing the stub without
+> the companion change is a regression, not a partial fix.
+>
+> Two of the three "leads for the next attempt" recorded below have also since become false on their
+> own - query 16 is ungated now (and query 9 is deleted entirely), and the shell's
+> `ESC_WAIT_CYCLES = 200_000_000` no longer exists (it is `ESC_WAIT_QUANTA = 10`, a monotonic-tick
+> loop). The serial-input failure it blames is most likely the serial FLOOD documented further down
+> this file, which was diagnosed later.
+
+**What the defect was.** `tsc_ticks_per_quantum()` returned `0`, and `scheduler::cycles_to_ticks` reads
+`0` as "fall back to exactly 1 tick" - so **every `sleep` and `recv_timeout` on this port collapsed to
+one quantum (~10 ms) regardless of what the caller asked for**. A duration the caller chose, silently
+replaced.
 
 **An attempt to fix it (branch `fix/arm-tsc-quantum`, not merged) killed serial input on the Pi**, and
 the cause was never identified. Recording it so the next attempt does not repeat the search:
@@ -246,6 +321,48 @@ the cause was never identified. Recording it so the next attempt does not repeat
    200_000_000` is "~100 ms at ~2 GHz" in **`read_tsc` cycles**, and `read_tsc` on the Pi is the ~1 MHz
    generic timer - so a bare-ESC wait is **~200 SECONDS** here. Same class of bug (an x86-calibrated
    cycle count), independent of the quantum.
+
+## CLOSED: the keyboard cannot be made interrupt-driven on this silicon (2026-08-14)
+
+**Asked:** program the DWC2's periodic scheduler so the controller runs the keyboard's interrupt
+endpoint itself and raises an IRQ on completion, instead of software sequencing it.
+
+**Answer: the hardware cannot.** Measured on the Pi 2, not inferred:
+
+```
+dwc2-svc: GHWCFG2=0x228ddd50 GHWCFG4=0x1ff00020 - arch 2 (internal DMA), descriptor DMA NOT supported
+```
+
+`GHWCFG4` bit 30 is clear. Descriptor (scatter/gather) DMA is the only mode in which this core walks a
+per-microframe schedule on its own; without it, software must sequence every split transaction. (QEMU
+reports `GHWCFG4=0x00000000`, which is an unimplemented register rather than an answer - it cannot
+settle this question, and the probe exists because the register was never read at all.)
+
+**Why `HCCHAR.ODDFRM` is not a way around it.** The core will defer a periodic transfer to a frame of
+the right parity, but ODDFRM selects odd/even FRAME only. The schedule needs MICROFRAME precision -
+start-split at `(current+1)&7` skipping microframe 6, complete-split at +2, retrying NYET in the
+following microframes - and 125 us resolution is below anything the controller will time for us. So
+`wait_uframe` is not sloppiness; it is supplying timing the hardware has no mechanism to supply.
+
+**What it costs, measured:** `kbd 2063ms` against `sleep 42862ms` = **4.6% of one core**, about 1.1% of
+the machine, for a working keyboard. The outer loop is already interrupt-driven (`recv_timeout` on the
+endpoint, woken by the kernel's IRQ delivery, `irq_unmask` for the level-triggered line); this cost is
+entirely inside the split sequencing.
+
+**The precedent agrees.** The Raspberry Pi's own `dwc_otg` driver solves this with an FIQ state machine
+(`dwc_otg.fiq_fsm_enable`) - which is what you build when the core cannot schedule splits itself.
+
+**The remaining options, and why the recommendation is to leave it:**
+
+| Option | Verdict |
+|---|---|
+| Descriptor DMA | Impossible - the bit is clear on this silicon |
+| FIQ/IRQ state machine in the kernel (the Pi's answer) | Works, and puts USB split scheduling back in RING 0 - re-adding a TCB member and undoing slice 5 for 4.6% of one core |
+| Block on the channel IRQ per split step | The complete-split window is ~125 us; an IPC wake cannot hit it, and a missed window loses the keystroke (the TT discards after the frame). Trades CPU for a worse keyboard |
+| Longer `bInterval` | Halves the cost, doubles keystroke latency. Available if the CPU ever matters more than the feel |
+
+Recorded rather than closed-by-fixing (§26.3): the constraint is the hardware's, and the cheapest
+correct answer is to keep paying 4.6% of one core.
 
 ## HARDWARE GOTCHA: a GPIO HAT can kill serial INPUT while output still works
 

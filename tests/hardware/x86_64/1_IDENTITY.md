@@ -20,7 +20,7 @@ Mirrors §22 (Tests 1-10 + IR1A/IR1B). Verifies constitutional invariants on rea
 
 | Test | Positive | Negative | Expected serial strings | HW status |
 |------|----------|----------|------------------------|-----------|
-| 1A - Bootstrap | ✓ | - | `kernel: 4 cores ready`, `supervisor: ready`, `registry: ready`, `logger: ready` | ✅ 2026-05-24 |
+| 1A - Bootstrap | ✓ | - | `smp: 4 cores ready`, `supervisor: ready`, `registry: ready`, `logger: ready` | ✅ 2026-05-24 |
 | 2A - Cap held | ✓ | - | `cap-test: 2A pass` | ✅ 2026-05-24 |
 | 2B - No cap | - | ✓ | `cap-test: 2B pass` | ✅ 2026-05-24 |
 | 2C - Wrong right | - | ✓ | `cap-test: 2C pass` | ✅ 2026-05-24 |

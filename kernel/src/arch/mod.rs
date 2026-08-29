@@ -12,7 +12,6 @@
 /// USB HID boot-protocol keyboard decoding, shared by the in-kernel USB drivers (`arch/arm/dwc2.rs`
 /// and `arch/aarch64/xhci.rs`). Pure logic, no CPU-specific anything - it lives here rather than in one
 /// arch's directory so the two ports cannot drift apart. See the module header.
-pub mod hid;
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;

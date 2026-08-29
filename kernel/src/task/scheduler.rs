@@ -133,6 +133,30 @@ fn bump_name_restart(name: &'static str) {
 }
 /// The recv endpoint owned by each task (None if the task has no endpoint). `AtomicU64` (0 = None;
 /// endpoint ids start at 100, so 0 is never a real recv endpoint) so the accessors stay unsafe-free.
+/// A task's SECOND endpoint - its reply mailbox - so death can reclaim it.
+///
+/// It leaked, and the leak PANICKED THE KERNEL. The reply endpoint is allocated at spawn, but only
+/// the primary was ever recorded, so `kill_task` reclaimed one of the two and the other stayed
+/// registered forever. Under a chaos storm - twelve supervisor respawns, each respawning the
+/// services beneath it - the 96-entry routing table filled and `register` panicked. Nothing above
+/// the kernel may take the kernel down, so a userspace kill storm must not be able to exhaust this
+/// table at all; that is what this array restores.
+static TASK_REPLY_ENDPOINT: [AtomicU64; MAX_TASKS] =
+    [const { AtomicU64::new(0) }; MAX_TASKS];
+
+/// Read and CLEAR a task's recorded reply endpoint, for a spawn that failed half-way and must give
+/// it back. Read-and-clear so the same endpoint cannot be reclaimed twice.
+pub fn take_task_reply_endpoint(slot: usize) -> Option<crate::ipc::EndpointId> {
+    if slot >= MAX_TASKS { return None; }
+    ep_from_u64(TASK_REPLY_ENDPOINT[slot].swap(0, Ordering::Relaxed))
+}
+
+/// Record a task's reply endpoint so `kill_task` can reclaim it. `None` clears it.
+pub fn set_task_reply_endpoint(slot: usize, endpoint: Option<crate::ipc::EndpointId>) {
+    if slot < MAX_TASKS {
+        TASK_REPLY_ENDPOINT[slot].store(ep_to_u64(endpoint), Ordering::Relaxed);
+    }
+}
 static TASK_ENDPOINT: [AtomicU64; MAX_TASKS] =
     [const { AtomicU64::new(0) }; MAX_TASKS];
 
@@ -171,6 +195,18 @@ pub fn monotonic_ticks() -> u64 {
 pub fn cycles_to_ticks(cycles: u64) -> u64 {
     let q = crate::arch::imp::boot::tsc_ticks_per_quantum();
     if q == 0 { 1 } else { (cycles / q).max(1) }
+}
+
+/// Convert a cycle count to MICROSECONDS, for the sub-tick sleep path.
+///
+/// `cycles_to_ticks` above floors everything shorter than a quantum to one whole tick, which is the
+/// right answer for a tick-based wake and the wrong answer for a caller that asked for 125 us. This
+/// keeps the resolution the caller actually requested; the arch decides whether it has hardware that
+/// can honour it.
+pub fn cycles_to_us(cycles: u64) -> u64 {
+    let q = crate::arch::imp::boot::tsc_ticks_per_quantum(); // cycles per 10 ms
+    if q == 0 { return 0; }                                  // uncalibrated: no honest conversion
+    cycles.saturating_mul(10_000) / q
 }
 
 /// Arm a timed wake for `slot` at absolute BSP-tick `deadline` (0 disarms).
@@ -305,6 +341,44 @@ static CORE_TOTAL_TICKS: PerCore<CachePaddedU64> = PerCore::new();
 /// The kernel is the last-resort recovery anchor (§6.3); if IT stalls silently nothing recovers it, so
 /// it must at minimum fail LOUD. `0` = that core has not ticked yet (still booting) - not a stall.
 static CORE_LAST_TICK_TSC: PerCore<CachePaddedU64> = PerCore::new();
+/// A wake that arrived for a task which was RUNNABLE at the time, and so left no other trace.
+///
+/// The block-then-wake handshake detects a racing wake by CAS: `block_and_reschedule` moves the task
+/// Running -> Blocked, and a wake that got there first has already moved it Running -> Ready, so the
+/// CAS fails and the task does not block. That works only while the task stays Running, and a
+/// PREEMPTION erases it. Concretely, for a synchronous `Call` on one core:
+///
+///   1. `call_dequeue` finds no reply yet and registers the caller as the endpoint's blocked_receiver.
+///      The caller is still RUNNING - it has not reached `block_and_reschedule`.
+///   2. A timer interrupt preempts it: Running -> Ready. Its peer runs and replies. The enqueue TAKES
+///      the blocked_receiver registration and wakes the caller - which is already Ready, so the wake
+///      is a no-op and leaves no record.
+///   3. The caller is rescheduled, Ready -> Running, and resumes exactly where it left off: at
+///      `block_and_reschedule`. The CAS Running -> Blocked now SUCCEEDS, because the state it would
+///      have tripped over was consumed by the ordinary preemption in step 2.
+///
+/// It blocks with its reply already sitting in the queue and its registration already consumed, so
+/// nothing is left to wake it. This flag is the missing record: set on every wake regardless of the
+/// target's state, and consumed by `block_and_reschedule`, which then declines to block and lets the
+/// caller re-check. Same race exists for a plain `recv`, and the same flag covers it.
+static TASK_WAKE_PENDING: [core::sync::atomic::AtomicBool; MAX_TASKS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_TASKS];
+
+/// How many times this core has HALTED in the idle path.
+///
+/// Diagnostic, and the one fact that separates the two remaining explanations for a slow `Call`. The
+/// idle lost-wakeup fix removed the dominant case, but a few calls still block once and wait almost
+/// exactly a second - the same signature. Either the core halted during that wait and a wake was
+/// still lost (a second hole, in a path the fix does not cover), or it never halted at all and the
+/// second is something else entirely wearing the same clothes. Sampling this across a call answers
+/// it outright instead of by argument.
+static CORE_IDLE_HALTS: PerCore<CachePaddedU64> = PerCore::new();
+
+/// Halts this core has taken in its idle path since boot. See `CORE_IDLE_HALTS`.
+pub fn core_idle_halts(core_id: usize) -> u64 {
+    CORE_IDLE_HALTS.get(core_id).0.load(Ordering::Relaxed)
+}
+
 /// Has the liveness watchdog announced itself? Only so the arming line is printed once, not per tick.
 static LIVENESS_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -398,6 +472,7 @@ pub fn init_arenas(n: usize) {
     CORE_ACTIVE_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_TOTAL_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_LAST_TICK_TSC.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
+    CORE_IDLE_HALTS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_RR_SLOT.init_with(n, |_| AtomicUsize::new(0));
     CORE_WAKE_HINT.init_with(n, |_| AtomicUsize::new(MAX_TASKS));
     CORE_PENDING_KSTACK_LEN.init_with(n, |_| AtomicUsize::new(0));
@@ -1084,6 +1159,8 @@ pub fn run(core_id: u32) -> ! {
                         }
                         let sched    = CORE_SCHED_CTX.as_mut_ptr(cid);
                         let next_ctx = TASK_CTX[next].assume_init_ref() as *const TaskContext;
+                        // Leaving idle: back to the 10 ms quantum before running real work.
+                        crate::arch::imp::boot::rearm_quantum_timer();
                         switch_context(sched, next_ctx);
                         // Execution returns here after the task is preempted and
                         // the scheduler loop is re-entered.
@@ -1095,10 +1172,6 @@ pub fn run(core_id: u32) -> ! {
                 }
             }
             None => {
-                // Core 0 drains the COM2 control channel when idle (§17).
-                if cid == 0 {
-                    crate::control::process_pending();
-                }
                 // Phase 2a - SLOW THE IDLE TICK (docs/power.md §14). With no ready tasks this core
                 // has nothing to preempt, yet its timer still fires ~100x/s purely to re-arm
                 // itself. Re-arm at ~1 s instead, so it wakes ~1x/s and sleeps deep in between.
@@ -1111,6 +1184,40 @@ pub fn run(core_id: u32) -> ! {
                 //  - It stays a lost-wake safety net: a missed WAKE_RECEIVER IPI is recovered on
                 //    the next ~1 s re-poll of the run queue, instead of parking the core forever.
                 //
+                // CLOSE THE LOST-WAKEUP WINDOW BEFORE HALTING.
+                //
+                // `pick_next` just said there is nothing to run. Between that answer and the halt
+                // below, interrupts were ENABLED - so a wake arriving in the gap (a cross-core
+                // WAKE_RECEIVER IPI, a device IRQ that queues a message) is taken and CONSUMED
+                // here, and the halt then sleeps through the event it was just told about. Nothing
+                // wakes the core until its next timer tick, and an idle core's tick is deliberately
+                // slowed to about a second - so one lost wake costs about a second.
+                //
+                // Not a hypothesis. Instrumenting `Call` printed, repeatedly,
+                //     call: slot 6 waited 1000079 us across 1 blocks
+                // ONE block and a flat ~1.000 s: a timer, not contention. It also explains the
+                // symptom that made no sense - that file operations were FASTER when the machine
+                // was BUSY - because a busy core never reaches this arm, so the race needs an idle
+                // core to happen at all. And `slow_idle` is gated on `cid != 0`, so only the APs
+                // slow their tick, which is why `fs` and `block-driver` (core 1) crawled while the
+                // shell and console (core 0) stayed responsive.
+                //
+                // The fix is the standard one, and closing this window is why `sti; hlt` exists:
+                // mask, RE-CHECK under the mask, and let the halt unmask atomically. An interrupt
+                // raised after the re-check is latched while masked and delivered the instant the
+                // halt unmasks, so it cannot be slept through. Whether that is sound is a property
+                // of the silicon, so the arch is asked rather than assumed - see
+                // `idle_mask_before_halt`, which ARM answers NO because its idle path does real
+                // work that needs interrupts enabled.
+                if crate::arch::imp::interrupts::idle_mask_before_halt() {
+                    crate::arch::imp::disable_interrupts();
+                    if pick_next(cid).is_some() {
+                        // Work arrived in the window. Do not halt - go round and run it.
+                        crate::arch::imp::enable_interrupts();
+                        continue;
+                    }
+                }
+
                 // Excluded: the BSP (it drives MONOTONIC_TICKS, scan_timed_wakes and the COM2/COM1
                 // polling, which must stay ~100 Hz), and any core that cannot halt (a Goldmont+
                 // sti-spin core gains nothing from a slower timer, so its behaviour is untouched).
@@ -1136,6 +1243,7 @@ pub fn run(core_id: u32) -> ! {
                 // ticks and IPIs.  The compiler_fence above forces a fresh reload
                 // of TASK_STATE on every iteration so wakeups from other cores
                 // are always visible.
+                CORE_IDLE_HALTS.get(cid).0.fetch_add(1, Ordering::Relaxed);
                 crate::arch::imp::wait_for_interrupt();
                 // Woke - by the slow idle timer, a WAKE_RECEIVER IPI, or a device IRQ. Restore the
                 // normal preemption quantum so a task picked on the next iteration is preemptible
@@ -1190,7 +1298,11 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // tick (§17).  The idle branch can't be relied on when core 0 always
         // has ready tasks.  COM1 polling replaces IRQ 4 (fully masked by PIC).
         if cid == 0 {
-            crate::control::process_pending();
+            // H1: surface any IOMMU translation fault - a confined device's DMA blocked outside its
+            // granted arena (§6.4). Cheap when quiet (a head/tail compare). This is ISOLATION
+            // reporting, so it runs on its own here rather than inside the COM2 control channel it
+            // used to share a function with (C1-6).
+            crate::arch::imp::iommu::drain_event_log();
             crate::arch::imp::uart_rx_poll();
             // Advance the BSP tick clock + wake any task whose recv_timeout deadline elapsed
             // (§12 timed-wait). BSP-driven because the BSP ticks reliably while APs idle; the
@@ -1245,11 +1357,15 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     // Report the overrun as a MULTIPLE of the deadline rather than in quanta: the
                     // quantum figure is precisely what is unavailable on some arches, and a panic message
                     // must not depend on the thing whose absence disabled this check in the first place.
+                    // The IRQ tally is what tells a reader WHICH wedge this is: a frozen count
+                    // means the core is not taking interrupts at all, a climbing one means it is and
+                    // the tick inside the handler is being skipped. Same symptom, opposite causes.
+                    let (irqs, last_src) = crate::arch::imp::core_irq_debug(other as u32);
                     panic!(
                         "LIVENESS WEDGE: core {} made NO progress for {} counter ticks ({}x the {} \
-                         allowed); last running task slot {}; detected by core {}. No forward progress \
-                         = loud stop.",
-                        other, dark, dark / deadline, deadline, stuck_task, cid
+                         allowed); last running task slot {}; it has taken {} interrupts, last source \
+                         {:#010x}; detected by core {}. No forward progress = loud stop.",
+                        other, dark, dark / deadline, deadline, stuck_task, irqs, last_src, cid
                     );
                 }
             }
@@ -1357,7 +1473,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // (run()'s loop) instead of switching to `next`, so the heavy ~22 ms spawn runs from run()'s
         // loop top with IF=1 - NEVER here in the IF=0 ISR, where it can't ACK other cores' TLB-shootdown
         // / WAKE_RECEIVER IPIs and wedges the box under a storm (the architectural proof; see
-        // scheduler::run + control::process_pending). `next` is left untouched (still Ready), so
+        // scheduler::run). `next` is left untouched (still Ready), so
         // pick_next re-picks it after the respawn. `prev` was set Ready by the CAS above, so it too is
         // rescheduled. This mirrors the is_dead switch above, but saves `prev` (it is live) so it resumes.
         if cid == 0 && crate::task::supervisor_respawn_pending() {
@@ -1465,6 +1581,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             TASK_CTX[next].assume_init_ref() as *const TaskContext
         };
 
+        if !abort_to_sched { leaving_idle_restore_quantum(prev); }
         switch_context(current_ctx, next_ctx);
     }
 }
@@ -1652,6 +1769,7 @@ pub fn yield_current() {
             TASK_CTX[next].assume_init_ref() as *const TaskContext
         };
 
+        if !abort_to_sched { leaving_idle_restore_quantum(prev); }
         switch_context(current_ctx, next_ctx);
         crate::arch::imp::enable_interrupts();
     }
@@ -1660,6 +1778,32 @@ pub fn yield_current() {
 /// Return the slot index of the currently-running task on this core.
 ///
 /// Returns `IDLE` (== MAX_TASKS) if the scheduler loop is active.
+/// Restore this core's preemption timer when it stops being idle.
+///
+/// THE IDLE TIMER LEAKED, and it made the whole machine run at 1 Hz. An idle core slows its tick to
+/// about a second to save power, and the idle loop restores the 10 ms quantum on the line AFTER its
+/// halt returns. But the halt does not always return: the timer interrupt can pick a runnable task
+/// and `switch_context` straight from the scheduler context INTO that task, so the idle loop is
+/// never resumed and the restore is never reached. The core then runs real work with a ONE SECOND
+/// preemption period.
+///
+/// Everything that followed is that one fact. A Ready task waits up to a second for its turn, so an
+/// `fs` write of 17 block round trips took 17 to 19 seconds; the serial log lands on integer-second
+/// boundaries because the whole machine advances on that tick; and it is WORSE WHEN THE MACHINE IS
+/// QUIET because the slow timer can only be armed by going idle in the first place. The instrumented
+/// `Call` reported `0 core halts` across a one-second wait, which is what finally placed it: the core
+/// was not asleep and had not lost a wake - it was awake, and simply not preempting.
+///
+/// So the restore belongs at every point the core leaves idle, not only on the path that happens to
+/// return to the idle loop. Idempotent and cheap (one LAPIC write), and a no-op on every arch whose
+/// `rearm_*` pair is a stub.
+#[inline]
+fn leaving_idle_restore_quantum(prev: usize) {
+    if prev >= MAX_TASKS {
+        crate::arch::imp::boot::rearm_quantum_timer();
+    }
+}
+
 pub fn current_task_slot() -> usize {
     let cid = current_core_id();
     CORE_CURRENT.get(cid).load(Ordering::Relaxed)
@@ -1694,6 +1838,10 @@ pub fn wake_by_slot(slot: usize, result: i64) {
             let first = TASK_STATE[slot].load(Ordering::Acquire);
             if first == TaskState::Dead as u8 { return; }
             TASK_WAKEUP_ERR[slot] = result;
+            // Record the wake BEFORE the state CAS below, and unconditionally - including when the
+            // target is already Ready, which is exactly the case the CAS cannot represent. See
+            // `TASK_WAKE_PENDING`.
+            TASK_WAKE_PENDING[slot].store(true, Ordering::Release);
 
             // CAS retry loop: transition any non-Dead state → Ready.
             //
@@ -1883,6 +2031,18 @@ pub fn kill_task_by_slot(slot: usize) {
         crate::arch::imp::release_console_foreground_if_owner(slot as u32);
 
         // Kill the task's endpoint if it has one.
+        // The reply mailbox dies with its task. Reclaiming only the primary is what filled the
+        // routing table and panicked the kernel - see `TASK_REPLY_ENDPOINT`.
+        let reply_ep = ep_from_u64(TASK_REPLY_ENDPOINT[slot].load(Ordering::Relaxed));
+        if let Some(rep_id) = reply_ep {
+            let (rx, tx) = crate::ipc::routing::kill_endpoint(rep_id);
+            if let Some(s) = rx { if s != slot { wake_by_slot(s, -7); } }
+            if let Some(s) = tx { if s != slot { wake_by_slot(s, -7); } }
+            crate::capability::table::mark_dead_resource(
+                crate::capability::cap::ResourceId::from(rep_id));
+            TASK_REPLY_ENDPOINT[slot].store(0, Ordering::Relaxed);
+        }
+
         if let Some(ep_id) = task_ep {
             // Bump generation in routing table and wake any blocked tasks.
             let (rx_slot, tx_slot) = crate::ipc::routing::kill_endpoint(ep_id);
@@ -1942,17 +2102,25 @@ pub fn kill_task_by_slot(slot: usize) {
             // ours); the respawned driver re-registers and re-opens its gate. The vectors mirror the
             // ServiceConfig hw_irqs (task/mod.rs) - the same by-name device coupling the DMA-quiesce block
             // below already uses; block-driver + nic-driver currently declare no hw_irq.
-            let dead_irq: u8 = match task_name {
-                "xhci" => 0x28,
-                "ehci" => 0x29,
-                _ => 0xFF,
-            };
-            if dead_irq != 0xFF {
-                crate::interrupt::route::unregister(dead_irq);
-                // Mask the source: effective for a level/INTx line (the ehci); a no-op for edge/MSI (the
-                // xhci), whose stray MSI is already harmless once the route is None (deliver finds no
-                // endpoint) and stops at the respawned driver's HCRST.
-                crate::arch::imp::ioapic::mask_vector(dead_irq);
+            // RELEASE BY ENDPOINT, not by service NAME. This was a hardcoded list - "xhci" =>
+            // 0x28, "ehci" => 0x29, anything else => release nothing - and `dwc2` was not on it, so
+            // the ARM USB driver kept its IRQ route across every restart. The kernel said so every
+            // time ("IRQ 41 already routed - overwriting (second claim or a missed unregister?)"),
+            // and the answer was: a missed unregister, here. Interrupt delivery to that service was
+            // erratic across restarts because of it.
+            //
+            // The routing table already maps line -> owning endpoint, so ask it. A list of names
+            // cannot help but go stale as services are added, renamed, or ported to an arch with a
+            // different vector; this cannot. Masking still happens - `unregister_endpoint` masks
+            // each line it releases, which is what stops a reused endpoint id inheriting the dead
+            // driver's interrupts.
+            let mut released = crate::interrupt::route::unregister_endpoint(ep_id);
+            if let Some(rep) = reply_ep {
+                released += crate::interrupt::route::unregister_endpoint(rep);
+            }
+            if released > 0 {
+                crate::kprintln!(
+                    "kill_task: slot={} '{}' released {} IRQ route(s)", slot, task_name, released);
             }
 
             // Reclaim the endpoint id itself for reuse (§14.2). Its routing entry is Dead and its
@@ -1967,9 +2135,13 @@ pub fn kill_task_by_slot(slot: usize) {
         // restart when it dies + gets respawned. A transient utility the shell re-invokes (observe-*,
         // greet, ...) is never bumped, so it never shows a restart - RESTARTS means "blew up and was
         // recovered", not "legitimately closed". The respawn reads the new count via next_restart_count.
+        // `time` and `control` were missing here too, which is the SECOND half of the same hardware
+        // symptom: even once their deaths notify the supervisor, a name absent from THIS set never
+        // accrues a restart, so `observe` reports 0 for a service that died 41 times. The operator's
+        // only view of recovery said nothing happened.
         if matches!(task_name,
-            "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "supervisor" | "counter"
-            | "nic-driver" | "net-stack")
+            "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "console" | "supervisor"
+            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control")
         {
             bump_name_restart(task_name);
         }
@@ -1989,8 +2161,31 @@ pub fn kill_task_by_slot(slot: usize) {
         // `counter` (examples/counter) is restartable too: it persists its state to `fs` and
         // reconstructs it on respawn (§14/§15), so its own death notifies the supervisor, which
         // respawns it (counter-test build only - it is absent elsewhere, so this never fires there).
-        if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "counter"
-            | "nic-driver" | "net-stack") {
+        // C5-1: `dwc2` was MISSING from this set, and it is the ARM32 USB host - storage, keyboard and
+        // networking all ride on it. It was spawned and never watched, so its death took all three down
+        // until reboot: a service made special by omission rather than by decision, which is the version
+        // of that violation nobody argues for and everybody ships. It is arm-only, so on other ports the
+        // name simply never appears here (the same shape as `counter`, which exists in one build).
+        // `time` and `control` were MISSING here for exactly as long as they existed - the same
+        // omission as `dwc2` above, committed in the same session that wrote the comment warning about
+        // it. Hardware showed it plainly: a 100-round storm killed `time` 41 times and `control` 47,
+        // and not one line said "died, restarting". They came back only when the supervisor's periodic
+        // reconcile noticed ("missed death notification"), so between the kill and that sweep the wall
+        // clock and the operator channel were simply gone - and `observe` reported ZERO restarts for
+        // both, because the counter tracks the notification path. A service that recovers by luck reads
+        // as a service that never fell over.
+        //
+        // The rule is now DERIVED and enforced (`V-managed-watched`): every name the supervisor manages
+        // must appear here. Two lists describing one fact is the shape that caused this, and it is the
+        // third time this session (ARM_SERVICES vs arm_built was the second).
+        // The terminal died, so nothing is rendering the display any more. Hand the screen back to the
+        // kernel's boot floor until the respawned instance takes it, or the machine goes dark with no
+        // way to say why (invariant 12).
+        if task_name == "console" {
+            crate::bootcon::reclaim_on_death();
+        }
+        if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "console"
+            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control") {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),
@@ -2244,6 +2439,26 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         let slot = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         assert!(slot < MAX_TASKS && TASK_VALID[slot].load(Ordering::Acquire),
                 "block_and_reschedule: no running task");
+
+        // A wake already arrived - do not block on top of it. See `TASK_WAKE_PENDING` for the race
+        // this closes (a preemption between registering as blocked_receiver and blocking here
+        // consumes the registration and leaves the CAS below nothing to trip over).
+        //
+        // RECV ONLY, deliberately. A blocked SENDER is woken because the kernel DELIVERED its
+        // `pending_send` from the routing entry; declining to block would skip that delivery and
+        // silently drop the request, turning a latency bug into a lost message. A blocked receiver
+        // has no such side effect - its caller loops and re-checks the queue, which is precisely what
+        // it should do.
+        //
+        // Returns 0, never the stored wake result: a stale error from an earlier wake would abort a
+        // healthy call. Zero means "something changed, look again", and the re-check discovers the
+        // real terminal condition for itself - a dead peer still surfaces as ReplyDead there.
+        if state == TaskState::BlockedOnRecv
+            && TASK_WAKE_PENDING[slot].swap(false, Ordering::AcqRel)
+        {
+            crate::arch::imp::enable_interrupts();
+            return 0;
+        }
 
         // Atomically transition Running → Blocked.
         //

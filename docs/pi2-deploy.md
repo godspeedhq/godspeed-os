@@ -108,7 +108,8 @@ no reboot.
 
 A USB mass-storage stick acknowledges a write when it has the data in its own buffer, not when it is on
 flash. Our stick **refuses SCSI SYNCHRONIZE CACHE**, so durability rides on **FUA** (force-unit-access
-on every write - `USE_FUA` in `arch/arm/dwc2.rs`), which this stick honours. With FUA on, every
+on every write - `USE_FUA` in `services/dwc2`, formerly `arch/arm/dwc2.rs` before the USB stack left the
+kernel), which this stick honours. With FUA on, every
 acknowledged write is on the medium before the ack, so a power cut does not lose the tail of a write
 sequence. See `CLAUDE.md` §6.1 (the backend-conditional recovery amendment) for the full treatment.
 

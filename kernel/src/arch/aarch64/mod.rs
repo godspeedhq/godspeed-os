@@ -29,8 +29,6 @@ pub mod mmu;
 pub mod ptables;
 #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
 pub mod sched_demo;
-#[cfg(all(feature = "pi4", feature = "pi4-sched-spawn"))]
-pub mod sched_spawn;
 #[cfg(feature = "pi4")]
 pub mod sched_supervisor;
 #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
@@ -1057,8 +1055,6 @@ extern "C" fn boot_high() -> ! {
     // A REAL service through the neutral spawn path. Checked first: if both features are on, running a
     // compiled service is the more informative of the two, and neither returns.
     // A demo, if one was asked for. Explicit request wins: the point of building with one is to watch it.
-    #[cfg(all(feature = "pi4", feature = "pi4-sched-spawn"))]
-    sched_spawn::run();
 
     #[cfg(all(feature = "pi4", feature = "pi4-sched-demo"))]
     sched_demo::run(&boot_info);
@@ -1066,10 +1062,7 @@ extern "C" fn boot_high() -> ! {
     // Otherwise the real OS bootstrap: the kernel's ONE direct spawn is the supervisor, which spawns
     // the rest. This is the DEFAULT, so `--features pi4` builds the OS rather than a kernel that boots
     // and halts - the deployed image and the tested image are then the same build.
-    #[cfg(all(
-        feature = "pi4",
-        not(any(feature = "pi4-sched-spawn", feature = "pi4-sched-demo"))
-    ))]
+    #[cfg(all(feature = "pi4", not(feature = "pi4-sched-demo")))]
     sched_supervisor::run();
 
     put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.
@@ -1254,6 +1247,8 @@ pub fn hw_random() -> Option<u32> { None }
 /// (the block driver then refuses to guess a divider). Only the Pi's ARM port learns this,
 /// from the VideoCore mailbox at boot.
 pub fn emmc_base_clock_hz() -> u32 { 0 }
+/// No board mailbox on this architecture: the driver uses whatever the chip holds. See query 23.
+pub fn board_mac_packed() -> Option<u64> { None }
 
 /// USB mass-storage block device (the ARM DWC2 Bulk-Only bridge). Only the Pi's ARM port has an
 /// in-kernel USB stack; elsewhere disks are userspace drivers, so there is no device here.
@@ -1309,6 +1304,12 @@ pub fn usb_disk_flush() -> bool { false }
 /// ARM port spent its entire bring-up silently undefended that way - the watchdog was inert because it
 /// keyed off an unrelated stubbed constant, so a real wedge produced no diagnostic at all. A safety net
 /// that is absent should at least be absent loudly (§26.4); here it is simply present.
+/// (interrupts dispatched, last GIC interrupt ID) for `core` - what the liveness panic reports.
+/// Tallied at IRQ entry in `exceptions.rs`; the 32-bit port's twin lives in `arch/arm/irq.rs`.
+pub fn core_irq_debug(core: u32) -> (u32, u32) {
+    exceptions::core_irq_debug(core)
+}
+
 #[cfg(feature = "pi4")]
 pub fn liveness_deadline_cycles() -> u64 { timer::frequency().saturating_mul(10) }
 #[cfg(not(feature = "pi4"))]
@@ -1318,22 +1319,22 @@ pub fn liveness_deadline_cycles() -> u64 { 0 }
 /// timer runs its syscalls atomically. Nothing to do here yet.
 pub fn note_user_task(_slot: usize) {}
 
-// --- Framebuffer console backend (`crate::fbcon`) ---
+// --- Boot/panic console floor backend (`crate::bootcon`) ---
 //
-// The neutral console owes each arch two things (see `crate::fbcon`'s module header): publish a written
-// rectangle, and say whether reading the framebuffer back is cheap. On the Pi 4 both live in `video`,
-// next to the mailbox call that obtained the framebuffer in the first place.
-
-/// On the Pi 4 the framebuffer is ordinary RAM the GPU scans out of, covered by the kernel's direct map
-/// as Normal cacheable memory - so reading it back costs what writing it does, and the console can
-/// scroll by copying within the framebuffer instead of repainting from its shadow grid.
+// The floor owes each arch ONE thing (see `crate::bootcon`'s module header): publish a written
+// rectangle. On the Pi 4 it lives in `video`, next to the mailbox call that obtained the framebuffer in
+// the first place - the framebuffer is ordinary RAM the GPU scans out of, covered by the kernel's direct
+// map as Normal CACHEABLE memory, so a written rectangle genuinely has to be cleaned to the point of
+// coherency before the GPU can see it.
+//
+// That cacheable mapping is also why this port does not yet hand the framebuffer to the `console`
+// service: the service would map the same physical pages non-cacheable, and ARM leaves mismatched
+// memory attributes UNPREDICTABLE. Carving the framebuffer out of a blanket block mapping is real
+// page-table work and needs Pi 4 hardware to verify, so it is deliberately not bundled here. Until
+// then the Pi 4 renders through the floor exactly as it does today.
 #[cfg(feature = "pi4")]
-pub use video::{fb_commit, FB_READBACK_CHEAP};
+pub use video::fb_commit;
 
-/// No framebuffer on the QEMU `virt` demarcation target. `false` selects the repaint-from-shadow-grid
-/// path, which never reads the framebuffer back.
-#[cfg(not(feature = "pi4"))]
-pub const FB_READBACK_CHEAP: bool = false;
 #[cfg(not(feature = "pi4"))]
 pub fn fb_commit(
     _base: usize, _pitch: usize, _bpp: usize,
@@ -1965,6 +1966,11 @@ pub mod page_tables {
             const USER     = 1 << 2;
             const PWT      = 1 << 3;
             const PCD      = 1 << 4;
+            // A framebuffer, not device registers: RAM the display controller scans out. Each arch
+            // picks the weakest type that is still coherent without cache maintenance - on AArch64
+            // Normal Non-cacheable, which gathers and buffers writes where Device-nGnRnE cannot. An
+            // arch that has nothing better may ignore it and keep its uncached-MMIO type.
+            const WRITE_COMBINE = 1 << 5;
             const NO_EXEC  = 1 << 63;
         }
     }
@@ -2236,6 +2242,29 @@ pub mod interrupts {
         // so every caller must re-check its condition rather than assume a wake means progress.
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
     }
+    #[cfg(feature = "pi4")]
+    /// May the idle loop MASK interrupts, re-check for runnable work, and then halt - relying on the
+    /// halt to unmask and halt in one indivisible step?
+    ///
+    /// This exists to close a lost-wakeup window, and the answer is a property of the silicon, so each
+    /// arch answers for itself rather than inheriting x86's. The window: the idle loop asks `pick_next`
+    /// for work, is told there is none, and halts. With interrupts ENABLED across that gap, a wake
+    /// landing in it is taken and consumed BEFORE the halt - and the halt then sleeps through the very
+    /// event it was told about, until the next timer tick. An idle core's tick is deliberately slowed to
+    /// about a second, so the cost of losing one is about a second.
+    ///
+    /// x86 says yes: `sti; hlt` is architecturally atomic, so masking first, re-checking, and then
+    /// executing it cannot lose an interrupt raised in between - it is latched while masked and taken
+    /// the instant `sti` retires.
+    ///
+    /// ARM says NO, and this is the reason the guard is a question rather than a rule: both ARM ports do
+    /// real work inside `wait_for_interrupt` (draining the UART so a keystroke can wake a blocked shell,
+    /// watching hub ports so a replug is noticed) and that work REQUIRES interrupts enabled - their own
+    /// comments say masking there would freeze the machine for the ~100 ms an enumeration takes. Masking
+    /// them to fix an x86 race would be importing our answer into their design (26.14). They keep the
+    /// narrower window; it is recorded here rather than silently left (26.7).
+    pub fn idle_mask_before_halt() -> bool { false }
+
     /// The idle loop may `wfi`: the generic timer keeps ticking through it, so a halted core is woken
     /// by its own 100 Hz tick even if nothing else ever targets it.
     #[cfg(feature = "pi4")]
@@ -2251,6 +2280,9 @@ pub mod interrupts {
     pub fn local_irq_restore(was_enabled: bool) {}
     #[cfg(not(feature = "pi4"))]
     pub fn wait_for_interrupt() {}                           // wfi
+    #[cfg(not(feature = "pi4"))]
+    pub fn idle_mask_before_halt() -> bool { false }
+    /// The stub arch layer cannot wake a halted core, so its idle loop must not halt.
     #[cfg(not(feature = "pi4"))]
     pub fn idle_can_halt() -> bool { false }
     pub fn send_eoi() {}                                     // GIC EOIR
@@ -2372,11 +2404,6 @@ pub mod iommu {
 }
 
 // ---------------------------------------------------------------------------
-pub mod fb {
-    pub fn dims_packed() -> u64 { 0 }
-}
-
-// ---------------------------------------------------------------------------
 /// Masking a device interrupt while a userspace driver handles it.
 ///
 /// Named `ioapic` because that is the x86 mechanism the neutral layer calls through; here it is the
@@ -2466,3 +2493,10 @@ pub mod ap_boot {
 /// and needed explicit `dma_sync` on every buffer; a service has no such primitive, so the mapping
 /// must remove the need rather than rely on the driver author remembering.
 pub const DMA_ARENA_UNCACHED: bool = true;
+
+/// Where a driver's DMA arena is mapped in ITS address space.
+///
+/// Per-arch because it is an ADDRESS, and an address is only meaningful in an address space that can
+/// hold it. The shared constant was `0x2_0000_0000`, an x86_64 value: on ARMv7 that is above the 32-bit
+/// ceiling, and the mapper truncated it to 0, laying the arena over the kernel's low megabyte.
+pub const DRIVER_DMA_VA: u64 = 0x2_0000_0000;

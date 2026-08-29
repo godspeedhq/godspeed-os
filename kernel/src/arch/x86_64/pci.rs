@@ -14,6 +14,25 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use portable_atomic::AtomicU64;
 use crate::smp::SpinLock;
 
+/// C8-1: how long the firmware gets to release a controller it still owns. A DURATION, not a read
+/// count. Both handoff waits were `for _ in 0..1_000_000u32`, and a million config reads is a
+/// different wall-clock wait on every machine - the same code gives the BIOS milliseconds on one board
+/// and seconds on another, with neither number chosen against the spec. The truth remains the
+/// ownership bit clearing; the clock only bounds how long we keep asking for it.
+const BIOS_HANDOFF_CYCLES: u64 = 2_000_000_000;
+
+/// Read the timestamp counter.
+///
+/// One documented `unsafe` instead of four inline ones: the C8-1 handoff waits need a clock in two
+/// places, each testing it twice, and repeating the block would have grown the audited unsafe surface
+/// four times over for one idea (§18.4).
+#[inline]
+fn rdtsc() -> u64 {
+    // SAFETY: `_rdtsc` reads a CPU counter. No memory is touched, no state is changed, and it is
+    // available on every x86_64 target this kernel builds for.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
 
@@ -324,7 +343,11 @@ pub fn ehci_bios_handoff() {
                 // Claim OS ownership and wait for the firmware to release.
                 config_write32(bus, dev, func, ptr, cap | (1 << 24));
                 let mut ok = false;
-                for _ in 0..1_000_000u32 {
+                // C8-1: was `for _ in 0..1_000_000u32`. A million config reads is a different wait on
+                // every machine. The truth is the firmware clearing its ownership bit; the clock only
+                // bounds how long we keep asking.
+                let t0 = rdtsc();
+                while rdtsc().wrapping_sub(t0) < BIOS_HANDOFF_CYCLES {
                     let v = config_read32(bus, dev, func, ptr);
                     if v & (1 << 16) == 0 {
                         ok = true;
@@ -413,8 +436,11 @@ pub fn xhci_bios_handoff() {
             if cap & (1 << 16) != 0 {
                 // SAFETY: claim OS ownership.
                 unsafe { core::ptr::write_volatile(cap_va as *mut u32, cap | (1 << 24)) };
+                // C8-1: bounded by the clock, not by a read count - the MMIO twin of the config-space
+                // handoff above.
                 let mut ok = false;
-                for _ in 0..1_000_000u32 {
+                let t0 = rdtsc();
+                while rdtsc().wrapping_sub(t0) < BIOS_HANDOFF_CYCLES {
                     // SAFETY: poll the same register for BIOS release.
                     if unsafe { core::ptr::read_volatile(cap_va as *const u32) } & (1 << 16) == 0 {
                         ok = true;

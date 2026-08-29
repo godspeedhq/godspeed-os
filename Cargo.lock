@@ -278,6 +278,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "console"
+version = "0.1.0"
+dependencies = [
+ "godspeed-sdk",
+ "noto-sans-mono-bitmap",
+]
+
+[[package]]
+name = "control"
+version = "0.1.0"
+dependencies = [
+ "godspeed-sdk",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -312,6 +327,13 @@ dependencies = [
 
 [[package]]
 name = "driver-skeleton"
+version = "0.1.0"
+dependencies = [
+ "godspeed-sdk",
+]
+
+[[package]]
+name = "dwc2"
 version = "0.1.0"
 dependencies = [
  "godspeed-sdk",
@@ -808,7 +830,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "time",
+ "time 0.3.47",
  "url",
  "uuid",
 ]
@@ -1514,6 +1536,13 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "time"
+version = "0.1.0"
+dependencies = [
+ "godspeed-sdk",
 ]
 
 [[package]]

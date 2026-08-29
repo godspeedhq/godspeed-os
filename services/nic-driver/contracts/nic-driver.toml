@@ -12,6 +12,13 @@ limit   = "16MiB"
 # Reach the BAR via ctx.mmio().
 hw_device = "nic"
 log_write = true
+# ARM32 (Pi 2) ONLY, and declared here because a communication path that exists in the kernel but not
+# in the contract is exactly what Commandment IV forbids. The USB stack moved out of the kernel into the
+# `dwc2` SERVICE, so this driver reaches its ethernet device by IPC (ops 0x10 INFO / 0x11 TX / 0x12 RX)
+# instead of the NET_DEVICE syscalls described below. The kernel grants the send cap only on arm; on x86
+# and aarch64 there is no such service and the grant is absent. That asymmetry is correct rather than
+# sloppy: a contract states what the service NEEDS, and the OS decides whether to grant it (§13.3).
+ipc_send  = ["dwc2"]
 # ARM NOTE (userspace-audit Audit 5, A5-U1) - applies to BOTH ARM ports: on neither is there a PCIe NIC,
 # so `hw_device = "nic"` resolves to nothing; instead the kernel grants this service the NET_DEVICE
 # capability BY NAME (frame syscalls 42-44 - `service_privileges` in kernel `task/mod.rs`, arch-gated to
@@ -34,9 +41,27 @@ log_write = true
 # embedded binary selected, and an unused capability is a smaller problem than a driver that cannot
 # reach its device.
 
+# PLACEMENT IS ARCH-CONDITIONAL, so it is NOT declared here.
+#
+# On x86 and aarch64 this service sits on core 1. On arm32 it is unpinned: cross-core wakes are
+# immediate there now (the BCM2836 mailbox doorbell), and core 0 is kept clear for `dwc2`, whose
+# split transactions must hit 125 us windows.
+#
+# A `[placement] core` line here would be a SECOND copy of that decision, and it would be wrong on
+# one of the two arches whatever value it carried - the drift Commandment III forbids. The single
+# source is `ServiceConfig.preferred_core` in kernel/src/task/mod.rs, which both the boot and the
+# RESTART paths consult. The comments that used to sit here saying "the kernel overrides this to
+# core 0" were describing exactly that duplication, and are now unnecessary as well as stale.
+
 [placement]
-core = 1   # a driver pins to the core its IRQ will route to (interrupt locality, §12.2)
-# ARM (Pi 2): the kernel overrides this to core 0 - the in-kernel DWC2 USB-net device is driven only from
-# core 0, and the NET_DEVICE syscalls guard on that core (userspace-audit Audit 5). This x86 value stands.
-# AArch64 (Pi 4): NOT overridden - core 1 as written. GENET is reached by MMIO from whichever core makes
-# the syscall, so there is no core-0 constraint to honour, and core 1 keeps it beside net-stack and fs.
+# DECLARED. The prose above argued that stating a core here would be a second copy of an
+# arch-conditional decision - and it is right that ONE number cannot be correct for both arches. But
+# saying nothing is not neutral: the kernel pins this service, the contract claims no opinion, and
+# `scripts/contract_check.py` reads that as what RUNS differing from what is DECLARED. It failed the
+# audit on exactly these three files.
+#
+# The convention the checker enforces resolves it: this line is the x86 value, which is what the
+# reconcile compares against, and the arch-conditional lives ONCE in `ServiceConfig.preferred_core`
+# (kernel/src/task/mod.rs), where arm32 puts it on core 1 beside net-stack. The reasoning for the ARM
+# choice sits beside that code rather than being restated here, so there is still one source per fact.
+core = 1

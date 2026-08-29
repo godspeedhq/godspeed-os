@@ -24,11 +24,65 @@ use godspeed_sdk::ServiceContext;
 // cards). There is no safe way to use a single-slot Pi's boot card as storage, so the backend is a
 // hazard, not a fallback. The file is kept for reference (a future board with a SEPARATE storage medium
 // could use it), but it is not a module here so it cannot be reached - see `backend_run`.
+/// A reply cap plus the CORRELATION TAG of the request it answers.
+///
+/// Every reply to `fs` carries the tag of the request that asked for it, so a reply that arrives out
+/// of order is DETECTABLE rather than silently believed. Chaos proved the need: after 98 rounds of
+/// killing and restarting these services the block protocol came back out of step, `fs` read LBA 7702
+/// and got a 17-byte reply where a 513-byte block belonged, and the only reason it noticed was that
+/// the SHAPE happened to be wrong. Two reads of different blocks are both 513 bytes and shape cannot
+/// separate them at all - one would simply be believed, which is silent data corruption.
+///
+/// The tag lives in the reply HANDLE rather than being remembered separately, so it cannot be
+/// forgotten: there is no way to answer a request without it, and the compiler says so.
+#[derive(Clone, Copy)]
+pub struct Reply {
+    pub cap: godspeed_sdk::CapHandle,
+    pub tag: u8,
+}
+
+impl Reply {
+    /// Answer, with the tag in front. `body` is the reply exactly as it was before tagging.
+    pub fn send(&self, ctx: &godspeed_sdk::ServiceContext, body: &[u8]) {
+        // 513 is the largest body (status + one block); one more for the tag. Fixed, on the stack,
+        // no allocation (§26.6.1).
+        let mut out = [0u8; 514];
+        out[0] = self.tag;
+        let n = body.len().min(out.len() - 1);
+        out[1..1 + n].copy_from_slice(&body[..n]);
+        // TRY_SEND, NEVER SEND - §8.9, and a deadlock rather than a style preference.
+        //
+        // A blocking reply can be held forever by a caller whose queue is full, and the chain is real:
+        // `fs` sends a request and then waits for the answer ON ITS OWN ENDPOINT, which keeps receiving
+        // client requests meanwhile. Sixteen arrive - a busy shell, or chaos flood-storming it - and the
+        // queue is full. With a blocking send nothing breaks it: this driver waits for room, `fs` waits
+        // for the reply, the shell waits behind `fs`. Dropping it instead is recoverable, because the
+        // caller's deadline fires and it retries. Every other service in the tree already does this;
+        // `block-driver` and `fs` were the two exceptions, and they are the persistence path.
+        //
+        // Logged on EVERY failure, deliberately un-rate-limited, and the protocol is why that is
+        // bounded: this driver's caller is `fs`, which has at most one request outstanding, so a repeat
+        // means its queue is persistently full - abnormal, and worth saying every time. A caller that
+        // has DIED yields at most the requests already in flight. Neither can flood (§26.7, §26.6).
+        // Measured: 55 in a 1,000-round chaos soak, every one beside a `kill_task` of the caller.
+        //
+        // The message names BOTH causes because they are different faults and this cannot tell them
+        // apart from here. Under chaos it is almost always the caller being killed mid-request
+        // (`liveness=Dead` sits beside each one), which is ordinary. A full queue on a LIVE caller is
+        // genuine backpressure and is the one worth chasing - so the line must not assert the second
+        // when it is seeing the first, which the earlier wording did.
+        if ctx.try_send_by_handle(self.cap, &godspeed_sdk::Message::from_bytes(&out[..1 + n])).is_err() {
+            ctx.log("block-driver: reply undelivered (caller is gone, or its queue is full) - it will time out and retry");
+        }
+    }
+}
+
 #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
 mod ahci;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 mod usbdisk;
-#[cfg(not(target_arch = "arm"))]
+// Now on BOTH ARM targets: arm32 reaches the `dwc2` service and aarch64 the `xhci` service, through
+// this one client. The wire format is identical, so only the service name differs.
 mod xhciblk;
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
@@ -77,8 +131,9 @@ fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { ahci::run(ct
 fn backend_run(ctx: &ServiceContext) -> ! {
     // Where the sector count comes from is the same build-time choice usbdisk.rs documents: the
     // in-kernel stack by syscall, or the `xhci` service by IPC. No probe, no fallback.
-    #[cfg(target_arch = "arm")]
-    let sectors = ctx.usb_disk_sectors();
+    // arm32 now asks the `dwc2` SERVICE over IPC, exactly as aarch64 asks `xhci` - the in-kernel
+    // stack's `usb_disk_*` syscalls are no longer the path. Same client, same wire format, different
+    // service name (`xhciblk::XHCI`), which is why this is a cfg flip rather than a port.
     // ONE quick question at startup, not a 20 s wait for an answer we no longer use.
     //
     // This called `sectors()`, which blocks up to 20 s for a capacity. That made every boot with no
@@ -94,7 +149,6 @@ fn backend_run(ctx: &ServiceContext) -> ! {
     // first request, through the same self-heal that already recovers a stick plugged in after boot -
     // hardware-proven across several plug/unplug cycles. Trading a guaranteed 20 s stall for a
     // recovery path that is exercised constantly is the right way round.
-    #[cfg(not(target_arch = "arm"))]
     let sectors = xhciblk::sectors_now(&ctx);
     if sectors == 0 {
         ctx.log("block-driver: no USB storage stick - NO disk (the SD card is the boot medium and is never written)");
@@ -122,7 +176,49 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // WAKE a deeply-blocked recv on an AP is unreliable under QEMU TCG (the drain flaked in the
             // flood-storm pin); the self-driven poll drains every quantum with no wake needed. Pinned by the
             // shell-test `chaos flood-storm block-driver` step (QEMU's pc machine has no AHCI, so it sits here).
-            loop { while ctx.try_recv().is_some() {} ctx.yield_cpu(); }
+            // ANSWER while draining. The loop here used to be
+            //     loop { while ctx.try_recv().is_some() {} ctx.yield_cpu(); }
+            // which retired every request and replied to none - so `fs` blocked forever in its first
+            // `block_capacity()`, never reached its own storage-unavailable degraded path, and never
+            // printed `fs: serving file API`; every file command in the shell hung behind it. On any
+            // machine with no AHCI (an NVMe-only box, QEMU's default `pc`) that is the whole storage
+            // stack silently dead, on a branch whose comment says the two services "come up and idle
+            // gracefully".
+            //
+            // The correct version was already in this crate: `ahci::serve_no_disk` answers CAPACITY
+            // with a truthful zero and everything else with STATUS_ERR. The drain reasoning below it
+            // still holds - what was missing was the reply.
+            //
+            // It keeps polling rather than blocking on `recv` for the reason the original comment
+            // gives (a cross-core flood must not depend on waking a deeply-blocked recv), so the
+            // answer path is inlined here rather than delegating to the blocking version.
+            loop {
+                while let Some(msg) = ctx.try_recv() {
+                    let reply = match ctx.take_pending_cap() {
+                        Some(c) => c,
+                        None => continue,   // nothing to answer on; dropping is all that is left
+                    };
+                    let raw = msg.payload_bytes();
+                    let (tag, p) = match raw.split_first() {
+                        Some((t, rest)) => (*t, rest),
+                        None => (0, &raw[..0]),
+                    };
+                    let reply = Reply { cap: reply, tag };
+                    let mut out = [0u8; 9];
+                    let n = if !p.is_empty() && p[0] == OP_CAPACITY {
+                        // Capacity is [STATUS_OK, sectors u64 LE]; zero sectors is the truth here and
+                        // is exactly what `fs` reads as "genuinely no disk".
+                        out[0] = STATUS_OK;
+                        9
+                    } else {
+                        out[0] = STATUS_ERR;
+                        1
+                    };
+                    reply.send(&ctx, &out[..n]);
+                    ctx.remove_cap(reply.cap);
+                }
+                ctx.yield_cpu();
+            }
         }
     }
 }

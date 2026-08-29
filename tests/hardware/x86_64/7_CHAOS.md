@@ -19,7 +19,7 @@ Mirrors §22 Chaos Tests (C1-C7). Graceful degradation under partial failures on
 ## C1 - 2-core degraded boot (2026-05-24)
 
 BIOS set to 2 cores. Results:
-- `smp: core 1 ready` / `kernel: 2 cores ready` ✓
+- `smp: core 1 ready` / `smp: 2 cores ready` ✓
 - pong placed correctly on core 1 ✓
 - ping/pong IPC working (`pong: received "1"`) ✓
 - C2/C3/C5/C7 all pass under 2-core constraints ✓

@@ -225,11 +225,13 @@ os/
       interrupt/route.rs
       invariants/assertions.rs
       log.rs               # kernel ring buffer
+      bootcon/             # boot + panic framebuffer blit (11.4) - NOT a terminal; see console/
 
   services/
     supervisor/            # restart authority + name authority (TCB); spawned directly by the kernel
                            #   (init removed, Phase 5; registry service retired, Phase 4 - Path C §3.7)
     logger/
+    console/               # the terminal: ANSI/CSI, grid, cursor, scroll (docs/console-service.md 9)
     block-driver/          # v1: trusted
     fs/                    # v1: trusted, depends on block-driver
 
@@ -272,7 +274,7 @@ os/
 > - **init** - **removed** entirely; the kernel spawns the supervisor directly (Path C / Phase 5).
 > - **registry** - left the TCB, then the *service* was **retired**; naming is now a minimal kernel directory (naming Phase 4 / Path C).
 > - **block-driver, fs** - **restartable** storage services, made safe by `fs`'s crash-consistent recovery (Phase D); their death is a supervisor restart, not a reboot.
-> - **DMA drivers (`xhci`/`ehci`)** - in the TCB **only on a machine with no IOMMU**; where an IOMMU confines them they are least-privilege and drop out (§6.4).
+> - **DMA drivers (`xhci`/`ehci` on x86, `dwc2` on ARM)** - all userspace services; in the TCB **only on a machine with no IOMMU**, where unconfined DMA is kernel-equivalent reach. Where an IOMMU confines them they are least-privilege and drop out (§6.4).
 >
 > The dated amendments in §6.1-§6.3 record how this floor was reached and why. They are ratified history, not proposals; this box is the settled result they add up to.
 
@@ -284,7 +286,7 @@ os/
 | `arch/x86_64`     | Direct hardware access                              |
 | `kernel/smp`      | Concurrent-correctness primitives                   |
 | `supervisor`      | Holds restart + name authority; **spawned directly by the kernel** (init removed, Phase 5); trusted but **restartable** - the kernel respawns it on death (Phase 6, §6.2), so the only non-restartable thing is the kernel itself |
-| `xhci`, `ehci` (DMA drivers) | **Machine-dependent (H1, §6.4):** in the TCB only on a machine with no IOMMU to confine them (DMA-anywhere = kernel-equivalent reach); **dropped** from it - least-privilege and restartable - wherever an IOMMU confines them to their arena. The case is reported loudly at boot (invariant 12). |
+| `xhci`, `ehci`, `dwc2` (DMA drivers) | **Machine-dependent (H1, §6.4):** in the TCB only on a machine with no IOMMU to confine them (DMA-anywhere = kernel-equivalent reach); **dropped** from it - least-privilege and restartable - wherever an IOMMU confines them to their arena. The case is reported loudly at boot (invariant 12). |
 
 > **Amendment 2026-06-12 (H1): DMA-capable drivers are no longer an unconditional TCB
 > member.** Before H1 they were an *implicit, unstated* member: with no IOMMU a driver
@@ -319,6 +321,13 @@ os/
 > block moves - and ordering can only be enforced by a device that attests durability. Two cases, and
 > the difference is a printed fact rather than a hidden assumption (exactly the §6.4 posture):
 > - **A backend that attests durability** keeps the guarantee intact. `ahci` issues `FLUSH CACHE EXT`
+>   **when `fs` asks for it, at the journal barriers** (amended 2026-08-22: it used to flush after
+>   every 512-byte sector, which cost a transaction a stack of full device flushes and made a single
+>   file write take tens of seconds on a SATA SSD; the barriers `fs` already declares - staged blocks
+>   before the commit record, commit record before any home block - are what the guarantee rests on,
+>   and a per-sector flush added nothing to them). The consequence is stated plainly: unflushed FILE
+>   DATA can be lost on a power cut, while METADATA stays crash-consistent, which is exactly what this
+>   section claims and no more.
 >   after every write; SD/EMMC completes a write only after the card releases its busy line. Ordering
 >   holds, `fs` recovers to a consistent state on mount, and the Phase D TCB claim stands unchanged.
 > - **A backend that cannot** does not. The Pi 2's USB stick refuses `SYNCHRONIZE CACHE` outright, and
@@ -331,7 +340,7 @@ os/
 > So the honest form of the Phase D claim is: **`fs` is restartable everywhere; it is crash-recoverable
 > on a backend that can be ordered.** Where it cannot be, `fs` remains restartable (its death is still a
 > supervisor restart, never a reboot - §6.2 is untouched) and a *power loss* may require a reformat.
-> Recorded rather than closed, per §26.3: the fix is a block path that can wait out a busy device
+> Recorded rather than closed, per §26.7: the fix is a block path that can wait out a busy device
 > without holding the core, which is real work and not a constant.
 
 > **Amendment 2026-06-09 (H11): `registry` is no longer a TCB member.** It became a
@@ -451,7 +460,7 @@ official, not the runtime behaviour.
 > SEC-2 removed **`REBOOT`** from the USB drivers, so a compromised driver can no longer hard-reset the
 > machine directly from any context - reboot lives only with the shell (its `reboot` command). The
 > residual (a keyboard can type) is inherent to being a keyboard, and is recorded here rather than
-> papered over. `docs/security-audit.md` SEC-2.
+> papered over. `audits/security-audit.md` SEC-2.
 >
 > **Amendment 2026-07-19 (SEC-2 follow-up): Ctrl+Alt+Del is restored, routed through the shell.** The
 > chord initially became ordinary keystrokes, which removed a familiar affordance. It now works again
@@ -496,12 +505,42 @@ official, not the runtime behaviour.
 > is unchanged until an SMMU confines the device. Also unmet on this port: §6.4 requires the confinement
 > case to be "reported loudly at boot", and nothing is printed either way (SEC-34).
 >
-> **ARM32 (Pi 2) is unchanged and the amendment below still governs it**: no PCIe and no
-> device-IRQ-to-userspace routing, so its DWC2 stack remains in the kernel and remains a TCB member.
-> The two ports now differ in exactly this, and the difference is recorded rather than blurred.
+> **ARM32 (Pi 2) has since followed** - see the 2026-08-17 amendment below. When this was written its
+> DWC2 stack was still in the kernel and still a TCB member; that is no longer true, and the sentence
+> that said the two ports "differ in exactly this" is superseded.
 > Verified: chaos max-carnage 100 rounds, selfcheck 349, hot-plug of keyboard and mass storage in both
 > directions, all on the userspace driver.
 
+> **Amendment 2026-08-17 (ARM32 / Pi 2): the DWC2 stack is OUT of the kernel too, and
+> `arch/arm/dwc2.rs` is DELETED.** The amendment below (SEC-29/SEC-30) records the in-kernel ARM USB
+> stack as a machine-dependent posture that could not be fixed on this hardware, because ARM did not
+> route device IRQs to userspace. **It does now**: `services/dwc2` registers for `USB_VECTOR`
+> (`arch/arm/irq.rs`) and is driven by the interrupt rather than the core-0 timer tick. So the two
+> consequences that amendment draws no longer hold as stated: the memory-safety of `arch/arm/dwc2.rs`
+> is not TCB-critical because that file does not exist, and **SEC-2's win DOES now travel to ARM** - the
+> ARM USB driver is a service holding only the capabilities its contract grants, so it cannot call
+> `hardware_reset` and does not sit inside the kernel trust perimeter.
+>
+> What does NOT change, and is the same caveat the Pi 4 carries: the Pi 2 has no IOMMU/SMMU, so the
+> driver's DMA is unconfined and a COMPROMISED driver is still kernel-equivalent by §6.4's own rule. A
+> buggy one is now bounded and restartable; a malicious one is not. The ACCIDENT surface is what closed
+> here, exactly as on aarch64. The residual that is inherent everywhere also stands: a keyboard's
+> keystrokes are commands (SEC-2).
+>
+> The same is now true of the DISPLAY on this port: `kernel/src/fbcon` (1,172 lines of terminal
+> emulation) left the kernel for `services/console`, leaving only the §11.4 boot/panic blit
+> (`docs/console-service.md` §9). Verified on hardware: chaos 50 rounds, 0 kernel panics, 0 liveness
+> wedges, selfcheck 350/0.
+
+> **[SUPERSEDED IN PART by the 2026-08-17 amendment above - read that first.] The in-kernel ARM USB
+> stack this describes NO LONGER EXISTS: `arch/arm/dwc2.rs` is deleted and `services/dwc2` drives the
+> controller from userspace on `USB_VECTOR`. Kept because §1 makes an amendment ratified history - this
+> records why ARM USB was ever a TCB member, which is what the later amendment is a reply to. What
+> still holds is the DMA half: the Pi 2 has no IOMMU/SMMU (`iommu::confine_device` returns `false` on
+> this arch), so a COMPROMISED driver remains kernel-equivalent by §6.4's rule. A buggy one is now
+> bounded and restartable. This block is placed out of date order, after the amendment that supersedes
+> it, so it is marked rather than left to be read as current.]**
+>
 > **Amendment 2026-07-23 (SEC-29/SEC-30): on the ARM32 (Raspberry Pi 2) port the USB drivers are
 > in-kernel TCB members - a machine/arch-dependent posture, the ARM analog of the no-IOMMU case above,
 > and larger.** The amendments above concern *userspace* USB drivers (`xhci`/`ehci`) confined - or not -
@@ -512,13 +551,13 @@ official, not the runtime behaviour.
 > frames**, and it is a TCB member by construction. This is **strictly more** than the no-IOMMU x86 case:
 > there the driver is untrusted-but-userspace with only its *DMA* unconfined; here the driver *is* the
 > kernel. It is not fixable on this hardware - the Pi 2 has no IOMMU/SMMU to confine USB DMA regardless,
-> and the userspace-driver split awaits device-IRQ-to-userspace routing - so, per §26.3, it is **recorded**
+> and the userspace-driver split awaits device-IRQ-to-userspace routing - so, per §26.7, it is **recorded**
 > rather than closed. Two consequences follow: (a) the memory-safety of `arch/arm/dwc2.rs` is TCB-critical
-> (audited: `docs/unsafe-audit.md`, `docs/security-audit.md` Audit 2, no UB/OOB/race); (b) **SEC-2's win
+> (audited: `audits/unsafe-audit.md`, `audits/security-audit.md` Audit 2, no UB/OOB/race); (b) **SEC-2's win
 > does not travel to ARM** - "REBOOT lives only with the shell, not the USB driver" is an x86 property; an
 > in-kernel ARM driver implicitly holds all kernel authority (it could call `hardware_reset` directly), so
 > the ARM keyboard driver sits inside the *kernel* trust perimeter, not merely the shell's. The residual
-> that IS shared with x86 is inherent: a keyboard's keystrokes are commands (SEC-2). `docs/security-audit.md`
+> that IS shared with x86 is inherent: a keyboard's keystrokes are commands (SEC-2). `audits/security-audit.md`
 > Audit 2 (SEC-29/30) is the full treatment.
 
 ---
@@ -704,6 +743,8 @@ recv(endpoint_cap)              -> Result<Message, IpcError>  // blocks until ms
 try_send(endpoint_cap, message) -> Result<(), IpcError>   // non-blocking
 call(target_cap, reply_cap, recv_cap, message)
                                 -> Result<Message, IpcError>  // send request + block for reply
+call_deadline(target_cap, reply_cap, recv_cap, message, secs)
+                                -> Result<Option<Message>, IpcError>  // `call`, bounded
 ```
 
 `call` is the synchronous request/reply primitive (syscall 41). It sends the request to `target`
@@ -712,6 +753,25 @@ wakes with the reply, or - if the replier dies before replying - with `ReplyDead
 hangs. This is **mechanism, not policy** (§26.10): the kernel learns only about a reply cap and its
 death semantics, never "request/reply" or "RPC". It is the primitive behind the SDK's
 `request_with_reply`; the reply-side twin of the blocked-sender `EndpointDead` wake.
+
+> **Amendment 2026-08-21 (`CallDeadline`, syscall 50): `call` gains a BOUND, because the unbounded one
+> was being worked around in a way that lost messages.** `call` is the only primitive that dequeues the
+> REPLY specifically (matched to the reply cap), leaving every other message queued - but it blocks
+> forever, so the SDK hand-rolled a bounded variant out of `send` + a plain endpoint `recv`. A plain
+> recv takes whatever is next, and a service that SERVES clients on the endpoint it awaits replies on
+> would therefore consume an unrelated client request, fail to match it, and drop it: the request lost
+> outright, and the real reply arriving later as an orphan that desynced every following exchange.
+> Observed on both the Pi 2 and the Pi 4 as `fs` clients hanging and the block protocol "losing step".
+>
+> The fix is not a workaround at the caller. It is the correct primitive made usable: same reply-cap
+> semantics, same `call_dequeue`, plus the deadline machinery `RecvTimeout` already uses. This is
+> **mechanism, not policy** (§26.10) - the kernel learns a deadline, not what the caller is waiting for
+> - and it is what §26.6 asks of every wait in the first place. `Ok(None)` means the deadline passed;
+> the reply cap is the caller's to reclaim, exactly as on any other failure (§8.5).
+>
+> A new syscall is a new kernel responsibility and the surface is pinned (Commandment I), so this is
+> recorded here rather than merely added: it is `call` with a bound, not a new capability, and the
+> enforcement layer refused the change until this amendment existed.
 
 ### 8.3 Routing
 
@@ -1011,6 +1071,16 @@ Because Limine supplies APIC IDs directly, the kernel does not need to probe ACP
 
 The kernel maintains a 16 KiB ring buffer (per-core view, single shared sink). Anything logged before the logger is up writes to the ring buffer and the serial console. When the logger starts, it drains the buffer.
 
+Where the machine's only output device is a display, the floor also includes a **minimal framebuffer blit** (`kernel/src/bootcon`): plain ASCII, escape sequences discarded, no character grid, no cursor, no scrollback. It is not a terminal - the terminal is the `console` service (`docs/console-service.md` §9).
+
+> **Amendment 2026-08-17 (console service): the log floor covers a minimal framebuffer blit, because §11.4 was x86-shaped.** This section said "serial console" because on a PC serial is always there. On a Raspberry Pi wired to a TV it may not be, and a kernel that can only speak to a serial port it does not have is **mute** - a boot that fails before any service exists, or a panic, produces a frozen screen and no reason on it, which is exactly the silent failure invariant 12 forbids.
+>
+> The blit earns ring-0 residency by **impossibility**, which is the only thing that does (the bar the control channel failed to clear and the supervisor spawn clears): **a panic halts every core, including the `console` service, so it cannot ask a service to report it.** Boot output has the same shape - it precedes every service, including the one that would render it. Both are this section's existing ring-buffer argument applied to a machine with no serial port, which is why the answer is the same one: a bounded floor the kernel owns.
+>
+> The amendment is deliberately **narrow**, and the narrowness is the point. What left the kernel in the same change was 1,172 lines of terminal emulation - the ANSI/CSI state machine, the UTF-8 decoder, the shadow grid, the cursor, scrolling, reverse video - because rendering a shell prompt is policy (§26.10) and a display driver is §4.4 anti-scope by name. What the floor keeps cannot format, cannot position, and cannot scroll: reaching the bottom of the screen clears it and starts again at the top, since serial holds the full history either way. Ownership of the framebuffer transfers to the service when the kernel GRANTS it, at spawn - not when the service first renders - and returns to the kernel if that service dies, or on a panic.
+>
+> §22 has no new test: the property this pins is a *negative* one on a machine we cannot fail on demand in QEMU. It is pinned instead by `scripts/commandments.py`, which counts the kernel's modules against §4.3 and for which `fbcon` was the last standing violation.
+
 ---
 
 ## 12. Drivers and Interrupts
@@ -1283,13 +1353,13 @@ A PR with an unsafe block lacking a SAFETY comment is rejected without review.
 
 ### 18.4 Audit Trail
 
-`docs/unsafe-audit.md` lists every unsafe block. CI checks the file matches source.
+`audits/unsafe-audit.md` lists every unsafe block. CI checks the file matches source.
 
 ### 18.5 Grandfathered Floors
 
 `unsafe` outside the four permitted layers (§18.1) is tolerated only as
 **grandfathered** lines in `task/`, `syscall/`, and `interrupt/`, frozen at the
-counts in `docs/unsafe-audit.md`. Those counts may **decrease** freely but may
+counts in `audits/unsafe-audit.md`. Those counts may **decrease** freely but may
 **increase** only by an amendment recorded here and in the audit, with a written
 safety + necessity rationale.
 
@@ -1364,7 +1434,7 @@ The test suite is layered. Each layer answers a different question about kernel 
 | Category    | Purpose                                              | Bar (what failure means)                          | Status |
 |-------------|------------------------------------------------------|---------------------------------------------------|--------|
 | Identity    | Pin constitutional decisions; existence proof        | Constitutional invariant violated                 | §22 (Test 11 added, H11) |
-| Property    | Universal invariants under random inputs             | A claim the spec makes does not hold              | Active |
+| Property    | Universal invariants under random inputs             | A claim the spec makes does not hold              | §22 (P1-P10, 10/10) |
 | Fuzz        | Crash resistance under adversarial inputs            | Kernel panics on user-controllable input          | Active |
 | Stress      | Survival under sustained load                        | Drift, leaks, or corruption appear over time      | Active |
 | Performance | Latency / throughput benchmarks                      | A measured number regressed                       | §22 (10/10) |
@@ -2245,7 +2315,7 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 - **Reply cap** - A one-shot capability to the caller's own endpoint, sent inside a `Call` request so the replier can reply to it. The kernel tracks, per blocked caller, the target endpoint it awaits; if that endpoint dies, the caller is woken with `ReplyDead`. The reply-side twin of the blocked-sender record (§8.2, §8.6).
 - **ReplyDead** - Error returned when the replier's endpoint dies while the caller is blocked in a `Call` awaiting its reply (value -12; §7.7, §8.6). The reply-side twin of `EndpointDead`, on the same generation/liveness mechanism.
 - **Routing table** - Kernel structure mapping `EndpointId → (CoreId, Generation, Liveness)`.
-- **TCB** - Trusted Computing Base. Kernel + arch + smp + init + supervisor. `registry` left the TCB via H11 (and the **registry service was then retired entirely** - naming Phase 4 / Path C, `docs/naming-design.md` §3.7); `block-driver` + `fs` left via the Phase D amendment (§6.1, once `fs` gained crash-consistent recovery). DMA drivers (`xhci`/`ehci`) are in the TCB only on a machine without an IOMMU (§6.4).
+- **TCB** - Trusted Computing Base. Kernel + arch + smp + supervisor. (**Not `init`** - it was removed in Path C / Phase 5; the kernel spawns the supervisor directly. And the supervisor is trusted but RESTARTABLE, Phase 6, so the only unkillable component is the kernel.) `registry` left the TCB via H11 (and the **registry service was then retired entirely** - naming Phase 4 / Path C, `docs/naming-design.md` §3.7); `block-driver` + `fs` left via the Phase D amendment (§6.1, once `fs` gained crash-consistent recovery). DMA drivers (`xhci`/`ehci`, and ARM's `dwc2`) are in the TCB only on a machine without an IOMMU to confine them (§6.4); all three are userspace services now.
 - **Trusted root** - `supervisor` (sole; `init` was removed in Path C / Phase 5 - the kernel spawns the supervisor directly). It is **trusted but restartable** (Path C / Phase 6, §6.2): the kernel respawns it on death - unconditionally, forever - so its failure is recovered, not a reboot. The **only unkillable component is the kernel itself**. (`block-driver` + `fs` are restartable storage services.)
 - **Name directory** - the kernel's minimal `name → EndpointId` map (`ipc::names`) + a gated "mint a SEND cap by name" (`AcquireSendCap`). The bounded recovery anchor that **replaced the registry service** (naming Phase 4 / Path C, §3.7): the supervisor wires services from a `name → cap` map and clients reacquire names through the directory. *(The retired `registry` userspace name service is `docs/registry.md` - historical.)*
 - **Service** - Userspace component with a contract, capability table, and isolated address space.
@@ -2266,6 +2336,20 @@ Filesystem persistence beyond the trusted block driver, network stack, work-stea
 > **Identity is stable. Location is not. Movement is invisible. Death is visible.**
 
 > **Failures are loud, never silent.**
+
+> **A failing Godspeed that preserves its invariants is preferable to a working Godspeed that violates
+> them.**
+
+The last one ranks the others. Every principle above can be traded against a deadline, a benchmark or a
+stubborn bug, and this says which way that trade goes: a system that fails while keeping its model
+intact is still this system, and can be fixed. A system that works by breaking its model is a different
+system that happens to run today, and what it has really lost is the reason to trust any of the rest of
+this document.
+
+This is not a preference for failure. It is a statement about what a fix is: making the system work
+WITHIN the model, and never widening the model to admit what is easier. Where the two genuinely cannot
+be reconciled, the honest move is to record the gap loudly and leave it open (§26.7) rather than close
+it with a violation.
 
 ---
 ---
@@ -2376,6 +2460,15 @@ A "shell" in this system is a capability-broker service. It:
 - Reads commands and constructs spawn requests, including the explicit caps each child should receive.
 
 This means there is no `stdin`, only an IPC endpoint to a console service. There is no `fork`, only an authenticated request to the supervisor. There is no inherited environment, only the caps the parent explicitly granted.
+
+> **Note (2026-08-17): a `console` service now exists, and it owns OUTPUT only.** This appendix
+> anticipated one service holding "keyboard input + display output"; what was built holds the display -
+> the terminal model, the grid, the cursor and the rendering (`docs/console-service.md` §9). Keyboard
+> INPUT is still brokered by the shell through the kernel's single-reader console ring, for the reason
+> recorded in `docs/console-service.md` §5a: there is one input ring and one reader slot, so a service
+> that owned the keyboard would block in `ConsoleRead` and could not also field take/release messages.
+> The split is deliberate, not partial. This appendix stays non-normative; it is the intent, and the
+> difference is recorded here rather than left to read as a description of what shipped.
 
 The full mechanics of how Unix-style scripting maps onto this model - pipes as capability-mediated endpoints, redirection as cap minting, etc. - are explored in Appendix D.
 
@@ -2790,6 +2883,19 @@ operator needs to see. Every failure path, including a retry that ultimately fai
 swallowed. This holds in any language: an ignored error return is the same silent fallback as a
 suppressed exception.
 
+**A limitation that cannot be closed is RECORDED, never papered over.** The rule above governs what the
+system does at runtime; this governs what the project says about itself, and it is the same refusal to
+hide. Some gaps cannot be closed today - the hardware has no such unit, the fix is real work and not a
+constant, the honest guarantee is narrower than the one already claimed. The temptation is to leave the
+broader claim standing because it is nearly true. Write the gap down instead: state plainly what does
+NOT hold, where, and why, at the place a reader would otherwise rely on the claim.
+
+A recorded limitation is a thing the next person can fix and can plan around. An unrecorded one is
+discovered by whoever trusts the document, usually at the worst moment, and it costs them the right to
+trust the rest of it. This is why a narrowed guarantee is amended into the text rather than quietly
+left; §6.1's backend-conditional crash-recovery claim and its ARM DMA posture are both here for exactly
+this reason.
+
 ---
 
 ## 26.8 Identity Over Location
@@ -2927,7 +3033,32 @@ A smaller coherent system is preferred over a larger impressive one.
 
 ---
 
-## 26.14 Preserve The Invariants
+## 26.14 Borrow The Mechanism, Never The Model
+
+Reference implementations are how this project learns hardware. Linux, BSD and u-boot are read as
+executable datasheets: which register the silicon needs written, in what order, with what value, and
+what the device does when you get it wrong. That reading is encouraged and has repeatedly been the
+difference between a working driver and a week of guessing.
+
+What is borrowed is the SILICON'S requirement. What is not borrowed is the other system's model.
+
+Those two are easy to confuse, because they arrive in the same file. A register write sequence is a
+fact about the hardware and belongs here unchanged. An ambient global, an unbounded buffer, a heap
+allocation on a hot path, a driver living in the kernel because that is where the reference put it -
+those are that system's answers to that system's constraints, and they are not facts about anything.
+Importing them because "Linux does it" is how a model rots while every individual change looks
+justified.
+
+The test is one question: **is this a property of the device, or a property of their design?** Ordering,
+timing, magic values, error semantics, what a bit means - the device. Where the state lives, who owns
+it, how it is allocated, what happens when it fails - ours to decide, under the constitution.
+
+Divergence from a reference is therefore normal and does not need apologising for; it needs recording.
+When this system deliberately does something differently, say so at the point of difference and say
+why, so the next reader knows it was a decision and not an oversight. Silent divergence is how a port
+acquires bugs nobody can explain; unexplained convergence is how it acquires violations nobody noticed.
+
+## 26.15 Preserve The Invariants
 
 Every contributor is responsible for preserving:
 - identity over location;
@@ -2948,7 +3079,7 @@ The default answer to architectural uncertainty is:
 
 ---
 
-## 26.15 Final Reminder
+## 26.16 Final Reminder
 
 The system is allowed to evolve.
 

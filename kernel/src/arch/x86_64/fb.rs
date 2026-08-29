@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! x86-64 backend for the shared framebuffer console (`crate::fbcon`).
+//! x86-64 backend for the kernel's boot/panic console floor (`crate::bootcon`).
 //!
-//! The terminal itself - escape parsing, the character grid, glyph rendering, scrolling - is neutral
-//! code. This file is only what is genuinely architecture-specific: reading the framebuffer's geometry
-//! out of the Limine boot protocol, and publishing writes to a **write-combining** mapping.
+//! The terminal lives in the `console` SERVICE (`docs/console-service.md` §9). This file is only what is
+//! genuinely architecture-specific: reading the framebuffer's geometry out of the Limine boot protocol,
+//! recovering its physical base for the service's grant, and publishing writes to a **write-combining**
+//! mapping.
 //!
 //! The framebuffer Limine maps lives in the higher half (PML4 entries 256-511), which `PageTable::new`
 //! copies into every task address space, so the pointer stays valid for the system lifetime and no
 //! explicit mapping is required.
 
 use limine::framebuffer::Framebuffer;
-
-/// Reading this framebuffer back is **expensive**: Limine's HHDM maps it write-combining, where reads
-/// run at tens of MB/s while writes are roughly 100x faster. So `fbcon::scroll` repaints from the shadow
-/// grid rather than shifting pixels in place - an 8 MB read-back cost about 130 ms per scrolled line on
-/// the T630 and dominated every kill/respawn-heavy workload.
-pub const FB_READBACK_CHEAP: bool = false;
 
 /// Publish a written rectangle. On x86 the framebuffer is coherent with the scanout engine, so there is
 /// nothing to clean and the rectangle is ignored - but the write-combining store buffer still has to be
@@ -41,8 +36,8 @@ pub fn fb_commit(
 /// Bring up the console from Limine's framebuffer descriptor. Called once in `_start`, right after
 /// `serial_init` and before the first `kprintln`, so all boot output mirrors to the display.
 ///
-/// This is where the framebuffer becomes a **slice**, which is what keeps the neutral console
-/// (`crate::fbcon`) free of `unsafe` - only the arch knows that the mapping is valid and permanent.
+/// This is where the framebuffer becomes a **slice**, which is what keeps the floor (`crate::bootcon`)
+/// free of `unsafe` - only the arch knows that the mapping is valid and permanent.
 pub fn fb_init(fb: &Framebuffer) {
     let len = (fb.pitch as usize) * (fb.height as usize);
     // SAFETY: Limine mapped [address, address + pitch*height) as this framebuffer and reports its own
@@ -53,8 +48,17 @@ pub fn fb_init(fb: &Framebuffer) {
     // the only live reference and the exclusivity of `&mut` holds.
     let mem: &'static mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(fb.address() as *mut u8, len) };
-    crate::fbcon::init(crate::fbcon::FbParams {
+    crate::bootcon::init(crate::bootcon::FbParams {
         mem,
+        // Limine reports the framebuffer at its HHDM address; the grant handed to the `console` service
+        // is built from the PHYSICAL base, because the service maps it into its own address space.
+        // Straight from Limine, NOT `page_tables::get_hhdm_offset()` - that is still 0 here, because
+        // this runs before `memory::init` publishes it, and subtracting 0 stored the higher-half
+        // address as "physical". The console's mapping was then built from an address wider than the
+        // machine's physical address width, so its first write to the screen took a reserved-bit page
+        // fault and the supervisor restarted it, forever. On screen that read as text appearing and
+        // vanishing: each dead console handed the framebuffer back to the kernel's boot floor.
+        phys: fb.address() as u64 - crate::arch::x86_64::hhdm_offset_from_limine(),
         pitch: fb.pitch as usize,
         bpp: (fb.bpp as usize) / 8,
         width: fb.width as usize,

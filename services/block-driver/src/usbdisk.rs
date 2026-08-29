@@ -5,11 +5,11 @@
 //! formatting that card destroys the boot medium (`fs` refuses to, see `foreign_disk`). A USB stick is
 //! the storage that can actually be given to GSFS on this board: boot from SD, store on USB.
 //!
-//! **Why it goes through the kernel.** ARM does not route device IRQs to userspace yet, so the whole USB
-//! stack - controller, enumeration, Bulk-Only transport - lives in the kernel (`arch/arm/dwc2.rs`,
-//! `arch/arm/CLAUDE.md`). This driver therefore does not touch hardware at all: it holds the `USB_DISK`
-//! capability and moves blocks with three gated syscalls, exactly as the ARM `nic-driver` bridges USB
-//! ethernet frames to `net-stack`. The block protocol above them - the same one `fs` speaks to the AHCI
+//! **Why it does not touch the hardware.** The USB stack - controller, enumeration, Bulk-Only transport
+//! - is the `dwc2` SERVICE (`services/dwc2`). It used to be in the kernel, because ARM did not route
+//! device IRQs to userspace; it does now (`USB_VECTOR`, `arch/arm/irq.rs`), and `kernel/src/arch/arm/dwc2.rs`
+//! is deleted. This driver therefore holds the `USB_DISK` capability and moves blocks over IPC, exactly
+//! as the ARM `nic-driver` bridges USB ethernet frames to `net-stack`. The block protocol above them - the same one `fs` speaks to the AHCI
 //! and EMMC backends - is this driver's own, so `fs` cannot tell which disk it is talking to.
 //!
 //! **Core affinity.** The kernel serves these syscalls only from core 0, because the DWC2 DMA buffer is
@@ -187,7 +187,7 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
                     // boot, where the kernel was not in the path at all.
                     "block-driver: {} lba {} refused by {}, status {}",
                     what, lba,
-                    if cfg!(target_arch = "arm") { "the kernel" } else { "the xhci service" },
+                    if cfg!(target_arch = "arm") { "the dwc2 service" } else { "the xhci service" },
                     code));
                 return false;
             }
@@ -233,36 +233,27 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
 // 2 s one aborted healthy commands). By the time it answers, the waiting has happened - so a failure
 // here is a real I/O error, and returning BUSY would send this loop off to wait another 30 s for a
 // device that already gave its answer.
-#[cfg(target_arch = "arm")]
-fn dev_read(ctx: &ServiceContext, lba: u64, buf: &mut [u8; 512]) -> i64 { ctx.usb_disk_read_status(lba, buf) }
-#[cfg(not(target_arch = "arm"))]
 fn dev_read(ctx: &ServiceContext, lba: u64, buf: &mut [u8; 512]) -> i64 {
     if super::xhciblk::read(ctx, lba, buf) { 0 } else { -1 }
 }
 
-#[cfg(target_arch = "arm")]
-fn dev_write(ctx: &ServiceContext, lba: u64, buf: &[u8; 512]) -> i64 { ctx.usb_disk_write_status(lba, buf) }
-#[cfg(not(target_arch = "arm"))]
 fn dev_write(ctx: &ServiceContext, lba: u64, buf: &[u8; 512]) -> i64 {
     if super::xhciblk::write(ctx, lba, buf) { 0 } else { -1 }
 }
 
-#[cfg(target_arch = "arm")]
-fn dev_flush(ctx: &ServiceContext) -> bool { ctx.usb_disk_flush() }
-#[cfg(not(target_arch = "arm"))]
 fn dev_flush(ctx: &ServiceContext) -> bool { super::xhciblk::flush(ctx) }
 
 /// Serve one block-IPC request. Same wire protocol as the AHCI and EMMC backends - `fs` is unaware of
 /// which one it is talking to.
-fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapHandle) {
+fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
     use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
-    let err = |ctx: &ServiceContext| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); };
+    let err = |ctx: &ServiceContext| { reply.send(ctx, &[STATUS_ERR]); };
     if p.is_empty() { return err(ctx); }
     if p[0] == OP_FLUSH {
         // The one backend that genuinely needs this: a stick acknowledges a WRITE(10) into its own
         // buffer, so without SYNCHRONIZE CACHE a reset loses the tail of everything just written.
         let status = if dev_flush(ctx) { STATUS_OK } else { STATUS_ERR };
-        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
+        reply.send(ctx, &[status]);
         return;
     }
     if p[0] == OP_CAPACITY {
@@ -277,25 +268,11 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
         // invoked somewhere else may never be invoked at all. An earlier attempt at this was reverted
         // because it appeared to cost input latency - that turned out to be logging and a pessimistic
         // probe timeout, both since fixed, and a capacity query is not a hot path (mount, and `drives`).
-        #[cfg(not(target_arch = "arm"))]
         let sectors = super::xhciblk::sectors_now(ctx);
-        // The SYSCALL path needs re-deriving every bit as much, and only the other one had it.
-        //
-        // The re-derive above is cfg-gated to `usb-via-xhci`, so a build without that feature served
-        // the BOOT-TIME snapshot forever. On a Pi 4 booted with no stick that snapshot is 0, so
-        // plugging a stick in changed nothing that anything above could see: xhci enumerated it and
-        // said "USB disk ready - 31266816 sectors" while `drives` reported no drive, for as long as
-        // the service lived. Killing block-driver fixed it because a fresh instance re-runs the
-        // startup query - which is the whole shape of the report, and the user diagnosed it from that.
-        //
-        // A snapshot of another component's truth has to be reconciled wherever it is served, not
-        // only on the backend that happened to get the fix first (§26.4, Commandment III).
-        #[cfg(target_arch = "arm")]
-        let sectors = ctx.usb_disk_sectors();
         let mut out = [0u8; 9];
         out[0] = STATUS_OK;
         out[1..9].copy_from_slice(&sectors.to_le_bytes());
-        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
+        reply.send(ctx, &out);
         return;
     }
     if p.len() < 9 { return err(ctx); }
@@ -307,7 +284,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
                 let mut out = [0u8; 513];
                 out[0] = STATUS_OK;
                 out[1..].copy_from_slice(&buf);
-                let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
+                reply.send(ctx, &out);
             } else { err(ctx); }
         }
         OP_WRITE_BLOCK => {
@@ -315,7 +292,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
             let mut buf = [0u8; 512];
             buf.copy_from_slice(&p[9..521]);
             let status = if with_busy_retry(ctx, "write", lba, || dev_write(ctx, lba, &buf)) { STATUS_OK } else { STATUS_ERR };
-            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
+            reply.send(ctx, &[status]);
         }
         OP_WRITE_ZEROS => {
             if p.len() < 17 { return err(ctx); }
@@ -325,7 +302,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapH
             for i in 0..count {
                 if !with_busy_retry(ctx, "write-zeros", lba + i, || dev_write(ctx, lba + i, &zero)) { ok = false; break; }
             }
-            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[if ok { STATUS_OK } else { STATUS_ERR }]));
+            reply.send(ctx, &[if ok { STATUS_OK } else { STATUS_ERR }]);
         }
         _ => err(ctx),
     }
@@ -337,8 +314,16 @@ pub fn run(ctx: &ServiceContext, sectors: u64) -> ! {
                              sectors, sectors / 2048));
     loop {
         let msg = ctx.recv();
-        let reply = match ctx.take_pending_cap() { Some(c) => c, None => continue };
-        serve(sectors, ctx, msg.payload_bytes(), reply);
-        ctx.remove_cap(reply);
+        let cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
+        // The correlation tag is byte 0 of every request; the backend below never sees it and parses
+        // exactly as it always did. Splitting it off HERE, once, is why fourteen reply sites did not
+        // each have to learn about it.
+        let p = msg.payload_bytes();
+        let (tag, body) = match p.split_first() {
+            Some((t, rest)) => (*t, rest),
+            None => (0, &p[..0]),
+        };
+        serve(sectors, ctx, body, crate::Reply { cap, tag });
+        ctx.remove_cap(cap);
     }
 }

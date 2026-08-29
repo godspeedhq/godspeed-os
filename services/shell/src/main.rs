@@ -1,6 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #![no_std]
 #![no_main]
+//! The shell - the user's interface to GodspeedOS, and a capability broker (Appendix B.3).
+//!
+//! This is the largest file in the repository, so read this before scrolling. It is one file because
+//! the shell is one task with one input loop; splitting it by command would scatter that loop across
+//! modules without making any command easier to find.
+//!
+//! **What it is.** Not a Unix shell: there is no fork, no exec, no inherited descriptors, no ambient
+//! stdin. It reads the console, parses a line, and either answers from its own state or asks a SERVICE
+//! over IPC - `fs` for files, `block-driver` for disks, the supervisor for spawning. Every authority it
+//! passes to a child is one it holds and grants explicitly.
+//!
+//! **How it is laid out.** A prompt/input loop, a command table dispatching to `cmd_*` functions (one
+//! per built-in), the gsh scripting language (`docs/`-documented: vars, if, for, fn, pipes), and the
+//! pipe machinery that composes built-ins with `|`.
+//!
+//! **What to know before editing.** The user stack is 256 KiB (`USER_STACK_PAGES` = 64 x 4 KiB, in
+//! `kernel/src/task/mod.rs`) and `pipe_run`'s frame already sits near it - measured at 177,297 bytes,
+//! 68%, on ENTRY, before any stage buffer is added. This line said 64 KiB for a long time and was
+//! simply wrong; it then misled the first instrument written to check it into reporting 270%.
+//! A large local in a command function can overflow the rest - mark record-builders `#[inline(never)]`
+//! (see the shell-stack note in `docs/`). There is no heap (§26.6.1): fixed arrays, bounded arenas, and
+//! streaming in `IO_CHUNK` pieces. And the shell is restartable like everything else - a crash gives a
+//! fresh prompt, losing the in-flight command but not the session (§6.2).
 
 use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError, ReqOutcome, ClockSource, Datetime};
 use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, AggErr, REC_MAX_ROWS, REC_ARENA};
@@ -83,13 +106,38 @@ const PATH_MAX: usize = 120; // fits in MAX_LINE; path_len is u8
 // End-of-stream marker a producer service sends to a built-in sink (the shell draining a
 // `service | write` pipe). A non-empty sentinel - the IPC path doesn't deliver an empty body.
 const PIPE_EOT: u8 = 0x04; // ASCII EOT
-// One pipe stage's buffer. 64 KiB so a producer (`tree /`, `find …`) can capture a large
-// listing without being clipped at the buffer. NOTE this is no longer the *binding* limit:
-// an IPC message is 4 KiB (PIPE_MSG_MAX) and a file is ~3.5 KiB, so a buffer wider than those
-// can only flow to a sink that can take it (today: none beyond 4 KiB). Lifting those is the
-// streaming/multi-block work (docs/pipes.md). The buffer lives on the user stack; two coexist
-// for a middle filter (input + output ≈ 128 KiB), which fits the 256 KiB user stack.
-const CAP_MAX: usize = 64 * 1024;
+// One pipe stage's buffer.
+//
+// 16 KiB, and this number is now MEASURED rather than argued. It was 64 KiB; it was cut to 16 on a
+// theory, reverted when the user rightly pointed out the theory had no evidence behind it, and is
+// back because the kernel's EL0 stack dump finally caught the fault in the act:
+//
+//     > roster | select name seat | to json | assert contains Luke
+//     *** aarch64 EXCEPTION  ELR_EL1 = 0x0  x30 = 0x0
+//         SP_EL0 = 0x7ffd2a90   x29 = 0x7fffb150
+//         stack at SP_EL0: 16 words, ALL ZERO
+//
+// Read off those registers: the stack is 185,200 bytes deep (71% of 256 KiB), the caller's frame
+// sits at 20,144, so the frame being entered is ~165 KiB BY ITSELF, and the zeros at SP are its own
+// stack-probe region. That is `pipe_run` (143,360 at 64 KiB) plus a stage, in the one pipeline that
+// combines the two largest frames in this file - pipe_run and cmd_roster (90,112). Their sum is
+// 233,472 of a 262,144 stack before a single caller is counted.
+//
+// At 16 KiB the same two are 45,056 and 40,960. That is the whole fix: the frames were never
+// survivable together, and the margin was thin enough that it tipped on what happened to be on the
+// stack already - which is why it looked intermittent and boot-dependent for days.
+//
+// Cost, unchanged from when this was 64 KiB: a producer whose output exceeds the buffer is TRUNCATED
+// and says so. Only the console can accept more than PIPE_MSG_MAX anyway; every other sink clips at
+// 4 KiB regardless of this number. Lifting it for real is the streaming work (docs/pipes.md).
+const CAP_MAX: usize = 16 * 1024;
+// The pipe buffer must stay wider than a single IPC message, or a stage crossing a service boundary
+// truncates a message it was handed whole - a bound that would look like a service bug rather than a
+// buffer that was shrunk past its floor. Pinned so the next person to tune CAP_MAX for stack cannot
+// take it below the one value it genuinely cannot go below.
+const _: () = assert!(CAP_MAX >= 4 * PIPE_MSG_MAX,
+    "CAP_MAX must leave room for several IPC messages; see the note above it");
+
 // A single IPC message body (= sdk MAX_PAYLOAD). A stage that must cross a service boundary is
 // bounded by this until pipe streaming chunks across messages.
 const PIPE_MSG_MAX: usize = 4096;
@@ -226,8 +274,56 @@ impl core::fmt::Write for FnCapBuf {
 // display (arch::console_push_byte), so we don't echo here - just accumulate
 // bytes until \r or \n. (On a serial terminal, turn local echo OFF to avoid
 // doubled characters.)
+/// The shell's own context: the SDK's `ServiceContext` plus the state the shell owns.
+///
+/// C6-1. `ServiceContext` is a zero-sized marker that reads the task's context page, so wrapping it
+/// costs nothing and `Deref` keeps every existing `ctx.log(...)` working unchanged. Deref coercion also
+/// means a `&ShellCtx` still passes to anything expecting a `&ServiceContext`, so adding owned state
+/// here did not touch a single call site - only the signatures of the functions that need it.
+///
+/// `Cell` rather than a lock or an atomic: this is one task on one core, so the cost of thread-safety
+/// would buy nothing, and an atomic here is what made the old version look acceptable while still being
+/// unowned. Interior mutability inside an owned struct is not global mutable state.
+/// The service's user stack, in bytes: `USER_STACK_PAGES = 64` x 4 KiB in `kernel/src/task/mod.rs`.
+///
+/// **This said 64 KiB in its first version**, taken from the prose at the top of this file rather
+/// than from the kernel that allocates the stack - and the first measurement it produced read
+/// "177297 of 65536 bytes (270% of the user stack)", a number that is not merely wrong but
+/// impossible. A diagnostic that reports 270% of a limit is worse than no diagnostic: it invites the
+/// reader to disbelieve the instrument instead of the code.
+///
+/// It is a duplicated fact either way (Commandment III) - `fs` hardcodes `256 * 1024` at its own
+/// stack report for the same reason - and the honest fix is one SDK-side accessor both read. Recorded
+/// here rather than quietly spread a third time.
+const USER_STACK_BYTES: usize = 64 * 4096;
+
+pub struct ShellCtx {
+    inner: ServiceContext,
+    /// The fs request correlation tag (see `next_fs_tag`).
+    fs_tag: core::cell::Cell<u8>,
+    /// Deepest `pipe_run` frame seen so far, in bytes. OWNED here rather than kept in a module-level
+    /// `static`, which is the anonymous singleton Invariant 9 forbids - the same mistake that had to be
+    /// undone in `xhci` an hour ago, and one this file already avoids for `fs_tag`.
+    pipe_stack_hwm: core::cell::Cell<usize>,
+}
+
+impl core::ops::Deref for ShellCtx {
+    type Target = ServiceContext;
+    fn deref(&self) -> &ServiceContext { &self.inner }
+}
+
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // C6-1: wrap the SDK context in the shell's own, which owns the fs correlation tag. Everything
+    // below still calls `ctx.log(...)` unchanged - `ShellCtx` derefs to `ServiceContext` - and deref
+    // coercion lets it pass to anything expecting the SDK type. The tag now has an owner with the same
+    // lifetime as the shell, instead of being a `static` that outlives nothing and belongs to no one.
+    let ctx = ShellCtx {
+        inner: ctx,
+        fs_tag: core::cell::Cell::new(0),
+        pipe_stack_hwm: core::cell::Cell::new(0),
+    };
+    let ctx = &ctx;
     // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
     // shown on the TV during startup - the user wants to see it come up. We log our
     // "ready" line into that stream, then wait for the input driver to report in
@@ -249,7 +345,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // seeds it before validating a fetched time (see cmd_date), which is a user-initiated moment when fs
     // has long settled and a slow answer is visible rather than silent.
 
-    wait_for_input_ready(&ctx);
+    // Do not wait: note it and carry on. A keystroke arriving later wakes the blocking read.
+    if !input_driver_announced(&ctx) {
+        ctx.log("shell: input driver not announced yet - prompting anyway (a later keystroke still wakes us)");
+    }
 
     // Boot is done: dismiss the boot screen on the TV (clear + stop mirroring logs
     // to it) and present a clean prompt. Serial keeps the full stream. This is also
@@ -296,6 +395,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Set once the clock is judged never to be coming - see its use below. Separate from
     // `clock_floor_recorded` because the floor genuinely was NOT recorded; this only says stop waiting.
     let mut clock_gaveup = false;
+    // Consecutive probes where `time` did not answer at all. See the backoff below.
+    let mut clock_silent: u32 = 0;
 
     loop {
         // Muted: a foreground app owns the console. Sleep + skip - don't draw, don't blocking-read. The
@@ -335,9 +436,48 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             clock_gaveup = true;
             ctx.log("shell: no network clock after 30s - blocking on input again (the floor stays unrecorded)");
         }
-        if !clock_floor_recorded && ctx.clock_source() == ClockSource::Ntp {
+        // `clock_gaveup` GATES THIS TOO. It was set three lines above and then not used here, so the
+        // shell kept asking `time` for the clock source on EVERY loop iteration, forever, on any
+        // machine that never syncs - which is the normal case with no cable. That is an RPC on the
+        // INPUT PATH, ahead of `console_read`.
+        //
+        // Under a chaos storm it is worse than wasteful: the log shows `time: request had no reply cap
+        // - dropping`, so the request cannot be answered at all, and the shell waits out its deadline
+        // once per iteration. That is the multi-second pause an operator sees mid-storm, and it sits
+        // in front of the keyboard read, so the prompt looks dead while it happens.
+        //
+        // Once we have given up on the clock there is nothing left to learn, so stop asking.
+        // BACK OFF WHEN THE ANSWER IS SILENCE. Asking a service that is not answering costs the full
+        // `time_rpc` budget - 2 s, a reacquire, another 2 s - and this sits in front of the keyboard
+        // read, so the prompt is dead for that long. Doing it every iteration for thirty seconds is
+        // why a machine with no network felt broken at the prompt.
+        //
+        // An answer that simply is not NTP yet is CHEAP and worth repeating - the clock may still
+        // arrive. Silence is expensive and means the service is unreachable, so after three of those
+        // we stop asking and say so once. The floor then stays unrecorded, which is a degraded state
+        // that is already reported rather than hidden (§26.7) - and an unrecorded floor is a far
+        // smaller harm than an interface that stops serving its user while it waits on a dependency.
+        // ONE probe per iteration, and its result decides both things: whether to record the floor,
+        // and whether asking again is worth what it costs.
+        let clock_probe = if !clock_gaveup && !clock_floor_recorded {
+            let r = time_source_probe(ctx);
+            if r.is_none() {
+                clock_silent += 1;
+                if clock_silent >= 3 {
+                    clock_gaveup = true;
+                    ctx.log("shell: `time` is not answering - stopped asking for the clock \
+                             (the floor stays unrecorded; the prompt stays responsive)");
+                }
+            } else {
+                clock_silent = 0;
+            }
+            r
+        } else {
+            None
+        };
+        if !clock_gaveup && !clock_floor_recorded && clock_probe == Some(ClockSource::Ntp) {
             clock_floor_recorded = true;
-            if let Some(f) = ctx.clock_floor() {
+            if let Some(f) = time_floor(ctx) {
                 if (0..=u32::MAX as i64).contains(&f) {
                     // NOT quiet. `quiet` is right for the reboot path, where the machine is resetting
                     // and a failed floor is not worth an operator's attention. Here it suppressed both
@@ -373,7 +513,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     break;
                 }
             }
-            ctx.console_write("gsh> ");
+            ctx.console_write(PROMPT);
             muted = false;
         }
 
@@ -384,17 +524,30 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // when somebody eventually pressed a key, or never. Polling until the sync lands and blocking
         // ever after costs a wakeup every MUTED_POLL_MS for the few seconds SNTP takes, and nothing at
         // all for the rest of the boot.
-        let b = if clock_floor_recorded || clock_gaveup {
-            ctx.console_read()
-        } else {
-            match ctx.try_console_read() {
-                Some(b) => b,
-                None => {
-                    ctx.sleep_ms(MUTED_POLL_MS);
-                    continue;
-                }
-            }
-        };
+        // ALWAYS BLOCK ON INPUT. The prompt waits for a keystroke and nothing else.
+        //
+        // This used to poll every 30 ms until a network clock arrived, so that an unattended machine
+        // would record its clock floor without anybody typing. The reasoning assumed "the few seconds
+        // SNTP takes" - but with no cable SNTP never lands, the give-up latch is 30 SECONDS, and the
+        // sleep it polls with is one no keystroke can interrupt. So on every boot of a machine with no
+        // network, the keyboard was dead-to-stuttering for the first thirty seconds. Reported from
+        // hardware as "keyboard doesn't work, I had to type in serial", and the shell's own comment
+        // predicted the symptom exactly ("bursts... the typing stutter reported on hardware") without
+        // anyone noticing it described the normal case rather than an edge one.
+        //
+        // The rule it breaks is the one this system is built on: wait on the TRUTH you need. What the
+        // prompt needs is a keystroke, and `console_read` blocks until exactly that - the kernel parks
+        // the task and the RX interrupt wakes it, with a lost-wakeup guard already in place. A clock
+        // has nothing to do with typing, and putting it in front of the read makes the user's primary
+        // interface hostage to a dependency that may never answer. That is the same fault as the
+        // network path spinning against the driver it was waiting for, one layer up and far more
+        // visible.
+        //
+        // The unattended clock-floor duty is NOT re-implemented here by other means, because the shell
+        // is the wrong owner for it: `time` owns the clock, so `time` should own its floor - reading
+        // it at start-up and persisting it when the clock is set. Removing it from the input path is
+        // the fix; putting it where it belongs is separate work, recorded rather than faked.
+        let b = ctx.console_read();
 
         match b {
             // Ctrl+Alt+Del (the SEC-2 follow-up). The USB driver cannot reboot - SEC-2 took REBOOT
@@ -424,7 +577,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     line.cur = 0;
                 }
                 nav = hist.len();
-                ctx.console_write("gsh> ");
+                ctx.console_write(PROMPT);
             }
             0x1B => {
                 // Escape: either a bare ESC (the Escape key → clear the line) or the start
@@ -458,7 +611,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 line.len = 0;
                 line.cur = 0;
                 nav = hist.len();
-                ctx.console_write("gsh> ");
+                ctx.console_write(PROMPT);
             }
             b if b >= 0x20 && b < 0x7f => line.insert(&ctx, b),
             _ => {}
@@ -470,14 +623,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 /// screen and clears it on exit, so afterwards we reprint the prompt + the in-progress
 /// line and park the cursor at its end. Runs at depth 0 (interactive) so help pages.
 fn run_help_key(
-    ctx: &ServiceContext,
+    ctx: &ShellCtx,
     cwd: &mut Cwd,
     last_result: &mut Result<(), ShellError>,
     line: &mut Line,
 ) {
     ctx.console_write("\r\n");
     *last_result = execute(ctx, b"help", cwd, *last_result, 0, &mut Out::Console);
-    ctx.console_write("gsh> ");
+    ctx.console_write(PROMPT);
     line.cur = line.len; // cursor at end after the reprint
     if line.len > 0 {
         ctx.console_write(core::str::from_utf8(line.bytes()).unwrap_or(""));
@@ -522,7 +675,7 @@ fn read_escape_byte(ctx: &ServiceContext) -> Option<u8> {
 /// PageUp/PageDown) and function keys an extended keyboard sends. Unknown sequences are
 /// consumed and ignored - never smeared onto the line. Bounded: a final byte must arrive
 /// within `CSI_MAX` bytes or we stop (defensive against a malformed serial stream).
-fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &mut History, nav: &mut usize) {
+fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usize) {
     const CSI_MAX: usize = 8;
     let mut param: u16 = 0;
     let mut have_param = false;
@@ -589,7 +742,7 @@ fn handle_csi(ctx: &ServiceContext, line: &mut Line, hist: &mut History, nav: &m
 /// `sort reverse`, the trailing `mkdir … parents`) and otherwise as a **file path**. One match fills
 /// it; several show the numbered menu (1-9 selects, Tab cycles). Operates from end-of-line so the menu
 /// reprint lines up with the cursor (§26.6: bounded).
-fn complete_tab(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd) {
+fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
     if line.len == 0 { return; }
     line.end(ctx);
     // Current token starts after the last space (or line start); its pipe segment starts after the
@@ -641,7 +794,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("busiest", &["mem", "restarts", "queue"]),
     ("date",    &["epoch", "sync"]),
-    ("net",     &["dns", "stats", "arp", "scan", "renew"]),
+    ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
     ("chaos",   &["kill-storm", "flood-storm", "mem-pressure", "spawn-storm", "max-carnage", "link-flap"]),
     ("write",   &["append", "prepend"]),
@@ -843,7 +996,7 @@ fn keyword_menu(ctx: &ServiceContext, line: &mut Line, tok_start: usize, cands: 
     }
     if n > shown { ctx.console_write("(type more to narrow) "); }
     ctx.console_write("\r\n");
-    ctx.console_write("gsh> ");
+    ctx.console_write(PROMPT);
     ctx.console_write(str_of(line.bytes()));
     let mut idx = usize::MAX;
     loop {
@@ -872,7 +1025,7 @@ struct PathHit { off: usize, len: usize, is_dir: bool }
 /// dir, ` ` for a file); several → fill the common prefix, print a numbered menu, then **digit**
 /// selects or **Tab** cycles to the next candidate (any other key keeps the line). No new authority
 /// - the shell already holds the `fs` LIST_DIR cap (the same `ls` uses).
-fn complete_path(ctx: &ServiceContext, line: &mut Line, cwd: &Cwd, tok_start: usize) {
+fn complete_path(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd, tok_start: usize) {
     let bytes = line.bytes();
     let token = &bytes[tok_start..];
     // dir part (everything up to and including the last '/') and the leaf being typed.
@@ -961,7 +1114,7 @@ fn fill_path(ctx: &ServiceContext, line: &mut Line, base_len: usize, name: &[u8]
 /// Print the numbered candidate menu, then run the selection loop: a **digit** (1-9) commits that
 /// entry; **Tab** cycles to the next candidate (filling it, no separator); any other key keeps the
 /// current line and returns (that key is not consumed as input - minor: re-press to use it).
-fn path_menu(ctx: &ServiceContext, line: &mut Line, base_len: usize, rbuf: &[u8; 512], hits: &[PathHit]) {
+fn path_menu(ctx: &ShellCtx, line: &mut Line, base_len: usize, rbuf: &[u8; 512], hits: &[PathHit]) {
     let n = hits.len();
     let shown = n.min(9);
     ctx.console_write("\r\n");
@@ -978,7 +1131,7 @@ fn path_menu(ctx: &ServiceContext, line: &mut Line, base_len: usize, rbuf: &[u8;
     }
     if n > shown { ctx.console_write("(type more to narrow) "); }
     ctx.console_write("\r\n");
-    ctx.console_write("gsh> ");
+    ctx.console_write(PROMPT);
     ctx.console_write(str_of(line.bytes()));
 
     let mut idx = usize::MAX; // MAX = no candidate filled yet (showing the common-prefix)
@@ -1002,6 +1155,14 @@ fn path_menu(ctx: &ServiceContext, line: &mut Line, base_len: usize, rbuf: &[u8;
 /// A bounded ring of recent command lines for up/down-arrow recall (§26.6: fixed size,
 /// oldest dropped when full). Lives in the shell session; cleared each boot.
 const HIST_MAX: usize = 16;
+/// The prompt. Its WIDTH sets the column the typed line starts at, so the two are defined
+/// together and checked at compile time - a longer prompt with a stale redraw column would
+/// erase from inside the prompt.
+const PROMPT: &str = "gsh> ";
+/// Cursor to the first column of the typed text (CHA, 1-based), then erase to end of line.
+const REDRAW: &str = "\x1b[6G\x1b[K";
+const _: () = assert!(PROMPT.len() + 1 == 6);
+
 struct History {
     lines: [[u8; MAX_LINE]; HIST_MAX],
     lens: [usize; HIST_MAX],
@@ -1048,7 +1209,7 @@ impl History {
     /// the oldest - a file line - if the merge exceeds HIST_MAX. `#[inline(never)]` keeps its ~4 KiB frame
     /// off the interactive key path (the shell's user stack is tight).
     #[inline(never)]
-    fn load(&mut self, ctx: &ServiceContext) {
+    fn load(&mut self, ctx: &ShellCtx) {
         if self.loaded { return; }
         self.loaded = true;
         let path = b"/.gsh_history";
@@ -1079,7 +1240,7 @@ impl History {
     /// one - best-effort either way, never an error surfaced to the user (§26.7). `#[inline(never)]` keeps
     /// its buffer off the Enter path (tight user stack).
     #[inline(never)]
-    fn save(&self, ctx: &ServiceContext) {
+    fn save(&self, ctx: &ShellCtx) {
         let path: &[u8] = b"/.gsh_history";
         let mut buf = [0u8; HIST_MAX * (MAX_LINE + 1)];
         let mut pos = 0usize;
@@ -1111,12 +1272,47 @@ impl Line {
 
     /// Reprint from the cursor to end-of-line, erase any stale tail (`ESC[K`), then
     /// step the cursor back to `cur`. Used after an insert/delete shifts the tail.
-    fn redraw_tail(&self, ctx: &ServiceContext) {
-        if self.cur < self.len {
-            ctx.console_write(core::str::from_utf8(&self.buf[self.cur..self.len]).unwrap_or(""));
+    /// Echo one line edit as a SINGLE console message: `lead`, the tail behind the cursor, an
+    /// optional erase, and the backspaces that put the cursor back.
+    ///
+    /// Every `console_write` is an IPC message to the `console` service, whose endpoint queue is 16
+    /// deep (§8.5). This used to cost 2 + n messages per keystroke - the character, an unconditional
+    /// `ESC[K`, and one backspace per tail character - so typing fast filled that queue in a handful
+    /// of keys. A full queue BLOCKS the sender (`BlockedOnSend`), and a blocked shell is not calling
+    /// `ConsoleRead`, so keystrokes piled into the kernel's input ring until it overflowed and dropped
+    /// them. That is the "keyboard trips when you bash it" reported from the Wyse. One message per
+    /// edit removes the pressure at its source rather than absorbing it downstream.
+    ///
+    /// `erase` is passed only when the line SHRANK (backspace, delete), which is the only case that
+    /// leaves a stale cell to the right of the reprinted tail. An insert grows the line, so the erase
+    /// is pure cost there - and it was being paid on every single character typed.
+    fn echo_edit(&self, ctx: &ServiceContext, lead: &[u8], erase: bool) {
+        let t = self.len - self.cur;
+        // `console_write` caps a message at 256 bytes, so a tail too long to batch falls back to the
+        // unbatched path below - correct, just chattier, and only reachable when editing near the
+        // start of a line more than half the maximum length.
+        if lead.len() + 2 * t + 3 <= 256 {
+            let mut b = [0u8; 256];
+            let mut n = 0;
+            b[n..n + lead.len()].copy_from_slice(lead);
+            n += lead.len();
+            b[n..n + t].copy_from_slice(&self.buf[self.cur..self.len]);
+            n += t;
+            if erase {
+                b[n..n + 3].copy_from_slice(b"\x1b[K");
+                n += 3;
+            }
+            for _ in 0..t {
+                b[n] = 0x08;
+                n += 1;
+            }
+            if n > 0 { ctx.console_write(core::str::from_utf8(&b[..n]).unwrap_or("")); }
+            return;
         }
-        ctx.console_write("\x1b[K"); // erase whatever the old (possibly longer) tail left
-        for _ in self.cur..self.len { ctx.console_write("\x08"); }
+        if !lead.is_empty() { ctx.console_write(core::str::from_utf8(lead).unwrap_or("")); }
+        if t > 0 { ctx.console_write(core::str::from_utf8(&self.buf[self.cur..self.len]).unwrap_or("")); }
+        if erase { ctx.console_write("\x1b[K"); }
+        for _ in 0..t { ctx.console_write("\x08"); }
     }
 
     /// Insert a printable byte at the cursor.
@@ -1135,10 +1331,9 @@ impl Line {
         self.buf[self.cur] = b;
         self.len += 1;
         self.cur += 1;
-        // Echo the inserted byte, then redraw the shifted tail behind it.
-        let s = [b];
-        ctx.console_write(core::str::from_utf8(&s).unwrap_or(""));
-        self.redraw_tail(ctx);
+        // Echo the inserted byte and the shifted tail as ONE message. No erase: an insert GROWS the
+        // line, so the reprinted tail is longer than what it replaces and nothing stale can remain.
+        self.echo_edit(ctx, &[b], false);
     }
 
     /// Delete the character before the cursor (Backspace).
@@ -1147,8 +1342,9 @@ impl Line {
         for i in self.cur..self.len { self.buf[i - 1] = self.buf[i]; }
         self.len -= 1;
         self.cur -= 1;
-        ctx.console_write("\x08"); // step left onto the deleted cell
-        self.redraw_tail(ctx);
+        // Step left onto the deleted cell, reprint the tail, erase the cell it no longer covers -
+        // one message. The erase IS needed here: the line shrank, so the tail leaves one stale cell.
+        self.echo_edit(ctx, b"\x08", true);
     }
 
     /// Delete the character at the cursor (the Delete key - forward delete).
@@ -1156,7 +1352,7 @@ impl Line {
         if self.cur >= self.len { return; }
         for i in (self.cur + 1)..self.len { self.buf[i - 1] = self.buf[i]; }
         self.len -= 1;
-        self.redraw_tail(ctx);
+        self.echo_edit(ctx, b"", true);
     }
 
     fn left(&mut self, ctx: &ServiceContext) {
@@ -1183,8 +1379,21 @@ impl Line {
     /// history recall, tab completion, and the bare-ESC clear. Erases from wherever the
     /// cursor is: step to the input start, `ESC[K` to wipe to end of line, then print.
     fn set(&mut self, ctx: &ServiceContext, new: &[u8]) {
-        while self.cur > 0 { self.cur -= 1; ctx.console_write("\x08"); }
-        ctx.console_write("\x1b[K");
+        // ABSOLUTE, not a walk back. This used to emit `cur` backspaces to return to the start of
+        // the typed text, which assumes the cursor is exactly where we last left it - and the
+        // console is a SHARED device the shell does not hold a lock on. Anything else that writes
+        // (a service log during chaos) moves the cursor out from under that count, so the walk back
+        // stops short of the prompt and the erase begins mid-text. What is left is a stale prefix:
+        // recalling history showed "gsh> chaos mselfcheck all-services 50 yes", and backspacing
+        // then emptied the BUFFER while those stale columns stayed on screen - so the line looked
+        // like "chaos m" but Enter submitted nothing. The buffer was right the whole time; only our
+        // belief about the cursor had drifted.
+        //
+        // CHA cannot drift: it names the column outright, so the erase always starts at the true
+        // start of the typed text and the prompt itself is preserved (which is why this is not a
+        // carriage return + reprint - a second prompt is indistinguishable from a real one).
+        ctx.console_write(REDRAW);
+        self.cur = 0;
         let n = new.len().min(MAX_LINE);
         self.buf[..n].copy_from_slice(&new[..n]);
         self.len = n;
@@ -1204,14 +1413,26 @@ impl Line {
 /// clear the boot screen without ever cutting it off mid-stream. The loop is just
 /// polling that flag; `MAX_SPINS` is a pure safety net for the impossible case
 /// where the driver never reports (it would mean xHCI hard-crashed at boot).
-fn wait_for_input_ready(ctx: &ServiceContext) {
-    const MAX_SPINS: u32 = 50_000_000;
-    for _ in 0..MAX_SPINS {
-        if ctx.input_ready() {
-            return;
-        }
-        ctx.yield_cpu();
-    }
+/// Report whether the input driver has announced itself - and do NOT wait for it.
+///
+/// This used to spin up to fifty million times before the shell printed its first prompt, waiting for
+/// the USB driver to report in. Three things wrong with that, and the third is the one that matters:
+///
+///   - it is a wait on a COUNT, which is not a duration: the same loop is a different length of time
+///     on every machine and every boot;
+///   - it is a spin, so it burns the core that `dwc2` needs to finish bringing the keyboard UP - the
+///     shell starving the very driver it was waiting for, the same self-defeating shape as the network
+///     path waiting on frames while saturating the service that fetches them;
+///   - and it is pointless. `console_read` blocks in the kernel on the input ring and is woken when a
+///     byte arrives, whether that byte comes from serial now or from a USB keyboard that finished
+///     enumerating a second later. Waiting for the driver to "be ready" buys nothing that blocking on
+///     the input itself does not already give.
+///
+/// The prompt is the user's interface and must exist from the moment the shell runs. Everything else -
+/// USB enumeration, the disk, the clock - comes up behind it, and the prompt simply works when it
+/// does.
+fn input_driver_announced(ctx: &ServiceContext) -> bool {
+    ctx.input_ready()
 }
 
 /// Split `s` into args with **minimal quoting**: a token wrapped in a matching pair of `'…'`
@@ -1297,7 +1518,7 @@ impl ShellError {
 /// path's 64 KiB `Stream`) into `cmd_run`'s, blowing the bounded user stack on the nested
 /// `run → cmd_run → execute` path (the same inlining-inflates-frame trap as the record builders).
 #[inline(never)]
-fn execute(ctx: &ServiceContext, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellError>, depth: u8, out: &mut Out) -> Result<(), ShellError> {
+fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellError>, depth: u8, out: &mut Out) -> Result<(), ShellError> {
     let Ok(s) = core::str::from_utf8(line) else {
         ctx.console_writeln("shell: invalid input");
         return Err(ShellError::Unknown);
@@ -1603,7 +1824,7 @@ fn compact_step(buf: &mut [u8], start: usize, dataend: usize, eof: bool) -> (usi
 /// the script buffer off the hot pipe frame, and the `fs` reply is dropped before any command
 /// runs - both bound the user stack (see the pipe stack-overflow lesson).
 #[inline(never)]
-fn cmd_run(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&str>, params: &Params) -> Result<(), ShellError> {
+fn cmd_run(ctx: &ShellCtx, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&str>, params: &Params) -> Result<(), ShellError> {
     let mut pbuf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut pbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     // Stream + MINIFY the script into the buffer (comments / blank lines / indentation stripped and
@@ -1628,7 +1849,7 @@ const IMPORT_MAX: usize = 16; // max names in one `from … import a b c …`
 /// Stream a file into `dst`, MINIFYING on the fly (`compact_step`): comments / blank lines /
 /// indentation stripped as it loads. Returns `(code_len, truncated)`. Used for both the main script
 /// and each imported lib; `dst` is a sub-slice of the resident buffer, so no second big buffer.
-fn stream_minify(ctx: &ServiceContext, path: &[u8], dst: &mut [u8]) -> (usize, bool) {
+fn stream_minify(ctx: &ShellCtx, path: &[u8], dst: &mut [u8]) -> (usize, bool) {
     let cap = dst.len();
     if cap < IO_CHUNK { return (0, true); } // no room even for one chunk
     let mut code = 0usize;
@@ -1677,7 +1898,7 @@ fn build_fn_def(scratch: &mut [u8], alias: &[u8], script: &[u8], base: usize, ft
 /// the requested functions (renamed on `as`) after it, then moves them down to `*code` - so only the
 /// requested (renamed) functions remain, indexed by the run's pre-scan. Loud + no-op on any error.
 #[inline(never)]
-fn resolve_one_import(ctx: &ServiceContext, stmt: &[u8], is_from: bool, script: &mut [u8], code: &mut usize) {
+fn resolve_one_import(ctx: &ShellCtx, stmt: &[u8], is_from: bool, script: &mut [u8], code: &mut usize) {
     let s = str_of(stmt);
     let mut toks = [""; 40];
     let mut nt = 0usize;
@@ -1756,7 +1977,7 @@ fn resolve_one_import(ctx: &ServiceContext, stmt: &[u8], is_from: bool, script: 
 /// statements and, for each, append the requested (optionally `as`-renamed) library functions to the
 /// buffer so the run's pre-scan indexes them. Explicit paths, flat namespace, loud on error. Runs
 /// BEFORE any pipe/report buffers exist, so the small parse scratch is well inside the stack.
-fn resolve_imports(ctx: &ServiceContext, script: &mut [u8], code: &mut usize) {
+fn resolve_imports(ctx: &ShellCtx, script: &mut [u8], code: &mut usize) {
     let scan_end = *code; // only the MAIN script is scanned (a lib importing a lib is not resolved)
     let mut pos = 0usize;
     while pos < scan_end {
@@ -2150,7 +2371,7 @@ fn valid_var_name(name: &str) -> bool {
 }
 
 /// `let [mut] <name> = <value>` - declare a binding.
-fn stmt_let(ctx: &ServiceContext, cwd: &Cwd, rest: &str, vars: &mut Vars, params: &Params) -> Result<(), ShellError> {
+fn stmt_let(ctx: &ShellCtx, cwd: &Cwd, rest: &str, vars: &mut Vars, params: &Params) -> Result<(), ShellError> {
     let (mutable, rest) = match rest.strip_prefix("mut ") { Some(r) => (true, r.trim_start()), None => (false, rest) };
     let (name, after) = split_first(rest);
     let after = after.trim_start();
@@ -2173,7 +2394,7 @@ fn stmt_let(ctx: &ServiceContext, cwd: &Cwd, rest: &str, vars: &mut Vars, params
 }
 
 /// `<name> = <value>` - reassign a mutable binding.
-fn stmt_reassign(ctx: &ServiceContext, cwd: &Cwd, name: &str, value: &str, vars: &mut Vars, params: &Params) -> Result<(), ShellError> {
+fn stmt_reassign(ctx: &ShellCtx, cwd: &Cwd, name: &str, value: &str, vars: &mut Vars, params: &Params) -> Result<(), ShellError> {
     // `x = $( cmd )` - capture command output as the new value.
     if let Some(inner) = capture_form(value) {
         return capture_reassign(ctx, cwd, name, inner, vars);
@@ -2192,7 +2413,7 @@ enum StmtOutcome { Cont(Result<(), ShellError>), Stop(Result<(), ShellError>) }
 
 /// Run one gsh statement: a `let`/reassignment/`fail`, or - after `$`-expansion - a plain command
 /// handed to the existing `execute`. `vars` is the run's variable table; `params` its parameters.
-fn run_stmt(ctx: &ServiceContext, cwd: &mut Cwd, stmt: &str, prev: Result<(), ShellError>, depth: u8, vars: &mut Vars, params: &Params, out: &mut Out) -> StmtOutcome {
+fn run_stmt(ctx: &ShellCtx, cwd: &mut Cwd, stmt: &str, prev: Result<(), ShellError>, depth: u8, vars: &mut Vars, params: &Params, out: &mut Out) -> StmtOutcome {
     let (head, rest) = split_first(stmt);
     // `fail <msg>` - print loudly and stop the run with Err.
     if head == "fail" {
@@ -2425,7 +2646,7 @@ fn eval_arith(ctx: &ServiceContext, expr: &str, vars: &Vars, params: &Params) ->
 /// Evaluate a condition to a bool. A condition is: `!<cond>` (negated), `<lhs> in <words...>`
 /// (membership), `<lhs> <op> <rhs>` (comparison; `result` compares by kind), or a command (true iff
 /// it returns `Ok`). A command condition does NOT update `result` - only real statements do.
-fn eval_cond(ctx: &ServiceContext, cwd: &mut Cwd, cond: &str, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8) -> bool {
+fn eval_cond(ctx: &ShellCtx, cwd: &mut Cwd, cond: &str, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8) -> bool {
     // Strip leading `!` ITERATIVELY (a parity flag), never by native recursion: a long `!!!...` run
     // would otherwise recurse once per `!` and overflow the bounded user stack (§26.6.1 - the
     // no-native-recursion rule every other gsh construct obeys). Then evaluate the bare condition once.
@@ -2436,7 +2657,7 @@ fn eval_cond(ctx: &ServiceContext, cwd: &mut Cwd, cond: &str, vars: &Vars, param
 }
 
 /// Evaluate a condition that has had any leading `!` already stripped (see `eval_cond`). `cond` is trimmed.
-fn eval_cond_bare(ctx: &ServiceContext, cwd: &mut Cwd, cond: &str, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8) -> bool {
+fn eval_cond_bare(ctx: &ShellCtx, cwd: &mut Cwd, cond: &str, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8) -> bool {
     if cond.is_empty() { ctx.console_writeln("gsh: empty condition"); return false; }
     // Scan tokens for `in` (membership) or a comparison operator, so either side may be a multi-token
     // arithmetic expression (`$i + 1 > $max`), not just a single token (docs/scripting.md §3-§4).
@@ -2610,7 +2831,7 @@ enum Step {
 /// each condition in turn: on the first true one, returns `Enter(body, If)` (the executor runs that
 /// block, then its `}` skips the rest of the chain); if none is true, takes a trailing `else` if
 /// present, else returns `Done(next)`.
-fn handle_if(b: &[u8], mut pos: usize, ctx: &ServiceContext, cwd: &mut Cwd, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8, ft: &FnTable) -> Step {
+fn handle_if(b: &[u8], mut pos: usize, ctx: &ShellCtx, cwd: &mut Cwd, vars: &Vars, params: &Params, prev: Result<(), ShellError>, depth: u8, ft: &FnTable) -> Step {
     loop {
         let open = match find_open_brace(b, pos) { Some(o) => o, None => { ctx.console_writeln("gsh: if: missing '{'"); return Step::Malformed(b.len()); } };
         let end = match find_matching_brace(b, open) { Some(e) => e, None => { ctx.console_writeln("gsh: if: unbalanced braces"); return Step::Malformed(b.len()); } };
@@ -2920,7 +3141,7 @@ fn fmt_walk_window(win: &[u8], eof: bool, depth: &mut usize, first: &mut bool,
 /// Stream `path` through the formatter, calling `emit` for each formatted run - constant memory (reads
 /// in chunks, holds only ONE partial statement). `UnitTooLong` if a single statement exceeds the hold;
 /// `Unparseable` if a block is left unclosed. No file-size limit.
-fn fmt_stream_pass(ctx: &ServiceContext, path: &[u8], emit: &mut dyn FnMut(&[u8]) -> bool) -> Result<(), FmtErr> {
+fn fmt_stream_pass(ctx: &ShellCtx, path: &[u8], emit: &mut dyn FnMut(&[u8]) -> bool) -> Result<(), FmtErr> {
     let mut work = [0u8; FMT_HOLD + FMT_RCHUNK];
     let mut hold = 0usize;
     let mut depth = 0usize;
@@ -2974,7 +3195,7 @@ fn parse_for_iter(b: &[u8], rest_start: usize, rest_end: usize) -> ForIter {
 
 /// Advance a `for` iterator by one: if a next item exists, set the loop var (`var`) to it and return
 /// the advanced iterator; else `None` (loop done). Words are `$`-expanded in the current scope.
-fn for_step(ctx: &ServiceContext, b: &[u8], vars: &mut Vars, var: usize, it: ForIter, params: &Params) -> Option<ForIter> {
+fn for_step(ctx: &ShellCtx, b: &[u8], vars: &mut Vars, var: usize, it: ForIter, params: &Params) -> Option<ForIter> {
     match it {
         ForIter::Range { cur, end } => {
             if cur >= end { return None; }
@@ -3024,7 +3245,7 @@ fn forlines_temp(id: u32, buf: &mut [u8; 24]) -> &[u8] {
 /// and the loop ends. A line is bytes up to `\n`; a final line without a trailing `\n` still counts;
 /// a trailing `\n` does not yield an extra empty line.
 #[inline(never)]
-fn forlines_step(ctx: &ServiceContext, vars: &mut Vars, var: usize, off: u32, id: u32) -> Option<ForIter> {
+fn forlines_step(ctx: &ShellCtx, vars: &mut Vars, var: usize, off: u32, id: u32) -> Option<ForIter> {
     let mut tb = [0u8; 24];
     let temp = forlines_temp(id, &mut tb);
     let mut rbuf = [0u8; IO_CHUNK];
@@ -3045,7 +3266,7 @@ fn forlines_step(ctx: &ServiceContext, vars: &mut Vars, var: usize, off: u32, id
 /// leaked by an errored prior run). Empty output -> no file (an empty loop). Loud + `Err` on a refused
 /// producer (run_captured said why), an over-16-KiB output, or a write failure.
 #[inline(never)]
-fn forlines_capture(ctx: &ServiceContext, cwd: &Cwd, inner: &str, temp: &[u8]) -> Result<(), ()> {
+fn forlines_capture(ctx: &ShellCtx, cwd: &Cwd, inner: &str, temp: &[u8]) -> Result<(), ()> {
     let _ = fs_request(ctx, OP_DELETE, temp, &[]);
     let mut rb = ReportBuf::new();
     let ok = { let mut o = Out::File(&mut rb); run_captured(ctx, cwd, inner, &mut o) };
@@ -3071,7 +3292,7 @@ fn forlines_capture(ctx: &ServiceContext, cwd: &Cwd, inner: &str, temp: &[u8]) -
 /// function's return (`min_depth` = that function's scope) and at script end / `fail` (`min_depth` =
 /// 0 = all). A deferred command runs like any statement; its result does NOT affect the script's
 /// control flow - defers are cleanup, run even on `fail`.
-fn run_defers(ctx: &ServiceContext, cwd: &mut Cwd, b: &[u8], defers: &mut [(usize, usize, usize)], ndefer: &mut usize, min_depth: usize, vars: &mut Vars, params: &Params, out: &mut Out, sdepth: u8) {
+fn run_defers(ctx: &ShellCtx, cwd: &mut Cwd, b: &[u8], defers: &mut [(usize, usize, usize)], ndefer: &mut usize, min_depth: usize, vars: &mut Vars, params: &Params, out: &mut Out, sdepth: u8) {
     loop {
         let mut idx = None;
         let mut i = *ndefer;
@@ -3247,7 +3468,7 @@ fn let_capture_form(s: &str) -> Option<(&str, bool, &str)> {
 /// a LIBRARY command (`health`), whose user asked for a dashboard, not a test report. Errors still
 /// print (each failing statement reports itself) and the Result still carries failure (§26.7 loud).
 /// `run`/`selfcheck` pass `false`: an orchestrated script run IS a report.
-fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool) -> Result<(), ShellError> {
+fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool) -> Result<(), ShellError> {
     // Per-run interpreter state: a bounded variable table, allocated once HERE (above `execute`) and
     // threaded by &mut into `run_stmt` - it never reaches `execute`/`pipe_run`'s frame. No heap (§26.6).
     let mut vars = Vars::new();
@@ -3681,7 +3902,7 @@ fn run_lines(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, out: &m
 /// dispatcher is tiny on purpose: the 32 KiB `ReportBuf` lives ONLY in `run_and_save`, called only
 /// on the save path - so a bare run/selfcheck does NOT carry 32 KiB of unused frame (which would
 /// tip its already-heavy `| assert` sub-pipelines over the user-stack ceiling).
-fn run_with_optional_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, save: Option<&str>, params: &Params)
+fn run_with_optional_save(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, save: Option<&str>, params: &Params)
     -> Result<(), ShellError>
 {
     match save {
@@ -3694,7 +3915,7 @@ fn run_with_optional_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth
 /// (direct file write, no pipe). `#[inline(never)]` so the 32 KiB buffer exists only while a save
 /// is actually running, not in the frame of every bare run.
 #[inline(never)]
-fn run_and_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, spath: &str, params: &Params)
+fn run_and_save(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, spath: &str, params: &Params)
     -> Result<(), ShellError>
 {
     let mut pbuf = [0u8; PATH_MAX];
@@ -3724,7 +3945,7 @@ fn run_and_save(ctx: &ServiceContext, cwd: &mut Cwd, src: &[u8], depth: u8, spat
 /// Write a report buffer to `path`, streaming to a multi-block file (the report exceeds one
 /// message). Quiet (the caller prints the human message); returns success. Reuses the same
 /// `WriteFile` / `WriteNew`+`WriteAt` shape as the pipe `write` sink, with no intermediate copy.
-fn save_report(ctx: &ServiceContext, path: &[u8], data: &[u8]) -> bool {
+fn save_report(ctx: &ShellCtx, path: &[u8], data: &[u8]) -> bool {
     // Bounded fs request (wall-clock): a chaos report is saved right after the storm may have hammered
     // fs, so the write must time out gracefully rather than hang the shell (the max-carnage aggregate
     // report is small → this single-message path).
@@ -3787,7 +4008,7 @@ fn library_script(name: &str) -> Option<&'static str> {
 /// tests have somewhere to write), then `selfcheck`. Re-runnable (the suite creates and deletes
 /// its own files). Refused inside a script (it runs one - no nesting).
 #[inline(never)]
-fn cmd_selfcheck(ctx: &ServiceContext, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<(), ShellError> {
+fn cmd_selfcheck(ctx: &ShellCtx, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<(), ShellError> {
     if depth > 0 {
         ctx.console_writeln("selfcheck: not available inside a script (it runs one)");
         return Err(ShellError::Unknown);
@@ -3816,7 +4037,7 @@ fn cmd_selfcheck(ctx: &ServiceContext, cwd: &mut Cwd, depth: u8, arg: &str) -> R
 /// `Err(AssertFailed)` + a `FAILED` line. This is the negative-test surface (§22's negative cases
 /// on hardware): `assert fails read /nope` verifies the guardrail refuses. The *content* form
 /// (`… | assert contains X`) is the pipe sink `assert_stream`.
-fn cmd_assert(ctx: &ServiceContext, cwd: &mut Cwd, rest: &str, depth: u8) -> Result<(), ShellError> {
+fn cmd_assert(ctx: &ShellCtx, cwd: &mut Cwd, rest: &str, depth: u8) -> Result<(), ShellError> {
     let (verb, cmd) = split_first(rest);
     match verb {
         "ok" | "fails" => {
@@ -3973,7 +4194,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "date" => help_block(ctx, "date", "date + time (from the hardware clock, or the network on the RTC-less Pi)", &[
             ("date", "full timestamp (weekday date time)", "date"),
             ("date epoch", "seconds since 1970-01-01", "date epoch"),
-            ("date sync", "fetch the time from the internet (SNTP) and set the clock", "date sync"),
+            ("date sync", "sync the clock from the internet NOW (it also syncs itself)", "date sync"),
         ], true),
         "net" => help_block(ctx, "net", "network status, DNS, and ARP host discovery", &[
             ("net", "IP, gateway (+MAC), and whether the gateway pings", "net"),
@@ -4154,8 +4375,8 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ("date", "epoch") => help_block(ctx, "date epoch", "seconds since 1970-01-01", &[
             ("date epoch", "print epoch seconds (not POSIX 'unix')", "date epoch"),
         ], false),
-        ("date", "sync") => help_block(ctx, "date sync", "set the clock from the internet (SNTP)", &[
-            ("date sync", "fetch the time over the network and set the wall clock, then print it (q aborts)", "date sync"),
+        ("date", "sync") => help_block(ctx, "date sync", "sync the clock from the internet NOW", &[
+            ("date sync", "the clock already syncs itself once the network is up, and re-tries about once a minute while it is unset; this asks for it immediately instead of waiting (q aborts)", "date sync"),
         ], false),
         ("net", "dns") => help_block(ctx, "net dns", "resolve a hostname to an IPv4 address", &[
             ("net dns <host>", "DNS A-record lookup via net-stack (slirp resolver)", "net dns example.com"),
@@ -4331,7 +4552,15 @@ fn cmd_help(ctx: &ServiceContext, depth: u8) -> Result<(), ShellError> {
     // is harmless and consistent). rows==0 means geometry is unknown → just print it.
     let (rows, _cols) = ctx.console_dims();
     let rows = rows as usize;
-    if depth > 0 || rows == 0 || total <= rows {
+    // UNKNOWN GEOMETRY IS NOT "NO TERMINAL". A failed `console_dims` returns 0, and this treated that
+    // as a reason to dump sixty lines past the top of the screen - the pager silently disappearing
+    // because a lookup missed. `edit` handles the same zero by assuming 24 rows and carrying on; this
+    // now does the same, so a future failure degrades instead of removing a feature.
+    //
+    // `depth > 0` stays a real reason to skip: nested help is being rendered into someone else's
+    // output (a pipe, `help | write`), where a pager would be wrong rather than merely unhelpful.
+    let rows = if rows == 0 { 24 } else { rows };
+    if depth > 0 || total <= rows {
         for i in 0..total { help_render_line(ctx, i, false); }
         return Ok(());
     }
@@ -4657,14 +4886,21 @@ fn cmd_mem(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     Ok(())
 }
 
-fn cmd_reboot(ctx: &ServiceContext) -> ! {
-    // Record the clock floor on the way down. This is what carries a BOOT-time network sync across the
-    // power cycle: net-stack sets the clock but holds no filesystem authority, and the shell does - so a
-    // deliberate reboot is the natural explicit moment to write it. Quiet + bounded: the machine is about
-    // to reset, so a missing filesystem must not delay or clutter the shutdown.
-    if let Some(f) = ctx.clock_floor() {
-        if (0..=u32::MAX as i64).contains(&f) { clock_floor_persist(ctx, f as u32, true); }
-    }
+fn cmd_reboot(ctx: &ShellCtx) -> ! {
+    // SAY IT FIRST, THEN DO IT. Nothing goes between the command and the action.
+    //
+    // This used to make two round trips before printing anything - `time_floor` to the clock service,
+    // then `clock_floor_persist`, which talks to `time` AND `fs` - so a slow or busy dependency turned
+    // `reboot` into a command that sat there silently. Right after a chaos storm, when those services
+    // are restarting, that is exactly when someone wants to reboot and exactly when it looks dead.
+    //
+    // The work is also redundant now: `time` owns the clock floor and persists it at the moment the
+    // clock is SET, so there is nothing for the shell to write on the way down. Two owners for one
+    // piece of state was the older bug; this is the second half of removing it.
+    //
+    // What remains is what the user asked for: a line, then the reset. If the SoC fails to reset, the
+    // kernel's reset path says so on the console - it is bounded and reports rather than hanging
+    // silently.
     ctx.console_writeln("rebooting...");
     ctx.reboot()
 }
@@ -4769,9 +5005,9 @@ impl core::fmt::Write for EpochBuf {
 /// the shell is never granted it), and `fs` answers a write with a status byte that can say FS_ERR or
 /// "no filesystem". Treating "a reply arrived" as "it worked" is how a refused privileged operation gets
 /// reported to the operator as done (§26.7, invariant 12).
-fn clock_floor_persist(ctx: &ServiceContext, epoch: u32, quiet: bool) -> bool {
-    if !ctx.set_clock_floor(epoch) {
-        if !quiet { ctx.console_writeln("date: the kernel refused the clock floor - not recorded"); }
+fn clock_floor_persist(ctx: &ShellCtx, epoch: u32, quiet: bool) -> bool {
+    if !time_floor_set(ctx, epoch as i64) {
+        if !quiet { ctx.console_writeln("date: the time service refused the clock floor - not recorded"); }
         return false;
     }
     let mut b = EpochBuf { buf: [0u8; 24], len: 0 };
@@ -4795,7 +5031,7 @@ fn clock_floor_persist(ctx: &ServiceContext, epoch: u32, quiet: bool) -> bool {
 /// SUCCESS (FS_OK is 0; 1 is FS_ERR), and skipping only one byte splices the length prefix into the data.
 /// That bug made a feature silently inert on every boot. Parsing it once, here, removes the failure mode
 /// for the next caller instead of leaving it lying around (§26.4 - one visible mechanism, not N copies).
-fn fs_read_file(ctx: &ServiceContext, path: &[u8], dst: &mut [u8], max_secs: i64) -> Option<usize> {
+fn fs_read_file(ctx: &ShellCtx, path: &[u8], dst: &mut [u8], max_secs: i64) -> Option<usize> {
     let r = fs_request_bounded(ctx, OP_READ_FILE, path, &[], max_secs)?;
     let p = r.payload_bytes();
     if p.first() != Some(&FS_OK) || p.len() < 5 { return None; }   // FS_NOTFOUND / FS_ERR / no filesystem
@@ -4810,7 +5046,7 @@ fn fs_read_file(ctx: &ServiceContext, path: &[u8], dst: &mut [u8], max_secs: i64
 /// a reading: it is not shown as the time and no "estimate" is derived from it (a machine powered off for
 /// six months would otherwise display a six-month-old timestamp indistinguishable from a measured one).
 /// Its whole job is to let the kernel REFUSE a clock value from before we last ran.
-fn clock_floor_seed(ctx: &ServiceContext) {
+fn clock_floor_seed(ctx: &ShellCtx) {
     let mut buf = [0u8; 24];
     let n = match fs_read_file(ctx, CLOCK_FLOOR_PATH, &mut buf, CLOCK_FS_SECS) {
         Some(n) if n > 0 => n,
@@ -4818,8 +5054,8 @@ fn clock_floor_seed(ctx: &ServiceContext) {
     };
     if let Ok(s) = core::str::from_utf8(&buf[..n]) {
         if let Some(v) = parse_u32(s.trim()) {
-            if !ctx.set_clock_floor(v) {
-                ctx.console_writeln("shell: the kernel refused the recorded clock floor - ignoring it");
+            if !time_floor_set(ctx, v as i64) {
+                ctx.console_writeln("shell: the time service refused the recorded clock floor - ignoring it");
             }
         }
     }
@@ -4831,7 +5067,7 @@ fn clock_floor_seed(ctx: &ServiceContext) {
 /// no format strings or timezones (§26.2: minimal surface). The subcommand is `epoch`, not `unix`: this is
 /// not POSIX, so the vocabulary doesn't borrow its name. Displaying the time NEVER writes to disk - the
 /// floor is recorded at explicit moments only (`date sync`, and before `reboot`).
-fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     // `date sync` - fetch the time from the network (SNTP) via net-stack and set the wall clock. The Pi 2
     // has no battery-backed RTC, so `date` reads zeros until this runs (also done automatically at boot).
@@ -4841,7 +5077,7 @@ fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
         // Reading it at boot instead put fs I/O on the startup path at fs's slowest moment - see the note
         // in service_main for what that cost.
         clock_floor_seed(ctx);
-        out.line_fmt(ctx, format_args!("Syncing the clock from the network (SNTP)... (q aborts)"));
+        out.line_fmt(ctx, format_args!("Asking the network for the time now (SNTP)... (q aborts)"));
         let msg = Message::from_bytes(&[10u8]);
         // The budget must cover net-stack's WORST case, not a guess: op 10 can run SNTP_TRIES rounds of a
         // DANCE_SECS drain (plus a DNS attempt) before it can honestly answer "no time". Timing out early
@@ -4873,13 +5109,15 @@ fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
                 return Ok(());
             }
         };
-        // Record the new time as the floor: we are demonstrably running now, so nothing earlier can be
-        // right later. Survives the power cycle that the (absent) RTC would otherwise have covered.
-        clock_floor_persist(ctx, epoch, false);
+        // The floor is NOT recorded here. `net-stack` hands the epoch to `time`, and `time` persists
+        // its own floor at the moment the clock is set - it owns the clock, so it owns the clock's
+        // state (§3.8). The shell writing it as well was a second owner for one piece of state, and a
+        // second owner is how the two drift.
+        let _ = epoch;
         // fall through to display the freshly-set time
     }
-    let dt = ctx.datetime();
-    let source = ctx.clock_source();
+    let dt = Datetime::from_epoch_secs(time_now(ctx).unwrap_or(0));
+    let source = time_source(ctx);
     if arg == "epoch" {
         // Raw fact, pipeable (conventions rule 7): the number only, no provenance decoration.
         out.line_fmt(ctx, format_args!("{}", dt.epoch_secs()));
@@ -4888,18 +5126,31 @@ fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     if source == ClockSource::Unset {
         // Say we do not know, rather than printing a number we cannot stand behind. If a floor was
         // recorded, report it AS A FLOOR - "we ran at least this late" is true; "it is now that" is not.
-        match ctx.clock_floor() {
-            Some(f) => {
-                let fd = Datetime::from_epoch_secs(f);
-                out.line_fmt(ctx, format_args!(
-                    "unset - no clock on this machine; `date sync` fetches it over the network"));
-                out.line_fmt(ctx, format_args!(
-                    "        (last known {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC from {} - a floor, not a reading)",
-                    fd.year, fd.month, fd.day, fd.hour, fd.minute, fd.second,
-                    core::str::from_utf8(CLOCK_FLOOR_PATH).unwrap_or("disk")));
-            }
-            None => out.line_fmt(ctx, format_args!(
-                "unset - no clock on this machine; `date sync` fetches it over the network")),
+        // SAY WHY, not just "unknown". The three sources are tried in order - a hardware clock, the
+        // network, then the floor on disk - so naming the one that is missing is the difference between
+        // a user waiting for something that will happen and a user waiting for something that will not.
+        // Unknown counts as NOT linked here: this only decides whether to promise the clock will
+        // arrive, and promising it on a link we could not confirm is the worse error.
+        let linked = net_link_up(ctx) == Some(true);
+        out.line_fmt(ctx, format_args!(
+            "the clock is not set: this board has no RTC, so the time can only come from the network"));
+        if linked {
+            // Precise about WHEN, because the retry is request-driven: net-stack re-asks at most once a
+            // minute, and only while it is handling a network request. On a machine nobody is using it
+            // does not fire on its own - net-stack deliberately has no idle tick (an earlier one stole
+            // client messages; see the note at its serve loop). So `date sync` is the reliable "now".
+            out.line_fmt(ctx, format_args!(
+                "        the network is up; it re-tries on network activity, or 'date sync' asks now"));
+        } else {
+            out.line_fmt(ctx, format_args!(
+                "        no network link - plug the cable in and it will set itself, or run 'date sync'"));
+        }
+        if let Some(f) = time_floor(ctx) {
+            let fd = Datetime::from_epoch_secs(f);
+            out.line_fmt(ctx, format_args!(
+                "        (last known {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC from {} - a floor, not a reading)",
+                fd.year, fd.month, fd.day, fd.hour, fd.minute, fd.second,
+                core::str::from_utf8(CLOCK_FLOOR_PATH).unwrap_or("disk")));
         }
         return Ok(());
     }
@@ -4912,11 +5163,19 @@ fn cmd_date(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
     // hardware RTC carries NO such guarantee (firmware may keep it in local time or in UTC, and
     // nothing here can tell which), so it gets no scale label rather than a guessed one - the same
     // rule as the rest of this command: say what is known, never invent the rest.
-    match ctx.clock_synced_secs_ago() {
-        Some(ago) => out.line_fmt(ctx, format_args!(
+    // A FLOOR-DERIVED CLOCK IS NOT AN RTC, and used to be labelled as one. On a board with no RTC the
+    // time can be carried over from `/clock.last` and then advanced correctly, which makes it a genuine
+    // reading and a LOWER BOUND: it cannot know how long the machine was powered off, so it is behind by
+    // exactly that unknown amount. Calling it `rtc` claims hardware this board does not have; calling it
+    // unset denies a time being displayed. It gets its own words.
+    match (source, time_synced_secs_ago(ctx)) {
+        (_, Some(ago)) => out.line_fmt(ctx, format_args!(
             "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC  (ntp, synced {} ago)",
             wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, HumanSecs(ago))),
-        None => out.line_fmt(ctx, format_args!(
+        (ClockSource::Floor, None) => out.line_fmt(ctx, format_args!(
+            "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC  (carried over from the last boot - AT LEAST this late; 'date sync' for the true time)",
+            wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)),
+        (_, None) => out.line_fmt(ctx, format_args!(
             "{} {:04}-{:02}-{:02} {:02}:{:02}:{:02}  (rtc, scale unknown)",
             wd, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)),
     }
@@ -5057,9 +5316,19 @@ fn cmd_ping(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellE
                     if rtt > rmax { rmax = rtt; }
                     rsum += rtt as u64; vcount += 1;
                 } else if p.first() == Some(&2) {
+                    // "LINK NOT CONFIRMED", not "no link". The distinction is the whole difference
+                    // between a hedge and a false statement: "cable unplugged?" is a QUESTION and
+                    // stays, because it is a fair thing to suggest; "no link" was an ASSERTION, and
+                    // it was made on a machine whose cable was plainly in and whose link was up.
+                    //
+                    // What the stack actually establishes to send this code is that it could not
+                    // CONFIRM a link - which a genuinely unplugged cable and a driver that did not
+                    // answer inside its deadline produce identically, and this layer cannot tell
+                    // them apart. So it names both and asserts neither.
+
                     // net-stack reports the NIC link is down - keep pinging at the same cadence so it is
                     // clearly still trying, and it resumes the moment the cable is back.
-                    out.line_fmt(ctx, format_args!("No reply from {}.{}.{}.{}: no link (cable unplugged?)", ip[0], ip[1], ip[2], ip[3]));
+                    out.line_fmt(ctx, format_args!("No reply from {}.{}.{}.{}: link not confirmed - cable unplugged, or the NIC driver did not answer", ip[0], ip[1], ip[2], ip[3]));
                 } else {
                     out.line_fmt(ctx, format_args!("Request timed out."));
                 }
@@ -5135,7 +5404,11 @@ fn net_stats_dump(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError>
         out.line_fmt(ctx, format_args!("  TNPDS.lo  0x{:08x}   TX ring base", tnpds));
         out.line_fmt(ctx, format_args!("  RDSAR.lo  0x{:08x}   RX ring base", rdsar));
         out.line_fmt(ctx, format_args!("  RX ring (rx_idx={}):", rx_idx));
-        for i in 0..4 {
+        // HOW MANY DESCRIPTORS THE DRIVER ACTUALLY SENT, not four. The reply carries one 4-byte word
+        // per RX descriptor after a 27-byte header, and the ring grew from 4 to 8 - so a fixed four
+        // here would silently show half the ring, which is the quiet half of the same bug that
+        // panicked the driver on the sending side.
+        for i in 0..(p.len() - 27) / 4 {
             let o = 27 + i * 4;
             let d = u32::from_le_bytes([p[o], p[o+1], p[o+2], p[o+3]]);
             out.line_fmt(ctx, format_args!("    [{}] opts1=0x{:08x}  OWN={} len={}", i, d, (d>>31)&1, d & 0x3FFF));
@@ -5184,6 +5457,9 @@ fn cmd_net(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellEr
     }
     if arg == "renew" {
         return net_renew(ctx, out);
+    }
+    if arg == "lease" {
+        return net_lease(ctx, out);
     }
     if !arg.is_empty() {
         ctx.console_writeln("net: unknown subcommand - try net, net dns <host>, net stats, net arp <ip>, net scan, net renew, or net help");
@@ -5332,7 +5608,15 @@ fn net_dns(ctx: &ServiceContext, host: &str, out: &mut Out) -> Result<(), ShellE
         // us "no reply arrived" (0 UDP) from "a reply arrived but did not match our port" (UDP > 0).
         let (fr, ud) = if p.len() >= 7 { (p[5], p[6]) } else { (0, 0) };
         let to = if p.len() >= 8 { p[7] } else { 0 };
-        out.line_fmt(ctx, format_args!("{}: no reply from the DNS server ({} frames, {} UDP, {} timeouts)", host, fr, ud, to));
+        // NAME THE LAYER THAT IS MISSING, not the one that stayed quiet. A lookup made with no lease
+        // has no gateway to send through, so nothing was ever put on the wire - and blaming the DNS
+        // server for not answering a question it never received points the reader at the network when
+        // the answer is on this machine. Only when there is no such reason do we report what we saw.
+        match net_unconfigured_reason(ctx) {
+            Some(why) => out.line_fmt(ctx, format_args!("{}: not resolved - {}", host, why)),
+            None => out.line_fmt(ctx, format_args!(
+                "{}: no reply from the DNS server ({} frames, {} UDP, {} timeouts)", host, fr, ud, to)),
+        }
         Err(ShellError::Unknown)
     }
 }
@@ -5364,6 +5648,148 @@ fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> 
         let _ = ctx.reacquire_by_name(peer);   // best-effort: the caller retries regardless
     }
     NetQ::Timeout
+}
+
+/// Is the ethernet link up right now? Asked of `nic-driver` (byte 7 of its `[3]` status), which reads
+/// the PHY rather than a cached boot-time flag.
+///
+/// Used only to explain an UNSET clock: "the network is up and being asked" and "there is no cable" are
+/// different situations for the user, and one of them is not going to resolve itself. A short deadline
+/// and a pessimistic default - if nic-driver does not answer we do not claim a link.
+/// Why a network request could not possibly have worked, or `None` if no such reason is known.
+///
+/// This exists because "no reply from the DNS server" was being printed for lookups the DNS server
+/// never heard. On a stack with no lease there is no gateway and no route, so the query goes nowhere -
+/// and the honest counters said so plainly, `0 frames, 0 UDP, 0 timeouts`, which is what "we never
+/// sent anything anybody could answer" looks like. Reporting that as a silent remote host accuses the
+/// wrong party and sends the reader looking at the network instead of at their own configuration.
+///
+/// `None` means "no better explanation available", NOT "everything is fine": if net-stack does not
+/// answer the status query, or answers something too short to read, we do not know why the lookup
+/// failed and must not invent a reason. The caller falls back to reporting exactly what it observed.
+///
+/// The order is the order the layers come up in, so the FIRST missing one is named rather than the
+/// last: a machine with no cable is told about the cable, not about its gateway.
+/// Ask net-stack for its status, reacquiring the peer once if the cached cap has gone stale.
+///
+/// §14.3 puts this obligation on the CLIENT: a service that restarted issues a new endpoint, and the
+/// cap we were holding is dead. `net_link_up` and `console_dims` already do this; the lease query did
+/// not, and the difference was visible - net-stack restarted three times under chaos (adopted at
+/// slots 16, 17, then 18), after which this shell reported "no lease" while net-stack was resolving
+/// DNS and SNTP perfectly well over the lease it still held. The network was fine; the question was
+/// being asked down a dead cap.
+fn net_status_reply(ctx: &ServiceContext) -> Option<Message> {
+    let req = Message::from_bytes(&[0u8]);
+    if let Some(r) = ctx.request_with_reply_deadline("net-stack", &req, 3) {
+        return Some(r);
+    }
+    if ctx.reacquire_by_name("net-stack") {
+        return ctx.request_with_reply_deadline("net-stack", &req, 3);
+    }
+    None
+}
+
+fn net_unconfigured_reason(ctx: &ServiceContext) -> Option<&'static str> {
+    match net_link_up(ctx) {
+        Some(true) => {}
+        Some(false) => return Some("no link (cable unplugged?)"),
+        // Say what actually happened. Blaming the cable here is how a driver problem spent a whole
+        // session looking like a hardware one.
+        None => return Some("cannot reach nic-driver (no answer) - link state unknown"),
+    }
+    let r = net_status_reply(ctx)?;
+    let p = r.payload_bytes();
+    if p.len() < 15 {
+        return None;                      // cannot read the status - say nothing rather than guess
+    }
+    // Flag byte: bit 0 = gateway resolved by ARP, bit 2 = DHCP granted this address.
+    if p[14] & 4 == 0 {
+        return Some("no address yet - DHCP has not completed");
+    }
+    if p[14] & 1 == 0 {
+        return Some("no route - the gateway has not answered ARP");
+    }
+    None
+}
+
+/// Link state as the DRIVER reports it, or `None` when the driver could not be reached.
+///
+/// THREE outcomes, not two. This used to return `bool` and fold "the driver did not answer" into
+/// `false`, which the caller then printed as "no link (cable unplugged?)" - a confident diagnosis of
+/// the one thing it had NOT established, with the cable plugged in the whole time. Reported from a
+/// Pi 2, where every ping said the cable was out until a chaos run restarted things.
+///
+/// The two causes need opposite responses (check the cable, versus the driver is unreachable) and
+/// §26.7 forbids a failed query from quietly becoming an answer, so they stay distinguishable here.
+fn net_link_up(ctx: &ServiceContext) -> Option<bool> {
+    let req = Message::from_bytes(&[3u8]);
+    // Reacquire and retry ONCE before giving up (§14.3). A cap to a service that has since restarted
+    // is stale, and nothing refreshes it on our behalf: the request just fails, for as long as this
+    // shell lives. That is consistent with what the Pi 2 showed - net-stack saw the link come up and
+    // auto-configured while the shell, asking the same driver a second later, got nothing.
+    if let Some(r) = ctx.request_with_reply_deadline("nic-driver", &req, 2) {
+        return read_link(r.payload_bytes());
+    }
+    if ctx.reacquire_by_name("nic-driver") {
+        if let Some(r) = ctx.request_with_reply_deadline("nic-driver", &req, 2) {
+            return read_link(r.payload_bytes());
+        }
+    }
+    None
+}
+
+/// Read a `[3]` status reply: `[ok, mac(6), link]`.
+///
+/// HONOUR THE OK BYTE. The driver replies with an all-zero buffer when its own query to the device
+/// failed - `ok = 0` AND `link = 0` - and reading only the link byte turns "I could not find out"
+/// into "the cable is out". That is how ping came to report an unplugged cable on a Pi 2 with the
+/// cable plainly in: the shell was faithfully relaying a zero that never meant what it read as.
+///
+/// The protocol already carries the distinction; nothing here needed inventing, only reading.
+fn read_link(p: &[u8]) -> Option<bool> {
+    if p.len() < 8 || p[0] == 0 {
+        return None;                    // driver could not determine it - not the same as "down"
+    }
+    Some(p[7] != 0)
+}
+
+/// `net lease` - ONE WORD: `ok`, `none`, or nothing at all if net-stack does not answer.
+///
+/// Exists for `selfcheck`. The suite can compare a whole line against a word list (`if $line in ok`)
+/// but has no substring test, so a status block full of formatted prose is not something it can assert
+/// on without inventing grammar - which is what the first version of that check did.
+///
+/// Three outcomes, deliberately distinct:
+/// - `ok`   - DHCP granted the address, OR there is no link so there is nothing to lease
+/// - `none` - the link is up and we are on the fallback address, which routes nowhere
+/// - (silence) - net-stack did not reply, so the caller can retry rather than conclude anything
+fn net_lease(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    match net_link_up(ctx) {
+        Some(true) => {}
+        Some(false) => {
+            out.line(ctx, "ok");        // no cable: nothing to lease, and not a fault
+            return Ok(());
+        }
+        // NOT "ok". We did not establish there is no link, so reporting the healthy no-cable answer
+        // would hide an unreachable driver behind a pass (§26.7).
+        None => {
+            out.line(ctx, "cannot reach nic-driver (no answer) - link state unknown");
+            return Ok(());
+        }
+    }
+    match net_status_reply(ctx) {
+        Some(r) => {
+            let p = r.payload_bytes();
+            // bit 2 of the flag byte = DHCP granted this address (net-stack publishes it).
+            out.line(ctx, if p.len() >= 15 && p[14] & 4 != 0 { "ok" } else { "none" });
+            Ok(())
+        }
+        // SILENT on no reply, on purpose. net-stack blocks its serve loop for the length of a DHCP
+        // dance, and a machine whose link has just come up is legitimately in one - saying `none`
+        // there would report a fault that is not there. The caller retries; if it never answers, the
+        // caller's own bound is what fails, and that failure is real.
+        None => Ok(()),
+    }
 }
 
 fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
@@ -5458,6 +5884,11 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
             out.line(ctx, "gateway  unresolved");
         }
         out.line(ctx, if flags & 2 != 0 { "ping     ok" } else { "ping     no" });
+        // Whether the address was GRANTED or guessed. A stack that cannot receive gets no offer and
+        // falls back, so this line is where a broken receive path becomes visible without sending
+        // anything - which is what lets `selfcheck` gate on it.
+        out.line(ctx, if flags & 4 != 0 { "lease    ok (DHCP)" }
+                      else { "lease    NONE (fallback address - not routable)" });
         if p.len() >= 19 {
             out.line_fmt(ctx, format_args!("dns      {}.{}.{}.{}", p[15], p[16], p[17], p[18]));
         }
@@ -5465,6 +5896,12 @@ fn net_status(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
         out.line(ctx, "ip       unassigned (link down - cable unplugged?)");
         out.line(ctx, "gateway  unresolved");
         out.line(ctx, "ping     no");
+        // Printed in BOTH branches, and "n/a" rather than "no" with the cable out. That wording is what
+        // lets `selfcheck` gate on a single assertion - `lacks 'lease    no'` - with no conditional:
+        // it passes when a lease is held AND when there is no link to get one on, and fails only in the
+        // case that is genuinely wrong, a live link with no lease. A machine without a cable is not a
+        // failing machine.
+        out.line(ctx, "lease    ok (no link - nothing to lease)");
         out.line(ctx, "dns      unresolved");
     }
     Ok(())
@@ -5716,7 +6153,7 @@ fn is_record_producer(name: &str) -> bool {
 /// build a record - and overflow the bounded user stack. Out-of-line, the big frame exists only
 /// while the builder actually runs.
 #[inline(never)]
-fn build_ls_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table> {
+fn build_ls_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut buf = [0u8; PATH_MAX];
     let path = resolve_or_err(ctx, cwd, arg, &mut buf)?;
     let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &[]) {
@@ -5811,9 +6248,9 @@ fn cap_rights_str(r: u8, buf: &mut [u8]) -> usize {
 /// drive in step 3; mirrors `drives_list`. Sizes are in MiB (so the column name carries the
 /// unit - a bare number cell can't).
 #[inline(never)]
-fn build_drives_table(ctx: &ServiceContext) -> Option<Table> {
+fn build_drives_table(ctx: &ShellCtx) -> Option<Table> {
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
-    let reply = match fs_raw(ctx, &[OP_DRIVES_INFO], 3600) {
+    let reply = match fs_raw(ctx, &[OP_DRIVES_INFO], FS_ANSWER_SECS) {
         Some(r) => r,
         None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); return None; }
     };
@@ -5867,7 +6304,7 @@ fn build_drives_table(ctx: &ServiceContext) -> Option<Table> {
 /// full `path`. Same bounded depth-first walk as `cmd_find`, emitting rows instead of printing
 /// the path. `arg` is the producer tail (`<pattern> [start]`).
 #[inline(never)]
-fn build_find_table(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Option<Table> {
+fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     let (target, start) = split_first(arg);
     if target.is_empty() { ctx.console_writeln("usage: find <name> [path]"); return None; }
     let start = if start.is_empty() { "/" } else { start };
@@ -5941,7 +6378,26 @@ enum Stream {
 /// `execute` (which would carry that 64 KiB into every command's frame, and via a nested
 /// `run → execute` chain overflow the user stack).
 #[inline(never)]
-fn pipe_run(ctx: &ServiceContext, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), ShellError> {
+fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), ShellError> {
+    // HIGH-WATER MARK, reported only when it moves. This file's own header says the user stack is
+    // 64 KiB and that this frame already sits near it, and the Pi 4 twice killed the shell inside a
+    // pipe with `ELR_EL1 = 0x0` - a branch to address zero, which is what a smashed frame's saved LR
+    // looks like. That is a HYPOTHESIS, and the shell was the one service with no way to confirm or
+    // kill it: `fs` prints its deepest block call, this printed nothing.
+    //
+    // Reported on a new maximum rather than every pipe, so a `selfcheck` of 357 cases does not become
+    // 357 log lines, and the number that matters - the worst frame reached - is still never missed.
+    {
+        let used = ctx.stack_used();
+        let prev = ctx.pipe_stack_hwm.get();
+        if used > prev {
+            ctx.pipe_stack_hwm.set(used);
+            ctx.log_fmt(format_args!(
+                "shell: pipe stack high-water {} of {} bytes ({}% of the user stack)",
+                used, USER_STACK_BYTES, used * 100 / USER_STACK_BYTES.max(1)
+            ));
+        }
+    }
     let mut stages = [""; MAX_STAGES];
     let mut n = 0usize;
     for part in line.split('|') {
@@ -6383,13 +6839,33 @@ fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
     // Bounded against a child that never parks. (The console service will make
     // output ordering automatic; this is the interim fix.)
     if let Some(slot) = find_running_slot(ctx, "observe-now") {
+        let mut parked = false;
         for _ in 0..1_000_000u32 {
             ctx.yield_cpu();
             let st = ctx.task_stat(slot);
             // state 2 = BlockedOnRecv → finished printing; invalid → gone.
             if !st.valid || st.state == 2 {
+                parked = true;
                 break;
             }
+        }
+        // REAP IT HERE, not on the next `observe now`. A parked one-shot is still a LIVE task: it
+        // holds its slot and its frames, and anything scanning the task table sees a service. Chaos
+        // does exactly that (deliberately - it keeps no hardcoded victim list, because one goes stale
+        // the moment the running set changes), so a parked `observe-now` was being killed as though it
+        // were a service, spending a victim slot that a real service should have had and reporting a
+        // kill that measured nothing.
+        //
+        // The old comment called this "at most one lingers", which is true and was never the point:
+        // one lingering task is enough to corrupt what the storm is measuring. The right owner of the
+        // cleanup is the shell, which spawned it and already holds the kill authority - it was simply
+        // doing it one invocation too late.
+        //
+        // Only when the park was actually OBSERVED. If the wait timed out, the child is still printing
+        // and killing it would truncate the frame the user asked for - so leave it, and the defensive
+        // kill at the top of this function reaps it next time. That is the case the old code was for.
+        if parked {
+            let _ = ctx.kill("observe-now");
         }
     }
     Ok(())
@@ -6753,7 +7229,7 @@ fn is_record_producer_service(name: &str) -> bool {
 }
 
 /// Run a producer built-in (`cmd args`) with its output going to `out`.
-fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
+fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) {
     let (cmd, arg) = split_first(cmdline);
     match cmd {
         "echo"         => { let _ = cmd_echo(ctx, arg, out); }
@@ -6783,7 +7259,7 @@ fn run_producer(ctx: &ServiceContext, cwd: &Cwd, cmdline: &str, out: &mut Out) {
 /// is refused loudly. `out` is a small (16 KiB `ReportBuf`-backed) sink so it does NOT stack up
 /// against `pipe_run`'s own 64 KiB buffers on the pipeline path - the nested-capture overflow trap
 /// ([[project-shell-stack-pipe]]). Returns true on success.
-fn run_captured(ctx: &ServiceContext, cwd: &Cwd, inner: &str, out: &mut Out) -> bool {
+fn run_captured(ctx: &ShellCtx, cwd: &Cwd, inner: &str, out: &mut Out) -> bool {
     let inner = inner.trim();
     if inner.is_empty() { ctx.console_writeln("gsh: $( ) needs a command"); return false; }
     // A PIPELINE capture would stack its 128 KiB of pipe buffers on top of the interpreter's live
@@ -6831,7 +7307,7 @@ fn capture_form(v: &str) -> Option<&str> {
 /// A ReportBuf (16 KiB), not a Cap (64 KiB), so on the `$(pipe)` path it does not overflow the stack
 /// against pipe_run's own 64 KiB buffers. A value larger than the var arena is refused by `define`.
 #[inline(never)]
-fn capture_define(ctx: &ServiceContext, cwd: &Cwd, name: &str, inner: &str, mutable: bool, vars: &mut Vars) -> Result<(), ShellError> {
+fn capture_define(ctx: &ShellCtx, cwd: &Cwd, name: &str, inner: &str, mutable: bool, vars: &mut Vars) -> Result<(), ShellError> {
     let mut rb = ReportBuf::new();
     let ok = { let mut o = Out::File(&mut rb); run_captured(ctx, cwd, inner, &mut o) };
     if !ok { return Err(ShellError::Unknown); }
@@ -6843,7 +7319,7 @@ fn capture_define(ctx: &ServiceContext, cwd: &Cwd, name: &str, inner: &str, muta
 
 /// `name = $( cmd )` - reassign a mutable binding from captured command output.
 #[inline(never)]
-fn capture_reassign(ctx: &ServiceContext, cwd: &Cwd, name: &str, inner: &str, vars: &mut Vars) -> Result<(), ShellError> {
+fn capture_reassign(ctx: &ShellCtx, cwd: &Cwd, name: &str, inner: &str, vars: &mut Vars) -> Result<(), ShellError> {
     let mut rb = ReportBuf::new();
     let ok = { let mut o = Out::File(&mut rb); run_captured(ctx, cwd, inner, &mut o) };
     if !ok { return Err(ShellError::Unknown); }
@@ -6873,7 +7349,7 @@ fn parse_write_mode(arg: &str) -> (WriteMode, &str) {
 const WRITE_TMP: &[u8] = b"/.write.tmp"; // append/prepend staging file (root → no dirname math)
 
 /// Read exactly `out.len()` bytes from `path` at byte `off`, looping `read_at`. False on short read.
-fn read_file_exact(ctx: &ServiceContext, path: &[u8], off: usize, out: &mut [u8]) -> bool {
+fn read_file_exact(ctx: &ShellCtx, path: &[u8], off: usize, out: &mut [u8]) -> bool {
     let mut done = 0usize;
     let mut tmp = [0u8; IO_CHUNK];
     while done < out.len() {
@@ -6893,7 +7369,7 @@ fn read_file_exact(ctx: &ServiceContext, path: &[u8], off: usize, out: &mut [u8]
 /// `max_secs` (RTC) via `fs_read_at_bounded`, so a wedged/slow fs times out per chunk instead of blocking
 /// the shell before its input loop. False on short read, timeout, or any miss - the caller treats that as
 /// "no history" (§26.7). Only the startup load uses this; ordinary file commands keep the unbounded path.
-fn read_file_exact_bounded(ctx: &ServiceContext, path: &[u8], off: usize, out: &mut [u8], max_secs: i64) -> bool {
+fn read_file_exact_bounded(ctx: &ShellCtx, path: &[u8], off: usize, out: &mut [u8], max_secs: i64) -> bool {
     let mut done = 0usize;
     let mut tmp = [0u8; IO_CHUNK];
     while done < out.len() {
@@ -6911,7 +7387,7 @@ fn read_file_exact_bounded(ctx: &ServiceContext, path: &[u8], off: usize, out: &
 
 /// Overwrite `p` (resolved path) with `data`. Small payload → one WriteFile; larger → write_new +
 /// streamed write_at chunks (so a piped payload up to the capture buffer reaches the file).
-fn stream_overwrite(ctx: &ServiceContext, p: &[u8], data: &[u8]) {
+fn stream_overwrite(ctx: &ShellCtx, p: &[u8], data: &[u8]) {
     if data.len() <= IO_CHUNK {
         match fs_request(ctx, OP_WRITE_FILE, p, data) {
             Some(r) if r.payload_bytes().first() == Some(&FS_OK) =>
@@ -6944,8 +7420,24 @@ fn stream_overwrite(ctx: &ServiceContext, p: &[u8], data: &[u8]) {
 /// scratch), any file size. `prepend` is a **full-file rewrite** - there is no insert-at-front in
 /// the filesystem - so it costs the same as rewriting the file (honest, §26.7). True on success.
 #[inline(never)]
-fn fs_stream_combine(ctx: &ServiceContext, p: &[u8], new: &[u8], prepend: bool) -> bool {
-    let old_size = fs_stat(ctx, p).map(|(sz, _)| sz as usize).unwrap_or(0);
+fn fs_stream_combine(ctx: &ShellCtx, p: &[u8], new: &[u8], prepend: bool) -> bool {
+    // A FAILED STAT IS NOT AN EMPTY FILE. `fs_stat` returns `None` for BOTH "absent" and "fs error",
+    // so `.unwrap_or(0)` made an errored stat on an existing file read as size 0: the combine loop
+    // below then copied only the NEW bytes, never entered the old-content branch, and the caller
+    // deleted the original and moved the temp in. An `append` that silently became an overwrite, and
+    // returned true.
+    //
+    // Absent is legitimate (appending to a file that does not exist creates it). Unreachable is not,
+    // so the two are now told apart by asking once more: a reply that arrives says the file is
+    // genuinely absent, no reply at all says `fs` could not answer.
+    let old_size = match fs_stat(ctx, p) {
+        Some((sz, _)) => sz as usize,
+        None if fs_request(ctx, OP_STAT_FILE, p, &[]).is_some() => 0,
+        None => {
+            ctx.console_writeln("write: cannot stat the target - ABORTING, nothing was changed");
+            return false;
+        }
+    };
     let total = old_size + new.len();
     if total == 0 {
         return matches!(fs_request(ctx, OP_WRITE_FILE, p, &[]).as_ref()
@@ -6987,7 +7479,7 @@ fn fs_stream_combine(ctx: &ServiceContext, p: &[u8], new: &[u8], prepend: bool) 
 
 /// The `write` pipe sink: `… | write [append|prepend] <path>`. Parses the mode (plain overwrites),
 /// resolves the path, and writes the captured/rendered `data`.
-fn pipe_write(ctx: &ServiceContext, cwd: &Cwd, arg: &str, data: &[u8]) {
+fn pipe_write(ctx: &ShellCtx, cwd: &Cwd, arg: &str, data: &[u8]) {
     let (mode, parg) = parse_write_mode(arg);
     let (pstr, _) = split_first(parg);
     if pstr.is_empty() { ctx.console_writeln("pipe: write needs a file path"); return; }
@@ -7171,7 +7663,17 @@ fn restart_one(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 // round + labels them "recovered"; kill-storm may target them. The only unkillable thing is the
 // kernel; the shell is excluded only because chaos runs *inside* it. (xhci/ehci/logger are
 // directly-restartable so max-carnage can't leave them dead.)
-const CHAOS_RESTARTABLE: [&str; 8] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "logger", "nic-driver", "net-stack"];
+// `time`, `control` and `dwc2` were MISSING here, and this list is not cosmetic: it is the expansion
+// of `kill all-services` and a hard refusal gate for `chaos kill-storm`. So the storm skipped them
+// and `chaos kill-storm time` was refused outright - Commandment II ("nothing escapes") silently
+// false for the three services whose omission from a DIFFERENT list was the C5-1 finding.
+//
+// This is the same fact as the supervisor's MANAGED and the kernel's two by-name sets, stated a
+// fourth time. It stays a literal for now because the shell cannot see the supervisor's list, but
+// the honest fix is to derive it from live tasks the way `chaos` derives its own exclusions - which
+// is exactly why chaos has no roster to drift.
+const CHAOS_RESTARTABLE: [&str; 11] = ["supervisor", "block-driver", "fs", "xhci", "ehci", "logger",
+                                       "nic-driver", "net-stack", "time", "control", "dwc2"];
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
 const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) - a deliberate cap, not a firehose
 // Per-round recovery wait is bounded by REAL wall-clock time (RTC seconds), not a yield count. A
@@ -7196,7 +7698,7 @@ const CHAOS_SAVE_TOTAL_SECS: i64 = 30;
 /// `CHAOS_SAVE_TOTAL_SECS` of WALL-CLOCK time while `fs` finishes re-mounting after a chaos storm -
 /// reacquiring a fresh `fs` cap each round (it may have just respawned). Bounded: `save_report` is
 /// itself wall-clock-bounded, so this never hangs; it gives up gracefully when fs won't stabilise.
-fn chaos_save_retry(ctx: &ServiceContext, ppath: &[u8], data: &[u8]) -> bool {
+fn chaos_save_retry(ctx: &ShellCtx, ppath: &[u8], data: &[u8]) -> bool {
     let t0 = ctx.epoch_secs_monotonic();
     loop {
         let _ = ctx.reacquire_by_name("fs");
@@ -7234,7 +7736,7 @@ fn chaos_wait_recovery(ctx: &ServiceContext, name: &str, og: u32) -> bool {
     }
 }
 
-fn cmd_chaos(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
+fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
     // Tokenize the raw line ourselves - `chaos kill-storm <svc> [rounds] [save <path>]` runs past
     // the shell's MAX_ARGS=4 tokenizer (6 tokens), so we can't rely on the shared `args` array.
     let mut tok: [&str; 8] = [""; 8];
@@ -7490,7 +7992,14 @@ fn chaos_launch(
         buf[..4].copy_from_slice(&rounds.to_le_bytes());
         let tb = target.as_bytes(); let n = tb.len().min(128);
         buf[4..4 + n].copy_from_slice(&tb[..n]);
-        let _ = ctx.send_by_handle(cap, &Message::from_bytes(&buf[..4 + n]));
+        // TRY_SEND from the SHELL, because the shell is the user's only way back in. A blocking send
+        // here hands `chaos` the power to hang the prompt just by having a full queue, which is the one
+        // thing nothing above the kernel may do. A refused send is reported and the bounded wait below
+        // then reports the real symptom - chaos never took the foreground - instead of the shell simply
+        // never returning (§8.9, §26.7).
+        if ctx.try_send_by_handle(cap, &Message::from_bytes(&buf[..4 + n])).is_err() {
+            ctx.console_writeln("chaos: could not be reached (its queue is full or it is restarting)");
+        }
         ctx.remove_cap(cap);
     }
     // Wait (bounded) for chaos to TAKE the console foreground before returning. Otherwise the shell loops
@@ -7520,9 +8029,18 @@ fn chaos_launch(
 /// captured by the serial log); an optional `save <path>` then materialises it to a file once the
 /// target has recovered (best-effort - if fs was the target and is down, it falls back to the console).
 #[inline(never)]
-fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
+fn chaos_kill_storm(ctx: &ShellCtx, cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     if ntok < 2 {
-        ctx.console_writeln("usage: chaos kill-storm <service> [rounds] [save <path>]   (service: supervisor | block-driver | fs)");
+        // The service list is PRINTED FROM THE ARRAY, not retyped. This line used to read
+        // "(service: supervisor | block-driver | fs)" - three names against the eight the gate
+        // actually held, so the usage text was wrong the day it was written and drifted further
+        // every time the array grew.
+        ctx.console_write("usage: chaos kill-storm <service> [rounds] [save <path>]   (service:");
+        for (i, s) in CHAOS_RESTARTABLE.iter().enumerate() {
+            ctx.console_write(if i == 0 { " " } else { " | " });
+            ctx.console_write(s);
+        }
+        ctx.console_writeln(")");
         return Err(ShellError::Unknown);
     }
     let svc = tok[1];
@@ -7624,7 +8142,23 @@ fn chaos_kill_storm(ctx: &ServiceContext, cwd: &Cwd, tok: &[&str], ntok: usize) 
 #[inline(never)]
 fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     const FLOOD_BURST_MAX:    u32 = 64; // cap per-round sends; > queue depth (16) so saturation shows
-    const FLOOD_DRAIN_YIELDS: u32 = 40; // yields to let the target drain before we re-check
+    /// How long to let the target drain before re-checking, IN MILLISECONDS.
+    ///
+    /// This was 40 YIELDS, and a count is not a duration - the same fault fixed in `nic-driver`'s
+    /// transmit wait tonight. `yield_cpu` returns as soon as the scheduler comes back, so on a quiet
+    /// core forty of them elapse in microseconds, and how much WALL CLOCK they cover depends entirely
+    /// on what else is runnable.
+    ///
+    /// That decided the verdict by accident. A service blocked in `recv` is woken by the send itself
+    /// and drains within a yield or two, so `logger` passed. A service that idles on a TIMER - `xhci`
+    /// with no controller sleeps between drains, and its 5 ms floors to one 10 ms tick - needs real
+    /// time, and the check sampled long before it woke. It was reported as "did NOT drain, CLOGGED
+    /// (still full) - flood-endpoint disease" when it was not clogged at all: the tool measured too
+    /// early and then named a disease after what it saw.
+    ///
+    /// 50 ms is several of those ticks, still imperceptible in a five-round storm, and it is a CLOCK
+    /// (Commandment VIII). A target that has not drained after it is genuinely stuck.
+    const FLOOD_DRAIN_MS: u64 = 50;
 
     if ntok < 2 {
         ctx.console_writeln("usage: chaos flood-storm <service> [rounds]   (any running service with a recv endpoint, e.g. fs | logger | block-driver)");
@@ -7676,7 +8210,7 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
         }
         depth[r] = sent;
         // 2. Let the target drain (the flood + any respawn settle).
-        for _ in 0..FLOOD_DRAIN_YIELDS { ctx.yield_cpu(); }
+        ctx.sleep_ms(FLOOD_DRAIN_MS);   // a real settle window - see FLOOD_DRAIN_MS
         if died {
             // The flood killed the service (or it had already died). Record it and reacquire the
             // respawned instance for the next round.
@@ -8075,11 +8609,118 @@ fn resolve_or_err<'a>(ctx: &ServiceContext, cwd: &Cwd, input: &str, out: &'a mut
 /// a zero byte can only be an untagged sender - a mismatch that fails loudly rather than aliasing a real
 /// tag. Wrapping is harmless: correlation only needs to distinguish requests that can be in flight at the
 /// same time, and there are at most a handful.
-fn next_fs_tag() -> u8 {
-    use core::sync::atomic::{AtomicU8, Ordering};
-    static FS_TAG: AtomicU8 = AtomicU8::new(0);
-    let t = FS_TAG.fetch_add(1, Ordering::Relaxed);
-    if t == 0 { FS_TAG.fetch_add(1, Ordering::Relaxed); 1 } else { t }
+/// Ask the `time` service a question. One reacquire-and-retry, for the reason `block-driver` learned
+/// in arm32 slice 3c: `find_send_slot` does not resolve a name, so a peer that restarted - or that
+/// started after us - is unreachable until we ask again, and `request_with_reply` returns None
+/// INSTANTLY when the slot was never wired. That reads as "the clock is broken" rather than "we never
+/// looked it up", which is the kind of silence this system forbids.
+fn time_rpc(ctx: &ShellCtx, body: &[u8]) -> Option<Message> {
+    // Bounded, and on the INPUT PATH: `time_source` runs in the shell's main loop before
+    // `console_read`, so an unbounded wait here is a dead prompt with no `q` and no hint - and the
+    // same call sits in front of `reboot`, putting the escape hatch behind the hang.
+    const TIME_SECS: i64 = 2;
+    if let Some(r) = ctx.request_with_reply_deadline("time", &Message::from_bytes(body), TIME_SECS) {
+        return Some(r);
+    }
+    let _ = ctx.reacquire_by_name("time");
+    ctx.request_with_reply_deadline("time", &Message::from_bytes(body), TIME_SECS)
+}
+
+/// `time_source`, but distinguishing NO ANSWER from an answer that simply is not NTP yet.
+///
+/// The difference decides whether asking again is cheap or expensive, and only the expensive case
+/// hurts. An answer costs a round trip; a NON-answer costs the full `time_rpc` budget - two seconds,
+/// then a reacquire and another two - and that bill is paid IN FRONT OF THE KEYBOARD READ, so the
+/// prompt is dead for four seconds at a time. Polling that every iteration for the first thirty
+/// seconds of every boot is what made a networkless machine feel broken at the prompt, and it is what
+/// desynchronised `osdev test shell` badly enough to fail 127 of 132 checks: the harness fired
+/// commands into a 64-byte serial ring that nothing was draining.
+fn time_source_probe(ctx: &ShellCtx) -> Option<ClockSource> {
+    let r = time_rpc(ctx, &[1])?;              // None = `time` did not answer at all
+    let p = r.payload_bytes();
+    if p.len() < 10 || p[0] == 0 { return Some(ClockSource::Unset); }
+    Some(match p[9] {
+        1 => ClockSource::Rtc,
+        2 => ClockSource::Ntp,
+        3 => ClockSource::Floor,
+        _ => ClockSource::Unset,
+    })
+}
+
+/// Where the current wall-clock reading came from, per the `time` service (clock slice 2).
+fn time_source(ctx: &ShellCtx) -> ClockSource {
+    match time_rpc(ctx, &[1]) {   // OP_NOW -> [ok, epoch(8), source]
+        Some(r) => {
+            let p = r.payload_bytes();
+            if p.len() < 10 || p[0] == 0 { return ClockSource::Unset; }
+            match p[9] {
+                1 => ClockSource::Rtc,
+                2 => ClockSource::Ntp,
+                3 => ClockSource::Floor,
+                _ => ClockSource::Unset,
+            }
+        }
+        None => ClockSource::Unset,
+    }
+}
+
+/// The clock's floor, per the `time` service (clock slice 2). `None` if it could not be asked - an
+/// unanswered question is not the same as a floor of zero, and conflating them would let a failed
+/// lookup silently authorise a time before the last boot.
+fn time_floor(ctx: &ShellCtx) -> Option<i64> {
+    let r = time_rpc(ctx, &[3])?;   // OP_FLOOR_GET -> [ok, floor(8)]
+    let p = r.payload_bytes();
+    if p.len() < 9 || p[0] == 0 { return None; }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&p[1..9]);
+    Some(i64::from_le_bytes(b))
+}
+
+/// Raise the clock floor, via the `time` service. Returns false if it refused (the floor only rises)
+/// or could not be reached - both are real failures and the caller reports them.
+fn time_floor_set(ctx: &ShellCtx, epoch: i64) -> bool {
+    let mut body = [0u8; 9];
+    body[0] = 4;                                     // OP_FLOOR_SET
+    body[1..9].copy_from_slice(&epoch.to_le_bytes());
+    match time_rpc(ctx, &body) {
+        Some(r) => r.payload_bytes().first() == Some(&1),
+        None => false,
+    }
+}
+
+/// The wall clock's current reading, per the `time` service. `None` when it could not be asked - the
+/// caller must not substitute a guess, because a rendered date is indistinguishable from a known one.
+fn time_now(ctx: &ShellCtx) -> Option<i64> {
+    let r = time_rpc(ctx, &[1])?;                    // OP_NOW -> [ok, epoch(8), source, age(8)]
+    let p = r.payload_bytes();
+    if p.len() < 10 || p[0] == 0 { return None; }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&p[1..9]);
+    Some(i64::from_le_bytes(b))
+}
+
+/// Seconds since the network last set the clock, or `None` if it never did this boot. Rides on OP_NOW
+/// so the age cannot disagree with the reading it describes.
+fn time_synced_secs_ago(ctx: &ShellCtx) -> Option<i64> {
+    let r = time_rpc(ctx, &[1])?;
+    let p = r.payload_bytes();
+    if p.len() < 18 || p[0] == 0 { return None; }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&p[10..18]);
+    match i64::from_le_bytes(b) { a if a < 0 => None, a => Some(a) }
+}
+
+fn next_fs_tag(ctx: &ShellCtx) -> u8 {
+    // C6-1: this counter used to be `static FS_TAG: AtomicU8` - unowned global mutable state
+    // (Invariant 9) wearing a thread-safe type. Nothing here is concurrent; the shell is one task on
+    // one core. It was a static because that was easier than giving it a home, which is how this
+    // violation always arrives.
+    //
+    // Its home is the fs channel, and the fs channel belongs to the shell, so it lives in `ShellCtx`.
+    let t = ctx.fs_tag.get().wrapping_add(1);
+    let t = if t == 0 { 1 } else { t };   // never 0: a zero tag can only be an untagged sender
+    ctx.fs_tag.set(t);
+    t
 }
 
 /// How many overtaken replies to discard before giving up. A desync is at most a few requests deep (the
@@ -8092,7 +8733,21 @@ const FS_STALE_MAX: u32 = 16;
 /// Discarding is safe precisely because the sender has moved on: a reply whose tag we are no longer
 /// waiting for belongs to a request whose caller has already returned. Keeping it would only let it be
 /// mistaken for a later answer, which is the failure this exists to end.
-fn fs_take_tagged(ctx: &ServiceContext, tag: u8, first: ReqOutcome, max_secs: i64) -> ReqOutcome {
+/// Wait for the reply carrying `tag`, discarding replies belonging to requests already abandoned.
+///
+/// THE DEADLINE IS FOR THE WHOLE WAIT, not for each attempt. Every discarded reply used to start a
+/// fresh full-length wait, so the real bound was FS_STALE_MAX x max_secs - sixteen times what the
+/// caller asked for, and on an interactive command that is indistinguishable from a hang.
+///
+/// Hardware showed it: after a 98-round chaos storm the block protocol came back out of step
+/// ("fs: block read at lba 7702 got a MALFORMED reply ... protocol desync"), the shell discarded one
+/// stale reply, waited for a tag that was never coming, and the operator pulled the power at about
+/// seventy seconds. The guard detected the desync correctly and then had nowhere to go.
+///
+/// A bound that multiplies is not a bound (§26.6), and the Rule Above The Rules is that a dependency
+/// which cannot answer must produce a loud failure rather than silence.
+fn fs_take_tagged(ctx: &ShellCtx, tag: u8, first: ReqOutcome, max_secs: i64) -> ReqOutcome {
+    let t0 = ctx.epoch_secs_monotonic();
     let mut outcome = first;
     for _ in 0..FS_STALE_MAX {
         match outcome {
@@ -8105,12 +8760,21 @@ fn fs_take_tagged(ctx: &ServiceContext, tag: u8, first: ReqOutcome, max_secs: i6
                     "shell: discarded an fs reply for tag {} while awaiting {} (an earlier request was overtaken)",
                     p.first().copied().unwrap_or(0), tag));
                 // Wait again WITHOUT re-sending: the request is already with fs, and sending it twice
-                // would ask for the work twice.
-                outcome = ctx.recv_abortable_deadline(max_secs);
+                // would ask for the work twice. But only for the time the caller has LEFT.
+                let spent = ctx.epoch_secs_monotonic().saturating_sub(t0);
+                let left = max_secs.saturating_sub(spent);
+                if left <= 0 {
+                    ctx.console_writeln("fs: no reply for this request - the storage protocol is out of step");
+                    return ReqOutcome::Timeout;
+                }
+                outcome = ctx.recv_abortable_deadline(left);
             }
             other => return other,
         }
     }
+    // Sixteen stale replies in one wait is not a slow disk, it is a protocol that has lost its place.
+    // Say so: the caller reports a failed operation either way, but only this knows WHY.
+    ctx.console_writeln("fs: too many out-of-order replies - the storage protocol is out of step");
     ReqOutcome::Timeout
 }
 
@@ -8121,8 +8785,34 @@ fn fs_take_tagged(ctx: &ServiceContext, tag: u8, first: ReqOutcome, max_secs: i6
 /// which fs would read as `tag = <opcode>` and dispatch on the byte after it - a silent misparse. Routing
 /// them through one helper is what makes "every name-addressed request carries a tag" true rather than
 /// mostly true (Commandment III: one path, not two).
-fn fs_raw(ctx: &ServiceContext, body: &[u8], max_secs: i64) -> Option<Message> {
-    let tag = next_fs_tag();
+/// How long `fs` gets to answer, BY WHAT IT WAS ASKED TO DO.
+///
+/// Every wait in this file was `3600`, with comments calling it "effectively unbounded - q is the
+/// real exit". That is not a bound, and making the USER the timeout is the one thing nothing above
+/// the kernel may do: a missing, dead or slow dependency must RETURN with a loud "unavailable". The
+/// callers already handle that outcome correctly - they were simply never reached, because nobody
+/// sits for an hour. It hung `tree` once and `write` once, and both looked like a dead machine.
+///
+/// Split by operation rather than flattened, because one number is wrong at one end or the other:
+/// short enough to bound a round trip aborts a whole-disk scan, and long enough for the scan is an
+/// afternoon for a round trip. The first attempt at this fixed ONE helper and left the one with
+/// forty callers, which is why `write` still hung after `tree` was fixed.
+const FS_ANSWER_SECS: i64 = 20;   // a round trip: milliseconds healthy, ~1 s across an fs respawn
+const FS_TREE_SECS:   i64 = 120;  // recursive delete - bounded by how much there is to remove
+/// fsck and scrub walk the FILE TREE from the root (`check_subtree` / `scrub_subtree` in `fs`), not
+/// every block of the volume - the measured run reported "verified 34 blocks across 17 files, 8
+/// dirs", and the slowest observed `check` was ~14 s. 60 s is four times that.
+///
+/// This was 600, on my assumption that they swept the whole disk. I did not check, and the cost was
+/// the user sitting in front of a `drives scrub` that would not answer for ten minutes - a bound so
+/// loose it is indistinguishable from the hang it replaced.
+const FS_FSCK_SECS:   i64 = 60;
+/// Format and reset DO rewrite the volume, and are the one thing here that legitimately takes
+/// minutes on a 15 GiB stick.
+const FS_FORMAT_SECS: i64 = 600;
+
+fn fs_raw(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
+    let tag = next_fs_tag(ctx);
     let mut req = [0u8; 4096];
     req[0] = tag;
     let n = body.len().min(req.len() - 1);
@@ -8143,10 +8833,10 @@ fn fs_raw(ctx: &ServiceContext, body: &[u8], max_secs: i64) -> Option<Message> {
     }
 }
 
-fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
+fn fs_request(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
-    let tag = next_fs_tag();
+    let tag = next_fs_tag(ctx);
     req[0] = tag;
     req[1] = op;
     req[2] = pl as u8;
@@ -8154,18 +8844,21 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
     let dn = data.len().min(req.len() - 3 - pl);
     req[3 + pl..3 + pl + dn].copy_from_slice(&data[..dn]);
     let msg = Message::from_bytes(&req[..3 + pl + dn]);
+    // DELETE_TREE is the one genuinely slow operation routed through here; the rest are round trips.
+    let secs = if op == OP_DELETE_TREE { FS_TREE_SECS } else { FS_ANSWER_SECS };
     drain_stale_fs_replies(ctx);          // an earlier abandoned reply must not be read as ours
-    // 3600 s here is the same "effectively unbounded, q is the real exit" budget the interactive path
-    // uses: it bounds only the wait for a REPLACEMENT reply after discarding an overtaken one.
-    // ABORTABLE, so `q` works while `fs` is merely slow.
-    let first = ctx.request_with_reply_abortable("fs", &msg, 3600);
+    // Bounded by `secs` (see FS_ANSWER_SECS): it was the same "effectively unbounded, q is the real
+    // exit" budget the interactive path used, and it bounds the wait for a REPLACEMENT reply after
+    // discarding an overtaken one. Still ABORTABLE, so `q` remains an EARLY exit while `fs` is merely
+    // slow - it is no longer the only exit.
+    let first = ctx.request_with_reply_abortable("fs", &msg, secs);
     if matches!(first, ReqOutcome::Aborted) {
         return None; // the user pressed q - that is an answer, not a failure to retry
     }
     // Wait for a REPLACEMENT only if a reply actually arrived (possibly an overtaken one).
     //
     // This is the stale-cap hang. When `fs` restarts, the shell's cached cap goes EndpointDead and
-    // the send fails outright - no reply, and none coming. Feeding that into a 3600-second wait for
+    // the send fails outright - no reply, and none coming. Feeding that into an hour-long wait for
     // a "replacement" meant the reacquire-and-retry immediately below was NEVER REACHED: the
     // recovery path existed, was correct, and sat behind an hour-long wait for something that could
     // not arrive. Reproduced in QEMU with `kill fs` then `drives`: one gen-mismatch line and then
@@ -8173,7 +8866,7 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
     //
     // A missing reply is not a late reply. Only the latter is worth waiting for.
     if matches!(first, ReqOutcome::Reply(_)) {
-        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag, first, 3600) {
+        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag, first, secs) {
             return Some(r);
         }
     }
@@ -8191,19 +8884,19 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
         drain_stale_fs_replies(ctx);
         // The retry is a NEW request and needs its own tag - reusing the first one would accept the
         // dead instance's late reply as this one's answer, which is the whole class of bug being closed.
-        let tag2 = next_fs_tag();
+        let tag2 = next_fs_tag(ctx);
         let mut req2 = req;
         req2[0] = tag2;
         let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
         // Same rule on the retry: never wait out an hour for a reply that was never sent.
-        let second = ctx.request_with_reply_abortable("fs", &msg2, 3600);
+        let second = ctx.request_with_reply_abortable("fs", &msg2, secs);
         if matches!(second, ReqOutcome::Aborted) {
             return None;
         }
         if !matches!(second, ReqOutcome::Reply(_)) {
             return None; // fs still unreachable - the next command retries (§14.3)
         }
-        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag2, second, 3600) {
+        if let ReqOutcome::Reply(r) = fs_take_tagged(ctx, tag2, second, secs) {
             return Some(r);
         }
     }
@@ -8226,10 +8919,10 @@ const HIST_LOAD_SECS: i64 = 2;
 /// `fs_request` for the report save: the reply wait is bounded by `SAVE_FS_MAX_SECS` of wall-clock
 /// time (RTC), so a still-restarting `fs` can't block the shell forever (the bug behind `chaos
 /// max-carnage … save` hanging). Reacquire + retry once on a miss, then give up.
-fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8], max_secs: i64) -> Option<Message> {
+fn fs_request_bounded(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8], max_secs: i64) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
-    let tag = next_fs_tag();
+    let tag = next_fs_tag(ctx);
     req[0] = tag;
     req[1] = op;
     req[2] = pl as u8;
@@ -8255,7 +8948,7 @@ fn fs_request_bounded(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8], ma
     // `drain_stale_fs_replies`. The next request drains it instead, which is decisive.
     if ctx.reacquire_by_name("fs") {
         drain_stale_fs_replies(ctx);
-        let tag2 = next_fs_tag();
+        let tag2 = next_fs_tag(ctx);
         let mut req2 = req;
         req2[0] = tag2;
         let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
@@ -8306,12 +8999,29 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
 /// shown), `Timeout` = fs unreachable. On a Timeout (send failed - `fs` restarted, cached cap went
 /// EndpointDead, Phase D §14.3) it reacquires `fs` by name and retries once. The plain blocking
 /// `fs_request` stays for internal/cleanup ops (deletes, tests) the user never waits on interactively.
-fn fs_request_q(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome {
+fn fs_request_q(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> ReqOutcome {
     const HINT_SECS: i64 = 2;    // print "(q to quit)" only if the wait lingers past this
-    const MAX_SECS:  i64 = 3600; // effectively unbounded - fs replies fast now; q is the real exit
+    // How long `fs` gets to answer before the shell declares storage unavailable.
+    //
+    // **This was 3600, with the comment "effectively unbounded - fs replies fast now; q is the real
+    // exit".** That is not a bound, and "q is the real exit" makes the USER the timeout: a `tree`
+    // whose LIST_DIR never came back sat for an hour looking hung, and the reacquire-and-retry path
+    // below gives it a second hour. It is the rule above the rules - nothing above the kernel may
+    // hang; a missing, dead or slow dependency must RETURN with a loud "unavailable". Every caller
+    // already handles that outcome properly ("tree: storage unavailable"); they were simply never
+    // reached.
+    //
+    // 20 s is generous for what this helper actually carries. Its ONLY callers are READ_FILE,
+    // STAT_FILE and LIST_DIR - operations that complete in milliseconds on a healthy mount, and
+    // whose worst legitimate case is an `fs` that died and is being respawned (~1 s). The whole-disk
+    // work that genuinely takes minutes - check, scrub, flash - does not come through here.
+    //
+    // The retry doubles it, so a truly dead `fs` costs 40 s and then says so, instead of costing an
+    // afternoon and saying nothing.
+    const MAX_SECS:  i64 = FS_ANSWER_SECS; // one source for this bound, not a second copy of 20
     let pl = path.len().min(255);
     let mut req = [0u8; 4096];
-    let tag = next_fs_tag();
+    let tag = next_fs_tag(ctx);
     req[0] = tag;
     req[1] = op;
     req[2] = pl as u8;
@@ -8324,7 +9034,7 @@ fn fs_request_q(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> ReqOu
         // Send failed (stale cap after an fs restart): reacquire by name and retry once, still hinted.
         // A fresh tag for the fresh request - see `fs_request`.
         ReqOutcome::Timeout if ctx.reacquire_by_name("fs") => {
-            let tag2 = next_fs_tag();
+            let tag2 = next_fs_tag(ctx);
             let mut req2 = req;
             req2[0] = tag2;
             let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
@@ -8344,16 +9054,16 @@ fn fs_request_q(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> ReqOu
 /// Conventions rule 9 (a blocking command stays q-abortable) is not optional for the longest commands in
 /// the system; those are the ones that need it most. Sends exactly `[op]`, matching what fs expects here
 /// (`fs_request_q` would append a path-length byte).
-fn fs_op_q(ctx: &ServiceContext, op: u8) -> ReqOutcome {
+fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
     const HINT_SECS: i64 = 2;    // print "(q to quit)" only once the wait lingers
-    const MAX_SECS:  i64 = 3600; // effectively unbounded: q is the real exit, not a deadline
-    let tag = next_fs_tag();
+    const MAX_SECS:  i64 = FS_FSCK_SECS; // check/scrub walk the TREE, not the volume - a real bound
+    let tag = next_fs_tag(ctx);
     let msg = Message::from_bytes(&[tag, op]);
     drain_stale_fs_replies(ctx);
     let first = ctx.request_with_reply_qhint("fs", &msg, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
     match fs_take_tagged(ctx, tag, first, MAX_SECS) {
         ReqOutcome::Timeout if ctx.reacquire_by_name("fs") => {
-            let tag2 = next_fs_tag();
+            let tag2 = next_fs_tag(ctx);
             let msg2 = Message::from_bytes(&[tag2, op]);
             let again = ctx.request_with_reply_qhint("fs", &msg2, HINT_SECS, MAX_SECS, || ctx.console_writeln("  (q to quit)"));
             fs_take_tagged(ctx, tag2, again, MAX_SECS)
@@ -8364,7 +9074,7 @@ fn fs_op_q(ctx: &ServiceContext, op: u8) -> ReqOutcome {
 
 /// Stat a path: `Some((size, is_dir))` if it exists, `None` otherwise. Used by the streaming
 /// read/copy paths to learn a file's size before chunking through it.
-fn fs_stat(ctx: &ServiceContext, path: &[u8]) -> Option<(u64, bool)> {
+fn fs_stat(ctx: &ShellCtx, path: &[u8]) -> Option<(u64, bool)> {
     let reply = fs_request(ctx, OP_STAT_FILE, path, &[])?;
     let p = reply.payload_bytes();
     if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
@@ -8376,7 +9086,7 @@ fn fs_stat(ctx: &ServiceContext, path: &[u8]) -> Option<(u64, bool)> {
 
 /// Read up to `IO_CHUNK` bytes from `path` at byte `offset` into `out`; returns bytes read
 /// (0 at EOF). One message - the building block for streaming a large file.
-fn fs_read_at(ctx: &ServiceContext, path: &[u8], offset: u64, out: &mut [u8]) -> Option<usize> {
+fn fs_read_at(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8]) -> Option<usize> {
     let mut tail = [0u8; 12];
     tail[..8].copy_from_slice(&offset.to_le_bytes());
     tail[8..12].copy_from_slice(&(IO_CHUNK as u32).to_le_bytes());
@@ -8396,7 +9106,7 @@ fn fs_read_at(ctx: &ServiceContext, path: &[u8], offset: u64, out: &mut [u8]) ->
 /// Deadline-bounded twin of `fs_stat` for the startup history load: the reply wait is capped at
 /// `max_secs` (RTC) via `fs_request_bounded`, so an alive-but-not-serving fs (respawned, still
 /// re-mounting) cannot hang the prompt. `None` on timeout/miss/absent, treated as "no file".
-fn fs_stat_bounded(ctx: &ServiceContext, path: &[u8], max_secs: i64) -> Option<(u64, bool)> {
+fn fs_stat_bounded(ctx: &ShellCtx, path: &[u8], max_secs: i64) -> Option<(u64, bool)> {
     let reply = fs_request_bounded(ctx, OP_STAT_FILE, path, &[], max_secs)?;
     let p = reply.payload_bytes();
     if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 {
@@ -8408,7 +9118,7 @@ fn fs_stat_bounded(ctx: &ServiceContext, path: &[u8], max_secs: i64) -> Option<(
 
 /// Deadline-bounded twin of `fs_read_at` for the startup history load - same per-chunk deadline
 /// discipline as `fs_stat_bounded`, so a stalled fs times out instead of blocking the shell.
-fn fs_read_at_bounded(ctx: &ServiceContext, path: &[u8], offset: u64, out: &mut [u8], max_secs: i64) -> Option<usize> {
+fn fs_read_at_bounded(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8], max_secs: i64) -> Option<usize> {
     let mut tail = [0u8; 12];
     tail[..8].copy_from_slice(&offset.to_le_bytes());
     tail[8..12].copy_from_slice(&(IO_CHUNK as u32).to_le_bytes());
@@ -8427,13 +9137,13 @@ fn fs_read_at_bounded(ctx: &ServiceContext, path: &[u8], offset: u64, out: &mut 
 
 /// Create/truncate `path` to hold `total` bytes (allocates the whole extent). Pairs with
 /// `fs_write_at` to stream a large file.
-fn fs_write_new(ctx: &ServiceContext, path: &[u8], total: u64) -> bool {
+fn fs_write_new(ctx: &ShellCtx, path: &[u8], total: u64) -> bool {
     matches!(fs_request(ctx, OP_WRITE_NEW, path, &total.to_le_bytes()),
              Some(r) if r.payload_bytes().first() == Some(&FS_OK))
 }
 
 /// Write `chunk` into `path` at block-aligned byte `offset`.
-fn fs_write_at(ctx: &ServiceContext, path: &[u8], offset: u64, chunk: &[u8]) -> bool {
+fn fs_write_at(ctx: &ShellCtx, path: &[u8], offset: u64, chunk: &[u8]) -> bool {
     let mut tail = [0u8; 8 + IO_CHUNK];
     tail[..8].copy_from_slice(&offset.to_le_bytes());
     let n = chunk.len().min(IO_CHUNK);
@@ -8460,7 +9170,7 @@ fn no_fs(ctx: &ServiceContext, p: &[u8]) -> bool {
 }
 
 /// `ls [path]` - list a directory.
-fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_ls(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let reply = match fs_request_q(ctx, OP_LIST_DIR, path, &[]) {
@@ -8511,7 +9221,7 @@ fn cmd_ls(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(
 /// for other failures (bad path, storage unavailable) until those get their own variants. The
 /// human-readable detail is still printed; the `Result` is the category.
 /// Open `path` via fs (`OP_OPEN`) and return the **file capability** the reply embeds, or `None`.
-fn fc_open(ctx: &ServiceContext, path: &[u8], rights: u8) -> Option<CapHandle> {
+fn fc_open(ctx: &ShellCtx, path: &[u8], rights: u8) -> Option<CapHandle> {
     let r = fs_request(ctx, OP_OPEN, path, &[rights])?;
     if r.payload_bytes().first() == Some(&FS_OK) {
         let h = ctx.take_pending_cap();
@@ -8566,7 +9276,7 @@ fn cmd_fcap_help(ctx: &ServiceContext) {
     ctx.console_writeln("  - revocable: the cap goes stale on close and on rename (no silent rebind)");
     ctx.console_writeln("It takes no path and never touches your files. See CLAUDE.md 7.10 / Test 14.");
 }
-fn cmd_fcap(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     if arg.trim() == "help" { cmd_fcap_help(ctx); return Ok(()); }
     if !arg.trim().is_empty() {
         ctx.console_writeln("fcap: takes no argument (it uses its own throwaway file). Try `fcap help`.");
@@ -8684,9 +9394,9 @@ fn cmd_fcap(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
 // spans out to a temp file and atomically replaces the original, then RESETS the add buffer + span
 // list - so the only bound is how much you edit *between saves*, not the file size. When the add
 // buffer or span list fills, the edit is refused loudly (the status bar says to save), never
-// silently dropped (§26.7). Rendering uses only the CSI subset the serial terminal AND the fbcon
-// support (`arch/x86_64/fb.rs`): cursor position, erase-to-EOL, show/hide; reverse-video bars are
-// SGR (pretty on serial, plain on the fbcon - it ignores the unsupported escape, no garbage).
+// silently dropped (§26.7). Rendering uses only the CSI subset the serial terminal AND the `console`
+// service support: cursor position, erase-to-EOL, show/hide; reverse-video bars are SGR (pretty on
+// serial, plain on a terminal that lacks it - the unsupported escape is ignored, never left as garbage).
 const EDIT_COLS_MAX: usize = 256;          // bar-render scratch width cap; also caps render cols
 const EDIT_TAB: usize = 4;                 // Tab inserts this many spaces
 const EDIT_ADD_MAX: usize = 32 * 1024;     // add-buffer: new typed bytes between saves (save resets)
@@ -8764,7 +9474,7 @@ impl Editor {
 
     /// Refill the window cache with the IO_CHUNK-aligned window of the original file containing
     /// original-file offset `abs`. On a read failure leaves `cache_len = 0`.
-    fn refill(&mut self, ctx: &ServiceContext, abs: usize) {
+    fn refill(&mut self, ctx: &ShellCtx, abs: usize) {
         let win = (abs / IO_CHUNK) * IO_CHUNK;
         let mut pbuf = [0u8; PATH_MAX];
         let pl = self.path_len;
@@ -8778,7 +9488,7 @@ impl Editor {
     /// Copy up to `n` logical bytes starting at document offset `logical` into `out`; returns the
     /// number actually copied (fewer than `n` only at end-of-document or on a read failure).
     /// Add-piece bytes come from memory; original-piece bytes come through the window cache.
-    fn read_span(&mut self, ctx: &ServiceContext, logical: usize, n: usize, out: &mut [u8]) -> usize {
+    fn read_span(&mut self, ctx: &ShellCtx, logical: usize, n: usize, out: &mut [u8]) -> usize {
         let want = n.min(out.len());
         let mut produced = 0usize;
         let (mut pi, mut off) = self.locate(logical);
@@ -8813,7 +9523,7 @@ impl Editor {
         produced
     }
 
-    fn byte_at(&mut self, ctx: &ServiceContext, pos: usize) -> Option<u8> {
+    fn byte_at(&mut self, ctx: &ShellCtx, pos: usize) -> Option<u8> {
         if pos >= self.total { return None; }
         let mut b = [0u8; 1];
         if self.read_span(ctx, pos, 1, &mut b) == 1 { Some(b[0]) } else { None }
@@ -8906,7 +9616,7 @@ impl Editor {
 
     /// Logical offset of the start of the line containing `pos` (just after the previous '\n', or
     /// 0). Bounded by EDIT_LINE_MAX - a longer line falls back to that many bytes back.
-    fn line_start(&mut self, ctx: &ServiceContext, pos: usize) -> usize {
+    fn line_start(&mut self, ctx: &ShellCtx, pos: usize) -> usize {
         let mut i = pos;
         let mut steps = 0;
         while i > 0 && steps < EDIT_LINE_MAX {
@@ -8916,7 +9626,7 @@ impl Editor {
         i
     }
     /// Logical offset of the '\n' ending the line containing `pos`, or `total` for the last line.
-    fn line_end(&mut self, ctx: &ServiceContext, pos: usize) -> usize {
+    fn line_end(&mut self, ctx: &ShellCtx, pos: usize) -> usize {
         let mut i = pos;
         let mut steps = 0;
         while i < self.total && steps < EDIT_LINE_MAX {
@@ -8926,13 +9636,13 @@ impl Editor {
         i
     }
     /// Count of '\n' bytes in `[from, to)` - the number of line breaks between two offsets.
-    fn lines_between(&mut self, ctx: &ServiceContext, from: usize, to: usize) -> usize {
+    fn lines_between(&mut self, ctx: &ShellCtx, from: usize, to: usize) -> usize {
         let mut n = 0; let mut i = from;
         while i < to { if self.byte_at(ctx, i) == Some(b'\n') { n += 1; } i += 1; }
         n
     }
     /// Advance `pos` forward by `k` line starts (stops at end-of-document).
-    fn advance_lines(&mut self, ctx: &ServiceContext, mut pos: usize, k: usize) -> usize {
+    fn advance_lines(&mut self, ctx: &ShellCtx, mut pos: usize, k: usize) -> usize {
         for _ in 0..k {
             let le = self.line_end(ctx, pos);
             if le >= self.total { return pos; }
@@ -8941,9 +9651,9 @@ impl Editor {
         pos
     }
 
-    fn move_home(&mut self, ctx: &ServiceContext) { let c = self.cur; self.cur = self.line_start(ctx, c); }
-    fn move_end(&mut self, ctx: &ServiceContext)  { let c = self.cur; self.cur = self.line_end(ctx, c); }
-    fn move_up(&mut self, ctx: &ServiceContext) {
+    fn move_home(&mut self, ctx: &ShellCtx) { let c = self.cur; self.cur = self.line_start(ctx, c); }
+    fn move_end(&mut self, ctx: &ShellCtx)  { let c = self.cur; self.cur = self.line_end(ctx, c); }
+    fn move_up(&mut self, ctx: &ShellCtx) {
         let c = self.cur;
         let ls = self.line_start(ctx, c);
         if ls == 0 { self.cur = 0; return; }
@@ -8952,7 +9662,7 @@ impl Editor {
         let plen = (ls - 1) - pls;              // previous line length (excluding its '\n')
         self.cur = pls + col.min(plen);
     }
-    fn move_down(&mut self, ctx: &ServiceContext) {
+    fn move_down(&mut self, ctx: &ShellCtx) {
         let c = self.cur;
         let le = self.line_end(ctx, c);
         if le >= self.total { self.cur = self.total; return; }
@@ -8962,7 +9672,7 @@ impl Editor {
         let nlen = self.line_end(ctx, nls) - nls;
         self.cur = nls + col.min(nlen);
     }
-    fn page(&mut self, ctx: &ServiceContext, down: bool) {
+    fn page(&mut self, ctx: &ShellCtx, down: bool) {
         for _ in 0..self.rows.saturating_sub(3).max(1) {
             if down { self.move_down(ctx) } else { self.move_up(ctx) }
         }
@@ -8985,9 +9695,9 @@ fn edit_goto(ctx: &ServiceContext, row: usize, col: usize) {
 
 /// Draw a full-width reverse-video bar: `text` (already formatted) left-justified, space-padded
 /// to `width`. The caller positions the cursor first. `\x1b[7m`/`\x1b[0m` are reverse-video on a
-/// serial terminal AND on the framebuffer console - the shared `kernel/src/fbcon` renders SGR 7 by
-/// inverting the glyph blend ramp, so the bar looks the same on the TV as in a terminal. (It used to
-/// be dropped on x86's fbcon and rendered only on ARM's; the two consoles are one module now.)
+/// serial terminal AND on the framebuffer console - the `console` SERVICE renders SGR 7 by inverting
+/// the glyph blend ramp, so the bar looks the same on the TV as in a terminal. (It used to be dropped
+/// on x86 and rendered only on ARM; there is one terminal now, and it is a service.)
 fn edit_bar(ctx: &ServiceContext, text: &[u8], width: usize) {
     let mut line = [b' '; EDIT_COLS_MAX];
     let w = width.min(EDIT_COLS_MAX);
@@ -9002,7 +9712,7 @@ fn edit_bar(ctx: &ServiceContext, text: &[u8], width: usize) {
 /// time, scanning only across the viewport - never the whole file), draws the title bar, the
 /// visible text rows materialised from the piece table through the window cache, the status bar,
 /// then parks the terminal cursor. Only the visible window is ever read - the iOS-scroll property.
-fn edit_render(ctx: &ServiceContext, ed: &mut Editor, name: &[u8]) {
+fn edit_render(ctx: &ShellCtx, ed: &mut Editor, name: &[u8]) {
     use core::fmt::Write as _;
     let textrows = ed.rows.saturating_sub(2).max(1); // rows between the title and status bars
     let cols = ed.cols;
@@ -9082,7 +9792,7 @@ fn edit_render(ctx: &ServiceContext, ed: &mut Editor, name: &[u8]) {
 /// Save the document by streaming the piece spans to a temp file and atomically replacing the
 /// target, then RESET the add buffer + span list (the per-session edit budget). Returns false on
 /// any I/O failure, leaving `modified` set so the quit prompt still protects unsaved work.
-fn edit_save(ctx: &ServiceContext, ed: &mut Editor) -> bool {
+fn edit_save(ctx: &ShellCtx, ed: &mut Editor) -> bool {
     let mut pbuf = [0u8; PATH_MAX];
     let pl = ed.path_len;
     pbuf[..pl].copy_from_slice(&ed.path[..pl]);
@@ -9128,7 +9838,7 @@ fn edit_save(ctx: &ServiceContext, ed: &mut Editor) -> bool {
 
 /// Decode a CSI sequence (after `ESC [`) into an editor cursor/edit action. Mirrors the shell's
 /// line-editor `handle_csi`, but the actions move the document cursor instead of the prompt.
-fn edit_csi(ctx: &ServiceContext, ed: &mut Editor) {
+fn edit_csi(ctx: &ShellCtx, ed: &mut Editor) {
     let mut param: u16 = 0;
     let mut fb = 0u8;
     for _ in 0..8 {
@@ -9159,7 +9869,7 @@ fn edit_csi(ctx: &ServiceContext, ed: &mut Editor) {
 /// Quit handler: clean if unsaved changes are handled. Returns `true` if the editor should exit.
 /// With no unsaved changes, quits immediately; otherwise prompts on the status row (y = save then
 /// quit, n = discard and quit, anything else = cancel and keep editing).
-fn edit_try_quit(ctx: &ServiceContext, ed: &mut Editor) -> bool {
+fn edit_try_quit(ctx: &ShellCtx, ed: &mut Editor) -> bool {
     if !ed.modified { return true; }
     edit_goto(ctx, ed.rows, 1);
     edit_bar(ctx, b" unsaved changes  -  y = save & quit,  n = discard & quit,  any other key = keep editing",
@@ -9174,7 +9884,7 @@ fn edit_try_quit(ctx: &ServiceContext, ed: &mut Editor) -> bool {
 }
 
 #[inline(never)] // big stack frame (the piece table + add buffer) - keep it off hot call paths
-fn cmd_edit(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
+fn cmd_edit(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
     let arg = arg.trim();
     if arg.is_empty() {
         ctx.console_writeln("usage: edit <path>     e.g. edit /notes.txt");
@@ -9241,7 +9951,7 @@ fn cmd_edit(ctx: &ServiceContext, cwd: &Cwd, arg: &str) -> Result<(), ShellError
     Ok(())
 }
 
-fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_read(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     // Stat first (one message) to learn the size, then STREAM the content in IO_CHUNK pieces
@@ -9282,7 +9992,7 @@ fn cmd_read(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result
 /// content is free-form - they can't trail the way `mkdir … parents` does (it would be swallowed as
 /// content). Append/prepend stream through a temp file (`fs_stream_combine`), so they are not bound
 /// by a small buffer; `prepend` is a full-file rewrite (no insert-at-front - honest, §26.7).
-fn cmd_write(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
+fn cmd_write(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
     let (mode, rest) = parse_write_mode(rest);
     if rest.is_empty() {
         ctx.console_writeln("usage: write [append|prepend] <path> [content]");
@@ -9336,7 +10046,7 @@ const FMT_IOBUF: usize = 3556;
 /// Stream-format `src` into a fresh temp `tmp` (2-pass: count the size for `OP_WRITE_NEW`, then
 /// stream-write). Reads `src` and writes `tmp` - DIFFERENT files, never `src` twice at once. Returns
 /// the formatted byte count. On failure deletes the temp; the caller leaves `src` untouched.
-fn fmt_to_temp(ctx: &ServiceContext, src: &[u8], tmp: &[u8]) -> Result<u64, FmtErr> {
+fn fmt_to_temp(ctx: &ShellCtx, src: &[u8], tmp: &[u8]) -> Result<u64, FmtErr> {
     let mut total = 0u64;
     {
         let mut count = |bytes: &[u8]| -> bool { total += bytes.len() as u64; true };
@@ -9373,7 +10083,7 @@ fn fmt_to_temp(ctx: &ServiceContext, src: &[u8], tmp: &[u8]) -> Result<u64, FmtE
 
 /// Stream-compare two files; true iff byte-identical. Reads them SEQUENTIALLY (one then the other),
 /// so it is safe even when one path is the source (no two concurrent reads of the same file).
-fn fmt_compare_files(ctx: &ServiceContext, a: &[u8], b: &[u8]) -> bool {
+fn fmt_compare_files(ctx: &ShellCtx, a: &[u8], b: &[u8]) -> bool {
     let mut off = 0u64;
     let mut ba = [0u8; FMT_IOBUF];
     let mut bb = [0u8; FMT_IOBUF];
@@ -9391,7 +10101,7 @@ fn fmt_compare_files(ctx: &ServiceContext, a: &[u8], b: &[u8]) -> bool {
 /// cap). `fmt check <path>` - report (loud + `Err`) whether it is already canonical, without writing.
 /// Guardrails (loud, file UNTOUCHED): won't-parse (unbalanced braces), or a single statement too long
 /// to hold. The format write streams into a temp then renames, so a failure never damages the original.
-fn cmd_fmt(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
+fn cmd_fmt(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
     let rest = rest.trim();
     let (check, pathstr) = match rest.split_once(char::is_whitespace) {
         Some(("check", p)) => (true, p.trim()),
@@ -9416,7 +10126,7 @@ fn cmd_fmt(ctx: &ServiceContext, cwd: &Cwd, rest: &str) -> Result<(), ShellError
 }
 
 /// Format or check ONE file. Bare `fmt [check] <path>`, and per-file (sequentially) for a comma-list.
-fn fmt_one(ctx: &ServiceContext, cwd: &Cwd, check: bool, pathstr: &str) -> Result<(), ShellError> {
+fn fmt_one(ctx: &ShellCtx, cwd: &Cwd, check: bool, pathstr: &str) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, pathstr, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut pcopy = [0u8; PATH_MAX];
@@ -9461,7 +10171,7 @@ fn fmt_one(ctx: &ServiceContext, cwd: &Cwd, check: bool, pathstr: &str) -> Resul
 }
 
 /// `mkdir <path> [parents]` - create a directory (with `parents`, create missing parents).
-fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
+fn cmd_mkdir(ctx: &ShellCtx, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
     // `mkdir a,b,c` creates each; `parents` applies to every segment. Report each, continue past a failure.
     if arg.contains(',') {
         let mut n = 0usize;
@@ -9476,7 +10186,7 @@ fn cmd_mkdir(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) -> Resul
 }
 
 /// Create ONE directory. Bare `mkdir <path> [parents]`, and per-segment for a comma-list.
-fn mkdir_one(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
+fn mkdir_one(ctx: &ShellCtx, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let op = if parents { OP_MKDIR_P } else { OP_MKDIR };
@@ -9499,7 +10209,7 @@ fn mkdir_one(ctx: &ServiceContext, cwd: &Cwd, arg: &str, parents: bool) -> Resul
 }
 
 /// `cd [path]` - change the current directory (validates it exists + is a directory).
-fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) -> Result<(), ShellError> {
+fn cmd_cd(ctx: &ShellCtx, cwd: &mut Cwd, arg: &str) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     // `cd -` toggles to the previous directory (already an absolute, normalized path - use it
     // directly, then run the same stat-validated switch so a since-deleted dir errors loudly).
@@ -9542,7 +10252,7 @@ fn cmd_cd(ctx: &ServiceContext, cwd: &mut Cwd, arg: &str) -> Result<(), ShellErr
 /// `copy <src> <dst>` - copy a file by STREAMING it through fixed chunks (read_at/write_at),
 /// so it copies files far larger than one IPC message with no whole-file buffer. File-only in
 /// this cut (no recursive dirs - that's `copy … recursive`).
-fn cmd_copy(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
+fn cmd_copy(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
     let mut sbuf = [0u8; PATH_MAX];
     let spath = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut sp = [0u8; PATH_MAX];
@@ -9585,7 +10295,7 @@ fn cmd_copy(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(),
 /// each child either copy the file (read+write, existing ops) or push the subdir. No new fs
 /// surface - copy already lives in the shell. Loud if the tree is wider than the walk's cap
 /// (§3.12), and refuses to copy a directory into its own subtree (would never terminate).
-fn cmd_copy_tree(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
+fn cmd_copy_tree(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
     let mut sbuf = [0u8; PATH_MAX];
     let src_abs = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut sp = [0u8; PATH_MAX];
@@ -9659,21 +10369,21 @@ fn cmd_copy_tree(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Resul
 }
 
 /// Stat a path: `Some(is_dir)` if it exists, `None` if not (or storage is down).
-fn stat_kind(ctx: &ServiceContext, path: &[u8]) -> Option<bool> {
+fn stat_kind(ctx: &ShellCtx, path: &[u8]) -> Option<bool> {
     let reply = fs_request(ctx, OP_STAT_FILE, path, &[])?;
     let p = reply.payload_bytes();
     if p.first() == Some(&FS_OK) && p.len() >= 11 && p[1] == 1 { Some(p[10] != 0) } else { None }
 }
 
 /// `mkdir <path>` via fs, treating success as true. Used by recursive copy to recreate dirs.
-fn mkdir_at(ctx: &ServiceContext, path: &[u8]) -> bool {
+fn mkdir_at(ctx: &ShellCtx, path: &[u8]) -> bool {
     matches!(fs_request(ctx, OP_MKDIR, path, &[]), Some(r) if r.payload_bytes().first() == Some(&FS_OK))
 }
 
 /// Stream-copy a file `src`→`dst` of any size: stat the size, allocate `dst`, then chunk
 /// through with `read_at`/`write_at` (one IO_CHUNK buffer, no whole-file buffer). Returns
 /// `Some(bytes)` on success. The building block under both `copy` and recursive `copy`.
-fn copy_file_streaming(ctx: &ServiceContext, src: &[u8], dst: &[u8]) -> Option<u64> {
+fn copy_file_streaming(ctx: &ShellCtx, src: &[u8], dst: &[u8]) -> Option<u64> {
     let (size, is_dir) = fs_stat(ctx, src)?;
     if is_dir { return None; }
     if !fs_write_new(ctx, dst, size) { return None; }
@@ -9690,7 +10400,7 @@ fn copy_file_streaming(ctx: &ServiceContext, src: &[u8], dst: &[u8]) -> Option<u
 
 /// Copy one file `src`→`dst` by streaming. Returns true on success; logs on failure so a
 /// single bad file in a subtree copy is visible but does not abort the whole walk (§3.12).
-fn copy_one(ctx: &ServiceContext, src: &[u8], dst: &[u8]) -> bool {
+fn copy_one(ctx: &ShellCtx, src: &[u8], dst: &[u8]) -> bool {
     match copy_file_streaming(ctx, src, dst) {
         Some(_) => true,
         None => { ctx.console_writeln_fmt(format_args!("copy: skipped (copy failed): {}", str_of(src))); false }
@@ -9709,7 +10419,7 @@ fn remap(dst_root: &[u8], src_root: &[u8], s: &[u8], out: &mut [u8; PATH_MAX]) -
 
 /// `rename <path> <newname>` - rename an entry in place (not a move; newname is one
 /// component). fs edits the directory entry; no blocks are read or freed.
-fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) -> Result<(), ShellError> {
+fn cmd_rename(ctx: &ShellCtx, cwd: &Cwd, path: &str, newname: &str) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let abspath = match resolve_or_err(ctx, cwd, path, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut pp = [0u8; PATH_MAX];
@@ -9730,7 +10440,7 @@ fn cmd_rename(ctx: &ServiceContext, cwd: &Cwd, path: &str, newname: &str) -> Res
 /// `delete <path>` - remove a file or empty directory; `delete <path> recursive` removes a
 /// whole subtree. fs does the work either way (plain = `OP_DELETE`, recursive =
 /// `OP_DELETE_TREE`, a depth-bounded subtree free); it frees the blocks and reclaims them.
-fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(), ShellError> {
+fn cmd_delete(ctx: &ShellCtx, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(), ShellError> {
     // `delete /a,/b` deletes each; `recursive` applies to every segment. Report each, continue past one
     // that is missing / fails.
     if arg.contains(',') {
@@ -9746,7 +10456,7 @@ fn cmd_delete(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) -> Re
 }
 
 /// Delete ONE path. Bare `delete <path> [recursive]`, and per-segment for a comma-list.
-fn delete_one(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(), ShellError> {
+fn delete_one(ctx: &ShellCtx, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     if path == b"/" {
@@ -9771,7 +10481,7 @@ fn delete_one(ctx: &ServiceContext, cwd: &Cwd, arg: &str, recursive: bool) -> Re
 }
 
 /// `move <src> <dst>` - relocate an entry (same data; only the directory entries change).
-fn cmd_move(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
+fn cmd_move(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
     let mut sbuf = [0u8; PATH_MAX];
     let spath = match resolve_or_err(ctx, cwd, src, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut sp = [0u8; PATH_MAX];
@@ -9806,7 +10516,7 @@ fn cmd_move(ctx: &ServiceContext, cwd: &Cwd, src: &str, dst: &str) -> Result<(),
 /// is bounded (a fixed pending-directory stack) and **loud on truncation** (§26.6/§3.12);
 /// the `fs_index` accelerator (persistence.md §6.5) is what we'd build if this walk ever
 /// gets too slow on a huge tree - not before.
-fn cmd_find(ctx: &ServiceContext, cwd: &Cwd, target: &str, start: &str, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_find(ctx: &ShellCtx, cwd: &Cwd, target: &str, start: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut sbuf = [0u8; PATH_MAX];
     let start_abs = match resolve_or_err(ctx, cwd, start, &mut sbuf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     let mut stack = PathStack::new();
@@ -9869,12 +10579,12 @@ const TREE_PREFIX_MAX: usize = TREE_MAX_DEPTH * 6;
 /// capacity explicit stack, depth-first, no recursion, loud on overflow (§3.12). A directory's
 /// whole subtree drains before its next sibling (LIFO + reverse-push), and each node records
 /// whether it is its parent's *last* child so the prefix draws `├──`/`└──` and `│`/blank
-/// continuation correctly. UTF-8: the fbcon decodes `├ └ │ ─` and renders light box glyphs;
+/// continuation correctly. UTF-8: the `console` service decodes `├ └ │ ─` and renders light box glyphs;
 /// a trailing `/` still marks directories (the console is monochrome - no colour to lean on).
 /// `#[inline(never)]`: holds the ~12 KiB `TreeStack` + prefix scratch off the hot pipe frame
 /// (it's a pipe producer; see [[project-shell-stack-pipe]]).
 #[inline(never)]
-fn cmd_tree(ctx: &ServiceContext, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let start = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
     match stat_kind(ctx, start) {
@@ -10098,7 +10808,7 @@ fn parse_match<'a>(args: &[&'a str], argc: usize, start: usize) -> Option<(bool,
 /// `match [except] <pattern> <path>` - print the lines of `<path>` that match (or, with
 /// `except`, that do not). The pipe form filters piped input instead; either way `match` is a
 /// FILTER, never a pipe producer (use `read <path> | match …` to feed a pipeline from a file).
-fn cmd_match(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
+fn cmd_match(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
     let (invert, pattern, path) = match parse_match(args, argc, 1) {
         Some(t) => t,
         None => { ctx.console_writeln("usage: match [except] <pattern> <path>"); return Err(ShellError::Unknown); }
@@ -10190,7 +10900,7 @@ fn write_count(ctx: &ServiceContext, input: &[u8], out: &mut Out) {
 
 /// `count <path>` - count the lines / words / bytes of a file. The pipe form `<producer> |
 /// count` counts piped input instead; either way `count` consumes input (never a producer).
-fn cmd_count(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
+fn cmd_count(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
     let path = if argc >= 2 { args[1] } else { "" };
     if path.is_empty() {
         ctx.console_writeln("count: a path is required (or pipe input: <producer> | count)");
@@ -10270,7 +10980,7 @@ fn write_sorted(ctx: &ServiceContext, input: &[u8], reverse: bool, out: &mut Out
 
 /// `sort [reverse] <path>` - print a file's lines in order. The pipe form `<producer> | sort`
 /// sorts piped input instead; either way `sort` consumes input (never a producer).
-fn cmd_sort(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
+fn cmd_sort(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Result<(), ShellError> {
     let (reverse, path) = parse_sort(args, argc, 1);
     if path.is_empty() {
         ctx.console_writeln("sort: a path is required (or pipe input: <producer> | sort)");
@@ -10356,7 +11066,7 @@ fn write_last(ctx: &ServiceContext, input: &[u8], n: usize, out: &mut Out) {
 
 /// `first [N] <path>` / `last [N] <path>` - print a file's first/last N lines (default 10). The
 /// pipe form `<producer> | first [N]` takes from piped input; either way it consumes input.
-fn cmd_take(ctx: &ServiceContext, cwd: &Cwd, args: &[&str], argc: usize, last: bool) -> Result<(), ShellError> {
+fn cmd_take(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize, last: bool) -> Result<(), ShellError> {
     let name = if last { "last" } else { "first" };
     let (n, path) = parse_take(args, argc, 1);
     if path.is_empty() {
@@ -10422,7 +11132,7 @@ impl PathStack {
 // Step 3: the data primitives `flash` / `label` / list (boot layer + multi-drive later).
 // ---------------------------------------------------------------------------
 
-fn cmd_drives(ctx: &ServiceContext, args: &[&str], argc: usize) -> Result<(), ShellError> {
+fn cmd_drives(ctx: &ShellCtx, args: &[&str], argc: usize) -> Result<(), ShellError> {
     let sub = if argc >= 2 { args[1] } else { "" };
     match sub {
         ""        => drives_list(ctx),
@@ -10504,9 +11214,9 @@ fn drive_sel_ok(ctx: &ServiceContext, sel: &str) -> bool {
 
 
 /// `drives` - list the attached drive (single-drive in step 3; index 0).
-fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
+fn drives_list(ctx: &ShellCtx) -> Result<(), ShellError> {
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
-    let reply = match fs_raw(ctx, &[OP_DRIVES_INFO], 3600) {
+    let reply = match fs_raw(ctx, &[OP_DRIVES_INFO], FS_ANSWER_SECS) {
         Some(r) => r,
         None => { ctx.console_writeln("drives: storage unavailable (no fs?)"); return Err(ShellError::Unknown); }
     };
@@ -10561,7 +11271,7 @@ fn drives_list(ctx: &ServiceContext) -> Result<(), ShellError> {
 /// be the GSFS target), and a confirmation prompt cannot convey that - `drives` shows it as an
 /// unformatted raw disk either way. So the danger is named explicitly and the override is a word the
 /// operator has to type.
-fn drives_flash(ctx: &ServiceContext, label: &str, force: bool) -> Result<(), ShellError> {
+fn drives_flash(ctx: &ShellCtx, label: &str, force: bool) -> Result<(), ShellError> {
     if label.len() > LABEL_MAX {
         ctx.console_writeln_fmt(format_args!("drives: label too long (max {})", LABEL_MAX));
         return Err(ShellError::Unknown);
@@ -10583,7 +11293,7 @@ fn drives_flash(ctx: &ServiceContext, label: &str, force: bool) -> Result<(), Sh
     // "flash FAILED" while fs is still formatting. Observed exactly that on hardware: fs logged
     // `flash requested`, never logged a failure, and the shell had already declared one.
     drain_stale_fs_replies(ctx);
-    match fs_raw(ctx, &req[..2 + ll], 3600) {
+    match fs_raw(ctx, &req[..2 + ll], FS_FORMAT_SECS) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: formatted as GSFS - mounted, ready to use now (no reboot)");
             Ok(())
@@ -10602,7 +11312,7 @@ fn drives_flash(ctx: &ServiceContext, label: &str, force: bool) -> Result<(), Sh
 
 /// `drives reset` - un-format the drive back to raw (zero the superblock). Destructive;
 /// a quick clean slate for re-testing the raw→flash path. NOT a secure wipe.
-fn drives_reset(ctx: &ServiceContext, force: bool) -> Result<(), ShellError> {
+fn drives_reset(ctx: &ShellCtx, force: bool) -> Result<(), ShellError> {
     ctx.console_write("This un-formats the drive back to raw (ERASES). Continue? [y/N] ");
     if !read_confirm(ctx) {
         ctx.console_writeln("drives: aborted");
@@ -10611,7 +11321,7 @@ fn drives_reset(ctx: &ServiceContext, force: bool) -> Result<(), ShellError> {
     // Reset zeroes block 0, which on a foreign disk is its partition table - same danger as flash.
     let op = if force { OP_RESET | 0x80 } else { OP_RESET };
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
-    match fs_raw(ctx, &[op], 3600) {
+    match fs_raw(ctx, &[op], FS_FORMAT_SECS) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln("drives: reset to raw - 'drives flash' to use again");
             Ok(())
@@ -10631,7 +11341,7 @@ fn drives_reset(ctx: &ServiceContext, force: bool) -> Result<(), ShellError> {
 /// count from it, and verify every block's CRC. Repairs allocation drift non-destructively;
 /// reports (does not delete) files/dirs whose blocks fail their CRC. No confirmation needed -
 /// it never erases data. Reply: [FS_OK, files:u32, dirs:u32, bad:u32, used:u64, free:u64].
-fn drives_check(ctx: &ServiceContext) -> Result<(), ShellError> {
+fn drives_check(ctx: &ShellCtx) -> Result<(), ShellError> {
     // q-abortable: a whole-disk pass can run for minutes on a slow stick, and a shell parked in an
     // unbounded request cannot see the keystroke that asks it to stop (conventions rule 9).
     match fs_op_q(ctx, OP_CHECK) {
@@ -10669,7 +11379,7 @@ fn drives_check(ctx: &ServiceContext) -> Result<(), ShellError> {
 /// CRC, report, change NOTHING on disk (distinct from `check`, which repairs the bitmap). Run it
 /// on a schedule to catch latent bit-rot early; without redundancy it detects but cannot repair.
 /// Reply: [FS_OK, files:u32, dirs:u32, bad:u32, scanned:u64].
-fn drives_scrub(ctx: &ServiceContext) -> Result<(), ShellError> {
+fn drives_scrub(ctx: &ShellCtx) -> Result<(), ShellError> {
     // q-abortable: a whole-disk pass can run for minutes on a slow stick, and a shell parked in an
     // unbounded request cannot see the keystroke that asks it to stop (conventions rule 9).
     match fs_op_q(ctx, OP_SCRUB) {
@@ -10704,7 +11414,7 @@ fn drives_scrub(ctx: &ServiceContext) -> Result<(), ShellError> {
 }
 
 /// `drives label <name>` - name / rename the drive (rewrites the superblock).
-fn drives_label(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
+fn drives_label(ctx: &ShellCtx, name: &str) -> Result<(), ShellError> {
     let nb = name.as_bytes();
     if nb.is_empty() || nb.len() > LABEL_MAX {
         ctx.console_writeln_fmt(format_args!("drives: label must be 1..{} chars", LABEL_MAX));
@@ -10716,7 +11426,7 @@ fn drives_label(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     req[1] = ll as u8;
     req[2..2 + ll].copy_from_slice(nb);
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn: replies carry no request id)
-    match fs_raw(ctx, &req[..2 + ll], 3600) {
+    match fs_raw(ctx, &req[..2 + ll], FS_ANSWER_SECS) {
         Some(r) if r.payload_bytes().first() == Some(&FS_OK) => {
             ctx.console_writeln_fmt(format_args!("drives: labelled '{}'", name));
             Ok(())

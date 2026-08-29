@@ -72,6 +72,16 @@ const MAX_IO_ATTEMPTS: u32 = 3;
 /// guest TSC races ahead so the wall-clock hold is shorter, which is fine - QEMU's emulated COMRESET
 /// is instant, it needs no real hold. read_tsc is hardware-proven to advance (perf §22).
 const COMRESET_HOLD_CYCLES: u64 = 4_000_000;
+/// C8-1: how long to wait for the SATA PHY to report a live link, and for the task file to go ready.
+///
+/// A DURATION, not a read count. These were `for _ in 0..2_000_000u32` loops over an MMIO register,
+/// and a count is not a duration - two million reads is a different wall-clock wait on every machine,
+/// so the same code waits milliseconds on one board and seconds on another. Neither number was chosen
+/// against the hardware's actual timing; both were chosen to "feel long enough" on the machine in
+/// front of someone. Commandment VIII: wait on truth, bounded by a clock.
+///
+/// The truth is the register; the clock only bounds how long we will believe it might still arrive.
+const LINK_WAIT_CYCLES: u64 = 400_000_000;
 
 struct Ahci<'a> {
     hba: &'a Mmio,
@@ -381,8 +391,23 @@ impl<'a> Ahci<'a> {
             self.arena.write32(DATA_OFF + i * 4, w);
         }
         self.issue_io(ctx, "write", ATA_WRITE_DMA_EXT, lba, 1, true, 512)?;
-        // Commit to the medium so writes survive a reboot (no-data command).
-        self.issue_io(ctx, "flush", ATA_FLUSH_EXT, 0, 0, false, 0)?;
+        // NO FLUSH HERE. Ordering is the CALLER's to declare, and `fs` already declares it.
+        //
+        // This issued a full FLUSH CACHE EXT after every 512-byte sector. A journal transaction is
+        // several writes - staged blocks, the commit record, the checkpoint, both superblock copies -
+        // so one `write /sc/a.txt hello` paid a stack of full device flushes. Measured on x86: writes
+        // 40-57 s against reads at 8.8 s, and reads issue no flush. The Pi never showed it because its
+        // USB stick refuses SYNCHRONIZE CACHE outright (§6.1) - there was no per-write flush to be slow.
+        //
+        // The flushes that MATTER are still issued, explicitly, by the layer that knows where the
+        // ordering points are: `fs` flushes at BARRIER 1 (staged blocks durable before the commit
+        // record that authorises replaying them) and BARRIER 2 (commit record durable before any home
+        // block is overwritten), and `format` flushes before it returns. Those two barriers ARE the
+        // atomicity §6.1 claims; a flush after every sector adds nothing to them.
+        //
+        // What changes: a data-block write not followed by a barrier may sit in the drive cache, so a
+        // power cut can lose the tail of freshly written FILE DATA. Metadata stays crash-consistent,
+        // which is exactly what §6.1 claims and no more. OP_FLUSH still issues a real flush.
         Ok(())
     }
 
@@ -406,15 +431,16 @@ impl<'a> Ahci<'a> {
             lba += n;
             left -= n;
         }
-        self.issue_io(ctx, "flush", ATA_FLUSH_EXT, 0, 0, false, 0)?;
+        // No flush, for the reason in `write_block`: the caller declares its barriers, and the one
+        // caller of this - `format` - flushes explicitly before it returns.
         Ok(())
     }
 
     /// Serve one block-IPC request (same protocol as the ATA PIO backend),
     /// replying through the client's `reply` cap.
-    fn serve(&self, ctx: &ServiceContext, p: &[u8], reply: CapHandle) {
+    fn serve(&self, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
         use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
-        let err = |ctx: &ServiceContext| { let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR])); };
+        let err = |ctx: &ServiceContext| { reply.send(ctx, &[STATUS_ERR]); };
         if p.is_empty() {
             err(ctx);
             return;
@@ -424,9 +450,15 @@ impl<'a> Ahci<'a> {
         if p[0] == OP_FLUSH {
             // Issue the flush and report what the DRIVE said. An earlier version of this branch
             // replied OK unconditionally, with a comment claiming FLUSH CACHE was "not implemented
-            // here" - which was wrong about this very file: `write_block` and `write_zeros` already
-            // issue ATA_FLUSH_EXT (0xEA) after every write, so this backend attests durability
-            // per-write, which is strictly stronger than on demand. Replying OK for a command never
+            // here" - which was wrong about this very file. It IS implemented, right below.
+            //
+            // `write_block` and `write_zeros` used to flush after every write, and this comment used
+            // to cite that as "durability per-write, strictly stronger than on demand". They no
+            // longer do: a flush per 512-byte sector cost a journal transaction a stack of full
+            // device flushes and made every file write on x86 take tens of seconds. Ordering is
+            // declared by `fs` at its journal barriers, and THIS branch is how it declares it - so
+            // this command is now the only flush the drive ever sees, and answering it honestly
+            // matters more than it did before. Replying OK for a command never
             // sent was an ASSERTED guarantee rather than an earned one, and that is the silent
             // fallback §26.7 forbids - the caller cannot tell a flush that happened from one that
             // did not. It costs three lines to answer honestly, so it answers honestly.
@@ -434,14 +466,14 @@ impl<'a> Ahci<'a> {
                 Ok(()) => STATUS_OK,
                 Err(_) => STATUS_ERR,
             };
-            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[st]));
+            reply.send(ctx, &[st]);
             return;
         }
         if p[0] == OP_CAPACITY {
             let mut out = [0u8; 9];
             out[0] = STATUS_OK;
             out[1..9].copy_from_slice(&self.sectors.get().to_le_bytes());
-            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
+            reply.send(ctx, &out);
             return;
         }
         if p.len() < 9 {
@@ -457,7 +489,7 @@ impl<'a> Ahci<'a> {
                     Ok(()) => {
                         out[0] = STATUS_OK;
                         out[1..].copy_from_slice(&sec);
-                        let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
+                        reply.send(ctx, &out);
                     }
                     Err(_) => err(ctx),
                 }
@@ -473,7 +505,7 @@ impl<'a> Ahci<'a> {
                     Ok(()) => STATUS_OK,
                     Err(_) => STATUS_ERR,
                 };
-                let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
+                reply.send(ctx, &[status]);
             }
             OP_WRITE_ZEROS => {
                 // [op, lba:u64, count:u64] - zero `count` blocks from `lba`.
@@ -486,7 +518,7 @@ impl<'a> Ahci<'a> {
                     Ok(()) => STATUS_OK,
                     Err(_) => STATUS_ERR,
                 };
-                let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[status]));
+                reply.send(ctx, &[status]);
             }
             _ => err(ctx),
         }
@@ -512,7 +544,8 @@ impl<'a> Ahci<'a> {
 fn wait_port_ready(ctx: &ServiceContext, hba: &Mmio, base: usize) -> bool {
     // 1. Fast path + slow-establish: a healthy, already-up link returns on the first read (zero added
     //    latency); a slow one gets a bounded window (read-count poll, the port_comreset DET idiom).
-    for _ in 0..2_000_000u32 {
+    let start = ctx.read_tsc();
+    while ctx.read_tsc().wrapping_sub(start) < LINK_WAIT_CYCLES {
         if hba.read32(base + PX_SSTS) & 0xF == 3 {
             return true;
         }
@@ -525,7 +558,8 @@ fn wait_port_ready(ctx: &ServiceContext, hba: &Mmio, base: usize) -> bool {
     let sctl = hba.read32(base + PX_SCTL);
     hba.write32(base + PX_SCTL, sctl & !0xF);
     // 3. Wait (bounded) for the PHY to (re)establish, then clear the error bits the reset latched.
-    for _ in 0..2_000_000u32 {
+    let start = ctx.read_tsc();
+    while ctx.read_tsc().wrapping_sub(start) < LINK_WAIT_CYCLES {
         if hba.read32(base + PX_SSTS) & 0xF == 3 {
             hba.write32(base + PX_SERR, 0xFFFF_FFFF); // W1C - init_port's COMRESET clears again
             return true;
@@ -553,16 +587,21 @@ fn serve_no_disk(ctx: &ServiceContext) -> ! {
             Some(c) => c,
             None => continue,
         };
-        let p = msg.payload_bytes();
+        let raw = msg.payload_bytes();
+        let (tag, p) = match raw.split_first() {
+            Some((t, rest)) => (*t, rest),
+            None => (0, &raw[..0]),
+        };
+        let reply = crate::Reply { cap: reply, tag };
         if !p.is_empty() && p[0] == OP_CAPACITY {
             // Capacity reply is [STATUS_OK, sectors:u64 LE]; sectors = 0 = "genuinely no disk".
             let mut out = [0u8; 9];
             out[0] = STATUS_OK;
-            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&out));
+            reply.send(ctx, &out);
         } else {
-            let _ = ctx.send_by_handle(reply, &Message::from_bytes(&[STATUS_ERR]));
+            reply.send(ctx, &[STATUS_ERR]);
         }
-        ctx.remove_cap(reply);
+        ctx.remove_cap(reply.cap);
     }
 }
 
@@ -600,7 +639,8 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
         // Wait (bounded) for the task file to go ready, THEN read the signature. A healthy port has
         // BSY already clear so this returns on the first read (zero added latency); an empty port never
         // reaches here (wait_port_ready fails DET first), so no empty-port waste.
-        for _ in 0..2_000_000u32 {
+        let start = ctx.read_tsc();
+        while ctx.read_tsc().wrapping_sub(start) < LINK_WAIT_CYCLES {
             if hba.read32(base + PX_TFD) & (TFD_BSY | TFD_DRQ) == 0 { break; }
         }
         let sig = hba.read32(base + PX_SIG);
@@ -674,13 +714,52 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
 
     // Serve block read/write requests from `fs` over IPC (READ/WRITE DMA EXT).
     ctx.log("block-driver: AHCI serving block I/O");
+
+    // THIS DRIVER'S HALF OF A ROUND TRIP, so the other half can be attributed by subtraction.
+    //
+    // `fs` measures a whole block round trip and sees about a second per trip on this machine, for a
+    // single 512-byte read. That second is either spent HERE - the AHCI command, this driver's own
+    // work - or in the kernel and scheduler getting the request here and the reply back. Those are
+    // different bugs with opposite fixes, and no amount of reading the code has settled which it is:
+    // both sides block properly, both wake paths are intact, and both services sit on core 1.
+    //
+    // So measure the half that can be measured alone. Cycles from dequeuing a request to sending its
+    // reply covers everything this driver does, device included. If that is milliseconds while `fs`
+    // sees a second, this driver is innocent and the time is in the kernel path. If it IS the second,
+    // the device or the command loop is, and the search moves in here.
+    //
+    // BOUNDED and QUIET (§26.6, §26.7): the threshold is 5 ms, which no healthy SATA command
+    // approaches, so a healthy system prints nothing at all. Beyond that it prints the first few and
+    // then every 64th, because the point is to learn the magnitude, not to narrate every request -
+    // and a driver that logs per-request under load becomes its own bottleneck. The counter is loop
+    // state, owned here, not a module static (Invariant 9).
+    let slow_threshold = ctx.duration_cycles(5);
+    let mut slow_seen: u64 = 0;
     loop {
         let msg = ctx.recv();
         let reply = match ctx.take_pending_cap() {
             Some(c) => c,
             None => continue,
         };
-        ahci.serve(ctx, msg.payload_bytes(), reply);
+        // Split the correlation tag off here, once - see `crate::Reply`.
+        let p = msg.payload_bytes();
+        let (tag, body) = match p.split_first() {
+            Some((t, rest)) => (*t, rest),
+            None => (0, &p[..0]),
+        };
+        let op = body.first().copied().unwrap_or(0);
+        let t_serve = ctx.read_tsc();
+        ahci.serve(ctx, body, crate::Reply { cap: reply, tag });
+        let spent = ctx.read_tsc().wrapping_sub(t_serve);
+        if slow_threshold > 0 && spent >= slow_threshold {
+            slow_seen += 1;
+            if slow_seen <= 3 || slow_seen % 64 == 0 {
+                ctx.log_fmt(format_args!(
+                    "block-driver: op {} spent {} us in the driver (slow #{})",
+                    op, spent.saturating_mul(1_000_000) / ctx.duration_cycles(1_000).max(1),
+                    slow_seen));
+            }
+        }
         ctx.remove_cap(reply);
     }
 }

@@ -137,9 +137,34 @@ pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
 }
 
 /// Copy `src` to a user address. Returns false if the pointer failed validation or faulted.
+/// DIAGNOSTIC: the largest kernel write into user memory, and where it landed.
+///
+/// The Pi 4 shell fault destroys tens of kilobytes of its own stack - a 1024-byte canary reduced to a
+/// longest run of ONE byte, no return address left in 32 KB, every stack page mapped, and NO other
+/// task mapping any of those frames. The shell has no `unsafe` and safe-Rust writes are bounds-checked,
+/// so the writer is not the shell and not another address space. That leaves the kernel writing through
+/// a user pointer - the one writer that crosses Rust`s guarantees.
+///
+/// Recorded HERE rather than at the ten call sites, so no path can be forgotten. Relaxed atomics: a
+/// diagnostic, where a torn read prints a wrong number and corrupts nothing.
+pub static UW_MAX_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static UW_MAX_DST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static UW_TOTAL:   core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static UW_COUNT:   core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool {
     if !validate_user_ptr(dst, src.len()) {
         return false;
+    }
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let n = src.len() as u64;
+        UW_COUNT.fetch_add(1, Relaxed);
+        UW_TOTAL.fetch_add(n, Relaxed);
+        if n > UW_MAX_LEN.load(Relaxed) {
+            UW_MAX_LEN.store(n, Relaxed);
+            UW_MAX_DST.store(dst, Relaxed);
+        }
     }
     copy_to_user(dst, src.as_ptr(), src.len())
 }
