@@ -608,7 +608,23 @@ pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
     // which the next driver kill frees again - the chaos double-free (a driver's BAR freed on every
     // kill, e.g. phys 0xFEB6C000 seen repeating in the T630 log). The DMA arena is cacheable (x86 DMA
     // is cache-coherent), so it has neither bit and is reclaimed normally below.
-    const UNCACHED: u64 = (1 << 3) | (1 << 4); // PWT | PCD (PageFlags)
+    //
+    // AMENDED 2026-08-29: the test is `PCD`, not `PCD && PWT`, and requiring BOTH was a real hole.
+    // The framebuffer grant is mapped PCD **without** PWT on x86 - deliberately, because strong-UC
+    // (PCD|PWT) cost 596 ms per console scroll on the Wyse and UC- (PCD alone) lets the firmware's
+    // write-combining MTRR apply. So a PERFORMANCE fix silently disarmed this guard, and the
+    // `console` service's 31.6 MiB framebuffer was freed into the RAM pool on every one of its deaths.
+    // Measured on the Wyse after `chaos max-carnage`: 315392 double-frees, all in
+    // 0x90000000..0x91f97000 (exactly 3840x2160x4), and `free_frames` 6666 ABOVE `total_frames`.
+    //
+    // The deeper lesson is why the two-bit form was wrong in the first place: cache bits are a PROXY
+    // for "this is device memory", and a proxy can be changed by someone optimising something else,
+    // who has no reason to know a safety check reads it. Any uncached leaf is not an allocator RAM
+    // frame here (the DMA arena is cacheable on x86 and is reclaimed normally, as below), so keying
+    // on PCD alone is both correct and harder to break by accident. The allocator now ALSO refuses
+    // these frames outright - see `allocator::reserve_no_free` - because a guard on the walker is a
+    // guard in one place, and the resource itself is where this belongs.
+    const UNCACHED: u64 = 1 << 4; // PCD (PageFlags) - any uncached leaf, not just strong-UC
 
     // Free INLINE during the walk - no fixed-size collection buffer. The old `ReclaimBuffer`
     // (capacity 512) SILENTLY DROPPED every frame past 512, so any task mapping more than ~2 MiB
@@ -625,7 +641,7 @@ pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
                     let pte = unsafe { read_entry(pt_phys, pt_i) };
                     if entry_present(pte) {
                         // Skip device MMIO (uncached BAR) - not an allocator frame, must not be freed.
-                        if pte & UNCACHED == UNCACHED { continue; }
+                        if pte & UNCACHED != 0 { continue; }
                         // SAFETY: leaf data frame of this dead task, post-shootdown; not read again.
                         unsafe { free_phys_frame(entry_phys(pte)); }
                         freed += 1;

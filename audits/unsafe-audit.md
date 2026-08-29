@@ -2377,7 +2377,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 15 | permitted |
 | capability/table.rs | 7 | permitted |
-| memory/allocator.rs | 45 | permitted |
+| memory/allocator.rs | 46 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
@@ -3081,6 +3081,24 @@ clock able to name the 125 us microframe the USB driver must hit. Each is measur
 history rather than asserted.
 
 ---
+
+## Framebuffer reservation (2026-08-29) - `memory/allocator.rs` 45 -> 46
+
+`reserve_no_free` records a physical range the allocator must never return to the free pool, using the
+same table and the same refusal as a DMA arena. Its one `unsafe` is the `&mut ALLOCATOR` under
+`alloc_lock()` inside `without_interrupts`, exactly as `alloc_dma_arena` above it does.
+
+Why it is needed. The framebuffer is DEVICE memory that the kernel MAPS into the `console` service, so
+the kill-path reclaim walks it like any other leaf and frees it. That inflates `free_frames` past
+`total_frames` and - far worse - marks the display's pages allocatable, so a later task can be handed
+the framebuffer as ordinary RAM. Measured on the Wyse after `chaos max-carnage`: 315392 double-frees,
+every one inside 0x90000000..0x91f97000 (exactly 3840x2160x4), and free 6666 frames above total.
+
+The walker DID have a guard for precisely this, and it names the hazard in its own comment. It tested
+`PCD && PWT`, and the framebuffer is mapped PCD-only on x86 so the firmware's write-combining MTRR
+applies - the 596 ms -> 29 ms console fix. A performance change disarmed a safety check, because the
+check inferred "device memory" from cache bits. The guard is now `PCD` alone AND repeated at the
+resource, where how something is mapped cannot affect it.
 
 ## Pi 4 shell-fault instruments (2026-08-28 / 29) - REMOVED, and what they actually found
 

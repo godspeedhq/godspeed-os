@@ -595,6 +595,57 @@ pub fn phys_in_ram(phys: u64) -> bool {
     unsafe { idx < ALLOCATOR.max_ram_frame }
 }
 
+/// Reserve a physical range the allocator must NEVER hand back to the free pool.
+///
+/// The same table and the same refusal as a DMA arena, for a range the allocator did not hand out in
+/// the first place: the FRAMEBUFFER. It is device memory that the kernel MAPS into the `console`
+/// service, so the kill-path reclaim walks it like any other leaf and frees it - which both inflates
+/// `free_frames` past `total_frames` and, far worse, marks the display's pages allocatable, so a later
+/// task can be handed the framebuffer as ordinary RAM.
+///
+/// The walker has a guard for exactly this, and it was disarmed by a change nowhere near it: it tested
+/// PCD **and** PWT, and the framebuffer is mapped PCD-only on x86 so the firmware's write-combining
+/// MTRR applies (the 596 ms -> 29 ms console fix). Measured on the Wyse after `chaos max-carnage`:
+/// 315392 double-frees, all inside 0x90000000..0x91f97000 - exactly 3840x2160x4 - and `free_frames`
+/// 6666 above `total_frames`.
+///
+/// So the guard is repeated HERE, where it cannot be disarmed by how something is mapped. Returns
+/// false if the table is full (reported loudly) and true if the range is reserved or already covered.
+pub fn reserve_no_free(phys: u64, n: usize) -> bool {
+    if n == 0 { return true; }
+    let base = (phys / FRAME_SIZE) as usize;
+    // IRQ-safe, and the same discipline as `alloc_dma_arena`: ALLOC_LOCKED is taken in interrupt
+    // context too, so the lock is held with interrupts masked.
+    let ok = crate::smp::without_interrupts(|| {
+        alloc_lock();
+        // SAFETY: lock held; single writer across all cores.
+        let a = unsafe { &mut *core::ptr::addr_of_mut!(ALLOCATOR) };
+        let mut done = false;
+        for &(b, len) in a.dma_reserves.iter() {
+            if len != 0 && base >= b && base + n <= b + len {
+                done = true; // already covered - idempotent, so a re-grant is not a second slot
+                break;
+            }
+        }
+        if !done {
+            for slot in a.dma_reserves.iter_mut() {
+                if slot.1 == 0 {
+                    *slot = (base, n);
+                    done = true;
+                    break;
+                }
+            }
+        }
+        alloc_unlock();
+        done
+    });
+    if ok { return true; }
+    crate::kprintln!(
+        "reserve_no_free: reservation table full ({}) - {:#x}+{} frames NOT protected; a kill-path          reclaim can free it into the RAM pool",
+        MAX_DMA_RESERVES, phys, n);
+    false
+}
+
 /// DIAGNOSTIC: is `phys` inside a device's DMA arena, or within `slack` frames of one?
 ///
 /// Returns `(hit, distance_in_frames)` where `hit` means the frame IS reserved for DMA.

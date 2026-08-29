@@ -4351,6 +4351,17 @@ fn spawn_service_with_config(
                         flags |= PageFlags::PWT;
                     }
                     let pages = g.len.div_ceil(PAGE_SIZE as u64);
+                    // The framebuffer is DEVICE memory the kernel is about to map into a service.
+                    // The kill-path reclaim walks a dead task's leaves and frees them, so without a
+                    // reservation the display's pages go into the RAM free pool the first time
+                    // `console` dies - inflating the free count past the total AND making the
+                    // framebuffer allocatable, so a later task can be handed the screen as RAM.
+                    //
+                    // The walker has a guard for this, keyed on the mapping being uncached, and it
+                    // was disarmed by a change nowhere near it (see `reserve_no_free`). Reserving the
+                    // range here puts the refusal on the RESOURCE, where how it is mapped cannot
+                    // affect it. Idempotent, so a console respawn does not consume a second slot.
+                    crate::memory::allocator::reserve_no_free(g.phys, pages as usize);
                     for i in 0..pages {
                         let off = i * PAGE_SIZE as u64;
                         page_table
