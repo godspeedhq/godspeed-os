@@ -932,6 +932,10 @@ pub struct TaskStatRaw {
     pub queue_depth: u8,
     pub run_ticks:   u64,
     pub uptime_secs: u64,
+    /// The endpoint this task OWNS (0 = none). Already read here to compute `queue_depth`; exposing it
+    /// costs nothing and is what lets a reader map an awaited endpoint back to the task that owns it,
+    /// which is the whole of the blocked-chain walk (`utilities/46_trace.md`).
+    pub endpoint:    u64,
 }
 
 /// Return a best-effort snapshot of task state at `slot`.
@@ -941,7 +945,8 @@ pub struct TaskStatRaw {
 pub fn task_stat(slot: usize) -> TaskStatRaw {
     if slot >= MAX_TASKS {
         return TaskStatRaw { valid: false, state: 0, core: 0, mem_used: 0, mem_limit: 0,
-                             name: "", restart_count: 0, queue_depth: 0, run_ticks: 0, uptime_secs: 0 };
+                             name: "", restart_count: 0, queue_depth: 0, run_ticks: 0, uptime_secs: 0,
+                             endpoint: 0 };
     }
     // SAFETY: read-only snapshot of static arrays; all reads are individually
     // naturally-atomic on x86_64 (u64/u32/pointer-width). Best-effort consistency
@@ -987,6 +992,8 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
                     (crate::arch::imp::rtc::now_epoch_monotonic().max(0) as u64).saturating_sub(spawn)
                 }
             },
+            // Already loaded above to compute `queue_depth` - exposing it costs no extra read.
+            endpoint: endpoint.map_or(0, |ep| ep.0),
         }
     }
 }

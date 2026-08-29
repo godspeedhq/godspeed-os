@@ -349,7 +349,32 @@ service_configs = [
 # nothing else, so without this it invents an address - and the invented one is hardcoded, hence
 # identical on every board running this system. The alternative is granting that service a second,
 # far wider MMIO window for one identity fact, which is more authority for less honesty.
-introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23]
+#
+# 24 + 25 (the blocked-chain reader, `utilities/46_trace.md`) answer the same question, and 25 answers
+# it on impossibility - the same bar as 23.
+#
+# 25 is the endpoint a task is blocked-in-CALL awaiting a reply from. It lives in
+# `ipc::routing::CALL_AWAIT_EP`, written under the routing lock, and it exists for CORRECTNESS: a dead
+# replier finds its blocked caller through it and wakes it with `ReplyDead` (8.6). **No service can
+# ever observe it.** A service could only learn that a task is stuck if the task told it - and a task
+# that is stuck is, by definition, the one thing that cannot. That is not inconvenience, it is
+# impossibility, so the kernel is the only place the answer can come from.
+#
+# 24 is the endpoint a task OWNS, which turns "awaiting endpoint 7" into "awaiting fs". It is the same
+# class as `task_stat` (another task's state, INTROSPECT-gated, already pinned) and returns a field
+# `task_stat` ALREADY loads to compute queue_depth - it is disclosure of an existing read, not a new
+# one. The alternative was widening the 80-byte TaskStat wire format, which changes an ABI every
+# caller depends on: more churn, identical disclosure.
+#
+# What it buys: the chain of who-awaits-whom IS the causal chain of a stuck system, so "why is this
+# task not progressing?" becomes a walk of state the kernel already keeps, with NO event ring, no
+# switch, no message ids, and no cost when unused (nothing runs until asked). The rejected alternative
+# was a trace buffer written on the IPC fast path - genuinely new kernel state and cost - which
+# `utilities/46_trace.md` records as mechanism B, deliberately not built.
+#
+# Neither query changes what the kernel DOES. Both are read-only, both are INTROSPECT-gated by falling
+# outside the ungated list, and the system behaves identically whether anything reads them or not.
+introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25]
 # Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
 # legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
 # before it builds, and classifying one honestly as a device driver fails the build - which is the

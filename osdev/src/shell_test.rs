@@ -451,6 +451,56 @@ pub fn run(image_path: &Path, smp: u32) {
         }
     }
 
+    // -------------------------------------------------------------------
+    // trace - the IPC blocked-chain reader (utilities/46_trace.md)
+    //
+    // It reads kernel state that already exists and records nothing, so the assertions that
+    // matter are that it RESOLVES: a chain must name the task holding the endpoint awaited,
+    // and a healthy machine must SAY so rather than answer with an empty table.
+    // -------------------------------------------------------------------
+    send(&mut write_half, b"trace version\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("trace 0."), "trace: version reports (conventions rule 5)"),
+        None => { println!("shell-test: FAIL - timed out after `trace version`"); fail += 1; }
+    }
+
+    send(&mut write_half, b"trace help\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("trace blocked") && r.contains("trace task"),
+                          "trace: help lists its subcommands (conventions rules 1+6)"),
+        None => { println!("shell-test: FAIL - timed out after `trace help`"); fail += 1; }
+    }
+
+    // Healthy machine: either a table of genuinely-blocked tasks, or the explicit "nothing is
+    // blocked" line. An EMPTY response is the failure - a question met with silence.
+    send(&mut write_half, b"trace blocked\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("no task is blocked") || r.contains("awaiting"),
+                          "trace blocked: answers, never silent"),
+        None => { println!("shell-test: FAIL - timed out after `trace blocked`"); fail += 1; }
+    }
+
+    // The shell is running (it is executing this), so it must report as such, not as stuck.
+    send(&mut write_half, b"trace service shell\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("task ") && r.contains("shell"),
+                          "trace service: resolves a name to its task and prints the chain"),
+        None => { println!("shell-test: FAIL - timed out after `trace service shell`"); fail += 1; }
+    }
+
+    send(&mut write_half, b"trace service nosuchsvc\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("no live task named"), "trace service: unknown name refused loudly"),
+        None => { println!("shell-test: FAIL - timed out after `trace service nosuchsvc`"); fail += 1; }
+    }
+
+    // Rule 3: `help` is the word; anything else is `unknown:`, which teaches the real word.
+    send(&mut write_half, b"trace -h\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("unknown: trace"), "trace: -h is unknown, not a hidden synonym"),
+        None => { println!("shell-test: FAIL - timed out after `trace -h`"); fail += 1; }
+    }
+
     // -----------------------------------------------------------------------
     // status
     // -----------------------------------------------------------------------

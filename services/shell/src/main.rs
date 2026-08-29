@@ -781,7 +781,7 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 /// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
-    "wait", "watch", "whatis", "busiest", "random", "gpio",
+    "wait", "watch", "whatis", "busiest", "random", "gpio", "trace",
 ];
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
@@ -792,6 +792,7 @@ const NO_PATH_CMDS: &[&str] = &[
 /// `<util> version` / `<util> help`), so they are NOT listed here.
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
+    ("trace",   &["blocked", "task", "service"]),
     ("busiest", &["mem", "restarts", "queue"]),
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
@@ -1596,6 +1597,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "version" => cmd_version_os(ctx, out),
         "mem"     => cmd_mem(ctx, out),
         "cores"   => cmd_cores(ctx, if argc >= 2 { args[1] } else { "" }, out),
+        "trace"   => cmd_trace(ctx, s["trace".len()..].trim()),
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "net"     => cmd_net(ctx, s["net".len()..].trim(), out),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
@@ -4128,6 +4130,12 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "help" => help_block(ctx, "help", "list all commands (or get help on one)", &[
             ("help", "the full categorised command list", "help"),
             ("<command> help", "usage + examples for one command", "status help"),
+        ], true),
+        "trace" => help_block(ctx, "trace", "why is this task not progressing? (reads kernel IPC state; records nothing)", &[
+            ("trace blocked", "every task blocked on another task, and who holds what it awaits", "trace blocked"),
+            ("trace task <slot>", "the chain rooted at one task, as a tree", "trace task 7"),
+            ("trace service <name>", "the same chain, rooted by service name", "trace service fs"),
+            ("trace version", "the utility version", "trace version"),
         ], true),
         "result" => help_block(ctx, "result", "show the previous command's result (Ok / Err)", &[
             ("result", "Ok if the last command succeeded, else Err(<reason>)", "result"),
@@ -6724,6 +6732,193 @@ fn cmd_roster(ctx: &ServiceContext) -> Result<(), ShellError> {
             Err(ShellError::Unknown)
         }
     }
+}
+
+/// Version of the `trace` utility (`utilities/46_trace.md`), reported by `trace version`.
+const TRACE_VERSION: &str = "0.1.0";
+/// Task slots to scan. Matches the other slot-scanning commands in this file.
+const TRACE_SLOTS: u32 = 256;
+
+/// `trace` - why is this task not progressing? (`utilities/46_trace.md`)
+///
+/// **A READER, not a tracer.** It records nothing, enables nothing, and has no switch, because every
+/// fact it prints is state the kernel already keeps for CORRECTNESS: `CALL_AWAIT_EP` exists so a dead
+/// replier wakes its caller with `ReplyDead` (8.6), and the chain of who-awaits-whom IS the causal
+/// chain of a stuck system. So the cost when unused is zero - nothing runs until asked - and no kernel
+/// responsibility is added: introspection over IPC state, both already inside MISCIS (4.3).
+///
+/// What it deliberately does NOT do: interpret a message. The kernel sees an opaque byte array, so
+/// this prints `awaiting endpoint 7`, never `fs.read("/etc/config")`. Naming an operation is protocol
+/// knowledge and belongs to the service that owns the protocol (4.4, 26.10).
+fn cmd_trace(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+    let mut it = arg.split_whitespace();
+    let sub = it.next().unwrap_or("");
+    let rest = it.next().unwrap_or("");
+    match sub {
+        "" | "help" => { util_help(ctx, "trace"); Ok(()) }
+        "version" => {
+            ctx.console_writeln_fmt(format_args!("trace {}", TRACE_VERSION));
+            Ok(())
+        }
+        "blocked" => trace_blocked(ctx),
+        "task" => match rest.parse::<u32>() {
+            Ok(slot) => trace_chain(ctx, slot),
+            _ => {
+                ctx.console_writeln("trace task: needs a task slot, e.g. `trace task 7`");
+                Err(ShellError::Unknown)
+            }
+        },
+        "service" => {
+            if rest.is_empty() {
+                ctx.console_writeln("trace service: needs a service name, e.g. `trace service fs`");
+                return Err(ShellError::Unknown);
+            }
+            match trace_slot_of_name(ctx, rest) {
+                Some(slot) => trace_chain(ctx, slot),
+                None => {
+                    ctx.console_writeln_fmt(format_args!("trace service: no live task named '{}'", rest));
+                    Err(ShellError::Unknown)
+                }
+            }
+        }
+        _ => {
+            ctx.console_writeln_fmt(format_args!("unknown: trace {}", sub));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+/// The first live task with this name, or `None`.
+fn trace_slot_of_name(ctx: &ServiceContext, want: &str) -> Option<u32> {
+    for slot in 0..TRACE_SLOTS {
+        let s = ctx.task_stat(slot);
+        if !s.valid { continue; }
+        if &s.name[..s.name_len.min(31)] == want.as_bytes() { return Some(slot); }
+    }
+    None
+}
+
+/// The live task owning `endpoint`, or `None` if nothing owns it - which is itself the answer when a
+/// task awaits an endpoint whose service has died and not yet come back.
+fn trace_owner_of(ctx: &ServiceContext, endpoint: u64) -> Option<u32> {
+    if endpoint == 0 { return None; }
+    for slot in 0..TRACE_SLOTS {
+        let s = ctx.task_stat(slot);
+        if !s.valid { continue; }
+        if ctx.task_own_endpoint(slot) == endpoint { return Some(slot); }
+    }
+    None
+}
+
+/// How a task is stuck, as one word. `call` is the interesting one: blocked in a synchronous CALL with
+/// the awaited endpoint recorded, which is what makes the chain walkable at all.
+fn trace_block_kind(state: u8, awaits: u64) -> &'static str {
+    if awaits != 0 { return "call"; }
+    match state {
+        2 => "recv",
+        3 => "send",
+        _ => "-",
+    }
+}
+
+/// `trace blocked` - every task blocked on another task, as a record table (so it pipes).
+fn trace_blocked(ctx: &ServiceContext) -> Result<(), ShellError> {
+    let mut t = Table::new(&["slot", "name", "blocked", "awaiting", "held_by"]);
+    let mut n = 0u32;
+    for slot in 0..TRACE_SLOTS {
+        let s = ctx.task_stat(slot);
+        if !s.valid { continue; }
+        let awaits = ctx.task_awaits_endpoint(slot);
+        // A task blocked on RECV with nothing awaited is IDLE, not stuck - it is waiting for work,
+        // which is what a healthy service does all day. Listing those would bury the handful that
+        // matter under every service on the machine.
+        if awaits == 0 && s.state != 3 { continue; }
+        let name = t.intern(&s.name[..s.name_len.min(31)]);
+        let kind = t.intern(trace_block_kind(s.state, awaits).as_bytes());
+        let held = match trace_owner_of(ctx, awaits) {
+            Some(o) => {
+                let h = ctx.task_stat(o);
+                t.intern(&h.name[..h.name_len.min(31)])
+            }
+            None if awaits != 0 => t.intern(b"NO LIVE OWNER"),
+            None => t.intern(b"-"),
+        };
+        t.add_row(&[Value::Int(slot as u64), name, kind, Value::Int(awaits), held]);
+        n += 1;
+    }
+    if n == 0 {
+        ctx.console_writeln("no task is blocked on another task.");
+        return Ok(());
+    }
+    { let mut o = Out::Console; t.to_grid(&mut OutSink { ctx, out: &mut o }); }
+    if t.overflow() {
+        ctx.console_writeln_fmt(format_args!("trace: more than {} rows shown (bounded)", REC_MAX_ROWS));
+    }
+    Ok(())
+}
+
+/// `trace task <slot>` / `trace service <name>` - the chain rooted at one task, as a tree.
+///
+/// Walks `awaited endpoint -> owning task -> what IT awaits`. Bounded two ways, because a stuck system
+/// is precisely where an unbounded walk would hang: a depth cap, and a repeat-visit check that names
+/// the cycle. 8.9 says the kernel does not detect deadlock - so a cycle surfacing HERE, in an operator
+/// tool, is exactly where it belongs.
+fn trace_chain(ctx: &ServiceContext, root: u32) -> Result<(), ShellError> {
+    let s = ctx.task_stat(root);
+    if !s.valid {
+        ctx.console_writeln_fmt(format_args!("trace: slot {} holds no live task", root));
+        return Err(ShellError::Unknown);
+    }
+    let mut seen = [u32::MAX; 16];
+    let mut nseen = 0usize;
+    let mut cur = root;
+    let mut depth = 0usize;
+    loop {
+        let st = ctx.task_stat(cur);
+        if !st.valid { break; }
+        let awaits = ctx.task_awaits_endpoint(cur);
+        let name = core::str::from_utf8(&st.name[..st.name_len.min(31)]).unwrap_or("?");
+        let pad = [b' '; 48];
+        let ind = (depth * 3).min(pad.len());
+        let indent = core::str::from_utf8(&pad[..ind]).unwrap_or("");
+        ctx.console_writeln_fmt(format_args!(
+            "{}{}task {} \"{}\" {} ({})",
+            indent, if depth > 0 { "`- " } else { "" }, cur, name, st.state_str(),
+            trace_block_kind(st.state, awaits)));
+
+        if awaits == 0 {
+            let runnable = st.state == 0 || st.state == 1;
+            ctx.console_writeln_fmt(format_args!(
+                "{}   root: awaits no task - {}", indent,
+                if runnable { "it is runnable, so the chain is not stuck here" }
+                else { "blocked on its own endpoint, waiting for work" }));
+            break;
+        }
+        ctx.console_writeln_fmt(format_args!("{}   awaiting endpoint {}", indent, awaits));
+
+        let next = match trace_owner_of(ctx, awaits) {
+            Some(nx) => nx,
+            None => {
+                ctx.console_writeln_fmt(format_args!(
+                    "{}   root: endpoint {} has NO LIVE OWNER - the peer died; this task wakes with ReplyDead",
+                    indent, awaits));
+                break;
+            }
+        };
+        if seen[..nseen].contains(&next) {
+            ctx.console_writeln_fmt(format_args!(
+                "{}   CYCLE: task {} is already in this chain - these tasks await each other (8.9)",
+                indent, next));
+            break;
+        }
+        if nseen < seen.len() { seen[nseen] = cur; nseen += 1; } else {
+            ctx.console_writeln_fmt(format_args!("{}   (chain longer than {} - stopping)", indent, seen.len()));
+            break;
+        }
+        cur = next;
+        depth += 1;
+    }
+    Ok(())
 }
 
 fn cmd_status(ctx: &ServiceContext) -> Result<(), ShellError> {

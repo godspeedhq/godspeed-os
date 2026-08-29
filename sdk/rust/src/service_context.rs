@@ -1611,6 +1611,28 @@ impl ServiceContext {
         if ret < 0 { 0 } else { ret as u64 }
     }
 
+    /// The endpoint task `slot` OWNS, or 0 if it owns none (InspectKernel query 24, INTROSPECT).
+    ///
+    /// With [`Self::task_awaits_endpoint`] this is the whole of the blocked-chain walk: map the
+    /// endpoint a stuck task awaits back to the task that owns it, then ask what THAT one awaits.
+    /// See `utilities/46_trace.md`.
+    pub fn task_own_endpoint(&self, slot: u32) -> u64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=24 = the task's own endpoint.
+        let ret = unsafe { raw_syscall(13, 24, slot as u64, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
+    /// The endpoint task `slot` is blocked-in-CALL awaiting a reply from, or 0 if no call is in
+    /// flight (InspectKernel query 25, INTROSPECT).
+    ///
+    /// A best-effort snapshot, on the same contract as [`Self::task_stat`]: the kernel reads it
+    /// without taking the routing lock, so an observer cannot stall the thing it observes.
+    pub fn task_awaits_endpoint(&self, slot: u32) -> u64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=25 = the endpoint awaited in a CALL.
+        let ret = unsafe { raw_syscall(13, 25, slot as u64, 0) };
+        if ret < 0 { 0 } else { ret as u64 }
+    }
+
     /// The wall-clock datetime captured by the kernel at **boot** (InspectKernel query 12, ungated).
     /// Same packed layout as `datetime`. Pairs with `datetime` to compute uptime as a wall-clock
     /// delta - portable across timer modes (a tick counter's rate is not: periodic-mode QEMU ticks

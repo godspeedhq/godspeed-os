@@ -1,6 +1,8 @@
 # `trace` - observing IPC call chains
 
-**Status:** DESIGN, for review. No code written.
+**Status:** **Mechanism A BUILT** (`trace blocked` / `task` / `service`), QEMU-verified, 6 checks in
+`osdev test shell`. Mechanism B (the event ring) is DESIGNED AND DELIBERATELY NOT BUILT - see §8.
+**Version:** 0.1.0
 **Pins:** §4.3 (kernel scope = the six), §4.4 (anti-scope), §8 (IPC), §8.6 (failure semantics),
 §26.4 (no silent complexity), §26.6 (bounded), §26.10 (mechanism not policy), invariant 12 (loud).
 **Conventions:** `utilities/0_conventions.md` §1.
@@ -257,6 +259,45 @@ more than a column.
    disabled path unchanged.
 
 ---
+
+## 8a. As built (mechanism A)
+
+What it cost, end to end:
+
+| Layer | Change |
+|---|---|
+| `ipc/routing.rs` | one safe reader, `call_await_endpoint` - no `unsafe`, `ipc/` stays unsafe-free |
+| `task/scheduler.rs` | `TaskStatRaw.endpoint`, populated from a value `task_stat` **already loaded** for `queue_depth` |
+| `syscall/dispatch.rs` | two match arms (queries 24, 25), INTROSPECT-gated by falling outside the ungated list |
+| `sdk` | two wrappers |
+| `shell` | `cmd_trace` + completion + `NO_PATH_CMDS` |
+
+**No new kernel state, no new kernel behaviour, no switch, and nothing on the IPC fast path.**
+
+The enforcement layer caught the queries and refused the build until they were pinned with a written
+answer to "why isn't this a service?" - which is the guard working as intended, and the answer is now
+in `COMMANDMENTS.baseline.toml` beside the pin. The short form: query 25 passes on **impossibility**
+(a task that is stuck is precisely the one that cannot tell a service it is stuck, so the kernel is
+the only possible source), and 24 is disclosure of a read `task_stat` already performs.
+
+Verified in QEMU (`osdev test shell`, 136/0/2):
+
+```
+gsh> trace blocked
+no task is blocked on another task.
+gsh> trace service shell
+task 7 "shell" Running (-)
+   root: awaits no task - it is runnable, so the chain is not stuck here
+gsh> trace service nosuchsvc
+trace service: no live task named 'nosuchsvc'
+```
+
+**What is NOT yet proven, stated plainly:** the multi-hop walk. A healthy machine has nothing blocked,
+so the runs above exercise the queries, the name resolution, the refusal and the conventions - but the
+chain never got longer than one hop, because there was no stuck chain to walk. Proving it needs a
+DELIBERATELY blocked chain (a service made to not reply while a caller waits), and until that test
+exists the walk is code that compiles and has not been watched doing its job. That is the next commit,
+not a footnote.
 
 ## 9. Open questions for review
 
