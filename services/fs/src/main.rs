@@ -3492,6 +3492,11 @@ impl BlockReply {
     }
 }
 
+/// Latch for the one-shot stack-depth report inside `block_rpc`. Owned by this service and touched
+/// nowhere else, in the same shape `xhci` uses for `PROBE_FAILS`.
+static STACK_DEPTH_REPORTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     // BOUNDED, on the LEAN await. The undeadlined form wakes only on the peer's DEATH, so a
     // block-driver that is alive but silent hung `fs` permanently and every shell command behind it.
@@ -3538,10 +3543,21 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     treq[1..1 + rn].copy_from_slice(&req[..rn]);
     let treq = &treq[..1 + rn];
 
-    // MEASURED HERE, at the deepest point of the request path, and only on the superblock read -
-    // OP_READ_BLOCK of LBA 0, which happens once per mount. No state to own, no flood, and it is the
-    // frame that actually matters: this is where the stack ran out five times.
-    if req.len() >= 9 && req[0] == OP_READ_BLOCK && req[1..9].iter().all(|b| *b == 0) {
+    // MEASURED HERE, at the deepest point of the request path, on the superblock read - it is the
+    // frame that actually matters, because this is where the stack ran out five times.
+    //
+    // ONCE PER LIFETIME, and the latch is a correction. This comment used to claim the line fires
+    // "once per mount. No state to own, no flood" - and the hardware log showed 175 of them in one
+    // boot, because LBA 0 is read far more often than a mount. Each is ~60 bytes on a 115200 serial
+    // port, and the keystroke echo does a SYNCHRONOUS polled write to that same port, so the flood
+    // was measurably delaying typing (25% of all serial traffic during an interactive window).
+    //
+    // A claim about frequency is a claim that can be wrong, and this one was. What is wanted is the
+    // deepest frame, which one reading gives; repeating it adds nothing and costs the keyboard.
+    if !STACK_DEPTH_REPORTED.load(core::sync::atomic::Ordering::Relaxed)
+        && req.len() >= 9 && req[0] == OP_READ_BLOCK && req[1..9].iter().all(|b| *b == 0)
+    {
+        STACK_DEPTH_REPORTED.store(true, core::sync::atomic::Ordering::Relaxed);
         ctx.log_fmt(format_args!(
             "fs: stack used at the deepest block call = {} of {} bytes",
             ctx.stack_used(), 256 * 1024));

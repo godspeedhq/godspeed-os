@@ -2200,6 +2200,9 @@ fn enumerate_one(
     ev_cycle: &mut u32,
     cmd_idx: &mut usize,
     hc_wedged: &mut bool,
+    // Whether the one-shot ring-state dump has already been printed. See its declaration, above
+    // `'reenum` - a latch reset by the re-enumeration it reports is not a latch.
+    diag_dumped: &mut bool,
 ) {
     *hc_wedged = false;
     let portsc_off = op + OP_PORTSC_BASE + (port as usize - 1) * 0x10;
@@ -2267,7 +2270,10 @@ fn enumerate_one(
             ctx.log("xhci: Enable Slot - no completion");
             // The FIRST command on a fresh controller. If this one gets no completion, nothing about
             // the DMA side has ever been proven, so dump it rather than guess (see `dump_ring_state`).
-            dump_ring_state(ctx, dma, mmio, op, ir0, cmd_off, *ev_idx, *ev_cycle);
+            if !*diag_dumped {
+                *diag_dumped = true;
+                dump_ring_state(ctx, dma, mmio, op, ir0, cmd_off, *ev_idx, *ev_cycle);
+            }
             *hc_wedged = hc_wedged_now(ctx, mmio, op);
             sa.free(dev_idx);
             return;
@@ -3062,6 +3068,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // reach two, which is the exact fault `hub_tried` had.
     let mut hub_seen: [u8; 64] = [0; 64];
     let mut hub_tried: u64 = 0;
+    // Ring-state dump: ONCE per driver lifetime, and ABOVE `'reenum` for the same reason every
+    // other latch here is - a latch reset by the re-enumeration it reports is not a latch.
+    //
+    // The dump exists to tell three causes of a "no completion" apart on a FRESH controller, and
+    // one dump answers that. It was firing on every failure instead: on the Wyse, ports 6/10/15
+    // report connected at SuperSpeed and never address, so each pass printed the ~200-character
+    // diagnosis several times over. Measured during interactive typing, `xhci` was 61% of ALL
+    // serial traffic - and the keystroke echo does a SYNCHRONOUS polled UART write, so it stalls
+    // behind every one of those lines. The failure itself is still reported loudly every time;
+    // only the fixed explanatory dump is said once (26.7 - visible failure, bounded output).
+    let mut diag_dumped = false;
     let mut hub_posted: u64 = 0;
     let mut hub_ok: u64 = 0;
     let mut hub_late: u64 = 0;
@@ -3267,6 +3284,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     &mut ev_cycle,
                     &mut cmd_idx,
                     &mut hc_wedged,
+                    &mut diag_dumped,
                 );
                 if hc_wedged {
                     ctx.log_fmt(format_args!(
