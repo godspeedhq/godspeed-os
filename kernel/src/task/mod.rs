@@ -4076,6 +4076,13 @@ fn spawn_service_with_config(
                 reply_recv_slot_u32 = u32::MAX;
             }
         }
+        } else {
+            // REFUSED, so give the id back. The allocation happened before the registration could
+            // fail, and without this an id vanished on every refusal - the same leak the death path
+            // had, on the path that runs precisely when the table is under pressure and can least
+            // afford it. The task simply awaits replies on its shared endpoint, as it did before
+            // reply endpoints existed.
+            crate::ipc::free_endpoint_id(reply_ep_id);
         }
 
         // Wire hw_interrupt lines to this endpoint (§12.3).

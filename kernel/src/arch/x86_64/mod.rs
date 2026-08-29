@@ -721,7 +721,23 @@ pub fn com2_try_read_byte() -> Option<u8> {
 // COM1 UART RX - interrupt-driven ring buffer for the shell service.
 // ---------------------------------------------------------------------------
 
-const COM1_RX_BUF_SIZE: usize = 64;
+/// Bytes the console input ring holds.
+///
+/// SIZED TO ONE FULL COMMAND LINE (the shell's `MAX_LINE`, 256), and that derivation is the point:
+/// the reader is a line-oriented shell, so the ring must survive the reader being busy for exactly
+/// as long as one command takes. At 64 it did not - a line longer than 64 bytes typed or pasted
+/// while the shell was still finishing the previous command lost its tail, including the CARRIAGE
+/// RETURN, so the next command silently joined the mangled line. That is what `osdev test files`
+/// was failing on: 40 checks red from ONE dropped byte.
+///
+/// aarch64 has been 256 since its ring was written (`arch/aarch64/uart_rx.rs`); x86 was the
+/// inconsistent one, exactly as it was for the drop COUNTER a few commits ago. Same file, same
+/// lesson twice: a bound must be derived from what the reader consumes, not picked.
+///
+/// The bound is still a bound (26.6) - 256 bytes of .bss, fixed, and an overflow beyond it is still
+/// counted and reported below (invariant 12). A busier reader can still lose a byte; it can no
+/// longer lose one to a single ordinary command line.
+const COM1_RX_BUF_SIZE: usize = 256;
 
 /// Single-producer (IRQ handler) / single-consumer (ConsoleRead syscall) ring buffer.
 /// head = read index (consumer advances), tail = write index (producer advances).

@@ -2782,6 +2782,16 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL - ls after fs-storm timeout"); fail += 1; }
     }
 
+    // Save the whole transcript. A check that fails here used to leave NOTHING to look at - the
+    // harness printed a label and threw the serial away, so the first move on any failure was to
+    // reproduce the whole run by hand. Same treatment `shell-test` already gives itself.
+    {
+        let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        let _ = std::fs::create_dir_all("build/tests");
+        let _ = std::fs::write("build/tests/files_serial.log", whole.as_bytes());
+        println!("files-test: serial saved to build/tests/files_serial.log");
+    }
+
     child.kill().ok();
     child.wait().ok();
     println!("\nfiles-test: {pass} passed, {fail} failed");

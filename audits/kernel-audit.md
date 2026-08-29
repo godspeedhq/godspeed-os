@@ -1512,3 +1512,67 @@ be one `--features` away in a shipped kernel.
   bounded on the cycle counter rather than an iteration count - the "a count is not a duration"
   lesson applied correctly.
 - **No new syscall** was added on this branch, so the cap-gate surface is unchanged.
+
+---
+
+## Audit 9 - the reply-endpoint id leak, found by BS5 (2026-08-29, `feat/trace`)
+
+Not a sweep. One bug, found by running a suite that had been red long enough to be assumed flaky, and
+recorded here because the shape of it is worth keeping.
+
+### K9-1 (HIGH, FIXED) - a spawn took TWO endpoint ids and a death gave ONE back
+
+`kernel/src/task/scheduler.rs` (death path) and `kernel/src/task/mod.rs` (spawn path).
+
+Every task gets a primary receive endpoint and an optional reply-only endpoint, each with an id from
+`ipc::alloc_endpoint_id`. The death path reclaimed the primary (`free_endpoint_id(ep_id)`) and never
+the reply one; the spawn path leaked the reply id outright when `try_register_optional` refused it.
+So every restart leaked one id, and a sustained restart storm marched the monotonic counter into the
+delegated/file-cap band, where the guard did exactly what it was written to do:
+
+```
+KERNEL PANIC: endpoint id space exhausted (reached the delegated/file-cap band at 4096)
+```
+
+**A userspace restart storm panicked the kernel** - the one outcome nothing above the kernel is
+allowed to cause. Reproduced by `osdev test stress` BS5 (5000 kill/respawn cycles), which died at
+~1744.
+
+Two things are worth separating here. The reclaim itself was written deliberately, with a comment
+naming this exact failure ("without this the id counter only climbs and a sustained restart storm
+exhausts the band and panics") - and it was still only half done, because the reply endpoint was
+added later and the reclaim was not revisited. **A resource that is allocated in two places must be
+freed in two places**, and the review question that catches it is not "is this freed?" but "is every
+allocation site matched?".
+
+The second is that the bound WORKED. The counter had a guard, the guard was loud, and it named the
+band it hit - which is why this was a two-minute diagnosis from a log line rather than an
+investigation. The failure mode a silent version of this produces is an id handed out twice.
+
+Fixed by reclaiming the reply id on death (safe to free immediately - the ordering care the primary
+needs is about the NAME directory, and a reply endpoint has no name) and on refusal.
+
+### K9-2 (MEDIUM, FIXED) - the console input ring was sized below one command line
+
+`kernel/src/arch/x86_64/mod.rs`, `COM1_RX_BUF_SIZE = 64`, against a reader whose line buffer is 256.
+
+A line longer than 64 bytes typed or pasted while the shell was finishing the previous command lost
+its tail, including the CARRIAGE RETURN, so the next command silently joined the mangled line. This
+is what `osdev test files` had been failing on - 40 checks red from one dropped byte. aarch64 has
+been 256 since its ring was written; x86 was the inconsistent one, exactly as it was for the drop
+COUNTER a few commits earlier. Sized to `MAX_LINE`, which is the derivation: the ring must survive
+the reader being busy for as long as one command takes.
+
+The drop was already counted and reported (that counter was added a few commits before this), and
+that report is the entire reason this was findable - the transcript said `console input ring FULL`
+one line before the mangled command. An instrument added for one bug paid for itself on the next.
+
+### K9-3 (LOW, FIXED) - two stress probes asked a question a dead service cannot answer
+
+`services/probe/src/main.rs`, S4 and BS4. Both killed the victim and THEN read its endpoint
+generation by name - but death unregisters the name (`names::unregister_endpoint`, the
+post-max-carnage fix), so the lookup misses and the query returns 0. The checks compared 0 against
+the previous generation and failed for a reason that has nothing to do with generations; they only
+ever passed by winning a race against the death path. Fixed by reading while the instance is alive,
+between the spawn and the kill - which is also the stronger question, and the one §7.5 actually makes
+a claim about. §22.4: a test failing for the wrong reason is a failure of the test.

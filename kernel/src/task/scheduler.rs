@@ -2048,6 +2048,19 @@ pub fn kill_task_by_slot(slot: usize) {
             crate::capability::table::mark_dead_resource(
                 crate::capability::cap::ResourceId::from(rep_id));
             TASK_REPLY_ENDPOINT[slot].store(0, Ordering::Relaxed);
+            // RECLAIM THE ID, exactly as the primary endpoint's is reclaimed below. Without this a
+            // spawn took TWO ids and a death gave ONE back, so every restart leaked one id and a
+            // sustained restart storm marched the counter into the delegated/file-cap band and
+            // PANICKED the kernel - which is the one thing nothing above the kernel may cause.
+            // Found by BS5 (5000 kill/respawn cycles), which died at ~1744 with
+            // "endpoint id space exhausted". The bound existed and was loud; what was missing was
+            // the other half of the reclaim it was guarding.
+            //
+            // Unlike the primary, this id is safe to free RIGHT HERE: the ordering care taken below
+            // is about the NAME directory, and a reply endpoint has no name. `kill_endpoint` has
+            // already marked its routing entry Dead and bumped its generation, so a reused id is
+            // seeded strictly above it and a stale cap still fails (14.2, 7.5).
+            crate::ipc::free_endpoint_id(rep_id);
         }
 
         if let Some(ep_id) = task_ep {
