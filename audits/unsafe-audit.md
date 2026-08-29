@@ -2327,7 +2327,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mod.rs | 68 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
-| arch/aarch64/exceptions.rs | 24 | permitted |
+| arch/aarch64/exceptions.rs | 25 | permitted |
 | arch/aarch64/uaccess.rs | 11 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
@@ -2335,7 +2335,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/gic.rs | 7 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 23 | permitted |
-| arch/aarch64/ptables.rs | 31 | permitted |
+| arch/aarch64/ptables.rs | 32 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
@@ -3164,6 +3164,22 @@ protected, and neither the shell's control print (a different page) nor its firs
 at the array's ends) says anything about that page. If it is already dirty at arming, the experiment is
 void and says so.
 
+### Framebuffer memory type (2026-08-29) - not a diagnostic, a fix
+
+`arch/aarch64/ptables.rs` 31 -> 32 (+1), and it is the only one here that is permanent rather than an
+instrument. The framebuffer grant reaches the `console` service as an MMIO grant (`PCD|PWT`), which
+AArch64 faithfully translates to **Device-nGnRnE** - the type that forbids gathering, buffering and
+reordering. That is right for device registers and wrong for a framebuffer, which is RAM the display
+controller scans out: it makes every 4-byte pixel an individually-acknowledged bus transaction, measured
+at 582 ms for one 1920x1080 repaint (about 14 MB/s). `task/mod.rs` has said "Normal NON-cacheable" in a
+comment since the grant was written; the code did not do it, because MAIR had no such slot.
+
+The new `unsafe` is a clean-and-invalidate of the page at the moment the alias is created. Handing a
+page to a non-cacheable mapping while the kernel still maps it cacheable through the direct map is a
+mismatched-attribute alias, which the ARM ARM leaves UNPREDICTABLE; the concrete hazard is a dirty line
+left from the boot console evicting later on top of what the terminal has since drawn - a display that
+corrupts itself seconds after a handover that looked clean. Flushing at the alias point removes it.
+
 ### The hole in my own scan (2026-08-29, third run)
 
 The third run came back valid on every precondition - guard page INTACT at arm time, descriptor
@@ -3182,6 +3198,18 @@ the address space, and the cross-task scan skipped this address space by constru
 `find_all_pa_diag` (ptables 29 -> 31) counts EVERY VA in a root that maps a given frame, and the dump
 now runs it on the faulting task's own root first. `exceptions.rs` 23 -> 24 for the call. Two or more
 VAs is the answer; one rules the hypothesis out.
+
+It came back **1**. So self-aliasing is out, and with it every CPU path: a read-only page written with
+no permission fault, one VA in one address space, no other address space mapping the frame, an
+allocator that has lost nothing, and zero kernel writes overlapping it. The writer is a device.
+
+`exceptions.rs` 24 -> 25 adds the instrument that follows from that. A device does not write "a stack";
+it writes a PHYSICAL RANGE whose size and alignment come from the transfer that produced it. The dump
+now measures the contiguous 0x20 run in physical memory around the frame - 512 bytes is a disk sector,
+1536/2048 a network frame buffer, a page or more a bulk transfer - which is what turns "a device did it"
+into "which device". It also settles whether the damage stops at the shell's stack or runs through it
+into neighbouring frames. Bounded to +/-2 MiB, every address checked against the RAM map before it is
+read.
 
 `find_pa_diag` walks the TABLES rather than probing every VA deliberately: probing the 2 GiB user range
 a page at a time is half a million walks per address space, and on a machine with ~180 live tasks that

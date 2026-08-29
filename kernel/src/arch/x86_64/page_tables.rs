@@ -554,6 +554,11 @@ bitflags::bitflags! {
         const USER      = 1 << 2;
         const PWT       = 1 << 3; // page write-through - for uncached MMIO (§12)
         const PCD       = 1 << 4; // page cache-disable - for uncached MMIO (§12)
+        // A framebuffer, not device registers: RAM the display controller scans out. Each arch
+        // picks the weakest type that is still coherent without cache maintenance - on AArch64
+        // Normal Non-cacheable, which gathers and buffers writes where Device-nGnRnE cannot. An
+        // arch that has nothing better may ignore it and keep its uncached-MMIO type.
+        const WRITE_COMBINE = 1 << 5;
         const NO_EXEC   = 1 << 63;
     }
 }

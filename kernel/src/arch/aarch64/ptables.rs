@@ -44,6 +44,8 @@ const DESC_PXN: u64 = 1 << 53;
 const DESC_UXN: u64 = 1 << 54;
 const ATTR_NORMAL: u64 = 1 << 2; // AttrIndx = 1 (MAIR slot 1), matching mmu.rs
 const ATTR_DEVICE: u64 = 0; // AttrIndx = 0 (MAIR slot 0) = Device-nGnRnE, matching mmu.rs
+/// AttrIndx = 2 (MAIR slot 2) = Normal Non-cacheable, matching mmu.rs. The framebuffer's type.
+const ATTR_NORMAL_NC: u64 = 2 << 2;
 
 const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
@@ -156,6 +158,20 @@ impl PageTable {
             // mapping - `unmap` is that. Refusing is louder than installing an invalid descriptor.
             return Err(MapError::NotMapped);
         }
+        // WRITE_COMBINE wins over PCD/PWT: it says the region is a FRAMEBUFFER - RAM the display
+        // controller scans out - not device registers. The faithful AArch64 type for that is Normal
+        // Non-cacheable, which still gathers and buffers writes. Device-nGnRnE, which PCD/PWT selects,
+        // forbids exactly that, making each 4-byte pixel its own acknowledged bus transaction.
+        if flags.contains(PageFlags::WRITE_COMBINE) {
+            return self.map_raw_attr(
+                virt.0,
+                phys.0,
+                flags.contains(PageFlags::USER),
+                flags.contains(PageFlags::WRITABLE),
+                !flags.contains(PageFlags::NO_EXEC),
+                ATTR_NORMAL_NC,
+            );
+        }
         let device = flags.contains(PageFlags::PCD) || flags.contains(PageFlags::PWT);
         self.map_raw(
             virt.0,
@@ -171,6 +187,39 @@ impl PageTable {
     pub fn map_raw(&mut self, virt: u64, phys: u64, user: bool, writable: bool, exec: bool, device: bool)
         -> Result<(), MapError>
     {
+        self.map_raw_attr(virt, phys, user, writable, exec,
+                          if device { ATTR_DEVICE } else { ATTR_NORMAL })
+    }
+
+    /// As [`PageTable::map_raw`], but naming the memory attribute outright instead of a device/normal
+    /// boolean. There are three memory types here, not two, and a boolean can only ever express two.
+    pub fn map_raw_attr(&mut self, virt: u64, phys: u64, user: bool, writable: bool, exec: bool, attr: u64)
+        -> Result<(), MapError>
+    {
+        let device = attr == ATTR_DEVICE;
+        // Handing a page to a NON-CACHEABLE mapping while the kernel still maps it CACHEABLE through
+        // the direct map is a mismatched-attribute alias, which the ARM ARM leaves UNPREDICTABLE. The
+        // concrete hazard is a dirty line left over from the boot console being evicted later, on top
+        // of whatever the terminal has since drawn - a display that corrupts itself seconds after a
+        // handover that looked clean. Clean-and-invalidate the page here, at the moment the alias is
+        // created, so the cacheable side holds nothing to write back.
+        if attr == ATTR_NORMAL_NC {
+            // SAFETY: cache maintenance by VA over one page reached through the kernel's direct map,
+            // which covers all of low physical memory. `dc civac` alters no architectural state beyond
+            // the caches; the `dsb` orders it before the new mapping is used.
+            unsafe {
+                let ctr: u64;
+                core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
+                let dline = 4u64 << ((ctr >> 16) & 0xF);
+                let start = super::mmu::KERNEL_VA_BASE + (phys & ADDR_MASK);
+                let mut a = start & !(dline - 1);
+                while a < start + 4096 {
+                    core::arch::asm!("dc civac, {}", in(reg) a, options(nostack));
+                    a += dline;
+                }
+                core::arch::asm!("dsb ish", options(nostack));
+            }
+        }
         let l1i = idx(virt, 1);
         // SAFETY: `self.root` is this table's live L1.
         let l1e = unsafe { get(self.root, l1i) };
@@ -221,7 +270,7 @@ impl PageTable {
         let mut e = if device {
             (phys & ADDR_MASK) | DESC_PAGE | DESC_AF | ATTR_DEVICE | DESC_UXN | DESC_PXN
         } else {
-            (phys & ADDR_MASK) | DESC_PAGE | DESC_AF | DESC_SH_INNER | ATTR_NORMAL
+            (phys & ADDR_MASK) | DESC_PAGE | DESC_AF | DESC_SH_INNER | attr
         };
         if user {
             e |= DESC_AP_EL0;

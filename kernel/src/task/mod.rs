@@ -4337,7 +4337,15 @@ fn spawn_service_with_config(
                         | PageFlags::WRITABLE
                         | PageFlags::USER
                         | PageFlags::NO_EXEC
-                        | PageFlags::PCD;
+                        | PageFlags::PCD
+                        // This is a FRAMEBUFFER - RAM the display controller scans out - not device
+                        // registers, and saying so is what lets an arch pick the right memory type.
+                        // AArch64 was mapping it Device-nGnRnE (the faithful reading of PCD|PWT), which
+                        // forbids the gathering and buffering a bulk pixel write depends on: one
+                        // 1920x1080 repaint measured 582 ms, about 14 MB/s, which is the slow and
+                        // jittery rendering reported from the television. An arch with nothing better
+                        // ignores this bit and keeps its uncached-MMIO type, so x86 is unchanged.
+                        | PageFlags::WRITE_COMBINE;
                     #[cfg(not(target_arch = "x86_64"))]
                     {
                         flags |= PageFlags::PWT;

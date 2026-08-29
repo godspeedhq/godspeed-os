@@ -1376,6 +1376,45 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
                     mapped_n += 1;
                     if crate::memory::allocator::frame_is_free(pa) == Some(true) { lost += 1; }
                 }
+                // HOW BIG IS THE WRITE, IN PHYSICAL TERMS?
+                //
+                // Every CPU explanation is now exhausted by measurement, so the writer is a device. A
+                // device does not write "a stack" - it writes a physical range, of a size and alignment
+                // that come from the transfer that produced it. Measuring that range is what turns "a
+                // device did it" into "which device": a 512-byte run is a disk sector, 1536 or 2048 is
+                // a network frame buffer, a page or more is a bulk transfer. It also settles whether
+                // the damage stops at the shell's stack (it would, if the target were chosen from the
+                // shell's own address) or runs straight through it into neighbouring frames.
+                //
+                // Walked through the direct map, bounded to +/-2 MiB, and every address checked against
+                // the RAM map before it is read.
+                {
+                    const LIMIT: u64 = 2 * 1024 * 1024;
+                    let base = super::mmu::KERNEL_VA_BASE;
+                    let mut lo = gpa + 0x800;
+                    let mut hi = gpa + 0x800;
+                    // SAFETY: reads through the kernel's direct map of RAM, each address confirmed to
+                    // be RAM by `phys_in_ram` before the read. Read-only, on the fatal-fault path.
+                    unsafe {
+                        while lo > gpa.saturating_sub(LIMIT)
+                            && crate::memory::allocator::phys_in_ram(lo - 1)
+                            && core::ptr::read_volatile((base + lo - 1) as *const u8) == 0x20
+                        { lo -= 1; }
+                        while hi < gpa + LIMIT
+                            && crate::memory::allocator::phys_in_ram(hi)
+                            && core::ptr::read_volatile((base + hi) as *const u8) == 0x20
+                        { hi += 1; }
+                    }
+                    super::put_str(b"\r\n    the 0x20 run in PHYSICAL memory: ");
+                    super::put_hex(lo);
+                    super::put_str(b" .. ");
+                    super::put_hex(hi);
+                    super::put_str(b" = ");
+                    super::put_dec(hi - lo);
+                    super::put_str(b" bytes, start aligned to ");
+                    super::put_dec(if lo == 0 { 0 } else { 1u64 << lo.trailing_zeros().min(20) });
+                    super::put_str(b" bytes");
+                }
                 super::put_str(b"\r\n    stack frames marked FREE while mapped: ");
                 super::put_dec(lost as u64);
                 super::put_str(b" of ");
