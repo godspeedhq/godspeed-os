@@ -48,7 +48,16 @@ cursor and scrolling are the userspace `console` SERVICE (`docs/console-service.
 only a minimal blit that draws plain ASCII and discards escapes. Where the framebuffer is ALSO granted
 to that service, the arch must map it Normal **non-cacheable** to match the service's own mapping - ARM
 leaves mismatched memory attributes for one physical page UNPREDICTABLE (`arch/arm/mmu.rs::section_fb`).
-An arch that maps it cacheable simply does not grant it, and renders through the floor (the Pi 4 today).
+The AArch64 mapper collapsed `PCD || PWT` to the **Device** attribute, which is right for registers
+and wrong for a framebuffer: Device-nGnRnE forbids the gathering and buffering a bulk pixel write
+depends on, and one 1920x1080 repaint measured **582 ms** (~14 MB/s) on the Pi 4 - slow enough that
+`selfcheck` never reached its end. A neutral `PageFlags::WRITE_COMBINE` now says what the region IS
+(a framebuffer, not registers) so each arch picks its own type; AArch64 maps it Normal
+non-cacheable via MAIR slot 2, and arm32 already did the right thing (`PCD|PWT` -> Normal-NC).
+An arch with nothing better ignores the bit and keeps its uncached-MMIO type, which is why x86 is
+unchanged. **The framebuffer is also RESERVED in the allocator** (`reserve_no_free`): it is device
+memory the kernel MAPS into a service, so the kill-path reclaim would otherwise free it into the
+RAM pool - see that function for the measurement that found it.
 
 For the **first milestone** of a new arch - boot the neutral kernel and print to a UART - the surface
 is far smaller: a `_start`, minimal CPU/stack setup, and a byte-out to the platform's serial device.
