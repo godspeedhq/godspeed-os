@@ -292,12 +292,28 @@ gsh> trace service nosuchsvc
 trace service: no live task named 'nosuchsvc'
 ```
 
-**What is NOT yet proven, stated plainly:** the multi-hop walk. A healthy machine has nothing blocked,
-so the runs above exercise the queries, the name resolution, the refusal and the conventions - but the
-chain never got longer than one hop, because there was no stuck chain to walk. Proving it needs a
-DELIBERATELY blocked chain (a service made to not reply while a caller waits), and until that test
-exists the walk is code that compiles and has not been watched doing its job. That is the next commit,
-not a footnote.
+**The multi-hop walk is proven** - `osdev test trace`, 10/10. A healthy machine has nothing blocked, so
+that test builds a chain that IS stuck: the reply-test build already has `asker` send `reply-server` a
+request it is built never to answer, then block in a synchronous `Call`. No new service and no new
+build feature were needed - the situation already existed, and had only ever been used to prove the
+death-wake. Read live, mid-block:
+
+```
+gsh> trace blocked
+slot  name   blocked  awaiting  held_by
+9     asker  call     116       reply-server
+
+gsh> trace service asker
+task 9 "asker" BlockRecv (call)
+   awaiting endpoint 116
+   `- task 8 "reply-server" BlockRecv (recv)
+      root: awaits no task - blocked on its own endpoint, waiting for work
+```
+
+That is the question answered in three lines: asker is stuck in a call on endpoint 116, reply-server
+holds it, and reply-server is not waiting on anyone - it is sitting on its own endpoint. The endpoint
+-> owner resolution across tasks is the part one hop can never demonstrate, and it is what this test
+exists for. `reply-dead` still passes 5/5, so reading a stuck chain changes nothing about it.
 
 ## 9. Open questions for review
 

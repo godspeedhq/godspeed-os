@@ -1315,6 +1315,7 @@ fn cmd_test(suite: &str) {
         "counter"      => run_counter_test(),
         "reply-server" => run_reply_server_test(),
         "reply-dead"   => run_reply_dead_test(),
+        "trace"        => run_trace_chain_test(),
         "resource-server" => run_resource_server_test(),
         "fs-check"     => run_fs_check_test(),
         "fs-scrub"     => run_fs_scrub_test(),
@@ -2461,6 +2462,25 @@ fn run_reply_server_test() {
 /// answers (b"HANG") and blocks for the reply; the harness KILLs `reply-server` while asker is blocked
 /// and asserts asker wakes with `ReplyDead` (`request_with_reply` -> None) instead of hanging - the
 /// reply-side twin of §22 Test 4 (a blocked sender wakes with `EndpointDead`). No panic.
+/// `trace` against a REAL blocked chain (`utilities/46_trace.md`, mechanism A).
+///
+/// The multi-hop walk is the one thing a healthy machine cannot prove: with nothing blocked, the
+/// chain never gets past one hop and the endpoint-to-owner resolution is never exercised. This reuses
+/// the reply-test build, where `asker` sends `reply-server` a request it never answers and blocks in
+/// a synchronous `Call` - a deterministically stuck chain - then reads it with `trace`.
+fn run_trace_chain_test() {
+    println!("
+=== trace: reading a REAL blocked chain (utilities/46_trace.md mechanism A) ===");
+    cmd_build_reply();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    crate::shell_test::run_trace_chain(&image_path, 4);
+}
+
 fn run_reply_dead_test() {
     println!("\n=== reply-dead: a blocked caller wakes with ReplyDead on peer death, never hangs (§8.6, VIII) ===");
     cmd_build_reply();

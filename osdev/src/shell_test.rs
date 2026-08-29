@@ -3341,6 +3341,129 @@ pub fn run_reply_server(image_path: &Path, smp: u32) {
 /// THE PROOF is asker logging `HANG woke with no reply ... (ReplyDead recovered)` AFTER the server was
 /// killed while it was demonstrably blocked (server logged it withheld the reply first). No hang, no
 /// panic. This is the reply-side twin of §22 Test 4 (a blocked *sender* wakes with `EndpointDead`).
+/// `trace` against a REAL blocked chain (`utilities/46_trace.md` mechanism A).
+///
+/// Everything else about `trace` can be checked on a healthy machine, but the thing that matters -
+/// the multi-hop walk - cannot: a healthy machine has nothing blocked, so the chain never gets past
+/// one hop and the endpoint-to-owner resolution is never exercised. This test creates a genuinely
+/// stuck chain and looks at it.
+///
+/// It needs no new service and no new build feature, because the reply-test build already contains
+/// exactly the situation: `asker` sends `reply-server` a request it is built never to answer
+/// (`b"HANG"`), then blocks in a synchronous `Call` awaiting a reply that will never come. That is a
+/// task stuck on another task, deterministically, for as long as we care to look.
+///
+/// THE PROOFS:
+///   1. `trace blocked` NAMES asker as blocked, with a non-zero awaited endpoint - the state the
+///      kernel keeps in `CALL_AWAIT_EP` for the reply-side death-wake (§8.6) is readable.
+///   2. It resolves that endpoint to `reply-server` - the endpoint-to-owner mapping works ACROSS
+///      tasks, which is the whole of the walk and is what one hop can never demonstrate.
+///   3. `trace service asker` prints the chain as a tree, naming the same peer.
+///   4. `trace service reply-server` shows the far end waiting for work, not stuck on anyone - so the
+///      walk terminates on a fact rather than running off the end.
+/// Then the machine is killed; nothing here changes system behaviour, which is the point of a reader.
+pub fn run_trace_chain(image_path: &Path, smp: u32) {
+    let sc = crate::qemu::timeout_scale();
+    println!("trace: booting (smp={smp}) bare-metal + reply-server + asker; the HANG request makes a real blocked chain");
+    let qemu       = crate::qemu::qemu_binary();
+    let image_str  = image_path.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+    let ctrl_port  = pick_free_port();
+
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  &format!("tcp::{ctrl_port},server,nowait"),
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("trace: QEMU launch failed at {qemu}: {e}"); std::process::exit(1); });
+
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => {
+            eprintln!("trace: could not connect to serial {shell_port}");
+            child.kill().ok();
+            std::process::exit(1);
+        }
+    };
+    let mut write_half = stream.try_clone().expect("clone tcp stream");
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    let mut cursor = 0usize;
+    macro_rules! check {
+        ($ok:expr, $label:expr) => {
+            if $ok { println!("trace: PASS - {}", $label); pass += 1; }
+            else { println!("trace: FAIL - {}", $label); fail += 1; }
+        };
+    }
+
+    // Wait for the chain to actually exist. Asserting on it before `reply-server` has withheld its
+    // reply would be testing a race, and a test that can pass for the wrong reason is worse than none.
+    check!(collect_until(&buf, &mut cursor, b"asker: sending HANG", Duration::from_secs(90 * sc)).is_some(),
+           "setup: asker sent the request that is never answered");
+    check!(collect_until(&buf, &mut cursor, b"reply-server: HANG received", Duration::from_secs(30 * sc)).is_some(),
+           "setup: reply-server withheld its reply - asker is now genuinely blocked");
+
+    // PROOF 1 + 2: the blocked table names the stuck task AND resolves what it waits on to a peer.
+    send(&mut write_half, b"trace blocked\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20 * sc)) {
+        Some(r) => {
+            check!(r.contains("asker"), "trace blocked: names the blocked task");
+            check!(r.contains("reply-server"),
+                   "trace blocked: RESOLVES the awaited endpoint to the task holding it (the walk)");
+            check!(r.contains("call"), "trace blocked: reports it as blocked in a CALL");
+        }
+        None => { println!("trace: FAIL - timed out on `trace blocked`"); fail += 3; }
+    }
+
+    // PROOF 3: the same relationship as a tree, rooted by service name.
+    send(&mut write_half, b"trace service asker\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20 * sc)) {
+        Some(r) => {
+            check!(r.contains("asker"), "trace service asker: roots the tree at the named task");
+            check!(r.contains("awaiting endpoint"), "trace service asker: names the endpoint awaited");
+            check!(r.contains("reply-server"), "trace service asker: walks the hop to the peer");
+        }
+        None => { println!("trace: FAIL - timed out on `trace service asker`"); fail += 3; }
+    }
+
+    // PROOF 4: the far end of the chain terminates on a fact. reply-server is not stuck on anyone -
+    // it is sitting on its own endpoint, which is what a service waiting for work looks like.
+    send(&mut write_half, b"trace service reply-server\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20 * sc)) {
+        Some(r) => check!(r.contains("awaits no task"),
+                          "trace service reply-server: the walk TERMINATES on a fact, not off the end"),
+        None => { println!("trace: FAIL - timed out on `trace service reply-server`"); fail += 1; }
+    }
+
+    let whole = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    check!(!whole.contains("KERNEL PANIC"), "no kernel panic while reading a stuck chain");
+    let _ = std::fs::write("build/tests/trace_serial.log", whole.as_bytes());
+
+    child.kill().ok();
+    child.wait().ok();
+    println!("\ntrace: {pass} passed, {fail} failed");
+    if fail > 0 { std::process::exit(1); }
+}
+
 pub fn run_reply_dead(image_path: &Path, smp: u32) {
     let sc = crate::qemu::timeout_scale();
     println!("reply-dead: booting (smp={smp}) bare-metal + reply-server + asker; logs on COM1, control on COM2");
