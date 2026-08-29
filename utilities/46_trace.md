@@ -315,15 +315,103 @@ holds it, and reply-server is not waiting on anyone - it is sitting on its own e
 -> owner resolution across tasks is the part one hop can never demonstrate, and it is what this test
 exists for. `reply-dead` still passes 5/5, so reading a stuck chain changes nothing about it.
 
+## 8b. As built (mechanism B) - the ring is a SERVICE, and the kernel gained nothing
+
+Section 6 above designed the ring **inside the kernel** and asked whether that was worth it. It was
+not, and the answer arrived from the question "why can't the trace be a service?". It can, and the
+service version is strictly better - so what shipped is not the design in §6. That section is kept as
+ratified history: it is the reasoning that had to be worked through to see why it was wrong.
+
+**What changed, and why each change is an improvement rather than a compromise:**
+
+| §6 proposed (in the kernel) | As built (in userspace) |
+|---|---|
+| ring in kernel `.bss` | a fixed array in the `logger` service |
+| `sender`/`receiver` task slots | the peer's **NAME**, because the emitter knows it |
+| `endpoint` + `generation` | not recorded - the name is what a reader wanted the endpoint to resolve to |
+| kernel-assigned `message_id` | not assigned; see `trace tree`, still out of scope |
+| a switch + `AtomicBool` on the IPC fast path | **nothing on the IPC path at all** |
+| a control syscall to arm/read it | ordinary IPC to a service |
+| `first_byte`, opaque to the kernel (§7's uncertainty) | `op`, interpreted by the service that OWNS the protocol - so §7's dilemma simply does not arise |
+
+**The peer is a name, and that is the whole reason this belongs out here.** The kernel may not know
+what a message means (§4.4, §26.10), so a kernel ring could only ever have recorded `endpoint 116,
+op 11` and left the reader to resolve it. The emitter called `request_with_reply("fs", ...)`: it
+already holds the name, and putting the name in the event is what produces the symbolic output the
+requirement asked for. The constraint the constitution imposes and the feature the requirement wanted
+point the same way - which is usually the sign the design is right.
+
+(The first attempt was a `tracer` service of its own. The enforcement layer refused it, correctly: the
+kernel holds a `service_config` per service, pinned as debt that may only shrink, so even a userspace
+ring would have cost ring 0 three lines. `logger` is already in every one of those lists and its whole
+purpose is diagnostic data, so the ring there costs the kernel **exactly zero**.)
+
+**Layers touched:**
+
+| Layer | Change |
+|---|---|
+| `sdk/rust/src/trace.rs` | wire format (18 B: seq, at_s, peer[12], op, kind), lazy one-time arming |
+| `sdk/rust/src/service_context.rs` | `trace_emit`; three emission points in `request_with_reply` |
+| `services/logger/src/main.rs` | the 192-event ring, dump + status replies |
+| `services/shell/src/main.rs` | `trace ipc`, `trace failures`, `trace status` |
+| **kernel** | **nothing** |
+
+**Cost when not tracing: one `Relaxed` load, branch not taken** - and nothing at the routing point, so
+`B1`/`B2` cannot move. A service traces only if its contract granted it `ipc_send = ["logger"]`, so
+tracing is **authority**: visible in `caps <service>`, revocable, absent by default (§3.1). §6 asked
+for a benchmark before shipping a switch on the fast path; there is no switch and no fast-path write,
+so the thing that needed measuring does not exist.
+
+**Bounded and loud (§26.6, invariant 12):** fixed ring, fixed events, no heap. Full = overwrite the
+oldest and **count it**; `trace status` reports the count. Emission is `try_send` with the result
+discarded, so a full logger queue costs the emitter nothing and loses one event - the right trade on
+an observability path, and the opposite of the one made on a correctness path. An observer must never
+be able to slow, block or break the thing it observes.
+
+**The reader is not recorded.** A call to `logger` itself is never traced: `trace ipc` reaches the ring
+by asking the service that holds it, so tracing those calls would fill the ring with the reader's own
+questions, two per dump, pushing out the traffic the reader came to see. Every other peer is still
+recorded and `trace status` still counts every accepted event, so nothing is hidden.
+
+**Time is shown relative to the oldest event in the dump.** The stored value is an epoch second; the
+absolute number says nothing on its own, and the **gap** between events is what a stall looks like.
+
+Verified in QEMU (`osdev test shell`, 140/0/2 - 10 of them `trace`):
+
+```
+gsh> trace status
+trace: ring 192 events; 2 recorded; 0 DROPPED (oldest overwritten before being read)
+trace: the ring lives in the `logger` service - the kernel records nothing.
+gsh> trace ipc
+seq  t+s  peer       op  event
+0    0    net-stack  2   REQUEST
+1    0    net-stack  2   REPLY
+```
+
+Real traffic, named, with no kernel involvement of any kind.
+
+**Still out of scope, unchanged:** `trace tree <message-id>` needs parent-id propagation through every
+service's request path (§6, and `docs/net-tags-design.md` describes the same problem for
+net-stack <-> nic-driver). It is not made easier or harder by this; it is simply not built.
+
+---
+
 ## 9. Open questions for review
 
 1. **Is mechanism B wanted at all**, given A answers the stated question? B is where all the kernel
-   growth is.
-2. **`op`/`first_byte`** (§7) - record it, or refuse it on principle?
-3. **Ring size**, if built. The log ring is 16 KiB; 32-byte events make 512 events per 16 KiB. At the
-   IPC rates chaos produces, that is a fraction of a second of history - which may be exactly right for
-   "what just happened", and useless for anything else. Worth deciding deliberately rather than picking
-   a number.
+   growth is. **ANSWERED: yes, and with zero kernel growth** - it is a service (§8b). The question
+   that resolved it was "why can't the trace be a service?", and every objection to B was really an
+   objection to B *being in the kernel*.
+2. **`op`/`first_byte`** (§7) - record it, or refuse it on principle? **ANSWERED: the dilemma
+   dissolved.** The recorder is the service that owns the protocol, and a service is entitled to
+   interpret its own messages. Nothing privileges a convention inside the kernel, because the kernel
+   is not involved.
+3. **Ring size**, if built. **ANSWERED: 192 events (~4 KiB) in `logger`.** Sized for "what just
+   happened", which is the question a stalled chain asks - deliberately not for "what happened a
+   minute ago", which needs either a much larger ring or filtering at the emitter, and
+   filtering-in-the-middle is the first step toward putting a programmable VM where it does not
+   belong. If longer history is ever wanted, the honest answer is a bigger arena HERE, costing one
+   service more memory and the kernel nothing.
 4. **`FOR` (blocked duration)** needs a per-task blocked-since stamp. One `u64` per task, written on
    block and cleared on wake - two stores on a path that already does several. Acceptable, or is the
    duration column not worth it?

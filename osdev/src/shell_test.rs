@@ -501,6 +501,27 @@ pub fn run(image_path: &Path, smp: u32) {
         None => { println!("shell-test: FAIL - timed out after `trace -h`"); fail += 1; }
     }
 
+    // The event ring, which lives in `logger` - not the kernel, and not a service of its own.
+    // The shell itself holds the emit cap, so simply having run commands should have filled it.
+    send(&mut write_half, b"trace status\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => {
+            check!(r.contains("ring 192 events"), "trace status: reports the ring capacity");
+            check!(r.contains("DROPPED"), "trace status: reports drops (a silent loss is the bug, invariant 12)");
+            check!(r.contains("the kernel records nothing"), "trace status: says where the ring lives");
+        }
+        None => { println!("shell-test: FAIL - timed out after `trace status`"); fail += 3; }
+    }
+
+    // Events must actually be RECORDED - the shell has been making fs/console calls all along.
+    send(&mut write_half, b"trace ipc\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("REQUEST") || r.contains("REPLY"),
+                          "trace ipc: the ring recorded real request/reply traffic"),
+        None => { println!("shell-test: FAIL - timed out after `trace ipc`"); fail += 1; }
+    }
+
+
     // -----------------------------------------------------------------------
     // status
     // -----------------------------------------------------------------------

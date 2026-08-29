@@ -227,7 +227,8 @@ mod datetime_tests {
 
 const SERVICE_CTX_ADDR:    u64   = 0x3ff000;
 const SERVICE_CTX_MAGIC:   u32   = 0xD0_5D_EA_D5;
-const MAX_SEND_PEERS:      usize = 4;
+/// MUST match `kernel::task::MAX_SEND_PEERS` - this indexes the kernel-written context page.
+const MAX_SEND_PEERS:      usize = 6;
 const PEER_NAME_BYTES:     usize = 24;
 
 #[repr(C)]
@@ -291,7 +292,7 @@ struct ServiceContextData {
 // Pinned by SIZE in both crates. It does not prove field ORDER, but it catches the mistake that
 // actually happens - an append on one side only - and it fails at compile time in the crate that
 // drifted rather than at boot in a service that reads garbage.
-const SERVICE_CONTEXT_DATA_SIZE: usize = 256;
+const SERVICE_CONTEXT_DATA_SIZE: usize = 320;   // 256 + 2 x SendPeerEntry(32) after MAX_SEND_PEERS 4 -> 6
 const _: () = assert!(
     core::mem::size_of::<ServiceContextData>() == SERVICE_CONTEXT_DATA_SIZE,
     "ServiceContextData changed size: update BOTH kernel/src/task/mod.rs and      sdk/rust/src/service_context.rs, then update SERVICE_CONTEXT_DATA_SIZE in both"
@@ -742,6 +743,45 @@ impl ServiceContext {
     /// instead of hanging it forever - no timer, no fixed yield count. On any failure (send failed,
     /// or `ReplyDead`) this returns `None`, so a caller like `fs`'s `block_rpc` reacquires the peer
     /// by name and retries exactly as it does for a failed send.
+    /// Emit one trace event, or do nothing at all.
+    ///
+    /// The whole cost when this service is not tracing is the `enabled()` load and a not-taken
+    /// branch. When it IS tracing, the send is `try_send` and its result is DISCARDED on purpose: an
+    /// observer must never be able to slow, block, or fail the thing it observes. A full logger queue
+    /// loses one event, which the ring counts and `trace status` reports - a visible loss, not a
+    /// silent one (invariant 12).
+    ///
+    /// Recursion is cut at the source: `logger` itself holds no `logger` send cap, so the sink cannot trace
+    /// its own sends, and no event can beget another.
+    #[inline]
+    fn trace_emit(&self, peer: &str, op: u8, kind: u8) {
+        // Arm lazily, ONCE. A service is handed a context with no init hook to run in, so there is
+        // nowhere else to resolve from. A service whose contract does not grant `ipc_send =
+        // ["logger"]` records `u32::MAX` here and never looks again: one relaxed load per call for the
+        // rest of its life, which is the cost the untraced majority pays.
+        if !crate::trace::resolved() {
+            crate::trace::set_sink_slot(self.find_send_slot(crate::trace::SINK_NAME).unwrap_or(u32::MAX));
+        }
+        let slot = crate::trace::sink_slot();
+        if slot == u32::MAX {
+            return;
+        }
+        // Do NOT record a call to the SINK ITSELF. The `trace` utility reads the ring by asking
+        // `logger` for it, so tracing that call would fill the ring with the reader's own questions -
+        // each dump adding two more events, pushing out the traffic the reader came to see. An
+        // instrument that mostly measures itself is not measuring anything. This hides nothing: every
+        // OTHER peer is still recorded, and `trace status` still counts every event accepted.
+        if peer == crate::trace::SINK_NAME {
+            return;
+        }
+        // Milliseconds are not available portably; seconds-since-boot is, on every arch (§ the
+        // `observe` clock note). Truncated to u32, which wraps after ~136 years of uptime.
+        let at = self.epoch_secs_monotonic() as u32;
+        let ev = crate::trace::encode(at, peer, op, kind);
+        let _ = self.try_send_by_handle(CapHandle(slot), &crate::ipc::Message::from_bytes(&ev));
+    }
+
+
     pub fn request_with_reply(
         &self,
         peer: &str,
@@ -751,9 +791,19 @@ impl ServiceContext {
         let self_grant = self.self_grant_handle()?;
         let reply_cap = self.derive_cap(self_grant)?;
         let recv = self.recv_handle()?;
+        // TRACE: the request going out, and below, how it ended. One relaxed load when this service
+        // holds no `logger` send cap (see `crate::trace`). `op` is byte 0 of OUR OWN message - this service
+        // is entitled to interpret its own protocol, and the kernel is not, which is precisely why the
+        // instrumentation lives here rather than at the routing point (§4.4, §26.10).
+        let op0 = msg.payload_bytes().first().copied().unwrap_or(0);
+        self.trace_emit(peer, op0, crate::trace::KIND_REQUEST);
         match crate::ipc::call(target, reply_cap, recv, msg) {
-            Ok(reply) => Some(reply),
+            Ok(reply) => {
+                self.trace_emit(peer, op0, crate::trace::KIND_REPLY);
+                Some(reply)
+            }
             Err(_) => {
+                self.trace_emit(peer, op0, crate::trace::KIND_PEER_LOST);
                 // Send failed (dead endpoint) or the peer died before replying (ReplyDead): the
                 // embedded reply cap may not have been transferred, so reclaim it (remove_cap is
                 // idempotent if the kernel already moved it out on a successful send). Without this, a

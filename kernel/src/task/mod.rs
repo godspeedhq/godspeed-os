@@ -225,7 +225,14 @@ const XHCI_DMA_PAGES:      u64 = 32 + 256 + 4;
 const EHCI_DMA_PAGES:      u64 = 16;
 
 /// Maximum named send peers per service.
-pub const MAX_SEND_PEERS:  usize = 4;
+/// Send peers a service may be wired with.
+///
+/// RAISED 4 -> 6 (2026-08-29). The shell legitimately needs five (`fs`, `block-driver`, `time`,
+/// `console`, `logger`), and at four the fifth was dropped SILENTLY - the contract declared it, the
+/// service never got the cap, and the only symptom was a peer that behaved as though it did not exist.
+/// The cap itself is right (a fixed array, §26.6); the silence was the bug, and the loud reject below
+/// is the other half of this fix.
+pub const MAX_SEND_PEERS:  usize = 6;
 /// Maximum bytes per peer name stored in ServiceContextData.
 pub const PEER_NAME_BYTES: usize = 24;
 
@@ -305,7 +312,7 @@ struct ServiceContextData {
 // Pinned by SIZE in both crates. It does not prove field ORDER, but it catches the mistake that
 // actually happens - an append on one side only - and it fails at compile time in the crate that
 // drifted rather than at boot in a service that reads garbage.
-const SERVICE_CONTEXT_DATA_SIZE: usize = 256;
+const SERVICE_CONTEXT_DATA_SIZE: usize = 320;   // 256 + 2 x SendPeerEntry(32) after MAX_SEND_PEERS 4 -> 6
 const _: () = assert!(
     core::mem::size_of::<ServiceContextData>() == SERVICE_CONTEXT_DATA_SIZE,
     "ServiceContextData changed size: update BOTH kernel/src/task/mod.rs and      sdk/rust/src/service_context.rs, then update SERVICE_CONTEXT_DATA_SIZE in both"
@@ -1192,7 +1199,10 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "fs" => Some(("fs", ServiceConfig {
             elf:               include_bytes!(env!("SVC_FS_ELF")),
             has_recv_endpoint: true, // owns an endpoint (reply target + future fs API)
-            send_peers:        &["block-driver"], // fs's block-driver peer (supervisor-provided / name-wired)
+            // "logger" is the EMIT cap: holding it is what makes this service traced, and its absence
+            // is what makes an untraced service cost one relaxed load (`sdk::trace`). Authority, visible
+            // in `caps fs`, revocable - not a global switch (3.1).
+            send_peers:        &["block-driver", "logger"],
             send_peers_grant:  false,
             preferred_core:    1,
             probe_mode:        0,
@@ -3662,7 +3672,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // `console`: terminal geometry, for the pager and `edit`. It used to come from the KERNEL
             // (`InspectKernel` query 9, now deleted) - the shell was asking the wrong party for a fact
             // the terminal owns (docs/console-service.md 9.7).
-            send_peers:        &["fs", "block-driver", "time", "console"],
+            send_peers:        &["fs", "block-driver", "time", "console", "logger"],
             send_peers_grant:  false,
             // ARM: OFF CORE 0, to keep the serial writer away from the microframe-timed USB driver.
             //
@@ -4222,6 +4232,16 @@ fn spawn_service_with_config(
     }
 
     // 2. Name-wire each declared send-peer the caller did NOT already provide.
+    // OVERFLOW IS LOUD (invariant 12). A contract declaring more peers than fit used to lose the extras
+    // in SILENCE: the declaration was there, the cap never arrived, and the only symptom was a peer
+    // behaving as though it did not exist - which reads as "that service is broken", not "you are over
+    // a limit". It cost a debugging cycle on the very change that raised this cap. Keeping the cap
+    // fixed is correct (26.6); losing data without saying so is the same shape as the x86 input ring.
+    if send_peers.len() > MAX_SEND_PEERS {
+        crate::kprintln!(
+            "task: '{}' declares {} send peers, limit {} - the extras are NOT wired (raise              MAX_SEND_PEERS in task/mod.rs AND sdk/service_context.rs, and SERVICE_CONTEXT_DATA_SIZE              in both)",
+            name, send_peers.len(), MAX_SEND_PEERS);
+    }
     for &peer_name in send_peers {
         if peer_count >= MAX_SEND_PEERS { break; }
 

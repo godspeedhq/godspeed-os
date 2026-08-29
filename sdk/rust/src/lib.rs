@@ -63,6 +63,8 @@ pub mod ipc;
 pub mod mmio;
 pub mod record;
 pub mod service_context;
+/// IPC trace emission - the client half of the trace ring `logger` holds (`utilities/46_trace.md`).
+pub mod trace;
 pub(crate) mod syscall;
 
 pub use capability::{CapHandle, CapError};

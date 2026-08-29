@@ -792,7 +792,7 @@ const NO_PATH_CMDS: &[&str] = &[
 /// `<util> version` / `<util> help`), so they are NOT listed here.
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
-    ("trace",   &["blocked", "task", "service"]),
+    ("trace",   &["blocked", "task", "service", "ipc", "failures", "status"]),
     ("busiest", &["mem", "restarts", "queue"]),
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
@@ -4135,6 +4135,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("trace blocked", "every task blocked on another task, and who holds what it awaits", "trace blocked"),
             ("trace task <slot>", "the chain rooted at one task, as a tree", "trace task 7"),
             ("trace service <name>", "the same chain, rooted by service name", "trace service fs"),
+            ("trace ipc", "recent IPC events from the ring in `logger` (newest last)", "trace ipc"),
+            ("trace failures", "only the timeouts and lost peers", "trace failures"),
+            ("trace status", "ring size, events recorded, events dropped", "trace status"),
             ("trace version", "the utility version", "trace version"),
         ], true),
         "result" => help_block(ctx, "result", "show the previous command's result (Ok / Err)", &[
@@ -6761,6 +6764,9 @@ fn cmd_trace(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
             Ok(())
         }
         "blocked" => trace_blocked(ctx),
+        "ipc" => trace_events(ctx, false),
+        "failures" => trace_events(ctx, true),
+        "status" => trace_status(ctx),
         "task" => match rest.parse::<u32>() {
             Ok(slot) => trace_chain(ctx, slot),
             _ => {
@@ -6786,6 +6792,106 @@ fn cmd_trace(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
             Err(ShellError::Unknown)
         }
     }
+}
+
+/// Ask `logger` for its recent trace events (`utilities/46_trace.md` mechanism B).
+///
+/// The ring lives in that service, not the kernel - so this is an ordinary request/reply to an
+/// ordinary service, and a logger that is dead or absent is answered with a sentence rather than a
+/// hang (Commandment VIII: a missing dependency RETURNS, loudly).
+fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellError> {
+    let req = [godspeed_sdk::trace::TRACE_OP_DUMP, 40u8];
+    let reply = match ctx.request_with_reply("logger", &Message::from_bytes(&req)) {
+        Some(r) => r,
+        None => {
+            ctx.console_writeln("trace: the logger service is unavailable (it holds the ring)");
+            return Err(ShellError::Unknown);
+        }
+    };
+    let b = reply.payload_bytes();
+    if b.is_empty() {
+        ctx.console_writeln("trace: logger returned nothing");
+        return Err(ShellError::Unknown);
+    }
+    let n = b[0] as usize;
+    let ev = godspeed_sdk::trace::EV_LEN;
+    let pl = godspeed_sdk::trace::PEER_LEN;
+    let mut t = Table::new(&["seq", "t+s", "peer", "op", "event"]);
+    let mut shown = 0u32;
+    // Time is shown RELATIVE to the oldest event in this dump. The absolute value is an epoch second -
+    // a large number that says nothing on its own; the GAP between events is what a stall looks like.
+    let base = if n > 0 && b.len() >= 9 {
+        u32::from_le_bytes([b[5], b[6], b[7], b[8]])
+    } else {
+        0
+    };
+    for i in 0..n {
+        let o = 1 + i * ev;
+        if o + ev > b.len() { break; }
+        let seq = u32::from_le_bytes([b[o], b[o+1], b[o+2], b[o+3]]);
+        let at  = u32::from_le_bytes([b[o+4], b[o+5], b[o+6], b[o+7]]);
+        let pname = &b[o+8..o+8+pl];
+        let plen = pname.iter().position(|&c| c == 0).unwrap_or(pl);
+        let op  = b[o+8+pl];
+        let kind = b[o+9+pl];
+        let kname = match kind {
+            godspeed_sdk::trace::KIND_REQUEST   => "REQUEST",
+            godspeed_sdk::trace::KIND_REPLY     => "REPLY",
+            godspeed_sdk::trace::KIND_TIMEOUT   => "TIMEOUT",
+            godspeed_sdk::trace::KIND_PEER_LOST => "PEER_LOST",
+            _ => "?",
+        };
+        // `trace failures` is the same ring, filtered - not a second recording path. The failure
+        // events are the ones a stall investigation starts from (8.6).
+        if failures_only && !matches!(kind, godspeed_sdk::trace::KIND_TIMEOUT | godspeed_sdk::trace::KIND_PEER_LOST) {
+            continue;
+        }
+        // The peer NAME came from the emitter, which knew it: it called `request_with_reply("fs", ..)`.
+        // No lookup, no endpoint, no cap slot - a slot is local to the emitter and means nothing here.
+        // (The EMITTER is not named: a service has no ambient identity to assert, which is the
+        // capability model working, not a gap. See `sdk::trace`.)
+        let peer = t.intern(&pname[..plen]);
+        let k = t.intern(kname.as_bytes());
+        t.add_row(&[Value::Int(seq as u64), Value::Int(at.saturating_sub(base) as u64),
+                    peer, Value::Int(op as u64), k]);
+        shown += 1;
+    }
+    if shown == 0 {
+        ctx.console_writeln(if failures_only { "trace: no failure events recorded" }
+                            else { "trace: no events recorded (is any service granted ipc_send=[\"logger\"]?)" });
+        return Ok(());
+    }
+    { let mut o = Out::Console; t.to_grid(&mut OutSink { ctx, out: &mut o }); }
+    Ok(())
+}
+
+/// `trace status` - ring capacity, events accepted, events DROPPED.
+///
+/// The drop count is the point. A ring that silently discards is the failure this project just fixed
+/// in the x86 keyboard path; one that reports what it lost is an instrument you can trust the rest of
+/// (invariant 12).
+fn trace_status(ctx: &ServiceContext) -> Result<(), ShellError> {
+    let req = [godspeed_sdk::trace::TRACE_OP_STATUS];
+    let reply = match ctx.request_with_reply("logger", &Message::from_bytes(&req)) {
+        Some(r) => r,
+        None => {
+            ctx.console_writeln("trace: the logger service is unavailable (it holds the ring)");
+            return Err(ShellError::Unknown);
+        }
+    };
+    let b = reply.payload_bytes();
+    if b.len() < 24 {
+        ctx.console_writeln("trace: logger returned a short status");
+        return Err(ShellError::Unknown);
+    }
+    let cap = u64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]);
+    let total = u64::from_le_bytes([b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]]);
+    let dropped = u64::from_le_bytes([b[16],b[17],b[18],b[19],b[20],b[21],b[22],b[23]]);
+    ctx.console_writeln_fmt(format_args!(
+        "trace: ring {} events; {} recorded; {} DROPPED (oldest overwritten before being read)",
+        cap, total, dropped));
+    ctx.console_writeln("trace: the ring lives in the `logger` service - the kernel records nothing.");
+    Ok(())
 }
 
 /// The first live task with this name, or `None`.
