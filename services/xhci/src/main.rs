@@ -3331,16 +3331,40 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // BOUND THE RETRY. A port that will not enumerate is skipped after three consecutive
                 // attempts - loudly, and once - until it is unplugged and replugged, which clears both
                 // the count and the poison.
-                if p < 64 {
+                // SPEND THE STRIKES IN THIS PASS, not one per pass.
+                //
+                // They used to accumulate ACROSS passes, so a port that never comes up took three
+                // re-enumerations to poison - and each re-enumeration is a ~1 s window in which the
+                // keyboard is not polled. On the Wyse that is four stalls in the first forty seconds
+                // of every boot, reported as "the keyboard stops for a split second". The port was
+                // never going to work; the ARMING COST was the bug.
+                //
+                // Retrying here poisons it inside the first pass, so a boot pays one stall instead of
+                // four. The trade is real and worth stating: a cross-pass retry gave a slow device
+                // ~12 s of extra settling and these attempts are back-to-back. Acceptable because the
+                // port reset and its settle delay already happened inside `enumerate_one`, and
+                // because the poison CLEARS on unplug - so the worst case for a device wrongly
+                // skipped is one replug, weighed against three seconds of dead keyboard every boot.
+                if p < 64 && enum_failed {
+                    let mut strikes = 1u8;
+                    while strikes < PORT_FAIL_LIMIT && !hc_wedged {
+                        enumerate_one(
+                            &ctx, &dma, &mmio, dboff, ir0, op, ctx_size, p, &mut sa, &mut devs,
+                            &mut ndev, &mut saw_hub, &mut disk, &mut ev_idx, &mut ev_cycle,
+                            &mut cmd_idx, &mut hc_wedged, &mut diag_dumped, &mut enum_failed,
+                        );
+                        if !enum_failed { break; }
+                        strikes += 1;
+                    }
                     if enum_failed {
-                        port_fails[p as usize] = port_fails[p as usize].saturating_add(1);
-                        if port_fails[p as usize] == PORT_FAIL_LIMIT {
-                            poisoned |= 1u64 << p;
-                            ctx.log_fmt(format_args!(
-                                "xhci: port {} failed to enumerate {} times - SKIPPING it until it is replugged (retrying it forever costs a ~1 s pass every ~12 s, and the keyboard is not polled during one)",
-                                p, PORT_FAIL_LIMIT));
-                        }
-                    } else {
+                        poisoned |= 1u64 << p;
+                        ctx.log_fmt(format_args!(
+                            "xhci: port {} failed to enumerate {} times in one pass - SKIPPING it until it is replugged (each retry costs a ~1 s pass in which the keyboard is not polled)",
+                            p, strikes));
+                    }
+                }
+                if p < 64 {
+                    if !enum_failed {
                         port_fails[p as usize] = 0;
                     }
                 }
