@@ -353,7 +353,8 @@ for one physical page UNPREDICTABLE, so both mappings must agree. They agree on 
 - Therefore the kernel's mapping becomes non-cacheable too (`section_fb`), and `fb_commit` (a
   clean-to-PoC on ARM, an `sfence` on x86) collapses on ARM to a store barrier - a `DSB`, ordering only,
   nothing to clean - while KEEPING its name and its rectangle argument, because an arch that maps its
-  framebuffer cacheable (the Pi 4) still needs both. `FB_READBACK_CHEAP` disappears with it: reading back a non-cacheable framebuffer is never cheap,
+  framebuffer cacheable still needs both. (**No arch does today.** That parenthetical used to name the
+  Pi 4; see 9.5.1 - it now maps Normal non-cacheable like the others.) `FB_READBACK_CHEAP` disappears with it: reading back a non-cacheable framebuffer is never cheap,
   so the terminal always repaints from its shadow grid and `scroll_by_copy` is deleted.
 
 Non-cacheable here means **Normal** non-cacheable, not **Device**. The distinction matters and the
@@ -366,6 +367,33 @@ driver MMIO grants that genuinely need it.
 
 Cost: the kernel's boot text is slower to paint. It is boot text, and the terminal's own scroll was
 already repaint-from-shadow on x86 for the same reason.
+
+#### 9.5.1 AArch64 had the SAME mistake as ARM, and it cost 582 ms a repaint (2026-08-29)
+
+The paragraph above predicted this exactly - "non-gathering would make every 32-bit pixel store its own
+bus transaction" - and then it happened on the OTHER ARM port. AArch64's `map` collapsed `PCD || PWT` to
+**Device**, so the Pi 4's framebuffer grant was Device-nGnRnE. One 1920x1080 repaint measured **582 ms**
+(~14 MB/s), slow enough that `selfcheck` never reached its end on that board - which for days looked
+like a filesystem or scheduling fault rather than a display one.
+
+Fixed by letting the neutral layer say what the region IS, instead of inferring it from cache bits:
+`PageFlags::WRITE_COMBINE` means "a framebuffer, not device registers", and each arch picks its own type
+- AArch64 Normal non-cacheable via MAIR slot 2, arm32 the encoding it already had, and an arch with
+nothing better ignores the bit (so x86 is unchanged). After: no `paint took` warning on any machine, and
+`selfcheck` completes on the Pi 4.
+
+**A second bug hid behind the same proxy.** The kill-path reclaim skips device MMIO so it is never freed
+into the RAM pool, and it identified "device MMIO" as `PCD && PWT`. The x86 framebuffer is mapped
+PCD-only *deliberately* (strong-UC cost 596 ms per scroll on the Wyse; UC- lets the firmware's
+write-combining MTRR apply), so that guard silently stopped covering it - and every `console` death
+freed the framebuffer into the allocator. Measured after `chaos max-carnage`: 315392 double-frees, all
+inside 0x90000000..0x91f97000 (exactly 3840x2160x4), and `free_frames` 6666 above `total_frames`. Worse
+than the wrong number: the display's pages became allocatable.
+
+The guard is now `PCD` alone, AND the framebuffer range is reserved in the allocator
+(`memory::allocator::reserve_no_free`) - because a check that reads a proxy can be disarmed by someone
+optimising something else, who has no reason to know a safety check depends on how they map a page. The
+resource itself is where the refusal belongs.
 
 ### The same mistake existed on x86, in the other direction (2026-08-25)
 

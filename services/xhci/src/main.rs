@@ -3004,9 +3004,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // an already-bound keyboard nor livelock the re-init. One bit per root port (max_ports <= 63 on real
     // HW; a port >= 64 simply is not poison-tracked, never poison-halted).
     let mut poisoned: u64 = 0;
-    // Consecutive enumeration failures per root port, OUTSIDE the loop for the reason every other
-    // latch here is: a counter reset by the re-enumeration it is meant to bound can never reach a
-    // threshold.
+    // Attempts a root port gets to enumerate before it is poisoned, spent WITHIN one pass.
     //
     // `poisoned` above only arms when a port WEDGES the host controller. A port that merely refuses
     // to enumerate - Address Device returning no completion, which is what the Wyse's SuperSpeed
@@ -3014,10 +3012,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // ~12 s, and the driver does not poll the keyboard during one. That is an unbounded retry (26.6),
     // felt as a keyboard that stalls about once every twelve seconds.
     //
-    // Three strikes, not one: a device still settling after a plug can legitimately fail once, and a
-    // port poisoned on a transient would never come up. Cleared by a successful pass and by an
-    // unplug, so a replug always gets a clean slate.
-    let mut port_fails: [u8; 64] = [0; 64];
+    // Three attempts, not one: a device still settling after a plug can legitimately fail once, and a
+    // port poisoned on a transient would never come up. The poison is cleared when the port goes
+    // empty, so a replug always gets a clean slate.
     const PORT_FAIL_LIMIT: u8 = 3;
     // Consecutive probes reporting the disk's port absent or unreachable. ABOVE the enumeration loop
     // on purpose: it was declared inside it and therefore reset to zero on EVERY pass, so it could
@@ -3328,10 +3325,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     &mut diag_dumped,
                     &mut enum_failed,
                 );
-                // BOUND THE RETRY. A port that will not enumerate is skipped after three consecutive
-                // attempts - loudly, and once - until it is unplugged and replugged, which clears both
-                // the count and the poison.
-                // SPEND THE STRIKES IN THIS PASS, not one per pass.
+                // BOUND THE RETRY, AND SPEND THE ATTEMPTS IN THIS PASS.
+                //
+                // A port that will not enumerate is skipped after three attempts - loudly, and once -
+                // until it is unplugged and replugged, which clears the poison.
                 //
                 // They used to accumulate ACROSS passes, so a port that never comes up took three
                 // re-enumerations to poison - and each re-enumeration is a ~1 s window in which the
@@ -3361,11 +3358,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         ctx.log_fmt(format_args!(
                             "xhci: port {} failed to enumerate {} times in one pass - SKIPPING it until it is replugged (each retry costs a ~1 s pass in which the keyboard is not polled)",
                             p, strikes));
-                    }
-                }
-                if p < 64 {
-                    if !enum_failed {
-                        port_fails[p as usize] = 0;
                     }
                 }
                 if hc_wedged {
@@ -4688,11 +4680,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     if !c {
                         present &= !(1 << p);
                         // The port is empty, so whatever refused to enumerate on it is gone. Clear
-                        // its strike count and its poison: the bound above exists to stop retrying a
-                        // device that will not come up, not to condemn the SOCKET. A replug must
-                        // always get a clean slate, or the bound becomes a permanent dead port.
+                        // its poison: the bound exists to stop retrying a device that will not come
+                        // up, not to condemn the SOCKET. A replug must always get a clean slate, or
+                        // the bound becomes a permanent dead port.
                         if p < 64 {
-                            port_fails[p as usize] = 0;
                             poisoned &= !(1u64 << p);
                         }
                     }

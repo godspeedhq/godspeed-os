@@ -3168,6 +3168,16 @@ It came back **1**. So self-aliasing is out, and with it every CPU path: a read-
 no permission fault, one VA in one address space, no other address space mapping the frame, an
 allocator that has lost nothing, and zero kernel writes overlapping it. The writer is a device.
 
+> **THAT CONCLUSION WAS WRONG.** Kept because this file is append-only evidence and the reasoning is
+> the point, but it must not be read as standing. The read-only guard page was ITSELF the last crash:
+> the claim "no legitimate write can land there" holds only while `run_lines` is LIVE, and once it
+> returns the stack unwinds and ordinary prompt code reuses those addresses. The final run took a
+> PERMISSION FAULT at `SP_EL0 == FAR_EL1` with the canary fully intact - a CPU write to that page
+> faults exactly as designed - so the earlier "written with no fault" readings were of a stack that had
+> already unwound, where a dead frame's contents mean nothing. What actually fixed the machine was the
+> framebuffer memory type (Device-nGnRnE -> Normal non-cacheable, 582 ms a repaint); see the section
+> above and `docs/console-service.md` 9.5.1.
+
 `exceptions.rs` 24 -> 25 adds the instrument that follows from that. A device does not write "a stack";
 it writes a PHYSICAL RANGE whose size and alignment come from the transfer that produced it. The dump
 now measures the contiguous 0x20 run in physical memory around the frame - 512 bytes is a disk sector,
