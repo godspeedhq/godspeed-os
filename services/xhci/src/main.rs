@@ -451,6 +451,12 @@ const TRB_DISABLE_SLOT: u32 = 10;
 /// endpoint, so every port's probe fails together - which makes any of them evidence, and makes the
 /// count meaningful only when unbroken (a single success resets it).
 static PROBE_FAILS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Whether the fixed explanatory command-failure hint has already been said. See its use in
+/// `hc_wedged_now`: the sentence is the same every time, so repeating it is serial bandwidth the
+/// keystroke echo has to wait behind. Owned by this service, like `PROBE_FAILS` above.
+static DIAG_HINT_SAID: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 const TRB_RESET_ENDPOINT: u32 = 14;
 /// Set TR Dequeue Pointer (xHCI 4.6.10) - tells the controller where to resume on that endpoint.
 /// Stop Endpoint (xHCI 4.6.9) - moves a RUNNING endpoint to Stopped, which is the state Set TR
@@ -2117,7 +2123,16 @@ fn dump_ring_state(
 fn hc_wedged_now(ctx: &ServiceContext, mmio: &Mmio, op: usize) -> bool {
     let sts = mmio.read32(op + OP_USBSTS);
     let wedged = sts & STS_WEDGED != 0;
-    ctx.log_fmt(format_args!("xhci: {}", DIAG_HINT));
+    // ONCE. This is 200 characters of FIXED explanatory text - it says what the numbers below mean,
+    // and it means the same thing every time. It was printed on all 42 command failures in one Wyse
+    // boot, roughly 8 KB of serial for one sentence's worth of information. The keystroke echo does a
+    // synchronous polled UART write, so every repetition is time the keyboard spends waiting.
+    //
+    // The USBSTS line below is NOT gated: it carries the actual per-failure state, which differs.
+    // Bounding the explanation is not hiding the failure (26.7) - each failure still reports itself.
+    if !DIAG_HINT_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        ctx.log_fmt(format_args!("xhci: {}", DIAG_HINT));
+    }
     ctx.log_fmt(format_args!(
         "xhci: post-command USBSTS={:#010x} (HCH={} HSE={} HCE={} CNR={}){}",
         sts,
@@ -2203,8 +2218,14 @@ fn enumerate_one(
     // Whether the one-shot ring-state dump has already been printed. See its declaration, above
     // `'reenum` - a latch reset by the re-enumeration it reports is not a latch.
     diag_dumped: &mut bool,
+    // Set when this port could not be enumerated (Enable Slot or Address Device failed) WITHOUT the
+    // host controller wedging. Distinct from `hc_wedged` on purpose: a wedge is catastrophic and
+    // poisons the port at once, while this is a port that simply will not come up - which must still
+    // be BOUNDED, because retrying it forever is what produces the ~1 s re-enumeration every ~12 s.
+    enum_failed: &mut bool,
 ) {
     *hc_wedged = false;
+    *enum_failed = false;
     let portsc_off = op + OP_PORTSC_BASE + (port as usize - 1) * 0x10;
     let psc = mmio.read32(portsc_off);
     if psc & PORT_CCS == 0 {
@@ -2268,6 +2289,7 @@ fn enumerate_one(
         Some(r) => r,
         None => {
             ctx.log("xhci: Enable Slot - no completion");
+            *enum_failed = true;
             // The FIRST command on a fresh controller. If this one gets no completion, nothing about
             // the DMA side has ever been proven, so dump it rather than guess (see `dump_ring_state`).
             if !*diag_dumped {
@@ -2280,6 +2302,7 @@ fn enumerate_one(
         }
     };
     if comp != 1 {
+        *enum_failed = true;
         ctx.log_fmt(format_args!(
             "xhci: Enable Slot failed (completion={})",
             comp
@@ -2325,6 +2348,7 @@ fn enumerate_one(
         Some(r) => r,
         None => {
             ctx.log("xhci: Address Device - no completion");
+            *enum_failed = true;
             let wedged = hc_wedged_now(ctx, mmio, op);
             sa.free(dev_idx);
             // Only try to disable the slot if the HC is still executing; on a wedged HC the command
@@ -2337,6 +2361,7 @@ fn enumerate_one(
         }
     };
     if comp != 1 {
+        *enum_failed = true;
         ctx.log_fmt(format_args!(
             "xhci: Address Device failed (completion={})",
             comp
@@ -2979,6 +3004,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // an already-bound keyboard nor livelock the re-init. One bit per root port (max_ports <= 63 on real
     // HW; a port >= 64 simply is not poison-tracked, never poison-halted).
     let mut poisoned: u64 = 0;
+    // Consecutive enumeration failures per root port, OUTSIDE the loop for the reason every other
+    // latch here is: a counter reset by the re-enumeration it is meant to bound can never reach a
+    // threshold.
+    //
+    // `poisoned` above only arms when a port WEDGES the host controller. A port that merely refuses
+    // to enumerate - Address Device returning no completion, which is what the Wyse's SuperSpeed
+    // ports 6/10/15 do - was retried on every pass, forever. Measured on hardware: a ~1 s pass every
+    // ~12 s, and the driver does not poll the keyboard during one. That is an unbounded retry (26.6),
+    // felt as a keyboard that stalls about once every twelve seconds.
+    //
+    // Three strikes, not one: a device still settling after a plug can legitimately fail once, and a
+    // port poisoned on a transient would never come up. Cleared by a successful pass and by an
+    // unplug, so a replug always gets a clean slate.
+    let mut port_fails: [u8; 64] = [0; 64];
+    const PORT_FAIL_LIMIT: u8 = 3;
     // Consecutive probes reporting the disk's port absent or unreachable. ABOVE the enumeration loop
     // on purpose: it was declared inside it and therefore reset to zero on EVERY pass, so it could
     // only reach its threshold if twenty probes ran with no re-enumeration in between. Anything that
@@ -3233,6 +3273,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // controller no longer has.
         let mut disk: Option<msc::Disk> = None;
         let mut hc_wedged = false;
+        let mut enum_failed = false;
         // TWO SWEEPS: every USB2 root port first, then every USB3 (SuperSpeed) one.
         //
         // USB3 ports used to be skipped outright. That was right while this driver only bound boot
@@ -3285,7 +3326,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     &mut cmd_idx,
                     &mut hc_wedged,
                     &mut diag_dumped,
+                    &mut enum_failed,
                 );
+                // BOUND THE RETRY. A port that will not enumerate is skipped after three consecutive
+                // attempts - loudly, and once - until it is unplugged and replugged, which clears both
+                // the count and the poison.
+                if p < 64 {
+                    if enum_failed {
+                        port_fails[p as usize] = port_fails[p as usize].saturating_add(1);
+                        if port_fails[p as usize] == PORT_FAIL_LIMIT {
+                            poisoned |= 1u64 << p;
+                            ctx.log_fmt(format_args!(
+                                "xhci: port {} failed to enumerate {} times - SKIPPING it until it is replugged (retrying it forever costs a ~1 s pass every ~12 s, and the keyboard is not polled during one)",
+                                p, PORT_FAIL_LIMIT));
+                        }
+                    } else {
+                        port_fails[p as usize] = 0;
+                    }
+                }
                 if hc_wedged {
                     ctx.log_fmt(format_args!(
                     "xhci: port {} wedged the HC - poisoning it and re-initialising the controller", p
@@ -4605,6 +4663,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                     if !c {
                         present &= !(1 << p);
+                        // The port is empty, so whatever refused to enumerate on it is gone. Clear
+                        // its strike count and its poison: the bound above exists to stop retrying a
+                        // device that will not come up, not to condemn the SOCKET. A replug must
+                        // always get a clean slate, or the bound becomes a permanent dead port.
+                        if p < 64 {
+                            port_fails[p as usize] = 0;
+                            poisoned &= !(1u64 << p);
+                        }
                     }
                 }
             }
