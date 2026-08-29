@@ -2327,15 +2327,15 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/mod.rs | 68 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
-| arch/aarch64/exceptions.rs | 25 | permitted |
-| arch/aarch64/uaccess.rs | 11 | permitted |
+| arch/aarch64/exceptions.rs | 17 | permitted |
+| arch/aarch64/uaccess.rs | 7 | permitted |
 | arch/aarch64/context.rs | 9 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 7 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 23 | permitted |
-| arch/aarch64/ptables.rs | 32 | permitted |
+| arch/aarch64/ptables.rs | 24 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
@@ -2377,7 +2377,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 15 | permitted |
 | capability/table.rs | 7 | permitted |
-| memory/allocator.rs | 46 | permitted |
+| memory/allocator.rs | 45 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
@@ -3082,87 +3082,34 @@ history rather than asserted.
 
 ---
 
-## Pi 4 shell-fault instruments (2026-08-28) - DIAGNOSTIC, on the fatal-fault path only
+## Pi 4 shell-fault instruments (2026-08-28 / 29) - REMOVED, and what they actually found
 
-Three files grow to test the one writer left standing for the Pi 4 shell fault. The evidence that
-forced it: a 1024-byte canary in the shell's stack is provably PRESENT (a kernel-side read printed 64
-`Z`s from `0x7fff7f18`) and provably ABSENT at fault time (a whole-stack scan covering all 262144
-bytes), destroyed inside a SINGLE statement - while the kernel's largest write into user memory is 522
-bytes, no other task maps those frames, and the shell contains no `unsafe`. No CPU-side writer in this
-system can do that. A DEVICE can: §6.4 records that this board has no IOMMU/SMMU wired up
-(`confine_device` returns false on aarch64), so a driver programs its controller with physical
-addresses and may write anywhere in RAM.
+These instruments are **gone**; the counts above are back to their pre-investigation values, except
+`ptables.rs` (+1, the framebuffer cache maintenance recorded below, which is a fix and stays). This
+section is kept because §1 makes an amendment ratified history, and because the conclusion the
+instruments produced was WRONG in a way worth recording.
 
-| File | Change | Why it is sound |
-|------|--------|-----------------|
-| `memory/allocator.rs` | 44 -> 45 (+1) | `phys_dma_proximity` reads the DMA reservation table read-only. Written only under the allocator lock at arena-allocation time and never mutated after; a torn read misreports a diagnostic and nothing else. |
-| `arch/aarch64/ptables.rs` | 21 -> 23 (+2) | `translate_diag` walks a page-table root read-only - the same descriptor walk `map_raw` performs, and `get` already refuses to dereference a non-RAM descriptor. |
-| `arch/aarch64/exceptions.rs` | 15 -> 17 (+2) | One `mrs ttbr0_el1` (a side-effect-free system-register read; it still holds the faulting task's root because the exception came from EL0 and nothing has switched), and one call to `translate_diag` above. |
+The hunt was for a Pi 4 shell fault that smashed the task's own stack with 0x20. Successive instruments
+- a mutated canary, a kernel-side write-destination tracker, a cross-task frame scan, an allocator
+consistency check, and finally a **read-only guard page** - eliminated the shell, other tasks, the
+kernel and the allocator, and led me to state that the writer was a device (DMA), because the guarded
+page was written with no permission fault.
 
-All three sit in layers where §18.1 permits `unsafe`. Every block carries a `// SAFETY:` comment, and
-all of it runs only after a task has already faulted fatally - it changes what the kernel PRINTS, never
-what it does.
+**That conclusion was wrong, and the instrument that produced it was itself the last crash.** The
+read-only guard page rested on the claim that no legitimate write could land there, since every byte
+belonged to a canary local to `run_lines`. That holds only while `run_lines` is LIVE. Once it returns,
+the stack unwinds and ordinary prompt-level code reuses the region - so the page I had permanently
+write-protected was written legitimately, taking a permission fault at `SP_EL0 == FAR_EL1` with the
+canary fully intact. A CPU write to that page faults exactly as designed; the earlier "no fault"
+readings were of a stack that had already unwound, where a dead frame's contents mean nothing.
 
-### The read-only canary page (2026-08-29) - the discriminator
+What actually fixed the machine was the framebuffer memory type below. With the framebuffer mapped
+Device-nGnRnE a single repaint took 582 ms, and `selfcheck` never reached its end. With it mapped
+Normal Non-cacheable, `selfcheck` runs to completion (356/0, repeatedly, hardware-verified) and the
+rendering is fast and smooth.
 
-Every candidate above was eliminated by measurement, including the kernel itself (`kernel writes ONTO
-the canary: 0`) and the DMA arenas (no overlap, none within 8 frames of a stack page) - and the canary
-is still destroyed. Elimination has run out of candidates, so the next instrument has to identify one
-POSITIVELY. CPU writes and DMA differ in exactly one observable way on a board with no IOMMU: **DMA
-bypasses the MMU.** So the shell now sizes its canary at 8 KiB, which guarantees one 4 KiB page lies
-wholly inside it, and the kernel marks that page read-only:
-
-- canary destroyed with **no fault** -> the writer was not the CPU. That is DMA, identified rather than inferred.
-- a **permission fault** -> a CPU writer after all, and `ELR_EL1` names the exact instruction.
-
-There is no third outcome, which is the property that makes it worth a flash.
-
-| File | Change | Why it is sound |
-|------|--------|-----------------|
-| `arch/aarch64/ptables.rs` | 23 -> 25 (+2) | `set_page_ro_diag` walks to one L3 descriptor with the same `get`/`set` accessors already audited, sets AP[2] (read-only) on a page that is already mapped and valid, then issues the `dsb`/`tlbi vaae1is`/`dsb`/`isb` sequence `unmap` already performs. It cannot create a mapping, widen one, or reach another address space: it only removes a permission from a page the caller already owns. |
-| `arch/aarch64/uaccess.rs` | 7 -> 10 (+3) | The marker check reads the staging buffer `copy_from_user` just filled (a slice over bytes this function owns), one `mrs ttbr0_el1` (side-effect-free, and inside the caller's own syscall so it names the caller's root), and the call above. |
-
-### The controls that keep the answer honest (2026-08-29)
-
-The first hardware run came back with the guarded page holding `0x20` and **no permission fault**,
-which is the "not the CPU" arm. Two things could fake that, and both are now tested rather than
-assumed:
-
-1. **Was the page still read-only when it was written?** A stale TLB entry, or something rewriting the
-   descriptor, would produce the same silence. The descriptor is now read back at arming time AND at
-   fault time and the two are compared, so the dump states whether the mapping was read-only for the
-   whole window instead of leaving it inferred.
-2. **Could another task have written the same FRAME through its own writable mapping?** Marking the
-   shell's mapping read-only does nothing about that, so "no fault" also fits one frame handed to two
-   address spaces. The fill byte makes this worth testing rather than dismissing: `0x20` is what a
-   screen clear writes, and `console` clears a grid of spaces. The dump now takes the guarded page's
-   PA and asks every other live task whether it maps it, naming the task and VA if so.
-
-Without (2), concluding "therefore DMA" would have been a third retraction in this investigation.
-
-| File | Change | Why it is sound |
-|------|--------|-----------------|
-| `arch/aarch64/ptables.rs` | 25 -> 29 (+4) | `descriptor_diag` returns the raw L3 descriptor via the same read-only walk as `translate_diag`; `find_pa_diag` descends the tree looking for one PA, skipping unmapped subtrees. Both are read-only and use the audited `get` accessor, which itself refuses a non-RAM descriptor. |
-| `arch/aarch64/exceptions.rs` | 17 -> 23 (+6) | One `mrs ttbr0_el1`, and three read-only walks (descriptor readback, guard-page translate, per-task frame search). All on the fatal-fault path. |
-| `arch/aarch64/uaccess.rs` | 10 -> 11 (+1) | The descriptor readback that proves the arm took effect - a guard never observed firing is not evidence that it fires. |
-
-One more instrument, and one correction, from the second hardware run. The correction first: the
-cross-task scan reports "no other USER address space maps it" and no longer says "so no CPU could have
-written it". That claim was wrong - the scan covers user address spaces only, while the kernel's direct
-map covers every physical frame read-write at EL1, so a kernel write through the HHDM reaches the frame
-without touching the read-only user mapping and without passing the `copy_to_user` tracker. Two
-candidates survive, not one, and `frame_is_free` (`memory/allocator.rs` 45 -> 46) tests the second: the
-direct-map path requires the kernel to believe the frame is something other than a live task's stack,
-and that belief lives in the free bitmap, so the dump asks it. A frame that is MAPPED by a running task
-and simultaneously marked FREE has been lost track of, and whatever is handed it next writes through the
-shell's stack with no fault and no tracker entry. The same question is asked of all 64 stack pages,
-because one lost frame is a bug and several is a pattern.
-
-The other addition is a PRECONDITION that was being assumed: the guard page's contents are now printed
-at ARM time. "Written while read-only" is only true if the page held the fill pattern when it was
-protected, and neither the shell's control print (a different page) nor its first/last check (two bytes
-at the array's ends) says anything about that page. If it is already dirty at arming, the experiment is
-void and says so.
+The lesson worth keeping: an instrument that perturbs the system is a suspect, not a witness. This one
+changed page permissions on a live stack, and every conclusion drawn from its silence was an artefact.
 
 ### Framebuffer memory type (2026-08-29) - not a diagnostic, a fix
 

@@ -127,89 +127,7 @@ pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
     // SAFETY: this core's staging slot, and interrupts do not re-enter a user copy on the same core (a
     // syscall runs with the caller's core to itself until it returns).
     let dst = unsafe { (&raw mut STAGE[core_index()]) as *mut u8 };
-    // ARM THE READ-ONLY CANARY EXPERIMENT, from a marker the shell prints.
-    //
-    // The trigger lives HERE, not in the syscall layer, for two reasons: `syscall/` is a grandfathered
-    // unsafe layer (§18.5) whose count may only fall, and the console write the shell uses passes
-    // through this function anyway. So the kernel watches for the shell's own `canary-control at`
-    // line and, once, marks the page holding the canary read-only.
-    //
-    // What that buys: CPU writes and DMA differ in exactly one observable way on a board with no
-    // IOMMU - DMA bypasses the MMU. If the canary is still destroyed with the page read-only and NO
-    // permission fault is reported, the writer was not the CPU. That is a positive identification of
-    // DMA rather than another candidate crossed off. If a fault IS taken, the dump names the PC.
     if copy_from_user(dst, ptr, len) {
-        {
-            use core::sync::atomic::Ordering::Relaxed;
-            const MARK: &[u8] = b"canary-guard 0x";
-            const DIGITS: usize = 16;
-            if !CANARY_RO_ARMED.load(Relaxed) && len >= MARK.len() + DIGITS {
-                // SAFETY: `copy_from_user` filled exactly `len` bytes of the staging buffer above.
-                let seen = unsafe { core::slice::from_raw_parts(dst as *const u8, len) };
-                if seen.starts_with(MARK) {
-                    let mut va = 0u64;
-                    let mut good = true;
-                    for &c in &seen[MARK.len()..MARK.len() + DIGITS] {
-                        let d = match c {
-                            b'0'..=b'9' => c - b'0',
-                            b'a'..=b'f' => c - b'a' + 10,
-                            b'A'..=b'F' => c - b'A' + 10,
-                            _ => { good = false; break; }
-                        };
-                        va = (va << 4) | d as u64;
-                    }
-                    // Refuse anything that is not a page-aligned address inside the user stack. The
-                    // marker is a service-supplied string, so it is INPUT: it selects which page of
-                    // its OWN address space to protect, and nothing else. A bad value is reported and
-                    // ignored rather than acted on (invariant 12).
-                    let in_stack = (0x7FFC_0000..0x8000_0000).contains(&va);
-                    if !good || va & 0xFFF != 0 || !in_stack {
-                        crate::kprintln!("canary-ro: REFUSED marker value {:#x} (aligned+in-stack required)", va);
-                    } else {
-                        CANARY_RO_ARMED.store(true, Relaxed);
-                        let root: u64;
-                        // SAFETY: reading TTBR0_EL1 at EL1 is side-effect-free, and this runs inside
-                        // the calling task's own syscall, so it names that task's root.
-                        unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) root, options(nomem, nostack)) };
-                        // SAFETY: the caller owns this address space; the helper clears write
-                        // permission on one already-mapped page of it and performs the TLB
-                        // maintenance that change requires.
-                        let ok = unsafe { super::ptables::set_page_ro_diag(root & !0xFFF, va) };
-                        // Read the descriptor straight back. A guard never observed taking effect is
-                        // not evidence that it took effect, and every conclusion drawn from "no fault"
-                        // depends on this one bit actually being set in the table.
-                        // SAFETY: read-only descriptor walk of the address space just modified.
-                        let desc = unsafe { super::ptables::descriptor_diag(root & !0xFFF, va) };
-                        match desc {
-                            Some(d) => {
-                                CANARY_GUARD_VA.store(va, Relaxed);
-                                CANARY_GUARD_DESC.store(d, Relaxed);
-                                crate::kprintln!(
-                                    "canary-ro: page {:#x} protected={} desc={:#x} pa={:#x} AP2(ro)={}",
-                                    va, ok, d, d & 0x0000_FFFF_FFFF_F000, (d >> 7) & 1);
-                                // THE PRECONDITION, stated rather than assumed.
-                                //
-                                // "The guarded page was written while read-only" is only true if it
-                                // held the fill pattern WHEN it was protected. The shell's control
-                                // print reads a different page, and its first/last check samples two
-                                // bytes at the array's ends - neither says anything about this page.
-                                // If it is already 0x20 here, nothing was written under protection and
-                                // the whole conclusion collapses, so it is checked, not assumed.
-                                match read_user_bytes(va + 0x800, 16) {
-                                    Some(b) => crate::kprintln!(
-                                        "canary-ro: guard page at arm time: {:02x} {:02x} {:02x} {:02x} ... ({})",
-                                        b[0], b[1], b[2], b[3],
-                                        if b.iter().all(|&x| x == 0x5A) { "INTACT - the experiment is valid" }
-                                        else { "ALREADY DIRTY - corruption preceded the arm; experiment VOID" }),
-                                    None => crate::kprintln!("canary-ro: guard page unreadable at arm time - experiment void"),
-                                }
-                            }
-                            None => crate::kprintln!("canary-ro: page {:#x} protected={} but NO L3 descriptor - experiment is void", va, ok),
-                        }
-                    }
-                }
-            }
-        }
         // SAFETY: `len <= MAX_USER_COPY` was checked, and `copy_from_user` filled exactly that many
         // bytes of this core's buffer.
         Some(unsafe { core::slice::from_raw_parts(dst as *const u8, len) })
@@ -233,20 +151,6 @@ pub static UW_MAX_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 pub static UW_MAX_DST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static UW_TOTAL:   core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static UW_COUNT:   core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Writes whose destination range OVERLAPS the shell's canary, and the first such write's address and
-/// length. See the note at the check site: the kernel was cleared on write SIZE, which is not the
-/// property that matters - where a write LANDS is.
-/// Set once the read-only canary experiment has been armed, so the marker acts exactly once per boot
-/// rather than re-protecting an already-protected page on every statement.
-pub static CANARY_RO_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// The guarded page's VA, and the descriptor as it read back at arming time. The fault dump re-reads
-/// the live descriptor and compares: equal means the mapping was read-only for the whole window, which
-/// is what turns "no permission fault" into evidence rather than an assumption.
-pub static CANARY_GUARD_VA:   core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static CANARY_GUARD_DESC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static UW_CANARY_HITS:      core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static UW_CANARY_FIRST_DST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static UW_CANARY_FIRST_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool {
     if !validate_user_ptr(dst, src.len()) {
@@ -260,30 +164,6 @@ pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool {
         if n > UW_MAX_LEN.load(Relaxed) {
             UW_MAX_LEN.store(n, Relaxed);
             UW_MAX_DST.store(dst, Relaxed);
-        }
-        // DOES ANY KERNEL WRITE LAND ON THE CANARY? Size was never the question.
-        //
-        // This tracker recorded only the LARGEST write - 522 bytes, a legitimate block reply - and I
-        // reported the kernel exonerated on that basis. That was the wrong property to measure: a
-        // 200-byte write landing ON the canary would corrupt it and never once appear as "largest".
-        //
-        // The chain that leads here: `canary` is a local of `run_lines`, whose frame is live for the
-        // whole run, so callees sit BELOW it and cannot reach it without writing outside their own
-        // frame; safe Rust cannot do that silently (it panics, and there is no panic) and the shell
-        // has no `unsafe`; other tasks are ruled out (no shared frames, no aliasing); DMA arenas do
-        // not overlap the stack. That leaves the kernel - the one writer that can put bytes at an
-        // arbitrary user address - and its DESTINATIONS have never been checked, only its sizes.
-        //
-        // So: flag any write whose range overlaps the canary, and keep the first one with enough
-        // detail to name the caller.
-        let lo = 0x7fff_7f18u64;
-        let hi = lo + 1024;
-        if dst < hi && dst.saturating_add(n) > lo {
-            UW_CANARY_HITS.fetch_add(1, Relaxed);
-            if UW_CANARY_FIRST_DST.load(Relaxed) == 0 {
-                UW_CANARY_FIRST_DST.store(dst, Relaxed);
-                UW_CANARY_FIRST_LEN.store(n, Relaxed);
-            }
         }
     }
     copy_to_user(dst, src.as_ptr(), src.len())

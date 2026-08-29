@@ -625,26 +625,6 @@ pub fn phys_dma_proximity(phys: u64, slack: usize) -> (bool, usize) {
     }
     (false, if nearest <= slack { nearest } else { usize::MAX })
 }
-/// DIAGNOSTIC: is this frame currently marked FREE in the allocator's bitmap?
-///
-/// The second surviving explanation for the Pi 4 shell corruption. The kernel's direct map covers
-/// every physical frame read-write, so a kernel write through it reaches a task's stack page without
-/// faulting on that task's (read-only) user mapping and without passing the `copy_to_user` tracker.
-/// For that to happen, the kernel must believe the frame is something other than the shell's stack -
-/// which shows up here as a frame that is mapped by a live task and yet marked free.
-///
-/// Reports free/used, plus the double-free counter, so "the allocator lost track of it" is a fact
-/// read off the output rather than a theory.
-pub fn frame_is_free(phys: u64) -> Option<bool> {
-    let idx = (phys / FRAME_SIZE) as usize;
-    // SAFETY: read-only bit test of the free bitmap. Written under the allocator lock; a torn read
-    // misreports one diagnostic bit and nothing else. Runs only on the fatal-fault path.
-    unsafe {
-        if BITMAP_PTR.is_null() || idx / 8 >= BITMAP_LEN { return None; }
-        Some(bitmap()[idx / 8] & (1 << (idx % 8)) != 0)
-    }
-}
-
 /// Walk the kernel half of the live PML4 (entries 256-511) and mark every
 /// PDPT / PD / PT / PML4 frame as "used" in the bitmap allocator.
 ///

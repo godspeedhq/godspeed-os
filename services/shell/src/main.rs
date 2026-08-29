@@ -1484,19 +1484,6 @@ impl ShellError {
 /// `run → cmd_run → execute` path (the same inlining-inflates-frame trap as the record builders).
 #[inline(never)]
 fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellError>, depth: u8, out: &mut Out) -> Result<(), ShellError> {
-    // SECOND CANARY - brackets the first. DIAGNOSTIC, not a feature.
-    //
-    // The canary in `run_lines` sits 2808 bytes ABOVE SP and is destroyed; the space fill starts AT
-    // SP and has reached 5344 bytes, i.e. 2536 bytes past it. So the write climbs UPWARD from a deep
-    // frame through its callers. `execute` is called BELOW `run_lines` (via `run_stmt`), so its frame
-    // lies between SP and that first canary: whether THIS one dies, and at what fill length, says how
-    // deep the origin is.
-    //
-    // 256 bytes, not 1024: `execute` recurses to depth 16, so the instrument must not itself push a
-    // stack this tight over. 0xC3 so it cannot be confused with 0x5A, 0x20 or 0x00.
-    const CANARY2_BYTE: u8 = 0xC3;
-    let canary2 = [CANARY2_BYTE; 256];
-    core::hint::black_box(&canary2);
     let Ok(s) = core::str::from_utf8(line) else {
         ctx.console_writeln("shell: invalid input");
         return Err(ShellError::Unknown);
@@ -3449,80 +3436,6 @@ fn let_capture_form(s: &str) -> Option<(&str, bool, &str)> {
 fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool) -> Result<(), ShellError> {
     // Per-run interpreter state: a bounded variable table, allocated once HERE (above `execute`) and
     // threaded by &mut into `run_stmt` - it never reaches `execute`/`pipe_run`'s frame. No heap (§26.6).
-    // STACK CANARY - DIAGNOSTIC, not a feature.
-    //
-    // Five of six Pi 4 shell faults smashed one frame with the SAME 4304-byte run of 0x20 and then
-    // returned into it (`ELR = 0x2020202020202020`). The fault is reported at the RETURN, long after
-    // whatever wrote those bytes finished - so every register dump so far names a victim and never a
-    // culprit. The console grid was ruled out by experiment (the fill did not move when the geometry
-    // did); the shell has no `unsafe`, a safe-Rust overrun would panic rather than corrupt, and there
-    // is no panic.
-    //
-    // This lives in `run_lines`, whose frame outlives every statement the suite runs, and is checked
-    // AFTER EACH STATEMENT. A smash large enough to reach the saved registers has to cross this array
-    // on the way, so the first statement to dirty it is the one that did it - named before the crash
-    // instead of after.
-    //
-    // `black_box` at both ends so it cannot be optimised away as write-only, and a pattern that is
-    // neither 0x00 nor 0x20 - the two fills already seen - so a hit cannot be confused with the
-    // corruption being hunted.
-    const CANARY_BYTE: u8 = 0x5A;
-    // Sized so that one whole 4 KiB PAGE lies strictly inside the array, with canary bytes on both
-    // sides of it. That interior page is the target of the read-only experiment below: because every
-    // byte of it belongs to the canary, NO legitimate write can land there - not the shell's deeper
-    // frames (lower addresses), not its callers' frames (higher), and not the canary's own
-    // per-statement poke (index 0, below the page). So a permission fault on that page cannot be a
-    // false positive; it can only be the writer being hunted.
-    let mut canary = [CANARY_BYTE; 8192];
-    core::hint::black_box(&canary);
-    let mut canary_reported = false;
-    // The first page boundary at or above the array start. `8192 - 4095 >= 4096`, so the page that
-    // begins there is wholly within the array whatever the array's alignment turns out to be.
-    let guard_page = ((canary.as_ptr() as usize) + 0xFFF) & !0xFFF;
-    // CONTROL: prove the canary bytes are REALLY at that address, as seen by the KERNEL.
-    //
-    // Every conclusion drawn from "the canary is gone" assumes the bytes were there to begin with. A
-    // read-only array that the shell only ever compares against could, in principle, be folded away,
-    // and then the shell`s own check would read "intact" forever while the stack held nothing - which
-    // is EXACTLY the pair of results that has been so contradictory.
-    //
-    // 0x5A is ASCII `Z`, so handing the array to `console_write` makes the KERNEL read that user
-    // pointer and print what it finds. A row of Zs proves three things at once: the bytes exist, they
-    // are at the address reported, and the kernel can read them there. Anything else - blanks, junk,
-    // nothing - means the instrument was never measuring memory and every conclusion from its absence
-    // is void. Once per run, so it adds no per-statement load.
-    ctx.console_writeln_fmt(format_args!("canary-control at {:#x}:", canary.as_ptr() as usize));
-    // ARM THE READ-ONLY EXPERIMENT.
-    //
-    // Everything that could write this stack has been eliminated by measurement: the shell (no
-    // `unsafe`, every buffer clamps), other tasks (no shared frames, no page aliasing), the kernel
-    // (zero `copy_to_user` writes overlapping the canary), and the DMA arenas (no overlap, none
-    // within 8 frames). The canary is destroyed anyway. One candidate is left that none of those
-    // checks can see: a device writing to a physical address it should never have been given. This
-    // board has no IOMMU/SMMU (6.4), so driver DMA is unconfined and invisible to all of the above.
-    //
-    // CPU writes and DMA differ in exactly one observable way here: DMA bypasses the MMU. Marking the
-    // interior page read-only therefore separates them, and does so POSITIVELY rather than by another
-    // elimination:
-    //   - canary destroyed and NO fault  -> the writer was not the CPU, which is DMA.
-    //   - a permission fault             -> a CPU writer after all, and the dump names its exact PC.
-    // Either outcome ends the investigation; there is no third result.
-    //
-    // The request travels as a marker on a line the kernel is already reading, NOT as a syscall: a
-    // service must not be able to ask the kernel to change page permissions, and adding a syscall for
-    // it would grow the kernel's responsibilities (4.4). Diagnostic-only; it goes when the fault does.
-    ctx.console_writeln_fmt(format_args!("canary-guard {:#018x}", guard_page));
-    ctx.console_writeln(core::str::from_utf8(&canary[..64]).unwrap_or("(not utf8)"));
-    // CONTROL: prove the canary EXISTS before trusting any conclusion drawn from its absence.
-    //
-    // The kernel scans the stack for 0x5A at fault time and has twice reported a longest run of ONE
-    // byte, which I read as "destroyed". That reading is only valid if the array is actually there:
-    // an optimiser free to elide it, or to reuse its slot after the last check, produces the same
-    // reading with nothing wrong at all. Printing its address and length once, on a HEALTHY run,
-    // settles which - and it costs one line per selfcheck.
-    ctx.console_writeln_fmt(format_args!(
-        "shell: canary at {:#x} len {} first={:#04x} last={:#04x}",
-        canary.as_ptr() as usize, canary.len(), canary[0], canary[canary.len() - 1]));
     let mut vars = Vars::new();
     let mut ran = 0u32;
     let mut failed = 0u32;
@@ -3924,45 +3837,6 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
                 StmtOutcome::Stop(r) => (r, true),
             }
         };
-        // Did THIS statement dirty the canary? Reported once - the first hit is the one that matters;
-        // everything after it is already running on a corrupt stack.
-        // SILENT per statement, LOUD only on a hit.
-        //
-        // The per-statement print was itself changing the outcome: it roughly doubled console output
-        // and the crash moved from statement ~122 to ~30-66, about a second into the run. On this
-        // board a single console paint has been measured at 355 ms, so an instrument that prints per
-        // statement is not observing the system, it is loading it. The canary is still CHECKED every
-        // statement - only the reporting is now conditional, so the measurement stays and the load
-        // goes.
-        {
-            // MUTATE IT, or the compiler is entitled to throw it away.
-            //
-            // The previous canary was never written, so LLVM could prove `position()` always returns
-            // `None`, fold the check to a constant, and treat the array as DEAD - after which its
-            // 1024-byte slot was legitimately reused by output buffers. That is why the kernel found
-            // spaces where the canary should be, and why the shell's check said "ok" the whole time:
-            // both were true, and neither was measuring memory. `black_box(&canary)` forces
-            // materialisation at that point only - it does not keep the array live across a loop.
-            //
-            // Writing byte 0 every statement makes the array observably live, so it must exist in real
-            // memory for the whole run. Byte 0 is then excluded from the check and the other 1023 are
-            // the actual canary.
-            //
-            // This is the discriminator the whole investigation now rests on. If THIS canary survives
-            // to the fault, nothing is corrupting the stack and the fault is a bad SP - the frame read
-            // its return address from the wrong offset. If it is destroyed, the corruption is real and
-            // I hunt the writer with an instrument that has earned it.
-            canary[0] = canary[0].wrapping_add(1);
-            core::hint::black_box(&mut canary);
-            if let Some(k) = canary[1..].iter().position(|&b| b != CANARY_BYTE) {
-                if !canary_reported {
-                    canary_reported = true;
-                    ctx.console_writeln_fmt(format_args!(
-                        "canary {:#x} BAD@{} =0x{:02x} - FIRST dirtied by: {}",
-                        canary.as_ptr() as usize, k + 1, canary[k + 1], s));
-                }
-            }
-        }
         last = res;
         if nrec < RUN_MAX_CMDS { verdict[nrec] = last.is_ok(); soff[nrec] = stmt_off as u16; slng[nrec] = stmt.len() as u16; }
         nrec += 1;
