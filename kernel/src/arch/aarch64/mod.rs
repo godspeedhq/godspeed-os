@@ -1306,6 +1306,9 @@ pub fn usb_disk_flush() -> bool { false }
 /// that is absent should at least be absent loudly (§26.4); here it is simply present.
 /// (interrupts dispatched, last GIC interrupt ID) for `core` - what the liveness panic reports.
 /// Tallied at IRQ entry in `exceptions.rs`; the 32-bit port's twin lives in `arch/arm/irq.rs`.
+/// No-op: this arch counts every IRQ in its own dispatcher, not on the timer path.
+pub fn note_irq(_vector: u32) {}
+
 pub fn core_irq_debug(core: u32) -> (u32, u32) {
     exceptions::core_irq_debug(core)
 }

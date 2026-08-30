@@ -225,7 +225,14 @@ const XHCI_DMA_PAGES:      u64 = 32 + 256 + 4;
 const EHCI_DMA_PAGES:      u64 = 16;
 
 /// Maximum named send peers per service.
-pub const MAX_SEND_PEERS:  usize = 4;
+/// Send peers a service may be wired with.
+///
+/// RAISED 4 -> 6 (2026-08-29). The shell legitimately needs five (`fs`, `block-driver`, `time`,
+/// `console`, `logger`), and at four the fifth was dropped SILENTLY - the contract declared it, the
+/// service never got the cap, and the only symptom was a peer that behaved as though it did not exist.
+/// The cap itself is right (a fixed array, §26.6); the silence was the bug, and the loud reject below
+/// is the other half of this fix.
+pub const MAX_SEND_PEERS:  usize = 6;
 /// Maximum bytes per peer name stored in ServiceContextData.
 pub const PEER_NAME_BYTES: usize = 24;
 
@@ -305,7 +312,7 @@ struct ServiceContextData {
 // Pinned by SIZE in both crates. It does not prove field ORDER, but it catches the mistake that
 // actually happens - an append on one side only - and it fails at compile time in the crate that
 // drifted rather than at boot in a service that reads garbage.
-const SERVICE_CONTEXT_DATA_SIZE: usize = 256;
+const SERVICE_CONTEXT_DATA_SIZE: usize = 320;   // 256 + 2 x SendPeerEntry(32) after MAX_SEND_PEERS 4 -> 6
 const _: () = assert!(
     core::mem::size_of::<ServiceContextData>() == SERVICE_CONTEXT_DATA_SIZE,
     "ServiceContextData changed size: update BOTH kernel/src/task/mod.rs and      sdk/rust/src/service_context.rs, then update SERVICE_CONTEXT_DATA_SIZE in both"
@@ -708,7 +715,17 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // That blocks only the core it runs on - and this service was sharing core 0 with `dwc2`,
             // whose split transactions must hit 125 us windows. Moving the writer is the cheap half
             // of the fix; it needs no console rework and it uses the cores this board has.
-            preferred_core:    if cfg!(target_arch = "arm") { 2 } else { 0 },
+            // OFF CORE 0 ON EVERY ARCH. ARM moved it first, for the reason above; x86 has now been
+            // shown to need the same thing for a different one. Every trace event WAKES this service,
+            // and while it sat on core 0 it preempted the shell twice per fs request: `osdev test
+            // files` went 222/0 -> 213/9 with tracing on, tab completion and `find` timing out, and
+            // straight back to 222/0 with nothing changed but this number. A diagnostic sink does not
+            // belong on the interactive core.
+            //
+            // Safe on a machine with fewer cores: an unavailable preferred core falls back to
+            // round-robin (`resolve_placement`), it does NOT fail the spawn - so a 1-core or 2-core
+            // box still gets its logger.
+            preferred_core:    2,
             probe_mode:        0,
             memory_limit:      8 * 1024 * 1024,   // matches logger.toml (a stub sink needs ~none); the
                                                  // contract is the source of truth (audit T1 reconcile)
@@ -1192,7 +1209,10 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "fs" => Some(("fs", ServiceConfig {
             elf:               include_bytes!(env!("SVC_FS_ELF")),
             has_recv_endpoint: true, // owns an endpoint (reply target + future fs API)
-            send_peers:        &["block-driver"], // fs's block-driver peer (supervisor-provided / name-wired)
+            // "logger" is the EMIT cap: holding it is what makes this service traced, and its absence
+            // is what makes an untraced service cost one relaxed load (`sdk::trace`). Authority, visible
+            // in `caps fs`, revocable - not a global switch (3.1).
+            send_peers:        &["block-driver", "logger"],
             send_peers_grant:  false,
             preferred_core:    1,
             probe_mode:        0,
@@ -3662,7 +3682,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // `console`: terminal geometry, for the pager and `edit`. It used to come from the KERNEL
             // (`InspectKernel` query 9, now deleted) - the shell was asking the wrong party for a fact
             // the terminal owns (docs/console-service.md 9.7).
-            send_peers:        &["fs", "block-driver", "time", "console"],
+            send_peers:        &["fs", "block-driver", "time", "console", "logger"],
             send_peers_grant:  false,
             // ARM: OFF CORE 0, to keep the serial writer away from the microframe-timed USB driver.
             //
@@ -4066,6 +4086,13 @@ fn spawn_service_with_config(
                 reply_recv_slot_u32 = u32::MAX;
             }
         }
+        } else {
+            // REFUSED, so give the id back. The allocation happened before the registration could
+            // fail, and without this an id vanished on every refusal - the same leak the death path
+            // had, on the path that runs precisely when the table is under pressure and can least
+            // afford it. The task simply awaits replies on its shared endpoint, as it did before
+            // reply endpoints existed.
+            crate::ipc::free_endpoint_id(reply_ep_id);
         }
 
         // Wire hw_interrupt lines to this endpoint (§12.3).
@@ -4222,6 +4249,16 @@ fn spawn_service_with_config(
     }
 
     // 2. Name-wire each declared send-peer the caller did NOT already provide.
+    // OVERFLOW IS LOUD (invariant 12). A contract declaring more peers than fit used to lose the extras
+    // in SILENCE: the declaration was there, the cap never arrived, and the only symptom was a peer
+    // behaving as though it did not exist - which reads as "that service is broken", not "you are over
+    // a limit". It cost a debugging cycle on the very change that raised this cap. Keeping the cap
+    // fixed is correct (26.6); losing data without saying so is the same shape as the x86 input ring.
+    if send_peers.len() > MAX_SEND_PEERS {
+        crate::kprintln!(
+            "task: '{}' declares {} send peers, limit {} - the extras are NOT wired (raise              MAX_SEND_PEERS in task/mod.rs AND sdk/service_context.rs, and SERVICE_CONTEXT_DATA_SIZE              in both)",
+            name, send_peers.len(), MAX_SEND_PEERS);
+    }
     for &peer_name in send_peers {
         if peer_count >= MAX_SEND_PEERS { break; }
 

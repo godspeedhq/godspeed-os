@@ -4,18 +4,28 @@ Structured log sink (§11.4). **Restartable.** Not a TCB member.
 
 ## Current behaviour (what the code actually does)
 
-The logger is a **minimal placeholder** today (`src/main.rs`): it prints `"logger: ready"` and then
-**drains its recv endpoint, dropping each message**. It does that draining deliberately - a registered
-service whose endpoint just parked (never `recv`s) would let a flood or a stray send fill its 16-deep
-queue and sit at 16/16 forever (the flood-endpoint disease). `recv` parks the task between messages, so
+The logger does two things, both "somewhere to put diagnostic data that someone reads later":
+
+1. **Drains its recv endpoint**, dropping any message it does not recognise.
+2. **Holds the IPC trace ring** (`utilities/46_trace.md` §8b) - a fixed 192-event history of
+   request/reply events emitted by services whose contract grants them `ipc_send = ["logger"]`, read
+   back by the `trace` utility (`trace ipc`, `trace failures`, `trace status`). Full = overwrite the
+   oldest and **count** it; `trace status` reports the count, because a silent loss is the bug
+   (invariant 12). The ring is not persistence - a restarted logger starts empty, and that is correct,
+   because the ring is history and nothing depends on it. **The kernel records nothing**: the emitter
+   knows its own peer's NAME and its own protocol's opcode, and the kernel is forbidden to know either
+   (§4.4, §26.10), which is why the instrumentation lives in the SDK and the ring lives here.
+
+The draining is deliberate - a registered service whose endpoint just parked (never `recv`s) would
+let a flood or a stray send fill its 16-deep queue and sit at 16/16 forever (the flood-endpoint disease). `recv` parks the task between messages, so
 the core still idles.
 
 **How services actually log today:** `ctx.log()` is a **syscall** that writes the kernel's 16 KiB ring
 buffer **and** the serial console **directly** - it does NOT send IPC to this service. So logging does
 not depend on the logger being up: when the logger is dead, `ctx.log()` still works (it never blocks on
 the logger and never returns `EndpointDead` from it), and a chaos storm that kills the logger loses no
-log output. The logger service exists to own its name + endpoint and to be a restartable home for the
-richer sink described next.
+log output. The logger service exists to own its name + endpoint, to hold the
+trace ring, and to be a restartable home for the richer sink described next.
 
 ## Future work (not yet implemented)
 

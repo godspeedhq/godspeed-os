@@ -13,4 +13,11 @@ ipc_receive = ["logger"]
 # never granted by the kernel - a contract stating authority the service never held (audit T1 reconcile).
 
 [placement]
-core = 0
+# OFF CORE 0. This service is woken by every trace event (it holds the IPC trace ring), and while it
+# sat on core 0 it preempted the SHELL twice per fs request - `osdev test files` went 222/0 to 213/9
+# with tracing on, and back to 222/0 with nothing changed but this number. ARM had already moved it
+# for a different reason: a serial write is an un-preemptible syscall of ~9 ms per log line, which was
+# wrecking the microframe timing of the USB driver sharing its core.
+#
+# A diagnostic sink does not belong on the interactive core, on either arch.
+core = 2

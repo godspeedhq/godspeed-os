@@ -932,6 +932,10 @@ pub struct TaskStatRaw {
     pub queue_depth: u8,
     pub run_ticks:   u64,
     pub uptime_secs: u64,
+    /// The endpoint this task OWNS (0 = none). Already read here to compute `queue_depth`; exposing it
+    /// costs nothing and is what lets a reader map an awaited endpoint back to the task that owns it,
+    /// which is the whole of the blocked-chain walk (`utilities/46_trace.md`).
+    pub endpoint:    u64,
 }
 
 /// Return a best-effort snapshot of task state at `slot`.
@@ -941,7 +945,8 @@ pub struct TaskStatRaw {
 pub fn task_stat(slot: usize) -> TaskStatRaw {
     if slot >= MAX_TASKS {
         return TaskStatRaw { valid: false, state: 0, core: 0, mem_used: 0, mem_limit: 0,
-                             name: "", restart_count: 0, queue_depth: 0, run_ticks: 0, uptime_secs: 0 };
+                             name: "", restart_count: 0, queue_depth: 0, run_ticks: 0, uptime_secs: 0,
+                             endpoint: 0 };
     }
     // SAFETY: read-only snapshot of static arrays; all reads are individually
     // naturally-atomic on x86_64 (u64/u32/pointer-width). Best-effort consistency
@@ -987,6 +992,8 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
                     (crate::arch::imp::rtc::now_epoch_monotonic().max(0) as u64).saturating_sub(spawn)
                 }
             },
+            // Already loaded above to compute `queue_depth` - exposing it costs no extra read.
+            endpoint: endpoint.map_or(0, |ep| ep.0),
         }
     }
 }
@@ -1264,6 +1271,12 @@ pub fn run(core_id: u32) -> ! {
 /// they are unused now that the ring-3 bring-up diagnostics are removed.
 #[no_mangle]
 pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u64, _interrupted_rsp: u64) {
+    // EVIDENCE FIRST, before any handling. The liveness watchdog's whole diagnostic value rests on
+    // being able to say whether a dark core is still TAKING interrupts (its handler is being skipped)
+    // or has stopped receiving them (its timer died) - and it can only say that if the count is
+    // stamped on arrival rather than on completion. A no-op on arches that count every IRQ in their
+    // own dispatcher; on x86 there is no such funnel, so the timer path stamps it here (vector 32).
+    crate::arch::imp::note_irq(32);
     let cid = current_core_id();
     // A11-1: EVERY core checks the panic flag, on the tick every core takes.
     //
@@ -1361,11 +1374,19 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     // means the core is not taking interrupts at all, a climbing one means it is and
                     // the tick inside the handler is being skipped. Same symptom, opposite causes.
                     let (irqs, last_src) = crate::arch::imp::core_irq_debug(other as u32);
+                    // SAY "IDLE" WHEN IT WAS IDLE. `CORE_CURRENT` holds `IDLE` (== MAX_TASKS) when a
+                    // core has nothing to run, and printing that as "last running task slot 224" sent
+                    // a reader hunting a task that does not exist - 224 is not a slot, it is the
+                    // sentinel meaning there was no task. The two cases want opposite investigations:
+                    // a real slot points at a service that stopped yielding, `idle` points at the
+                    // core's own wakeup path.
+                    let what = if stuck_task == IDLE { "IDLE (no task)" } else { "task slot" };
+                    let slot_num = if stuck_task == IDLE { 0 } else { stuck_task };
                     panic!(
                         "LIVENESS WEDGE: core {} made NO progress for {} counter ticks ({}x the {} \
-                         allowed); last running task slot {}; it has taken {} interrupts, last source \
+                         allowed); it was running {} {}; it has taken {} timer interrupts, last vector \
                          {:#010x}; detected by core {}. No forward progress = loud stop.",
-                        other, dark, dark / deadline, deadline, stuck_task, irqs, last_src, cid
+                        other, dark, dark / deadline, deadline, what, slot_num, irqs, last_src, cid
                     );
                 }
             }
@@ -2041,6 +2062,19 @@ pub fn kill_task_by_slot(slot: usize) {
             crate::capability::table::mark_dead_resource(
                 crate::capability::cap::ResourceId::from(rep_id));
             TASK_REPLY_ENDPOINT[slot].store(0, Ordering::Relaxed);
+            // RECLAIM THE ID, exactly as the primary endpoint's is reclaimed below. Without this a
+            // spawn took TWO ids and a death gave ONE back, so every restart leaked one id and a
+            // sustained restart storm marched the counter into the delegated/file-cap band and
+            // PANICKED the kernel - which is the one thing nothing above the kernel may cause.
+            // Found by BS5 (5000 kill/respawn cycles), which died at ~1744 with
+            // "endpoint id space exhausted". The bound existed and was loud; what was missing was
+            // the other half of the reclaim it was guarding.
+            //
+            // Unlike the primary, this id is safe to free RIGHT HERE: the ordering care taken below
+            // is about the NAME directory, and a reply endpoint has no name. `kill_endpoint` has
+            // already marked its routing entry Dead and bumped its generation, so a reused id is
+            // seeded strictly above it and a stale cap still fails (14.2, 7.5).
+            crate::ipc::free_endpoint_id(rep_id);
         }
 
         if let Some(ep_id) = task_ep {

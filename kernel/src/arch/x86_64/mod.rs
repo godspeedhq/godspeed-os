@@ -325,8 +325,55 @@ pub fn usb_disk_flush() -> bool { false }
 /// A normal shootdown or critical section is milliseconds, so ~3 s cannot false-fire.
 /// (interrupts dispatched, last IRQ source) for `core`. Not tracked on this port, so the liveness
 /// panic prints zeros rather than a wrong number - it was added to diagnose an arm32 wedge.
-pub fn core_irq_debug(_core: u32) -> (u32, u32) {
-    (0, 0)
+/// Per-core interrupt evidence for the liveness watchdog: how many timer interrupts a core has
+/// TAKEN, and the vector of the last one.
+///
+/// # Why this stopped being a stub
+///
+/// It returned `(0, 0)`, and the watchdog prints that as "it has taken 0 interrupts, last source
+/// 0x00000000" - which reads as hard evidence that a wedged core stopped being interrupted, when it
+/// was a hardcoded zero that could not distinguish anything. The comment at the panic site says this
+/// clause is exactly what tells a reader WHICH wedge they have ("a frozen count means the core is not
+/// taking interrupts at all, a climbing one means it is and the tick inside the handler is being
+/// skipped") - so on x86 the one field separating the two causes was the field that was invented. A
+/// wedge on the T630 is what surfaced it.
+///
+/// ARM has counted since its watchdog was written (`arch/arm/irq.rs`); x86 was the inconsistent one.
+///
+/// SCOPE, stated rather than implied: this counts the TIMER path only, because x86 has no single
+/// funnel every interrupt passes through - each vector has its own stub. That is the interrupt the
+/// watchdog hunts (a core whose timer stopped IS the wedge), but it is not "all interrupts", and a
+/// reader comparing this with ARM's number should know the difference.
+///
+/// A FIXED ARRAY, not a `PerCore` arena, and deliberately: this is stamped from an interrupt that
+/// fires long before any per-core arena is allocated, so an arena here would be a null dereference
+/// inside an ISR. 64 slots is 512 bytes of .bss and covers every machine this runs on; a core id past
+/// it is simply not counted rather than wrapped onto another core's tally, because a diagnostic that
+/// quietly attributes one core's interrupts to another is worse than one that says nothing.
+const IRQ_DEBUG_CORES: usize = 64;
+static IRQ_COUNT: [core::sync::atomic::AtomicU32; IRQ_DEBUG_CORES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; IRQ_DEBUG_CORES];
+static IRQ_LAST_VEC: [core::sync::atomic::AtomicU32; IRQ_DEBUG_CORES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; IRQ_DEBUG_CORES];
+
+/// Record that this core TOOK an interrupt. Stamped BEFORE any handling, so the count proves the
+/// interrupt arrived rather than that its handler finished - a handler that hangs is precisely the
+/// case this exists to tell apart.
+#[inline]
+pub fn note_irq(vector: u32) {
+    use core::sync::atomic::Ordering;
+    let cid = crate::task::scheduler::current_core_id();
+    if cid < IRQ_DEBUG_CORES {
+        IRQ_COUNT[cid].fetch_add(1, Ordering::Relaxed);
+        IRQ_LAST_VEC[cid].store(vector, Ordering::Relaxed);
+    }
+}
+
+pub fn core_irq_debug(core: u32) -> (u32, u32) {
+    use core::sync::atomic::Ordering;
+    let i = core as usize;
+    if i >= IRQ_DEBUG_CORES { return (0, 0); }
+    (IRQ_COUNT[i].load(Ordering::Relaxed), IRQ_LAST_VEC[i].load(Ordering::Relaxed))
 }
 
 pub fn liveness_deadline_cycles() -> u64 {
@@ -721,7 +768,23 @@ pub fn com2_try_read_byte() -> Option<u8> {
 // COM1 UART RX - interrupt-driven ring buffer for the shell service.
 // ---------------------------------------------------------------------------
 
-const COM1_RX_BUF_SIZE: usize = 64;
+/// Bytes the console input ring holds.
+///
+/// SIZED TO ONE FULL COMMAND LINE (the shell's `MAX_LINE`, 256), and that derivation is the point:
+/// the reader is a line-oriented shell, so the ring must survive the reader being busy for exactly
+/// as long as one command takes. At 64 it did not - a line longer than 64 bytes typed or pasted
+/// while the shell was still finishing the previous command lost its tail, including the CARRIAGE
+/// RETURN, so the next command silently joined the mangled line. That is what `osdev test files`
+/// was failing on: 40 checks red from ONE dropped byte.
+///
+/// aarch64 has been 256 since its ring was written (`arch/aarch64/uart_rx.rs`); x86 was the
+/// inconsistent one, exactly as it was for the drop COUNTER a few commits ago. Same file, same
+/// lesson twice: a bound must be derived from what the reader consumes, not picked.
+///
+/// The bound is still a bound (26.6) - 256 bytes of .bss, fixed, and an overflow beyond it is still
+/// counted and reported below (invariant 12). A busier reader can still lose a byte; it can no
+/// longer lose one to a single ordinary command line.
+const COM1_RX_BUF_SIZE: usize = 256;
 
 /// Single-producer (IRQ handler) / single-consumer (ConsoleRead syscall) ring buffer.
 /// head = read index (consumer advances), tail = write index (producer advances).

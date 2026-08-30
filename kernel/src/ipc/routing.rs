@@ -105,6 +105,25 @@ fn set_call_await(caller_slot: usize, target: EndpointId) {
     }
 }
 
+/// The endpoint `slot` is blocked-in-CALL awaiting a reply from, or 0 if it has no call in flight.
+///
+/// **Reads state the kernel already keeps for correctness; it records nothing new.** `CALL_AWAIT_EP`
+/// exists so a dead replier wakes its caller with `ReplyDead` (§8.6). That same record answers "why is
+/// this task not progressing?", because the chain of who-awaits-whom IS the causal chain - so the
+/// `trace` utility is a reader of this, not a tracer (`utilities/46_trace.md`).
+///
+/// Relaxed, and deliberately so: this is a best-effort snapshot for an operator, on the same contract
+/// as `task_stat`. A value read the instant before the awaited endpoint replies is stale, and that is
+/// acceptable - the alternative is taking the `TABLE` lock on an introspection path, which would let
+/// an observer perturb the thing it observes.
+pub fn call_await_endpoint(slot: usize) -> u64 {
+    if slot < CALL_AWAIT_EP.len() {
+        CALL_AWAIT_EP[slot].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
 /// Clear `caller_slot`'s outstanding-call record (TABLE held, or a lone store on the kill path).
 #[inline]
 fn clear_call_await_inner(caller_slot: usize) {

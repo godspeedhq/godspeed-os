@@ -1171,6 +1171,9 @@ pub fn usb_disk_flush() -> bool { false }
 /// so the margin is deliberately generous; it can tighten once the ARM worst case is measured rather
 /// than reasoned about.
 /// (interrupts dispatched, last IRQ source) for `core` - what the liveness panic reports.
+/// No-op: this arch counts every IRQ in `irq::arm_irq_dispatch`, which sees them all.
+pub fn note_irq(_vector: u32) {}
+
 pub fn core_irq_debug(core: u32) -> (u32, u32) {
     irq::core_irq_debug(core)
 }

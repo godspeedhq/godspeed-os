@@ -1512,3 +1512,117 @@ be one `--features` away in a shipped kernel.
   bounded on the cycle counter rather than an iteration count - the "a count is not a duration"
   lesson applied correctly.
 - **No new syscall** was added on this branch, so the cap-gate surface is unchanged.
+
+---
+
+## Audit 9 - the reply-endpoint id leak, found by BS5 (2026-08-29, `feat/trace`)
+
+Not a sweep. One bug, found by running a suite that had been red long enough to be assumed flaky, and
+recorded here because the shape of it is worth keeping.
+
+### K9-1 (HIGH, FIXED) - a spawn took TWO endpoint ids and a death gave ONE back
+
+`kernel/src/task/scheduler.rs` (death path) and `kernel/src/task/mod.rs` (spawn path).
+
+Every task gets a primary receive endpoint and an optional reply-only endpoint, each with an id from
+`ipc::alloc_endpoint_id`. The death path reclaimed the primary (`free_endpoint_id(ep_id)`) and never
+the reply one; the spawn path leaked the reply id outright when `try_register_optional` refused it.
+So every restart leaked one id, and a sustained restart storm marched the monotonic counter into the
+delegated/file-cap band, where the guard did exactly what it was written to do:
+
+```
+KERNEL PANIC: endpoint id space exhausted (reached the delegated/file-cap band at 4096)
+```
+
+**A userspace restart storm panicked the kernel** - the one outcome nothing above the kernel is
+allowed to cause. Reproduced by `osdev test stress` BS5 (5000 kill/respawn cycles), which died at
+~1744.
+
+Two things are worth separating here. The reclaim itself was written deliberately, with a comment
+naming this exact failure ("without this the id counter only climbs and a sustained restart storm
+exhausts the band and panics") - and it was still only half done, because the reply endpoint was
+added later and the reclaim was not revisited. **A resource that is allocated in two places must be
+freed in two places**, and the review question that catches it is not "is this freed?" but "is every
+allocation site matched?".
+
+The second is that the bound WORKED. The counter had a guard, the guard was loud, and it named the
+band it hit - which is why this was a two-minute diagnosis from a log line rather than an
+investigation. The failure mode a silent version of this produces is an id handed out twice.
+
+Fixed by reclaiming the reply id on death (safe to free immediately - the ordering care the primary
+needs is about the NAME directory, and a reply endpoint has no name) and on refusal.
+
+### K9-2 (MEDIUM, FIXED) - the console input ring was sized below one command line
+
+`kernel/src/arch/x86_64/mod.rs`, `COM1_RX_BUF_SIZE = 64`, against a reader whose line buffer is 256.
+
+A line longer than 64 bytes typed or pasted while the shell was finishing the previous command lost
+its tail, including the CARRIAGE RETURN, so the next command silently joined the mangled line. This
+is what `osdev test files` had been failing on - 40 checks red from one dropped byte. aarch64 has
+been 256 since its ring was written; x86 was the inconsistent one, exactly as it was for the drop
+COUNTER a few commits earlier. Sized to `MAX_LINE`, which is the derivation: the ring must survive
+the reader being busy for as long as one command takes.
+
+The drop was already counted and reported (that counter was added a few commits before this), and
+that report is the entire reason this was findable - the transcript said `console input ring FULL`
+one line before the mangled command. An instrument added for one bug paid for itself on the next.
+
+### K9-3 (LOW, FIXED) - two stress probes asked a question a dead service cannot answer
+
+`services/probe/src/main.rs`, S4 and BS4. Both killed the victim and THEN read its endpoint
+generation by name - but death unregisters the name (`names::unregister_endpoint`, the
+post-max-carnage fix), so the lookup misses and the query returns 0. The checks compared 0 against
+the previous generation and failed for a reason that has nothing to do with generations; they only
+ever passed by winning a race against the death path. Fixed by reading while the instance is alive,
+between the spawn and the kill - which is also the stronger question, and the one §7.5 actually makes
+a claim about. §22.4: a test failing for the wrong reason is a failure of the test.
+
+### A9-4 (OPEN) - A8-1's wedge RETURNED once the BSP could actually reach idle
+
+`LIVENESS WEDGE: core 0 ... slot 224` (224 = IDLE), ~4 s after boot on the T630, on `feat/trace`. That
+is A8-1's fingerprint exactly - same core, same sentinel, same machine, same delay - and A8-1's own
+note says why it had been invisible: **"Latent for the life of the port - userspace spin-yielded, so
+the BSP never reached idle."**
+
+That is the connection. On this branch `logger` moved OFF core 0 (every trace event wakes it, and on
+core 0 it preempted the shell twice per fs request - `osdev test files` 222/0 -> 213/9, and back to
+222/0 with nothing changed but the core number). Core 0 now holds only services that BLOCK, so a fully
+idle BSP became common for the first time. The trace work did not create this defect; it removed the
+thing that was hiding it.
+
+**PLACEMENT IS NOT THE FIX, and calling it one would be wrong.** GodspeedOS is expected to run on a
+SINGLE core, where `preferred_core: 2` falls back to round-robin onto core 0 - so on a one-core machine
+the sink shares the shell's core again by necessity, the contention that moved it returns, and an idle
+BSP is the only BSP there is. Moving `logger` bought measured headroom on a 4-core box and exposed this
+defect; it does not remove either problem. Both the idle-halt path and the cost of waking a sink have
+to be correct on one core.
+
+`rearm_quantum_timer` still exists, still carries the "never halt without a freshly armed wake"
+comment, and is still called from four sites in `task/scheduler.rs` - so this is not a plain revert.
+Either the fix is incomplete or a second path halts without arming. Deliberately left OPEN rather than
+guessed at (26.7): the next reproduction now carries real evidence, because of A9-5.
+
+### A9-5 (FIXED) - the watchdog's own evidence was invented on x86
+
+`core_irq_debug` in `arch/x86_64/mod.rs` returned `(0, 0)`. The watchdog prints that as "it has taken
+0 interrupts, last source 0x00000000", and the comment at the panic site says that clause is precisely
+what tells a reader WHICH wedge they have: *"a frozen count means the core is not taking interrupts at
+all, a climbing one means it is and the tick inside the handler is being skipped. Same symptom,
+opposite causes."*
+
+So on x86 the single field that separates the two causes was a hardcoded zero - a panic message
+steering every reader toward one of two conclusions regardless of which was true. ARM has counted
+since its watchdog was written; x86 was the inconsistent one, which is the third time that exact
+sentence has been true in this cycle (the input-ring drop counter and the console ring size were the
+others).
+
+Fixed: a per-core counter stamped on ARRIVAL in the timer path (before any handling, so it proves the
+interrupt was TAKEN rather than that its handler finished - a hung handler is the case being told
+apart). A fixed 64-entry array rather than a `PerCore` arena, because this is stamped from an
+interrupt that fires long before any arena is allocated; a core id past the array is not counted
+rather than wrapped onto another core's tally. It counts the TIMER path only - x86 has no single IRQ
+funnel - and the message now says `timer interrupts` / `last vector` so it is not read as ARM's
+all-interrupt count.
+
+The message also said `last running task slot 224` when 224 is `IDLE == MAX_TASKS`, the sentinel for
+"no task at all" - sending a reader to hunt a task that does not exist. It now says `IDLE (no task)`.

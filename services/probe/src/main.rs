@@ -1223,16 +1223,29 @@ fn mode_stress_s4(ctx: &ServiceContext) -> ! {
         idle(ctx);
     }
 
-    let mut prev_gen = ctx.inspect_endpoint_generation("stress-s4-victim");
+    // Read the generation while the instance is ALIVE, between the spawn and the kill.
+    //
+    // This used to read it AFTER the kill, and that stopped being answerable when death gained
+    // `names::unregister_endpoint` (task/scheduler.rs - the post-max-carnage fix that stops a dead
+    // instance clearing a live one's name). A dead service HAS no name, so the lookup misses and the
+    // query returns 0, so the check compared 0 against the previous generation and failed for a
+    // reason that has nothing to do with generations. It only ever passed by winning a race against
+    // the death path. A test that fails for the wrong reason is a failure of the test (22.4).
+    //
+    // Asking while the instance is alive is also the STRONGER question, and the one 7.5 actually
+    // makes a claim about: each fresh instance must carry a generation above the last instance's, so
+    // every cap minted against the old one is stale. `next_generation()` is a global counter, so this
+    // must hold for every respawn regardless of which endpoint id or slot the instance lands on.
+    let mut prev_gen = 0u64;
     for _ in 0..10u32 {
         let _ = ctx.spawn("stress-s4-victim");
-        let _ = ctx.kill("stress-s4-victim");
         let gen = ctx.inspect_endpoint_generation("stress-s4-victim");
         if gen <= prev_gen {
             ctx.log("stress: S4 FAIL - generation not monotonic under churn");
             idle(ctx);
         }
         prev_gen = gen;
+        let _ = ctx.kill("stress-s4-victim");
         if !matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead)) {
             ctx.log("stress: S4 FAIL - cap A not stale during churn");
             idle(ctx);
@@ -2797,16 +2810,19 @@ fn mode_stress_bs4(ctx: &ServiceContext) -> ! {
         idle(ctx);
     }
 
-    let mut prev_gen = ctx.inspect_endpoint_generation("stress-bs4-victim");
+    // Read the generation while the instance is ALIVE (see the same note on S4): a dead service has
+    // no name, so a post-kill lookup misses and returns 0, which is not a statement about
+    // generations at all. BS5 below already asks in this order.
+    let mut prev_gen = 0u64;
     for _ in 0..50u32 {
         let _ = ctx.spawn("stress-bs4-victim");
-        let _ = ctx.kill("stress-bs4-victim");
         let gen = ctx.inspect_endpoint_generation("stress-bs4-victim");
         if gen <= prev_gen {
             ctx.log("stress: BS4 FAIL - generation not monotonic under churn");
             idle(ctx);
         }
         prev_gen = gen;
+        let _ = ctx.kill("stress-bs4-victim");
         if !matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead)) {
             ctx.log("stress: BS4 FAIL - cap A not stale during churn");
             idle(ctx);

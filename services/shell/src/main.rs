@@ -314,6 +314,11 @@ impl core::ops::Deref for ShellCtx {
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    // Name this service in the trace ring. It cannot ask what it is called (identity is not ambient),
+    // so a traced service says - see `sdk::trace` for why that costs nothing in trust.
+    ctx.trace_as("shell");
+    // `fs` requests carry a correlation tag at byte 0 (`req[0] = tag`), so the opcode is at byte 1.
+    ctx.trace_op_at("fs", 1);
     // C6-1: wrap the SDK context in the shell's own, which owns the fs correlation tag. Everything
     // below still calls `ctx.log(...)` unchanged - `ShellCtx` derefs to `ServiceContext` - and deref
     // coercion lets it pass to anything expecting the SDK type. The tag now has an owner with the same
@@ -781,7 +786,7 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 /// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
-    "wait", "watch", "whatis", "busiest", "random", "gpio",
+    "wait", "watch", "whatis", "busiest", "random", "gpio", "trace",
 ];
 
 /// Commands whose FIRST argument (the token right after the command, within its pipe segment) is a
@@ -792,6 +797,7 @@ const NO_PATH_CMDS: &[&str] = &[
 /// `<util> version` / `<util> help`), so they are NOT listed here.
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
+    ("trace",   &["blocked", "chain", "deps", "endpoint", "endpoints", "ipc", "failures", "status"]),
     ("busiest", &["mem", "restarts", "queue"]),
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
@@ -1596,6 +1602,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "version" => cmd_version_os(ctx, out),
         "mem"     => cmd_mem(ctx, out),
         "cores"   => cmd_cores(ctx, if argc >= 2 { args[1] } else { "" }, out),
+        "trace"   => cmd_trace(ctx, s["trace".len()..].trim()),
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "net"     => cmd_net(ctx, s["net".len()..].trim(), out),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
@@ -4107,13 +4114,112 @@ type Row = (&'static str, &'static str, &'static str);
 /// Render the standard help block: `<title> <ver> - <desc>`, each usage row followed by a
 /// real example, then (for a top-level utility) the version/help footer.
 fn help_block(ctx: &ServiceContext, title: &str, desc: &str, rows: &[Row], footer: bool) {
+    // PAGE IT WHEN IT DOES NOT FIT. `help` (the full list) has paged for a long time; a single
+    // command's help never did, because no command's help was taller than a screen. `trace`'s is: it
+    // documents six views and eight columns, and on a 34-row console the top scrolled away for good
+    // on a framebuffer with no scrollback. The fix is not to write less - the column notes are the
+    // useful part - it is to reuse the pager that already exists.
+    let lines = help_block_lines(rows, footer);
+    let (rows_avail, _) = ctx.console_dims();
+    // Unknown geometry is not "no terminal": a failed lookup returns 0, and `edit` and `trace` both
+    // assume 24 rather than dropping the feature.
+    let rows_avail = if rows_avail == 0 { 24 } else { rows_avail as usize };
+    if lines + 3 <= rows_avail {
+        help_block_render(ctx, title, desc, rows, footer, 0, lines);
+        return;
+    }
+    line_pager(ctx, lines, rows_avail,
+        &|c| {
+            c.console_write_fmt(format_args!("{} {} - {}\x1b[K\n", title, UTIL_VERSION, desc));
+            c.console_write("\x1b[K\n");
+            c.console_write("usage:\x1b[K\n");
+            3
+        },
+        &|c, i| help_block_line(c, rows, footer, i), &|_| {});
+}
+
+/// How many scrolling lines a help block has (the header is pinned, so it does not count).
+fn help_block_lines(rows: &[Row], footer: bool) -> usize {
+    let mut n = 0usize;
+    for (_, _, ex) in rows { n += if ex.is_empty() { 1 } else { 2 }; }
+    if footer { n += 2; }
+    n
+}
+
+/// Render scrolling line `i` of a help block, erasing its tail for the pager's in-place repaint.
+///
+/// CLAMPED TO THE CONSOLE WIDTH, and that is load-bearing rather than cosmetic. The pager counts
+/// LOGICAL lines and paints one per screen row; a line longer than the terminal wraps onto a second
+/// row, so every wrapped row pushes the frame down, scrolls the pinned header off the top and makes
+/// the whole thing look like it started in the middle. That is exactly what `trace help` did on a
+/// 102-column display while looking perfect on serial, which has no width at all.
+///
+/// The rows are short now, but content should not be able to break the frame - so an over-long line
+/// is cut and marked with a `>` rather than silently wrapped. Visible truncation is a bug report; a
+/// broken pager is a mystery.
+fn help_block_line(ctx: &ServiceContext, rows: &[Row], footer: bool, i: usize) {
+    let mut n = 0usize;
+    for (sig, d, ex) in rows {
+        if n == i {
+            help_write_clamped(ctx, format_args!("  {:<28}  {}", sig, d));
+            return;
+        }
+        n += 1;
+        if !ex.is_empty() {
+            if n == i {
+                help_write_clamped(ctx, format_args!("      e.g. {}", ex));
+                return;
+            }
+            n += 1;
+        }
+    }
+    if footer {
+        if n == i     { ctx.console_write("  version\x1b[K\n"); return; }
+        if n + 1 == i { ctx.console_write("  help\x1b[K\n"); }
+    }
+}
+
+/// Write one pager line, cut to the console width so it occupies exactly one screen row.
+fn help_write_clamped(ctx: &ServiceContext, args: core::fmt::Arguments) {
+    let (_, cols) = ctx.console_dims();
+    let cols = if cols == 0 { 80 } else { cols as usize };
+    let mut buf = [0u8; 256];
+    let mut w = ClampWriter { buf: &mut buf, n: 0 };
+    let _ = core::fmt::write(&mut w, args);
+    let n = w.n;
+    let keep = n.min(cols.saturating_sub(1)).min(256);
+    if let Ok(text) = core::str::from_utf8(&buf[..keep]) {
+        ctx.console_write(text);
+        if keep < n { ctx.console_write(">"); }
+    }
+    ctx.console_write("\x1b[K\n");
+}
+
+/// A fixed-buffer `fmt::Write` sink. Bounded, no heap (26.6.1).
+struct ClampWriter<'a> { buf: &'a mut [u8; 256], n: usize }
+impl core::fmt::Write for ClampWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = self.buf.len().saturating_sub(self.n);
+        let take = s.len().min(room);
+        self.buf[self.n..self.n + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.n += take;
+        Ok(())
+    }
+}
+
+/// The unpaged rendering, for a block that fits.
+fn help_block_render(ctx: &ServiceContext, title: &str, desc: &str, rows: &[Row], footer: bool,
+                     from: usize, to: usize) {
     ctx.console_writeln_fmt(format_args!("{} {} - {}", title, UTIL_VERSION, desc));
     ctx.console_writeln("");
     ctx.console_writeln("usage:");
+    let mut n = 0usize;
     for (sig, d, ex) in rows {
-        ctx.console_writeln_fmt(format_args!("  {:<28}  {}", sig, d));
+        if n >= from && n < to { ctx.console_writeln_fmt(format_args!("  {:<28}  {}", sig, d)); }
+        n += 1;
         if !ex.is_empty() {
-            ctx.console_writeln_fmt(format_args!("      e.g. {}", ex));
+            if n >= from && n < to { ctx.console_writeln_fmt(format_args!("      e.g. {}", ex)); }
+            n += 1;
         }
     }
     if footer {
@@ -4128,6 +4234,18 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "help" => help_block(ctx, "help", "list all commands (or get help on one)", &[
             ("help", "the full categorised command list", "help"),
             ("<command> help", "usage + examples for one command", "status help"),
+        ], true),
+        "trace" => help_block(ctx, "trace", "who waits on whom, who can reach whom, what just happened", &[
+            ("trace blocked", "every task stuck on another task", "trace blocked"),
+            ("trace chain <name|slot>", "the same, as a tree from one task", "trace chain fs"),
+            ("trace deps <service>", "what it can call, as a tree", "trace deps shell"),
+            ("trace endpoints", "every live endpoint and its owner", "trace endpoints"),
+            ("trace endpoint <id>", "who owns one, and who can reach it", "trace endpoint 112"),
+            ("trace ipc", "recent IPC exchanges, oldest first", "trace ipc"),
+            ("trace failures", "the same, only timeouts and lost peers", "trace failures"),
+            ("trace status", "ring size, events recorded, events dropped", "trace status"),
+            ("", "", ""),
+            ("trace <view> help", "what that view's output MEANS, column by column", "trace ipc help"),
         ], true),
         "result" => help_block(ctx, "result", "show the previous command's result (Ok / Err)", &[
             ("result", "Ok if the last command succeeded, else Err(<reason>)", "result"),
@@ -4230,7 +4348,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "caps" => help_block(ctx, "caps", "show a service's capabilities (records when piped)", &[
             ("caps", "this shell's own capabilities", "caps"),
             ("caps <service>", "capabilities held by <service>", "caps logger"),
-            ("caps [service] | <verb>", "piped: records resource/rights", "caps logger | where rights~send"),
+            ("caps [service] | <verb>", "piped: records resource/rights", "caps logger | where rights contains send"),
         ], true),
         "spawn" => help_block(ctx, "spawn", "start a service", &[
             ("spawn <svc>", "start the service <svc>", "spawn pong"),
@@ -4346,8 +4464,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("last [N] <path>", "last N lines of a file", "last 20 /log"),
         ], true),
         "where" => help_block(ctx, "where", "keep records whose field matches (record-pipe stage)", &[
-            ("<records> | where <col><op><val>", "ops: = != > < >= <= ~ (contains)", "status | where mem>0"),
+            ("<records> | where <col><op><val>", "ops: = != > < >= <=, and the word `contains`", "status | where mem>0"),
             ("… | where state=BlockRecv", "textual when either side is non-numeric", "status | where state=BlockRecv"),
+            ("… | where <col> contains <text>", "substring match - a WORD, because a symbol for it was unreadable", "caps logger | where rights contains send"),
         ], true),
         "select" => help_block(ctx, "select", "keep only some columns, in order (record-pipe stage)", &[
             ("<records> | select <col> [col…]", "project the named columns", "status | select name core state"),
@@ -4355,6 +4474,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "to" => help_block(ctx, "to", "render records to a format (record-pipe stage)", &[
             ("<records> | to json", "JSON array of objects", "status | to json"),
             ("<records> | to yaml", "YAML list of mappings", "status | where mem>0 | to yaml"),
+            ("<records> | to grid", "the plain table - useful when a producer draws something else", "trace deps fs | to grid"),
         ], true),
         "from" => help_block(ctx, "from", "parse text into records (record-pipe stage)", &[
             ("<text> | from json", "parse a flat JSON array of objects", "read /svc.json | from json"),
@@ -4593,19 +4713,51 @@ fn help_to_out(ctx: &ServiceContext, out: &mut Out) {
 /// This is the same write-only repaint the fast boot-time scroll uses, so scrolling is smooth
 /// rather than a black flash + full reprint. Bounded: at most `total` lines, clamped each step.
 fn help_pager(ctx: &ServiceContext, total: usize, rows: usize) {
+    line_pager(ctx, total, rows, &|_| 0, &|c, i| help_render_line(c, i, true), &|_| {});
+}
+
+/// The pager, over ANY indexable set of lines.
+///
+/// This was `help`-shaped: it called `help_render_line` directly, so the one screenful-at-a-time
+/// reader in the system could only ever read `help`. `trace ipc` needs exactly the same thing and
+/// there is no reason for a second copy of it, so the caller now supplies how to render line `i`.
+/// Everything else - the in-place repaint, the key handling, the clamping - is unchanged.
+fn line_pager(ctx: &ServiceContext, total: usize, rows: usize,
+              pinned: &dyn Fn(&ServiceContext) -> usize,
+              render: &dyn Fn(&ServiceContext, usize),
+              end_frame: &dyn Fn(&ServiceContext)) {
+    // A PINNED region, repainted at the top of every frame and never scrolled.
+    //
+    // The pager homes to row 1 and paints over whatever was there, so anything printed BEFORE it is
+    // gone the moment the first frame lands - which is exactly what happened to `trace ipc`'s legend
+    // on a framebuffer console: printed, then immediately overwritten, and invisible. A table's column
+    // header has the same problem one page in, for the same reason: it was line 0 of the scrolling
+    // region, so page 2 lost the column names.
+    //
+    // Both belong in a region the pager owns and repaints. `pinned` returns how many lines it drew, so
+    // the scrolling area sizes itself; `help` pins nothing and returns 0.
     let page = rows.saturating_sub(1).max(1); // leave one row for the status line
-    let max_top = total.saturating_sub(page);
     let mut top = 0usize;
     ctx.console_write("\x1b[?25l"); // hide the cursor for the whole pager session
     loop {
         ctx.console_write("\x1b[H"); // home - repaint over the old frame, no clear-to-black
+        let pin_lines = pinned(ctx);
+        let page = page.saturating_sub(pin_lines).max(1);
+        let max_top = total.saturating_sub(page);
         let end = (top + page).min(total);
-        for i in top..end { help_render_line(ctx, i, true); }
+        if top > max_top { top = max_top; }
+        for i in top..end { render(ctx, i); }
         // Status line (no trailing newline so it parks at the bottom). Scroll keys lead,
         // since holding Up/Down scrolls smoothly (typematic auto-repeat). ESC[J after it
         // wipes any rows left over from a taller previous frame (e.g. the short last page).
+        // Everything the frame buffered goes out before the status line, so the status line is last
+        // on screen as well as last in the code.
+        end_frame(ctx);
         ctx.console_write_fmt(format_args!(
-            "[ lines {}-{} of {} ]  up/down: scroll  space: next page  g/G: top/end  q: quit",
+            // SAY WHAT ACTUALLY WORKS. `j`/`k`, `b` and Enter were all handled and none of them were
+            // mentioned - a reader who tries `j` because it is muscle memory finds it works, which
+            // means the line was under-reporting the tool rather than describing it.
+            "[ lines {}-{} of {} ]  up/down or j/k: scroll  space: page down  b: page up  g/G: top/end  q: quit",
             top + 1, end, total));
         ctx.console_write("\x1b[J");
         // Read one command key (arrows/PageUp/Down arrive as escape sequences).
@@ -4637,6 +4789,8 @@ fn help_pager(ctx: &ServiceContext, total: usize, rows: usize) {
             _ => {}
         }
         if quit { break; }
+        let page = page.saturating_sub(pin_lines).max(1);
+        let max_top = total.saturating_sub(page);
         if to_top { top = 0; }
         else if to_bottom { top = max_top; }
         else {
@@ -6140,7 +6294,7 @@ fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
 /// roster), `ls` (dir listing), `caps` (held capabilities), `drives` (attached disks), `find`
 /// (search hits) are shell-side, so no wire codec is needed - they pass by value like `status`.
 fn is_record_producer(name: &str) -> bool {
-    matches!(name, "status" | "ls" | "caps" | "drives" | "find" | "observe" | "uptime")
+    matches!(name, "status" | "ls" | "caps" | "drives" | "find" | "observe" | "uptime" | "trace")
 }
 
 /// `ls` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
@@ -6420,6 +6574,20 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), 
             "find"    => match build_find_table(ctx, cwd, arg)  { Some(t) => t, None => return Err(ShellError::Unknown) },
             "observe" => match build_observe_table(ctx, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
             "uptime"  => build_uptime_table(ctx),
+            // `trace ipc` / `trace failures` are record sources; the other subcommands are readers
+            // of live kernel state that print a tree, and a tree is not a table. Piping one of those
+            // is refused loudly rather than quietly yielding the wrong thing.
+            "trace"   => match split_first(arg).0 {
+                "ipc"      => match build_trace_table(ctx, false) { Some(t) => t, None => return Err(ShellError::Unknown) },
+                "deps"     => match build_deps_table(ctx, split_first(arg).1.trim()) { Some(t) => t, None => return Err(ShellError::Unknown) },
+                "endpoints" => build_endpoints_table(ctx),
+                "failures" => match build_trace_table(ctx, true)  { Some(t) => t, None => return Err(ShellError::Unknown) },
+                other      => {
+                    ctx.console_writeln_fmt(format_args!(
+                        "trace: '{}' is not a record source - pipe 'trace ipc' or 'trace failures'", other));
+                    return Err(ShellError::Unknown);
+                }
+            },
             _         => build_status_table(ctx),
         };
         // Loud on the record bound (§3.12/§26.6): a producer that overran rows/arena is reported,
@@ -6606,7 +6774,12 @@ fn pipe_transform(ctx: &ServiceContext, stage: &str, cmd: &str, s: &mut Stream) 
                 match fmt {
                     "json" => t.to_json(&mut sink),
                     "yaml" => t.to_yaml(&mut sink),
-                    _ => { ctx.console_writeln("to: unknown format (try: to json | to yaml)"); return false; }
+                    // The GRID, as a pipe stage. It existed as the console rendering of every record
+                    // source but could not be ASKED for, so a producer that draws something else on
+                    // the console - `trace deps` draws a tree - had no way to offer the table. One
+                    // producer, three renderings, and the choice belongs to the reader.
+                    "grid" => t.to_grid(&mut sink),
+                    _ => { ctx.console_writeln("to: unknown format (try: to json | to yaml | to grid)"); return false; }
                 }
             }
             *s = Stream::Bytes(c);
@@ -6724,6 +6897,1166 @@ fn cmd_roster(ctx: &ServiceContext) -> Result<(), ShellError> {
             Err(ShellError::Unknown)
         }
     }
+}
+
+/// Task slots to scan. Matches the other slot-scanning commands in this file.
+const TRACE_SLOTS: u32 = 256;
+
+/// `trace` - why is this task not progressing? (`utilities/46_trace.md`)
+///
+/// **A READER, not a tracer.** It records nothing, enables nothing, and has no switch, because every
+/// fact it prints is state the kernel already keeps for CORRECTNESS: `CALL_AWAIT_EP` exists so a dead
+/// replier wakes its caller with `ReplyDead` (8.6), and the chain of who-awaits-whom IS the causal
+/// chain of a stuck system. So the cost when unused is zero - nothing runs until asked - and no kernel
+/// responsibility is added: introspection over IPC state, both already inside MISCIS (4.3).
+///
+/// What it deliberately does NOT do: interpret a message. The kernel sees an opaque byte array, so
+/// this prints `awaiting endpoint 7`, never `fs.read("/etc/config")`. Naming an operation is protocol
+/// knowledge and belongs to the service that owns the protocol (4.4, 26.10).
+/// `trace <view> help` - what ONE view's output means.
+///
+/// The top-level help listed every view AND every column, which made it taller than a console and
+/// turned a reference into something you had to page through to find one line. A view's columns are
+/// only interesting once you are looking at that view, so they live with it. `trace help` is now the
+/// map; this is the detail, one screen at a time, and neither needs a pager.
+fn trace_sub_help(ctx: &ServiceContext, view: &str) -> bool {
+    match view {
+        "blocked" => help_block(ctx, "trace blocked", "every task stuck on ANOTHER task", &[
+            ("slot / name", "the blocked task's scheduler slot and service name", ""),
+            ("blocked", "how it waits: `call` (awaiting a reply) or `recv`", ""),
+            ("awaiting", "the endpoint id it waits on - `trace endpoint <id>`", ""),
+            ("held_by", "the service that owns it, i.e. owes the answer", ""),
+            ("silence", "nothing is stuck. Idle on your OWN endpoint is not stuck", ""),
+        ], false),
+        "chain" => help_block(ctx, "trace chain", "who one task is stuck behind, as a tree", &[
+            ("<name|slot>", "a service name, or a task slot - digits are a slot", "trace chain 7"),
+            ("reading it", "each line is who the line above waits for", ""),
+            ("root: own endpoint", "idle - waiting for work. The chain ends fine here", ""),
+            ("root: runnable", "it is running right now", ""),
+        ], false),
+        "deps" => help_block(ctx, "trace deps", "what a service can call, as a tree", &[
+            ("indent", "a child is a service its parent holds a SEND cap to", ""),
+            ("N calls", "exchanges still IN THE RING - a window, not a total", ""),
+            ("(write list)", "the operations seen, by name", ""),
+            ("N FAILED", "of those, how many did not end in a reply", ""),
+            ("0 calls", "authority held but unused here - worth asking why", ""),
+            ("reply#NNN", "a cap to an endpoint no task owns: a return address", ""),
+            ("as a table", "| to grid - its header names every filterable column", "trace deps fs | to grid"),
+            ("declared peers", "NOT shown: they live in the kernel, unreadable here", ""),
+        ], false),
+        "endpoints" => help_block(ctx, "trace endpoints", "every live endpoint and its owner", &[
+            ("endpoint", "the id to pass to `trace endpoint <id>`", "trace endpoint 112"),
+            ("queue", "messages waiting - non-zero on an idle service is work arriving", ""),
+            ("primary only", "a reply mailbox has no name, hence reply#NNN elsewhere", ""),
+        ], false),
+        "endpoint" => help_block(ctx, "trace endpoint", "who owns an endpoint, and who can reach it", &[
+            ("owned by task N", "a live service's endpoint", ""),
+            ("a kernel resource", "ids 1-5 are log_write, spawn, console_read, ...", "trace endpoint 4"),
+            ("NO LIVE OWNER", "its task died, or it is a reply-only mailbox", ""),
+            ("holder / rights", "every live task holding a cap, and its rights", ""),
+        ], false),
+        "ipc" | "failures" => help_block(ctx, "trace ipc", "recent IPC exchanges, oldest first", &[
+            ("seq", "the CALLER'S own count. A gap = an event that never arrived", ""),
+            ("sec", "when the RING saw it, from the oldest row. Not a latency", ""),
+            ("caller / peer", "who called, and who was called, by name", ""),
+            ("op", "the operation by name; a number = unnamed in this shell", ""),
+            ("outcome", "REPLY TIMEOUT PEER_LOST QUEUE_FULL ABORTED", ""),
+            ("TIMEOUT", "no answer in time. The peer is alive as far as we know", ""),
+            ("PEER_LOST", "the send failed, or the peer died mid-call", ""),
+            ("QUEUE_FULL", "the peer is ALIVE and congested - not absent", ""),
+            ("in flight", "not here: one row per exchange, written when it ENDS", ""),
+            ("filtering", "it is a record source", "trace ipc | where outcome=TIMEOUT"),
+        ], false),
+        "status" => help_block(ctx, "trace status", "the ring itself", &[
+            ("ring N events", "capacity. Fixed, no heap", ""),
+            ("N recorded", "events accepted since the sink last started", ""),
+            ("N DROPPED", "overwritten before being read", ""),
+            ("the OTHER loss", "a send that failed never arrived, so it is NOT counted", ""),
+            ("", "it shows only as a gap in a caller's seq", ""),
+        ], false),
+        _ => return false,
+    }
+    true
+}
+
+fn cmd_trace(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+    let mut it = arg.split_whitespace();
+    let sub = it.next().unwrap_or("");
+    let rest = it.next().unwrap_or("");
+    match sub {
+        "" | "help" => { util_help(ctx, "trace"); Ok(()) }
+        // The SHARED version printer, like every other utility. This hand-rolled its own with a
+        // private `TRACE_VERSION` constant, so `trace version` said 0.1.0 while every help header
+        // said 0.4.0 - one utility reporting two versions of itself, which is the one thing a
+        // `version` command exists to be trusted about. It also skipped the creator credit that
+        // conventions rule 5 requires and the suite asserts for every other utility.
+        "version" => { util_version(ctx, "trace"); Ok(()) }
+        // `trace <view> help` - the detail for one view, before the view itself runs.
+        v if rest == "help" && trace_sub_help(ctx, v) => Ok(()),
+        "blocked" => trace_blocked(ctx),
+        "ipc" => trace_events(ctx, false),
+        "failures" => trace_events(ctx, true),
+        "status" => trace_status(ctx),
+        "deps" => trace_deps(ctx, rest),
+        "endpoint" => trace_endpoint(ctx, rest),
+        "endpoints" => trace_endpoints(ctx),
+        // ONE view, EITHER subject. This was two subcommands - `trace task <slot>` and `trace service
+        // <name>` - which named the SUBJECT KIND while every other subcommand names the VIEW. That
+        // read as two different things right up until you noticed they printed identical output from
+        // identical code, and it left `trace service fs` and `trace deps fs` looking like siblings
+        // when only one of them is named for what it shows.
+        //
+        // The argument disambiguates itself: all digits is a slot, anything else is a name. No flag,
+        // no second verb, and nothing a caller has to remember beyond "chain of what?".
+        "chain" => {
+            if rest.is_empty() {
+                ctx.console_writeln("trace chain: needs a service name or a task slot, e.g. `trace chain fs` or `trace chain 7`");
+                return Err(ShellError::Unknown);
+            }
+            match rest.parse::<u32>() {
+                Ok(slot) => trace_chain(ctx, slot),
+                _ => match trace_slot_of_name(ctx, rest) {
+                    Some(slot) => trace_chain(ctx, slot),
+                    None => {
+                        ctx.console_writeln_fmt(format_args!("trace chain: no live task named '{}'", rest));
+                        Err(ShellError::Unknown)
+                    }
+                },
+            }
+        }
+        _ => {
+            ctx.console_writeln_fmt(format_args!("unknown: trace {}", sub));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+/// Ask `logger` for its recent trace events (`utilities/46_trace.md` mechanism B).
+///
+/// The ring lives in that service, not the kernel - so this is an ordinary request/reply to an
+/// ordinary service, and a logger that is dead or absent is answered with a sentence rather than a
+/// hang (Commandment VIII: a missing dependency RETURNS, loudly).
+/// Build the trace ring's events as a `Table`.
+///
+/// A TABLE and not printed text, so `trace ipc` is a record source like `status` or `ls`: it renders
+/// as a grid on the console, pages when it is taller than the screen, and pipes into the record verbs
+/// (`trace ipc | where peer=fs`, `| to json`, `| to yaml`, `| count`). One producer, three uses -
+/// the alternative was a printer plus a separate serialiser that would drift apart.
+fn build_trace_table(ctx: &ServiceContext, failures_only: bool) -> Option<Table> {
+    // Ask for exactly what a record `Table` can hold - not a screenful, and not the whole ring.
+    //
+    // The ring keeps 192 events and one reply message could carry ~180 of them, but `REC_MAX_ROWS` is
+    // 64, so asking for more only produced a loud "result exceeded the record bound - truncated" on
+    // every single run. A bound announced once in `trace status` is information; the same bound
+    // announced on every command is noise that trains you to ignore it. So the newest 64 are what a
+    // dump shows, and `trace status` remains the place that says how much history exists.
+    let req = [godspeed_sdk::trace::TRACE_OP_DUMP, REC_MAX_ROWS as u8];
+    let reply = match trace_ask(ctx, &req) {
+        Some(r) => r,
+        None => {
+            ctx.console_writeln("trace: the logger service did not answer in 3 attempts (it holds the ring)");
+            return None;
+        }
+    };
+    let b = reply.payload_bytes();
+    if b.is_empty() {
+        ctx.console_writeln("trace: logger returned nothing");
+        return None;
+    }
+    let n = b[0] as usize;
+    let ev = godspeed_sdk::trace::EV_LEN;
+    let pl = godspeed_sdk::trace::PEER_LEN;
+    // COLUMN NAMES SAY WHAT THEY HOLD. They were `eseq / t+s / peer / op / event`, which needed the
+    // legend to be readable at all; these need it only for the detail:
+    //   caller  - who made the call, as that service DECLARED itself (`ctx.trace_as`). A service
+    //             cannot ask what it is called (identity is not ambient), and the kernel's unforgeable
+    //             answer - `Message.sender_ep` - is deliberately kernel-internal, so a traced service
+    //             says. That costs nothing in trust: the whole event is already its testimony.
+    //   seq     - the EMITTER'S own event number. Not global, so a mixed dump interleaves several
+    //             sequences and can look unsorted - it is not, rows are in ring order, oldest first.
+    //             A GAP in one service's numbering is that service's dropped events.
+    //   sec     - seconds since the oldest row shown. The stored value is an epoch second, which says
+    //             nothing on its own; the GAP between rows is what a stall looks like.
+    //   peer    - the service that was CALLED, by name (the emitter knew it; see `sdk::trace`).
+    //   op      - that protocol's OPCODE, taken from the byte the EMITTING SERVICE says it lives in
+    //             (`ctx.trace_op_at`), and rendered by NAME where this shell knows the protocol.
+    //             `utilities/46_trace.md` 7 worried that "byte 0 is the opcode" is a CONVENTION and
+    //             that a protocol putting something else there would produce a misleading column. It
+    //             was right, and both busy protocols do exactly that: `shell -> fs` and
+    //             `fs -> block-driver` each PREPEND a one-byte correlation tag, so byte 0 is a
+    //             request id and the opcode sits at byte 1. The answer is not to rename the column
+    //             after the byte - it is to record the RIGHT byte, which only the service that speaks
+    //             the protocol can say.
+    //   outcome - how the exchange ENDED. One row per exchange, so this is its whole story.
+    let mut t = Table::new(&["seq", "sec", "caller", "peer", "op", "outcome"]);
+    let base = if n > 0 && b.len() >= 9 {
+        u32::from_le_bytes([b[5], b[6], b[7], b[8]])
+    } else {
+        0
+    };
+    for i in 0..n {
+        let o = 1 + i * ev;
+        if o + ev > b.len() { break; }
+        let seq = u32::from_le_bytes([b[o], b[o+1], b[o+2], b[o+3]]);
+        let at  = u32::from_le_bytes([b[o+4], b[o+5], b[o+6], b[o+7]]);
+        let cname = &b[o+8..o+8+pl];
+        let clen = cname.iter().position(|&c| c == 0).unwrap_or(pl);
+        let pname = &b[o+8+pl..o+8+2*pl];
+        let plen = pname.iter().position(|&c| c == 0).unwrap_or(pl);
+        let op  = b[o+8+2*pl];
+        let kind = b[o+9+2*pl];
+        let kname = match kind {
+            godspeed_sdk::trace::KIND_REQUEST    => "REQUEST",
+            godspeed_sdk::trace::KIND_REPLY      => "REPLY",
+            godspeed_sdk::trace::KIND_TIMEOUT    => "TIMEOUT",
+            godspeed_sdk::trace::KIND_PEER_LOST  => "PEER_LOST",
+            godspeed_sdk::trace::KIND_QUEUE_FULL => "QUEUE_FULL",
+            godspeed_sdk::trace::KIND_ABORTED    => "ABORTED",
+            _ => "?",
+        };
+        // `trace failures` is the same ring, FILTERED - not a second recording path. QUEUE_FULL is a
+        // failure to get there, so it belongs; ABORTED is the user changing their mind, so it does not.
+        if failures_only && !matches!(kind, godspeed_sdk::trace::KIND_TIMEOUT
+                                          | godspeed_sdk::trace::KIND_PEER_LOST
+                                          | godspeed_sdk::trace::KIND_QUEUE_FULL) {
+            continue;
+        }
+        // The peer NAME came from the emitter, which knew it: it called `request_with_reply("fs", ..)`.
+        // No lookup, no endpoint, no cap slot - a slot is local to the emitter and means nothing here.
+        // (The EMITTER is not named: a service has no ambient identity to assert, which is the
+        // capability model working, not a gap. See `sdk::trace`.)
+        let peer = t.intern(&pname[..plen]);
+        // A service that never declared itself reads `?`, not a guess (see `sdk::trace`).
+        let caller = if clen == 0 { t.intern(b"?") } else { t.intern(&cname[..clen]) };
+        let k = t.intern(kname.as_bytes());
+        let opv = trace_op_cell(&mut t, &pname[..plen], op);
+        t.add_row(&[Value::Int(seq as u64), Value::Int(at.saturating_sub(base) as u64),
+                    caller, peer, opv, k]);
+    }
+    Some(t)
+}
+
+/// A frame accumulator for the pager: many lines, few console writes.
+///
+/// `console_write` is ONE SYSCALL per call, capped at 256 bytes, and each call is a message to the
+/// `console` service whose queue is 16 deep. A paged frame is a legend, a header, a screenful of rows
+/// and a status line - about sixty writes if each is sent on its own, per KEYPRESS. Holding `j`
+/// outruns the sink, the queue backs up, and the keyboard appears dead while the machine is fine.
+///
+/// This is the same lesson the console service itself learned (`docs/console-service.md`): a repaint
+/// is one batch, not one message per line. Text accumulates here and goes out in full 256-byte
+/// writes, so a frame costs about a dozen syscalls instead of sixty.
+///
+/// Bounded and no heap: one fixed buffer, flushed when full and at the end of each frame.
+struct FrameBuf {
+    buf: [u8; 256],
+    n: usize,
+}
+impl FrameBuf {
+    fn new() -> Self { Self { buf: [0u8; 256], n: 0 } }
+    fn put(&mut self, ctx: &ServiceContext, bytes: &[u8]) {
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let room = self.buf.len() - self.n;
+            let take = rest.len().min(room);
+            self.buf[self.n..self.n + take].copy_from_slice(&rest[..take]);
+            self.n += take;
+            rest = &rest[take..];
+            if self.n == self.buf.len() { self.flush(ctx); }
+        }
+    }
+    fn flush(&mut self, ctx: &ServiceContext) {
+        if self.n == 0 { return; }
+        if let Ok(text) = core::str::from_utf8(&self.buf[..self.n]) { ctx.console_write(text); }
+        self.n = 0;
+    }
+}
+/// A bounded line buffer for one rendered grid row.
+///
+/// The pager repaints IN PLACE (no clear-to-black), so every line it draws must erase its own tail or
+/// a shorter row leaves the previous frame's characters hanging off the end - which on a framebuffer
+/// console reads as garbage rather than as a short row. `Table::grid_row` writes plain text and its
+/// own newline, so the row is buffered here and re-emitted as `text + ESC[K + newline`.
+///
+/// 256 bytes: a console line is at most a couple of hundred columns and a trace row is about fifty.
+/// An over-long row is truncated rather than smearing - bounded, and the visible effect is a clipped
+/// line, not a corrupted screen.
+struct LineBuf {
+    b: [u8; 256],
+    n: usize,
+}
+impl LineBuf {
+    fn new() -> Self { Self { b: [0u8; 256], n: 0 } }
+    /// Append the buffered line, with an erase-to-end-of-line, to the FRAME - not to the console.
+    ///
+    /// It used to write straight through, which cost TWO syscalls per row (the text, then the erase).
+    /// A screenful is then well over a hundred console messages per keypress against a 16-deep queue,
+    /// and holding a scroll key outruns the sink: the keyboard looks dead while the machine is fine.
+    fn flush_into(&mut self, ctx: &ServiceContext, f: &mut FrameBuf) {
+        let end = self.n.min(self.b.len());
+        // Trim the newline `grid_row`/`grid_header` appended; we supply our own after the erase.
+        let end = if end > 0 && self.b[end - 1] == b'\n' { end - 1 } else { end };
+        f.put(ctx, &self.b[..end]);
+        f.put(ctx, b"\x1b[K\n");
+        self.n = 0;
+    }
+}
+impl RecordSink for LineBuf {
+    fn put(&mut self, bytes: &[u8]) {
+        let room = self.b.len().saturating_sub(self.n);
+        let n = bytes.len().min(room);
+        self.b[self.n..self.n + n].copy_from_slice(&bytes[..n]);
+        self.n += n;
+    }
+}
+
+/// An opcode's NAME, for the protocols this shell can name. `None` when it cannot.
+///
+/// A number tells you nothing without a lookup table, and a reader who has to hold `11 = read` in
+/// their head is doing work the tool should have done. The names cost nothing: they are as short as
+/// the numbers once rendered, and they make the column filterable in words - `trace ipc | where
+/// op=read`.
+///
+/// WHERE THIS KNOWLEDGE COMES FROM matters. For `fs` it is the shell's OWN opcode constants - it is
+/// an fs client and builds these requests itself, so the names cannot drift from what it sends. For
+/// `block-driver` the shell is not a client, so the small table below is a DISPLAY convenience
+/// mirroring `services/block-driver`'s constants; if it ever drifts, the effect is a wrong word for a
+/// known op, which is why anything unrecognised renders as the bare number instead of a guess.
+fn trace_op_name(peer: &[u8], op: u8) -> Option<&'static str> {
+    match peer {
+        b"fs" => Some(match op {
+            OP_WRITE_FILE  => "write",     OP_READ_FILE   => "read",
+            OP_STAT_FILE   => "stat",      OP_MKDIR       => "mkdir",
+            OP_LIST_DIR    => "list",      OP_RENAME      => "rename",
+            OP_DELETE      => "delete",    OP_MOVE        => "move",
+            OP_MKDIR_P     => "mkdir-p",   OP_DELETE_TREE => "delete-tree",
+            OP_DRIVES_INFO => "drives",    OP_FLASH       => "flash",
+            OP_LABEL       => "label",     OP_RESET       => "reset",
+            OP_WRITE_NEW   => "write-new", OP_WRITE_AT    => "write-at",
+            OP_READ_AT     => "read-at",   OP_CHECK       => "check",
+            OP_SCRUB       => "scrub",     OP_OPEN        => "open",
+            _ => return None,
+        }),
+        // Mirrors `services/block-driver/src/main.rs`. See the note above on why this is allowed to
+        // be a copy and what happens if it is wrong.
+        b"block-driver" => Some(match op {
+            1 => "read", 2 => "write", 3 => "capacity", 4 => "zero", 5 => "flush",
+            _ => return None,
+        }),
+        _ => None,
+    }
+}
+
+/// Render `op` for the grid: its name where we know one, the bare number where we do not.
+fn trace_op_cell(t: &mut Table, peer: &[u8], op: u8) -> Value {
+    if let Some(name) = trace_op_name(peer, op) {
+        return t.intern(name.as_bytes());
+    }
+    // Unknown protocol or unknown op: the number, as text, so the column stays one type. A mixed
+    // Int/Str column would filter and serialise inconsistently.
+    let mut b = [0u8; 3];
+    let mut n = 0;
+    let (h, tens, ones) = (op / 100, (op / 10) % 10, op % 10);
+    if h > 0 { b[n] = b'0' + h; n += 1; }
+    if h > 0 || tens > 0 { b[n] = b'0' + tens; n += 1; }
+    b[n] = b'0' + ones; n += 1;
+    t.intern(&b[..n])
+}
+
+/// `trace deps <service>` - what a service is WIRED to call, and what it has actually called.
+///
+/// # Why this is built from capabilities and not from a contract
+///
+/// The obvious source for "what does fs depend on" is its contract's `ipc_send` list. That is a
+/// DECLARATION - a statement of intent that the kernel validated once at spawn. This reads the live
+/// capability table instead (`task_caps`), and resolves each endpoint cap back to the task that owns
+/// that endpoint. So a row is not "the toml says it may call block-driver"; it is "this service is
+/// holding, right now, a SEND capability whose endpoint block-driver owns". Authority as it actually
+/// stands, which is what 26.9 asks to be inspectable.
+///
+/// The second column is the interesting one. A peer it HOLDS authority for but has never called is
+/// authority it does not appear to need - the exact thing a least-privilege review is looking for
+/// (3.1), and invisible from either source alone.
+///
+/// `calls` counts only what the ring still holds, so it is a recent window and not a lifetime total.
+/// A `0` there means "not in the last 64 events", never "never".
+/// `#[inline(never)]`, like every sibling table builder: this frame holds a multi-KB `Table` plus the
+/// peer and op scratch arrays, and inlining it into `pipe_run` would add all of that to EVERY
+/// pipeline's frame - including byte-only ones that never build a record. The shell's user stack is
+/// 256 KiB and `pipe_run` already sits near it.
+#[inline(never)]
+fn build_deps_table(ctx: &ServiceContext, name: &str) -> Option<Table> {
+    if name.is_empty() {
+        ctx.console_writeln("usage: trace deps <service>");
+        return None;
+    }
+    let slot = match slot_of(ctx, name) {
+        Some(s) => s,
+        None => {
+            ctx.console_writeln_fmt(format_args!("trace deps: no live service named '{}'", name));
+            return None;
+        }
+    };
+
+    // 1. Authority: every endpoint cap this service holds that carries SEND, resolved to its owner.
+    let mut caps = [CapInfo::default(); 64];
+    let n = ctx.task_caps(slot, &mut caps);
+    let mut peers  = [[0u8; 24]; 16];
+    let mut plens  = [0usize; 16];
+    let mut grantable = [false; 16];
+    let mut np     = 0usize;
+    for cap in caps.iter().take(n) {
+        // Rights bitfield (sdk CapInfo): READ=1 WRITE=2 SEND=4 RECV=8 GRANT=16 REVOKE=32.
+        //
+        // EVERY send capability, and the GRANT bit REPORTED rather than used as a filter.
+        //
+        // This filtered `SEND|GRANT` out, because a reply capability carries GRANT (it is derived from
+        // the caller's self-grant) and counting those had `logger` "calling" the shell. But a peer the
+        // SUPERVISOR provides at spawn carries GRANT too - it must, or the supervisor could not
+        // re-delegate it - so the filter also deleted real wiring: `net-stack` showed no `nic-driver`
+        // dependency at all, right after a ping that demonstrably used it.
+        //
+        // The two are indistinguishable from here: same right, same shape, and the kernel does not
+        // record which is which. Dropping them hides real dependencies; including them silently shows
+        // return addresses as dependencies. So they are included and MARKED, and the legend says a
+        // grantable edge may be either. An honest ambiguity beats a confident wrong answer in either
+        // direction (26.7).
+        if cap.rights & 4 == 0 { continue; }
+        // A stable kernel resource (log_write, spawn, ...) is not a peer; only endpoints resolve.
+        let owner = match trace_owner_of(ctx, cap.resource_id) { Some(o) => o, None => continue };
+        let h = ctx.task_stat(owner);
+        let l = h.name_len.min(24);
+        if l == 0 { continue; }
+        // Its own endpoint is not a dependency.
+        if &h.name[..l] == name.as_bytes() { continue; }
+        let mut dup = false;
+        for i in 0..np { if plens[i] == l && peers[i][..l] == h.name[..l] { dup = true; break; } }
+        if dup || np == peers.len() { continue; }
+        peers[np][..l].copy_from_slice(&h.name[..l]);
+        plens[np] = l;
+        grantable[np] = cap.rights & 16 != 0;
+        np += 1;
+    }
+
+    // 2. Observation: what the ring saw this caller do. Absent ring, the authority half still stands.
+    let mut calls  = [0u32; 16];
+    let mut failed = [0u32; 16];
+    let mut opbuf  = [[0u8; 40]; 16];
+    let mut oplen  = [0usize; 16];
+    if let Some(ev) = build_trace_table(ctx, false) {
+        for r in 0..ev.nrows() {
+            let (c, pr, op, oc) = (ev.cell_bytes(r, 2), ev.cell_bytes(r, 3),
+                                   ev.cell_bytes(r, 4), ev.cell_bytes(r, 5));
+            if c != name.as_bytes() { continue; }
+            let mut idx = None;
+            for i in 0..np { if plens[i] == pr.len() && peers[i][..plens[i]] == *pr { idx = Some(i); break; } }
+            // A peer seen in the ring but holding no cap now: it was reacquired or the peer restarted.
+            // Record it rather than dropping it - a call that happened is a fact.
+            let i = match idx {
+                Some(i) => i,
+                None if np < peers.len() && !pr.is_empty() && pr.len() <= 24 => {
+                    peers[np][..pr.len()].copy_from_slice(pr);
+                    plens[np] = pr.len();
+                    np += 1;
+                    np - 1
+                }
+                None => continue,
+            };
+            calls[i] += 1;
+            if oc != b"REPLY" { failed[i] += 1; }
+            // Collect distinct op names, space separated, bounded by the cell.
+            let mut seen = false;
+            let cur = &opbuf[i][..oplen[i]];
+            let mut k = 0;
+            while k < cur.len() {
+                let mut e = k;
+                while e < cur.len() && cur[e] != b' ' { e += 1; }
+                if &cur[k..e] == op { seen = true; break; }
+                k = e + 1;
+            }
+            if !seen && oplen[i] + op.len() + 1 < opbuf[i].len() {
+                if oplen[i] > 0 { opbuf[i][oplen[i]] = b' '; oplen[i] += 1; }
+                let l = oplen[i];
+                opbuf[i][l..l + op.len()].copy_from_slice(op);
+                oplen[i] += op.len();
+            }
+        }
+    }
+
+    let mut t = Table::new(&["depth", "parent", "peer", "grant", "calls", "failed", "ops"]);
+    for i in 0..np {
+        let pv = t.intern(&peers[i][..plens[i]]);
+        let par = t.intern(name.as_bytes());
+        let ov = if oplen[i] == 0 { t.intern(b"-") } else { t.intern(&opbuf[i][..oplen[i]]) };
+        let gv = t.intern(if grantable[i] { b"grantable" } else { b"-" });
+        t.add_row(&[Value::Int(1), par, pv, gv, Value::Int(calls[i] as u64),
+                    Value::Int(failed[i] as u64), ov]);
+    }
+    // Then walk BELOW each direct peer, so the answer is the service's transitive reach rather than
+    // one level of it - `shell -> fs -> block-driver` is the storage stack, and seeing only the first
+    // arrow answers a smaller question than the one being asked.
+    // The ancestry of each branch: the root, then whatever that branch has descended through. Only
+    // this is used to stop a cycle - see `deps_level`.
+    let mut path  = [[0u8; 24]; 8];
+    let mut pl    = [0usize; 8];
+    let l0 = name.len().min(24);
+    path[0][..l0].copy_from_slice(&name.as_bytes()[..l0]);
+    pl[0] = l0;
+    for i in 0..np {
+        path[1][..plens[i]].copy_from_slice(&peers[i][..plens[i]]);
+        pl[1] = plens[i];
+        deps_level(ctx, &mut t, &peers[i][..plens[i]], 2, &mut path, &mut pl, 2);
+    }
+    Some(t)
+}
+
+/// One level of `trace deps`, appended to `t` at `depth` under `parent`.
+///
+/// Split from the root call so the walk can RECUR without the root's ring pass being redone at every
+/// level: the observed counts come from a single scan of the event table, which the caller does once
+/// and threads down. A level that finds nothing simply adds no rows.
+#[inline(never)]
+fn deps_level(ctx: &ServiceContext, t: &mut Table, parent: &[u8], depth: u64,
+              path: &mut [[u8; 24]; 8], plens: &mut [usize; 8], pdepth: usize) {
+    if depth > DEPS_MAX_DEPTH || t.nrows() >= DEPS_MAX_ROWS { return; }
+    let pname = match core::str::from_utf8(parent) { Ok(s) => s, Err(_) => return };
+    let slot = match slot_of(ctx, pname) { Some(s) => s, None => return };
+    let mut caps = [CapInfo::default(); 64];
+    let n = ctx.task_caps(slot, &mut caps);
+    // Children of THIS parent, deduplicated. A service can hold several caps to one peer (a wired one
+    // and a copy it derived), and a row per CAP drew `fs` twice under `time` and `block-driver` twice
+    // under `fs`. Distinctness of children and absence of cycles are different problems: this is the
+    // first, the `path` check below is the second, and collapsing them into one "seen" set is what
+    // flattened the tree in the previous version.
+    for cap in caps.iter().take(n) {
+        // EVERY send cap, GRANT or not - see the note in `build_deps_table` on why filtering GRANT
+        // was wrong.
+        if cap.rights & 4 == 0 { continue; }
+        // AN ENDPOINT WITH NO LIVE OWNER IS THE MOST INTERESTING ROW HERE, and it used to be dropped
+        // in silence - which is how `net-stack` appeared to have no `nic-driver` dependency at all.
+        // A service holding a send cap to something that no longer exists is a fact worth printing:
+        // it is a stale cap, and the next send on it returns EndpointDead (14.3).
+        let owner = match trace_owner_of(ctx, cap.resource_id) {
+            Some(o) => o,
+            None => {
+                if t.nrows() < DEPS_MAX_ROWS {
+                    // NAMED FOR WHAT IT IS, AND STILL QUERYABLE. `task_stat` reports a task's PRIMARY
+                    // endpoint, and a reply capability targets the caller's REPLY-only endpoint - so a
+                    // cap that resolves to no live task is, in practice, a return address. Bare
+                    // `endpoint#119` made a reader stop and decode an id that means nothing to them;
+                    // `reply#119` says what it is AND keeps the id, which `trace endpoint 119` can
+                    // answer. A number is only noise when it is a dead end.
+                    let mut nb = [0u8; 24];
+                    let mut q = 0usize;
+                    write_bytes(&mut nb, &mut q, b"reply#");
+                    write_u32(&mut nb, &mut q, cap.resource_id as u32);
+                    let pv = t.intern(&nb[..q]);
+                    let par = t.intern(parent);
+                    let stale = t.intern(b"-");
+                    let gv = t.intern(if cap.rights & 16 != 0 { b"grantable" } else { b"-" });
+                    t.add_row(&[Value::Int(depth), par, pv, gv, Value::Int(0), Value::Int(0), stale]);
+                }
+                continue;
+            }
+        };
+        let h = ctx.task_stat(owner);
+        let l = h.name_len.min(24);
+        if l == 0 || &h.name[..l] == parent { continue; }
+        // CYCLE GUARD ON THE PATH, not on the whole tree.
+        //
+        // This was a global "seen" set, and it was wrong: `block-driver` is a direct peer of the shell
+        // AND a peer of `fs`, so once it was drawn under the shell it could never be drawn under `fs`,
+        // and `trace deps shell` showed `fs  24 calls` with nothing beneath it. That is precisely the
+        // transitive reach the tree exists to show, deleted by an over-eager guard.
+        //
+        // A node MAY appear under several parents - a dependency graph is a DAG and that is what a DAG
+        // looks like. What must never happen is a node appearing as its own ancestor, which is the
+        // actual cycle, so the check is against this branch's ancestry alone.
+        let mut cyclic = false;
+        for i in 0..pdepth { if plens[i] == l && path[i][..l] == h.name[..l] { cyclic = true; break; } }
+        if cyclic { continue; }
+        // The EDGE must be unique, not merely unique within this call. A node can be reached twice
+        // (`time` directly, and again through `net-stack`), and each visit ran its own dedup - so the
+        // table ended up holding `time -> fs` twice and the renderer, which finds children by parent
+        // NAME, drew both under every occurrence of `time`. Deduplicate the pair against the table
+        // itself and the question does not arise.
+        let mut dup = false;
+        for r in 0..t.nrows() {
+            if t.cell_bytes(r, 1) == parent && t.cell_bytes(r, 2) == &h.name[..l] { dup = true; break; }
+        }
+        if dup { continue; }
+        if t.nrows() >= DEPS_MAX_ROWS { return; }
+        let pv = t.intern(&h.name[..l]);
+        let par = t.intern(parent);
+        let dash = t.intern(b"-");
+        let gv = t.intern(if cap.rights & 16 != 0 { b"grantable" } else { b"-" });
+        t.add_row(&[Value::Int(depth), par, pv, gv, Value::Int(0), Value::Int(0), dash]);
+        let mut child = [0u8; 24];
+        child[..l].copy_from_slice(&h.name[..l]);
+        if pdepth < path.len() {
+            path[pdepth][..l].copy_from_slice(&h.name[..l]);
+            plens[pdepth] = l;
+            deps_level(ctx, t, &child[..l], depth + 1, path, plens, pdepth + 1);
+        }
+    }
+}
+
+/// How deep the dependency walk goes, and how many edges it will draw.
+///
+/// Bounded because a walk over live capability state has no natural end (26.6): a cycle would run
+/// forever without the guard in `deps_level`, and even an acyclic graph could be wide. Three levels
+/// is `shell -> fs -> block-driver`, which is the whole storage stack; a fourth has never existed
+/// here. Both limits are visible in the output rather than silently applied - see `trace_deps`.
+///
+/// 48 edges, not 24: at 24 the notice fired on EVERY `trace deps shell`, and a bound that always
+/// trips is a bound set too low - it stops being information and becomes furniture the reader learns
+/// to ignore, which is worse than no notice at all.
+const DEPS_MAX_DEPTH: u64 = 3;
+const DEPS_MAX_ROWS: usize = 48;
+
+/// What the columns mean, printed above the grid on the CONSOLE path only.
+///
+/// Not in the pipe path: `trace ipc | to json` must emit records and nothing else, so a legend there
+/// would be corrupting the stream with prose.
+/// Returns the number of LINES it wrote, because the pager PINS this region and its frame arithmetic
+/// depends on that number being exact. It was a hand-maintained constant and drifted twice - most
+/// recently to 8 while this function wrote 7, so the pinned region claimed a row it never painted. A
+/// count of lines written belongs to the thing that writes them.
+fn trace_legend(ctx: &ServiceContext, f: &mut FrameBuf, n: usize) -> usize {
+    f.put(ctx, b"--------------------------------- legend ---------------------------------\x1b[K\n");
+    f.put(ctx, b"seq     the caller's own count - a gap is an event that never arrived\x1b[K\n");
+    f.put(ctx, b"sec     when the ring recorded it, from the oldest row shown - 1s steps\x1b[K\n");
+    f.put(ctx, b"caller  who called | peer  who was called\x1b[K\n");
+    f.put(ctx, b"op      what was asked for - a number when this shell cannot name it\x1b[K\n");
+    f.put(ctx, b"outcome REPLY | TIMEOUT | PEER_LOST | QUEUE_FULL | ABORTED\x1b[K\n");
+    let mut nb = [0u8; 24];
+    let mut q = 0usize;
+    write_u32(&mut nb, &mut q, n as u32);
+    f.put(ctx, b"----------------------------- IPC events (");
+    f.put(ctx, &nb[..q]);
+    f.put(ctx, b") -----------------------------\x1b[K\n");
+    7
+}
+
+/// Lines [`trace_legend`] draws, so the pager can size its scrolling area.
+/// Lines the trace legend occupies. Used ONLY to decide whether paging is needed - the number
+/// that must be exact is the PINNED height, and that comes from `trace_legend` itself.
+const TRACE_LEGEND_LINES: usize = 7;
+
+fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellError> {
+    let t = match build_trace_table(ctx, failures_only) {
+        Some(t) => t,
+        None    => return Err(ShellError::Unknown),
+    };
+    if t.nrows() == 0 {
+        ctx.console_writeln(if failures_only { "trace: no failure events recorded" }
+                            else { "trace: no events recorded (is any service granted ipc_send=[\"logger\"]?)" });
+        return Ok(());
+    }
+    // PAGE when it does not fit, exactly as `help` does - a ring dump is routinely taller than the
+    // screen, and the framebuffer console has no scrollback, so the top would otherwise be gone
+    // forever. Unknown geometry is not "no terminal": a failed `console_dims` returns 0, and `edit`
+    // already treats that as 24 rows rather than dropping the feature.
+    let (rows, _cols) = ctx.console_dims();
+    let rows = if rows == 0 { 24 } else { rows as usize };
+    let w = t.grid_widths();
+    // Does it fit unpaged? Legend block, column header, and a line of slack.
+    if t.nrows() + TRACE_LEGEND_LINES + 2 <= rows {
+        // The unpaged path batches too: it is the same screenful, drawn once.
+        let mut f = FrameBuf::new();
+        let _ = trace_legend(ctx, &mut f, t.nrows());
+        let mut lb = LineBuf::new();
+        t.grid_header(&mut lb, &w);
+        lb.flush_into(ctx, &mut f);
+        for r in 0..t.nrows() {
+            t.grid_row(&mut lb, r, &w);
+            lb.flush_into(ctx, &mut f);
+        }
+        f.flush(ctx);
+        return Ok(());
+    }
+    // PINNED: the legend and the column header are repainted at the top of every frame. They used to
+    // be printed before the pager started, which put them exactly where its first `ESC[H` repaint
+    // lands - so on a framebuffer console the legend flashed and vanished. The column header had the
+    // same fate one page in, having been line 0 of the scrolling region.
+    //
+    // ONE FRAME, A DOZEN SYSCALLS. Every line here goes into a shared `FrameBuf` and out in 256-byte
+    // writes, flushed just before the status line. Writing each line straight to the console cost two
+    // syscalls per row - over a hundred console messages per keypress against a 16-deep queue - so
+    // holding a scroll key outran the sink and the keyboard went unresponsive.
+    let frame = core::cell::RefCell::new(FrameBuf::new());
+    line_pager(ctx, t.nrows(), rows,
+        &|c| {
+            let mut f = frame.borrow_mut();
+            let legend = trace_legend(c, &mut f, t.nrows());
+            let mut lb = LineBuf::new();
+            t.grid_header(&mut lb, &w);
+            lb.flush_into(c, &mut f);
+            legend + 1 // what the legend ACTUALLY wrote, plus the column header
+        },
+        &|c, i| {
+            let mut f = frame.borrow_mut();
+            let mut lb = LineBuf::new();
+            t.grid_row(&mut lb, i, &w);
+            lb.flush_into(c, &mut f);
+        },
+        &|c| frame.borrow_mut().flush(c));
+    Ok(())
+}
+
+/// `trace status` - ring capacity, events accepted, events DROPPED.
+///
+/// The drop count is the point. A ring that silently discards is the failure this project just fixed
+/// in the x86 keyboard path; one that reports what it lost is an instrument you can trust the rest of
+/// (invariant 12).
+/// Ask the ring-holding service, RETRYING a busy sink.
+///
+/// A single attempt was reporting a service that is alive and busy as "unavailable". The sink takes
+/// events and control requests on one 16-deep endpoint, so a burst of events can fill it and reject
+/// the reader - which is congestion, not absence, and the two must not be reported the same way
+/// (the same distinction `KIND_QUEUE_FULL` exists for). Bounded: three attempts, then it says so.
+fn trace_ask(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
+    for _ in 0..3 {
+        if let Some(r) = ctx.request_with_reply("logger", &Message::from_bytes(req)) {
+            return Some(r);
+        }
+        // REACQUIRE BETWEEN ATTEMPTS. A busy sink is transient and a yield is the right answer, but a
+        // RESTARTED one never recovers by waiting: the cap is stale and every retry fails identically.
+        // After a chaos storm restarted `logger` forty times, this loop failed three times in a row
+        // and reported a live service as unreachable (14.3 - reacquire by name, then retry).
+        let _ = ctx.reacquire_by_name("logger");
+        ctx.yield_cpu();
+    }
+    None
+}
+
+/// Draw the edges under `parent` as a tree, the way `tree` draws directories.
+///
+/// # Why this walks the EDGES instead of printing rows in order
+///
+/// The table is an edge list, and its rows are not in depth-first order - the walk collects a
+/// service's direct peers first, then descends into each. Printing rows sequentially with an indent
+/// would therefore have drawn a tree whose shape was an artefact of collection order. Following
+/// `parent -> peer` at render time is correct for any order, which is also what makes the same table
+/// safe to pipe.
+///
+/// Connectors are `tree`'s: `|--` for a child with siblings after it, `\--` for the last, and an
+/// ancestor that was not its parent's last child leaves a `|` continuation so the lines join up.
+/// Bounded by construction: `DEPS_MAX_DEPTH` levels and a fixed prefix buffer, so a cycle in the
+/// data (there cannot be one - `deps_level` guards names) still could not run away here.
+fn deps_draw(ctx: &ServiceContext, t: &Table, parent: &[u8], prefix: &mut [u8; 48],
+             plen: usize, depth: usize, anc: &mut [[u8; 24]; 8], nanc: usize) {
+    if depth as u64 >= DEPS_MAX_DEPTH + 1 { return; }
+    // Find this parent's children, so the LAST one can draw the closing connector.
+    // Children of this parent - EXCLUDING reply addresses, which are counted for the closing note
+    // instead. They are in the record (a piper can see them) but they are not dependencies, and a
+    // `reply` node under every service is noise a reader has to look past on every line.
+    let mut kids = [0usize; DEPS_MAX_ROWS];
+    let mut nk = 0usize;
+    for r in 0..t.nrows() {
+        if t.cell_bytes(r, 1) != parent { continue; }
+        if t.cell_bytes(r, 2).starts_with(b"reply#") { continue; }
+        if nk < kids.len() { kids[nk] = r; nk += 1; }
+    }
+    for k in 0..nk {
+        let r = kids[k];
+        let last = k + 1 == nk;
+        let peer   = t.cell_bytes(r, 2);
+        let grant  = t.cell_bytes(r, 3);
+        let calls  = t.cell_int(r, 4).unwrap_or(0);
+        let failed = t.cell_int(r, 5).unwrap_or(0);
+        let ops    = t.cell_bytes(r, 6);
+        // The `grant` bit stays in the RECORD for anyone who filters on it, but not in the tree: with
+        // reply addresses now named, a grantable edge to a live service is a supervisor-wired peer,
+        // and a marker on nearly every row is decoration rather than information.
+        let _ = grant;
+        let pre  = core::str::from_utf8(&prefix[..plen]).unwrap_or("");
+        let conn = if last { "\u{2514}\u{2500}\u{2500} " } else { "\u{251c}\u{2500}\u{2500} " };
+        let pname = core::str::from_utf8(peer).unwrap_or("?");
+        let oname = core::str::from_utf8(ops).unwrap_or("-");
+        if calls == 0 && peer == godspeed_sdk::trace::SINK_NAME.as_bytes() {
+            // THE SINK ALWAYS READS 0, and that is not idle authority - it is the most-used capability
+            // on this row. Emissions to the ring are deliberately never recorded (an observer that
+            // records itself fills the ring with its own questions), so without this the line would
+            // say "granted and unused" about the one capability that makes tracing work at all - and a
+            // reader tidying up unused authority would revoke exactly the wrong thing.
+            ctx.console_write_fmt(format_args!(
+                "{}{}{}  (trace sink - its own traffic is never recorded)\x1b[K\n", pre, conn, pname));
+        } else if calls == 0 {
+            ctx.console_write_fmt(format_args!("{}{}{}\x1b[K\n", pre, conn, pname));
+        } else if failed == 0 {
+            ctx.console_write_fmt(format_args!(
+                "{}{}{}  {} calls  ({})\x1b[K\n", pre, conn, pname, calls, oname));
+        } else {
+            ctx.console_write_fmt(format_args!(
+                "{}{}{}  {} calls  {} FAILED  ({})\x1b[K\n", pre, conn, pname, calls, failed, oname));
+        }
+        // Extend the prefix for this child's own children: a continuation bar when it has siblings
+        // below it, blanks when it was the last.
+        let piece: &[u8] = if last { b"    " } else { "\u{2502}   ".as_bytes() };
+        if plen + piece.len() <= prefix.len() {
+            prefix[plen..plen + piece.len()].copy_from_slice(piece);
+            let mut child = [0u8; 24];
+            let cl = peer.len().min(child.len());
+            child[..cl].copy_from_slice(&peer[..cl]);
+            // A node already on this line of descent is a CYCLE (`time` reaches `net-stack`, which
+            // reaches `time`). Draw it, then stop: expanding it again would repeat a subtree the
+            // reader has already seen, and the graph is a DAG only if you ignore that edge.
+            let mut seen_anc = false;
+            for i in 0..nanc { if anc[i][..cl] == child[..cl] && anc[i][cl..].iter().all(|&b| b == 0) { seen_anc = true; break; } }
+            if !seen_anc && nanc < anc.len() {
+                // CLEAR the slot first. A sibling branch may have left a longer name here ("net-stack"),
+                // and writing "time" over it leaves "stack" trailing - so the all-zero tail check
+                // failed and the ancestor was not recognised, which let a cycle expand one more time.
+                anc[nanc] = [0u8; 24];
+                anc[nanc][..cl].copy_from_slice(&peer[..cl]);
+                deps_draw(ctx, t, &child[..cl], prefix, plen + piece.len(), depth + 1, anc, nanc + 1);
+            }
+        }
+    }
+}
+
+/// `trace endpoints` - every live task's endpoint, the map from names to the ids.
+///
+/// The missing fourth source. Ids arrive from `caps <service>` (as `endpoint#N`), from `trace
+/// blocked`'s `awaiting` column and from `trace deps`' reply list - all of which hand you ONE id in
+/// context. None of them answers "what endpoints exist", so the map from a service name to its number
+/// had to be assembled by hand before `trace endpoint <id>` could be used deliberately.
+///
+/// A record source like every other view, so it filters and pipes: `trace endpoints | where
+/// name contains fs`, `| to json`.
+///
+/// Only PRIMARY endpoints appear, because that is what the kernel reports per task. A reply-only
+/// mailbox has no name here - which is precisely why an unresolvable cap shows as `reply#NNN` in a
+/// dependency tree rather than as a service.
+#[inline(never)]
+fn build_endpoints_table(ctx: &ServiceContext) -> Table {
+    let mut t = Table::new(&["slot", "name", "endpoint", "state", "queue"]);
+    for slot in 0u32..256 {
+        let st = ctx.task_stat(slot);
+        if !st.valid || st.state == 4 { continue; }
+        let ep = ctx.task_own_endpoint(slot);
+        if ep == 0 { continue; }   // a task with no endpoint cannot be talked to; nothing to list
+        let name  = t.intern(&st.name[..st.name_len.min(31)]);
+        let state = t.intern(st.state_str().as_bytes());
+        t.add_row(&[Value::Int(slot as u64), name, Value::Int(ep),
+                    state, Value::Int(st.queue_depth as u64)]);
+    }
+    t
+}
+
+/// `trace endpoints` on the console.
+fn trace_endpoints(ctx: &ServiceContext) -> Result<(), ShellError> {
+    let t = build_endpoints_table(ctx);
+    if t.nrows() == 0 {
+        ctx.console_writeln("trace endpoints: no live task owns an endpoint");
+        return Ok(());
+    }
+    ctx.console_writeln("--------------------------------- legend ---------------------------------");
+    ctx.console_writeln("endpoint  the id to pass to `trace endpoint <id>`; queue = messages waiting");
+    ctx.console_writeln("only PRIMARY endpoints - a reply mailbox has no name, hence reply#NNN");
+    ctx.console_writeln("------------------------------ live endpoints -----------------------------");
+    let mut o = Out::Console;
+    t.to_grid(&mut OutSink { ctx, out: &mut o });
+    Ok(())
+}
+
+/// `trace endpoint <id>` - what an endpoint is, and WHO CAN REACH IT.
+///
+/// The inverse of `trace deps`, and the question the capability model makes worth asking: `deps` says
+/// who a service calls, this says who holds authority over a given endpoint. There was no way to ask
+/// it before - `caps <service>` answers one holder at a time, and you cannot enumerate holders from a
+/// resource.
+///
+/// It also turns the `reply#NNN` rows in a dependency tree from a dead end into a lookup. An endpoint
+/// with no live owner is not a mystery once you can see it is held by two services and owned by none:
+/// it is a return address whose task has moved on.
+///
+/// Bounded: a scan of the task table (256 slots, the same bound `status` uses) reading each task's
+/// caps. No allocation, no recursion.
+fn trace_endpoint(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+    let id: u64 = match arg.trim().trim_start_matches('#').parse() {
+        Ok(v) => v,
+        Err(_) => {
+            ctx.console_writeln("trace endpoint: needs an endpoint id, e.g. `trace endpoint 119`");
+            return Err(ShellError::Unknown);
+        }
+    };
+    // A STABLE KERNEL RESOURCE IS NOT AN ENDPOINT. Ids 1-5 are `log_write`, `spawn`, `console_read`,
+    // `console_push`, `introspect`; calling id 4 "an endpoint with no live owner" was true of the
+    // lookup and false about the thing - it has no owner because nothing owns it, by design.
+    let mut rb = [0u8; 32];
+    let rlen = cap_resource_name(id, &mut rb);
+    let rname = core::str::from_utf8(&rb[..rlen]).unwrap_or("?");
+    if !rname.starts_with("endpoint#") {
+        ctx.console_writeln_fmt(format_args!(
+            "{} (id {}) - a kernel resource, not an endpoint: it has no owning task", rname, id));
+        return trace_endpoint_holders(ctx, id);
+    }
+    match trace_owner_of(ctx, id) {
+        Some(o) => {
+            let h = ctx.task_stat(o);
+            ctx.console_writeln_fmt(format_args!(
+                "endpoint {} - owned by task {} \"{}\" ({})", id, o, h.name_str(), h.state_str()));
+        }
+        None => ctx.console_writeln_fmt(format_args!(
+            "endpoint {} - NO LIVE OWNER. Either its task died, or it is a reply-only endpoint (a \
+             task's reply mailbox is not its primary one, and only primaries are named here)", id)),
+    }
+    trace_endpoint_holders(ctx, id)
+}
+
+/// Every live task holding a capability to `id`. Split out so the kernel-resource path above can
+/// reuse it - "who can reach this" is the same question whether the target is an endpoint or not.
+fn trace_endpoint_holders(ctx: &ServiceContext, id: u64) -> Result<(), ShellError> {
+    let mut t = Table::new(&["holder", "slot", "rights"]);
+    for slot in 0u32..256 {
+        let st = ctx.task_stat(slot);
+        if !st.valid || st.state == 4 { continue; }
+        let mut caps = [CapInfo::default(); 64];
+        let n = ctx.task_caps(slot, &mut caps);
+        for cap in caps.iter().take(n) {
+            if cap.resource_id != id { continue; }
+            let name = t.intern(&st.name[..st.name_len.min(31)]);
+            let mut gb = [0u8; 48];
+            let glen = cap_rights_str(cap.rights, &mut gb);
+            let rights = t.intern(&gb[..glen]);
+            t.add_row(&[name, Value::Int(slot as u64), rights]);
+        }
+    }
+    if t.nrows() == 0 {
+        ctx.console_writeln("no live task holds a capability to it");
+        return Ok(());
+    }
+    ctx.console_writeln("held by:");
+    let mut o = Out::Console;
+    t.to_grid(&mut OutSink { ctx, out: &mut o });
+    Ok(())
+}
+
+/// `trace deps <service>` on the console: the dependency graph, drawn as a tree.
+///
+/// # A tree and a record stream are the same data
+///
+/// The table this renders holds one row per EDGE (`parent`, `peer`, `depth`), which is what a tree
+/// is. So the console draws the edges as a tree and a pipe gets the rows - one producer, two
+/// renderings, exactly as `trace ipc` does for its grid, its pager and its pipe. Neither form is a
+/// lossy summary of the other, which is what makes it safe to have both:
+///
+///   trace deps shell                      -> the tree
+///   trace deps shell | where peer=fs      -> the edges into fs
+///   trace deps shell | to json            -> the graph, machine-readable
+fn trace_deps(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
+    let t = match build_deps_table(ctx, name) {
+        Some(t) => t,
+        None    => return Err(ShellError::Unknown),
+    };
+    if t.nrows() == 0 {
+        ctx.console_writeln_fmt(format_args!(
+            "trace deps: '{}' holds no send capability to another service - it calls no one", name));
+        return Ok(());
+    }
+    ctx.console_write("--------------------------------- legend ---------------------------------\x1b[K\n");
+    ctx.console_write("indent  who calls whom: a child is a service its parent holds a SEND cap to\x1b[K\n");
+    ctx.console_write("calls   how many the ring still holds - a recent window, never a lifetime\x1b[K\n");
+    ctx.console_write("0 calls authority held but unused here (worth asking why it is granted)\x1b[K\n");
+    // THE TREE HIDES ITS OWN COLUMNS. A reader looking at an indented list has no way to know the rows
+    // are records, so the filter examples in the footer arrive out of nowhere.
+    //
+    // POINT AT THE GRID, do not list the columns here. The first version copied them into this line
+    // and immediately got it wrong: it named five of the seven, dropping `grant` and `failed`, so a
+    // reader would never have learned that `where failed>0` works. The grid header IS the list, it
+    // cannot drift from itself, and a copy that can drift is a second truth (26.4).
+    ctx.console_write("as a table (its header names every column you can filter on): | to grid\x1b[K\n");
+    ctx.console_write_fmt(format_args!(
+        "------------------------- {} dependencies -------------------------\x1b[K\n", name));
+
+    ctx.console_writeln(name);
+    let mut anc = [[0u8; 24]; 8];
+    let nl = name.len().min(24);
+    anc[0][..nl].copy_from_slice(&name.as_bytes()[..nl]);
+    deps_draw(ctx, &t, name.as_bytes(), &mut [0u8; 48], 0, 0, &mut anc, 1);
+
+    // Reply addresses, reported ONCE rather than as a node under every service. Nothing is hidden -
+    // they are rows in the table and `trace deps <svc> | to grid` shows them - but they are return
+    // addresses, not dependencies, and the tree is for the dependencies.
+    // COUNT, and point at the view that lists them. This used to print the ids inline, and at ten of
+    // them the line was already a paragraph - and worse, it lied twice: a 96-byte id buffer silently
+    // dropped the tenth id while the count still said ten, and the same endpoint appeared more than
+    // once because a reply address is reached under several parents.
+    //
+    // A summary line must not grow with the data. The rows are already IN the record, with the parent
+    // that holds each one, so the honest answer is a count plus the pipe that renders them properly.
+    let mut replies = 0usize;
+    for r in 0..t.nrows() { if t.cell_bytes(r, 2).starts_with(b"reply#") { replies += 1; } }
+    if replies > 0 {
+        ctx.console_writeln_fmt(format_args!(
+            "({} reply address(es) hidden - `trace deps {} | where peer contains reply` lists them)",
+            replies, name));
+    }
+    // The walk is bounded (26.6), and a bound reached in silence is a lie about completeness.
+    if t.nrows() >= DEPS_MAX_ROWS {
+        ctx.console_writeln_fmt(format_args!(
+            "trace deps: stopped at {} edges - the graph is larger than this view", DEPS_MAX_ROWS));
+    }
+    Ok(())
+}
+
+fn trace_status(ctx: &ServiceContext) -> Result<(), ShellError> {
+    let req = [godspeed_sdk::trace::TRACE_OP_STATUS];
+    let reply = match trace_ask(ctx, &req) {
+        Some(r) => r,
+        None => {
+            ctx.console_writeln("trace: the logger service did not answer in 3 attempts (it holds the ring)");
+            return Err(ShellError::Unknown);
+        }
+    };
+    let b = reply.payload_bytes();
+    if b.len() < 24 {
+        ctx.console_writeln("trace: logger returned a short status");
+        return Err(ShellError::Unknown);
+    }
+    let cap = u64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]]);
+    let total = u64::from_le_bytes([b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]]);
+    let dropped = u64::from_le_bytes([b[16],b[17],b[18],b[19],b[20],b[21],b[22],b[23]]);
+    ctx.console_writeln_fmt(format_args!(
+        "trace: ring {} events; {} recorded; {} DROPPED (oldest overwritten before being read)",
+        cap, total, dropped));
+    ctx.console_writeln("trace: the ring lives in the `logger` service - the kernel records nothing.");
+    Ok(())
+}
+
+/// The first live task with this name, or `None`.
+fn trace_slot_of_name(ctx: &ServiceContext, want: &str) -> Option<u32> {
+    for slot in 0..TRACE_SLOTS {
+        let s = ctx.task_stat(slot);
+        if !s.valid { continue; }
+        if &s.name[..s.name_len.min(31)] == want.as_bytes() { return Some(slot); }
+    }
+    None
+}
+
+/// The live task owning `endpoint`, or `None` if nothing owns it - which is itself the answer when a
+/// task awaits an endpoint whose service has died and not yet come back.
+fn trace_owner_of(ctx: &ServiceContext, endpoint: u64) -> Option<u32> {
+    if endpoint == 0 { return None; }
+    for slot in 0..TRACE_SLOTS {
+        let s = ctx.task_stat(slot);
+        if !s.valid { continue; }
+        if ctx.task_own_endpoint(slot) == endpoint { return Some(slot); }
+    }
+    None
+}
+
+/// How a task is stuck, as one word. `call` is the interesting one: blocked in a synchronous CALL with
+/// the awaited endpoint recorded, which is what makes the chain walkable at all.
+fn trace_block_kind(state: u8, awaits: u64) -> &'static str {
+    if awaits != 0 { return "call"; }
+    match state {
+        2 => "recv",
+        3 => "send",
+        _ => "-",
+    }
+}
+
+/// `trace blocked` - every task blocked on another task, as a record table (so it pipes).
+fn trace_blocked(ctx: &ServiceContext) -> Result<(), ShellError> {
+    let mut t = Table::new(&["slot", "name", "blocked", "awaiting", "held_by"]);
+    let mut n = 0u32;
+    for slot in 0..TRACE_SLOTS {
+        let s = ctx.task_stat(slot);
+        if !s.valid { continue; }
+        let awaits = ctx.task_awaits_endpoint(slot);
+        // A task blocked on RECV with nothing awaited is IDLE, not stuck - it is waiting for work,
+        // which is what a healthy service does all day. Listing those would bury the handful that
+        // matter under every service on the machine.
+        if awaits == 0 && s.state != 3 { continue; }
+        let name = t.intern(&s.name[..s.name_len.min(31)]);
+        let kind = t.intern(trace_block_kind(s.state, awaits).as_bytes());
+        let held = match trace_owner_of(ctx, awaits) {
+            Some(o) => {
+                let h = ctx.task_stat(o);
+                t.intern(&h.name[..h.name_len.min(31)])
+            }
+            None if awaits != 0 => t.intern(b"NO LIVE OWNER"),
+            None => t.intern(b"-"),
+        };
+        t.add_row(&[Value::Int(slot as u64), name, kind, Value::Int(awaits), held]);
+        n += 1;
+    }
+    if n == 0 {
+        ctx.console_writeln("no task is blocked on another task.");
+        return Ok(());
+    }
+    { let mut o = Out::Console; t.to_grid(&mut OutSink { ctx, out: &mut o }); }
+    if t.overflow() {
+        ctx.console_writeln_fmt(format_args!("trace: more than {} rows shown (bounded)", REC_MAX_ROWS));
+    }
+    Ok(())
+}
+
+/// `trace chain <name|slot>` - who a task is stuck behind right now, as a tree.
+///
+/// Walks `awaited endpoint -> owning task -> what IT awaits`. Bounded two ways, because a stuck system
+/// is precisely where an unbounded walk would hang: a depth cap, and a repeat-visit check that names
+/// the cycle. 8.9 says the kernel does not detect deadlock - so a cycle surfacing HERE, in an operator
+/// tool, is exactly where it belongs.
+fn trace_chain(ctx: &ServiceContext, root: u32) -> Result<(), ShellError> {
+    let s = ctx.task_stat(root);
+    if !s.valid {
+        ctx.console_writeln_fmt(format_args!("trace: slot {} holds no live task", root));
+        return Err(ShellError::Unknown);
+    }
+    let mut seen = [u32::MAX; 16];
+    let mut nseen = 0usize;
+    let mut cur = root;
+    let mut depth = 0usize;
+    loop {
+        let st = ctx.task_stat(cur);
+        if !st.valid { break; }
+        let awaits = ctx.task_awaits_endpoint(cur);
+        let name = core::str::from_utf8(&st.name[..st.name_len.min(31)]).unwrap_or("?");
+        let pad = [b' '; 48];
+        let ind = (depth * 3).min(pad.len());
+        let indent = core::str::from_utf8(&pad[..ind]).unwrap_or("");
+        ctx.console_writeln_fmt(format_args!(
+            "{}{}task {} \"{}\" {} ({})",
+            indent, if depth > 0 { "`- " } else { "" }, cur, name, st.state_str(),
+            trace_block_kind(st.state, awaits)));
+
+        if awaits == 0 {
+            let runnable = st.state == 0 || st.state == 1;
+            ctx.console_writeln_fmt(format_args!(
+                "{}   root: awaits no task - {}", indent,
+                if runnable { "it is runnable, so the chain is not stuck here" }
+                else { "blocked on its own endpoint, waiting for work" }));
+            break;
+        }
+        ctx.console_writeln_fmt(format_args!("{}   awaiting endpoint {}", indent, awaits));
+
+        let next = match trace_owner_of(ctx, awaits) {
+            Some(nx) => nx,
+            None => {
+                ctx.console_writeln_fmt(format_args!(
+                    "{}   root: endpoint {} has NO LIVE OWNER - the peer died; this task wakes with ReplyDead",
+                    indent, awaits));
+                break;
+            }
+        };
+        if seen[..nseen].contains(&next) {
+            ctx.console_writeln_fmt(format_args!(
+                "{}   CYCLE: task {} is already in this chain - these tasks await each other (8.9)",
+                indent, next));
+            break;
+        }
+        if nseen < seen.len() { seen[nseen] = cur; nseen += 1; } else {
+            ctx.console_writeln_fmt(format_args!("{}   (chain longer than {} - stopping)", indent, seen.len()));
+            break;
+        }
+        cur = next;
+        depth += 1;
+    }
+    Ok(())
 }
 
 fn cmd_status(ctx: &ServiceContext) -> Result<(), ShellError> {

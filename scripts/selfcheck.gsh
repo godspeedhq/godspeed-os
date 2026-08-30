@@ -288,7 +288,7 @@ status | where core=0 | assert contains supervisor
 status | where state=Running | assert contains shell
 status | where slot>=0 | assert contains shell
 status | where core<1 | assert contains supervisor
-status | where name~super | assert contains supervisor
+status | where name contains super | assert contains supervisor
 status | select name state | assert contains shell
 status | sort name | assert contains supervisor
 status | sort reverse slot | assert contains shell
@@ -320,6 +320,45 @@ assert fails-with Unknown spawn nosuchservice
 assert fails kill nosuchservice
 assert fails restart supervisor
 assert fails restart nosuchservice
+
+# ===== trace: the IPC observability views =====
+echo ''
+echo '===== trace: blocked / chain / deps / endpoints / ipc / status ====='
+# Every view must ANSWER. A healthy machine has nothing blocked, and saying so is the correct answer -
+# an empty result would not be (idle on your own endpoint is not stuck).
+# `blocked`, `chain` and `status` print a report rather than records, so they are not pipe producers -
+# `assert ok` is the form for those, and it is not a weaker check here: each returns Err when it cannot
+# answer, which is exactly the failure being guarded against.
+assert ok trace blocked
+assert ok trace chain shell
+# `deps` reads the LIVE capability table, so the shell must show the peers it actually holds.
+trace deps shell | assert contains fs
+trace deps fs | assert contains block-driver
+# The tree and the record stream are the same data - the grid header names every filterable column.
+trace deps shell | to grid | assert contains parent
+trace deps shell | where peer contains fs | assert contains fs
+# The endpoint inventory, and the inverse lookup it exists to feed.
+trace endpoints | assert contains logger
+trace endpoints | where name contains fs | assert contains fs
+# The ring itself answers, and reports its drop count (a silent loss is the bug - invariant 12).
+assert ok trace status
+# The shell has been calling `fs` throughout this suite, so the ring holds real traffic.
+trace ipc | assert contains outcome
+# Every view refuses an unknown subject LOUDLY rather than answering with nothing.
+assert fails trace chain nosuchsvc
+assert fails trace deps nosuchsvc
+assert fails trace endpoint notanumber
+assert fails trace nosuchview
+
+# THE SINK IS RESTARTABLE, AND THE READER MUST SURVIVE IT. `logger` holds the trace ring; killing it
+# invalidates every cached capability to it. Without a reacquire the shell keeps a stale generation
+# forever, so `trace ipc` reports a live service as unreachable and every emission logs a kernel
+# gen-mismatch - which is exactly what a chaos storm produced on hardware (cap 985 vs record 1025)
+# before this was fixed. Kill it, then prove the views still work (14.3: reacquire by name, retry).
+assert ok chaos kill-storm logger 1
+assert ok trace status
+trace ipc | assert contains outcome
+trace endpoints | assert contains logger
 
 # ===== files: create / read / overwrite / append / empty / quoted =====
 echo ''
@@ -458,7 +497,7 @@ roster | where role=core | assert contains Matthew
 roster | where role!=core | assert lacks Matthew
 roster | where seat>1 | assert lacks Matthew
 roster | where seat=1 | assert contains Matthew
-roster | where name~ar | assert contains Mark
+roster | where name contains ar | assert contains Mark
 roster | sort reverse seat | assert contains John
 roster | to json | assert contains role
 roster | to json | from json | where role=core | assert contains Matthew
@@ -476,7 +515,7 @@ read /sc/data.json | from json | where n=2 | assert contains y
 read /sc/data.json | from json | where n!=2 | assert lacks y
 read /sc/data.json | from json | where n>=2 | assert lacks x
 read /sc/data.json | from json | where n<=1 | assert contains x
-read /sc/data.json | from json | where name~y | assert contains y
+read /sc/data.json | from json | where name contains y | assert contains y
 read /sc/data.json | from json | select name | assert contains z
 read /sc/data.json | from json | select name n | to yaml | assert contains name
 read /sc/data.json | from json | sort n | assert contains x
