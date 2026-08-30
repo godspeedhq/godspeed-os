@@ -2900,7 +2900,7 @@ static BRUTAL_ADV_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BA3", name: "alloc_edge_cycles_5x", spec_ref: "§22 Brutal Adv BA3",
         kind: TestKind::WatchSerial {
-            expect:       &["adv: BA3 pass \u{2014} 5\u{d7} alloc edge cycles rejected without panic"],
+            expect:       &["adv: BA3 pass - 5\u{d7} alloc edge cycles rejected without panic"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
             timeout_secs: 900,
         },
@@ -2908,7 +2908,7 @@ static BRUTAL_ADV_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BA4", name: "recv_cap_as_send_5x", spec_ref: "§22 Brutal Adv BA4",
         kind: TestKind::WatchSerial {
-            expect:       &["adv: BA4 pass \u{2014} 5\u{d7} RECV-cap-as-SEND rejected; non-SEND caps rejected"],
+            expect:       &["adv: BA4 pass - 5\u{d7} RECV-cap-as-SEND rejected; non-SEND caps rejected"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
             timeout_secs: 900,
         },
@@ -2924,7 +2924,7 @@ static BRUTAL_ADV_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "BA6", name: "cap_table_fill_5x", spec_ref: "§22 Brutal Adv BA6",
         kind: TestKind::WatchSerial {
-            expect:       &["adv: BA6 pass \u{2014} 5\u{d7} cap-table fill returned None without panic"],
+            expect:       &["adv: BA6 pass - 5x fill-to-exhaustion + drain, each cycle real, no panic"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:"],
             timeout_secs: 900,
         },

@@ -11,10 +11,20 @@ Exit: 0 if no em/en dash is present in tracked text files, 1 otherwise.
 
 import subprocess
 import sys
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
 EM, EN = chr(0x2014), chr(0x2013)  # em-dash / en-dash; via chr() so this file has no literal dash
+
+# ESCAPED forms count too. A dash written as a source escape is invisible to a literal scan, and the
+# miss is not cosmetic: osdev/src/validator.rs held three harness expectations containing an escaped
+# em-dash while the probes they matched had been purged to plain hyphens. The strings stopped
+# matching, so each of those tests sat out its 900-second timeout and then FAILED - a broken suite
+# hiding behind a passing dash gate. Built with chr() for the same reason as the pair above.
+_D = chr(92)
+ESCAPED = re.compile(_D + _D + r"(?:u" + _D + r"{20(?:14|13)" + _D + r"}|u20(?:14|13)|"
+                     r"N" + _D + r"{E[MN] DASH" + _D + r"}|x" + _D + r"{20(?:14|13)" + _D + r"})", re.I)
 # Text file suffixes worth scanning. Binary assets (images, fonts, os.img) are skipped.
 TEXT_SUFFIXES = {".rs", ".md", ".toml", ".py", ".yml", ".yaml", ".sh", ".json", ".html", ".css",
                  ".js", ".txt", ".gsh", ".c", ".h", ".s", ".ld", ".cfg", ".conf"}
@@ -36,8 +46,12 @@ def main() -> int:
         except (UnicodeDecodeError, FileNotFoundError):
             continue  # binary or removed; not our concern
         for i, line in enumerate(text.splitlines(), 1):
-            if EM in line or EN in line:
-                kind = "em-dash (U+2014)" if EM in line else "en-dash (U+2013)"
+            esc = ESCAPED.search(line)
+            if EM in line or EN in line or esc:
+                if esc:
+                    kind = "escaped dash (" + esc.group(0) + ")"
+                else:
+                    kind = "em-dash (U+2014)" if EM in line else "en-dash (U+2013)"
                 rel = path.relative_to(REPO_ROOT).as_posix()
                 violations.append(f"  {rel}:{i}: {kind} - use a plain ASCII hyphen (-)")
 
@@ -50,7 +64,7 @@ def main() -> int:
         print(f"\n{len(violations)} em/en dash(es). Replace each with a plain hyphen (-).")
         return 1
 
-    print("Dash check passed - no em-dash (U+2014) or en-dash (U+2013) in any tracked text file.")
+    print("Dash check passed - no em-dash (U+2014) or en-dash (U+2013), literal or escaped, in any tracked text file.")
     return 0
 
 
