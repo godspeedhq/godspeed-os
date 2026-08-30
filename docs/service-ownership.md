@@ -321,6 +321,80 @@ Step D is arch-shaped work: x86 config space via I/O ports, Pi 4 via ECAM, and *
 all** (the DWC2 is soldered to the SoC, which is why `HwClass::Dwc2` is the one class whose presence
 is a `cfg!`, not a scan).
 
+### What happens when `bus-manager` dies
+
+Drivers get their MMIO base, IRQ and DMA arena from `bus-manager`, so it must come up before any
+driver. That is a new ordering dependency, and the failure question follows immediately.
+
+**The supervisor caches the enumeration results** - a bounded array of `(BDF, class, BAR, size, IRQ)`,
+fixed size, no heap, the same discipline as its `name -> cap` map. It is the thing that respawns
+drivers, so it needs those facts at restart time. If it had to query a possibly-dead `bus-manager`
+first, a `bus-manager` crash would take out every driver restart with it (Commandment VIII: a
+dependent must not hang on a dependency that is gone).
+
+If the SUPERVISOR dies, it re-derives, and the chain terminates:
+
+```
+  supervisor dies
+       |
+       v
+  kernel respawns it            (6.2 - unconditionally, forever)
+       |
+       v
+  adopts the still-running services, including bus-manager
+       |
+       v
+  re-queries bus-manager  ->  facts back
+```
+
+If both are dead, the supervisor spawns `bus-manager` first and then queries it. There is no
+circularity, because **`bus-manager` needs no discovered facts to start**: it needs access to PCI
+config space, which is an architectural constant (an I/O port pair on x86, a fixed ECAM window on
+Pi 4), not something anyone discovered.
+
+### Why the enumeration results do NOT go in the kernel
+
+The tempting move is to put them where nothing can die. It is the same instinct that produced the
+kernel name directory - which was the right call - but this case fails the test that one passed:
+
+> **The kernel keeps what cannot be RE-DERIVED. Anything re-readable stays out.**
+
+A `name -> endpoint` mapping is irreducible: if the supervisor dies holding it there is nothing to
+re-read, because endpoint ids exist only in kernel state. That is exactly why 3.7 justified the
+directory as a recovery anchor.
+
+Bus enumeration is the opposite. The irreducible source is **the hardware itself**, and it never goes
+away - config space can be re-read in microseconds by anything holding the capability. A kernel copy
+would be a derived view of a truth that is always available: the kind of cache 26.4 and Commandment
+III reject, adding a second thing that can be wrong and buying no availability.
+
+It would also quietly undo step D. The point of D is that the kernel stops knowing what is on the
+bus; keeping the results puts a device table back - smaller, but the same category of thing. The pin
+exists to catch precisely that.
+
+### The fiddly part of D: assignment once, re-read always
+
+Re-enumeration after a restart must not disturb live drivers. On the Pi 4 today the kernel does not
+merely read the bus, it **assigns**:
+
+```
+  pcie: xHCI BAR0 assigned bus 0xf8000000 -> CPU 0x600000000
+```
+
+If `bus-manager` inherits that job, dies, and restarts while `xhci` is running against the window it
+was given, a naive re-scan that reassigns BARs pulls the address out from under a live driver.
+
+So enumeration splits in two, and the split is a hard requirement rather than an optimisation:
+
+| phase | when | what it may do |
+|---|---|---|
+| **assignment** | a device with nothing programmed | write BARs, enable bus-master |
+| **re-enumeration** | every restart after that | **read only** - report what is already programmed |
+
+Idempotent by construction: read the BAR, and if it is already programmed, keep it and report it.
+This is the genuinely fiddly part of D, more so than config-space access itself, and it wants
+designing in rather than discovering the first time `chaos` kills `bus-manager` mid-transfer.
+
 ### Ordering: C first, D second, with one condition
 
 **Design C's spawn ABI for the end state, not the interim.** The supervisor should pass the hardware
