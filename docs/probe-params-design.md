@@ -119,6 +119,29 @@ Result: identity 24/0/0, property 10/0, fuzz 8/0, stress 10/0, adv 15/0, chaos 7
 identity-brutal 6/0, property-brutal 10/0. Both authority outliers are covered - IR1A exercises
 `probe-11a`'s IRQ route, Test 5A exercises `probe-5a-send`'s grantable peer caps.
 
+### Hardware: four machines, three architectures (2026-08-30)
+
+| machine | arch | selfcheck | chaos max-carnage | kernel panics / wedges |
+|---|---|---|---|---|
+| HP T630 | x86_64 (AMD) | 377/0 twice | 100 rounds, 590 kills | 0 / 0 |
+| Wyse 5070 | x86_64 (Intel) | 377/0 twice | 100 rounds, 545 kills | 0 / 0 |
+| Raspberry Pi 2 B | ARMv7 | 377/0 twice | 100 rounds, 530 kills | 0 / 0 |
+| Raspberry Pi 4 B | AArch64 | 377/0 twice | 100 rounds, 568 kills | 0 / 0 |
+
+**2,233 real service kills, zero kernel panics, zero liveness wedges**, and every service-level panic
+came from the ONE designed site (`sdk/rust/src/service_context.rs:571` - `recv` panicking on
+`EndpointDead` so the supervisor restarts the service). A second panic site anywhere in that tally
+would have been the tell that something broke; there was none, on any port.
+
+Every number is identical to v0.12.0, which is the result to want from a change that deleted 2,317
+lines of kernel and rewrote how every task stores its name: the machines cannot tell.
+
+**What hardware did NOT cover, stated because a green log invites the wrong conclusion.** The
+bare-metal, arm32 and aarch64 supervisors all gate out probe spawning, so no hardware run exercised
+the parameterised path itself. Hardware proved the CONSEQUENCES (owned task names, the shrunken
+kernel, the name-squatting refusal compiled in, the system still behaving under a storm); the QEMU
+suites proved the path. Together they are complete; neither is alone.
+
 **One pre-existing failure surfaced and was fixed on the way.** Brutal property BP7 read the victim's
 generation *between* the kill and the respawn - the dead window, where unregister-on-death correctly
 returns 0 - so it failed on its first iteration and had done since unregister-on-death landed (P7 was
