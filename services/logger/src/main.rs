@@ -79,6 +79,15 @@ struct Ev {
 fn reply(ctx: &ServiceContext, out: &[u8]) {
     if let Some(cap) = ctx.take_pending_cap() {
         let _ = ctx.try_send_by_handle(cap, &Message::from_bytes(out));
+        // RECLAIM IT. A reply capability is a one-shot return address handed to us inside the request;
+        // sending on it does not consume it, so leaving it behind burns a cap-table slot per reply
+        // until the table is full. `block-driver`, `console` and `fs` all do this - this service was
+        // the one that did not.
+        //
+        // It was visible before it was fatal: `trace deps fs` drew `logger -> shell`, because a
+        // retained return address is indistinguishable from a wired peer (both SEND|GRANT to a live
+        // task's endpoint). A leak that shows up as a wrong arrow in a diagram is a lucky leak.
+        ctx.remove_cap(cap);
     }
 }
 

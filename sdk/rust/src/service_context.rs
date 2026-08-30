@@ -802,7 +802,22 @@ impl ServiceContext {
         // anyone - and the caller already used `try_send` and did not wait. An observer must not be
         // able to slow the thing it observes, and a millisecond of port I/O per IPC is exactly that.
         let ev = crate::trace::encode(peer, op, kind);
-        let _ = self.try_send_by_handle(CapHandle(slot), &crate::ipc::Message::from_bytes(&ev));
+        if self.try_send_by_handle(CapHandle(slot), &crate::ipc::Message::from_bytes(&ev)).is_err() {
+            // THE SINK RESTARTED - REACQUIRE IT. The slot is resolved once and cached, so a `logger`
+            // respawn left every emitter holding a stale generation FOREVER: tracing silently stopped,
+            // `trace ipc` could not reach the ring, and each emission logged a kernel gen-mismatch.
+            // Seen on hardware after a chaos storm restarted `logger` forty times - cap generation 985
+            // against a live record of 1025.
+            //
+            // This is the ordinary reacquire-by-name recovery every client owes a restartable peer
+            // (14.3); the trace path just never did it. Only on FAILURE, so the healthy path is
+            // unchanged, and if the sink is genuinely down the next emission tries again.
+            if self.reacquire_by_name(crate::trace::SINK_NAME) {
+                if let Some(fresh) = self.find_send_slot(crate::trace::SINK_NAME) {
+                    crate::trace::set_sink_slot(fresh);
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------

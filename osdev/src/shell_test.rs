@@ -463,10 +463,20 @@ pub fn run(image_path: &Path, smp: u32) {
     // -------------------------------------------------------------------
     send(&mut write_half, b"trace version\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
-        Some(r) => check!(r.contains("trace 0."), "trace: version reports (conventions rule 5)"),
+        // The SHARED version, and the creator credit - the same bar every other utility is held to.
+        // `trace 0.` passed while the utility reported 0.1.0 from a private constant and every help
+        // header said 0.4.0; an assertion that cannot see a two-version utility is not much of one.
+        Some(r) => check!(r.contains(&format!("trace {ver}")) && r.contains("Bankole Ogundero"),
+                          "trace: version reports the shared version + credit (conventions rule 5)"),
         None => { println!("shell-test: FAIL - timed out after `trace version`"); fail += 1; }
     }
 
+    // WHETHER `trace help` pages depends on the console HEIGHT, so drive it in a way that works
+    // either way: the command, then a lone `q` afterwards. If a pager is up the q quits it; if the
+    // help fit on one screen the q is an unknown command and harmless.
+    //
+    // Sending pager keys unconditionally leaked them into the NEXT command the moment the help got
+    // short enough to fit - the prompt showed `qtrace blocked` and the suite failed one check down.
     send(&mut write_half, b"trace help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("trace blocked") && r.contains("trace chain"),
@@ -484,6 +494,21 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // The shell is running (it is executing this), so it must report as such, not as stuck.
+    // Per-view help: the top level is the MAP, each view carries its own columns.
+    send(&mut write_half, b"trace ipc help\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
+        Some(r) => check!(r.contains("outcome") && r.contains("QUEUE_FULL") && r.contains("seq"),
+                          "trace ipc help: explains that view's columns"),
+        None => { println!("shell-test: FAIL - timed out after `trace ipc help`"); fail += 1; }
+    }
+    send(&mut write_half, b"trace deps help\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
+        Some(r) => check!(r.contains("reply#NNN") && r.contains("to grid"),
+                          "trace deps help: explains the tree and its table form"),
+        None => { println!("shell-test: FAIL - timed out after `trace deps help`"); fail += 1; }
+    }
+    send(&mut write_half, b"q\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5));
     send(&mut write_half, b"trace chain shell\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("task ") && r.contains("shell"),
@@ -572,11 +597,44 @@ pub fn run(image_path: &Path, smp: u32) {
     }
     // The reply addresses are IN the record with their parents, so the pipe lists them properly -
     // which is why the tree footer is a count and a pointer rather than an id list that grows.
-    send(&mut write_half, b"trace deps shell | where peer~reply\r");
+    send(&mut write_half, b"trace deps shell | where peer contains reply\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
         Some(r) => check!(r.contains("reply#") && r.contains("parent"),
-                          "trace deps | where peer~reply: lists the reply addresses with their holders"),
-        None => { println!("shell-test: FAIL - timed out after `where peer~reply`"); fail += 1; }
+                          "trace deps | where peer contains reply: lists the reply addresses with their holders"),
+        None => { println!("shell-test: FAIL - timed out after `where peer contains reply`"); fail += 1; }
+    }
+    // An UNKNOWN COLUMN must select nothing, not everything: a mistyped column used to pass the
+    // whole table through, which looks exactly like "it all matched".
+    send(&mut write_half, b"status | where nosuchcol contains x | count\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
+        Some(r) => check!(r.contains("no such column") && !r.contains("supervisor"),
+                          "where: an unknown column selects NOTHING, and says so"),
+        None => { println!("shell-test: FAIL - timed out after `where nosuchcol`"); fail += 1; }
+    }
+    // `trace deps` must name its own table form - a tree hides that its rows are records.
+    send(&mut write_half, b"trace deps fs\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
+        Some(r) => check!(r.contains("to grid") && r.contains("header names every column"),
+                          "trace deps: points at the grid, whose header names the columns"),
+        None => { println!("shell-test: FAIL - timed out after `trace deps fs` legend"); fail += 1; }
+    }
+    // `trace endpoints` - the INVENTORY: the map from service names to endpoint ids, which is what
+    // made `trace endpoint <id>` usable deliberately rather than by copying an id out of a tree.
+    send(&mut write_half, b"trace endpoints\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
+        Some(r) => {
+            check!(r.contains("endpoint") && r.contains("shell") && r.contains("fs"),
+                   "trace endpoints: lists live services with their endpoint ids");
+            check!(r.contains("live endpoints"),
+                   "trace endpoints: says what it is showing");
+        }
+        None => { println!("shell-test: FAIL - timed out after `trace endpoints`"); fail += 2; }
+    }
+    send(&mut write_half, b"trace endpoints | where name contains fs | to json\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)) {
+        Some(r) => check!(r.contains("\"endpoint\":") && r.contains("\"fs\""),
+                          "trace endpoints: filters and pipes like every other record source"),
+        None => { println!("shell-test: FAIL - timed out after `trace endpoints | to json`"); fail += 1; }
     }
     // `trace endpoint` - the INVERSE of deps: who owns an endpoint and who can reach it.
     send(&mut write_half, b"trace endpoint 4\r");

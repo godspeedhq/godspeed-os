@@ -135,6 +135,189 @@ output from identical code while being named after the SUBJECT KIND, which made 
 things and made `trace service fs` read oddly beside `trace deps fs`. The argument disambiguates
 itself - digits are a slot, anything else is a name.
 
+### Reading the output: every command, every column, every number
+
+The rest of this document is the reasoning. This section is the reference: what each command prints,
+what each column holds, and what a number in it actually counts.
+
+---
+
+#### `trace blocked` - who is stuck on someone else
+
+```text
+gsh> trace blocked
+no task is blocked on another task.
+```
+
+That sentence is the healthy answer, not an empty result. A service parked on its OWN endpoint is
+idle - waiting for work - and is deliberately not listed. Only a task waiting on ANOTHER task appears:
+
+```text
+slot  name   blocked  awaiting  held_by
+9     asker  call     116       reply-server
+```
+
+| column | what it holds |
+|---|---|
+| `slot` | the kernel scheduler slot of the blocked task (the same number `status` shows) |
+| `name` | that task's service name |
+| `blocked` | HOW it is waiting: `call` (a synchronous request awaiting its reply) or `recv` |
+| `awaiting` | the ENDPOINT ID it is waiting on - an opaque kernel id, resolvable with `trace endpoint` |
+| `held_by` | the service that OWNS that endpoint, i.e. the one that owes the answer |
+
+`held_by` is the payoff: it turns "task 9 is blocked" into "task 9 is waiting on reply-server".
+
+---
+
+#### `trace chain <name|slot>` - the same, as a tree from one task
+
+```text
+gsh> trace chain asker
+task 9 "asker" BlockRecv (call)
+   awaiting endpoint 116
+   `- task 8 "reply-server" BlockRecv (recv)
+      root: awaits no task - blocked on its own endpoint, waiting for work
+```
+
+Read it downward: each line is who the line above is waiting for. The walk stops at a ROOT - a task
+waiting on nobody - and says which kind of root it is:
+
+| root line | means |
+|---|---|
+| `awaits no task - blocked on its own endpoint, waiting for work` | idle. The chain ends here because this service is fine |
+| `awaits no task - it is runnable, so the chain is not stuck here` | running right now |
+
+The argument is a service NAME or a task SLOT; digits are read as a slot. `trace chain 7` and
+`trace chain shell` are the same query.
+
+---
+
+#### `trace deps <service>` - what it can call, and what it has called
+
+```text
+gsh> trace deps fs
+fs
+|-- block-driver  27 calls  (capacity)
+`-- logger  (trace sink - its own traffic is never recorded)
+(2 reply address(es) hidden - `trace deps fs | where peer contains reply` lists them)
+```
+
+Indentation is the call direction: a child is a service its parent **holds a SEND capability to**.
+This is read from the live capability table, so it is what the service can do right now - not what a
+contract declared.
+
+| what you see | what it means |
+|---|---|
+| `27 calls` | how many exchanges with that peer are STILL IN THE RING. A recent window, never a lifetime total. `0` means "not in the last 64 events", never "never" |
+| `(capacity)` | the distinct operations seen, by name. A bare number is an opcode this shell has no name for |
+| `4 FAILED` | of those calls, how many ended in anything other than a reply |
+| `(trace sink - its own traffic is never recorded)` | `logger` always reads 0 calls: emissions to the ring are deliberately not traced, so this is the MOST used capability here, not an unused one |
+| `reply#119` | a send capability whose endpoint no live task owns - a return address, not a dependency. Counted below the tree rather than drawn in it |
+| `stopped at N edges` | the walk hit its bound; the graph is larger than the view |
+
+As records (`| to grid`), one row per EDGE:
+
+| column | what it holds |
+|---|---|
+| `depth` | 1 for a direct peer, 2 for a peer of that peer, and so on |
+| `parent` | the service that holds the capability |
+| `peer` | the service it points at |
+| `grant` | `grantable` if the cap carries GRANT. That means EITHER a supervisor-wired peer OR a reply address - the two are indistinguishable from userspace, so the ambiguity is reported rather than guessed |
+| `calls` / `failed` | as above |
+| `ops` | space-separated distinct operation names, or `-` |
+
+---
+
+#### `trace endpoint <id>` - what an endpoint is, and who can reach it
+
+```text
+gsh> trace endpoint 116
+endpoint 116 - owned by task 8 "reply-server" (BlockRecv)
+held by:
+holder     slot  rights
+asker      9     send
+supervisor 0     send grant
+```
+
+The inverse of `deps`: that one says who a service calls, this says who holds authority over a given
+endpoint. Three shapes of answer:
+
+| first line | means |
+|---|---|
+| `owned by task N "name" (state)` | a live service's endpoint |
+| `console_push (id 4) - a kernel resource, not an endpoint` | ids 1-5 are stable kernel resources (`log_write`, `spawn`, `console_read`, `console_push`, `introspect`). They have no owning task by design |
+| `NO LIVE OWNER` | either the owning task died, or it is a REPLY-only endpoint. A task's reply mailbox is not its primary one, and only primaries are named here |
+
+| column | what it holds |
+|---|---|
+| `holder` | a live service holding a capability to this resource |
+| `slot` | that holder's scheduler slot |
+| `rights` | the rights on ITS copy, spelled out: `read write send recv grant revoke` |
+
+`no live task holds a capability to it` is a complete answer, not a failure.
+
+---
+
+#### `trace ipc` and `trace failures` - what happened
+
+```text
+seq  sec  caller  peer          op        outcome
+9    0    shell   fs            write     REPLY
+10   2    shell   net-stack     1         TIMEOUT
+6    2    fs      block-driver  capacity  REPLY
+```
+
+One row per completed exchange, oldest first, newest last. `trace failures` is the same ring filtered
+to the failures.
+
+| column | what the NUMBER or word actually is |
+|---|---|
+| `seq` | the CALLER'S OWN event counter, starting at 0 when that service started. Not global - a mixed dump interleaves several sequences and can look unsorted; it is not, rows are in ring order. A GAP is the one loss nothing else can see: an event whose send failed on a full queue never reached the ring, so `trace status` reports 0 dropped while events are being lost |
+| `sec` | when the RING recorded the row, counted from the oldest row shown, in whole seconds. NOT a latency, and not when the call was made. It exists to show a HOLE - forty rows in one second, then a four-second gap, and that gap is the stall |
+| `caller` | who made the call, as that service declared itself (`ctx.trace_as`). `?` means a service traced without declaring a name |
+| `peer` | who was called, by name. The emitter knew it, so no lookup is involved |
+| `op` | the OPERATION, by name (`read`, `write`, `capacity`). A bare number is an opcode this shell has no table for - `net-stack`'s protocol, for instance |
+| `outcome` | how it ended - see below |
+
+Outcomes, and what each one tells you to do:
+
+| outcome | means |
+|---|---|
+| `REPLY` | the peer answered |
+| `TIMEOUT` | the peer did not answer within the caller's deadline. It is alive as far as the kernel knows |
+| `PEER_LOST` | the send failed, or the peer died while the call was outstanding (`ReplyDead`) |
+| `QUEUE_FULL` | the peer is ALIVE and its queue is full. Congestion, not absence - answering it by reacquiring a capability that was never stale is a bug this project has already paid for once |
+| `ABORTED` | the user pressed `q`. Not a failure of anything |
+
+A request still IN FLIGHT is not here: one row is written per exchange, when it ends. The live view of
+something stuck is `trace blocked`.
+
+---
+
+#### `trace status` - the ring itself
+
+```text
+trace: ring 192 events; 2 recorded; 0 DROPPED (oldest overwritten before being read)
+trace: the ring lives in the `logger` service - the kernel records nothing.
+```
+
+| number | what it counts |
+|---|---|
+| `ring N events` | capacity. Fixed, no heap |
+| `N recorded` | events ever ACCEPTED by the sink since it last started. A logger restart resets it |
+| `N DROPPED` | events overwritten before anyone read them. **This cannot see the other kind of loss** - an event whose `try_send` failed never arrived, so it is invisible here and shows only as a gap in a caller's `seq` |
+
+---
+
+#### Who is traced at all
+
+Only exchanges made through the SDK's request/reply calls, by services whose contract grants
+`ipc_send = ["logger"]`. Today that is `fs` and `shell`. Tracing is authority: visible in
+`caps <service>`, revocable, and absent by default - not a global switch. A service holding no such
+capability emits nothing, at a cost of one relaxed atomic load.
+
+---
+
 ### `trace blocked` - the whole point, in one screen
 
 ```
@@ -159,9 +342,14 @@ Two failure shapes it must name rather than hide:
   is a task about to be woken with `ReplyDead`, and saying so distinguishes "stuck" from "already
   losing".
 
-### `trace task 42` / `trace service fs`
+### `trace task 42` / `trace service fs`  *(as PROPOSED; shipped as `trace chain`)*
 
-The same walk, rooted at one task, printed as the tree the requirement asks for:
+The same walk, rooted at one task, printed as the tree the requirement asks for. Two subcommands were
+proposed here, one per subject kind - they shipped as a single `trace chain <name|slot>`, because they
+printed identical output from identical code and naming them after the SUBJECT rather than the VIEW
+made `trace service fs` read oddly beside `trace deps fs`. The sketch below also shows a per-hop
+duration, which was not built: the kernel does not stamp when a task blocked, and adding that stamp is
+kernel growth for a diagnostic. See the reference section above for what it actually prints.
 
 ```
 gsh> trace task 42

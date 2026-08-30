@@ -174,8 +174,16 @@ impl Table {
     /// Keep only rows whose column `col` satisfies `<op> val` (in place). Ops: `=`/`==` `!=` `>`
     /// `<` `>=` `<=` `~`(contains). Numeric when both sides parse as numbers, else textual.
     /// Returns `false` (table unchanged) if `col` is not a column.
+    /// Keep rows matching `col op val`. Returns false if `col` is not a column - and in that case the
+    /// table is EMPTIED, not left alone.
+    ///
+    /// It used to be left alone, so `where peeer contains reply` printed a notice and then handed the
+    /// whole table onward: a mistyped column produced output identical to "everything matched", and a
+    /// `| count` downstream reported the full count. A predicate that could not be evaluated has not
+    /// selected anything, and saying so with zero rows is the honest answer (invariant 12) - the loud
+    /// notice stays, but it is no longer contradicted by the data underneath it.
     pub fn filter(&mut self, col: &str, op: &str, val: &str) -> bool {
-        let ci = match self.col_index(col) { Some(i) => i, None => return false };
+        let ci = match self.col_index(col) { Some(i) => i, None => { self.nrows = 0; return false; } };
         let mut keep = 0usize;
         for r in 0..self.nrows {
             if row_matches(self, r, ci, op, val) {
@@ -541,11 +549,23 @@ impl Table {
 /// The operator is the longest match (`!=`/`>=`/`<=`/`==` before `=`/`>`/`<`/`~`); before it is
 /// the column, after it the value. `None` if no operator is present.
 pub fn parse_predicate(tok: &str) -> Option<(&str, &str, &str)> {
-    for op in ["!=", ">=", "<=", "=="] {
-        if let Some(i) = tok.find(op) { return Some((&tok[..i], op, &tok[i + op.len()..])); }
+    // `contains` IS A WORD, and words are the vocabulary here (`utilities/0_conventions.md` rule 4:
+    // "Subcommands are words, never single-letter flags. A word means the same thing across every
+    // utility"). The comparison operators `= != > < >= <=` are self-evident to anyone who has seen
+    // arithmetic; `~` was the one nobody could read without being told, which is exactly the cost that
+    // rule exists to avoid. It is REPLACED rather than aliased - rule 3 rejects synonyms outright.
+    //
+    // Written spaced (`peer contains reply`) because that is how a word reads. The symbolic operators
+    // stay unspaced, as they are written everywhere else.
+    let t = tok.trim();
+    if let Some(i) = t.find(" contains ") {
+        return Some((t[..i].trim(), "~", t[i + " contains ".len()..].trim()));
     }
-    for op in ["=", ">", "<", "~"] {
-        if let Some(i) = tok.find(op) { return Some((&tok[..i], &tok[i..i + 1], &tok[i + 1..])); }
+    for op in ["!=", ">=", "<=", "=="] {
+        if let Some(i) = t.find(op) { return Some((&t[..i], op, &t[i + op.len()..])); }
+    }
+    for op in ["=", ">", "<"] {
+        if let Some(i) = t.find(op) { return Some((&t[..i], &t[i..i + 1], &t[i + 1..])); }
     }
     None
 }

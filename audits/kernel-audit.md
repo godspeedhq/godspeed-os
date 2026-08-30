@@ -1576,3 +1576,53 @@ the previous generation and failed for a reason that has nothing to do with gene
 ever passed by winning a race against the death path. Fixed by reading while the instance is alive,
 between the spawn and the kill - which is also the stronger question, and the one §7.5 actually makes
 a claim about. §22.4: a test failing for the wrong reason is a failure of the test.
+
+### A9-4 (OPEN) - A8-1's wedge RETURNED once the BSP could actually reach idle
+
+`LIVENESS WEDGE: core 0 ... slot 224` (224 = IDLE), ~4 s after boot on the T630, on `feat/trace`. That
+is A8-1's fingerprint exactly - same core, same sentinel, same machine, same delay - and A8-1's own
+note says why it had been invisible: **"Latent for the life of the port - userspace spin-yielded, so
+the BSP never reached idle."**
+
+That is the connection. On this branch `logger` moved OFF core 0 (every trace event wakes it, and on
+core 0 it preempted the shell twice per fs request - `osdev test files` 222/0 -> 213/9, and back to
+222/0 with nothing changed but the core number). Core 0 now holds only services that BLOCK, so a fully
+idle BSP became common for the first time. The trace work did not create this defect; it removed the
+thing that was hiding it.
+
+**PLACEMENT IS NOT THE FIX, and calling it one would be wrong.** GodspeedOS is expected to run on a
+SINGLE core, where `preferred_core: 2` falls back to round-robin onto core 0 - so on a one-core machine
+the sink shares the shell's core again by necessity, the contention that moved it returns, and an idle
+BSP is the only BSP there is. Moving `logger` bought measured headroom on a 4-core box and exposed this
+defect; it does not remove either problem. Both the idle-halt path and the cost of waking a sink have
+to be correct on one core.
+
+`rearm_quantum_timer` still exists, still carries the "never halt without a freshly armed wake"
+comment, and is still called from four sites in `task/scheduler.rs` - so this is not a plain revert.
+Either the fix is incomplete or a second path halts without arming. Deliberately left OPEN rather than
+guessed at (26.7): the next reproduction now carries real evidence, because of A9-5.
+
+### A9-5 (FIXED) - the watchdog's own evidence was invented on x86
+
+`core_irq_debug` in `arch/x86_64/mod.rs` returned `(0, 0)`. The watchdog prints that as "it has taken
+0 interrupts, last source 0x00000000", and the comment at the panic site says that clause is precisely
+what tells a reader WHICH wedge they have: *"a frozen count means the core is not taking interrupts at
+all, a climbing one means it is and the tick inside the handler is being skipped. Same symptom,
+opposite causes."*
+
+So on x86 the single field that separates the two causes was a hardcoded zero - a panic message
+steering every reader toward one of two conclusions regardless of which was true. ARM has counted
+since its watchdog was written; x86 was the inconsistent one, which is the third time that exact
+sentence has been true in this cycle (the input-ring drop counter and the console ring size were the
+others).
+
+Fixed: a per-core counter stamped on ARRIVAL in the timer path (before any handling, so it proves the
+interrupt was TAKEN rather than that its handler finished - a hung handler is the case being told
+apart). A fixed 64-entry array rather than a `PerCore` arena, because this is stamped from an
+interrupt that fires long before any arena is allocated; a core id past the array is not counted
+rather than wrapped onto another core's tally. It counts the TIMER path only - x86 has no single IRQ
+funnel - and the message now says `timer interrupts` / `last vector` so it is not read as ARM's
+all-interrupt count.
+
+The message also said `last running task slot 224` when 224 is `IDLE == MAX_TASKS`, the sentinel for
+"no task at all" - sending a reader to hunt a task that does not exist. It now says `IDLE (no task)`.

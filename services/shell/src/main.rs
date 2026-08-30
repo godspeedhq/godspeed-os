@@ -797,7 +797,7 @@ const NO_PATH_CMDS: &[&str] = &[
 /// `<util> version` / `<util> help`), so they are NOT listed here.
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
-    ("trace",   &["blocked", "chain", "deps", "endpoint", "ipc", "failures", "status"]),
+    ("trace",   &["blocked", "chain", "deps", "endpoint", "endpoints", "ipc", "failures", "status"]),
     ("busiest", &["mem", "restarts", "queue"]),
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
@@ -4114,13 +4114,112 @@ type Row = (&'static str, &'static str, &'static str);
 /// Render the standard help block: `<title> <ver> - <desc>`, each usage row followed by a
 /// real example, then (for a top-level utility) the version/help footer.
 fn help_block(ctx: &ServiceContext, title: &str, desc: &str, rows: &[Row], footer: bool) {
+    // PAGE IT WHEN IT DOES NOT FIT. `help` (the full list) has paged for a long time; a single
+    // command's help never did, because no command's help was taller than a screen. `trace`'s is: it
+    // documents six views and eight columns, and on a 34-row console the top scrolled away for good
+    // on a framebuffer with no scrollback. The fix is not to write less - the column notes are the
+    // useful part - it is to reuse the pager that already exists.
+    let lines = help_block_lines(rows, footer);
+    let (rows_avail, _) = ctx.console_dims();
+    // Unknown geometry is not "no terminal": a failed lookup returns 0, and `edit` and `trace` both
+    // assume 24 rather than dropping the feature.
+    let rows_avail = if rows_avail == 0 { 24 } else { rows_avail as usize };
+    if lines + 3 <= rows_avail {
+        help_block_render(ctx, title, desc, rows, footer, 0, lines);
+        return;
+    }
+    line_pager(ctx, lines, rows_avail,
+        &|c| {
+            c.console_write_fmt(format_args!("{} {} - {}\x1b[K\n", title, UTIL_VERSION, desc));
+            c.console_write("\x1b[K\n");
+            c.console_write("usage:\x1b[K\n");
+            3
+        },
+        &|c, i| help_block_line(c, rows, footer, i), &|_| {});
+}
+
+/// How many scrolling lines a help block has (the header is pinned, so it does not count).
+fn help_block_lines(rows: &[Row], footer: bool) -> usize {
+    let mut n = 0usize;
+    for (_, _, ex) in rows { n += if ex.is_empty() { 1 } else { 2 }; }
+    if footer { n += 2; }
+    n
+}
+
+/// Render scrolling line `i` of a help block, erasing its tail for the pager's in-place repaint.
+///
+/// CLAMPED TO THE CONSOLE WIDTH, and that is load-bearing rather than cosmetic. The pager counts
+/// LOGICAL lines and paints one per screen row; a line longer than the terminal wraps onto a second
+/// row, so every wrapped row pushes the frame down, scrolls the pinned header off the top and makes
+/// the whole thing look like it started in the middle. That is exactly what `trace help` did on a
+/// 102-column display while looking perfect on serial, which has no width at all.
+///
+/// The rows are short now, but content should not be able to break the frame - so an over-long line
+/// is cut and marked with a `>` rather than silently wrapped. Visible truncation is a bug report; a
+/// broken pager is a mystery.
+fn help_block_line(ctx: &ServiceContext, rows: &[Row], footer: bool, i: usize) {
+    let mut n = 0usize;
+    for (sig, d, ex) in rows {
+        if n == i {
+            help_write_clamped(ctx, format_args!("  {:<28}  {}", sig, d));
+            return;
+        }
+        n += 1;
+        if !ex.is_empty() {
+            if n == i {
+                help_write_clamped(ctx, format_args!("      e.g. {}", ex));
+                return;
+            }
+            n += 1;
+        }
+    }
+    if footer {
+        if n == i     { ctx.console_write("  version\x1b[K\n"); return; }
+        if n + 1 == i { ctx.console_write("  help\x1b[K\n"); }
+    }
+}
+
+/// Write one pager line, cut to the console width so it occupies exactly one screen row.
+fn help_write_clamped(ctx: &ServiceContext, args: core::fmt::Arguments) {
+    let (_, cols) = ctx.console_dims();
+    let cols = if cols == 0 { 80 } else { cols as usize };
+    let mut buf = [0u8; 256];
+    let mut w = ClampWriter { buf: &mut buf, n: 0 };
+    let _ = core::fmt::write(&mut w, args);
+    let n = w.n;
+    let keep = n.min(cols.saturating_sub(1)).min(256);
+    if let Ok(text) = core::str::from_utf8(&buf[..keep]) {
+        ctx.console_write(text);
+        if keep < n { ctx.console_write(">"); }
+    }
+    ctx.console_write("\x1b[K\n");
+}
+
+/// A fixed-buffer `fmt::Write` sink. Bounded, no heap (26.6.1).
+struct ClampWriter<'a> { buf: &'a mut [u8; 256], n: usize }
+impl core::fmt::Write for ClampWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = self.buf.len().saturating_sub(self.n);
+        let take = s.len().min(room);
+        self.buf[self.n..self.n + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.n += take;
+        Ok(())
+    }
+}
+
+/// The unpaged rendering, for a block that fits.
+fn help_block_render(ctx: &ServiceContext, title: &str, desc: &str, rows: &[Row], footer: bool,
+                     from: usize, to: usize) {
     ctx.console_writeln_fmt(format_args!("{} {} - {}", title, UTIL_VERSION, desc));
     ctx.console_writeln("");
     ctx.console_writeln("usage:");
+    let mut n = 0usize;
     for (sig, d, ex) in rows {
-        ctx.console_writeln_fmt(format_args!("  {:<28}  {}", sig, d));
+        if n >= from && n < to { ctx.console_writeln_fmt(format_args!("  {:<28}  {}", sig, d)); }
+        n += 1;
         if !ex.is_empty() {
-            ctx.console_writeln_fmt(format_args!("      e.g. {}", ex));
+            if n >= from && n < to { ctx.console_writeln_fmt(format_args!("      e.g. {}", ex)); }
+            n += 1;
         }
     }
     if footer {
@@ -4136,28 +4235,17 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("help", "the full categorised command list", "help"),
             ("<command> help", "usage + examples for one command", "status help"),
         ], true),
-        "trace" => help_block(ctx, "trace", "who is waiting on whom, who can reach whom, and what just happened", &[
-            // -- live kernel state: what is stuck RIGHT NOW --
-            ("trace blocked", "every task blocked on ANOTHER task, and who holds what it awaits. Silence means nothing is stuck: a service parked on its own endpoint is idle, not wedged", "trace blocked"),
-            ("trace chain <name|slot>", "the same, rooted at one task and drawn as a tree. Takes a service name or a task slot - digits are a slot", "trace chain fs"),
-            // -- live capability state: who CAN reach whom --
-            ("trace deps <service>", "what it can call, as a tree, with what it has actually called. Read from its live capability table, not from a contract", "trace deps shell"),
-            ("  declared vs held", "this shows capabilities HELD. A contract's declared peers live in the kernel and are not readable from here; that view arrives when the supervisor owns service policy", "trace deps fs"),
-            ("  reply#NNN", "a send cap whose endpoint no task owns - a return address, not a dependency. Counted below the tree, and resolvable", "trace endpoint 119"),
-            ("trace endpoint <id>", "the INVERSE of deps: what an endpoint is, who owns it, and every live task holding a capability to it", "trace endpoint 119"),
-            // -- the ring: what HAPPENED --
-            ("trace ipc", "recent IPC exchanges from the ring in `logger`, oldest first. Pages like `help`; pipes like `status`", "trace ipc | where peer=fs"),
-            ("trace failures", "the same ring, filtered to timeouts, lost peers and full queues", "trace failures | to json"),
-            ("trace status", "ring size, events recorded, events DROPPED - and where the ring lives", "trace status"),
-            ("  the caller column", "who made the call. Each traced service declares its own name (`ctx.trace_as`) - a service cannot ask what it is called, because identity is not ambient", "trace ipc | where caller=fs"),
-            ("  the peer column", "who was called, by name. The emitter knew it, so no lookup is involved", "trace ipc | where peer=block-driver"),
-            ("  the op column", "the OPERATION asked for, by name (read, write, list, capacity, flush ...). A bare number means this shell has no name for that protocol's opcodes", "trace ipc | where op=read"),
-            ("  the seq column", "each caller counts its OWN events, so a mixed dump interleaves several sequences - rows are still in ring order. A GAP is the one loss nothing else can see: an event whose send failed on a full queue never reached the ring, so `trace status` reports 0 dropped while events are being lost", "trace ipc | where caller=fs"),
-            ("  the sec column", "when the RING recorded the row, counted from the oldest row shown, in whole seconds. Not a latency and not when the call was made - it is for spotting a HOLE (forty rows in one second, then a four-second gap, and that gap is the stall)", "trace ipc"),
-            ("  the outcome column", "how the exchange ended: REPLY, TIMEOUT (no answer in time), PEER_LOST (the peer died or the send failed), QUEUE_FULL (alive but congested), ABORTED (you pressed q)", "trace ipc | where outcome=TIMEOUT"),
-            // -- who is recorded at all --
-            ("what gets recorded", "only exchanges made through the SDK request/reply calls, by services whose contract grants `ipc_send = [\"logger\"]`. Tracing is authority you can see in `caps <service>` and revoke - not a global switch", "caps fs"),
-            ("trace version", "the utility version", "trace version"),
+        "trace" => help_block(ctx, "trace", "who waits on whom, who can reach whom, what just happened", &[
+            ("trace blocked", "every task stuck on another task", "trace blocked"),
+            ("trace chain <name|slot>", "the same, as a tree from one task", "trace chain fs"),
+            ("trace deps <service>", "what it can call, as a tree", "trace deps shell"),
+            ("trace endpoints", "every live endpoint and its owner", "trace endpoints"),
+            ("trace endpoint <id>", "who owns one, and who can reach it", "trace endpoint 112"),
+            ("trace ipc", "recent IPC exchanges, oldest first", "trace ipc"),
+            ("trace failures", "the same, only timeouts and lost peers", "trace failures"),
+            ("trace status", "ring size, events recorded, events dropped", "trace status"),
+            ("", "", ""),
+            ("trace <view> help", "what that view's output MEANS, column by column", "trace ipc help"),
         ], true),
         "result" => help_block(ctx, "result", "show the previous command's result (Ok / Err)", &[
             ("result", "Ok if the last command succeeded, else Err(<reason>)", "result"),
@@ -4260,7 +4348,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "caps" => help_block(ctx, "caps", "show a service's capabilities (records when piped)", &[
             ("caps", "this shell's own capabilities", "caps"),
             ("caps <service>", "capabilities held by <service>", "caps logger"),
-            ("caps [service] | <verb>", "piped: records resource/rights", "caps logger | where rights~send"),
+            ("caps [service] | <verb>", "piped: records resource/rights", "caps logger | where rights contains send"),
         ], true),
         "spawn" => help_block(ctx, "spawn", "start a service", &[
             ("spawn <svc>", "start the service <svc>", "spawn pong"),
@@ -4376,8 +4464,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("last [N] <path>", "last N lines of a file", "last 20 /log"),
         ], true),
         "where" => help_block(ctx, "where", "keep records whose field matches (record-pipe stage)", &[
-            ("<records> | where <col><op><val>", "ops: = != > < >= <= ~ (contains)", "status | where mem>0"),
+            ("<records> | where <col><op><val>", "ops: = != > < >= <=, and the word `contains`", "status | where mem>0"),
             ("… | where state=BlockRecv", "textual when either side is non-numeric", "status | where state=BlockRecv"),
+            ("… | where <col> contains <text>", "substring match - a WORD, because a symbol for it was unreadable", "caps logger | where rights contains send"),
         ], true),
         "select" => help_block(ctx, "select", "keep only some columns, in order (record-pipe stage)", &[
             ("<records> | select <col> [col…]", "project the named columns", "status | select name core state"),
@@ -4624,7 +4713,7 @@ fn help_to_out(ctx: &ServiceContext, out: &mut Out) {
 /// This is the same write-only repaint the fast boot-time scroll uses, so scrolling is smooth
 /// rather than a black flash + full reprint. Bounded: at most `total` lines, clamped each step.
 fn help_pager(ctx: &ServiceContext, total: usize, rows: usize) {
-    line_pager(ctx, total, rows, &|_| 0, &|c, i| help_render_line(c, i, true));
+    line_pager(ctx, total, rows, &|_| 0, &|c, i| help_render_line(c, i, true), &|_| {});
 }
 
 /// The pager, over ANY indexable set of lines.
@@ -4635,7 +4724,8 @@ fn help_pager(ctx: &ServiceContext, total: usize, rows: usize) {
 /// Everything else - the in-place repaint, the key handling, the clamping - is unchanged.
 fn line_pager(ctx: &ServiceContext, total: usize, rows: usize,
               pinned: &dyn Fn(&ServiceContext) -> usize,
-              render: &dyn Fn(&ServiceContext, usize)) {
+              render: &dyn Fn(&ServiceContext, usize),
+              end_frame: &dyn Fn(&ServiceContext)) {
     // A PINNED region, repainted at the top of every frame and never scrolled.
     //
     // The pager homes to row 1 and paints over whatever was there, so anything printed BEFORE it is
@@ -4660,6 +4750,9 @@ fn line_pager(ctx: &ServiceContext, total: usize, rows: usize,
         // Status line (no trailing newline so it parks at the bottom). Scroll keys lead,
         // since holding Up/Down scrolls smoothly (typematic auto-repeat). ESC[J after it
         // wipes any rows left over from a taller previous frame (e.g. the short last page).
+        // Everything the frame buffered goes out before the status line, so the status line is last
+        // on screen as well as last in the code.
+        end_frame(ctx);
         ctx.console_write_fmt(format_args!(
             // SAY WHAT ACTUALLY WORKS. `j`/`k`, `b` and Enter were all handled and none of them were
             // mentioned - a reader who tries `j` because it is muscle memory finds it works, which
@@ -6487,6 +6580,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out) -> Result<(), 
             "trace"   => match split_first(arg).0 {
                 "ipc"      => match build_trace_table(ctx, false) { Some(t) => t, None => return Err(ShellError::Unknown) },
                 "deps"     => match build_deps_table(ctx, split_first(arg).1.trim()) { Some(t) => t, None => return Err(ShellError::Unknown) },
+                "endpoints" => build_endpoints_table(ctx),
                 "failures" => match build_trace_table(ctx, true)  { Some(t) => t, None => return Err(ShellError::Unknown) },
                 other      => {
                     ctx.console_writeln_fmt(format_args!(
@@ -6805,8 +6899,6 @@ fn cmd_roster(ctx: &ServiceContext) -> Result<(), ShellError> {
     }
 }
 
-/// Version of the `trace` utility (`utilities/46_trace.md`), reported by `trace version`.
-const TRACE_VERSION: &str = "0.1.0";
 /// Task slots to scan. Matches the other slot-scanning commands in this file.
 const TRACE_SLOTS: u32 = 256;
 
@@ -6821,22 +6913,93 @@ const TRACE_SLOTS: u32 = 256;
 /// What it deliberately does NOT do: interpret a message. The kernel sees an opaque byte array, so
 /// this prints `awaiting endpoint 7`, never `fs.read("/etc/config")`. Naming an operation is protocol
 /// knowledge and belongs to the service that owns the protocol (4.4, 26.10).
+/// `trace <view> help` - what ONE view's output means.
+///
+/// The top-level help listed every view AND every column, which made it taller than a console and
+/// turned a reference into something you had to page through to find one line. A view's columns are
+/// only interesting once you are looking at that view, so they live with it. `trace help` is now the
+/// map; this is the detail, one screen at a time, and neither needs a pager.
+fn trace_sub_help(ctx: &ServiceContext, view: &str) -> bool {
+    match view {
+        "blocked" => help_block(ctx, "trace blocked", "every task stuck on ANOTHER task", &[
+            ("slot / name", "the blocked task's scheduler slot and service name", ""),
+            ("blocked", "how it waits: `call` (awaiting a reply) or `recv`", ""),
+            ("awaiting", "the endpoint id it waits on - `trace endpoint <id>`", ""),
+            ("held_by", "the service that owns it, i.e. owes the answer", ""),
+            ("silence", "nothing is stuck. Idle on your OWN endpoint is not stuck", ""),
+        ], false),
+        "chain" => help_block(ctx, "trace chain", "who one task is stuck behind, as a tree", &[
+            ("<name|slot>", "a service name, or a task slot - digits are a slot", "trace chain 7"),
+            ("reading it", "each line is who the line above waits for", ""),
+            ("root: own endpoint", "idle - waiting for work. The chain ends fine here", ""),
+            ("root: runnable", "it is running right now", ""),
+        ], false),
+        "deps" => help_block(ctx, "trace deps", "what a service can call, as a tree", &[
+            ("indent", "a child is a service its parent holds a SEND cap to", ""),
+            ("N calls", "exchanges still IN THE RING - a window, not a total", ""),
+            ("(write list)", "the operations seen, by name", ""),
+            ("N FAILED", "of those, how many did not end in a reply", ""),
+            ("0 calls", "authority held but unused here - worth asking why", ""),
+            ("reply#NNN", "a cap to an endpoint no task owns: a return address", ""),
+            ("as a table", "| to grid - its header names every filterable column", "trace deps fs | to grid"),
+            ("declared peers", "NOT shown: they live in the kernel, unreadable here", ""),
+        ], false),
+        "endpoints" => help_block(ctx, "trace endpoints", "every live endpoint and its owner", &[
+            ("endpoint", "the id to pass to `trace endpoint <id>`", "trace endpoint 112"),
+            ("queue", "messages waiting - non-zero on an idle service is work arriving", ""),
+            ("primary only", "a reply mailbox has no name, hence reply#NNN elsewhere", ""),
+        ], false),
+        "endpoint" => help_block(ctx, "trace endpoint", "who owns an endpoint, and who can reach it", &[
+            ("owned by task N", "a live service's endpoint", ""),
+            ("a kernel resource", "ids 1-5 are log_write, spawn, console_read, ...", "trace endpoint 4"),
+            ("NO LIVE OWNER", "its task died, or it is a reply-only mailbox", ""),
+            ("holder / rights", "every live task holding a cap, and its rights", ""),
+        ], false),
+        "ipc" | "failures" => help_block(ctx, "trace ipc", "recent IPC exchanges, oldest first", &[
+            ("seq", "the CALLER'S own count. A gap = an event that never arrived", ""),
+            ("sec", "when the RING saw it, from the oldest row. Not a latency", ""),
+            ("caller / peer", "who called, and who was called, by name", ""),
+            ("op", "the operation by name; a number = unnamed in this shell", ""),
+            ("outcome", "REPLY TIMEOUT PEER_LOST QUEUE_FULL ABORTED", ""),
+            ("TIMEOUT", "no answer in time. The peer is alive as far as we know", ""),
+            ("PEER_LOST", "the send failed, or the peer died mid-call", ""),
+            ("QUEUE_FULL", "the peer is ALIVE and congested - not absent", ""),
+            ("in flight", "not here: one row per exchange, written when it ENDS", ""),
+            ("filtering", "it is a record source", "trace ipc | where outcome=TIMEOUT"),
+        ], false),
+        "status" => help_block(ctx, "trace status", "the ring itself", &[
+            ("ring N events", "capacity. Fixed, no heap", ""),
+            ("N recorded", "events accepted since the sink last started", ""),
+            ("N DROPPED", "overwritten before being read", ""),
+            ("the OTHER loss", "a send that failed never arrived, so it is NOT counted", ""),
+            ("", "it shows only as a gap in a caller's seq", ""),
+        ], false),
+        _ => return false,
+    }
+    true
+}
+
 fn cmd_trace(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
     let mut it = arg.split_whitespace();
     let sub = it.next().unwrap_or("");
     let rest = it.next().unwrap_or("");
     match sub {
         "" | "help" => { util_help(ctx, "trace"); Ok(()) }
-        "version" => {
-            ctx.console_writeln_fmt(format_args!("trace {}", TRACE_VERSION));
-            Ok(())
-        }
+        // The SHARED version printer, like every other utility. This hand-rolled its own with a
+        // private `TRACE_VERSION` constant, so `trace version` said 0.1.0 while every help header
+        // said 0.4.0 - one utility reporting two versions of itself, which is the one thing a
+        // `version` command exists to be trusted about. It also skipped the creator credit that
+        // conventions rule 5 requires and the suite asserts for every other utility.
+        "version" => { util_version(ctx, "trace"); Ok(()) }
+        // `trace <view> help` - the detail for one view, before the view itself runs.
+        v if rest == "help" && trace_sub_help(ctx, v) => Ok(()),
         "blocked" => trace_blocked(ctx),
         "ipc" => trace_events(ctx, false),
         "failures" => trace_events(ctx, true),
         "status" => trace_status(ctx),
         "deps" => trace_deps(ctx, rest),
         "endpoint" => trace_endpoint(ctx, rest),
+        "endpoints" => trace_endpoints(ctx),
         // ONE view, EITHER subject. This was two subcommands - `trace task <slot>` and `trace service
         // <name>` - which named the SUBJECT KIND while every other subcommand names the VIEW. That
         // read as two different things right up until you noticed they printed identical output from
@@ -6972,6 +7135,41 @@ fn build_trace_table(ctx: &ServiceContext, failures_only: bool) -> Option<Table>
     Some(t)
 }
 
+/// A frame accumulator for the pager: many lines, few console writes.
+///
+/// `console_write` is ONE SYSCALL per call, capped at 256 bytes, and each call is a message to the
+/// `console` service whose queue is 16 deep. A paged frame is a legend, a header, a screenful of rows
+/// and a status line - about sixty writes if each is sent on its own, per KEYPRESS. Holding `j`
+/// outruns the sink, the queue backs up, and the keyboard appears dead while the machine is fine.
+///
+/// This is the same lesson the console service itself learned (`docs/console-service.md`): a repaint
+/// is one batch, not one message per line. Text accumulates here and goes out in full 256-byte
+/// writes, so a frame costs about a dozen syscalls instead of sixty.
+///
+/// Bounded and no heap: one fixed buffer, flushed when full and at the end of each frame.
+struct FrameBuf {
+    buf: [u8; 256],
+    n: usize,
+}
+impl FrameBuf {
+    fn new() -> Self { Self { buf: [0u8; 256], n: 0 } }
+    fn put(&mut self, ctx: &ServiceContext, bytes: &[u8]) {
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let room = self.buf.len() - self.n;
+            let take = rest.len().min(room);
+            self.buf[self.n..self.n + take].copy_from_slice(&rest[..take]);
+            self.n += take;
+            rest = &rest[take..];
+            if self.n == self.buf.len() { self.flush(ctx); }
+        }
+    }
+    fn flush(&mut self, ctx: &ServiceContext) {
+        if self.n == 0 { return; }
+        if let Ok(text) = core::str::from_utf8(&self.buf[..self.n]) { ctx.console_write(text); }
+        self.n = 0;
+    }
+}
 /// A bounded line buffer for one rendered grid row.
 ///
 /// The pager repaints IN PLACE (no clear-to-black), so every line it draws must erase its own tail or
@@ -6988,15 +7186,17 @@ struct LineBuf {
 }
 impl LineBuf {
     fn new() -> Self { Self { b: [0u8; 256], n: 0 } }
-    /// Write the buffered line with an erase-to-end-of-line, then reset.
-    fn flush_erased(&mut self, ctx: &ServiceContext) {
+    /// Append the buffered line, with an erase-to-end-of-line, to the FRAME - not to the console.
+    ///
+    /// It used to write straight through, which cost TWO syscalls per row (the text, then the erase).
+    /// A screenful is then well over a hundred console messages per keypress against a 16-deep queue,
+    /// and holding a scroll key outruns the sink: the keyboard looks dead while the machine is fine.
+    fn flush_into(&mut self, ctx: &ServiceContext, f: &mut FrameBuf) {
         let end = self.n.min(self.b.len());
         // Trim the newline `grid_row`/`grid_header` appended; we supply our own after the erase.
         let end = if end > 0 && self.b[end - 1] == b'\n' { end - 1 } else { end };
-        if let Ok(text) = core::str::from_utf8(&self.b[..end]) {
-            ctx.console_write(text);
-        }
-        ctx.console_write("\x1b[K\n");
+        f.put(ctx, &self.b[..end]);
+        f.put(ctx, b"\x1b[K\n");
         self.n = 0;
     }
 }
@@ -7317,34 +7517,23 @@ const DEPS_MAX_ROWS: usize = 48;
 ///
 /// Not in the pipe path: `trace ipc | to json` must emit records and nothing else, so a legend there
 /// would be corrupting the stream with prose.
-fn trace_legend(ctx: &ServiceContext, n: usize) {
-    // SHAPED LIKE `observe`'s LEGEND, and for the reason `observe` shapes it that way: every line has
-    // to fit the narrowest console anyone reads this on. The first version was two ~110-character
-    // lines, which on a 102-column TV wrapped or clipped - so the legend was there and still could not
-    // be read, which is the same as not having one.
-    //
-    // Banners are 74 columns, matching `observe` exactly: this is the second place in the system that
-    // explains a table, and two explanations that look different read as two unrelated tools.
-    //
-    // Each line ends with ESC[K because the pager repaints IN PLACE with no clear-to-black; without it
-    // a shorter line leaves the previous frame's tail hanging off the end.
-    ctx.console_write("--------------------------------- legend ---------------------------------\x1b[K\n");
-    // LOWERCASE, matching the column header exactly. These are not decorative labels: they are the
-    // names you TYPE - `trace ipc | where caller=fs` - and the keys `to json` emits. A legend showing
-    // `CALLER` teaches a string that does not work in a pipe. (`observe` uses caps because its own
-    // display columns are caps; it is consistent with itself, and this is consistent with the record
-    // producers, every one of which is lowercase.)
-    ctx.console_write("seq     the caller's own count - a gap is an event that never arrived\x1b[K\n");
-    ctx.console_write("sec     when the ring recorded it, from the oldest row shown - 1s steps\x1b[K\n");
-    ctx.console_write("caller  who called | peer  who was called\x1b[K\n");
-    ctx.console_write("op      what was asked for - a number when this shell cannot name it\x1b[K\n");
-    ctx.console_write("outcome REPLY | TIMEOUT | PEER_LOST | QUEUE_FULL | ABORTED\x1b[K\n");
-    ctx.console_write_fmt(format_args!(
-        "----------------------------- IPC events ({}) -----------------------------\x1b[K\n", n));
+fn trace_legend(ctx: &ServiceContext, f: &mut FrameBuf, n: usize) {
+    f.put(ctx, b"--------------------------------- legend ---------------------------------\x1b[K\n");
+    f.put(ctx, b"seq     the caller's own count - a gap is an event that never arrived\x1b[K\n");
+    f.put(ctx, b"sec     when the ring recorded it, from the oldest row shown - 1s steps\x1b[K\n");
+    f.put(ctx, b"caller  who called | peer  who was called\x1b[K\n");
+    f.put(ctx, b"op      what was asked for - a number when this shell cannot name it\x1b[K\n");
+    f.put(ctx, b"outcome REPLY | TIMEOUT | PEER_LOST | QUEUE_FULL | ABORTED\x1b[K\n");
+    let mut nb = [0u8; 24];
+    let mut q = 0usize;
+    write_u32(&mut nb, &mut q, n as u32);
+    f.put(ctx, b"----------------------------- IPC events (");
+    f.put(ctx, &nb[..q]);
+    f.put(ctx, b") -----------------------------\x1b[K\n");
 }
 
 /// Lines [`trace_legend`] draws, so the pager can size its scrolling area.
-const TRACE_LEGEND_LINES: usize = 7;
+const TRACE_LEGEND_LINES: usize = 8;
 
 fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellError> {
     let t = match build_trace_table(ctx, failures_only) {
@@ -7365,30 +7554,45 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
     let w = t.grid_widths();
     // 2 legend lines + 1 column header + 1 status line.
     if t.nrows() + TRACE_LEGEND_LINES + 2 <= rows {
-        trace_legend(ctx, t.nrows());
-        let mut o = Out::Console;
-        let mut sink = OutSink { ctx, out: &mut o };
-        t.grid_header(&mut sink, &w);
-        for r in 0..t.nrows() { t.grid_row(&mut sink, r, &w); }
+        // The unpaged path batches too: it is the same screenful, drawn once.
+        let mut f = FrameBuf::new();
+        trace_legend(ctx, &mut f, t.nrows());
+        let mut lb = LineBuf::new();
+        t.grid_header(&mut lb, &w);
+        lb.flush_into(ctx, &mut f);
+        for r in 0..t.nrows() {
+            t.grid_row(&mut lb, r, &w);
+            lb.flush_into(ctx, &mut f);
+        }
+        f.flush(ctx);
         return Ok(());
     }
     // PINNED: the legend and the column header are repainted at the top of every frame. They used to
     // be printed before the pager started, which put them exactly where its first `ESC[H` repaint
     // lands - so on a framebuffer console the legend flashed and vanished. The column header had the
     // same fate one page in, having been line 0 of the scrolling region.
+    //
+    // ONE FRAME, A DOZEN SYSCALLS. Every line here goes into a shared `FrameBuf` and out in 256-byte
+    // writes, flushed just before the status line. Writing each line straight to the console cost two
+    // syscalls per row - over a hundred console messages per keypress against a 16-deep queue - so
+    // holding a scroll key outran the sink and the keyboard went unresponsive.
+    let frame = core::cell::RefCell::new(FrameBuf::new());
     line_pager(ctx, t.nrows(), rows,
         &|c| {
-            trace_legend(c, t.nrows());
+            let mut f = frame.borrow_mut();
+            trace_legend(c, &mut f, t.nrows());
             let mut lb = LineBuf::new();
             t.grid_header(&mut lb, &w);
-            lb.flush_erased(c);
+            lb.flush_into(c, &mut f);
             TRACE_LEGEND_LINES + 1 // the legend block, plus the column header
         },
         &|c, i| {
+            let mut f = frame.borrow_mut();
             let mut lb = LineBuf::new();
             t.grid_row(&mut lb, i, &w);
-            lb.flush_erased(c);
-        });
+            lb.flush_into(c, &mut f);
+        },
+        &|c| frame.borrow_mut().flush(c));
     Ok(())
 }
 
@@ -7408,6 +7612,11 @@ fn trace_ask(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
         if let Some(r) = ctx.request_with_reply("logger", &Message::from_bytes(req)) {
             return Some(r);
         }
+        // REACQUIRE BETWEEN ATTEMPTS. A busy sink is transient and a yield is the right answer, but a
+        // RESTARTED one never recovers by waiting: the cap is stale and every retry fails identically.
+        // After a chaos storm restarted `logger` forty times, this loop failed three times in a row
+        // and reported a live service as unreachable (14.3 - reacquire by name, then retry).
+        let _ = ctx.reacquire_by_name("logger");
         ctx.yield_cpu();
     }
     None
@@ -7497,6 +7706,51 @@ fn deps_draw(ctx: &ServiceContext, t: &Table, parent: &[u8], prefix: &mut [u8; 4
             }
         }
     }
+}
+
+/// `trace endpoints` - every live task's endpoint, the map from names to the ids.
+///
+/// The missing fourth source. Ids arrive from `caps <service>` (as `endpoint#N`), from `trace
+/// blocked`'s `awaiting` column and from `trace deps`' reply list - all of which hand you ONE id in
+/// context. None of them answers "what endpoints exist", so the map from a service name to its number
+/// had to be assembled by hand before `trace endpoint <id>` could be used deliberately.
+///
+/// A record source like every other view, so it filters and pipes: `trace endpoints | where
+/// name contains fs`, `| to json`.
+///
+/// Only PRIMARY endpoints appear, because that is what the kernel reports per task. A reply-only
+/// mailbox has no name here - which is precisely why an unresolvable cap shows as `reply#NNN` in a
+/// dependency tree rather than as a service.
+#[inline(never)]
+fn build_endpoints_table(ctx: &ServiceContext) -> Table {
+    let mut t = Table::new(&["slot", "name", "endpoint", "state", "queue"]);
+    for slot in 0u32..256 {
+        let st = ctx.task_stat(slot);
+        if !st.valid || st.state == 4 { continue; }
+        let ep = ctx.task_own_endpoint(slot);
+        if ep == 0 { continue; }   // a task with no endpoint cannot be talked to; nothing to list
+        let name  = t.intern(&st.name[..st.name_len.min(31)]);
+        let state = t.intern(st.state_str().as_bytes());
+        t.add_row(&[Value::Int(slot as u64), name, Value::Int(ep),
+                    state, Value::Int(st.queue_depth as u64)]);
+    }
+    t
+}
+
+/// `trace endpoints` on the console.
+fn trace_endpoints(ctx: &ServiceContext) -> Result<(), ShellError> {
+    let t = build_endpoints_table(ctx);
+    if t.nrows() == 0 {
+        ctx.console_writeln("trace endpoints: no live task owns an endpoint");
+        return Ok(());
+    }
+    ctx.console_writeln("--------------------------------- legend ---------------------------------");
+    ctx.console_writeln("endpoint  the id to pass to `trace endpoint <id>`; queue = messages waiting");
+    ctx.console_writeln("only PRIMARY endpoints - a reply mailbox has no name, hence reply#NNN");
+    ctx.console_writeln("------------------------------ live endpoints -----------------------------");
+    let mut o = Out::Console;
+    t.to_grid(&mut OutSink { ctx, out: &mut o });
+    Ok(())
 }
 
 /// `trace endpoint <id>` - what an endpoint is, and WHO CAN REACH IT.
@@ -7598,6 +7852,14 @@ fn trace_deps(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     ctx.console_write("indent  who calls whom: a child is a service its parent holds a SEND cap to\x1b[K\n");
     ctx.console_write("calls   how many the ring still holds - a recent window, never a lifetime\x1b[K\n");
     ctx.console_write("0 calls authority held but unused here (worth asking why it is granted)\x1b[K\n");
+    // THE TREE HIDES ITS OWN COLUMNS. A reader looking at an indented list has no way to know the rows
+    // are records, so the filter examples in the footer arrive out of nowhere.
+    //
+    // POINT AT THE GRID, do not list the columns here. The first version copied them into this line
+    // and immediately got it wrong: it named five of the seven, dropping `grant` and `failed`, so a
+    // reader would never have learned that `where failed>0` works. The grid header IS the list, it
+    // cannot drift from itself, and a copy that can drift is a second truth (26.4).
+    ctx.console_write("as a table (its header names every column you can filter on): | to grid\x1b[K\n");
     ctx.console_write_fmt(format_args!(
         "------------------------- {} dependencies -------------------------\x1b[K\n", name));
 
@@ -7621,7 +7883,7 @@ fn trace_deps(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     for r in 0..t.nrows() { if t.cell_bytes(r, 2).starts_with(b"reply#") { replies += 1; } }
     if replies > 0 {
         ctx.console_writeln_fmt(format_args!(
-            "({} reply address(es) hidden - `trace deps {} | where peer~reply` lists them)",
+            "({} reply address(es) hidden - `trace deps {} | where peer contains reply` lists them)",
             replies, name));
     }
     // The walk is bounded (26.6), and a bound reached in silence is a lie about completeness.

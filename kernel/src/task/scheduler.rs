@@ -1271,6 +1271,12 @@ pub fn run(core_id: u32) -> ! {
 /// they are unused now that the ring-3 bring-up diagnostics are removed.
 #[no_mangle]
 pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u64, _interrupted_rsp: u64) {
+    // EVIDENCE FIRST, before any handling. The liveness watchdog's whole diagnostic value rests on
+    // being able to say whether a dark core is still TAKING interrupts (its handler is being skipped)
+    // or has stopped receiving them (its timer died) - and it can only say that if the count is
+    // stamped on arrival rather than on completion. A no-op on arches that count every IRQ in their
+    // own dispatcher; on x86 there is no such funnel, so the timer path stamps it here (vector 32).
+    crate::arch::imp::note_irq(32);
     let cid = current_core_id();
     // A11-1: EVERY core checks the panic flag, on the tick every core takes.
     //
@@ -1368,11 +1374,19 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     // means the core is not taking interrupts at all, a climbing one means it is and
                     // the tick inside the handler is being skipped. Same symptom, opposite causes.
                     let (irqs, last_src) = crate::arch::imp::core_irq_debug(other as u32);
+                    // SAY "IDLE" WHEN IT WAS IDLE. `CORE_CURRENT` holds `IDLE` (== MAX_TASKS) when a
+                    // core has nothing to run, and printing that as "last running task slot 224" sent
+                    // a reader hunting a task that does not exist - 224 is not a slot, it is the
+                    // sentinel meaning there was no task. The two cases want opposite investigations:
+                    // a real slot points at a service that stopped yielding, `idle` points at the
+                    // core's own wakeup path.
+                    let what = if stuck_task == IDLE { "IDLE (no task)" } else { "task slot" };
+                    let slot_num = if stuck_task == IDLE { 0 } else { stuck_task };
                     panic!(
                         "LIVENESS WEDGE: core {} made NO progress for {} counter ticks ({}x the {} \
-                         allowed); last running task slot {}; it has taken {} interrupts, last source \
+                         allowed); it was running {} {}; it has taken {} timer interrupts, last vector \
                          {:#010x}; detected by core {}. No forward progress = loud stop.",
-                        other, dark, dark / deadline, deadline, stuck_task, irqs, last_src, cid
+                        other, dark, dark / deadline, deadline, what, slot_num, irqs, last_src, cid
                     );
                 }
             }
