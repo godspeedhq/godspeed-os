@@ -22,6 +22,7 @@ use crate::ipc::message::Message;
 use crate::ipc::routing;
 use crate::smp::percpu::{num_cores, PerCore, PerCoreMut};
 use crate::smp::SpinLock;
+use crate::smp::names::NameTable;
 use crate::task::state::TaskState;
 
 // ---------------------------------------------------------------------------
@@ -53,46 +54,22 @@ static TASK_STATE: [AtomicU8; MAX_TASKS] =
 /// `TaskStat` already exposes to userspace, so the two representations now agree instead of one being
 /// converted into the other.
 const TASK_NAME_MAX: usize = 32;
-static mut TASK_NAME:     [[u8; TASK_NAME_MAX]; MAX_TASKS] = [[0u8; TASK_NAME_MAX]; MAX_TASKS];
-static mut TASK_NAME_LEN: [u8; MAX_TASKS]                  = [0u8; MAX_TASKS];
 
-/// This slot's name. Borrowed from a `static` that outlives every task, so the `'static` the rest of
-/// the kernel expects is genuine rather than a lifetime assertion.
+/// Per-task NAME, OWNED rather than borrowed.
 ///
-/// # Safety
-/// Single writer per slot (the spawn path, before the task is enqueued); readers see either the old
-/// or the new name, never a tear, because the length is written last.
-pub fn task_name(slot: usize) -> &'static str {
-    if slot >= MAX_TASKS { return ""; }
-    // SAFETY: `TASK_NAME` is a kernel-lifetime static; `len` is only ever set to a value <= 32 by
-    // `set_task_name`, and the bytes below it were written before it.
-    unsafe {
-        let lens = &*core::ptr::addr_of!(TASK_NAME_LEN);
-        let arrs = &*core::ptr::addr_of!(TASK_NAME);
-        let len  = lens[slot] as usize;
-        core::str::from_utf8(&arrs[slot][..len.min(TASK_NAME_MAX)]).unwrap_or("")
-    }
-}
+/// This was `[&'static str; MAX_TASKS]`, which quietly required every task name to be a string
+/// literal compiled into the kernel - and that is why the kernel held a `service_config` row per
+/// service: a caller-supplied name had nowhere to live. Owning the bytes is what lets a SPAWNER name
+/// the task it is spawning (`docs/probe-params-design.md`).
+///
+/// The interior mutability that needs lives in `smp::names::NameTable`, a permitted layer (18.1),
+/// so this file grows no `unsafe` (18.5). 32 bytes is what `TaskStatRaw` already exposes to
+/// userspace, so the two representations agree instead of one being converted into the other.
+static TASK_NAMES: NameTable<MAX_TASKS, TASK_NAME_MAX> = NameTable::new();
 
-/// Record this slot's name, truncating at 32 bytes rather than refusing - a name is an identity, and
-/// a spawn should not fail because someone chose a long one.
-///
-/// # Safety
-/// Called from the spawn path only, before the task is enqueued and therefore before any other core
-/// can observe the slot.
-unsafe fn set_task_name(slot: usize, name: &str) {
-    if slot >= MAX_TASKS { return; }
-    let b = name.as_bytes();
-    let n = b.len().min(TASK_NAME_MAX);
-    unsafe {
-        let arr = &mut (*core::ptr::addr_of_mut!(TASK_NAME))[slot];
-        *arr = [0u8; TASK_NAME_MAX];
-        arr[..n].copy_from_slice(&b[..n]);
-        // LENGTH LAST: a reader that catches this mid-write sees the old length over new bytes, or
-        // the new length over new bytes - never a length that outruns what has been written.
-        (*core::ptr::addr_of_mut!(TASK_NAME_LEN))[slot] = n as u8;
-    }
-}
+/// This slot's name, or `""` for a slot that has none.
+pub fn task_name(slot: usize) -> &'static str { TASK_NAMES.get(slot) }
+
 static TASK_VALID: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX_TASKS];
 /// Which core each task is pinned to (set at enqueue time; immutable after).
 static mut TASK_CORE:  [u32; MAX_TASKS]        = [0u32; MAX_TASKS];
@@ -678,7 +655,7 @@ pub unsafe fn commit_task(
     // SAFETY: slot is reserved; IF=0 prevents concurrent modification.
     unsafe {
         TASK_CTX[slot].write(ctx);
-        set_task_name(slot, name);
+        TASK_NAMES.set(slot, name);
         TASK_SPAWN_DT[slot].store(crate::arch::imp::rtc::now_epoch_monotonic().max(1).max(0) as u64, Ordering::Relaxed);
         TASK_IS_USER[slot]          = is_user;
         // Arch hook: on ARM a user task's syscalls must run atomically (the timer skips preempting it
@@ -718,7 +695,7 @@ pub fn enqueue(
                 TASK_CTX[i].write(ctx);
                 TASK_CAP[i].write(caps);
                 TASK_STATE[i].store(TaskState::Ready as u8, Ordering::Relaxed);
-                set_task_name(i, name);
+                TASK_NAMES.set(i, name);
                 TASK_SPAWN_DT[i].store(crate::arch::imp::rtc::now_epoch_monotonic().max(1).max(0) as u64, Ordering::Relaxed);
                 TASK_VALID[i].store(true, Ordering::Release);
                 TASK_CORE[i]             = core_id;

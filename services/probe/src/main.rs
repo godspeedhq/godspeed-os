@@ -71,6 +71,9 @@
 #![no_std]
 #![no_main]
 
+// The probe parameter table - shared by source with the `supervisor`, the other spawner.
+mod table;
+
 use godspeed_sdk::{adversarial, service_context::AllocError, CapError, CapHandle, IpcError, Message, ServiceContext};
 
 #[allow(dead_code)]
@@ -666,7 +669,7 @@ fn mode_prop_p2(ctx: &ServiceContext) -> ! {
     for _iter in 0..3u32 {
         for _cycle in 0..2u32 {
             let _ = ctx.kill("prop-p2-victim");
-            let _ = ctx.spawn("prop-p2-victim");
+            let _ = table::probe(ctx, "prop-p2-victim");
             let gen = ctx.inspect_endpoint_generation("prop-p2-victim");
             if gen <= prev_gen {
                 ctx.log("prop: P2 FAIL - generation not strictly monotonic after kill/respawn");
@@ -798,7 +801,7 @@ fn mode_prop_p8(ctx: &ServiceContext) -> ! {
         let n_cycles = 1 + (xorshift64(&mut rng) % 2) as u32;
         for _cycle in 0..n_cycles {
             let _ = ctx.kill("prop-p8-victim");
-            let _ = ctx.spawn("prop-p8-victim");
+            let _ = table::probe(ctx, "prop-p8-victim");
             let gen = ctx.inspect_endpoint_generation("prop-p8-victim");
             if gen <= prev_gen {
                 ctx.log("prop: P8 FAIL - generation not monotonic after restart");
@@ -874,7 +877,7 @@ fn mode_prop_p5(ctx: &ServiceContext) -> ! {
     // the absolute count unreliable. Spawn success is the authoritative P5 signal.
     for _ in 0..50u32 {
         let _ = ctx.kill("prop-p5-victim");
-        match ctx.spawn("prop-p5-victim") {
+        match table::probe(ctx, "prop-p5-victim") {
             // SAY WHAT FAILED, not what we assume failed. This read "routing table overflow;
             // orphan detected" without ever looking at the error, and that guess has now cost a
             // bisect: routing DOES reuse dead slots (`try_register` accepts an entry whose liveness
@@ -909,7 +912,7 @@ fn mode_prop_p7(ctx: &ServiceContext) -> ! {
     let mut prev_gen: u64 = 0;
     for _ in 0..50u32 {
         let _ = ctx.kill("prop-p7-victim");
-        let _ = ctx.spawn("prop-p7-victim");
+        let _ = table::probe(ctx, "prop-p7-victim");
         let gen = ctx.inspect_endpoint_generation("prop-p7-victim");
         if gen <= prev_gen {
             ctx.log("prop: P7 FAIL - generation not monotonic across kill/respawn (TLB lifecycle broken)");
@@ -1076,7 +1079,7 @@ fn mode_fuzz_f7(ctx: &ServiceContext) -> ! {
         let _ = ctx.try_send_by_handle(CapHandle(0xBEEF), &msg);
         let _ = ctx.try_send_by_handle(CapHandle(u32::MAX), &msg);
 
-        let _ = ctx.spawn("fuzz-f7-victim");
+        let _ = table::probe(ctx, "fuzz-f7-victim");
         // stale cap still has old generation → still EndpointDead after respawn.
         if let Some(h) = stale {
             let _ = ctx.try_send_by_handle(h, &msg);
@@ -1145,7 +1148,7 @@ fn mode_stress_s2(ctx: &ServiceContext) -> ! {
     }
     for _ in 0..50u32 {
         let _ = ctx.kill("stress-s2-victim");
-        match ctx.spawn("stress-s2-victim") {
+        match table::probe(ctx, "stress-s2-victim") {
             Err(_) => {
                 ctx.log("stress: S2 FAIL - spawn failed (kstack pool exhausted?)");
                 idle(ctx);
@@ -1238,7 +1241,7 @@ fn mode_stress_s4(ctx: &ServiceContext) -> ! {
     // must hold for every respawn regardless of which endpoint id or slot the instance lands on.
     let mut prev_gen = 0u64;
     for _ in 0..10u32 {
-        let _ = ctx.spawn("stress-s4-victim");
+        let _ = table::probe(ctx, "stress-s4-victim");
         let gen = ctx.inspect_endpoint_generation("stress-s4-victim");
         if gen <= prev_gen {
             ctx.log("stress: S4 FAIL - generation not monotonic under churn");
@@ -1304,7 +1307,7 @@ fn mode_stress_s5(ctx: &ServiceContext) -> ! {
     let mut prev_gen: u64 = 0;
     for _ in 0..500u32 {
         let _ = ctx.kill("stress-s5-victim");
-        let _ = ctx.spawn("stress-s5-victim");
+        let _ = table::probe(ctx, "stress-s5-victim");
         let gen = ctx.inspect_endpoint_generation("stress-s5-victim");
         if gen <= prev_gen {
             ctx.log("stress: S5 FAIL - generation not strictly monotonic after kill/respawn");
@@ -1573,7 +1576,7 @@ fn mode_perf_b5(ctx: &ServiceContext) -> ! {
     let mut total_spawn: u64 = 0;
     for _ in 0..N {
         let t0 = ctx.read_tsc();
-        let _ = ctx.spawn("perf-b5-victim");
+        let _ = table::probe(ctx, "perf-b5-victim");
         let t1 = ctx.read_tsc();
         total_spawn += t1.wrapping_sub(t0);
         let _ = ctx.kill("perf-b5-victim");
@@ -1583,12 +1586,12 @@ fn mode_perf_b5(ctx: &ServiceContext) -> ! {
     ctx.log("perf: B5 done");
 
     // B6: kill+spawn (restart) cost.
-    let _ = ctx.spawn("perf-b5-victim"); // ensure alive before cycling
+    let _ = table::probe(ctx, "perf-b5-victim"); // ensure alive before cycling
     let mut total_restart: u64 = 0;
     for _ in 0..N {
         let t0 = ctx.read_tsc();
         let _ = ctx.kill("perf-b5-victim");
-        let _ = ctx.spawn("perf-b5-victim");
+        let _ = table::probe(ctx, "perf-b5-victim");
         let t1 = ctx.read_tsc();
         total_restart += t1.wrapping_sub(t0);
     }
@@ -2184,7 +2187,7 @@ fn mode_chaos_c7(ctx: &ServiceContext) -> ! {
         let _ = ctx.kill("chaos-c7-victim");
         let t2 = ctx.read_tsc();
         // Respawn on core 2 → new page table mapping → another TLB shootdown on core 2.
-        let _ = ctx.spawn("chaos-c7-victim");
+        let _ = table::probe(ctx, "chaos-c7-victim");
         let t3 = ctx.read_tsc();
         // Brief yield to allow the new victim to be scheduled and its pages faulted in.
         for _ in 0..50u32 { ctx.yield_cpu(); }
@@ -2304,12 +2307,12 @@ fn mode_xlife(ctx: &ServiceContext) -> ! {
         let a = ctx.read_tsc();
         let _ = ctx.kill("xlife-near");
         let b = ctx.read_tsc();
-        let _ = ctx.spawn("xlife-near");
+        let _ = table::probe(ctx, "xlife-near");
         let c = ctx.read_tsc();
         // cross-core: kill + respawn xlife-far (core 2).
         let _ = ctx.kill("xlife-far");
         let d = ctx.read_tsc();
-        let _ = ctx.spawn("xlife-far");
+        let _ = table::probe(ctx, "xlife-far");
         let e = ctx.read_tsc();
 
         k_near = k_near.wrapping_add(b.wrapping_sub(a));
@@ -2353,7 +2356,7 @@ fn mode_prop_bp2(ctx: &ServiceContext) -> ! {
     let mut prev_gen: u64 = 0;
     for cycle in 0..20u32 {
         let _ = ctx.kill("prop-bp2-victim");
-        let _ = ctx.spawn("prop-bp2-victim");
+        let _ = table::probe(ctx, "prop-bp2-victim");
         let gen = ctx.inspect_endpoint_generation("prop-bp2-victim");
         if gen <= prev_gen {
             ctx.log_fmt(format_args!("prop: BP2 FAIL - generation not monotonic at cycle {}", cycle));
@@ -2432,7 +2435,7 @@ fn mode_prop_bp5(ctx: &ServiceContext) -> ! {
     // live count to fluctuate independently of BP5's own cycles.
     for _ in 0..150u32 {
         let _ = ctx.kill("prop-bp5-victim");
-        match ctx.spawn("prop-bp5-victim") {
+        match table::probe(ctx, "prop-bp5-victim") {
             Err(_) => {
                 ctx.log("prop: BP5 FAIL - spawn failed (routing table overflow; orphan detected)");
                 idle(ctx);
@@ -2502,7 +2505,7 @@ fn mode_prop_bp7(ctx: &ServiceContext) -> ! {
             idle(ctx);
         }
         prev_gen = gen;
-        let _ = ctx.spawn("prop-bp7-victim");
+        let _ = table::probe(ctx, "prop-bp7-victim");
     }
     ctx.log("prop: BP7 pass (150/150)");
     idle(ctx)
@@ -2516,7 +2519,7 @@ fn mode_prop_bp8(ctx: &ServiceContext) -> ! {
         let n_cycles = 1 + (xorshift64(&mut rng) % 2) as u32;
         for _cycle in 0..n_cycles {
             let _ = ctx.kill("prop-bp8-victim");
-            let _ = ctx.spawn("prop-bp8-victim");
+            let _ = table::probe(ctx, "prop-bp8-victim");
             let gen = ctx.inspect_endpoint_generation("prop-bp8-victim");
             if gen <= prev_gen {
                 ctx.log("prop: BP8 FAIL - generation not monotonic after restart");
@@ -2550,7 +2553,7 @@ fn mode_prop_bp9(ctx: &ServiceContext) -> ! {
             ctx.log_fmt(format_args!("prop: BP9 FAIL - not all 3 slots EndpointDead after kill at cycle {}", cycle));
             idle(ctx);
         }
-        let _ = ctx.spawn("prop-bp9-victim");
+        let _ = table::probe(ctx, "prop-bp9-victim");
         // Stale caps must NOT auto-update to the new instance's generation.
         let still0 = matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead));
         let still1 = matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead));
@@ -2678,7 +2681,7 @@ fn mode_fuzz_bf7(ctx: &ServiceContext) -> ! {
         let _ = ctx.try_send_by_handle(CapHandle(0xBEEF), &msg);
         let _ = ctx.try_send_by_handle(CapHandle(u32::MAX), &msg);
 
-        let _ = ctx.spawn("fuzz-bf7-victim");
+        let _ = table::probe(ctx, "fuzz-bf7-victim");
         if let Some(h) = stale {
             let _ = ctx.try_send_by_handle(h, &msg);
         }
@@ -2740,7 +2743,7 @@ fn mode_stress_bs2(ctx: &ServiceContext) -> ! {
     }
     for _ in 0..200u32 {
         let _ = ctx.kill("stress-bs2-victim");
-        match ctx.spawn("stress-bs2-victim") {
+        match table::probe(ctx, "stress-bs2-victim") {
             Err(_) => {
                 ctx.log("stress: BS2 FAIL - spawn failed (kstack pool exhausted?)");
                 idle(ctx);
@@ -2815,7 +2818,7 @@ fn mode_stress_bs4(ctx: &ServiceContext) -> ! {
     // generations at all. BS5 below already asks in this order.
     let mut prev_gen = 0u64;
     for _ in 0..50u32 {
-        let _ = ctx.spawn("stress-bs4-victim");
+        let _ = table::probe(ctx, "stress-bs4-victim");
         let gen = ctx.inspect_endpoint_generation("stress-bs4-victim");
         if gen <= prev_gen {
             ctx.log("stress: BS4 FAIL - generation not monotonic under churn");
@@ -2842,7 +2845,7 @@ fn mode_stress_bs5(ctx: &ServiceContext) -> ! {
     let mut prev_gen: u64 = 0;
     for _ in 0..5_000u32 {
         let _ = ctx.kill("stress-bs5-victim");
-        let _ = ctx.spawn("stress-bs5-victim");
+        let _ = table::probe(ctx, "stress-bs5-victim");
         let gen = ctx.inspect_endpoint_generation("stress-bs5-victim");
         if gen <= prev_gen {
             ctx.log("stress: BS5 FAIL - generation not strictly monotonic after kill/respawn");
@@ -2992,7 +2995,7 @@ fn mode_stress_bs10(ctx: &ServiceContext) -> ! {
     }
 
     for _ in 0..50u32 {
-        let _ = ctx.spawn("stress-bs10-victim");
+        let _ = table::probe(ctx, "stress-bs10-victim");
         let _ = ctx.kill("stress-bs10-victim");
         if !matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead)) {
             ctx.log("stress: BS10 FAIL - cap A not stale during cycle");
@@ -3265,7 +3268,7 @@ fn mode_perf_bp5(ctx: &ServiceContext) -> ! {
     let mut total_spawn: u64 = 0;
     for _ in 0..N {
         let t0 = ctx.read_tsc();
-        let _ = ctx.spawn("perf-bp5-victim");
+        let _ = table::probe(ctx, "perf-bp5-victim");
         let t1 = ctx.read_tsc();
         total_spawn += t1.wrapping_sub(t0);
         let _ = ctx.kill("perf-bp5-victim");
@@ -3275,12 +3278,12 @@ fn mode_perf_bp5(ctx: &ServiceContext) -> ! {
     ctx.log("perf: BP5 done");
 
     // BP6: kill+spawn (restart) cost.
-    let _ = ctx.spawn("perf-bp5-victim");
+    let _ = table::probe(ctx, "perf-bp5-victim");
     let mut total_restart: u64 = 0;
     for _ in 0..N {
         let t0 = ctx.read_tsc();
         let _ = ctx.kill("perf-bp5-victim");
-        let _ = ctx.spawn("perf-bp5-victim");
+        let _ = table::probe(ctx, "perf-bp5-victim");
         let t1 = ctx.read_tsc();
         total_restart += t1.wrapping_sub(t0);
     }
@@ -3425,7 +3428,7 @@ fn mode_chaos_bc7(ctx: &ServiceContext) -> ! {
     for i in 0..15u32 {
         let _ = ctx.try_send("chaos-bc7-victim", &msg);
         let _ = ctx.kill("chaos-bc7-victim");
-        let _ = ctx.spawn("chaos-bc7-victim");
+        let _ = table::probe(ctx, "chaos-bc7-victim");
         for _ in 0..10u32 { ctx.yield_cpu(); }
         if i % 5 == 4 {
             ctx.log_fmt(format_args!("chaos: BC7 iter {}/15", i + 1));

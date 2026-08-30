@@ -682,6 +682,18 @@ fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
 /// core_id encoding:
 ///   - 0x0000 = core 0, 0x0001 = core 1, …
 ///   - 0xFFFF = let the kernel choose (preferred_core from service_config).
+/// Probe parameters ride in the UPPER 32 bits of `arg0`, which `Spawn` never used:
+/// `[55..48] flags  [47..32] probe mode  [31..16] core  [15..0] spawn cap slot`.
+/// No new syscall and no change in arity - see `docs/probe-params-design.md`.
+const SPAWN_FLAG_HAS_RECV:  u64 = 1 << 48;
+const SPAWN_FLAG_SMALL_MEM: u64 = 1 << 49;
+const SPAWN_FLAG_IS_PROBE:  u64 = 1 << 50;
+
+/// Upper bound on the name payload (`name` + NUL-separated peer names). It was 64, which held a
+/// name alone; a peer list needs more. Bounded and small (26.6) - the longest real payload is
+/// well under half of this.
+const SPAWN_PAYLOAD_MAX: usize = 128;
+
 fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
     let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
     let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
@@ -697,17 +709,42 @@ fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
     }
 
     let len = name_len as usize;
-    if len == 0 || len > 64 { return -1; }
-    let name_bytes = match read_user_bytes(name_ptr, len) {
+    if len == 0 || len > SPAWN_PAYLOAD_MAX { return -1; }
+    let payload = match read_user_bytes(name_ptr, len) {
         Some(b) => b,
         None    => return -1,
     };
-    let name = match core::str::from_utf8(name_bytes) {
+    let payload = match core::str::from_utf8(payload) {
         Ok(s)  => s,
         Err(_) => return -1,
     };
 
-    match crate::task::spawn_service_by_name(name, core_override) {
+    if packed_arg0 & SPAWN_FLAG_IS_PROBE != 0 {
+        // `name\0peer\0peer`. The caller supplies the peer LIST; each name still has to resolve
+        // through the kernel name directory, so this grants nothing that a contract's `send_peers`
+        // would not have.
+        let mut parts = payload.split('\0');
+        let name = match parts.next() { Some(n) if !n.is_empty() => n, _ => return -1 };
+        let mut peers: [&str; crate::task::MAX_SEND_PEERS] = [""; crate::task::MAX_SEND_PEERS];
+        let mut np = 0usize;
+        for p in parts {
+            if p.is_empty() { continue; }
+            if np >= crate::task::MAX_SEND_PEERS { return -1; }   // loud refusal, never a silent drop
+            peers[np] = p;
+            np += 1;
+        }
+        let params = crate::task::ProbeParams {
+            mode:              ((packed_arg0 >> 32) & 0xFFFF) as u32,
+            has_recv_endpoint: packed_arg0 & SPAWN_FLAG_HAS_RECV  != 0,
+            mem_mib:           if packed_arg0 & SPAWN_FLAG_SMALL_MEM != 0 { 4 } else { 0 },
+        };
+        return match crate::task::spawn_probe(name, core_override, params, &peers[..np]) {
+            Ok(_)  => 0,
+            Err(_) => -1,
+        };
+    }
+
+    match crate::task::spawn_service_by_name(payload, core_override) {
         Ok(_)  => 0,
         Err(_) => -1,
     }

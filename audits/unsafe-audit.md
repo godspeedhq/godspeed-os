@@ -2385,6 +2385,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | smp/mod.rs | 1 | permitted |
 | smp/percpu.rs | 8 | permitted |
 | smp/placement.rs | 1 | permitted |
+| smp/names.rs | 4 | permitted |
 | smp/spinlock.rs | 5 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
 | loader.rs | 2 | grandfathered |
@@ -3030,6 +3031,35 @@ no neutral file gained any `unsafe`. `arch/arm/mod.rs` and `arch/riscv32/mod.rs`
 the current stub sizes; they may grow as a real port fills the arch surface, each increase
 carrying its own `// SAFETY:` and an audit bump.
 
+
+## `smp/names.rs` NEW, 4 lines (2026-08-30) - owned task names, so a SPAWNER can name what it spawns
+
+Task names were `[&'static str; MAX_TASKS]`. That is a small thing with a large consequence: a name
+had to be a string literal compiled into the kernel, so a caller could not supply one - which is
+exactly why the kernel held a `service_config` row per service. Making the bytes owned is the
+prerequisite for taking that catalogue out of ring 0 (`docs/probe-params-design.md`; 193 rows and
+2,317 lines left `kernel/src/task/mod.rs` in the same change).
+
+**Why it is in `smp/` and not `task/`.** Owning the bytes needs interior mutability behind a shared
+`static`. Written where it is used, that would have grown `task/scheduler.rs` from 37 to 40 - a
+grandfathered floor, which 18.5 permits to grow only by a CLAUDE.md amendment, and only after trying
+a permitted layer first. A permitted layer fits here honestly rather than as a dodge: a shared array
+with one writer per slot and readers on every core IS a concurrency primitive, and it belongs beside
+`SpinLock`. `task/scheduler.rs` stays at 37 with no `unsafe` of its own; the four blocks are audited
+once, here.
+
+| Block | Argument |
+|---|---|
+| `unsafe impl Sync for NameTable` | Every write goes through `set`, whose caller guarantees it is the only writer for that slot; readers only read bytes below an `Acquire`-loaded length. |
+| `get`: `&*self.bytes.get()` | The length was published with `Release` after those bytes were written, so they are initialised and stable. The target is a `static`, so the returned `'static` borrow is genuine and not an assertion. |
+| `set`: `&mut *self.bytes.get()` | Caller-guaranteed exclusive write access to the slot (the spawn path holds it reserved with interrupts off, before the task is enqueued and therefore before another core can observe it). |
+| `set` (the `unsafe fn` itself) | The single-writer precondition is a real data-race precondition, not boot ordering, so 18.5's "make it a safe `fn`" does not apply - violating it is UB, not a wedge. |
+
+**Length last, and length first.** The writer publishes bytes then length (`Release`); a reader loads
+length (`Acquire`) then bytes. A reader racing a write sees the old length over new bytes, or the new
+length over new bytes - never a length that outruns what has been written.
+
+Bounded and flat (26.6.1): a fixed `MAX_TASKS * 32` byte array in `.bss`. No heap, no interner.
 
 ## `arch/arm/irq.rs` 13 -> 16 (+3): routing the USB interrupt to userspace (arm32 Phase 1)
 
