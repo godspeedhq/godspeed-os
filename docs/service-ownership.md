@@ -441,7 +441,102 @@ already has to guarantee.
 
 ---
 
-## 8. Where the pin lands at each step
+## 8. How Linux and Windows install a driver, and why ours is a different problem
+
+Worth knowing what the mainstream systems actually do here, because they solve a problem this design
+does not have - and the difference is the whole argument for the microkernel shape.
+
+### Linux
+
+A driver is a kernel module, a `.ko` file. Installing one is genuinely dynamic, no reboot:
+
+```
+  device appears (boot scan, or hot-plug)
+       |
+       v
+  KERNEL enumerates the bus, builds a modalias string
+       "pci:v00008086d0000100Esv...sc..."
+       |
+       v
+  udev (USERSPACE) sees the uevent, looks the alias up in modules.alias
+       |
+       v
+  modprobe  ->  KERNEL relocates and links the .ko INTO KERNEL ADDRESS SPACE,
+                runs module_init(), the driver registers with the PCI subsystem
+       |
+       v
+  driver bound to device.  No reboot.  rmmod unloads it.
+```
+
+Note the split, because it is the same one step D proposes: the **kernel** scans the bus, **userspace**
+decides which module matches. Reboots are for kernel upgrades, not driver installs.
+
+### Windows
+
+The same shape with different names. A `.sys` file plus an `.inf` declaring which hardware IDs it
+claims; the PnP manager enumerates, matches the hardware ID against the driver store, and loads the
+driver into kernel space at runtime. Most installs need no reboot - you get prompted when the device
+is already in use, or for boot-start drivers that load before the disk stack.
+
+Two Windows details matter to this design:
+
+- **Driver signing is kernel-enforced.** Since Vista x64 the kernel refuses unsigned kernel-mode
+  drivers. That is not a policy nicety; it is load-bearing, precisely because the code is about to run
+  with kernel privilege. Linux has the same under Secure Boot (`CONFIG_MODULE_SIG`).
+- **UMDF.** Microsoft moved a large class of drivers - printers, many USB devices - into USER MODE,
+  because kernel-mode driver bugs were the single largest cause of blue screens. They spent years
+  retrofitting what a microkernel has by construction.
+
+### What they share that we do not
+
+Both are monolithic, so **installing a driver means injecting code into the kernel at runtime.**
+Everything else follows from that one fact:
+
+| consequence | Linux / Windows | GodspeedOS |
+|---|---|---|
+| driver code runs with kernel privilege | yes | no - it is an ordinary service |
+| a driver bug can take the machine down | panic / BSOD | the supervisor restarts it |
+| signature enforcement is REQUIRED for safety | yes - arbitrary kernel code otherwise | no - capabilities bound it either way |
+| unloading a driver | genuinely hard (`rmmod` often refuses) | `kill`, which this system does constantly |
+| the kernel grows with each driver | yes | **never** |
+
+On GodspeedOS a driver is already just a service. Installing one never means new kernel code - not at
+step C, not at step 2, not ever. It means putting a binary somewhere and asking the supervisor to
+spawn it.
+
+```
+  device appears on the bus
+       |
+       v
+  bus-manager SERVICE enumerates, reports BDF / class / BAR / IRQ      <- step D
+       |
+       v
+  supervisor picks a driver, reads its signed package from fs          <- step 2
+       |
+       v
+  kernel VERIFIES the signature, then spawns an ordinary task with
+  exactly the MMIO window, IRQ and DMA arena the contract declares     <- step C
+       |
+       v
+  driver running in USERSPACE.  No reboot.  `kill` unloads it, and the
+  supervisor restarts it if it dies.
+```
+
+### The consequence for our signing model
+
+**Their signing exists to make kernel-privileged code safe. Ours exists only to authenticate a
+binary.** If a signed driver of ours turns out to be malicious it still cannot do more than its
+capabilities allow, and an IOMMU bounds its DMA where the hardware has one (6.4). Same mechanism,
+much smaller blast radius, because the hard problem they are solving with it is one this system never
+took on.
+
+The other half of their difficulty is already gone too. "Unloading is hard" does not apply here:
+killing and restarting services is the thing this system does most. Chaos did it **2,233 times across
+four machines** in the step A validation without a single kernel panic.
+
+---
+
+## 9. Where the pin lands at each step
 
 | step | `service_configs` pin | adding a service | adding a driver | update without reflash |
 |---|---|---|---|---|
@@ -453,7 +548,7 @@ already has to guarantee.
 
 ---
 
-## 9. Open items
+## 10. Open items
 
 - **The CLAUDE.md amendment for step C** must state the widening in section 4's words: after C, a
   runtime-compromised supervisor can introduce new code, and nothing before step 2 prevents it.
@@ -466,7 +561,7 @@ already has to guarantee.
 
 ---
 
-## 10. Related
+## 11. Related
 
 - `docs/probe-params-design.md` - step A in full, including the as-built ABI and the hardware table
 - `docs/naming-design.md` - Path C: how naming left the kernel, and the recovery-directory argument
