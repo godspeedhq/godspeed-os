@@ -41,7 +41,58 @@ static mut TASK_CAP:   [MaybeUninit<CapTable>; MAX_TASKS] =
 /// and `block_and_reschedule` (CAS) are race-free (§8.4 lost-wakeup fix).
 static TASK_STATE: [AtomicU8; MAX_TASKS] =
     [const { AtomicU8::new(TaskState::Dead as u8) }; MAX_TASKS];
-static mut TASK_NAME:  [&str; MAX_TASKS]       = [""; MAX_TASKS];
+/// Per-task NAME, owned rather than borrowed.
+///
+/// This was `[&'static str; MAX_TASKS]`, which quietly required every task name to be a string
+/// literal compiled into the kernel - and that is why the kernel holds a `service_config` row per
+/// service: a caller-supplied name had nowhere to live. Owning the bytes is what lets a SPAWNER name
+/// the task it is spawning, which is the whole point of moving the service catalogue out of ring 0
+/// (`docs/probe-params-design.md`).
+///
+/// Bounded and flat (26.6): a fixed 32 bytes per slot, no heap, no interner, no lifetimes. 32 is what
+/// `TaskStat` already exposes to userspace, so the two representations now agree instead of one being
+/// converted into the other.
+const TASK_NAME_MAX: usize = 32;
+static mut TASK_NAME:     [[u8; TASK_NAME_MAX]; MAX_TASKS] = [[0u8; TASK_NAME_MAX]; MAX_TASKS];
+static mut TASK_NAME_LEN: [u8; MAX_TASKS]                  = [0u8; MAX_TASKS];
+
+/// This slot's name. Borrowed from a `static` that outlives every task, so the `'static` the rest of
+/// the kernel expects is genuine rather than a lifetime assertion.
+///
+/// # Safety
+/// Single writer per slot (the spawn path, before the task is enqueued); readers see either the old
+/// or the new name, never a tear, because the length is written last.
+pub fn task_name(slot: usize) -> &'static str {
+    if slot >= MAX_TASKS { return ""; }
+    // SAFETY: `TASK_NAME` is a kernel-lifetime static; `len` is only ever set to a value <= 32 by
+    // `set_task_name`, and the bytes below it were written before it.
+    unsafe {
+        let lens = &*core::ptr::addr_of!(TASK_NAME_LEN);
+        let arrs = &*core::ptr::addr_of!(TASK_NAME);
+        let len  = lens[slot] as usize;
+        core::str::from_utf8(&arrs[slot][..len.min(TASK_NAME_MAX)]).unwrap_or("")
+    }
+}
+
+/// Record this slot's name, truncating at 32 bytes rather than refusing - a name is an identity, and
+/// a spawn should not fail because someone chose a long one.
+///
+/// # Safety
+/// Called from the spawn path only, before the task is enqueued and therefore before any other core
+/// can observe the slot.
+unsafe fn set_task_name(slot: usize, name: &str) {
+    if slot >= MAX_TASKS { return; }
+    let b = name.as_bytes();
+    let n = b.len().min(TASK_NAME_MAX);
+    unsafe {
+        let arr = &mut (*core::ptr::addr_of_mut!(TASK_NAME))[slot];
+        *arr = [0u8; TASK_NAME_MAX];
+        arr[..n].copy_from_slice(&b[..n]);
+        // LENGTH LAST: a reader that catches this mid-write sees the old length over new bytes, or
+        // the new length over new bytes - never a length that outruns what has been written.
+        (*core::ptr::addr_of_mut!(TASK_NAME_LEN))[slot] = n as u8;
+    }
+}
 static TASK_VALID: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX_TASKS];
 /// Which core each task is pinned to (set at enqueue time; immutable after).
 static mut TASK_CORE:  [u32; MAX_TASKS]        = [0u32; MAX_TASKS];
@@ -66,7 +117,8 @@ static TASK_KERNEL_STACK_TOP: [AtomicU64; MAX_TASKS] =
 const NAME_RESTART_MAX: usize = 64;
 
 struct NameRestart {
-    name:  &'static str,
+    name:  [u8; TASK_NAME_MAX],
+    len:   u8,
     count: u64,
 }
 
@@ -78,7 +130,7 @@ struct NameRestartTable {
 impl NameRestartTable {
     const fn new() -> Self {
         Self {
-            entries: [const { NameRestart { name: "", count: 0 } }; NAME_RESTART_MAX],
+            entries: [const { NameRestart { name: [0u8; TASK_NAME_MAX], len: 0, count: 0 } }; NAME_RESTART_MAX],
             len:     0,
         }
     }
@@ -91,13 +143,13 @@ static NAME_RESTART: SpinLock<NameRestartTable> = SpinLock::new(NameRestartTable
 /// bumped - reads 0. READ-ONLY: the increment happens at death and only for the restartable set, so
 /// re-running a transient command (observe-*, greet, ...) is NOT a restart ("RESTARTS = it blew up,
 /// not it was legitimately closed").
-fn next_restart_count(name: &'static str) -> u64 {
+fn next_restart_count(name: &str) -> u64 {
     if name.is_empty() {
         return 0;
     }
     let tbl = NAME_RESTART.lock_irq();
     for i in 0..tbl.len {
-        if tbl.entries[i].name == name {
+        if &tbl.entries[i].name[..tbl.entries[i].len as usize] == name.as_bytes() {
             return tbl.entries[i].count;
         }
     }
@@ -109,20 +161,24 @@ fn next_restart_count(name: &'static str) -> u64 {
 /// `block-driver`, `shell`, `xhci`, `ehci`, `logger`, `supervisor`). Transient utilities the shell
 /// re-invokes are never bumped, so they never show a restart. The respawn reads the new count via
 /// `next_restart_count`; the first death of a name records count 1.
-fn bump_name_restart(name: &'static str) {
+fn bump_name_restart(name: &str) {
     if name.is_empty() {
         return;
     }
     let mut tbl = NAME_RESTART.lock_irq();
     for i in 0..tbl.len {
-        if tbl.entries[i].name == name {
+        if &tbl.entries[i].name[..tbl.entries[i].len as usize] == name.as_bytes() {
             tbl.entries[i].count = tbl.entries[i].count.saturating_add(1);
             return;
         }
     }
     if tbl.len < NAME_RESTART_MAX {
         let len = tbl.len;
-        tbl.entries[len] = NameRestart { name, count: 1 };
+        let b = name.as_bytes();
+        let n = b.len().min(TASK_NAME_MAX);
+        let mut nb = [0u8; TASK_NAME_MAX];
+        nb[..n].copy_from_slice(&b[..n]);
+        tbl.entries[len] = NameRestart { name: nb, len: n as u8, count: 1 };
         tbl.len = len + 1;
     } else {
         crate::kprintln!(
@@ -613,7 +669,7 @@ pub fn release_task_slot(slot: usize) {
 /// * IF=0 (syscall context).
 pub unsafe fn commit_task(
     slot:             usize,
-    name:             &'static str,
+    name:             &str,
     ctx:              TaskContext,
     is_user:          bool,
     kernel_stack_top: u64,
@@ -622,7 +678,7 @@ pub unsafe fn commit_task(
     // SAFETY: slot is reserved; IF=0 prevents concurrent modification.
     unsafe {
         TASK_CTX[slot].write(ctx);
-        TASK_NAME[slot]             = name;
+        set_task_name(slot, name);
         TASK_SPAWN_DT[slot].store(crate::arch::imp::rtc::now_epoch_monotonic().max(1).max(0) as u64, Ordering::Relaxed);
         TASK_IS_USER[slot]          = is_user;
         // Arch hook: on ARM a user task's syscalls must run atomically (the timer skips preempting it
@@ -647,7 +703,7 @@ pub unsafe fn commit_task(
 /// to avoid a 1 536-byte `CapTable` on the kernel stack.
 #[allow(dead_code)]
 pub fn enqueue(
-    name:             &'static str,
+    name:             &str,
     ctx:              TaskContext,
     caps:             CapTable,
     core_id:          u32,
@@ -662,7 +718,7 @@ pub fn enqueue(
                 TASK_CTX[i].write(ctx);
                 TASK_CAP[i].write(caps);
                 TASK_STATE[i].store(TaskState::Ready as u8, Ordering::Relaxed);
-                TASK_NAME[i]             = name;
+                set_task_name(i, name);
                 TASK_SPAWN_DT[i].store(crate::arch::imp::rtc::now_epoch_monotonic().max(1).max(0) as u64, Ordering::Relaxed);
                 TASK_VALID[i].store(true, Ordering::Release);
                 TASK_CORE[i]             = core_id;
@@ -963,11 +1019,11 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
             core:        TASK_CORE[slot],
             mem_used:    TASK_ALLOC_BYTES[slot],
             mem_limit:   TASK_LIMIT_BYTES[slot],
-            name:        TASK_NAME[slot],
+            name:        task_name(slot),
             // DERIVED, not stored (Commandment III): the restart lineage's one truth is NAME_RESTART
             // (the per-name counter). A live instance's count IS its name's count - so we recompute it
             // here rather than cache a per-slot copy that could drift from the source.
-            restart_count: next_restart_count(TASK_NAME[slot]),
+            restart_count: next_restart_count(task_name(slot)),
             queue_depth,
             run_ticks:   TASK_RUN_TICKS[slot].load(Ordering::Relaxed),
             uptime_secs: {
@@ -1942,7 +1998,7 @@ pub fn find_task_by_name(name: &str) -> Option<usize> {
     unsafe {
         for i in 0..MAX_TASKS {
             if TASK_VALID[i].load(Ordering::Acquire)
-                && TASK_NAME[i] == name
+                && task_name(i) == name
                 && TaskState::from(TASK_STATE[i].load(Ordering::Acquire)) != TaskState::Dead
             {
                 return Some(i);
@@ -2037,7 +2093,7 @@ pub fn kill_task_by_slot(slot: usize) {
     unsafe {
 
         // Capture identity before any slot state changes.
-        let task_name = TASK_NAME[slot];
+        let task_name = crate::task::scheduler::task_name(slot);
         let task_ep   = ep_from_u64(TASK_ENDPOINT[slot].load(Ordering::Relaxed));
 
         // If this task was itself blocked in a synchronous CALL, drop its outstanding-call record so
