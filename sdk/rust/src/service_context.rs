@@ -762,6 +762,14 @@ impl ServiceContext {
     /// is the honest answer rather than a guess.
     pub fn trace_as(&self, name: &str) { crate::trace::set_caller(name); }
 
+    /// Declare that requests to `peer` carry their opcode at byte `at` (default 0).
+    ///
+    /// For protocols that prepend a correlation tag - `shell -> fs` and `fs -> block-driver` both do -
+    /// byte 0 is a request id, so a trace that recorded it was showing noise in a column labelled
+    /// "op". The SDK is generic and cannot know; the service that owns the protocol can. See
+    /// `crate::trace::set_op_offset`.
+    pub fn trace_op_at(&self, peer: &str, at: u8) { crate::trace::set_op_offset(peer, at); }
+
     fn trace_emit(&self, peer: &str, op: u8, kind: u8) {
         // Arm lazily, ONCE. A service is handed a context with no init hook to run in, so there is
         // nowhere else to resolve from. A service whose contract does not grant `ipc_send =
@@ -840,8 +848,10 @@ impl ServiceContext {
     /// was never the right instrument for: `trace blocked` reads it from the kernel, live, which is
     /// what a hang needs (`utilities/46_trace.md` mechanism A).
     #[inline]
-    fn trace_in(&self, _peer: &str, msg: &crate::ipc::Message) -> u8 {
-        msg.payload_bytes().first().copied().unwrap_or(0)
+    fn trace_in(&self, peer: &str, msg: &crate::ipc::Message) -> u8 {
+        // The opcode's byte is the PEER'S protocol's business, not a fixed 0 - see `trace_op_at`.
+        let at = crate::trace::op_offset(peer);
+        msg.payload_bytes().get(at).copied().unwrap_or(0)
     }
 
     /// Synchronous request/reply on the caller own endpoint. Blocks until the reply arrives, or until
@@ -882,7 +892,7 @@ impl ServiceContext {
     pub fn request_with_reply_deadline_into(
         &self, peer: &str, req: &[u8], buf: &mut [u8], max_secs: i64,
     ) -> Option<usize> {
-        let op = req.first().copied().unwrap_or(0);
+        let op = req.get(crate::trace::op_offset(peer)).copied().unwrap_or(0);
         let out = self.request_with_reply_deadline_into_inner(peer, req, buf, max_secs);
         self.trace_out(peer, op, if out.is_some() { crate::trace::KIND_REPLY }
                                  else { crate::trace::KIND_TIMEOUT });

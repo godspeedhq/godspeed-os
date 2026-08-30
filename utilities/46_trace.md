@@ -118,29 +118,22 @@ the kernel.
 
 ## 5. Command surface
 
-Per `0_conventions.md` §1: words not flags, `help` everywhere, `version`, raw facts.
+As shipped - six views, each named for WHAT IT SHOWS rather than what you give it:
 
-```
-trace                       usage (rule 1)
-trace help                  usage
-trace version               46_trace.md's version
-
-trace blocked               every blocked task, what it awaits, and for how long
-trace task <pid>            the blocked-chain rooted at one task
-trace service <name>        the blocked-chain rooted at a service, by name
-
-trace ipc                   [B] recent IPC events, newest last
-trace tree <message-id>     [B] one request and everything it caused
-trace failures              [B] recent ENDPOINT_DEAD / PEER_LOST / drops
-
-trace on | off | status     [B] enable, disable, report the switch + drop count
+```text
+  trace blocked                 what is stuck, everywhere
+  trace chain <name|slot>       what one task is stuck behind, as a tree
+  trace deps <service>          what it can call, as a tree, with what it has called
+  trace endpoint <id>           the inverse: who owns an endpoint, and who can reach it
+  trace ipc                     what happened - the ring, paged and pipeable
+  trace failures                the same ring, only the failures
+  trace status                  ring size, recorded, dropped
 ```
 
-`[B]` = needs the event ring. Everything unmarked works with mechanism A alone.
-
-**`trace` takes service names, pids and numbers - never paths.** It goes in `NO_PATH_CMDS`
-(conventions §1.9), so Tab at an argument position does nothing rather than listing the root directory.
-Subcommand keywords complete at their position, wired in the same commit.
+`trace task <slot>` and `trace service <name>` were folded into `trace chain`: they printed identical
+output from identical code while being named after the SUBJECT KIND, which made them look like two
+things and made `trace service fs` read oddly beside `trace deps fs`. The argument disambiguates
+itself - digits are a slot, anything else is a name.
 
 ### `trace blocked` - the whole point, in one screen
 
@@ -509,6 +502,143 @@ A dump shows the newest **64** events - what a record `Table` holds - while the 
 Asking for more only produced "result exceeded the record bound - truncated" on every run, and a bound
 announced every time is noise that trains you to ignore it. `trace status` remains where the true ring
 size and drop count live.
+
+### The shape of the whole thing
+
+Three questions, three sources, and the kernel is only in one of them.
+
+```text
+                    WHAT IS STUCK NOW            WHO CAN REACH WHOM            WHAT HAPPENED
+                    trace blocked                trace deps                    trace ipc
+                    trace chain                  trace endpoint                trace failures
+                          |                            |                             |
+                          v                            v                             v
+                  +---------------+           +----------------+          +--------------------+
+                  | kernel, LIVE  |           | kernel, LIVE   |          | logger, a RING     |
+                  | who awaits    |           | capability     |          | of past exchanges  |
+                  | which endpoint|           | tables         |          |                    |
+                  +---------------+           +----------------+          +--------------------+
+                    read-only,                  read-only,                  written by SERVICES,
+                    2 queries                   existing syscall            never by the kernel
+```
+
+The kernel records nothing. It answers two questions it already knew the answer to (which endpoint a
+blocked task awaits, and which endpoint a task owns); everything historical is written by services
+into a service.
+
+### How an event gets into the ring
+
+```text
+   fs                                     kernel                    logger
+   |                                        |                          |
+   |-- request_with_reply("block-driver") ->|                          |
+   |                                        |-- deliver -> block-driver|
+   |<------------- reply ------------------ |                          |
+   |                                                                   |
+   |   ONE event per exchange, describing how it ENDED:                |
+   |   seq, caller="fs", peer="block-driver", op, outcome=REPLY        |
+   |-- try_send (fire and forget, never blocks) --------------------->|
+   |                                                                   |-- stamp the time
+   |                                                                   |-- store in a 192 ring
+   |                                                                   |   (full = drop oldest,
+   |                                                                   |    and COUNT it)
+   |                                                                   |
+   shell -- TRACE_OP_DUMP ------------------------------------------->|
+   shell <- the newest 64 events ------------------------------------ |
+```
+
+Three properties fall out of that picture, and each is deliberate:
+
+- **The kernel is not on the path at all.** No ring in ring 0, no retention policy, no control
+  syscall, and nothing added to the IPC fast path.
+- **The emitter never waits.** `try_send` and the result is discarded: a full sink costs the emitting
+  service nothing and loses one event, which the ring counts and `trace status` reports.
+- **A service that holds no `logger` send cap emits nothing**, at the cost of one relaxed load.
+  Tracing is authority, visible in `caps <service>` and revocable.
+
+### Why the sink is not on the interactive core
+
+```text
+   BEFORE                                  AFTER
+   core 0: shell  logger                   core 0: shell
+           ^^^^^  ^^^^^^                   core 2: logger
+           every event WAKES logger,
+           preempting the shell            the wake lands on another core
+           twice per fs request
+
+   osdev test files: 222/0 -> 213/9        osdev test files: 222/0
+   tab completion timing out,              (nothing changed but the core number)
+   Enter keystrokes lost
+```
+
+### What `trace deps` reads, and what it cannot
+
+```text
+   contract (fs.toml)          kernel service_config          fs's LIVE cap table
+   ipc_send = [...]     --->   send_peers = [...]      --->   [ SEND -> ep 42 ]
+        |                            |                        [ SEND -> ep 51 ]
+        |                            |                               |
+   host-only:                  inside the kernel:               task_caps(slot)
+   reconciled at build         not readable from a                    |
+   time, never ships           service                                v
+                                                              trace deps  <-- reads THIS
+```
+
+`trace deps` walks the right-hand column: capabilities a service is holding right now, each endpoint
+resolved back to its owning task. The left-hand columns are what "declared" would mean, and neither is
+reachable without new kernel surface - which is why that view waits for the supervisor to own service
+policy.
+
+### `trace deps` and `trace endpoint`: authority, in both directions
+
+`trace ipc` answers "what happened"; `trace chain` answers "what is stuck now". Neither answers the
+question the capability model makes most worth asking - **who can reach whom** - so two views do:
+
+```
+gsh> trace deps net-stack            gsh> trace endpoint 4
+net-stack                            endpoint 4 - NO LIVE OWNER.
+|-- nic-driver                       held by:
+`-- time                             holder  slot  rights
+    `-- fs                           xhci    8     write
+        |-- block-driver
+        `-- logger  (trace sink - its own traffic is never recorded)
+(3 reply address(es) not shown: reply#119 reply#107 - `trace endpoint <id>` resolves one)
+```
+
+Both are built from the LIVE capability table (`task_caps`), not from a contract: a row is not "the
+toml says it may call block-driver", it is "this service is holding, right now, a SEND capability
+whose endpoint block-driver owns". That is 26.9 - authority inspectable as it actually stands.
+
+**A tree and a record stream are the same data.** The table holds one row per EDGE
+(`depth, parent, peer, grant, calls, failed, ops`), which is what a tree IS, so the console draws it
+and a pipe gets the rows - `trace deps shell | where peer=fs`, `| to json`, `| to grid`. `to grid`
+was added for this: the grid was every record source's console rendering but could not be ASKED for,
+so a producer that draws something else had no way to offer the table.
+
+Four bugs surfaced only because the tree draws structure a table hides, and each is a rule:
+
+1. **A global "seen" set flattened it.** `block-driver` is a direct peer of the shell AND a peer of
+   `fs`, so once drawn it was never drawn again - `fs 24 calls` had nothing beneath it. Distinctness
+   of children and absence of cycles are DIFFERENT problems: dedupe the edge, guard the path.
+2. **Edges were duplicated.** `time` is reached twice (directly and via `net-stack`) and each visit
+   added its own `time -> fs` row; the renderer, which finds children by parent NAME, then drew both
+   under every occurrence. The edge itself must be unique.
+3. **The cycle guard silently failed.** A short name written over a longer one in an ancestor slot
+   left `"stack"` trailing, so the match missed and the cycle expanded one level further.
+4. **Filtering `SEND|GRANT` deleted real wiring.** A reply capability carries GRANT, so filtering it
+   hid return addresses - and also hid every peer the SUPERVISOR provides at spawn, which carries
+   GRANT because the supervisor must be able to re-delegate it. `net-stack` showed no `nic-driver`
+   dependency at all, immediately after a ping that demonstrably used it. The two are
+   indistinguishable from userspace, so they are included and the ambiguity is REPORTED (26.7):
+   dropping them hides real dependencies, including them silently shows return addresses as
+   dependencies, and an honest ambiguity beats a confident wrong answer in either direction.
+
+**What it deliberately does NOT show: DECLARED dependencies.** A contract's `ipc_send` list lives in
+`service_config` inside the kernel (the `.toml` never ships - `contract_check.py` reconciles it at
+build time), so `trace deps <svc> declared` would need a new `InspectKernel` query: kernel-surface
+growth for a diagnostic, which this project does not do. It is deferred to the work that moves the
+service catalogue into the supervisor, after which the supervisor owns that policy and the query is
+service-to-service with the kernel uninvolved.
 
 ### What the same hardware run says about the ring's limits
 

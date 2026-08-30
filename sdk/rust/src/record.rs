@@ -130,6 +130,27 @@ impl Table {
     pub fn ncols(&self) -> usize { self.ncols }
     /// Number of rows.
     pub fn nrows(&self) -> usize { self.nrows }
+
+    /// The value of a numeric cell; `None` for a string or absent one. The twin of
+    /// [`Table::cell_bytes`], for the same reason: deriving a view from a table beats rendering it
+    /// and parsing the text back.
+    pub fn cell_int(&self, r: usize, c: usize) -> Option<u64> {
+        if r >= self.nrows || c >= self.ncols { return None; }
+        self.cell_num(self.rows[r][c])
+    }
+
+    /// The bytes of a string cell; empty for a numeric or absent one.
+    ///
+    /// Exists so one table can be DERIVED from another - `trace deps` reads the event table to count
+    /// what a service actually called. Without it the only way to consume a `Table` was to render it
+    /// and re-parse the text, which is the round-trip this record model exists to avoid.
+    pub fn cell_bytes(&self, r: usize, c: usize) -> &[u8] {
+        if r >= self.nrows || c >= self.ncols { return b""; }
+        match self.rows[r][c] {
+            Value::Str { .. } => self.cell_str(self.rows[r][c]),
+            _ => b"",
+        }
+    }
     /// True if any bound was exceeded while building (rows/cols/arena/name).
     pub fn overflow(&self) -> bool { self.overflow }
 

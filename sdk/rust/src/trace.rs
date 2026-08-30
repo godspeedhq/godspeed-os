@@ -118,6 +118,57 @@ pub mod spin_name {
     }
 }
 
+/// Where a given PEER's protocol keeps its opcode, when it is not byte 0.
+///
+/// # Why this exists
+///
+/// The trace recorded byte 0 of the request and called it the opcode, because that is what most
+/// protocols do. Two of ours do not, and they are the two you actually see: `shell -> fs` and
+/// `fs -> block-driver` both PREPEND a one-byte correlation tag (added to stop replies being matched
+/// by arrival order, which had `fs` accepting one block's data as another's). So byte 0 was a request
+/// id and the column was showing noise while claiming to show opcodes.
+///
+/// The SDK cannot know this - it is generic across every peer - and the KERNEL certainly cannot, since
+/// it may not interpret a payload at all. The service that owns the protocol can, and that is exactly
+/// where the rest of this design already puts protocol knowledge. So it declares it, once, per peer.
+///
+/// Bounded: four entries, no heap, a linear scan of at most four short names per emit. A fifth
+/// declaration is dropped rather than growing - and dropped LOUDLY is not possible here (this is the
+/// emit path), so the bound is set well above the two entries the system actually needs.
+const OP_AT_MAX: usize = 4;
+static OP_AT_NAMES: [spin_name::Name; OP_AT_MAX] = [
+    spin_name::Name::new(), spin_name::Name::new(),
+    spin_name::Name::new(), spin_name::Name::new(),
+];
+static OP_AT_OFFSETS: [AtomicU32; OP_AT_MAX] = [
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+];
+
+/// Declare that `peer`'s protocol keeps its opcode at byte `at` of the request.
+pub fn set_op_offset(peer: &str, at: u8) {
+    for i in 0..OP_AT_MAX {
+        if !OP_AT_NAMES[i].is_set() {
+            OP_AT_NAMES[i].set(peer);
+            OP_AT_OFFSETS[i].store(at as u32, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// The byte of a request to `peer` that carries its opcode. 0 unless declared otherwise.
+pub fn op_offset(peer: &str) -> usize {
+    let mut want = [0u8; PEER_LEN];
+    let n = peer.len().min(PEER_LEN);
+    want[..n].copy_from_slice(&peer.as_bytes()[..n]);
+    for i in 0..OP_AT_MAX {
+        if !OP_AT_NAMES[i].is_set() { break; }
+        let mut have = [0u8; PEER_LEN];
+        OP_AT_NAMES[i].read_into(&mut have);
+        if have == want { return OP_AT_OFFSETS[i].load(Ordering::Relaxed) as usize; }
+    }
+    0
+}
+
 /// Declare the emitting service's own name; see [`CALLER`].
 #[inline]
 pub fn set_caller(name: &str) { CALLER.set(name); }

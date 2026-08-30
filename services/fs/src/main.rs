@@ -413,6 +413,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Name this service in the trace ring. It cannot ask what it is called (identity is not ambient),
     // so a traced service says - see `sdk::trace` for why that costs nothing in trust.
     ctx.trace_as("fs");
+    // block-driver requests carry a correlation tag at byte 0 (`treq[0] = tag`), opcode at byte 1.
+    ctx.trace_op_at("block-driver", 1);
     ctx.log("fs: starting");
 
     // Wait on block-driver's TRUTH, never on a clock (Commandment VIII). `block_capacity` returns
