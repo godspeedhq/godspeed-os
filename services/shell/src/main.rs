@@ -7078,14 +7078,15 @@ fn build_trace_table(ctx: &ServiceContext, failures_only: bool) -> Option<Table>
     //   sec     - seconds since the oldest row shown. The stored value is an epoch second, which says
     //             nothing on its own; the GAP between rows is what a stall looks like.
     //   peer    - the service that was CALLED, by name (the emitter knew it; see `sdk::trace`).
-    //   op      - that protocol's OPCODE, from the byte the emitting service says it lives in
-    //             means. `utilities/46_trace.md` 7 worried that "byte 0 is the opcode" is a
-    //             CONVENTION, and that a protocol putting something else there would produce a
-    //             misleading column. It does: `fs` PREPENDS a correlation tag to every block-driver
-    //             request (`treq[0] = tag; treq[1..] = req`), so those rows carry a tag and the real
-    //             opcode sits at byte 1. Calling the column `op` asserted a meaning the data does not
-    //             have; `byte0` states a fact and leaves the interpretation to whoever knows the
-    //             protocol - which is the same discipline the kernel follows about payloads.
+    //   op      - that protocol's OPCODE, taken from the byte the EMITTING SERVICE says it lives in
+    //             (`ctx.trace_op_at`), and rendered by NAME where this shell knows the protocol.
+    //             `utilities/46_trace.md` 7 worried that "byte 0 is the opcode" is a CONVENTION and
+    //             that a protocol putting something else there would produce a misleading column. It
+    //             was right, and both busy protocols do exactly that: `shell -> fs` and
+    //             `fs -> block-driver` each PREPEND a one-byte correlation tag, so byte 0 is a
+    //             request id and the opcode sits at byte 1. The answer is not to rename the column
+    //             after the byte - it is to record the RIGHT byte, which only the service that speaks
+    //             the protocol can say.
     //   outcome - how the exchange ENDED. One row per exchange, so this is its whole story.
     let mut t = Table::new(&["seq", "sec", "caller", "peer", "op", "outcome"]);
     let base = if n > 0 && b.len() >= 9 {
@@ -7517,7 +7518,11 @@ const DEPS_MAX_ROWS: usize = 48;
 ///
 /// Not in the pipe path: `trace ipc | to json` must emit records and nothing else, so a legend there
 /// would be corrupting the stream with prose.
-fn trace_legend(ctx: &ServiceContext, f: &mut FrameBuf, n: usize) {
+/// Returns the number of LINES it wrote, because the pager PINS this region and its frame arithmetic
+/// depends on that number being exact. It was a hand-maintained constant and drifted twice - most
+/// recently to 8 while this function wrote 7, so the pinned region claimed a row it never painted. A
+/// count of lines written belongs to the thing that writes them.
+fn trace_legend(ctx: &ServiceContext, f: &mut FrameBuf, n: usize) -> usize {
     f.put(ctx, b"--------------------------------- legend ---------------------------------\x1b[K\n");
     f.put(ctx, b"seq     the caller's own count - a gap is an event that never arrived\x1b[K\n");
     f.put(ctx, b"sec     when the ring recorded it, from the oldest row shown - 1s steps\x1b[K\n");
@@ -7530,10 +7535,13 @@ fn trace_legend(ctx: &ServiceContext, f: &mut FrameBuf, n: usize) {
     f.put(ctx, b"----------------------------- IPC events (");
     f.put(ctx, &nb[..q]);
     f.put(ctx, b") -----------------------------\x1b[K\n");
+    7
 }
 
 /// Lines [`trace_legend`] draws, so the pager can size its scrolling area.
-const TRACE_LEGEND_LINES: usize = 8;
+/// Lines the trace legend occupies. Used ONLY to decide whether paging is needed - the number
+/// that must be exact is the PINNED height, and that comes from `trace_legend` itself.
+const TRACE_LEGEND_LINES: usize = 7;
 
 fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellError> {
     let t = match build_trace_table(ctx, failures_only) {
@@ -7552,11 +7560,11 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
     let (rows, _cols) = ctx.console_dims();
     let rows = if rows == 0 { 24 } else { rows as usize };
     let w = t.grid_widths();
-    // 2 legend lines + 1 column header + 1 status line.
+    // Does it fit unpaged? Legend block, column header, and a line of slack.
     if t.nrows() + TRACE_LEGEND_LINES + 2 <= rows {
         // The unpaged path batches too: it is the same screenful, drawn once.
         let mut f = FrameBuf::new();
-        trace_legend(ctx, &mut f, t.nrows());
+        let _ = trace_legend(ctx, &mut f, t.nrows());
         let mut lb = LineBuf::new();
         t.grid_header(&mut lb, &w);
         lb.flush_into(ctx, &mut f);
@@ -7580,11 +7588,11 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
     line_pager(ctx, t.nrows(), rows,
         &|c| {
             let mut f = frame.borrow_mut();
-            trace_legend(c, &mut f, t.nrows());
+            let legend = trace_legend(c, &mut f, t.nrows());
             let mut lb = LineBuf::new();
             t.grid_header(&mut lb, &w);
             lb.flush_into(c, &mut f);
-            TRACE_LEGEND_LINES + 1 // the legend block, plus the column header
+            legend + 1 // what the legend ACTUALLY wrote, plus the column header
         },
         &|c, i| {
             let mut f = frame.borrow_mut();

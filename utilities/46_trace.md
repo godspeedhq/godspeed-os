@@ -118,12 +118,13 @@ the kernel.
 
 ## 5. Command surface
 
-As shipped - six views, each named for WHAT IT SHOWS rather than what you give it:
+As shipped - seven views, each named for WHAT IT SHOWS rather than what you give it:
 
 ```text
   trace blocked                 what is stuck, everywhere
   trace chain <name|slot>       what one task is stuck behind, as a tree
   trace deps <service>          what it can call, as a tree, with what it has called
+  trace endpoints               every live endpoint and its owner - the map from names to ids
   trace endpoint <id>           the inverse: who owns an endpoint, and who can reach it
   trace ipc                     what happened - the ring, paged and pipeable
   trace failures                the same ring, only the failures
@@ -225,6 +226,37 @@ As records (`| to grid`), one row per EDGE:
 | `grant` | `grantable` if the cap carries GRANT. That means EITHER a supervisor-wired peer OR a reply address - the two are indistinguishable from userspace, so the ambiguity is reported rather than guessed |
 | `calls` / `failed` | as above |
 | `ops` | space-separated distinct operation names, or `-` |
+
+---
+
+#### `trace endpoints` - the map from names to ids
+
+```text
+gsh> trace endpoints
+slot  name          endpoint  state      queue
+0     supervisor    100       BlockRecv  0
+1     logger        102       BlockRecv  0
+6     fs            112       BlockRecv  0
+```
+
+The inventory the other views assume you have. Ids reach you one at a time from `caps <service>` (as
+`endpoint#N`), from `trace blocked`'s `awaiting` column and from `trace deps`' reply list - none of
+which answers "what endpoints exist", so `trace endpoint <id>` could not be used deliberately without
+first assembling this by hand.
+
+| column | what it holds |
+|---|---|
+| `slot` | the task's scheduler slot, as `status` shows it |
+| `name` | the service |
+| `endpoint` | the id to pass to `trace endpoint <id>` |
+| `state` | the task state - `BlockRecv` here means idle, waiting for work |
+| `queue` | messages WAITING in that endpoint. Non-zero on an idle service means work is arriving faster than it drains |
+
+Only PRIMARY endpoints appear, because that is what the kernel reports per task. A reply-only mailbox
+has no name here - which is exactly why an unresolvable capability shows as `reply#NNN` in a
+dependency tree rather than as a service.
+
+A record source, so it filters and pipes: `trace endpoints | where name contains fs | to json`.
 
 ---
 
@@ -409,7 +441,22 @@ failure/recovery example works, because that one is a **time sequence, not a tre
 
 ---
 
-## 7. The one line I am not certain of: recording `op`
+## 7. The one line I am not certain of: recording `op`  *(RESOLVED - and the premise was WRONG)*
+
+> **As built:** the uncertainty below was justified and its factual premise was false. Both busy
+> protocols put something else at byte 0: `shell -> fs` and `fs -> block-driver` each PREPEND a
+> one-byte correlation tag (added so replies are not matched by arrival order, after `fs` accepted one
+> block's data as another's). So a trace recording byte 0 showed REQUEST IDS in a column labelled
+> "op" - `183`, `177`, `212` against `block-driver`.
+>
+> The answer was not to rename the column after the byte. It is that **the service which speaks the
+> protocol declares where its opcode lives** - `ctx.trace_op_at("fs", 1)`, once at startup. The SDK is
+> generic across peers and cannot know; the kernel may not interpret a payload at all; the service
+> can, which is where this design already puts every other piece of protocol knowledge. The shell then
+> renders the opcode by NAME (`read`, `write`, `capacity`), because a number needs a lookup table the
+> reader does not have.
+>
+> The section below is kept as the reasoning that led there, per 1 (an amendment is ratified history).
 
 `op` is byte 0 of the message. Every service protocol in this tree happens to put its opcode there
 (`fs`, `block-driver`, the block IPC protocol). Recording it is what makes `trace ipc` readable rather
@@ -531,7 +578,7 @@ purpose is diagnostic data, so the ring there costs the kernel **exactly zero**.
 
 | Layer | Change |
 |---|---|
-| `sdk/rust/src/trace.rs` | wire format (18 B: seq, at_s, peer[12], op, kind), lazy one-time arming |
+| `sdk/rust/src/trace.rs` | wire format (34 B: seq, at_s, caller[12], peer[12], op, kind), lazy one-time arming, per-peer opcode offset |
 | `sdk/rust/src/service_context.rs` | `trace_emit`; three emission points in `request_with_reply` |
 | `services/logger/src/main.rs` | the 192-event ring, dump + status replies |
 | `services/shell/src/main.rs` | `trace ipc`, `trace failures`, `trace status` |

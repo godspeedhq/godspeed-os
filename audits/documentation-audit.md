@@ -510,3 +510,62 @@ the old story (Commandment III - and the amendment is the truth).
 - **`audits/unsafe-audit.md`** no longer lists the deleted `arch/aarch64/xhci.rs`, and the checker now
   FAILS on a row whose file is missing instead of passing silently (`e2810e00`) - the enforcement gap
   that let the stale row survive is closed, not just the row.
+
+---
+
+## Audit: the `trace` branch (2026-08-30, `feat/trace` @ `f1f4d5ff`)
+
+Requested before merge. Scope: everything this branch wrote - `utilities/46_trace.md`, the trace code
+comments, and the per-directory guides it touched. Six defects, all fixed; every one of them was
+created by a LATER change in the same branch invalidating an EARLIER piece of prose.
+
+### DOC-1 (HIGH) - a section's factual premise was false, and we had disproved it ourselves
+
+`46_trace.md` 7 read: *"`op` is byte 0 of the message. Every service protocol in this tree happens to
+put its opcode there (`fs`, `block-driver`, the block IPC protocol)."*
+
+Both of those protocols prepend a one-byte CORRELATION TAG, which this branch discovered while
+reading a trace that showed `183` and `177` where opcodes belonged. So the section's premise was
+already false when written, and the branch proved it false without going back to correct it. Marked
+RESOLVED with the actual answer (the service declares where its opcode lives - `ctx.trace_op_at`) and
+the original kept as ratified history per 1.
+
+### DOC-2 (MEDIUM) - a whole view was missing from its own reference
+
+`trace endpoints` did not appear anywhere in `46_trace.md`, including a section headed "every command,
+every column, every number". It was added after that section was written. A reference that claims
+completeness and silently omits a command is worse than one that does not claim it.
+
+### DOC-3 (MEDIUM) - the wire format was two revisions stale
+
+"wire format (18 B: seq, at_s, peer[12], op, kind)" - the event is 34 B and carries `caller[12]`. The
+`caller` column was the branch's most-discussed addition and the format line never moved.
+
+### DOC-4 (MEDIUM) - a code comment spliced by a rename, arguing for a removed name
+
+The `op` column comment read "...from the byte the emitting service says it lives in **means.**" - a
+sentence welded to the corpse of the one it replaced - and then spent six lines arguing for the name
+`byte0`, which was reverted when the offset became declarable. A comment that argues for a decision
+the code no longer implements is worse than no comment.
+
+### DOC-5 (LOW) - `sdk/rust/CLAUDE.md` did not list `trace.rs`
+
+A new SDK module absent from the file table that exists to say what each module is for.
+
+### DOC-6 (MEDIUM, and it was a real bug) - a hand-maintained line count had drifted, twice
+
+`TRACE_LEGEND_LINES` said 8; `trace_legend` wrote 7. The pager PINS that region and sizes its
+scrolling area from the number, so the frame claimed a row it never painted. Not merely stale prose -
+a wrong constant in the arithmetic that had just been fixed for a different off-by-one.
+
+Fixed at the root rather than by correcting the number: `trace_legend` now RETURNS the count it wrote,
+and the pinned height comes from that. The constant survives only to decide whether paging is needed,
+where being conservative costs a page boundary and nothing else. A count of lines written belongs to
+the thing that writes them (26.4 - one irreducible source, no second truth).
+
+### The pattern worth naming
+
+All six are the same shape: a change landed, and the prose describing the thing it changed did not
+move with it. Four of them were introduced by ME, within hours, in this branch. The defence is not
+"write better comments" - it is to prefer sources that CANNOT drift: a returned count over a constant,
+a grid header over a copied column list, a pointer to the file over a duplicated table.
