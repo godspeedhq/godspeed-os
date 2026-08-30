@@ -2496,16 +2496,23 @@ fn mode_prop_bp7(ctx: &ServiceContext) -> ! {
     // BP7 - TLB shootdown leaves no stale mappings - 150 cycles (§10.5).
     // Proxy: 150 kill/respawn cycles; generation monotonicity confirms the full
     // kill/shootdown lifecycle completed correctly each time.
+    //
+    // The generation is read AFTER the respawn, for the reason P7 records above: unregister-on-death
+    // (§14.2, the self-heal) clears the dead service's name while the id is still ours, so a by-name
+    // read in the dead window returns 0 - correctly. This loop used to read between the kill and the
+    // respawn, so it failed on its FIRST iteration (0 <= 0) and had done since unregister-on-death
+    // landed; P7 was updated then and BP7 was not. The assertion it was meant to make is intact and
+    // is now actually made: 150 cycles, each generation strictly greater than the last (§7.5).
     let mut prev_gen: u64 = 0;
     for _ in 0..150u32 {
         let _ = ctx.kill("prop-bp7-victim");
+        let _ = table::probe(ctx, "prop-bp7-victim");
         let gen = ctx.inspect_endpoint_generation("prop-bp7-victim");
         if gen <= prev_gen {
-            ctx.log("prop: BP7 FAIL - generation not monotonic after kill (TLB lifecycle broken)");
+            ctx.log("prop: BP7 FAIL - generation not monotonic across kill/respawn (TLB lifecycle broken)");
             idle(ctx);
         }
         prev_gen = gen;
-        let _ = table::probe(ctx, "prop-bp7-victim");
     }
     ctx.log("prop: BP7 pass (150/150)");
     idle(ctx)

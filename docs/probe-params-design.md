@@ -1,6 +1,7 @@
 # Probe parameters at spawn: taking 193 policy rows out of the kernel
 
-**Status:** design, being implemented on `feat/supervisor-owns-images`.
+**Status:** BUILT, on `feat/supervisor-owns-images`. The pin moved 221 -> 29 and
+`kernel/src/task/mod.rs` lost 2,317 lines.
 **Scope:** test probes only. Real services are untouched by this step.
 
 ## The problem, measured
@@ -41,9 +42,33 @@ flags: bit0 has_recv_endpoint   bit1 small memory limit (4 MiB)   bit2 is-probe
 
 `send_peers` ride in the existing name argument as a **NUL-separated list**: the first element is the
 task name, the rest are peer names. The kernel already name-wires peers through `ipc::names`, so it
-needs the list and nothing else. Longest such string in the current table is well under 128 bytes.
+needs the list and nothing else. The payload limit went from 64 to 128 bytes, which the longest real
+payload is well under; a payload that will not fit is REFUSED rather than truncated, because a
+silently shortened peer name would wire a probe to the wrong service and read as a passing test.
 
 The kernel keeps **one** `probe` entry: the ELF and the defaults.
+
+### The prerequisite: task names had to be owned
+
+Task names were `[&'static str; MAX_TASKS]`. That is a small thing with a large consequence: a name
+had to be a string literal compiled into the kernel, so a caller could not supply one - which is
+*why* the catalogue existed. They are owned bytes now, in `smp::names::NameTable`.
+
+That module is in a permitted layer (§18.1) deliberately, not incidentally. Written where it is used
+it would have taken `task/scheduler.rs` from 37 `unsafe` lines to 40 - a grandfathered floor, which
+§18.5 lets grow only by a CLAUDE.md amendment, and only after trying a permitted layer first. It fits
+there honestly rather than as a dodge: a shared array with one writer per slot and readers on every
+core **is** a concurrency primitive, and it belongs beside `SpinLock`. `task/scheduler.rs` stays at
+its floor; the four blocks are audited once, in `audits/unsafe-audit.md`.
+
+### One table, two spawners
+
+**Two** principals spawn probes: the `supervisor` starts each suite, and a probe **respawns its own
+victim** (a restart test has to). Both need the same parameters, so the table is one file -
+`services/probe/src/table.rs` - which the supervisor includes by path. Two copies of a parameter
+table is two truths (Commandment III): the second drifts, and a probe respawned with the wrong mode
+is a test that passes while testing the wrong thing. It lives with the `probe` program because it
+describes that program's test modes, not the supervisor's policy.
 
 ## What stays in the kernel, and why
 
@@ -64,13 +89,39 @@ It does not move service IMAGES, and it does not let the supervisor supply hardw
 is the larger change (the `Spawn` ABI carrying an image pointer), and it needs a CLAUDE.md amendment
 because it changes who arbitrates hardware authority. This step deliberately stops short of it.
 
+## What this costs, recorded rather than left to be discovered (§26.7)
+
+A probe can no longer be spawned or restarted **by name alone**, because its parameters are no
+longer anywhere the kernel can look them up. Two consequences:
+
+- `control RESTART <probe>` over the operator channel now fails with `NotFound` and a loud kernel
+  line, where it used to work. Nothing uses it - the suites only ever `KILL` a probe, and every
+  respawn goes through the table - but it is a real capability that went away, so it is written down
+  rather than left for the next person to trip over.
+- A probe that `chaos` kills stays dead. That is unchanged: probes were never in the supervisor's
+  `MANAGED` set, so nothing respawned them before either.
+
+Spawning a **real service** by name is untouched: those 29 rows are still in the kernel, and the
+plain `Spawn` path is byte-for-byte what it was.
+
 ## Effect on the pin
 
-`service_configs` drops from **221** to about **29**: the real services, the examples, and the two
-authority outliers above. Kernel responsibility decreases; nothing is added.
+`service_configs` drops from **221** to **29**: the real services, the examples, and the single
+generic `probe` entry. Kernel responsibility decreases; nothing is added.
 
 ## How it is verified
 
 The probes ARE the QEMU suites - `identity`, `property`, `fuzz`, `stress`, `adv`, `chaos` and their
 brutal variants all spawn them. A wrong parameter does not fail subtly; 193 probes fail loudly. The
 full battery is the test for this change.
+
+Result: identity 24/0/0, property 10/0, fuzz 8/0, stress 10/0, adv 15/0, chaos 7/0,
+identity-brutal 6/0, property-brutal 10/0. Both authority outliers are covered - IR1A exercises
+`probe-11a`'s IRQ route, Test 5A exercises `probe-5a-send`'s grantable peer caps.
+
+**One pre-existing failure surfaced and was fixed on the way.** Brutal property BP7 read the victim's
+generation *between* the kill and the respawn - the dead window, where unregister-on-death correctly
+returns 0 - so it failed on its first iteration and had done since unregister-on-death landed (P7 was
+updated then; BP7 was not). Confirmed against `main` before attributing it, per "don't guess". The
+kernel was right and the test was stale; BP7 now reads after the respawn, like P7, and makes the
+assertion it was written to make.

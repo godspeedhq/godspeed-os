@@ -36,6 +36,7 @@ truthful and shorter than writing five files to repeat them.
 | `scripting.md`      | `gsh` - the GodspeedOS shell language |
 | `service-control-cap.md` | Design note: capability-gating kill/restart behind `service_control` |
 | `net-tags-design.md` | Design spec: correlation tags between `net-stack` and `nic-driver` |
+| `probe-params-design.md` | **BUILT:** taking the 193 test-probe rows out of the kernel's service catalogue. Why 221 `service_config` entries were never 221 programs (27 ELFs; 193 of the rows are one binary and a test-mode number), the parameters riding in `Spawn`'s unused upper `arg0` bits with the peer list as a NUL-separated name payload, what stays in the kernel because it is AUTHORITY rather than a setting (`probe-11a`'s IRQ route, `probe-5a-send`'s grantable caps), and the owned-task-name prerequisite that made any of it possible. Pin 221 -> 29 |
 | `arm32-usb-userspace.md` | Taking the DWC2 USB stack out of the arm32 kernel |
 | `xhci-topology.md`  | The topology model the `xhci` service needs |
 | `xhci-split.md`     | Splitting input from storage in the `xhci` service |
