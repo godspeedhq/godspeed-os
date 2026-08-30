@@ -1510,6 +1510,23 @@ pub fn spawn_probe(name: &str, core_override: Option<u32>, p: ProbeParams, peers
     // The probe image and the fields that never varied come from ONE kernel entry.
     let (_, cfg) = service_config("probe").ok_or(SpawnError::NotFound)?;
 
+    // A CALLER-SUPPLIED NAME MAY NOT BE A REAL SERVICE'S NAME.
+    //
+    // This is the one new authority the parameterised path creates, so it is closed here rather than
+    // left to convention. Before, `Spawn` could only start a service the kernel already knew, under
+    // the name the kernel gave it - name and binary were bound together. Now a SPAWN holder chooses
+    // the name, and every service holds a spawn cap (22 Test A9). Without this check, a compromised
+    // service could wait for `fs` to die and register the PROBE binary under the name `fs`; clients
+    // reacquiring by name (14.3) would then wire themselves to it. The name directory is a recovery
+    // anchor, and an anchor that can be squatted is not one.
+    //
+    // Refusing the whole real catalogue is deliberately blunter than refusing the live set: a name
+    // is dangerous precisely while its service is DEAD, which is when a liveness test would pass.
+    if service_config(name).is_some() {
+        crate::kprintln!("task: spawn probe '{}' rejected: that is a real service's name", name);
+        return Err(SpawnError::NotFound);
+    }
+
     if scheduler::find_task_by_name(name).is_some() {
         crate::kprintln!("task: spawn '{}' rejected: already running", name);
         return Err(SpawnError::AlreadyRunning);
