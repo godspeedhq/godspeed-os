@@ -76,7 +76,12 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
                 // restarting a service that already died is exactly the case the harness drives.
                 // SPAWN does not kill - starting something already running must fail, not replace it.
                 if restart { let _ = ctx.kill(name); }
-                let ok = if np > 0 {
+                let ok = if let Some(r) = probes::row(name) {
+                    // A TEST PROBE, asked for by a probe respawning its own victim. Its parameters
+                    // come from the shared table here rather than off the wire - the caller sends a
+                    // name, not a configuration, so a probe cannot ask to be something it is not.
+                    spawn_probe_row(ctx, r).is_ok()
+                } else if np > 0 {
                     // Peers supplied. INSTALL them from the name-cap map where we have caps, rather
                     // than name-wiring: a provided cap is what makes the child use a CAPABILITY
                     // rather than resolve a name, which is the property Phase 0b exists to prove and
@@ -380,6 +385,48 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
 
 #[path = "../../probe/src/table.rs"]
 mod probes;
+
+/// The test-probe image - 193 test modes in one binary (docs/probe-params-design.md).
+///
+/// NOT PRESENT IN A BARE-METAL BUILD, and that is the point of it living here rather than in the
+/// kernel. It used to be `include_bytes!` in `kernel/src/task/mod.rs` with no cfg at all, so every
+/// shipped kernel carried ~105 KiB of adversary - code that deliberately page-faults, hogs cores and
+/// brute-forces cap slots - reachable at runtime by any SPAWN holder, on a machine that has no test
+/// harness to run it. §4.4 says the kernel holds no developer tooling; this is how that becomes true
+/// rather than aspirational.
+#[cfg(not(feature = "bare-metal"))]
+static PROBE_ELF: &[u8] = include_bytes!(env!("SVC_PROBE_ELF"));
+
+/// Start one probe from its table row. The supervisor holds the image, so it spawns directly.
+///
+/// Everything that used to be keyed by NAME inside the kernel now travels in the request: the mode,
+/// the memory limit, the core, the peers, the PRIVILEGES (`probes::privileges_of`), the test-IRQ
+/// class (`hw_class_of`) and the grantable-peers flag (`peers_grant_of`). The kernel refuses any
+/// privilege the supervisor cannot itself delegate, so this passes authority on rather than minting.
+#[cfg(not(feature = "bare-metal"))]
+pub fn spawn_probe_row(ctx: &ServiceContext, r: probes::Row) -> Result<(), godspeed_sdk::Error> {
+    let (name, mode, recv, mem_mib, core, peers) = r;
+    let mut req = godspeed_sdk::service_context::SpawnRequest::new(PROBE_ELF, name);
+    req.flags = if recv { godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV } else { 0 };
+    if probes::peers_grant_of(name) { req.flags |= godspeed_sdk::service_context::SPAWN_FLAG_PEERS_GRANT; }
+    // A probe's core is a PREFERENCE, as a catalogue row's was: a machine with fewer cores must still
+    // run the suite rather than lose the probes that name a core it lacks.
+    req.core         = core.unwrap_or(u32::MAX);
+    req.memory_limit = if mem_mib == 0 { 64 * 1024 * 1024 } else { (mem_mib as u64) * 1024 * 1024 };
+    req.privileges   = probes::privileges_of(name);
+    req.probe_mode   = mode;
+    req.hw_flags     = probes::hw_class_of(name);
+    let mut buf = [0u8; 128];
+    ctx.spawn_image(&mut req, &mut buf, peers).map(|_| ())
+}
+
+/// Bare-metal carries no probe image, so there is nothing to start. Loud rather than silent: a probe
+/// that quietly did not run reads as a passing suite (invariant 12).
+#[cfg(feature = "bare-metal")]
+pub fn spawn_probe_row(ctx: &ServiceContext, r: probes::Row) -> Result<(), godspeed_sdk::Error> {
+    ctx.log_fmt(format_args!("supervisor: no probe image in a bare-metal build - '{}' not spawned", r.0));
+    Err(godspeed_sdk::Error::InvalidArgument)
+}
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Phase 1 of moving naming out of the kernel (docs/naming-design.md).

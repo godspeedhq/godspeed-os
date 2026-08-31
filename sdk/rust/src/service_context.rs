@@ -280,6 +280,13 @@ pub const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
 /// a core the machine does not have failed to spawn rather than degrading - `logger` and `xhci` (both
 /// core 2) simply vanished under `-smp 2`, which 11.3 requires to keep working.
 pub const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
+/// Mint the child's name-wired peer caps WITH `GRANT`, so it can re-delegate them.
+///
+/// AUTHORITY, not a setting: handing out a re-delegatable capability is itself a grant (§7.4), which
+/// is why the kernel used to keep this keyed by name for the one probe that needs it (§22 Test 5A).
+/// As a request bit it is checked the same way every privilege is - the spawner may ask for it only
+/// because it could transfer such a cap itself.
+pub const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
 
 /// Bits for `SpawnRequest::privileges`. A spawner may only request what it HOLDS ITSELF - the kernel
 /// checks, and refuses otherwise - so this passes authority on, it never mints it (3.1, 7.3).
@@ -313,6 +320,9 @@ pub mod hwclass {
     pub const EHCI:        u32 = 4;
     pub const DWC2:        u32 = 5;
     pub const FRAMEBUFFER: u32 = 6;
+    /// Not a device: the software-raised test interrupt (§22 IR1). A class, so that the probe which
+    /// receives it names a CLASS like any driver and the kernel states the vector.
+    pub const TEST_IRQ:    u32 = 7;
 }
 
 impl SpawnRequest {
@@ -405,18 +415,6 @@ pub mod supcmd {
     }
 }
 
-/// Parameters a spawner supplies for a test probe (`ServiceContext::spawn_probe`).
-///
-/// 193 of the kernel's service-catalogue rows were the same `probe` binary differing by a test mode
-/// - one program and a table of parameters. A parameter is policy (26.10), so it comes from the
-/// spawner now. `docs/probe-params-design.md`.
-#[derive(Clone, Copy)]
-pub struct ProbeSpec {
-    pub mode:              u32,
-    pub has_recv_endpoint: bool,
-    /// Memory ceiling in MiB. 0 = the kernel's probe default (64 MiB).
-    pub mem_mib:           u32,
-}
 
 /// Probe parameters ride in the upper 32 bits of `Spawn`'s `arg0`, which were unused:
 /// `[55..48] flags  [47..32] mode  [31..16] core  [15..0] spawn cap slot`.
@@ -3046,51 +3044,6 @@ impl ServiceContext {
         else { Ok(Some(CapHandle(ret as u32 - 1))) }
     }
 
-    /// Spawn a probe under a caller-supplied name and parameters (`Spawn`, syscall 7 - no new
-    /// syscall, and no change in arity: the parameters ride in the upper 32 bits of `arg0`, which
-    /// were unused, and the peer list rides in the name argument as a NUL-separated list).
-    ///
-    /// This carries no AUTHORITY. A probe that needs an IRQ line routed to it, or peer caps that
-    /// carry GRANT, is still decided by the kernel keyed by name - a caller says what a probe IS,
-    /// never what it may DO. See `docs/probe-params-design.md`.
-    pub fn spawn_probe(&self, name: &str, core: Option<u32>, spec: ProbeSpec, peers: &[&str])
-        -> Result<(), crate::Error>
-    {
-        let data = Self::ctx();
-        if data.magic != SERVICE_CTX_MAGIC { return Err(crate::Error::InvalidArgument); }
-        let slot = data.spawn_slot;
-        if slot == u32::MAX { return Err(crate::Error::Cap(CapError::CapNotHeld)); }
-
-        // `name\0peer\0peer`. Bounded (26.6): a fixed stack buffer, and a payload that will not
-        // fit is REFUSED rather than truncated - a silently shortened peer name would wire a probe
-        // to the wrong service, or to nothing, and read as a passing test.
-        let mut buf = [0u8; SPAWN_PAYLOAD_MAX];
-        let mut n   = 0usize;
-        let mut put = |b: &[u8], buf: &mut [u8; SPAWN_PAYLOAD_MAX], n: &mut usize| -> bool {
-            if *n + b.len() > SPAWN_PAYLOAD_MAX { return false; }
-            buf[*n..*n + b.len()].copy_from_slice(b);
-            *n += b.len();
-            true
-        };
-        if !put(name.as_bytes(), &mut buf, &mut n) { return Err(crate::Error::InvalidArgument); }
-        for p in peers {
-            if !put(b"\0", &mut buf, &mut n) || !put(p.as_bytes(), &mut buf, &mut n) {
-                return Err(crate::Error::InvalidArgument);
-            }
-        }
-
-        let core_field = core.unwrap_or(0xFFFF) as u64 & 0xFFFF;
-        let mut packed = (slot as u64 & 0xFFFF) | (core_field << 16)
-                       | ((spec.mode as u64 & 0xFFFF) << 32)
-                       | SPAWN_FLAG_IS_PROBE;
-        if spec.has_recv_endpoint { packed |= SPAWN_FLAG_HAS_RECV; }
-        if spec.mem_mib == 4      { packed |= SPAWN_FLAG_SMALL_MEM; }
-
-        // SAFETY: syscall(7) = Spawn; slot comes from the kernel-written context page; `buf` is a
-        // live stack buffer of `n` initialised bytes.
-        let ret = unsafe { raw_syscall(7, packed, buf.as_ptr() as u64, n as u64) };
-        if ret == 0 { Ok(()) } else { Err(crate::Error::InvalidArgument) }
-    }
 
     /// Spawn `name` on `core` (0xFFFF = round-robin) and receive a `SEND|GRANT` cap to its recv
     /// endpoint. This is the Phase-0 seam for moving naming out of the kernel

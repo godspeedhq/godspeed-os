@@ -369,13 +369,6 @@ const SUPERVISOR_ELF: &[u8] = b"\xDE\xAD"; // invalid ELF, triggers LoadFailed
 #[cfg(not(feature = "test-bad-supervisor"))]
 const SUPERVISOR_ELF: &[u8] = include_bytes!(env!("SVC_SUPERVISOR_ELF"));
 
-/// The one shared probe ELF. Every probe/test-driver service uses this exact
-/// reference, so the spawn path can identify "is a probe" by pointer identity
-/// (`elf_bytes` == `PROBE_ELF`) - used to mint the service_control cap for the
-/// test drivers without enumerating every probe name. A single const guarantees
-/// the pointer compares equal; separate `include_bytes!` sites would not.
-const PROBE_ELF: &[u8] = include_bytes!(env!("SVC_PROBE_ELF"));
-
 struct ServiceConfig {
     elf:               &'static [u8],
     has_recv_endpoint: bool,
@@ -404,7 +397,7 @@ struct ServiceConfig {
 /// spawn path. The BAR *address* is still runtime-discovered by the PCI scan (a hardware location is a
 /// different irreducible fact from the authorization); only the driver's *class* is declared here.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum HwClass { None, Ahci, Nic, Xhci, Ehci, Dwc2, Framebuffer }
+enum HwClass { None, Ahci, Nic, Xhci, Ehci, Dwc2, Framebuffer, TestIrq }
 
 impl HwClass {
     /// Did the PCI scan find this class of controller?
@@ -423,6 +416,9 @@ impl HwClass {
             HwClass::Ehci => pci::EHCI_FOUND.load(Relaxed),
             HwClass::Ahci => pci::AHCI_FOUND.load(Relaxed),
             HwClass::Nic  => pci::NIC_FOUND.load(Relaxed),
+            // Not a device: the software-generated test interrupt (`FireIrq`) that IR1 delivers.
+            // Always "present" because the kernel raises it itself - there is nothing to scan for.
+            HwClass::TestIrq => true,
             HwClass::None => false,
         }
     }
@@ -465,8 +461,16 @@ impl HwClass {
     /// A discovered DMA-capable controller needs a physically-contiguous DMA arena.
     fn needs_dma(self) -> bool {
         // The framebuffer is not a DMA master - the display scans it, this service only writes it - so
-        // it gets a window and no arena. Everything else that is `found()` DMAs.
-        self != HwClass::None && self != HwClass::Framebuffer && self.found()
+        // it gets a window and no arena. The test interrupt is not a device at all: it only needs a
+        // vector routed to an endpoint. Everything else that is `found()` DMAs.
+        //
+        // TestIrq was caught here rather than reasoned out: `found()` is `true` for it (the kernel
+        // raises the vector itself), so it fell through and `probe-11a` was handed a 64 KiB arena
+        // whose permanent physical reservation is the one `dma_phys_slot` gives unclassified
+        // callers - `XHCI_DMA_PHYS`, the REAL xHCI driver's. A test probe aliasing a driver's DMA
+        // region, on a machine that has both. Every suite passed while it did.
+        self != HwClass::None && self != HwClass::Framebuffer && self != HwClass::TestIrq
+            && self.found()
     }
     /// Arena size: xHCI needs room for its 256-buffer scratchpad; every other driver gets 64 KiB.
     fn dma_pages(self) -> u64 { if self == HwClass::Xhci { XHCI_DMA_PAGES } else { EHCI_DMA_PAGES } }
@@ -478,10 +482,12 @@ impl HwClass {
             HwClass::Ehci => &EHCI_DMA_PHYS,
             HwClass::Ahci => &AHCI_DMA_PHYS,
             HwClass::Nic  => &NIC_DMA_PHYS,
-            // Neither DMAs, so neither ever reaches here - `needs_dma()` gates every caller. They
+            // None of these DMA, so none ever reaches here - `needs_dma()` gates every caller. They
             // return a real slot rather than panicking because an unreachable arm that aborts is a
-            // crash waiting for a refactor, and a wrong-but-unused reservation is not.
-            HwClass::None | HwClass::Framebuffer => &XHCI_DMA_PHYS,
+            // crash waiting for a refactor, and a wrong-but-unused reservation is not. It must STAY
+            // unused: this hands back the xHCI driver's own reservation, so a class that reached here
+            // by accident would alias it (TestIrq did, until `needs_dma` was corrected).
+            HwClass::None | HwClass::Framebuffer | HwClass::TestIrq => &XHCI_DMA_PHYS,
         }
     }
     /// Confine this DMA-capable driver via the IOMMU? Only xHCI qualifies today (§6.4; ehci + block-driver
@@ -494,6 +500,7 @@ impl HwClass {
         match self {
             HwClass::Dwc2 => 0xFFFF, // no PCI on this board, so no bus-master enable to perform
             HwClass::Framebuffer => 0xFFFF, // not a PCI device
+            HwClass::TestIrq     => 0xFFFF, // not a device at all - a software-raised vector
             HwClass::Xhci => pci::XHCI_BDF.load(Relaxed),
             HwClass::Ehci => pci::EHCI_BDF.load(Relaxed),
             HwClass::Ahci => pci::AHCI_BDF.load(Relaxed),
@@ -524,7 +531,7 @@ pub const EHCI_CORE: u32 = 3;
 /// An UNKNOWN class is refused rather than treated as none: a spawner asking for a device this kernel
 /// cannot grant must hear so, not receive a driver with no MMIO window that enumerates nothing and
 /// reports no error (invariant 12).
-pub fn hw_class_known(class: u32) -> bool { class <= 6 }
+pub fn hw_class_known(class: u32) -> bool { class <= 7 }
 
 /// Resolve a spawn request's device class to the kernel's own scan results.
 fn hw_class_of(class: u32) -> HwClass {
@@ -535,6 +542,7 @@ fn hw_class_of(class: u32) -> HwClass {
         4 => HwClass::Ehci,
         5 => HwClass::Dwc2,
         6 => HwClass::Framebuffer,
+        7 => HwClass::TestIrq,
         _ => HwClass::None,
     }
 }
@@ -566,6 +574,11 @@ fn hw_irqs_for(class: HwClass) -> &'static [u8] {
         HwClass::Nic  => &[0x2A],
         #[cfg(not(target_arch = "aarch64"))]
         HwClass::Nic  => &[],
+        // The SOFTWARE test interrupt (§22 IR1): `control` raises vector 33 with FireIrq and the
+        // kernel must route it to the registered driver's endpoint. It is a vector like any other -
+        // the caller names the class and the kernel states the number - which is what lets the probe
+        // that receives it stop being a kernel-known name.
+        HwClass::TestIrq => &[33],
         HwClass::Ahci | HwClass::Framebuffer | HwClass::None => &[],
     }
 }
@@ -708,11 +721,11 @@ struct Privileges {
     set_clock_floor: bool, // SET_CLOCK (READ): raise the persisted clock floor only (the shell)
 }
 
-fn service_privileges(name: &str, is_probe: bool) -> Privileges {
+fn service_privileges(name: &str) -> Privileges {
     Privileges {
         // supervisor is the spawner (init removed, Phase 5); the shell brokers spawns; chaos spawns
         // mem-pressure tasks for max-carnage's spawn-burst dimension; probes spawn victims.
-        spawn: is_probe || matches!(name, "supervisor"),
+        spawn: matches!(name, "supervisor"),
         // Both USB host drivers push decoded keystrokes: xhci (front ports), ehci (USB 2.0 back ports).
         // `dwc2` is the arm32 USB keyboard driver, so it needs this for the same reason `xhci` and
         // `ehci` do. Its absence was the whole of "the keyboard does not work": the transfers were
@@ -725,27 +738,20 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // driver and is why the grant is enumerated here by name rather than implied by holding a
         // USB controller.
         console_push: matches!(name, "xhci" | "ehci" | "dwc2"),
-        // shell + observe use TaskStat/InspectKernel; supervisor's reconcile loop scans real liveness;
-        // chaos does victim selection; the prop-/stress- probes query victim generations.
-        // EXACT names, not a prefix. `name.starts_with("observe")` granted INTROSPECT to anything
-        // whose name began with those letters - harmless while the kernel owned every name, and a
-        // privilege obtainable by CHOOSING A STRING once a caller supplies them (step C). The
-        // `observe*` trio is now enumerated; when they move, the bit comes in the spawn request and
-        // these names leave too.
+        // THE PREFIX HOLE IS CLOSED. This used to read
+        //     `matches!(name, "supervisor") || name.starts_with("prop-") || name.starts_with("stress-")`
+        // and was recorded here as a known one (26.7): probe names are caller-supplied, so a service
+        // holding a spawn cap could obtain INTROSPECT BY CHOOSING A STRING. The fix named in that note
+        // - "carry a privilege word like `SpawnImage` does, checked against what the CALLER may
+        // delegate" - is what moving the probe image did. The prop-/stress- drivers get INTROSPECT
+        // from `probes::privileges_of` in the supervisor's request now, and adv-a11 still gets none,
+        // so the test whose subject is a probe WITHOUT the cap keeps its subject.
         //
-        // The `prop-`/`stress-` prefixes remain and are a KNOWN HOLE, recorded rather than papered
-        // over (26.7): probe names ARE caller-supplied since step A, so a service holding a spawn cap
-        // can spawn a probe named `prop-x` and receive INTROSPECT. Narrow - the caller gets the fixed
-        // probe binary running a fixed test mode, not arbitrary code - but it is authority obtained
-        // by choosing a string. It cannot simply become `is_probe`: adv-a11 asserts that a probe
-        // WITHOUT INTROSPECT is denied, so widening it to every probe would delete that test's
-        // subject. The real fix is for `spawn_probe` to carry a privilege word like `SpawnImage`
-        // does, checked against what the CALLER may delegate. See docs/service-ownership.md.
-        introspect: matches!(name, "supervisor")
-            || name.starts_with("prop-") || name.starts_with("stress-"),
+        // Only the supervisor is left, because only the supervisor is still spawned by name.
+        introspect: matches!(name, "supervisor"),
         // shell (interactive broker), supervisor (restart authority), chaos (the point of max-carnage),
         // and every probe (they kill victims to exercise kill/revocation).
-        service_control: is_probe || matches!(name, "supervisor"),
+        service_control: matches!(name, "supervisor"),
         // SEC-2: REBOOT lives ONLY with the shell (its `reboot` command); the USB drivers no longer
         // hold it. A keyboard driver can synthesize any keystroke (the console's inherent trust, §6.4),
         // but it must not ALSO be able to hard-reset the machine directly from any context.
@@ -757,7 +763,7 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // flooding, pipe sinks), supervisor (reconcile-by-name), probes. `adv-a13` is the §22 Test A13
         // NEGATIVE pin - deliberately excluded so it holds no ACQUIRE_ANY (proves AcquireSendCap denies
         // a non-holder). Ordinary services get none; their AcquireSendCap is limited to declared peers.
-        acquire_any: (is_probe && name != "adv-a13") || matches!(name, "supervisor"),
+        acquire_any: matches!(name, "supervisor"),
         // NET_DEVICE, GPIO_DEVICE, USB_DISK and SET_CLOCK are SANCTIONED KERNEL-ONLY BY-NAME GRANTS (the U15 / userspace-audit
         // A5-U1 doctrine): they are deliberately NOT contract capabilities - the kernel is their single
         // source of truth, and `contract_check.py` does not reconcile them. Both are arch-gated to ARM
@@ -843,27 +849,9 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // ----------------------------------------------------------------
-        // Adversarial-test probes - Milestone 13.
-        // Victim/passive services must be listed before their attackers so
-        // their endpoints are registered when the attacker's SEND caps are wired.
-        // ----------------------------------------------------------------
-        // A1: random cap slots → always Err. No caps needed.
-        // THE ONE PROBE ENTRY. 193 rows used to sit here, the same binary differing by a test mode -
-        // one program and a table of parameters. The parameters now come from the spawner
-        // (`spawn_probe`, `docs/probe-params-design.md`); this holds only what never varied: the
-        // image, and the defaults a caller may leave unset.
-        "probe" => Some(("probe", ServiceConfig {
-            elf:               PROBE_ELF,
-            has_recv_endpoint: false,      // per-spawn: ProbeParams.has_recv_endpoint
-            send_peers:        &[],        // per-spawn: the peer list in the spawn payload
-            send_peers_grant:  false,      // AUTHORITY: `probe_authority`, keyed by name
-            preferred_core:    u32::MAX,   // per-spawn: the core argument
-            probe_mode:        0,          // per-spawn: ProbeParams.mode
-            memory_limit:      64 * 1024 * 1024, // per-spawn override: ProbeParams.mem_mib
-            hw_irqs:           &[],        // AUTHORITY: `probe_authority`, keyed by name
-            has_console_read:  false,
-        })),
+        // The probe entry is GONE with the rest: the supervisor holds the test image and supplies
+        // every parameter, privilege and authority in the spawn request. `supervisor` is the only
+        // service the kernel still bootstraps, because nothing is beneath it.
         _ => None,
     }
 }
@@ -980,6 +968,8 @@ pub fn spawn_from_image(
     // `hw_irqs_for` rather than named by the caller - see that function for why a vector is
     // authority. `SpawnImage` refuses a request that tries to name one.
     hw_class:          u32,
+    // Mint the name-wired peer caps with GRANT so the child may re-delegate them (§22 Test 5A).
+    peers_grant:       bool,
 ) -> Result<Option<EndpointId>, SpawnError> {
     if service_config(name).is_some() {
         crate::kprintln!("task: SpawnImage '{}' rejected: that name belongs to the kernel catalogue", name);
@@ -993,15 +983,9 @@ pub fn spawn_from_image(
     let core_id = resolve_spawn_core(core_override, core_preferred)?;
     let mem = if memory_limit == 0 { 64 * 1024 * 1024 } else { memory_limit };
 
-    // Reserve BEFORE doing any work, not after success. The name belongs to a supervisor-authored
-    // service from the moment the supervisor asks for it, and reserving on the way out would leave a
-    // window - however small - in which a caller-named probe could take it. A spawn that then FAILS
-    // still holds its name, which is correct: it is a real service's name either way.
-    crate::ipc::names::reserve(name);
-
     let hw = hw_class_of(hw_class);
     let result = spawn_service_with_image(name, image, core_id, has_recv_endpoint, peers, mode,
-                                          false, mem, hw_irqs_for(hw), has_console_read,
+                                          peers_grant, mem, hw_irqs_for(hw), has_console_read,
                                           Some(privileges), Some(hw), installs);
     if let Err(ref e) = result {
         crate::kprintln!("task: SpawnImage '{}' failed: {:?}", name, e);
@@ -1009,98 +993,18 @@ pub fn spawn_from_image(
     result
 }
 
-/// Parameters a SPAWNER supplies for a probe, instead of the kernel holding a row per probe.
+/// Spawn the one service the kernel still bootstraps, from the one row it still holds.
 ///
-/// 193 of the kernel's 221 `service_config` entries are the same `probe` binary differing by a test
-/// mode - one program and a table of test parameters, and a parameter is policy (26.10). These are
-/// the fields that actually varied; everything else was identical across all 193.
+/// This used to start 221 services. What remains is `supervisor`, because nothing is beneath it -
+/// every other image, parameter and privilege now belongs to the supervisor and arrives in a
+/// `SpawnImage` request (`docs/service-ownership.md`).
 ///
-/// What is NOT here is deliberate: `hw_irqs` and `send_peers_grant` stay keyed by name in the kernel,
-/// because routing an interrupt line and handing out a re-delegatable capability are AUTHORITY
-/// decisions, not settings. The line is: the kernel decides what a service may DO, the caller says
-/// what it IS. See `docs/probe-params-design.md`.
-#[derive(Clone, Copy)]
-pub struct ProbeParams {
-    pub mode:              u32,
-    pub has_recv_endpoint: bool,
-    /// Memory ceiling in MiB. 0 means "the probe default" (64 MiB).
-    pub mem_mib:           u32,
-}
-
-/// Spawn the probe binary under a CALLER-SUPPLIED name and parameters.
-///
-/// The name is owned by the task (`scheduler::set_task_name`), which is what makes this possible at
-/// all - see the commit that made task names bytes rather than literals.
-///
-/// `peers` are resolved through the kernel name directory exactly as a contract's `send_peers` are;
-/// the caller supplies the LIST, not the authority - each peer must already be registered, and an
-/// absent one is skipped with the same loud line as any other spawn.
-pub fn spawn_probe(name: &str, core_override: Option<u32>, p: ProbeParams, peers: &[&str])
-    -> Result<Option<EndpointId>, SpawnError>
-{
-    // The probe image and the fields that never varied come from ONE kernel entry.
-    let (_, cfg) = service_config("probe").ok_or(SpawnError::NotFound)?;
-
-    // A CALLER-SUPPLIED NAME MAY NOT BE A REAL SERVICE'S NAME.
-    //
-    // This is the one new authority the parameterised path creates, so it is closed here rather than
-    // left to convention. Before, `Spawn` could only start a service the kernel already knew, under
-    // the name the kernel gave it - name and binary were bound together. Now a SPAWN holder chooses
-    // the name, and every service holds a spawn cap (22 Test A9). Without this check, a compromised
-    // service could wait for `fs` to die and register the PROBE binary under the name `fs`; clients
-    // reacquiring by name (14.3) would then wire themselves to it. The name directory is a recovery
-    // anchor, and an anchor that can be squatted is not one.
-    //
-    // Refusing the whole real catalogue is deliberately blunter than refusing the live set: a name
-    // is dangerous precisely while its service is DEAD, which is when a liveness test would pass.
-    // A CALLER-SUPPLIED NAME MAY NOT BE A REAL SERVICE'S NAME - asked of BOTH places a real service
-    // can now come from. `service_config` covers what the kernel still bootstraps; `is_reserved`
-    // covers everything the SUPERVISOR spawns, which after step C is almost all of it. Asking only
-    // the catalogue left `fs`, `shell`, `logger` and the rest squattable the moment their images
-    // moved out of the kernel - see `ipc::names::reserve` for the attack and why a reservation must
-    // outlive the service.
-    if service_config(name).is_some() || crate::ipc::names::is_reserved(name) {
-        crate::kprintln!("task: spawn probe '{}' rejected: that is a real service's name", name);
-        return Err(SpawnError::NotFound);
-    }
-
-    if scheduler::find_task_by_name(name).is_some() {
-        crate::kprintln!("task: spawn '{}' rejected: already running", name);
-        return Err(SpawnError::AlreadyRunning);
-    }
-
-    let core_id = resolve_spawn_core(core_override, cfg.preferred_core)?;
-    let mem = if p.mem_mib == 0 { cfg.memory_limit } else { (p.mem_mib as u64) * 1024 * 1024 };
-
-    // AUTHORITY STAYS WITH THE KERNEL. A probe that needs an IRQ line routed to it, or peer caps that
-    // carry GRANT, is asking for something the caller may not simply assert - so those two are looked
-    // up by name here rather than taken from the parameters.
-    let (hw_irqs, grant) = probe_authority(name);
-
-    let result = spawn_service_with_image(name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
-                              p.has_recv_endpoint, peers, p.mode,
-                              grant, mem, hw_irqs,
-                              false, None, None, None);
-    if let Err(ref e) = result {
-        crate::kprintln!("task: spawn probe '{}' failed: {:?}", name, e);
-    }
-    result
-}
-
-/// The two probes whose configuration is AUTHORITY rather than parameter, kept in the kernel.
-///
-/// `probe-11a` needs IRQ 33 routed to its endpoint (12.3) - routing a hardware interrupt line to a
-/// service is a grant. `probe-5a-send` needs its peer caps minted with GRANT so it can re-delegate
-/// them (22 Test 5A) - handing out a re-delegatable capability is a grant too. Everything else about
-/// all 193 probes is a parameter, and parameters come from the caller.
-fn probe_authority(name: &str) -> (&'static [u8], bool) {
-    match name {
-        "probe-11a"     => (&[33], false),
-        "probe-5a-send" => (&[],   true),
-        _               => (&[],   false),
-    }
-}
-
+/// The last two things to leave were AUTHORITY rather than settings, and are worth recording because
+/// the split they forced is now resolved: a probe's IRQ route and its grantable peer caps were kept
+/// keyed by name here, on the rule "the kernel decides what a service may DO, the caller says what it
+/// IS". Both now travel in the request without weakening that rule - the IRQ as a device CLASS whose
+/// vector the kernel still chooses (`hw_irqs_for`), the grant as a flag checked like any privilege.
+/// The caller still cannot assert an authority; it can only name one the kernel already understood.
 pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<Option<EndpointId>, SpawnError> {
     let (static_name, cfg) = service_config(name).ok_or(SpawnError::NotFound)?;
 
@@ -1122,8 +1026,6 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<O
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
                               cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
                               cfg.has_console_read, None, None, None);
-    // As on the image path: a real service's name is not available to a caller-named probe.
-    if result.is_ok() { crate::ipc::names::reserve(static_name); }
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn '{}' failed: {:?}", name, e);
     }
@@ -1308,16 +1210,15 @@ fn spawn_service_with_image(
     // Previously every service got this unconditionally ("spawn authority, every
     // service in v1") - a system-wide blast-radius widening this closes. Capture the
     // slot (u32::MAX when not granted); the SDK already treats MAX as "not held".
-    // All six non-hardware authorities below come from the ONE `service_privileges` table (audit U15),
-    // not a re-derived `name ==` check per grant. `is_probe` covers the whole test-probe family by ELF
-    // identity so no probe is missed by name.
-    // A caller-supplied image is never the probe: `is_probe` exists to give the whole test-probe
-    // family its privileges by ELF identity rather than a re-derived `name ==` check, and only the
-    // kernel's own rodata has an identity to compare.
-    let is_probe = match image {
-        crate::loader::ImageSource::Kernel(b) => core::ptr::eq(b.as_ptr(), PROBE_ELF.as_ptr()),
-        crate::loader::ImageSource::User { .. } => false,
-    };
+    // The non-hardware authorities come from the ONE `service_privileges` table (audit U15), not a
+    // re-derived `name ==` check per grant.
+    //
+    // `is_probe` is GONE with the probe image. It compared the spawning ELF against the kernel's own
+    // `PROBE_ELF` rodata to give the whole test-probe family its privileges by identity rather than
+    // by name - which only worked while the kernel HELD that image. The probes' privileges now
+    // travel in the spawn request like every other service's (`probes::privileges_of`), checked
+    // against what the supervisor may delegate, which is what the `prop-`/`stress-` prefix hole
+    // recorded below always needed.
     let privs = match priv_override {
         // The spawner named them. Every bit was checked against the CALLER's own holdings before we
         // got here, so this cannot escalate - it can only pass on what the spawner already has.
@@ -1344,7 +1245,7 @@ fn spawn_service_with_image(
             // test, so the resource still exists and simply has no holder.
             usb_disk:        false,
         },
-        None => service_privileges(name, is_probe),
+        None => service_privileges(name),
     };
 
     let mut spawn_slot_u32 = u32::MAX;

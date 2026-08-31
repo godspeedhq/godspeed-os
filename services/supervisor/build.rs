@@ -32,6 +32,11 @@ fn main() {
     // directory by an earlier ARM-era build. The guard only fires when a file is missing, and a stale
     // file is not missing - so a supervisor would have shipped an image nothing rebuilds. Embedding
     // only what this arch actually runs removes the question.
+    // The probe image is TEST TOOLING and is embedded only where a harness can run it (§4.4). A
+    // bare-metal image ships no adversary - see `PROBE_ELF` in main.rs.
+    let bare_metal = std::env::var("CARGO_FEATURE_BARE_METAL").is_ok();
+    let probe: &[&str] = if bare_metal { &[] } else { &["probe"] };
+
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let usb: &[&str] = match arch.as_str() {
         "x86_64"  => &["xhci", "ehci"],
@@ -46,7 +51,7 @@ fn main() {
     let target_dir = std::path::Path::new(&out)
         .ancestors().nth(3).expect("OUT_DIR shallower than expected").to_path_buf();
 
-    for name in EMBEDDED.iter().chain(usb.iter()) {
+    for name in EMBEDDED.iter().chain(usb.iter()).chain(probe.iter()) {
         let elf = target_dir.join(name);
         // LOUD, not a fallback (invariant 12). An embedded image that silently resolved to nothing
         // would produce a supervisor that cannot start the service, failing far from the cause.

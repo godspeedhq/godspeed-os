@@ -74,7 +74,78 @@
 // The probe parameter table - shared by source with the `supervisor`, the other spawner.
 mod table;
 
-use godspeed_sdk::{adversarial, service_context::{AllocError, ProbeSpec}, CapError, CapHandle, IpcError, Message, ServiceContext};
+/// Start one probe from its table row - the PROBE's half of `table::probe`.
+///
+/// A probe respawning its own victim (a restart test has to) does not hold the probe IMAGE: it moved
+/// to the supervisor, which is the spawn authority anyway. So it ASKS.
+///
+/// ONE-WAY, and that is forced rather than chosen. Every driver probe in the table is `recv = false`
+/// - none of them has an endpoint - so a request/reply has nowhere for the reply to land. Routing
+/// this through `spawn_via_supervisor` therefore failed on the FIRST respawn, not under load, which
+/// is what §22 P5/P7 and the stress restart storms caught.
+///
+/// So the confirmation waits on TRUTH instead of on a reply (Commandment VIII): every victim in the
+/// table has a recv endpoint, so it REGISTERS ITS NAME when it starts, and the name resolving again
+/// is the spawn having happened. The kill that preceded it unregistered that name, so this cannot
+/// see the previous instance.
+///
+/// The bound is a poll COUNT, not a duration, and that is a real limitation (a count means a
+/// different wall time on every machine). It is bounded and LOUD either way - a victim that never
+/// appears returns Err and says so, rather than a test hanging or, worse, quietly proceeding without
+/// its subject.
+pub fn spawn_probe_row(ctx: &ServiceContext, r: table::Row) -> Result<(), godspeed_sdk::Error> {
+    let (name, _mode, _recv, _mem, core, peers) = r;
+    let mut buf = [0u8; godspeed_sdk::service_context::supcmd::MAX];
+    let n = godspeed_sdk::service_context::supcmd::encode(
+        &mut buf, godspeed_sdk::service_context::supcmd::SPAWN,
+        core.unwrap_or(u32::MAX), name, peers)
+        .ok_or(godspeed_sdk::Error::InvalidArgument)?;
+    let msg = Message::from_bytes(&buf[..n]);
+
+    // TRY_SEND, NEVER A BLOCKING SEND (§8.9). Every probe respawn in the suite now funnels through
+    // the supervisor's one 16-deep queue - `stress-bs5` alone asks for 5,000 - so that queue is full
+    // for long stretches. A blocking send there does not slow a probe down, it removes it: `chaos-c7`
+    // sent one request behind thousands and was never heard from again, silent until the harness
+    // timed the whole test out. Retrying around a full queue lets a starved caller interleave.
+    //
+    // The supervisor is restartable (§6.2), so a cached cap to it goes stale on every respawn:
+    // reacquire by name and retry, exactly as `spawn_via_supervisor` does.
+    let mut sent = false;
+    for attempt in 0..20_000 {
+        match ctx.try_send("supervisor", &msg) {
+            Ok(())  => { sent = true; break; }
+            Err(_) => {
+                // Distinguish "queue full, wait" from "peer gone, reacquire": a stale cap never
+                // drains, so retrying it forever would hang exactly as the blocking send did.
+                if attempt % 256 == 255 { let _ = ctx.reacquire_by_name("supervisor"); }
+                ctx.yield_cpu();
+            }
+        }
+    }
+    if !sent {
+        ctx.log_fmt(format_args!("probe: cannot reach the supervisor to spawn '{}'", name));
+        return Err(godspeed_sdk::Error::InvalidArgument);
+    }
+
+    // Poll in BATCHES. Checking on every yield meant two syscalls (mint a cap, drop it) per
+    // iteration - up to 40,000 per respawn, and `stress-bs5` does 5,000 respawns. That churn is not
+    // free: it showed up as a rising rate of GARBLED SERIAL LINES, because more cross-core syscall
+    // traffic means more chance of interleaving mid-`kprintln`, and a test whose pass string arrives
+    // as "adv:? A7 pas" fails on a system that behaved correctly.
+    for _ in 0..1_000 {
+        if let Some(c) = ctx.acquire_send_grant_cap(name) {
+            // Reclaim it: this is a liveness probe, not a peer we intend to keep, and a cap left
+            // behind on every respawn would fill the table over a 100k-cycle restart storm (§26.6).
+            ctx.remove_cap(c);
+            return Ok(());
+        }
+        for _ in 0..32 { ctx.yield_cpu(); }
+    }
+    ctx.log_fmt(format_args!("probe: '{}' never registered after a spawn request", name));
+    Err(godspeed_sdk::Error::InvalidArgument)
+}
+
+use godspeed_sdk::{adversarial, service_context::AllocError, CapError, CapHandle, IpcError, Message, ServiceContext};
 
 #[allow(dead_code)]
 const MODE_PASSIVE:         u32 = 0;
@@ -1814,36 +1885,25 @@ fn mode_adv_a9(ctx: &ServiceContext) -> ! {
         Ok(()) => ctx.log("adv: A9 FAIL - unexpected spawn success for unknown service"),
     }
 
-    // A9b - NAME SQUATTING. The parameterised probe path lets a SPAWN holder choose the NAME of the
-    // task it starts, so it must not be able to choose a REAL service's name. The attack is not
-    // hypothetical: the kernel name directory is the recovery anchor clients reacquire through
-    // (14.3), so a probe registered as `fs` while the real `fs` is dead collects its clients.
+    // A9b - NAME SQUATTING, now structurally impossible rather than merely refused.
     //
-    // This ALSO guards a regression that already happened once. The kernel used to answer "is this a
-    // real service's name?" from its service catalogue - and step C moved that catalogue to the
-    // supervisor, emptying it, which silently reduced the refusal set to `{supervisor, probe}`. The
-    // names below are exactly the ones that became squattable, so this test fails if the reservation
-    // is ever lost again.
+    // The parameterised probe path used to let a SPAWN holder choose the NAME of the task it started
+    // while the KERNEL supplied the probe image, so a caller could bind ANY name to that binary. That
+    // mattered because the kernel name directory is the recovery anchor clients reacquire through
+    // (§14.3): a probe registered as `fs` collects `fs`'s clients while the real `fs` is dead, and a
+    // liveness check passes in exactly that window.
     //
-    // A probe holds SPAWN, so the syscall is authorised and only the NAME check can refuse it.
-    //
-    // THE VICTIMS HERE ARE ALL SPAWNED BEFORE ANY PROBE, DELIBERATELY, and that limit is the finding
-    // rather than a convenience. A name is reserved when the supervisor SPAWNS it, so a service that
-    // has not started yet is not yet protected - and `fs` and `shell` start AFTER the probes in this
-    // build, so squatting either of them still SUCCEEDS today. That is a real residual window, not a
-    // test artifact; it is recorded in docs/service-ownership.md 10 rather than asserted here,
-    // because a test that always fails stops being read. Closing it needs the supervisor to reserve
-    // its whole managed set up front, which it currently has no way to say.
-    let mut squats = 0;
-    for victim in ["logger", "console", "supervisor"] {
-        match ctx.spawn_probe(victim, None, ProbeSpec { mode: 0, has_recv_endpoint: false, mem_mib: 4 }, &[]) {
-            Err(_) => squats += 1,
-            Ok(())  => ctx.log_fmt(format_args!(
-                "adv: A9 FAIL - squatted the real service name '{}'", victim)),
-        }
+    // Moving the image to the supervisor removed the free parameter. A name no longer CARRIES an
+    // image - it SELECTS a table row - so a real service's name simply is not a probe name, and an
+    // unknown one is refused outright. This asserts that directly: neither a live service's name nor
+    // an invented one can be started as a probe.
+    let mut refused = 0;
+    for victim in ["fs", "logger", "shell", "console", "supervisor", "not-a-real-probe"] {
+        if table::probe(ctx, victim).is_err() { refused += 1; }
+        else { ctx.log_fmt(format_args!("adv: A9 FAIL - started '{}' as a probe", victim)); }
     }
-    if squats == 3 {
-        ctx.log("adv: A9b pass - 3 already-running service names refused to a caller-named probe");
+    if refused == 6 {
+        ctx.log("adv: A9b pass - 6 non-probe names refused; a name selects a row, not an image");
     }
     idle(ctx)
 }

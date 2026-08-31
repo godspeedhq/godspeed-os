@@ -830,6 +830,8 @@ const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
 /// `core` is a STRICT placement (a restart's `--core N`), not a table's PREFERRED core. See §9.2 and
 /// the SDK constant of the same name for why conflating the two stops a machine booting.
 const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
+/// Mint the child's peer caps with GRANT (§22 Test 5A). See the SDK constant.
+const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
 
 fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     // The SPAWN capability gates this exactly as it gates `Spawn` (3.1): supplying an image does not
@@ -1015,6 +1017,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         req.privileges,
         req.probe_mode,
         req.hw_flags,
+        req.flags & SPAWN_FLAG_PEERS_GRANT != 0,
     ) {
         // Hand back a SEND|GRANT cap to the new endpoint, as `SpawnReturningEndpoint` does: the
         // spawner has to be able to record `name -> cap` for the service it just started, or it
@@ -1061,31 +1064,10 @@ fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
         Err(_) => return -1,
     };
 
-    if packed_arg0 & SPAWN_FLAG_IS_PROBE != 0 {
-        // `name\0peer\0peer`. The caller supplies the peer LIST; each name still has to resolve
-        // through the kernel name directory, so this grants nothing that a contract's `send_peers`
-        // would not have.
-        let mut parts = payload.split('\0');
-        let name = match parts.next() { Some(n) if !n.is_empty() => n, _ => return -1 };
-        let mut peers: [&str; crate::task::MAX_SEND_PEERS] = [""; crate::task::MAX_SEND_PEERS];
-        let mut np = 0usize;
-        for p in parts {
-            if p.is_empty() { continue; }
-            if np >= crate::task::MAX_SEND_PEERS { return -1; }   // loud refusal, never a silent drop
-            peers[np] = p;
-            np += 1;
-        }
-        let params = crate::task::ProbeParams {
-            mode:              ((packed_arg0 >> 32) & 0xFFFF) as u32,
-            has_recv_endpoint: packed_arg0 & SPAWN_FLAG_HAS_RECV  != 0,
-            mem_mib:           if packed_arg0 & SPAWN_FLAG_SMALL_MEM != 0 { 4 } else { 0 },
-        };
-        return match crate::task::spawn_probe(name, core_override, params, &peers[..np]) {
-            Ok(_)  => 0,
-            Err(_) => -1,
-        };
-    }
-
+    // THE PROBE PATH IS GONE. `Spawn` used to carry a test probe's parameters packed into the
+    // unused upper bits of `arg0` - the kernel supplying the image and looking its two authorities up
+    // by name. The image moved to the supervisor, so there is nothing here to spawn: a probe is now
+    // an ordinary `SpawnImage`, and a probe that needs a victim asks the supervisor for one.
     match crate::task::spawn_service_by_name(payload, core_override) {
         Ok(_)  => 0,
         Err(_) => -1,

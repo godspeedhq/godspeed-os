@@ -24,7 +24,7 @@
 //!
 //! See `docs/probe-params-design.md`.
 
-use godspeed_sdk::service_context::{ProbeSpec, ServiceContext};
+use godspeed_sdk::service_context::{privbits, ServiceContext};
 
 /// `(name, mode, has_recv_endpoint, memory MiB - 0 = default, core, send peers)`
 const PROBES: &[(&str, u32, bool, u32, Option<u32>, &[&str])] = &[
@@ -223,16 +223,66 @@ const PROBES: &[(&str, u32, bool, u32, Option<u32>, &[&str])] = &[
     ("xsend-recv", 201, true, 0, Some(2), &[]),
 ];
 
+/// One probe's parameters: `(name, mode, has_recv_endpoint, memory MiB, core, send peers)`.
+pub type Row = (&'static str, u32, bool, u32, Option<u32>, &'static [&'static str]);
+
+/// The row for `name`, or `None`.
+pub fn row(name: &str) -> Option<Row> {
+    PROBES.iter().copied().find(|&(n, ..)| n == name)
+}
+
+/// The privileges a probe is spawned with.
+///
+/// These used to be derived INSIDE THE KERNEL from the task's name - `is_probe` (an ELF-pointer
+/// comparison) plus two name tests. That was workable while the kernel owned every name, and became
+/// a hole once callers supplied them: `service_privileges` granted INTROSPECT to anything whose name
+/// began `prop-` or `stress-`, so a SPAWN holder could obtain the privilege BY CHOOSING A STRING.
+/// The kernel's own comment named the fix - "carry a privilege word like `SpawnImage` does, checked
+/// against what the CALLER may delegate" - and this is it. The rule is unchanged; what changed is WHO
+/// states it (the spawner, explicitly) and that the kernel now CHECKS it against the supervisor's own
+/// holdings instead of inferring it from a string.
+pub fn privileges_of(name: &str) -> u32 {
+    // Every probe kills victims to exercise kill/revocation, and spawns them to begin with.
+    let mut p = privbits::SPAWN | privbits::SERVICE_CONTROL;
+    // adv-a13 is the §22 Test A13 NEGATIVE pin: it must hold NO ACQUIRE_ANY, so that
+    // AcquireSendCap can be shown to deny a non-holder. Excluding it here is the test's subject.
+    if name != "adv-a13" { p |= privbits::ACQUIRE_ANY; }
+    // The property/stress drivers read their victims' generations. adv-a11 must NOT have this - it
+    // asserts that a probe WITHOUT INTROSPECT is denied - which is why this cannot be "every probe".
+    if name.starts_with("prop-") || name.starts_with("stress-") { p |= privbits::INTROSPECT; }
+    p
+}
+
+/// The device class a probe drives, if any.
+///
+/// `probe-11a` receives the software test interrupt (§22 IR1). Routing a vector is AUTHORITY, so the
+/// probe names a CLASS and the kernel supplies the number it assigned - the same rule every driver
+/// follows, which is what let this stop being a name the kernel had to know.
+pub fn hw_class_of(name: &str) -> u32 {
+    if name == "probe-11a" { godspeed_sdk::service_context::hwclass::TEST_IRQ } else { 0 }
+}
+
+/// Does this probe need its peer caps minted WITH `GRANT`?
+///
+/// `probe-5a-send` re-delegates a cap it was given (§22 Test 5A), which is the whole of that test.
+/// Handing out a re-delegatable capability is itself a grant, so this is authority too - carried as
+/// a spawn FLAG now rather than a name the kernel keeps.
+pub fn peers_grant_of(name: &str) -> bool { name == "probe-5a-send" }
+
 /// Spawn a probe by name, supplying its parameters from the table above.
 ///
 /// Loud on a name that is not in the table (invariant 12): a probe that silently did not run would
 /// read as a passing test suite, which is the worst possible failure here.
+///
+/// HOW it starts is the caller's business, because the two principals that spawn probes differ in
+/// what they hold. The `supervisor` holds the probe IMAGE and starts it directly; a probe respawning
+/// its own victim does not, and asks the supervisor. Each crate supplies `spawn_probe_row`.
 pub fn probe(ctx: &ServiceContext, name: &str) -> Result<(), godspeed_sdk::Error> {
-    for &(n, mode, recv, mem_mib, core, peers) in PROBES {
-        if n == name {
-            return ctx.spawn_probe(name, core, ProbeSpec { mode, has_recv_endpoint: recv, mem_mib }, peers);
+    match row(name) {
+        Some(r) => crate::spawn_probe_row(ctx, r),
+        None => {
+            ctx.log_fmt(format_args!("probe-table: no probe named '{}' - not spawned", name));
+            Err(godspeed_sdk::Error::InvalidArgument)
         }
     }
-    ctx.log_fmt(format_args!("probe-table: no probe named '{}' - not spawned", name));
-    Err(godspeed_sdk::Error::InvalidArgument)
 }
