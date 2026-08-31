@@ -827,6 +827,9 @@ impl SpawnRequest {
 const SPAWN_REQUEST_VERSION:  u32 = 3;
 const SPAWN_FLAG_REQ_RECV:    u32 = 1 << 0;
 const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
+/// `core` is a STRICT placement (a restart's `--core N`), not a table's PREFERRED core. See §9.2 and
+/// the SDK constant of the same name for why conflating the two stops a machine booting.
+const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
 
 fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     // The SPAWN capability gates this exactly as it gates `Spawn` (3.1): supplying an image does not
@@ -839,11 +842,21 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
 
-    if req_len as usize != SPAWN_REQUEST_BYTES { return -1; }
+    if req_len as usize != SPAWN_REQUEST_BYTES {
+        crate::kprintln!("task: SpawnImage refused - request is {} bytes (kernel expects {})",
+            req_len, SPAWN_REQUEST_BYTES);
+        return -1;
+    }
     // ONE fetch. Every decision below is taken from this copy, so the caller cannot rewrite a field
     // between its validation and its use - the same double-fetch discipline the loader applies to
     // the ELF header window.
-    let raw = match read_user_bytes(req_ptr, req_len as usize) { Some(b) => b, None => return -1 };
+    let raw = match read_user_bytes(req_ptr, req_len as usize) {
+        Some(b) => b,
+        None => {
+            crate::kprintln!("task: SpawnImage refused - request buffer {:#x} not readable", req_ptr);
+            return -1;
+        }
+    };
     let req = SpawnRequest::decode(raw);
 
     if req.version != SPAWN_REQUEST_VERSION {
@@ -860,6 +873,16 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     // this kernel will not grant must hear so, not receive a task that silently lacks it and fails
     // somewhere unrelated. They stay refused because the kernel resolves addresses from the class -
     // see the field comment - and will keep doing so until the bus scan itself moves (step D).
+    // An INTERRUPT VECTOR is authority exactly as a physical address is (`task::hw_irqs_for`), and
+    // it was the one hardware field still passed through from the caller - so a spawner could name a
+    // vector it had no claim to while being refused the addresses beside it. Refused now: the kernel
+    // derives a driver's vectors from the device class it names.
+    if req.irq_count != 0 {
+        crate::kprintln!(
+            "task: SpawnImage refused - interrupt vectors are not honoured; name the device CLASS instead (irq_count={})",
+            req.irq_count);
+        return -1;
+    }
     if req.mmio_base != 0 || req.mmio_len != 0 || req.dma_pages != 0 || req.bdf != 0 {
         crate::kprintln!(
             "task: SpawnImage refused - raw hardware addresses are not honoured; name the device CLASS instead (mmio={:#x}+{:#x} dma_pages={} bdf={:#x})",
@@ -890,7 +913,10 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     }
 
     let name_len = req.name_len as usize;
-    if name_len == 0 || name_len > 64 { return -1; }
+    if name_len == 0 || name_len > 64 {
+        crate::kprintln!("task: SpawnImage refused - name length {} (must be 1..=64)", name_len);
+        return -1;
+    }
     let name_bytes = match read_user_bytes(req.name_ptr, name_len) { Some(b) => b, None => return -1 };
     let mut name_buf = [0u8; 64];
     name_buf[..name_len].copy_from_slice(name_bytes);
@@ -902,20 +928,36 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     let mut np = 0usize;
     let plen = req.peers_len as usize;
     if plen > 0 {
-        if plen > SPAWN_PAYLOAD_MAX { return -1; }
+        if plen > SPAWN_PAYLOAD_MAX {
+            crate::kprintln!("task: SpawnImage refused - peer payload {} bytes (max {})",
+                plen, SPAWN_PAYLOAD_MAX);
+            return -1;
+        }
         let pb = match read_user_bytes(req.peers_ptr, plen) { Some(b) => b, None => return -1 };
         peer_buf[..plen].copy_from_slice(pb);
         let ps = match core::str::from_utf8(&peer_buf[..plen]) { Ok(s) => s, Err(_) => return -1 };
         for part in ps.split('\0') {
             if part.is_empty() { continue; }
-            if np >= crate::task::MAX_SEND_PEERS { return -1; }
+            if np >= crate::task::MAX_SEND_PEERS {
+                crate::kprintln!("task: SpawnImage refused - more than {} peers",
+                    crate::task::MAX_SEND_PEERS);
+                return -1;
+            }
             peers[np] = part;
             np += 1;
         }
     }
 
-    if req.image_len == 0 || req.image_len > u32::MAX as u64 { return -1; }
-    let core_override = if req.core == u32::MAX { None } else { Some(req.core) };
+    if req.image_len == 0 || req.image_len > u32::MAX as u64 {
+        crate::kprintln!("task: SpawnImage refused - image length {}", req.image_len);
+        return -1;
+    }
+    // STRICT placement vs a PREFERENCE (9.2) - see `SPAWN_FLAG_CORE_STRICT`. A caller's explicit
+    // `--core N` must be honoured or rejected; a table's preferred core must fall back to
+    // round-robin so a machine with fewer ready cores still comes up (11.3).
+    let strict = req.flags & SPAWN_FLAG_CORE_STRICT != 0;
+    let core_override  = if req.core == u32::MAX || !strict { None } else { Some(req.core) };
+    let core_preferred = if req.core == u32::MAX || strict  { u32::MAX } else { req.core };
 
     // Caller-provided caps for the child's peers. Same encoding and the SAME AUTHORITY RULE as
     // `SpawnWithCaps`: the caller must already hold each cap WITH GRANT, so copying it into the child
@@ -925,7 +967,11 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     let mut installs = [InstallCap { name: [0u8; PEER_NAME_BYTES], name_len: 0, cap };
                         crate::task::MAX_SEND_PEERS];
     let ni = req.installs_count as usize;
-    if ni > crate::task::MAX_SEND_PEERS { return -1; }
+    if ni > crate::task::MAX_SEND_PEERS {
+        crate::kprintln!("task: SpawnImage refused - {} installs (max {})",
+            ni, crate::task::MAX_SEND_PEERS);
+        return -1;
+    }
     if ni > 0 {
         // Each entry is at least 1 + 1 + 2 bytes; the buffer is read once, like every other input.
         let ilen = ni * (2 + PEER_NAME_BYTES + 2);
@@ -960,6 +1006,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         name,
         crate::loader::ImageSource::User { base: req.image_ptr, len: req.image_len as usize },
         core_override,
+        core_preferred,
         req.memory_limit,
         req.flags & SPAWN_FLAG_REQ_RECV    != 0,
         req.flags & SPAWN_FLAG_REQ_CONSOLE != 0,
@@ -968,7 +1015,6 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         req.privileges,
         req.probe_mode,
         req.hw_flags,
-        &req.irqs[..(req.irq_count as usize).min(4)],
     ) {
         // Hand back a SEND|GRANT cap to the new endpoint, as `SpawnReturningEndpoint` does: the
         // spawner has to be able to record `name -> cap` for the service it just started, or it

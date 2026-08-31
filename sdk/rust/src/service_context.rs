@@ -269,6 +269,17 @@ pub struct SpawnRequest {
 pub const SPAWN_REQUEST_VERSION:  u32 = 3;
 pub const SPAWN_FLAG_REQ_RECV:    u32 = 1 << 0;
 pub const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
+/// `core` is a STRICT placement, not a preference.
+///
+/// The two are different rules (9.2) and the kernel has always had both: an explicitly-requested core
+/// (a restart's `--core N`) is REJECTED with `PlacementInvalid` when that core is not ready, because
+/// silently placing the service elsewhere would defeat the point of asking. A catalogue row's
+/// PREFERRED core falls back to round-robin instead, so a machine with fewer cores still boots.
+///
+/// Without this bit a moved service's table preference read as an override, and every service naming
+/// a core the machine does not have failed to spawn rather than degrading - `logger` and `xhci` (both
+/// core 2) simply vanished under `-smp 2`, which 11.3 requires to keep working.
+pub const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
 
 /// Bits for `SpawnRequest::privileges`. A spawner may only request what it HOLDS ITSELF - the kernel
 /// checks, and refuses otherwise - so this passes authority on, it never mints it (3.1, 7.3).
@@ -287,6 +298,8 @@ pub mod privbits {
     pub const SET_CLOCK_FLOOR: u32 = 1 << 9;
     /// SET_CLOCK with WRITE (set the wall clock). Distinct from SET_CLOCK_FLOOR, the READ right.
     pub const SET_CLOCK:       u32 = 1 << 10;
+    /// NET_DEVICE: move ethernet frames through the in-kernel network device (aarch64's GENET).
+    pub const NET_DEVICE:      u32 = 1 << 11;
 }
 
 /// Device classes a spawner can name in `SpawnRequest::hw_flags`. The kernel resolves the class to

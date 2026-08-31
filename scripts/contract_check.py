@@ -212,10 +212,26 @@ def parse_supervisor_images(name: str):
     # the peer list and ignore whatever follows. A parser that silently stops matching when a table
     # grows is the failure this check exists to prevent - it did fail loudly, which is why this is here.
     m = re.search(r'\(\s*"' + re.escape(name) + r'"\s*,\s*[A-Z0-9_]+_ELF\s*,\s*([^,]+),\s*([^,]+),'
-                  r'\s*([^,]+),\s*&\[([^\]]*)\]', src)
+                  r'\s*([^,]+),\s*(.{0,200})', src, re.DOTALL)
     if not m:
         return None
-    mem_expr, core_expr, peers_raw = m.group(2).strip(), m.group(3).strip(), m.group(4)
+    mem_expr, core_expr = m.group(2).strip(), m.group(3).strip()
+    # The peer list is either a plain `&[...]` or an ARCH-CONDITIONAL one:
+    #   `if cfg!(target_arch = "arm") { &["dwc2"] } else { &[] }`
+    # Take the FIRST list, which is the ARM branch. That is not arbitrary: it is exactly what
+    # `parse_kernel` does with the cfg'd `send_peers` it replaced (the `#[cfg(target_arch = "arm")]`
+    # line comes first in the kernel row), and it is what nic-driver.toml states - `ipc_send =
+    # ["dwc2"]`, with an ARM note explaining it. Reading the else branch here instead would silently
+    # change what this check MEANS as a service moves house, which is the one thing it exists to stop.
+    #
+    # It deliberately differs from `_core_of`, which takes the else branch: the .toml states the
+    # x86-intended CORE but the ARM peer list. That asymmetry is in how the contracts are written,
+    # not in the parser, so it is reproduced rather than corrected here.
+    tail = m.group(4)
+    lists = re.findall(r'&\[([^\]]*)\]', tail)
+    if not lists:
+        return None
+    peers_raw = lists[0]
     lm  = re.search(r'(\d+)\s*\*\s*1024\s*\*\s*1024', mem_expr)
     return {
         "limit": int(lm.group(1)) * 1024 * 1024 if lm else None,

@@ -539,15 +539,43 @@ fn hw_class_of(class: u32) -> HwClass {
     }
 }
 
+/// The interrupt vector(s) a device CLASS is served by, as THIS kernel routes them.
+///
+/// An IRQ vector is AUTHORITY, not a setting. Routing a vector to a task is what makes that task
+/// receive the device's interrupts - on ARM, granting the USB vector is precisely what takes the
+/// controller away from whoever held it. So a spawner able to NAME a vector could hand a service
+/// another device's interrupts, which is the ambient authority 3.1 forbids.
+///
+/// The supervisor therefore names a device CLASS and the kernel supplies the vector IT assigned, by
+/// the same rule and for the same reason as the MMIO window and the DMA arena (`SpawnImage` refuses
+/// those outright). The vector is a property of the device and of this kernel's own routing, so it
+/// is the kernel's to state - exactly the 26.14 question: a property of the device, not of the
+/// caller's design.
+fn hw_irqs_for(class: HwClass) -> &'static [u8] {
+    match class {
+        HwClass::Xhci => &[crate::arch::imp::interrupts::XHCI_MSI_VECTOR],
+        HwClass::Ehci => &[crate::arch::imp::interrupts::EHCI_MSI_VECTOR],
+        // The DWC2 is the ARM board's USB host; on any other arch there is no such controller.
+        #[cfg(target_arch = "arm")]
+        HwClass::Dwc2 => &[crate::arch::imp::irq::USB_VECTOR],
+        #[cfg(not(target_arch = "arm"))]
+        HwClass::Dwc2 => &[],
+        // GENET's macirq on aarch64 (SPI 157 -> neutral vector 0x2A). x86's nic-driver is a PCIe
+        // NIC with no such route, so the grant is arch-gated rather than unconditional.
+        #[cfg(target_arch = "aarch64")]
+        HwClass::Nic  => &[0x2A],
+        #[cfg(not(target_arch = "aarch64"))]
+        HwClass::Nic  => &[],
+        HwClass::Ahci | HwClass::Framebuffer | HwClass::None => &[],
+    }
+}
+
 fn service_hw(name: &str) -> (HwClass, bool) {
     match name {
-        "dwc2"                                 => (HwClass::Dwc2, false),
-        "xhci"                                 => (HwClass::Xhci, false),
-        "ehci"                                 => (HwClass::Ehci, false),
-        // `block-driver` and `console` moved to the supervisor (step C): each names its class in
-        // the spawn request (HwClass::Ahci, HwClass::Framebuffer) and the kernel resolves that to
-        // what its own scan found. The DISPLAY is a device like any other here.
-        "nic-driver" | "e1000"                 => (HwClass::Nic,  false),
+        // EVERY driver has moved to the supervisor (step C). Each names its device CLASS in the
+        // spawn request - Ahci, Framebuffer, Xhci, Ehci, Dwc2, Nic - and the kernel resolves that
+        // against its OWN bus scan, so the caller never names an address or an interrupt vector.
+        // Nothing is left to look up by name here.
         // `resource-server`, `fs` and `net-stack` all moved to the supervisor (step C): their
         // RESOURCE_MINT arrives in the spawn request, checked against what the SUPERVISOR may
         // delegate, instead of being granted here by name. Nothing is left in this arm.
@@ -590,11 +618,21 @@ pub mod privbits {
     /// from SET_CLOCK_FLOOR above, which is the same resource with READ - see the note there for why
     /// the split exists and must not be collapsed.
     pub const SET_CLOCK:       u32 = 1 << 10;
+    /// NET_DEVICE: move ethernet frames through the in-kernel network device (`NetFrame*`/`NetInfo`,
+    /// syscalls 42-44). Held by `nic-driver` on aarch64, where the Pi 4's GENET sits behind those
+    /// syscalls; on arm32 the USB-net device moved into the `dwc2` SERVICE, so the driver reaches
+    /// frames over IPC and needs nothing here.
+    ///
+    /// It gets a bit because `nic-driver`'s image moved to the supervisor, and a moved service must
+    /// still be able to receive an authority it genuinely uses. Without one the driver would come up,
+    /// look healthy, and have every frame call denied - a dead network with no error at spawn, which
+    /// is the failure shape this whole mechanism exists to prevent.
+    pub const NET_DEVICE:      u32 = 1 << 11;
     /// Every bit this kernel understands. Anything outside it is refused, so a newer spawner cannot
     /// quietly ask for a privilege this kernel would ignore.
     pub const KNOWN: u32 = SPAWN | CONSOLE_PUSH | INTROSPECT | SERVICE_CONTROL
                          | FIRE_IRQ | REBOOT | ACQUIRE_ANY | RESOURCE_MINT
-                         | GPIO | SET_CLOCK_FLOOR | SET_CLOCK;
+                         | GPIO | SET_CLOCK_FLOOR | SET_CLOCK | NET_DEVICE;
 }
 
 /// Which requested privilege the CALLING task does not itself hold, if any.
@@ -604,7 +642,7 @@ pub mod privbits {
 pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
     use crate::capability::*;
     if requested & !privbits::KNOWN != 0 { return Some("an unknown privilege bit"); }
-    let checks: [(u32, ResourceId, &'static str); 11] = [
+    let checks: [(u32, ResourceId, &'static str); 12] = [
         (privbits::SPAWN,           SPAWN_RESOURCE,           "SPAWN"),
         (privbits::CONSOLE_PUSH,    CONSOLE_PUSH_RESOURCE,    "CONSOLE_PUSH"),
         (privbits::INTROSPECT,      INTROSPECT_RESOURCE,      "INTROSPECT"),
@@ -616,6 +654,7 @@ pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
         (privbits::GPIO,            GPIO_DEVICE_RESOURCE,     "GPIO"),
         (privbits::SET_CLOCK_FLOOR, SET_CLOCK_RESOURCE,       "SET_CLOCK_FLOOR"),
         (privbits::SET_CLOCK,       SET_CLOCK_RESOURCE,       "SET_CLOCK"),
+        (privbits::NET_DEVICE,      NET_DEVICE_RESOURCE,      "NET_DEVICE"),
     ];
     for (bit, res, label) in checks {
         // GRANT, not WRITE. Delegating an authority and EXERCISING it are different rights (7.4), and
@@ -651,6 +690,7 @@ const SUPERVISOR_DELEGATABLE: &[(u32, crate::capability::cap::ResourceId)] = &[
     (privbits::GPIO,            GPIO_DEVICE_RESOURCE),
     (privbits::SET_CLOCK_FLOOR, SET_CLOCK_RESOURCE),
     (privbits::SET_CLOCK,       SET_CLOCK_RESOURCE),
+    (privbits::NET_DEVICE,      NET_DEVICE_RESOURCE),
 ];
 
 struct Privileges {
@@ -747,8 +787,12 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         //
         // (The original note here claimed the stack is in-kernel on BOTH ARM ports. That was true when
         // it was written and stopped being true when the aarch64 driver was deleted.)
-        usb_disk: cfg!(any(target_arch = "arm", target_arch = "aarch64"))
-            && matches!(name, "block-driver"),
+        // Nothing holds USB_DISK any more. It named `block-driver` alone, and `block-driver`'s image
+        // moved to the supervisor - so this arm could not fire even if the authority were still
+        // wanted, and it is not: the driver reaches its stick through the `dwc2` / `xhci` service over
+        // IPC on both ARM ports. Left as `false` rather than deleted along with the resource and its
+        // three syscalls, which is a separate change (audit SEC-37).
+        usb_disk: false,
         //   the shell's `gpio` command drives the SoC pins (the gated `Gpio` syscall, 45).
         gpio: false, // delegated in the spawn request (step C)
         //   SET_CLOCK, in two strengths (rights narrow, §7.4). WRITE = set the wall clock itself, held only
@@ -796,170 +840,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             preferred_core:    0,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // xhci - USB host-controller driver (§12). Receives its controller's
-        // MMIO BAR (mapped by name in the spawn path) + later its IRQ. Trusted
-        // userspace driver. has_recv_endpoint for future interrupt delivery.
-        // `dwc2` - the arm32 userspace USB host driver (Phase 2 skeleton).
-        //
-        // Granting `hw_irqs = [0x29]` is what makes `arm_irq_dispatch` route the USB interrupt HERE
-        // instead of to the in-kernel stack: the dispatcher picks by registration, so spawning this
-        // service is what takes the controller away from the kernel. Deliberate, and the whole point
-        // of the phase - but it means USB is expected to be degraded while a skeleton holds the
-        // vector. See docs/arm32-usb-userspace.md.
-        //
-        // Core 0: the DWC2 interrupt is routed to core 0 by `route_usb_irq_to_core0`, and a driver
-        // that receives its interrupt on one core while running on another pays a cross-core wake for
-        // every single one. The Pi 4 learned this the expensive way - `xhci`'s MSI destination had
-        // drifted to a core the driver did not run on, and co-locating them was what took it from
-        // 100% CPU to 0%.
-        "dwc2" => Some(("dwc2", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_DWC2_ELF")),
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[0x29],
-            has_console_read:  false,
-        })),
-        "xhci" => Some(("xhci", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_XHCI_ELF")),
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            // Core 2: the USB drivers busy-poll their controllers at ~100% CPU, so co-locating both
-            // on core 1 (with nic-driver + net-stack + fs + block-driver) SATURATED it - starving the
-            // networking (net-stack's frame requests to nic-driver timed out) and the keyboard itself
-            // (input garbled then died on the T630). Spreading the two busy-pollers onto the idle cores
-            // (xhci=2, ehci=3) leaves core 1 for the request-driven services. Falls back to round-robin
-            // if core 2 is not ready.
-            preferred_core:    XHCI_CORE,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            // Route the xHCI MSI (interrupts::XHCI_MSI_VECTOR = 0x28) to this driver's recv
-            // endpoint (§12). The kernel programmed the controller's MSI-X to this vector at
-            // boot; the driver enables the controller's interrupter and drains the events.
-            hw_irqs:           &[0x28],
-            has_console_read:  false,
-        })),
-        // `ehci` - userspace USB 2.0 driver (§12) for the back ports' EHCI controller. Same
-        // shape as `xhci`; the kernel grants its MMIO/DMA at spawn (E1b+). Busy-polls on core 1
-        // (alongside xHCI) - the model that worked flawlessly. The EHCI's legacy INTx can't drive
-        // a block-and-wake loop on this hardware (deliver() fired zero times once the driver
-        // blocked across many T630 flashes), and the CPU-reduction attempts introduced quirks, so
-        // both USB drivers are back on plain busy-poll. Core 1 runs hot; reclaiming that idle is
-        // deferred (revisit later).
-        "ehci" => Some(("ehci", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_EHCI_ELF")),
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    EHCI_CORE,   // core 3: the other busy-poller, off the saturated core 1 (see xhci)
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            // Route the EHCI INTx (interrupts::EHCI_MSI_VECTOR = 0x29, IOAPIC-routed) to this
-            // driver's recv endpoint (§12). The driver enables USBINTR + acks + unmasks.
-            hw_irqs:           &[0x29],
-            has_console_read:  false,
-        })),
-        // `nic-driver` - userspace NIC driver (networking, v2; docs/networking.md, Phase 1).
-        // The kernel maps the Intel e1000's BAR0 by name at spawn (gated on the discovered NIC
-        // actually being an e1000), like the USB/AHCI controllers. Phase 1 step 2 is reset +
-        // read the MAC; TX/RX rings, the RX IRQ, and the frame interface to net-stack follow.
-        "nic-driver" => Some(("nic-driver", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_NIC_DRIVER_ELF")),
-            has_recv_endpoint: true, // will serve the frame interface to net-stack (§12)
-            // ARM32: the USB-net device is behind the `dwc2` SERVICE, so nic-driver needs a send cap
-            // to it - the same edge `block-driver` got in slice 3c. Without it `request_with_reply`
-            // finds no send slot and returns None INSTANTLY, which looks like a dead cable rather
-            // than a missing grant: every layer healthy in isolation, the edge between them absent.
-            #[cfg(target_arch = "arm")]
-            send_peers:        &["dwc2"],
-            #[cfg(not(target_arch = "arm"))]
-            send_peers:        &[],
-            send_peers_grant:  false,
-            // ARM KEEPS THIS ON CORE 0 - and the reason is neither of the two written here before.
-            // Both were wrong, and hardware refuted each in turn.
-            //
-            //   1. "The `msc_*` syscalls refuse when `!on_core0()`." True until slice 5 deleted the
-            //      in-kernel DWC2 stack; now provably false (no `on_core0` reference remains in
-            //      `arch/arm`, and `usb_disk_*` are inert stubs).
-            //   2. "Cross-core request/reply does not complete." False. Unpinned services stalled
-            //      because `dwc2` DROPPED block requests when it had no disk (fixed separately), not
-            //      because of cores; with that fixed they came up correctly on all four.
-            //
-            // The real reason is LATENCY, and it was found by an operator noticing `ls` and `read`
-            // had gone sluggish: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB, so the
-            // scheduler's cross-core wake does nothing and the target core does not notice a message
-            // until its next 10 ms timer tick. Cross-core IPC costs up to a full quantum PER HOP, and
-            // a file read is shell -> fs -> block-driver -> dwc2. Unpinning turned a same-core chain
-            // into three cross-core hops and made every command visibly slow. The giveaway was that a
-            // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
-            // chain again.
-            //
-            // UNPINNED, now that the IPI exists (BCM2836 core mailboxes; proven every boot by
-            // `arm32: IPI selftest PASS`). Cross-core wakes are immediate, so spreading these no
-            // longer costs a 10 ms tick per hop - the reason they were pinned in the first place.
-            //
-            // The stronger reason is what the IPI exposed. With wakes now actually preempting, `dwc2`
-            // shares core 0 with everything that gets woken, and its split-transaction sequencing is
-            // microframe-timed: a start-split and its complete-split must land in specific 125 us
-            // windows. Preempted between them, the transaction translator is left holding a
-            // transaction nobody collects - it wedges, gets cleared, and wedges again. Hardware showed
-            // that loop plainly: eight Clear_TT_Buffer calls and eight port re-enumerations in a
-            // couple of minutes, which the operator experiences as the keyboard pausing.
-            //
-            // So moving storage and the network OFF core 0 is not load-balancing here, it is giving
-            // the one timing-critical service on this board room to hit its deadlines. `dwc2` stays on
-            // core 0 because that is where its interrupt is routed.
-            //
-            // (Superseded rationale kept below so the next reader sees what was believed and why.)
-            //
-            // The old reason - the in-kernel DWC2 stack's `msc_*` entry points refused when
-            // `!on_core0()` - died with slice 5, and is verifiably gone (no `on_core0` reference
-            // remains in `arch/arm`; `usb_disk_*` are inert stubs). Unpinning on that basis was tried
-            // and it BROKE STORAGE: block-driver spawned on core 2 and logged nothing at all - not
-            // even its own "no disk" line - while `fs` on core 1 never reached "serving file API"
-            // behind it, and `nic-driver` on core 3 stopped after "starting". Everything left on core
-            // 0 was fine.
-            //
-            // The real constraint is underneath: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB,
-            // so a task blocked in `recv` on another core is never woken by its sender (§8.3 relies on
-            // that IPI). Cross-core request/reply therefore does not complete on this port, and every
-            // service that uses it has been co-located on core 0 - which is why three cores sit idle.
-            //
-            // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
-            // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
-            // unpins these three, and it unpins them everywhere at once.
-            // arm32: core 1, and NOT unpinned.
-            //
-            // Unpinning these three was meant to "give the timing-critical USB driver a quieter core
-            // 0" (75c18457). It did the opposite: unpinned means ROUND-ROBIN, and round-robin put
-            // `net-stack` straight back onto core 0 alongside `dwc2` - observed on hardware as
-            // "'dwc2' spawned OK on core 0 / 'net-stack' spawned OK on core 0".
-            //
-            // That is the worst possible pairing. `net-stack` waits for replies by POLLING
-            // (`drain_scan` -> try_recv + yield_cpu), and the scheduler quantum is 10 ms, so it can
-            // hold core 0 for 10 ms at a stretch. `dwc2`'s split transactions have to hit 125 us
-            // windows - eighty times finer. So the service waiting for a DHCP or ARP reply was
-            // starving the driver that had to deliver it: a spin that defeats itself.
-            //
-            // Pinned, and pinned TOGETHER with net-stack, which is what the contract used to say
-            // before the audit deleted it ("co-located with nic-driver - the two exchange frames
-            // constantly"). Same-core request/reply is safe now that the SDK waits poll rather than
-            // block. Core 0 is left to `dwc2` alone, which is what the unpin was for.
-            preferred_core:    if cfg!(target_arch = "arm") { 1 } else { 1 },
-            probe_mode:        0,
-            memory_limit:      16 * 1024 * 1024,
-            // GENET's macirq on aarch64 (SPI 157 -> neutral vector 0x2A). x86's nic-driver is a
-            // PCIe NIC with no such route, so the grant is arch-gated rather than unconditional.
-            #[cfg(target_arch = "aarch64")]
-            hw_irqs:           &[0x2A],
-            #[cfg(not(target_arch = "aarch64"))]
             hw_irqs:           &[],
             has_console_read:  false,
         })),
@@ -1079,7 +959,11 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
 pub fn spawn_from_image(
     name:              &str,
     image:             crate::loader::ImageSource,
+    // A STRICT placement: reject with `PlacementInvalid` if that core is not ready (§9.2).
     core_override:     Option<u32>,
+    // The service's PREFERRED core (`u32::MAX` = none): used only when there is no override, and
+    // falls back to round-robin if that core is not ready, so a machine with fewer cores still boots.
+    core_preferred:    u32,
     memory_limit:      u64,
     has_recv_endpoint: bool,
     has_console_read:  bool,
@@ -1092,9 +976,10 @@ pub fn spawn_from_image(
     privileges:        u32,
     // The service's mode selector (see `SpawnRequest::probe_mode`).
     mode:              u32,
-    // The device class this service drives (0 = none), and the IRQ lines routed to its endpoint.
+    // The device class this service drives (0 = none). Its IRQ lines are DERIVED from the class by
+    // `hw_irqs_for` rather than named by the caller - see that function for why a vector is
+    // authority. `SpawnImage` refuses a request that tries to name one.
     hw_class:          u32,
-    irqs:              &[u8],
 ) -> Result<Option<EndpointId>, SpawnError> {
     if service_config(name).is_some() {
         crate::kprintln!("task: SpawnImage '{}' rejected: that name belongs to the kernel catalogue", name);
@@ -1105,12 +990,13 @@ pub fn spawn_from_image(
         return Err(SpawnError::AlreadyRunning);
     }
 
-    let core_id = resolve_spawn_core(core_override, u32::MAX)?;
+    let core_id = resolve_spawn_core(core_override, core_preferred)?;
     let mem = if memory_limit == 0 { 64 * 1024 * 1024 } else { memory_limit };
 
+    let hw = hw_class_of(hw_class);
     let result = spawn_service_with_image(name, image, core_id, has_recv_endpoint, peers, mode,
-                                          false, mem, irqs, has_console_read,
-                                          Some(privileges), Some(hw_class_of(hw_class)), installs);
+                                          false, mem, hw_irqs_for(hw), has_console_read,
+                                          Some(privileges), Some(hw), installs);
     if let Err(ref e) = result {
         crate::kprintln!("task: SpawnImage '{}' failed: {:?}", name, e);
     }
@@ -1432,11 +1318,16 @@ fn spawn_service_with_image(
             gpio:            bits & privbits::GPIO            != 0,
             set_clock_floor: bits & privbits::SET_CLOCK_FLOOR != 0,
             set_clock:       bits & privbits::SET_CLOCK       != 0,
-            // Still not expressible in the wire form: these belong to services that also need the
-            // HARDWARE path (net-stack, the ARM block-driver), so they will arrive with it rather
-            // than ahead of it. A moved service does not get them silently - the request carries no
-            // bit for them, so asking is impossible rather than ignored.
-            net_device:      false,
+            net_device:      bits & privbits::NET_DEVICE      != 0,
+            // USB_DISK has NO bit, and that is the finding rather than an omission. It gated
+            // `block-driver`'s reach to a USB stick through the in-kernel Bulk-Only stack - and on
+            // BOTH ARM ports that stack is gone: the driver now asks the `dwc2` / `xhci` SERVICE over
+            // IPC (`xhciblk`), which calls no `usb_disk_*` syscall at all. So the authority is
+            // vestigial, and moving `block-driver` to the supervisor dropped it rather than
+            // preserving it. That is the narrowing audit SEC-37 asked for, reached as a consequence
+            // of the move: whole-device read/write reach is no longer handed to a service that
+            // stopped using it. Deleting the syscalls themselves is a separate change with its own
+            // test, so the resource still exists and simply has no holder.
             usb_disk:        false,
         },
         None => service_privileges(name, is_probe),

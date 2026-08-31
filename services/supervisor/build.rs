@@ -16,8 +16,29 @@ fn main() {
     println!("cargo:rerun-if-changed={}", ld.display());
     println!("cargo:rustc-link-arg=--entry=service_main");
 
-    // The images this supervisor carries. One entry today (the step-C proof); the rest follow.
-    const EMBEDDED: &[&str] = &["pong", "roster", "reply-server", "holder", "upper", "mem-pressure", "ping", "time", "logger", "asker", "resource-server", "chaos", "control", "observe", "greet", "counter", "shell", "fs", "net-stack", "block-driver", "console"];
+    // The images this supervisor carries.
+    const EMBEDDED: &[&str] = &["pong", "roster", "reply-server", "holder", "upper", "mem-pressure",
+        "ping", "time", "logger", "asker", "resource-server", "chaos", "control", "observe", "greet",
+        "counter", "shell", "fs", "net-stack", "block-driver", "console", "nic-driver"];
+
+    // The USB host drivers exist only where their controller does, so they are embedded PER ARCH -
+    // the same split, for the same reasons, that `scripts/service_embed_check.py` spells out:
+    //   x86_64  - xhci (front ports) + ehci (USB 2.0 back ports); no DWC2 on a PC.
+    //   arm     - dwc2 alone; the Pi 2 has no PCIe, no xHCI and no EHCI.
+    //   aarch64 - xhci alone; the Pi 4 drives the VL805 over PCIe, and DWC2 is arm32-only.
+    //
+    // This list was flat and unconditional first, and that was WORSE THAN WRONG: on x86 the absent
+    // `dwc2` did not trip the panic below, it resolved to a TWELVE-DAY-OLD binary left in the target
+    // directory by an earlier ARM-era build. The guard only fires when a file is missing, and a stale
+    // file is not missing - so a supervisor would have shipped an image nothing rebuilds. Embedding
+    // only what this arch actually runs removes the question.
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let usb: &[&str] = match arch.as_str() {
+        "x86_64"  => &["xhci", "ehci"],
+        "arm"     => &["dwc2"],
+        "aarch64" => &["xhci"],
+        _         => &[],
+    };
 
     // OUT_DIR is <target>/<triple>/<profile>/build/<pkg>-<hash>/out, so the binaries this build
     // needs sit four levels up. Derived rather than assumed, so it holds for every triple.
@@ -25,7 +46,7 @@ fn main() {
     let target_dir = std::path::Path::new(&out)
         .ancestors().nth(3).expect("OUT_DIR shallower than expected").to_path_buf();
 
-    for name in EMBEDDED {
+    for name in EMBEDDED.iter().chain(usb.iter()) {
         let elf = target_dir.join(name);
         // LOUD, not a fallback (invariant 12). An embedded image that silently resolved to nothing
         // would produce a supervisor that cannot start the service, failing far from the cause.

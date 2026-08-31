@@ -185,7 +185,17 @@ static MEM_PRESSURE_ELF: &[u8] = include_bytes!(env!("SVC_MEM_PRESSURE_ELF"));
 static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
 static REPLY_SERVER_ELF: &[u8] = include_bytes!(env!("SVC_REPLY_SERVER_ELF"));
 static HOLDER_ELF: &[u8] = include_bytes!(env!("SVC_HOLDER_ELF"));
+
 static CONSOLE_ELF: &[u8] = include_bytes!(env!("SVC_CONSOLE_ELF"));
+static NIC_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_NIC_DRIVER_ELF"));
+// The USB host drivers exist only where their controller does (see `build.rs`, which embeds exactly
+// these): xhci+ehci on a PC, dwc2 on the Pi 2, xhci on the Pi 4.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+static XHCI_ELF: &[u8] = include_bytes!(env!("SVC_XHCI_ELF"));
+#[cfg(target_arch = "x86_64")]
+static EHCI_ELF: &[u8] = include_bytes!(env!("SVC_EHCI_ELF"));
+#[cfg(target_arch = "arm")]
+static DWC2_ELF: &[u8] = include_bytes!(env!("SVC_DWC2_ELF"));
 
 /// `(name, image, flags, memory limit, preferred core, send peers, privileges, mode, hw class)` for
 /// every service whose image the supervisor holds.
@@ -275,6 +285,25 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("console", CONSOLE_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      8 * 1024 * 1024, if cfg!(target_arch = "arm") { 3 } else { 0 }, &[], 0, 0,
      godspeed_sdk::service_context::hwclass::FRAMEBUFFER),
+    // The four INTERRUPT-DRIVEN drivers. None of them names a vector: the kernel derives it from the
+    // device class (`hw_irqs_for`), because routing a vector IS authority - on ARM, granting the USB
+    // vector is exactly what takes the controller away from whoever held it.
+    //
+    // CONSOLE_PUSH is what makes a USB keyboard a keyboard. Its absence was once the whole of "the
+    // keyboard does not work": correct transfers, valid HID reports, every push rejected. It also puts
+    // these drivers inside the SHELL'S trust perimeter, because keystrokes are commands (SEC-2) - so
+    // it is granted deliberately, and REBOOT is deliberately NOT.
+    //
+    // Cores 2 and 3: both USB drivers busy-poll their controllers at ~100% CPU, and co-locating them
+    // on core 1 saturated it - starving networking and garbling the keyboard itself on the T630.
+    // NET_DEVICE is aarch64-only in effect: the Pi 4's GENET sits behind the NetFrame syscalls, while
+    // arm32 reaches frames through the `dwc2` service over IPC. The bit is arch-neutral - the kernel
+    // refuses any privilege the supervisor cannot delegate - so it is set where it is used and the
+    // grant is simply never exercised elsewhere.
+    ("nic-driver", NIC_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     16 * 1024 * 1024, 1, if cfg!(target_arch = "arm") { &["dwc2"] } else { &[] },
+     if cfg!(target_arch = "aarch64") { godspeed_sdk::service_context::privbits::NET_DEVICE } else { 0 }, 0,
+     godspeed_sdk::service_context::hwclass::NIC),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0, 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
@@ -283,18 +312,56 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("holder", HOLDER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
 ];
 
+/// The USB host drivers, which exist only where their controller does - so the TABLE is per arch,
+/// rather than one table with rows that would name an image this build never embedded. Same split as
+/// `build.rs` and `scripts/service_embed_check.py`, and it must stay in step with both.
+#[cfg(target_arch = "x86_64")]
+const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
+    ("xhci", XHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     64 * 1024 * 1024, 2, &[],
+     godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
+     godspeed_sdk::service_context::hwclass::XHCI),
+    ("ehci", EHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     64 * 1024 * 1024, 3, &[],
+     godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
+     godspeed_sdk::service_context::hwclass::EHCI),
+];
+#[cfg(target_arch = "aarch64")]
+const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
+    ("xhci", XHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     64 * 1024 * 1024, 2, &[],
+     godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
+     godspeed_sdk::service_context::hwclass::XHCI),
+];
+/// arm32's USB host: keyboard, mass storage and USB-net all sit behind it, which is why `nic-driver`
+/// and `block-driver` both name it as a peer on that port.
+#[cfg(target_arch = "arm")]
+const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
+    ("dwc2", DWC2_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     64 * 1024 * 1024, 0, &[],
+     godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
+     godspeed_sdk::service_context::hwclass::DWC2),
+];
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "arm")))]
+const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[];
+
 /// Spawn `name` from a supervisor-held image, if we hold one. `None` means "not ours - use the
 /// kernel catalogue", which is how the two coexist while services move across one at a time.
 fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
                   installs: &[(&str, CapHandle)])
     -> Option<Result<Option<CapHandle>, godspeed_sdk::Error>>
 {
-    let &(_, image, flags, mem, table_core, table_peers, privs, mode, hw) = IMAGES.iter().find(|(n, ..)| *n == name)?;
+    let &(_, image, flags, mem, table_core, table_peers, privs, mode, hw) =
+        IMAGES.iter().chain(USB_IMAGES.iter()).find(|(n, ..)| *n == name)?;
     let mut req = godspeed_sdk::service_context::SpawnRequest::new(image, name);
     // An explicit core from the caller wins (a RESTART override, 14.4); otherwise the table's
-    // preference, which is what the contract declares.
-    req.core         = if core == 0xFFFF || core == u32::MAX { table_core } else { core };
-    req.flags        = flags;
+    // preference, which is what the contract declares. The DIFFERENCE between those two is carried
+    // explicitly: an override is STRICT (reject if that core is not ready), a preference FALLS BACK
+    // to round-robin. Sending the preference as an override is what made `logger` and `xhci` fail to
+    // spawn at all on a 2-core machine instead of landing on another core.
+    let caller_chose = !(core == 0xFFFF || core == u32::MAX);
+    req.core         = if caller_chose { core } else { table_core };
+    req.flags        = flags | if caller_chose { godspeed_sdk::service_context::SPAWN_FLAG_CORE_STRICT } else { 0 };
     req.memory_limit = mem;
     // Privileges the supervisor asks the child be given. The kernel refuses any bit the SUPERVISOR
     // does not itself hold, so this passes authority on rather than minting it.
