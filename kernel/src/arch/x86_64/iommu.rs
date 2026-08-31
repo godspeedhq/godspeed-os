@@ -778,8 +778,11 @@ pub fn release_device(bdf: u32) -> bool {
 
 /// Drain and decode any new IOMMU fault events, printing each (device, fault
 /// type, faulting address). Safe; cheap when quiet (just a head/tail compare).
-/// Bounded per call so it is safe to invoke from the timer-tick path. Called
-/// from `control::process_pending` on core 0.
+/// Bounded per call so it is safe to invoke from the timer-tick path. Called from
+/// `scheduler::run` on core 0 (the idle path), which is where it moved when the COM2 control channel
+/// became a userspace service - it is ISOLATION reporting and has no business sharing a function
+/// with an operator channel (C1-6). It named `control::process_pending` until 2026-08-31; that
+/// function no longer exists.
 pub fn drain_event_log() -> u32 {
     let mmio_va = IOMMU_MMIO_VA.load(Ordering::Relaxed);
     let evt_phys = EVENT_LOG_PHYS.load(Ordering::Relaxed);

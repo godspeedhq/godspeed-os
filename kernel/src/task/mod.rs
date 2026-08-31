@@ -2501,8 +2501,15 @@ pub fn spawn_supervisor() {
 // The supervisor is no longer the non-restartable trusted root: when it dies, the KERNEL respawns it
 // (the kernel is the one thing that cannot die - the last-resort recovery anchor of Path C, §3.7).
 // The death path (`kill_task`) only FLAGS the respawn - running it inline is unsafe (we are mid-
-// teardown of the dying supervisor). `control::process_pending` (Core 0 control tick, already a
-// spawn-safe deferred point that respawns services for RESTART) polls the flag and does the respawn.
+// teardown of the dying supervisor). `scheduler::run` on CORE 0 polls the flag at its loop top,
+// where IF=1, and does the respawn (`poll_supervisor_respawn`, below).
+//
+// NOT the timer ISR, and not `control::process_pending` - which does not exist any more, and could
+// not have done this anyway. A ~22 ms spawn issuing all-core TLB shootdowns wedges the box at IF=0,
+// because core 0 cannot ACK other cores' IPIs while stuck in it. `poll_supervisor_respawn` carries
+// the full argument; this note was still naming the old caller after that one was corrected on
+// 2026-08-14, which is how a fix applied at ONE site leaves the same false statement standing forty
+// lines above the comment that warns about it.
 //
 // **No bound on the number of respawns - deliberately.** A cap that panicked after N respawns would
 // re-introduce the very reboot Phase 6 eliminates (just deferred from 1 death to N), and would hand
