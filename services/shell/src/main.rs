@@ -8388,9 +8388,35 @@ fn spawn_one(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
         report(ctx, "already running: ", name);
         return Err(ShellError::Unknown);
     }
-    match ctx.spawn(name) {
+    // ASK THE SUPERVISOR, not the kernel. Once a service's image lives in the supervisor the kernel
+    // has no row to spawn it from, and asking by name returns NotFound (step C,
+    // `docs/service-ownership.md`). The guards above are unchanged, so `Denied` for a core service
+    // and `Unknown` for an already-running one still come from here, not from the answer.
+    match spawn_via_supervisor(ctx, name) {
         Ok(())  => { report(ctx, "spawned: ", name); Ok(()) }
         Err(_)  => { report(ctx, "spawn failed (unknown service?): ", name); Err(ShellError::Unknown) }
+    }
+}
+
+/// The supervisor's command wire format (see `services/supervisor/src/main.rs`). A mismatch shows up
+/// as CMD_UNKNOWN rather than silently doing the wrong thing.
+const SUP_CMD_MARKER: u8 = 0x01;
+const SUP_CMD_SPAWN:  u8 = b'S';
+const SUP_CMD_OK:     u8 = 0;
+
+/// Ask the supervisor to start `name`. Bounded (26.6): a deadline, never an open wait - a shell that
+/// hung here would look like a dead machine to the person typing.
+fn spawn_via_supervisor(ctx: &ServiceContext, name: &str) -> Result<(), ()> {
+    let mut buf = [0u8; 64];
+    buf[0] = SUP_CMD_MARKER;
+    buf[1] = SUP_CMD_SPAWN;
+    buf[2..6].copy_from_slice(&u32::MAX.to_le_bytes());   // no core override: placement per 9.2
+    let nb = name.as_bytes();
+    let n  = nb.len().min(buf.len() - 6);
+    buf[6..6 + n].copy_from_slice(&nb[..n]);
+    match ctx.request_with_reply_call_err("supervisor", &Message::from_bytes(&buf[..6 + n]), 10) {
+        Ok(Some(reply)) if reply.payload_bytes().first() == Some(&SUP_CMD_OK) => Ok(()),
+        _ => Err(()),
     }
 }
 

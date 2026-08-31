@@ -14,7 +14,13 @@ limit   = "8MiB"
 
 [capabilities]
 # `time` (clock slice 2): the wall clock is a service, so `date` and the boot floor ask it.
-ipc_send    = ["block-driver", "fs", "time", "console", "logger"]
+# `supervisor` (step C, docs/service-ownership.md): the shell's `spawn` command asks the SUPERVISOR
+# to start a service, not the kernel. Once an image lives in the supervisor the kernel has no row to
+# spawn it from. Not new authority - the shell already holds SPAWN, SERVICE_CONTROL, ACQUIRE_ANY and
+# REBOOT - the same authority routed to the principal that can actually act on it (14.4).
+#
+# This is SIX peers, which is MAX_SEND_PEERS. A seventh needs that bound raised deliberately.
+ipc_send    = ["block-driver", "fs", "time", "console", "logger", "supervisor"]
 ipc_receive = ["shell"]
 log_write   = true
 

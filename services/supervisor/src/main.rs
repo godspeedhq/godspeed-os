@@ -38,6 +38,9 @@ use godspeed_sdk::{ServiceContext, CapHandle, ipc::Message};
 pub const CMD_MARKER:  u8 = 0x01;
 /// Restart: kill if alive, then spawn. `core` of `u32::MAX` means "re-evaluate placement" (9.2).
 pub const CMD_RESTART: u8 = b'R';
+/// Spawn: start a service that is not running. Same reason as RESTART - once an image lives here,
+/// the kernel has no row to spawn it from, so the shell's `spawn` must come through this channel.
+pub const CMD_SPAWN:   u8 = b'S';
 
 /// Reply status. One byte, so a caller can log the truth rather than assume success.
 pub const CMD_OK:      u8 = 0;
@@ -52,15 +55,18 @@ pub const CMD_UNKNOWN: u8 = 2;
 fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) -> bool {
     if payload.first() != Some(&CMD_MARKER) { return false; }
 
-    let status = if payload.len() >= 6 && payload[1] == CMD_RESTART {
+    let status = if payload.len() >= 6 && (payload[1] == CMD_RESTART || payload[1] == CMD_SPAWN) {
         let core = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
         match core::str::from_utf8(&payload[6..]) {
             Ok(name) if !name.is_empty() => {
-                ctx.log_fmt(format_args!("supervisor: RESTART {} core={}",
+                let restart = payload[1] == CMD_RESTART;
+                ctx.log_fmt(format_args!("supervisor: {} {} core={}",
+                    if restart { "RESTART" } else { "SPAWN" },
                     name, if core == u32::MAX { -1i64 } else { core as i64 }));
-                // Kill first. A kill that finds nothing is NOT an error here: restarting a service
-                // that already died is exactly the case the test harness drives.
-                let _ = ctx.kill(name);
+                // RESTART kills first; a kill that finds nothing is NOT an error here, because
+                // restarting a service that already died is exactly the case the harness drives.
+                // SPAWN does not kill - starting something already running must fail, not replace it.
+                if restart { let _ = ctx.kill(name); }
                 // No core given: use the WIRED respawn, so a service with peers (fs -> block-driver)
                 // gets them provided rather than only name-wired. With an explicit core, place it
                 // there - which is what `control` did before, so no wiring is lost that it had.

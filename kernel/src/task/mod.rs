@@ -1373,7 +1373,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             // `console`: terminal geometry, for the pager and `edit`. It used to come from the KERNEL
             // (`InspectKernel` query 9, now deleted) - the shell was asking the wrong party for a fact
             // the terminal owns (docs/console-service.md 9.7).
-            send_peers:        &["fs", "block-driver", "time", "console", "logger"],
+            send_peers:        &["fs", "block-driver", "time", "console", "logger", "supervisor"],
             send_peers_grant:  false,
             // ARM: OFF CORE 0, to keep the serial writer away from the microframe-timed USB driver.
             //
