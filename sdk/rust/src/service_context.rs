@@ -251,12 +251,18 @@ pub struct SpawnRequest {
     pub bdf:          u32,
     pub irq_count:    u32,
     pub irqs:         [u8; 4],
-    pub peers_ptr:    u64,
-    pub peers_len:    u32,
-    pub _pad:         u32,
+    pub peers_ptr:      u64,
+    pub peers_len:      u32,
+    pub _pad:           u32,
+    /// Caller-provided caps to install into the child: `[label_len][label][slot_lo][slot_hi]`
+    /// repeated. The same encoding `SpawnWithCaps` uses - one wire format, not two.
+    pub installs_ptr:   u64,
+    pub installs_count: u32,
+    pub _pad2:          u32,
 }
 
-pub const SPAWN_REQUEST_VERSION:  u32 = 1;
+/// 2 since `installs` was added. A spawner built against a different kernel is refused loudly.
+pub const SPAWN_REQUEST_VERSION:  u32 = 2;
 pub const SPAWN_FLAG_REQ_RECV:    u32 = 1 << 0;
 pub const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
 
@@ -271,7 +277,27 @@ impl SpawnRequest {
             privileges: 0, hw_flags: 0, mmio_base: 0, mmio_len: 0,
             dma_pages: 0, bdf: 0, irq_count: 0, irqs: [0; 4],
             peers_ptr: 0, peers_len: 0, _pad: 0,
+            installs_ptr: 0, installs_count: 0, _pad2: 0,
         }
+    }
+
+    /// Encode `(label, cap)` pairs into `buf` and point this request at them.
+    ///
+    /// The caller must hold each cap WITH GRANT: the kernel checks it, and that check is what makes
+    /// installing them non-escalating (7.3) - a caller that can GRANT a cap could transfer it anyway.
+    pub fn set_installs(&mut self, buf: &mut [u8], pairs: &[(&str, CapHandle)]) -> bool {
+        let mut n = 0usize;
+        for (label, cap) in pairs {
+            let lb = label.as_bytes();
+            if lb.is_empty() || lb.len() > 32 { return false; }
+            if n + 1 + lb.len() + 2 > buf.len() { return false; }
+            buf[n] = lb.len() as u8; n += 1;
+            buf[n..n + lb.len()].copy_from_slice(lb); n += lb.len();
+            buf[n] = (cap.0 & 0xFF) as u8; buf[n + 1] = ((cap.0 >> 8) & 0xFF) as u8; n += 2;
+        }
+        self.installs_ptr   = if n > 0 { buf.as_ptr() as u64 } else { 0 };
+        self.installs_count = pairs.len() as u32;
+        true
     }
 }
 

@@ -467,6 +467,48 @@ A pipe collapsed into the same thing on the way: **a pipe is not a special kind 
 whose producer is handed its downstream as a peer** - which is exactly what the kernel's own
 `spawn_service_pipe` does. One request shape covers both.
 
+### Two more things that had to follow the config out of the kernel
+
+Moving an image breaks whatever still READS that service's config from the kernel, and each one is
+invisible until something fails. Two found so far, both real:
+
+**`SpawnImage` could not install caller-provided caps.** `SpawnWithCaps` installs a cap the SPAWNER
+supplies into the child - which is how `fs` gets `block-driver`'s cap rather than resolving a name,
+and `net-stack` gets `nic-driver`'s. `SpawnImage` passed `None`, so no WIRED service could move. The
+kernel already had the machinery; only the ABI did not carry it. `SpawnRequest` gained
+`installs_ptr`/`installs_count` using the SAME `[label_len][label][slot_lo][slot_hi]` encoding
+`SpawnWithCaps` uses (one wire format, not two), the version bumped 1 -> 2 so a mismatched spawner is
+refused rather than misparsed, and the GRANT check is kept exactly: the caller must already hold each
+cap grantably, which is what makes installing it non-escalating (7.3).
+
+**`AcquireSendCap` authorised a reacquire from the kernel CATALOGUE.** A service may reacquire a peer
+it DECLARED without holding the broad `ACQUIRE_ANY` - that is the 14.3 recovery every client owes a
+restartable peer. The check was:
+
+```rust
+match service_config(name) {          // the kernel catalogue
+    Some((_, cfg)) => cfg.send_peers.iter().any(|p| *p == peer),
+    None           => false,          // a moved service: "declares nothing"
+}
+```
+
+So a supervisor-owned service was permanently denied it: `ping` looped
+`reacquire failed, retrying next tick` forever once `pong` changed core. It now reads what the task
+was ACTUALLY WIRED WITH, recorded at spawn - the honester source anyway, being the real wiring rather
+than a table saying what it should have been.
+
+> **The pattern to expect: as configuration leaves the kernel, everything that READS that
+> configuration has to follow it.** The contract reconciler was the first (it now checks the kernel or
+> the supervisor); these are the second and third. More will surface in the `service_hw` and
+> privileged groups.
+
+**The unsafe rule improved the design a second time.** Recording per-task peers first added an
+`unsafe fn` to `task/scheduler.rs` - 37 to 39 on an 18.5 grandfathered floor, which may grow only by
+a CLAUDE.md amendment. But that table only ever needs COMPARISON, never a borrowed `&str`, so storing
+it as per-byte atomics makes every operation safe: `smp::names::AtomicNameSet` beside `NameTable`,
+zero new `unsafe` anywhere, floor untouched, no amendment needed. (The loader shrank 2 -> 1 the same
+way.)
+
 ### The blocker: only a SPAWNER can obtain a grantable cap
 
 `spawn_with_caps` TRANSFERS a cap into the child, and a transfer requires `GRANT` (8.5). Only a
@@ -503,7 +545,8 @@ than a name - with the cap now sourced from whoever actually spawned the service
 
 ### Where this stopped, and why
 
-Four moved: `pong`, `roster`, `reply-server`, `holder`. Pin 29 -> 25.
+Seven moved: `pong`, `ping`, `roster`, `reply-server`, `holder`, `upper`, `mem-pressure`.
+Pin 29 -> 22. `ping` is wired to `pong`, so the installs path is exercised rather than merely built.
 
 `pong`, `greet`, `upper` and `mem-pressure` were moved and REVERTED. Each is referenced by something
 that spawns it by name (`spawnwired`, the pipe tests, `chaos`), and the three blockers above are

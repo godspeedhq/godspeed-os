@@ -70,6 +70,41 @@ static TASK_NAMES: NameTable<MAX_TASKS, TASK_NAME_MAX> = NameTable::new();
 /// This slot's name, or `""` for a slot that has none.
 pub fn task_name(slot: usize) -> &'static str { TASK_NAMES.get(slot) }
 
+/// Per-task DECLARED SEND-PEERS, recorded at spawn.
+///
+/// The kernel authorises `AcquireSendCap` for a name a service DECLARED as a peer, so a service can
+/// reacquire a peer that restarted (14.2/14.3) without holding the broad ACQUIRE_ANY. That check used
+/// to read `service_config` - the kernel catalogue - which silently answers "declares nothing" for a
+/// service whose config has moved to the supervisor (step C). The effect was a supervisor-owned
+/// service being permanently unable to reacquire a restarted peer: `ping` looping
+/// "reacquire failed, retrying next tick" forever after `pong` moved core.
+///
+/// So the kernel records what it was ACTUALLY wired with, which is the honest source anyway - the
+/// wiring, not a declaration it has to look up somewhere. Bounded and flat (26.6): one row per
+/// (task, peer) slot, reusing the audited `NameTable` primitive so this adds no `unsafe`.
+static TASK_PEERS: crate::smp::names::AtomicNameSet<
+    { MAX_TASKS * crate::task::MAX_SEND_PEERS },
+    { crate::task::PEER_NAME_BYTES }> = crate::smp::names::AtomicNameSet::new();
+
+/// Record this task's declared send-peers. Called from the spawn path, with the slot reserved.
+///
+/// SAFE, deliberately: `AtomicNameSet` stores every byte atomically, so this needs no `unsafe` and
+/// `task/scheduler.rs` stays at its 18.5 grandfathered floor.
+pub fn set_task_peers(slot: usize, peers: &[&str]) {
+    if slot >= MAX_TASKS { return; }
+    for i in 0..crate::task::MAX_SEND_PEERS {
+        TASK_PEERS.set(slot * crate::task::MAX_SEND_PEERS + i,
+                       peers.get(i).copied().unwrap_or(""));
+    }
+}
+
+/// Did this task declare `peer` as a send-peer at spawn?
+pub fn task_declares_peer(slot: usize, peer: &str) -> bool {
+    if slot >= MAX_TASKS || peer.is_empty() { return false; }
+    (0..crate::task::MAX_SEND_PEERS)
+        .any(|i| TASK_PEERS.matches(slot * crate::task::MAX_SEND_PEERS + i, peer))
+}
+
 static TASK_VALID: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX_TASKS];
 /// Which core each task is pinned to (set at enqueue time; immutable after).
 static mut TASK_CORE:  [u32; MAX_TASKS]        = [0u32; MAX_TASKS];

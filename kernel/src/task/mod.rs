@@ -650,13 +650,14 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
 /// cap to it (`AcquireSendCap`) is contract-authorized recovery (§14.2), not ambient authority (§3.1).
 /// The caller's name comes from the existing `task_stat` snapshot and its declared peers from the
 /// static `service_config`, so this adds no new per-task kernel state and no new `unsafe`.
+/// Did the calling task declare `peer` as a send-peer at spawn?
+///
+/// Reads what the task was ACTUALLY WIRED WITH, recorded by the spawn path, rather than looking the
+/// service up in the kernel catalogue. The catalogue answer is wrong for any service whose config has
+/// moved to the supervisor (step C): it says "declares nothing", which denied a supervisor-owned
+/// service the reacquire it needs after a peer restarts (14.3) - `ping` could never re-find `pong`.
 pub fn current_task_declares_peer(peer: &str) -> bool {
-    let slot = scheduler::current_task_slot();
-    let name = scheduler::task_stat(slot).name;
-    match service_config(name) {
-        Some((_, cfg)) => cfg.send_peers.iter().any(|p| *p == peer),
-        None           => false,
-    }
+    scheduler::task_declares_peer(scheduler::current_task_slot(), peer)
 }
 
 fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
@@ -807,14 +808,12 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        "ping" => Some(("ping", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PING_ELF")),
+        "counter" => Some(("counter", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_COUNTER_ELF")),
             has_recv_endpoint: true,
-            // ping reaches pong (name-wired here, or supervisor-provided); it reacquires pong by
-            // name via the kernel directory on EndpointDead.
-            send_peers:        &["pong"],
+            send_peers:        &["fs"],
             send_peers_grant:  false,
-            preferred_core:    0,
+            preferred_core:    u32::MAX,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
@@ -1166,23 +1165,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // counter (examples/counter): a STATEFUL service that survives its OWN restart by
-        // persisting its running count to `fs` and reconstructing it on spawn (§14 restart, §15
-        // persistence). Owns its endpoint (fs replies there via the per-request reply cap) and sends
-        // to `fs` (read/write /counter.dat). Spawned only in the counter-test build (`osdev test
-        // counter`); idle/absent everywhere else. Restartable: its death notifies the supervisor,
-        // which respawns it (scheduler death-notification set + supervisor restart loop).
-        "counter" => Some(("counter", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_COUNTER_ELF")),
-            has_recv_endpoint: true,            // fs reply target (request_with_reply embeds a reply cap)
-            send_peers:        &["fs"],         // file-API ops to fs; reacquired by name on EndpointDead
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
         // asker (examples/asker): the request/reply CLIENT that exercises reply-server. Owns its
         // endpoint (reply-server replies there via the embedded reply cap) and sends to `reply-server`.
         // Spawned only in the reply-test build (`osdev test reply-server`); idle/absent elsewhere.
@@ -1415,6 +1397,9 @@ pub fn spawn_from_image(
     has_recv_endpoint: bool,
     has_console_read:  bool,
     peers:             &[&str],
+    // Caller-provided peer caps, GRANT-validated by the syscall. `None` = name-wire the peers
+    // instead, which is the path a service with no provided caps takes.
+    installs:          Option<&[InstallCap]>,
 ) -> Result<Option<EndpointId>, SpawnError> {
     if service_config(name).is_some() {
         crate::kprintln!("task: SpawnImage '{}' rejected: that name belongs to the kernel catalogue", name);
@@ -1429,7 +1414,7 @@ pub fn spawn_from_image(
     let mem = if memory_limit == 0 { 64 * 1024 * 1024 } else { memory_limit };
 
     let result = spawn_service_with_image(name, image, core_id, has_recv_endpoint, peers, 0,
-                                          false, mem, &[], has_console_read, None);
+                                          false, mem, &[], has_console_read, installs);
     if let Err(ref e) = result {
         crate::kprintln!("task: SpawnImage '{}' failed: {:?}", name, e);
     }
@@ -2335,6 +2320,23 @@ fn spawn_service_with_image(
                 data.send_peers[i].slot     = peer_data[i].0;
                 data.send_peers[i].name_len = peer_data[i].1;
                 data.send_peers[i].name     = peer_data[i].2;
+            }
+
+            // Record the same peer NAMES kernel-side. `AcquireSendCap` authorises a reacquire for a
+            // name the task declared (14.3 recovery, without the broad ACQUIRE_ANY), and that check
+            // used to read the kernel CATALOGUE - which answers "declares nothing" for a service whose
+            // config lives in the supervisor. Recording the actual wiring here is both the fix and the
+            // honester source: what the task was wired with, not what a table says it should have been.
+            {
+                let mut names: [&str; MAX_SEND_PEERS] = [""; MAX_SEND_PEERS];
+                let mut nn = 0usize;
+                for i in 0..peer_count {
+                    let l = peer_data[i].1 as usize;
+                    if let Ok(nm) = core::str::from_utf8(&peer_data[i].2[..l.min(PEER_NAME_BYTES)]) {
+                        names[nn] = nm; nn += 1;
+                    }
+                }
+                scheduler::set_task_peers(task_slot, &names[..nn]);
             }
         }
         let ctx_flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::NO_EXEC;

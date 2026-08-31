@@ -742,6 +742,11 @@ struct SpawnRequest {
     /// `send_peers` are: the caller supplies the LIST, never the authority.
     peers_ptr:    u64,
     peers_len:    u32,
+    /// Caller-provided caps to install into the child, as `[label_len][label][slot_lo][slot_hi]`
+    /// repeated - the SAME encoding `SpawnWithCaps` already uses, deliberately, so there is one wire
+    /// format for this and not two.
+    installs_ptr:   u64,
+    installs_count: u32,
 }
 
 /// Wire size of a `SpawnRequest`, in bytes. Every field at a fixed little-endian offset:
@@ -754,13 +759,16 @@ struct SpawnRequest {
 ///  24 name_ptr  u64   56 mmio_base    u64     88 peers_ptr u64
 ///  32 name_len  u32   64 mmio_len     u64     96 peers_len u32
 ///                                            100 reserved  u32
+///                                            104 installs_ptr   u64
+///                                            112 installs_count u32
+///                                            116 reserved       u32
 /// ```
 ///
 /// These are exactly the offsets a `repr(C)` layout of the SDK's matching struct produces on both
 /// 32- and 64-bit targets (every `u64` lands 8-aligned), so the two agree by construction - but the
 /// KERNEL's copy is the definition, and it reads each field at a stated offset rather than trusting
 /// that agreement.
-const SPAWN_REQUEST_BYTES: usize = 104;
+const SPAWN_REQUEST_BYTES: usize = 120;
 
 impl SpawnRequest {
     /// Decode the request from its wire bytes.
@@ -793,11 +801,15 @@ impl SpawnRequest {
             irqs:         [b[84], b[85], b[86], b[87]],
             peers_ptr:    u64_at(88),
             peers_len:    u32_at(96),
+            installs_ptr:   u64_at(104),
+            installs_count: u32_at(112),
         }
     }
 }
 
-const SPAWN_REQUEST_VERSION:  u32 = 1;
+/// Bumped to 2 when `installs` was added. The version field exists for exactly this: a spawner
+/// built against a different kernel is REFUSED loudly rather than misparsing a shorter struct.
+const SPAWN_REQUEST_VERSION:  u32 = 2;
 const SPAWN_FLAG_REQ_RECV:    u32 = 1 << 0;
 const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
 
@@ -866,6 +878,45 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     if req.image_len == 0 || req.image_len > u32::MAX as u64 { return -1; }
     let core_override = if req.core == u32::MAX { None } else { Some(req.core) };
 
+    // Caller-provided caps for the child's peers. Same encoding and the SAME AUTHORITY RULE as
+    // `SpawnWithCaps`: the caller must already hold each cap WITH GRANT, so copying it into the child
+    // is non-escalating (7.3) - it could have transferred the whole cap anyway. Every step is bounds
+    // checked because the descriptor is untrusted.
+    use crate::task::{InstallCap, PEER_NAME_BYTES};
+    let mut installs = [InstallCap { name: [0u8; PEER_NAME_BYTES], name_len: 0, cap };
+                        crate::task::MAX_SEND_PEERS];
+    let ni = req.installs_count as usize;
+    if ni > crate::task::MAX_SEND_PEERS { return -1; }
+    if ni > 0 {
+        // Each entry is at least 1 + 1 + 2 bytes; the buffer is read once, like every other input.
+        let ilen = ni * (2 + PEER_NAME_BYTES + 2);
+        let ibuf = match read_user_bytes(req.installs_ptr, ilen.min(512)) {
+            Some(b) => b,
+            None    => return -1,
+        };
+        let mut p = 0usize;
+        for entry in installs.iter_mut().take(ni) {
+            if p >= ibuf.len() { return -1; }
+            let label_len = ibuf[p] as usize;
+            p += 1;
+            if label_len == 0 || label_len > PEER_NAME_BYTES || p + label_len + 2 > ibuf.len() {
+                return -1;
+            }
+            let mut nm = [0u8; PEER_NAME_BYTES];
+            nm[..label_len].copy_from_slice(&ibuf[p..p + label_len]);
+            p += label_len;
+            let slot = (ibuf[p] as usize) | ((ibuf[p + 1] as usize) << 8);
+            p += 2;
+            let held = match scheduler::current_task_lookup_cap(slot, Rights::GRANT) {
+                Ok(c)  => c,
+                Err(e) => return cap_err_to_i64(e),
+            };
+            entry.name     = nm;
+            entry.name_len = label_len as u8;
+            entry.cap      = held;
+        }
+    }
+
     match crate::task::spawn_from_image(
         name,
         crate::loader::ImageSource::User { base: req.image_ptr, len: req.image_len as usize },
@@ -874,6 +925,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         req.flags & SPAWN_FLAG_REQ_RECV    != 0,
         req.flags & SPAWN_FLAG_REQ_CONSOLE != 0,
         &peers[..np],
+        if ni > 0 { Some(&installs[..ni]) } else { None },
     ) {
         // Hand back a SEND|GRANT cap to the new endpoint, as `SpawnReturningEndpoint` does: the
         // spawner has to be able to record `name -> cap` for the service it just started, or it

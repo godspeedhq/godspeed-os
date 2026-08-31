@@ -28,6 +28,52 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU8, Ordering};
 
+/// `N` slots of at most `L` bytes each, stored ATOMICALLY - so every operation is safe.
+///
+/// The sibling of `NameTable`, for the case that does not need to BORROW a name: comparison only.
+/// `NameTable` has to hand back a `&'static str`, which forces a raw read out of an `UnsafeCell`;
+/// where a caller only asks "is this slot this name?", atomic bytes answer it with no `unsafe` at
+/// all. That matters beyond tidiness: the caller here is `task/scheduler.rs`, one of 18.5's
+/// GRANDFATHERED floors, which may not grow its unsafe count without a CLAUDE.md amendment. Choosing
+/// the representation that needs none is cheaper than the amendment, and better.
+///
+/// Per-byte atomics are a real cost, paid once per spawn on a table read only by `AcquireSendCap`.
+pub struct AtomicNameSet<const N: usize, const L: usize> {
+    bytes: [[core::sync::atomic::AtomicU8; L]; N],
+    lens:  [AtomicU8; N],
+}
+
+impl<const N: usize, const L: usize> AtomicNameSet<N, L> {
+    pub const fn new() -> Self {
+        Self {
+            bytes: [const { [const { core::sync::atomic::AtomicU8::new(0) }; L] }; N],
+            lens:  [const { AtomicU8::new(0) }; N],
+        }
+    }
+
+    /// Record `name` in `slot`, truncating at `L`. Safe: every write is atomic, so concurrent
+    /// writers produce a wrong name rather than undefined behaviour - and there is only ever one.
+    pub fn set(&self, slot: usize, name: &str) {
+        if slot >= N { return; }
+        let b = name.as_bytes();
+        let n = b.len().min(L);
+        for i in 0..L {
+            self.bytes[slot][i].store(if i < n { b[i] } else { 0 }, Ordering::Relaxed);
+        }
+        // LENGTH LAST, as in `NameTable`: it publishes the bytes above.
+        self.lens[slot].store(n as u8, Ordering::Release);
+    }
+
+    /// Is `slot` exactly `name`?
+    pub fn matches(&self, slot: usize, name: &str) -> bool {
+        if slot >= N { return false; }
+        let b = name.as_bytes();
+        let n = self.lens[slot].load(Ordering::Acquire) as usize;
+        if n != b.len() || n > L { return false; }
+        (0..n).all(|i| self.bytes[slot][i].load(Ordering::Relaxed) == b[i])
+    }
+}
+
 /// `N` slots of at most `L` bytes each.
 pub struct NameTable<const N: usize, const L: usize> {
     bytes: UnsafeCell<[[u8; L]; N]>,

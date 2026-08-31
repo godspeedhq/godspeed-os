@@ -80,7 +80,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
                     // Peers supplied (a pipe). A supervisor-held image takes them directly; a
                     // kernel-held one goes through the kernel's pipe spawn, which prepends the
                     // downstream to the producer's declared peers the same way.
-                    match spawn_by_image(ctx, name, core, &peers[..np]) {
+                    match spawn_by_image(ctx, name, core, &peers[..np], &[]) {
                         Some(Ok(c))  => { spawned_cap = c; true }
                         Some(Err(_)) => false,
                         None         => ctx.spawn_pipe(name, peers[0]).is_ok(),
@@ -150,6 +150,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
 
 /// The images carried here rather than by the kernel. Each one deleted a `service_config` row.
 static PONG_ELF: &[u8] = include_bytes!(env!("SVC_PONG_ELF"));
+static PING_ELF: &[u8] = include_bytes!(env!("SVC_PING_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
 static MEM_PRESSURE_ELF: &[u8] = include_bytes!(env!("SVC_MEM_PRESSURE_ELF"));
 static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
@@ -167,6 +168,7 @@ static HOLDER_ELF: &[u8] = include_bytes!(env!("SVC_HOLDER_ELF"));
 /// `u32::MAX` as the core means "no preference" (9.2 round-robin); a caller-supplied core overrides it.
 const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str])] = &[
     ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 1, &[]),
+    ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"]),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[]),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[]),
     ("roster", ROSTER_ELF, 0, 64 * 1024 * 1024, u32::MAX, &[]),
@@ -176,7 +178,8 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str])] = &[
 
 /// Spawn `name` from a supervisor-held image, if we hold one. `None` means "not ours - use the
 /// kernel catalogue", which is how the two coexist while services move across one at a time.
-fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str])
+fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
+                  installs: &[(&str, CapHandle)])
     -> Option<Result<Option<CapHandle>, godspeed_sdk::Error>>
 {
     let &(_, image, flags, mem, table_core, table_peers) = IMAGES.iter().find(|(n, ..)| *n == name)?;
@@ -188,6 +191,10 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str])
     req.memory_limit = mem;
     // Peers likewise: a caller that has caps to provide passes them, otherwise the declared list.
     let use_peers = if peers.is_empty() { table_peers } else { peers };
+    // Caller-provided peer caps, when there are any. The kernel checks each holds GRANT, so passing
+    // them is non-escalating (7.3) - the supervisor could transfer them outright.
+    let mut ibuf = [0u8; 256];
+    if !installs.is_empty() && !req.set_installs(&mut ibuf, installs) { return Some(Err(godspeed_sdk::Error::InvalidArgument)); }
     let mut buf = [0u8; 128];
     Some(ctx.spawn_image(&mut req, &mut buf, use_peers))
 }
@@ -275,6 +282,28 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
     if n == 0 {
         return spawn_mapped(ctx, map, name, 0xFFFF); // nothing to provide - plain name-wired spawn
     }
+    // A supervisor-held image goes down SpawnImage, carrying the same provided caps. Without this
+    // a wired service could not move at all: `fs` is spawned with `block-driver`'s cap PROVIDED
+    // rather than name-resolved, and the kernel has no row to spawn it from once its image is here.
+    if let Some(r) = spawn_by_image(ctx, name, 0xFFFF, &[], &installs[..n]) {
+        return match r {
+            Ok(Some(cap)) => {
+                if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
+                let _ = map.record(name, cap.0);
+                ctx.log_fmt(format_args!(
+                    "supervisor: {} wired from the name-cap map ({} peer(s) provided; image supplied here)", name, n));
+                true
+            }
+            Ok(None) => true,
+            Err(_) => {
+                // Same recovery as the kernel path below: a provided cap went stale because its peer
+                // respawned, so retry fully name-wired rather than leaving the service dead.
+                ctx.log_fmt(format_args!(
+                    "supervisor: {} cached peer cap stale (peer restarted) - name-wiring instead", name));
+                spawn_mapped(ctx, map, name, 0xFFFF)
+            }
+        };
+    }
     match ctx.spawn_with_caps(name, 0xFFFF, &installs[..n]) {
         Ok(Some(cap)) => {
             // Free the dead instance's cap on a restart (see spawn_mapped) - no cap-table leak.
@@ -303,7 +332,7 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
 /// Returns true if the service spawned with an endpoint cap (used by the restart loop).
 fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u32) -> bool {
     // A supervisor-held image goes down the SpawnImage path; the kernel has no row for it.
-    if let Some(r) = spawn_by_image(ctx, name, core, &[]) {
+    if let Some(r) = spawn_by_image(ctx, name, core, &[], &[]) {
         return match r {
             Ok(Some(cap)) => {
                 if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
@@ -558,8 +587,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             ctx.log("supervisor: WARN: failed to spawn pong on core 1, trying core 0");
             let _ = spawn_mapped(&ctx, &mut name_map, "pong", 0);
         }
+        // Through `spawn_mapped`, like pong: this service's image is carried HERE, so the kernel has
+        // no row to spawn it from. `ctx.spawn_on` would fall back to the kernel path - correctly, since
+        // the supervisor has no supervisor-peer to route through - and find nothing.
         ctx.log("supervisor: spawning ping...");
-        if ctx.spawn_on("ping", 0).is_err() {
+        if !spawn_mapped(&ctx, &mut name_map, "ping", 0) {
             ctx.log("supervisor: WARN: failed to spawn ping");
         }
         ctx.log("supervisor: pong+ping done");
