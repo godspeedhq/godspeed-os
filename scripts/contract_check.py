@@ -156,6 +156,26 @@ def _core_of(expr: str):
     m = re.search(r'(\d+)', expr)
     return int(m.group(1)) if m else None
 
+def _supervisor_grants_resource_mint(name: str) -> bool:
+    """Does the supervisor's IMAGES row for `name` request the RESOURCE_MINT privilege?
+
+    RESOURCE_MINT follows the config out of the kernel (step C): a moved service carries it as a
+    privilege BIT in the supervisor's table rather than as `service_hw`'s second element. Split on row
+    boundaries rather than matching a regex across one - a row spans several lines once it carries
+    privileges, and a single-line pattern silently matches nothing, which is how a check stops
+    checking without anyone noticing.
+    """
+    try:
+        src = SUPERVISOR_MAIN.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    needle = chr(34) + name + chr(34) + ","
+    for row in src.split(chr(10) + "    ("):
+        if row.startswith(needle) and "_ELF" in row:
+            return "privbits::RESOURCE_MINT" in row
+    return False
+
+
 def parse_supervisor_images(name: str):
     """The supervisor's IMAGES row for `name`, in the same shape `parse_kernel` returns, or None."""
     try:
@@ -215,6 +235,12 @@ def main() -> int:
                 f"  FAIL  {name}: ipc_send {t['send']} (.toml) != send_peers {k['send']} (kernel)")
 
         khw, kmint = kernel_hw.get(name, (None, False))
+        # RESOURCE_MINT follows the config out of the kernel (step C): a moved service carries it as a
+        # privilege BIT in the supervisor's IMAGES row, not as `service_hw`'s second element. Same rule
+        # as the rest of this check - reconcile against wherever the config actually lives, so moving a
+        # service does not quietly escape it.
+        if not kmint and _supervisor_grants_resource_mint(name):
+            kmint = True
         if t["hw_device"] != khw:
             failures.append(
                 f"  FAIL  {name}: hw_device {t['hw_device']!r} (.toml) != {khw!r} (kernel service_hw)")

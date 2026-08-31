@@ -285,6 +285,8 @@ pub mod privbits {
     pub const GPIO:            u32 = 1 << 8;
     /// SET_CLOCK with READ (raise the clock FLOOR), not WRITE (step the clock).
     pub const SET_CLOCK_FLOOR: u32 = 1 << 9;
+    /// SET_CLOCK with WRITE (set the wall clock). Distinct from SET_CLOCK_FLOOR, the READ right.
+    pub const SET_CLOCK:       u32 = 1 << 10;
 }
 
 impl SpawnRequest {

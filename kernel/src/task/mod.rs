@@ -527,10 +527,9 @@ fn service_hw(name: &str) -> (HwClass, bool) {
         "ehci"                                 => (HwClass::Ehci, false),
         "block-driver"                         => (HwClass::Ahci, false),
         "nic-driver" | "e1000"                 => (HwClass::Nic,  false),
-        // `resource-server` moved to the supervisor (step C): its RESOURCE_MINT now arrives in the
-        // spawn request, checked against what the SUPERVISOR holds, instead of being granted here by
-        // name. `fs` and `net-stack` still take the by-name path until they move too.
-        "fs" | "net-stack" => (HwClass::None, true),
+        // `resource-server`, `fs` and `net-stack` all moved to the supervisor (step C): their
+        // RESOURCE_MINT arrives in the spawn request, checked against what the SUPERVISOR may
+        // delegate, instead of being granted here by name. Nothing is left in this arm.
         _                                      => (HwClass::None, false),
     }
 }
@@ -566,11 +565,15 @@ pub mod privbits {
     /// authority that split was built to withhold, and would fail anyway (a WRITE cap does not satisfy
     /// a READ check).
     pub const SET_CLOCK_FLOOR: u32 = 1 << 9;
+    /// SET_CLOCK with WRITE: SET the wall clock (net-stack, from SNTP, on RTC-less ARM). Distinct
+    /// from SET_CLOCK_FLOOR above, which is the same resource with READ - see the note there for why
+    /// the split exists and must not be collapsed.
+    pub const SET_CLOCK:       u32 = 1 << 10;
     /// Every bit this kernel understands. Anything outside it is refused, so a newer spawner cannot
     /// quietly ask for a privilege this kernel would ignore.
     pub const KNOWN: u32 = SPAWN | CONSOLE_PUSH | INTROSPECT | SERVICE_CONTROL
                          | FIRE_IRQ | REBOOT | ACQUIRE_ANY | RESOURCE_MINT
-                         | GPIO | SET_CLOCK_FLOOR;
+                         | GPIO | SET_CLOCK_FLOOR | SET_CLOCK;
 }
 
 /// Which requested privilege the CALLING task does not itself hold, if any.
@@ -580,7 +583,7 @@ pub mod privbits {
 pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
     use crate::capability::*;
     if requested & !privbits::KNOWN != 0 { return Some("an unknown privilege bit"); }
-    let checks: [(u32, ResourceId, &'static str); 10] = [
+    let checks: [(u32, ResourceId, &'static str); 11] = [
         (privbits::SPAWN,           SPAWN_RESOURCE,           "SPAWN"),
         (privbits::CONSOLE_PUSH,    CONSOLE_PUSH_RESOURCE,    "CONSOLE_PUSH"),
         (privbits::INTROSPECT,      INTROSPECT_RESOURCE,      "INTROSPECT"),
@@ -591,6 +594,7 @@ pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
         (privbits::RESOURCE_MINT,   RESOURCE_MINT_RESOURCE,   "RESOURCE_MINT"),
         (privbits::GPIO,            GPIO_DEVICE_RESOURCE,     "GPIO"),
         (privbits::SET_CLOCK_FLOOR, SET_CLOCK_RESOURCE,       "SET_CLOCK_FLOOR"),
+        (privbits::SET_CLOCK,       SET_CLOCK_RESOURCE,       "SET_CLOCK"),
     ];
     for (bit, res, label) in checks {
         // GRANT, not WRITE. Delegating an authority and EXERCISING it are different rights (7.4), and
@@ -625,6 +629,7 @@ const SUPERVISOR_DELEGATABLE: &[(u32, crate::capability::cap::ResourceId)] = &[
     (privbits::REBOOT,          REBOOT_RESOURCE),
     (privbits::GPIO,            GPIO_DEVICE_RESOURCE),
     (privbits::SET_CLOCK_FLOOR, SET_CLOCK_RESOURCE),
+    (privbits::SET_CLOCK,       SET_CLOCK_RESOURCE),
 ];
 
 struct Privileges {
@@ -735,8 +740,7 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // only source of a wall clock. Without the grant net-stack does the whole query, gets a real
         // answer, and is refused at the last step - the clock stays at the boot epoch while the log
         // says the time was fetched.
-        set_clock:       cfg!(any(target_arch = "arm", target_arch = "aarch64"))
-            && matches!(name, "net-stack"),
+        set_clock:       false, // net-stack carries SET_CLOCK in its spawn request now (step C)
         // aarch64 joins arm: the Pi 4 has no RTC either, so the floor the shell persists to
         // /clock.last is what carries a network sync across a power cycle. READ, not WRITE - raising
         // the floor only constrains which clock values are acceptable, where WRITE would let the shell
@@ -1055,95 +1059,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             #[cfg(target_arch = "aarch64")]
             hw_irqs:           &[0x2A],
             #[cfg(not(target_arch = "aarch64"))]
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // net-stack (services/net-stack): the model-AGNOSTIC half of networking (docs/networking.md).
-        // Owns its endpoint (nic-driver replies frames there via the per-request reply cap) and sends
-        // to nic-driver (the frame interface). Spawned AFTER nic-driver so its send-peer cap wires from
-        // the kernel name table at spawn. Core 1. No hardware - it speaks ARP/IP over raw frames.
-        "net-stack" => Some(("net-stack", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_NET_STACK_ELF")),
-            has_recv_endpoint: true,               // nic-driver replies frames here (per-request reply cap)
-            // `time` (clock slice 2): SNTP is a network fact this service fetches; whether to BELIEVE it
-            // is the clock's policy, so the reading is handed over rather than written to a syscall.
-            send_peers:        &["nic-driver", "time"],    // the frame interface; reacquired by name on death
-            send_peers_grant:  false,
-            // ARM KEEPS THIS ON CORE 0 - and the reason is neither of the two written here before.
-            // Both were wrong, and hardware refuted each in turn.
-            //
-            //   1. "The `msc_*` syscalls refuse when `!on_core0()`." True until slice 5 deleted the
-            //      in-kernel DWC2 stack; now provably false (no `on_core0` reference remains in
-            //      `arch/arm`, and `usb_disk_*` are inert stubs).
-            //   2. "Cross-core request/reply does not complete." False. Unpinned services stalled
-            //      because `dwc2` DROPPED block requests when it had no disk (fixed separately), not
-            //      because of cores; with that fixed they came up correctly on all four.
-            //
-            // The real reason is LATENCY, and it was found by an operator noticing `ls` and `read`
-            // had gone sluggish: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB, so the
-            // scheduler's cross-core wake does nothing and the target core does not notice a message
-            // until its next 10 ms timer tick. Cross-core IPC costs up to a full quantum PER HOP, and
-            // a file read is shell -> fs -> block-driver -> dwc2. Unpinning turned a same-core chain
-            // into three cross-core hops and made every command visibly slow. The giveaway was that a
-            // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
-            // chain again.
-            //
-            // UNPINNED, now that the IPI exists (BCM2836 core mailboxes; proven every boot by
-            // `arm32: IPI selftest PASS`). Cross-core wakes are immediate, so spreading these no
-            // longer costs a 10 ms tick per hop - the reason they were pinned in the first place.
-            //
-            // The stronger reason is what the IPI exposed. With wakes now actually preempting, `dwc2`
-            // shares core 0 with everything that gets woken, and its split-transaction sequencing is
-            // microframe-timed: a start-split and its complete-split must land in specific 125 us
-            // windows. Preempted between them, the transaction translator is left holding a
-            // transaction nobody collects - it wedges, gets cleared, and wedges again. Hardware showed
-            // that loop plainly: eight Clear_TT_Buffer calls and eight port re-enumerations in a
-            // couple of minutes, which the operator experiences as the keyboard pausing.
-            //
-            // So moving storage and the network OFF core 0 is not load-balancing here, it is giving
-            // the one timing-critical service on this board room to hit its deadlines. `dwc2` stays on
-            // core 0 because that is where its interrupt is routed.
-            //
-            // (Superseded rationale kept below so the next reader sees what was believed and why.)
-            //
-            // The old reason - the in-kernel DWC2 stack's `msc_*` entry points refused when
-            // `!on_core0()` - died with slice 5, and is verifiably gone (no `on_core0` reference
-            // remains in `arch/arm`; `usb_disk_*` are inert stubs). Unpinning on that basis was tried
-            // and it BROKE STORAGE: block-driver spawned on core 2 and logged nothing at all - not
-            // even its own "no disk" line - while `fs` on core 1 never reached "serving file API"
-            // behind it, and `nic-driver` on core 3 stopped after "starting". Everything left on core
-            // 0 was fine.
-            //
-            // The real constraint is underneath: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB,
-            // so a task blocked in `recv` on another core is never woken by its sender (§8.3 relies on
-            // that IPI). Cross-core request/reply therefore does not complete on this port, and every
-            // service that uses it has been co-located on core 0 - which is why three cores sit idle.
-            //
-            // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
-            // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
-            // unpins these three, and it unpins them everywhere at once.
-            // arm32: core 1, co-located with nic-driver and OFF core 0 - see the note there.
-            preferred_core:    if cfg!(target_arch = "arm") { 1 } else { 1 },
-            probe_mode:        0,
-            memory_limit:      16 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // `fs` - userspace filesystem (persistence, v2; §15, docs/persistence.md).
-        // Phase 1: mounts by reading the superblock (LBA 0) from `block-driver`
-        // over IPC and validating its magic. Spawned AFTER block-driver (its
-        // send-peer cap wires from the kernel name table at spawn). Core 1.
-        "fs" => Some(("fs", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_FS_ELF")),
-            has_recv_endpoint: true, // owns an endpoint (reply target + future fs API)
-            // "logger" is the EMIT cap: holding it is what makes this service traced, and its absence
-            // is what makes an untraced service cost one relaxed load (`sdk::trace`). Authority, visible
-            // in `caps fs`, revocable - not a global switch (3.1).
-            send_peers:        &["block-driver", "logger"],
-            send_peers_grant:  false,
-            preferred_core:    1,
-            probe_mode:        0,
-            memory_limit:      32 * 1024 * 1024,
             hw_irqs:           &[],
             has_console_read:  false,
         })),
@@ -1608,13 +1523,13 @@ fn spawn_service_with_image(
             acquire_any:     bits & privbits::ACQUIRE_ANY     != 0,
             gpio:            bits & privbits::GPIO            != 0,
             set_clock_floor: bits & privbits::SET_CLOCK_FLOOR != 0,
+            set_clock:       bits & privbits::SET_CLOCK       != 0,
             // Still not expressible in the wire form: these belong to services that also need the
             // HARDWARE path (net-stack, the ARM block-driver), so they will arrive with it rather
             // than ahead of it. A moved service does not get them silently - the request carries no
             // bit for them, so asking is impossible rather than ignored.
             net_device:      false,
             usb_disk:        false,
-            set_clock:       false,
         },
         None => service_privileges(name, is_probe),
     };
