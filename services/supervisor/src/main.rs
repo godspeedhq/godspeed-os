@@ -151,6 +151,8 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
 /// The images carried here rather than by the kernel. Each one deleted a `service_config` row.
 static PONG_ELF: &[u8] = include_bytes!(env!("SVC_PONG_ELF"));
 static PING_ELF: &[u8] = include_bytes!(env!("SVC_PING_ELF"));
+static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
+static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
 static MEM_PRESSURE_ELF: &[u8] = include_bytes!(env!("SVC_MEM_PRESSURE_ELF"));
 static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
@@ -168,6 +170,8 @@ static HOLDER_ELF: &[u8] = include_bytes!(env!("SVC_HOLDER_ELF"));
 /// `u32::MAX` as the core means "no preference" (9.2 round-robin); a caller-supplied core overrides it.
 const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str])] = &[
     ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 1, &[]),
+    ("time", TIME_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "net-stack"]),
+    ("logger", LOGGER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, 2, &[]),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"]),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[]),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[]),
@@ -552,9 +556,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Mirrors the block-driver/fs/shell adopt lines in the reconcile path.
         let _ = name_map.record("logger", cap.0);
         ctx.log("supervisor: adopted running logger");
-    } else if ctx.spawn("logger").is_err() {
+    } else if !spawn_mapped(&ctx, &mut name_map, "logger", 0xFFFF) {
+        // Through the image table: the supervisor carries logger's image now, and it does not route
+        // through itself (no supervisor-peer), so `ctx.spawn` would take the kernel path and find
+        // nothing. Same shape as pong/ping.
         ctx.log("supervisor: logger spawn failed, retrying");
-        let _ = ctx.spawn("logger");
+        let _ = spawn_mapped(&ctx, &mut name_map, "logger", 0xFFFF);
     }
 
     // The terminal (docs/console-service.md §9). Spawned right after the logger and before anything

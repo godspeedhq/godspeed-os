@@ -700,39 +700,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        "logger" => Some(("logger", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_LOGGER_ELF")),
-            has_recv_endpoint: true,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            // ARM: OFF CORE 0, to keep the serial writer away from the microframe-timed USB driver.
-            //
-            // Measured: a 125 us sleep averages 9398 us during boot and 608 us on a quiet system - a
-            // 15x difference made entirely of console traffic. A serial write is a syscall, 115200
-            // baud is ~87 us per byte, and this port deliberately refuses to preempt a user task
-            // mid-syscall (preempting SVC corrupts the banked SPSR/sp). So one ~100-character log
-            // line holds its core, un-preemptible, for about 9 ms.
-            //
-            // That blocks only the core it runs on - and this service was sharing core 0 with `dwc2`,
-            // whose split transactions must hit 125 us windows. Moving the writer is the cheap half
-            // of the fix; it needs no console rework and it uses the cores this board has.
-            // OFF CORE 0 ON EVERY ARCH. ARM moved it first, for the reason above; x86 has now been
-            // shown to need the same thing for a different one. Every trace event WAKES this service,
-            // and while it sat on core 0 it preempted the shell twice per fs request: `osdev test
-            // files` went 222/0 -> 213/9 with tracing on, tab completion and `find` timing out, and
-            // straight back to 222/0 with nothing changed but this number. A diagnostic sink does not
-            // belong on the interactive core.
-            //
-            // Safe on a machine with fewer cores: an unavailable preferred core falls back to
-            // round-robin (`resolve_placement`), it does NOT fail the spawn - so a 1-core or 2-core
-            // box still gets its logger.
-            preferred_core:    2,
-            probe_mode:        0,
-            memory_limit:      8 * 1024 * 1024,   // matches logger.toml (a stub sink needs ~none); the
-                                                 // contract is the source of truth (audit T1 reconcile)
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
         // time (services/time): the wall clock, moved out of the kernel (finding C1-6). §4.3 names six
         // kernel responsibilities and timekeeping is not among them. The kernel keeps only the register
         // read - x86's CMOS RTC answers on port I/O, which no service can reach - and this service owns
@@ -754,30 +721,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             preferred_core:    u32::MAX,
             probe_mode:        0,
             memory_limit:      8 * 1024 * 1024,   // matches control.toml
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "time" => Some(("time", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_TIME_ELF")),
-            has_recv_endpoint: true,
-            // `fs`, so the clock can own its own FLOOR - read /clock.last at start-up and persist
-            // it when the clock is set. That duty used to sit in the SHELL, which polled `time` on the
-            // INPUT PATH waiting for a network clock, so on a machine that never syncs the prompt was
-            // unresponsive for the first thirty seconds of every boot. The clock's owner is the right
-            // place for the clock's state (§3.8: state belongs to the service that owns it).
-            //
-            // One direction only: `time` may ask `fs`. It must never call `net-stack`, which calls
-            // `time` to set the clock after SNTP - two single-threaded services calling each other is a
-            // deadlock, so the network stays a PUSH toward this service and never a pull from it.
-            send_peers:        &["fs", "net-stack"],   // fs = the clock floor; net-stack = the one-way "sync now" nudge
-            send_peers_grant:  false,
-            probe_mode:        0,
-            // UNPINNED (§9.2: name a core only with a real reason). The clock has no interrupt to be
-            // local to and no peer to be co-resident with, so round-robin places it. Contracted
-            // placement is deployment-coupled by design; inventing one here would be noise the
-            // supervisor is then obliged to honour.
-            preferred_core:    u32::MAX,
-            memory_limit:      8 * 1024 * 1024,   // matches time.toml
             hw_irqs:           &[],
             has_console_read:  false,
         })),
