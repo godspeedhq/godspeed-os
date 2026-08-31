@@ -843,9 +843,61 @@ four machines** in the step A validation without a single kernel panic.
 |---|---|---|---|---|
 | before | 221 | kernel change | kernel change | no |
 | **A (done)** | **29** | kernel change | kernel change | no |
-| C | 1 | **no kernel change** | kernel change | no |
+| **C (done)** | **2** | **no kernel change** | kernel change | no |
 | D | 1 | no kernel change | **no kernel change** | no |
 | 2 | 1 | no kernel change | no kernel change | **yes** |
+
+**Step C is built.** The pin is **2**: `supervisor` (the target - the kernel must bootstrap it
+because nothing is beneath it) and `probe`. Every other service's image, memory limit, placement,
+peers, privileges and device class lives in the supervisor's `IMAGES` table.
+
+### 9.1 What a driver names, and what it may not
+
+A driver row names a device **class** (`hwclass::AHCI`, `XHCI`, `EHCI`, `DWC2`, `NIC`,
+`FRAMEBUFFER`). The kernel resolves that against its own bus scan and supplies the MMIO window, the
+DMA arena, the PCI BDF **and the interrupt vector**. `SpawnImage` refuses a request that names any
+of them directly.
+
+The vector belongs on that list and was nearly missed. An IRQ vector is authority in exactly the way
+a physical address is - routing a vector to a task is what makes that task receive the device's
+interrupts, and on ARM granting the USB vector is precisely what takes the controller away from
+whoever held it. For a while addresses were refused while vectors passed straight through from the
+caller, which is the same hole with a different field name. `hw_irqs_for(class)` closes it: the
+kernel states the vector it assigned, so the supervisor never picks one.
+
+This is also why step C needed **no** constitutional amendment for IRQ routing. The concern recorded
+earlier - that the kernel can only refuse an IRQ route to the wrong ELF *because it holds the ELF* -
+dissolves once the vector is derived rather than requested. There is no wrong route to refuse,
+because the caller cannot express one.
+
+### 9.2 What the move cost, and what caught it
+
+Six services moved in this step; three defects came with them, and **none was visible to the 410
+tests that were passing at the time**:
+
+| defect | why the suites missed it |
+|---|---|
+| `console` could have lost its framebuffer | identity/shell/files all drive the shell over SERIAL; the screen is not looked at. Caught by a QEMU **screendump**. |
+| the USB drivers were dead | the identity QEMU has no xHCI controller at all. Caught by **22 Test 12**, the only suite that attaches one. |
+| a table's PREFERRED core was sent as a STRICT override | every suite runs `-smp 4`, and no row names a core above 3. Caught only because Test 12 boots `-smp 2`, where `logger` and `xhci` vanished. |
+
+The pattern is the one this programme keeps re-learning: **a moved service missing a field does not
+fail to start. It starts, looks healthy, and does the wrong thing.** A green suite is evidence about
+the paths that suite exercises and nothing else. Two further traps of the same shape were found
+beside them: `EMBEDDED` was a flat list, so on x86 the absent `dwc2` resolved to a twelve-day-old
+binary rather than tripping the build guard (a guard that fires on a MISSING file does not fire on a
+stale one); and seven refusals in `handle_spawn_image` returned `-1` with nothing on the console, so
+a failed spawn reported only "InvalidArgument".
+
+### 9.3 An authority that left rather than moved
+
+`USB_DISK` gated `block-driver`'s whole-device reach to a USB stick through the in-kernel Bulk-Only
+stack. It has **no** privilege bit, deliberately: on both ARM ports the driver now reaches its stick
+through the `dwc2` / `xhci` service over IPC and calls no `usb_disk_*` syscall at all. So the move
+dropped the authority instead of carrying it - the narrowing audit SEC-37 asked for, arrived at as a
+consequence rather than as a task. `NET_DEVICE` went the other way and did get a bit, because
+`nic-driver` genuinely uses it for the Pi 4's GENET. The test for the two was the same question:
+does the service still call the syscall?
 
 ---
 
@@ -853,6 +905,14 @@ four machines** in the step A validation without a single kernel panic.
 
 - **The CLAUDE.md amendment for step C** must state the widening in section 4's words: after C, a
   runtime-compromised supervisor can introduce new code, and nothing before step 2 prevents it.
+  (The IRQ-routing half of this concern is closed - see 9.1 - but the code-introduction half stands
+  and is the reason step 2 exists.)
+- **`probe` is the last non-supervisor row.** It needs two things, both of which fit the existing
+  model: a `SPAWN_FLAG_PEERS_GRANT` bit (`probe-5a-send` gets grantable peer caps, which the
+  supervisor already holds and so may pass on), and a class for the TEST interrupt line that
+  `probe-11a` receives - the kernel supplying vector 33 from the class, exactly as it does a
+  device's. The work is larger than it looks because the 193 probe spawns go through `Spawn`'s
+  packed-parameter path rather than `SpawnImage`.
 - **Step D's arch shape** is unmeasured. x86 I/O-port config space and Pi 4 ECAM are known
   quantities; arm32 has no PCI, so the bus-manager is x86 + Pi 4 only and `dwc2` keeps its
   SoC-presence path.
