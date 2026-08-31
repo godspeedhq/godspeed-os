@@ -1108,20 +1108,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // asker (examples/asker): the request/reply CLIENT that exercises reply-server. Owns its
-        // endpoint (reply-server replies there via the embedded reply cap) and sends to `reply-server`.
-        // Spawned only in the reply-test build (`osdev test reply-server`); idle/absent elsewhere.
-        "asker" => Some(("asker", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_ASKER_ELF")),
-            has_recv_endpoint: true,            // reply target (request_with_reply blocks on this endpoint)
-            send_peers:        &["reply-server"], // sends requests to reply-server; reacquired by name on EndpointDead
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
         // resource-server (examples/resource-server): the delegated-resource-capability OWNER (§7.10).
         // Owns its endpoint (a cap holder's `resource_invoke` is routed here, badged) and SENDs to
         // `holder` to GRANT it the minted resource cap. Holds RESOURCE_MINT (granted by name below,

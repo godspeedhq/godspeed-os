@@ -580,6 +580,48 @@ so the destination page becomes a SAFE SLICE ONCE made both the zeroing and the 
 and `loader.rs` went **2 -> 1**: it shrank while gaining the ability to read user memory. The rule did
 not merely catch a violation, it produced a better design.
 
+### Where step C stopped, and exactly what each remaining service waits on
+
+**Pin 29 -> 19. Ten services the kernel has never heard of:** `pong`, `ping`, `time`, `logger`,
+`asker`, `roster`, `reply-server`, `holder`, `upper`, `mem-pressure`. That includes `logger`, which
+every service logs through, and `time`, which the shell and net-stack depend on - so the mechanism is
+carrying load-bearing services, not only demos.
+
+Everything that could move without new mechanism has moved. The remaining 19 rows:
+
+| service | waits on |
+|---|---|
+| `counter` | nothing technical - it is `spawncap`'s only viable subject (not running at boot, has a recv endpoint, and its peer `fs` is always up) |
+| `greet` | `spawnwired` needs the SHELL to TRANSFER a cap into the spawn request; nothing else wants that, so building it would be speculative (26.2) |
+| `probe` | the probe path resolves its ELF via `service_config`, AND probes need `is_probe` privileges |
+| `observe`, `observe-now`, `observe-live` | INTROSPECT, granted by NAME PREFIX |
+| `chaos`, `control`, `shell` | privileges (SPAWN, SERVICE_CONTROL, ACQUIRE_ANY, REBOOT) |
+| `console`, `fs`, `net-stack`, `resource-server` | `service_hw` - framebuffer grant / RESOURCE_MINT |
+| `block-driver`, `xhci`, `ehci`, `dwc2`, `nic-driver` | `service_hw` - MMIO, DMA arena, IRQ, IOMMU |
+| `supervisor` | stays forever - the recovery anchor |
+
+**Seventeen of the nineteen reduce to ONE question:** the `privileges` and `hw` fields, which is the
+amendment. Only `counter` and `greet` are blocked on anything else, and both are small.
+
+So the machinery of step C is done and proven; what remains is a decision about the trust model, not
+more plumbing.
+
+### A trap the privileges design must not inherit: privilege by NAME PREFIX
+
+`INTROSPECT` is granted to any service whose name starts with `observe`, `prop-` or `stress-`:
+
+```rust
+introspect: ... || name.starts_with("observe") || name.starts_with("prop-") ...
+```
+
+Harmless while the kernel owns every name. The moment a CALLER supplies names it reads as "call
+yourself `observe-x` and get introspection" - a privilege obtainable by choosing a string. Whatever
+replaces `service_privileges` must not carry this forward, and it is a concrete reason the privileges
+design deserves a look rather than a mechanical port.
+
+It is the same shape as the two defects the moves already surfaced (the contract reconciler,
+`AcquireSendCap`): **authorization keyed on something the kernel is giving up.**
+
 ### Ordering: C first, D second, with one condition
 
 **Design C's spawn ABI for the end state, not the interim.** The supervisor should pass the hardware
