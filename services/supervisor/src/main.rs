@@ -153,6 +153,7 @@ static PONG_ELF: &[u8] = include_bytes!(env!("SVC_PONG_ELF"));
 static PING_ELF: &[u8] = include_bytes!(env!("SVC_PING_ELF"));
 static ASKER_ELF: &[u8] = include_bytes!(env!("SVC_ASKER_ELF"));
 static RESOURCE_SERVER_ELF: &[u8] = include_bytes!(env!("SVC_RESOURCE_SERVER_ELF"));
+static CHAOS_ELF: &[u8] = include_bytes!(env!("SVC_CHAOS_ELF"));
 static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
 static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
@@ -179,6 +180,15 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32)] = &[
     // kernel refuses it unless the SUPERVISOR holds it too - so this passes authority on, never mints.
     ("resource-server", RESOURCE_SERVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["holder"],
      godspeed_sdk::service_context::privbits::RESOURCE_MINT),
+    // Four privileges, all delegated by the supervisor from its GRANT-only caps. `chaos` also needs
+    // CONSOLE_READ ('q' to abort a storm), which is a spawn FLAG rather than a privilege bit.
+    ("chaos", CHAOS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV
+                       | godspeed_sdk::service_context::SPAWN_FLAG_REQ_CONSOLE,
+     8 * 1024 * 1024, 0, &["supervisor"],
+     godspeed_sdk::service_context::privbits::SPAWN
+     | godspeed_sdk::service_context::privbits::INTROSPECT
+     | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
+     | godspeed_sdk::service_context::privbits::ACQUIRE_ANY),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0),

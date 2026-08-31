@@ -631,7 +631,7 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
     Privileges {
         // supervisor is the spawner (init removed, Phase 5); the shell brokers spawns; chaos spawns
         // mem-pressure tasks for max-carnage's spawn-burst dimension; probes spawn victims.
-        spawn: is_probe || matches!(name, "supervisor" | "shell" | "chaos" | "control"),
+        spawn: is_probe || matches!(name, "supervisor" | "shell" | "control"),
         // Both USB host drivers push decoded keystrokes: xhci (front ports), ehci (USB 2.0 back ports).
         // `dwc2` is the arm32 USB keyboard driver, so it needs this for the same reason `xhci` and
         // `ehci` do. Its absence was the whole of "the keyboard does not work": the transfers were
@@ -646,11 +646,11 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         console_push: matches!(name, "xhci" | "ehci" | "dwc2"),
         // shell + observe use TaskStat/InspectKernel; supervisor's reconcile loop scans real liveness;
         // chaos does victim selection; the prop-/stress- probes query victim generations.
-        introspect: matches!(name, "shell" | "supervisor" | "chaos" | "control")
+        introspect: matches!(name, "shell" | "supervisor" | "control")
             || name.starts_with("observe") || name.starts_with("prop-") || name.starts_with("stress-"),
         // shell (interactive broker), supervisor (restart authority), chaos (the point of max-carnage),
         // and every probe (they kill victims to exercise kill/revocation).
-        service_control: is_probe || matches!(name, "shell" | "supervisor" | "chaos" | "control"),
+        service_control: is_probe || matches!(name, "shell" | "supervisor" | "control"),
         // SEC-2: REBOOT lives ONLY with the shell (its `reboot` command); the USB drivers no longer
         // hold it. A keyboard driver can synthesize any keystroke (the console's inherent trust, §6.4),
         // but it must not ALSO be able to hard-reset the machine directly from any context.
@@ -662,7 +662,7 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // flooding, pipe sinks), supervisor (reconcile-by-name), probes. `adv-a13` is the §22 Test A13
         // NEGATIVE pin - deliberately excluded so it holds no ACQUIRE_ANY (proves AcquireSendCap denies
         // a non-holder). Ordinary services get none; their AcquireSendCap is limited to declared peers.
-        acquire_any: (is_probe && name != "adv-a13") || matches!(name, "shell" | "supervisor" | "chaos"),
+        acquire_any: (is_probe && name != "adv-a13") || matches!(name, "shell" | "supervisor"),
         // NET_DEVICE, GPIO_DEVICE, USB_DISK and SET_CLOCK are SANCTIONED KERNEL-ONLY BY-NAME GRANTS (the U15 / userspace-audit
         // A5-U1 doctrine): they are deliberately NOT contract capabilities - the kernel is their single
         // source of truth, and `contract_check.py` does not reconcile them. Both are arch-gated to ARM
@@ -796,22 +796,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             memory_limit:      8 * 1024 * 1024,   // matches control.toml
             hw_irqs:           &[],
             has_console_read:  false,
-        })),
-        // chaos: the spawn-on-demand system-stress orchestrator for `chaos max-carnage`. It kills +
-        // floods other services and is the one program a run never kills (it excludes ITSELF). Holds
-        // SERVICE_CONTROL (kill), INTROSPECT (task_stat victim selection), ACQUIRE_ANY (flood), SPAWN
-        // (mem-pressure spawn-burst), CONSOLE_READ (q-poll + the foreground claim, syscall 40), LOG_WRITE
-        // (the TUI, via ConsoleWrite). Excluded from auto-spawn; the shell spawns it by name on demand.
-        "chaos" => Some(("chaos", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_CHAOS_ELF")),
-            has_recv_endpoint: true,  // recv the round count from the shell launcher at startup
-            send_peers:        &["supervisor"],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        0,
-            memory_limit:      8 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  true,
         })),
         "greet" => Some(("greet", ServiceConfig {
             elf:               include_bytes!(env!("SVC_GREET_ELF")),
