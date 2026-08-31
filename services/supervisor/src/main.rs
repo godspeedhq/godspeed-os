@@ -13,6 +13,7 @@
 #![no_main]
 
 use godspeed_sdk::{ServiceContext, CapHandle, ipc::Message};
+use godspeed_sdk::service_context::supcmd;
 
 // ONE table, shared by source with the other principal that spawns probes: a probe respawns its own
 // victim, and a second copy of these parameters would be a second truth (Commandment III).
@@ -33,19 +34,16 @@ use godspeed_sdk::{ServiceContext, CapHandle, ipc::Message};
 // See `docs/service-ownership.md`.
 // ---------------------------------------------------------------------------------------------
 
-/// First byte of a command. Not a legal first byte of a service name, which is what separates a
-/// command from the kernel's death notification without changing the notification's format.
-pub const CMD_MARKER:  u8 = 0x01;
 /// Restart: kill if alive, then spawn. `core` of `u32::MAX` means "re-evaluate placement" (9.2).
-pub const CMD_RESTART: u8 = b'R';
+
 /// Spawn: start a service that is not running. Same reason as RESTART - once an image lives here,
 /// the kernel has no row to spawn it from, so the shell's `spawn` must come through this channel.
-pub const CMD_SPAWN:   u8 = b'S';
+
 
 /// Reply status. One byte, so a caller can log the truth rather than assume success.
-pub const CMD_OK:      u8 = 0;
-pub const CMD_FAILED:  u8 = 1;
-pub const CMD_UNKNOWN: u8 = 2;
+
+
+
 
 /// Handle a command and answer it. Returns false if this was not a command at all.
 ///
@@ -53,11 +51,11 @@ pub const CMD_UNKNOWN: u8 = 2;
 /// must never block the supervisor, which is the one service everything else depends on, and a
 /// retained return address burns a cap-table slot per request (the `logger` leak, §26.6).
 fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) -> bool {
-    if payload.first() != Some(&CMD_MARKER) { return false; }
+    if payload.first() != Some(&supcmd::MARKER) { return false; }
 
     // The new service's endpoint cap, when the spawn produced one - returned to the caller below.
     let mut spawned_cap: Option<CapHandle> = None;
-    let status = if payload.len() >= 6 && (payload[1] == CMD_RESTART || payload[1] == CMD_SPAWN) {
+    let status = if payload.len() >= 6 && (payload[1] == supcmd::RESTART || payload[1] == supcmd::SPAWN) {
         let core = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
         match core::str::from_utf8(&payload[6..]) {
             // `name` may carry a NUL-separated PEER LIST after it, exactly as SpawnRequest's payload
@@ -70,7 +68,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
                 let mut peers: [&str; 6] = [""; 6];
                 let mut np = 0usize;
                 for pr in it { if !pr.is_empty() && np < peers.len() { peers[np] = pr; np += 1; } }
-                let restart = payload[1] == CMD_RESTART;
+                let restart = payload[1] == supcmd::RESTART;
                 ctx.log_fmt(format_args!("supervisor: {} {} core={}",
                     if restart { "RESTART" } else { "SPAWN" },
                     name, if core == u32::MAX { -1i64 } else { core as i64 }));
@@ -99,13 +97,13 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
                     // For the kernel-catalogue paths the cap was recorded in the name map by
                     // `spawn_mapped`; read it back so every successful spawn answers the same way.
                     if spawned_cap.is_none() { spawned_cap = map.get(name).map(CapHandle); }
-                    CMD_OK
-                } else { CMD_FAILED }
+                    supcmd::OK
+                } else { supcmd::FAILED }
             }
-            _ => CMD_UNKNOWN,
+            _ => supcmd::UNKNOWN,
         }
     } else {
-        CMD_UNKNOWN
+        supcmd::UNKNOWN
     };
 
     // The reply carries a SEND|GRANT cap to the new service, when there is one.
@@ -316,7 +314,7 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
         };
     }
     match ctx.spawn_returning_endpoint(name, core) {
-        Some(cap) => {
+        Ok(Some(cap)) => {
             // On a restart, free the dead instance's cap before recording the new one, so a
             // kill-storm can't leak the supervisor's cap table (the map already updates in place).
             if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
@@ -327,7 +325,11 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
             }
             true
         }
-        None => { ctx.log_fmt(format_args!("supervisor: spawn {} returned no endpoint cap", name)); false }
+        // SPAWNED, and this service simply has no recv endpoint (`mem-pressure`, `greet`, `roster`).
+        // That is a SUCCESS with nothing to record - not a failure. Reading it as one is what made
+        // `chaos spawn-storm` report the task-pool ceiling hit at spawn #1.
+        Ok(None) => true,
+        Err(()) => { ctx.log_fmt(format_args!("supervisor: spawn {} FAILED", name)); false }
     }
 }
 
@@ -835,7 +837,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
     loop {
         let msg = ctx.recv();
-        // A command, or a death notification? The first byte decides (see CMD_MARKER).
+        // A command, or a death notification? The first byte decides (see supcmd::MARKER).
         if handle_command(&ctx, &mut name_map, msg.payload_bytes()) { continue; }
         let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
         // Two recovery paths race after a mass-kill: the convergence (converge()/reconcile()) may have

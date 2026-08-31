@@ -788,7 +788,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "chaos" => Some(("chaos", ServiceConfig {
             elf:               include_bytes!(env!("SVC_CHAOS_ELF")),
             has_recv_endpoint: true,  // recv the round count from the shell launcher at startup
-            send_peers:        &[],
+            send_peers:        &["supervisor"],
             send_peers_grant:  false,
             preferred_core:    0,
             probe_mode:        0,

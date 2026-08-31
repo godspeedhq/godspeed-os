@@ -275,6 +275,60 @@ impl SpawnRequest {
     }
 }
 
+/// The supervisor's command channel wire format.
+///
+/// ONE definition. This lived in three services at once (`supervisor`, `control`, `shell`) - three
+/// copies of a protocol, which is the second-truth problem this project rejects everywhere else
+/// (26.4, Commandment III). A drifted copy would not fail loudly; it would send a byte the supervisor
+/// reads as a different opcode.
+///
+/// The supervisor's endpoint receives two kinds of message, told apart by the first byte:
+///
+/// ```text
+///   death notice   "pong"                        <- kernel-generated; a name, [a-z0-9-]
+///   command        0x01 op <core u32 LE> name    <- 0x01 cannot begin a name
+///                                    name may be followed by NUL-separated PEER names
+/// ```
+///
+/// Choosing an impossible first byte means the kernel's death-notification format does not change at
+/// all: the two are unambiguous without the kernel learning anything about commands.
+pub mod supcmd {
+    /// First byte of a command. Not a legal first byte of a service name.
+    pub const MARKER:  u8 = 0x01;
+    /// Kill if alive, then spawn.
+    pub const RESTART: u8 = b'R';
+    /// Spawn a service that is not running.
+    pub const SPAWN:   u8 = b'S';
+
+    /// Reply status, one byte, so a caller can log the truth rather than assume success.
+    pub const OK:      u8 = 0;
+    pub const FAILED:  u8 = 1;
+    pub const UNKNOWN: u8 = 2;
+
+    /// Longest command payload: opcode + core + a name and its peers.
+    pub const MAX: usize = 128;
+
+    /// Build `MARKER op <core> name[\0peer]*` into `buf`, returning its length.
+    pub fn encode(buf: &mut [u8; MAX], op: u8, core: u32, name: &str, peers: &[&str]) -> Option<usize> {
+        if name.is_empty() { return None; }
+        buf[0] = MARKER;
+        buf[1] = op;
+        buf[2..6].copy_from_slice(&core.to_le_bytes());
+        let mut n = 6usize;
+        let mut put = |b: &[u8], buf: &mut [u8; MAX], n: &mut usize| -> bool {
+            if *n + b.len() > MAX { return false; }
+            buf[*n..*n + b.len()].copy_from_slice(b);
+            *n += b.len();
+            true
+        };
+        if !put(name.as_bytes(), buf, &mut n) { return None; }
+        for p in peers {
+            if !put(&[0u8], buf, &mut n) || !put(p.as_bytes(), buf, &mut n) { return None; }
+        }
+        Some(n)
+    }
+}
+
 /// Parameters a spawner supplies for a test probe (`ServiceContext::spawn_probe`).
 ///
 /// 193 of the kernel's service-catalogue rows were the same `probe` binary differing by a test mode
@@ -2801,7 +2855,60 @@ impl ServiceContext {
     }
 
     /// Spawn a service by name on `core` (0xFFFF = kernel round-robin).
+    ///
+    /// **Asks the SUPERVISOR when this service can reach it**, and the kernel otherwise.
+    ///
+    /// Step C moves service images out of the kernel (`docs/service-ownership.md`), and a service the
+    /// kernel does not hold cannot be spawned by name through the kernel. Seven separate callers did
+    /// exactly that - control's RESTART, the supervisor's own respawn, the shell's `spawn`, the
+    /// shell's PIPES, `spawncap`, `spawnwired`, and `chaos` - and each was found by a regression
+    /// rather than by reading. Routing HERE fixes all of them at once, including the ones not yet
+    /// found.
+    ///
+    /// The condition is exactly right by construction: the SUPERVISOR has no supervisor-peer, so it
+    /// keeps the kernel path it must have; a service with no such peer keeps the old behaviour and
+    /// can still spawn anything the kernel still owns.
     pub fn spawn_on(&self, name: &str, core: u32) -> Result<(), crate::Error> {
+        if self.find_send_slot("supervisor").is_some() {
+            return self.spawn_via_supervisor(name, core, &[]).map(|_| ());
+        }
+        self.spawn_on_kernel(name, core)
+    }
+
+    /// Ask the supervisor to spawn `name`, returning the `SEND|GRANT` cap it hands back (`None` if
+    /// the service has no recv endpoint, or the cap could not be taken).
+    ///
+    /// The supervisor is RESTARTABLE (6.2), so a cached cap to it goes stale on every respawn. This
+    /// reacquires by name and retries ONCE on `Err` - the send itself failed, so the peer is gone -
+    /// and never on `Ok(None)`, where the deadline passed and the request may well have landed
+    /// (retrying a possibly-delivered spawn would start the service twice).
+    pub fn spawn_via_supervisor(&self, name: &str, core: u32, peers: &[&str])
+        -> Result<Option<CapHandle>, crate::Error>
+    {
+        let mut buf = [0u8; supcmd::MAX];
+        let n = supcmd::encode(&mut buf, supcmd::SPAWN, core, name, peers)
+            .ok_or(crate::Error::InvalidArgument)?;
+        let msg = crate::ipc::Message::from_bytes(&buf[..n]);
+        for attempt in 0..2 {
+            match self.request_with_reply_call_err("supervisor", &msg, 2) {
+                Ok(Some(reply)) => {
+                    let ok = reply.payload_bytes().first() == Some(&supcmd::OK);
+                    let cap = self.take_pending_cap();
+                    if ok { return Ok(cap); }
+                    // Answered "no". Reclaim any cap that rode along, or it leaks a table slot.
+                    if let Some(c) = cap { self.remove_cap(c); }
+                    return Err(crate::Error::InvalidArgument);
+                }
+                Ok(None) => return Err(crate::Error::InvalidArgument),
+                Err(_) if attempt == 0 => { let _ = self.reacquire_by_name("supervisor"); }
+                Err(_) => return Err(crate::Error::InvalidArgument),
+            }
+        }
+        Err(crate::Error::InvalidArgument)
+    }
+
+    /// The kernel spawn-by-name path, unrouted. What `spawn_on` used to be.
+    pub fn spawn_on_kernel(&self, name: &str, core: u32) -> Result<(), crate::Error> {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC {
             return Err(crate::Error::InvalidArgument);
@@ -2915,16 +3022,23 @@ impl ServiceContext {
     /// starts - a userspace `name → cap` map - instead of the kernel resolving names. Requires the
     /// SPAWN cap. `None` if the cap is not held, the spawn failed, or the service has no recv
     /// endpoint to hand back. The old name-wiring path is unchanged; this is purely additive.
-    pub fn spawn_returning_endpoint(&self, name: &str, core: u32) -> Option<CapHandle> {
+    /// `Err(())` the spawn failed. `Ok(None)` it spawned but has no recv endpoint. `Ok(Some(cap))`
+    /// it spawned and here is a `SEND|GRANT` cap to its endpoint.
+    ///
+    /// The three-way answer is the point. This returned a bare `Option` and the kernel a bare slot,
+    /// so "no endpoint" and "failed" were the same value - and a caller that spawns a service without
+    /// an endpoint (`mem-pressure`, `greet`, `roster`) read success as failure.
+    pub fn spawn_returning_endpoint(&self, name: &str, core: u32) -> Result<Option<CapHandle>, ()> {
         let data = Self::ctx();
-        if data.magic != SERVICE_CTX_MAGIC { return None; }
+        if data.magic != SERVICE_CTX_MAGIC { return Err(()); }
         let slot = data.spawn_slot;
-        if slot == u32::MAX { return None; }
+        if slot == u32::MAX { return Err(()); }
         let bytes  = name.as_bytes();
         let packed = ((core as u64 & 0xFFFF) << 16) | (slot as u64 & 0xFFFF);
         // SAFETY: syscall(38) = SpawnReturningEndpoint; slot from the kernel-written page; bytes valid.
         let ret = unsafe { raw_syscall(38, packed, bytes.as_ptr() as u64, bytes.len() as u64) };
-        if ret < 0 { None } else { Some(CapHandle(ret as u32)) }
+        // slot + 1, so 0 is "spawned, no recv endpoint" and never a real slot.
+        if ret < 0 { Err(()) } else if ret == 0 { Ok(None) } else { Ok(Some(CapHandle(ret as u32 - 1))) }
     }
 
     /// Spawn `name` on `core` (0xFFFF = round-robin), wiring its send-peers from caller-supplied

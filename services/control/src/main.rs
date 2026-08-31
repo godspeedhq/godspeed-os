@@ -21,6 +21,7 @@
 //! pins grew by one each to make it possible.
 
 use godspeed_sdk::{ServiceContext, ipc::Message};
+use godspeed_sdk::service_context::supcmd;
 
 /// Kernel introspection query that pops one byte from COM2, or -1 when the port is empty.
 const Q_COM2_BYTE: u64 = 21;
@@ -55,31 +56,29 @@ fn execute(ctx: &ServiceContext, line: &str) {
                 // Bounded (26.6): a deadline, not an open wait. A supervisor that is mid-respawn of
                 // itself must never hang the operator channel - the harness would read a hang as a
                 // dead machine.
-                let mut buf = [0u8; 64];
-                buf[0] = CMD_MARKER;
-                buf[1] = CMD_RESTART;
-                buf[2..6].copy_from_slice(&core.unwrap_or(u32::MAX).to_le_bytes());
-                let nb = name.as_bytes();
-                let n  = nb.len().min(buf.len() - 6);
-                buf[6..6 + n].copy_from_slice(&nb[..n]);
-
+                let mut buf = [0u8; supcmd::MAX];
+                let n = match supcmd::encode(&mut buf, supcmd::RESTART,
+                                             core.unwrap_or(u32::MAX), name, &[]) {
+                    Some(n) => n,
+                    None    => { ctx.log("control: RESTART name too long"); return; }
+                };
                 // The supervisor is restartable, so a cached cap to it goes stale on every respawn.
-                // Reacquire by name and retry ONCE on `Err` (the send failed - the peer is gone),
-                // never on `Ok(None)` (the deadline passed and the request may have landed).
-                let msg = Message::from_bytes(&buf[..6 + n]);
+                // Reacquire and retry ONCE on `Err` (the send failed - the peer is gone), never on
+                // `Ok(None)` (the deadline passed and the request may have landed).
+                let msg = Message::from_bytes(&buf[..n]);
                 let mut answer = ctx.request_with_reply_call_err("supervisor", &msg, 10);
                 if answer.is_err() && ctx.reacquire_by_name("supervisor") {
                     answer = ctx.request_with_reply_call_err("supervisor", &msg, 10);
                 }
+                // A spawn reply may carry a cap; control does not want it, so reclaim it (26.6).
+                if let Some(c) = ctx.take_pending_cap() { ctx.remove_cap(c); }
                 match answer {
                     Ok(Some(reply)) => match reply.payload_bytes().first() {
-                        Some(&CMD_OK) => ctx.log_fmt(format_args!("control: {} restarted", name)),
-                        Some(&CMD_UNKNOWN) =>
+                        Some(&supcmd::OK) => ctx.log_fmt(format_args!("control: {} restarted", name)),
+                        Some(&supcmd::UNKNOWN) =>
                             ctx.log_fmt(format_args!("control: restart failed: supervisor did not understand the request for {}", name)),
                         _ => ctx.log_fmt(format_args!("control: restart failed: supervisor could not restart {}", name)),
                     },
-                    // LOUD on both (invariant 12). A silent timeout here would read as a restart that
-                    // worked, which is the one thing an operator channel must never imply.
                     Ok(None) => ctx.log_fmt(format_args!(
                         "control: restart failed: supervisor did not answer within 10s ({})", name)),
                     Err(e)   => ctx.log_fmt(format_args!(
@@ -101,13 +100,6 @@ fn execute(ctx: &ServiceContext, line: &str) {
         None => {}
     }
 }
-
-/// The supervisor's command wire format. Kept in step with `services/supervisor/src/main.rs`; a
-/// mismatch shows up immediately as CMD_UNKNOWN rather than silently doing the wrong thing.
-const CMD_MARKER:  u8 = 0x01;
-const CMD_RESTART: u8 = b'R';
-const CMD_OK:      u8 = 0;
-const CMD_UNKNOWN: u8 = 2;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {

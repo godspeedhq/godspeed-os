@@ -11,6 +11,12 @@ request = "4MiB"
 limit   = "8MiB"
 
 [capabilities]
+# `supervisor` (step C, docs/service-ownership.md): chaos spawns services (mem-pressure, the
+# spawn-storm), and a service whose image the supervisor owns cannot be spawned by name through the
+# kernel. `ctx.spawn` routes through this peer automatically when it is present. Not new authority -
+# chaos already holds SPAWN and SERVICE_CONTROL - the same authority routed to the principal that can
+# act on it.
+ipc_send    = ["supervisor"]
 ipc_receive = ["chaos"]
 log_write   = true
 

@@ -994,11 +994,19 @@ fn handle_spawn_returning_endpoint(packed_arg0: u64, name_ptr: u64, name_len: u6
             let rid    = crate::capability::cap::ResourceId::from(ep_id);
             let ep_cap = crate::capability::mint_cap(rid, Rights::SEND | Rights::GRANT);
             match scheduler::current_task_insert_cap(ep_cap) {
-                Ok(slot) => slot as i64,
+                Ok(slot) => slot as i64 + 1,
                 Err(e)   => cap_err_to_i64(e),
             }
         }
-        Ok(None) => -1, // spawned, but no recv endpoint - nothing to hand back
+        // SLOT + 1 above, so 0 can mean "spawned, but this service has no recv endpoint" without
+        // colliding with slot 0. It used to return -1 here, which is what a FAILED spawn returns -
+        // so a caller could not tell a service that started and has no endpoint (`mem-pressure`,
+        // `greet`, `roster`) from one that did not start at all.
+        //
+        // That was latent while only the shell's `spawncap` used this: it only ever spawned services
+        // that HAVE endpoints. Routing the supervisor's spawns through it surfaced the ambiguity as
+        // "chaos spawn-storm hit the ceiling at spawn #1" - a successful spawn read as a refusal.
+        Ok(None) => 0,
         Err(_)   => -1,
     }
 }
