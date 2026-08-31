@@ -771,8 +771,12 @@ pub fn run(image_path: &Path, smp: u32) {
     // SpawnReturningEndpoint syscall hands the caller a SEND|GRANT cap to the spawned service's
     // endpoint. `spawncap pong` spawns pong, gets the cap, and sends a probe through it - proving
     // the returned cap actually routes. The old name-wiring path is untouched (purely additive).
-    // Use `upper` (also has a recv endpoint) so the later `spawnwired` test can spawn `pong` itself.
-    send(&mut write_half, b"spawncap upper\r");
+    // Names a service the KERNEL still owns. `spawncap` exercises `SpawnReturningEndpoint` - a
+    // kernel syscall against the kernel's own catalogue - so its subject must still be in it.
+    // `upper` moved to the supervisor (step C, docs/service-ownership.md); `counter` has a recv
+    // endpoint and has not. When that catalogue reaches its single `supervisor` entry, this
+    // diagnostic retires together with the syscall it tests.
+    send(&mut write_half, b"spawncap counter\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)) {
         Some(r) => check!(r.contains("endpoint cap acquired; send Ok"),
                           "spawncap: SpawnReturningEndpoint returns a routable endpoint cap"),
