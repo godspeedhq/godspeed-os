@@ -993,6 +993,12 @@ pub fn spawn_from_image(
     let core_id = resolve_spawn_core(core_override, core_preferred)?;
     let mem = if memory_limit == 0 { 64 * 1024 * 1024 } else { memory_limit };
 
+    // Reserve BEFORE doing any work, not after success. The name belongs to a supervisor-authored
+    // service from the moment the supervisor asks for it, and reserving on the way out would leave a
+    // window - however small - in which a caller-named probe could take it. A spawn that then FAILS
+    // still holds its name, which is correct: it is a real service's name either way.
+    crate::ipc::names::reserve(name);
+
     let hw = hw_class_of(hw_class);
     let result = spawn_service_with_image(name, image, core_id, has_recv_endpoint, peers, mode,
                                           false, mem, hw_irqs_for(hw), has_console_read,
@@ -1047,7 +1053,13 @@ pub fn spawn_probe(name: &str, core_override: Option<u32>, p: ProbeParams, peers
     //
     // Refusing the whole real catalogue is deliberately blunter than refusing the live set: a name
     // is dangerous precisely while its service is DEAD, which is when a liveness test would pass.
-    if service_config(name).is_some() {
+    // A CALLER-SUPPLIED NAME MAY NOT BE A REAL SERVICE'S NAME - asked of BOTH places a real service
+    // can now come from. `service_config` covers what the kernel still bootstraps; `is_reserved`
+    // covers everything the SUPERVISOR spawns, which after step C is almost all of it. Asking only
+    // the catalogue left `fs`, `shell`, `logger` and the rest squattable the moment their images
+    // moved out of the kernel - see `ipc::names::reserve` for the attack and why a reservation must
+    // outlive the service.
+    if service_config(name).is_some() || crate::ipc::names::is_reserved(name) {
         crate::kprintln!("task: spawn probe '{}' rejected: that is a real service's name", name);
         return Err(SpawnError::NotFound);
     }
@@ -1110,6 +1122,8 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<O
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
                               cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
                               cfg.has_console_read, None, None, None);
+    // As on the image path: a real service's name is not available to a caller-named probe.
+    if result.is_ok() { crate::ipc::names::reserve(static_name); }
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn '{}' failed: {:?}", name, e);
     }

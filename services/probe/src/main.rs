@@ -74,7 +74,7 @@
 // The probe parameter table - shared by source with the `supervisor`, the other spawner.
 mod table;
 
-use godspeed_sdk::{adversarial, service_context::AllocError, CapError, CapHandle, IpcError, Message, ServiceContext};
+use godspeed_sdk::{adversarial, service_context::{AllocError, ProbeSpec}, CapError, CapHandle, IpcError, Message, ServiceContext};
 
 #[allow(dead_code)]
 const MODE_PASSIVE:         u32 = 0;
@@ -1812,6 +1812,38 @@ fn mode_adv_a9(ctx: &ServiceContext) -> ! {
     match ctx.spawn("nonexistent-does-not-exist") {
         Err(_) => ctx.log("adv: A9 pass - spawn of unknown service returned Err"),
         Ok(()) => ctx.log("adv: A9 FAIL - unexpected spawn success for unknown service"),
+    }
+
+    // A9b - NAME SQUATTING. The parameterised probe path lets a SPAWN holder choose the NAME of the
+    // task it starts, so it must not be able to choose a REAL service's name. The attack is not
+    // hypothetical: the kernel name directory is the recovery anchor clients reacquire through
+    // (14.3), so a probe registered as `fs` while the real `fs` is dead collects its clients.
+    //
+    // This ALSO guards a regression that already happened once. The kernel used to answer "is this a
+    // real service's name?" from its service catalogue - and step C moved that catalogue to the
+    // supervisor, emptying it, which silently reduced the refusal set to `{supervisor, probe}`. The
+    // names below are exactly the ones that became squattable, so this test fails if the reservation
+    // is ever lost again.
+    //
+    // A probe holds SPAWN, so the syscall is authorised and only the NAME check can refuse it.
+    //
+    // THE VICTIMS HERE ARE ALL SPAWNED BEFORE ANY PROBE, DELIBERATELY, and that limit is the finding
+    // rather than a convenience. A name is reserved when the supervisor SPAWNS it, so a service that
+    // has not started yet is not yet protected - and `fs` and `shell` start AFTER the probes in this
+    // build, so squatting either of them still SUCCEEDS today. That is a real residual window, not a
+    // test artifact; it is recorded in docs/service-ownership.md 10 rather than asserted here,
+    // because a test that always fails stops being read. Closing it needs the supervisor to reserve
+    // its whole managed set up front, which it currently has no way to say.
+    let mut squats = 0;
+    for victim in ["logger", "console", "supervisor"] {
+        match ctx.spawn_probe(victim, None, ProbeSpec { mode: 0, has_recv_endpoint: false, mem_mib: 4 }, &[]) {
+            Err(_) => squats += 1,
+            Ok(())  => ctx.log_fmt(format_args!(
+                "adv: A9 FAIL - squatted the real service name '{}'", victim)),
+        }
+    }
+    if squats == 3 {
+        ctx.log("adv: A9b pass - 3 already-running service names refused to a caller-named probe");
     }
     idle(ctx)
 }

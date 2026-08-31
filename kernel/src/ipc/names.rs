@@ -14,6 +14,9 @@ const NAME_MAX:    usize = 32;
 #[derive(Clone, Copy)]
 struct NameEntry {
     valid:       bool,
+    /// This name belongs to a SUPERVISOR-AUTHORED service, and is not available to a caller-chosen
+    /// one. Survives the service's death, which `valid` deliberately does not - see `reserve`.
+    reserved:    bool,
     name_len:    u8,
     name:        [u8; NAME_MAX],
     endpoint_id: EndpointId,
@@ -23,6 +26,7 @@ impl NameEntry {
     const fn empty() -> Self {
         Self {
             valid: false,
+            reserved: false,
             name_len: 0,
             name: [0u8; NAME_MAX],
             endpoint_id: EndpointId(0),
@@ -86,20 +90,23 @@ pub fn register(name: &str, endpoint_id: EndpointId) {
         }
     }
 
-    // Update existing entry.
+    // Update existing entry. `valid || reserved`, because a RESERVED entry for a dead service keeps
+    // its name while its endpoint is gone - re-registering that name is exactly what a respawn does.
     for entry in names.iter_mut() {
-        if entry.valid && entry.name_len == len
+        if (entry.valid || entry.reserved) && entry.name_len == len
             && &entry.name[..len as usize] == bytes
         {
+            entry.valid       = true;
             entry.endpoint_id = endpoint_id;
             drop(names);
             report_evicted(evicted, name, endpoint_id);
             return;
         }
     }
-    // Insert in first free slot.
+    // Insert in first free slot. A reserved entry is OCCUPIED even with `valid == false`: its whole
+    // purpose is to hold the name down after its service dies.
     for entry in names.iter_mut() {
-        if !entry.valid {
+        if !entry.valid && !entry.reserved {
             entry.valid       = true;
             entry.name_len    = len;
             entry.name        = [0u8; NAME_MAX];
@@ -139,6 +146,64 @@ pub fn unregister(name: &str) {
 /// is being respawned (so their death-notifications are lost). The `endpoint_id` guard is the
 /// respawn-race safety: if a fresh instance has *already* re-registered the name to a new endpoint,
 /// this is a no-op - we must never unregister the live one.
+/// Reserve `name` for a SUPERVISOR-AUTHORED service, permanently.
+///
+/// Restores a guarantee the step-C moves silently removed. `spawn_probe` lets a SPAWN holder choose
+/// the name of the task it starts, and refused "a real service's name" by asking the kernel's service
+/// catalogue. Moving the catalogue to the supervisor emptied that catalogue, so the refusal set
+/// shrank to `{supervisor, probe}` and every other name - `fs`, `shell`, `logger`, `console` - became
+/// available to squat.
+///
+/// The attack that guard was written against: wait for `fs` to die, start the PROBE binary under the
+/// name `fs`, and clients reacquiring by name (14.3) wire themselves to it. The kernel's name
+/// directory is a recovery ANCHOR, and an anchor that can be squatted is not one.
+///
+/// A reservation therefore outlives the service, because the danger window is precisely when the
+/// service is DEAD - which is when a liveness check passes and `unregister_endpoint` has already
+/// dropped the mapping. It does NOT make the name resolve: `lookup` still requires `valid`, so a dead
+/// service's name misses exactly as before and its clients still get `EndpointDead`.
+///
+/// Reserving at spawn (rather than from a declared list) keeps this MECHANISM, not policy: the kernel
+/// learns nothing about which services exist, it only remembers that a name it was given by the
+/// spawner is not a name a caller may choose. That is sufficient for the actual threat - a client can
+/// only be misdirected to a name it was wired to, and being wired to it means it was spawned, hence
+/// reserved.
+pub fn reserve(name: &str) {
+    let bytes = name.as_bytes();
+    if bytes.len() > NAME_MAX { return; }
+    let len = bytes.len() as u8;
+    let mut names = NAMES.lock_irq();
+    for entry in names.iter_mut() {
+        if (entry.valid || entry.reserved) && entry.name_len == len
+            && &entry.name[..len as usize] == bytes
+        {
+            entry.reserved = true;
+            return;
+        }
+    }
+    for entry in names.iter_mut() {
+        if !entry.valid && !entry.reserved {
+            entry.reserved = true;
+            entry.name_len = len;
+            entry.name     = [0u8; NAME_MAX];
+            entry.name[..len as usize].copy_from_slice(bytes);
+            return;
+        }
+    }
+    drop(names);
+    // Loud, because the consequence is a name that can now be squatted (invariant 12).
+    crate::kprintln!("ipc::names: table full, cannot RESERVE '{}' - it is squattable", name);
+}
+
+/// Is `name` reserved for a supervisor-authored service? See `reserve`.
+pub fn is_reserved(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.len() > NAME_MAX { return false; }
+    let len = bytes.len() as u8;
+    let names = NAMES.lock_irq();
+    names.iter().any(|e| e.reserved && e.name_len == len && &e.name[..len as usize] == bytes)
+}
+
 pub fn unregister_endpoint(name: &str, endpoint_id: EndpointId) {
     let bytes = name.as_bytes();
     if bytes.len() > NAME_MAX { return; }

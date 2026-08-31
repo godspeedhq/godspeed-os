@@ -907,6 +907,30 @@ does the service still call the syscall?
   runtime-compromised supervisor can introduce new code, and nothing before step 2 prevents it.
   (The IRQ-routing half of this concern is closed - see 9.1 - but the code-introduction half stands
   and is the reason step 2 exists.)
+- **OPEN, and a REGRESSION THIS WORK CAUSED: a real service's name can be squatted before that
+  service first starts.** `spawn_probe` lets a SPAWN holder choose the name of the task it starts,
+  and refused "a real service's name" by asking the kernel's service catalogue. Moving that catalogue
+  to the supervisor emptied it, so the refusal set silently shrank to `{supervisor, probe}`. The
+  attack it guarded against is concrete: the kernel name directory is the recovery anchor clients
+  reacquire through (§14.3), so a probe registered as `fs` collects `fs`'s clients.
+
+  **Partly closed.** `ipc::names::reserve` now holds a name down permanently the moment the
+  supervisor spawns it, surviving the service's death - which is when squatting it would work, since
+  `unregister_endpoint` has already dropped the mapping and a liveness check would pass. Pinned by
+  the A9b arm of §22 Adversarial A9.
+
+  **The residual is the window BEFORE a service first starts**, and it is demonstrated, not
+  theoretical: in the adversarial build the probes run before `fs` and `shell`, and a probe takes
+  either name successfully. It is not confined to test builds - the `shell` holds SPAWN and starts
+  before `net-stack` and `nic-driver` on a normal boot.
+
+  Closing it needs the supervisor to reserve its whole managed set BEFORE it spawns anything, and it
+  currently has no way to say so: reserving is a side effect of spawning, not something the name
+  authority can declare. Every option costs something - a `ReserveName` syscall is new kernel surface
+  (though on a directory the kernel already owns); a separate namespace for caller-chosen names makes
+  squatting structurally impossible but touches every peer-resolution path. Recorded here per §26.7
+  rather than left to be discovered by whoever trusts the guard.
+
 - **`probe` is the last non-supervisor row.** It needs two things, both of which fit the existing
   model: a `SPAWN_FLAG_PEERS_GRANT` bit (`probe-5a-send` gets grantable peer caps, which the
   supervisor already holds and so may pass on), and a class for the TEST interrupt line that
