@@ -840,14 +840,34 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     // NOT-YET-HONOURED FIELDS ARE REFUSED, NOT IGNORED (invariant 12). A spawner asking for an MMIO
     // window or a privilege this kernel does not yet grant must hear so, rather than receive a task
     // that silently lacks what it needs and fails later somewhere unrelated.
-    if req.privileges != 0 || req.hw_flags != 0 || req.mmio_base != 0 || req.mmio_len != 0
+    // HARDWARE fields are still refused; PRIVILEGES are honoured below. Refusing rather than ignoring
+    // is the rule (invariant 12): a spawner asking for an MMIO window this kernel will not grant must
+    // hear so, not receive a task that silently lacks it and fails somewhere unrelated.
+    if req.hw_flags != 0 || req.mmio_base != 0 || req.mmio_len != 0
         || req.dma_pages != 0 || req.bdf != 0 || req.irq_count != 0
     {
         crate::kprintln!(
-            "task: SpawnImage refused - hardware/privilege fields not honoured yet (privileges={:#x} hw_flags={:#x} mmio={:#x}+{:#x} dma_pages={} bdf={:#x} irqs={})",
-            req.privileges, req.hw_flags, req.mmio_base, req.mmio_len, req.dma_pages, req.bdf,
-            req.irq_count);
+            "task: SpawnImage refused - hardware fields not honoured yet (hw_flags={:#x} mmio={:#x}+{:#x} dma_pages={} bdf={:#x} irqs={})",
+            req.hw_flags, req.mmio_base, req.mmio_len, req.dma_pages, req.bdf, req.irq_count);
         return -1;
+    }
+
+    // A CALLER MAY NOT GRANT ITSELF AUTHORITY IT DOES NOT HOLD.
+    //
+    // This is the whole security content of the privileges field, and it is the same rule
+    // `SpawnWithCaps` applies to an installed cap (8.5, 7.3): a spawner may hand a child only what it
+    // could already hand it. So each requested privilege is checked against the CALLER's own holdings
+    // - the supervisor holds SPAWN and SERVICE_CONTROL and may therefore pass them on; it does not
+    // hold REBOOT, so it cannot mint one for a child no matter what it asks for.
+    //
+    // Without this the field would be exactly the ambient authority 3.1 forbids: "ask and receive".
+    if req.privileges != 0 {
+        if let Some(missing) = crate::task::privileges_caller_lacks(req.privileges) {
+            crate::kprintln!(
+                "task: SpawnImage refused - caller asked to grant '{}' which it does not hold itself",
+                missing);
+            return -1;
+        }
     }
 
     let name_len = req.name_len as usize;
@@ -926,6 +946,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         req.flags & SPAWN_FLAG_REQ_CONSOLE != 0,
         &peers[..np],
         if ni > 0 { Some(&installs[..ni]) } else { None },
+        req.privileges,
     ) {
         // Hand back a SEND|GRANT cap to the new endpoint, as `SpawnReturningEndpoint` does: the
         // spawner has to be able to record `name -> cap` for the service it just started, or it

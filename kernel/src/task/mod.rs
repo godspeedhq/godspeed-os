@@ -527,7 +527,10 @@ fn service_hw(name: &str) -> (HwClass, bool) {
         "ehci"                                 => (HwClass::Ehci, false),
         "block-driver"                         => (HwClass::Ahci, false),
         "nic-driver" | "e1000"                 => (HwClass::Nic,  false),
-        "fs" | "net-stack" | "resource-server" => (HwClass::None, true),
+        // `resource-server` moved to the supervisor (step C): its RESOURCE_MINT now arrives in the
+        // spawn request, checked against what the SUPERVISOR holds, instead of being granted here by
+        // name. `fs` and `net-stack` still take the by-name path until they move too.
+        "fs" | "net-stack" => (HwClass::None, true),
         _                                      => (HwClass::None, false),
     }
 }
@@ -539,6 +542,76 @@ fn service_hw(name: &str) -> (HwClass, bool) {
 /// authority; IV honor contracts declaratively): the spawn path reads these booleans, never a re-derived
 /// `name ==` check. `is_probe` (the caller's ELF is `PROBE_ELF`) covers the whole test-probe family by
 /// identity, so no probe is missed by name.
+/// Bit positions for `SpawnRequest::privileges`. One bit per field of `Privileges` below, in
+/// declaration order, so the wire form and the struct cannot drift apart silently.
+///
+/// A caller may only request bits it HOLDS ITSELF (`privileges_caller_lacks`), which is what keeps
+/// this from being ambient authority (3.1): a spawner passes on what it has, it does not mint.
+pub mod privbits {
+    pub const SPAWN:           u32 = 1 << 0;
+    pub const CONSOLE_PUSH:    u32 = 1 << 1;
+    pub const INTROSPECT:      u32 = 1 << 2;
+    pub const SERVICE_CONTROL: u32 = 1 << 3;
+    pub const FIRE_IRQ:        u32 = 1 << 4;
+    pub const REBOOT:          u32 = 1 << 5;
+    pub const ACQUIRE_ANY:     u32 = 1 << 6;
+    pub const RESOURCE_MINT:   u32 = 1 << 7;
+    /// Every bit this kernel understands. Anything outside it is refused, so a newer spawner cannot
+    /// quietly ask for a privilege this kernel would ignore.
+    pub const KNOWN: u32 = SPAWN | CONSOLE_PUSH | INTROSPECT | SERVICE_CONTROL
+                         | FIRE_IRQ | REBOOT | ACQUIRE_ANY | RESOURCE_MINT;
+}
+
+/// Which requested privilege the CALLING task does not itself hold, if any.
+///
+/// `None` means every requested bit is one the caller could already exercise, so passing it to a
+/// child grants nothing new - the same non-escalation argument as an installed cap (7.3).
+pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
+    use crate::capability::*;
+    if requested & !privbits::KNOWN != 0 { return Some("an unknown privilege bit"); }
+    let checks: [(u32, ResourceId, &'static str); 8] = [
+        (privbits::SPAWN,           SPAWN_RESOURCE,           "SPAWN"),
+        (privbits::CONSOLE_PUSH,    CONSOLE_PUSH_RESOURCE,    "CONSOLE_PUSH"),
+        (privbits::INTROSPECT,      INTROSPECT_RESOURCE,      "INTROSPECT"),
+        (privbits::SERVICE_CONTROL, SERVICE_CONTROL_RESOURCE, "SERVICE_CONTROL"),
+        (privbits::FIRE_IRQ,        FIRE_IRQ_RESOURCE,        "FIRE_IRQ"),
+        (privbits::REBOOT,          REBOOT_RESOURCE,          "REBOOT"),
+        (privbits::ACQUIRE_ANY,     ACQUIRE_ANY_RESOURCE,     "ACQUIRE_ANY"),
+        (privbits::RESOURCE_MINT,   RESOURCE_MINT_RESOURCE,   "RESOURCE_MINT"),
+    ];
+    for (bit, res, label) in checks {
+        // GRANT, not WRITE. Delegating an authority and EXERCISING it are different rights (7.4), and
+        // conflating them would force the supervisor to hold every privilege it might ever pass on -
+        // a maximally-privileged supervisor that could mint resources, reboot the machine and inject
+        // keystrokes, purely so it could delegate those things. With GRANT-only caps it can pass them
+        // on and never use them, which is strictly less authority than the alternative.
+        if requested & bit != 0 && !scheduler::current_task_holds_resource(res, Rights::GRANT) {
+            return Some(label);
+        }
+    }
+    None
+}
+
+/// Privileges the SUPERVISOR may DELEGATE to a service it spawns, without being able to use them.
+///
+/// Minted GRANT-only: `resource_mint` (and every other privileged syscall) checks for WRITE, so the
+/// supervisor cannot exercise any of these - it can only pass them to a child. That is the whole
+/// point: a spawner needs the right to DELEGATE authority, not the authority itself.
+///
+/// This is not new reach. The supervisor could already start `fs`, which holds RESOURCE_MINT by name;
+/// being able to name the privilege changes which BINARY receives it, not whether the privilege can
+/// be obtained at all - and step 2's signing is what re-anchors "which binary" (docs/service-ownership.md).
+const SUPERVISOR_DELEGATABLE: &[(u32, crate::capability::cap::ResourceId)] = &[
+    (privbits::RESOURCE_MINT,   RESOURCE_MINT_RESOURCE),
+    (privbits::INTROSPECT,      INTROSPECT_RESOURCE),
+    (privbits::SERVICE_CONTROL, SERVICE_CONTROL_RESOURCE),
+    (privbits::SPAWN,           SPAWN_RESOURCE),
+    (privbits::ACQUIRE_ANY,     ACQUIRE_ANY_RESOURCE),
+    (privbits::CONSOLE_PUSH,    CONSOLE_PUSH_RESOURCE),
+    (privbits::FIRE_IRQ,        FIRE_IRQ_RESOURCE),
+    (privbits::REBOOT,          REBOOT_RESOURCE),
+];
+
 struct Privileges {
     spawn:           bool, // SPAWN: create tasks (supervisor, the shell, chaos' spawn-burst, probes)
     console_push:    bool, // CONSOLE_PUSH: inject keystrokes into the input ring (USB keyboard drivers)
@@ -1108,22 +1181,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // resource-server (examples/resource-server): the delegated-resource-capability OWNER (§7.10).
-        // Owns its endpoint (a cap holder's `resource_invoke` is routed here, badged) and SENDs to
-        // `holder` to GRANT it the minted resource cap. Holds RESOURCE_MINT (granted by name below,
-        // like fs). Spawned only in the resource-test build (`osdev test resource-server`); idle/absent
-        // everywhere else - standalone, without the mint grant, it just idles (graceful degrade, §7.10).
-        "resource-server" => Some(("resource-server", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_RESOURCE_SERVER_ELF")),
-            has_recv_endpoint: true,            // resource_invoke is routed here, badged with (rid, right)
-            send_peers:        &["holder"],     // sends the GRANT (the resource cap) to holder
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
         // ----------------------------------------------------------------
         // Adversarial-test probes - Milestone 13.
         // Victim/passive services must be listed before their attackers so
@@ -1298,7 +1355,7 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
     }
     let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
         cfg.has_recv_endpoint, &pipe_peers[..np], cfg.probe_mode, cfg.send_peers_grant,
-        cfg.memory_limit, cfg.hw_irqs, cfg.has_console_read, None);
+        cfg.memory_limit, cfg.hw_irqs, cfg.has_console_read, None, None);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn pipe '{}' -> '{}' failed: {:?}", producer, sink, e);
     }
@@ -1329,6 +1386,9 @@ pub fn spawn_from_image(
     // Caller-provided peer caps, GRANT-validated by the syscall. `None` = name-wire the peers
     // instead, which is the path a service with no provided caps takes.
     installs:          Option<&[InstallCap]>,
+    // Privilege bits the spawner asks the child be given. Already checked against the CALLER's own
+    // holdings by the syscall, so this cannot escalate (3.1, 7.3).
+    privileges:        u32,
 ) -> Result<Option<EndpointId>, SpawnError> {
     if service_config(name).is_some() {
         crate::kprintln!("task: SpawnImage '{}' rejected: that name belongs to the kernel catalogue", name);
@@ -1343,7 +1403,8 @@ pub fn spawn_from_image(
     let mem = if memory_limit == 0 { 64 * 1024 * 1024 } else { memory_limit };
 
     let result = spawn_service_with_image(name, image, core_id, has_recv_endpoint, peers, 0,
-                                          false, mem, &[], has_console_read, installs);
+                                          false, mem, &[], has_console_read,
+                                          Some(privileges), installs);
     if let Err(ref e) = result {
         crate::kprintln!("task: SpawnImage '{}' failed: {:?}", name, e);
     }
@@ -1415,7 +1476,7 @@ pub fn spawn_probe(name: &str, core_override: Option<u32>, p: ProbeParams, peers
     let result = spawn_service_with_image(name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
                               p.has_recv_endpoint, peers, p.mode,
                               grant, mem, hw_irqs,
-                              false, None);
+                              false, None, None);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn probe '{}' failed: {:?}", name, e);
     }
@@ -1456,7 +1517,7 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<O
     let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
                               cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
-                              cfg.has_console_read, None);
+                              cfg.has_console_read, None, None);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn '{}' failed: {:?}", name, e);
     }
@@ -1479,7 +1540,7 @@ pub fn spawn_service_by_name_with_installs(
     let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
                               cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
-                              cfg.has_console_read, Some(installs));
+                              cfg.has_console_read, None, Some(installs));
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn '{}' (with installs) failed: {:?}", name, e);
     }
@@ -1553,6 +1614,10 @@ fn spawn_service_with_image(
     memory_limit:      u64,
     hw_irqs:           &[u8],
     has_console_read:  bool,
+    // `Some(bits)` = the SPAWNER named these privileges (SpawnImage, already checked against what the
+    // caller itself holds). `None` = resolve them from the kernel's by-name table, which is the
+    // catalogue path and goes away with the catalogue.
+    priv_override:     Option<u32>,
     // Phase 0b (docs/naming-design.md): if `Some`, wire the child's send-peers from these
     // caller-supplied `(label, cap)` entries instead of resolving `send_peers` against the kernel
     // name table. The kernel installs each cap and records `label → slot` in the child's send-peer
@@ -1563,7 +1628,15 @@ fn spawn_service_with_image(
     // The declared hardware class + mint authority for this service (audit M7 / T1 Phase B). Every
     // MMIO / DMA / IOMMU / bus-master / RESOURCE_MINT grant below is driven off these, not a `name ==`
     // check - one declaration (`service_hw`), reconciled against the .toml for contracted services.
-    let (hw, resource_mint) = service_hw(name);
+    let (hw, resource_mint_by_name) = service_hw(name);
+    // RESOURCE_MINT is NOT a field of `Privileges` - it is a separate flag out of `service_hw`, so a
+    // spawner-supplied privilege set has to be threaded to it explicitly. Missing this meant a moved
+    // service spawned fine and then idled with "no RESOURCE_MINT cap", which the dedicated
+    // `osdev test resource-server` caught and identity/shell/files could not: none of them exercise it.
+    let resource_mint = match priv_override {
+        Some(bits) => bits & privbits::RESOURCE_MINT != 0,
+        None       => resource_mint_by_name,
+    };
 
     // DIAG step markers (gated by SPAWN_TRACE; off by default - see its doc).
     if SPAWN_TRACE { crate::kprintln!("spawn[elf]: '{}'", name); }
@@ -1635,7 +1708,27 @@ fn spawn_service_with_image(
         crate::loader::ImageSource::Kernel(b) => core::ptr::eq(b.as_ptr(), PROBE_ELF.as_ptr()),
         crate::loader::ImageSource::User { .. } => false,
     };
-    let privs = service_privileges(name, is_probe);
+    let privs = match priv_override {
+        // The spawner named them. Every bit was checked against the CALLER's own holdings before we
+        // got here, so this cannot escalate - it can only pass on what the spawner already has.
+        Some(bits) => Privileges {
+            spawn:           bits & privbits::SPAWN           != 0,
+            console_push:    bits & privbits::CONSOLE_PUSH    != 0,
+            introspect:      bits & privbits::INTROSPECT      != 0,
+            service_control: bits & privbits::SERVICE_CONTROL != 0,
+            fire_irq:        bits & privbits::FIRE_IRQ        != 0,
+            reboot:          bits & privbits::REBOOT          != 0,
+            acquire_any:     bits & privbits::ACQUIRE_ANY     != 0,
+            // Not yet expressible in the wire form; the by-name table still answers for these on the
+            // catalogue path, and a moved service simply does not get them (refused, not silent).
+            net_device:      false,
+            usb_disk:        false,
+            gpio:            false,
+            set_clock:       false,
+            set_clock_floor: false,
+        },
+        None => service_privileges(name, is_probe),
+    };
 
     let mut spawn_slot_u32 = u32::MAX;
     if privs.spawn {
@@ -1813,6 +1906,16 @@ fn spawn_service_with_image(
     // is never spawned, so the grant never fires.
     // `net-stack` mints SOCKET capabilities (a socket is a delegated resource cap, §7.10, the same
     // mechanism `fs` uses for files) - so it needs the same minting authority.
+    // The supervisor gets a GRANT-ONLY cap for every delegatable privilege, so it can pass authority
+    // to a service it spawns without being able to exercise any of it (see SUPERVISOR_DELEGATABLE).
+    if name == "supervisor" {
+        for (_, res) in SUPERVISOR_DELEGATABLE {
+            let d = mint_cap(*res, Rights::GRANT);
+            caps.insert(d)
+                .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+        }
+    }
+
     if resource_mint {
         let rm_cap = mint_cap(RESOURCE_MINT_RESOURCE, Rights::WRITE);
         caps.insert(rm_cap)
@@ -2334,7 +2437,7 @@ fn spawn_service_with_image(
 // supervisor up, which is the thing that has to work anyway. If that ever proves too large a first
 // step, the answer is a smaller supervisor - not a second spawn path in the kernel.
 pub fn spawn_supervisor() {
-    match spawn_service_with_image("supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None) {
+    match spawn_service_with_image("supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None, None) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => panic!("supervisor spawn failed: {:?}", e),
     }
@@ -2437,7 +2540,7 @@ pub fn poll_supervisor_respawn() {
     // the pressure eases. (Only the BOOT-time spawn_supervisor keeps its fatal panic - §22 Test 1B.)
     match spawn_service_with_image(
         "supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false,
-        64 * 1024 * 1024, &[], false, None,
+        64 * 1024 * 1024, &[], false, None, None,
     ) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => {

@@ -266,6 +266,19 @@ pub const SPAWN_REQUEST_VERSION:  u32 = 2;
 pub const SPAWN_FLAG_REQ_RECV:    u32 = 1 << 0;
 pub const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
 
+/// Bits for `SpawnRequest::privileges`. A spawner may only request what it HOLDS ITSELF - the kernel
+/// checks, and refuses otherwise - so this passes authority on, it never mints it (3.1, 7.3).
+pub mod privbits {
+    pub const SPAWN:           u32 = 1 << 0;
+    pub const CONSOLE_PUSH:    u32 = 1 << 1;
+    pub const INTROSPECT:      u32 = 1 << 2;
+    pub const SERVICE_CONTROL: u32 = 1 << 3;
+    pub const FIRE_IRQ:        u32 = 1 << 4;
+    pub const REBOOT:          u32 = 1 << 5;
+    pub const ACQUIRE_ANY:     u32 = 1 << 6;
+    pub const RESOURCE_MINT:   u32 = 1 << 7;
+}
+
 impl SpawnRequest {
     /// A request with everything the kernel does not yet honour left at zero.
     pub fn new(image: &[u8], name: &str) -> Self {

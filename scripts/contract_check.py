@@ -153,8 +153,11 @@ def parse_supervisor_images(name: str):
     except OSError:
         return None
     # ("name", NAME_ELF, flags, mem, core, &[peers])
+    # Tolerant of columns being APPENDED to the tuple (privileges was added after peers): match up to
+    # the peer list and ignore whatever follows. A parser that silently stops matching when a table
+    # grows is the failure this check exists to prevent - it did fail loudly, which is why this is here.
     m = re.search(r'\(\s*"' + re.escape(name) + r'"\s*,\s*[A-Z0-9_]+_ELF\s*,\s*([^,]+),\s*([^,]+),'
-                  r'\s*([^,]+),\s*&\[([^\]]*)\]\s*\)', src)
+                  r'\s*([^,]+),\s*&\[([^\]]*)\]', src)
     if not m:
         return None
     mem_expr, core_expr, peers_raw = m.group(2).strip(), m.group(3).strip(), m.group(4)
