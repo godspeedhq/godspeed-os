@@ -63,8 +63,15 @@ fn execute(ctx: &ServiceContext, line: &str) {
                 let n  = nb.len().min(buf.len() - 6);
                 buf[6..6 + n].copy_from_slice(&nb[..n]);
 
-                match ctx.request_with_reply_call_err(
-                        "supervisor", &Message::from_bytes(&buf[..6 + n]), 10) {
+                // The supervisor is restartable, so a cached cap to it goes stale on every respawn.
+                // Reacquire by name and retry ONCE on `Err` (the send failed - the peer is gone),
+                // never on `Ok(None)` (the deadline passed and the request may have landed).
+                let msg = Message::from_bytes(&buf[..6 + n]);
+                let mut answer = ctx.request_with_reply_call_err("supervisor", &msg, 10);
+                if answer.is_err() && ctx.reacquire_by_name("supervisor") {
+                    answer = ctx.request_with_reply_call_err("supervisor", &msg, 10);
+                }
+                match answer {
                     Ok(Some(reply)) => match reply.payload_bytes().first() {
                         Some(&CMD_OK) => ctx.log_fmt(format_args!("control: {} restarted", name)),
                         Some(&CMD_UNKNOWN) =>

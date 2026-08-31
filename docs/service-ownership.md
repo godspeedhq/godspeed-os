@@ -442,6 +442,64 @@ constitution already describes.
 `pong` is reverted to the catalogue for now so the tree stays green; `spawn_pong` is kept compiled
 (`#[allow(dead_code)]`) so the ABI cannot rot before the restart path lands.
 
+### What a service move actually costs: every caller of spawn-by-name
+
+Moving an image is the easy half. The hard half is that a service the kernel does not know cannot be
+spawned BY NAME through the kernel - and far more code did that than the catalogue suggested. Found
+one regression at a time:
+
+| caller | mechanism | found by |
+|---|---|---|
+| `control RESTART` | `ctx.spawn_on` | identity 6A/6B/10A/10B |
+| supervisor's own respawn | `spawn_returning_endpoint` | the same |
+| shell `spawn` | `ctx.spawn` | reading the code |
+| shell PIPES | `ctx.spawn_pipe` | files 189/33 |
+| shell `spawncap` | `spawn_returning_endpoint` | shell 67/99 |
+| shell `spawnwired` | `spawn_with_caps` | shell 67/99 |
+| `chaos` | `ctx.spawn` | shell 67/99 |
+
+Four are fixed and routed through the supervisor. The lesson is the SHAPE: fixing these one at a time
+is wrong, because the eighth is found by a regression rather than by reading. **The routing belongs in
+the SDK's `ctx.spawn*`** - ask the supervisor when the caller holds a supervisor peer, fall back to the
+kernel when it does not. The supervisor has no supervisor-peer, so it keeps the kernel path naturally.
+
+A pipe collapsed into the same thing on the way: **a pipe is not a special kind of spawn, it is a spawn
+whose producer is handed its downstream as a peer** - which is exactly what the kernel's own
+`spawn_service_pipe` does. One request shape covers both.
+
+### The blocker: only a SPAWNER can obtain a grantable cap
+
+`spawn_with_caps` TRANSFERS a cap into the child, and a transfer requires `GRANT` (8.5). Only a
+service's SPAWNER is handed a `SEND|GRANT` cap to it; `acquire_send_cap` yields SEND alone, and rights
+never widen (7.3).
+
+So once the supervisor owns a service's image, **nothing else can ever obtain a grantable cap to that
+service.** No amount of acquiring differently fixes it. The supervisor must hand one back:
+
+```
+   today   CMD_SPAWN reply = [status]
+   needed  CMD_SPAWN reply = [status] + an embedded SEND|GRANT cap to the new endpoint
+```
+
+That is right on its own terms - the supervisor owns what it spawns, so it should be the principal
+that delegates access to it - but it is a protocol change, and it is what `spawnwired` (Phase-0b)
+needs before `pong` can move.
+
+### Where this stopped, and why
+
+Three leaves moved: `roster`, `reply-server`, `holder` - nothing else spawns or wires to them. Pin
+29 -> 26.
+
+`pong`, `greet`, `upper` and `mem-pressure` were moved and REVERTED. Each is referenced by something
+that spawns it by name (`spawnwired`, the pipe tests, `chaos`), and the three blockers above are
+prerequisites rather than details. Reverting is sequencing, not scope reduction: the infrastructure
+(`SpawnImage`, the loader, the command channel, the reacquire recovery, the widened contract gate) is
+all in place and green.
+
+**A correction worth recording.** The `pong` move was reported as "proven end to end" on the strength
+of identity 24/0/0. The SHELL suite - not run at the time - fails on it, and would have then. One
+suite is not end to end, and the commit message that says so is wrong.
+
 ### The double-fetch the loader closes
 
 A user image is MUTABLE BY ITS OWNER while the kernel reads it. Validating the program headers in

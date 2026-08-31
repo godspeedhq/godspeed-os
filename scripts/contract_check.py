@@ -139,6 +139,33 @@ def parse_kernel(name: str, source: str) -> dict | None:
     return {"limit": limit, "core": core, "send": send}
 
 
+
+# Step C (docs/service-ownership.md): a service's config moves from the kernel's `service_config` to
+# the SUPERVISOR's `IMAGES` table as its image moves. The contract is still the source of truth; this
+# reconciles it against wherever the config actually LIVES, so a service moving out of the kernel does
+# not quietly escape the check. The table deliberately carries the same fields the kernel row did.
+SUPERVISOR_MAIN = SERVICES / "supervisor" / "src" / "main.rs"
+
+def parse_supervisor_images(name: str):
+    """The supervisor's IMAGES row for `name`, in the same shape `parse_kernel` returns, or None."""
+    try:
+        src = SUPERVISOR_MAIN.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    # ("name", NAME_ELF, flags, mem, core, &[peers])
+    m = re.search(r'\(\s*"' + re.escape(name) + r'"\s*,\s*[A-Z0-9_]+_ELF\s*,\s*([^,]+),\s*([^,]+),'
+                  r'\s*([^,]+),\s*&\[([^\]]*)\]\s*\)', src)
+    if not m:
+        return None
+    mem_expr, core_expr, peers_raw = m.group(2).strip(), m.group(3).strip(), m.group(4)
+    lm  = re.search(r'(\d+)\s*\*\s*1024\s*\*\s*1024', mem_expr)
+    return {
+        "limit": int(lm.group(1)) * 1024 * 1024 if lm else None,
+        "core":  None if "u32::MAX" in core_expr else int(core_expr),
+        "send":  sorted(re.findall(r'"([^"]+)"', peers_raw)),
+    }
+
+
 def main() -> int:
     source = KERNEL_CFG.read_text(encoding="utf-8")
     kernel_hw = parse_service_hw(source)
@@ -153,7 +180,11 @@ def main() -> int:
         t = parse_toml(toml_path)
         k = parse_kernel(name, source)
         if k is None:
-            failures.append(f"  FAIL  {name}: no `service_config` arm found in kernel/src/task/mod.rs")
+            # Not in the kernel: it may have moved to the supervisor (step C). Reconcile there.
+            k = parse_supervisor_images(name)
+        if k is None:
+            failures.append(f"  FAIL  {name}: no config found - neither a `service_config` arm in "
+                            f"kernel/src/task/mod.rs nor an `IMAGES` row in services/supervisor")
             continue
 
         if t["limit"] != k["limit"]:

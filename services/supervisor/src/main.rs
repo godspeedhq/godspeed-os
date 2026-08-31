@@ -58,7 +58,16 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
     let status = if payload.len() >= 6 && (payload[1] == CMD_RESTART || payload[1] == CMD_SPAWN) {
         let core = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
         match core::str::from_utf8(&payload[6..]) {
-            Ok(name) if !name.is_empty() => {
+            // `name` may carry a NUL-separated PEER LIST after it, exactly as SpawnRequest's payload
+            // does: `producer\0sink` is how a pipe arrives. A pipe is not a special kind of spawn -
+            // it is a spawn whose producer is given its downstream as a peer, which is precisely what
+            // the kernel's own `spawn_service_pipe` does.
+            Ok(spec) if !spec.is_empty() => {
+                let mut it = spec.split('\0');
+                let name = match it.next() { Some(n) if !n.is_empty() => n, _ => return true };
+                let mut peers: [&str; 6] = [""; 6];
+                let mut np = 0usize;
+                for pr in it { if !pr.is_empty() && np < peers.len() { peers[np] = pr; np += 1; } }
                 let restart = payload[1] == CMD_RESTART;
                 ctx.log_fmt(format_args!("supervisor: {} {} core={}",
                     if restart { "RESTART" } else { "SPAWN" },
@@ -67,11 +76,22 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
                 // restarting a service that already died is exactly the case the harness drives.
                 // SPAWN does not kill - starting something already running must fail, not replace it.
                 if restart { let _ = ctx.kill(name); }
-                // No core given: use the WIRED respawn, so a service with peers (fs -> block-driver)
-                // gets them provided rather than only name-wired. With an explicit core, place it
-                // there - which is what `control` did before, so no wiring is lost that it had.
-                let ok = if core == u32::MAX { respawn_retry(ctx, map, name) }
-                         else                { spawn_mapped(ctx, map, name, core) };
+                let ok = if np > 0 {
+                    // Peers supplied (a pipe). A supervisor-held image takes them directly; a
+                    // kernel-held one goes through the kernel's pipe spawn, which prepends the
+                    // downstream to the producer's declared peers the same way.
+                    match spawn_by_image(ctx, name, core, &peers[..np]) {
+                        Some(Ok(_))  => true,
+                        Some(Err(_)) => false,
+                        None         => ctx.spawn_pipe(name, peers[0]).is_ok(),
+                    }
+                } else if core == u32::MAX {
+                    // No core given: the WIRED respawn, so a service with peers (fs -> block-driver)
+                    // gets them provided rather than only name-wired.
+                    respawn_retry(ctx, map, name)
+                } else {
+                    spawn_mapped(ctx, map, name, core)
+                };
                 if ok { CMD_OK } else { CMD_FAILED }
             }
             _ => CMD_UNKNOWN,
@@ -99,12 +119,24 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
 // restart is what broke identity 6A/6B/10A/10B the first time.
 // ---------------------------------------------------------------------------------------------
 
-/// The `pong` image, carried here rather than by the kernel.
-static PONG_ELF: &[u8] = include_bytes!(env!("SVC_PONG_ELF"));
+/// The images carried here rather than by the kernel. Each one deleted a `service_config` row.
+static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
+static REPLY_SERVER_ELF: &[u8] = include_bytes!(env!("SVC_REPLY_SERVER_ELF"));
+static HOLDER_ELF: &[u8] = include_bytes!(env!("SVC_HOLDER_ELF"));
 
-/// `(name, image, flags, memory limit)` for every service whose image the supervisor holds.
-const IMAGES: &[(&str, &[u8], u32, u64)] = &[
-    ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024),
+/// `(name, image, flags, memory limit, preferred core, send peers)` for every service whose image
+/// the supervisor holds.
+///
+/// It carries everything the service's CONTRACT declares, deliberately. The contract is the source of
+/// truth (Commandment III) and `scripts/contract_check.py` reconciles it against wherever the config
+/// actually lives - so a service moving out of the kernel must not lose a field on the way, or the
+/// move would quietly weaken the check that keeps the two honest.
+///
+/// `u32::MAX` as the core means "no preference" (9.2 round-robin); a caller-supplied core overrides it.
+const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str])] = &[
+    ("roster", ROSTER_ELF, 0, 64 * 1024 * 1024, u32::MAX, &[]),
+    ("reply-server", REPLY_SERVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[]),
+    ("holder", HOLDER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[]),
 ];
 
 /// Spawn `name` from a supervisor-held image, if we hold one. `None` means "not ours - use the
@@ -112,13 +144,17 @@ const IMAGES: &[(&str, &[u8], u32, u64)] = &[
 fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str])
     -> Option<Result<Option<CapHandle>, godspeed_sdk::Error>>
 {
-    let &(_, image, flags, mem) = IMAGES.iter().find(|(n, ..)| *n == name)?;
+    let &(_, image, flags, mem, table_core, table_peers) = IMAGES.iter().find(|(n, ..)| *n == name)?;
     let mut req = godspeed_sdk::service_context::SpawnRequest::new(image, name);
-    req.core         = core;
+    // An explicit core from the caller wins (a RESTART override, 14.4); otherwise the table's
+    // preference, which is what the contract declares.
+    req.core         = if core == 0xFFFF || core == u32::MAX { table_core } else { core };
     req.flags        = flags;
     req.memory_limit = mem;
+    // Peers likewise: a caller that has caps to provide passes them, otherwise the declared list.
+    let use_peers = if peers.is_empty() { table_peers } else { peers };
     let mut buf = [0u8; 128];
-    Some(ctx.spawn_image(&mut req, &mut buf, peers))
+    Some(ctx.spawn_image(&mut req, &mut buf, use_peers))
 }
 
 #[path = "../../probe/src/table.rs"]
@@ -478,10 +514,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // shell (`spawn pong` then `spawn ping`) when you want the cross-core demo.
     #[cfg(not(any(feature = "bare-metal", feature = "idle-only", feature = "bp2-only", feature = "perf-iso")))]
     {
-        // STEP C: pong's image is carried HERE, not by the kernel. `spawn_mapped` dispatches to the
-        // SpawnImage path via `spawn_by_image`, and so does every restart - which is the half that
-        // matters, since the kernel has no `pong` row to fall back on.
-        ctx.log("supervisor: spawning pong (image supplied by supervisor)...");
+        ctx.log("supervisor: spawning pong...");
         if !spawn_mapped(&ctx, &mut name_map, "pong", 1) {
             ctx.log("supervisor: WARN: failed to spawn pong on core 1, trying core 0");
             let _ = spawn_mapped(&ctx, &mut name_map, "pong", 0);

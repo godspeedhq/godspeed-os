@@ -780,19 +780,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // mem-pressure: a spawn-on-demand memory-pressure victim for `chaos mem-pressure` (allocs 4 MiB
-        // chunks up to this limit, then AllocDenied; killed to reclaim). Not in any auto-spawn set.
-        "mem-pressure" => Some(("mem-pressure", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_MEM_PRESSURE_ELF")),
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,
-            memory_limit:      32 * 1024 * 1024, // ~8 chunks then AllocDenied; a clear free-frames swing
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
         // chaos: the spawn-on-demand system-stress orchestrator for `chaos max-carnage`. It kills +
         // floods other services and is the one program a run never kills (it excludes ITSELF). Holds
         // SERVICE_CONTROL (kill), INTROSPECT (task_stat victim selection), ACQUIRE_ANY (flood), SPAWN
@@ -809,32 +796,9 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  true,
         })),
-        "ping" => Some(("ping", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PING_ELF")),
-            has_recv_endpoint: true,
-            // ping reaches pong (name-wired here, or supervisor-provided); it reacquires pong by
-            // name via the kernel directory on EndpointDead.
-            send_peers:        &["pong"],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // ----------------------------------------------------------------
-        // greet / upper - capability-mediated pipe demo (Appendix D.3).
-        // `upper` recvs and uppercases each line. `greet` has NO static send
-        // authority (send_peers empty) - the shell delegates it a SEND cap to
-        // upper's endpoint at spawn, which becomes its send_peers[0]. Authority
-        // is granted at composition time, not held by contract.
-        // ----------------------------------------------------------------
         "upper" => Some(("upper", ServiceConfig {
             elf:               include_bytes!(env!("SVC_UPPER_ELF")),
             has_recv_endpoint: true,
-            // A pipe SINK is recorded in the kernel name-directory at spawn; the shell resolves its
-            // endpoint by name at runtime (`builtin | service`, `acquire_send_grant_cap`) - no
-            // contracted cap.
             send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
@@ -846,7 +810,7 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "greet" => Some(("greet", ServiceConfig {
             elf:               include_bytes!(env!("SVC_GREET_ELF")),
             has_recv_endpoint: false,
-            send_peers:        &[], // delegated at runtime by the shell, not contracted
+            send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
             probe_mode:        0,
@@ -854,14 +818,36 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // roster - record-producing pipe demo (docs/records.md): emits a typed Table as JSON
-        // through the shell-delegated SEND cap. Same zero-ambient-authority shape as greet.
-        "roster" => Some(("roster", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_ROSTER_ELF")),
+        "mem-pressure" => Some(("mem-pressure", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_MEM_PRESSURE_ELF")),
             has_recv_endpoint: false,
-            send_peers:        &[], // delegated at runtime by the shell, not contracted
+            send_peers:        &[],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
+            probe_mode:        0,
+            memory_limit:      32 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        "pong" => Some(("pong", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PONG_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
+            send_peers_grant:  false,
+            preferred_core:    1,
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
+        "ping" => Some(("ping", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PING_ELF")),
+            has_recv_endpoint: true,
+            // ping reaches pong (name-wired here, or supervisor-provided); it reacquires pong by
+            // name via the kernel directory on EndpointDead.
+            send_peers:        &["pong"],
+            send_peers_grant:  false,
+            preferred_core:    0,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
@@ -1230,21 +1216,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        // reply-server (examples/reply-server): the request/reply (RPC) SERVER. Owns its endpoint
-        // (clients send requests here) and has NO named send peer - it replies only over the reply
-        // capability each request embeds (§7.10/§8.5). Spawned only in the reply-test build (`osdev
-        // test reply-server`); idle/absent everywhere else - standalone it just blocks on recv().
-        "reply-server" => Some(("reply-server", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_REPLY_SERVER_ELF")),
-            has_recv_endpoint: true,            // clients send requests here; replies via embedded cap
-            send_peers:        &[],             // no named peer: it answers over the client's reply cap
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
         // asker (examples/asker): the request/reply CLIENT that exercises reply-server. Owns its
         // endpoint (reply-server replies there via the embedded reply cap) and sends to `reply-server`.
         // Spawned only in the reply-test build (`osdev test reply-server`); idle/absent elsewhere.
@@ -1268,21 +1239,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             elf:               include_bytes!(env!("SVC_RESOURCE_SERVER_ELF")),
             has_recv_endpoint: true,            // resource_invoke is routed here, badged with (rid, right)
             send_peers:        &["holder"],     // sends the GRANT (the resource cap) to holder
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // holder (examples/holder): the delegated-resource-capability CLIENT. Owns its endpoint (the
-        // GRANT lands here, and resource-server's replies to its cap invocations come back here). It
-        // declares NO send-peer: it acts only through the granted cap (the kernel routes a
-        // resource_invoke to the owner). Spawned only in the resource-test build; idle/absent elsewhere.
-        "holder" => Some(("holder", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_HOLDER_ELF")),
-            has_recv_endpoint: true,            // grant target + reply target for its resource_invokes
-            send_peers:        &[],             // names no one; uses the granted cap, routed by the kernel
             send_peers_grant:  false,
             preferred_core:    u32::MAX,        // round-robin (no [placement] in its contract)
             probe_mode:        0,

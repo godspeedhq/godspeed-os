@@ -8392,7 +8392,7 @@ fn spawn_one(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     // has no row to spawn it from, and asking by name returns NotFound (step C,
     // `docs/service-ownership.md`). The guards above are unchanged, so `Denied` for a core service
     // and `Unknown` for an already-running one still come from here, not from the answer.
-    match spawn_via_supervisor(ctx, name) {
+    match spawn_via_supervisor(ctx, name, &[]) {
         Ok(())  => { report(ctx, "spawned: ", name); Ok(()) }
         Err(_)  => { report(ctx, "spawn failed (unknown service?): ", name); Err(ShellError::Unknown) }
     }
@@ -8404,20 +8404,48 @@ const SUP_CMD_MARKER: u8 = 0x01;
 const SUP_CMD_SPAWN:  u8 = b'S';
 const SUP_CMD_OK:     u8 = 0;
 
-/// Ask the supervisor to start `name`. Bounded (26.6): a deadline, never an open wait - a shell that
-/// hung here would look like a dead machine to the person typing.
-fn spawn_via_supervisor(ctx: &ServiceContext, name: &str) -> Result<(), ()> {
-    let mut buf = [0u8; 64];
+/// Ask the supervisor to start `name`, optionally wired to send to `peers`.
+///
+/// Bounded (26.6): a deadline, never an open wait - a shell that hung here would look like a dead
+/// machine to the person typing.
+///
+/// A PIPE is not a special kind of spawn. It is a spawn whose producer is handed its downstream as a
+/// peer, which is exactly what the kernel's own `spawn_service_pipe` does - so one request shape
+/// covers both, and the supervisor decides whether the image is its own or the kernel's.
+fn spawn_via_supervisor(ctx: &ServiceContext, name: &str, peers: &[&str]) -> Result<(), ()> {
+    let mut buf = [0u8; 128];
     buf[0] = SUP_CMD_MARKER;
     buf[1] = SUP_CMD_SPAWN;
     buf[2..6].copy_from_slice(&u32::MAX.to_le_bytes());   // no core override: placement per 9.2
-    let nb = name.as_bytes();
-    let n  = nb.len().min(buf.len() - 6);
-    buf[6..6 + n].copy_from_slice(&nb[..n]);
-    match ctx.request_with_reply_call_err("supervisor", &Message::from_bytes(&buf[..6 + n]), 10) {
-        Ok(Some(reply)) if reply.payload_bytes().first() == Some(&SUP_CMD_OK) => Ok(()),
-        _ => Err(()),
+    let mut n = 6usize;
+    let mut put = |b: &[u8], buf: &mut [u8; 128], n: &mut usize| -> bool {
+        if *n + b.len() > buf.len() { return false; }
+        buf[*n..*n + b.len()].copy_from_slice(b);
+        *n += b.len();
+        true
+    };
+    if !put(name.as_bytes(), &mut buf, &mut n) { return Err(()); }
+    for p in peers {
+        if !put(&[0u8], &mut buf, &mut n) || !put(p.as_bytes(), &mut buf, &mut n) { return Err(()); }
     }
+    // The supervisor is RESTARTABLE (6.2), so a cached cap to it goes stale the moment it respawns -
+    // and under `chaos kill-storm supervisor` that is constantly. This is the ordinary
+    // reacquire-by-name recovery every client owes a restartable peer (14.3): retry ONLY on `Err`
+    // (the send itself failed, so the peer is gone), never on `Ok(None)` (the deadline passed, and
+    // the request may well have landed).
+    //
+    // Two seconds, not ten. This is the interactive prompt: a person waiting on `spawn` must get an
+    // answer, and a supervisor that is mid-respawn should cost them a blink, not a stall.
+    let msg = Message::from_bytes(&buf[..n]);
+    for attempt in 0..2 {
+        match ctx.request_with_reply_call_err("supervisor", &msg, 2) {
+            Ok(Some(reply)) if reply.payload_bytes().first() == Some(&SUP_CMD_OK) => return Ok(()),
+            Ok(_) => return Err(()),                       // answered, and the answer was no
+            Err(_) if attempt == 0 => { let _ = ctx.reacquire_by_name("supervisor"); }
+            Err(_) => return Err(()),
+        }
+    }
+    Err(())
 }
 
 /// `spawncap <name>` - **Phase-0 diagnostic** (`docs/naming-design.md`). Spawns a service via the
@@ -8454,6 +8482,11 @@ fn cmd_spawncap(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
 /// child uses it - the seam by which the supervisor (not the kernel) owns naming. Removed / folded
 /// into the supervisor in a later phase.
 fn cmd_spawnwired(ctx: &ServiceContext) -> Result<(), ShellError> {
+    // NOTE (step C): this needs a SEND|GRANT cap, because `spawn_with_caps` TRANSFERS it into the
+    // child (8.5) - and only a service's SPAWNER gets a grantable cap to it. `acquire_send_cap`
+    // yields SEND alone and rights never widen (7.3), so when `pong`'s image moves to the supervisor
+    // this diagnostic cannot be fixed by acquiring differently: the supervisor has to hand back a
+    // grantable cap in its spawn reply. Recorded in `docs/service-ownership.md`.
     let pong = match ctx.spawn_returning_endpoint("pong", 0xFFFF) {
         Some(h) => h,
         None => { ctx.console_writeln("spawnwired: could not spawn pong / acquire its endpoint cap"); return Err(ShellError::Unknown); }
@@ -8484,7 +8517,9 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
         }
     }
     // Wire the service to send its output to the SHELL's own endpoint.
-    if ctx.spawn_pipe(svc, "shell").is_err() {
+    // Through the SUPERVISOR, which owns some of these images now and the kernel the rest. A pipe
+    // stage is a spawn wired to send to the shell's own endpoint.
+    if spawn_via_supervisor(ctx, svc, &["shell"]).is_err() {
         ctx.console_writeln_fmt(format_args!("pipe: failed to spawn '{}'", svc));
         return false;
     }
