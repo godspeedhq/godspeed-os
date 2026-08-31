@@ -161,7 +161,52 @@ it knows, by the two mechanisms it already has, and forms no opinion about consu
 
 ---
 
-## 9. Amending C.2
+## 9. The service should be renamed: `logger` -> `events`
+
+**The name is already wrong.** `logger` holds the 192-event IPC TRACE ring; it stopped being a logger
+when `trace` shipped. So this is not a rename in anticipation of a new job - it is the name catching
+up with the job it already has.
+
+**It is cheap, and the reason is the capability model working.** `ctx.log()` resolves through
+`log_write_slot` - a CAPABILITY, not a name - so essentially every call site in the system is already
+insulated from what the receiving service is called. Only ~46 literal `"logger"` occurrences exist in
+code (the supervisor's image table and MANAGED list, contracts, the name directory, tests).
+
+**`events` rather than `observability`:**
+
+- **`observe` already exists** - the live top/htop view. `observability` blurs the two;
+  `events` and `observe` read as complementary: one HOLDS the stream, the other RENDERS the state.
+- **House style is one short word** - `trace`, `drives`, `edit`, `observe`.
+- **It names what the thing holds.** Log lines are events. IPC trace records are events. Metric
+  samples are events. An honest unifying noun.
+- `observability` is a PROPERTY OF A SYSTEM, not a component. A service named after a property tends
+  to become a dumping ground, which is precisely what 4.4 and 26.2 exist to prevent.
+
+### The constraint that must survive the rename
+
+`docs/logging.md` makes a load-bearing argument that this service is a **stateless broker, not a
+store**: a persisting logger cycles through `fs`, and worse, **makes observing a storage failure
+depend on storage.**
+
+Renaming it to `events` invites exactly the violation - "events implies history, history implies
+persistence". So state the line precisely:
+
+> `events` may hold **bounded VOLATILE** state (the 192-event ring already does). It must never
+> acquire a **durable-storage** dependency.
+
+If retained metrics are wanted later, that is a separate consumer which DRAINS `events` - not
+`events` growing an `fs` peer. The service that reports a storage failure must not be downstream of
+storage.
+
+### Timing
+
+Do the rename **as part of** the observability work, not before it. Standalone it is 46 sites of
+churn with no behaviour change; bundled, the new name is justified by the new job and lands in one
+coherent commit.
+
+---
+
+## 10. Amending C.2
 
 Appendix C.2 is explicitly non-normative, so this note does not amend the constitution. But its
 "known endpoint" phrasing should be read in light of the `trace` evidence: the kernel does not need
