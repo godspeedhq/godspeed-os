@@ -773,10 +773,13 @@ pub fn run(image_path: &Path, smp: u32) {
     // the returned cap actually routes. The old name-wiring path is untouched (purely additive).
     // Names a service the KERNEL still owns. `spawncap` exercises `SpawnReturningEndpoint` - a
     // kernel syscall against the kernel's own catalogue - so its subject must still be in it.
-    // `upper` moved to the supervisor (step C, docs/service-ownership.md); `counter` has a recv
+    // Names a SUPERVISOR-OWNED service now: `spawncap` asks the supervisor to spawn it and proves
+    // the returned cap routes. `upper` has a recv endpoint and is not running at boot. The old
+    // form called SpawnReturningEndpoint directly, whose subject - the kernel catalogue - is being
+    // deleted; the supervisor still exercises that syscall on every boot for what remains.
     // endpoint and has not. When that catalogue reaches its single `supervisor` entry, this
     // diagnostic retires together with the syscall it tests.
-    send(&mut write_half, b"spawncap counter\r");
+    send(&mut write_half, b"spawncap upper\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)) {
         Some(r) => check!(r.contains("endpoint cap acquired; send Ok"),
                           "spawncap: SpawnReturningEndpoint returns a routable endpoint cap"),

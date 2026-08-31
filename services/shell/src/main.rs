@@ -8408,7 +8408,12 @@ fn cmd_spawncap(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
         ctx.console_writeln(PROTECTED_MSG);
         return Err(ShellError::Denied);
     }
-    match ctx.spawn_returning_endpoint(name, 0xFFFF) {
+    // Through the SUPERVISOR, which is where a grantable cap to a spawned service comes from now:
+    // only a service's spawner holds one (8.5, 7.3). This used to call `SpawnReturningEndpoint`
+    // directly, whose remaining life is the shrinking kernel catalogue - and which the supervisor
+    // already exercises on every boot for every service still in it, proven by wired services
+    // working. The property asserted is unchanged: the returned cap ROUTES.
+    match ctx.spawn_via_supervisor(name, 0xFFFF, &[]).map_err(|_| ()) {
         Ok(Some(h)) => {
             let r = ctx.try_send_by_handle(h, &Message::from_bytes(&[0x01]));
             ctx.remove_cap(h);   // reclaim the probe endpoint cap (no leak)
@@ -8422,7 +8427,7 @@ fn cmd_spawncap(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
                 "spawncap: {} - spawned, but it has no recv endpoint to hand back", name));
             Err(ShellError::Unknown)
         }
-        Err(()) => {
+        Err(_) => {
             ctx.console_writeln_fmt(format_args!(
                 "spawncap: could not acquire endpoint cap for {} (cap not held / spawn failed / no endpoint)", name));
             Err(ShellError::Unknown)

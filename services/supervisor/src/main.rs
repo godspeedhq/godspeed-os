@@ -173,6 +173,7 @@ static CONTROL_ELF: &[u8] = include_bytes!(env!("SVC_CONTROL_ELF"));
 /// rows would otherwise expect three crates.
 static OBSERVE_ELF: &[u8] = include_bytes!(env!("SVC_OBSERVE_ELF"));
 static GREET_ELF: &[u8] = include_bytes!(env!("SVC_GREET_ELF"));
+static COUNTER_ELF: &[u8] = include_bytes!(env!("SVC_COUNTER_ELF"));
 static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
 static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
@@ -230,6 +231,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32)] = &[
     // (spawn_wired), which is what `spawnwired` proves: the child reaches pong through a capability
     // it was handed, not by resolving a name.
     ("greet", GREET_ELF, 0, 64 * 1024 * 1024, u32::MAX, &["pong"], 0, 0),
+    ("counter", COUNTER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["fs"], 0, 0),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0),
