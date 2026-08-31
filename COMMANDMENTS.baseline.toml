@@ -83,7 +83,7 @@ features = [
 #
 # The target is ONE entry - `supervisor`, which the kernel must bootstrap because nothing is beneath it,
 # exactly as with `kernel_spawned_service`. Every other service's policy belongs to the supervisor, with
-# its image handed to the Spawn syscall rather than compiled into ring 0. 25 is the distance from that (it was 218: the 193 test probes moved to the supervisor - docs/probe-params-design.md).
+# its image handed to the Spawn syscall rather than compiled into ring 0. 24 is the distance from that (it was 218: the 193 test probes moved to the supervisor - docs/probe-params-design.md).
 #
 # Listed in full, without splitting "real" services from test ones: any rule for that split is a
 # judgment encoded as a pattern, and the next service named outside the pattern slips through.
@@ -106,7 +106,6 @@ service_configs = [
     "observe-live",
     "observe-now",
     "ping",
-    "pong",
     "probe",
     "resource-server",
     "shell",

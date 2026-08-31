@@ -55,6 +55,8 @@ pub const CMD_UNKNOWN: u8 = 2;
 fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) -> bool {
     if payload.first() != Some(&CMD_MARKER) { return false; }
 
+    // The new service's endpoint cap, when the spawn produced one - returned to the caller below.
+    let mut spawned_cap: Option<CapHandle> = None;
     let status = if payload.len() >= 6 && (payload[1] == CMD_RESTART || payload[1] == CMD_SPAWN) {
         let core = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
         match core::str::from_utf8(&payload[6..]) {
@@ -81,18 +83,24 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
                     // kernel-held one goes through the kernel's pipe spawn, which prepends the
                     // downstream to the producer's declared peers the same way.
                     match spawn_by_image(ctx, name, core, &peers[..np]) {
-                        Some(Ok(_))  => true,
+                        Some(Ok(c))  => { spawned_cap = c; true }
                         Some(Err(_)) => false,
                         None         => ctx.spawn_pipe(name, peers[0]).is_ok(),
                     }
                 } else if core == u32::MAX {
+                    // (the wired/mapped paths record the cap in the name map; read it back below)
                     // No core given: the WIRED respawn, so a service with peers (fs -> block-driver)
                     // gets them provided rather than only name-wired.
                     respawn_retry(ctx, map, name)
                 } else {
                     spawn_mapped(ctx, map, name, core)
                 };
-                if ok { CMD_OK } else { CMD_FAILED }
+                if ok {
+                    // For the kernel-catalogue paths the cap was recorded in the name map by
+                    // `spawn_mapped`; read it back so every successful spawn answers the same way.
+                    if spawned_cap.is_none() { spawned_cap = map.get(name).map(CapHandle); }
+                    CMD_OK
+                } else { CMD_FAILED }
             }
             _ => CMD_UNKNOWN,
         }
@@ -100,9 +108,32 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
         CMD_UNKNOWN
     };
 
-    if let Some(cap) = ctx.take_pending_cap() {
-        let _ = ctx.try_send_by_handle(cap, &Message::from_bytes(&[status]));
-        ctx.remove_cap(cap);
+    // The reply carries a SEND|GRANT cap to the new service, when there is one.
+    //
+    // This is FORCED by the capability rules, not a convenience. `spawn_with_caps` TRANSFERS a cap
+    // into a child, and a transfer requires GRANT (8.5); only a service's SPAWNER is handed
+    // SEND|GRANT to it, `acquire_send_cap` yields SEND alone, and rights never widen (7.3). So once
+    // the supervisor owns an image, NOTHING else can ever obtain a grantable cap to that service
+    // unless the supervisor hands one back. It owns what it spawns, so it is the right principal to
+    // delegate access to it.
+    //
+    // A copy is DERIVED for the caller and the supervisor keeps its own (it needs it to wire
+    // dependents later). If the send fails the derived copy is reclaimed - an orphaned cap is a
+    // table slot leaked per request (26.6).
+    if let Some(reply_cap) = ctx.take_pending_cap() {
+        let msg = Message::from_bytes(&[status]);
+        let sent = match spawned_cap.and_then(|c| ctx.derive_cap(c)) {
+            Some(granted) => {
+                let r = ctx.send_with_cap_by_handle(reply_cap, granted, &msg);
+                if r.is_err() { ctx.remove_cap(granted); }
+                r.is_ok()
+            }
+            None => false,
+        };
+        // No cap to send, or sending it failed: still ANSWER, so the caller is never left waiting
+        // on a reply that is not coming (invariant 12). It gets the status alone.
+        if !sent { let _ = ctx.try_send_by_handle(reply_cap, &msg); }
+        ctx.remove_cap(reply_cap);
     }
     true
 }
@@ -120,6 +151,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
 // ---------------------------------------------------------------------------------------------
 
 /// The images carried here rather than by the kernel. Each one deleted a `service_config` row.
+static PONG_ELF: &[u8] = include_bytes!(env!("SVC_PONG_ELF"));
 static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
 static REPLY_SERVER_ELF: &[u8] = include_bytes!(env!("SVC_REPLY_SERVER_ELF"));
 static HOLDER_ELF: &[u8] = include_bytes!(env!("SVC_HOLDER_ELF"));
@@ -134,6 +166,7 @@ static HOLDER_ELF: &[u8] = include_bytes!(env!("SVC_HOLDER_ELF"));
 ///
 /// `u32::MAX` as the core means "no preference" (9.2 round-robin); a caller-supplied core overrides it.
 const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str])] = &[
+    ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 1, &[]),
     ("roster", ROSTER_ELF, 0, 64 * 1024 * 1024, u32::MAX, &[]),
     ("reply-server", REPLY_SERVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[]),
     ("holder", HOLDER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[]),

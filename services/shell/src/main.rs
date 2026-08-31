@@ -8439,13 +8439,46 @@ fn spawn_via_supervisor(ctx: &ServiceContext, name: &str, peers: &[&str]) -> Res
     let msg = Message::from_bytes(&buf[..n]);
     for attempt in 0..2 {
         match ctx.request_with_reply_call_err("supervisor", &msg, 2) {
-            Ok(Some(reply)) if reply.payload_bytes().first() == Some(&SUP_CMD_OK) => return Ok(()),
-            Ok(_) => return Err(()),                       // answered, and the answer was no
+            Ok(Some(reply)) if reply.payload_bytes().first() == Some(&SUP_CMD_OK) => {
+                // The reply may carry a SEND|GRANT cap to the new service. A caller that does not
+                // want it must RECLAIM it, or every spawn leaks a cap-table slot (26.6).
+                if let Some(c) = ctx.take_pending_cap() { ctx.remove_cap(c); }
+                return Ok(());
+            }
+            Ok(_) => {
+                if let Some(c) = ctx.take_pending_cap() { ctx.remove_cap(c); }
+                return Err(());                           // answered, and the answer was no
+            }
             Err(_) if attempt == 0 => { let _ = ctx.reacquire_by_name("supervisor"); }
             Err(_) => return Err(()),
         }
     }
     Err(())
+}
+
+/// Ask the supervisor to start `name` and KEEP the `SEND|GRANT` cap it returns.
+///
+/// The grantable cap only exists because the supervisor made it: a transfer needs GRANT (8.5), only
+/// a spawner holds it, and rights never widen (7.3). This is how a caller obtains one for a service
+/// whose image the supervisor owns.
+fn spawn_via_supervisor_for_cap(ctx: &ServiceContext, name: &str) -> Option<CapHandle> {
+    let mut buf = [0u8; 128];
+    buf[0] = SUP_CMD_MARKER;
+    buf[1] = SUP_CMD_SPAWN;
+    buf[2..6].copy_from_slice(&u32::MAX.to_le_bytes());
+    let nb = name.as_bytes();
+    let n  = nb.len().min(buf.len() - 6);
+    buf[6..6 + n].copy_from_slice(&nb[..n]);
+    let msg = Message::from_bytes(&buf[..6 + n]);
+    for attempt in 0..2 {
+        match ctx.request_with_reply_call_err("supervisor", &msg, 2) {
+            Ok(Some(_)) => return ctx.take_pending_cap(),
+            Ok(None)    => return None,
+            Err(_) if attempt == 0 => { let _ = ctx.reacquire_by_name("supervisor"); }
+            Err(_)      => return None,
+        }
+    }
+    None
 }
 
 /// `spawncap <name>` - **Phase-0 diagnostic** (`docs/naming-design.md`). Spawns a service via the
@@ -8482,12 +8515,11 @@ fn cmd_spawncap(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
 /// child uses it - the seam by which the supervisor (not the kernel) owns naming. Removed / folded
 /// into the supervisor in a later phase.
 fn cmd_spawnwired(ctx: &ServiceContext) -> Result<(), ShellError> {
-    // NOTE (step C): this needs a SEND|GRANT cap, because `spawn_with_caps` TRANSFERS it into the
-    // child (8.5) - and only a service's SPAWNER gets a grantable cap to it. `acquire_send_cap`
-    // yields SEND alone and rights never widen (7.3), so when `pong`'s image moves to the supervisor
-    // this diagnostic cannot be fixed by acquiring differently: the supervisor has to hand back a
-    // grantable cap in its spawn reply. Recorded in `docs/service-ownership.md`.
-    let pong = match ctx.spawn_returning_endpoint("pong", 0xFFFF) {
+    // A SEND|GRANT cap, because `spawn_with_caps` TRANSFERS it into the child (8.5) - and only a
+    // service's SPAWNER holds one. `pong`'s image belongs to the supervisor, so the supervisor is
+    // the spawner and the supervisor returns the cap. `acquire_send_cap` cannot serve here: it
+    // yields SEND alone and rights never widen (7.3).
+    let pong = match spawn_via_supervisor_for_cap(ctx, "pong") {
         Some(h) => h,
         None => { ctx.console_writeln("spawnwired: could not spawn pong / acquire its endpoint cap"); return Err(ShellError::Unknown); }
     };

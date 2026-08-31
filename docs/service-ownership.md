@@ -481,14 +481,29 @@ service.** No amount of acquiring differently fixes it. The supervisor must hand
    needed  CMD_SPAWN reply = [status] + an embedded SEND|GRANT cap to the new endpoint
 ```
 
-That is right on its own terms - the supervisor owns what it spawns, so it should be the principal
-that delegates access to it - but it is a protocol change, and it is what `spawnwired` (Phase-0b)
-needs before `pong` can move.
+**BUILT.** The reply now carries a derived `SEND|GRANT` cap when the spawn produced an endpoint. This
+is the capability model pointing somewhere real rather than an obstacle to route around:
+
+> A transfer needs GRANT. Only a spawner holds GRANT. Rights never widen.
+> => **whoever owns the image must be the principal that delegates access to it.**
+
+Ownership and delegation belong together; the old code only avoided that because the kernel owned
+everything. Three details the implementation has to get right:
+
+- **The caller reclaims what it does not want.** `spawn_via_supervisor` drops the returned cap
+  immediately, or every spawn leaks a cap-table slot - the exact leak `logger` had, which surfaced as
+  a wrong arrow in a dependency tree.
+- **A DERIVED copy, not the original.** The supervisor keeps its own (it needs it to wire dependents
+  later) and reclaims the derived copy if the send fails.
+- **It always answers.** No cap, or a failed cap-send, still replies with the status alone, so a
+  caller is never left waiting on a reply that is not coming (invariant 12).
+
+`spawnwired` keeps testing exactly what it was written to test - that a child uses a PASSED cap rather
+than a name - with the cap now sourced from whoever actually spawned the service.
 
 ### Where this stopped, and why
 
-Three leaves moved: `roster`, `reply-server`, `holder` - nothing else spawns or wires to them. Pin
-29 -> 26.
+Four moved: `pong`, `roster`, `reply-server`, `holder`. Pin 29 -> 25.
 
 `pong`, `greet`, `upper` and `mem-pressure` were moved and REVERTED. Each is referenced by something
 that spawns it by name (`spawnwired`, the pipe tests, `chaos`), and the three blockers above are
