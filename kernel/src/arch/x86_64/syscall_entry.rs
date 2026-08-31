@@ -195,6 +195,36 @@ pub fn clear_user_copy_active(core: usize) {
 /// must consume it before the next read / any reschedule (the prior borrowed-user-slice
 /// return required the same).
 #[inline]
+/// Copy `len` bytes from a USER range into kernel memory, under the same page-fault guard as
+/// `read_user_bytes` - but into a CALLER-SUPPLIED destination rather than the per-core scratch slot.
+///
+/// This exists because the scratch slot is one message long (4 KiB) and the ELF loader has to move
+/// whole service images (the largest today is 405 KiB) out of the supervisor's address space. Rather
+/// than grow the scratch or stage a whole image in the kernel, the loader copies ONE PAGE AT A TIME
+/// straight into the freshly allocated destination frame, so the kernel never holds more than a page
+/// of an untrusted image at once (26.6 - the bound is visible and constant).
+///
+/// Capped at one page per call for exactly that reason: the bound belongs here, where it can be read
+/// off the source, not in the caller's discipline.
+///
+/// Returns `false` if the range is not a valid user range or `len` exceeds a page. A source page
+/// that is unmapped raises a CPL0 #PF which `pf_handler` turns into "kill the caller" via the
+/// `USER_COPY_ACTIVE` guard, exactly as for `read_user_bytes` - so this never faults the kernel.
+pub fn copy_user_to_kernel(src: u64, dst: *mut u8, len: usize) -> bool {
+    if len == 0 { return true; }
+    if len > crate::arch::imp::page_tables::PAGE_SIZE { return false; }
+    if !validate_user_ptr(src, len) { return false; }
+    let core = crate::task::scheduler::current_core_id();
+    if core >= num_cores() { return false; }
+    USER_COPY_ACTIVE.get(core).store(true, Ordering::SeqCst);
+    // SAFETY: `[src, src+len)` is a validated user range and `len` <= one page; `dst` is supplied by
+    // the caller, which owns it (the loader passes a just-allocated, HHDM-mapped frame). A fault on
+    // the source does not return here - `pf_handler` kills the caller while the guard is set.
+    unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dst, len) };
+    USER_COPY_ACTIVE.get(core).store(false, Ordering::SeqCst);
+    true
+}
+
 pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
     if !validate_user_ptr(ptr, len) { return None; }
     if len > crate::ipc::message::MAX_MESSAGE_SIZE { return None; }

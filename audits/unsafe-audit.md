@@ -2359,7 +2359,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
-| arch/arm/mod.rs | 49 | permitted |
+| arch/arm/mod.rs | 50 | permitted |
 | arch/loongarch64/mod.rs | 25 | permitted |
 | arch/riscv32/mod.rs | 25 | permitted |
 | arch/riscv64/mod.rs | 25 | permitted |
@@ -2375,7 +2375,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/page_tables.rs | 51 | permitted |
 | arch/x86_64/pci.rs | 20 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
-| arch/x86_64/syscall_entry.rs | 15 | permitted |
+| arch/x86_64/syscall_entry.rs | 16 | permitted |
 | capability/table.rs | 7 | permitted |
 | memory/allocator.rs | 46 | permitted |
 | memory/frame.rs | 1 | permitted |
@@ -2388,7 +2388,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | smp/names.rs | 4 | permitted |
 | smp/spinlock.rs | 5 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
-| loader.rs | 2 | grandfathered |
+| loader.rs | 1 | grandfathered |
 | main.rs | 2 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
 | task/mod.rs | 7 | grandfathered |
@@ -3031,6 +3031,55 @@ no neutral file gained any `unsafe`. `arch/arm/mod.rs` and `arch/riscv32/mod.rs`
 the current stub sizes; they may grow as a real port fills the arch surface, each increase
 carrying its own `// SAFETY:` and an audit bump.
 
+
+## `copy_user_to_kernel` (2026-08-30) - the loader can read an image out of USER memory; `loader.rs` 2 -> 1
+
+Step C hands the kernel a service image from the SUPERVISOR's address space instead of its own rodata
+(`docs/service-ownership.md`). `read_user_bytes` cannot carry it: it is capped at one message (4 KiB)
+and lands in a shared per-core scratch slot, while the largest service image is 405 KiB.
+
+**New arch seam, one per arch:** `copy_user_to_kernel(src, dst, len) -> bool`, **bounded to ONE PAGE
+per call**. The loader copies the overlap of a single destination page at a time, so the kernel never
+holds more than a page of an untrusted image at once. The bound lives in the seam, where it can be
+read off the source, rather than in the caller's discipline (26.6).
+
+| file | count | what |
+|---|---|---|
+| `arch/x86_64/syscall_entry.rs` | 15 -> 16 (+1) | the guarded `copy_nonoverlapping`, under the same `USER_COPY_ACTIVE` guard as `read_user_bytes`: a #PF on the source does not return, `pf_handler` kills the caller. |
+| `arch/arm/mod.rs` | 49 -> 50 (+1) | the same copy, after `validate_user_ptr` + `user_range_accessible` probing, as this port's `read_user_bytes` already does. |
+| `arch/aarch64/uaccess.rs` | unchanged | the new `copy_user_to_kernel` is a SAFE wrapper over the existing private `copy_from_user`. |
+| `loader.rs` | 2 -> **1** (-1) | **shrank.** See below. |
+
+**`loader.rs` got smaller while gaining the ability to read user memory**, which is worth recording
+because the obvious implementation would have grown it. The first attempt added an `unsafe fn
+copy_out(off, *mut u8, len)` beside the existing raw `write_bytes` zeroing and raw
+`copy_nonoverlapping`: 2 -> 4, in a file that is neither a permitted layer nor one of 18.5's
+grandfathered floors.
+
+Instead the destination page is turned into a **safe slice ONCE**:
+
+```rust
+// SAFETY: `phys` is from the frame allocator and exclusively ours until mapped; the HHDM is
+// established before load() is ever called.
+let page: &mut [u8] = unsafe {
+    core::slice::from_raw_parts_mut((get_hhdm_offset() + phys) as *mut u8, PAGE_SIZE)
+};
+page.fill(0);                                   // was: raw write_bytes
+src.read_into(src_off, &mut page[a..b]);        // was: raw copy_nonoverlapping
+```
+
+Both raw writes become safe slice operations, and the only remaining raw access in the whole loader
+is that one `from_raw_parts_mut`. This is 18.5's rule applied rather than argued around: the new raw
+access belongs in a permitted layer (the arch seam), and the caller keeps none of it.
+
+**The double-fetch this design closes.** A user image is mutable by its owner WHILE the kernel reads
+it, so validating program headers in place and then acting on them would let a supplier pass
+validation and rewrite the offsets before the copy - landing bytes at an address the kernel approved
+a different value for. The header window (one page: an ELF64 header is 64 bytes and a program header
+56, so 72 of them fit) is therefore fetched ONCE into a bounded kernel buffer, and every decision is
+taken from that immutable copy. Segment CONTENT is streamed live and never interpreted, so a byte
+that changes mid-copy can only corrupt the image its own supplier provided. An image whose program
+headers sit beyond the window is refused, loudly, rather than read in place.
 
 ## `smp/names.rs` NEW, 4 lines (2026-08-30) - owned task names, so a SPAWNER can name what it spawns
 

@@ -393,7 +393,12 @@ def check_kernel_spawns(check, pins):
     # the reality was fixed. A probe must test the rule, or fixing the code breaks the guard.
     found = {}
     if pins.get("_spawn_src") is not None:
-        for m in re.finditer(r'spawn_service_with_config\(\s*"([a-z0-9-]+)"', pins["_spawn_src"]):
+        # `spawn_service_with_image` since step C made the image source explicit (it takes an
+        # `ImageSource` rather than a `&[u8]`, so the kernel's own rodata and a caller-supplied image
+        # go down one path). Both spellings are matched: the old name is still what the red-team
+        # fixtures below use, and a checker that silently matched NOTHING after a rename is exactly
+        # the failure this check exists to prevent.
+        for m in re.finditer(r'spawn_service_with_(?:config|image)\(\s*"([a-z0-9-]+)"', pins["_spawn_src"]):
             found.setdefault(m.group(1), "kernel/src/<probe>")
         out = [Violation(path, 0,
                          f"the kernel spawns '{svc}' on its own initiative. The kernel restarts exactly "
@@ -409,7 +414,9 @@ def check_kernel_spawns(check, pins):
             if not n.endswith(".rs"):
                 continue
             f = os.path.join(base, n)
-            for m in re.finditer(r'spawn_service_with_config\(\s*"([a-z0-9-]+)"', read(f)):
+            # See the seam above: `spawn_service_with_image` is the post-step-C name. Both are
+            # matched, because a checker that silently finds nothing after a rename fails open.
+            for m in re.finditer(r'spawn_service_with_(?:config|image)\(\s*"([a-z0-9-]+)"', read(f)):
                 found.setdefault(m.group(1), os.path.relpath(f, ROOT).replace("\\", "/"))
     out = [Violation(path, 0,
                      f"the kernel spawns '{svc}' on its own initiative. The kernel restarts exactly ONE "

@@ -226,6 +226,55 @@ mod datetime_tests {
 // ---------------------------------------------------------------------------
 
 const SERVICE_CTX_ADDR:    u64   = 0x3ff000;
+/// What a spawner tells the kernel about a task it wants started from an image IT supplies
+/// (`SpawnImage`, syscall 52). Layout must match the kernel's `SpawnRequest` exactly.
+///
+/// Shaped for the end state, not for what the kernel honours today: the hardware and privilege
+/// fields are here because step D needs them, and a request that sets one is REFUSED loudly rather
+/// than silently ignored (`docs/service-ownership.md`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SpawnRequest {
+    pub version:      u32,
+    pub flags:        u32,
+    pub image_ptr:    u64,
+    pub image_len:    u64,
+    pub name_ptr:     u64,
+    pub name_len:     u32,
+    pub core:         u32,
+    pub memory_limit: u64,
+    pub privileges:   u32,
+    pub hw_flags:     u32,
+    pub mmio_base:    u64,
+    pub mmio_len:     u64,
+    pub dma_pages:    u32,
+    pub bdf:          u32,
+    pub irq_count:    u32,
+    pub irqs:         [u8; 4],
+    pub peers_ptr:    u64,
+    pub peers_len:    u32,
+    pub _pad:         u32,
+}
+
+pub const SPAWN_REQUEST_VERSION:  u32 = 1;
+pub const SPAWN_FLAG_REQ_RECV:    u32 = 1 << 0;
+pub const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
+
+impl SpawnRequest {
+    /// A request with everything the kernel does not yet honour left at zero.
+    pub fn new(image: &[u8], name: &str) -> Self {
+        Self {
+            version: SPAWN_REQUEST_VERSION, flags: 0,
+            image_ptr: image.as_ptr() as u64, image_len: image.len() as u64,
+            name_ptr: name.as_ptr() as u64, name_len: name.len() as u32,
+            core: u32::MAX, memory_limit: 0,
+            privileges: 0, hw_flags: 0, mmio_base: 0, mmio_len: 0,
+            dma_pages: 0, bdf: 0, irq_count: 0, irqs: [0; 4],
+            peers_ptr: 0, peers_len: 0, _pad: 0,
+        }
+    }
+}
+
 /// Parameters a spawner supplies for a test probe (`ServiceContext::spawn_probe`).
 ///
 /// 193 of the kernel's service-catalogue rows were the same `probe` binary differing by a test mode
@@ -2766,6 +2815,45 @@ impl ServiceContext {
         // SAFETY: syscall(7) = Spawn; slot is from kernel-written page; bytes is valid.
         let ret = unsafe {
             raw_syscall(7, packed, bytes.as_ptr() as u64, bytes.len() as u64)
+        };
+        if ret == 0 { Ok(()) } else { Err(crate::Error::InvalidArgument) }
+    }
+
+    /// Spawn a task from an image THIS service supplies (`SpawnImage`, syscall 52).
+    ///
+    /// The kernel loads what it is handed instead of looking a name up in its own catalogue - the
+    /// step that ends that catalogue (`docs/service-ownership.md`). Requires the SPAWN capability,
+    /// exactly as `spawn` does: supplying the image is not authority to start it.
+    ///
+    /// `peers` are NUL-joined into a caller-owned buffer; each name still resolves through the
+    /// kernel name directory, so this grants nothing a contract's `send_peers` would not.
+    pub fn spawn_image(&self, req: &mut SpawnRequest, peers_buf: &mut [u8], peers: &[&str])
+        -> Result<(), crate::Error>
+    {
+        let data = Self::ctx();
+        if data.magic != SERVICE_CTX_MAGIC { return Err(crate::Error::InvalidArgument); }
+        let slot = data.spawn_slot;
+        if slot == u32::MAX { return Err(crate::Error::Cap(CapError::CapNotHeld)); }
+
+        let mut n = 0usize;
+        for (i, p) in peers.iter().enumerate() {
+            if i > 0 {
+                if n >= peers_buf.len() { return Err(crate::Error::InvalidArgument); }
+                peers_buf[n] = 0; n += 1;
+            }
+            let b = p.as_bytes();
+            if n + b.len() > peers_buf.len() { return Err(crate::Error::InvalidArgument); }
+            peers_buf[n..n + b.len()].copy_from_slice(b);
+            n += b.len();
+        }
+        req.peers_ptr = if n > 0 { peers_buf.as_ptr() as u64 } else { 0 };
+        req.peers_len = n as u32;
+
+        // SAFETY: syscall(52) = SpawnImage; `req` is a live, fully initialised SpawnRequest whose
+        // layout matches the kernel's, and the kernel copies it once before reading any field.
+        let ret = unsafe {
+            raw_syscall(52, req as *const SpawnRequest as u64,
+                        core::mem::size_of::<SpawnRequest>() as u64, slot as u64)
         };
         if ret == 0 { Ok(()) } else { Err(crate::Error::InvalidArgument) }
     }

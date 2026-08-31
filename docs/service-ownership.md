@@ -395,6 +395,75 @@ Idempotent by construction: read the BAR, and if it is already programmed, keep 
 This is the genuinely fiddly part of D, more so than config-space access itself, and it wants
 designing in rather than discovering the first time `chaos` kills `bus-manager` mid-transfer.
 
+### Slice 1 built, and the next problem it revealed: RESTART must go through the supervisor
+
+Built and proven (2026-08-30):
+
+| piece | what |
+|---|---|
+| `copy_user_to_kernel` | new arch seam on all 7 arches, **bounded to ONE PAGE per call** |
+| `loader::ImageSource` | the loader reads from kernel rodata OR a caller's address space |
+| header-window fetch | closes the double-fetch (see below) |
+| `SpawnImage` (syscall 52) | a versioned `SpawnRequest`, fetched once, gated by the same SPAWN cap |
+| `task::spawn_from_image` | no `ServiceConfig`, nothing resolved by name |
+| SDK `spawn_image` | matching layout |
+| `services/supervisor/build.rs` | the supervisor can embed service images - the other end of the move |
+
+Identity **24/0/0** on the `ImageSource` refactor alone, before any service moved, so the loader
+rework is proven transparent independently of the new path.
+
+**Then `pong` was moved across as the end-to-end proof, and identity failed 6A, 6B, 10A and 10B - all
+four restart tests.** The cause is not a plumbing bug, it is the next required piece:
+
+```
+  control RESTART pong 2
+       |
+       v
+  control does  ctx.spawn_on("pong", 2)   ->  the KERNEL CATALOGUE path
+       |
+       v
+  kernel: no `pong` row (it moved)  ->  NotFound
+```
+
+`control` has been bypassing the supervisor and asking the kernel to spawn by name, which only ever
+worked because the kernel held every image. 14.4 already says restart authority is the SUPERVISOR's
+(`supervisor.restart(name, placement_override)`); step C forces the code onto the path the
+constitution already describes.
+
+**This blocks every service, not just `pong`**, so it is the next slice rather than a detail:
+
+- `control` needs to reach the supervisor - it has neither a send-peer to it nor `ACQUIRE_ANY` today.
+- The supervisor's endpoint currently receives only DEATH NOTIFICATIONS, whose payload is a bare
+  name. A restart command carrying a core override needs to be distinguishable from one, without
+  changing the kernel-generated notification format.
+- Death-notification respawn alone is not enough: 10A restarts with an explicit core override, and a
+  death notice cannot carry one.
+
+`pong` is reverted to the catalogue for now so the tree stays green; `spawn_pong` is kept compiled
+(`#[allow(dead_code)]`) so the ABI cannot rot before the restart path lands.
+
+### The double-fetch the loader closes
+
+A user image is MUTABLE BY ITS OWNER while the kernel reads it. Validating the program headers in
+place and then acting on them would let a supplier pass validation and rewrite the offsets before the
+segment copy, landing bytes at an address the kernel approved a different value for.
+
+```
+  1. copy ELF header + program headers into a BOUNDED kernel buffer   (one page; refuse if beyond)
+  2. validate ENTIRELY from that copy                                  <- offsets now immutable
+  3. stream segment CONTENT page by page, straight from user memory    <- kernel never interprets it
+```
+
+Only content is read live, and the kernel forms no opinion about content, so a byte that changes
+mid-copy can only corrupt the image its own supplier provided.
+
+**A note on how the unsafe rule paid off.** The first implementation added an `unsafe fn copy_out`
+beside the loader's existing raw zeroing and raw copy: 2 unsafe lines to 4, in a file that is neither
+a permitted layer nor one of 18.5's grandfathered floors. `unsafe_check.py` refused it. Restructuring
+so the destination page becomes a SAFE SLICE ONCE made both the zeroing and the copy safe operations,
+and `loader.rs` went **2 -> 1**: it shrank while gaining the ability to read user memory. The rule did
+not merely catch a violation, it produced a better design.
+
 ### Ordering: C first, D second, with one condition
 
 **Design C's spawn ABI for the end state, not the interim.** The supervisor should pass the hardware

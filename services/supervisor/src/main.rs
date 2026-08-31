@@ -16,6 +16,30 @@ use godspeed_sdk::{ServiceContext, CapHandle};
 
 // ONE table, shared by source with the other principal that spawns probes: a probe respawns its own
 // victim, and a second copy of these parameters would be a second truth (Commandment III).
+
+/// The `pong` image, carried by the supervisor rather than the kernel (step C).
+static PONG_ELF: &[u8] = include_bytes!(env!("SVC_PONG_ELF"));
+
+/// Spawn `pong` on `core` from the supervisor's own copy of its image.
+///
+/// Everything the kernel used to hold in its `service_config` row is supplied here instead: the
+/// image, the mailbox, the memory ceiling and the placement. Nothing is looked up by name.
+///
+/// NOT YET WIRED IN. Moving `pong` across proved the `SpawnImage` path end to end and then failed
+/// identity 6A/6B/10A/10B, because RESTART still resolves through the kernel catalogue - see
+/// `docs/service-ownership.md`, "restart must go through the supervisor". The image path works; the
+/// restart path is the next slice, and it blocks every service, not just this one. Kept compiled so
+/// the ABI cannot rot while that lands.
+#[allow(dead_code)]
+fn spawn_pong(ctx: &ServiceContext, core: u32) -> Result<(), godspeed_sdk::Error> {
+    let mut req = godspeed_sdk::service_context::SpawnRequest::new(PONG_ELF, "pong");
+    req.core         = core;
+    req.flags        = godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV; // pong receives
+    req.memory_limit = 64 * 1024 * 1024;
+    let mut peers = [0u8; 8]; // pong has no send-peers; the buffer is required, not used
+    ctx.spawn_image(&mut req, &mut peers, &[])
+}
+
 #[path = "../../probe/src/table.rs"]
 mod probes;
 

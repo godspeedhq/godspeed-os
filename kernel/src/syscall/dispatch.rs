@@ -82,6 +82,10 @@ pub enum SyscallNumber {
     UsbDiskRead            = 47,
     UsbDiskWrite           = 48,
     UsbDiskFlush           = 49,
+    /// Spawn a task from an image the CALLER supplies, described by a `SpawnRequest` in its own
+    /// memory (step C, `docs/service-ownership.md`). The kernel stops holding a catalogue of what
+    /// each service IS; it loads what it is handed, and enforces what the request may ask for.
+    SpawnImage             = 52,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -124,6 +128,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::Log            as u64 => handle_log(arg0, arg1, arg2),
         n if n == SyscallNumber::AllocMem       as u64 => handle_alloc_mem(arg0),
         n if n == SyscallNumber::Spawn          as u64 => handle_spawn(arg0, arg1, arg2),
+        n if n == SyscallNumber::SpawnImage     as u64 => handle_spawn_image(arg0, arg1, arg2),
         n if n == SyscallNumber::SpawnReturningEndpoint as u64 => handle_spawn_returning_endpoint(arg0, arg1, arg2),
         n if n == SyscallNumber::SpawnWithCaps as u64 => handle_spawn_with_caps(arg0, arg1, arg2),
         n if n == SyscallNumber::Kill           as u64 => handle_kill(arg0, arg1),
@@ -693,6 +698,187 @@ const SPAWN_FLAG_IS_PROBE:  u64 = 1 << 50;
 /// name alone; a peer list needs more. Bounded and small (26.6) - the longest real payload is
 /// well under half of this.
 const SPAWN_PAYLOAD_MAX: usize = 128;
+
+
+// ---------------------------------------------------------------------------------------------
+// SpawnImage (52) - the caller supplies the image
+// ---------------------------------------------------------------------------------------------
+
+/// What a spawner tells the kernel about the task it wants started.
+///
+/// Fixed layout, fetched ONCE (see `handle_spawn_image`), and VERSIONED so a mismatch is a loud
+/// refusal rather than a misparse. Every field is here because step C or step D needs it, even where
+/// the kernel does not honour it yet: the ABI is the expensive thing to change, so it is shaped for
+/// the end state now and the interim is a REFUSAL, never a silent ignore
+/// (`docs/service-ownership.md`, "design C's spawn ABI for the end state").
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SpawnRequest {
+    /// Must equal `SPAWN_REQUEST_VERSION`. A spawner built against a different kernel is refused.
+    version:      u32,
+    /// bit0 has_recv_endpoint, bit1 has_console_read.
+    flags:        u32,
+    image_ptr:    u64,
+    image_len:    u64,
+    name_ptr:     u64,
+    name_len:     u32,
+    /// `u32::MAX` = let the kernel round-robin (9.2).
+    core:         u32,
+    memory_limit: u64,
+    /// Privilege bitmask (SPAWN, CONSOLE_PUSH, INTROSPECT, SERVICE_CONTROL, RESOURCE_MINT, REBOOT,
+    /// ACQUIRE_ANY, ...). NOT honoured yet - must be 0.
+    privileges:   u32,
+    /// bit0 iommu_confine, bit1 needs_dma. NOT honoured yet - must be 0.
+    hw_flags:     u32,
+    /// Device MMIO window to grant. NOT honoured yet - must be 0.
+    mmio_base:    u64,
+    mmio_len:     u64,
+    /// DMA arena size in pages, PCI BDF, and IRQ lines. NOT honoured yet - must be 0.
+    dma_pages:    u32,
+    bdf:          u32,
+    irq_count:    u32,
+    irqs:         [u8; 4],
+    /// NUL-separated peer names, resolved through the kernel name directory exactly as a contract's
+    /// `send_peers` are: the caller supplies the LIST, never the authority.
+    peers_ptr:    u64,
+    peers_len:    u32,
+}
+
+/// Wire size of a `SpawnRequest`, in bytes. Every field at a fixed little-endian offset:
+///
+/// ```text
+///   0 version u32     36 core         u32     72 dma_pages u32
+///   4 flags   u32     40 memory_limit u64     76 bdf       u32
+///   8 image_ptr u64   48 privileges   u32     80 irq_count u32
+///  16 image_len u64   52 hw_flags     u32     84 irqs      [u8;4]
+///  24 name_ptr  u64   56 mmio_base    u64     88 peers_ptr u64
+///  32 name_len  u32   64 mmio_len     u64     96 peers_len u32
+///                                            100 reserved  u32
+/// ```
+///
+/// These are exactly the offsets a `repr(C)` layout of the SDK's matching struct produces on both
+/// 32- and 64-bit targets (every `u64` lands 8-aligned), so the two agree by construction - but the
+/// KERNEL's copy is the definition, and it reads each field at a stated offset rather than trusting
+/// that agreement.
+const SPAWN_REQUEST_BYTES: usize = 104;
+
+impl SpawnRequest {
+    /// Decode the request from its wire bytes.
+    ///
+    /// EXPLICIT rather than a `repr(C)` reinterpret, deliberately. Casting the buffer to a struct
+    /// would make the ABI depend on two separate crates agreeing about padding and alignment, and it
+    /// would need `unsafe` in `syscall/`, which is one of 18.5's grandfathered floors - growable only
+    /// by amendment. Reading each field at a stated offset costs a few lines, needs no `unsafe`, and
+    /// makes the wire format something you can read off the source instead of infer from a layout.
+    fn decode(b: &[u8]) -> Self {
+        let u32_at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let u64_at = |o: usize| u64::from_le_bytes([
+            b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7]]);
+        Self {
+            version:      u32_at(0),
+            flags:        u32_at(4),
+            image_ptr:    u64_at(8),
+            image_len:    u64_at(16),
+            name_ptr:     u64_at(24),
+            name_len:     u32_at(32),
+            core:         u32_at(36),
+            memory_limit: u64_at(40),
+            privileges:   u32_at(48),
+            hw_flags:     u32_at(52),
+            mmio_base:    u64_at(56),
+            mmio_len:     u64_at(64),
+            dma_pages:    u32_at(72),
+            bdf:          u32_at(76),
+            irq_count:    u32_at(80),
+            irqs:         [b[84], b[85], b[86], b[87]],
+            peers_ptr:    u64_at(88),
+            peers_len:    u32_at(96),
+        }
+    }
+}
+
+const SPAWN_REQUEST_VERSION:  u32 = 1;
+const SPAWN_FLAG_REQ_RECV:    u32 = 1 << 0;
+const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
+
+fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
+    // The SPAWN capability gates this exactly as it gates `Spawn` (3.1): supplying an image does not
+    // supply the authority to start it.
+    let cap = match scheduler::current_task_lookup_cap(spawn_cap_slot as usize, Rights::WRITE) {
+        Ok(c)  => c,
+        Err(e) => return cap_err_to_i64(e),
+    };
+    if cap.resource_id != crate::capability::SPAWN_RESOURCE {
+        return cap_err_to_i64(CapError::CapWrongScope);
+    }
+
+    if req_len as usize != SPAWN_REQUEST_BYTES { return -1; }
+    // ONE fetch. Every decision below is taken from this copy, so the caller cannot rewrite a field
+    // between its validation and its use - the same double-fetch discipline the loader applies to
+    // the ELF header window.
+    let raw = match read_user_bytes(req_ptr, req_len as usize) { Some(b) => b, None => return -1 };
+    let req = SpawnRequest::decode(raw);
+
+    if req.version != SPAWN_REQUEST_VERSION {
+        crate::kprintln!("task: SpawnImage refused - request version {} (kernel speaks {})",
+            req.version, SPAWN_REQUEST_VERSION);
+        return -1;
+    }
+
+    // NOT-YET-HONOURED FIELDS ARE REFUSED, NOT IGNORED (invariant 12). A spawner asking for an MMIO
+    // window or a privilege this kernel does not yet grant must hear so, rather than receive a task
+    // that silently lacks what it needs and fails later somewhere unrelated.
+    if req.privileges != 0 || req.hw_flags != 0 || req.mmio_base != 0 || req.mmio_len != 0
+        || req.dma_pages != 0 || req.bdf != 0 || req.irq_count != 0
+    {
+        crate::kprintln!(
+            "task: SpawnImage refused - hardware/privilege fields not honoured yet (privileges={:#x} hw_flags={:#x} mmio={:#x}+{:#x} dma_pages={} bdf={:#x} irqs={})",
+            req.privileges, req.hw_flags, req.mmio_base, req.mmio_len, req.dma_pages, req.bdf,
+            req.irq_count);
+        return -1;
+    }
+
+    let name_len = req.name_len as usize;
+    if name_len == 0 || name_len > 64 { return -1; }
+    let name_bytes = match read_user_bytes(req.name_ptr, name_len) { Some(b) => b, None => return -1 };
+    let mut name_buf = [0u8; 64];
+    name_buf[..name_len].copy_from_slice(name_bytes);
+    let name = match core::str::from_utf8(&name_buf[..name_len]) { Ok(s) => s, Err(_) => return -1 };
+
+    // Peers: the same NUL-separated form and the same bound as the probe path.
+    let mut peer_buf = [0u8; SPAWN_PAYLOAD_MAX];
+    let mut peers: [&str; crate::task::MAX_SEND_PEERS] = [""; crate::task::MAX_SEND_PEERS];
+    let mut np = 0usize;
+    let plen = req.peers_len as usize;
+    if plen > 0 {
+        if plen > SPAWN_PAYLOAD_MAX { return -1; }
+        let pb = match read_user_bytes(req.peers_ptr, plen) { Some(b) => b, None => return -1 };
+        peer_buf[..plen].copy_from_slice(pb);
+        let ps = match core::str::from_utf8(&peer_buf[..plen]) { Ok(s) => s, Err(_) => return -1 };
+        for part in ps.split('\0') {
+            if part.is_empty() { continue; }
+            if np >= crate::task::MAX_SEND_PEERS { return -1; }
+            peers[np] = part;
+            np += 1;
+        }
+    }
+
+    if req.image_len == 0 || req.image_len > u32::MAX as u64 { return -1; }
+    let core_override = if req.core == u32::MAX { None } else { Some(req.core) };
+
+    match crate::task::spawn_from_image(
+        name,
+        crate::loader::ImageSource::User { base: req.image_ptr, len: req.image_len as usize },
+        core_override,
+        req.memory_limit,
+        req.flags & SPAWN_FLAG_REQ_RECV    != 0,
+        req.flags & SPAWN_FLAG_REQ_CONSOLE != 0,
+        &peers[..np],
+    ) {
+        Ok(_)  => 0,
+        Err(_) => -1,
+    }
+}
 
 fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
     let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;

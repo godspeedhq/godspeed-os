@@ -986,7 +986,7 @@ pub fn ap_init(_core_id: u32) {}
 
 pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, local_irq_save, local_irq_restore};
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
-pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
+pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes, copy_user_to_kernel};
 
 /// Switch to a new stack top - `sp` on ARM. `#[inline(always)]` for the same reason as x86: the
 /// caller's frame must not outlive the switch.
@@ -1857,6 +1857,25 @@ pub mod syscall_entry {
         // kernel shares the service page table while handling the syscall, so `ptr` is addressable and
         // the copy cannot fault.
         Some(unsafe { core::slice::from_raw_parts(ptr as usize as *const u8, len) })
+    }
+
+    /// Copy `len` bytes from a USER range into kernel memory, bounded to ONE PAGE per call.
+    ///
+    /// The ELF loader uses this to move a service image out of the supervisor's address space a page at
+    /// a time, so the kernel never holds more than a page of an untrusted image at once (26.6 - the
+    /// bound is visible here rather than left to the caller's discipline). `read_user_bytes` cannot do
+    /// this: it is capped at one message and lands in a shared per-core scratch slot.
+    ///
+    /// Returns false if the range is not valid user memory or `len` exceeds a page.
+    pub fn copy_user_to_kernel(src: u64, dst: *mut u8, len: usize) -> bool {
+        if len == 0 { return true; }
+        if len > crate::arch::imp::page_tables::PAGE_SIZE { return false; }
+        if !validate_user_ptr(src, len) { return false; }
+        if !user_range_accessible(src, len, false) { return false; }
+        // SAFETY: range-checked user VA, probed mapped-readable at PL0; the kernel shares the
+        // service page table while handling the syscall, so `src` is addressable and cannot fault.
+        unsafe { core::ptr::copy_nonoverlapping(src as usize as *const u8, dst, len); }
+        true
     }
 
     /// Write `src` to user VA `dst`, after range-checking AND confirming every page is user-writable.

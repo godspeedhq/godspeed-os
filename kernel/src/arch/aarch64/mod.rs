@@ -1371,7 +1371,7 @@ pub fn net_frame_rx(_dst: &mut [u8]) -> usize {
 pub fn net_info() -> Option<([u8; 6], bool)> {
     None
 }
-pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
+pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes, copy_user_to_kernel};
 
 /// Switch to a new stack top - `sp` on AArch64. `#[inline(always)]` for the same reason as x86.
 /// # Safety: caller guarantees `top` is a valid aligned stack top; nothing live is on the old stack.
@@ -2171,12 +2171,16 @@ pub mod syscall_entry {
     #[cfg(feature = "pi4")]
     pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> { super::uaccess::read_user_bytes(ptr, len) }
     #[cfg(feature = "pi4")]
+    pub fn copy_user_to_kernel(src: u64, dst: *mut u8, len: usize) -> bool { super::uaccess::copy_user_to_kernel(src, dst, len) }
+    #[cfg(feature = "pi4")]
     pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool { super::uaccess::write_user_bytes(dst, src) }
 
     #[cfg(not(feature = "pi4"))]
     pub fn validate_user_ptr(ptr: u64, len: usize) -> bool { false }
     #[cfg(not(feature = "pi4"))]
     pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> { None }
+    #[cfg(not(feature = "pi4"))]
+    pub fn copy_user_to_kernel(_src: u64, _dst: *mut u8, _len: usize) -> bool { false }
     #[cfg(not(feature = "pi4"))]
     pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool { false }
     /// The free-running physical counter. Monotonic, never reset, shared by all cores - which is what

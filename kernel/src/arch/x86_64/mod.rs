@@ -292,7 +292,7 @@ pub fn ap_init(core_id: u32) {
 
 pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, local_irq_save, local_irq_restore};
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
-pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
+pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes, copy_user_to_kernel};
 
 /// Non-PCI fixed-physical peripheral MMIO grant (the ARM Pi path). x86 discovers driver MMIO from the
 /// PCI scan (handled in the spawn path via `HwClass::mmio_bar`), so there is never a fixed-physical

@@ -286,6 +286,7 @@ pub mod syscall_entry {
     pub fn init_percore_arenas(n: usize) {}
     pub fn validate_user_ptr(ptr: u64, len: usize) -> bool { false }
     pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> { None }
+    pub fn copy_user_to_kernel(_src: u64, _dst: *mut u8, _len: usize) -> bool { false }
     pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool { false }
     pub fn read_cycle_counter() -> u64 { 0 }                 // CNTPCT_EL0
 }

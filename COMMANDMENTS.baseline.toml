@@ -387,6 +387,18 @@ UsbDiskInfo              = 46
 UsbDiskRead              = 47
 UsbDiskWrite             = 48
 UsbDiskFlush             = 49
+# Step C (docs/service-ownership.md). The pin asks "why isn't this a service?" - and here the honest
+# answer is that it CANNOT be: loading an ELF into a fresh address space is memory isolation, which is
+# the kernel's own job (4.3, MISCIS). Nothing above the kernel can map a page.
+#
+# It does not ADD a kernel responsibility, it REMOVES one. `Spawn` requires the kernel to hold a
+# catalogue of every service - image, memory limit, placement, peers, privileges - which is policy
+# living in ring 0 (26.10). `SpawnImage` takes all of that from the CALLER, so the catalogue can go:
+# the pin above it (`service_configs`) is what shrinks, from 29 entries towards 1.
+#
+# The request is versioned and fetched ONCE, and fields the kernel does not yet honour are REFUSED
+# rather than ignored (invariant 12).
+SpawnImage               = 52
 
 # ------------------------------------------------------------------------------------------------
 # Recorded exemptions.

@@ -805,6 +805,17 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  true,
         })),
+        "pong" => Some(("pong", ServiceConfig {
+            elf:               include_bytes!(env!("SVC_PONG_ELF")),
+            has_recv_endpoint: true,
+            send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
+            send_peers_grant:  false,
+            preferred_core:    1,
+            probe_mode:        0,
+            memory_limit:      64 * 1024 * 1024,
+            hw_irqs:           &[],
+            has_console_read:  false,
+        })),
         "ping" => Some(("ping", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PING_ELF")),
             has_recv_endpoint: true,
@@ -813,17 +824,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             send_peers:        &["pong"],
             send_peers_grant:  false,
             preferred_core:    0,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        "pong" => Some(("pong", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PONG_ELF")),
-            has_recv_endpoint: true,
-            send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
-            send_peers_grant:  false,
-            preferred_core:    1,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
             hw_irqs:           &[],
@@ -1469,13 +1469,55 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
         pipe_peers[np] = p;
         np += 1;
     }
-    let result = spawn_service_with_config(static_name, cfg.elf, core_id,
+    let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
         cfg.has_recv_endpoint, &pipe_peers[..np], cfg.probe_mode, cfg.send_peers_grant,
         cfg.memory_limit, cfg.hw_irqs, cfg.has_console_read, None);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn pipe '{}' -> '{}' failed: {:?}", producer, sink, e);
     }
     result.map(|_| ())
+}
+
+/// Spawn a task from an image the CALLER supplied (step C, `SpawnImage`).
+///
+/// This is the path that ends the kernel's service catalogue. It takes no `ServiceConfig` and looks
+/// nothing up by name: the image, the name, the placement, the memory ceiling, the mailbox and the
+/// peer list all arrive from the spawner, and the kernel's job is to enforce, not to decide
+/// (`docs/service-ownership.md`).
+///
+/// What it still refuses, and why the refusal is not a leftover: a caller may not claim a name the
+/// kernel's own catalogue still uses. While ANY name-keyed policy remains, letting a caller pick
+/// such a name would let it inherit that policy for arbitrary code - the same squatting hole
+/// `spawn_probe` closes, and for the same reason (the kernel name directory is the recovery anchor).
+/// When the catalogue reaches its single `supervisor` entry this check narrows to that one name,
+/// which must never be claimable by anything.
+pub fn spawn_from_image(
+    name:              &str,
+    image:             crate::loader::ImageSource,
+    core_override:     Option<u32>,
+    memory_limit:      u64,
+    has_recv_endpoint: bool,
+    has_console_read:  bool,
+    peers:             &[&str],
+) -> Result<Option<EndpointId>, SpawnError> {
+    if service_config(name).is_some() {
+        crate::kprintln!("task: SpawnImage '{}' rejected: that name belongs to the kernel catalogue", name);
+        return Err(SpawnError::NotFound);
+    }
+    if scheduler::find_task_by_name(name).is_some() {
+        crate::kprintln!("task: spawn '{}' rejected: already running", name);
+        return Err(SpawnError::AlreadyRunning);
+    }
+
+    let core_id = resolve_spawn_core(core_override, u32::MAX)?;
+    let mem = if memory_limit == 0 { 64 * 1024 * 1024 } else { memory_limit };
+
+    let result = spawn_service_with_image(name, image, core_id, has_recv_endpoint, peers, 0,
+                                          false, mem, &[], has_console_read, None);
+    if let Err(ref e) = result {
+        crate::kprintln!("task: SpawnImage '{}' failed: {:?}", name, e);
+    }
+    result
 }
 
 /// Parameters a SPAWNER supplies for a probe, instead of the kernel holding a row per probe.
@@ -1540,7 +1582,7 @@ pub fn spawn_probe(name: &str, core_override: Option<u32>, p: ProbeParams, peers
     // up by name here rather than taken from the parameters.
     let (hw_irqs, grant) = probe_authority(name);
 
-    let result = spawn_service_with_config(name, cfg.elf, core_id,
+    let result = spawn_service_with_image(name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
                               p.has_recv_endpoint, peers, p.mode,
                               grant, mem, hw_irqs,
                               false, None);
@@ -1581,7 +1623,7 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<O
 
     let core_id = resolve_spawn_core(core_override, cfg.preferred_core)?;
 
-    let result = spawn_service_with_config(static_name, cfg.elf, core_id,
+    let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
                               cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
                               cfg.has_console_read, None);
@@ -1604,7 +1646,7 @@ pub fn spawn_service_by_name_with_installs(
         return Err(SpawnError::AlreadyRunning);
     }
     let core_id = resolve_spawn_core(core_override, cfg.preferred_core)?;
-    let result = spawn_service_with_config(static_name, cfg.elf, core_id,
+    let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
                               cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
                               cfg.has_console_read, Some(installs));
@@ -1666,11 +1708,13 @@ fn cleanup_partial_spawn(task_slot: usize, name: &str, own_endpoint: Option<Endp
 /// `EndpointId` (`None` if it has no endpoint) - the caller (via the spawn syscall) can mint a
 /// cap to it. This is the Phase-0 seam for moving naming out of the kernel (`docs/naming-design.md`):
 /// a spawner can collect a cap to every service it starts without the kernel resolving names.
-fn spawn_service_with_config(
+fn spawn_service_with_image(
     // NOT `&'static str`. A caller-supplied name is what lets a spawner name what it spawns; the
     // task owns its bytes now (`scheduler::set_task_name`), so nothing here needs the literal.
     name:              &str,
-    elf_bytes:         &[u8],
+    // Where the image lives: kernel rodata (the catalogue path, until it is gone) or the CALLER's
+    // address space (`SpawnImage`). See `loader::ImageSource` for the double-fetch discipline.
+    image:             crate::loader::ImageSource,
     core_id:           u32,
     has_recv_endpoint: bool,
     send_peers:        &[&str],
@@ -1696,7 +1740,7 @@ fn spawn_service_with_config(
 
     // 1. Parse ELF.
     let crate::loader::LoadedElf { mut page_table, entry_va, mapped_bytes: elf_mapped_bytes } =
-        crate::loader::load(elf_bytes)?;
+        crate::loader::load_from(&image)?;
 
     if SPAWN_TRACE { crate::kprintln!("spawn[stack]: '{}'", name); }
 
@@ -1754,7 +1798,13 @@ fn spawn_service_with_config(
     // All six non-hardware authorities below come from the ONE `service_privileges` table (audit U15),
     // not a re-derived `name ==` check per grant. `is_probe` covers the whole test-probe family by ELF
     // identity so no probe is missed by name.
-    let is_probe = core::ptr::eq(elf_bytes.as_ptr(), PROBE_ELF.as_ptr());
+    // A caller-supplied image is never the probe: `is_probe` exists to give the whole test-probe
+    // family its privileges by ELF identity rather than a re-derived `name ==` check, and only the
+    // kernel's own rodata has an identity to compare.
+    let is_probe = match image {
+        crate::loader::ImageSource::Kernel(b) => core::ptr::eq(b.as_ptr(), PROBE_ELF.as_ptr()),
+        crate::loader::ImageSource::User { .. } => false,
+    };
     let privs = service_privileges(name, is_probe);
 
     let mut spawn_slot_u32 = u32::MAX;
@@ -2437,7 +2487,7 @@ fn spawn_service_with_config(
 // supervisor up, which is the thing that has to work anyway. If that ever proves too large a first
 // step, the answer is a smaller supervisor - not a second spawn path in the kernel.
 pub fn spawn_supervisor() {
-    match spawn_service_with_config("supervisor", SUPERVISOR_ELF, 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None) {
+    match spawn_service_with_image("supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => panic!("supervisor spawn failed: {:?}", e),
     }
@@ -2531,8 +2581,9 @@ pub fn poll_supervisor_respawn() {
     // directly; on a transient failure, log LOUD (§26.7) and RE-ARM PENDING so the next Core-0 tick
     // retries. The supervisor's footprint is constant and just-reclaimed, so a retry succeeds the moment
     // the pressure eases. (Only the BOOT-time spawn_supervisor keeps its fatal panic - §22 Test 1B.)
-    match spawn_service_with_config(
-        "supervisor", SUPERVISOR_ELF, 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None,
+    match spawn_service_with_image(
+        "supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false,
+        64 * 1024 * 1024, &[], false, None,
     ) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => {
