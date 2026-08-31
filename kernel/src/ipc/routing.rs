@@ -241,10 +241,17 @@ pub fn try_register_optional(id: EndpointId, core_id: u32, generation: Generatio
         // client traffic while waiting on the endpoint it also serves), so it is a fact an operator
         // needs rather than an implementation detail.
         //
-        // Never observed firing: zero refusals across the shell, identity and property suites on
-        // x86 and a full arm32 boot. That is why the threshold is unchanged - it was suspected of
-        // starving the mailbox at boot and the measurement did not support it. This log exists so
-        // the next person has evidence instead of the same suspicion.
+        // IT FIRES. This said "never observed firing" on the strength of the shell, identity and
+        // property suites and a full arm32 boot - and that is no longer true: a bare-metal T630 boot
+        // refuses three times during `selfcheck` (71 of 96 free against a reserve of 72), and the
+        // probe-heavy builds refuse considerably more. The claim is corrected rather than deleted,
+        // because the log did its job: it turned a suspicion into a measurement, which is what it was
+        // added for.
+        //
+        // The threshold is still unchanged, deliberately. What the evidence shows is a reserve that
+        // is tight for a system with ~25 live endpoints, not one that is starving anything: the
+        // refused callers fall back to awaiting replies on their own endpoint and the T630 run was
+        // 377/0 with no panic. Raising it is a real change with its own measurement, not a reflex.
         let n = REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
         if n <= 3 || n % 64 == 0 {
             crate::kprintln!(
