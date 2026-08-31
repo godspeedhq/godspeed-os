@@ -107,8 +107,26 @@ The properties that make it right are exactly the ones a push model loses:
 - **Loss is visible, not silent.** A ring that overwrote can say so (a dropped-count), so the
   consumer learns it missed events rather than silently seeing fewer (invariant 12).
 
-Kernel events would ride the same shape: the existing log ring, or a sibling events ring if the
-volume or the record type warrants one.
+### What the kernel actually emits today: TEXT, not events
+
+Checked rather than assumed, because it changes the answer:
+
+```
+   kprintln!  ->  [u8; 16 KiB] BYTE ring  ->  serial (always)
+                                          ->  drained ONCE, when `logger` starts
+```
+
+`kernel/src/log.rs` is a **byte ring of formatted, human-readable lines** - not typed records - and
+`drain_to_logger` has exactly one caller, the logger's startup. After that everything reaches serial
+and the ring only matters again on the next boot.
+
+**So "kernel events ride the existing ring" would mean PARSING TEXT**, which is fragile and creates a
+second truth: the parser's idea of an event versus what the kernel meant (26.4). A format change in a
+`kprintln!` would silently break a consumer, with nothing to catch it.
+
+If structured kernel events are ever genuinely wanted, that is a **sibling ring of typed records** -
+same drained shape, same bounded-and-overwriting properties, but records instead of bytes. It must
+clear the three-part test below first. Nothing does today.
 
 ---
 
@@ -197,6 +215,24 @@ persistence". So state the line precisely:
 If retained metrics are wanted later, that is a separate consumer which DRAINS `events` - not
 `events` growing an `fs` peer. The service that reports a storage failure must not be downstream of
 storage.
+
+**A few minutes of scrollback in RAM, gone on restart, is the RIGHT design** - not a limitation to
+apologise for. The trace ring already works this way (192 events), and losing it on restart is
+consistent with 14.2: a restart is a RE-INIT, not a resume.
+
+The consequence, stated plainly rather than discovered later: **if `events` dies, the window dies
+with it**, and under `chaos max-carnage` it is a target like anything else. That is acceptable only
+because of what sits beneath it:
+
+| tier | survives | holds |
+|---|---|---|
+| **serial + the kernel ring** | anything, including a panic that halts every core | the floor - boot, panics, kernel lines |
+| **the `events` ring** | its own process lifetime | recent history, convenient, fine to lose |
+| **durable storage** | - | **never, for either** |
+
+So `events` is a convenience layer over a floor that outlives it, not the system's only memory. That
+floor must not be weakened to make `events` look better: the kernel keeps writing to serial
+unconditionally, exactly as it does now.
 
 ### Timing
 
