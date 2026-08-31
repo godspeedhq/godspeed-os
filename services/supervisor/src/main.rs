@@ -12,10 +12,74 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, CapHandle};
+use godspeed_sdk::{ServiceContext, CapHandle, ipc::Message};
 
 // ONE table, shared by source with the other principal that spawns probes: a probe respawns its own
 // victim, and a second copy of these parameters would be a second truth (Commandment III).
+
+
+// ---------------------------------------------------------------------------------------------
+// The operator command channel (step C).
+//
+// The supervisor's endpoint now receives TWO kinds of message, told apart by the first byte:
+//
+//   death notice   "pong"                        <- kernel-generated; a service name, [a-z0-9-]
+//   command        0x01 'R' <core u32 LE> "pong" <- 0x01 cannot begin a name, so this is unambiguous
+//
+// Why a command channel exists at all: `control` used to do `kill` then `spawn` ITSELF, asking the
+// KERNEL to spawn by name. That only ever worked because the kernel held every service image. Once
+// an image lives here, only this service can respawn it - which is what 14.4 always said
+// (`supervisor.restart(name, placement_override)`); the code was going around it.
+// See `docs/service-ownership.md`.
+// ---------------------------------------------------------------------------------------------
+
+/// First byte of a command. Not a legal first byte of a service name, which is what separates a
+/// command from the kernel's death notification without changing the notification's format.
+pub const CMD_MARKER:  u8 = 0x01;
+/// Restart: kill if alive, then spawn. `core` of `u32::MAX` means "re-evaluate placement" (9.2).
+pub const CMD_RESTART: u8 = b'R';
+
+/// Reply status. One byte, so a caller can log the truth rather than assume success.
+pub const CMD_OK:      u8 = 0;
+pub const CMD_FAILED:  u8 = 1;
+pub const CMD_UNKNOWN: u8 = 2;
+
+/// Handle a command and answer it. Returns false if this was not a command at all.
+///
+/// The reply is NON-BLOCKING and the reply cap is reclaimed either way: a caller that has gone away
+/// must never block the supervisor, which is the one service everything else depends on, and a
+/// retained return address burns a cap-table slot per request (the `logger` leak, §26.6).
+fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) -> bool {
+    if payload.first() != Some(&CMD_MARKER) { return false; }
+
+    let status = if payload.len() >= 6 && payload[1] == CMD_RESTART {
+        let core = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+        match core::str::from_utf8(&payload[6..]) {
+            Ok(name) if !name.is_empty() => {
+                ctx.log_fmt(format_args!("supervisor: RESTART {} core={}",
+                    name, if core == u32::MAX { -1i64 } else { core as i64 }));
+                // Kill first. A kill that finds nothing is NOT an error here: restarting a service
+                // that already died is exactly the case the test harness drives.
+                let _ = ctx.kill(name);
+                // No core given: use the WIRED respawn, so a service with peers (fs -> block-driver)
+                // gets them provided rather than only name-wired. With an explicit core, place it
+                // there - which is what `control` did before, so no wiring is lost that it had.
+                let ok = if core == u32::MAX { respawn_retry(ctx, map, name) }
+                         else                { spawn_mapped(ctx, map, name, core) };
+                if ok { CMD_OK } else { CMD_FAILED }
+            }
+            _ => CMD_UNKNOWN,
+        }
+    } else {
+        CMD_UNKNOWN
+    };
+
+    if let Some(cap) = ctx.take_pending_cap() {
+        let _ = ctx.try_send_by_handle(cap, &Message::from_bytes(&[status]));
+        ctx.remove_cap(cap);
+    }
+    true
+}
 
 /// The `pong` image, carried by the supervisor rather than the kernel (step C).
 static PONG_ELF: &[u8] = include_bytes!(env!("SVC_PONG_ELF"));
@@ -670,6 +734,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
     loop {
         let msg = ctx.recv();
+        // A command, or a death notification? The first byte decides (see CMD_MARKER).
+        if handle_command(&ctx, &mut name_map, msg.payload_bytes()) { continue; }
         let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
         // Two recovery paths race after a mass-kill: the convergence (converge()/reconcile()) may have
         // ALREADY respawned this service before its queued death notification reached us. If it is

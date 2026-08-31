@@ -744,7 +744,11 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
         "control" => Some(("control", ServiceConfig {
             elf:               include_bytes!(env!("SVC_CONTROL_ELF")),
             has_recv_endpoint: true,
-            send_peers:        &[],
+            // RESTART is forwarded to the supervisor, which holds restart authority (14.4) and - once
+            // images move - is the only thing that can respawn a service at all. This is not new
+            // authority for `control`: it already holds SERVICE_CONTROL and SPAWN, so it could kill
+            // and start services directly. It is the same authority routed correctly.
+            send_peers:        &["supervisor"],
             send_peers_grant:  false,
             preferred_core:    u32::MAX,
             probe_mode:        0,

@@ -20,7 +20,7 @@
 //! holds every authority - so writing them down is a reduction even though the syscall and capability
 //! pins grew by one each to make it possible.
 
-use godspeed_sdk::ServiceContext;
+use godspeed_sdk::{ServiceContext, ipc::Message};
 
 /// Kernel introspection query that pops one byte from COM2, or -1 when the port is empty.
 const Q_COM2_BYTE: u64 = 21;
@@ -46,16 +46,37 @@ fn execute(ctx: &ServiceContext, line: &str) {
             Some(name) => {
                 let core: Option<u32> = parts.next().and_then(|s| s.parse().ok());
                 ctx.log_fmt(format_args!("control: RESTART {} core={:?}", name, core));
-                // Kill first, then spawn. A kill that finds nothing is not an error here: RESTART of a
-                // service that already died is exactly the case the harness uses.
-                let _ = ctx.kill(name);
-                let spawned = match core {
-                    Some(c) => ctx.spawn_on(name, c),
-                    None => ctx.spawn(name),
-                };
-                match spawned {
-                    Ok(()) => ctx.log_fmt(format_args!("control: {} restarted", name)),
-                    Err(e) => ctx.log_fmt(format_args!("control: restart failed: {:?}", e)),
+                // ASK THE SUPERVISOR. This used to kill and then spawn here, which meant asking the
+                // KERNEL to spawn by name - and that only ever worked because the kernel held every
+                // service image. Restart authority is the supervisor's (14.4), and once an image
+                // lives there it is the only thing that CAN respawn it
+                // (`docs/service-ownership.md`).
+                //
+                // Bounded (26.6): a deadline, not an open wait. A supervisor that is mid-respawn of
+                // itself must never hang the operator channel - the harness would read a hang as a
+                // dead machine.
+                let mut buf = [0u8; 64];
+                buf[0] = CMD_MARKER;
+                buf[1] = CMD_RESTART;
+                buf[2..6].copy_from_slice(&core.unwrap_or(u32::MAX).to_le_bytes());
+                let nb = name.as_bytes();
+                let n  = nb.len().min(buf.len() - 6);
+                buf[6..6 + n].copy_from_slice(&nb[..n]);
+
+                match ctx.request_with_reply_call_err(
+                        "supervisor", &Message::from_bytes(&buf[..6 + n]), 10) {
+                    Ok(Some(reply)) => match reply.payload_bytes().first() {
+                        Some(&CMD_OK) => ctx.log_fmt(format_args!("control: {} restarted", name)),
+                        Some(&CMD_UNKNOWN) =>
+                            ctx.log_fmt(format_args!("control: restart failed: supervisor did not understand the request for {}", name)),
+                        _ => ctx.log_fmt(format_args!("control: restart failed: supervisor could not restart {}", name)),
+                    },
+                    // LOUD on both (invariant 12). A silent timeout here would read as a restart that
+                    // worked, which is the one thing an operator channel must never imply.
+                    Ok(None) => ctx.log_fmt(format_args!(
+                        "control: restart failed: supervisor did not answer within 10s ({})", name)),
+                    Err(e)   => ctx.log_fmt(format_args!(
+                        "control: restart failed: supervisor unreachable ({:?}) - {}", e, name)),
                 }
             }
             None => ctx.log("control: RESTART missing name"),
@@ -73,6 +94,13 @@ fn execute(ctx: &ServiceContext, line: &str) {
         None => {}
     }
 }
+
+/// The supervisor's command wire format. Kept in step with `services/supervisor/src/main.rs`; a
+/// mismatch shows up immediately as CMD_UNKNOWN rather than silently doing the wrong thing.
+const CMD_MARKER:  u8 = 0x01;
+const CMD_RESTART: u8 = b'R';
+const CMD_OK:      u8 = 0;
+const CMD_UNKNOWN: u8 = 2;
 
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
