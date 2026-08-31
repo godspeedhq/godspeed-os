@@ -155,6 +155,11 @@ static ASKER_ELF: &[u8] = include_bytes!(env!("SVC_ASKER_ELF"));
 static RESOURCE_SERVER_ELF: &[u8] = include_bytes!(env!("SVC_RESOURCE_SERVER_ELF"));
 static CHAOS_ELF: &[u8] = include_bytes!(env!("SVC_CHAOS_ELF"));
 static CONTROL_ELF: &[u8] = include_bytes!(env!("SVC_CONTROL_ELF"));
+/// ONE binary, three names. `observe`, `observe-now` and `observe-live` are the same program - the
+/// NAME selects the mode, exactly as the kernel's three rows did (all three were
+/// `include_bytes!(env!("SVC_OBSERVE_ELF"))`). Worth stating, because a reader seeing three IMAGES
+/// rows would otherwise expect three crates.
+static OBSERVE_ELF: &[u8] = include_bytes!(env!("SVC_OBSERVE_ELF"));
 static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
 static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
@@ -163,8 +168,13 @@ static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
 static REPLY_SERVER_ELF: &[u8] = include_bytes!(env!("SVC_REPLY_SERVER_ELF"));
 static HOLDER_ELF: &[u8] = include_bytes!(env!("SVC_HOLDER_ELF"));
 
-/// `(name, image, flags, memory limit, preferred core, send peers, privileges)` for every service
-/// whose image the supervisor holds.
+/// `(name, image, flags, memory limit, preferred core, send peers, privileges, mode)` for every
+/// service whose image the supervisor holds.
+///
+/// `mode` is the `probe_mode` selector. Named for probes, its first user, but general - `observe`,
+/// `observe-now` and `observe-live` are ONE binary that reads it to choose one-shot / live /
+/// foreground. Leaving it at 0 made `observe-now` run the LIVE LOOP: 100% CPU, flooding the console
+/// until the shell blocked on a send.
 ///
 /// It carries everything the service's CONTRACT declares, deliberately. The contract is the source of
 /// truth (Commandment III) and `scripts/contract_check.py` reconciles it against wherever the config
@@ -172,15 +182,15 @@ static HOLDER_ELF: &[u8] = include_bytes!(env!("SVC_HOLDER_ELF"));
 /// move would quietly weaken the check that keeps the two honest.
 ///
 /// `u32::MAX` as the core means "no preference" (9.2 round-robin); a caller-supplied core overrides it.
-const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32)] = &[
-    ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 1, &[], 0),
-    ("time", TIME_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "net-stack"], 0),
-    ("logger", LOGGER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, 2, &[], 0),
-    ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0),
+const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32)] = &[
+    ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 1, &[], 0, 0),
+    ("time", TIME_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "net-stack"], 0, 0),
+    ("logger", LOGGER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, 2, &[], 0, 0),
+    ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0),
     // FIRST service to move carrying a PRIVILEGE. RESOURCE_MINT arrives in the spawn request and the
     // kernel refuses it unless the SUPERVISOR holds it too - so this passes authority on, never mints.
     ("resource-server", RESOURCE_SERVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["holder"],
-     godspeed_sdk::service_context::privbits::RESOURCE_MINT),
+     godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0),
     // Four privileges, all delegated by the supervisor from its GRANT-only caps. `chaos` also needs
     // CONSOLE_READ ('q' to abort a storm), which is a spawn FLAG rather than a privilege bit.
     ("chaos", CHAOS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV
@@ -189,20 +199,26 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32)] = &[
      godspeed_sdk::service_context::privbits::SPAWN
      | godspeed_sdk::service_context::privbits::INTROSPECT
      | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
-     | godspeed_sdk::service_context::privbits::ACQUIRE_ANY),
+     | godspeed_sdk::service_context::privbits::ACQUIRE_ANY, 0),
     // The COM2 operator channel. FIRE_IRQ is the one privilege only this service holds.
     ("control", CONTROL_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      8 * 1024 * 1024, u32::MAX, &["supervisor"],
      godspeed_sdk::service_context::privbits::SPAWN
      | godspeed_sdk::service_context::privbits::INTROSPECT
      | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
-     | godspeed_sdk::service_context::privbits::FIRE_IRQ),
-    ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0),
-    ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0),
-    ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0),
-    ("roster", ROSTER_ELF, 0, 64 * 1024 * 1024, u32::MAX, &[], 0),
-    ("reply-server", REPLY_SERVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0),
-    ("holder", HOLDER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0),
+     | godspeed_sdk::service_context::privbits::FIRE_IRQ, 0),
+    ("observe", OBSERVE_ELF, 0, 8 * 1024 * 1024, u32::MAX, &[],
+     godspeed_sdk::service_context::privbits::INTROSPECT, 0),
+    ("observe-now", OBSERVE_ELF, 0, 8 * 1024 * 1024, u32::MAX, &[],
+     godspeed_sdk::service_context::privbits::INTROSPECT, 1),
+    ("observe-live", OBSERVE_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_CONSOLE, 8 * 1024 * 1024, 0, &[],
+     godspeed_sdk::service_context::privbits::INTROSPECT, 2),
+    ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0),
+    ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0),
+    ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0),
+    ("roster", ROSTER_ELF, 0, 64 * 1024 * 1024, u32::MAX, &[], 0, 0),
+    ("reply-server", REPLY_SERVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0),
+    ("holder", HOLDER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0),
 ];
 
 /// Spawn `name` from a supervisor-held image, if we hold one. `None` means "not ours - use the
@@ -211,7 +227,7 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
                   installs: &[(&str, CapHandle)])
     -> Option<Result<Option<CapHandle>, godspeed_sdk::Error>>
 {
-    let &(_, image, flags, mem, table_core, table_peers, privs) = IMAGES.iter().find(|(n, ..)| *n == name)?;
+    let &(_, image, flags, mem, table_core, table_peers, privs, mode) = IMAGES.iter().find(|(n, ..)| *n == name)?;
     let mut req = godspeed_sdk::service_context::SpawnRequest::new(image, name);
     // An explicit core from the caller wins (a RESTART override, 14.4); otherwise the table's
     // preference, which is what the contract declares.
@@ -221,6 +237,7 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
     // Privileges the supervisor asks the child be given. The kernel refuses any bit the SUPERVISOR
     // does not itself hold, so this passes authority on rather than minting it.
     req.privileges   = privs;
+    req.probe_mode   = mode;
     // Peers likewise: a caller that has caps to provide passes them, otherwise the declared list.
     let use_peers = if peers.is_empty() { table_peers } else { peers };
     // Caller-provided peer caps, when there are any. The kernel checks each holds GRANT, so passing

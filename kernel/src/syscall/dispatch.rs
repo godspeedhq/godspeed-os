@@ -747,6 +747,12 @@ struct SpawnRequest {
     /// format for this and not two.
     installs_ptr:   u64,
     installs_count: u32,
+    /// The service's MODE. Named `probe_mode` in `ServiceConfig` because probes were its first user,
+    /// but it is a general mode selector: `observe` reads it to choose one-shot / live / foreground,
+    /// and picks the LIVE LOOP when it is 0. Omitting it made `observe-now` spin at 100% CPU flooding
+    /// the console until the shell blocked on a send - a service that moved, spawned, ran, and did
+    /// the WRONG THING.
+    probe_mode:     u32,
 }
 
 /// Wire size of a `SpawnRequest`, in bytes. Every field at a fixed little-endian offset:
@@ -762,13 +768,15 @@ struct SpawnRequest {
 ///                                            104 installs_ptr   u64
 ///                                            112 installs_count u32
 ///                                            116 reserved       u32
+///                                            120 probe_mode     u32
+///                                            124 reserved       u32
 /// ```
 ///
 /// These are exactly the offsets a `repr(C)` layout of the SDK's matching struct produces on both
 /// 32- and 64-bit targets (every `u64` lands 8-aligned), so the two agree by construction - but the
 /// KERNEL's copy is the definition, and it reads each field at a stated offset rather than trusting
 /// that agreement.
-const SPAWN_REQUEST_BYTES: usize = 120;
+const SPAWN_REQUEST_BYTES: usize = 128;
 
 impl SpawnRequest {
     /// Decode the request from its wire bytes.
@@ -803,13 +811,14 @@ impl SpawnRequest {
             peers_len:    u32_at(96),
             installs_ptr:   u64_at(104),
             installs_count: u32_at(112),
+            probe_mode:     u32_at(120),
         }
     }
 }
 
 /// Bumped to 2 when `installs` was added. The version field exists for exactly this: a spawner
 /// built against a different kernel is REFUSED loudly rather than misparsing a shorter struct.
-const SPAWN_REQUEST_VERSION:  u32 = 2;
+const SPAWN_REQUEST_VERSION:  u32 = 3;
 const SPAWN_FLAG_REQ_RECV:    u32 = 1 << 0;
 const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
 
@@ -947,6 +956,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         &peers[..np],
         if ni > 0 { Some(&installs[..ni]) } else { None },
         req.privileges,
+        req.probe_mode,
     ) {
         // Hand back a SEND|GRANT cap to the new endpoint, as `SpawnReturningEndpoint` does: the
         // spawner has to be able to record `name -> cap` for the service it just started, or it

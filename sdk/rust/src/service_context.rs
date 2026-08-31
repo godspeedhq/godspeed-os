@@ -259,10 +259,14 @@ pub struct SpawnRequest {
     pub installs_ptr:   u64,
     pub installs_count: u32,
     pub _pad2:          u32,
+    /// Mode selector. Named for probes, its first user, but general: `observe` reads it to choose
+    /// one-shot / live / foreground, and takes the LIVE LOOP at 0.
+    pub probe_mode:     u32,
+    pub _pad3:          u32,
 }
 
 /// 2 since `installs` was added. A spawner built against a different kernel is refused loudly.
-pub const SPAWN_REQUEST_VERSION:  u32 = 2;
+pub const SPAWN_REQUEST_VERSION:  u32 = 3;
 pub const SPAWN_FLAG_REQ_RECV:    u32 = 1 << 0;
 pub const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
 
@@ -291,6 +295,7 @@ impl SpawnRequest {
             dma_pages: 0, bdf: 0, irq_count: 0, irqs: [0; 4],
             peers_ptr: 0, peers_len: 0, _pad: 0,
             installs_ptr: 0, installs_count: 0, _pad2: 0,
+            probe_mode: 0, _pad3: 0,
         }
     }
 

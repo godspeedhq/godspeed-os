@@ -646,8 +646,22 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         console_push: matches!(name, "xhci" | "ehci" | "dwc2"),
         // shell + observe use TaskStat/InspectKernel; supervisor's reconcile loop scans real liveness;
         // chaos does victim selection; the prop-/stress- probes query victim generations.
+        // EXACT names, not a prefix. `name.starts_with("observe")` granted INTROSPECT to anything
+        // whose name began with those letters - harmless while the kernel owned every name, and a
+        // privilege obtainable by CHOOSING A STRING once a caller supplies them (step C). The
+        // `observe*` trio is now enumerated; when they move, the bit comes in the spawn request and
+        // these names leave too.
+        //
+        // The `prop-`/`stress-` prefixes remain and are a KNOWN HOLE, recorded rather than papered
+        // over (26.7): probe names ARE caller-supplied since step A, so a service holding a spawn cap
+        // can spawn a probe named `prop-x` and receive INTROSPECT. Narrow - the caller gets the fixed
+        // probe binary running a fixed test mode, not arbitrary code - but it is authority obtained
+        // by choosing a string. It cannot simply become `is_probe`: adv-a11 asserts that a probe
+        // WITHOUT INTROSPECT is denied, so widening it to every probe would delete that test's
+        // subject. The real fix is for `spawn_probe` to carry a privilege word like `SpawnImage`
+        // does, checked against what the CALLER may delegate. See docs/service-ownership.md.
         introspect: matches!(name, "shell" | "supervisor")
-            || name.starts_with("observe") || name.starts_with("prop-") || name.starts_with("stress-"),
+            || name.starts_with("prop-") || name.starts_with("stress-"),
         // shell (interactive broker), supervisor (restart authority), chaos (the point of max-carnage),
         // and every probe (they kill victims to exercise kill/revocation).
         service_control: is_probe || matches!(name, "shell" | "supervisor"),
@@ -1162,46 +1176,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],        // AUTHORITY: `probe_authority`, keyed by name
             has_console_read:  false,
         })),
-        "observe" => Some(("observe", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_OBSERVE_ELF")),
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0, // MODE_LIVE
-            memory_limit:      8 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // `observe now` - one-shot static metrics frame (probe_mode 1 = MODE_NOW).
-        // Same ELF as `observe`; the shell brokers a kill-then-spawn of this.
-        "observe-now" => Some(("observe-now", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_OBSERVE_ELF")),
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        1, // MODE_NOW
-            memory_limit:      8 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // `observe` (live) - full-screen foreground view (probe_mode 2 = MODE_LIVE).
-        // Same ELF as `observe`; the shell spawns it, pauses its own read loop, and
-        // resumes when it parks (the shell-brokered foreground handoff). Holds
-        // CONSOLE_READ so it can poll for `q` (non-blocking) and toggle echo while
-        // it owns the screen.
-        "observe-live" => Some(("observe-live", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_OBSERVE_ELF")),
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    0,
-            probe_mode:        2, // MODE_LIVE
-            memory_limit:      8 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  true,
-        })),
         "shell" => Some(("shell", ServiceConfig {
             elf:               include_bytes!(env!("SVC_SHELL_ELF")),
             // Endpoint + an `fs` send-peer so the `drives`/file commands can request_with_reply
@@ -1349,6 +1323,8 @@ pub fn spawn_from_image(
     // Privilege bits the spawner asks the child be given. Already checked against the CALLER's own
     // holdings by the syscall, so this cannot escalate (3.1, 7.3).
     privileges:        u32,
+    // The service's mode selector (see `SpawnRequest::probe_mode`).
+    mode:              u32,
 ) -> Result<Option<EndpointId>, SpawnError> {
     if service_config(name).is_some() {
         crate::kprintln!("task: SpawnImage '{}' rejected: that name belongs to the kernel catalogue", name);
@@ -1362,7 +1338,7 @@ pub fn spawn_from_image(
     let core_id = resolve_spawn_core(core_override, u32::MAX)?;
     let mem = if memory_limit == 0 { 64 * 1024 * 1024 } else { memory_limit };
 
-    let result = spawn_service_with_image(name, image, core_id, has_recv_endpoint, peers, 0,
+    let result = spawn_service_with_image(name, image, core_id, has_recv_endpoint, peers, mode,
                                           false, mem, &[], has_console_read,
                                           Some(privileges), installs);
     if let Err(ref e) = result {
