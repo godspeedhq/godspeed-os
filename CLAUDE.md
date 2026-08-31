@@ -2504,6 +2504,19 @@ Architectural intent: the kernel emits structured events (IPC volume, cap denial
 
 Constraint: this must not pollute kernel scope. The kernel publishes; the metrics service interprets.
 
+> **Note (2026-08-31): the "known endpoint" above is the part to re-examine; the constraint under it
+> is exactly right.** This appendix predates the `trace` utility, which shipped with ZERO kernel
+> growth - the ring lives in the `logger` service and the instrumentation in the SDK. The reasoning
+> that kept it out of ring 0 applies here: a kernel event queue needs a bound, a bound needs a drop
+> policy, and deciding what to discard is a judgement (§26.10). A kernel-held endpoint to a
+> RESTARTABLE consumer is worse still - stale, with nobody above it to recover it (§14.3).
+>
+> Kernel STATE is already published by pull (`InspectKernel`, 24 queries, and `TaskStat`, gated by
+> INTROSPECT). Kernel EVENTS can ride the §11.4 shape: a bounded ring the kernel writes and a service
+> DRAINS - no endpoint, no consumer identity, no policy in the kernel. `docs/observability.md` has
+> the full argument and the three-part test any new mechanism must pass first. Non-normative, as is
+> this appendix.
+
 ## C.3 Cluster Mode (Single-System-Image)
 
 **Tentative timeline:** multi-year research direction. Not a milestone commitment for any specific version.
