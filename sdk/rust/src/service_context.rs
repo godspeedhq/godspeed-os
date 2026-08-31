@@ -289,6 +289,19 @@ pub mod privbits {
     pub const SET_CLOCK:       u32 = 1 << 10;
 }
 
+/// Device classes a spawner can name in `SpawnRequest::hw_flags`. The kernel resolves the class to
+/// what its own bus scan found - a CLASS rather than an address, because the kernel keeps a permanent
+/// physical DMA reservation per device that a respawned driver must get back.
+pub mod hwclass {
+    pub const NONE:        u32 = 0;
+    pub const AHCI:        u32 = 1;
+    pub const NIC:         u32 = 2;
+    pub const XHCI:        u32 = 3;
+    pub const EHCI:        u32 = 4;
+    pub const DWC2:        u32 = 5;
+    pub const FRAMEBUFFER: u32 = 6;
+}
+
 impl SpawnRequest {
     /// A request with everything the kernel does not yet honour left at zero.
     pub fn new(image: &[u8], name: &str) -> Self {

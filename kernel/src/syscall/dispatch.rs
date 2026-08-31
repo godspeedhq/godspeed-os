@@ -728,7 +728,13 @@ struct SpawnRequest {
     /// Privilege bitmask (SPAWN, CONSOLE_PUSH, INTROSPECT, SERVICE_CONTROL, RESOURCE_MINT, REBOOT,
     /// ACQUIRE_ANY, ...). NOT honoured yet - must be 0.
     privileges:   u32,
-    /// bit0 iommu_confine, bit1 needs_dma. NOT honoured yet - must be 0.
+    /// The DEVICE CLASS this service drives (`task::hw_class_of`), or 0 for none.
+    ///
+    /// A CLASS rather than raw MMIO/DMA addresses, and that is not a shortcut: the kernel keeps a
+    /// PERMANENT PHYSICAL DMA RESERVATION PER DEVICE, reused across restarts so a respawned driver
+    /// gets the same arena its controller may still be pointing at. That is per-device kernel state,
+    /// so the request has to identify the DEVICE - an address cannot express it. The kernel resolves
+    /// the class to what its own bus scan found; moving the SCAN is step D.
     hw_flags:     u32,
     /// Device MMIO window to grant. NOT honoured yet - must be 0.
     mmio_base:    u64,
@@ -849,15 +855,19 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     // NOT-YET-HONOURED FIELDS ARE REFUSED, NOT IGNORED (invariant 12). A spawner asking for an MMIO
     // window or a privilege this kernel does not yet grant must hear so, rather than receive a task
     // that silently lacks what it needs and fails later somewhere unrelated.
-    // HARDWARE fields are still refused; PRIVILEGES are honoured below. Refusing rather than ignoring
-    // is the rule (invariant 12): a spawner asking for an MMIO window this kernel will not grant must
-    // hear so, not receive a task that silently lacks it and fails somewhere unrelated.
-    if req.hw_flags != 0 || req.mmio_base != 0 || req.mmio_len != 0
-        || req.dma_pages != 0 || req.bdf != 0 || req.irq_count != 0
-    {
+    // `hw_flags` (the device class) is honoured below. The RAW address fields are still refused, and
+    // refusing rather than ignoring is the rule (invariant 12): a spawner asking for an MMIO window
+    // this kernel will not grant must hear so, not receive a task that silently lacks it and fails
+    // somewhere unrelated. They stay refused because the kernel resolves addresses from the class -
+    // see the field comment - and will keep doing so until the bus scan itself moves (step D).
+    if req.mmio_base != 0 || req.mmio_len != 0 || req.dma_pages != 0 || req.bdf != 0 {
         crate::kprintln!(
-            "task: SpawnImage refused - hardware fields not honoured yet (hw_flags={:#x} mmio={:#x}+{:#x} dma_pages={} bdf={:#x} irqs={})",
-            req.hw_flags, req.mmio_base, req.mmio_len, req.dma_pages, req.bdf, req.irq_count);
+            "task: SpawnImage refused - raw hardware addresses are not honoured; name the device CLASS instead (mmio={:#x}+{:#x} dma_pages={} bdf={:#x})",
+            req.mmio_base, req.mmio_len, req.dma_pages, req.bdf);
+        return -1;
+    }
+    if !crate::task::hw_class_known(req.hw_flags) {
+        crate::kprintln!("task: SpawnImage refused - unknown device class {}", req.hw_flags);
         return -1;
     }
 
@@ -957,6 +967,8 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         if ni > 0 { Some(&installs[..ni]) } else { None },
         req.privileges,
         req.probe_mode,
+        req.hw_flags,
+        &req.irqs[..(req.irq_count as usize).min(4)],
     ) {
         // Hand back a SEND|GRANT cap to the new endpoint, as `SpawnReturningEndpoint` does: the
         // spawner has to be able to record `name -> cap` for the service it just started, or it

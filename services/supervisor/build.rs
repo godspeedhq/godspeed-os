@@ -17,7 +17,7 @@ fn main() {
     println!("cargo:rustc-link-arg=--entry=service_main");
 
     // The images this supervisor carries. One entry today (the step-C proof); the rest follow.
-    const EMBEDDED: &[&str] = &["pong", "roster", "reply-server", "holder", "upper", "mem-pressure", "ping", "time", "logger", "asker", "resource-server", "chaos", "control", "observe", "greet", "counter", "shell", "fs", "net-stack"];
+    const EMBEDDED: &[&str] = &["pong", "roster", "reply-server", "holder", "upper", "mem-pressure", "ping", "time", "logger", "asker", "resource-server", "chaos", "control", "observe", "greet", "counter", "shell", "fs", "net-stack", "block-driver"];
 
     // OUT_DIR is <target>/<triple>/<profile>/build/<pkg>-<hash>/out, so the binaries this build
     // needs sit four levels up. Derived rather than assumed, so it holds for every triple.

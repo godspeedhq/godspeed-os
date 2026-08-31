@@ -519,13 +519,34 @@ pub const EHCI_CORE: u32 = 3;
 /// M7 / T1 Phase B). For the services that ship a `.toml`, `scripts/contract_check.py` reconciles this
 /// against the contract's `hw_device` / `resource_mint`, so the kernel and the contract cannot diverge
 /// (Commandment III). `xhci` / `ehci` / `resource-server` have no contract and are declared here only.
+/// Is this a device class this kernel understands? 0 = none.
+///
+/// An UNKNOWN class is refused rather than treated as none: a spawner asking for a device this kernel
+/// cannot grant must hear so, not receive a driver with no MMIO window that enumerates nothing and
+/// reports no error (invariant 12).
+pub fn hw_class_known(class: u32) -> bool { class <= 6 }
+
+/// Resolve a spawn request's device class to the kernel's own scan results.
+fn hw_class_of(class: u32) -> HwClass {
+    match class {
+        1 => HwClass::Ahci,
+        2 => HwClass::Nic,
+        3 => HwClass::Xhci,
+        4 => HwClass::Ehci,
+        5 => HwClass::Dwc2,
+        6 => HwClass::Framebuffer,
+        _ => HwClass::None,
+    }
+}
+
 fn service_hw(name: &str) -> (HwClass, bool) {
     match name {
         "dwc2"                                 => (HwClass::Dwc2, false),
         "console"                              => (HwClass::Framebuffer, false),
         "xhci"                                 => (HwClass::Xhci, false),
         "ehci"                                 => (HwClass::Ehci, false),
-        "block-driver"                         => (HwClass::Ahci, false),
+        // `block-driver` moved to the supervisor (step C): it names HwClass::Ahci in its spawn
+        // request, and the kernel resolves that to what its own scan found.
         "nic-driver" | "e1000"                 => (HwClass::Nic,  false),
         // `resource-server`, `fs` and `net-stack` all moved to the supervisor (step C): their
         // RESOURCE_MINT arrives in the spawn request, checked against what the SUPERVISOR may
@@ -872,99 +893,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[0x29],
             has_console_read:  false,
         })),
-        // `block-driver` - userspace ATA PIO disk driver (persistence, v2; §6.3,
-        // docs/persistence.md). The kernel grants its ATA port window by name in
-        // the spawn path (6a-pio); no MMIO, no DMA, no IRQ wired yet (polled).
-        // Phase 1 reads sector 0 and logs it. Pinned to core 1, off the shell/TCB.
-        "block-driver" => Some(("block-driver", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_BLOCK_DRIVER_ELF")),
-            has_recv_endpoint: true, // serves block read/write requests from fs (§4)
-            // With the USB stack in userspace, block-driver reaches the disk by IPC to the `xhci`
-            // SERVICE - so it needs a SEND cap to that name. Without one, `request_with_reply("xhci",
-            // ..)` finds no send slot and returns None INSTANTLY. That is exactly what the Pi 4
-            // showed: the service sat in its poll loop with the disk bound, never receiving a single
-            // message, while block-driver burned its whole 20 s wait failing to address it. Every
-            // layer looked healthy in isolation, because the missing piece was the EDGE between them.
-            //
-            // block-driver reaches the disk THROUGH a USB host-controller SERVICE on both ARM
-            // targets now: `xhci` on aarch64, `dwc2` on arm32. The arm32 arm used to be empty, with a
-            // comment saying "the USB stack is still in the kernel... so there is no such peer" -
-            // true when it was written and false since the driver moved out.
-            //
-            // The paragraph above is the reason this edge cannot be left to be noticed later: without
-            // the SEND cap, `request_with_reply` finds no send slot and returns None INSTANTLY, so
-            // the driver sits in its poll loop with the disk bound and never receives a message while
-            // block-driver reports no storage. Every layer healthy in isolation, and the missing
-            // piece the edge between them.
-            #[cfg(target_arch = "aarch64")]
-            send_peers:        &["xhci"],
-            #[cfg(target_arch = "arm")]
-            send_peers:        &["dwc2"],
-            #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
-            send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
-            send_peers_grant:  false,
-            // ARM KEEPS THIS ON CORE 0 - and the reason is neither of the two written here before.
-            // Both were wrong, and hardware refuted each in turn.
-            //
-            //   1. "The `msc_*` syscalls refuse when `!on_core0()`." True until slice 5 deleted the
-            //      in-kernel DWC2 stack; now provably false (no `on_core0` reference remains in
-            //      `arch/arm`, and `usb_disk_*` are inert stubs).
-            //   2. "Cross-core request/reply does not complete." False. Unpinned services stalled
-            //      because `dwc2` DROPPED block requests when it had no disk (fixed separately), not
-            //      because of cores; with that fixed they came up correctly on all four.
-            //
-            // The real reason is LATENCY, and it was found by an operator noticing `ls` and `read`
-            // had gone sluggish: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB, so the
-            // scheduler's cross-core wake does nothing and the target core does not notice a message
-            // until its next 10 ms timer tick. Cross-core IPC costs up to a full quantum PER HOP, and
-            // a file read is shell -> fs -> block-driver -> dwc2. Unpinning turned a same-core chain
-            // into three cross-core hops and made every command visibly slow. The giveaway was that a
-            // chaos run made it FASTER: respawns re-drew placement and happened to co-locate the
-            // chain again.
-            //
-            // UNPINNED, now that the IPI exists (BCM2836 core mailboxes; proven every boot by
-            // `arm32: IPI selftest PASS`). Cross-core wakes are immediate, so spreading these no
-            // longer costs a 10 ms tick per hop - the reason they were pinned in the first place.
-            //
-            // The stronger reason is what the IPI exposed. With wakes now actually preempting, `dwc2`
-            // shares core 0 with everything that gets woken, and its split-transaction sequencing is
-            // microframe-timed: a start-split and its complete-split must land in specific 125 us
-            // windows. Preempted between them, the transaction translator is left holding a
-            // transaction nobody collects - it wedges, gets cleared, and wedges again. Hardware showed
-            // that loop plainly: eight Clear_TT_Buffer calls and eight port re-enumerations in a
-            // couple of minutes, which the operator experiences as the keyboard pausing.
-            //
-            // So moving storage and the network OFF core 0 is not load-balancing here, it is giving
-            // the one timing-critical service on this board room to hit its deadlines. `dwc2` stays on
-            // core 0 because that is where its interrupt is routed.
-            //
-            // (Superseded rationale kept below so the next reader sees what was believed and why.)
-            //
-            // The old reason - the in-kernel DWC2 stack's `msc_*` entry points refused when
-            // `!on_core0()` - died with slice 5, and is verifiably gone (no `on_core0` reference
-            // remains in `arch/arm`; `usb_disk_*` are inert stubs). Unpinning on that basis was tried
-            // and it BROKE STORAGE: block-driver spawned on core 2 and logged nothing at all - not
-            // even its own "no disk" line - while `fs` on core 1 never reached "serving file API"
-            // behind it, and `nic-driver` on core 3 stopped after "starting". Everything left on core
-            // 0 was fine.
-            //
-            // The real constraint is underneath: `arch::arm`'s `send_ipi_to_lapic` is an EMPTY STUB,
-            // so a task blocked in `recv` on another core is never woken by its sender (§8.3 relies on
-            // that IPI). Cross-core request/reply therefore does not complete on this port, and every
-            // service that uses it has been co-located on core 0 - which is why three cores sit idle.
-            //
-            // So the pin stays until cross-core wakeups work, and it is now documented as a WORKAROUND
-            // FOR A KERNEL GAP rather than as a property of this driver. Fixing the IPI is what
-            // unpins these three, and it unpins them everywhere at once.
-            // arm32: core 2. Off core 0 for the same reason as the networking pair (see nic-driver),
-            // and off core 1 so a burst of disk I/O and a burst of frames do not queue behind
-            // each other on one core.
-            preferred_core:    if cfg!(target_arch = "arm") { 2 } else { 1 },
-            probe_mode:        0,
-            memory_limit:      16 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
         // `nic-driver` - userspace NIC driver (networking, v2; docs/networking.md, Phase 1).
         // The kernel maps the Intel e1000's BAR0 by name at spawn (gated on the discovered NIC
         // actually being an e1000), like the USB/AHCI controllers. Phase 1 step 2 is reset +
@@ -1155,7 +1083,7 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
     }
     let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
         cfg.has_recv_endpoint, &pipe_peers[..np], cfg.probe_mode, cfg.send_peers_grant,
-        cfg.memory_limit, cfg.hw_irqs, cfg.has_console_read, None, None);
+        cfg.memory_limit, cfg.hw_irqs, cfg.has_console_read, None, None, None);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn pipe '{}' -> '{}' failed: {:?}", producer, sink, e);
     }
@@ -1191,6 +1119,9 @@ pub fn spawn_from_image(
     privileges:        u32,
     // The service's mode selector (see `SpawnRequest::probe_mode`).
     mode:              u32,
+    // The device class this service drives (0 = none), and the IRQ lines routed to its endpoint.
+    hw_class:          u32,
+    irqs:              &[u8],
 ) -> Result<Option<EndpointId>, SpawnError> {
     if service_config(name).is_some() {
         crate::kprintln!("task: SpawnImage '{}' rejected: that name belongs to the kernel catalogue", name);
@@ -1205,8 +1136,8 @@ pub fn spawn_from_image(
     let mem = if memory_limit == 0 { 64 * 1024 * 1024 } else { memory_limit };
 
     let result = spawn_service_with_image(name, image, core_id, has_recv_endpoint, peers, mode,
-                                          false, mem, &[], has_console_read,
-                                          Some(privileges), installs);
+                                          false, mem, irqs, has_console_read,
+                                          Some(privileges), Some(hw_class_of(hw_class)), installs);
     if let Err(ref e) = result {
         crate::kprintln!("task: SpawnImage '{}' failed: {:?}", name, e);
     }
@@ -1278,7 +1209,7 @@ pub fn spawn_probe(name: &str, core_override: Option<u32>, p: ProbeParams, peers
     let result = spawn_service_with_image(name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
                               p.has_recv_endpoint, peers, p.mode,
                               grant, mem, hw_irqs,
-                              false, None, None);
+                              false, None, None, None);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn probe '{}' failed: {:?}", name, e);
     }
@@ -1319,7 +1250,7 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<O
     let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
                               cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
-                              cfg.has_console_read, None, None);
+                              cfg.has_console_read, None, None, None);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn '{}' failed: {:?}", name, e);
     }
@@ -1342,7 +1273,7 @@ pub fn spawn_service_by_name_with_installs(
     let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
                               cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
-                              cfg.has_console_read, None, Some(installs));
+                              cfg.has_console_read, None, None, Some(installs));
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn '{}' (with installs) failed: {:?}", name, e);
     }
@@ -1420,6 +1351,9 @@ fn spawn_service_with_image(
     // caller itself holds). `None` = resolve them from the kernel's by-name table, which is the
     // catalogue path and goes away with the catalogue.
     priv_override:     Option<u32>,
+    // `Some(class)` = the SPAWNER named the device this service drives. `None` = resolve it by name
+    // from `service_hw`, the catalogue path, which goes away with the catalogue.
+    hw_override:       Option<HwClass>,
     // Phase 0b (docs/naming-design.md): if `Some`, wire the child's send-peers from these
     // caller-supplied `(label, cap)` entries instead of resolving `send_peers` against the kernel
     // name table. The kernel installs each cap and records `label → slot` in the child's send-peer
@@ -1430,7 +1364,8 @@ fn spawn_service_with_image(
     // The declared hardware class + mint authority for this service (audit M7 / T1 Phase B). Every
     // MMIO / DMA / IOMMU / bus-master / RESOURCE_MINT grant below is driven off these, not a `name ==`
     // check - one declaration (`service_hw`), reconciled against the .toml for contracted services.
-    let (hw, resource_mint_by_name) = service_hw(name);
+    let (hw_by_name, resource_mint_by_name) = service_hw(name);
+    let hw = hw_override.unwrap_or(hw_by_name);
     // RESOURCE_MINT is NOT a field of `Privileges` - it is a separate flag out of `service_hw`, so a
     // spawner-supplied privilege set has to be threaded to it explicitly. Missing this meant a moved
     // service spawned fine and then idled with "no RESOURCE_MINT cap", which the dedicated
@@ -2241,7 +2176,7 @@ fn spawn_service_with_image(
 // supervisor up, which is the thing that has to work anyway. If that ever proves too large a first
 // step, the answer is a smaller supervisor - not a second spawn path in the kernel.
 pub fn spawn_supervisor() {
-    match spawn_service_with_image("supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None, None) {
+    match spawn_service_with_image("supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None, None, None) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => panic!("supervisor spawn failed: {:?}", e),
     }
@@ -2344,7 +2279,7 @@ pub fn poll_supervisor_respawn() {
     // the pressure eases. (Only the BOOT-time spawn_supervisor keeps its fatal panic - §22 Test 1B.)
     match spawn_service_with_image(
         "supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false,
-        64 * 1024 * 1024, &[], false, None, None,
+        64 * 1024 * 1024, &[], false, None, None, None,
     ) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => {

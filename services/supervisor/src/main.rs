@@ -176,6 +176,7 @@ static GREET_ELF: &[u8] = include_bytes!(env!("SVC_GREET_ELF"));
 static COUNTER_ELF: &[u8] = include_bytes!(env!("SVC_COUNTER_ELF"));
 static SHELL_ELF: &[u8] = include_bytes!(env!("SVC_SHELL_ELF"));
 static FS_ELF: &[u8] = include_bytes!(env!("SVC_FS_ELF"));
+static BLOCK_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_BLOCK_DRIVER_ELF"));
 static NET_STACK_ELF: &[u8] = include_bytes!(env!("SVC_NET_STACK_ELF"));
 static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
 static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
@@ -185,8 +186,12 @@ static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
 static REPLY_SERVER_ELF: &[u8] = include_bytes!(env!("SVC_REPLY_SERVER_ELF"));
 static HOLDER_ELF: &[u8] = include_bytes!(env!("SVC_HOLDER_ELF"));
 
-/// `(name, image, flags, memory limit, preferred core, send peers, privileges, mode)` for every
-/// service whose image the supervisor holds.
+/// `(name, image, flags, memory limit, preferred core, send peers, privileges, mode, hw class)` for
+/// every service whose image the supervisor holds.
+///
+/// `hw class` names the DEVICE a driver drives (`hwclass::*`); the kernel resolves it to what its own
+/// bus scan found. A class rather than an address, because the kernel keeps a permanent physical DMA
+/// reservation per device that a respawned driver must be given back.
 ///
 /// `mode` is the `probe_mode` selector. Named for probes, its first user, but general - `observe`,
 /// `observe-now` and `observe-live` are ONE binary that reads it to choose one-shot / live /
@@ -199,15 +204,15 @@ static HOLDER_ELF: &[u8] = include_bytes!(env!("SVC_HOLDER_ELF"));
 /// move would quietly weaken the check that keeps the two honest.
 ///
 /// `u32::MAX` as the core means "no preference" (9.2 round-robin); a caller-supplied core overrides it.
-const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32)] = &[
-    ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 1, &[], 0, 0),
-    ("time", TIME_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "net-stack"], 0, 0),
-    ("logger", LOGGER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, 2, &[], 0, 0),
-    ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0),
+const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
+    ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 1, &[], 0, 0, 0),
+    ("time", TIME_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "net-stack"], 0, 0, 0),
+    ("logger", LOGGER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, 2, &[], 0, 0, 0),
+    ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0, 0),
     // FIRST service to move carrying a PRIVILEGE. RESOURCE_MINT arrives in the spawn request and the
     // kernel refuses it unless the SUPERVISOR holds it too - so this passes authority on, never mints.
     ("resource-server", RESOURCE_SERVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["holder"],
-     godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0),
+     godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0, 0),
     // Four privileges, all delegated by the supervisor from its GRANT-only caps. `chaos` also needs
     // CONSOLE_READ ('q' to abort a storm), which is a spawn FLAG rather than a privilege bit.
     ("chaos", CHAOS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV
@@ -216,25 +221,25 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32)] = &[
      godspeed_sdk::service_context::privbits::SPAWN
      | godspeed_sdk::service_context::privbits::INTROSPECT
      | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
-     | godspeed_sdk::service_context::privbits::ACQUIRE_ANY, 0),
+     | godspeed_sdk::service_context::privbits::ACQUIRE_ANY, 0, 0),
     // The COM2 operator channel. FIRE_IRQ is the one privilege only this service holds.
     ("control", CONTROL_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      8 * 1024 * 1024, u32::MAX, &["supervisor"],
      godspeed_sdk::service_context::privbits::SPAWN
      | godspeed_sdk::service_context::privbits::INTROSPECT
      | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
-     | godspeed_sdk::service_context::privbits::FIRE_IRQ, 0),
+     | godspeed_sdk::service_context::privbits::FIRE_IRQ, 0, 0),
     ("observe", OBSERVE_ELF, 0, 8 * 1024 * 1024, u32::MAX, &[],
-     godspeed_sdk::service_context::privbits::INTROSPECT, 0),
+     godspeed_sdk::service_context::privbits::INTROSPECT, 0, 0),
     ("observe-now", OBSERVE_ELF, 0, 8 * 1024 * 1024, u32::MAX, &[],
-     godspeed_sdk::service_context::privbits::INTROSPECT, 1),
+     godspeed_sdk::service_context::privbits::INTROSPECT, 1, 0),
     ("observe-live", OBSERVE_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_CONSOLE, 8 * 1024 * 1024, 0, &[],
-     godspeed_sdk::service_context::privbits::INTROSPECT, 2),
+     godspeed_sdk::service_context::privbits::INTROSPECT, 2, 0),
     // `greet` declares `pong` as a peer so the supervisor INSTALLS pong's cap from its name-cap map
     // (spawn_wired), which is what `spawnwired` proves: the child reaches pong through a capability
     // it was handed, not by resolving a name.
-    ("greet", GREET_ELF, 0, 64 * 1024 * 1024, u32::MAX, &["pong"], 0, 0),
-    ("counter", COUNTER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["fs"], 0, 0),
+    ("greet", GREET_ELF, 0, 64 * 1024 * 1024, u32::MAX, &["pong"], 0, 0, 0),
+    ("counter", COUNTER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["fs"], 0, 0, 0),
     // The user's interface. GPIO and SET_CLOCK_FLOOR are ARM-only in effect but the bits are
     // arch-neutral: the kernel refuses any the supervisor cannot delegate, and on x86 the underlying
     // grant is simply never used. SET_CLOCK_FLOOR is the NARROW right (raise the clock floor), not
@@ -248,18 +253,22 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32)] = &[
      | godspeed_sdk::service_context::privbits::ACQUIRE_ANY
      | godspeed_sdk::service_context::privbits::REBOOT
      | godspeed_sdk::service_context::privbits::GPIO
-     | godspeed_sdk::service_context::privbits::SET_CLOCK_FLOOR, 0),
+     | godspeed_sdk::service_context::privbits::SET_CLOCK_FLOOR, 0, 0),
     ("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 32 * 1024 * 1024, 1, &["block-driver", "logger"],
-     godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0),
+     godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0, 0),
     ("net-stack", NET_STACK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, if cfg!(target_arch = "arm") { 1 } else { 1 }, &["nic-driver", "time"],
      godspeed_sdk::service_context::privbits::RESOURCE_MINT
-     | godspeed_sdk::service_context::privbits::SET_CLOCK, 0),
-    ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0),
-    ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0),
-    ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0),
-    ("roster", ROSTER_ELF, 0, 64 * 1024 * 1024, u32::MAX, &[], 0, 0),
-    ("reply-server", REPLY_SERVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0),
-    ("holder", HOLDER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0),
+     | godspeed_sdk::service_context::privbits::SET_CLOCK, 0, 0),
+    // FIRST DRIVER to move. AHCI: an MMIO BAR, a DMA arena and a PCI BDF for the bus-master enable -
+    // and no IRQ line, which is why it is the right one to prove the path on.
+    ("block-driver", BLOCK_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, if cfg!(target_arch = "arm") { 2 } else { 1 }, &["xhci"], 0, 0,
+     godspeed_sdk::service_context::hwclass::AHCI),
+    ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0, 0),
+    ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
+    ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
+    ("roster", ROSTER_ELF, 0, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
+    ("reply-server", REPLY_SERVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
+    ("holder", HOLDER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
 ];
 
 /// Spawn `name` from a supervisor-held image, if we hold one. `None` means "not ours - use the
@@ -268,7 +277,7 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
                   installs: &[(&str, CapHandle)])
     -> Option<Result<Option<CapHandle>, godspeed_sdk::Error>>
 {
-    let &(_, image, flags, mem, table_core, table_peers, privs, mode) = IMAGES.iter().find(|(n, ..)| *n == name)?;
+    let &(_, image, flags, mem, table_core, table_peers, privs, mode, hw) = IMAGES.iter().find(|(n, ..)| *n == name)?;
     let mut req = godspeed_sdk::service_context::SpawnRequest::new(image, name);
     // An explicit core from the caller wins (a RESTART override, 14.4); otherwise the table's
     // preference, which is what the contract declares.
@@ -279,6 +288,7 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
     // does not itself hold, so this passes authority on rather than minting it.
     req.privileges   = privs;
     req.probe_mode   = mode;
+    req.hw_flags     = hw;
     // Peers likewise: a caller that has caps to provide passes them, otherwise the declared list.
     let use_peers = if peers.is_empty() { table_peers } else { peers };
     // Caller-provided peer caps, when there are any. The kernel checks each holds GRANT, so passing
@@ -378,8 +388,7 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
     if let Some(r) = spawn_by_image(ctx, name, 0xFFFF, &[], &installs[..n]) {
         return match r {
             Ok(Some(cap)) => {
-                if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
-                let _ = map.record(name, cap.0);
+                record_name(ctx, map, name, cap);
                 ctx.log_fmt(format_args!(
                     "supervisor: {} wired from the name-cap map ({} peer(s) provided; image supplied here)", name, n));
                 true
@@ -396,9 +405,8 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
     }
     match ctx.spawn_with_caps(name, 0xFFFF, &installs[..n]) {
         Ok(Some(cap)) => {
-            // Free the dead instance's cap on a restart (see spawn_mapped) - no cap-table leak.
-            if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
-            let _ = map.record(name, cap.0);
+            // Frees the dead instance's cap on a restart (see spawn_mapped) - no cap-table leak.
+            record_name_quiet(ctx, map, name, cap);
             ctx.log_fmt(format_args!(
                 "supervisor: {} wired from the name-cap map ({} peer(s) provided; rest name-wired)", name, n));
             true
@@ -417,6 +425,35 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
     }
 }
 
+/// Record `name -> cap` in the map, replacing any previous entry, and REPORT the outcome.
+///
+/// Every path that records a name goes through here. Three call sites had grown their own copy of
+/// this, and they had already drifted: two logged the recording and one did not (so 22 Test 11's
+/// assertion depended on WHICH path ran), and two discarded `record`'s return value entirely - a full
+/// map would drop the name with nobody told, which is the silent failure invariant 12 forbids.
+///
+/// The line is the observable for a real property: the name is re-recorded, so the kernel directory
+/// resolves the NEW instance after a restart.
+fn record_name(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, cap: CapHandle) {
+    if record_name_quiet(ctx, map, name, cap) {
+        ctx.log_fmt(format_args!("supervisor: name-map + {} (endpoint cap slot {})", name, cap.0));
+    }
+}
+
+/// `record_name` for callers that announce the recording THEMSELVES (an adopt, a wired spawn), so the
+/// map operation stays silent on success and the caller's own line is the only one. Returns whether
+/// the name was recorded.
+///
+/// A FULL map is still reported HERE rather than left to the caller, because every one of these sites
+/// used to discard this and then print "adopted running X" - a line that was not true if the record
+/// had just been dropped. Announcing the outcome is optional; hiding a failure is not (invariant 12).
+fn record_name_quiet(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, cap: CapHandle) -> bool {
+    if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
+    if map.record(name, cap.0) { return true; }
+    ctx.log_fmt(format_args!("supervisor: name-map FULL - dropped {}", name));
+    false
+}
+
 /// Spawn `name` on `core` (0xFFFF = round-robin) AND record its endpoint cap in `map` (Phase 1).
 /// The spawn itself is identical to `ctx.spawn` - the new syscall just also hands back a cap.
 /// Returns true if the service spawned with an endpoint cap (used by the restart loop).
@@ -424,11 +461,7 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
     // A supervisor-held image goes down the SpawnImage path; the kernel has no row for it.
     if let Some(r) = spawn_by_image(ctx, name, core, &[], &[]) {
         return match r {
-            Ok(Some(cap)) => {
-                if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
-                map.record(name, cap.0);
-                true
-            }
+            Ok(Some(cap)) => { record_name(ctx, map, name, cap); true }
             Ok(None) => true,            // spawned; no endpoint to record
             Err(e) => {
                 ctx.log_fmt(format_args!("supervisor: spawn '{}' from image FAILED ({:?})", name, e));
@@ -438,14 +471,9 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
     }
     match ctx.spawn_returning_endpoint(name, core) {
         Ok(Some(cap)) => {
-            // On a restart, free the dead instance's cap before recording the new one, so a
-            // kill-storm can't leak the supervisor's cap table (the map already updates in place).
-            if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
-            if map.record(name, cap.0) {
-                ctx.log_fmt(format_args!("supervisor: name-map + {} (endpoint cap slot {})", name, cap.0));
-            } else {
-                ctx.log_fmt(format_args!("supervisor: name-map FULL - dropped {}", name));
-            }
+            // On a restart the dead instance's cap is freed before the new one is recorded, so a
+            // kill-storm can't leak the supervisor's cap table (`record_name` does both).
+            record_name(ctx, map, name, cap);
             true
         }
         // SPAWNED, and this service simply has no recv endpoint (`mem-pressure`, `greet`, `roster`).
@@ -470,7 +498,7 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
 /// rather than respawned. Narrow race; full liveness-aware reconciliation is a follow-up.
 fn ensure_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u32) -> bool {
     if let Some(cap) = ctx.acquire_send_grant_cap(name) {
-        let _ = map.record(name, cap.0);
+        record_name_quiet(ctx, map, name, cap);
         ctx.log_fmt(format_args!("supervisor: adopted running {} (slot {})", name, cap.0));
         return true;
     }
@@ -480,7 +508,7 @@ fn ensure_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u
 /// `ensure_mapped` for a service with peers - adopt if already running, else `spawn_wired`.
 fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[&str]) -> bool {
     if let Some(cap) = ctx.acquire_send_grant_cap(name) {
-        let _ = map.record(name, cap.0);
+        record_name_quiet(ctx, map, name, cap);
         ctx.log_fmt(format_args!("supervisor: adopted running {} (slot {})", name, cap.0));
         return true;
     }
@@ -640,7 +668,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // its endpoint by name - instead of trying to spawn a duplicate the kernel's singleton guard
         // rejects, which used to print a misleading "logger spawn failed" on every `kill supervisor`.
         // Mirrors the block-driver/fs/shell adopt lines in the reconcile path.
-        let _ = name_map.record("logger", cap.0);
+        record_name_quiet(&ctx, &mut name_map, "logger", cap);
         ctx.log("supervisor: adopted running logger");
     } else if !spawn_mapped(&ctx, &mut name_map, "logger", 0xFFFF) {
         // Through the image table: the supervisor carries logger's image now, and it does not route
@@ -656,7 +684,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // is the source of truth) and the kernel's boot floor keeps the display - degraded, never silent.
     ctx.log("supervisor: spawning console...");
     if let Some(cap) = ctx.acquire_send_grant_cap("console") {
-        let _ = name_map.record("console", cap.0);
+        record_name_quiet(&ctx, &mut name_map, "console", cap);
         ctx.log("supervisor: adopted running console");
     } else if ctx.spawn("console").is_err() {
         ctx.log("supervisor: console spawn failed - display stays on the kernel boot floor");

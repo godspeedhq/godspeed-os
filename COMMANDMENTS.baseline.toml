@@ -79,16 +79,21 @@ features = [
 # The kernel holds a `service_config` for each of these - memory limit, placement core, capabilities,
 # send peers, embedded ELF. Loading a task is mechanism and belongs to the kernel; a CATALOGUE of what
 # every service is allowed is policy, and policy belongs to the supervisor (§26.10). §4.4 also forbids
-# "developer tooling" in the kernel, and roughly 190 of these are test probes.
+# "developer tooling" in the kernel, which is what the 193 test-probe rows were.
 #
 # The target is ONE entry - `supervisor`, which the kernel must bootstrap because nothing is beneath it,
 # exactly as with `kernel_spawned_service`. Every other service's policy belongs to the supervisor, with
-# its image handed to the Spawn syscall rather than compiled into ring 0. 7 is the distance from that (it was 218: the 193 test probes moved to the supervisor - docs/probe-params-design.md).
+# its image handed to the Spawn syscall rather than compiled into ring 0.
+#
+# It was 221. No running total is written here: the list below IS the count, and a number in a comment
+# is a second copy of it, free to drift and needing a hand-edit every time the list shrinks (the same
+# reason the responsibility count is not in this file). What history records instead are the two moves
+# that cannot be read off the list - the 193 test probes (docs/probe-params-design.md) and the service
+# images (docs/service-ownership.md).
 #
 # Listed in full, without splitting "real" services from test ones: any rule for that split is a
 # judgment encoded as a pattern, and the next service named outside the pattern slips through.
 service_configs = [
-    "block-driver",
     "console",
     "dwc2",
     "ehci",
