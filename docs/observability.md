@@ -242,7 +242,94 @@ coherent commit.
 
 ---
 
-## 10. Amending C.2
+## 10. The plan
+
+Phased so that the kernel change is **pulled into existence** by a service that has demonstrably hit
+the wall (26.2), not built ahead of one. Each phase is independently useful and independently
+shippable.
+
+### Phase 0 - build the service against what already exists
+
+No kernel change at all. Rename `logger` -> `events` (section 9) and give it the observability job:
+
+```
+   InspectKernel (24 queries) --pull--+
+   TaskStat                   --pull--+--> events --> exposition
+   kernel text ring           --drain-+      |
+   its own 192-event trace ring ------+      +-- holds INTROSPECT + a log cap
+```
+
+Deliverable: metrics and logs and traces served by one service, with **zero** kernel growth. This is
+most of the value, and it is reachable today.
+
+### Phase 1 - find out what is actually missing
+
+Run it. Use it. Record specifically what could not be answered and why. The PREDICTION, written down
+so it can be wrong:
+
+> **Capability denials will be the gap.** They are never logged (verified: no `kprintln!` on any
+> `CapNotHeld` / `CapInsufficientRights` path), so a denial returns an error to the caller and
+> vanishes. The adversarial suite proves denials HAPPEN; an operator cannot see that they DID.
+
+If phase 1 finds the text ring and the pull queries are enough, **stop** - the kernel gains nothing
+and that is the best outcome, not a disappointment.
+
+### Phase 2 - a typed event ring, only if phase 1 justifies it
+
+| piece | size |
+|---|---|
+| typed record: timestamp, core, kind, subject, two payload words. **NO STRINGS** | ~30 lines |
+| bounded ring + a DROPPED-COUNT, so loss is visible rather than silent (invariant 12) | ~60 lines, mirrors `log.rs` |
+| emit macro | ~10 lines |
+| emit sites | a handful, see the rule below |
+| drain, as a new `InspectKernel` query - **no new syscall** | ~30 lines |
+| gating | reuse INTROSPECT; no new capability |
+
+Roughly **150-200 lines of kernel**. That is real 4.3 growth and should be argued for, not waved
+through.
+
+### The three rules that keep phase 2 honest
+
+**1. Emit only where the path is ALREADY exceptional.** A capability denial is already an error
+return - rare, and off the success path. A success-path emit is not acceptable at any size: 20 makes
+the IPC fast path the one place where performance is a first-class constraint, and 21 rejects a
+change to it without a benchmark. B1 (IPC round-trip) and B4 (cap validation) must show no regression.
+
+**2. No strings, ever.** A string means formatting inside the kernel: unbounded work on a hot path,
+and a judgement about wording. Fixed-size records only; the DRAINER renders them. This is also what
+removes the fragile text-parsing problem in section 5.
+
+**3. The record layout is a frozen ABI.** Versioned like `SpawnRequest`, and a mismatched consumer is
+refused loudly rather than misreading a shorter record.
+
+### What it costs at the enforcement layer
+
+Both surfaces this touches are PINNED, and deliberately so:
+
+- **`InspectKernel` queries are pinned individually** (`scripts/commandments.py::check_introspect_queries`):
+  *"a new query is a new kernel responsibility"*. The drain query must be added to
+  `introspect_queries` with a written reason.
+- **`kernel/src/` unsafe** is audited per file (18.4). A ring using the existing `SpinLock` pattern
+  should need none; if it does, it belongs in a permitted layer (18.5), as `smp::names` did.
+
+Neither is a formality. The pin refusing a `tracer` service is what produced the current design.
+
+### The objection, and the answer
+
+> *"Deciding what to record is judgement, and judgement is policy (26.10) - the argument that kept
+> the trace ring out of the kernel."*
+
+The answer is that **the kernel already makes that judgement, about 60 times, in every `kprintln!`**
+it contains. It already decides that a failed spawn, an IOMMU fault and an SMP bring-up are worth
+reporting. Structured events do not ADD judgement to the kernel; they change the ENCODING of
+judgement it already exercises, from text a consumer must parse into records a consumer can read.
+
+That is a genuinely different claim from the trace ring, which asked the kernel to make a NEW
+judgement (what to retain, what to discard, for whom) that it was not making anywhere else.
+
+---
+
+## 11. Amending C.2
 
 Appendix C.2 is explicitly non-normative, so this note does not amend the constitution. But its
 "known endpoint" phrasing should be read in light of the `trace` evidence: the kernel does not need
