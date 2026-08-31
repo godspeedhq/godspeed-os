@@ -875,8 +875,23 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         req.flags & SPAWN_FLAG_REQ_CONSOLE != 0,
         &peers[..np],
     ) {
-        Ok(_)  => 0,
-        Err(_) => -1,
+        // Hand back a SEND|GRANT cap to the new endpoint, as `SpawnReturningEndpoint` does: the
+        // spawner has to be able to record `name -> cap` for the service it just started, or it
+        // cannot wire dependents to it and cannot re-wire them after a restart.
+        //
+        // Returned as SLOT + 1, so 0 unambiguously means "spawned, but this service has no recv
+        // endpoint". `SpawnReturningEndpoint` returns the bare slot and therefore cannot tell slot 0
+        // from no-endpoint; not repeating that here.
+        Ok(Some(ep_id)) => {
+            let rid    = crate::capability::cap::ResourceId::from(ep_id);
+            let ep_cap = crate::capability::mint_cap(rid, Rights::SEND | Rights::GRANT);
+            match scheduler::current_task_insert_cap(ep_cap) {
+                Ok(slot) => slot as i64 + 1,
+                Err(e)   => cap_err_to_i64(e),
+            }
+        }
+        Ok(None) => 0,
+        Err(_)   => -1,
     }
 }
 

@@ -809,17 +809,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  true,
         })),
-        "pong" => Some(("pong", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_PONG_ELF")),
-            has_recv_endpoint: true,
-            send_peers:        &[], // Path C: recorded in the kernel directory at spawn; no peers
-            send_peers_grant:  false,
-            preferred_core:    1,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
         "ping" => Some(("ping", ServiceConfig {
             elf:               include_bytes!(env!("SVC_PING_ELF")),
             has_recv_endpoint: true,

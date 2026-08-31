@@ -81,27 +81,38 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
     true
 }
 
-/// The `pong` image, carried by the supervisor rather than the kernel (step C).
+// ---------------------------------------------------------------------------------------------
+// Images the SUPERVISOR carries (step C, docs/service-ownership.md)
+//
+// One entry today. Every service that moves here leaves a `service_config` row in the kernel, and
+// the `service_configs` pin shrinks by one - the pin is the score.
+//
+// The dispatch is in `spawn_by_image`, which every spawn path consults FIRST. That matters more than
+// it looks: a service the supervisor carries must be spawnable AND RESTARTABLE through this path,
+// because the kernel no longer has a row to spawn it from. Moving an image without routing the
+// restart is what broke identity 6A/6B/10A/10B the first time.
+// ---------------------------------------------------------------------------------------------
+
+/// The `pong` image, carried here rather than by the kernel.
 static PONG_ELF: &[u8] = include_bytes!(env!("SVC_PONG_ELF"));
 
-/// Spawn `pong` on `core` from the supervisor's own copy of its image.
-///
-/// Everything the kernel used to hold in its `service_config` row is supplied here instead: the
-/// image, the mailbox, the memory ceiling and the placement. Nothing is looked up by name.
-///
-/// NOT YET WIRED IN. Moving `pong` across proved the `SpawnImage` path end to end and then failed
-/// identity 6A/6B/10A/10B, because RESTART still resolves through the kernel catalogue - see
-/// `docs/service-ownership.md`, "restart must go through the supervisor". The image path works; the
-/// restart path is the next slice, and it blocks every service, not just this one. Kept compiled so
-/// the ABI cannot rot while that lands.
-#[allow(dead_code)]
-fn spawn_pong(ctx: &ServiceContext, core: u32) -> Result<(), godspeed_sdk::Error> {
-    let mut req = godspeed_sdk::service_context::SpawnRequest::new(PONG_ELF, "pong");
+/// `(name, image, flags, memory limit)` for every service whose image the supervisor holds.
+const IMAGES: &[(&str, &[u8], u32, u64)] = &[
+    ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024),
+];
+
+/// Spawn `name` from a supervisor-held image, if we hold one. `None` means "not ours - use the
+/// kernel catalogue", which is how the two coexist while services move across one at a time.
+fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str])
+    -> Option<Result<Option<CapHandle>, godspeed_sdk::Error>>
+{
+    let &(_, image, flags, mem) = IMAGES.iter().find(|(n, ..)| *n == name)?;
+    let mut req = godspeed_sdk::service_context::SpawnRequest::new(image, name);
     req.core         = core;
-    req.flags        = godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV; // pong receives
-    req.memory_limit = 64 * 1024 * 1024;
-    let mut peers = [0u8; 8]; // pong has no send-peers; the buffer is required, not used
-    ctx.spawn_image(&mut req, &mut peers, &[])
+    req.flags        = flags;
+    req.memory_limit = mem;
+    let mut buf = [0u8; 128];
+    Some(ctx.spawn_image(&mut req, &mut buf, peers))
 }
 
 #[path = "../../probe/src/table.rs"]
@@ -214,6 +225,21 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
 /// The spawn itself is identical to `ctx.spawn` - the new syscall just also hands back a cap.
 /// Returns true if the service spawned with an endpoint cap (used by the restart loop).
 fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u32) -> bool {
+    // A supervisor-held image goes down the SpawnImage path; the kernel has no row for it.
+    if let Some(r) = spawn_by_image(ctx, name, core, &[]) {
+        return match r {
+            Ok(Some(cap)) => {
+                if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
+                map.record(name, cap.0);
+                true
+            }
+            Ok(None) => true,            // spawned; no endpoint to record
+            Err(e) => {
+                ctx.log_fmt(format_args!("supervisor: spawn '{}' from image FAILED ({:?})", name, e));
+                false
+            }
+        };
+    }
     match ctx.spawn_returning_endpoint(name, core) {
         Some(cap) => {
             // On a restart, free the dead instance's cap before recording the new one, so a
@@ -446,10 +472,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // shell (`spawn pong` then `spawn ping`) when you want the cross-core demo.
     #[cfg(not(any(feature = "bare-metal", feature = "idle-only", feature = "bp2-only", feature = "perf-iso")))]
     {
-        ctx.log("supervisor: spawning pong...");
-        if ctx.spawn_on("pong", 1).is_err() {
+        // STEP C: pong's image is carried HERE, not by the kernel. `spawn_mapped` dispatches to the
+        // SpawnImage path via `spawn_by_image`, and so does every restart - which is the half that
+        // matters, since the kernel has no `pong` row to fall back on.
+        ctx.log("supervisor: spawning pong (image supplied by supervisor)...");
+        if !spawn_mapped(&ctx, &mut name_map, "pong", 1) {
             ctx.log("supervisor: WARN: failed to spawn pong on core 1, trying core 0");
-            let _ = ctx.spawn_on("pong", 0);
+            let _ = spawn_mapped(&ctx, &mut name_map, "pong", 0);
         }
         ctx.log("supervisor: spawning ping...");
         if ctx.spawn_on("ping", 0).is_err() {

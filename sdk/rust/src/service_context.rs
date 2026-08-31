@@ -2827,8 +2827,10 @@ impl ServiceContext {
     ///
     /// `peers` are NUL-joined into a caller-owned buffer; each name still resolves through the
     /// kernel name directory, so this grants nothing a contract's `send_peers` would not.
+    /// Returns a `SEND|GRANT` cap to the new service's recv endpoint, or `None` if it has none -
+    /// the spawner needs it to record `name -> cap` and re-wire dependents after a restart.
     pub fn spawn_image(&self, req: &mut SpawnRequest, peers_buf: &mut [u8], peers: &[&str])
-        -> Result<(), crate::Error>
+        -> Result<Option<CapHandle>, crate::Error>
     {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return Err(crate::Error::InvalidArgument); }
@@ -2855,7 +2857,10 @@ impl ServiceContext {
             raw_syscall(52, req as *const SpawnRequest as u64,
                         core::mem::size_of::<SpawnRequest>() as u64, slot as u64)
         };
-        if ret == 0 { Ok(()) } else { Err(crate::Error::InvalidArgument) }
+        // slot + 1, so 0 means "spawned, no recv endpoint" without colliding with slot 0.
+        if ret < 0 { Err(crate::Error::InvalidArgument) }
+        else if ret == 0 { Ok(None) }
+        else { Ok(Some(CapHandle(ret as u32 - 1))) }
     }
 
     /// Spawn a probe under a caller-supplied name and parameters (`Spawn`, syscall 7 - no new
