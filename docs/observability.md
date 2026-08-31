@@ -329,7 +329,62 @@ judgement (what to retain, what to discard, for whom) that it was not making any
 
 ---
 
-## 11. Amending C.2
+## 11. What would the new kernel responsibility be CALLED? (MISCIS)
+
+The right answer is that **it must not need a name - and if it does, that is the signal to stop.**
+
+4.3 enumerates six kernel responsibilities: **M**emory, **I**PC, **S**cheduling, **C**apability,
+**I**nterrupt, **S**MP. Every event proposed here is an event OF one of them:
+
+| event | responsibility |
+|---|---|
+| capability denial | **C**apability |
+| queue overflow, endpoint death | **I**PC |
+| task killed, restarted, preempted | **S**cheduling |
+| alloc denied | **M**emory |
+
+None is a new THING THE KERNEL DOES. The ring changes how the kernel REPORTS what it already does.
+`MISCISO` would be ugly, and the ugliness is diagnostic: **needing a seventh letter means the wrong
+thing is being built.** That is a usable test for any future proposal, not just this one.
+
+### But the kernel already HAS a responsibility outside MISCIS
+
+Worth stating, because it was a surprise on checking: 4.3 enumerates six, and 11.4 separately
+mandates a 16 KiB log ring, unconditional serial output, and the panic/boot framebuffer blit. None of
+that is memory, IPC, scheduling, capability, interrupt or SMP. It is **REPORTING** - and the two
+sections do not reference each other, so the kernel's reporting floor sits outside the enumeration
+that is supposed to bound kernel scope.
+
+11.4 justifies it, and the justification is strict - **IMPOSSIBILITY**:
+
+> a panic halts every core, INCLUDING the `console` service, so it cannot ask a service to report it.
+> Boot output has the same shape: it precedes every service, including the one that would render it.
+
+That is the bar the console blit cleared and the operator control channel failed.
+
+### So events are not a new responsibility - but the bar is higher than "useful"
+
+Events would be the existing 11.4 reporting floor **encoded as records instead of text**. No new
+letter, because reporting was never a letter; it is a floor justified separately and narrowly.
+
+And it must clear 11.4's bar, not a lower one. Being honest about the gap:
+
+> A capability denial is **"only the kernel KNOWS"**, not **"only the kernel CAN report"**. The denied
+> service could say so itself - it simply will not, if it is the hostile one. That is weaker than a
+> panic that halts every core.
+
+So phase 2's justification is **weaker than the three-part test in section 6 makes it sound**, and
+phase 1 has to do real work: demonstrate the blind spot MATTERS IN PRACTICE, not merely that it
+exists. "An operator could not diagnose X without this" is the standard; "this would be nice to have"
+is not.
+
+If phase 1 cannot produce that evidence, the correct outcome is that the kernel gains nothing and
+`events` reports what it can see. Recorded here so the bar is set BEFORE anyone is invested in
+clearing it.
+
+---
+
+## 12. Amending C.2
 
 Appendix C.2 is explicitly non-normative, so this note does not amend the constitution. But its
 "known endpoint" phrasing should be read in light of the `trace` evidence: the kernel does not need
