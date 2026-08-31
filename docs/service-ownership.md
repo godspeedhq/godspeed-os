@@ -843,13 +843,17 @@ four machines** in the step A validation without a single kernel panic.
 |---|---|---|---|---|
 | before | 221 | kernel change | kernel change | no |
 | **A (done)** | **29** | kernel change | kernel change | no |
-| **C (done)** | **2** | **no kernel change** | kernel change | no |
+| **C (done)** | **1** | **no kernel change** | kernel change | no |
 | D | 1 | no kernel change | **no kernel change** | no |
 | 2 | 1 | no kernel change | no kernel change | **yes** |
 
-**Step C is built.** The pin is **2**: `supervisor` (the target - the kernel must bootstrap it
-because nothing is beneath it) and `probe`. Every other service's image, memory limit, placement,
-peers, privileges and device class lives in the supervisor's `IMAGES` table.
+**Step C is built, and the pin is at its target: 1.** `supervisor` alone, because the kernel must
+bootstrap it - nothing is beneath it. Every other service's image, memory limit, placement, peers,
+privileges and device class lives in the supervisor's `IMAGES` table.
+
+The kernel embeds ONE service image now, down from 30. A bare-metal image also embeds no test probe
+at all, which is checkable rather than asserted: the probe-only strings are present in `os.img` and
+absent from `os-usb.img`.
 
 ### 9.1 What a driver names, and what it may not
 
@@ -907,29 +911,25 @@ does the service still call the syscall?
   runtime-compromised supervisor can introduce new code, and nothing before step 2 prevents it.
   (The IRQ-routing half of this concern is closed - see 9.1 - but the code-introduction half stands
   and is the reason step 2 exists.)
-- **OPEN, and a REGRESSION THIS WORK CAUSED: a real service's name can be squatted before that
-  service first starts.** `spawn_probe` lets a SPAWN holder choose the name of the task it starts,
-  and refused "a real service's name" by asking the kernel's service catalogue. Moving that catalogue
-  to the supervisor emptied it, so the refusal set silently shrank to `{supervisor, probe}`. The
-  attack it guarded against is concrete: the kernel name directory is the recovery anchor clients
-  reacquire through (§14.3), so a probe registered as `fs` collects `fs`'s clients.
+- **CLOSED: the name-squatting regression this work caused.** `spawn_probe` let a SPAWN holder choose
+  the NAME of the task it started while the KERNEL supplied the probe image, and refused "a real
+  service's name" by asking the kernel's service catalogue - which step C emptied, silently shrinking
+  the refusal set to `{supervisor, probe}`. It mattered because the name directory is the recovery
+  anchor clients reacquire through (§14.3): a probe registered as `fs` collects `fs`'s clients while
+  the real `fs` is dead, which is exactly when a liveness check passes.
 
-  **Partly closed.** `ipc::names::reserve` now holds a name down permanently the moment the
-  supervisor spawns it, surviving the service's death - which is when squatting it would work, since
-  `unregister_endpoint` has already dropped the mapping and a liveness check would pass. Pinned by
-  the A9b arm of §22 Adversarial A9.
+  It was first patched with a permanent name RESERVATION in `ipc::names`, and that patch has since
+  been REMOVED - not reverted in retreat, but superseded. Moving the probe image closed the hole
+  structurally: a name no longer carries an image, it SELECTS a table row, so a caller cannot bind an
+  arbitrary name to the probe binary at all and an unknown name is refused outright. The reservation
+  had no callers left, and a dead guard that still looks live is worse than none. Pinned by A9b.
 
-  **The residual is the window BEFORE a service first starts**, and it is demonstrated, not
-  theoretical: in the adversarial build the probes run before `fs` and `shell`, and a probe takes
-  either name successfully. It is not confined to test builds - the `shell` holds SPAWN and starts
-  before `net-stack` and `nic-driver` on a normal boot.
-
-  Closing it needs the supervisor to reserve its whole managed set BEFORE it spawns anything, and it
-  currently has no way to say so: reserving is a side effect of spawning, not something the name
-  authority can declare. Every option costs something - a `ReserveName` syscall is new kernel surface
-  (though on a directory the kernel already owns); a separate namespace for caller-chosen names makes
-  squatting structurally impossible but touches every peer-resolution path. Recorded here per §26.7
-  rather than left to be discovered by whoever trusts the guard.
+  What REMAINS is the step-C widening proper, and it is wider than the probe path was: `SpawnImage`
+  takes a caller-supplied image, so a SPAWN holder can start ARBITRARY BYTES under a real service's
+  name in the window while that service is dead. It is bounded only by `AlreadyRunning`. Step 2
+  (signed packages) is the answer; a cheaper interim would be to gate `SpawnImage` behind a
+  capability only the supervisor holds, since nothing else legitimately calls it - shell, chaos,
+  control and the probes all ask the supervisor instead.
 
 - **`probe` is the last non-supervisor row.** It needs two things, both of which fit the existing
   model: a `SPAWN_FLAG_PEERS_GRANT` bit (`probe-5a-send` gets grantable peer caps, which the
@@ -943,6 +943,12 @@ does the service still call the syscall?
 - **Step 2's key management** has no design yet, and it is process as much as code.
 - **A9-4, the BSP idle wedge**, is unrelated to this work and remains open and deferred. It did not
   recur on any of the four hardware runs.
+
+- **DONE: `probe` moved (pin 1).** The two authorities that kept it in the kernel both found homes in
+  the existing model - the IRQ route as a device CLASS (`hwclass::TEST_IRQ`, the kernel still states
+  the vector) and the grantable peer caps as a spawn FLAG - so no constitutional amendment was
+  needed. Its 193 spawns route through the supervisor, which holds the image; a probe respawning its
+  own victim ASKS, one-way, and confirms by watching the victim register its name.
 
 ---
 
