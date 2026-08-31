@@ -631,7 +631,7 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
     Privileges {
         // supervisor is the spawner (init removed, Phase 5); the shell brokers spawns; chaos spawns
         // mem-pressure tasks for max-carnage's spawn-burst dimension; probes spawn victims.
-        spawn: is_probe || matches!(name, "supervisor" | "shell" | "control"),
+        spawn: is_probe || matches!(name, "supervisor" | "shell"),
         // Both USB host drivers push decoded keystrokes: xhci (front ports), ehci (USB 2.0 back ports).
         // `dwc2` is the arm32 USB keyboard driver, so it needs this for the same reason `xhci` and
         // `ehci` do. Its absence was the whole of "the keyboard does not work": the transfers were
@@ -646,17 +646,17 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         console_push: matches!(name, "xhci" | "ehci" | "dwc2"),
         // shell + observe use TaskStat/InspectKernel; supervisor's reconcile loop scans real liveness;
         // chaos does victim selection; the prop-/stress- probes query victim generations.
-        introspect: matches!(name, "shell" | "supervisor" | "control")
+        introspect: matches!(name, "shell" | "supervisor")
             || name.starts_with("observe") || name.starts_with("prop-") || name.starts_with("stress-"),
         // shell (interactive broker), supervisor (restart authority), chaos (the point of max-carnage),
         // and every probe (they kill victims to exercise kill/revocation).
-        service_control: is_probe || matches!(name, "shell" | "supervisor" | "control"),
+        service_control: is_probe || matches!(name, "shell" | "supervisor"),
         // SEC-2: REBOOT lives ONLY with the shell (its `reboot` command); the USB drivers no longer
         // hold it. A keyboard driver can synthesize any keystroke (the console's inherent trust, §6.4),
         // but it must not ALSO be able to hard-reset the machine directly from any context.
         // FIRE_IRQ: only the control service. It exists so the COM2 command interpreter could leave
         // the kernel; naming the authority is what made that possible (C1-6).
-        fire_irq: matches!(name, "control"),
+        fire_irq: false, // `control` carries FIRE_IRQ in its spawn request now (step C)
         reboot: matches!(name, "shell"),
         // Operator/test instruments that legitimately reach arbitrary services by name: shell (chaos
         // flooding, pipe sinks), supervisor (reconcile-by-name), probes. `adv-a13` is the §22 Test A13
@@ -770,30 +770,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             preferred_core:    if cfg!(target_arch = "arm") { 3 } else { 0 },
             probe_mode:        0,
             memory_limit:      8 * 1024 * 1024, // matches console.toml
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // time (services/time): the wall clock, moved out of the kernel (finding C1-6). §4.3 names six
-        // kernel responsibilities and timekeeping is not among them. The kernel keeps only the register
-        // read - x86's CMOS RTC answers on port I/O, which no service can reach - and this service owns
-        // what the read MEANS: conversion, the plausibility window, provenance and the floor.
-        //
-        // It needs no hardware grant: it reads the RTC through the introspection query that already
-        // exists and serves the result over IPC.
-        // control (services/control): the COM2 operator channel, moved out of the kernel (C1-6). The
-        // kernel keeps the byte read (query 21, transport); this owns the interpretation.
-        "control" => Some(("control", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_CONTROL_ELF")),
-            has_recv_endpoint: true,
-            // RESTART is forwarded to the supervisor, which holds restart authority (14.4) and - once
-            // images move - is the only thing that can respawn a service at all. This is not new
-            // authority for `control`: it already holds SERVICE_CONTROL and SPAWN, so it could kill
-            // and start services directly. It is the same authority routed correctly.
-            send_peers:        &["supervisor"],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,
-            memory_limit:      8 * 1024 * 1024,   // matches control.toml
             hw_irqs:           &[],
             has_console_read:  false,
         })),

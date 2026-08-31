@@ -154,6 +154,7 @@ static PING_ELF: &[u8] = include_bytes!(env!("SVC_PING_ELF"));
 static ASKER_ELF: &[u8] = include_bytes!(env!("SVC_ASKER_ELF"));
 static RESOURCE_SERVER_ELF: &[u8] = include_bytes!(env!("SVC_RESOURCE_SERVER_ELF"));
 static CHAOS_ELF: &[u8] = include_bytes!(env!("SVC_CHAOS_ELF"));
+static CONTROL_ELF: &[u8] = include_bytes!(env!("SVC_CONTROL_ELF"));
 static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
 static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
@@ -189,6 +190,13 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32)] = &[
      | godspeed_sdk::service_context::privbits::INTROSPECT
      | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
      | godspeed_sdk::service_context::privbits::ACQUIRE_ANY),
+    // The COM2 operator channel. FIRE_IRQ is the one privilege only this service holds.
+    ("control", CONTROL_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     8 * 1024 * 1024, u32::MAX, &["supervisor"],
+     godspeed_sdk::service_context::privbits::SPAWN
+     | godspeed_sdk::service_context::privbits::INTROSPECT
+     | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
+     | godspeed_sdk::service_context::privbits::FIRE_IRQ),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0),
