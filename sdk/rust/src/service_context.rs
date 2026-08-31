@@ -281,6 +281,10 @@ pub mod privbits {
     pub const REBOOT:          u32 = 1 << 5;
     pub const ACQUIRE_ANY:     u32 = 1 << 6;
     pub const RESOURCE_MINT:   u32 = 1 << 7;
+    /// ARM-only in practice; the bit is arch-neutral.
+    pub const GPIO:            u32 = 1 << 8;
+    /// SET_CLOCK with READ (raise the clock FLOOR), not WRITE (step the clock).
+    pub const SET_CLOCK_FLOOR: u32 = 1 << 9;
 }
 
 impl SpawnRequest {

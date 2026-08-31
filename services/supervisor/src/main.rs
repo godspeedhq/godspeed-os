@@ -174,6 +174,7 @@ static CONTROL_ELF: &[u8] = include_bytes!(env!("SVC_CONTROL_ELF"));
 static OBSERVE_ELF: &[u8] = include_bytes!(env!("SVC_OBSERVE_ELF"));
 static GREET_ELF: &[u8] = include_bytes!(env!("SVC_GREET_ELF"));
 static COUNTER_ELF: &[u8] = include_bytes!(env!("SVC_COUNTER_ELF"));
+static SHELL_ELF: &[u8] = include_bytes!(env!("SVC_SHELL_ELF"));
 static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
 static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
@@ -232,6 +233,20 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32)] = &[
     // it was handed, not by resolving a name.
     ("greet", GREET_ELF, 0, 64 * 1024 * 1024, u32::MAX, &["pong"], 0, 0),
     ("counter", COUNTER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["fs"], 0, 0),
+    // The user's interface. GPIO and SET_CLOCK_FLOOR are ARM-only in effect but the bits are
+    // arch-neutral: the kernel refuses any the supervisor cannot delegate, and on x86 the underlying
+    // grant is simply never used. SET_CLOCK_FLOOR is the NARROW right (raise the clock floor), not
+    // SET_CLOCK (step the clock) - the split exists precisely to withhold the latter.
+    ("shell", SHELL_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV
+                       | godspeed_sdk::service_context::SPAWN_FLAG_REQ_CONSOLE,
+     8 * 1024 * 1024, if cfg!(target_arch = "arm") { 1 } else { 0 }, &["fs", "block-driver", "time", "console", "logger", "supervisor"],
+     godspeed_sdk::service_context::privbits::SPAWN
+     | godspeed_sdk::service_context::privbits::INTROSPECT
+     | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
+     | godspeed_sdk::service_context::privbits::ACQUIRE_ANY
+     | godspeed_sdk::service_context::privbits::REBOOT
+     | godspeed_sdk::service_context::privbits::GPIO
+     | godspeed_sdk::service_context::privbits::SET_CLOCK_FLOOR, 0),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0),

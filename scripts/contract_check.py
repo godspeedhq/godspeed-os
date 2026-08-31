@@ -146,6 +146,16 @@ def parse_kernel(name: str, source: str) -> dict | None:
 # not quietly escape the check. The table deliberately carries the same fields the kernel row did.
 SUPERVISOR_MAIN = SERVICES / "supervisor" / "src" / "main.rs"
 
+def _core_of(expr: str):
+    """A `preferred_core` expression as an int, or None for `u32::MAX` (no preference)."""
+    if "u32::MAX" in expr:
+        return None
+    m = re.search(r'if cfg!\([^)]*\)\s*\{\s*\d+\s*\}\s*else\s*\{\s*(\d+)\s*\}', expr)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(\d+)', expr)
+    return int(m.group(1)) if m else None
+
 def parse_supervisor_images(name: str):
     """The supervisor's IMAGES row for `name`, in the same shape `parse_kernel` returns, or None."""
     try:
@@ -164,7 +174,11 @@ def parse_supervisor_images(name: str):
     lm  = re.search(r'(\d+)\s*\*\s*1024\s*\*\s*1024', mem_expr)
     return {
         "limit": int(lm.group(1)) * 1024 * 1024 if lm else None,
-        "core":  None if "u32::MAX" in core_expr else int(core_expr),
+        # Same arch-conditional handling as `parse_kernel`: `if cfg!(target_arch = "arm") { 1 } else
+        # { 0 }` takes the ELSE (x86) branch, because this check runs on the host and the .toml states
+        # the x86-intended core. Without it the shell's row raised a ValueError rather than reporting a
+        # mismatch - a checker that CRASHES is worse than one that fails, since it reports nothing at all.
+        "core":  _core_of(core_expr),
         "send":  sorted(re.findall(r'"([^"]+)"', peers_raw)),
     }
 

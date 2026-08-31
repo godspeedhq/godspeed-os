@@ -556,10 +556,21 @@ pub mod privbits {
     pub const REBOOT:          u32 = 1 << 5;
     pub const ACQUIRE_ANY:     u32 = 1 << 6;
     pub const RESOURCE_MINT:   u32 = 1 << 7;
+    /// ARM-only in practice (`cfg!(target_arch = "arm")`), but the BIT is arch-neutral: the kernel
+    /// still refuses it unless the caller may delegate it, and the supervisor's table simply does not
+    /// set it elsewhere.
+    pub const GPIO:            u32 = 1 << 8;
+    /// SET_CLOCK with READ, not WRITE. The narrow right: raise the persisted clock FLOOR, which only
+    /// constrains which clock values are acceptable - where WRITE would let the holder step every
+    /// task's view of the time of day. Granting plain SET_CLOCK instead would hand over exactly the
+    /// authority that split was built to withhold, and would fail anyway (a WRITE cap does not satisfy
+    /// a READ check).
+    pub const SET_CLOCK_FLOOR: u32 = 1 << 9;
     /// Every bit this kernel understands. Anything outside it is refused, so a newer spawner cannot
     /// quietly ask for a privilege this kernel would ignore.
     pub const KNOWN: u32 = SPAWN | CONSOLE_PUSH | INTROSPECT | SERVICE_CONTROL
-                         | FIRE_IRQ | REBOOT | ACQUIRE_ANY | RESOURCE_MINT;
+                         | FIRE_IRQ | REBOOT | ACQUIRE_ANY | RESOURCE_MINT
+                         | GPIO | SET_CLOCK_FLOOR;
 }
 
 /// Which requested privilege the CALLING task does not itself hold, if any.
@@ -569,7 +580,7 @@ pub mod privbits {
 pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
     use crate::capability::*;
     if requested & !privbits::KNOWN != 0 { return Some("an unknown privilege bit"); }
-    let checks: [(u32, ResourceId, &'static str); 8] = [
+    let checks: [(u32, ResourceId, &'static str); 10] = [
         (privbits::SPAWN,           SPAWN_RESOURCE,           "SPAWN"),
         (privbits::CONSOLE_PUSH,    CONSOLE_PUSH_RESOURCE,    "CONSOLE_PUSH"),
         (privbits::INTROSPECT,      INTROSPECT_RESOURCE,      "INTROSPECT"),
@@ -578,6 +589,8 @@ pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
         (privbits::REBOOT,          REBOOT_RESOURCE,          "REBOOT"),
         (privbits::ACQUIRE_ANY,     ACQUIRE_ANY_RESOURCE,     "ACQUIRE_ANY"),
         (privbits::RESOURCE_MINT,   RESOURCE_MINT_RESOURCE,   "RESOURCE_MINT"),
+        (privbits::GPIO,            GPIO_DEVICE_RESOURCE,     "GPIO"),
+        (privbits::SET_CLOCK_FLOOR, SET_CLOCK_RESOURCE,       "SET_CLOCK_FLOOR"),
     ];
     for (bit, res, label) in checks {
         // GRANT, not WRITE. Delegating an authority and EXERCISING it are different rights (7.4), and
@@ -610,6 +623,8 @@ const SUPERVISOR_DELEGATABLE: &[(u32, crate::capability::cap::ResourceId)] = &[
     (privbits::CONSOLE_PUSH,    CONSOLE_PUSH_RESOURCE),
     (privbits::FIRE_IRQ,        FIRE_IRQ_RESOURCE),
     (privbits::REBOOT,          REBOOT_RESOURCE),
+    (privbits::GPIO,            GPIO_DEVICE_RESOURCE),
+    (privbits::SET_CLOCK_FLOOR, SET_CLOCK_RESOURCE),
 ];
 
 struct Privileges {
@@ -631,7 +646,7 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
     Privileges {
         // supervisor is the spawner (init removed, Phase 5); the shell brokers spawns; chaos spawns
         // mem-pressure tasks for max-carnage's spawn-burst dimension; probes spawn victims.
-        spawn: is_probe || matches!(name, "supervisor" | "shell"),
+        spawn: is_probe || matches!(name, "supervisor"),
         // Both USB host drivers push decoded keystrokes: xhci (front ports), ehci (USB 2.0 back ports).
         // `dwc2` is the arm32 USB keyboard driver, so it needs this for the same reason `xhci` and
         // `ehci` do. Its absence was the whole of "the keyboard does not work": the transfers were
@@ -660,23 +675,23 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // WITHOUT INTROSPECT is denied, so widening it to every probe would delete that test's
         // subject. The real fix is for `spawn_probe` to carry a privilege word like `SpawnImage`
         // does, checked against what the CALLER may delegate. See docs/service-ownership.md.
-        introspect: matches!(name, "shell" | "supervisor")
+        introspect: matches!(name, "supervisor")
             || name.starts_with("prop-") || name.starts_with("stress-"),
         // shell (interactive broker), supervisor (restart authority), chaos (the point of max-carnage),
         // and every probe (they kill victims to exercise kill/revocation).
-        service_control: is_probe || matches!(name, "shell" | "supervisor"),
+        service_control: is_probe || matches!(name, "supervisor"),
         // SEC-2: REBOOT lives ONLY with the shell (its `reboot` command); the USB drivers no longer
         // hold it. A keyboard driver can synthesize any keystroke (the console's inherent trust, §6.4),
         // but it must not ALSO be able to hard-reset the machine directly from any context.
         // FIRE_IRQ: only the control service. It exists so the COM2 command interpreter could leave
         // the kernel; naming the authority is what made that possible (C1-6).
         fire_irq: false, // `control` carries FIRE_IRQ in its spawn request now (step C)
-        reboot: matches!(name, "shell"),
+        reboot: false, // the shell carries REBOOT in its spawn request now (step C)
         // Operator/test instruments that legitimately reach arbitrary services by name: shell (chaos
         // flooding, pipe sinks), supervisor (reconcile-by-name), probes. `adv-a13` is the §22 Test A13
         // NEGATIVE pin - deliberately excluded so it holds no ACQUIRE_ANY (proves AcquireSendCap denies
         // a non-holder). Ordinary services get none; their AcquireSendCap is limited to declared peers.
-        acquire_any: (is_probe && name != "adv-a13") || matches!(name, "shell" | "supervisor"),
+        acquire_any: (is_probe && name != "adv-a13") || matches!(name, "supervisor"),
         // NET_DEVICE, GPIO_DEVICE, USB_DISK and SET_CLOCK are SANCTIONED KERNEL-ONLY BY-NAME GRANTS (the U15 / userspace-audit
         // A5-U1 doctrine): they are deliberately NOT contract capabilities - the kernel is their single
         // source of truth, and `contract_check.py` does not reconcile them. Both are arch-gated to ARM
@@ -709,7 +724,7 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         usb_disk: cfg!(any(target_arch = "arm", target_arch = "aarch64"))
             && matches!(name, "block-driver"),
         //   the shell's `gpio` command drives the SoC pins (the gated `Gpio` syscall, 45).
-        gpio: cfg!(target_arch = "arm") && matches!(name, "shell"),
+        gpio: false, // delegated in the spawn request (step C)
         //   SET_CLOCK, in two strengths (rights narrow, §7.4). WRITE = set the wall clock itself, held only
         //   by net-stack, which runs the SNTP exchange (the RTC-less ARM port has no other time source).
         //   READ = raise the persisted clock FLOOR only, held by the shell, which reads the last-known time
@@ -728,8 +743,7 @@ fn service_privileges(name: &str, is_probe: bool) -> Privileges {
         // step every task's view of the time of day. The narrower right already existed here; granting
         // the shell plain `set_clock` instead would have handed it exactly the authority this split was
         // built to withhold, and would have failed anyway - a WRITE cap does not satisfy a READ check.
-        set_clock_floor: cfg!(any(target_arch = "arm", target_arch = "aarch64"))
-            && matches!(name, "shell"),
+        set_clock_floor: false, // delegated in the spawn request (step C)
     }
 }
 
@@ -1153,47 +1167,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             memory_limit:      64 * 1024 * 1024, // per-spawn override: ProbeParams.mem_mib
             hw_irqs:           &[],        // AUTHORITY: `probe_authority`, keyed by name
             has_console_read:  false,
-        })),
-        "shell" => Some(("shell", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_SHELL_ELF")),
-            // Endpoint + an `fs` send-peer so the `drives`/file commands can request_with_reply
-            // to `fs` (the reply-cap pattern needs the shell's own endpoint). The shell holds
-            // only a narrow SEND to fs - fs enforces all disk authority. `fs` must be spawned
-            // before the shell so this cap resolves (supervisor order). The shell resolves a pipe
-            // sink's endpoint at runtime via the kernel directory (`acquire_send_grant_cap`) -
-            // no contracted peer.
-            has_recv_endpoint: true,
-            // `block-driver` as well as `fs`, so `drives` can ask the DEVICE about the device.
-            //
-            // "Is there a disk and how big" is block-driver's fact; "is it mounted, what label, how
-            // free" is fs's. Routing both through `fs` made it answer a hardware question from its
-            // own mount state - which is how `drives` reported 15 GB for an unplugged stick. Each
-            // fact now comes from its owner (Commandment III).
-            //
-            // It also gives a useful answer when `fs` is dead: "disk present, filesystem
-            // unavailable" instead of nothing at all (§26.7).
-            // `time` (clock slice 2): the wall clock is a service, so `date` and the boot floor ask it.
-            // `console`: terminal geometry, for the pager and `edit`. It used to come from the KERNEL
-            // (`InspectKernel` query 9, now deleted) - the shell was asking the wrong party for a fact
-            // the terminal owns (docs/console-service.md 9.7).
-            send_peers:        &["fs", "block-driver", "time", "console", "logger", "supervisor"],
-            send_peers_grant:  false,
-            // ARM: OFF CORE 0, to keep the serial writer away from the microframe-timed USB driver.
-            //
-            // Measured: a 125 us sleep averages 9398 us during boot and 608 us on a quiet system - a
-            // 15x difference made entirely of console traffic. A serial write is a syscall, 115200
-            // baud is ~87 us per byte, and this port deliberately refuses to preempt a user task
-            // mid-syscall (preempting SVC corrupts the banked SPSR/sp). So one ~100-character log
-            // line holds its core, un-preemptible, for about 9 ms.
-            //
-            // That blocks only the core it runs on - and this service was sharing core 0 with `dwc2`,
-            // whose split transactions must hit 125 us windows. Moving the writer is the cheap half
-            // of the fix; it needs no console rework and it uses the cores this board has.
-            preferred_core:    if cfg!(target_arch = "arm") { 1 } else { 0 },
-            probe_mode:        0,
-            memory_limit:      8 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  true,
         })),
         _ => None,
     }
@@ -1633,13 +1606,15 @@ fn spawn_service_with_image(
             fire_irq:        bits & privbits::FIRE_IRQ        != 0,
             reboot:          bits & privbits::REBOOT          != 0,
             acquire_any:     bits & privbits::ACQUIRE_ANY     != 0,
-            // Not yet expressible in the wire form; the by-name table still answers for these on the
-            // catalogue path, and a moved service simply does not get them (refused, not silent).
+            gpio:            bits & privbits::GPIO            != 0,
+            set_clock_floor: bits & privbits::SET_CLOCK_FLOOR != 0,
+            // Still not expressible in the wire form: these belong to services that also need the
+            // HARDWARE path (net-stack, the ARM block-driver), so they will arrive with it rather
+            // than ahead of it. A moved service does not get them silently - the request carries no
+            // bit for them, so asking is impossible rather than ignored.
             net_device:      false,
             usb_disk:        false,
-            gpio:            false,
             set_clock:       false,
-            set_clock_floor: false,
         },
         None => service_privileges(name, is_probe),
     };
