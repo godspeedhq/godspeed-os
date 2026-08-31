@@ -80,9 +80,13 @@ objections were decisive there:
   judgement, and judgement is policy (26.10). That is the argument that kept the trace ring out.
 - **A slow or dead consumer cannot be waited on.** The kernel must never block on userspace, so it
   must drop - which is the same policy decision again, now on the kernel's critical path.
-- **The kernel would hold an endpoint to a RESTARTABLE service.** Every client of a restartable peer
-  owes it a reacquire (14.3). In userspace that is a retry; in the kernel there is nobody above to
-  recover it, and a stale endpoint in ring 0 is a much worse thing than a stale cap in a service.
+- ~~**The kernel would hold an endpoint to a RESTARTABLE service.**~~ **CORRECTION: this objection is
+  not decisive, and was wrong to present as such.** The kernel ALREADY does this - it sends death
+  notifications to the supervisor's endpoint, and the staleness is solved: the respawned supervisor
+  re-registers in `ipc::names` and notifications re-point to it (6.2). The pattern exists and works.
+  What distinguishes that case is NECESSITY - recovery has no alternative, since the kernel is the
+  last-resort anchor - whereas observability has one. A relationship the kernel is forced into is not
+  a licence for relationships it merely finds convenient.
 - **It grows the kernel for a diagnostic**, which is the shape 4.4 and 26.2 both reject.
 
 ---
@@ -329,9 +333,44 @@ judgement (what to retain, what to discard, for whom) that it was not making any
 
 ---
 
+## 10a. Endpoint or ring? A ring is a PLACE; an endpoint is a RELATIONSHIP
+
+Worth settling explicitly, because "the kernel exposes a reporting endpoint that `events` subscribes
+to" is the natural first design - and the kernel already does exactly that for death notifications,
+so it is not obviously wrong.
+
+| | **ring** (kernel writes, service drains) | **endpoint** (kernel sends, service subscribes) |
+|---|---|---|
+| kernel knows its consumer | no | **yes** - registration, identity |
+| consumer dies | nothing happens | kernel must handle it and re-point |
+| queue full | overwrites; there is no choice to make | `try_send` fails, so: drop |
+| cost at the EMIT SITE | append ~32 bytes | routing lookup, target queue, locks |
+
+**The last row decides it.** A capability denial lives on the cap-validation path - 20's
+"constant-time cap + generation check", which 21 forbids changing without a benchmark. Appending a
+fixed record there is affordable; performing an IPC SEND there is not.
+
+The others matter too, and in the same direction: with a ring the kernel does not know who reads,
+when, or whether anyone does. That ignorance IS the property being bought. "Not a kernel
+responsibility" is strongest when the kernel cannot even name its consumer.
+
+### And "subscribe" still works, from the service's side
+
+Nothing about the user-facing model changes. `events` drains on a timer, keeps a bounded RAM buffer,
+serves it, and loses it on restart - exactly the stateless shape section 9 requires. The difference is
+invisible from userspace and total from the kernel's: **pull, so the kernel never learns that `events`
+exists.**
+
+---
+
 ## 11. What would the new kernel responsibility be CALLED? (MISCIS)
 
 The right answer is that **it must not need a name - and if it does, that is the signal to stop.**
+
+And reporting should not BECOME a responsibility. It cannot be removed either - invariant 12 requires
+loud failure and 11.4 mandates the floor precisely because a panic cannot ask a service - so the
+achievable goal is to keep it **mechanism-only**: the kernel writes facts to a place and forms no
+opinion about who reads them, when, or what they mean.
 
 4.3 enumerates six kernel responsibilities: **M**emory, **I**PC, **S**cheduling, **C**apability,
 **I**nterrupt, **S**MP. Every event proposed here is an event OF one of them:
