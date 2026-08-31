@@ -185,6 +185,7 @@ static MEM_PRESSURE_ELF: &[u8] = include_bytes!(env!("SVC_MEM_PRESSURE_ELF"));
 static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
 static REPLY_SERVER_ELF: &[u8] = include_bytes!(env!("SVC_REPLY_SERVER_ELF"));
 static HOLDER_ELF: &[u8] = include_bytes!(env!("SVC_HOLDER_ELF"));
+static CONSOLE_ELF: &[u8] = include_bytes!(env!("SVC_CONSOLE_ELF"));
 
 /// `(name, image, flags, memory limit, preferred core, send peers, privileges, mode, hw class)` for
 /// every service whose image the supervisor holds.
@@ -263,6 +264,17 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // and no IRQ line, which is why it is the right one to prove the path on.
     ("block-driver", BLOCK_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, if cfg!(target_arch = "arm") { 2 } else { 1 }, &["xhci"], 0, 0,
      godspeed_sdk::service_context::hwclass::AHCI),
+    // The terminal (docs/console-service.md 9). Its "hardware" is the DISPLAY: the kernel maps the
+    // framebuffer into it and describes the PIXEL geometry only - character geometry belongs to the
+    // terminal, which is this service. Same class mechanism as a driver's BAR, and for the same
+    // reason: the supervisor may not name a physical address.
+    //
+    // Core 3 on ARM (not 0) is deliberate and hardware-earned: a full-screen repaint is millions of
+    // non-cacheable pixel stores in one un-preemptible stretch, and sharing a core with dwc2's
+    // 125 us split-transaction windows produced NYET storms and a six-second keyboard stall.
+    ("console", CONSOLE_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     8 * 1024 * 1024, if cfg!(target_arch = "arm") { 3 } else { 0 }, &[], 0, 0,
+     godspeed_sdk::service_context::hwclass::FRAMEBUFFER),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0, 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
@@ -686,7 +698,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     if let Some(cap) = ctx.acquire_send_grant_cap("console") {
         record_name_quiet(&ctx, &mut name_map, "console", cap);
         ctx.log("supervisor: adopted running console");
-    } else if ctx.spawn("console").is_err() {
+    } else if !spawn_mapped(&ctx, &mut name_map, "console", 0xFFFF) {
         ctx.log("supervisor: console spawn failed - display stays on the kernel boot floor");
     }
 

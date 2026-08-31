@@ -542,11 +542,11 @@ fn hw_class_of(class: u32) -> HwClass {
 fn service_hw(name: &str) -> (HwClass, bool) {
     match name {
         "dwc2"                                 => (HwClass::Dwc2, false),
-        "console"                              => (HwClass::Framebuffer, false),
         "xhci"                                 => (HwClass::Xhci, false),
         "ehci"                                 => (HwClass::Ehci, false),
-        // `block-driver` moved to the supervisor (step C): it names HwClass::Ahci in its spawn
-        // request, and the kernel resolves that to what its own scan found.
+        // `block-driver` and `console` moved to the supervisor (step C): each names its class in
+        // the spawn request (HwClass::Ahci, HwClass::Framebuffer) and the kernel resolves that to
+        // what its own scan found. The DISPLAY is a device like any other here.
         "nic-driver" | "e1000"                 => (HwClass::Nic,  false),
         // `resource-server`, `fs` and `net-stack` all moved to the supervisor (step C): their
         // RESOURCE_MINT arrives in the spawn request, checked against what the SUPERVISOR may
@@ -796,33 +796,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             preferred_core:    0,
             probe_mode:        0,
             memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
-        // The terminal (docs/console-service.md 9). Holds the framebuffer grant (`service_hw`) and
-        // renders every console byte the kernel `try_send`s to its endpoint.
-        //
-        // ARM: core 3, and NOT core 0. I put it on core 0 first, reasoning that a console write is what
-        // the user is waiting to see so it should sit with the shell - and that was wrong twice over.
-        // The shell is on core 1, and core 0 is deliberately left to `dwc2` ALONE (see the note on
-        // net-stack below, and the logger's, which was moved off core 0 for exactly this).
-        //
-        // It matters more here than it did for the logger. A full-screen repaint is millions of
-        // non-cacheable pixel stores in one un-preemptible stretch, and dwc2's split transactions have
-        // to hit 125 us microframe windows. Sharing a core with it produced NYET storms and two
-        // "keyboard TT wedged" stalls, one of them six seconds long, on the first boot that had a
-        // terminal to starve it.
-        //
-        // Core 3 rather than 2 because the logger and block-driver are on 2; the terminal is the one
-        // service whose latency the user watches directly, so it gets the idle core.
-        "console" => Some(("console", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_CONSOLE_ELF")),
-            has_recv_endpoint: true, // the console byte stream AND geometry requests arrive here
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    if cfg!(target_arch = "arm") { 3 } else { 0 },
-            probe_mode:        0,
-            memory_limit:      8 * 1024 * 1024, // matches console.toml
             hw_irqs:           &[],
             has_console_read:  false,
         })),

@@ -94,7 +94,6 @@ features = [
 # Listed in full, without splitting "real" services from test ones: any rule for that split is a
 # judgment encoded as a pattern, and the next service named outside the pattern slips through.
 service_configs = [
-    "console",
     "dwc2",
     "ehci",
     "nic-driver",
