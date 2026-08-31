@@ -8441,13 +8441,18 @@ fn cmd_spawnwired(ctx: &ServiceContext) -> Result<(), ShellError> {
     // service's SPAWNER holds one. `pong`'s image belongs to the supervisor, so the supervisor is
     // the spawner and the supervisor returns the cap. `acquire_send_cap` cannot serve here: it
     // yields SEND alone and rights never widen (7.3).
-    let pong = match ctx.spawn_via_supervisor("pong", 0xFFFF, &[]).ok().flatten() {
-        Some(h) => h,
-        None => { ctx.console_writeln("spawnwired: could not spawn pong / acquire its endpoint cap"); return Err(ShellError::Unknown); }
-    };
-    match ctx.spawn_with_caps("greet", 0xFFFF, &[("pong", pong)]) {
+    // Ask the SUPERVISOR to spawn `greet` wired to `pong`. It installs pong's cap from its name-cap
+    // map, so greet reaches pong through a CAPABILITY IT WAS HANDED rather than by resolving a name -
+    // which is the property this diagnostic exists to prove, unchanged.
+    //
+    // The INSTALLER is now the supervisor rather than the shell. That is not a weakening: only a
+    // service's spawner holds a grantable cap to it (8.5, 7.3), and `pong`'s spawner is the
+    // supervisor. It is also the shape every wired service gets at boot, so the diagnostic now
+    // exercises the real path instead of a shell-only one.
+    let _ = ctx.spawn_via_supervisor("pong", 0xFFFF, &[]);   // may already be running
+    match ctx.spawn_via_supervisor("greet", 0xFFFF, &["pong"]) {
         Ok(_)  => { ctx.console_writeln("spawnwired: greet wired to pong via a passed cap (watch for pong: received)"); Ok(()) }
-        Err(_) => { ctx.console_writeln("spawnwired: spawn_with_caps(greet) failed"); Err(ShellError::Unknown) }
+        Err(_) => { ctx.console_writeln("spawnwired: supervisor could not spawn greet wired to pong"); Err(ShellError::Unknown) }
     }
 }
 

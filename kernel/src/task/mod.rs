@@ -787,17 +787,6 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
             hw_irqs:           &[],
             has_console_read:  false,
         })),
-        "greet" => Some(("greet", ServiceConfig {
-            elf:               include_bytes!(env!("SVC_GREET_ELF")),
-            has_recv_endpoint: false,
-            send_peers:        &[],
-            send_peers_grant:  false,
-            preferred_core:    u32::MAX,
-            probe_mode:        0,
-            memory_limit:      64 * 1024 * 1024,
-            hw_irqs:           &[],
-            has_console_read:  false,
-        })),
         "counter" => Some(("counter", ServiceConfig {
             elf:               include_bytes!(env!("SVC_COUNTER_ELF")),
             has_recv_endpoint: true,

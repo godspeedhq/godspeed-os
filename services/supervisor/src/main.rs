@@ -77,13 +77,25 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
                 // SPAWN does not kill - starting something already running must fail, not replace it.
                 if restart { let _ = ctx.kill(name); }
                 let ok = if np > 0 {
-                    // Peers supplied (a pipe). A supervisor-held image takes them directly; a
-                    // kernel-held one goes through the kernel's pipe spawn, which prepends the
-                    // downstream to the producer's declared peers the same way.
-                    match spawn_by_image(ctx, name, core, &peers[..np], &[]) {
-                        Some(Ok(c))  => { spawned_cap = c; true }
-                        Some(Err(_)) => false,
-                        None         => ctx.spawn_pipe(name, peers[0]).is_ok(),
+                    // Peers supplied. INSTALL them from the name-cap map where we have caps, rather
+                    // than name-wiring: a provided cap is what makes the child use a CAPABILITY
+                    // rather than resolve a name, which is the property Phase 0b exists to prove and
+                    // the shape every wired service already gets at boot.
+                    //
+                    // `spawn_wired` falls back to a name-wired spawn for any peer we have no cap for,
+                    // so a pipe whose downstream is not in the map still works.
+                    let mut have_caps = false;
+                    for p in &peers[..np] { if map.get(p).is_some() { have_caps = true; } }
+                    if have_caps {
+                        let ok = spawn_wired(ctx, map, name, &peers[..np]);
+                        if ok { spawned_cap = map.get(name).map(CapHandle); }
+                        ok
+                    } else {
+                        match spawn_by_image(ctx, name, core, &peers[..np], &[]) {
+                            Some(Ok(c))  => { spawned_cap = c; true }
+                            Some(Err(_)) => false,
+                            None         => ctx.spawn_pipe(name, peers[0]).is_ok(),
+                        }
                     }
                 } else if core == u32::MAX {
                     // (the wired/mapped paths record the cap in the name map; read it back below)
@@ -160,6 +172,7 @@ static CONTROL_ELF: &[u8] = include_bytes!(env!("SVC_CONTROL_ELF"));
 /// `include_bytes!(env!("SVC_OBSERVE_ELF"))`). Worth stating, because a reader seeing three IMAGES
 /// rows would otherwise expect three crates.
 static OBSERVE_ELF: &[u8] = include_bytes!(env!("SVC_OBSERVE_ELF"));
+static GREET_ELF: &[u8] = include_bytes!(env!("SVC_GREET_ELF"));
 static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
 static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
@@ -213,6 +226,10 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32)] = &[
      godspeed_sdk::service_context::privbits::INTROSPECT, 1),
     ("observe-live", OBSERVE_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_CONSOLE, 8 * 1024 * 1024, 0, &[],
      godspeed_sdk::service_context::privbits::INTROSPECT, 2),
+    // `greet` declares `pong` as a peer so the supervisor INSTALLS pong's cap from its name-cap map
+    // (spawn_wired), which is what `spawnwired` proves: the child reaches pong through a capability
+    // it was handed, not by resolving a name.
+    ("greet", GREET_ELF, 0, 64 * 1024 * 1024, u32::MAX, &["pong"], 0, 0),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0),
