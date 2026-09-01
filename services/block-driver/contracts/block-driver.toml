@@ -43,13 +43,21 @@ log_write = true
 # between a compliant and a non-compliant kernel leaves the violation one build away. A contract is
 # a spec artifact, so citing a flag that cannot be set sends a reader hunting for it.
 #
-# It is declared UNCONDITIONALLY here while the kernel declares it under `cfg(feature)`, because a
-# TOML contract has no notion of a build feature and `contract_check.py` compares one text against
-# the other. The honest reading is "block-driver MAY send to xhci"; an unused send peer grants
-# authority that is never exercised, which is a smaller problem than the alternative - the missing
-# edge cost a full debugging round on the Pi 4, where every service looked healthy in isolation and
-# the disk was simply unaddressable.
-ipc_send = ["xhci"]
+# BOTH NAMES are declared, because the peer differs BY PORT: `dwc2` on arm32 (Pi 2), `xhci` on
+# aarch64 (Pi 4), and NEITHER on x86, where this driver reaches an AHCI controller directly through
+# its own MMIO window. A TOML contract has no notion of an arch, so it states the union - every peer
+# this service may send to on the ports it runs on - and `contract_check.py` reconciles against that
+# union. An unused send peer grants authority that is never exercised, which is a smaller problem
+# than the alternative.
+#
+# The alternative is not hypothetical. This said `["xhci"]` alone, and when the service's config
+# moved to the supervisor the three-way `#[cfg]` behind it was flattened to match - which is correct
+# ONLY on the Pi 4. On the Pi 2 the driver then held a send cap to a service that does not exist
+# there and none to `dwc2`, so `request_with_reply` found no send slot and returned None instantly:
+# 0 sectors, no disk, `ls` broken, while dwc2 had the stick enumerated and bound the whole time.
+# Every layer healthy in isolation, and the missing piece the edge between them - twice now, on two
+# different boards.
+ipc_send = ["dwc2", "xhci"]
 
 [placement]
 # DECLARED. The prose above argued that stating a core here would be a second copy of an

@@ -216,22 +216,34 @@ def parse_supervisor_images(name: str):
     if not m:
         return None
     mem_expr, core_expr = m.group(2).strip(), m.group(3).strip()
-    # The peer list is either a plain `&[...]` or an ARCH-CONDITIONAL one:
-    #   `if cfg!(target_arch = "arm") { &["dwc2"] } else { &[] }`
-    # Take the FIRST list, which is the ARM branch. That is not arbitrary: it is exactly what
-    # `parse_kernel` does with the cfg'd `send_peers` it replaced (the `#[cfg(target_arch = "arm")]`
-    # line comes first in the kernel row), and it is what nic-driver.toml states - `ipc_send =
-    # ["dwc2"]`, with an ARM note explaining it. Reading the else branch here instead would silently
-    # change what this check MEANS as a service moves house, which is the one thing it exists to stop.
+    # The peer list is either a plain `&[...]` or an ARCH-CONDITIONAL one, which can be three-way:
+    #   `if cfg!(arm) { &["dwc2"] } else if cfg!(aarch64) { &["xhci"] } else { &[] }`
+    # Compare against the UNION of the branches, because a TOML contract has no notion of an arch and
+    # the honest thing for it to state is every peer this service may send to on the ports it runs on.
     #
-    # It deliberately differs from `_core_of`, which takes the else branch: the .toml states the
-    # x86-intended CORE but the ARM peer list. That asymmetry is in how the contracts are written,
-    # not in the parser, so it is reproduced rather than corrected here.
-    tail = m.group(4)
-    lists = re.findall(r'&\[([^\]]*)\]', tail)
+    # Taking one branch was tried and is wrong: on the host it read the arm arm, so `block-driver`'s
+    # contract could only ever agree with ONE of its three ports and the other two went unchecked.
+    # The union costs a little precision - a contract satisfied by the union does not prove each
+    # branch is individually right - but that is the same trade the contract already documents for an
+    # unconditional declaration, and it is strictly more coverage than checking one arch and ignoring
+    # the rest.
+    # Bound the scan to THIS row's peer expression. `tail` is a fixed window of following text, so a
+    # blind union over it swallowed the NEXT row's peers - `logger` (no peers) read as `asker`'s
+    # `["reply-server"]` and failed a check it should pass. Match the expression shape instead:
+    # either a plain `&[...]`, or a complete `if cfg!(..) { &[..] } [else if ..] [else { &[..] }]`.
+    tail = m.group(4).lstrip()
+    chain = re.match(
+        r'if\s+cfg!\([^)]*\)\s*\{[^}]*\}'
+        r'(?:\s*else\s+if\s+cfg!\([^)]*\)\s*\{[^}]*\})*'
+        r'(?:\s*else\s*\{[^}]*\})?', tail)
+    scope = chain.group(0) if chain else (re.match(r'&\[[^\]]*\]', tail).group(0)
+                                          if re.match(r'&\[[^\]]*\]', tail) else None)
+    if scope is None:
+        return None
+    lists = re.findall(r'&\[([^\]]*)\]', scope)
     if not lists:
         return None
-    peers_raw = lists[0]
+    peers_raw = ",".join(lists)
     lm  = re.search(r'(\d+)\s*\*\s*1024\s*\*\s*1024', mem_expr)
     return {
         "limit": int(lm.group(1)) * 1024 * 1024 if lm else None,

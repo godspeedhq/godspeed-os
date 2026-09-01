@@ -93,10 +93,24 @@ for i in range 1 5 {                     # range A B -> 1 2 3 4
     hits = $hits + 1                     # reassigned each pass: a fixed slot, no arena growth
 }
 echo hits-$hits | assert contains hits-4
-write /sc_fl.txt oneline                 # for line in (producer): iterate a producer's output lines
 let mut nlines = 0
-for line in (read /sc_fl.txt) { nlines = $nlines + 1 }
-if $nlines > 0 { echo forline-ok | assert contains forline-ok } else { fail "for line: empty" }
+# for line in (producer): iterate a producer's output lines.
+#
+# GUARDED ON THE WRITE, because `fail` STOPS THE RUN and this line needs storage. On a machine with
+# no disk (a Pi 2 with no USB stick) the write failed, the loop saw nothing, and the whole suite
+# aborted HERE - at section 6 of 31, reporting "ran 48, failed 4" as though that were the suite.
+# Twenty-five sections that have nothing to do with storage never executed, and the count read like a
+# small run rather than a truncated one.
+#
+# The guard is on the WRITE rather than on `nlines`, deliberately: skipping whenever the loop came
+# back empty would also swallow a genuinely broken `for line` on a machine that HAS a disk, which is
+# the bug this test exists to catch. Write succeeded -> run the real test, `fail` included.
+if write /sc_fl.txt oneline {
+    for line in (read /sc_fl.txt) { nlines = $nlines + 1 }
+    if $nlines > 0 { echo forline-ok | assert contains forline-ok } else { fail "for line: empty" }
+} else {
+    echo 'SKIP for-line: no writable storage on this machine'
+}
 delete /sc_fl.txt
 
 echo ''

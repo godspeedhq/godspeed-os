@@ -277,8 +277,21 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      | godspeed_sdk::service_context::privbits::SET_CLOCK, 0, 0),
     // FIRST DRIVER to move. AHCI: an MMIO BAR, a DMA arena and a PCI BDF for the bus-master enable -
     // and no IRQ line, which is why it is the right one to prove the path on.
-    ("block-driver", BLOCK_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, if cfg!(target_arch = "arm") { 2 } else { 1 }, &["xhci"], 0, 0,
-     godspeed_sdk::service_context::hwclass::AHCI),
+    // block-driver reaches the disk THROUGH A USB HOST-CONTROLLER SERVICE on both ARM targets:
+    // `xhci` on aarch64, `dwc2` on arm32. On x86 it drives AHCI directly and needs NO such peer.
+    //
+    // ALL THREE ARMS MATTER, and this row is why. Moving it out of the kernel flattened a
+    // three-way `#[cfg]` into a bare `&["xhci"]`, which is right only on aarch64. The Pi 2 then had
+    // a send cap to a service that does not exist there and none to `dwc2`, so
+    // `request_with_reply("dwc2", ..)` found no send slot and returned None INSTANTLY: 0 sectors, no
+    // disk, `ls` broken - while dwc2 had the stick enumerated and BOUND the whole time. The comment
+    // deleted along with the cfg had predicted precisely that ("every layer healthy in isolation,
+    // and the missing piece the edge between them"), which is the argument for carrying a warning
+    // WITH the thing it warns about.
+    ("block-driver", BLOCK_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
+     if cfg!(target_arch = "arm") { 2 } else { 1 },
+     if cfg!(target_arch = "arm") { &["dwc2"] } else if cfg!(target_arch = "aarch64") { &["xhci"] } else { &[] },
+     0, 0, godspeed_sdk::service_context::hwclass::AHCI),
     // The terminal (docs/console-service.md 9). Its "hardware" is the DISPLAY: the kernel maps the
     // framebuffer into it and describes the PIXEL geometry only - character geometry belongs to the
     // terminal, which is this service. Same class mechanism as a driver's BAR, and for the same
