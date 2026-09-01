@@ -129,12 +129,34 @@ pub fn sectors(ctx: &ServiceContext) -> u64 {
 /// its source, which §26.4 and §14.3 both forbid - the disk is `xhci`'s truth, and a cached copy of
 /// another service's truth must be re-derived, not remembered.
 pub fn sectors_now(ctx: &ServiceContext) -> u64 {
-    let Some(r) = rpc(ctx, &[OP_CAPACITY]) else { return 0 };
+    // ZERO HAS THREE CAUSES AND THEY NEEDED TELLING APART. A post-chaos Pi 2 served
+    // `storage unavailable` for 23 s across two selfcheck runs while `dwc2` demonstrably HAD the
+    // stick - it had just enumerated it and read sector 0 back as "GSFS". Everything above this
+    // reported the same word for all three cases, so the log said "no capacity" and could not say
+    // whether the driver was unreachable, refusing, or honestly reporting an empty bay.
+    //
+    // Logged only on the ZERO paths, so a healthy mount stays silent and a stuck one explains itself
+    // on the first request rather than after another hardware round (§26.7).
+    let Some(r) = rpc(ctx, &[OP_CAPACITY]) else {
+        ctx.log("block-driver: capacity 0 - the USB host service did not ANSWER (cap stale after its restart, or it is busy)");
+        return 0;
+    };
     let p = r.payload_bytes();
-    if p.len() < 9 || p[0] != STATUS_OK {
+    if p.len() < 9 {
+        ctx.log_fmt(format_args!(
+            "block-driver: capacity 0 - short reply, {} bytes (want 9) - protocol mismatch, not an empty bay", p.len()));
         return 0;
     }
-    u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]])
+    if p[0] != STATUS_OK {
+        ctx.log_fmt(format_args!(
+            "block-driver: capacity 0 - the USB host service REFUSED (status {}) - it is reachable but has no disk bound", p[0]));
+        return 0;
+    }
+    let n = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]);
+    if n == 0 {
+        ctx.log("block-driver: capacity 0 - the USB host service ANSWERED zero: no mass-storage device bound");
+    }
+    n
 }
 
 /// Read one 512-byte sector. `false` means the read did not happen - never a partially-filled buf.
