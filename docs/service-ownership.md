@@ -372,6 +372,63 @@ It would also quietly undo step D. The point of D is that the kernel stops knowi
 bus; keeping the results puts a device table back - smaller, but the same category of thing. The pin
 exists to catch precisely that.
 
+### The blocker D has to answer first: who may name an ADDRESS
+
+The sketch above has the supervisor spawn a driver "with those facts" - MMIO base, IRQ, BDF. Step C
+established the opposite rule and `SpawnImage` now enforces it:
+
+```
+task: SpawnImage refused - raw hardware addresses are not honoured; name the device CLASS instead
+```
+
+That refusal is not fussiness. A caller that can name an MMIO base can point a driver at ANY physical
+memory, which is kernel-equivalent reach on any board without an IOMMU - both Pis, and any x86 machine
+whose firmware supplies no IVRS (§6.4). Handing that to the supervisor would give back, in one field,
+more than the whole probe-image move took away.
+
+And the kernel cannot simply validate a supplied address, because validating it means reading config
+space to see whether the address really belongs to that device - which is precisely the capability D
+is trying to remove from the kernel. Stated plainly, that is a circle:
+
+> to check the supervisor's number the kernel must read the bus; if it can read the bus it does not
+> need the supervisor's number.
+
+**The resolution is to move the granularity, not the trust.** The caller names a **device**, never an
+address:
+
+```
+  supervisor  ->  "spawn `xhci`, it claims BDF 00:14.0, class 0x0c0330"
+  kernel      ->  reads THAT BDF's class code and BAR0 from config space
+                  class matches?  grant the BAR it read.  else REFUSE.
+```
+
+This is the step-C principle at finer granularity - *the caller says WHICH device, the kernel says
+WHERE it is* - and every property that made the class mechanism safe survives:
+
+- **No address is ever supplied.** The kernel reads BAR0 itself, so a wrong or hostile number cannot
+  become a mapping.
+- **A wrong BDF is caught**, not obeyed: the class code at that BDF is checked against the class the
+  driver claims, so pointing the `xhci` driver at the NIC is refused rather than granted.
+- **`dma_phys_slot` still works**, which a raw address could never express: the permanent per-device
+  physical DMA reservation is keyed by the device, and the device is what the caller named.
+
+What the kernel LOSES is what D is actually about, and it is the larger half:
+
+| stays (mechanism) | goes (policy) |
+|---|---|
+| read one BDF's class code + BAR on request | scanning the bus and classifying what is on it |
+| verify the claim, grant or refuse | `XHCI_FOUND` / `AHCI_ABAR` / `NIC_BDF` and their siblings |
+| | one `HwClass` variant per device the kernel was taught |
+| | deciding which driver claims which device |
+
+So the kernel's bus responsibility SHRINKS from "enumerate and classify" to "read one register set and
+check it matches". A new kind of device needs no kernel change: `bus-manager` enumerates it, the
+supervisor picks a driver, and the kernel verifies the claim without ever having heard of that class.
+
+This is a refinement of the sketch above, not what it originally said, and it is recorded here rather
+than discovered mid-implementation - the sketch would have required the kernel to accept caller-named
+addresses, and that trade was never actually argued for.
+
 ### The fiddly part of D: assignment once, re-read always
 
 Re-enumeration after a restart must not disturb live drivers. On the Pi 4 today the kernel does not
