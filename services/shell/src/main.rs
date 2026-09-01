@@ -3490,6 +3490,17 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
     let mut soff = [0u16; RUN_MAX_CMDS];
     let mut slng = [0u16; RUN_MAX_CMDS];
     let mut nrec = 0usize;
+    // FAILURES ARE RECORDED FOR THE WHOLE RUN, not just the capped prefix. The arrays above stop at
+    // 256 statements; the self-check suite is now ~392, so a failure past the cap was COUNTED in
+    // "failed N" and had no line anywhere - the operator is told a test failed and cannot find out
+    // which. That is the silent failure invariant 12 forbids, and it cost a Pi 2 debugging round:
+    // `run: ran 392, failed 1` with `match FAIL` over the saved report returning nothing at all.
+    //
+    // Separate and much smaller, because failures are rare while passes are not: 32 spans is 128
+    // bytes, against 1.9 KiB to raise the cap to 640 - and raising the cap only moves the cliff.
+    let mut fail_off = [0u16; RUN_MAX_FAILS];
+    let mut fail_len = [0u16; RUN_MAX_FAILS];
+    let mut nfail_rec = 0usize;
     let b = src;
     let ft = prescan_fns(ctx, b); // index `fn` definitions so a call may precede its definition (§7)
     let sdepth = depth + 1; // statements/conditions run one level deeper (a nested `run` is refused)
@@ -3883,7 +3894,14 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
         if nrec < RUN_MAX_CMDS { verdict[nrec] = last.is_ok(); soff[nrec] = stmt_off as u16; slng[nrec] = stmt.len() as u16; }
         nrec += 1;
         ran += 1;
-        if last.is_err() { failed += 1; }
+        if last.is_err() {
+            failed += 1;
+            if nfail_rec < RUN_MAX_FAILS {
+                fail_off[nfail_rec] = stmt_off as u16;
+                fail_len[nfail_rec] = stmt.len() as u16;
+                nfail_rec += 1;
+            }
+        }
         if stop { break; }
     }
     // Script exit (normal end OR `fail`): run any remaining defers - LIFO, across all scopes (§5).
@@ -3898,6 +3916,26 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
         for j in 0..shown {
             out.put(ctx, if !verdict[j] { "FAIL  " } else { "PASS  " });
             out.line(ctx, str_of(&b[soff[j] as usize..soff[j] as usize + slng[j] as usize]));
+        }
+        // Say so when the per-statement detail above is only a prefix, rather than letting a reader
+        // assume a clean tail (§26.7).
+        if nrec > RUN_MAX_CMDS {
+            out.line_fmt(ctx, format_args!(
+                "--- (per-statement detail covers the first {} of {} statements) ---",
+                RUN_MAX_CMDS, nrec));
+        }
+        // Every failure, wherever it happened. This is the part that must never be capped away.
+        if failed > 0 {
+            out.line(ctx, "--- failures ---");
+            for j in 0..nfail_rec.min(RUN_MAX_FAILS) {
+                out.put(ctx, "FAIL  ");
+                out.line(ctx, str_of(&b[fail_off[j] as usize..fail_off[j] as usize + fail_len[j] as usize]));
+            }
+            if failed as usize > nfail_rec {
+                out.line_fmt(ctx, format_args!(
+                    "FAIL  ... and {} more (only the first {} are listed)",
+                    failed as usize - nfail_rec, RUN_MAX_FAILS));
+            }
         }
         out.line_fmt(ctx, format_args!("run: ran {}, failed {}", ran, failed));
     }
@@ -3971,8 +4009,17 @@ fn save_report(ctx: &ShellCtx, path: &[u8], data: &[u8]) -> bool {
 }
 
 /// Cap on per-command summary lines `run` records (the verdict array). Commands past this still
-/// run and count in the totals; only their individual PASS/FAIL line is omitted.
+/// run and count in the totals; only their individual PASS line is omitted - a FAILURE past the cap
+/// is still named, in the `--- failures ---` block (see `RUN_MAX_FAILS`).
 const RUN_MAX_CMDS: usize = 256;
+
+/// Cap on FAILING statements recorded across the WHOLE run, independent of `RUN_MAX_CMDS`.
+///
+/// A failure that is counted but cannot be named is the silent failure invariant 12 forbids, and
+/// with a 392-statement suite against a 256-statement verdict array that is exactly what happened.
+/// Failures are rare, so this array is small and always covers the full run; passes are many, so
+/// their detail stays capped. Overflowing THIS is reported too, with the count.
+const RUN_MAX_FAILS: usize = 32;
 
 /// The self-check suite, embedded in the shell binary (so it ships with the boot image - no
 /// host-side `dd` of a data disk). Run straight from rodata, so it can be far larger than an
