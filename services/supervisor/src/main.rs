@@ -953,6 +953,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(target_arch = "arm")]
     ensure_mapped(&ctx, &mut name_map, "dwc2", 0xFFFF);
 
+    // THE USB HOST COMES UP BEFORE THE DISK THAT LIVES ON IT - on aarch64 too, not just arm32.
+    //
+    // `block-driver` reaches the Pi 4's disk THROUGH the `xhci` service, exactly as it reaches the
+    // Pi 2's through `dwc2` above. But `xhci` was spawned ninety lines further down, so at boot
+    // block-driver asked a service that did not exist yet and its first capacity probe could not
+    // even resolve the name. The instrument said so on the first Pi 4 boot that carried it:
+    //
+    //   block-driver: 'xhci' did not answer, and the retry after reacquire COULD NOT REACQUIRE
+    //                 - the name does not resolve: no live instance
+    //   task: 'xhci' spawned OK on core 2        <- two lines LATER
+    //
+    // Not fatal - `fs` re-probes on every request and recovers - but it makes every boot start
+    // storage-less and recover, rather than simply working, and it is the same "did not ANSWER"
+    // state that a post-chaos Pi 2 got stuck in for 23 s. A dependency spawned after its dependent
+    // guarantees a failed first probe; ordering it correctly costs nothing.
+    //
+    // The later `xhci` site stays, and ADOPTS this instance rather than starting a second - which is
+    // what `ensure_mapped` is for, and why this is safe to say twice. x86 keeps its existing
+    // position: there `xhci` is a keyboard driver and the disk is AHCI, so it is not in this path.
+    #[cfg(target_arch = "aarch64")]
+    ensure_mapped(&ctx, &mut name_map, "xhci", 0xFFFF);
+
     ensure_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
     // fs needs a disk → bare-metal / blockdev only.
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]
