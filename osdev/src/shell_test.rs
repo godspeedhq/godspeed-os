@@ -4200,8 +4200,18 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
         Some(r) => {
             println!("\n=== baked suite transcript ===\n{}\n=== end ===", r.trim());
-            // Green iff the run summary is "failed 0" AND no assert printed a FAILED line.
-            if r.contains("failed 0") && !r.contains("FAILED") {
+            // Green iff the run summary says "failed 0" AND the report printed no failures block.
+            //
+            // It used to also require the absence of the substring "FAILED", on the theory that only
+            // a failing assert prints it. SERVICES print it too, in the ordinary course of a passing
+            // run: `assert fails spawn nosuchservice` is a NEGATIVE test, and the supervisor
+            // correctly logs "spawn nosuchservice FAILED" while it passes. So the condition could
+            // never be satisfied, and this check reported FAIL on a green suite.
+            //
+            // `--- failures ---` is the precise signal, printed by the runner itself and only when
+            // `failed > 0` - a verdict from the thing under test, not a substring shared with every
+            // service log on the console.
+            if r.contains("failed 0") && !r.contains("--- failures ---") {
                 println!("script-test: PASS - baked suite ran green (failed 0)"); pass += 1;
             } else {
                 println!("script-test: FAIL - baked suite not green"); fail += 1;
@@ -4242,7 +4252,8 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
         Some(r) => {
             // Always save the full live transcript so the run can be inspected line-by-line.
             let _ = std::fs::write("build/selfcheck-transcript.txt", r.as_bytes());
-            if r.contains("failed 0") && !r.contains("FAILED") {
+            // See the baked-suite check above for why "FAILED" is the wrong marker.
+            if r.contains("failed 0") && !r.contains("--- failures ---") {
                 println!("script-test: PASS - embedded `selfcheck` ran green (failed 0) - transcript -> build/selfcheck-transcript.txt"); pass += 1;
             } else {
                 println!("\n=== selfcheck transcript ===\n{}\n=== end ===", r.trim());
