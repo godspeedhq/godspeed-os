@@ -174,6 +174,23 @@ const RTL_ISR_RDU:  u16 = 1 << 4;  // Rx Descriptor Unavailable - the ring fille
 const RTL_ISR_FOVW: u16 = 1 << 6;  // Rx FIFO Overflow - also halts RX until the ring is re-armed
 
 // C+ 16-byte descriptor word 0 (opts1): flags in the high bits, length/size in the low 14 bits.
+/// Empty RX drains before this driver reports the chip's own counters, once. TWO triggers, because
+/// "never received anything" and "stopped receiving" need very different thresholds.
+///
+/// `NEVER`: this instance has reaped ZERO frames and been asked this many times. That is exactly the
+/// observed failure - a NIC that comes back from a chaos restart with link UP and TX working and
+/// never receives again - and it cannot fire on a link that has ever worked, so it can be LOW.
+///
+/// Low matters: the drain loops are PACED (see net-stack's poll-pacing comment), so empty drains
+/// accrue in the hundreds over a 20 s DHCP window, not the thousands. A threshold in the tens of
+/// thousands would sit silent through the very failure this exists to catch - an instrument that
+/// cannot reach its own trigger.
+const RX_SILENCE_NEVER: u32 = 256;
+
+/// `STALLED`: frames DID arrive at some point and then stopped. A quiet-but-healthy link reaches this
+/// legitimately, so it is high - and the report is one line per driver lifetime either way.
+const RX_SILENCE_STALLED: u32 = 20_000;
+
 const RTL_DESC_OWN: u32 = 1 << 31; // owned by the NIC (set = NIC's; it clears the bit when done)
 const RTL_DESC_EOR: u32 = 1 << 30; // end of ring (the last descriptor - the NIC wraps here)
 const RTL_DESC_FS:  u32 = 1 << 29; // first segment (TX)
@@ -317,6 +334,13 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     let mut tx_fail_logged = 0u32;         // diagnose the first few TX timeouts to guide the root-cause fix
     // Counts replies that could not be delivered; see `note_reply`.
     let mut reply_fails = 0u32;
+    // RX GROUND TRUTH. Added after a T630 chaos run left this NIC with link UP and TX working
+    // (net-stack reported "6 sent 0 SEND-FAILED") and ZERO frames received, permanently. The log
+    // could not say whether the chip stopped receiving, the driver stopped reaping, or delivery to
+    // net-stack failed - because none of those three numbers was ever LOGGED, only served on request.
+    // All three look identical from outside, and they are three different bugs.
+    let mut empty_drains = 0u32;
+    let mut rx_silence_logged = false;
     loop {
         let req = ctx.recv();
         let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
@@ -442,7 +466,51 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                 }
             }
             out[0] = nfr;
-            if nfr > 0 { rx_count = rx_count.saturating_add(nfr as u16); }
+            if nfr > 0 {
+                rx_count = rx_count.saturating_add(nfr as u16);
+                empty_drains = 0;
+            } else {
+                empty_drains = empty_drains.saturating_add(1);
+                // Asked for frames this many times running with none to give. A quiet link does that
+                // legitimately, so the threshold is high enough that only a STUCK receive path trips
+                // it - and it reports ONCE per driver lifetime, never per drain (§26.4: loud, not
+                // noise). A restart re-arms it, which is right: each instance gets to say so once.
+                // Never received anything -> report early. Received then stopped -> report late.
+                let trip = (rx_count == 0 && empty_drains >= RX_SILENCE_NEVER)
+                    || empty_drains >= RX_SILENCE_STALLED;
+                if trip && !rx_silence_logged {
+                    rx_silence_logged = true;
+                    // The CHIP's own tally counters, read as `net stats` reads them - layer-1 ground
+                    // truth, independent of anything this driver believes:
+                    //
+                    //   RxOk > 0, reaped == 0     -> chip received; the DRIVER is not reaping
+                    //                                (ring not re-armed, OWN bit, rx_idx desynced)
+                    //   RxOk == 0, Missed > 0     -> chip received and DROPPED it (no buffers armed)
+                    //   RxOk == 0, Missed == 0    -> nothing reached the chip (wire / PHY / filter)
+                    //   reaped > 0, reply_fails>0 -> reaped fine; DELIVERY to net-stack is broken
+                    //
+                    // Four outcomes, one line, four different bugs.
+                    let tb = arena.phys_at(TALLY_OFF);
+                    for i in 0..64 { arena.write8(TALLY_OFF + i, 0); }
+                    mmio.write32(RTL_DTCCR + 4, (tb >> 32) as u32);
+                    mmio.write32(RTL_DTCCR, ((tb as u32) & !0x3F) | 0x08);
+                    let mut td = 0u32;
+                    while td < TALLY_POLL_MAX && mmio.read32(RTL_DTCCR) & 0x08 != 0 {
+                        ctx.yield_cpu(); td += 1;
+                    }
+                    let phy = mmio.read8(RTL_PHYSTATUS);
+                    ctx.log_fmt(format_args!(
+                        "nic-driver: RX SILENT {} drains - chip RxOk={} RxErr={} Missed={} TxOk={} (dump {}), reaped={} reply_fails={} link={} rx_idx={}",
+                        empty_drains,
+                        arena.read32(TALLY_OFF + 0x08),
+                        arena.read32(TALLY_OFF + 0x18) & 0xFFFF,
+                        arena.read32(TALLY_OFF + 0x1C) & 0xFFFF,
+                        arena.read32(TALLY_OFF + 0x00),
+                        if td < TALLY_POLL_MAX { "ok" } else { "TIMED OUT" },
+                        rx_count, reply_fails,
+                        if phy & 0x02 != 0 { "up" } else { "DOWN" }, rx_idx));
+                }
+            }
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])), &ctx, &mut reply_fails);
             ctx.remove_cap(reply_cap);
             continue;
