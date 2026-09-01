@@ -372,7 +372,74 @@ It would also quietly undo step D. The point of D is that the kernel stops knowi
 bus; keeping the results puts a device table back - smaller, but the same category of thing. The pin
 exists to catch precisely that.
 
-### The blocker D had to answer: who may name an ADDRESS
+### D1 (BUILT): a driver names its device by PCI CLASS CODE
+
+D splits in two, and the halves are not alternatives - the first is a prerequisite for the second:
+
+| | what moves | what it buys |
+|---|---|---|
+| **D1 - built** | the kernel stops INTERPRETING the bus | adding a driver needs no kernel change |
+| **D2 - not built** | the kernel stops LOOKING at the bus | `hw-enumerator`; the kernel holds no bus code |
+
+You cannot move WHO produces a device table that is not produced yet, so D1 comes first regardless.
+
+**What is built.** The boot scan records every device it meets into a generic table -
+`(BDF, class code, six BARs, IRQ line, vendor, device)` - before any per-class branch cares what it
+is. A driver then names its device by the industry-standard 24-bit (class, subclass, prog-if) triple:
+`0x010601` IS an AHCI SATA controller on every machine ever built, so the kernel needs no name for
+it. `hw_flags` bit 31 marks the value as a class code; the kernel looks it up and grants that
+device's BAR, DMA arena and BDF.
+
+Three facts travel with it, because they belong to the DRIVER rather than to the bus, and **none of
+them is an address**:
+
+- **BAR index** - which BAR holds the registers. xHCI uses 0, AHCI uses 5 (`ABAR`). An index, so the
+  kernel still supplies the value from its own scan. This is not a detail: the first version of the
+  table recorded BAR0 only, and the boot cross-check caught it at once - AHCI read back 0 against a
+  static that said `0xfebd9000`.
+- **DMA pages** - how much arena. A size; the kernel still decides WHERE. Bounded at 2048 pages,
+  because an unbounded size is a denial of service (§26.6).
+- **Confine** - IOMMU or passthrough. Policy (§6.4).
+
+`mmio_base`, `mmio_len` and `bdf` remain REFUSED, exactly as step C left them.
+
+DMA reservations are keyed per DEVICE now rather than per class name, so a device the kernel cannot
+name still gets the same physical arena back across a restart - which is what makes a driver respawn
+transparent to a controller still DMAing into it.
+
+**`block-driver` is the first caller**, chosen as the strictest test available: a non-zero BAR index,
+a DMA arena, a BDF for bus-master enable, and no interrupt. `files` (222 tests) exercises the whole
+path end to end.
+
+**The cross-check that made it safe.** Before anything switched over, the boot log printed the
+generic table against the per-class statics it replaces. Two independent views of one truth had to
+agree first, and the agreement is evidence in the log rather than an assertion in a commit message:
+
+```
+pci: device table - 8 device(s) recorded (generic, no class knowledge)
+pci:   xHCI class 0x0c0330 AGREES (BAR0 0xfebd4000 BDF 0x0020)
+pci:   EHCI class 0x0c0320 absent from both - agrees
+pci:   AHCI class 0x010601 AGREES (BAR5 0xfebd9000 BDF 0x00fa)
+pci:   NIC  class 0x020000 AGREES (BAR0 0xfeb80000 BDF 0x0010)
+```
+
+**What D1 does NOT yet do: interrupts.** A driver spawned by class code gets MMIO, DMA and its BDF -
+but no vector. The named classes return a vector the kernel assigned and programmed into the device's
+MSI at boot; doing that for a device the kernel cannot name means allocating from a vector POOL and
+programming MSI generically. `program_msi(bdf, vector, dest)` is already generic - what is missing is
+the pool and an IDT stub per vector in it, which is naked assembly and boot-critical. It is squarely
+the kernel's work (interrupt routing is one of the six, §4.3), so it belongs there rather than in the
+caller, and it wants its own hardware round rather than being written alongside something else.
+
+So today: a ported driver that POLLS needs no kernel change. One that needs an interrupt still does.
+That is the honest edge of D1 and the next piece of work.
+
+**Per-arch state.** x86_64 fills the table. arm32 never will - it has no PCI at all, the DWC2 is
+soldered, and every driver there names a non-PCI kind. aarch64 is a real GAP rather than a
+non-applicable one: the Pi 4 has PCIe and `pcie::init` walks it, but it does not record into the
+table yet, so its drivers still name a kind.
+
+### The blocker D2 has to answer: who may name an ADDRESS
 
 The sketch above has the supervisor spawn a driver "with those facts": MMIO base, IRQ, BDF. Step C
 established the opposite and `SpawnImage` enforces it, refusing raw addresses outright - because a
@@ -952,7 +1019,9 @@ four machines** in the step A validation without a single kernel panic.
 | before | 221 | kernel change | kernel change | no |
 | **A (done)** | **29** | kernel change | kernel change | no |
 | **C (done)** | **1** | **no kernel change** | kernel change | no |
-| D | 1 | no kernel change | **no kernel change** | no |
+| **D1 (done)** | 1 | no kernel change | **no kernel change** (polled drivers) | no |
+| D1b | 1 | no kernel change | **no kernel change** (+ interrupts) | no |
+| D2 | 1 | no kernel change | no kernel change, and no bus code in the kernel | no |
 | 2 | 1 | no kernel change | no kernel change | **yes** |
 
 **Step C is built, and the pin is at its target: 1.** `supervisor` alone, because the kernel must

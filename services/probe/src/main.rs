@@ -1923,7 +1923,8 @@ fn mode_adv_a9(ctx: &ServiceContext) -> ! {
     let mut req = godspeed_sdk::service_context::SpawnRequest::new(&junk, "adv-a9-image-attack");
     let mut peers_buf = [0u8; 8];
     match ctx.spawn_image(&mut req, &mut peers_buf, &[]) {
-        Err(_) => ctx.log("adv: A9c pass - SpawnImage refused to a SPAWN holder without IMAGE_SPAWN"),
+        Err(_) => ctx.log("adv: A9c pass"),   // short ON PURPOSE: the adversarial build faults probes while others
+                                    // log, and a long line is a wider window to be shredded mid-write.
         Ok(_)  => ctx.log("adv: A9 FAIL - started a caller-supplied image while holding only SPAWN"),
     }
     idle(ctx)
