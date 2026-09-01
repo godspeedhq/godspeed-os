@@ -160,7 +160,20 @@ service_configs = [
 #
 # Neither query changes what the kernel DOES. Both are read-only, both are INTROSPECT-gated by falling
 # outside the ungated list, and the system behaves identically whether anything reads them or not.
-introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25]
+#
+# 26 (added 2026-09-01) reports how many FAULT diagnostics were written without the serial lock, and
+# so may appear spliced into another log line (audits/kernel-audit.md Audit 10). It exists because the
+# splice cannot be eliminated outright: when a page fault interrupts a `kprintln` on its OWN core, the
+# handler cannot wait for a lock that core already holds, and writing unlocked is the only way to
+# report the fault at all. That residual is real, so it is COUNTED rather than left silent - a
+# corrupted line becomes explainable instead of mysterious, which is the whole reason the splice cost
+# two wrong diagnoses before it was understood (invariant 12, §26.7).
+#
+# Read-only, INTROSPECT-gated like the rest, and it changes nothing the kernel DOES. It counts an
+# event the kernel was already having; it does not create one. It was briefly written as UNGATED on
+# the reasoning that a health counter discloses no task state - which this pin caught, correctly. The
+# ungated set is a deliberate list, not a judgement call to be made per query at the call site.
+introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26]
 # Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
 # legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
 # before it builds, and classifying one honestly as a device driver fails the build - which is the

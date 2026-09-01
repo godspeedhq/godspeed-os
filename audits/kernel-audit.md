@@ -1656,7 +1656,57 @@ Another writer's bytes (`[`, `0x` - the shape of a `kprintln!`) are spliced INTO
 line, twice. The test did not fail because the property under test broke; it failed because the
 kernel corrupted the sentence saying so.
 
-### The mechanism
+### CORRECTION (2026-09-01): the mechanism below is WRONG. The real cause is the FAULT path.
+
+The section that follows blamed `SERIAL_LOCK`'s best-effort give-up, reasoning that two line-atomic
+writers could only interleave if one gave up. The reasoning was sound and the conclusion was wrong,
+because it assumed both writers go through `log::write_fmt`. One does not.
+
+**The four fault handlers write to COM1 with no lock at all.** `pf_handler`, `gpf_handler`,
+`exc_dispatch` and `exception_halt_handler` emit through `serial_puts_nolck` / `serial_hex64_nolck`,
+and the comment above them says why:
+
+> Use lock-free serial to avoid a deadlock if LOG_LOCK is already held by the kprintln that was
+> interrupted (interrupt gate: IF=0).
+
+That reasoning is CORRECT, for the case it names. A page fault can interrupt a `kprintln` **on its own
+core** that holds the lock; waiting for it would self-deadlock, and the fault would go unreported.
+
+The defect is that the remedy is **over-broad**. It bypasses the lock unconditionally - including when
+another core holds it, or when nobody does. Those are exactly the cases where waiting was both safe
+and cheap, and they are what produced every splice observed. The `adv` suite makes the collision
+routine: the adversarial build deliberately faults probes (A14/A15/C2) while other services log, so a
+PF diagnostic and a service log line race constantly. Hence `adv: A9c pass` zipped through
+`per_core_ursp=... GS.base=...`.
+
+Everything else the section below records - the evidence, the decomposition, the false-PASS analysis -
+stands. Only the attributed cause was wrong. It is corrected in place rather than rewritten, because
+how a wrong mechanism survived a page of careful reasoning is the more useful record: BOTH writers
+looked line-atomic, and the one that was not never appeared in the paths I read.
+
+### THE FIX (2026-09-01)
+
+The unavoidable case stays unavoidable; the avoidable one stops corrupting the log.
+
+`SERIAL_LOCK` now records its OWNER (`SERIAL_LOCK_OWNER`, `core_id + 1`), which lets the fault path
+tell the two situations apart:
+
+- **This core already owns it** - we interrupted our own `kprintln`. Return immediately and write
+  unlocked, exactly as before. Spinning could not help and would only delay the fault report.
+- **Anyone else, or nobody** - spin BRIEFLY (`SERIAL_FAULT_SPIN_CAP`, 50k, two orders below the
+  ordinary cap because a fault handler must not dawdle) and take the lock if it comes free. No splice.
+- **Contended past the budget** - write unlocked, as before, and count it.
+
+Each of the four handlers brackets its emit block with `serial_fault_lock_acquire` /
+`serial_fault_lock_release`. The release is placed inside the handler and **before any divergence** -
+`kill_current()` and `halt_all_cores()` both come after it - so the lock can never be stranded, which
+would silence all logging. That property is checked, not assumed.
+
+The residual is REPORTED rather than left silent: `InspectKernel` query 26 returns how many
+diagnostics were written unlocked. 0 means every diagnostic that boot was emitted cleanly. It is
+ungated - a kernel-health counter that discloses no task state.
+
+### The mechanism (AS ORIGINALLY WRITTEN - see the correction above)
 
 Both writers are already line-atomic by design. `kprintln!` and the service `log` syscall share
 `log::write_fmt`, whose `LogSink` stages up to 512 bytes and emits them through ONE call to

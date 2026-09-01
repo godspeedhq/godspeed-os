@@ -390,10 +390,25 @@ fn commandment_check() {
 pub fn cmd_build() {
     commandment_check();
     clean_supervisor();
-    // Services must be compiled before the kernel - kernel/build.rs embeds
-    // the service ELF bytes via include_bytes!(env!("SVC_*_ELF")).
+    // Services must be compiled before the kernel - kernel/build.rs embeds the service ELF bytes via
+    // include_bytes!(env!("SVC_*_ELF")).
+    //
+    // And the SUPERVISOR must be compiled after the services IT embeds, for the same reason one layer
+    // down. It used to sit FIRST in this list, so every image this path wrote carried a supervisor
+    // holding the PREVIOUS build of all 22 services beside a current kernel - silently, because a
+    // stale file is not a missing one. That is the exact bug `scripts/embed_order_check.py` was
+    // written for on the Pi ports; it was here too, on the default path that `osdev run` and the
+    // property/fuzz/chaos/stress suites all use.
+    //
+    // It hid because it only bites when cargo actually REWRITES a service binary - an unchanged
+    // service keeps its old mtime and the supervisor stays newer by luck. Intermittent, which is why
+    // it survived: it was found by the embed-order gate refusing to write a property image, not by
+    // anything failing.
+    //
+    // `cmd_build_bare_metal` had this right already (a `non_supervisor` list, supervisor built after).
     let service_crates = [
-        "supervisor", "logger", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder",
+        "logger", "mem-pressure", "chaos", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker", "resource-server", "holder",
+        "supervisor",   // LAST: it embeds every name above it
     ];
     for crate_name in &service_crates {
         let status = std::process::Command::new("cargo")

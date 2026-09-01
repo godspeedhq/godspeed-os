@@ -2053,6 +2053,14 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // both disclose another task's state.
         24 => scheduler::task_stat(arg1 as usize).endpoint as i64,
         25 => crate::ipc::routing::call_await_endpoint(arg1 as usize) as i64,
+        // 26: fault diagnostics written WITHOUT the serial lock, and so possibly spliced into another
+        // line (audits/kernel-audit.md Audit 10). A residual, not a defect count: when a fault
+        // interrupts a `kprintln` on its own core the handler cannot wait for the lock it already
+        // holds, and writing unlocked is the only way to report the fault at all. This says how often
+        // that happened, so a corrupted line in the log is explainable rather than mysterious - the
+        // whole reason the splice cost two wrong diagnoses before it was understood. 0 means every
+        // diagnostic this boot was emitted cleanly.
+        26 => crate::arch::imp::serial_unlocked_emit_count() as i64,
         2 => {
             // Endpoint generation by name.
             let len = arg2 as usize;

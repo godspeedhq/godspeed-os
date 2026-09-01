@@ -581,6 +581,67 @@ pub fn serial_write_byte(b: u8) {
     }
 }
 
+/// Times a fault diagnostic had to be written UNLOCKED, and so may have spliced another line.
+static SERIAL_UNLOCKED_EMITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many fault diagnostics were written without the lock, and so may appear spliced into another
+/// line. Zero means every diagnostic in this boot was emitted cleanly.
+pub fn serial_unlocked_emit_count() -> u64 {
+    SERIAL_UNLOCKED_EMITS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Take `SERIAL_LOCK` around a fault diagnostic, if it can be taken SAFELY and QUICKLY.
+///
+/// The fault handlers print with the `_nolck` writers because they may have interrupted a `kprintln`
+/// on this very core that holds the lock; blocking on it would deadlock. That reasoning is sound for
+/// that case and ONLY that case. Bypassing the lock unconditionally also bypasses it when another
+/// core is mid-line, and the two lines then interleave byte by byte - the corruption recorded in
+/// `audits/kernel-audit.md` Audit 10, which produced both false FAILures and a false PASS in §22.
+///
+/// So it spins BRIEFLY and takes the lock if it comes free, and writes unlocked otherwise - which
+/// covers both cases with one rule and no bookkeeping. When the holder is THIS core the spin simply
+/// expires and we write unlocked, exactly as before; that costs a few microseconds on a path that is
+/// already reporting a fault.
+///
+/// It deliberately does NOT identify the lock's owner to skip that spin. The first version did, and
+/// the owner had to be recorded by the ordinary writers - which meant an APIC MMIO read
+/// (`current_core_id`) on EVERY serial write, on a path that also runs during early boot BEFORE the
+/// APIC is initialised, violating that function's stated precondition. It made A8/A9/A10 fail
+/// reproducibly. A cheap rule that is always correct beats an optimisation that has to be maintained
+/// by the hot path (§26.13).
+///
+/// Returns whether the lock is held and must be released.
+pub fn serial_fault_lock_acquire() -> bool {
+    use core::sync::atomic::Ordering;
+    let mut t = 0u32;
+    while t < SERIAL_FAULT_SPIN_CAP {
+        if SERIAL_LOCK
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+        core::hint::spin_loop();
+        t += 1;
+    }
+    SERIAL_UNLOCKED_EMITS.fetch_add(1, Ordering::Relaxed);
+    false
+}
+
+/// Release what `serial_fault_lock_acquire` took. A no-op when it did not take it.
+pub fn serial_fault_lock_release(held: bool) {
+    use core::sync::atomic::Ordering;
+    if held {
+        SERIAL_LOCK.store(false, Ordering::Release);
+    }
+}
+
+/// Spin budget for the FAULT path - microseconds, not milliseconds. An ordinary writer can afford to
+/// wait out a whole line; a fault handler cannot, and the fallback (write unlocked, exactly as before)
+/// is always available. Small enough that the same-core case - where the spin can never succeed -
+/// costs almost nothing.
+const SERIAL_FAULT_SPIN_CAP: u32 = 2_000;
+
 /// Spin cap for best-effort `SERIAL_LOCK` acquisition (~seconds on real HW).
 const SERIAL_LOCK_SPIN_CAP: u32 = 5_000_000;
 /// Spin cap for the COM1 THRE (transmit-holding-register-empty) poll.
