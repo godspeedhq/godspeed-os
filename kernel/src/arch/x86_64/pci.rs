@@ -888,6 +888,10 @@ pub fn program_xhci_msi() -> bool {
 /// hardware (ARAT `hlt` idle) does not service promptly (§12). Falls back to the BSP if that core is not
 /// ready (single-core), where the driver runs on the BSP anyway. Previously hardcoded core 1, which had
 /// drifted away from the drivers' actual cores (2/3) - the co-location is now real (docs/power.md).
+/// The LAPIC id an allocated pool vector should be delivered to. Same rule as the named USB
+/// vectors: the core the owning driver is pinned to, so a device event wakes that core directly.
+pub fn msi_dest_lapic(core_id: u32) -> u8 { usb_irq_dest_lapic(core_id) }
+
 fn usb_irq_dest_lapic(driver_core: u32) -> u8 {
     if crate::smp::core::is_ready(driver_core) {
         crate::smp::core::core_lapic_id(driver_core) as u8

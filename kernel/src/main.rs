@@ -358,12 +358,19 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
         );
         log_idle_tick_config();
 
-        // Interrupt-driven USB (§12): program the xHCI's MSI now that the APs are up, so it
-        // targets the xHCI driver's core (core 1) - a keypress then wakes that core straight
-        // out of its idle `hlt`, no cross-core wake. (The EHCI was programmed earlier, before
-        // the firmware handoff, routed to the BSP; see above.) The interrupter stays OFF until
-        // the userspace driver enables it, so nothing fires yet.
-        arch::imp::pci::program_xhci_msi();
+        // The xHCI's MSI used to be programmed HERE, with the kernel's own `XHCI_MSI_VECTOR`
+        // constant. It is not any more: the driver names its device by PCI class code and asks for
+        // an interrupt, so the kernel allocates a pool vector and programs it AT SPAWN
+        // (`task::pci_msi_vector`, step D1b) - which happens after this point, and overwrote
+        // whatever was set here.
+        //
+        // The write is deleted rather than left as a harmless duplicate, because it is not
+        // harmless: a dead write to a device register that a later write always replaces would
+        // keep working if the pool path were ever removed, hiding the regression instead of
+        // failing loudly (invariant 12). One writer, at the point the vector is decided.
+        //
+        // The EHCI is still on the named path (it names `HwClass::Ehci`) and is programmed earlier,
+        // before the firmware handoff, routed to the BSP; see above.
 
         task::scheduler::run(0)
     }

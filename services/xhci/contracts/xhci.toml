@@ -15,8 +15,24 @@ limit   = "64MiB"
 
 [capabilities]
 ipc_receive = ["xhci"]
-hw_device   = "xhci"
-hw_interrupt = [40]   # 0x28
+# The device is named by its PCI CLASS CODE - the industry-standard (class, subclass, prog-if)
+# triple - not by a name the kernel was taught. 0x0C0330 is class 0x0C serial bus, subclass 0x03 USB,
+# prog-if 0x30 xHCI, and it means that on every machine ever built. The kernel holds no name for it:
+# the boot scan records what the bus reports and this code selects from it, so this driver is
+# addable with NO KERNEL CHANGE (step D1, docs/service-ownership.md §5).
+#
+# `hw_pci_bar` is an INDEX, not an address - xHCI puts its registers in BAR0 where AHCI uses BAR5 -
+# so the kernel still supplies the value from its own scan. Both are reconciled against the
+# supervisor's spawn row by scripts/contract_check.py (Commandment III).
+hw_pci_class = "0c0330"
+hw_pci_bar = 0
+# NO VECTOR NUMBER, deliberately. This used to read `hw_interrupt = [40]`, back when the kernel held
+# a constant named XHCI_MSI_VECTOR. Routing a vector is AUTHORITY, not a setting (step C): a caller
+# that could name one could ask to be handed another device's interrupts. So the driver declares
+# only that it NEEDS an interrupt, and the kernel allocates one from its MSI pool at spawn and
+# programs the device with it. Which vector it gets is a runtime fact, printed at boot ("pci-msi:"),
+# and is not written down anywhere - exactly as the BAR address is not.
+hw_pci_irq = true
 log_write   = true
 
 [placement]

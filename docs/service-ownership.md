@@ -423,16 +423,51 @@ pci:   AHCI class 0x010601 AGREES (BAR5 0xfebd9000 BDF 0x00fa)
 pci:   NIC  class 0x020000 AGREES (BAR0 0xfeb80000 BDF 0x0010)
 ```
 
-**What D1 does NOT yet do: interrupts.** A driver spawned by class code gets MMIO, DMA and its BDF -
-but no vector. The named classes return a vector the kernel assigned and programmed into the device's
-MSI at boot; doing that for a device the kernel cannot name means allocating from a vector POOL and
-programming MSI generically. `program_msi(bdf, vector, dest)` is already generic - what is missing is
-the pool and an IDT stub per vector in it, which is naked assembly and boot-critical. It is squarely
-the kernel's work (interrupt routing is one of the six, §4.3), so it belongs there rather than in the
-caller, and it wants its own hardware round rather than being written alongside something else.
+### D1b (BUILT): the MSI vector pool - an interrupt without a name
 
-So today: a ported driver that POLLS needs no kernel change. One that needs an interrupt still does.
-That is the honest edge of D1 and the next piece of work.
+D1 left one thing forcing a kernel rebuild: a driver spawned by class code got MMIO, DMA and its BDF,
+but **no vector**. The named classes each had a constant the kernel was taught (`XHCI_MSI_VECTOR`,
+`EHCI_MSI_VECTOR`) with its own hand-written IDT stub, so a device the kernel had no name for had no
+vector to be given. A ported driver that polls needed no kernel change; one that wanted an interrupt
+still did - which is most real drivers.
+
+**The pool is eight anonymous vectors** (`MSI_POOL_BASE = 0x30`, `MSI_POOL_LEN = 8`) with identical
+stubs, handed to devices as they spawn. Nothing in the kernel knows what any of them is FOR: a vector
+is allocated to a device, written into that device's own MSI message-data register, and delivered to
+whichever endpoint registered the route (§12.2) - exactly what the two named vectors do, minus the
+name. Eight, and bounded on purpose (§26.6): the busiest board here presents three interrupt-driven
+devices, and exhaustion is REPORTED rather than silently leaving a driver without interrupts.
+
+**A vector number is still authority, and callers still cannot name one.** This is the part that had
+to stay true. Step C established that a caller may not ask for a specific IRQ, because a caller that
+could would be asking to be handed another device's interrupts. The pool does not weaken that: the
+driver declares only `hw_pci_irq = true` - that it NEEDS an interrupt - and the kernel decides which.
+Which vector it got is a runtime fact printed at boot, exactly as the BAR address is:
+
+```
+pci-msi: class 0x0c0330 BDF 0x0020 -> vector 0x30 (pool slot 0)
+```
+
+**Allocated per DEVICE, not per spawn**, and that is what makes a restart work. The vector is written
+into the device's own register, so a respawned driver must be handed the SAME one back - a fresh
+vector each time would both exhaust the pool after eight restarts and leave the controller raising an
+interrupt nobody routes. Same reasoning as the permanent DMA reservation beside it.
+
+**`xhci` is the caller, chosen as the strictest test available.** It is the only IOMMU-CONFINED
+driver, it needs the largest arena (292 pages), and §22 Test 12 checks the entire chain end to end
+rather than any one link: confined to its arena, the page past it unmapped, and a keyboard actually
+enumerated THROUGH the confined domain - on a pool vector, with the kernel holding no name for the
+device. That test passes.
+
+Programming it at spawn also made the kernel's boot-time write to the same register dead, so it was
+deleted rather than left as a harmless duplicate. It is not harmless: a write that a later write
+always replaces keeps working if the later one is ever removed, which hides the regression instead of
+failing loudly (invariant 12). One writer, at the point the vector is decided.
+
+**So D1 + D1b together: a driver for any PCI device this kernel has never heard of - registers, DMA
+arena, bus-master enable and interrupt - needs NO kernel change.** That was the goal.
+
+The remaining gap is not interrupts, it is arches: only x86_64 fills the device table (below).
 
 **Per-arch state.** x86_64 fills the table. arm32 never will - it has no PCI at all, the DWC2 is
 soldered, and every driver there names a non-PCI kind. aarch64 is a real GAP rather than a
@@ -1101,12 +1136,20 @@ does the service still call the syscall?
   arbitrary name to the probe binary at all and an unknown name is refused outright. The reservation
   had no callers left, and a dead guard that still looks live is worse than none. Pinned by A9b.
 
-  What REMAINS is the step-C widening proper, and it is wider than the probe path was: `SpawnImage`
-  takes a caller-supplied image, so a SPAWN holder can start ARBITRARY BYTES under a real service's
-  name in the window while that service is dead. It is bounded only by `AlreadyRunning`. Step 2
-  (signed packages) is the answer; a cheaper interim would be to gate `SpawnImage` behind a
-  capability only the supervisor holds, since nothing else legitimately calls it - shell, chaos,
-  control and the probes all ask the supervisor instead.
+  What REMAINED is the step-C widening proper, and it was wider than the probe path was: `SpawnImage`
+  takes a caller-supplied image, so a SPAWN holder could start ARBITRARY BYTES under a real service's
+  name in the window while that service is dead, bounded only by `AlreadyRunning`.
+
+  **The interim named here is now BUILT: `SpawnImage` is gated behind `IMAGE_SPAWN`**, a capability
+  only the supervisor holds. Nothing else legitimately calls it - shell, chaos, control and the
+  probes all ask the supervisor instead - so the gate costs nothing and removes "any SPAWN holder"
+  from the sentence above. Holding SPAWN now lets a caller start a service the supervisor already
+  knows; introducing NEW CODE takes a separate capability.
+
+  That narrows the window rather than closing it: the supervisor is still trusted with arbitrary
+  bytes, so a runtime-compromised supervisor can still introduce code. Step 2 (signed packages) is
+  the answer to that, and remains open. The honest statement is that step C's widening is now
+  bounded to ONE principal instead of every SPAWN holder (§26.7).
 
 - **`probe` is the last non-supervisor row.** It needs two things, both of which fit the existing
   model: a `SPAWN_FLAG_PEERS_GRANT` bit (`probe-5a-send` gets grantable peer caps, which the

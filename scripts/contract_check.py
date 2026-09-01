@@ -58,8 +58,13 @@ def parse_toml(path: Path) -> dict:
     m = re.search(r'hw_pci_class\s*=\s*"([0-9a-fA-F]+)"', text)
     if m:
         bar = re.search(r'hw_pci_bar\s*=\s*(\d+)', text)
-        return_pci = "pci:%s:%s" % (m.group(1).lower().lstrip("0") or "0",
-                                    bar.group(1) if bar else "0")
+        # An interrupt is authority, so whether the driver gets one is part of what is reconciled:
+        # a contract that stopped declaring `hw_pci_irq` while the spawn row still asked for a vector
+        # would be a driver holding authority its contract does not admit to.
+        irq = re.search(r'hw_pci_irq\s*=\s*true', text)
+        return_pci = "pci:%s:%s:%s" % (m.group(1).lower().lstrip("0") or "0",
+                                       bar.group(1) if bar else "0",
+                                       "irq" if irq else "noirq")
     else:
         return_pci = None
 
@@ -209,9 +214,10 @@ def _supervisor_hw_device(name: str):
     # compares against the contract's `hw_pci_class` / `hw_pci_bar` without either side needing a
     # table of names. A checker that had to know that 0x010601 means "ahci" would be the very
     # kernel-side device knowledge step D1 removes, one layer up.
-    m = re.search(r"hwclass::pci\(\s*0x([0-9a-fA-F_]+)\s*,\s*(\d+)", row)
+    m = re.search(r"hwclass::pci(_irq)?\(\s*0x([0-9a-fA-F_]+)\s*,\s*(\d+)", row)
     if m:
-        return "pci:%s:%s" % (m.group(1).replace("_", "").lower().lstrip("0") or "0", m.group(2))
+        return "pci:%s:%s:%s" % (m.group(2).replace("_", "").lower().lstrip("0") or "0",
+                                 m.group(3), "irq" if m.group(1) else "noirq")
 
     m = re.search(r"hwclass::(\w+)", row)
     if not m or m.group(1) == "NONE":

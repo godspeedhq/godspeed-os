@@ -27,11 +27,72 @@ const LIMINE_CONF: &str = r#"timeout: -1
     kernel_path: boot():/kernel.elf
 "#;
 
+/// Refuse to write an image whose supervisor embeds a STALE copy of a service.
+///
+/// The supervisor `include_bytes!`s every service, so it must be built AFTER all of them. If it is
+/// built first, cargo happily reuses the previous run's binaries and the image ships services one
+/// build behind, next to a current kernel. Nothing fails and nothing warns: a stale file is not a
+/// missing one. The machine then runs yesterday's code while the log, the source and the commit all
+/// say otherwise - so a hardware result is read as evidence about code that was never running.
+///
+/// This is not hypothetical. `scripts/arm_build.py` built the supervisor at index 4 of 24 and
+/// `scripts/pi4_build.py` at index 6 of 24, so on BOTH Pi ports every image carried stale copies of
+/// everything built after it. `scripts/embed_order_check.py` closed it there.
+///
+/// It is checked HERE, in the two functions that write an image, rather than after each of the 34
+/// supervisor build sites: ordering is a convention, and a convention visible only as a list's index
+/// order is one edit away from being wrong again. No image can be written without passing this.
+///
+/// Only a WARNING when the timestamps are merely equal-or-close, and fatal only when a service is
+/// genuinely newer - a rebuild that touches nothing leaves mtimes untouched, which is fine.
+fn assert_embed_order(kernel_elf: &Path) {
+    let outdir = match kernel_elf.parent() { Some(d) => d, None => return };
+    let sup = outdir.join("supervisor");
+    let sup_mtime = match std::fs::metadata(&sup).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        // No supervisor binary next to the kernel: this is a build layout the check does not know
+        // (a test image, another target dir). Say so rather than passing silently - an unrun check
+        // that prints nothing is indistinguishable from one that passed (invariant 12).
+        Err(_) => {
+            println!("embed-order: no supervisor beside {} - ordering NOT checked",
+                     kernel_elf.display());
+            return;
+        }
+    };
+
+    let mut stale: Vec<String> = Vec::new();
+    let entries = match std::fs::read_dir(outdir) { Ok(e) => e, Err(_) => return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_file() { continue; }
+        let name = match p.file_name().and_then(|n| n.to_str()) { Some(n) => n, None => continue };
+        // Only the service binaries: no extension, and not the supervisor or kernel themselves.
+        if name == "supervisor" || name == "kernel" || p.extension().is_some() { continue; }
+        if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+            if t > sup_mtime { stale.push(name.to_string()); }
+        }
+    }
+
+    if !stale.is_empty() {
+        stale.sort();
+        eprintln!("
+embed-order: the SUPERVISOR IS OLDER than {} service(s) it embeds:", stale.len());
+        eprintln!("    {}", stale.join(", "));
+        eprintln!("
+An image written now would carry the PREVIOUS build of those, beside a current");
+        eprintln!("kernel - silently. Build the supervisor LAST (after every other service), then");
+        eprintln!("the kernel. Refusing to write the image.
+");
+        std::process::exit(1);
+    }
+}
+
 /// Build a bootable disk image at `image_path`.
 ///
 /// Lower-level version of `create`; used when a non-default image path is
 /// needed (e.g. the bad-supervisor test image for §22 Test 1B).
 pub fn create_at(kernel_elf: &Path, limine_dir: &Path, image_path: &Path) -> PathBuf {
+    assert_embed_order(kernel_elf);
     if let Some(parent) = image_path.parent() {
         std::fs::create_dir_all(parent).expect("failed to create image parent dir");
     }
@@ -250,6 +311,7 @@ pub fn create_uefi(kernel_elf: &Path, limine_dir: &Path) -> PathBuf {
 }
 
 pub fn create_uefi_at(kernel_elf: &Path, limine_dir: &Path, image_path: &Path) -> PathBuf {
+    assert_embed_order(kernel_elf);
     if let Some(p) = image_path.parent() {
         std::fs::create_dir_all(p).expect("create image parent dir");
     }

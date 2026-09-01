@@ -328,6 +328,10 @@ pub mod hwclass {
     pub const PCI:         u32 = 1 << 31;
     /// Bit 28: place this device behind the IOMMU (§6.4).
     pub const PCI_CONFINE: u32 = 1 << 28;
+    /// Bit 29: this driver wants an INTERRUPT. The kernel allocates a vector from its MSI pool and
+    /// programs the device with it - the caller never names a vector, because routing one is
+    /// authority (`task::hw_irqs_for`).
+    pub const PCI_IRQ:     u32 = 1 << 29;
 
     /// Describe a PCI device by what the BUS says it is: the industry-standard 24-bit
     /// (class, subclass, prog-if) triple, plus which BAR holds its registers.
@@ -338,6 +342,11 @@ pub mod hwclass {
     /// (xHCI 0, AHCI 5), and an INDEX is not an address, so it is safe to accept from a caller.
     pub const fn pci(class_code: u32, bar_ix: u32, confine: bool) -> u32 {
         PCI | (if confine { PCI_CONFINE } else { 0 }) | ((bar_ix & 0x7) << 24) | (class_code & 0x00FF_FFFF)
+    }
+
+    /// `pci`, for a driver that needs an INTERRUPT as well.
+    pub const fn pci_irq(class_code: u32, bar_ix: u32, confine: bool) -> u32 {
+        pci(class_code, bar_ix, confine) | PCI_IRQ
     }
 }
 

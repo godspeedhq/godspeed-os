@@ -157,6 +157,107 @@ unsafe extern "C" fn uart_rx_irq_handler() {
 // xHCI MSI ISR (vector = irq 0x28) - USB host-controller interrupt (§12).
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// THE MSI VECTOR POOL (step D1b)
+//
+// `XHCI_MSI_VECTOR` and `EHCI_MSI_VECTOR` below are vectors the kernel was TAUGHT: one constant per
+// device class it knows, each with its own stub. A driver for a device nobody taught it about could
+// therefore get MMIO, DMA and its BDF from the generic device table - and no interrupt, because
+// there was no vector to give it. That is the last thing forcing a kernel rebuild to port an
+// interrupt-driven driver.
+//
+// The pool is eight anonymous vectors with identical stubs, handed out to devices as they are
+// spawned. Nothing here knows what any of them is FOR: a vector is allocated to a device, written
+// into that device's MSI message-data register, and delivered to whichever endpoint registered the
+// route (§12.2) - exactly what the two named vectors do, minus the name.
+//
+// EIGHT, and bounded on purpose (§26.6): every board here presents fewer interrupt-driven devices
+// than that (the Wyse, the busiest, has three), and exhaustion is reported rather than silently
+// leaving a driver without interrupts.
+//
+// The range is clear of everything the IDT already installs: 0-31 CPU exceptions, 32 timer, 33 the
+// FireIrq test vector, 36 COM1, 0x28/0x29 the two named MSIs, 0x80 syscall, 0xF0-0xF2 IPIs, 0xFF.
+pub const MSI_POOL_BASE: u8 = 0x30;
+pub const MSI_POOL_LEN:  usize = 8;
+
+/// Generate one pool vector: a naked stub that saves the caller-saved registers, calls its handler,
+/// restores and `iretq`s - byte-for-byte the shape `xhci_msi_isr_stub` uses, which is the one that
+/// has run on four machines.
+///
+/// `sym` rather than a literal symbol name in the asm: the existing stubs call
+/// `"call xhci_msi_handler"` and rely on `#[no_mangle]` to make that resolve, which works but ties
+/// correctness to a name that nothing checks. `sym` makes the linker prove it.
+macro_rules! msi_pool_vector {
+    ($stub:ident, $handler:ident, $vec:expr) => {
+        /// # Safety
+        /// Called from raw interrupt context (IF=0).
+        unsafe extern "C" fn $handler() {
+            // SAFETY: called from the IDT stub with IF=0. `deliver` routes to the registered
+            // endpoint and EOIs; with no route registered it discards and still EOIs.
+            unsafe { dispatch_irq($vec); }
+        }
+
+        #[unsafe(naked)]
+        pub unsafe extern "C" fn $stub() {
+            // SAFETY: raw interrupt entry; all register saves are explicit.
+            core::arch::naked_asm!(
+                "test byte ptr [rsp + 8], 3",
+                "jz 1f",
+                "swapgs",
+                "1:",
+                "push rax",
+                "push rcx",
+                "push rdx",
+                "push rdi",
+                "push rsi",
+                "push r8",
+                "push r9",
+                "push r10",
+                "push r11",
+                "call {handler}",
+                "pop r11",
+                "pop r10",
+                "pop r9",
+                "pop r8",
+                "pop rsi",
+                "pop rdi",
+                "pop rdx",
+                "pop rcx",
+                "pop rax",
+                "test byte ptr [rsp + 8], 3",
+                "jz 2f",
+                "swapgs",
+                "2:",
+                "iretq",
+                handler = sym $handler,
+            )
+        }
+    };
+}
+
+msi_pool_vector!(msi_pool_isr_0, msi_pool_handler_0, MSI_POOL_BASE);
+msi_pool_vector!(msi_pool_isr_1, msi_pool_handler_1, MSI_POOL_BASE + 1);
+msi_pool_vector!(msi_pool_isr_2, msi_pool_handler_2, MSI_POOL_BASE + 2);
+msi_pool_vector!(msi_pool_isr_3, msi_pool_handler_3, MSI_POOL_BASE + 3);
+msi_pool_vector!(msi_pool_isr_4, msi_pool_handler_4, MSI_POOL_BASE + 4);
+msi_pool_vector!(msi_pool_isr_5, msi_pool_handler_5, MSI_POOL_BASE + 5);
+msi_pool_vector!(msi_pool_isr_6, msi_pool_handler_6, MSI_POOL_BASE + 6);
+msi_pool_vector!(msi_pool_isr_7, msi_pool_handler_7, MSI_POOL_BASE + 7);
+
+/// Entry-point address of pool stub `i`, for the IDT install in `boot.rs`.
+pub fn msi_pool_stub(i: usize) -> u64 {
+    (match i {
+        0 => msi_pool_isr_0 as *const (),
+        1 => msi_pool_isr_1 as *const (),
+        2 => msi_pool_isr_2 as *const (),
+        3 => msi_pool_isr_3 as *const (),
+        4 => msi_pool_isr_4 as *const (),
+        5 => msi_pool_isr_5 as *const (),
+        6 => msi_pool_isr_6 as *const (),
+        _ => msi_pool_isr_7 as *const (),
+    }) as u64
+}
+
 /// IDT vector AND `IRQ_TABLE` index for the xHCI controller's MSI. MSI lets us pick the
 /// vector freely (it is written into the device's message-data register), so vector and
 /// the route's pseudo-irq are the same number - no PCI interrupt-line / IOAPIC GSI mapping.

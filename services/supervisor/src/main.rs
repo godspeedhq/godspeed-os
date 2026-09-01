@@ -349,7 +349,16 @@ const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("xhci", XHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      64 * 1024 * 1024, 2, &[],
      godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
-     godspeed_sdk::service_context::hwclass::XHCI),
+     // Named by the bus, WITH an interrupt (step D1b). 0x0C0330 is the industry-standard class code
+     // for an xHCI USB controller - class 0x0C serial bus, subclass 0x03 USB, prog-if 0x30 xHCI -
+     // and its registers are in BAR0. `pci_irq` asks the kernel for a vector from its MSI pool; the
+     // caller never names one, because routing a vector is authority.
+     //
+     // This is the strictest driver to move: it is the only one that is IOMMU-CONFINED, it needs the
+     // largest DMA arena (292 pages for the 256-buffer scratchpad), and §22 Test 12 checks the whole
+     // chain end to end - confined to its arena, out-of-arena unmapped, and a keyboard actually
+     // enumerated THROUGH the confined domain.
+     godspeed_sdk::service_context::hwclass::pci_irq(0x0C_03_30, 0, true)),
     ("ehci", EHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      64 * 1024 * 1024, 3, &[],
      godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
@@ -406,6 +415,8 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
     req.dma_pages    = match name {
         // 64 KiB - the size `HwClass::Ahci` implied before the class had a name in the kernel.
         "block-driver" => 16,
+        // 32 rings + a 256-buffer scratchpad + 4 - the size `XHCI_DMA_PAGES` held in the kernel.
+        "xhci" => 32 + 256 + 4,
         _ => 0,
     };
     // Peers likewise: a caller that has caps to provide passes them, otherwise the declared list.

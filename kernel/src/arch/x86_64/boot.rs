@@ -1460,6 +1460,14 @@ pub(super) unsafe fn init_idt() {
             IdtEntry::new(super::interrupts::xhci_msi_isr_stub as *const () as u64);
         idt[super::interrupts::EHCI_MSI_VECTOR as usize] =
             IdtEntry::new(super::interrupts::ehci_msi_isr_stub as *const () as u64);
+        // The MSI vector POOL (step D1b): eight anonymous vectors handed out to devices the kernel
+        // has no name for. Installed unconditionally and harmless until one is allocated - an
+        // unrouted vector is discarded by `route::deliver`, exactly as the two named ones are before
+        // their driver spawns.
+        for i in 0..super::interrupts::MSI_POOL_LEN {
+            idt[super::interrupts::MSI_POOL_BASE as usize + i] =
+                IdtEntry::new(super::interrupts::msi_pool_stub(i));
+        }
         idt[0x80] = IdtEntry::new_user(super::syscall_entry::int80_entry as *const () as u64);
         idt[0xF0] = IdtEntry::new(ipi_wake_stub   as *const () as u64);
         idt[0xF1] = IdtEntry::new(ipi_tlb_stub    as *const () as u64);

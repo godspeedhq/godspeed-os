@@ -616,6 +616,61 @@ pub fn hw_class_known(class: u32) -> bool {
 pub const HW_PCI_FLAG: u32 = 1 << 31;
 /// `hw_flags` bit 28: put this device behind the IOMMU (§6.4).
 pub const HW_PCI_CONFINE: u32 = 1 << 28;
+/// `hw_flags` bit 29: this driver wants an INTERRUPT - allocate a vector from the MSI pool and
+/// program the device's MSI with it (step D1b).
+pub const HW_PCI_IRQ: u32 = 1 << 29;
+
+/// The MSI vector allocated to each PCI device, indexed by its slot in the scan table. 0 = none yet.
+///
+/// Per DEVICE, not per spawn, and that is what makes a restart work: the vector is written into the
+/// device's own MSI register, so a respawned driver must be given the SAME one back - allocating a
+/// fresh vector each time would both exhaust the pool after eight restarts and leave the controller
+/// raising an interrupt nobody routes. Same reasoning as the permanent DMA reservation beside it.
+static PCI_MSI_VEC: [core::sync::atomic::AtomicU8; crate::arch::imp::pci::MAX_DEVICES] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; crate::arch::imp::pci::MAX_DEVICES];
+
+/// Next free slot in the MSI pool. Monotonic: a vector is never returned, because the device it was
+/// written into keeps using it for the life of the boot.
+static MSI_POOL_NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The vector this PCI device should raise, allocating and programming one on first use.
+///
+/// Returns 0 when there is nothing to route: no such device, the pool is exhausted, or the device
+/// refused MSI. Every one of those is reported - a driver silently left without interrupts presents
+/// later as a device that never responds, which is the diagnosis this saves (invariant 12).
+fn pci_msi_vector(class_code: u32, core_id: u32) -> u8 {
+    use core::sync::atomic::Ordering;
+    let Some(d) = crate::arch::imp::pci::find_by_class(class_code) else { return 0 };
+    if d.index >= crate::arch::imp::pci::MAX_DEVICES { return 0; }
+
+    let existing = PCI_MSI_VEC[d.index].load(Ordering::Relaxed);
+    if existing != 0 { return existing; }   // a restart: same device, same vector
+
+    let slot = MSI_POOL_NEXT.fetch_add(1, Ordering::Relaxed) as usize;
+    if slot >= crate::arch::imp::interrupts::MSI_POOL_LEN {
+        crate::kprintln!(
+            "pci-msi: pool exhausted ({} vectors) - class {:#08x} gets NO interrupt and must poll",
+            crate::arch::imp::interrupts::MSI_POOL_LEN, class_code);
+        return 0;
+    }
+    let vector = crate::arch::imp::interrupts::MSI_POOL_BASE + slot as u8;
+
+    // Deliver to the core the driver is pinned to, so a device event wakes that core directly out
+    // of its idle halt rather than via a cross-core IPI - the same reasoning the named vectors use.
+    let dest = crate::arch::imp::pci::msi_dest_lapic(core_id);
+    if !crate::arch::imp::pci::program_msi(d.bdf, vector, dest)
+        && !crate::arch::imp::pci::program_msix(d.bdf, vector, dest)
+    {
+        crate::kprintln!(
+            "pci-msi: BDF {:#06x} (class {:#08x}) accepted neither MSI nor MSI-X - no interrupt, must poll",
+            d.bdf, class_code);
+        return 0;
+    }
+    PCI_MSI_VEC[d.index].store(vector, Ordering::Relaxed);
+    crate::kprintln!("pci-msi: class {:#08x} BDF {:#06x} -> vector {:#04x} (pool slot {})",
+                     class_code, d.bdf, vector, slot);
+    vector
+}
 
 /// Decode a `hw_flags` PCI descriptor: `bit31 | confine<<28 | bar_ix<<24 | class_code`.
 fn hw_pci_of(class: u32, dma_pages: u32) -> HwClass {
@@ -687,6 +742,9 @@ fn hw_irqs_for(class: HwClass) -> &'static [u8] {
         // interrupt: it must poll. The four existing drivers keep their named classes and their
         // vectors, so nothing regresses - but a new driver that needs an interrupt still waits on
         // this. Stated rather than papered over (§26.7).
+        // Resolved at the SPAWN SITE instead, by `pci_msi_vector`: allocating a vector needs the
+        // core the driver will run on (for the delivery destination), and this returns a 'static
+        // slice which an allocated value cannot live in.
         HwClass::Pci { .. } => &[],
     }
 }
@@ -1102,8 +1160,18 @@ pub fn spawn_from_image(
 
     let hw = if hw_class & HW_PCI_FLAG != 0 { hw_pci_of(hw_class, dma_pages) }
              else { hw_class_of(hw_class) };
+
+    // A PCI driver that asked for an interrupt gets a pool vector, allocated once per DEVICE and
+    // programmed into its MSI. Held in a local so it can be passed as a slice - `hw_irqs_for`
+    // returns 'static and cannot carry an allocated value.
+    let pci_irq: [u8; 1] = match hw {
+        HwClass::Pci { class_code, .. } if hw_class & HW_PCI_IRQ != 0 =>
+            [pci_msi_vector(class_code, core_id)],
+        _ => [0],
+    };
+    let irqs: &[u8] = if pci_irq[0] != 0 { &pci_irq } else { hw_irqs_for(hw) };
     let result = spawn_service_with_image(name, image, core_id, has_recv_endpoint, peers, mode,
-                                          peers_grant, mem, hw_irqs_for(hw), has_console_read,
+                                          peers_grant, mem, irqs, has_console_read,
                                           Some(privileges), Some(hw), installs);
     if let Err(ref e) = result {
         crate::kprintln!("task: SpawnImage '{}' failed: {:?}", name, e);
