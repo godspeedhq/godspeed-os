@@ -1706,6 +1706,50 @@ The residual is REPORTED rather than left silent: `InspectKernel` query 26 retur
 diagnostics were written unlocked. 0 means every diagnostic that boot was emitted cleanly. It is
 ungated - a kernel-health counter that discloses no task state.
 
+### HARDWARE-CONFIRMED (2026-09-01, T630), and what is left
+
+The T630 ran 8 selfchecks (all 0 fails) and 4 chaos runs of 100 rounds, with the keyboard moved from
+EHCI to xHCI mid-session. 0 kernel panics, 0 liveness wedges.
+
+**The class this fix targets is gone.** The canary is the chaos report line - peak concurrent logging,
+and the line that came out unreadable on both the Pi 4 and the T630 before:
+
+```
+before:  total: 100 bouods, 58E kClls, 4=7 0looded, 100 6emcpressuxe, 100 spawns. k rnel:xhci...
+after:   total: 100 rounds, 622 kills, 519 flooded, 100 mem-pressure, 100 spawns. kernel: alive
+```
+
+Intact all four times. Mid-token corruption measured across the whole log: **0 in 55,457 lines**,
+against 2 in 27,485 lines before - twice the output, none of the damage. In QEMU, `osdev test adv`
+went to 15/0 on three consecutive runs, the best that suite has ever been (15/0, 14/1, 13/2, 15/0,
+14/1 beforehand).
+
+**RESIDUAL, RECORDED NOT FIXED: line-boundary joins from the CONSOLE path.**
+
+About 2,980 lines in that same log (~5%) carry a short fragment glued to their START, e.g.
+
+```
+[15:17:14.025] seehci: SPLIT device (hub port 4): VID=0x046d PID=0xc30a
+```
+
+where `se` belongs to another message. This is a DIFFERENT mechanism and predates this fix:
+`console_write_byte` takes `SERIAL_LOCK` **per byte**, so console output (shell echo, a service's
+chaos report) interleaves with log lines at byte granularity. The commit that fixed the fault path
+added a function and removed or modified NOTHING in `serial_write_byte` or
+`serial_write_bytes_lockfree` - the diff shows additions only - so this class cannot have come from it.
+
+**Why it is left, and why that is not the same judgement as before.** These joins prepend or append
+fragments; they do NOT corrupt line interiors. That is measurable, not assumed: the mid-token count is
+0 while these number in the thousands. It is also exactly why `adv` reaches 15/0 - a substring match
+still finds its expected text contiguous. The fault-path splice could split a line THROUGH the matched
+text, which is what produced false failures AND the false PASS on A6. So the class that made the test
+suite lie is closed; what remains makes logs untidy.
+
+Fixing it means batching console output into whole lines before taking the lock, which is a real change
+to the INTERACTIVE path (keystroke echo is inherently per-byte) for a cosmetic gain. Recorded here so
+the next reader knows it is a known residual with a known cause and a known cost, rather than
+rediscovering it as a mystery (§26.7).
+
 ### The mechanism (AS ORIGINALLY WRITTEN - see the correction above)
 
 Both writers are already line-atomic by design. `kprintln!` and the service `log` syscall share
