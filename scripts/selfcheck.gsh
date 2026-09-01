@@ -29,6 +29,14 @@
 # #  is a `run <file>`-time feature, shown (not run) near the bottom.       #
 # ##########################################################################
 
+# WHICH BUILD IS THIS? First line of the run, before any test, because a serial log that cannot
+# identify its own image is worth less than it looks. A clean run proves nothing if nobody can say
+# WHICH build produced it - and a diagnostic that only speaks on FAILURE cannot prove it was even
+# present. That happened: a NIC fault was instrumented, the next hardware run came back clean, and
+# the log was equally consistent with "the fix shipped and the bug is rare" and "the old image was
+# still on the stick". `version` prints the git SHA stamped in at build time, so every log from here
+# answers that in its own first line.
+version
 echo ''
 echo '#################### gsh LANGUAGE TOUR ####################'
 if ls /tour { delete /tour recursive }    # an aborted run leaves it behind; mkdir would then fail
