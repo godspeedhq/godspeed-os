@@ -60,8 +60,26 @@ fn rpc(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
     if let Some(r) = ctx.request_with_reply(XHCI, &msg) {
         return Some(r);
     }
-    let _ = ctx.reacquire_by_name(XHCI);
-    ctx.request_with_reply(XHCI, &msg)
+    // WHEN BOTH ATTEMPTS FAIL, SAY WHETHER THE REACQUIRE WORKED. That is the one distinction left
+    // between the two causes this path can have, and they need opposite fixes:
+    //   reacquired, still silent -> the service is ALIVE but not answering (busy, or wedged)
+    //   reacquire FAILED          -> the name did not resolve; there is no live instance to reach
+    // A post-chaos Pi 2 sat in this state for 23 s across two selfcheck runs (99 file failures each)
+    // while dwc2 demonstrably held the disk, so "no answer" alone was not enough to act on.
+    //
+    // Logged only when the RETRY also fails, so an ordinary stale-cap recovery - which is the common
+    // case and works - stays silent.
+    let reacquired = ctx.reacquire_by_name(XHCI);
+    let out = ctx.request_with_reply(XHCI, &msg);
+    if out.is_none() {
+        ctx.log_fmt(format_args!(
+            "block-driver: '{}' did not answer, and the retry after reacquire {} - {}",
+            XHCI,
+            if reacquired { "reacquired OK" } else { "COULD NOT REACQUIRE" },
+            if reacquired { "the service is alive but silent (busy or wedged)" }
+            else { "the name does not resolve: no live instance" }));
+    }
+    out
 }
 
 /// How long to wait for `xhci` to report a capacity - a REAL DURATION, in milliseconds.
