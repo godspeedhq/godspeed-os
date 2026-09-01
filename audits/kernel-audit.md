@@ -1700,6 +1700,31 @@ So the failure mode is not "a test sometimes fails". It is **the oracle is unrel
 directions**: which way a given splice resolves depends only on where in the line it lands. A green
 suite is therefore weaker evidence than it looks, and that is the part worth acting on.
 
+### The clearest single instance, because it decomposes exactly
+
+```
+000000000000000 per_core_ursp=0x000000007ffffff8 GS.basead?=0xffff8v: A9c 000pass
+```
+
+That is two whole lines zipped together, and every byte of both survives:
+
+```
+GS.base | ad | ?=0xffff8 | v: A9c  | 000 | pass
+kernel  | svc| kernel    | svc     | ker | svc
+```
+
+`adv: A9c pass` is present with two insertions totalling twelve characters. Nothing was lost - the
+writers simply alternated. That is what a bounded-spin give-up produces, and it is why the corrupted
+line is close to the length of the original rather than mangled beyond recognition.
+
+It is also why the harness can now RECOGNISE one: a splice leaves the expected line as a subsequence
+broken by a FEW CONTIGUOUS runs of foreign bytes, where unrelated text containing the same letters
+needs many. Counting gaps (at most 4 insertions, at most 64 characters) separates them cleanly - it
+catches all four splices observed here and rejects prose that merely contains the letters in order.
+The first attempt used a length threshold instead and refused to judge anything under 24 characters,
+which excluded `adv: A9c pass` - the line that recurs most, and short ON PURPOSE precisely to narrow
+its own splice window.
+
 ### Why it matters beyond a flaky test
 
 A spliced log line is a SILENT failure of the one instrument every other diagnosis depends on

@@ -453,6 +453,25 @@ into the device's own register, so a respawned driver must be handed the SAME on
 vector each time would both exhaust the pool after eight restarts and leave the controller raising an
 interrupt nobody routes. Same reasoning as the permanent DMA reservation beside it.
 
+The same vector, but **reprogrammed** on every spawn rather than just handed back, for two reasons.
+The first is a real bug the constitution's own restart rule implies: §9.2 re-evaluates placement from
+scratch and deliberately does NOT remember the previous core, so a respawn can land elsewhere - and a
+cached vector still aimed at the dead instance's LAPIC would deliver the device's interrupts to a core
+with nobody waiting on them. The destination is therefore re-derived per spawn.
+
+The second is defensive. Returning early without writing assumes the device's MSI configuration
+survived the driver's death, which is an assumption about every driver that will ever use this pool
+rather than a guarantee. It holds for xHCI (MSI lives in PCI config space; `HCRST` resets the
+operational registers, not config space), but a heavier reset path would come back with no MSI
+programmed and fail SILENTLY: the driver restarts, reports ready, and the keyboard never types again.
+The write is idempotent and costs a few config-space accesses once per spawn.
+
+**Testability gap, stated rather than glossed:** neither of those is exercised in QEMU. The only build
+with a live xHCI is the IOMMU test (`-device qemu-xhci`), which has no shell or `chaos` to kill it
+with, and the drivers the ordinary QEMU config does spawn take no pool vector. So the restart path is
+reached first by chaos ON HARDWARE, which does kill `xhci`. Both changes are reasoned, not measured,
+and this says so (§26.7).
+
 **`xhci` is the caller, chosen as the strictest test available.** It is the only IOMMU-CONFINED
 driver, it needs the largest arena (292 pages), and §22 Test 12 checks the entire chain end to end
 rather than any one link: confined to its arena, the page past it unmapped, and a keyboard actually

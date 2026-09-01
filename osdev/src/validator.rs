@@ -2393,27 +2393,45 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
 /// to catch a real splice and tight enough not to fire on unrelated text.
 fn spliced_match(content: &str, expect: &str) -> bool {
     let need: Vec<char> = expect.chars().collect();
-    // Too short to judge. Below this, the characters of the needle appear in order inside ordinary
-    // log text often enough to call a splice on a line that was simply never printed - and a wrong
-    // "it was corrupted" is worse than a plain "not seen", because it sends the reader to the wrong
-    // audit entry. A real splice is only ever observed in the long descriptive pass lines anyway.
-    if need.len() < 24 { return false; }
+    if need.len() < 8 { return false; }
 
-    // Slack scales WITH the needle instead of being a flat constant. Observed splices insert a few
-    // bytes into a long line (3 chars into 59; 4 into 43), so the corrupted line stays close to its
-    // original length. A window several times the needle would match unrelated prose that merely
-    // happens to contain the right letters in order.
-    let slack = core::cmp::max(16, need.len() / 2);
+    // The discriminator is the number of GAPS, not the length of the match.
+    //
+    // A splice interleaves two whole streams, so every byte of both survives and the expected line
+    // is present as a subsequence broken by a FEW CONTIGUOUS runs of foreign bytes - one per time
+    // the other writer got in. The A9c case is the shape:
+    //
+    //   GS.base + `ad` + ?=0xffff8 + `v: A9c ` + 000 + `pass`
+    //
+    // "adv: A9c pass" with two insertions totalling 12 characters. Unrelated prose that merely
+    // happens to contain the right letters in order needs MANY gaps to do it, which is what
+    // separates the two. Counting gaps lets short needles be judged safely, where the earlier
+    // length threshold simply refused - and refused on exactly the line that recurs, because A9c is
+    // deliberately short to narrow its own splice window.
+    const MAX_GAPS: usize = 4;
+    const MAX_INSERTED: usize = 64;
+
     let hay: Vec<char> = content.chars().collect();
-    let window = need.len() + slack;
     for start in 0..hay.len() {
         if hay[start] != need[0] { continue; }
         let mut n = 0usize;
-        for i in start..hay.len().min(start + window) {
+        let mut gaps = 0usize;
+        let mut inserted = 0usize;
+        let mut in_gap = false;
+        let mut i = start;
+        while i < hay.len() && n < need.len() {
             if hay[i] == need[n] {
                 n += 1;
-                if n == need.len() { return true; }
+                in_gap = false;
+            } else {
+                if !in_gap { gaps += 1; in_gap = true; }
+                inserted += 1;
+                if gaps > MAX_GAPS || inserted > MAX_INSERTED { break; }
             }
+            i += 1;
+        }
+        if n == need.len() && gaps > 0 && gaps <= MAX_GAPS && inserted <= MAX_INSERTED {
+            return true;
         }
     }
     false
@@ -2489,7 +2507,7 @@ fn poll_serial(
                 .collect();
             if absent.is_empty() {
                 return TestOutcome::Fail(format!(
-                    "SERIAL SPLICE (not a property failure) - line printed but corrupted                      mid-write by a concurrent writer: {}. See audits/kernel-audit.md Audit 10;                      serial at {}",
+                    "SERIAL SPLICE, not a property failure: {} was PRINTED but corrupted mid-write by a concurrent writer (audits/kernel-audit.md Audit 10). Serial: {}",
                     spliced.join(", "), path.display()
                 ));
             }

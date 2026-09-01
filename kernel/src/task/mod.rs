@@ -653,12 +653,43 @@ fn pci_msi_vector(class_code: u32, core_id: u32) -> u8 {
     let Some(d) = crate::arch::imp::pci::find_by_class(class_code) else { return 0 };
     if d.index >= crate::arch::imp::pci::MAX_DEVICES { return 0; }
 
-    let existing = PCI_MSI_VEC[d.index].load(Ordering::Relaxed);
-    if existing != 0 { return existing; }   // a restart: same device, same vector
-
     // Deliver to the core the driver is pinned to, so a device event wakes that core directly out
     // of its idle halt rather than via a cross-core IPI - the same reasoning the named vectors use.
+    // Recomputed on a restart because the respawn may land on a DIFFERENT core than the instance
+    // that died (§9.2: placement is re-evaluated from scratch, the previous core is not remembered),
+    // and an interrupt still aimed at the old core would be delivered where nobody is waiting.
     let dest = crate::arch::imp::pci::msi_dest_lapic(core_id);
+
+    // A RESTART: same device, so the same vector - allocating a fresh one would both drain the pool
+    // after eight restarts and leave the controller raising an interrupt nobody routes.
+    //
+    // But it is REPROGRAMMED rather than just handed back. Returning early without writing assumes
+    // the device's MSI configuration survived the driver's death, and that is an assumption about
+    // every driver that will ever use this pool, not a guarantee. It happens to hold for xHCI (MSI
+    // lives in PCI config space; `HCRST` resets the operational registers, not config space) - but a
+    // driver whose reset path is heavier, or a device that loses config on a function-level reset,
+    // would come back with no MSI programmed at all. The failure would be silent and awful to
+    // diagnose: the driver restarts, reports ready, and the keyboard never types again.
+    //
+    // The write is idempotent and costs a few config-space accesses once per spawn, so paying it
+    // unconditionally is strictly cheaper than the class of bug it forecloses. The destination is
+    // re-derived above, so this also FIXES the case where the respawn moved cores.
+    let existing = PCI_MSI_VEC[d.index].load(Ordering::Relaxed);
+    if existing != 0 {
+        if !crate::arch::imp::pci::program_msi(d.bdf, existing, dest)
+            && !crate::arch::imp::pci::program_msix(d.bdf, existing, dest)
+        {
+            // It took this vector once and will not take it now. Loud, because the driver is about
+            // to run believing it has interrupts (invariant 12).
+            crate::kprintln!(
+                "pci-msi: BDF {:#06x} REFUSED its own vector {:#04x} on restart - no interrupt",
+                d.bdf, existing);
+            return 0;
+        }
+        crate::kprintln!("pci-msi: class {:#08x} BDF {:#06x} -> vector {:#04x} (restart, same vector)",
+                         class_code, d.bdf, existing);
+        return existing;
+    }
 
     // The slot is consumed only once the device is actually PROGRAMMED. Reserving first and
     // programming after would let a device that accepts neither MSI nor MSI-X burn a slot on every
