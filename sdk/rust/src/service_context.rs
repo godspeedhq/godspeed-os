@@ -323,6 +323,22 @@ pub mod hwclass {
     /// Not a device: the software-raised test interrupt (§22 IR1). A class, so that the probe which
     /// receives it names a CLASS like any driver and the kernel states the vector.
     pub const TEST_IRQ:    u32 = 7;
+
+    /// Bit 31: the value is a PCI CLASS CODE, not one of the named kinds above.
+    pub const PCI:         u32 = 1 << 31;
+    /// Bit 28: place this device behind the IOMMU (§6.4).
+    pub const PCI_CONFINE: u32 = 1 << 28;
+
+    /// Describe a PCI device by what the BUS says it is: the industry-standard 24-bit
+    /// (class, subclass, prog-if) triple, plus which BAR holds its registers.
+    ///
+    /// This is what lets a driver be added with NO KERNEL CHANGE. `0x0C0330` is xHCI on every
+    /// machine ever built, so the kernel needs no name for it - it looks the code up in the table
+    /// its boot scan already filled. The BAR index is the one extra fact, because devices differ
+    /// (xHCI 0, AHCI 5), and an INDEX is not an address, so it is safe to accept from a caller.
+    pub const fn pci(class_code: u32, bar_ix: u32, confine: bool) -> u32 {
+        PCI | (if confine { PCI_CONFINE } else { 0 }) | ((bar_ix & 0x7) << 24) | (class_code & 0x00FF_FFFF)
+    }
 }
 
 impl SpawnRequest {

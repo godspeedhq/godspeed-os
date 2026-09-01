@@ -2074,6 +2074,28 @@ pub mod pci {
     pub static NIC_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
     pub static NIC_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
     pub static NIC_VENDOR_DEVICE: AtomicU32 = AtomicU32::new(0);
+
+    // ---- The generic device table (step D1). See `arch/x86_64/pci.rs` for the real one.
+    /// One device as the bus reports it. Same shape on every arch so the spawn path is arch-neutral.
+    #[derive(Clone, Copy)]
+    pub struct PciDevice {
+        pub index: usize,
+        pub bdf: u32,
+        pub class_code: u32,
+        pub bar: [u64; 6],
+        pub irq_line: u8,
+        pub vendor: u16,
+        pub device: u16,
+    }
+    pub static DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
+    pub fn device_at(_n: usize) -> Option<PciDevice> { None }
+    /// ARM32 HAS NO PCI AT ALL - the DWC2 is soldered to the BCM283x and there is no bus to walk.
+    /// So this is not "unimplemented", it is EMPTY BY CONSTRUCTION: no class code can ever match,
+    /// and every driver on this port names a non-PCI kind (`HwClass::Dwc2`). One slot, because the
+    /// array it sizes must exist and nothing will ever fill it.
+    pub const MAX_DEVICES: usize = 1;
+    pub fn find_by_class(_class_code: u32) -> Option<PciDevice> { None }
+
     pub fn init() {}
     pub fn clear_bus_master(bdf: u32) {}
     pub fn set_bus_master(bdf: u32) {}

@@ -291,7 +291,18 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("block-driver", BLOCK_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
      if cfg!(target_arch = "arm") { 2 } else { 1 },
      if cfg!(target_arch = "arm") { &["dwc2"] } else if cfg!(target_arch = "aarch64") { &["xhci"] } else { &[] },
-     0, 0, godspeed_sdk::service_context::hwclass::AHCI),
+     0, 0,
+     // NAMED BY THE BUS, not by the kernel (step D1). 0x010601 is the industry-standard PCI class
+     // code for an AHCI SATA controller - class 0x01 mass storage, subclass 0x06 SATA, prog-if 0x01
+     // AHCI - and BAR 5 is where the AHCI spec puts its registers (`ABAR`). The kernel holds no
+     // name for either fact: it looks the code up in the table its boot scan filled, and takes the
+     // BAR at the index this row gives.
+     //
+     // FIRST driver on the generic path, chosen because it is the strictest test available: it
+     // needs a NON-ZERO BAR INDEX (the bug the boot cross-check caught), a DMA arena, a PCI BDF for
+     // bus-master enable, and it already takes no interrupt - so nothing is lost while generic
+     // vector allocation is still outstanding. `files` (222 tests) exercises the whole path.
+     godspeed_sdk::service_context::hwclass::pci(0x01_06_01, 5, false)),
     // The terminal (docs/console-service.md 9). Its "hardware" is the DISPLAY: the kernel maps the
     // framebuffer into it and describes the PIXEL geometry only - character geometry belongs to the
     // terminal, which is this service. Same class mechanism as a driver's BAR, and for the same
@@ -386,6 +397,17 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
     req.privileges   = privs;
     req.probe_mode   = mode;
     req.hw_flags     = hw;
+    // The DMA arena a PCI driver needs, in 4 KiB pages. A SIZE, not an address - the kernel still
+    // decides WHERE the arena lives; this says only how big. Zero for a register-only driver.
+    //
+    // Kept beside the table rather than as a tenth column: it applies to the handful of rows that
+    // name a PCI class code, and widening every row to carry a field that is 0 for twenty of them
+    // would be noise. Folds into the row if that stops being true.
+    req.dma_pages    = match name {
+        // 64 KiB - the size `HwClass::Ahci` implied before the class had a name in the kernel.
+        "block-driver" => 16,
+        _ => 0,
+    };
     // Peers likewise: a caller that has caps to provide passes them, otherwise the declared list.
     let use_peers = if peers.is_empty() { table_peers } else { peers };
     // Caller-provided peer caps, when there are any. The kernel checks each holds GRANT, so passing

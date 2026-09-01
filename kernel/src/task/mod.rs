@@ -397,7 +397,40 @@ struct ServiceConfig {
 /// spawn path. The BAR *address* is still runtime-discovered by the PCI scan (a hardware location is a
 /// different irreducible fact from the authorization); only the driver's *class* is declared here.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum HwClass { None, Ahci, Nic, Xhci, Ehci, Dwc2, Framebuffer, TestIrq }
+enum HwClass {
+    None,
+    // ---- NON-PCI kinds. These are SoC or boot facts, not bus facts: nothing enumerates them, so
+    // they stay named. `Dwc2` is soldered to the BCM283x, the framebuffer is a Limine/mailbox
+    // handoff, and the test IRQ is software. A name is the only way to refer to them.
+    Dwc2,
+    Framebuffer,
+    TestIrq,
+    /// ---- ANY PCI DEVICE, named by what the BUS says it is rather than by what the kernel was
+    /// taught (step D1).
+    ///
+    /// `class_code` is the industry-standard 24-bit (class, subclass, prog-if) triple, so a driver
+    /// for a device this kernel has never heard of needs NO kernel change: the supervisor puts the
+    /// code in the spawn request and the scan table answers it.
+    ///
+    /// The other three fields are the facts a class name used to imply, now stated by the caller
+    /// because they belong to the DRIVER, not to the bus:
+    ///   - `bar_ix`  which BAR holds the registers (xHCI 0, AHCI 5 - an INDEX, never an address)
+    ///   - `dma_pages` how much DMA arena it needs (a SIZE, bounded by the syscall)
+    ///   - `confine` whether to put it behind the IOMMU (policy, §6.4)
+    Pci { class_code: u32, bar_ix: u8, dma_pages: u32, confine: bool },
+    // ---- The legacy per-class names, still populated by the scan and still the default path until
+    // every caller names a class code. They go away with their last reader.
+    Ahci, Nic, Xhci, Ehci,
+}
+
+/// PERMANENT per-device DMA reservations for PCI devices found by the scan (§12 DMA
+/// permanent-reserve), indexed by the device's slot in the table.
+///
+/// A restarted driver must be handed back the SAME physical arena - that is what makes a respawn
+/// transparent to a controller that is still DMAing into it. Keyed by device index rather than by
+/// class name, which is the whole point: a device the kernel cannot name still gets a reservation.
+static PCI_DMA_PHYS: [portable_atomic::AtomicU64; crate::arch::imp::pci::MAX_DEVICES] =
+    [const { portable_atomic::AtomicU64::new(0) }; crate::arch::imp::pci::MAX_DEVICES];
 
 impl HwClass {
     /// Did the PCI scan find this class of controller?
@@ -419,6 +452,9 @@ impl HwClass {
             // Not a device: the software-generated test interrupt (`FireIrq`) that IR1 delivers.
             // Always "present" because the kernel raises it itself - there is nothing to scan for.
             HwClass::TestIrq => true,
+            // Present iff the scan met a device claiming this class code.
+            HwClass::Pci { class_code, .. } =>
+                crate::arch::imp::pci::find_by_class(class_code).is_some(),
             HwClass::None => false,
         }
     }
@@ -444,6 +480,11 @@ impl HwClass {
             // `Mmio` wrapper. The DWC2's address therefore belongs there, not here. Returning 0 is
             // how this class says "not on a bus" rather than "not present" - `found()` above is the
             // one that answers presence.
+            // The BAR the DRIVER named, from the device the BUS reported. Never an address the
+            // caller supplied - the index picks which of the six the scan already read.
+            HwClass::Pci { class_code, bar_ix, .. } =>
+                crate::arch::imp::pci::find_by_class(class_code)
+                    .map_or(0, |d| d.bar[(bar_ix as usize).min(5)]),
             HwClass::Dwc2 => 0,
             // ZERO for the same reason as the DWC2: not on a bus, so not a BAR. The framebuffer has its
             // own grant path (the `HwClass::Framebuffer` branch in the spawn MMIO block) because it
@@ -469,11 +510,24 @@ impl HwClass {
         // whose permanent physical reservation is the one `dma_phys_slot` gives unclassified
         // callers - `XHCI_DMA_PHYS`, the REAL xHCI driver's. A test probe aliasing a driver's DMA
         // region, on a machine that has both. Every suite passed while it did.
+        // A PCI device DMAs iff the caller asked for an arena. Zero pages = a register-only
+        // driver, which is a legitimate shape (block-driver's AHCI needs one, a serial card does not).
+        if let HwClass::Pci { dma_pages, .. } = self {
+            return dma_pages > 0 && self.found();
+        }
         self != HwClass::None && self != HwClass::Framebuffer && self != HwClass::TestIrq
             && self.found()
     }
     /// Arena size: xHCI needs room for its 256-buffer scratchpad; every other driver gets 64 KiB.
-    fn dma_pages(self) -> u64 { if self == HwClass::Xhci { XHCI_DMA_PAGES } else { EHCI_DMA_PAGES } }
+    fn dma_pages(self) -> u64 {
+        match self {
+            // The CALLER states it: how much DMA a driver needs is the driver's fact, and the
+            // xHCI-needs-more special case was the last per-class size in the kernel.
+            HwClass::Pci { dma_pages, .. } => dma_pages as u64,
+            HwClass::Xhci => XHCI_DMA_PAGES,
+            _ => EHCI_DMA_PAGES,
+        }
+    }
     /// The permanent per-class DMA phys reservation, reused across respawns (§12 DMA permanent-reserve).
     fn dma_phys_slot(self) -> &'static portable_atomic::AtomicU64 {
         match self {
@@ -487,12 +541,29 @@ impl HwClass {
             // crash waiting for a refactor, and a wrong-but-unused reservation is not. It must STAY
             // unused: this hands back the xHCI driver's own reservation, so a class that reached here
             // by accident would alias it (TestIrq did, until `needs_dma` was corrected).
+            // Per DEVICE, not per class - a device the kernel cannot name still needs its arena
+            // handed back on restart. `index` is the scan slot, stable for the boot.
+            HwClass::Pci { class_code, .. } =>
+                match crate::arch::imp::pci::find_by_class(class_code) {
+                    Some(d) if d.index < crate::arch::imp::pci::MAX_DEVICES => &PCI_DMA_PHYS[d.index],
+                    // Unreachable: `needs_dma()` gates every caller and is false when the device is
+                    // absent. Returns a real slot rather than panicking, as the arms below do.
+                    _ => &PCI_DMA_PHYS[0],
+                },
             HwClass::None | HwClass::Framebuffer | HwClass::TestIrq => &XHCI_DMA_PHYS,
         }
     }
     /// Confine this DMA-capable driver via the IOMMU? Only xHCI qualifies today (§6.4; ehci + block-driver
     /// keep a stale firmware DMA pointer that confinement would fault, so they stay in passthrough).
-    fn iommu_confine(self) -> bool { self == HwClass::Xhci }
+    fn iommu_confine(self) -> bool {
+        match self {
+            // Policy, so the caller states it (§6.4). `ehci` and `block-driver` keep a stale
+            // firmware DMA pointer that confinement would fault, which is why this was never
+            // "confine every driver" in the first place.
+            HwClass::Pci { confine, .. } => confine,
+            _ => self == HwClass::Xhci,
+        }
+    }
     /// The device's PCI BDF (bus/device/function) for the bus-master + D0 enable, or 0xFFFF if none.
     fn bdf(self) -> u32 {
         use crate::arch::imp::pci;
@@ -501,6 +572,8 @@ impl HwClass {
             HwClass::Dwc2 => 0xFFFF, // no PCI on this board, so no bus-master enable to perform
             HwClass::Framebuffer => 0xFFFF, // not a PCI device
             HwClass::TestIrq     => 0xFFFF, // not a device at all - a software-raised vector
+            HwClass::Pci { class_code, .. } =>
+                crate::arch::imp::pci::find_by_class(class_code).map_or(0xFFFF, |d| d.bdf),
             HwClass::Xhci => pci::XHCI_BDF.load(Relaxed),
             HwClass::Ehci => pci::EHCI_BDF.load(Relaxed),
             HwClass::Ahci => pci::AHCI_BDF.load(Relaxed),
@@ -531,10 +604,32 @@ pub const EHCI_CORE: u32 = 3;
 /// An UNKNOWN class is refused rather than treated as none: a spawner asking for a device this kernel
 /// cannot grant must hear so, not receive a driver with no MMIO window that enumerates nothing and
 /// reports no error (invariant 12).
-pub fn hw_class_known(class: u32) -> bool { class <= 7 }
+pub fn hw_class_known(class: u32) -> bool {
+    // Bit 31 = "this is a PCI CLASS CODE, not one of the kernel's named kinds". Any class code is
+    // acceptable BY DESIGN - that is the whole of step D1. The kernel does not have a list of the
+    // ones it knows, because having one is what forced a kernel rebuild per driver.
+    if class & HW_PCI_FLAG != 0 { return true; }
+    class <= 7
+}
+
+/// `hw_flags` bit 31: the low bits describe a PCI device rather than a named kind.
+pub const HW_PCI_FLAG: u32 = 1 << 31;
+/// `hw_flags` bit 28: put this device behind the IOMMU (§6.4).
+pub const HW_PCI_CONFINE: u32 = 1 << 28;
+
+/// Decode a `hw_flags` PCI descriptor: `bit31 | confine<<28 | bar_ix<<24 | class_code`.
+fn hw_pci_of(class: u32, dma_pages: u32) -> HwClass {
+    HwClass::Pci {
+        class_code: class & 0x00FF_FFFF,
+        bar_ix:     ((class >> 24) & 0x7) as u8,
+        dma_pages,
+        confine:    class & HW_PCI_CONFINE != 0,
+    }
+}
 
 /// Resolve a spawn request's device class to the kernel's own scan results.
 fn hw_class_of(class: u32) -> HwClass {
+    if class & HW_PCI_FLAG != 0 { return hw_pci_of(class, 0); }
     match class {
         1 => HwClass::Ahci,
         2 => HwClass::Nic,
@@ -580,6 +675,19 @@ fn hw_irqs_for(class: HwClass) -> &'static [u8] {
         // that receives it stop being a kernel-known name.
         HwClass::TestIrq => &[33],
         HwClass::Ahci | HwClass::Framebuffer | HwClass::None => &[],
+        // NO VECTOR YET, and this is the honest edge of step D1 rather than an oversight.
+        //
+        // The named classes above return a vector the KERNEL assigned and programmed into the
+        // device's MSI/MSI-X at boot (`pci: MSI-X enabled on 00:04.0 vector=0x28`). Doing that for a
+        // device the kernel cannot name means allocating a vector from a pool and programming that
+        // device's MSI generically - which is real work, and squarely the kernel's (interrupt
+        // routing is one of the six, §4.3), so it belongs here rather than in the caller.
+        //
+        // Until it lands, a driver spawned by CLASS CODE gets MMIO, DMA and its BDF but no
+        // interrupt: it must poll. The four existing drivers keep their named classes and their
+        // vectors, so nothing regresses - but a new driver that needs an interrupt still waits on
+        // this. Stated rather than papered over (§26.7).
+        HwClass::Pci { .. } => &[],
     }
 }
 
@@ -975,6 +1083,8 @@ pub fn spawn_from_image(
     // `hw_irqs_for` rather than named by the caller - see that function for why a vector is
     // authority. `SpawnImage` refuses a request that tries to name one.
     hw_class:          u32,
+    // DMA arena size in pages, for a PCI descriptor. A size, not an address (see the syscall).
+    dma_pages:         u32,
     // Mint the name-wired peer caps with GRANT so the child may re-delegate them (§22 Test 5A).
     peers_grant:       bool,
 ) -> Result<Option<EndpointId>, SpawnError> {
@@ -990,7 +1100,8 @@ pub fn spawn_from_image(
     let core_id = resolve_spawn_core(core_override, core_preferred)?;
     let mem = if memory_limit == 0 { 64 * 1024 * 1024 } else { memory_limit };
 
-    let hw = hw_class_of(hw_class);
+    let hw = if hw_class & HW_PCI_FLAG != 0 { hw_pci_of(hw_class, dma_pages) }
+             else { hw_class_of(hw_class) };
     let result = spawn_service_with_image(name, image, core_id, has_recv_endpoint, peers, mode,
                                           peers_grant, mem, hw_irqs_for(hw), has_console_read,
                                           Some(privileges), Some(hw), installs);

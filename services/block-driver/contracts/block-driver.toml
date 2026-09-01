@@ -12,13 +12,24 @@ request = "8MiB"
 limit   = "16MiB"
 
 [capabilities]
-# block-driver is an AHCI (SATA) driver: it holds the HBA's MMIO window (ABAR) + a DMA arena. It
-# DECLARES the device CLASS here; the kernel resolves the runtime-discovered BAR address by the PCI
-# scan and grants MMIO/DMA accordingly (kernel `service_hw` / `HwClass::Ahci`, audit T1 Phase B). The
-# class is reconciled against the kernel by scripts/contract_check.py, so contract and kernel cannot
-# diverge (Commandment III); the BAR address stays the one runtime fact. (The retired ATA-PIO backend's
-# `hw_pio` was removed - the contract no longer mis-states the driver's privilege.)
-hw_device = "ahci"
+# block-driver is an AHCI (SATA) driver: it holds the HBA's MMIO window (ABAR) + a DMA arena.
+#
+# It declares the device by its PCI CLASS CODE - the industry-standard (class, subclass, prog-if)
+# triple - rather than by a name the kernel was taught. 0x010601 is class 0x01 mass storage,
+# subclass 0x06 SATA, prog-if 0x01 AHCI, and it means that on every machine ever built. The kernel
+# holds no name for it: the boot scan records what the bus reports, and this code selects from it.
+# That is what makes a driver addable with NO KERNEL CHANGE (step D1, docs/service-ownership.md §5).
+#
+# `hw_pci_bar` is the one extra fact, because devices differ in where they put their registers: the
+# AHCI spec puts them in BAR5 (`ABAR`) where xHCI and the NICs use BAR0. It is an INDEX, not an
+# address - the kernel supplies the value from its own scan - which is why a caller may state it.
+#
+# Both are reconciled against the supervisor's spawn row by scripts/contract_check.py, so contract
+# and code cannot diverge (Commandment III). The BAR ADDRESS remains the one runtime fact, never
+# written down anywhere. (The retired ATA-PIO backend's `hw_pio` was removed - the contract no
+# longer mis-states the driver's privilege.)
+hw_pci_class = "010601"
+hw_pci_bar = 5
 log_write = true
 
 # PLACEMENT IS ARCH-CONDITIONAL, so it is NOT declared here.

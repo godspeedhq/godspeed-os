@@ -832,6 +832,10 @@ const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
 const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
 /// Mint the child's peer caps with GRANT (§22 Test 5A). See the SDK constant.
 const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
+/// Ceiling on a caller-requested DMA arena, in 4 KiB pages. 2048 = 8 MiB, comfortably above the
+/// largest real request (xHCI's scratchpad, 1168 KiB) and far below anything that could starve the
+/// frame allocator.
+const MAX_DMA_PAGES: u32 = 2048;
 
 fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     // The SPAWN capability gates this exactly as it gates `Spawn` (3.1): supplying an image does not
@@ -907,7 +911,16 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
             req.irq_count);
         return -1;
     }
-    if req.mmio_base != 0 || req.mmio_len != 0 || req.dma_pages != 0 || req.bdf != 0 {
+    // `dma_pages` is now HONOURED for a PCI descriptor: a SIZE is not an address, so a caller
+    // naming one cannot reach memory it was not granted - the arena is still allocated by the
+    // kernel, wherever the kernel decides. Bounded, because an unbounded size is a denial of
+    // service (§26.6). The ADDRESS fields stay refused.
+    if req.dma_pages > MAX_DMA_PAGES {
+        crate::kprintln!("task: SpawnImage refused - dma_pages {} exceeds the cap of {}",
+                         req.dma_pages, MAX_DMA_PAGES);
+        return -1;
+    }
+    if req.mmio_base != 0 || req.mmio_len != 0 || req.bdf != 0 {
         crate::kprintln!(
             "task: SpawnImage refused - raw hardware addresses are not honoured; name the device CLASS instead (mmio={:#x}+{:#x} dma_pages={} bdf={:#x})",
             req.mmio_base, req.mmio_len, req.dma_pages, req.bdf);
@@ -1039,6 +1052,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         req.privileges,
         req.probe_mode,
         req.hw_flags,
+        req.dma_pages,
         req.flags & SPAWN_FLAG_PEERS_GRANT != 0,
     ) {
         // Hand back a SEND|GRANT cap to the new endpoint, as `SpawnReturningEndpoint` does: the

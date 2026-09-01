@@ -2390,6 +2390,33 @@ pub mod pci {
     pub static NIC_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
     pub static NIC_BDF: AtomicU32 = AtomicU32::new(0xFFFF);
     pub static NIC_VENDOR_DEVICE: AtomicU32 = AtomicU32::new(0);
+
+    // ---- The generic device table (step D1). See `arch/x86_64/pci.rs` for the real one.
+    /// One device as the bus reports it. Same shape on every arch so the spawn path is arch-neutral.
+    #[derive(Clone, Copy)]
+    pub struct PciDevice {
+        pub index: usize,
+        pub bdf: u32,
+        pub class_code: u32,
+        pub bar: [u64; 6],
+        pub irq_line: u8,
+        pub vendor: u16,
+        pub device: u16,
+    }
+    pub static DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
+    pub fn device_at(_n: usize) -> Option<PciDevice> { None }
+    /// AARCH64 HAS PCIe (the Pi 4's VL805 sits on it) BUT THIS TABLE IS NOT FILLED YET.
+    ///
+    /// Not "no bus" like arm32 - a real gap. `pcie::init` walks the bridge, assigns the BAR and
+    /// hands back one `Device`, but it does not record into a generic table, so a class-code lookup
+    /// finds nothing here and an aarch64 driver must still name a kind (`HwClass::Xhci`). Filling
+    /// this is the rest of step D1 for this port.
+    ///
+    /// It returns `None` rather than guessing, so the failure is a driver that gets no MMIO and says
+    /// so - never one silently pointed at the wrong window (§26.7).
+    pub const MAX_DEVICES: usize = 32;
+    pub fn find_by_class(_class_code: u32) -> Option<PciDevice> { None }
+
     pub fn init() {}
     pub fn clear_bus_master(bdf: u32) {}
     pub fn set_bus_master(bdf: u32) {}

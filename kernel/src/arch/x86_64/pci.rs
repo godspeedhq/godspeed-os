@@ -73,6 +73,9 @@ pub const MAX_DEVICES: usize = 32;
 /// about what it is, and the BAR/BDF are read straight from config space.
 #[derive(Clone, Copy)]
 pub struct PciDevice {
+    /// Slot in the scan table. Stable for the life of the boot, which is what makes it usable as the
+    /// index of a PERMANENT per-device DMA reservation (§12) - the thing a class name used to key.
+    pub index: usize,
     /// (bus << 8) | (dev << 3) | func - the same packing `*_BDF` uses.
     pub bdf: u32,
     /// (class << 16) | (subclass << 8) | prog_if.
@@ -123,6 +126,7 @@ pub fn device_at(n: usize) -> Option<PciDevice> {
     let mut bar = [0u64; 6];
     for (i, b) in bar.iter_mut().enumerate() { *b = DEV_BARS[n * 6 + i].load(Ordering::Relaxed); }
     Some(PciDevice {
+        index:      n,
         bdf:        DEV_BDF[n].load(Ordering::Relaxed),
         class_code: DEV_CLASS[n].load(Ordering::Relaxed),
         bar,
