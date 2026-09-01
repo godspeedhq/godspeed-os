@@ -294,7 +294,7 @@ classes it was taught about.
    kernel                               kernel
      PCI scan                             (no bus knowledge at all)
      XHCI_FOUND  = true
-     XHCI_BAR    = 0x...                bus-manager service
+     XHCI_BAR    = 0x...                hw-enumerator
      AHCI_FOUND  = ...                    reads PCI config space
      NIC_FOUND   = ...                    reports: "BDF 00:14.0, class 0x0c0330,
         |                                            BAR0 0x..., IRQ ..."
@@ -312,7 +312,7 @@ So the truthful answer to "can a contributor write a driver without touching the
 - **a driver for a device the scanner already recognises** - yes, after step C
 - **a driver for a new kind of device** - not until step D
 
-Step D is not large: the kernel already does the scan, so it is a matter of granting a bus-manager
+Step D is not large: the kernel already does the scan, so it is a matter of granting a hw-enumerator
 service access to config space and having it report, instead of the kernel keeping a table of device
 classes. It also fits the constitution better than what is there now - enumerating a bus and deciding
 which driver claims which device is policy, and 4.4 already says drivers are not kernel scope.
@@ -321,15 +321,15 @@ Step D is arch-shaped work: x86 config space via I/O ports, Pi 4 via ECAM, and *
 all** (the DWC2 is soldered to the SoC, which is why `HwClass::Dwc2` is the one class whose presence
 is a `cfg!`, not a scan).
 
-### What happens when `bus-manager` dies
+### What happens when `hw-enumerator` dies
 
-Drivers get their MMIO base, IRQ and DMA arena from `bus-manager`, so it must come up before any
+Drivers get their MMIO base, IRQ and DMA arena from `hw-enumerator`, so it must come up before any
 driver. That is a new ordering dependency, and the failure question follows immediately.
 
 **The supervisor caches the enumeration results** - a bounded array of `(BDF, class, BAR, size, IRQ)`,
 fixed size, no heap, the same discipline as its `name -> cap` map. It is the thing that respawns
-drivers, so it needs those facts at restart time. If it had to query a possibly-dead `bus-manager`
-first, a `bus-manager` crash would take out every driver restart with it (Commandment VIII: a
+drivers, so it needs those facts at restart time. If it had to query a possibly-dead `hw-enumerator`
+first, a `hw-enumerator` crash would take out every driver restart with it (Commandment VIII: a
 dependent must not hang on a dependency that is gone).
 
 If the SUPERVISOR dies, it re-derives, and the chain terminates:
@@ -341,14 +341,14 @@ If the SUPERVISOR dies, it re-derives, and the chain terminates:
   kernel respawns it            (6.2 - unconditionally, forever)
        |
        v
-  adopts the still-running services, including bus-manager
+  adopts the still-running services, including hw-enumerator
        |
        v
-  re-queries bus-manager  ->  facts back
+  re-queries hw-enumerator  ->  facts back
 ```
 
-If both are dead, the supervisor spawns `bus-manager` first and then queries it. There is no
-circularity, because **`bus-manager` needs no discovered facts to start**: it needs access to PCI
+If both are dead, the supervisor spawns `hw-enumerator` first and then queries it. There is no
+circularity, because **`hw-enumerator` needs no discovered facts to start**: it needs access to PCI
 config space, which is an architectural constant (an I/O port pair on x86, a fixed ECAM window on
 Pi 4), not something anyone discovered.
 
@@ -436,14 +436,27 @@ and reconciled against the kernel by `scripts/contract_check.py`, so a new grant
 quietly. A second, cheap pin on its IPC opcode list would catch growth that needs no new authority;
 worth adding when the service exists, not before (§26.2).
 
-**The name matters more than it looks.** "bus-manager" invites management - it names the thing after a
+**The name matters more than it looks.** "hw-enumerator" invites management - it names the thing after a
 role that has no natural boundary, and the first person to propose power management will be right, by
-its own name. `bus-probe` (or `bus-report`) names what it does, and makes the same proposal read as
-out of scope on sight.
+its own name.
 
-PROPOSED, not adopted: the rest of this document still says `bus-manager`, and renaming a thing is
-worth doing once, deliberately, rather than half-way. If the rename is taken, it is a sed and this
-paragraph becomes the reason it happened.
+**The service is `hw-enumerator`.** It names the ACTION and nothing else, so "the enumerator should
+also configure the device" reads as out of scope on sight - which is the whole job of the name.
+
+The prefix is `hw-`, not `device-`, because that is already this codebase's word for the domain:
+`hw_device`, `hw_class`, `hw_mmio`, `hw_irqs`, `hw_flags`. A `device-` prefix would be a second name
+for the same concept. It also stays true on arm32, which has NO BUS at all - the DWC2 is soldered to
+the SoC - so a name built on "bus" would be a misnomer on one of the four machines while "hardware"
+holds everywhere.
+
+Two candidates were ruled out on facts rather than taste. `hw-probe` / `device-probe` COLLIDE with the
+existing `probe` service and its 17 `probe-*` rows - the name would read as one of them in logs and in
+the kernel name directory. `hw-discovery` invites exactly the probing logic that must not accumulate
+here, which is the same failure as "manager" one step quieter.
+
+The road not taken, recorded because it may be the better answer if this service ever starts to drift:
+`hw-inventory` names the OUTPUT rather than the action, and a list cannot act at all - marginally
+stronger against creep, at the cost of being less obvious to a newcomer.
 
 **Read-only is the goal and may not be free.** On x86 firmware assigns BARs before the OS runs, so
 reading is genuinely enough. On the Pi 4 the kernel currently ASSIGNS them
@@ -476,7 +489,7 @@ merely read the bus, it **assigns**:
   pcie: xHCI BAR0 assigned bus 0xf8000000 -> CPU 0x600000000
 ```
 
-If `bus-manager` inherits that job, dies, and restarts while `xhci` is running against the window it
+If `hw-enumerator` inherits that job, dies, and restarts while `xhci` is running against the window it
 was given, a naive re-scan that reassigns BARs pulls the address out from under a live driver.
 
 So enumeration splits in two, and the split is a hard requirement rather than an optimisation:
@@ -488,7 +501,7 @@ So enumeration splits in two, and the split is a hard requirement rather than an
 
 Idempotent by construction: read the BAR, and if it is already programmed, keep it and report it.
 This is the genuinely fiddly part of D, more so than config-space access itself, and it wants
-designing in rather than discovering the first time `chaos` kills `bus-manager` mid-transfer.
+designing in rather than discovering the first time `chaos` kills `hw-enumerator` mid-transfer.
 
 ### Slice 1 built, and the next problem it revealed: RESTART must go through the supervisor
 
@@ -721,7 +734,7 @@ It is the same shape as the two defects the moves already surfaced (the contract
 
 **Design C's spawn ABI for the end state, not the interim.** The supervisor should pass the hardware
 facts explicitly at spawn, so `service_hw` and `HwClass` leave the kernel **at C**. In the interim
-the supervisor obtains those values from a kernel discovery query; at D, the bus-manager supplies
+the supervisor obtains those values from a kernel discovery query; at D, the hw-enumerator supplies
 them instead.
 
 The ABI is the expensive, hard-to-change part. Design it once for where we are going, and D only
@@ -904,7 +917,7 @@ spawn it.
   device appears on the bus
        |
        v
-  bus-manager SERVICE enumerates, reports BDF / class / BAR / IRQ      <- step D
+  hw-enumerator SERVICE enumerates, reports BDF / class / BAR / IRQ      <- step D
        |
        v
   supervisor picks a driver, reads its signed package from fs          <- step 2
@@ -1033,7 +1046,7 @@ does the service still call the syscall?
   device's. The work is larger than it looks because the 193 probe spawns go through `Spawn`'s
   packed-parameter path rather than `SpawnImage`.
 - **Step D's arch shape** is unmeasured. x86 I/O-port config space and Pi 4 ECAM are known
-  quantities; arm32 has no PCI, so the bus-manager is x86 + Pi 4 only and `dwc2` keeps its
+  quantities; arm32 has no PCI, so the hw-enumerator is x86 + Pi 4 only and `dwc2` keeps its
   SoC-presence path.
 - **Step 2's key management** has no design yet, and it is process as much as code.
 - **A9-4, the BSP idle wedge**, is unrelated to this work and remains open and deferred. It did not
