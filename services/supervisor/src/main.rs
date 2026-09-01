@@ -332,7 +332,24 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("nic-driver", NIC_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      16 * 1024 * 1024, 1, if cfg!(target_arch = "arm") { &["dwc2"] } else { &[] },
      if cfg!(target_arch = "aarch64") { godspeed_sdk::service_context::privbits::NET_DEVICE } else { 0 }, 0,
-     godspeed_sdk::service_context::hwclass::NIC),
+     // x86: named by the bus. 0x020000 is class 0x02 network, subclass 0x00 ethernet - the class
+     // EVERY PCI ethernet controller reports, whoever made it.
+     //
+     // This is the case that shows what class-code addressing is FOR. `HwClass::Nic` granted MMIO
+     // only to two hard-coded vendor/device IDs (Intel 8086:100E and Realtek 10EC:8168), so a third
+     // NIC needed a KERNEL REBUILD to be driven at all - the exact thing step D exists to end. By
+     // the class, any ethernet controller is addressable and the kernel needs to know none of them.
+     //
+     // `BAR_AUTO` rather than an index, because the two supported NICs already disagree: the e1000
+     // puts its registers in BAR0 while the RTL8168 puts I/O ports there and its registers in BAR2.
+     // "The first mapped memory BAR" is what the old scan did and what both need.
+     //
+     // ARM keeps the kind: the NIC is not on a PCI bus on either Pi (LAN9514 over USB on the Pi 2,
+     // GENET on the Pi 4), so there is no class code to name and no table to find it in.
+     if cfg!(target_arch = "x86_64") {
+         godspeed_sdk::service_context::hwclass::pci(
+             0x02_00_00, godspeed_sdk::service_context::hwclass::BAR_AUTO, false)
+     } else { godspeed_sdk::service_context::hwclass::NIC }),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0, 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
@@ -417,6 +434,8 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
         "block-driver" => 16,
         // 32 rings + a 256-buffer scratchpad + 4 - the size `XHCI_DMA_PAGES` held in the kernel.
         "xhci" => 32 + 256 + 4,
+        // 64 KiB - the `_ => EHCI_DMA_PAGES` default the NIC used to fall through to.
+        "nic-driver" => 16,
         _ => 0,
     };
     // Peers likewise: a caller that has caps to provide passes them, otherwise the declared list.

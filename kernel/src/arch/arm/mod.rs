@@ -1894,6 +1894,13 @@ pub mod syscall_entry {
 
 // ---------------------------------------------------------------------------
 pub mod interrupts {
+    /// The MSI vector pool is x86-only (`arch/x86_64/interrupts.rs`, step D1b). Neither Pi has one:
+    /// a pool hands vectors to devices found on a PCI bus, and there is no PCI bus here to find them
+    /// on - `pci::find_by_class` returns `None`, so `task::pci_msi_vector` returns before it ever
+    /// consults these. LEN 0 states that plainly ("the pool holds nothing") rather than naming a
+    /// range of vectors this arch does not route.
+    pub const MSI_POOL_BASE: u8 = 0;
+    pub const MSI_POOL_LEN: usize = 0;
     pub const XHCI_MSI_VECTOR: u8 = 0x28;
     pub const EHCI_MSI_VECTOR: u8 = 0x29;
 

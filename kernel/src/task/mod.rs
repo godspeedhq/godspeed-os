@@ -414,7 +414,8 @@ enum HwClass {
     ///
     /// The other three fields are the facts a class name used to imply, now stated by the caller
     /// because they belong to the DRIVER, not to the bus:
-    ///   - `bar_ix`  which BAR holds the registers (xHCI 0, AHCI 5 - an INDEX, never an address)
+    ///   - `bar_ix`  which BAR holds the registers (xHCI 0, AHCI 5 - an INDEX, never an address),
+    ///               or `BAR_AUTO` for the first mapped MEMORY BAR
     ///   - `dma_pages` how much DMA arena it needs (a SIZE, bounded by the syscall)
     ///   - `confine` whether to put it behind the IOMMU (policy, §6.4)
     Pci { class_code: u32, bar_ix: u8, dma_pages: u32, confine: bool },
@@ -482,6 +483,15 @@ impl HwClass {
             // one that answers presence.
             // The BAR the DRIVER named, from the device the BUS reported. Never an address the
             // caller supplied - the index picks which of the six the scan already read.
+            // `BAR_AUTO` asks for the first mapped memory BAR instead of a numbered one. This is
+            // what lets ONE driver cover devices that put their registers in different places: the
+            // e1000 uses BAR0, while the RTL8168 on the Wyse puts I/O ports there and its registers
+            // in BAR2. Both are "the first memory BAR". Still not an address - a rule the kernel
+            // evaluates over its own scan, exactly as an index is.
+            HwClass::Pci { class_code, bar_ix: BAR_AUTO, .. } =>
+                crate::arch::imp::pci::find_by_class(class_code)
+                    .and_then(|d| d.bar.iter().copied().find(|&b| b != 0))
+                    .unwrap_or(0),
             HwClass::Pci { class_code, bar_ix, .. } =>
                 crate::arch::imp::pci::find_by_class(class_code)
                     .map_or(0, |d| d.bar[(bar_ix as usize).min(5)]),
@@ -646,31 +656,51 @@ fn pci_msi_vector(class_code: u32, core_id: u32) -> u8 {
     let existing = PCI_MSI_VEC[d.index].load(Ordering::Relaxed);
     if existing != 0 { return existing; }   // a restart: same device, same vector
 
-    let slot = MSI_POOL_NEXT.fetch_add(1, Ordering::Relaxed) as usize;
-    if slot >= crate::arch::imp::interrupts::MSI_POOL_LEN {
-        crate::kprintln!(
-            "pci-msi: pool exhausted ({} vectors) - class {:#08x} gets NO interrupt and must poll",
-            crate::arch::imp::interrupts::MSI_POOL_LEN, class_code);
-        return 0;
-    }
-    let vector = crate::arch::imp::interrupts::MSI_POOL_BASE + slot as u8;
-
     // Deliver to the core the driver is pinned to, so a device event wakes that core directly out
     // of its idle halt rather than via a cross-core IPI - the same reasoning the named vectors use.
     let dest = crate::arch::imp::pci::msi_dest_lapic(core_id);
-    if !crate::arch::imp::pci::program_msi(d.bdf, vector, dest)
-        && !crate::arch::imp::pci::program_msix(d.bdf, vector, dest)
-    {
-        crate::kprintln!(
-            "pci-msi: BDF {:#06x} (class {:#08x}) accepted neither MSI nor MSI-X - no interrupt, must poll",
-            d.bdf, class_code);
-        return 0;
+
+    // The slot is consumed only once the device is actually PROGRAMMED. Reserving first and
+    // programming after would let a device that accepts neither MSI nor MSI-X burn a slot on every
+    // spawn attempt, so eight restarts of one such device would exhaust the pool for every other
+    // device - a bounded resource drained by a path that never used it (§26.6).
+    //
+    // The CAS makes that safe without ASSUMING spawns are serialised. If another core took the slot
+    // in between we retry with the next one and reprogram, so the last write to the device is
+    // always the vector we end up holding.
+    loop {
+        let slot = MSI_POOL_NEXT.load(Ordering::Acquire) as usize;
+        if slot >= crate::arch::imp::interrupts::MSI_POOL_LEN {
+            crate::kprintln!(
+                "pci-msi: pool exhausted ({} vectors) - class {:#08x} gets NO interrupt and must poll",
+                crate::arch::imp::interrupts::MSI_POOL_LEN, class_code);
+            return 0;
+        }
+        let vector = crate::arch::imp::interrupts::MSI_POOL_BASE + slot as u8;
+
+        if !crate::arch::imp::pci::program_msi(d.bdf, vector, dest)
+            && !crate::arch::imp::pci::program_msix(d.bdf, vector, dest)
+        {
+            crate::kprintln!(
+                "pci-msi: BDF {:#06x} (class {:#08x}) accepted neither MSI nor MSI-X - no interrupt, must poll",
+                d.bdf, class_code);
+            return 0;   // no slot consumed
+        }
+
+        if MSI_POOL_NEXT.compare_exchange(
+                slot as u32, slot as u32 + 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            continue;   // lost the slot to another core; take the next one and reprogram
+        }
+        PCI_MSI_VEC[d.index].store(vector, Ordering::Relaxed);
+        crate::kprintln!("pci-msi: class {:#08x} BDF {:#06x} -> vector {:#04x} (pool slot {})",
+                         class_code, d.bdf, vector, slot);
+        return vector;
     }
-    PCI_MSI_VEC[d.index].store(vector, Ordering::Relaxed);
-    crate::kprintln!("pci-msi: class {:#08x} BDF {:#06x} -> vector {:#04x} (pool slot {})",
-                     class_code, d.bdf, vector, slot);
-    vector
 }
+
+/// `bar_ix` value meaning "the first mapped MEMORY BAR" rather than a numbered one (see
+/// `hw_mmio_of`). 7 is free because the field is 3 bits and only 0..5 are real BARs.
+pub const BAR_AUTO: u8 = 7;
 
 /// Decode a `hw_flags` PCI descriptor: `bit31 | confine<<28 | bar_ix<<24 | class_code`.
 fn hw_pci_of(class: u32, dma_pages: u32) -> HwClass {

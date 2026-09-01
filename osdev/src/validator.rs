@@ -2371,6 +2371,54 @@ fn run_one(test: &TestSpec, image: &Path) -> TestOutcome {
 
 /// Poll `path` until all `expect` substrings appear, any `fail_on` substring
 /// appears, or `deadline` passes.
+/// Does `content` hold `expect` with foreign bytes SPLICED into it?
+///
+/// The kernel's serial writer takes `SERIAL_LOCK` best-effort: it spins for a bounded number of
+/// iterations and then writes ANYWAY, because an unbounded spin here wedged a core with IF=0 once
+/// (`audits/kernel-audit.md` Audit 10). Under output pressure two messages therefore interleave, and
+/// a log line arrives with another writer's bytes inside it:
+///
+/// ```text
+/// adv: A6 pass - cap table filled then rejected without pa403nic
+/// adv: A10 pass [ - kernel addrs as0x syscall args
+/// ```
+///
+/// Both are the expected line, corrupted. Reporting that as "lines not seen" sends the reader
+/// looking for a kernel bug that is not there - it cost two wrong diagnoses before the serial was
+/// read by hand. Worse, a splice landing AFTER the matched substring produces a false PASS, so the
+/// oracle is unreliable in both directions and a green run deserves the same suspicion.
+///
+/// The test is a subsequence within a bounded window: every byte of `expect`, in order, inside a
+/// span no longer than `expect.len()` plus a slack for the interleaved bytes. That is loose enough
+/// to catch a real splice and tight enough not to fire on unrelated text.
+fn spliced_match(content: &str, expect: &str) -> bool {
+    let need: Vec<char> = expect.chars().collect();
+    // Too short to judge. Below this, the characters of the needle appear in order inside ordinary
+    // log text often enough to call a splice on a line that was simply never printed - and a wrong
+    // "it was corrupted" is worse than a plain "not seen", because it sends the reader to the wrong
+    // audit entry. A real splice is only ever observed in the long descriptive pass lines anyway.
+    if need.len() < 24 { return false; }
+
+    // Slack scales WITH the needle instead of being a flat constant. Observed splices insert a few
+    // bytes into a long line (3 chars into 59; 4 into 43), so the corrupted line stays close to its
+    // original length. A window several times the needle would match unrelated prose that merely
+    // happens to contain the right letters in order.
+    let slack = core::cmp::max(16, need.len() / 2);
+    let hay: Vec<char> = content.chars().collect();
+    let window = need.len() + slack;
+    for start in 0..hay.len() {
+        if hay[start] != need[0] { continue; }
+        let mut n = 0usize;
+        for i in start..hay.len().min(start + window) {
+            if hay[i] == need[n] {
+                n += 1;
+                if n == need.len() { return true; }
+            }
+        }
+    }
+    false
+}
+
 fn poll_serial(
     path:     &Path,
     expect:   &[&str],
@@ -2423,17 +2471,35 @@ fn poll_serial(
             // final check so we don't report a false timeout.
             std::thread::sleep(Duration::from_millis(600));
             let content = std::fs::read_to_string(path).unwrap_or_default();
-            let missing: Vec<String> = expect.iter()
+            let missing: Vec<&&str> = expect.iter()
                 .filter(|e| !content.contains(**e))
-                .map(|e| format!("\"{e}\""))
                 .collect();
             if missing.is_empty() {
                 return TestOutcome::Pass;
             }
-            return TestOutcome::Fail(format!(
-                "timeout - lines not seen: {}",
-                missing.join(", ")
-            ));
+            // Name a SPLICED line as spliced. Otherwise a corrupted-but-present line reads as a
+            // missing one, and the reader goes hunting for a kernel bug that is not there.
+            let spliced: Vec<String> = missing.iter()
+                .filter(|e| spliced_match(&content, e))
+                .map(|e| format!("\"{e}\""))
+                .collect();
+            let absent: Vec<String> = missing.iter()
+                .filter(|e| !spliced_match(&content, e))
+                .map(|e| format!("\"{e}\""))
+                .collect();
+            if absent.is_empty() {
+                return TestOutcome::Fail(format!(
+                    "SERIAL SPLICE (not a property failure) - line printed but corrupted                      mid-write by a concurrent writer: {}. See audits/kernel-audit.md Audit 10;                      serial at {}",
+                    spliced.join(", "), path.display()
+                ));
+            }
+            let mut msg = format!("timeout - lines not seen: {}", absent.join(", "));
+            if !spliced.is_empty() {
+                msg.push_str(&format!(
+                    " (and SPLICED, printed but corrupted: {} - audits/kernel-audit.md Audit 10)",
+                    spliced.join(", ")));
+            }
+            return TestOutcome::Fail(msg);
         }
 
         std::thread::sleep(Duration::from_millis(200));

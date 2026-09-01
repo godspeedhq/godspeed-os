@@ -1626,3 +1626,101 @@ all-interrupt count.
 
 The message also said `last running task slot 224` when 224 is `IDLE == MAX_TASKS`, the sentinel for
 "no task at all" - sending a reader to hunt a task that does not exist. It now says `IDLE (no task)`.
+
+---
+
+## Audit 10 - the serial write can splice one log line into another (2026-09-01, `feat/supervisor-owns-images`)
+
+**Status: FOUND, NOT FIXED. Pre-existing, not caused by the vector-pool work that found it.**
+
+### The evidence
+
+`osdev test adv` fails intermittently, and the failing test MOVES between runs: four runs of the same
+binary gave `{}`, `{A10}`, `{A3, A9}`, and `{}`. A test whose result changes without the code
+changing is worth chasing, because it makes every other result in that suite worth less.
+
+The harness saves each test's serial (`build/tests/6_ADVERSARIAL/<id>-<name>.log`), and the failing
+A10 run holds the answer directly. Expected:
+
+```
+adv: A10 pass - kernel addrs as syscall args
+```
+
+Actually on the wire:
+
+```
+adv: A10 pass [ - kernel addrs as0x syscall args
+```
+
+Another writer's bytes (`[`, `0x` - the shape of a `kprintln!`) are spliced INTO the middle of the
+line, twice. The test did not fail because the property under test broke; it failed because the
+kernel corrupted the sentence saying so.
+
+### The mechanism
+
+Both writers are already line-atomic by design. `kprintln!` and the service `log` syscall share
+`log::write_fmt`, whose `LogSink` stages up to 512 bytes and emits them through ONE call to
+`serial_write_bytes_lockfree` - a single `SERIAL_LOCK` hold per message. That was itself a fix for
+this class of problem, and it is not what is failing.
+
+What splices is the lock's **best-effort give-up**. Both `serial_write_byte` and
+`serial_write_bytes_lockfree` spin for at most `SERIAL_LOCK_SPIN_CAP` (5,000,000) and then **write
+anyway**:
+
+```rust
+let mut got = false;
+while t < SERIAL_LOCK_SPIN_CAP { ...try acquire...; t += 1; }
+// proceeds whether or not `got`
+```
+
+That give-up is deliberate and correct in intent: an unbounded spin here wedged a core with IF=0
+once already (`bugs/1_CROSS_CORE_IPC_REPLY_TO_BSP_STALLS.md`), so the cap must stay. But the
+consequence has never been stated: **when the cap is exhausted the kernel silently interleaves two
+messages**, and a UART is slow enough for that to be reachable - a 45-byte line is 45 bounded THRE
+polls with the lock held, which another core under load can outlast.
+
+It correlates with host load, which fits: every failing run tonight had other work running on the
+machine, and both runs with the host to itself were clean.
+
+### It also causes FALSE PASSES, which is worse
+
+A later run made the severity clearer. In one `osdev test adv` run, three separate splices landed:
+
+```
+adv: A6 pass - cap table filled then rejected without pa403nic     <- `403` inside "panic"
+adv: A10 pass [ - kernel addrs as0x syscall args                   <- `[` and `0x` mid-line
+<clobbered>A10 pass -                                              <- the "adv: " prefix destroyed
+```
+
+A6 **PASSED**. The harness matches a substring, and that splice landed after the end of the matched
+prefix, so a corrupted line satisfied the check. A10 failed only because its splice happened to hit
+the matched part.
+
+So the failure mode is not "a test sometimes fails". It is **the oracle is unreliable in both
+directions**: which way a given splice resolves depends only on where in the line it lands. A green
+suite is therefore weaker evidence than it looks, and that is the part worth acting on.
+
+### Why it matters beyond a flaky test
+
+A spliced log line is a SILENT failure of the one instrument every other diagnosis depends on
+(invariant 12, §26.7). Tonight it produced two wrong conclusions before the serial was read: first
+that A9 might be a regression from the `IMAGE_SPAWN` gate, then that the log path was atomic and so
+splicing could not be the cause. Both were reasoning; the serial file settled it in one line.
+
+### What is NOT the fix
+
+Removing the cap. That reinstates a known core wedge, and §25 is explicit that a fix which needs a
+violation is the wrong fix.
+
+### Options, for a decision rather than a drive-by change
+
+1. **Count the give-ups and expose the count** (`InspectKernel`). No change to the byte stream and no
+   new kernel responsibility - it makes an existing silent event visible, which is what invariant 12
+   asks. A corrupted log becomes explainable instead of mysterious, and the harness could report it.
+2. **Raise the cap.** Reduces frequency, does not remove the case, and the number wants justifying
+   against the wedge it exists to prevent.
+3. **Leave it and record it here.** What is happening now.
+
+Recorded rather than papered over (§26.7): the fix touches the most safety-critical output path in
+the system, on a defect that predates this branch, so it is written down for a decision rather than
+changed unprompted alongside unrelated work.

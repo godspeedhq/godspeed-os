@@ -344,6 +344,13 @@ pub mod hwclass {
         PCI | (if confine { PCI_CONFINE } else { 0 }) | ((bar_ix & 0x7) << 24) | (class_code & 0x00FF_FFFF)
     }
 
+    /// BAR index meaning "the first mapped MEMORY BAR" rather than a numbered one.
+    ///
+    /// Use this when one driver covers devices that put their registers in different BARs - the
+    /// e1000 uses BAR0 where the RTL8168 puts I/O ports there and its registers in BAR2. Both are
+    /// "the first memory BAR", and neither driver should have to know which it got.
+    pub const BAR_AUTO: u32 = 7;
+
     /// `pci`, for a driver that needs an INTERRUPT as well.
     pub const fn pci_irq(class_code: u32, bar_ix: u32, confine: bool) -> u32 {
         pci(class_code, bar_ix, confine) | PCI_IRQ

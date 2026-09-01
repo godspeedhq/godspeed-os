@@ -467,6 +467,36 @@ failing loudly (invariant 12). One writer, at the point the vector is decided.
 **So D1 + D1b together: a driver for any PCI device this kernel has never heard of - registers, DMA
 arena, bus-master enable and interrupt - needs NO kernel change.** That was the goal.
 
+### `BAR_AUTO`, and the NIC that could not be expressed without it
+
+Moving a second driver found the design's first real limit, which is the useful kind of finding:
+**`hw_pci_bar = <index>` could not express the NIC.**
+
+The NIC scan never used a fixed index. It walks the BARs and takes the **first mapped MEMORY BAR**,
+and that is not an accident - it is what lets ONE driver cover both supported cards. The e1000 puts
+its registers in BAR0; the RTL8168 on the Wyse puts I/O ports there and its registers in BAR2. Any
+number written in a contract is wrong for one of them.
+
+So BAR index **7** now means AUTO: the first mapped memory BAR. It costs no bits (the field is 3
+bits and only 0..5 are real BARs), and it is still not an address - it is a RULE the kernel evaluates
+over its own scan, exactly as an index is. It is arguably the better default: a driver wants "my
+registers", and which BAR they landed in is the bus's business.
+
+**What moving `nic-driver` actually bought is bigger than the addressing.** `HwClass::Nic` granted
+MMIO only to two hard-coded vendor/device IDs:
+
+```rust
+HwClass::Nic if matches!(NIC_VENDOR_DEVICE, 0x100E_8086 | 0x8168_10EC) => NIC_MMIO_BASE
+```
+
+Intel 8086:100E and Realtek 10EC:8168. **A third NIC could not be driven at all without a kernel
+rebuild** - a whitelist of specific silicon, in the kernel, which is precisely what step D exists to
+delete. Named by class 0x020000 ("PCI ethernet controller", which every one of them reports) the
+whitelist is gone and the kernel knows none of them.
+
+ARM keeps the kind, correctly: neither Pi has a PCI bus (LAN9514 over USB on the Pi 2, GENET on the
+Pi 4), so there is no class code to name and no table to find it in.
+
 The remaining gap is not interrupts, it is arches: only x86_64 fills the device table (below).
 
 **Per-arch state.** x86_64 fills the table. arm32 never will - it has no PCI at all, the DWC2 is
