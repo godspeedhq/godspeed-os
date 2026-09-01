@@ -372,64 +372,102 @@ It would also quietly undo step D. The point of D is that the kernel stops knowi
 bus; keeping the results puts a device table back - smaller, but the same category of thing. The pin
 exists to catch precisely that.
 
-### The blocker D has to answer first: who may name an ADDRESS
+### The blocker D had to answer: who may name an ADDRESS
 
-The sketch above has the supervisor spawn a driver "with those facts" - MMIO base, IRQ, BDF. Step C
-established the opposite rule and `SpawnImage` now enforces it:
+The sketch above has the supervisor spawn a driver "with those facts": MMIO base, IRQ, BDF. Step C
+established the opposite and `SpawnImage` enforces it, refusing raw addresses outright - because a
+caller that can name an MMIO base can point a driver at ANY physical memory, which is kernel-equivalent
+reach on any board without an IOMMU (both Pis, and any x86 machine whose firmware supplies no IVRS).
 
-```
-task: SpawnImage refused - raw hardware addresses are not honoured; name the device CLASS instead
-```
+An earlier draft of this section concluded that D was therefore blocked, on the reasoning that the
+kernel cannot validate a supplied address without reading config space - the very capability D removes.
+**That reasoning was wrong, and this replaces it.** The kernel does not need to know WHICH DEVICE owns a
+range. It only needs to know the range is **not RAM** - and it already holds that truth, independently
+of any bus, in the memory map the bootloader handed it (`BootInfo.memory_map`, retained for the
+kernel's lifetime).
 
-That refusal is not fussiness. A caller that can name an MMIO base can point a driver at ANY physical
-memory, which is kernel-equivalent reach on any board without an IOMMU - both Pis, and any x86 machine
-whose firmware supplies no IVRS (§6.4). Handing that to the supervisor would give back, in one field,
-more than the whole probe-image move took away.
-
-And the kernel cannot simply validate a supplied address, because validating it means reading config
-space to see whether the address really belongs to that device - which is precisely the capability D
-is trying to remove from the kernel. Stated plainly, that is a circle:
-
-> to check the supervisor's number the kernel must read the bus; if it can read the bus it does not
-> need the supervisor's number.
-
-**The resolution is to move the granularity, not the trust.** The caller names a **device**, never an
-address:
+So the check is:
 
 ```
-  supervisor  ->  "spawn `xhci`, it claims BDF 00:14.0, class 0x0c0330"
-  kernel      ->  reads THAT BDF's class code and BAR0 from config space
-                  class matches?  grant the BAR it read.  else REFUSE.
+  bus-probe    reads config space, enumerates, reports (BDF, class, BAR, size, IRQ)
+  supervisor   picks a driver for a device, spawns it with (phys, len)
+  kernel       REFUSES any range that intersects usable RAM   <- against its OWN map, not the caller's word
 ```
 
-This is the step-C principle at finer granularity - *the caller says WHICH device, the kernel says
-WHERE it is* - and every property that made the class mechanism safe survives:
+What a compromised reporter or supervisor can then do is hand a driver **some other device's
+registers**. What it can never do is map RAM, kernel page tables, or another service's memory. That is
+a real bound, checked against a truth the kernel owns - not trust in a number it was given. It is also
+the same posture §6.4 already accepts for a DMA-capable driver on a board with no IOMMU, so it adds no
+new CATEGORY of exposure; today's arrangement is not safer, only more implicit.
 
-- **No address is ever supplied.** The kernel reads BAR0 itself, so a wrong or hostile number cannot
-  become a mapping.
-- **A wrong BDF is caught**, not obeyed: the class code at that BDF is checked against the class the
-  driver claims, so pointing the `xhci` driver at the NIC is refused rather than granted.
-- **`dma_phys_slot` still works**, which a raw address could never express: the permanent per-device
-  physical DMA reservation is keyed by the device, and the device is what the caller named.
+With that, the kernel's bus responsibility goes to **zero**: no scan, no classification, no `HwClass`
+variant per device, none of the 21 per-class statics. All 1,017 lines of `pci.rs` leave the kernel.
+What it gains is a bounds check against a map it already has, and granting MMIO by `(phys, len)`
+instead of by class - mechanism, not policy.
 
-What the kernel LOSES is what D is actually about, and it is the larger half:
+### The service is a REPORTER, and must stay one
 
-| stays (mechanism) | goes (policy) |
+The greatest risk to this service is not a bug. It is that the only component able to see the whole bus
+is an obvious home for anything bus-shaped, and each addition will look reasonable on its own: power
+states, hot-plug policy, BAR rebalancing, MSI vector allocation, AER handling, an `lspci` surface,
+"while you are in there, could you also...". That is §26.1 erosion with a different subject, and the
+kernel is only small because something says no on its behalf.
+
+So the same discipline applies, and the same way - **by capability, not by policy**:
+
+> It READS config space and REPORTS what is there. It does not decide, assign, configure, or own.
+
+The load-bearing constraint is that it holds almost nothing:
+
+| it holds | it must never hold |
 |---|---|
-| read one BDF's class code + BAR on request | scanning the bus and classifying what is on it |
-| verify the claim, grant or refuse | `XHCI_FOUND` / `AHCI_ABAR` / `NIC_BDF` and their siblings |
-| | one `HwClass` variant per device the kernel was taught |
-| | deciding which driver claims which device |
+| read access to config space | `SPAWN` / `IMAGE_SPAWN` - it starts nothing |
+| its own recv endpoint | `SERVICE_CONTROL` - it stops nothing |
+| a log | any MMIO or DMA grant - it drives no device |
+| | **write** access to config space - see below |
 
-So the kernel's bus responsibility SHRINKS from "enumerate and classify" to "read one register set and
-check it matches". A new kind of device needs no kernel change: `bus-manager` enumerates it, the
-supervisor picks a driver, and the kernel verifies the claim without ever having heard of that class.
+Most of the funky things are then IMPOSSIBLE rather than forbidden, which is the only kind of "no"
+that survives a determined contributor. Deciding which driver claims a device stays with the
+supervisor, where it already lives: the reporter says "BDF 00:14.0 is class 0x0c0330", and something
+else decides that means `xhci`. A reporter that also chose drivers would be a policy engine.
 
-This is a refinement of the sketch above, not what it originally said, and it is recorded here rather
-than discovered mid-implementation - the sketch would have required the kernel to accept caller-named
-addresses, and that trade was never actually argued for.
+This is checkable today, without new machinery: a service's authorities are declared in its contract
+and reconciled against the kernel by `scripts/contract_check.py`, so a new grant cannot appear
+quietly. A second, cheap pin on its IPC opcode list would catch growth that needs no new authority;
+worth adding when the service exists, not before (§26.2).
 
-### The fiddly part of D: assignment once, re-read always
+**The name matters more than it looks.** "bus-manager" invites management - it names the thing after a
+role that has no natural boundary, and the first person to propose power management will be right, by
+its own name. `bus-probe` (or `bus-report`) names what it does, and makes the same proposal read as
+out of scope on sight.
+
+PROPOSED, not adopted: the rest of this document still says `bus-manager`, and renaming a thing is
+worth doing once, deliberately, rather than half-way. If the rename is taken, it is a sed and this
+paragraph becomes the reason it happened.
+
+**Read-only is the goal and may not be free.** On x86 firmware assigns BARs before the OS runs, so
+reading is genuinely enough. On the Pi 4 the kernel currently ASSIGNS them
+(`pcie: xHCI BAR0 assigned bus 0xf8000000 -> CPU 0x600000000`), and assignment is a write. If that job
+moves too, the service acquires write access and with it the power to point any device anywhere - a
+materially bigger thing to trust, and the door through which "manager" walks back in. Keeping
+assignment where it is (the boot path, once) and the reporter read-only is the better split, and the
+"assignment once, re-read always" problem below is exactly why.
+
+### The two costs still to accept before building
+
+**1. Config-space access for the reporter.** Pi 4 ECAM is an MMIO window - no new mechanism. x86 uses
+I/O ports `0xCF8`/`0xCFC`, and userspace cannot execute `IN`/`OUT`, so this needs a port-I/O capability
+or a gated syscall: a NEW KERNEL AUTHORITY, and the pin grows again. Defensible - it is the mechanism
+that lets 1,017 lines leave ring 0, which is the same trade `FIRE_IRQ` made for 123 lines - but it is a
+real addition and belongs in the decision, not in the implementation.
+
+**2. The interrupt.** A vector is authority (`task::hw_irqs_for`), and the kernel currently states it
+rather than accepting it. Under D the device's IRQ line comes from config space, which the kernel no
+longer reads. Either the reporter reports it and the kernel bounds-checks the vector against the range
+it is willing to route, or that single fact keeps a foot in the kernel. The first is consistent with
+the address decision above; the second is smaller. Unresolved, deliberately.
+
+### The fiddly part of D: assignment once, re-read always### The fiddly part of D: assignment once, re-read always
 
 Re-enumeration after a restart must not disturb live drivers. On the Pi 4 today the kernel does not
 merely read the bus, it **assigns**:
