@@ -3122,7 +3122,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The vector the KERNEL programmed this controller's MSI to deliver on; an interrupt notification
     // arrives as exactly this one byte (kernel/src/ipc/message.rs), which is what makes a real IRQ
     // distinguishable from a block request on the same endpoint.
-    const MSI_VECTOR: u8 = 0x28;
+    //
+    // ASKED FOR, not assumed. This was `const MSI_VECTOR: u8 = 0x28` - correct while the kernel held
+    // one constant per device class, so both sides knew the number statically. The MSI pool (step D1b)
+    // allocates a vector at spawn instead, and the kernel began routing 0x30 while this still tested
+    // for 0x28. Nothing broke loudly: the interrupt still woke the loop, the keyboard still typed, and
+    // the poll fallback covered the rest. It just reported `0 MSI, 7799 msg` on the T630 - every real
+    // interrupt filed as an unknown message, by the instrument whose whole job is to say whether
+    // interrupts work. The comment below `is_irq` had predicted precisely this.
+    //
+    // `None` means no interrupt was granted, and then NOTHING is an IRQ - which is the honest reading,
+    // not a reason to guess. The loop's 10 ms poll already covers that case.
+    let msi_vector: Option<u8> = ctx.irq_vector();
+    ctx.log_fmt(format_args!(
+        "xhci: IRQ vector granted by the kernel: {}",
+        match msi_vector { Some(v) => v, None => 0 }));
     'reenum: loop {
         // Stop + reset the controller. The Wyse `chaos max-carnage` all-core freeze lands
         // DETERMINISTICALLY in this sequence (the log dies right after the "v..." line above), so bracket
@@ -3912,7 +3926,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // the "waking on interrupts (MSI)" line proved only that something had arrived. I read
             // that line off a hardware log and told the user interrupts were working. It was never
             // evidence. Now it means what it says.
-            let is_irq = woke.as_ref().is_some_and(|m| m.payload_bytes() == [MSI_VECTOR]);
+            let is_irq = msi_vector.is_some_and(|v| {
+                woke.as_ref().is_some_and(|m| m.payload_bytes() == [v])
+            });
             if is_irq { msi_count = msi_count.saturating_add(1); }
             // Woken by a message that is NOT an interrupt - i.e. a block request, or anything else
             // addressed to this endpoint. Counted because the arithmetic says something is: the idle

@@ -303,6 +303,23 @@ struct ServiceContextData {
     reply_recv_slot:    u32,
     /// SEND|GRANT cap to `reply_recv_slot`'s endpoint, for handing out as a reply cap. `u32::MAX` = none.
     reply_grant_slot:   u32,
+    /// The interrupt VECTOR(s) this service was granted, so a driver can learn which one it got.
+    ///
+    /// The kernel used to hand every driver a vector it could also hardcode: `XHCI_MSI_VECTOR` was a
+    /// kernel constant, so both sides knew 0x28 statically and a driver comparing against its own copy
+    /// was correct. The MSI pool (step D1b) makes the vector ALLOCATED AT SPAWN, and that quietly
+    /// invalidated the hardcoded copy: the kernel began routing 0x30 while `services/xhci` still tested
+    /// for 0x28, so it classified every real interrupt as an unknown message and reported `0 MSI, 7799
+    /// msg` on hardware. Nothing broke - the interrupt still WOKE the driver - but the one instrument
+    /// that says whether interrupts work had started reporting the opposite.
+    ///
+    /// The design gap was this field's absence, not the stale constant. A driver already learns its
+    /// MMIO window and DMA arena from the kernel (`ctx.mmio()`, `ctx.dma_region()`) precisely because
+    /// it may not name them; its vector is the same kind of fact and now travels the same way. A
+    /// caller still cannot ASK for a particular vector - that is authority (§12.3) - it can only be
+    /// told which one it was given.
+    irq_count:          u32,      // 0 = no interrupt granted
+    irqs:               [u8; 4],  // the granted vectors; only the first `irq_count` are meaningful
 }
 
 // The kernel writes this struct and the SDK reads it, from two crates, with no shared definition -
@@ -312,7 +329,7 @@ struct ServiceContextData {
 // Pinned by SIZE in both crates. It does not prove field ORDER, but it catches the mistake that
 // actually happens - an append on one side only - and it fails at compile time in the crate that
 // drifted rather than at boot in a service that reads garbage.
-const SERVICE_CONTEXT_DATA_SIZE: usize = 320;   // 256 + 2 x SendPeerEntry(32) after MAX_SEND_PEERS 4 -> 6
+const SERVICE_CONTEXT_DATA_SIZE: usize = 328;   // 320 + irq_count(4) + irqs[4] - the granted vector (D1b)
 const _: () = assert!(
     core::mem::size_of::<ServiceContextData>() == SERVICE_CONTEXT_DATA_SIZE,
     "ServiceContextData changed size: update BOTH kernel/src/task/mod.rs and      sdk/rust/src/service_context.rs, then update SERVICE_CONTEXT_DATA_SIZE in both"
@@ -2125,6 +2142,19 @@ fn spawn_service_with_image(
             data.fb_height          = fb_grant.map_or(0, |g| g.height);
             data.fb_bpp             = fb_grant.map_or(0, |g| g.bpp);
             data.fb_shifts          = fb_grant.map_or(0, |g| g.shifts);
+            // The granted interrupt vector(s). Written here beside the MMIO and DMA grants because it
+            // is the same kind of fact: something the kernel CHOSE for this driver, which the driver
+            // must be able to read and may not name. Truncated to the field, loudly - a driver told
+            // about fewer vectors than it was routed would misclassify the rest.
+            data.irq_count = core::cmp::min(hw_irqs.len(), data.irqs.len()) as u32;
+            if hw_irqs.len() > data.irqs.len() {
+                crate::kprintln!(
+                    "task: '{}' routed {} IRQs but the context carries {} - the rest are ROUTED but not reported",
+                    name, hw_irqs.len(), data.irqs.len());
+            }
+            for (i, &v) in hw_irqs.iter().take(data.irqs.len()).enumerate() {
+                data.irqs[i] = v;
+            }
             for i in 0..peer_count {
                 data.send_peers[i].slot     = peer_data[i].0;
                 data.send_peers[i].name_len = peer_data[i].1;
