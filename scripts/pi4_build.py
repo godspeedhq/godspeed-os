@@ -139,7 +139,10 @@ import service_embed_check
 service_embed_check.enforce(str(ROOT), "aarch64")
 
 # 1. The services first - the kernel embeds their ELFs, so a stale service is baked into the image.
-for svc in PI4_SERVICES:
+# THE SUPERVISOR IS BUILT LAST - it `include_bytes!`s every other service, so building it earlier
+# (it was index 6 of 24) ships the PREVIOUS build of everything after it. See scripts/embed_order_check.py.
+_ORDERED = [s for s in PI4_SERVICES if s != "supervisor"] +            (["supervisor"] if "supervisor" in PI4_SERVICES else [])
+for svc in _ORDERED:
     feats = ["--features", "bare-metal"] if svc == "supervisor" else []
     if svc == "supervisor":
         feats = ["--features", "bare-metal"]
@@ -159,6 +162,10 @@ for svc in PI4_SERVICES:
 import stack_fit_check
 stack_fit_check.enforce(
     tool("rust-objdump"), str(ROOT), TARGET, PROFILE, PI4_SERVICES, 64 * 4096)
+
+sys.path.insert(0, str(ROOT / "scripts"))
+import embed_order_check
+embed_order_check.enforce(str(ROOT), TARGET, PROFILE, PI4_SERVICES)
 
 # 2. The kernel.
 args = ["cargo", "build", "-p", "kernel", "--target", TARGET, "--features", FEATURES] + rel

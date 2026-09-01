@@ -152,13 +152,23 @@ def main():
     #    hardware alias, which STALLs in the DATA stage. A flag that selects nothing is worse than an
     #    absent one: it reports success and you debug the wrong layer.
     _check_embed()
-    for svc in ARM_SERVICES:
+    # THE SUPERVISOR IS BUILT LAST, because it `include_bytes!`s every other service. Built earlier -
+    # it was index 4 of 24 - cargo reuses the previous run's binaries for everything after it, and the
+    # image ships services one build behind next to a current kernel. Nothing fails and nothing warns.
+    # Caught when a shell change verified on x86 was demonstrably absent from `kernel7.img`.
+    ordered = [s for s in ARM_SERVICES if s != "supervisor"] +               (["supervisor"] if "supervisor" in ARM_SERVICES else [])
+    for svc in ordered:
         feats = []
         if svc == "supervisor":
             feats = ["--features", "bare-metal"]
         elif svc == "dwc2" and args.qemu:
             feats = ["--features", "qemu"]
         run(["cargo", "build", "-p", svc, "--target", TARGET] + feats + rel)
+
+    # 1a2. THE SUPERVISOR MUST BE NEWER THAN EVERYTHING IT EMBEDS - ordering made enforceable.
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import embed_order_check
+    embed_order_check.enforce(ROOT, TARGET, profile, ARM_SERVICES)
 
     # 1b. EVERY SERVICE MUST FIT ITS OWN STACK.
     #
