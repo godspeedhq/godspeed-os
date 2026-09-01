@@ -1893,6 +1893,14 @@ pub mod syscall_entry {
 }
 
 // ---------------------------------------------------------------------------
+/// No unlocked-fault-write counter on this arch: the x86 fault handlers are the ones that bypass the
+/// serial lock (audits/kernel-audit.md Audit 10). Reports 0 rather than pretending to measure
+/// something - a zero it HAS earned, because nothing here writes unlocked.
+///
+/// Lives at the ARCH TOP LEVEL, not inside `mod pci`, because `syscall::dispatch` reaches it as
+/// `crate::arch::imp::serial_unlocked_emit_count` - which is where x86 defines it too.
+pub fn serial_unlocked_emit_count() -> u64 { 0 }
+
 pub mod interrupts {
     /// The MSI vector pool is x86-only (`arch/x86_64/interrupts.rs`, step D1b). Neither Pi has one:
     /// a pool hands vectors to devices found on a PCI bus, and there is no PCI bus here to find them
@@ -2109,10 +2117,6 @@ pub mod pci {
     pub fn set_power_d0(bdf: u32) {}
     pub fn xhci_bios_handoff() {}
     pub fn ehci_flr_probe() {}
-    /// No unlocked-fault-write counter on this arch yet: the x86 fault handlers are the ones that
-    /// bypass the serial lock (audits/kernel-audit.md Audit 10). Reports 0 rather than pretending to
-    /// measure something - a zero it HAS earned, because nothing here writes unlocked.
-    pub fn serial_unlocked_emit_count() -> u64 { 0 }
     pub fn program_msi(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
     pub fn program_msix(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
     /// No LAPIC on ARM; the pool is x86-only until this port grows a generic MSI path.

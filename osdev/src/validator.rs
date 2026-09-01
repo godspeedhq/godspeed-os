@@ -1181,7 +1181,19 @@ static BRUTAL_STRESS_TESTS: &[TestSpec] = &[
         kind: TestKind::WatchSerial {
             expect:       &["stress: BS5 pass (5000/5000)"],
             fail_on:      &["KERNEL PANIC", "KERNEL PF:", "stress: BS5 FAIL"],
-            timeout_secs: 720, // 6× S5's 120s - extra margin for concurrent kill/respawn pressure
+            // MEASURED, not guessed: 5000 cycles cost ~1210 s, and the per-500-cycle cost is FLAT
+            // (~121 s per block across all ten blocks) - so no leak and no degradation over 5000
+            // respawns, which is the property this test exists to check. 3000 s is ~2.5x observed,
+            // and is the budget actually CONFIRMED by two passing runs - 2400 s was computed but never
+            // run, and a budget nothing has passed at is a guess wearing a measurement's clothes.
+            //
+            // It was 720 s, with a comment claiming "6x S5's 120s" - stale twice over. S5's budget
+            // had since become 400 s, and more importantly the WORK changed: step C routed service
+            // spawn through the SUPERVISOR, so a respawn is now a round-trip through its 16-deep
+            // queue under ~200-task load rather than a direct kernel syscall. BS5 is the only test
+            // that does 5000 of them, so it is the only one that change re-priced. The system is
+            // fine; the number was measuring an architecture that no longer exists.
+            timeout_secs: 3000,
         },
     },
     TestSpec {

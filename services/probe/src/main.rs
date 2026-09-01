@@ -2964,7 +2964,13 @@ fn mode_stress_bs5(ctx: &ServiceContext) -> ! {
     // BS5 - Generation integrity, 5× S5 (§22 Brutal Stress BS5).
     // 5000 kill/respawn cycles; endpoint generation must be strictly monotonic.
     let mut prev_gen: u64 = 0;
-    for _ in 0..5_000u32 {
+    for i in 0..5_000u32 {
+        // Progress, every 500 cycles. A test that runs for minutes and logs NOTHING until it
+        // finishes cannot say whether a timeout means "slow" or "stuck" - and those are different
+        // bugs with different fixes. This one timed out twice with no way to tell which it was.
+        if i % 500 == 0 {
+            ctx.log_fmt(format_args!("stress: BS5 progress {}/5000", i));
+        }
         let _ = ctx.kill("stress-bs5-victim");
         let _ = table::probe(ctx, "stress-bs5-victim");
         let gen = ctx.inspect_endpoint_generation("stress-bs5-victim");

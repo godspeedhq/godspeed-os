@@ -556,6 +556,109 @@ variant per device, none of the 21 per-class statics. All 1,017 lines of `pci.rs
 What it gains is a bounds check against a map it already has, and granting MMIO by `(phys, len)`
 instead of by class - mechanism, not policy.
 
+### DECIDED (2026-09-01): `hw-enumerator` may hold direct hardware authority
+
+The question this section poses is settled. A service MAY hold direct hardware-access authority,
+scoped to the minimum its contract needs. The governing line:
+
+```
+kernel:     "Given a valid capability, I permit this operation."
+userspace:  "I know what this operation MEANS."
+```
+
+The kernel knows how to perform `in(port)` / `out(port, value)`. It does not know that `0xCF8` means
+PCI configuration, how to walk a bus, what a class code identifies, or how to read a BAR. That
+knowledge is hardware SEMANTICS and belongs in userspace. This is §26.10 applied to a privileged
+instruction rather than to a syscall.
+
+**The x86 legacy PCI grant.** For Configuration Mechanism #1, `hw-enumerator` receives exactly:
+
+```
+MAY:       OUT32 0xCF8          (select a config register)
+           IN32  0xCFC-0xCFF    (read it)
+MUST NOT:  OUT   0xCFC-0xCFF    (write it)
+```
+
+Not "all port I/O", and not `READ/WRITE 0xCF8-0xCFF`. Authority reflects the operations actually
+required, and enumeration is inherently read-only.
+
+**Read-only is a PERMANENT boundary, not a starting point.** CF8/CFC looks like two ports but CF8
+selects WHICH register CFC reaches, so CFC write authority is effectively write access across the
+whole of PCI configuration space - every BAR, every command register, every device. There is no
+narrower form of it at port granularity, because the target is chosen by data rather than by the
+interface. So if a future need requires configuration-space mutation - destructive BAR sizing is the
+obvious one - CFC write MUST NOT simply be added. A different mechanism must be designed and justified
+separately. Godspeed does not currently need sizing (`mmio_len` comes from a fixed page count per
+class, not from probing), so there is nothing to solve today and no reason to solve it speculatively
+(§26.2).
+
+**CF8/CFC must have ONE exclusive holder.** The pair is STATEFUL: a write to CF8 selects, a read of
+CFC retrieves. Two independent holders do not merely race, they silently read each other's device:
+
+```
+A: OUT CF8, addr_A
+B: OUT CF8, addr_B
+A: IN  CFC          <- A reads B's register, and nothing anywhere says so
+```
+
+That is a silent wrong answer, which is worse than a denied one (invariant 12). The holder is
+`hw-enumerator`, and there is no kernel exception - see the next section for why the kernel does not
+need config reads either.
+
+### Address ADMISSIBILITY, not device PROVENANCE
+
+Moving enumeration out raises a second question, and conflating two guarantees is the trap:
+
+```
+admissibility:  "May this physical range EVER be granted as MMIO?"
+provenance:     "Does this range actually belong to THIS device?"
+```
+
+**The kernel guarantees the first and explicitly declines the second.** It checks a claimed range
+against the memory map it already owns and refuses anything intersecting usable RAM, the kernel image,
+service memory or the frame pool. No PCI interpretation, no config read - so the exclusivity rule above
+holds without a kernel carve-out, and the check is arch-neutral (Limine on x86, device tree on ARM).
+
+The rule this enforces:
+
+> A service may IDENTIFY a physical address. It may not thereby ACQUIRE AUTHORITY over that address.
+
+**The residual, stated rather than disguised.** Admissibility does not prove ownership. A compromised
+`hw-enumerator` could still claim *driver A -> device B's window*, provided B's window is itself an
+admissible non-RAM region. What it can never do is turn protected memory into MMIO authority. That
+reduces the catastrophic case ("userspace can mint authority over arbitrary physical memory") to a
+materially smaller one ("the discovery service may misassociate one hardware window with another"),
+and the residual is the same posture §6.4 already accepts for an unconfined DMA driver. If the stronger
+claim is ever needed, it belongs to device-scoped IOMMU authority - not to dragging PCI parsing back
+into ring 0 to strengthen today's check.
+
+**Two implementation hazards, because both are wrong-by-default:**
+
+1. **Unknown classification must DENY.** The memory map's match ends in a catch-all
+   (`_ => MemoryKind::Reserved`), which today absorbs ACPI NVS, bad memory, the framebuffer, and every
+   firmware type that does not exist yet. Written as a denylist ("deny RAM, kernel, services, pool;
+   admit the rest"), the check ADMITS all of those and silently widens as new types appear. A security
+   check must default to deny.
+2. **The check applies to the PAGE-ALIGNED granted range**, not the claimed range. MMIO is mapped in
+   pages; a window sharing a page with a denied region leaks that region even though the claim passed.
+
+**One empirical question, answerable from a boot dump rather than by reasoning:** do real BARs fall
+inside a firmware-DESCRIBED region, or in an undescribed gap? If they sit in gaps (common - the PCI
+hole is often not described), the clean rule is *admit iff the range overlaps no described region*,
+complete by construction and needing no per-type list. If firmware describes the hole as reserved, that
+rule denies legitimate BARs and the positive-classification form is required instead. The T630 and the
+Wyse may differ; dump both before fixing the wording.
+
+### "Not in `hw-enumerator`" does not mean "must be in the kernel"
+
+The prohibition on CFC writes does not imply that configuration-space mutation belongs in ring 0. It
+means such mutation is not `hw-enumerator`'s. Where it belongs is a separate decision requiring its own
+justification, and a future constrained probe or separate service may be the right answer.
+
+This is worth stating as a rule because the failure mode is structural: without it, every prohibition
+on a service becomes an argument for the kernel by default, and the kernel grows by exclusion - one
+carefully-reasoned exception at a time, each individually defensible.
+
 ### The service is a REPORTER, and must stay one
 
 The greatest risk to this service is not a bug. It is that the only component able to see the whole bus
