@@ -844,6 +844,28 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
 
+    // AND `IMAGE_SPAWN` ON TOP OF IT - a SECOND, distinct authority, because these are two different
+    // powers that were sharing one capability.
+    //
+    // `SPAWN` means "start a service the system already knows". This syscall means "start ARBITRARY
+    // BYTES, under a name you choose", which is a power that did not exist before step C moved the
+    // images out of the kernel (`docs/service-ownership.md`): while the kernel held every image, a
+    // spawner could only ask for one the kernel already had. Afterwards this had to accept bytes from
+    // userspace, and it was gated by the capability the SHELL happens to hold for unrelated reasons -
+    // as do `chaos`, `control` and every probe. Any of them could have introduced new code under a
+    // real service's name in the window while that service was dead, and clients reacquiring by name
+    // (§14.3) would have wired themselves to it.
+    //
+    // Checked against the caller's own table rather than a slot it passes, exactly as
+    // `privileges_caller_lacks` checks a delegated privilege: the authority is a property of the
+    // caller, not of an argument it chooses.
+    if !scheduler::current_task_holds_resource(
+        crate::capability::IMAGE_SPAWN_RESOURCE, Rights::WRITE)
+    {
+        crate::kprintln!("task: SpawnImage refused - caller holds SPAWN but not IMAGE_SPAWN (starting arbitrary bytes is the supervisor's authority alone; ask it via supcmd::SPAWN)");
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+
     if req_len as usize != SPAWN_REQUEST_BYTES {
         crate::kprintln!("task: SpawnImage refused - request is {} bytes (kernel expects {})",
             req_len, SPAWN_REQUEST_BYTES);

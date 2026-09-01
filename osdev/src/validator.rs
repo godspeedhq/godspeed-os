@@ -556,7 +556,7 @@ static ADV_TESTS: &[TestSpec] = &[
     TestSpec {
         id: "A9", name: "direct_spawn_bypasses_supervisor", spec_ref: "§22 Adversarial A9",
         kind: TestKind::WatchSerial {
-            expect:       &["adv: A9 pass", "adv: A9b pass"],
+            expect:       &["adv: A9 pass", "adv: A9b pass", "adv: A9c pass"],
             fail_on:      &["KERNEL PANIC", "adv: A9 FAIL"],
             timeout_secs: 30,
         },

@@ -1905,6 +1905,27 @@ fn mode_adv_a9(ctx: &ServiceContext) -> ! {
     if refused == 6 {
         ctx.log("adv: A9b pass - 6 non-probe names refused; a name selects a row, not an image");
     }
+
+    // A9c - SPAWN IS NOT PERMISSION TO SUPPLY THE CODE.
+    //
+    // This probe HOLDS a spawn cap - `privileges_of` grants every probe SPAWN, and the A9 case above
+    // relies on it - so the syscall is authorised and only the second, distinct authority can refuse
+    // it. `SpawnImage` starts ARBITRARY BYTES under a name the caller chooses, which is a different
+    // power from starting a service the system already knows, and until IMAGE_SPAWN existed they were
+    // the same capability: the shell, `chaos`, `control` and every probe could introduce new code
+    // under a real service's name while that service was dead, and clients reacquiring by name (§14.3)
+    // would wire themselves to it.
+    //
+    // The image here is deliberately NOT a valid ELF. The refusal must come from the CAPABILITY, before
+    // the kernel looks at a byte of it - if this ever starts failing for "bad image" instead, the gate
+    // has moved and the test has stopped testing the gate.
+    let junk = [0u8; 64];
+    let mut req = godspeed_sdk::service_context::SpawnRequest::new(&junk, "adv-a9-image-attack");
+    let mut peers_buf = [0u8; 8];
+    match ctx.spawn_image(&mut req, &mut peers_buf, &[]) {
+        Err(_) => ctx.log("adv: A9c pass - SpawnImage refused to a SPAWN holder without IMAGE_SPAWN"),
+        Ok(_)  => ctx.log("adv: A9 FAIL - started a caller-supplied image while holding only SPAWN"),
+    }
     idle(ctx)
 }
 

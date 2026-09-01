@@ -13,7 +13,7 @@ use crate::arch::imp::context_switch::TaskContext;
 use crate::arch::imp::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE, FIRE_IRQ_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE, FIRE_IRQ_RESOURCE, IMAGE_SPAWN_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -719,6 +719,10 @@ struct Privileges {
     gpio:            bool, // GPIO_DEVICE: drive the SoC GPIO pins (ARM `gpio` shell command)
     set_clock:       bool, // SET_CLOCK (WRITE): set the wall clock from SNTP (RTC-less ARM; net-stack)
     set_clock_floor: bool, // SET_CLOCK (READ): raise the persisted clock floor only (the shell)
+    /// IMAGE_SPAWN: start a task from a CALLER-SUPPLIED image (`SpawnImage`). The supervisor alone -
+    /// see `IMAGE_SPAWN_RESOURCE` for why this is not the same authority as `spawn`, and why it is
+    /// deliberately absent from `SUPERVISOR_DELEGATABLE`.
+    image_spawn:     bool,
 }
 
 fn service_privileges(name: &str) -> Privileges {
@@ -726,6 +730,9 @@ fn service_privileges(name: &str) -> Privileges {
         // supervisor is the spawner (init removed, Phase 5); the shell brokers spawns; chaos spawns
         // mem-pressure tasks for max-carnage's spawn-burst dimension; probes spawn victims.
         spawn: matches!(name, "supervisor"),
+        // The supervisor is the only principal that HOLDS images, and the only caller of
+        // `SpawnImage` in the tree. Everything else asks it over IPC (`supcmd::SPAWN`).
+        image_spawn: matches!(name, "supervisor"),
         // Both USB host drivers push decoded keystrokes: xhci (front ports), ehci (USB 2.0 back ports).
         // `dwc2` is the arm32 USB keyboard driver, so it needs this for the same reason `xhci` and
         // `ehci` do. Its absence was the whole of "the keyboard does not work": the transfers were
@@ -1234,6 +1241,10 @@ fn spawn_service_with_image(
             set_clock_floor: bits & privbits::SET_CLOCK_FLOOR != 0,
             set_clock:       bits & privbits::SET_CLOCK       != 0,
             net_device:      bits & privbits::NET_DEVICE      != 0,
+            // NO BIT, and none is coming. A spawner cannot pass on the authority to spawn arbitrary
+            // images: that is exactly the widening this capability exists to close, and a wire bit
+            // for it would re-open the hole one grant later.
+            image_spawn:     false,
             // USB_DISK has NO bit, and that is the finding rather than an omission. It gated
             // `block-driver`'s reach to a USB stick through the in-kernel Bulk-Only stack - and on
             // BOTH ARM ports that stack is gone: the driver now asks the `dwc2` / `xhci` SERVICE over
@@ -1485,6 +1496,14 @@ fn spawn_service_with_image(
     if privs.gpio {
         let g_cap = mint_cap(GPIO_DEVICE_RESOURCE, Rights::WRITE);
         caps.insert(g_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+
+    // IMAGE_SPAWN: the supervisor starts services from images IT holds (`SpawnImage`, syscall 52).
+    // Minted here; WHO holds it is in `service_privileges` - and it is exactly one principal.
+    if privs.image_spawn {
+        let is_cap = mint_cap(IMAGE_SPAWN_RESOURCE, Rights::WRITE);
+        caps.insert(is_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 

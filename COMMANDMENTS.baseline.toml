@@ -250,6 +250,26 @@ GPIO_DEVICE        = 11
 USB_DISK           = 12
 SET_CLOCK          = 13
 FIRE_IRQ           = 14
+# IMAGE_SPAWN - start a task from a CALLER-SUPPLIED image (`SpawnImage`, syscall 52).
+#
+# The checker's question is "why isn't this a service?", and for a CAPABILITY the answer is that it
+# cannot be one: enforcing capabilities IS the kernel's job (§4.3, the C in MISCIS). A capability
+# checked in userspace is not a capability.
+#
+# It adds NO new kernel responsibility. The kernel already gated this syscall - it simply gated it
+# with `SPAWN`, and those turned out to be two different powers wearing one name: "start a service
+# the system knows" and "start ARBITRARY BYTES under a name you choose". The second did not exist
+# before step C moved the images out of the kernel; afterwards `SpawnImage` had to accept bytes from
+# userspace and was guarded by the capability the SHELL holds for unrelated reasons - as do `chaos`,
+# `control` and every probe. Splitting them is the kernel distinguishing two things it was already
+# doing, not taking on a third.
+#
+# The trade, stated plainly: this pin GROWS BY ONE, and what it buys is that twelve services lose the
+# power to introduce new code under a real service's name while that service is dead - the window in
+# which a client reacquiring by name (§14.3) would wire itself to the impostor. Deliberately NOT
+# delegatable (absent from SUPERVISOR_DELEGATABLE), so it cannot be handed on one grant later.
+# Pinned by §22 Adversarial A9c: a probe that HOLDS a spawn cap is refused.
+IMAGE_SPAWN        = 15
 
 
 [kernel.arch_roles]
