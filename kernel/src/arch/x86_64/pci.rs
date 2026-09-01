@@ -54,6 +54,98 @@ const PROGIF_EHCI: u8 = 0x20;
 /// Discovered-xHCI record. Written once by `init` on the BSP during boot,
 /// read later when minting the driver's caps. Plain atomics: single writer at
 /// boot, no concurrent access.
+// ---------------------------------------------------------------------------
+// THE GENERIC DEVICE TABLE (step D1) - what is on the bus, with NO opinion about it.
+//
+// Every static below this block names a device CLASS the kernel was taught: XHCI_FOUND, AHCI_ABAR,
+// NIC_BDF. That is what forces a KERNEL REBUILD to add a driver for a device nobody taught it about,
+// and driver porting is the roadmap - so the kernel stops interpreting and starts reporting.
+//
+// A device is identified by its PCI CLASS CODE - the 24-bit (class, subclass, prog-if) triple that
+// is an INDUSTRY STANDARD: 0x0C0330 IS "xHCI", everywhere, forever. The kernel never has to be told
+// what that means, which is exactly the property the per-class statics lack.
+//
+// Bounded and flat (§26.6): a fixed array, no heap, filled once during the boot scan. 32 is well
+// above what any board here presents (the Wyse, the busiest, enumerates 16).
+pub const MAX_DEVICES: usize = 32;
+
+/// One device as the bus reports it. No interpretation: the class code is the device's own claim
+/// about what it is, and the BAR/BDF are read straight from config space.
+#[derive(Clone, Copy)]
+pub struct PciDevice {
+    /// (bus << 8) | (dev << 3) | func - the same packing `*_BDF` uses.
+    pub bdf: u32,
+    /// (class << 16) | (subclass << 8) | prog_if.
+    pub class_code: u32,
+    /// ALL SIX BARs, 64-bit-combined and masked. 0 = absent, or the high half of a 64-bit pair.
+    ///
+    /// Six, not one, because WHICH BAR holds a device's registers is a property of the DEVICE:
+    /// xHCI and the NICs use BAR0, AHCI uses BAR5 (ABAR). Recording only BAR0 was the first version
+    /// of this table, and the boot-time cross-check below caught it at once - AHCI read back 0
+    /// against a static that said 0xfebd9000. The kernel still knows nothing about which is which:
+    /// the driver's own row names the index, and an index is not an address.
+    pub bar: [u64; 6],
+    /// The interrupt LINE from config space (0x3C). Not the vector we route - see `hw_irqs_for`.
+    pub irq_line: u8,
+    pub vendor: u16,
+    pub device: u16,
+}
+
+static DEV_BDF:   [AtomicU32; MAX_DEVICES] = [const { AtomicU32::new(0xFFFF) }; MAX_DEVICES];
+static DEV_CLASS: [AtomicU32; MAX_DEVICES] = [const { AtomicU32::new(0) }; MAX_DEVICES];
+/// Flattened [device][bar] - DEV_BARS[d * 6 + b].
+static DEV_BARS:  [AtomicU64; MAX_DEVICES * 6] = [const { AtomicU64::new(0) }; MAX_DEVICES * 6];
+static DEV_IRQ:   [AtomicU8;  MAX_DEVICES] = [const { AtomicU8::new(0) }; MAX_DEVICES];
+static DEV_VEN:   [AtomicU32; MAX_DEVICES] = [const { AtomicU32::new(0) }; MAX_DEVICES];
+pub static DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Record one device during the scan. Loud when full rather than silently dropping the tail: a
+/// device that is present but unreported reads later as "no such hardware" (invariant 12).
+fn record_device(bdf: u32, class_code: u32, bars: [u64; 6], irq_line: u8, vendor: u16, device: u16) {
+    let n = DEVICE_COUNT.load(Ordering::Relaxed) as usize;
+    if n >= MAX_DEVICES {
+        crate::kprintln!("pci: device table full ({}) - {:#06x} class {:#08x} NOT recorded",
+                         MAX_DEVICES, bdf, class_code);
+        return;
+    }
+    DEV_BDF[n].store(bdf, Ordering::Relaxed);
+    DEV_CLASS[n].store(class_code, Ordering::Relaxed);
+    for (i, b) in bars.iter().enumerate() { DEV_BARS[n * 6 + i].store(*b, Ordering::Relaxed); }
+    DEV_IRQ[n].store(irq_line, Ordering::Relaxed);
+    DEV_VEN[n].store(((vendor as u32) << 16) | device as u32, Ordering::Relaxed);
+    DEVICE_COUNT.store(n as u32 + 1, Ordering::Relaxed);
+}
+
+/// The `n`th device the scan found, or `None`.
+pub fn device_at(n: usize) -> Option<PciDevice> {
+    if n >= DEVICE_COUNT.load(Ordering::Relaxed) as usize { return None; }
+    let vd = DEV_VEN[n].load(Ordering::Relaxed);
+    let mut bar = [0u64; 6];
+    for (i, b) in bar.iter_mut().enumerate() { *b = DEV_BARS[n * 6 + i].load(Ordering::Relaxed); }
+    Some(PciDevice {
+        bdf:        DEV_BDF[n].load(Ordering::Relaxed),
+        class_code: DEV_CLASS[n].load(Ordering::Relaxed),
+        bar,
+        irq_line:   DEV_IRQ[n].load(Ordering::Relaxed),
+        vendor:     (vd >> 16) as u16,
+        device:     vd as u16,
+    })
+}
+
+/// The FIRST device whose class code matches, or `None`.
+///
+/// First rather than best: a machine with two devices of one class (the Wyse has several USB
+/// controllers) gets its lowest-numbered one, which is the same device the per-class statics chose.
+/// A driver that must have a SPECIFIC instance names a BDF, not a class - that is what `device_at`
+/// and the table are for.
+pub fn find_by_class(class_code: u32) -> Option<PciDevice> {
+    let n = DEVICE_COUNT.load(Ordering::Relaxed) as usize;
+    (0..n.min(MAX_DEVICES)).find_map(|i| match device_at(i) {
+        Some(d) if d.class_code == class_code => Some(d),
+        _ => None,
+    })
+}
+
 pub static XHCI_FOUND: AtomicBool = AtomicBool::new(false);
 pub static XHCI_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 pub static XHCI_IRQ: AtomicU8 = AtomicU8::new(0);
@@ -896,6 +988,40 @@ pub fn init() {
                 let class = (class_reg >> 24) as u8;
                 let subclass = (class_reg >> 16) as u8;
                 let progif = (class_reg >> 8) as u8;
+
+                // RECORD IT, whatever it is, BEFORE any per-class branch below cares what it is.
+                // This is the whole of step D1 on the scan side: the table is what the kernel knows,
+                // and it knows nothing about what any of it MEANS. The per-class statics below are
+                // now a derived view of this table and go away with the last reader.
+                {
+                    let device_id = ((config_read32(bus as u8, dev, func, 0x00) >> 16) & 0xFFFF) as u16;
+                    // All six BARs (0x10..0x24). A 64-bit memory BAR (bits[2:1] = 10) consumes
+                    // the NEXT slot as its high half, which is then left 0 rather than read as a
+                    // BAR of its own - reading it as one would invent a window out of an address.
+                    let mut bars = [0u64; 6];
+                    let mut bi = 0usize;
+                    while bi < 6 {
+                        let off = 0x10u8 + (bi as u8) * 4;
+                        let lo = config_read32(bus as u8, dev, func, off);
+                        if lo & 0x1 != 0 { bi += 1; continue; }   // I/O-space BAR, not memory
+                        if lo & 0x6 == 0x4 && bi + 1 < 6 {
+                            let hi = config_read32(bus as u8, dev, func, off + 4);
+                            bars[bi] = ((hi as u64) << 32) | ((lo & 0xFFFF_FFF0) as u64);
+                            bi += 2;
+                        } else {
+                            bars[bi] = (lo & 0xFFFF_FFF0) as u64;
+                            bi += 1;
+                        }
+                    }
+                    record_device(
+                        ((bus as u32) << 8) | ((dev as u32) << 3) | func as u32,
+                        ((class as u32) << 16) | ((subclass as u32) << 8) | progif as u32,
+                        bars,
+                        (config_read32(bus as u8, dev, func, 0x3C) & 0xFF) as u8,
+                        vendor,
+                        device_id,
+                    );
+                }
                 // Log EVERY USB host controller (subclass 0x03), of any kind, so
                 // we can see the full USB topology - devices may live on a second
                 // xHCI or an EHCI/OHCI the boot-port controller doesn't cover.
@@ -1013,5 +1139,37 @@ pub fn init() {
         );
     } else {
         crate::kprintln!("pci: no xHCI controller found");
+    }
+
+    // CROSS-CHECK: the generic table against the per-class statics it will replace.
+    //
+    // Two independent views of one truth must agree BEFORE anything is switched over to the new one.
+    // Printed once at boot, so the agreement is evidence in the log rather than an assumption in a
+    // commit message - and the day they disagree, the log says which device and which fact.
+    let n = DEVICE_COUNT.load(Ordering::Relaxed);
+    crate::kprintln!("pci: device table - {} device(s) recorded (generic, no class knowledge)", n);
+    for (label, want_found, want_bar, want_class, bar_ix) in [
+        ("xHCI", XHCI_FOUND.load(Ordering::Relaxed), XHCI_MMIO_BASE.load(Ordering::Relaxed), 0x0C_03_30u32, 0usize),
+        ("EHCI", EHCI_FOUND.load(Ordering::Relaxed), EHCI_MMIO_BASE.load(Ordering::Relaxed), 0x0C_03_20, 0),
+        // AHCI's registers are ABAR = BAR5, not BAR0. That difference is why the table records six.
+        ("AHCI", AHCI_FOUND.load(Ordering::Relaxed), AHCI_ABAR.load(Ordering::Relaxed),      0x01_06_01, 5),
+        // Ethernet: class 0x02, subclass 0x00, prog-if 0x00. Both models we drive (e1000, RTL8168)
+        // report the same triple - which is the point: the class code says "ethernet controller",
+        // and WHICH ethernet controller is the driver's business, not the kernel's.
+        ("NIC",  NIC_FOUND.load(Ordering::Relaxed),  NIC_MMIO_BASE.load(Ordering::Relaxed),  0x02_00_00, 0),
+    ] {
+        match find_by_class(want_class) {
+            Some(d) if want_found && d.bar[bar_ix] == want_bar =>
+                crate::kprintln!("pci:   {} class {:#08x} AGREES (BAR{} {:#x} BDF {:#06x})",
+                                 label, want_class, bar_ix, d.bar[bar_ix], d.bdf),
+            Some(d) =>
+                crate::kprintln!("pci:   {} class {:#08x} DISAGREES - table BAR{} {:#x}, static {:#x} (found={})",
+                                 label, want_class, bar_ix, d.bar[bar_ix], want_bar, want_found),
+            None if !want_found =>
+                crate::kprintln!("pci:   {} class {:#08x} absent from both - agrees", label, want_class),
+            None =>
+                crate::kprintln!("pci:   {} class {:#08x} MISSING from the table but the static says found (BAR {:#x})",
+                                 label, want_class, want_bar),
+        }
     }
 }
