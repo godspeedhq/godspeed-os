@@ -138,9 +138,11 @@ fn slots_on(bus: u8) -> u8 {
 
 /// Walk the buses and fill `out`; returns how many devices were recorded.
 ///
-/// Functions past 0 are probed only when the header type says they exist (bit 7 of offset 0x0E) -
-/// the standard rule, and it keeps the walk from doing eight times the work for the single-function
-/// devices that are most of any bus.
+/// Functions past 0 are probed only when a PRESENT function 0 says the device is single-function
+/// (bit 7 of offset 0x0E) - which keeps the walk from doing eight times the work for the
+/// single-function devices that are most of any bus. When function 0 is ABSENT that check cannot run,
+/// so every function is probed: a hidden function 0 above a live function is a real chipset pattern,
+/// not a malformed device (see `scan`).
 ///
 /// THE WALK STOPS WHERE THE KERNEL STOPS IT. `MAX_BUS` is a bound, not a topology: how many buses
 /// actually exist is a property of the machine, and the kernel - which programmed the bridge bus
@@ -170,9 +172,20 @@ fn scan(ctx: &ServiceContext, out: &mut [Found; MAX_FOUND]) -> usize {
                     }
                 };
                 if id == 0xFFFF_FFFF || id == 0 {
-                    if func == 0 {
-                        break; // no function 0 means no device here at all
-                    }
+                    // ABSENT FUNCTION 0 DOES NOT MEAN AN ABSENT DEVICE, which is what this used to
+                    // assume - it broke out of the function loop, so a device whose function 0 is
+                    // hidden was invisible entirely.
+                    //
+                    // The Wyse (Intel Gemini Lake) has exactly that: `00:0d.2`, a serial-bus
+                    // controller with no function 0 above it. The kernel's scan probes all eight
+                    // functions unconditionally and recorded 15 devices; this walk recorded 14, and
+                    // the missing one was found only by printing both lists and diffing them.
+                    //
+                    // So: keep probing. The cost is seven extra config reads for a slot that really
+                    // is empty - a few hundred port operations across a whole bus, once, at boot -
+                    // against a device the machine has and the report does not. The multifunction
+                    // check below still short-circuits the common case, a PRESENT single-function
+                    // device, which is what that optimisation was actually for.
                     continue;
                 }
 
