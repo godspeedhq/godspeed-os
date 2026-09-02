@@ -1191,6 +1191,23 @@ pub fn init() {
 
     let n = DEVICE_COUNT.load(Ordering::Relaxed);
     crate::kprintln!("pci: device table - {} device(s) recorded (generic, no class knowledge)", n);
+
+    // ONE LINE PER DEVICE, in the same shape `hw-enumerator` prints, so the two walks can be DIFFED
+    // rather than compared by count.
+    //
+    // The count alone is what a hardware run actually gave: the Wyse reported 15 here against the
+    // userspace walk's 14, which says a device is missing without saying WHICH - and "which" is the
+    // whole question, because the answer decides whether the userspace walk needs to probe more slots,
+    // more buses, or more functions. Retiring this scanner (the point of step D) is gated on the two
+    // walks agreeing on real hardware, and an agreement that can only be checked by counting is not
+    // one anybody can trust.
+    for i in 0..n {
+        if let Some(d) = device_at(i as usize) {
+            crate::kprintln!("pci:   {:02x}:{:02x}.{} class {:#08x} bar0 {:#x}",
+                             (d.bdf >> 8) & 0xFF, (d.bdf >> 3) & 0x1F, d.bdf & 0x7,
+                             d.class_code, d.bar[0]);
+        }
+    }
     for (label, want_found, want_bar, want_class, bar_ix) in [
         ("xHCI", XHCI_FOUND.load(Ordering::Relaxed), XHCI_MMIO_BASE.load(Ordering::Relaxed), 0x0C_03_30u32, 0usize),
         ("EHCI", EHCI_FOUND.load(Ordering::Relaxed), EHCI_MMIO_BASE.load(Ordering::Relaxed), 0x0C_03_20, 0),
