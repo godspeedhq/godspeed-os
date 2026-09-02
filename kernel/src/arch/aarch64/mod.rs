@@ -1666,10 +1666,19 @@ const SERIAL_LINE_MAX: usize = 512;
 #[cfg(feature = "pi4")]
 const SERIAL_RING_LINES: usize = 24;
 
-/// Lines one core puts on the wire before letting another take over, so the drainer cannot be pinned
-/// doing everyone's UART work by cores queueing faster than it writes.
+/// Lines one core puts on the wire before letting another take over.
+///
+/// A WRITER BECOMES THE DRAINER, so this is work conscripted from whoever happened to log next - and
+/// at a full ring's worth (24) over two passes that was up to 48 lines, roughly a third of a second of
+/// wire time at 115200. A core disappearing for 340 ms to do everyone else's logging is not bounded
+/// behaviour in any useful sense (§26.6); it is the same "one core pays for everyone" shape that made
+/// the spin design unusable, just relocated.
+///
+/// Four lines is enough to keep the wire busy - the next writer along picks up where this one stopped,
+/// and under any load worth draining there is always a next writer. If there is not, the ring simply
+/// waits for one, which costs latency on an idle machine and nothing else.
 #[cfg(feature = "pi4")]
-const SERIAL_DRAIN_BUDGET: usize = SERIAL_RING_LINES;
+const SERIAL_DRAIN_BUDGET: usize = 4;
 
 #[cfg(feature = "pi4")]
 struct SerialRing {
