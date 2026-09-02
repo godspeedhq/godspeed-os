@@ -25,7 +25,7 @@ Broadcom's, and large); the Raspberry Pi Imager writes them for you.
    points the firmware at our kernel.
 2. **Reinsert the card** so Windows mounts the small FAT **boot partition** (labelled `bootfs` or
    `boot`).
-3. **Copy `build/config.txt` onto it, replacing the Imager's** (say yes to overwrite). Ours is the
+3. **Copy `build/config-pi2.txt` onto it AS `config.txt`, replacing the Imager's** (say yes to overwrite). Ours is the
    canonical `boot/pi2/config.txt`, staged next to the kernel by `arm_build.py`. It is three lines:
    - `kernel=kernel7.img` - load our flat image by name (the firmware loads it at `0x8000`, where
      `kernel/kernel-arm.ld` expects it).

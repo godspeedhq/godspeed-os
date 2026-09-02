@@ -200,13 +200,20 @@ print(f"OK  {img.relative_to(ROOT)}  ({img.stat().st_size} bytes, "
 # never re-typed onto a card by hand. Same rule as the Pi 2 (scripts/arm_build.py).
 cfg_src = ROOT / "boot" / "pi4" / "config.txt"
 if cfg_src.exists():
-    shutil.copyfile(cfg_src, img.parent / "config.txt")
-    print("OK  build/config.txt   (canonical copy of boot/pi4/config.txt)")
+    # BOARD-SPECIFIC NAME, and that is the whole point. Both this script and `arm_build.py` stage a
+    # config, and they used to stage it to the SAME `build/config.txt` - so whichever ran last won,
+    # silently. Building both ports in one session (the normal thing to do) then copying "the" config
+    # to a card put the Pi 2's config next to the Pi 4's kernel: `kernel=kernel7.img`, `arm_64bit=0`.
+    # The Pi 4 obediently tried to boot a 32-bit Pi 2 kernel and sat on the rainbow screen with no
+    # serial output, which looks exactly like a corrupt image and is not. Distinct names cannot
+    # clobber each other, and the deploy line below now says which file to copy.
+    shutil.copyfile(cfg_src, img.parent / "config-pi4.txt")
+    print("OK  build/config-pi4.txt   (canonical copy of boot/pi4/config.txt)")
 else:
     # Loud, not silent: a missing config means the card would keep whatever `kernel=` line it
     # already had, and boot SOMEONE ELSE'S kernel while reporting a successful build.
-    print(f"WARNING: {cfg_src} is missing - build/config.txt NOT staged")
+    print(f"WARNING: {cfg_src} is missing - build/config-pi4.txt NOT staged")
 
 print("Deploy to Pi 4: copy build/kernel8.img to the card's FAT boot partition AS godspeed8.img,")
-print("                and build/config.txt as config.txt. The name differs on purpose: it leaves")
+print("                and build/config-pi4.txt as config.txt. Both names differ on purpose:")
 print("                a stock Raspberry Pi OS kernel8.img in place as a known-good fallback.")

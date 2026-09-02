@@ -228,7 +228,7 @@ def main():
     # (boot/pi2/config.txt), never re-typed onto a card by hand (docs/pi2-deploy.md).
     cfg_src = os.path.join(ROOT, "boot", "pi2", "config.txt")
     if os.path.exists(cfg_src):
-        shutil.copyfile(cfg_src, os.path.join(out_dir, "config.txt"))
+        shutil.copyfile(cfg_src, os.path.join(out_dir, "config-pi2.txt"))
 
     # Verify the ARTIFACT, not the steps: a stale embed is silent and reaches hardware (verify_image).
     verify_image(img, args.qemu)
@@ -236,7 +236,7 @@ def main():
     size = os.path.getsize(img)
     print(f"\nOK  build/kernel7.img  ({size} bytes, feature={kfeatures}, profile={profile})")
     print("Boot in QEMU:  python scripts/arm_run.py")
-    print("Deploy to Pi:  copy build/kernel7.img + build/config.txt to the SD card's FAT boot partition")
+    print("Deploy to Pi:  copy build/kernel7.img, and build/config-pi2.txt AS config.txt, to the card")
     print("               (full procedure incl. the storage USB stick: docs/pi2-deploy.md)")
 
 
