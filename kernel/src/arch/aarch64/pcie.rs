@@ -245,6 +245,10 @@ pub fn init(ram_bytes: u64) -> Option<Device> {
         return None;
     }
 
+    // The probe answered, so the registers are safe to touch - including for a capability holder
+    // going through `cfg_read_gated`.
+    RC_PRESENT.store(true, core::sync::atomic::Ordering::Release);
+
     put_str(b"pcie: bringing up the BCM2711 root complex\r\n");
 
     // 1. Both resets asserted, then settle. Some firmware leaves PERST# released; starting from a known
@@ -402,6 +406,17 @@ fn report_routing() {
 /// the aarch64 twin of x86's `PCI_CONFIG_LOCK`, which carries the same reasoning.
 static CFG_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
 
+/// Is there a root complex on this machine at all?
+///
+/// Set only once `init` has PROBED for one and found it. Until then - and forever on a board that has
+/// none - `cfg_read_gated` must refuse, because a config access here is not a harmless read of an
+/// absent device: it is an external abort from the interconnect, which at EL1 halts the machine.
+/// `init` already guards its own first touch with `probe_read32` for exactly that reason; a capability
+/// holder reaching the same registers needs the same guard, or a service can wedge a core with one
+/// syscall on any board without PCIe. Observed under QEMU raspi4b, which emulates no root complex:
+/// the enumerator's first read stalled its core until the liveness watchdog panicked.
+static RC_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// The highest bus number the bridge is programmed to forward (see the `0x18` write in `init`:
 /// primary 0, secondary 1, subordinate 1).
 const SUBORDINATE_BUS: u32 = 1;
@@ -426,6 +441,12 @@ const SUBORDINATE_BUS: u32 = 1;
 /// registers further up the block - EXT_CFG_INDEX at 0x9000 or the reset control at 0x9210 - which is
 /// exactly why the kernel mediates instead of granting an MMIO page.
 pub(super) fn cfg_read_gated(sel: u32, off: u16) -> Option<u32> {
+    // NO ROOT COMPLEX, NO ACCESS. Touching these registers on a board that has none is an external
+    // abort that halts the machine, not a read that returns all-ones - so this is refused before the
+    // bus check, and a caller is told rather than taking the core down with it.
+    if !RC_PRESENT.load(core::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
     let bus = (sel >> 20) & 0xFF;
     if bus > SUBORDINATE_BUS {
         return None;
