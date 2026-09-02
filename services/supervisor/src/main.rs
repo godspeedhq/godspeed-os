@@ -701,24 +701,40 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
 /// kernel re-points death notifications to the respawned supervisor via the directory, so after this
 /// reconciliation the restart loop works exactly as on a fresh boot.
 ///
-/// Known v1 limitation: the kernel directory keeps a name even after the service dies, so a service
-/// that died *during* the supervisor's brief (~1 tick) downtime would be adopted as a stale cap
-/// rather than respawned. Narrow race; full liveness-aware reconciliation is a follow-up.
+/// ADOPTION IS GATED ON REAL LIVENESS, and that gate is not optional.
+///
+/// This used to adopt whenever `acquire_send_grant_cap` succeeded - but the kernel directory keeps a
+/// name after its service dies, so that call KEEPS SUCCEEDING for a dead endpoint. A service that died
+/// during the supervisor's own downtime was therefore "adopted" as a dead cap and never respawned, and
+/// the dead cap was recorded in the map and handed to its clients at their spawn. Those clients then
+/// could not send, and could not recover by reacquiring either, because the directory hands out the
+/// same dead entry. Permanent, and only cleared by restarting everything.
+///
+/// It was written down as a "narrow race ... follow-up". It is not narrow under load: one 100-round
+/// `chaos max-carnage` produced 61 block-driver respawns against 57 name records, and the four gaps
+/// took storage down for the rest of the run. `name_alive` is the same `task_stat` discipline
+/// `managed_alive` already uses, and its comment says exactly why a cap-acquire cannot serve here.
 fn ensure_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u32) -> bool {
-    if let Some(cap) = ctx.acquire_send_grant_cap(name) {
-        record_name_quiet(ctx, map, name, cap);
-        ctx.log_fmt(format_args!("supervisor: adopted running {} (slot {})", name, cap.0));
-        return true;
+    if name_alive(ctx, name) {
+        if let Some(cap) = ctx.acquire_send_grant_cap(name) {
+            record_name_quiet(ctx, map, name, cap);
+            ctx.log_fmt(format_args!("supervisor: adopted running {} (slot {})", name, cap.0));
+            return true;
+        }
     }
     spawn_mapped(ctx, map, name, core)
 }
 
 /// `ensure_mapped` for a service with peers - adopt if already running, else `spawn_wired`.
 fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[&str]) -> bool {
-    if let Some(cap) = ctx.acquire_send_grant_cap(name) {
-        record_name_quiet(ctx, map, name, cap);
-        ctx.log_fmt(format_args!("supervisor: adopted running {} (slot {})", name, cap.0));
-        return true;
+    // Same liveness gate as `ensure_mapped` - see its header for why a successful cap-acquire is not
+    // evidence the service is alive.
+    if name_alive(ctx, name) {
+        if let Some(cap) = ctx.acquire_send_grant_cap(name) {
+            record_name_quiet(ctx, map, name, cap);
+            ctx.log_fmt(format_args!("supervisor: adopted running {} (slot {})", name, cap.0));
+            return true;
+        }
     }
     spawn_wired(ctx, map, name, peers)
 }

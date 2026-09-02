@@ -22,6 +22,7 @@
 #![no_main]
 
 use godspeed_sdk::{CapHandle, Message, ServiceContext};
+use godspeed_sdk::service_context::DeadlineOutcomeInto;
 
 mod crc32;
 use crc32::crc32;
@@ -3568,32 +3569,72 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
             ctx.stack_used(), 256 * 1024));
     }
 
+    // THE RETRY IS GATED ON WHICH FAILURE HAPPENED, and that gate is the whole fix.
+    //
+    // This loop used to retry on `None` from the `_into` helper, which collapses four outcomes into
+    // one. Two of them want OPPOSITE responses:
+    //   SendFailed - the request never left (stale cap after the peer respawned, or an exhausted cap
+    //                table here). Nothing is in flight, so reacquire and retry ONCE. This is the only
+    //                safe retry, and it is the one that heals a restarted `block-driver`.
+    //   Timeout    - the request WAS delivered and no reply came. Re-sending asks for the work twice
+    //                and, since only the op tag distinguishes replies, desyncs every later exchange.
+    // Collapsed together, a caller must guess wrong in one direction. The old code guessed "retry",
+    // which is right for the first and wrong for the second.
+    //
+    // It also could not say what went wrong, and said something specific anyway: "did not answer
+    // within 30 s (and could not be reacquired)" was printed for failures that took MILLISECONDS and
+    // never reached a reacquire. On hardware that sent the reader after `block-driver`, which was
+    // alive the whole time with an empty queue. A message that names a cause it did not observe is
+    // worse than one that admits it does not know.
+    let mut last = "";
     for attempt in 0..2 {
-        if attempt == 1 && !ctx.reacquire_by_name("block-driver") {
-            break;
-        }
-        if let Some(n) =
-            ctx.request_with_reply_deadline_into("block-driver", treq, &mut rbuf, BLOCK_RPC_SECS)
-        {
-            if n == 0 {
-                return None;
-            }
-            if rbuf[0] != tag {
-                ctx.log_fmt(format_args!(
-                    "fs: discarded a block reply for tag {} while awaiting {} - the protocol is out of step",
-                    rbuf[0], tag));
-                // Do NOT re-send: the request is already with the driver, and asking twice would ask
-                // for the WORK twice. The caller retries at its own level, by which point the queue
-                // has drained.
-                return None;
-            }
-            return Some(BlockReply { buf: rbuf, len: n - 1 });
-        }
         if attempt == 1 {
-            break;
+            if !ctx.reacquire_by_name("block-driver") {
+                ctx.log("fs: block-driver send failed AND it could not be reacquired by name - \
+                         either the name is not registered right now, or this service has no free \
+                         cap slot left to hold it");
+                return None;
+            }
+            ctx.log("fs: block-driver send failed - reacquired by name, retrying once");
+        }
+        match ctx.request_with_reply_deadline_outcome_into(
+            "block-driver", treq, &mut rbuf, BLOCK_RPC_SECS)
+        {
+            DeadlineOutcomeInto::Reply(n) => {
+                if n == 0 {
+                    return None;
+                }
+                if rbuf[0] != tag {
+                    ctx.log_fmt(format_args!(
+                        "fs: discarded a block reply for tag {} while awaiting {} - the protocol is out of step",
+                        rbuf[0], tag));
+                    // Do NOT re-send: the request is already with the driver, and asking twice would
+                    // ask for the WORK twice. The caller retries at its own level, by which point the
+                    // queue has drained.
+                    return None;
+                }
+                return Some(BlockReply { buf: rbuf, len: n - 1 });
+            }
+            // Delivered, unanswered. The peer is alive and holding the request; re-sending would ask
+            // for the work twice and desync the tags.
+            DeadlineOutcomeInto::Timeout => {
+                ctx.log_fmt(format_args!(
+                    "fs: block-driver received the request but did not reply within {} s - failing (NOT re-sent: a late reply would desync the protocol)",
+                    BLOCK_RPC_SECS));
+                return None;
+            }
+            // Alive but backed up. Nothing left, so nothing can arrive late - but reacquiring would
+            // not help either, because the cap is fine and the QUEUE is the problem.
+            DeadlineOutcomeInto::QueueFull => {
+                ctx.log("fs: block-driver queue is full - failing (its cap is fine; it is behind)");
+                return None;
+            }
+            // The one worth retrying.
+            DeadlineOutcomeInto::SendFailed => { last = "send failed"; }
         }
     }
-    ctx.log("fs: block-driver did not answer within 30 s (and could not be reacquired) - failing");
+    ctx.log_fmt(format_args!(
+        "fs: block-driver unreachable ({}) even after reacquiring by name - failing", last));
     None
 }
 

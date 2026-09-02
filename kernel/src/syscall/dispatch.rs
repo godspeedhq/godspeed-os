@@ -1396,7 +1396,14 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
 
     let ep_id = match crate::ipc::names::lookup(name) {
         Some(id) => id,
-        None     => return -1, // service not registered
+        None     => {
+            // SAID, not swallowed. This and the cap-table refusal below both returned a bare -1, so a
+            // service that could not reacquire a peer had no way to learn WHY - and reported the peer
+            // as unresponsive. On hardware that sent the reader after a `block-driver` which was alive
+            // the whole time with an empty queue, while the real answer was here (invariant 12).
+            crate::kprintln!("acquire: '{}' is not in the name directory - nothing to acquire", name);
+            return -1;
+        }
     };
 
     let resource_id = crate::capability::cap::ResourceId::from(ep_id);
@@ -1415,7 +1422,15 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
 
     match scheduler::current_task_insert_cap(cap) {
         Ok(slot) => slot as i64,
-        Err(_)   => -1, // cap table full
+        Err(_)   => {
+            // The caller's own table is full - the peer is fine. This is the failure that makes a
+            // transient outage PERMANENT: once a service cannot hold one more cap it can never
+            // reacquire anything again, so it stays broken until it is restarted. Naming it is the
+            // difference between diagnosing that in one boot and chasing the peer for several.
+            crate::kprintln!(
+                "acquire: '{}' resolved, but the caller's capability table is FULL - it cannot hold                  the cap. This service will not recover until it is restarted.", name);
+            -1
+        }
     }
 }
 

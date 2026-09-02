@@ -11,6 +11,28 @@ use crate::syscall::raw_syscall;
 
 /// Outcome of an abortable request/reply ([`ServiceContext::request_with_reply_abortable`]): the reply
 /// arrived, the user pressed `q`/`Q`/ESC to abort the wait, or the deadline expired with no reply.
+/// Outcome of [`ServiceContext::request_with_reply_deadline_outcome_into`] - the buffer-writing twin
+/// of [`DeadlineOutcome`].
+///
+/// It exists because the `_into` form collapsed all four outcomes into `Option<usize>`, and the two
+/// that matter are OPPOSITES. `SendFailed` means the request never left, so nothing can arrive late
+/// and retrying after a reacquire is safe. `Timeout` means it DID leave, so a late reply is still
+/// coming and re-sending desyncs the protocol - every later reply is matched to the wrong request.
+/// A caller handed `None` cannot tell those apart, so it must either never retry (and stay broken
+/// after a peer restarts) or always retry (and desync). `fs` had the first of those.
+#[derive(Debug)]
+pub enum DeadlineOutcomeInto {
+    /// A reply arrived; the payload is in the caller's buffer, this many bytes of it.
+    Reply(usize),
+    /// The send never left: the peer's cap is stale or its name does not currently resolve. Nothing
+    /// is in flight. Reacquire by name and retry ONCE - this is the only safe retry.
+    SendFailed,
+    /// The peer's queue was full. The request did not leave either, but the peer is alive and busy.
+    QueueFull,
+    /// The request was delivered and no reply came in time. Do NOT re-send.
+    Timeout,
+}
+
 pub enum ReqOutcome {
     Reply(Message),
     Aborted,
@@ -1391,6 +1413,64 @@ impl ServiceContext {
             Ok(Some(len)) => Ok(Some(crate::ipc::Message::from_bytes(&buf[..len]))),
             Ok(None)      => { self.remove_cap(reply_cap); Ok(None) }
             Err(e)        => { self.remove_cap(reply_cap); Err(e) }
+        }
+    }
+
+    /// Bounded request/reply into a caller buffer, reporting WHICH failure happened.
+    ///
+    /// Same work as [`Self::request_with_reply_deadline_into`], same stack shape - the caller supplies
+    /// the buffer so no reply-sized frame appears here - but it does not throw the reason away. See
+    /// [`DeadlineOutcomeInto`] for why the distinction is not a nicety: the two common failures want
+    /// opposite responses, and a caller given `None` has to guess wrong in one direction or the other.
+    pub fn request_with_reply_deadline_outcome_into(
+        &self, peer: &str, req: &[u8], buf: &mut [u8], max_secs: i64,
+    ) -> DeadlineOutcomeInto {
+        let op = req.get(crate::trace::op_offset(peer)).copied().unwrap_or(0);
+        let out = self.request_with_reply_deadline_outcome_into_inner(peer, req, buf, max_secs);
+        self.trace_out(peer, op, match &out {
+            DeadlineOutcomeInto::Reply(_)   => crate::trace::KIND_REPLY,
+            DeadlineOutcomeInto::SendFailed => crate::trace::KIND_PEER_LOST,
+            DeadlineOutcomeInto::QueueFull  => crate::trace::KIND_QUEUE_FULL,
+            DeadlineOutcomeInto::Timeout    => crate::trace::KIND_TIMEOUT,
+        });
+        out
+    }
+
+    fn request_with_reply_deadline_outcome_into_inner(
+        &self, peer: &str, req: &[u8], buf: &mut [u8], max_secs: i64,
+    ) -> DeadlineOutcomeInto {
+        // Each of these is a DISTINCT reason the request never left, and every one of them used to be
+        // an anonymous `None`: no such peer wired or resolvable, no endpoint of our own to be replied
+        // to, and - the one that made this permanent rather than transient - NO FREE CAP SLOT to derive
+        // a reply cap into. A service whose table has filled reports "peer did not answer", which sends
+        // the reader looking at the peer.
+        let target = match self.find_send_slot(peer) {
+            Some(s) => CapHandle(s),
+            None => return DeadlineOutcomeInto::SendFailed,
+        };
+        let (recv, grant) = match self.reply_mailbox() {
+            Some((r, g)) => (r, g),
+            None => match (self.recv_handle(), self.self_grant_handle()) {
+                (Some(r), Some(g)) => (r, g),
+                _ => return DeadlineOutcomeInto::SendFailed,
+            },
+        };
+        let reply_cap = match self.derive_cap(grant) {
+            Some(c) => c,
+            None => return DeadlineOutcomeInto::SendFailed,
+        };
+        let secs = if max_secs <= 0 { 0 } else { max_secs as u64 };
+        let out = crate::ipc::call_deadline_into(target, reply_cap, recv, req, buf, secs);
+        // The kernel consumes the reply cap on a delivered call; on any other outcome it is ours to
+        // reclaim, or the slot leaks one per failed request (§8.5, the three checks).
+        match out {
+            Ok(Some(n)) => DeadlineOutcomeInto::Reply(n),
+            Ok(None) => { self.remove_cap(reply_cap); DeadlineOutcomeInto::Timeout }
+            Err(crate::ipc::IpcError::QueueFull) => {
+                self.remove_cap(reply_cap);
+                DeadlineOutcomeInto::QueueFull
+            }
+            Err(_) => { self.remove_cap(reply_cap); DeadlineOutcomeInto::SendFailed }
         }
     }
 
