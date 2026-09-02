@@ -659,6 +659,47 @@ This is worth stating as a rule because the failure mode is structural: without 
 on a service becomes an argument for the kernel by default, and the kernel grows by exclusion - one
 carefully-reasoned exception at a time, each individually defensible.
 
+### D2 (BUILT 2026-09-02): `hw-enumerator` walks the bus in userspace
+
+Implemented and proven in QEMU. The kernel gained two gated syscalls - `PortOut32` (53) and
+`PortIn32` (54) - behind a new `PCI_CFG` authority. It learns a port number and a 32-bit value, and
+nothing else: not that 0xCF8 selects a configuration register, not how to walk a bus, not what a
+class code identifies, not where a BAR lives. All of that moved to `services/hw-enumerator`.
+
+**The proof is the same cross-check that made D1 safe**: two independent walks of one bus must agree.
+The kernel's own scan reports the NIC at `00:03.0 vendor=0x8086`; the userspace walk found it at the
+same address with class `0x020000`, alongside five more devices:
+
+```
+hw-enumerator: probe 00:00.0 vendor/device = 0x12378086
+hw-enum: 00:00.0 class 0x060000 vendor 0x8086 device 0x1237   host bridge
+hw-enum: 00:02.0 class 0x030000 vendor 0x1234 device 0x1111   VGA
+hw-enum: 00:03.0 class 0x020000 vendor 0x8086 device 0x100e bar0 0xfebc0000 irq 11
+hw-enumerator: 6 device(s) found by USERSPACE enumeration
+```
+
+**Read-only, permanently, and the allowlist lives in `arch/x86_64` beside the instruction it guards**
+- a 32-bit write to 0xCF8, a 32-bit read of 0xCFC-0xCFF. Both syscalls and the authority are PINNED
+in `COMMANDMENTS.baseline.toml`, each answering the checker's question ("why isn't this a service?"
+- it is; `in`/`out` are privileged instructions no ring-3 code can execute, the same shape as the RTC
+read `time` needs).
+
+x86 only: ARM has no port I/O address space, so the image is not embedded there and the syscalls can
+only refuse. The service CONTRACT is the stable thing; the capability under it varies by platform.
+
+**What it does NOT do yet.** This is ADDITIVE. `kernel/src/arch/x86_64/pci.rs` still runs and still
+does the boot scan - nothing consumes the userspace results for anything load-bearing. Retiring those
+1,183 lines is the next step, and it wants the two walks agreeing on REAL HARDWARE first, not only in
+QEMU. That is the same discipline D1 followed: record, cross-check, and only then switch over.
+
+**Adding one service needed its name in SIX places**, and this is worth writing down because nothing
+checks that they agree: `IMAGES` (the image), `MANAGED` (reconcile), an `ensure_mapped` call (BOOT -
+`MANAGED` says what to RESTART, not what to START), the restart-counter set, the death-notification
+set, and the privilege MINT. Each list is correct on its own terms. Three of the six were missed on
+the first attempt; the enforcement layer caught them, including a privilege that was checked and
+delegatable but never minted - which failed SILENTLY, because the SDK wrapper read any non-negative
+syscall return as success, so the service saw "success" and read zeros.
+
 ### The service is a REPORTER, and must stay one
 
 The greatest risk to this service is not a bug. It is that the only component able to see the whole bus
