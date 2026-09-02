@@ -1074,6 +1074,15 @@ extern "C" fn boot_high() -> ! {
 }
 
 /// Print a u64 as `0x...` - enough diagnostics to report a register without pulling in formatting.
+/// RESIDUAL, recorded rather than left to be discovered (§26.7): a line assembled from SEVERAL calls
+/// is not atomic, even though each call is.
+///
+/// `put_str` claims the UART for its own run and releases it, so a boot line built as
+/// `put_str(..) + put_dec(..) + put_str(..)` has gaps another core can write into. The claim is
+/// owner-aware and nests, so the fix is bracketing helpers around a whole line rather than a claim per
+/// token - but every such site is boot-time code, where contention is lowest, and the interleaving
+/// actually observed on hardware came from the runtime paths (kernel log against service console),
+/// which are now serialised per line. Left open deliberately, not overlooked.
 pub(crate) fn put_hex(v: u64) {
     put_str(b"0x");
     let mut started = false;
@@ -1648,9 +1657,16 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
 /// gate has nothing to select - honoured as soon as one exists.
 #[cfg(feature = "pi4")]
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
+    // TAKES THE SAME CLAIM AS THE KERNEL LOG, because the UART does not care which side of the
+    // syscall boundary a byte came from. This path was unclaimed while the log path was serialised,
+    // so the two shredded each other: a chaos separator woven through a `cap::get:` line, a device
+    // descriptor spliced into a service banner. Serialising only the kernel's own writers fixes half
+    // a problem and leaves the half a person actually reads - the shell's output - still broken.
+    let claim = claim_serial();
     for &b in s {
         serial_write_byte(b);
     }
+    release_serial(claim);
     // The gate is now real: `false` means a full-screen app owns the display, so this text belongs on
     // serial only.
     if to_fb {
