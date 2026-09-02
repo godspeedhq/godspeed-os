@@ -9464,6 +9464,16 @@ fn chaos_kill_storm(ctx: &ShellCtx, cwd: &Cwd, tok: &[&str], ntok: usize) -> Res
         else if let Some(n) = parse_u32(tok[i]) { rounds = n; i += 1; }
         else { i += 1; }
     }
+    // Say so when the request is REDUCED. It used to clamp silently: `chaos kill-storm nic-driver 120`
+    // ran 100 and only said "100 rounds" in a later line, so an operator who asked for 120 got 100 and
+    // could only find out by re-reading the report. A bounded mechanism is right (§26.6 - the per-round
+    // results live in fixed stack arrays, sized by this constant, no heap); silently delivering less
+    // than was asked for is not (invariant 12). The cap is stated WITH ITS REASON, because "why 100?"
+    // is the operator's next question and the answer is the array beside it.
+    if rounds > CHAOS_MAX_ROUNDS {
+        ctx.console_writeln_fmt(format_args!(
+            "chaos: {} rounds requested, running {} - CHAOS_MAX_ROUNDS, the size of the fixed per-round result arrays (no heap, CLAUDE.md 26.6.1)", rounds, CHAOS_MAX_ROUNDS));
+    }
     let rounds = rounds.clamp(1, CHAOS_MAX_ROUNDS);
     if slot_of(ctx, svc).is_none() {
         ctx.console_writeln_fmt(format_args!("chaos: '{}' is not running", svc));
@@ -9573,6 +9583,16 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     let mut rounds = CHAOS_DEFAULT_ROUNDS;
     let mut i = 2;
     while i < ntok { if let Some(n) = parse_u32(tok[i]) { rounds = n; } i += 1; }
+    // Say so when the request is REDUCED. It used to clamp silently: `chaos kill-storm nic-driver 120`
+    // ran 100 and only said "100 rounds" in a later line, so an operator who asked for 120 got 100 and
+    // could only find out by re-reading the report. A bounded mechanism is right (§26.6 - the per-round
+    // results live in fixed stack arrays, sized by this constant, no heap); silently delivering less
+    // than was asked for is not (invariant 12). The cap is stated WITH ITS REASON, because "why 100?"
+    // is the operator's next question and the answer is the array beside it.
+    if rounds > CHAOS_MAX_ROUNDS {
+        ctx.console_writeln_fmt(format_args!(
+            "chaos: {} rounds requested, running {} - CHAOS_MAX_ROUNDS, the size of the fixed per-round result arrays (no heap, CLAUDE.md 26.6.1)", rounds, CHAOS_MAX_ROUNDS));
+    }
     let rounds = rounds.clamp(1, CHAOS_MAX_ROUNDS);
 
     if slot_of(ctx, svc).is_none() {
@@ -9701,6 +9721,16 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
     let mut rounds = CHAOS_DEFAULT_ROUNDS;
     let mut i = 1;
     while i < ntok { if let Some(n) = parse_u32(tok[i]) { rounds = n; } i += 1; }
+    // Say so when the request is REDUCED. It used to clamp silently: `chaos kill-storm nic-driver 120`
+    // ran 100 and only said "100 rounds" in a later line, so an operator who asked for 120 got 100 and
+    // could only find out by re-reading the report. A bounded mechanism is right (§26.6 - the per-round
+    // results live in fixed stack arrays, sized by this constant, no heap); silently delivering less
+    // than was asked for is not (invariant 12). The cap is stated WITH ITS REASON, because "why 100?"
+    // is the operator's next question and the answer is the array beside it.
+    if rounds > CHAOS_MAX_ROUNDS {
+        ctx.console_writeln_fmt(format_args!(
+            "chaos: {} rounds requested, running {} - CHAOS_MAX_ROUNDS, the size of the fixed per-round result arrays (no heap, CLAUDE.md 26.6.1)", rounds, CHAOS_MAX_ROUNDS));
+    }
     let rounds = rounds.clamp(1, CHAOS_MAX_ROUNDS);
 
     let total    = ctx.inspect_kernel_total_frames();

@@ -237,6 +237,11 @@ pub fn init(p: FbParams) {
     // Publish LAST - `ready` is what every entry point tests before it touches the lock, so the floor
     // must be fully built and cleared before any of them may proceed.
     READY.store(true, Ordering::Release);
+    // FIRST line of every boot: which image is this? Printed here because this is the earliest point
+    // the log floor exists, and before any service - so it is present even in a log that goes no
+    // further, and in a chaos-only run where nothing asks the shell for `version`.
+    crate::kprintln!("GodspeedOS {} {} ({}) - kernel", env!("CARGO_PKG_VERSION"),
+                     env!("GODSPEED_TARGET_ARCH"), env!("GODSPEED_GIT_SHA"));
     crate::kprintln!("bootcon: {}x{} {}bpp, font-scale {}x", w, h, bpp * 8, scale);
 }
 
