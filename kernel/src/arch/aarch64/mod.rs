@@ -1111,14 +1111,12 @@ pub(crate) fn put_str(s: &[u8]) {
     // reporting how many cores had come up. An instrument that loses the measurement is worse than no
     // instrument, because it looks like a result.
     #[cfg(feature = "pi4")]
-    let held = claim_serial();
+    let claim = claim_serial();
     for &b in s {
         put_byte(b);
     }
     #[cfg(feature = "pi4")]
-    if held {
-        SERIAL_BUSY.store(false, Ordering::Release);
-    }
+    release_serial(claim);
     // Serial first, then the display: serial is the source of truth, and a mirror that ran first would
     // put the display ahead of the log it is mirroring.
     #[cfg(feature = "pi4")]
@@ -1498,7 +1496,7 @@ pub fn serial_write_byte(b: u8) {
     if b == b'\n' { put_byte(b'\r'); }
     put_byte(b);
 }
-/// Held by whichever core is mid-line on the UART.
+/// Held by whichever core is mid-line on the UART, as `core_id + 1`. `0` means free.
 ///
 /// **Without this, multi-core logging is not merely untidy - it is unreadable, and it lies.** Four cores
 /// writing a byte at a time into one FIFO interleave at character granularity, so lines vanish into each
@@ -1507,41 +1505,125 @@ pub fn serial_write_byte(b: u8) {
 /// because their output was shredded by the boot core's. Debugging SMP through that instrument means
 /// drawing conclusions from evidence the instrument destroyed.
 ///
-/// The claim is BOUNDED and never fatal: a core that cannot get it writes anyway rather than spinning
-/// forever. A garbled line is bad; a core deadlocked inside the panic handler trying to report why is
-/// worse, and this path is reachable from panics and ISRs.
+/// The claim is BOUNDED and never fatal: a core that cannot get it within a deadline writes anyway
+/// rather than spinning forever. A garbled line is bad; a core deadlocked inside the panic handler
+/// trying to report why is worse, and this path is reachable from panics and ISRs.
+///
+/// The OWNER is stored, not just a flag, so a write that re-enters this path on the same core - an ISR
+/// logging while that core is mid-line, or a panic raised inside a write - is recognised as nested and
+/// proceeds instead of waiting for a claim it already holds.
 #[cfg(feature = "pi4")]
-static SERIAL_BUSY: AtomicBool = AtomicBool::new(false);
+static SERIAL_OWNER: AtomicU32 = AtomicU32::new(0);
 
-/// Try ONCE for the serial claim. Never spins.
+/// Guards the DISPLAY mirror, separately from the UART.
 ///
-/// **A log line must never make a core wait.** The first version spun up to two million times for the
-/// claim, and held it across the framebuffer render - so every core stalled behind every other core's
-/// glyph drawing and cache maintenance. Boot went from seconds to 104 SECONDS, characters trickled out
-/// one at a time, and a core that had spent ten seconds spinning was correctly declared wedged by the
-/// liveness watchdog. Tidy logs are not worth a stalled scheduler; that trade was never mine to make.
-///
-/// So: one attempt. A contended writer emits its bytes anyway and skips only the display mirror, which
-/// is the expensive part and the part nobody is reading during contention. Lines can interleave under
-/// load - which is what the 32-bit port accepts, for exactly this reason.
+/// Two different costs want two different policies. The UART run is the bottleneck and is worth waiting
+/// for; the framebuffer render is expensive, happens only while the boot log still mirrors, and is
+/// never worth making another core wait for. So the mirror keeps the original try-once rule - a
+/// contended core simply skips it - while the UART gets a bounded wait.
 #[cfg(feature = "pi4")]
-fn claim_serial() -> bool {
-    SERIAL_BUSY
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
+static MIRROR_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// What a claim attempt produced.
+#[cfg(feature = "pi4")]
+enum SerialClaim {
+    /// Acquired here; this writer must release it.
+    Held,
+    /// Already held BY THIS CORE further up the stack. Proceed, and do NOT release - the outer writer
+    /// still owns it and releasing here would hand the UART away mid-line.
+    Nested,
+    /// The deadline passed with another core still holding. Write anyway: interleaved output is bad,
+    /// a stalled core is worse, and this is exactly the behaviour the port had before the wait existed.
+    Expired,
+}
+
+/// Longest a core will wait for the UART before writing anyway.
+///
+/// A DURATION, not a spin count, because a count means a different wait on every machine and the two
+/// boards this runs on clock the generic timer differently (54 MHz on the Pi 4, 62.5 MHz under QEMU).
+/// Sized at roughly one line's worth of UART time at 115200 baud plus margin: long enough that the
+/// common case - one other core mid-line - is simply waited out, short enough that heavy contention
+/// degrades to the old interleaving rather than to a stalled scheduler.
+#[cfg(feature = "pi4")]
+fn serial_claim_deadline_ticks() -> u64 {
+    // 10 ms. `timer::frequency` reads CNTFRQ_EL0; a machine that reports 0 gets no wait at all, which is the
+    // old behaviour rather than an unbounded one.
+    timer::frequency() / 100
+}
+
+/// Claim the UART for one line, waiting a BOUNDED time for it.
+///
+/// **Why waiting is affordable here, when spinning for this claim once cost a 104-second boot.** That
+/// disaster was not the wait itself: it was holding the claim across the framebuffer render, so every
+/// core queued behind every other core's glyph drawing and cache maintenance. The render is now outside
+/// the claim entirely (see `MIRROR_BUSY`), and what remains inside it is the UART byte run.
+///
+/// THE WAIT IS VERY NEARLY FREE, and that is the argument this rests on rather than a measurement.
+/// `put_byte` spins for FIFO space, so a contended writer was never proceeding cheaply - it was
+/// already blocking, just destructively. The UART is the bottleneck either way: two cores interleaving
+/// two 80-byte lines occupy it for the same total time as writing those lines one after the other, and
+/// the last core to finish finishes at the same moment under both schemes. Serialising spends time
+/// that was being spent anyway, and buys whole lines with it. What it does NOT do is add a new class
+/// of stall: the pre-existing one is simply relocated from the FIFO wait to the claim wait.
+///
+/// Heavy contention degrades to the OLD behaviour rather than to a stalled core: past the deadline a
+/// writer interleaves exactly as it always did. So this is a strict improvement in the common case
+/// (one other core mid-line, waited out) and a no-op in the pathological one.
+#[cfg(feature = "pi4")]
+fn claim_serial() -> SerialClaim {
+    // SAFETY: a side-effect-free MPIDR_EL1 read. Valid at any point including early boot, which is why
+    // the owner can be identified on THIS path - unlike x86, where core identity costs an APIC MMIO
+    // read with a boot-ordering precondition and must not be taken on every log line.
+    let me = unsafe { boot::get_lapic_id() } + 1;
+    if SERIAL_OWNER.load(Ordering::Acquire) == me {
+        return SerialClaim::Nested;
+    }
+    let deadline = read_cycle_counter().wrapping_add(serial_claim_deadline_ticks());
+    loop {
+        if SERIAL_OWNER
+            .compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return SerialClaim::Held;
+        }
+        if read_cycle_counter() >= deadline {
+            return SerialClaim::Expired;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Release the claim, but ONLY if this writer is the one that took it.
+///
+/// A nested writer must not release: the outer one on this core still owns the line it is midway
+/// through, and handing the UART away here would let another core land inside it - reintroducing
+/// exactly the interleaving the claim exists to prevent.
+#[cfg(feature = "pi4")]
+fn release_serial(claim: SerialClaim) {
+    if matches!(claim, SerialClaim::Held) {
+        SERIAL_OWNER.store(0, Ordering::Release);
+    }
 }
 
 #[cfg(feature = "pi4")]
 pub fn serial_write_bytes_lockfree(s: &[u8]) {
-    let held = claim_serial();
+    let claim = claim_serial();
+
     for &b in s { serial_write_byte(b); }
-    // The display mirror happens ONLY for the core that holds the claim. It renders glyphs and cleans
-    // cache lines, which is far more expensive than the UART write - making every other core wait for
-    // it is what turned a boot into a two-minute crawl. A contended writer's bytes still reach serial,
-    // which is the record that matters.
-    if held {
+
+    // RELEASED BEFORE THE MIRROR, and that ordering is the whole reason a wait is affordable above.
+    // Holding the UART across the render is what turned a boot into a two-minute crawl.
+    release_serial(claim);
+
+    // The mirror keeps the ORIGINAL rule: one attempt, and a contended core skips it. It is expensive,
+    // it only does anything while the boot log still reaches the display, and nobody is reading the
+    // screen during contention anyway. Serial keeps the full record either way.
+    if MIRROR_BUSY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
         video::mirror_log(s);
-        SERIAL_BUSY.store(false, Ordering::Release);
+        MIRROR_BUSY.store(false, Ordering::Release);
     }
 }
 
@@ -1677,13 +1759,11 @@ pub fn console_notice(s: &[u8]) {
 /// call is still a line another core can land inside.
 #[cfg(feature = "pi4")]
 fn serial_write_bytes_lockfree_no_fb(s: &[u8]) {
-    let held = claim_serial();
+    let claim = claim_serial();
     for &b in s {
         serial_write_byte(b);
     }
-    if held {
-        SERIAL_BUSY.store(false, Ordering::Release);
-    }
+    release_serial(claim);
 }
 
 /// A fixed stack buffer that `write!` can render into. No heap (§26.6.1): the bound is the buffer,
