@@ -1550,14 +1550,24 @@ enum SerialClaim {
 ///
 /// A DURATION, not a spin count, because a count means a different wait on every machine and the two
 /// boards this runs on clock the generic timer differently (54 MHz on the Pi 4, 62.5 MHz under QEMU).
-/// Sized at roughly one line's worth of UART time at 115200 baud plus margin: long enough that the
-/// common case - one other core mid-line - is simply waited out, short enough that heavy contention
-/// degrades to the old interleaving rather than to a stalled scheduler.
+///
+/// **IT MUST EXCEED THE LONGEST SINGLE WRITE, or it accomplishes nothing.** The first version used
+/// 10 ms, which sounded generous and was not: the neutral log stages up to `SERIAL_STAGE` (512) bytes
+/// and flushes them in ONE call, and 512 bytes at 115200 baud is about 44 ms of UART time. So a waiter
+/// expired mid-write essentially every time and interleaved exactly as it had before - hardware showed
+/// the splice count unmoved, 6 lines then 5, while the claim was working perfectly and simply never
+/// being reached. A bound shorter than the thing it is bounding is not a safety valve, it is an
+/// off switch.
+///
+/// 150 ms covers a maximum-length write with room for a couple queued behind it. Waiting that long is
+/// affordable for the reason the whole claim is affordable: the UART is the bottleneck either way, so
+/// this is time the waiter would have spent interleaving its own bytes into someone else's line. Past
+/// the deadline it does exactly that, so pathological contention still degrades rather than stalls.
 #[cfg(feature = "pi4")]
 fn serial_claim_deadline_ticks() -> u64 {
-    // 10 ms. `timer::frequency` reads CNTFRQ_EL0; a machine that reports 0 gets no wait at all, which is the
-    // old behaviour rather than an unbounded one.
-    timer::frequency() / 100
+    // 150 ms. `timer::frequency` reads CNTFRQ_EL0; a machine reporting 0 gets no wait at all, which is
+    // the old behaviour rather than an unbounded one.
+    (timer::frequency() / 1000) * 150
 }
 
 /// Claim the UART for one line, waiting a BOUNDED time for it.
