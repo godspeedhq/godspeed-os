@@ -283,6 +283,22 @@ FIRE_IRQ           = 14
 # delegatable (absent from SUPERVISOR_DELEGATABLE), so it cannot be handed on one grant later.
 # Pinned by §22 Adversarial A9c: a probe that HOLDS a spawn cap is refused.
 IMAGE_SPAWN        = 15
+# PCI_CFG - read PCI configuration space through the legacy CF8/CFC ports (step D2).
+#
+# "Why isn't this a service?" - the SEMANTICS are: `hw-enumerator` owns them. This authority exists
+# because `in`/`out` are privileged instructions no ring-3 code can execute, so the kernel must
+# perform the access on a holder's behalf. It is the smallest authority that makes userspace
+# enumeration possible at all.
+#
+# Held by ONE service, and permanently READ-ONLY. The pair is STATEFUL - a write to CF8 selects, a
+# read of CFC retrieves - so two holders would not merely race, they would silently read each other's
+# device: a wrong answer with nothing anywhere to say so, which is worse than a refused one.
+#
+# The write side of the DATA port is not granted and must never be. CF8 selects which register CFC
+# reaches, so authority to write CFC is authority to write ANY configuration register of ANY device
+# on the bus - every BAR, every command register - and there is no narrower form of it at port
+# granularity, because the target is chosen by data rather than by the interface.
+PCI_CFG            = 16
 
 
 [kernel.arch_roles]
@@ -393,6 +409,25 @@ NetFrameTx               = 42
 NetFrameRx               = 43
 NetInfo                  = 44
 FireIrq                  = 51
+# PORT I/O, gated by PCI_CFG (step D2 - hardware enumeration in userspace).
+#
+# "Why isn't this a service?" - it IS. `hw-enumerator` is the service, and these two syscalls exist
+# because `in`/`out` are PRIVILEGED INSTRUCTIONS: ring 3 cannot execute them, so no service can reach
+# a port without the kernel performing the access. Same shape as the RTC read `time` needs, and the
+# same answer: the kernel keeps the INSTRUCTION and the service keeps the MEANING.
+#
+# What the kernel learns is a port number and a 32-bit value. It does not learn that 0xCF8 selects a
+# PCI configuration register, how to walk a bus, what a class code identifies, or where a BAR is -
+# all of that lives in `services/hw-enumerator`, and 1183 lines of `arch/x86_64/pci.rs` are what it
+# is there to replace.
+#
+# The authority is narrow and permanently READ-ONLY: a 32-bit write to 0xCF8, a 32-bit read of
+# 0xCFC-0xCFF, enforced by an allowlist in `arch/x86_64`. The DATA port's write side is absent and
+# must stay absent - CF8 selects what CFC reaches, so a CFC write would be a write to any config
+# register of any device on the bus. If discovery ever needs mutation, that is a different mechanism
+# to design, not this pair to widen (docs/service-ownership.md, D2).
+PortOut32                = 53
+PortIn32                 = 54
 Gpio                     = 45
 UsbDiskInfo              = 46
 UsbDiskRead              = 47

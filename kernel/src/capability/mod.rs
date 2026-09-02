@@ -141,6 +141,20 @@ pub const FIRE_IRQ_RESOURCE: ResourceId = ResourceId(14);
 /// It stops the authority leaking to the twelve services that merely wanted to start something.
 pub const IMAGE_SPAWN_RESOURCE: ResourceId = ResourceId(15);
 
+/// Authority to read PCI configuration space through the legacy CF8/CFC port pair (step D2).
+///
+/// Held by ONE service - `hw-enumerator` - and READ-ONLY, permanently. CF8 selects which config
+/// register CFC reaches, so CFC WRITE authority is effectively write access across the whole of PCI
+/// configuration space: every BAR, every command register, every device. There is no narrower form
+/// of it at port granularity, because the target is chosen by data rather than by the interface. So
+/// the write side is not granted, and if a future need requires configuration-space mutation a
+/// different mechanism must be designed rather than this one widened (docs/service-ownership.md, D2).
+///
+/// The kernel enforces WHICH PORTS this permits and nothing else. It does not know that 0xCF8 means
+/// PCI configuration, how to walk a bus, or what a class code identifies - that is hardware SEMANTICS
+/// and it lives in the service (§26.10).
+pub const PCI_CFG_RESOURCE: ResourceId = ResourceId(16);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever - §7.5).
@@ -159,5 +173,6 @@ pub fn init() {
     table::register_resource(USB_DISK_RESOURCE);
     table::register_resource(SET_CLOCK_RESOURCE);
     table::register_resource(IMAGE_SPAWN_RESOURCE);
+    table::register_resource(PCI_CFG_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }

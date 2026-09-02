@@ -86,6 +86,11 @@ pub enum SyscallNumber {
     /// memory (step C, `docs/service-ownership.md`). The kernel stops holding a catalogue of what
     /// each service IS; it loads what it is handed, and enforces what the request may ask for.
     SpawnImage             = 52,
+    /// Write 32 bits to an I/O port. Gated by `PCI_CFG_RESOURCE`, and the kernel permits only the
+    /// ports that capability names - see `port_out32_allowed`.
+    PortOut32              = 53,
+    /// Read 32 bits from an I/O port. Same gate, its own allowlist (`port_in32_allowed`).
+    PortIn32               = 54,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -157,6 +162,8 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::ResourceInvoke as u64 => handle_resource_invoke(arg0, arg1, arg2),
         n if n == SyscallNumber::ResourceRevoke as u64 => handle_resource_revoke(arg0),
         n if n == SyscallNumber::LastRecvBadge  as u64 => scheduler::take_last_recv_badge() as i64,
+        n if n == SyscallNumber::PortOut32 as u64 => handle_port_out32(arg0, arg1),
+        n if n == SyscallNumber::PortIn32  as u64 => handle_port_in32(arg0),
         _ => -1, // Unknown syscall.
     }
 }
@@ -2473,6 +2480,55 @@ fn handle_reboot() -> i64 {
 const NET_FRAME_MAX: usize = 1600;
 
 /// NetFrameTx (42): transmit a raw ethernet frame via the in-kernel USB-net device. `arg0` = frame ptr,
+// ---------------------------------------------------------------------------
+// PORT I/O (step D2) - the mechanism a userspace hardware enumerator needs.
+//
+// The kernel knows how to PERFORM an authorised port operation. It does not know what the operation
+// MEANS - that 0xCF8 selects a PCI configuration register, how to walk a bus, what a class code
+// identifies, or how to read a BAR. That knowledge is hardware semantics and lives in the service
+// (§26.10, docs/service-ownership.md D2). This is the whole of the kernel's involvement.
+// ---------------------------------------------------------------------------
+
+/// PortOut32 (53): `arg0` = port, `arg1` = value. Gated by `PCI_CFG_RESOURCE` + WRITE.
+///
+/// Returns 0 on success, `CapNotHeld` without the capability, `-1` for a port the capability does not
+/// permit. Both refusals are LOUD (invariant 12): a caller that quietly did nothing would leave an
+/// enumerator reading whatever register happened to be selected last.
+fn handle_port_out32(port: u64, value: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::PCI_CFG_RESOURCE, Rights::WRITE) {
+        crate::kprintln!("port: OUT32 {:#06x} refused - caller does not hold PCI_CFG", port as u16);
+        return CapError::CapNotHeld as i64;
+    }
+    // The PORT allowlist lives in `arch` beside the instruction it guards, so the check and the I/O
+    // cannot drift apart and this file needs no `unsafe` (§18.5 - its floor may only shrink).
+    if !crate::arch::imp::pci_cfg_out32(port as u16, value as u32) {
+        crate::kprintln!("port: OUT32 {:#06x} refused - PCI_CFG permits a 32-bit write to 0xCF8 only",
+                         port as u16);
+        return -1;
+    }
+    0
+}
+
+/// PortIn32 (54): `arg0` = port. Gated by `PCI_CFG_RESOURCE` + READ.
+///
+/// Returns the 32-bit value read (as a positive i64), `CapNotHeld`, or `-1` for a port the capability
+/// does not permit. A read result is returned widened rather than as an out-parameter so the ARM ABI's
+/// one-register-per-argument limit is not a factor.
+fn handle_port_in32(port: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::PCI_CFG_RESOURCE, Rights::READ) {
+        crate::kprintln!("port: IN32 {:#06x} refused - caller does not hold PCI_CFG", port as u16);
+        return CapError::CapNotHeld as i64;
+    }
+    match crate::arch::imp::pci_cfg_in32(port as u16) {
+        Some(v) => v as i64,
+        None => {
+            crate::kprintln!("port: IN32 {:#06x} refused - PCI_CFG permits reads of 0xCFC-0xCFF only",
+                             port as u16);
+            -1
+        }
+    }
+}
+
 /// `arg1` = length. Gated by NET_DEVICE (validated by holdings - the args fill the ABI, no slot to pass).
 /// Returns 0 on success, -1 on error. On non-ARM arches `net_frame_tx` is a stub returning false.
 fn handle_net_frame_tx(ptr: u64, len: u64) -> i64 {

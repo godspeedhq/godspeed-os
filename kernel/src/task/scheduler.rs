@@ -2243,7 +2243,10 @@ pub fn kill_task_by_slot(slot: usize) {
         // only view of recovery said nothing happened.
         if matches!(task_name,
             "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "console" | "supervisor"
-            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control")
+            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control"
+            // hw-enumerator is MANAGED, so its death is a restart like any other - and a restart that
+            // is not COUNTED cannot be observed: `observe` would report 0 for a service that died.
+            | "hw-enumerator")
         {
             bump_name_restart(task_name);
         }
@@ -2287,7 +2290,11 @@ pub fn kill_task_by_slot(slot: usize) {
             crate::bootcon::reclaim_on_death();
         }
         if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "logger" | "console"
-            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control") {
+            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control"
+            // hw-enumerator: MANAGED, so its death must REACH the supervisor. Without this it would
+            // still come back - on the next reconcile sweep - which is exactly why the omission hides:
+            // not dead forever, just dead for a while, and nothing says so.
+            | "hw-enumerator") {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),

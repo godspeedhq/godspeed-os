@@ -307,6 +307,9 @@ pub mod privbits {
     pub const SET_CLOCK:       u32 = 1 << 10;
     /// NET_DEVICE: move ethernet frames through the in-kernel network device (aarch64's GENET).
     pub const NET_DEVICE:      u32 = 1 << 11;
+    /// Read PCI configuration space through the legacy CF8/CFC ports (step D2). READ-ONLY and held
+    /// by ONE service - see `docs/service-ownership.md` D2 for why the write side is not on offer.
+    pub const PCI_CFG:         u32 = 1 << 12;
 }
 
 /// Device classes a spawner can name in `SpawnRequest::hw_flags`. The kernel resolves the class to
@@ -2764,6 +2767,27 @@ impl ServiceContext {
         let d = Self::ctx();
         let n = core::cmp::min(d.irq_count as usize, d.irqs.len());
         &d.irqs[..n]
+    }
+
+    /// Write 32 bits to an I/O port. Requires the `PCI_CFG` privilege, and the kernel permits only
+    /// the ports that capability names (0xCF8).
+    ///
+    /// `true` on success; `false` if the capability is missing or the port is not permitted - both of
+    /// which the kernel also reports (invariant 12), so a caller need not guess which it was.
+    pub fn port_out32(&self, port: u16, value: u32) -> bool {
+        // SAFETY: a plain syscall; the kernel validates the capability and the port before any I/O.
+        unsafe { crate::syscall::raw_syscall(53, port as u64, value as u64, 0) == 0 }
+    }
+
+    /// Read 32 bits from an I/O port. Requires `PCI_CFG`; permitted ports are 0xCFC-0xCFF.
+    ///
+    /// `None` if the capability is missing or the port is not permitted. Note the distinction from
+    /// `Some(0xFFFF_FFFF)`, which is a SUCCESSFUL read of an absent device - the bus floats high, and
+    /// that is data, not an error.
+    pub fn port_in32(&self, port: u16) -> Option<u32> {
+        // SAFETY: a plain syscall; the kernel validates the capability and the port before any I/O.
+        let r = unsafe { crate::syscall::raw_syscall(54, port as u64, 0, 0) };
+        if r < 0 { None } else { Some(r as u32) }
     }
 
     /// Allocate `size` bytes of read/write memory within this task's budget.

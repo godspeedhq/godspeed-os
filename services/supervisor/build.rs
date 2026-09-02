@@ -45,13 +45,21 @@ fn main() {
         _         => &[],
     };
 
+    // `hw-enumerator` is x86-only for the same reason, one layer down: its authority is legacy PCI
+    // CF8/CFC PORT I/O, and ARM has no port I/O address space at all. Embedding it there would ship a
+    // service that comes up, is refused by the kernel on its first config read, says so, and idles -
+    // a service that cannot work on the machine it is on. A hardware enumerator for those ports would
+    // reach its devices another way (device tree, ECAM), which is a different implementation behind
+    // the same service contract.
+    let enumerator: &[&str] = if arch == "x86_64" { &["hw-enumerator"] } else { &[] };
+
     // OUT_DIR is <target>/<triple>/<profile>/build/<pkg>-<hash>/out, so the binaries this build
     // needs sit four levels up. Derived rather than assumed, so it holds for every triple.
     let out = std::env::var("OUT_DIR").unwrap();
     let target_dir = std::path::Path::new(&out)
         .ancestors().nth(3).expect("OUT_DIR shallower than expected").to_path_buf();
 
-    for name in EMBEDDED.iter().chain(usb.iter()).chain(probe.iter()) {
+    for name in EMBEDDED.iter().chain(usb.iter()).chain(enumerator.iter()).chain(probe.iter()) {
         let elf = target_dir.join(name);
         // LOUD, not a fallback (invariant 12). An embedded image that silently resolved to nothing
         // would produce a supervisor that cannot start the service, failing far from the cause.

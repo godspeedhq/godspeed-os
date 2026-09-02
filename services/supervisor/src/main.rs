@@ -184,6 +184,10 @@ static FS_ELF: &[u8] = include_bytes!(env!("SVC_FS_ELF"));
 static BLOCK_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_BLOCK_DRIVER_ELF"));
 static NET_STACK_ELF: &[u8] = include_bytes!(env!("SVC_NET_STACK_ELF"));
 static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
+/// Hardware discovery in userspace (step D2). x86 only - ARM has no port I/O address space, so the
+/// service would come up, be refused by the kernel on its first config read, say so, and idle.
+#[cfg(target_arch = "x86_64")]
+static HW_ENUMERATOR_ELF: &[u8] = include_bytes!(env!("SVC_HW_ENUMERATOR_ELF"));
 static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
 static MEM_PRESSURE_ELF: &[u8] = include_bytes!(env!("SVC_MEM_PRESSURE_ELF"));
@@ -223,6 +227,18 @@ static DWC2_ELF: &[u8] = include_bytes!(env!("SVC_DWC2_ELF"));
 const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 1, &[], 0, 0, 0),
     ("time", TIME_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "net-stack"], 0, 0, 0),
+    // Hardware discovery, in USERSPACE (step D2). Carries PCI_CFG - a 32-bit write to 0xCF8 and a
+    // 32-bit read of 0xCFC-0xCFF, and nothing else. The write side of the DATA port is deliberately
+    // absent: CF8 selects which register CFC reaches, so writing CFC would be writing any config
+    // register of any device on the bus.
+    //
+    // ONE holder, because the pair is stateful - two would silently read each other's device. If a
+    // second service ever needs config reads, that is a design decision about who enumerates, not a
+    // second grant.
+    #[cfg(target_arch = "x86_64")]
+    ("hw-enumerator", HW_ENUMERATOR_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     8 * 1024 * 1024, u32::MAX, &[],
+     godspeed_sdk::service_context::privbits::PCI_CFG, 0, 0),
     ("logger", LOGGER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, 2, &[], 0, 0, 0),
     ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0, 0),
     // FIRST service to move carrying a PRIVILEGE. RESOURCE_MINT arrives in the spawn request and the
@@ -709,7 +725,7 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 /// The restartable services the supervisor is responsible for (§6.1). Hoisted so the scan, `reconcile`,
 /// and `converge` share ONE roster. Order matters: block-driver before fs before shell (each wires to
 /// the previous); nic-driver before net-stack.
-const MANAGED_N: usize = 12;
+const MANAGED_N: usize = 13;
 const MANAGED: [&str; MANAGED_N] =
     ["block-driver", "fs", "shell", "xhci", "ehci", "logger", "console", "nic-driver", "net-stack",
      // C1-6: both moved OUT of the kernel and so must be started BY someone. `time` owns the wall
@@ -720,7 +736,11 @@ const MANAGED: [&str; MANAGED_N] =
      // listing it costs other ports nothing. It was in the kernel's death-notification set but in no
      // reconcile list at all - so a DROPPED notification left the Pi's storage, keyboard and network
      // down with no backstop to notice.
-     "time", "control", "dwc2"];
+     "time", "control", "dwc2",
+     // Hardware discovery in userspace (step D2). x86-only in practice - the image is embedded only
+     // there - and reconcile skips any name absent from the map, so listing it unconditionally costs
+     // the ARM ports nothing, exactly as `dwc2` above costs x86 nothing.
+     "hw-enumerator"];
 
 /// Scan REAL liveness via `task_stat` (NOT a cap-acquire, which the kernel directory keeps succeeding
 /// for a dead name - the `ensure_*` stale-cap-adopt race, line ~149): which MANAGED services have a live
@@ -986,6 +1006,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // neither can delay the prompt the way a driver bring-up would.
     ensure_mapped(&ctx, &mut name_map, "time", 0xFFFF);
     ensure_mapped(&ctx, &mut name_map, "control", 0xFFFF);
+    // hw-enumerator (x86): hardware discovery in userspace (step D2). Started here because it holds
+    // no device and blocks nothing - it reads PCI config space once, reports, and then answers
+    // questions. On ARM the image is not embedded and this is a no-op, the same way `dwc2` above is a
+    // no-op on x86.
+    //
+    // It is spawned EXPLICITLY rather than left to the MANAGED list, because MANAGED is the watch and
+    // reconcile set - it says what to RESTART, not what to START. A service in MANAGED and nowhere
+    // else is embedded, configured, watched, and never runs; that is the shape the comment above
+    // MANAGED warns about, and this service hit it on its first boot.
+    ensure_mapped(&ctx, &mut name_map, "hw-enumerator", 0xFFFF);
     // dwc2 (arm32): the Pi 2's ENTIRE USB stack - storage, keyboard and networking all ride on this
     // one service. Spawned BEFORE block-driver and nic-driver because both name it as a send_peer: a
     // peer that does not exist yet costs them their direct cap and forces a name-wire later.

@@ -2206,6 +2206,16 @@ pub mod syscall_entry {
 ///
 /// Lives at the ARCH TOP LEVEL, not inside `mod pci`, because `syscall::dispatch` reaches it as
 /// `crate::arch::imp::serial_unlocked_emit_count` - which is where x86 defines it too.
+/// ARM has NO PORT I/O ADDRESS SPACE - `in`/`out` are x86 instructions with no equivalent here. So
+/// this is not "unimplemented", it is absent by construction: the gated `PortOut32` / `PortIn32`
+/// syscalls exist on every arch for one dispatch table, and on this one they can only REFUSE.
+/// Peripherals here are memory-mapped and reached through an MMIO grant instead.
+///
+/// Safe, and performs no I/O - there is none to perform.
+pub fn pci_cfg_out32(_port: u16, _val: u32) -> bool { false }
+/// See `pci_cfg_out32`. Always refuses, so a caller is told rather than handed a plausible zero.
+pub fn pci_cfg_in32(_port: u16) -> Option<u32> { None }
+
 pub fn serial_unlocked_emit_count() -> u64 { 0 }
 
 pub mod interrupts {

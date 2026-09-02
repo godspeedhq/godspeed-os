@@ -2165,6 +2165,11 @@ write_page_table_base, invalidate_tlb_page}`, `interrupts::{local_irq_save, loca
 | `arch/x86_64/page_tables.rs` | 41 → 46 (+5) | CR3 read/write + `invlpg` primitives (the MMU-base + TLB seam). |
 | `arch/x86_64/mod.rs` | 33 → 35 (+2) | `switch_to_boot_stack` (the boot stack-pointer seam; `#[inline(always)]`). |
 | `arch/x86_64/interrupts.rs` | 21 → 22 (+1) | `local_irq_save` (the irq-save half; `local_irq_restore` calls `enable_interrupts`). |
+| `arch/x86_64/mod.rs` | 37 → 39 (+2) | `pci_cfg_out32` / `pci_cfg_in32` - the port instructions behind the gated `PortOut32`/`PortIn32` syscalls (step D2, userspace hardware enumeration). One `out dx, eax` and one `in eax, dx`, each carrying a SAFETY comment.
+
+Placed here DELIBERATELY. The first version put the `unsafe` in `syscall/dispatch.rs` and grew that file 2 -> 4 - and dispatch.rs is a §18.5 GRANDFATHERED FLOOR, which may decrease freely but may increase only by an amendment with a written rationale. §18.5 says new `unsafe` a feature needs must first try to live in a permitted layer, so it moved to `arch/` and dispatch.rs is back at its floor with no amendment required - the worked example that section describes, hit for real.
+
+The port ALLOWLIST moved with it, which is the better placement independently: the check now sits beside the instruction it guards, so the two cannot drift apart, and the wrappers are SAFE by construction rather than by a contract a caller could get wrong. |
 | `arch/x86_64/interrupts.rs` | 22 → 26 (+4) | The MSI VECTOR POOL (step D1b): `macro_rules! msi_pool_vector` generates eight identical naked ISR stubs, so the four lines are written ONCE in the macro body and expanded eight times - `#[unsafe(naked)]`, `pub unsafe extern "C" fn` (the stub), `unsafe extern "C" fn` (its handler), and the `unsafe { dispatch_irq(vec) }` inside it. Same shape as `xhci_msi_isr_stub` beside it, which has run on four machines; the macro means the shape is written once instead of eight times, which is why the count grew by 4 and not 32. Permitted layer (`arch/`, §18.1); each carries a `// SAFETY:` and the asm resolves its handler with `sym` rather than a `#[no_mangle]` name nothing checks. |
 | `memory/allocator.rs` | 44 → 43 (-1) | CR3-read asm replaced by `arch::imp::read_page_table_base`. |
 | `smp/ipi.rs` | 25 → 23 (-2) | CR3 reload + `invlpg` + rflags save/restore replaced by `arch::imp` primitives. |
@@ -2372,7 +2377,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/interrupts.rs | 26 | permitted |
 | arch/x86_64/ioapic.rs | 8 | permitted |
 | arch/x86_64/iommu.rs | 74 | permitted |
-| arch/x86_64/mod.rs | 37 | permitted |
+| arch/x86_64/mod.rs | 39 | permitted |
 | arch/x86_64/page_tables.rs | 51 | permitted |
 | arch/x86_64/pci.rs | 20 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |

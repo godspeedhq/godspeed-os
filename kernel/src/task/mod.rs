@@ -13,7 +13,7 @@ use crate::arch::imp::context_switch::TaskContext;
 use crate::arch::imp::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE, FIRE_IRQ_RESOURCE, IMAGE_SPAWN_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE, FIRE_IRQ_RESOURCE, IMAGE_SPAWN_RESOURCE, PCI_CFG_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -885,11 +885,19 @@ pub mod privbits {
     /// look healthy, and have every frame call denied - a dead network with no error at spawn, which
     /// is the failure shape this whole mechanism exists to prevent.
     pub const NET_DEVICE:      u32 = 1 << 11;
+    /// PCI_CFG: read PCI configuration space through the legacy CF8/CFC ports (step D2).
+    ///
+    /// READ-ONLY, permanently, and the kernel enforces WHICH PORTS rather than what they mean. CF8
+    /// selects which register CFC reaches, so a CFC write would be a write to any config register of
+    /// any device on the bus; there is no narrower form of that at port granularity, so it is not on
+    /// offer. Held by ONE service (`hw-enumerator`), because the pair is stateful - two holders do
+    /// not merely race, they silently read each other's device.
+    pub const PCI_CFG:         u32 = 1 << 12;
     /// Every bit this kernel understands. Anything outside it is refused, so a newer spawner cannot
     /// quietly ask for a privilege this kernel would ignore.
     pub const KNOWN: u32 = SPAWN | CONSOLE_PUSH | INTROSPECT | SERVICE_CONTROL
                          | FIRE_IRQ | REBOOT | ACQUIRE_ANY | RESOURCE_MINT
-                         | GPIO | SET_CLOCK_FLOOR | SET_CLOCK | NET_DEVICE;
+                         | GPIO | SET_CLOCK_FLOOR | SET_CLOCK | NET_DEVICE | PCI_CFG;
 }
 
 /// Which requested privilege the CALLING task does not itself hold, if any.
@@ -899,7 +907,7 @@ pub mod privbits {
 pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
     use crate::capability::*;
     if requested & !privbits::KNOWN != 0 { return Some("an unknown privilege bit"); }
-    let checks: [(u32, ResourceId, &'static str); 12] = [
+    let checks: [(u32, ResourceId, &'static str); 13] = [
         (privbits::SPAWN,           SPAWN_RESOURCE,           "SPAWN"),
         (privbits::CONSOLE_PUSH,    CONSOLE_PUSH_RESOURCE,    "CONSOLE_PUSH"),
         (privbits::INTROSPECT,      INTROSPECT_RESOURCE,      "INTROSPECT"),
@@ -912,6 +920,7 @@ pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
         (privbits::SET_CLOCK_FLOOR, SET_CLOCK_RESOURCE,       "SET_CLOCK_FLOOR"),
         (privbits::SET_CLOCK,       SET_CLOCK_RESOURCE,       "SET_CLOCK"),
         (privbits::NET_DEVICE,      NET_DEVICE_RESOURCE,      "NET_DEVICE"),
+        (privbits::PCI_CFG,         PCI_CFG_RESOURCE,         "PCI_CFG"),
     ];
     for (bit, res, label) in checks {
         // GRANT, not WRITE. Delegating an authority and EXERCISING it are different rights (7.4), and
@@ -948,6 +957,7 @@ const SUPERVISOR_DELEGATABLE: &[(u32, crate::capability::cap::ResourceId)] = &[
     (privbits::SET_CLOCK_FLOOR, SET_CLOCK_RESOURCE),
     (privbits::SET_CLOCK,       SET_CLOCK_RESOURCE),
     (privbits::NET_DEVICE,      NET_DEVICE_RESOURCE),
+    (privbits::PCI_CFG,         PCI_CFG_RESOURCE),
 ];
 
 struct Privileges {
@@ -959,6 +969,7 @@ struct Privileges {
     reboot:          bool, // REBOOT: hardware-reset the machine (shell `reboot` only - SEC-2)
     acquire_any:     bool, // ACQUIRE_ANY: reach ARBITRARY services by name via AcquireSendCap (§3.1)
     net_device:      bool, // NET_DEVICE: move ethernet frames via the in-kernel USB-net bridge (ARM nic-driver)
+    pci_cfg:         bool, // PCI_CFG: read PCI config space via CF8/CFC (hw-enumerator, step D2)
     usb_disk:        bool, // USB_DISK: read/write blocks on the in-kernel USB mass-storage device (ARM block-driver)
     gpio:            bool, // GPIO_DEVICE: drive the SoC GPIO pins (ARM `gpio` shell command)
     set_clock:       bool, // SET_CLOCK (WRITE): set the wall clock from SNTP (RTC-less ARM; net-stack)
@@ -1030,6 +1041,11 @@ fn service_privileges(name: &str) -> Privileges {
         // nic-driver reaches frames over IPC and the syscalls have nothing behind them. Keeping the
         // grant would be authority it cannot use - the exact over-grant the audits keep finding.
         net_device: cfg!(target_arch = "aarch64") && matches!(name, "nic-driver"),
+        // No service in the KERNEL's catalogue holds PCI_CFG. `hw-enumerator` is a moved service -
+        // the supervisor owns its image and requests this privilege in the spawn request, which the
+        // kernel grants only because the supervisor itself holds a GRANT cap for it. That is step C's
+        // shape and the reason this reads `false` rather than naming a service (§7.4).
+        pci_cfg: false,
         // USB_DISK: `block-driver` reaches a USB stick through syscalls 46-48 rather than MMIO, on
         // the port where the USB stack is IN THE KERNEL - which is now ARM32 (Pi 2) ONLY. On aarch64
         // the in-kernel driver was deleted (CLAUDE.md §6.4, 2026-08-09) and block-driver goes through
@@ -1498,6 +1514,7 @@ fn spawn_service_with_image(
             set_clock_floor: bits & privbits::SET_CLOCK_FLOOR != 0,
             set_clock:       bits & privbits::SET_CLOCK       != 0,
             net_device:      bits & privbits::NET_DEVICE      != 0,
+            pci_cfg:         bits & privbits::PCI_CFG         != 0,
             // NO BIT, and none is coming. A spawner cannot pass on the authority to spawn arbitrary
             // images: that is exactly the widening this capability exists to close, and a wire bit
             // for it would re-open the hole one grant later.
@@ -1737,6 +1754,20 @@ fn spawn_service_with_image(
     if privs.net_device {
         let nd_cap = mint_cap(NET_DEVICE_RESOURCE, Rights::WRITE);
         caps.insert(nd_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+
+    // PCI_CFG: `hw-enumerator` reads PCI configuration space through CF8/CFC (PortOut32/PortIn32,
+    // syscalls 53-54, step D2). Minted here; WHO holds it is the spawn request's privilege bits.
+    //
+    // READ | WRITE, and the write right is NOT a hole in the read-only story: performing a config
+    // READ requires writing the ADDRESS port to select which register the data port returns. What
+    // makes the authority read-only is the kernel's PORT ALLOWLIST - a write is permitted to 0xCF8
+    // and to nothing else, so no configuration register can be modified through this capability.
+    // The rights say "you may drive this pair"; the allowlist says which direction each port goes.
+    if privs.pci_cfg {
+        let pc_cap = mint_cap(PCI_CFG_RESOURCE, Rights::READ | Rights::WRITE);
+        caps.insert(pc_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
