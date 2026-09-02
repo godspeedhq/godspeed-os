@@ -1551,23 +1551,30 @@ enum SerialClaim {
 /// A DURATION, not a spin count, because a count means a different wait on every machine and the two
 /// boards this runs on clock the generic timer differently (54 MHz on the Pi 4, 62.5 MHz under QEMU).
 ///
-/// **IT MUST EXCEED THE LONGEST SINGLE WRITE, or it accomplishes nothing.** The first version used
-/// 10 ms, which sounded generous and was not: the neutral log stages up to `SERIAL_STAGE` (512) bytes
-/// and flushes them in ONE call, and 512 bytes at 115200 baud is about 44 ms of UART time. So a waiter
-/// expired mid-write essentially every time and interleaved exactly as it had before - hardware showed
-/// the splice count unmoved, 6 lines then 5, while the claim was working perfectly and simply never
-/// being reached. A bound shorter than the thing it is bounding is not a safety valve, it is an
-/// off switch.
+/// **DELIBERATELY SHORTER THAN THE LONGEST WRITE, which is a compromise and not an oversight.**
 ///
-/// 150 ms covers a maximum-length write with room for a couple queued behind it. Waiting that long is
-/// affordable for the reason the whole claim is affordable: the UART is the bottleneck either way, so
-/// this is time the waiter would have spent interleaving its own bytes into someone else's line. Past
-/// the deadline it does exactly that, so pathological contention still degrades rather than stalls.
+/// The tempting reasoning is: the neutral log flushes up to `SERIAL_STAGE` (512) bytes in one call,
+/// 512 bytes at 115200 baud is ~44 ms, so a deadline below that expires mid-write and accomplishes
+/// nothing. That reasoning is correct about the mechanism and wrong about the remedy. Raising the
+/// deadline to 150 ms was tried on hardware and made chaos rounds take 6.4 SECONDS each against a
+/// baseline near 1 - cores spending their quanta waiting on a UART instead of running services. That
+/// is the 104-second-boot failure returning by a different route, and it is a far worse bug than a
+/// garbled log line.
+///
+/// So the wait is sized to serialise the SHORT lines that make up most of the log, and to give up
+/// rather than queue behind a long flush. Splices therefore still occur, concentrated exactly where
+/// the writes are longest. That residual is real and is recorded in the audit rather than implied
+/// away.
+///
+/// THE ACTUAL FIX IS NOT A LONGER WAIT. It is not waiting: a bounded ring that accepts whole lines
+/// from any core and lets a single drainer write them, so no writer ever blocks on the UART and lines
+/// cannot interleave by construction. That is a larger change to the machine's only diagnostic path
+/// and wants its own careful pass; this constant is the honest interim.
 #[cfg(feature = "pi4")]
 fn serial_claim_deadline_ticks() -> u64 {
-    // 150 ms. `timer::frequency` reads CNTFRQ_EL0; a machine reporting 0 gets no wait at all, which is
-    // the old behaviour rather than an unbounded one.
-    (timer::frequency() / 1000) * 150
+    // 10 ms - about one short line's worth of UART time. `timer::frequency` reads CNTFRQ_EL0; a
+    // machine reporting 0 gets no wait at all, which is the old behaviour rather than an unbounded one.
+    timer::frequency() / 100
 }
 
 /// Claim the UART for one line, waiting a BOUNDED time for it.
