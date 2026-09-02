@@ -283,21 +283,24 @@ FIRE_IRQ           = 14
 # delegatable (absent from SUPERVISOR_DELEGATABLE), so it cannot be handed on one grant later.
 # Pinned by §22 Adversarial A9c: a probe that HOLDS a spawn cap is refused.
 IMAGE_SPAWN        = 15
-# PCI_CFG - read PCI configuration space through the legacy CF8/CFC ports (step D2).
+# PCI_CFG - read one PCI configuration register (step D2).
 #
 # "Why isn't this a service?" - the SEMANTICS are: `hw-enumerator` owns them. This authority exists
-# because `in`/`out` are privileged instructions no ring-3 code can execute, so the kernel must
-# perform the access on a holder's behalf. It is the smallest authority that makes userspace
-# enumeration possible at all.
+# because reaching configuration space needs a privileged instruction or a kernel-only mapping that
+# no ring-3 code has, so the kernel must perform the access on a holder's behalf. It is the smallest
+# authority that makes userspace enumeration possible at all.
 #
-# Held by ONE service, and permanently READ-ONLY. The pair is STATEFUL - a write to CF8 selects, a
-# read of CFC retrieves - so two holders would not merely race, they would silently read each other's
-# device: a wrong answer with nothing anywhere to say so, which is worse than a refused one.
+# PERMANENTLY READ-ONLY. Configuration space holds every BAR and every command register, and the
+# target is chosen by data rather than by the interface, so write authority here is write authority
+# over every device on the bus and there is no narrower form of it to grant. The capability is minted
+# with READ alone - not READ|WRITE - so no unexercisable right sits around waiting for a later change
+# to find a use for it.
 #
-# The write side of the DATA port is not granted and must never be. CF8 selects which register CFC
-# reaches, so authority to write CFC is authority to write ANY configuration register of ANY device
-# on the bus - every BAR, every command register - and there is no narrower form of it at port
-# granularity, because the target is chosen by data rather than by the interface.
+# SAFE FOR MULTIPLE HOLDERS, because the operation is atomic. The underlying hardware is a stateful
+# index/data pair on both ports, and were selecting and reading two separate operations, two holders
+# would silently read each other's device - a wrong answer with nothing anywhere to say so, which is
+# worse than a refused one. The kernel itself drives that pair on its spawn and kill paths, so this
+# was never hypothetical: a split interface raced the kernel, not just other services.
 PCI_CFG            = 16
 
 
@@ -409,25 +412,26 @@ NetFrameTx               = 42
 NetFrameRx               = 43
 NetInfo                  = 44
 FireIrq                  = 51
-# PORT I/O, gated by PCI_CFG (step D2 - hardware enumeration in userspace).
+# What the kernel learns is a selector and a register offset - two opaque numbers. It does not learn
+# what they name: not that a bus/device/function encoding sits inside the selector, not how to walk a
+# bus, not what a class code identifies. That knowledge is hardware semantics and lives in the
+# `hw-enumerator` service, which is the whole point of step D2.
 #
-# "Why isn't this a service?" - it IS. `hw-enumerator` is the service, and these two syscalls exist
-# because `in`/`out` are PRIVILEGED INSTRUCTIONS: ring 3 cannot execute them, so no service can reach
-# a port without the kernel performing the access. Same shape as the RTC read `time` needs, and the
-# same answer: the kernel keeps the INSTRUCTION and the service keeps the MEANING.
+# ONE SYSCALL, NOT A SELECT/READ PAIR, and the count is the smaller half of why. Configuration space
+# is reached on both ports through a stateful index/data register pair: latch a selector, then read
+# the data. Split across two syscalls, two callers interleave and each reads whichever register the
+# OTHER selected - and the KERNEL uses that same pair on its spawn and kill paths (`program_msi`,
+# `set_bus_master`), so a split pair races the kernel's own accesses and can land a kernel WRITE on a
+# device a service selected. A lock cannot close that: the kernel would have to hold it across two
+# syscalls and wait for a service to issue the second, which nothing above the kernel may make it do.
+# Atomic under one lock, the window does not exist.
 #
-# What the kernel learns is a port number and a 32-bit value. It does not learn that 0xCF8 selects a
-# PCI configuration register, how to walk a bus, what a class code identifies, or where a BAR is -
-# all of that lives in `services/hw-enumerator`, and 1183 lines of `arch/x86_64/pci.rs` are what it
-# is there to replace.
-#
-# The authority is narrow and permanently READ-ONLY: a 32-bit write to 0xCF8, a 32-bit read of
-# 0xCFC-0xCFF, enforced by an allowlist in `arch/x86_64`. The DATA port's write side is absent and
-# must stay absent - CF8 selects what CFC reaches, so a CFC write would be a write to any config
-# register of any device on the bus. If discovery ever needs mutation, that is a different mechanism
-# to design, not this pair to widen (docs/service-ownership.md, D2).
-PortOut32                = 53
-PortIn32                 = 54
+# The authority is narrow and permanently READ-ONLY: one configuration register read, and no write of
+# any kind. Configuration space holds every BAR and every command register, and the target is chosen
+# by data rather than by the interface, so there is no narrower form of write authority to grant -
+# which is exactly why none is. Widening this to allow writes (destructive BAR sizing is the obvious
+# temptation) requires a different mechanism designed on its own terms, never this one relaxed.
+PciCfgRead               = 53
 Gpio                     = 45
 UsbDiskInfo              = 46
 UsbDiskRead              = 47

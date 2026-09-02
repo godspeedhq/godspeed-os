@@ -566,21 +566,52 @@ kernel:     "Given a valid capability, I permit this operation."
 userspace:  "I know what this operation MEANS."
 ```
 
-The kernel knows how to perform `in(port)` / `out(port, value)`. It does not know that `0xCF8` means
-PCI configuration, how to walk a bus, what a class code identifies, or how to read a BAR. That
-knowledge is hardware SEMANTICS and belongs in userspace. This is §26.10 applied to a privileged
-instruction rather than to a syscall.
+The kernel knows how to perform one configuration read. It does not know what the selector it was
+handed NAMES - not that a bus/device/function encoding sits inside it, not how to walk a bus, not what
+a class code identifies, not how to read a BAR. That knowledge is hardware SEMANTICS and belongs in
+userspace. This is §26.10 applied to a privileged access rather than to a syscall.
 
-**The x86 legacy PCI grant.** For Configuration Mechanism #1, `hw-enumerator` receives exactly:
+**The grant.** `hw-enumerator` receives exactly one operation:
 
 ```
-MAY:       OUT32 0xCF8          (select a config register)
-           IN32  0xCFC-0xCFF    (read it)
-MUST NOT:  OUT   0xCFC-0xCFF    (write it)
+MAY:       read one configuration register  (selector + offset, both opaque to the kernel)
+MUST NOT:  write configuration space at all
+MUST NOT:  leave the hardware selector pointing anywhere
 ```
 
-Not "all port I/O", and not `READ/WRITE 0xCF8-0xCFF`. Authority reflects the operations actually
+Not "all port I/O", and not "read/write config space". Authority reflects the operations actually
 required, and enumeration is inherently read-only.
+
+**One operation, not a select-then-read pair - and that is a correctness requirement, not tidiness.**
+Configuration space is reached on both ports through a stateful index/data register pair: latch a
+selector, then read the data. The first version of this grant exposed those as two syscalls, and that
+was wrong in a way hardware found before review did. Two callers interleaved read whichever register
+the OTHER selected. Worse, the KERNEL drives the same pair on its spawn and kill paths
+(`program_msi`, `set_bus_master`), so a split interface raced the kernel's own accesses and could land
+a kernel WRITE on a device a service had selected. A lock cannot close that gap: the kernel would have
+to hold it across two syscalls and wait for a service to issue the second, and nothing above the
+kernel may make the kernel wait. Folding the pair into one atomic kernel operation removes the window
+entirely, makes multiple holders safe, and leaves the caller unable to write anything at all.
+
+**The kernel enforces admissibility, and this is where "a service must not be able to halt the
+machine" becomes concrete.** On the Pi 4, a configuration read past the bus range the bridge is
+programmed to forward is an unsupported request: the root complex raises an SError and stalls the
+interconnect, rather than returning the harmless all-ones a PC's host bridge synthesizes. An early
+build of the enumerator walked four buses on a board that forwards one, and took the machine down with
+it - a userspace service panicking the kernel through an argument, which is the one thing that must
+never happen. So the kernel refuses a bus it did not program a route to. That is address
+admissibility, not device provenance: the kernel checks that an access is safe to perform, never that
+the caller is entitled to the device behind it.
+
+**Recorded limitation (§26.7): this is PREVENTION, not recovery.** The kernel stops the unsafe access
+from being issued; it cannot survive one that is. An aborted configuration read stalls the CPU inside
+a load instruction and holds the interconnect, which is a hardware condition with no software exit -
+the observed failure was another core, doing unrelated work, making no scheduler progress for ten
+seconds until the liveness watchdog fired. The watchdog did its job (a loud stop rather than silent
+corruption), and the admissibility check means a service cannot reach that state through this
+capability. But if some future access can still abort, the outcome is a panic and not a refusal, and
+that is worth knowing before granting a wider hardware capability to anything.
+
 
 **Read-only is a PERMANENT boundary, not a starting point.** CF8/CFC looks like two ports but CF8
 selects WHICH register CFC reaches, so CFC write authority is effectively write access across the
@@ -661,31 +692,54 @@ carefully-reasoned exception at a time, each individually defensible.
 
 ### D2 (BUILT 2026-09-02): `hw-enumerator` walks the bus in userspace
 
-Implemented and proven in QEMU. The kernel gained two gated syscalls - `PortOut32` (53) and
-`PortIn32` (54) - behind a new `PCI_CFG` authority. It learns a port number and a 32-bit value, and
-nothing else: not that 0xCF8 selects a configuration register, not how to walk a bus, not what a
+Implemented, proven in QEMU on x86, and on hardware on the Pi 4. The kernel gained ONE gated syscall
+- `PciCfgRead` (53) - behind a new `PCI_CFG` authority. It learns a selector and a register offset,
+two opaque numbers, and nothing else: not what the selector names, not how to walk a bus, not what a
 class code identifies, not where a BAR lives. All of that moved to `services/hw-enumerator`.
 
 **The proof is the same cross-check that made D1 safe**: two independent walks of one bus must agree.
-The kernel's own scan reports the NIC at `00:03.0 vendor=0x8086`; the userspace walk found it at the
-same address with class `0x020000`, alongside five more devices:
+On q35 the kernel's own scan records 8 devices and the userspace walk finds the same 8, with the NIC,
+xHCI, AHCI and EHCI each cross-checked `AGREES`:
 
 ```
-hw-enumerator: probe 00:00.0 vendor/device = 0x12378086
-hw-enum: 00:00.0 class 0x060000 vendor 0x8086 device 0x1237   host bridge
-hw-enum: 00:02.0 class 0x030000 vendor 0x1234 device 0x1111   VGA
-hw-enum: 00:03.0 class 0x020000 vendor 0x8086 device 0x100e bar0 0xfebc0000 irq 11
-hw-enumerator: 6 device(s) found by USERSPACE enumeration
+hw-enumerator: probe 00:00.0 vendor/device = 0x29c08086
+hw-enumerator: 00:02.0 class 0x020000 vendor 0x8086 device 0x10d3 bar0 0xfeb80000 irq 11
+hw-enumerator: 00:04.0 class 0x0c0330 vendor 0x1b36 device 0x000d bar0 0xfebd4004 irq 10
+hw-enumerator: 8 device(s) found by USERSPACE enumeration
+pci: device table - 8 device(s) recorded (generic, no class knowledge)
+pci:   NIC class 0x020000 AGREES (BAR0 0xfeb80000 BDF 0x0010)
 ```
 
-**Read-only, permanently, and the allowlist lives in `arch/x86_64` beside the instruction it guards**
-- a 32-bit write to 0xCF8, a 32-bit read of 0xCFC-0xCFF. Both syscalls and the authority are PINNED
-in `COMMANDMENTS.baseline.toml`, each answering the checker's question ("why isn't this a service?"
-- it is; `in`/`out` are privileged instructions no ring-3 code can execute, the same shape as the RTC
-read `time` needs).
+**TWO PLATFORMS, ONE SERVICE, AND THAT IS THE WHOLE CLAIM.** x86 reaches configuration space through
+the CF8/CFC ports; the Pi 4 through a memory-mapped window on its root complex. Both are an
+index/data pair, so the same syscall and the same capability serve both. What differs is the selector
+encoding, and that lives entirely in the service:
 
-x86 only: ARM has no port I/O address space, so the image is not embedded there and the syscalls can
-only refuse. The service CONTRACT is the stable thing; the capability under it varies by platform.
+```
+x86    bus<<16 | dev<<11 | func<<8      (mechanism #1)
+Pi 4   bus<<20 | dev<<15 | func<<12     (root complex config window)
+```
+
+A third platform with a third layout needs no kernel change at all. That is the assertion D2 exists to
+make, and it now has two data points rather than one.
+
+**Why the kernel mediates on the Pi 4 instead of just granting the window.** The cheaper answer - map
+the root complex into the service and let it drive the pair itself - cannot be made safe there. MMIO
+grants are PAGE-granular, and the config INDEX register at 0x9000 shares its 4 KiB page with the
+bridge's software-reset control at 0x9210. Granting the page so a service could READ config space
+would also grant it the power to reset the root complex out from under every device on it. Register
+granularity is only available from inside the kernel, which is the same argument the x86 side makes
+about port granularity.
+
+**Read-only, permanently.** The capability is minted with `READ` alone - there is no write operation
+behind it, so granting `WRITE` would be a right nobody can exercise and exactly the kind of thing a
+later change quietly finds a use for. The syscall and the authority are PINNED in
+`COMMANDMENTS.baseline.toml`, each answering the checker's question ("why isn't this a service?" - it
+is; reaching config space needs a privileged instruction or a kernel-only mapping no ring-3 code has,
+the same shape as the RTC read `time` needs).
+
+The Pi 2 has no PCI at all, so there the kernel can only refuse - which it says, rather than handing
+back a plausible zero a caller would read as an empty machine.
 
 **What it does NOT do yet.** This is ADDITIVE. `kernel/src/arch/x86_64/pci.rs` still runs and still
 does the boot scan - nothing consumes the userspace results for anything load-bearing. Retiring those

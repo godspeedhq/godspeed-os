@@ -86,11 +86,13 @@ pub enum SyscallNumber {
     /// memory (step C, `docs/service-ownership.md`). The kernel stops holding a catalogue of what
     /// each service IS; it loads what it is handed, and enforces what the request may ask for.
     SpawnImage             = 52,
-    /// Write 32 bits to an I/O port. Gated by `PCI_CFG_RESOURCE`, and the kernel permits only the
-    /// ports that capability names - see `port_out32_allowed`.
-    PortOut32              = 53,
-    /// Read 32 bits from an I/O port. Same gate, its own allowlist (`port_in32_allowed`).
-    PortIn32               = 54,
+    /// One complete PCI configuration read: select and fetch, indivisibly. Gated by `PCI_CFG`.
+    ///
+    /// ONE syscall rather than a select/read pair, because the pair is stateful: split, two callers
+    /// (or a caller and the KERNEL, which uses the same registers on the spawn and kill paths) read
+    /// whichever register the other selected. Atomic here, that window does not exist - and a caller
+    /// can no longer WRITE anything at all, which is strictly less authority than the pair carried.
+    PciCfgRead             = 53,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -162,8 +164,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::ResourceInvoke as u64 => handle_resource_invoke(arg0, arg1, arg2),
         n if n == SyscallNumber::ResourceRevoke as u64 => handle_resource_revoke(arg0),
         n if n == SyscallNumber::LastRecvBadge  as u64 => scheduler::take_last_recv_badge() as i64,
-        n if n == SyscallNumber::PortOut32 as u64 => handle_port_out32(arg0, arg1),
-        n if n == SyscallNumber::PortIn32  as u64 => handle_port_in32(arg0),
+        n if n == SyscallNumber::PciCfgRead as u64 => handle_pci_cfg_read(arg0, arg1),
         _ => -1, // Unknown syscall.
     }
 }
@@ -2489,41 +2490,31 @@ const NET_FRAME_MAX: usize = 1600;
 // (§26.10, docs/service-ownership.md D2). This is the whole of the kernel's involvement.
 // ---------------------------------------------------------------------------
 
-/// PortOut32 (53): `arg0` = port, `arg1` = value. Gated by `PCI_CFG_RESOURCE` + WRITE.
+/// PciCfgRead (53): `arg0` = configuration selector, `arg1` = register offset. Gated by
+/// `PCI_CFG_RESOURCE` + READ.
 ///
-/// Returns 0 on success, `CapNotHeld` without the capability, `-1` for a port the capability does not
-/// permit. Both refusals are LOUD (invariant 12): a caller that quietly did nothing would leave an
-/// enumerator reading whatever register happened to be selected last.
-fn handle_port_out32(port: u64, value: u64) -> i64 {
-    if !scheduler::current_task_holds_resource(crate::capability::PCI_CFG_RESOURCE, Rights::WRITE) {
-        crate::kprintln!("port: OUT32 {:#06x} refused - caller does not hold PCI_CFG", port as u16);
-        return CapError::CapNotHeld as i64;
-    }
-    // The PORT allowlist lives in `arch` beside the instruction it guards, so the check and the I/O
-    // cannot drift apart and this file needs no `unsafe` (§18.5 - its floor may only shrink).
-    if !crate::arch::imp::pci_cfg_out32(port as u16, value as u32) {
-        crate::kprintln!("port: OUT32 {:#06x} refused - PCI_CFG permits a 32-bit write to 0xCF8 only",
-                         port as u16);
-        return -1;
-    }
-    0
-}
-
-/// PortIn32 (54): `arg0` = port. Gated by `PCI_CFG_RESOURCE` + READ.
+/// Returns the 32-bit value read (as a positive i64 - a full u32 always widens non-negative, so
+/// 0xFFFFFFFF is data and not an error), `CapNotHeld` without the capability, or `-1` for an access
+/// the arch will not admit.
 ///
-/// Returns the 32-bit value read (as a positive i64), `CapNotHeld`, or `-1` for a port the capability
-/// does not permit. A read result is returned widened rather than as an out-parameter so the ARM ABI's
-/// one-register-per-argument limit is not a factor.
-fn handle_port_in32(port: u64) -> i64 {
+/// A REFUSAL IS LOUD (invariant 12) but not fatal to the caller: an enumerator walking a bus is
+/// told where its authority ends and stops there, rather than being handed a plausible zero it would
+/// report as an empty machine.
+fn handle_pci_cfg_read(sel: u64, offset: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::PCI_CFG_RESOURCE, Rights::READ) {
-        crate::kprintln!("port: IN32 {:#06x} refused - caller does not hold PCI_CFG", port as u16);
+        crate::kprintln!("pci-cfg: read sel {:#010x} refused - caller does not hold PCI_CFG",
+                         sel as u32);
         return CapError::CapNotHeld as i64;
     }
-    match crate::arch::imp::pci_cfg_in32(port as u16) {
+    // The access, its lock and its admissibility check live in `arch` beside the registers they
+    // guard, so the check and the I/O cannot drift apart and this file needs no `unsafe`
+    // (§18.5 - its floor may only shrink).
+    match crate::arch::imp::pci_cfg_read32(sel as u32, offset as u16) {
         Some(v) => v as i64,
         None => {
-            crate::kprintln!("port: IN32 {:#06x} refused - PCI_CFG permits reads of 0xCFC-0xCFF only",
-                             port as u16);
+            crate::kprintln!(
+                "pci-cfg: read sel {:#010x} off {:#06x} refused - outside what this machine admits",
+                sel as u32, offset as u16);
             -1
         }
     }

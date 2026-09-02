@@ -1757,16 +1757,24 @@ fn spawn_service_with_image(
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
-    // PCI_CFG: `hw-enumerator` reads PCI configuration space through CF8/CFC (PortOut32/PortIn32,
-    // syscalls 53-54, step D2). Minted here; WHO holds it is the spawn request's privilege bits.
+    // PCI_CFG: `hw-enumerator` reads PCI configuration space (step D2). ONE syscall performs a
+    // complete read - latch the selector, fetch the register - and there is no write of any kind.
     //
-    // READ | WRITE, and the write right is NOT a hole in the read-only story: performing a config
-    // READ requires writing the ADDRESS port to select which register the data port returns. What
-    // makes the authority read-only is the kernel's PORT ALLOWLIST - a write is permitted to 0xCF8
-    // and to nothing else, so no configuration register can be modified through this capability.
-    // The rights say "you may drive this pair"; the allowlist says which direction each port goes.
+    // The kernel learns two opaque numbers, a selector and an offset. It does not learn what they
+    // name, which is the whole point: bus walking and class codes are hardware semantics that belong
+    // in the service (§26.10). What the kernel DOES enforce is admissibility - a well-formed cycle,
+    // and on a board whose bridge aborts reads past its subordinate bus, only a bus it forwards.
+    // That is not interpretation, it is the kernel refusing to perform an access that could halt the
+    // machine on an argument a service chose.
+    //
+    // READ-ONLY, permanently. Config space holds every BAR and command register, and the target is
+    // chosen by data rather than by the interface, so write authority here is write authority over
+    // every device on the bus and there is no narrower form of it to mint.
     if privs.pci_cfg {
-        let pc_cap = mint_cap(PCI_CFG_RESOURCE, Rights::READ | Rights::WRITE);
+        // READ alone. There is no longer any write operation behind this capability, so granting
+        // WRITE would be authority nobody can exercise - and a right that is minted but unused is
+        // the kind of thing a later change quietly finds a use for (§7.3, grant the least).
+        let pc_cap = mint_cap(PCI_CFG_RESOURCE, Rights::READ);
         caps.insert(pc_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }

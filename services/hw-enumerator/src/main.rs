@@ -25,15 +25,17 @@
 //!
 //! # Its authority, and why it is shaped that way
 //!
-//! It holds `PCI_CFG`: a 32-bit WRITE to 0xCF8 and a 32-bit READ of 0xCFC-0xCFF. Nothing else, and
-//! the write side of the DATA port is permanently absent.
+//! It holds `PCI_CFG`, which grants exactly one operation: READ one configuration register. It
+//! cannot write configuration space at all, and it cannot leave the hardware selector pointing
+//! anywhere, because selecting and reading are one indivisible kernel operation rather than two it
+//! could be interrupted between.
 //!
-//! That asymmetry is the design, not an oversight. CF8 selects which register CFC reaches, so
-//! authority to write CFC is authority to write ANY configuration register of ANY device on the bus:
-//! every BAR, every command register. There is no narrower form of it at port granularity, because
-//! the target is chosen by data rather than by the interface. Enumeration is inherently read-only, so
-//! it takes the read half. If discovery ever needs mutation - destructive BAR sizing is the obvious
-//! case - that wants a different mechanism designed on its own terms, not this capability widened
+//! READ-ONLY IS A PERMANENT BOUNDARY, not a starting point. Configuration space is where every BAR
+//! and every command register lives, so write authority over it is write authority over every device
+//! on the bus - and the target is chosen by data rather than by the interface, so there is no
+//! narrower form of it to grant. Enumeration is inherently read-only, so it takes the read half and
+//! only that. If discovery ever needs mutation - destructive BAR sizing is the obvious case - that
+//! wants a different mechanism designed and justified on its own terms, never this one widened
 //! because widening is convenient.
 //!
 //! # Bounded, like everything else
@@ -46,13 +48,12 @@
 
 use godspeed_sdk::{Message, ServiceContext};
 
-/// PCI configuration ADDRESS port. Writing it selects which register the DATA port reads.
-const CONFIG_ADDRESS: u16 = 0xCF8;
-/// PCI configuration DATA port.
-const CONFIG_DATA: u16 = 0xCFC;
-
-/// Buses to walk. The spec allows 256; every board this runs on uses a handful, and walking 256
-/// costs 256x the config reads to find nothing. Bounded at what the hardware actually is (§26.2).
+/// Buses to walk, at most.
+///
+/// A BOUND, NOT A TOPOLOGY. How many buses a machine really has is the machine's business and the
+/// walk discovers it - the kernel refuses a bus the bridge does not forward, and `scan` stops there.
+/// This only keeps the loop finite if that never happens, so it is set at what any board here could
+/// plausibly carry rather than the 256 the spec allows (§26.6).
 const MAX_BUS: u8 = 4;
 /// Devices per bus and functions per device - fixed by the PCI spec, not choices.
 const MAX_DEV: u8 = 32;
@@ -84,69 +85,76 @@ impl Found {
 
 /// Read one 32-bit configuration register.
 ///
-/// THE ADDRESS FORMAT IS THIS SERVICE'S KNOWLEDGE, not the kernel's - and there are two of them,
-/// which is the clearest demonstration of why that knowledge belongs here. Both platforms expose
-/// configuration space through an INDEX/DATA pair; only the encoding differs:
+/// THE SELECTOR ENCODING IS THIS SERVICE'S KNOWLEDGE, not the kernel's - and there are two of them,
+/// which is the clearest demonstration of why that knowledge belongs here. Both platforms reach
+/// configuration space through an index/data register pair; only the encoding differs:
 ///
 /// ```text
-/// x86 (CF8/CFC ports)          bit31 enable | bus<<16 | dev<<11 | func<<8 | off&0xFC
-/// Pi 4 (memory-mapped window)  bus<<20 | dev<<15 | func<<12,  then read DATA + off
+/// x86    bus<<16 | dev<<11 | func<<8      (mechanism #1, through CF8/CFC)
+/// Pi 4   bus<<20 | dev<<15 | func<<12     (through the root complex config window)
 /// ```
 ///
-/// The kernel performs the access and enforces which register may be touched. It never learns either
-/// encoding - so a third platform with a third layout needs no kernel change at all, which is the
-/// whole claim D2 makes.
+/// The kernel performs the access and enforces which registers may be reached. It never learns
+/// either encoding - so a third platform with a third layout needs no kernel change at all, which is
+/// the whole claim D2 makes.
 ///
-/// `None` means the KERNEL REFUSED - a missing capability, or a target outside the grant. An ABSENT
-/// DEVICE IS NOT AN ERROR: the bus floats high and the read returns 0xFFFF_FFFF, which is data for
-/// the caller to interpret rather than a failure.
+/// `None` means the KERNEL REFUSED: either this service does not hold `PCI_CFG`, or the access is
+/// one the machine will not admit. An ABSENT DEVICE IS NOT A REFUSAL - the bus floats high and the
+/// read returns 0xFFFF_FFFF, which is data for the caller to interpret.
 fn cfg_read(ctx: &ServiceContext, bus: u8, dev: u8, func: u8, offset: u8) -> Option<u32> {
     #[cfg(target_arch = "x86_64")]
-    {
-        let addr = 0x8000_0000u32
-            | ((bus as u32) << 16)
-            | ((dev as u32) << 11)
-            | ((func as u32) << 8)
-            | ((offset as u32) & 0xFC);
-        if !ctx.port_out32(CONFIG_ADDRESS, addr) {
-            return None;
-        }
-        ctx.port_in32(CONFIG_DATA)
-    }
+    let sel = ((bus as u32) << 16) | ((dev as u32) << 11) | ((func as u32) << 8);
     #[cfg(target_arch = "aarch64")]
-    {
-        // Bus 0 is the root complex itself, whose registers are NOT behind the DATA window - they
-        // are the bridge's own control block, sharing pages with things like its reset control. This
-        // service does not read them: a root complex is not a device a driver binds to, and reaching
-        // it would mean widening the grant to cover registers that can reset the bus. Reported as
-        // absent, which is the truth as far as this service's authority extends.
-        if bus == 0 {
-            return Some(0xFFFF_FFFF);
-        }
-        let sel = ((bus as u32) << 20) | ((dev as u32) << 15) | ((func as u32) << 12);
-        if !ctx.port_out32(0, sel) {
-            return None;
-        }
-        ctx.port_in32((offset as u16) & 0xFC)
-    }
+    let sel = ((bus as u32) << 20) | ((dev as u32) << 15) | ((func as u32) << 12);
+    ctx.pci_cfg_read(sel, offset as u16)
 }
 
-/// Walk the bus and fill `out`; returns how many devices were recorded.
+/// How many device slots to probe on a bus.
+///
+/// A PCI ROOT BUS can carry 32 devices. A bus BEHIND A BRIDGE, on any machine either of these ports
+/// runs on, is the far end of a PCIe link - and a PCIe link is point-to-point, so only device 0 can
+/// exist there. Probing 31 slots that cannot be occupied is not merely wasted work: a config read to
+/// a device the fabric has no route to is an unsupported request, which some root complexes answer
+/// with an abort rather than the all-ones a PC host bridge synthesizes.
+///
+/// LIMITATION, recorded rather than papered over (§26.7): a bridge to a CONVENTIONAL PCI segment can
+/// legitimately carry devices 1-31, and this would not see them. No machine this runs on has one.
+/// The alternative - probe all 32 and rely on being refused - trades a reporting gap for a class of
+/// access that is unsafe on real hardware, which is the worse trade.
+fn slots_on(bus: u8) -> u8 {
+    if bus == 0 { MAX_DEV } else { 1 }
+}
+
+/// Walk the buses and fill `out`; returns how many devices were recorded.
 ///
 /// Functions past 0 are probed only when the header type says they exist (bit 7 of offset 0x0E) -
 /// the standard rule, and it keeps the walk from doing eight times the work for the single-function
 /// devices that are most of any bus.
+///
+/// THE WALK STOPS WHERE THE KERNEL STOPS IT. `MAX_BUS` is a bound, not a topology: how many buses
+/// actually exist is a property of the machine, and the kernel - which programmed the bridge bus
+/// range - is what knows it. A refusal partway through therefore means "the bus range ends here",
+/// and is reported as such rather than treated as a failure. Only a refusal on the VERY FIRST read
+/// is a real problem, because nothing has succeeded yet to say the path works at all.
 fn scan(ctx: &ServiceContext, out: &mut [Found; MAX_FOUND]) -> usize {
     let mut n = 0usize;
+    let mut any_ok = false;
     for bus in 0..MAX_BUS {
-        for dev in 0..MAX_DEV {
+        for dev in 0..slots_on(bus) {
             for func in 0..MAX_FUNC {
                 let id = match cfg_read(ctx, bus, dev, func, 0x00) {
-                    Some(v) => v,
+                    Some(v) => {
+                        any_ok = true;
+                        v
+                    }
                     None => {
-                        // The kernel refused. Say so ONCE and stop: continuing would issue thousands
-                        // more refused syscalls and bury the reason (§26.7 - reported, not swallowed).
-                        ctx.log("hw-enumerator: config read REFUSED by the kernel - no PCI_CFG capability?");
+                        if any_ok {
+                            ctx.log_fmt(format_args!(
+                                "hw-enumerator: bus {} not admitted - the machine bus range ends below it, stopping here",
+                                bus));
+                        } else {
+                            ctx.log("hw-enumerator: FIRST config read refused - no PCI_CFG capability? nothing enumerated");
+                        }
                         return n;
                     }
                 };
@@ -198,25 +206,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // GROUND TRUTH before the walk. An empty result is ambiguous on its own - it means either "this
     // machine has no devices" or "the config path is broken and every read returns nothing" - and
     // those look identical in a log unless something is known to be there. So read one register that
-    // must answer, and say what came back, before believing anything the walk reports.
+    // MUST answer, and say what came back, before believing anything the walk reports.
     //
-    // WHICH device that is differs by platform, and the difference is not incidental:
-    //   x86    00:00.0 is the host bridge. Present on every PC, and reached through the same
-    //          CF8/CFC path as everything else, so it tests the whole path.
-    //   Pi 4   bus 0 is the ROOT COMPLEX, whose registers sit outside the config window and are
-    //          deliberately outside this service's grant (see `cfg_read`) - so it always reads
-    //          absent here and would be a canary that fails on a healthy machine. The first real
-    //          device is behind the bridge on bus 1, and that is what tests the index/data pair.
-    #[cfg(target_arch = "x86_64")]
-    let (pb, pd, pf, what) = (0u8, 0u8, 0u8, "host bridge");
-    #[cfg(target_arch = "aarch64")]
-    let (pb, pd, pf, what) = (1u8, 0u8, 0u8, "first device behind the bridge");
-    match cfg_read(&ctx, pb, pd, pf, 0x00) {
+    // 00:00.0 serves on both ports, for different reasons that happen to agree: on a PC it is the
+    // host bridge, and on the Pi 4 it is the root complex own config header. Either way something is
+    // there on a healthy machine, so all-ones or a refusal is a real signal rather than a quirk of
+    // which board this is.
+    match cfg_read(&ctx, 0, 0, 0, 0x00) {
         Some(v) => ctx.log_fmt(format_args!(
-            "hw-enumerator: probe {:02x}:{:02x}.{} ({}) vendor/device = {:#010x} (0xffffffff = nothing there, 0 = read returned nothing)",
-            pb, pd, pf, what, v)),
-        None => ctx.log_fmt(format_args!(
-            "hw-enumerator: probe {:02x}:{:02x}.{} REFUSED by the kernel", pb, pd, pf)),
+            "hw-enumerator: probe 00:00.0 vendor/device = {:#010x} (0xffffffff = nothing there, 0 = read returned nothing)", v)),
+        None => ctx.log("hw-enumerator: probe 00:00.0 REFUSED by the kernel"),
     }
 
     let mut found = [Found::empty(); MAX_FOUND];

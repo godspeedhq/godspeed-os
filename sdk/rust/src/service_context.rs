@@ -2769,24 +2769,25 @@ impl ServiceContext {
         &d.irqs[..n]
     }
 
-    /// Write 32 bits to an I/O port. Requires the `PCI_CFG` privilege, and the kernel permits only
-    /// the ports that capability names (0xCF8).
+    /// Read one 32-bit PCI configuration register. Requires the `PCI_CFG` privilege.
     ///
-    /// `true` on success; `false` if the capability is missing or the port is not permitted - both of
-    /// which the kernel also reports (invariant 12), so a caller need not guess which it was.
-    pub fn port_out32(&self, port: u16, value: u32) -> bool {
-        // SAFETY: a plain syscall; the kernel validates the capability and the port before any I/O.
-        unsafe { crate::syscall::raw_syscall(53, port as u64, value as u64, 0) == 0 }
-    }
-
-    /// Read 32 bits from an I/O port. Requires `PCI_CFG`; permitted ports are 0xCFC-0xCFF.
+    /// `sel` is a bus/device/function selector in the platform's own encoding, which is the CALLER'S
+    /// knowledge - the kernel performs the access and enforces which registers may be reached, but
+    /// never interprets what the selector names. `offset` is the register within that function.
     ///
-    /// `None` if the capability is missing or the port is not permitted. Note the distinction from
-    /// `Some(0xFFFF_FFFF)`, which is a SUCCESSFUL read of an absent device - the bus floats high, and
-    /// that is data, not an error.
-    pub fn port_in32(&self, port: u16) -> Option<u32> {
-        // SAFETY: a plain syscall; the kernel validates the capability and the port before any I/O.
-        let r = unsafe { crate::syscall::raw_syscall(54, port as u64, 0, 0) };
+    /// ONE call, not a select-then-read pair, because the underlying hardware register pair is
+    /// stateful: split across two calls, two callers would each read whichever register the other
+    /// selected, and the KERNEL uses the same pair on its spawn and kill paths. Atomic here, that
+    /// window does not exist - and this interface cannot write anything at all.
+    ///
+    /// `None` if the capability is missing, or the access is one this machine will not admit (a bus
+    /// its bridge does not forward, say - reading past it is an abort on some hardware rather than a
+    /// harmless all-ones). Both are reported by the kernel too (invariant 12), so a caller need not
+    /// guess which it was. Note the distinction from `Some(0xFFFF_FFFF)`, which is a SUCCESSFUL read
+    /// of an absent device - the bus floats high, and that is data, not an error.
+    pub fn pci_cfg_read(&self, sel: u32, offset: u16) -> Option<u32> {
+        // SAFETY: a plain syscall; the kernel validates the capability and the access before any I/O.
+        let r = unsafe { crate::syscall::raw_syscall(53, sel as u64, offset as u64, 0) };
         if r < 0 { None } else { Some(r as u32) }
     }
 

@@ -115,12 +115,6 @@ pub struct Device {
 /// The VIA VL805 (and its VL806 sibling), which is what a Pi 4's USB-A ports hang off.
 const VIA_VENDOR: u16 = 0x1106;
 
-/// A root-complex register pointer, for the gated config-access primitives in `arch::aarch64`
-/// (step D2). Exposed so those can reach EXT_CFG_INDEX / EXT_CFG_DATA without duplicating the
-/// peripheral-window translation - and ONLY those two offsets are ever passed, enforced there.
-#[inline]
-pub(super) fn rc_reg(off: u64) -> *mut u32 { reg(off) }
-
 #[inline]
 fn reg(off: u64) -> *mut u32 {
     // The root complex is inside the peripheral window, so `mmio` translates it correctly on both
@@ -210,6 +204,7 @@ fn cfg_read(bus: u8, dev: u8, func: u8, off: u16) -> u32 {
         return rd(off as u64 & 0xFFF);
     }
     let idx = ((bus as u32) << 20) | ((dev as u32) << 15) | ((func as u32) << 12);
+    let _g = CFG_LOCK.lock();
     wr(EXT_CFG_INDEX, idx);
     rd(EXT_CFG_DATA + (off as u64 & 0xFFF))
 }
@@ -222,6 +217,7 @@ fn cfg_write(bus: u8, dev: u8, func: u8, off: u16, val: u32) {
         return;
     }
     let idx = ((bus as u32) << 20) | ((dev as u32) << 15) | ((func as u32) << 12);
+    let _g = CFG_LOCK.lock();
     wr(EXT_CFG_INDEX, idx);
     wr(EXT_CFG_DATA + (off as u64 & 0xFFF), val);
 }
@@ -397,6 +393,58 @@ fn report_routing() {
     put_str(b" status ");
     put_hex(rd(PCIE_STATUS) as u64);
     put_str(b"\r\n");
+}
+
+/// Serializes config access. INDEX/DATA is ONE global register pair - an access is "latch the
+/// selector, then read the data" - so two of them interleaved read each other's device. The kernel's
+/// own walk is single-threaded at boot, but `cfg_read_gated` below lets a SERVICE issue config reads
+/// on another core at any time, so the pair is now genuinely shared and must be serialized. This is
+/// the aarch64 twin of x86's `PCI_CONFIG_LOCK`, which carries the same reasoning.
+static CFG_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+
+/// The highest bus number the bridge is programmed to forward (see the `0x18` write in `init`:
+/// primary 0, secondary 1, subordinate 1).
+const SUBORDINATE_BUS: u32 = 1;
+
+/// One complete config read for a capability holder: select and fetch, indivisibly.
+///
+/// ATOMIC BY CONSTRUCTION, and that is the point. Exposing "write the selector" and "read the data"
+/// as two separate operations would let a caller be descheduled between them - or two callers
+/// interleave - and each would then read whichever device the OTHER selected. That is a wrong answer
+/// with nothing anywhere to say so, which is worse than a refused one (invariant 12). One operation
+/// under one lock removes the window entirely, and the caller cannot leave the selector anywhere.
+///
+/// REFUSES A BUS THE BRIDGE DOES NOT FORWARD, and this is not a nicety. A config read past the
+/// subordinate bus is an unsupported request on this root complex: it raises an SError and stalls the
+/// interconnect rather than reading back all-ones the way a PC's host bridge does. A service must not
+/// be able to halt the machine with an argument, so admissibility is checked HERE - the kernel
+/// programmed the bus range and is the only thing that knows it. What the kernel does NOT do is
+/// interpret the selector any further: `sel` is the caller's encoding, not a device it vouches for.
+///
+/// Bus 0 is the bridge's own config header, which answers from the root-complex register block rather
+/// than through the window. Masked to that header (`0..0xFFF`), so this cannot reach the control
+/// registers further up the block - EXT_CFG_INDEX at 0x9000 or the reset control at 0x9210 - which is
+/// exactly why the kernel mediates instead of granting an MMIO page.
+pub(super) fn cfg_read_gated(sel: u32, off: u16) -> Option<u32> {
+    let bus = (sel >> 20) & 0xFF;
+    if bus > SUBORDINATE_BUS {
+        return None;
+    }
+    let o = (off as u64) & 0xFFF;
+    if bus == 0 {
+        // Bus 0 carries exactly one device: the root complex bridge itself. Its header answers from
+        // the register block directly, which has no device/function selector to apply - so without
+        // this check every slot on bus 0 would read back the BRIDGE and a caller would report 32 of
+        // them. Absent is the truth for every slot but the first.
+        if sel & 0x000F_F000 != 0 {
+            return Some(0xFFFF_FFFF);
+        }
+        let _g = CFG_LOCK.lock();
+        return Some(rd(o));
+    }
+    let _g = CFG_LOCK.lock();
+    wr(EXT_CFG_INDEX, sel);
+    Some(rd(EXT_CFG_DATA + o))
 }
 
 /// Walk bus 1 looking for a VIA xHCI controller, and give it a BAR inside the window.

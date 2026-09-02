@@ -23,25 +23,27 @@ limit   = "8MiB"
 ipc_receive = ["hw-enumerator"]
 log_write   = true
 
-# PCI configuration READ, through the legacy CF8/CFC port pair. The kernel enforces exactly which
-# ports and which direction: a 32-bit write to 0xCF8, a 32-bit read of 0xCFC-0xCFF, nothing else.
+# PCI configuration READ. One gated syscall performs a complete read - select the register and fetch
+# it, indivisibly - and there is no write of any kind.
 #
-# THE WRITE SIDE OF THE DATA PORT IS PERMANENTLY ABSENT, and that asymmetry is the design. CF8 selects
-# which register CFC reaches, so authority to write CFC is authority to write ANY configuration
-# register of ANY device on the bus - every BAR, every command register. There is no narrower form of
-# it at port granularity, because the target is chosen by data rather than by the interface.
-# Enumeration is inherently read-only, so it takes the read half and only that.
+# READ-ONLY IS PERMANENT, and that asymmetry is the design. Configuration space is where every BAR and
+# every command register lives, so write authority over it is write authority over every device on the
+# bus. There is no narrower form to grant, because the target is chosen by data rather than by the
+# interface. Enumeration is inherently read-only, so it takes the read half and only that.
 #
 # If discovery ever needs configuration-space mutation - destructive BAR sizing is the obvious case -
 # this capability MUST NOT simply be widened. A different mechanism has to be designed and justified
 # on its own terms.
 #
-# ONE HOLDER. The pair is stateful: a write to CF8 selects, a read of CFC retrieves. Two independent
-# holders do not merely race, they silently read each other's device - a wrong answer with nothing
-# anywhere to say so, which is worse than a refused one (invariant 12).
+# ATOMIC, so multiple holders are safe. The underlying hardware is a stateful index/data pair, and
+# were selecting and reading two separate operations, two holders would silently read each other's
+# device - a wrong answer with nothing anywhere to say so, which is worse than a refused one
+# (invariant 12). The kernel itself uses that pair on the spawn and kill paths, so this is not a
+# hypothetical about future services.
 #
-# x86 ONLY. ARM has no port I/O address space at all; the syscalls exist there for one dispatch table
-# and can only refuse. A hardware enumerator on those ports would reach its devices another way
-# (device tree, ECAM), which is why the SERVICE contract is the stable thing and the capability under
-# it varies by platform.
+# PLATFORM-INDEPENDENT AUTHORITY, platform-specific meaning. x86 reaches config space through the
+# CF8/CFC ports; the Pi 4 through a memory-mapped window on its root complex. The capability is the
+# same either way because the OPERATION is the same; what differs is the selector encoding, and that
+# lives in the service. The Pi 2 has no PCI at all, so there the kernel can only refuse - which it
+# says, rather than handing back a plausible zero that would read as an empty machine.
 pci_cfg = true

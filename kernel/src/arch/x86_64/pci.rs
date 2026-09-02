@@ -249,6 +249,37 @@ fn config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     }
 }
 
+/// One complete config read for a holder of `PCI_CFG` - select and fetch, indivisibly.
+///
+/// ATOMIC BY CONSTRUCTION, and that is the point. Exposing "write the address port" and "read the
+/// data port" as two separate operations would let a caller be descheduled between them, or two
+/// callers interleave - and each would then read whichever register the OTHER selected. Worse, the
+/// KERNEL uses this same pair at runtime (`program_msi`, `set_bus_master` on the spawn and kill
+/// paths), so a split pair races the kernel's own accesses and can land a kernel WRITE on a device
+/// the service selected. `PCI_CONFIG_LOCK` above already exists to stop exactly that between cores;
+/// a two-syscall interface simply could not be held inside it, because the caller might never issue
+/// the second half and the kernel would wait on a service (which nothing above the kernel may make
+/// it do). One operation under one lock removes the window entirely.
+///
+/// The address is FORCED WELL-FORMED - enable bit set, reserved bits 30:24 cleared, offset
+/// dword-aligned - so a caller cannot ask for a malformed configuration cycle. What the kernel does
+/// NOT do is interpret the selector any further: which bus, device and function `sel` names is the
+/// caller's knowledge, not a device the kernel vouches for.
+///
+/// `offset` is folded into the address the way mechanism #1 requires; the data port is read whole.
+pub(super) fn cfg_read_gated(sel: u32, offset: u16) -> Option<u32> {
+    let addr = 0x8000_0000u32 | (sel & 0x00FF_FF00) | ((offset as u32) & 0xFC);
+    // Lock held across the address+data pair - see `PCI_CONFIG_LOCK`.
+    let _g = PCI_CONFIG_LOCK.lock();
+    // SAFETY: mechanism #1 on the two fixed configuration ports, exactly as `config_read32` above.
+    // The address is masked well-formed immediately above, so no other port and no malformed cycle
+    // is reachable through here. A config read has no effect on memory and cannot fault.
+    Some(unsafe {
+        outl(CONFIG_ADDRESS, addr);
+        inl(CONFIG_DATA)
+    })
+}
+
 /// Write one 32-bit dword to PCI config space (mechanism #1). `offset` is
 /// dword-aligned (low two bits ignored).
 fn config_write32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {

@@ -1156,52 +1156,12 @@ pub unsafe fn uart_rx_drain_fifo() {
 // Port I/O helpers.
 // ---------------------------------------------------------------------------
 
-#[inline]
-/// The PCI configuration ports a `PCI_CFG` holder may WRITE: the ADDRESS register, and nothing else.
+/// One complete PCI configuration read, for a holder of `PCI_CFG`.
 ///
-/// Writing it selects which register a read of the data port returns, which is why the read side is
-/// narrow too. THE DATA PORT IS DELIBERATELY ABSENT FROM THIS SET AND MUST STAY ABSENT: CF8 selects
-/// what CFC reaches, so permitting a CFC write would permit a write to any configuration register of
-/// any device on the bus. There is no narrower form of that at port granularity, because the target
-/// is chosen by data rather than by the interface (docs/service-ownership.md, D2).
-fn pci_cfg_out_allowed(port: u16) -> bool { port == 0xCF8 }
-
-/// The ports a `PCI_CFG` holder may READ: the configuration DATA register and its byte aliases.
-fn pci_cfg_in_allowed(port: u16) -> bool { (0xCFC..=0xCFF).contains(&port) }
-
-/// Write 32 bits to a PCI-configuration port, if this is one the capability permits.
-///
-/// SAFE by construction rather than by contract: the allowlist is checked HERE, so there is no
-/// precondition for a caller to get wrong and no `unsafe` at the call site. That placement is what
-/// §18.5 asks for - new `unsafe` belongs in a permitted layer (`arch/`), not grown into a
-/// grandfathered file like `syscall/dispatch.rs`, whose floor may only shrink.
-///
-/// Returns false for a port outside the set, so the caller can report the refusal.
-pub fn pci_cfg_out32(port: u16, val: u32) -> bool {
-    if !pci_cfg_out_allowed(port) { return false; }
-    // SAFETY: `out dx, eax` to 0xCF8, the PCI configuration address register - checked immediately
-    // above, so no other port can be reached through here. Selecting a config register has no effect
-    // on memory and cannot fault.
-    unsafe {
-        core::arch::asm!("out dx, eax", in("dx") port, in("eax") val,
-            options(nomem, nostack, preserves_flags));
-    }
-    true
-}
-
-/// Read 32 bits from a PCI-configuration port, if this is one the capability permits.
-///
-/// `None` for a port outside the set. See `pci_cfg_out32` for why the check lives here.
-pub fn pci_cfg_in32(port: u16) -> Option<u32> {
-    if !pci_cfg_in_allowed(port) { return None; }
-    let val: u32;
-    // SAFETY: `in eax, dx` from 0xCFC-0xCFF, the PCI configuration data register - checked
-    // immediately above. A read of it has no side effect on memory and cannot fault.
-    unsafe {
-        core::arch::asm!("in eax, dx", out("eax") val, in("dx") port,
-            options(nomem, nostack, preserves_flags));
-    }
-    Some(val)
+/// The work is in `pci`, beside the `PCI_CONFIG_LOCK` it must be serialized against. This is the
+/// arch's entry point for the syscall and nothing more.
+pub fn pci_cfg_read32(sel: u32, off: u16) -> Option<u32> {
+    pci::cfg_read_gated(sel, off)
 }
 
 unsafe fn outb(port: u16, val: u8) {
