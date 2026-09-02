@@ -3588,7 +3588,7 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     // worse than one that admits it does not know.
     let mut last = "";
     for attempt in 0..2 {
-        if attempt == 1 {
+        if attempt == 1 && last == "send failed" {
             if !ctx.reacquire_by_name("block-driver") {
                 ctx.log("fs: block-driver send failed AND it could not be reacquired by name - \
                          either the name is not registered right now, or this service has no free \
@@ -3623,11 +3623,25 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
                     BLOCK_RPC_SECS));
                 return None;
             }
-            // Alive but backed up. Nothing left, so nothing can arrive late - but reacquiring would
-            // not help either, because the cap is fine and the QUEUE is the problem.
+            // Alive but backed up. The send NEVER LEFT, so nothing can arrive late and a retry is
+            // safe - the same reasoning that makes `SendFailed` retryable. What differs is that the
+            // cap is fine and reacquiring would be pointless: the QUEUE is the problem, so yield and
+            // ask again.
+            //
+            // Failing here instead of retrying was a REGRESSION I introduced with this match. The old
+            // code retried on every failure, which was wrong for `Timeout` and right for this - and
+            // collapsing them lost the right half along with the wrong one. It showed up as `edit`
+            // hanging while CREATING a file (a burst of writes fills the driver's queue) while editing
+            // an existing one, which writes at the same rate but starts from a warm queue, kept
+            // working: 10 passed, 5 failed, and every failure a timeout rather than a wrong answer.
             DeadlineOutcomeInto::QueueFull => {
-                ctx.log("fs: block-driver queue is full - failing (its cap is fine; it is behind)");
-                return None;
+                if attempt == 1 {
+                    ctx.log("fs: block-driver queue still full after a yield - failing");
+                    return None;
+                }
+                last = "queue full";
+                ctx.yield_cpu();   // let the driver drain before asking again
+                continue;
             }
             // The one worth retrying.
             DeadlineOutcomeInto::SendFailed => { last = "send failed"; }
