@@ -416,6 +416,26 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
         put_hex(class as u64);
         put_str(b"\r\n");
 
+        // RECORD IT, whatever it is, BEFORE the per-class filter below (step D1). The order is the
+        // whole point: a table built from what the BUS reported - not from what this kernel happens
+        // to care about - is one that can serve a driver for a device the kernel has no name for.
+        //
+        // BARs are read raw here. On this board the firmware does NOT assign them; the code below
+        // assigns BAR0 for the controller it drives, and re-records afterwards with the assigned
+        // value. A device nobody drives therefore shows 0, which is the truth about it rather than a
+        // guess - and `hw_mmio_of` grants nothing for a 0 BAR, so a driver gets no mapping and says
+        // so instead of being pointed somewhere plausible (§26.7).
+        {
+            let mut bars = [0u64; 6];
+            for (i, b) in bars.iter_mut().enumerate() {
+                let raw = cfg_read(1, dev, 0, 0x10 + (i as u16) * 4);
+                if raw & 0x1 == 0 { *b = (raw & !0xF) as u64; }   // memory BAR; I/O BARs are not usable here
+            }
+            let irq_line = (cfg_read(1, dev, 0, 0x3C) & 0xFF) as u8;
+            let bdf = ((1u32) << 8) | ((dev as u32) << 3);        // bus 1, func 0 - same encoding as x86's make_bdf
+            crate::arch::aarch64::pci::record_device(bdf, class, bars, irq_line, vendor, device);
+        }
+
         // Class 0x0C0330 is "serial bus / USB / xHCI". Checking the CLASS rather than the device id is
         // what makes this work on a board that ships a VL806 instead of a VL805.
         if vendor != VIA_VENDOR || class != 0x0C_0330 {
@@ -587,6 +607,39 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
         put_str(b", device cmd ");
         put_hex((cfg_read(1, dev, 0, 0x04) & 0xFFFF) as u64);
         put_str(b"\r\n");
+
+        // Re-record with the BAR this code just ASSIGNED. The first record above captured the raw
+        // config space, where BAR0 reads 0 because the firmware on this board assigns nothing - so
+        // without this the table would hold a truthful-but-useless 0 for the one device we drive.
+        //
+        // `cpu_base` (not the bus address) because that is what a driver needs to map, and it is what
+        // the x86 table stores for every device: one meaning for the field on both ports.
+        {
+            let bdf = ((1u32) << 8) | ((dev as u32) << 3);
+            let mut bars = [0u64; 6];
+            bars[0] = cpu_base;
+            let irq_line = (cfg_read(1, dev, 0, 0x3C) & 0xFF) as u8;
+            crate::arch::aarch64::pci::record_device(bdf, 0x0C_0330, bars, irq_line, vendor, device);
+        }
+
+        // CROSS-CHECK, printed rather than asserted. The generic table and the `Device` returned here
+        // are two independent views of one truth, and they must agree before anything is switched over
+        // to the table. This is not ceremony: the identical check on x86 caught the AHCI BAR at once -
+        // the table recorded BAR0 while AHCI's registers are in BAR5, and the log said so on the first
+        // boot rather than in a driver that mapped the wrong window.
+        //
+        // It PRINTS because this port cannot be tested in QEMU (no VL805 emulation), so the first real
+        // evidence arrives from a Pi 4 boot log. A mismatch here is the thing to look for.
+        if let Some(d) = crate::arch::aarch64::pci::find_by_class(0x0C_0330) {
+            let agree = d.bar[0] == cpu_base && d.vendor == vendor && d.device == device;
+            crate::kprintln!(
+                "pcie: device table - {} device(s); xHCI class 0x0c0330 {} (BAR0 {:#x} vs assigned {:#x}, BDF {:#06x})",
+                crate::arch::aarch64::pci::DEVICE_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+                if agree { "AGREES" } else { "DISAGREES - do not trust the table" },
+                d.bar[0], cpu_base, d.bdf);
+        } else {
+            crate::kprintln!("pcie: device table has NO 0x0c0330 entry though one was just driven - table is wrong");
+        }
 
         return Some(Device {
             bus: 1,

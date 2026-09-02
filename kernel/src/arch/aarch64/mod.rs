@@ -2418,19 +2418,83 @@ pub mod pci {
         pub vendor: u16,
         pub device: u16,
     }
+    /// The Pi 4 has PCIe (the VL805 hangs the USB-A ports off it), so unlike arm32 this table is
+    /// REAL - filled by `pcie::init` as it walks the bridge (step D1 for this port).
+    ///
+    /// Small because the bus is: the Pi 4's root complex carries one device. 8 leaves room for a
+    /// board that carries more without pretending the machine is a PC.
+    pub const MAX_DEVICES: usize = 8;
+
+    static DEV_BDF:   [AtomicU32; MAX_DEVICES] = [const { AtomicU32::new(0xFFFF) }; MAX_DEVICES];
+    static DEV_CLASS: [AtomicU32; MAX_DEVICES] = [const { AtomicU32::new(0) }; MAX_DEVICES];
+    static DEV_BARS:  [AtomicU64; MAX_DEVICES * 6] = [const { AtomicU64::new(0) }; MAX_DEVICES * 6];
+    static DEV_IRQ:   [core::sync::atomic::AtomicU8; MAX_DEVICES] =
+        [const { core::sync::atomic::AtomicU8::new(0) }; MAX_DEVICES];
+    static DEV_VEN:   [AtomicU32; MAX_DEVICES] = [const { AtomicU32::new(0) }; MAX_DEVICES];
     pub static DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
-    pub fn device_at(_n: usize) -> Option<PciDevice> { None }
-    /// AARCH64 HAS PCIe (the Pi 4's VL805 sits on it) BUT THIS TABLE IS NOT FILLED YET.
-    ///
-    /// Not "no bus" like arm32 - a real gap. `pcie::init` walks the bridge, assigns the BAR and
-    /// hands back one `Device`, but it does not record into a generic table, so a class-code lookup
-    /// finds nothing here and an aarch64 driver must still name a kind (`HwClass::Xhci`). Filling
-    /// this is the rest of step D1 for this port.
-    ///
-    /// It returns `None` rather than guessing, so the failure is a driver that gets no MMIO and says
-    /// so - never one silently pointed at the wrong window (§26.7).
-    pub const MAX_DEVICES: usize = 32;
-    pub fn find_by_class(_class_code: u32) -> Option<PciDevice> { None }
+
+    /// Record one device exactly as the bus reported it. Called by `pcie::init` for EVERY device it
+    /// meets, before any per-class branch decides whether it is one this kernel cares about - that
+    /// order is the point: a table built from what the bus says is a table that can serve a driver
+    /// for a device the kernel has no name for.
+    pub fn record_device(bdf: u32, class_code: u32, bars: [u64; 6], irq_line: u8,
+                         vendor: u16, device: u16) {
+        use core::sync::atomic::Ordering;
+        let n = DEVICE_COUNT.load(Ordering::Relaxed) as usize;
+
+        // UPDATE IN PLACE if this BDF is already recorded, rather than appending a second entry.
+        //
+        // This port records each device TWICE on purpose: once from raw config space as the scan
+        // meets it, and again for the controller it drives once this code has ASSIGNED that device's
+        // BAR (the firmware here assigns none). Appending both would leave two rows for one device
+        // with `find_by_class` returning the FIRST - the one whose BAR0 is still 0 - so every lookup
+        // would hand back the useless row and the driver would get no mapping.
+        let existing = (0..n.min(MAX_DEVICES)).find(|&i| DEV_BDF[i].load(Ordering::Relaxed) == bdf);
+        let slot = match existing {
+            Some(i) => i,
+            None if n < MAX_DEVICES => { DEVICE_COUNT.store(n as u32 + 1, Ordering::Relaxed); n }
+            None => {
+                crate::kprintln!("pcie: device table full ({}) - {:#06x} class {:#08x} NOT recorded",
+                                 MAX_DEVICES, bdf, class_code);
+                return;
+            }
+        };
+        let n = slot;
+        DEV_BDF[n].store(bdf, Ordering::Relaxed);
+        DEV_CLASS[n].store(class_code, Ordering::Relaxed);
+        for (i, b) in bars.iter().enumerate() { DEV_BARS[n * 6 + i].store(*b, Ordering::Relaxed); }
+        DEV_IRQ[n].store(irq_line, Ordering::Relaxed);
+        DEV_VEN[n].store(((vendor as u32) << 16) | device as u32, Ordering::Relaxed);
+    }
+
+    /// The `n`th device the scan found, or `None`.
+    pub fn device_at(n: usize) -> Option<PciDevice> {
+        use core::sync::atomic::Ordering;
+        if n >= DEVICE_COUNT.load(Ordering::Relaxed) as usize { return None; }
+        let vd = DEV_VEN[n].load(Ordering::Relaxed);
+        let mut bar = [0u64; 6];
+        for (i, b) in bar.iter_mut().enumerate() { *b = DEV_BARS[n * 6 + i].load(Ordering::Relaxed); }
+        Some(PciDevice {
+            index:      n,
+            bdf:        DEV_BDF[n].load(Ordering::Relaxed),
+            class_code: DEV_CLASS[n].load(Ordering::Relaxed),
+            bar,
+            irq_line:   DEV_IRQ[n].load(Ordering::Relaxed),
+            vendor:     (vd >> 16) as u16,
+            device:     vd as u16,
+        })
+    }
+
+    /// The FIRST device whose class code matches, or `None`. Same rule as x86: first, not best - a
+    /// driver that must have a SPECIFIC instance names a BDF, which is what `device_at` is for.
+    pub fn find_by_class(class_code: u32) -> Option<PciDevice> {
+        use core::sync::atomic::Ordering;
+        let n = DEVICE_COUNT.load(Ordering::Relaxed) as usize;
+        (0..n.min(MAX_DEVICES)).find_map(|i| match device_at(i) {
+            Some(d) if d.class_code == class_code => Some(d),
+            _ => None,
+        })
+    }
 
     pub fn init() {}
     pub fn clear_bus_master(bdf: u32) {}
