@@ -746,6 +746,26 @@ does the boot scan - nothing consumes the userspace results for anything load-be
 1,183 lines is the next step, and it wants the two walks agreeing on REAL HARDWARE first, not only in
 QEMU. That is the same discipline D1 followed: record, cross-check, and only then switch over.
 
+**THE WALKS DO NOT AGREE YET, and hardware is what said so (2026-09-03).** Four machines ran the pair:
+
+| machine | kernel scan | userspace walk | verdict |
+|---|---|---|---|
+| QEMU q35 | 8 | 8 | identical, device for device |
+| Pi 4 | 1 endpoint | 2 (bridge + endpoint) | agrees; the extra is the bridge itself |
+| Wyse (Intel Gemini Lake) | **15** | **14** | ONE DEVICE MISSING |
+
+The Wyse gap is the `slots_on` limitation, and the claim attached to it - that no machine this runs on
+carries devices behind a bridge past slot 0 - was written from a sample of two and falsified by the
+third. Until that device is identified and reached, retiring the kernel scanner would LOSE hardware on
+a real board, so D3 is blocked on it rather than on effort.
+
+The Wyse also produced a false `NIC ... DISAGREES` on a machine whose networking was perfect: the
+cross-check compared `bar[0]` against a BAR_AUTO-resolved address, which asks whether BAR0 equals BAR2
+on every RTL8168. Fixed, and worth stating as a rule the rest of D depends on - **a cross-check that
+fails on a healthy machine destroys the property it exists to establish.** The whole switch-over plan
+rests on trusting these two lists; a list that cries wolf is worse than no list. The table now prints
+one line per device so the two can be diffed rather than compared by count.
+
 **Adding one service needed its name in SIX places**, and this is worth writing down because nothing
 checks that they agree: `IMAGES` (the image), `MANAGED` (reconcile), an `ensure_mapped` call (BOOT -
 `MANAGED` says what to RESTART, not what to START), the restart-counter set, the death-notification
@@ -817,7 +837,11 @@ assignment where it is (the boot path, once) and the reporter read-only is the b
 
 ### The two costs still to accept before building
 
-**1. Config-space access for the reporter.** Pi 4 ECAM is an MMIO window - no new mechanism. x86 uses
+**1. Config-space access for the reporter. PAID (2026-09-02).** One gated syscall, `PciCfgRead`, behind
+a `PCI_CFG` capability minted READ-only - see D2 below for the shape and why it is one operation rather
+than a select/read pair. The kernel gained one syscall, not two, and the authority cannot write.
+The original statement of the cost follows, because the trade it describes is what was accepted:
+Pi 4 ECAM is an MMIO window - no new mechanism. x86 uses
 I/O ports `0xCF8`/`0xCFC`, and userspace cannot execute `IN`/`OUT`, so this needs a port-I/O capability
 or a gated syscall: a NEW KERNEL AUTHORITY, and the pin grows again. Defensible - it is the mechanism
 that lets 1,017 lines leave ring 0, which is the same trade `FIRE_IRQ` made for 123 lines - but it is a
@@ -829,7 +853,7 @@ longer reads. Either the reporter reports it and the kernel bounds-checks the ve
 it is willing to route, or that single fact keeps a foot in the kernel. The first is consistent with
 the address decision above; the second is smaller. Unresolved, deliberately.
 
-### The fiddly part of D: assignment once, re-read always### The fiddly part of D: assignment once, re-read always
+### The fiddly part of D: assignment once, re-read always
 
 Re-enumeration after a restart must not disturb live drivers. On the Pi 4 today the kernel does not
 merely read the bus, it **assigns**:
