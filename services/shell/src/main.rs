@@ -6413,7 +6413,8 @@ fn build_caps_table(ctx: &ServiceContext, name: &str) -> Option<Table> {
 }
 
 /// Write a capability's resource name into `buf`, returning its length. Stable kernel
-/// resources by id (matching `cmd_caps`), everything else as `endpoint#N`.
+/// resources by id, everything else as `endpoint#N`. `cmd_caps` CALLS this rather than keeping a
+/// copy of the table, so the piped and console views of `caps` cannot disagree.
 fn cap_resource_name(id: u64, buf: &mut [u8]) -> usize {
     let mut p = 0usize;
     // EVERY well-known resource is named, and the reason is that the fallback below LIES about the
@@ -8163,27 +8164,20 @@ fn cmd_caps(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
         ctx.console_writeln("  (none)");
         return Ok(());
     }
-    // Legend: left column is the resource the cap targets, right column the rights
-    // it grants (§7.4). log_write/spawn/console_read/console_push/introspect are
-    // kernel resources; endpoint#N is an IPC endpoint.
+    // Legend: left column is the resource the cap targets, right column the rights it grants (§7.4).
+    // A named row is one of the kernel's fixed resources; `endpoint#N` is an IPC endpoint.
     ctx.console_writeln("  RESOURCE (target)  RIGHTS (read/write/send/recv/grant/revoke)");
     for cap in caps.iter().take(n) {
         let mut buf = [b' '; 64];
         let mut pos = 0usize;
         write_bytes(&mut buf, &mut pos, b"  ");
-        // Resource name (stable kernel resources by id; others by number).
-        match cap.resource_id {
-            1 => write_bytes(&mut buf, &mut pos, b"log_write"),
-            2 => write_bytes(&mut buf, &mut pos, b"spawn"),
-            3 => write_bytes(&mut buf, &mut pos, b"console_read"),
-            4 => write_bytes(&mut buf, &mut pos, b"console_push"),
-            5 => write_bytes(&mut buf, &mut pos, b"introspect"),
-            6 => write_bytes(&mut buf, &mut pos, b"service_control"),
-            id => {
-                write_bytes(&mut buf, &mut pos, b"endpoint#");
-                write_u32(&mut buf, &mut pos, id as u32);
-            }
-        }
+        // ONE naming table, shared with the record producer - this used to hold a SECOND, hand-copied
+        // match on the same ids, and the two drifted exactly as a duplicated table does. Naming all
+        // sixteen resources fixed the piped view while this one kept printing `endpoint#8` for
+        // `reboot`, so `caps` in a pipe and `caps` on the console disagreed about what a service can
+        // do - and the console one, the one a person actually reads, was the liar. A second source of
+        // truth cannot be kept in sync by intention (§26.4); it has to not exist.
+        pos += cap_resource_name(cap.resource_id, &mut buf[pos..]);
         while pos < 18 { buf[pos] = b' '; pos += 1; }
         // Rights spelled out (§7.4) so no decoding is needed.
         let r = cap.rights;

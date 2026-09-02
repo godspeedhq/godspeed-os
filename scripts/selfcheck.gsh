@@ -4,7 +4,8 @@
 # the file-command tests). Passes iff the summary says "failed 0".
 #
 # Covers every shell utility's main functions + negative cases, EXCEPT:
-#   - observe : it is a live full-screen view (only `observe now` is a snapshot; tested).
+#   - observe : the live full-screen view. `observe now` IS covered below, but only in its PIPED
+#               form - see that section for what that does and does not reach.
 #   - drives  : flashing/relabel/reset touch disks and prompt y/N - not scriptable.
 # Re-runnable: everything is created under /sc, removed at the START of the run, and deleted again at
 # the end. Cleaning only at the end is not re-runnable - it assumes the previous run REACHED its end.
@@ -322,6 +323,38 @@ caps shell | select resource | assert contains introspect
 assert fails caps nosuchservice
 assert fails-with FileNotFound caps nosuchservice
 
+# ===== observe now: the metrics snapshot =====
+echo ''
+echo '===== observe now: the one-shot metrics frame (piped record form) ====='
+# WHAT THIS REACHES, stated plainly because it is less than the command name suggests. `observe now`
+# has TWO renderers, and piping picks the other one:
+#   unpiped -> the `observe-now` SERVICE prints a formatted, column-aligned frame to the console
+#   piped   -> the SHELL builds a record table (`build_observe_table`) with an extra `ticks` column
+# `assert` needs a pipe, so everything here exercises the SHELL's record path. The service's
+# console frame cannot be captured from inside the shell at all; it is asserted by the host harness
+# in `osdev/src/shell_test.rs`, which reads raw serial and so can see it - including the column
+# alignment, which is where a long service name broke the table and no test noticed.
+#
+# That split is worth knowing rather than glossing: a green line here does NOT mean the frame a
+# person looks at is right. It means the introspection path behind it works.
+#
+# CONSEQUENCE, recorded because it is a real hole and not a technicality (§26.7): the harness that
+# checks the frame runs only under QEMU, so ON HARDWARE nothing checks the table's alignment at all.
+# A board-specific rendering problem would pass this suite. It cannot be closed by writing a better
+# test here - `assert` needs a pipe and a pipe changes the renderer - so it is written down instead.
+assert ok observe now
+# The gated introspection path answers: the table is built from `task_stat`, so a service that is
+# actually running has to appear in it.
+observe now | assert contains supervisor
+observe now | assert contains shell
+# `ticks` is the column that distinguishes this from `status` (cumulative cpu-time). If it is absent
+# the record form has silently degraded into a second `status`.
+observe now | assert contains ticks
+# The record verbs compose over it like any other producer (docs/records.md).
+observe now | where name contains shell | assert contains shell
+observe now | select name state | assert lacks ticks
+observe now | to json | assert contains name
+
 # ===== hw-enumerator: hardware discovery in USERSPACE (step D2) =====
 echo ''
 echo '===== hw-enumerator: userspace PCI discovery + its narrow authority ====='
@@ -376,7 +409,15 @@ if $hwe > 0 {
     echo 'SKIP  hw-enumerator - this machine has no PCI to enumerate (Pi 2); not a failure'
 }
 
-# `caps` must NAME a well-known resource, never print it as an anonymous number. Ten of the sixteen
+# `caps` must NAME a well-known resource, never print it as an anonymous number.
+#
+# THIS ASSERTS A PIPED `caps`, and for a while that was not the same thing as the `caps` a person
+# reads. There were TWO copies of the naming table - one in the record producer, one in the console
+# renderer - so naming all sixteen resources fixed the piped view while the console view kept
+# printing `endpoint#8` for `reboot`. The piped test passed the whole time. The console output cannot
+# be captured (piping is what switches renderers), so no assertion can ever guard it directly; the
+# only real fix was to delete the duplicate so both views read from ONE table. This line therefore
+# guards the naming for both, and that is only true while that remains a single table (§26.4). Ten of the sixteen
 # used to fall through to an `endpoint#N` fallback, which reported (for instance) the shell's authority
 # to reboot the machine as "endpoint#8" - a label naming the wrong KIND of thing, so a reader could not
 # tell real authority from an ordinary IPC endpoint. Authority has to be readable (§26.9). The shell

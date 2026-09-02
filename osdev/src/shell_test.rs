@@ -937,6 +937,86 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // observe now: the table is ALIGNED.
+    //
+    // This is here, and not in selfcheck, because it CANNOT be there: `assert` needs a pipe, and
+    // piping `observe now` switches to the shell's record producer - a different renderer entirely.
+    // The formatted frame only exists on the console, so the only thing that can see it is a test
+    // reading raw serial. That gap is not hypothetical: the NAME column was 12 wide, `hw-enumerator`
+    // is 13, and every column on that one row shifted right for as long as nobody looked.
+    //
+    // Checking a fixed column index would just re-encode today's layout. Instead take the offset of
+    // `CORE` from the HEADER and require every data row to carry its `C` there - so the assertion
+    // says "the table lines up", survives a deliberate width change, and fails on an accidental one.
+    // -----------------------------------------------------------------------
+    // WAIT FOR THE FRAME TO FINISH before reading the buffer. `observe now` prints asynchronously,
+    // and the step above only waited as far as the header - so scanning here caught whatever bytes
+    // had happened to arrive. It saw 6 rows of a 13-row table and passed, with the row this check
+    // exists for (`hw-enumerator`, row 5) inside the window by a single line. A check whose coverage
+    // depends on serial timing is a check that will one day pass over the bug.
+    //
+    // `cmd_observe_now` does not return the prompt until observe-now has parked, so the `gsh>` after
+    // the frame is the signal that the whole table has been printed.
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15));
+
+    let mut aligned = true;
+    let mut checked = 0usize;
+    let mut worst = String::new();
+    let frame = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    let lines: Vec<&str> = frame.lines().collect();
+
+    // ANCHOR ON THE HEADER, EXACTLY, AND STOP AT THE END OF THE TABLE. The first version of this
+    // check did neither, and passed/failed for reasons unrelated to alignment:
+    //   - it matched any line containing TASK, NAME and CORE, which selected the LEGEND line
+    //     ("TASK scheduler slot | NAME service name | CORE cpu core") instead of the header;
+    //   - it then scanned the WHOLE serial buffer, so its "rows" included lines from unrelated
+    //     tables printed elsewhere in the session (a `caps` listing, for one).
+    // It reported a failure with the correct code in place and a failure with the broken code in
+    // place - the same verdict for opposite inputs, which is the definition of measuring nothing.
+    // The header line is the one that STARTS with "TASK NAME"; the table is the run of data rows
+    // immediately after it, and the first line that is not one ends it.
+    let hdr_at = lines.iter().position(|l| l.trim_start().starts_with("TASK NAME"));
+    match hdr_at {
+        None => { println!("shell-test: FAIL - observe now: no task table header to align against"); fail += 1; }
+        Some(hi) => {
+            let hdr = lines[hi];
+            match hdr.find("CORE") {
+                None => { println!("shell-test: FAIL - observe now: header has no CORE column"); fail += 1; }
+                Some(core_col) => {
+                    for line in &lines[hi + 1..] {
+                        let t = line.trim_start();
+                        if !t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                            break; // end of the table
+                        }
+                        checked += 1;
+                        // A row too SHORT to reach the column is misaligned too - skipping it (as an
+                        // earlier version did) would hide exactly the truncation worth catching.
+                        let ok = line.as_bytes().get(core_col) == Some(&b'C');
+                        if !ok {
+                            aligned = false;
+                            if worst.is_empty() { worst = (*line).to_string(); }
+                        }
+                    }
+                    if checked == 0 {
+                        println!("shell-test: FAIL - observe now: header found but no rows under it");
+                        fail += 1;
+                    } else {
+                        // The row COUNT is reported, not just the verdict: a check that silently
+                        // examined nothing would otherwise pass and read exactly like one that
+                        // examined everything.
+                        check!(aligned, &format!(
+                            "observe now: all {} rows' CORE column lines up with the header", checked));
+                        if !aligned {
+                            println!("shell-test:   header:              {}", hdr);
+                            println!("shell-test:   first misaligned row: {}", worst);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // caps <service> - list a service's held capabilities (introspection path).
     // The shell holds the INTROSPECT cap, so it can read its own caps; introspect
     // itself must appear in the list.
