@@ -40,10 +40,21 @@ ARCH_EXEMPT = {
     "arm": {
         "ehci": "x86-only USB2 controller driver; the Pi 2 has no EHCI",
         "xhci": "the Pi 2 has no PCIe and no xHCI controller; its USB host is dwc2",
+        "hw-enumerator": "its authority is legacy PCI CF8/CFC PORT I/O, and ARM has no port I/O "
+                         "address space at all - `in`/`out` are x86 instructions with no equivalent. "
+                         "Not 'not ported yet': there is nothing here for it to read. A hardware "
+                         "enumerator for this board would reach devices by device tree instead, "
+                         "which is a different implementation behind the same service contract "
+                         "(docs/service-ownership.md, D2).",
     },
     "aarch64": {
         "ehci": "x86-only USB2 controller driver; the Pi 4's USB host is the VL805 xHCI",
         "dwc2": "arm32-only (Pi 2) USB host driver; the Pi 4 drives xhci over PCIe",
+        "hw-enumerator": "as arm32: no port I/O address space, so the CF8/CFC mechanism this "
+                         "service is built on does not exist. The Pi 4 DOES have PCIe, reached "
+                         "through ECAM rather than ports - so a future enumerator here is a real "
+                         "possibility, and would be a second implementation of this contract, not "
+                         "this one ported.",
     },
 }
 

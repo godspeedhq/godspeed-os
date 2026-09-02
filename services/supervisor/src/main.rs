@@ -1006,15 +1006,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // neither can delay the prompt the way a driver bring-up would.
     ensure_mapped(&ctx, &mut name_map, "time", 0xFFFF);
     ensure_mapped(&ctx, &mut name_map, "control", 0xFFFF);
-    // hw-enumerator (x86): hardware discovery in userspace (step D2). Started here because it holds
-    // no device and blocks nothing - it reads PCI config space once, reports, and then answers
-    // questions. On ARM the image is not embedded and this is a no-op, the same way `dwc2` above is a
-    // no-op on x86.
+    // hw-enumerator: hardware discovery in userspace (step D2). Started here because it holds no
+    // device and blocks nothing - it reads PCI config space once, reports, then answers questions.
     //
-    // It is spawned EXPLICITLY rather than left to the MANAGED list, because MANAGED is the watch and
+    // x86 ONLY, and the cfg is load-bearing rather than tidiness. ARM has no port I/O address space,
+    // so the image is not embedded there - and asking to spawn a name the kernel has no image for
+    // does NOT quietly do nothing: the kernel embeds an empty placeholder and the spawn fails with
+    // `LoadFailed(TooSmall)`. An earlier version of this line was unconditional with a comment
+    // asserting it was "a no-op on ARM", which was simply untrue; `scripts/service_embed_check.py`
+    // refused the arm build and said so before any board booted.
+    //
+    // Spawned EXPLICITLY rather than left to the MANAGED list, because MANAGED is the watch and
     // reconcile set - it says what to RESTART, not what to START. A service in MANAGED and nowhere
     // else is embedded, configured, watched, and never runs; that is the shape the comment above
     // MANAGED warns about, and this service hit it on its first boot.
+    #[cfg(target_arch = "x86_64")]
     ensure_mapped(&ctx, &mut name_map, "hw-enumerator", 0xFFFF);
     // dwc2 (arm32): the Pi 2's ENTIRE USB stack - storage, keyboard and networking all ride on this
     // one service. Spawned BEFORE block-driver and nic-driver because both name it as a send_peer: a
