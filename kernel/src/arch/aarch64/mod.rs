@@ -2206,15 +2206,56 @@ pub mod syscall_entry {
 ///
 /// Lives at the ARCH TOP LEVEL, not inside `mod pci`, because `syscall::dispatch` reaches it as
 /// `crate::arch::imp::serial_unlocked_emit_count` - which is where x86 defines it too.
-/// ARM has NO PORT I/O ADDRESS SPACE - `in`/`out` are x86 instructions with no equivalent here. So
-/// this is not "unimplemented", it is absent by construction: the gated `PortOut32` / `PortIn32`
-/// syscalls exist on every arch for one dispatch table, and on this one they can only REFUSE.
-/// Peripherals here are memory-mapped and reached through an MMIO grant instead.
+// PCI CONFIGURATION ACCESS for a userspace enumerator (step D2, aarch64).
+//
+// This board has no port I/O - `in`/`out` are x86 instructions - but it DOES have PCIe, and its
+// configuration space is reached through an INDEX/DATA pair that is structurally the same shape as
+// x86's CF8/CFC, just memory-mapped: write a bus/dev/func selector to EXT_CFG_INDEX, then read the
+// register from a window at EXT_CFG_DATA. So the same two gated primitives serve, with the same
+// division of knowledge: the kernel performs the access and enforces WHICH registers, the service
+// knows what the bits mean.
+//
+// WHY THE KERNEL MEDIATES RATHER THAN GRANTING AN MMIO WINDOW. The obvious alternative - hand the
+// service a mapping of the root-complex registers and let it drive the pair itself - cannot be made
+// safe here: MMIO grants are PAGE-granular, and `EXT_CFG_INDEX` (0x9000) shares its 4 KiB page with
+// `RGR1_SW_INIT_1` (0x9210), the bridge's software-reset control. Granting the page to read config
+// space would also grant the power to reset the root complex out from under every device on it.
+// Register granularity is only available from in here, which is exactly the argument the x86 port
+// allowlist makes (docs/service-ownership.md, D2).
+
+/// Offset of the configuration DATA window from the root-complex base.
+const D2_EXT_CFG_DATA: u64 = 0x8000;
+/// Offset of the configuration INDEX (selector) register.
+const D2_EXT_CFG_INDEX: u64 = 0x9000;
+
+/// Select which configuration register the DATA window exposes.
 ///
-/// Safe, and performs no I/O - there is none to perform.
-pub fn pci_cfg_out32(_port: u16, _val: u32) -> bool { false }
-/// See `pci_cfg_out32`. Always refuses, so a caller is told rather than handed a plausible zero.
-pub fn pci_cfg_in32(_port: u16) -> Option<u32> { None }
+/// `sel` is a bus/device/function selector the SERVICE builds - this code does not interpret it, the
+/// same way the x86 side does not interpret what goes to 0xCF8. Only the INDEX register is writable
+/// through here, so no other root-complex register can be reached; in particular not the reset
+/// control sharing its page.
+///
+/// The `port` argument is ignored: it exists because the syscall is shared with x86, where it names
+/// a port. Passing anything but the selector convention is harmless - there is exactly one writable
+/// target on this arch.
+pub fn pci_cfg_out32(_port: u16, sel: u32) -> bool {
+    // SAFETY: a volatile write to the root complex's EXT_CFG_INDEX in the kernel's Device mapping -
+    // the one register this capability may write. Selecting a config register has no effect on
+    // memory and cannot fault.
+    unsafe { (crate::arch::aarch64::pcie::rc_reg(D2_EXT_CFG_INDEX)).write_volatile(sel) };
+    true
+}
+
+/// Read a configuration register from the DATA window.
+///
+/// `off` is a byte offset WITHIN the window, masked to it - so this can only ever read config space
+/// for whichever device the selector above chose, never another root-complex register.
+pub fn pci_cfg_in32(off: u16) -> Option<u32> {
+    let o = D2_EXT_CFG_DATA + (off as u64 & 0xFFF);
+    // SAFETY: a volatile read within the configuration DATA window, masked to it immediately above.
+    // A config read has no side effect on memory and cannot fault.
+    Some(unsafe { (crate::arch::aarch64::pcie::rc_reg(o)).read_volatile() })
+}
 
 pub fn serial_unlocked_emit_count() -> u64 { 0 }
 

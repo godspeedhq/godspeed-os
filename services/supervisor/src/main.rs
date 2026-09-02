@@ -184,9 +184,10 @@ static FS_ELF: &[u8] = include_bytes!(env!("SVC_FS_ELF"));
 static BLOCK_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_BLOCK_DRIVER_ELF"));
 static NET_STACK_ELF: &[u8] = include_bytes!(env!("SVC_NET_STACK_ELF"));
 static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
-/// Hardware discovery in userspace (step D2). x86 only - ARM has no port I/O address space, so the
-/// service would come up, be refused by the kernel on its first config read, say so, and idle.
-#[cfg(target_arch = "x86_64")]
+/// Hardware discovery in userspace (step D2). Where configuration space is reachable: x86 via the
+/// CF8/CFC ports, aarch64 via the Pi 4's memory-mapped INDEX/DATA window. Not arm32 - the Pi 2 has
+/// no PCI bus at all, so the service would have nothing to read.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 static HW_ENUMERATOR_ELF: &[u8] = include_bytes!(env!("SVC_HW_ENUMERATOR_ELF"));
 static LOGGER_ELF: &[u8] = include_bytes!(env!("SVC_LOGGER_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
@@ -235,7 +236,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // ONE holder, because the pair is stateful - two would silently read each other's device. If a
     // second service ever needs config reads, that is a design decision about who enumerates, not a
     // second grant.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     ("hw-enumerator", HW_ENUMERATOR_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      8 * 1024 * 1024, u32::MAX, &[],
      godspeed_sdk::service_context::privbits::PCI_CFG, 0, 0),
@@ -1020,7 +1021,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // reconcile set - it says what to RESTART, not what to START. A service in MANAGED and nowhere
     // else is embedded, configured, watched, and never runs; that is the shape the comment above
     // MANAGED warns about, and this service hit it on its first boot.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     ensure_mapped(&ctx, &mut name_map, "hw-enumerator", 0xFFFF);
     // dwc2 (arm32): the Pi 2's ENTIRE USB stack - storage, keyboard and networking all ride on this
     // one service. Spawned BEFORE block-driver and nic-driver because both name it as a send_peer: a

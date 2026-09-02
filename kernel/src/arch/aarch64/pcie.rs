@@ -115,6 +115,12 @@ pub struct Device {
 /// The VIA VL805 (and its VL806 sibling), which is what a Pi 4's USB-A ports hang off.
 const VIA_VENDOR: u16 = 0x1106;
 
+/// A root-complex register pointer, for the gated config-access primitives in `arch::aarch64`
+/// (step D2). Exposed so those can reach EXT_CFG_INDEX / EXT_CFG_DATA without duplicating the
+/// peripheral-window translation - and ONLY those two offsets are ever passed, enforced there.
+#[inline]
+pub(super) fn rc_reg(off: u64) -> *mut u32 { reg(off) }
+
 #[inline]
 fn reg(off: u64) -> *mut u32 {
     // The root complex is inside the peripheral window, so `mmio` translates it correctly on both

@@ -50,11 +50,6 @@ ARCH_EXEMPT = {
     "aarch64": {
         "ehci": "x86-only USB2 controller driver; the Pi 4's USB host is the VL805 xHCI",
         "dwc2": "arm32-only (Pi 2) USB host driver; the Pi 4 drives xhci over PCIe",
-        "hw-enumerator": "as arm32: no port I/O address space, so the CF8/CFC mechanism this "
-                         "service is built on does not exist. The Pi 4 DOES have PCIe, reached "
-                         "through ECAM rather than ports - so a future enumerator here is a real "
-                         "possibility, and would be a second implementation of this contract, not "
-                         "this one ported.",
     },
 }
 

@@ -84,23 +84,51 @@ impl Found {
 
 /// Read one 32-bit configuration register.
 ///
-/// THE ADDRESS FORMAT IS THIS SERVICE'S KNOWLEDGE, not the kernel's: bit 31 enables the cycle, then
-/// bus / device / function / offset pack into the low bits. The kernel receives a finished 32-bit
-/// value and a port number, and never learns what the bits mean.
+/// THE ADDRESS FORMAT IS THIS SERVICE'S KNOWLEDGE, not the kernel's - and there are two of them,
+/// which is the clearest demonstration of why that knowledge belongs here. Both platforms expose
+/// configuration space through an INDEX/DATA pair; only the encoding differs:
 ///
-/// `None` means the KERNEL REFUSED - a missing capability, or a port outside the grant. An ABSENT
+/// ```text
+/// x86 (CF8/CFC ports)          bit31 enable | bus<<16 | dev<<11 | func<<8 | off&0xFC
+/// Pi 4 (memory-mapped window)  bus<<20 | dev<<15 | func<<12,  then read DATA + off
+/// ```
+///
+/// The kernel performs the access and enforces which register may be touched. It never learns either
+/// encoding - so a third platform with a third layout needs no kernel change at all, which is the
+/// whole claim D2 makes.
+///
+/// `None` means the KERNEL REFUSED - a missing capability, or a target outside the grant. An ABSENT
 /// DEVICE IS NOT AN ERROR: the bus floats high and the read returns 0xFFFF_FFFF, which is data for
 /// the caller to interpret rather than a failure.
 fn cfg_read(ctx: &ServiceContext, bus: u8, dev: u8, func: u8, offset: u8) -> Option<u32> {
-    let addr = 0x8000_0000u32
-        | ((bus as u32) << 16)
-        | ((dev as u32) << 11)
-        | ((func as u32) << 8)
-        | ((offset as u32) & 0xFC);
-    if !ctx.port_out32(CONFIG_ADDRESS, addr) {
-        return None;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let addr = 0x8000_0000u32
+            | ((bus as u32) << 16)
+            | ((dev as u32) << 11)
+            | ((func as u32) << 8)
+            | ((offset as u32) & 0xFC);
+        if !ctx.port_out32(CONFIG_ADDRESS, addr) {
+            return None;
+        }
+        ctx.port_in32(CONFIG_DATA)
     }
-    ctx.port_in32(CONFIG_DATA)
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Bus 0 is the root complex itself, whose registers are NOT behind the DATA window - they
+        // are the bridge's own control block, sharing pages with things like its reset control. This
+        // service does not read them: a root complex is not a device a driver binds to, and reaching
+        // it would mean widening the grant to cover registers that can reset the bus. Reported as
+        // absent, which is the truth as far as this service's authority extends.
+        if bus == 0 {
+            return Some(0xFFFF_FFFF);
+        }
+        let sel = ((bus as u32) << 20) | ((dev as u32) << 15) | ((func as u32) << 12);
+        if !ctx.port_out32(0, sel) {
+            return None;
+        }
+        ctx.port_in32((offset as u16) & 0xFC)
+    }
 }
 
 /// Walk the bus and fill `out`; returns how many devices were recorded.
@@ -167,15 +195,28 @@ fn scan(ctx: &ServiceContext, out: &mut [Found; MAX_FOUND]) -> usize {
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("hw-enumerator: starting - PCI discovery in USERSPACE (step D2)");
 
-    // GROUND TRUTH before the walk: bus 0, device 0, function 0 is the host bridge, which exists on
-    // every PC. If this reads as absent, the port path is wrong and every "no device here" below is a
-    // consequence of that rather than a fact about the machine - and the walk would report an empty
-    // bus with total confidence.
-    let probe = cfg_read(&ctx, 0, 0, 0, 0x00);
-    match probe {
+    // GROUND TRUTH before the walk. An empty result is ambiguous on its own - it means either "this
+    // machine has no devices" or "the config path is broken and every read returns nothing" - and
+    // those look identical in a log unless something is known to be there. So read one register that
+    // must answer, and say what came back, before believing anything the walk reports.
+    //
+    // WHICH device that is differs by platform, and the difference is not incidental:
+    //   x86    00:00.0 is the host bridge. Present on every PC, and reached through the same
+    //          CF8/CFC path as everything else, so it tests the whole path.
+    //   Pi 4   bus 0 is the ROOT COMPLEX, whose registers sit outside the config window and are
+    //          deliberately outside this service's grant (see `cfg_read`) - so it always reads
+    //          absent here and would be a canary that fails on a healthy machine. The first real
+    //          device is behind the bridge on bus 1, and that is what tests the index/data pair.
+    #[cfg(target_arch = "x86_64")]
+    let (pb, pd, pf, what) = (0u8, 0u8, 0u8, "host bridge");
+    #[cfg(target_arch = "aarch64")]
+    let (pb, pd, pf, what) = (1u8, 0u8, 0u8, "first device behind the bridge");
+    match cfg_read(&ctx, pb, pd, pf, 0x00) {
         Some(v) => ctx.log_fmt(format_args!(
-            "hw-enumerator: probe 00:00.0 vendor/device = {:#010x} (0xffffffff = bus floats, 0 = read returned nothing)", v)),
-        None    => ctx.log("hw-enumerator: probe 00:00.0 REFUSED by the kernel"),
+            "hw-enumerator: probe {:02x}:{:02x}.{} ({}) vendor/device = {:#010x} (0xffffffff = nothing there, 0 = read returned nothing)",
+            pb, pd, pf, what, v)),
+        None => ctx.log_fmt(format_args!(
+            "hw-enumerator: probe {:02x}:{:02x}.{} REFUSED by the kernel", pb, pd, pf)),
     }
 
     let mut found = [Found::empty(); MAX_FOUND];

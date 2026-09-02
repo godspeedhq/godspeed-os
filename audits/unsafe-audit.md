@@ -2165,6 +2165,9 @@ write_page_table_base, invalidate_tlb_page}`, `interrupts::{local_irq_save, loca
 | `arch/x86_64/page_tables.rs` | 41 → 46 (+5) | CR3 read/write + `invlpg` primitives (the MMU-base + TLB seam). |
 | `arch/x86_64/mod.rs` | 33 → 35 (+2) | `switch_to_boot_stack` (the boot stack-pointer seam; `#[inline(always)]`). |
 | `arch/x86_64/interrupts.rs` | 21 → 22 (+1) | `local_irq_save` (the irq-save half; `local_irq_restore` calls `enable_interrupts`). |
+| `arch/aarch64/mod.rs` | 68 → 70 (+2) | `pci_cfg_out32` / `pci_cfg_in32` - the aarch64 half of the gated config access a userspace enumerator needs (step D2). One volatile write to the root complex's EXT_CFG_INDEX selector, one volatile read within the EXT_CFG_DATA window, each with a SAFETY comment.
+
+The kernel mediates here rather than granting an MMIO window, and that is the reason these two blocks exist at all: MMIO grants are PAGE-granular, and `EXT_CFG_INDEX` (0x9000) shares its 4 KiB page with `RGR1_SW_INIT_1` (0x9210), the bridge's software-reset control. Handing the page over so a service could read config space would also hand it the power to reset the root complex out from under every device on it. Register granularity is only available from inside the kernel - the same argument the x86 port allowlist makes, and the write side is likewise limited to the SELECTOR, so no other root-complex register is reachable through this capability. |
 | `arch/x86_64/mod.rs` | 37 → 39 (+2) | `pci_cfg_out32` / `pci_cfg_in32` - the port instructions behind the gated `PortOut32`/`PortIn32` syscalls (step D2, userspace hardware enumeration). One `out dx, eax` and one `in eax, dx`, each carrying a SAFETY comment.
 
 Placed here DELIBERATELY. The first version put the `unsafe` in `syscall/dispatch.rs` and grew that file 2 -> 4 - and dispatch.rs is a §18.5 GRANDFATHERED FLOOR, which may decrease freely but may increase only by an amendment with a written rationale. §18.5 says new `unsafe` a feature needs must first try to live in a permitted layer, so it moved to `arch/` and dispatch.rs is back at its floor with no amendment required - the worked example that section describes, hit for real.
@@ -2330,7 +2333,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 68 | permitted |
+| arch/aarch64/mod.rs | 70 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
 | arch/aarch64/exceptions.rs | 17 | permitted |

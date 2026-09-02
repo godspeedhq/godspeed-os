@@ -51,7 +51,11 @@ fn main() {
     // a service that cannot work on the machine it is on. A hardware enumerator for those ports would
     // reach its devices another way (device tree, ECAM), which is a different implementation behind
     // the same service contract.
-    let enumerator: &[&str] = if arch == "x86_64" { &["hw-enumerator"] } else { &[] };
+    // Embedded where configuration space is REACHABLE: x86 through the CF8/CFC ports, aarch64
+    // through the Pi 4's memory-mapped INDEX/DATA window. Not arm32 - the Pi 2 has no PCI at all,
+    // so there is nothing there for it to read.
+    let enumerator: &[&str] =
+        if arch == "x86_64" || arch == "aarch64" { &["hw-enumerator"] } else { &[] };
 
     // OUT_DIR is <target>/<triple>/<profile>/build/<pkg>-<hash>/out, so the binaries this build
     // needs sit four levels up. Derived rather than assumed, so it holds for every triple.

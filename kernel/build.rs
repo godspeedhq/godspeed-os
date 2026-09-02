@@ -198,14 +198,14 @@ const ARM_ONLY: &[&str] = &["dwc2"];
     let aarch64_built: &[&str] = if aarch64_demo {
         &["logger", "console", "time", "control", "ping", "pong", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
-          "block-driver", "fs", "nic-driver", "net-stack", "xhci",
+          "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     } else {
         // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
         // carnage, and observe is how it is watched while it does. Both are arch-neutral.
         &["logger", "console", "time", "control", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
-          "block-driver", "fs", "nic-driver", "net-stack", "xhci",
+          "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     };
     let aarch64_dir = workspace
