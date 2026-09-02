@@ -6416,13 +6416,35 @@ fn build_caps_table(ctx: &ServiceContext, name: &str) -> Option<Table> {
 /// resources by id (matching `cmd_caps`), everything else as `endpoint#N`.
 fn cap_resource_name(id: u64, buf: &mut [u8]) -> usize {
     let mut p = 0usize;
+    // EVERY well-known resource is named, and the reason is that the fallback below LIES about the
+    // ones that are not. Ten of these (7-16) used to fall through to `endpoint#N`, so `caps` reported
+    // a service that can reboot the machine as holding "endpoint#8" - authority hidden behind a label
+    // that names the wrong kind of thing entirely. A reviewer must be able to read off what a service
+    // can do (§26.9), and that is the whole job of this command.
+    //
+    // The names match the vocabulary a contract uses (`pci_cfg = true`), so what a service DECLARES
+    // and what it is observed to HOLD read the same and can be compared directly.
+    //
+    // Ids 1-16 are the kernel's fixed set (`capability::*_RESOURCE`); anything above is a real
+    // endpoint, and only those reach the fallback. Adding a resource without adding it here puts it
+    // straight back into the lie, so keep the two in step.
     match id {
-        1 => write_bytes(buf, &mut p, b"log_write"),
-        2 => write_bytes(buf, &mut p, b"spawn"),
-        3 => write_bytes(buf, &mut p, b"console_read"),
-        4 => write_bytes(buf, &mut p, b"console_push"),
-        5 => write_bytes(buf, &mut p, b"introspect"),
-        6 => write_bytes(buf, &mut p, b"service_control"),
+        1  => write_bytes(buf, &mut p, b"log_write"),
+        2  => write_bytes(buf, &mut p, b"spawn"),
+        3  => write_bytes(buf, &mut p, b"console_read"),
+        4  => write_bytes(buf, &mut p, b"console_push"),
+        5  => write_bytes(buf, &mut p, b"introspect"),
+        6  => write_bytes(buf, &mut p, b"service_control"),
+        7  => write_bytes(buf, &mut p, b"resource_mint"),
+        8  => write_bytes(buf, &mut p, b"reboot"),
+        9  => write_bytes(buf, &mut p, b"acquire_any"),
+        10 => write_bytes(buf, &mut p, b"net_device"),
+        11 => write_bytes(buf, &mut p, b"gpio_device"),
+        12 => write_bytes(buf, &mut p, b"usb_disk"),
+        13 => write_bytes(buf, &mut p, b"set_clock"),
+        14 => write_bytes(buf, &mut p, b"fire_irq"),
+        15 => write_bytes(buf, &mut p, b"image_spawn"),
+        16 => write_bytes(buf, &mut p, b"pci_cfg"),
         other => { write_bytes(buf, &mut p, b"endpoint#"); write_u32(buf, &mut p, other as u32); }
     }
     p

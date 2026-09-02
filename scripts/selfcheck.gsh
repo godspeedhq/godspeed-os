@@ -322,6 +322,68 @@ caps shell | select resource | assert contains introspect
 assert fails caps nosuchservice
 assert fails-with FileNotFound caps nosuchservice
 
+# ===== hw-enumerator: hardware discovery in USERSPACE (step D2) =====
+echo ''
+echo '===== hw-enumerator: userspace PCI discovery + its narrow authority ====='
+# NOT EVERY MACHINE HAS PCI. This service exists on x86 and on the Pi 4; the Pi 2's peripherals hang
+# off a memory-mapped bus with no PCI at all, so there is nothing here to enumerate and no service to
+# ask. Probe for it and SKIP OUT LOUD, the same way the clock check does above - a silent skip is a
+# test that has quietly stopped testing, and asserting it unconditionally would fail the Pi 2 for
+# lacking hardware rather than for anything being wrong.
+# The probe has to survive BOTH machines, and getting it wrong is quiet rather than loud - which is
+# why it is written this way and not the obvious way.
+#
+# `for line in (status | where ...)` is the shape that reads best and it does NOT work: gsh refuses to
+# capture a PIPELINE (bounded stack - it says so). The refusal made the loop body never run, `hwe`
+# stayed 0, and the suite cheerfully printed SKIP on a machine that HAS the service. A probe that
+# fails safe-looking is worse than one that fails loudly, so it is staged through a file the way the
+# error message and every other capture in this suite do it.
+#
+# `count` is what makes the answer unambiguous: it counts DATA rows, not the header, so a match is 1
+# and no match is 0. Reading the raw table instead would see a header row either way and always say
+# "present". Root is used for the staging file because `/sc` is not created until much later in this
+# script, and writing into a missing parent fails.
+status | where name contains hw-enumerator | count | write /hwe.txt
+let mut hwe = 0
+for line in (read /hwe.txt) { if $line > 0 { hwe = 1 } }
+delete /hwe.txt
+if $hwe > 0 {
+    # It is alive, and it is where the supervisor put it.
+    status | where name contains hw-enumerator | assert contains hw-enumerator
+    # It survived to serve: a service that logged its scan and then died would still be "in the
+    # table" for a moment, so assert the state the supervisor keeps it in.
+    status | where name contains hw-enumerator | assert lacks Dead
+    # The kernel directory resolves it by name - the property that makes it reacquirable (§14.3).
+    trace endpoints | assert contains hw-enumerator
+
+    # THE AUTHORITY, which is the part actually worth pinning. `pci_cfg` is a hardware capability
+    # granted to a userspace service, so its SHAPE is a security claim and not an implementation
+    # detail: one configuration READ and nothing else. `caps` names the resource rather than printing
+    # it as an anonymous id, so the claim is readable here at all.
+    caps hw-enumerator | assert contains pci_cfg
+    caps hw-enumerator | where resource=pci_cfg | assert contains read
+    # THE REGRESSION GUARD. Config space holds every BAR and every command register, so write
+    # authority over it is write authority over every device on the bus - there is no narrower form,
+    # because the target is chosen by data rather than by the interface. It was minted READ|WRITE
+    # once, before the write operation was removed. If anyone re-adds that right, this line fails and
+    # says why, which is the whole point of writing it down as a test rather than as a comment.
+    caps hw-enumerator | where resource=pci_cfg | assert lacks write
+    # And it holds no authority it has no business holding: discovery does not spawn, kill, or reboot.
+    caps hw-enumerator | assert lacks service_control
+    caps hw-enumerator | assert lacks reboot
+    caps hw-enumerator | assert lacks image_spawn
+} else {
+    echo 'SKIP  hw-enumerator - this machine has no PCI to enumerate (Pi 2); not a failure'
+}
+
+# `caps` must NAME a well-known resource, never print it as an anonymous number. Ten of the sixteen
+# used to fall through to an `endpoint#N` fallback, which reported (for instance) the shell's authority
+# to reboot the machine as "endpoint#8" - a label naming the wrong KIND of thing, so a reader could not
+# tell real authority from an ordinary IPC endpoint. Authority has to be readable (§26.9). The shell
+# holds `reboot`, so it is the honest witness for this on every machine.
+caps shell | assert contains reboot
+caps shell | assert lacks endpoint#8
+
 # ===== lifecycle guardrails + supervisor recovery (safe, deterministic) =====
 echo ''
 echo '===== lifecycle guardrails + supervisor recovery (safe, deterministic) ====='
