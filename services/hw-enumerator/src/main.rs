@@ -188,7 +188,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log_fmt(format_args!("hw-enumerator: {} device(s) found by USERSPACE enumeration", n));
     for f in found.iter().take(n) {
         ctx.log_fmt(format_args!(
-            "hw-enum: {:02x}:{:02x}.{} class {:#08x} vendor {:#06x} device {:#06x} bar0 {:#010x} irq {}",
+            "hw-enumerator: {:02x}:{:02x}.{} class {:#08x} vendor {:#06x} device {:#06x} bar0 {:#010x} irq {}",
             (f.bdf >> 8) & 0xFF,
             (f.bdf >> 3) & 0x1F,
             f.bdf & 0x7,
