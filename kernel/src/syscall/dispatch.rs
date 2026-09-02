@@ -1371,6 +1371,32 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
 /// Reacquire a fresh SEND cap to a named service (§14.2). **Gated (§3.1, see the in-body comment):**
 /// the caller must hold `ACQUIRE_ANY` (operator/test) or declare `name` as a contract send-peer
 /// (recovery). `arg2=1` also requests the GRANT right (cap-transfer tests, P3).
+/// Has this name already been reported as absent from the directory? Records it if not.
+///
+/// Bounded and heap-free (§26.6.1): a fixed table of names already warned about. When it fills, no new
+/// names are reported - a deliberate ceiling, because the alternative is an unbounded log on a serial
+/// wire that is already the system's bottleneck. Sixteen distinct names is more than the whole managed
+/// roster, so filling it means something is acquiring names nobody declared.
+fn warn_once_for(name: &str) -> bool {
+    const MAX_NAMES: usize = 16;
+    const NAME_MAX: usize = 32;
+    static SEEN: crate::smp::SpinLock<([[u8; NAME_MAX]; MAX_NAMES], [u8; MAX_NAMES], usize)> =
+        crate::smp::SpinLock::new(([[0; NAME_MAX]; MAX_NAMES], [0; MAX_NAMES], 0));
+    let b = name.as_bytes();
+    if b.len() > NAME_MAX { return true; } // too long to remember; report it every time rather than never
+    let mut g = SEEN.lock();
+    let n = g.2;
+    for i in 0..n {
+        if g.1[i] as usize == b.len() && g.0[i][..b.len()] == *b { return false; }
+    }
+    if n == MAX_NAMES { return false; }
+    let len = b.len();
+    g.0[n][..len].copy_from_slice(b);
+    g.1[n] = len as u8;
+    g.2 = n + 1;
+    true
+}
+
 fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> i64 {
     let len = name_len as usize;
     if len == 0 || len > 64 { return -1; }
@@ -1397,11 +1423,25 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
     let ep_id = match crate::ipc::names::lookup(name) {
         Some(id) => id,
         None     => {
-            // SAID, not swallowed. This and the cap-table refusal below both returned a bare -1, so a
-            // service that could not reacquire a peer had no way to learn WHY - and reported the peer
-            // as unresponsive. On hardware that sent the reader after a `block-driver` which was alive
-            // the whole time with an empty queue, while the real answer was here (invariant 12).
-            crate::kprintln!("acquire: '{}' is not in the name directory - nothing to acquire", name);
+            // SAID, not swallowed - but ONCE PER NAME, because saying it every time was worse than
+            // not saying it.
+            //
+            // This and the cap-table refusal below both returned a bare -1, so a service that could
+            // not reacquire a peer had no way to learn WHY, and reported the peer as unresponsive. On
+            // hardware that sent the reader after a `block-driver` which was alive the whole time with
+            // an empty queue (invariant 12).
+            //
+            // Unconditional, it then produced 394 lines in one chaos run - 2.5% of the log, 293 of
+            // them for a single name - on a wire already carrying 73% of its capacity. This refusal is
+            // TRANSIENT and EXPECTED: peers are acquired before they are spawned at boot, and again
+            // while one is mid-restart. The caller retries and recovers. The FIRST occurrence of a
+            // name is the diagnostic; the next three hundred are the instrument competing with the
+            // thing it is measuring. The cap-table refusal below is NOT rate-limited: it is rare,
+            // permanent, and the one that actually strands a service.
+            if warn_once_for(name) {
+                crate::kprintln!(
+                    "acquire: '{}' is not in the name directory - nothing to acquire (further occurrences for this name are not logged)", name);
+            }
             return -1;
         }
     };
