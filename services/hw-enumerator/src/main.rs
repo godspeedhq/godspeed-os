@@ -117,10 +117,21 @@ fn cfg_read(ctx: &ServiceContext, bus: u8, dev: u8, func: u8, offset: u8) -> Opt
 /// a device the fabric has no route to is an unsupported request, which some root complexes answer
 /// with an abort rather than the all-ones a PC host bridge synthesizes.
 ///
-/// LIMITATION, recorded rather than papered over (§26.7): a bridge to a CONVENTIONAL PCI segment can
-/// legitimately carry devices 1-31, and this would not see them. No machine this runs on has one.
-/// The alternative - probe all 32 and rely on being refused - trades a reporting gap for a class of
-/// access that is unsafe on real hardware, which is the worse trade.
+/// LIMITATION, and the claim that used to sit here was FALSIFIED by the first machine that tested it.
+///
+/// It said "no machine this runs on" carries devices 1-31 behind a bridge. The Wyse (Intel Gemini
+/// Lake) does: its kernel scan - which walks all 256 buses by 32 slots by 8 functions - records 15
+/// devices where this walk reports 14. One device sits somewhere this does not look, and the honest
+/// statement is that I asserted a fact about every machine from a sample of two.
+///
+/// The gap is knowingly left open rather than closed blind. Widening the walk means probing slots that
+/// cannot be occupied on a point-to-point PCIe link, and on the Pi 4 an out-of-range config read is an
+/// SError that halts the machine, not a harmless all-ones. The kernel's admissibility check refuses
+/// out-of-RANGE buses, and its own scan reads bus 1 device 1 safely - so widening is probably safe -
+/// but "probably safe" is not the bar for a change whose failure mode is a dead board, and this is a
+/// REPORTER with no clients, so the cost of the gap today is one unlisted device in a log.
+///
+/// To close it: probe all 32 slots per admitted bus, and prove it on the Pi 4 before believing it.
 fn slots_on(bus: u8) -> u8 {
     if bus == 0 { MAX_DEV } else { 1 }
 }

@@ -1185,6 +1185,10 @@ pub fn init() {
     // Two independent views of one truth must agree BEFORE anything is switched over to the new one.
     // Printed once at boot, so the agreement is evidence in the log rather than an assumption in a
     // commit message - and the day they disagree, the log says which device and which fact.
+    // Sentinel for "resolve this the BAR_AUTO way" - out of range of a real BAR index (0..5), so it
+    // can never collide with one.
+    const BAR_AUTO_IX: usize = usize::MAX;
+
     let n = DEVICE_COUNT.load(Ordering::Relaxed);
     crate::kprintln!("pci: device table - {} device(s) recorded (generic, no class knowledge)", n);
     for (label, want_found, want_bar, want_class, bar_ix) in [
@@ -1195,15 +1199,34 @@ pub fn init() {
         // Ethernet: class 0x02, subclass 0x00, prog-if 0x00. Both models we drive (e1000, RTL8168)
         // report the same triple - which is the point: the class code says "ethernet controller",
         // and WHICH ethernet controller is the driver's business, not the kernel's.
-        ("NIC",  NIC_FOUND.load(Ordering::Relaxed),  NIC_MMIO_BASE.load(Ordering::Relaxed),  0x02_00_00, 0),
+        // BAR_AUTO_IX, not 0. The static path resolves the NIC's registers with the BAR_AUTO rule -
+        // the first NON-ZERO BAR - because the two cards this drives put them in different places:
+        // the e1000 in BAR0, the RTL8168 in BAR2 with I/O ports in BAR0. The scan stores 0 for an
+        // I/O BAR (it skips them deliberately), so comparing `bar[0]` against a BAR_AUTO result asks
+        // whether BAR0 equals BAR2 and answers no on every RTL8168 machine.
+        //
+        // That is what the Wyse reported: `NIC DISAGREES - table BAR0 0x0, static 0xa1104000` on a
+        // board whose networking was working perfectly - DNS resolving, ping at 0% loss. A
+        // cross-check exists to make the table's trustworthiness evidence rather than assumption;
+        // one that fails on a healthy machine destroys exactly the property it was written to
+        // establish, and teaches a reader to skip the line.
+        ("NIC",  NIC_FOUND.load(Ordering::Relaxed),  NIC_MMIO_BASE.load(Ordering::Relaxed),  0x02_00_00, BAR_AUTO_IX),
     ] {
+        // Resolve the index the same way the spawn path does, so the two sides compare like with like.
+        let bar_of = |d: &PciDevice| -> u64 {
+            if bar_ix == BAR_AUTO_IX {
+                d.bar.iter().copied().find(|&b| b != 0).unwrap_or(0)
+            } else {
+                d.bar[bar_ix.min(5)]
+            }
+        };
         match find_by_class(want_class) {
-            Some(d) if want_found && d.bar[bar_ix] == want_bar =>
+            Some(d) if want_found && bar_of(&d) == want_bar =>
                 crate::kprintln!("pci:   {} class {:#08x} AGREES (BAR{} {:#x} BDF {:#06x})",
-                                 label, want_class, bar_ix, d.bar[bar_ix], d.bdf),
+                                 label, want_class, bar_ix, bar_of(&d), d.bdf),
             Some(d) =>
                 crate::kprintln!("pci:   {} class {:#08x} DISAGREES - table BAR{} {:#x}, static {:#x} (found={})",
-                                 label, want_class, bar_ix, d.bar[bar_ix], want_bar, want_found),
+                                 label, want_class, bar_ix, bar_of(&d), want_bar, want_found),
             None if !want_found =>
                 crate::kprintln!("pci:   {} class {:#08x} absent from both - agrees", label, want_class),
             None =>
